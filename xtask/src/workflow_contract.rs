@@ -3414,9 +3414,15 @@ fi
     /// evidence (`e2e_fail_total: None`) and a well-formed table, so a
     /// regression in either the guard or the renderer's degenerate case is
     /// caught by behavior rather than a pinned string.
+    ///
+    /// Unreadable E2E evidence is itself a NO-GO signal, not a reason to hide
+    /// the page: `render_table` always emits the status-table header, so
+    /// this case reaches the publish step the same as a well-formed table.
+    /// Only a truly empty/degenerate table (no `facts.json` at all) trips
+    /// the guard.
     #[cfg(unix)]
     #[test]
-    fn release_readiness_wiki_publish_guard_stops_on_unreadable_e2e_evidence() {
+    fn release_readiness_wiki_publish_guard_only_stops_on_a_missing_table() {
         use crate::release_readiness::{CommitBuckets, Facts, Verdict, render_table};
 
         let nightly = read_workflow("nightly.yml");
@@ -3461,8 +3467,13 @@ fi
             known_issues: vec![],
         });
         assert!(
-            !run(&unreadable).contains("REACHED_PUBLISH"),
-            "unreadable E2E evidence must stop the release-readiness wiki publish"
+            run(&unreadable).contains("REACHED_PUBLISH"),
+            "unreadable E2E evidence is a NO-GO verdict, not a reason to hide the wiki page"
+        );
+
+        assert!(
+            !run("").contains("REACHED_PUBLISH"),
+            "a missing/empty table.md must still stop the release-readiness wiki publish"
         );
 
         let well_formed = render_table(&Facts {

@@ -288,6 +288,15 @@ pub(crate) enum Command {
         /// (`needs.windows-nightly.result`).
         #[arg(long)]
         windows_result: String,
+        /// One `NAME=RESULT` pair per E2E GPU/WSL lane job (e.g.
+        /// `MI300X=${{ needs.e2e-gpu-nightly.result }}`), repeatable. A lane
+        /// that dies before uploading its `report.json` (preflight failure,
+        /// timeout, runner loss) would otherwise just vanish from the
+        /// consolidated E2E report's totals, reading as zero failures; this
+        /// gates on the lane job's own result so a silently-missing lane
+        /// still fails the release-readiness verdict.
+        #[arg(long = "e2e-lane-result")]
+        e2e_lane_results: Vec<String>,
         /// Path to write the structured facts JSON (input to the narrative step).
         #[arg(long)]
         out: PathBuf,
@@ -389,6 +398,7 @@ fn run() -> Result<()> {
             e2e_report,
             nightly_result,
             windows_result,
+            e2e_lane_results,
             out,
             table_out,
         } => release_readiness::run(
@@ -396,6 +406,7 @@ fn run() -> Result<()> {
             &e2e_report,
             &nightly_result,
             &windows_result,
+            &e2e_lane_results,
             &out,
             &table_out,
         )?,

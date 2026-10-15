@@ -78,6 +78,7 @@ pub fn run(
     e2e_report: &Path,
     nightly_result: &str,
     windows_result: &str,
+    e2e_lane_results: &[String],
     out: &Path,
     table_out: &Path,
 ) -> Result<()> {
@@ -96,6 +97,7 @@ pub fn run(
         e2e_fail_total,
         nightly_result,
         windows_result,
+        e2e_lane_results,
     );
 
     write_parented(out, &serde_json::to_string_pretty(&facts)?)?;
@@ -113,6 +115,7 @@ fn assemble_facts(
     e2e_fail_total: Option<u64>,
     nightly_result: &str,
     windows_result: &str,
+    e2e_lane_results: &[String],
 ) -> Facts {
     let mut failing_gates = Vec::new();
     // `skipped` is a legitimate outcome on a no-op night (e.g.
@@ -127,6 +130,17 @@ fn assemble_facts(
         None => failing_gates.push("E2E (report unreadable)".to_string()),
         Some(n) if n > 0 => failing_gates.push(format!("E2E ({n} failure(s))")),
         Some(_) => {}
+    }
+    // The Total row above only counts platforms whose `report.json` actually
+    // got uploaded — a GPU lane that dies before uploading (preflight
+    // failure, timeout, runner loss) just drops out of it, silently reading
+    // as zero failures. Gate on the lane jobs' own results too, so a lane
+    // that never reported still fails the release-readiness gate.
+    for pair in e2e_lane_results {
+        let (name, result) = pair.split_once('=').unwrap_or((pair.as_str(), ""));
+        if !matches!(result, "success" | "skipped") {
+            failing_gates.push(format!("E2E lane {name} ({result})"));
+        }
     }
 
     let verdict = if failing_gates.is_empty() {
@@ -212,27 +226,26 @@ pub fn categorize(subjects: &[String]) -> CommitBuckets {
             continue;
         };
         let head = &subject[..colon];
-        let mut rest = subject[colon + 1..].trim().to_string();
-        let breaking = head.ends_with('!');
+        let rest = subject[colon + 1..].trim();
         let head_no_bang = head.trim_end_matches('!');
         let kind = head_no_bang.split('(').next().unwrap_or("");
+        // Only `feat!`/`fix!` denote a breaking change in Conventional
+        // Commits; a bare `!` after e.g. `chore` or `docs` isn't one.
+        let breaking = head.ends_with('!') && matches!(kind, "feat" | "fix");
         let scope = head_no_bang
             .find('(')
             .and_then(|i| head_no_bang[i + 1..].strip_suffix(')'));
         if scope.is_some_and(is_internal_only_scope) {
             continue;
         }
-        let pr = extract_pr_number(subject);
         // `rest` still carries the trailing `(#NNN)` GitHub appends on
         // squash-merge, since it's after the colon too; strip it here so
         // `render_table` isn't left printing `subject (#NNN) (#NNN)`.
-        if let Some(n) = pr {
-            let suffix = format!(" (#{n})");
-            if let Some(stripped) = rest.strip_suffix(&suffix) {
-                rest = stripped.to_string();
-            }
-        }
-        let entry = CommitEntry { pr, subject: rest };
+        let (pr, rest) = split_trailing_pr_reference(rest);
+        let entry = CommitEntry {
+            pr,
+            subject: rest.to_string(),
+        };
         if breaking {
             buckets.breaking.push(entry);
         } else {
@@ -246,21 +259,34 @@ pub fn categorize(subjects: &[String]) -> CommitBuckets {
     buckets
 }
 
-/// Extract a trailing `(#NNN)` GitHub squash-merge PR reference, if present.
-/// Only matches when `(#NNN)` is the very end of the subject (after
-/// trimming trailing whitespace) — `(#NNN)` appearing mid-sentence (e.g.
-/// `"fix: handle (#12) refs"`) is not a PR reference.
-fn extract_pr_number(subject: &str) -> Option<u64> {
-    let trimmed = subject.trim_end();
+/// Split off a trailing `(#NNN)` GitHub squash-merge PR reference, if
+/// present, returning the PR number and the text with it removed. Only
+/// matches when `(#NNN)` is the very end of the text (after trimming
+/// trailing whitespace) — `(#NNN)` appearing mid-sentence (e.g. `"fix:
+/// handle (#12) refs"`) is not a PR reference.
+fn split_trailing_pr_reference(text: &str) -> (Option<u64>, &str) {
+    let trimmed = text.trim_end();
     if !trimmed.ends_with(')') {
-        return None;
+        return (None, text);
     }
-    let start = trimmed.rfind("(#")?;
-    trimmed[start + 2..trimmed.len() - 1].parse().ok()
+    let Some(start) = trimmed.rfind("(#") else {
+        return (None, text);
+    };
+    let Some(number) = trimmed[start + 2..trimmed.len() - 1].parse().ok() else {
+        return (None, text);
+    };
+    (Some(number), trimmed[..start].trim_end())
+}
+
+#[cfg(test)]
+fn extract_pr_number(subject: &str) -> Option<u64> {
+    split_trailing_pr_reference(subject).0
 }
 
 #[derive(serde::Deserialize)]
 struct RawReactionGroup {
+    #[serde(default)]
+    content: String,
     users: RawUsers,
 }
 #[derive(serde::Deserialize)]
@@ -297,7 +323,7 @@ fn collect_known_issues() -> Result<Vec<KnownIssue>> {
             "--json",
             "number,title,body,reactionGroups",
             "--limit",
-            "100",
+            "1000",
         ])
         .output()
         .context(
@@ -318,7 +344,14 @@ fn collect_known_issues() -> Result<Vec<KnownIssue>> {
         .map(|i| KnownIssue {
             number: i.number,
             title: i.title,
-            reactions: i.reaction_groups.iter().map(|g| g.users.total_count).sum(),
+            // Only count 👍 as a vote of "this affects me"; other reactions
+            // (👎, 😕, etc.) shouldn't boost an issue's rank.
+            reactions: i
+                .reaction_groups
+                .iter()
+                .filter(|g| g.content == "THUMBS_UP")
+                .map(|g| g.users.total_count)
+                .sum(),
             body_excerpt: excerpt(&i.body, 240),
         })
         .collect();
@@ -359,6 +392,7 @@ fn escape_markdown(text: &str) -> String {
     text.chars()
         .flat_map(|c| match c {
             '\n' | '\r' => vec![' '],
+            '\\' => vec!['\\', '\\'],
             '|' | '[' | ']' | '*' | '_' | '`' | '<' | '>' => vec!['\\', c],
             _ => vec![c],
         })
@@ -379,15 +413,15 @@ pub(crate) fn render_table(facts: &Facts) -> String {
     );
     let _ = writeln!(out, "Commits considered: since `{}`\n", facts.since_tag);
 
-    // Unreadable E2E evidence means the gate table itself can't be trusted;
-    // render a short warning instead of a table carrying a bogus "0
-    // failures" row. `publish-release-readiness-wiki`'s guard greps for the
-    // table header below, so omitting it here also makes that guard trip.
-    let Some(e2e_fail_total) = facts.e2e_fail_total else {
-        out.push_str(
-            "⚠️ E2E evidence was unreadable; the gate table could not be rendered. See `failing_gates` in `facts.json`.\n",
-        );
-        return out;
+    // Unreadable E2E evidence is itself a NO-GO signal (see
+    // `assemble_facts`), not grounds to skip the table — a NO-GO page must
+    // still publish so it's visible on the wiki. The table always carries
+    // the header below so `publish-release-readiness-wiki`'s guard (which
+    // greps for it) only trips on a truly empty/degenerate table.
+    let e2e_failing = facts.failing_gates.iter().any(|g| g.starts_with("E2E"));
+    let e2e_evidence = match facts.e2e_fail_total {
+        Some(n) => format!("{n} failure(s) across all platforms"),
+        None => "evidence unreadable".to_string(),
     };
 
     out.push_str("| Area | Evidence | Status |\n|---|---|:--:|\n");
@@ -402,8 +436,8 @@ pub(crate) fn render_table(facts: &Facts) -> String {
     );
     let _ = writeln!(
         out,
-        "| E2E | {e2e_fail_total} failure(s) across all platforms | {} |",
-        if e2e_fail_total > 0 { "❌" } else { "✅" }
+        "| E2E | {e2e_evidence} | {} |",
+        if e2e_failing { "❌" } else { "✅" }
     );
     out.push('\n');
 
@@ -414,12 +448,13 @@ pub(crate) fn render_table(facts: &Facts) -> String {
             return;
         }
         for e in entries {
+            let subject = escape_markdown(&e.subject);
             match e.pr {
                 Some(pr) => {
-                    let _ = writeln!(out, "- {} (#{pr})", e.subject);
+                    let _ = writeln!(out, "- {subject} (#{pr})");
                 }
                 None => {
-                    let _ = writeln!(out, "- {}", e.subject);
+                    let _ = writeln!(out, "- {subject}");
                 }
             }
         }
@@ -566,6 +601,7 @@ mod tests {
             Some(0),
             "success",
             "success",
+            &[],
         );
         assert_eq!(facts.verdict, Verdict::Go);
         assert!(facts.failing_gates.is_empty());
@@ -580,6 +616,7 @@ mod tests {
             None,
             "success",
             "success",
+            &[],
         );
         assert_eq!(facts.verdict, Verdict::NoGo);
         assert_eq!(facts.failing_gates, vec!["E2E (report unreadable)"]);
@@ -594,6 +631,7 @@ mod tests {
             Some(0),
             "success",
             "skipped",
+            &[],
         );
         assert_eq!(facts.verdict, Verdict::Go);
         assert!(facts.failing_gates.is_empty());
@@ -608,13 +646,59 @@ mod tests {
             Some(0),
             "success",
             "failure",
+            &[],
         );
         assert_eq!(facts.verdict, Verdict::NoGo);
         assert_eq!(facts.failing_gates, vec!["windows build (failure)"]);
     }
 
     #[test]
-    fn render_table_omits_the_header_when_e2e_evidence_is_unreadable() {
+    fn assemble_facts_is_no_go_when_e2e_failures_are_nonzero() {
+        let facts = assemble_facts(
+            "v1.0.0",
+            CommitBuckets::default(),
+            vec![],
+            Some(3),
+            "success",
+            "success",
+            &[],
+        );
+        assert_eq!(facts.verdict, Verdict::NoGo);
+        assert_eq!(facts.failing_gates, vec!["E2E (3 failure(s))"]);
+    }
+
+    #[test]
+    fn assemble_facts_is_no_go_when_nightly_build_fails() {
+        let facts = assemble_facts(
+            "v1.0.0",
+            CommitBuckets::default(),
+            vec![],
+            Some(0),
+            "failure",
+            "success",
+            &[],
+        );
+        assert_eq!(facts.verdict, Verdict::NoGo);
+        assert_eq!(facts.failing_gates, vec!["nightly build (failure)"]);
+    }
+
+    #[test]
+    fn assemble_facts_is_no_go_when_an_e2e_lane_did_not_report() {
+        let facts = assemble_facts(
+            "v1.0.0",
+            CommitBuckets::default(),
+            vec![],
+            Some(0),
+            "success",
+            "success",
+            &["MI300X=failure".to_string(), "RAD3=success".to_string()],
+        );
+        assert_eq!(facts.verdict, Verdict::NoGo);
+        assert_eq!(facts.failing_gates, vec!["E2E lane MI300X (failure)"]);
+    }
+
+    #[test]
+    fn render_table_always_renders_the_header_even_when_e2e_evidence_is_unreadable() {
         let facts = assemble_facts(
             "v1.0.0",
             CommitBuckets::default(),
@@ -622,9 +706,45 @@ mod tests {
             None,
             "success",
             "success",
+            &[],
         );
         let table = render_table(&facts);
-        assert!(!table.contains("| Area | Evidence | Status |"));
+        assert!(table.contains("| Area | Evidence | Status |"));
+        assert!(table.contains("| E2E | evidence unreadable | ❌ |"));
+    }
+
+    #[test]
+    fn render_table_marks_the_build_row_failed_on_a_build_gate() {
+        let facts = assemble_facts(
+            "v1.0.0",
+            CommitBuckets::default(),
+            vec![],
+            Some(0),
+            "failure",
+            "success",
+            &[],
+        );
+        let table = render_table(&facts);
+        assert!(
+            table.contains(
+                "| Build (Linux + Windows nightly) | nightly / windows-nightly jobs | ❌ |"
+            )
+        );
+    }
+
+    #[test]
+    fn render_table_marks_the_e2e_row_failed_on_nonzero_failures() {
+        let facts = assemble_facts(
+            "v1.0.0",
+            CommitBuckets::default(),
+            vec![],
+            Some(2),
+            "success",
+            "success",
+            &[],
+        );
+        let table = render_table(&facts);
+        assert!(table.contains("| E2E | 2 failure(s) across all platforms | ❌ |"));
     }
 
     #[test]
@@ -641,10 +761,69 @@ mod tests {
             Some(0),
             "success",
             "success",
+            &[],
         );
         let table = render_table(&facts);
         assert!(table.contains("| Area | Evidence | Status |"));
         assert!(table.contains(r"!\[x\](evil) \| injected row"));
         assert!(!table.contains("![x](evil) | injected row"));
+    }
+
+    #[test]
+    fn render_table_escapes_markdown_in_commit_subjects() {
+        let facts = assemble_facts(
+            "v1.0.0",
+            CommitBuckets {
+                features: vec![CommitEntry {
+                    pr: Some(1),
+                    subject: "add [evil](link) | row".to_string(),
+                }],
+                ..CommitBuckets::default()
+            },
+            vec![],
+            Some(0),
+            "success",
+            "success",
+            &[],
+        );
+        let table = render_table(&facts);
+        assert!(table.contains(r"add \[evil\](link) \| row"));
+        assert!(!table.contains("add [evil](link) | row"));
+    }
+
+    #[test]
+    fn escape_markdown_doubles_a_literal_backslash() {
+        assert_eq!(escape_markdown(r"a\b"), r"a\\b");
+    }
+
+    #[test]
+    fn categorize_does_not_treat_a_bang_on_other_types_as_breaking() {
+        let subjects = vec!["docs!: rewrite the README".to_string()];
+        let got = categorize(&subjects);
+        assert!(got.breaking.is_empty());
+        assert!(got.features.is_empty());
+        assert!(got.fixes.is_empty());
+    }
+
+    #[test]
+    fn categorize_does_not_double_append_the_pr_suffix() {
+        let subjects = vec!["fix: correct VRAM probe (#124)".to_string()];
+        let got = categorize(&subjects);
+        assert_eq!(got.fixes[0].subject, "correct VRAM probe");
+        assert!(!got.fixes[0].subject.contains("(#124)"));
+    }
+
+    #[test]
+    fn collect_known_issues_counts_only_thumbs_up_reactions() {
+        let raw: Vec<RawReactionGroup> = serde_json::from_str(
+            r#"[{"content":"THUMBS_UP","users":{"totalCount":3}},{"content":"THUMBS_DOWN","users":{"totalCount":5}}]"#,
+        )
+        .unwrap();
+        let total: u64 = raw
+            .iter()
+            .filter(|g| g.content == "THUMBS_UP")
+            .map(|g| g.users.total_count)
+            .sum();
+        assert_eq!(total, 3);
     }
 }
