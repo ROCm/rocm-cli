@@ -306,6 +306,25 @@ fn capture_user_path() -> String {
         .unwrap_or_default()
 }
 
+/// Write a value to the real Windows user PATH (`HKCU\Environment\Path`) via
+/// PowerShell's `[Environment]::SetEnvironmentVariable`, the same call
+/// `install.ps1` makes. The value travels through the child's own environment
+/// (`$env:...`), never interpolated into the script string, so this helper --
+/// unlike the `rocm fix fix-6-path` write it is used to stage around -- has no
+/// quoting exposure of its own.
+///
+/// Only for staging a known test value. Putting the runner's real PATH back is
+/// [`restore_user_path`]'s job, which goes through the registry directly to
+/// keep the value's original `REG_EXPAND_SZ`/`REG_SZ` kind.
+#[cfg(windows)]
+fn write_user_path(value: &str) -> std::io::Result<std::process::ExitStatus> {
+    let script = "[Environment]::SetEnvironmentVariable('Path', $env:ROCM_E2E_NEW_PATH, 'User')";
+    Command::new("powershell")
+        .args(["-NoProfile", "-Command", script])
+        .env("ROCM_E2E_NEW_PATH", value)
+        .status()
+}
+
 /// The Windows user PATH as the registry stores it, so it can be put back
 /// exactly: `[Environment]` would expand its `%VARIABLES%` on the way out and
 /// write it back as `REG_SZ`.
@@ -368,6 +387,60 @@ fn restore_user_path(previous: &CapturedUserPath) {
             "warning: could not run PowerShell to restore Windows user PATH ({error}); the runner PATH may still reference the test install dir"
         ),
     }
+}
+
+/// Stage a known value on the real Windows user PATH for a scenario outside
+/// this module (`diagnose_steps`'s `fix-6-path` coverage), capturing the real
+/// value first so [`LifecycleState`]'s `Drop` restores it afterward -- the
+/// same guarantee this module's own `install.ps1` scenarios get.
+///
+/// Panics on failure, unlike [`restore_user_path`]'s warn-and-continue: this
+/// runs during setup, not teardown, and a silently failed stage would run the
+/// rest of the scenario against an unknown real PATH value instead of the one
+/// it asked for.
+#[cfg(windows)]
+pub(crate) fn stage_user_path_for_test(world: &mut crate::E2eWorld, value: &str) {
+    let state = world.lifecycle.get_or_insert_with(LifecycleState::default);
+    if state.captured_user_path.is_none() {
+        state.captured_user_path = Some(capture_raw_user_path());
+    }
+    let status =
+        write_user_path(value).expect("failed to run PowerShell to stage the test User PATH");
+    assert!(
+        status.success(),
+        "failed to stage the test User PATH (exit {status})"
+    );
+}
+
+/// Off Windows there is no User-scope PATH to stage, and the only caller's
+/// scenario is `@requires-os:windows` so it resolves to skip; the stub exists
+/// purely so `diagnose_steps` compiles on every platform.
+#[cfg(not(windows))]
+// Platform stub. The `cfg` sibling calls non-const code, so making only this
+// arm `const` would give the two platforms different signatures and push
+// `missing_const_for_fn` onto every caller in turn.
+#[allow(clippy::missing_const_for_fn)]
+pub(crate) fn stage_user_path_for_test(world: &mut crate::E2eWorld, _value: &str) {
+    let _ = world;
+}
+
+/// Read back the real Windows user PATH. Exposed for `diagnose_steps`'s
+/// `fix-6-path` coverage, which asserts the state a real write left behind,
+/// not just the CLI's own report of it.
+#[cfg(windows)]
+pub(crate) fn read_user_path_for_test() -> String {
+    capture_user_path()
+}
+
+/// Off Windows there is no User-scope PATH to read back; see
+/// [`stage_user_path_for_test`]'s stub for why this arm exists at all.
+#[cfg(not(windows))]
+// Platform stub. The `cfg` sibling calls non-const code, so making only this
+// arm `const` would give the two platforms different signatures and push
+// `missing_const_for_fn` onto every caller in turn.
+#[allow(clippy::missing_const_for_fn)]
+pub(crate) fn read_user_path_for_test() -> String {
+    String::new()
 }
 
 /// The real (non-isolated) user rocm state dir, `~/.rocm`, if a home dir is
