@@ -431,7 +431,7 @@ Feature: Interactive dashboard
     And the user tries to quit chat
     Then the dashboard asks whether to quit while a model is still being served
     When the user declines the quit prompt
-    And the user sends a message about GPU health
+    And the user sends a message about GPU health without refocusing the input
     Then the assistant's GPU status response is displayed
     When the user quits interactive chat
     Then interactive chat exits successfully
@@ -503,7 +503,8 @@ Feature: Interactive dashboard
     And the terminal is restored to the normal screen
     And the managed model is still listed as running
     When the user opens the dashboard
-    And the user tries to quit the dashboard
+    Then the dashboard home view is displayed
+    When the user tries to quit the dashboard
     Then the dashboard asks whether to quit while a model is still being served
     When the user presses Ctrl-C in the dashboard
     Then the dashboard exits from the keystroke with code 130

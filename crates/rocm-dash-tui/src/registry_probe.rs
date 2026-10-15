@@ -59,12 +59,14 @@ pub struct ManagedRegistrySnapshot {
 ///
 /// Implementations MUST stay cheap: a local JSON-file read only, never a
 /// daemon round-trip or network I/O. In the dashboard, [`snapshot`](Self::snapshot)
-/// is called only from `request_quit` (on the quit keystroke) and from
-/// `quit_confirm_request`, which calls it on every render while the
-/// quit-confirm prompt is open. The launcher calls `has_live_instance` on
-/// every render too, but through `StaticManagedRegistrySnapshot` — a read
-/// cached once per menu pass — so `snapshot` itself is not called per-frame
-/// there.
+/// is called every time something needs `live_registry_snapshot`'s answer:
+/// `request_quit` on the quit keystroke, `quit_confirm_request` on every
+/// render while the quit-confirm prompt is open, and
+/// `quit_confirm_open_services_key` on the `s` keystroke while it's open.
+/// The launcher's own `has_live_instance` check calls it on every render
+/// too, but through `StaticManagedRegistrySnapshot` — a read cached once per
+/// menu pass — so that per-frame call never reaches an implementation's
+/// actual registry I/O; only the dashboard's calls above do.
 pub trait ManagedRegistryProbe: std::fmt::Debug + Send + Sync {
     /// Read the registry now and classify it from the record's own `status`
     /// field, the same statuses `Instance::status.is_serving()` treats as

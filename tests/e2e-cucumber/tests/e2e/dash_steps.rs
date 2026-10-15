@@ -621,6 +621,28 @@ async fn send_gpu_message(world: &mut E2eWorld) {
         .unwrap_or_else(|e| panic!("failed to submit the chat message: {e}"));
 }
 
+/// Counterpart of `send_gpu_message` for a chat input that is already
+/// focused — `dash-28`'s `/quit`-then-decline round trip (`try_quit_chat`
+/// presses `i` to focus before typing `/quit`) leaves `chat_focused` set,
+/// since nothing on the decline path blurs it. Sending `send_gpu_message`'s
+/// own leading `i` there would be read as a literal character rather than a
+/// focus gesture (`actions.rs`'s `chat.focused` branch maps `Char('i')` to
+/// `ChatInput('i')`, not `ChatFocus`), corrupting the message into
+/// `"ihow is gpu-2 doing"` — not caught by this scenario only because the
+/// mock replies to anything that isn't the approval-trigger phrase. Mirrors
+/// `send_managed_model_message`'s own already-focused pattern.
+#[when("the user sends a message about GPU health without refocusing the input")]
+async fn send_gpu_message_already_focused(world: &mut E2eWorld) {
+    let tui = session(world);
+    tui.wait_for_screen("No messages yet.", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("chat surface never became ready: {e}"));
+    tui.send("how is gpu-2 doing")
+        .unwrap_or_else(|e| panic!("failed to type the chat message: {e}"));
+    tui.send("\r")
+        .unwrap_or_else(|e| panic!("failed to submit the chat message: {e}"));
+}
+
 #[when("the user sends a message that triggers a tool approval")]
 async fn send_approval_trigger_message(world: &mut E2eWorld) {
     let tui = session(world);
