@@ -379,8 +379,19 @@ This replaced an existence-only guard that never reinstalled, which had frozen b
 MI300X runners on a 16-day-old runtime and left drift from a fresh install untested
 (`EAI-8057`). The decision logic lives in `xtask` rather than the workflows because
 the pre-warm block is duplicated across multiple jobs in two shells;
-`xtask/src/e2e_prewarm.rs` carries unit tests for each freshness verdict, and the
+[`xtask/src/e2e_prewarm.rs`](../xtask/src/e2e_prewarm.rs) carries unit tests for each freshness verdict, and the
 `runtime-update-reports-freshness` scenario pins the `rocm update` output shape those tests assume.
+
+A pre-warm invoked with `--version`/`--build-date` overrides most of the above: a
+pin opts out of following the channel index's latest entirely, so the
+update/reuse-at-latest logic above does not apply. `rocm update` always resolves
+a channel to the index's latest version and has no notion of "stay on the
+version I originally pinned," so a pinned run instead looks for an
+already-installed runtime whose key names that exact pin. It still self-heals
+that runtime's own stale composition via repair, but never follows
+`update`/`repair` toward the index's latest key, and installs a fresh
+side-by-side runtime only when no match is found. See
+[`decide()`](../xtask/src/e2e_prewarm.rs)'s doc comment for the full rationale.
 
 ## Blocking vs. non-blocking
 
