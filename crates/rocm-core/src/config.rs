@@ -19,7 +19,6 @@ use std::time::Duration;
 
 use crate::AppPaths;
 use crate::BuiltinWatcherSpec;
-use crate::unix_time_millis;
 use crate::user_runtime_dir;
 
 /// Automation watcher review mode: how much autonomy a watcher has to act on
@@ -543,67 +542,22 @@ impl RocmCliConfig {
             .with_context(|| format!("failed to parse {}", path.display()))
     }
 
-    /// Persist the config by replacing it: write a sibling temp file, then
-    /// rename it over `config.json`.
+    /// Persist the config by replacing it via the shared `write_atomic`
+    /// helper (write a sibling temp file, then rename it over `config.json`;
+    /// see that helper's own doc for the write/rename/cleanup guarantees).
     ///
-    /// Guarantees: an interrupted save (full disk, crash, killed process) can
-    /// never leave a truncated or empty `config.json`, which `load` refuses to
-    /// parse, and a reader sees either the old file or the new one. The
-    /// destination is never removed first, because `load` reads a missing
-    /// `config.json` as "no config" and answers with defaults.
-    ///
-    /// The temp file is `config.json.tmp-<millis>-<pid>`; the pid keeps two
-    /// `rocm` processes saving in the same millisecond apart. It is removed if
-    /// the write or the rename fails.
-    ///
-    /// Not guaranteed:
-    /// - Durability. The bytes are not fsynced before the rename, so a power
-    ///   loss can still surface the new name with unflushed contents.
-    /// - Replacing a `config.json` that another process holds open without
-    ///   delete sharing. On Windows the rename then fails with a sharing
-    ///   violation, the save returns that error, and the old config stays in
-    ///   place.
+    /// The destination is never removed first, because `load` reads a
+    /// missing `config.json` as "no config" and answers with defaults — a
+    /// removed-then-not-yet-replaced window would lose every setting without
+    /// so much as an error.
     pub fn save(&self, paths: &AppPaths) -> Result<()> {
         let path = paths.config_path();
         fs::create_dir_all(&paths.config_dir)
             .with_context(|| format!("failed to create {}", paths.config_dir.display()))?;
         let bytes =
             serde_json::to_vec_pretty(self).context("failed to serialize rocm-cli config")?;
-        // Both halves of the suffix matter: the timestamp keeps successive saves
-        // apart, and the pid keeps two `rocm` processes saving in the same
-        // millisecond from writing each other's temp file and losing one of the
-        // two updates.
-        let tmp_path = path.with_extension(format!(
-            "json.tmp-{}-{}",
-            unix_time_millis(),
-            std::process::id()
-        ));
-        // Cleaned up on failure, like the rename below: a full disk otherwise
-        // strands a partial `config.json.tmp-<ts>-<pid>` next to the real config
-        // on every attempt.
-        fs::write(&tmp_path, bytes)
-            .with_context(|| format!("failed to write {}", tmp_path.display()))
-            .inspect_err(|_| {
-                let _ = fs::remove_file(&tmp_path);
-            })?;
-        // The destination is NOT removed first: `fs::rename` replaces an
-        // existing file on both supported platforms (it is `MoveFileEx` with
-        // `MOVEFILE_REPLACE_EXISTING` on Windows), and removing it would open a
-        // window with no `config.json` at all — which `load` reads as "no
-        // config" and silently answers with defaults, losing every setting
-        // without so much as an error.
-        fs::rename(&tmp_path, &path)
-            .with_context(|| {
-                format!(
-                    "failed to move rocm-cli config {} into {}",
-                    tmp_path.display(),
-                    path.display()
-                )
-            })
-            .inspect_err(|_| {
-                let _ = fs::remove_file(&tmp_path);
-            })?;
-        Ok(())
+        crate::write_atomic(&path, &bytes, "json")
+            .with_context(|| format!("failed to save rocm-cli config to {}", path.display()))
     }
 
     pub fn engine_config(&self, engine: &str) -> Option<&EngineUserConfig> {
@@ -735,7 +689,6 @@ impl RocmCliConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::builtin_watcher;
     use crate::test_support::temp_app_paths;
 
     // The socket-path precedence is mirrored in `rocm-dash-core`; these tests
@@ -875,46 +828,6 @@ mod tests {
 
         config.provider_config_mut("openai").enabled = true;
         assert!(config.provider_enabled("openai"));
-    }
-
-    #[test]
-    fn builtin_watchers_include_read_only_gpu_metrics() {
-        let watcher = builtin_watcher("gpu-metrics").expect("gpu-metrics watcher should exist");
-
-        assert_eq!(watcher.default_mode, WatcherMode::Observe);
-        assert!(watcher.trigger.contains("gpu.metrics"));
-        assert_eq!(watcher.actions, &["record_gpu_metrics"]);
-    }
-
-    #[test]
-    fn builtin_watchers_include_reviewed_cache_warm() {
-        let watcher = builtin_watcher("cache-warm").expect("cache-warm watcher should exist");
-
-        assert_eq!(watcher.default_mode, WatcherMode::Propose);
-        assert!(watcher.trigger.contains("cache.warm"));
-        assert_eq!(watcher.actions, &["queue_prefetch_proposal"]);
-    }
-
-    #[test]
-    fn builtin_watchers_include_reviewed_driver_upgrade() {
-        let watcher =
-            builtin_watcher("driver-upgrade").expect("driver-upgrade watcher should exist");
-
-        assert_eq!(watcher.default_mode, WatcherMode::Propose);
-        assert!(watcher.trigger.contains("update.available"));
-        assert!(watcher.trigger.contains("component=driver"));
-        assert_eq!(watcher.actions, &["prepare_driver_plan"]);
-    }
-
-    #[test]
-    fn builtin_watchers_include_reviewed_gpu_thermal_protect() {
-        let watcher = builtin_watcher("gpu-thermal-protect")
-            .expect("gpu-thermal-protect watcher should exist");
-
-        assert_eq!(watcher.default_mode, WatcherMode::Propose);
-        assert!(watcher.trigger.contains("gpu.thermal_pressure"));
-        assert!(watcher.trigger.contains("gpu.memory_pressure"));
-        assert_eq!(watcher.actions, &["queue_stop_server_proposal"]);
     }
 
     // ===== Dashboard sub-config + migration =====

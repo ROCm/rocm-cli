@@ -8,9 +8,9 @@
 //! the running daemon's live snapshot (`AutomationRuntimeState`), the
 //! logically append-only JSONL stores for watcher action events
 //! (`AutomationEventRecord`), audit log entries, and review proposals, and
-//! the accessors used to read them back. Every write — a single appended
-//! line or a full rewrite on proposal status update/replace — goes through
-//! [`write_atomic`], so a crash or full disk mid-write never leaves a
+//! the accessors used to read them back. Every write to the JSONL stores —
+//! an appended record or a full rewrite on proposal status update — goes
+//! through `write_atomic`, so a crash or full disk mid-write never leaves a
 //! truncated store. `AutomationTriggerEvent` is also defined here, but this
 //! module persists none of it: it is the in-memory trigger type passed
 //! between `rocmd`'s watcher and webhook plumbing (`apps/rocmd/src/watchers.rs`,
@@ -207,33 +207,9 @@ pub struct AuditEventRecord {
     pub service_id: Option<String>,
 }
 
-/// Replace `path`'s content by writing a sibling temp file and renaming it
-/// over the destination, mirroring `RocmCliConfig::save`'s guarantee: an
-/// interrupted write (full disk, crash, killed process) can never leave a
-/// truncated file in place, and a reader sees either the old content or the
-/// new content. The temp file is removed if the write or the rename fails.
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    let tmp_path = path.with_extension(format!(
-        "jsonl.tmp-{}-{}",
-        unix_time_millis(),
-        std::process::id()
-    ));
-    fs::write(&tmp_path, bytes)
-        .with_context(|| format!("failed to write {}", tmp_path.display()))
-        .inspect_err(|_| {
-            let _ = fs::remove_file(&tmp_path);
-        })?;
-    fs::rename(&tmp_path, path)
-        .with_context(|| format!("failed to replace {}", path.display()))
-        .inspect_err(|_| {
-            let _ = fs::remove_file(&tmp_path);
-        })?;
-    Ok(())
-}
-
 /// Append one JSONL `record` to `path`: read the existing content (if any),
 /// append the serialized record plus a newline, and replace the file via
-/// [`write_atomic`].
+/// `write_atomic`.
 fn append_jsonl_record<T: Serialize>(path: &Path, record: &T, context_label: &str) -> Result<()> {
     let mut line = serde_json::to_string(record)
         .with_context(|| format!("failed to serialize {context_label}"))?;
@@ -244,7 +220,7 @@ fn append_jsonl_record<T: Serialize>(path: &Path, record: &T, context_label: &st
         String::new()
     };
     existing.push_str(&line);
-    write_atomic(path, existing.as_bytes())
+    crate::write_atomic(path, existing.as_bytes(), "jsonl")
 }
 
 /// Read every JSONL record from `path` and keep only the most recent `limit`
@@ -389,7 +365,7 @@ fn write_automation_proposals(
         );
         text.push('\n');
     }
-    write_atomic(&path, text.as_bytes())
+    crate::write_atomic(&path, text.as_bytes(), "jsonl")
 }
 
 fn normalize_proposal_identity(proposal: &mut AutomationProposalRecord, index: usize) {
@@ -434,6 +410,46 @@ pub fn load_recent_automation_events(
 mod tests {
     use super::*;
     use crate::test_support::temp_app_paths;
+
+    #[test]
+    fn builtin_watchers_include_read_only_gpu_metrics() {
+        let watcher = builtin_watcher("gpu-metrics").expect("gpu-metrics watcher should exist");
+
+        assert_eq!(watcher.default_mode, WatcherMode::Observe);
+        assert!(watcher.trigger.contains("gpu.metrics"));
+        assert_eq!(watcher.actions, &["record_gpu_metrics"]);
+    }
+
+    #[test]
+    fn builtin_watchers_include_reviewed_cache_warm() {
+        let watcher = builtin_watcher("cache-warm").expect("cache-warm watcher should exist");
+
+        assert_eq!(watcher.default_mode, WatcherMode::Propose);
+        assert!(watcher.trigger.contains("cache.warm"));
+        assert_eq!(watcher.actions, &["queue_prefetch_proposal"]);
+    }
+
+    #[test]
+    fn builtin_watchers_include_reviewed_driver_upgrade() {
+        let watcher =
+            builtin_watcher("driver-upgrade").expect("driver-upgrade watcher should exist");
+
+        assert_eq!(watcher.default_mode, WatcherMode::Propose);
+        assert!(watcher.trigger.contains("update.available"));
+        assert!(watcher.trigger.contains("component=driver"));
+        assert_eq!(watcher.actions, &["prepare_driver_plan"]);
+    }
+
+    #[test]
+    fn builtin_watchers_include_reviewed_gpu_thermal_protect() {
+        let watcher = builtin_watcher("gpu-thermal-protect")
+            .expect("gpu-thermal-protect watcher should exist");
+
+        assert_eq!(watcher.default_mode, WatcherMode::Propose);
+        assert!(watcher.trigger.contains("gpu.thermal_pressure"));
+        assert!(watcher.trigger.contains("gpu.memory_pressure"));
+        assert_eq!(watcher.actions, &["queue_stop_server_proposal"]);
+    }
 
     #[test]
     fn append_audit_event_writes_jsonl_record() -> Result<()> {

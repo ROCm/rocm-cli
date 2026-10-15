@@ -2,9 +2,10 @@
 //
 // SPDX-License-Identifier: MIT
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -472,6 +473,47 @@ pub fn unix_time_millis() -> u128 {
         .as_millis()
 }
 
+/// Replace `path`'s content by writing a sibling temp file and renaming it
+/// over the destination: an interrupted write (full disk, crash, killed
+/// process) can never leave a truncated file in place, and a reader sees
+/// either the old content or the new content. The destination is NOT removed
+/// first: `fs::rename` replaces an existing file on both supported platforms
+/// (it is `MoveFileEx` with `MOVEFILE_REPLACE_EXISTING` on Windows), and
+/// removing it would open a window with no file at all, which a concurrent
+/// reader could see as "file doesn't exist" instead of the old or new
+/// content. The temp file is removed if the write or the rename fails.
+///
+/// `tmp_ext` names the temp file's extension (e.g. `"json"`, `"jsonl"`).
+/// Both halves of the generated suffix matter: the timestamp keeps
+/// successive writes to the same path apart, and the pid keeps two
+/// processes writing in the same millisecond from clobbering each other's
+/// temp file and losing one of the two updates.
+///
+/// Not guaranteed:
+/// - Durability: the bytes are not fsynced before the rename, so a power
+///   loss can still surface the new name with unflushed contents.
+/// - Replacing a destination another process holds open without delete
+///   sharing: on Windows the rename then fails with a sharing violation,
+///   this returns that error, and the old destination stays in place.
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8], tmp_ext: &str) -> Result<()> {
+    let tmp_path = path.with_extension(format!(
+        "{tmp_ext}.tmp-{}-{}",
+        unix_time_millis(),
+        std::process::id()
+    ));
+    fs::write(&tmp_path, bytes)
+        .with_context(|| format!("failed to write {}", tmp_path.display()))
+        .inspect_err(|_| {
+            let _ = fs::remove_file(&tmp_path);
+        })?;
+    fs::rename(&tmp_path, path)
+        .with_context(|| format!("failed to replace {}", path.display()))
+        .inspect_err(|_| {
+            let _ = fs::remove_file(&tmp_path);
+        })?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -638,5 +680,65 @@ mod tests {
     fn command_failure_detail_reports_no_output_when_both_are_empty_or_whitespace() {
         let output = test_process_output("  \n", "   ");
         assert_eq!(command_failure_detail(&output), "no output");
+    }
+
+    #[test]
+    fn write_atomic_writes_bytes_and_leaves_no_temp_file() -> Result<()> {
+        let temp_root =
+            std::env::temp_dir().join(format!("rocm-cli-write-atomic-ok-{}", unix_time_millis()));
+        fs::create_dir_all(&temp_root)?;
+        let path = temp_root.join("store.jsonl");
+
+        write_atomic(&path, b"hello\n", "jsonl")?;
+
+        let written = fs::read(&path)?;
+        let leftovers: Vec<_> = fs::read_dir(&temp_root)?
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name())
+            .collect();
+        let _ = fs::remove_dir_all(&temp_root);
+
+        assert_eq!(written, b"hello\n");
+        assert_eq!(
+            leftovers,
+            vec![OsString::from("store.jsonl")],
+            "a successful write must leave no `*.tmp-*` sibling behind"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn write_atomic_rename_failure_leaves_destination_and_dir_untouched() -> Result<()> {
+        let temp_root =
+            std::env::temp_dir().join(format!("rocm-cli-write-atomic-fail-{}", unix_time_millis()));
+        fs::create_dir_all(&temp_root)?;
+        let path = temp_root.join("store.jsonl");
+        // A file can't be renamed over an existing directory, so making the
+        // destination a directory forces `write_atomic`'s rename step to fail
+        // after the temp file has already been written.
+        fs::create_dir_all(&path)?;
+
+        let result = write_atomic(&path, b"hello\n", "jsonl");
+        let destination_is_still_a_dir = path.is_dir();
+        let leftovers: Vec<_> = fs::read_dir(&temp_root)?
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name())
+            .collect();
+        let _ = fs::remove_dir_all(&temp_root);
+
+        assert!(
+            result.is_err(),
+            "renaming a file onto an existing directory must fail"
+        );
+        assert!(
+            destination_is_still_a_dir,
+            "a failed rename must leave the destination untouched"
+        );
+        assert_eq!(
+            leftovers,
+            vec![OsString::from("store.jsonl")],
+            "the temp file must be removed when the rename fails"
+        );
+        Ok(())
     }
 }
