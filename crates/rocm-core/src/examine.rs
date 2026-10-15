@@ -1837,8 +1837,14 @@ fn kfd_present_on_host() -> bool {
 }
 
 /// `amdkfd_loaded`: an `amdkfd` module in the list, or kfd present on the host.
-fn amdkfd_present(modules: &[&str], kfd_on_host: bool) -> bool {
-    modules.contains(&"amdkfd") || kfd_on_host
+///
+/// `modules` is `None` when the module list could not be read; kfd being
+/// present on the host still answers `true` then, and nothing else is known.
+fn amdkfd_state(modules: Option<&[&str]>, kfd_on_host: bool) -> Option<bool> {
+    match modules {
+        Some(modules) => Some(modules.contains(&"amdkfd") || kfd_on_host),
+        None => kfd_on_host.then_some(true),
+    }
 }
 
 fn probe_modules(e: &mut Examination) {
@@ -1856,10 +1862,9 @@ fn probe_modules(e: &mut Examination) {
             .filter_map(|line| line.split_whitespace().next())
             .collect();
         e.amdgpu_loaded = Some(modules.contains(&"amdgpu"));
-        e.amdkfd_loaded = Some(amdkfd_present(&modules, kfd_on_host));
-    } else if kfd_on_host {
-        // No module list to read, but kfd is demonstrably there.
-        e.amdkfd_loaded = Some(true);
+        e.amdkfd_loaded = amdkfd_state(Some(&modules), kfd_on_host);
+    } else {
+        e.amdkfd_loaded = amdkfd_state(None, kfd_on_host);
     }
 
     for dir in ["/etc/modprobe.d", "/usr/lib/modprobe.d", "/run/modprobe.d"] {
@@ -6441,20 +6446,28 @@ mod tests {
 
     #[test]
     fn amdkfd_is_present_when_listed_as_a_module() {
-        assert!(amdkfd_present(&["amdgpu", "amdkfd"], false));
+        assert_eq!(amdkfd_state(Some(&["amdgpu", "amdkfd"]), false), Some(true));
     }
 
     /// kfd built into the kernel never appears in the module list.
     #[test]
     fn amdkfd_is_present_when_built_in_and_absent_from_the_module_list() {
-        assert!(amdkfd_present(&["amdgpu", "drm"], true));
-        assert!(amdkfd_present(&[], true));
+        assert_eq!(amdkfd_state(Some(&["amdgpu", "drm"]), true), Some(true));
+        assert_eq!(amdkfd_state(Some(&[]), true), Some(true));
     }
 
     #[test]
     fn amdkfd_is_absent_with_neither_a_module_nor_kfd_on_the_host() {
-        assert!(!amdkfd_present(&["amdgpu", "drm"], false));
-        assert!(!amdkfd_present(&[], false));
+        assert_eq!(amdkfd_state(Some(&["amdgpu", "drm"]), false), Some(false));
+        assert_eq!(amdkfd_state(Some(&[]), false), Some(false));
+    }
+
+    /// With no module list, kfd on the host still answers; without it the
+    /// field stays unknown rather than claiming `false`.
+    #[test]
+    fn amdkfd_with_an_unreadable_module_list_follows_the_host() {
+        assert_eq!(amdkfd_state(None, true), Some(true));
+        assert_eq!(amdkfd_state(None, false), None);
     }
 
     /// The host side of the check, against a planted root: the sysfs class
@@ -6490,6 +6503,37 @@ mod tests {
         assert!(!neither, "an empty root has no kfd");
         assert!(sysfs_only, "/sys/class/kfd/kfd alone counts");
         assert!(dev_only, "/dev/kfd alone counts");
+    }
+
+    /// The wiring, not just the helpers: `probe_modules` must consult the host
+    /// root. On every machine this runs on, no `amdkfd` module line exists, so
+    /// `Some(true)` can only come from the planted `/dev/kfd`.
+    #[cfg(all(feature = "e2e-test-hooks", target_os = "linux"))]
+    #[test]
+    fn probe_modules_reports_amdkfd_when_kfd_is_on_the_host() {
+        use crate::hardware_root::TEST_HOST_ROOT_ENV;
+        use crate::test_env::RestoredEnvVar;
+
+        let root = std::env::temp_dir().join(format!(
+            "rocm-core-probe-kfd-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::create_dir_all(root.join("dev")).expect("plant dev");
+        std::fs::write(root.join("dev/kfd"), "").expect("plant /dev/kfd");
+        let amdkfd_loaded = {
+            let _guard = crate::hardware_root::HOST_ROOT_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _root = RestoredEnvVar::set(TEST_HOST_ROOT_ENV, &root);
+            let mut e = Examination::default();
+            probe_modules(&mut e);
+            e.amdkfd_loaded
+        };
+        std::fs::remove_dir_all(&root).ok();
+        assert_eq!(amdkfd_loaded, Some(true));
     }
 
     /// The probes themselves, not just `host_path`, answer from a simulated
