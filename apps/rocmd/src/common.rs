@@ -63,18 +63,28 @@ pub(crate) fn gather_gpu_snapshot() -> CodexBridgeGpuSnapshot {
             return CodexBridgeGpuSnapshot {
                 // `{error:#}` rather than `to_string()`: the outermost context
                 // alone says "failed to launch amd-smi ...", which names the
-                // wrong thing when what actually happened was a timeout. Two of
-                // the failures below gain their causes this way, both of them
-                // raised inside `run_with_timeout`: the timeout, and the
-                // failure to spawn -- on a host with no amd-smi at all, which
-                // is every no-GPU host, the note now ends ": failed to spawn
-                // process: No such file or directory (os error 2)". (The
-                // non-zero-exit and parse failures below are their own
-                // outermost context and already read correctly.) The note is
-                // the only account of this that reaches the bridge snapshot and
-                // the automation watcher, so it carries the causes too --
-                // bounded, because it is persisted; see `run_with_timeout`'s
-                // `MAX_QUOTED_OUTPUT_CHARS`. Pinned by `examine-25`.
+                // wrong thing when what actually happened was a timeout. Pinned
+                // by `examine-25`, which asserts that the rendered note names
+                // the timeout and not just the launch.
+                //
+                // Every failure `run_with_timeout` raises carries its cause the
+                // same way, since all of them arrive under that one context:
+                // the timeout, the failure to spawn, and the poll and reap
+                // failures of its wait loop. Spawn is the case on a host where
+                // none of the paths `resolve_amd_smi_binary` searches holds an
+                // `amd-smi`, down to the bare name on `PATH`; the cause is then
+                // the OS's own "not found" text, which is not the same string
+                // on Linux and Windows, and `rocmd` runs this probe on both --
+                // so none of it is quoted here, and no test pins it. A host
+                // with no GPU but an amd-smi installed is a different case: it
+                // spawns and fails at a non-zero exit. (The non-zero-exit and
+                // parse failures below are their own outermost context and
+                // already read correctly.)
+                //
+                // The note is the only account of any of this that reaches the
+                // bridge snapshot and the automation watcher, so it carries the
+                // causes too -- bounded, because it is persisted; see
+                // `run_with_timeout`'s `MAX_QUOTED_OUTPUT_CHARS`.
                 amd_smi_available: false,
                 static_snapshot: None,
                 monitor_snapshot: None,

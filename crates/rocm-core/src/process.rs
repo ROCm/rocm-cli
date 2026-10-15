@@ -630,8 +630,9 @@ const DRAIN_GRACE: Duration = Duration::from_millis(200);
 /// It bounds this message and nothing else. A caller that quotes the `Output`
 /// handed back to it is quoting raw child output of its own, unbounded and
 /// persisted the same way -- `capture_amd_smi_json`'s non-zero-exit `bail!` and
-/// the daemon's `parse_sandbox_child_output` both do. Those predate this
-/// constant and are #623's, not its.
+/// the daemon's `parse_sandbox_child_output` both do. Both predate this
+/// constant and are outside its scope; of the two, #623 tracks the
+/// `capture_amd_smi_json` quote.
 ///
 /// The bound matters because the message does not stop at a terminal. `rocmd`
 /// renders the whole error chain into the bridge snapshot's `note`, and the
@@ -1159,7 +1160,7 @@ mod tests {
     ///
     /// Setting stdin on the caller's side is also the contract under test: this
     /// function's own stdio overrides whatever the caller set, which is what
-    /// lets all three callers hand over a bare `Command` and say nothing about
+    /// lets all four callers hand over a bare `Command` and say nothing about
     /// stdin at all.
     ///
     /// One thing it does not pin, said plainly rather than left to be
@@ -1169,6 +1170,14 @@ mod tests {
     /// mutant was run and does pass here. What is caught is the regression that
     /// can actually happen -- no stdin setting at all, which is the line this
     /// function took over from its callers.
+    ///
+    /// The race is avoidable by re-execing this test binary under a stdin pipe
+    /// the outer test holds open and asserting in that child, which would fail
+    /// the `inherit` mutant too. Not done: it buys one mutant that no plausible
+    /// edit produces -- nothing would replace `null` with `inherit`, the stdio
+    /// mode this helper exists to stop callers from being handed -- at the cost
+    /// of a self-re-execing test whose own harness plumbing is then the thing
+    /// most likely to break.
     fn assert_the_child_is_given_an_empty_stdin(mut command: Command) {
         let (stdin_reader, stdin_writer) =
             std::io::pipe().expect("failed to create a pipe for the child's stdin");
@@ -1873,10 +1882,11 @@ mod tests {
         }
     }
 
-    /// A scratch directory holding a Windows fixture's script and payload.
+    /// A scratch directory holding a Windows fixture's script, and for
+    /// [`Self::flooding`] fixtures the payload beside it.
     ///
     /// Per-process unique so concurrent test binaries cannot collide on it, and
-    /// removed on drop so a failing assertion does not leave the payload behind.
+    /// removed on drop so a failing assertion does not leave either behind.
     #[cfg(windows)]
     struct WindowsFixture {
         dir: std::path::PathBuf,
