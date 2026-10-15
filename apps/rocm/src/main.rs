@@ -29045,6 +29045,62 @@ install therock";
         let _ = fs::remove_dir_all(root);
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_real_stop_that_a_survivor_outlives_says_the_key_is_gone_and_it_is() {
+        // A keyed service is stopped for real (the production stop, which drops
+        // its endpoint key), then something still answers with its model, so the
+        // run aborts. The abort must say the key was dropped, and the key must
+        // actually be gone: the message and the state asserted together.
+        let endpoint = ServingEndpoint::serving("amd/keyed-model");
+        let (root, paths) = test_paths("uninstall-keyed-survivor");
+        let mut server = std::process::Command::new("sleep")
+            .arg("60")
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn the managed server stand-in");
+        let pid = server.id();
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-keyed",
+            "vllm",
+            "amd/keyed-model",
+            "amd/keyed-model",
+            "127.0.0.1",
+            endpoint.port,
+            "managed",
+            pid,
+            None,
+            None,
+            None,
+        );
+        record.engine_pid = Some(pid);
+        record.supervisor_start_ticks = rocm_core::process_start_ticks(pid);
+        record.status = "ready".to_owned();
+        record.write().expect("write record");
+        endpoint_keys::store_endpoint_api_key(&paths, "svc-keyed", "live-secret")
+            .expect("store the key");
+        assert!(endpoint_keys::endpoint_api_key(&paths, "svc-keyed").is_some());
+
+        let report = stop_managed_services_before_uninstall(&paths).expect("the pass runs");
+        let message = format!(
+            "{:#}",
+            uninstall_removal_gate(&report).expect_err("the survivor aborts the run")
+        );
+        assert!(
+            message.contains("the stop already dropped this service's endpoint key"),
+            "{message}"
+        );
+        assert_eq!(
+            endpoint_keys::endpoint_api_key(&paths, "svc-keyed"),
+            None,
+            "the message claims the key was dropped: {message}"
+        );
+        let _ = server.wait();
+        drop(endpoint);
+        let _ = fs::remove_dir_all(root);
+    }
+
     // Gated to Linux with its siblings: nothing here is Linux-specific (loopback HTTP and an injected stop), but no Windows lane has run it yet.
     #[cfg(target_os = "linux")]
     #[test]

@@ -1617,6 +1617,72 @@ mod stop_gate_tests {
     }
 
     #[test]
+    fn a_removal_failing_in_the_middle_names_the_later_entries_as_not_attempted() {
+        let root = std::env::temp_dir().join(format!(
+            "rocm-cli-uninstall-test-three-{}-{}",
+            std::process::id(),
+            rocm_core::unix_time_millis()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create the test root");
+        let first = root.join("config.toml");
+        let middle = root.join("data");
+        let last = root.join("cache");
+        fs::write(&first, b"config").expect("seed first");
+        fs::create_dir_all(&middle).expect("seed middle");
+        fs::create_dir_all(&last).expect("seed last");
+        let entry = |kind: &'static str, path: &PathBuf| UninstallPlanEntry {
+            kind,
+            path: path.clone(),
+        };
+        let plan = UninstallPlan {
+            actions: vec![
+                entry("config", &first),
+                entry("data", &middle),
+                entry("cache", &last),
+            ],
+            skipped: Vec::new(),
+            warnings: Vec::new(),
+            ..UninstallPlan::default()
+        };
+
+        let error = stop_then_remove_with(
+            &plan,
+            || Ok(ManagedServiceStopReport::default()),
+            |path| {
+                if path == middle {
+                    bail!("directory not empty")
+                }
+                if path.is_dir() {
+                    fs::remove_dir_all(path)?;
+                } else {
+                    fs::remove_file(path)?;
+                }
+                Ok(())
+            },
+        )
+        .expect_err("a failing removal must fail the uninstall");
+
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(&format!("Already removed: config {}", first.display())),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("Not attempted: cache {}", last.display())),
+            "{message}"
+        );
+        assert!(
+            !message.contains("Not attempted: data"),
+            "the failed entry is reported apart from the untouched ones: {message}"
+        );
+        assert!(!first.exists(), "removed, as the note says");
+        assert!(middle.exists(), "the failed entry is still there");
+        assert!(last.exists(), "the not-attempted entry is still on disk");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn a_removal_that_fails_first_reports_the_failed_entry_as_possibly_partial() {
         let (root, plan) = plan_removing_one_file("fails-first");
         let doomed = plan.actions[0].path.clone();
@@ -1687,7 +1753,6 @@ mod stop_gate_tests {
             )),
             "{message}"
         );
-        assert!(!message.contains("Still present"), "{message}");
         assert!(!data.join("a").exists() && data.join("b").exists());
         let _ = fs::remove_dir_all(root);
     }

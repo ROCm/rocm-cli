@@ -148,6 +148,8 @@ Feature: Release install lifecycle
     And a local server this machine manages is running
     When the user uninstalls from the installed binary
     Then the removal is reported as complete
+    And the uninstall plan says the managed servers will be stopped before removal
+    And the uninstall result says one managed service was stopped
     And the local server this machine manages is no longer running
     And the installed rocm and rocmd binaries are gone
     And the isolated config, data, and cache folders are gone
@@ -314,6 +316,8 @@ Feature: Release install lifecycle
     And a local server this machine manages is running
     When the user uninstalls from the installed binary
     Then the removal is reported as complete
+    And the uninstall plan says the managed servers will be stopped before removal
+    And the uninstall result says one managed service was stopped
     And the local server this machine manages is no longer running
     And the non-running installed rocmd binary is gone
     And the isolated config, data, and cache folders are gone
@@ -346,6 +350,7 @@ Feature: Release install lifecycle
     When the user uninstalls from the installed binary
     Then the removal is reported as complete
     And the uninstall plan says the background helper will be stopped
+    And the uninstall result says the background helper was stopped
     And the background helper is no longer running
     And the isolated config, data, and cache folders are gone
 

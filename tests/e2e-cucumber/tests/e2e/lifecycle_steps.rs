@@ -18,7 +18,7 @@
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use cucumber::{given, then, when};
 use e2e_cucumber::mock_server::{ServiceRecordOptions, write_service_record_with};
@@ -629,6 +629,9 @@ fn spawn_long_lived_child() -> std::process::Child {
         command
     };
     command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
         .expect("failed to start the managed server stand-in")
 }
@@ -1648,12 +1651,39 @@ async fn then_background_helper_stopped(world: &mut E2eWorld) {
 
 #[then("the uninstall plan says the background helper will be stopped")]
 async fn then_plan_names_helper(world: &mut E2eWorld) {
-    // Asserted next to the outcome scenario 26 checks in its following steps:
+    // Asserted next to the outcome the `lifecycle-linux-uninstall-stops-background-helper` scenario checks in its following steps:
     // the plan is only worth reading if the stop it promises happens.
     let out = &state(world).last_output;
     assert!(
         out.contains("the background helper (rocmd, pid") && out.contains("will be stopped"),
         "the plan did not say the helper will be stopped:\n{out}"
+    );
+}
+
+#[then("the uninstall plan says the managed servers will be stopped before removal")]
+async fn then_plan_names_servers(world: &mut E2eWorld) {
+    let out = &state(world).last_output;
+    assert!(
+        out.contains("those servers will be stopped before removal"),
+        "the plan did not say the managed servers will be stopped before removal:\n{out}"
+    );
+}
+
+#[then("the uninstall result says one managed service was stopped")]
+async fn then_result_names_stopped_service(world: &mut E2eWorld) {
+    let out = &state(world).last_output;
+    assert!(
+        out.contains("stopped 1 managed service(s) before removal"),
+        "the result did not report the stopped service:\n{out}"
+    );
+}
+
+#[then("the uninstall result says the background helper was stopped")]
+async fn then_result_names_stopped_helper(world: &mut E2eWorld) {
+    let out = &state(world).last_output;
+    assert!(
+        out.contains("stopped the background helper (rocmd)"),
+        "the result did not report the stopped helper:\n{out}"
     );
 }
 
@@ -1676,7 +1706,7 @@ async fn then_managed_server_still_running(world: &mut E2eWorld) {
 async fn then_cache_only_says_left_running(world: &mut E2eWorld) {
     let out = &state(world).last_output;
     assert!(
-        out.contains("are left running") || out.contains("left running"),
+        out.contains("so those servers are left running"),
         "the keep-binaries-and-data run did not say the server is left running:\n{out}"
     );
     assert_eq!(
