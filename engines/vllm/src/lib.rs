@@ -301,7 +301,10 @@ where
 }
 
 fn detect_response() -> DetectResponse {
-    let runtime = crate::runtime::resolve_vllm_runtime(None);
+    detect_response_for(crate::runtime::resolve_vllm_runtime(None))
+}
+
+fn detect_response_for(runtime: anyhow::Result<crate::runtime::VllmRuntime>) -> DetectResponse {
     let installed = runtime.is_ok();
     let mut notes = Vec::new();
     if cfg!(windows) {
@@ -412,6 +415,54 @@ mod tests {
     use super::*;
     use rocm_engine_protocol::ENGINE_RECIPE_CONTRACT_VERSION;
     use serde_json::json;
+
+    #[cfg(unix)]
+    #[test]
+    fn detect_reports_a_runtime_whose_extensions_do_not_import_as_unavailable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let python = dir.path().join("python");
+        std::fs::write(
+            &python,
+            "#!/bin/sh\necho '{\"failures\": [{\"module\": \"vllm._rocm_C\", \"error\": \"undefined symbol: x\"}]}'\n",
+        )
+        .expect("write stand-in interpreter");
+        std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod stand-in interpreter");
+        let runtime = crate::runtime::VllmRuntime {
+            runtime_id: "test".to_owned(),
+            env_id: "test".to_owned(),
+            command: PathBuf::from("vllm"),
+            python_executable: Some(python),
+            version: None,
+            source: "test".to_owned(),
+            sdk_root: None,
+            sdk_bin: None,
+            sdk_bin_paths: Vec::new(),
+            sdk_library_paths: Vec::new(),
+            rocm_sdk_version: None,
+        };
+        let detect = detect_response_for(Ok(runtime));
+        assert!(detect.installed);
+        let device = &detect.available_devices[0];
+        assert!(!device.available);
+        assert!(
+            device
+                .reason
+                .as_deref()
+                .is_some_and(|r| r.contains("vllm._rocm_C")),
+            "{:?}",
+            device.reason
+        );
+        assert!(
+            detect
+                .notes
+                .iter()
+                .any(|note| note.contains("undefined symbol: x")),
+            "{:?}",
+            detect.notes
+        );
+    }
 
     #[test]
     fn engine_recipe_launch_args_forward_required_flags() {
