@@ -35,17 +35,19 @@ unsupported. rocm-cli does not use a CPU fallback for this path.
 ## Lemonade backend alignment on engine install
 
 Lemonade's `resources/backend_versions.json` pins which ROCm SDK version its
-`llamacpp:rocm` backend downloads. On Linux/WSL, `rocm engines install
-lemonade` attempts to rewrite that pin to match the active ROCm SDK so the
-backend it installs is paired with the SDK actually in use, rather than
+`llamacpp:rocm` backend downloads. On Linux/WSL and Windows, `rocm engines
+install lemonade` attempts to rewrite that pin to match the active ROCm SDK so
+the backend it installs is paired with the SDK actually in use, rather than
 whatever version Lemonade shipped pinned to. The attempt is skipped outright
-on native Windows, left alone when the active SDK reports a nightly version
-rather than a plain `X.Y.Z` the alignment can match against (or no active SDK
-version can be determined at all, or Lemonade's packaged pin can't be read),
-skipped when the pin already matches the active version, and skipped on a
-host where Lemonade would select `llamacpp:vulkan` instead of `llamacpp:rocm`
-regardless (WSL2 being the documented case, and also the fallback if that
-probe itself fails), since no rewrite can make an unsupported ROCm build
+on any other OS, where no mechanism exists to verify whether a backend
+actually resolves its ROCm libraries, left alone when the active SDK reports
+a nightly version rather than a plain `X.Y.Z` the alignment can match against
+(or no active SDK version can be determined at all, or Lemonade's packaged
+pin can't be read), skipped when the pin already matches the active version,
+and skipped on a host where Lemonade would select `llamacpp:vulkan` instead of
+`llamacpp:rocm` regardless (WSL2 being the documented case, and also the
+fallback if that probe itself fails), since no rewrite can make an
+unsupported ROCm build
 resolve there.
 
 The rewrite tries two builds in order. The first keeps Lemonade's own pinned
