@@ -2070,6 +2070,31 @@ mod tests {
         assert!(plan.mutating);
     }
 
+    /// The Windows half of the same `reaches_os_release_parse` guard: a
+    /// native Windows host's driver install is `windows_validate_only`
+    /// regardless of what the local read says, since the Linux driver
+    /// install this plan guards is never attempted there. Without this half
+    /// of the guard, a Windows host whose `real_os_release()` happens to come
+    /// back `Unreadable` would wrongly take the Linux-only
+    /// `unreadable_os_release` policy instead.
+    #[test]
+    fn a_windows_host_ignores_an_unreadable_local_os_release_read() {
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
+        let read = rocm_core::hardware_root::OsRelease::Unreadable {
+            path: "/usr/lib/os-release",
+            error: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied"),
+        };
+        let plan = build_driver_install_plan_read(
+            &test_examine("windows", false),
+            &read,
+            true,
+            PrivilegeEscalation::Sudo,
+        );
+        assert_eq!(plan.policy, "windows_validate_only");
+        assert!(!plan.supported);
+        assert!(!plan.mutating);
+    }
+
     /// With a duplicated key, the plan is built from the last assignment — the
     /// one a shell keeps, and the one `rocm examine` reports, since both read
     /// through `rocm_core::os_release`.
