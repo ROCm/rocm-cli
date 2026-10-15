@@ -505,9 +505,19 @@ fn engine_recipe_enables_tool_choice(hint: Option<&EngineRecipeHint>) -> bool {
 /// bail in `serve()`. Everything it does has a side effect that must not
 /// precede that bail — a runtime-registry write, a self-managed engine install,
 /// a `ResolveModel` round-trip — and the only consumer of its answer
-/// (`reuse_existing`) is a term of that bail's condition. So it must open
-/// exactly when the bail is in play: under a GPU-required policy, on a host the
-/// probe *authoritatively* reports as having no usable AMD GPU.
+/// (`reuse_existing`) is a term of that bail's condition. So it must not open
+/// any wider than the bail's own host precondition: under a GPU-required
+/// policy, on a host the probe *authoritatively* reports as having no usable
+/// AMD GPU.
+///
+/// Not "exactly when the bail fires", and the difference is only in test-hook
+/// builds: the bail also requires `!scripted_backend_failure` and
+/// `!e2e_simulate_oom_launch()` (see the `if` below it), both of which are
+/// `cfg!(feature = "e2e-test-hooks")`/env-gated. Under those scenarios the gate
+/// can open while the bail cannot fire. That is deliberate — those hooks stand
+/// in for the GPU the lane does not have, so the reuse path they exercise must
+/// still behave as it would on a real GPU-less host — and it costs nothing in a
+/// shipped binary, where neither term can be true.
 ///
 /// `host_has_no_usable_gpu` is therefore the bail's own predicate, computed once
 /// by the caller and handed to both, so the two cannot drift apart. They did:

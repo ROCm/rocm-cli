@@ -1386,6 +1386,43 @@ async fn user_serves_live_model_requiring_a_key(world: &mut E2eWorld) {
     world.cli_rc = Some(rc);
 }
 
+/// Serve the *same* model the live planted record names, pinned to a GPU ordinal
+/// the host does not have.
+///
+/// The discriminating step of serve-29, and it only means anything on a host
+/// that has a usable GPU. There the reuse pre-gate must stay shut on
+/// `host_has_no_usable_gpu` alone — every other term is satisfied, since the
+/// planted record matches on liveness, engine and canonical model id — so
+/// `validate_pinned_gpu_index` runs first and refuses ordinal 99 before any
+/// engine or registry work. Open the gate (for instance by dropping the host
+/// predicate at `serve()`'s call site) and `validate_engine_selection_runtime`
+/// runs first instead, re-filing the planted setup manifest into the registry on
+/// the way; the paired `no runtime registry manifest was written` is what sees
+/// that.
+///
+/// No `--env-id`, unlike serve-25/28: `validate_engine_selection_runtime` only
+/// reaches `recover_setup_runtime_registration` when neither `--runtime-id` nor
+/// `--env-id` is given, so naming one would make that assertion unfalsifiable.
+/// Captured pipe output rather than a PTY, because the expected outcome is a
+/// refusal on stderr and not a deployment summary.
+#[when("the user serves that same model pinned to a GPU index that does not exist")]
+async fn user_serves_live_model_on_absent_gpu_index(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(
+        world,
+        &[
+            "serve",
+            OOM_GUIDANCE_MODEL,
+            "--engine",
+            "vllm",
+            "--gpu",
+            "99",
+        ],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
 #[when("the CLI reports the service as ready")]
 async fn when_cli_reports_ready(world: &mut E2eWorld) {
     // Read readiness from the CLI's own view (`services list`), not a direct

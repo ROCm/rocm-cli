@@ -191,9 +191,16 @@ pub fn is_control_or_line_separator(c: char) -> bool {
 /// wrong escape is *runnable* and misleading rather than obviously broken;
 /// control bytes would still reach the terminal. The canonical fallback is the
 /// branch that already exists for "this line cannot be used", and it is
-/// guaranteed to report a cause. The user's own line stays visible in the
-/// human-readable sentence beside the command (and in the log tail printed with
-/// it), so nothing is lost but the copy-paste convenience.
+/// guaranteed to report a cause.
+///
+/// What the user keeps depends on which surface they are looking at, and only
+/// one of the two shows them their own line. The vLLM engine's startup-failure
+/// hint renders the selected row beside the command and prints the log tail just
+/// above it, so there nothing is lost but the copy-paste convenience. The `rocm
+/// serve` summary's OOM note shows neither — it is one sentence plus the
+/// command — so on that surface the fallback really does withhold the failing
+/// line, and the user has to reach for `rocm services logs <service-id>` (which
+/// is what docs/manual-testing.md §5a tells them).
 ///
 /// This is the counterpart of [`strip_terminal_control_sequences`], not a
 /// duplicate of it: text rocm-cli merely *echoes* is stripped, while text it

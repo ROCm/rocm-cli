@@ -691,9 +691,13 @@ busy-GPU-versus-model-too-large breakdown. A failing line that cannot be placed
 in a shell-quoted argument intact — one containing an apostrophe, for instance —
 is replaced by a canonical vLLM OOM symptom, which reports the same cause.
 
-A line carrying **terminal control bytes** (vLLM's colourised logger, or a
-progress-bar repaint) is the one case where the two surfaces can print different
-commands for the same failure, and both are sound. The engine's own failure
+A line carrying **terminal control bytes** that an *escape sequence* is part of
+— vLLM's colourised logger, or a repaint that moves the cursor with something
+like `ESC[1A` or clears the row with `ESC[2K` — is the one case where the two
+surfaces can print different commands for the same failure, and both are sound.
+(A bare carriage-return repaint is not that case: the log is split on `\r`, so
+the allocator line comes back as a clean segment carrying no escape and the two
+surfaces quote it identically.) The engine's own failure
 message refuses the raw line and falls back to the canonical symptom. The serve
 summary reads the log *after* the engine has echoed its tail into it as the rows
 a terminal would have drawn, so the note quotes that rendered row — real text the

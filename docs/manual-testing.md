@@ -487,8 +487,9 @@ Expected result:
   it as rendered rows, so that row is what it quotes. Do not mark this a failure:
   the engine's own failure message *does* fall back to the canonical symptom for
   the same line, so the two surfaces can print different `--symptom` arguments
-  for one failure and both are correct (README, "A line carrying terminal control
-  bytes"; pinned by
+  for one failure and both are correct (see
+  [When a serve runs out of GPU memory](../README.md#when-a-serve-runs-out-of-gpu-memory)
+  in the README; pinned by
   `the_colourised_round_trip_quotes_the_row_the_terminal_drew`).
 - If the pre-launch low-VRAM warning already printed the
   `--gpu-memory-utilization` advice for this GPU, the OOM note does not repeat

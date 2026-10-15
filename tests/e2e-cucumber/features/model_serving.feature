@@ -432,3 +432,36 @@ Feature: Model serving
     Then serving is refused before any engine starts
     And the user is told no AMD GPU was detected
     And the user is not told to stop the running server
+
+  # The reuse pre-gate's OTHER half, and the only lane that can see it. serve-25,
+  # 27 and 28 all run on GPU-less hosts, where `host_has_no_usable_gpu` is true
+  # and the gate's outcome is decided entirely by the live-service term — so none
+  # of them can tell the current gate from the one it replaced. Neither can the
+  # unit test (`the_reuse_pregate_stays_shut_on_a_host_that_has_a_usable_gpu`):
+  # it calls `reuse_pregate_opens` directly, so it pins the helper but not
+  # `serve()`'s decision to pass the host predicate into it. Drop that argument
+  # at the call site and the whole suite stays green.
+  #
+  # This scenario is the discriminator, and it needs a real GPU: on a host that
+  # HAS one the gate must stay shut, so `--gpu` validation keeps the position
+  # #267 (`945d81b`) gave it and an out-of-range ordinal is refused before any
+  # engine or registry work. The planted record matches on liveness, engine and
+  # model, so the live-service term is TRUE here — the host predicate is the only
+  # thing holding the gate shut, which is exactly what makes the mutation visible.
+  #
+  # `setup names an unregistered runtime folder` is what makes the ordering
+  # observable, the same way it does in serve-27: it plants the one state that
+  # makes `recover_setup_runtime_registration`'s write reachable. No `--env-id`
+  # here, deliberately — `validate_engine_selection_runtime` only reaches that
+  # recovery when neither `--runtime-id` nor `--env-id` is given, so passing one
+  # would make the last Then vacuous. With the gate wrongly open the manifest is
+  # re-filed before the refusal and that Then goes red; with it shut the registry
+  # is still empty.
+  @id:serve-live-reuse-candidate-does-not-preempt-gpu-validation @requires-gpu @requires-os:linux
+  Scenario: serve-29 - A reusable live service does not pull engine work ahead of --gpu validation
+    Given a live managed vLLM serve has an OOM startup log
+    And setup names an unregistered runtime folder
+    When the user serves that same model pinned to a GPU index that does not exist
+    Then serving is refused before any engine starts
+    And the user is told that GPU index is unavailable
+    And no runtime registry manifest was written

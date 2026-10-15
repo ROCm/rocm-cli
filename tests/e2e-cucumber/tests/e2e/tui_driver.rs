@@ -172,12 +172,16 @@ impl TuiSession {
 
     /// As [`spawn`](Self::spawn), but overlays `extra_env` onto the child only.
     ///
-    /// Two kinds of step need this. One sets a variable the CLI reads at startup
-    /// (e.g. the test-only `ROCM_E2E_SIMULATE_OOM_LAUNCH` fault-injection
-    /// switch). The other has a `Given` that planted scenario-owned state (e.g. a
-    /// shell rc file) which only the piped `run_rocm_with_env` path would
-    /// otherwise pick up, since [`pty_env`]'s `HOME`/lack of `SHELL` are the
-    /// PTY's own isolation rather than that state.
+    /// A step needs this when a `Given` has planted scenario-owned state that
+    /// only the piped `run_rocm_with_env` path would otherwise pick up, since
+    /// [`pty_env`]'s `HOME`/lack of `SHELL` are the PTY's own isolation rather
+    /// than that state. The sole caller today is the `fix`-prompt step in
+    /// `diagnose_steps.rs`, which overrides `HOME`/`SHELL` so the fix resolves
+    /// to the shell rc file its `Given` wrote.
+    ///
+    /// Not the route a test-only CLI switch takes: `ROCM_E2E_SIMULATE_OOM_LAUNCH`
+    /// and friends go onto `world.command_env`, which plain [`spawn`](Self::spawn)
+    /// already applies, so they need no overlay here.
     ///
     /// The vars are applied per-child on the `CommandBuilder`, never via the
     /// shared process environment, so concurrent scenarios on the no-GPU lane
