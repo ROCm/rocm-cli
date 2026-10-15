@@ -176,7 +176,7 @@ fn stop_then_remove_writing_to(
 /// the record of the change are all still there to retry with. Then the
 /// config, data, and cache go, while `rocm` is still there to retry a failure
 /// with; then the binaries, and the record only once every change is undone.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn execute_plan(plan: &UninstallPlan, report: &mut dyn FnMut(String)) -> Result<()> {
     execute_plan_with(plan, report, &remove_path)
 }

@@ -712,10 +712,10 @@ pub(crate) fn stop_managed_services_before_uninstall(
 }
 
 /// [`stop_managed_services_before_uninstall`] with a stop that reports only a
-/// `status`, which counts as confirmed when it reads `stopped`. Test-only: the
+/// `status`, which counts as confirmed when it reads `stopped`. Unix-test-only: the
 /// production stop decides on the confirmed flag, and the tests that care drive
 /// [`stop_managed_services_confirmed_with`] directly.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn stop_managed_services_with(
     paths: &AppPaths,
     stop_service: impl Fn(&AppPaths, &str) -> Result<serde_json::Value>,
