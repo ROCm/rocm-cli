@@ -567,7 +567,10 @@ Feature: Diagnosing failures and listing fixes
   # scenario's own root reports gfx_target_version 90012 (gfx90c), and a
   # stand-in `lspci` lists an empty bus so the runner's real cards are not
   # described. The same mechanism `examine-23` uses, so this runs on every Linux
-  # lane, GPU or not.
+  # lane, GPU or not -- WSL2 included, since `@requires-os:linux` matches a host
+  # whose `os_family` is `linux` and WSL2's is. Every `rocm` call in the scenario
+  # therefore has to carry the planted host root, or the WSL2 lane answers about
+  # itself instead of about the simulated machine.
   @id:diagnose-unsupported-gpu-is-explained-not-fixed @requires-os:linux
   Scenario: diagnose-38 - A GPU with no ROCm build is explained, and nothing is offered to install
     Given a machine whose only GPU is one ROCm has no build for

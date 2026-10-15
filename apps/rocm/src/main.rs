@@ -262,9 +262,10 @@ enum Command {
     /// you: AUTO means this command carries the change out; NEEDS-ARG means it
     /// will, once told what to act on; PRINT-ONLY means it prints the steps for
     /// you to run yourself (typically because they need sudo or a reboot); and
-    /// DIAGNOSE-ONLY means no reliable fix exists and nothing will be changed
-    /// (no catalog entry carries this marker today; it is reserved for a
-    /// future detect-but-cannot-repair failure).
+    /// DIAGNOSE-ONLY means no reliable fix exists, so running it names the
+    /// problem and changes nothing (`info-20-gpu-no-rocm-support` is the entry
+    /// marked that way today: a GPU ROCm has no runtime build for is a fact
+    /// about the hardware, not something to put right).
     /// Use `--dry-run` to see any fix's plan without changing anything.
     Fix {
         /// Fix id, e.g. fix-4-render-group. Omit to list available fixes.

@@ -916,7 +916,13 @@ const RECIPES: &[FixRecipe] = &[
         verify: "",
         notes: &[
             "HSA_OVERRIDE_GFX_VERSION is NOT a workaround here: it makes the runtime load kernels built for another architecture, which faults at runtime rather than adding support.",
-            "`rocm serve` already picks a Vulkan engine on this host, so nothing has to change to use the GPU for inference.",
+            // Not "`rocm serve` already picks a Vulkan engine on this host":
+            // that is a claim about the CLI's own runtime behaviour which this
+            // catalog does not decide. A configured default engine outranks
+            // `default_engine_for_host`, and Lemonade picks its llama.cpp
+            // backend itself. The matching note in `diagnose`'s `check_20` is
+            // worded the same way.
+            "To use this GPU for inference, serve with a Vulkan-capable engine. If you have set a default engine that needs ROCm, that one will not work here; `rocm serve --engine lemonade` does not need it.",
         ],
         doc_url: Some(
             "https://rocm.docs.amd.com/projects/install-on-linux/en/latest/reference/system-requirements.html",

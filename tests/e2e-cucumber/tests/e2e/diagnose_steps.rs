@@ -2545,10 +2545,47 @@ async fn assert_unsupported_gpu_has_no_fix(world: &mut E2eWorld) {
         text.contains("apply with: rocm fix info-20-gpu-no-rocm-support"),
         "every cause carries the command that acts on it, this one included:\n{text}"
     );
-    let (_, _, rc) = crate::run_rocm(world, &["fix", "info-20-gpu-no-rocm-support", "--yes"]);
+    // Run against the SAME simulated host the diagnosis was made on, not the
+    // runner's own machine. `run_rocm_with_scenario_env` in the When step
+    // consumes `world.command_env` by design, so the host root is re-applied
+    // here explicitly rather than by reaching into a drained field.
+    //
+    // This is not cosmetic. `rocm fix` gates on `fix::current_os`, which
+    // resolves WSL by probing `/dev/dxg` and `/proc/version` *through* the host
+    // root. On a WSL2 runner -- which `@requires-os:linux` selects, because WSL2
+    // reports an `os_family` of `linux` -- the unrooted command is read as os
+    // `wsl`, which this entry deliberately does not apply on, and it exits 3 for
+    // a reason that has nothing to do with the behaviour under test.
+    let host_root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("host-root");
+    let (fix_stdout, _, rc) = crate::run_rocm_with_env(
+        world,
+        &["fix", "info-20-gpu-no-rocm-support", "--yes"],
+        &[(
+            "ROCM_CLI_TEST_HOST_ROOT",
+            host_root.to_string_lossy().as_ref(),
+        )],
+    );
     assert_eq!(
         rc, 0,
-        "the id the report told the user to run must be one `rocm fix` accepts"
+        "the id the report told the user to run must be one `rocm fix` accepts:\n{fix_stdout}"
+    );
+    // Exit 0 alone is also what a PRINT-ONLY routing produces, and that one
+    // hands the user commands to run. What the report promised is that there is
+    // nothing to apply, so the promise is what gets asserted -- AGENTS.md §3.
+    assert!(
+        fix_stdout.contains("no reliable fix, so this command changes nothing"),
+        "a DIAGNOSE-ONLY id has to say it changed nothing; exit 0 on its own would \
+         equally describe a print-only fix handing over steps to carry out:\n{fix_stdout}"
+    );
+    assert!(
+        !fix_stdout.contains("Copy the commands above"),
+        "and it must not route through the print-only path, which asks for steps to be \
+         run that this entry does not have:\n{fix_stdout}"
     );
 }
 

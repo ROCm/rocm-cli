@@ -1162,12 +1162,19 @@ fn classify_amd_marketing_name(name: &str) -> (String, bool) {
 
 /// Whether a gfx target belongs to an AMD APU family.
 ///
-/// APUs: gfx90c (Vega iGPU in Renoir / Lucienne / Cezanne / Barcelo), gfx1103
-/// (Phoenix / Hawk Point) and the gfx115x parts (Strix Point / Strix Halo).
-/// Their neighbors gfx1100 / gfx1101 / gfx1102 (Navi 31 / 32 / 33) share the
-/// gfx110x prefix but are *discrete* RDNA3 GPUs, so they must not match —
-/// otherwise they inflate `has_apu` and suppress `has_discrete_amd`, which gates
-/// the iGPU+dGPU collision fix. (Target -> product per LLVM AMDGPUUsage.)
+/// APUs: gfx90c (Vega iGPU in Renoir / Lucienne / Cezanne / Barcelo), the
+/// RDNA2 iGPUs gfx1033 / gfx1035 / gfx1036 (Van Gogh, Rembrandt / Yellow Carp,
+/// Raphael), gfx1103 (Phoenix / Hawk Point) and the gfx115x parts (Strix Point /
+/// Strix Halo).
+///
+/// Their neighbours on both prefixes are *discrete* parts and must not match:
+/// gfx1100 / gfx1101 / gfx1102 (Navi 31 / 32 / 33) on gfx110x, and gfx1030 /
+/// gfx1031 / gfx1032 / gfx1034 (Navi 21 / 22 / 23 / 24) on gfx103x — which is
+/// why the gfx103x arm enumerates rather than taking a threshold the way
+/// gfx110x can. A discrete part matching here inflates `has_apu` and suppresses
+/// `has_discrete_amd`, which gates the iGPU+dGPU collision fix. (Target ->
+/// product per LLVM AMDGPUUsage; `pnp_device_id_table_agrees_about_apus` holds
+/// this list against `host_gpu`'s PCI-id table, part by part.)
 ///
 /// Two consumers rely on this, for different reasons:
 ///
@@ -1175,6 +1182,13 @@ fn classify_amd_marketing_name(name: &str) -> (String, bool) {
 ///   iGPU+dGPU device-visibility collisions;
 /// - serve's VRAM reporting, because an APU has no private VRAM — see
 ///   `vram_capacity_is_meaningful` in the `rocm` binary.
+///
+/// The second consumer is on **every** platform, not just Windows where the
+/// gfx103x arm was added for: a Linux gfx1035 host now skips serve's VRAM
+/// warning. That is the intended reading of the change and not a side effect to
+/// be narrowed away — Rembrandt has no private VRAM on Linux either, so warning
+/// about its "capacity" was reporting a number that does not mean what the
+/// warning says it means.
 ///
 /// This answers a question about the *part*, not about the host: a machine can
 /// pair an APU with a discrete card, so a true verdict here does not mean every
@@ -3060,24 +3074,69 @@ fn probe_hip_sdk_windows(e: &mut Examination) {
         let (rc, out, _) = run(&hipinfo.to_string_lossy(), &[], Duration::from_secs(15));
         if rc == 0 {
             e.hipinfo_status = "ok".to_owned();
-            for line in out.lines() {
-                if let Some(rest) = line.trim().strip_prefix("gcnArchName:")
-                    && let Some(gfx) = crate::extract_first_gfx_token(rest)
-                    && let Some(gpu) = e
-                        .gpus
-                        .iter_mut()
-                        .find(|g| g.is_amd && g.gfx_target.is_empty())
-                {
-                    gpu.gfx_target = gfx;
-                    gpu.is_apu = Some(gfx_is_apu_family(&gpu.gfx_target));
-                }
-            }
+            fill_unidentified_gpus_from_hipinfo(&mut e.gpus, &out);
         } else {
             e.hipinfo_status = format!("error rc={rc}");
         }
     } else {
         e.hipinfo_present = false;
         e.hipinfo_status = "missing".to_owned();
+    }
+}
+
+/// Fill in the `gfx_target` of AMD GPUs the Windows probes could not identify,
+/// from `hipInfo`'s `gcnArchName:` lines.
+///
+/// `hipInfo` prints one block per *visible* device and gives no stable handle
+/// tying a block to a `Win32_VideoController` row, so the pairing is positional:
+/// the Nth unidentified AMD GPU gets the Nth architecture line. That is the only
+/// correspondence available, and it is a fallback — the PCI device id and the
+/// marketing name both answer first, and better.
+///
+/// Positional pairing has to account for the GPUs that were already answered
+/// for, which is the subtlety this function exists to hold. `hipInfo` still
+/// prints a block for a card the PCI-id table resolved, but that card is no
+/// longer an empty slot, so a naive "first empty slot" walk hands *its*
+/// architecture to the next card along. The concrete case: a Radeon 680M
+/// (resolved to `gfx1035` from its device id) beside an RX 6800M (in neither
+/// table). `hipInfo` prints gfx1035 then gfx1031; the first line finds the 6800M
+/// as the only empty slot and makes it a `gfx1035` APU. That inverts both
+/// `has_apu` and `has_discrete_amd`, which gate `fix-9-igpu-dgpu`, and the
+/// second line is then dropped — the discrete card ends up described as the
+/// integrated one.
+///
+/// So an architecture already held by an identified GPU is consumed rather than
+/// assigned: one line per holder, by count, not by presence. Counting matters —
+/// two identical cards print the same name twice, and dropping every repeat
+/// would leave the second one unidentified forever.
+fn fill_unidentified_gpus_from_hipinfo(gpus: &mut [Gpu], hipinfo_stdout: &str) {
+    // What the earlier, better probes already answered. Each of these has a
+    // `gcnArchName` block of its own coming, which belongs to it.
+    let mut already_identified: Vec<String> = gpus
+        .iter()
+        .filter(|g| g.is_amd && !g.gfx_target.is_empty())
+        .map(|g| g.gfx_target.to_ascii_lowercase())
+        .collect();
+
+    for line in hipinfo_stdout.lines() {
+        let Some(rest) = line.trim().strip_prefix("gcnArchName:") else {
+            continue;
+        };
+        let Some(gfx) = crate::extract_first_gfx_token(rest) else {
+            continue;
+        };
+        if let Some(position) = already_identified.iter().position(|held| *held == gfx) {
+            already_identified.swap_remove(position);
+            continue;
+        }
+        let Some(gpu) = gpus
+            .iter_mut()
+            .find(|g| g.is_amd && g.gfx_target.is_empty())
+        else {
+            continue;
+        };
+        gpu.is_apu = Some(gfx_is_apu_family(&gfx));
+        gpu.gfx_target = gfx;
     }
 }
 
@@ -5712,6 +5771,115 @@ mod tests {
             "both gate fix-9-igpu-dgpu: has_apu={}, has_discrete_amd={}",
             e.has_apu,
             e.has_discrete_amd
+        );
+    }
+
+    /// The `hipInfo` fallback must not hand an identified GPU's architecture to
+    /// the card next to it.
+    ///
+    /// Same failure as `a_rembrandt_laptop_with_a_discrete_card_opens_the_igpu_dgpu_gate`
+    /// and the same gate underneath it, reached by the other door. The pairing
+    /// is positional, and the PCI-id lookup now fills some slots before
+    /// `hipInfo` is asked — but `hipInfo` still prints a block for every device,
+    /// including the filled ones. Walking to the "first empty slot" therefore
+    /// gives the *iGPU's* architecture to the first card the tables could not
+    /// identify.
+    ///
+    /// Concretely: a Radeon 680M resolved to gfx1035 from its device id, beside
+    /// an RX 6800M that is in neither table. `hipInfo` prints gfx1035 then
+    /// gfx1031. Unguarded, the 6800M becomes a gfx1035 APU, `has_discrete_amd`
+    /// goes false, `has_apu` is the only flag left, and `fix-9-igpu-dgpu` is
+    /// suppressed on the one host shape it exists for.
+    #[test]
+    fn hipinfo_does_not_give_an_identified_gpus_architecture_to_its_neighbour() {
+        let mut gpus = vec![
+            Gpu {
+                name: "AMD Radeon(TM) Graphics".to_owned(),
+                gfx_target: "gfx1035".to_owned(),
+                is_amd: true,
+                is_apu: Some(true),
+                ..Gpu::default()
+            },
+            // In neither table: no device-id arm, and "RX 6800M" carries no APU
+            // keyword, so it arrives here genuinely unidentified.
+            Gpu {
+                name: "AMD Radeon RX 6800M".to_owned(),
+                is_amd: true,
+                is_apu: Some(false),
+                ..Gpu::default()
+            },
+        ];
+        fill_unidentified_gpus_from_hipinfo(
+            &mut gpus,
+            "--------------------------------------------------------------------------------\n\
+             device#                           0\n\
+             Name:                             AMD Radeon(TM) Graphics\n\
+             gcnArchName:                      gfx1035\n\
+             device#                           1\n\
+             Name:                             AMD Radeon RX 6800M\n\
+             gcnArchName:                      gfx1031\n",
+        );
+        assert_eq!(
+            gpus[0].gfx_target, "gfx1035",
+            "the identified iGPU keeps what the device id said: {:?}",
+            gpus[0]
+        );
+        assert_eq!(
+            gpus[1].gfx_target, "gfx1031",
+            "the discrete card must get its OWN architecture line, not the one \
+             already spoken for by the iGPU: {:?}",
+            gpus[1]
+        );
+        assert_eq!(
+            gpus[1].is_apu,
+            Some(false),
+            "and must not be relabelled integrated, which is what turns \
+             has_discrete_amd off: {:?}",
+            gpus[1]
+        );
+
+        let mut e = Examination {
+            gpus,
+            ..Examination::default()
+        };
+        summarise_gpu_categories(&mut e);
+        assert!(
+            e.has_apu && e.has_discrete_amd,
+            "both gate fix-9-igpu-dgpu: has_apu={}, has_discrete_amd={}",
+            e.has_apu,
+            e.has_discrete_amd
+        );
+    }
+
+    /// Consuming by count and not by presence: two identical cards print the
+    /// same architecture twice, and only one of them was identified.
+    ///
+    /// The cheap form of the guard above — "skip any line whose architecture
+    /// some GPU already holds" — leaves the second card unidentified forever on
+    /// this machine, which is the regression the guard must not introduce.
+    #[test]
+    fn hipinfo_still_identifies_a_second_card_of_the_same_architecture() {
+        let mut gpus = vec![
+            Gpu {
+                gfx_target: "gfx1100".to_owned(),
+                is_amd: true,
+                is_apu: Some(false),
+                ..Gpu::default()
+            },
+            Gpu {
+                is_amd: true,
+                ..Gpu::default()
+            },
+        ];
+        fill_unidentified_gpus_from_hipinfo(
+            &mut gpus,
+            "gcnArchName:  gfx1100\ngcnArchName:  gfx1100\n",
+        );
+        assert_eq!(
+            gpus[1].gfx_target, "gfx1100",
+            "one line is consumed by the GPU that already holds that target; the \
+             other still belongs to the card nothing has identified: {:?}",
+            gpus[1]
         );
     }
 

@@ -2168,11 +2168,20 @@ fn check_20_gpu_unsupported_by_rocm(e: &Examination, _symptom: &str) -> Diagnosi
     // command a lie for this one id and left `--json` consumers a null to learn
     // about.
     let fix = Fix {
-        summary: "No ROCm/HIP runtime build exists for this architecture, so there is nothing to install or configure. Use a Vulkan-based engine, which is what `rocm serve` already picks here.".to_owned(),
+        // Deliberately a claim about the GPU and not about what `rocm serve`
+        // will do. "`rocm serve` already picks a Vulkan engine on this host" was
+        // neither: `default_engine_for_host` answers lemonade here, but a
+        // configured default outranks it, and whether Lemonade then lands on
+        // Vulkan is its own runtime choice over
+        // `LLAMACPP_BACKEND_PRIORITY ["rocm","vulkan"]`. A note promising an
+        // outcome this catalog does not decide would be false for anyone who
+        // had set an engine. The wording below matches `therock`'s refusal for
+        // the same hardware, which is the other place a user meets this fact.
+        summary: "No ROCm/HIP runtime build exists for this architecture, so there is nothing to install or configure. Vulkan-based engines do not use ROCm and work on it; Lemonade, the default engine here, is one.".to_owned(),
         fix_id: ID.to_owned(),
         notes: vec![
             "HSA_OVERRIDE_GFX_VERSION is NOT a workaround here: it makes the runtime load kernels built for another architecture, which faults at runtime rather than adding support.".to_owned(),
-            "`rocm serve` already picks a Vulkan engine on this host, so nothing has to change to use the GPU for inference.".to_owned(),
+            "To use this GPU for inference, serve with a Vulkan-capable engine. If you have set a default engine that needs ROCm, that one will not work here; `rocm serve --engine lemonade` does not need it.".to_owned(),
         ],
         ..Fix::default()
     };
@@ -3215,6 +3224,62 @@ mod tests {
             no_hip.score, 0,
             "with no HIP-based setup the SDK's state is not evidence of \
              anything: {no_hip:?}"
+        );
+    }
+
+    #[test]
+    fn fix_13_does_not_contradict_itself_about_whether_the_hip_sdk_is_there() {
+        // The PyTorch clause has two wordings, chosen on `sdk_path.is_empty()`,
+        // and the choice had nothing standing on it: forcing that condition to
+        // `true` left every fix-13 test green while putting "the HIP SDK is not
+        // present on this host" in the same finding as "HIP SDK at C:\... but
+        // hipInfo.exe is missing". A user reading two opposite lines under one
+        // cause has no way to tell which is true, which is the whole reason the
+        // branch exists.
+        //
+        // Both arms are asserted together because the failure is a pair: the
+        // wording that is right for one host is wrong for the other, so a test
+        // holding only one arm is satisfied by a constant.
+        let host = |sdk_path: &str| Examination {
+            os_family: "windows".to_owned(),
+            has_amd_gpu: true,
+            hip_sdk_path: sdk_path.to_owned(),
+            hipinfo_present: false,
+            framework: "pytorch".to_owned(),
+            framework_rocm_version: "hip=7.14.60850".to_owned(),
+            framework_source: "path".to_owned(),
+            ..Examination::default()
+        };
+
+        let absent = check_13_hip_sdk_missing(&host(""), "");
+        let absent_text = absent.evidence.join("\n");
+        assert!(
+            absent_text.contains("the HIP SDK is not present on this host"),
+            "with no SDK anywhere, the PyTorch clause has to say the SDK is \
+             absent: {absent:?}"
+        );
+        assert!(
+            !absent_text.contains("needs a working system HIP SDK"),
+            "and must not instead imply one is there but not working: {absent:?}"
+        );
+
+        let broken = check_13_hip_sdk_missing(&host("C:\\Program Files\\AMD\\ROCm\\6.4"), "");
+        let broken_text = broken.evidence.join("\n");
+        assert!(
+            broken_text.contains("needs a working system HIP SDK"),
+            "with an SDK directory present, the clause is about it not working, \
+             not about it being absent: {broken:?}"
+        );
+        assert!(
+            !broken_text.contains("the HIP SDK is not present on this host"),
+            "saying the SDK is absent beside `HIP SDK at C:\\... but hipInfo.exe \
+             is missing` puts two contradictory lines in one finding: {broken:?}"
+        );
+        // And the line it would contradict is in that same finding, so the
+        // assertion above is about a real pairing and not a hypothetical one.
+        assert!(
+            broken_text.contains("hipInfo.exe is missing"),
+            "the arm this wording exists to agree with must be present: {broken:?}"
         );
     }
 

@@ -1653,6 +1653,38 @@ compare the new entry on every lane. A
 scenario that runs the check itself would need the Windows lane and a host
 with an old runtime installed.
 
+### A GPU with no ROCm build
+
+`info-20-gpu-no-rocm-support` is the catalog's one `DIAGNOSE-ONLY` entry: every
+AMD GPU on the host identifies as a target ROCm has never shipped a runtime
+build for (today only `gfx90c`, the Vega iGPU in Renoir / Lucienne / Cezanne /
+Barcelo). `rocm fix` still answers for the id — by naming the problem, changing
+nothing and exiting 0 — because `diagnose` prints `apply with: rocm fix <id>`
+for every cause it reports.
+
+`diagnose-38` covers it end to end. The host is simulated rather than required:
+a KFD node planted under the scenario's own root reports `gfx_target_version
+90012`, so it runs on **every** Linux lane, WSL2 included — `@requires-os:linux`
+matches a host whose `os_family` is `linux`, and WSL2's is. Every `rocm` call in
+that scenario therefore has to carry `ROCM_CLI_TEST_HOST_ROOT`: `rocm fix` gates
+on the OS, and `fix::current_os` resolves WSL *through* the host root, so an
+unrooted call on a WSL2 runner is read as `wsl` — an OS this entry deliberately
+does not apply on — and exits 3.
+
+```bash
+cargo xtask e2e -- -n '(diagnose-38)'
+```
+
+The other half of the same change — `fix-13-hip-sdk-missing` no longer firing
+just because no HIP SDK is installed — has **no** end-to-end coverage and cannot
+have any. `check_13_hip_sdk_missing` returns early on every non-Windows host, so
+on a Linux lane that early return alone satisfies "no cause tells this user to
+install the HIP SDK"; the assertion would still hold with `check_20` deleted.
+The gate itself is held by unit tests in `diagnose.rs`
+(`fix_13_does_not_fire_on_a_lemonade_vulkan_host_with_no_hip_evidence` and its
+neighbours) and by the Windows manual check in
+[manual-testing.md](manual-testing.md), in the Ryzen 4000/5000 section.
+
 ## Model Fit Preflight
 
 `rocm diagnose --model <ref>` answers whether a curated model will run on this
