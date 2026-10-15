@@ -25,7 +25,7 @@ use rocm_core::{AppPaths, ExamineSummary, shell_command_for_host};
 use serde::{Deserialize, Serialize};
 
 use crate::cli_report;
-use crate::runtime_install_finalize::{empty_as_unknown, read_os_release};
+use crate::runtime_install_finalize::{empty_as_unknown, real_os_release};
 
 pub(crate) fn install_driver(
     paths: &AppPaths,
@@ -35,7 +35,7 @@ pub(crate) fn install_driver(
 ) -> std::result::Result<DriverInstallResult, DriverInstallError> {
     let examine =
         ExamineSummary::gather().map_err(|source| DriverInstallError::new(source, false))?;
-    let os_release = read_os_release();
+    let os_release = real_os_release();
     // The only place the real privilege level is read; every builder below takes
     // it as a parameter so both branches stay testable on any host.
     let plan =
@@ -1943,7 +1943,7 @@ mod tests {
     }
 
     /// `build_driver_install_plan_read` is the one seam `install_driver` hands
-    /// its `read_os_release()` result to. Both are now one-line delegations
+    /// its `real_os_release()` result to. Both are now one-line delegations
     /// to `hardware_root::read_os_release`, so reverting either back to a raw
     /// `/etc/os-release` read is a type error here, not a silent regression.
     /// This still pins the behaviour at the seam itself: an `OsRelease` that

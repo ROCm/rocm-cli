@@ -1303,10 +1303,7 @@ mod tests {
                 ("ID=derivative\nID_LIKE=\"rhel fedora\"\n", &dnf),
             ] {
                 assert_eq!(
-                    &plan_for_os_release_read(
-                        &crate::hardware_root::OsRelease::found(text),
-                        build
-                    ),
+                    &plan_for_os_release_read(&crate::hardware_root::OsRelease::found(text), build),
                     expected,
                     "{label}: {text:?}"
                 );
@@ -1429,7 +1426,7 @@ mod tests {
     }
 
     /// `install_hint_for_read`/`plan_for_os_release_read` are the one seam
-    /// `openmpi::real_os_release()` and `runtime_install_finalize::read_os_release()`
+    /// `openmpi::real_os_release()` and `runtime_install_finalize::real_os_release()`
     /// hand their result to — both now one-line delegations to
     /// `hardware_root::read_os_release`, so reverting either back to a raw
     /// `/etc/os-release` read is a type error here, not a silent regression.

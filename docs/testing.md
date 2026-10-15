@@ -1651,8 +1651,9 @@ erroring for a reason other than absence) against an injected temp directory
 rather than the real host. The `a_fallback_read_plans*`/
 `an_unreadable_file*`/`distro_name_names_an_unreadable_file` tests in
 `rocm-core` and `rocm` construct an `OsRelease` directly — bypassing the real
-read entirely, since the production functions that do it (`real_os_release`,
-`runtime_install_finalize::read_os_release`) read the real machine
+read entirely, since the production functions that do it
+(`openmpi::real_os_release`, `runtime_install_finalize::real_os_release`)
+read the real machine
 unconditionally and cannot honour a simulated root — to pin that a
 fallback-sourced read plans and hints identically to a primary-sourced one
 with the same text, and that a file which exists but cannot be read is named
