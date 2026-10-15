@@ -59,15 +59,16 @@ concurrency:
   # a pull_request, push, merge_group and workflow_dispatch run can never share a
   # group. A PR run is keyed on the PR NUMBER, so a new push to that PR
   # supersedes the older run. A push or merge_group run is keyed on its commit
-  # SHA, unique per run: even with cancel-in-progress off, GitHub replaces a
-  # still-PENDING run in a shared group with a newer one, which would drop the
-  # record of a commit that landed. Manual dispatches get a unique (run_id) group
+  # ref AND commit SHA, unique per run: even with cancel-in-progress off, GitHub
+  # replaces a still-PENDING run in a shared group with a newer one, which would
+  # drop the record of a commit that landed. (The ref is part of the key so a
+  # release branch cut at main's head does not queue behind main's run.) Manual dispatches get a unique (run_id) group
   # so a stuck dispatch never blocks later dispatches.
   group: >-
     ${{ github.workflow }}-${{ github.event_name }}-${{
       github.event_name == 'pull_request' && github.event.pull_request.number
       || github.event_name == 'workflow_dispatch' && github.run_id
-      || github.sha }}
+      || format('{0}-{1}', github.ref, github.sha) }}
   # Supersede only pull_request runs; every other run has a group of its own.
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
@@ -89,8 +90,9 @@ jobs:
       pull-requests: read
     outputs:
       heavy: ${{ steps.filter.outputs.heavy || steps.all.outputs.forced }}
-      # Narrow GPU-serve gate; forced true off-PR so the merge queue always runs
-      # the full matrix and its required checks are never starved.
+      # Narrow GPU-serve gate; forced true off-PR so the merge queue runs the
+      # full matrix (every lane but MI300X, which skips merge_group) and its
+      # required checks are never starved.
       serve: ${{ steps.filter.outputs.serve || steps.all.outputs.forced }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -171,8 +173,8 @@ jobs:
     # required build-and-test / mock e2e remain the authoritative build gate.
     #
     # Not on merge_group: this check is not required for merging, and the queue
-    # does not wait for it, so with a single MI300X runner the queue entry's job
-    # stayed queued long after its PR merged — an orphaned run that only delays
+    # does not wait for it, so with the limited MI300X runner capacity the queue
+    # entry's job stayed queued long after its PR merged — an orphaned run that only delays
     # the PR runs behind it. (The other lanes still run in the merge queue.)
     if: >-
       always()

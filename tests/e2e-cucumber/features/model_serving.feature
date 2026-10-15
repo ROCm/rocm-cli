@@ -35,7 +35,7 @@ Feature: Model serving
   # vLLM per-PR canary: one real vLLM serve runs on every PR so a broken serve is
   # caught before merge, while the heavier `@merge-queue` serves
   # (`serve-default-engine-working-endpoint`, `serve-default-engine-inference`,
-  # and `serve-readiness-contract`) run only in the merge queue.
+  # and `serve-readiness-contract`) run only in the merge queue (not on MI300X).
   @id:serve-vllm-inference @requires-gpu @requires-engine:vllm
   Scenario: serve-05 - A served model responds to inference requests on vLLM
     Given a managed runtime is active

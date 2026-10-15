@@ -3637,8 +3637,9 @@ fi
     #[test]
     fn workflows_use_distinct_concurrency_groups() {
         // Isolation comes from the group KEY differing per workflow. Extract the
-        // actual concurrency.group value from each and assert (a) both keep
-        // supersession, (b) both key on github.workflow, and (c) the two group
+        // actual concurrency.group value from each and assert (a) ci.yml keeps
+        // supersession (e2e-selfhosted.yml scopes it to pull_request, see
+        // `self_hosted_supersession_is_scoped_to_pull_requests`), (b) both key on github.workflow, and (c) the two group
         // expressions and workflow names differ — so at runtime the groups are
         // distinct and an offline-runner stall in one can't hold the other.
         let ci = read_workflow("ci.yml");
@@ -4451,7 +4452,7 @@ jobs:
         let sh = read_workflow("e2e-selfhosted.yml");
         let group = concurrency_group(&sh);
         assert!(
-            group.contains("github.event_name"),
+            group.contains("${{ github.workflow }}-${{ github.event_name }}-"),
             "the group must carry the event name so runs of different triggers never \
              share a group (got `{group}`)"
         );
@@ -4463,11 +4464,12 @@ jobs:
             group.contains("github.run_id"),
             "a workflow_dispatch run must keep a unique group (got `{group}`)"
         );
-        // Not the ref: GitHub replaces a still-pending run in a shared group even
-        // with cancel-in-progress off, so two pushes to `main` would drop one.
+        // Ref AND commit: GitHub replaces a still-pending run in a shared group
+        // even with cancel-in-progress off, so a ref-only key would let a second
+        // push to `main` drop the first.
         assert!(
-            group.contains("github.sha") && !group.contains("github.ref"),
-            "a push or merge_group run must be keyed on its commit, not the ref \
+            group.contains("format('{0}-{1}', github.ref, github.sha)"),
+            "a push or merge_group run must be keyed on its ref and commit \
              (got `{group}`)"
         );
         assert_eq!(
@@ -4496,7 +4498,8 @@ jobs:
                 .join(" ")
         };
         assert!(
-            gate("e2e-gpu").contains("github.event_name != 'merge_group'"),
+            normalized_whitespace(&gate("e2e-gpu"))
+                .contains("&& github.event_name != 'merge_group' &&"),
             "e2e-gpu (MI300X) must not run on merge_group events"
         );
         assert!(

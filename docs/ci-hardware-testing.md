@@ -263,11 +263,13 @@ otherwise `vllm` is only preferred for the `*-dcgpu` families and
 The GPU jobs (in `e2e-selfhosted.yml`) run automatically on `push`,
 `pull_request`, and `merge_group` (every GPU lane except MI300X, which is not
 required for merging and so is skipped in the merge queue rather than left
-queued behind a single runner after its PR has merged) when the workflow's own
-`changes` job's `serve` path filter is `true`. A new push to a pull request
+queued on limited runner capacity after its PR has merged) when the workflow's
+own `changes` job's `serve` path filter is `true`. A new push to a pull request
 cancels that PR's older run; push, `merge_group` and manual runs each get a
-group of their own, so none is cancelled or replaced by another. `push` fires on `main` and on any `release/**`
-branch, so pushing to a release branch runs the full self-hosted matrix ahead
+group of their own, so none is cancelled or replaced by another. The heavy
+`@merge-queue` serves therefore no longer run on MI300X (the vLLM host), only
+on the other lanes; the per-PR vLLM canary is the vLLM serve coverage before a
+change lands. `push` fires on `main` and on any `release/**` branch, so pushing to a release branch runs the full self-hosted matrix ahead
 of cutting the `v*` tag that `release.yml` builds/publishes from — this is the
 release-candidate regression gate; `pull_request` fires against any base
 branch. `serve` is narrower than `heavy`: it matches only
@@ -277,7 +279,8 @@ plus broad-dependency safety nets), **not** a blanket `**/*.rs`. So a Rust chang
 that cannot affect serving — e.g. a dashboard-only or unrelated-crate PR — skips
 the heavy GPU matrix, while compile coverage for every crate still runs on
 `ci.yml`'s always-on build/test lanes. Off `pull_request` (push/merge_group) the
-filter is forced `true`, so the full matrix always runs there. Unlike the
+filter is forced `true`, so the full matrix (minus MI300X in the merge queue)
+always runs there. Unlike the
 pre-split layout the GPU jobs do **not** gate on the hosted `build-and-test` job
 — cross-workflow `needs` is not possible, so each GPU job builds the `rocm`
 binary itself as its first real step (a broken build fails that job fast and
