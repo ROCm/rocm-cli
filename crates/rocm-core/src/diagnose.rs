@@ -4104,6 +4104,86 @@ mod tests {
         }
     }
 
+    /// ROCMAI-543: every string `rocm diagnose` can put on a redirectable
+    /// stream has to be plain ASCII, or a Windows console on the OEM code page
+    /// (437) renders UTF-8 punctuation as mojibake like `ΓÇö`.
+    ///
+    /// Driven off `CHECKERS` rather than off a list of individual messages.
+    /// The catalog *is* the registry of everything this command can say, so a
+    /// check added later is covered the day it lands and no single sentence
+    /// needs a pinned copy here -- a test that restates the constant it checks
+    /// protects very little. Both surfaces are asserted because both are
+    /// redirectable: the rendered text report, and the `--json` payload, which
+    /// `serde_json` emits as raw UTF-8 rather than `\u` escapes.
+    ///
+    /// Two of this fix's conversions sit on branches a default `Examination`
+    /// never reaches -- the dGPU/APU pairing in `check_9_igpu_dgpu_collision`
+    /// and `check_16_vllm_oom`'s "does not fit" wording -- so the corpus lights
+    /// them deliberately and the coverage guard at the end fails if it stops.
+    #[test]
+    fn every_message_the_diagnose_catalog_can_emit_is_ascii() {
+        let corpus: Vec<(&str, Examination, &str)> = vec![
+            ("linux, no symptom", linux_base(), ""),
+            ("wsl, no symptom", wsl_base(), ""),
+            (
+                "linux apu+dgpu, crash",
+                igpu_dgpu_host("linux"),
+                "torch crashes with a segfault",
+            ),
+            (
+                "windows apu+dgpu, crash",
+                igpu_dgpu_host("windows"),
+                "torch crashes with a segfault",
+            ),
+            ("linux vllm oom", linux_base(), VLLM_OOM_CANONICAL_SYMPTOM),
+            ("wsl vllm oom", wsl_base(), VLLM_OOM_CANONICAL_SYMPTOM),
+        ];
+
+        let mut everything_seen = String::new();
+        for (label, examination, symptom) in &corpus {
+            // Every catalog entry, not only the ones that scored high enough to
+            // be reported on this host: a message is still shipped text when the
+            // host it describes is not the one under test.
+            for (check, _) in CHECKERS {
+                let diagnosis = check(examination, symptom);
+                let json = serde_json::to_string(&diagnosis).expect("a Diagnosis serializes");
+                assert!(
+                    json.is_ascii(),
+                    "{label}: diagnosis `{}` carries non-ASCII punctuation, which renders as \
+                     mojibake on a Windows console using the OEM code page (ROCMAI-543): {json}",
+                    diagnosis.id
+                );
+                everything_seen.push_str(&json);
+            }
+
+            let report = diagnose(examination, symptom);
+            let text = render_report_text(&report, report.matched.len());
+            assert!(
+                text.is_ascii(),
+                "{label}: `rocm diagnose` text output must be ASCII-only (ROCMAI-543):\n{text}"
+            );
+            let json = serde_json::to_string(&report).expect("a DiagnoseReport serializes");
+            assert!(
+                json.is_ascii(),
+                "{label}: `rocm diagnose --json` output must be ASCII-only (ROCMAI-543): {json}"
+            );
+            everything_seen.push_str(&text);
+        }
+
+        // An invariant test that quietly stops reaching the branches it was
+        // written for passes for the wrong reason. These markers sit beside the
+        // converted punctuation without containing it, so they stay true
+        // whichever way the dash goes and only fail if the corpus rots.
+        assert!(
+            everything_seen.contains("Discrete GPU(s):"),
+            "the corpus no longer reaches check_9's dGPU/APU branch, so its wording is unguarded"
+        );
+        assert!(
+            everything_seen.contains("reservation will not help"),
+            "the corpus no longer reaches check_16's does-not-fit wording, so it is unguarded"
+        );
+    }
+
     #[test]
     fn fix_9_igpu_dgpu_waits_for_an_argument_rather_than_claiming_it_will_act() {
         // This pinned `auto_applicable: true` until the catalog gained a class.

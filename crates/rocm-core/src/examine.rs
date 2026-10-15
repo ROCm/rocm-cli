@@ -4745,6 +4745,16 @@ mod tests {
             "the unexposed devices must still be accounted for: {:?}",
             e.notes
         );
+        // ROCMAI-543: `rocm examine` prints every note verbatim, and this one
+        // carried an em dash before " only the passed-through GPUs". A Windows
+        // console on the OEM code page renders that as mojibake, so the whole
+        // note has to stay ASCII -- not only the substrings asserted above.
+        assert!(
+            note.is_ascii(),
+            "examine notes must be ASCII-only; non-ASCII punctuation renders as mojibake on \
+             a Windows console using the OEM code page (ROCMAI-543): {:?}",
+            e.notes
+        );
     }
 
     #[test]

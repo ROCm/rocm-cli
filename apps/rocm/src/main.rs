@@ -22182,6 +22182,16 @@ install therock";
             "the skip reason must name the stop command:\n{}",
             outcome.text
         );
+        // ROCMAI-543: the skip line is built by `build_service_prune_plan` as
+        // "<id> is <status> - stop it first with `<cmd>`" and printed verbatim.
+        // Asserting the whole rendered plan rather than that one sentence also
+        // covers the counts, the headings, and any line added to the plan later.
+        assert!(
+            outcome.text.is_ascii(),
+            "`rocm services prune` output must be ASCII-only; non-ASCII punctuation renders \
+             as mojibake on a Windows console using the OEM code page (ROCMAI-543):\n{}",
+            outcome.text
+        );
         Ok(())
     }
 
@@ -22817,6 +22827,70 @@ install therock";
             prune.skipped_live, 1,
             "prune must count it as still running:\n{}",
             prune.text
+        );
+        Ok(())
+    }
+
+    /// `rocm uninstall`'s review warns that a remote session keeps running on
+    /// someone else's machine, and names the command that stops it properly.
+    ///
+    /// Nothing exercised that warning before: no test planted a remote session
+    /// record, so the whole sentence -- including the ASCII punctuation this
+    /// change put in it (ROCMAI-543) -- shipped uncovered. The remediation is
+    /// asserted alongside the encoding because a warning that stops naming
+    /// `rocm remote stop` leaves the user with no way to act on it.
+    #[test]
+    fn uninstall_warns_about_remote_sessions_in_ascii_and_names_the_stop_command() -> Result<()> {
+        let (root, paths) = test_paths("uninstall-remote-session-warning");
+        paths.ensure()?;
+        let session = crate::remote::session::RemoteSessionRecord {
+            session_id: crate::remote::session::RemoteSessionRecord::id_for("dev-box", 8000),
+            target: "dev-box".to_owned(),
+            peer_host: "dev-box".to_owned(),
+            ssh_port: None,
+            model: "qwen".to_owned(),
+            remote_service_id: "svc-remote".to_owned(),
+            remote_cli: "rocm".to_owned(),
+            remote_port: 8000,
+            tailnet_port: 8000,
+            base_url: "http://dev-box:8000/v1".to_owned(),
+            created_at_unix_ms: 1,
+        };
+        session.write(&paths)?;
+
+        // `keep_binaries` so the plan never reaches outside the sandbox: the
+        // binary paths are the host's real ones and have nothing to do with
+        // this warning.
+        let options = UninstallOptions {
+            dry_run: true,
+            keep_binaries: true,
+            ..UninstallOptions::default()
+        };
+        let plan = build_uninstall_plan(&paths, &options);
+        let _ = fs::remove_dir_all(&root);
+        let plan = plan?;
+
+        let warning = plan
+            .warnings
+            .iter()
+            .find(|warning| warning.contains("remote session record(s)"))
+            .unwrap_or_else(|| {
+                panic!("a planted remote session must be warned about: {plan:#?}");
+            });
+        assert!(
+            warning.contains(&session.session_id),
+            "the warning must name the session it found: {warning}"
+        );
+        assert!(
+            warning.contains("rocm remote stop <session>"),
+            "the warning must name the command that stops the remote model: {warning}"
+        );
+        // ROCMAI-543: printed verbatim by `render_uninstall_plan`, so non-ASCII
+        // punctuation here renders as mojibake like "ΓÇö" on a Windows console
+        // using the OEM code page.
+        assert!(
+            warning.is_ascii(),
+            "the remote-session warning must be ASCII-only (ROCMAI-543): {warning}"
         );
         Ok(())
     }
@@ -23562,6 +23636,15 @@ install therock";
         assert!(rendered.contains("Onboarding will not reopen automatically"));
         assert!(rendered.contains("ROCm installs were not deleted"));
         assert!(rendered.contains("API keys"));
+        // ROCMAI-543: the assertions above stop before the ` - open it from
+        // `rocm dash`'s Observe tab` clause, so they stay green with the em
+        // dash put back. This covers the whole block that `rocm setup --reset`
+        // prints, including any line added to it later.
+        assert!(
+            rendered.is_ascii(),
+            "the setup-reset prompt must be ASCII-only; non-ASCII punctuation renders as \
+             mojibake on a Windows console using the OEM code page (ROCMAI-543): {rendered}"
+        );
         assert!(!rendered.contains("request plan"));
         assert!(!rendered.contains("planner:"));
         assert!(!rendered.contains("tool_schema"));

@@ -65,6 +65,24 @@ const fn is_safe_shared_dir(uid: u32, mode: u32) -> bool {
     uid == 0 && (mode & 0o1000 != 0)
 }
 
+/// Why a socket directory this daemon could not tighten is refused.
+///
+/// Lifted out of [`prepare_socket_dir`] so the wording itself is reachable from
+/// a test. The branch that emits it needs a directory owned by a *second* uid,
+/// which a unit test cannot conjure -- the same limitation already recorded on
+/// `only_root_owned_sticky_dir_is_safe_shared` -- so without this split the
+/// message has no coverage at all.
+#[cfg(unix)]
+fn unsecurable_socket_dir_context(parent: &std::path::Path) -> String {
+    format!(
+        "restricting socket directory {} to mode 0700 - it is owned by \
+         another user, so a local user could replace the telemetry \
+         socket. Point the socket at a directory you own, for example \
+         under $XDG_RUNTIME_DIR or $HOME",
+        parent.display()
+    )
+}
+
 /// Ensure the socket's parent directory exists and is private (mode `0o700`).
 ///
 /// Directory permissions are *defense-in-depth*: the socket itself is bound with
@@ -120,15 +138,7 @@ fn prepare_socket_dir(parent: &std::path::Path) -> anyhow::Result<()> {
                  created with mode 0600"
             );
         } else {
-            return Err(e).with_context(|| {
-                format!(
-                    "restricting socket directory {} to mode 0700 - it is owned by \
-                     another user, so a local user could replace the telemetry \
-                     socket. Point the socket at a directory you own, for example \
-                     under $XDG_RUNTIME_DIR or $HOME",
-                    parent.display()
-                )
-            });
+            return Err(e).with_context(|| unsecurable_socket_dir_context(parent));
         }
     }
     Ok(())
@@ -319,7 +329,29 @@ mod tests {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::path::Path;
 
-    use super::{is_safe_shared_dir, prepare_socket_dir};
+    use super::{is_safe_shared_dir, prepare_socket_dir, unsecurable_socket_dir_context};
+
+    /// ROCMAI-543: the refusal is an error the CLI prints on a redirectable
+    /// stream, so it must be plain ASCII -- a Windows console on the OEM code
+    /// page renders a UTF-8 em dash as mojibake like `ΓÇö`. It also has to keep
+    /// naming the remediation, which is the only thing in it a user can act on.
+    #[test]
+    fn the_unsecurable_socket_dir_refusal_is_ascii_and_names_the_remedy() {
+        let message = unsecurable_socket_dir_context(Path::new("/shared/telemetry"));
+        assert!(
+            message.is_ascii(),
+            "the socket-directory refusal must be ASCII-only (ROCMAI-543): {message}"
+        );
+        assert!(
+            message.contains("/shared/telemetry"),
+            "the refusal must name the directory it is about: {message}"
+        );
+        assert!(
+            message.contains("$XDG_RUNTIME_DIR") && message.contains("$HOME"),
+            "the refusal must keep naming somewhere the user can point the socket instead: \
+             {message}"
+        );
+    }
 
     /// The safe-to-continue predicate is the security-critical decision for a
     /// directory we cannot tighten, and the squatting case (a non-root user

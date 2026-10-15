@@ -1316,6 +1316,20 @@ fn print_recipe(r: &FixRecipe) {
     }
 }
 
+/// What `rocm fix` says when it is handed a `rocm diagnose` ranking position
+/// (`#1`) rather than a fix-id.
+///
+/// Lifted out of [`apply`] so the wording is reachable from a test: `fail!`
+/// writes straight to the process's own stderr, which an in-process test cannot
+/// capture, so the only other way to cover these two lines would be to spawn
+/// the binary.
+fn diagnosis_position_refusal(fix_id: &str) -> [String; 2] {
+    [
+        format!("`{fix_id}` looks like a position in a `rocm diagnose` report, not a fix-id."),
+        "Use the `id:` shown against that cause - `rocm diagnose` prints an `apply with:` line you can copy.".to_owned(),
+    ]
+}
+
 /// Apply (or print) the fix identified by `fix_id`. Returns the process exit code.
 #[must_use]
 pub fn apply(fix_id: &str, opts: &FixOptions) -> i32 {
@@ -1326,10 +1340,9 @@ pub fn apply(fix_id: &str, opts: &FixOptions) -> i32 {
             // number here. It is a position in one report, not a name -- and it
             // does not line up with the catalog's `fix-N` names either, so a
             // bare "unknown id" left them with nothing to correct.
-            fail!("`{fix_id}` looks like a position in a `rocm diagnose` report, not a fix-id.");
-            fail!(
-                "Use the `id:` shown against that cause - `rocm diagnose` prints an `apply with:` line you can copy."
-            );
+            for line in diagnosis_position_refusal(fix_id) {
+                fail!("{line}");
+            }
         } else {
             fail!("Run `rocm diagnose` to see which fix-id applies.");
         }
@@ -2764,6 +2777,26 @@ mod tests {
         // behaviour that a script could start depending on.
         assert_eq!(apply("#1", &FixOptions::default()), 2);
         assert_eq!(apply("bogus", &FixOptions::default()), 2);
+
+        // ROCMAI-543: the two lines `apply` writes to stderr on this path must
+        // be plain ASCII, or a Windows console on the OEM code page renders the
+        // punctuation as mojibake like `ΓÇö`. The exit code above says nothing
+        // about them, and `fail!` writes past any in-process capture.
+        let refusal = diagnosis_position_refusal("#1");
+        for line in &refusal {
+            assert!(
+                line.is_ascii(),
+                "the position-argument refusal must be ASCII-only (ROCMAI-543): {line}"
+            );
+        }
+        // Both halves still have to do their job: name what the user typed, and
+        // name where the real id is printed.
+        assert!(refusal[0].contains("#1"), "refusal: {refusal:?}");
+        assert!(
+            refusal[1].contains("id:") && refusal[1].contains("apply with:"),
+            "the refusal must keep pointing at the `id:`/`apply with:` lines \
+             `rocm diagnose` prints: {refusal:?}"
+        );
     }
 
     #[test]
