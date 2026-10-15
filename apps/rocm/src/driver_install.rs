@@ -999,7 +999,7 @@ fn build_driver_install_plan(
             );
             // Debian deliberately reuses AMD's Ubuntu-suite repository: AMD's
             // documented Debian install maps Debian 12 -> jammy and 13 -> noble
-            // and serves them from the .../ubuntu graphics tree. Surface that in
+            // and serves them from the .../ubuntu amdgpu tree. Surface that in
             // the plan so the Ubuntu codename on a Debian host doesn't read as a
             // misdetection.
             plan.reason = format!(
@@ -2953,7 +2953,7 @@ VERSION_ID="9.4"
     fn driver_plan_debian_uses_intended_ubuntu_suite() {
         let _env = ScopedTestEnv::with_amd_overrides_cleared();
         // AMD's documented Debian install deliberately serves Debian from the
-        // Ubuntu-suite graphics tree (Debian 12 -> jammy). Lock that in and
+        // Ubuntu-suite amdgpu tree (Debian 12 -> jammy). Lock that in and
         // ensure the plan explains the mapping is intentional.
         let os_release = r#"
 ID=debian

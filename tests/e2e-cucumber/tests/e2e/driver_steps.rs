@@ -20,8 +20,12 @@ async fn preview_wsl_driver_install(world: &mut E2eWorld) {
 
 #[when("the user previews driver installation on this host")]
 async fn preview_driver_install_on_this_host(world: &mut E2eWorld) {
+    // `--dkms` is required here: every driver-plan builder gates its entire
+    // command list (repo setup, signing key, package install) behind
+    // `dkms`, so a plan built without it is empty and the apt-repo-file/key
+    // assertion below would have nothing to find.
     let (stdout, stderr, rc) =
-        crate::run_rocm_with_env(world, &["install", "driver", "--dry-run"], &[]);
+        crate::run_rocm_with_env(world, &["install", "driver", "--dkms", "--dry-run"], &[]);
     world.cli_output = Some(stdout);
     world.cli_stderr = Some(stderr);
     world.cli_rc = Some(rc);

@@ -313,7 +313,7 @@ const RECIPES: &[FixRecipe] = &[
     FixRecipe {
         fix_id: "fix-3-rocm-kernel",
         title: "ROCm/distro/kernel triple unsupported",
-        rationale: "ROCm is installed but your kernel/distro combination is outside the supported matrix. Match the kernel to the matrix first, then rerun `rocm install driver --dkms`.",
+        rationale: "ROCm is installed but your kernel/distro combination is outside the supported matrix. Match the kernel to the matrix first, then rerun `rocm install driver --dkms`. To avoid the DKMS build entirely, use `rocm install sdk` instead: it installs the userspace ROCm stack without touching the kernel module.",
         commands: &[
             "# Cross-check the live AMD matrix before changing anything:",
             "#   https://rocm.docs.amd.com/projects/install-on-linux/en/latest/reference/system-requirements.html",
@@ -390,10 +390,16 @@ const RECIPES: &[FixRecipe] = &[
         title: "Quarantine duplicate AMD repos",
         rationale: "More than one ROCm/AMDGPU repo file exists. The package manager is mixing versions; quarantine the extras before reinstalling.",
         commands: &[
-            "ls /etc/apt/sources.list.d/ | grep -iE 'rocm|amdgpu|radeon'",
+            "# Run only the line matching your package manager:",
+            "ls /etc/apt/sources.list.d/ | grep -iE 'rocm|amdgpu|radeon' || true   # Debian/Ubuntu",
+            "ls /etc/yum.repos.d/ | grep -iE 'rocm|amdgpu|radeon' || true          # RHEL/Fedora/Rocky/Alma/Oracle",
+            "ls /etc/zypp/repos.d/ | grep -iE 'rocm|amdgpu|radeon' || true         # SLES/openSUSE",
             "# For each duplicate file:",
-            "sudo mv /etc/apt/sources.list.d/<file>.list /etc/apt/sources.list.d/<file>.list.bak",
-            "sudo apt update",
+            "sudo mv /etc/apt/sources.list.d/<file>.list /etc/apt/sources.list.d/<file>.list.bak   # or the yum/zypp equivalent",
+            "# Run only the line matching your package manager:",
+            "sudo apt update      # Debian/Ubuntu",
+            "sudo dnf clean all   # RHEL/Fedora/Rocky/Alma/Oracle",
+            "sudo zypper refresh  # SLES/openSUSE",
         ],
         needs_sudo: true,
         needs_reboot: false,
@@ -3246,6 +3252,52 @@ mod tests {
             named.iter().any(|f| f.contains("--device-index")),
             "the catalog knows which argument fix-9-igpu-dgpu waits for, so the flags line \
              has to say it: {named:?}"
+        );
+    }
+
+    #[test]
+    fn fix_7_apt_commands_match_the_diagnose_copy_verbatim() {
+        // Same drift guard as fix_12_apt_commands_match_the_diagnose_copy_verbatim:
+        // diagnose.rs builds its own per-family command list for fix-7 rather than
+        // reusing this recipe, so drive diagnose() itself instead of comparing
+        // against a hardcoded literal that can't detect diagnose.rs drifting.
+        let e = crate::examine::Examination {
+            os_family: "linux".to_owned(),
+            distro_id: "ubuntu".to_owned(),
+            rocm_repos_seen: vec![
+                "/etc/apt/sources.list.d/rocm.list".to_owned(),
+                "/etc/apt/sources.list.d/amdgpu.list".to_owned(),
+            ],
+            ..crate::examine::Examination::default()
+        };
+        let report = crate::diagnose::diagnose(&e, "stale repo conflict");
+        let hit = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-7-stale-repos")
+            .expect("duplicate repo files should be diagnosed");
+        let diagnose_apt_list_cmd = hit
+            .fix
+            .as_ref()
+            .unwrap()
+            .commands
+            .first()
+            .expect("fix-7 always lists the repo dir first on a recognized family")
+            .as_str();
+
+        let recipe = RECIPES
+            .iter()
+            .find(|r| r.fix_id == "fix-7-stale-repos")
+            .expect("fix-7-stale-repos recipe must exist");
+        let recipe_apt_list_cmd = recipe
+            .commands
+            .iter()
+            .find(|c| c.trim_end().ends_with("# Debian/Ubuntu") && c.contains("ls /etc/apt"))
+            .map(|c| c.split('#').next().unwrap().trim_end())
+            .expect("recipe must have a commented apt list line");
+        assert_eq!(
+            recipe_apt_list_cmd, diagnose_apt_list_cmd,
+            "this recipe's apt list command must match what diagnose.rs's apt family actually emits for fix-7-stale-repos"
         );
     }
 

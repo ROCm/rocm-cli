@@ -847,6 +847,8 @@ fn check_3_rocm_kernel_unsupported(e: &Examination, symptom: &str) -> Diagnosis 
             "#   https://rocm.docs.amd.com/projects/install-on-linux/en/latest/reference/system-requirements.html".to_owned(),
             "# If your kernel is above the supported range, install the HWE".to_owned(),
             "# kernel that matches ROCm, then rerun `rocm install driver --dkms`.".to_owned(),
+            "# To avoid the DKMS build entirely, use `rocm install sdk` instead:".to_owned(),
+            "# it installs the userspace ROCm stack without touching the kernel module.".to_owned(),
         ],
         fix_id: "fix-3-rocm-kernel".to_owned(),
         needs_reboot: true,
@@ -1094,21 +1096,28 @@ fn check_7_stale_repos(e: &Examination, symptom: &str) -> Diagnosis {
         return zero("fix-7-stale-repos", "Stale ROCm repos");
     }
     let family = repo_pkg_family(e);
-    let list_cmd = match family {
-        "dnf" => "ls /etc/yum.repos.d/ | grep -iE 'rocm|amdgpu|radeon' || true".to_owned(),
-        "zypper" => "ls /etc/zypp/repos.d/ | grep -iE 'rocm|amdgpu|radeon' || true".to_owned(),
-        _ => "ls /etc/apt/sources.list.d/ | grep -iE 'rocm|amdgpu|radeon' || true".to_owned(),
-    };
-    let mut commands = vec![list_cmd];
+    let mut commands = Vec::new();
+    match family {
+        "apt" => commands
+            .push("ls /etc/apt/sources.list.d/ | grep -iE 'rocm|amdgpu|radeon' || true".to_owned()),
+        "dnf" => {
+            commands
+                .push("ls /etc/yum.repos.d/ | grep -iE 'rocm|amdgpu|radeon' || true".to_owned());
+        }
+        "zypper" => commands
+            .push("ls /etc/zypp/repos.d/ | grep -iE 'rocm|amdgpu|radeon' || true".to_owned()),
+        _ => {}
+    }
     for r in repos {
         commands.push(format!(
             "# sudo mv {r} {r}.bak     # quarantine, do not delete yet"
         ));
     }
     match family {
+        "apt" => commands.push("sudo apt update".to_owned()),
         "dnf" => commands.push("sudo dnf clean all".to_owned()),
         "zypper" => commands.push("sudo zypper refresh".to_owned()),
-        _ => commands.push("sudo apt update".to_owned()),
+        _ => {}
     }
     commands.push(
         "# If the package manager now resolves, reinstall the driver only (review the plan, then approve):"
@@ -1117,9 +1126,10 @@ fn check_7_stale_repos(e: &Examination, symptom: &str) -> Diagnosis {
     commands.push("#   rocm install driver --dkms   # review the plan".to_owned());
     commands.push("#   rocm install driver --dkms --yes   # reinstalls the driver only".to_owned());
     let verify = match family {
+        "apt" => "sudo apt update 2>&1 | tail -n 20".to_owned(),
         "dnf" => "sudo dnf clean all 2>&1 | tail -n 20".to_owned(),
         "zypper" => "sudo zypper refresh 2>&1 | tail -n 20".to_owned(),
-        _ => "sudo apt update 2>&1 | tail -n 20".to_owned(),
+        _ => "rocm examine --json | grep -q '\"rocm_install_method\"'".to_owned(),
     };
     let fix = Fix {
         summary: "Quarantine duplicate ROCm/AMDGPU repo files and resolve the package manager before re-running any installer.".to_owned(),
@@ -6171,7 +6181,8 @@ mod tests {
             .iter()
             .find(|d| d.id == "fix-7-stale-repos")
             .expect("duplicate repo files should be diagnosed");
-        let commands = hit.fix.as_ref().unwrap().commands.join("\n");
+        let fix = hit.fix.as_ref().unwrap();
+        let commands = fix.commands.join("\n");
         assert!(
             commands.contains("/etc/zypp/repos.d/") && commands.contains("sudo zypper refresh"),
             "a SLES host must get zypper remediation: {commands}"
@@ -6179,6 +6190,45 @@ mod tests {
         assert!(
             !commands.contains("apt") && !commands.contains("dpkg"),
             "a SLES host must not be told to run apt/dpkg commands: {commands}"
+        );
+        assert!(
+            fix.verify.contains("sudo zypper refresh"),
+            "a SLES host's verify step must also use zypper, not apt: {}",
+            fix.verify
+        );
+    }
+
+    #[test]
+    fn stale_repos_emits_no_package_manager_commands_on_pacman_hosts() {
+        let mut e = linux_base();
+        e.distro_id = "arch".to_owned();
+        e.rocm_repos_seen = vec!["/some/rocm.repo".to_owned(), "/some/amdgpu.repo".to_owned()];
+        let report = diagnose(&e, "stale repo conflict");
+        let hit = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-7-stale-repos")
+            .expect("duplicate repo files should be diagnosed");
+        let fix = hit.fix.as_ref().unwrap();
+        let commands: Vec<&str> = fix
+            .commands
+            .iter()
+            .map(String::as_str)
+            .filter(|c| !c.trim_start().starts_with('#'))
+            .collect();
+        assert!(
+            commands.iter().all(|c| !c.contains("apt")
+                && !c.contains("dpkg")
+                && !c.contains("dnf")
+                && !c.contains("zypper")),
+            "must not print a foreign package manager's commands on an unresolved/pacman host: {commands:?}"
+        );
+        assert!(
+            !fix.verify.contains("apt")
+                && !fix.verify.contains("dnf")
+                && !fix.verify.contains("zypper"),
+            "verify step must not assume a foreign package manager on a pacman host: {}",
+            fix.verify
         );
     }
 
