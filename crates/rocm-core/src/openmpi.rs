@@ -1496,6 +1496,49 @@ mod tests {
         }
     }
 
+    /// The same malformed line as
+    /// [`an_unreadable_file_plans_nothing_and_names_its_line`], but read
+    /// through the fallback path: both the plan's reason and the hint must
+    /// name `/usr/lib/os-release`, not `/etc/os-release`. Every malformed-line
+    /// test before this one went through either the bare, hardcoded-`/etc`
+    /// functions or [`crate::hardware_root::OsRelease::found`] (which also
+    /// hardcodes `/etc/os-release`), so a regression that hardcoded the path
+    /// back into `plan_for_os_release_read`/`install_hint_for_read` would
+    /// have passed every one of them.
+    #[test]
+    fn a_fallback_reads_malformed_line_names_the_fallback_path() {
+        let read = crate::hardware_root::OsRelease::Found {
+            path: "/usr/lib/os-release",
+            text: "ID=ubuntu\nexport ID=debian\n".to_owned(),
+        };
+        for (label, build, manual) in BUILDERS {
+            let plan = plan_for_os_release_read(&read, build);
+            assert!(!plan.supported, "{label}");
+            assert!(
+                plan.reason.starts_with(
+                    "/usr/lib/os-release line 2 is not a plain assignment: \
+                     \"export ID=debian\", so the distribution cannot be read; to fix \
+                     it, remove that line or rewrite it as NAME=value. Could not map \
+                     distribution"
+                ),
+                "{label}: {}",
+                plan.reason
+            );
+
+            let hint = install_hint_for_read(&read, build, manual);
+            assert_eq!(
+                hint.text,
+                format!(
+                    "{manual}; /usr/lib/os-release line 2 is not a plain assignment: \
+                     \"export ID=debian\", so the distribution cannot be read; to fix it, \
+                     remove that line or rewrite it as NAME=value"
+                ),
+                "{label}"
+            );
+            assert!(!hint.plan_installs, "{label}");
+        }
+    }
+
     /// An automatic install is offered exactly when the plan it would run
     /// installs something: for a recognised distribution, and not for an
     /// unknown one or an unreadable file.

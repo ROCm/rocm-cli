@@ -2014,6 +2014,64 @@ mod tests {
         );
     }
 
+    /// The same malformed line as
+    /// [`an_unreadable_os_release_names_its_line_and_plans_nothing`], but read
+    /// through the fallback path: the reason must name `/usr/lib/os-release`,
+    /// not `/etc/os-release`. That test only exercises the bare,
+    /// hardcoded-`/etc` `build_driver_install_plan`, so a regression that
+    /// hardcoded the path back into `build_driver_install_plan_read` would
+    /// still pass it.
+    #[test]
+    fn a_fallback_reads_malformed_line_names_the_fallback_path() {
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
+        let read = rocm_core::hardware_root::OsRelease::Found {
+            path: "/usr/lib/os-release",
+            text: "ID=ubuntu\nVERSION_ID=\"24.04\"\nVERSION_CODENAME=noble\nunset ID\n".to_owned(),
+        };
+        let plan = build_driver_install_plan_read(
+            &test_examine("linux", false),
+            &read,
+            true,
+            PrivilegeEscalation::Sudo,
+        );
+        assert_eq!(
+            plan.reason,
+            "/usr/lib/os-release line 4 is not a plain assignment: \"unset ID\"; no driver \
+             commands were planned because the distro cannot be read. To fix it, remove \
+             that line or rewrite it as NAME=value."
+        );
+        assert!(!plan.supported);
+        assert!(plan.commands.is_empty(), "{:?}", plan.commands);
+        assert_eq!(plan.policy, "unreadable_os_release");
+    }
+
+    /// On WSL, `build_driver_install_plan_read`'s `Unreadable` branch must
+    /// not fire at all: WSL has its own guest-side os-release probe (see
+    /// `examine.rs`'s `WSL_REMOTE_PROBE`), so the local Rust-side read this
+    /// function receives is never authoritative for a WSL host, and the plan
+    /// must stay the ordinary `wsl_rocdxg` one — not `unreadable_os_release` —
+    /// regardless of what it says. Without the `reaches_os_release_parse`
+    /// guard this would plan nothing on a WSL host whose local read happens
+    /// to come back `Unreadable`, even though the guest-side probe may read
+    /// the distro just fine.
+    #[test]
+    fn a_wsl_host_ignores_an_unreadable_local_os_release_read() {
+        let _env = scoped_rocdxg_env();
+        let read = rocm_core::hardware_root::OsRelease::Unreadable {
+            path: "/usr/lib/os-release",
+            error: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied"),
+        };
+        let plan = build_driver_install_plan_read(
+            &test_examine("linux", true),
+            &read,
+            true,
+            PrivilegeEscalation::Sudo,
+        );
+        assert_eq!(plan.policy, "wsl_rocdxg");
+        assert!(plan.supported);
+        assert!(plan.mutating);
+    }
+
     /// With a duplicated key, the plan is built from the last assignment — the
     /// one a shell keeps, and the one `rocm examine` reports, since both read
     /// through `rocm_core::os_release`.

@@ -3186,6 +3186,35 @@ mod tests {
         assert_eq!(e.compute_status(), "degraded");
     }
 
+    /// The same malformed line as
+    /// [`an_unreadable_os_release_names_its_line_instead_of_a_distro`], but
+    /// read through the fallback path: `probe_failures` must name
+    /// `/usr/lib/os-release`, not `/etc/os-release`. That test only exercises
+    /// [`crate::hardware_root::OsRelease::found`], which hardcodes
+    /// `/etc/os-release`, so a regression that hardcoded the path back into
+    /// `record_distro`'s message would still pass it.
+    #[test]
+    fn a_fallback_reads_malformed_line_names_the_fallback_path_in_probe_failures() {
+        let mut e = linux_host_with_a_gpu();
+        record_distro(
+            &mut e,
+            &crate::hardware_root::OsRelease::Found {
+                path: "/usr/lib/os-release",
+                text: "ID=ubuntu\nVERSION_ID=\"24.04\"\nexport ID=debian\n".to_owned(),
+            },
+        );
+        assert_eq!(
+            e.probe_failures,
+            vec![
+                "/usr/lib/os-release line 3 is not a plain assignment: \"export ID=debian\"; \
+                 the distro is not reported."
+                    .to_owned()
+            ]
+        );
+        assert_eq!((e.distro_id.as_str(), e.distro_version.as_str()), ("", ""));
+        assert_eq!(e.compute_status(), "degraded");
+    }
+
     /// Serialises the tests that read or replace the process-global
     /// `RUNTIME_LIBRARY_PATH_ENV` while they run. Env is shared by every test
     /// thread, so a test that sets it and one that composes a child env from it

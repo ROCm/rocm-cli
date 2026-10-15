@@ -4848,6 +4848,24 @@ Class Name:                Display
         );
     }
 
+    /// The same malformed line as the second case in
+    /// [`pretty_name_reads_as_sh_reads_it`], but read through the fallback
+    /// path: the message must name `/usr/lib/os-release`, not
+    /// `/etc/os-release`. That test only exercises
+    /// [`hardware_root::OsRelease::found`], which hardcodes
+    /// `/etc/os-release`, so a regression that hardcoded the path back into
+    /// `distro_name_from_os_release`'s message would still pass it.
+    #[test]
+    fn a_fallback_reads_malformed_line_names_the_fallback_path() {
+        assert_eq!(
+            distro_name_from_os_release(&hardware_root::OsRelease::Found {
+                path: "/usr/lib/os-release",
+                text: "PRETTY_NAME=\"Ubuntu 24.04 LTS\"\nunset ID\n".to_owned(),
+            }),
+            "Linux (/usr/lib/os-release line 2 is not a plain assignment: \"unset ID\")"
+        );
+    }
+
     #[test]
     fn dev_dxg_is_believed_on_its_own() {
         // Nothing but WSLg's GPU passthrough creates this device node, so it is
