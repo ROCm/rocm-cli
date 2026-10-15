@@ -70,10 +70,39 @@ pub(crate) fn gather_gpu_snapshot() -> CodexBridgeGpuSnapshot {
         Ok(value) => Some(value),
         Err(error) => {
             return CodexBridgeGpuSnapshot {
+                // `{error:#}` rather than `to_string()`: the outermost context
+                // alone says "failed to launch amd-smi ...", which names the
+                // wrong thing when what actually happened was a timeout. Pinned
+                // by `examine-25`, which asserts that the rendered note names
+                // the timeout and not just the launch.
+                //
+                // Every failure `run_with_timeout` raises carries its cause the
+                // same way, since all of them arrive under that one context:
+                // the timeout, the failure to spawn, and the poll and reap
+                // failures of its wait loop. The `/dev/kfd` pre-flight in
+                // `amd_smi_json` is the one failure that arrives *without* it,
+                // because it declines before there is a launch to contextualise
+                // -- its own message is self-describing and reaches the note
+                // intact. Spawn is the case on a host where
+                // none of the paths `resolve_amd_smi_binary` searches holds an
+                // `amd-smi`, down to the bare name on `PATH`; the cause is then
+                // the OS's own "not found" text, which is not the same string
+                // on Linux and Windows, and `rocmd` runs this probe on both --
+                // so none of it is quoted here, and no test pins it. A host
+                // with no GPU but an amd-smi installed is a different case: it
+                // spawns and fails at a non-zero exit. (The non-zero-exit and
+                // parse failures below are their own outermost context and
+                // already read correctly.)
+                //
+                // The note is the only account of any of this that reaches the
+                // bridge snapshot and the automation watcher, so it carries the
+                // causes too -- bounded, because it is persisted; see the
+                // `MAX_QUOTED_OUTPUT_CHARS` that `amd_smi_json` and
+                // `run_with_timeout` each apply to their own quote.
                 amd_smi_available: false,
                 static_snapshot: None,
                 monitor_snapshot: None,
-                note: Some(error.to_string()),
+                note: Some(format!("{error:#}")),
             };
         }
     };
@@ -84,10 +113,14 @@ pub(crate) fn gather_gpu_snapshot() -> CodexBridgeGpuSnapshot {
         Ok(value) => Some(value),
         Err(error) => {
             return CodexBridgeGpuSnapshot {
+                // Same reasoning as the `static` probe above, but a different
+                // test: examine-25's stalled `static` probe returns before this
+                // branch is ever reached, so reverting this `{error:#}` is
+                // caught by `examine-26` alone. Pinned by `examine-26`.
                 amd_smi_available: true,
                 static_snapshot,
                 monitor_snapshot: None,
-                note: Some(error.to_string()),
+                note: Some(format!("{error:#}")),
             };
         }
     };
@@ -117,6 +150,10 @@ pub(crate) fn gather_gpu_snapshot_for_config(config: &RocmCliConfig) -> CodexBri
 }
 
 fn capture_amd_smi_json(args: &[&str]) -> Result<Value> {
+    // `rocm_core::amd_smi_json`, not a local spawn: it is the one launch site
+    // that runs the `/dev/kfd` pre-flight, and the pre-flight protects nothing
+    // unless every launch goes through it. The spawn, the timeout, the
+    // non-zero-exit quote and the JSON parse all live there now.
     amd_smi_json(args, AMD_SMI_PROBE_TIMEOUT)
 }
 
@@ -184,22 +221,13 @@ pub(crate) fn run_rocm_capture_for_paths(
 ) -> Result<CommandCapture> {
     let rocm_binary = daemon_binary_path()?;
     let mut command = ProcessCommand::new(&rocm_binary);
+    // Stdio left to `run_with_timeout`, which sets it itself.
     command
         .args(args)
         .env("ROCM_CLI_CONFIG_DIR", &paths.config_dir)
         .env("ROCM_CLI_DATA_DIR", &paths.data_dir)
-        .env("ROCM_CLI_CACHE_DIR", &paths.cache_dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    // The shared helper, not a local poll-and-`wait_with_output` loop: this path
-    // is reached from the MCP bridge's examine/update/sandbox-check handlers,
-    // where `rocm` can easily print more than the 64 KiB pipe buffer, and the
-    // local copy reported that as a timeout it had itself caused. It also quoted
-    // the whole of the child's output into that timeout error, which is the
-    // unbounded-note defect `fix/rocmai-448-drain-child-pipes` reproduced from
-    // the daemon's JSONL logs; the shared helper quotes none of it.
-    let output = rocm_core::run_command_with_timeout(command, timeout)
+        .env("ROCM_CLI_CACHE_DIR", &paths.cache_dir);
+    let output = rocm_core::process::run_with_timeout(command, timeout, "process")
         .with_context(|| format!("failed to run {}", rocm_binary.display()))?;
     Ok(CommandCapture {
         argv: std::iter::once(rocm_binary.display().to_string())

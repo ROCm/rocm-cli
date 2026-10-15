@@ -201,8 +201,9 @@ fn spawn_vllm_server(
         bail!(
             "vLLM requires the OpenMPI runtime (libmpi.so / libmpi_cxx.so and mpirun), which was not found; \
 without it `import torch` fails with `libmpi_cxx.so.40: cannot open shared object file`. \
-{}, or run `rocm engines install vllm --yes` to install it automatically, then retry.",
+{}, then retry.",
             rocm_core::openmpi::install_hint()
+                .or("run `rocm engines install vllm --yes` to install it automatically")
         );
     }
 
@@ -215,8 +216,9 @@ without it `import torch` fails with `libmpi_cxx.so.40: cannot open shared objec
         bail!(
             "vLLM requires the libatomic runtime (libatomic.so.1), which was not found; \
 without it `import torch` fails with `libatomic.so.1: cannot open shared object file`. \
-{}, or run `rocm engines install vllm --yes` to install it automatically, then retry.",
+{}, then retry.",
             rocm_core::openmpi::libatomic_install_hint()
+                .or("run `rocm engines install vllm --yes` to install it automatically")
         );
     }
 
@@ -231,8 +233,9 @@ without it `import torch` fails with `libatomic.so.1: cannot open shared object 
             "vLLM requires the system numactl runtime (libnuma.so.1 with the libnuma_1.2 symbols), which was not found; \
 the ROCm SDK's bundled numa uses renamed symbol versions and cannot satisfy it, so `import torch` fails with \
 `libnuma.so.1: version 'libnuma_1.2' not found`. \
-{}, or run `rocm engines install vllm --yes` to install it automatically, then retry.",
+{}, then retry.",
             rocm_core::openmpi::libnuma_install_hint()
+                .or("run `rocm engines install vllm --yes` to install it automatically")
         );
     }
 

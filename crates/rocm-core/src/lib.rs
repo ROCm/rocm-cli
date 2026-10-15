@@ -7,19 +7,20 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fs;
-// `Read`/`Command`/`Stdio`/`thread`/`Instant` are this branch's, not survivors
-// of the `process.rs` extraction (#599): `run_command_with_timeout` and its
-// drain and reaper threads still live in this module, so the `Read` bound that
-// `drain_on_thread` needs has to come back even though the extraction took the
-// import with it. The `windows_sys` block that used to sit here left with that
-// extraction and is deliberately not kept — nothing in this file uses it any
-// more, and an unused import is a hard error on the Windows lane's
-// `-D warnings` build.
-use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+// `Command` is this module's own — [`amd_smi_json_with`] builds one — but
+// nothing here runs it: the wait, the kill and both pipe drains belong to
+// [`crate::process::run_with_timeout`], which is why no production `Stdio`
+// import comes back with it (the helper sets the child's stdio itself, and its
+// docs say callers should not). `Stdio` and `thread` are left to the KFD open
+// probe and its Linux-only test, hence the `cfg`s: an unused import is a hard
+// error on the Windows lane's `-D warnings` build.
+use std::process::Command;
+#[cfg(all(test, target_os = "linux"))]
+use std::process::Stdio;
+#[cfg(target_os = "linux")]
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(all(test, unix))]
 mod archive_props;
@@ -38,6 +39,7 @@ pub mod model_catalog;
 pub mod model_readiness;
 pub mod net;
 pub mod openmpi;
+pub mod os_release;
 pub mod paths;
 pub mod proc_lifecycle;
 pub mod process;
@@ -46,6 +48,7 @@ pub mod report_delivery;
 pub mod rocm_install;
 pub mod runtime;
 pub mod terminal;
+pub mod user_path;
 
 #[cfg(test)]
 mod test_env;
@@ -78,9 +81,10 @@ pub use host_gpu::{
     DriverSummary, ExamineSummary, HostGpuSummary, WslHostDriverProbe, WslSummary,
     default_engine_for_host, default_engine_for_platform, detect_gpu_driver_version,
     detect_host_gfx_target, detect_host_gpu_diagnostics, detect_host_gpu_summary,
-    detect_system_ram_gib, extract_first_gfx_token, has_usable_amd_gpu, interactive_terminal,
-    is_amdgpu_device, is_wsl_host, known_therock_families, normalize_therock_family,
-    preferred_serve_engine_for_host_gpu_summary, usable_amd_gpu_indices,
+    detect_system_ram_gib, extract_first_gfx_token, gfx_target_has_no_rocm_build,
+    has_usable_amd_gpu, interactive_terminal, is_amdgpu_device, is_wsl_host,
+    known_therock_families, normalize_therock_family, preferred_serve_engine_for_host_gpu_summary,
+    usable_amd_gpu_indices,
 };
 #[cfg(any(target_os = "linux", test))]
 use host_gpu::{KfdGpuNode, kfd_gpu_nodes_in};
@@ -2023,7 +2027,8 @@ fn device_readable(device: &Path) -> bool {
 /// The `open` runs on its own thread and the caller waits on a channel, because
 /// there is no portable way to interrupt a blocking `open` once it has entered
 /// the kernel. A probe that overruns leaves that thread parked — the same
-/// trade-off [`reap_in_background`] documents, and for the same reason: one
+/// trade-off [`crate::process::run_with_timeout`] makes when it abandons rather
+/// than joins its readers, and for the same reason: one
 /// leaked thread is strictly cheaper than a blocked caller, and a device that
 /// can park a thread forever is exactly the device this whole gate exists to
 /// refuse. The opened handle is dropped on the probe thread, so a late success
@@ -2095,10 +2100,11 @@ const MAX_QUOTED_OUTPUT_CHARS: usize = 2000;
 /// added.
 ///
 /// `timeout` is defence in depth, not the mitigation: see
-/// [`run_command_with_timeout`], which kills the child and hands the `wait` to a
-/// detached reaper — neither of which dislodges a process in uninterruptible
-/// sleep. It bounds the ordinary failures — a slow or wedged-but-signalable
-/// `amd-smi` — and it bounds this call's own return, not the child's lifetime.
+/// [`crate::process::run_with_timeout`], which kills the timed-out child and
+/// waits on it — neither of which dislodges a process in uninterruptible sleep,
+/// and the `wait` of an undislodgeable one does not return either. It bounds
+/// the ordinary failures — a slow or wedged-but-signalable `amd-smi` — and the
+/// pre-flight above, not the timeout, is what keeps the D-state case away.
 pub fn amd_smi_json(args: &[&str], timeout: Duration) -> Result<serde_json::Value> {
     amd_smi_json_with(
         &resolve_amd_smi_binary(),
@@ -2125,12 +2131,11 @@ fn amd_smi_json_with(
     }
 
     let mut command = Command::new(binary);
-    command
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let output = run_command_with_timeout(command, timeout)
+    // No stdio here: `run_with_timeout` sets null stdin and piped stdout/stderr
+    // itself, since capturing both is its contract, and its docs say callers
+    // should not set them.
+    command.args(args);
+    let output = crate::process::run_with_timeout(command, timeout, "amd-smi")
         .with_context(|| format!("failed to launch amd-smi {}", args.join(" ")))?;
 
     if !output.status.success() {
@@ -2159,133 +2164,6 @@ fn amd_smi_json_with(
 
     serde_json::from_slice(&output.stdout)
         .with_context(|| format!("failed to parse amd-smi {} json", args.join(" ")))
-}
-
-/// Wait for `command` for at most `timeout`, killing it and failing if it
-/// overruns.
-///
-/// Bounds signalable children only. A child in uninterruptible sleep ignores
-/// the `kill`, so callers that can reach one must decline to spawn it in the
-/// first place — see the pre-flight on [`amd_smi_json`]. This function at least
-/// returns to its caller in that case rather than joining the child in its wait.
-///
-/// On timeout the calling thread returns without waiting on the child; the
-/// `wait` is handed to a detached reaper thread instead, because
-/// `std::process::Child` has no reaping `Drop` and dropping the handle here
-/// would strand a zombie for the lifetime of this process. That reap is
-/// best-effort: it completes only if the child actually dies, which is the
-/// same condition the `kill` above already depends on. See
-/// `reap_in_background`.
-pub fn run_command_with_timeout(
-    mut command: Command,
-    timeout: Duration,
-) -> Result<std::process::Output> {
-    let mut child = command.spawn().context("failed to spawn child process")?;
-    // Drain both pipes on their own threads for as long as the child runs.
-    // Polling `try_wait` alone cannot: a child that fills the pipe buffer
-    // (64 KiB on Linux) blocks mid-write and never exits, so a merely verbose
-    // command would be reported as having hung. `amd-smi metric --json` on a
-    // multi-GPU host clears 64 KiB comfortably.
-    let stdout = child.stdout.take().and_then(drain_on_thread);
-    let stderr = child.stderr.take().and_then(drain_on_thread);
-    let started = Instant::now();
-    loop {
-        if let Some(status) = child.try_wait().context("failed to poll child process")? {
-            // The child is gone, so it has dropped its write ends and the
-            // readers see EOF. A surviving grandchild holding an inherited
-            // write end can still keep them open, exactly as the
-            // `wait_with_output` this replaces would have.
-            return Ok(std::process::Output {
-                status,
-                stdout: join_drained(stdout),
-                stderr: join_drained(stderr),
-            });
-        }
-        if started.elapsed() >= timeout {
-            // `kill` is allowed to fail — most often because the child exited
-            // between the `try_wait` above and here, in which case it is already
-            // a zombie and the reap below is exactly what is needed. Reap
-            // unconditionally rather than only on a successful kill.
-            let _ = child.kill();
-            // This thread deliberately joins neither the child nor the readers:
-            // an unkillable child would block both, which is the hang this
-            // timeout exists to bound. That costs the partial output the message
-            // used to quote; the reader threads end by themselves once the child
-            // does.
-            reap_in_background(child);
-            bail!("process exceeded {}s timeout", timeout.as_secs());
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-}
-
-/// Take ownership of a killed child and `wait` for it on a detached thread.
-///
-/// `std::process::Child` has no reaping `Drop`: dropping the handle after a
-/// `kill` leaves the child a zombie occupying a PID slot for the whole lifetime
-/// of this process. That is affordable for a one-shot CLI and not for a daemon
-/// — `rocmd`'s watcher tick reaches this path on its GPU-telemetry cadence, so
-/// a host where `amd-smi` reliably overruns the probe timeout would accrue
-/// zombies until the PID table ran dry. Reaping on a *detached* thread is what
-/// lets the `wait` happen without the calling thread paying for it.
-///
-/// Guarantees:
-///
-/// - The calling thread returns immediately; it never waits on the child.
-/// - A child that does die — the normal case after `SIGKILL`, and the case
-///   where it had already exited before the `kill` — is reaped, and its PID is
-///   released, within roughly the time the kernel takes to tear it down.
-///
-/// Does not guarantee:
-///
-/// - That the child dies. A process in uninterruptible sleep ignores `SIGKILL`,
-///   so its reaper parks until the kernel lets it go, possibly forever — and so
-///   do both reader threads, which only end at EOF on their pipes. The resources
-///   leaked in that case are three parked threads rather than a zombie PID:
-///   better than blocking the caller, but still a leak, and a larger one than
-///   the single blocked caller thread the pre-rewrite code would have had. The
-///   only real mitigation is declining to spawn against a suspect device: see
-///   the pre-flight on [`amd_smi_json`].
-/// - That a reaper always exists. If the thread cannot be spawned, the child is
-///   dropped and left as a zombie. That is strictly better than propagating an
-///   error from a path that is already reporting one — but it is *not* what the
-///   pre-rewrite code did: that waited synchronously after the `kill` and so
-///   left no zombie, at the cost of blocking the caller in the D-state case
-///   this function exists to return from.
-///
-/// Reaper threads do not accumulate under normal operation: one is created per
-/// timeout, and each one exits as soon as its child does. Accumulation needs a
-/// steady supply of children that never die, which is the uninterruptible-sleep
-/// case above.
-fn reap_in_background(mut child: std::process::Child) {
-    let _ = thread::Builder::new()
-        .name("rocm-reap-timed-out-child".to_owned())
-        .spawn(move || {
-            let _ = child.wait();
-        });
-}
-
-/// Start draining `pipe` on its own thread, or return `None` if no thread can be
-/// started.
-///
-/// `thread::Builder` rather than `thread::spawn` for the same reason
-/// [`reap_in_background`] uses it: a panic here would unwind out of a daemon
-/// with the child already spawned and nobody left to kill or reap it. Failing to
-/// start a reader instead costs that stream's output and leaves the timeout to
-/// bound the call, which is survivable.
-fn drain_on_thread<R: Read + Send + 'static>(mut pipe: R) -> Option<thread::JoinHandle<Vec<u8>>> {
-    thread::Builder::new()
-        .name("rocm-drain-child-pipe".to_owned())
-        .spawn(move || {
-            let mut buffer = Vec::new();
-            let _ = pipe.read_to_end(&mut buffer);
-            buffer
-        })
-        .ok()
-}
-
-fn join_drained(reader: Option<thread::JoinHandle<Vec<u8>>>) -> Vec<u8> {
-    reader.map_or_else(Vec::new, |handle| handle.join().unwrap_or_default())
 }
 
 /// A validated managed-service identifier that is safe to use as a single
@@ -2620,130 +2498,6 @@ mod tests {
         assert!(
             ran_while_allowed,
             "the fake amd-smi never ran at all, so the blocked case proves nothing"
-        );
-        Ok(())
-    }
-
-    /// A merely verbose child must not be mistaken for a hung one. Polling
-    /// `try_wait` without draining deadlocks the moment the child fills the
-    /// pipe buffer — 64 KiB on Linux, which `amd-smi metric --json` clears on a
-    /// multi-GPU host — and that deadlock surfaces as a spurious timeout, which
-    /// for the `serve` path means GPU auto-selection silently loses its VRAM
-    /// telemetry. Both pipes are filled because either one alone can stall the
-    /// child.
-    #[test]
-    #[cfg(unix)]
-    fn a_child_that_outgrows_the_pipe_buffer_is_not_reported_as_hung() -> Result<()> {
-        const BYTES: usize = 300_000;
-
-        let mut command = Command::new("sh");
-        command
-            .arg("-c")
-            .arg(format!(
-                "yes rocm | head -c {BYTES}; yes err | head -c {BYTES} >&2"
-            ))
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        let output = run_command_with_timeout(command, Duration::from_secs(10))?;
-
-        assert!(output.status.success(), "the child should have exited 0");
-        assert_eq!(
-            output.stdout.len(),
-            BYTES,
-            "stdout was truncated or stalled"
-        );
-        assert_eq!(
-            output.stderr.len(),
-            BYTES,
-            "stderr was truncated or stalled"
-        );
-        Ok(())
-    }
-
-    /// Killing a timed-out child is not the same as reaping it.
-    /// `std::process::Child` has no reaping `Drop`, so dropping the handle
-    /// after the `kill` strands the corpse in state `Z` for the lifetime of
-    /// this process. `rocmd` reaches this path from its watcher tick, so on a
-    /// host where `amd-smi` reliably overruns the probe timeout that is an
-    /// unbounded PID leak rather than a one-off.
-    ///
-    /// The child records its own PID before sleeping well past the timeout, so
-    /// this watches the real process table instead of inferring anything from
-    /// the returned error. Drop `reap_in_background` and the entry sits at `Z`
-    /// until the poll below gives up.
-    ///
-    /// Linux-only: `/proc` is where a zombie is observable. The behaviour is
-    /// not Linux-specific, only the assertion is.
-    #[test]
-    #[cfg(target_os = "linux")]
-    fn a_timed_out_child_is_reaped_rather_than_left_a_zombie() -> Result<()> {
-        /// The `stat` state field is the first token after the last `)`, which
-        /// is where parsing has to start because `comm` may itself contain
-        /// parentheses. `None` means the entry is gone, i.e. fully reaped.
-        fn process_state(pid: u32) -> Option<char> {
-            let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-            stat.rsplit_once(')')?
-                .1
-                .split_whitespace()
-                .next()?
-                .chars()
-                .next()
-        }
-
-        let temp_root = std::env::temp_dir().join(format!("rocm-cli-reap-{}", unix_time_millis()));
-        fs::create_dir_all(&temp_root)?;
-        let pid_file = temp_root.join("child-pid");
-
-        // `$$` is this `sh`, which is our direct child whether or not the shell
-        // execs the `sleep` over itself — either way it is the process we kill
-        // and therefore the one that must be reaped. The sleep outlasts the
-        // timeout by enough that the child cannot exit on its own and make the
-        // assertion pass for the wrong reason.
-        let mut command = Command::new("sh");
-        command
-            .arg("-c")
-            .arg(format!("echo $$ > '{}'; sleep 30", pid_file.display()))
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        let result = run_command_with_timeout(command, Duration::from_millis(300));
-        assert!(
-            result.is_err(),
-            "the child outlives the timeout, so this must have timed out: {result:?}"
-        );
-
-        let pid: u32 = fs::read_to_string(&pid_file)
-            .context("the child never recorded its pid, so nothing was proven")?
-            .trim()
-            .parse()
-            .context("unparseable child pid")?;
-        let _ = fs::remove_dir_all(&temp_root);
-
-        // Poll until the entry is *gone*, which is the only state that proves
-        // both halves of the contract. `!= Z` would not: a timeout path that
-        // never killed the child leaves it in `S`, which satisfies `!= Z` while
-        // the child sleeps on. Two transients make this a poll rather than a
-        // single sample — the kernel tearing the child down after the `SIGKILL`
-        // (briefly still `R`/`S`) and the detached reaper waiting on the corpse
-        // (`Z`) — so anything short of `None` is retried until the deadline.
-        //
-        // No PID-reuse hazard: the loop stops at the first `None`, and the slot
-        // cannot be recycled before then because a zombie still occupies it.
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let mut state = process_state(pid);
-        while state.is_some() && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(25));
-            state = process_state(pid);
-        }
-
-        assert_eq!(
-            state, None,
-            "pid {pid} was never reaped: the timeout path must kill the child and wait on it \
-             (state `Z` means it was killed but not reaped; any live state means it was \
-             never killed)"
         );
         Ok(())
     }

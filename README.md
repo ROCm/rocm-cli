@@ -80,7 +80,9 @@ add a demo. Until the demo-gifs workflow has run once, these links 404.
 
 The installer downloads a prebuilt bundle, verifies its SHA-256 checksum,
 installs the `rocm` and `rocmd` binaries into `~/.local/bin`, and adds that
-directory to your shell `PATH`. Rerun it any time to upgrade.
+directory to your shell `PATH`. Rerun it any time to upgrade. `rocm uninstall`
+removes the binaries, and undoes the `PATH` change too when no other program
+lives in that directory.
 
 ### Linux and WSL (x86_64)
 
@@ -278,6 +280,13 @@ the leading `#1`, `#2` are ranking positions for reading order only — `rocm
 fix` takes the id, not the position.
 
 - `--symptom` takes raw error text to sharpen keyword scoring.
+- On Windows, `diagnose` also checks the age of the Visual C++ runtime, not
+  only whether it is there. The runtime in `System32` must be 14.40 or newer
+  (`fix-21-msvc-redist-outdated`). Programs built with a recent toolset, such
+  as the llama.cpp server that Lemonade installs, crash with an access
+  violation in `MSVCP140.dll` on an older one. `rocm examine --json` shows the
+  version it read as `msvc_redist_version`. `rocm fix` only prints the update
+  plan, including a `winget install` line; it never runs the install.
 - `--top` caps how many matches are shown in the human-readable output
   (default 5) — `--json` always emits the full, untruncated report.
 - `--distro` diagnoses a WSL distribution from the Windows host instead of
@@ -353,6 +362,20 @@ rocm update         [--apply] [--runtime KEY] [--activate] [--dry-run]
 
 `install sdk` downloads TheRock ROCm wheels into a Python environment managed
 by rocm-cli.
+
+#### GPUs with no ROCm build
+
+Some AMD GPUs are detected but have no ROCm SDK build at all. The Vega iGPU in
+Renoir, Lucienne, Cezanne and Barcelo APUs — the Radeon Vega graphics in Ryzen
+4000 and 5000 mobile and desktop parts, reported as `gfx90c` — is one of them.
+
+For these, `install sdk` stops and says no ROCm SDK build exists for that GPU,
+instead of listing package families to try. It does the same when you name such
+a target yourself with `--family gfx90c`: the request is refused, and no other
+family is substituted for it. `rocm examine` reports the same conclusion on a
+`rocm_support` line (see [Examine](#examine)).
+
+These GPUs still work with the Vulkan backend, which needs no ROCm SDK.
 
 #### Compiler toolchain (--devel)
 
@@ -932,7 +955,20 @@ rocm logs [--service <service-id>] [--search TERM ...]
 
 rocm uninstall [--yes] [--dry-run]
                [--keep-binaries] [--keep-config] [--keep-data] [--keep-cache]
+               [--force-dev-binaries]
 ```
+
+`rocm uninstall` lists what it will do and asks before doing it (`--yes` skips
+the question, `--dry-run` only lists). It removes the config, data, and cache
+directories and the installed binaries, including the running `rocm.exe` on
+Windows. It also undoes the `PATH` change the installer made: the marked block
+in your shell profile, or the user `PATH` entry the Windows installer recorded
+adding. That change stays when other programs live in the same folder, since
+they may rely on it (the review names them), and with `--keep-binaries`. A
+`PATH` line you wrote yourself is never touched. The `PATH` change is undone
+first: if it cannot be, nothing is removed, so you can fix the cause and run
+`rocm uninstall` again. Each step is reported as it finishes, so if a later
+step fails, the output still shows what was already removed.
 
 On Linux, if a config, data, or cache folder is a link to somewhere else (for
 example a cache moved to a bigger disk), `rocm uninstall` removes the link and

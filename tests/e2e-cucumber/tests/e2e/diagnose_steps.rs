@@ -5,6 +5,7 @@
 use cucumber::{given, then, when};
 
 use crate::E2eWorld;
+use crate::e2e::lifecycle_steps;
 use crate::e2e::tui_driver::{TuiSession, default_timeout};
 
 /// A symptom string that scores a catalog match on both Linux and Windows. It
@@ -51,6 +52,43 @@ const MUTATING_FIX_ID: &str = "fix-9-igpu-dgpu";
 /// root or touching real group membership.
 const COMMAND_FAILURE_FIX_ID: &str = "fix-4-render-group";
 
+/// The Windows PATH-repair recipe at the center of ROCMAI-449. Its own e2e
+/// coverage lives here rather than being folded into [`MUTATING_FIX_ID`]'s
+/// scenario: unlike every other fix-recipe mock in this file, there is no
+/// precedent for faking the thing under test (`powershell.exe`/`setx.exe`
+/// itself), so these scenarios run the real write against the real
+/// User-scope PATH on a `@requires-os:windows` lane instead -- see
+/// `lifecycle_steps::stage_user_path_for_test` for how that stays restorable.
+const PATH_FIX_ID: &str = "fix-6-path";
+
+/// The directory stood in for a HIP SDK install root, inside the scenario's
+/// isolated root. `fix-6-path` resolves its bin dir from `$HIP_PATH` (or the
+/// newest real ROCm install if unset), so pointing `HIP_PATH` here with a real
+/// `bin` subdirectory on disk is enough to reach the PATH read/plan/write
+/// logic without a real ROCm install.
+fn path_fix_sdk_dir(world: &E2eWorld) -> std::path::PathBuf {
+    world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("fake-hip-sdk")
+}
+
+/// The bin dir `fix-6-path` would prepend to the User PATH, under
+/// [`path_fix_sdk_dir`].
+fn path_fix_bin_dir(world: &E2eWorld) -> std::path::PathBuf {
+    path_fix_sdk_dir(world).join("bin")
+}
+
+/// A real pre-existing User PATH value containing an apostrophe, the way
+/// `C:\Users\O'Brien\bin` would appear on a host with that username. Not a
+/// contrived edge case -- see `ps_single_quote_escape`'s doc comment in
+/// `crates/rocm-core/src/fix.rs` -- and chosen so [`assert_path_fix_prepended_with_apostrophe_intact`]
+/// can prove the escaped write script still parses correctly against a real
+/// `powershell.exe`, not just the unit test's simulated one.
+const PATH_FIX_EXISTING_USER_PATH: &str = r"C:\Users\O'Brien\bin;C:\Windows\System32";
+
 /// Every fix-id in the closed catalog, in the order `rocm fix` lists them.
 ///
 /// A duplicate of the catalog, on purpose: a test that derived this list from
@@ -89,6 +127,7 @@ const CATALOG_FIX_IDS: &[&str] = &[
     "fix-wsl-7-wsl1",
     "fix-18-comgr-conflict",
     "fix-19-shm-too-small",
+    "fix-21-msvc-redist-outdated",
 ];
 
 /// The fixes the CLI carries out itself **on the host running the suite**.
@@ -346,6 +385,41 @@ async fn user_named_diagnosis_position(world: &mut E2eWorld) {
     // CLI never sees it. The product behaviour under test is what happens when
     // the argument does arrive.
     world.model_name = Some("#1".to_string());
+}
+
+#[given("a Windows host with a HIP SDK install and an apostrophe already on the real User PATH")]
+async fn user_on_windows_with_hip_sdk_and_apostrophe_path(world: &mut E2eWorld) {
+    let bin_dir = path_fix_bin_dir(world);
+    std::fs::create_dir_all(&bin_dir)
+        .expect("failed to create the scenario's fake HIP SDK bin dir");
+    world
+        .command_env
+        .push(("HIP_PATH", path_fix_sdk_dir(world).into_os_string()));
+    // Captured and restored by `LifecycleState`'s `Drop` (see
+    // `stage_user_path_for_test`), the same guarantee the lifecycle Windows
+    // scenarios get for the same machine-global state.
+    lifecycle_steps::stage_user_path_for_test(world, PATH_FIX_EXISTING_USER_PATH);
+    world.model_name = Some(PATH_FIX_ID.to_string());
+}
+
+#[given("a Windows host with a HIP SDK install and no way to resolve PowerShell")]
+async fn user_on_windows_with_hip_sdk_and_no_powershell(world: &mut E2eWorld) {
+    let bin_dir = path_fix_bin_dir(world);
+    std::fs::create_dir_all(&bin_dir)
+        .expect("failed to create the scenario's fake HIP SDK bin dir");
+    world
+        .command_env
+        .push(("HIP_PATH", path_fix_sdk_dir(world).into_os_string()));
+    // An empty child PATH means the CLI's own `Command::new("powershell")`
+    // cannot resolve the binary at all -- `powershell.exe` lives under
+    // `System32\WindowsPowerShell\v1.0`, which Windows does NOT search
+    // unconditionally the way it does System32 itself, so this is a real
+    // instance of the "PowerShell missing" cause `ps_env_scope`'s doc comment
+    // names, not a faked one. Nothing here touches the real machine's
+    // User-scope PATH, so no capture/restore is needed: the read never gets
+    // far enough to risk it.
+    world.command_env.push(("PATH", std::ffi::OsString::new()));
+    world.model_name = Some(PATH_FIX_ID.to_string());
 }
 
 // ── When ───────────────────────────────────────────────────────────
@@ -1415,6 +1489,67 @@ async fn assert_command_failure_reported_on_stderr(world: &mut E2eWorld) {
     assert!(
         !stdout.contains("group membership NOT changed"),
         "the command-failure explanation must not also be on stdout:\n{stdout}"
+    );
+}
+
+#[then("the CLI used PowerShell's SetEnvironmentVariable, not setx, to update the User PATH")]
+async fn assert_path_fix_used_set_environment_variable(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no fix output");
+    assert_eq!(
+        world.cli_rc,
+        Some(0),
+        "expected the real PATH write to succeed:\n{output}"
+    );
+    assert!(
+        output.contains("[Environment]::SetEnvironmentVariable("),
+        "expected the PowerShell plan/write line cb9f748d introduced, not setx:\n{output}"
+    );
+    assert!(
+        !output.contains("setx "),
+        "setx must not appear now that the write goes through PowerShell:\n{output}"
+    );
+    assert!(
+        output.contains("This only takes effect in NEW shells"),
+        "expected the post-write wording cb9f748d introduced:\n{output}"
+    );
+}
+
+#[then("the HIP SDK bin dir is prepended on the real User PATH, apostrophe intact")]
+async fn assert_path_fix_prepended_with_apostrophe_intact(world: &mut E2eWorld) {
+    let bin_dir = path_fix_bin_dir(world).to_string_lossy().into_owned();
+    let new_user_path = lifecycle_steps::read_user_path_for_test();
+    assert!(
+        new_user_path.starts_with(&bin_dir),
+        "expected {bin_dir} prepended (not appended) to the real User PATH: {new_user_path:?}"
+    );
+    assert!(
+        new_user_path.contains("O'Brien"),
+        "the pre-existing apostrophe-containing path entry must survive the write \
+         unmangled -- a failure here means the write script's quoting broke \
+         mid-statement against a real powershell.exe, not just the unit test's \
+         simulated one:\n{new_user_path:?}"
+    );
+}
+
+#[then("the CLI aborts the PATH fix with exit code 4 and changes nothing")]
+async fn assert_path_fix_aborts_on_unreadable_path(world: &mut E2eWorld) {
+    let output = world.cli_output.as_deref().unwrap_or("");
+    let stderr = world.cli_stderr.as_deref().unwrap_or("");
+    assert_eq!(
+        world.cli_rc,
+        Some(4),
+        "a failed PATH read must abort with exit code 4 -- the same code as a \
+         write failure -- rather than being silently treated as an empty PATH \
+         (ROCMAI-449):\n{output}\n{stderr}"
+    );
+    let combined = format!("{output}\n{stderr}");
+    assert!(
+        combined.contains("Could not read the current User PATH"),
+        "expected the abort message naming the failed read:\n{combined}"
+    );
+    assert!(
+        !combined.contains("Plan: prepend"),
+        "a failed read must abort before any write plan is printed:\n{combined}"
     );
 }
 

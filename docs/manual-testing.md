@@ -193,6 +193,44 @@ Use `--family` only when a test needs a fixed package family. Do not use it for
 normal user setup. The script checks the default install; add `--devel` to check
 the opt-in compiler toolchain path instead.
 
+### 2a. A GPU target with no ROCm build
+
+Any machine can run this one; it needs no particular GPU. `gfx90c` is the Vega
+iGPU in Renoir, Lucienne, Cezanne and Barcelo APUs, and ROCm publishes no build
+for it:
+
+```powershell
+rocm install sdk --family gfx90c --dry-run
+```
+
+Expected result:
+
+- The command fails. It says no ROCm SDK build exists for `gfx90c`, names
+  `--family` as where the target came from, and states that nothing was
+  installed and no other family was substituted.
+- It offers **no** package family to try instead. A message listing
+  `gfx110X-all`, `gfx90X-dcgpu` or any other family here is a regression: it
+  invites installing a build for different silicon. In particular
+  `gfx90X-dcgpu` appearing means the data-center catch-all has been reopened.
+- It does not fall back to this machine's own GPU. On a host with a supported
+  card, a run that succeeds and installs for that card is a regression — the
+  named target must not be silently replaced.
+
+On a Ryzen 4000 or 5000 machine whose Vega iGPU is the only GPU, two further
+checks, which cannot be made anywhere else:
+
+- `rocm examine` shows `detected_gfx_target: gfx90c` with an empty
+  `compatible_therock_family`, plus a `rocm_support` line saying the GPU is
+  detected but not supported by ROCm and that the Vulkan backend can still be
+  used. A `<unknown>` target, or a missing `rocm_support` line, means detection
+  regressed.
+- A plain `rocm install sdk`, with no `--family`, gives the same refusal with
+  the wording for a *detected* GPU rather than a requested one.
+
+On Windows, a hybrid laptop with both the Vega iGPU and a discrete card must
+still report the discrete card from `rocm examine`; the iGPU is listed first by
+WMI and must not hide it.
+
 ## 3. Lemonade GPU Verification
 
 Lemonade is the default local assistant/server engine. Serve a small assistant
@@ -208,6 +246,12 @@ Expected result:
 - The run does not fall back to CPU or Vulkan.
 - If the GPU cannot be used, the command fails with a clear error.
 - The OpenAI-compatible endpoint answers a simple chat request.
+
+If the llama.cpp server exits at start with an access violation (`0xC0000005`
+in `MSVCP140.dll`), the Visual C++ runtime on the machine is probably older than
+14.40. Run `rocm diagnose` and expect `fix-21-msvc-redist-outdated`. `rocm fix
+fix-21-msvc-redist-outdated` prints the update plan and changes nothing. After
+the update, restart Lemonade and repeat the serve command above.
 
 While the log stream is attached, verify detach and stop behave differently:
 
@@ -577,3 +621,27 @@ To turn provider-assisted planning back off:
 ```powershell
 rocm config clear-planner-provider
 ```
+
+## 8. Uninstall
+
+Run this last, on a machine installed with the release installer (not a
+`cargo` build, whose binaries uninstall leaves alone):
+
+```powershell
+rocm uninstall --dry-run
+rocm uninstall
+```
+
+Expected result:
+
+- The dry run lists the binaries (on Windows, `rocm.exe` is marked as deleted
+  as the command exits) and, under
+  `PATH changes from the installer that would be undone:`, the shell profile
+  (Linux) or the user `PATH` entry (Windows). It removes nothing.
+- After confirming, the install folder holds no `rocm`/`rocmd` files, and a new
+  terminal no longer gets the install folder on `PATH` from the installer's
+  change.
+- If another program lives in the install folder, the review instead says
+  `PATH change left in place` and names it, and the `PATH` change stays.
+- With `rocm uninstall --keep-binaries`, the review says the `PATH` change
+  stays too, and it does.

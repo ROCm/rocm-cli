@@ -128,11 +128,15 @@ const fn gpu_reachable_for_preflight(is_wsl_host: bool, has_usable_gpu: bool) ->
 /// logical clock rather than restoring wall time. The warning goes to `tracing`, not
 /// stdout/stderr. It is reached through [`runner_options`], which runtime code
 /// calls only from [`maybe_spawn_embedded_daemon`]; `run_async` calls that only
-/// when [`should_spawn_daemon`] holds, i.e. for a live `rocm dash` and for
-/// `rocm chat` (including the launcher's routes into them), not for a focused
-/// overlay or `rocm dash --replay`/`--demo`. On those paths the process is about
-/// to hand the terminal to the TUI, and the client log is file-only (see
-/// `logging.rs`), so a stray stdout/stderr write would corrupt the display.
+/// when [`should_spawn_daemon`] holds, i.e. for a live `rocm dash` and for an
+/// interactive `rocm chat` (including the launcher's routes into them; a
+/// non-interactive `rocm chat` renders text and never enters `run_async`), not
+/// for a focused overlay or `rocm dash --replay`/`--demo`. All of this is
+/// unix-only: on Windows [`maybe_spawn_embedded_daemon`] never calls
+/// [`runner_options`], so no entry point reaches the warning. On the paths that
+/// do reach it, the process is about to hand the terminal to the TUI, and the
+/// client log is file-only (see `logging.rs`), so a stray stdout/stderr write
+/// would corrupt the display.
 fn dash_test_clock_offset_path(paths: &AppPaths) -> Option<PathBuf> {
     let path = paths.dash_test_clock_file();
     if !path.is_file() {

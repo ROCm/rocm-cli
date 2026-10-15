@@ -23,8 +23,8 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 use std::process::{Command as ProcessCommand, Stdio};
-// Test-only now: the Linux sandbox timeout no longer runs its own sleep-poll
-// loop, it delegates to `rocm_core::run_command_with_timeout`.
+// Only the tests still park a thread here; the sandbox spawn now goes through
+// `rocm_core::process::run_with_timeout`, which owns its own reader threads.
 #[cfg(test)]
 use std::thread;
 use std::time::Duration;
@@ -117,7 +117,8 @@ fn run_bubblewrap_sandbox(
         policy,
     );
 
-    let output = run_process_with_timeout(command, Duration::from_mins(1))?;
+    let output =
+        rocm_core::process::run_with_timeout(command, Duration::from_mins(1), "sandbox process")?;
     let value = parse_sandbox_child_output(output, "bubblewrap sandbox")?;
     record_sandbox_audit(paths, tool, "bubblewrap", true, service_id.as_deref())?;
     Ok(sandbox_report(tool, "bubblewrap", value))
@@ -936,39 +937,6 @@ fn append_sandbox_tool_command_args(
     if let Some(message) = message {
         command.arg("--message").arg(message);
     }
-}
-
-/// Run the bubblewrap child under a timeout, via the one shared helper.
-///
-/// This used to be a third hand-rolled copy of the same poll-and-kill loop, from
-/// the same split (`e760d9a5`) that produced the amd-smi ones — and it carried
-/// the same defect: it polled `try_wait` while both pipes stayed undrained, so a
-/// sandbox child that filled the 64 KiB pipe buffer blocked mid-write and was
-/// then reported as having exceeded its timeout. A verbose child, misdiagnosed
-/// as a hang. `rocm_core::run_command_with_timeout` drains both pipes on their
-/// own threads and hands the `wait` of a killed child to a detached reaper, so
-/// routing through it fixes that here too and leaves one implementation to
-/// maintain.
-///
-/// The stdio setup stays at this call site because the helper does not impose
-/// one: [`rocm_core::amd_smi_json`] configures its own the same way.
-///
-/// Two deliberate message changes come with the move. The helper's timeout error
-/// is the generic `process exceeded <n>s timeout`, so the "sandbox process"
-/// framing is restored as context rather than baked into the bail. And it no
-/// longer quotes the timed-out child's partial output: the helper refuses to
-/// join the reader threads on the timeout path precisely because an unkillable
-/// child would block them, which is the hang the timeout exists to bound.
-#[cfg(target_os = "linux")]
-fn run_process_with_timeout(
-    mut command: ProcessCommand,
-    timeout: Duration,
-) -> Result<std::process::Output> {
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    rocm_core::run_command_with_timeout(command, timeout).context("sandbox process failed")
 }
 
 #[cfg(target_os = "linux")]

@@ -160,20 +160,23 @@ pub(crate) fn vllm_runtime_warnings(runtime: &VllmRuntime) -> Vec<String> {
     ];
     if !cfg!(windows) && !rocm_core::openmpi::detect_openmpi().present {
         warnings.push(format!(
-            "OpenMPI runtime (libmpi.so / libmpi_cxx.so / mpirun) was not found; vLLM requires it. {}, or rerun `rocm engines install vllm --yes`.",
+            "OpenMPI runtime (libmpi.so / libmpi_cxx.so / mpirun) was not found; vLLM requires it. {}.",
             rocm_core::openmpi::install_hint()
+                .or("rerun `rocm engines install vllm --yes`")
         ));
     }
     if !cfg!(windows) && !rocm_core::openmpi::libatomic_present() {
         warnings.push(format!(
-            "libatomic runtime (libatomic.so.1) was not found; vLLM's torch wheel requires it. {}, or rerun `rocm engines install vllm --yes`.",
+            "libatomic runtime (libatomic.so.1) was not found; vLLM's torch wheel requires it. {}.",
             rocm_core::openmpi::libatomic_install_hint()
+                .or("rerun `rocm engines install vllm --yes`")
         ));
     }
     if !cfg!(windows) && !rocm_core::openmpi::libnuma_present() {
         warnings.push(format!(
-            "system numactl runtime (libnuma.so.1 with libnuma_1.2) was not found; vLLM's torch wheel requires it and the ROCm SDK's bundled numa cannot satisfy it. {}, or rerun `rocm engines install vllm --yes`.",
+            "system numactl runtime (libnuma.so.1 with libnuma_1.2) was not found; vLLM's torch wheel requires it and the ROCm SDK's bundled numa cannot satisfy it. {}.",
             rocm_core::openmpi::libnuma_install_hint()
+                .or("rerun `rocm engines install vllm --yes`")
         ));
     }
     warnings
