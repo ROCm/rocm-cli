@@ -147,7 +147,7 @@ fn dash_test_clock_offset_path(paths: &AppPaths) -> Option<PathBuf> {
         "dashboard telemetry clock is in TEST mode, not wall time: a logical \
          clock read from this file drives displayed timestamps, the timestamps \
          written into persisted session records, and every figure derived from \
-         them — generation throughput, latency averages and metric freshness. \
+         them - generation throughput, latency averages and metric freshness. \
          Only the E2E harness creates it; remove it and restart the dashboard to \
          return to wall time (deleting it mid-run pins the logical clock instead)."
     );
