@@ -2133,10 +2133,17 @@ fn replace_file_windows(path: &Path, replacement: &Path) -> std::io::Result<()> 
 ///   planting a link) but it is a behaviour change, so a caller that means to
 ///   write through a link must resolve it first.
 pub fn write_file_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
+    let temp_id = format!("{}-{}", std::process::id(), unix_time_millis());
+    write_file_atomically_with_temp_id(path, bytes, &temp_id)
+}
+
+/// [`write_file_atomically`] with the scratch-file id supplied, so a test can
+/// plant files under the names the attempts will try and drive the
+/// already-exists retry and the exhausted-attempts failure deterministically.
+fn write_file_atomically_with_temp_id(path: &Path, bytes: &[u8], temp_id: &str) -> Result<()> {
     let parent = path.parent().context("file path has no parent directory")?;
     fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
 
-    let temp_id = format!("{}-{}", std::process::id(), unix_time_millis());
     let mut reserved = None;
     for attempt in 0..ATOMIC_WRITE_TEMP_ATTEMPTS {
         let tmp = temp_sibling_path(path, &OsString::from(format!("{temp_id}-{attempt}")))?;
@@ -2219,6 +2226,56 @@ mod tests {
                 name.contains(".tmp-").then_some(name)
             })
             .collect()
+    }
+
+    #[test]
+    fn a_taken_scratch_name_is_skipped_and_the_write_still_lands() {
+        // Another writer already holds attempt 0's name: the write must move on to
+        // the next attempt rather than fail or clobber the file it does not own.
+        let root = atomic_write_root("scratch-name-taken");
+        let target = root.join("record.json");
+        let taken = root.join("record.json.tmp-fixed-0");
+        fs::write(&taken, b"someone else's scratch").expect("plant the taken name");
+
+        write_file_atomically_with_temp_id(&target, b"mine", "fixed").expect("write");
+
+        assert_eq!(fs::read(&target).expect("read"), b"mine");
+        assert_eq!(
+            fs::read(&taken).expect("read"),
+            b"someone else's scratch",
+            "a scratch file that is not ours is left untouched"
+        );
+        assert_eq!(
+            leftover_scratch_files(&root),
+            vec!["record.json.tmp-fixed-0".to_owned()],
+            "our own scratch file is gone once published"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn every_scratch_name_taken_is_an_error_not_a_clobber() {
+        let root = atomic_write_root("scratch-names-exhausted");
+        let target = root.join("record.json");
+        fs::write(&target, b"original").expect("seed the target");
+        for attempt in 0..ATOMIC_WRITE_TEMP_ATTEMPTS {
+            fs::write(root.join(format!("record.json.tmp-fixed-{attempt}")), b"x")
+                .expect("plant a taken name");
+        }
+
+        let error = write_file_atomically_with_temp_id(&target, b"new", "fixed")
+            .expect_err("no scratch name is free");
+
+        assert!(
+            format!("{error:#}").contains("failed to reserve a temporary file"),
+            "{error:#}"
+        );
+        assert_eq!(
+            fs::read(&target).expect("read"),
+            b"original",
+            "a failed reservation leaves the target as it was"
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     /// Linux/unix: relies on a rename replacing the directory entry while an

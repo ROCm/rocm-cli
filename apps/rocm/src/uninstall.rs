@@ -91,18 +91,30 @@ fn stop_then_remove_with(
     stop_managed_services: impl FnOnce() -> Result<ManagedServiceStopReport>,
     remove: impl Fn(&std::path::Path) -> Result<()>,
 ) -> Result<()> {
+    stop_then_remove_writing_to(plan, stop_managed_services, remove, &mut std::io::stderr())
+}
+
+/// [`stop_then_remove_with`] with the stream the stop pass's warnings go to, so
+/// a test can read what the operator would see on stderr and in which order
+/// relative to the abort.
+fn stop_then_remove_writing_to(
+    plan: &UninstallPlan,
+    stop_managed_services: impl FnOnce() -> Result<ManagedServiceStopReport>,
+    remove: impl Fn(&std::path::Path) -> Result<()>,
+    warnings_out: &mut impl std::io::Write,
+) -> Result<()> {
     let stop_report = stop_managed_services()?;
     // Every fail-open the stop pass took, on stderr rather than stdout: these
     // are the places uninstall proceeded without proving the port was free, so
     // they have to survive the operator piping its output somewhere. Printed
     // before the gate, so they are on screen whether or not it aborts.
-    write_stop_warnings(&mut std::io::stderr(), &stop_report);
+    write_stop_warnings(warnings_out, &stop_report);
     if let Some(line) = uninstall_removal_gate(&stop_report)? {
         println!("{line}");
     }
 
-    // The removal itself is not transactional: entries go in plan order (binaries
-    // before config, data and cache) with no rollback. A failure partway can
+    // The removal itself is not transactional: entries go in plan order (sorted
+    // by path, so binaries are not necessarily first) with no rollback. A failure partway can
     // therefore leave the binaries and service records gone while a server the
     // gate judged stopped is not, so say exactly what is and is not removed
     // instead of a bare "failed to remove".
@@ -164,7 +176,10 @@ mod tests {
 
     use anyhow::bail;
 
-    use super::{stop_managed_services_then_remove, stop_then_remove_with, write_stop_warnings};
+    use super::{
+        stop_managed_services_then_remove, stop_then_remove_with, stop_then_remove_writing_to,
+        write_stop_warnings,
+    };
     use crate::uninstall_gate::{
         FailedManagedServiceStop, ManagedServiceStopReport, StopFailureRemedy,
     };
@@ -373,6 +388,66 @@ mod tests {
             String::from_utf8(out).expect("utf8"),
             "warning: first fail-open\nwarning: second fail-open\n"
         );
+    }
+
+    #[test]
+    fn the_stop_warnings_reach_the_operator_whether_or_not_the_run_aborts() {
+        // `write_stop_warnings` is tested on its own above; this pins the call
+        // site in the command, which a no-op there would otherwise leave green:
+        // the fail-opens are the only disclosure that uninstall proceeded without
+        // proving a port was free.
+        let (root, plan) = plan_removing_one_file("warnings-proceed");
+        let mut out = Vec::new();
+        stop_then_remove_writing_to(
+            &plan,
+            || {
+                Ok(ManagedServiceStopReport {
+                    warnings: vec!["could not check port 9".to_owned()],
+                    ..ManagedServiceStopReport::default()
+                })
+            },
+            |path| {
+                fs::remove_file(path)?;
+                Ok(())
+            },
+            &mut out,
+        )
+        .expect("a run with only fail-open warnings proceeds");
+        assert_eq!(
+            String::from_utf8(out).expect("utf8"),
+            "warning: could not check port 9\n"
+        );
+        let _ = fs::remove_dir_all(root);
+
+        // And on the abort path: printed before the gate refuses, so they are on
+        // screen even though nothing was removed.
+        let (root, plan) = plan_removing_one_file("warnings-abort");
+        let doomed = plan.actions[0].path.clone();
+        let mut out = Vec::new();
+        let error = stop_then_remove_writing_to(
+            &plan,
+            || {
+                Ok(ManagedServiceStopReport {
+                    failed: vec![FailedManagedServiceStop {
+                        service_id: "svc-stuck".to_owned(),
+                        reason: "still \"ready\"".to_owned(),
+                        remedy: StopFailureRemedy::StopTheService,
+                    }],
+                    warnings: vec!["could not check port 9".to_owned()],
+                    ..ManagedServiceStopReport::default()
+                })
+            },
+            |_| panic!("an aborted run removes nothing"),
+            &mut out,
+        )
+        .expect_err("a failed stop aborts");
+        assert!(format!("{error:#}").contains("svc-stuck"));
+        assert_eq!(
+            String::from_utf8(out).expect("utf8"),
+            "warning: could not check port 9\n"
+        );
+        assert!(doomed.is_file(), "nothing was removed");
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

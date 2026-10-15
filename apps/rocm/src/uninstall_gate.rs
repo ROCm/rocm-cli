@@ -18,7 +18,8 @@ use std::time::Duration;
 
 use crate::{
     MANAGED_STOP_GRACE, endpoint_keys, host_port_resolves, load_managed_services,
-    loopback_tcp_port_is_reachable, managed_service_is_live, stop_internal_managed_service,
+    loopback_tcp_port_is_reachable, managed_service_is_live, managed_service_record_is_in_use,
+    stop_internal_managed_service_confirmed,
 };
 
 /// A managed service uninstall could not confirm stopped, and why.
@@ -238,67 +239,145 @@ pub(crate) struct ManagedServiceStopReport {
     pub(crate) helper_stopped: bool,
 }
 
-/// What the plan should tell the operator about the background helper, derived
-/// from the same state file and identity decision the stop pass acts on, so the
-/// line cannot promise a stop that pass then refuses.
+/// The kill breadth the stop applies to the background helper.
 ///
-/// `None` when there is nothing to say: no state file, a helper that is not
-/// running, or a recorded pid that is free or belongs to someone else.
+/// A constant so a test can see the scope the production stop hands the
+/// termination, rather than only that some termination was requested.
+pub(crate) const HELPER_KILL_SCOPE: rocm_core::KillScope = rocm_core::KillScope::Tree;
+
+/// How much of a process tree the stop signals, in words, for the plan and the
+/// docs: only Linux enumerates descendants (`process_tree_pids` returns just the
+/// root on Windows), so the claim cannot be the same on both.
+pub(crate) fn tree_scope_words() -> &'static str {
+    if rocm_core::runtime_is_windows() {
+        "only the recorded process (descendants are not enumerated on Windows)"
+    } else {
+        "its whole process tree"
+    }
+}
+
+/// What the gate decides about the background helper, read without touching it.
+///
+/// The one decision behind the plan's note, the pre-flight and the stop itself,
+/// so the plan cannot promise a stop that the stop then refuses.
+pub(crate) enum HelperDecision {
+    /// No state file, `running` false, a free pid, or a pid that belongs to
+    /// someone else.
+    NothingToStop,
+    /// The state file exists but does not read or parse.
+    UnreadableState(String),
+    /// A live pid is recorded as the helper but cannot be proven to be it.
+    Unverifiable { pid: u32 },
+    /// Verified as the helper: stop it.
+    Stop {
+        pid: u32,
+        identity: rocm_core::ProcessIdentity,
+    },
+}
+
+/// Decide [`HelperDecision`] from the state file and one reading of the pid.
+pub(crate) fn helper_decision(paths: &AppPaths) -> HelperDecision {
+    // Three outcomes, not two. `load` returns `Ok(None)` only when there is no
+    // state file at all; a permission error or a half-written file returns
+    // `Err`, and discarding that would skip the daemon stop silently and let
+    // uninstall delete the tooling while a live `rocmd` respawns what the
+    // service pass just stopped.
+    let state = match AutomationRuntimeState::load(paths) {
+        Ok(Some(state)) => state,
+        Ok(None) => return HelperDecision::NothingToStop,
+        Err(error) => return HelperDecision::UnreadableState(format!("{error:#}")),
+    };
+    // `running` is the same inactive contract `background_helper_already_running`
+    // spawns on. Only the clean-shutdown path writes `running: false`, so a false
+    // flag means the recorded pid belongs to a daemon that already exited, and
+    // anything alive under it now inherited the number.
+    if !state.running || state.daemon_pid == 0 || state.daemon_pid == std::process::id() {
+        return HelperDecision::NothingToStop;
+    }
+    if !rocm_core::process_is_running(state.daemon_pid) {
+        return HelperDecision::NothingToStop;
+    }
+    // Kill nothing this cannot identify. `terminate_verified` with `force` is a
+    // SIGKILL across the whole process tree, and `runtime-state.json` outlives a
+    // crash, OOM-kill or reboot with `running` still true, so the recorded pid
+    // can belong to an unrelated process by the time uninstall runs. An absent
+    // start-time is unverifiable on its own (see `record_predates_start_ticks`),
+    // and one reading of the daemon's start-time serves the whole decision, so
+    // a pid that flickers cannot clear one check and fail another.
+    let identity = rocm_core::ProcessIdentity::new(state.daemon_pid, state.daemon_start_ticks);
+    let observed_start_ticks = rocm_core::process_start_ticks(state.daemon_pid);
+    match daemon_identity_outcome(
+        rocm_core::identity_state_with_observed(&identity, observed_start_ticks),
+        record_predates_start_ticks(state.daemon_start_ticks),
+    ) {
+        DaemonIdentityOutcome::NothingOfOurs => HelperDecision::NothingToStop,
+        DaemonIdentityOutcome::Unverifiable => HelperDecision::Unverifiable {
+            pid: state.daemon_pid,
+        },
+        DaemonIdentityOutcome::Stop => HelperDecision::Stop {
+            pid: state.daemon_pid,
+            identity,
+        },
+    }
+}
+
+/// The refusal a [`HelperDecision`] amounts to, if any.
+fn helper_refusal(paths: &AppPaths, decision: &HelperDecision) -> Option<FailedManagedServiceStop> {
+    match decision {
+        // Name the file, not a pid: nothing parsed, so no pid was ever
+        // recovered and "kill that pid" would be advice nobody can follow.
+        HelperDecision::UnreadableState(error) => Some(FailedManagedServiceStop {
+            service_id: format!("rocmd ({})", paths.automation_state_path().display()),
+            reason: format!(
+                "the background helper's runtime state could not be read, so it cannot be \
+                 confirmed stopped: {error}"
+            ),
+            remedy: StopFailureRemedy::RepairTheDaemonState,
+        }),
+        HelperDecision::Unverifiable { pid } => Some(daemon_identity_unverified(
+            *pid,
+            &paths.automation_state_path(),
+        )),
+        HelperDecision::NothingToStop | HelperDecision::Stop { .. } => None,
+    }
+}
+
+/// What the plan should tell the operator about the background helper, derived
+/// from the same decision the stop pass acts on, so the line cannot promise a
+/// stop that pass then refuses.
+///
+/// `None` when there is nothing to say: nothing to stop, or a refusal the plan's
+/// consolidated refusal line already names. `run_refuses` is whether that line
+/// is present: a helper that is verified but sits in a run which aborts before
+/// the stop is left running, and saying "will be stopped" would be false.
 pub(crate) fn background_helper_plan_note(
     paths: &AppPaths,
     removes_recovery_tooling: bool,
+    run_refuses: bool,
 ) -> Option<String> {
     let state_file = paths.automation_state_path();
-    let state = match AutomationRuntimeState::load(paths) {
-        Ok(Some(state)) => state,
-        Ok(None) => return None,
-        Err(error) => {
-            return Some(if removes_recovery_tooling {
-                format!(
-                    "could not read the background helper's runtime state {}: {error:#}. \
-                     Uninstall will refuse to remove anything until it can be read",
-                    state_file.display()
-                )
-            } else {
-                format!(
-                    "could not read the background helper's runtime state {}: {error:#}. \
-                     This run keeps the tooling, so it does not check it",
-                    state_file.display()
-                )
-            });
-        }
-    };
-    if !state.running
-        || state.daemon_pid == 0
-        || state.daemon_pid == std::process::id()
-        || !rocm_core::process_is_running(state.daemon_pid)
-    {
-        return None;
-    }
-    let identity = rocm_core::ProcessIdentity::new(state.daemon_pid, state.daemon_start_ticks);
-    let outcome = daemon_identity_outcome(
-        rocm_core::identity_state_with_observed(
-            &identity,
-            rocm_core::process_start_ticks(state.daemon_pid),
-        ),
-        record_predates_start_ticks(state.daemon_start_ticks),
-    );
-    let pid = state.daemon_pid;
-    match (outcome, removes_recovery_tooling) {
-        (DaemonIdentityOutcome::NothingOfOurs, _) => None,
-        (DaemonIdentityOutcome::Stop, true) => Some(format!(
-            "the background helper (rocmd, pid {pid}) is running; it will be stopped, with its \
-             whole process tree, before removal"
-        )),
-        (DaemonIdentityOutcome::Unverifiable, true) => Some(format!(
-            "the background helper (rocmd, pid {pid}) is running but cannot be verified as \
-             rocmd (no start time was recorded for it), so uninstall will refuse to remove \
-             anything until you stop it or delete {}",
+    match (helper_decision(paths), removes_recovery_tooling) {
+        (HelperDecision::NothingToStop, _) => None,
+        // Named by the refusal line, which comes from the same decision.
+        (HelperDecision::UnreadableState(_) | HelperDecision::Unverifiable { .. }, true) => None,
+        (HelperDecision::UnreadableState(error), false) => Some(format!(
+            "could not read the background helper's runtime state {}: {error}. This run keeps \
+             the tooling, so it does not check it",
             state_file.display()
         )),
-        (_, false) => Some(format!(
+        (HelperDecision::Unverifiable { pid }, false)
+        | (HelperDecision::Stop { pid, .. }, false) => Some(format!(
             "the background helper (rocmd, pid {pid}) is running; this removal keeps the \
-             tooling, so it is left running"
+                 tooling, so it is left running"
+        )),
+        (HelperDecision::Stop { pid, .. }, true) if run_refuses => Some(format!(
+            "the background helper (rocmd, pid {pid}) is running; uninstall will refuse (see \
+             above) before stopping anything, so it is left running"
+        )),
+        (HelperDecision::Stop { pid, .. }, true) => Some(format!(
+            "the background helper (rocmd, pid {pid}) is running; it will be stopped before \
+             removal, and the kill covers {}",
+            tree_scope_words()
         )),
     }
 }
@@ -395,211 +474,79 @@ pub(crate) fn stop_background_helper_before_uninstall(
     paths: &AppPaths,
     report: &mut ManagedServiceStopReport,
 ) {
-    stop_background_helper_with(paths, report, |identity| {
-        rocm_core::terminate_verified(
-            identity,
-            rocm_core::KillScope::Tree,
-            MANAGED_STOP_GRACE,
-            true,
-        )
+    stop_background_helper_with(paths, report, |identity, scope| {
+        rocm_core::terminate_verified(identity, scope, MANAGED_STOP_GRACE, true)
     });
 }
 
 /// [`stop_background_helper_before_uninstall`] with the verified termination
-/// injectable, so a test can make the stop come back unconfirmed.
+/// injectable, so a test can make the stop come back unconfirmed and see the
+/// [`HELPER_KILL_SCOPE`] the production stop asks for.
 pub(crate) fn stop_background_helper_with(
     paths: &AppPaths,
     report: &mut ManagedServiceStopReport,
-    terminate: impl FnOnce(&rocm_core::ProcessIdentity) -> rocm_core::TerminationOutcome,
+    terminate: impl FnOnce(
+        &rocm_core::ProcessIdentity,
+        rocm_core::KillScope,
+    ) -> rocm_core::TerminationOutcome,
 ) {
-    // Three outcomes, not two. `load` returns `Ok(None)` only when there is no
-    // state file at all; a permission error or a half-written file returns
-    // `Err`, and discarding that would skip the daemon stop silently and let
-    // uninstall delete the tooling while a live `rocmd` respawns what the
-    // service pass just stopped — the exact defect this gate exists to close.
-    // The service side already treats an unparseable record as a hard failure
-    // (see `unreadable_service_manifests`); this is the same call.
-    let state = match AutomationRuntimeState::load(paths) {
-        Ok(Some(state)) => state,
-        Ok(None) => return,
-        Err(error) => {
-            // Name the file, not a pid: nothing parsed, so no pid was ever
-            // recovered and "kill that pid" would be advice nobody can follow.
-            // Repairing or deleting this file is the only action that clears it,
-            // and uninstall has no `--force`, so the abort has to say so.
-            report.failed.push(FailedManagedServiceStop {
-                service_id: format!("rocmd ({})", paths.automation_state_path().display()),
-                reason: format!(
-                    "the background helper's runtime state could not be read, so it cannot be \
-                     confirmed stopped: {error:#}"
-                ),
-                remedy: StopFailureRemedy::RepairTheDaemonState,
-            });
-            return;
-        }
+    let decision = helper_decision(paths);
+    if let Some(failure) = helper_refusal(paths, &decision) {
+        report.failed.push(failure);
+        return;
+    }
+    let HelperDecision::Stop { pid, identity } = decision else {
+        return;
     };
-    // `running` is the same inactive contract `background_helper_already_running`
-    // spawns on, and honoring it here is what keeps this path off an unrelated
-    // process. Only the clean-shutdown path writes `running: false` — a daemon
-    // started without `--automations-enabled` returns before its first state
-    // write — so a false flag means the recorded pid belongs to a daemon that
-    // already exited, and anything alive under it now inherited the number.
-    if !state.running || state.daemon_pid == 0 || state.daemon_pid == std::process::id() {
-        return;
-    }
-    if !rocm_core::process_is_running(state.daemon_pid) {
-        return;
-    }
-    // Kill nothing this cannot identify. `terminate_verified` with `force` is a
-    // SIGKILL across the whole process tree, and `runtime-state.json` outlives a
-    // crash, OOM-kill or reboot with `running` still true — so the recorded PID
-    // can belong to an unrelated process by the time uninstall runs.
-    //
-    // `identity_state` maps an unrecorded start-time to `Matches` (best-effort,
-    // for legacy state files), which is exactly wrong here: a state file written
-    // by a pre-upgrade `rocmd` has no `daemon_start_ticks`, and treating that as
-    // a match would force-kill a whole tree at a PID this cannot prove is ours —
-    // the ordinary upgrade path. So when this platform *can* read a start-time
-    // (`/proc`) yet none was recorded, the record simply predates the field:
-    // treat it as unverifiable, leave the process alone, and abort. Being told
-    // to kill a PID is recoverable; killing an unrelated process tree is not.
-    //
-    // The decision no longer asks the platform whether a start-time could have
-    // been recorded: both supported platforms can, so an absent one is
-    // `record_predates_start_ticks`, unverifiable on its own. That also closes
-    // the case where a legacy record's pid was momentarily unreadable and would
-    // have landed in the best-effort `Matches` arm.
-    //
-    // One reading of the *daemon's* start-time then serves the identity question
-    // below. Reading it twice let two answers come from different observations,
-    // so a PID that flickered could clear one check and fail the other.
-    let identity = rocm_core::ProcessIdentity::new(state.daemon_pid, state.daemon_start_ticks);
-    let observed_start_ticks = rocm_core::process_start_ticks(state.daemon_pid);
-    let unverifiable_pre_upgrade_record = record_predates_start_ticks(state.daemon_start_ticks);
-    match daemon_identity_outcome(
-        rocm_core::identity_state_with_observed(&identity, observed_start_ticks),
-        unverifiable_pre_upgrade_record,
-    ) {
-        DaemonIdentityOutcome::NothingOfOurs => return,
-        DaemonIdentityOutcome::Unverifiable => {
-            report.failed.push(daemon_identity_unverified(
-                state.daemon_pid,
-                &paths.automation_state_path(),
-            ));
-            return;
-        }
-        DaemonIdentityOutcome::Stop => {}
-    }
     println!("stopping the background helper (rocmd)");
-    let outcome = terminate(&identity);
+    let outcome = terminate(&identity, HELPER_KILL_SCOPE);
     if outcome.stopped() {
         report.helper_stopped = true;
     } else if matches!(outcome, rocm_core::TerminationOutcome::Unverified) {
         report.failed.push(daemon_identity_unverified(
-            state.daemon_pid,
+            pid,
             &paths.automation_state_path(),
         ));
     } else {
         report.failed.push(FailedManagedServiceStop {
-            service_id: format!("rocmd (pid {})", state.daemon_pid),
-            reason: "the background helper could not be confirmed stopped, and it restarts \
-                     managed services whose endpoint stops answering"
+            service_id: format!("rocmd (pid {})", pid),
+            reason: "the background helper was signalled but could not be confirmed stopped (the \
+                     servers it supervised may already be down), and it restarts managed \
+                     services whose endpoint stops answering"
                 .to_owned(),
             remedy: StopFailureRemedy::StopTheDaemon,
         });
     }
 }
 
-/// Stop every live managed service before uninstall removes the binaries and
-/// service records needed to stop them.
+/// Whether the stop pass has to deal with `record`: it reads as running, or its
+/// status says something other than `stopped` while a recorded process is still
+/// alive.
 ///
-/// The defect this closes (EAI-8014): uninstall reported success while a
-/// publicly-bound, GPU-holding managed server kept serving, and deleted the
-/// `rocm`/`rocmd` binaries and service manifests — so the supported
-/// `rocm services stop` path was gone and only a manual PID kill remained.
-///
-/// A service is only counted stopped when [`stop_internal_managed_service`]
-/// confirms every recorded process is gone (its `status` reaches `stopped`);
-/// anything else lands in `failed` so the caller aborts and keeps the tooling.
-///
-/// Fail-closed on discovery too: if the services directory exists but cannot be
-/// enumerated, the error propagates so uninstall aborts rather than deleting the
-/// tooling while blind to what it manages. (`load_managed_services` returns an
-/// empty list — not an error — when no services directory exists, so a clean
-/// install still uninstalls.) A manifest that exists but does not parse is
-/// likewise a failure, not a silent skip — see
-/// [`unreadable_service_manifests`].
-pub(crate) fn stop_managed_services_before_uninstall(
-    paths: &AppPaths,
-) -> Result<ManagedServiceStopReport> {
-    stop_managed_services_with(paths, stop_internal_managed_service)
+/// The status string alone is not enough: `refresh_from_engine_state` adopts
+/// `failed` from the engine's own state file, and the liveness refresh returns
+/// early for a non-live status without consulting the pids, so a server whose
+/// engine reported failure while its process is still up reads as removable.
+/// `services remove` guards with [`managed_service_record_is_in_use`] for the
+/// same reason. A record that reads `stopped` is left to the port probe: that
+/// status is written only once the recorded processes are confirmed gone, so a
+/// live pid under it is a reused number, and refusing on it would block every
+/// uninstall that finds an old record.
+pub(crate) fn record_needs_stopping(record: &ManagedServiceRecord) -> bool {
+    managed_service_is_live(record)
+        || (record.status != "stopped" && managed_service_record_is_in_use(record))
 }
 
-/// [`stop_managed_services_before_uninstall`] with the per-service stop
-/// injectable, so a test can make it fail — which no real process reliably does.
-pub(crate) fn stop_managed_services_with(
-    paths: &AppPaths,
-    stop_service: impl Fn(&AppPaths, &str) -> Result<serde_json::Value>,
-) -> Result<ManagedServiceStopReport> {
-    let mut report = ManagedServiceStopReport::default();
-    // Everything that can doom the run is decided BEFORE anything is stopped.
-    //
-    // Stopping is not free and not undoable: each confirmed stop drops that
-    // service's endpoint key, and this command's own abort text says a publicly
-    // bound service has to be served again with an explicit flag to come back.
-    // Once the gate is going to abort — the tooling stays, nothing is removed —
-    // every stop performed on the way there is pure cost to the operator, paid
-    // for a removal that will not happen. So a helper stop that recorded a
-    // failure returns here, and an unparseable manifest (which can perfectly
-    // well describe a live, GPU-holding server) is collected up front rather
-    // than after every other service is already down.
-    //
-    // The manifest scan goes first because it is the only one of the two that
-    // costs nothing: it reads the services directory and signals nothing. The
-    // helper stop is itself destructive — it force-kills a process tree — so
-    // running it ahead of a read that can doom the run would terminate a live,
-    // perfectly verifiable `rocmd` for an uninstall that then removes nothing.
-    for manifest in unreadable_service_manifests(paths)? {
-        report.failed.push(FailedManagedServiceStop {
-            // The full path, not the file name: the only remedy is to act on the
-            // file, so the message has to say which file.
-            service_id: manifest.display().to_string(),
-            reason:
-                "service record could not be parsed, so its server cannot be located or stopped"
-                    .to_owned(),
-            remedy: StopFailureRemedy::RepairTheRecord,
-        });
-    }
-    if !report.failed.is_empty() {
-        return Ok(report);
-    }
-    // A live record with no recorded start time cannot prove its pid is still the
-    // server (the pid may have been reused after a reboot), and the stop below
-    // force-kills a process tree. Refuse before anything is stopped, as the
-    // daemon path does for a tick-less state file.
-    for record in load_managed_services(paths)?
-        .iter()
-        .filter(|record| managed_service_is_live(record))
-    {
-        let unprovable = unprovable_live_pids(record);
-        if !unprovable.is_empty() {
-            report.failed.push(FailedManagedServiceStop {
-                service_id: record.service_id.clone(),
-                reason: format!(
-                    "no start time was recorded for live pid(s) {unprovable:?}, so they cannot be \
-                     told apart from a reused pid"
-                ),
-                remedy: StopFailureRemedy::ConfirmTheServicePid,
-            });
-        }
-    }
-    if !report.failed.is_empty() {
-        return Ok(report);
-    }
+/// The records a stop pass partitions after the live ones are set aside: those
+/// already stopped, and those stopped but sharing an endpoint with a live record.
+struct RecordPartition<'a> {
+    already_stopped: Vec<&'a ManagedServiceRecord>,
+    deferred_partners: Vec<(&'a ManagedServiceRecord, Vec<String>)>,
+}
+
+fn partition_records(records: &[ManagedServiceRecord]) -> RecordPartition<'_> {
     // A record already stopped before this run needs no stop to be judged, and a
-    // survivor from the previous run reads exactly like that: probe those first,
-    // so a run that is going to abort anyway has stopped nothing on the way.
-    let records = load_managed_services(paths)?;
+    // survivor from the previous run reads exactly like that: probe those first.
     //
     // Except a stopped record that shares its host:port with a live one: serving
     // the same model again after a stop leaves exactly that pair, and the live
@@ -607,7 +554,7 @@ pub(crate) fn stop_managed_services_with(
     // stopped record until the live one has been stopped, so it is probed after.
     let live_endpoints: Vec<(String, Vec<String>, u16)> = records
         .iter()
-        .filter(|record| managed_service_is_live(record))
+        .filter(|record| record_needs_stopping(record))
         .map(|record| {
             (
                 record.service_id.clone(),
@@ -631,27 +578,175 @@ pub(crate) fn stop_managed_services_with(
             .map(|(id, _, _)| id.clone())
             .collect()
     };
-    let shares_a_live_endpoint = |record: &ManagedServiceRecord| !live_partners(record).is_empty();
-    let already_stopped: Vec<&ManagedServiceRecord> = records
+    RecordPartition {
+        already_stopped: records
+            .iter()
+            .filter(|record| !record_needs_stopping(record) && live_partners(record).is_empty())
+            .collect(),
+        deferred_partners: records
+            .iter()
+            .filter(|record| !record_needs_stopping(record))
+            .map(|record| (record, live_partners(record)))
+            .filter(|(_, partners)| !partners.is_empty())
+            .collect(),
+    }
+}
+
+/// Everything the stop pass would refuse before it signals or removes anything,
+/// decided without touching a process, and the records it read to decide.
+///
+/// This is the one place those refusals live. The stop pass runs it first and
+/// returns on any failure, so a run that is going to abort has stopped nothing
+/// on the way (each confirmed stop drops that service's endpoint key, which
+/// cannot be re-minted); the plan runs the same function, so the line the
+/// operator confirms against describes the run that will happen. Order matters
+/// and is the order of cost: an unparseable manifest, then a live pid that
+/// cannot be proven ours, then a stopped record whose port still answers as its
+/// own model, then a background helper that cannot be identified. Each group
+/// returns before the next, as the stop pass always did.
+///
+/// Fail-closed on discovery too: if the services directory exists but cannot be
+/// enumerated, the error propagates so uninstall aborts rather than deleting the
+/// tooling while blind to what it manages.
+fn preflight_with_records(
+    paths: &AppPaths,
+) -> Result<(ManagedServiceStopReport, Vec<ManagedServiceRecord>)> {
+    let mut report = ManagedServiceStopReport::default();
+    // A manifest that exists but does not parse can describe a live,
+    // GPU-holding server; `load_managed_services` skips it silently.
+    for manifest in unreadable_service_manifests(paths)? {
+        report.failed.push(FailedManagedServiceStop {
+            // The full path, not the file name: the only remedy is to act on the
+            // file, so the message has to say which file.
+            service_id: manifest.display().to_string(),
+            reason:
+                "service record could not be parsed, so its server cannot be located or stopped"
+                    .to_owned(),
+            remedy: StopFailureRemedy::RepairTheRecord,
+        });
+    }
+    if !report.failed.is_empty() {
+        return Ok((report, Vec::new()));
+    }
+    let records = load_managed_services(paths)?;
+    // A live record with no recorded start time cannot prove its pid is still the
+    // server (the pid may have been reused after a reboot), and the stop below
+    // force-kills a process tree. Refuse before anything is stopped, as the
+    // daemon path does for a tick-less state file.
+    for record in records
         .iter()
-        .filter(|record| !managed_service_is_live(record) && !shares_a_live_endpoint(record))
-        .collect();
-    let deferred_partners: Vec<(&ManagedServiceRecord, Vec<String>)> = records
+        .filter(|record| record_needs_stopping(record))
+    {
+        let unprovable = unprovable_live_pids(record);
+        if !unprovable.is_empty() {
+            report.failed.push(FailedManagedServiceStop {
+                service_id: record.service_id.clone(),
+                reason: format!(
+                    "no start time was recorded for live pid(s) {unprovable:?}, so they cannot be \
+                     told apart from a reused pid"
+                ),
+                remedy: StopFailureRemedy::ConfirmTheServicePid,
+            });
+        }
+    }
+    if !report.failed.is_empty() {
+        return Ok((report, records));
+    }
+    let partition = partition_records(&records);
+    probe_records_for_survivors(paths, &partition.already_stopped, &[], &mut report);
+    if !report.failed.is_empty() {
+        return Ok((report, records));
+    }
+    if let Some(failure) = helper_refusal(paths, &helper_decision(paths)) {
+        report.failed.push(failure);
+    }
+    Ok((report, records))
+}
+
+/// [`preflight_with_records`] for the plan: the refusals a run would hit and the
+/// fail-open disclosures it would make, with nothing stopped.
+pub(crate) fn uninstall_preflight(paths: &AppPaths) -> Result<ManagedServiceStopReport> {
+    preflight_with_records(paths).map(|(report, _)| report)
+}
+
+/// The plan's one line for a run that will refuse, built from the failures
+/// [`uninstall_preflight`] found. It says what the run does not do as well as
+/// what blocks it: the pre-flight returns before anything is stopped.
+pub(crate) fn preflight_refusal_line(report: &ManagedServiceStopReport) -> Option<String> {
+    if report.failed.is_empty() {
+        return None;
+    }
+    let detail = report
+        .failed
         .iter()
-        .filter(|record| !managed_service_is_live(record) && shares_a_live_endpoint(record))
-        .map(|record| (record, live_partners(record)))
-        .collect();
-    probe_records_for_survivors(paths, &already_stopped, &[], &mut report);
+        .map(|failure| format!("{} ({})", failure.service_id, failure.reason))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Some(format!(
+        "uninstall will refuse to remove anything, and will stop nothing, until this is \
+         resolved: {detail}"
+    ))
+}
+
+/// Stop every managed service that is in use before uninstall removes the
+/// binaries and service records needed to stop them.
+///
+/// The defect this closes (EAI-8014): uninstall reported success while a
+/// publicly-bound, GPU-holding managed server kept serving, and deleted the
+/// `rocm`/`rocmd` binaries and service manifests — so the supported
+/// `rocm services stop` path was gone and only a manual PID kill remained.
+///
+/// A service is only counted stopped when the stop confirms every recorded
+/// process gone (the boolean [`stop_internal_managed_service_confirmed`]
+/// returns — the report's `status` string cannot say it, because a record that
+/// already read `stopped` keeps that status through a stop that confirmed
+/// nothing); anything else lands in `failed` so the caller aborts and keeps the
+/// tooling.
+pub(crate) fn stop_managed_services_before_uninstall(
+    paths: &AppPaths,
+) -> Result<ManagedServiceStopReport> {
+    stop_managed_services_confirmed_with(paths, stop_internal_managed_service_confirmed)
+}
+
+/// [`stop_managed_services_before_uninstall`] with a stop that reports only a
+/// `status`, which counts as confirmed when it reads `stopped`. Test-only: the
+/// production stop decides on the confirmed flag, and the tests that care drive
+/// [`stop_managed_services_confirmed_with`] directly.
+#[cfg(test)]
+pub(crate) fn stop_managed_services_with(
+    paths: &AppPaths,
+    stop_service: impl Fn(&AppPaths, &str) -> Result<serde_json::Value>,
+) -> Result<ManagedServiceStopReport> {
+    stop_managed_services_confirmed_with(paths, |paths, service_id| {
+        let result = stop_service(paths, service_id)?;
+        let confirmed = result.get("status").and_then(serde_json::Value::as_str) == Some("stopped");
+        Ok((result, confirmed))
+    })
+}
+
+/// [`stop_managed_services_before_uninstall`] with the per-service stop
+/// injectable, so a test can make it fail or fail to confirm — which no real
+/// process reliably does.
+pub(crate) fn stop_managed_services_confirmed_with(
+    paths: &AppPaths,
+    stop_service: impl Fn(&AppPaths, &str) -> Result<(serde_json::Value, bool)>,
+) -> Result<ManagedServiceStopReport> {
+    // The refusals are decided before anything is stopped, by the function the
+    // plan also calls. Past this point a stop can still fail, the helper can
+    // still not die, and a survivor can still answer after the stops, so the
+    // abort message names what the run already did.
+    let (mut report, records) = preflight_with_records(paths)?;
     if !report.failed.is_empty() {
         return Ok(report);
     }
+    let partition = partition_records(&records);
     stop_background_helper_before_uninstall(paths, &mut report);
     if !report.failed.is_empty() {
         return Ok(report);
     }
     let mut attempted: Vec<&ManagedServiceRecord> = Vec::new();
     for record in &records {
-        if !managed_service_is_live(record) {
+        if !record_needs_stopping(record) {
             continue;
         }
         attempted.push(record);
@@ -660,20 +755,23 @@ pub(crate) fn stop_managed_services_with(
         // this, an uninstall with a live server reads as a hang.
         println!("stopping managed service {}", record.service_id);
         match stop_service(paths, &record.service_id) {
-            Ok(result) => {
+            Ok((_, true)) => report.stopped.push(record.service_id.clone()),
+            Ok((result, false)) => {
                 let status = result
                     .get("status")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("unknown");
-                if status == "stopped" {
-                    report.stopped.push(record.service_id.clone());
-                } else {
-                    report.failed.push(FailedManagedServiceStop {
-                        service_id: record.service_id.clone(),
-                        reason: format!("still \"{status}\" after the stop attempt"),
-                        remedy: StopFailureRemedy::StopTheService,
-                    });
-                }
+                report.failed.push(FailedManagedServiceStop {
+                    service_id: record.service_id.clone(),
+                    reason: if status == "stopped" {
+                        "its record reads \"stopped\", but the stop could not confirm every \
+                         recorded process gone"
+                            .to_owned()
+                    } else {
+                        format!("still \"{status}\" after the stop attempt")
+                    },
+                    remedy: StopFailureRemedy::StopTheService,
+                });
             }
             Err(error) => report.failed.push(FailedManagedServiceStop {
                 service_id: record.service_id.clone(),
@@ -696,8 +794,9 @@ pub(crate) fn stop_managed_services_with(
     // instructions.
     //
     // What differs is the evidence required, because a stopped record keeps its
-    // manifest and its old port until `rocm services remove` or `prune` deletes it, so an unrelated process that later binds that port
-    // must not brick uninstall with no way out:
+    // manifest and its old port until `rocm services remove` or `prune` deletes
+    // it, so an unrelated process that later binds that port must not brick
+    // uninstall with no way out:
     //
     //   * stopped by this pass — any listener fails the gate. We killed the
     //     recorded processes seconds ago; something answering there is the
@@ -710,7 +809,8 @@ pub(crate) fn stop_managed_services_with(
     // A deferred record whose live partner failed to stop is already explained by
     // the partner's own failure: the listener there IS the partner, so judging the
     // stopped record too would name one survivor twice, under the wrong remedy.
-    let deferred: Vec<&ManagedServiceRecord> = deferred_partners
+    let deferred: Vec<&ManagedServiceRecord> = partition
+        .deferred_partners
         .iter()
         .filter(|(_, partners)| {
             !partners
@@ -763,10 +863,12 @@ fn probe_records_for_survivors(
             {
                 report.warnings.push(format!(
                     "{} is recorded for service {}, but that name does not resolve here, so \
-                     whether anything is still serving on port {} could not be checked at all — \
-                     proceeding. A record written on another machine, or under a hostname since \
-                     removed, looks like this. If that service may still be running, stop it \
-                     before re-running uninstall.",
+                     whether anything is still serving on port {} could not be checked at all, \
+                     and uninstall is proceeding without that check. A record written on \
+                     another machine, or under a hostname since removed, looks like this. If \
+                     that service may still be running, it has to be found and stopped by hand: \
+                     this uninstall does not wait for you to, and removes the tooling that \
+                     would have stopped it.",
                     record.host, record.service_id, record.port
                 ));
             }
@@ -820,16 +922,16 @@ fn probe_records_for_survivors(
                         "{}:{} still accepts connections and answered the identity probe with an \
                          empty model list, so it cannot be told from an unrelated service; {} is \
                          already recorded stopped — proceeding. An engine still loading or \
-                         unloading looks like this. If that is a server of yours, stop whatever \
-                         holds that port first.",
+                         unloading looks like this. If that is a server of yours, it has to be \
+                         found and stopped by hand: this uninstall does not wait for you to.",
                         record.host, record.port, record.service_id
                     )),
                     StoppedRecordVerdict::ProceedUnidentified => report.warnings.push(format!(
                         "{}:{} still accepts connections but did not answer the identity probe \
                          with a usable model list, and service {} is already recorded stopped — \
                          proceeding. That can be a wedged engine, an unrelated server on the \
-                         port, or a stale endpoint key. If it is a server of yours, stop whatever \
-                         holds that port first.",
+                         port, or a stale endpoint key. If it is a server of yours, it has to be \
+                         found and stopped by hand: this uninstall does not wait for you to.",
                         record.host, record.port, record.service_id
                     )),
                     StoppedRecordVerdict::ProceedUnrelated => {}
@@ -850,6 +952,10 @@ fn probe_records_for_survivors(
                 continue;
             }
         }
+        // A confirmed stop already dropped this service's endpoint key, and it
+        // cannot be re-minted: say so on the failure rather than let the abort
+        // message read as if the survivor were untouched.
+        let key_dropped = report.stopped.contains(&record.service_id);
         report
             .stopped
             .retain(|stopped| stopped != &record.service_id);
@@ -863,8 +969,14 @@ fn probe_records_for_survivors(
             // happen — on the one output they have to reason from.
             reason: if stopped_by_this_pass {
                 format!(
-                    "{}:{} still accepts connections after the stop",
-                    record.host, record.port
+                    "{}:{} still accepts connections after the stop{}",
+                    record.host,
+                    record.port,
+                    if key_dropped {
+                        "; the stop already dropped this service's endpoint key"
+                    } else {
+                        ""
+                    }
                 )
             } else {
                 format!(
@@ -1087,26 +1199,37 @@ pub(crate) fn uninstall_removal_gate(report: &ManagedServiceStopReport) -> Resul
             .map(|failure| format!("{} ({})", failure.service_id, failure.reason))
             .collect::<Vec<_>>()
             .join("; ");
-        // Say what the aborted run already did. The stop pass is not atomic: a
-        // service stopped before the failing one is down for good, and stopping
-        // it dropped its endpoint key, which cannot be re-minted — a public
-        // service must be served again with `--allow-public-bind` to come back.
-        // "No files were removed" alone would read as "nothing happened".
+        // Say what the aborted run already did. The stop pass is not atomic: the
+        // pre-flight refuses before anything is stopped, but a stop that fails,
+        // a helper that will not die, or a survivor found after the stops all
+        // abort a run that has already stopped some services. Each stopped one
+        // is down for good, and stopping it dropped its endpoint key, which
+        // cannot be re-minted — a publicly bound service, or one launched with
+        // `--require-api-key`, must be served again to come back. "No files
+        // were removed" alone would read as "nothing happened".
         let services_note = if report.stopped.is_empty() {
             String::new()
         } else {
             format!(
-                " These services were stopped before the failure and stay stopped: {}. Stopping \
-                 them dropped their endpoint keys, so a publicly bound one has to be served \
-                 again with `rocm serve <model> --host <host> --port <port> --allow-public-bind` (add \
-                 `--api-key <key>`) \
-                 to return.",
-                report.stopped.join(", ")
+                " These services were stopped during this run and stay stopped: {}. Stopping \
+                 them dropped their endpoint keys, so a service that was publicly bound, or \
+                 launched with `--require-api-key`, has to be served again with `rocm serve \
+                 <model> --host <host> --port <port>`, adding `--allow-public-bind` for a public \
+                 host and `--require-api-key` for a keyed one {}.",
+                report.stopped.join(", "),
+                rocm_engine_protocol::RELAUNCH_KEY_CHOICE
             )
         };
         let helper_note = if report.helper_stopped {
             " The background helper (rocmd) was stopped and stays stopped: nothing supervises or \
              recovers managed services until it is started again."
+        } else if report
+            .failed
+            .iter()
+            .any(|failure| failure.remedy == StopFailureRemedy::StopTheDaemon)
+        {
+            " The background helper (rocmd) was signalled but not confirmed gone, so the servers \
+             it supervised may already be down."
         } else {
             ""
         };

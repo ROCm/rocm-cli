@@ -11052,6 +11052,17 @@ fn stop_internal_managed_service(paths: &AppPaths, service_id: &str) -> Result<s
     stop_internal_managed_service_with(paths, service_id, terminate_recorded_service_pids)
 }
 
+/// [`stop_internal_managed_service`], also returning whether the stop is
+/// confirmed. Uninstall decides on this flag, not on the report's `status`: a
+/// record that already read `stopped` keeps that status through a stop that
+/// confirmed nothing.
+pub(crate) fn stop_internal_managed_service_confirmed(
+    paths: &AppPaths,
+    service_id: &str,
+) -> Result<(serde_json::Value, bool)> {
+    stop_internal_managed_service_confirmed_with(paths, service_id, terminate_recorded_service_pids)
+}
+
 /// [`stop_internal_managed_service`], with the termination of the recorded
 /// processes supplied by the caller. Production passes
 /// [`terminate_recorded_service_pids`]; a test passes a stand-in that observes
@@ -13738,66 +13749,71 @@ fn build_uninstall_plan(paths: &AppPaths, options: &UninstallOptions) -> Result<
         ));
     }
 
+    // What the stop pass would refuse, decided by the very function it runs first
+    // (`uninstall_preflight`), so the lines below describe the run that will
+    // happen instead of a promise the gate then breaks. Only meaningful where the
+    // stop pass runs at all: a run that keeps the tooling does not check.
+    let removes_recovery_tooling = plan_removes_recovery_tooling(&plan, paths);
+    let mut preflight_refusal: Option<String> = None;
+    if removes_recovery_tooling && services_read_error.is_none() {
+        match uninstall_gate::uninstall_preflight(paths) {
+            Ok(report) => preflight_refusal = uninstall_gate::preflight_refusal_line(&report),
+            Err(error) => {
+                preflight_refusal = Some(format!(
+                    "uninstall will refuse to remove anything, and will stop nothing, until the \
+                     managed service records under {} can be checked: {error:#}",
+                    paths.services_dir().display()
+                ));
+            }
+        }
+    }
+    let run_refuses = preflight_refusal.is_some() || services_read_error.is_some();
+    if let Some(line) = preflight_refusal {
+        plan.warnings.push(line);
+    }
+
     if !managed_services.is_empty() {
         // Two independent conditions decide whether a server actually gets
         // stopped, and the warning must reflect BOTH or it describes work
-        // uninstall never does: the record has to be live, and the plan has to
-        // be removing the tooling that stops it (`uninstall()` skips the whole
-        // stop pass otherwise). This runs after the actions are final, so the
-        // predicate sees the plan the operator is about to confirm.
-        let live = managed_services
+        // uninstall never does: the record has to need stopping, and the plan has
+        // to be removing the tooling that stops it (`uninstall()` skips the whole
+        // stop pass otherwise). A run that will refuse stops nothing at all.
+        let in_use = managed_services
             .iter()
-            .filter(|record| managed_service_is_live(record))
+            .filter(|record| uninstall_gate::record_needs_stopping(record))
             .count();
         let services_dir = paths.services_dir().display().to_string();
         let total = managed_services.len();
-        let refused: Vec<String> = managed_services
-            .iter()
-            .filter(|record| managed_service_is_live(record))
-            .filter(|record| !uninstall_gate::unprovable_live_pids(record).is_empty())
-            .map(|record| record.service_id.clone())
-            .collect();
-        plan.warnings.push(if live == 0 {
-            // "none is recorded as running", not "none has a running server":
-            // this counts statuses, and a record reads "stopped" the moment its
-            // supervisor is killed even if an engine grandchild kept the port.
-            // The stop pass probes for exactly that, so the plan must not
+        plan.warnings.push(if in_use == 0 {
+            // "none is in use", not "none has a running server": this counts
+            // statuses and recorded pids, and a record reads "stopped" the moment
+            // its supervisor is killed even if an engine grandchild kept the
+            // port. The stop pass probes for exactly that, so the plan must not
             // promise it away — this line is the last thing read before
             // confirming.
             format!("{total} managed service record(s) exist under {services_dir}; none is recorded as running")
-        } else if plan_removes_recovery_tooling(&plan, paths) && !refused.is_empty() {
-            // The stop pass refuses a live record whose pid has no recorded start
-            // time, so promising "will be stopped" for it would describe a run
-            // that aborts. Same decision, read from the same function.
-            format!(
-                "{live} of {total} managed service record(s) under {services_dir} are recorded as running; {} of them ({}) have a live pid with no recorded start time, so uninstall will refuse to remove anything until you stop them yourself{}",
-                refused.len(),
-                refused.join(", "),
-                if refused.len() < live {
-                    "; the others will be stopped before removal"
-                } else {
-                    ""
-                }
-            )
-        } else if plan_removes_recovery_tooling(&plan, paths) {
-            format!(
-                "{live} of {total} managed service record(s) under {services_dir} are recorded as running; those servers will be stopped before removal"
-            )
-        } else {
+        } else if !removes_recovery_tooling {
             // Cache-only and other tooling-preserving runs: say what is true —
             // the servers keep running, and they remain stoppable afterwards.
             format!(
-                "{live} of {total} managed service record(s) under {services_dir} are recorded as running; this removal keeps `rocm services stop` and the service records, so those servers are left running"
+                "{in_use} of {total} managed service record(s) under {services_dir} are in use (recorded as running, or with a recorded process still alive); this removal keeps `rocm services stop` and the service records, so those servers are left running"
+            )
+        } else if run_refuses {
+            format!(
+                "{in_use} of {total} managed service record(s) under {services_dir} are in use (recorded as running, or with a recorded process still alive); none of them will be stopped, because uninstall will refuse (see above)"
+            )
+        } else {
+            format!(
+                "{in_use} of {total} managed service record(s) under {services_dir} are in use (recorded as running, or with a recorded process still alive); those servers will be stopped before removal"
             )
         });
     }
 
     // The helper is reported whether or not any service record exists: a live
     // `rocmd` with an empty services directory still gets force-stopped.
-    if let Some(note) = uninstall_gate::background_helper_plan_note(
-        paths,
-        plan_removes_recovery_tooling(&plan, paths),
-    ) {
+    if let Some(note) =
+        uninstall_gate::background_helper_plan_note(paths, removes_recovery_tooling, run_refuses)
+    {
         plan.warnings.push(note);
     }
 
@@ -27154,9 +27170,19 @@ install therock";
         pid: u32,
         start_ticks: Option<u64>,
     ) -> ManagedServiceRecord {
+        managed_record_named(paths, "svc-managed-stop", pid, start_ticks)
+    }
+
+    #[cfg(unix)]
+    fn managed_record_named(
+        paths: &AppPaths,
+        service_id: &str,
+        pid: u32,
+        start_ticks: Option<u64>,
+    ) -> ManagedServiceRecord {
         let mut record = ManagedServiceRecord::new(
             paths,
-            "svc-managed-stop",
+            service_id,
             "vllm",
             "m",
             "m",
@@ -27751,22 +27777,6 @@ install therock";
             assert!(
                 error.contains(expected),
                 "every failure class must carry its own remedy; missing {expected:?} in: {error}"
-            );
-        }
-        // The three classes whose advice is useless without the ids must name
-        // them — "find what holds that port" for an unnamed service is not a
-        // way out. The other two are general instructions and name nothing.
-        for expected in [
-            "svc-orphaned",
-            "runtime.json",
-            "svc-corrupt.json",
-            "svc-oldport",
-            "svc-tickless",
-            "/x/runtime-state.json",
-        ] {
-            assert!(
-                error.contains(expected),
-                "id-carrying remedies must name their ids; missing {expected:?} in: {error}"
             );
         }
         // Most actionable first, hand-repair last: a dead-end-avoidance
@@ -28936,7 +28946,7 @@ install therock";
             state.daemon_start_ticks = rocm_core::process_start_ticks(pid);
             state.write(&paths).expect("write runtime state");
             let mut report = ManagedServiceStopReport::default();
-            stop_background_helper_with(&paths, &mut report, |_| {
+            stop_background_helper_with(&paths, &mut report, |_, _| {
                 panic!("pid {pid} must never be signalled")
             });
             assert!(
@@ -28988,8 +28998,18 @@ install therock";
         };
         let message = format!("{:#}", uninstall_removal_gate(&report).unwrap_err());
         assert!(
-            message.contains("rocm serve <model> --host <host> --port <port> --allow-public-bind"),
+            message.contains("rocm serve <model> --host <host> --port <port>`, adding `--allow-public-bind` for a public host"),
             "without --host a serve binds loopback and the public service does not return: {message}"
+        );
+        // The same wording the two refusals use, from one builder: a keyed
+        // service needs `--require-api-key`, and the key itself is optional.
+        assert!(
+            message.contains("`--require-api-key` for a keyed one"),
+            "{message}"
+        );
+        assert!(
+            message.contains(rocm_engine_protocol::RELAUNCH_KEY_CHOICE),
+            "{message}"
         );
     }
 
@@ -29443,20 +29463,26 @@ install therock";
             },
         )
         .expect("build the plan");
-        let warning = plan
+        let refusal = plan
             .warnings
             .iter()
-            .find(|warning| warning.contains("managed service record"))
-            .expect("the plan warns about managed services");
+            .find(|warning| warning.contains("will refuse to remove anything"))
+            .expect("the plan says the run will refuse");
         assert!(
-            warning.contains("no recorded start time")
-                && warning.contains("will refuse to remove anything")
-                && warning.contains("svc-managed-stop"),
-            "the plan must say the stop will be refused and for which record: {warning}"
+            refusal.contains("no start time was recorded")
+                && refusal.contains("will stop nothing")
+                && refusal.contains("svc-managed-stop"),
+            "the plan must say the stop will be refused and for which record: {refusal}"
         );
+        let count = plan
+            .warnings
+            .iter()
+            .find(|warning| warning.contains("managed service record(s) under"))
+            .expect("the plan counts the managed services");
         assert!(
-            !warning.contains("those servers will be stopped before removal"),
-            "the plan must not promise the stop the gate refuses: {warning}"
+            count.contains("none of them will be stopped")
+                && !count.contains("will be stopped before removal"),
+            "the plan must not promise the stop the gate refuses: {count}"
         );
 
         let report = stop_managed_services_with(&paths, |_, _| {
@@ -29476,6 +29502,604 @@ install therock";
         let _ = child.kill();
         let _ = child.wait();
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn full_plan_options() -> UninstallOptions {
+        UninstallOptions {
+            yes: true,
+            force_dev_binaries: true,
+            ..UninstallOptions::default()
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn plan_warning_containing(plan: &UninstallPlan, needle: &str) -> Option<String> {
+        plan.warnings
+            .iter()
+            .find(|warning| warning.contains(needle))
+            .cloned()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_unparseable_record_beside_a_live_one_makes_the_plan_refuse_and_the_stop_pass_stop_nothing()
+     {
+        // A live, verifiable server plus a manifest that does not parse. The plan
+        // used to count the live record and say "will be stopped before removal"
+        // while the stop pass refused on the manifest before touching anything.
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn a live managed server");
+        let pid = child.id();
+        let (root, paths) = test_paths("uninstall-plan-bad-manifest");
+        let mut record = managed_record_for_pid(&paths, pid, rocm_core::process_start_ticks(pid));
+        record.status = "ready".to_owned();
+        record.write().expect("write service record");
+        let bad = paths.services_dir().join("bad.json");
+        fs::write(&bad, b"{").expect("plant an unparseable manifest");
+
+        let plan = build_uninstall_plan(&paths, &full_plan_options()).expect("build the plan");
+        let refusal = plan_warning_containing(&plan, "will refuse to remove anything")
+            .expect("the plan says the run will refuse");
+        assert!(
+            refusal.contains(&bad.display().to_string()) && refusal.contains("will stop nothing"),
+            "{refusal}"
+        );
+        let count = plan_warning_containing(&plan, "managed service record(s) under")
+            .expect("the plan counts the managed services");
+        assert!(
+            count.contains("none of them will be stopped")
+                && !count.contains("will be stopped before removal"),
+            "{count}"
+        );
+
+        let report = stop_managed_services_with(&paths, |_, _| {
+            panic!("the run the plan said would refuse must stop nothing")
+        })
+        .expect("stop pass");
+        assert!(report.stopped.is_empty(), "{report:?}");
+        assert_eq!(report.failed.len(), 1, "{report:?}");
+        assert_eq!(report.failed[0].remedy, StopFailureRemedy::RepairTheRecord);
+        assert!(child.try_wait().expect("poll").is_none(), "left alive");
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_verifiable_record_beside_a_tickless_one_is_not_stopped_and_the_plan_says_so() {
+        // The refusal returns before any stop, so "the others will be stopped"
+        // was never true. Two live servers, one without a start time: neither is
+        // stopped, and the plan says so for both.
+        let mut ticked = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn a verifiable server");
+        let mut tickless = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn a tickless server");
+        let (root, paths) = test_paths("uninstall-plan-partial-refusal");
+        let mut good = managed_record_named(
+            &paths,
+            "svc-good",
+            ticked.id(),
+            rocm_core::process_start_ticks(ticked.id()),
+        );
+        good.status = "ready".to_owned();
+        good.write().expect("write the verifiable record");
+        let mut bad = managed_record_named(&paths, "svc-bad", tickless.id(), None);
+        bad.status = "ready".to_owned();
+        bad.write().expect("write the tickless record");
+
+        let plan = build_uninstall_plan(&paths, &full_plan_options()).expect("build the plan");
+        let refusal = plan_warning_containing(&plan, "will refuse to remove anything")
+            .expect("the plan says the run will refuse");
+        assert!(
+            refusal.contains("svc-bad") && !refusal.contains("svc-good"),
+            "{refusal}"
+        );
+        let count = plan_warning_containing(&plan, "managed service record(s) under")
+            .expect("the plan counts the managed services");
+        assert!(
+            count.contains("2 of 2")
+                && count.contains("none of them will be stopped")
+                && !count.contains("the others will be stopped"),
+            "{count}"
+        );
+
+        let report = stop_managed_services_with(&paths, |_, _| {
+            panic!("a refused run must not stop the verifiable record either")
+        })
+        .expect("stop pass");
+        assert!(report.stopped.is_empty(), "{report:?}");
+        assert!(ticked.try_wait().expect("poll").is_none(), "left alive");
+        for child in [&mut ticked, &mut tickless] {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_dead_tickless_pid_beside_a_live_verifiable_one_does_not_make_the_run_refuse() {
+        // `unprovable_live_pids` filters on liveness: a recorded pid that is gone
+        // cannot be a reused one that gets killed. Dropping the filter would turn
+        // every record with a stale engine pid into a refusal. The plan says the
+        // server will be stopped, and the stop pass really does.
+        let child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn the live supervisor");
+        let pid = child.id();
+        let mut gone = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn a short-lived process");
+        let dead_pid = gone.id();
+        gone.wait().expect("reap it");
+        let (root, paths) = test_paths("uninstall-dead-tickless-engine");
+        let mut record = managed_record_for_pid(&paths, pid, rocm_core::process_start_ticks(pid));
+        record.engine_pid = Some(dead_pid);
+        record.engine_start_ticks = None;
+        record.status = "ready".to_owned();
+        record.write().expect("write service record");
+
+        let plan = build_uninstall_plan(&paths, &full_plan_options()).expect("build the plan");
+        assert!(
+            plan_warning_containing(&plan, "will refuse to remove anything").is_none(),
+            "{:?}",
+            plan.warnings
+        );
+        let count = plan_warning_containing(&plan, "managed service record(s) under")
+            .expect("the plan counts the managed services");
+        assert!(count.contains("will be stopped before removal"), "{count}");
+
+        let report = stop_managed_services_with(&paths, |_, _| {
+            Ok(serde_json::json!({ "status": "stopped" }))
+        })
+        .expect("stop pass");
+        assert!(report.failed.is_empty(), "{report:?}");
+        assert_eq!(report.stopped, vec!["svc-managed-stop".to_owned()]);
+        let mut child = child;
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_failed_record_whose_engine_is_still_alive_is_stopped_not_waved_through() {
+        // `refresh_from_engine_state` adopts `failed` while the engine process is
+        // still up, and the liveness refresh does not look at pids for a non-live
+        // status. The status alone read as "nothing to stop", and the tooling was
+        // removed under a process that may still hold the GPU.
+        let child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn the engine");
+        let pid = child.id();
+        let (root, paths) = test_paths("uninstall-failed-record-live-engine");
+        let mut record = managed_record_for_pid(&paths, pid, rocm_core::process_start_ticks(pid));
+        record.status = "failed".to_owned();
+        record.write().expect("write service record");
+
+        let plan = build_uninstall_plan(&paths, &full_plan_options()).expect("build the plan");
+        let count = plan_warning_containing(&plan, "managed service record(s) under")
+            .expect("the plan counts the managed services");
+        assert!(
+            count.contains("1 of 1") && count.contains("will be stopped before removal"),
+            "{count}"
+        );
+
+        let report = stop_managed_services_before_uninstall(&paths).expect("stop pass");
+        assert_eq!(
+            report.stopped,
+            vec!["svc-managed-stop".to_owned()],
+            "{report:?}"
+        );
+        let mut child = child;
+        assert_stopped_within_grace(
+            &mut child,
+            "the failed record's live engine must be stopped",
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_stopped_record_with_a_reused_live_pid_is_left_to_the_port_probe() {
+        // The narrower half of the same predicate: a record that reads `stopped`
+        // is written only once its processes are confirmed gone, so a live pid
+        // under it is a reused number. Refusing on it would block every uninstall
+        // that finds an old, tickless record.
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn an unrelated process");
+        let (root, paths) = test_paths("uninstall-stopped-record-reused-pid");
+        let mut record = managed_record_for_pid(&paths, child.id(), None);
+        record.status = "stopped".to_owned();
+        record.write().expect("write service record");
+
+        let report = stop_managed_services_with(&paths, |_, _| {
+            panic!("a stopped record is not stopped again")
+        })
+        .expect("stop pass");
+        assert!(report.failed.is_empty(), "{report:?}");
+        assert!(child.try_wait().expect("poll").is_none(), "left alone");
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_stop_that_does_not_confirm_is_a_failure_whatever_the_status_says() {
+        // The decision is the confirmed flag. A supervisor's clean-exit write
+        // leaves the record reading `stopped` while a grandchild is still alive;
+        // the status string then says "stopped" for a stop that confirmed nothing.
+        let child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn the managed server");
+        let pid = child.id();
+        let (root, paths) = test_paths("uninstall-unconfirmed-stop");
+        let mut record = managed_record_for_pid(&paths, pid, rocm_core::process_start_ticks(pid));
+        record.status = "ready".to_owned();
+        record.write().expect("write service record");
+
+        let report = stop_managed_services_confirmed_with(&paths, |_, _| {
+            Ok((serde_json::json!({ "status": "stopped" }), false))
+        })
+        .expect("stop pass");
+        assert!(report.stopped.is_empty(), "{report:?}");
+        assert_eq!(report.failed.len(), 1, "{report:?}");
+        assert_eq!(report.failed[0].remedy, StopFailureRemedy::StopTheService);
+        assert!(
+            report.failed[0].reason.contains("could not confirm"),
+            "{}",
+            report.failed[0].reason
+        );
+
+        // And the converse: a confirmed stop counts whatever the report's status
+        // string says, because the flag is what the stop actually established.
+        let report =
+            stop_managed_services_confirmed_with(&paths, |_, _| Ok((serde_json::json!({}), true)))
+                .expect("stop pass");
+        assert_eq!(
+            report.stopped,
+            vec!["svc-managed-stop".to_owned()],
+            "{report:?}"
+        );
+        assert!(report.failed.is_empty(), "{report:?}");
+        let mut child = child;
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_stop_that_finds_the_record_already_stopped_still_reports_it_unconfirmed() {
+        // The premise of the test above, on the real stop: a record that reads
+        // `stopped` keeps that status through a stop whose termination did not
+        // confirm. Only the flag distinguishes it from a confirmed stop.
+        let (root, paths) = test_paths("uninstall-stop-keeps-status");
+        let mut record = managed_record_for_pid(&paths, std::process::id(), None);
+        record.status = "stopped".to_owned();
+        record.write().expect("write service record");
+
+        let (report, confirmed) =
+            stop_internal_managed_service_confirmed_with(&paths, "svc-managed-stop", |_| {
+                (Vec::new(), false)
+            })
+            .expect("stop");
+        assert_eq!(report["status"], "stopped");
+        assert!(
+            !confirmed,
+            "an unconfirmed termination is not a confirmed stop"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_unreadable_helper_state_makes_the_plan_refuse_and_the_stop_pass_say_which_file() {
+        let (root, paths) = test_paths("uninstall-plan-helper-state-unreadable");
+        let state_file = paths.automation_state_path();
+        fs::create_dir_all(state_file.parent().expect("a parent")).expect("create the dir");
+        fs::write(&state_file, b"{ not json").expect("plant an unparseable state file");
+
+        let plan = build_uninstall_plan(&paths, &full_plan_options()).expect("build the plan");
+        let refusal = plan_warning_containing(&plan, "will refuse to remove anything")
+            .expect("the plan says the run will refuse");
+        assert!(
+            refusal.contains(&state_file.display().to_string())
+                && refusal.contains("could not be read"),
+            "{refusal}"
+        );
+        let report = stop_managed_services_before_uninstall(&paths).expect("stop pass");
+        assert_eq!(report.failed.len(), 1, "{report:?}");
+        assert_eq!(
+            report.failed[0].remedy,
+            StopFailureRemedy::RepairTheDaemonState
+        );
+
+        // A run that keeps the tooling does not check, and says so.
+        let cache_only = UninstallOptions {
+            yes: true,
+            keep_binaries: true,
+            keep_config: true,
+            keep_data: true,
+            ..UninstallOptions::default()
+        };
+        let plan = build_uninstall_plan(&paths, &cache_only).expect("build the cache plan");
+        assert!(
+            plan_warning_containing(&plan, "will refuse to remove anything").is_none(),
+            "{:?}",
+            plan.warnings
+        );
+        let note = plan_warning_containing(&plan, "background helper")
+            .expect("the cache-only plan names the unreadable state");
+        assert!(note.contains("does not check it"), "{note}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_recycled_helper_pid_is_neither_planned_nor_stopped() {
+        // The recorded pid is alive but its start time does not match: that is a
+        // reused number, so there is nothing of ours to stop. The plan must not
+        // say "will be stopped", and the stop pass must leave the process alone.
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn an unrelated process");
+        let pid = child.id();
+        let (root, paths) = test_paths("uninstall-helper-recycled");
+        let mut state = runtime_state(true, pid);
+        state.daemon_start_ticks = rocm_core::process_start_ticks(pid).map(|t| t.wrapping_add(1));
+        state.write(&paths).expect("write runtime state");
+
+        let plan = build_uninstall_plan(&paths, &full_plan_options()).expect("build the plan");
+        assert!(
+            plan_warning_containing(&plan, "background helper").is_none(),
+            "{:?}",
+            plan.warnings
+        );
+        let report = stop_managed_services_before_uninstall(&paths).expect("stop pass");
+        assert!(
+            !report.helper_stopped && report.failed.is_empty(),
+            "{report:?}"
+        );
+        assert!(child.try_wait().expect("poll").is_none(), "left alone");
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_helper_recorded_as_not_running_is_neither_planned_nor_stopped() {
+        // `running: false` is the clean-shutdown write: the pid in the file names
+        // a process that already exited, and whatever is alive under it now is
+        // someone else's — even when its start time happens to match.
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn an unrelated process");
+        let pid = child.id();
+        let (root, paths) = test_paths("uninstall-helper-not-running");
+        let mut state = runtime_state(false, pid);
+        state.daemon_start_ticks = rocm_core::process_start_ticks(pid);
+        state.write(&paths).expect("write runtime state");
+
+        let plan = build_uninstall_plan(&paths, &full_plan_options()).expect("build the plan");
+        assert!(
+            plan_warning_containing(&plan, "background helper").is_none(),
+            "{:?}",
+            plan.warnings
+        );
+        let report = stop_managed_services_before_uninstall(&paths).expect("stop pass");
+        assert!(
+            !report.helper_stopped && report.failed.is_empty(),
+            "{report:?}"
+        );
+        assert!(child.try_wait().expect("poll").is_none(), "left alone");
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_helper_is_stopped_with_the_whole_tree_scope() {
+        // The production stop hands the termination `HELPER_KILL_SCOPE`; a
+        // single-process kill would leave the helper's engine children holding
+        // the GPU. The injected termination sees the scope the real one would.
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn the helper stand-in");
+        let pid = child.id();
+        let (root, paths) = test_paths("uninstall-helper-scope");
+        let mut state = runtime_state(true, pid);
+        state.daemon_start_ticks = rocm_core::process_start_ticks(pid);
+        state.write(&paths).expect("write runtime state");
+
+        let mut seen = None;
+        let mut report = ManagedServiceStopReport::default();
+        stop_background_helper_with(&paths, &mut report, |_, scope| {
+            seen = Some(scope);
+            rocm_core::TerminationOutcome::Graceful
+        });
+        assert_eq!(seen, Some(rocm_core::KillScope::Tree));
+        assert_eq!(seen, Some(HELPER_KILL_SCOPE));
+        assert!(report.helper_stopped, "{report:?}");
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_resolvable_host_with_nothing_listening_is_not_a_fail_open() {
+        // `host_port_resolves` separates "nothing is listening" (the normal,
+        // silent case) from "the name does not resolve" (evidence of nothing,
+        // disclosed). A host that resolves must not draw the disclosure.
+        let (root, paths) = test_paths("uninstall-resolvable-dead-endpoint");
+        let mut record = managed_record_for_pid(&paths, std::process::id(), None);
+        record.status = "stopped".to_owned();
+        record.host = "127.0.0.1".to_owned();
+        record.port = 0;
+        record.write().expect("write service record");
+
+        let report = stop_managed_services_with(&paths, |_, _| {
+            panic!("a stopped record is not stopped again")
+        })
+        .expect("stop pass");
+        assert!(report.failed.is_empty(), "{report:?}");
+        assert!(
+            report.warnings.is_empty(),
+            "a refused connect is evidence the port is free, not a fail-open: {:?}",
+            report.warnings
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn following_the_tickless_pid_advice_lets_the_retry_proceed() {
+        // The advice for a live pid with no start time: stop it yourself, or
+        // delete the record if it is not your server. Either has to clear the
+        // refusal.
+        let mut stopped_by_hand = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn a tickless server");
+        let (root, paths) = test_paths("uninstall-advice-tickless-stop");
+        let mut record = managed_record_for_pid(&paths, stopped_by_hand.id(), None);
+        record.status = "ready".to_owned();
+        record.write().expect("write service record");
+        let first =
+            stop_managed_services_with(&paths, |_, _| panic!("must not stop")).expect("first pass");
+        assert_eq!(first.failed.len(), 1, "{first:?}");
+
+        stopped_by_hand.kill().expect("`kill <pid>`");
+        stopped_by_hand.wait().expect("reap it");
+        let second = stop_managed_services_with(&paths, |_, _| panic!("nothing left to stop"))
+            .expect("retry after killing the pid");
+        assert!(second.failed.is_empty(), "{second:?}");
+        let _ = fs::remove_dir_all(root);
+
+        // Or: it was not our server, so delete the record file by hand.
+        let mut stranger = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn an unrelated process");
+        let (root, paths) = test_paths("uninstall-advice-tickless-delete");
+        let mut record = managed_record_for_pid(&paths, stranger.id(), None);
+        record.status = "ready".to_owned();
+        record.write().expect("write service record");
+        let first =
+            stop_managed_services_with(&paths, |_, _| panic!("must not stop")).expect("first pass");
+        assert_eq!(first.failed.len(), 1, "{first:?}");
+        fs::remove_file(paths.services_dir().join("svc-managed-stop.json"))
+            .expect("delete the record file");
+        let second = stop_managed_services_with(&paths, |_, _| panic!("no record left"))
+            .expect("retry after deleting the record");
+        assert!(second.failed.is_empty(), "{second:?}");
+        assert!(stranger.try_wait().expect("poll").is_none(), "left alone");
+        let _ = stranger.kill();
+        let _ = stranger.wait();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn following_the_daemon_pid_advice_lets_the_retry_proceed() {
+        // The advice for a helper that cannot be proven to be rocmd: stop it if
+        // it is rocmd, or delete the runtime state file if it is something else.
+        let mut helper = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn the helper stand-in");
+        let (root, paths) = test_paths("uninstall-advice-daemon-stop");
+        runtime_state(true, helper.id())
+            .write(&paths)
+            .expect("write runtime state");
+        let first = stop_managed_services_before_uninstall(&paths).expect("first pass");
+        assert_eq!(first.failed.len(), 1, "{first:?}");
+        assert_eq!(
+            first.failed[0].remedy,
+            StopFailureRemedy::ConfirmTheDaemonPid
+        );
+
+        helper.kill().expect("`kill <pid>`");
+        helper.wait().expect("reap it");
+        let second = stop_managed_services_before_uninstall(&paths).expect("retry after the kill");
+        assert!(second.failed.is_empty(), "{second:?}");
+        let _ = fs::remove_dir_all(root);
+
+        let mut stranger = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn an unrelated process");
+        let (root, paths) = test_paths("uninstall-advice-daemon-delete");
+        runtime_state(true, stranger.id())
+            .write(&paths)
+            .expect("write runtime state");
+        let first = stop_managed_services_before_uninstall(&paths).expect("first pass");
+        assert_eq!(first.failed.len(), 1, "{first:?}");
+        fs::remove_file(paths.automation_state_path()).expect("delete the state file");
+        let second = stop_managed_services_before_uninstall(&paths)
+            .expect("retry after deleting the state file");
+        assert!(
+            second.failed.is_empty() && !second.helper_stopped,
+            "{second:?}"
+        );
+        assert!(stranger.try_wait().expect("poll").is_none(), "left alone");
+        let _ = stranger.kill();
+        let _ = stranger.wait();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn the_abort_names_what_the_run_already_stopped_and_the_helper_it_signalled() {
+        let report = ManagedServiceStopReport {
+            stopped: vec!["svc-down".to_owned()],
+            failed: vec![
+                FailedManagedServiceStop {
+                    service_id: "svc-stuck".to_owned(),
+                    reason: "still \"ready\"".to_owned(),
+                    remedy: StopFailureRemedy::StopTheService,
+                },
+                FailedManagedServiceStop {
+                    service_id: "rocmd (pid 7)".to_owned(),
+                    reason: "not confirmed".to_owned(),
+                    remedy: StopFailureRemedy::StopTheDaemon,
+                },
+            ],
+            warnings: Vec::new(),
+            helper_stopped: false,
+        };
+        let message = format!("{:#}", uninstall_removal_gate(&report).unwrap_err());
+        assert!(
+            message.contains("stopped during this run and stay stopped: svc-down"),
+            "{message}"
+        );
+        assert!(!message.contains("before the failure"), "{message}");
+        assert!(
+            message.contains("signalled but not confirmed gone"),
+            "{message}"
+        );
+        assert!(message.contains("--require-api-key"), "{message}");
+        assert!(message.contains("--allow-public-bind"), "{message}");
+        assert!(message.contains("ROCM_SERVE_API_KEY"), "{message}");
     }
 
     #[cfg(target_os = "linux")]
@@ -29560,10 +30184,10 @@ install therock";
         let note = plan
             .warnings
             .iter()
-            .find(|warning| warning.contains("background helper"))
+            .find(|warning| warning.contains("will refuse to remove anything"))
             .expect("the plan names the unverifiable helper");
         assert!(
-            note.contains("cannot be verified") && note.contains("will refuse to remove anything"),
+            note.contains("could not be verified") && note.contains(&format!("pid {pid}")),
             "{note}"
         );
         let report = stop_managed_services_before_uninstall(&paths).expect("stop pass");
@@ -30191,7 +30815,7 @@ install therock";
         state.write(&paths).expect("write runtime state");
 
         let mut report = ManagedServiceStopReport::default();
-        stop_background_helper_with(&paths, &mut report, |_| {
+        stop_background_helper_with(&paths, &mut report, |_, _| {
             rocm_core::TerminationOutcome::TimedOut
         });
         assert!(report.stopped.is_empty(), "{report:?}");
@@ -30200,7 +30824,7 @@ install therock";
         assert!(uninstall_removal_gate(&report).is_err());
 
         let mut report = ManagedServiceStopReport::default();
-        stop_background_helper_with(&paths, &mut report, |_| {
+        stop_background_helper_with(&paths, &mut report, |_, _| {
             rocm_core::TerminationOutcome::Unverified
         });
         assert_eq!(report.failed.len(), 1, "{report:?}");
@@ -30210,7 +30834,7 @@ install therock";
         );
 
         let mut report = ManagedServiceStopReport::default();
-        stop_background_helper_with(&paths, &mut report, |_| {
+        stop_background_helper_with(&paths, &mut report, |_, _| {
             rocm_core::TerminationOutcome::Graceful
         });
         assert!(report.failed.is_empty(), "{report:?}");
@@ -30344,7 +30968,7 @@ install therock";
     }
 
     #[test]
-    fn the_tickless_pid_advice_names_ids_and_a_manual_action_that_works() {
+    fn the_tickless_pid_advice_text_names_the_id_and_both_platforms_kill_commands() {
         let report = ManagedServiceStopReport {
             stopped: Vec::new(),
             failed: vec![FailedManagedServiceStop {

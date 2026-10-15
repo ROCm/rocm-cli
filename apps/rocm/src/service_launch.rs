@@ -195,30 +195,22 @@ pub(crate) fn ensure_public_service_has_endpoint_key(
     // "only this machine" and the bind address can no longer be trusted to
     // answer the question on its own.
     if requires_api_key && !key_present {
-        // A public bind needs its own flag to be served again, so the advice
-        // carries it exactly when the recorded host is public.
-        let public_flag = if rocm_engine_protocol::is_public_bind_host(host) {
-            " --allow-public-bind"
-        } else {
-            ""
-        };
         bail!(
             "managed service was launched with `--require-api-key` but has no endpoint API key, \
              so restarting it would reopen it without authentication. Something outside this \
              machine may still be publishing its port. The key is dropped when a service stops \
-             and cannot be recovered. Launch it again with \
-             `rocm serve <model> --host {host} --port <port>{public_flag} --require-api-key` \
-             (add `--api-key <key>`, or set ROCM_SERVE_API_KEY, to choose the key instead of \
-             generating one)."
+             and cannot be recovered. Launch it again with `{}` {}.",
+            rocm_engine_protocol::relaunch_command(host, true),
+            rocm_engine_protocol::RELAUNCH_KEY_CHOICE
         );
     }
     if rocm_engine_protocol::is_public_bind_host(host) && !key_present {
         bail!(
             "managed service is bound to the public host `{host}` but has no endpoint API key, \
              so restarting it would reopen it without authentication. The key is dropped when a \
-             service stops and cannot be recovered. Launch it again with \
-             `rocm serve <model> --host {host} --port <port> --allow-public-bind` (add `--api-key <key>`, or set \
-             ROCM_SERVE_API_KEY, to choose the key instead of generating one)."
+             service stops and cannot be recovered. Launch it again with `{}` {}.",
+            rocm_engine_protocol::relaunch_command(host, false),
+            rocm_engine_protocol::RELAUNCH_KEY_CHOICE
         );
     }
     Ok(())
