@@ -497,6 +497,11 @@ async fn close_onboarding_setup(world: &mut E2eWorld) {
     const ADOPT_BROWSER_TITLE: &str = "Pick an existing ROCm folder";
     const CONFIGURE_BROWSER_TITLE: &str = "Pick an install folder";
     let tui = session(world);
+    // Recorded from inside the predicate below, not re-read from a second
+    // `screen_text()` call afterward — the screen can keep moving between
+    // the predicate matching and a later read, so only the frame the
+    // predicate actually saw can be trusted to name which marker matched.
+    let mut open_sub_view_marker: Option<&'static str> = None;
     tui.wait_for_screen_where(
         &format!("{CONFIGURE_FOOTER:?} or {ADOPT_BROWSER_TITLE:?} to appear"),
         |screen| {
@@ -504,7 +509,14 @@ async fn close_onboarding_setup(world: &mut E2eWorld) {
                 !screen.contains(CONFIGURE_BROWSER_TITLE),
                 "the install-folder browser is still open; close it before calling this step:\n{screen}"
             );
-            screen.contains(CONFIGURE_FOOTER) || screen.contains(ADOPT_BROWSER_TITLE)
+            open_sub_view_marker = if screen.contains(ADOPT_BROWSER_TITLE) {
+                Some(ADOPT_BROWSER_TITLE)
+            } else if screen.contains(CONFIGURE_FOOTER) {
+                Some(CONFIGURE_FOOTER)
+            } else {
+                None
+            };
+            open_sub_view_marker.is_some()
         },
         default_timeout(),
     )
@@ -512,11 +524,8 @@ async fn close_onboarding_setup(world: &mut E2eWorld) {
     .unwrap_or_else(|e| {
         panic!("no sub-view is open, so there is nothing to close before the wizard itself: {e}")
     });
-    let open_sub_view_marker = if tui.screen_text().contains(ADOPT_BROWSER_TITLE) {
-        ADOPT_BROWSER_TITLE
-    } else {
-        CONFIGURE_FOOTER
-    };
+    let open_sub_view_marker =
+        open_sub_view_marker.expect("wait_for_screen_where succeeded without recording a marker");
     tui.send("\u{1b}")
         .unwrap_or_else(|e| panic!("failed to leave the open sub-view: {e}"));
     tui.wait_until_gone(open_sub_view_marker, default_timeout())
