@@ -33,16 +33,6 @@ pub fn sibling_binary_path(binary_name: &str) -> Result<PathBuf> {
     )
 }
 
-pub fn sibling_binary_exists(binary_name: &str) -> bool {
-    let Ok(current_exe) = current_executable_path() else {
-        return false;
-    };
-    let Ok(candidates) = sibling_binary_candidates(&current_exe, binary_name) else {
-        return false;
-    };
-    candidates.iter().any(|candidate| candidate.is_file())
-}
-
 fn sibling_binary_candidates(current_exe: &Path, binary_name: &str) -> Result<Vec<PathBuf>> {
     let Some(binary_dir) = current_exe.parent() else {
         bail!("current executable has no parent directory");
@@ -79,7 +69,8 @@ pub fn daemon_binary_path() -> Result<PathBuf> {
         .and_then(|parent| parent.file_name())
         .and_then(|name| name.to_str())
         == Some("deps")
-        && let Ok(rocm) = sibling_binary_path("rocm")
+        && let Ok(candidates) = sibling_binary_candidates(&current_exe, "rocm")
+        && let Some(rocm) = candidates.into_iter().find(|candidate| candidate.is_file())
     {
         return Ok(rocm);
     }

@@ -4,24 +4,90 @@
 
 //! Automation-daemon runtime state and its on-disk records.
 //!
-//! The running daemon's live snapshot (`AutomationRuntimeState`), the
-//! append-only JSONL stores for watcher action events (`AutomationEventRecord`)
-//! and audit log entries, the review-proposal store (append-only on write,
-//! but rewritten in full on status update or replace), and the accessors
-//! used to read them back. `AutomationTriggerEvent` is also defined here as
-//! the shared wire type for a watcher trigger, but this module persists
-//! none of it — it is produced and consumed in-memory by `rocmd`'s
-//! watcher/webhook plumbing.
+//! The built-in watcher catalog (`BuiltinWatcherSpec`/`builtin_watcher(s)`),
+//! the running daemon's live snapshot (`AutomationRuntimeState`), the
+//! logically append-only JSONL stores for watcher action events
+//! (`AutomationEventRecord`), audit log entries, and review proposals, and
+//! the accessors used to read them back. Every write — a single appended
+//! line or a full rewrite on proposal status update/replace — goes through
+//! [`write_atomic`], so a crash or full disk mid-write never leaves a
+//! truncated store. `AutomationTriggerEvent` is also defined here, but this
+//! module persists none of it: it is the in-memory trigger type passed
+//! between `rocmd`'s watcher and webhook plumbing (`apps/rocmd/src/watchers.rs`,
+//! `apps/rocmd/src/webhook.rs`), never serialized.
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::AppPaths;
 use crate::WatcherMode;
 use crate::require_nonempty;
 use crate::unix_time_millis;
+
+#[derive(Debug, Clone, Copy)]
+pub struct BuiltinWatcherSpec {
+    pub id: &'static str,
+    pub summary: &'static str,
+    pub trigger: &'static str,
+    pub default_mode: WatcherMode,
+    pub actions: &'static [&'static str],
+}
+
+const BUILTIN_WATCHERS: &[BuiltinWatcherSpec] = &[
+    BuiltinWatcherSpec {
+        id: "therock-update",
+        summary: "Emit scheduled TheRock update reminders and proposals.",
+        trigger: "schedule: every 6h",
+        default_mode: WatcherMode::Observe,
+        actions: &["remind_update_check", "queue_update_proposal"],
+    },
+    BuiltinWatcherSpec {
+        id: "server-recover",
+        summary: "Observe or restart failed managed services when restart metadata exists.",
+        trigger: "event: managed_service_failed",
+        default_mode: WatcherMode::Contained,
+        actions: &["collect_failure_snapshot", "restart_managed_service"],
+    },
+    BuiltinWatcherSpec {
+        id: "gpu-metrics",
+        summary: "Record read-only local amd-smi GPU telemetry availability; no proposals or mutations.",
+        trigger: "event: gpu.metrics availability/unavailability",
+        default_mode: WatcherMode::Observe,
+        actions: &["record_gpu_metrics"],
+    },
+    BuiltinWatcherSpec {
+        id: "cache-warm",
+        summary: "Queue reviewed artifact prefetch proposals for registry model artifacts.",
+        trigger: "event: cache.warm",
+        default_mode: WatcherMode::Propose,
+        actions: &["queue_prefetch_proposal"],
+    },
+    BuiltinWatcherSpec {
+        id: "driver-upgrade",
+        summary: "Queue reviewed read-only driver install plans when a local driver update signal is received.",
+        trigger: "event: update.available component=driver",
+        default_mode: WatcherMode::Propose,
+        actions: &["prepare_driver_plan"],
+    },
+    BuiltinWatcherSpec {
+        id: "gpu-thermal-protect",
+        summary: "Queue reviewed stop-serving proposals when GPU temperature or memory pressure is high.",
+        trigger: "event: gpu.thermal_pressure or gpu.memory_pressure",
+        default_mode: WatcherMode::Propose,
+        actions: &["queue_stop_server_proposal"],
+    },
+];
+
+pub const fn builtin_watchers() -> &'static [BuiltinWatcherSpec] {
+    BUILTIN_WATCHERS
+}
+
+pub fn builtin_watcher(id: &str) -> Option<&'static BuiltinWatcherSpec> {
+    builtin_watchers().iter().find(|watcher| watcher.id == id)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WatcherRuntimeSnapshot {
@@ -141,20 +207,81 @@ pub struct AuditEventRecord {
     pub service_id: Option<String>,
 }
 
-pub fn append_automation_event(paths: &AppPaths, event: &AutomationEventRecord) -> Result<()> {
-    paths.ensure()?;
-    let path = paths.automation_events_path();
-    let mut line =
-        serde_json::to_string(event).context("failed to serialize automation event record")?;
+/// Replace `path`'s content by writing a sibling temp file and renaming it
+/// over the destination, mirroring `RocmCliConfig::save`'s guarantee: an
+/// interrupted write (full disk, crash, killed process) can never leave a
+/// truncated file in place, and a reader sees either the old content or the
+/// new content. The temp file is removed if the write or the rename fails.
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let tmp_path = path.with_extension(format!(
+        "jsonl.tmp-{}-{}",
+        unix_time_millis(),
+        std::process::id()
+    ));
+    fs::write(&tmp_path, bytes)
+        .with_context(|| format!("failed to write {}", tmp_path.display()))
+        .inspect_err(|_| {
+            let _ = fs::remove_file(&tmp_path);
+        })?;
+    fs::rename(&tmp_path, path)
+        .with_context(|| format!("failed to replace {}", path.display()))
+        .inspect_err(|_| {
+            let _ = fs::remove_file(&tmp_path);
+        })?;
+    Ok(())
+}
+
+/// Append one JSONL `record` to `path`: read the existing content (if any),
+/// append the serialized record plus a newline, and replace the file via
+/// [`write_atomic`].
+fn append_jsonl_record<T: Serialize>(path: &Path, record: &T, context_label: &str) -> Result<()> {
+    let mut line = serde_json::to_string(record)
+        .with_context(|| format!("failed to serialize {context_label}"))?;
     line.push('\n');
     let mut existing = if path.is_file() {
-        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?
     } else {
         String::new()
     };
     existing.push_str(&line);
-    fs::write(&path, existing).with_context(|| format!("failed to write {}", path.display()))?;
-    Ok(())
+    write_atomic(path, existing.as_bytes())
+}
+
+/// Read every JSONL record from `path` and keep only the most recent `limit`
+/// (in on-disk order). Returns an empty vec when `path` doesn't exist yet or
+/// `limit` is `0`.
+fn load_recent_jsonl_records<T: serde::de::DeserializeOwned>(
+    path: &Path,
+    limit: usize,
+    context_label: &str,
+) -> Result<Vec<T>> {
+    if !path.is_file() || limit == 0 {
+        return Ok(Vec::new());
+    }
+    let text =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let mut records = Vec::new();
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let record = serde_json::from_str::<T>(line)
+            .with_context(|| format!("failed to parse {context_label} in {}", path.display()))?;
+        records.push(record);
+    }
+    if records.len() > limit {
+        records.drain(0..records.len() - limit);
+    }
+    Ok(records)
+}
+
+pub fn append_automation_event(paths: &AppPaths, event: &AutomationEventRecord) -> Result<()> {
+    paths.ensure()?;
+    append_jsonl_record(
+        &paths.automation_events_path(),
+        event,
+        "automation event record",
+    )
 }
 
 pub fn append_automation_proposal(
@@ -162,38 +289,20 @@ pub fn append_automation_proposal(
     proposal: &AutomationProposalRecord,
 ) -> Result<()> {
     paths.ensure()?;
-    let path = paths.automation_proposals_path();
     let mut proposal = proposal.clone();
     if proposal.proposal_id.is_empty() {
         proposal.proposal_id = generate_proposal_id(&proposal.watcher_id);
     }
-    let mut line = serde_json::to_string(&proposal)
-        .context("failed to serialize automation proposal record")?;
-    line.push('\n');
-    let mut existing = if path.is_file() {
-        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?
-    } else {
-        String::new()
-    };
-    existing.push_str(&line);
-    fs::write(&path, existing).with_context(|| format!("failed to write {}", path.display()))?;
-    Ok(())
+    append_jsonl_record(
+        &paths.automation_proposals_path(),
+        &proposal,
+        "automation proposal record",
+    )
 }
 
 pub fn append_audit_event(paths: &AppPaths, event: &AuditEventRecord) -> Result<()> {
     paths.ensure()?;
-    let path = paths.audit_events_path();
-    let mut line =
-        serde_json::to_string(event).context("failed to serialize audit event record")?;
-    line.push('\n');
-    let mut existing = if path.is_file() {
-        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?
-    } else {
-        String::new()
-    };
-    existing.push_str(&line);
-    fs::write(&path, existing).with_context(|| format!("failed to write {}", path.display()))?;
-    Ok(())
+    append_jsonl_record(&paths.audit_events_path(), event, "audit event record")
 }
 
 pub fn load_automation_proposals(paths: &AppPaths) -> Result<Vec<AutomationProposalRecord>> {
@@ -239,23 +348,6 @@ pub fn find_automation_proposal(
         .with_context(|| format!("automation proposal `{proposal_id}` not found"))
 }
 
-pub fn replace_automation_proposal(
-    paths: &AppPaths,
-    updated: &AutomationProposalRecord,
-) -> Result<AutomationProposalRecord> {
-    require_nonempty(&updated.proposal_id, "proposal_id")?;
-    let mut proposals = load_automation_proposals(paths)?;
-    let Some(existing) = proposals
-        .iter_mut()
-        .find(|proposal| proposal.proposal_id == updated.proposal_id)
-    else {
-        bail!("automation proposal `{}` not found", updated.proposal_id);
-    };
-    *existing = updated.clone();
-    write_automation_proposals(paths, &proposals)?;
-    Ok(updated.clone())
-}
-
 pub fn update_automation_proposal_status(
     paths: &AppPaths,
     proposal_id: &str,
@@ -280,26 +372,7 @@ pub fn update_automation_proposal_status(
 }
 
 pub fn load_recent_audit_events(paths: &AppPaths, limit: usize) -> Result<Vec<AuditEventRecord>> {
-    let path = paths.audit_events_path();
-    if !path.is_file() || limit == 0 {
-        return Ok(Vec::new());
-    }
-
-    let text =
-        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
-    let mut events = Vec::new();
-    for line in text.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let event = serde_json::from_str::<AuditEventRecord>(line)
-            .with_context(|| format!("failed to parse audit event in {}", path.display()))?;
-        events.push(event);
-    }
-    if events.len() > limit {
-        events.drain(0..events.len() - limit);
-    }
-    Ok(events)
+    load_recent_jsonl_records(&paths.audit_events_path(), limit, "audit event")
 }
 
 fn write_automation_proposals(
@@ -316,8 +389,7 @@ fn write_automation_proposals(
         );
         text.push('\n');
     }
-    fs::write(&path, text).with_context(|| format!("failed to write {}", path.display()))?;
-    Ok(())
+    write_atomic(&path, text.as_bytes())
 }
 
 fn normalize_proposal_identity(proposal: &mut AutomationProposalRecord, index: usize) {
@@ -355,27 +427,7 @@ pub fn load_recent_automation_events(
     paths: &AppPaths,
     limit: usize,
 ) -> Result<Vec<AutomationEventRecord>> {
-    let path = paths.automation_events_path();
-    if !path.is_file() {
-        return Ok(Vec::new());
-    }
-
-    let bytes = fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
-    let text =
-        String::from_utf8(bytes).with_context(|| format!("failed to decode {}", path.display()))?;
-    let mut events = Vec::new();
-    for line in text.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let event = serde_json::from_str::<AutomationEventRecord>(line)
-            .with_context(|| format!("failed to parse event in {}", path.display()))?;
-        events.push(event);
-    }
-    if events.len() > limit {
-        events.drain(0..events.len() - limit);
-    }
-    Ok(events)
+    load_recent_jsonl_records(&paths.automation_events_path(), limit, "event")
 }
 
 #[cfg(test)]

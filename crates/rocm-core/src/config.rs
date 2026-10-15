@@ -5,9 +5,10 @@
 //! The unified `rocm-cli` config and its nested sections.
 //!
 //! `RocmCliConfig`: engine/provider/watcher/telemetry/permissions/setup
-//! knobs, the built-in automation-watcher catalog
-//! (`WatcherMode`/`BuiltinWatcherSpec`), and the rocm-dash dashboard
-//! sub-config (daemon + TUI), including its one-shot legacy-TOML migration.
+//! knobs (including `WatcherMode`, the persisted watcher-review-mode enum;
+//! the built-in watcher catalog itself lives in `automation.rs`), and the
+//! rocm-dash dashboard sub-config (daemon + TUI), including its one-shot
+//! legacy-TOML migration.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -17,6 +18,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::AppPaths;
+use crate::BuiltinWatcherSpec;
 use crate::unix_time_millis;
 use crate::user_runtime_dir;
 
@@ -38,68 +40,6 @@ impl WatcherMode {
             Self::Contained => "contained",
         }
     }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct BuiltinWatcherSpec {
-    pub id: &'static str,
-    pub summary: &'static str,
-    pub trigger: &'static str,
-    pub default_mode: WatcherMode,
-    pub actions: &'static [&'static str],
-}
-
-const BUILTIN_WATCHERS: &[BuiltinWatcherSpec] = &[
-    BuiltinWatcherSpec {
-        id: "therock-update",
-        summary: "Emit scheduled TheRock update reminders and proposals.",
-        trigger: "schedule: every 6h",
-        default_mode: WatcherMode::Observe,
-        actions: &["remind_update_check", "queue_update_proposal"],
-    },
-    BuiltinWatcherSpec {
-        id: "server-recover",
-        summary: "Observe or restart failed managed services when restart metadata exists.",
-        trigger: "event: managed_service_failed",
-        default_mode: WatcherMode::Contained,
-        actions: &["collect_failure_snapshot", "restart_managed_service"],
-    },
-    BuiltinWatcherSpec {
-        id: "gpu-metrics",
-        summary: "Record read-only local amd-smi GPU telemetry availability; no proposals or mutations.",
-        trigger: "event: gpu.metrics availability/unavailability",
-        default_mode: WatcherMode::Observe,
-        actions: &["record_gpu_metrics"],
-    },
-    BuiltinWatcherSpec {
-        id: "cache-warm",
-        summary: "Queue reviewed artifact prefetch proposals for registry model artifacts.",
-        trigger: "event: cache.warm",
-        default_mode: WatcherMode::Propose,
-        actions: &["queue_prefetch_proposal"],
-    },
-    BuiltinWatcherSpec {
-        id: "driver-upgrade",
-        summary: "Queue reviewed read-only driver install plans when a local driver update signal is received.",
-        trigger: "event: update.available component=driver",
-        default_mode: WatcherMode::Propose,
-        actions: &["prepare_driver_plan"],
-    },
-    BuiltinWatcherSpec {
-        id: "gpu-thermal-protect",
-        summary: "Queue reviewed stop-serving proposals when GPU temperature or memory pressure is high.",
-        trigger: "event: gpu.thermal_pressure or gpu.memory_pressure",
-        default_mode: WatcherMode::Propose,
-        actions: &["queue_stop_server_proposal"],
-    },
-];
-
-pub const fn builtin_watchers() -> &'static [BuiltinWatcherSpec] {
-    BUILTIN_WATCHERS
-}
-
-pub fn builtin_watcher(id: &str) -> Option<&'static BuiltinWatcherSpec> {
-    builtin_watchers().iter().find(|watcher| watcher.id == id)
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -795,6 +735,7 @@ impl RocmCliConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::builtin_watcher;
     use crate::test_support::temp_app_paths;
 
     // The socket-path precedence is mirrored in `rocm-dash-core`; these tests
@@ -1299,6 +1240,7 @@ last_installed_runtime_id = "therock-release"
     #[cfg(windows)]
     #[allow(unsafe_code)] // Win32 FFI
     fn windows_file_identity(path: &Path) -> Result<(u32, u64)> {
+        use anyhow::bail;
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::Foundation::HANDLE;
         use windows_sys::Win32::Storage::FileSystem::{
@@ -1312,7 +1254,7 @@ last_installed_runtime_id = "therock-release"
         let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
         let handle = file.as_raw_handle() as HANDLE;
         if unsafe { GetFileInformationByHandle(handle, &raw mut info) } == 0 {
-            anyhow::bail!(
+            bail!(
                 "failed to read the file identity of {}: {}",
                 path.display(),
                 std::io::Error::last_os_error()
