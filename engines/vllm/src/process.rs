@@ -1493,13 +1493,22 @@ mod tests {
 
         apply_therock_env(&mut command, &runtime)?;
 
-        let stub = env
-            .path()
-            .join("rocm-cli-lib-compat")
-            .join("libmpi_cxx.so.40");
+        let compat_dir = env.path().join("rocm-cli-lib-compat");
+        let stub = compat_dir.join("libmpi_cxx.so.40");
         assert!(
             stub.is_file(),
             "ensure_therock_compat_shims must have written the libmpi_cxx stub"
+        );
+
+        let ld_library_path = command
+            .get_envs()
+            .find_map(|(key, value)| (key == "LD_LIBRARY_PATH").then_some(value))
+            .flatten()
+            .expect("LD_LIBRARY_PATH set");
+        assert!(
+            std::env::split_paths(ld_library_path).any(|entry| entry == compat_dir),
+            "ensure_therock_compat_shims's answer must reach LD_LIBRARY_PATH: \
+             {ld_library_path:?} should contain {compat_dir:?}"
         );
         Ok(())
     }

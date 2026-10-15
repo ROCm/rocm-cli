@@ -638,11 +638,11 @@ pub(crate) fn runtime_bin_paths(runtime: &VllmRuntime) -> Vec<PathBuf> {
 /// How [`therock_library_path_entries_inner`] decides whether the compat dir
 /// belongs on the loader path.
 enum CompatDirSignal {
-    /// No `ensure_therock_compat_shims` call preceded this derivation (the
-    /// running-state payload path, which never writes shims). Falls back to a
-    /// read-only directory listing of whatever is already on disk: not
-    /// authoritative, but the best available signal without performing a
-    /// write.
+    /// `ensure_therock_compat_shims`'s answer is not passed in to this
+    /// derivation (the running-state payload path, which never calls it).
+    /// Falls back to a read-only directory listing of whatever is already on
+    /// disk: not authoritative, but the best available signal without
+    /// performing a write.
     Unchecked,
     /// This launch's authoritative answer from `ensure_therock_compat_shims`:
     /// `Some(dir)` when a shim is needed, `None` when it is not — even if one
@@ -660,8 +660,8 @@ pub(crate) fn therock_library_path_entries(runtime: &VllmRuntime) -> Vec<PathBuf
 /// the authoritative answer for whether the compat dir belongs on the loader
 /// path. Unlike a directory listing, it is not fooled by a stub some earlier
 /// run left behind after the host later gained a real `libmpi_cxx` — that
-/// case now resolves to `None` here, exactly as `ensure_mpi_cxx_compat`
-/// reports it.
+/// case resolves to `None` here, exactly as `ensure_mpi_cxx_compat` reports
+/// it for this launch.
 pub(crate) fn therock_library_path_entries_for_launch(
     runtime: &VllmRuntime,
     compat_shim: Option<PathBuf>,
