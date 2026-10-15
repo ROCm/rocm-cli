@@ -6,7 +6,6 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::fs;
-use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -143,7 +142,9 @@ pub use proc_lifecycle::{
     process_start_ticks, terminate_verified,
 };
 pub use process::{
-    FileLock, detach_command_session, process_is_running, terminate_process, terminate_process_tree,
+    FileLock, LoopbackPortLease, MANAGED_LAUNCH_LOCK_TIMEOUT, detach_command_session,
+    is_canonical_loopback_host, lease_loopback_port, process_is_running, terminate_process,
+    terminate_process_tree,
 };
 #[cfg(windows)]
 pub use process::{
@@ -522,86 +523,6 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8], tmp_ext: &str) -> Result<(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Managed-service port leasing and the shared allocation lock.
-//
-// Both `rocm serve` and `rocmd` recovery contend for the same local TCP ports
-// and the same service records, so the primitives that arbitrate them live here
-// rather than in either binary.
-// ---------------------------------------------------------------------------
-
-/// True only for the exact canonical default loopback host.
-///
-/// Proactive OS collision detection (leasing a real socket before launch) is
-/// claimed only for this one host. `localhost`, `::1`, `0.0.0.0`, and other
-/// IPv4 addresses are "custom hosts": they require an explicit port and keep the
-/// existing engine-owned bind/error behavior, because an IPv4-loopback probe
-/// would not prove anything about the address the engine will actually bind.
-#[must_use]
-pub fn is_canonical_loopback_host(host: &str) -> bool {
-    host.trim() == DEFAULT_LOCAL_HOST
-}
-
-/// A real, held `127.0.0.1:<port>` listener proving the port is bindable now.
-///
-/// The lease is the collision check: it is acquired before any manifest, log, or
-/// child process exists, and [`LoopbackPortLease::release`] drops the socket
-/// immediately before the engine child is spawned so the child can bind it. The
-/// window between release and the child's bind is unavoidable without engine
-/// socket-passing; it is far narrower than the previous "bind and hope" launch.
-#[derive(Debug)]
-pub struct LoopbackPortLease {
-    port: u16,
-    listener: Option<TcpListener>,
-}
-
-impl LoopbackPortLease {
-    #[must_use]
-    pub const fn port(&self) -> u16 {
-        self.port
-    }
-
-    /// True while this lease still holds the socket open.
-    #[must_use]
-    pub const fn is_held(&self) -> bool {
-        self.listener.is_some()
-    }
-
-    /// Close the socket and hand the port to the caller. Call this immediately
-    /// before spawning the process that will bind it.
-    pub fn release(mut self) -> u16 {
-        self.listener = None;
-        self.port
-    }
-
-    /// A lease over a port this process never probed, for custom hosts where the
-    /// engine — not the CLI — owns bind success or failure.
-    #[must_use]
-    pub const fn engine_owned(port: u16) -> Self {
-        Self {
-            port,
-            listener: None,
-        }
-    }
-}
-
-/// Try to take an exclusive IPv4-loopback lease on `port`.
-///
-/// Errors are returned verbatim so callers can distinguish "occupied"
-/// ([`std::io::ErrorKind::AddrInUse`], the only condition that should advance an
-/// automatic scan) from a privileged or unavailable address, which must fail
-/// immediately rather than silently choosing a different port.
-pub fn lease_loopback_port(port: u16) -> std::io::Result<LoopbackPortLease> {
-    let listener = TcpListener::bind(std::net::SocketAddrV4::new(
-        std::net::Ipv4Addr::LOCALHOST,
-        port,
-    ))?;
-    Ok(LoopbackPortLease {
-        port,
-        listener: Some(listener),
-    })
-}
-
 /// File name of the shared allocation lock, inside [`AppPaths::services_dir`].
 ///
 /// Not a `.json` file, so `load_managed_services` never mistakes it for a
@@ -711,6 +632,7 @@ mod tests {
     use crate::test_support::workspace_test_artifact_dir;
 
     use std::fs;
+    use std::net::TcpListener;
     use std::path::Path;
     use std::process::{Command, Stdio};
 

@@ -4636,7 +4636,9 @@ fn apply_service_prune_plan(
 /// guard back to its caller, and `start_managed_service`/`run_attached_service`
 /// only drop it once the record is persisted (see that function's own comment,
 /// which this one must not drift from). The gap was simply that prune never
-/// acquired it: the helper above was the single acquirer in the tree. Taking it
+/// acquired it: the helper above was the only acquirer in this binary (`rocmd`'s
+/// recovery path takes the same file lock too, bounded, from its own process —
+/// see `restart_managed_service`'s doc comment). Taking it
 /// here closes the window deterministically, for any number of records, which no
 /// age floor can — the window is not short and is not bounded, because
 /// `spawn_managed_engine_child`'s idempotency guard runs `load_managed_services`
@@ -7202,6 +7204,13 @@ fn restart_internal_managed_service(
 
 /// [`restart_internal_managed_service`], with the termination of the recorded
 /// processes supplied by the caller — see [`stop_internal_managed_service_with`].
+///
+/// The respawn is serialized on the same cross-process launch lock a fresh
+/// `rocm serve` launch and `rocmd` recovery both use: the confirmed stop just
+/// released this service's (host, port), and nothing reserves it again until
+/// the new child binds and its record is published, so a concurrent launch or
+/// recovery could otherwise claim the exact port this restart is about to
+/// reuse.
 fn restart_internal_managed_service_with(
     paths: &AppPaths,
     service_id: &str,
@@ -7251,8 +7260,49 @@ fn restart_internal_managed_service_with(
     let (stopped_record, _) = read_managed_service_manifest(paths, service_id)?;
     // Still after the stop, like the device-policy refusal inside it always was:
     // the callers' "stopped by the attempt" report and pin restore both cover a
-    // restart that gets this far and fails.
+    // restart that gets this far and fails. Pure computation — it parses the
+    // record, it does not touch the network — so it stays ahead of the launch
+    // lock below and a refused device policy still fails before anything binds.
     let serve_args = restart_child_argv(&record)?;
+    // The confirmed stop just released this (host, port): nothing holds it again
+    // until the new child binds and `record_restarted_child` publishes below.
+    // Close that gap the same way a fresh launch and `rocmd` recovery do —
+    // under the shared launch lock, with a re-check against the disk and a
+    // loopback preflight — so a concurrent launch or recovery can't claim this
+    // exact port out from under the restart. Unbounded, like every other
+    // CLI-side acquire of this lock (see `FileLock::acquire_bounded`'s doc
+    // comment for why only `rocmd`'s recovery bounds its wait).
+    let launch_lock = rocm_core::FileLock::acquire(paths.managed_launch_lock_path())?;
+    if let Some(collision) = load_managed_services(paths)
+        .context("failed to re-read managed services under the launch lock")?
+        .into_iter()
+        .find(|other| {
+            other.service_id != stopped_record.service_id
+                && other.is_live()
+                && other.host == stopped_record.host
+                && other.port == stopped_record.port
+        })
+    {
+        bail!(
+            "cannot restart `{service_id}` on {}:{}: {} claimed that port while the restart \
+             was waiting for the launch lock",
+            stopped_record.host,
+            stopped_record.port,
+            collision.service_id
+        );
+    }
+    let port_lease = if rocm_core::is_canonical_loopback_host(&stopped_record.host) {
+        Some(
+            rocm_core::lease_loopback_port(stopped_record.port).with_context(|| {
+                format!(
+                    "cannot restart `{service_id}` on {}:{}: its port is in use",
+                    stopped_record.host, stopped_record.port
+                )
+            })?,
+        )
+    } else {
+        None
+    };
     fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -7270,6 +7320,11 @@ fn restart_internal_managed_service_with(
         record.runtime_id.as_deref(),
         record.env_id.as_deref(),
     )?;
+    // Hand the port to the respawned child: close the probe socket immediately
+    // before the spawn, still holding the launch lock.
+    if let Some(lease) = port_lease {
+        lease.release();
+    }
     // A restarted public service comes back authenticated: its 0600 key file
     // persists across restarts (removed only on stop), so hand the child the same
     // file and reuse the key for the readiness probe.
@@ -7321,6 +7376,10 @@ fn restart_internal_managed_service_with(
     // Recorded before the readiness wait, so a stop issued during it finds the
     // new child rather than the processes already stopped.
     let started = record_restarted_child(paths, &stopped_record, runtime_pin, child_pid)?;
+    // Published; a concurrent launch or recovery now sees this service as live
+    // on its port again, so there is nothing left for the lock to protect, and
+    // the readiness wait below can block for many seconds.
+    drop(launch_lock);
     let readiness = wait_for_service_http_ready(
         &started.engine,
         &started.host,
@@ -8178,10 +8237,7 @@ pub(crate) fn managed_service_sidebar_counts(
 }
 
 pub(crate) fn managed_service_is_live(record: &ManagedServiceRecord) -> bool {
-    matches!(
-        record.status.as_str(),
-        "ready" | "running" | "starting" | "recovering"
-    )
+    record.is_live()
 }
 
 /// Idempotency guard for managed launches: returns an already-live managed
@@ -12862,6 +12918,7 @@ pub(crate) mod tests {
         assert!(help.contains("11435"), "{help}");
         assert!(help.contains("automatically"), "{help}");
         assert!(help.contains("127.0.0.1"), "{help}");
+        assert!(help.contains("explicit --port"), "{help}");
     }
 
     #[test]
@@ -17570,6 +17627,87 @@ pub(crate) mod tests {
             "the other restart's PID stays"
         );
         assert_eq!(on_disk.restart_count, 0, "nothing was written");
+    }
+
+    /// The gap a manual restart used to leave open: the confirmed stop just
+    /// released the service's port, and nothing reserves it again until the
+    /// new child binds and `record_restarted_child` publishes — a concurrent
+    /// `rocm serve` launch could claim that exact port in between. Recreate
+    /// the race under the shared launch lock and require the restart to
+    /// refuse rather than spawn a competitor onto it, following the same
+    /// wait-then-publish-then-release shape as
+    /// `services_prune_waits_for_the_managed_launch_lock_before_sweeping`.
+    #[test]
+    fn restart_refuses_a_port_a_launch_claimed_while_it_waited_for_the_lock() -> Result<()> {
+        use std::sync::mpsc;
+
+        const WAIT_PROOF: Duration = Duration::from_millis(500);
+
+        let (root, paths) = test_paths("restart-launch-claimed-port");
+        paths.ensure()?;
+        let service_id = "svc-restart-launch-claimed-port";
+        let record = stop_test_record(&paths, service_id);
+        let host = record.host.clone();
+        let port = record.port;
+        record.write()?;
+
+        let launch_lock = rocm_core::FileLock::acquire(paths.managed_launch_lock_path())?;
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let (waited, finished) = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                started_tx.send(()).expect("signal about to restart");
+                let outcome =
+                    restart_internal_managed_service_with(&paths, service_id, None, |_| {
+                        (Vec::new(), true)
+                    });
+                let _ = done_tx.send(outcome.map_err(|error| format!("{error:#}")));
+            });
+            started_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("restart thread started");
+            let early = done_rx.recv_timeout(WAIT_PROOF);
+            let waited = early.is_err();
+            // Simulate a fresh `rocm serve --gpu auto` publishing a brand-new
+            // service on this exact port while the restart was still waiting
+            // for the lock it itself now holds.
+            let mut competitor = ManagedServiceRecord::new(
+                &paths,
+                "svc-fresh-launch",
+                "lemonade",
+                "other-model",
+                "other-model-canonical",
+                &host,
+                port,
+                "managed",
+                0,
+                None,
+                None,
+                None,
+            );
+            competitor.status = "starting".to_owned();
+            competitor.write().expect("publish the competing record");
+            drop(launch_lock);
+            let finished = match early {
+                Ok(finished) => finished,
+                Err(_) => done_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("restart completes once the launch lock is released"),
+            };
+            (waited, finished)
+        });
+        let _ = fs::remove_dir_all(root);
+
+        assert!(
+            waited,
+            "the restart must serialize on the shared launch lock"
+        );
+        let error =
+            finished.expect_err("a live competitor on the same port must refuse the restart");
+        assert!(error.contains("svc-fresh-launch"), "{error}");
+        assert!(error.contains("claimed that port"), "{error}");
+        Ok(())
     }
 
     #[test]

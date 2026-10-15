@@ -1806,7 +1806,6 @@ mod tests {
         };
         wizard.editor = Some(crate::ui::serve_wizard::InlineEditor {
             field: crate::ui::serve_wizard::Field::Host,
-            original: "127.0.0.1".into(),
             value: "localhost".into(),
             cursor: 9,
             selected: false,

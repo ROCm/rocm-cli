@@ -2235,6 +2235,16 @@ fn validate_chat_launch_server_tool_call(call: &providers::ChatToolCall) -> Resu
     if !is_loopback_host(&host) {
         bail!("local assistant cannot request non-local host `{host}`");
     }
+    // `rocm serve` proves a port is free only on the exact default host; every
+    // other spelling (including the loopback aliases `localhost`/`::1` this
+    // check still accepts) needs an explicit port or the CLI call refuses
+    // later with a less actionable error. See `is_canonical_loopback_host`.
+    if object.get("port").is_none() && !rocm_core::is_canonical_loopback_host(&host) {
+        bail!(
+            "local assistant must supply an explicit `port` for host `{host}`; automatic port \
+             selection is only supported on the default host {DEFAULT_LOCAL_HOST}"
+        );
+    }
     if object
         .get("device")
         .and_then(serde_json::Value::as_str)
@@ -6212,6 +6222,48 @@ model recipes
         };
         let error = validate_chat_tool_call(&host).unwrap_err().to_string();
         assert!(error.contains("non-local host"));
+    }
+
+    #[test]
+    fn chat_tool_call_requires_an_explicit_port_for_non_canonical_loopback_hosts() {
+        let no_port = providers::ChatToolCall {
+            id: None,
+            name: "launch_server".to_owned(),
+            arguments: serde_json::json!({
+                "model": "tiny.gguf",
+                "engine": "vllm",
+                "host": "localhost"
+            }),
+        };
+        let error = validate_chat_tool_call(&no_port).unwrap_err().to_string();
+        assert!(
+            error.contains("explicit `port`"),
+            "unexpected error: {error}"
+        );
+
+        let with_port = providers::ChatToolCall {
+            id: None,
+            name: "launch_server".to_owned(),
+            arguments: serde_json::json!({
+                "model": "tiny.gguf",
+                "engine": "vllm",
+                "host": "localhost",
+                "port": 11999
+            }),
+        };
+        validate_chat_tool_call(&with_port).expect("explicit port on localhost is allowed");
+
+        let canonical_no_port = providers::ChatToolCall {
+            id: None,
+            name: "launch_server".to_owned(),
+            arguments: serde_json::json!({
+                "model": "tiny.gguf",
+                "engine": "vllm",
+                "host": "127.0.0.1"
+            }),
+        };
+        validate_chat_tool_call(&canonical_no_port)
+            .expect("automatic port selection still works on the canonical loopback host");
     }
 
     #[test]

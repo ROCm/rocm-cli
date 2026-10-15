@@ -1082,6 +1082,7 @@ enum AttachOutcome {
 /// survives the session — Ctrl-D detaches and leaves it running, Ctrl-C stops it.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_attached_service(
+    paths: &AppPaths,
     engine: &str,
     service_id: &str,
     requested_model: &str,
@@ -1095,10 +1096,8 @@ pub(crate) fn run_attached_service(
     launch_lock: rocm_core::FileLock,
     require_api_key: bool,
 ) -> Result<()> {
-    let paths = AppPaths::discover()?;
-
     let spawn = spawn_managed_engine_child(
-        &paths,
+        paths,
         engine,
         service_id,
         requested_model,
@@ -1111,7 +1110,14 @@ pub(crate) fn run_attached_service(
         env_id,
         resolve.engine_recipe.as_ref(),
         require_api_key,
-    )?;
+    )
+    // Mirrors the background path's cleanup in `serve_cmd.rs`: a pre-spawn
+    // failure (port reserved/in use, range exhausted, other bind error) returns
+    // before any service record exists, so nothing else clears the key just
+    // stored for this attempt.
+    .inspect_err(|_| {
+        drop_orphaned_endpoint_key_on_already_running(paths, service_id, endpoint_api_key);
+    })?;
     // The claiming record is persisted (or an existing service was found), so the
     // selected GPU is now visible to concurrent auto-selection. Release the launch
     // lock before streaming logs, which blocks for the whole attached session.
@@ -1133,7 +1139,7 @@ pub(crate) fn run_attached_service(
                 "  stop: {}",
                 service_hints::service_stop_hint(&report.service_id)
             );
-            drop_orphaned_endpoint_key_on_already_running(&paths, service_id, endpoint_api_key);
+            drop_orphaned_endpoint_key_on_already_running(paths, service_id, endpoint_api_key);
             return Ok(());
         }
         ManagedSpawn::Spawned { record, child_pid } => (
@@ -1179,7 +1185,7 @@ pub(crate) fn run_attached_service(
             println!("  logs: rocm logs {service_id}");
             println!("  stop: {}", service_hints::service_stop_hint(&service_id));
             record_cli_audit_event(
-                &paths,
+                paths,
                 "service",
                 "serve_detach",
                 "info",
@@ -1191,7 +1197,7 @@ pub(crate) fn run_attached_service(
         AttachOutcome::Stop => {
             println!("stopping server...");
             match run_internal_sandbox_tool(
-                &paths,
+                paths,
                 SandboxToolArg::StopServer,
                 Some(service_id.clone()),
                 true,
@@ -1205,7 +1211,7 @@ pub(crate) fn run_attached_service(
                 }
             }
             record_cli_audit_event(
-                &paths,
+                paths,
                 "service",
                 "serve_stop",
                 "info",
@@ -1374,6 +1380,7 @@ fn stream_attached_logs_no_tty(log_path: &Path, child_pid: u32) -> Result<Attach
 mod tests {
     use super::*;
     use crate::tests::test_paths;
+    use rocm_core::DEFAULT_LOCAL_HOST;
 
     #[test]
     fn serve_bind_validation_requires_public_ack() {
@@ -1643,6 +1650,18 @@ mod tests {
             None,
             true,
         );
+
+        // This guard fires before any child is spawned, so `record.engine_pid`
+        // is still `None` when `spawn_managed_engine_child`'s cleanup arm calls
+        // `abandon_failed_managed_launch` — proving its pre-spawn branch
+        // (delete everything) runs from the real call site, not just from the
+        // `abandoned_launch_leaves_no_record_log_or_endpoint_key` test that
+        // calls the helper directly.
+        let manifest_path = paths.service_manifest_path("lemonade-qwen-3000");
+        let log_path = paths.service_log_path("lemonade-qwen-3000");
+        let engine_state_path = paths.service_engine_state_path("lemonade", "lemonade-qwen-3000");
+        let key = endpoint_keys::endpoint_api_key(&paths, "lemonade-qwen-3000");
+        let live = live_managed_services(&paths);
         let _ = fs::remove_dir_all(root);
 
         let Err(error) = result else {
@@ -1657,6 +1676,284 @@ mod tests {
             message.contains("without authentication"),
             "the refusal must say what the risk is: {message}"
         );
+        assert!(
+            !manifest_path.exists(),
+            "a pre-spawn failure must not leave a record"
+        );
+        assert!(
+            !log_path.exists(),
+            "a pre-spawn failure must not leave a log"
+        );
+        assert!(
+            !engine_state_path.exists(),
+            "a pre-spawn failure must not leave engine state"
+        );
+        assert_eq!(
+            key, None,
+            "a pre-spawn failure must not leave the unusable key behind"
+        );
+        assert!(
+            live.is_empty(),
+            "a pre-spawn failure must leave no reservation"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_spawn_past_the_first_write_terminates_the_child_and_keeps_a_failed_record()
+    -> Result<()> {
+        // Drives the real call site's *post*-spawn cleanup branch, which
+        // neither `abandoned_launch_*` test reaches (they call
+        // `abandon_failed_managed_launch` directly). An engine name this
+        // binary does not build in makes the real spawned child (a second
+        // `rocm` process) exit almost immediately via
+        // `run_builtin_engine_serve_http`'s `other => bail!(...)` arm, after
+        // `launch_managed_engine_child_locked` has already set
+        // `record.engine_pid` — so cleanup must terminate (already-dead) the
+        // child, keep the record and log for inspection, mark the record
+        // `failed`, and clear only the endpoint key.
+        let (root, paths) = test_paths("managed-spawn-unknown-engine-cleanup");
+        paths.ensure()?;
+        let service_id = "no-such-engine-qwen-4000";
+        endpoint_keys::store_endpoint_api_key(&paths, service_id, "test-key")?;
+
+        let resolve = ResolveModelResponse {
+            canonical_model_id: "qwen-canonical".to_owned(),
+            task: "chat".to_owned(),
+            source: "hf".to_owned(),
+            revision: "main".to_owned(),
+            loader: "llama.cpp".to_owned(),
+            trust_remote_code: false,
+            chat_template_mode: "auto".to_owned(),
+            dtype: "auto".to_owned(),
+            device_policy: DevicePolicy::GpuPreferred,
+            estimated_memory: "unknown".to_owned(),
+            launch_defaults: serde_json::json!({}),
+            engine_recipe: None,
+            warnings: Vec::new(),
+        };
+
+        let result = spawn_managed_engine_child(
+            &paths,
+            "no-such-engine",
+            service_id,
+            "qwen",
+            &resolve,
+            "127.0.0.1",
+            serve_port::PortRequest::Explicit(11_514),
+            &resolve.device_policy,
+            &[],
+            None,
+            None,
+            None,
+            false,
+        );
+
+        let manifest_path = paths.service_manifest_path(service_id);
+        let log_path = paths.service_log_path(service_id);
+        let persisted = load_managed_services(&paths)
+            .expect("re-read manifests")
+            .into_iter()
+            .find(|candidate| candidate.service_id == service_id);
+        let key = endpoint_keys::endpoint_api_key(&paths, service_id);
+        let live = live_managed_services(&paths);
+
+        let Err(error) = result else {
+            panic!("an engine this binary does not build in must not report success")
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("managed engine exited immediately"),
+            "the failure must come from the spawned child dying, not an earlier guard: {message}"
+        );
+        assert!(
+            manifest_path.exists(),
+            "a post-spawn failure must keep the record for inspection"
+        );
+        assert!(
+            log_path.exists(),
+            "a post-spawn failure must keep the log for inspection"
+        );
+        let persisted =
+            persisted.expect("a post-spawn failure must leave the record on disk, not delete it");
+        assert_eq!(
+            persisted.status, "failed",
+            "a post-spawn failure must mark the record failed, not leave it stuck"
+        );
+        assert_eq!(
+            key, None,
+            "a post-spawn failure must still clear the endpoint key"
+        );
+        assert!(
+            live.is_empty(),
+            "a failed record must not still reserve its port"
+        );
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_port_reservation_leaves_no_orphaned_endpoint_key() -> Result<()> {
+        // serve() stores the new attempt's endpoint key before calling
+        // start_managed_service. If spawn_managed_engine_child fails inside
+        // resolve_managed_port_in_transaction (explicit port already reserved
+        // by another live service), it returns before any ManagedServiceRecord
+        // exists for this attempt, so abandon_failed_managed_launch never runs.
+        // The caller's .inspect_err() cleanup (drop_orphaned_endpoint_key_on_already_running)
+        // must be what clears the key.
+        let (root, paths) = test_paths("orphaned-key-on-reserved-port");
+        paths.ensure()?;
+        let mut other = ManagedServiceRecord::new(
+            &paths,
+            "lemonade-llama-1000",
+            "lemonade",
+            "llama",
+            "llama-canonical",
+            "127.0.0.1",
+            11513,
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            None,
+        );
+        other.status = "ready".to_owned();
+        other.engine_pid = Some(std::process::id());
+        other.write()?;
+
+        let resolve = ResolveModelResponse {
+            canonical_model_id: "qwen-canonical".to_owned(),
+            task: "chat".to_owned(),
+            source: "hf".to_owned(),
+            revision: "main".to_owned(),
+            loader: "llama.cpp".to_owned(),
+            trust_remote_code: false,
+            chat_template_mode: "auto".to_owned(),
+            dtype: "auto".to_owned(),
+            device_policy: DevicePolicy::GpuPreferred,
+            estimated_memory: "unknown".to_owned(),
+            launch_defaults: serde_json::json!({}),
+            engine_recipe: None,
+            warnings: Vec::new(),
+        };
+
+        let service_id = "lemonade-qwen-2000";
+        endpoint_keys::store_endpoint_api_key(&paths, service_id, "test-key")?;
+
+        let result = spawn_managed_engine_child(
+            &paths,
+            "lemonade",
+            service_id,
+            "qwen",
+            &resolve,
+            "127.0.0.1",
+            serve_port::PortRequest::Explicit(11513),
+            &resolve.device_policy,
+            &[],
+            None,
+            None,
+            None,
+            false,
+        );
+        let Err(error) = result else {
+            let _ = fs::remove_dir_all(root);
+            panic!("explicit port already reserved by a live service must be rejected")
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("already reserved by managed service"),
+            "unexpected error: {error}"
+        );
+
+        drop_orphaned_endpoint_key_on_already_running(&paths, service_id, Some("test-key"));
+        assert!(
+            endpoint_keys::endpoint_api_key(&paths, service_id).is_none(),
+            "cleanup must drop the key this failed attempt staged before launching"
+        );
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn attached_launch_failing_before_spawn_leaves_no_orphaned_endpoint_key() -> Result<()> {
+        // The background path's cleanup lives in serve_cmd.rs, wrapping
+        // start_managed_service. run_attached_service is the other caller of
+        // spawn_managed_engine_child and needs the identical .inspect_err()
+        // cleanup, not a simulated one: drive the real function end to end.
+        let (root, paths) = test_paths("orphaned-key-attached-reserved-port");
+        paths.ensure()?;
+        fs::create_dir_all(paths.services_dir())?;
+        let mut other = ManagedServiceRecord::new(
+            &paths,
+            "lemonade-llama-1000",
+            "lemonade",
+            "llama",
+            "llama-canonical",
+            "127.0.0.1",
+            11514,
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            None,
+        );
+        other.status = "ready".to_owned();
+        other.engine_pid = Some(std::process::id());
+        other.write()?;
+
+        let resolve = ResolveModelResponse {
+            canonical_model_id: "qwen-canonical".to_owned(),
+            task: "chat".to_owned(),
+            source: "hf".to_owned(),
+            revision: "main".to_owned(),
+            loader: "llama.cpp".to_owned(),
+            trust_remote_code: false,
+            chat_template_mode: "auto".to_owned(),
+            dtype: "auto".to_owned(),
+            device_policy: DevicePolicy::GpuPreferred,
+            estimated_memory: "unknown".to_owned(),
+            launch_defaults: serde_json::json!({}),
+            engine_recipe: None,
+            warnings: Vec::new(),
+        };
+
+        let service_id = "lemonade-qwen-attached-2000";
+        endpoint_keys::store_endpoint_api_key(&paths, service_id, "test-key")?;
+        let launch_lock = rocm_core::FileLock::acquire(paths.managed_launch_lock_path())?;
+
+        let result = run_attached_service(
+            &paths,
+            "lemonade",
+            service_id,
+            "qwen",
+            &resolve,
+            "127.0.0.1",
+            serve_port::PortRequest::Explicit(11514),
+            &[],
+            None,
+            None,
+            Some("test-key"),
+            launch_lock,
+            false,
+        );
+        let Err(error) = result else {
+            let _ = fs::remove_dir_all(root);
+            panic!("explicit port already reserved by a live service must be rejected")
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("already reserved by managed service"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            endpoint_keys::endpoint_api_key(&paths, service_id).is_none(),
+            "a pre-spawn failure must drop the key this attempt staged before launching"
+        );
+
+        let _ = fs::remove_dir_all(root);
         Ok(())
     }
 
@@ -2242,6 +2539,72 @@ mod tests {
     }
 
     #[test]
+    fn stopping_the_reserving_record_frees_its_explicit_port_for_reuse() -> Result<()> {
+        // Proves the mechanism `rocm services stop` relies on: it never touches
+        // the port directly, it only flips the stopped record's `status` (see
+        // the `all_stopped` branch in `main.rs`'s stop handler). This recreates
+        // that exact disk state and checks the same explicit port a live
+        // competitor refused now resolves, closing the loop the E2E
+        // `assert_port_reserved_message` step only checks by wording.
+        let (root, paths) = test_paths("alloc-explicit-port-freed-by-stop");
+        paths.ensure()?;
+        let mut holder = ManagedServiceRecord::new(
+            &paths,
+            "lemonade-a-1",
+            "lemonade",
+            "model-a",
+            "model-a".to_owned(),
+            DEFAULT_LOCAL_HOST,
+            11_435,
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            None,
+        );
+        holder.status = "running".to_owned();
+        holder.engine_pid = Some(std::process::id());
+        holder.write()?;
+
+        let still_reserved = resolve_managed_port_in_transaction(
+            &paths,
+            "lemonade",
+            "model-b",
+            DEFAULT_LOCAL_HOST,
+            serve_port::PortRequest::Explicit(11_435),
+            &mut always_free,
+        );
+        assert!(
+            matches!(still_reserved, Err(ref error) if error.to_string().contains("already reserved by managed service lemonade-a-1")),
+            "unexpected result while still running: {still_reserved:?}"
+        );
+
+        holder.status = "stopped".to_owned();
+        holder.write()?;
+
+        let decision = resolve_managed_port_in_transaction(
+            &paths,
+            "lemonade",
+            "model-b",
+            DEFAULT_LOCAL_HOST,
+            serve_port::PortRequest::Explicit(11_435),
+            &mut always_free,
+        );
+        let _ = fs::remove_dir_all(root);
+
+        match decision? {
+            ManagedPortDecision::Lease(lease) => assert_eq!(lease.port(), 11_435),
+            ManagedPortDecision::AlreadyLive(existing) => {
+                panic!(
+                    "a stopped record must not block reuse: {}",
+                    existing.service_id
+                )
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn allocation_transaction_rejects_an_explicit_port_a_recovering_service_holds() -> Result<()> {
         let (root, paths) = test_paths("alloc-txn-rejects-explicit-collision");
         paths.ensure()?;
@@ -2372,6 +2735,99 @@ mod tests {
             "exactly one racing transaction must launch"
         );
         assert_eq!(live_count, 1, "only one record may end up live");
+        Ok(())
+    }
+
+    #[test]
+    fn select_gpu_indices_under_launch_lock_blocks_for_the_full_hold_and_then_sees_the_holders_write()
+    -> Result<()> {
+        // The standing gap this closes: nothing exercised the real lock-acquisition
+        // function production callers use (`select_gpu_indices_under_launch_lock`)
+        // against a lock another thread actually holds, so a refactor that dropped
+        // the lock early (or stopped threading it through) would not fail any test.
+        // A real end-to-end spawn test is avoided here per the fix-forward plan:
+        // `spawn_managed_engine_child` is still exercised for real, but only via its
+        // `AlreadyLive` short-circuit (a pre-seeded duplicate record), so no child
+        // process is ever launched.
+        use std::sync::{Arc, Barrier};
+        use std::time::Instant;
+
+        let (root, paths) = test_paths("launch-lock-holds-across-spawn");
+        paths.ensure()?;
+        write_live_service_record(&paths, "lemonade-held-1", "held-canonical", 11_520, "ready")?;
+
+        let barrier = Arc::new(Barrier::new(2));
+        let hold_for = Duration::from_millis(250);
+
+        let holder_paths = paths.clone();
+        let holder_barrier = Arc::clone(&barrier);
+        let holder = thread::spawn(move || -> Result<()> {
+            let _lock = rocm_core::FileLock::acquire(holder_paths.managed_launch_lock_path())?;
+            holder_barrier.wait();
+            thread::sleep(hold_for);
+            Ok(())
+        });
+
+        barrier.wait();
+        let started = Instant::now();
+        let (gpu_indices, launch_lock) =
+            crate::select_gpu_indices_under_launch_lock(&paths, true, None, || None, None, None)?;
+        let waited = started.elapsed();
+
+        let resolve = ResolveModelResponse {
+            canonical_model_id: "held-canonical".to_owned(),
+            task: "chat".to_owned(),
+            source: "hf".to_owned(),
+            revision: "main".to_owned(),
+            loader: "llama.cpp".to_owned(),
+            trust_remote_code: false,
+            chat_template_mode: "auto".to_owned(),
+            dtype: "auto".to_owned(),
+            device_policy: DevicePolicy::GpuPreferred,
+            estimated_memory: "unknown".to_owned(),
+            launch_defaults: serde_json::json!({}),
+            engine_recipe: None,
+            warnings: Vec::new(),
+        };
+        let spawn = spawn_managed_engine_child(
+            &paths,
+            "lemonade",
+            "lemonade-held-2",
+            "held-model",
+            &resolve,
+            DEFAULT_LOCAL_HOST,
+            serve_port::PortRequest::Auto,
+            &resolve.device_policy,
+            &gpu_indices,
+            None,
+            None,
+            None,
+            false,
+        );
+        drop(launch_lock);
+        holder.join().expect("holder thread")?;
+        let _ = fs::remove_dir_all(root);
+
+        // `thread::sleep` only guarantees *at least* `hold_for`, but under a
+        // loaded host (e.g. a full parallel `cargo test` run on WSL2) timer
+        // coalescing can make the measured wait a hair short of the nominal
+        // hold. Allow a small margin so the test still fails loudly if the
+        // call returns early, without being flaky on actual block duration.
+        let margin = Duration::from_millis(20);
+        assert!(
+            waited + margin >= hold_for,
+            "select_gpu_indices_under_launch_lock returned before the holder released the lock: waited {waited:?}, held {hold_for:?}"
+        );
+        match spawn? {
+            ManagedSpawn::AlreadyRunning(report) => {
+                assert_eq!(report.service_id, "lemonade-held-1");
+            }
+            ManagedSpawn::Spawned { .. } => {
+                panic!(
+                    "expected the pre-seeded AlreadyLive record to short-circuit, not a real spawn"
+                )
+            }
+        }
         Ok(())
     }
 

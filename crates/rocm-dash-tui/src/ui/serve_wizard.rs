@@ -140,8 +140,6 @@ pub enum PortMode {
 #[derive(Debug, Clone)]
 pub struct InlineEditor {
     pub field: Field,
-    /// Value to restore on Escape.
-    pub original: String,
     pub value: String,
     /// Cursor position, in characters, in `0..=value.chars().count()`.
     pub cursor: usize,
@@ -153,7 +151,6 @@ impl InlineEditor {
     fn new(field: Field, value: &str) -> Self {
         Self {
             field,
-            original: value.to_string(),
             value: value.to_string(),
             cursor: value.chars().count(),
             selected: true,
@@ -317,6 +314,10 @@ impl ServeWizardState {
             Field::Mode => self.managed = !self.managed,
             _ => {}
         }
+        // Cycling Port back to Custom can fix the exact complaint an outstanding
+        // message is naming (e.g. "set Port to Custom"); without this, that
+        // message would sit on screen after the toggle that resolved it.
+        refresh_message(self);
     }
 
     /// Direct typing only applies to the Model row; Host and the custom port
@@ -567,7 +568,7 @@ pub fn on_key(
     Vec::new()
 }
 
-/// Drive the inline editor. Enter accepts, Escape restores, and nothing here
+/// Drive the inline editor. Enter accepts, Escape discards, and nothing here
 /// can open another overlay.
 fn editor_key(w: &mut ServeWizardState, code: KeyCode) {
     if w.editor.is_none() {
@@ -575,14 +576,9 @@ fn editor_key(w: &mut ServeWizardState, code: KeyCode) {
     }
     match code {
         KeyCode::Esc => {
-            // Restore the original — an abandoned edit never mutates the form.
-            if let Some(ed) = w.editor.take() {
-                match ed.field {
-                    Field::Host => w.host = ed.original,
-                    Field::Port => w.port = ed.original,
-                    _ => {}
-                }
-            }
+            // The form's host/port are only written on Enter, so discarding
+            // the editor here never mutates them.
+            w.editor = None;
             refresh_message(w);
         }
         KeyCode::Left | KeyCode::Right => {
@@ -1497,7 +1493,7 @@ mod tests {
     }
 
     #[test]
-    fn editor_escape_restores_the_original_value() {
+    fn editor_escape_discards_the_edit() {
         let mut wiz = Some(ServeWizardState {
             advanced_expanded: true,
             ..Default::default()
@@ -1512,7 +1508,7 @@ mod tests {
         let w = wiz.as_ref().unwrap();
         assert!(w.editor.is_none(), "Esc closes the editor");
         assert!(wiz.is_some(), "Esc in the editor never closes the overlay");
-        assert_eq!(w.host, "127.0.0.1", "original restored");
+        assert_eq!(w.host, "127.0.0.1", "edit was never committed to the form");
     }
 
     #[test]

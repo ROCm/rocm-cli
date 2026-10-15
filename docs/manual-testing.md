@@ -285,6 +285,19 @@ While the log stream is attached, verify detach and stop behave differently:
 - Re-run the serve command and press `Ctrl+C` instead. The server shuts down and
   `rocm services` no longer lists it as running.
 
+Omit `--port` on the default loopback host to exercise automatic selection:
+
+```powershell
+rocm serve qwen --engine lemonade --device gpu_required --managed
+```
+
+Expected result:
+
+- The command picks the first free port in `11435`-`11535` instead of failing
+  or always landing on `11435`.
+- `rocm services` shows the launched service bound to the port it picked, and
+  the deployment summary's endpoint matches it.
+
 ## 4. Local Server Records
 
 After a managed or foreground serve attempt, inspect local server records:

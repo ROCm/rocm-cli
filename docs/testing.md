@@ -956,7 +956,7 @@ cargo test -p rocmd recovery_waits_for_the_allocation_lock_and_refuses_an_occupi
 
 Omitting `--port` on the default loopback host scans `11435..=11535` for a
 candidate neither reserved by a live managed-service record nor occupied on the
-OS (`serve_port.rs`), under the same `services/launch.lock` that serializes
+OS ([`serve_port.rs`](../apps/rocm/src/serve_port.rs)), under the same `services/launch.lock` that serializes
 every other managed launch and `rocmd` recovery attempt. An explicit `--port`
 on a non-default `--host` is still required: automatic selection only probes
 `127.0.0.1` and refuses to guess elsewhere.

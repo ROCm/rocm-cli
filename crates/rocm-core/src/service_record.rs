@@ -322,6 +322,17 @@ impl ManagedServiceRecord {
         Ok(self.status != previous)
     }
 
+    /// Whether this record still reserves its port: the sole definition of
+    /// "live" shared between the CLI's launch-time port check and `rocmd`'s
+    /// recovery, so the two can never disagree about who owns a port.
+    #[must_use]
+    pub fn is_live(&self) -> bool {
+        matches!(
+            self.status.as_str(),
+            "ready" | "running" | "starting" | "recovering"
+        )
+    }
+
     fn with_storage_paths(&self) -> Self {
         let mut record = self.clone();
         record.manifest_path = normalize_runtime_path_for_storage(&record.manifest_path);

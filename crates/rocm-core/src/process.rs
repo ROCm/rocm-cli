@@ -24,11 +24,13 @@
 //! [#623](https://github.com/ROCm/rocm-cli/issues/623).
 
 use anyhow::{Context, Result, bail};
+use crate::DEFAULT_LOCAL_HOST;
 #[cfg(windows)]
 use std::collections::BTreeMap;
 #[cfg(windows)]
 use std::ffi::{OsStr, OsString};
 use std::fs;
+use std::net::TcpListener;
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -428,6 +430,156 @@ impl FileLock {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// Like [`Self::acquire`], but fails with an actionable error instead of
+    /// blocking forever once `timeout` has elapsed.
+    ///
+    /// Used where an indefinite wait would be a worse failure mode than a
+    /// clear timeout message — e.g. `rocmd`'s automatic recovery, which must
+    /// not hang forever behind a `rocm serve` launch holding the same lock.
+    /// A `rocm serve` launch itself uses the unbounded [`Self::acquire`]: its
+    /// own worst-case hold time (the already-running probe inside the launch
+    /// transaction) can exceed [`MANAGED_LAUNCH_LOCK_TIMEOUT`], so bounding it
+    /// would trade a real, slow-but-working launch for a spurious failure.
+    ///
+    /// # Errors
+    /// Fails when the lock file cannot be created/locked, or when another
+    /// holder keeps it for the whole timeout.
+    pub fn acquire_bounded(path: impl Into<PathBuf>, timeout: Duration) -> Result<Self> {
+        let path = path.into();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create lock directory {}", parent.display()))?;
+        }
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("failed to open lock file {}", path.display()))?;
+        let deadline = Instant::now() + timeout;
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(Self { file, path }),
+                Err(std::fs::TryLockError::WouldBlock) => {}
+                Err(std::fs::TryLockError::Error(error)) => {
+                    return Err(anyhow::Error::new(error)
+                        .context(format!("failed to lock {}", path.display())));
+                }
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                bail!(
+                    "timed out after {timeout:?} waiting for the lock at {path}; another \
+                     `rocm serve` launch or `rocmd` recovery is mid-transaction. Retry in a \
+                     moment, and check `rocm services` for a stuck launch.",
+                    path = path.display()
+                );
+            }
+            thread::sleep(FILE_LOCK_BOUNDED_POLL.min(deadline - now));
+        }
+    }
+}
+
+/// Polling interval used while waiting on [`FileLock::acquire_bounded`].
+const FILE_LOCK_BOUNDED_POLL: Duration = Duration::from_millis(25);
+
+/// Total time `rocmd`'s automatic recovery waits for the launch lock.
+///
+/// Bounds contention on [`crate::paths::AppPaths::managed_launch_lock_path`] during the
+/// port-allocation window, failing with an actionable error instead of hanging. Only
+/// `rocmd`'s recovery/restart path is bounded this way; a `rocm serve` launch holds the
+/// same lock with the unbounded [`FileLock::acquire`] (see its doc comment on
+/// [`FileLock::acquire_bounded`] for why).
+pub const MANAGED_LAUNCH_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+
+// ---------------------------------------------------------------------------
+// Managed-service port leasing.
+//
+// Both `rocm serve` and `rocmd` recovery contend for the same local TCP ports
+// and the same service records, so the primitives that arbitrate them live here
+// rather than in either binary. The transaction itself is serialized by the
+// existing [`crate::paths::AppPaths::managed_launch_lock_path`] / [`FileLock`] — see
+// [`FileLock::acquire_bounded`] for the bounded variant this contention uses.
+// ---------------------------------------------------------------------------
+
+/// True only for the exact canonical default loopback host.
+///
+/// Proactive OS collision detection (leasing a real socket before launch) is
+/// claimed only for this one host. `localhost`, `::1`, `0.0.0.0`, and other
+/// IPv4 addresses are "custom hosts": they require an explicit port and keep the
+/// existing engine-owned bind/error behavior, because an IPv4-loopback probe
+/// would not prove anything about the address the engine will actually bind.
+#[must_use]
+pub fn is_canonical_loopback_host(host: &str) -> bool {
+    host.trim() == DEFAULT_LOCAL_HOST
+}
+
+/// A real, held `127.0.0.1:<port>` listener proving the port is bindable now.
+///
+/// The lease is the collision check: it is acquired before any manifest, log, or
+/// child process exists, and [`LoopbackPortLease::release`] drops the socket
+/// immediately before the engine child is spawned so the child can bind it. The
+/// window between release and the child's bind is unavoidable without engine
+/// socket-passing; it is far narrower than the previous "bind and hope" launch.
+#[derive(Debug)]
+pub struct LoopbackPortLease {
+    port: u16,
+    listener: Option<TcpListener>,
+}
+
+impl LoopbackPortLease {
+    #[must_use]
+    pub const fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// True while this lease still holds the socket open.
+    ///
+    /// No production caller needs this: `release` is the only thing that ever
+    /// changes it, and callers already know whether they called `release`. It
+    /// stays `pub` because downstream crates' tests assert on it directly
+    /// (e.g. `apps/rocm`'s `serve_port` tests), where `#[cfg(test)]` here
+    /// would not apply.
+    #[must_use]
+    pub const fn is_held(&self) -> bool {
+        self.listener.is_some()
+    }
+
+    /// Close the socket and hand the port to the caller. Call this immediately
+    /// before spawning the process that will bind it.
+    pub fn release(mut self) -> u16 {
+        self.listener = None;
+        self.port
+    }
+
+    /// A lease over a port this process never probed, for custom hosts where the
+    /// engine, not the CLI, owns bind success or failure.
+    #[must_use]
+    pub const fn engine_owned(port: u16) -> Self {
+        Self {
+            port,
+            listener: None,
+        }
+    }
+}
+
+/// Try to take an exclusive IPv4-loopback lease on `port`.
+///
+/// Errors are returned verbatim so callers can distinguish "occupied"
+/// ([`std::io::ErrorKind::AddrInUse`], the only condition that should advance an
+/// automatic scan) from a privileged or unavailable address, which must fail
+/// immediately rather than silently choosing a different port.
+pub fn lease_loopback_port(port: u16) -> std::io::Result<LoopbackPortLease> {
+    let listener = TcpListener::bind(std::net::SocketAddrV4::new(
+        std::net::Ipv4Addr::LOCALHOST,
+        port,
+    ))?;
+    Ok(LoopbackPortLease {
+        port,
+        listener: Some(listener),
+    })
 }
 
 impl Drop for FileLock {

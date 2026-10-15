@@ -368,7 +368,11 @@ Feature: Model serving
   # bind is attempted, naming the service so the user can stop it or pick
   # another port. Reaching this check needs a real GPU: `resolve_serve_port`
   # only runs once `spawn_managed_engine_child` has a completed model/engine
-  # resolution in hand, and `serve` has no CPU fallback that gets there.
+  # resolution in hand, and `serve` has no CPU fallback that gets there. The
+  # "stop the service holding that port" advice is checked here by its wording
+  # only; the advice is actually proven by
+  # `stopping_the_reserving_record_frees_its_explicit_port_for_reuse` in
+  # apps/rocm/src/service_launch.rs, per AGENTS.md section 3.
   # Runs in the merge queue, like its automatic-port sibling serve-auto-port-skips-occupied.
   @id:serve-explicit-port-reserved @requires-gpu @merge-queue
   Scenario: serve-27 - Serving on a port another managed service already holds is refused
