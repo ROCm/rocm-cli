@@ -557,6 +557,44 @@ Feature: Diagnosing failures and listing fixes
     When the user asks the CLI to diagnose that symptom in machine-readable form
     Then no vLLM startup OOM is reported
 
+  # Round 2 of ROCMAI-449 (`fix-6-path`): the escaped-write fix
+  # (`ps_single_quote_escape` in crates/rocm-core/src/fix.rs) is unit-tested
+  # against the exact script string that gets built, but only a real Windows
+  # host with a real `powershell.exe` can prove the escaped script still
+  # parses and the value it carries survives the round trip. This also covers
+  # the user-observable behaviour round 1 (`cb9f748d`) introduced -- the
+  # PowerShell write in place of `setx`, and prepend- rather than
+  # append-ordering -- which had no e2e coverage of any kind before this.
+  #
+  # Real, not mocked: every other fix-recipe e2e mock in this suite (see
+  # `fake_executable::write_fake_executable` in diagnose-15/-16) stands a fake
+  # in for an external helper like `usermod`/`sudo`, never for the thing under
+  # test. There is no precedent for faking `powershell.exe`/`setx.exe` itself,
+  # so this runs the real write against the real User-scope PATH and restores
+  # it afterward via `LifecycleState`'s `Drop` -- the same mechanism
+  # lifecycle-13's `install.ps1` PATH scenario already uses for the same
+  # machine-global state.
+  @id:diagnose-fix-path-prepends-with-apostrophe-intact @requires-os:windows
+  Scenario: diagnose-38 - Fixing a missing PATH entry prepends it and survives an apostrophe already on the real PATH
+    Given a Windows host with a HIP SDK install and an apostrophe already on the real User PATH
+    When the user asks the CLI to apply the approved fix
+    Then the CLI used PowerShell's SetEnvironmentVariable, not setx, to update the User PATH
+    And the HIP SDK bin dir is prepended on the real User PATH, apostrophe intact
+
+  # The headline behaviour `cb9f748d` fixed: before it, a failed PATH read was
+  # silently treated as an empty PATH, and the write that followed replaced
+  # the user's entire real User PATH with just the SDK's bin dir. This denies
+  # the CLI's own PowerShell resolution (one of the three real causes
+  # `ps_env_scope`'s doc comment names -- "PowerShell missing") rather than
+  # faking the read failing, so the abort this proves is a real one, not a
+  # simulated one, and it never touches the real User PATH at all, so no
+  # capture/restore is needed here.
+  @id:diagnose-fix-path-aborts-on-unreadable-user-path @requires-os:windows
+  Scenario: diagnose-39 - A fix-6-path run that cannot read the real User PATH aborts instead of wiping it
+    Given a Windows host with a HIP SDK install and no way to resolve PowerShell
+    When the user asks the CLI to apply the approved fix
+    Then the CLI aborts the PATH fix with exit code 4 and changes nothing
+
   # The ticket's host: a laptop whose only AMD GPU is a Vega iGPU ROCm has never
   # shipped a runtime build for. The point of the whole change is what such a
   # machine is told, and before it the top-ranked answer was "install the HIP
@@ -572,7 +610,7 @@ Feature: Diagnosing failures and listing fixes
   # therefore has to carry the planted host root, or the WSL2 lane answers about
   # itself instead of about the simulated machine.
   @id:diagnose-unsupported-gpu-is-explained-not-fixed @requires-os:linux
-  Scenario: diagnose-38 - A GPU with no ROCm build is explained, and nothing is offered to install
+  Scenario: diagnose-40 - A GPU with no ROCm build is explained, and nothing is offered to install
     Given a machine whose only GPU is one ROCm has no build for
     When the user asks the CLI to diagnose that machine's state
     Then the diagnosis names the architecture and says Vulkan still works
