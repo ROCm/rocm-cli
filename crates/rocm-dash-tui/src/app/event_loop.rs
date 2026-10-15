@@ -234,7 +234,7 @@ fn refresh_update_status(state: &mut AppState) -> Vec<rocm_dash_core::state::Sid
 /// needing to spin up the full async terminal loop to reach it.
 ///
 /// That unit test calls this function directly, so it does **not** cover the
-/// call site in `run` dropping the hand-off entirely, or passing the
+/// call site in `event_loop` dropping the hand-off entirely, or passing the
 /// wrong field — `run`/`event_loop` are only reachable through the full async
 /// terminal loop, which only the `@requires-os:linux` e2e lane
 /// (`tests/e2e-cucumber/features/dash.feature`, any scenario that opens a real
