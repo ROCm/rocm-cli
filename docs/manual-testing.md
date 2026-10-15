@@ -247,6 +247,12 @@ Expected result:
 - If the GPU cannot be used, the command fails with a clear error.
 - The OpenAI-compatible endpoint answers a simple chat request.
 
+If the llama.cpp server exits at start with an access violation (`0xC0000005`
+in `MSVCP140.dll`), the Visual C++ runtime on the machine is probably older than
+14.40. Run `rocm diagnose` and expect `fix-21-msvc-redist-outdated`. `rocm fix
+fix-21-msvc-redist-outdated` prints the update plan and changes nothing. After
+the update, restart Lemonade and repeat the serve command above.
+
 While the log stream is attached, verify detach and stop behave differently:
 
 - Press `Ctrl+D`. The stream ends and the shell prompt returns, printing a
@@ -615,3 +621,27 @@ To turn provider-assisted planning back off:
 ```powershell
 rocm config clear-planner-provider
 ```
+
+## 8. Uninstall
+
+Run this last, on a machine installed with the release installer (not a
+`cargo` build, whose binaries uninstall leaves alone):
+
+```powershell
+rocm uninstall --dry-run
+rocm uninstall
+```
+
+Expected result:
+
+- The dry run lists the binaries (on Windows, `rocm.exe` is marked as deleted
+  as the command exits) and, under
+  `PATH changes from the installer that would be undone:`, the shell profile
+  (Linux) or the user `PATH` entry (Windows). It removes nothing.
+- After confirming, the install folder holds no `rocm`/`rocmd` files, and a new
+  terminal no longer gets the install folder on `PATH` from the installer's
+  change.
+- If another program lives in the install folder, the review instead says
+  `PATH change left in place` and names it, and the `PATH` change stays.
+- With `rocm uninstall --keep-binaries`, the review says the `PATH` change
+  stays too, and it does.

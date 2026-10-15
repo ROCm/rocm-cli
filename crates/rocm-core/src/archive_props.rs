@@ -877,7 +877,9 @@ pub struct CaseOutcome {
     /// removed outside it, hard links shared with outside files, and the
     /// extraction root itself removed or replaced by a non-directory.
     pub escapes: Vec<String>,
-    /// The state of the tree left inside the root.
+    /// The state of the tree left inside the root. Its `shared_inodes` is
+    /// always empty: a hard link shared with an outside file is a write
+    /// outside, so [`run_case`] moves those into `escapes`.
     pub tree: Violations,
 }
 
@@ -1052,6 +1054,13 @@ pub struct Expect {
     /// No symlink in the extracted tree resolves outside it.
     pub no_outward_links: bool,
 }
+
+/// Only escapes are judged: the contract for an extractor that makes no
+/// promise about modes or outward links.
+pub const ESCAPES_ONLY: Expect = Expect {
+    modes: Modes::Unchecked,
+    no_outward_links: false,
+};
 
 impl CaseOutcome {
     /// `Ok` when the outcome meets `expect`, else the outcome as text.

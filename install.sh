@@ -294,6 +294,33 @@ EOF
   printf '%s\n' "updated:${profile}"
 }
 
+# Whether profile $1 holds the installer's marked block for path expression $2,
+# spelled the way append_path_snippet writes it, and closed by its end marker,
+# as `rocm uninstall` requires before it removes one. A block for another
+# folder, or a PATH line outside the markers, does not count.
+profile_has_own_block() {
+  [ -f "$1" ] || return 1
+  escaped="$(escape_for_double_quotes "$2")"
+  # Passed through the environment: awk -v would undo the escaping above.
+  ROCM_CLI_BLOCK_QUOTED="\"${escaped}\"" ROCM_CLI_BLOCK_LISTED="\"${escaped}:" awk '
+    { sub(/[ \t\r]+$/, "") }
+    $0 == "# >>> rocm-cli path >>>" { inside = 1; hit = 0; next }
+    $0 == "# <<< rocm-cli path <<<" { if (inside && hit) found = 1; inside = 0; next }
+    inside && (index($0, ENVIRON["ROCM_CLI_BLOCK_QUOTED"]) || index($0, ENVIRON["ROCM_CLI_BLOCK_LISTED"])) { hit = 1 }
+    END { exit found ? 0 : 1 }
+  ' "$1"
+}
+
+# Add one line to the record of the PATH change this installer made, unless it
+# is already there.
+record_path_edit() {
+  record="${INSTALL_DIR}/.rocm-cli-path-edit"
+  if [ -f "${record}" ] && grep -qxF "$1" "${record}"; then
+    return 0
+  fi
+  printf '%s\n' "$1" >> "${record}"
+}
+
 ensure_installer_process_path() {
   case ":${PATH}:" in
     *:"${INSTALL_DIR}":*)
@@ -511,6 +538,16 @@ case ":${PATH}:" in
       profile_path="$(profile_path_for_shell)"
       path_expr="$(path_expr_for_profile "${INSTALL_DIR}")"
       profile_result="$(append_path_snippet "${profile_path}" "$(shell_name)" "${path_expr}")" || true
+      # Record where the marked block lives, and how it spells this folder, so
+      # `rocm uninstall` can take it out again. Only a marked block for this
+      # folder is recorded: a PATH line the user wrote themselves, or a block
+      # another install wrote for a different folder, is not this install's.
+      # Lines are added, not replaced, so a block an earlier install wrote from
+      # another shell is still on record.
+      if profile_has_own_block "${profile_path}" "${path_expr}"; then
+        record_path_edit "profile ${profile_path}"
+        record_path_edit "path-expr ${path_expr}"
+      fi
       case "${profile_result}" in
         updated:*)
           echo "shell profile updated:"

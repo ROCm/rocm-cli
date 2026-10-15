@@ -390,54 +390,19 @@ jobs:
         run: bash scripts/reclaim-gpu.sh
 
       # GPU preflight: fail fast (~90s) instead of hanging to the job cap when the
-      # GPU is missing, the driver is wedged, or VRAM is still saturated by a
-      # leftover serve. A BOUNDED POLL, not a one-shot check: transient contention
-      # (e.g. the reclaim step's kills still draining VRAM) self-heals within
-      # seconds, so we retry up to a ceiling and succeed the moment the GPU is both
-      # responsive AND has enough free VRAM. Only a genuinely absent/wedged/held
-      # GPU reaches the ceiling and fails — with a per-reason message.
+      # GPU is missing, the driver is wedged, or the card is still held by a
+      # leftover serve. Two gates — a bounded poll on free memory, then an
+      # assertion that no leaked E2E engine process survives — because neither
+      # sees what the other does. A serve here needs most of the card, so the
+      # floor is generous; but against a 192 GiB MI300X a 16 GiB floor only trips
+      # past ~176 GiB held, which is why the process gate exists (#446). The
+      # floor stays for the case the process gate cannot see: a non-E2E tenant
+      # exhausting a shared host. See .github/scripts/gpu-preflight.sh.
       - name: GPU preflight (bounded wait for an available GPU)
+        env:
+          GPU_PREFLIGHT_MIN_FREE_GIB: 16
         run: |
-          # A serve here needs most of the card; require a generous free-VRAM
-          # floor so a leftover serve (which the reclaim step should have killed)
-          # is caught, while normal baseline (~300 MB used) passes immediately.
-          MIN_FREE_GIB="${GPU_PREFLIGHT_MIN_FREE_GIB:-16}"
-          CEILING_SECS="${GPU_PREFLIGHT_CEILING_SECS:-90}"
-          min_free=$(( MIN_FREE_GIB * 1024 * 1024 * 1024 ))
-          deadline=$(( SECONDS + CEILING_SECS ))
-          reason="rocm-smi never returned within its timeout (driver wedged or GPU absent)"
-          # Check the deadline only after a poll, never before the first one.
-          # $SECONDS counts whole wall-clock seconds, so a short ceiling can
-          # lapse before the loop is entered, and the verdict below would then
-          # describe a reading that was never taken.
-          first_poll=1
-          while [ "$first_poll" -eq 1 ] || [ "$SECONDS" -lt "$deadline" ]; do
-            first_poll=0
-            # rocm-smi itself can hang on a wedged driver — bound it with timeout.
-            out=$(timeout 15 rocm-smi --showmeminfo vram 2>/dev/null) || { sleep 5; continue; }
-            # Parse the byte value AFTER the colon; the line prefix "GPU[0]" would
-            # otherwise make a naive first-number match pick up the "0".
-            total=$(printf '%s\n' "$out" | grep -i 'VRAM Total Memory' | sed 's/.*: *//' | grep -oE '[0-9]+' | tail -1)
-            used=$(printf '%s\n' "$out" | grep -i 'VRAM Total Used Memory' | sed 's/.*: *//' | grep -oE '[0-9]+' | tail -1)
-            if [ -z "$total" ] || [ -z "$used" ]; then
-              reason="rocm-smi returned no VRAM figures (no AMD GPU detected)"
-              sleep 5; continue
-            fi
-            free=$(( total - used ))
-            if [ "$free" -ge "$min_free" ]; then
-              echo "GPU ready: $(( free / 1024 / 1024 / 1024 )) GiB free (>= ${MIN_FREE_GIB} GiB)."
-              exit 0
-            fi
-            reason="VRAM never dropped below the floor: only $(( free / 1024 / 1024 / 1024 )) GiB free (< ${MIN_FREE_GIB} GiB) — a serve is likely still holding the GPU"
-            echo "waiting: $(( free / 1024 / 1024 / 1024 )) GiB free (< ${MIN_FREE_GIB} GiB)…"
-            sleep 5
-          done
-          echo "::error::GPU preflight failed after ${CEILING_SECS}s: ${reason}"
-          # Name what is holding the card instead of leaving the next reader to
-          # reconstruct it: --report-holders prints per-process VRAM and the
-          # engine processes visible here. Never fails the step itself.
-          bash scripts/reclaim-gpu.sh --report-holders || true
-          exit 1
+          bash .github/scripts/gpu-preflight.sh
 
       # cache: false — this self-hosted runner persists the build cache itself via
       # CARGO_TARGET_DIR (below), so the action's rust-cache is pure overhead.
@@ -523,45 +488,19 @@ jobs:
       - name: Reclaim GPU from stray E2E processes
         run: bash scripts/reclaim-gpu.sh
 
-      # Bounded wait for a free GPU. Floor is half of the R9700S's 32GB — high
-      # enough to catch a leftover serve, low enough that a clean pod passes on
-      # the first poll. Same as the per-PR rad3 lane.
+      # Bounded wait for a free GPU, then an assertion that no leaked E2E engine
+      # process survives. The floor stays at the shared 16 GiB default, a flat
+      # constant rather than a proportion of capacity — high enough to catch a
+      # leftover serve, low enough that a clean pod passes on the first poll; do
+      # NOT scale it down for a smaller part. On a 32GB card it still only trips
+      # past 16 GiB held, so the floor alone would miss a leftover serve holding
+      # less than that; the process gate is what catches it (#446). Same as the
+      # per-PR rad3 lane. See .github/scripts/gpu-preflight.sh.
       - name: GPU preflight (bounded wait for an available GPU)
+        env:
+          GPU_PREFLIGHT_MIN_FREE_GIB: 16
         run: |
-          MIN_FREE_GIB="${GPU_PREFLIGHT_MIN_FREE_GIB:-16}"
-          CEILING_SECS="${GPU_PREFLIGHT_CEILING_SECS:-90}"
-          min_free=$(( MIN_FREE_GIB * 1024 * 1024 * 1024 ))
-          deadline=$(( SECONDS + CEILING_SECS ))
-          reason="rocm-smi never returned within its timeout (driver wedged or GPU absent)"
-          # Check the deadline only after a poll, never before the first one.
-          # $SECONDS counts whole wall-clock seconds, so a short ceiling can
-          # lapse before the loop is entered, and the verdict below would then
-          # describe a reading that was never taken.
-          first_poll=1
-          while [ "$first_poll" -eq 1 ] || [ "$SECONDS" -lt "$deadline" ]; do
-            first_poll=0
-            out=$(timeout 15 rocm-smi --showmeminfo vram 2>/dev/null) || { sleep 5; continue; }
-            total=$(printf '%s\n' "$out" | grep -i 'VRAM Total Memory' | sed 's/.*: *//' | grep -oE '[0-9]+' | tail -1)
-            used=$(printf '%s\n' "$out" | grep -i 'VRAM Total Used Memory' | sed 's/.*: *//' | grep -oE '[0-9]+' | tail -1)
-            if [ -z "$total" ] || [ -z "$used" ]; then
-              reason="rocm-smi returned no VRAM figures (no AMD GPU detected)"
-              sleep 5; continue
-            fi
-            free=$(( total - used ))
-            if [ "$free" -ge "$min_free" ]; then
-              echo "GPU ready: $(( free / 1024 / 1024 / 1024 )) GiB free (>= ${MIN_FREE_GIB} GiB)."
-              exit 0
-            fi
-            reason="VRAM never dropped below the floor: only $(( free / 1024 / 1024 / 1024 )) GiB free (< ${MIN_FREE_GIB} GiB) — a serve is likely still holding the GPU"
-            echo "waiting: $(( free / 1024 / 1024 / 1024 )) GiB free (< ${MIN_FREE_GIB} GiB)…"
-            sleep 5
-          done
-          echo "::error::GPU preflight failed after ${CEILING_SECS}s: ${reason}"
-          # Name what is holding the card instead of leaving the next reader to
-          # reconstruct it: --report-holders prints per-process VRAM and the
-          # engine processes visible here. Never fails the step itself.
-          bash scripts/reclaim-gpu.sh --report-holders || true
-          exit 1
+          bash .github/scripts/gpu-preflight.sh
 
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
@@ -627,45 +566,17 @@ jobs:
       - name: Reclaim GPU from stray E2E processes
         run: bash scripts/reclaim-gpu.sh
 
-      # Bounded wait for a free GPU. Floor matches the per-PR MI350P lane and the
-      # other Instinct lane — high enough to catch a leftover serve, low enough
-      # that a clean pod passes on the first poll.
+      # Bounded wait for a free GPU, then an assertion that no leaked E2E engine
+      # process survives. Floor matches the per-PR MI350P lane and the other
+      # Instinct lane — low enough that a clean pod passes on the first poll,
+      # and against a pool this size it only trips near exhaustion, so the
+      # process gate is what actually catches a leftover serve (#446). See
+      # .github/scripts/gpu-preflight.sh.
       - name: GPU preflight (bounded wait for an available GPU)
+        env:
+          GPU_PREFLIGHT_MIN_FREE_GIB: 16
         run: |
-          MIN_FREE_GIB="${GPU_PREFLIGHT_MIN_FREE_GIB:-16}"
-          CEILING_SECS="${GPU_PREFLIGHT_CEILING_SECS:-90}"
-          min_free=$(( MIN_FREE_GIB * 1024 * 1024 * 1024 ))
-          deadline=$(( SECONDS + CEILING_SECS ))
-          reason="rocm-smi never returned within its timeout (driver wedged or GPU absent)"
-          # Check the deadline only after a poll, never before the first one.
-          # $SECONDS counts whole wall-clock seconds, so a short ceiling can
-          # lapse before the loop is entered, and the verdict below would then
-          # describe a reading that was never taken.
-          first_poll=1
-          while [ "$first_poll" -eq 1 ] || [ "$SECONDS" -lt "$deadline" ]; do
-            first_poll=0
-            out=$(timeout 15 rocm-smi --showmeminfo vram 2>/dev/null) || { sleep 5; continue; }
-            total=$(printf '%s\n' "$out" | grep -i 'VRAM Total Memory' | sed 's/.*: *//' | grep -oE '[0-9]+' | tail -1)
-            used=$(printf '%s\n' "$out" | grep -i 'VRAM Total Used Memory' | sed 's/.*: *//' | grep -oE '[0-9]+' | tail -1)
-            if [ -z "$total" ] || [ -z "$used" ]; then
-              reason="rocm-smi returned no VRAM figures (no AMD GPU detected)"
-              sleep 5; continue
-            fi
-            free=$(( total - used ))
-            if [ "$free" -ge "$min_free" ]; then
-              echo "GPU ready: $(( free / 1024 / 1024 / 1024 )) GiB free (>= ${MIN_FREE_GIB} GiB)."
-              exit 0
-            fi
-            reason="VRAM never dropped below the floor: only $(( free / 1024 / 1024 / 1024 )) GiB free (< ${MIN_FREE_GIB} GiB) — a serve is likely still holding the GPU"
-            echo "waiting: $(( free / 1024 / 1024 / 1024 )) GiB free (< ${MIN_FREE_GIB} GiB)…"
-            sleep 5
-          done
-          echo "::error::GPU preflight failed after ${CEILING_SECS}s: ${reason}"
-          # Name what is holding the card instead of leaving the next reader to
-          # reconstruct it: --report-holders prints per-process VRAM and the
-          # engine processes visible here. Never fails the step itself.
-          bash scripts/reclaim-gpu.sh --report-holders || true
-          exit 1
+          bash .github/scripts/gpu-preflight.sh
 
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
@@ -707,6 +618,88 @@ jobs:
           name: e2e-gpu-mi350p-${{ matrix.channel }}-report
           path: tests/e2e-cucumber/results/
 
+  # W7900 counterpart to e2e-gpu-nightly. Mirrors the per-PR e2e-gpu-w7900 lane
+  # in e2e-selfhosted.yml (w7900 label, shared uv cache, GPU preflight), with
+  # @nightly scenarios enabled. Keep the two in step: the report crate asserts
+  # the nightly lanes publish the same platforms as the per-PR lanes.
+  e2e-gpu-nightly-w7900:
+    name: E2E tests (W7900, incl. nightly-only)
+    timeout-minutes: 90
+    runs-on: [self-hosted, linux, w7900]
+    strategy:
+      fail-fast: false
+      matrix:
+        channel: [release, nightly]
+    continue-on-error: true
+    env:
+      E2E_INCLUDE_NIGHTLY: "1"
+      E2E_SERVE_TIMEOUT_SECS: "300"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Reclaim the GPU before running: a serve leaked by a killed or
+      # timed-out prior run (its Drop teardown never executed) keeps an engine
+      # process on the card and starves this job's serves. Scoped to E2E-owned
+      # trees: a manual /workload serve is matched only if its command line
+      # also names an E2E root — see the exposure documented in
+      # scripts/reclaim-gpu.sh.
+      - name: Reclaim GPU from stray E2E processes
+        run: bash scripts/reclaim-gpu.sh
+
+      # Bounded wait for a free GPU, then an assertion that no leaked E2E engine
+      # process survives. The floor stays at the shared 16 GiB default, which is
+      # a flat constant rather than a proportion of capacity: it only has to be
+      # high enough to catch a leftover serve still holding the card, and low
+      # enough that a clean host passes on the first poll. Same as the per-PR
+      # W7900 lane — do NOT scale it down for a smaller part. On a 48GB card it
+      # only trips past ~32 GiB held, so the process gate is what catches a
+      # leftover serve holding less (#446). See .github/scripts/gpu-preflight.sh.
+      - name: GPU preflight (bounded wait for an available GPU)
+        env:
+          GPU_PREFLIGHT_MIN_FREE_GIB: 16
+        run: |
+          bash .github/scripts/gpu-preflight.sh
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          cache: false
+
+      - name: Run full E2E on W7900 (incl. nightly-only)
+        run: |
+          # $RUNNER_WORKSPACE is on a volume that outlives any single job, so the
+          # cargo target dir and shared caches stay warm.
+          export CARGO_TARGET_DIR="$RUNNER_WORKSPACE/e2e-target"
+          export E2E_SHARED_CACHE_DIR="$RUNNER_WORKSPACE/e2e-shared"
+          # Same mount as the runtimes it populates, so uv hardlinks into them
+          # instead of copying, and inside the uv-cache-gc initContainer's floor
+          # (see e2e-selfhosted.yml e2e-gpu).
+          runner_root="$(dirname "$(dirname "$RUNNER_WORKSPACE")")"
+          export E2E_SHARED_UV_CACHE_DIR="$runner_root/uv-cache"
+          prewarm="$RUNNER_WORKSPACE/e2e-prewarm-multi-arch-v2"
+          export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
+
+          # See the e2e-gpu lane in e2e-selfhosted.yml for why the
+          # e2e-test-hooks feature must match what `cargo xtask e2e` would build.
+          cargo build --release -p rocm -p rocmd --features rocm/e2e-test-hooks
+          export ROCM_CLI_BINARY="$CARGO_TARGET_DIR/release/rocm"
+          export ROCM_CLI_ROCMD_BINARY="$CARGO_TARGET_DIR/release/rocmd"
+
+          # Pre-warm once, serially, in place (no mv/symlink), and refresh it when
+          # the channel index has published a newer runtime — the tree is a cache,
+          # not a one-shot. See `xtask e2e-prewarm`.
+          HF_HOME="$E2E_SHARED_CACHE_DIR/huggingface" \
+          UV_CACHE_DIR="$E2E_SHARED_UV_CACHE_DIR" \
+            cargo xtask e2e-prewarm --channel ${{ matrix.channel }} --prewarm-dir "$prewarm"
+
+          cargo xtask e2e
+
+      - name: Upload E2E report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-gpu-w7900-${{ matrix.channel }}-report
+          path: tests/e2e-cucumber/results/
+
   # Strix Halo counterpart to e2e-gpu-nightly. The same @nightly large-model
   # scenario serves the platform-specific Lemonade GGUF on this host. Keep the
   # runner's storage and runtime setup aligned with e2e-selfhosted.yml's proven
@@ -743,147 +736,19 @@ jobs:
           echo "prepared"
           bash scripts/reclaim-gpu.sh
 
+      # Bounded wait for a free GPU, then an assertion that no leaked E2E engine
+      # process survives. gfx1151 shares system memory, so the floor is smaller
+      # than the Instinct lanes' and is applied to GTT whenever the reported
+      # VRAM pool is only a BIOS carveout too small to satisfy it. Against a
+      # whole ~62 GiB aperture an 8 GiB floor trips only past ~54 GiB held, so
+      # the process gate is what notices a serve holding a few GiB (#446); the
+      # floor is kept for the non-E2E tenant it cannot see. Same script as every
+      # other bash lane: .github/scripts/gpu-preflight.sh.
       - name: GPU preflight (bounded wait for an available GPU)
+        env:
+          GPU_PREFLIGHT_MIN_FREE_GIB: 8
         run: |
-          MIN_FREE_GIB="${GPU_PREFLIGHT_MIN_FREE_GIB:-8}"
-          CEILING_SECS="${GPU_PREFLIGHT_CEILING_SECS:-90}"
-          min_free=$(( MIN_FREE_GIB * 1024 * 1024 * 1024 ))
-          deadline=$(( SECONDS + CEILING_SECS ))
-          reason="rocm-smi never returned within its timeout (driver wedged or GPU absent)"
-          # `<POOL> Total [Used ]Memory (B): <n>`, last GPU's row wins. Anchoring
-          # on the `(B)` unit stops a differently-denominated reading being
-          # compared as bytes. The trailing `|| true` yields an empty string for
-          # a pool this host does not report (GTT on a discrete card), which the
-          # guards below handle. This step sets no `shell:`, and neither this
-          # workflow nor its jobs set `defaults.run.shell`, so GitHub runs it as
-          # `bash -e {0}` — the documented default, which unlike an explicit
-          # `shell: bash` does NOT add `-o pipefail`. The pipeline's status is
-          # therefore `tail`'s and `-e` would not fire anyway: the `|| true` is
-          # insurance against a future pipefail, not load-bearing today.
-          field() { printf '%s\n' "$out" | grep -iE "$1 \(B\):" | sed 's/.*: *//' | grep -oE '[0-9]+' | tail -1 || true; }
-          shown=0
-          # Both memos below describe the host, not the moment, so they are
-          # answered once and reused. Re-asking each tick spends the ceiling on
-          # `timeout`s rather than on retries, which is what the ceiling is for.
-          # Neither is ever set from a call that was merely cut short.
-          combined=1
-          gtt_absent=0
-          # Check the deadline only after a poll, never before the first one.
-          # $SECONDS counts whole wall-clock seconds, so a short ceiling can
-          # lapse before the loop is entered, and the verdict below would then
-          # describe a reading that was never taken.
-          first_poll=1
-          while [ "$first_poll" -eq 1 ] || [ "$SECONDS" -lt "$deadline" ]; do
-            first_poll=0
-            out=""
-            rc=0
-            if [ "$combined" -eq 1 ]; then
-              out=$(timeout 15 rocm-smi --showmeminfo vram gtt 2>/dev/null) || rc=$?
-              # Read the marker the way `field` reads the same text, so a casing
-              # variant costs neither a redundant query nor a missed pool.
-              if [ "$rc" -ne 0 ] || ! printf '%s\n' "$out" | grep -qi 'VRAM Total Memory (B):'; then
-                out=""
-                # 124 is `timeout`'s own signal: the call was cut short, which
-                # says nothing about whether this rocm-smi accepts the two-pool
-                # form. Only a call that actually answered may retire it.
-                [ "$rc" -eq 124 ] || combined=0
-              fi
-            fi
-            if [ -z "$out" ]; then
-              # A rocm-smi that rejects the two-pool form: fall back to the
-              # single-pool call this step has always made.
-              out=$(timeout 15 rocm-smi --showmeminfo vram 2>/dev/null) || { sleep 5; continue; }
-            fi
-            total=$(field 'VRAM Total Memory')
-            used=$(field 'VRAM Total Used Memory')
-            gtt_total=$(field 'GTT Total Memory')
-            gtt_used=$(field 'GTT Total Used Memory')
-            if [ -z "$total" ] || [ -z "$used" ]; then
-              reason="rocm-smi returned no VRAM figures (no AMD GPU detected)"
-              sleep 5; continue
-            fi
-            # Print the raw pools once: without them a failure here cannot be
-            # told apart from a genuinely occupied GPU by reading this log.
-            if [ "$shown" -eq 0 ]; then
-              echo "rocm-smi pools (used/total bytes): VRAM ${used}/${total}, GTT ${gtt_used:-n/a}/${gtt_total:-n/a}"
-              shown=1
-            fi
-            # A zero total is a failed reading, not a carveout. Retry instead of
-            # reinterpreting it as an APU and passing the gate on whatever GTT
-            # reports — a wedged driver must not clear this step.
-            if [ "$total" -le 0 ]; then
-              reason="rocm-smi reported a VRAM total of 0 (unparseable or wedged reading)"
-              sleep 5; continue
-            fi
-            pool=VRAM
-            if [ "$total" -lt "$min_free" ]; then
-              # An APU has no private VRAM: this total is the fixed BIOS carveout
-              # while the engine allocates out of GTT-backed system RAM, so the
-              # floor is being applied to a pool the engine never draws on — it
-              # fails healthy hosts and stays quiet on starved ones. See
-              # `vram_capacity_is_meaningful` in apps/rocm/src/main.rs, which
-              # withholds the product's equivalent warning for the same reason.
-              # What the floor then means: ${MIN_FREE_GIB} GiB against the whole
-              # GTT aperture, so it trips only near exhaustion and will not
-              # notice a serve holding a few GiB. Same sensitivity this floor had
-              # on a large-carveout host rather than a new gap, but coarse either
-              # way — see #446.
-              # Discrete cards never reach this branch — their VRAM total is far
-              # above the floor.
-              if [ "$gtt_absent" -eq 0 ] && { [ -z "$gtt_total" ] || [ -z "$gtt_used" ]; }; then
-                # The two-pool form above may have been rejected outright, in
-                # which case the fallback query carried no GTT rows. Ask for the
-                # pool on its own before concluding the host has none, or a CLI
-                # quirk fails a healthy APU with the very report this avoids.
-                rc=0
-                out=$(timeout 15 rocm-smi --showmeminfo gtt 2>/dev/null) || rc=$?
-                gtt_total=$(field 'GTT Total Memory')
-                gtt_used=$(field 'GTT Total Used Memory')
-                if [ -n "$gtt_total" ] && [ -n "$gtt_used" ]; then
-                  # The line printed above necessarily read `GTT n/a/n/a` — the
-                  # combined query is what failed. Report what the pool the gate
-                  # now decides on actually holds, or the log contradicts the
-                  # verdict on precisely the hosts this branch exists for.
-                  echo "rocm-smi GTT pool (separate query): ${gtt_used}/${gtt_total}"
-                elif [ "$rc" -ne 0 ]; then
-                  # A query that failed is not a host without the pool. Keeping
-                  # them apart stops a flaky call being reported as a hardware
-                  # fact, and leaves the memo below for the real thing.
-                  reason="VRAM total is $(( total / 1024 / 1024 )) MiB, under the ${MIN_FREE_GIB} GiB floor, and the GTT query itself failed (rocm-smi exit ${rc}) — the pool was never read"
-                  sleep 5; continue
-                else
-                  gtt_absent=1
-                fi
-              fi
-              if [ -z "$gtt_total" ] || [ -z "$gtt_used" ]; then
-                reason="VRAM total is $(( total / 1024 / 1024 )) MiB, under the ${MIN_FREE_GIB} GiB floor, and rocm-smi reported no GTT pool — the floor cannot be met from VRAM on this host"
-                sleep 5; continue
-              fi
-              # A zero total is a failed reading on this pool too. Without this
-              # the gate reports `0 GiB free … a serve is likely still holding
-              # the GPU` — the exact false report this step exists to stop, one
-              # pool over from where it was stopped.
-              if [ "$gtt_total" -le 0 ]; then
-                reason="rocm-smi reported a GTT total of 0 (unparseable or wedged reading)"
-                sleep 5; continue
-              fi
-              pool=GTT; total="$gtt_total"; used="$gtt_used"
-            fi
-            free=$(( total - used ))
-            if [ "$free" -ge "$min_free" ]; then
-              echo "GPU ready: $(( free / 1024 / 1024 / 1024 )) GiB ${pool} free (>= ${MIN_FREE_GIB} GiB)."
-              exit 0
-            fi
-            reason="${pool} never dropped below the floor: only $(( free / 1024 / 1024 / 1024 )) GiB free (< ${MIN_FREE_GIB} GiB) — a serve is likely still holding the GPU"
-            echo "waiting: $(( free / 1024 / 1024 / 1024 )) GiB ${pool} free (< ${MIN_FREE_GIB} GiB)…"
-            sleep 5
-          done
-          echo "::error::GPU preflight failed after ${CEILING_SECS}s: ${reason}"
-          # Name what is holding the card instead of leaving the next reader to
-          # reconstruct it: --report-holders prints per-process VRAM and the
-          # engine processes visible here. Never fails the step itself.
-          bash scripts/reclaim-gpu.sh --report-holders || true
-          exit 1
+          bash .github/scripts/gpu-preflight.sh
 
       - name: Ensure Rust toolchain
         run: |
@@ -973,6 +838,19 @@ jobs:
 
       # Best-effort when rocm-smi is absent; when present, fail within the bounded
       # ceiling instead of letting a held or wedged GPU consume the full job cap.
+      #
+      # WHAT THIS DOES NOT CATCH, and the Linux lanes now do. This is a
+      # free-memory floor ONLY. A fixed 8 GiB against a whole ~62 GiB gfx1151
+      # aperture trips only past ~54 GiB held, so a leftover llama-server
+      # holding 10-20 GiB clears it — the gap #446 was opened about. The bash
+      # lanes close it by asserting no leaked E2E engine process survives
+      # (`reclaim-gpu.sh --assert-clear`); native Windows has no bash to run
+      # that with, so this copy keeps memory-only semantics. A PowerShell
+      # equivalent, reading Win32_Process the way the reclaim step above
+      # already does, is deliberate follow-up — not something this block
+      # silently already has. Kept as a separate copy for the same reason the
+      # reclaim is (EAI-8751), and pinned against drift by
+      # `apu_preflight_twins_do_not_drift` in xtask/src/workflow_contract.rs.
       - name: GPU preflight (bounded wait for an available GPU)
         shell: powershell
         run: |
@@ -998,6 +876,14 @@ jobs:
           # once and reused - see the native Ubuntu lane.
           $combined = $true
           $gttAbsent = $false
+          # Unlike the bash lanes, this loop checks the deadline before its
+          # first poll, and that is deliberate. Get-Date has sub-second
+          # precision, so the first poll is skipped only if the step stalls for
+          # the whole ceiling between computing the deadline and entering the
+          # loop, which the production ceiling makes unreachable. The bash lanes
+          # poll first (#608) because $SECONDS counts whole wall-clock seconds,
+          # so a short ceiling there could lapse after a stall of microseconds
+          # (#607).
           while ((Get-Date) -lt $deadline) {
             $out = ""
             if ($combined) {
@@ -1375,8 +1261,18 @@ jobs:
       # access under WSL is exactly what this lane is proving out, so an absent
       # rocm-smi is a reported condition, not a job failure: the capability probe
       # then resolves @requires-gpu scenarios to skip and the rest still runs. A
-      # GPU that IS present but stays held by a leftover serve still fails, since
-      # that would corrupt the serve scenarios' results.
+      # GPU that IS present but stays held fails the job, since that would
+      # corrupt the serve scenarios' results.
+      #
+      # What "held" means here is weaker than on the native lanes, and the
+      # difference is the whole of #446. This body keeps only the free-memory
+      # floor; it does not run `reclaim-gpu.sh --assert-clear`, which is what
+      # actually catches a leftover serve. Against a whole GTT aperture the
+      # floor trips only near exhaustion, so a serve holding a few GiB clears
+      # it. The script is not invoked because this body runs inside the WSL
+      # distro through Invoke-WslBash.ps1, where the repo checkout is not at a
+      # path this step can assume. Closing it is follow-up work, tracked with
+      # the equivalent Windows gap.
       - name: GPU preflight (advisory bounded wait)
         shell: powershell
         run: |
@@ -1596,14 +1492,15 @@ jobs:
           path: tests/e2e-cucumber/results/
           # The copy-out step above is deliberately best-effort (it must not
           # report red just because an earlier step already failed the job),
-          # so this is the only place left to catch a copy that failed for its
-          # own reason: default `warn` would upload nothing, and the
-          # consolidated report's `discover()` (xtask/src/e2e_report.rs) simply
-          # omits any platform with no report.json rather than flagging it, so
-          # the lane would silently vanish from the report instead of showing
-          # as a failure. Only the WSL lanes need this: every other lane
-          # writes report.json directly in-job, with no extra guest-to-host
-          # copy step that can fail on its own.
+          # so a copy that failed for its own reason leaves results/ empty.
+          # `error` makes that a failed step here, in the lane that owns the
+          # copy, where default `warn` would upload nothing without a word.
+          # The consolidated report job's missing-report check flags the absent
+          # artifact too, and is the only signal on a `continue-on-error` lane:
+          # a failed step there does not turn the lane's check red. Only the
+          # WSL lanes need this guard: every other lane writes report.json
+          # directly in-job, with no guest-to-host copy step that can fail on
+          # its own.
           if-no-files-found: error
 
   # The nightly lanes each uploaded a report nobody joined up, so reading a
@@ -1618,12 +1515,15 @@ jobs:
     # Narrower than the workflow-level `contents: write`, which exists for the
     # release-publishing jobs. This one checks out, downloads artifacts, runs an
     # xtask and uploads; it has no business being able to write to the repo.
+    # `actions: read` lets the missing-report check list this run's artifacts.
     permissions:
       contents: read
+      actions: read
     needs:
       - e2e-gpu-nightly
       - e2e-gpu-nightly-rad3
       - e2e-gpu-nightly-mi350p
+      - e2e-gpu-nightly-w7900
       - e2e-gpu-nightly-strix
       - e2e-gpu-nightly-strix-windows
       - e2e-wsl-nightly
@@ -1658,6 +1558,57 @@ jobs:
             --artifacts-dir e2e-artifacts \
             --html-out consolidated/index.html > consolidated/support-matrix.md
           cat consolidated/support-matrix.md >> "$GITHUB_STEP_SUMMARY"
+
+      # A lane that dies before writing report.json (preflight, build, a crash
+      # before results exist) uploads nothing, and `discover()` can only render
+      # the reports that arrived, so that lane would drop out of the grid with
+      # no row and no FAIL. On a `continue-on-error` lane nothing else is red
+      # either. So check it here: every lane that ran (any `needs` result but
+      # `skipped`) must have uploaded its report artifact. This reads the run's
+      # artifact list rather than e2e-artifacts/, because download-artifact
+      # flattens a single match into the root and loses its name. The list also
+      # holds earlier attempts' artifacts, so a re-run that uploads nothing can
+      # pass on the first attempt's report: this can miss a lane, but never
+      # flags one that did upload. Every lane carries a `matrix.channel` axis and is
+      # checked through its `release` leg (the matrix context does not exist in
+      # this job), which stands for the whole lane. LANE_REPORTS, and this script's behaviour,
+      # are pinned by xtask's workflow contract tests. The annotation quotes the
+      # lane's `needs` result verbatim; on a `continue-on-error` lane it may read
+      # `success` even though the lane failed, so the absent artifact is the
+      # signal, not that value. `!cancelled()`, not `always()`: a run
+      # superseded mid-flight cuts lanes off before upload, which is not a gap.
+      - name: Check every lane that ran uploaded its report
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEEDS: ${{ toJSON(needs) }}
+          LANE_REPORTS: |
+            e2e-gpu-nightly=e2e-gpu-release-report
+            e2e-gpu-nightly-rad3=e2e-gpu-rad3-release-report
+            e2e-gpu-nightly-mi350p=e2e-gpu-mi350p-release-report
+            e2e-gpu-nightly-w7900=e2e-gpu-w7900-release-report
+            e2e-gpu-nightly-strix=e2e-gpu-strix-ubuntu-release-report
+            e2e-gpu-nightly-strix-windows=e2e-gpu-strix-windows-release-report
+            e2e-wsl-nightly=e2e-gpu-strix-wsl-release-report
+        run: |
+          uploaded=$(gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts" \
+            --jq '.artifacts[].name') || {
+            echo "::error::could not list this run's artifacts, so no lane was checked"
+            exit 1
+          }
+          missing=0
+          while IFS='=' read -r job artifact; do
+            [ -n "$job" ] || continue
+            result=$(jq -r --arg job "$job" '.[$job].result // "absent"' <<<"$NEEDS")
+            [ "$result" = skipped ] && continue
+            if ! grep -qxF "$artifact" <<<"$uploaded"; then
+              echo "::error::lane $job ran (needs result: $result) but uploaded no $artifact, so it is missing from the consolidated report"
+              echo "- :x: \`$job\` ran (needs result: $result) but uploaded no \`$artifact\`; it is missing from the grid above" >> "$GITHUB_STEP_SUMMARY"
+              missing=1
+            fi
+          done <<<"$LANE_REPORTS"
+          exit "$missing"
 
       - name: Upload consolidated report
         if: always()

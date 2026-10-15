@@ -95,16 +95,15 @@ use rocm_core::{
     ManagedServiceRecord, ModelRecipeRecord, ModelRecipeRegistry, ModelRecipeRegistrySource,
     PERMISSIONS_MODE_ASK, PERMISSIONS_MODE_FULL_ACCESS, RocmCliConfig, TELEMETRY_MODE_LOCAL,
     TELEMETRY_MODE_OFF, WatcherMode, append_audit_event, builtin_model_recipes, builtin_watcher,
-    builtin_watchers, command_failure_detail, connect_tcp_stream, daemon_binary_path,
-    default_engine_for_platform, detect_host_gfx_target, detect_host_gpu_summary,
-    engine_binary_path, engine_plugin_dirs, format_host_port, format_http_base_url,
-    interactive_terminal, load_model_recipe_registry, load_recent_audit_events,
-    load_recent_automation_events, load_recent_automation_proposals, managed_pip_cache_dir,
-    managed_service_endpoint_readiness, model_artifact_cache_status, model_catalog_platforms,
-    model_recipe_featured, model_recipe_target_platform_label, normalize_therock_family,
-    platform_matches_gfx_family, process_is_running, read_http_response_bounded,
-    resolve_builtin_model_recipe, runtime_install_root_is_protected, uv_cache_source,
-    write_all_tcp_stream,
+    builtin_watchers, connect_tcp_stream, daemon_binary_path, default_engine_for_platform,
+    detect_host_gfx_target, detect_host_gpu_summary, engine_binary_path, engine_plugin_dirs,
+    format_host_port, format_http_base_url, interactive_terminal, load_model_recipe_registry,
+    load_recent_audit_events, load_recent_automation_events, load_recent_automation_proposals,
+    managed_pip_cache_dir, managed_service_endpoint_readiness, model_artifact_cache_status,
+    model_catalog_platforms, model_recipe_featured, model_recipe_target_platform_label,
+    normalize_therock_family, platform_matches_gfx_family, process_is_running,
+    read_http_response_bounded, resolve_builtin_model_recipe, runtime_install_root_is_protected,
+    uv_cache_source, write_all_tcp_stream,
 };
 use rocm_engine_protocol::{
     DEFAULT_LOG_TAIL_LINES, DetectRequest, DetectResponse, DevicePolicy,
@@ -648,6 +647,12 @@ rocm logs --search error timeout")]
         command: BenchCommand,
     },
     /// Remove ROCm CLI-managed files from this computer.
+    ///
+    /// Removes the config, data, and cache directories and the installed
+    /// binaries, including the running rocm.exe on Windows. It also undoes the
+    /// PATH change the installer made (its marked shell-profile block, or the
+    /// user PATH entry it recorded adding on Windows), unless other programs
+    /// share the install folder.
     Uninstall {
         /// Do not ask for interactive confirmation.
         #[arg(long)]
@@ -655,7 +660,7 @@ rocm logs --search error timeout")]
         /// Show what would be removed without deleting anything.
         #[arg(long)]
         dry_run: bool,
-        /// Keep installed rocm-cli binaries.
+        /// Keep installed rocm-cli binaries, and the installer's PATH change.
         #[arg(long)]
         keep_binaries: bool,
         /// Keep saved settings.
@@ -6576,6 +6581,10 @@ pub(crate) fn chat_tool_approval_request(
         else {
             bail!("ROCm command tool is read-only and does not need approval");
         };
+        // `pending_title` is deliberately short (e.g. "Install driver"); don't
+        // read that as all the approver sees. The full `rocm` argv rides
+        // along via `display_command` below and is what the approval body
+        // actually renders (see `dash_seam.rs`'s `RocmToolExecutor::execute`).
         return Ok(ChatToolApprovalRequest {
             pending_title,
             command_title,
@@ -6626,6 +6635,9 @@ pub(crate) fn chat_tool_approval_request(
         "watcher_disable" => ("Disable automation", "Automations"),
         other => bail!("ROCm tool `{other}` is read-only or unsupported for approval"),
     };
+    // Same as the `rocm_command` arm above: `pending_title` is short by
+    // design — the full command line rides along in `display_command` and
+    // is what the approval body renders, not just this title.
     Ok(ChatToolApprovalRequest {
         pending_title: pending_title.to_owned(),
         command_title: command_title.to_owned(),
@@ -8309,13 +8321,10 @@ fn run_rocm_capture_for_paths(
 ) -> Result<CommandCapture> {
     let rocm_binary = daemon_binary_path()?;
     let mut command = ProcessCommand::new(&rocm_binary);
-    command
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    // Stdio left to `run_with_timeout`, which sets it itself.
+    command.args(args);
     apply_app_path_env(&mut command, paths);
-    let output = run_command_with_timeout(command, timeout)
+    let output = rocm_core::process::run_with_timeout(command, timeout, "process")
         .with_context(|| format!("failed to run {}", rocm_binary.display()))?;
     Ok(CommandCapture {
         argv: std::iter::once(rocm_binary.display().to_string())
@@ -8573,37 +8582,6 @@ fn render_install_sdk_dry_run_for_args(paths: &AppPaths, args: &[String]) -> Res
         },
     )?
     .output)
-}
-
-fn run_command_with_timeout(
-    mut command: ProcessCommand,
-    timeout: Duration,
-) -> Result<std::process::Output> {
-    let mut child = command.spawn().context("failed to spawn child process")?;
-    let started = std::time::Instant::now();
-    loop {
-        if child
-            .try_wait()
-            .context("failed to poll child process")?
-            .is_some()
-        {
-            return child
-                .wait_with_output()
-                .context("failed to collect child process output");
-        }
-        if started.elapsed() >= timeout {
-            let _ = child.kill();
-            let output = child
-                .wait_with_output()
-                .context("failed to collect timed-out child process output")?;
-            bail!(
-                "process exceeded {}s timeout: {}",
-                timeout.as_secs(),
-                command_failure_detail(&output)
-            );
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
 }
 
 fn internal_mcp_install_sdk_args(
@@ -9797,9 +9775,9 @@ fn artifact_source_policy_label(policy: &str) -> &str {
     }
 }
 
-/// Human-readable size. `rocm storage` reports caches that are routinely tens
-/// of megabytes, so the intermediate tiers matter: a bare byte count is
-/// unreadable at the sizes this reports.
+/// Human-readable size, for `rocm storage`'s cache report and the automations
+/// proposal history. Both report values routinely in the tens of megabytes,
+/// so the intermediate tiers matter: a bare byte count is unreadable there.
 fn format_bytes(bytes: u64) -> String {
     const KIB: f64 = 1024.0;
     // `{:.1}` rounds, so from 1023.95 of a unit upwards the text already reads
@@ -11958,7 +11936,7 @@ pub(crate) fn render_automations_text(paths: &AppPaths, config: &RocmCliConfig) 
                     .arguments
                     .get("artifact_max_bytes")
                     .and_then(serde_json::Value::as_u64)
-                    .map_or_else(|| "not set".to_owned(), format_bytes_for_user);
+                    .map_or_else(|| "not set".to_owned(), format_bytes);
                 let _ = writeln!(output, "      download: approved up to {limit}");
             } else if proposal_kind(&proposal) == ProposalKind::PrefetchArtifact {
                 let _ = writeln!(output, "      download: not approved yet");
@@ -12091,26 +12069,6 @@ fn audit_event_plain_summary(event: &AuditEventRecord) -> &'static str {
         "engine" => "Engine activity was recorded.",
         _ => "Background activity was recorded.",
     }
-}
-
-fn format_bytes_for_user(bytes: u64) -> String {
-    const UNITS: [&str; 3] = ["KB", "MB", "GB"];
-    // Below 1 KB the count is printed whole, so no rounding can disagree with
-    // the comparison.
-    if bytes < 1024 {
-        return format!("{bytes} bytes");
-    }
-    let mut value = bytes as f64 / 1024.0;
-    let mut unit = 0;
-    // Promote while the value AS PRINTED would reach 1024, not merely while the
-    // raw value does: 1_048_575 bytes is 1023.999… KB, which `{:.1}` renders as
-    // "1024.0 KB". Comparing the rounded tenths, as `rocm_core::format_bytes`
-    // does, keeps every size in the unit it belongs to.
-    while unit + 1 < UNITS.len() && (value * 10.0).round() >= 10_240.0 {
-        value /= 1024.0;
-        unit += 1;
-    }
-    format!("{value:.1} {}", UNITS[unit])
 }
 
 const fn watcher_mode_plain_label(mode: WatcherMode) -> &'static str {
@@ -13595,38 +13553,24 @@ struct UninstallPlan {
     actions: Vec<UninstallPlanEntry>,
     skipped: Vec<String>,
     warnings: Vec<String>,
+    /// Installer PATH changes `rocm uninstall` undoes.
+    path_edits: Vec<uninstall::PathEdit>,
+    /// The installer's record of its PATH change, removed once that change is
+    /// undone.
+    path_record: Option<PathBuf>,
+    /// The running executable, on Windows, which is deleted as the command exits.
+    self_delete: Option<PathBuf>,
 }
 
 fn build_uninstall_plan(paths: &AppPaths, options: &UninstallOptions) -> Result<UninstallPlan> {
     let mut plan = UninstallPlan::default();
 
-    if options.keep_binaries {
-        plan.skipped
-            .push("binary removal disabled by --keep-binaries".to_owned());
-    } else {
-        let current_exe =
-            daemon_binary_path().context("failed to discover current rocm executable")?;
-        if is_dev_binary_layout(&current_exe) && !options.force_dev_binaries {
-            plan.skipped.push(format!(
-                "binary removal skipped because {} looks like a cargo target build; pass --force-dev-binaries to remove sibling debug/release binaries",
-                current_exe.display()
-            ));
-        } else {
-            for path in collect_installed_binary_candidates(&current_exe)? {
-                if rocm_core::runtime_is_windows() && path == current_exe {
-                    plan.skipped.push(format!(
-                        "skipping running executable on Windows: {}",
-                        path.display()
-                    ));
-                    continue;
-                }
-                plan.actions.push(UninstallPlanEntry {
-                    kind: "binary",
-                    path,
-                });
-            }
-        }
-    }
+    plan_installed_binaries(
+        &mut plan,
+        options,
+        || daemon_binary_path().context("failed to discover current rocm executable"),
+        rocm_core::runtime_home_dir().as_deref(),
+    )?;
 
     for (keep, kind, path) in [
         (options.keep_config, "config", paths.config_dir.clone()),
@@ -13713,6 +13657,76 @@ fn build_uninstall_plan(paths: &AppPaths, options: &UninstallOptions) -> Result<
     Ok(plan)
 }
 
+/// Plan removing the installed binaries beside the running one, which
+/// `current_exe` names, and undoing the installer's PATH change for their
+/// folder. `--keep-binaries` keeps both, and so does a cargo build's folder.
+fn plan_installed_binaries(
+    plan: &mut UninstallPlan,
+    options: &UninstallOptions,
+    current_exe: impl FnOnce() -> Result<PathBuf>,
+    home: Option<&Path>,
+) -> Result<()> {
+    if options.keep_binaries {
+        // The PATH change only serves the binaries, so it stays with them.
+        plan.skipped.push(
+            "binary removal disabled by --keep-binaries, so any PATH change the installer made \
+             stays too"
+                .to_owned(),
+        );
+        return Ok(());
+    }
+    let current_exe = current_exe()?;
+    if is_dev_binary_layout(&current_exe) && !options.force_dev_binaries {
+        plan.skipped.push(format!(
+            "binary removal skipped because {} looks like a cargo target build; pass --force-dev-binaries to remove sibling debug/release binaries",
+            current_exe.display()
+        ));
+        return Ok(());
+    }
+    let binaries = collect_installed_binary_candidates(&current_exe)?;
+    for path in &binaries {
+        // Windows will not unlink a running image; it is deleted as the
+        // command exits instead.
+        if is_running_executable(path, &current_exe, cfg!(windows)) {
+            plan.self_delete = Some(path.clone());
+            continue;
+        }
+        // The PATH record goes only once its change is undone; see
+        // `uninstall::plan_path_edits`.
+        if path.file_name().and_then(|name| name.to_str()) == Some(uninstall::PATH_EDIT_RECORD) {
+            continue;
+        }
+        plan.actions.push(UninstallPlanEntry {
+            kind: "binary",
+            path: path.clone(),
+        });
+    }
+    if let Some(bin_dir) = current_exe.parent() {
+        uninstall::plan_path_edits(plan, bin_dir, &binaries, home);
+    }
+    Ok(())
+}
+
+/// Whether `path`, an entry of the running executable's folder, is the running
+/// executable itself, which only Windows has to treat specially. Windows names
+/// are case-insensitive, and the running image may report its own name in
+/// another case, or in its 8.3 short form (`ROCM.EXE`), than the folder listing
+/// does; missing it would plan an ordinary removal that Windows refuses.
+fn is_running_executable(path: &Path, current_exe: &Path, windows: bool) -> bool {
+    if !windows {
+        return false;
+    }
+    path == current_exe
+        || (path.parent() == current_exe.parent()
+            && path
+                .file_name()
+                .zip(current_exe.file_name())
+                .is_some_and(|(name, exe)| {
+                    name.to_string_lossy()
+                        .eq_ignore_ascii_case(&exe.to_string_lossy())
+                }))
+}
+
 pub(crate) fn render_uninstall_dry_run(paths: &AppPaths) -> Result<String> {
     let options = UninstallOptions {
         dry_run: true,
@@ -13726,14 +13740,16 @@ fn render_uninstall_plan(plan: &UninstallPlan, options: &UninstallOptions) -> St
     let mut output = String::new();
     let _ = writeln!(output, "Uninstall review");
     let _ = writeln!(output);
-    if plan.actions.is_empty() {
+    let removals = uninstall::removal_count(plan);
+    if uninstall::plan_is_empty(plan) {
         let _ = writeln!(output, "Nothing managed by rocm-cli would be removed.");
-    } else {
-        let _ = writeln!(output, "{} item(s) would be removed:", plan.actions.len());
+    } else if removals > 0 {
+        let _ = writeln!(output, "{removals} item(s) would be removed:");
         for entry in &plan.actions {
             let _ = writeln!(output, "  - {}: {}", entry.kind, entry.path.display());
         }
     }
+    uninstall::render_extra_plan(&mut output, plan);
     if !plan.warnings.is_empty() {
         let _ = writeln!(output);
         let _ = writeln!(output, "Please review:");
@@ -13863,7 +13879,7 @@ fn collect_installed_binary_candidates(current_exe: &Path) -> Result<Vec<PathBuf
 }
 
 fn is_rocm_install_entry_name(name: &str) -> bool {
-    if name == ".rocm-cli-manifest" {
+    if name == ".rocm-cli-manifest" || name == uninstall::PATH_EDIT_RECORD {
         return true;
     }
     let normalized = name.strip_suffix(".exe").unwrap_or(name);
@@ -19559,47 +19575,37 @@ model recipes
         }
     }
 
-    #[test]
-    fn format_bytes_steps_up_instead_of_printing_1024_of_the_smaller_unit() {
-        assert_eq!(format_bytes(1023), "1023 bytes");
-        assert_eq!(format_bytes(1024), "1.0 KiB");
-        // One byte short of the next unit used to round to "1024.0 KiB".
-        assert_eq!(format_bytes(1_048_575), "1.0 MiB");
-        assert_eq!(format_bytes(1_048_576), "1.0 MiB");
-        assert_eq!(format_bytes(1_073_741_823), "1.0 GiB");
-    }
-
     /// Just below a unit boundary the value rounds up to a full 1024 of the
     /// SMALLER unit, which has to be reported as 1.0 of the larger one — the
     /// same defect `rocm_core::format_bytes` had. Each pair is the last input
     /// that still belongs to the smaller unit and the first that `{:.1}` rounds
-    /// up to 1024.0 of it; the second used to print "1024.0 KB" / "1024.0 MB".
+    /// up to 1024.0 of it; the second used to print "1024.0 KiB" / "1024.0 MiB".
     #[test]
-    fn format_bytes_for_user_promotes_a_value_that_rounds_up_to_a_full_unit() {
-        assert_eq!(format_bytes_for_user(1023), "1023 bytes");
-        assert_eq!(format_bytes_for_user(1024), "1.0 KB");
-        assert_eq!(format_bytes_for_user(1_048_524), "1023.9 KB");
-        assert_eq!(format_bytes_for_user(1_048_525), "1.0 MB");
-        assert_eq!(format_bytes_for_user(1_048_575), "1.0 MB");
-        assert_eq!(format_bytes_for_user(1_048_576), "1.0 MB");
-        assert_eq!(format_bytes_for_user(1_073_689_395), "1023.9 MB");
-        assert_eq!(format_bytes_for_user(1_073_689_396), "1.0 GB");
-        assert_eq!(format_bytes_for_user(1_073_741_823), "1.0 GB");
-        // GB is the top unit: nothing to promote to, so 1024 GB stays in it.
-        assert_eq!(format_bytes_for_user(1_099_511_627_776), "1024.0 GB");
+    fn format_bytes_steps_up_instead_of_printing_1024_of_the_smaller_unit() {
+        assert_eq!(format_bytes(1023), "1023 bytes");
+        assert_eq!(format_bytes(1024), "1.0 KiB");
+        assert_eq!(format_bytes(1_048_524), "1023.9 KiB");
+        assert_eq!(format_bytes(1_048_525), "1.0 MiB");
+        assert_eq!(format_bytes(1_048_575), "1.0 MiB");
+        assert_eq!(format_bytes(1_048_576), "1.0 MiB");
+        assert_eq!(format_bytes(1_073_689_395), "1023.9 MiB");
+        assert_eq!(format_bytes(1_073_689_396), "1.0 GiB");
+        assert_eq!(format_bytes(1_073_741_823), "1.0 GiB");
+        // GiB is the top unit: nothing to promote to, so 1024 GiB stays in it.
+        assert_eq!(format_bytes(1_099_511_627_776), "1024.0 GiB");
     }
 
-    /// The units `format_bytes_for_user` prints, smallest first.
-    const USER_BYTE_UNITS: [&str; 4] = ["bytes", "KB", "MB", "GB"];
+    /// The units `format_bytes` prints, smallest first.
+    const BYTE_UNITS: [&str; 4] = ["bytes", "KiB", "MiB", "GiB"];
 
     /// Byte counts that actually visit the unit boundaries. A uniform `u64`
     /// almost always lands far above the top unit, so on its own it never
     /// samples the band where `{:.1}` rounding reaches 1024.0. The other arms
     /// draw uniformly within one unit's range, and from a window just below
-    /// each rounded boundary (KB→MB, MB→GB) that scales with the boundary, as
-    /// the band does — see `rocm_core::disk_space`'s generator for the full
+    /// each rounded boundary (KiB→MiB, MiB→GiB) that scales with the boundary,
+    /// as the band does — see `rocm_core::disk_space`'s generator for the full
     /// reasoning.
-    fn user_byte_count_strategy() -> impl proptest::strategy::Strategy<Value = u64> {
+    fn byte_count_strategy() -> impl proptest::strategy::Strategy<Value = u64> {
         use proptest::prelude::*;
         prop_oneof![
             any::<u64>(),
@@ -19631,20 +19637,20 @@ model recipes
         /// Both edges compare the mantissa as printed, in tenths: that is the
         /// quantity a reader sees, so it is the one the scaling has to decide on.
         #[test]
-        fn format_bytes_for_user_renders_a_size_in_its_own_unit(
-            bytes in user_byte_count_strategy(),
+        fn format_bytes_renders_a_size_in_its_own_unit(
+            bytes in byte_count_strategy(),
         ) {
-            let rendered = format_bytes_for_user(bytes);
+            let rendered = format_bytes(bytes);
             let (value, unit) = rendered
                 .split_once(' ')
                 .expect("rendered size is `<number> <unit>`");
             let value: f64 = value.parse().expect("numeric part parses");
             let tenths = (value * 10.0).round();
-            let exponent = USER_BYTE_UNITS
+            let exponent = BYTE_UNITS
                 .iter()
                 .position(|name| *name == unit)
                 .expect("rendered unit is one of the known units");
-            if exponent + 1 < USER_BYTE_UNITS.len() {
+            if exponent + 1 < BYTE_UNITS.len() {
                 proptest::prop_assert!(
                     tenths < 10_240.0,
                     "{bytes} rendered as {rendered}, which should have been \
@@ -19664,7 +19670,7 @@ model recipes
                     (smaller * 10.0).round() >= 10_240.0,
                     "{bytes} rendered as {rendered}, but still fits the smaller \
                      unit as {smaller:.1} {}",
-                    USER_BYTE_UNITS[exponent - 1],
+                    BYTE_UNITS[exponent - 1],
                 );
             }
         }
@@ -25985,8 +25991,9 @@ install therock";
                     "artifact_ref": "tiny/model#gguf",
                     "allow_artifact_download": true,
                     // One byte under 1 MiB: `{:.1}` rounds it up to a full
-                    // 1024 KB, so the approved cap must read as "1.0 MB", not
-                    // "1024.0 KB".
+                    // 1024 KiB, so the approved cap must read as "1.0 MiB",
+                    // not "1024.0 KiB". It must also read as `MiB`, not `MB`
+                    // — this is base-1024 math, not base-1000 (issue #190).
                     "artifact_max_bytes": 1_048_575
                 }),
                 reviewed_at_unix_ms: None,
@@ -26029,7 +26036,7 @@ install therock";
         assert!(rendered.contains("server: svc-plain"));
         assert!(rendered.contains("proposal-file [waiting for review] Prepare a model file"));
         assert!(rendered.contains("model file: tiny/model#gguf"));
-        assert!(rendered.contains("download: approved up to 1.0 MB"));
+        assert!(rendered.contains("download: approved up to 1.0 MiB"));
         assert!(rendered.contains(
             "controls: /automations approve proposal-plain | /automations reject proposal-plain"
         ));
