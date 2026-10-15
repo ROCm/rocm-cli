@@ -14,7 +14,6 @@
 //! and read from `engines_cmd.rs`.
 
 use std::fmt::Write as _;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 
@@ -149,15 +148,17 @@ pub(crate) const fn empty_as_unknown(value: &str) -> &str {
     if value.is_empty() { "<unknown>" } else { value }
 }
 
-/// The real host's `/etc/os-release`.
+/// The real host's `/etc/os-release`, falling back to `/usr/lib/os-release`
+/// when the former is absent (per `os-release(5)`).
 ///
 /// Deliberately not routed through `rocm_core::host_path`: every caller builds
 /// a package-manager plan (`apt`, `dnf`, `amdgpu-install`) that then runs
 /// against the real machine, so a simulated host root must not choose its
 /// distro. The descriptive distro name `examine` reports comes from
-/// `rocm_core::detect_distro_name`, which does follow a simulated root.
-pub(crate) fn read_os_release() -> Result<String> {
-    fs::read_to_string("/etc/os-release").context("failed to read /etc/os-release")
+/// `ExamineSummary::gather`'s `distro` field, which does follow a simulated
+/// root.
+pub(crate) fn real_os_release() -> rocm_core::hardware_root::OsRelease {
+    rocm_core::hardware_root::read_os_release(rocm_core::hardware_root::identity_path_for_str)
 }
 
 /// Run a command given as an argv vector directly, without going through a shell.
@@ -202,8 +203,8 @@ pub(crate) fn ensure_openmpi_for_vllm(approved: bool) -> Result<()> {
         return Ok(());
     }
 
-    let plan = rocm_core::openmpi::plan_for_os_release(
-        &read_os_release().unwrap_or_default(),
+    let plan = rocm_core::openmpi::plan_for_os_release_read(
+        &real_os_release(),
         rocm_core::openmpi::build_openmpi_install_plan,
     );
 
@@ -377,10 +378,7 @@ fn ensure_torch_runtime_dep(approved: bool, dep: &TorchRuntimeDep) {
         return;
     }
 
-    let plan = rocm_core::openmpi::plan_for_os_release(
-        &read_os_release().unwrap_or_default(),
-        dep.build_plan,
-    );
+    let plan = rocm_core::openmpi::plan_for_os_release_read(&real_os_release(), dep.build_plan);
 
     println!("{} setup", dep.name);
     println!("  reason: {}", dep.reason);
@@ -1970,6 +1968,8 @@ pub(crate) fn finalize_successful_sdk_install(
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use std::fs;
+
     use super::*;
     use crate::test_support::write_test_pip_runtime;
     use crate::tests::{
@@ -2082,13 +2082,25 @@ pub(crate) mod tests {
         assert_eq!(preferred_engine_for_sdk_family("gfx120X-all"), None);
     }
 
+    /// The real candidate path/text `real_os_release_ignores_a_simulated_host_root`
+    /// expects, read independently rather than by calling
+    /// `hardware_root::read_os_release` a second time. `Absent` and
+    /// `Unreadable` are not interchangeable: a non-`NotFound` error must
+    /// always report `Unreadable`, never silently fall through to `Absent`.
+    #[cfg(all(feature = "e2e-test-hooks", target_os = "linux"))]
+    enum ExpectedOsRelease {
+        Found(&'static str, String),
+        Absent,
+        Unreadable(&'static str),
+    }
+
     /// The package-manager plans run against the real machine, so a simulated
     /// host root must not change the distro they are built for: under a root
-    /// whose `/etc/os-release` names a different distro, `read_os_release`
+    /// whose `/etc/os-release` names a different distro, `real_os_release`
     /// still returns the real file.
     #[cfg(all(feature = "e2e-test-hooks", target_os = "linux"))]
     #[test]
-    fn read_os_release_ignores_a_simulated_host_root() {
+    fn real_os_release_ignores_a_simulated_host_root() {
         let root = std::env::temp_dir().join(format!(
             "rocm-os-release-host-root-{}-{}",
             std::process::id(),
@@ -2109,18 +2121,52 @@ pub(crate) mod tests {
                 rocm_core::hardware_root::TEST_HOST_ROOT_ENV,
                 &root.to_string_lossy(),
             );
-            read_os_release().unwrap_or_default()
+            real_os_release()
         };
         fs::remove_dir_all(&root).ok();
 
         assert!(
-            !read.contains("planted-distro"),
-            "read the simulated root's os-release: {read:?}"
+            !read.text().contains("planted-distro"),
+            "read the simulated root's os-release: {:?}",
+            read.text()
         );
-        assert_eq!(
-            read,
-            fs::read_to_string("/etc/os-release").unwrap_or_default()
-        );
+        // Independent of `hardware_root::read_os_release`: rather than call
+        // the exact same helper with the same identity resolver `real_os_release`
+        // wraps one line away (which would pass even if its `.context(...)`
+        // call or resolver closure broke), read both candidate paths directly
+        // and apply the same existence-only fallback rule inline. This mirrors
+        // which variant is correct for each case, rather than accepting
+        // `Absent` or `Unreadable` interchangeably — see `ExpectedOsRelease`'s
+        // own doc comment for why that distinction matters.
+        let expected = match fs::read_to_string("/etc/os-release") {
+            Ok(text) => ExpectedOsRelease::Found("/etc/os-release", text),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                match fs::read_to_string("/usr/lib/os-release") {
+                    Ok(text) => ExpectedOsRelease::Found("/usr/lib/os-release", text),
+                    Err(e2) if e2.kind() == std::io::ErrorKind::NotFound => {
+                        ExpectedOsRelease::Absent
+                    }
+                    Err(_) => ExpectedOsRelease::Unreadable("/usr/lib/os-release"),
+                }
+            }
+            Err(_) => ExpectedOsRelease::Unreadable("/etc/os-release"),
+        };
+        match expected {
+            ExpectedOsRelease::Found(path, text) => {
+                assert_eq!((read.path(), read.text()), (path, text.as_str()));
+            }
+            ExpectedOsRelease::Absent => assert!(
+                matches!(&read, rocm_core::hardware_root::OsRelease::Absent),
+                "expected Absent, got {read:?}"
+            ),
+            ExpectedOsRelease::Unreadable(path) => assert!(
+                matches!(
+                    &read,
+                    rocm_core::hardware_root::OsRelease::Unreadable { path: p, .. } if *p == path
+                ),
+                "expected Unreadable at {path}, got {read:?}"
+            ),
+        }
     }
 
     // The install report is only as honest as the reconciliation that reaches

@@ -282,7 +282,7 @@ Feature: GPU detection and system inspection
   # `cargo xtask e2e` and every prebuilt full-suite lane use), so they describe a
   # machine other than the runner. The driver plan cannot be exercised this way:
   # `rocm install driver` builds a plan that runs against the real machine, so it
-  # deliberately reads the real `/etc/os-release` (see `read_os_release`); its
+  # deliberately reads the real `/etc/os-release` (see `real_os_release`); its
   # parsing is covered by the unit tests in `driver_install.rs`.
   #
   # The planted distributions are ones no CI runner or developer host here runs,
@@ -404,3 +404,27 @@ Feature: GPU detection and system inspection
     Given amd-smi answers the first probe and then stalls on the second
     When the daemon gathers a bridge snapshot
     Then the snapshot keeps the first probe's GPUs and explains the second with a bounded note naming the timeout
+
+  # `os-release(5)` says to read `/etc/os-release` and, if it does not exist,
+  # fall back to `/usr/lib/os-release`. This plants a simulated host root with
+  # only the fallback path populated, so a reader that stopped after the first
+  # candidate would see no file at all and report an unknown distribution.
+  @id:examine-falls-back-to-usr-lib-os-release @requires-os:linux
+  Scenario: examine-27 - The inspection falls back to /usr/lib/os-release when /etc/os-release is absent
+    Given a machine whose release file exists only at /usr/lib/os-release
+    When the user inspects that machine in machine-readable form
+    Then the inspection reports the distribution "ubuntu" version "24.04" named "Ubuntu 24.04 LTS"
+    And the inspection reports no trouble reading the release file
+
+  # Before this change, a release file that exists but cannot be read (not
+  # absent, so no fallback candidate is tried either) silently produced an
+  # empty, unreported distro with no failure recorded. It now reports the
+  # file as itself, distinctly from both an unknown distribution and a
+  # malformed line it never reached. A directory in place of the file is a
+  # non-`NotFound` read error that needs no root privilege, unlike a
+  # mode-000 file, which CI running as root would read anyway.
+  @id:examine-degrades-on-unreadable-release-file @requires-os:linux
+  Scenario: examine-28 - An unreadable release file degrades the verdict on a machine with a GPU
+    Given a GPU machine whose release file cannot be read
+    When the user inspects that machine in machine-readable form
+    Then the inspection's verdict is degraded, and its only failure says the release file could not be read
