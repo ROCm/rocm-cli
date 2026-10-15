@@ -34,8 +34,6 @@ use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 #[cfg(not(windows))]
-use std::process::ExitStatus;
-#[cfg(not(windows))]
 use std::process::{Command as ProcessCommand, Stdio};
 use std::thread;
 use std::time::Duration;
@@ -47,8 +45,11 @@ use rocm_core::{AppPaths, AutomationRuntimeState, EndpointReadiness, ManagedServ
 use rocm_core::{format_http_base_url, process_is_running};
 use rocm_engine_protocol::{DevicePolicy, EngineRecipeHint, ResolveModelResponse};
 
+#[cfg(not(windows))]
+use crate::apply_app_path_env;
 use crate::endpoint_keys;
 use crate::engines_cmd::env_root_for_service;
+use crate::read_optional_tail_lines;
 use crate::serve_port;
 use crate::service_hints;
 use crate::{
@@ -59,8 +60,6 @@ use crate::{
 };
 #[cfg(windows)]
 use crate::{app_path_env_var_refs, app_path_env_var_values};
-#[cfg(not(windows))]
-use crate::{apply_app_path_env, read_optional_tail_lines};
 
 pub(crate) fn validate_bind_host(host: &str, allow_public_bind: bool) -> Result<()> {
     if !is_loopback_host(host) && !allow_public_bind {
@@ -244,8 +243,14 @@ pub(crate) fn attach_background_stdio(
     Ok(())
 }
 
-#[cfg(not(windows))]
-pub(crate) fn managed_engine_startup_failure_detail(status: ExitStatus, log_path: &Path) -> String {
+/// `status_clause` is a pre-formatted fragment inserted right after "exited
+/// immediately" (e.g. `" with status exit status: 1"` on Unix, where a real
+/// `ExitStatus` is available; empty on Windows, where the liveness check
+/// below only has a yes/no answer, not an exit code).
+pub(crate) fn managed_engine_startup_failure_detail(
+    status_clause: &str,
+    log_path: &Path,
+) -> String {
     let mut recent_lines = read_optional_tail_lines(log_path, 80, "service log");
     if recent_lines.is_empty() {
         for _ in 0..5 {
@@ -258,12 +263,12 @@ pub(crate) fn managed_engine_startup_failure_detail(status: ExitStatus, log_path
     }
     if recent_lines.is_empty() {
         return format!(
-            "managed engine exited immediately with status {status}; inspect {}",
+            "managed engine exited immediately{status_clause}; inspect {}",
             log_path.display()
         );
     }
     format!(
-        "managed engine exited immediately with status {status}; inspect {}\n\nrecent startup log output:\n{}",
+        "managed engine exited immediately{status_clause}; inspect {}\n\nrecent startup log output:\n{}",
         log_path.display(),
         recent_lines.join("\n")
     )
@@ -696,8 +701,19 @@ fn launch_managed_engine_child_locked(
         if let Some(key_file) = endpoint_key_file.as_deref() {
             env_refs.push((rocm_engine_protocol::ENDPOINT_API_KEY_FILE_ENV, key_file));
         }
-        rocm_core::spawn_detached_no_inherit(&current_exe, &serve_args, &env_refs)
-            .context("failed to launch managed engine process")?
+        let child_pid = rocm_core::spawn_detached_no_inherit(&current_exe, &serve_args, &env_refs)
+            .context("failed to launch managed engine process")?;
+        // Set before the immediate-exit check below, so a bail! here still leaves
+        // `record.engine_pid` telling cleanup that a child was spawned.
+        record.engine_pid = Some(child_pid);
+        thread::sleep(Duration::from_millis(200));
+        if !process_is_running(child_pid) {
+            bail!(
+                "{}",
+                managed_engine_startup_failure_detail("", &record.log_path)
+            );
+        }
+        child_pid
     };
     #[cfg(not(windows))]
     let child_pid = {
@@ -726,7 +742,10 @@ fn launch_managed_engine_child_locked(
         {
             bail!(
                 "{}",
-                managed_engine_startup_failure_detail(status, &record.log_path)
+                managed_engine_startup_failure_detail(
+                    &format!(" with status {status}"),
+                    &record.log_path
+                )
             );
         }
         child_pid
