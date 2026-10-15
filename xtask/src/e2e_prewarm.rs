@@ -98,9 +98,9 @@ pub enum Decision {
 /// permanently `update_available` against a `release` index that has moved on,
 /// and following that status would silently replace the pin with latest. A
 /// pinned run instead looks for an already-installed runtime whose key names
-/// that exact pin, ignoring `status` entirely, and installs fresh (never
-/// `update`/`repair`, which only ever apply the index's latest key) when none is
-/// found.
+/// that exact pin: it still self-heals that runtime's own stale composition via
+/// repair, but never follows `update`/`repair` toward the index's latest key,
+/// and installs a fresh side-by-side runtime only when no match is found.
 #[must_use]
 pub fn decide(update_report: &str, channel: &str, pin: Option<&str>) -> Decision {
     // The empty-registry wording from `render_update_report`. Checked before the
@@ -430,6 +430,27 @@ pub fn dangling_active_runtime(runtimes_list_report: &str) -> Option<&str> {
     })
 }
 
+/// The already-installed runtime (from `rocm runtimes list`, which carries no
+/// `channel=` field at all) whose key names `pin` within `channel`.
+///
+/// Mirrors `decide()`'s pin branch, which scopes its own search to
+/// `channel_runtimes` (or a same-channel unattributed error line) before ever
+/// calling `key_matches_pin` — `key_matches_pin` alone only checks whether the
+/// pin's token/digit-run appears in a key, with no notion of channel, so an
+/// unscoped search here could match a `release` pin against an installed
+/// `nightly` runtime that happens to share the pin's version/build-date
+/// digits, silently serving the wrong channel's SDK. Since this listing has no
+/// channel field to key off at all, the guard is the same `{channel}-` prefix
+/// `decide()` falls back to for its own degraded, channel-less lines.
+fn find_pinned_runtime_entry(listing: &str, channel: &str, pin: &str) -> Option<RuntimeEntry> {
+    let channel_prefix = format!("{channel}-");
+    listing
+        .lines()
+        .filter_map(RuntimeEntry::parse)
+        .filter(|entry| entry.runtime_key.starts_with(&channel_prefix))
+        .find(|entry| key_matches_pin(&entry.runtime_key, pin))
+}
+
 /// Managed runtimes the tree could be pointed at instead, in report order.
 ///
 /// Read-only entries are excluded on purpose. `runtimes adopt` records a folder
@@ -659,11 +680,7 @@ pub fn run(
                 // had a transient failure. Check the registry directly instead.
                 match list_runtimes(&rocm, prewarm_dir) {
                     Ok(listing) => {
-                        if let Some(entry) = listing
-                            .lines()
-                            .filter_map(RuntimeEntry::parse)
-                            .find(|entry| key_matches_pin(&entry.runtime_key, pin))
-                        {
+                        if let Some(entry) = find_pinned_runtime_entry(&listing, channel, pin) {
                             println!(
                                 "pre-warm: `rocm update` failed ({error:#}); pinned runtime {} is already installed, reusing it",
                                 entry.runtime_key
@@ -1315,6 +1332,56 @@ active_status: ambiguous runtime_id=therock-release:gfx94X-dcgpu; activate one r
         // install that follows activates whatever it installs.
         assert!(activation_candidates(NO_RUNTIMES).is_empty());
         assert!(activation_candidates("").is_empty());
+    }
+
+    /// A `rocm runtimes list` on a tree holding both a `release` and a `nightly`
+    /// runtime, the latter installed at the version the test below pins —
+    /// the shape that would wrongly satisfy an unscoped pin search for
+    /// `release`.
+    const MULTI_CHANNEL: &str = "\
+registered ROCm runtimes
+  active_runtime_id: therock-release:gfx94X-dcgpu
+  active_runtime_key: release-wheel-gfx94x-dcgpu-7-13-0
+  previous_runtime_key: <unset>
+  registry: /w/e2e-prewarm/data/runtimes/registry
+  marker: /w/e2e-prewarm/data/runtimes/active.json
+  installed:
+    legend: * = active, - = rollback target
+
+    * release-wheel-gfx94x-dcgpu-7-13-0 runtime_id=therock-release-gfx94x-dcgpu version=7.13.0 format=wheel family=gfx94X-dcgpu mode=managed status=usable
+      install_root: /w/e2e-prewarm/data/runtimes/wheel/release-wheel-gfx94x-dcgpu-7-13-0
+    nightly-wheel-gfx94x-dcgpu-7-14-0 runtime_id=therock-nightly-gfx94x-dcgpu version=7.14.0 format=wheel family=gfx94X-dcgpu mode=managed status=usable
+      install_root: /w/e2e-prewarm/data/runtimes/wheel/nightly-wheel-gfx94x-dcgpu-7-14-0
+";
+
+    #[test]
+    fn pinned_runtime_entry_is_found_within_its_own_channel() {
+        assert_eq!(
+            find_pinned_runtime_entry(MULTI_CHANNEL, "release", "7.13.0").map(|e| e.runtime_key),
+            Some("release-wheel-gfx94x-dcgpu-7-13-0".to_owned())
+        );
+    }
+
+    #[test]
+    fn pinned_runtime_entry_does_not_match_another_channels_installed_runtime() {
+        // 7.14.0 is only installed under `nightly`, not the requested
+        // `release`. `rocm runtimes list` carries no `channel=` field at all
+        // (unlike `rocm update`'s report), so the `{channel}-` prefix guard is
+        // the only thing standing between this and silently serving the wrong
+        // channel's SDK for a pin that happens to share another channel's
+        // installed version.
+        assert!(find_pinned_runtime_entry(MULTI_CHANNEL, "release", "7.14.0").is_none());
+        assert_eq!(
+            find_pinned_runtime_entry(MULTI_CHANNEL, "nightly", "7.14.0").map(|e| e.runtime_key),
+            Some("nightly-wheel-gfx94x-dcgpu-7-14-0".to_owned()),
+            "sanity: the matching channel's own entry must still be found"
+        );
+    }
+
+    #[test]
+    fn pinned_runtime_entry_is_none_when_the_tree_is_empty() {
+        assert!(find_pinned_runtime_entry(NO_RUNTIMES, "release", "7.13.0").is_none());
+        assert!(find_pinned_runtime_entry("", "release", "7.13.0").is_none());
     }
 
     #[test]
