@@ -555,7 +555,26 @@ fn friendly_engine_detect_note_fallback(note: &str) -> String {
 /// (`ensure_engine_allowed_on_platform`), so the inventory cannot call an
 /// engine unsupported while those commands go ahead with it, or the reverse.
 fn engine_runtime_status_label(engine: &str, detect: &DetectResponse) -> &'static str {
-    runtime_status_label_for(detect.installed, engine_ruled_out_by_platform(engine))
+    let ruled_out = engine_ruled_out_by_platform(engine);
+    if detect.installed
+        && engine.eq_ignore_ascii_case("vllm")
+        && ruled_out != PlatformRuleOut::NativeWindowsVllm
+        && engine_reports_unusable_device(detect)
+    {
+        "installed, not usable"
+    } else {
+        runtime_status_label_for(detect.installed, ruled_out)
+    }
+}
+
+/// An installed vLLM whose own detect says its GPU path cannot run: its
+/// compiled extensions do not import. Reporting that as `ready` sends
+/// the user to a serve that is certain to fail.
+fn engine_reports_unusable_device(detect: &DetectResponse) -> bool {
+    detect
+        .available_devices
+        .iter()
+        .any(|device| !device.available && device.reason.is_some())
 }
 
 /// [`engine_runtime_status_label`] with the platform decision passed in rather
@@ -918,6 +937,52 @@ mod tests {
         );
         assert_eq!(
             runtime_status_label_for(false, PlatformRuleOut::AimDockerUnavailable),
+            "not found"
+        );
+    }
+
+    #[test]
+    fn installed_vllm_whose_extensions_do_not_import_is_not_reported_ready() {
+        let detect = |installed: bool, available: bool, reason: Option<&str>| DetectResponse {
+            installed,
+            env_id: None,
+            runtime_kind: None,
+            runtime_executable: None,
+            managed_env: None,
+            python_version: None,
+            torch_version: None,
+            transformers_version: None,
+            available_devices: vec![rocm_engine_protocol::EngineDeviceAvailability {
+                kind: "rocm_gpu".to_owned(),
+                available,
+                reason: reason.map(str::to_owned),
+            }],
+            capabilities: rocm_engine_protocol::EngineCapabilities {
+                cpu: false,
+                rocm_gpu: true,
+                openai_compatible: true,
+                tool_calling: false,
+                quantized_models: "vllm-supported".to_owned(),
+                reasoning_parser: false,
+            },
+            notes: Vec::new(),
+        };
+        if cfg!(windows) {
+            return;
+        }
+        assert_eq!(
+            engine_runtime_status_label("vllm", &detect(true, true, None)),
+            "ready"
+        );
+        assert_eq!(
+            engine_runtime_status_label(
+                "vllm",
+                &detect(true, false, Some("compiled extensions do not import"))
+            ),
+            "installed, not usable"
+        );
+        assert_eq!(
+            engine_runtime_status_label("vllm", &detect(false, false, Some("not installed"))),
             "not found"
         );
     }
