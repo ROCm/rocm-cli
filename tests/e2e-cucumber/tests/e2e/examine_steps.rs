@@ -1457,6 +1457,60 @@ async fn gpu_machine_with_unreadable_release_file(world: &mut E2eWorld) {
     plant_gpu_fixtures(world);
 }
 
+/// A simulated host root, plus a `lsmod` on `PATH` that lists `amdgpu` and no
+/// `amdkfd`, so the module list never answers for kfd. `with_kfd` plants the
+/// `/dev/kfd` node.
+fn plant_machine_without_amdkfd_module(world: &mut E2eWorld, with_kfd: bool) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .to_owned();
+    let host = root.join("host-root");
+    std::fs::create_dir_all(host.join("dev")).expect("failed to create planted /dev");
+    if with_kfd {
+        std::fs::write(host.join("dev/kfd"), "").expect("failed to plant /dev/kfd");
+    }
+    let bin = root.join("fake-bin");
+    std::fs::create_dir_all(&bin).expect("failed to create the fake PATH dir");
+    rocm_core::fake_executable::write_fake_executable(
+        &bin.join("lsmod"),
+        "#!/bin/sh\nprintf 'Module Size Used by\\namdgpu 1 0\\ndrm 1 1 amdgpu\\n'\n",
+    )
+    .expect("failed to write the fake lsmod");
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .expect("PATH entries cannot hold a separator");
+    world.command_env.push(("PATH", path));
+    world
+        .command_env
+        .push(("ROCM_CLI_TEST_HOST_ROOT", host.into_os_string()));
+}
+
+#[given("a machine whose kernel exposes kfd but lists no amdkfd module")]
+async fn machine_with_built_in_kfd(world: &mut E2eWorld) {
+    plant_machine_without_amdkfd_module(world, true);
+}
+
+#[given("a machine whose kernel has no kfd and lists no amdkfd module")]
+async fn machine_without_kfd(world: &mut E2eWorld) {
+    plant_machine_without_amdkfd_module(world, false);
+}
+
+#[then("the inspection reports kfd as loaded")]
+async fn assert_kfd_loaded(world: &mut E2eWorld) {
+    let json = parsed_json(world);
+    assert_eq!(json["amdkfd_loaded"], serde_json::json!(true), "{json:#}");
+}
+
+#[then("the inspection reports kfd as not loaded")]
+async fn assert_kfd_not_loaded(world: &mut E2eWorld) {
+    let json = parsed_json(world);
+    assert_eq!(json["amdkfd_loaded"], serde_json::json!(false), "{json:#}");
+}
+
 #[when("the user inspects that machine in machine-readable form")]
 async fn user_inspects_planted_machine(world: &mut E2eWorld) {
     let (stdout, stderr, rc) =

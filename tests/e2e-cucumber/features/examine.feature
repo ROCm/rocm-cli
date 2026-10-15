@@ -428,3 +428,19 @@ Feature: GPU detection and system inspection
     Given a GPU machine whose release file cannot be read
     When the user inspects that machine in machine-readable form
     Then the inspection's verdict is degraded, and its only failure says the release file could not be read
+
+  # kfd is linked into `amdgpu` (`HSA_AMD` is a `bool` Kconfig option), so a
+  # healthy machine never lists an `amdkfd` module. The report used to read
+  # that as "kfd missing". Each scenario plants a module list naming `amdgpu`
+  # only, so the answer can come only from the kernel's kfd interfaces.
+  @id:examine-reports-kfd-built-into-the-kernel @requires-os:linux
+  Scenario: examine-29 - The inspection reports kfd on a machine whose module list has no amdkfd
+    Given a machine whose kernel exposes kfd but lists no amdkfd module
+    When the user inspects that machine in machine-readable form
+    Then the inspection reports kfd as loaded
+
+  @id:examine-reports-kfd-absent-without-kfd-interfaces @requires-os:linux
+  Scenario: examine-30 - The inspection reports kfd as not loaded on a machine without it
+    Given a machine whose kernel has no kfd and lists no amdkfd module
+    When the user inspects that machine in machine-readable form
+    Then the inspection reports kfd as not loaded
