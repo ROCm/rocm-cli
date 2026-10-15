@@ -4487,6 +4487,20 @@ jobs:
         // job is never waited for and, behind a single runner, outlives the PR it
         // was queued for. The other lanes are unaffected.
         let sh = read_workflow("e2e-selfhosted.yml");
+        // The sibling lanes' "keep running in the queue" check below is vacuous
+        // if the workflow stops triggering on merge_group at all.
+        let triggers = normalized_whitespace(
+            &top_level_block(&sh, "on")
+                .lines()
+                .map(strip_comment)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        assert!(
+            triggers.contains("merge_group: branches: [main] types: [checks_requested]"),
+            "e2e-selfhosted.yml must still trigger on merge_group (checks_requested on main) \
+             so the lanes that stay in the merge queue actually run (got `{triggers}`)"
+        );
         let gate = |job: &str| {
             let block = job_block(&sh, job);
             let start = block
