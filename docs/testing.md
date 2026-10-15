@@ -1627,11 +1627,12 @@ above matches on all three: `rocm install driver` via
 hints via `plan_for_os_release_read`/`install_hint_for_read`, and `rocm
 examine`'s distro fields and distro name via `record_distro` and
 `distro_name_from_os_release`, which both take the whole `OsRelease` directly.
-The three `_read`-suffixed functions are the one seam the real call site hands
-its result to; the bare-text functions they delegate to (`plan_for_os_release`,
-`install_hint_for`, `build_driver_install_plan`) are kept only for the unit
-tests below, which fixture text directly and have no `OsRelease` of their
-own to construct.
+The three `_read`-suffixed functions are the one seam the real call site
+hands its result to, and each delegates to the matching `_at` function with
+the path it actually read. `install_hint_for`/`build_driver_install_plan`
+are bare-text siblings of `_at` — not something `_read` delegates through —
+kept only for the unit tests below, which fixture text directly and have no
+`OsRelease` of their own to construct.
 
 ```bash
 cargo test -p rocm-core --lib os_release

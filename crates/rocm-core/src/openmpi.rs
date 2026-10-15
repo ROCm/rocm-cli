@@ -868,10 +868,12 @@ pub fn plan_for_os_release_at(
 /// Names the file actually read in an unreadable-line message, and reports a
 /// file that exists but could not be read as itself rather than as an unknown
 /// distribution. Without the latter, a host whose `/etc/os-release` is merely
-/// unreadable (permission denied, a directory in its place) would plan
-/// nothing and say "Could not map distribution (ID=)" — the same message an
-/// actually unknown distribution gets — sending the user looking for a
-/// support gap instead of a filesystem problem.
+/// unreadable (permission denied, a directory in its place) would say only
+/// "Could not map distribution (ID=)" — the same message an actually unknown
+/// distribution gets, sending the user looking for a support gap instead of
+/// a filesystem problem. The real cause is now prepended ahead of that
+/// generic message, not substituted for it — `build("", "")` still produces
+/// it, since nothing else identifies the distribution either.
 #[must_use]
 pub fn plan_for_os_release_read(
     read: &crate::hardware_root::OsRelease,
@@ -1016,7 +1018,8 @@ const LIBNUMA_MANUAL_HINT: &str =
 /// Build a short, distro-aware hint describing how to install the OpenMPI
 /// runtime that vLLM requires, for embedding in user-facing error messages.
 ///
-/// On Linux it reads `/etc/os-release` and returns the package-manager command
+/// On Linux it reads `/etc/os-release` (falling back to `/usr/lib/os-release`
+/// per `os-release(5)`) and returns the package-manager command
 /// from [`build_openmpi_install_plan`] when the distribution is recognized,
 /// otherwise a generic instruction. Off Linux it returns a generic message,
 /// since the OpenMPI path is not exercised there.
@@ -1043,7 +1046,8 @@ pub fn install_hint() -> InstallHint {
 /// Build a short, distro-aware hint describing how to install the `libatomic`
 /// runtime that vLLM requires, for embedding in user-facing error messages.
 ///
-/// On Linux it reads `/etc/os-release` and returns the package-manager command
+/// On Linux it reads `/etc/os-release` (falling back to `/usr/lib/os-release`
+/// per `os-release(5)`) and returns the package-manager command
 /// from [`build_libatomic_install_plan`] when the distribution is recognized,
 /// otherwise a generic instruction. Off Linux it returns a generic message.
 /// [`InstallHint::or`] offers an automatic install only when that plan
@@ -1069,7 +1073,8 @@ pub fn libatomic_install_hint() -> InstallHint {
 /// Build a short, distro-aware hint describing how to install the real `libnuma`
 /// runtime that PyTorch requires, for embedding in user-facing error messages.
 ///
-/// On Linux it reads `/etc/os-release` and returns the package-manager command
+/// On Linux it reads `/etc/os-release` (falling back to `/usr/lib/os-release`
+/// per `os-release(5)`) and returns the package-manager command
 /// from [`build_libnuma_install_plan`] when the distribution is recognized,
 /// otherwise a generic instruction. Off Linux it returns a generic message.
 /// [`InstallHint::or`] offers an automatic install only when that plan

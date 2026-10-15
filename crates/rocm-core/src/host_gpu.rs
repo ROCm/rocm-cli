@@ -4833,10 +4833,11 @@ Class Name:                Display
         );
     }
 
-    /// A file that exists but could not be read names itself and the error,
-    /// distinctly from a bad line it never reached and from "no file at all"
-    /// — which `detect_distro_name` keeps reporting as unknown, unchanged by
-    /// this PR (see its own doc comment).
+    /// A file that exists but could not be read names itself and the error —
+    /// new behavior; it used to be folded into "unknown" like an absent file.
+    /// It is distinct from a bad line it never reached, and from "no file at
+    /// all", which `detect_distro_name` still reports as unknown (see its own
+    /// doc comment) — that part is unchanged.
     #[test]
     fn distro_name_names_an_unreadable_file_instead_of_guessing_linux() {
         assert_eq!(
