@@ -682,8 +682,10 @@ filesystem: a bind mount or `subPath` volume is enough to make Linux refuse the
 hardlink, and `uv` then silently copies. This cache holds every wheel `uv`
 downloads — the ROCm SDK and the torch stack included — so it is typically the
 largest directory rocm-cli manages, on the order of several GB per SDK version
-installed. It is removed by `rocm uninstall` unless `--keep-data` is passed, and
-its location can be overridden with `ROCM_CLI_UV_CACHE_DIR`.
+installed. It is removed by `rocm uninstall`. On the default layout, the
+configuration and data directories are both `~/.rocm`, so keeping it takes
+`--keep-data` and `--keep-config` together. Its location can be overridden
+with `ROCM_CLI_UV_CACHE_DIR`.
 
 ### Lemonade Embeddable Runtime
 
