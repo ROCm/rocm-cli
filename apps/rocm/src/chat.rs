@@ -2235,11 +2235,28 @@ fn validate_chat_launch_server_tool_call(call: &providers::ChatToolCall) -> Resu
     if !is_loopback_host(&host) {
         bail!("local assistant cannot request non-local host `{host}`");
     }
+    // Validate the same way the argv builder reads it
+    // (`object.get("port").and_then(serde_json::Value::as_u64)`), so a
+    // malformed `port` (wrong type, out of range) can't slip past this check
+    // only to have the argv builder silently drop it and fall through to
+    // automatic port selection.
+    let port = match object.get("port") {
+        None => None,
+        Some(value) => {
+            let port = value
+                .as_u64()
+                .context("ROCm tool `launch_server` argument `port` must be an integer")?;
+            if !(1..=u64::from(u16::MAX)).contains(&port) {
+                bail!("ROCm tool `launch_server` argument `port` must be between 1 and 65535");
+            }
+            Some(port)
+        }
+    };
     // `rocm serve` proves a port is free only on the exact default host; every
     // other spelling (including the loopback aliases `localhost`/`::1` this
     // check still accepts) needs an explicit port or the CLI call refuses
     // later with a less actionable error. See `is_canonical_loopback_host`.
-    if object.get("port").is_none() && !rocm_core::is_canonical_loopback_host(&host) {
+    if port.is_none() && !rocm_core::is_canonical_loopback_host(&host) {
         bail!(
             "local assistant must supply an explicit `port` for host `{host}`; automatic port \
              selection is only supported on the default host {DEFAULT_LOCAL_HOST}"
@@ -6264,6 +6281,50 @@ model recipes
         };
         validate_chat_tool_call(&canonical_no_port)
             .expect("automatic port selection still works on the canonical loopback host");
+    }
+
+    #[test]
+    fn chat_tool_call_rejects_a_malformed_port_instead_of_letting_it_fall_through() {
+        // A non-integer `port` must not be treated as "no port supplied" here:
+        // the argv builder (`object.get("port").and_then(as_u64)`) would drop
+        // it just as silently, so without this check a malformed port on a
+        // non-canonical host would sail past validation only to fall through
+        // to automatic port selection the host doesn't support.
+        let string_port = providers::ChatToolCall {
+            id: None,
+            name: "launch_server".to_owned(),
+            arguments: serde_json::json!({
+                "model": "tiny.gguf",
+                "engine": "vllm",
+                "host": "localhost",
+                "port": "11999"
+            }),
+        };
+        let error = validate_chat_tool_call(&string_port)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("must be an integer"),
+            "unexpected error: {error}"
+        );
+
+        let out_of_range_port = providers::ChatToolCall {
+            id: None,
+            name: "launch_server".to_owned(),
+            arguments: serde_json::json!({
+                "model": "tiny.gguf",
+                "engine": "vllm",
+                "host": "127.0.0.1",
+                "port": 70000
+            }),
+        };
+        let error = validate_chat_tool_call(&out_of_range_port)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("between 1 and 65535"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

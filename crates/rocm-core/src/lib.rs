@@ -143,8 +143,8 @@ pub use proc_lifecycle::{
 };
 pub use process::{
     FileLock, LoopbackPortLease, MANAGED_LAUNCH_LOCK_TIMEOUT, detach_command_session,
-    is_canonical_loopback_host, lease_loopback_port, process_is_running, terminate_process,
-    terminate_process_tree,
+    is_canonical_loopback_host, lease_loopback_port, lease_loopback_port_or_bind_error,
+    process_is_running, terminate_process, terminate_process_tree,
 };
 #[cfg(windows)]
 pub use process::{
@@ -632,7 +632,6 @@ mod tests {
     use crate::test_support::workspace_test_artifact_dir;
 
     use std::fs;
-    use std::net::TcpListener;
     use std::path::Path;
     use std::process::{Command, Stdio};
 
@@ -902,7 +901,6 @@ mod tests {
 
     const LOCK_CHILD_PATH_ENV: &str = "ROCM_CORE_TEST_LOCK_PATH";
     const LOCK_CHILD_READY_ENV: &str = "ROCM_CORE_TEST_LOCK_READY";
-    const HANDOFF_PORT_ENV: &str = "ROCM_CORE_TEST_HANDOFF_PORT";
 
     fn lock_test_dir(label: &str) -> PathBuf {
         let dir = workspace_test_artifact_dir().join(format!(
@@ -933,26 +931,6 @@ mod tests {
             command.env(key, value);
         }
         command.spawn().expect("spawn helper test process")
-    }
-
-    #[test]
-    fn canonical_loopback_host_is_only_the_exact_default_address() {
-        assert!(is_canonical_loopback_host(DEFAULT_LOCAL_HOST));
-        assert!(is_canonical_loopback_host("  127.0.0.1  "));
-        // Everything else is a "custom host": explicit port, engine-owned bind.
-        for host in [
-            "localhost",
-            "::1",
-            "0.0.0.0",
-            "127.0.0.2",
-            "192.168.1.4",
-            "",
-        ] {
-            assert!(
-                !is_canonical_loopback_host(host),
-                "{host} must not be treated as the canonical loopback host"
-            );
-        }
     }
 
     #[test]
@@ -1043,58 +1021,4 @@ mod tests {
             .expect("the OS releases the lock when the holding process exits");
     }
 
-    #[test]
-    fn loopback_lease_blocks_a_second_bind_until_released() {
-        let ephemeral = TcpListener::bind(("127.0.0.1", 0)).expect("ephemeral bind");
-        let port = ephemeral.local_addr().expect("local addr").port();
-        drop(ephemeral);
-
-        let lease = lease_loopback_port(port).expect("free port leases");
-        assert_eq!(lease.port(), port);
-        assert!(lease.is_held());
-        let conflict = lease_loopback_port(port).expect_err("a held port must not lease twice");
-        assert_eq!(conflict.kind(), std::io::ErrorKind::AddrInUse);
-
-        assert_eq!(lease.release(), port);
-        lease_loopback_port(port).expect("the port is bindable again after release");
-    }
-
-    #[test]
-    fn engine_owned_lease_holds_no_socket() {
-        // Custom hosts get a port carrier, never a loopback probe.
-        let lease = LoopbackPortLease::engine_owned(8000);
-        assert_eq!(lease.port(), 8000);
-        assert!(!lease.is_held());
-    }
-
-    #[test]
-    #[ignore = "spawned as a child process by released_loopback_lease_is_immediately_bindable_by_another_process"]
-    fn loopback_handoff_child() {
-        let Ok(port) = std::env::var(HANDOFF_PORT_ENV) else {
-            return;
-        };
-        let port: u16 = port.parse().expect("handoff port");
-        let lease = lease_loopback_port(port).expect("child binds the released port");
-        assert_eq!(lease.port(), port);
-    }
-
-    #[test]
-    fn released_loopback_lease_is_immediately_bindable_by_another_process() {
-        let ephemeral = TcpListener::bind(("127.0.0.1", 0)).expect("ephemeral bind");
-        let port = ephemeral.local_addr().expect("local addr").port();
-        drop(ephemeral);
-        let lease = lease_loopback_port(port).expect("parent leases the port");
-        assert_eq!(lease.release(), port);
-
-        let status = spawn_helper_test(
-            "tests::loopback_handoff_child",
-            &[(HANDOFF_PORT_ENV, port.to_string())],
-        )
-        .wait()
-        .expect("handoff child exits");
-        assert!(
-            status.success(),
-            "a separate process must bind the port immediately after the lease is released"
-        );
-    }
 }

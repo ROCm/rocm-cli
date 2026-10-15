@@ -582,6 +582,40 @@ pub fn lease_loopback_port(port: u16) -> std::io::Result<LoopbackPortLease> {
     })
 }
 
+/// [`lease_loopback_port`], but mapped to an `anyhow::Error`.
+///
+/// Only uses `in_use_message` for a genuine collision
+/// ([`std::io::ErrorKind::AddrInUse`]). Any other bind failure (permission
+/// denied, address unavailable, ...) gets its own generic message instead —
+/// mislabelling those as "in use" sends the user to stop a service that
+/// isn't the actual problem. Mirrors `rocm serve`'s own
+/// `explicit_bind_error`; shared by the CLI's restart re-check and
+/// `rocmd`'s recovery re-check so neither duplicates (or drifts from) that
+/// distinction.
+pub fn lease_loopback_port_or_bind_error(
+    port: u16,
+    in_use_message: impl std::fmt::Display,
+) -> anyhow::Result<LoopbackPortLease> {
+    lease_loopback_port(port).map_err(|error| bind_error(port, &error, in_use_message))
+}
+
+/// Pure error-mapping half of [`lease_loopback_port_or_bind_error`], split out
+/// so the `AddrInUse`-vs-other-error distinction is tested against a
+/// synthetic `io::Error` rather than needing a real bind failure (a
+/// privileged port, an unavailable address) that is not reliably
+/// reproducible in CI.
+fn bind_error(
+    port: u16,
+    error: &std::io::Error,
+    in_use_message: impl std::fmt::Display,
+) -> anyhow::Error {
+    if error.kind() == std::io::ErrorKind::AddrInUse {
+        anyhow::anyhow!("{in_use_message}")
+    } else {
+        anyhow::anyhow!("failed to reserve port {port}: {error}")
+    }
+}
+
 impl Drop for FileLock {
     fn drop(&mut self) {
         // Best-effort: an unlock failure only means the OS releases it slightly
@@ -1168,6 +1202,207 @@ fn assemble_output(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::workspace_test_artifact_dir;
+    use std::process::Stdio;
+
+    const LOCK_CHILD_PATH_ENV: &str = "ROCM_CORE_TEST_LOCK_PATH";
+    const LOCK_CHILD_READY_ENV: &str = "ROCM_CORE_TEST_LOCK_READY";
+    const HANDOFF_PORT_ENV: &str = "ROCM_CORE_TEST_HANDOFF_PORT";
+
+    fn lock_test_dir(label: &str) -> PathBuf {
+        let dir = workspace_test_artifact_dir().join(format!(
+            "{label}-{}-{}",
+            std::process::id(),
+            crate::unix_time_millis()
+        ));
+        fs::create_dir_all(&dir).expect("create lock test dir");
+        dir
+    }
+
+    /// Re-run this test binary, executing exactly one `#[ignore]`d helper test in
+    /// a genuinely separate process. Cross-process locking and socket handoff
+    /// cannot be proven inside one process.
+    fn spawn_helper_test(name: &str, envs: &[(&str, String)]) -> std::process::Child {
+        let exe = std::env::current_exe().expect("test binary path");
+        let mut command = Command::new(exe);
+        command
+            .arg(name)
+            .arg("--exact")
+            .arg("--ignored")
+            .arg("--test-threads")
+            .arg("1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        for (key, value) in envs {
+            command.env(key, value);
+        }
+        command.spawn().expect("spawn helper test process")
+    }
+
+    #[test]
+    fn canonical_loopback_host_is_only_the_exact_default_address() {
+        assert!(is_canonical_loopback_host(DEFAULT_LOCAL_HOST));
+        assert!(is_canonical_loopback_host("  127.0.0.1  "));
+        // Everything else is a "custom host": explicit port, engine-owned bind.
+        for host in [
+            "localhost",
+            "::1",
+            "0.0.0.0",
+            "127.0.0.2",
+            "192.168.1.4",
+            "",
+        ] {
+            assert!(
+                !is_canonical_loopback_host(host),
+                "{host} must not be treated as the canonical loopback host"
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_file_lock_excludes_independent_handles_and_fails_closed_on_timeout() {
+        let path = lock_test_dir("core-bounded-lock-exclusive").join("launch.lock");
+        let held = FileLock::acquire_bounded(&path, Duration::from_secs(5)).expect("first holder");
+        assert_eq!(held.path(), path.as_path());
+
+        // A second, independent file handle must contend on the OS lock rather
+        // than sail through, and must give up with an actionable error.
+        let started = Instant::now();
+        let error = FileLock::acquire_bounded(&path, Duration::from_millis(200))
+            .expect_err("a held lock must not be acquired twice");
+        assert!(
+            started.elapsed() >= Duration::from_millis(200),
+            "waiter returned before its deadline"
+        );
+        let message = format!("{error:#}");
+        assert!(message.contains("timed out"), "{message}");
+
+        drop(held);
+        FileLock::acquire_bounded(&path, Duration::from_secs(5))
+            .expect("lock is free once the guard is dropped");
+    }
+
+    #[test]
+    #[ignore = "spawned as a child process by bounded_file_lock_is_released_when_the_holder_process_exits"]
+    fn bounded_file_lock_child_holder() {
+        let Ok(path) = std::env::var(LOCK_CHILD_PATH_ENV) else {
+            return;
+        };
+        let ready = std::env::var(LOCK_CHILD_READY_ENV).expect("ready-file path");
+        let guard = FileLock::acquire_bounded(Path::new(&path), Duration::from_secs(10))
+            .expect("child acquires the shared lock");
+        fs::write(&ready, "held").expect("signal that the child holds the lock");
+        thread::sleep(Duration::from_millis(300));
+        // Leak the guard so the lock is released by process exit alone — that is
+        // the property a crashed launcher depends on.
+        std::mem::forget(guard);
+    }
+
+    #[test]
+    fn bounded_file_lock_is_released_when_the_holder_process_exits() {
+        let dir = lock_test_dir("core-bounded-lock-crossproc");
+        let path = dir.join("launch.lock");
+        let ready = dir.join("child-ready");
+        let mut child = spawn_helper_test(
+            "process::tests::bounded_file_lock_child_holder",
+            &[
+                (LOCK_CHILD_PATH_ENV, path.display().to_string()),
+                (LOCK_CHILD_READY_ENV, ready.display().to_string()),
+            ],
+        );
+
+        let deadline = Instant::now() + Duration::from_mins(1);
+        while !ready.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "child never reported holding the lock"
+            );
+            thread::sleep(Duration::from_millis(25));
+        }
+
+        let busy = FileLock::acquire_bounded(&path, Duration::from_millis(50))
+            .expect_err("the lock must be exclusive across processes");
+        assert!(format!("{busy:#}").contains("timed out"));
+
+        let status = child.wait().expect("child holder exits");
+        assert!(status.success(), "child holder failed: {status}");
+        FileLock::acquire_bounded(&path, Duration::from_secs(10))
+            .expect("the OS releases the lock when the holding process exits");
+    }
+
+    #[test]
+    fn loopback_lease_blocks_a_second_bind_until_released() {
+        let ephemeral = TcpListener::bind(("127.0.0.1", 0)).expect("ephemeral bind");
+        let port = ephemeral.local_addr().expect("local addr").port();
+        drop(ephemeral);
+
+        let lease = lease_loopback_port(port).expect("free port leases");
+        assert_eq!(lease.port(), port);
+        assert!(lease.is_held());
+        let conflict = lease_loopback_port(port).expect_err("a held port must not lease twice");
+        assert_eq!(conflict.kind(), std::io::ErrorKind::AddrInUse);
+
+        assert_eq!(lease.release(), port);
+        lease_loopback_port(port).expect("the port is bindable again after release");
+    }
+
+    #[test]
+    fn bind_error_labels_only_a_genuine_collision_as_in_use() {
+        let in_use = bind_error(
+            9000,
+            &std::io::Error::from(std::io::ErrorKind::AddrInUse),
+            "its port is in use",
+        );
+        assert_eq!(in_use.to_string(), "its port is in use");
+
+        let other = bind_error(
+            9000,
+            &std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+            "its port is in use",
+        );
+        assert_ne!(other.to_string(), "its port is in use");
+        assert!(other.to_string().contains("9000"));
+    }
+
+    #[test]
+    fn engine_owned_lease_holds_no_socket() {
+        // Custom hosts get a port carrier, never a loopback probe.
+        let lease = LoopbackPortLease::engine_owned(8000);
+        assert_eq!(lease.port(), 8000);
+        assert!(!lease.is_held());
+    }
+
+    #[test]
+    #[ignore = "spawned as a child process by released_loopback_lease_is_immediately_bindable_by_another_process"]
+    fn loopback_handoff_child() {
+        let Ok(port) = std::env::var(HANDOFF_PORT_ENV) else {
+            return;
+        };
+        let port: u16 = port.parse().expect("handoff port");
+        let lease = lease_loopback_port(port).expect("child binds the released port");
+        assert_eq!(lease.port(), port);
+    }
+
+    #[test]
+    fn released_loopback_lease_is_immediately_bindable_by_another_process() {
+        let ephemeral = TcpListener::bind(("127.0.0.1", 0)).expect("ephemeral bind");
+        let port = ephemeral.local_addr().expect("local addr").port();
+        drop(ephemeral);
+        let lease = lease_loopback_port(port).expect("parent leases the port");
+        assert_eq!(lease.release(), port);
+
+        let status = spawn_helper_test(
+            "process::tests::loopback_handoff_child",
+            &[(HANDOFF_PORT_ENV, port.to_string())],
+        )
+        .wait()
+        .expect("handoff child exits");
+        assert!(
+            status.success(),
+            "a separate process must bind the port immediately after the lease is released"
+        );
+    }
 
     #[test]
     fn file_lock_creates_missing_parent_dirs_and_lock_file() {

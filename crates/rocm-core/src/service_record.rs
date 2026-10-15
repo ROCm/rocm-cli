@@ -324,7 +324,14 @@ impl ManagedServiceRecord {
 
     /// Whether this record still reserves its port: the sole definition of
     /// "live" shared between the CLI's launch-time port check and `rocmd`'s
-    /// recovery, so the two can never disagree about who owns a port.
+    /// recovery. Same predicate, not same data: the CLI's `load_managed_services`
+    /// refreshes each record's PID/endpoint liveness before this runs, while
+    /// `rocmd::persistence::load_managed_services` reads the file as-is. A
+    /// record whose process has died since its last write can therefore still
+    /// read `is_live()` to `rocmd` after the CLI would have refreshed it to
+    /// `"stopped"`. That fails safe — recovery defers rather than racing a
+    /// collision — but it can stall on a stale record until something else
+    /// rewrites it.
     #[must_use]
     pub fn is_live(&self) -> bool {
         matches!(
@@ -334,8 +341,9 @@ impl ManagedServiceRecord {
     }
 
     /// Whether this live record reserves `port` — the sole collision check
-    /// shared by the CLI's restart re-check and `rocmd`'s recovery re-check, so
-    /// the two can never disagree about who owns a port.
+    /// shared by the CLI's restart re-check and `rocmd`'s recovery re-check.
+    /// See [`Self::is_live`]'s doc for the data-freshness gap between the two
+    /// callers.
     ///
     /// Deliberately host-blind: a `0.0.0.0` (or `localhost`) listener also
     /// blocks the loopback address a competing bind would target, so comparing

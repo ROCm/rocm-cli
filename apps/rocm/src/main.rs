@@ -4635,10 +4635,11 @@ fn apply_service_prune_plan(
 /// window — [`select_gpu_indices_under_launch_lock`] acquires it, hands the
 /// guard back to its caller, and `start_managed_service`/`run_attached_service`
 /// only drop it once the record is persisted (see that function's own comment,
-/// which this one must not drift from). The gap was simply that prune never
-/// acquired it: the helper above was the only acquirer in this binary (`rocmd`'s
-/// recovery path takes the same file lock too, bounded, from its own process —
-/// see `restart_managed_service`'s doc comment). Taking it
+/// which this one must not drift from). `restart_internal_managed_service_with`
+/// acquires the same lock around its own respawn, for the same reason. The gap
+/// was simply that prune never acquired it, while those two already did
+/// (`rocmd`'s recovery path takes the same file lock too, bounded, from its own
+/// process — see `restart_managed_service`'s doc comment). Taking it
 /// here closes the window deterministically, for any number of records, which no
 /// age floor can — the window is not short and is not bounded, because
 /// `spawn_managed_engine_child`'s idempotency guard runs `load_managed_services`
@@ -7289,14 +7290,13 @@ fn restart_internal_managed_service_with(
         );
     }
     let port_lease = if rocm_core::is_canonical_loopback_host(&stopped_record.host) {
-        Some(
-            rocm_core::lease_loopback_port(stopped_record.port).with_context(|| {
-                format!(
-                    "cannot restart `{service_id}` on {}:{}: its port is in use",
-                    stopped_record.host, stopped_record.port
-                )
-            })?,
-        )
+        Some(rocm_core::lease_loopback_port_or_bind_error(
+            stopped_record.port,
+            format_args!(
+                "cannot restart `{service_id}` on {}:{}: its port is in use",
+                stopped_record.host, stopped_record.port
+            ),
+        )?)
     } else {
         None
     };
