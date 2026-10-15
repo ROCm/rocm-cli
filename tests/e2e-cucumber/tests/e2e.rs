@@ -159,6 +159,12 @@ pub struct E2eWorld {
     /// it whatever the scenario's outcome, and so the stop's effect on it can
     /// be observed through the handle rather than by PID alone.
     pub recorded_process: Option<std::process::Child>,
+    /// The scripted-engine `service_id` a serve step captured from the CLI's
+    /// own printed output (ROCMAI-541 N5) — not by scanning the services dir
+    /// for "the newest record" after the fact, which a concurrent recovery
+    /// mechanism could make ambiguous. Set as soon as the id is known; read
+    /// by the later `Then` steps instead of re-deriving it.
+    pub scripted_service_id: Option<String>,
 }
 
 /// One scenario's resolved expectation plus the identity needed to report it.
@@ -311,6 +317,7 @@ impl Default for E2eWorld {
             skill_reference: None,
             skill_symptom: None,
             recorded_process: None,
+            scripted_service_id: None,
         }
     }
 }

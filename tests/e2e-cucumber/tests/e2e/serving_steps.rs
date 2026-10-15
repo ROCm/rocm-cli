@@ -1770,12 +1770,42 @@ fn latest_scripted_engine_record(world: &E2eWorld) -> serde_json::Value {
 /// (named by the record's own `engine_state_path` field).
 fn scripted_engine_record_and_state(world: &E2eWorld) -> (serde_json::Value, serde_json::Value) {
     let record = latest_scripted_engine_record(world);
+    record_and_state_from(record)
+}
+
+/// Like [`scripted_engine_record_and_state`], but reads the manifest by its
+/// known `service_id` (`<service_id>.json` — see `AppPaths::service_manifest_path`)
+/// rather than scanning the services dir for "the newest record" (ROCMAI-541
+/// N5): a concurrent recovery mechanism could otherwise make that ambiguous.
+fn scripted_engine_record_and_state_for(
+    world: &E2eWorld,
+    service_id: &str,
+) -> (serde_json::Value, serde_json::Value) {
+    let manifest_path = world.app_paths().service_manifest_path(service_id);
+    let record = read_json_file(&manifest_path);
+    record_and_state_from(record)
+}
+
+fn record_and_state_from(record: serde_json::Value) -> (serde_json::Value, serde_json::Value) {
     let engine_state_path = record
         .get("engine_state_path")
         .and_then(serde_json::Value::as_str)
         .unwrap_or_else(|| panic!("record has no engine_state_path: {record}"));
     let engine_state = read_json_file(std::path::Path::new(engine_state_path));
     (record, engine_state)
+}
+
+/// Extract the `service_id` the CLI printed for an attached managed launch
+/// (`println!("  service_id: {service_id}");` in `run_attached_service`) from
+/// its captured stdout (ROCMAI-541 N5). Deterministic and tied to this exact
+/// invocation, unlike scanning the services dir afterward for "the newest
+/// record".
+fn parse_service_id_from_output(output: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        line.trim_start()
+            .strip_prefix("service_id: ")
+            .map(str::to_owned)
+    })
 }
 
 /// Guard against a binary built without `rocm/e2e-test-hooks`: without that
@@ -1820,6 +1850,11 @@ async fn user_serves_expecting_scripted_crash(world: &mut E2eWorld) {
             "--verbose",
         ],
     );
+    // Captured from the CLI's own printed output (ROCMAI-541 N5) — right here,
+    // before any `Then` step would otherwise need to re-derive it by scanning
+    // the services dir for "the newest record", which a concurrent recovery
+    // mechanism could make ambiguous.
+    world.scripted_service_id = parse_service_id_from_output(&stdout);
     world.cli_output = Some(stdout);
     world.cli_stderr = Some(stderr);
     world.cli_rc = Some(rc);
@@ -1839,7 +1874,11 @@ async fn assert_scripted_crash_fails(world: &mut E2eWorld) {
 
 #[then("the service record and its engine state both read failed")]
 async fn assert_scripted_crash_marks_failed(world: &mut E2eWorld) {
-    let (record, engine_state) = scripted_engine_record_and_state(world);
+    let service_id = world
+        .scripted_service_id
+        .clone()
+        .expect("no scripted service_id captured from the serve's own output");
+    let (record, engine_state) = scripted_engine_record_and_state_for(world, &service_id);
     assert_eq!(record["status"], "failed", "manifest: {record}");
     assert_eq!(
         engine_state["status"], "failed",
@@ -1852,6 +1891,21 @@ async fn scripted_engine_armed_to_run(world: &mut E2eWorld) {
     world
         .command_env
         .push(("ROCM_E2E_SCRIPTED_ENGINE", "1".into()));
+}
+
+/// Kill `child` and collect its combined stdout+stderr, best-effort. Used to
+/// diagnose a hung wait before it falls through to a generic timeout panic
+/// (ROCMAI-541 N5).
+fn kill_and_collect_combined_output(mut child: std::process::Child) -> String {
+    let _ = child.kill();
+    match child.wait_with_output() {
+        Ok(output) => format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ),
+        Err(error) => format!("(failed to collect output after kill: {error})"),
+    }
 }
 
 #[when("the user attaches to the scripted serve in the background")]
@@ -1901,11 +1955,24 @@ async fn user_attaches_scripted_serve_in_background(world: &mut E2eWorld) {
         if is_running {
             break;
         }
-        assert!(
-            Instant::now() < deadline,
-            "the scripted engine's service record never reached `running` under {}",
-            dir.display()
-        );
+        if Instant::now() >= deadline {
+            // Diagnose before the generic timeout panic (ROCMAI-541 N5): a
+            // binary under test built without the `rocm/e2e-test-hooks`
+            // feature never reaches the scripted engine at all, so this loop
+            // would otherwise just spin for the full 30s and panic with a
+            // message that gives no hint why. Kill the attached process and
+            // check its own output for that specific cause first.
+            let child = world
+                .recorded_process
+                .take()
+                .expect("scenario recorded no attached serve process");
+            let output = kill_and_collect_combined_output(child);
+            assert_scripted_hook_was_reached(&output);
+            panic!(
+                "the scripted engine's service record never reached `running` under {}:\n{output}",
+                dir.display()
+            );
+        }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }

@@ -11509,6 +11509,15 @@ fn record_restarted_child(
 /// resolves it the same way: on the failure branch this marks both the
 /// manifest and the engine's own state file `failed` and fails loudly,
 /// mirroring the launch path's contract.
+///
+/// That failure branch is itself ambiguous one level further, exactly as on
+/// the launch path: the dead, not-yet-`Serving` child could be a crash, or it
+/// could be a `rocm services stop`/`rocm dash` stop landing during this
+/// restart's own readiness wait — see
+/// [`crate::service_launch::managed_service_stop_was_requested`]'s doc
+/// comment (ROCMAI-541 B1). That check is consulted first and, when it
+/// fires, this returns the record as it is on disk now — whatever the stop
+/// already recorded — rather than falling through to stamp `failed` over it.
 fn record_restart_readiness(
     paths: &AppPaths,
     started: &ManagedServiceRecord,
@@ -11516,6 +11525,10 @@ fn record_restart_readiness(
     mut child_is_alive: impl FnMut() -> bool,
 ) -> Result<ManagedServiceRecord> {
     if readiness != EndpointReadiness::Serving && !child_is_alive() {
+        if crate::service_launch::managed_service_stop_was_requested(paths, &started.service_id) {
+            return Ok(read_managed_service_manifest(paths, &started.service_id)
+                .map_or_else(|_| started.clone(), |(record, _)| record));
+        }
         let _ = update_restarting_record(paths, started, |current| {
             current.status = "failed".to_owned();
         })?;
@@ -24329,6 +24342,45 @@ install therock";
         assert!(message.contains("Model pulled successfully"), "{message}");
         assert_eq!(on_disk.status, "failed");
         assert_eq!(engine_state["status"], "failed");
+    }
+
+    /// ROCMAI-541 B1: a `rocm services stop`/`rocm dash` stop that lands
+    /// during a restart's own readiness wait must not be reported as a
+    /// crash — mirroring
+    /// `finalize_managed_launch_readiness_treats_a_requested_stop_as_clean`
+    /// on the fresh-launch path. Before this, only the attach path checked
+    /// `managed_service_stop_was_requested`; this decision point stamped
+    /// `failed` over a cleanly, intentionally stopped restart instead.
+    #[test]
+    fn restart_readiness_treats_a_requested_stop_as_clean_not_a_crash() {
+        let (root, paths) = test_paths("restart-readiness-requested-stop");
+        paths.ensure().unwrap();
+        let service_id = "svc-restart-readiness-requested-stop";
+        let stopped = stopped_restart_record(&paths, service_id);
+        let started = record_restarted_child(&paths, &stopped, None, std::process::id()).unwrap();
+
+        // Simulate a concurrent stop confirming the restarted child gone
+        // during the wait: it writes the marker and `status: "stopped"` to
+        // the manifest on disk directly, never through `started`.
+        let mut stopped_meanwhile = raw_manifest(&paths, service_id);
+        stopped_meanwhile.status = "stopped".to_owned();
+        stopped_meanwhile.stop_requested_unix_ms = Some(4_321);
+        stopped_meanwhile.write().unwrap();
+
+        let result =
+            record_restart_readiness(&paths, &started, EndpointReadiness::Unreachable, || false);
+
+        let on_disk = raw_manifest(&paths, service_id);
+        let _ = fs::remove_dir_all(root);
+
+        let returned = result.expect("a requested stop must not fail the restart");
+        assert_eq!(returned.status, "stopped");
+        assert_eq!(returned.stop_requested_unix_ms, Some(4_321));
+        assert_eq!(
+            on_disk.status, "stopped",
+            "the manifest must not be overwritten with `failed`"
+        );
+        assert_eq!(on_disk.stop_requested_unix_ms, Some(4_321));
     }
 
     #[test]

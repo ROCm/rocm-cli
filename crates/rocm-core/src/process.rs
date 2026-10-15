@@ -723,4 +723,46 @@ mod tests {
 
         let _ = fs::remove_dir_all(&dir);
     }
+
+    /// ROCMAI-541 N3: pins the core contract `ManagedChildLiveness` exists
+    /// for — a child that has exited must read as not-running, and a second
+    /// call after it has already been reaped must keep reading that way
+    /// rather than panicking or erroring (this type's whole reason to exist
+    /// is that a bare `process_is_running` pid probe gets this wrong for a
+    /// Unix zombie; see the type's doc comment). The Windows arm
+    /// (`ManagedChildLiveness::Windows`, backed by `process_is_running` over
+    /// `OpenProcess`/`GetExitCodeProcess`) is not exercised here: it cannot be
+    /// built on a non-Windows test target, and this repo's test environment
+    /// has no Windows runner to exercise it on.
+    #[cfg(not(windows))]
+    #[test]
+    fn managed_child_liveness_unix_reports_dead_after_exit_and_does_not_double_reap() {
+        use std::process::Command;
+        use std::time::{Duration, Instant};
+
+        let child = Command::new("true")
+            .spawn()
+            .expect("spawn a trivial, immediately-exiting child");
+        let mut liveness = ManagedChildLiveness::from_child(child);
+
+        // Poll rather than assume a fixed sleep always outraces the scheduler:
+        // `true` exits almost immediately, but the test only needs it to be
+        // gone by the time it checks, not instantly.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while liveness.is_running() {
+            assert!(
+                Instant::now() < deadline,
+                "child did not report dead within the timeout"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // The second call is the point of this test: reaping must not leave
+        // the type unable to answer again, or answering "running" once it no
+        // longer can reap a real exit status.
+        assert!(
+            !liveness.is_running(),
+            "a second call after reaping must still report dead, not panic or flip to `true`"
+        );
+    }
 }
