@@ -228,6 +228,12 @@ the ROCm SDK's bundled numa uses renamed symbol versions and cannot satisfy it, 
         );
     }
 
+    if !cfg!(windows)
+        && let Some(problem) = vllm_extension_import_problem(runtime)
+    {
+        bail!("{problem}");
+    }
+
     if let Some(parent) = request.state_path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
@@ -451,6 +457,93 @@ fn apply_therock_env_with(
         );
     }
     Ok(())
+}
+/// Imports vLLM's compiled extensions the way the server will, after torch.
+///
+/// `import torch` first: the extensions link against libtorch and fail to load
+/// without it, which would blame vLLM for a missing import order. A torch that
+/// does not import is a different failure with its own checks, so it reports
+/// nothing here instead of being charged to the extensions.
+const VLLM_EXTENSION_PROBE_SCRIPT: &str = r#"import importlib, json
+failures = []
+try:
+    import torch  # noqa: F401
+except Exception:
+    print(json.dumps({"failures": []}))
+    raise SystemExit(0)
+for name in ("vllm._C", "vllm._rocm_C"):
+    try:
+        importlib.import_module(name)
+    except Exception as error:
+        failures.append({"module": name, "error": str(error)[:400]})
+print(json.dumps({"failures": failures}))
+"#;
+/// How long the extension probe may run. Importing torch takes seconds; a hang
+/// must not stall `rocm engines list`.
+const VLLM_EXTENSION_PROBE_TIMEOUT: Duration = Duration::from_mins(1);
+
+/// Why vLLM's compiled extensions cannot be imported in `runtime`, or `None`
+/// when they import or the check could not run.
+///
+/// A wheel built against a different torch than the one beside it installs and
+/// reports a version, yet its `_C`/`_rocm_C` fail with undefined `c10::hip`
+/// symbols; the server then dies deep in engine start-up with an unrelated
+/// `AttributeError`. This surfaces the cause up front. Best-effort: any trouble
+/// running the probe yields `None`, never a false alarm.
+pub(crate) fn vllm_extension_import_problem(runtime: &VllmRuntime) -> Option<String> {
+    let python = runtime.python_executable.as_ref()?;
+    let mut command = ProcessCommand::new(python);
+    command
+        .arg("-c")
+        .arg(VLLM_EXTENSION_PROBE_SCRIPT)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    apply_therock_env(&mut command, runtime).ok()?;
+    let mut child = command.spawn().ok()?;
+    let deadline = Instant::now() + VLLM_EXTENSION_PROBE_TIMEOUT;
+    loop {
+        match child.try_wait().ok()? {
+            Some(status) if status.success() => break,
+            Some(_) => return None,
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            None => std::thread::sleep(Duration::from_millis(50)),
+        }
+    }
+    let mut stdout = String::new();
+    std::io::Read::read_to_string(&mut child.stdout.take()?, &mut stdout).ok()?;
+    extension_import_problem_from_probe(&stdout, runtime)
+}
+
+/// Reads the probe's JSON into the guidance a user can act on.
+fn extension_import_problem_from_probe(output: &str, runtime: &VllmRuntime) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(output.trim()).ok()?;
+    let failures = value.get("failures")?.as_array()?;
+    if failures.is_empty() {
+        return None;
+    }
+    let details = failures
+        .iter()
+        .filter_map(|failure| {
+            Some(format!(
+                "{}: {}",
+                failure.get("module")?.as_str()?,
+                failure.get("error")?.as_str()?
+            ))
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    Some(format!(
+        "vLLM is installed in runtime `{}` but its compiled extensions do not import ({details}). \
+This usually means the vLLM wheel was built against a different torch than the one in this \
+runtime, so serving would fail during engine start-up. Install a vLLM build that matches the \
+runtime's torch (for example from source against it), or switch to a runtime vLLM supports.",
+        runtime.runtime_id
+    ))
 }
 /// The venv root a runtime's vLLM lives in, derived from its own python
 /// executable (`<venv>/bin/python` → `<venv>`) rather than the TheRock SDK
@@ -1743,6 +1836,55 @@ WARNING Failed to import from vllm._C with ImportError('libtorch_cuda.so: cannot
             .flatten();
         assert_eq!(target_device, Some(std::ffi::OsStr::new("rocm")));
         Ok(())
+    }
+    #[test]
+    fn extension_probe_with_no_failures_reports_no_problem() {
+        let runtime = test_vllm_runtime(None, None);
+        assert_eq!(
+            extension_import_problem_from_probe(r#"{"failures": []}"#, &runtime),
+            None
+        );
+        assert_eq!(
+            extension_import_problem_from_probe("not json", &runtime),
+            None
+        );
+    }
+    #[test]
+    fn extension_probe_failures_name_the_module_symbol_and_runtime() {
+        let runtime = test_vllm_runtime(None, None);
+        let problem = extension_import_problem_from_probe(
+            r#"{"failures": [{"module": "vllm._C", "error": "undefined symbol: _ZN3c103hip19getCurrentHIPStreamEa"}]}"#,
+            &runtime,
+        )
+        .expect("a failing extension is a problem");
+        assert!(problem.contains("vllm._C"), "{problem}");
+        assert!(problem.contains("getCurrentHIPStreamEa"), "{problem}");
+        assert!(problem.contains("`test`"), "{problem}");
+        assert!(problem.contains("different torch"), "{problem}");
+    }
+    #[cfg(unix)]
+    #[test]
+    fn extension_check_runs_the_probe_with_the_runtimes_python() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir()?;
+        let python = dir.path().join("python");
+        // Stands in for the interpreter: ignores `-c <script>` and prints a failing probe.
+        fs::write(
+            &python,
+            "#!/bin/sh\necho '{\"failures\": [{\"module\": \"vllm._rocm_C\", \"error\": \"undefined symbol: x\"}]}'\n",
+        )?;
+        fs::set_permissions(&python, fs::Permissions::from_mode(0o755))?;
+        let runtime = test_vllm_runtime(Some(python), None);
+        let problem = vllm_extension_import_problem(&runtime).expect("the probe failure surfaces");
+        assert!(problem.contains("vllm._rocm_C"), "{problem}");
+        Ok(())
+    }
+    #[test]
+    fn extension_check_is_silent_without_a_python_executable() {
+        assert_eq!(
+            vllm_extension_import_problem(&test_vllm_runtime(None, None)),
+            None
+        );
     }
     #[test]
     fn stop_scope_includes_vllm_workers() {
