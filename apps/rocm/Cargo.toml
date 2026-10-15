@@ -54,6 +54,7 @@ ureq = { version = "2.12", features = ["native-certs"] }
 libc.workspace = true
 
 [target.'cfg(windows)'.dependencies]
+self-replace = "1.5"
 windows-native-keyring-store = "1.1"
 
 [target.'cfg(target_os = "macos")'.dependencies]

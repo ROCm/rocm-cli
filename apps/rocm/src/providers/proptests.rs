@@ -40,7 +40,11 @@ fn collect_events(
 
 /// The events the emitter produces for `body` delivered in one piece.
 fn events_for_whole_body(body: &[u8]) -> Vec<ProviderStreamEvent> {
-    collect_events(|emitter| emitter.push_bytes(body)).expect("fixture stream parses and finishes")
+    collect_events(|emitter| {
+        emitter.push_bytes(body).expect("fixture lines parse");
+        Ok(())
+    })
+    .expect("fixture stream finishes")
 }
 
 /// Split `bytes` at the given (unsorted, possibly duplicated) offsets.
