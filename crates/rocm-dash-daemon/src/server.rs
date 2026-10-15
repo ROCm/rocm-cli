@@ -224,6 +224,23 @@ async fn run_unix(_path: PathBuf, _opts: RunnerOptions) -> anyhow::Result<()> {
     ))
 }
 
+/// Logged when a client sends `Pause` or `Resume`, which the daemon accepts
+/// but the runner does not act on yet.
+///
+/// ROCMAI-543: this is not TTY output, but it is not exempt either. It is
+/// routed by `apps/rocm/src/logging.rs` (`rocm_dash_daemon=info`) into the
+/// daily-rotated client log file, a plain UTF-8 writer that -- unlike the
+/// spinner ellipses this sweep deliberately leaves alone -- is never gated on
+/// `is_terminal()`. A Windows reader assuming the OEM code page would render a
+/// UTF-8 em dash here as mojibake, which is exactly the reported bug.
+///
+/// Lifted out of [`handle_client`] so the wording is reachable from a test:
+/// the branch that emits it sits inside a `select!` loop that a unit test
+/// cannot drive without a live socket peer and a runner. This mirrors the
+/// split already used for [`unsecurable_socket_dir_context`].
+#[cfg(unix)]
+const PAUSE_RESUME_UNSUPPORTED: &str = "pause/resume - runner does not honor yet";
+
 #[cfg(unix)]
 async fn handle_client(
     stream: tokio::net::UnixStream,
@@ -284,7 +301,7 @@ async fn handle_client(
                         // The runner pushes snapshots regularly; nothing to do here yet.
                     }
                     Command::Pause | Command::Resume => {
-                        info!(?cmd, "pause/resume — runner does not honor yet");
+                        info!(?cmd, "{PAUSE_RESUME_UNSUPPORTED}");
                     }
                     Command::Goodbye => {
                         let _ = write_line(&mut wr, &Event::Bye).await;
@@ -329,7 +346,27 @@ mod tests {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::path::Path;
 
-    use super::{is_safe_shared_dir, prepare_socket_dir, unsecurable_socket_dir_context};
+    use super::{
+        PAUSE_RESUME_UNSUPPORTED, is_safe_shared_dir, prepare_socket_dir,
+        unsecurable_socket_dir_context,
+    };
+
+    /// ROCMAI-543: the pause/resume notice is written to the daily-rotated
+    /// client log file, which is a plain UTF-8 writer and is never gated on
+    /// `is_terminal()`, so the TTY-only exemption this sweep grants the spinner
+    /// does not apply to it. Pin both the ASCII property and the exact wording.
+    #[test]
+    fn the_pause_resume_notice_is_ascii() {
+        assert!(
+            PAUSE_RESUME_UNSUPPORTED.is_ascii(),
+            "the pause/resume log notice must be ASCII-only (ROCMAI-543): \
+             {PAUSE_RESUME_UNSUPPORTED}"
+        );
+        assert_eq!(
+            PAUSE_RESUME_UNSUPPORTED, "pause/resume - runner does not honor yet",
+            "the pause/resume log notice changed; keep it ASCII (ROCMAI-543)"
+        );
+    }
 
     /// ROCMAI-543: the refusal is an error the CLI prints on a redirectable
     /// stream, so it must be plain ASCII -- a Windows console on the OEM code
