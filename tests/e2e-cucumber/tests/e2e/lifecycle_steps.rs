@@ -337,7 +337,14 @@ pub(crate) fn stage_user_path_for_test(world: &mut crate::E2eWorld, value: &str)
     );
 }
 
+/// Off Windows there is no User-scope PATH to stage, and the only caller's
+/// scenario is `@requires-os:windows` so it resolves to skip; the stub exists
+/// purely so `diagnose_steps` compiles on every platform.
 #[cfg(not(windows))]
+// Platform stub. The `cfg` sibling calls non-const code, so making only this
+// arm `const` would give the two platforms different signatures and push
+// `missing_const_for_fn` onto every caller in turn.
+#[allow(clippy::missing_const_for_fn)]
 pub(crate) fn stage_user_path_for_test(world: &mut crate::E2eWorld, _value: &str) {
     let _ = world;
 }
@@ -350,7 +357,13 @@ pub(crate) fn read_user_path_for_test() -> String {
     capture_user_path()
 }
 
+/// Off Windows there is no User-scope PATH to read back; see
+/// [`stage_user_path_for_test`]'s stub for why this arm exists at all.
 #[cfg(not(windows))]
+// Platform stub. The `cfg` sibling calls non-const code, so making only this
+// arm `const` would give the two platforms different signatures and push
+// `missing_const_for_fn` onto every caller in turn.
+#[allow(clippy::missing_const_for_fn)]
 pub(crate) fn read_user_path_for_test() -> String {
     String::new()
 }
