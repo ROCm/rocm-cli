@@ -132,8 +132,8 @@ const fn gpu_reachable_for_preflight(is_wsl_host: bool, has_usable_gpu: bool) ->
 /// interactive `rocm chat` (including the launcher's routes into them; a
 /// non-interactive `rocm chat` renders text and never enters `run_async`), not
 /// for a focused overlay or `rocm dash --replay`/`--demo`. All of this is
-/// unix-only: on Windows `maybe_spawn_embedded_daemon` never calls
-/// `runner_options`, so no entry point reaches the warning. On the paths that
+/// unix-only: on Windows [`maybe_spawn_embedded_daemon`] never calls
+/// [`runner_options`], so no entry point reaches the warning. On the paths that
 /// do reach it, the process is about to hand the terminal to the TUI, and the
 /// client log is file-only (see `logging.rs`), so a stray stdout/stderr write
 /// would corrupt the display.

@@ -45,11 +45,12 @@ Feature: Model serving
     And the response identifies the correct model
 
   # Large-model coverage (dogfooding W9): serve a representative large model for
-  # each GPU platform end-to-end at least once. MI300X uses Qwen/Qwen3.6-27B through
-  # vLLM; Strix Halo uses the hardware-verified
-  # unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_XL checkpoint through Lemonade. These slow
-  # loads stay off the ordinary per-PR path, and the longer readiness timeout also
-  # gives the first inference request enough time to complete.
+  # each GPU platform end-to-end at least once. The model follows the lane's serve
+  # engine: the vLLM lanes (MI300X, MI350P) use Qwen/Qwen3.6-27B; the Lemonade lanes
+  # (Strix Halo, R9700, W7900) use the unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_XL
+  # checkpoint, hardware-verified on Strix Halo. These slow loads stay off the
+  # ordinary per-PR path, and the longer readiness timeout also gives the first
+  # inference request enough time to complete.
   @id:serve-large-model-inference @requires-gpu @serve-timeout:2400 @nightly
   Scenario: serve-06 - A large platform-specific model serves and responds to inference
     Given a managed runtime is active

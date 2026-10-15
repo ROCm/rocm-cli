@@ -36,6 +36,7 @@ pub mod report_delivery;
 pub mod rocm_install;
 pub mod runtime;
 pub mod terminal;
+pub mod user_path;
 
 #[cfg(test)]
 mod test_env;

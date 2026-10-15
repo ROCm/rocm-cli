@@ -1281,8 +1281,35 @@ that is then installed as root, and this replaces the self-test that shipped
 with the removed `scripts/wsl_setup_rocdxg.sh`. It needs a POSIX shell and
 `sha256sum`, so it is Unix-only.
 
+The eight native Linux GPU preflights are one script,
+[`gpu-preflight.sh`](../.github/scripts/gpu-preflight.sh), which each lane runs
+with its own `GPU_PREFLIGHT_MIN_FREE_GIB` (16 on the discrete lanes, 8 on
+Strix). It applies two gates, because neither sees what the other does: a
+bounded wait on free memory, and then `reclaim-gpu.sh --assert-clear`. The
+memory floor is a fixed number of GiB against whatever pool `rocm-smi` reports,
+so its sensitivity is set by the pool's size rather than by what a serve holds —
+against a ~62 GiB Strix GTT aperture it trips only past ~54 GiB held, and
+against a 192 GiB MI300X only past ~176 GiB, so a leftover `llama-server`
+holding 10–20 GiB clears every lane. The process assertion catches that by
+name. Every external call the script makes is bounded by `timeout 15`, the
+`--assert-clear` scan included: that scan reads `/proc/<pid>/cmdline` for every
+process, and a holder wedged in uninterruptible sleep — the state this gate
+fires on — can block the read. A scan that does not finish **fails** the
+preflight, with its own message, rather than being taken as a clear host; so
+does a scan that could not be run at all — a missing script, a flag the two
+scripts disagree about — which gets a third message rather than being reported
+as a surviving process nobody can then find. The
+floor is kept rather than replaced because the converse is just as
+real and the process check cannot see it: a non-E2E tenant on a shared host can
+exhaust the pool while running nothing the reclaim rules match. The two
+Windows-native blocks remain PowerShell copies with the memory floor only; the
+two WSL blocks remain advisory, warning where these fail.
+
 `reclaim-gpu.sh` frees the GPU from engine processes a killed prior run leaked.
-The self-hosted Linux GPU lanes run it before their GPU preflight; the two
+The self-hosted Linux GPU lanes run it before their GPU preflight, and again
+with `--assert-clear` from inside the preflight once the memory floor is
+satisfied — that mode kills nothing, exits non-zero naming any leaked process
+still running, and reuses the same selection the reclaim itself acts on. The two
 native Windows lanes have no bash and restate the rule in PowerShell instead,
 with their root list pinned to the script's by an `xtask` contract test. The
 WSL lanes skip the proactive reclaim before preflight — they provision a fresh
@@ -1347,7 +1374,14 @@ generated public-key PEM installer verification; verify first-install PATH setup
 Linux writes the shell profile); reinstall stale-manifest purge and config
 preservation; a Windows loopback-HTTP install; isolated installed-binary
 directory smoke checks (`rocm examine` must read only the isolated
-config/data/cache, never the real user `.rocm` state); and full-purge uninstall.
+config/data/cache, never the real user `.rocm` state); and uninstall: a full
+purge that also restores the shell profile, the Windows user `PATH` taken back
+off with its other entries and its registry type kept, the `PATH` change kept while another program shares the install folder or
+with `--keep-binaries`, a `PATH` change that cannot be undone removing nothing
+so it can be retried, a profile and install-folder spelling found only through
+the installer's record, and the running Windows `rocm.exe` removed. The two
+Windows scenarios that change the user `PATH` are `@serial`, since it is one
+registry value for the whole machine.
 Each scenario generates its own local keys, package, and install root under a
 per-scenario temp directory, so they are independent and use generated local
 keys only — project-owned production signing keys remain an owner-controlled
@@ -1624,6 +1658,34 @@ RUSTC_WRAPPER= cargo xtask e2e -- -n 'examine-2[0-3] '
 
 The install plans deliberately read the real file, so no scenario plants one
 for them; their parsing is covered by the unit tests above.
+
+## Windows Runtime Preflight
+
+On Windows, `rocm diagnose` compares the Visual C++ runtime in `System32`
+with the floor programs built with a recent toolset need, 14.40. The version
+comes from the file version of `msvcp140.dll` and `vcruntime140.dll`, and
+shows in `rocm examine --json` as `msvc_redist_version` (the older of the two,
+empty when neither could be read).
+
+```powershell
+rocm examine --json | ConvertFrom-Json | Select-Object msvc_redist_version
+rocm diagnose
+rocm fix fix-21-msvc-redist-outdated
+```
+
+On a machine whose runtime is older than 14.40, `diagnose` reports
+`fix-21-msvc-redist-outdated` with no symptom text. `rocm fix` prints the plan
+and runs nothing: the update needs the Windows administrator prompt. After the
+update, the plan's verify command prints the new version.
+
+The version comparison and the symptom keywords are covered by unit tests in
+`diagnose.rs`. No end-to-end scenario drives this check, because the e2e suite
+cannot give a Linux host a Windows runtime: the check is gated to Windows. The
+catalog scenarios (`diagnose-12`, `diagnose-34`) and the reference-doc
+scenarios (`skill-catalog-ids-match-cli` and its neighbours) do list and
+compare the new entry on every lane. A
+scenario that runs the check itself would need the Windows lane and a host
+with an old runtime installed.
 
 ## Model Fit Preflight
 
