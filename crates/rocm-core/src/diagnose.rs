@@ -3353,6 +3353,51 @@ mod tests {
         }
     }
 
+    /// A pasted HIP-loading error still opens fix-13 when no AMD GPU was
+    /// detected at all — deliberately, and this is the test that says so.
+    ///
+    /// `symptom_names_hip_loading` is the one of `needs_hip`'s three disjuncts
+    /// not gated on `e.has_amd_gpu`, and the asymmetry is the point. The other
+    /// two read a *probe* ("PyTorch here is a HIP build"), which is only
+    /// meaningful beside a GPU. This one reads a *fact the user supplied*: a
+    /// process on this machine tried to load HIP and failed. A GPU probe
+    /// answering "nothing detected" is itself one of the things a broken HIP
+    /// install causes, so letting it veto the user's own error would silence
+    /// the entry on the hosts most likely to need it — a headless box whose
+    /// driver did not load, or a WSL guest where the probe sees no card.
+    /// Installing the HIP SDK is the right next step either way; if there
+    /// genuinely is no AMD GPU, fix-13 ranks beside the other causes rather
+    /// than suppressing them.
+    #[test]
+    fn fix_13_still_answers_a_pasted_hip_error_when_no_amd_gpu_was_detected() {
+        let no_gpu = Examination {
+            os_family: "windows".to_owned(),
+            // The probe found nothing: no `has_amd_gpu`, no `gpus` entries.
+            ..Examination::default()
+        };
+        let finding = check_13_hip_sdk_missing(&no_gpu, "amdhip64.dll was not found");
+        assert_eq!(
+            finding.score, 85,
+            "the same score as the host with a detected GPU: the pasted error is the \
+             evidence, and an absent-GPU probe does not weaken it: {finding:?}"
+        );
+        assert!(
+            finding
+                .evidence
+                .iter()
+                .any(|ev| ev.contains("No HIP SDK install found")),
+            "and the SDK's absence is still named as the thing to put right: {finding:?}"
+        );
+        // Nothing here is an unsupported-GPU host, so the entry that outranks
+        // fix-13 on the ticket's laptop must stay silent rather than firing on
+        // a machine whose hardware was never identified.
+        assert_eq!(
+            check_20_gpu_unsupported_by_rocm(&no_gpu, "").score,
+            0,
+            "an undetected GPU is not a confirmed-unsupported one"
+        );
+    }
+
     /// The gate still holds on the host it was built for: a pasted error that
     /// says nothing about HIP opens nothing.
     ///
@@ -3516,7 +3561,8 @@ mod tests {
         // An AMD GPU with an empty gfx target is undetected, not supported.
         // Claiming the host has no ROCm support while a card we could not
         // identify is in it would turn a detection gap into a false claim --
-        // the same trap GFX_TARGETS_WITHOUT_ROCM_SUPPORT's doc comment avoids.
+        // the same trap `host_gpu::gfx_target_has_no_rocm_build`'s doc comment
+        // avoids.
         let e = Examination {
             has_amd_gpu: true,
             gpus: vec![
@@ -3668,8 +3714,8 @@ mod tests {
             "the evidence must still render:\n{out}"
         );
         // Not rendered from the checker's own `class` -- `check_20` returns the
-        // `Fix::default()` PRINT-ONLY until `attach_catalog_classes` fills it
-        // from the catalog, which is what the full `diagnose()` path does and
+        // `Fix::default()` PRINT-ONLY until `take_applicability_from_the_catalog`
+        // fills it from the catalog, which is what the full `diagnose()` path does and
         // what `fix_13_does_not_fire_on_a_lemonade_vulkan_host_with_no_hip_evidence`
         // asserts. This one pins the lines that do not depend on it.
         assert!(
@@ -6283,13 +6329,22 @@ mod tests {
 
     #[test]
     fn diagnosis_remediation_matches_the_fix_catalog_for_shared_fix_ids() {
-        // fix-15, fix-16 and fix-21 live in two places: the `rocm fix` catalog
-        // (crate::fix::RECIPES) and the Fix these checks embed in a Diagnosis.
-        // The prose *framing* legitimately differs by surface (a catalog
-        // rationale vs a diagnosis summary), but the actionable remediation must
-        // not silently diverge -- the verify command, the notes, and the
-        // executable command lines have to agree. This is the guard that they
-        // do; it caught a two-vs-three-space `verify` and a reworded note.
+        // fix-15, fix-16, fix-21 and info-20 live in two places: the `rocm fix`
+        // catalog (crate::fix::RECIPES) and the Fix these checks embed in a
+        // Diagnosis. The prose *framing* legitimately differs by surface (a
+        // catalog rationale vs a diagnosis summary), but the actionable
+        // remediation must not silently diverge -- the verify command, the
+        // notes, and the executable command lines have to agree. This is the
+        // guard that they do; it caught a two-vs-three-space `verify` and a
+        // reworded note.
+        //
+        // info-20 is the same dual-representation shape even though it has
+        // nothing to run: its notes are the whole of its remedy (that
+        // HSA_OVERRIDE_GFX_VERSION is not a workaround, and that `rocm serve`
+        // already picks Vulkan), so the two copies drifting would leave one
+        // surface giving advice the other contradicts. Its empty `commands` and
+        // `verify` have to stay agreed on too, since a command appearing on one
+        // side only is how a DIAGNOSE-ONLY entry silently stops being one.
         let vllm_oom = check_16_vllm_oom(
             &Examination {
                 os_family: "linux".to_owned(),
@@ -6313,7 +6368,18 @@ mod tests {
             },
             "",
         );
-        for diag in [vllm_oom, msvc, msvc_outdated] {
+        let unsupported_gpu = check_20_gpu_unsupported_by_rocm(
+            &Examination {
+                gpus: vec![Gpu {
+                    gfx_target: "gfx90c".to_owned(),
+                    is_amd: true,
+                    ..Gpu::default()
+                }],
+                ..Examination::default()
+            },
+            "",
+        );
+        for diag in [vllm_oom, msvc, msvc_outdated, unsupported_gpu] {
             assert!(
                 diag.score >= MIN_SCORE_FOR_MATCH,
                 "test setup must yield a real match for {}",

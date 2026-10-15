@@ -48,10 +48,11 @@ struct Remediation {
     /// mismatch instead of being quietly translated into agreement.
     os_scope: String,
     /// The marker word this id carries: `AUTO`, `NEEDS-ARG`, `PRINT-ONLY`, or
-    /// `DIAGNOSE-ONLY` (no catalog entry uses the last one yet, but it is
-    /// recognised rather than silently dropped -- an unrecognised marker drops
-    /// its row from the map, which previously made `NEEDS-ARG` vanish fix-9
-    /// entirely instead of failing on the mismatched marker).
+    /// `DIAGNOSE-ONLY` (`info-20-gpu-no-rocm-support` is the only entry using
+    /// the last one today). Every one is recognised rather than silently
+    /// dropped -- an unrecognised marker drops its row from the map, which
+    /// previously made `NEEDS-ARG` vanish fix-9 entirely instead of failing on
+    /// the mismatched marker.
     marker: String,
     /// A platform whose marker differs from [`Remediation::marker`], and what
     /// it is there. `rocm fix`'s listing reports the marker for the machine it

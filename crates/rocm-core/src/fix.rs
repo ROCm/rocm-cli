@@ -908,7 +908,7 @@ const RECIPES: &[FixRecipe] = &[
     FixRecipe {
         fix_id: "info-20-gpu-no-rocm-support",
         title: "GPU has no ROCm/HIP support (Vulkan backend still works)",
-        rationale: "This machine's only AMD GPU is a part ROCm has never shipped a runtime build for -- not one that is merely undetected. No ROCm or HIP install, driver version or environment variable changes that, so there is nothing to apply. Vulkan-based engines, which is what Lemonade runs by default, do not use ROCm and work on it.",
+        rationale: "Every AMD GPU on this machine is a part ROCm has never shipped a runtime build for -- not one that is merely undetected. No ROCm or HIP install, driver version or environment variable changes that, so there is nothing to apply. Vulkan-based engines, which is what Lemonade runs by default, do not use ROCm and work on it.",
         commands: &[],
         needs_sudo: false,
         needs_reboot: false,
@@ -1448,9 +1448,11 @@ fn plan_of(recipe: &FixRecipe) -> Plan {
 /// Everything `apply` does once the id has resolved to a recipe.
 ///
 /// Split out from [`apply`] so the class gate can be reached with a recipe the
-/// catalog does not contain. [`FixClass::DiagnoseOnly`] has no member today, so
-/// without this seam its branch is unreachable from any test and would sit
-/// unexercised until the first unfixable problem turns up.
+/// catalog does not contain, which keeps every class's branch reachable from a
+/// test however few entries the catalog happens to carry for it.
+/// [`FixClass::DiagnoseOnly`] had no member at all until
+/// `info-20-gpu-no-rocm-support`, the first; the seam is what exercised its
+/// branch before that, and still covers any class the catalog later empties.
 #[must_use]
 fn act_on(recipe: &FixRecipe, opts: &FixOptions) -> i32 {
     print_recipe(recipe);
@@ -2340,9 +2342,11 @@ mod tests {
     ///
     /// The distinction this pins is 0 against 3. Exit 3 is "not applicable on
     /// this machine", which would send a caller looking for a different machine
-    /// to run the fix on; there is no such machine, because there is no fix. The
-    /// catalog has no `DIAGNOSE-ONLY` entry yet, so nothing else in the suite
-    /// reaches this branch.
+    /// to run the fix on; there is no such machine, because there is no fix.
+    /// Driven through the synthetic recipe rather than through
+    /// `info-20-gpu-no-rocm-support`, the catalog's one `DIAGNOSE-ONLY` entry,
+    /// so the exit code stays pinned to the class and not to whichever entries
+    /// happen to carry it.
     #[test]
     fn a_problem_with_no_reliable_fix_reports_success_and_does_not_look_portable() {
         let opts = FixOptions::default();

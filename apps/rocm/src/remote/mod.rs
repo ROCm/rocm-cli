@@ -580,8 +580,9 @@ fn unwind_partial_serve(
 
 /// One item per line, bulleted. Shared rather than reimplemented per call
 /// site, so a third copy never has to decide independently whether to match
-/// this formatting.
-pub(crate) fn bullets(items: &[String]) -> String {
+/// this formatting. Private: the only other caller is `remote::install`, a
+/// child module, which sees a plain-private item without any added visibility.
+fn bullets(items: &[String]) -> String {
     items
         .iter()
         .map(|item| format!("  - {item}"))

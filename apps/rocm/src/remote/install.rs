@@ -399,6 +399,22 @@ mod tests {
                 without_a_fix: vec![],
             })
         );
+
+        // The aside is conditional, and nothing else pins the empty case: a
+        // guard that always took the non-empty branch would print the "Also
+        // reported, with no fix to apply" header with nothing under it, telling
+        // a reader this machine has an unfixable problem it does not have.
+        let message = describe_refusal(
+            &assess(&report, true).expect("refused"),
+            "gpu-box",
+            &report,
+            5,
+        );
+        assert!(
+            !message.contains("with no fix to apply"),
+            "every finding here is actionable, so the fixless aside must not appear \
+             at all -- an empty one is a dangling header: {message}"
+        );
     }
 
     /// A machine whose only finding has no fix is refused, and told so in words
@@ -512,6 +528,27 @@ mod tests {
         assert_eq!(
             assess(&report_with(vec![]), false),
             Some(Refusal::NeedsPasswordlessSudo)
+        );
+    }
+
+    #[test]
+    fn a_fixless_finding_outranks_a_sudo_problem() {
+        // Same reasoning as the other two refusal variants, and the one this
+        // change introduces: sorting out passwordless sudo would not make this
+        // machine installable, because the catalog has nothing to install for
+        // its GPU either way. Leading with sudo would send someone to configure
+        // it and then meet this refusal anyway.
+        let report = report_with(vec![finding_without_a_fix(
+            "GPU has no ROCm/HIP support (Vulkan backend still works)",
+            60,
+        )]);
+        assert!(
+            matches!(
+                assess(&report, false),
+                Some(Refusal::NothingToInstall { .. })
+            ),
+            "a machine with nothing to install is not a sudo problem: {:?}",
+            assess(&report, false)
         );
     }
 

@@ -2554,10 +2554,29 @@ async fn assert_unsupported_gpu_has_no_fix(world: &mut E2eWorld) {
 
 #[then("no cause tells this user to install the HIP SDK")]
 async fn assert_no_hip_sdk_advice(world: &mut E2eWorld) {
-    // The regression this change exists for. `fix-13-hip-sdk-missing` is
-    // Windows-only, so on this Linux lane the general form is the one worth
-    // pinning: nothing on a host with no HIP-based setup may propose an SDK
-    // install as the way forward.
+    // DELIBERATELY WEAKER THAN ITS NAME SUGGESTS, and a reader should know
+    // which half of the change it covers.
+    //
+    // `check_13_hip_sdk_missing` opens with `if e.os_family != "windows" {
+    // return zero(..) }`, which predates this change. On a Linux lane that
+    // early return alone makes this assertion hold, so it would still pass with
+    // `check_20` deleted. What it is worth is the general form: a guard that
+    // nothing *else* ever starts proposing an SDK install on a Vulkan-only
+    // host, and that the Windows gate above is not removed without a
+    // replacement. It is not proof of the Windows regression.
+    //
+    // That regression has no end-to-end coverage, and cannot have any today.
+    // The host-simulation seam (`rocm_core::hardware_root`, via
+    // `ROCM_CLI_TEST_HOST_ROOT`) re-roots Linux sysfs/procfs/device paths only;
+    // the Windows GPU probe shells out to `Win32_VideoController` and has no
+    // seam, so a Windows-shaped gfx90c host cannot be planted at all. The
+    // Windows lane that runs per PR is restricted to `@lifecycle` scenarios by
+    // `E2E_ONLY_LIFECYCLE=1`, and the self-hosted Windows lanes run on real
+    // Strix Halo (gfx1151, supported), where `check_20` correctly stays silent.
+    // The stated substitute is the unit test
+    // `fix_13_does_not_fire_on_a_lemonade_vulkan_host_with_no_hip_evidence` in
+    // `rocm-core::diagnose`, which drives the whole `diagnose()` pipeline on
+    // the ticket's exact Windows/gfx90c host shape.
     let output = world.cli_output.as_ref().expect("no diagnose output");
     assert!(
         !output.contains("fix-13-hip-sdk-missing"),

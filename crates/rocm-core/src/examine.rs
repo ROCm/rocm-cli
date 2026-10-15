@@ -5612,11 +5612,32 @@ mod tests {
         // asked at all when the PNP id already resolved a target -- the name
         // match is wasted work in that case, and if it ever disagreed with the
         // id, the id must still win (it names the ASIC, not the brand).
-        let out = "AMD Radeon(TM) 8060S Graphics\t32.0.12033.1030\tPCI\\VEN_1002&DEV_1586&SUBSYS_00000000&REV_C1\\3&11583659&0&08";
+        //
+        // The two inputs are made to DISAGREE on purpose, and that disagreement
+        // is the whole point: PNP id `73a0` is Navi 21 (gfx1030, discrete),
+        // while the name "AMD Radeon(TM) 8060S Graphics" is one of the handful
+        // `classify_amd_marketing_name` answers for, as gfx1151 and an APU. No
+        // such part ships -- which is exactly why it is the input. A pair the
+        // two paths agree about passes with the PNP lookup deleted, silently
+        // re-testing the marketing fallback that `marketing_name_maps_strix_halo`
+        // already covers for this same string; only a pair that cannot both be
+        // right pins *precedence* rather than *agreement*. Both halves of the
+        // answer are asserted because the two paths disagree about `is_apu` as
+        // well as about the target.
+        let out = "AMD Radeon(TM) 8060S Graphics\t32.0.12033.1030\tPCI\\VEN_1002&DEV_73A0&SUBSYS_00000000&REV_C1\\3&11583659&0&08";
         let mut e = Examination::default();
         parse_gpus_windows_output(out, &mut e);
         assert_eq!(e.gpus.len(), 1, "{:?}", e.gpus);
-        assert_eq!(e.gpus[0].gfx_target, "gfx1151", "{:?}", e.gpus[0]);
+        let gpu = &e.gpus[0];
+        assert_eq!(
+            gpu.gfx_target, "gfx1030",
+            "the PNP id names the ASIC and has to win over the brand name: {gpu:?}"
+        );
+        assert_eq!(
+            gpu.is_apu,
+            Some(false),
+            "`is_apu` has to follow the id's target too, not the name heuristic: {gpu:?}"
+        );
     }
 
     /// Every target `host_gpu`'s PNP table can return has to be classified by
