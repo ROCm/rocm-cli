@@ -7,10 +7,12 @@
 //! `DeterministicModelRecipe`, `DeterministicServiceRow`,
 //! `DeterministicEngineRow`) and its leaf helpers — tool-call argument
 //! normalization and display labels, deterministic tool-output parsing, and
-//! the MCP-result/loopback-port/service-running-state helpers. Each is
-//! `pub(crate)` and called from `main.rs` via qualified `chat::` paths,
-//! except for a handful of private parsing internals used only within this
-//! file; nothing here calls back into `main.rs`.
+//! the MCP-result/loopback-port/service-running-state helpers. The types
+//! are read from `main.rs` as return values (`DeterministicServiceRow` and
+//! `DeterministicEngineRow` are never named there directly); the helper
+//! functions are `pub(crate)` and called from `main.rs` via qualified
+//! `chat::` paths, except for a handful of private internals used only
+//! within this file; nothing here calls back into `main.rs`.
 //!
 //! Full domain extraction, mirroring `providers.rs`. Phase 6d (ROCMAI-88) of
 //! the `main.rs` modularization (see `docs/architecture.md`), split across
