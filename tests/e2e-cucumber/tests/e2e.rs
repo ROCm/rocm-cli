@@ -780,6 +780,34 @@ pub fn rocmd_binary() -> PathBuf {
     })
 }
 
+/// Plants the `[[bin]]` fixture `name` (see `e2e_cucumber::fixture_binary`)
+/// at the exact path `dest`.
+///
+/// Parent dirs are created as needed. Shared so the three stand-ins
+/// (`fake-tailscale`, `fake-uv`, `fake-python`) don't each repeat the same
+/// create-then-write body.
+///
+/// Lives here rather than in `e2e_cucumber::fixture_binary` because it needs
+/// `rocm_core::fake_executable::write_fake_executable` to avoid reopening the
+/// `ETXTBSY` race a plain `std::fs::copy` would — holding a write fd on `dest`
+/// for the duration of the copy is exactly the window that race exploits —
+/// and `rocm-core` is a dev-dependency this crate's library target cannot
+/// reach, only this test binary.
+pub fn install_fixture_binary(name: &str, dest: &Path) {
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)
+            .unwrap_or_else(|e| panic!("failed to create {}: {e}", parent.display()));
+    }
+    let contents = std::fs::read(e2e_cucumber::fixture_binary::fixture_binary(name))
+        .unwrap_or_else(|e| panic!("failed to read the {name} stand-in: {e}"));
+    rocm_core::fake_executable::write_fake_executable(dest, contents).unwrap_or_else(|e| {
+        panic!(
+            "failed to install the {name} stand-in at {}: {e}",
+            dest.display()
+        )
+    });
+}
+
 /// Spawn the real `rocm` binary with the scenario's isolated env.
 ///
 /// Returns `(stdout, stderr, rc)`. Every scenario goes through here, so this is
