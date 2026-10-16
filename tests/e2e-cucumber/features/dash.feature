@@ -550,3 +550,33 @@ Feature: Interactive dashboard
     When the user quits the dashboard
     Then the dashboard exits successfully
     And the managed model is still listed as running
+
+  # #693: dash-25 proves `spawn_in` threads a scenario-owned folder into the
+  # real browser, but its whitespace case lives in a CHILD entry under that
+  # folder (`ADOPT_SCENARIO_CHILD`), not in the `spawn_in` cwd itself — so it
+  # never drives #500's `quote_display_arg` fix through the real
+  # approval-preview render a user actually sees. Here the scenario's own
+  # root IS the whitespace path: `spawn_in`'s cwd has a space in its own
+  # name, onboarding's Adopt flow resolves its browser start from that exact
+  # cwd (`std::env::current_dir()` in `activate_choice`), and choosing
+  # "[ use this folder ]" stages an approval whose `--root` argument is that
+  # same whitespace path. #500 already has widget-level `TestBackend`
+  # snapshot coverage of the quoting in isolation
+  # (`approval_snapshot_quotes_args_containing_spaces` in
+  # `crates/rocm-dash-tui/tests/wave0_job_bridge.rs`); this is the missing
+  # black-box proof that the real wizard renders it quoted too.
+  @id:dash-onboarding-adopt-whitespace-cwd-quotes-approval-preview @requires-os:linux
+  Scenario: dash-35 - Adopting a folder whose own path contains a space quotes it in the approval preview
+    When the user opens the dashboard in a scenario folder whose own name has a space
+    And the user opens the Observe view
+    And the user opens onboarding setup
+    Then the onboarding welcome screen is displayed
+    When the user continues past the onboarding welcome screen
+    Then the onboarding setup choices are displayed
+    When the user chooses to adopt an existing folder
+    Then the existing-folder browser is displayed
+    When the user chooses the current folder
+    Then the approval preview quotes the whitespace-containing root path
+    When the user denies the adopt approval and closes onboarding setup
+    And the user quits the dashboard
+    Then the dashboard exits successfully
