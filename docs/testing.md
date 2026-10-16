@@ -1666,9 +1666,10 @@ hands its result to, and each delegates to the matching `_at` function with
 the path it actually read. The unit tests below call the `_read` functions
 directly too, constructing an `OsRelease` from fixture text instead of going
 through a bare-text sibling — `crate::hardware_root::OsRelease::found` in
-`crates/rocm-core/src/openmpi.rs`'s tests, and the equivalent
-`os_release_found` test helper in `apps/rocm/src/driver_install.rs`'s (the
-former is `#[cfg(test)] pub(crate)` inside `rocm-core` and so not visible from
+[openmpi.rs](../crates/rocm-core/src/openmpi.rs)'s tests, and the equivalent
+`os_release_found` test helper in
+[driver_install.rs](../apps/rocm/src/driver_install.rs)'s (the former is
+`#[cfg(test)] pub(crate)` inside `rocm-core` and so not visible from
 `apps/rocm`'s own tests).
 
 ```bash
