@@ -205,6 +205,50 @@ async fn open_dashboard_in_scenario_folder(world: &mut E2eWorld) {
     world.tui = Some(session);
 }
 
+/// Name of the scenario-owned directory `dash-36` (#693) spawns directly
+/// into. Unlike [`ADOPT_SCENARIO_CHILD`] — a whitespace-containing *child*
+/// entry listed by a browser rooted elsewhere — the space here is in this
+/// directory's own name, and this directory itself is the `spawn_in` cwd.
+/// Onboarding's Adopt flow seeds its browser from `std::env::current_dir()`
+/// (`activate_choice` in `onboarding.rs`) with no intervening navigation, so
+/// choosing "[ use this folder ]" stages an approval whose `--root` argument
+/// is this exact whitespace path — the one #500's `quote_display_arg`
+/// (`crates/rocm-dash-tui/src/ui/exec.rs`) is supposed to quote for display,
+/// and the one dash-25 never reaches.
+///
+/// Kept to two short words: the approval preview's command line wraps at
+/// word boundaries (`Wrap { trim: false }` in `draw_approval`) once it
+/// outgrows the popup's own content width, and the popup sits beside other
+/// dashboard panels on the *same* physical terminal rows — so a wrap inside
+/// `--root`'s quoted value splits across a `vt100` row boundary with
+/// unrelated panel text in between on the row that wrapped, which
+/// `approval_preview_quotes_whitespace_root`'s single-row match cannot see
+/// through. A short name keeps the whole `--root "<root>"` segment (prefix
+/// plus the host's own, uncontrollable temp-directory path) on one row with
+/// margin to spare; the `--python <root>/bin/python` tail is long enough to
+/// wrap on its own and is not part of what that step asserts.
+const ADOPT_WHITESPACE_ROOT: &str = "a b";
+
+#[when("the user opens the dashboard in a scenario folder whose own name has a space")]
+async fn open_dashboard_in_whitespace_named_folder(world: &mut E2eWorld) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .to_path_buf();
+    let cwd = root.join(ADOPT_WHITESPACE_ROOT);
+    std::fs::create_dir_all(&cwd).unwrap_or_else(|e| {
+        panic!(
+            "failed to create scenario-owned folder {}: {e}",
+            cwd.display()
+        )
+    });
+    let session = TuiSession::spawn_in(world, &["dash", "--demo"], &cwd)
+        .unwrap_or_else(|e| panic!("failed to open the dashboard in {}: {e}", cwd.display()));
+    world.tui = Some(session);
+}
+
 #[when("the user opens interactive chat")]
 async fn open_chat(world: &mut E2eWorld) {
     let args: &[&str] = if world.chat_use_mock {
@@ -571,6 +615,40 @@ async fn close_onboarding_setup(world: &mut E2eWorld) {
     tui.wait_until_gone(open_sub_view_marker, default_timeout())
         .await
         .unwrap_or_else(|e| panic!("sub-view did not close: {e}"));
+    tui.send("\u{1b}")
+        .unwrap_or_else(|e| panic!("failed to close onboarding: {e}"));
+    tui.wait_until_gone("Welcome to ROCm — first-run setup", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("onboarding wizard did not close: {e}"));
+}
+
+/// The approval modal's own popup title (`format!("Review: {}", req.title)`
+/// in `draw_approval`, with `req.title` set from `OnboardingChoice::title()`
+/// in `stage_approval`), used by `deny_adopt_approval_and_close_onboarding`
+/// both to wait for the modal and as proof it closed.
+const ADOPT_APPROVAL_TITLE: &str = "Review: adopt existing ROCm folder";
+
+#[when("the user denies the adopt approval and closes onboarding setup")]
+async fn deny_adopt_approval_and_close_onboarding(world: &mut E2eWorld) {
+    // `close_onboarding_setup` above closes the two sub-views it was written
+    // for (Configure, and the Adopt folder browser), but a staged approval is
+    // a third, later sub-view neither of its markers matches — this scenario
+    // (dash-36, #693) is the first to reach one. Same double-Esc shape:
+    // the first Esc denies the approval (`on_key`'s approval-focused branch
+    // treats Esc the same as `n`/`q` — `ApprovalVerdict::Cancel`), landing
+    // back on the bare Choose step with nothing else open; the second Esc
+    // then closes the wizard itself from there (`OnboardingStep::Choose`'s
+    // own Esc arm). Waiting for the approval's own title to clear between
+    // the two keys avoids the same coalescing risk `close_onboarding_setup`
+    // guards against: two bare ESC bytes arriving in the same PTY read
+    // collapse into a single `KeyCode::Esc`, which would only dismiss the
+    // approval and leave the wizard open.
+    let tui = session(world);
+    tui.send("\u{1b}")
+        .unwrap_or_else(|e| panic!("failed to deny the adopt approval: {e}"));
+    tui.wait_until_gone(ADOPT_APPROVAL_TITLE, default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the adopt approval prompt did not close: {e}"));
     tui.send("\u{1b}")
         .unwrap_or_else(|e| panic!("failed to close onboarding: {e}"));
     tui.wait_until_gone("Welcome to ROCm — first-run setup", default_timeout())
@@ -1682,6 +1760,75 @@ async fn existing_folder_browser_shows_scenario_folder(world: &mut E2eWorld) {
         .wait_for_screen(&marker, default_timeout())
         .await
         .unwrap_or_else(|e| panic!("the existing-folder browser did not show {marker:?}: {e}"));
+}
+
+#[then("the existing-folder browser is displayed")]
+async fn existing_folder_browser_displayed(world: &mut E2eWorld) {
+    // The Adopt browser's own popup title (`FolderBrowser::new("Pick an
+    // existing ROCm folder", ...)` in `onboarding.rs`'s `activate_choice`) —
+    // distinct from the Configure-path browser's "Pick an install folder"
+    // the existing `install_folder_browser_displayed` step waits for.
+    // Synchronizes before `choose_current_folder`, which has no wait of its
+    // own, the same way `install_folder_browser_displayed` does for dash-23.
+    session(world)
+        .wait_for_screen("Pick an existing ROCm folder", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the existing-folder browser did not appear: {e}"));
+}
+
+#[then("the approval preview quotes the whitespace-containing root path")]
+async fn approval_preview_quotes_whitespace_root(world: &mut E2eWorld) {
+    // The real path the Adopt browser resolved: `activate_choice` seeds it
+    // from the spawned child's own `std::env::current_dir()`, which on
+    // Linux always reports the fully resolved (symlink-free) absolute path
+    // of the `spawn_in` cwd — the same string `Path::canonicalize` computes
+    // here on the directory `open_dashboard_in_whitespace_named_folder`
+    // created, so the two agree without hardcoding a path.
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join(ADOPT_WHITESPACE_ROOT)
+        .canonicalize()
+        .unwrap_or_else(|e| panic!("failed to canonicalize the scenario root: {e}"));
+    // `quote_display_arg` (`crates/rocm-dash-tui/src/ui/exec.rs`, #500) wraps
+    // any whitespace-containing argument value in a pair of quote characters
+    // with no other transformation (our path has no embedded quote to
+    // escape), so the rendered `--root` argument is this exact string,
+    // quoted. #693's contract is "rendered as one unambiguous, quoted unit" —
+    // not any particular quote character — so this accepts either common
+    // convention rather than pinning the double-quote `quote_display_arg`
+    // happens to use today; a future change to the escaping character alone
+    // should not read as a regression here.
+    //
+    // Matched as one contiguous substring of `screen_text()` deliberately,
+    // not with any whitespace-collapsing across rows: the approval popup is
+    // drawn beside other dashboard panels that occupy the *same* physical
+    // terminal rows, so a row that wrapped mid-argument carries unrelated
+    // panel border text after the wrap point, before the popup's own text
+    // resumes on the next row — collapsing runs of whitespace there would
+    // paste that unrelated text into the middle of our expected string
+    // instead of reconstructing it. `ADOPT_WHITESPACE_ROOT`'s own doc
+    // comment is what actually keeps this segment on one row.
+    let expected_double_quoted = format!("--root \"{}\"", root.display());
+    let expected_single_quoted = format!("--root '{}'", root.display());
+    session(world)
+        .wait_for_screen_where(
+            &format!(
+                "the approval preview to contain {expected_double_quoted:?} or {expected_single_quoted:?}"
+            ),
+            |screen| {
+                screen.contains(&expected_double_quoted) || screen.contains(&expected_single_quoted)
+            },
+            default_timeout(),
+        )
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "the approval preview never showed {expected_double_quoted:?} or {expected_single_quoted:?}: {e}"
+            )
+        });
 }
 
 #[then("the Configure step shows the chosen folder instead of the placeholder")]
