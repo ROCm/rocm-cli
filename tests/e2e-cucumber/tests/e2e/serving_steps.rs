@@ -1366,6 +1366,27 @@ async fn assert_service_in_list(world: &mut E2eWorld) {
     );
 }
 
+/// ROCMAI-550: `rocm services list` must show the backend/device the engine
+/// actually selected (read live from its `Healthcheck` RPC), not just that a
+/// service exists. Reuses `assert_service_in_list`'s model-name match so this
+/// only checks the row for the service this scenario just started.
+#[then("the services list reports the engine's actual backend device")]
+async fn assert_services_list_reports_device(world: &mut E2eWorld) {
+    let (stdout, _, _) = crate::run_rocm(world, &["services", "list"]);
+    let model = world.model_name.as_deref().unwrap_or("");
+    let block = stdout
+        .split("\n- ")
+        .find(|block| block.to_lowercase().contains(&model.to_lowercase()))
+        .unwrap_or_else(|| panic!("no services-list entry for model {model}:\n{stdout}"));
+    assert!(
+        block
+            .lines()
+            .any(|line| line.trim_start().starts_with("device:")),
+        "services list entry for {model} is missing a `device:` line — the engine's \
+         Healthcheck RPC should report the backend it actually selected:\n{block}"
+    );
+}
+
 #[then("the list reports the attempt and how to look at it")]
 async fn assert_past_attempts_reported(world: &mut E2eWorld) {
     let stdout = world

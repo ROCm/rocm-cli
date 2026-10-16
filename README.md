@@ -676,8 +676,11 @@ services stop <service-id> --yes`) or match the original flags.
 
 By default the server runs in the background under rocm-cli's supervision and
 prints a deployment summary — a progress indicator while it starts, then a table
-with the status, the full inference endpoint, the API-qualified model name, and a
-quick smoke test (time to first token and approximate tokens/sec). Control
+with the status, the engine and the backend device it actually selected (for
+example `rocm gpu 0` or `vulkan gpu 0`, read back from the running engine), the
+full inference endpoint, the API-qualified model name, and a quick smoke test
+(time to first token and approximate tokens/sec). `rocm services` reports the
+same `device` for each running service. Control
 returns to your shell with the server still running; manage it later with `rocm
 services` (below).
 

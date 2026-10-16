@@ -55,6 +55,10 @@ pub(crate) struct DeploymentSummary {
     pub service_id: String,
     /// `"ready"`, `"starting"`, or an existing service's status.
     pub status: String,
+    /// The backend/device the engine actually selected (e.g. `"vulkan gpu 0"`,
+    /// `"rocm gpu 0"`), read from the engine's own `Healthcheck` response.
+    /// `None` when the query failed or the service was not ready to ask.
+    pub device: Option<String>,
     /// True when an equivalent server was already running and nothing was spawned.
     pub already_running: bool,
     pub metrics: SmokeMetrics,
@@ -121,11 +125,17 @@ pub(crate) fn render_summary(summary: &DeploymentSummary) -> String {
         ]
     };
 
+    let device_row = summary
+        .device
+        .as_deref()
+        .map(|device| ("device", device.to_owned()));
+
     let rows: Vec<(&str, String)> = [
         vec![
             ("status", summary.status.clone()),
             ("engine", summary.engine.clone()),
         ],
+        device_row.into_iter().collect(),
         model_rows,
         vec![
             ("endpoint", summary.chat_endpoint.clone()),
@@ -257,6 +267,22 @@ fn compute_metrics(
 mod tests {
     use super::*;
 
+    /// A rendered summary with the api key masked, for panic messages.
+    ///
+    /// `render_summary` prints the key by design, and a failing assertion that
+    /// interpolated the whole summary would copy it into CI logs, which are
+    /// retained and widely readable. Assert on the real text; print this.
+    fn redacted(rendered: &str) -> String {
+        rendered
+            .lines()
+            .map(|line| match line.split_once("api key: ") {
+                Some((prefix, _)) => format!("{prefix}api key: <redacted>"),
+                None => line.to_owned(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     fn base_summary() -> DeploymentSummary {
         DeploymentSummary {
             engine: "vllm".to_owned(),
@@ -265,6 +291,7 @@ mod tests {
             chat_endpoint: "http://127.0.0.1:1337/v1/chat/completions".to_owned(),
             service_id: "vllm-qwen-1720000000".to_owned(),
             status: "ready".to_owned(),
+            device: None,
             already_running: false,
             metrics: SmokeMetrics {
                 ttft: Some(Duration::from_millis(180)),
@@ -367,17 +394,19 @@ mod tests {
                 line.trim_start().starts_with(label) && line.trim_end().ends_with(value)
             })
         };
-        assert!(row("requested model", "qwen"), "{rendered}");
+        assert!(row("requested model", "qwen"), "{}", redacted(&rendered));
         assert!(
             row("resolved model", "Qwen3-4B-Instruct-2507-GGUF"),
-            "{rendered}"
+            "{}",
+            redacted(&rendered)
         );
         // The bare `model` row is not used when the two differ.
         assert!(
             !rendered
                 .lines()
                 .any(|line| line.trim_start().starts_with("model ")),
-            "{rendered}"
+            "{}",
+            redacted(&rendered)
         );
     }
 
@@ -396,7 +425,11 @@ mod tests {
         let mut summary = base_summary();
         summary.status = "starting".to_owned();
         let rendered = render_summary(&summary);
-        assert!(rendered.contains("not ready yet"), "heading: {rendered}");
+        assert!(
+            rendered.contains("not ready yet"),
+            "heading: {}",
+            redacted(&rendered)
+        );
         assert!(rendered.contains("did not report ready"));
         assert!(rendered.contains("rocm logs --service"));
     }
@@ -411,14 +444,20 @@ mod tests {
         summary.status = "running".to_owned();
         summary.metrics = SmokeMetrics::default();
         let rendered = render_summary(&summary);
-        assert!(rendered.contains("not ready yet"), "heading: {rendered}");
+        assert!(
+            rendered.contains("not ready yet"),
+            "heading: {}",
+            redacted(&rendered)
+        );
         assert!(
             rendered.contains("no smoke test was run"),
-            "the skipped smoke test must be explained: {rendered}"
+            "the skipped smoke test must be explained: {}",
+            redacted(&rendered)
         );
         assert!(
             rendered.contains("still loading"),
-            "the user needs to know this resolves on its own: {rendered}"
+            "the user needs to know this resolves on its own: {}",
+            redacted(&rendered)
         );
         assert!(rendered.contains("rocm services list"));
     }
@@ -436,17 +475,47 @@ mod tests {
     }
 
     #[test]
+    fn device_row_shown_only_when_known() {
+        let without_device = render_summary(&base_summary());
+        assert!(
+            !without_device.contains("device"),
+            "{}",
+            redacted(&without_device)
+        );
+
+        let mut summary = base_summary();
+        summary.device = Some("vulkan gpu 0".to_owned());
+        let rendered = render_summary(&summary);
+        assert!(
+            rendered
+                .lines()
+                .any(|line| line.trim_start().starts_with("device")
+                    && line.trim_end().ends_with("vulkan gpu 0")),
+            "{}",
+            redacted(&rendered)
+        );
+    }
+
+    #[test]
     fn api_key_client_config_shown_only_when_present() {
         // Loopback / no key: the summary must not mention an api key at all.
         let plain = render_summary(&base_summary());
-        assert!(!plain.contains("api key"), "{plain}");
+        assert!(!plain.contains("api key"), "{}", redacted(&plain));
 
         // Public bind: the key is shown once as secure client config.
         let mut summary = base_summary();
         summary.api_key = Some("endpoint-secret".to_owned());
         let rendered = render_summary(&summary);
-        assert!(rendered.contains("api key: endpoint-secret"), "{rendered}");
-        assert!(rendered.contains("shown only now"), "{rendered}");
+        assert!(
+            rendered.contains("api key: endpoint-secret"),
+            "{}",
+            redacted(&rendered)
+        );
+        assert!(
+            rendered.contains("shown only now"),
+            "{}",
+            redacted(&rendered)
+        );
     }
 
     #[test]
