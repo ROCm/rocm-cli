@@ -312,7 +312,9 @@ const RECIPES: &[FixRecipe] = &[
         needs_sudo: false,
         needs_reboot: false,
         needs_relogin: false,
-        verify: "env | grep HSA_OVERRIDE_GFX_VERSION || echo OK_UNSET",
+        // One line for bash, cmd and Windows PowerShell. Python is there
+        // already: the override only matters to a framework wheel.
+        verify: "python -c \"import os; print(os.environ.get('HSA_OVERRIDE_GFX_VERSION') or 'OK_UNSET')\"",
         notes: &[],
         doc_url: None,
         applies_on: PRINT_ON_LINUX_AND_WSL_AUTO_ON_WINDOWS,
@@ -382,12 +384,13 @@ const RECIPES: &[FixRecipe] = &[
             "# Linux:",
             "echo 'export PATH=\"/opt/rocm/bin:$PATH\"' >> ~/.bashrc",
             "# Windows:",
-            "setx PATH \"%PATH%;C:\\Program Files\\AMD\\ROCm\\<version>\\bin\"",
+            "powershell -NoProfile -Command \"[Environment]::SetEnvironmentVariable('Path', 'C:\\Program Files\\AMD\\ROCm\\<version>\\bin;' + [Environment]::GetEnvironmentVariable('Path', 'User'), 'User')\"",
+            "# This changes the User Path only. Reopen the terminal afterwards.",
         ],
         needs_sudo: false,
         needs_reboot: false,
         needs_relogin: false,
-        verify: "rocminfo | head -n 5 && hipcc --version",
+        verify: "hipcc --version",
         notes: &[],
         doc_url: None,
         applies_on: AUTO_ON_LINUX_WINDOWS_AND_WSL,
@@ -578,7 +581,7 @@ const RECIPES: &[FixRecipe] = &[
         needs_sudo: false,
         needs_reboot: false,
         needs_relogin: false,
-        verify: "where vcruntime140.dll && where vcruntime140_1.dll",
+        verify: "powershell -NoProfile -Command \"(Get-Item $env:SystemRoot\\System32\\vcruntime140.dll,$env:SystemRoot\\System32\\vcruntime140_1.dll).VersionInfo | Select-Object FileName,FileVersion\"",
         notes: &[
             "If installing the redistributable still leaves a missing-DLL error, the failing DLL is probably amdhip64_X.dll itself; that points at fix-13-hip-sdk-missing rather than this fix. If the runtime is present but the program crashes with an access violation, see fix-21-msvc-redist-outdated.",
         ],
@@ -1095,6 +1098,41 @@ pub(crate) fn recipe_verify_notes_and_run_commands(
             .collect::<Vec<_>>();
         (recipe.verify, recipe.notes, run_commands)
     })
+}
+
+/// Test-only rule for what a printed command must not contain when it is shown
+/// to a user of Windows PowerShell 5.1 as well as cmd:
+///
+/// - `&&` and `||`, which are syntax errors in Windows PowerShell 5.1;
+/// - a bare `where`, which starts a command and is the `Where-Object` alias in
+///   PowerShell, not `where.exe`;
+/// - a `%NAME%` reference, which PowerShell passes on as literal text. For
+///   `setx PATH "%PATH%;..."` that writes `%PATH%` into the user's Path.
+///
+/// Shared by the checks on the `RECIPES` catalog here and on the `Fix` values
+/// that `diagnose.rs` builds.
+#[cfg(test)]
+pub(crate) fn fails_in_windows_powershell(line: &str) -> Option<&'static str> {
+    if line.contains("&&") || line.contains("||") {
+        return Some("`&&` or `||`, a syntax error in Windows PowerShell 5.1");
+    }
+    let starts_bare_where = line
+        .split(['|', ';'])
+        .any(|part| part.split_whitespace().next() == Some("where"));
+    if starts_bare_where {
+        return Some("a bare `where`, which is `Where-Object` in PowerShell");
+    }
+    // The text between a `%` and the next one. The last piece has no closing
+    // `%`, so it is never a name.
+    let pieces: Vec<&str> = line.split('%').collect();
+    let names_a_cmd_variable = pieces
+        .get(1..pieces.len().saturating_sub(1))
+        .unwrap_or_default()
+        .iter()
+        .any(|name| {
+            !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        });
+    names_a_cmd_variable.then_some("a `%NAME%` reference, which PowerShell does not expand")
 }
 
 /// Test-only view of the platform families a recipe is runnable on.
@@ -2731,6 +2769,245 @@ mod tests {
                 r.fix_id
             );
         }
+    }
+
+    /// The commands and the verify line of a recipe that applies on Windows
+    /// are shown to users of Windows PowerShell and of cmd, so none may use
+    /// what `fails_in_windows_powershell` lists. The set of recipes is derived
+    /// from `applies_on`, so a new Windows recipe is covered without editing
+    /// this test.
+    ///
+    /// This pins the text only. Only `the_msvc_verify_runs_in_cmd_and_powershell`
+    /// runs a verify command in a shell, and only fix-15's, on Windows. The same
+    /// rule is applied to the `Fix` values that `diagnose.rs` builds, in
+    /// `windows_diagnosis_remediation_passes_the_powershell_text_rule`.
+    #[test]
+    fn windows_recipes_pass_the_powershell_text_rule() {
+        let windows: Vec<&FixRecipe> = RECIPES
+            .iter()
+            .filter(|r| r.platform("windows").is_some())
+            .collect();
+        assert!(
+            windows.iter().any(|r| r.fix_id == "fix-15-msvc-redist"),
+            "the derivation found no Windows recipes: {windows:?}",
+            windows = windows.iter().map(|r| r.fix_id).collect::<Vec<_>>()
+        );
+        for r in windows {
+            let printed = r
+                .commands
+                .iter()
+                .copied()
+                .filter(|c| !c.trim_start().starts_with('#'))
+                .chain(std::iter::once(r.verify));
+            for line in printed {
+                if let Some(why) = fails_in_windows_powershell(line) {
+                    panic!("{}: `{line}` uses {why}", r.fix_id);
+                }
+            }
+        }
+    }
+
+    /// The fix-15 verify line, taken apart. This is a structural check on the
+    /// text, so it runs on every host: a misspelled cmdlet or environment
+    /// variable fails here even where no Windows shell is available. It does not
+    /// replace running the line. `the_msvc_verify_runs_in_cmd_and_powershell`
+    /// does that, and only on Windows.
+    #[test]
+    fn the_msvc_verify_is_a_wellformed_powershell_command() {
+        let verify = find_recipe("fix-15-msvc-redist")
+            .expect("fix-15 is in the catalog")
+            .verify;
+        // Starts with `powershell` so cmd runs it too. The body is one
+        // double-quoted argument, so cmd leaves the `$env:` text alone and an
+        // outer PowerShell expands it before the inner one starts.
+        let body = verify
+            .strip_prefix("powershell -NoProfile -Command \"")
+            .and_then(|rest| rest.strip_suffix('"'))
+            .unwrap_or_else(|| panic!("not a quoted `powershell -Command` argument: {verify}"));
+        assert!(
+            !body.contains('"'),
+            "an inner quote would end the argument: {body}"
+        );
+        // Every command word is a real cmdlet, and the only variable is the
+        // one that holds the Windows directory.
+        let cmdlets: Vec<&str> = body
+            .split('|')
+            .map(|stage| {
+                stage
+                    .trim()
+                    .trim_start_matches('(')
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+            })
+            .collect();
+        assert_eq!(cmdlets, ["Get-Item", "Select-Object"], "{body}");
+        for var in body.split("$env:").skip(1) {
+            assert!(
+                var.starts_with("SystemRoot\\System32\\vcruntime140"),
+                "an unexpected variable or path in the verify line: {body}"
+            );
+        }
+        assert_eq!(body.matches("$env:SystemRoot").count(), 2, "{body}");
+        for dll in ["vcruntime140.dll", "vcruntime140_1.dll"] {
+            assert!(body.contains(dll), "{dll} is not checked: {body}");
+        }
+        assert!(
+            body.contains(".VersionInfo") && body.ends_with("Select-Object FileName,FileVersion"),
+            "{body}"
+        );
+    }
+
+    /// Runs the fix-15 verify line the way a user would: typed into cmd, and
+    /// typed into Windows PowerShell. Both must exit 0 and print both DLLs with
+    /// a dotted version. The runtime is installed on the Windows CI hosts, so a
+    /// failure here means the line is broken.
+    ///
+    /// The PowerShell leg feeds the line on stdin (`-Command -`), which parses
+    /// it as typed text. Passing it as an argument of an outer `-Command` is
+    /// not the same thing: PowerShell joins its arguments after removing their
+    /// quotes, so the inner command text would be cut at the first space and
+    /// the pipe would run in the outer shell.
+    ///
+    /// Only compiled on Windows. Linux and macOS lanes do not run it, which is
+    /// why `the_msvc_verify_is_a_wellformed_powershell_command` also checks the
+    /// text on every host.
+    #[cfg(windows)]
+    #[test]
+    fn the_msvc_verify_runs_in_cmd_and_powershell() {
+        use std::io::Write;
+        use std::os::windows::process::CommandExt;
+        use std::process::{Command, Stdio};
+        let verify = find_recipe("fix-15-msvc-redist")
+            .expect("fix-15 is in the catalog")
+            .verify;
+        let mut cmd = Command::new("cmd");
+        cmd.arg("/C").raw_arg(verify);
+        let mut ps = Command::new("powershell");
+        ps.args(["-NoProfile", "-Command", "-"]);
+        for (shell, mut command) in [("cmd", cmd), ("powershell", ps)] {
+            command
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let mut child = command.spawn().expect("the shell starts");
+            let mut stdin = child.stdin.take().expect("stdin is piped");
+            if shell == "powershell" {
+                writeln!(stdin, "{verify}").expect("the line is written");
+            }
+            drop(stdin);
+            let out = child.wait_with_output().expect("the shell finishes");
+            let text = String::from_utf8_lossy(&out.stdout);
+            let err = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                out.status.success(),
+                "{shell}: {:?}\n{text}\n{err}",
+                out.status
+            );
+            assert!(err.trim().is_empty(), "{shell} wrote to stderr: {err}");
+            // A long file name can be cut short in a table, so count the stem.
+            assert!(
+                text.matches("vcruntime140").count() >= 2,
+                "{shell} did not list both runtime DLLs:\n{text}"
+            );
+            let has_version = text.split_whitespace().any(|w| {
+                let parts: Vec<&str> = w.split('.').collect();
+                parts.len() >= 3
+                    && parts
+                        .iter()
+                        .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+            });
+            assert!(has_version, "{shell} printed no dotted version:\n{text}");
+        }
+    }
+
+    /// Runs the fix-2 verify line typed into cmd and into Windows PowerShell,
+    /// once with the override unset and once with it set. Python is on PATH on
+    /// the Windows CI hosts. Only compiled on Windows; the line's shape is
+    /// checked on every host by `the_override_verify_is_one_line_for_every_shell`.
+    #[cfg(windows)]
+    #[test]
+    fn the_override_verify_runs_in_cmd_and_powershell() {
+        use std::io::Write;
+        use std::os::windows::process::CommandExt;
+        use std::process::{Command, Stdio};
+        let verify = find_recipe("fix-2-unset-override").unwrap().verify;
+        for (value, expected) in [(None, "OK_UNSET"), (Some("11.0.0"), "11.0.0")] {
+            let mut cmd = Command::new("cmd");
+            cmd.arg("/C").raw_arg(verify);
+            let mut ps = Command::new("powershell");
+            ps.args(["-NoProfile", "-Command", "-"]);
+            for (shell, mut command) in [("cmd", cmd), ("powershell", ps)] {
+                match value {
+                    Some(v) => command.env("HSA_OVERRIDE_GFX_VERSION", v),
+                    None => command.env_remove("HSA_OVERRIDE_GFX_VERSION"),
+                };
+                command
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+                let mut child = command.spawn().expect("the shell starts");
+                let mut stdin = child.stdin.take().expect("stdin is piped");
+                if shell == "powershell" {
+                    writeln!(stdin, "{verify}").expect("the line is written");
+                }
+                drop(stdin);
+                let out = child.wait_with_output().expect("the shell finishes");
+                let text = String::from_utf8_lossy(&out.stdout);
+                let err = String::from_utf8_lossy(&out.stderr);
+                assert!(
+                    out.status.success(),
+                    "{shell}: {:?}\n{text}\n{err}",
+                    out.status
+                );
+                assert_eq!(text.trim(), expected, "{shell}, stderr: {err}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_powershell_text_rule_flags_what_it_should() {
+        for bad in [
+            "a && b",
+            "a || b",
+            "where foo.dll",
+            "echo x | where foo",
+            "setx PATH \"%PATH%;C:\\bin\"",
+            "echo %HIP_PATH%",
+            // The lines this PR replaced.
+            "env | grep HSA_OVERRIDE_GFX_VERSION || echo OK_UNSET",
+        ] {
+            assert!(fails_in_windows_powershell(bad).is_some(), "{bad}");
+        }
+        for good in [
+            "where.exe foo.dll",
+            "a | b",
+            "echo 100% done",
+            "echo 50%x",
+            "echo % %",
+            find_recipe("fix-2-unset-override").unwrap().verify,
+        ] {
+            assert!(fails_in_windows_powershell(good).is_none(), "{good}");
+        }
+    }
+
+    /// The fix-2 verify line is shown on Linux, WSL and Windows, so it must be
+    /// one command that bash, cmd and PowerShell all run the same way: a
+    /// `python -c` whose program is one double-quoted argument with no inner
+    /// double quote and no `$`, so no shell expands anything in it.
+    #[test]
+    fn the_override_verify_is_one_line_for_every_shell() {
+        let verify = find_recipe("fix-2-unset-override").unwrap().verify;
+        let program = verify
+            .strip_prefix("python -c \"")
+            .and_then(|rest| rest.strip_suffix('"'))
+            .unwrap_or_else(|| panic!("not a quoted `python -c` argument: {verify}"));
+        assert!(!program.contains(['"', '$', '`', '%']), "{program}");
+        assert!(
+            program.contains("os.environ.get('HSA_OVERRIDE_GFX_VERSION')")
+                && program.contains("'OK_UNSET'"),
+            "{program}"
+        );
     }
 
     #[test]
