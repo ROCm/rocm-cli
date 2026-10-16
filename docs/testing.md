@@ -631,6 +631,26 @@ download that is not a ComfyUI release, which is neither installed nor kept:
 cargo xtask e2e -- -n "comfyui-(0[5-9]|1[0-3])"
 ```
 
+`-n` bypasses the suite's applicability resolver, so the `@requires-os:linux`
+gate is not applied: run it only on Linux.
+
+`comfyui-14` is different: it installs ComfyUI into a real, isolated managed
+runtime and checks the ROCm torch stack survives with no `nvidia-*` packages
+added. It carries `@requires-gpu @nightly @requires-os:linux @requires-bare-metal`
+and does a real `install sdk --yes` first (system-package consent, and a sudo
+OpenMPI install on vLLM families). Those tags gate it only in a
+harness-selected run, which needs the nightly opt-in and a bare-metal Linux AMD
+GPU host:
+
+```bash
+E2E_INCLUDE_NIGHTLY=1 cargo xtask e2e
+```
+
+Do not select it with `-n`/`--name`, or with the `name_filter` input of the
+self-hosted CI dispatch (which forwards `--name`): each bypasses every gate
+above, so on WSL2, Windows or a machine with no GPU it would still run the real
+install.
+
 ## Runtime Selection And Activation
 
 List registered managed or read-only runtimes and their exact side-by-side keys:
