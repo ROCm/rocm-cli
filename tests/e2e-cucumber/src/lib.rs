@@ -5,6 +5,7 @@
 pub mod capability;
 pub mod chat_request;
 pub mod expectation;
+pub mod fixture_binary;
 pub mod harness_diagnostics;
 pub mod http_server;
 pub mod installer_fixture;
@@ -20,6 +21,16 @@ pub mod serve_log;
 pub mod shared_runtime;
 
 use std::path::{Path, PathBuf};
+
+/// Whether `id` names a `rocm fix` catalog entry.
+///
+/// A remediable `fix-`/`fix-wsl-` one, or a `DiagnoseOnly` `info-` one.
+/// Shared so a future third prefix (or an `info-` rename) is a one-line
+/// change instead of four.
+#[must_use]
+pub fn is_catalog_id(id: &str) -> bool {
+    id.starts_with("fix-") || id.starts_with("info-")
+}
 
 /// Select the single binary directory consumed by lifecycle packaging.
 ///

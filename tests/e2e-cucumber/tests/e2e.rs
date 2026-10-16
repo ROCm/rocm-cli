@@ -158,6 +158,13 @@ pub struct E2eWorld {
     /// has something real to terminate. Held here so `Drop` can kill and reap
     /// it whatever the scenario's outcome, and so the stop's effect on it can
     /// be observed through the handle rather than by PID alone.
+    ///
+    /// Also doubles as the disposable `sleep` child `dash-28` points
+    /// "e2e-mock"'s `supervisor_pid`/`engine_pid` at. `register_mock_service`
+    /// deliberately points those fields at *this harness's own* PID so startup
+    /// liveness checks see a live process — fine for every scenario that only
+    /// reads the record, but a real `rocm services stop e2e-mock --yes` would
+    /// then signal the harness process itself.
     pub recorded_process: Option<std::process::Child>,
 }
 
@@ -207,6 +214,17 @@ fn validated_shared_dir(env_var: &str) -> Option<PathBuf> {
 /// `llamacpp:rocm`).
 fn shared_cache_dir() -> Option<PathBuf> {
     validated_shared_dir("E2E_SHARED_CACHE_DIR")
+}
+
+/// The `ROCM_CLI_CACHE_DIR` a scenario rooted at `root` resolves to: the shared
+/// dir when CI provides one, else the scenario-local `<root>/cache`. The one
+/// definition both [`E2eWorld::isolate_env`] (which hands this to the spawned
+/// process as an env var) and [`E2eWorld::app_paths`] (which a step reads or
+/// writes fixtures through directly) call, so the two cannot drift apart the
+/// way they once did: a fixture written through `app_paths()` must land where
+/// the CLI's own `ROCM_CLI_CACHE_DIR` actually points, shared cache or not.
+fn cache_dir_for(root: &Path) -> PathBuf {
+    shared_cache_dir().map_or_else(|| root.join("cache"), |shared| shared.join("rocm-cli"))
 }
 
 /// A persistent `uv` download/build cache shared across scenarios (`UV_CACHE_DIR`).
@@ -305,6 +323,23 @@ impl Default for E2eWorld {
 }
 
 impl E2eWorld {
+    /// The `AppPaths` the CLI under test resolves for this scenario: the same
+    /// roots [`isolate_env`] hands it as `ROCM_CLI_*_DIR`. Shared by any step
+    /// that needs to read or write fixtures exactly where the spawned `rocm`
+    /// process will look for them.
+    pub fn app_paths(&self) -> rocm_core::AppPaths {
+        let root = self
+            .isolated_root
+            .as_ref()
+            .expect("scenario has no isolated root")
+            .path();
+        rocm_core::AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: cache_dir_for(root),
+        }
+    }
+
     /// The isolation/behaviour environment every spawned `rocm` gets, as owned
     /// `(key, value)` pairs. Shared by the piped `std::process::Command` path and
     /// the pseudo-terminal path; PTY-only isolation is added by [`pty_env`].
@@ -334,9 +369,7 @@ impl E2eWorld {
             // `write_cached_http_entry`), so concurrent scenarios sharing this
             // dir can't tear either into a state `load_startup_update_check`
             // would hard-error on.
-            let cache_dir = shared_cache_dir()
-                .map_or_else(|| root.join("cache"), |shared| shared.join("rocm-cli"));
-            env.push(("ROCM_CLI_CACHE_DIR", cache_dir.into_os_string()));
+            env.push(("ROCM_CLI_CACHE_DIR", cache_dir_for(root).into_os_string()));
         }
         // Share only STATE-FREE, content-addressed caches across scenarios when
         // CI provides a persistent shared dir (see shared_cache_dir): HF model
@@ -752,6 +785,34 @@ pub fn rocmd_binary() -> PathBuf {
             configured.display()
         )
     })
+}
+
+/// Plants the `[[bin]]` fixture `name` (see `e2e_cucumber::fixture_binary`)
+/// at the exact path `dest`.
+///
+/// Parent dirs are created as needed. Shared so the three stand-ins
+/// (`fake-tailscale`, `fake-uv`, `fake-python`) don't each repeat the same
+/// create-then-write body.
+///
+/// Lives here rather than in `e2e_cucumber::fixture_binary` because it needs
+/// `rocm_core::fake_executable::write_fake_executable` to avoid reopening the
+/// `ETXTBSY` race a plain `std::fs::copy` would — holding a write fd on `dest`
+/// for the duration of the copy is exactly the window that race exploits —
+/// and `rocm-core` is a dev-dependency this crate's library target cannot
+/// reach, only this test binary.
+pub fn install_fixture_binary(name: &str, dest: &Path) {
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)
+            .unwrap_or_else(|e| panic!("failed to create {}: {e}", parent.display()));
+    }
+    let contents = std::fs::read(e2e_cucumber::fixture_binary::fixture_binary(name))
+        .unwrap_or_else(|e| panic!("failed to read the {name} stand-in: {e}"));
+    rocm_core::fake_executable::write_fake_executable(dest, contents).unwrap_or_else(|e| {
+        panic!(
+            "failed to install the {name} stand-in at {}: {e}",
+            dest.display()
+        )
+    });
 }
 
 /// Spawn the real `rocm` binary with the scenario's isolated env.

@@ -3460,7 +3460,7 @@ fn unsupported_host_gpu_message(raw_arch: &str) -> String {
          `rocm install sdk` has nothing to install for it.\n\
          The GPU is detected but is not supported by ROCm; \
          the Vulkan backend can still be used. \
-         Try `rocm serve <model>` — it runs on Lemonade's Vulkan backend instead."
+         Try `rocm serve <model>` - it runs on Lemonade's Vulkan backend instead."
     )
 }
 
@@ -5211,7 +5211,7 @@ try:
         # `Requires-Dist` entries carry environment markers after ';'. Only the
         # requirement itself matters here.
         requirement = raw.split(";")[0].strip()
-        # The distribution name runs up to the first specifier, extra or space —
+        # The distribution name runs up to the first specifier, extra or space -
         # and there is usually no space at all, as in `torch==2.11.0+gitd0c8b1f`.
         matched = re.match(r"[A-Za-z0-9._-]+", requirement)
         if matched is None:

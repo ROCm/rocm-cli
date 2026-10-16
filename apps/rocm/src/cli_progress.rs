@@ -6,6 +6,24 @@
 //! (starting a server, downloading a large artifact). Written to stderr only,
 //! so piped/redirected output — and stdout, which callers may still be
 //! printing a final summary to — never sees control characters.
+//!
+//! This module is deliberately exempt from ROCMAI-543's "user-facing output
+//! must be ASCII" rule, and the exemption is structural rather than an
+//! oversight. The mojibake that ticket reports ("ΓÇö") is the UTF-8 bytes
+//! `E2 80 94` decoded as code page 437 — a byte-level misdecode that can only
+//! happen once raw bytes leave the process, i.e. on a redirected stream. A
+//! write to a real Windows console never takes that path: the handle is a
+//! console, so it goes out as UTF-16 via `WriteConsoleW` and no code page is
+//! consulted. Every spinner here is hard-gated on `stderr().is_terminal()`
+//! (see [`Spinner::render_current`], which returns early when disabled), so
+//! its labels reach a console or nothing at all, and can never be misdecoded.
+//!
+//! The exemption also cannot be partially applied: [`SPINNER_FRAMES`] is
+//! Braille and [`truncate_to_width`] appends U+2026 as its overflow marker, so
+//! every repaint emits non-ASCII regardless of how the caller spells its
+//! label. Transliterating the labels alone would change nothing observable —
+//! making this module ASCII means replacing its visual language, which is a
+//! deliberate design choice (it matches the dashboard's), not a bug.
 
 use std::io::{IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, Ordering};

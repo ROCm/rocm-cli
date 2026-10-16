@@ -487,7 +487,7 @@ pub async fn run_loop(
             // both causes are named since either is possible here.
             warnings.push(if opts.amd_smi_gpu_reachable {
                 "amd-smi is missing, unresolvable, or failed to run, even though a GPU was \
-                 detected by other means (WSL ROCDXG bridge) — if it is installed, this GPU \
+                 detected by other means (WSL ROCDXG bridge) - if it is installed, this GPU \
                  model may not be supported by the installed amd-smi/ROCm, or not supported on \
                  WSL yet"
                     .into()

@@ -635,13 +635,13 @@ async fn setup_lemonade_hf_checkpoint_model(world: &mut E2eWorld) {
 
 #[given("a large model is being served on GPU")]
 async fn setup_large_gpu_model(world: &mut E2eWorld) {
-    // Large-model nightly coverage follows the host's serving path. MI300X uses
-    // the dense BF16 model through vLLM; Strix Halo uses the hardware-verified
-    // UD-Q4_K_XL GGUF checkpoint through Lemonade. The scenario's @serve-timeout
-    // tag widens both the readiness poll and heavy-model inference timeout. For
-    // vLLM it also raises ROCM_CLI_VLLM_READY_TIMEOUT_SECS (see isolate_cmd),
-    // preventing the CLI's default readiness cap from terminating the server
-    // mid-load.
+    // Large-model nightly coverage follows the host's serving path. vLLM hosts
+    // (MI300X, MI350P) use the dense BF16 model; Lemonade hosts (Strix Halo,
+    // R9700, W7900) use the UD-Q4_K_XL GGUF checkpoint, hardware-verified on
+    // Strix Halo. The scenario's @serve-timeout tag widens both the readiness
+    // poll and heavy-model inference timeout. For vLLM it also raises
+    // ROCM_CLI_VLLM_READY_TIMEOUT_SECS (see isolate_cmd), preventing the CLI's
+    // default readiness cap from terminating the server mid-load.
     let (model, engine, ready_substr) =
         if e2e_cucumber::capability::host_capability().effective_serve_engine == "lemonade" {
             // ready_substr is the base name WITHOUT the quant. lemonade serves
@@ -741,6 +741,12 @@ async fn user_serves_multiple_engines(world: &mut E2eWorld) {
 #[when("the user lists running services")]
 async fn user_lists_services(world: &mut E2eWorld) {
     let (stdout, _, _) = crate::run_rocm(world, &["services", "list"]);
+    world.cli_output = Some(stdout);
+}
+
+#[when("the user lists recommended models")]
+async fn user_lists_recommended_models(world: &mut E2eWorld) {
+    let stdout = crate::run_rocm_ok(world, &["model"]);
     world.cli_output = Some(stdout);
 }
 
@@ -1302,6 +1308,20 @@ async fn assert_full_model_name(world: &mut E2eWorld) {
     assert!(
         resolved.contains('/'),
         "expected a fully qualified model name (org/model), got '{resolved}'\n\nfull output:\n{output}"
+    );
+}
+
+#[then("the model list output contains only ASCII characters")]
+async fn assert_model_list_is_ascii(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no CLI output");
+    assert!(
+        output.contains("Recommended models"),
+        "expected the `rocm model` header to be present, got:\n{output}"
+    );
+    assert!(
+        output.is_ascii(),
+        "rocm model output must be ASCII-only; non-ASCII punctuation renders as \
+         mojibake on a Windows console using the OEM code page (ROCMAI-543): {output}"
     );
 }
 

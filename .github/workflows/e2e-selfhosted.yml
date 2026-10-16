@@ -6,12 +6,14 @@ name: E2E self-hosted
 # the newer run's merge-required (GitHub-hosted) checks would sit pending with
 # zero jobs (observed on PR #138). Isolating these lanes in their own workflow —
 # with their OWN concurrency group — means an offline runner can only ever stall
-# THIS workflow's supersession, never the required checks in ci.yml.
+# THIS workflow's supersession, never the required checks in ci.yml. Only
+# pull_request runs are superseded (see `concurrency:` below).
 #
 # These lanes are non-blocking because none of their check names are in
 # branch protection's required-status-check list (confirmed 2026-09-11) — not
-# because of `continue-on-error`, which is `false` below so a real hardware
-# regression shows red instead of always green. PRs #334, #335 and #343 all
+# because of `continue-on-error`, which is `false` on every lane but
+# one, so a real hardware regression shows red instead of always green. The
+# exception is `e2e-gpu-w7900`, `true` only while that hardware is proven out. PRs #334, #335 and #343 all
 # landed while `E2E tests (Strix Halo, Ubuntu)` reported `cancelled` on the
 # merge_group ref, which a required check under ALLGREEN would have blocked;
 # renaming a lane is therefore safe.
@@ -42,7 +44,7 @@ on:
         type: choice
         default: all
         # Each value also selectable on its own; `all` covers every lane below.
-        options: [all, app-dev-gpu, strix-ubuntu, strix-windows, strix-wsl]
+        options: [all, app-dev-gpu, strix-ubuntu, strix-windows, strix-wsl, w7900]
       name_filter:
         description: "Scenario-name regex (cucumber --name); empty = full suite"
         type: string
@@ -54,12 +56,23 @@ on:
 
 concurrency:
   # Own group, namespaced by this workflow so it is DISTINCT from ci.yml's shared
-  # group — the whole point of the split. Manual dispatches still get a unique
-  # (run_id) group so a stuck dispatch never blocks later dispatches.
+  # group — the whole point of the split. The key also carries the event name, so
+  # a pull_request, push, merge_group and workflow_dispatch run can never share a
+  # group. A PR run is keyed on the PR NUMBER, so a new push to that PR
+  # supersedes the older run. A push or merge_group run is keyed on its ref
+  # AND commit SHA, unique per run: even with cancel-in-progress off, GitHub
+  # replaces a still-PENDING run in a shared group with a newer one, which
+  # would drop the record of a commit that landed. (The ref is part of the key
+  # so a release branch cut at main's head does not queue behind main's run.)
+  # Manual dispatches get a unique (run_id) group so a stuck dispatch never
+  # blocks later dispatches.
   group: >-
-    ${{ github.workflow }}-${{ github.ref }}-${{
-      github.event_name == 'workflow_dispatch' && github.run_id || 'shared' }}
-  cancel-in-progress: true
+    ${{ github.workflow }}-${{ github.event_name }}-${{
+      github.event_name == 'pull_request' && github.event.pull_request.number
+      || github.event_name == 'workflow_dispatch' && github.run_id
+      || format('{0}-{1}', github.ref, github.sha) }}
+  # Supersede only pull_request runs; every other run has a group of its own.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -79,9 +92,16 @@ jobs:
       pull-requests: read
     outputs:
       heavy: ${{ steps.filter.outputs.heavy || steps.all.outputs.forced }}
-      # Narrow GPU-serve gate; forced true off-PR so the merge queue always runs
-      # the full matrix and its required checks are never starved.
+      # Narrow GPU-serve gate; forced true off-PR so the merge queue runs the
+      # full matrix (every lane but MI300X, which skips merge_group) and its
+      # required checks are never starved.
       serve: ${{ steps.filter.outputs.serve || steps.all.outputs.forced }}
+      # ROCMAI-430: the three most recent rows of the official release list
+      # (rocm.docs.amd.com/en/latest/release/versions.html, see
+      # xtask/src/rocm_releases.rs), fanned out ONLY on a release-branch push —
+      # everywhere else (PR, merge queue, manual dispatch) this stays a
+      # single-element `current` matrix, same cost as before this existed.
+      sdk_version_matrix: ${{ steps.sdk_matrix.outputs.matrix }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -146,8 +166,17 @@ jobs:
         if: github.event_name != 'pull_request'
         run: echo "forced=true" >> "$GITHUB_OUTPUT"
 
+      - name: Compute sdk_version matrix (ROCMAI-430)
+        id: sdk_matrix
+        run: |
+          if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == refs/heads/release/* ]]; then
+            echo 'matrix=["current","n-1","n-2"]' >> "$GITHUB_OUTPUT"
+          else
+            echo 'matrix=["current"]' >> "$GITHUB_OUTPUT"
+          fi
+
   e2e-gpu:
-    name: E2E tests (MI300X)
+    name: E2E tests (MI300X, ${{ matrix.sdk_version }})
     timeout-minutes: 90
     # `mi300x`, not `amd-gpu`: every AMD GPU runner carries `amd-gpu`, including
     # the Strix Halo hosts, so `[self-hosted, linux, amd-gpu]` let this lane land
@@ -155,13 +184,28 @@ jobs:
     # `e2e-gpu-report`, which the consolidated grid renders as MI300X.
     runs-on: [self-hosted, linux, mi300x]
     needs: [changes]
+    strategy:
+      fail-fast: false
+      # n-1/n-2 (ROCMAI-430) only fan out on a release-branch push — see the
+      # `changes` job's `sdk_version_matrix` output; everywhere else this is a
+      # single-element `["current"]` matrix, so the ordinary PR/merge-queue path
+      # runs exactly one job, unchanged from before this matrix existed.
+      matrix:
+        sdk_version: ${{ fromJSON(needs.changes.outputs.sdk_version_matrix) }}
     # No build-and-test gate (cross-workflow needs is unavailable): the job builds
     # the rocm binary itself, and this check isn't in the required list (see the
     # file header), so a broken build here still can't block a merge; ci.yml's
     # required build-and-test / mock e2e remain the authoritative build gate.
+    #
+    # Not on merge_group: this check is not required for merging, and the queue
+    # does not wait for it, so with limited MI300X runner capacity the queue
+    # entry's job can stay queued long after its PR merged — an orphaned run
+    # that only delays the PR runs behind it. (The other lanes still run in
+    # the merge queue.)
     if: >-
       always()
       && needs.changes.result == 'success'
+      && github.event_name != 'merge_group'
       && (
         (github.event_name != 'workflow_dispatch'
           && needs.changes.outputs.serve == 'true')
@@ -180,12 +224,6 @@ jobs:
       # workflow sets this unconditionally; here it lets a scoped dispatch confirm
       # a single nightly scenario (e.g. the 27B serve) without the full nightly run.
       E2E_INCLUDE_NIGHTLY: "${{ inputs.include_nightly && '1' || '' }}"
-      # Opt-in @merge-queue serves: the heavy real serves (default-engine +
-      # readiness) run only in the merge queue, where a cheaper per-engine canary
-      # (scenarios 5 vLLM / 7 lemonade) has already guarded the PR. This keeps the
-      # per-PR GPU run short while still exercising the full serve matrix before a
-      # change lands. Only set on the `merge_group` event.
-      E2E_MERGE_QUEUE: "${{ github.event_name == 'merge_group' && '1' || '' }}"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -199,54 +237,19 @@ jobs:
         run: bash scripts/reclaim-gpu.sh
 
       # GPU preflight: fail fast (~90s) instead of hanging to the job cap when the
-      # GPU is missing, the driver is wedged, or VRAM is still saturated by a
-      # leftover serve. A BOUNDED POLL, not a one-shot check: transient contention
-      # (e.g. the reclaim step's kills still draining VRAM) self-heals within
-      # seconds, so we retry up to a ceiling and succeed the moment the GPU is both
-      # responsive AND has enough free VRAM. Only a genuinely absent/wedged/held
-      # GPU reaches the ceiling and fails — with a per-reason message.
+      # GPU is missing, the driver is wedged, or the card is still held by a
+      # leftover serve. Two gates — a bounded poll on free memory, then an
+      # assertion that no leaked E2E engine process survives — because neither
+      # sees what the other does. A serve here needs most of the card, so the
+      # floor is generous; but against a 192 GiB MI300X a 16 GiB floor only trips
+      # past ~176 GiB held, which is why the process gate exists (#446). The
+      # floor stays for the case the process gate cannot see: a non-E2E tenant
+      # exhausting a shared host. See .github/scripts/gpu-preflight.sh.
       - name: GPU preflight (bounded wait for an available GPU)
+        env:
+          GPU_PREFLIGHT_MIN_FREE_GIB: 16
         run: |
-          # A serve here needs most of the card; require a generous free-VRAM
-          # floor so a leftover serve (which the reclaim step should have killed)
-          # is caught, while normal baseline (~300 MB used) passes immediately.
-          MIN_FREE_GIB="${GPU_PREFLIGHT_MIN_FREE_GIB:-16}"
-          CEILING_SECS="${GPU_PREFLIGHT_CEILING_SECS:-90}"
-          min_free=$(( MIN_FREE_GIB * 1024 * 1024 * 1024 ))
-          deadline=$(( SECONDS + CEILING_SECS ))
-          reason="rocm-smi never returned within its timeout (driver wedged or GPU absent)"
-          # Check the deadline only after a poll, never before the first one.
-          # $SECONDS counts whole wall-clock seconds, so a short ceiling can
-          # lapse before the loop is entered, and the verdict below would then
-          # describe a reading that was never taken.
-          first_poll=1
-          while [ "$first_poll" -eq 1 ] || [ "$SECONDS" -lt "$deadline" ]; do
-            first_poll=0
-            # rocm-smi itself can hang on a wedged driver — bound it with timeout.
-            out=$(timeout 15 rocm-smi --showmeminfo vram 2>/dev/null) || { sleep 5; continue; }
-            # Parse the byte value AFTER the colon; the line prefix "GPU[0]" would
-            # otherwise make a naive first-number match pick up the "0".
-            total=$(printf '%s\n' "$out" | grep -i 'VRAM Total Memory' | sed 's/.*: *//' | grep -oE '[0-9]+' | tail -1)
-            used=$(printf '%s\n' "$out" | grep -i 'VRAM Total Used Memory' | sed 's/.*: *//' | grep -oE '[0-9]+' | tail -1)
-            if [ -z "$total" ] || [ -z "$used" ]; then
-              reason="rocm-smi returned no VRAM figures (no AMD GPU detected)"
-              sleep 5; continue
-            fi
-            free=$(( total - used ))
-            if [ "$free" -ge "$min_free" ]; then
-              echo "GPU ready: $(( free / 1024 / 1024 / 1024 )) GiB free (>= ${MIN_FREE_GIB} GiB)."
-              exit 0
-            fi
-            reason="VRAM never dropped below the floor: only $(( free / 1024 / 1024 / 1024 )) GiB free (< ${MIN_FREE_GIB} GiB) — a serve is likely still holding the GPU"
-            echo "waiting: $(( free / 1024 / 1024 / 1024 )) GiB free (< ${MIN_FREE_GIB} GiB)…"
-            sleep 5
-          done
-          echo "::error::GPU preflight failed after ${CEILING_SECS}s: ${reason}"
-          # Name what is holding the card instead of leaving the next reader to
-          # reconstruct it: --report-holders prints per-process VRAM and the
-          # engine processes visible here. Never fails the step itself.
-          bash scripts/reclaim-gpu.sh --report-holders || true
-          exit 1
+          bash .github/scripts/gpu-preflight.sh
 
       # cache: false — on this self-hosted runner we persist the build cache
       # ourselves via CARGO_TARGET_DIR (below). The action's built-in
@@ -353,7 +356,8 @@ jobs:
           # (16 days stale on both MI300X runners when measured — EAI-8057).
           HF_HOME="$E2E_SHARED_CACHE_DIR/huggingface" \
           UV_CACHE_DIR="$E2E_SHARED_UV_CACHE_DIR" \
-            cargo xtask e2e-prewarm --channel release --prewarm-dir "$prewarm"
+            cargo xtask e2e-prewarm --channel release --prewarm-dir "$prewarm" \
+              --release-label "${{ matrix.sdk_version }}"
 
           # Optional scenario-name filter for a scoped dispatch — lets a manual
           # run select only the large-model scenario instead of the whole suite.
@@ -365,11 +369,30 @@ jobs:
             cargo xtask e2e
           fi
 
-      - name: Upload E2E report
-        if: always()
+      # Three mutually-exclusive steps, not one templated `name:` (ROCMAI-430):
+      # `xtask::e2e_report`'s static contract test greps `name: e2e-*` lines
+      # literally, so a GH-expression-computed name would be invisible to it. The
+      # `current` leg's name is UNCHANGED from before this matrix existed — it's
+      # also what a single-element (non-release-branch) matrix always uploads.
+      - name: Upload E2E report (current)
+        if: always() && matrix.sdk_version == 'current'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: e2e-gpu-report
+          path: tests/e2e-cucumber/results/
+
+      - name: Upload E2E report (n-1)
+        if: always() && matrix.sdk_version == 'n-1'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-gpu-n-1-report
+          path: tests/e2e-cucumber/results/
+
+      - name: Upload E2E report (n-2)
+        if: always() && matrix.sdk_version == 'n-2'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-gpu-n-2-report
           path: tests/e2e-cucumber/results/
 
   # Second AMD GPU architecture: the Strix Halo (gfx1151) Ubuntu lane. DevLab
@@ -383,7 +406,7 @@ jobs:
   # still points at RUNNER_WORKSPACE to dodge checkout's `git clean -ffdx`
   # mid-job. Non-blocking while this hardware is proven out.
   e2e-gpu-strix-ubuntu:
-    name: E2E tests (Strix Halo, Ubuntu)
+    name: E2E tests (Strix Halo, Ubuntu, ${{ matrix.channel }}, ${{ matrix.sdk_version }})
     # 45min: see e2e-gpu — one collapsed job runs all serves + per-scenario
     # install sdk; the cap must exceed the run so the job writes platform.json.
     # Raised from 35 after moving to the pool: RUNNER_WORKSPACE (CARGO_TARGET_DIR,
@@ -409,6 +432,10 @@ jobs:
       fail-fast: false
       matrix:
         channel: [release, nightly]
+        # See `e2e-gpu` (ROCMAI-430): layered alongside the pre-existing
+        # `channel` dimension above, not replacing it — this lane is the only
+        # per-PR job with two independent matrix axes.
+        sdk_version: ${{ fromJSON(needs.changes.outputs.sdk_version_matrix) }}
     env:
       E2E_SERVE_TIMEOUT_SECS: "300"
       # A pool host can be busy with other CI work between GPU preflight and
@@ -419,7 +446,7 @@ jobs:
       # Match the MI300X dispatch path: opt into the platform-adaptive large-model
       # scenario only when the manual include_nightly input is enabled.
       E2E_INCLUDE_NIGHTLY: "${{ inputs.include_nightly && '1' || '' }}"
-      # Heavy @merge-queue serves run only in the merge queue; see e2e-gpu.
+      # Heavy @merge-queue serves run only in the merge queue.
       E2E_MERGE_QUEUE: "${{ github.event_name == 'merge_group' && '1' || '' }}"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -434,155 +461,21 @@ jobs:
         run: bash scripts/reclaim-gpu.sh
 
       # GPU preflight: bounded wait so a missing/wedged/held GPU fails fast (~90s)
-      # instead of hanging to the job cap. Transient contention (VRAM still
-      # draining from the reclaim above) self-heals within the ceiling. See the
-      # e2e-gpu job for the rationale. gfx1151 shares system memory, so the free
-      # floor is smaller than the Instinct card, and it is applied to GTT rather
-      # than VRAM whenever the reported VRAM pool is only a BIOS carveout too
-      # small to satisfy it. Against a whole GTT aperture that floor trips only
-      # near exhaustion and will not notice a serve holding a few GiB — see the
-      # note inside the step, and #446 for sizing it proportionally.
+      # instead of hanging to the job cap. Transient contention (memory still
+      # draining from the reclaim above) self-heals within the ceiling. gfx1151
+      # shares system memory, so the free floor is smaller than the Instinct
+      # card, and it is applied to GTT rather than VRAM whenever the reported
+      # VRAM pool is only a BIOS carveout too small to satisfy it. Against a
+      # whole ~62 GiB GTT aperture an 8 GiB floor trips only past ~54 GiB held
+      # and will not notice a serve holding a few GiB — so a second gate asserts
+      # no leaked E2E engine process survives (#446). The floor is kept, not
+      # replaced: it catches a non-E2E tenant exhausting this shared host, which
+      # no process check can see. See .github/scripts/gpu-preflight.sh.
       - name: GPU preflight (bounded wait for an available GPU)
+        env:
+          GPU_PREFLIGHT_MIN_FREE_GIB: 8
         run: |
-          MIN_FREE_GIB="${GPU_PREFLIGHT_MIN_FREE_GIB:-8}"
-          CEILING_SECS="${GPU_PREFLIGHT_CEILING_SECS:-90}"
-          min_free=$(( MIN_FREE_GIB * 1024 * 1024 * 1024 ))
-          deadline=$(( SECONDS + CEILING_SECS ))
-          reason="rocm-smi never returned within its timeout (driver wedged or GPU absent)"
-          # `<POOL> Total [Used ]Memory (B): <n>`, last GPU's row wins. Anchoring
-          # on the `(B)` unit stops a differently-denominated reading being
-          # compared as bytes. The trailing `|| true` yields an empty string for
-          # a pool this host does not report (GTT on a discrete card), which the
-          # guards below handle. This step sets no `shell:`, and neither this
-          # workflow nor its jobs set `defaults.run.shell`, so GitHub runs it as
-          # `bash -e {0}` — the documented default, which unlike an explicit
-          # `shell: bash` does NOT add `-o pipefail`. The pipeline's status is
-          # therefore `tail`'s and `-e` would not fire anyway: the `|| true` is
-          # insurance against a future pipefail, not load-bearing today.
-          field() { printf '%s\n' "$out" | grep -iE "$1 \(B\):" | sed 's/.*: *//' | grep -oE '[0-9]+' | tail -1 || true; }
-          shown=0
-          # Both memos below describe the host, not the moment, so they are
-          # answered once and reused. Re-asking each tick spends the ceiling on
-          # `timeout`s rather than on retries, which is what the ceiling is for.
-          # Neither is ever set from a call that was merely cut short.
-          combined=1
-          gtt_absent=0
-          # Check the deadline only after a poll, never before the first one.
-          # $SECONDS counts whole wall-clock seconds, so a short ceiling can
-          # lapse before the loop is entered, and the verdict below would then
-          # describe a reading that was never taken.
-          first_poll=1
-          while [ "$first_poll" -eq 1 ] || [ "$SECONDS" -lt "$deadline" ]; do
-            first_poll=0
-            out=""
-            rc=0
-            if [ "$combined" -eq 1 ]; then
-              out=$(timeout 15 rocm-smi --showmeminfo vram gtt 2>/dev/null) || rc=$?
-              # Read the marker the way `field` reads the same text, so a casing
-              # variant costs neither a redundant query nor a missed pool.
-              if [ "$rc" -ne 0 ] || ! printf '%s\n' "$out" | grep -qi 'VRAM Total Memory (B):'; then
-                out=""
-                # 124 is `timeout`'s own signal: the call was cut short, which
-                # says nothing about whether this rocm-smi accepts the two-pool
-                # form. Only a call that actually answered may retire it.
-                [ "$rc" -eq 124 ] || combined=0
-              fi
-            fi
-            if [ -z "$out" ]; then
-              # A rocm-smi that rejects the two-pool form: fall back to the
-              # single-pool call this step has always made.
-              out=$(timeout 15 rocm-smi --showmeminfo vram 2>/dev/null) || { sleep 5; continue; }
-            fi
-            total=$(field 'VRAM Total Memory')
-            used=$(field 'VRAM Total Used Memory')
-            gtt_total=$(field 'GTT Total Memory')
-            gtt_used=$(field 'GTT Total Used Memory')
-            if [ -z "$total" ] || [ -z "$used" ]; then
-              reason="rocm-smi returned no VRAM figures (no AMD GPU detected)"
-              sleep 5; continue
-            fi
-            # Print the raw pools once: without them a failure here cannot be
-            # told apart from a genuinely occupied GPU by reading this log.
-            if [ "$shown" -eq 0 ]; then
-              echo "rocm-smi pools (used/total bytes): VRAM ${used}/${total}, GTT ${gtt_used:-n/a}/${gtt_total:-n/a}"
-              shown=1
-            fi
-            # A zero total is a failed reading, not a carveout. Retry instead of
-            # reinterpreting it as an APU and passing the gate on whatever GTT
-            # reports — a wedged driver must not clear this step.
-            if [ "$total" -le 0 ]; then
-              reason="rocm-smi reported a VRAM total of 0 (unparseable or wedged reading)"
-              sleep 5; continue
-            fi
-            pool=VRAM
-            if [ "$total" -lt "$min_free" ]; then
-              # An APU has no private VRAM: this total is the fixed BIOS carveout
-              # while the engine allocates out of GTT-backed system RAM, so the
-              # floor is being applied to a pool the engine never draws on — it
-              # fails healthy hosts and stays quiet on starved ones. See
-              # `vram_capacity_is_meaningful` in apps/rocm/src/main.rs, which
-              # withholds the product's equivalent warning for the same reason.
-              # What the floor then means: ${MIN_FREE_GIB} GiB against the whole
-              # GTT aperture, so it trips only near exhaustion and will not
-              # notice a serve holding a few GiB. Same sensitivity this floor had
-              # on a large-carveout host rather than a new gap, but coarse either
-              # way — see #446.
-              # Discrete cards never reach this branch — their VRAM total is far
-              # above the floor.
-              if [ "$gtt_absent" -eq 0 ] && { [ -z "$gtt_total" ] || [ -z "$gtt_used" ]; }; then
-                # The two-pool form above may have been rejected outright, in
-                # which case the fallback query carried no GTT rows. Ask for the
-                # pool on its own before concluding the host has none, or a CLI
-                # quirk fails a healthy APU with the very report this avoids.
-                rc=0
-                out=$(timeout 15 rocm-smi --showmeminfo gtt 2>/dev/null) || rc=$?
-                gtt_total=$(field 'GTT Total Memory')
-                gtt_used=$(field 'GTT Total Used Memory')
-                if [ -n "$gtt_total" ] && [ -n "$gtt_used" ]; then
-                  # The line printed above necessarily read `GTT n/a/n/a` — the
-                  # combined query is what failed. Report what the pool the gate
-                  # now decides on actually holds, or the log contradicts the
-                  # verdict on precisely the hosts this branch exists for.
-                  echo "rocm-smi GTT pool (separate query): ${gtt_used}/${gtt_total}"
-                elif [ "$rc" -ne 0 ]; then
-                  # A query that failed is not a host without the pool. Keeping
-                  # them apart stops a flaky call being reported as a hardware
-                  # fact, and leaves the memo below for the real thing.
-                  reason="VRAM total is $(( total / 1024 / 1024 )) MiB, under the ${MIN_FREE_GIB} GiB floor, and the GTT query itself failed (rocm-smi exit ${rc}) — the pool was never read"
-                  sleep 5; continue
-                else
-                  gtt_absent=1
-                fi
-              fi
-              if [ -z "$gtt_total" ] || [ -z "$gtt_used" ]; then
-                reason="VRAM total is $(( total / 1024 / 1024 )) MiB, under the ${MIN_FREE_GIB} GiB floor, and rocm-smi reported no GTT pool — the floor cannot be met from VRAM on this host"
-                sleep 5; continue
-              fi
-              # A zero total is a failed reading on this pool too. Without this
-              # the gate reports `0 GiB free … a serve is likely still holding
-              # the GPU` — the exact false report this step exists to stop, one
-              # pool over from where it was stopped.
-              if [ "$gtt_total" -le 0 ]; then
-                reason="rocm-smi reported a GTT total of 0 (unparseable or wedged reading)"
-                sleep 5; continue
-              fi
-              pool=GTT; total="$gtt_total"; used="$gtt_used"
-            fi
-            free=$(( total - used ))
-            if [ "$free" -ge "$min_free" ]; then
-              echo "GPU ready: $(( free / 1024 / 1024 / 1024 )) GiB ${pool} free (>= ${MIN_FREE_GIB} GiB)."
-              exit 0
-            fi
-            reason="${pool} never dropped below the floor: only $(( free / 1024 / 1024 / 1024 )) GiB free (< ${MIN_FREE_GIB} GiB) — a serve is likely still holding the GPU"
-            echo "waiting: $(( free / 1024 / 1024 / 1024 )) GiB ${pool} free (< ${MIN_FREE_GIB} GiB)…"
-            sleep 5
-          done
-          echo "::error::GPU preflight failed after ${CEILING_SECS}s: ${reason}"
-          # Name what is holding the card instead of leaving the next reader to
-          # reconstruct it: --report-holders prints per-process VRAM and the
-          # engine processes visible here. Never fails the step itself.
-          bash scripts/reclaim-gpu.sh --report-holders || true
-          exit 1
+          bash .github/scripts/gpu-preflight.sh
 
       # Pool hosts don't preinstall cargo/rustup; bootstrap ourselves with
       # --no-modify-path so it never writes to $HOME/.profile (setup-rust-
@@ -626,7 +519,8 @@ jobs:
           # See the e2e-gpu lane and `xtask e2e-prewarm` for why the old
           # existence-only guard froze this lane on its first runtime (EAI-8057).
           HF_HOME="$E2E_SHARED_CACHE_DIR/huggingface" \
-            cargo xtask e2e-prewarm --channel ${{ matrix.channel }} --prewarm-dir "$prewarm"
+            cargo xtask e2e-prewarm --channel ${{ matrix.channel }} --prewarm-dir "$prewarm" \
+              --release-label "${{ matrix.sdk_version }}"
 
           # Optional scenario-name filter for a scoped manual dispatch.
           NAME_FILTER="${{ github.event.inputs.name_filter }}"
@@ -637,18 +531,37 @@ jobs:
             cargo xtask e2e
           fi
 
-      - name: Upload E2E report
-        if: always()
+      # Three mutually-exclusive steps per the `sdk_version` leg, same as
+      # `e2e-gpu` (ROCMAI-430); the `current` leg's name is unchanged from
+      # before the matrix existed, keeping `${{ matrix.channel }}` as the only
+      # templated segment so `without_channel_matrix_segment` still strips it
+      # down to the canonical base name.
+      - name: Upload E2E report (current)
+        if: always() && matrix.sdk_version == 'current'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: e2e-gpu-strix-ubuntu-${{ matrix.channel }}-report
+          path: tests/e2e-cucumber/results/
+
+      - name: Upload E2E report (n-1)
+        if: always() && matrix.sdk_version == 'n-1'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-gpu-strix-ubuntu-${{ matrix.channel }}-n-1-report
+          path: tests/e2e-cucumber/results/
+
+      - name: Upload E2E report (n-2)
+        if: always() && matrix.sdk_version == 'n-2'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-gpu-strix-ubuntu-${{ matrix.channel }}-n-2-report
           path: tests/e2e-cucumber/results/
 
   # First real Windows GPU coverage: the Strix Halo Windows 11 runner. The
   # existing windows-build-and-test uses GitHub-hosted windows-latest, which has
   # no GPU. Non-blocking so it never gates the PR.
   e2e-gpu-strix-windows:
-    name: E2E tests (Strix Halo, Windows)
+    name: E2E tests (Strix Halo, Windows, ${{ matrix.sdk_version }})
     # 45min: see e2e-gpu — one collapsed job runs all serves + per-scenario
     # install sdk; the cap must exceed the run so the job writes platform.json.
     # Matches e2e-gpu-strix-ubuntu's raised cap: this lane moved onto the same
@@ -658,6 +571,10 @@ jobs:
     timeout-minutes: 45
     runs-on: [self-hosted, windows, devlab-dispatch, strix-halo]
     needs: [changes]
+    strategy:
+      fail-fast: false
+      matrix:
+        sdk_version: ${{ fromJSON(needs.changes.outputs.sdk_version_matrix) }}
     # See `e2e-gpu`: no build-and-test gate (cross-workflow); strix-windows.
     if: >-
       always()
@@ -682,7 +599,7 @@ jobs:
       # Match the Linux Strix dispatch path: opt into the platform-adaptive
       # large-model scenario only when the manual input is enabled.
       E2E_INCLUDE_NIGHTLY: "${{ inputs.include_nightly && '1' || '' }}"
-      # Heavy @merge-queue serves run only in the merge queue; see e2e-gpu.
+      # Heavy @merge-queue serves run only in the merge queue.
       E2E_MERGE_QUEUE: "${{ github.event_name == 'merge_group' && '1' || '' }}"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -730,8 +647,21 @@ jobs:
       # available so a wedged/held GPU fails fast instead of hanging to the cap.
       # BEST-EFFORT because the Windows ROCm GPU query tool isn't verified here —
       # if no rocm-smi is found we WARN and continue rather than false-fail a
-      # working runner. When rocm-smi IS present we poll free VRAM the same way as
-      # the Linux jobs and fail only after the ceiling.
+      # working runner. When rocm-smi IS present we poll free memory the same way
+      # as the Linux jobs and fail only after the ceiling.
+      #
+      # WHAT THIS DOES NOT CATCH, and the Linux lanes now do. This is a
+      # free-memory floor ONLY. A fixed 8 GiB against a whole ~62 GiB gfx1151
+      # aperture trips only past ~54 GiB held, so a leftover llama-server
+      # holding 10-20 GiB clears it — the gap #446 was opened about. The bash
+      # lanes close it by asserting no leaked E2E engine process survives
+      # (`reclaim-gpu.sh --assert-clear`); native Windows has no bash to run
+      # that with, so this copy keeps memory-only semantics. A PowerShell
+      # equivalent, reading Win32_Process the way the reclaim step above
+      # already does, is deliberate follow-up — not something this block
+      # silently already has. Kept as a separate copy for the same reason the
+      # reclaim is (EAI-8751), and pinned against drift by
+      # `apu_preflight_twins_do_not_drift` in xtask/src/workflow_contract.rs.
       - name: GPU preflight (bounded wait for an available GPU)
         shell: powershell
         run: |
@@ -762,8 +692,9 @@ jobs:
           # precision, so the first poll is skipped only if the step stalls for
           # the whole ceiling between computing the deadline and entering the
           # loop, which the production ceiling makes unreachable. The bash lanes
-          # poll first because $SECONDS counts whole wall-clock seconds, so a
-          # short ceiling there could lapse after a stall of microseconds (#607).
+          # poll first (#608) because $SECONDS counts whole wall-clock seconds,
+          # so a short ceiling there could lapse after a stall of microseconds
+          # (#607).
           while ((Get-Date) -lt $deadline) {
             $out = ""
             if ($combined) {
@@ -925,7 +856,7 @@ jobs:
           # decision lives in `xtask e2e-prewarm` rather than being reimplemented
           # here in PowerShell, so this lane and the Linux lanes cannot drift
           # (EAI-8057; the old existence-only guard never reinstalled).
-          cargo xtask e2e-prewarm --channel release --prewarm-dir "$prewarm"
+          cargo xtask e2e-prewarm --channel release --prewarm-dir "$prewarm" --release-label "${{ matrix.sdk_version }}"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
           # Optional scenario-name filter for a scoped manual dispatch.
@@ -937,11 +868,25 @@ jobs:
             cargo xtask e2e
           }
 
-      - name: Upload E2E report
-        if: always()
+      - name: Upload E2E report (current)
+        if: always() && matrix.sdk_version == 'current'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: e2e-gpu-strix-windows-report
+          path: tests/e2e-cucumber/results/
+
+      - name: Upload E2E report (n-1)
+        if: always() && matrix.sdk_version == 'n-1'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-gpu-strix-windows-n-1-report
+          path: tests/e2e-cucumber/results/
+
+      - name: Upload E2E report (n-2)
+        if: always() && matrix.sdk_version == 'n-2'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-gpu-strix-windows-n-2-report
           path: tests/e2e-cucumber/results/
 
   # WSL2 coverage on real hardware: an Ubuntu-24.04 distro installed fresh
@@ -958,7 +903,7 @@ jobs:
   # scenarios the host cannot satisfy resolve to skip from the capability
   # probe, so nothing is filtered out here.
   e2e-wsl:
-    name: E2E tests (Strix Halo, WSL2)
+    name: E2E tests (Strix Halo, WSL2, ${{ matrix.sdk_version }})
     # 120min: like the native pool lanes, every job here is cold (fresh distro,
     # fresh build, fresh prewarm) — plus the ~5min/job distro-install overhead
     # the pool maintainer flagged. Conservative starting budget; tune down once
@@ -969,6 +914,10 @@ jobs:
     timeout-minutes: 120
     runs-on: [self-hosted, windows, devlab-dispatch, strix-halo]
     needs: [changes]
+    strategy:
+      fail-fast: false
+      matrix:
+        sdk_version: ${{ fromJSON(needs.changes.outputs.sdk_version_matrix) }}
     # See `e2e-gpu`: no build-and-test gate (cross-workflow); strix-wsl. Gated on
     # `serve` like the sibling lanes rather than the broader `heavy`: the
     # consolidated report gates on `serve` too, so a heavy-but-not-serve change
@@ -998,7 +947,7 @@ jobs:
       # Match the other hardware lanes: opt into the platform-adaptive
       # large-model scenario only when the manual include_nightly input is on.
       E2E_INCLUDE_NIGHTLY: "${{ inputs.include_nightly && '1' || '' }}"
-      # Heavy @merge-queue serves run only in the merge queue; see e2e-gpu.
+      # Heavy @merge-queue serves run only in the merge queue.
       E2E_MERGE_QUEUE: "${{ github.event_name == 'merge_group' && '1' || '' }}"
       # apps/rocm/build.rs falls back to GitHub's own GITHUB_HEAD_REF/
       # GITHUB_REF_NAME when this isn't set, but those never reach the WSL
@@ -1247,8 +1196,15 @@ jobs:
       # access under WSL is exactly what this lane is proving out, so an absent
       # rocm-smi is a reported condition, not a job failure: the capability probe
       # then resolves @requires-gpu scenarios to skip and the rest still runs. A
-      # GPU that IS present but stays held by a leftover serve still fails, since
-      # that would corrupt the serve scenarios' results. `rocm-smi` itself isn't
+      # GPU that IS present but stays held fails the job, since that would
+      # corrupt the serve scenarios' results — though "held" means less here
+      # than on the native lanes: this body keeps only the free-memory floor and
+      # does not run `reclaim-gpu.sh --assert-clear`, so a serve holding a few
+      # GiB of a whole GTT aperture clears it. The script is not invoked because
+      # this body runs inside the WSL distro through Invoke-WslBash.ps1, where
+      # the repo checkout is not at a path this step can assume. See #446;
+      # closing it is follow-up work, with the equivalent Windows gap.
+      # `rocm-smi` itself isn't
       # installed by any step above (the maintainer's ask covered `/dev/dxg` +
       # `librocdxg.so`, not a full ROCm apt stack), so this step is expected to
       # warn-and-skip rather than report a real reading — a deliberate scope
@@ -1451,7 +1407,8 @@ jobs:
           # See the e2e-gpu lane and `xtask e2e-prewarm` for why the old
           # existence-only guard froze this lane on its first runtime (EAI-8057).
           HF_HOME="$E2E_SHARED_CACHE_DIR/huggingface" \
-            cargo xtask e2e-prewarm --channel release --prewarm-dir "$prewarm"
+            cargo xtask e2e-prewarm --channel release --prewarm-dir "$prewarm" \
+              --release-label "${{ matrix.sdk_version }}"
 
           # Optional scenario-name filter for a scoped manual dispatch.
           NAME_FILTER="${{ github.event.inputs.name_filter }}"
@@ -1496,23 +1453,175 @@ jobs:
           }
           exit 0
 
-      - name: Upload E2E report
-        if: always()
+      # Three literal-named conditional steps rather than one templated `name:`
+      # — see e2e-gpu's upload-step comment for why. `if-no-files-found: error`
+      # on all three: the copy-out step above is deliberately best-effort (it
+      # must not report red just because an earlier step already failed the
+      # job), so this is the only place left to catch a copy that failed for
+      # its own reason: default `warn` would upload nothing, and the
+      # consolidated report's `discover()` (xtask/src/e2e_report.rs) simply
+      # omits any platform with no report.json rather than flagging it, so the
+      # lane would silently vanish from the report instead of showing as a
+      # failure. Only the WSL lanes need this: every other lane writes
+      # report.json directly in-job, with no extra guest-to-host copy step
+      # that can fail on its own.
+      - name: Upload E2E report (current)
+        if: always() && matrix.sdk_version == 'current'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: e2e-gpu-strix-wsl-report
           path: tests/e2e-cucumber/results/
-          # The copy-out step above is deliberately best-effort (it must not
-          # report red just because an earlier step already failed the job),
-          # so this is the only place left to catch a copy that failed for its
-          # own reason: default `warn` would upload nothing, and the
-          # consolidated report's `discover()` (xtask/src/e2e_report.rs) simply
-          # omits any platform with no report.json rather than flagging it, so
-          # the lane would silently vanish from the report instead of showing
-          # as a failure. Only the WSL lanes need this: every other lane
-          # writes report.json directly in-job, with no extra guest-to-host
-          # copy step that can fail on its own.
           if-no-files-found: error
+
+      - name: Upload E2E report (n-1)
+        if: always() && matrix.sdk_version == 'n-1'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-gpu-strix-wsl-n-1-report
+          path: tests/e2e-cucumber/results/
+          if-no-files-found: error
+
+      - name: Upload E2E report (n-2)
+        if: always() && matrix.sdk_version == 'n-2'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-gpu-strix-wsl-n-2-report
+          path: tests/e2e-cucumber/results/
+          if-no-files-found: error
+
+  e2e-gpu-w7900:
+    name: E2E tests (W7900, ${{ matrix.sdk_version }})
+    # 90min: matches every other Linux GPU lane — same collapsed suite. The card
+    # is smaller than the Instinct parts, so do not tighten this below their cap.
+    timeout-minutes: 90
+    # `w7900` names the hardware rather than reusing the generic `amd-gpu`:
+    # GitHub matches a job to any runner whose labels are a superset, so a shared
+    # label would let this workstation card pick up Instinct-targeted work and
+    # vice versa.
+    runs-on: [self-hosted, linux, w7900]
+    needs: [changes]
+    strategy:
+      fail-fast: false
+      matrix:
+        sdk_version: ${{ fromJSON(needs.changes.outputs.sdk_version_matrix) }}
+    if: >-
+      always()
+      && needs.changes.result == 'success'
+      && (
+        (github.event_name != 'workflow_dispatch'
+          && needs.changes.outputs.serve == 'true')
+        || (github.event_name == 'workflow_dispatch'
+          && (inputs.platform == 'all' || inputs.platform == 'w7900'))
+      )
+    # Non-blocking while this hardware is proven out, as the MI350P lane is.
+    # Flip to `false` once it has a track record — that is what the older lanes
+    # run with, so a real regression on this silicon shows red instead of
+    # always green.
+    continue-on-error: true
+    env:
+      E2E_SERVE_TIMEOUT_SECS: "300"
+      E2E_INCLUDE_NIGHTLY: "${{ inputs.include_nightly && '1' || '' }}"
+      # Full serve matrix at the merge-queue gate.
+      E2E_MERGE_QUEUE: "${{ github.event_name == 'merge_group' && '1' || '' }}"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Reclaim the GPU before running: a serve leaked by a killed or
+      # timed-out prior run (its Drop teardown never executed) keeps an engine
+      # process on the card and starves this job's serves. Scoped to E2E-owned
+      # trees: a manual /workload serve is matched only if its command line
+      # also names an E2E root — see the exposure documented in
+      # scripts/reclaim-gpu.sh.
+      - name: Reclaim GPU from stray E2E processes
+        run: bash scripts/reclaim-gpu.sh
+
+      # Bounded wait, as in e2e-gpu, then an assertion that no leaked E2E engine
+      # process survives. One card per job, so rocm-smi sees exactly the GPU this
+      # lane runs on. The floor stays at the shared 16 GiB default, which is a
+      # flat constant rather than a proportion of capacity: it only has to be
+      # high enough to catch a leftover serve still holding the card, and low
+      # enough that a clean host passes on the first poll. e2e-gpu uses the same
+      # 16 GiB against a very different VRAM size for exactly that reason — do
+      # NOT scale it down for a smaller part. On a 48GB card that floor only
+      # trips past ~32 GiB held, so the floor alone would miss a leftover serve
+      # holding less; the process gate is what catches it (#446). The floor is
+      # kept for the case the process gate cannot see: a non-E2E tenant
+      # exhausting the host. See .github/scripts/gpu-preflight.sh.
+      - name: GPU preflight (bounded wait for an available GPU)
+        env:
+          GPU_PREFLIGHT_MIN_FREE_GIB: 16
+        run: |
+          bash .github/scripts/gpu-preflight.sh
+
+      # cache: false for the same reason as e2e-gpu — the build cache is kept in
+      # CARGO_TARGET_DIR on the work volume, not in GitHub's cache service.
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          cache: false
+
+      - name: Run E2E tests on W7900
+        run: |
+          # $RUNNER_WORKSPACE is on a volume that outlives any single job, so the
+          # cargo target dir and the shared caches are still warm on the next one.
+          export CARGO_TARGET_DIR="$RUNNER_WORKSPACE/e2e-target"
+          export E2E_SHARED_CACHE_DIR="$RUNNER_WORKSPACE/e2e-shared"
+          # Same mount as the runtimes it populates, so uv hardlinks into them
+          # instead of copying, and inside the directory the runner's uv-cache-gc
+          # initContainer bounds — see the e2e-gpu lane for both mechanisms and
+          # why a cache one level deeper keeps the links but loses the floor.
+          runner_root="$(dirname "$(dirname "$RUNNER_WORKSPACE")")"
+          export E2E_SHARED_UV_CACHE_DIR="$runner_root/uv-cache"
+          # Pre-warm one shared runtime in place before the suite. Not an
+          # optimization — `install sdk` bakes absolute paths into the runtime
+          # manifest, so installing anywhere temporary breaks every later serve.
+          # See e2e-gpu for the full rationale.
+          prewarm="$RUNNER_WORKSPACE/e2e-prewarm-multi-arch-v2"
+          export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
+
+          # See the e2e-gpu lane for why the e2e-test-hooks feature must match
+          # what `cargo xtask e2e` would build.
+          cargo build --release -p rocm -p rocmd --features rocm/e2e-test-hooks
+          export ROCM_CLI_BINARY="$CARGO_TARGET_DIR/release/rocm"
+          export ROCM_CLI_ROCMD_BINARY="$CARGO_TARGET_DIR/release/rocmd"
+
+          # Pre-warm once, serially, in place (no mv/symlink), and refresh it when
+          # the channel index has moved on — the tree is a cache, not a one-shot.
+          # See the e2e-gpu lane and `xtask e2e-prewarm`.
+          HF_HOME="$E2E_SHARED_CACHE_DIR/huggingface" \
+          UV_CACHE_DIR="$E2E_SHARED_UV_CACHE_DIR" \
+            cargo xtask e2e-prewarm --channel release --prewarm-dir "$prewarm" \
+              --release-label "${{ matrix.sdk_version }}"
+
+          # Optional scenario-name filter for a scoped manual dispatch — a cheap
+          # way to exercise this lane against a single scenario without the full suite.
+          NAME_FILTER="${{ github.event.inputs.name_filter }}"
+          if [ -n "$NAME_FILTER" ]; then
+            echo "name filter active: $NAME_FILTER"
+            cargo xtask e2e -- --name "$NAME_FILTER"
+          else
+            cargo xtask e2e
+          fi
+
+      - name: Upload E2E report (current)
+        if: always() && matrix.sdk_version == 'current'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-gpu-w7900-report
+          path: tests/e2e-cucumber/results/
+
+      - name: Upload E2E report (n-1)
+        if: always() && matrix.sdk_version == 'n-1'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-gpu-w7900-n-1-report
+          path: tests/e2e-cucumber/results/
+
+      - name: Upload E2E report (n-2)
+        if: always() && matrix.sdk_version == 'n-2'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-gpu-w7900-n-2-report
+          path: tests/e2e-cucumber/results/
 
   # Consolidate this workflow's self-hosted platform reports into one GPU-side
   # cross-platform grid (Summary + merged HTML). Distinct name from ci.yml's
@@ -1524,12 +1633,17 @@ jobs:
     name: E2E consolidated report (self-hosted)
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # `actions: read` lets the missing-report check list this run's artifacts.
+    permissions:
+      contents: read
+      actions: read
     needs:
       - changes
       - e2e-gpu
       - e2e-gpu-strix-ubuntu
       - e2e-gpu-strix-windows
       - e2e-wsl
+      - e2e-gpu-w7900
     # Gate on `serve`: every lane this report consolidates (the GPU jobs) is now
     # serve-gated, so a serve-only change runs them and their report must still be
     # produced. On dispatch `serve` is unset, so also run when the trigger was
@@ -1563,6 +1677,56 @@ jobs:
           cargo xtask e2e-report \
             --artifacts-dir e2e-artifacts \
             --html-out consolidated/index.html >> "$GITHUB_STEP_SUMMARY"
+
+      # A lane that dies before writing report.json (preflight, build, a crash
+      # before results exist) uploads nothing, and `discover()` can only render
+      # the reports that arrived, so that lane would drop out of the grid with
+      # no row and no FAIL. On a `continue-on-error` lane nothing else is red
+      # either. So check it here: every lane that ran (any `needs` result but
+      # `skipped`) must have uploaded its report artifact. This reads the run's
+      # artifact list rather than e2e-artifacts/, because download-artifact
+      # flattens a single match into the root and loses its name. The list also
+      # holds earlier attempts' artifacts, so a re-run that uploads nothing can
+      # pass on the first attempt's report: this can miss a lane, but never
+      # flags one that did upload. A lane with a `matrix.channel` axis is checked
+      # through its `release` leg (the matrix context does not exist in this
+      # job), which stands for the whole lane. LANE_REPORTS, and this script's
+      # behaviour,
+      # are pinned by xtask's workflow contract tests. The annotation quotes the
+      # lane's `needs` result verbatim; on a `continue-on-error` lane it may read
+      # `success` even though the lane failed, so the absent artifact is the
+      # signal, not that value. `!cancelled()`, not `always()`: a run
+      # superseded mid-flight cuts lanes off before upload, which is not a gap.
+      - name: Check every lane that ran uploaded its report
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEEDS: ${{ toJSON(needs) }}
+          LANE_REPORTS: |
+            e2e-gpu=e2e-gpu-report
+            e2e-gpu-strix-ubuntu=e2e-gpu-strix-ubuntu-release-report
+            e2e-gpu-strix-windows=e2e-gpu-strix-windows-report
+            e2e-wsl=e2e-gpu-strix-wsl-report
+            e2e-gpu-w7900=e2e-gpu-w7900-report
+        run: |
+          uploaded=$(gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts" \
+            --jq '.artifacts[].name') || {
+            echo "::error::could not list this run's artifacts, so no lane was checked"
+            exit 1
+          }
+          missing=0
+          while IFS='=' read -r job artifact; do
+            [ -n "$job" ] || continue
+            result=$(jq -r --arg job "$job" '.[$job].result // "absent"' <<<"$NEEDS")
+            [ "$result" = skipped ] && continue
+            if ! grep -qxF "$artifact" <<<"$uploaded"; then
+              echo "::error::lane $job ran (needs result: $result) but uploaded no $artifact, so it is missing from the consolidated report"
+              echo "- :x: \`$job\` ran (needs result: $result) but uploaded no \`$artifact\`; it is missing from the grid above" >> "$GITHUB_STEP_SUMMARY"
+              missing=1
+            fi
+          done <<<"$LANE_REPORTS"
+          exit "$missing"
 
       - name: Upload consolidated report
         if: always()

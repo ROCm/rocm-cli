@@ -337,6 +337,20 @@ pub fn gen_tps_aggregate(tps: Option<f64>, any_held: bool) -> String {
     }
 }
 
+/// The "…and N more" summary line for a list capped to its first `cap`
+/// items, or `None` when `len` doesn't exceed `cap`.
+///
+/// Shared by every capped list (`tabs::pane::live_lines`'s
+/// `OpenServeWizard`/`OpenServices` arms, `ui::quit_confirm_body_with`) so
+/// the overflow wording and arithmetic stay identical across them. Each call
+/// site still passes its own `cap` literal alongside its own separate
+/// `.take(N)` — this does not keep the two in sync if one changes without
+/// the other; it only keeps what "N more" means, and how it's phrased, from
+/// drifting between call sites.
+pub fn overflow_line(len: usize, cap: usize) -> Option<String> {
+    (len > cap).then(|| format!("  …and {} more", len - cap))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -791,5 +805,16 @@ mod tests {
     fn gen_tps_detail_freshness_legacy_says_unknown() {
         let out = gen_tps_detail_freshness(None, None);
         assert_eq!(out, "unknown");
+    }
+
+    #[test]
+    fn overflow_line_none_when_not_exceeding_cap() {
+        assert_eq!(overflow_line(0, 5), None);
+        assert_eq!(overflow_line(5, 5), None);
+    }
+
+    #[test]
+    fn overflow_line_reports_the_remainder() {
+        assert_eq!(overflow_line(7, 5), Some("  …and 2 more".to_string()));
     }
 }
