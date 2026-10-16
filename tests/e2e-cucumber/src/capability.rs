@@ -34,6 +34,30 @@ fn rocm_binary() -> String {
     std::env::var("ROCM_CLI_BINARY").unwrap_or_else(|_| "rocm".to_string())
 }
 
+/// Whether a container runtime is usable here.
+///
+/// Probed rather than assumed: a developer machine may have the client without
+/// a running daemon.
+///
+/// Necessary but not sufficient for `@requires-docker` — see the
+/// `requires_docker` gate in `expectation.rs`, which also wants an explicit
+/// opt-in. A daemon answering does not mean the fixture image can be built: a
+/// self-hosted runner behind a restricted network has both a working daemon
+/// and no route to the package mirror the image installs from.
+///
+/// Also used by [`HostCapability::engine_available`] for `"aim"`: unlike
+/// lemonade/vllm, the AIM adapter is always present in the binary's inventory
+/// (a static description, not a liveness probe — see `rocm engines list`), so
+/// "can this engine start" must check for a reachable Docker daemon itself.
+pub(crate) fn docker_available() -> bool {
+    std::process::Command::new("docker")
+        .arg("info")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
 /// What `rocm serve <model>` would pick with no `--engine`, from GPU family + OS.
 ///
 /// Mirrors the product precedence in `preferred_serve_engine_for_host_gpu_summary`
@@ -140,6 +164,7 @@ impl HostCapability {
                 !self.os_family.eq_ignore_ascii_case("windows")
                     && family_prefers_vllm(self.gfx_target.as_deref())
             }
+            "aim" => self.available_engines.iter().any(|e| e == engine) && docker_available(),
             _ => self.available_engines.iter().any(|e| e == engine),
         }
     }
