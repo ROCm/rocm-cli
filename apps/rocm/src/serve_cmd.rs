@@ -275,7 +275,8 @@ fn engine_recipe_with_generation_defaults(
         engine: engine.to_owned(),
         ..EngineRecipeHint::default()
     });
-    if engine.eq_ignore_ascii_case("vllm") {
+    if engine.eq_ignore_ascii_case("vllm") || engine.eq_ignore_ascii_case("aim") {
+        // AIM images bundle vLLM, so its `--override-generation-config` flag applies unchanged.
         let mut overrides = serde_json::Map::new();
         if let Some(temperature) = defaults.temperature {
             overrides.insert("temperature".to_owned(), serde_json::json!(temperature));
