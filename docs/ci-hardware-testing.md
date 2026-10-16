@@ -45,15 +45,10 @@ rung instead of being removed outright.
 
 The release-candidate rung's `release/**` trigger merged in PR #415, so
 `e2e-selfhosted.yml` on `main` already triggers on `push: branches: [main,
-"release/**"]`. `cargo xtask e2e-prewarm` has no `--version`/`--build-date`
-pin today — every lane, including this one, tracks whatever build the channel
-index currently serves (see the pre-warm section below for the exact,
-unpinned invocation). Pinning it to hold at `n-1`/`n-2` instead of
-always-latest, and wiring an actual `sdk_version: [current, n-1, n-2]` matrix
-axis into the release-branch trigger, is pending work (ROCMAI-430): nothing
-in this repo today maps "n-1"/"n-2" to a concrete SDK version
-([`therock.rs`](../apps/rocm/src/therock.rs)'s `parse_simple_index_versions`
-is private).
+"release/**"]`. On that trigger, every self-hosted GPU job additionally pins
+`cargo xtask e2e-prewarm --release-label` to hold at `n-1`/`n-2` instead of
+always tracking the channel's latest build (ROCMAI-430; see "Triggers"
+below for the full `sdk_version: [current, n-1, n-2]` matrix mechanism).
 
 ## Platforms
 
@@ -199,12 +194,21 @@ setup: enable the wiki and save its first page in the GitHub web UI, because
 GitHub does not create the wiki's git repository until then and the job fails
 with that explanation until it exists.
 
-The lane artifacts are named canonically (`e2e-report`, `e2e-gpu-report`,
-`e2e-gpu-rad3-report`, `e2e-gpu-mi350p-report`, `e2e-gpu-w7900-report`,
-`e2e-gpu-strix-ubuntu-report`, `e2e-gpu-strix-windows-report`,
-`e2e-gpu-strix-wsl-report`) in `ci.yml` and
+The lane artifacts are named canonically (`e2e-gpu-mi350p-report`,
+`e2e-gpu-n-1-report`, `e2e-gpu-n-2-report`, `e2e-gpu-rad3-report`,
+`e2e-gpu-report`, `e2e-gpu-strix-ubuntu-n-1-report`,
+`e2e-gpu-strix-ubuntu-n-2-report`, `e2e-gpu-strix-ubuntu-report`,
+`e2e-gpu-strix-windows-n-1-report`, `e2e-gpu-strix-windows-n-2-report`,
+`e2e-gpu-strix-windows-report`, `e2e-gpu-strix-wsl-n-1-report`,
+`e2e-gpu-strix-wsl-n-2-report`, `e2e-gpu-strix-wsl-report`,
+`e2e-gpu-w7900-n-1-report`, `e2e-gpu-w7900-n-2-report`,
+`e2e-gpu-w7900-report`, `e2e-report`) in `ci.yml` and
 `e2e-selfhosted.yml`, because the report derives each platform's name and OS
-from the artifact name. `nightly.yml`'s self-hosted lanes run a `channel:
+from the artifact name. The `-n-1`/`-n-2` suffixes are the non-`current` legs
+of the per-PR `sdk_version` matrix (below, under "Triggers"); a `current`-leg
+artifact keeps its pre-matrix name unchanged. `rad3`/`mi350p` are nightly-only
+lanes (ROCMAI-125) and don't run that matrix, so they have no `-n-1`/`-n-2`
+entries. `nightly.yml`'s self-hosted lanes run a `channel:
 [release, nightly]` matrix and append the channel as the final segment before
 the `-report` affix (e.g. `e2e-gpu-strix-windows-nightly-report`); the report
 strips that segment before matching, so the platform/OS derivation is
@@ -266,7 +270,27 @@ The GPU jobs (in `e2e-selfhosted.yml`) run automatically on `push`,
 branch, so pushing to a release branch runs the full self-hosted matrix ahead
 of cutting the `v*` tag that `release.yml` builds/publishes from — this is the
 release-candidate regression gate; `pull_request` fires against any base
-branch. `serve` is narrower than `heavy`: it matches only
+branch.
+
+On a release-branch push, every self-hosted GPU job additionally expands into
+a `strategy.matrix.sdk_version` of `[current, n-1, n-2]` (ROCMAI-430) — three
+legs, each pinning `cargo xtask e2e-prewarm --release-label <leg>` to a
+different TheRock SDK version (`current` tracks the channel's latest;
+`n-1`/`n-2` pin the prior two released versions from
+[`xtask/src/rocm_releases.rs`](../xtask/src/rocm_releases.rs), a static table
+seeded from the official
+[release list](https://rocm.docs.amd.com/en/latest/release/versions.html)).
+Off a release-branch push the matrix resolves to `[current]` only, so an
+ordinary PR run is unaffected. Each leg uploads its own artifact (the
+`-n-1`/`-n-2` suffix above); the pre-warm's runtime-key design lets all three
+versions share one pre-warmed runtime tree rather than needing separate ones.
+`e2e-gpu-strix-ubuntu` layers this `sdk_version` axis alongside its
+pre-existing `channel` axis (ROCMAI-125) rather than replacing it, so a
+release-branch push runs all six `channel` × `sdk_version` combinations on
+that lane; `rad3`/`mi350p` are nightly-only (above) and don't run this matrix
+at all.
+
+`serve` is narrower than `heavy`: it matches only
 paths that can change serve *behaviour* or the GPU E2E harness (the engines, the
 serve code path in `apps/rocm`/`apps/rocmd`, `rocm-core`, the e2e-cucumber crate,
 plus broad-dependency safety nets), **not** a blanket `**/*.rs`. So a Rust change
