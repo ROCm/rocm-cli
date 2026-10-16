@@ -63,6 +63,13 @@ where
     builder
 }
 
+/// The exact text of the warning `ChatGptAgentClient::complete` logs when
+/// `temperature`/`top_p`/`max_tokens` is set. Shared with the test below so
+/// the regression test asserts the SAME message the operator actually sees,
+/// rather than a copy that can silently drift from it.
+const CHATGPT_DROPPED_PARAMS_WARNING: &str =
+    "temperature/top_p/max_tokens are ignored by the ChatGPT backend";
+
 fn validate_chatgpt_inference_params(params: &InferenceParams) -> Result<(), AgentError> {
     if params.temperature.is_some() && params.top_p.is_some() {
         return Err(AgentError::Build(
@@ -603,7 +610,7 @@ where
                 temperature = ?self.params.temperature,
                 top_p = ?self.params.top_p,
                 max_tokens = ?self.params.max_tokens,
-                "temperature/top_p/max_tokens are ignored by the ChatGPT backend"
+                "{CHATGPT_DROPPED_PARAMS_WARNING}"
             );
         }
 
@@ -2085,6 +2092,98 @@ mod tests {
         fn exit(&self, _span: &tracing::span::Id) {}
     }
 
+    /// One tracing event's level, `backend` tag (if any), and message text —
+    /// captured by [`CapturedWarnEvents`].
+    struct CapturedEvent {
+        level: tracing::Level,
+        backend: Option<String>,
+        message: Option<String>,
+    }
+
+    /// Unlike [`CapturedBackendTags`] (which records only the `backend`
+    /// field's value and is blind to level/message), this captures each
+    /// event's level and message text too, so a test can assert the SPECIFIC
+    /// warn-level diagnostic fired — not merely that `complete()` produced
+    /// one extra `chatgpt-oauth`-tagged event of any level and any text.
+    /// Counting tags alone would stay green if `warn!` were silently changed
+    /// to `info!`, or if the message text were altered or removed, since
+    /// `CapturedBackendTags` ignores both.
+    #[derive(Default)]
+    struct CapturedWarnEvents(Mutex<Vec<CapturedEvent>>);
+
+    impl CapturedWarnEvents {
+        /// Count of events at exactly WARN level, tagged `chatgpt-oauth`,
+        /// whose message is exactly [`CHATGPT_DROPPED_PARAMS_WARNING`].
+        fn dropped_params_warning_count(&self) -> usize {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| {
+                    e.level == tracing::Level::WARN
+                        && e.backend.as_deref() == Some("chatgpt-oauth")
+                        && e.message.as_deref() == Some(CHATGPT_DROPPED_PARAMS_WARNING)
+                })
+                .count()
+        }
+    }
+
+    impl tracing::Subscriber for CapturedWarnEvents {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct EventVisitor {
+                backend: Option<String>,
+                message: Option<String>,
+            }
+            impl tracing::field::Visit for EventVisitor {
+                fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                    if field.name() == "backend" {
+                        self.backend = Some(value.to_string());
+                    }
+                }
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    // tracing wraps a `Display` message in an internal type
+                    // whose `Debug` impl forwards straight to `Display`, so
+                    // `{value:?}` yields the exact message text here (this is
+                    // also why `tracing-subscriber`'s own fmt layer shows
+                    // plain, unquoted messages despite reading them through
+                    // `record_debug`).
+                    if field.name() == "message" {
+                        self.message = Some(format!("{value:?}"));
+                    }
+                }
+            }
+            let mut visitor = EventVisitor {
+                backend: None,
+                message: None,
+            };
+            event.record(&mut visitor);
+            self.0.lock().unwrap().push(CapturedEvent {
+                level: *event.metadata().level(),
+                backend: visitor.backend,
+                message: visitor.message,
+            });
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
     /// Ensures at least one always-interested [`tracing::Subscriber`] has
     /// been registered as the process-wide global default before any test
     /// installs its own thread-local one via [`tracing::subscriber::set_default`].
@@ -2644,9 +2743,15 @@ mod tests {
     /// `chatgpt_agent_client_complete_warns_when_dropped_params_are_set` test
     /// below. Shared so both the non-default and the default-params run
     /// drive the exact same request/response shape; only `params` differs.
+    /// Returns the `RecordingHttpClient` too, so the caller can inspect the
+    /// actual wire request and check that the warned-about fields are
+    /// omitted, not just that the diagnostic fired.
     fn chatgpt_client_for_dropped_params_warning_test(
         params: InferenceParams,
-    ) -> ChatGptAgentClient<rig::test_utils::RecordingHttpClient> {
+    ) -> (
+        ChatGptAgentClient<rig::test_utils::RecordingHttpClient>,
+        rig::test_utils::RecordingHttpClient,
+    ) {
         use rig::test_utils::RecordingHttpClient;
 
         let response_body = chatgpt_response_completed_sse(json!([{
@@ -2659,18 +2764,21 @@ mod tests {
         let http_client = RecordingHttpClient::new(response_body);
         let chatgpt_client = rig::providers::chatgpt::Client::builder()
             .api_key("test-access-token")
-            .http_client(http_client)
+            .http_client(http_client.clone())
             .build()
             .expect("build client over the recording HTTP double");
 
-        ChatGptAgentClient {
-            client: chatgpt_client,
-            model: "test-model".to_string(),
-            preamble: TEST_PREAMBLE.to_string(),
-            params,
-            executor: None,
-            approval_tx: None,
-        }
+        (
+            ChatGptAgentClient {
+                client: chatgpt_client,
+                model: "test-model".to_string(),
+                preamble: TEST_PREAMBLE.to_string(),
+                params,
+                executor: None,
+                approval_tx: None,
+            },
+            http_client,
+        )
     }
 
     /// Regression test for <https://github.com/ROCm/rocm-cli/issues/664>:
@@ -2680,17 +2788,14 @@ mod tests {
     /// above), so `ChatGptAgentClient::complete` must instead warn the
     /// operator that these flags are ignored for this backend.
     ///
-    /// `CapturedBackendTags` only records the `backend` field's *value*, not
-    /// the event's message or level, so a bare "does the tag `chatgpt-oauth`
-    /// appear" assertion can't distinguish the new warning from the two
-    /// `finish_agent_request` lifecycle events (`"chat request start"` /
-    /// `"chat request complete"`) every successful `complete()` call already
-    /// emits with that same tag. Counting events instead proves the
-    /// correlation `AGENTS.md` §3 requires: a non-default-params run must
-    /// capture exactly one MORE `chatgpt-oauth`-tagged event than the same
-    /// call with `InferenceParams::default()` — i.e. the warning fires if
-    /// and only if a dropped param is actually set, not merely that some
-    /// warning text exists somewhere.
+    /// Uses [`CapturedWarnEvents`], not [`CapturedBackendTags`]: a bare
+    /// "chatgpt-oauth tag count went up by one" assertion stays green even if
+    /// `warn!` were silently changed to `info!`, or the message text altered
+    /// or removed — `CapturedBackendTags` ignores both level and message.
+    /// [`CapturedWarnEvents::dropped_params_warning_count`] instead requires
+    /// an EXACT match: WARN level, the `chatgpt-oauth` tag, AND the literal
+    /// [`CHATGPT_DROPPED_PARAMS_WARNING`] text — so the test proves the
+    /// SPECIFIC diagnostic fired, not merely that some extra event did.
     ///
     /// Each of `temperature`, `top_p`, and `max_tokens` is set ALONE in its
     /// own run (never paired with another) so a single dropped `.is_some()`
@@ -2702,20 +2807,44 @@ mod tests {
     /// `validate_chatgpt_inference_params`), which is also why the pre-existing
     /// `..._forwards_model_and_instructions_to_the_wire` test above never sets
     /// `top_p`.
+    ///
+    /// Each isolated case also inspects the actual wire request and asserts
+    /// `temperature`/`max_output_tokens`/`top_p` are all absent from it — the
+    /// warning's own claim, checked alongside the diagnostic rather than
+    /// assumed.
     #[tokio::test]
     async fn chatgpt_agent_client_complete_warns_when_dropped_params_are_set() {
+        warm_tracing_interest_cache();
         let history = [ChatTurn::user("check gpu 0")];
 
-        let default_client =
+        let (default_client, default_http) =
             chatgpt_client_for_dropped_params_warning_test(InferenceParams::default());
-        let (reply, default_tags) =
-            complete_capturing_backend_tags(&default_client, &history).await;
+        let default_warn_events = Arc::new(CapturedWarnEvents::default());
+        let tracing_guard = tracing::subscriber::set_default(default_warn_events.clone());
+        let reply = default_client
+            .complete(&history, fixture_snapshot())
+            .await
+            .expect("scripted single-turn reply should succeed");
+        drop(tracing_guard);
         assert_eq!(reply, "GPU 0 is healthy.");
-        assert!(
-            default_tags.iter().all(|t| t == "chatgpt-oauth"),
-            "all captured lifecycle events must carry the \"chatgpt-oauth\" tag: \
-             default={default_tags:?}"
+        assert_eq!(
+            default_warn_events.dropped_params_warning_count(),
+            0,
+            "InferenceParams::default() must not emit the dropped-params warning"
         );
+        let default_requests = default_http.requests();
+        assert_eq!(default_requests.len(), 1);
+        let default_body: serde_json::Value =
+            serde_json::from_slice(&default_requests[0].body).expect("request body is JSON");
+        let default_obj = default_body
+            .as_object()
+            .expect("request body is a JSON object");
+        for key in ["temperature", "max_output_tokens", "top_p"] {
+            assert!(
+                !default_obj.contains_key(key),
+                "default params: {key} should not be on the wire either way: {default_body}"
+            );
+        }
 
         let isolated_cases = [
             (
@@ -2745,21 +2874,35 @@ mod tests {
         ];
 
         for (label, params) in isolated_cases {
-            let client = chatgpt_client_for_dropped_params_warning_test(params);
-            let (reply, tags) = complete_capturing_backend_tags(&client, &history).await;
+            let (client, http) = chatgpt_client_for_dropped_params_warning_test(params);
+            let warn_events = Arc::new(CapturedWarnEvents::default());
+            let tracing_guard = tracing::subscriber::set_default(warn_events.clone());
+            let reply = client
+                .complete(&history, fixture_snapshot())
+                .await
+                .expect("scripted single-turn reply should succeed");
+            drop(tracing_guard);
             assert_eq!(reply, "GPU 0 is healthy.", "case: {label}");
-            assert!(
-                tags.iter().all(|t| t == "chatgpt-oauth"),
-                "case {label}: all captured lifecycle events must carry the \
-                 \"chatgpt-oauth\" tag: {tags:?}"
-            );
             assert_eq!(
-                tags.len(),
-                default_tags.len() + 1,
-                "case {label}: setting it alone must emit exactly one more \
-                 chatgpt-oauth-tagged event (the dropped-params warning) than \
-                 InferenceParams::default(): case={tags:?}, default={default_tags:?}"
+                warn_events.dropped_params_warning_count(),
+                1,
+                "case {label}: setting it alone must emit the dropped-params \
+                 warning exactly once"
             );
+
+            let requests = http.requests();
+            assert_eq!(requests.len(), 1, "case {label}");
+            let body: serde_json::Value =
+                serde_json::from_slice(&requests[0].body).expect("request body is JSON");
+            let obj = body.as_object().expect("request body is a JSON object");
+            for key in ["temperature", "max_output_tokens", "top_p"] {
+                assert!(
+                    !obj.contains_key(key),
+                    "case {label}: {key} must be absent from the wire request \
+                     (rig-core zeroes it before sending) even though the \
+                     warning fired for the dropped param: {body}"
+                );
+            }
         }
     }
 
