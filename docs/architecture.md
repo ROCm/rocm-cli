@@ -27,10 +27,11 @@ Each per-crate module inventory lists one file per line. Flat inventories (every
 
 ### `apps/rocm` — main CLI binary
 
-[`main.rs`](../apps/rocm/src/main.rs) itself is **partially modularized** — Phase 6a (ROCMAI-82) extracted the driver-install/engines/serve clusters, Phase 6b (ROCMAI-91) extracted the managed-process-launch cluster, Phase 6c (ROCMAI-89) extracted the `runtimes` command/uninstall/rollback/SDK-install-finalization clusters below; the rest of the split is planned across several more PRs, one cluster at a time (see EAI-7768).
+[`main.rs`](../apps/rocm/src/main.rs) itself is **partially modularized** — Phase 6a (ROCMAI-82) extracted the driver-install/engines/serve clusters, Phase 6b (ROCMAI-91) extracted the managed-process-launch cluster, Phase 6c (ROCMAI-89) extracted the `runtimes` command/uninstall/rollback/SDK-install-finalization clusters, Phase 6d (ROCMAI-88, in progress) is extracting the chat/assistant + MCP tool-bridge cluster below across three PRs; the rest of the split is planned across several more PRs, one cluster at a time (see EAI-7768).
 
 - [`automations.rs`](../apps/rocm/src/automations.rs) — mechanical relocation, dispatch-adjacent, no owned types.
 - [`bootstrap.rs`](../apps/rocm/src/bootstrap.rs) — a further-extracted variant of full domain extraction: it owns its clap command enum (`BootstrapCommand`) and dispatch function too, rather than leaving them in [`main.rs`](../apps/rocm/src/main.rs).
+- [`chat.rs`](../apps/rocm/src/chat.rs) — full domain extraction (Phase 6d, ROCMAI-88), mirrors [`providers.rs`](../apps/rocm/src/providers.rs). Owns the chat/MCP-bridge cluster's `pub(crate)` types (`ChatRocmCommandAction`, `CommandCapture`, `DeterministicModelRecipe`, `DeterministicServiceRow`, `DeterministicEngineRow`) and its bottom-of-call-graph helpers, including `normalized_chat_rocm_command_args` and `managed_service_running_state`; a handful of internals (a tool-call label mapper among them) stay private. `main.rs` constructs `ChatRocmCommandAction` and `CommandCapture` directly, and only receives `DeterministicModelRecipe` as a parameter and `DeterministicServiceRow`/`DeterministicEngineRow` as return values, neither of the latter two ever named there directly. The cluster's orchestration bodies — `run_internal_mcp_call`, the `validate_chat_*` family, `deterministic_rocm_tool_summary` — and the `dispatch()`/[`dash_seam.rs`](../apps/rocm/src/dash_seam.rs) call-site qualification are still in [`main.rs`](../apps/rocm/src/main.rs).
 - [`chat_host_facts.rs`](../apps/rocm/src/chat_host_facts.rs) — full domain extraction.
 - [`cli_progress.rs`](../apps/rocm/src/cli_progress.rs) — shared CLI-output component (`Spinner`, `AnimatedSpinner`).
 - [`cli_report.rs`](../apps/rocm/src/cli_report.rs) — shared CLI-output component (`ActionReport`).
@@ -139,8 +140,8 @@ These modules are private `mod` declarations — [`lib.rs`](../crates/e2e-report
 
 - [`install.rs`](../engines/vllm/src/install.rs) — ROCm/vLLM build-variant discovery, install execution, and runtime-repair assessment.
 - [`process.rs`](../engines/vllm/src/process.rs) — spawn/env/path setup and readiness polling.
-- [`runtime.rs`](../engines/vllm/src/runtime.rs) — TheRock/managed-runtime resolution.
-- [`state.rs`](../engines/vllm/src/state.rs) — service state file I/O.
+- [`runtime.rs`](../engines/vllm/src/runtime.rs) — TheRock/managed-runtime resolution and TheRock library/bin path derivation; derives paths only, performing no filesystem writes itself. The launch path's compat-shim writes (a `libmpi_cxx` stub, stale-numa-shim removal) live in the separate `ensure_therock_compat_shims`, called from `process.rs`; the running-state payload, which never calls it, falls back to a plain directory listing instead.
+- [`state.rs`](../engines/vllm/src/state.rs) — service state file I/O, log tailing, and health/inference probing.
 
 [`lib.rs`](../engines/vllm/src/lib.rs) keeps only CLI/envelope dispatch and the few items shared across those modules.
 

@@ -736,7 +736,10 @@ fn probe_os(e: &mut Examination) {
         e.os_family = "linux".to_owned();
         e.kernel_release = run("uname", &["-r"], SHORT).1.trim().to_owned();
         e.kernel_cmdline = read_host_text("/proc/cmdline").trim().to_owned();
-        record_distro(e, &read_host_text("/etc/os-release"));
+        record_distro(
+            e,
+            &crate::hardware_root::read_os_release(crate::hardware_root::host_path_for_str),
+        );
         if let Some(param) = parse_iommu_param(&e.kernel_cmdline) {
             e.iommu_kernel_param = param;
         }
@@ -751,21 +754,31 @@ fn probe_os(e: &mut Examination) {
     }
 }
 
-/// Fill the distro fields from os-release `text`, through the same parser the
-/// driver plan uses, so the two report the same distro.
+/// Fill the distro fields from `read`, through the same parser the driver
+/// plan uses, so the two report the same distro.
 ///
-/// An unreadable file leaves both fields empty and says why in
-/// `probe_failures`, naming the line — an empty distro with no explanation
-/// would read as "nothing to report" rather than "something to fix". A missing
-/// file reads as empty text, which is not a failure.
-fn record_distro(e: &mut Examination, text: &str) {
-    match crate::os_release::parse(text) {
+/// An unreadable line leaves both fields empty and says why in
+/// `probe_failures`, naming the file actually read and the line — an empty
+/// distro with no explanation would read as "nothing to report" rather than
+/// "something to fix". A missing file reads as empty text, which is not a
+/// failure; a file that exists but could not be read is, and is reported as
+/// itself rather than as an unreadable line it never reached.
+fn record_distro(e: &mut Examination, read: &crate::hardware_root::OsRelease) {
+    if let crate::hardware_root::OsRelease::Unreadable { path, error } = read {
+        e.probe_failures.push(format!(
+            "{}; the distro is not reported.",
+            crate::hardware_root::unreadable_prefix(path, error)
+        ));
+        return;
+    }
+    match crate::os_release::parse(read.text()) {
         Ok(mut fields) => {
             e.distro_id = fields.remove("ID").unwrap_or_default();
             e.distro_version = fields.remove("VERSION_ID").unwrap_or_default();
         }
         Err(unreadable) => e.probe_failures.push(format!(
-            "/etc/os-release {unreadable}; the distro is not reported."
+            "{} {unreadable}; the distro is not reported.",
+            read.path()
         )),
     }
 }
@@ -827,6 +840,12 @@ fn host_driver_fields(probe: crate::WslHostDriverProbe) -> (bool, Option<String>
 ///
 /// `librocdxg` is globbed across `/opt/rocm*` for the same reason the in-guest
 /// probe resolves it across installs: a versioned root must not read as missing.
+///
+/// The distro's `id`/`version` fields fall back from `/etc/os-release` to
+/// `/usr/lib/os-release` per `os-release(5)`, matching every other reader in
+/// this crate — this is the one that runs inside the distro over `wsl.exe`
+/// rather than through [`crate::host_path`], so it needs its own copy of the
+/// fallback rather than sharing `hardware_root::read_os_release`.
 const WSL_REMOTE_PROBE: &str = r#"
 echo "kernel=$(uname -r 2>/dev/null)"
 if [ -e /dev/dxg ]; then echo dxg=1; else echo dxg=0; fi
@@ -848,10 +867,27 @@ if command -v rocminfo >/dev/null 2>&1; then
 else
   echo rocminfo=0
 fi
-. /etc/os-release 2>/dev/null
+try_os_release() {
+  if [ -e "$1" ]; then . "$1" 2>/dev/null
+  elif [ -e "$2" ]; then . "$2" 2>/dev/null
+  fi
+}
+try_os_release /etc/os-release /usr/lib/os-release
 echo "id=${ID}"
 echo "version=${VERSION_ID}"
 "#;
+
+/// The `try_os_release` shell function embedded in [`WSL_REMOTE_PROBE`]: sources
+/// `$1`, falling back to `$2` per `os-release(5)` when `$1` does not exist — an
+/// existence check (`[ -e ... ]`), not a readability one, so a permission-denied
+/// primary is not silently replaced by a possibly stale fallback.
+///
+/// Duplicated as its own constant, with the paths left as parameters, so the
+/// test below can run this exact function body against temp-directory paths
+/// instead of the real `/etc`; [`try_os_release_fn_is_embedded_in_the_wsl_remote_probe`]
+/// guards against the two drifting apart.
+#[cfg(test)]
+const TRY_OS_RELEASE_FN: &str = "try_os_release() {\n  if [ -e \"$1\" ]; then . \"$1\" 2>/dev/null\n  elif [ -e \"$2\" ]; then . \"$2\" 2>/dev/null\n  fi\n}";
 
 /// Parse `wsl.exe -l -q` into distribution names.
 ///
@@ -1162,12 +1198,19 @@ fn classify_amd_marketing_name(name: &str) -> (String, bool) {
 
 /// Whether a gfx target belongs to an AMD APU family.
 ///
-/// APUs: gfx90c (Vega iGPU in Renoir / Lucienne / Cezanne / Barcelo), gfx1103
-/// (Phoenix / Hawk Point) and the gfx115x parts (Strix Point / Strix Halo).
-/// Their neighbors gfx1100 / gfx1101 / gfx1102 (Navi 31 / 32 / 33) share the
-/// gfx110x prefix but are *discrete* RDNA3 GPUs, so they must not match —
-/// otherwise they inflate `has_apu` and suppress `has_discrete_amd`, which gates
-/// the iGPU+dGPU collision fix. (Target -> product per LLVM AMDGPUUsage.)
+/// APUs: gfx90c (Vega iGPU in Renoir / Lucienne / Cezanne / Barcelo), the
+/// RDNA2 iGPUs gfx1033 / gfx1035 / gfx1036 (Van Gogh, Rembrandt / Yellow Carp,
+/// Raphael), gfx1103 (Phoenix / Hawk Point) and the gfx115x parts (Strix Point /
+/// Strix Halo).
+///
+/// Their neighbours on both prefixes are *discrete* parts and must not match:
+/// gfx1100 / gfx1101 / gfx1102 (Navi 31 / 32 / 33) on gfx110x, and gfx1030 /
+/// gfx1031 / gfx1032 / gfx1034 (Navi 21 / 22 / 23 / 24) on gfx103x — which is
+/// why the gfx103x arm enumerates rather than taking a threshold the way
+/// gfx110x can. A discrete part matching here inflates `has_apu` and suppresses
+/// `has_discrete_amd`, which gates the iGPU+dGPU collision fix. (Target ->
+/// product per LLVM AMDGPUUsage; `pnp_device_id_table_agrees_about_apus` holds
+/// this list against `host_gpu`'s PCI-id table, part by part.)
 ///
 /// Two consumers rely on this, for different reasons:
 ///
@@ -1175,6 +1218,13 @@ fn classify_amd_marketing_name(name: &str) -> (String, bool) {
 ///   iGPU+dGPU device-visibility collisions;
 /// - serve's VRAM reporting, because an APU has no private VRAM — see
 ///   `vram_capacity_is_meaningful` in the `rocm` binary.
+///
+/// The second consumer is on **every** platform, not just Windows where the
+/// gfx103x arm was added for: a Linux gfx1035 host now skips serve's VRAM
+/// warning. That is the intended reading of the change and not a side effect to
+/// be narrowed away — Rembrandt has no private VRAM on Linux either, so warning
+/// about its "capacity" was reporting a number that does not mean what the
+/// warning says it means.
 ///
 /// This answers a question about the *part*, not about the host: a machine can
 /// pair an APU with a discrete card, so a true verdict here does not mean every
@@ -1194,6 +1244,14 @@ pub fn gfx_is_apu_family(gfx: &str) -> bool {
     // gfx110x: only gfx1103 and above are APUs; gfx1100/1101/1102 are discrete.
     if let Some(digit) = gfx_model_digit(&g, "gfx110") {
         return digit >= 3;
+    }
+    // gfx103x: non-contiguous, unlike gfx110x's threshold. gfx1033/1035/1036
+    // are the RDNA2 APUs (Van Gogh variant aside, host_gpu's own PCI-id table
+    // maps them as such); gfx1030/1031/1032/1034 are Navi 21-24 desktop/mobile
+    // discrete cards (RX 6000-series, RX 6500 XT). A plain threshold would get
+    // this family wrong in both directions.
+    if let Some(digit) = gfx_model_digit(&g, "gfx103") {
+        return matches!(digit, 3 | 5 | 6);
     }
     false
 }
@@ -2952,6 +3010,13 @@ fn probe_gpus_windows(e: &mut Examination) {
             .push("Win32_VideoController query failed; cannot enumerate GPUs.".to_owned());
         return;
     }
+    parse_gpus_windows_output(&out, e);
+}
+
+/// Split out from [`probe_gpus_windows`] so the parsing can be driven with
+/// synthetic `Win32_VideoController` output -- there is no Windows host to run
+/// the real probe against in this test suite.
+fn parse_gpus_windows_output(out: &str, e: &mut Examination) {
     for line in out.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -2985,12 +3050,30 @@ fn probe_gpus_windows(e: &mut Examination) {
         if !is_amd {
             continue;
         }
-        let (gfx_guess, is_apu_guess) = classify_amd_marketing_name(&name);
+        // The PNP id first, the marketing name only as a fallback -- tried in
+        // that order, not computed eagerly and discarded, since the name match
+        // is wasted work whenever the id resolves.
+        //
+        // `Win32_VideoController` hands us `PCI\VEN_1002&DEV_1636&...` in the
+        // same row as the name, and `host_gpu`'s PCI-id table answers for parts
+        // the name table has no arm for -- every Vega iGPU among them. This
+        // probe used to drop the id and ask the name alone, so a Renoir /
+        // Lucienne / Cezanne / Barcelo laptop reported an empty `gfx_target`
+        // unless a HIP SDK was installed for `hipInfo` to fill it in: exactly
+        // the host that has no HIP SDK to ask. A device id is also the stronger
+        // answer where both have one, being the ASIC rather than the brand.
+        let (gfx_target, is_apu) = match crate::host_gpu::gfx_target_from_pnp_device_id(&pnp) {
+            // `gfx_is_apu_family` knows the answer whenever the id resolved a
+            // target; the name heuristic's `is_apu` guess is only consulted
+            // when nothing identified the part.
+            Some(target) => (target.to_owned(), gfx_is_apu_family(target)),
+            None => classify_amd_marketing_name(&name),
+        };
         e.gpus.push(Gpu {
             name,
-            gfx_target: gfx_guess,
+            gfx_target,
             pci_id: pnp,
-            is_apu: Some(is_apu_guess),
+            is_apu: Some(is_apu),
             is_amd: true,
         });
     }
@@ -3032,24 +3115,69 @@ fn probe_hip_sdk_windows(e: &mut Examination) {
         let (rc, out, _) = run(&hipinfo.to_string_lossy(), &[], Duration::from_secs(15));
         if rc == 0 {
             e.hipinfo_status = "ok".to_owned();
-            for line in out.lines() {
-                if let Some(rest) = line.trim().strip_prefix("gcnArchName:")
-                    && let Some(gfx) = crate::extract_first_gfx_token(rest)
-                    && let Some(gpu) = e
-                        .gpus
-                        .iter_mut()
-                        .find(|g| g.is_amd && g.gfx_target.is_empty())
-                {
-                    gpu.gfx_target = gfx;
-                    gpu.is_apu = Some(gfx_is_apu_family(&gpu.gfx_target));
-                }
-            }
+            fill_unidentified_gpus_from_hipinfo(&mut e.gpus, &out);
         } else {
             e.hipinfo_status = format!("error rc={rc}");
         }
     } else {
         e.hipinfo_present = false;
         e.hipinfo_status = "missing".to_owned();
+    }
+}
+
+/// Fill in the `gfx_target` of AMD GPUs the Windows probes could not identify,
+/// from `hipInfo`'s `gcnArchName:` lines.
+///
+/// `hipInfo` prints one block per *visible* device and gives no stable handle
+/// tying a block to a `Win32_VideoController` row, so the pairing is positional:
+/// the Nth unidentified AMD GPU gets the Nth architecture line. That is the only
+/// correspondence available, and it is a fallback — the PCI device id and the
+/// marketing name both answer first, and better.
+///
+/// Positional pairing has to account for the GPUs that were already answered
+/// for, which is the subtlety this function exists to hold. `hipInfo` still
+/// prints a block for a card the PCI-id table resolved, but that card is no
+/// longer an empty slot, so a naive "first empty slot" walk hands *its*
+/// architecture to the next card along. The concrete case: a Radeon 680M
+/// (resolved to `gfx1035` from its device id) beside an RX 6800M (in neither
+/// table). `hipInfo` prints gfx1035 then gfx1031; the first line finds the 6800M
+/// as the only empty slot and makes it a `gfx1035` APU. That inverts both
+/// `has_apu` and `has_discrete_amd`, which gate `fix-9-igpu-dgpu`, and the
+/// second line is then dropped — the discrete card ends up described as the
+/// integrated one.
+///
+/// So an architecture already held by an identified GPU is consumed rather than
+/// assigned: one line per holder, by count, not by presence. Counting matters —
+/// two identical cards print the same name twice, and dropping every repeat
+/// would leave the second one unidentified forever.
+fn fill_unidentified_gpus_from_hipinfo(gpus: &mut [Gpu], hipinfo_stdout: &str) {
+    // What the earlier, better probes already answered. Each of these has a
+    // `gcnArchName` block of its own coming, which belongs to it.
+    let mut already_identified: Vec<String> = gpus
+        .iter()
+        .filter(|g| g.is_amd && !g.gfx_target.is_empty())
+        .map(|g| g.gfx_target.to_ascii_lowercase())
+        .collect();
+
+    for line in hipinfo_stdout.lines() {
+        let Some(rest) = line.trim().strip_prefix("gcnArchName:") else {
+            continue;
+        };
+        let Some(gfx) = crate::extract_first_gfx_token(rest) else {
+            continue;
+        };
+        if let Some(position) = already_identified.iter().position(|held| *held == gfx) {
+            already_identified.swap_remove(position);
+            continue;
+        }
+        let Some(gpu) = gpus
+            .iter_mut()
+            .find(|g| g.is_amd && g.gfx_target.is_empty())
+        else {
+            continue;
+        };
+        gpu.is_apu = Some(gfx_is_apu_family(&gfx));
+        gpu.gfx_target = gfx;
     }
 }
 
@@ -3152,7 +3280,9 @@ mod tests {
         let mut e = linux_host_with_a_gpu();
         record_distro(
             &mut e,
-            "ID=ubuntu\nVERSION_ID=\"24.04\"\nexport ID=debian\n",
+            &crate::hardware_root::OsRelease::found(
+                "ID=ubuntu\nVERSION_ID=\"24.04\"\nexport ID=debian\n",
+            ),
         );
         assert_eq!(
             e.probe_failures,
@@ -3166,7 +3296,10 @@ mod tests {
         assert_eq!(e.compute_status(), "degraded");
 
         let mut e = linux_host_with_a_gpu();
-        record_distro(&mut e, "ID='ubuntu'\nVERSION_ID='24.04' # LTS\n");
+        record_distro(
+            &mut e,
+            &crate::hardware_root::OsRelease::found("ID='ubuntu'\nVERSION_ID='24.04' # LTS\n"),
+        );
         assert!(e.probe_failures.is_empty(), "{:?}", e.probe_failures);
         assert_eq!(
             (e.distro_id.as_str(), e.distro_version.as_str()),
@@ -3176,8 +3309,62 @@ mod tests {
 
         // No file at all is not a failure: there is nothing to fix.
         let mut e = Examination::default();
-        record_distro(&mut e, "");
+        record_distro(&mut e, &crate::hardware_root::OsRelease::Absent);
         assert!(e.probe_failures.is_empty(), "{:?}", e.probe_failures);
+    }
+
+    /// A file that exists but could not be read is reported as itself — not
+    /// folded into an empty, unreported distro the way `Absent` is, and not
+    /// pointing at the wrong candidate when the fallback was the one that
+    /// failed.
+    #[test]
+    fn an_unreadable_file_names_itself_instead_of_a_distro() {
+        let mut e = linux_host_with_a_gpu();
+        record_distro(
+            &mut e,
+            &crate::hardware_root::OsRelease::Unreadable {
+                path: "/usr/lib/os-release",
+                error: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied"),
+            },
+        );
+        assert_eq!(
+            e.probe_failures,
+            vec![
+                "/usr/lib/os-release could not be read: denied; the distro is not reported."
+                    .to_owned()
+            ]
+        );
+        assert_eq!((e.distro_id.as_str(), e.distro_version.as_str()), ("", ""));
+        assert_eq!(e.compute_status(), "degraded");
+    }
+
+    /// The same malformed line as
+    /// [`an_unreadable_os_release_names_its_line_instead_of_a_distro`], but
+    /// read through the fallback path: `probe_failures` must name
+    /// `/usr/lib/os-release`, not `/etc/os-release`. That test only exercises
+    /// [`crate::hardware_root::OsRelease::found`], which hardcodes
+    /// `/etc/os-release`, so a regression that hardcoded the path back into
+    /// `record_distro`'s message would still pass it.
+    #[test]
+    fn a_fallback_reads_malformed_line_names_the_fallback_path_in_probe_failures() {
+        let mut e = linux_host_with_a_gpu();
+        record_distro(
+            &mut e,
+            &crate::hardware_root::OsRelease::Found {
+                path: "/usr/lib/os-release",
+                text: "ID=ubuntu\nVERSION_ID=\"24.04\"\nexport ID=debian\n".to_owned(),
+            },
+        );
+        assert_eq!(
+            e.probe_failures,
+            vec![
+                "/usr/lib/os-release line 3 is not a plain assignment: \"export ID=debian\"; \
+                 the distro is not reported."
+                    .to_owned()
+            ]
+        );
+        assert_eq!((e.distro_id.as_str(), e.distro_version.as_str()), ("", ""));
+        assert_eq!(e.compute_status(), "degraded");
     }
 
     /// Serialises the tests that read or replace the process-global
@@ -5532,6 +5719,290 @@ mod tests {
         assert!(!gfx_is_apu_family("gfx906"));
         assert!(!gfx_is_apu_family("gfx90"));
         assert!(!gfx_is_apu_family(""));
+
+        // gfx103x is non-contiguous, unlike gfx110x's threshold: gfx1033
+        // (Van Gogh) / gfx1035 (Rembrandt/Barcelo-R) / gfx1036 are RDNA2
+        // APUs, while gfx1030/1031/1032 (Navi 21/22/23, RX 6000 series) and
+        // gfx1034 (Navi 24, RX 6500 XT) are discrete. A Rembrandt laptop
+        // misclassified here would report as a discrete GPU and suppress
+        // `fix-9-igpu-dgpu` detection on an iGPU+dGPU host.
+        assert!(gfx_is_apu_family("gfx1033"));
+        assert!(gfx_is_apu_family("gfx1035"));
+        assert!(gfx_is_apu_family("gfx1036"));
+        assert!(!gfx_is_apu_family("gfx1030"));
+        assert!(!gfx_is_apu_family("gfx1031"));
+        assert!(!gfx_is_apu_family("gfx1032"));
+        assert!(!gfx_is_apu_family("gfx1034"));
+    }
+
+    #[test]
+    fn windows_gpu_probe_classifies_a_vega_igpu_through_the_pci_table_not_the_name() {
+        // ROCMAI-546: the real host this ticket was filed against. Windows
+        // reports Renoir/Cezanne's Vega iGPU under the generic marketing name
+        // "AMD Radeon(TM) Graphics", which `classify_amd_marketing_name` does
+        // not recognize (it only maps Phoenix/Strix-and-newer names) -- so
+        // without the PCI-id lookup this host's `gfx_target` stays empty and
+        // `info-20-gpu-no-rocm-support` can never fire on it.
+        let out = "AMD Radeon(TM) Graphics\t31.0.21004.7\tPCI\\VEN_1002&DEV_1636&SUBSYS_12341002&REV_C8\\4&1a2b3c4d&0&0008";
+        let mut e = Examination::default();
+        parse_gpus_windows_output(out, &mut e);
+        assert_eq!(e.gpus.len(), 1, "{:?}", e.gpus);
+        let gpu = &e.gpus[0];
+        assert_eq!(gpu.gfx_target, "gfx90c", "{gpu:?}");
+        assert!(gpu.is_amd);
+        assert_eq!(gpu.is_apu, Some(true), "gfx90c is an APU family: {gpu:?}");
+    }
+
+    #[test]
+    fn windows_gpu_probe_does_not_misclassify_a_rembrandt_apu_as_discrete() {
+        // Regression: the PNP-id path resolves gfx1035 for a Rembrandt/
+        // Barcelo-R laptop (PNP id 164d), but `gfx_is_apu_family` used to have
+        // no gfx103x arm at all, so a real iGPU reported `is_apu: Some(false)`
+        // -- the opposite of what the marketing-name path ("AMD Radeon 680M")
+        // would have said via `APU_KEYWORDS`. That silently suppressed
+        // `fix-9-igpu-dgpu` detection on exactly the iGPU+dGPU host shape this
+        // PR is otherwise improving detection for.
+        let out = "AMD Radeon 680M\t31.0.21012.9\tPCI\\VEN_1002&DEV_164D&SUBSYS_14F11002&REV_C8\\3&11583659&0&08";
+        let mut e = Examination::default();
+        parse_gpus_windows_output(out, &mut e);
+        assert_eq!(e.gpus.len(), 1, "{:?}", e.gpus);
+        let gpu = &e.gpus[0];
+        assert_eq!(gpu.gfx_target, "gfx1035", "{gpu:?}");
+        assert_eq!(
+            gpu.is_apu,
+            Some(true),
+            "a Rembrandt/Barcelo-R iGPU must not report as discrete: {gpu:?}"
+        );
+    }
+
+    #[test]
+    fn windows_gpu_probe_prefers_the_pci_id_match_when_one_exists() {
+        // A name `classify_amd_marketing_name` already recognizes must not be
+        // asked at all when the PNP id already resolved a target -- the name
+        // match is wasted work in that case, and if it ever disagreed with the
+        // id, the id must still win (it names the ASIC, not the brand).
+        //
+        // The two inputs are made to DISAGREE on purpose, and that disagreement
+        // is the whole point: PNP id `73a0` is Navi 21 (gfx1030, discrete),
+        // while the name "AMD Radeon(TM) 8060S Graphics" is one of the handful
+        // `classify_amd_marketing_name` answers for, as gfx1151 and an APU. No
+        // such part ships -- which is exactly why it is the input. A pair the
+        // two paths agree about passes with the PNP lookup deleted, silently
+        // re-testing the marketing fallback that `marketing_name_maps_strix_halo`
+        // already covers for this same string; only a pair that cannot both be
+        // right pins *precedence* rather than *agreement*. Both halves of the
+        // answer are asserted because the two paths disagree about `is_apu` as
+        // well as about the target.
+        let out = "AMD Radeon(TM) 8060S Graphics\t32.0.12033.1030\tPCI\\VEN_1002&DEV_73A0&SUBSYS_00000000&REV_C1\\3&11583659&0&08";
+        let mut e = Examination::default();
+        parse_gpus_windows_output(out, &mut e);
+        assert_eq!(e.gpus.len(), 1, "{:?}", e.gpus);
+        let gpu = &e.gpus[0];
+        assert_eq!(
+            gpu.gfx_target, "gfx1030",
+            "the PNP id names the ASIC and has to win over the brand name: {gpu:?}"
+        );
+        assert_eq!(
+            gpu.is_apu,
+            Some(false),
+            "`is_apu` has to follow the id's target too, not the name heuristic: {gpu:?}"
+        );
+    }
+
+    /// Every target `host_gpu`'s PNP table can return has to be classified by
+    /// `gfx_is_apu_family`, because the Windows GPU probe composes the two.
+    ///
+    /// The per-device tests above each pin one row of that table. This pins the
+    /// *invariant* between the two tables, which is what actually broke: adding
+    /// a PCI id without teaching `gfx_is_apu_family` about its target silently
+    /// gives the part the fallthrough answer — `false`, "discrete" — with no
+    /// test anywhere disagreeing. That is exactly how gfx1033 / gfx1035 /
+    /// gfx1036 came to be labelled "RDNA2 APUs" by one table and discrete by
+    /// the other.
+    #[test]
+    fn pnp_device_id_table_agrees_about_apus() {
+        for (pnp, gfx, integrated) in [
+            // Vega iGPUs: Renoir, Lucienne, Cezanne, Barcelo.
+            ("PCI\\VEN_1002&DEV_1636&SUBSYS_08A71028", "gfx90c", true),
+            ("PCI\\VEN_1002&DEV_164C&SUBSYS_380D103C", "gfx90c", true),
+            ("PCI\\VEN_1002&DEV_1638&SUBSYS_0A2E1025", "gfx90c", true),
+            ("PCI\\VEN_1002&DEV_15E7&SUBSYS_8A431043", "gfx90c", true),
+            // RDNA2 iGPUs: Van Gogh, Rembrandt / Yellow Carp, Raphael.
+            ("PCI\\VEN_1002&DEV_163F&SUBSYS_11111111", "gfx1033", true),
+            ("PCI\\VEN_1002&DEV_164D&SUBSYS_22222222", "gfx1035", true),
+            ("PCI\\VEN_1002&DEV_1681&SUBSYS_33333333", "gfx1035", true),
+            ("PCI\\VEN_1002&DEV_164E&SUBSYS_44444444", "gfx1036", true),
+            // RDNA3 / RDNA3.5 iGPUs: Phoenix and Strix.
+            ("PCI\\VEN_1002&DEV_15BF&SUBSYS_55555555", "gfx1103", true),
+            ("PCI\\VEN_1002&DEV_1114&SUBSYS_66666666", "gfx1152", true),
+            // Discrete cards through the same door, so a blanket `true` fails
+            // here too: Navi 21 / 22 / 23 / 24 and Navi 48.
+            ("PCI\\VEN_1002&DEV_73A0&SUBSYS_77777777", "gfx1030", false),
+            ("PCI\\VEN_1002&DEV_73C0&SUBSYS_88888888", "gfx1031", false),
+            ("PCI\\VEN_1002&DEV_73E0&SUBSYS_99999999", "gfx1032", false),
+            ("PCI\\VEN_1002&DEV_743F&SUBSYS_AAAAAAAA", "gfx1034", false),
+            ("PCI\\VEN_1002&DEV_7550&SUBSYS_2435148C", "gfx1201", false),
+        ] {
+            assert_eq!(
+                crate::host_gpu::gfx_target_from_pnp_device_id(pnp),
+                Some(gfx),
+                "{pnp}: the PCI-id table moved under this test"
+            );
+            assert_eq!(
+                gfx_is_apu_family(gfx),
+                integrated,
+                "{pnp} -> {gfx}: the two tables disagree about whether this \
+                 part is integrated"
+            );
+        }
+    }
+
+    /// The consequence the misclassification actually had, asserted where it
+    /// lands rather than one step upstream of it.
+    ///
+    /// `fix-9-igpu-dgpu` is gated on `has_apu && has_discrete_amd`
+    /// (`check_9_igpu_dgpu_collision`), and both are derived from `is_apu` by
+    /// `summarise_gpu_categories`. A Rembrandt iGPU reported as discrete does
+    /// not merely carry a wrong field: it turns the gate off on the one host
+    /// shape the check exists for. Note the dGPU's marketing name carries no
+    /// APU keyword either way, so nothing here rests on `APU_KEYWORDS`.
+    #[test]
+    fn a_rembrandt_laptop_with_a_discrete_card_opens_the_igpu_dgpu_gate() {
+        let out = "AMD Radeon 680M\t31.0.21012.9\tPCI\\VEN_1002&DEV_164D&SUBSYS_14F11002&REV_C8\n\
+                   AMD Radeon RX 6600M\t31.0.21012.9\tPCI\\VEN_1002&DEV_73E0&SUBSYS_14F11002&REV_C7";
+        let mut e = Examination::default();
+        parse_gpus_windows_output(out, &mut e);
+        assert_eq!(e.gpus.len(), 2, "{:?}", e.gpus);
+        assert_eq!(e.gpus[0].is_apu, Some(true), "{:?}", e.gpus[0]);
+        assert_eq!(e.gpus[1].is_apu, Some(false), "{:?}", e.gpus[1]);
+        summarise_gpu_categories(&mut e);
+        assert!(
+            e.has_apu && e.has_discrete_amd,
+            "both gate fix-9-igpu-dgpu: has_apu={}, has_discrete_amd={}",
+            e.has_apu,
+            e.has_discrete_amd
+        );
+    }
+
+    /// The `hipInfo` fallback must not hand an identified GPU's architecture to
+    /// the card next to it.
+    ///
+    /// Same failure as `a_rembrandt_laptop_with_a_discrete_card_opens_the_igpu_dgpu_gate`
+    /// and the same gate underneath it, reached by the other door. The pairing
+    /// is positional, and the PCI-id lookup now fills some slots before
+    /// `hipInfo` is asked — but `hipInfo` still prints a block for every device,
+    /// including the filled ones. Walking to the "first empty slot" therefore
+    /// gives the *iGPU's* architecture to the first card the tables could not
+    /// identify.
+    ///
+    /// Concretely: a Radeon 680M resolved to gfx1035 from its device id, beside
+    /// an RX 6800M that is in neither table. `hipInfo` prints gfx1035 then
+    /// gfx1031. Unguarded, the 6800M becomes a gfx1035 APU, `has_discrete_amd`
+    /// goes false, `has_apu` is the only flag left, and `fix-9-igpu-dgpu` is
+    /// suppressed on the one host shape it exists for.
+    #[test]
+    fn hipinfo_does_not_give_an_identified_gpus_architecture_to_its_neighbour() {
+        let mut gpus = vec![
+            Gpu {
+                name: "AMD Radeon(TM) Graphics".to_owned(),
+                gfx_target: "gfx1035".to_owned(),
+                is_amd: true,
+                is_apu: Some(true),
+                ..Gpu::default()
+            },
+            // In neither table: no device-id arm, and "RX 6800M" carries no APU
+            // keyword, so it arrives here genuinely unidentified.
+            Gpu {
+                name: "AMD Radeon RX 6800M".to_owned(),
+                is_amd: true,
+                is_apu: Some(false),
+                ..Gpu::default()
+            },
+        ];
+        fill_unidentified_gpus_from_hipinfo(
+            &mut gpus,
+            "--------------------------------------------------------------------------------\n\
+             device#                           0\n\
+             Name:                             AMD Radeon(TM) Graphics\n\
+             gcnArchName:                      gfx1035\n\
+             device#                           1\n\
+             Name:                             AMD Radeon RX 6800M\n\
+             gcnArchName:                      gfx1031\n",
+        );
+        assert_eq!(
+            gpus[0].gfx_target, "gfx1035",
+            "the identified iGPU keeps what the device id said: {:?}",
+            gpus[0]
+        );
+        assert_eq!(
+            gpus[1].gfx_target, "gfx1031",
+            "the discrete card must get its OWN architecture line, not the one \
+             already spoken for by the iGPU: {:?}",
+            gpus[1]
+        );
+        assert_eq!(
+            gpus[1].is_apu,
+            Some(false),
+            "and must not be relabelled integrated, which is what turns \
+             has_discrete_amd off: {:?}",
+            gpus[1]
+        );
+
+        let mut e = Examination {
+            gpus,
+            ..Examination::default()
+        };
+        summarise_gpu_categories(&mut e);
+        assert!(
+            e.has_apu && e.has_discrete_amd,
+            "both gate fix-9-igpu-dgpu: has_apu={}, has_discrete_amd={}",
+            e.has_apu,
+            e.has_discrete_amd
+        );
+    }
+
+    /// Consuming by count and not by presence: two identical cards print the
+    /// same architecture twice, and only one of them was identified.
+    ///
+    /// The cheap form of the guard above — "skip any line whose architecture
+    /// some GPU already holds" — leaves the second card unidentified forever on
+    /// this machine, which is the regression the guard must not introduce.
+    #[test]
+    fn hipinfo_still_identifies_a_second_card_of_the_same_architecture() {
+        let mut gpus = vec![
+            Gpu {
+                gfx_target: "gfx1100".to_owned(),
+                is_amd: true,
+                is_apu: Some(false),
+                ..Gpu::default()
+            },
+            Gpu {
+                is_amd: true,
+                ..Gpu::default()
+            },
+        ];
+        fill_unidentified_gpus_from_hipinfo(
+            &mut gpus,
+            "gcnArchName:  gfx1100\ngcnArchName:  gfx1100\n",
+        );
+        assert_eq!(
+            gpus[1].gfx_target, "gfx1100",
+            "one line is consumed by the GPU that already holds that target; the \
+             other still belongs to the card nothing has identified: {:?}",
+            gpus[1]
+        );
+    }
+
+    /// A gcnArchName feature suffix or upper-casing must not change a gfx103x
+    /// verdict, the same way the gfx110x and gfx90c arms already guarantee.
+    #[test]
+    fn gfx103x_verdict_survives_case_and_a_feature_suffix() {
+        assert!(gfx_is_apu_family("GFX1035"));
+        assert!(gfx_is_apu_family("gfx1035:xnack-"));
+        assert!(!gfx_is_apu_family("GFX1034"));
+        assert!(!gfx_is_apu_family("gfx1032:xnack-"));
+        // Degenerate input never matches: no model digit, no verdict.
+        assert!(!gfx_is_apu_family("gfx103"));
     }
 
     #[test]
@@ -5787,6 +6258,151 @@ mod tests {
             ("planted", "0.1")
         );
         assert_eq!(name.as_deref(), Some("Planted 0.1"));
+    }
+
+    /// `os-release(5)` falls back to `/usr/lib/os-release` when `/etc/os-release`
+    /// is absent. Both `rocm examine` reads must still answer from a host that
+    /// ships only the fallback path — a probe that stopped after the first
+    /// candidate would read as an unknown distro instead.
+    #[cfg(all(feature = "e2e-test-hooks", target_os = "linux"))]
+    #[test]
+    fn os_release_reads_fall_back_to_usr_lib_when_etc_is_absent() {
+        use crate::hardware_root::TEST_HOST_ROOT_ENV;
+        use crate::test_env::RestoredEnvVar;
+
+        let root = std::env::temp_dir().join(format!(
+            "rocm-core-os-release-fallback-root-{}",
+            crate::test_support::unique_suffix()
+        ));
+        std::fs::create_dir_all(root.join("usr/lib")).expect("create planted /usr/lib");
+        std::fs::write(
+            root.join("usr/lib/os-release"),
+            "ID='fallback'\nVERSION_ID='1.2'\nPRETTY_NAME='Fallback 1.2'\n",
+        )
+        .expect("write planted os-release");
+
+        let (examined, name) = {
+            let _guard = crate::hardware_root::HOST_ROOT_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _root = RestoredEnvVar::set(TEST_HOST_ROOT_ENV, &root);
+            let mut examined = Examination::default();
+            probe_os(&mut examined);
+            (examined, crate::host_gpu::detect_distro_name())
+        };
+        std::fs::remove_dir_all(&root).ok();
+
+        assert_eq!(
+            (
+                examined.distro_id.as_str(),
+                examined.distro_version.as_str()
+            ),
+            ("fallback", "1.2")
+        );
+        assert_eq!(name.as_deref(), Some("Fallback 1.2"));
+    }
+
+    /// Guards [`TRY_OS_RELEASE_FN`] against drifting from the copy embedded in
+    /// [`WSL_REMOTE_PROBE`]: the test below exercises the standalone constant,
+    /// so if a future edit touches one and not the other, this catches it
+    /// rather than the test silently proving the wrong logic.
+    #[test]
+    fn try_os_release_fn_is_embedded_in_the_wsl_remote_probe() {
+        assert!(
+            WSL_REMOTE_PROBE.contains(TRY_OS_RELEASE_FN),
+            "WSL_REMOTE_PROBE's os-release handling has drifted from the tested function"
+        );
+    }
+
+    /// The WSL remote probe's `try_os_release` shell function, run for real
+    /// under `/bin/sh` against temp-directory paths rather than the real
+    /// `/etc`: it sources the first path that exists, falling back to the
+    /// second only when the first is absent, matching `os-release(5)` and the
+    /// Rust-side `hardware_root::read_os_release`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn try_os_release_sources_the_fallback_only_when_the_primary_is_absent() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let primary = dir.path().join("primary");
+        let fallback = dir.path().join("fallback");
+        std::fs::write(&fallback, "ID=fallback\n").expect("write fallback");
+
+        let script = format!("{TRY_OS_RELEASE_FN}\ntry_os_release \"$1\" \"$2\"\necho \"id=$ID\"");
+        let run = || {
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&script)
+                .arg("sh")
+                .arg(&primary)
+                .arg(&fallback)
+                .output()
+                .expect("run sh")
+        };
+
+        let before = run();
+        assert_eq!(
+            String::from_utf8_lossy(&before.stdout).trim(),
+            "id=fallback",
+            "stderr: {}",
+            String::from_utf8_lossy(&before.stderr)
+        );
+
+        std::fs::write(&primary, "ID=primary\n").expect("write primary");
+        let after = run();
+        assert_eq!(
+            String::from_utf8_lossy(&after.stdout).trim(),
+            "id=primary",
+            "stderr: {}",
+            String::from_utf8_lossy(&after.stderr)
+        );
+    }
+
+    /// `[ -e "$1" ]` is an existence check, not a readability one: a primary
+    /// that exists but cannot be sourced (here, a directory in its place, the
+    /// same portable non-readable fixture the Rust-side test above uses)
+    /// must not fall through to the `elif` and source the fallback — that
+    /// would silently read a file that may not describe this host, matching
+    /// `hardware_root::read_os_release`'s own non-absence rule.
+    ///
+    /// This is deliberately a directory, not a permission-denied file: CI
+    /// commonly runs as root, where a `chmod 000` file is still readable, so
+    /// a mode-000 fixture would pass or fail depending on who runs it. A
+    /// directory fails to source for a different, root-safe reason ("is a
+    /// directory"), which is enough to prove this one claim — existence is
+    /// not readability — but is **not** the same failure mode as a genuinely
+    /// unreadable primary. Under `/bin/sh` (`dash` on Debian/Ubuntu),
+    /// sourcing a *permission-denied* file is a fatal shell-level error that
+    /// aborts the whole embedded script immediately, not just this function —
+    /// a materially different outcome than "`$ID` stays unset" and one this
+    /// test does not exercise. That abort-on-unreadable-primary behavior
+    /// predates the `/usr/lib/os-release` fallback this module adds; fixing
+    /// it is out of scope here (tracked as a possible follow-up, not a
+    /// blocker for the fallback itself).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn try_os_release_does_not_source_the_fallback_when_the_primary_is_not_sourceable() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let primary = dir.path().join("primary");
+        let fallback = dir.path().join("fallback");
+        std::fs::create_dir(&primary).expect("create primary as a directory");
+        std::fs::write(&fallback, "ID=fallback\n").expect("write fallback");
+
+        let script = format!("{TRY_OS_RELEASE_FN}\ntry_os_release \"$1\" \"$2\"\necho \"id=$ID\"");
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .arg("sh")
+            .arg(&primary)
+            .arg(&fallback)
+            .output()
+            .expect("run sh");
+
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "id=",
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }
 

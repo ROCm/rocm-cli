@@ -578,6 +578,18 @@ fn unwind_partial_serve(
     leftovers
 }
 
+/// One item per line, bulleted. Shared rather than reimplemented per call
+/// site, so a third copy never has to decide independently whether to match
+/// this formatting. Private: the only other caller is `remote::install`, a
+/// child module, which sees a plain-private item without any added visibility.
+fn bullets(items: &[String]) -> String {
+    items
+        .iter()
+        .map(|item| format!("  - {item}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Attach what could not be cleaned up to the error that caused it.
 fn describe_leftovers(error: anyhow::Error, target: &str, leftovers: &[String]) -> anyhow::Error {
     if leftovers.is_empty() {
@@ -586,11 +598,7 @@ fn describe_leftovers(error: anyhow::Error, target: &str, leftovers: &[String]) 
     error.context(format!(
         "{target} was left with things this command could not undo:\n{}\n\
          Check it with: ssh {target} -- rocm services list",
-        leftovers
-            .iter()
-            .map(|leftover| format!("  - {leftover}"))
-            .collect::<Vec<_>>()
-            .join("\n")
+        bullets(leftovers)
     ))
 }
 
