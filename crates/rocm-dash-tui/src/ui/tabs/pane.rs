@@ -419,9 +419,9 @@ fn live_lines(action: KeyAction, state: &AppState, theme: &Theme) -> (Vec<Line<'
                     Span::styled(r.id.clone(), Style::default().fg(theme.fg)),
                 ]));
             }
-            if n > 4 {
+            if let Some(tail) = format::overflow_line(n, 4) {
                 lines.push(Line::from(Span::styled(
-                    format!("  …and {} more", n - 4),
+                    tail,
                     Style::default().fg(theme.muted),
                 )));
             }
@@ -465,9 +465,9 @@ fn live_lines(action: KeyAction, state: &AppState, theme: &Theme) -> (Vec<Line<'
                         ),
                     ]));
                 }
-                if running.len() > 5 {
+                if let Some(tail) = format::overflow_line(running.len(), 5) {
                     lines.push(Line::from(Span::styled(
-                        format!("  …and {} more", running.len() - 5),
+                        tail,
                         Style::default().fg(theme.muted),
                     )));
                 }

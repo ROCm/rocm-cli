@@ -158,6 +158,13 @@ pub struct E2eWorld {
     /// has something real to terminate. Held here so `Drop` can kill and reap
     /// it whatever the scenario's outcome, and so the stop's effect on it can
     /// be observed through the handle rather than by PID alone.
+    ///
+    /// Also doubles as the disposable `sleep` child `dash-28` points
+    /// "e2e-mock"'s `supervisor_pid`/`engine_pid` at. `register_mock_service`
+    /// deliberately points those fields at *this harness's own* PID so startup
+    /// liveness checks see a live process — fine for every scenario that only
+    /// reads the record, but a real `rocm services stop e2e-mock --yes` would
+    /// then signal the harness process itself.
     pub recorded_process: Option<std::process::Child>,
 }
 
