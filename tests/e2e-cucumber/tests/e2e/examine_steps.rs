@@ -40,6 +40,18 @@ const STUB_MARKET_NAME: &str = "stub-accelerator";
 /// otherwise, per `command_failure_detail` — not stdout unconditionally.
 const STUB_FIRST_GPU_MARKET_NAME: &str = "stub-accelerator-gpu0";
 
+/// The `e2e-test-hooks` seam that names the device node `rocm_core`'s `amd-smi`
+/// pre-flight opens (EAI-8457).
+///
+/// Spelled out rather than imported: `rocm_core` exports it only to its own
+/// crate, because a `pub` constant would read as an invitation for production
+/// code to consult it. The harness has to agree with that string by hand, and
+/// the scenario that points it at an absent path is what notices if it drifts:
+/// it asserts the decline names *that* path, so a build that ignored the
+/// variable would decline naming `/dev/kfd` and fail, rather than passing on a
+/// gate that declined for the host's own reasons.
+const KFD_DEVICE_SEAM: &str = "ROCM_E2E_KFD_DEVICE";
+
 /// Where the `amd-smi` stub and its payload live inside the isolated root.
 ///
 /// Derived rather than carried on the World so the Given and the When agree on
@@ -1712,6 +1724,44 @@ async fn stub_amd_smi_that_stalls_only_on_monitor(world: &mut E2eWorld) {
     );
 }
 
+/// Where the stub records that it ran, so the decline can be asserted as "never
+/// spawned" rather than merely "reported unavailable".
+fn stub_ran_marker(world: &E2eWorld) -> PathBuf {
+    stub_bin_dir(world).join("amd-smi-ran")
+}
+
+#[given("the KFD device cannot be opened")]
+async fn kfd_device_cannot_be_opened(world: &mut E2eWorld) {
+    // A stub that *would* answer perfectly well, and a marker that records it
+    // running. The point of the gate is that neither ever happens: a scenario
+    // whose stub could not have answered anyway would pass against a gate that
+    // had been deleted.
+    let payload = write_stub_payload(world);
+    let marker = stub_ran_marker(world);
+    write_amd_smi_stub(
+        world,
+        &format!(
+            "touch {marker}\nexec cat {payload}",
+            marker = marker.display(),
+            payload = payload.display()
+        ),
+    );
+
+    // Inside the isolated root and never created. The decline must name this
+    // path, which is what proves the daemon read the seam rather than falling
+    // back to `/dev/kfd` -- a host-dependent answer that would make the
+    // scenario pass for the wrong reason on a lane with no GPU.
+    let absent = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("absent-kfd-device");
+    world
+        .command_env
+        .push((KFD_DEVICE_SEAM, absent.into_os_string()));
+}
+
 #[when("the daemon gathers a bridge snapshot")]
 async fn daemon_gathers_bridge_snapshot(world: &mut E2eWorld) {
     let rocmd = crate::rocmd_binary();
@@ -1749,6 +1799,28 @@ async fn daemon_gathers_bridge_snapshot(world: &mut E2eWorld) {
     )
     .expect("failed to build the stub PATH");
     command.env("PATH", path);
+
+    // The `/dev/kfd` pre-flight in `rocm_core::amd_smi_json` (EAI-8457) refuses
+    // to spawn `amd-smi` at all when the device cannot be opened, and the lane
+    // that runs these scenarios per PR has no `/dev/kfd`. Without a seam the
+    // stub would never be reached and all three scenarios would assert against
+    // a decline instead of the pipe-drain behaviour they are about.
+    //
+    // `ROCM_CLI_TEST_HOST_ROOT` cannot do this job: the gate deliberately keeps
+    // the real node's veto, so a simulated root can only ever make it decline.
+    // The `e2e-test-hooks` path seam can, and it moves the gate rather than
+    // disabling it -- the daemon still opens the file named here before it
+    // spawns anything, which is why a plain readable file is enough to stand in
+    // for a healthy device. The companion scenario points the same variable at
+    // an absent path to exercise the other branch.
+    let kfd_stand_in = isolated_home.join("kfd-stand-in");
+    std::fs::write(&kfd_stand_in, b"").expect("failed to plant the stand-in KFD node");
+    command.env(KFD_DEVICE_SEAM, &kfd_stand_in);
+    // Applied after the default above so a scenario that pushed its own value
+    // -- the declined branch does -- wins over it.
+    for (key, value) in &world.command_env {
+        command.env(key, value);
+    }
 
     let output = command
         .output()
@@ -1865,6 +1937,60 @@ async fn assert_stalled_probe_note_is_bounded(world: &mut E2eWorld) {
         length <= MAX_NOTE_CHARS,
         "the note must be bounded before it reaches the bridge snapshot and the automation \
          logs, but amd-smi's {STUB_GPU_COUNT}-GPU payload produced {length} characters"
+    );
+}
+
+#[then("the snapshot says amd-smi was never launched and names the device")]
+async fn assert_snapshot_declined_the_launch(world: &mut E2eWorld) {
+    let rc = world.cli_rc.expect("no rocmd exit status recorded");
+    let stdout = world.cli_output.as_ref().expect("no rocmd output recorded");
+    let stderr = world.cli_stderr.as_deref().unwrap_or("");
+    // A declined probe degrades the GPU section the same way a timed-out one
+    // does; it must not fail the command.
+    assert_eq!(rc, 0, "rocmd bridge-snapshot failed:\n{stdout}\n{stderr}");
+
+    let snapshot: serde_json::Value = serde_json::from_str(stdout)
+        .unwrap_or_else(|error| panic!("bridge-snapshot did not emit JSON: {error}\n{stderr}"));
+    let gpu = &snapshot["gpu"];
+
+    assert_eq!(
+        gpu["amd_smi_available"],
+        serde_json::Value::Bool(false),
+        "a launch that was refused cannot have reported a GPU: {gpu}"
+    );
+    let note = gpu["note"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a degraded snapshot must explain itself: {gpu}"));
+    assert!(
+        note.contains("declined to launch"),
+        "the note must say the launch was refused, not blame the binary or a timeout: {note:?}"
+    );
+
+    // The device this run was pointed at, not `/dev/kfd`. On a lane with no GPU
+    // the gate declines either way, so without this the scenario would pass
+    // against a build that ignored the seam entirely -- and would then be
+    // asserting the runner's own missing device rather than the gate.
+    let expected = world
+        .command_env
+        .iter()
+        .find(|(key, _)| *key == KFD_DEVICE_SEAM)
+        .map(|(_, value)| value.to_string_lossy().into_owned())
+        .expect("the scenario must have pointed the pre-flight at an absent device");
+    assert!(
+        note.contains(&expected),
+        "the note must name the device the pre-flight actually probed ({expected}): {note:?}"
+    );
+
+    // The load-bearing half: the gate's claim is that nothing is spawned, which
+    // a note alone does not establish. The stub would have answered this probe
+    // perfectly, so the marker's absence is the only evidence that the refusal
+    // happened before the launch rather than after a failed one.
+    let marker = stub_ran_marker(world);
+    assert!(
+        !marker.exists(),
+        "the pre-flight must refuse before the spawn, but the stub amd-smi ran and left \
+         {}",
+        marker.display()
     );
 }
 

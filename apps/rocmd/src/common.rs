@@ -5,9 +5,8 @@
 use anyhow::{Context, Result, bail};
 use rocm_core::{
     AppPaths, AutomationRuntimeState, CodexBridgeEngine, CodexBridgeGpuSnapshot,
-    CodexBridgeSnapshot, ExamineSummary, RocmCliConfig, daemon_binary_path,
-    default_engine_for_platform, format_host_port, load_recent_automation_events,
-    resolve_amd_smi_binary, unix_time_millis,
+    CodexBridgeSnapshot, ExamineSummary, RocmCliConfig, amd_smi_json, daemon_binary_path,
+    default_engine_for_platform, format_host_port, load_recent_automation_events, unix_time_millis,
 };
 #[cfg(test)]
 use rocm_engine_protocol::EnginePluginDescriptor;
@@ -26,6 +25,16 @@ use std::process::{Command as ProcessCommand, Stdio};
 use std::thread;
 use std::time::Duration;
 
+/// How long `rocmd` waits on an `amd-smi` probe before giving up on it.
+///
+/// Deliberately 5x shorter than `serve`'s `AMD_SMI_SERVE_PROBE_TIMEOUT` (10s),
+/// even though both now reach the same `rocm_core::amd_smi_json`. The two pay
+/// different prices for giving up early. This one runs on the GPU-telemetry
+/// watcher's polling cadence, where a probe that is abandoned costs one stale
+/// tick and the next poll retries moments later — so a long wait buys nothing
+/// and keeps a watcher thread parked on an unhealthy host. `serve` gets exactly
+/// one shot at learning the GPU layout before placing a model, and abandoning
+/// it degrades the placement decision for the whole lifetime of that service.
 const AMD_SMI_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub(crate) fn build_bridge_snapshot(paths: &AppPaths) -> Result<CodexBridgeSnapshot> {
@@ -70,7 +79,11 @@ pub(crate) fn gather_gpu_snapshot() -> CodexBridgeGpuSnapshot {
                 // Every failure `run_with_timeout` raises carries its cause the
                 // same way, since all of them arrive under that one context:
                 // the timeout, the failure to spawn, and the poll and reap
-                // failures of its wait loop. Spawn is the case on a host where
+                // failures of its wait loop. The `/dev/kfd` pre-flight in
+                // `amd_smi_json` is the one failure that arrives *without* it,
+                // because it declines before there is a launch to contextualise
+                // -- its own message is self-describing and reaches the note
+                // intact. Spawn is the case on a host where
                 // none of the paths `resolve_amd_smi_binary` searches holds an
                 // `amd-smi`, down to the bare name on `PATH`; the cause is then
                 // the OS's own "not found" text, which is not the same string
@@ -83,8 +96,9 @@ pub(crate) fn gather_gpu_snapshot() -> CodexBridgeGpuSnapshot {
                 //
                 // The note is the only account of any of this that reaches the
                 // bridge snapshot and the automation watcher, so it carries the
-                // causes too -- bounded, because it is persisted; see
-                // `run_with_timeout`'s `MAX_QUOTED_OUTPUT_CHARS`.
+                // causes too -- bounded, because it is persisted; see the
+                // `MAX_QUOTED_OUTPUT_CHARS` that `amd_smi_json` and
+                // `run_with_timeout` each apply to their own quote.
                 amd_smi_available: false,
                 static_snapshot: None,
                 monitor_snapshot: None,
@@ -136,32 +150,11 @@ pub(crate) fn gather_gpu_snapshot_for_config(config: &RocmCliConfig) -> CodexBri
 }
 
 fn capture_amd_smi_json(args: &[&str]) -> Result<Value> {
-    let amd_smi_binary = resolve_amd_smi_binary();
-    let mut command = ProcessCommand::new(&amd_smi_binary);
-    // No stdio here: `run_with_timeout` sets null stdin and piped stdout/stderr
-    // itself, since capturing both is its contract.
-    command.args(args);
-    let output = rocm_core::process::run_with_timeout(command, AMD_SMI_PROBE_TIMEOUT, "process")
-        .with_context(|| format!("failed to launch amd-smi {}", args.join(" ")))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        anyhow::bail!(
-            "amd-smi {} failed: {}",
-            args.join(" "),
-            if !stderr.is_empty() {
-                stderr
-            } else if !stdout.is_empty() {
-                stdout
-            } else {
-                format!("exit status {}", output.status)
-            }
-        );
-    }
-
-    serde_json::from_slice(&output.stdout)
-        .with_context(|| format!("failed to parse amd-smi {} json", args.join(" ")))
+    // `rocm_core::amd_smi_json`, not a local spawn: it is the one launch site
+    // that runs the `/dev/kfd` pre-flight, and the pre-flight protects nothing
+    // unless every launch goes through it. The spawn, the timeout, the
+    // non-zero-exit quote and the JSON parse all live there now.
+    amd_smi_json(args, AMD_SMI_PROBE_TIMEOUT)
 }
 
 pub(crate) fn bridge_engine_inventory() -> Vec<CodexBridgeEngine> {
