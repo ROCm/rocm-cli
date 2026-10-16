@@ -664,6 +664,14 @@ impl AppState {
     /// below, in contrast, both reads the registry live AND consults that
     /// result unconditionally, for a different question (which ids are
     /// reachable).
+    ///
+    /// **Known gap:** pointing the dashboard at a non-local daemon via the
+    /// `dashboard.tui.connect` config value, where that daemon does not
+    /// discover *this* host's `services_dir`, is not accounted for. Once a
+    /// snapshot lands, `instances` is sourced from that other daemon and this
+    /// host's local registry read is ignored for this question (per above),
+    /// so a model served here would not open the prompt. Not a case this
+    /// gate is built to handle.
     pub(crate) fn has_live_instance(&self) -> bool {
         self.has_live_instance_with(&self.live_registry_snapshot())
     }

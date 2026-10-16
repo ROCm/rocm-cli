@@ -1603,6 +1603,17 @@ async fn dashboard_menu_is_displayed(world: &mut E2eWorld) {
         .unwrap_or_else(|e| panic!("dashboard menu did not appear: {e}"));
 }
 
+/// Navigates `Modal::Menu`'s items (`["Options", "Help", "Quit"]`,
+/// `ui/modal.rs`) down to "Quit" and activates it — `j` twice from the
+/// default `menu_sel: 0`, then `Enter` (`KeyAction::MenuActivate`). Requires
+/// the menu to already be open (`the dashboard menu is displayed`).
+#[when("the user selects Quit from the dashboard menu")]
+async fn select_quit_from_dashboard_menu(world: &mut E2eWorld) {
+    session(world)
+        .send("jj\r")
+        .unwrap_or_else(|e| panic!("failed to select Quit from the dashboard menu: {e}"));
+}
+
 #[then("the dashboard menu is closed")]
 async fn dashboard_menu_is_closed(world: &mut E2eWorld) {
     // A bare Escape send is not guaranteed to have been acted on yet by the

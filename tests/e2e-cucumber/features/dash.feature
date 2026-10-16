@@ -526,3 +526,27 @@ Feature: Interactive dashboard
     Then the dashboard home view is displayed
     When the user tries to quit the dashboard
     Then the dashboard exits immediately with no quit confirmation
+
+  # #145 / AGENTS.md §3: the Esc-menu "Quit" row shares `request_quit` with
+  # every other quit gesture (`actions.rs`'s `KeyAction::MenuActivate` arm),
+  # but until now that sharing was only proven at the unit level — mutating
+  # the row's own `return request_quit(state)` back to `return true` fails no
+  # scenario, only unit tests (`quitting_from_the_esc_menu_opens_the_same_confirm_prompt`
+  # et al). This scenario reaches the row the way a user would: Esc opens the
+  # menu, and navigating to and activating "Quit" asks the same quit-confirm
+  # prompt every other entry point does.
+  @id:dash-esc-menu-quit-row-confirms-when-serving @requires-os:linux
+  Scenario: dash-34 - Choosing Quit from the Esc menu while a model is being served asks for confirmation first
+    Given a running managed model is available locally
+    When the user opens the dashboard
+    And the user opens the Observe view
+    Then the managed model is displayed
+    When the user presses Escape
+    Then the dashboard menu is displayed
+    When the user selects Quit from the dashboard menu
+    Then the dashboard asks whether to quit while a model is still being served
+    When the user declines the quit prompt
+    Then the managed model is displayed
+    When the user quits the dashboard
+    Then the dashboard exits successfully
+    And the managed model is still listed as running
