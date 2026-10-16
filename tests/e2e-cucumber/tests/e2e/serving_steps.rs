@@ -637,22 +637,34 @@ async fn setup_lemonade_hf_checkpoint_model(world: &mut E2eWorld) {
 async fn setup_aim_model(world: &mut E2eWorld) {
     // AIM has no model catalog in this PR's scope (ROCMAI-555): the model
     // argument IS the raw AIM Docker image reference, not a short recipe name
-    // like the vLLM/Lemonade scenarios above. This is the smallest model image
-    // the ROCMAI-553 registry spike found — `instinct`/`gpu`, and its
-    // `PYTORCH_ROCM_ARCH` lists `gfx1151` (Strix Halo, the only runner this
-    // scenario actually executes on).
-    let image = "amdenterpriseai/aim-meta-llama-llama-3-2-1b-instruct:0.11.1";
-    // The container bundles vLLM, which is expected to echo the model's baked-in
-    // HF id (not the Docker image reference) as `model` — mirroring
-    // `engine_registry.rs`'s identical "presumed, unconfirmed until Strix Halo
-    // validation pass" note. Confirm this id against the real container during
-    // that pass and adjust if it reports something else.
-    let model = "meta-llama/Llama-3.2-1B-Instruct";
+    // like the vLLM/Lemonade scenarios above.
+    //
+    // The `aim-meta-llama-llama-3-2-1b-instruct` image originally used here
+    // bundles only Instinct-series (MI300X/MI250X/MI355X/MI325X/MI350X)
+    // profiles — confirmed via its container logs to report "Found 0
+    // compatible profiles" on Strix Halo/gfx1151, the only runner this
+    // scenario executes on. `aim-radeon-qwen-qwen3-5-9b` is a Radeon-targeted
+    // image, hardware-verified serving real inference on Strix Halo; its
+    // profile still needs an explicit pick via `--engine-env` because
+    // auto-selection isn't reliable for Radeon targets yet.
+    let image = "amdenterpriseai/aim-radeon-qwen-qwen3-5-9b:0.12.0-preview";
+    // The container bundles vLLM, which echoes the model's baked-in HF id
+    // (not the Docker image reference) as `model` — confirmed live on Strix
+    // Halo.
+    let model = "Qwen/Qwen3.5-9B";
     serve_and_wait(
         world,
-        &["serve", image, "--engine", "aim", "--managed"],
+        &[
+            "serve",
+            image,
+            "--engine",
+            "aim",
+            "--engine-env",
+            "AIM_PROFILE_ID=vllm-w7900-bf16-tp1-latency",
+            "--managed",
+        ],
         model,
-        "Llama-3.2-1B",
+        "Qwen3.5-9B",
     )
     .await;
 }

@@ -390,14 +390,18 @@ impl E2eWorld {
         }
         // When a scenario declares a longer serve-readiness window (via a
         // `@serve-timeout:<secs>` tag → serve_timeout_override), also raise the
-        // CLI's OWN vLLM readiness cap to match. `rocm serve --managed` otherwise
-        // SIGTERM-kills a vLLM that isn't ready within its default (5 min,
-        // EAI-7393), which a large model's cold load legitimately exceeds — so
-        // extending only the harness's poll (`model_is_ready`) isn't enough; the CLI
-        // would kill the server first. Keeping the two in lockstep makes the
-        // big-model serve actually reach ready (verified on MI300X with Qwen3.6-27B).
+        // CLI's OWN per-engine readiness cap(s) to match. `rocm serve --managed`
+        // otherwise kills/fails a server that isn't ready within its default (5
+        // min, EAI-7393), which a large model's cold load legitimately exceeds —
+        // so extending only the harness's poll (`model_is_ready`) isn't enough;
+        // the CLI would terminate the server first. Keeping them in lockstep
+        // makes the big-model serve actually reach ready (vLLM verified on
+        // MI300X with Qwen3.6-27B; AIM verified on Strix Halo with a 9B model's
+        // cold-start HF download). Setting both vars unconditionally is harmless
+        // — the unused one is a no-op for whichever engine isn't in play.
         if let Some(secs) = self.serve_timeout_override {
             env.push(("ROCM_CLI_VLLM_READY_TIMEOUT_SECS", secs.to_string().into()));
+            env.push(("ROCM_CLI_AIM_READY_TIMEOUT_SECS", secs.to_string().into()));
         }
         env
     }
