@@ -347,8 +347,11 @@ Feature: Model serving
   # reference, not a short recipe name. `@requires-engine:aim` only skips here
   # when Docker itself is unreachable (see `HostCapability::engine_available`'s
   # "aim" arm); a Strix Halo self-hosted runner with Docker is where this
-  # actually runs.
-  @id:serve-aim-inference @requires-gpu @requires-engine:aim
+  # actually runs. `@serve-timeout:1200` widens both the harness's readiness
+  # poll and the CLI's own ROCM_CLI_AIM_READY_TIMEOUT_SECS (see isolate_cmd) —
+  # a cold-start HF weight download for this 9B model legitimately exceeds the
+  # engine's default 5-minute readiness cap.
+  @id:serve-aim-inference @requires-gpu @requires-engine:aim @serve-timeout:1200
   Scenario: serve-26 - A model served on AIM responds to inference requests
     Given a managed runtime is active
     And a model is being served on aim
