@@ -1663,10 +1663,13 @@ examine`'s distro fields and distro name via `record_distro` and
 `distro_name_from_os_release`, which both take the whole `OsRelease` directly.
 The three `_read`-suffixed functions are the one seam the real call site
 hands its result to, and each delegates to the matching `_at` function with
-the path it actually read. `install_hint_for`/`build_driver_install_plan`
-are bare-text siblings of `_at` — not something `_read` delegates through —
-kept only for the unit tests below, which fixture text directly and have no
-`OsRelease` of their own to construct.
+the path it actually read. The unit tests below call the `_read` functions
+directly too, constructing an `OsRelease` from fixture text instead of going
+through a bare-text sibling — `crate::hardware_root::OsRelease::found` in
+`crates/rocm-core/src/openmpi.rs`'s tests, and the equivalent
+`os_release_found` test helper in `apps/rocm/src/driver_install.rs`'s (the
+former is `#[cfg(test)] pub(crate)` inside `rocm-core` and so not visible from
+`apps/rocm`'s own tests).
 
 ```bash
 cargo test -p rocm-core --lib os_release
