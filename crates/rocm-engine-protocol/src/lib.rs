@@ -48,6 +48,34 @@ pub fn is_public_bind_host(host: &str) -> bool {
     !matches!(host, "127.0.0.1" | "localhost" | "::1")
 }
 
+/// The `rocm serve` invocation that brings back a service whose endpoint key
+/// was dropped, for the refusals and the uninstall abort that tell an operator
+/// to launch it again.
+///
+/// One builder for every place that prints it (the `rocm serve` and `rocmd`
+/// refusals and the uninstall abort, one command per stopped service), so they
+/// cannot drift: a public host needs `--allow-public-bind`, and a service that
+/// asked for authentication needs `--require-api-key` even on loopback. The key
+/// itself is optional ([`RELAUNCH_KEY_CHOICE`]).
+#[must_use]
+pub fn relaunch_command(host: &str, require_api_key: bool) -> String {
+    let public_flag = if is_public_bind_host(host) {
+        " --allow-public-bind"
+    } else {
+        ""
+    };
+    let key_flag = if require_api_key {
+        " --require-api-key"
+    } else {
+        ""
+    };
+    format!("rocm serve <model> --host {host} --port <port>{public_flag}{key_flag}")
+}
+
+/// The parenthetical that follows a [`relaunch_command`]: supplying a key is
+/// optional, and the environment variable keeps it out of shell history.
+pub const RELAUNCH_KEY_CHOICE: &str = "(add `--api-key <key>`, or set ROCM_SERVE_API_KEY, to choose the key instead of generating one)";
+
 /// Resolve the endpoint API key an engine adapter must enforce, if any.
 ///
 /// Reads the key file named by [`ENDPOINT_API_KEY_FILE_ENV`]. Returns `None` when
@@ -769,6 +797,26 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         assert_eq!(endpoint_key_file_if_present(&paths, service_id), None);
         std::fs::remove_dir_all(&paths.data_dir).ok();
+    }
+
+    #[test]
+    fn relaunch_command_carries_exactly_the_flags_the_service_needs() {
+        assert_eq!(
+            relaunch_command("127.0.0.1", false),
+            "rocm serve <model> --host 127.0.0.1 --port <port>"
+        );
+        assert_eq!(
+            relaunch_command("127.0.0.1", true),
+            "rocm serve <model> --host 127.0.0.1 --port <port> --require-api-key"
+        );
+        assert_eq!(
+            relaunch_command("0.0.0.0", false),
+            "rocm serve <model> --host 0.0.0.0 --port <port> --allow-public-bind"
+        );
+        assert_eq!(
+            relaunch_command("0.0.0.0", true),
+            "rocm serve <model> --host 0.0.0.0 --port <port> --allow-public-bind --require-api-key"
+        );
     }
 
     #[test]

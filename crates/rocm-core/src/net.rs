@@ -521,6 +521,27 @@ pub fn http_get_text_with_auth(
     endpoint_api_key: Option<&str>,
     timeout: Duration,
 ) -> Result<String> {
+    let parts = http_get_with_auth(endpoint_url, path, endpoint_api_key, timeout)?;
+    if parts.status != 200 {
+        bail!("HTTP endpoint returned HTTP {}", parts.status);
+    }
+    Ok(parts.body)
+}
+
+/// GET `path` and return the response status alongside the body.
+///
+/// The GET sibling of [`http_post_json_with_auth`], and it exists for the same
+/// reason: a caller probing an endpoint has to tell "the server answered, with a
+/// refusal" apart from "the server never answered", and only the former proves
+/// something is alive on that port. [`http_get_text_with_auth`] collapses both
+/// into `Err` — correct for callers that only want a 200's body, wrong for
+/// anything deciding whether a port is still held.
+pub fn http_get_with_auth(
+    endpoint_url: &str,
+    path: &str,
+    endpoint_api_key: Option<&str>,
+    timeout: Duration,
+) -> Result<HttpResponseParts> {
     let deadline = Instant::now() + timeout;
     let (host, port) = parse_http_endpoint(endpoint_url)
         .with_context(|| format!("unsupported endpoint URL `{endpoint_url}`"))?;
@@ -541,10 +562,12 @@ pub fn http_get_text_with_auth(
         .split_once("\r\n\r\n")
         .context("HTTP response was missing a body")?;
     let status_line = headers.lines().next().unwrap_or_default();
-    if !status_line.contains(" 200 ") {
-        bail!("HTTP endpoint returned {status_line}");
-    }
-    Ok(body.to_owned())
+    let status = http_status_code(status_line)
+        .with_context(|| format!("unparsable HTTP status line `{status_line}`"))?;
+    Ok(HttpResponseParts {
+        status,
+        body: body.to_owned(),
+    })
 }
 
 /// POST a JSON body and return the response status line plus body.
@@ -777,19 +800,59 @@ pub fn openai_models_endpoint_has_model(
     endpoint_api_key: Option<&str>,
     timeout: Duration,
 ) -> Result<bool> {
+    Ok(
+        openai_models_endpoint_identity(endpoint_url, expected_model, endpoint_api_key, timeout)?
+            == EndpointIdentity::ServesExpectedModel,
+    )
+}
+
+/// What a listener said when asked which models it serves.
+///
+/// The distinction [`openai_models_endpoint_has_model`] cannot draw: it answers
+/// `false` both for "this is someone else's service" and for "this endpoint
+/// answered, but listed nothing". For a readiness poll those are the same — not
+/// ready either way — but for a caller deciding whether something still holds a
+/// port they are opposites. An engine that is up but has not populated its model
+/// list yet, or is mid-unload, lists nothing while very much holding the GPU.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum EndpointIdentity {
+    /// Listed a model matching the one asked about (or listed models when no
+    /// particular one was asked for).
+    ServesExpectedModel,
+    /// Listed models, none of which match — a different service on this port.
+    ServesOtherModels,
+    /// Answered `/v1/models` with an empty list. Says nothing either way about
+    /// whose service this is.
+    ListsNoModels,
+}
+
+/// Ask a listener which models it serves, keeping "listed nothing" distinct.
+pub fn openai_models_endpoint_identity(
+    endpoint_url: &str,
+    expected_model: Option<&str>,
+    endpoint_api_key: Option<&str>,
+    timeout: Duration,
+) -> Result<EndpointIdentity> {
     let body = http_get_text_with_auth(endpoint_url, "/v1/models", endpoint_api_key, timeout)?;
     let value = serde_json::from_str::<serde_json::Value>(body.trim())
         .context("failed to parse /v1/models JSON")?;
     let loaded_models = openai_loaded_model_ids(&value);
     if loaded_models.is_empty() {
-        return Ok(false);
+        return Ok(EndpointIdentity::ListsNoModels);
     }
     let Some(expected_model) = expected_model.filter(|value| !value.trim().is_empty()) else {
-        return Ok(true);
+        return Ok(EndpointIdentity::ServesExpectedModel);
     };
-    Ok(loaded_models
-        .iter()
-        .any(|loaded| model_refs_match(loaded, expected_model)))
+    Ok(
+        if loaded_models
+            .iter()
+            .any(|loaded| model_refs_match(loaded, expected_model))
+        {
+            EndpointIdentity::ServesExpectedModel
+        } else {
+            EndpointIdentity::ServesOtherModels
+        },
+    )
 }
 
 pub fn managed_service_endpoint_model_ready(
@@ -808,6 +871,29 @@ pub fn managed_service_endpoint_model_ready(
         None
     };
     openai_models_endpoint_has_model(&record.endpoint_url, expected, endpoint_api_key, timeout)
+}
+
+/// [`managed_service_endpoint_model_ready`] without collapsing "listed nothing"
+/// into "not ours".
+///
+/// An empty `endpoint_url` is the one case with no listener to ask about at all,
+/// so it stays an error rather than being reported as an identity.
+pub fn managed_service_endpoint_identity(
+    record: &ManagedServiceRecord,
+    endpoint_api_key: Option<&str>,
+    timeout: Duration,
+) -> Result<EndpointIdentity> {
+    if record.endpoint_url.trim().is_empty() {
+        bail!("service record has no endpoint URL to identify");
+    }
+    let expected = if !record.canonical_model_id.trim().is_empty() {
+        Some(record.canonical_model_id.as_str())
+    } else if !record.model_ref.trim().is_empty() {
+        Some(record.model_ref.as_str())
+    } else {
+        None
+    };
+    openai_models_endpoint_identity(&record.endpoint_url, expected, endpoint_api_key, timeout)
 }
 
 /// How far along a managed service's endpoint is.
@@ -1185,6 +1271,145 @@ mod tests {
         server.join().expect("server thread should not panic")?;
         Ok(())
     }
+    #[test]
+    fn an_empty_model_list_is_not_reported_as_somebody_elses_service() -> Result<()> {
+        // `openai_models_endpoint_has_model` answers `false` both for "these are
+        // someone else's models" and for "this endpoint listed nothing". For a
+        // readiness poll that is fine — not ready either way. For a caller
+        // deciding whether something still holds a port they are opposites: an
+        // engine that is up but has not populated its list yet, or is
+        // mid-unload, lists nothing while holding the port and the GPU, and
+        // reading that as "not ours" removes the tooling out from under it.
+        //
+        // Four connections: an empty list and a stranger's list, asked twice —
+        // once through the enum, once through the bool wrapper. The wrapper is
+        // where the three-way answer collapses back to the readiness contract
+        // every existing caller depends on, and that single comparison is not
+        // pinned by asserting on the enum alone.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        let server = std::thread::spawn(move || -> Result<()> {
+            let empty = r#"{"data":[]}"#;
+            let stranger = r#"{"data":[{"id":"someone/else"}]}"#;
+            for body in [empty, stranger, empty, stranger] {
+                let (mut stream, _) = listener.accept()?;
+                stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                let mut buffer = [0_u8; 512];
+                let _ = stream.read(&mut buffer)?;
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )?;
+            }
+            Ok(())
+        });
+        let endpoint = format!("http://127.0.0.1:{port}/v1");
+
+        assert_eq!(
+            openai_models_endpoint_identity(
+                &endpoint,
+                Some("amd/ours"),
+                None,
+                Duration::from_secs(2)
+            )?,
+            EndpointIdentity::ListsNoModels,
+            "an empty list says nothing about whose service this is"
+        );
+        assert_eq!(
+            openai_models_endpoint_identity(
+                &endpoint,
+                Some("amd/ours"),
+                None,
+                Duration::from_secs(2)
+            )?,
+            EndpointIdentity::ServesOtherModels,
+            "a list that names other models is the only real evidence of a stranger"
+        );
+
+        // Across the wrapper. Only `ServesExpectedModel` may read as ready:
+        // mapping either of the other two arms to `true` would tell every
+        // readiness caller that an endpoint listing nothing, or listing a
+        // stranger's model, is serving theirs.
+        assert!(
+            !openai_models_endpoint_has_model(
+                &endpoint,
+                Some("amd/ours"),
+                None,
+                Duration::from_secs(2)
+            )?,
+            "an endpoint listing nothing is not serving our model"
+        );
+        assert!(
+            !openai_models_endpoint_has_model(
+                &endpoint,
+                Some("amd/ours"),
+                None,
+                Duration::from_secs(2)
+            )?,
+            "an endpoint serving a stranger's model is not serving ours"
+        );
+
+        server.join().expect("server thread should not panic")?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_get_reports_a_refusal_as_an_answer_not_as_a_failure() -> Result<()> {
+        // The distinction `http_get_text_with_auth` cannot make. Its `Err` means
+        // "no 200", which lumps a 401 from a live server together with a dead
+        // port — and a caller deciding whether something still holds a port has
+        // to tell those apart: only the refusal proves the port is held.
+        //
+        // Two connections: the same 401 read both ways.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        let server = std::thread::spawn(move || -> Result<()> {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept()?;
+                stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                let mut buffer = [0_u8; 512];
+                let _ = stream.read(&mut buffer)?;
+                write!(
+                    stream,
+                    "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )?;
+            }
+            Ok(())
+        });
+        let endpoint = format!("http://127.0.0.1:{port}/v1");
+
+        let parts = http_get_with_auth(&endpoint, "/models", None, Duration::from_secs(2))?;
+        assert_eq!(
+            parts.status, 401,
+            "a refusal is an answer, and its status has to survive"
+        );
+        assert!(
+            http_get_text_with_auth(&endpoint, "/models", None, Duration::from_secs(2)).is_err(),
+            "the text helper still collapses every non-200 into an error"
+        );
+
+        server.join().expect("server thread should not panic")?;
+
+        // And an unreachable port is an error either way — the two must not
+        // collapse in the other direction.
+        let dead = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let dead_port = dead.local_addr()?.port();
+        drop(dead);
+        assert!(
+            http_get_with_auth(
+                &format!("http://127.0.0.1:{dead_port}/v1"),
+                "/models",
+                None,
+                Duration::from_millis(500),
+            )
+            .is_err(),
+            "nothing answered, so there is no status to report"
+        );
+        Ok(())
+    }
+
     // Why readiness is gated on an inference probe (EAI-7333): a server that
     // lists the model on `/v1/models` but cannot yet serve
     // `/v1/chat/completions` still reports the model as present. This test pins

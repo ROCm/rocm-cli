@@ -645,3 +645,35 @@ Expected result:
   `PATH change left in place` and names it, and the `PATH` change stays.
 - With `rocm uninstall --keep-binaries`, the review says the `PATH` change
   stays too, and it does.
+
+### With a running managed server
+
+Start a managed server (`rocm serve <model>`), then run:
+
+```powershell
+rocm uninstall --yes
+```
+
+Expected result:
+
+- The plan warns the server will be stopped before removal. If the background
+  helper (`rocmd`) is running and the run proceeds, the plan says it will be stopped before removal (its whole process tree on Linux; only the recorded process on Windows, and the plan says so). On a run that will refuse, the plan says the helper is left running instead.
+- The server (and helper) are stopped, then the files are removed and the
+  command exits 0.
+
+The refusal paths each need a fresh install and a fresh managed server, because
+a successful `uninstall --yes` above removes the install. Reinstall, start a
+managed server again, then:
+
+- **Unreadable record.** Write `{` into `<data dir>/services/bad.json`, where
+  the data directory is the one `rocm examine` reports, and run
+  `rocm uninstall --yes`. It must exit non-zero, name that file's full path,
+  advise repairing or deleting it, and leave the install, config, and data
+  directories in place.
+- **No recorded start time.** Edit the server's record under the same
+  `services` folder and delete its `supervisor_start_ticks` field (a record
+  written by an older version looks like this). The plan must say the stop
+  will be refused, and `rocm uninstall --yes` must exit non-zero naming the
+  pid, leave the server running, and remove nothing.
+- **Keep binaries and data (removes only config and cache).** `rocm uninstall --yes --keep-binaries --keep-data` must leave
+  the server and the helper running and say so in the plan.
