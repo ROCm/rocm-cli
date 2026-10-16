@@ -405,37 +405,6 @@ Feature: GPU detection and system inspection
     When the daemon gathers a bridge snapshot
     Then the snapshot keeps the first probe's GPUs and explains the second with a bounded note naming the timeout
 
-  # The other side of the three above, and the user-observable half of the
-  # `/dev/kfd` pre-flight (EAI-8457): where those three prove a healthy device
-  # still reaches amd-smi, this proves an unopenable one stops the launch from
-  # happening at all. On a host in that state amd-smi can park in
-  # uninterruptible sleep, where no signal and therefore no timeout reaches it,
-  # so "declined" is the only outcome that bounds the daemon's 60s telemetry
-  # poll. The snapshot degrades; the command still succeeds.
-  #
-  # Non-vacuity is the whole difficulty here, and it is carried in two places.
-  # The stub amd-smi would answer this probe perfectly and records that it ran,
-  # so the marker's absence is what distinguishes "refused before the spawn"
-  # from "spawned and failed" -- deleting the gate makes this scenario fail
-  # rather than merely changing a message. And the note must name the device
-  # this run pointed the pre-flight at: the lane that runs this per PR has no
-  # `/dev/kfd` of its own, so a build that ignored the seam would decline for
-  # the host's own reasons and otherwise look identical.
-  #
-  # The seam is `ROCM_E2E_KFD_DEVICE`, honoured only by an `e2e-test-hooks`
-  # build (`rocm_core::preflight_kfd_device`), and it moves the device the gate
-  # opens rather than skipping the gate. `ROCM_CLI_TEST_HOST_ROOT` cannot stand
-  # in for it: the gate keeps the real node's veto on purpose, so a simulated
-  # root can only ever make it decline -- which is this branch, but leaves the
-  # three scenarios above unable to reach amd-smi on a GPU-less runner at all.
-  # Linux-only, like its three siblings: the stub is a shell script, and the
-  # gate is a wave-through on every other platform.
-  @id:examine-telemetry-declines-an-unopenable-kfd-device @requires-os:linux
-  Scenario: examine-29 - An unopenable KFD device stops amd-smi being launched at all
-    Given the KFD device cannot be opened
-    When the daemon gathers a bridge snapshot
-    Then the snapshot says amd-smi was never launched and names the device
-
   # `os-release(5)` says to read `/etc/os-release` and, if it does not exist,
   # fall back to `/usr/lib/os-release`. This plants a simulated host root with
   # only the fallback path populated, so a reader that stopped after the first
@@ -459,3 +428,36 @@ Feature: GPU detection and system inspection
     Given a GPU machine whose release file cannot be read
     When the user inspects that machine in machine-readable form
     Then the inspection's verdict is degraded, and its only failure says the release file could not be read
+
+  # The other side of examine-24/25/26, and the user-observable half of the
+  # `/dev/kfd` pre-flight (EAI-8457): where those three prove a healthy device
+  # still reaches amd-smi, this proves an unopenable one stops the launch from
+  # happening at all. (Declared here at the end rather than beside them because
+  # the scenario index is per-feature and in declaration order.) On a host in
+  # that state amd-smi can park in
+  # uninterruptible sleep, where no signal and therefore no timeout reaches it,
+  # so "declined" is the only outcome that bounds the daemon's 60s telemetry
+  # poll. The snapshot degrades; the command still succeeds.
+  #
+  # Non-vacuity is the whole difficulty here, and it is carried in two places.
+  # The stub amd-smi would answer this probe perfectly and records that it ran,
+  # so the marker's absence is what distinguishes "refused before the spawn"
+  # from "spawned and failed" -- deleting the gate makes this scenario fail
+  # rather than merely changing a message. And the note must name the device
+  # this run pointed the pre-flight at: the lane that runs this per PR has no
+  # `/dev/kfd` of its own, so a build that ignored the seam would decline for
+  # the host's own reasons and otherwise look identical.
+  #
+  # The seam is `ROCM_E2E_KFD_DEVICE`, honoured only by an `e2e-test-hooks`
+  # build (`rocm_core::preflight_kfd_device`), and it moves the device the gate
+  # opens rather than skipping the gate. `ROCM_CLI_TEST_HOST_ROOT` cannot stand
+  # in for it: the gate keeps the real node's veto on purpose, so a simulated
+  # root can only ever make it decline -- which is this branch, but leaves
+  # examine-24/25/26 unable to reach amd-smi on a GPU-less runner at all.
+  # Linux-only, like its three siblings: the stub is a shell script, and the
+  # gate is a wave-through on every other platform.
+  @id:examine-telemetry-declines-an-unopenable-kfd-device @requires-os:linux
+  Scenario: examine-29 - An unopenable KFD device stops amd-smi being launched at all
+    Given the KFD device cannot be opened
+    When the daemon gathers a bridge snapshot
+    Then the snapshot says amd-smi was never launched and names the device
