@@ -1457,8 +1457,12 @@ mod tests {
                  (status: exit status: 1){context}\n"
             ),
         )?;
-        let tail =
-            rocm_core::tail_lines(&path, STARTUP_FAILURE_LOG_TAIL_LINES, MAX_TAIL_READ)?.join("\n");
+        let tail = rocm_core::tail_lines(
+            &path,
+            STARTUP_FAILURE_LOG_TAIL_LINES,
+            crate::state::MAX_TAIL_READ,
+        )?
+        .join("\n");
         fs::remove_file(&path).ok();
 
         // The measurement the bound rests on: the engine's raw line is no longer
@@ -1578,8 +1582,12 @@ mod tests {
                  (status: exit status: 1){context}\n"
             ),
         )?;
-        let tail =
-            rocm_core::tail_lines(&path, STARTUP_FAILURE_LOG_TAIL_LINES, MAX_TAIL_READ)?.join("\n");
+        let tail = rocm_core::tail_lines(
+            &path,
+            STARTUP_FAILURE_LOG_TAIL_LINES,
+            crate::state::MAX_TAIL_READ,
+        )?
+        .join("\n");
         fs::remove_file(&path).ok();
 
         // Read 2 — the CLI, same budget, later file. The gap.

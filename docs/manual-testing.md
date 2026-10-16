@@ -716,7 +716,7 @@ To turn provider-assisted planning back off:
 rocm config clear-planner-provider
 ```
 
-## 8. Uninstall
+## 9. Uninstall
 
 Run this last, on a machine installed with the release installer (not a
 `cargo` build, whose binaries uninstall leaves alone):
