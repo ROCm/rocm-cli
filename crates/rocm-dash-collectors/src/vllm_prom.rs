@@ -87,7 +87,7 @@ impl InstanceMetrics for VllmPrometheusCollector {
 
     fn fetch(&self, _svc: &DiscoveredService) -> Result<InstanceSample> {
         Err(CollectorError::Unsupported(
-            "VllmPrometheusCollector is async — call fetch_async() from a tokio runtime".into(),
+            "VllmPrometheusCollector is async - call fetch_async() from a tokio runtime".into(),
         ))
     }
 }

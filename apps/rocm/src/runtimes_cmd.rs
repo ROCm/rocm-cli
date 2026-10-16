@@ -984,7 +984,7 @@ fn apply_runtime_uninstall(
     if install_root_decision.should_remove() && manifest.install_root.exists() {
         fs::remove_dir_all(&manifest.install_root).with_context(|| {
             format!(
-                "failed to remove runtime folder {} — the runtime registry entry has not \
+                "failed to remove runtime folder {} - the runtime registry entry has not \
                  been removed yet, so `rocm runtimes list` will still show this runtime as \
                  installed and pointing at this (now possibly partially deleted) folder \
                  until the removal succeeds",

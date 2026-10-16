@@ -22,6 +22,17 @@ path = "src/bin/rocm-demo-env.rs"
 name = "fake-tailscale"
 path = "src/bin/fake-tailscale.rs"
 
+# Stand-ins for `uv` and the runtime's Python interpreter, planted by the
+# `rocm comfyui install` scenarios so they run deterministically and offline
+# on every platform cargo builds for (see `src/fixture_binary.rs`).
+[[bin]]
+name = "fake-uv"
+path = "src/bin/fake-uv.rs"
+
+[[bin]]
+name = "fake-python"
+path = "src/bin/fake-python.rs"
+
 [dependencies]
 axum.workspace = true
 cucumber = { version = "0.23", features = ["output-json", "output-junit"] }

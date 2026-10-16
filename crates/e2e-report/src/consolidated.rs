@@ -9,11 +9,11 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use maud::{DOCTYPE, Markup, PreEscaped, html};
+use maud::{Markup, html};
 use serde::Deserialize;
 
 use crate::command_coverage::command_coverage_markdown;
-use crate::components::{STYLE, feature_group, now_utc, stats_bar};
+use crate::components::{feature_group, now_utc, page_shell, stats_bar};
 use crate::parse::{
     EXPECTED_FAILURE_TAG, Feature, Stats, XfailReport, evaluate_xfail_features, parse_features,
     scenario_id, scenario_passed, stats_of,
@@ -65,12 +65,27 @@ fn parse_descriptor(name: &str) -> Descriptor {
         None => (core, false),
     };
 
+    // The self-hosted sdk_version matrix (ROCMAI-430) runs non-`current` legs
+    // under a distinct artifact name (`e2e-gpu-n-1-report`) so the two legs'
+    // uploads don't collide; strip that suffix BEFORE matching the platform
+    // table below, then fold it back into the platform label so the two legs
+    // still render as distinct rows/columns instead of two identical-looking
+    // "MI300X Linux" entries.
+    let (core, release_label) = match core.strip_suffix("-n-1") {
+        Some(rest) => (rest, Some("n-1")),
+        None => match core.strip_suffix("-n-2") {
+            Some(rest) => (rest, Some("n-2")),
+            None => (core, None),
+        },
+    };
+
     let (platform, os) = match core {
         // The bare mock expect-pass artifact is `e2e-report` → core "report" or "".
         "" | "report" => ("Mock", "Linux"),
         "gpu" => ("MI300X", "Linux"),
         "gpu-rad3" => ("R9700", "Linux"),
         "gpu-mi350p" => ("MI350P", "Linux"),
+        "gpu-w7900" => ("W7900", "Linux"),
         "gpu-strix-ubuntu" => ("Strix Halo", "Ubuntu"),
         "gpu-strix-windows" => ("Strix Halo", "Windows"),
         // Same silicon again, third host boundary: an Ubuntu distro under WSL2 on
@@ -85,14 +100,25 @@ fn parse_descriptor(name: &str) -> Descriptor {
         // be reported as Linux — so render Unknown / Unknown rather than defaulting
         // OS to Linux the way `fallback_descriptor` does for a titlecased platform.
         "unknown" => ("Unknown", "Unknown"),
-        other => return fallback_descriptor(other, known_bugs, channel_from_name),
+        other => return fallback_descriptor(other, known_bugs, channel_from_name, release_label),
     };
 
     Descriptor {
-        platform: platform.to_string(),
+        platform: labeled_platform(platform, release_label),
         os: os.to_string(),
         known_bugs,
         channel_from_name,
+    }
+}
+
+/// Append the sdk_version matrix leg (`n-1`/`n-2`) to a platform label so two
+/// legs of the same platform don't render as identical rows/columns. `None`
+/// (the `current` leg) is left alone — its artifact name is unchanged from
+/// before the matrix existed, so that leg's label is too.
+fn labeled_platform(platform: &str, release_label: Option<&str>) -> String {
+    match release_label {
+        Some(label) => format!("{platform} ({label})"),
+        None => platform.to_string(),
     }
 }
 
@@ -100,6 +126,7 @@ fn fallback_descriptor(
     core: &str,
     known_bugs: bool,
     channel_from_name: Option<&'static str>,
+    release_label: Option<&str>,
 ) -> Descriptor {
     let platform = core
         .split('-')
@@ -112,12 +139,13 @@ fn fallback_descriptor(
         })
         .collect::<Vec<_>>()
         .join(" ");
+    let platform = if platform.is_empty() {
+        "Unknown".to_string()
+    } else {
+        platform
+    };
     Descriptor {
-        platform: if platform.is_empty() {
-            "Unknown".to_string()
-        } else {
-            platform
-        },
+        platform: labeled_platform(&platform, release_label),
         os: "Linux".to_string(),
         known_bugs,
         channel_from_name,
@@ -163,16 +191,21 @@ impl RunMeta {
 /// One of these corresponds to one uploaded `*-report` artifact (a
 /// platform × tier combination, e.g. "GPU Strix Ubuntu (known bugs)").
 ///
-/// `pub` (with no `pub` fields) so a caller producing both the HTML report and
-/// the markdown summary in one process can build this set once via
-/// [`load_platform_reports`] and pass it to both outputs; see there for why
-/// (ROCMAI-484). The type stays opaque from outside this crate: nothing
-/// outside this crate needs to construct one or read its fields.
-pub struct PlatformReport {
+/// `pub(crate)`: a caller producing both the HTML report and the markdown
+/// summary in one process builds this set once via [`load_platform_reports`]
+/// (ROCMAI-484), but reaches it only through the opaque [`PlatformReports`]
+/// bundle that function returns — nothing outside this crate needs to
+/// construct one or read its fields directly.
+pub(crate) struct PlatformReport {
     desc: Descriptor,
-    /// Precomputed column label (platform, OS and effective channel) kept
-    /// for the per-platform detail sections, exposed so `command_coverage.rs`
-    /// reuses it rather than reaching into `desc`/`versions`.
+    /// Precomputed column label (platform, OS and effective channel) for the
+    /// per-platform detail sections and the markdown XPASS/Regression notes.
+    /// Also the de-duplication key for command-coverage columns across a
+    /// platform's tiers (see `command_coverage.rs`) — a display-only change
+    /// to this field (e.g. a known-bugs marker) would silently split or
+    /// merge those columns, so keep that consumer in mind alongside the
+    /// other two. `pub(crate)` so `command_coverage.rs` can reuse it rather
+    /// than reaching into `desc`/`versions` itself.
     pub(crate) label: String,
     features: Vec<Feature>,
     stats: Stats,
@@ -737,6 +770,16 @@ fn reconciled_tally(json_path: &Path) -> Option<ReconciledTally> {
     Some(t)
 }
 
+/// The channel that governs a platform's rendering: the manifest's
+/// `versions.channel` when known, falling back to the channel captured
+/// from the artifact name for the errored-run case where no
+/// `platform.json` was ever written. Shared by [`PlatformReport::load`] and
+/// [`PlatformReport::effective_channel`] so the fallback rule can't drift
+/// between the two.
+fn resolve_channel<'a>(versions: &'a PlatformVersions, desc: &'a Descriptor) -> Option<&'a str> {
+    versions.channel.as_deref().or(desc.channel_from_name)
+}
+
 impl PlatformReport {
     fn load(artifact: String, json_path: &Path) -> Self {
         let features = parse_features(json_path);
@@ -752,9 +795,7 @@ impl PlatformReport {
         let versions = parse_platform_manifest(json_path)
             .map(|m| m.versions)
             .unwrap_or_default();
-        // Manifest channel wins when known; the artifact-name channel is only a
-        // fallback for the errored-run case where no `platform.json` was written.
-        let effective_channel = versions.channel.as_deref().or(desc.channel_from_name);
+        let effective_channel = resolve_channel(&versions, &desc);
         let label =
             with_channel_suffix(&format!("{} {}", desc.platform, desc.os), effective_channel);
         Self {
@@ -770,15 +811,10 @@ impl PlatformReport {
         }
     }
 
-    /// The channel that governs this platform's rendering: the manifest's
-    /// `versions.channel` when known, falling back to the channel captured
-    /// from the artifact name for the errored-run case where no
-    /// `platform.json` was ever written.
+    /// The channel that governs this platform's rendering. See
+    /// [`resolve_channel`].
     fn effective_channel(&self) -> Option<&str> {
-        self.versions
-            .channel
-            .as_deref()
-            .or(self.desc.channel_from_name)
+        resolve_channel(&self.versions, &self.desc)
     }
 
     /// Map each scenario name → whether it passed. Uses the canonical
@@ -862,21 +898,35 @@ fn report_sort_key(r: &PlatformReport) -> (&str, &str, bool, Option<&str>) {
     )
 }
 
-/// Build the per-platform `PlatformReport` set once, from every platform's
-/// `report.json`/`platform.json`/`commands.jsonl`, sorted by platform/OS,
-/// then known-bugs flag, then channel.
+/// The per-platform `PlatformReport` set, bundled with the `(label,
+/// json_path)` inputs they were parsed from.
 ///
-/// Shared by [`generate_consolidated_from_reports`] and
-/// [`consolidated_summary_markdown_from_reports`], so a caller producing both
-/// outputs from the same `inputs` in one process (e.g. `xtask`'s
-/// `e2e_report::run`) runs `PlatformReport::load` — and so reads each
-/// platform's `commands.jsonl` — once instead of once per output
-/// (ROCMAI-484). The expectation grid and scenario reference sections parse
-/// `inputs` independently of this set on every call; see
-/// [`generate_consolidated_from_reports`] and
-/// [`consolidated_summary_markdown_from_reports`] for what each output still
-/// parses `inputs` for.
-pub fn load_platform_reports(inputs: &[(String, PathBuf)]) -> Vec<PlatformReport> {
+/// Returned by [`load_platform_reports`] so [`generate_consolidated`] and
+/// [`consolidated_summary_markdown`] always render `reports` and `inputs`
+/// from the same platform set — the two can no longer be independently
+/// filtered, reordered, or re-paired into a self-contradicting report the way
+/// two loose parameters could (ROCMAI-484 / ROCm/rocm-cli#640). Opaque:
+/// nothing outside this crate needs to read `reports` or `inputs`
+/// individually, only hand the bundle to the two render functions.
+pub struct PlatformReports {
+    reports: Vec<PlatformReport>,
+    inputs: Vec<(String, PathBuf)>,
+}
+
+/// Build the per-platform `PlatformReport` set once, bundled with the
+/// `inputs` that produced it.
+///
+/// Parses every platform's `report.json`/`platform.json`/`commands.jsonl`,
+/// sorted by platform/OS, then known-bugs flag, then channel. Shared by
+/// [`generate_consolidated`] and [`consolidated_summary_markdown`],
+/// so a caller producing both outputs from the same `inputs` in one process
+/// (e.g. `xtask`'s `e2e_report::run`) runs `PlatformReport::load` — and so
+/// reads each platform's `commands.jsonl` — once instead of once per output.
+/// The expectation grid and scenario reference sections parse the bundled
+/// `inputs` independently of `reports` on every call; see
+/// [`generate_consolidated`] and [`consolidated_summary_markdown`] for what
+/// each output still parses `inputs` for.
+pub fn load_platform_reports(inputs: &[(String, PathBuf)]) -> PlatformReports {
     let mut reports: Vec<PlatformReport> = inputs
         .iter()
         .map(|(label, path)| PlatformReport::load(label.clone(), path))
@@ -884,45 +934,37 @@ pub fn load_platform_reports(inputs: &[(String, PathBuf)]) -> Vec<PlatformReport
     // Group each platform's rows together and order tiers expect-pass → known
     // bugs, instead of the alphabetical mash of the old single-label sort.
     reports.sort_by(|a, b| report_sort_key(a).cmp(&report_sort_key(b)));
-    reports
+    PlatformReports {
+        reports,
+        inputs: inputs.to_vec(),
+    }
 }
 
-/// Build one consolidated HTML report from several per-platform `report.json`
-/// files.
+/// Platform cell for a table that renders OS in its own column (so this omits
+/// `desc.os`, unlike `PlatformReport::label`) — shared between the markdown
+/// summary and `matrix_table` so the two can't drift the way they already
+/// have once (the markdown/HTML drift fixed by #460).
+fn platform_cell(r: &PlatformReport) -> String {
+    with_channel_suffix(&r.desc.platform, r.effective_channel())
+}
+
+/// Build one consolidated HTML report from a [`PlatformReports`] bundle.
 ///
-/// `inputs` is `(label, json_path)` pairs; the label identifies the
-/// platform/tier (e.g. "GPU Strix Windows (known bugs)"). New platforms need no
-/// code change — the caller just passes more inputs.
+/// The bundle's `inputs` are `(label, json_path)` pairs; the label identifies
+/// the platform/tier (e.g. "GPU Strix Windows (known bugs)"). New platforms
+/// need no code change — the caller just passes more inputs to
+/// [`load_platform_reports`].
 ///
-/// Thin wrapper around [`generate_consolidated_from_reports`]. **Deprecated**
-/// for every caller, including one that only needs the HTML output — call
-/// [`load_platform_reports`] once and [`generate_consolidated_from_reports`]
-/// directly instead.
-#[deprecated(
-    note = "rebuilds the PlatformReport set on every call; call load_platform_reports \
-            once and use generate_consolidated_from_reports/\
-            consolidated_summary_markdown_from_reports instead (see ROCm/rocm-cli#640)"
-)]
+/// `bundle.inputs` is still needed here for the expectation grid, which is
+/// keyed differently and re-parses `report.json` and `platform.json` from
+/// `inputs`, independently of `bundle.reports`.
 pub fn generate_consolidated(
-    inputs: &[(String, PathBuf)],
+    bundle: &PlatformReports,
     html_out: &Path,
     meta: &RunMeta,
 ) -> std::io::Result<()> {
-    generate_consolidated_from_reports(&load_platform_reports(inputs), inputs, html_out, meta)
-}
-
-/// Same as [`generate_consolidated`], but takes already-parsed `reports`.
-///
-/// `reports` comes from [`load_platform_reports`], used instead of reparsing
-/// `inputs` itself. `inputs` is still needed for the expectation grid, which
-/// is keyed differently and re-parses `report.json` and `platform.json` from
-/// `inputs`, independently of `reports`.
-pub fn generate_consolidated_from_reports(
-    reports: &[PlatformReport],
-    inputs: &[(String, PathBuf)],
-    html_out: &Path,
-    meta: &RunMeta,
-) -> std::io::Result<()> {
+    let reports = &bundle.reports;
+    let inputs = &bundle.inputs;
     let now = now_utc();
     let all_ok = reports.iter().all(PlatformReport::ok);
     let overall = if reports.is_empty() {
@@ -934,86 +976,59 @@ pub fn generate_consolidated_from_reports(
         ("status-fail", format!("{bad} platform(s) need attention"))
     };
 
-    let markup = html! {
-        (DOCTYPE)
-        html lang="en" {
-            head {
-                meta charset="utf-8";
-                title { "Consolidated E2E Report" }
-                style { (PreEscaped(STYLE)) }
+    let body = html! {
+        div.header {
+            h1 { "Consolidated E2E Report" }
+            div.generated {
+                @if let Some(line) = meta.line() { (line) br; }
+                "Generated " (now)
             }
-            body {
-                div.header {
-                    h1 { "Consolidated E2E Report" }
-                    div.generated {
-                        @if let Some(line) = meta.line() { (line) br; }
-                        "Generated " (now)
-                    }
-                }
+        }
 
-                h2 { "Summary Information" }
-                table.summary-table {
-                    tr {
-                        td { "Status:" }
-                        td class=(overall.0) { (overall.1) }
-                    }
-                    tr { td { "Rows:" } td { (reports.len()) } }
-                }
+        h2 { "Summary Information" }
+        table.summary-table {
+            tr {
+                td { "Status:" }
+                td class=(overall.0) { (overall.1) }
+            }
+            tr { td { "Rows:" } td { (reports.len()) } }
+        }
 
-                @if reports.is_empty() {
-                    p { "No per-platform report.json files were found to consolidate." }
-                } @else {
-                    h2 { "Platforms" }
-                    (matrix_table(reports))
-                    (legend())
+        @if reports.is_empty() {
+            p { "No per-platform report.json files were found to consolidate." }
+        } @else {
+            h2 { "Platforms" }
+            (matrix_table(reports))
+            (legend())
 
-                    (expectation_grid_html(inputs))
+            (expectation_grid_html(inputs))
 
-                    h2 { "Per-platform Details" }
-                    div.details {
-                        @for report in reports {
-                            (platform_section(report))
-                        }
-                    }
+            h2 { "Per-platform Details" }
+            div.details {
+                @for report in reports {
+                    (platform_section(report))
                 }
             }
         }
     };
+    let markup = page_shell("Consolidated E2E Report", body);
 
     std::fs::write(html_out, markup.into_string())
 }
 
-/// Render the consolidated result as a GitHub-flavoured markdown table, for
-/// piping into `$GITHUB_STEP_SUMMARY`. Same inputs as
-/// [`generate_consolidated`].
+/// Render the consolidated result from a [`PlatformReports`] bundle as a
+/// GitHub-flavoured markdown table, for piping into `$GITHUB_STEP_SUMMARY`.
+/// Same bundle as [`generate_consolidated`].
 ///
-/// Thin wrapper around [`consolidated_summary_markdown_from_reports`].
-/// **Deprecated** for every caller, including one that only needs the
-/// markdown output — call [`load_platform_reports`] once and
-/// [`consolidated_summary_markdown_from_reports`] directly instead.
-#[deprecated(
-    note = "rebuilds the PlatformReport set on every call; call load_platform_reports \
-            once and use generate_consolidated_from_reports/\
-            consolidated_summary_markdown_from_reports instead (see ROCm/rocm-cli#640)"
-)]
-pub fn consolidated_summary_markdown(inputs: &[(String, PathBuf)]) -> String {
-    consolidated_summary_markdown_from_reports(&load_platform_reports(inputs), inputs)
-}
-
-/// Same as [`consolidated_summary_markdown`], but takes already-parsed
-/// `reports`.
-///
-/// `reports` comes from [`load_platform_reports`], used instead of reparsing
-/// `inputs` itself. `inputs` is still needed for the expectation grid and
-/// scenario reference sections, which are keyed differently and each build
-/// their own expectation grid from `inputs`, independently re-parsing
-/// `report.json` and `platform.json`, independently of `reports`.
-pub fn consolidated_summary_markdown_from_reports(
-    reports: &[PlatformReport],
-    inputs: &[(String, PathBuf)],
-) -> String {
+/// `bundle.inputs` is still needed here for the expectation grid and scenario
+/// reference sections, which are keyed differently and each build their own
+/// expectation grid from `inputs`, independently re-parsing `report.json` and
+/// `platform.json`, independently of `bundle.reports`.
+pub fn consolidated_summary_markdown(bundle: &PlatformReports) -> String {
     use std::fmt::Write as _;
 
+    let reports = &bundle.reports;
+    let inputs = &bundle.inputs;
     let mut out = String::from("## E2E consolidated report\n\n");
     if reports.is_empty() {
         out.push_str("_No per-platform report.json files were found to consolidate._\n");
@@ -1040,7 +1055,7 @@ pub fn consolidated_summary_markdown_from_reports(
         // Component versions in the Platform/OS cells: ROCm/vLLM/lemonade under the
         // platform, the OS version under the OS. Absent components are omitted (mock
         // has no runtime; a not-yet-probed source is simply skipped).
-        let plat_base = with_channel_suffix(&r.desc.platform, r.effective_channel());
+        let plat_base = platform_cell(r);
         let plat_cell = match r.versions.platform_stack() {
             s if s.is_empty() => plat_base,
             s => format!("{plat_base}<br><sub>{s}</sub>"),
@@ -1433,7 +1448,7 @@ fn matrix_table(reports: &[PlatformReport]) -> Markup {
             @for r in reports {
                 @let (total, pass, fail, skip, xf) = r.display_counts();
                 tr {
-                    td { (with_channel_suffix(&r.desc.platform, r.effective_channel())) }
+                    td { (platform_cell(r)) }
                     td { (r.desc.os) }
                     td.num { (total) }
                     td.num { (pass) }
@@ -1515,11 +1530,6 @@ fn platform_section(report: &PlatformReport) -> Markup {
 }
 
 #[cfg(test)]
-// Several tests below exercise the deprecated generate_consolidated/
-// consolidated_summary_markdown wrappers directly (including proving they
-// still agree with the _from_reports entry points they now delegate to); the
-// deprecation targets outside callers, not this crate's own tests of them.
-#[allow(deprecated)]
 mod tests {
     use super::*;
     use crate::command_coverage::{KNOWN_COMMAND_SURFACE, command_coverage_summary};
@@ -1565,6 +1575,7 @@ mod tests {
             ("e2e-gpu-report", "MI300X", "Linux"),
             ("e2e-gpu-rad3-report", "R9700", "Linux"),
             ("e2e-gpu-mi350p-report", "MI350P", "Linux"),
+            ("e2e-gpu-w7900-report", "W7900", "Linux"),
             ("e2e-gpu-strix-ubuntu-report", "Strix Halo", "Ubuntu"),
             ("e2e-gpu-strix-windows-report", "Strix Halo", "Windows"),
             // Must not fall through to `fallback_descriptor`, which would render
@@ -1604,6 +1615,27 @@ mod tests {
                 "Windows",
             ),
             ("e2e-gpu-strix-wsl-nightly-report", "Strix Halo", "WSL2"),
+        ] {
+            let d = parse_descriptor(name);
+            assert_eq!(
+                (d.platform.as_str(), d.os.as_str()),
+                (platform, os),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_descriptor_distinguishes_sdk_version_matrix_legs() {
+        // The sdk_version matrix (ROCMAI-430) uploads non-`current` legs under a
+        // distinct artifact name so they don't collide with each other or with
+        // the `current` leg's unchanged name. Platform/OS must still resolve
+        // correctly, with the leg folded into the platform label so the rows
+        // don't render as two identical "MI300X Linux" entries.
+        for (name, platform, os) in [
+            ("e2e-gpu-n-1-report", "MI300X (n-1)", "Linux"),
+            ("e2e-gpu-n-2-report", "MI300X (n-2)", "Linux"),
+            ("e2e-gpu-strix-wsl-n-1-report", "Strix Halo (n-1)", "WSL2"),
         ] {
             let d = parse_descriptor(name);
             assert_eq!(
@@ -1682,7 +1714,7 @@ mod tests {
                 b.path().to_path_buf(),
             ),
         ];
-        let md = consolidated_summary_markdown(&inputs);
+        let md = consolidated_summary_markdown(&load_platform_reports(&inputs));
         assert!(md.contains("| Mock | Linux | 2 | 2 | 0 | 0 | n/a | PASS |"));
         assert!(md.contains("| MI300X | Linux | 1 | 0 | 1 | 0 | 1 | PASS |"));
     }
@@ -1694,94 +1726,27 @@ mod tests {
             "e2e-gpu-known-bugs-report".to_string(),
             b.path().to_path_buf(),
         )];
-        let md = consolidated_summary_markdown(&inputs);
+        let md = consolidated_summary_markdown(&load_platform_reports(&inputs));
         assert!(md.contains("Needs attention"));
         assert!(md.contains("XPASS"));
     }
 
     #[test]
     fn consolidated_summary_markdown_empty_inputs() {
-        let md = consolidated_summary_markdown(&[]);
+        let md = consolidated_summary_markdown(&load_platform_reports(&[]));
         assert!(md.contains("No per-platform report.json files"));
     }
 
-    /// Replace the `now_utc()` timestamp embedded after `"Generated "` in
-    /// rendered HTML with nothing, so two renders taken a second apart (each
-    /// has 1-second resolution, see `components::now_utc`) still compare
-    /// equal. The timestamp runs up to the closing `<` of its containing tag.
-    fn strip_generated_timestamp(html: &str) -> String {
-        const MARK: &str = "Generated ";
-        let Some(mark_at) = html.find(MARK) else {
-            return html.to_string();
-        };
-        let ts_start = mark_at + MARK.len();
-        let ts_end = html[ts_start..]
-            .find('<')
-            .map_or(html.len(), |i| ts_start + i);
-        format!("{}{}", &html[..ts_start], &html[ts_end..])
-    }
-
     #[test]
-    fn wrapper_and_from_reports_outputs_agree() {
-        // ROCMAI-484: generate_consolidated/consolidated_summary_markdown now
-        // delegate to the *_from_reports entry points via load_platform_reports.
-        // This shows the two call shapes give the same output; it cannot tell
-        // whether the wrappers actually delegate, since both sides call the
-        // same load_platform_reports and the same *_from_reports body — a
-        // wrapper that copied the old code inline would stay green here too.
-        // That `_from_reports` actually uses `reports` rather than re-deriving
-        // it from `inputs` is covered by
-        // from_reports_entry_points_follow_reports_not_inputs and
-        // from_reports_entry_points_render_reports_not_inputs_when_both_nonempty
-        // instead.
-        let a = write_report(&feature_json(&[(&[], &["passed"]), (&[], &["passed"])]));
-        let b = write_report(&feature_json(&[(&["expected-failure"], &["failed"])]));
-        let inputs = vec![
-            ("e2e-report".to_string(), a.path().to_path_buf()),
-            (
-                "e2e-gpu-known-bugs-report".to_string(),
-                b.path().to_path_buf(),
-            ),
-        ];
-
-        let md_via_wrapper = consolidated_summary_markdown(&inputs);
-        let reports = load_platform_reports(&inputs);
-        let md_via_reports = consolidated_summary_markdown_from_reports(&reports, &inputs);
-        assert_eq!(md_via_wrapper, md_via_reports);
-
-        let out_via_wrapper = tempfile::NamedTempFile::new().expect("temp");
-        generate_consolidated(&inputs, out_via_wrapper.path(), &RunMeta::default())
-            .expect("generate via wrapper");
-        let out_via_reports = tempfile::NamedTempFile::new().expect("temp");
-        generate_consolidated_from_reports(
-            &reports,
-            &inputs,
-            out_via_reports.path(),
-            &RunMeta::default(),
-        )
-        .expect("generate via reports");
-        let html_via_wrapper = std::fs::read_to_string(out_via_wrapper.path()).expect("read");
-        let html_via_reports = std::fs::read_to_string(out_via_reports.path()).expect("read");
-        // If the "Generated " marker were ever renamed, strip_generated_timestamp
-        // would return its input unchanged and this test would go back to being
-        // flaky (see the comment on strip_generated_timestamp) without saying why.
-        assert!(html_via_wrapper.contains("Generated "));
-        assert!(html_via_reports.contains("Generated "));
-        assert_eq!(
-            strip_generated_timestamp(&html_via_wrapper),
-            strip_generated_timestamp(&html_via_reports)
-        );
-    }
-
-    #[test]
-    fn generate_consolidated_from_reports_still_renders_the_expectation_grid_from_inputs() {
-        // Review finding (6f130efe round): passing `&[]` instead of `inputs` to
-        // the `expectation_grid_html(inputs)` call inside
-        // generate_consolidated_from_reports passed every existing test,
-        // because wrapper_and_from_reports_outputs_agree's fixture has no
-        // platform.json, so its grid is empty on both sides of that comparison
-        // either way. Give this one a platform.json via write_platform and
-        // assert the grid heading actually renders.
+    fn generate_consolidated_renders_the_expectation_grid() {
+        // Review finding (6f130efe round, back when `generate_consolidated`
+        // was `generate_consolidated_from_reports` and took `reports` and
+        // `inputs` as two loose parameters): passing `&[]` instead of `inputs`
+        // to the `expectation_grid_html(inputs)` call inside passed every
+        // existing test at the time, because the fixtures used elsewhere had
+        // no platform.json, so the grid was empty either way. Give this one a
+        // platform.json via write_platform and assert the grid heading
+        // actually renders.
         let report = feature_json(&[(&["id:serve-a"], &["passed"])]);
         let platform = r#"{
             "platform_slug": "mock",
@@ -1792,110 +1757,14 @@ mod tests {
         }"#;
         let (_d, path) = write_platform(&report, platform);
         let inputs = vec![("mock".to_string(), path)];
-        let reports = load_platform_reports(&inputs);
+        let bundle = load_platform_reports(&inputs);
 
         let out = tempfile::NamedTempFile::new().expect("temp");
-        generate_consolidated_from_reports(&reports, &inputs, out.path(), &RunMeta::default())
-            .expect("generate");
+        generate_consolidated(&bundle, out.path(), &RunMeta::default()).expect("generate");
         let html = std::fs::read_to_string(out.path()).expect("read");
         assert!(
             html.contains("Expectation grid (scenario × platform)"),
             "grid heading missing from output:\n{html}"
-        );
-    }
-
-    #[test]
-    fn from_reports_entry_points_follow_reports_not_inputs() {
-        // `inputs` points at a real, non-empty report, but `reports` is passed
-        // as empty. If `*_from_reports` silently ignored `reports` and
-        // re-derived it from `inputs` (e.g. by calling load_platform_reports
-        // itself), this would render a one-row report instead of "no reports".
-        let a = write_report(&feature_json(&[(&[], &["passed"])]));
-        let inputs = vec![("e2e-report".to_string(), a.path().to_path_buf())];
-        let empty_reports: Vec<PlatformReport> = Vec::new();
-
-        let md = consolidated_summary_markdown_from_reports(&empty_reports, &inputs);
-        assert!(md.contains("No per-platform report.json files"));
-        // Not `!md.contains("e2e-report")`: that label is the `inputs` tuple's
-        // key, which never appears in rendered output (the platform renders as
-        // "Mock") — so it can't tell a buggy re-derive-from-inputs apart from
-        // the correct empty-reports path either way.
-        assert!(!md.contains("| Mock"));
-
-        let out = tempfile::NamedTempFile::new().expect("temp");
-        generate_consolidated_from_reports(
-            &empty_reports,
-            &inputs,
-            out.path(),
-            &RunMeta::default(),
-        )
-        .expect("generate");
-        let html = std::fs::read_to_string(out.path()).expect("read");
-        assert!(html.contains("No per-platform report.json files were found to consolidate."));
-        assert!(!html.contains("Per-platform Details"));
-    }
-
-    #[test]
-    fn from_reports_entry_points_render_reports_not_inputs_when_both_nonempty() {
-        // `inputs` and `reports` are both non-empty here, and built from two
-        // different fixtures: `inputs` is "e2e-report" (Mock, one passing
-        // scenario, no commands.jsonl); `reports` is "e2e-gpu-report" (MI300X,
-        // one failing scenario, with a `rocm serve` command recorded). If
-        // `*_from_reports` silently ignored `reports` and re-derived its own
-        // set from `inputs` (e.g. by calling load_platform_reports(inputs)
-        // itself), every assertion below would read "Mock"/pass/no-coverage
-        // instead of "MI300X"/fail/the recorded command.
-        let inputs_report = write_report(&feature_json(&[(&[], &["passed"])]));
-        let inputs = vec![("e2e-report".to_string(), inputs_report.path().to_path_buf())];
-
-        let reports_dir = tempfile::tempdir().expect("tempdir");
-        let reports_report = reports_dir.path().join("report.json");
-        std::fs::write(&reports_report, feature_json(&[(&[], &["failed"])])).expect("write report");
-        std::fs::write(
-            reports_dir.path().join("commands.jsonl"),
-            concat!(
-                r#"{"scenario":"s0","subcommand":"rocm serve Qwen --engine","command":"rocm serve Qwen --engine vllm","engine":"vllm","engine_is_default":false}"#,
-                "\n",
-            ),
-        )
-        .expect("write commands");
-        let reports = load_platform_reports(&[("e2e-gpu-report".to_string(), reports_report)]);
-
-        let md = consolidated_summary_markdown_from_reports(&reports, &inputs);
-        assert!(
-            md.contains("MI300X"),
-            "matrix row must follow reports:\n{md}"
-        );
-        assert!(
-            !md.contains("| Mock"),
-            "must not render inputs' platform:\n{md}"
-        );
-        assert!(
-            md.contains("rocm serve Qwen --engine vllm"),
-            "command coverage must follow reports' commands.jsonl:\n{md}"
-        );
-
-        let out = tempfile::NamedTempFile::new().expect("temp");
-        generate_consolidated_from_reports(&reports, &inputs, out.path(), &RunMeta::default())
-            .expect("generate");
-        let html = std::fs::read_to_string(out.path()).expect("read");
-        assert!(
-            html.contains("<td>MI300X</td>"),
-            "matrix row must follow reports:\n{html}"
-        );
-        assert!(
-            !html.contains("<td>Mock</td>"),
-            "matrix must not render inputs' platform:\n{html}"
-        );
-        assert!(
-            html.contains("platform-name\">MI300X Linux</span>"),
-            "per-platform details must follow reports:\n{html}"
-        );
-        // Not a bare `!html.contains("Mock")`: the static legend text always
-        // says "Mock" regardless of which platform actually rendered.
-        assert!(
-            !html.contains("platform-name\">Mock Linux</span>"),
-            "per-platform details must not render inputs' platform:\n{html}"
         );
     }
 
@@ -1911,13 +1780,13 @@ mod tests {
             ("e2e-gpu-report".to_string(), mi300x.path().to_path_buf()),
         ];
 
-        let reports = load_platform_reports(&inputs);
-        let keys: Vec<_> = reports.iter().map(report_sort_key).collect();
+        let bundle = load_platform_reports(&inputs);
+        let keys: Vec<_> = bundle.reports.iter().map(report_sort_key).collect();
         let mut sorted_keys = keys.clone();
         sorted_keys.sort();
         assert_eq!(keys, sorted_keys);
-        assert_eq!(reports[0].desc.platform, "MI300X");
-        assert_eq!(reports[1].desc.platform, "Mock");
+        assert_eq!(bundle.reports[0].desc.platform, "MI300X");
+        assert_eq!(bundle.reports[1].desc.platform, "Mock");
     }
 
     #[test]
@@ -1950,8 +1819,9 @@ mod tests {
             ),
         ];
 
-        let reports = load_platform_reports(&inputs);
-        let actual: Vec<_> = reports
+        let bundle = load_platform_reports(&inputs);
+        let actual: Vec<_> = bundle
+            .reports
             .iter()
             .map(|r| (r.desc.os.as_str(), r.desc.known_bugs))
             .collect();
@@ -2114,9 +1984,18 @@ mod tests {
             ("mi300x-release".to_string(), release_path),
             ("mi300x-nightly".to_string(), nightly_path),
         ];
-        generate_consolidated(&inputs, out.path(), &RunMeta::default()).expect("generate");
+        generate_consolidated(
+            &load_platform_reports(&inputs),
+            out.path(),
+            &RunMeta::default(),
+        )
+        .expect("generate");
         let html = std::fs::read_to_string(out.path()).expect("read");
         assert!(html.contains("Consolidated E2E Report"));
+        assert!(
+            html.contains("<title>Consolidated E2E Report</title>"),
+            "the page_shell title argument must reach the <title> tag, not just the <h1>"
+        );
         assert!(html.contains("Platforms"));
         assert!(html.contains("Legend"));
         assert!(
@@ -2169,7 +2048,7 @@ mod tests {
         .expect("write commands");
 
         let inputs = vec![("e2e-gpu-report".to_string(), report)];
-        let md = consolidated_summary_markdown(&inputs);
+        let md = consolidated_summary_markdown(&load_platform_reports(&inputs));
         assert!(md.contains("### Command coverage"));
         // adoption: rc=1 but scenario passed → ✅
         assert!(
@@ -2278,7 +2157,7 @@ mod tests {
         );
 
         // Each feature gets its own table under its own heading.
-        let md = consolidated_summary_markdown(&inputs);
+        let md = consolidated_summary_markdown(&load_platform_reports(&inputs));
         assert!(
             md.contains("#### Examine"),
             "missing feature heading:\n{md}"
@@ -2450,6 +2329,163 @@ mod tests {
     }
 
     #[test]
+    fn consolidated_summary_markdown_orders_rows_by_report_sort_key() {
+        // report_sort_key_orders_by_every_dimension already pins all four
+        // tuple elements via a direct call to report_sort_key with synthetic
+        // PlatformReports. This test instead goes through the public
+        // consolidated_summary_markdown entry point with realistic
+        // artifact-name fixtures, so a regression in load_platform_reports'
+        // use of report_sort_key — e.g. calling it with the wrong field order,
+        // or not calling it at all — would still be caught even if
+        // report_sort_key itself stayed correct in isolation.
+        //
+        // Pins all four elements of the sort-key tuple, in precedence order:
+        // platform, os, known_bugs, channel. Three Strix Halo rows alone
+        // can't pin `platform` — they all share it, so dropping or swapping
+        // that element would not change their order — so a fourth row on a
+        // different platform ("Unknown"/"Unknown", via the explicit
+        // "e2e-unknown-report" artifact name) is added: "Strix Halo" sorts
+        // before "Unknown" by platform, but "Unknown" alone (as an OS) sorts
+        // before "Windows", so dropping the platform element from the key, or
+        // swapping it with os, both move this row ahead of the Windows row
+        // instead of after it. Within the Strix Halo rows: "Strix Halo"/Ubuntu
+        // before "Strix Halo"/Windows pins os; the two Ubuntu rows, identical
+        // except for the known-bugs artifact suffix, pin known_bugs ordering
+        // (false < true) once os and channel are held equal. A fifth and
+        // sixth row on two more distinct platforms with opposite channels —
+        // MI300X/release and R9700/nightly — pin channel's precedence below
+        // platform: "nightly" sorts before "release", so if channel outranked
+        // platform in the key, R9700 would sort first; "MI300X" sorts before
+        // "R9700" by platform, so the correct key keeps MI300X first
+        // regardless. A seventh row, same platform/os as the MI300X row but
+        // known_bugs=true and channel=nightly, pins that known_bugs outranks
+        // channel too: "nightly" sorts before "release", so if channel
+        // outranked known_bugs, this row would sort before the MI300X/release
+        // row despite known_bugs=false < true. Channel's own effect on
+        // ordering — as a tie-breaker once platform/os/known_bugs are equal —
+        // is pinned by generate_consolidated_writes_html and
+        // command_coverage_distinguishes_channels_on_same_platform, not
+        // repeated here.
+        // No platform.json sidecar, so display_counts falls back to raw junit
+        // stats and each row's distinct scenario count (1/2/3/4/5/6/7) tells
+        // the rows apart in the rendered table.
+        let ubuntu_plain_report = write_report(&feature_json(&[(&[], &["passed"])]));
+        let ubuntu_known_bugs_report =
+            write_report(&feature_json(&[(&[], &["passed"]), (&[], &["passed"])]));
+        let windows_plain_report = write_report(&feature_json(&[
+            (&[], &["passed"]),
+            (&[], &["passed"]),
+            (&[], &["passed"]),
+        ]));
+        let unknown_report = write_report(&feature_json(&[
+            (&[], &["passed"]),
+            (&[], &["passed"]),
+            (&[], &["passed"]),
+            (&[], &["passed"]),
+        ]));
+        let mi300x_release_report = write_report(&feature_json(&[
+            (&[], &["passed"]),
+            (&[], &["passed"]),
+            (&[], &["passed"]),
+            (&[], &["passed"]),
+            (&[], &["passed"]),
+        ]));
+        let r9700_nightly_report = write_report(&feature_json(&[
+            (&[], &["passed"]),
+            (&[], &["passed"]),
+            (&[], &["passed"]),
+            (&[], &["passed"]),
+            (&[], &["passed"]),
+            (&[], &["passed"]),
+        ]));
+        let mi300x_known_bugs_nightly_report = write_report(&feature_json(&[
+            (&[], &["passed"]),
+            (&[], &["passed"]),
+            (&[], &["passed"]),
+            (&[], &["passed"]),
+            (&[], &["passed"]),
+            (&[], &["passed"]),
+            (&[], &["passed"]),
+        ]));
+        let inputs = vec![
+            (
+                "e2e-gpu-strix-windows-report".to_string(),
+                windows_plain_report.path().to_path_buf(),
+            ),
+            (
+                "e2e-gpu-strix-ubuntu-known-bugs-report".to_string(),
+                ubuntu_known_bugs_report.path().to_path_buf(),
+            ),
+            (
+                "e2e-gpu-strix-ubuntu-report".to_string(),
+                ubuntu_plain_report.path().to_path_buf(),
+            ),
+            (
+                "e2e-unknown-report".to_string(),
+                unknown_report.path().to_path_buf(),
+            ),
+            (
+                "e2e-gpu-release-report".to_string(),
+                mi300x_release_report.path().to_path_buf(),
+            ),
+            (
+                "e2e-gpu-rad3-nightly-report".to_string(),
+                r9700_nightly_report.path().to_path_buf(),
+            ),
+            (
+                "e2e-gpu-known-bugs-nightly-report".to_string(),
+                mi300x_known_bugs_nightly_report.path().to_path_buf(),
+            ),
+        ];
+
+        let md = consolidated_summary_markdown(&load_platform_reports(&inputs));
+        let ubuntu_plain_pos = md
+            .find("| Strix Halo | Ubuntu | 1 |")
+            .expect("plain Ubuntu row");
+        let ubuntu_known_bugs_pos = md
+            .find("| Strix Halo | Ubuntu | 2 |")
+            .expect("known-bugs Ubuntu row");
+        let windows_pos = md
+            .find("| Strix Halo | Windows | 3 |")
+            .expect("Windows row");
+        let unknown_pos = md
+            .find("| Unknown | Unknown | 4 |")
+            .expect("Unknown-platform row");
+        let mi300x_pos = md
+            .find("| MI300X (release) | Linux | 5 |")
+            .expect("MI300X release row");
+        let r9700_pos = md
+            .find("| R9700 (nightly) | Linux | 6 |")
+            .expect("R9700 nightly row");
+        let mi300x_known_bugs_nightly_pos = md
+            .find("| MI300X (nightly) | Linux | 7 |")
+            .expect("MI300X known-bugs nightly row");
+        assert!(
+            ubuntu_plain_pos < ubuntu_known_bugs_pos,
+            "same platform/os: known_bugs=false must sort before known_bugs=true:\n{md}"
+        );
+        assert!(
+            ubuntu_known_bugs_pos < windows_pos,
+            "same platform: Ubuntu must sort before Windows regardless of known_bugs:\n{md}"
+        );
+        assert!(
+            windows_pos < unknown_pos,
+            "\"Strix Halo\" must sort before \"Unknown\" by platform, even though \"Unknown\" as an OS sorts before \"Windows\":\n{md}"
+        );
+        assert!(
+            mi300x_pos < r9700_pos,
+            "\"MI300X\" must sort before \"R9700\" by platform, even though its channel \
+             (\"release\") sorts after R9700's (\"nightly\"):\n{md}"
+        );
+        assert!(
+            mi300x_pos < mi300x_known_bugs_nightly_pos,
+            "same platform/os: known_bugs=false must sort before known_bugs=true, even though \
+             the known_bugs=true row's channel (\"nightly\") sorts before the known_bugs=false \
+             row's (\"release\"):\n{md}"
+        );
+    }
+
+    #[test]
     fn nightly_failure_reaches_needs_attention_in_its_own_column() {
         // Pins that a release pass and a nightly fail on the same slug land in
         // two separate columns (not one collision that a merge clause has to
@@ -2569,7 +2605,8 @@ mod tests {
             ]
         }"#;
         let (_d, path) = write_platform(&report, platform);
-        let md = consolidated_summary_markdown(&[("mock".to_string(), path)]);
+        let md =
+            consolidated_summary_markdown(&load_platform_reports(&[("mock".to_string(), path)]));
         assert!(md.contains("##### serve-x"), "missing anchor:\n{md}");
         assert!(
             md.contains("##### serve-z"),
@@ -2593,7 +2630,8 @@ mod tests {
             ]
         }"#;
         let (_d, path) = write_platform(&report, platform);
-        let md = consolidated_summary_markdown(&[("mock".to_string(), path)]);
+        let md =
+            consolidated_summary_markdown(&load_platform_reports(&[("mock".to_string(), path)]));
 
         for (id, name) in [
             ("serve-a", "serve-01 - first skipped"),
@@ -2633,7 +2671,7 @@ mod tests {
         }"#;
         let (_d, path) = write_platform(&report, platform);
         let inputs = vec![("mi300x".to_string(), path)];
-        let md = consolidated_summary_markdown(&inputs);
+        let md = consolidated_summary_markdown(&load_platform_reports(&inputs));
         assert!(md.contains("### Expectation grid"), "grid missing:\n{md}");
         assert!(
             md.contains("[`serve-x`](#serve-x) | ✗ |"),
@@ -2660,7 +2698,7 @@ mod tests {
         }"#;
         let (_d, path) = write_platform(&report, platform);
         let inputs = vec![("strix-halo".to_string(), path)];
-        let md = consolidated_summary_markdown(&inputs);
+        let md = consolidated_summary_markdown(&load_platform_reports(&inputs));
         assert!(md.contains("⚠️XPASS"), "grid cell should show XPASS:\n{md}");
         assert!(
             md.contains("**XPASS** on `strix-halo`: `serve-default` (EAI-7333)"),
@@ -2680,7 +2718,7 @@ mod tests {
         }"#;
         let (_d, path) = write_platform(&report, platform);
         let inputs = vec![("mi300x".to_string(), path)];
-        let md = consolidated_summary_markdown(&inputs);
+        let md = consolidated_summary_markdown(&load_platform_reports(&inputs));
         assert!(
             md.contains("✅XPASS (flaky)"),
             "grid should show tolerated flaky XPASS:\n{md}"
@@ -2708,7 +2746,7 @@ mod tests {
         let (_d, path) = write_platform(&report, platform);
         let inputs = vec![("mi300x".to_string(), path)];
 
-        let md = consolidated_summary_markdown(&inputs);
+        let md = consolidated_summary_markdown(&load_platform_reports(&inputs));
         for glyph in ["✅XPASS (flaky)", "⚠️n/a-ran", "⚠️no-result"] {
             assert!(
                 md.contains(glyph),
@@ -2828,7 +2866,7 @@ mod tests {
         }"#;
         let (_d, path) = write_platform(&report, platform);
         let inputs = vec![("mi300x".to_string(), path)];
-        let md = consolidated_summary_markdown(&inputs);
+        let md = consolidated_summary_markdown(&load_platform_reports(&inputs));
         for token in [
             "Ubuntu 24.04.3 LTS",
             "ROCm 7.13.0",
@@ -2854,7 +2892,7 @@ mod tests {
         }"#;
         let (_d, path) = write_platform(&report, platform);
         let inputs = vec![("mock".to_string(), path)];
-        let md = consolidated_summary_markdown(&inputs);
+        let md = consolidated_summary_markdown(&load_platform_reports(&inputs));
         assert!(md.contains("Debian 12"), "should show OS distro:\n{md}");
         assert!(!md.contains("vLLM "), "no vLLM version known → omit:\n{md}");
     }
@@ -2873,7 +2911,7 @@ mod tests {
         }"#;
         let (_d, path) = write_platform(&report, platform);
         let inputs = vec![("mock".to_string(), path)];
-        let md = consolidated_summary_markdown(&inputs);
+        let md = consolidated_summary_markdown(&load_platform_reports(&inputs));
         assert!(
             md.contains("[`gpu-only`](#gpu-only) | n/a |"),
             "skip should render as n/a:\n{md}"
@@ -2918,7 +2956,10 @@ mod tests {
         assert!(!uncovered.contains(&"rocm serve"));
 
         // The rendered markdown surfaces the % and the fold-out.
-        let md = consolidated_summary_markdown(&[("e2e-gpu-report".to_string(), report)]);
+        let md = consolidated_summary_markdown(&load_platform_reports(&[(
+            "e2e-gpu-report".to_string(),
+            report,
+        )]));
         assert!(
             md.contains("CLI surface coverage:"),
             "coverage line missing:\n{md}"
@@ -2969,7 +3010,7 @@ mod tests {
             ("mi300x-release".to_string(), release_report),
             ("mi300x-nightly".to_string(), nightly_report),
         ];
-        let md = consolidated_summary_markdown(&inputs);
+        let md = consolidated_summary_markdown(&load_platform_reports(&inputs));
 
         // Assert structure before glyphs: a column-collapse regression must
         // fail loudly here rather than passing by reading the wrong cell.
@@ -3021,7 +3062,7 @@ mod tests {
         // regardless of input order: feed nightly before release and confirm
         // the summary rows land in the same relative order either way.
         let reversed_inputs = vec![inputs[1].clone(), inputs[0].clone()];
-        let md_reversed = consolidated_summary_markdown(&reversed_inputs);
+        let md_reversed = consolidated_summary_markdown(&load_platform_reports(&reversed_inputs));
         let rows: Vec<&str> = md.lines().filter(|l| l.starts_with("| Mi300x (")).collect();
         let rows_reversed: Vec<&str> = md_reversed
             .lines()
@@ -3039,7 +3080,7 @@ mod tests {
         // Old-style artifact (report.json only) → no grid section.
         let report = write_report(&feature_json(&[(&[], &["passed"])]));
         let inputs = vec![("e2e-report".to_string(), report.path().to_path_buf())];
-        let md = consolidated_summary_markdown(&inputs);
+        let md = consolidated_summary_markdown(&load_platform_reports(&inputs));
         assert!(
             !md.contains("### Expectation grid"),
             "no grid expected:\n{md}"
@@ -3074,7 +3115,7 @@ mod tests {
         assert_eq!((total, pass, fail, xfail), (2, 1, 0, 1));
 
         let inputs = vec![("e2e-report".to_string(), path)];
-        let md = consolidated_summary_markdown(&inputs);
+        let md = consolidated_summary_markdown(&load_platform_reports(&inputs));
         assert!(
             md.contains("| Mock | Linux | 2 | 1 | 0 | 0 | 1 | PASS |"),
             "summary row should be reconciled PASS with 0 fails:\n{md}"

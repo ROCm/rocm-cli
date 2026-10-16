@@ -22,6 +22,7 @@
 //! output, importing nothing from the product crates.
 
 use std::io::{Read, Write};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -123,6 +124,11 @@ impl TermSignal {
     }
 }
 
+/// Marker text from the dash's quit-confirm prompt (issue #145), drawn as
+/// part of its title when a model is still serving. Shared with
+/// `dash_steps`'s `Then` step for the prompt so the two can't drift apart.
+pub(crate) const QUIT_CONFIRM_MARKER: &str = "quit anyway";
+
 /// A running `rocm` TUI attached to a pseudo-terminal.
 pub struct TuiSession {
     child: Box<dyn Child + Send + Sync>,
@@ -180,7 +186,26 @@ impl TuiSession {
         args: &[&str],
         extra_env: &[(&str, &str)],
     ) -> Result<Self, String> {
-        Self::spawn_binary_with_env(world, crate::rocm_binary(), args, extra_env)
+        Self::spawn_binary_with_env(world, crate::rocm_binary(), args, extra_env, None)
+    }
+
+    /// Like [`spawn`](Self::spawn), but spawned with `dir` as the child's
+    /// working directory. Without this, portable-pty's `CommandBuilder`
+    /// never inherits the harness's own cwd on Unix — it falls back to
+    /// `$HOME`, which is already this scenario's isolated `HOME` (see
+    /// [`pty_env`]). On Windows it falls back to `%USERPROFILE%` when that
+    /// names a real directory — the real host profile, not this scenario's
+    /// isolation — and only inherits the harness's own cwd (via a null
+    /// `lpCurrentDirectory` to `CreateProcessW`) when `%USERPROFILE%` is
+    /// unset or not a directory. `spawn_in` makes the cwd an arbitrary,
+    /// explicit choice — independent of `HOME`/`USERPROFILE` overrides, and
+    /// the only reliable control on Windows — for driving a UI flow that
+    /// resolves its initial path via `std::env::current_dir()`: onboarding's
+    /// Adopt-existing folder browser does this unconditionally (see
+    /// dash-25); its Configure-path sibling does the same only when nothing
+    /// is already staged.
+    pub fn spawn_in(world: &E2eWorld, args: &[&str], dir: &Path) -> Result<Self, String> {
+        Self::spawn_binary_with_env(world, crate::rocm_binary(), args, &[], Some(dir))
     }
 
     /// Spawn a specific `rocm` binary under a fresh PTY.
@@ -193,7 +218,7 @@ impl TuiSession {
         binary: impl AsRef<std::ffi::OsStr>,
         args: &[&str],
     ) -> Result<Self, String> {
-        Self::spawn_binary_with_env(world, binary, args, &[])
+        Self::spawn_binary_with_env(world, binary, args, &[], None)
     }
 
     fn spawn_binary_with_env(
@@ -201,6 +226,7 @@ impl TuiSession {
         binary: impl AsRef<std::ffi::OsStr>,
         args: &[&str],
         extra_env: &[(&str, &str)],
+        cwd: Option<&Path>,
     ) -> Result<Self, String> {
         let pair = native_pty_system()
             .openpty(PtySize {
@@ -214,6 +240,16 @@ impl TuiSession {
         let mut cmd = CommandBuilder::new(binary);
         for arg in args {
             cmd.arg(arg);
+        }
+        if let Some(dir) = cwd {
+            // portable-pty 0.9.0 silently filters a non-directory cwd and
+            // falls back per the doc comment above, with no error, so check
+            // it ourselves rather than let a typo'd or not-yet-created
+            // target spawn somewhere else without saying so.
+            if !dir.is_dir() {
+                return Err(format!("cwd {} is not a directory", dir.display()));
+            }
+            cmd.cwd(dir);
         }
         // Inherit the parent environment first, then overlay the isolation and
         // deterministic-terminal vars — mirroring how the piped `run_rocm` path
@@ -661,15 +697,32 @@ impl TuiSession {
     /// the app has finished acting on whatever came just before it (e.g. right
     /// after an unsynchronized `send` like the Escape key), it can be consumed
     /// by that transient state and never reach the quit handler — the process
-    /// then never exits and this hangs until `timeout`. Re-sending the gesture
-    /// on a short cadence closes that gap the same way [`send_until`] does for
-    /// screen markers: if the first attempt landed (the common case), the
-    /// process has already exited by the first check and nothing is resent.
+    /// then never exits and this hangs until `timeout`. Re-sending on a short
+    /// cadence closes that gap the same way [`send_until`] does for screen
+    /// markers: if the first attempt landed (the common case), the process
+    /// has already exited by the first check and the loop below never reaches
+    /// a second send. What's resent each pass isn't always the same literal
+    /// `gesture` either — see the quit-confirm handling below, which switches
+    /// to `"y"` once the prompt is on screen.
     pub async fn quit_and_wait(&mut self, timeout: Duration) -> Result<(), String> {
+        // Several fixtures leave a model serving (`simulated`/demo sessions
+        // never do — `AppState::has_live_instance` always returns `false`
+        // there), which opens the quit-confirm prompt (issue #145) instead of
+        // exiting straight away — on `q`, and on `/quit` too: `rocm chat` is
+        // the same
+        // dashboard with the Chat tab focused (`run_chat` calls the same
+        // `run_async`), so it renders and is gated by the identical prompt.
+        // Once it's open, `q`/`Q` are read as Cancel (see `approval_key`) and
+        // the prompt owns every key ahead of chat-input focus, so blindly
+        // resending the normal gesture below would — for `q` — flip the
+        // prompt open/closed forever instead of ever confirming it, and —
+        // for `/quit\r` — type "uit" into chat as a message once the leading
+        // `q` cancels the prompt. Either way it never exits.
         let gesture = if self.is_chat { "/quit\r" } else { "q" };
         let deadline = Instant::now() + timeout;
         loop {
-            self.send(gesture)?;
+            let confirming = self.screen_snapshot().0.contains(QUIT_CONFIRM_MARKER);
+            self.send(if confirming { "y" } else { gesture })?;
             let remaining = deadline.saturating_duration_since(Instant::now());
             let attempt = KEY_RESEND_INTERVAL.min(remaining);
             match self.wait_for_exit_code_within(attempt).await {

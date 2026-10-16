@@ -169,7 +169,7 @@ pub(crate) fn render_summary(summary: &DeploymentSummary) -> String {
         let _ = writeln!(out, "  api key: {api_key}");
         let _ = writeln!(
             out,
-            "  note: this key is shown only now — clients must send `Authorization: Bearer <key>`"
+            "  note: this key is shown only now - clients must send `Authorization: Bearer <key>`"
         );
     }
     if !ready && !summary.already_running {
@@ -185,7 +185,7 @@ pub(crate) fn render_summary(summary: &DeploymentSummary) -> String {
         };
         let _ = writeln!(
             out,
-            "  note: {explanation} — check `rocm logs --service {}` or `rocm services list`",
+            "  note: {explanation} - check `rocm logs --service {}` or `rocm services list`",
             summary.service_id
         );
     }

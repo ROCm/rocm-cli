@@ -4,17 +4,17 @@
   "generated_at_unix_ms": null,
   "platforms": [
     {
-      "label": "AMD Ryzen AI — Strix Halo (Lemonade / llama.cpp)",
+      "label": "AMD Ryzen AI - Strix Halo (Lemonade / llama.cpp)",
       "engines": ["lemonade", "llama.cpp", "llamacpp"],
       "gfx_families": ["gfx1151"]
     },
     {
-      "label": "AMD Radeon — RX 7000/9000, Radeon PRO (Lemonade / llama.cpp)",
+      "label": "AMD Radeon - RX 7000/9000, Radeon PRO (Lemonade / llama.cpp)",
       "engines": ["lemonade", "llama.cpp", "llamacpp"],
       "gfx_families": ["gfx110X-all", "gfx120X-all"]
     },
     {
-      "label": "AMD Instinct — MI300X, MI350X, MI355X (vLLM)",
+      "label": "AMD Instinct - MI300X, MI350X, MI355X (vLLM)",
       "engines": ["vllm"],
       "gfx_families": ["gfx906", "gfx908", "gfx90a", "gfx94X-dcgpu", "gfx950-dcgpu"]
     }

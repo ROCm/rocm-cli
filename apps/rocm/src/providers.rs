@@ -2816,6 +2816,20 @@ mod tests {
         }
     }
 
+    /// The client thread's result, waiting at most `TRUNCATED_STREAM_BOUND`
+    /// for it, and then the server's through [`served_request_within_bound`],
+    /// but only when the client returned. A client that never returned
+    /// already fails the test, so this does not spend a second bound waiting
+    /// on a server it may never have reached.
+    fn client_then_server<T>(
+        client: &mpsc::Receiver<T>,
+        server: thread::JoinHandle<Result<String>>,
+    ) -> (Result<T, mpsc::RecvTimeoutError>, Option<Result<String>>) {
+        let outcome = client.recv_timeout(TRUNCATED_STREAM_BOUND);
+        let served = outcome.is_ok().then(|| served_request_within_bound(server));
+        (outcome, served)
+    }
+
     #[test]
     fn local_provider_stream_chat_fails_when_engine_dies_mid_chunked_stream() -> Result<()> {
         let (root, paths, server) =
@@ -2844,10 +2858,7 @@ mod tests {
             );
             let _ = sender.send((result.map_err(|error| format!("{error:#}")), received));
         });
-        let outcome = receiver.recv_timeout(TRUNCATED_STREAM_BOUND);
-        // A client that never returned already fails the test below, so don't
-        // spend a second bound waiting on a server it may never have reached.
-        let served = outcome.is_ok().then(|| served_request_within_bound(server));
+        let (outcome, served) = client_then_server(&receiver, server);
         let audit_text = fs::read_to_string(paths.audit_events_path()).unwrap_or_default();
         fs::remove_dir_all(root).ok();
 
@@ -2891,10 +2902,7 @@ mod tests {
         thread::spawn(move || {
             let _ = sender.send(crate::serve_summary::run_smoke_test(&paths, "Qwen/Qwen3.5"));
         });
-        let outcome = receiver.recv_timeout(TRUNCATED_STREAM_BOUND);
-        // A client that never returned already fails the test below, so don't
-        // spend a second bound waiting on a server it may never have reached.
-        let served = outcome.is_ok().then(|| served_request_within_bound(server));
+        let (outcome, served) = client_then_server(&receiver, server);
         fs::remove_dir_all(root).ok();
 
         let metrics = outcome.map_err(|_| {

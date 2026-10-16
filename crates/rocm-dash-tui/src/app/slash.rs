@@ -15,7 +15,7 @@
 
 use super::{
     ActiveTab, AppState, ChatProvider, ChatTurn, Modal, ProviderSwitch, SlashOutcome,
-    SlashToolRequest,
+    SlashToolRequest, request_quit,
 };
 
 impl AppState {
@@ -49,7 +49,10 @@ impl AppState {
             "gpu" => self.active_tab = ActiveTab::Observe,
             "help" | "?" => self.modal = Modal::Help,
             "clear" => self.chat.clear(),
-            "quit" | "exit" => self.should_quit = true,
+            // Shares `KeyAction::Quit`'s own gate (issue #145): a model still
+            // being served gets the same confirm prompt the `q` key opens,
+            // instead of a second, independently-decided quit path.
+            "quit" | "exit" => self.should_quit = request_quit(self),
             // --- Group B: read-only overlays (mirror the keybind handlers) ---
             "doctor" => {
                 self.close_overlays();

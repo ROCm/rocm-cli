@@ -18,7 +18,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// checkout, would otherwise share the directory, and each call wipes it
 /// first, so one run would delete the other's files. The pid separates
 /// processes and the per-process counter separates calls within one, so no two
-/// calls agree whatever the tag.
+/// calls agree whatever the tag. The `remove_dir_all` wipe stays anyway: after
+/// pid reuse, it clears a leftover directory of the same name that an earlier
+/// run left behind.
 pub(crate) fn scratch_dir(tag: &str) -> PathBuf {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let dir = Path::new(env!("CARGO_MANIFEST_DIR"))

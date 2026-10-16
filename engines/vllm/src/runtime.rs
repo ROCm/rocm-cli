@@ -5,7 +5,7 @@
 use anyhow::{Context, Result, bail};
 use rocm_core::{AppPaths, split_local_version};
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -602,6 +602,227 @@ print(json.dumps({"present": spec is not None, "version": version}))
     }
 }
 
+/// Describes a resolved runtime's TheRock SDK layout for the running-state
+/// payload, or `None` when the runtime is not backed by a TheRock SDK root.
+/// Performs no filesystem writes: `therock_library_path_entries` only derives
+/// paths here, it never writes the compat shims a launch needs those paths to
+/// contain — see [`ensure_therock_compat_shims`].
+pub(crate) fn therock_runtime_env_payload(runtime: &VllmRuntime) -> Option<Value> {
+    let root = runtime.sdk_root.as_ref()?;
+    Some(json!({
+        "runtime_id": runtime.runtime_id,
+        "env_id": runtime.env_id,
+        "root": root.display().to_string(),
+        "bin": runtime.sdk_bin.as_ref().map(|path| path.display().to_string()),
+        "bin_paths": runtime_bin_paths(runtime)
+            .into_iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>(),
+        "library_paths": therock_library_path_entries(runtime)
+            .into_iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>(),
+        "source": runtime.source,
+    }))
+}
+
+pub(crate) fn runtime_bin_paths(runtime: &VllmRuntime) -> Vec<PathBuf> {
+    let mut entries = Vec::new();
+    if let Some(bin) = runtime.sdk_bin.as_ref() {
+        entries.push(bin.clone());
+    }
+    entries.extend(runtime.sdk_bin_paths.iter().cloned());
+    dedupe_paths(entries)
+}
+
+/// How [`therock_library_path_entries_inner`] decides whether the compat dir
+/// belongs on the loader path.
+enum CompatDirSignal {
+    /// `ensure_therock_compat_shims`'s answer is not passed in to this
+    /// derivation (the running-state payload path, which never calls it).
+    /// Falls back to a read-only directory listing of whatever is already on
+    /// disk: not authoritative, but the best available signal without
+    /// performing a write.
+    Unchecked,
+    /// This launch's authoritative answer from `ensure_therock_compat_shims`:
+    /// on the launch path, `Some(dir)` when a shim was needed and written,
+    /// `None` when it was not needed or could not be written — even if one is
+    /// still sitting on disk
+    /// from an earlier run.
+    Checked(Option<PathBuf>),
+}
+
+pub(crate) fn therock_library_path_entries(runtime: &VllmRuntime) -> Vec<PathBuf> {
+    therock_library_path_entries_inner(runtime, CompatDirSignal::Unchecked)
+}
+
+/// Same path derivation as [`therock_library_path_entries`], for the launch
+/// path: `compat_shim` is the `Option<PathBuf>` [`ensure_therock_compat_shims`]
+/// returned for *this launch*'s `ensure_mpi_cxx_compat` call, and is used as
+/// the authoritative answer for whether the compat dir belongs on the loader
+/// path. Unlike a directory listing, it is not fooled by a stub some earlier
+/// run left behind after the host later gained a real `libmpi_cxx` — that
+/// case resolves to `None` here, exactly as `ensure_mpi_cxx_compat` reports
+/// it for this launch.
+pub(crate) fn therock_library_path_entries_for_launch(
+    runtime: &VllmRuntime,
+    compat_shim: Option<PathBuf>,
+) -> Vec<PathBuf> {
+    therock_library_path_entries_inner(runtime, CompatDirSignal::Checked(compat_shim))
+}
+
+fn therock_library_path_entries_inner(
+    runtime: &VllmRuntime,
+    compat_dir_signal: CompatDirSignal,
+) -> Vec<PathBuf> {
+    let Some(root) = runtime.sdk_root.as_ref() else {
+        return dedupe_paths(runtime.sdk_library_paths.clone());
+    };
+    let mut entries = runtime.sdk_library_paths.clone();
+    entries.extend([
+        root.join("lib"),
+        root.join("lib64"),
+        root.join("lib").join("rocm_sysdeps").join("lib"),
+    ]);
+    if cfg!(target_os = "linux") {
+        let wsl_dxcore_lib = PathBuf::from("/usr/lib/wsl/lib");
+        if wsl_dxcore_lib.is_dir() {
+            entries.push(wsl_dxcore_lib);
+        }
+        // OpenMPI is installed outside the default loader path on some distros
+        // (notably RHEL-family under /usr/lib64/openmpi/lib); make sure vLLM can
+        // load libmpi.so at launch when it lives there.
+        entries.extend(rocm_core::openmpi::openmpi_library_dirs());
+
+        // The compat shims this directory may hold (see
+        // `ensure_therock_compat_shims`) are not ensured here — this function
+        // only derives the path, never writes. On the launch path
+        // (`Checked`), include the candidate exactly when
+        // `ensure_therock_compat_shims` says a shim is needed this launch —
+        // this is what keeps a leftover stub from an earlier run (the host
+        // has since gained a real `libmpi_cxx.so*`) from shadowing the loader
+        // path. On the running-state payload path (`Unchecked`), which never
+        // calls that function, fall back to a read-only directory listing of
+        // whatever is already there: not authoritative, but the best
+        // available signal without performing a write.
+        match compat_dir_signal {
+            CompatDirSignal::Checked(shim) => entries.extend(shim),
+            CompatDirSignal::Unchecked => {
+                if let Some(compat_dir) = runtime_compat_dir(runtime)
+                    && compat_dir_has_shims(&compat_dir)
+                {
+                    entries.push(compat_dir);
+                }
+            }
+        }
+    }
+    dedupe_paths(entries)
+}
+
+/// Whether `compat_dir` currently has any entry at all — a plain directory
+/// listing, not a check for a specific shim [`ensure_therock_compat_shims`]
+/// would recognize. This is the fallback [`therock_library_path_entries`]
+/// uses on the running-state payload path, which never calls that function
+/// and so has no authoritative answer to consult; see
+/// [`therock_library_path_entries_for_launch`] for the path that does.
+fn compat_dir_has_shims(compat_dir: &Path) -> bool {
+    compat_dir
+        .read_dir()
+        .is_ok_and(|mut entries| entries.next().is_some())
+}
+/// Materializes the runtime-owned OpenMPI compatibility shims that
+/// `therock_library_path_entries`' `compat_dir` entry depends on. Call once
+/// from the launch path, before building the environment a server is spawned
+/// with — never from running-state payload assembly, which only needs the
+/// path list `therock_library_path_entries` derives, not the shims
+/// themselves. Returns the `libmpi_cxx` compat dir when a shim is needed for
+/// *this* launch and `ensure_mpi_cxx_compat` wrote it — pass this on to
+/// [`therock_library_path_entries_for_launch`] rather than having that
+/// derivation re-check the directory itself. Returns `None` without touching
+/// the filesystem when `runtime.sdk_root` is absent, so this function stays
+/// safe to call independent of a caller's own gating.
+///
+/// `ensure_mpi_cxx_compat` is the real probe in production
+/// ([`rocm_core::openmpi::ensure_mpi_cxx_compat`]); tests inject a fixed
+/// answer here to exercise the rest of this hand-off without depending on
+/// this host's own OpenMPI/compiler state.
+pub(crate) fn ensure_therock_compat_shims(
+    runtime: &VllmRuntime,
+    ensure_mpi_cxx_compat: impl FnOnce(&Path) -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    // No-op without `sdk_root`, matching `therock_library_path_entries_inner`'s
+    // own gating.
+    runtime.sdk_root.as_ref()?;
+    let compat_dir = runtime_compat_dir(runtime)?;
+    // PyTorch's `libtorch_global_deps.so` lists `libmpi_cxx.so.40` as a
+    // NEEDED dependency, but OpenMPI 5.x removed the legacy C++ bindings, so
+    // `import torch` aborts with `libmpi_cxx.so.40: cannot open shared object
+    // file`. When no real `libmpi_cxx.so*` exists, materialize an embedded
+    // `libmpi_cxx.so.40` stub (built at compile time, see rocm-core's
+    // build.rs) into this directory. The stub only *defines* the legacy C++
+    // binding symbols torch needs; they are never called in single-node
+    // serving, so this is safe.
+    let mpi_cxx_shim = ensure_mpi_cxx_compat(&compat_dir);
+    // PyTorch's `libc10.so` NEEDS the standard `libnuma.so.1` soname with the
+    // upstream `libnuma_1.2` symbol version. TheRock bundles numa only under
+    // the renamed soname `librocm_sysdeps_numa.so.1` whose versions are
+    // rewritten to `AMDROCM_SYSDEPS_1.0_libnuma_*`, which cannot satisfy that
+    // binding. An older rocm-cli release symlinked `libnuma.so.1` to that
+    // bundled library; on the loader path it shadowed any real system libnuma
+    // and broke `import torch` with `version 'libnuma_1.2' not found`. Remove
+    // that stale shim here so the real numactl runtime (installed via the
+    // package manager) wins; `libnuma_present()`/`spawn_vllm_server` handle
+    // the install/preflight.
+    remove_stale_numa_shim(&compat_dir);
+    mpi_cxx_shim
+}
+/// Remove a stale `libnuma.so.1` compatibility symlink left by older rocm-cli
+/// versions in `compat_dir`. That shim pointed at the ROCm SDK's bundled
+/// `librocm_sysdeps_numa.so.1`, whose renamed symbol versions cannot satisfy the
+/// `libnuma_1.2` symbol PyTorch's `libc10.so` binds; leaving it on the loader
+/// path would shadow a correctly installed system libnuma. No-op when absent or
+/// when the entry is not a symlink.
+fn remove_stale_numa_shim(compat_dir: &Path) {
+    let link = compat_dir.join("libnuma.so.1");
+    if let Ok(meta) = link.symlink_metadata()
+        && meta.file_type().is_symlink()
+    {
+        let _ = fs::remove_file(&link);
+    }
+}
+/// A writable, runtime-owned directory for managed-runtime library compatibility
+/// shims (see [`therock_library_path_entries`]). Prefers the managed Python
+/// environment root (`<env>/bin/python` -> `<env>`); falls back to the SDK root
+/// when no Python launcher is recorded.
+fn runtime_compat_dir(runtime: &VllmRuntime) -> Option<PathBuf> {
+    const COMPAT_DIR_NAME: &str = "rocm-cli-lib-compat";
+    if let Some(env_root) = runtime
+        .python_executable
+        .as_ref()
+        .and_then(|python| python.parent())
+        .and_then(|bin| bin.parent())
+    {
+        return Some(env_root.join(COMPAT_DIR_NAME));
+    }
+    runtime
+        .sdk_root
+        .as_ref()
+        .map(|root| root.join(COMPAT_DIR_NAME))
+}
+
+fn dedupe_paths(entries: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut deduped = Vec::new();
+    for entry in entries {
+        if !entry.as_os_str().is_empty() && !deduped.iter().any(|seen| seen == &entry) {
+            deduped.push(entry);
+        }
+    }
+    deduped
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -780,5 +1001,183 @@ mod tests {
     #[test]
     fn runtime_has_discover_build_rejects_no_recorded_version() {
         assert!(!runtime_has_discover_build(&runtime_with_sdk_version(None)));
+    }
+    #[test]
+    fn therock_library_path_entries_include_sysdeps_for_hip_apps() {
+        // A fixed path is safe here: this function only derives candidate
+        // paths and never writes to disk (see `ensure_therock_compat_shims`
+        // for the step that does).
+        let root = PathBuf::from("/tmp/rocm-sdk");
+        let runtime = VllmRuntime {
+            runtime_id: "therock-release:gfx120X-all".to_owned(),
+            env_id: "external-vllm-therock".to_owned(),
+            command: PathBuf::from("vllm"),
+            python_executable: None,
+            version: None,
+            source: "managed_runtime_manifest:test".to_owned(),
+            sdk_root: Some(root.clone()),
+            sdk_bin: Some(root.join("bin")),
+            sdk_bin_paths: vec![root.join("runtime").join("bin")],
+            sdk_library_paths: vec![root.join("runtime").join("lib")],
+            rocm_sdk_version: None,
+        };
+        let entries = therock_library_path_entries(&runtime);
+        assert!(entries.contains(&root.join("runtime").join("lib")));
+        assert!(entries.contains(&root.join("lib")));
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.ends_with(Path::new("lib").join("rocm_sysdeps").join("lib")))
+        );
+    }
+
+    #[test]
+    fn compat_dir_has_shims_reflects_directory_contents() {
+        let empty = tempfile::tempdir().unwrap();
+        assert!(!compat_dir_has_shims(empty.path()));
+
+        let populated = tempfile::tempdir().unwrap();
+        fs::write(populated.path().join("libmpi_cxx.so.40"), b"stub").unwrap();
+        assert!(compat_dir_has_shims(populated.path()));
+
+        let missing = empty.path().join("never-created");
+        assert!(!compat_dir_has_shims(&missing));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn runtime_with_compat_dir(env_root: &Path) -> VllmRuntime {
+        VllmRuntime {
+            runtime_id: "therock-release:gfx120X-all".to_owned(),
+            env_id: "external-vllm-therock".to_owned(),
+            command: PathBuf::from("vllm"),
+            python_executable: Some(env_root.join("bin").join("python")),
+            version: None,
+            source: "managed_runtime_manifest:test".to_owned(),
+            sdk_root: Some(env_root.join("sdk")),
+            sdk_bin: None,
+            sdk_bin_paths: Vec::new(),
+            sdk_library_paths: Vec::new(),
+            rocm_sdk_version: None,
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn therock_library_path_entries_omits_compat_dir_with_nothing_in_it() {
+        let env = tempfile::tempdir().unwrap();
+        let runtime = runtime_with_compat_dir(env.path());
+
+        let entries = therock_library_path_entries(&runtime);
+
+        assert!(
+            !entries.contains(&env.path().join("rocm-cli-lib-compat")),
+            "an absent/empty compat dir must not shadow the loader path: {entries:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn therock_library_path_entries_includes_compat_dir_once_a_shim_exists() {
+        let env = tempfile::tempdir().unwrap();
+        let runtime = runtime_with_compat_dir(env.path());
+        let compat_dir = env.path().join("rocm-cli-lib-compat");
+        fs::create_dir_all(&compat_dir).unwrap();
+        fs::write(compat_dir.join("libmpi_cxx.so.40"), b"stub").unwrap();
+
+        let entries = therock_library_path_entries(&runtime);
+
+        assert!(
+            entries.contains(&compat_dir),
+            "a populated compat dir must be on the loader path: {entries:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn therock_library_path_entries_for_launch_ignores_a_leftover_stub_this_launch_does_not_need() {
+        // A leftover `libmpi_cxx.so.40` from an earlier run, now that the host
+        // has gained a real `libmpi_cxx` (`ensure_mpi_cxx_compat` reports
+        // `None` for this launch), must not shadow the loader path — unlike
+        // `therock_library_path_entries`'s directory-listing fallback, which
+        // cannot tell a leftover stub from one still needed.
+        let env = tempfile::tempdir().unwrap();
+        let runtime = runtime_with_compat_dir(env.path());
+        let compat_dir = env.path().join("rocm-cli-lib-compat");
+        fs::create_dir_all(&compat_dir).unwrap();
+        fs::write(compat_dir.join("libmpi_cxx.so.40"), b"stale stub").unwrap();
+
+        let entries = therock_library_path_entries_for_launch(&runtime, None);
+
+        assert!(
+            !entries.contains(&compat_dir),
+            "a stub this launch's ensure call says is not needed must not be \
+             included just because one is still on disk: {entries:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn therock_library_path_entries_for_launch_includes_the_shim_ensure_reported() {
+        let env = tempfile::tempdir().unwrap();
+        let runtime = runtime_with_compat_dir(env.path());
+        let compat_dir = env.path().join("rocm-cli-lib-compat");
+
+        let entries = therock_library_path_entries_for_launch(&runtime, Some(compat_dir.clone()));
+
+        assert!(
+            entries.contains(&compat_dir),
+            "the dir `ensure_therock_compat_shims` reports needed must be on \
+             the loader path, even before anything is listed on disk: {entries:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn ensure_therock_compat_shims_writes_nothing_without_an_sdk_root() {
+        // `python_executable` alone (no `sdk_root`) is the real shape of the
+        // `ROCM_CLI_VLLM_PYTHON`/`VLLM_PYTHON` external-python runtime that
+        // `resolve_vllm_runtime` builds. Exercises this `pub(crate)`
+        // function's own `sdk_root` guard directly, independent of whether
+        // any caller reaches it with that runtime shape.
+        //
+        // Whether a write would otherwise happen on this host (a stub
+        // embedded at compile time, and no real `libmpi_cxx.so*` already
+        // present) varies by host, so probe `ensure_mpi_cxx_compat` against a
+        // throwaway directory first: when it would do nothing anyway, this
+        // test cannot distinguish "guarded correctly" from "nothing to guard
+        // against", so skip the directory-emptiness assertion in that case —
+        // the `shim.is_none()` assertion below still holds either way.
+        let probe = tempfile::tempdir().unwrap();
+        let would_write_without_the_guard =
+            rocm_core::openmpi::ensure_mpi_cxx_compat(probe.path()).is_some();
+
+        let env = tempfile::tempdir().unwrap();
+        let runtime = VllmRuntime {
+            runtime_id: "external-vllm-python".to_owned(),
+            env_id: "external-vllm-python".to_owned(),
+            command: PathBuf::from("vllm"),
+            python_executable: Some(env.path().join("bin").join("python")),
+            version: None,
+            source: "environment python".to_owned(),
+            sdk_root: None,
+            sdk_bin: None,
+            sdk_bin_paths: Vec::new(),
+            sdk_library_paths: Vec::new(),
+            rocm_sdk_version: None,
+        };
+
+        let shim = ensure_therock_compat_shims(&runtime, rocm_core::openmpi::ensure_mpi_cxx_compat);
+
+        assert!(
+            shim.is_none(),
+            "no sdk_root means the compat dir is never on the loader path, \
+             so there is nothing to report needing a shim for"
+        );
+        if would_write_without_the_guard {
+            assert!(
+                !env.path().join("rocm-cli-lib-compat").exists(),
+                "must not write into the venv root's compat dir when sdk_root is absent"
+            );
+        }
     }
 }

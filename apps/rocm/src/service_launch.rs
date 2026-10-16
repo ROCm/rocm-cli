@@ -676,7 +676,7 @@ fn render_endpoint_client_config(endpoint_url: &str, api_key: &str) -> String {
     let _ = writeln!(out, "  api key: {api_key}");
     let _ = writeln!(
         out,
-        "  note: this key is shown only now — clients must send `Authorization: Bearer <key>`"
+        "  note: this key is shown only now - clients must send `Authorization: Bearer <key>`"
     );
     let _ = writeln!(
         out,
@@ -942,7 +942,7 @@ pub(crate) fn run_attached_service(
         // codeql[rust/cleartext-logging]
         print!("{}", render_endpoint_client_config(&endpoint, key));
     }
-    println!("  streaming engine logs — Ctrl-D detaches (leaves it running), Ctrl-C stops it");
+    println!("  streaming engine logs - Ctrl-D detaches (leaves it running), Ctrl-C stops it");
     println!();
 
     let outcome = stream_attached_logs(&log_path, child_pid)?;
@@ -950,7 +950,7 @@ pub(crate) fn run_attached_service(
 
     match outcome {
         AttachOutcome::Detach => {
-            println!("detached — server still running");
+            println!("detached - server still running");
             println!("  service_id: {service_id}");
             println!("  endpoint: {endpoint}");
             println!("  list: rocm services");
@@ -967,7 +967,7 @@ pub(crate) fn run_attached_service(
             Ok(())
         }
         AttachOutcome::Stop => {
-            println!("stopping server…");
+            println!("stopping server...");
             match run_internal_sandbox_tool(
                 &paths,
                 SandboxToolArg::StopServer,

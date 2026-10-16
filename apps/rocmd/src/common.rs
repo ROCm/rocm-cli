@@ -5,7 +5,7 @@
 use anyhow::{Context, Result, bail};
 use rocm_core::{
     AppPaths, AutomationRuntimeState, CodexBridgeEngine, CodexBridgeGpuSnapshot,
-    CodexBridgeSnapshot, ExamineSummary, RocmCliConfig, command_failure_detail, daemon_binary_path,
+    CodexBridgeSnapshot, ExamineSummary, RocmCliConfig, daemon_binary_path,
     default_engine_for_platform, format_host_port, load_recent_automation_events,
     resolve_amd_smi_binary, unix_time_millis,
 };
@@ -61,10 +61,34 @@ pub(crate) fn gather_gpu_snapshot() -> CodexBridgeGpuSnapshot {
         Ok(value) => Some(value),
         Err(error) => {
             return CodexBridgeGpuSnapshot {
+                // `{error:#}` rather than `to_string()`: the outermost context
+                // alone says "failed to launch amd-smi ...", which names the
+                // wrong thing when what actually happened was a timeout. Pinned
+                // by `examine-25`, which asserts that the rendered note names
+                // the timeout and not just the launch.
+                //
+                // Every failure `run_with_timeout` raises carries its cause the
+                // same way, since all of them arrive under that one context:
+                // the timeout, the failure to spawn, and the poll and reap
+                // failures of its wait loop. Spawn is the case on a host where
+                // none of the paths `resolve_amd_smi_binary` searches holds an
+                // `amd-smi`, down to the bare name on `PATH`; the cause is then
+                // the OS's own "not found" text, which is not the same string
+                // on Linux and Windows, and `rocmd` runs this probe on both --
+                // so none of it is quoted here, and no test pins it. A host
+                // with no GPU but an amd-smi installed is a different case: it
+                // spawns and fails at a non-zero exit. (The non-zero-exit and
+                // parse failures below are their own outermost context and
+                // already read correctly.)
+                //
+                // The note is the only account of any of this that reaches the
+                // bridge snapshot and the automation watcher, so it carries the
+                // causes too -- bounded, because it is persisted; see
+                // `run_with_timeout`'s `MAX_QUOTED_OUTPUT_CHARS`.
                 amd_smi_available: false,
                 static_snapshot: None,
                 monitor_snapshot: None,
-                note: Some(error.to_string()),
+                note: Some(format!("{error:#}")),
             };
         }
     };
@@ -75,10 +99,14 @@ pub(crate) fn gather_gpu_snapshot() -> CodexBridgeGpuSnapshot {
         Ok(value) => Some(value),
         Err(error) => {
             return CodexBridgeGpuSnapshot {
+                // Same reasoning as the `static` probe above, but a different
+                // test: examine-25's stalled `static` probe returns before this
+                // branch is ever reached, so reverting this `{error:#}` is
+                // caught by `examine-26` alone. Pinned by `examine-26`.
                 amd_smi_available: true,
                 static_snapshot,
                 monitor_snapshot: None,
-                note: Some(error.to_string()),
+                note: Some(format!("{error:#}")),
             };
         }
     };
@@ -110,12 +138,10 @@ pub(crate) fn gather_gpu_snapshot_for_config(config: &RocmCliConfig) -> CodexBri
 fn capture_amd_smi_json(args: &[&str]) -> Result<Value> {
     let amd_smi_binary = resolve_amd_smi_binary();
     let mut command = ProcessCommand::new(&amd_smi_binary);
-    command
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let output = run_command_with_timeout(command, AMD_SMI_PROBE_TIMEOUT)
+    // No stdio here: `run_with_timeout` sets null stdin and piped stdout/stderr
+    // itself, since capturing both is its contract.
+    command.args(args);
+    let output = rocm_core::process::run_with_timeout(command, AMD_SMI_PROBE_TIMEOUT, "process")
         .with_context(|| format!("failed to launch amd-smi {}", args.join(" ")))?;
 
     if !output.status.success() {
@@ -190,37 +216,6 @@ pub(crate) struct CommandCapture {
     pub(crate) stderr: String,
 }
 
-pub(crate) fn run_command_with_timeout(
-    mut command: ProcessCommand,
-    timeout: Duration,
-) -> Result<std::process::Output> {
-    let mut child = command.spawn().context("failed to spawn child process")?;
-    let started = std::time::Instant::now();
-    loop {
-        if child
-            .try_wait()
-            .context("failed to poll child process")?
-            .is_some()
-        {
-            return child
-                .wait_with_output()
-                .context("failed to collect child process output");
-        }
-        if started.elapsed() >= timeout {
-            let _ = child.kill();
-            let output = child
-                .wait_with_output()
-                .context("failed to collect timed-out child process output")?;
-            bail!(
-                "process exceeded {}s timeout: {}",
-                timeout.as_secs(),
-                command_failure_detail(&output)
-            );
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-}
-
 pub(crate) fn run_rocm_capture(args: &[&str]) -> Result<CommandCapture> {
     let paths = AppPaths::discover()?;
     run_rocm_capture_for_paths(&paths, args, Duration::from_mins(2))
@@ -233,15 +228,13 @@ pub(crate) fn run_rocm_capture_for_paths(
 ) -> Result<CommandCapture> {
     let rocm_binary = daemon_binary_path()?;
     let mut command = ProcessCommand::new(&rocm_binary);
+    // Stdio left to `run_with_timeout`, which sets it itself.
     command
         .args(args)
         .env("ROCM_CLI_CONFIG_DIR", &paths.config_dir)
         .env("ROCM_CLI_DATA_DIR", &paths.data_dir)
-        .env("ROCM_CLI_CACHE_DIR", &paths.cache_dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let output = run_command_with_timeout(command, timeout)
+        .env("ROCM_CLI_CACHE_DIR", &paths.cache_dir);
+    let output = rocm_core::process::run_with_timeout(command, timeout, "process")
         .with_context(|| format!("failed to run {}", rocm_binary.display()))?;
     Ok(CommandCapture {
         argv: std::iter::once(rocm_binary.display().to_string())

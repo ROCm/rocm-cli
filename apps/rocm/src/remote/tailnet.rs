@@ -383,7 +383,7 @@ pub(crate) fn render_targets(status: &TailnetStatus, tag: Option<&str>) -> Strin
     );
     let _ = writeln!(
         output,
-        "ROCm, or the ROCm CLI — run `rocm remote doctor <machine>` to find out."
+        "ROCm, or the ROCm CLI - run `rocm remote doctor <machine>` to find out."
     );
     if tag.is_none() {
         let _ = writeln!(

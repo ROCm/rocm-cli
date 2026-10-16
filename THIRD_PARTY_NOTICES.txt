@@ -5846,6 +5846,7 @@ The following component(s) are licensed under Apache License 2.0:
   - security-framework-sys 2.17.0 <https://github.com/kornelski/rust-security-framework>
   - security-framework 2.11.1 <https://github.com/kornelski/rust-security-framework>
   - security-framework 3.7.0 <https://github.com/kornelski/rust-security-framework>
+  - self-replace 1.5.0 <https://github.com/mitsuhiko/self-replace>
   - serde_with 3.21.0 <https://github.com/jonasbb/serde_with/>
   - serde_with_macros 3.21.0 <https://github.com/jonasbb/serde_with/>
   - signal-hook-mio 0.2.5 <https://github.com/vorner/signal-hook>

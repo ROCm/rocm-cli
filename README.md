@@ -80,7 +80,9 @@ add a demo. Until the demo-gifs workflow has run once, these links 404.
 
 The installer downloads a prebuilt bundle, verifies its SHA-256 checksum,
 installs the `rocm` and `rocmd` binaries into `~/.local/bin`, and adds that
-directory to your shell `PATH`. Rerun it any time to upgrade.
+directory to your shell `PATH`. Rerun it any time to upgrade. `rocm uninstall`
+removes the binaries, and undoes the `PATH` change too when no other program
+lives in that directory.
 
 ### Linux and WSL (x86_64)
 
@@ -161,7 +163,17 @@ Pick a row with the arrow keys and `Enter`; press `q` — or `Ctrl-C`, which qui
 from the launcher and the dashboard alike and restores your terminal — to quit.
 The one exception is the dashboard's console for a **running** job, where
 `Ctrl-C` keeps its existing meaning of "cancel this job" and does not quit; once
-that job finishes, `Ctrl-C` quits there too. On a non-interactive terminal (or
+that job finishes, `Ctrl-C` quits there too. If a model is still being served,
+quitting (`q`, the Esc menu's `Quit` row, or `/quit`/`/exit` in chat — from the
+launcher, or from a dashboard or chat session opened directly) asks for
+confirmation first, naming the model and the real `rocm services stop <id>
+--yes` command to stop it; from the dashboard, pressing `s` instead jumps
+straight to the Services overlay to stop it there. Declining (`n`/Esc) returns
+to where you were; confirming (`y`/Enter) quits anyway — either way the model
+keeps running in the background, it just won't happen by surprise. Unlike `q`,
+`Ctrl-C` always quits immediately without asking (same running-job exception as
+above). See `docs/manual-testing.md` for the Windows- and
+launcher-hosted-session-specific details. On a non-interactive terminal (or
 piped output), `rocm` prints a one-shot status summary instead of opening the
 launcher.
 
@@ -278,6 +290,13 @@ the leading `#1`, `#2` are ranking positions for reading order only — `rocm
 fix` takes the id, not the position.
 
 - `--symptom` takes raw error text to sharpen keyword scoring.
+- On Windows, `diagnose` also checks the age of the Visual C++ runtime, not
+  only whether it is there. The runtime in `System32` must be 14.40 or newer
+  (`fix-21-msvc-redist-outdated`). Programs built with a recent toolset, such
+  as the llama.cpp server that Lemonade installs, crash with an access
+  violation in `MSVCP140.dll` on an older one. `rocm examine --json` shows the
+  version it read as `msvc_redist_version`. `rocm fix` only prints the update
+  plan, including a `winget install` line; it never runs the install.
 - `--top` caps how many matches are shown in the human-readable output
   (default 5) — `--json` always emits the full, untruncated report.
 - `--distro` diagnoses a WSL distribution from the Windows host instead of
@@ -327,9 +346,10 @@ this machine: AUTO (this command carries out the change), NEEDS-ARG (it will,
 once given the argument it names), PRINT-ONLY (it prints the steps for you to
 run yourself — usually because the right command depends on a choice only you
 can make, sometimes because it also needs sudo or a reboot), or DIAGNOSE-ONLY
-(no reliable fix exists, so nothing will be changed -- no catalog entry
-carries this marker today; it is reserved for a future detect-but-cannot-repair
-failure).
+(no reliable fix exists, so running it names the problem, changes nothing and
+exits 0). `info-20-gpu-no-rocm-support` is the entry marked DIAGNOSE-ONLY
+today: a GPU ROCm has never shipped a runtime build for is a fact about the
+hardware, not something an install or a setting can put right.
 
 - `--dry-run` shows any fix's plan without changing anything.
 - `--yes` skips the interactive confirmation once you've reviewed it.
@@ -949,7 +969,20 @@ rocm logs [--service <service-id>] [--search TERM ...]
 
 rocm uninstall [--yes] [--dry-run]
                [--keep-binaries] [--keep-config] [--keep-data] [--keep-cache]
+               [--force-dev-binaries]
 ```
+
+`rocm uninstall` lists what it will do and asks before doing it (`--yes` skips
+the question, `--dry-run` only lists). It removes the config, data, and cache
+directories and the installed binaries, including the running `rocm.exe` on
+Windows. It also undoes the `PATH` change the installer made: the marked block
+in your shell profile, or the user `PATH` entry the Windows installer recorded
+adding. That change stays when other programs live in the same folder, since
+they may rely on it (the review names them), and with `--keep-binaries`. A
+`PATH` line you wrote yourself is never touched. The `PATH` change is undone
+first: if it cannot be, nothing is removed, so you can fix the cause and run
+`rocm uninstall` again. Each step is reported as it finishes, so if a later
+step fails, the output still shows what was already removed.
 
 On Linux, if a config, data, or cache folder is a link to somewhere else (for
 example a cache moved to a bigger disk), `rocm uninstall` removes the link and

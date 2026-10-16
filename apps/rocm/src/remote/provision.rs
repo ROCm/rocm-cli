@@ -58,7 +58,7 @@ pub(crate) fn install_cli(
     platform: Option<&RemotePlatform>,
     channel: &str,
 ) -> Result<(String, Provisioned)> {
-    println!("  remote CLI: not found — installing it on {target} ...");
+    println!("  remote CLI: not found - installing it on {target} ...");
 
     match run_remote_installer(transport, channel) {
         Ok(()) => {
