@@ -444,7 +444,10 @@ active default runtime, not about what a named prefix loses.
 #### Driver installation
 
 `install driver` installs the AMD kernel driver on Linux, using DKMS or a native
-package.
+package. On bare metal it defaults to the floating `latest` amdgpu release;
+set `ROCM_CLI_AMDGPU_DRIVER_VERSION` to pin a specific one. This replaces the
+older `ROCM_CLI_AMDGPU_VERSION`/`ROCM_CLI_AMDGPU_PACKAGE_RELEASE` pair, which
+pinned a fixed default and are no longer read.
 
 #### Updates
 
