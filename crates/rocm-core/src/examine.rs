@@ -225,8 +225,14 @@ pub struct Examination {
     pub has_discrete_amd: bool,
 
     // driver / runtime (Linux)
+    /// amdgpu is present: listed as a module, or `/sys/module/amdgpu` exists,
+    /// which it does whether amdgpu is loaded as a module or built into the
+    /// kernel (where it never appears in `lsmod`).
     pub amdgpu_loaded: Option<bool>,
     pub amdgpu_blacklisted_in: Vec<String>,
+    /// kfd is available: as a separate `amdkfd` module on kernels before 4.20
+    /// (where kfd was merged into `amdgpu.ko`), or through `/sys/class/kfd/kfd`
+    /// or `/dev/kfd` on current ones. The name predates the merge.
     pub amdkfd_loaded: Option<bool>,
     pub secure_boot: String,
     pub iommu_kernel_param: String,
@@ -1786,6 +1792,46 @@ fn summarise_gpu_categories(e: &mut Examination) {
 // Kernel module / device probes (Linux)
 // ---------------------------------------------------------------------------
 
+/// Whether the kernel's kfd is present on this host, however it got there.
+///
+/// kfd is not a module of its own: `HSA_AMD` is a `bool` Kconfig option and
+/// amdkfd is linked into `amdgpu`, so no `amdkfd` line ever appears in the
+/// module list, built in or not. The kernel's own interfaces are the signal:
+/// the `/sys/class/kfd/kfd` class device, or the `/dev/kfd` node.
+fn kfd_present_on_host() -> bool {
+    crate::host_path("/sys/class/kfd/kfd").exists() || crate::host_path("/dev/kfd").exists()
+}
+
+/// Whether the amdgpu driver is present on this host, loaded or built in.
+///
+/// A built-in driver is absent from the module list, but the kernel still
+/// registers `/sys/module/amdgpu` for it, exactly as it does for a loaded one.
+fn amdgpu_present_on_host() -> bool {
+    crate::host_path("/sys/module/amdgpu").exists()
+}
+
+/// `amdgpu_loaded`: an `amdgpu` module in the list, or amdgpu present on the host.
+///
+/// `modules` is `None` when the module list could not be read; amdgpu being
+/// present on the host still answers `true` then, and nothing else is known.
+fn amdgpu_state(modules: Option<&[&str]>, amdgpu_on_host: bool) -> Option<bool> {
+    match modules {
+        Some(modules) => Some(modules.contains(&"amdgpu") || amdgpu_on_host),
+        None => amdgpu_on_host.then_some(true),
+    }
+}
+
+/// `amdkfd_loaded`: an `amdkfd` module in the list, or kfd present on the host.
+///
+/// `modules` is `None` when the module list could not be read; kfd being
+/// present on the host still answers `true` then, and nothing else is known.
+fn amdkfd_state(modules: Option<&[&str]>, kfd_on_host: bool) -> Option<bool> {
+    match modules {
+        Some(modules) => Some(modules.contains(&"amdkfd") || kfd_on_host),
+        None => kfd_on_host.then_some(true),
+    }
+}
+
 fn probe_modules(e: &mut Examination) {
     let (rc, out, _) = run("lsmod", &[], SHORT);
     let module_text = if rc == 0 {
@@ -1794,14 +1840,13 @@ fn probe_modules(e: &mut Examination) {
         let txt = read_host_text("/proc/modules");
         if txt.is_empty() { None } else { Some(txt) }
     };
-    if let Some(text) = module_text {
-        let modules: Vec<&str> = text
-            .lines()
+    let modules: Option<Vec<&str>> = module_text.as_deref().map(|text| {
+        text.lines()
             .filter_map(|line| line.split_whitespace().next())
-            .collect();
-        e.amdgpu_loaded = Some(modules.contains(&"amdgpu"));
-        e.amdkfd_loaded = Some(modules.contains(&"amdkfd"));
-    }
+            .collect()
+    });
+    e.amdgpu_loaded = amdgpu_state(modules.as_deref(), amdgpu_present_on_host());
+    e.amdkfd_loaded = amdkfd_state(modules.as_deref(), kfd_present_on_host());
 
     for dir in ["/etc/modprobe.d", "/usr/lib/modprobe.d", "/run/modprobe.d"] {
         let Ok(entries) = std::fs::read_dir(crate::host_path(dir)) else {
@@ -6095,6 +6140,184 @@ mod tests {
                 e.os_version
             );
         }
+    }
+
+    #[test]
+    fn amdkfd_is_present_when_listed_as_a_module() {
+        assert_eq!(amdkfd_state(Some(&["amdgpu", "amdkfd"]), false), Some(true));
+    }
+
+    /// kfd built into the kernel never appears in the module list.
+    #[test]
+    fn amdkfd_is_present_when_built_in_and_absent_from_the_module_list() {
+        assert_eq!(amdkfd_state(Some(&["amdgpu", "drm"]), true), Some(true));
+        assert_eq!(amdkfd_state(Some(&[]), true), Some(true));
+    }
+
+    #[test]
+    fn amdkfd_is_absent_with_neither_a_module_nor_kfd_on_the_host() {
+        assert_eq!(amdkfd_state(Some(&["amdgpu", "drm"]), false), Some(false));
+        assert_eq!(amdkfd_state(Some(&[]), false), Some(false));
+    }
+
+    /// With no module list, kfd on the host still answers; without it the
+    /// field stays unknown rather than claiming `false`.
+    #[test]
+    fn amdkfd_with_an_unreadable_module_list_follows_the_host() {
+        assert_eq!(amdkfd_state(None, true), Some(true));
+        assert_eq!(amdkfd_state(None, false), None);
+    }
+
+    #[test]
+    fn amdgpu_is_present_when_listed_as_a_module() {
+        assert_eq!(amdgpu_state(Some(&["amdgpu", "drm"]), false), Some(true));
+    }
+
+    /// amdgpu built into the kernel never appears in the module list.
+    #[test]
+    fn amdgpu_is_present_when_built_in_and_absent_from_the_module_list() {
+        assert_eq!(amdgpu_state(Some(&["drm"]), true), Some(true));
+        assert_eq!(amdgpu_state(Some(&[]), true), Some(true));
+    }
+
+    #[test]
+    fn amdgpu_is_absent_with_neither_a_module_nor_sysfs_on_the_host() {
+        assert_eq!(amdgpu_state(Some(&["drm"]), false), Some(false));
+        assert_eq!(amdgpu_state(Some(&[]), false), Some(false));
+    }
+
+    /// With no module list, sysfs on the host still answers; without it the
+    /// field stays unknown rather than claiming `false`.
+    #[test]
+    fn amdgpu_with_an_unreadable_module_list_follows_the_host() {
+        assert_eq!(amdgpu_state(None, true), Some(true));
+        assert_eq!(amdgpu_state(None, false), None);
+    }
+
+    /// The host side of the check, against a planted root.
+    #[cfg(all(feature = "e2e-test-hooks", target_os = "linux"))]
+    #[test]
+    fn amdgpu_present_on_host_reads_sysfs_module_dir() {
+        use crate::hardware_root::TEST_HOST_ROOT_ENV;
+        use crate::test_env::RestoredEnvVar;
+
+        let root = std::env::temp_dir().join(format!(
+            "rocm-core-amdgpu-present-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::create_dir_all(&root).expect("create root");
+        let (neither, planted) = {
+            let _guard = crate::hardware_root::HOST_ROOT_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _root = RestoredEnvVar::set(TEST_HOST_ROOT_ENV, &root);
+            let neither = amdgpu_present_on_host();
+            std::fs::create_dir_all(root.join("sys/module/amdgpu")).expect("plant sysfs");
+            (neither, amdgpu_present_on_host())
+        };
+        std::fs::remove_dir_all(&root).ok();
+        assert!(!neither, "an empty root has no amdgpu");
+        assert!(planted, "/sys/module/amdgpu counts");
+    }
+
+    /// The wiring, not just the helpers: `probe_modules` must consult the host
+    /// root. The `amdgpu` module line cannot be planted away on a machine that
+    /// has one, so this only asserts the positive: with `/sys/module/amdgpu`
+    /// planted the field is `Some(true)` whatever the module list says.
+    #[cfg(all(feature = "e2e-test-hooks", target_os = "linux"))]
+    #[test]
+    fn probe_modules_reports_amdgpu_when_it_is_on_the_host() {
+        use crate::hardware_root::TEST_HOST_ROOT_ENV;
+        use crate::test_env::RestoredEnvVar;
+
+        let root = std::env::temp_dir().join(format!(
+            "rocm-core-probe-amdgpu-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::create_dir_all(root.join("sys/module/amdgpu")).expect("plant sysfs");
+        let amdgpu_loaded = {
+            let _guard = crate::hardware_root::HOST_ROOT_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _root = RestoredEnvVar::set(TEST_HOST_ROOT_ENV, &root);
+            let mut e = Examination::default();
+            probe_modules(&mut e);
+            e.amdgpu_loaded
+        };
+        std::fs::remove_dir_all(&root).ok();
+        assert_eq!(amdgpu_loaded, Some(true));
+    }
+
+    /// The host side of the check, against a planted root: the sysfs class
+    /// device alone, the device node alone, and neither.
+    #[cfg(all(feature = "e2e-test-hooks", target_os = "linux"))]
+    #[test]
+    fn kfd_present_on_host_reads_sysfs_and_the_device_node() {
+        use crate::hardware_root::TEST_HOST_ROOT_ENV;
+        use crate::test_env::RestoredEnvVar;
+
+        let root = std::env::temp_dir().join(format!(
+            "rocm-core-kfd-present-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::create_dir_all(&root).expect("create root");
+        let (neither, sysfs_only, dev_only) = {
+            let _guard = crate::hardware_root::HOST_ROOT_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _root = RestoredEnvVar::set(TEST_HOST_ROOT_ENV, &root);
+            let neither = kfd_present_on_host();
+            std::fs::create_dir_all(root.join("sys/class/kfd/kfd")).expect("plant sysfs");
+            let sysfs_only = kfd_present_on_host();
+            std::fs::remove_dir_all(root.join("sys")).expect("unplant sysfs");
+            std::fs::create_dir_all(root.join("dev")).expect("plant dev");
+            std::fs::write(root.join("dev/kfd"), "").expect("plant /dev/kfd");
+            (neither, sysfs_only, kfd_present_on_host())
+        };
+        std::fs::remove_dir_all(&root).ok();
+        assert!(!neither, "an empty root has no kfd");
+        assert!(sysfs_only, "/sys/class/kfd/kfd alone counts");
+        assert!(dev_only, "/dev/kfd alone counts");
+    }
+
+    /// The wiring, not just the helpers: `probe_modules` must consult the host
+    /// root. On every machine this runs on, no `amdkfd` module line exists, so
+    /// `Some(true)` can only come from the planted `/dev/kfd`.
+    #[cfg(all(feature = "e2e-test-hooks", target_os = "linux"))]
+    #[test]
+    fn probe_modules_reports_amdkfd_when_kfd_is_on_the_host() {
+        use crate::hardware_root::TEST_HOST_ROOT_ENV;
+        use crate::test_env::RestoredEnvVar;
+
+        let root = std::env::temp_dir().join(format!(
+            "rocm-core-probe-kfd-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::create_dir_all(root.join("dev")).expect("plant dev");
+        std::fs::write(root.join("dev/kfd"), "").expect("plant /dev/kfd");
+        let amdkfd_loaded = {
+            let _guard = crate::hardware_root::HOST_ROOT_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _root = RestoredEnvVar::set(TEST_HOST_ROOT_ENV, &root);
+            let mut e = Examination::default();
+            probe_modules(&mut e);
+            e.amdkfd_loaded
+        };
+        std::fs::remove_dir_all(&root).ok();
+        assert_eq!(amdkfd_loaded, Some(true));
     }
 
     /// The probes themselves, not just `host_path`, answer from a simulated
