@@ -862,7 +862,7 @@ fn unreadable_os_release_plan(reason: String, repo_version_expr: String) -> Driv
 /// branch (reached before `_at` is even called), so both report the same
 /// `invalid_driver_version_override` plan on a malformed override rather than
 /// one of them silently falling back to `latest`.
-fn resolve_repo_version_expr() -> Result<String, DriverInstallPlan> {
+fn resolve_repo_version_expr() -> Result<String, Box<DriverInstallPlan>> {
     // Resolved here rather than left as a shell `${VAR:-default}` expression:
     // these commands are built with `printf '%s\n' '...'` (single-quoted) so the
     // written repo file has a working baseurl regardless of shell. The value is
@@ -877,7 +877,7 @@ fn resolve_repo_version_expr() -> Result<String, DriverInstallPlan> {
     match std::env::var("ROCM_CLI_AMDGPU_DRIVER_VERSION") {
         Err(_) => Ok("latest".to_owned()),
         Ok(v) if is_safe_shell_token(&v) => Ok(v),
-        Ok(v) => Err(DriverInstallPlan {
+        Ok(v) => Err(Box::new(DriverInstallPlan {
             supported: false,
             mutating: false,
             policy: "invalid_driver_version_override".to_owned(),
@@ -890,7 +890,7 @@ fn resolve_repo_version_expr() -> Result<String, DriverInstallPlan> {
             commands: Vec::new(),
             checks: vec!["rocm examine".to_owned()],
             reboot_required: false,
-        }),
+        })),
     }
 }
 
@@ -927,7 +927,7 @@ fn build_driver_install_plan_at(
 
     let repo_version_expr = match resolve_repo_version_expr() {
         Ok(v) => v,
-        Err(plan) => return plan,
+        Err(plan) => return *plan,
     };
 
     // An unreadable file is reported as itself, naming the line, rather than
@@ -1138,7 +1138,7 @@ fn build_driver_install_plan_read(
     {
         let repo_version_expr = match resolve_repo_version_expr() {
             Ok(v) => v,
-            Err(plan) => return plan,
+            Err(plan) => return *plan,
         };
         return unreadable_os_release_plan(
             format!(
