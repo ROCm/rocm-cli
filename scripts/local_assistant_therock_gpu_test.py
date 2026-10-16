@@ -68,7 +68,7 @@ def main() -> int:
             print_step(f"Copied ROCm runtime registry from {source_state}.")
 
         localize_huggingface_cache(env, repo_root)
-        return run_live_acceptance(args, rocm, env, temp_state_root)
+        return run_live_acceptance(args, rocm, env)
     finally:
         if temp_state_root is not None and not args.keep_state:
             print_step(f"Removing temporary ROCm CLI state under {temp_state_root}.")
@@ -79,7 +79,6 @@ def run_live_acceptance(
     args: argparse.Namespace,
     rocm: Path,
     env: dict[str, str],
-    temp_state_root: Path | None,
 ) -> int:
     data_dir = rocm_cli_data_dir(env)
     service_id = args.service_id
