@@ -341,3 +341,17 @@ Feature: Model serving
   Scenario: serve-25 - The recommended model list prints ASCII-only text
     When the user lists recommended models
     Then the model list output contains only ASCII characters
+
+  # AIM serve + inference canary (ROCMAI-554). AIM has no model catalog in this
+  # PR's scope (ROCMAI-555) — the model argument IS the raw AIM Docker image
+  # reference, not a short recipe name. `@requires-engine:aim` only skips here
+  # when Docker itself is unreachable (see `HostCapability::engine_available`'s
+  # "aim" arm); a Strix Halo self-hosted runner with Docker is where this
+  # actually runs.
+  @id:serve-aim-inference @requires-gpu @requires-engine:aim
+  Scenario: serve-26 - A model served on AIM responds to inference requests
+    Given a managed runtime is active
+    And a model is being served on aim
+    When the user sends a chat completion request
+    Then the response contains a model reply
+    And the response identifies the correct model

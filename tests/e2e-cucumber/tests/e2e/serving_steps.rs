@@ -633,6 +633,30 @@ async fn setup_lemonade_hf_checkpoint_model(world: &mut E2eWorld) {
     .await;
 }
 
+#[given("a model is being served on aim")]
+async fn setup_aim_model(world: &mut E2eWorld) {
+    // AIM has no model catalog in this PR's scope (ROCMAI-555): the model
+    // argument IS the raw AIM Docker image reference, not a short recipe name
+    // like the vLLM/Lemonade scenarios above. This is the smallest model image
+    // the ROCMAI-553 registry spike found — `instinct`/`gpu`, and its
+    // `PYTORCH_ROCM_ARCH` lists `gfx1151` (Strix Halo, the only runner this
+    // scenario actually executes on).
+    let image = "amdenterpriseai/aim-meta-llama-llama-3-2-1b-instruct:0.11.1";
+    // The container bundles vLLM, which is expected to echo the model's baked-in
+    // HF id (not the Docker image reference) as `model` — mirroring
+    // `engine_registry.rs`'s identical "presumed, unconfirmed until Strix Halo
+    // validation pass" note. Confirm this id against the real container during
+    // that pass and adjust if it reports something else.
+    let model = "meta-llama/Llama-3.2-1B-Instruct";
+    serve_and_wait(
+        world,
+        &["serve", image, "--engine", "aim", "--managed"],
+        model,
+        "Llama-3.2-1B",
+    )
+    .await;
+}
+
 #[given("a large model is being served on GPU")]
 async fn setup_large_gpu_model(world: &mut E2eWorld) {
     // Large-model nightly coverage follows the host's serving path. vLLM hosts
