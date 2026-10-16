@@ -78,12 +78,16 @@ pub(crate) fn shell_quote(value: &str) -> String {
 /// and C1 (so ESC and the 8-bit CSI alike), plus the Unicode format characters:
 /// a bidi override such as U+202E reorders how the rest of the line is drawn,
 /// and a zero-width character hides a difference between what is shown and
-/// what runs. U+2028/U+2029 are added because a terminal may start a new row
-/// at either, which would let a value forge a line of its own.
+/// what runs. U+2028/U+2029 are added, through
+/// [`rocm_core::terminal::is_control_or_line_separator`], because a terminal
+/// may start a new row at either, which would let a value forge a line of its
+/// own. That is the predicate the terminal classifier and the vLLM symptom
+/// guard share for the same reason, so the set of line-breaking characters is
+/// decided in one place.
 pub(crate) fn has_terminal_control_character(value: &str) -> bool {
     value.chars().any(|character| {
         rocm_core::terminal::is_control_or_format(character)
-            || matches!(character, '\u{2028}' | '\u{2029}')
+            || rocm_core::terminal::is_control_or_line_separator(character)
     })
 }
 
