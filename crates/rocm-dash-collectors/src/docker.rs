@@ -141,7 +141,7 @@ impl ServiceDiscovery for DockerDiscovery {
 
     fn discover(&self) -> Result<Vec<DiscoveredService>> {
         Err(CollectorError::Unsupported(
-            "DockerDiscovery is async — call discover_async() from a tokio runtime".into(),
+            "DockerDiscovery is async - call discover_async() from a tokio runtime".into(),
         ))
     }
 }

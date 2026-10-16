@@ -642,6 +642,28 @@ fn parse_windows_display_name(text: &str) -> Option<String> {
         })
 }
 
+/// The gfx target for a Windows PNP device id such as
+/// `PCI\VEN_1002&DEV_1636&SUBSYS_...`, or `None` when the id is not an AMD
+/// device or its PCI device id is not in the table.
+///
+/// The pair of private helpers this wraps is what `host_gpu`'s own Windows
+/// display probe already uses. It is public so `examine`'s Windows GPU probe
+/// can answer from the same table rather than from marketing-name matching
+/// alone: `Win32_VideoController` hands that probe the PNP id in the same
+/// query that gives it the name, and without this it dropped the id on the
+/// floor and left `gfx_target` empty for every part the name table does not
+/// cover -- which is every Vega iGPU, so a Renoir/Cezanne laptop reported no
+/// architecture at all unless a HIP SDK was installed to ask `hipInfo`.
+///
+/// Returns the first match only. Which GPU of several a caller is asking about
+/// is the caller's question; this answers for one device id.
+#[must_use]
+pub fn gfx_target_from_pnp_device_id(pnp_id: &str) -> Option<&'static str> {
+    amd_pci_device_id_from_pnp_id(pnp_id)
+        .as_deref()
+        .and_then(gfx_target_from_amd_pci_device_id)
+}
+
 fn amd_pci_device_id_from_pnp_id(pnp_id: &str) -> Option<String> {
     let upper = pnp_id.to_ascii_uppercase();
     if !upper.contains("VEN_1002") {
@@ -3639,6 +3661,44 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    /// The public wrapper `examine`'s Windows GPU probe reads, over the four
+    /// Vega iGPU device ids that matter to `info-20-gpu-no-rocm-support`.
+    ///
+    /// This is the only source of a gfx target for those parts on a Windows
+    /// host with no HIP SDK: `classify_amd_marketing_name` has no Vega arm, and
+    /// `hipInfo` is in the SDK that is not installed. Without it the ticket's
+    /// 4700U laptop reported an empty target, and the check that exists for it
+    /// could not fire on the machine it was written for.
+    #[test]
+    fn the_pnp_wrapper_answers_for_the_vega_igpus_with_no_rocm_build() {
+        for (pnp, expected) in [
+            ("PCI\\VEN_1002&DEV_1636&SUBSYS_08A71028&REV_C1", "gfx90c"),
+            ("PCI\\VEN_1002&DEV_164C&SUBSYS_380D103C&REV_C1", "gfx90c"),
+            ("PCI\\VEN_1002&DEV_1638&SUBSYS_0A2E1025&REV_C1", "gfx90c"),
+            ("PCI\\VEN_1002&DEV_15E7&SUBSYS_8A431043&REV_C1", "gfx90c"),
+            // A supported part through the same door, so this is not read as
+            // "the wrapper returns gfx90c".
+            ("PCI\\VEN_1002&DEV_7550&SUBSYS_2435148C", "gfx1201"),
+        ] {
+            assert_eq!(gfx_target_from_pnp_device_id(pnp), Some(expected), "{pnp}");
+            assert_eq!(
+                gfx_target_has_no_rocm_build(expected),
+                expected == "gfx90c",
+                "{pnp}: and the unsupported predicate has to agree about it"
+            );
+        }
+        assert_eq!(
+            gfx_target_from_pnp_device_id("PCI\\VEN_10DE&DEV_2504"),
+            None,
+            "an NVIDIA device id is not an AMD gfx target"
+        );
+        assert_eq!(
+            gfx_target_from_pnp_device_id("PCI\\VEN_1002&DEV_FFFF"),
+            None,
+            "an AMD device id the table does not carry is unknown, not guessed"
+        );
     }
 
     #[test]

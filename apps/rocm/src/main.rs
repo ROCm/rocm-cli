@@ -167,8 +167,8 @@ struct Cli {
 enum Command {
     /// Check this computer's GPU, ROCm install, engines, and setup folders.
     ///
-    /// A GPU that is recognized but has no ROCm build at all — `gfx90c`, the
-    /// Vega iGPU in Renoir, Lucienne, Cezanne and Barcelo APUs — is reported on
+    /// A GPU that is recognized but has no ROCm build at all - `gfx90c`, the
+    /// Vega iGPU in Renoir, Lucienne, Cezanne and Barcelo APUs - is reported on
     /// a `rocm_support` line saying so, so that an empty
     /// `compatible_therock_family` does not read as a failed probe. Such a GPU
     /// still works through the Vulkan backend.
@@ -192,7 +192,7 @@ enum Command {
     ///
     /// Matches this machine against a fixed catalog of known misconfigurations and
     /// ranks what it finds. It can only recognise failure modes that are in the
-    /// catalog: no match means "not recognised", not "nothing is wrong" — in that
+    /// catalog: no match means "not recognised", not "nothing is wrong" - in that
     /// case it points you at where to report the symptom.
     ///
     /// Each cause is printed with an `id:` and an `apply with:` command. The
@@ -219,7 +219,7 @@ enum Command {
         /// Takes a curated model name or alias (see `rocm model`). Nothing is
         /// fetched: the answer comes from the recipe and this host's GPU. A
         /// model the catalog does not carry is reported as undetermined rather
-        /// than blocked — `rocm serve` still accepts it, this just cannot say
+        /// than blocked - `rocm serve` still accepts it, this just cannot say
         /// in advance whether it fits.
         ///
         /// A flag rather than a positional: `diagnose` takes no positional
@@ -253,7 +253,7 @@ enum Command {
     },
     /// Apply a known fix by id (see `rocm diagnose`); run with no id to list fixes.
     ///
-    /// Takes the `id:` that `rocm diagnose` reports against a cause — not the
+    /// Takes the `id:` that `rocm diagnose` reports against a cause - not the
     /// `#1`/`#2` ranking position, which belongs to one report and is not a name.
     /// With no id it lists the whole catalog.
     ///
@@ -261,9 +261,10 @@ enum Command {
     /// you: AUTO means this command carries the change out; NEEDS-ARG means it
     /// will, once told what to act on; PRINT-ONLY means it prints the steps for
     /// you to run yourself (typically because they need sudo or a reboot); and
-    /// DIAGNOSE-ONLY means no reliable fix exists and nothing will be changed
-    /// (no catalog entry carries this marker today; it is reserved for a
-    /// future detect-but-cannot-repair failure).
+    /// DIAGNOSE-ONLY means no reliable fix exists, so running it names the
+    /// problem and changes nothing (`info-20-gpu-no-rocm-support` is the entry
+    /// marked that way today: a GPU ROCm has no runtime build for is a fact
+    /// about the hardware, not something to put right).
     /// Use `--dry-run` to see any fix's plan without changing anything.
     Fix {
         /// Fix id, e.g. fix-4-render-group. Omit to list available fixes.
@@ -518,7 +519,7 @@ rocm serve qwen --verbose --device gpu_required")]
         ///
         /// Loopback serving is credential-free because only this machine can
         /// reach it. That stops being true when something else republishes the
-        /// port — a tailnet publish, a reverse proxy, a container port map — at
+        /// port - a tailnet publish, a reverse proxy, a container port map - at
         /// which point the bind address no longer describes who can call it.
         /// Pass this to keep the endpoint authenticated anyway. `rocm remote`
         /// sets it on every session it starts.
@@ -683,7 +684,7 @@ rocm logs --search error timeout")]
 #[derive(Subcommand, Debug)]
 enum BenchCommand {
     /// Run a concurrency sweep (RAW serving throughput, synthetic single-shot
-    /// requests — not agent-shaped, not comparable to *-agent-bench harnesses).
+    /// requests - not agent-shaped, not comparable to *-agent-bench harnesses).
     ///
     /// Measures RAW serving throughput (synthetic single-shot requests, vLLM
     /// benchmark_serving shape). It does NOT reproduce agent-shaped, multi-turn,
@@ -749,8 +750,8 @@ rocm install sdk --devel")]
         /// TheRock GPU package family to install, such as gfx110X-all.
         ///
         /// A GPU target ROCm publishes no build for is refused rather than
-        /// mapped to a near neighbour: `--family gfx90c` — the Vega iGPU in
-        /// Renoir, Lucienne, Cezanne and Barcelo APUs — fails and installs
+        /// mapped to a near neighbour: `--family gfx90c` - the Vega iGPU in
+        /// Renoir, Lucienne, Cezanne and Barcelo APUs - fails and installs
         /// nothing, instead of substituting another family. A plain `rocm
         /// install sdk` reports the same refusal when it detects such a GPU.
         #[arg(long)]
@@ -773,7 +774,7 @@ rocm install sdk --devel")]
         /// Approve replacing the current active default ROCm runtime (and
         /// required system-package installs such as OpenMPI for vLLM) without
         /// prompting; required outside an interactive terminal whenever a
-        /// managed runtime is already the active default — including when this
+        /// managed runtime is already the active default - including when this
         /// install targets a different GPU family or channel, which takes over
         /// the active default just the same. An install with no active default
         /// runtime never prompts.
@@ -869,7 +870,7 @@ enum RuntimesCommand {
     },
     /// Switch back to the previously selected ROCm runtime.
     #[command(
-        after_help = "NOTE: rollback has no history — it remembers only the runtime you just \
+        after_help = "NOTE: rollback has no history - it remembers only the runtime you just \
 left, so it cannot undo more than one activation."
     )]
     Rollback {
@@ -1097,8 +1098,8 @@ enum ServicesCommand {
     Prune {
         /// Only remove records and files untouched for at least this many hours.
         ///
-        /// Age is measured from when the record file was last written — a stop,
-        /// a restart, or a status correction all count as touching it — so a
+        /// Age is measured from when the record file was last written - a stop,
+        /// a restart, or a status correction all count as touching it - so a
         /// server that has only just stopped keeps its log and stays
         /// restartable. Pass 0 to include everything that is not running.
         #[arg(long, default_value_t = DEFAULT_SERVICE_PRUNE_MIN_AGE_HOURS)]
@@ -1242,7 +1243,7 @@ enum FrameworkArg {
     /// Probe llama.cpp only.
     #[value(name = "llama-cpp", alias = "llamacpp")]
     LlamaCpp,
-    /// Probe no framework at all — fastest, and enough for GPU and driver questions.
+    /// Probe no framework at all - fastest, and enough for GPU and driver questions.
     Skip,
 }
 
@@ -1813,7 +1814,7 @@ fn render_setup_status_text(paths: &AppPaths, config: &RocmCliConfig) -> Result<
     } else if config.onboarding_dismissed {
         "setup dismissed"
     } else {
-        "first-time setup available — open manually via `rocm dash`'s Observe tab with `n`"
+        "first-time setup available - open manually via `rocm dash`'s Observe tab with `n`"
     };
 
     let mut output = String::new();
@@ -1847,7 +1848,7 @@ fn reset_setup_prompt_state(paths: &AppPaths, config: &mut RocmCliConfig) -> Res
     config.setup.completed = false;
     config.save(paths)?;
     Ok([
-        "Onboarding will not reopen automatically — open it from `rocm dash`'s Observe tab with `n`.",
+        "Onboarding will not reopen automatically - open it from `rocm dash`'s Observe tab with `n`.",
         "ROCm installs were not deleted.",
         "Installed ROCm folders, API keys, and provider settings were kept.",
         "",
@@ -4399,7 +4400,7 @@ fn build_service_prune_plan(
         if managed_service_record_is_in_use(&record) {
             plan.skipped_live += 1;
             plan.skipped.push(format!(
-                "{} is {} — stop it first with `{}`",
+                "{} is {} - stop it first with `{}`",
                 record.service_id,
                 record.status,
                 service_hints::service_stop_hint(&record.service_id)
@@ -8934,6 +8935,22 @@ fn append_examine_engine_inventory(
     }
 }
 
+/// The per-hardware-group heading in `rocm model`, carrying the "this is the
+/// box you are on" marker when the group matches the detected host GPU.
+///
+/// Split out of [`render_model_registry_text_with_context_and_host`] only so
+/// the marked branch is reachable from a test. Taking it in situ needs a host
+/// whose real gfx target matches a catalog platform, which the default no-GPU
+/// CI lane never provides — leaving the marker (`←` before ROCMAI-543) as the
+/// one ASCII conversion on this surface that nothing guards.
+fn model_catalog_platform_heading(label: &str, your_gpu: bool) -> String {
+    if your_gpu {
+        format!("{label} <- your GPU")
+    } else {
+        label.to_owned()
+    }
+}
+
 #[allow(dead_code)]
 pub(crate) fn render_model_registry_text_with_context_and_host(
     _paths: Option<&AppPaths>,
@@ -8980,11 +8997,7 @@ pub(crate) fn render_model_registry_text_with_context_and_host(
         let your_gpu = host_gfx_family
             .as_deref()
             .is_some_and(|family| platform_matches_gfx_family(platform, family));
-        let heading = if your_gpu {
-            format!("{} \u{2190} your GPU", platform.label)
-        } else {
-            platform.label.clone()
-        };
+        let heading = model_catalog_platform_heading(&platform.label, your_gpu);
         let _ = writeln!(output, "\n{heading}");
         for recipe in group {
             // Show the canonical Hugging Face id (the reliable serve target) and
@@ -9009,7 +9022,7 @@ pub(crate) fn render_model_registry_text_with_context_and_host(
     if matches!(registry.source, ModelRecipeRegistrySource::BuiltIn) {
         let _ = writeln!(
             output,
-            "\nThese are recommendations — you can serve any compatible Hugging Face model:\n  \
+            "\nThese are recommendations - you can serve any compatible Hugging Face model:\n  \
              rocm serve <owner/repo>          # vLLM, e.g. Qwen/Qwen3.6-27B\n  \
              rocm serve <owner/repo>:<quant>  # Lemonade GGUF, e.g. unsloth/Qwen3.6-35B-A3B-GGUF:Q4_K_M\n\
              \nUse `rocm model --verbose` for details."
@@ -9119,11 +9132,11 @@ pub(crate) fn render_model_registry_verbose_text_with_context_and_host(
 fn model_catalog_header(registry: &ModelRecipeRegistry) -> String {
     match &registry.source {
         ModelRecipeRegistrySource::BuiltIn => {
-            "Recommended models — run one with `rocm serve <model>`".to_owned()
+            "Recommended models - run one with `rocm serve <model>`".to_owned()
         }
         ModelRecipeRegistrySource::SignedIndex { index_path, .. } => {
             format!(
-                "Recommended models — from recipe index {}",
+                "Recommended models - from recipe index {}",
                 index_path.display()
             )
         }
@@ -11342,7 +11355,7 @@ fn apply_runtime_update(
 /// `append_update_activate_summary`, and `render_sdk_install_success` for the
 /// call sites.
 const ROLLBACK_RECOVERY_HINT: &str = "  next step: if this causes problems, run `rocm runtimes rollback` \
-(no history — undoes only this one activation)";
+(no history - undoes only this one activation)";
 
 /// Appends the `--activate` branch of the `update --apply` summary. The
 /// rollback hint is only shown when a previous runtime was actually recorded —
@@ -13207,7 +13220,7 @@ fn build_uninstall_plan(paths: &AppPaths, options: &UninstallOptions) -> Result<
         plan.warnings.push(format!(
             "{} remote session record(s) exist under {}; their models keep running on the \
              remote machines and their endpoints stay published. Removing these records only \
-             loses track of them — run `rocm remote stop <session>` for each first: {}",
+             loses track of them - run `rocm remote stop <session>` for each first: {}",
             remote_sessions.len(),
             paths.remote_sessions_dir().display(),
             remote_sessions
@@ -21765,6 +21778,16 @@ install therock";
             "the skip reason must name the stop command:\n{}",
             outcome.text
         );
+        // ROCMAI-543: the skip line is built by `build_service_prune_plan` as
+        // "<id> is <status> - stop it first with `<cmd>`" and printed verbatim.
+        // Asserting the whole rendered plan rather than that one sentence also
+        // covers the counts, the headings, and any line added to the plan later.
+        assert!(
+            outcome.text.is_ascii(),
+            "`rocm services prune` output must be ASCII-only; non-ASCII punctuation renders \
+             as mojibake on a Windows console using the OEM code page (ROCMAI-543):\n{}",
+            outcome.text
+        );
         Ok(())
     }
 
@@ -22400,6 +22423,70 @@ install therock";
             prune.skipped_live, 1,
             "prune must count it as still running:\n{}",
             prune.text
+        );
+        Ok(())
+    }
+
+    /// `rocm uninstall`'s review warns that a remote session keeps running on
+    /// someone else's machine, and names the command that stops it properly.
+    ///
+    /// Nothing exercised that warning before: no test planted a remote session
+    /// record, so the whole sentence -- including the ASCII punctuation this
+    /// change put in it (ROCMAI-543) -- shipped uncovered. The remediation is
+    /// asserted alongside the encoding because a warning that stops naming
+    /// `rocm remote stop` leaves the user with no way to act on it.
+    #[test]
+    fn uninstall_warns_about_remote_sessions_in_ascii_and_names_the_stop_command() -> Result<()> {
+        let (root, paths) = test_paths("uninstall-remote-session-warning");
+        paths.ensure()?;
+        let session = crate::remote::session::RemoteSessionRecord {
+            session_id: crate::remote::session::RemoteSessionRecord::id_for("dev-box", 8000),
+            target: "dev-box".to_owned(),
+            peer_host: "dev-box".to_owned(),
+            ssh_port: None,
+            model: "qwen".to_owned(),
+            remote_service_id: "svc-remote".to_owned(),
+            remote_cli: "rocm".to_owned(),
+            remote_port: 8000,
+            tailnet_port: 8000,
+            base_url: "http://dev-box:8000/v1".to_owned(),
+            created_at_unix_ms: 1,
+        };
+        session.write(&paths)?;
+
+        // `keep_binaries` so the plan never reaches outside the sandbox: the
+        // binary paths are the host's real ones and have nothing to do with
+        // this warning.
+        let options = UninstallOptions {
+            dry_run: true,
+            keep_binaries: true,
+            ..UninstallOptions::default()
+        };
+        let plan = build_uninstall_plan(&paths, &options);
+        let _ = fs::remove_dir_all(&root);
+        let plan = plan?;
+
+        let warning = plan
+            .warnings
+            .iter()
+            .find(|warning| warning.contains("remote session record(s)"))
+            .unwrap_or_else(|| {
+                panic!("a planted remote session must be warned about: {plan:#?}");
+            });
+        assert!(
+            warning.contains(&session.session_id),
+            "the warning must name the session it found: {warning}"
+        );
+        assert!(
+            warning.contains("rocm remote stop <session>"),
+            "the warning must name the command that stops the remote model: {warning}"
+        );
+        // ROCMAI-543: printed verbatim by `render_uninstall_plan`, so non-ASCII
+        // punctuation here renders as mojibake like "ΓÇö" on a Windows console
+        // using the OEM code page.
+        assert!(
+            warning.is_ascii(),
+            "the remote-session warning must be ASCII-only (ROCMAI-543): {warning}"
         );
         Ok(())
     }
@@ -23145,6 +23232,15 @@ install therock";
         assert!(rendered.contains("Onboarding will not reopen automatically"));
         assert!(rendered.contains("ROCm installs were not deleted"));
         assert!(rendered.contains("API keys"));
+        // ROCMAI-543: the assertions above stop before the ` - open it from
+        // `rocm dash`'s Observe tab` clause, so they stay green with the em
+        // dash put back. This covers the whole block that `rocm setup --reset`
+        // prints, including any line added to it later.
+        assert!(
+            rendered.is_ascii(),
+            "the setup-reset prompt must be ASCII-only; non-ASCII punctuation renders as \
+             mojibake on a Windows console using the OEM code page (ROCMAI-543): {rendered}"
+        );
         assert!(!rendered.contains("request plan"));
         assert!(!rendered.contains("planner:"));
         assert!(!rendered.contains("tool_schema"));
@@ -23216,7 +23312,7 @@ install therock";
         // See the pointer comment in
         // `setup_reset_cli_output_is_plain_and_persists_first_time_prompt`
         // above: this only guards the string, not the underlying behavior.
-        assert!(rendered.contains("status: first-time setup available — open manually"));
+        assert!(rendered.contains("status: first-time setup available - open manually"));
         assert!(rendered.contains("active_runtime_status: <unset>"));
         Ok(())
     }
@@ -25734,15 +25830,94 @@ install therock";
     }
 
     #[test]
+    fn model_catalog_platform_heading_marks_the_host_gpu_in_ascii() {
+        assert_eq!(
+            model_catalog_platform_heading("AMD Instinct - MI300X", false),
+            "AMD Instinct - MI300X",
+            "an unmatched platform heading is the bare label"
+        );
+
+        // ROCMAI-543: this marker was `←` (U+2190), which a Windows console on
+        // the OEM code page renders as mojibake. `render_model_registry_text_*`
+        // only reaches this branch on a host whose real gfx target matches a
+        // catalog platform, so the default no-GPU CI lane never covers it.
+        // Asserting the exact string (not `contains`) is what makes a revert of
+        // the punctuation alone fail, which a substring check would not.
+        let marked = model_catalog_platform_heading("AMD Instinct - MI300X", true);
+        assert_eq!(marked, "AMD Instinct - MI300X <- your GPU");
+        assert!(
+            marked.is_ascii(),
+            "the host-GPU marker must be ASCII (ROCMAI-543): {marked}"
+        );
+    }
+
+    /// ROCMAI-543: the clap doc comments are the largest single surface of
+    /// user-facing text this fix rewrote, and nothing exercised them — no test
+    /// renders `--help` at all. Walking the whole command tree, rather than
+    /// only the top-level `--help`, is what makes this cover the edits that
+    /// were actually made: every one of them sits on a nested subcommand's
+    /// field or variant (`rocm runtime install --family`, `rocm services
+    /// prune --older-than-hours`, `rocm runtime rollback`'s `after_help`,
+    /// ...), none of which the top-level help renders. Asserting on the
+    /// rendered help rather than on individual strings means a future option
+    /// added anywhere in the tree is covered the day it lands.
+    #[test]
+    fn every_help_text_in_the_command_tree_is_ascii() {
+        fn assert_ascii_help(cmd: &mut clap::Command, path: &str) {
+            // Both renderings: `-h` and `--help` draw from different fields
+            // (`about` vs `long_about`, and clap truncates the short form at
+            // the first paragraph), so a non-ASCII character in a later
+            // paragraph is only visible in the long form.
+            for rendered in [cmd.render_help(), cmd.render_long_help()] {
+                let rendered = rendered.to_string();
+                assert!(
+                    rendered.is_ascii(),
+                    "`{path} --help` must be ASCII-only; non-ASCII punctuation renders as \
+                     mojibake on a Windows console using the OEM code page (ROCMAI-543): \
+                     {rendered}"
+                );
+            }
+            // Collect first: `find_subcommand_mut` needs a mutable borrow that
+            // cannot overlap the iterator borrowing `cmd`.
+            let names: Vec<String> = cmd
+                .get_subcommands()
+                .map(|sub| sub.get_name().to_owned())
+                .collect();
+            for name in names {
+                let child_path = format!("{path} {name}");
+                let child = cmd
+                    .find_subcommand_mut(&name)
+                    .expect("subcommand name was just enumerated from this command");
+                assert_ascii_help(child, &child_path);
+            }
+        }
+
+        assert_ascii_help(&mut Cli::command(), "rocm");
+    }
+
+    #[test]
     fn render_model_registry_text_lists_builtin_recipes() {
         let rendered = render_model_registry_text_with_context_and_host(None, None, None);
 
+        // ROCMAI-543: a Windows console on the OEM code page (437) renders a
+        // UTF-8 em dash (and other non-ASCII punctuation) as mojibake like
+        // "ΓÇö" instead of transliterating it, so user-facing CLI output must
+        // stick to ASCII. `is_ascii()` is strictly stronger than a single
+        // em-dash check: it also catches smart quotes, ellipses, and arrows
+        // reintroduced anywhere in this output (a new catalog label, a new
+        // hint line, a "your GPU" heading), not just U+2014.
+        assert!(
+            rendered.is_ascii(),
+            "rocm model output must be ASCII-only; non-ASCII punctuation renders as \
+             mojibake on a Windows console using the OEM code page (ROCMAI-543): {rendered}"
+        );
+
         // Clean header: what the list is + the one action, no implementation jargon.
-        assert!(rendered.contains("Recommended models — run one with `rocm serve <model>`"));
+        assert!(rendered.contains("Recommended models - run one with `rocm serve <model>`"));
         // Featured current models are grouped under their hardware target, each
         // with the quant that fits a single GPU.
-        assert!(rendered.contains("AMD Ryzen AI — Strix Halo (Lemonade / llama.cpp)"));
-        assert!(rendered.contains("AMD Instinct — MI300X, MI350X, MI355X (vLLM)"));
+        assert!(rendered.contains("AMD Ryzen AI - Strix Halo (Lemonade / llama.cpp)"));
+        assert!(rendered.contains("AMD Instinct - MI300X, MI350X, MI355X (vLLM)"));
         // Strix Halo GGUF entries carry the servable owner/repo:variant ref.
         assert!(rendered.contains("unsloth/Qwen3.6-35B-A3B-GGUF:Q4_K_M"));
         assert!(rendered.contains("Q4_K_M GGUF"));
@@ -25788,7 +25963,7 @@ install therock";
         let header = model_catalog_header(&builtin);
         assert_eq!(
             header,
-            "Recommended models — run one with `rocm serve <model>`"
+            "Recommended models - run one with `rocm serve <model>`"
         );
         assert!(!header.contains("built-in"));
         assert!(!header.contains("fallback"));
@@ -25805,8 +25980,12 @@ install therock";
         };
         assert_eq!(
             model_catalog_header(&configured),
-            "Recommended models — from recipe index /etc/rocm/recipes.json"
+            "Recommended models - from recipe index /etc/rocm/recipes.json"
         );
+        // ROCMAI-543: both header variants are printed verbatim, so neither may
+        // carry non-ASCII punctuation that mojibakes on a Windows OEM code page.
+        assert!(model_catalog_header(&builtin).is_ascii());
+        assert!(model_catalog_header(&configured).is_ascii());
     }
 
     #[test]
@@ -25830,9 +26009,16 @@ install therock";
         assert!(rendered.contains("source: built-in recipe registry"));
         // Verbose keeps every recipe (including hidden ones) and annotates each
         // with its curated catalog placement.
-        assert!(rendered.contains("catalog: AMD Instinct — MI300X, MI350X, MI355X (vLLM)"));
+        assert!(rendered.contains("catalog: AMD Instinct - MI300X, MI350X, MI355X (vLLM)"));
         assert!(rendered.contains("catalog: hidden (resolvable via rocm serve"));
         assert!(rendered.contains("sshleifer/tiny-gpt2"));
+        // ROCMAI-543: `rocm model --verbose` output must stick to ASCII too, not
+        // only the default non-verbose listing.
+        assert!(
+            rendered.is_ascii(),
+            "rocm model --verbose output must be ASCII-only; non-ASCII punctuation renders \
+             as mojibake on a Windows console using the OEM code page (ROCMAI-543): {rendered}"
+        );
     }
 
     #[test]

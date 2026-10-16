@@ -594,3 +594,25 @@ Feature: Diagnosing failures and listing fixes
     Given a Windows host with a HIP SDK install and no way to resolve PowerShell
     When the user asks the CLI to apply the approved fix
     Then the CLI aborts the PATH fix with exit code 4 and changes nothing
+
+  # The ticket's host: a laptop whose only AMD GPU is a Vega iGPU ROCm has never
+  # shipped a runtime build for. The point of the whole change is what such a
+  # machine is told, and before it the top-ranked answer was "install the HIP
+  # SDK" -- a download that would not have helped, on a host whose default
+  # engine does not use HIP at all.
+  #
+  # The host is simulated rather than required: a KFD node planted under the
+  # scenario's own root reports gfx_target_version 90012 (gfx90c), and a
+  # stand-in `lspci` lists an empty bus so the runner's real cards are not
+  # described. The same mechanism `examine-23` uses, so this runs on every Linux
+  # lane, GPU or not -- WSL2 included, since `@requires-os:linux` matches a host
+  # whose `os_family` is `linux` and WSL2's is. Every `rocm` call in the scenario
+  # therefore has to carry the planted host root, or the WSL2 lane answers about
+  # itself instead of about the simulated machine.
+  @id:diagnose-unsupported-gpu-is-explained-not-fixed @requires-os:linux
+  Scenario: diagnose-40 - A GPU with no ROCm build is explained, and nothing is offered to install
+    Given a machine whose only GPU is one ROCm has no build for
+    When the user asks the CLI to diagnose that machine's state
+    Then the diagnosis names the architecture and says Vulkan still works
+    And that cause offers no fix to apply, and says so
+    And no cause tells this user to install the HIP SDK
