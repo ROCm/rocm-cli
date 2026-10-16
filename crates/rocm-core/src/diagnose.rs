@@ -15,7 +15,7 @@
 //! data; the per-check logic mirrors `diagnose.py` field-for-field so the two
 //! stay behaviorally identical.
 
-use crate::examine::{Examination, WslFacts};
+use crate::examine::{Examination, Gpu, WslFacts};
 #[cfg(test)]
 use crate::rocm_install::discover_rocm_installs_in;
 use regex::Regex;
@@ -622,6 +622,32 @@ fn amd_gfx_targets(e: &Examination) -> Vec<String> {
         .collect()
 }
 
+/// `(judged, excluded)` targets for the framework arch checks: the discrete
+/// GPUs when the host also has an integrated one — serving uses the card, and
+/// fix-9 tells the user to hide the iGPU — otherwise every AMD GPU.
+fn serving_gfx_targets(e: &Examination) -> (Vec<String>, Vec<String>) {
+    let all = amd_gfx_targets(e);
+    if !(e.has_apu && e.has_discrete_amd) {
+        return (all, Vec::new());
+    }
+    let (discrete, integrated): (Vec<_>, Vec<_>) = e
+        .gpus
+        .iter()
+        .filter(|g| g.is_amd && !g.gfx_target.is_empty())
+        .partition(|g| g.is_apu == Some(false));
+    let targets = |gpus: Vec<&Gpu>| -> Vec<String> {
+        gpus.into_iter().map(|g| g.gfx_target.clone()).collect()
+    };
+    let discrete = targets(discrete);
+    // If no discrete GPU carries a target (e.g. Windows hipInfo fills only the
+    // first GPU, or detection fell through), judging nothing would silently
+    // disable the arch checks. Fall back to every target rather than go quiet.
+    if discrete.is_empty() {
+        return (all, Vec::new());
+    }
+    (discrete, targets(integrated))
+}
+
 fn amd_gpu_count(e: &Examination) -> usize {
     e.gpus.iter().filter(|g| g.is_amd).count()
 }
@@ -663,8 +689,13 @@ fn check_1_arch_not_in_wheel(e: &Examination, symptom: &str) -> Diagnosis {
     evidence.extend(kw_ev);
 
     let framework_arch = &e.framework_arch_list;
-    let gfx_targets = amd_gfx_targets(e);
+    let (gfx_targets, integrated) = serving_gfx_targets(e);
     if !framework_arch.is_empty() && !gfx_targets.is_empty() {
+        if !integrated.is_empty() {
+            evidence.push(format!(
+                "integrated GPU target(s) {integrated:?} not judged: this host also has a discrete GPU, which is what serving uses"
+            ));
+        }
         let missing: Vec<String> = gfx_targets
             .iter()
             .filter(|t| !framework_arch.contains(t))
@@ -768,14 +799,14 @@ fn check_2_hsa_override_unneeded(e: &Examination, symptom: &str) -> Diagnosis {
     }
 
     let framework_arch = &e.framework_arch_list;
-    let gfx_targets = amd_gfx_targets(e);
+    let (gfx_targets, _) = serving_gfx_targets(e);
     if !framework_arch.is_empty()
         && !gfx_targets.is_empty()
         && gfx_targets.iter().all(|t| framework_arch.contains(t))
     {
         score += 25;
         evidence.push(format!(
-            "every detected GPU target ({gfx_targets:?}) is in the framework arch list ({framework_arch:?}); the override is hiding the native gfx."
+            "every GPU target serving uses ({gfx_targets:?}) is in the framework arch list ({framework_arch:?}); the override is hiding the native gfx."
         ));
     }
 
@@ -3869,6 +3900,125 @@ mod tests {
         assert_eq!(top.id, "fix-1-arch");
         // 50 (keyword) + 55 (missing arch), clamped to 100.
         assert_eq!(top.score, 100);
+    }
+
+    /// The upstream PyTorch ROCm wheel list: covers the RDNA3 cards and none
+    /// of the desktop iGPUs.
+    fn upstream_wheel_arch_list() -> Vec<String> {
+        [
+            "gfx900", "gfx906", "gfx908", "gfx90a", "gfx942", "gfx1030", "gfx1100", "gfx1101",
+            "gfx1102",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+    }
+
+    /// A Ryzen 7000 desktop: Raphael iGPU (gfx1036) beside an RX 7900 XT
+    /// (gfx1100), both targets filled, as `examine` reports since #434.
+    fn raphael_plus_navi31() -> Examination {
+        let mut e = linux_base();
+        e.framework = "pytorch".to_owned();
+        e.framework_arch_list = upstream_wheel_arch_list();
+        e.gpus = vec![
+            Gpu {
+                gfx_target: "gfx1100".to_owned(),
+                is_amd: true,
+                is_apu: Some(false),
+                ..Gpu::default()
+            },
+            Gpu {
+                gfx_target: "gfx1036".to_owned(),
+                is_amd: true,
+                is_apu: Some(true),
+                ..Gpu::default()
+            },
+        ];
+        e.has_apu = true;
+        e.has_discrete_amd = true;
+        e
+    }
+
+    #[test]
+    fn arch_check_judges_the_discrete_gpu_when_an_igpu_is_beside_it() {
+        // #434 fills the iGPU's target, so judging it against a wheel that covers
+        // the card the user serves on would send them to reinstall torch for
+        // nothing.
+        let e = raphael_plus_navi31();
+        let d = check_1_arch_not_in_wheel(&e, "");
+        assert_eq!(d.score, 0, "{:?}", d.evidence);
+        let d = check_1_arch_not_in_wheel(&e, "HSA_STATUS_ERROR_INVALID_ISA");
+        assert!(d.score < 50, "iGPU must not add +55: {:?}", d.evidence);
+        assert!(
+            d.evidence
+                .iter()
+                .any(|l| l.contains("gfx1036") && l.contains("not judged")),
+            "the excluded iGPU must be named: {:?}",
+            d.evidence
+        );
+    }
+
+    #[test]
+    fn arch_check_still_fires_when_the_discrete_gpu_is_the_missing_one() {
+        let mut e = raphael_plus_navi31();
+        e.gpus[0].gfx_target = "gfx1201".to_owned();
+        let d = check_1_arch_not_in_wheel(&e, "");
+        assert_eq!(d.score, 55, "{:?}", d.evidence);
+        assert!(d.evidence.iter().any(|l| l.contains("[\"gfx1201\"]")));
+    }
+
+    #[test]
+    fn override_check_counts_the_discrete_gpu_as_covered_beside_an_igpu() {
+        let mut e = raphael_plus_navi31();
+        e.env
+            .insert("HSA_OVERRIDE_GFX_VERSION".to_owned(), "11.0.0".to_owned());
+        let d = check_2_hsa_override_unneeded(&e, "");
+        // 30 (set) + 25 (serving target covered); the iGPU must not veto it.
+        assert_eq!(d.score, 55, "{:?}", d.evidence);
+    }
+
+    #[test]
+    fn serving_targets_are_everything_without_a_discrete_gpu() {
+        // Strix Halo: only an APU. Judged on its own target, as before.
+        let mut e = linux_base();
+        e.gpus = vec![Gpu {
+            gfx_target: "gfx1151".to_owned(),
+            is_amd: true,
+            is_apu: Some(true),
+            ..Gpu::default()
+        }];
+        e.has_apu = true;
+        assert_eq!(
+            serving_gfx_targets(&e),
+            (vec!["gfx1151".to_owned()], Vec::new())
+        );
+    }
+
+    #[test]
+    fn serving_targets_fall_back_to_all_when_no_discrete_target_is_known() {
+        // Mixed host, but the discrete GPU has no target yet (Windows hipInfo
+        // fills only the first GPU). Judge every known target instead of none.
+        let mut e = linux_base();
+        e.gpus = vec![
+            Gpu {
+                gfx_target: String::new(),
+                is_amd: true,
+                is_apu: Some(false),
+                ..Gpu::default()
+            },
+            Gpu {
+                gfx_target: "gfx1103".to_owned(),
+                is_amd: true,
+                is_apu: Some(true),
+                ..Gpu::default()
+            },
+        ];
+        e.has_apu = true;
+        e.has_discrete_amd = true;
+        assert_eq!(
+            serving_gfx_targets(&e),
+            (vec!["gfx1103".to_owned()], Vec::new())
+        );
     }
 
     /// The gate the rocm-doctor skill tells an agent to read, and the reason it

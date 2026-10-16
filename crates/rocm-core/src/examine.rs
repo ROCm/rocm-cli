@@ -584,7 +584,30 @@ pub(crate) fn run_with_env(
     envs: &[(String, OsString)],
     timeout: Duration,
 ) -> (i32, String, String) {
-    let (rc, stdout, stderr) = run_raw(program, args, envs, timeout);
+    let (rc, stdout, stderr) = run_raw(program, args, envs, &[], timeout);
+    (
+        rc,
+        String::from_utf8_lossy(&stdout).into_owned(),
+        String::from_utf8_lossy(&stderr).into_owned(),
+    )
+}
+
+/// [`run`] with named environment variables removed from the child's
+/// environment.
+///
+/// `rocminfo` reports the gfx target an `HSA_OVERRIDE_GFX_VERSION` masquerades
+/// as, not the hardware's, so a probe that reads the agent target must run with
+/// that override scrubbed — otherwise a user who set it to make an unlisted
+/// iGPU usable would have the masqueraded target folded into `gpus[]`, and
+/// `diagnose` would read the override's own value back and advise removing the
+/// thing that is working.
+pub(crate) fn run_scrubbing(
+    program: &str,
+    args: &[&str],
+    remove: &[&str],
+    timeout: Duration,
+) -> (i32, String, String) {
+    let (rc, stdout, stderr) = run_raw(program, args, &[], remove, timeout);
     (
         rc,
         String::from_utf8_lossy(&stdout).into_owned(),
@@ -597,11 +620,17 @@ fn run_raw(
     program: &str,
     args: &[&str],
     envs: &[(String, OsString)],
+    remove: &[&str],
     timeout: Duration,
 ) -> (i32, Vec<u8>, Vec<u8>) {
-    let Ok(mut child) = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(args)
-        .envs(envs.iter().map(|(key, value)| (key, value)))
+        .envs(envs.iter().map(|(key, value)| (key, value)));
+    for key in remove {
+        command.env_remove(key);
+    }
+    let Ok(mut child) = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -663,7 +692,7 @@ fn run_raw(
 /// mojibake — no NUL-density or validity test can tell the two apart. The one
 /// reliable fact is which program produced the bytes.
 fn run_utf16le(program: &str, args: &[&str], timeout: Duration) -> (i32, String) {
-    let (rc, stdout, _) = run_raw(program, args, &[], timeout);
+    let (rc, stdout, _) = run_raw(program, args, &[], &[], timeout);
     (rc, decode_utf16le(&stdout))
 }
 
@@ -1216,6 +1245,16 @@ fn classify_amd_marketing_name(name: &str) -> (String, bool) {
 /// pair an APU with a discrete card, so a true verdict here does not mean every
 /// GPU on the host is integrated.
 pub fn gfx_is_apu_family(gfx: &str) -> bool {
+    gfx_apu_family_verdict(gfx) == Some(true)
+}
+
+/// The family table's verdict on a gfx target.
+///
+/// `Some(true)` for a known APU family, `Some(false)` for a known discrete one,
+/// `None` when the table does not cover the target. The `None` case is what
+/// lets a name-based guess stand (see [`apply_family_verdict`]);
+/// [`gfx_is_apu_family`] folds it into `false`.
+fn gfx_apu_family_verdict(gfx: &str) -> Option<bool> {
     let g = gfx.to_lowercase();
     // gfx90c: the Vega iGPU in Renoir / Lucienne / Cezanne / Barcelo. Compared
     // whole (up to a feature suffix) so other gfx90x data-center parts such as
@@ -1225,13 +1264,26 @@ pub fn gfx_is_apu_family(gfx: &str) -> bool {
     }
     // gfx115x: every Strix part is an APU.
     if gfx_model_digit(&g, "gfx115").is_some() {
-        return true;
+        return Some(true);
     }
     // gfx110x: only gfx1103 and above are APUs; gfx1100/1101/1102 are discrete.
     if let Some(digit) = gfx_model_digit(&g, "gfx110") {
-        return digit >= 3;
+        return Some(digit >= 3);
     }
-    false
+    None
+}
+
+/// Let the gfx target's family decide `is_apu` where the table has a verdict.
+///
+/// The target is the more reliable evidence (a marketing-name keyword match is
+/// a guess), so it overrides an earlier verdict — but only where the table
+/// actually covers the family. Otherwise the earlier verdict stands, since
+/// "not in the table" is not evidence of a discrete part. The same rule serves
+/// the rocminfo mapping on Linux and the hipInfo mapping on Windows.
+fn apply_family_verdict(gpu: &mut Gpu) {
+    if let Some(is_apu) = gfx_apu_family_verdict(&gpu.gfx_target) {
+        gpu.is_apu = Some(is_apu);
+    }
 }
 
 /// The model digit that follows `prefix` in a gfx target, e.g. `3` from
@@ -1355,7 +1407,15 @@ fn probe_gpus_rocminfo(e: &mut Examination) {
         return;
     }
     e.rocminfo_present = true;
-    let (rc, out, err) = run("rocminfo", &[], Duration::from_secs(15));
+    // Scrub `HSA_OVERRIDE_GFX_VERSION`: under the override rocminfo reports the
+    // masqueraded gfx as the agent `Name:`, not the hardware's. See
+    // [`run_scrubbing`].
+    let (rc, out, err) = run_scrubbing(
+        "rocminfo",
+        &[],
+        &["HSA_OVERRIDE_GFX_VERSION"],
+        Duration::from_secs(15),
+    );
     if rc != 0 {
         let merged = format!("{out}\n{err}").to_lowercase();
         e.rocminfo_status = if merged.contains("rock module is not loaded") {
@@ -1372,6 +1432,85 @@ fn probe_gpus_rocminfo(e: &mut Examination) {
     apply_rocminfo_gpu_agents(e, &out);
 }
 
+/// One GPU agent as `rocminfo` prints it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RocminfoGpuAgent {
+    gfx_target: String,
+    marketing_name: String,
+    /// The agent's `BDFID:` rendered as the `dddd:bb:dd.f` form `lspci -D` and
+    /// the kernel topology use, so it can be matched with [`pci_ids_match`].
+    /// `None` when the line is absent or reads `0`.
+    pci_id: Option<String>,
+}
+
+/// Every GPU agent in `rocminfo` output, in agent order.
+///
+/// Only the first `Name:` after an `Agent` header is the agent's name: a GPU
+/// agent lists its ISAs as further `Name:` lines (`amdgcn-amd-amdhsa--gfx1100`,
+/// `...--gfx11-generic`) after `Device Type:`, and letting those overwrite the
+/// name meant that by the next header no GPU agent started with `gfx` any more
+/// and every one was dropped (#393). `Marketing Name:` and `BDFID:` are taken
+/// the same way.
+fn parse_rocminfo_gpu_agents(out: &str) -> Vec<RocminfoGpuAgent> {
+    let mut agents = Vec::new();
+    let mut cur_name = String::new();
+    let mut cur_marketing = String::new();
+    let mut cur_pci: Option<String> = None;
+    let mut cur_is_gpu = false;
+    let mut commit =
+        |name: &mut String, marketing: &mut String, pci: &mut Option<String>, is_gpu: bool| {
+            if is_gpu && name.starts_with("gfx") {
+                agents.push(RocminfoGpuAgent {
+                    gfx_target: std::mem::take(name),
+                    marketing_name: std::mem::take(marketing),
+                    pci_id: pci.take(),
+                });
+            }
+            name.clear();
+            marketing.clear();
+            *pci = None;
+        };
+    for line in out.lines() {
+        let s = line.trim();
+        if s.starts_with("Agent ") {
+            commit(&mut cur_name, &mut cur_marketing, &mut cur_pci, cur_is_gpu);
+            cur_is_gpu = false;
+        } else if let Some(rest) = s.strip_prefix("Name:") {
+            if cur_name.is_empty() {
+                cur_name = rest.trim().to_owned();
+            }
+        } else if let Some(rest) = s.strip_prefix("Marketing Name:") {
+            if cur_marketing.is_empty() {
+                cur_marketing = rest.trim().to_owned();
+            }
+        } else if let Some(rest) = s.strip_prefix("BDFID:") {
+            if cur_pci.is_none() {
+                cur_pci = rest.trim().parse::<u32>().ok().and_then(bdfid_to_pci_id);
+            }
+        } else if let Some(rest) = s.strip_prefix("Device Type:") {
+            cur_is_gpu = rest.contains("GPU");
+        }
+    }
+    commit(&mut cur_name, &mut cur_marketing, &mut cur_pci, cur_is_gpu);
+    agents
+}
+
+/// rocminfo's `BDFID:` as a `dddd:bb:dd.f` address. The value packs
+/// `bus << 8 | device << 3 | function` with no domain — the same number the
+/// kernel's `location_id` carries — so the domain is rendered as `0000`, which
+/// is what every single-domain host has. `None` for `0`: that is the host
+/// bridge, and emitting it would be a wrong-but-plausible address that could
+/// match an unrelated entry (the same refusal as `kfd_node_pci_id`).
+fn bdfid_to_pci_id(bdfid: u32) -> Option<String> {
+    if bdfid == 0 {
+        return None;
+    }
+    let bus = (bdfid >> 8) & 0xff;
+    let device = (bdfid >> 3) & 0x1f;
+    let function = bdfid & 0x7;
+    Some(format!("0000:{bus:02x}:{device:02x}.{function}"))
+}
+
 /// Fold a `rocminfo` reading into the GPU list, against caller-supplied output.
 ///
 /// Split from the process launch the same way [`apply_kernel_gpu_membership`] is
@@ -1379,62 +1518,85 @@ fn probe_gpus_rocminfo(e: &mut Examination) {
 /// behaviour here is how an agent is matched onto an existing entry, and a test
 /// that had to run the real `rocminfo` could only assert it on a host with a
 /// GPU. See `a_rocminfo_marketing_name_outranks_the_kernel_topology_placeholder`.
+///
+/// An agent is matched to the entry with the same PCI address (its `BDFID:`
+/// against the entry's `pci_id`), so rocminfo's and lspci's enumeration orders
+/// need not agree. Only an agent with no usable `BDFID:` (older rocminfo) falls
+/// back to the next unclaimed AMD entry by position, and a fallback never
+/// displaces an exact match; an agent whose `BDFID:` matched nothing is a device
+/// the PCI scan did not list, so it becomes its own GPU rather than land on an
+/// unrelated card.
+///
+/// rocminfo never overwrites a `gfx_target` already present: the membership
+/// pass has by now stamped each entry with the kernel's native target by
+/// address, and rocminfo's reading is the same value normally and a masqueraded
+/// one under an override. What rocminfo contributes is the marketing name the
+/// kernel cannot supply and an `is_apu` verdict from the target's family.
 fn apply_rocminfo_gpu_agents(e: &mut Examination, out: &str) {
-    let mut gfx_targets: Vec<(String, String)> = Vec::new();
-    let mut cur_name = String::new();
-    let mut cur_marketing = String::new();
-    let mut cur_is_gpu = false;
-    for line in out.lines() {
-        let s = line.trim();
-        if s.starts_with("Agent ") {
-            if cur_is_gpu && cur_name.starts_with("gfx") {
-                gfx_targets.push((cur_name.clone(), cur_marketing.clone()));
-            }
-            cur_name.clear();
-            cur_marketing.clear();
-            cur_is_gpu = false;
-        } else if let Some(rest) = s.strip_prefix("Name:") {
-            cur_name = rest.trim().to_owned();
-        } else if let Some(rest) = s.strip_prefix("Marketing Name:") {
-            cur_marketing = rest.trim().to_owned();
-        } else if let Some(rest) = s.strip_prefix("Device Type:") {
-            cur_is_gpu = rest.contains("GPU");
-        }
-    }
-    if cur_is_gpu && cur_name.starts_with("gfx") {
-        gfx_targets.push((cur_name, cur_marketing));
-    }
-    if gfx_targets.is_empty() {
+    let agents = parse_rocminfo_gpu_agents(out);
+    if agents.is_empty() {
         return;
     }
 
-    let amd_indices: Vec<usize> = e
-        .gpus
-        .iter()
-        .enumerate()
-        .filter(|(_, g)| g.is_amd)
-        .map(|(idx, _)| idx)
-        .collect();
-    for (idx, (gfx, marketing)) in gfx_targets.into_iter().enumerate() {
-        if let Some(&gpu_idx) = amd_indices.get(idx) {
+    let mut claimed = vec![false; e.gpus.len()];
+    let mut slots: Vec<Option<usize>> = vec![None; agents.len()];
+    // Pass 1: exact PCI-address matches, so a positional fallback can never
+    // take a slot that a later agent identifies precisely.
+    for (agent_idx, agent) in agents.iter().enumerate() {
+        let Some(pci_id) = agent.pci_id.as_deref() else {
+            continue;
+        };
+        if let Some(gpu_idx) = e
+            .gpus
+            .iter()
+            .enumerate()
+            .position(|(idx, g)| g.is_amd && !claimed[idx] && pci_ids_match(&g.pci_id, pci_id))
+        {
+            claimed[gpu_idx] = true;
+            slots[agent_idx] = Some(gpu_idx);
+        }
+    }
+    // Pass 2: only agents that carry no address fall back to position.
+    for (agent_idx, slot) in slots.iter_mut().enumerate() {
+        if slot.is_some() || agents[agent_idx].pci_id.is_some() {
+            continue;
+        }
+        if let Some(gpu_idx) = e
+            .gpus
+            .iter()
+            .enumerate()
+            .position(|(idx, g)| g.is_amd && !claimed[idx])
+        {
+            claimed[gpu_idx] = true;
+            *slot = Some(gpu_idx);
+        }
+    }
+
+    for (agent, slot) in agents.into_iter().zip(slots) {
+        if let Some(gpu_idx) = slot {
             let gpu = &mut e.gpus[gpu_idx];
-            gpu.gfx_target = gfx.clone();
-            if !marketing.is_empty() && gpu_name_is_unknown(&gpu.name) {
-                gpu.name = marketing;
+            if gpu.gfx_target.is_empty() {
+                gpu.gfx_target = agent.gfx_target;
             }
-            gpu.is_apu = Some(gfx_is_apu_family(&gfx));
+            if !agent.marketing_name.is_empty() && gpu_name_is_unknown(&gpu.name) {
+                gpu.name = agent.marketing_name;
+            }
+            apply_family_verdict(gpu);
         } else {
-            let is_apu = gfx_is_apu_family(&gfx);
+            // No entry to fill: the family table is the only evidence, so an
+            // unknown family stays `None` rather than being called discrete.
+            // Claiming discrete would set `has_discrete_amd` for an iGPU the
+            // PCI scan did not list, suppressing the fix-9 iGPU+dGPU diagnosis.
             e.gpus.push(Gpu {
-                name: if marketing.is_empty() {
+                name: if agent.marketing_name.is_empty() {
                     "AMD GPU".to_owned()
                 } else {
-                    marketing
+                    agent.marketing_name
                 },
-                gfx_target: gfx,
+                is_apu: gfx_apu_family_verdict(&agent.gfx_target),
+                gfx_target: agent.gfx_target,
+                pci_id: agent.pci_id.unwrap_or_default(),
                 is_amd: true,
-                is_apu: Some(is_apu),
-                ..Gpu::default()
             });
         }
     }
@@ -3077,7 +3239,7 @@ fn probe_hip_sdk_windows(e: &mut Examination) {
                         .find(|g| g.is_amd && g.gfx_target.is_empty())
                 {
                     gpu.gfx_target = gfx;
-                    gpu.is_apu = Some(gfx_is_apu_family(&gpu.gfx_target));
+                    apply_family_verdict(gpu);
                 }
             }
         } else {
@@ -5578,6 +5740,318 @@ mod tests {
         assert_eq!((r, w), (Some(true), Some(true)));
         let (r, w) = mode_access("crw-rw----", "root", "render", "alice", &[]);
         assert_eq!((r, w), (Some(false), Some(false)));
+    }
+
+    fn agent(gfx: &str, marketing: &str, pci: Option<&str>) -> RocminfoGpuAgent {
+        RocminfoGpuAgent {
+            gfx_target: gfx.to_owned(),
+            marketing_name: marketing.to_owned(),
+            pci_id: pci.map(str::to_owned),
+        }
+    }
+
+    fn lspci_gpu(name: &str, pci_id: &str, is_apu: bool) -> Gpu {
+        Gpu {
+            name: name.to_owned(),
+            pci_id: pci_id.to_owned(),
+            is_amd: true,
+            is_apu: Some(is_apu),
+            ..Gpu::default()
+        }
+    }
+
+    /// Verbatim `rocminfo` shape: a GPU agent's ISAs follow as further `Name:` lines.
+    const ROCMINFO_APU_PLUS_DGPU: &str = "\
+*******
+Agent 1
+*******
+  Name:                    AMD Ryzen 5 7500X3D 6-Core Processor
+  Uuid:                    CPU-XX
+  Marketing Name:          AMD Ryzen 5 7500X3D 6-Core Processor
+  Vendor Name:             CPU
+  Device Type:             CPU
+*******
+Agent 2
+*******
+  Name:                    gfx1100
+  Uuid:                    GPU-XX
+  Marketing Name:          AMD Radeon RX 7900 XT
+  Vendor Name:             AMD
+  Node:                    1
+  Device Type:             GPU
+  BDFID:                   768
+  ISA Info:
+    ISA 1
+      Name:                    amdgcn-amd-amdhsa--gfx1100
+      Machine Models:          HSA_MACHINE_MODEL_LARGE
+    ISA 2
+      Name:                    amdgcn-amd-amdhsa--gfx11-generic
+*******
+Agent 3
+*******
+  Name:                    gfx1036
+  Marketing Name:          AMD Ryzen 5 7500X3D 6-Core Processor
+  Vendor Name:             AMD
+  Node:                    2
+  Device Type:             GPU
+  BDFID:                   4352
+  ISA Info:
+    ISA 1
+      Name:                    amdgcn-amd-amdhsa--gfx1036
+    ISA 2
+      Name:                    amdgcn-amd-amdhsa--gfx10-3-generic
+*** Done ***
+";
+
+    #[test]
+    fn rocminfo_gpu_agents_survive_isa_name_lines() {
+        // #393: the ISA `Name:` lines used to overwrite the agent name and every GPU was dropped.
+        assert_eq!(
+            parse_rocminfo_gpu_agents(ROCMINFO_APU_PLUS_DGPU),
+            vec![
+                agent("gfx1100", "AMD Radeon RX 7900 XT", Some("0000:03:00.0")),
+                agent(
+                    "gfx1036",
+                    "AMD Ryzen 5 7500X3D 6-Core Processor",
+                    Some("0000:11:00.0")
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn bdfid_renders_as_the_address_lspci_and_the_kernel_use() {
+        // rocminfo prints `BDFID: 768` for the card lspci lists at 0000:03:00.0.
+        assert_eq!(bdfid_to_pci_id(768).as_deref(), Some("0000:03:00.0"));
+        assert_eq!(bdfid_to_pci_id(4352).as_deref(), Some("0000:11:00.0"));
+        assert_eq!(bdfid_to_pci_id(0), None, "0 is the host bridge, refused");
+    }
+
+    #[test]
+    fn rocminfo_last_agent_is_committed_at_end_of_input() {
+        let out = "\
+Agent 1
+  Name:                    gfx1100
+  Marketing Name:          AMD Radeon RX 7900 XT
+  Device Type:             GPU
+  ISA Info:
+    ISA 1
+      Name:                    amdgcn-amd-amdhsa--gfx1100
+";
+        assert_eq!(
+            parse_rocminfo_gpu_agents(out),
+            vec![agent("gfx1100", "AMD Radeon RX 7900 XT", None)]
+        );
+    }
+
+    #[test]
+    fn rocminfo_cpu_only_host_yields_no_targets() {
+        let out = "\
+Agent 1
+  Name:                    AMD EPYC 9654 96-Core Processor
+  Marketing Name:          AMD EPYC 9654 96-Core Processor
+  Device Type:             CPU
+*** Done ***
+";
+        assert!(parse_rocminfo_gpu_agents(out).is_empty());
+    }
+
+    #[test]
+    fn rocminfo_agents_without_isa_lines_still_parse() {
+        let out = "\
+Agent 1
+  Name:                    AMD Ryzen 9 7950X 16-Core Processor
+  Device Type:             CPU
+Agent 2
+  Name:                    gfx942
+  Marketing Name:          AMD Instinct MI300X
+  Device Type:             GPU
+Agent 3
+  Name:                    gfx942
+  Marketing Name:          AMD Instinct MI300X
+  Device Type:             GPU
+";
+        assert_eq!(
+            parse_rocminfo_gpu_agents(out),
+            vec![
+                agent("gfx942", "AMD Instinct MI300X", None),
+                agent("gfx942", "AMD Instinct MI300X", None),
+            ]
+        );
+    }
+
+    #[test]
+    fn rocminfo_agents_join_entries_by_pci_address_not_position() {
+        // lspci enumerates the iGPU first; rocminfo lists the dGPU first. The
+        // address join must still put gfx1100 on the 7900 XT and gfx1036 on
+        // Raphael — a positional zip would swap them.
+        let mut e = Examination {
+            gpus: vec![
+                lspci_gpu("Raphael", "0000:11:00.0", true),
+                lspci_gpu("Navi 31 [Radeon RX 7900 XT]", "0000:03:00.0", false),
+            ],
+            ..Examination::default()
+        };
+        apply_rocminfo_gpu_agents(&mut e, ROCMINFO_APU_PLUS_DGPU);
+        assert_eq!(e.gpus.len(), 2, "no extra GPUs when both agents matched");
+        assert_eq!(
+            (e.gpus[0].gfx_target.as_str(), e.gpus[0].is_apu),
+            ("gfx1036", Some(true))
+        );
+        assert_eq!(
+            (e.gpus[1].gfx_target.as_str(), e.gpus[1].is_apu),
+            ("gfx1100", Some(false))
+        );
+    }
+
+    #[test]
+    fn rocminfo_never_overwrites_a_target_the_kernel_already_filled() {
+        // The membership pass stamped the kernel's native target by address.
+        // rocminfo must defer to it: under `HSA_OVERRIDE_GFX_VERSION` its
+        // reading is the masqueraded gfx, and even unmasked it is no better
+        // than the kernel's. It still supplies the name the kernel cannot.
+        let mut e = Examination::default();
+        apply_kernel_gpu_membership(
+            &mut e,
+            &[crate::KfdGpuNode {
+                pci_id: "0000:03:00.0".to_owned(),
+                gfx_target: "gfx1100".to_owned(),
+            }],
+        );
+        let masqueraded = "\
+Agent 1
+  Name:                    gfx1030
+  Marketing Name:          AMD Radeon RX 7900 XT
+  Device Type:             GPU
+  BDFID:                   768
+";
+        apply_rocminfo_gpu_agents(&mut e, masqueraded);
+        assert_eq!(e.gpus.len(), 1);
+        assert_eq!(e.gpus[0].gfx_target, "gfx1100", "kernel target kept");
+        assert_eq!(e.gpus[0].name, "AMD Radeon RX 7900 XT", "name supplied");
+    }
+
+    #[test]
+    fn rocminfo_agents_without_bdfid_fall_back_to_position() {
+        let mut e = Examination {
+            gpus: vec![
+                lspci_gpu("Instinct MI300X", "0000:05:00.0", false),
+                lspci_gpu("Instinct MI300X", "0000:26:00.0", false),
+            ],
+            ..Examination::default()
+        };
+        apply_rocminfo_gpu_agents(
+            &mut e,
+            "Agent 1\n  Name: gfx942\n  Marketing Name: AMD Instinct MI300X\n  Device Type: GPU\n\
+             Agent 2\n  Name: gfx942\n  Marketing Name: AMD Instinct MI300X\n  Device Type: GPU\n",
+        );
+        assert_eq!(e.gpus.len(), 2);
+        assert!(e.gpus.iter().all(|g| g.gfx_target == "gfx942"));
+    }
+
+    #[test]
+    fn rocminfo_bdfid_match_is_never_displaced_by_a_positional_agent() {
+        // Agent 1 has no BDFID, agent 2 names the first entry precisely. The
+        // exact match must win that slot; the positional agent takes the other.
+        let mut e = Examination {
+            gpus: vec![
+                lspci_gpu("Navi 31 [Radeon RX 7900 XT]", "0000:03:00.0", false),
+                lspci_gpu("Raphael", "0000:11:00.0", true),
+            ],
+            ..Examination::default()
+        };
+        apply_rocminfo_gpu_agents(
+            &mut e,
+            "Agent 1\n  Name: gfx1036\n  Device Type: GPU\n\
+             Agent 2\n  Name: gfx1100\n  Device Type: GPU\n  BDFID: 768\n",
+        );
+        assert_eq!(e.gpus[0].gfx_target, "gfx1100");
+        assert_eq!(e.gpus[1].gfx_target, "gfx1036");
+    }
+
+    #[test]
+    fn rocminfo_agent_with_an_unmatched_bdfid_is_appended_not_misplaced() {
+        // An agent whose `BDFID` matches no entry is a device the PCI scan did
+        // not list: its own GPU, carrying its address, never a positional guess
+        // onto an unrelated card.
+        let mut e = Examination {
+            gpus: vec![lspci_gpu(
+                "Navi 31 [Radeon RX 7900 XT]",
+                "0000:03:00.0",
+                false,
+            )],
+            ..Examination::default()
+        };
+        apply_rocminfo_gpu_agents(
+            &mut e,
+            "Agent 1\n  Name: gfx1100\n  Device Type: GPU\n  BDFID: 768\n\
+             Agent 2\n  Name: gfx942\n  Marketing Name: AMD Instinct MI300X\n  Device Type: GPU\n  BDFID: 9728\n",
+        );
+        assert_eq!(e.gpus.len(), 2, "the unmatched agent is appended");
+        assert_eq!(e.gpus[0].gfx_target, "gfx1100", "the matched one stays put");
+        assert_eq!(e.gpus[1].gfx_target, "gfx942");
+        assert_eq!(e.gpus[1].pci_id, "0000:26:00.0", "it keeps its address");
+    }
+
+    #[test]
+    fn appended_unknown_family_gpu_is_not_called_discrete() {
+        // A Raphael iGPU (gfx1036, not in the family table) with no entry to
+        // fill appends as `is_apu: None`, not `Some(false)` — otherwise
+        // `has_discrete_amd` turns on for an iGPU and fix-9 goes quiet.
+        let mut e = Examination::default();
+        apply_rocminfo_gpu_agents(
+            &mut e,
+            "Agent 1\n  Name: gfx1036\n  Marketing Name: AMD Raphael\n  Device Type: GPU\n",
+        );
+        assert_eq!(e.gpus.len(), 1);
+        assert_eq!(e.gpus[0].gfx_target, "gfx1036");
+        assert_eq!(e.gpus[0].is_apu, None, "unknown family is not discrete");
+    }
+
+    #[test]
+    fn family_verdict_overrides_a_name_guess_only_where_the_table_knows() {
+        let mut strix = lspci_gpu("AMD Radeon Graphics", "0000:c5:00.0", false);
+        strix.gfx_target = "gfx1151".to_owned();
+        apply_family_verdict(&mut strix);
+        assert_eq!(strix.is_apu, Some(true));
+        let mut navi = lspci_gpu("Strix-something [Radeon]", "0000:03:00.0", true);
+        navi.gfx_target = "gfx1100".to_owned();
+        apply_family_verdict(&mut navi);
+        assert_eq!(navi.is_apu, Some(false));
+        // gfx1036 is not in the table: the earlier verdict stands.
+        let mut raphael = lspci_gpu("Raphael", "0000:11:00.0", true);
+        raphael.gfx_target = "gfx1036".to_owned();
+        apply_family_verdict(&mut raphael);
+        assert_eq!(raphael.is_apu, Some(true));
+        assert_eq!(gfx_apu_family_verdict("gfx1036"), None);
+        assert!(
+            !gfx_is_apu_family("gfx1036"),
+            "the bool form folds unknown to false"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn run_scrubbing_removes_the_named_var_from_the_child() {
+        // The rocminfo target probe runs through `run_scrubbing` so an
+        // `HSA_OVERRIDE_GFX_VERSION` in the caller's environment cannot reach
+        // it and masquerade as the hardware's gfx. Prove the var is gone from
+        // the child while a plain `run` still inherits it.
+        //
+        // Env-mutation contract: the key's lock is taken before the mutation,
+        // and `RestoredEnvVar` puts the old value back on drop, inside the lock.
+        static HSA_OVERRIDE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = HSA_OVERRIDE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let key = "HSA_OVERRIDE_GFX_VERSION";
+        let _restore = crate::test_env::RestoredEnvVar::set(key, std::path::Path::new("10.3.0"));
+        let script = ["-c", "printf %s \"$HSA_OVERRIDE_GFX_VERSION\""];
+        let timeout = Duration::from_secs(5);
+        let (_, inherited, _) = run("sh", &script, timeout);
+        let (_, scrubbed, _) = run_scrubbing("sh", &script, &[key], timeout);
+        assert_eq!(inherited, "10.3.0", "a plain run inherits the override");
+        assert_eq!(scrubbed, "", "run_scrubbing must drop it");
     }
 
     #[test]
