@@ -161,6 +161,13 @@ pub struct E2eWorld {
     /// has something real to terminate. Held here so `Drop` can kill and reap
     /// it whatever the scenario's outcome, and so the stop's effect on it can
     /// be observed through the handle rather than by PID alone.
+    ///
+    /// Also doubles as the disposable `sleep` child `dash-28` points
+    /// "e2e-mock"'s `supervisor_pid`/`engine_pid` at. `register_mock_service`
+    /// deliberately points those fields at *this harness's own* PID so startup
+    /// liveness checks see a live process — fine for every scenario that only
+    /// reads the record, but a real `rocm services stop e2e-mock --yes` would
+    /// then signal the harness process itself.
     pub recorded_process: Option<std::process::Child>,
 }
 
@@ -782,6 +789,34 @@ pub fn rocmd_binary() -> PathBuf {
             configured.display()
         )
     })
+}
+
+/// Plants the `[[bin]]` fixture `name` (see `e2e_cucumber::fixture_binary`)
+/// at the exact path `dest`.
+///
+/// Parent dirs are created as needed. Shared so the three stand-ins
+/// (`fake-tailscale`, `fake-uv`, `fake-python`) don't each repeat the same
+/// create-then-write body.
+///
+/// Lives here rather than in `e2e_cucumber::fixture_binary` because it needs
+/// `rocm_core::fake_executable::write_fake_executable` to avoid reopening the
+/// `ETXTBSY` race a plain `std::fs::copy` would — holding a write fd on `dest`
+/// for the duration of the copy is exactly the window that race exploits —
+/// and `rocm-core` is a dev-dependency this crate's library target cannot
+/// reach, only this test binary.
+pub fn install_fixture_binary(name: &str, dest: &Path) {
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)
+            .unwrap_or_else(|e| panic!("failed to create {}: {e}", parent.display()));
+    }
+    let contents = std::fs::read(e2e_cucumber::fixture_binary::fixture_binary(name))
+        .unwrap_or_else(|e| panic!("failed to read the {name} stand-in: {e}"));
+    rocm_core::fake_executable::write_fake_executable(dest, contents).unwrap_or_else(|e| {
+        panic!(
+            "failed to install the {name} stand-in at {}: {e}",
+            dest.display()
+        )
+    });
 }
 
 /// Spawn the real `rocm` binary with the scenario's isolated env.

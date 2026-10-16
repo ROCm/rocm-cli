@@ -709,6 +709,14 @@ pub struct ServiceRecordOptions {
     pub startup_phase: Option<&'static str>,
     pub supervisor_pid: u32,
     pub engine_pid: Option<u32>,
+    /// The supervisor's start-time token (`rocm_core::process_start_ticks`),
+    /// the same identity check a real launch path writes alongside
+    /// `supervisor_pid`. `None` (the default) keeps the historical
+    /// `"supervisor_start_ticks": null` — a record with no token at all, which
+    /// `identity_state`'s `(None, _) => Matches` arm treats as a best-effort
+    /// match on PID alone. Set it when a scenario's stop must exercise the
+    /// stronger start-time-verified identity check instead.
+    pub supervisor_start_ticks: Option<u64>,
     /// The runtime the service recorded when it was launched, as a runtime
     /// *key* (`release-tarball-gfx942`) — the field is named `runtime_id` on
     /// disk, but every launch path resolves its selector to an exact key before
@@ -734,6 +742,7 @@ impl Default for ServiceRecordOptions {
             startup_phase: None,
             supervisor_pid: 0,
             engine_pid: None,
+            supervisor_start_ticks: None,
             runtime_id: None,
             host: None,
         }
@@ -784,6 +793,7 @@ pub fn write_service_record_with(
         "status": options.status,
         "startup_phase": options.startup_phase,
         "supervisor_pid": options.supervisor_pid,
+        "supervisor_start_ticks": options.supervisor_start_ticks,
         "engine_pid": options.engine_pid,
         "runtime_id": options.runtime_id,
         "env_id": null,
