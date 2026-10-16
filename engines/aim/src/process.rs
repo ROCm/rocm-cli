@@ -17,6 +17,23 @@ const STOP_GRACE: Duration = Duration::from_secs(10);
 const READY_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const DEFAULT_READY_TIMEOUT: Duration = Duration::from_mins(5);
 
+/// Time to wait for the AIM container to become ready before reporting failure.
+///
+/// Defaults to [`DEFAULT_READY_TIMEOUT`]. A cold start (image's first HF weight
+/// download, first-decode compile) can exceed the default, so the timeout is
+/// configurable via `ROCM_CLI_AIM_READY_TIMEOUT_SECS` (a positive integer number
+/// of seconds) — mirrors `engines/vllm`'s `ROCM_CLI_VLLM_READY_TIMEOUT_SECS`.
+fn aim_ready_timeout() -> Duration {
+    resolve_aim_ready_timeout(std::env::var("ROCM_CLI_AIM_READY_TIMEOUT_SECS").ok())
+}
+
+fn resolve_aim_ready_timeout(override_value: Option<String>) -> Duration {
+    override_value
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map_or(DEFAULT_READY_TIMEOUT, Duration::from_secs)
+}
+
 /// Deterministic, Docker-name-sanitized container identity for a service.
 /// This *is* the service's identity for the AIM engine — no PID/start-ticks
 /// tracking, since `docker run -d` leaves no long-lived client process to
@@ -229,7 +246,7 @@ pub(crate) fn serve_http(request: ServeHttpRequest) -> Result<()> {
     )?;
 
     let name = container_name(&request.service_id);
-    let timeout = DEFAULT_READY_TIMEOUT;
+    let timeout = aim_ready_timeout();
     // The container self-reports under the registry's HF-style canonical name
     // (e.g. `meta-llama/Llama-3.2-1B-Instruct`), not the Docker image reference
     // used for `docker pull`/`run` — matching `/v1/models` against the image ref
@@ -334,6 +351,31 @@ pub(crate) fn parse_gpu_indices_arg(value: Option<&str>) -> Result<Vec<u32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aim_ready_timeout_uses_default_without_override() {
+        assert_eq!(resolve_aim_ready_timeout(None), DEFAULT_READY_TIMEOUT);
+    }
+
+    #[test]
+    fn aim_ready_timeout_honors_positive_override() {
+        assert_eq!(
+            resolve_aim_ready_timeout(Some(" 900 ".to_owned())),
+            Duration::from_mins(15)
+        );
+    }
+
+    #[test]
+    fn aim_ready_timeout_ignores_invalid_or_zero_override() {
+        assert_eq!(
+            resolve_aim_ready_timeout(Some("0".to_owned())),
+            DEFAULT_READY_TIMEOUT
+        );
+        assert_eq!(
+            resolve_aim_ready_timeout(Some("not-a-number".to_owned())),
+            DEFAULT_READY_TIMEOUT
+        );
+    }
 
     #[test]
     fn container_name_sanitizes_unsafe_characters() {
