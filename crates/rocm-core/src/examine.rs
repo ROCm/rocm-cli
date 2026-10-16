@@ -246,8 +246,9 @@ pub struct Examination {
     // driver / runtime (Linux)
     pub amdgpu_loaded: Option<bool>,
     pub amdgpu_blacklisted_in: Vec<String>,
-    /// kfd is present: an `amdkfd` module, or the kernel's kfd interfaces
-    /// (`/sys/class/kfd/kfd`, `/dev/kfd`) when kfd is built into the kernel.
+    /// kfd is available: as a separate `amdkfd` module on kernels before 4.20
+    /// (where kfd was merged into `amdgpu.ko`), or through `/sys/class/kfd/kfd`
+    /// or `/dev/kfd` on current ones. The name predates the merge.
     pub amdkfd_loaded: Option<bool>,
     pub secure_boot: String,
     pub iommu_kernel_param: String,
