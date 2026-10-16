@@ -133,10 +133,12 @@ pub fn gfx_target_has_no_rocm_build(gfx: &str) -> bool {
 ///
 /// `Unknown` deliberately covers both "nothing detected" and "a gfx target we
 /// don't recognize" rather than being called `Unsupported` — see the doc
-/// comment on [`gfx_target_has_no_rocm_build`] and
-/// `GFX_TARGETS_WITHOUT_ROCM_SUPPORT` in `diagnose.rs` for why conflating
-/// "confirmed no ROCm build" with "unrecognized" would turn a detection gap
-/// into a false claim about the hardware.
+/// comment on [`gfx_target_has_no_rocm_build`] for why conflating "confirmed
+/// no ROCm build" with "unrecognized" would turn a detection gap into a false
+/// claim about the hardware. Only that predicate's conjunction with
+/// [`normalize_therock_family`] establishes the "confirmed" half; an
+/// unrecognized target satisfies neither conjunct, so it is a gap in what this
+/// catalog knows rather than a fact about the card.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GpuSupportLevel {
     /// A TheRock package family covers this GPU: full ROCm/HIP support.
@@ -160,6 +162,21 @@ pub fn gpu_support_level(
         (Some(gfx), None) if gfx_target_has_no_rocm_build(gfx) => GpuSupportLevel::VulkanOnly,
         _ => GpuSupportLevel::Unknown,
     }
+}
+
+/// [`gpu_support_level`] for a [`HostGpuSummary`] the caller already probed.
+///
+/// The two fields are read here, once, rather than at each call site: they are
+/// positional arguments of the same type on [`gpu_support_level`], so a call
+/// site that transposed them would classify a Vulkan-only host as `RocmHip`
+/// and still compile. `rocm engines` and the codex-bridge `engines` tool both
+/// derive the level from this struct, so both go through this.
+#[must_use]
+pub fn gpu_support_level_for_host_gpu(host_gpu: &HostGpuSummary) -> GpuSupportLevel {
+    gpu_support_level(
+        host_gpu.gfx_target.as_deref(),
+        host_gpu.therock_family.as_deref(),
+    )
 }
 
 pub fn normalize_therock_family(value: &str) -> Option<String> {
@@ -3545,6 +3562,44 @@ mod tests {
         assert_eq!(
             gpu_support_level(Some("gfx90c"), None),
             GpuSupportLevel::VulkanOnly
+        );
+    }
+
+    /// The two `HostGpuSummary` fields must reach `gpu_support_level` in the
+    /// right positions. Both are `Option<String>`, so transposing them still
+    /// compiles — and it would answer `RocmHip` for exactly the Vulkan-only
+    /// host this classification exists to stop lying to.
+    #[test]
+    fn gpu_support_level_for_host_gpu_reads_a_vulkan_only_summary_as_vulkan_only() {
+        let host_gpu = HostGpuSummary {
+            name: Some("AMD Radeon Graphics".to_owned()),
+            gfx_target: Some("gfx90c".to_owned()),
+            therock_family: None,
+        };
+        assert_eq!(
+            gpu_support_level_for_host_gpu(&host_gpu),
+            GpuSupportLevel::VulkanOnly
+        );
+    }
+
+    #[test]
+    fn gpu_support_level_for_host_gpu_reads_a_covered_summary_as_rocm_hip() {
+        let host_gpu = HostGpuSummary {
+            name: Some("AMD Instinct MI300X".to_owned()),
+            gfx_target: Some("gfx942".to_owned()),
+            therock_family: Some("gfx94X-dcgpu".to_owned()),
+        };
+        assert_eq!(
+            gpu_support_level_for_host_gpu(&host_gpu),
+            GpuSupportLevel::RocmHip
+        );
+    }
+
+    #[test]
+    fn gpu_support_level_for_host_gpu_reads_an_undetected_summary_as_unknown() {
+        assert_eq!(
+            gpu_support_level_for_host_gpu(&HostGpuSummary::default()),
+            GpuSupportLevel::Unknown
         );
     }
 

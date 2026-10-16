@@ -3330,14 +3330,9 @@ pub(crate) fn run_internal_mcp_call(
                 serde_json::json!(gpu),
             ))
         }
-        "engines" => {
-            let engines =
-                builtin_codex_bridge_engine_inventory(host_gpu_support_level(Some(paths)));
-            Ok(internal_mcp_tool_success(
-                format!("Found {} engine entries.", engines.len()),
-                serde_json::json!({ "engines": engines }),
-            ))
-        }
+        "engines" => Ok(internal_mcp_engines_tool_result(host_gpu_support_level(
+            Some(paths),
+        ))),
         "services" => {
             let services = load_managed_services(paths)?;
             Ok(internal_mcp_tool_success(
@@ -3528,6 +3523,24 @@ pub(crate) fn run_internal_mcp_call(
         }
         other => bail!("unsupported MCP tool `{other}`"),
     }
+}
+
+/// The `engines` MCP tool result for a host at `gpu_support_level`.
+///
+/// Split from the match arm above only so the GPU-aware branch is reachable
+/// from a test: the arm's own argument is a live host probe, and no CI runner
+/// has a GPU that is detected *and* confirmed to have no ROCm build, so the
+/// Vulkan-only wording a bridge client would render could not otherwise be
+/// asserted on. Nothing else moved — the summary text, the `engines` key and
+/// the entries themselves are what the arm built inline.
+fn internal_mcp_engines_tool_result(
+    gpu_support_level: rocm_core::GpuSupportLevel,
+) -> serde_json::Value {
+    let engines = builtin_codex_bridge_engine_inventory(gpu_support_level);
+    internal_mcp_tool_success(
+        format!("Found {} engine entries.", engines.len()),
+        serde_json::json!({ "engines": engines }),
+    )
 }
 
 fn internal_mcp_arguments(value: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
@@ -5980,6 +5993,73 @@ model recipes
             Some("rocm")
         );
         assert!(mcp_tool_result_text(&result).contains(env!("CARGO_PKG_VERSION")));
+    }
+
+    /// The bridge's `engines` tool carries the same claim `rocm engines` and
+    /// `rocm examine` carry, so it gets the same pair of tests. These assert on
+    /// the serialized payload because `structuredContent.engines[].summary` is
+    /// the exact string an MCP client renders to the operator.
+    #[test]
+    fn engines_mcp_tool_names_vulkan_for_a_gpu_with_no_rocm_support() {
+        let result = internal_mcp_engines_tool_result(rocm_core::GpuSupportLevel::VulkanOnly);
+
+        let summary = engines_tool_lemonade_summary(&result);
+        assert!(
+            summary.contains("no ROCm/HIP support") && summary.contains("Vulkan llama.cpp backend"),
+            "the MCP client must be handed the real backend: {summary}"
+        );
+        assert!(
+            !summary.contains("with ROCm llama.cpp backend"),
+            "the stale ROCm claim must not reach an MCP client: {summary}"
+        );
+        assert!(mcp_tool_result_text(&result).contains("engine entries"));
+    }
+
+    #[test]
+    fn engines_mcp_tool_keeps_rocm_note_for_a_rocm_capable_gpu() {
+        let result = internal_mcp_engines_tool_result(rocm_core::GpuSupportLevel::RocmHip);
+
+        assert_eq!(
+            engines_tool_lemonade_summary(&result),
+            "default embedded Lemonade server with ROCm llama.cpp backend"
+        );
+    }
+
+    /// Pins the wiring the two tests above cannot see: that the tool reaches
+    /// the host-aware inventory through the live probe rather than a level
+    /// nailed to a constant. A hard-coded level that disagrees with this host
+    /// fails here.
+    #[test]
+    fn engines_mcp_tool_answers_for_the_host_it_runs_on() {
+        let (_root, paths) = test_paths("mcp-engines-host-probe");
+
+        let result = run_internal_mcp_call(&paths, "engines", serde_json::json!({}), false)
+            .expect("the engines mcp tool is read-only and should run");
+
+        assert_eq!(
+            result.get("isError").and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            result.get("structuredContent"),
+            internal_mcp_engines_tool_result(host_gpu_support_level(Some(&paths)))
+                .get("structuredContent"),
+            "the `engines` tool must report this host's support level"
+        );
+    }
+
+    /// The lemonade `summary` as an MCP client reads it out of the tool result.
+    fn engines_tool_lemonade_summary(result: &serde_json::Value) -> String {
+        result
+            .pointer("/structuredContent/engines")
+            .and_then(serde_json::Value::as_array)
+            .expect("the engines tool must return an `engines` array")
+            .iter()
+            .find(|engine| engine.get("id").and_then(serde_json::Value::as_str) == Some("lemonade"))
+            .and_then(|engine| engine.get("summary"))
+            .and_then(serde_json::Value::as_str)
+            .expect("the engines tool must carry a lemonade summary")
+            .to_owned()
     }
 
     #[test]
