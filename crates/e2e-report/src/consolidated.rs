@@ -472,9 +472,17 @@ struct GridColumn {
     /// Canonical platform label (e.g. "MI300X", "Strix Halo", "Mock"), parsed
     /// from the artifact name the same way every other section of the report
     /// derives its platform label (see [`parse_descriptor`]). Drives
-    /// [`GridColumn::label`] so the grid heading can't disagree with the
-    /// summary matrix / per-platform details for the same platform.
+    /// [`GridColumn::label`] (together with `os`) so the grid heading can't
+    /// disagree with the summary matrix / per-platform details for the same
+    /// platform.
     platform: String,
+    /// Canonical OS (e.g. "Ubuntu", "Windows", "WSL2"), parsed the same way as
+    /// `platform`. The grid has no separate OS column the way the summary
+    /// matrix does, so this has to be part of [`GridColumn::label`] itself —
+    /// Ubuntu, Windows and WSL2 Strix Halo lanes share one `platform` value
+    /// and commonly the same channel/engine too, so omitting `os` here would
+    /// give genuinely different columns an identical heading.
+    os: String,
     /// Effective serve engine on this host (for the column subheading).
     engine: String,
     /// Component versions (OS/ROCm/vLLM/lemonade) for the column heading.
@@ -494,12 +502,18 @@ fn with_channel_suffix(base: &str, channel: Option<&str>) -> String {
 }
 
 impl GridColumn {
-    /// Column heading label: the canonical platform, plus its channel when
-    /// known — the part of column identity that doesn't already show up in
-    /// `versions.summary()`. Mirrors [`platform_cell`]'s OS-less form so the
-    /// same platform reads identically in the grid and the summary matrix.
+    /// Column heading label: canonical platform + OS, plus channel when known
+    /// — the part of column identity that doesn't already show up in
+    /// `versions.summary()`. Full form (platform AND OS), matching
+    /// [`PlatformReport::load`]'s `label` and [`excluded_platform_label`] —
+    /// NOT [`platform_cell`]'s OS-less form, which is only safe there because
+    /// the summary matrix shows OS in its own table column; the grid has no
+    /// such column, so this heading is the only place OS would ever show.
     fn label(&self) -> String {
-        with_channel_suffix(&self.platform, self.versions.channel.as_deref())
+        with_channel_suffix(
+            &format!("{} {}", self.platform, self.os),
+            self.versions.channel.as_deref(),
+        )
     }
 }
 
@@ -603,12 +617,16 @@ impl Grid {
                         && c.versions.channel == manifest.versions.channel
                 })
                 .unwrap_or_else(|| {
+                    // Canonical label, not the raw slug — derived the same way
+                    // every other section of the report derives its platform
+                    // label (issue #702). Both fields, not just `platform`:
+                    // see `GridColumn::os`'s doc for why OS has to be part of
+                    // the label here specifically.
+                    let desc = parse_descriptor(label);
                     columns.push(GridColumn {
                         slug: manifest.platform_slug.clone(),
-                        // Canonical label, not the raw slug — derived the same
-                        // way every other section of the report derives its
-                        // platform label (issue #702).
-                        platform: parse_descriptor(label).platform,
+                        platform: desc.platform,
+                        os: desc.os,
                         engine: manifest
                             .capability
                             .as_ref()
@@ -2458,18 +2476,103 @@ mod tests {
             "same slug, different channel, must be two columns"
         );
         let labels: Vec<_> = grid.columns.iter().map(GridColumn::label).collect();
-        // Canonical label (via parse_descriptor on the artifact name, same as
-        // every other section of the report), not the raw "mi300x" slug — see
-        // `command_coverage_distinguishes_channels_on_same_platform`, which
-        // proves the same "mi300x-release"/"mi300x-nightly" artifact names
-        // resolve to desc.platform == "Mi300x" elsewhere in this report.
+        // Canonical platform+OS label (via parse_descriptor on the artifact
+        // name, same as every other section of the report), not the raw
+        // "mi300x" slug — see `command_coverage_distinguishes_channels_on_same_platform`,
+        // which proves the same "mi300x-release"/"mi300x-nightly" artifact
+        // names resolve to desc.platform == "Mi300x" / desc.os == "Linux"
+        // elsewhere in this report.
         assert!(
-            labels.contains(&"Mi300x (release)".to_string()),
+            labels.contains(&"Mi300x Linux (release)".to_string()),
             "{labels:?}"
         );
         assert!(
-            labels.contains(&"Mi300x (nightly)".to_string()),
+            labels.contains(&"Mi300x Linux (nightly)".to_string()),
             "{labels:?}"
+        );
+    }
+
+    #[test]
+    fn grid_disambiguates_same_platform_different_os_lanes() {
+        // Three real lanes of the same silicon family (Strix Halo on Ubuntu,
+        // Windows, WSL2) with the same channel and engine: their distinct
+        // manifest `platform_slug`s keep them as three separate columns, but
+        // without OS in the displayed label their headings — and their
+        // needs-attention entries — would all read identically as
+        // "Strix Halo", masking which lane actually failed. Flagged by an
+        // automated review on PR #706; the grid has no separate OS column the
+        // way the summary matrix does, so OS has to be part of the heading
+        // itself here.
+        let lane = |slug: &str| {
+            format!(
+                r#"{{
+                "platform_slug": "{slug}",
+                "capability": {{"effective_serve_engine": "lemonade"}},
+                "expectations": [{{"id":"serve-x","feature":"Serving","expected":"pass"}}]
+            }}"#
+            )
+        };
+        let passed = feature_json(&[(&["id:serve-x"], &["passed"])]);
+        let failed = feature_json(&[(&["id:serve-x"], &["failed"])]);
+        let (_d1, ubuntu_path) = write_platform(&passed, &lane("strix-halo-ubuntu"));
+        let (_d2, windows_path) = write_platform(&failed, &lane("strix-halo-windows"));
+        let (_d3, wsl_path) = write_platform(&passed, &lane("strix-halo-wsl"));
+
+        let inputs = vec![
+            ("e2e-gpu-strix-ubuntu-report".to_string(), ubuntu_path),
+            ("e2e-gpu-strix-windows-report".to_string(), windows_path),
+            ("e2e-gpu-strix-wsl-report".to_string(), wsl_path),
+        ];
+
+        let grid = Grid::build(&inputs);
+        assert_eq!(
+            grid.columns.len(),
+            3,
+            "three distinct manifest slugs must stay three separate columns"
+        );
+        let labels: Vec<_> = grid.columns.iter().map(GridColumn::label).collect();
+        assert_eq!(
+            labels
+                .iter()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            3,
+            "all three headings must be distinct, not all read as \"Strix Halo\": {labels:?}"
+        );
+        assert!(
+            labels.contains(&"Strix Halo Ubuntu".to_string()),
+            "{labels:?}"
+        );
+        assert!(
+            labels.contains(&"Strix Halo Windows".to_string()),
+            "{labels:?}"
+        );
+        assert!(
+            labels.contains(&"Strix Halo WSL2".to_string()),
+            "{labels:?}"
+        );
+
+        // The Windows lane is the one that failed; its needs-attention entry
+        // must say so by lane, not just by (ambiguous) platform.
+        let problems = grid.problems();
+        let problem_labels: Vec<_> = problems
+            .iter()
+            .map(|(label, id, _, _)| (label, id))
+            .collect();
+        assert!(
+            problems
+                .iter()
+                .any(|(label, id, outcome, _)| label == "Strix Halo Windows"
+                    && *id == "serve-x"
+                    && outcome.is_problem()),
+            "the failing Windows lane must be identifiable in needs-attention: {problem_labels:?}"
+        );
+        assert!(
+            !problems
+                .iter()
+                .any(|(label, _, _, _)| label == "Strix Halo Ubuntu" || label == "Strix Halo WSL2"),
+            "the passing Ubuntu/WSL2 lanes must not appear as problems: {problem_labels:?}"
         );
     }
 
@@ -2673,7 +2776,7 @@ mod tests {
         assert!(
             grid.problems()
                 .iter()
-                .any(|(label, id, _, _)| label == "Mi300x (nightly)" && *id == "serve-x"),
+                .any(|(label, id, _, _)| label == "Mi300x Linux (nightly)" && *id == "serve-x"),
             "the nightly failure must surface in the needs-attention list",
         );
     }
@@ -2722,9 +2825,10 @@ mod tests {
     fn single_channel_artifacts_render_unchanged() {
         // No channel anywhere in the input (older artifact / no runtime active):
         // exactly one column, with no "(channel)" suffix appended to the
-        // heading. The heading itself is the canonical platform label parsed
-        // from the artifact name ("mock" -> "Mock" via parse_descriptor's
-        // fallback titlecasing), not the raw `platform_slug` — see issue #702.
+        // heading. The heading itself is the canonical platform + OS label
+        // parsed from the artifact name ("mock" -> "Mock"/"Linux" via
+        // parse_descriptor's fallback titlecasing, which always assigns
+        // Linux), not the raw `platform_slug` — see issue #702.
         let platform = r#"{
             "platform_slug": "mock",
             "capability": {"effective_serve_engine": "none"},
@@ -2736,7 +2840,7 @@ mod tests {
 
         let grid = Grid::build(&inputs);
         assert_eq!(grid.columns.len(), 1);
-        assert_eq!(grid.columns[0].label(), "Mock");
+        assert_eq!(grid.columns[0].label(), "Mock Linux");
     }
 
     #[test]
@@ -2848,10 +2952,12 @@ mod tests {
         let inputs = vec![("strix-halo".to_string(), path)];
         let md = consolidated_summary_markdown(&load_platform_reports(&inputs));
         assert!(md.contains("⚠️XPASS"), "grid cell should show XPASS:\n{md}");
-        // Canonical label ("Strix Halo", via parse_descriptor's fallback
-        // titlecasing), not the raw "strix-halo" slug — see issue #702.
+        // Canonical label ("Strix Halo Linux", via parse_descriptor's fallback
+        // titlecasing — fallback_descriptor always assigns Linux), not the raw
+        // "strix-halo" slug, and WITH the OS (the grid has no separate OS
+        // column, unlike the summary matrix) — see issue #702.
         assert!(
-            md.contains("**XPASS** on `Strix Halo`: `serve-default` (EAI-7333)"),
+            md.contains("**XPASS** on `Strix Halo Linux`: `serve-default` (EAI-7333)"),
             "needs-attention should list the XPASS with bug:\n{md}"
         );
     }
@@ -3308,13 +3414,13 @@ mod tests {
                 .map(GridColumn::label)
                 .collect::<Vec<_>>()
         );
-        assert_eq!(grid.columns[0].label(), "Mock");
+        assert_eq!(grid.columns[0].label(), "Mock Linux");
         assert_eq!(
             grid.excluded,
             std::collections::BTreeSet::from(["MI300X Linux".to_string()]),
             "the platform.json-less platform must be named as excluded, with OS \
-             (excluded_platform_label uses the full platform+OS form, unlike the \
-             OS-less GridColumn::label, so it can't collide with a same-named \
+             (both excluded_platform_label and GridColumn::label use the full \
+             platform+OS form, so an excluded lane can't collide with a same-named \
              different-OS included column)"
         );
 
@@ -3391,7 +3497,7 @@ mod tests {
         assert!(
             note.contains(
                 "more platform(s) parsed a platform.json but declared no expectations, \
-                 so they have no rows to show either: Mock"
+                 so they have no rows to show either: Mock Linux"
             ),
             "must ALSO name the empty-expectations platform, not silently drop it \
              alongside the manifest-less one:\n{note}"
