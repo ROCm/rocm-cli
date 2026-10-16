@@ -132,7 +132,7 @@ static BUILTIN_ENGINE_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 /// User-selectable serving engines, in the order shown in `--help` and shell
 /// completions. Used as the clap `value_parser` for every user-facing `--engine`
 /// argument so the possible values stay in sync across the CLI surface.
-const SUPPORTED_ENGINES: [&str; 2] = ["lemonade", "vllm"];
+const SUPPORTED_ENGINES: [&str; 3] = ["lemonade", "vllm", "aim"];
 
 #[derive(Parser, Debug)]
 #[command(
@@ -2755,6 +2755,10 @@ const fn builtin_engine_inventory() -> &'static [(&'static str, &'static str)] {
         (
             "vllm",
             "Linux/WSL ROCm GPU serving engine through external vLLM",
+        ),
+        (
+            "aim",
+            "AMD Enterprise AI pre-built Docker serving containers",
         ),
     ]
 }
@@ -13565,6 +13569,10 @@ pub(crate) const fn engine_inventory() -> &'static [(&'static str, &'static str)
             "vllm",
             "Linux/WSL ROCm GPU serving engine through external vLLM",
         ),
+        (
+            "aim",
+            "AMD Enterprise AI pre-built Docker serving containers",
+        ),
     ]
 }
 
@@ -13858,6 +13866,7 @@ fn builtin_engine_request(
             envelope.clone(),
         )),
         "vllm" => Some(rocm_engine_vllm::builtin_handle_envelope(envelope.clone())),
+        "aim" => Some(rocm_engine_aim::builtin_handle_envelope(envelope.clone())),
         _ => None,
     }
 }
@@ -13876,7 +13885,7 @@ fn run_builtin_engine_stdio(engine: &str) -> Result<()> {
 }
 
 fn builtin_engine_available(engine: &str) -> bool {
-    matches!(engine, "lemonade" | "vllm")
+    matches!(engine, "lemonade" | "vllm" | "aim")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -13910,6 +13919,19 @@ fn run_builtin_engine_serve_http(
             engine_recipe,
         ),
         "vllm" => rocm_engine_vllm::builtin_serve_http(
+            service_id,
+            model_ref,
+            host,
+            port,
+            parsed_policy,
+            gpu_indices,
+            runtime_id,
+            env_id,
+            state_path,
+            log_path,
+            engine_recipe,
+        ),
+        "aim" => rocm_engine_aim::builtin_serve_http(
             service_id,
             model_ref,
             host,

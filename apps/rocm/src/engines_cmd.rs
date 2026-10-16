@@ -178,7 +178,7 @@ fn resolve_engine_install_runtime_id(
 }
 
 pub(crate) fn engine_manages_own_runtime(engine: &str) -> bool {
-    engine == "lemonade"
+    engine == "lemonade" || engine == "aim"
 }
 
 fn env_root_for_runtime(
