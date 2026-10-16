@@ -140,6 +140,7 @@ pub(crate) fn launch_service(request: LaunchRequest) -> Result<LaunchResponse> {
         &request.host,
         request.port,
         &gpu_indices,
+        engine_recipe.as_ref().map(|hint| &hint.extra_env),
     )?;
     let endpoint_url = endpoint_url(&request.host, request.port);
     crate::state::write_running_state(
@@ -175,6 +176,7 @@ fn run_container(
     host: &str,
     port: u16,
     gpu_indices: &[u32],
+    extra_env: Option<&std::collections::BTreeMap<String, String>>,
 ) -> Result<Option<String>> {
     let name = container_name(service_id);
     let metadata = crate::registry::fetch_image_metadata(model_ref).unwrap_or_default();
@@ -193,6 +195,7 @@ fn run_container(
         None
     };
 
+    let empty_env = std::collections::BTreeMap::default();
     crate::docker::run(
         &name,
         model_ref,
@@ -201,6 +204,7 @@ fn run_container(
         crate::DEFAULT_AIM_PORT,
         if use_gpu { gpu_indices } else { &[] },
         render_gid,
+        extra_env.unwrap_or(&empty_env),
     )?;
     Ok(metadata.canonical_name)
 }
@@ -212,6 +216,7 @@ pub(crate) fn serve_http(request: ServeHttpRequest) -> Result<()> {
         &request.host,
         request.port,
         &request.gpu_indices,
+        request.engine_recipe.as_ref().map(|hint| &hint.extra_env),
     )?;
 
     crate::state::write_running_state(

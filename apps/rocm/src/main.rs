@@ -564,6 +564,12 @@ rocm serve qwen --verbose --device gpu_required")]
         /// authenticated too.
         #[arg(long)]
         api_key: Option<String>,
+        /// Extra `KEY=VALUE` environment variable to pass through to the engine's
+        /// own process/container (repeatable). Engine-specific; currently only
+        /// `--engine aim` reads these (e.g. `AIM_PROFILE_ID`). Ignored by engines
+        /// that don't consume engine-env overrides.
+        #[arg(long = "engine-env", value_name = "KEY=VALUE")]
+        engine_env: Vec<String>,
     },
     /// [preview] Install, start, stop, or inspect ComfyUI.
     #[command(alias = "comfy")]
@@ -2510,6 +2516,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             top_p,
             max_tokens,
             api_key,
+            engine_env,
         }) => serve(ServeArgs {
             model,
             engine,
@@ -2531,6 +2538,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             top_p,
             max_tokens,
             api_key,
+            engine_env,
         }),
         Some(Command::Comfyui { command }) => comfyui(command),
         Some(Command::Services { command }) => services(command),
