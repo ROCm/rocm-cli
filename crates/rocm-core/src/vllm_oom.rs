@@ -40,8 +40,8 @@ pub const VLLM_OOM_DIAGNOSE_COMMAND: &str = "rocm diagnose --symptom";
 /// the allocator keywords, so it scores as an OOM just as strongly as the real
 /// line does, and it lands *after* it. A newest-first scan would therefore
 /// always select rocm-cli's own sentence, which contains `'` and backticks, so
-/// [`quotable_in_single_quotes`] would reject it and the printed command would
-/// fall back to [`VLLM_OOM_CANONICAL_SYMPTOM`] every single time in real use —
+/// [`quotable_in_single_quotes`](terminal::quotable_in_single_quotes) would reject it and the printed command would
+/// fall back to [`VLLM_OOM_CANONICAL_SYMPTOM`](diagnose::VLLM_OOM_CANONICAL_SYMPTOM) every single time in real use —
 /// exactly the "quote the user's real line" promise the note is built on.
 ///
 /// Matching on rocm-cli's own wording is deliberate, rather than truncating the
@@ -57,7 +57,7 @@ fn is_rocm_authored_log_line(segment: &str) -> bool {
 
 /// Whether one log segment carries a genuine out-of-memory failure, scored with
 /// the *same* rule as the `rocm diagnose` vLLM-OOM checker (`check_16_vllm_oom`,
-/// reached through [`vllm_oom_symptom_is_diagnosable`]) so the engine hint, the
+/// reached through [`vllm_oom_symptom_is_diagnosable`](diagnose::vllm_oom_symptom_is_diagnosable)) so the engine hint, the
 /// post-failure serve summary and `rocm diagnose` never disagree on what counts
 /// as a vLLM OOM. The segment is vLLM's own process output, so the checker's
 /// required vLLM anchor is supplied by context: it is scored as
@@ -88,7 +88,7 @@ fn is_rocm_authored_log_line(segment: &str) -> bool {
 ///
 /// This costs nothing on the quoting side, and provably so: a segment that
 /// `rendered_lines` splits into more than one row must contain a control
-/// character or an `ESC`, and [`quotable_in_single_quotes`] rejects every one of
+/// character or an `ESC`, and [`quotable_in_single_quotes`](terminal::quotable_in_single_quotes) rejects every one of
 /// those. So a multi-row segment can only ever reach the printed command as the
 /// canonical fallback — it can never be stripped into a runnable lookalike of
 /// the user's error. The raw segment, control bytes intact, is still what
@@ -110,7 +110,7 @@ fn segment_shows_oom(segment: &str) -> bool {
 /// that is what the diagnostic re-splits with. `rendered_lines` also discards
 /// escape sequences and other control bytes, and the segment returned here
 /// becomes the `--symptom` argument: sanitising it means
-/// [`quotable_in_single_quotes`] only ever sees clean text, never rejects it,
+/// [`quotable_in_single_quotes`](terminal::quotable_in_single_quotes) only ever sees clean text, never rejects it,
 /// and the canonical-symptom fallback stops firing — so a colourised OOM line
 /// would be stripped into a lookalike and printed rather than refused. Keeping
 /// the raw bytes here and doing the *scoring* on rendered rows inside
@@ -164,12 +164,12 @@ fn vllm_log_segments(log: &str) -> impl Iterator<Item = String> + '_ {
 /// The exact guarantee is narrower than "whatever comes back is diagnosable",
 /// and the difference is load-bearing. What holds is:
 ///
-/// > if [`quotable_in_single_quotes`] accepts the returned value, then
-/// > [`vllm_oom_symptom_is_diagnosable`] accepts it too.
+/// > if [`quotable_in_single_quotes`](terminal::quotable_in_single_quotes) accepts the returned value, then
+/// > [`vllm_oom_symptom_is_diagnosable`](diagnose::vllm_oom_symptom_is_diagnosable) accepts it too.
 ///
 /// That is what the callers need, because quotability is what they gate the
 /// printed command on, and it is exactly enough: a returned line that is *not*
-/// quotable is replaced by [`VLLM_OOM_CANONICAL_SYMPTOM`], which is diagnosable,
+/// quotable is replaced by [`VLLM_OOM_CANONICAL_SYMPTOM`](diagnose::VLLM_OOM_CANONICAL_SYMPTOM), which is diagnosable,
 /// so the printed command always reports a cause either way.
 ///
 /// The stronger claim is false, and necessarily so. A segment carrying an
@@ -200,8 +200,8 @@ fn vllm_log_segments(log: &str) -> impl Iterator<Item = String> + '_ {
 ///
 /// The return value is *log text*, not a shell-safe token: some callers only
 /// display it. A caller that renders it inside a quoted command must gate it on
-/// [`quotable_in_single_quotes`] first and fall back to
-/// [`VLLM_OOM_CANONICAL_SYMPTOM`] otherwise. Guaranteeing quotability here
+/// [`quotable_in_single_quotes`](terminal::quotable_in_single_quotes) first and fall back to
+/// [`VLLM_OOM_CANONICAL_SYMPTOM`](diagnose::VLLM_OOM_CANONICAL_SYMPTOM) otherwise. Guaranteeing quotability here
 /// instead would impose the command-builder's constraint on the display-only
 /// callers, silently withholding the user's real error from text that is never
 /// pasted anywhere.
@@ -220,7 +220,7 @@ pub fn vllm_oom_diagnose_symptom(log_tail: &str) -> Option<String> {
 /// selected, with the `vllm: ` anchor already removed by the caller.
 ///
 /// Not the same operation as stripping the segment's control bytes, and the
-/// difference is the whole point. [`strip_terminal_control_sequences`] deletes
+/// difference is the whole point. [`strip_terminal_control_sequences`](terminal::strip_terminal_control_sequences) deletes
 /// every break token — `\r`, `ESC[1A`, `NEL`, `VT`, `U+2028`… — *without a
 /// separator*, so a progress-bar repaint such as
 /// `Loading weights: 90%\x1b[1Atorch.OutOfMemoryError: HIP out of memory` comes
