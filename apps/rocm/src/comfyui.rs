@@ -2297,6 +2297,7 @@ fn child_path_string(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use crate::chat;
     use rocm_core::{runtime_python_executable_in_env, runtime_rocm_library_filename};
     use std::net::TcpListener;
