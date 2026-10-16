@@ -444,3 +444,16 @@ Feature: GPU detection and system inspection
     Given a machine whose kernel has no kfd and lists no amdkfd module
     When the user inspects that machine in machine-readable form
     Then the inspection reports kfd as not loaded
+
+  # amdgpu built into the kernel is absent from `lsmod` too, so it was read as
+  # "module not loaded" and `rocm diagnose` scored that, plus a DKMS failure
+  # and Secure Boot, as evidence. `/sys/module/amdgpu` exists for a loaded
+  # module and a built-in driver alike. The machine also has a ROCm install
+  # and Secure Boot enabled, so the evidence lines are reachable if the flag
+  # regresses.
+  @id:examine-reports-amdgpu-built-into-the-kernel @requires-os:linux
+  Scenario: examine-31 - A built-in amdgpu is reported as loaded and diagnose finds no driver fault
+    Given a machine whose kernel has amdgpu built in and lists no amdgpu module
+    When the user inspects and diagnoses that machine
+    Then the inspection reports amdgpu as loaded
+    And the diagnosis cites no missing amdgpu module, DKMS failure or Secure Boot evidence
