@@ -3889,8 +3889,13 @@ mod tests {
     /// If publishing the `recovering` transition fails, nothing has been
     /// spawned yet: the rollback at that first write must undo the in-memory
     /// transition and leave the on-disk record exactly as it was, not a
-    /// half-applied `recovering` row. A manifest file made read-only after
-    /// being seeded fails that exact write without ever reaching the spawn.
+    /// half-applied `recovering` row. The manifest write goes through
+    /// [`crate::write_atomic`][rocm_core_write_atomic]-style write-then-rename,
+    /// so a read-only *file* no longer blocks it (rename ignores the
+    /// destination's own permission bits) — a read-only *directory* still does,
+    /// since it can't hold the new temp file the rename needs.
+    ///
+    /// [rocm_core_write_atomic]: rocm_core
     ///
     /// Unix only and skipped as root, where a read-only mode is not enforced
     /// and the write would simply succeed.
@@ -3910,14 +3915,20 @@ mod tests {
         record.status = "failed".to_owned();
         record.write()?;
 
-        let manifest_path = paths.service_manifest_path(service_id);
-        fs::set_permissions(&manifest_path, std::fs::Permissions::from_mode(0o444))?;
+        let services_dir = paths.services_dir();
+        // The launch lock and service log files are both created lazily, on
+        // first acquire and on first open respectively; pre-create them so
+        // making the directory read-only below blocks only the manifest's
+        // write-then-rename, not those earlier opens.
+        fs::File::create(paths.managed_launch_lock_path())?;
+        fs::File::create(&record.log_path)?;
+        fs::set_permissions(&services_dir, std::fs::Permissions::from_mode(0o555))?;
 
         let result = restart_managed_service(&paths, &mut record);
 
         // Restore write access so the rest of the write (if any landed) can be
         // read back, and so cleanup can remove the directory.
-        fs::set_permissions(&manifest_path, std::fs::Permissions::from_mode(0o644))?;
+        fs::set_permissions(&services_dir, std::fs::Permissions::from_mode(0o755))?;
         let persisted = load_service_record(&paths, service_id);
         fs::remove_dir_all(root).ok();
 
@@ -4018,6 +4029,9 @@ mod tests {
     /// subsequent rollback write hit the same permission error. That must be
     /// reported as a rollback failure, not swallowed as the original one.
     ///
+    /// The manifest writes go through write-then-rename, so blocking the
+    /// *directory* (not the file) is what actually denies them.
+    ///
     /// Unix only and skipped as root, where a read-only mode is not enforced.
     #[cfg(unix)]
     #[test]
@@ -4038,8 +4052,9 @@ mod tests {
         record.write()?;
 
         let manifest_path = paths.service_manifest_path(service_id);
+        let services_dir = paths.services_dir();
         let lock = {
-            let manifest_path = manifest_path.clone();
+            let services_dir = services_dir.clone();
             thread::spawn(move || -> bool {
                 let deadline = std::time::Instant::now() + Duration::from_secs(10);
                 while std::time::Instant::now() < deadline {
@@ -4048,8 +4063,8 @@ mod tests {
                         && on_disk.status == "recovering"
                         && on_disk.supervisor_pid == 0
                         && fs::set_permissions(
-                            &manifest_path,
-                            std::fs::Permissions::from_mode(0o444),
+                            &services_dir,
+                            std::fs::Permissions::from_mode(0o555),
                         )
                         .is_ok()
                     {
@@ -4062,7 +4077,7 @@ mod tests {
         };
         let outcome = restart_managed_service(&paths, &mut record);
         let locked_in_time = lock.join().expect("lock thread");
-        fs::set_permissions(&manifest_path, std::fs::Permissions::from_mode(0o644))?;
+        fs::set_permissions(&services_dir, std::fs::Permissions::from_mode(0o755))?;
         let persisted = load_service_record(&paths, service_id);
         fs::remove_dir_all(root).ok();
 
