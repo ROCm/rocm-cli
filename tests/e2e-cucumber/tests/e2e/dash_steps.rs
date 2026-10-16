@@ -52,6 +52,330 @@ const fn session(world: &mut E2eWorld) -> &mut TuiSession {
         .expect("no interactive TUI session is open for this scenario")
 }
 
+// This is a protocol contract journey: CLI, embedded daemon and TUI are real;
+// the HTTP service is a named protocol fixture, not GPU inference.
+const PROTOCOL_MODELS: [&str; 2] = ["Protocol-Qwen-4B", "Protocol-Phi-3B"];
+
+#[given("an external Lemonade server has two models loaded")]
+async fn external_lemonade_protocol(world: &mut E2eWorld) {
+    let server = e2e_cucumber::lemonade_protocol::LemonadeProtocolServer::start(&PROTOCOL_MODELS);
+    configure_lemonade_discovery(world, server.port());
+    let root = world.isolated_root.as_ref().expect("isolated root").path();
+    assert!(
+        !root.join("data/services").exists(),
+        "no managed service may be planted"
+    );
+    world.lemonade_protocol = Some(server);
+}
+
+fn configure_lemonade_discovery(world: &E2eWorld, port: u16) {
+    // Discovery is off by default in the isolated config (see
+    // `disable_lemonade_discovery_by_default`), so these scenarios turn it on
+    // explicitly. `lemonade_host` is omitted to exercise its serde default.
+    // Socket isolation comes from the PTY driver's HOME/XDG environment.
+    write_dashboard_config(
+        world,
+        serde_json::json!({
+            "dashboard": { "daemon": { "enable_lemonade": true, "lemonade_port": port,
+                "discovery_tick_secs": 0.1, "instance_tick_secs": 0.1 } }
+        }),
+    );
+}
+
+#[given("the dashboard watches only managed services")]
+async fn dashboard_managed_only(world: &mut E2eWorld) {
+    // An unrelated live endpoint on the default port must not supply the
+    // model or external-running status in this real managed-service journey.
+    write_dashboard_config(
+        world,
+        serde_json::json!({"dashboard": {"daemon": {"enable_lemonade": false}}}),
+    );
+}
+
+/// Keep a dashboard that is not testing Lemonade discovery away from any real
+/// Lemonade server on the default port. Call before every dashboard spawn.
+fn disable_lemonade_discovery_by_default(world: &E2eWorld) {
+    let root = world.isolated_root.as_ref().expect("isolated root").path();
+    let dir = root.join("config");
+    std::fs::create_dir_all(&dir).expect("create config dir");
+    let path = dir.join("config.json");
+    let existing = std::fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+    let config = e2e_cucumber::dash_screen::with_lemonade_discovery_default_off(existing);
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&config).expect("serialize config"),
+    )
+    .expect("write config");
+}
+
+fn write_dashboard_config(world: &E2eWorld, config: serde_json::Value) {
+    let root = world.isolated_root.as_ref().expect("isolated root").path();
+    let dir = root.join("config");
+    std::fs::create_dir_all(&dir).expect("create config dir");
+    let path = dir.join("config.json");
+    // An earlier step may have written the active runtime here; keep it.
+    let existing = std::fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+    let merged = e2e_cucumber::dash_screen::merge_dashboard_daemon_config(existing, &config);
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&merged).expect("serialize config"),
+    )
+    .expect("write config");
+}
+
+#[then("both loaded models are displayed with throughput shown as unknown")]
+async fn external_models_visible(world: &mut E2eWorld) {
+    session(world)
+        .wait_for_screen_where(
+            "both protocol models, with unknown unattributable throughput",
+            |screen| {
+                PROTOCOL_MODELS.iter().all(|model| {
+                    screen
+                        .lines()
+                        .any(|line| protocol_tps_cell(line, model) == Some("—"))
+                })
+            },
+            default_timeout(),
+        )
+        .await
+        .expect("external models should be discovered");
+}
+
+fn protocol_tps_cell<'a>(line: &'a str, model: &str) -> Option<&'a str> {
+    let mut cells = line.split_whitespace().skip_while(|cell| *cell != model);
+    cells.next()?;
+    cells.next()
+}
+
+#[when("the external Lemonade server unloads its second model")]
+async fn external_single_model(world: &mut E2eWorld) {
+    world
+        .lemonade_protocol
+        .as_ref()
+        .expect("fixture")
+        .set_loaded(&PROTOCOL_MODELS[..1]);
+}
+
+#[then("only the first model is displayed, with its throughput")]
+async fn external_single_model_rate(world: &mut E2eWorld) {
+    session(world)
+        .wait_for_screen_where(
+            "single protocol model with unambiguous last-request throughput",
+            |screen| {
+                !screen.contains(PROTOCOL_MODELS[1])
+                    && screen
+                        .lines()
+                        .any(|line| protocol_tps_cell(line, PROTOCOL_MODELS[0]) == Some("38"))
+                    // The rate is the last completed request's, and the screen says so.
+                    && screen.contains("last req tok/s")
+            },
+            default_timeout(),
+        )
+        .await
+        .expect("single loaded model owns endpoint stats");
+}
+
+#[when("the external Lemonade server unloads every model")]
+async fn external_unload(world: &mut E2eWorld) {
+    world
+        .lemonade_protocol
+        .as_ref()
+        .expect("fixture")
+        .set_loaded(&[]);
+}
+
+#[then("no loaded model is displayed and none are reported as discovered")]
+async fn external_models_absent(world: &mut E2eWorld) {
+    session(world)
+        .wait_for_screen_where(
+            "unloaded external models disappear",
+            |screen| {
+                PROTOCOL_MODELS.iter().all(|m| !screen.contains(m))
+                    && screen.contains("no serving models discovered")
+            },
+            default_timeout(),
+        )
+        .await
+        .expect("stale external models must disappear");
+}
+
+#[when("the external Lemonade server loads both models again")]
+async fn external_reload(world: &mut E2eWorld) {
+    world
+        .lemonade_protocol
+        .as_ref()
+        .expect("fixture")
+        .set_loaded(&PROTOCOL_MODELS);
+}
+
+#[when("the external Lemonade server stops responding")]
+async fn external_unreachable(world: &mut E2eWorld) {
+    drop(world.lemonade_protocol.take());
+}
+
+#[then("the external server received no lifecycle request and no managed record exists")]
+async fn external_server_untouched(world: &mut E2eWorld) {
+    // What this proves: the fixture recorded only observational requests (the
+    // stray-request check below) and the registry holds no record. The health
+    // read is a sanity check that the fixture still answers; the fixture is an
+    // in-process thread the dashboard cannot stop, so it is not evidence of
+    // anything on its own.
+    let fixture = world.lemonade_protocol.as_ref().expect("fixture");
+    let response = reqwest::get(format!("{}/api/v1/health", fixture.base_url()))
+        .await
+        .expect("dashboard quit must leave external service alive");
+    assert!(response.status().is_success());
+    let body: serde_json::Value = response.json().await.expect("health JSON");
+    assert_eq!(body["status"], "ok");
+    // The dashboard may only observe: any load, unload, stop or other request
+    // reaching the external server would be a lifecycle action on a service it
+    // does not own.
+    assert_eq!(
+        fixture.stray_requests(),
+        Vec::<String>::new(),
+        "the dashboard sent a non-observational request to the external server"
+    );
+    assert_eq!(
+        body["all_models_loaded"].as_array().expect("models").len(),
+        2
+    );
+    let services = world
+        .isolated_root
+        .as_ref()
+        .expect("root")
+        .path()
+        .join("data/services");
+    assert!(
+        !services.exists()
+            || std::fs::read_dir(services)
+                .expect("services")
+                .next()
+                .is_none(),
+        "discovery must not adopt an external fixture as a managed service"
+    );
+}
+
+#[when("the user selects engine status in the Serving view")]
+async fn engine_status_pane(world: &mut E2eWorld) {
+    let tui = session(world);
+    tui.use_detail_size().expect("enlarge dashboard");
+    tui.send_until("3", "● Serving", default_timeout())
+        .await
+        .expect("Serving view");
+    tui.send("gj").expect("select Engines action");
+}
+
+#[then("Lemonade is shown as externally running without a managed installation")]
+async fn external_installation_truth(world: &mut E2eWorld) {
+    session(world)
+        .wait_for_screen_where(
+            "external versus managed engine state",
+            |screen| {
+                screen.contains("Lemonade — externally running")
+                    && screen.contains("Managed runtime — not installed")
+            },
+            default_timeout(),
+        )
+        .await
+        .expect("engine status must distinguish external service and managed install");
+}
+
+#[then("Lemonade returns to the managed installation status without external availability")]
+async fn external_availability_cleared(world: &mut E2eWorld) {
+    session(world)
+        .wait_for_screen_where(
+            "unreachable endpoint no longer counts as external availability",
+            |screen| {
+                screen.contains("Lemonade — managed runtime not installed")
+                    && !screen.contains("Lemonade — externally running")
+            },
+            default_timeout(),
+        )
+        .await
+        .expect("engine status must return to managed inventory after endpoint loss");
+}
+
+#[then("the real managed Lemonade model is displayed")]
+async fn real_lemonade_visible(world: &mut E2eWorld) {
+    // The preceding real inference assertion identifies this scenario's model.
+    // Direct llama-server need not expose Lemonade stats: missing throughput is
+    // truthful and must not cause us to invent a rate to satisfy this journey.
+    //
+    // Anchored to a full Observe instances row (the model cell followed by the
+    // TOK/S .. KV% cells), not to the name appearing anywhere on screen, so a
+    // stray mention elsewhere cannot satisfy it. The dashboard watches only
+    // managed services in this scenario, so that row is the registry-owned one.
+    // The row carries neither status nor port; the next steps read those from
+    // the instance detail.
+    session(world)
+        .wait_for_screen_where(
+            "an Observe row for the managed Lemonade model",
+            |screen| {
+                screen.lines().any(|line| {
+                    e2e_cucumber::dash_screen::observe_row_cells(line, "Qwen3-0.6B").is_some()
+                })
+            },
+            default_timeout(),
+        )
+        .await
+        .expect("dashboard must display this scenario's real served model");
+}
+
+#[then("the managed model's instance detail shows it ready on the port it was served on")]
+async fn real_lemonade_detail_ready(world: &mut E2eWorld) {
+    let endpoint = world
+        .endpoint
+        .clone()
+        .expect("the serve step sets an endpoint");
+    let port = e2e_cucumber::dash_screen::endpoint_port(&endpoint)
+        .unwrap_or_else(|| panic!("no port in served endpoint {endpoint}"));
+    session(world)
+        .wait_for_screen_where(
+            "instance detail showing the model READY on the served port",
+            |screen| {
+                e2e_cucumber::dash_screen::instance_detail_matches(
+                    screen,
+                    "Qwen3-0.6B",
+                    "READY",
+                    &port,
+                )
+            },
+            default_timeout(),
+        )
+        .await
+        .unwrap_or_else(|e| {
+            panic!("instance detail must show Qwen3-0.6B READY on port {port}: {e}")
+        });
+}
+
+#[when("the user closes instance detail")]
+async fn close_instance_detail(world: &mut E2eWorld) {
+    // Esc closes the popup, but with no popup open it opens the menu. So send
+    // it once and wait for the popup to be gone.
+    let tui = session(world);
+    tui.send("\x1b")
+        .unwrap_or_else(|e| panic!("failed to send Esc: {e}"));
+    tui.wait_for_screen_where(
+        "instance detail closed",
+        |screen| !screen.contains("Instance · "),
+        default_timeout(),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("instance detail did not close: {e}"));
+}
+
+#[then("Lemonade is shown as a managed runtime installation")]
+async fn real_lemonade_installed(world: &mut E2eWorld) {
+    session(world)
+        .wait_for_screen("Lemonade — managed runtime installed", default_timeout())
+        .await
+        .expect("managed engine Detect evidence must reach dashboard");
+}
+
 // ── Given ──────────────────────────────────────────────────────────
 
 #[given("interactive chat uses an offline assistant")]
@@ -160,6 +484,7 @@ async fn replay_missing_recording(world: &mut E2eWorld) {
     ));
     let _ = std::fs::remove_file(&missing);
     let path = missing.to_string_lossy().to_string();
+    disable_lemonade_discovery_by_default(world);
     let session = TuiSession::spawn(world, &["dash", "--replay", &path])
         .unwrap_or_else(|e| panic!("failed to spawn dash under a pty: {e}"));
     world.tui = Some(session);
@@ -169,6 +494,7 @@ async fn replay_missing_recording(world: &mut E2eWorld) {
 async fn open_dashboard_demo(world: &mut E2eWorld) {
     // `--demo` replays a deterministic synthetic session, so the dashboard
     // populates with no GPU and no daemon — a stable, mock-tier target.
+    disable_lemonade_discovery_by_default(world);
     let session = TuiSession::spawn(world, &["dash", "--demo"])
         .unwrap_or_else(|e| panic!("failed to open the dashboard: {e}"));
     world.tui = Some(session);
@@ -219,6 +545,7 @@ async fn open_chat(world: &mut E2eWorld) {
 
 #[when("the user opens the dashboard")]
 async fn open_dashboard(world: &mut E2eWorld) {
+    disable_lemonade_discovery_by_default(world);
     let tui = TuiSession::spawn(world, &["dash"])
         .unwrap_or_else(|e| panic!("failed to open the dashboard: {e}"));
     world.tui = Some(tui);
@@ -228,6 +555,7 @@ async fn open_dashboard(world: &mut E2eWorld) {
 async fn open_launcher(world: &mut E2eWorld) {
     // Bare `rocm` (no subcommand) opens the launcher front door under an
     // interactive terminal — the PTY slave satisfies `interactive_terminal()`.
+    disable_lemonade_discovery_by_default(world);
     let tui = TuiSession::spawn(world, &[])
         .unwrap_or_else(|e| panic!("failed to open the launcher: {e}"));
     world.tui = Some(tui);
@@ -283,6 +611,104 @@ async fn open_services_overlay(world: &mut E2eWorld) {
     tui.wait_for_screen(SERVICES_OVERLAY_TITLE, default_timeout())
         .await
         .unwrap_or_else(|e| panic!("failed to open the services overlay: {e}"));
+}
+
+#[then("the Services overlay has no managed servers")]
+async fn external_services_are_read_only(world: &mut E2eWorld) {
+    session(world)
+        .wait_for_screen(
+            "No managed services. Start one with `rocm serve <model> --managed`.",
+            default_timeout(),
+        )
+        .await
+        .expect("discovered external models must not become lifecycle targets");
+}
+
+#[then("the Services overlay lists the managed model with its port")]
+async fn services_overlay_lists_managed_model(world: &mut E2eWorld) {
+    let model = world.model_name.clone().expect("no model name set");
+    let port =
+        e2e_cucumber::dash_screen::endpoint_port(world.endpoint.as_deref().expect("no endpoint"))
+            .expect("endpoint has a port");
+    let port_cell = format!(":{port}");
+    session(world)
+        .wait_for_screen_where(
+            "a Services row for the managed model and its port",
+            |screen| {
+                !screen.contains("No managed services.")
+                    && screen
+                        .lines()
+                        .any(|line| line.contains(&model) && line.contains(&port_cell))
+            },
+            default_timeout(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("the managed service is not listed in the overlay: {e}"));
+}
+
+#[when("the user asks to stop the listed service")]
+async fn user_stages_stop(world: &mut E2eWorld) {
+    // Sent once: the key stages an approval, and a second copy would land on the
+    // approval prompt rather than the list.
+    session(world)
+        .send("s")
+        .unwrap_or_else(|e| panic!("failed to send the stop key: {e}"));
+}
+
+#[then("a stop approval prompt names the managed model and its port")]
+async fn stop_approval_is_shown(world: &mut E2eWorld) {
+    let model = world.model_name.clone().expect("no model name set");
+    let port =
+        e2e_cucumber::dash_screen::endpoint_port(world.endpoint.as_deref().expect("no endpoint"))
+            .expect("endpoint has a port");
+    let detail = format!("model: {model}   port: {port}");
+    session(world)
+        .wait_for_screen_where(
+            "a stop approval for the managed service",
+            |screen| {
+                screen.contains("Review: stop service")
+                    && screen.contains("Approve (y)")
+                    && screen.contains(&detail)
+            },
+            default_timeout(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("no stop approval prompt appeared: {e}"));
+}
+
+#[when("the user declines the approval prompt")]
+async fn user_declines_approval(world: &mut E2eWorld) {
+    // Esc declines without confirming. The prompt itself going away is the
+    // proof the key was read; the overlay list stays open behind it.
+    let tui = session(world);
+    tui.send("\u{1b}")
+        .unwrap_or_else(|e| panic!("failed to decline the approval: {e}"));
+    tui.wait_until_gone("Review: stop service", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the approval prompt did not close: {e}"));
+}
+
+#[when("the user attempts to stop and restart the external models")]
+async fn external_lifecycle_keys_do_nothing(world: &mut E2eWorld) {
+    let tui = session(world);
+    tui.send("sr").expect("attempt stop and restart");
+    // One Escape closes the list only if neither key staged an approval or a
+    // lifecycle console. In either modal, it dismisses that modal instead and
+    // leaves the Services overlay open, which the next step then catches.
+    tui.send("\u{1b}").expect("close Services list");
+}
+
+#[then("the Services overlay closes without an approval prompt or job")]
+async fn external_lifecycle_keys_left_no_modal(world: &mut E2eWorld) {
+    session(world)
+        .wait_until_gone(SERVICES_OVERLAY_TITLE, default_timeout())
+        .await
+        .expect("external lifecycle keys must not stage approval or launch a job");
+}
+
+#[then("both loaded models are still displayed")]
+async fn external_models_still_visible(world: &mut E2eWorld) {
+    external_models_visible(world).await;
 }
 
 #[then("the overlay reports the record that is no longer running")]

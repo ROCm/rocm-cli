@@ -140,6 +140,18 @@ These modules are private `mod` declarations — [`lib.rs`](../crates/e2e-report
 
 ### `engines/lemonade`, `engines/vllm` — inference engine adapters
 
+Lemonade's route decision in
+[`direct_llama.rs`](../engines/lemonade/src/direct_llama.rs) keeps unknown or
+multi-file catalog entries with the router. A direct server retains its exact
+alias; router state records the normalized served name as `canonical_model_id`
+while preserving the requested `model_ref`.
+
+Dashboard ownership comes from managed registry discovery, not endpoint names or
+ID prefixes. The serde-defaulted `Instance.managed` field in
+[`metrics.rs`](../crates/rocm-dash-core/src/metrics.rs) defaults to false for older
+snapshots. External rows remain observable but are excluded from lifecycle
+controls in [`services_manager.rs`](../crates/rocm-dash-tui/src/ui/services_manager.rs).
+
 `engines/vllm` follows full domain extraction:
 
 - [`install.rs`](../engines/vllm/src/install.rs) — ROCm/vLLM build-variant discovery, install execution, and runtime-repair assessment.
@@ -152,9 +164,10 @@ These modules are private `mod` declarations — [`lib.rs`](../crates/e2e-report
 `engines/lemonade` follows the same pattern:
 
 - [`backend_alignment.rs`](../engines/lemonade/src/backend_alignment.rs) — ROCm-SDK-to-llama.cpp-backend Tier 1/Tier 2/revert alignment and backend discovery/install/selection.
-- [`direct_llama.rs`](../engines/lemonade/src/direct_llama.rs) — Hugging Face checkpoint/GGUF resolution and the direct-llama-server serve path.
+- [`direct_llama.rs`](../engines/lemonade/src/direct_llama.rs) — Hugging Face checkpoint/GGUF resolution, registered GGUF checkpoint lookup from the installed Lemonade catalog, selected-backend binary lookup, and the direct-llama-server serve path.
 - [`install.rs`](../engines/lemonade/src/install.rs) — embeddable-runtime archive download/verify/extract, cache locking, and manifest persistence.
 - [`process.rs`](../engines/lemonade/src/process.rs) — `lemond`/llama-server spawn, env/path setup, and readiness/health polling.
+- [`router_serve.rs`](../engines/lemonade/src/router_serve.rs) — the router serve path: spawn `lemond`, select a GPU backend, load and verify the model by its router name, and, on any error after the spawn (state writes and the final wait included), stop the server and mark engine state failed. A model load or verification failure is tagged so `lib.rs` can, on Linux only, retry through the selected GPU backend's llama-server (`direct_fallback_route` in [`direct_llama.rs`](../engines/lemonade/src/direct_llama.rs)); any other error is returned as it is. The steps sit behind a trait so tests can drive them without a real server.
 - [`runtime_dir.rs`](../engines/lemonade/src/runtime_dir.rs) — `XDG_RUNTIME_DIR` tier1/2/3 hardening for the spawned child.
 - [`state.rs`](../engines/lemonade/src/state.rs) — service state file I/O, device-policy/GPU-selection parsing, and port/endpoint helpers.
 

@@ -1337,6 +1337,7 @@ mod tests {
             Instance {
                 container_id: "svc-managed".to_string(),
                 status: InstanceStatus::Running,
+                managed: true,
                 ..Default::default()
             },
         );

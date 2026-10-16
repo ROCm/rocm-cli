@@ -534,6 +534,60 @@ async fn assert_lemonade_backend_alignment_reported(world: &mut E2eWorld) {
     );
 }
 
+/// The advice `rocm serve` prints when a selected backend's `llama-server` is
+/// missing is `rocm engines install lemonade --reinstall`. This checks that after
+/// the reinstall the binary the direct serve route looks for exists. The runtime
+/// is not damaged first, so this does not prove the reinstall restores a missing
+/// binary.
+///
+/// The lookup mirrors the engine's own (`<runtime_dir>/bin/llamacpp/<backend>/`)
+/// through [`e2e_cucumber::lemonade_backend::find_llama_server`], reading the
+/// runtime directory and backend from the manifest the install just wrote.
+#[then("the selected Lemonade backend's llama-server binary is installed")]
+async fn assert_lemonade_backend_server_installed(world: &mut E2eWorld) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("scenario has no isolated state root")
+        .path();
+    let manifest_path = root.join("data/engines/lemonade/manifests/runtime.json");
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&manifest_path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", manifest_path.display())),
+    )
+    .unwrap_or_else(|error| panic!("failed to parse {}: {error}", manifest_path.display()));
+    let field = |name: &str| {
+        manifest[name]
+            .as_str()
+            .unwrap_or_else(|| panic!("no `{name}` in {}: {manifest}", manifest_path.display()))
+            .to_owned()
+    };
+    let (recipe, backend, runtime_dir) = (
+        field("backend_recipe"),
+        field("backend_name"),
+        std::path::PathBuf::from(field("runtime_dir")),
+    );
+    assert_eq!(
+        recipe, "llamacpp",
+        "the selected recipe is not llama.cpp, so direct serving has no llama-server to find: \
+         {manifest}"
+    );
+    let lookup = e2e_cucumber::lemonade_backend::find_llama_server(&runtime_dir, &backend)
+        .unwrap_or_else(|reason| panic!("{reason}: {manifest}"));
+    assert!(
+        lookup.found.is_some(),
+        "after the reinstall, no llama-server exists for the selected backend `{backend}` under {}. \
+         Searched (flat, or one build-numbered level down):\n{}",
+        runtime_dir.display(),
+        lookup
+            .searched
+            .iter()
+            .map(|dir| format!("  {}", dir.display()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
 /// The CLI names the variable whenever it is set, so a user can tell it was
 /// read -- this alone does not prove alignment was actually skipped.
 ///

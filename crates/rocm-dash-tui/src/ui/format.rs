@@ -240,6 +240,10 @@ pub const HELD_MARKER: &str = "*";
 /// panels rather than inventing view-specific descriptions.
 pub const HELD_LEGEND: &str = "* = held (prior scrape window)";
 
+/// Explains the tok/s of a Lemonade row: the endpoint reports the rate of its most
+/// recent completed request, which stays unchanged while the server is idle.
+pub const LAST_REQ_LEGEND: &str = "Lemonade tok/s = last req tok/s (not live)";
+
 /// Compact gen_tps for narrow table cells (matches the existing bare-number format).
 ///
 /// - `None` → `"—"` (unavailable; em-dash matches the rest of the table)
