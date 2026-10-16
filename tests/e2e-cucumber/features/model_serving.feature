@@ -342,37 +342,8 @@ Feature: Model serving
     When the user lists recommended models
     Then the model list output contains only ASCII characters
 
-  # Regression test (EAI-8059 review): re-issuing `serve` against an
-  # already-running managed service must never blame *this* invocation for the
-  # other process's failure — nothing was launched here, so there is nothing for
-  # it to have OOM'd on. What this scenario covers end-to-end is that the reuse
-  # summary carries no memory guidance; it does NOT discriminate the
-  # `already_running` clause of `append_oom_serve_note`'s guard, because the real
-  # reuse path reports `log_path: None` and the note is withheld on that ground
-  # alone. The planted OOM log therefore states the premise (a live service whose
-  # log does carry a real allocator signature) rather than driving the assertion.
-  # The `already_running` clause itself is pinned by the unit test
-  # `append_oom_serve_note_ignores_an_already_running_services_log`, which feeds
-  # it an OOM-bearing log path directly.
-  # Runs on the no-GPU mock host: reusing an already-running managed service
-  # launches nothing and pins no GPU, so `rocm serve` bypasses the GPU-required
-  # pre-flight and reaches the reuse short-circuit even here. It therefore gates
-  # every PR and allocates no GPU memory.
-  #
-  # Titled for what it proves, not for what it is about: the OOM-absence Then
-  # cannot fail on this path (the note is already withheld for the missing log
-  # path), so replacing the `append_oom_serve_note` call with a no-op leaves this
-  # scenario green — serve-27 is the one that goes red. What only this scenario
-  # proves is the reuse exemption itself: that a GPU-less host reaches the reuse
-  # summary at all.
-  @id:serve-oom-memory-guidance @requires-no-gpu @requires-os:linux
-  Scenario: serve-26 - Reuse succeeds on a GPU-less host and the summary carries no memory guidance
-    Given a live managed vLLM serve has an OOM startup log
-    When the user opens its interactive serve summary
-    Then the summary reflects the reused already-running service
-    And the deployment summary does not blame this invocation for GPU memory
-
-  # Positive counterpart of serve-26 (EAI-8059 review asked for both): when
+  # The positive case for the OOM note (EAI-8059 review asked for it
+  # explicitly, alongside the withholding the unit tests pin): when
   # THIS invocation launches a managed vLLM serve that OOMs and never becomes
   # ready, the summary MUST name the memory knobs. A real launch cannot run on a
   # GPU-less host, so the mock lane build compiles in a test-only fault-injection
@@ -384,104 +355,9 @@ Feature: Model serving
   # where xtask builds the binary with the feature. @requires-no-gpu because the
   # fabricated launch stands in for the GPU the mock lane does not have.
   @id:serve-oom-launch-memory-guidance @requires-no-gpu @requires-os:linux @requires-oom-fault-injection
-  Scenario: serve-27 - A launch that runs out of GPU memory names the memory knobs
+  Scenario: serve-26 - A launch that runs out of GPU memory names the memory knobs
     Given a managed vLLM launch will run out of GPU memory
     When the user opens the interactive serve summary for that launch
     Then the deployment summary blames this launch for GPU memory
     And the deployment summary names the GPU memory knobs
     And the deployment summary quotes the engine's own failing line
-
-  # Regression test for the GPU fail-fast contract (EAI-8059 review). The reuse
-  # pre-gate that lets an already-running service skip the no-usable-GPU bail used
-  # to key on the ENGINE alone, so any live managed service was enough to pull the
-  # reuse probe's engine work — for a self-managing engine, an
-  # `ensure_self_managed_engine_ready` that prints "Preparing <engine> for GPU
-  # serving..." and downloads an install — in front of the bail. On a GPU-less
-  # host that is exactly backwards: the invocation can never reuse a service for a
-  # DIFFERENT model, so it must refuse first and prepare nothing.
-  #
-  # Lemonade specifically, because it is the engine that manages its own runtime
-  # and therefore the one whose preparation is user-visible; the planted record
-  # names lemonade too, so the engine matches and the MODEL is the only thing
-  # keeping the pre-gate shut. Scenario 13 already covers the plain refusal with
-  # no service planted at all, and serve-26 plants the SAME model, so neither
-  # discriminates the model keying — this one does.
-  #
-  # The second premise makes the refusal's ORDERING observable. `rocm serve`
-  # resolves its runtime selection below the bail on purpose: that resolution
-  # reaches `recover_setup_runtime_registration`, which writes a runtime registry
-  # manifest and can fail with a manifest error in place of the no-GPU message.
-  # Nothing enforced the ordering, because recovery returns early when no setup
-  # venv is configured and the e2e roots carry none — so moving the call above
-  # the bail left all three refusal scenarios green. Planting a configured setup
-  # venv that the registry has not yet recorded is what makes the write reachable,
-  # and the last Then is what refuses it.
-  @id:serve-unrelated-live-service-still-fails-fast @requires-no-gpu
-  Scenario: serve-28 - A live service for another model does not soften the no-GPU refusal
-    Given a live managed Lemonade serve for an unrelated model
-    And setup names an unregistered runtime folder
-    When the user serves a different model with Lemonade under the GPU-required default
-    Then serving is refused before any engine starts
-    And the user is told no AMD GPU was detected
-    And no engine was prepared for GPU serving
-    And no runtime registry manifest was written
-
-  # Regression test for the reuse pre-gate's *acceptance* term (EAI-8059
-  # review). serve-26 plants a record this invocation really can reuse, and
-  # serve-28 plants one for a different model, so the gate's outer condition is
-  # false there. Neither reaches the case this one does: a live service that
-  # matches on liveness, engine and canonical model id — so the outer condition
-  # holds — but that `spawn_managed_engine_child` would still refuse. Deciding
-  # the no-GPU bypass on the weaker test sent the user to a dead end: the bail
-  # was skipped, the spawn told them to stop the running server and re-run, and
-  # the re-run — with nothing left to reuse — hit the no-GPU refusal the first
-  # run had bypassed. The advice named a command that could not clear the
-  # condition.
-  #
-  # `--require-api-key` against a service that has no key is the cheapest way to
-  # make `managed_service_reuse_refusal` answer Some on a record that is
-  # otherwise a perfect match; the recipe-mismatch term would do as well. The
-  # discriminating assertion is the absence of the stop advice: with the gate
-  # back on `existing_live_managed_service(..).is_some()` the run reaches the
-  # spawn and prints it. `--env-id` satisfies model resolution without
-  # installing a runtime, exactly as serve-26 does.
-  @id:serve-unreusable-live-service-still-fails-fast @requires-no-gpu @requires-os:linux
-  Scenario: serve-29 - A live service this invocation cannot reuse does not soften the no-GPU refusal
-    Given a live managed vLLM serve has an OOM startup log
-    When the user serves that same model with --require-api-key under the GPU-required default
-    Then serving is refused before any engine starts
-    And the user is told no AMD GPU was detected
-    And the user is not told to stop the running server
-
-  # The reuse pre-gate's OTHER half, and the only lane that can see it. serve-26,
-  # 28 and 29 all run on GPU-less hosts, where `host_has_no_usable_gpu` is true
-  # and the gate's outcome is decided entirely by the live-service term — so none
-  # of them can tell the current gate from the one it replaced. Neither can the
-  # unit test (`the_reuse_pregate_stays_shut_on_a_host_that_has_a_usable_gpu`):
-  # it calls `reuse_pregate_opens` directly, so it pins the helper but not
-  # `serve()`'s decision to pass the host predicate into it. Drop that argument
-  # at the call site and the whole suite stays green.
-  #
-  # This scenario is the discriminator, and it needs a real GPU: on a host that
-  # HAS one the gate must stay shut, so `--gpu` validation keeps the position
-  # #267 (`945d81b`) gave it and an out-of-range ordinal is refused before any
-  # engine or registry work. The planted record matches on liveness, engine and
-  # model, so the live-service term is TRUE here — the host predicate is the only
-  # thing holding the gate shut, which is exactly what makes the mutation visible.
-  #
-  # `setup names an unregistered runtime folder` is what makes the ordering
-  # observable, the same way it does in serve-28: it plants the one state that
-  # makes `recover_setup_runtime_registration`'s write reachable. No `--env-id`
-  # here, deliberately — `validate_engine_selection_runtime` only reaches that
-  # recovery when neither `--runtime-id` nor `--env-id` is given, so passing one
-  # would make the last Then vacuous. With the gate wrongly open the manifest is
-  # re-filed before the refusal and that Then goes red; with it shut the registry
-  # is still empty.
-  @id:serve-live-reuse-candidate-does-not-preempt-gpu-validation @requires-gpu @requires-os:linux
-  Scenario: serve-30 - A reusable live service does not pull engine work ahead of --gpu validation
-    Given a live managed vLLM serve has an OOM startup log
-    And setup names an unregistered runtime folder
-    When the user serves that same model pinned to a GPU index that does not exist
-    Then serving is refused before any engine starts
-    And the user is told that GPU index is unavailable
-    And no runtime registry manifest was written

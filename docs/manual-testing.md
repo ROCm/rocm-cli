@@ -513,12 +513,12 @@ Expected result:
   and reports that nothing would be removed. That is the only thing a preview
   writes.
 
-## 5. vLLM Serve Memory Guidance And The Reuse Exemption
+## 5. vLLM Serve Memory Guidance
 
 Needs a Linux or WSL host where the vLLM engine can start. The behaviour under
 test is described in
 [the README](../README.md#when-a-serve-runs-out-of-gpu-memory); the automated
-coverage is listed in [testing.md](testing.md#serve-oom-guidance-and-the-reuse-exemption).
+coverage is listed in [testing.md](testing.md#serve-oom-guidance).
 
 ### 5a. The out-of-memory note
 
@@ -587,70 +587,6 @@ rocm serve <same model> --engine vllm --gpu-memory-utilization 1 --verbose
 - Re-running `rocm serve` against an already-running service prints the
   already-running summary with no memory note, whatever that service's own log
   contains. Read that service's log with `rocm services logs <service-id>`.
-
-### 5c. Reuse is exempt from the no-GPU refusal
-
-This is a change to a refusal you may be relying on, so check both halves. Mask
-every device to stand in for a host with no usable AMD GPU — the same condition
-the refusal names.
-
-1. With a GPU visible, start a server and let it become ready:
-
-   ```bash
-   rocm serve <model> --engine vllm --managed
-   ```
-
-2. Re-run the *same* command with every device masked:
-
-   ```bash
-   HIP_VISIBLE_DEVICES= rocm serve <model> --engine vllm --managed
-   ```
-
-   Expected result: it does **not** refuse. The summary reports the service was
-   already running and hands back its endpoint. Nothing is launched and no GPU
-   is pinned.
-
-3. With the same mask, check the two terms of the pre-gate *separately*. The
-   gate (`any_live_managed_service_for_model`) tests the engine first and only
-   then the model, so one command that changes both cannot tell you which term
-   held the gate shut — a different-engine run is refused whatever the model
-   name, and would pass even if the model term had been deleted.
-
-   3a. **Same engine, different model.** This is the run that actually exercises
-   the model term. Pick a name that does **not** overlap the running one as a
-   substring — if the live service is `qwen3-8b-instruct`, do not use `qwen`:
-
-   ```bash
-   HIP_VISIBLE_DEVICES= rocm serve <a non-overlapping model> --engine vllm --managed
-   ```
-
-   Expected result: `no usable AMD GPU detected; rocm serve requires a GPU under
-   the gpu_required policy…`, and the refusal comes *first* — no engine
-   preparation, no download, no runtime manifest written. A live service for
-   another model must not soften the refusal or pull engine work in front of it.
-
-   The non-overlapping name matters: model matching is deliberately lenient, so
-   an overlapping name (`qwen` against a live `qwen3-8b-instruct`) *does* let
-   engine preparation run before the refusal. That is documented behaviour, not
-   a defect — see the reuse section of the README — so testing this step with an
-   overlapping name proves nothing.
-
-   3b. **Different engine.** Lemonade is the self-managing engine whose
-   preparation is user-visible, so this is where a missing refusal would show:
-
-   ```bash
-   HIP_VISIBLE_DEVICES= rocm serve <model> --engine lemonade --managed
-   ```
-
-   Expected result: the same refusal, and still first — no
-   `Preparing lemonade for GPU serving…` line and no embeddable download. Note
-   that the model name is irrelevant here: the engine mismatch alone shuts the
-   gate, which is exactly why 3a is a separate run.
-
-4. Stop the service (`rocm services stop <service-id> --yes`) and repeat step 2.
-
-   Expected result: with nothing left to reuse, the masked run refuses with the
-   same message as step 3a.
 
 ## 6. ComfyUI Verification
 

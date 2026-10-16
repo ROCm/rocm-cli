@@ -1530,11 +1530,10 @@ toolchain, so install the runtime with `rocm install sdk --devel` (see
 On native Windows this script prints a JSON skip result; run it from WSL/Linux
 for live ROCm GPU acceptance.
 
-## Serve OOM Guidance And The Reuse Exemption
+## Serve OOM Guidance
 
-Two `rocm serve` behaviours are checked here: the interactive deployment
-summary's out-of-memory note, and the reuse path's exemption from the
-GPU-required pre-flight. See [the README](../README.md#when-a-serve-runs-out-of-gpu-memory)
+The `rocm serve` interactive deployment summary's out-of-memory note is checked
+here. See [the README](../README.md#when-a-serve-runs-out-of-gpu-memory)
 for the user-facing contract and [vllm.md](vllm.md#shared-or-busy-gpus) for the
 flag and the quoting rule.
 
@@ -1564,52 +1563,17 @@ cargo test -p rocm --bin rocm an_apostrophe_in_the_failing_line_cannot_break_out
 cargo test -p rocm --bin rocm control_bytes_from_the_log_never_reach_the_printed_command
 ```
 
-The gate that decides whether the note is appended at all, and the pre-gate that
-decides which invocations may skip the no-usable-GPU refusal:
+The gate that decides whether the note is appended at all:
 
 ```bash
 cargo test -p rocm --bin rocm append_oom_serve_note_
-cargo test -p rocm --bin rocm reuse_pregate_
 ```
 
 `append_oom_serve_note_ignores_an_already_running_services_log` is the only
 check that discriminates the `already_running` clause of that gate: it passes a
-log path that *does* contain an OOM signature. The reuse E2E scenario below
-cannot, because the real reuse path reports no log path at all and the note is
-withheld on that ground alone.
-
-The pre-gate has five conditions. Three decide whether a live record matches
-this invocation, and each has a test that fails when only that condition is
-broken — `reuse_pregate_still_keys_on_the_engine` for the engine,
-`reuse_pregate_admits_a_match_on_the_raw_model_ref_alone` for the
-`record.model_ref` arm (every other positive case also matches on the canonical
-id, so without it that arm was deletable with the suite green), and
-`reuse_pregate_rejects_a_record_that_is_no_longer_live` for
-`managed_service_is_live`, which the shared helper otherwise always satisfies.
-
-The other two decide whether the gate may be consulted at all, and both live in
-`reuse_pregate_opens` (`apps/rocm/src/serve_cmd.rs`):
-
-- `host_has_no_usable_gpu` — the no-usable-GPU bail's own predicate, computed
-  once in `serve()` and handed to both. On a host that has a usable GPU the bail
-  cannot fire, so reuse buys nothing and the gate stays shut — which keeps
-  `--gpu` validation in the position #267 gave it. An unprobeable platform is
-  "unknown", not "no GPU", so it does not open the gate either.
-- `cpu_only` — a `--device cpu_only` serve never reaches the bail, so it has
-  nothing to exempt. (The CLI cannot actually produce that policy today;
-  `parse_device_policy` rejects it. The term is the helper's own guard.)
-
-`the_reuse_pregate_stays_shut_on_a_host_that_has_a_usable_gpu` covers both,
-including that the managed-service probe is not even *consulted* on a GPU host
-(`load_managed_services` refreshes liveness and can cost a probe and a
-`record.write()` per live record).
-
-That unit test exercises `reuse_pregate_opens` directly, so on its own it cannot
-see `serve()` ceasing to pass `host_has_no_usable_gpu` at the call site — the
-call site is a seam no unit test in `apps/rocm` can reach, because the host GPU
-probe is a real hardware probe with no injection point. serve-30 closes it, and
-being `@requires-gpu` it runs on the **`E2E self-hosted`** lane only, never on
-the per-PR mock lane.
+log path that *does* contain an OOM signature together with
+`already_running: true`. No E2E scenario can, because the real reuse path
+reports no log path at all and the note is withheld on that ground alone.
 
 The fault-injection feature must never reach a shipped binary:
 
@@ -1618,7 +1582,7 @@ cargo test -p xtask the_release_workflow_builds_no_feature_gated_binaries
 cargo test -p xtask prebuilt_e2e_lanes_enable_test_hooks
 ```
 
-E2E scenarios, in
+The E2E scenario lives in
 [`tests/e2e-cucumber/features/model_serving.feature`](../tests/e2e-cucumber/features/model_serving.feature).
 Run the suite unfiltered and let the harness select:
 
@@ -1626,72 +1590,26 @@ Run the suite unfiltered and let the harness select:
 cargo xtask e2e
 ```
 
-There is deliberately no focused command for these five. Cucumber 0.23 honours
+There is deliberately no focused command for it. Cucumber 0.23 honours
 *either* its own CLI filter *or* the harness closure, never both, so `-n` or
 `--tags` bypasses the OS, capability and expectation resolution that decides
 whether a scenario may run at all (see the comment at
 [`tests/e2e-cucumber/tests/e2e.rs`](../tests/e2e-cucumber/tests/e2e.rs), above
 `only_lifecycle`). That matters most
-for serve-27, which is gated on the `@requires-oom-fault-injection` capability:
+for serve-26, which is gated on the `@requires-oom-fault-injection` capability:
 selected from the CLI it would run on a binary built without the hook and fail
 for the wrong reason. Note also that `-n` matches the scenario *name*
-(`serve-26 - Reuse succeeds on a GPU-less host ...`), not the `@id:` tag, so
+(`serve-26 - A launch that runs out of GPU memory ...`), not the `@id:` tag, so
 passing an id to it silently selects nothing.
 
-- serve-26, `@id:serve-oom-memory-guidance` — a `serve` that reuses an
-  already-running vLLM service whose log *does* carry an OOM traceback prints
-  the reuse summary with no memory guidance in it.
-- serve-27, `@id:serve-oom-launch-memory-guidance` — a launch that runs out of
-  GPU memory blames this launch and names the knobs. The positive counterpart of
-  serve-26.
-- serve-28, `@id:serve-unrelated-live-service-still-fails-fast` — a live
-  Lemonade service for an *unrelated* model does not soften the no-GPU refusal:
-  serving a different model is refused before any engine starts, and nothing is
-  prepared or downloaded. Lemonade specifically, because it manages its own
-  runtime and so is the engine whose preparation is user-visible.
-  It carries a second premise — a configured setup venv the runtime registry has
-  not yet recorded — which makes the refusal's *ordering* observable. `rocm
-  serve` resolves its runtime selection below the no-GPU bail deliberately,
-  because that resolution reaches `recover_setup_runtime_registration`, which
-  writes a runtime registry manifest and can fail with a manifest error that has
-  nothing to do with the GPU. Recovery returns early when no setup venv is
-  configured, and no other e2e root has one, so without this fixture the call
-  could be hoisted above the bail with every refusal scenario still green. The
-  final `Then` asserts the registry is still empty after the refusal.
-- serve-29, `@id:serve-unreusable-live-service-still-fails-fast` — a live vLLM
-  service for the *same* model, which this invocation nonetheless cannot reuse
-  (`--require-api-key` against a service that has no key), also does not soften
-  the refusal. This is the pre-gate's *acceptance* term, which serve-26 and
-  serve-28 cannot reach: serve-26 plants a record that really is reusable, and
-  serve-28 fails the gate's outer engine/model condition before the acceptance
-  test runs. The discriminating assertion is that the `rocm services stop`
-  advice is absent — that advice is printed only from the spawn, which is
-  reachable only once the no-GPU bail has been bypassed.
-
-Those four carry `@requires-no-gpu` (their premise is a host with no usable AMD
-GPU), so they get their live coverage on the GitHub-hosted mock lane; serve-26,
-serve-27 and serve-29 also carry `@requires-os:linux`.
-
-The fifth is the pre-gate's other half, and it is the one that needs real
-hardware:
-
-- serve-30, `@id:serve-live-reuse-candidate-does-not-preempt-gpu-validation`
-  (**`@requires-gpu`**, so the `E2E self-hosted` lane only) — on a host that
-  *does* have a usable GPU, a live service this invocation really could reuse
-  still does not pull engine or registry work ahead of `--gpu` validation. The
-  record matches on liveness, engine and canonical model id, so every term of
-  the pre-gate except `host_has_no_usable_gpu` is satisfied and that predicate
-  alone is what holds the gate shut. It reuses serve-28's setup-venv fixture so
-  the final `Then` can assert the registry is still empty: with the gate wrongly
-  open, `recover_setup_runtime_registration` re-files the planted manifest before
-  the refusal. This is the only check in the repo that fails if `serve()` stops
-  passing the host predicate into `reuse_pregate_opens` — the unit test pins the
-  helper, not the call site, and the four no-GPU scenarios above run where the
-  gate opens either way.
+- serve-26, `@id:serve-oom-launch-memory-guidance` — a launch that runs out of
+  GPU memory blames this launch, names the knobs, and quotes the engine's own
+  failing line. It carries `@requires-no-gpu` (the fabricated launch stands in
+  for the GPU the mock lane does not have) and `@requires-os:linux`.
 
 ### The OOM fault-injection capability
 
-serve-27 needs a managed launch that really failed on VRAM, which a GPU-less CI
+serve-26 needs a managed launch that really failed on VRAM, which a GPU-less CI
 host cannot produce. It is therefore driven by a test-only fault-injection hook:
 the `rocm` crate feature `e2e-oom-fault-injection`, armed at run time by
 `ROCM_E2E_SIMULATE_OOM_LAUNCH=1`, makes `rocm serve` fabricate the on-disk state
@@ -1711,7 +1629,7 @@ was handed a prebuilt binary.
 Consequently, every lane that runs a **prebuilt** `ROCM_CLI_BINARY` — the
 self-hosted lanes in [`e2e-selfhosted.yml`](../.github/workflows/e2e-selfhosted.yml)
 and the [`nightly.yml`](../.github/workflows/nightly.yml) lanes — has the hook
-compiled out and resolves serve-27 to a reported **skip**, not a silent pass. It
+compiled out and resolves serve-26 to a reported **skip**, not a silent pass. It
 gates PRs on the GitHub-hosted mock lane, which lets `cargo xtask e2e` build the
 binary itself. The prebuilt lanes' `--features` floor is asserted as a superset
 check rather than an exact match for this reason; see the test notes on
@@ -1721,7 +1639,7 @@ check rather than an exact match for this reason; see the test notes on
 Be precise about *which* gate produces the skip, because the hook is not always
 the one that decides. On the Windows lifecycle lane in
 [`ci.yml`](../.github/workflows/ci.yml) the hook is compiled out too, but
-serve-27 is never selected there at all: that lane runs `E2E_ONLY_LIFECYCLE` and
+serve-26 is never selected there at all: that lane runs `E2E_ONLY_LIFECYCLE` and
 the scenario carries `@requires-os:linux`. On the GPU lanes it is
 `@requires-no-gpu` that excludes it. The missing hook is the deciding gate only
 where a Linux, GPU-less lane runs a prebuilt binary.
