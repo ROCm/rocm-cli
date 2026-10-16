@@ -40,14 +40,15 @@ use crate::endpoint_keys;
 use crate::engines_cmd::{engine_manages_own_runtime, ensure_self_managed_engine_ready};
 use crate::serve_summary;
 use crate::service_launch::{
-    drop_orphaned_endpoint_key_on_already_running, ensure_background_helper_running_quiet,
-    ensure_public_bind_engine_supported, print_managed_launch_plain, resolve_endpoint_auth,
-    run_attached_service, start_managed_service, validate_bind_host,
+    drop_orphaned_endpoint_key_on_already_running, e2e_simulate_oom_launch,
+    ensure_background_helper_running_quiet, ensure_public_bind_engine_supported,
+    print_managed_launch_plain, resolve_endpoint_auth, run_attached_service, start_managed_service,
+    validate_bind_host,
 };
 use crate::{
-    cli_progress, collect_serve_notes, detect_gpu_count, device_policy_name, engine_request,
-    gpu_vram_usage, parse_device_policy, parse_gpu_selection, resolve_engine_selection,
-    select_gpu_indices_under_launch_lock, serve_gpu_low_memory_warning,
+    append_oom_serve_note, cli_progress, collect_serve_notes, detect_gpu_count, device_policy_name,
+    engine_request, gpu_vram_usage, parse_device_policy, parse_gpu_selection,
+    resolve_engine_selection, select_gpu_indices_under_launch_lock, serve_gpu_low_memory_warning,
     validate_engine_selection_runtime, validate_pinned_gpu_index,
 };
 
@@ -667,11 +668,14 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     // same rule as a backstop. Skipped for cpu_only; permissive when availability
     // cannot be probed on this platform (probe returns `None`). The E2E-only
     // backend-failure scenario bypasses this host precondition so the black-box
-    // test reaches Lemonade's backend boundary without real GPU hardware.
+    // test reaches Lemonade's backend boundary without real GPU hardware, and the
+    // E2E-only OOM-launch fault injection likewise stands in for the GPU it does
+    // not have.
     let scripted_backend_failure = cfg!(feature = "e2e-test-hooks")
         && std::env::var_os("ROCM_E2E_LEMONADE_BACKEND_INSTALL_FAILURE").is_some();
     if !cpu_only
         && !scripted_backend_failure
+        && !e2e_simulate_oom_launch()
         && let Some(usable) = visible_gpu_indices.as_deref()
         && usable.is_empty()
     {
@@ -919,6 +923,33 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
                 gpu_memory_utilization_note.as_deref(),
                 host_gpu_summary.as_ref(),
                 engine_serves_vllm,
+            );
+            // A managed serve that failed on VRAM lands here not-ready with the OOM
+            // traceback only in its own log. Read that log tail so the summary can
+            // name the memory knobs, since the pre-launch low-VRAM warning cannot
+            // fire without amd-smi/rocm-smi telemetry.
+            //
+            // Note the asymmetry this sits inside: `summary_mode` is
+            // `background && stdout().is_terminal()`, so the guidance reaches an
+            // interactive user only. A scripted / CI / assistant-driven run takes
+            // `print_managed_launch_plain`, which ends at `readiness: {status}`
+            // and carries no *post-launch* note. It is not noteless: the
+            // `!summary_mode` branch above still prints the pre-launch planning
+            // lines, low-VRAM `note:` included, so the asymmetry is precisely
+            // that the OOM confirmation and the `rocm diagnose --symptom`
+            // command are missing — not that the path prints nothing. That path
+            // is machine-readable by design and is not the place to grow prose,
+            // but it does mean the same failed launch is explained in one
+            // invocation and not the other.
+            // The engine *name*, not `engine_serves_vllm`: the note's gate is
+            // derived inside `append_oom_serve_note` from the value it is about,
+            // because a boolean here was a call-site seam no test could hold.
+            let notes = append_oom_serve_note(
+                notes,
+                &selected_engine,
+                report.already_running,
+                &report.status,
+                report.log_path.as_deref(),
             );
             let summary = serve_summary::DeploymentSummary {
                 engine: selected_engine.clone(),

@@ -712,6 +712,74 @@ model across multiple GPUs is not supported. Because selection uses the
 `amd-smi` ordinal but is applied via `HIP_VISIBLE_DEVICES`, rocm-cli warns when
 `ROCR_VISIBLE_DEVICES` is set, since the two orderings can diverge.
 
+#### When a serve runs out of GPU memory
+
+When a vLLM serve that **this command launched** fails to become ready and its
+engine log shows an out-of-memory failure, the deployment summary adds a note
+confirming the attempt ran out of GPU memory, naming the two knobs that can fix
+it — `--gpu-memory-utilization <fraction greater than 0 and at most 1>` and
+`--gpu <index>` — warning that lowering the reservation will not help if the
+model simply does not fit, and printing a
+`rocm diagnose --symptom '<your failing line>'` command for the full
+busy-GPU-versus-model-too-large breakdown. A failing line that cannot be placed
+in a shell-quoted argument intact — one containing an apostrophe, for instance —
+is replaced by a canonical vLLM OOM symptom, which reports the same cause.
+
+A line carrying **terminal control bytes** that an *escape sequence* is part of
+— vLLM's colourised logger, or a repaint that moves the cursor with something
+like `ESC[1A` or clears the row with `ESC[2K` — is the one case where the two
+surfaces can print different commands for the same failure, and both are sound.
+(A bare carriage-return repaint is not that case: the log is split on `\r`, so
+the allocator line comes back as a clean segment carrying no escape and the two
+surfaces quote it identically.) The engine's own failure
+message refuses the raw line and falls back to the canonical symptom. The serve
+summary reads the log *after* the engine has echoed its tail into it as the rows
+a terminal would have drawn, so the note quotes that rendered row — real text the
+terminal printed, carrying no control bytes — instead. See
+[docs/vllm.md](https://github.com/ROCm/rocm-cli/blob/main/docs/vllm.md) for the
+flag itself and the quoting rule each printed command follows.
+
+The note is deliberately narrow, so its absence is not evidence that memory was
+fine. It appears only when all of the following hold:
+
+- The engine is vLLM. It is the only engine with `--gpu-memory-utilization`.
+- You are looking at the **interactive deployment summary** — the default
+  background managed launch with a terminal on stdout. A piped, redirected, or
+  otherwise scripted run prints the plain machine-readable form
+  (`readiness: <status>`), which carries no *post-launch* notes — it still
+  prints the pre-launch planning lines, including the low-VRAM `note:` when
+  amd-smi reports a tight card, so a `note:` in piped output is never this one —
+  and `--verbose`/`--foreground` streams the engine log in your terminal instead,
+  where the traceback is already in front of you. Either way, the log is on
+  disk: `rocm services logs <service-id>`.
+- The service **failed to become ready** (recorded status `starting`). A `ready`
+  service, or a `running` one whose endpoint is up while the model is still
+  loading, is healthy and is never given memory advice.
+- The log tail carries a real allocator failure — `HIP out of memory`,
+  `CUDA out of memory`, `hipErrorOutOfMemory`, or a `torch.OutOfMemoryError`
+  corroborated by an allocator message. A bare "out of memory" phrase from the
+  kernel OOM killer or an unrelated subprocess does not qualify, and a failure
+  with no memory signature is never dressed up as one.
+- **This** invocation launched the process. A `rocm serve` that reuses an
+  already-running service launches nothing, and its summary carries no log path
+  at all, so the running service's log is never read and this invocation is
+  never blamed for another process's failure. Read that service's own log with
+  `rocm services logs <service-id>` instead.
+- **The failing line is still near the end of the log.** The summary reads a
+  fixed tail of the engine log, and it reads it *after* the engine has appended
+  its own failure message — which echoes that same tail back — to the file. A
+  launch that OOMs and then logs another ~80 lines of shutdown can therefore push
+  the allocator line out of the window the summary sees, and no note appears even
+  though the engine's own message (in `rocm services logs <service-id>`, or in
+  `--verbose`/`--foreground` output) names the OOM. The engine's message is the
+  authority on whether the launch ran out of memory; this note is the convenience
+  copy.
+
+If the pre-launch low-VRAM warning already printed the
+`--gpu-memory-utilization` advice for the selected GPU, the OOM note drops that
+one sentence rather than repeating it; the rest of the note — the confirmation,
+the model-too-large caveat, and the `diagnose` command — still appears.
+
 Manage background servers started with `--managed`:
 
 ```

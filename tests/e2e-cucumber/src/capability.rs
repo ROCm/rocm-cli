@@ -123,11 +123,27 @@ pub struct HostCapability {
     /// Stable platform identity derived from hardware, not from an artifact name:
     /// "mock" (no AMD GPU), else the family/target (e.g. "mi300x", "strix-halo").
     pub platform_slug: String,
+    /// Whether the `rocm` binary under test carries the test-only
+    /// `e2e-oom-fault-injection` hook, so `@requires-oom-fault-injection`
+    /// scenarios can simulate a GPU-less OOM launch. It is compiled out of the
+    /// shipping binary, and the harness cannot probe for it (no product command
+    /// exposes it), so `xtask e2e` reports it via the [`OOM_FAULT_INJECTION_ENV`]
+    /// environment variable — set only when xtask built the binary itself with
+    /// the feature, and absent for a prebuilt `ROCM_CLI_BINARY` (the self-hosted
+    /// lanes' shipping release build). See [`probe_host_capability`].
+    pub oom_fault_injection: bool,
     /// Whether two file names differing only in letter case are two files under
     /// the temp root the scenarios' isolated roots are created in. Gates
     /// `@requires-case-sensitive-fs`; see [`probe_case_sensitive_fs`].
     pub case_sensitive_fs: bool,
 }
+
+/// Environment variable `xtask e2e` sets to `1` when it compiled the binary
+/// under test with the `rocm/e2e-oom-fault-injection` feature.
+///
+/// Re-exported from `e2e-report` — the single source of truth shared with the
+/// producer (`xtask::e2e`) — so the two sides cannot drift out of sync.
+pub use e2e_report::OOM_FAULT_INJECTION_ENV;
 
 impl HostCapability {
     /// Whether a given engine can actually START on this host. Distinct from
@@ -376,6 +392,8 @@ fn probe_host_capability() -> HostCapability {
     let effective_serve_engine = effective_serve_engine(gfx_target.as_deref(), &os_family);
     let platform_slug =
         derive_platform_slug(has_amd_gpu, gfx_target.as_deref(), &os_family, is_wsl);
+    let oom_fault_injection =
+        oom_fault_injection_from_env(std::env::var_os(OOM_FAULT_INJECTION_ENV).as_deref());
     let case_sensitive_fs = probe_case_sensitive_fs(root);
 
     HostCapability {
@@ -387,6 +405,7 @@ fn probe_host_capability() -> HostCapability {
         available_engines,
         effective_serve_engine,
         platform_slug,
+        oom_fault_injection,
         case_sensitive_fs,
     }
 }
@@ -499,6 +518,28 @@ fn host_has_usable_gpu(gfx_target: Option<&str>, is_wsl: bool, driver_status: &s
         driver_status,
         selected_visibility_mask(hip.as_deref(), rocr.as_deref()),
     )
+}
+
+/// Whether [`OOM_FAULT_INJECTION_ENV`] says the binary under test carries the
+/// `e2e-oom-fault-injection` hook.
+///
+/// The hook is a compile-time feature the harness cannot probe for, so this
+/// trusts the signal `xtask e2e` sets — and only when it built the binary itself.
+/// A prebuilt `ROCM_CLI_BINARY` (the shipping release build) leaves it unset, so
+/// those lanes skip `@requires-oom-fault-injection` rather than running a
+/// scenario the binary cannot satisfy.
+///
+/// Factored out and tested directly, like every other non-trivial capability
+/// field, because the compared *value* is the second half of a
+/// two-independently-maintained-literals coupling: `xtask/src/e2e.rs` sets `"1"`,
+/// this reads `"1"`, and changing one side alone (`"1"` → `"true"`) would turn
+/// the tag into a permanent skip on every lane with nothing red anywhere — the
+/// exact failure mode `OOM_FAULT_INJECTION_ENV`'s own doc comment warns about for
+/// the variable's *name*. Only the exact string `1` counts: an unset variable, an
+/// empty one, `0` and `true` all mean "no hook", so an operator who exports the
+/// variable loosely does not fake coverage.
+pub(crate) fn oom_fault_injection_from_env(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|value| value == "1")
 }
 
 /// Match the product's visibility-mask precedence: HIP wins when present,
@@ -801,6 +842,7 @@ mod tests {
             available_engines: vec!["lemonade".to_owned(), "vllm".to_owned()],
             effective_serve_engine: "lemonade".to_owned(),
             platform_slug: "strix-halo".to_owned(),
+            oom_fault_injection: false,
             case_sensitive_fs: false,
         };
         assert!(strix.engine_available("lemonade"));
@@ -816,6 +858,7 @@ mod tests {
             available_engines: vec!["lemonade".to_owned(), "vllm".to_owned()],
             effective_serve_engine: "vllm".to_owned(),
             platform_slug: "mi300x".to_owned(),
+            oom_fault_injection: false,
             case_sensitive_fs: true,
         };
         assert!(mi300x.engine_available("vllm"));
@@ -1133,5 +1176,28 @@ Local model engines
         let not_a_dir = tmp.path().join("plain-file");
         std::fs::write(&not_a_dir, "").expect("write file");
         assert!(!probe_case_sensitive_fs(&not_a_dir));
+    }
+
+    /// The value half of the `@requires-oom-fault-injection` contract.
+    ///
+    /// `expectation.rs`'s `requires_oom_fault_injection_runs_only_when_the_hook_is_built_in`
+    /// builds `HostCapability { oom_fault_injection: .. }` by hand and so never
+    /// reaches this comparison; without this test, editing the literal on one
+    /// side of the producer/consumer pair would make serve-26 a permanent skip
+    /// with nothing red. The `"1"` asserted here is the same literal
+    /// `xtask::e2e`'s `command.env(OOM_FAULT_INJECTION_ENV, "1")` writes, pinned
+    /// by `release_build_resolves_and_exports_both_cli_binaries` on that side.
+    #[test]
+    fn only_the_exact_value_the_producer_writes_arms_the_hook() {
+        use std::ffi::OsStr;
+        assert!(oom_fault_injection_from_env(Some(OsStr::new("1"))));
+        // Everything else means "no hook". `"true"` and `"0"` in particular: a
+        // one-sided edit to either literal must turn the tag off loudly here,
+        // not silently on every lane.
+        assert!(!oom_fault_injection_from_env(None));
+        assert!(!oom_fault_injection_from_env(Some(OsStr::new(""))));
+        assert!(!oom_fault_injection_from_env(Some(OsStr::new("0"))));
+        assert!(!oom_fault_injection_from_env(Some(OsStr::new("true"))));
+        assert!(!oom_fault_injection_from_env(Some(OsStr::new(" 1"))));
     }
 }

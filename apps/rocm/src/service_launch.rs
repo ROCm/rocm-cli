@@ -536,6 +536,108 @@ fn spawn_managed_engine_child(
     })
 }
 
+/// Test-only fault-injection switch, off (`const false`) in shipped binaries:
+/// the `e2e-oom-fault-injection` feature is enabled only by the `xtask e2e`
+/// mock-lane build, never by the release build. When enabled and
+/// `ROCM_E2E_SIMULATE_OOM_LAUNCH=1` is set on the process, `rocm serve` fabricates
+/// the on-disk state of a managed vLLM launch that spawned, wrote an
+/// out-of-memory traceback to the log it owns, and never became ready — so the
+/// positive OOM-guidance summary path can be verified on a GPU-less CI host,
+/// where a real launch cannot run. See [`simulate_oom_managed_launch`].
+#[cfg(feature = "e2e-oom-fault-injection")]
+pub(crate) fn e2e_simulate_oom_launch() -> bool {
+    std::env::var_os("ROCM_E2E_SIMULATE_OOM_LAUNCH").is_some_and(|value| value == "1")
+}
+
+/// Release builds carry no fault-injection switch: the seam compiles out
+/// entirely, so `rocm serve` behaves identically to a build without the feature.
+#[cfg(not(feature = "e2e-oom-fault-injection"))]
+pub(crate) const fn e2e_simulate_oom_launch() -> bool {
+    false
+}
+
+/// Test-only (see [`e2e_simulate_oom_launch`]): fabricate the on-disk state of a
+/// managed vLLM launch that spawned, OOM'd, and never became ready, then return
+/// the launch report the summary path would see for it — `already_running: false`
+/// (this invocation launched it), `status: "starting"` (it failed to become
+/// ready), and a `log_path` whose contents carry a real allocator OOM signature.
+/// [`crate::append_oom_serve_note`] then renders the memory-knob guidance. No process is
+/// spawned. Compiled out of shipped binaries.
+#[cfg(feature = "e2e-oom-fault-injection")]
+#[allow(clippy::too_many_arguments)]
+fn simulate_oom_managed_launch(
+    paths: &AppPaths,
+    engine: &str,
+    service_id: &str,
+    requested_model: &str,
+    resolve: &ResolveModelResponse,
+    host: &str,
+    port: u16,
+    device_policy: &DevicePolicy,
+    gpu_indices: &[u32],
+    runtime_id: Option<&str>,
+    env_id: Option<&str>,
+) -> Result<ManagedLaunchReport> {
+    paths.ensure()?;
+    fs::create_dir_all(paths.services_dir())?;
+    let mut record = ManagedServiceRecord::new(
+        paths,
+        service_id,
+        engine,
+        requested_model,
+        resolve.canonical_model_id.clone(),
+        host,
+        port,
+        "managed",
+        std::process::id(),
+        runtime_id.map(str::to_owned),
+        env_id.map(str::to_owned),
+        Some(device_policy_name(device_policy).to_owned()),
+    );
+    record.gpu_indices = gpu_indices.to_vec();
+    record.status = "starting".to_owned();
+    record.write()?;
+    // A real allocator OOM signature in the log this invocation owns, so the
+    // summary renders memory guidance for a launch that actually OOM'd.
+    //
+    // The engine's own error block is reproduced below it, because that is what
+    // a real managed launch leaves on disk, and leaving it out hid a bug this
+    // scenario should have caught: the supervisor and the engine share one log,
+    // so when vLLM OOMs the engine bails with its startup-log context — which
+    // embeds rocm-cli's own OOM hint — and `exit_code_for` writes that whole
+    // error back into the same file, *after* the real line. A fixture carrying
+    // only the raw OOM line can never see the newest-first scan land on
+    // rocm-cli's own sentence instead of the user's error.
+    let real_line = "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.";
+    fs::write(
+        &record.log_path,
+        format!(
+            "{real_line}\n\
+             Error: vLLM server process exited before becoming ready (status: exit status: 1)\n\
+             \n\
+             Startup log, last {} lines as the terminal drew them:\n\
+             {real_line}\n\
+             \n\
+             {}{real_line}). {}\n\
+             For conditional remediation, run `{} 'vllm: {real_line}'`.\n",
+            rocm_engine_protocol::DEFAULT_LOG_TAIL_LINES,
+            rocm_core::VLLM_OOM_DETECTED_PREFIX,
+            rocm_core::VLLM_GPU_MEMORY_UTILIZATION_HINT,
+            rocm_core::VLLM_OOM_DIAGNOSE_COMMAND,
+        ),
+    )
+    .with_context(|| format!("failed to write {}", record.log_path.display()))?;
+    Ok(ManagedLaunchReport {
+        service_id: service_id.to_owned(),
+        endpoint_url: format!("{}/v1", format_http_base_url(host, port)),
+        status: "starting".to_owned(),
+        already_running: false,
+        child_pid: None,
+        log_path: Some(record.log_path),
+        manifest_path: Some(record.manifest_path),
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn start_managed_service(
     engine: &str,
@@ -555,6 +657,22 @@ pub(crate) fn start_managed_service(
     on_wait_tick: &mut dyn FnMut(Duration),
 ) -> Result<ManagedLaunchReport> {
     let paths = AppPaths::discover()?;
+    #[cfg(feature = "e2e-oom-fault-injection")]
+    if e2e_simulate_oom_launch() {
+        return simulate_oom_managed_launch(
+            &paths,
+            engine,
+            service_id,
+            requested_model,
+            resolve,
+            host,
+            port,
+            device_policy,
+            gpu_indices,
+            runtime_id,
+            env_id,
+        );
+    }
     let (mut record, child_pid) = match spawn_managed_engine_child(
         &paths,
         engine,

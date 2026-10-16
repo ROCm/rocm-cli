@@ -570,7 +570,82 @@ Expected result:
   first one's "yes" not actually exiting anything — is the bug this fixes
   (issue #145).
 
-## 5. ComfyUI Verification
+## 5. vLLM Serve Memory Guidance
+
+Needs a Linux or WSL host where the vLLM engine can start. The behaviour under
+test is described in
+[the README](../README.md#when-a-serve-runs-out-of-gpu-memory); the automated
+coverage is listed in [testing.md](testing.md#serve-oom-guidance).
+
+### 5a. The out-of-memory note
+
+Force a launch that cannot fit — either a model larger than the card, or the
+same model with the whole card reserved while another workload holds memory:
+
+```bash
+rocm serve <model too large for this GPU> --engine vllm --gpu-memory-utilization 1
+```
+
+Run it in an interactive terminal, with no `--verbose` and no redirection, so
+you get the default deployment summary.
+
+Expected result:
+
+- The summary reports the server did not become ready, and carries a `note:`
+  saying the serve attempt ran out of GPU memory.
+- The note names both knobs: `--gpu-memory-utilization` (with its `(0, 1]`
+  domain spelled out) and `--gpu <index>`.
+- It states that lowering the reservation will not help if the model simply does
+  not fit, and points at a smaller or quantized model instead.
+- It ends with a runnable `rocm diagnose --symptom '…'`. Paste that line
+  unchanged: it must run and report the vLLM out-of-memory cause, not "no known
+  cause".
+- The `--symptom` value is one balanced single-quoted argument. If your failing
+  log line carried an apostrophe, the command falls back to the canonical
+  `vllm: …` symptom rather than your line — that is correct, and your real line
+  is still in `rocm services logs <service-id>`.
+- If your failing line carried terminal **colour codes**, expect the *rendered
+  row* — the line as the terminal drew it, escapes gone — not the canonical
+  symptom. The note reads the log after the engine has echoed its tail back into
+  it as rendered rows, so that row is what it quotes. Do not mark this a failure:
+  the engine's own failure message *does* fall back to the canonical symptom for
+  the same line, so the two surfaces can print different `--symptom` arguments
+  for one failure and both are correct (see
+  [When a serve runs out of GPU memory](../README.md#when-a-serve-runs-out-of-gpu-memory)
+  in the README; pinned by
+  `the_colourised_round_trip_quotes_the_row_the_terminal_drew`).
+- If the pre-launch low-VRAM warning already printed the
+  `--gpu-memory-utilization` advice for this GPU, the OOM note does not repeat
+  that sentence, but still carries the confirmation, the model-too-large caveat,
+  and the `diagnose` command.
+
+### 5b. Where the note is deliberately absent
+
+None of these is a bug; check each so the note's scope is not mistaken for
+flakiness:
+
+```bash
+rocm serve <same model> --engine vllm --gpu-memory-utilization 1 | cat
+rocm serve <same model> --engine vllm --gpu-memory-utilization 1 --verbose
+```
+
+- Piped or redirected: the plain machine-readable form ends at
+  `readiness: starting` and carries no *post-launch* note. It does still print
+  the pre-launch planning lines above that, so on a tight card you will see the
+  low-VRAM `note:` with the same `--gpu-memory-utilization` sentence — check
+  that what is missing is the OOM note (the "ran out of GPU memory"
+  confirmation and the `rocm diagnose --symptom` command), not every `note:`.
+- `--verbose` (or `--foreground`): the engine log streams in your terminal, so
+  you read the traceback directly instead.
+- A server that becomes ready, and one that is still loading its model while its
+  endpoint is already up, both carry no memory note.
+- A failure that is not a memory failure (serve a nonexistent model id) carries
+  no memory note either — it must not be dressed up as one.
+- Re-running `rocm serve` against an already-running service prints the
+  already-running summary with no memory note, whatever that service's own log
+  contains. Read that service's log with `rocm services logs <service-id>`.
+
+## 6. ComfyUI Verification
 
 ComfyUI is managed as an app surface. It should start a local web server and
 show the URL to open:
@@ -649,7 +724,7 @@ python scripts\comfyui_therock_gpu_test.py
 This test may download a small checkpoint and submit a cat image workflow
 through the ComfyUI HTTP API.
 
-## 6. Optional Cloud Provider Key
+## 7. Optional Cloud Provider Key
 
 Local ROCm use does not need a cloud provider key. If you want to test OpenAI or
 Anthropic provider setup, save the key through stdin so it does not land in
@@ -674,7 +749,7 @@ To remove the saved key:
 rocm config clear-provider-key openai
 ```
 
-## 7. Optional Provider-Assisted Planning
+## 8. Optional Provider-Assisted Planning
 
 Most users should leave this off. To test ambiguity resolution with an already
 running local provider service:
@@ -698,7 +773,7 @@ To turn provider-assisted planning back off:
 rocm config clear-planner-provider
 ```
 
-## 8. Uninstall
+## 9. Uninstall
 
 Run this last, on a machine installed with the release installer (not a
 `cargo` build, whose binaries uninstall leaves alone):

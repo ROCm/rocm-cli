@@ -1530,6 +1530,120 @@ toolchain, so install the runtime with `rocm install sdk --devel` (see
 On native Windows this script prints a JSON skip result; run it from WSL/Linux
 for live ROCm GPU acceptance.
 
+## Serve OOM Guidance
+
+The `rocm serve` interactive deployment summary's out-of-memory note is checked
+here. See [the README](../README.md#when-a-serve-runs-out-of-gpu-memory)
+for the user-facing contract and [vllm.md](vllm.md#shared-or-busy-gpus) for the
+flag and the quoting rule.
+
+Focused unit coverage — what counts as a vLLM OOM, and which log line is routed
+into the printed `rocm diagnose --symptom` command:
+
+```bash
+cargo test -p rocm-core vllm_oom_gate_matches_allocator_signatures_but_not_generic_failures
+cargo test -p rocm-core vllm_oom_diagnose_symptom_selects_the_failing_line_or_reports_no_oom
+cargo test -p rocm-core every_rendered_line_break_keeps_the_gate_in_step_with_the_scorer
+cargo test -p rocm-core the_engine_hint_is_never_quoted_back_as_the_users_own_line
+cargo test -p rocm-engine-vllm the_hint_never_quotes_itself_back_on_a_second_read_of_the_shared_log
+cargo test -p rocm-core quotable_in_single_quotes_rejects_quote_and_control_bearing_symptoms
+cargo test -p rocm-core the_stripper_follows_the_escape_grammar_not_just_the_colour_case
+```
+
+The note itself — its conditions, the de-duplication of the hint the pre-launch
+low-VRAM warning already printed, and the quoting guard on the command it hands
+the user to paste:
+
+```bash
+cargo test -p rocm --bin rocm oom_note_
+cargo test -p rocm --bin rocm oom_signatures_are_detected_case_insensitively
+cargo test -p rocm --bin rocm unrelated_failures_are_not_flagged_as_oom
+cargo test -p rocm --bin rocm the_shared_hint_is_de_duplicated_without_losing_the_rest_of_the_oom_note
+cargo test -p rocm --bin rocm an_apostrophe_in_the_failing_line_cannot_break_out_of_the_printed_command
+cargo test -p rocm --bin rocm control_bytes_from_the_log_never_reach_the_printed_command
+```
+
+The gate that decides whether the note is appended at all:
+
+```bash
+cargo test -p rocm --bin rocm append_oom_serve_note_
+```
+
+`append_oom_serve_note_ignores_an_already_running_services_log` is the only
+check that discriminates the `already_running` clause of that gate: it passes a
+log path that *does* contain an OOM signature together with
+`already_running: true`. No E2E scenario can, because the real reuse path
+reports no log path at all and the note is withheld on that ground alone.
+
+The fault-injection feature must never reach a shipped binary:
+
+```bash
+cargo test -p xtask the_release_workflow_builds_no_feature_gated_binaries
+cargo test -p xtask prebuilt_e2e_lanes_enable_test_hooks
+```
+
+The E2E scenario lives in
+[`tests/e2e-cucumber/features/model_serving.feature`](../tests/e2e-cucumber/features/model_serving.feature).
+Run the suite unfiltered and let the harness select:
+
+```bash
+cargo xtask e2e
+```
+
+There is deliberately no focused command for it. Cucumber 0.23 honours
+*either* its own CLI filter *or* the harness closure, never both, so `-n` or
+`--tags` bypasses the OS, capability and expectation resolution that decides
+whether a scenario may run at all (see the comment at
+[`tests/e2e-cucumber/tests/e2e.rs`](../tests/e2e-cucumber/tests/e2e.rs), above
+`only_lifecycle`). That matters most
+for serve-26, which is gated on the `@requires-oom-fault-injection` capability:
+selected from the CLI it would run on a binary built without the hook and fail
+for the wrong reason. Note also that `-n` matches the scenario *name*
+(`serve-26 - A launch that runs out of GPU memory ...`), not the `@id:` tag, so
+passing an id to it silently selects nothing.
+
+- serve-26, `@id:serve-oom-launch-memory-guidance` — a launch that runs out of
+  GPU memory blames this launch, names the knobs, and quotes the engine's own
+  failing line. It carries `@requires-no-gpu` (the fabricated launch stands in
+  for the GPU the mock lane does not have) and `@requires-os:linux`.
+
+### The OOM fault-injection capability
+
+serve-26 needs a managed launch that really failed on VRAM, which a GPU-less CI
+host cannot produce. It is therefore driven by a test-only fault-injection hook:
+the `rocm` crate feature `e2e-oom-fault-injection`, armed at run time by
+`ROCM_E2E_SIMULATE_OOM_LAUNCH=1`, makes `rocm serve` fabricate the on-disk state
+of a managed vLLM launch that spawned, wrote an allocator OOM traceback to the
+log it owns, and never became ready. No process is spawned, and the seam
+compiles out entirely without the feature, so a build that does not enable it
+behaves exactly as the shipped binary does.
+
+Only `cargo xtask e2e` enables it, by building the binary under test with
+`--features "rocm/e2e-test-hooks rocm/e2e-oom-fault-injection"`, and it is the
+only producer of the `ROCM_E2E_OOM_FAULT_INJECTION=1` signal the harness reads.
+This is the one capability the harness **cannot probe for** — no product command
+exposes a compile-time feature — so `@requires-oom-fault-injection` resolves
+from that variable alone, and xtask clears it rather than inheriting it when it
+was handed a prebuilt binary.
+
+Consequently, every lane that runs a **prebuilt** `ROCM_CLI_BINARY` — the
+self-hosted lanes in [`e2e-selfhosted.yml`](../.github/workflows/e2e-selfhosted.yml)
+and the [`nightly.yml`](../.github/workflows/nightly.yml) lanes — has the hook
+compiled out and resolves serve-26 to a reported **skip**, not a silent pass. It
+gates PRs on the GitHub-hosted mock lane, which lets `cargo xtask e2e` build the
+binary itself. The prebuilt lanes' `--features` floor is asserted as a superset
+check rather than an exact match for this reason; see the test notes on
+`assert_prebuilt_e2e_lanes_enable_test_hooks` in
+[`xtask/src/workflow_contract.rs`](../xtask/src/workflow_contract.rs).
+
+Be precise about *which* gate produces the skip, because the hook is not always
+the one that decides. On the Windows lifecycle lane in
+[`ci.yml`](../.github/workflows/ci.yml) the hook is compiled out too, but
+serve-26 is never selected there at all: that lane runs `E2E_ONLY_LIFECYCLE` and
+the scenario carries `@requires-os:linux`. On the GPU lanes it is
+`@requires-no-gpu` that excludes it. The missing hook is the deciding gate only
+where a Linux, GPU-less lane runs a prebuilt binary.
+
 ## Windows Tool Notes
 
 The TheRock SDK wheel install path should not require users to install global
