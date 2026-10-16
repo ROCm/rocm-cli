@@ -2693,17 +2693,40 @@ fn refresh_startup_update_check_quietly() {
 
 fn build_codex_bridge_snapshot(paths: &AppPaths) -> Result<CodexBridgeSnapshot> {
     let config = RocmCliConfig::load(paths).unwrap_or_default();
+    // Hoisted out of the struct literal so the engine rows can be told what this
+    // host actually supports. The probe is already paid for: `gpu_support_level`
+    // takes exactly the two fields this summary already carries, so the engine
+    // list costs no detection the snapshot was not doing anyway.
+    let examine = ExamineSummary::gather()?;
+    let gpu_support_level = rocm_core::gpu_support_level(
+        examine.detected_gfx_target.as_deref(),
+        examine.compatible_therock_family.as_deref(),
+    );
     Ok(CodexBridgeSnapshot {
         protocol: "rocmd-codex-bridge-v0".to_owned(),
         generated_at_unix_ms: rocm_core::unix_time_millis(),
-        examine: ExamineSummary::gather()?,
+        examine,
         gpu: build_codex_bridge_gpu_snapshot(&config),
         config,
         automation_runtime: AutomationRuntimeState::load(paths)?,
         recent_automation_events: load_recent_automation_events(paths, 32)?,
-        engines: builtin_codex_bridge_engine_inventory(),
+        engines: builtin_codex_bridge_engine_inventory(gpu_support_level),
         services: load_managed_services(paths)?,
     })
+}
+
+/// This host's GPU support level from the cheap host probe, for the call sites
+/// that need it without gathering a whole [`ExamineSummary`].
+///
+/// The same two inputs `rocm examine` derives it from, read through
+/// `detect_host_gpu_summary` rather than the full examine gather — exactly what
+/// `render_engine_inventory_text_with_paths` (i.e. `rocm engines`) already does.
+fn host_gpu_support_level(paths: Option<&AppPaths>) -> rocm_core::GpuSupportLevel {
+    let host_gpu = rocm_core::detect_host_gpu_summary(paths);
+    rocm_core::gpu_support_level(
+        host_gpu.gfx_target.as_deref(),
+        host_gpu.therock_family.as_deref(),
+    )
 }
 
 fn build_codex_bridge_gpu_snapshot(config: &RocmCliConfig) -> CodexBridgeGpuSnapshot {
@@ -2724,20 +2747,26 @@ fn build_codex_bridge_gpu_snapshot(config: &RocmCliConfig) -> CodexBridgeGpuSnap
     }
 }
 
-/// The engine catalogue in the codex-bridge snapshot, taken verbatim from
-/// [`builtin_engine_inventory`] — including lemonade's unconditional "with ROCm
-/// llama.cpp backend", which ROCMAI-550 replaced in `rocm examine` and
-/// `rocm engines` but deliberately left alone here.
+/// The engine catalogue in the codex-bridge snapshot and the bridge's `engines`
+/// tool, built from [`builtin_engine_inventory`] with lemonade's note replaced
+/// by [`lemonade_engine_note`] for the given support level.
 ///
-/// It is left alone because this list is the static catalogue, in the same
-/// shape as the unconditional `installed_binary: true` beside it: every field
-/// but `default_for_platform` describes the engine, not this host. A consumer
-/// that wants the host's real support level reads it off the `examine` block
-/// in the same snapshot, which carries `detected_gfx_target` and
-/// `compatible_therock_family` — the two inputs `rocm_core::gpu_support_level`
-/// takes. Making this row host-aware would change the bridge's JSON contract
-/// and is worth its own change, not a rider on this one.
-fn builtin_codex_bridge_engine_inventory() -> Vec<CodexBridgeEngine> {
+/// It takes the level rather than reading the static row because the stale
+/// "with ROCm llama.cpp backend" claim is exactly what ROCMAI-550 exists to
+/// remove, and this is a user-facing surface like the other two: a bridge
+/// client renders `summary` to the operator. Both call sites can answer the
+/// question — `build_codex_bridge_snapshot` already gathers the
+/// [`ExamineSummary`] that carries the two inputs, and the `engines` tool takes
+/// the same cheap host probe `rocm engines` does — so there was no call site
+/// here that genuinely could not see the host.
+///
+/// Only `summary` moves. The field set, its names and `installed_binary: true`
+/// beside it are untouched, so the bridge's JSON shape is the same; what
+/// changes is that one string stops asserting ROCm support on a host that has
+/// none, which is the same correction the two CLI surfaces got.
+fn builtin_codex_bridge_engine_inventory(
+    gpu_support_level: rocm_core::GpuSupportLevel,
+) -> Vec<CodexBridgeEngine> {
     let default_engine = default_engine_for_platform();
     let binary_path = daemon_binary_path()
         .ok()
@@ -2746,7 +2775,11 @@ fn builtin_codex_bridge_engine_inventory() -> Vec<CodexBridgeEngine> {
         .iter()
         .map(|(id, summary)| CodexBridgeEngine {
             id: (*id).to_owned(),
-            summary: (*summary).to_owned(),
+            summary: if *id == "lemonade" {
+                lemonade_engine_note(gpu_support_level).to_owned()
+            } else {
+                (*summary).to_owned()
+            },
             default_for_platform: *id == default_engine,
             installed_binary: true,
             binary_path: binary_path.clone(),
@@ -2754,13 +2787,18 @@ fn builtin_codex_bridge_engine_inventory() -> Vec<CodexBridgeEngine> {
         .collect()
 }
 
-/// The lemonade engine note shown in `rocm examine` and `rocm engines`, adjusted
-/// for whether this host's detected GPU can actually use the ROCm llama.cpp
-/// backend. Both call sites have a live `GpuSupportLevel` in scope; the places
-/// that print this note statically — the dashboard TUI, `rocmd`'s own catalog,
-/// and [`builtin_codex_bridge_engine_inventory`]'s copy of
-/// [`builtin_engine_inventory`] — keep the unconditional ROCm wording, since
-/// they describe the engine in the abstract rather than this host.
+/// The lemonade engine note shown in `rocm examine`, `rocm engines` and the
+/// codex-bridge engine inventory, adjusted for whether this host's detected GPU
+/// can actually use the ROCm llama.cpp backend.
+///
+/// All three of those have a live `GpuSupportLevel` in scope. The two places
+/// that still print the note statically — the dashboard TUI's engine-manager
+/// pane and `rocmd`'s own catalog in `apps/rocmd/src/common.rs` — keep the
+/// unconditional ROCm wording, and that is deliberate rather than an oversight:
+/// the TUI pane renders a hard-coded descriptive list with no probe behind it,
+/// and `rocmd` is the daemon answering for whichever host a client asks about,
+/// not necessarily the one it runs on. Both are their own change if they ever
+/// need to be host-aware.
 const fn lemonade_engine_note(level: rocm_core::GpuSupportLevel) -> &'static str {
     match level {
         rocm_core::GpuSupportLevel::VulkanOnly => {
@@ -8082,7 +8120,8 @@ pub(crate) fn run_internal_mcp_call(
             ))
         }
         "engines" => {
-            let engines = builtin_codex_bridge_engine_inventory();
+            let engines =
+                builtin_codex_bridge_engine_inventory(host_gpu_support_level(Some(paths)));
             Ok(internal_mcp_tool_success(
                 format!("Found {} engine entries.", engines.len()),
                 serde_json::json!({ "engines": engines }),
