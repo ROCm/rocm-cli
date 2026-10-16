@@ -419,6 +419,47 @@ fn resolve_amd_smi_binary_in_home(home_dir: Option<&Path>) -> OsString {
 /// [`crate::examine::WslFacts`]).
 const KFD_DEVICE: &str = "/dev/kfd";
 
+/// Name of the E2E-only seam that moves the pre-flight's device node, so the
+/// gate's two branches are both reachable from a Gherkin scenario.
+///
+/// Honoured only by a build carrying the `e2e-test-hooks` feature, which no
+/// released artefact does; see [`preflight_kfd_device`].
+#[cfg(feature = "e2e-test-hooks")]
+pub(crate) const TEST_KFD_DEVICE_ENV: &str = "ROCM_E2E_KFD_DEVICE";
+
+/// The device node [`amd_smi_json`] runs its pre-flight against.
+///
+/// [`KFD_DEVICE`] in every shipped build. An `e2e-test-hooks` build lets
+/// [`TEST_KFD_DEVICE_ENV`] name a different path, which is what makes the gate
+/// testable from the outside at all.
+///
+/// Why a seam rather than the existing [`crate::hardware_root`] re-rooting:
+/// [`kfd_readable`] deliberately keeps the *real* node's veto, so a simulated
+/// root can only ever make the gate decline, never allow. That asymmetry is the
+/// invariant that stops a simulated root launching `amd-smi` on a machine with
+/// no GPU, and it is correct — but it also means no simulated root can exercise
+/// the *allowed* branch on a GPU-less runner, which is where the per-PR lane
+/// runs. A path override sidesteps that without touching the invariant: the
+/// production build has no override, so the veto and the real device are all
+/// there is.
+///
+/// Safe to be an override rather than a bypass. It relocates the probe; it does
+/// not skip it. A build with the feature on and the variable unset — every unit
+/// test in this crate, and every E2E scenario that does not set it — gates on
+/// `/dev/kfd` exactly as production does.
+#[cfg(feature = "e2e-test-hooks")]
+fn preflight_kfd_device() -> std::path::PathBuf {
+    std::env::var_os(TEST_KFD_DEVICE_ENV)
+        .map_or_else(|| std::path::PathBuf::from(KFD_DEVICE), Into::into)
+}
+
+/// Production counterpart of [`preflight_kfd_device`]: the constant, with no
+/// environment consulted. See that function for why the seam exists.
+#[cfg(not(feature = "e2e-test-hooks"))]
+fn preflight_kfd_device() -> std::path::PathBuf {
+    std::path::PathBuf::from(KFD_DEVICE)
+}
+
 /// Whether `/dev/kfd` can be opened for reading — the pre-flight every
 /// `amd-smi` launch goes through, and it is **mandatory** before every launch.
 ///
@@ -602,7 +643,10 @@ const MAX_QUOTED_OUTPUT_CHARS: usize = 2000;
 pub fn amd_smi_json(args: &[&str], timeout: Duration) -> Result<serde_json::Value> {
     amd_smi_json_with(
         &resolve_amd_smi_binary(),
-        Path::new(KFD_DEVICE),
+        // [`preflight_kfd_device`], not the constant: identical in every shipped
+        // build, and the one seam an E2E scenario can move so that both sides of
+        // the gate are reachable from the lane that runs per PR.
+        &preflight_kfd_device(),
         args,
         timeout,
     )
@@ -1168,6 +1212,55 @@ mod tests {
             "amd_smi_json must decline exactly when the gate on {KFD_DEVICE} does; a wrapper \
              that passes some other path declines on neither host"
         );
+    }
+
+    /// The E2E path seam is an override, not a bypass: with the variable unset
+    /// the pre-flight device is `/dev/kfd` on every build, and with it set the
+    /// gate still *runs* — against the named path — rather than being skipped.
+    ///
+    /// Worth pinning because the seam's whole justification is that it cannot
+    /// weaken a shipped build. Both halves are load-bearing: a `preflight_kfd_device`
+    /// that read the variable unconditionally would fail the unset half here and
+    /// hand any process on the host a way to disable the gate, and one that
+    /// returned a readable path outright — the bypass this deliberately is not —
+    /// would fail the declining half.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_e2e_kfd_path_seam_moves_the_gate_without_disabling_it() {
+        // The same serializer the simulated-root tests take, rather than a
+        // second one: both mutate the environment the pre-flight reads, and one
+        // lock for the pair cannot deadlock against itself.
+        let _env = crate::hardware_root::HOST_ROOT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        assert_eq!(
+            preflight_kfd_device(),
+            Path::new(KFD_DEVICE),
+            "with no seam set, every build must gate on the real device"
+        );
+
+        #[cfg(feature = "e2e-test-hooks")]
+        {
+            let scratch = tempfile::tempdir().expect("a scratch dir");
+            let absent = scratch.path().join("no-such-kfd");
+            let _seam = crate::test_env::RestoredEnvVar::set(TEST_KFD_DEVICE_ENV, &absent);
+
+            assert_eq!(
+                preflight_kfd_device(),
+                absent,
+                "an e2e-test-hooks build must honour the seam"
+            );
+
+            let error = amd_smi_json(&["--rocm-cli-gate-probe"], Duration::from_secs(5))
+                .expect_err("an unopenable seam path must decline the launch");
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("declined to launch")
+                    && message.contains(&absent.display().to_string()),
+                "the seam must move the gate, not remove it; got: {message}"
+            );
+        }
     }
 
     /// A failing `amd-smi` that prints a payload must not paste the payload into

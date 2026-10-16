@@ -342,54 +342,34 @@ Feature: Model serving
     When the user lists recommended models
     Then the model list output contains only ASCII characters
 
-  # KNOWN GAP — the `/dev/kfd` pre-flight on the serve probes (EAI-8457) has no
-  # scenario here yet. It is now reachable, which it was not when this note was
-  # first written; what follows records what changed rather than arguing the
-  # behaviour is untestable, because it no longer is.
+  # The `/dev/kfd` pre-flight (EAI-8457) is covered by `examine-29` in
+  # `examine.feature`, not here, and this note records why the scenario lives
+  # there rather than alongside the serve probes it also guards.
   #
-  # The behaviour: on a Linux host where `/dev/kfd` cannot be opened, `--gpu
-  # auto` no longer launches `amd-smi` at all (`detect_gpu_count`,
-  # `gpu_vram_usage`), so GPU auto-selection degrades to service state alone
-  # where it previously attempted the launch. That is user-observable, so §3 of
-  # AGENTS.md asks for a scenario rather than only the `rocm-core` unit tests
-  # that pin `kfd_readable` and `amd_smi_json`.
+  # The behaviour: on a Linux host where the KFD device cannot be opened,
+  # `rocm_core::amd_smi_json` declines the launch outright, so `serve`'s
+  # `gpu_vram_usage` and `detect_gpu_count` degrade to service state alone where
+  # they previously attempted the spawn. The same chokepoint serves `rocmd`'s
+  # bridge snapshot, and that surface is the one a scenario can observe
+  # directly: the snapshot reports `amd_smi_available` and a note that says why,
+  # as JSON, in one command. `serve`'s probes discard their error with `.ok()?`
+  # by design, so the declined branch is visible there only as the absence of a
+  # GPU-aware placement -- which a GPU-less lane cannot tell apart from having
+  # no GPU. One scenario on the observable surface beats a weaker one here.
   #
-  # The premise needs a host that is BOTH GPU-present by the KFD/DRM sysfs rule
-  # AND unable to open `/dev/kfd` — the real shape of a container started
-  # without `--device /dev/kfd`, or a user outside the render group, where
-  # world-readable sysfs still enumerates the device that `open(2)` then
-  # refuses. No lane is naturally that host, but two earlier claims about why it
-  # could never be manufactured were wrong and are corrected here:
+  # Reaching either branch needs the `e2e-test-hooks` seam
+  # `ROCM_E2E_KFD_DEVICE` (`rocm_core::preflight_kfd_device`), which moves the
+  # device the gate opens. `ROCM_CLI_TEST_HOST_ROOT` cannot substitute: the gate
+  # keeps the real node's veto on purpose, so a simulated root can make it
+  # decline but never allow -- see
+  # `the_kfd_gate_honours_a_simulated_root_but_keeps_the_real_device_veto`.
   #
-  #   - "the no-GPU mock lane never reaches either probe" is false. It holds for
-  #     serve-13's plain path, where `usable_amd_gpu_indices` answers an
-  #     authoritative empty set and `serve` bails first — but
-  #     `ROCM_E2E_LEMONADE_BACKEND_INSTALL_FAILURE` (set by the mock lane, see
-  #     `serving_steps.rs`) skips exactly that bail in `serve_cmd.rs`, and
-  #     `gpu_vram_usage()` is called below it. `host_accelerator_memory` in
-  #     `main.rs` reaches the same probe from `diagnose --model` with no GPU
-  #     guard at all. The declined branch therefore does run on the mock lane.
-  #   - "`KFD_DEVICE` is a compile-time constant with no path override" is now
-  #     false too: the gate is routed through `rocm_core::host_path`, so an
-  #     `e2e-test-hooks` build with `ROCM_CLI_TEST_HOST_ROOT` set can present a
-  #     simulated host whose KFD topology says GPU-present and whose `/dev/kfd`
-  #     is absent. The real device keeps its veto, so this can only manufacture
-  #     the *declined* branch, never a spurious allow.
-  #
-  # What is still true: `@requires-gpu` lanes have a readable `/dev/kfd` by
-  # construction, and `@requires-wsl` exercises the wave-through, which is the
-  # opposite branch. So the scenario belongs on the mock lane, built from the
-  # simulated root plus a hanging stub `amd-smi` — `serve` and `diagnose` must
-  # complete promptly where before this change they would have hung on it.
-  #
-  # Covered meanwhile at unit level in `rocm-core`, each confirmed non-vacuous
-  # by mutation: `the_kfd_gate_stops_amd_smi_before_it_is_spawned` asserts the
-  # gate stops the *spawn* (a fake `amd-smi` leaves a marker file that must not
+  # Also covered at unit level in `rocm-core`, each confirmed non-vacuous by
+  # mutation: `the_kfd_gate_stops_amd_smi_before_it_is_spawned` asserts the gate
+  # stops the *spawn* (a fake `amd-smi` leaves a marker file that must not
   # appear), with the same fixture re-run against a readable device to prove the
   # fake would otherwise have executed;
   # `the_public_amd_smi_entry_point_gates_on_the_real_kfd_device` pins that the
-  # production wrapper gates on `/dev/kfd` itself; and
-  # `the_kfd_gate_honours_a_simulated_root_but_keeps_the_real_device_veto` pins
-  # the routing the scenario above would depend on.
-  #
-  # Retire this note when that mock-lane scenario lands.
+  # production wrapper gates on the real device; and
+  # `the_e2e_kfd_path_seam_moves_the_gate_without_disabling_it` pins that the
+  # seam above relocates the probe instead of skipping it.
