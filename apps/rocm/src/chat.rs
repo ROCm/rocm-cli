@@ -18,9 +18,9 @@
 //! three PRs given the cluster's size: this module's contents are now parts
 //! 1 and 2's combined slice (types, leaf helpers, and the orchestration
 //! bodies above). The cluster's regression tests still live in `main.rs`'s
-//! shared `mod tests` block, calling back in via `chat::`; moving them here,
-//! and this module's own `docs/architecture.md` entry, are the third PR's
-//! job.
+//! shared `mod tests` block, calling back in via `chat::`; moving them, and
+//! auditing which of this module's `pub(crate)` items have no caller outside
+//! it and could be module-private, are the third PR's job.
 
 use crate::runtime_install_finalize::empty_as_unknown;
 use crate::runtimes_cmd::render_runtimes_text;
@@ -2099,10 +2099,10 @@ pub(crate) fn chat_tool_approval_request(
         "watcher_enable" => ("Enable automation", "Automations"),
         "watcher_disable" => ("Disable automation", "Automations"),
         other => bail!("ROCm tool `{other}` is read-only or unsupported for approval"),
+    };
     // Same as the `rocm_command` arm above: `pending_title` is short by
     // design — the full command line rides along in `display_command` and
     // is what the approval body renders, not just this title.
-    };
     Ok(ChatToolApprovalRequest {
         pending_title: pending_title.to_owned(),
         command_title: command_title.to_owned(),
@@ -3596,7 +3596,6 @@ fn run_rocm_capture_for_paths(
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
     })
 }
-
 
 pub(crate) fn run_rocm_command_for_paths(
     paths: &AppPaths,
