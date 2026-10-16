@@ -309,6 +309,15 @@ mod tests {
     /// dash in prose explaining the code is not output, and flagging those
     /// would make the guard unusable. Clap help text *is* doc comments and so
     /// is not covered here -- see the module docs for the test that does.
+    ///
+    /// Only `//`-style prose is treated that way, though. The attribute
+    /// spelling of the same thing -- `#[doc = "..."]`, or the `note` of a
+    /// `#[deprecated(note = "...")]` -- is a string literal and is scanned
+    /// like any other, so semantically identical prose is judged differently
+    /// depending on which syntax it is written in. Nothing in the tree hits
+    /// that today; whoever first writes an em dash in a `#[doc = "..."]` and
+    /// is told to exempt it should widen the comment skip here rather than
+    /// add an `EXEMPT_LITERALS` entry for prose.
     fn non_ascii_literals(source: &str) -> Vec<Finding> {
         let bytes = source.as_bytes();
         let mut findings = Vec::new();
@@ -592,12 +601,82 @@ mod tests {
 
     /// `(offset just past the matching `]`, newlines crossed)` for the bracket
     /// group opening at `at`.
+    ///
+    /// Brackets are counted on *code* bytes only. A `]` inside a string, a
+    /// char literal or a comment is text, and counting it closed the group
+    /// one character early -- returning an offset in the middle of that
+    /// literal. The main loop then resumed there, so the literal's real
+    /// closing `"` was read as an *opening* one, every quote after it was
+    /// paired off by one, and the braces of the next `\u{....}` escape were
+    /// taken for code braces. That desync is not local: `open_test` and
+    /// `depth` stay wrong for the rest of the file, and a genuinely
+    /// non-ASCII **production** literal further down is then never recorded
+    /// at all -- the exact silent miss this whole-tree scan exists to make
+    /// impossible. See
+    /// [`a_bracket_inside_a_literal_does_not_hide_later_production_text`].
+    ///
+    /// So the group is walked with the same recognisers the outer loop uses
+    /// rather than re-scanned from `at` on suspicion: they already know every
+    /// string form the language has, and bailing out would bring back the
+    /// `[&str; 2]` semicolon this function was added to step over.
     fn bracket_group_end(source: &str, at: usize) -> (usize, usize) {
         let bytes = source.as_bytes();
         let mut i = at;
         let mut depth = 0usize;
         let mut newlines = 0usize;
         while i < bytes.len() {
+            // Mid-character bytes of a non-ASCII literal or comment: nothing
+            // this walk opens on starts with one, and slicing there panics.
+            if !source.is_char_boundary(i) {
+                i += 1;
+                continue;
+            }
+            let rest = &source[i..];
+
+            if rest.starts_with("//") {
+                i = rest.find('\n').map_or(bytes.len(), |n| i + n);
+                continue;
+            }
+            if rest.starts_with("/*") {
+                let mut nesting = 1usize;
+                i += 2;
+                while i < bytes.len() && nesting > 0 {
+                    if bytes[i] == b'\n' {
+                        newlines += 1;
+                        i += 1;
+                    } else if bytes[i..].starts_with(b"/*") {
+                        nesting += 1;
+                        i += 2;
+                    } else if bytes[i..].starts_with(b"*/") {
+                        nesting -= 1;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                continue;
+            }
+
+            // Line 0 is passed in so the returned line is the newline count.
+            if let Some((_, _, next)) = raw_string_at(source, i, 0) {
+                newlines += next.1;
+                i = next.0;
+                continue;
+            }
+            if let Some((_, _, next)) = quoted_string_at(source, i, 0) {
+                newlines += next.1;
+                i = next.0;
+                continue;
+            }
+            if bytes[i] == b'\'' {
+                if let Some((_, next)) = char_literal_at(source, i) {
+                    i = next;
+                    continue;
+                }
+                i += 1;
+                continue;
+            }
+
             match bytes[i] {
                 b'[' => depth += 1,
                 b']' => {
@@ -871,6 +950,24 @@ mod tests {
     /// resolved against its directory and then normalised back to repo-root
     /// relative. Embeds of `.rs` files are skipped: those are already walked
     /// as sources in their own right.
+    ///
+    /// Note the scoping difference from [`non_ascii_literals`]: "test-only" is
+    /// decided by the *including file's path*, not by whether the
+    /// `include_str!` sits in a `#[cfg(test)]` block. So a production file
+    /// that embeds a fixture from inside its own test module is still walked
+    /// -- `crates/rocm-dash-tui/src/skills.rs:451` does exactly that, from
+    /// inside the `#[cfg(test)] mod tests` beginning at `:415`, and passes
+    /// only because that fixture is pure ASCII. A fixture carrying a real
+    /// non-ASCII character would be a false positive here.
+    ///
+    /// That is deliberate, not an oversight. Scoping by call site would mean
+    /// asking the hand-rolled test-span tracker in [`non_ascii_literals`]
+    /// which embeds to *drop*, so a lexer bug there would silently blind this
+    /// test to a real catalog -- a false negative, and the one failure mode
+    /// this guard cannot survive. Path-based scoping is independent of the
+    /// lexer, and the cost of being wrong is an `EXEMPT_EMBEDDED` entry with
+    /// a one-line reason. If that false positive ever actually lands, prefer
+    /// the entry; only move to call-site scoping if they start accumulating.
     fn embedded_data_files() -> Vec<(String, String)> {
         let root = repo_root();
         let mut out = Vec::new();
@@ -1214,6 +1311,81 @@ mod tests {
     fn an_array_type_semicolon_does_not_end_a_test_item_early() {
         let source = "#[cfg(test)]\nstatic X: [&str; 2] = [\n    \"\u{2014}\",\n    \"b\",\n];\n";
         assert!(lines(source).is_empty(), "{:?}", lines(source));
+    }
+
+    /// ...and the inverse of that stepping-over: a `]` *inside* one of the
+    /// array's string elements is text, not the group's close.
+    ///
+    /// This fixture asserts the **consequence**, not an offset. Counting that
+    /// `]` ended the group one character early and resumed the main scan
+    /// inside the element, so the element's real closing `"` was read as an
+    /// *opening* quote; from there every quote in the file is paired off by
+    /// one and the scan swallows whole functions as if they were one long
+    /// string. The em dash on line 5 is production output in every case
+    /// below, and before the fix each one reported **zero** findings -- a
+    /// silent miss, which is the only failure mode a guard like this cannot
+    /// survive. The test item itself (lines 1-2) must still be skipped.
+    #[test]
+    fn a_bracket_inside_a_literal_does_not_hide_later_production_text() {
+        const PRODUCTION: &str = "\n\nfn f() {\n    let _ = \"\u{2014}\";\n}\n";
+        for array in [
+            // An ordinary string element holding a `]`.
+            "[\"a]b\", \"c\"]",
+            // ...with the element after it an escaped em dash, the shape that
+            // also fed the `{` and `}` of `\\u{2014}` to the brace tracking.
+            "[\"a]b\", \"\\u{2014}\"]",
+            // A raw string, which has no escapes to hide behind.
+            "[r#\"a]b\"#, \"c\"]",
+            // A byte string: the `b` prefix is what the desynced scan latched
+            // onto as a literal opener.
+            "[b\"a]b\", b\"c\"]",
+            // A `]` preceded by an escaped quote inside the element.
+            "[\"a\\\"]b\", \"c\"]",
+        ] {
+            let source = format!("#[cfg(test)]\nstatic X: [&str; 2] = {array};{PRODUCTION}");
+            let found = lines(&source);
+            assert_eq!(
+                found.len(),
+                1,
+                "the production literal after {array} must still be reported: {found:?}"
+            );
+            assert_eq!(found[0].0, 5, "line of the production literal: {found:?}");
+            assert_eq!(found[0].1, "\u{2014}", "{found:?}");
+        }
+    }
+
+    /// The helper itself, at the offsets the fixture above can only show
+    /// indirectly. Comments are included for completeness rather than because
+    /// a miss was reproducible through them: a `]` in a comment did return a
+    /// mid-comment offset before the fix, but the main loop happened to
+    /// resynchronise on the group's real `]` in every shape tried, so no
+    /// hidden production literal could be demonstrated for that case.
+    #[test]
+    fn bracket_group_end_counts_brackets_on_code_bytes_only() {
+        // Each group is a `[..]` followed by a `!` sentinel; the walk must
+        // stop exactly on the sentinel however the inner `]`s are spelled.
+        for group in [
+            "[\"a]b\", \"c\"]!",
+            "[r#\"a]b\"#, \"c\"]!",
+            "[b\"a]b\"]!",
+            "[\"a\\\"]b\"]!",
+            "[']']!",
+            "[/* ] */ \"a\"]!",
+            "[\n    // a ] in prose\n    \"a\",\n]!",
+            "[[\"a]b\"], [\"c\"]]!",
+        ] {
+            let (end, newlines) = bracket_group_end(group, 0);
+            assert_eq!(
+                end,
+                group.len() - 1,
+                "must stop just past the real closing bracket of {group:?}"
+            );
+            assert_eq!(
+                newlines,
+                group[..end].matches('\n').count(),
+                "newlines crossed in {group:?}"
+            );
+        }
     }
 
     /// A multi-line test attribute must not throw the line counter off; the
