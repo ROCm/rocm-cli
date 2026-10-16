@@ -22,6 +22,8 @@ mod deletion_properties;
 mod driver_install;
 mod endpoint_keys;
 mod engines_cmd;
+#[cfg(test)]
+mod gpu_selection_proptests;
 mod logging;
 mod provider_keys;
 mod providers;
@@ -14076,6 +14078,10 @@ fn select_gpu_indices_under_launch_lock(
 /// enumerated. `detected` is only a fallback range check for hosts where the
 /// visible set is unknown (`visible` is `None`). Both `None` (an unprobeable
 /// host) is allowed through so serving can still proceed.
+///
+/// Precondition: `detected` is never `Some(0)`. [`detect_gpu_count`] maps an
+/// empty amd-smi list to `None`, and the out-of-range message below computes
+/// `count - 1`, which would underflow on zero.
 fn validate_pinned_gpu_index(
     index: u32,
     detected: Option<usize>,
