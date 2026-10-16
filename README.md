@@ -163,7 +163,17 @@ Pick a row with the arrow keys and `Enter`; press `q` — or `Ctrl-C`, which qui
 from the launcher and the dashboard alike and restores your terminal — to quit.
 The one exception is the dashboard's console for a **running** job, where
 `Ctrl-C` keeps its existing meaning of "cancel this job" and does not quit; once
-that job finishes, `Ctrl-C` quits there too. On a non-interactive terminal (or
+that job finishes, `Ctrl-C` quits there too. If a model is still being served,
+quitting (`q`, the Esc menu's `Quit` row, or `/quit`/`/exit` in chat — from the
+launcher, or from a dashboard or chat session opened directly) asks for
+confirmation first, naming the model and the real `rocm services stop <id>
+--yes` command to stop it; from the dashboard, pressing `s` instead jumps
+straight to the Services overlay to stop it there. Declining (`n`/Esc) returns
+to where you were; confirming (`y`/Enter) quits anyway — either way the model
+keeps running in the background, it just won't happen by surprise. Unlike `q`,
+`Ctrl-C` always quits immediately without asking (same running-job exception as
+above). See `docs/manual-testing.md` for the Windows- and
+launcher-hosted-session-specific details. On a non-interactive terminal (or
 piped output), `rocm` prints a one-shot status summary instead of opening the
 launcher.
 

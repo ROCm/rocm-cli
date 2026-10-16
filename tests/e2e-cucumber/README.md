@@ -240,6 +240,15 @@ The `.feature` file is both the spec and the test input — cucumber reads it at
 3. Implement step functions: Given = setup, When = action, Then = assertion.
 4. Register the module in `tests/e2e.rs` with `pub mod <name>_steps;`.
 5. Run to verify.
+6. If a step needs to fake a subprocess the CLI shells out to (`uv`, a runtime's
+   `python`, `tailscale`), add a `[[bin]]` under [`src/bin/`](src/bin/) rather
+   than writing a shell/batch script: it builds on every platform cargo already
+   targets. [`fixture_binary`](src/fixture_binary.rs)'s `fixture_binary()`
+   locates it and `fixture_target_name()` names it; `install_fixture_binary` in
+   [`tests/e2e.rs`](tests/e2e.rs) plants it (it needs the `rocm-core`
+   dev-dependency the library target can't reach). See
+   [`fake-uv`](src/bin/fake-uv.rs), [`fake-python`](src/bin/fake-python.rs),
+   and [`fake-tailscale`](src/bin/fake-tailscale.rs) for the pattern.
 
 ## Design principles
 
