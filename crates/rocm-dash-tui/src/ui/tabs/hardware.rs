@@ -413,9 +413,7 @@ pub fn gpu_compact_line(
         ),
     ];
     let base_w: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-    let used_g = g.vram_used_mb as f64 / 1024.0;
-    let tot_g = g.vram_total_mb as f64 / 1024.0;
-    let vram = format!("  {used_g:.0}/{tot_g:.0} GB");
+    let vram = format!("  {}", format::mib_pair(g.vram_used_mb, g.vram_total_mb));
     if base_w + vram.chars().count() <= width as usize {
         spans.push(Span::styled(vram, Style::default().fg(theme.muted)));
     }
@@ -751,10 +749,10 @@ mod tests {
         assert_eq!(temp_span.style.fg, Some(theme.err));
         assert_eq!(pow_span.style.fg, Some(theme.err));
         // wide → vram segment included
-        assert!(line.spans.iter().any(|s| s.content.contains("GB")));
+        assert!(line.spans.iter().any(|s| s.content.contains("GiB")));
         // narrow → vram segment dropped (truncation by omission)
         let narrow = gpu_compact_line(&hot, &theme, 24, false);
-        assert!(!narrow.spans.iter().any(|s| s.content.contains("GB")));
+        assert!(!narrow.spans.iter().any(|s| s.content.contains("GiB")));
     }
 
     #[test]
