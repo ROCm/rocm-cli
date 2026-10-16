@@ -773,6 +773,12 @@ async fn user_lists_services(world: &mut E2eWorld) {
     world.cli_output = Some(stdout);
 }
 
+#[when("the user lists recommended models")]
+async fn user_lists_recommended_models(world: &mut E2eWorld) {
+    let stdout = crate::run_rocm_ok(world, &["model"]);
+    world.cli_output = Some(stdout);
+}
+
 #[when("the user serves a model without specifying an engine")]
 async fn user_serves_default_engine(world: &mut E2eWorld) {
     // This scenario tests automatic *engine selection* — a platform-agnostic
@@ -1229,7 +1235,7 @@ fn setup_runtime_fixture_paths(world: &E2eWorld) -> (PathBuf, PathBuf) {
     )
 }
 
-/// Makes the refusal's *ordering* observable, which no assertion in serve-25/27/28
+/// Makes the refusal's *ordering* observable, which no assertion in serve-26/28/29
 /// could do before.
 ///
 /// `rocm serve` resolves its runtime selection with
@@ -1389,7 +1395,7 @@ async fn user_serves_live_model_requiring_a_key(world: &mut E2eWorld) {
 /// Serve the *same* model the live planted record names, pinned to a GPU ordinal
 /// the host does not have.
 ///
-/// The discriminating step of serve-29, and it only means anything on a host
+/// The discriminating step of serve-30, and it only means anything on a host
 /// that has a usable GPU. There the reuse pre-gate must stay shut on
 /// `host_has_no_usable_gpu` alone — every other term is satisfied, since the
 /// planted record matches on liveness, engine and canonical model id — so
@@ -1400,7 +1406,7 @@ async fn user_serves_live_model_requiring_a_key(world: &mut E2eWorld) {
 /// the way; the paired `no runtime registry manifest was written` is what sees
 /// that.
 ///
-/// No `--env-id`, unlike serve-25/28: `validate_engine_selection_runtime` only
+/// No `--env-id`, unlike serve-26/29: `validate_engine_selection_runtime` only
 /// reaches `recover_setup_runtime_registration` when neither `--runtime-id` nor
 /// `--env-id` is given, so naming one would make that assertion unfalsifiable.
 /// Captured pipe output rather than a PTY, because the expected outcome is a
@@ -1742,7 +1748,7 @@ async fn assert_oom_launch_quotes_the_real_line(world: &mut E2eWorld) {
     // The only assertion in this scenario that can fail on the symptom
     // *selection*. The other two Then steps match text `oom_memory_note` emits
     // unconditionally, so deleting the `is_rocm_authored_log_line` filter — or
-    // dropping the `rocm diagnose` sentence altogether — left serve-26 green
+    // dropping the `rocm diagnose` sentence altogether — left serve-27 green
     // while the note silently fell back to the canonical symptom. That is the
     // bug the fixture's engine-error block was added to expose, and nothing
     // asserted it.
@@ -1801,6 +1807,20 @@ async fn assert_full_model_name(world: &mut E2eWorld) {
     assert!(
         resolved.contains('/'),
         "expected a fully qualified model name (org/model), got '{resolved}'\n\nfull output:\n{output}"
+    );
+}
+
+#[then("the model list output contains only ASCII characters")]
+async fn assert_model_list_is_ascii(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no CLI output");
+    assert!(
+        output.contains("Recommended models"),
+        "expected the `rocm model` header to be present, got:\n{output}"
+    );
+    assert!(
+        output.is_ascii(),
+        "rocm model output must be ASCII-only; non-ASCII punctuation renders as \
+         mojibake on a Windows console using the OEM code page (ROCMAI-543): {output}"
     );
 }
 

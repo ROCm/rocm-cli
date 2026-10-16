@@ -16,7 +16,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::time::{Duration, Instant};
 
-use crate::runtime::{VllmRuntime, runtime_has_discover_build};
+use crate::runtime::{
+    VllmRuntime, ensure_therock_compat_shims, runtime_bin_paths, runtime_has_discover_build,
+    therock_library_path_entries_for_launch,
+};
+use crate::{ServeHttpRequest, engine_recipe_launch_args};
 
 /// Tail budget for the startup-failure summary (and its OOM hint).
 ///
@@ -26,7 +30,6 @@ use crate::runtime::{VllmRuntime, runtime_has_discover_build};
 /// "the tail" of a failed launch. A change to the protocol budget moves both.
 const STARTUP_FAILURE_LOG_TAIL_LINES: usize = DEFAULT_LOG_TAIL_LINES;
 
-pub(crate) const MAX_TAIL_READ: u64 = 4 * 1024 * 1024;
 /// How long a stop waits for the server to actually exit after each signal
 /// before reporting a timeout (or, under `force`, escalating to `SIGKILL`).
 const STOP_GRACE: Duration = Duration::from_secs(10);
@@ -129,21 +132,6 @@ pub(crate) fn launch_service(request: LaunchRequest) -> Result<LaunchResponse> {
         log_path: log_path.display().to_string(),
         state_path: state_path.display().to_string(),
     })
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct ServeHttpRequest {
-    pub service_id: String,
-    pub model_ref: String,
-    pub host: String,
-    pub port: u16,
-    pub device_policy: DevicePolicy,
-    pub gpu_indices: Vec<u32>,
-    pub runtime_id: Option<String>,
-    pub env_id: Option<String>,
-    pub state_path: PathBuf,
-    pub log_path: Option<PathBuf>,
-    pub engine_recipe: Option<EngineRecipeHint>,
 }
 
 pub(crate) fn serve_http(mut request: ServeHttpRequest) -> Result<()> {
@@ -417,6 +405,19 @@ pub(crate) fn parse_gpu_indices_arg(value: Option<&str>) -> Result<Vec<u32>> {
 }
 
 pub(crate) fn apply_therock_env(command: &mut ProcessCommand, runtime: &VllmRuntime) -> Result<()> {
+    apply_therock_env_with(command, runtime, rocm_core::openmpi::ensure_mpi_cxx_compat)
+}
+
+/// Same as [`apply_therock_env`], with the `libmpi_cxx` probe
+/// [`ensure_therock_compat_shims`] takes injectable, so a test can exercise
+/// the whole "no shim needed" hand-off into `LD_LIBRARY_PATH` without
+/// depending on this host's own OpenMPI/compiler state. Production code
+/// always goes through [`apply_therock_env`].
+fn apply_therock_env_with(
+    command: &mut ProcessCommand,
+    runtime: &VllmRuntime,
+    ensure_mpi_cxx_compat: impl FnOnce(&Path) -> Option<PathBuf>,
+) -> Result<()> {
     command.env("VLLM_TARGET_DEVICE", "rocm");
     if runtime_has_discover_build(runtime) {
         apply_vllm_rocm10_discover_env(command, runtime)?;
@@ -443,10 +444,11 @@ pub(crate) fn apply_therock_env(command: &mut ProcessCommand, runtime: &VllmRunt
         );
     }
     if !cfg!(windows) {
+        let compat_shim = ensure_therock_compat_shims(runtime, ensure_mpi_cxx_compat);
         command.env(
             "LD_LIBRARY_PATH",
             prepend_path_entries(
-                &therock_library_path_entries(runtime),
+                &therock_library_path_entries_for_launch(runtime, compat_shim),
                 std::env::var_os("LD_LIBRARY_PATH"),
             )?,
         );
@@ -560,12 +562,6 @@ fn vllm_serve_args(
     args.extend(engine_recipe_launch_args(engine_recipe));
     args
 }
-
-pub(crate) fn engine_recipe_launch_args(engine_recipe: Option<&EngineRecipeHint>) -> Vec<String> {
-    engine_recipe
-        .map(|hint| hint.required_flags.clone())
-        .unwrap_or_default()
-}
 /// Whether to launch vLLM with `--enforce-eager` (CUDA graphs disabled).
 ///
 /// Defaults to enabled because FULL CUDA-graph replay hangs ROCm gfx94x GPUs
@@ -596,107 +592,6 @@ fn resolve_vllm_ready_timeout(override_value: Option<String>) -> Duration {
         .and_then(|value| value.trim().parse::<u64>().ok())
         .filter(|secs| *secs > 0)
         .map_or(DEFAULT_VLLM_READY_TIMEOUT, Duration::from_secs)
-}
-
-pub(crate) fn runtime_bin_paths(runtime: &VllmRuntime) -> Vec<PathBuf> {
-    let mut entries = Vec::new();
-    if let Some(bin) = runtime.sdk_bin.as_ref() {
-        entries.push(bin.clone());
-    }
-    entries.extend(runtime.sdk_bin_paths.iter().cloned());
-    dedupe_paths(entries)
-}
-
-pub(crate) fn therock_library_path_entries(runtime: &VllmRuntime) -> Vec<PathBuf> {
-    let Some(root) = runtime.sdk_root.as_ref() else {
-        return dedupe_paths(runtime.sdk_library_paths.clone());
-    };
-    let mut entries = runtime.sdk_library_paths.clone();
-    entries.extend([
-        root.join("lib"),
-        root.join("lib64"),
-        root.join("lib").join("rocm_sysdeps").join("lib"),
-    ]);
-    if cfg!(target_os = "linux") {
-        let wsl_dxcore_lib = PathBuf::from("/usr/lib/wsl/lib");
-        if wsl_dxcore_lib.is_dir() {
-            entries.push(wsl_dxcore_lib);
-        }
-        // OpenMPI is installed outside the default loader path on some distros
-        // (notably RHEL-family under /usr/lib64/openmpi/lib); make sure vLLM can
-        // load libmpi.so at launch when it lives there.
-        entries.extend(rocm_core::openmpi::openmpi_library_dirs());
-
-        if let Some(compat_dir) = runtime_compat_dir(runtime) {
-            // PyTorch's `libtorch_global_deps.so` lists `libmpi_cxx.so.40` as a
-            // NEEDED dependency, but OpenMPI 5.x removed the legacy C++ bindings,
-            // so `import torch` aborts with `libmpi_cxx.so.40: cannot open shared
-            // object file`. When no real `libmpi_cxx.so*` exists, materialize an
-            // embedded `libmpi_cxx.so.40` stub (built at compile time, see
-            // rocm-core's build.rs) into a runtime-owned directory and add it to
-            // the loader path. The stub only *defines* the legacy C++ binding
-            // symbols torch needs; they are never called in single-node serving,
-            // so this is safe.
-            if let Some(dir) = rocm_core::openmpi::ensure_mpi_cxx_compat(&compat_dir) {
-                entries.push(dir);
-            }
-            // PyTorch's `libc10.so` NEEDS the standard `libnuma.so.1` soname with
-            // the upstream `libnuma_1.2` symbol version. TheRock bundles numa only
-            // under the renamed soname `librocm_sysdeps_numa.so.1` whose versions
-            // are rewritten to `AMDROCM_SYSDEPS_1.0_libnuma_*`, which cannot
-            // satisfy that binding. An older rocm-cli release symlinked
-            // `libnuma.so.1` to that bundled library; on the loader path it
-            // shadowed any real system libnuma and broke `import torch` with
-            // `version 'libnuma_1.2' not found`. Remove that stale shim here so
-            // the real numactl runtime (installed via the package manager) wins;
-            // `libnuma_present()`/`spawn_vllm_server` handle the install/preflight.
-            remove_stale_numa_shim(&compat_dir);
-        }
-    }
-    dedupe_paths(entries)
-}
-/// Remove a stale `libnuma.so.1` compatibility symlink left by older rocm-cli
-/// versions in `compat_dir`. That shim pointed at the ROCm SDK's bundled
-/// `librocm_sysdeps_numa.so.1`, whose renamed symbol versions cannot satisfy the
-/// `libnuma_1.2` symbol PyTorch's `libc10.so` binds; leaving it on the loader
-/// path would shadow a correctly installed system libnuma. No-op when absent or
-/// when the entry is not a symlink.
-fn remove_stale_numa_shim(compat_dir: &Path) {
-    let link = compat_dir.join("libnuma.so.1");
-    if let Ok(meta) = link.symlink_metadata()
-        && meta.file_type().is_symlink()
-    {
-        let _ = fs::remove_file(&link);
-    }
-}
-/// A writable, runtime-owned directory for managed-runtime library compatibility
-/// shims (see [`therock_library_path_entries`]). Prefers the managed Python
-/// environment root (`<env>/bin/python` -> `<env>`); falls back to the SDK root
-/// when no Python launcher is recorded.
-fn runtime_compat_dir(runtime: &VllmRuntime) -> Option<PathBuf> {
-    const COMPAT_DIR_NAME: &str = "rocm-cli-lib-compat";
-    if let Some(env_root) = runtime
-        .python_executable
-        .as_ref()
-        .and_then(|python| python.parent())
-        .and_then(|bin| bin.parent())
-    {
-        return Some(env_root.join(COMPAT_DIR_NAME));
-    }
-    runtime
-        .sdk_root
-        .as_ref()
-        .map(|root| root.join(COMPAT_DIR_NAME))
-}
-
-fn dedupe_paths(entries: Vec<PathBuf>) -> Vec<PathBuf> {
-    let mut deduped = Vec::new();
-    for entry in entries {
-        if !entry.as_os_str().is_empty() && !deduped.iter().any(|seen| seen == &entry) {
-            deduped.push(entry);
-        }
-    }
-    deduped
 }
 
 fn prepend_path_entries(entries: &[PathBuf], current: Option<OsString>) -> Result<OsString> {
@@ -885,7 +780,7 @@ fn wait_for_vllm_ready(
 /// Reads the last N lines from a log file and returns them as a formatted string.
 /// Delegates the seek/tail logic to `rocm_core::tail_lines`.
 fn summarize_startup_log_tail(log_path: &Path, limit: usize) -> Result<String> {
-    let lines = rocm_core::tail_lines(log_path, limit, MAX_TAIL_READ)?;
+    let lines = rocm_core::tail_lines(log_path, limit, crate::state::MAX_TAIL_READ)?;
     if lines.is_empty() {
         return Ok(String::new());
     }
@@ -1034,15 +929,6 @@ mod tests {
             DevicePolicy::GpuRequired
         );
         Ok(())
-    }
-    #[test]
-    fn engine_recipe_launch_args_forward_required_flags() {
-        let hint = test_engine_recipe(ENGINE_NAME, ENGINE_RECIPE_CONTRACT_VERSION);
-
-        assert_eq!(
-            engine_recipe_launch_args(Some(&hint)),
-            vec!["--enable-auto-tool-choice".to_owned()]
-        );
     }
     #[test]
     fn resolve_model_omits_gpu_memory_utilization_default() -> Result<()> {
@@ -1831,35 +1717,6 @@ mod tests {
         );
     }
     #[test]
-    fn therock_library_path_entries_include_sysdeps_for_hip_apps() {
-        let root = PathBuf::from(if cfg!(windows) {
-            r"C:\rocm-sdk"
-        } else {
-            "/tmp/rocm-sdk"
-        });
-        let runtime = VllmRuntime {
-            runtime_id: "therock-release:gfx120X-all".to_owned(),
-            env_id: "external-vllm-therock".to_owned(),
-            command: PathBuf::from("vllm"),
-            python_executable: None,
-            version: None,
-            source: "managed_runtime_manifest:test".to_owned(),
-            sdk_root: Some(root.clone()),
-            sdk_bin: Some(root.join("bin")),
-            sdk_bin_paths: vec![root.join("runtime").join("bin")],
-            sdk_library_paths: vec![root.join("runtime").join("lib")],
-            rocm_sdk_version: None,
-        };
-        let entries = therock_library_path_entries(&runtime);
-        assert!(entries.contains(&root.join("runtime").join("lib")));
-        assert!(entries.contains(&root.join("lib")));
-        assert!(
-            entries
-                .iter()
-                .any(|entry| entry.ends_with(Path::new("lib").join("rocm_sysdeps").join("lib")))
-        );
-    }
-    #[test]
     fn launch_env_sets_vllm_rocm_target_device() -> Result<()> {
         let runtime = VllmRuntime {
             runtime_id: "therock-release:gfx120X-all".to_owned(),
@@ -1888,6 +1745,146 @@ mod tests {
     #[test]
     fn stop_scope_includes_vllm_workers() {
         assert_eq!(STOP_SCOPE, rocm_core::KillScope::Tree);
+    }
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn apply_therock_env_actually_runs_the_compat_shim_step() -> Result<()> {
+        // The stale-numa-shim removal `ensure_therock_compat_shims` performs
+        // does not depend on host state — it always removes a `libnuma.so.1`
+        // symlink it finds — so assert on that as proof the call actually
+        // happened. See `apply_therock_env_writes_libmpi_cxx_stub_when_needed`
+        // below for the other half of that call, the mpi_cxx stub write,
+        // which does depend on host state and needs its own oracle.
+        let env = tempfile::tempdir()?;
+        let compat_dir = env.path().join("rocm-cli-lib-compat");
+        fs::create_dir_all(&compat_dir)?;
+        let stale_shim = compat_dir.join("libnuma.so.1");
+        std::os::unix::fs::symlink("/does/not/exist", &stale_shim)?;
+
+        let runtime = VllmRuntime {
+            runtime_id: "therock-release:gfx120X-all".to_owned(),
+            env_id: "external-vllm-therock".to_owned(),
+            command: PathBuf::from("vllm"),
+            python_executable: Some(env.path().join("bin").join("python")),
+            version: None,
+            source: "managed_runtime_manifest:test".to_owned(),
+            sdk_root: Some(env.path().join("sdk")),
+            sdk_bin: None,
+            sdk_bin_paths: Vec::new(),
+            sdk_library_paths: Vec::new(),
+            rocm_sdk_version: None,
+        };
+        let mut command = ProcessCommand::new("vllm");
+
+        apply_therock_env(&mut command, &runtime)?;
+
+        assert!(
+            stale_shim.symlink_metadata().is_err(),
+            "ensure_therock_compat_shims must have removed the stale numa shim"
+        );
+        Ok(())
+    }
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn apply_therock_env_writes_libmpi_cxx_stub_when_needed() -> Result<()> {
+        // Whether this host needs the `libmpi_cxx.so.40` stub depends on host
+        // state this test does not control: a real `libmpi_cxx.so*` already
+        // present, or no stub embedded at compile time (no C compiler on the
+        // build host). Use `ensure_mpi_cxx_compat` itself as the oracle,
+        // against a throwaway directory so probing does not touch the
+        // directory this test actually asserts on. When it answers `None`
+        // here, `apply_therock_env`'s own call cannot write a stub either, and
+        // there is nothing this test can check on this host.
+        let probe = tempfile::tempdir()?;
+        if rocm_core::openmpi::ensure_mpi_cxx_compat(probe.path()).is_none() {
+            return Ok(());
+        }
+
+        let env = tempfile::tempdir()?;
+        let runtime = VllmRuntime {
+            runtime_id: "therock-release:gfx120X-all".to_owned(),
+            env_id: "external-vllm-therock".to_owned(),
+            command: PathBuf::from("vllm"),
+            python_executable: Some(env.path().join("bin").join("python")),
+            version: None,
+            source: "managed_runtime_manifest:test".to_owned(),
+            sdk_root: Some(env.path().join("sdk")),
+            sdk_bin: None,
+            sdk_bin_paths: Vec::new(),
+            sdk_library_paths: Vec::new(),
+            rocm_sdk_version: None,
+        };
+        let mut command = ProcessCommand::new("vllm");
+
+        apply_therock_env(&mut command, &runtime)?;
+
+        let compat_dir = env.path().join("rocm-cli-lib-compat");
+        let stub = compat_dir.join("libmpi_cxx.so.40");
+        assert!(
+            stub.is_file(),
+            "ensure_therock_compat_shims must have written the libmpi_cxx stub"
+        );
+
+        let ld_library_path = command
+            .get_envs()
+            .find_map(|(key, value)| (key == "LD_LIBRARY_PATH").then_some(value))
+            .flatten()
+            .expect("LD_LIBRARY_PATH set");
+        assert!(
+            std::env::split_paths(ld_library_path).any(|entry| entry == compat_dir),
+            "ensure_therock_compat_shims's answer must reach LD_LIBRARY_PATH: \
+             {ld_library_path:?} should contain {compat_dir:?}"
+        );
+        Ok(())
+    }
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn apply_therock_env_excludes_a_leftover_stub_this_launch_does_not_need() -> Result<()> {
+        // The opposite host state from
+        // `apply_therock_env_writes_libmpi_cxx_stub_when_needed`, made
+        // deterministic (rather than dependent on this host's own OpenMPI
+        // install or compiler) by injecting the `ensure_mpi_cxx_compat`
+        // answer through `apply_therock_env_with`: when this launch's probe
+        // says no shim is needed, a stub some earlier run left behind in
+        // `compat_dir` must not keep that directory on the loader path.
+        let env = tempfile::tempdir()?;
+        let runtime = VllmRuntime {
+            runtime_id: "therock-release:gfx120X-all".to_owned(),
+            env_id: "external-vllm-therock".to_owned(),
+            command: PathBuf::from("vllm"),
+            python_executable: Some(env.path().join("bin").join("python")),
+            version: None,
+            source: "managed_runtime_manifest:test".to_owned(),
+            sdk_root: Some(env.path().join("sdk")),
+            sdk_bin: None,
+            sdk_bin_paths: Vec::new(),
+            sdk_library_paths: Vec::new(),
+            rocm_sdk_version: None,
+        };
+
+        // Plant the leftover directly, bypassing `ensure_mpi_cxx_compat`:
+        // this is what a prior launch leaves behind on a host that has since
+        // gained a real `libmpi_cxx.so*`.
+        let compat_dir = env.path().join("rocm-cli-lib-compat");
+        fs::create_dir_all(&compat_dir)?;
+        fs::write(compat_dir.join("libmpi_cxx.so.40"), b"stale stub")?;
+
+        let mut command = ProcessCommand::new("vllm");
+
+        apply_therock_env_with(&mut command, &runtime, |_compat_dir| None)?;
+
+        let ld_library_path = command
+            .get_envs()
+            .find_map(|(key, value)| (key == "LD_LIBRARY_PATH").then_some(value))
+            .flatten()
+            .expect("LD_LIBRARY_PATH set");
+        assert!(
+            !std::env::split_paths(ld_library_path).any(|entry| entry == compat_dir),
+            "a leftover stub must not keep the compat dir on the loader path \
+             when this launch does not need one: {ld_library_path:?} should \
+             not contain {compat_dir:?}"
+        );
+        Ok(())
     }
     fn test_vllm_runtime(
         python_executable: Option<PathBuf>,

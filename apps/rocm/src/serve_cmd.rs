@@ -919,7 +919,7 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     // answer rather than repeating the registry recovery.
     //
     // The ordering is enforced by `@id:serve-unrelated-live-service-still-fails-fast`
-    // (serve-27), which plants a configured-but-unregistered setup venv — the one
+    // (serve-28), which plants a configured-but-unregistered setup venv — the one
     // state that makes the recovery's write reachable — and asserts the runtime
     // registry is still empty after the refusal. Without that fixture the call
     // could be hoisted above the bail with the whole suite green, because
@@ -1269,7 +1269,7 @@ mod tests {
         assert!(
             reuse_pregate_opens(false, host_has_no_usable_gpu(Some(&[])), || true),
             "a host with no usable GPU and a matching live service must still \
-             reach the reuse probe, or the exemption serve-25 covers is gone"
+             reach the reuse probe, or the exemption serve-26 covers is gone"
         );
         // ...and `--device cpu_only` never had a GPU bail to exempt.
         assert!(!reuse_pregate_opens(

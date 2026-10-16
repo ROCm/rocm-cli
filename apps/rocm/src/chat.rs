@@ -374,36 +374,36 @@ pub(crate) fn parse_deterministic_service_rows(tool_text: &str) -> Vec<Determini
     let mut current: Option<DeterministicServiceRow> = None;
     for line in tool_text.lines() {
         let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix("- service_id=") {
-            if let Some(row) = current.take() {
-                rows.push(row);
-            }
-            let mut row = DeterministicServiceRow::default();
-            for token in rest.split_whitespace() {
-                if let Some((key, value)) = token.split_once('=') {
-                    match key {
-                        "service_id" => row.service_id = value.to_owned(),
-                        "engine" => row.engine = value.to_owned(),
-                        "model" => row.model = value.to_owned(),
-                        "status" => row.status = value.to_owned(),
-                        "running_state" => row.running_state = value.to_owned(),
-                        "endpoint" => row.endpoint = value.to_owned(),
-                        _ => {}
+        if let Some(rest) = trimmed.strip_prefix("- ") {
+            if rest.starts_with("service_id=") {
+                if let Some(row) = current.take() {
+                    rows.push(row);
+                }
+                let mut row = DeterministicServiceRow::default();
+                for token in rest.split_whitespace() {
+                    if let Some((key, value)) = token.split_once('=') {
+                        match key {
+                            "service_id" => row.service_id = value.to_owned(),
+                            "engine" => row.engine = value.to_owned(),
+                            "model" => row.model = value.to_owned(),
+                            "status" => row.status = value.to_owned(),
+                            "running_state" => row.running_state = value.to_owned(),
+                            "endpoint" => row.endpoint = value.to_owned(),
+                            _ => {}
+                        }
                     }
                 }
+                if row.running_state.is_empty() {
+                    row.running_state = managed_service_running_state(&row.status).to_owned();
+                }
+                current = Some(row);
+                continue;
             }
-            if row.running_state.is_empty() {
-                row.running_state = managed_service_running_state(&row.status).to_owned();
-            }
-            current = Some(row);
-            continue;
-        }
-        if let Some(service_id) = trimmed.strip_prefix("- ") {
             if let Some(row) = current.take() {
                 rows.push(row);
             }
             current = Some(DeterministicServiceRow {
-                service_id: service_id.to_owned(),
+                service_id: rest.to_owned(),
                 ..Default::default()
             });
             continue;
@@ -755,25 +755,11 @@ vllm: not_installed
             "  - service_id=svc-1 engine=vllm model=qwen status=ready running_state=running endpoint=127.0.0.1:8000",
         );
         assert_eq!(rows.len(), 1);
-        // service_id is not asserted here: see
-        // parse_deterministic_service_rows_reads_inline_service_id_rocmai_577
-        // below for why.
+        assert_eq!(rows[0].service_id, "svc-1");
         assert_eq!(rows[0].engine, "vllm");
         assert_eq!(rows[0].status, "ready");
         assert_eq!(rows[0].running_state, "running");
         assert_eq!(rows[0].endpoint, "127.0.0.1:8000");
-    }
-
-    #[test]
-    #[ignore = "ROCMAI-577: the leading \"- service_id=\" prefix strip consumes \
-                the `service_id` key before the per-token `key=value` loop runs, \
-                so the bare id token that's left (`svc-1`) has no `=` and is \
-                silently dropped"]
-    fn parse_deterministic_service_rows_reads_inline_service_id_rocmai_577() {
-        let rows = parse_deterministic_service_rows(
-            "  - service_id=svc-1 engine=vllm model=qwen status=ready running_state=running endpoint=127.0.0.1:8000",
-        );
-        assert_eq!(rows[0].service_id, "svc-1");
     }
 
     #[test]

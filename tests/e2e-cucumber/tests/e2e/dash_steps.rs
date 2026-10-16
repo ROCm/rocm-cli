@@ -134,6 +134,37 @@ async fn open_dashboard_demo(world: &mut E2eWorld) {
     world.tui = Some(session);
 }
 
+/// The name of a child directory `dash-25` plants under the scenario's cwd;
+/// `existing_folder_browser_shows_scenario_folder` asserts the browser lists
+/// it by this fixed, short label rather than its full path — the browser's
+/// entry list labels children by `file_name()` alone (`build_entries` in
+/// `folder_browser.rs`), so this stays robust however long the host's own
+/// temp directory is, unlike the browser's *header* line, which renders
+/// `current_dir` verbatim in an unwrapped `Paragraph` and would silently
+/// clip (and falsely fail this scenario) on a long enough temp path. The
+/// space in the name is explained in dash-25's scenario comment.
+const ADOPT_SCENARIO_CHILD: &str = "adopt me";
+
+#[when("the user opens the dashboard in a scenario-owned folder")]
+async fn open_dashboard_in_scenario_folder(world: &mut E2eWorld) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .to_path_buf();
+    let child = root.join(ADOPT_SCENARIO_CHILD);
+    std::fs::create_dir_all(&child).unwrap_or_else(|e| {
+        panic!(
+            "failed to create scenario-owned folder {}: {e}",
+            child.display()
+        )
+    });
+    let session = TuiSession::spawn_in(world, &["dash", "--demo"], &root)
+        .unwrap_or_else(|e| panic!("failed to open the dashboard in {}: {e}", root.display()));
+    world.tui = Some(session);
+}
+
 #[when("the user opens interactive chat")]
 async fn open_chat(world: &mut E2eWorld) {
     let args: &[&str] = if world.chat_use_mock {
@@ -417,6 +448,15 @@ async fn choose_install_rocm_sdk(world: &mut E2eWorld) {
         .unwrap_or_else(|e| panic!("failed to choose Install ROCm SDK: {e}"));
 }
 
+#[when("the user chooses to adopt an existing folder")]
+async fn choose_adopt_existing_folder(world: &mut E2eWorld) {
+    // "Adopt an existing ROCm folder" is the choose-menu's second entry, one
+    // `Down` past the default "Install ROCm SDK (pip)".
+    session(world)
+        .send("j\r")
+        .unwrap_or_else(|e| panic!("failed to choose Adopt an existing folder: {e}"));
+}
+
 #[when("the user browses for an install folder")]
 async fn browse_for_install_folder(world: &mut E2eWorld) {
     session(world)
@@ -434,16 +474,63 @@ async fn choose_current_folder(world: &mut E2eWorld) {
 
 #[when("the user closes onboarding setup")]
 async fn close_onboarding_setup(world: &mut E2eWorld) {
-    // Two `Esc`: the first backs Configure out to Choose, the second closes
-    // the wizard entirely — it owns every key while open (see
-    // `draw_onboarding`'s doc comment), so `q` cannot reach the dashboard
-    // until it is gone.
+    // Two `Esc`: the first backs out of whichever sub-view currently has
+    // focus — the SDK Configure channel/pin sub-view (reached via Install
+    // SDK; its own folder browser, opened with `Tab`, is always closed by
+    // the time this step runs, as in dash-23) or the Adopt-path's own folder
+    // browser — the second closes the wizard entirely; it owns every key
+    // while open (see `draw_onboarding`'s doc comment), so `q` cannot reach
+    // the dashboard until it is gone. Each sub-view leaves its own marker on
+    // screen (the Configure sub-view's "Tab browse folder" footer hint, or
+    // the Adopt browser's own popup title); wait for one of them to actually
+    // render — a single snapshot can race a step immediately before this
+    // one that is still mid-repaint — then wait for that marker to clear
+    // before the second `Esc`, or the two `Esc` bytes can land in the same
+    // PTY read and coalesce into one `KeyCode::Esc` (crossterm reads
+    // back-to-back ESC bytes as a single Esc key), which only backs out of
+    // the sub-view and leaves the wizard open. Configure's own folder
+    // browser ("Pick an install folder") is rejected outright rather than
+    // silently waited past: closing it is the caller's job, not this
+    // step's, so seeing it here means a scenario called this step too
+    // early.
+    const CONFIGURE_FOOTER: &str = "Tab browse folder";
+    const ADOPT_BROWSER_TITLE: &str = "Pick an existing ROCm folder";
+    const CONFIGURE_BROWSER_TITLE: &str = "Pick an install folder";
     let tui = session(world);
+    // Recorded from inside the predicate below, not re-read from a second
+    // `screen_text()` call afterward — the screen can keep moving between
+    // the predicate matching and a later read, so only the frame the
+    // predicate actually saw can be trusted to name which marker matched.
+    let mut open_sub_view_marker: Option<&'static str> = None;
+    tui.wait_for_screen_where(
+        &format!("{CONFIGURE_FOOTER:?} or {ADOPT_BROWSER_TITLE:?} to appear"),
+        |screen| {
+            assert!(
+                !screen.contains(CONFIGURE_BROWSER_TITLE),
+                "the install-folder browser is still open; close it before calling this step:\n{screen}"
+            );
+            open_sub_view_marker = if screen.contains(ADOPT_BROWSER_TITLE) {
+                Some(ADOPT_BROWSER_TITLE)
+            } else if screen.contains(CONFIGURE_FOOTER) {
+                Some(CONFIGURE_FOOTER)
+            } else {
+                None
+            };
+            open_sub_view_marker.is_some()
+        },
+        default_timeout(),
+    )
+    .await
+    .unwrap_or_else(|e| {
+        panic!("no sub-view is open, so there is nothing to close before the wizard itself: {e}")
+    });
+    let open_sub_view_marker =
+        open_sub_view_marker.expect("wait_for_screen_where succeeded without recording a marker");
     tui.send("\u{1b}")
-        .unwrap_or_else(|e| panic!("failed to leave Configure: {e}"));
-    tui.wait_until_gone("Tab browse folder", default_timeout())
+        .unwrap_or_else(|e| panic!("failed to leave the open sub-view: {e}"));
+    tui.wait_until_gone(open_sub_view_marker, default_timeout())
         .await
-        .unwrap_or_else(|e| panic!("Configure sub-view did not close: {e}"));
+        .unwrap_or_else(|e| panic!("sub-view did not close: {e}"));
     tui.send("\u{1b}")
         .unwrap_or_else(|e| panic!("failed to close onboarding: {e}"));
     tui.wait_until_gone("Welcome to ROCm — first-run setup", default_timeout())
@@ -1122,19 +1209,36 @@ async fn install_folder_browser_displayed(world: &mut E2eWorld) {
         .unwrap_or_else(|e| panic!("the install-folder browser did not appear: {e}"));
 }
 
+#[then("the existing-folder browser lists the scenario folder's contents")]
+async fn existing_folder_browser_shows_scenario_folder(world: &mut E2eWorld) {
+    // The browser lists `ADOPT_SCENARIO_CHILD` as a child entry only if it's
+    // browsing our scenario's own cwd (seeded from `std::env::current_dir()`
+    // in `onboarding.rs`'s `AdoptExisting` arm) — so this is only reachable if
+    // `spawn_in` actually set the child process's working directory to our
+    // scenario root, exactly as the full path would prove, but without
+    // depending on the host's temp-directory length (see
+    // `ADOPT_SCENARIO_CHILD`'s doc comment).
+    let marker = format!("{ADOPT_SCENARIO_CHILD}/");
+    session(world)
+        .wait_for_screen(&marker, default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the existing-folder browser did not show {marker:?}: {e}"));
+}
+
 #[then("the Configure step shows the chosen folder instead of the placeholder")]
 async fn configure_shows_chosen_folder(world: &mut E2eWorld) {
     session(world)
         .wait_for_screen_where(
-            "the Folder row shows a chosen path rather than the unset placeholder",
+            "the Folder row shows a chosen path rather than the unset placeholder, with the install-folder browser closed",
             |screen| {
                 screen.contains("Folder:")
                     && !screen.contains("default managed folder · Tab to browse")
+                    && !screen.contains("Pick an install folder")
             },
             default_timeout(),
         )
         .await
-        .unwrap_or_else(|e| panic!("the Folder row never showed a chosen path: {e}"));
+        .unwrap_or_else(|e| panic!("the Folder row never showed a chosen path with the browser closed: {e}"));
 }
 
 #[then("the managed model is displayed")]

@@ -1505,7 +1505,7 @@ local curl smoke and accepted fields.
 vLLM TheRock GPU acceptance:
 
 ```bash
-cargo test -p rocm-engine-vllm running_state_records_managed_therock_env_for_gpu_verification
+cargo test -p rocm-engine-vllm write_running_state_records_managed_therock_env_for_gpu_verification
 cargo test -p rocm-engine-vllm managed_env_reflects_managed_runtime_manifest_source
 cargo test -p rocm-engine-vllm resolve_model_omits_gpu_memory_utilization_default
 python -m py_compile scripts/vllm_therock_gpu_test.py
@@ -1607,7 +1607,7 @@ including that the managed-service probe is not even *consulted* on a GPU host
 That unit test exercises `reuse_pregate_opens` directly, so on its own it cannot
 see `serve()` ceasing to pass `host_has_no_usable_gpu` at the call site — the
 call site is a seam no unit test in `apps/rocm` can reach, because the host GPU
-probe is a real hardware probe with no injection point. serve-29 closes it, and
+probe is a real hardware probe with no injection point. serve-30 closes it, and
 being `@requires-gpu` it runs on the **`E2E self-hosted`** lane only, never on
 the per-PR mock lane.
 
@@ -1632,19 +1632,19 @@ There is deliberately no focused command for these five. Cucumber 0.23 honours
 whether a scenario may run at all (see the comment at
 [`tests/e2e-cucumber/tests/e2e.rs`](../tests/e2e-cucumber/tests/e2e.rs), above
 `only_lifecycle`). That matters most
-for serve-26, which is gated on the `@requires-oom-fault-injection` capability:
+for serve-27, which is gated on the `@requires-oom-fault-injection` capability:
 selected from the CLI it would run on a binary built without the hook and fail
 for the wrong reason. Note also that `-n` matches the scenario *name*
-(`serve-25 - Reuse succeeds on a GPU-less host ...`), not the `@id:` tag, so
+(`serve-26 - Reuse succeeds on a GPU-less host ...`), not the `@id:` tag, so
 passing an id to it silently selects nothing.
 
-- serve-25, `@id:serve-oom-memory-guidance` — a `serve` that reuses an
+- serve-26, `@id:serve-oom-memory-guidance` — a `serve` that reuses an
   already-running vLLM service whose log *does* carry an OOM traceback prints
   the reuse summary with no memory guidance in it.
-- serve-26, `@id:serve-oom-launch-memory-guidance` — a launch that runs out of
+- serve-27, `@id:serve-oom-launch-memory-guidance` — a launch that runs out of
   GPU memory blames this launch and names the knobs. The positive counterpart of
-  serve-25.
-- serve-27, `@id:serve-unrelated-live-service-still-fails-fast` — a live
+  serve-26.
+- serve-28, `@id:serve-unrelated-live-service-still-fails-fast` — a live
   Lemonade service for an *unrelated* model does not soften the no-GPU refusal:
   serving a different model is refused before any engine starts, and nothing is
   prepared or downloaded. Lemonade specifically, because it manages its own
@@ -1658,30 +1658,30 @@ passing an id to it silently selects nothing.
   configured, and no other e2e root has one, so without this fixture the call
   could be hoisted above the bail with every refusal scenario still green. The
   final `Then` asserts the registry is still empty after the refusal.
-- serve-28, `@id:serve-unreusable-live-service-still-fails-fast` — a live vLLM
+- serve-29, `@id:serve-unreusable-live-service-still-fails-fast` — a live vLLM
   service for the *same* model, which this invocation nonetheless cannot reuse
   (`--require-api-key` against a service that has no key), also does not soften
-  the refusal. This is the pre-gate's *acceptance* term, which serve-25 and
-  serve-27 cannot reach: serve-25 plants a record that really is reusable, and
-  serve-27 fails the gate's outer engine/model condition before the acceptance
+  the refusal. This is the pre-gate's *acceptance* term, which serve-26 and
+  serve-28 cannot reach: serve-26 plants a record that really is reusable, and
+  serve-28 fails the gate's outer engine/model condition before the acceptance
   test runs. The discriminating assertion is that the `rocm services stop`
   advice is absent — that advice is printed only from the spawn, which is
   reachable only once the no-GPU bail has been bypassed.
 
 Those four carry `@requires-no-gpu` (their premise is a host with no usable AMD
-GPU), so they get their live coverage on the GitHub-hosted mock lane; serve-25,
-serve-26 and serve-28 also carry `@requires-os:linux`.
+GPU), so they get their live coverage on the GitHub-hosted mock lane; serve-26,
+serve-27 and serve-29 also carry `@requires-os:linux`.
 
 The fifth is the pre-gate's other half, and it is the one that needs real
 hardware:
 
-- serve-29, `@id:serve-live-reuse-candidate-does-not-preempt-gpu-validation`
+- serve-30, `@id:serve-live-reuse-candidate-does-not-preempt-gpu-validation`
   (**`@requires-gpu`**, so the `E2E self-hosted` lane only) — on a host that
   *does* have a usable GPU, a live service this invocation really could reuse
   still does not pull engine or registry work ahead of `--gpu` validation. The
   record matches on liveness, engine and canonical model id, so every term of
   the pre-gate except `host_has_no_usable_gpu` is satisfied and that predicate
-  alone is what holds the gate shut. It reuses serve-27's setup-venv fixture so
+  alone is what holds the gate shut. It reuses serve-28's setup-venv fixture so
   the final `Then` can assert the registry is still empty: with the gate wrongly
   open, `recover_setup_runtime_registration` re-files the planted manifest before
   the refusal. This is the only check in the repo that fails if `serve()` stops
@@ -1691,7 +1691,7 @@ hardware:
 
 ### The OOM fault-injection capability
 
-serve-26 needs a managed launch that really failed on VRAM, which a GPU-less CI
+serve-27 needs a managed launch that really failed on VRAM, which a GPU-less CI
 host cannot produce. It is therefore driven by a test-only fault-injection hook:
 the `rocm` crate feature `e2e-oom-fault-injection`, armed at run time by
 `ROCM_E2E_SIMULATE_OOM_LAUNCH=1`, makes `rocm serve` fabricate the on-disk state
@@ -1711,7 +1711,7 @@ was handed a prebuilt binary.
 Consequently, every lane that runs a **prebuilt** `ROCM_CLI_BINARY` — the
 self-hosted lanes in [`e2e-selfhosted.yml`](../.github/workflows/e2e-selfhosted.yml)
 and the [`nightly.yml`](../.github/workflows/nightly.yml) lanes — has the hook
-compiled out and resolves serve-26 to a reported **skip**, not a silent pass. It
+compiled out and resolves serve-27 to a reported **skip**, not a silent pass. It
 gates PRs on the GitHub-hosted mock lane, which lets `cargo xtask e2e` build the
 binary itself. The prebuilt lanes' `--features` floor is asserted as a superset
 check rather than an exact match for this reason; see the test notes on
@@ -1721,7 +1721,7 @@ check rather than an exact match for this reason; see the test notes on
 Be precise about *which* gate produces the skip, because the hook is not always
 the one that decides. On the Windows lifecycle lane in
 [`ci.yml`](../.github/workflows/ci.yml) the hook is compiled out too, but
-serve-26 is never selected there at all: that lane runs `E2E_ONLY_LIFECYCLE` and
+serve-27 is never selected there at all: that lane runs `E2E_ONLY_LIFECYCLE` and
 the scenario carries `@requires-os:linux`. On the GPU lanes it is
 `@requires-no-gpu` that excludes it. The missing hook is the deciding gate only
 where a Linux, GPU-less lane runs a prebuilt binary.
@@ -1955,6 +1955,39 @@ scenarios (`skill-catalog-ids-match-cli` and its neighbours) do list and
 compare the new entry on every lane. A
 scenario that runs the check itself would need the Windows lane and a host
 with an old runtime installed.
+
+### A GPU with no ROCm build
+
+`info-20-gpu-no-rocm-support` is the catalog's one `DIAGNOSE-ONLY` entry: every
+AMD GPU on the host identifies as a target ROCm has never shipped a runtime
+build for (today only `gfx90c`, the Vega iGPU in Renoir / Lucienne / Cezanne /
+Barcelo). `rocm fix` still answers for the id — by naming the problem, changing
+nothing and exiting 0 — because `diagnose` prints `apply with: rocm fix <id>`
+for every cause it reports.
+
+`diagnose-40` covers it end to end. The host is simulated rather than required:
+a KFD node planted under the scenario's own root reports `gfx_target_version
+90012`, so it runs on **every** Linux lane, WSL2 included — `@requires-os:linux`
+matches a host whose `os_family` is `linux`, and WSL2's is. Every `rocm` call in
+that scenario therefore has to carry `ROCM_CLI_TEST_HOST_ROOT`: `rocm fix` gates
+on the OS, and `fix::current_os` resolves WSL *through* the host root, so an
+unrooted call on a WSL2 runner is read as `wsl` — an OS this entry deliberately
+does not apply on — and exits 3.
+
+```bash
+cargo xtask e2e -- -n '(diagnose-40)'
+```
+
+The other half of the same change — `fix-13-hip-sdk-missing` no longer firing
+just because no HIP SDK is installed — has **no** end-to-end coverage and cannot
+have any. `check_13_hip_sdk_missing` returns early on every non-Windows host, so
+on a Linux lane that early return alone satisfies "no cause tells this user to
+install the HIP SDK"; the assertion would still hold with `check_20` deleted.
+The gate itself is held by unit tests in
+[diagnose.rs](../crates/rocm-core/src/diagnose.rs)
+(`fix_13_does_not_fire_on_a_lemonade_vulkan_host_with_no_hip_evidence` and its
+neighbours) and by the Windows manual check in
+[manual-testing.md](manual-testing.md), in the Ryzen 4000/5000 section.
 
 ## Model Fit Preflight
 

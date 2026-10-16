@@ -22,6 +22,7 @@
 //! output, importing nothing from the product crates.
 
 use std::io::{Read, Write};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -191,7 +192,26 @@ impl TuiSession {
         args: &[&str],
         extra_env: &[(&str, &str)],
     ) -> Result<Self, String> {
-        Self::spawn_binary_with_env(world, crate::rocm_binary(), args, extra_env)
+        Self::spawn_binary_with_env(world, crate::rocm_binary(), args, extra_env, None)
+    }
+
+    /// Like [`spawn`](Self::spawn), but spawned with `dir` as the child's
+    /// working directory. Without this, portable-pty's `CommandBuilder`
+    /// never inherits the harness's own cwd on Unix — it falls back to
+    /// `$HOME`, which is already this scenario's isolated `HOME` (see
+    /// [`pty_env`]). On Windows it falls back to `%USERPROFILE%` when that
+    /// names a real directory — the real host profile, not this scenario's
+    /// isolation — and only inherits the harness's own cwd (via a null
+    /// `lpCurrentDirectory` to `CreateProcessW`) when `%USERPROFILE%` is
+    /// unset or not a directory. `spawn_in` makes the cwd an arbitrary,
+    /// explicit choice — independent of `HOME`/`USERPROFILE` overrides, and
+    /// the only reliable control on Windows — for driving a UI flow that
+    /// resolves its initial path via `std::env::current_dir()`: onboarding's
+    /// Adopt-existing folder browser does this unconditionally (see
+    /// dash-25); its Configure-path sibling does the same only when nothing
+    /// is already staged.
+    pub fn spawn_in(world: &E2eWorld, args: &[&str], dir: &Path) -> Result<Self, String> {
+        Self::spawn_binary_with_env(world, crate::rocm_binary(), args, &[], Some(dir))
     }
 
     /// Spawn a specific `rocm` binary under a fresh PTY.
@@ -204,7 +224,7 @@ impl TuiSession {
         binary: impl AsRef<std::ffi::OsStr>,
         args: &[&str],
     ) -> Result<Self, String> {
-        Self::spawn_binary_with_env(world, binary, args, &[])
+        Self::spawn_binary_with_env(world, binary, args, &[], None)
     }
 
     /// Backing implementation of [`spawn_binary`] / [`spawn_with_env`]: spawn
@@ -215,6 +235,7 @@ impl TuiSession {
         binary: impl AsRef<std::ffi::OsStr>,
         args: &[&str],
         extra_env: &[(&str, &str)],
+        cwd: Option<&Path>,
     ) -> Result<Self, String> {
         let pair = native_pty_system()
             .openpty(PtySize {
@@ -228,6 +249,16 @@ impl TuiSession {
         let mut cmd = CommandBuilder::new(binary);
         for arg in args {
             cmd.arg(arg);
+        }
+        if let Some(dir) = cwd {
+            // portable-pty 0.9.0 silently filters a non-directory cwd and
+            // falls back per the doc comment above, with no error, so check
+            // it ourselves rather than let a typo'd or not-yet-created
+            // target spawn somewhere else without saying so.
+            if !dir.is_dir() {
+                return Err(format!("cwd {} is not a directory", dir.display()));
+            }
+            cmd.cwd(dir);
         }
         // Inherit the parent environment first, then overlay the isolation and
         // deterministic-terminal vars — mirroring how the piped `run_rocm` path

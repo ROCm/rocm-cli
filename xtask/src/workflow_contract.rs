@@ -873,32 +873,35 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
         }
     }
 
-    /// The nightly WSL lane's `runs-on` must track the per-PR lane's, byte for
-    /// byte: both jobs claim to run on the same DevLab Dispatch pool host
-    /// (`e2e-wsl-nightly`'s header comment, docs/ci-hardware-testing.md), and
-    /// nothing else pins that claim -- reverting `e2e-wsl-nightly` to its old
-    /// static `[self-hosted, linux, strix-halo, wsl]` labels (its pre-migration
-    /// runs-on; `native` never applied to this job, only to the two
-    /// `e2e-gpu-nightly-strix*` lanes) would leave every other assertion in
-    /// this file green while the doc and the comment both quietly went false
-    /// again.
+    /// Each nightly DevLab Dispatch lane's `runs-on` must track its per-PR
+    /// counterpart's, byte for byte: both jobs in each pair claim to run on
+    /// the same pool host (the nightly job's header comment,
+    /// docs/ci-hardware-testing.md), and nothing else pins that claim --
+    /// reverting a nightly job to its old static `native`/`wsl` labels would
+    /// leave every other assertion in this file green while the doc and the
+    /// comment both quietly went false again.
     #[test]
-    fn nightly_wsl_lane_shares_the_per_pr_pool_labels() {
+    fn nightly_devlab_dispatch_lanes_share_the_per_pr_pool_labels() {
         let sh = read_workflow("e2e-selfhosted.yml");
         let nightly = read_workflow("nightly.yml");
-        let per_pr = runs_on_values(job_block(&sh, "e2e-wsl"));
-        let nightly_wsl = runs_on_values(job_block(&nightly, "e2e-wsl-nightly"));
-        assert!(!per_pr.is_empty(), "e2e-wsl declares a runs-on");
-        assert!(
-            per_pr.iter().any(|value| value.contains("devlab-dispatch")),
-            "e2e-wsl must actually be on the DevLab Dispatch pool, not just equal to \
-             nightly's (equal-and-empty would pass the assertion below): {per_pr:?}"
-        );
-        assert_eq!(
-            per_pr, nightly_wsl,
-            "e2e-wsl-nightly's runs-on must match e2e-wsl's exactly -- both are documented as \
-             the same DevLab Dispatch pool"
-        );
+        for (per_pr_job, nightly_job) in [
+            ("e2e-wsl", "e2e-wsl-nightly"),
+            ("e2e-gpu-strix-windows", "e2e-gpu-nightly-strix-windows"),
+        ] {
+            let per_pr = runs_on_values(job_block(&sh, per_pr_job));
+            let nightly_values = runs_on_values(job_block(&nightly, nightly_job));
+            assert!(!per_pr.is_empty(), "{per_pr_job} declares a runs-on");
+            assert!(
+                per_pr.iter().any(|value| value.contains("devlab-dispatch")),
+                "{per_pr_job} must actually be on the DevLab Dispatch pool, not just equal to \
+                 {nightly_job}'s (equal-and-empty would pass the assertion below): {per_pr:?}"
+            );
+            assert_eq!(
+                per_pr, nightly_values,
+                "{nightly_job}'s runs-on must match {per_pr_job}'s exactly -- both are \
+                 documented as the same DevLab Dispatch pool"
+            );
+        }
     }
 
     #[test]
@@ -1083,20 +1086,45 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
 
     /// The report artifact a lane's upload step names (`name: e2e-*-report`).
     fn uploaded_report_artifact(workflow: &str, text: &str, job: &str) -> String {
-        let names: Vec<&str> = job_block(text, job)
-            .lines()
-            .filter_map(|line| line.trim().strip_prefix("name: "))
-            .filter(|name| name.starts_with("e2e-") && name.ends_with("-report"))
-            .collect();
-        assert_eq!(
-            names.len(),
-            1,
-            "{workflow} job `{job}` should upload exactly one `e2e-*-report` artifact, \
-             found {names:?}"
-        );
+        // A lane with an `sdk_version` matrix (ROCMAI-430) uploads one artifact
+        // per leg, each behind its own mutually exclusive `if:` — pair every
+        // artifact name with the `if:` directly above it in the same step, then
+        // pick the `current` leg to stand for the whole lane, the same way a
+        // channel axis below is checked through its `release` leg.
+        let mut last_if: Option<&str> = None;
+        let mut candidates: Vec<(&str, Option<&str>)> = Vec::new();
+        for line in job_block(text, job).lines() {
+            let trimmed = line.trim();
+            if let Some(cond) = trimmed.strip_prefix("if: ") {
+                last_if = Some(cond);
+            } else if let Some(name) = trimmed.strip_prefix("name: ")
+                && name.starts_with("e2e-")
+                && name.ends_with("-report")
+            {
+                candidates.push((name, last_if));
+            }
+        }
+        let chosen = match candidates.as_slice() {
+            [(name, _)] => *name,
+            _ => {
+                candidates
+                    .iter()
+                    .find(|(_, cond)| {
+                        cond.is_some_and(|c| c.contains("matrix.sdk_version == 'current'"))
+                    })
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "{workflow} job `{job}` should upload exactly one `e2e-*-report` \
+                             artifact, or one `current`-leg one among an sdk_version matrix, \
+                             found {candidates:?}"
+                        )
+                    })
+                    .0
+            }
+        };
         // The report job has no `matrix` context, so a lane with a channel axis is
         // checked through its `release` leg, which stands for the whole lane.
-        names[0].replace("${{ matrix.channel }}", "release")
+        chosen.replace("${{ matrix.channel }}", "release")
     }
 
     #[test]
