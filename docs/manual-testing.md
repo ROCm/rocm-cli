@@ -572,6 +572,12 @@ Expected result:
 
 ## 5. Reuse Is Exempt From The No-GPU Refusal
 
+**Linux or WSL only.** Unlike the rest of this file, the commands below are
+bash, not PowerShell, and they pin `--engine vllm`, which is unsupported on
+native Windows. The behaviour itself is not platform-specific; only this recipe
+for reproducing it is. On native Windows, substitute `--engine lemonade`
+throughout and set the mask with `$env:HIP_VISIBLE_DEVICES = ""` (and clear it
+with `Remove-Item Env:HIP_VISIBLE_DEVICES` afterwards).
 
 This is a change to a refusal you may be relying on, so check both halves. Mask
 every device to stand in for a host with no usable AMD GPU — the same condition
@@ -608,7 +614,7 @@ the refusal names.
    ```
 
    Expected result: `no usable AMD GPU detected; rocm serve requires a GPU under
-   the gpu_required policy…`, and the refusal comes *first* — no engine
+   the gpu_required policy ...`, and the refusal comes *first* — no engine
    preparation, no download, no runtime manifest written. A live service for
    another model must not soften the refusal or pull engine work in front of it.
 
@@ -626,7 +632,7 @@ the refusal names.
    ```
 
    Expected result: the same refusal, and still first — no
-   `Preparing lemonade for GPU serving…` line and no embeddable download. Note
+   `Preparing lemonade for GPU serving...` line and no embeddable download. Note
    that the model name is irrelevant here: the engine mismatch alone shuts the
    gate, which is exactly why 3a is a separate run.
 

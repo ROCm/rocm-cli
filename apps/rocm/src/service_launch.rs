@@ -310,12 +310,11 @@ enum ManagedSpawn {
 /// The ways a live managed service that already matches on liveness, engine and
 /// canonical model id can still be unusable by this invocation.
 ///
-/// Those three terms are necessary but not sufficient:
-/// [`spawn_managed_engine_child`] refuses reuse on two further terms, and under
-/// `gpu_required` the serve path adds a third. One variant per term.
-/// [`managed_service_reuse_refusal`] is the single decision procedure both
-/// callers ask, so the two cannot answer differently — which they previously
-/// did; see that function for what the disagreement cost.
+/// Those three terms are necessary but not sufficient: three further terms can
+/// still refuse, one variant each. [`managed_service_reuse_refusal`] is the
+/// single decision procedure both callers ask, so the two cannot answer
+/// differently — which they previously did; see that function for what the
+/// disagreement cost.
 pub(crate) enum ManagedReuseRefusal {
     /// The live service was started with different serve options.
     RecipeMismatch,
@@ -352,14 +351,22 @@ pub(crate) enum ManagedReuseRefusal {
 /// predicate means a service that cannot actually be reused never buys the
 /// bypass, so the user gets the accurate refusal first and keeps their server.
 ///
-/// `requested_device_policy` is `None` for callers that are not gating the GPU
-/// refusal on the answer (the spawn itself), which keeps the spawn's acceptance
-/// exactly as it was on hosts that do have a GPU.
+/// `requested_device_policy` is taken by value, not as an `Option`, on purpose.
+/// It was optional so the spawn could opt out of the device-policy term, and
+/// that left two holes at once: the spawn's `DevicePolicyTooWeak` arm was
+/// unreachable (an untestable bail), and `serve()` — the caller that *does*
+/// gate the GPU refusal on this answer — could silently drop the term by
+/// passing `None`, with the whole suite still green. Both callers have a
+/// `DevicePolicy` in hand, so requiring it costs nothing and makes that
+/// mutation a compile error. It widens nothing observable today either: the
+/// only policy a record can carry is the one `parse_device_policy` admits
+/// (see below), so `existing.device_policy == Some("cpu_only")` is not
+/// reachable from any `rocm serve` this CLI can run.
 pub(crate) fn managed_service_reuse_refusal(
     existing: &ManagedServiceRecord,
     requested_recipe_json: Option<&str>,
     require_api_key: bool,
-    requested_device_policy: Option<&DevicePolicy>,
+    requested_device_policy: &DevicePolicy,
 ) -> Option<ManagedReuseRefusal> {
     if existing.engine_recipe_json.as_deref() != requested_recipe_json {
         return Some(ManagedReuseRefusal::RecipeMismatch);
@@ -376,10 +383,10 @@ pub(crate) fn managed_service_reuse_refusal(
     // is deliberately no wider match on "anything but `CpuOnly`": it would be
     // identical at runtime and would read as a guard against a `gpu_preferred`
     // bypass that no CLI invocation can reach. A `cpu_only` invocation would be
-    // satisfied by anything anyway and never reaches the bail; `None` is the
-    // spawn, which is not gating the bail at all. README.md's "that is the only
-    // policy pair refused" is the contract, and this matches it exactly.
-    if matches!(requested_device_policy, Some(DevicePolicy::GpuRequired))
+    // satisfied by anything anyway and never reaches the bail. README.md's
+    // "that is the only policy pair refused" is the contract, and this matches
+    // it exactly.
+    if matches!(requested_device_policy, DevicePolicy::GpuRequired)
         && existing.device_policy.as_deref() == Some("cpu_only")
     {
         return Some(ManagedReuseRefusal::DevicePolicyTooWeak);
@@ -430,15 +437,19 @@ fn spawn_managed_engine_child(
         // non-reusable service bypass the no-GPU refusal and the user was sent
         // here to be told to stop a working server for nothing.
         //
-        // No device-policy term on this side: the spawn is reached on hosts that
-        // do have a GPU, where reuse across policies was already accepted, and
-        // widening that is not this change's business. The serve path passes the
-        // policy because it is the one deciding the bail.
+        // The same device policy the serve path passes. This side used to pass
+        // `None` to keep the spawn's acceptance untouched, but that opted the
+        // spawn out of a term it has the input for, left its own
+        // `DevicePolicyTooWeak` bail unreachable, and made the serve path's
+        // argument droppable. Nothing observable widens: `parse_device_policy`
+        // is the only producer of a `DevicePolicy` on every path that reaches
+        // here and it rejects `cpu_only`, so no record this CLI writes can
+        // carry the policy this term refuses.
         match managed_service_reuse_refusal(
             &existing,
             requested_recipe_json.as_deref(),
             require_api_key,
-            None,
+            device_policy,
         ) {
             Some(ManagedReuseRefusal::RecipeMismatch) => bail!(
                 "managed service `{}` is already running for engine `{engine}` and model `{}` with different serve options (recipe hint, tool-call parser, or generation defaults); stop it and run `rocm serve` again to apply the requested options",
@@ -454,10 +465,14 @@ fn spawn_managed_engine_child(
                 resolve.canonical_model_id,
                 service_hints::service_stop_hint(&existing.service_id)
             ),
-            // Not reachable from here: this caller passes no policy, so the
-            // predicate never returns it. Spelled out rather than wildcarded so
-            // adding a term to the predicate is a compile error here, which is
-            // the point of sharing it.
+            // Reachable only from a record whose `device_policy` says
+            // `cpu_only`, which no `rocm serve` can write today
+            // (`parse_device_policy` refuses that policy outright) — so this is
+            // a guard against a record written by some future path, not a
+            // refusal users see now. The advice still names a command that
+            // clears the condition: stopping the service removes the only thing
+            // this term can object to, and the rerun then launches normally
+            // (AGENTS.md section 3).
             Some(ManagedReuseRefusal::DevicePolicyTooWeak) => bail!(
                 "managed service `{}` is already running under a device policy that cannot \
                  satisfy this request; stop it with `{}` and run the command again",
@@ -1302,8 +1317,7 @@ mod tests {
         // The baseline must be reusable, or the negative cases below could pass
         // for the wrong reason.
         assert!(
-            managed_service_reuse_refusal(&base, None, true, Some(&DevicePolicy::GpuRequired))
-                .is_none(),
+            managed_service_reuse_refusal(&base, None, true, &DevicePolicy::GpuRequired).is_none(),
             "a matching service with no recipe, a key, and a gpu_required policy is reusable"
         );
 
@@ -1311,12 +1325,7 @@ mod tests {
         let mut mismatched = base.clone();
         mismatched.engine_recipe_json = Some("{\"engine\":\"vllm\"}".to_owned());
         assert!(matches!(
-            managed_service_reuse_refusal(
-                &mismatched,
-                None,
-                true,
-                Some(&DevicePolicy::GpuRequired)
-            ),
+            managed_service_reuse_refusal(&mismatched, None, true, &DevicePolicy::GpuRequired),
             Some(ManagedReuseRefusal::RecipeMismatch)
         ));
 
@@ -1325,46 +1334,35 @@ mod tests {
         let mut anonymous = base.clone();
         anonymous.requires_api_key = false;
         assert!(matches!(
-            managed_service_reuse_refusal(&anonymous, None, true, Some(&DevicePolicy::GpuRequired)),
+            managed_service_reuse_refusal(&anonymous, None, true, &DevicePolicy::GpuRequired),
             Some(ManagedReuseRefusal::MissingApiKey)
         ));
         assert!(
-            managed_service_reuse_refusal(
-                &anonymous,
-                None,
-                false,
-                Some(&DevicePolicy::GpuRequired)
-            )
-            .is_none(),
+            managed_service_reuse_refusal(&anonymous, None, false, &DevicePolicy::GpuRequired)
+                .is_none(),
             "an anonymous service is fine when no key was demanded"
         );
 
-        // Device policy — the term only `serve()` passes, because it is the one
+        // Device policy — the term `serve()` depends on, because it is the one
         // gating the no-usable-GPU bail on the answer. Reusing a `cpu_only`
         // service to answer a `gpu_required` serve is the silent CPU fallback.
         let mut cpu_only = base;
         cpu_only.device_policy = Some("cpu_only".to_owned());
         assert!(matches!(
-            managed_service_reuse_refusal(&cpu_only, None, true, Some(&DevicePolicy::GpuRequired)),
+            managed_service_reuse_refusal(&cpu_only, None, true, &DevicePolicy::GpuRequired),
             Some(ManagedReuseRefusal::DevicePolicyTooWeak)
         ));
         // `GpuRequired` is the only policy the CLI can produce — `--device
         // gpu_preferred`/`auto`/`gpu` all parse to it and `cpu_only` is rejected
         // (`parse_device_policy_defaults_to_gpu_required_without_cpu_fallback`) —
         // so there is no second policy arm to discriminate here, and asserting
-        // one would pin an input `serve()` never produces.
+        // one would pin an input `serve()` never produces. Both callers pass
+        // the same policy; the parameter is not optional, so neither can drop
+        // this term without a compile error.
         //
-        // The spawn passes no policy, so its acceptance on a GPU host is
-        // unchanged by this term — deliberately, since widening it there is not
-        // this change's business.
-        assert!(
-            managed_service_reuse_refusal(&cpu_only, None, true, None).is_none(),
-            "a caller that is not gating the GPU bail must see the old acceptance"
-        );
         // A cpu_only *invocation* never reaches the bail, so nothing to refuse.
         assert!(
-            managed_service_reuse_refusal(&cpu_only, None, true, Some(&DevicePolicy::CpuOnly))
-                .is_none()
+            managed_service_reuse_refusal(&cpu_only, None, true, &DevicePolicy::CpuOnly).is_none()
         );
 
         let _ = std::fs::remove_dir_all(&root);

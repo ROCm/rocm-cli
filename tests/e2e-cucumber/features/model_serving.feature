@@ -350,10 +350,10 @@ Feature: Model serving
   # reaches the reuse short-circuit even on a GPU-less host.
   #
   # This is the only scenario that proves the exemption's happy path end to end,
-  # and the only one of the four that can: serve-27 plants a record for a
-  # different model, serve-27 one this invocation cannot actually reuse, and
-  # serve-28 runs on a host that *has* a GPU. It runs on the no-GPU mock host, so
-  # it gates every PR and allocates no GPU memory.
+  # and the only one of the five that can: serve-27 plants a record for a
+  # different model, serve-28 and serve-30 each plant one this invocation cannot
+  # actually reuse, and serve-29 runs on a host that *has* a GPU. It runs on the
+  # no-GPU mock host, so it gates every PR and allocates no GPU memory.
   @id:serve-reuse-exempt-from-no-gpu-refusal @requires-no-gpu @requires-os:linux
   Scenario: serve-26 - Reuse succeeds on a GPU-less host
     Given a live managed vLLM serve is already running
@@ -409,11 +409,12 @@ Feature: Model serving
   #
   # `--require-api-key` against a service that has no key is the cheapest way to
   # make `managed_service_reuse_refusal` answer Some on a record that is
-  # otherwise a perfect match; the recipe-mismatch term would do as well. The
-  # discriminating assertion is the absence of the stop advice: with the gate
-  # back on `existing_live_managed_service(..).is_some()` the run reaches the
-  # spawn and prints it. `--env-id` satisfies model resolution without
-  # installing a runtime, exactly as serve-26 does.
+  # otherwise a perfect match. The discriminating assertion is the absence of
+  # the stop advice: with the gate back on
+  # `existing_live_managed_service(..).is_some()` the run reaches the spawn and
+  # prints it. `--env-id` satisfies model resolution without installing a
+  # runtime, exactly as serve-26 does. The recipe term is a separate argument of
+  # the same predicate and is not covered here — serve-30 covers it.
   @id:serve-unreusable-live-service-still-fails-fast @requires-no-gpu @requires-os:linux
   Scenario: serve-28 - A live service this invocation cannot reuse does not soften the no-GPU refusal
     Given a live managed vLLM serve is already running
@@ -423,9 +424,9 @@ Feature: Model serving
     And the user is not told to stop the running server
 
   # The reuse pre-gate's OTHER half, and the only lane that can see it. serve-26,
-  # 27 and 28 all run on GPU-less hosts, where `host_has_no_usable_gpu` is true
-  # and the gate's outcome is decided entirely by the live-service term — so none
-  # of them can tell the current gate from the one it replaced. Neither can the
+  # 27, 28 and 30 all run on GPU-less hosts, where `host_has_no_usable_gpu` is
+  # true and the gate's outcome is decided entirely by the live-service term — so
+  # none of them can tell the current gate from the one it replaced. Neither can the
   # unit test (`the_reuse_pregate_stays_shut_on_a_host_that_has_a_usable_gpu`):
   # it calls `reuse_pregate_opens` directly, so it pins the helper but not
   # `serve()`'s decision to pass the host predicate into it. Drop that argument
@@ -454,3 +455,30 @@ Feature: Model serving
     Then serving is refused before any engine starts
     And the user is told that GPU index is unavailable
     And no runtime registry manifest was written
+
+  # The recipe argument of the reuse decision, and the only check in the repo
+  # that fails when `serve()` stops passing it. serve-28 is the same shape for
+  # `--require-api-key`, but it cannot stand in for this one: the two arguments
+  # are independent, and the record every other scenario plants carries no
+  # recipe at all (`engine_recipe_json: null`), which is exactly what a serve
+  # with no recipe-bearing flags asks for — so the recipe argument matches
+  # whether `serve()` passes it or passes nothing, and dropping it changed no
+  # outcome anywhere.
+  #
+  # `--tool-call-parser hermes` is the cheapest way to make the requested recipe
+  # non-null without a catalog entry: on vLLM it synthesizes a recipe hint even
+  # for a model that has none, so `managed_service_reuse_refusal` sees a
+  # mismatch against the planted record's null and refuses reuse. This
+  # invocation therefore earns no bypass and must still get the no-GPU refusal.
+  # Pass `None` for that argument at the call site and the mismatch disappears,
+  # the bypass is granted, and the run reaches the spawn — which refuses with
+  # the recipe-mismatch message instead, so the no-GPU assertion goes red.
+  # `--env-id` satisfies model resolution without installing a runtime, exactly
+  # as serve-26 and serve-28 do.
+  @id:serve-recipe-mismatched-live-service-still-fails-fast @requires-no-gpu @requires-os:linux
+  Scenario: serve-30 - A live service with a different recipe does not soften the no-GPU refusal
+    Given a live managed vLLM serve is already running
+    When the user serves that same model with a tool-call parser under the GPU-required default
+    Then serving is refused before any engine starts
+    And the user is told no AMD GPU was detected
+    And the user is not told to relaunch the server with different options

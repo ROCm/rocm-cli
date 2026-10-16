@@ -539,6 +539,22 @@ fn reuse_pregate_opens(
     !cpu_only && host_has_no_usable_gpu && live_service_matches()
 }
 
+/// The no-usable-GPU bail's host precondition, read from the visibility-resolved
+/// set of usable AMD GPU ordinals.
+///
+/// A named function rather than an inline expression because three things have
+/// to answer it identically: the bail, the reuse pre-gate whose only product is
+/// a term of that bail, and the unit test that pins the pre-gate. The test used
+/// to spell the expression out a second time, so changing the real one left it
+/// green and only serve-29 — on a self-hosted GPU lane — could notice.
+///
+/// `None` is "could not probe on this platform", not "no GPU", and stays
+/// permissive; only an authoritative empty set is "no usable GPU". See the call
+/// site in [`serve`] for what answers `None`.
+const fn host_has_no_usable_gpu(visible: Option<&[u32]>) -> bool {
+    matches!(visible, Some([]))
+}
+
 /// Parsed `rocm serve` arguments. Grouped into a struct to keep the dispatcher
 /// and `serve()` readable now that the verb carries verbose/smoke-test controls.
 pub(crate) struct ServeArgs {
@@ -690,6 +706,15 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     // CPU-only serving never pins a GPU, so skip GPU resolution entirely and
     // surface the explicit `--gpu` as ignored rather than printing a device the
     // server will not use.
+    //
+    // Always `false` today, and kept anyway: `parse_device_policy` rejects
+    // `cpu`/`cpu_only` outright (pinned by
+    // `parse_device_policy_defaults_to_gpu_required_without_cpu_fallback`), so
+    // the only policy that reaches here is `GpuRequired`. The term is what makes
+    // every `!cpu_only` guard below read as a guard on the *policy* rather than
+    // on a constant, so admitting the policy later cannot silently turn CPU-only
+    // serving into GPU pre-flight failures. It is not evidence that the CPU path
+    // is exercised; nothing in the suite can reach it.
     let cpu_only = matches!(device_policy, DevicePolicy::CpuOnly);
     // AMD GPU ordinals still usable after the active visibility mask
     // (`HIP_VISIBLE_DEVICES`, then `ROCR_VISIBLE_DEVICES`) is applied, in HIP
@@ -714,9 +739,7 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     // reuse pre-gate below whose only product is a term of that bail. `None` is
     // "could not probe on this platform", not "no GPU", so it does not open
     // either one.
-    let host_has_no_usable_gpu = visible_gpu_indices
-        .as_deref()
-        .is_some_and(<[u32]>::is_empty);
+    let host_has_no_usable_gpu = host_has_no_usable_gpu(visible_gpu_indices.as_deref());
     // Reusing an already-running managed service launches nothing and pins no
     // GPU, so it must bypass the GPU-required pre-flight below — the reused
     // service was already vetted at its own launch, and this invocation does no
@@ -797,9 +820,12 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
             // nothing left to reuse — hit the no-GPU refusal. The advice named a
             // command that could not clear the condition.
             //
-            // The device policy is passed here and not at the spawn because this
-            // is the caller gating the GPU bail on the answer: a `cpu_only`
-            // service must not buy a `gpu_required` serve a bypass of it.
+            // Every argument here is load-bearing, and each has a scenario that
+            // fails if it is dropped: serve-28 for `require_api_key`, serve-30
+            // for `requested_recipe_json`. The device policy cannot be dropped
+            // at all — the predicate takes it by value, so passing nothing is a
+            // compile error (see `managed_service_reuse_refusal`). A `cpu_only`
+            // service must not buy a `gpu_required` serve a bypass of the bail.
             let requested_recipe_json = engine_recipe
                 .as_ref()
                 .map(serde_json::to_string)
@@ -812,7 +838,7 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
                             &existing,
                             requested_recipe_json.as_deref(),
                             require_api_key,
-                            Some(&device_policy),
+                            &device_policy,
                         )
                         .is_none()
                     });
@@ -830,11 +856,23 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     // resolution (which can write a runtime registry manifest), the `ResolveModel`
     // round-trip, and any self-managed engine install — runs first only when
     // this bail's own host predicate already holds *and* a live managed service
-    // already matches this engine and model, i.e. only when this invocation is
-    // about to reuse it and legitimately skip the bail. On a host with a usable
-    // GPU, and whenever no such service exists (the ordinary launch, and every
-    // no-GPU refusal path), that block's body is skipped and this is the first
-    // thing that runs.
+    // already matches this engine and model. On a host with a usable GPU, and
+    // whenever no such service matches (the ordinary launch, and every no-GPU
+    // refusal path that has no overlapping live service), that block's body is
+    // skipped and this is the first thing that runs.
+    //
+    // "Matches" is weaker than "is about to be reused", and the difference is
+    // visible to users. `any_live_managed_service_for_model` matches model names
+    // leniently (a two-way substring compare), so a live `qwen3-8b-instruct`
+    // opens the gate for `rocm serve qwen` — an invocation that then fails
+    // `managed_service_reuse_refusal` and still gets this bail, having already
+    // paid for the engine preparation. Worse, a `?` on
+    // `validate_engine_selection_runtime`, `ensure_self_managed_engine_ready` or
+    // `engine_request` above can return an unrelated error *instead of* this
+    // refusal on such a host. Both are the documented price of leniency (README
+    // and `--help` state it); narrowing the match would silently break reuse by
+    // short name, which is the worse failure. serve-27 is the regression test
+    // for the non-overlapping case, where the ordering does hold strictly.
     //
     // Its *condition* is not free either, though it is paid only on a host this
     // bail already applies to: `any_live_managed_service_for_model`
@@ -1195,11 +1233,12 @@ mod tests {
     /// Both halves are asserted, because the probe is a cost as well as a term:
     /// on a host with a GPU the gate must be shut *without* consulting the
     /// managed-service records at all.
+    ///
+    /// The host predicate comes from the production
+    /// [`host_has_no_usable_gpu`], not a copy of its expression — this test
+    /// used to restate it, so changing the real one left the test green.
     #[test]
     fn the_reuse_pregate_stays_shut_on_a_host_that_has_a_usable_gpu() {
-        let host_has_no_usable_gpu =
-            |visible: Option<&[u32]>| visible.is_some_and(<[u32]>::is_empty);
-
         let mut probed = false;
         assert!(
             !reuse_pregate_opens(false, host_has_no_usable_gpu(Some(&[0])), || {
@@ -1235,7 +1274,10 @@ mod tests {
             "a host with no usable GPU and a matching live service must still \
              reach the reuse probe, or the exemption serve-26 covers is gone"
         );
-        // ...and `--device cpu_only` never had a GPU bail to exempt.
+        // ...and `--device cpu_only` never had a GPU bail to exempt. No CLI
+        // invocation can produce that policy today (`parse_device_policy`
+        // rejects `cpu_only`), so this asserts the helper's own guard, not a
+        // reachable `serve()` input — see the `cpu_only` binding in `serve`.
         assert!(!reuse_pregate_opens(
             true,
             host_has_no_usable_gpu(Some(&[])),

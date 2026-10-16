@@ -41,8 +41,10 @@ fn interactive_summary_timeout() -> Duration {
 const UNRELATED_LIVE_MODEL: &str = "e2e/unrelated-live-model";
 /// The GGUF model the Lemonade-pinned serve steps request. Same checkpoint
 /// `serve-lemonade-preparation-recovery` uses, so no new download is implied on
-/// any lane that ever does reach a real install.
-const LEMONADE_SERVE_TARGET: &str = "Qwen3-0.6B-GGUF";
+/// any lane that ever does reach a real install — which is also why
+/// [`REUSE_REFUSAL_MODEL`] picked it, so this aliases that constant rather than
+/// repeating the literal.
+const LEMONADE_SERVE_TARGET: &str = REUSE_REFUSAL_MODEL;
 /// How long to wait for a freshly served model's endpoint to become ready.
 ///
 /// On real GPU hardware the first serve of a model downloads its weights and
@@ -1390,10 +1392,51 @@ async fn user_serves_live_model_requiring_a_key(world: &mut E2eWorld) {
     world.cli_rc = Some(rc);
 }
 
+/// Serve the *same* model the live planted record names, asking for a vLLM
+/// tool-call parser the running service was not started with.
+///
+/// The discriminating step of serve-30. Liveness, engine and canonical model id
+/// all match, so the pre-gate's outer condition holds, and `--tool-call-parser`
+/// is what makes the *requested* recipe non-null: on vLLM
+/// `engine_recipe_with_tool_call_override` synthesizes a hint even for a model
+/// that has no catalog recipe. The planted record carries
+/// `engine_recipe_json: null`, so `managed_service_reuse_refusal` answers
+/// `RecipeMismatch`, this invocation cannot actually reuse the service, and it
+/// must not be granted the bypass of the no-usable-GPU refusal.
+///
+/// Stop `serve()` passing `requested_recipe_json` and the comparison becomes
+/// null against null: the bypass is granted, the run reaches
+/// `spawn_managed_engine_child`, and that caller's own recipe-mismatch refusal
+/// replaces the no-GPU one — which `the user is told no AMD GPU was detected`
+/// sees. Every other scenario plants a null recipe against a serve that
+/// requests none, so none of them can tell the two apart. `--env-id` satisfies
+/// model resolution without installing a runtime, the same way serve-26 and
+/// serve-28 do; captured pipe output rather than a PTY, because the expected
+/// outcome is a refusal on stderr.
+#[when("the user serves that same model with a tool-call parser under the GPU-required default")]
+async fn user_serves_live_model_with_a_tool_call_parser(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(
+        world,
+        &[
+            "serve",
+            LIVE_REUSE_MODEL,
+            "--engine",
+            "vllm",
+            "--env-id",
+            "e2e-reuse",
+            "--tool-call-parser",
+            "hermes",
+        ],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
 /// Serve the *same* model the live planted record names, pinned to a GPU ordinal
 /// the host does not have.
 ///
-/// The discriminating step of serve-30, and it only means anything on a host
+/// The discriminating step of serve-29, and it only means anything on a host
 /// that has a usable GPU. There the reuse pre-gate must stay shut on
 /// `host_has_no_usable_gpu` alone — every other term is satisfied, since the
 /// planted record matches on liveness, engine and canonical model id — so
@@ -1404,11 +1447,11 @@ async fn user_serves_live_model_requiring_a_key(world: &mut E2eWorld) {
 /// the way; the paired `no runtime registry manifest was written` is what sees
 /// that.
 ///
-/// No `--env-id`, unlike serve-26/29: `validate_engine_selection_runtime` only
-/// reaches `recover_setup_runtime_registration` when neither `--runtime-id` nor
-/// `--env-id` is given, so naming one would make that assertion unfalsifiable.
-/// Captured pipe output rather than a PTY, because the expected outcome is a
-/// refusal on stderr and not a deployment summary.
+/// No `--env-id`, unlike serve-26/28/30: `validate_engine_selection_runtime`
+/// only reaches `recover_setup_runtime_registration` when neither
+/// `--runtime-id` nor `--env-id` is given, so naming one would make that
+/// assertion unfalsifiable. Captured pipe output rather than a PTY, because the
+/// expected outcome is a refusal on stderr and not a deployment summary.
 #[when("the user serves that same model pinned to a GPU index that does not exist")]
 async fn user_serves_live_model_on_absent_gpu_index(world: &mut E2eWorld) {
     let (stdout, stderr, rc) = crate::run_rocm(
@@ -1537,6 +1580,26 @@ async fn assert_no_stop_the_running_server_advice(world: &mut E2eWorld) {
         !output.contains("rocm services stop"),
         "a live service this invocation cannot reuse must refuse on the GPU, not send the \
          user to stop it and re-run into the same refusal:\n{output}"
+    );
+}
+
+/// serve-30's counterpart to `the user is not told to stop the running server`.
+///
+/// The recipe-mismatch refusal `spawn_managed_engine_child` raises does not
+/// print `rocm services stop` — it says to stop the service and run `rocm
+/// serve` again "to apply the requested options" — so the other step's token
+/// cannot see it. `different serve options` is the phrase that refusal owns,
+/// and it is reachable only once the no-GPU bail has been bypassed, so its
+/// absence says the bypass was not granted. Stopping the server would not clear
+/// a no-GPU condition either: the re-run would have nothing left to reuse and
+/// would hit the same refusal.
+#[then("the user is not told to relaunch the server with different options")]
+async fn assert_no_relaunch_with_different_options_advice(world: &mut E2eWorld) {
+    let output = serve_output(world);
+    assert!(
+        !output.contains("different serve options"),
+        "a live service this invocation cannot reuse must refuse on the GPU, not send the \
+         user to relaunch it with the requested options and back into the same refusal:\n{output}"
     );
 }
 

@@ -1576,7 +1576,16 @@ see `serve()` ceasing to pass `host_has_no_usable_gpu` at the call site — the
 call site is a seam no unit test in `apps/rocm` can reach, because the host GPU
 probe is a real hardware probe with no injection point. serve-29 closes it, and
 being `@requires-gpu` it runs on the **`E2E self-hosted`** lane only, never on
-the per-PR mock lane.
+the per-PR mock lane. The host predicate itself is the shared
+`host_has_no_usable_gpu` function, called by both the bail and the test rather
+than restated in either, so the test cannot drift from the production rule.
+
+The bypass decision's other arguments are in the same position — the unit tests
+in `apps/rocm/src/service_launch.rs` pin `managed_service_reuse_refusal` itself,
+not which values `serve()` hands it — so each one has a scenario instead:
+serve-28 for `require_api_key`, serve-30 for the requested recipe. The device
+policy needs neither: the predicate takes it by value rather than as an
+`Option`, so a call site that drops it does not compile.
 
 E2E scenarios, in
 [`tests/e2e-cucumber/features/model_serving.feature`](../tests/e2e-cucumber/features/model_serving.feature).
@@ -1586,14 +1595,22 @@ Run the suite unfiltered and let the harness select:
 cargo xtask e2e
 ```
 
-There is deliberately no focused command for these four. Cucumber 0.23 honours
-*either* its own CLI filter *or* the harness closure, never both, so `-n` or
-`--tags` bypasses the OS, capability and expectation resolution that decides
-whether a scenario may run at all (see the comment at
+Unfiltered, deliberately — do not reach for the `cargo xtask e2e -- -n "..."`
+form other sections of this file use. Cucumber 0.23 honours *either* its own CLI
+filter *or* the harness closure, never both, so `-n` and `--tags` bypass the OS,
+capability and expectation resolution that decides whether a scenario may run at
+all (see the comment at
 [`tests/e2e-cucumber/tests/e2e.rs`](../tests/e2e-cucumber/tests/e2e.rs), above
-`only_lifecycle`). Note also that `-n` matches the scenario *name*
-(`serve-26 - Reuse succeeds on a GPU-less host`), not the `@id:` tag, so passing
-an id to it silently selects nothing.
+`only_lifecycle`). That caveat applies to every `-n` in this file, but it bites
+hardest here: these five are selected *by* host GPU state, so `-n` runs them on
+hosts whose premise does not hold — serve-26/27/28/30 need a host with no usable
+AMD GPU and serve-29 needs one with a GPU, and each silently reports the wrong
+answer on the other. (The one supported way to drive them off their own lane is
+to make the host match: masking every device with `HIP_VISIBLE_DEVICES=` makes
+the harness and the product agree the host has no usable GPU, which is what the
+mock lane has.) Note also that `-n` matches the scenario *name* (`serve-26 -
+Reuse succeeds on a GPU-less host`), not the `@id:` tag, so passing an id to it
+silently selects nothing.
 
 - serve-26, `@id:serve-reuse-exempt-from-no-gpu-refusal` — a `serve` that
   matches an already-running vLLM service on a GPU-less host is not refused: it
@@ -1622,12 +1639,25 @@ an id to it silently selects nothing.
   test runs. The discriminating assertion is that the `rocm services stop`
   advice is absent — that advice is printed only from the spawn, which is
   reachable only once the no-GPU bail has been bypassed.
+- serve-30, `@id:serve-recipe-mismatched-live-service-still-fails-fast` — the
+  same shape for the *other* independent argument of that acceptance test. A
+  live vLLM service for the same model, against a serve that asks for a
+  `--tool-call-parser` the service was not started with, is a recipe mismatch,
+  so it also earns no bypass. serve-28 cannot stand in for it: the record every
+  other scenario plants carries `engine_recipe_json: null`, which is exactly
+  what a serve with no recipe-bearing flags requests, so the recipe argument
+  matched whether `serve()` passed it or not. `--tool-call-parser` is the
+  cheapest way to make the requested recipe non-null without a catalog entry —
+  on vLLM it synthesizes a recipe hint for a model that has none. The
+  discriminating assertion is that the message is still the no-GPU one: grant
+  the bypass and the run reaches the spawn, whose own recipe-mismatch refusal
+  replaces it.
 
-Those three carry `@requires-no-gpu` (their premise is a host with no usable AMD
-GPU), so they get their live coverage on the GitHub-hosted mock lane; serve-26
-and serve-28 also carry `@requires-os:linux`.
+Those four carry `@requires-no-gpu` (their premise is a host with no usable AMD
+GPU), so they get their live coverage on the GitHub-hosted mock lane; serve-26,
+serve-28 and serve-30 also carry `@requires-os:linux`.
 
-The fourth is the pre-gate's other half, and it is the one that needs real
+The fifth is the pre-gate's other half, and it is the one that needs real
 hardware:
 
 - serve-29, `@id:serve-live-reuse-candidate-does-not-preempt-gpu-validation`
@@ -1641,7 +1671,7 @@ hardware:
   open, `recover_setup_runtime_registration` re-files the planted manifest before
   the refusal. This is the only check in the repo that fails if `serve()` stops
   passing the host predicate into `reuse_pregate_opens` — the unit test pins the
-  helper, not the call site, and the three no-GPU scenarios above run where the
+  helper, not the call site, and the four no-GPU scenarios above run where the
   gate opens either way.
 
 ## Windows Tool Notes
