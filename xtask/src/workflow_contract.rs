@@ -3389,7 +3389,8 @@ fi
             String::from_utf8_lossy(&out.stdout).into_owned()
         };
 
-        let empty = e2e_report::consolidated_summary_markdown_from_reports(&[], &[]);
+        let empty =
+            e2e_report::consolidated_summary_markdown(&e2e_report::load_platform_reports(&[]));
         assert!(
             !run(&empty).contains("REACHED_PUBLISH"),
             "the generator's empty output must stop the publish"
