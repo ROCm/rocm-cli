@@ -1937,3 +1937,81 @@ async fn assert_partial_snapshot_note_names_the_monitor_timeout(world: &mut E2eW
          the same bound, but amd-smi's {STUB_GPU_COUNT}-GPU payload produced {length} characters"
     );
 }
+
+// ── Windows display driver ─────────────────────────────────────────
+
+/// The first day not counted as older: the release of the first HIP SDK for
+/// Windows, `FIRST_HIP_SDK_FOR_WINDOWS` in `rocm_core::windows_driver`.
+///
+/// Repeated here on purpose. The step judges the CLI's verdict against the day
+/// the documentation names, so a verdict computed from a drifted constant would
+/// not agree with it. Dates are `yyyy-MM-dd`, which order as text.
+const FIRST_HIP_SDK_FOR_WINDOWS_DAY: &str = "2023-07-27";
+
+/// The driver record the machine-readable form carries, if it carries one.
+pub(crate) fn windows_driver_record(json: &serde_json::Value) -> Option<&serde_json::Value> {
+    json.pointer("/summary/driver/windows")
+}
+
+/// What the machine-readable form says about the driver's age, worked out from
+/// its date and not from the verdict it carries, so the verdict can be held
+/// against it.
+fn age_expected_from_date(record: &serde_json::Value) -> &'static str {
+    match record.get("date").and_then(serde_json::Value::as_str) {
+        None => "unknown",
+        Some(date) if date < FIRST_HIP_SDK_FOR_WINDOWS_DAY => "predates_first_hip_sdk",
+        Some(_) => "not_older",
+    }
+}
+
+#[then(
+    "the inspection reports the display driver's version and date as the machine-readable form does"
+)]
+async fn assert_examine_reports_driver_version_and_date(world: &mut E2eWorld) {
+    let json = parsed_json(world);
+    let text = world.cli_stderr.as_ref().expect("no readable inspection");
+    let record = windows_driver_record(&json).unwrap_or_else(|| {
+        panic!("the machine-readable form carries no Windows driver record:\n{json:#}")
+    });
+    let version = record
+        .get("version")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    assert!(!version.is_empty(), "{record:#}");
+    assert_eq!(field_value(text, "driver_version"), Some(version), "{text}");
+    let date = record
+        .get("date")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("<unknown>");
+    assert_eq!(field_value(text, "driver_date"), Some(date), "{text}");
+}
+
+#[then("the inspection calls the driver old only when its date is before 27 July 2023")]
+async fn assert_examine_driver_age_follows_the_date(world: &mut E2eWorld) {
+    let json = parsed_json(world);
+    let text = world.cli_stderr.as_ref().expect("no readable inspection");
+    let record = windows_driver_record(&json)
+        .unwrap_or_else(|| panic!("no Windows driver record in the machine-readable form"));
+    let expected = age_expected_from_date(record);
+    assert_eq!(
+        record.get("age").and_then(serde_json::Value::as_str),
+        Some(expected),
+        "the machine-readable verdict does not follow the driver date:\n{record:#}"
+    );
+    let age = field_value(text, "driver_age").unwrap_or_else(|| panic!("no driver_age:\n{text}"));
+    let expected_start = match expected {
+        "predates_first_hip_sdk" => "older than the first HIP SDK for Windows",
+        "not_older" => "not older than the first HIP SDK for Windows",
+        _ => "unknown",
+    };
+    assert!(
+        age.starts_with(expected_start),
+        "driver_age should start with {expected_start:?} for {record:#}, got: {age}"
+    );
+    // Whatever the verdict, the text says the minimum is not established. It
+    // must never present the date as a compatibility requirement.
+    assert!(
+        expected == "unknown" || age.contains("not established"),
+        "{age}"
+    );
+}
