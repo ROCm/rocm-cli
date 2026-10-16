@@ -88,9 +88,9 @@ pub use host_gpu::{
     default_engine_for_host, default_engine_for_platform, detect_gpu_driver_version,
     detect_host_gfx_target, detect_host_gpu_diagnostics, detect_host_gpu_summary,
     detect_system_ram_gib, extract_first_gfx_token, gfx_target_has_no_rocm_build,
-    gpu_support_level, has_usable_amd_gpu, interactive_terminal, is_amdgpu_device, is_wsl_host,
-    known_therock_families, normalize_therock_family, preferred_serve_engine_for_host_gpu_summary,
-    usable_amd_gpu_indices,
+    gpu_support_level, gpu_support_level_for_host_gpu, has_usable_amd_gpu, interactive_terminal,
+    is_amdgpu_device, is_wsl_host, known_therock_families, normalize_therock_family,
+    preferred_serve_engine_for_host_gpu_summary, usable_amd_gpu_indices,
 };
 #[cfg(any(target_os = "linux", test))]
 use host_gpu::{KfdGpuNode, kfd_gpu_nodes_in};
