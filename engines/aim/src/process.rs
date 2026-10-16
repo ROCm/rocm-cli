@@ -69,9 +69,15 @@ pub(crate) fn resolve_model_response(request: ResolveModelRequest) -> Result<Res
     }
 
     Ok(ResolveModelResponse {
-        canonical_model_id: metadata
-            .canonical_name
-            .unwrap_or_else(|| request.model_ref.clone()),
+        // Must stay the Docker image reference, not `metadata.canonical_name`'s
+        // human-readable HF-style id: `apps/rocm` re-threads `canonical_model_id`
+        // back into Launch/ServeHttp as `model_ref` (service id generation,
+        // `__engine-serve-http` argv, `docker pull`/`docker run`) for every
+        // built-in engine uniformly. For vLLM/Lemonade that coincides with the
+        // resolved HF repo id; for AIM it would swap in a non-pullable display
+        // string instead of the image (found via live Strix Halo validation:
+        // `docker pull meta-llama/Llama-3.2-1B-Instruct` failed outright).
+        canonical_model_id: request.model_ref,
         task: "text-generation".to_owned(),
         source: "docker_registry".to_owned(),
         revision: "main".to_owned(),
@@ -135,7 +141,6 @@ pub(crate) fn launch_service(request: LaunchRequest) -> Result<LaunchResponse> {
         request.port,
         &gpu_indices,
     )?;
-
     let endpoint_url = endpoint_url(&request.host, request.port);
     crate::state::write_running_state(
         &request.service_id,
@@ -170,17 +175,17 @@ fn run_container(
     host: &str,
     port: u16,
     gpu_indices: &[u32],
-) -> Result<()> {
+) -> Result<Option<String>> {
     let name = container_name(service_id);
+    let metadata = crate::registry::fetch_image_metadata(model_ref).unwrap_or_default();
     if crate::docker::inspect_running(&name)?.unwrap_or(false) {
-        return Ok(());
+        return Ok(metadata.canonical_name);
     }
 
     if !crate::docker::image_present(model_ref)? {
         crate::docker::pull(model_ref)?;
     }
 
-    let metadata = crate::registry::fetch_image_metadata(model_ref).unwrap_or_default();
     let use_gpu = metadata.accelerator_type.as_deref() != Some("cpu") && !gpu_indices.is_empty();
     let render_gid = if use_gpu {
         crate::docker::render_group_gid()
@@ -196,11 +201,12 @@ fn run_container(
         crate::DEFAULT_AIM_PORT,
         if use_gpu { gpu_indices } else { &[] },
         render_gid,
-    )
+    )?;
+    Ok(metadata.canonical_name)
 }
 
 pub(crate) fn serve_http(request: ServeHttpRequest) -> Result<()> {
-    run_container(
+    let canonical_name = run_container(
         &request.service_id,
         &request.model_ref,
         &request.host,
@@ -219,11 +225,17 @@ pub(crate) fn serve_http(request: ServeHttpRequest) -> Result<()> {
 
     let name = container_name(&request.service_id);
     let timeout = DEFAULT_READY_TIMEOUT;
+    // The container self-reports under the registry's HF-style canonical name
+    // (e.g. `meta-llama/Llama-3.2-1B-Instruct`), not the Docker image reference
+    // used for `docker pull`/`run` — matching `/v1/models` against the image ref
+    // would never find it. Fall back to the image ref only when the registry
+    // didn't advertise a canonical name.
+    let expected_model_id = canonical_name.as_deref().unwrap_or(&request.model_ref);
     match wait_for_container_ready(
         &name,
         &request.host,
         request.port,
-        &request.model_ref,
+        expected_model_id,
         timeout,
     ) {
         Ok(()) => Ok(()),
