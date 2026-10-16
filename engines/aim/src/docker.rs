@@ -7,10 +7,20 @@
 //! already uses for its own CLI (`run_lemonade_pull`/`run_lemonade_backend_install`).
 
 use anyhow::{Context, Result, bail};
+use std::collections::BTreeMap;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
 pub(crate) const DOCKER_BIN: &str = "docker";
+
+/// Builds `-e KEY=VALUE` args for engine-specific env overrides (e.g. AIM's
+/// `AIM_PROFILE_ID`). Sorted (`BTreeMap`) for deterministic argv in tests/logs.
+fn extra_env_args(extra_env: &BTreeMap<String, String>) -> Vec<String> {
+    extra_env
+        .iter()
+        .flat_map(|(key, value)| ["-e".to_owned(), format!("{key}={value}")])
+        .collect()
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run(
@@ -21,6 +31,7 @@ pub(crate) fn run(
     container_port: u16,
     gpu_indices: &[u32],
     render_gid: Option<u32>,
+    extra_env: &BTreeMap<String, String>,
 ) -> Result<()> {
     let mut command = Command::new(DOCKER_BIN);
     command
@@ -43,6 +54,8 @@ pub(crate) fn run(
             command.arg("--group-add").arg(gid.to_string());
         }
     }
+
+    command.args(extra_env_args(extra_env));
 
     command.arg(image);
     command.stdin(Stdio::null());
@@ -196,10 +209,26 @@ pub(crate) fn daemon_reachable() -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::extra_env_args;
+    use std::collections::BTreeMap;
+
     #[test]
     fn render_group_gid_parses_getent_format() {
         let line = "render:x:993:";
         let gid: Option<u32> = line.trim().split(':').nth(2).and_then(|s| s.parse().ok());
         assert_eq!(gid, Some(993));
+    }
+
+    #[test]
+    fn extra_env_args_builds_sorted_flags() {
+        assert!(extra_env_args(&BTreeMap::new()).is_empty());
+
+        let mut extra_env = BTreeMap::new();
+        extra_env.insert("AIM_PROFILE_ID".to_owned(), "vllm-foo".to_owned());
+        extra_env.insert("ANOTHER".to_owned(), "x".to_owned());
+        assert_eq!(
+            extra_env_args(&extra_env),
+            vec!["-e", "AIM_PROFILE_ID=vllm-foo", "-e", "ANOTHER=x"]
+        );
     }
 }

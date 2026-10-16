@@ -21,6 +21,7 @@
 //! to `service_launch.rs` in ROCMAI-91 (Phase 6b), along with its test module;
 //! this file's `use` list below points there now instead of at the crate root.
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use anyhow::{Result, bail};
@@ -180,6 +181,7 @@ fn protocol_engine_recipe_hint(
             engine: engine_recipe.engine.clone(),
             required_flags: engine_recipe.required_flags.clone(),
             parser_settings: engine_recipe.parser_settings.clone(),
+            extra_env: BTreeMap::new(),
             preferred_endpoint: engine_recipe.preferred_endpoint.as_ref().map(|endpoint| {
                 EngineRecipeEndpointHint {
                     endpoint_mode: endpoint.endpoint_mode.clone(),
@@ -483,6 +485,38 @@ fn parse_gpu_memory_utilization(value: Option<&str>) -> Result<Option<f64>> {
     Ok(Some(parsed))
 }
 
+/// Applies `--engine-env KEY=VALUE` overrides to the engine recipe's `extra_env`
+/// map. Generic by design (not gated to a specific engine): the mechanism exists
+/// so any engine that reads `EngineRecipeHint::extra_env` (currently only
+/// `engines/aim`, for overrides like `AIM_PROFILE_ID`) can accept host-specific
+/// env tweaks without a dedicated flag per variable. A minimal hint is
+/// synthesized when none exists. With no `--engine-env` the hint passes through
+/// unchanged.
+fn engine_recipe_with_extra_env(
+    engine: &str,
+    hint: Option<EngineRecipeHint>,
+    engine_env: &[String],
+) -> Result<Option<EngineRecipeHint>> {
+    if engine_env.is_empty() {
+        return Ok(hint);
+    }
+    let mut hint = hint.unwrap_or_else(|| EngineRecipeHint {
+        contract_version: ENGINE_RECIPE_CONTRACT_VERSION.to_owned(),
+        engine: engine.to_owned(),
+        ..EngineRecipeHint::default()
+    });
+    for entry in engine_env {
+        let (key, value) = entry
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("--engine-env expects `KEY=VALUE`; got `{entry}`"))?;
+        if key.is_empty() {
+            bail!("--engine-env expects `KEY=VALUE` with a non-empty key; got `{entry}`");
+        }
+        hint.extra_env.insert(key.to_owned(), value.to_owned());
+    }
+    Ok(Some(hint))
+}
+
 /// Whether the resolved engine recipe launches vLLM with tool calling enabled.
 fn engine_recipe_enables_tool_choice(hint: Option<&EngineRecipeHint>) -> bool {
     hint.is_some_and(|hint| {
@@ -515,6 +549,7 @@ pub(crate) struct ServeArgs {
     pub(crate) top_p: Option<f32>,
     pub(crate) max_tokens: Option<u32>,
     pub(crate) api_key: Option<String>,
+    pub(crate) engine_env: Vec<String>,
 }
 
 pub(crate) fn serve(args: ServeArgs) -> Result<()> {
@@ -539,6 +574,7 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
         top_p,
         max_tokens,
         api_key,
+        engine_env,
     } = args;
     let _ = managed; // background is now the default; --managed is accepted as an explicit synonym.
     validate_bind_host(&host, allow_public_bind)?;
@@ -627,6 +663,7 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
         engine_recipe,
         generation_defaults,
     )?;
+    let engine_recipe = engine_recipe_with_extra_env(&selected_engine, engine_recipe, &engine_env)?;
     let tool_call_note = if tool_call_parser.is_some() && !engine_serves_vllm {
         Some(format!(
             "note: --tool-call-parser applies only to vLLM; ignored for engine '{selected_engine}'"
