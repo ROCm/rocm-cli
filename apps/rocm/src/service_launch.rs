@@ -307,6 +307,93 @@ enum ManagedSpawn {
     },
 }
 
+/// The ways a live managed service that already matches on liveness, engine and
+/// canonical model id can still be unusable by this invocation.
+///
+/// Those three terms are necessary but not sufficient: three further terms can
+/// still refuse, one variant each. [`managed_service_reuse_refusal`] is the
+/// single decision procedure both callers ask, so the two cannot answer
+/// differently — which they previously did; see that function for what the
+/// disagreement cost.
+pub(crate) enum ManagedReuseRefusal {
+    /// The live service was started with different serve options.
+    RecipeMismatch,
+    /// `--require-api-key` was asked for and the live service has no key.
+    ///
+    /// The engine reads its key once, at launch, from the environment the spawn
+    /// builds — so a server started without one keeps serving anonymously no
+    /// matter what is written afterwards. Upgrading the record would be worse
+    /// than doing nothing: it would claim auth the live process does not
+    /// enforce, and `ensure_public_service_has_endpoint_key` would pass on the
+    /// strength of a key file nothing reads. `rocm remote serve` relies on this:
+    /// it publishes a loopback port onto the tailnet and prints "the API key
+    /// above is what stops anyone else calling it", which reusing an
+    /// unauthenticated service silently would make false about an endpoint the
+    /// whole tailnet can reach. Refusing is the only answer that fails closed.
+    MissingApiKey,
+    /// The live service runs under a device policy that does not satisfy this
+    /// invocation's. Reusing a `cpu_only` service to answer a `gpu_required`
+    /// serve is the silent CPU fallback AGENTS.md section 6 forbids.
+    DevicePolicyTooWeak,
+}
+
+/// Why this invocation cannot reuse `existing` — or `None` when it genuinely
+/// can. See [`ManagedReuseRefusal`] for the terms this answers on.
+///
+/// This exists because `serve()`'s reuse pre-gate lets a matching live service
+/// skip the no-usable-AMD-GPU refusal. Deciding that bypass on a *weaker* test
+/// than the spawn then uses to accept reuse produced a dead end: on a GPU-less
+/// host (`HIP_VISIBLE_DEVICES=` with a server live from another shell) a serve
+/// with different options bypassed the refusal, reached the spawn, and was told
+/// to stop the server and run the command again — and the rerun, with nothing
+/// left to reuse, hit the no-GPU refusal. The advice named a command that could
+/// not clear the condition, which AGENTS.md section 3 forbids. Sharing the
+/// predicate means a service that cannot actually be reused never buys the
+/// bypass, so the user gets the accurate refusal first and keeps their server.
+///
+/// `requested_device_policy` is taken by value, not as an `Option`, on purpose.
+/// It was optional so the spawn could opt out of the device-policy term, and
+/// that left two holes at once: the spawn's `DevicePolicyTooWeak` arm was
+/// unreachable (an untestable bail), and `serve()` — the caller that *does*
+/// gate the GPU refusal on this answer — could silently drop the term by
+/// passing `None`, with the whole suite still green. Both callers have a
+/// `DevicePolicy` in hand, so requiring it costs nothing and makes that
+/// mutation a compile error. It widens nothing observable today either: the
+/// only policy a record can carry is the one `parse_device_policy` admits
+/// (see below), so `existing.device_policy == Some("cpu_only")` is not
+/// reachable from any `rocm serve` this CLI can run.
+pub(crate) fn managed_service_reuse_refusal(
+    existing: &ManagedServiceRecord,
+    requested_recipe_json: Option<&str>,
+    require_api_key: bool,
+    requested_device_policy: &DevicePolicy,
+) -> Option<ManagedReuseRefusal> {
+    if existing.engine_recipe_json.as_deref() != requested_recipe_json {
+        return Some(ManagedReuseRefusal::RecipeMismatch);
+    }
+    if require_api_key && !existing.requires_api_key {
+        return Some(ManagedReuseRefusal::MissingApiKey);
+    }
+    // Only `gpu_required` can be let down by the record's policy, and the
+    // enumeration is exhaustive rather than narrow: `parse_device_policy`
+    // (`main.rs`) maps `auto`, `gpu`, `gpu_required` *and* `gpu_preferred` onto
+    // `GpuRequired`, and rejects `cpu_only` with an error, so `GpuRequired` is
+    // the only policy `serve()` can hand this predicate — pinned by
+    // `parse_device_policy_defaults_to_gpu_required_without_cpu_fallback`. There
+    // is deliberately no wider match on "anything but `CpuOnly`": it would be
+    // identical at runtime and would read as a guard against a `gpu_preferred`
+    // bypass that no CLI invocation can reach. A `cpu_only` invocation would be
+    // satisfied by anything anyway and never reaches the bail. README.md's
+    // "that is the only policy pair refused" is the contract, and this matches
+    // it exactly.
+    if matches!(requested_device_policy, DevicePolicy::GpuRequired)
+        && existing.device_policy.as_deref() == Some("cpu_only")
+    {
+        return Some(ManagedReuseRefusal::DevicePolicyTooWeak);
+    }
+    None
+}
+
 /// Spawn the detached engine child shared by the managed (background) and
 /// attached (`--verbose`/`--foreground`) serve paths. Returns before the HTTP
 /// readiness wait; callers decide whether to block on readiness
@@ -344,30 +431,32 @@ fn spawn_managed_engine_child(
     if let Some(existing) =
         existing_live_managed_service(paths, engine, &resolve.canonical_model_id)
     {
-        if existing.engine_recipe_json != requested_recipe_json {
-            bail!(
+        // Asked through the shared predicate rather than re-tested here, so this
+        // refusal and `serve()`'s reuse pre-gate cannot disagree about whether a
+        // service is reusable. When they disagreed, the pre-gate let a
+        // non-reusable service bypass the no-GPU refusal and the user was sent
+        // here to be told to stop a working server for nothing.
+        //
+        // The same device policy the serve path passes. This side used to pass
+        // `None` to keep the spawn's acceptance untouched, but that opted the
+        // spawn out of a term it has the input for, left its own
+        // `DevicePolicyTooWeak` bail unreachable, and made the serve path's
+        // argument droppable. Nothing observable widens: `parse_device_policy`
+        // is the only producer of a `DevicePolicy` on every path that reaches
+        // here and it rejects `cpu_only`, so no record this CLI writes can
+        // carry the policy this term refuses.
+        match managed_service_reuse_refusal(
+            &existing,
+            requested_recipe_json.as_deref(),
+            require_api_key,
+            device_policy,
+        ) {
+            Some(ManagedReuseRefusal::RecipeMismatch) => bail!(
                 "managed service `{}` is already running for engine `{engine}` and model `{}` with different serve options (recipe hint, tool-call parser, or generation defaults); stop it and run `rocm serve` again to apply the requested options",
                 existing.service_id,
                 resolve.canonical_model_id
-            );
-        }
-        // Reuse cannot satisfy a demand for auth the running server never got.
-        // The engine reads its key once, at launch, from the environment this
-        // function builds below — so a server started without one keeps serving
-        // anonymously no matter what is written afterwards. Upgrading the record
-        // here would be worse than doing nothing: the record would claim auth
-        // that the live process does not enforce, and
-        // `ensure_public_service_has_endpoint_key` would pass on the strength of
-        // a key file nothing reads.
-        //
-        // This is what `rocm remote serve` relies on. It publishes a loopback
-        // port onto the tailnet and prints "the API key above is what stops
-        // anyone else calling it". Reusing an unauthenticated service silently
-        // would make that sentence false about an endpoint the whole tailnet can
-        // reach. Refusing is the only answer that fails closed, and it is the
-        // same shape as the recipe mismatch above.
-        if require_api_key && !existing.requires_api_key {
-            bail!(
+            ),
+            Some(ManagedReuseRefusal::MissingApiKey) => bail!(
                 "managed service `{}` is already running for engine `{engine}` and model `{}` \
                  without authentication, and a running server cannot be given a key it did not \
                  start with; stop it with `{}` and run the command again to \
@@ -375,7 +464,22 @@ fn spawn_managed_engine_child(
                 existing.service_id,
                 resolve.canonical_model_id,
                 service_hints::service_stop_hint(&existing.service_id)
-            );
+            ),
+            // Reachable only from a record whose `device_policy` says
+            // `cpu_only`, which no `rocm serve` can write today
+            // (`parse_device_policy` refuses that policy outright) — so this is
+            // a guard against a record written by some future path, not a
+            // refusal users see now. The advice still names a command that
+            // clears the condition: stopping the service removes the only thing
+            // this term can object to, and the rerun then launches normally
+            // (AGENTS.md section 3).
+            Some(ManagedReuseRefusal::DevicePolicyTooWeak) => bail!(
+                "managed service `{}` is already running under a device policy that cannot \
+                 satisfy this request; stop it with `{}` and run the command again",
+                existing.service_id,
+                service_hints::service_stop_hint(&existing.service_id)
+            ),
+            None => {}
         }
         record_cli_audit_event(
             paths,
@@ -1180,6 +1284,88 @@ mod tests {
         // Other control combos are not detach/stop triggers.
         assert_eq!(detach_key_outcome(true, 'q'), None);
         assert_eq!(detach_key_outcome(true, 'z'), None);
+    }
+
+    /// A record with every reuse-relevant field set to the "reusable" value, so
+    /// each test below breaks exactly one term and nothing else.
+    fn reusable_record(paths: &AppPaths) -> ManagedServiceRecord {
+        let mut record = ManagedServiceRecord::new(
+            paths,
+            "vllm-qwen-1000",
+            "vllm",
+            "qwen",
+            "qwen-canonical".to_owned(),
+            "127.0.0.1",
+            8000,
+            "managed",
+            0,
+            None,
+            None,
+            Some("gpu_required".to_owned()),
+        );
+        record.engine_recipe_json = None;
+        record.requires_api_key = true;
+        record
+    }
+
+    #[test]
+    fn reuse_is_refused_on_every_term_the_spawn_and_the_gpu_bail_depend_on() {
+        let (root, paths) = test_paths("managed-reuse-predicate");
+        paths.ensure().expect("paths");
+        let base = reusable_record(&paths);
+
+        // The baseline must be reusable, or the negative cases below could pass
+        // for the wrong reason.
+        assert!(
+            managed_service_reuse_refusal(&base, None, true, &DevicePolicy::GpuRequired).is_none(),
+            "a matching service with no recipe, a key, and a gpu_required policy is reusable"
+        );
+
+        // Recipe mismatch — the spawn's first refusal.
+        let mut mismatched = base.clone();
+        mismatched.engine_recipe_json = Some("{\"engine\":\"vllm\"}".to_owned());
+        assert!(matches!(
+            managed_service_reuse_refusal(&mismatched, None, true, &DevicePolicy::GpuRequired),
+            Some(ManagedReuseRefusal::RecipeMismatch)
+        ));
+
+        // Unmet `--require-api-key` — the spawn's second refusal. Also pins that
+        // it is *only* refused when the key is actually demanded.
+        let mut anonymous = base.clone();
+        anonymous.requires_api_key = false;
+        assert!(matches!(
+            managed_service_reuse_refusal(&anonymous, None, true, &DevicePolicy::GpuRequired),
+            Some(ManagedReuseRefusal::MissingApiKey)
+        ));
+        assert!(
+            managed_service_reuse_refusal(&anonymous, None, false, &DevicePolicy::GpuRequired)
+                .is_none(),
+            "an anonymous service is fine when no key was demanded"
+        );
+
+        // Device policy — the term `serve()` depends on, because it is the one
+        // gating the no-usable-GPU bail on the answer. Reusing a `cpu_only`
+        // service to answer a `gpu_required` serve is the silent CPU fallback.
+        let mut cpu_only = base;
+        cpu_only.device_policy = Some("cpu_only".to_owned());
+        assert!(matches!(
+            managed_service_reuse_refusal(&cpu_only, None, true, &DevicePolicy::GpuRequired),
+            Some(ManagedReuseRefusal::DevicePolicyTooWeak)
+        ));
+        // `GpuRequired` is the only policy the CLI can produce — `--device
+        // gpu_preferred`/`auto`/`gpu` all parse to it and `cpu_only` is rejected
+        // (`parse_device_policy_defaults_to_gpu_required_without_cpu_fallback`) —
+        // so there is no second policy arm to discriminate here, and asserting
+        // one would pin an input `serve()` never produces. Both callers pass
+        // the same policy; the parameter is not optional, so neither can drop
+        // this term without a compile error.
+        //
+        // A cpu_only *invocation* never reaches the bail, so nothing to refuse.
+        assert!(
+            managed_service_reuse_refusal(&cpu_only, None, true, &DevicePolicy::CpuOnly).is_none()
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -570,7 +570,78 @@ Expected result:
   first one's "yes" not actually exiting anything — is the bug this fixes
   (issue #145).
 
-## 5. ComfyUI Verification
+## 5. Reuse Is Exempt From The No-GPU Refusal
+
+**Linux or WSL only.** Unlike the rest of this file, the commands below are
+bash, not PowerShell, and they pin `--engine vllm`, which is unsupported on
+native Windows. The behaviour itself is not platform-specific; only this recipe
+for reproducing it is. On native Windows, substitute `--engine lemonade`
+throughout and set the mask with `$env:HIP_VISIBLE_DEVICES = ""` (and clear it
+with `Remove-Item Env:HIP_VISIBLE_DEVICES` afterwards).
+
+This is a change to a refusal you may be relying on, so check both halves. Mask
+every device to stand in for a host with no usable AMD GPU — the same condition
+the refusal names.
+
+1. With a GPU visible, start a server and let it become ready:
+
+   ```bash
+   rocm serve <model> --engine vllm --managed
+   ```
+
+2. Re-run the *same* command with every device masked:
+
+   ```bash
+   HIP_VISIBLE_DEVICES= rocm serve <model> --engine vllm --managed
+   ```
+
+   Expected result: it does **not** refuse. The summary reports the service was
+   already running and hands back its endpoint. Nothing is launched and no GPU
+   is pinned.
+
+3. With the same mask, check the two terms of the pre-gate *separately*. The
+   gate (`any_live_managed_service_for_model`) tests the engine first and only
+   then the model, so one command that changes both cannot tell you which term
+   held the gate shut — a different-engine run is refused whatever the model
+   name, and would pass even if the model term had been deleted.
+
+   3a. **Same engine, different model.** This is the run that actually exercises
+   the model term. Pick a name that does **not** overlap the running one as a
+   substring — if the live service is `qwen3-8b-instruct`, do not use `qwen`:
+
+   ```bash
+   HIP_VISIBLE_DEVICES= rocm serve <a non-overlapping model> --engine vllm --managed
+   ```
+
+   Expected result: `no usable AMD GPU detected; rocm serve requires a GPU under
+   the gpu_required policy ...`, and the refusal comes *first* — no engine
+   preparation, no download, no runtime manifest written. A live service for
+   another model must not soften the refusal or pull engine work in front of it.
+
+   The non-overlapping name matters: model matching is deliberately lenient, so
+   an overlapping name (`qwen` against a live `qwen3-8b-instruct`) *does* let
+   engine preparation run before the refusal. That is documented behaviour, not
+   a defect — see the reuse section of the README — so testing this step with an
+   overlapping name proves nothing.
+
+   3b. **Different engine.** Lemonade is the self-managing engine whose
+   preparation is user-visible, so this is where a missing refusal would show:
+
+   ```bash
+   HIP_VISIBLE_DEVICES= rocm serve <model> --engine lemonade --managed
+   ```
+
+   Expected result: the same refusal, and still first — no
+   `Preparing lemonade for GPU serving...` line and no embeddable download. Note
+   that the model name is irrelevant here: the engine mismatch alone shuts the
+   gate, which is exactly why 3a is a separate run.
+
+4. Stop the service (`rocm services stop <service-id> --yes`) and repeat step 2.
+
+   Expected result: with nothing left to reuse, the masked run refuses with the
+   same message as step 3a.
+
+## 6. ComfyUI Verification
 
 ComfyUI is managed as an app surface. It should start a local web server and
 show the URL to open:
@@ -649,7 +720,7 @@ python scripts\comfyui_therock_gpu_test.py
 This test may download a small checkpoint and submit a cat image workflow
 through the ComfyUI HTTP API.
 
-## 6. Optional Cloud Provider Key
+## 7. Optional Cloud Provider Key
 
 Local ROCm use does not need a cloud provider key. If you want to test OpenAI or
 Anthropic provider setup, save the key through stdin so it does not land in
@@ -674,7 +745,7 @@ To remove the saved key:
 rocm config clear-provider-key openai
 ```
 
-## 7. Optional Provider-Assisted Planning
+## 8. Optional Provider-Assisted Planning
 
 Most users should leave this off. To test ambiguity resolution with an already
 running local provider service:
@@ -698,7 +769,7 @@ To turn provider-assisted planning back off:
 rocm config clear-planner-provider
 ```
 
-## 8. Uninstall
+## 9. Uninstall
 
 Run this last, on a machine installed with the release installer (not a
 `cargo` build, whose binaries uninstall leaves alone):
