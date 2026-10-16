@@ -702,6 +702,55 @@ model across multiple GPUs is not supported. Because selection uses the
 `amd-smi` ordinal but is applied via `HIP_VISIBLE_DEVICES`, rocm-cli warns when
 `ROCR_VISIBLE_DEVICES` is set, since the two orderings can diverge.
 
+#### Reuse is exempt from the no-GPU refusal
+
+Under the default `gpu_required` policy, `rocm serve` on a host with no usable
+AMD GPU fails fast with `no usable AMD GPU detected`, before any engine is
+prepared or downloaded. A `rocm serve` that matches an **already-running
+managed service for the same engine and model** now skips that refusal and
+prints the reuse summary instead. This is a real change to a refusal you may be
+relying on: on a GPU-less host, `rocm serve <model>` can now succeed where it
+previously always failed.
+
+The exemption is limited to that case, and nothing else about `gpu_required`
+changes. The reused service was vetted against the policy at its own launch,
+and the reusing invocation launches no process and does no GPU work. A live
+service for a different engine does not soften the refusal, and neither does one
+for a model whose name does not overlap — those still fail fast with the usual
+message and prepare nothing.
+
+Matching the engine and model is necessary but not sufficient. The exemption
+applies only when the service would *actually* be reused, which is the same
+predicate the launch itself applies: the recipe settings must match (the
+sampling-control rule under [Model serving](#model-serving) above), and a
+`--require-api-key` request must be satisfiable by a service that already has a
+key. The exemption adds one device-policy term that the launch does not check,
+because only this decision gates the GPU refusal: a `gpu_required` serve is not
+exempted by a service recorded as `cpu_only`. That is the only policy pair
+refused — any other combination, including a record that predates the field and
+so names no policy at all, is accepted. A live service that fails any of those
+is not reusable, so it buys no bypass — `rocm serve` refuses
+on the GPU first, which is the accurate message and leaves your running server
+alone. (Telling you to stop it and re-run would not help: the re-run would have
+nothing left to reuse and would hit the same GPU refusal.)
+
+Two limits are worth stating exactly, because they are easy to read as stronger
+than they are:
+
+- **Model names are matched leniently.** The check that decides whether reuse is
+  even worth asking about uses the same two-way substring match the service
+  listings use, so a live `qwen3-8b-instruct` service opens it for
+  `rocm serve qwen`. On a GPU-less host that invocation then does engine
+  preparation — possibly printing `Preparing <engine> for GPU serving…` and
+  installing — *before* the refusal it ultimately gets. Leniency is deliberate:
+  tightening it would silently break legitimate reuse by short name. Only a
+  model name that does not overlap is guaranteed to refuse with nothing
+  prepared.
+- **`--gpu <index>` is still validated.** The exemption skips the no-usable-GPU
+  bail, not the pinned-index check that follows it, so `rocm serve <model> --gpu 0`
+  is still refused when GPU 0 is not visible, even with a reusable service
+  running. The exemption applies as described under the default `--gpu auto`.
+
 Manage background servers started with `--managed`:
 
 ```
