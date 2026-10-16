@@ -194,7 +194,7 @@ pub(crate) fn resolve_serve_port(
                 }
             }
             bail!(
-                "no free TCP port for {DEFAULT_LOCAL_HOST} in {AUTO_PORT_FIRST}–{AUTO_PORT_LAST}; \
+                "no free TCP port for {DEFAULT_LOCAL_HOST} in {AUTO_PORT_FIRST}-{AUTO_PORT_LAST}; \
                  every candidate is reserved by a live managed service or already in use. Stop an \
                  unused server with `{}`, or pass an explicit `--port`.",
                 service_hints::service_action_hint("stop", "<service-id>")
@@ -451,7 +451,7 @@ mod tests {
         let error = resolve_serve_port(DEFAULT_LOCAL_HOST, PortRequest::Auto, &[], &mut probe)
             .expect_err("an exhausted range must fail");
         let message = format!("{error:#}");
-        assert!(message.contains("11435–11535"), "{message}");
+        assert!(message.contains("11435-11535"), "{message}");
     }
 
     #[test]
