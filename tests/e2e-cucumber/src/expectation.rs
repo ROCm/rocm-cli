@@ -182,7 +182,7 @@ pub struct ScenarioDecl {
     /// per-engine canary on the fast path, so it is skipped on ordinary per-PR /
     /// on-demand runs and only runs in the merge queue, which opts in via
     /// `E2E_MERGE_QUEUE`. Keeps the PR feedback loop short while still exercising
-    /// the full serve matrix before a change lands.
+    /// the full serve matrix (on every lane but MI300X) before a change lands.
     pub merge_queue: bool,
 }
 
