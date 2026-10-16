@@ -65,6 +65,20 @@ fn parse_descriptor(name: &str) -> Descriptor {
         None => (core, false),
     };
 
+    // The self-hosted sdk_version matrix (ROCMAI-430) runs non-`current` legs
+    // under a distinct artifact name (`e2e-gpu-n-1-report`) so the two legs'
+    // uploads don't collide; strip that suffix BEFORE matching the platform
+    // table below, then fold it back into the platform label so the two legs
+    // still render as distinct rows/columns instead of two identical-looking
+    // "MI300X Linux" entries.
+    let (core, release_label) = match core.strip_suffix("-n-1") {
+        Some(rest) => (rest, Some("n-1")),
+        None => match core.strip_suffix("-n-2") {
+            Some(rest) => (rest, Some("n-2")),
+            None => (core, None),
+        },
+    };
+
     let (platform, os) = match core {
         // The bare mock expect-pass artifact is `e2e-report` → core "report" or "".
         "" | "report" => ("Mock", "Linux"),
@@ -86,14 +100,25 @@ fn parse_descriptor(name: &str) -> Descriptor {
         // be reported as Linux — so render Unknown / Unknown rather than defaulting
         // OS to Linux the way `fallback_descriptor` does for a titlecased platform.
         "unknown" => ("Unknown", "Unknown"),
-        other => return fallback_descriptor(other, known_bugs, channel_from_name),
+        other => return fallback_descriptor(other, known_bugs, channel_from_name, release_label),
     };
 
     Descriptor {
-        platform: platform.to_string(),
+        platform: labeled_platform(platform, release_label),
         os: os.to_string(),
         known_bugs,
         channel_from_name,
+    }
+}
+
+/// Append the sdk_version matrix leg (`n-1`/`n-2`) to a platform label so two
+/// legs of the same platform don't render as identical rows/columns. `None`
+/// (the `current` leg) is left alone — its artifact name is unchanged from
+/// before the matrix existed, so that leg's label is too.
+fn labeled_platform(platform: &str, release_label: Option<&str>) -> String {
+    match release_label {
+        Some(label) => format!("{platform} ({label})"),
+        None => platform.to_string(),
     }
 }
 
@@ -101,6 +126,7 @@ fn fallback_descriptor(
     core: &str,
     known_bugs: bool,
     channel_from_name: Option<&'static str>,
+    release_label: Option<&str>,
 ) -> Descriptor {
     let platform = core
         .split('-')
@@ -113,12 +139,13 @@ fn fallback_descriptor(
         })
         .collect::<Vec<_>>()
         .join(" ");
+    let platform = if platform.is_empty() {
+        "Unknown".to_string()
+    } else {
+        platform
+    };
     Descriptor {
-        platform: if platform.is_empty() {
-            "Unknown".to_string()
-        } else {
-            platform
-        },
+        platform: labeled_platform(&platform, release_label),
         os: "Linux".to_string(),
         known_bugs,
         channel_from_name,
@@ -1613,6 +1640,27 @@ mod tests {
                 "Windows",
             ),
             ("e2e-gpu-strix-wsl-nightly-report", "Strix Halo", "WSL2"),
+        ] {
+            let d = parse_descriptor(name);
+            assert_eq!(
+                (d.platform.as_str(), d.os.as_str()),
+                (platform, os),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_descriptor_distinguishes_sdk_version_matrix_legs() {
+        // The sdk_version matrix (ROCMAI-430) uploads non-`current` legs under a
+        // distinct artifact name so they don't collide with each other or with
+        // the `current` leg's unchanged name. Platform/OS must still resolve
+        // correctly, with the leg folded into the platform label so the rows
+        // don't render as two identical "MI300X Linux" entries.
+        for (name, platform, os) in [
+            ("e2e-gpu-n-1-report", "MI300X (n-1)", "Linux"),
+            ("e2e-gpu-n-2-report", "MI300X (n-2)", "Linux"),
+            ("e2e-gpu-strix-wsl-n-1-report", "Strix Halo (n-1)", "WSL2"),
         ] {
             let d = parse_descriptor(name);
             assert_eq!(

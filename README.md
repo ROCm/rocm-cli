@@ -336,9 +336,10 @@ this machine: AUTO (this command carries out the change), NEEDS-ARG (it will,
 once given the argument it names), PRINT-ONLY (it prints the steps for you to
 run yourself — usually because the right command depends on a choice only you
 can make, sometimes because it also needs sudo or a reboot), or DIAGNOSE-ONLY
-(no reliable fix exists, so nothing will be changed -- no catalog entry
-carries this marker today; it is reserved for a future detect-but-cannot-repair
-failure).
+(no reliable fix exists, so running it names the problem, changes nothing and
+exits 0). `info-20-gpu-no-rocm-support` is the entry marked DIAGNOSE-ONLY
+today: a GPU ROCm has never shipped a runtime build for is a fact about the
+hardware, not something an install or a setting can put right.
 
 - `--dry-run` shows any fix's plan without changing anything.
 - `--yes` skips the interactive confirmation once you've reviewed it.

@@ -147,7 +147,7 @@ fn dash_test_clock_offset_path(paths: &AppPaths) -> Option<PathBuf> {
         "dashboard telemetry clock is in TEST mode, not wall time: a logical \
          clock read from this file drives displayed timestamps, the timestamps \
          written into persisted session records, and every figure derived from \
-         them — generation throughput, latency averages and metric freshness. \
+         them - generation throughput, latency averages and metric freshness. \
          Only the E2E harness creates it; remove it and restart the dashboard to \
          return to wall time (deleting it mid-run pins the logical clock instead)."
     );
@@ -739,7 +739,7 @@ pub fn run_bench(a: BenchLoadArgs) -> Result<()> {
             .into_json()
             .with_context(|| format!("parsing the {models_url} response"))?;
         rocm_dash_tui::llm::pick_first_model(&body)
-            .with_context(|| format!("no model found at {models_url} — pass --model explicitly"))?
+            .with_context(|| format!("no model found at {models_url} - pass --model explicitly"))?
     };
 
     // Resolve the output path: default to the same `<data_dir>/bench/results.csv`
@@ -759,7 +759,7 @@ pub fn run_bench(a: BenchLoadArgs) -> Result<()> {
         requests,
     };
 
-    println!("mode: raw serving throughput (synthetic prompts) — not agent-workload.");
+    println!("mode: raw serving throughput (synthetic prompts) - not agent-workload.");
     if auto_ramp {
         println!(
             "endpoint={endpoint} model={model} mode=auto-ramp isl={isl} osl={osl} requests={requests}"
@@ -814,7 +814,7 @@ pub fn run_bench(a: BenchLoadArgs) -> Result<()> {
                 .as_deref()
                 .unwrap_or("no reason recorded");
             eprintln!(
-                "warning: {}/{} requests failed in {} — first failure: {reason}",
+                "warning: {}/{} requests failed in {} - first failure: {reason}",
                 report.failed, report.attempted, row.cell
             );
         }
@@ -835,7 +835,7 @@ pub fn run_bench(a: BenchLoadArgs) -> Result<()> {
         }
     }
     println!(
-        "note: local saturation smoke-test — client-measured throughput, not an official ROCm/AMD benchmark."
+        "note: local saturation smoke-test - client-measured throughput, not an official ROCm/AMD benchmark."
     );
     println!("wrote {} row(s) to {}", reports.len(), csv_path.display());
 
@@ -849,7 +849,7 @@ pub fn run_bench(a: BenchLoadArgs) -> Result<()> {
             .find_map(|report| report.first_error.as_deref())
             .unwrap_or("no reason recorded");
         anyhow::bail!(
-            "every benchmark request failed against {endpoint} — first failure: {reason}"
+            "every benchmark request failed against {endpoint} - first failure: {reason}"
         );
     }
 

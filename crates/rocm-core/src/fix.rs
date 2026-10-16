@@ -217,6 +217,14 @@ const NEEDS_DEVICE_INDEX: &[Platform] = &[
     },
 ];
 
+/// `info-20-gpu-no-rocm-support`. Not "wsl": WSL2 reports no GPU topology, so
+/// the checker that produces this id never fires there and `rocm fix` would be
+/// claiming an answer for a host it was never asked about.
+const DIAGNOSE_ONLY_ON_LINUX_AND_WINDOWS: &[Platform] = &[
+    on("linux", FixClass::DiagnoseOnly),
+    on("windows", FixClass::DiagnoseOnly),
+];
+
 /// A remediation recipe keyed by the stable `fix-id`.
 struct FixRecipe {
     fix_id: &'static str,
@@ -746,7 +754,7 @@ const RECIPES: &[FixRecipe] = &[
         needs_sudo: false,
         needs_reboot: false,
         needs_relogin: false,
-        verify: "grep VERSION_ID /etc/os-release",
+        verify: "f=/etc/os-release; [ -e \"$f\" ] || f=/usr/lib/os-release; grep VERSION_ID \"$f\" 2>/dev/null | head -1",
         notes: &[
             "Distros install side by side, so the current one can stay until the new one is set up.",
         ],
@@ -888,6 +896,38 @@ const RECIPES: &[FixRecipe] = &[
         ],
         doc_url: Some("https://aka.ms/vs/17/release/vc_redist.x64.exe"),
         applies_on: PRINT_ON_WINDOWS,
+        runner: None,
+    },
+    // The first [`FixClass::DiagnoseOnly`] member, and an `info-` id rather than
+    // a `fix-` one: the `fix-N` series names problems that have a remedy, and
+    // this entry's whole content is that there is none. The id still belongs in
+    // this catalog, because `rocm diagnose` prints `apply with: rocm fix <id>`
+    // for every cause it reports, and `rocm fix` has to answer for every id it
+    // prints -- here by naming the problem and changing nothing, which is what
+    // `Plan::Unfixable` does.
+    FixRecipe {
+        fix_id: "info-20-gpu-no-rocm-support",
+        title: "GPU has no ROCm/HIP support (Vulkan backend still works)",
+        rationale: "Every AMD GPU on this machine is a part ROCm has never shipped a runtime build for -- not one that is merely undetected. No ROCm or HIP install, driver version or environment variable changes that, so there is nothing to apply. Vulkan-based engines, which is what Lemonade runs by default, do not use ROCm and work on it.",
+        commands: &[],
+        needs_sudo: false,
+        needs_reboot: false,
+        needs_relogin: false,
+        verify: "",
+        notes: &[
+            "HSA_OVERRIDE_GFX_VERSION is NOT a workaround here: it makes the runtime load kernels built for another architecture, which faults at runtime rather than adding support.",
+            // Not "`rocm serve` already picks a Vulkan engine on this host":
+            // that is a claim about the CLI's own runtime behaviour which this
+            // catalog does not decide. A configured default engine outranks
+            // `default_engine_for_host`, and Lemonade picks its llama.cpp
+            // backend itself. The matching note in `diagnose`'s `check_20` is
+            // worded the same way.
+            "To use this GPU for inference, serve with a Vulkan-capable engine. If you have set a default engine that needs ROCm, that one will not work here; `rocm serve --engine lemonade` does not need it.",
+        ],
+        doc_url: Some(
+            "https://rocm.docs.amd.com/projects/install-on-linux/en/latest/reference/system-requirements.html",
+        ),
+        applies_on: DIAGNOSE_ONLY_ON_LINUX_AND_WINDOWS,
         runner: None,
     },
 ];
@@ -1345,6 +1385,20 @@ fn print_recipe(r: &FixRecipe) {
     }
 }
 
+/// What `rocm fix` says when it is handed a `rocm diagnose` ranking position
+/// (`#1`) rather than a fix-id.
+///
+/// Lifted out of [`apply`] so the wording is reachable from a test: `fail!`
+/// writes straight to the process's own stderr, which an in-process test cannot
+/// capture, so the only other way to cover these two lines would be to spawn
+/// the binary.
+fn diagnosis_position_refusal(fix_id: &str) -> [String; 2] {
+    [
+        format!("`{fix_id}` looks like a position in a `rocm diagnose` report, not a fix-id."),
+        "Use the `id:` shown against that cause - `rocm diagnose` prints an `apply with:` line you can copy.".to_owned(),
+    ]
+}
+
 /// Apply (or print) the fix identified by `fix_id`. Returns the process exit code.
 #[must_use]
 pub fn apply(fix_id: &str, opts: &FixOptions) -> i32 {
@@ -1355,10 +1409,9 @@ pub fn apply(fix_id: &str, opts: &FixOptions) -> i32 {
             // number here. It is a position in one report, not a name -- and it
             // does not line up with the catalog's `fix-N` names either, so a
             // bare "unknown id" left them with nothing to correct.
-            fail!("`{fix_id}` looks like a position in a `rocm diagnose` report, not a fix-id.");
-            fail!(
-                "Use the `id:` shown against that cause — `rocm diagnose` prints an `apply with:` line you can copy."
-            );
+            for line in diagnosis_position_refusal(fix_id) {
+                fail!("{line}");
+            }
         } else {
             fail!("Run `rocm diagnose` to see which fix-id applies.");
         }
@@ -1414,9 +1467,11 @@ fn plan_of(recipe: &FixRecipe) -> Plan {
 /// Everything `apply` does once the id has resolved to a recipe.
 ///
 /// Split out from [`apply`] so the class gate can be reached with a recipe the
-/// catalog does not contain. [`FixClass::DiagnoseOnly`] has no member today, so
-/// without this seam its branch is unreachable from any test and would sit
-/// unexercised until the first unfixable problem turns up.
+/// catalog does not contain, which keeps every class's branch reachable from a
+/// test however few entries the catalog happens to carry for it.
+/// [`FixClass::DiagnoseOnly`] had no member at all until
+/// `info-20-gpu-no-rocm-support`, the first; the seam is what exercised its
+/// branch before that, and still covers any class the catalog later empties.
 #[must_use]
 fn act_on(recipe: &FixRecipe, opts: &FixOptions) -> i32 {
     print_recipe(recipe);
@@ -2396,9 +2451,11 @@ mod tests {
     ///
     /// The distinction this pins is 0 against 3. Exit 3 is "not applicable on
     /// this machine", which would send a caller looking for a different machine
-    /// to run the fix on; there is no such machine, because there is no fix. The
-    /// catalog has no `DIAGNOSE-ONLY` entry yet, so nothing else in the suite
-    /// reaches this branch.
+    /// to run the fix on; there is no such machine, because there is no fix.
+    /// Driven through the synthetic recipe rather than through
+    /// `info-20-gpu-no-rocm-support`, the catalog's one `DIAGNOSE-ONLY` entry,
+    /// so the exit code stays pinned to the class and not to whichever entries
+    /// happen to carry it.
     #[test]
     fn a_problem_with_no_reliable_fix_reports_success_and_does_not_look_portable() {
         let opts = FixOptions::default();
@@ -2453,33 +2510,76 @@ mod tests {
         );
     }
 
-    /// No entry is `DIAGNOSE-ONLY` on any platform.
+    /// Exactly which entries are `DIAGNOSE-ONLY`, and on which platforms.
     ///
-    /// The class ships with no member on purpose: it is what lets a
-    /// detect-but-cannot-repair failure be accepted as an entry at all. It ships
-    /// now rather than when the first member arrives because `rocm diagnose
-    /// --json` already serialises `class`, and a consumer that deserialises
-    /// that output into a fixed enum today would reject a payload carrying a
-    /// variant added later -- shipping the full set from the start means that
-    /// variant is already something callers have to tolerate. This test is the
-    /// tripwire — when it fails, the first real member has arrived, and the
-    /// scenario that was waiting for one becomes demonstrable against it rather
-    /// than staying provisional.
+    /// The class shipped with no member on purpose: it is what lets a
+    /// detect-but-cannot-repair failure be accepted as an entry at all. It
+    /// shipped before the first member arrived because `rocm diagnose --json`
+    /// already serialises `class`, and a consumer that deserialised that output
+    /// into a fixed enum would reject a payload carrying a variant added later
+    /// -- shipping the full set from the start means that variant is already
+    /// something callers have to tolerate.
+    ///
+    /// `info-20-gpu-no-rocm-support` is the first member, and this is now the
+    /// pin rather than the tripwire: the list is exact, so promoting an entry
+    /// to "there is no fix" -- the strongest thing this catalog can say about a
+    /// problem, and the one a user can do least with -- fails here until it is
+    /// written down.
     #[test]
-    fn the_catalog_has_no_diagnose_only_entry_yet() {
-        let members: Vec<&str> = RECIPES
+    fn diagnose_only_has_exactly_the_members_the_catalog_names() {
+        let members: Vec<(&str, Vec<&str>)> = RECIPES
             .iter()
             .filter(|r| {
                 r.applies_on
                     .iter()
                     .any(|p| p.class == FixClass::DiagnoseOnly)
             })
-            .map(|r| r.fix_id)
+            .map(|r| {
+                (
+                    r.fix_id,
+                    r.applies_on
+                        .iter()
+                        .filter(|p| p.class == FixClass::DiagnoseOnly)
+                        .map(|p| p.os)
+                        .collect(),
+                )
+            })
             .collect();
+        assert_eq!(
+            members,
+            vec![("info-20-gpu-no-rocm-support", vec!["linux", "windows"])],
+            "DIAGNOSE-ONLY membership changed. That is the class working as intended -- update \
+             this test, and say in the commit why the new entry has no fix."
+        );
+    }
+
+    /// The first `DIAGNOSE-ONLY` member reaches [`Plan::Unfixable`] from the
+    /// real catalog, not only from the synthetic recipe above.
+    ///
+    /// `the_class_gate_is_reached_only_after_the_platform_gate` and its sibling
+    /// both build a recipe by hand, so between them they prove the branch works
+    /// without proving anything ships through it. This runs `plan_of` on the
+    /// catalog entry itself, on each OS it is scoped to.
+    #[test]
+    fn the_catalogs_diagnose_only_entry_plans_as_unfixable() {
+        let recipe = find_recipe("info-20-gpu-no-rocm-support")
+            .expect("the informational entry is in the catalog");
+        assert_eq!(
+            recipe.os_scope(),
+            vec!["linux", "windows"],
+            "the checker is registered for linux and windows, so the recipe has to answer there"
+        );
+        for os in recipe.os_scope() {
+            assert_eq!(
+                recipe.platform(os).map(|p| p.class),
+                Some(FixClass::DiagnoseOnly),
+                "{os}: `rocm fix info-20-gpu-no-rocm-support` must name the problem and change \
+                 nothing"
+            );
+        }
         assert!(
-            members.is_empty(),
-            "{members:?} now use DIAGNOSE-ONLY. That is the class working as intended -- update \
-             this test, and demonstrate the scenario that was waiting for a member."
+            recipe.runner.is_none() && recipe.commands.is_empty() && recipe.verify.is_empty(),
+            "an entry with no fix has nothing to run, nothing to copy and nothing to verify"
         );
     }
 
@@ -2490,10 +2590,11 @@ mod tests {
         let count = ids.len();
         ids.dedup();
         assert_eq!(ids.len(), count, "duplicate fix-id in RECIPES");
-        // 20 bare-metal/Windows entries (fix-16-vllm-oom, fix-17-torch-dlpack,
-        // fix-18-comgr-conflict, fix-19-shm-too-small and
-        // fix-21-msvc-redist-outdated among them) plus the 7 WSL ones.
-        assert_eq!(count, 27, "expected 27 catalog entries");
+        // 21 bare-metal/Windows entries (fix-16-vllm-oom, fix-17-torch-dlpack,
+        // fix-18-comgr-conflict, fix-19-shm-too-small,
+        // fix-21-msvc-redist-outdated and the informational
+        // info-20-gpu-no-rocm-support among them) plus the 7 WSL ones.
+        assert_eq!(count, 28, "expected 28 catalog entries");
     }
 
     /// `rocm fix fix-21-msvc-redist-outdated` prints the plan and runs nothing.
@@ -2916,6 +3017,26 @@ mod tests {
         // behaviour that a script could start depending on.
         assert_eq!(apply("#1", &FixOptions::default()), 2);
         assert_eq!(apply("bogus", &FixOptions::default()), 2);
+
+        // ROCMAI-543: the two lines `apply` writes to stderr on this path must
+        // be plain ASCII, or a Windows console on the OEM code page renders the
+        // punctuation as mojibake like `ΓÇö`. The exit code above says nothing
+        // about them, and `fail!` writes past any in-process capture.
+        let refusal = diagnosis_position_refusal("#1");
+        for line in &refusal {
+            assert!(
+                line.is_ascii(),
+                "the position-argument refusal must be ASCII-only (ROCMAI-543): {line}"
+            );
+        }
+        // Both halves still have to do their job: name what the user typed, and
+        // name where the real id is printed.
+        assert!(refusal[0].contains("#1"), "refusal: {refusal:?}");
+        assert!(
+            refusal[1].contains("id:") && refusal[1].contains("apply with:"),
+            "the refusal must keep pointing at the `id:`/`apply with:` lines \
+             `rocm diagnose` prints: {refusal:?}"
+        );
     }
 
     #[test]

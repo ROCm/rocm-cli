@@ -328,3 +328,26 @@ Feature: Interactive dashboard
     Then the dashboard reports live GPU telemetry
     When the user quits the dashboard
     Then the dashboard exits successfully
+
+  # #501: proves TuiSession::spawn_in (see its doc comment) threads the
+  # given directory into the live child. Spawns into a scenario-owned
+  # folder, plants a child directory with a space in its name, and asserts
+  # the real folder browser lists that child by its fixed-length entry
+  # label rather than the host-length-dependent header path (see
+  # ADOPT_SCENARIO_CHILD's doc comment). The space is in the child's name,
+  # not the scenario's own cwd — it exercises the browser's whitespace
+  # rendering; a whitespace path through spawn_in itself remains follow-up
+  # work tracked in #693.
+  @id:dash-onboarding-adopt-honors-spawn-cwd @requires-os:linux
+  Scenario: dash-25 - Adopt existing opens the folder browser rooted at the session's own working directory
+    When the user opens the dashboard in a scenario-owned folder
+    And the user opens the Observe view
+    And the user opens onboarding setup
+    Then the onboarding welcome screen is displayed
+    When the user continues past the onboarding welcome screen
+    Then the onboarding setup choices are displayed
+    When the user chooses to adopt an existing folder
+    Then the existing-folder browser lists the scenario folder's contents
+    When the user closes onboarding setup
+    And the user quits the dashboard
+    Then the dashboard exits successfully

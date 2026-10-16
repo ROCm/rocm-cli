@@ -11,6 +11,7 @@
 //! definition and dispatch. Run via the workspace alias `cargo xtask <command>`.
 
 mod affected;
+mod ascii_output_contract;
 mod catalog;
 mod coverage;
 mod crate_edges;
@@ -24,6 +25,7 @@ mod manifest;
 mod package;
 mod paths;
 mod powershell;
+mod rocm_releases;
 mod signing;
 mod tpn;
 mod verify_commits;
@@ -217,6 +219,9 @@ pub(crate) enum Command {
     /// tree stays a cache: an install happens only when nothing is present for the
     /// channel, an in-place side-by-side update only when the index is genuinely
     /// ahead, and anything unclear (an unreachable index) reuses what is there.
+    /// `--version`/`--build-date` override all of that: a pin is served if already
+    /// installed, else freshly installed side-by-side — the index's latest is
+    /// never consulted while a pin is set.
     E2ePrewarm {
         /// TheRock package channel the shared runtime should track.
         #[arg(long, default_value = "release")]
@@ -229,6 +234,23 @@ pub(crate) enum Command {
         /// `data/runtimes` is what the lanes export as `E2E_SHARED_RUNTIMES_DIR`.
         #[arg(long)]
         prewarm_dir: PathBuf,
+        /// Pin the pre-warmed SDK to this exact TheRock package version instead
+        /// of tracking the channel's latest.
+        #[arg(long, conflicts_with_all = ["build_date", "release_label"])]
+        version: Option<String>,
+        /// Pin the pre-warmed SDK to the TheRock package built on this date.
+        #[arg(
+            long,
+            value_name = "YYYY-MM-DD",
+            conflicts_with_all = ["version", "release_label"]
+        )]
+        build_date: Option<String>,
+        /// Pin the pre-warmed SDK to one of the official release list's three
+        /// most recent versions (see `rocm_releases`), for the self-hosted
+        /// sdk_version matrix. `current` tracks the channel's latest, same as
+        /// omitting `--version`/`--build-date` entirely.
+        #[arg(long, conflicts_with_all = ["version", "build_date"])]
+        release_label: Option<rocm_releases::ReleaseLabel>,
     },
     /// Consolidate per-platform E2E `report.json` files (one per CI job/runner)
     /// into a single cross-platform HTML report, and print a summary matrix to
@@ -312,7 +334,22 @@ fn run() -> Result<()> {
             channel,
             keep,
             prewarm_dir,
-        } => e2e_prewarm::run(&channel, keep, &prewarm_dir)?,
+            version,
+            build_date,
+            release_label,
+        } => {
+            let resolved_version = match release_label {
+                Some(label) => label.pin().map(str::to_owned),
+                None => version,
+            };
+            e2e_prewarm::run(
+                &channel,
+                keep,
+                &prewarm_dir,
+                resolved_version.as_deref(),
+                build_date.as_deref(),
+            )?;
+        }
         Command::E2eReport {
             artifacts_dir,
             html_out,

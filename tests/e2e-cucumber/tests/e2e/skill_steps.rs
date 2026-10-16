@@ -48,10 +48,11 @@ struct Remediation {
     /// mismatch instead of being quietly translated into agreement.
     os_scope: String,
     /// The marker word this id carries: `AUTO`, `NEEDS-ARG`, `PRINT-ONLY`, or
-    /// `DIAGNOSE-ONLY` (no catalog entry uses the last one yet, but it is
-    /// recognised rather than silently dropped -- an unrecognised marker drops
-    /// its row from the map, which previously made `NEEDS-ARG` vanish fix-9
-    /// entirely instead of failing on the mismatched marker).
+    /// `DIAGNOSE-ONLY` (`info-20-gpu-no-rocm-support` is the only entry using
+    /// the last one today). Every one is recognised rather than silently
+    /// dropped -- an unrecognised marker drops its row from the map, which
+    /// previously made `NEEDS-ARG` vanish fix-9 entirely instead of failing on
+    /// the mismatched marker.
     marker: String,
     /// A platform whose marker differs from [`Remediation::marker`], and what
     /// it is there. `rocm fix`'s listing reports the marker for the machine it
@@ -162,7 +163,12 @@ fn parse_reference_catalog(md: &str) -> BTreeMap<String, Remediation> {
             continue;
         }
         let id = cells[0].trim_matches('`');
-        if !id.starts_with("fix-") {
+        // `info-` as well as `fix-`: the catalog's DIAGNOSE-ONLY entries carry
+        // an `info-` id precisely because they have no fix to offer, and they
+        // are rows in this table like any other. Matching `fix-` alone dropped
+        // them silently, so the table could disagree with the CLI about them
+        // and nothing would say so.
+        if !e2e_cucumber::is_catalog_id(id) {
             continue;
         }
         // Taken verbatim, never normalised. A shorthand like `both` used to be
@@ -254,7 +260,11 @@ fn parse_fix_listing(stdout: &str) -> BTreeMap<String, Remediation> {
             continue;
         };
         let id = rest.split_whitespace().next().unwrap_or_default();
-        if !id.starts_with("fix-") {
+        // `info-` too, matching `parse_reference_catalog`: the DIAGNOSE-ONLY
+        // entry is listed by `rocm fix` like any other, and dropping it from
+        // one side of this comparison and not the other would report it as an
+        // id the CLI no longer offers.
+        if !e2e_cucumber::is_catalog_id(id) {
             continue;
         }
         out.insert(

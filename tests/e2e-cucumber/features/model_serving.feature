@@ -323,12 +323,31 @@ Feature: Model serving
     Then the CLI refuses and names the exact command to stop the existing service
     And running that command actually stops the service
 
+  # ROCMAI-543: a Windows console on the OEM code page (437) renders a UTF-8 em
+  # dash, and other non-ASCII punctuation, as mojibake (e.g. "ΓÇö") instead of
+  # transliterating it. `rocm model` is the flagship instance of that bug class;
+  # this pins the fix at the CLI-output level (not just the internal renderer
+  # unit tests in apps/rocm/src/main.rs) so a future catalog label or hint line
+  # cannot reintroduce it unnoticed. No GPU needed: the command only reads the
+  # built-in catalog.
+  #
+  # The step says ASCII-only rather than punctuation-only because that is what
+  # it enforces: the rule is about the *bytes* on a redirected stream, so a
+  # non-ASCII letter or CJK label would be exactly as unreadable on code page
+  # 437 as an em dash is. Narrowing the assertion to a punctuation class to
+  # match a narrower wording would make this scenario weaker than the
+  # whole-tree contract in xtask/src/ascii_output_contract.rs that it mirrors.
+  @id:serve-model-list-output-is-ascii
+  Scenario: serve-25 - The recommended model list prints ASCII-only text
+    When the user lists recommended models
+    Then the model list output contains only ASCII characters
+
   # Real CLI coverage for automatic port allocation. A loopback listener holds
   # the legacy default while one real managed GPU serve starts; the reported
   # endpoint must advance to the next candidate rather than failing late in the
   # engine. Runs in the merge queue because it launches a real model server.
   @id:serve-auto-port-skips-occupied @requires-gpu @merge-queue
-  Scenario: serve-25 - Automatic serving skips an occupied default port
+  Scenario: serve-26 - Automatic serving skips an occupied default port
     Given a managed runtime is active
     And the default serve port is occupied
     When the user serves a model with automatic port selection
@@ -339,7 +358,7 @@ Feature: Model serving
   # before any engine or GPU work, so it needs no GPU and gates every PR
   # (ungated), like its sibling serve-14.
   @id:serve-invalid-port-rejected
-  Scenario: serve-26 - Serving with an out-of-range port is refused with a clear reason
+  Scenario: serve-27 - Serving with an out-of-range port is refused with a clear reason
     When the user serves a model with an out-of-range port
     Then serving is refused before any engine starts
     And the user is told the port must be between 1 and 65535
@@ -354,9 +373,9 @@ Feature: Model serving
   # only; the advice is actually proven by
   # `stopping_the_reserving_record_frees_its_explicit_port_for_reuse` in
   # apps/rocm/src/service_launch.rs, per AGENTS.md section 3.
-  # Runs in the merge queue, like its automatic-port sibling serve-25.
+  # Runs in the merge queue, like its automatic-port sibling serve-26.
   @id:serve-explicit-port-reserved @requires-gpu @merge-queue
-  Scenario: serve-27 - Serving on a port another managed service already holds is refused
+  Scenario: serve-28 - Serving on a port another managed service already holds is refused
     Given a managed runtime is active
     And another managed service already reserves the default serve port
     When the user serves a model explicitly on the reserved port
