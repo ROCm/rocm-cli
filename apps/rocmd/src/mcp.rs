@@ -445,7 +445,8 @@ pub(crate) fn rocm_mcp_tools() -> Vec<Value> {
                     "port": {
                         "type": "integer",
                         "minimum": 1,
-                        "maximum": 65535
+                        "maximum": 65535,
+                        "description": "Required unless host is exactly 127.0.0.1 (localhost/::1 still need one)."
                     },
                     "allow_public_bind": {
                         "type": "boolean"
@@ -1093,6 +1094,16 @@ fn build_launch_server_args(arguments: &serde_json::Map<String, Value>) -> Resul
             "launch_server host `{host}` is not loopback; require `allow_public_bind=true` before binding a non-local interface"
         );
     }
+    // `rocm serve` proves a port is free only on the exact default host; every
+    // other spelling (including the loopback aliases `localhost`/`::1` the
+    // check above still accepts) needs an explicit port or the CLI call
+    // refuses later with a less actionable error. See `is_canonical_loopback_host`.
+    if arguments.get("port").is_none() && !rocm_core::is_canonical_loopback_host(host) {
+        bail!(
+            "launch_server host `{host}` needs an explicit `port`; automatic port selection is \
+             only supported on the default host {DEFAULT_LOCAL_HOST}"
+        );
+    }
 
     let mut argv = vec!["serve".to_owned(), model.to_owned(), "--managed".to_owned()];
     if let Some(engine) = arguments.get("engine").and_then(Value::as_str) {
@@ -1421,9 +1432,32 @@ mod tests {
             ("model".to_owned(), Value::String("tiny-gpt2".to_owned())),
             ("host".to_owned(), Value::String("0.0.0.0".to_owned())),
             ("allow_public_bind".to_owned(), Value::Bool(true)),
+            ("port".to_owned(), Value::Number(11999.into())),
         ]);
         let args = build_launch_server_args(&arguments)?;
         assert!(args.contains(&"--allow-public-bind".to_owned()));
+        Ok(())
+    }
+
+    #[test]
+    fn launch_server_requires_an_explicit_port_for_non_canonical_loopback_hosts() {
+        let arguments = serde_json::Map::from_iter([
+            ("model".to_owned(), Value::String("tiny-gpt2".to_owned())),
+            ("host".to_owned(), Value::String("localhost".to_owned())),
+        ]);
+        let error = build_launch_server_args(&arguments).unwrap_err();
+        assert!(error.to_string().contains("explicit `port`"), "{error:#}");
+    }
+
+    #[test]
+    fn launch_server_allows_localhost_with_an_explicit_port() -> Result<()> {
+        let arguments = serde_json::Map::from_iter([
+            ("model".to_owned(), Value::String("tiny-gpt2".to_owned())),
+            ("host".to_owned(), Value::String("localhost".to_owned())),
+            ("port".to_owned(), Value::Number(11999.into())),
+        ]);
+        let args = build_launch_server_args(&arguments)?;
+        assert!(args.contains(&"11999".to_owned()));
         Ok(())
     }
 

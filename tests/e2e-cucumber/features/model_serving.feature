@@ -341,3 +341,43 @@ Feature: Model serving
   Scenario: serve-25 - The recommended model list prints ASCII-only text
     When the user lists recommended models
     Then the model list output contains only ASCII characters
+
+  # Real CLI coverage for automatic port allocation. A loopback listener holds
+  # the legacy default while one real managed GPU serve starts; the reported
+  # endpoint must advance to the next candidate rather than failing late in the
+  # engine. Runs in the merge queue because it launches a real model server.
+  @id:serve-auto-port-skips-occupied @requires-gpu @merge-queue
+  Scenario: serve-26 - Automatic serving skips an occupied default port
+    Given a managed runtime is active
+    And the default serve port is occupied
+    When the user serves a model with automatic port selection
+    Then the service uses the next automatic port
+
+  # Parse-time refusal (serve-port rewrite): an out-of-range `--port` (0 here;
+  # 65536 and non-numeric values share the same parser and message) is rejected
+  # before any engine or GPU work, so it needs no GPU and gates every PR
+  # (ungated), like its sibling serve-14.
+  @id:serve-invalid-port-rejected
+  Scenario: serve-27 - Serving with an out-of-range port is refused with a clear reason
+    When the user serves a model with an out-of-range port
+    Then serving is refused before any engine starts
+    And the user is told the port must be between 1 and 65535
+
+  # Collision-safe explicit ports (serve-port rewrite). An explicit `--port`
+  # equal to one a live managed service already holds must be refused before any
+  # bind is attempted, naming the service so the user can stop it or pick
+  # another port. Reaching this check needs a real GPU: `resolve_serve_port`
+  # only runs once `spawn_managed_engine_child` has a completed model/engine
+  # resolution in hand, and `serve` has no CPU fallback that gets there. The
+  # "stop the service holding that port" advice is checked here by its wording
+  # only; the advice is actually proven by
+  # `stopping_the_reserving_record_frees_its_explicit_port_for_reuse` in
+  # apps/rocm/src/service_launch.rs, per AGENTS.md section 3.
+  # Runs in the merge queue, like its automatic-port sibling serve-26.
+  @id:serve-explicit-port-reserved @requires-gpu @merge-queue
+  Scenario: serve-28 - Serving on a port another managed service already holds is refused
+    Given a managed runtime is active
+    And another managed service already reserves the default serve port
+    When the user serves a model explicitly on the reserved port
+    Then serving is refused before any engine starts
+    And the user is told to stop the service holding that port

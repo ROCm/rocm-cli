@@ -449,6 +449,35 @@ impl MockServer {
         Self::spawn(model_name, false).await
     }
 
+    /// Like [`Self::start`], but binds a caller-specified port instead of an
+    /// ephemeral one — for scenarios that plant a managed-service record
+    /// naming an exact port and need a real listener behind it, so the CLI's
+    /// liveness probe reports the model as listed instead of demoting the
+    /// record before an explicit-port collision check ever runs.
+    pub async fn start_on_port(model_name: &str, port: u16) -> Self {
+        let last_chat_request = Arc::new(Mutex::new(None));
+        let chat_paths = Arc::new(Mutex::new(Vec::new()));
+        let state = ServerState {
+            model_name: model_name.to_string(),
+            metrics: None,
+            scripted_metrics: None,
+            last_chat_request: Arc::clone(&last_chat_request),
+            chat_paths: Arc::clone(&chat_paths),
+        };
+        let app = Router::new()
+            .route("/v1/models", get(handle_models))
+            .route("/models", get(handle_models))
+            .route("/v1/chat/completions", post(handle_chat))
+            .route("/chat/completions", post(handle_chat))
+            .with_state(state);
+        Self {
+            server: http_server::spawn_on_port(app, port).await,
+            scripted: None,
+            last_chat_request,
+            chat_paths,
+        }
+    }
+
     /// Like [`Self::start`], but also opts into a deterministic vLLM-flavoured
     /// `/metrics` route (see [`MetricsCounter`]) — for scenarios that exercise
     /// the dashboard's live generation-rate / TTFT / TPOT display against a

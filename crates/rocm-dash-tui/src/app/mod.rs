@@ -915,7 +915,8 @@ impl AppState {
     /// (and is ignored while a job runs) before it can eject the manager.
     pub(crate) fn active_overlay_at_root(&self) -> bool {
         self.serve_wizard.as_ref().is_none_or(|w| {
-            w.browser.is_none()
+            w.editor.is_none()
+                && w.browser.is_none()
                 && w.picker.is_none()
                 && w.approval.is_none()
                 && w.active_job.is_none()
@@ -1795,6 +1796,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn serve_wizard_editor_handles_escape_before_overlay_back_out() {
+        let mut state = AppState::new("t".into(), "default-dark".into());
+        state.active_tab = ActiveTab::Serving;
+        let mut wizard = crate::ui::serve_wizard::ServeWizardState {
+            model: "typed-model".into(),
+            ..Default::default()
+        };
+        wizard.editor = Some(crate::ui::serve_wizard::InlineEditor {
+            field: crate::ui::serve_wizard::Field::Host,
+            value: "localhost".into(),
+            cursor: 9,
+            selected: false,
+        });
+        state.serve_wizard = Some(wizard);
+
+        assert!(
+            !state.should_pane_back_out(crossterm::event::KeyCode::Esc),
+            "Esc must reach the inline editor instead of closing the wizard"
+        );
+        assert_eq!(
+            state.serve_wizard.as_ref().unwrap().model,
+            "typed-model",
+            "the in-progress form remains available to the editor handler"
+        );
+    }
+
     /// `active_overlay_at_root`'s per-manager clauses are a hand-maintained
     /// enumeration of each manager's nested sub-view fields (documented on
     /// `OnboardingState`, which lists every struct this covers). Nothing stops
@@ -1826,10 +1854,12 @@ mod tests {
             field: _,
             model: _,
             engine_idx: _,
-            device_idx: _,
             host: _,
+            port_mode: _,
             port: _,
             managed: _,
+            advanced_expanded: _,
+            editor,
             browser,
             picker,
             approval,
@@ -1837,7 +1867,11 @@ mod tests {
             message: _,
         } = ServeWizardState::default();
         assert!(
-            browser.is_none() && picker.is_none() && approval.is_none() && active_job.is_none()
+            editor.is_none()
+                && browser.is_none()
+                && picker.is_none()
+                && approval.is_none()
+                && active_job.is_none()
         );
 
         let InstallManagerState {

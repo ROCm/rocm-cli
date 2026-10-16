@@ -138,7 +138,9 @@ pub use proc_lifecycle::{
     process_start_ticks, terminate_verified,
 };
 pub use process::{
-    FileLock, detach_command_session, process_is_running, terminate_process, terminate_process_tree,
+    FileLock, LoopbackPortLease, MANAGED_LAUNCH_LOCK_TIMEOUT, detach_command_session,
+    is_canonical_loopback_host, lease_loopback_port, lease_loopback_port_or_bind_error,
+    process_is_running, terminate_process, terminate_process_tree,
 };
 #[cfg(windows)]
 pub use process::{
