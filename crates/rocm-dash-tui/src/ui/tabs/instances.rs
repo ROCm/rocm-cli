@@ -1092,12 +1092,15 @@ mod tests {
     fn mk_state(instances: HashMap<String, Instance>, sel: usize) -> AppState {
         AppState {
             services_past_attempts: 0,
+            managed_registry_probe: None,
+            launcher_hosted: false,
             connect: "test".into(),
             conn: ConnState::Initial,
             latest: None,
             history: std::collections::VecDeque::new(),
             bench_rows: std::collections::VecDeque::new(),
             instances,
+            has_received_snapshot: false,
             active_tab: crate::app::ActiveTab::Observe,
             modal: crate::app::Modal::None,
             menu_sel: 0,
@@ -1166,6 +1169,7 @@ mod tests {
             slash_tool: None,
             plan_request: None,
             approval: None,
+            quit_confirm: None,
             active_provider: crate::app::ChatProvider::default(),
             provider_switch: None,
             update_status: crate::app::UpdateStatus::Unknown,

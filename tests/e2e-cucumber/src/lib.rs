@@ -5,6 +5,7 @@
 pub mod capability;
 pub mod chat_request;
 pub mod expectation;
+pub mod fixture_binary;
 pub mod harness_diagnostics;
 pub mod http_server;
 pub mod installer_fixture;

@@ -351,3 +351,222 @@ Feature: Interactive dashboard
     When the user closes onboarding setup
     And the user quits the dashboard
     Then the dashboard exits successfully
+
+  # #145: quitting used to leave a served model running in the background
+  # with no warning at all. Declining first, then confirming, in the same
+  # scenario pins both halves of the fix with one launch.
+  @id:dash-quit-confirm-when-serving @requires-os:linux
+  Scenario: dash-26 - Quitting while a model is being served asks for confirmation first
+    Given a running managed model is available locally
+    When the user opens the dashboard
+    And the user opens the Observe view
+    Then the managed model is displayed
+    When the user tries to quit the dashboard
+    Then the dashboard asks whether to quit while a model is still being served
+    And the quit prompt shows the real stop command for the managed model
+    When the user declines the quit prompt
+    Then the managed model is displayed
+    When the user tries to quit the dashboard
+    Then the dashboard asks whether to quit while a model is still being served
+    And the quit prompt offers to open Services for the serving model
+    When the user presses s to manage the serving model
+    Then the services overlay opens showing the managed model
+    When the user closes the managed services overlay
+    And the user quits the dashboard
+    Then the dashboard exits successfully
+    And the managed model is still listed as running
+
+  # #145: the launcher front door is a second, independent quit entry point
+  # from the dashboard's own — same bug (quitting silently left a served
+  # model running), same fix. Mirrors dash-26 for the launcher's copy of the
+  # prompt: declining first, then confirming, pins both halves with one launch.
+  @id:dash-launcher-quit-confirm-when-serving @requires-os:linux
+  Scenario: dash-27 - Quitting the launcher while a model is being served asks for confirmation first
+    Given a running managed model is available locally
+    When the user opens the launcher
+    Then the launcher shows the model serving
+    When the user tries to quit the launcher
+    Then the launcher asks whether to quit while a model is still being served
+    And the quit prompt shows the real stop command for the managed model
+    When the user declines the quit prompt
+    Then the launcher shows the model serving
+    When the user quits the launcher
+    Then the launcher exits successfully
+    And the managed model is still listed as running
+
+  # AGENTS.md §3: the quit prompt's remediation line names a real, fillable
+  # command (`dash-26` already pins the exact string) — prove it actually
+  # works, not just that the text is right. This runs the literal command a
+  # user would copy from the prompt and checks the registry `rocm services`
+  # itself reads, independent of whether the TUI's own live view has caught up
+  # to the external change by the time the scenario ends.
+  @id:dash-quit-prompt-stop-command-actually-works @requires-os:linux
+  Scenario: dash-28 - Running the quit prompt's printed stop command actually stops the model
+    Given a running managed model is available locally
+    And the managed model's record points at a disposable process
+    When the user opens the dashboard
+    And the user opens the Observe view
+    Then the managed model is displayed
+    When the user tries to quit the dashboard
+    Then the dashboard asks whether to quit while a model is still being served
+    And the quit prompt shows the real stop command for the managed model
+    When the user declines the quit prompt
+    And the user runs the quit prompt's stop command
+    Then the managed model is no longer listed as running
+    And the disposable process has exited
+    When the user quits the dashboard
+    Then the dashboard exits successfully
+
+  # #145: `/quit` in chat shares the exact same `request_quit` gate as the
+  # dashboard's `q` and the launcher's own `q`, but had no scenario coverage of
+  # its own before this — only the `q` path did. `rocm chat` is the same
+  # dashboard with the Chat tab focused (`run_chat` calls the same
+  # `run_async`), so the model being served here is exactly as real as it is
+  # in dash-26.
+  @id:dash-chat-quit-confirm-when-serving @requires-os:linux
+  Scenario: dash-29 - Quitting chat with /quit while a model is being served asks for confirmation first
+    Given a running managed model is available locally
+    And interactive chat uses an offline assistant
+    When the user opens interactive chat
+    And the user tries to quit chat
+    Then the dashboard asks whether to quit while a model is still being served
+    When the user declines the quit prompt
+    And the user sends a message about GPU health without refocusing the input
+    Then the assistant's GPU status response is displayed
+    When the user quits interactive chat
+    Then interactive chat exits successfully
+    And the managed model is still listed as running
+
+  # #145: the launcher is a persistent hub — escalating into the full
+  # dashboard ("Open full dashboard") and quitting FROM THERE used to ask
+  # "May still be serving — quit anyway?" a second time, and approving it only
+  # returned to the launcher menu, which then immediately asked the identical
+  # question again on its own next `q` — a prompt whose "yes" didn't actually
+  # exit the process at all. Only the launcher's own copy of the prompt may
+  # ever govern the real exit; the escalated dashboard's own `q` must return
+  # straight to the launcher menu with no prompt of its own.
+  @id:dash-launcher-hosted-dashboard-quit-is-not-asked-twice @requires-os:linux
+  Scenario: dash-30 - Quitting a dashboard opened from the launcher does not ask twice
+    Given a running managed model is available locally
+    When the user opens the launcher
+    Then the launcher shows the model serving
+    When the user opens the dashboard from the launcher
+    And the user quits back to the launcher
+    Then the launcher shows the model serving
+    When the user tries to quit the launcher
+    Then the launcher asks whether to quit while a model is still being served
+    When the user quits the launcher
+    Then the launcher exits successfully
+    And the managed model is still listed as running
+
+  # #145: `run_chat`'s own `launcher_hosted` flag must get the exact same
+  # double-prompt suppression `run`'s does (dash-30) — escalating into Chat
+  # from the launcher (the other hosted route, `launcher_route_hosts_session`)
+  # and quitting FROM THERE must return straight to the launcher menu with no
+  # quit-confirm prompt of its own; only the launcher's own copy may ever
+  # govern the real exit.
+  @id:dash-launcher-hosted-chat-quit-is-not-asked-twice @requires-os:linux
+  Scenario: dash-31 - Quitting chat opened from the launcher does not ask twice
+    Given a running managed model is available locally
+    When the user opens the launcher
+    Then the launcher shows the model serving
+    When the user opens chat from the launcher
+    And the user quits chat back to the launcher
+    Then the launcher shows the model serving
+    When the user tries to quit the launcher
+    Then the launcher asks whether to quit while a model is still being served
+    When the user quits the launcher
+    Then the launcher exits successfully
+    And the managed model is still listed as running
+
+  # README's "First run" section promises `Ctrl-C` always quits immediately
+  # without asking, even while a model is still being served — unlike
+  # `q`/Esc/`/quit`, which all route through the confirm-before-quit gate
+  # (dash-26). dash-20 already covers the keystroke with nothing serving;
+  # this is the "will not happen" half AGENTS.md §3 asks for: with a model
+  # serving, Ctrl-C must still exit on the spot rather than opening the
+  # prompt dash-26 pins — both before that prompt has been triggered, and
+  # (the production event loop puts the Ctrl-C arm ahead of the quit-confirm
+  # arm in its match, a relationship only re-opening the dashboard and
+  # triggering the prompt first can actually exercise) while it is already
+  # open. `press_ctrl_c_and_wait` waits for process exit, so a quit-confirm
+  # prompt intercepting the keystroke instead would time either half out, not
+  # silently pass it.
+  @id:dash-ctrl-c-skips-the-quit-confirm-while-serving @requires-os:linux
+  Scenario: dash-32 - Ctrl-C quits immediately even while a model is being served
+    Given a running managed model is available locally
+    When the user opens the dashboard
+    And the user opens the Observe view
+    Then the managed model is displayed
+    When the user presses Ctrl-C in the dashboard
+    Then the dashboard exits from the keystroke with code 130
+    And the terminal is restored to the normal screen
+    And the managed model is still listed as running
+    When the user opens the dashboard
+    Then the dashboard home view is displayed
+    When the user tries to quit the dashboard
+    Then the dashboard asks whether to quit while a model is still being served
+    When the user presses Ctrl-C in the dashboard
+    Then the dashboard exits from the keystroke with code 130
+    And the managed model is still listed as running
+
+  # `quit_and_wait`'s own retry loop answers "y" to any quit-confirm prompt it
+  # sees (`tui_driver.rs`), so every other scenario that quits through it
+  # would silently swallow a regression that opened the prompt when nothing
+  # is being served — a corrupted `AppState::has_live_instance` falsely
+  # reporting live would just get auto-confirmed away. This is the one
+  # scenario that bypasses that helper (`the user tries to quit the
+  # dashboard` sends a bare `q` and resolves nothing) and asserts the
+  # negative directly: with `--demo` serving no model at all, `q` must exit
+  # on the very first keystroke, with the quit-confirm prompt never opening
+  # to be auto-answered.
+  @id:dash-quit-skips-confirm-with-nothing-serving @requires-os:linux
+  Scenario: dash-33 - Quitting with nothing serving exits immediately, without asking
+    When the user opens the dashboard with demo data
+    Then the dashboard home view is displayed
+    When the user tries to quit the dashboard
+    Then the dashboard exits immediately with no quit confirmation
+
+  # #145 / AGENTS.md §3: the Esc-menu "Quit" row shares `request_quit` with
+  # every other quit gesture (`actions.rs`'s `KeyAction::MenuActivate` arm),
+  # but until now that sharing was only proven at the unit level — mutating
+  # the row's own `return request_quit(state)` back to `return true` fails no
+  # scenario, only unit tests (`quitting_from_the_esc_menu_opens_the_same_confirm_prompt`
+  # et al). This scenario reaches the row the way a user would: Esc opens the
+  # menu, and navigating to and activating "Quit" asks the same quit-confirm
+  # prompt every other entry point does.
+  @id:dash-esc-menu-quit-row-confirms-when-serving @requires-os:linux
+  Scenario: dash-34 - Choosing Quit from the Esc menu while a model is being served asks for confirmation first
+    Given a running managed model is available locally
+    When the user opens the dashboard
+    And the user opens the Observe view
+    Then the managed model is displayed
+    When the user presses Escape
+    Then the dashboard menu is displayed
+    When the user selects Quit from the dashboard menu
+    Then the dashboard asks whether to quit while a model is still being served
+    When the user declines the quit prompt
+    Then the managed model is displayed
+    When the user quits the dashboard
+    Then the dashboard exits successfully
+    And the managed model is still listed as running
+
+  # gpu_compact_line (the one-line-per-GPU row the Hardware/Observe GPU section
+  # renders once it's too tight for the full bordered panels — see
+  # `plan_gpu_rows` in hardware.rs) divided vram_used_mb/vram_total_mb by 1024
+  # (binary arithmetic) but printed the result labeled "GB" (implying SI/
+  # decimal units) instead of "GiB" (#673 — the same mislabeling class as #190,
+  # pinned for a different formatter in automations-05). The demo session's 8
+  # GPUs already force this row onto the compact layout at any terminal size
+  # the other dash scenarios use, but the Observe tab nests the GPU section
+  # inside a 35%-height split of the tab body, which stays too short to show
+  # any GPU rows at all until the terminal is grown well past the sizes those
+  # other scenarios need — hence the extra resize here.
+  @id:dash-gpu-vram-uses-binary-units @requires-os:linux
+  Scenario: dash-35 - The compact GPU row shows VRAM in binary units
+    When the user opens the dashboard with demo data
+    And the user opens the Observe view
+    And the user grows the terminal until the GPU section shows compact rows
+    Then the GPU section reports VRAM in binary units
+    When the user quits the dashboard
+    Then the dashboard exits successfully
