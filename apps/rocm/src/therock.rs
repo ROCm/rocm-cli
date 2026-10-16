@@ -6466,7 +6466,7 @@ fn slugify(value: &str) -> String {
 }
 
 #[cfg(test)]
-#[path = "therock_persisted_state_props.rs"]
+#[path = "therock_persisted_state_proptests.rs"]
 mod persisted_state_props;
 
 #[cfg(test)]
