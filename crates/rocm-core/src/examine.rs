@@ -1730,7 +1730,7 @@ fn apply_kernel_gpu_membership(e: &mut Examination, nodes: &[crate::KfdGpuNode])
         // because "the bus has it and the kernel does not" is a diagnosis.
         e.notes.push(format!(
             "{} AMD PCI device(s) are on the bus but not exposed by the kernel here, so they \
-             are not listed as GPUs: {}. In a container this is expected — only the \
+             are not listed as GPUs: {}. In a container this is expected - only the \
              passed-through GPUs are usable.",
             unexposed.len(),
             unexposed.join(", ")
@@ -5035,6 +5035,16 @@ mod tests {
         assert!(
             note.contains("not exposed by the kernel") && note.contains("0000:11:00.0"),
             "the unexposed devices must still be accounted for: {:?}",
+            e.notes
+        );
+        // ROCMAI-543: `rocm examine` prints every note verbatim, and this one
+        // carried an em dash before " only the passed-through GPUs". A Windows
+        // console on the OEM code page renders that as mojibake, so the whole
+        // note has to stay ASCII -- not only the substrings asserted above.
+        assert!(
+            note.is_ascii(),
+            "examine notes must be ASCII-only; non-ASCII punctuation renders as mojibake on \
+             a Windows console using the OEM code page (ROCMAI-543): {:?}",
             e.notes
         );
     }

@@ -452,7 +452,7 @@ fn serve_with_transport(
             return Err(error.context(format!(
                 "a model may now be running on {} port {} with nothing tracking it.\n\
                      Check with: ssh {} -- {remote_cli} services list\n\
-                     Its API key was kept at {} — it is the only copy.",
+                     Its API key was kept at {} - it is the only copy.",
                 request.target,
                 request.remote_port,
                 request.target,
@@ -571,7 +571,7 @@ fn unwind_partial_serve(
         session::clear_key(paths, session_id);
     } else {
         leftovers.push(format!(
-            "its API key was kept at {} — it is the only copy",
+            "its API key was kept at {} - it is the only copy",
             session::key_path(paths, session_id).display()
         ));
     }
@@ -976,14 +976,14 @@ fn render_status(
                 Known(publish::PublishState::Published) => "yes".to_owned(),
                 Known(publish::PublishState::Absent) => "no".to_owned(),
                 Known(publish::PublishState::Foreign { forwards_to }) =>
-                    format!("no — that port now forwards to {forwards_to}"),
+                    format!("no - that port now forwards to {forwards_to}"),
                 // Not "no": Funnel is classified before anything is asked about
                 // our own forward and short-circuits, so this state says
                 // nothing either way about whether the endpoint is published.
                 // Leading with "no" answered a question it had not looked at,
                 // and buried the one thing here that needs acting on.
                 Known(publish::PublishState::FunnelAllowed) => format!(
-                    "exposed — Tailscale Funnel is allowed on that port, which puts it on the \
+                    "exposed - Tailscale Funnel is allowed on that port, which puts it on the \
                      public internet; run `tailscale funnel --tcp={} off` on the remote, then \
                      check again",
                     record.tailnet_port
@@ -994,12 +994,12 @@ fn render_status(
                 // stay distinct because the next step differs — fix the reply,
                 // fix the remote's tailscale, or fix the connection.
                 Known(publish::PublishState::Unreadable) =>
-                    "unknown — the machine's reply could not be read".to_owned(),
+                    "unknown - the machine's reply could not be read".to_owned(),
                 // Reached, and it told us why. Printing its own words beats
                 // "could not be asked", which describes a different failure and
                 // sends the user to check the network instead of the remote.
-                Failed(why) => format!("unknown — the machine answered: {why}"),
-                Unreachable(why) => format!("unknown — the machine could not be asked: {why}"),
+                Failed(why) => format!("unknown - the machine answered: {why}"),
+                Unreachable(why) => format!("unknown - the machine could not be asked: {why}"),
             }
         );
 
@@ -1225,7 +1225,7 @@ fn render_stopped(
         if !withdrawn {
             let _ = writeln!(
                 output,
-                "  endpoint still reachable on the tailnet — clear it with:\n    \
+                "  endpoint still reachable on the tailnet - clear it with:\n    \
                  ssh {} -- tailscale serve --tcp={} off",
                 record.target, record.tailnet_port
             );
@@ -1233,7 +1233,7 @@ fn render_stopped(
         if !model_stopped {
             let _ = writeln!(
                 output,
-                "  model may still hold the GPU — check with:\n    \
+                "  model may still hold the GPU - check with:\n    \
                  ssh {} -- {} services list",
                 record.target, record.remote_cli
             );

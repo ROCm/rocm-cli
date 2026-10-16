@@ -11,6 +11,7 @@
 //! definition and dispatch. Run via the workspace alias `cargo xtask <command>`.
 
 mod affected;
+mod ascii_output_contract;
 mod catalog;
 mod coverage;
 mod crate_edges;

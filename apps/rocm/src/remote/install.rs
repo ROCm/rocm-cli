@@ -233,7 +233,7 @@ pub(crate) fn describe_refusal(
              What was found:\n{}\n\n\
              These are the situations the setup wizard exists to walk a person through, \
              and it cannot do that over a connection with nobody watching. Resolve them \
-             first — the suggested fixes are below.{}\n\n{}",
+             first - the suggested fixes are below.{}\n\n{}",
             bullets(findings),
             if without_a_fix.is_empty() {
                 // Only here is a rerun promised, because only here is resolving
@@ -251,7 +251,7 @@ pub(crate) fn describe_refusal(
                 // again — so "then run this again" would be describing a path
                 // that does not exist. AGENTS.md §3.
                 format!(
-                    "\n\nAlso reported, with no fix to apply — these describe the machine \
+                    "\n\nAlso reported, with no fix to apply - these describe the machine \
                      rather than something to put right, and will still be true afterwards:\n{}\
                      \n\nBecause of them, an unattended install will still be refused once the \
                      list above is resolved. Set this machine up yourself if you want ROCm on \
@@ -272,7 +272,7 @@ pub(crate) fn describe_refusal(
              What was found:\n{}\n\n\
              The catalog has no fix for any of this: it describes what the machine is, not \
              something that went wrong. There is nothing to resolve, a second run reaches the \
-             same answer, and no install command clears it — running one on that machine \
+             same answer, and no install command clears it - running one on that machine \
              yourself meets the same facts. What is left is a decision about the machine; \
              the report below is what there is to make it on.\n\n{}",
             bullets(findings),
@@ -280,7 +280,7 @@ pub(crate) fn describe_refusal(
         ),
         Refusal::NeedsPasswordlessSudo => format!(
             "installing ROCm on {target} needs administrator rights, and this connection \
-             cannot answer a password prompt — it would hang rather than fail.\n\n\
+             cannot answer a password prompt - it would hang rather than fail.\n\n\
              Either set up passwordless sudo there, or install it yourself:\n  \
              ssh {target} -- rocm bootstrap setup"
         ),
