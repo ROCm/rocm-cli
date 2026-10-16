@@ -588,6 +588,25 @@ where
         // exclusive. Reject the combination before device login or network I/O.
         validate_chatgpt_inference_params(&self.params)?;
 
+        // rig-core's ChatGPT provider unconditionally zeroes temperature,
+        // max_output_tokens, and additional_parameters.top_p in its own
+        // `create_request` before the request reaches the wire, regardless of
+        // what `self.params` holds (tracked upstream in rig-core, not fixable
+        // here — see https://github.com/ROCm/rocm-cli/issues/664). Warn so the
+        // operator knows these flags are silently ignored for this backend.
+        if self.params.temperature.is_some()
+            || self.params.top_p.is_some()
+            || self.params.max_tokens.is_some()
+        {
+            warn!(
+                backend = "chatgpt-oauth",
+                temperature = ?self.params.temperature,
+                top_p = ?self.params.top_p,
+                max_tokens = ?self.params.max_tokens,
+                "temperature/top_p/max_tokens are ignored by the ChatGPT backend"
+            );
+        }
+
         // Device-code login on first use; the provider caches the token after.
         // A failed/declined sign-in is an Auth error (distinct from a build
         // failure), surfaced as a clear error turn — never leaks the token.
@@ -2618,6 +2637,130 @@ mod tests {
             !tags.is_empty() && tags.iter().all(|t| t == "chatgpt-oauth"),
             "complete() must tag its lifecycle trace events \"chatgpt-oauth\", got {tags:?}"
         );
+    }
+
+    /// Builds a `ChatGptAgentClient` wired to a `RecordingHttpClient` that
+    /// replies with a single scripted turn, for the
+    /// `chatgpt_agent_client_complete_warns_when_dropped_params_are_set` test
+    /// below. Shared so both the non-default and the default-params run
+    /// drive the exact same request/response shape; only `params` differs.
+    fn chatgpt_client_for_dropped_params_warning_test(
+        params: InferenceParams,
+    ) -> ChatGptAgentClient<rig::test_utils::RecordingHttpClient> {
+        use rig::test_utils::RecordingHttpClient;
+
+        let response_body = chatgpt_response_completed_sse(json!([{
+            "type": "message",
+            "id": "msg-test",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{ "type": "output_text", "text": "GPU 0 is healthy." }],
+        }]));
+        let http_client = RecordingHttpClient::new(response_body);
+        let chatgpt_client = rig::providers::chatgpt::Client::builder()
+            .api_key("test-access-token")
+            .http_client(http_client)
+            .build()
+            .expect("build client over the recording HTTP double");
+
+        ChatGptAgentClient {
+            client: chatgpt_client,
+            model: "test-model".to_string(),
+            preamble: TEST_PREAMBLE.to_string(),
+            params,
+            executor: None,
+            approval_tx: None,
+        }
+    }
+
+    /// Regression test for <https://github.com/ROCm/rocm-cli/issues/664>:
+    /// rig-core's ChatGPT provider silently zeroes `temperature`,
+    /// `max_output_tokens`, and `top_p` before the wire (pinned by
+    /// `chatgpt_agent_client_complete_forwards_model_and_instructions_to_the_wire`
+    /// above), so `ChatGptAgentClient::complete` must instead warn the
+    /// operator that these flags are ignored for this backend.
+    ///
+    /// `CapturedBackendTags` only records the `backend` field's *value*, not
+    /// the event's message or level, so a bare "does the tag `chatgpt-oauth`
+    /// appear" assertion can't distinguish the new warning from the two
+    /// `finish_agent_request` lifecycle events (`"chat request start"` /
+    /// `"chat request complete"`) every successful `complete()` call already
+    /// emits with that same tag. Counting events instead proves the
+    /// correlation `AGENTS.md` §3 requires: a non-default-params run must
+    /// capture exactly one MORE `chatgpt-oauth`-tagged event than the same
+    /// call with `InferenceParams::default()` — i.e. the warning fires if
+    /// and only if a dropped param is actually set, not merely that some
+    /// warning text exists somewhere.
+    ///
+    /// Each of `temperature`, `top_p`, and `max_tokens` is set ALONE in its
+    /// own run (never paired with another) so a single dropped `.is_some()`
+    /// disjunct in the production `if` — including the exact "forgot the
+    /// `top_p` check" shape this issue is about — fails exactly one of these
+    /// three cases instead of staying green under all of them. `top_p` can't
+    /// be paired with `temperature` here regardless: ChatGPT Responses
+    /// rejects that combination before the warn check ever runs (see
+    /// `validate_chatgpt_inference_params`), which is also why the pre-existing
+    /// `..._forwards_model_and_instructions_to_the_wire` test above never sets
+    /// `top_p`.
+    #[tokio::test]
+    async fn chatgpt_agent_client_complete_warns_when_dropped_params_are_set() {
+        let history = [ChatTurn::user("check gpu 0")];
+
+        let default_client =
+            chatgpt_client_for_dropped_params_warning_test(InferenceParams::default());
+        let (reply, default_tags) =
+            complete_capturing_backend_tags(&default_client, &history).await;
+        assert_eq!(reply, "GPU 0 is healthy.");
+        assert!(
+            default_tags.iter().all(|t| t == "chatgpt-oauth"),
+            "all captured lifecycle events must carry the \"chatgpt-oauth\" tag: \
+             default={default_tags:?}"
+        );
+
+        let isolated_cases = [
+            (
+                "temperature alone",
+                InferenceParams {
+                    temperature: Some(0.4),
+                    top_p: None,
+                    max_tokens: None,
+                },
+            ),
+            (
+                "top_p alone",
+                InferenceParams {
+                    temperature: None,
+                    top_p: Some(0.9),
+                    max_tokens: None,
+                },
+            ),
+            (
+                "max_tokens alone",
+                InferenceParams {
+                    temperature: None,
+                    top_p: None,
+                    max_tokens: Some(256),
+                },
+            ),
+        ];
+
+        for (label, params) in isolated_cases {
+            let client = chatgpt_client_for_dropped_params_warning_test(params);
+            let (reply, tags) = complete_capturing_backend_tags(&client, &history).await;
+            assert_eq!(reply, "GPU 0 is healthy.", "case: {label}");
+            assert!(
+                tags.iter().all(|t| t == "chatgpt-oauth"),
+                "case {label}: all captured lifecycle events must carry the \
+                 \"chatgpt-oauth\" tag: {tags:?}"
+            );
+            assert_eq!(
+                tags.len(),
+                default_tags.len() + 1,
+                "case {label}: setting it alone must emit exactly one more \
+                 chatgpt-oauth-tagged event (the dropped-params warning) than \
+                 InferenceParams::default(): case={tags:?}, default={default_tags:?}"
+            );
+        }
     }
 
     /// As `rig_agent_client_complete_forwards_executor_and_approval_channel`,

@@ -837,7 +837,13 @@ rocm chat [--provider anthropic|openai|...] [--model NAME] [--prompt TEXT] [--to
 Chat with an AI provider from the terminal. Reads from stdin when `--prompt` is
 omitted. `--temperature`, `--top-p`, and `--max-tokens` are optional sampling
 controls forwarded to the request; each is independent, so omit any of them to
-use the provider's default.
+use the provider's default. In the interactive chat session (run from a
+terminal with no `--prompt` and no piped stdin), if no local engine is
+reachable and no API key/URL is configured, chat falls back to the no-key
+ChatGPT OAuth sign-in; that backend logs a warning and ignores all three flags
+(an upstream rig-core limitation, not something rocm-cli can forward around —
+see [#664](https://github.com/ROCm/rocm-cli/issues/664)). The non-interactive
+`--prompt`/piped-stdin path never reaches this fallback.
 
 ### ComfyUI
 
