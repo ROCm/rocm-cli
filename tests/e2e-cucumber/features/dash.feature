@@ -550,3 +550,23 @@ Feature: Interactive dashboard
     When the user quits the dashboard
     Then the dashboard exits successfully
     And the managed model is still listed as running
+
+  # gpu_compact_line (the one-line-per-GPU row the Hardware/Observe GPU section
+  # renders once it's too tight for the full bordered panels — see
+  # `plan_gpu_rows` in hardware.rs) divided vram_used_mb/vram_total_mb by 1024
+  # (binary arithmetic) but printed the result labeled "GB" (implying SI/
+  # decimal units) instead of "GiB" (#673 — the same mislabeling class as #190,
+  # pinned for a different formatter in automations-05). The demo session's 8
+  # GPUs already force this row onto the compact layout at any terminal size
+  # the other dash scenarios use, but the Observe tab nests the GPU section
+  # inside a 35%-height split of the tab body, which stays too short to show
+  # any GPU rows at all until the terminal is grown well past the sizes those
+  # other scenarios need — hence the extra resize here.
+  @id:dash-gpu-vram-uses-binary-units @requires-os:linux
+  Scenario: dash-35 - The compact GPU row shows VRAM in binary units
+    When the user opens the dashboard with demo data
+    And the user opens the Observe view
+    And the user grows the terminal until the GPU section shows compact rows
+    Then the GPU section reports VRAM in binary units
+    When the user quits the dashboard
+    Then the dashboard exits successfully

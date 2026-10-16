@@ -2108,3 +2108,51 @@ async fn gen_tps_no_longer_displayed(world: &mut E2eWorld) {
             )
         });
 }
+
+/// Terminal rows tall enough that the Observe tab's 35%-height GPU sub-panel
+/// (`super::hardware::draw` called from `tabs/observe.rs`) has enough of its
+/// own area to show GPU rows at all. The demo session's 8 GPUs are already far
+/// past `plan_gpu_rows`'s full-panel threshold at this height (that would need
+/// the GPU sub-panel's own area north of 65 rows), so this lands solidly in
+/// its compact one-line-per-GPU layout — the regime `gpu_compact_line` draws.
+/// `grow_rows` keeps the standard 80-column width, comfortably over the 54
+/// columns `gpu_compact_line`'s own truncation budget needs to keep the vram
+/// segment on the line (`gpu_compact_line_vram_truncation_threshold` pins
+/// that exact 54 in `hardware.rs`).
+const GPU_COMPACT_ROWS: u16 = 70;
+
+#[when("the user grows the terminal until the GPU section shows compact rows")]
+async fn grow_for_gpu_compact_rows(world: &mut E2eWorld) {
+    let tui = session(world);
+    tui.grow_rows(GPU_COMPACT_ROWS)
+        .unwrap_or_else(|e| panic!("failed to resize the terminal: {e}"));
+    // The demo replay's GPU telemetry lands asynchronously, same as the
+    // instance table `open_instance_detail` waits on above; wait for a GPU
+    // row's own marker rather than assuming the first post-resize frame
+    // already carries it.
+    tui.wait_for_screen("°C", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("GPU compact rows never rendered: {e}"));
+}
+
+#[then("the GPU section reports VRAM in binary units")]
+async fn gpu_section_reports_binary_units(world: &mut E2eWorld) {
+    let screen = session(world).screen_text();
+    // Scoped to the compact GPU row itself (the line carrying its "°C"
+    // cell) rather than the whole screen: "GiB" alone also appears in the
+    // section header's per-logical-GPU figure and the instances table, so a
+    // screen-wide positive assertion would pass even if this row regressed.
+    let gpu_row = screen
+        .lines()
+        .find(|line| line.contains("°C"))
+        .unwrap_or_else(|| panic!("no compact GPU row on screen:\n{screen}"));
+    assert!(
+        gpu_row.contains("GiB"),
+        "expected the GPU row's VRAM figure in binary (GiB) units, got:\n{gpu_row}"
+    );
+    assert!(
+        !gpu_row.contains(" GB"),
+        "#673 REGRESSION: GPU VRAM is labeled in decimal-looking GB units \
+         instead of binary GiB, got:\n{gpu_row}"
+    );
+}
