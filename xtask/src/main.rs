@@ -25,6 +25,7 @@ mod manifest;
 mod package;
 mod paths;
 mod powershell;
+mod release_readiness;
 mod rocm_releases;
 mod signing;
 mod tpn;
@@ -265,6 +266,44 @@ pub(crate) enum Command {
         #[arg(long)]
         html_out: PathBuf,
     },
+    /// Compute a mechanical GO/NO-GO release-readiness verdict and status
+    /// table from the nightly build/E2E results and commits since the last
+    /// release tag, plus the categorized facts an LLM narrative step drafts
+    /// prose from (the verdict and table never depend on that step).
+    ReleaseReadiness {
+        /// Baseline tag for `git log <tag>..HEAD` (e.g. the last published
+        /// release tag, resolved by the caller via `git describe --tags
+        /// --abbrev=0 --match 'v*'`).
+        #[arg(long)]
+        since_tag: String,
+        /// Path to the consolidated E2E `support-matrix.md` produced by
+        /// `cargo xtask e2e-report` (reused as-is, not regenerated).
+        #[arg(long)]
+        e2e_report: PathBuf,
+        /// The calling workflow's own nightly Linux build job result
+        /// (`needs.nightly.result`).
+        #[arg(long)]
+        nightly_result: String,
+        /// The calling workflow's own nightly Windows build job result
+        /// (`needs.windows-nightly.result`).
+        #[arg(long)]
+        windows_result: String,
+        /// One `NAME=RESULT` pair per E2E GPU/WSL lane job (e.g.
+        /// `MI300X=${{ needs.e2e-gpu-nightly.result }}`), repeatable. A lane
+        /// that dies before uploading its `report.json` (preflight failure,
+        /// timeout, runner loss) would otherwise just vanish from the
+        /// consolidated E2E report's totals, reading as zero failures; this
+        /// gates on the lane job's own result so a silently-missing lane
+        /// still fails the release-readiness verdict.
+        #[arg(long = "e2e-lane-result")]
+        e2e_lane_results: Vec<String>,
+        /// Path to write the structured facts JSON (input to the narrative step).
+        #[arg(long)]
+        out: PathBuf,
+        /// Path to write the mechanical verdict + status table markdown.
+        #[arg(long)]
+        table_out: PathBuf,
+    },
     /// Lint PowerShell scripts with PSScriptAnalyzer (parse errors are reported
     /// too, so this also covers syntax).
     PowershellLint {
@@ -354,6 +393,23 @@ fn run() -> Result<()> {
             artifacts_dir,
             html_out,
         } => e2e_report::run(&artifacts_dir, &html_out)?,
+        Command::ReleaseReadiness {
+            since_tag,
+            e2e_report,
+            nightly_result,
+            windows_result,
+            e2e_lane_results,
+            out,
+            table_out,
+        } => release_readiness::run(
+            &since_tag,
+            &e2e_report,
+            &nightly_result,
+            &windows_result,
+            &e2e_lane_results,
+            &out,
+            &table_out,
+        )?,
         Command::PowershellLint { shell, files } => powershell::run(shell, files)?,
     }
     Ok(())
