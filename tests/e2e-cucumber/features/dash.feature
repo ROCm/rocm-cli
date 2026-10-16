@@ -460,13 +460,13 @@ Feature: Interactive dashboard
     And the managed model is still listed as running
 
   # #145: `run_chat`'s own `launcher_hosted` flag must get the exact same
-  # double-prompt suppression `run`'s does (dash-29) — escalating into Chat
+  # double-prompt suppression `run`'s does (dash-30) — escalating into Chat
   # from the launcher (the other hosted route, `launcher_route_hosts_session`)
   # and quitting FROM THERE must return straight to the launcher menu with no
   # quit-confirm prompt of its own; only the launcher's own copy may ever
   # govern the real exit.
   @id:dash-launcher-hosted-chat-quit-is-not-asked-twice @requires-os:linux
-  Scenario: dash-30 - Quitting chat opened from the launcher does not ask twice
+  Scenario: dash-31 - Quitting chat opened from the launcher does not ask twice
     Given a running managed model is available locally
     When the user opens the launcher
     Then the launcher shows the model serving
@@ -482,10 +482,10 @@ Feature: Interactive dashboard
   # README's "First run" section promises `Ctrl-C` always quits immediately
   # without asking, even while a model is still being served — unlike
   # `q`/Esc/`/quit`, which all route through the confirm-before-quit gate
-  # (dash-25). dash-20 already covers the keystroke with nothing serving;
+  # (dash-26). dash-20 already covers the keystroke with nothing serving;
   # this is the "will not happen" half AGENTS.md §3 asks for: with a model
   # serving, Ctrl-C must still exit on the spot rather than opening the
-  # prompt dash-25 pins — both before that prompt has been triggered, and
+  # prompt dash-26 pins — both before that prompt has been triggered, and
   # (the production event loop puts the Ctrl-C arm ahead of the quit-confirm
   # arm in its match, a relationship only re-opening the dashboard and
   # triggering the prompt first can actually exercise) while it is already
@@ -493,7 +493,7 @@ Feature: Interactive dashboard
   # prompt intercepting the keystroke instead would time either half out, not
   # silently pass it.
   @id:dash-ctrl-c-skips-the-quit-confirm-while-serving @requires-os:linux
-  Scenario: dash-31 - Ctrl-C quits immediately even while a model is being served
+  Scenario: dash-32 - Ctrl-C quits immediately even while a model is being served
     Given a running managed model is available locally
     When the user opens the dashboard
     And the user opens the Observe view
@@ -521,7 +521,7 @@ Feature: Interactive dashboard
   # on the very first keystroke, with the quit-confirm prompt never opening
   # to be auto-answered.
   @id:dash-quit-skips-confirm-with-nothing-serving @requires-os:linux
-  Scenario: dash-32 - Quitting with nothing serving exits immediately, without asking
+  Scenario: dash-33 - Quitting with nothing serving exits immediately, without asking
     When the user opens the dashboard with demo data
     Then the dashboard home view is displayed
     When the user tries to quit the dashboard

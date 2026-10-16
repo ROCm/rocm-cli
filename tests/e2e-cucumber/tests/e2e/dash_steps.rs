@@ -106,7 +106,7 @@ async fn running_managed_model(world: &mut E2eWorld) {
 /// Re-point "e2e-mock"'s `supervisor_pid`/`engine_pid` at a disposable `sleep`
 /// child instead of this harness's own PID. `register_mock_service_with`
 /// always points those fields at the harness process, which is fine for a
-/// scenario that only ever reads the record — but `dash-27` goes on to run the
+/// scenario that only ever reads the record — but `dash-28` goes on to run the
 /// literal `rocm services stop e2e-mock --yes` the prompt prints, and that
 /// command signals whatever PID the record names. Without this step it
 /// signals the cucumber harness itself (SIGTERM, `KillScope::Tree`).
@@ -121,7 +121,7 @@ async fn managed_model_record_points_at_disposable_process(world: &mut E2eWorld)
     let child = std::process::Command::new("sleep")
         .arg("300")
         .spawn()
-        .expect("failed to spawn disposable process for dash-27's stop-command step");
+        .expect("failed to spawn disposable process for dash-28's stop-command step");
     let pid = child.id();
     let supervisor_start_ticks = rocm_core::process_start_ticks(pid);
     world.recorded_process = Some(child);
@@ -622,7 +622,7 @@ async fn send_gpu_message(world: &mut E2eWorld) {
 }
 
 /// Counterpart of `send_gpu_message` for a chat input that is already
-/// focused — `dash-28`'s `/quit`-then-decline round trip (`try_quit_chat`
+/// focused — `dash-29`'s `/quit`-then-decline round trip (`try_quit_chat`
 /// presses `i` to focus before typing `/quit`) leaves `chat_focused` set,
 /// since nothing on the decline path blurs it. Sending `send_gpu_message`'s
 /// own leading `i` there would be read as a literal character rather than a
@@ -958,7 +958,7 @@ async fn managed_model_no_longer_listed_as_running(world: &mut E2eWorld) {
 /// this, a `rocm services stop` that merely rewrote the record's status to
 /// `stopped` without signalling anything would still leave
 /// `managed_model_no_longer_listed_as_running` above green — it only reads
-/// the registry, never the process `dash-27`'s own
+/// the registry, never the process `dash-28`'s own
 /// "the managed model's record points at a disposable process" step pointed
 /// the record's `supervisor_pid`/`engine_pid` at.
 #[then("the disposable process has exited")]

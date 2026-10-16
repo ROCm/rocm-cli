@@ -1112,7 +1112,7 @@ mod tests {
         // so the stop command should be available here regardless.
         //
         // This only pins the printed string (AGENTS.md §3) — it does not run
-        // the command. `dash-27`
+        // the command. `dash-28`
         // (`@id:dash-quit-prompt-stop-command-actually-works`) is the test
         // that proves a real `rocm services stop <id> --yes` actually clears
         // the condition.
@@ -1406,7 +1406,7 @@ mod tests {
         // offer it for a service this host's own registry manages.
         //
         // This only pins the printed string (AGENTS.md §3) — a string match
-        // cannot show the command "works". `dash-27`
+        // cannot show the command "works". `dash-28`
         // (`@id:dash-quit-prompt-stop-command-actually-works`) is the test
         // that runs it for real and proves it does.
         use rocm_dash_core::metrics::{Instance, InstanceStatus};
