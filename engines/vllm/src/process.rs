@@ -19,7 +19,7 @@ use std::process::{Command as ProcessCommand, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::runtime::{
-    VllmRuntime, runtime_bin_paths, runtime_has_discover_build,
+    VllmRuntime, ensure_therock_compat_shims, runtime_bin_paths, runtime_has_discover_build,
     therock_library_path_entries_for_launch,
 };
 use crate::{ServeHttpRequest, engine_recipe_launch_args};
@@ -401,6 +401,19 @@ pub(crate) fn parse_gpu_indices_arg(value: Option<&str>) -> Result<Vec<u32>> {
 }
 
 pub(crate) fn apply_therock_env(command: &mut ProcessCommand, runtime: &VllmRuntime) -> Result<()> {
+    apply_therock_env_with(command, runtime, rocm_core::openmpi::ensure_mpi_cxx_compat)
+}
+
+/// Same as [`apply_therock_env`], with the `libmpi_cxx` probe
+/// [`ensure_therock_compat_shims`] takes injectable, so a test can exercise
+/// the whole "no shim needed" hand-off into `LD_LIBRARY_PATH` without
+/// depending on this host's own OpenMPI/compiler state. Production code
+/// always goes through [`apply_therock_env`].
+fn apply_therock_env_with(
+    command: &mut ProcessCommand,
+    runtime: &VllmRuntime,
+    ensure_mpi_cxx_compat: impl FnOnce(&Path) -> Option<PathBuf>,
+) -> Result<()> {
     command.env("VLLM_TARGET_DEVICE", "rocm");
     if runtime_has_discover_build(runtime) {
         apply_vllm_rocm10_discover_env(command, runtime)?;
@@ -427,7 +440,7 @@ pub(crate) fn apply_therock_env(command: &mut ProcessCommand, runtime: &VllmRunt
         );
     }
     if !cfg!(windows) {
-        let compat_shim = crate::runtime::ensure_therock_compat_shims(runtime);
+        let compat_shim = ensure_therock_compat_shims(runtime, ensure_mpi_cxx_compat);
         command.env(
             "LD_LIBRARY_PATH",
             prepend_path_entries(
@@ -1509,6 +1522,55 @@ mod tests {
             std::env::split_paths(ld_library_path).any(|entry| entry == compat_dir),
             "ensure_therock_compat_shims's answer must reach LD_LIBRARY_PATH: \
              {ld_library_path:?} should contain {compat_dir:?}"
+        );
+        Ok(())
+    }
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn apply_therock_env_excludes_a_leftover_stub_this_launch_does_not_need() -> Result<()> {
+        // The opposite host state from
+        // `apply_therock_env_writes_libmpi_cxx_stub_when_needed`, made
+        // deterministic (rather than dependent on this host's own OpenMPI
+        // install or compiler) by injecting the `ensure_mpi_cxx_compat`
+        // answer through `apply_therock_env_with`: when this launch's probe
+        // says no shim is needed, a stub some earlier run left behind in
+        // `compat_dir` must not keep that directory on the loader path.
+        let env = tempfile::tempdir()?;
+        let runtime = VllmRuntime {
+            runtime_id: "therock-release:gfx120X-all".to_owned(),
+            env_id: "external-vllm-therock".to_owned(),
+            command: PathBuf::from("vllm"),
+            python_executable: Some(env.path().join("bin").join("python")),
+            version: None,
+            source: "managed_runtime_manifest:test".to_owned(),
+            sdk_root: Some(env.path().join("sdk")),
+            sdk_bin: None,
+            sdk_bin_paths: Vec::new(),
+            sdk_library_paths: Vec::new(),
+            rocm_sdk_version: None,
+        };
+
+        // Plant the leftover directly, bypassing `ensure_mpi_cxx_compat`:
+        // this is what a prior launch leaves behind on a host that has since
+        // gained a real `libmpi_cxx.so*`.
+        let compat_dir = env.path().join("rocm-cli-lib-compat");
+        fs::create_dir_all(&compat_dir)?;
+        fs::write(compat_dir.join("libmpi_cxx.so.40"), b"stale stub")?;
+
+        let mut command = ProcessCommand::new("vllm");
+
+        apply_therock_env_with(&mut command, &runtime, |_compat_dir| None)?;
+
+        let ld_library_path = command
+            .get_envs()
+            .find_map(|(key, value)| (key == "LD_LIBRARY_PATH").then_some(value))
+            .flatten()
+            .expect("LD_LIBRARY_PATH set");
+        assert!(
+            !std::env::split_paths(ld_library_path).any(|entry| entry == compat_dir),
+            "a leftover stub must not keep the compat dir on the loader path \
+             when this launch does not need one: {ld_library_path:?} should \
+             not contain {compat_dir:?}"
         );
         Ok(())
     }

@@ -645,8 +645,10 @@ enum CompatDirSignal {
     /// performing a write.
     Unchecked,
     /// This launch's authoritative answer from `ensure_therock_compat_shims`:
-    /// `Some(dir)` when a shim is needed, `None` when it is not — even if one
-    /// is still sitting on disk from an earlier run.
+    /// on the launch path, `Some(dir)` when a shim was needed and written,
+    /// `None` when it was not needed or could not be written — even if one is
+    /// still sitting on disk
+    /// from an earlier run.
     Checked(Option<PathBuf>),
 }
 
@@ -733,30 +735,26 @@ fn compat_dir_has_shims(compat_dir: &Path) -> bool {
 /// from the launch path, before building the environment a server is spawned
 /// with — never from running-state payload assembly, which only needs the
 /// path list `therock_library_path_entries` derives, not the shims
-/// themselves. Returns the `libmpi_cxx` compat dir exactly when
-/// `ensure_mpi_cxx_compat` determined a shim is needed for *this* launch —
-/// pass this on to [`therock_library_path_entries_for_launch`] rather than
-/// having that derivation re-check the directory itself. Returns `None`
-/// without touching the filesystem when `runtime.sdk_root` is absent, so this
-/// function stays safe to call independent of a caller's own gating — see the
-/// guard below for why that gating isn't exercised by this function's current
-/// caller today.
-pub(crate) fn ensure_therock_compat_shims(runtime: &VllmRuntime) -> Option<PathBuf> {
+/// themselves. Returns the `libmpi_cxx` compat dir when a shim is needed for
+/// *this* launch and `ensure_mpi_cxx_compat` wrote it — pass this on to
+/// [`therock_library_path_entries_for_launch`] rather than having that
+/// derivation re-check the directory itself. Returns `None` without touching
+/// the filesystem when `runtime.sdk_root` is absent, so this function stays
+/// safe to call independent of a caller's own gating.
+///
+/// `ensure_mpi_cxx_compat` is the real probe in production
+/// ([`rocm_core::openmpi::ensure_mpi_cxx_compat`]); tests inject a fixed
+/// answer here to exercise the rest of this hand-off without depending on
+/// this host's own OpenMPI/compiler state.
+pub(crate) fn ensure_therock_compat_shims(
+    runtime: &VllmRuntime,
+    ensure_mpi_cxx_compat: impl FnOnce(&Path) -> Option<PathBuf>,
+) -> Option<PathBuf> {
     if !cfg!(target_os = "linux") {
         return None;
     }
-    // `therock_library_path_entries_inner` only ever adds the compat dir to
-    // the loader path when `sdk_root` is present (its own early return on
-    // `sdk_root.is_none()` discards any `CompatDirSignal`), so a shim written
-    // here when `sdk_root` is absent (e.g. the `ROCM_CLI_VLLM_PYTHON`/
-    // `VLLM_PYTHON` external-python runtime, which sets `python_executable`
-    // without `sdk_root`) would have no effect on the launched process's
-    // environment. This function's only current caller, `apply_therock_env`,
-    // already returns before reaching this call when `sdk_root` is absent
-    // (`process.rs`'s own early return), so this guard is not live-reachable
-    // today; it exists so this `pub(crate)` function stays correct on its own
-    // terms; matching `therock_library_path_entries_inner`'s gating, rather
-    // than relying on every future caller to repeat that caller's check.
+    // No-op without `sdk_root`, matching `therock_library_path_entries_inner`'s
+    // own gating.
     runtime.sdk_root.as_ref()?;
     let compat_dir = runtime_compat_dir(runtime)?;
     // PyTorch's `libtorch_global_deps.so` lists `libmpi_cxx.so.40` as a
@@ -767,7 +765,7 @@ pub(crate) fn ensure_therock_compat_shims(runtime: &VllmRuntime) -> Option<PathB
     // build.rs) into this directory. The stub only *defines* the legacy C++
     // binding symbols torch needs; they are never called in single-node
     // serving, so this is safe.
-    let mpi_cxx_shim = rocm_core::openmpi::ensure_mpi_cxx_compat(&compat_dir);
+    let mpi_cxx_shim = ensure_mpi_cxx_compat(&compat_dir);
     // PyTorch's `libc10.so` NEEDS the standard `libnuma.so.1` soname with the
     // upstream `libnuma_1.2` symbol version. TheRock bundles numa only under
     // the renamed soname `librocm_sysdeps_numa.so.1` whose versions are
@@ -1138,17 +1136,9 @@ mod tests {
     fn ensure_therock_compat_shims_writes_nothing_without_an_sdk_root() {
         // `python_executable` alone (no `sdk_root`) is the real shape of the
         // `ROCM_CLI_VLLM_PYTHON`/`VLLM_PYTHON` external-python runtime that
-        // `resolve_vllm_runtime` builds. `therock_library_path_entries_inner`
-        // never adds the compat dir to the loader path for this runtime kind
-        // either way (its own early return on `sdk_root.is_none()` discards
-        // any signal this function could produce), so a write here would be a
-        // pure, unwanted side effect with no effect on the launched process
-        // *if this function were ever called for that runtime shape* — its
-        // one current caller, `apply_therock_env`, already returns before
-        // reaching this call when `sdk_root` is absent, so this is exercising
-        // this `pub(crate)` function's own guard directly, not a path a
-        // launch can reach today. Kept so the function stays correct on its
-        // own terms independent of that caller.
+        // `resolve_vllm_runtime` builds. Exercises this `pub(crate)`
+        // function's own `sdk_root` guard directly, independent of whether
+        // any caller reaches it with that runtime shape.
         //
         // Whether a write would otherwise happen on this host (a stub
         // embedded at compile time, and no real `libmpi_cxx.so*` already
@@ -1176,7 +1166,7 @@ mod tests {
             rocm_sdk_version: None,
         };
 
-        let shim = ensure_therock_compat_shims(&runtime);
+        let shim = ensure_therock_compat_shims(&runtime, rocm_core::openmpi::ensure_mpi_cxx_compat);
 
         assert!(
             shim.is_none(),
