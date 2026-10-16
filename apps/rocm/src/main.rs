@@ -480,7 +480,7 @@ rocm model --verbose"
     /// post-launch notes (it still prints the pre-launch planning ones), and --verbose
     /// streams the traceback itself. It is never shown for a healthy or
     /// still-loading server, for a non-memory failure, or for a run that reused an
-    /// already-running server rather than launching one — read that server's own log with
+    /// already-running server rather than launching one; read that server's own log with
     /// `rocm services logs <service-id>`.
     #[command(after_help = "EXAMPLES:\n  \
 rocm serve qwen\n  \
