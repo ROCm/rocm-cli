@@ -788,11 +788,13 @@ jobs:
   # Windows counterpart to e2e-gpu-nightly-strix. Keep the PowerShell-native
   # setup aligned with e2e-selfhosted.yml's proven Strix Windows job while
   # opting into the same platform-adaptive @nightly large-model scenario as the
-  # Linux runner.
+  # Linux runner. Same DevLab Dispatch pool as e2e-wsl-nightly below and the
+  # per-PR e2e-gpu-strix-windows/e2e-wsl jobs in e2e-selfhosted.yml — there is
+  # no separate dedicated "native" Windows host registered for this anymore.
   e2e-gpu-nightly-strix-windows:
     name: E2E tests (Strix Halo, Windows, incl. nightly-only)
     timeout-minutes: 90
-    runs-on: [self-hosted, windows, strix-halo, native]
+    runs-on: [self-hosted, windows, devlab-dispatch, strix-halo]
     continue-on-error: true
     strategy:
       fail-fast: false
@@ -1004,8 +1006,9 @@ jobs:
         shell: powershell
         run: |
           # Install the shared runtime in place because its manifest contains
-          # absolute paths. The persistent runner workspace keeps those paths valid
-          # across scenarios and subsequent runs.
+          # absolute paths. On the ephemeral DevLab Dispatch pool this host is
+          # destroyed after the job, so the paths only need to stay valid for
+          # this run's scenarios, not across runs.
           $prewarm = "$env:RUNNER_WORKSPACE\e2e-prewarm-multi-arch-v2"
           $env:E2E_SHARED_RUNTIMES_DIR = "$prewarm\data\runtimes"
 
@@ -1013,9 +1016,10 @@ jobs:
           # isolate_env() derives HF_HOME/PIP_CACHE_DIR/ROCM_CLI_CACHE_DIR from
           # this per scenario. Without it every serve scenario here re-downloads
           # its model checkpoint cold, which raced serve-08's readiness timeout
-          # (EAI-8031 / #260) on every nightly run — this host was never actually
-          # warm for it, since Windows doesn't set HOME by default and the
-          # engine's cache lookup didn't fall back to USERPROFILE.
+          # (EAI-8031 / #260) on every nightly run — on the ephemeral pool there's
+          # no cache carried over from a prior job, so this is cold every
+          # scenario, and Windows doesn't set HOME by default so the engine's
+          # cache lookup didn't fall back to USERPROFILE either.
           $env:E2E_SHARED_CACHE_DIR = "$env:RUNNER_WORKSPACE\e2e-shared"
 
           # See the e2e-gpu lane in e2e-selfhosted.yml for why the
@@ -1043,12 +1047,11 @@ jobs:
 
   # WSL2 counterpart to e2e-gpu-nightly-strix: an Ubuntu-24.04 distro installed
   # fresh inside WSL2 on a DevLab Dispatch pool Windows host — the same pool
-  # the per-PR `e2e-gpu-strix-windows`/`e2e-wsl` jobs use, not a separate
-  # `wsl`-labeled runner and not the `native` host e2e-gpu-nightly-strix-windows
-  # still runs on. Mirrors the per-PR `e2e-wsl` lane in e2e-selfhosted.yml step
-  # for step (see that job's header comment for the pool maintainer's
-  # sign-off), opting into the same @nightly large-model scenario as the other
-  # nightly lanes.
+  # `e2e-gpu-nightly-strix-windows` above and the per-PR `e2e-gpu-strix-windows`/
+  # `e2e-wsl` jobs use, not a separate `wsl`-labeled runner. Mirrors the per-PR
+  # `e2e-wsl` lane in e2e-selfhosted.yml step for step (see that job's header
+  # comment for the pool maintainer's sign-off), opting into the same @nightly
+  # large-model scenario as the other nightly lanes.
   e2e-wsl-nightly:
     name: E2E tests (Strix Halo, WSL2, incl. nightly-only)
     # See e2e-wsl in e2e-selfhosted.yml: every job here is cold (fresh distro,

@@ -51,7 +51,7 @@ pub(crate) fn examine_remote(
 fn parse_examination(json: &str) -> Result<Examination> {
     serde_json::from_str::<Examination>(json.trim()).context(
         "could not understand the remote machine's system state. The remote CLI is \
-         probably a different version than this one — update whichever is older.",
+         probably a different version than this one - update whichever is older.",
     )
 }
 

@@ -216,7 +216,7 @@ Expected result:
   card, a run that succeeds and installs for that card is a regression — the
   named target must not be silently replaced.
 
-On a Ryzen 4000 or 5000 machine whose Vega iGPU is the only GPU, two further
+On a Ryzen 4000 or 5000 machine whose Vega iGPU is the only GPU, four further
 checks, which cannot be made anywhere else:
 
 - `rocm examine` shows `detected_gfx_target: gfx90c` with an empty
@@ -226,10 +226,29 @@ checks, which cannot be made anywhere else:
   regressed.
 - A plain `rocm install sdk`, with no `--family`, gives the same refusal with
   the wording for a *detected* GPU rather than a requested one.
+- `rocm diagnose` reports `info-20-gpu-no-rocm-support`, naming `gfx90c` and
+  saying Vulkan-based engines still work, with a `DIAGNOSE-ONLY` /
+  `no reliable fix` flag and an `apply with: rocm fix info-20-gpu-no-rocm-support`
+  line. **`fix-13-hip-sdk-missing` ("HIP SDK not installed") must not be the
+  top-ranked cause, and on a host with no HIP-built framework must not appear
+  at all** — telling this user to download the HIP SDK is the regression
+  ROCMAI-546 removed, and the download would not have helped. On **Windows**
+  this is the only place the check can be made: `check_13_hip_sdk_missing`
+  returns early on every non-Windows host, so the Linux e2e lane (`diagnose-40`)
+  cannot distinguish a working gate from a deleted one.
+- `rocm fix info-20-gpu-no-rocm-support --yes` exits 0, prints "This problem has
+  no reliable fix, so this command changes nothing", and does **not** print
+  "Copy the commands above". Anything installed, downloaded or written by that
+  command is a regression.
 
 On Windows, a hybrid laptop with both the Vega iGPU and a discrete card must
 still report the discrete card from `rocm examine`; the iGPU is listed first by
-WMI and must not hide it.
+WMI and must not hide it. With a HIP SDK installed, check the per-GPU targets
+rather than only the list: each card must carry its own `gfx_target`, and a
+discrete card reported as `gfx1035` with `is_apu: true` means the `hipInfo`
+fallback paired an architecture line with the wrong GPU. On that machine
+`rocm diagnose` must **not** report `info-20-gpu-no-rocm-support` at all — the
+discrete card does have ROCm support, so the whole-machine claim is false.
 
 ## 2b. Bare-Metal Driver Install
 
@@ -269,7 +288,7 @@ the update, restart Lemonade and repeat the serve command above.
 While the log stream is attached, verify detach and stop behave differently:
 
 - Press `Ctrl+D`. The stream ends and the shell prompt returns, printing a
-  "detached — server still running" note with the service id. Confirm the server
+  "detached - server still running" note with the service id. Confirm the server
   is still up: `rocm services` lists it and the endpoint still answers a chat
   request. Stop it afterward with `rocm services stop <service-id> --yes`.
 - Re-run the serve command and press `Ctrl+C` instead. The server shuts down and
@@ -507,6 +526,63 @@ Expected result:
   and reports that nothing would be removed. That is the only thing a preview
   writes.
 
+With a model still managed-serving (`rocm serve --managed ...`), open the
+dashboard or the pre-dashboard launcher and press `q` (or the Esc menu's
+`Quit` row, or `/quit` from chat):
+
+```powershell
+rocm dash
+rocm
+```
+
+Expected result:
+
+- A prompt appears naming the serving model and warning that it may
+  still be running in the background after you quit, with the real
+  `rocm services stop <service-id> --yes` command (the actual id, not a
+  placeholder) to stop it first. From the dashboard (not the launcher) on a
+  host where its own daemon client never connects (Windows, for the whole
+  session), the prompt still shows that same stop command and the service
+  id, but not the model's name — the dashboard's own live view is where the
+  name comes from, and it never fills there. The launcher's own copy of the
+  prompt always names the model, Windows included — it reads the
+  managed-service registry directly rather than through the dashboard's
+  daemon connection.
+- From the dashboard (not the launcher), the prompt also offers `s`: pressing
+  it closes the prompt and opens the Services overlay, pre-focused on the
+  serving model, so you can stop it there through the overlay's own
+  approval+job flow. The launcher's copy of the prompt does not show this
+  hint or respond to `s` — it has no live Services overlay to jump to — and
+  neither does the dashboard on Windows, for the same reason the model's name
+  is missing there.
+- Declining (`n`/Esc) returns to where you were — the dashboard, or the
+  launcher's own front door, whichever you pressed `q` from. Any plain modal
+  that was open when you pressed `q` (the Esc menu, Options, Detail, Theme
+  Picker, Help, …) is closed along with the prompt, not restored. A manager
+  overlay (Services, the Serve wizard, …) can never be the thing that was
+  open in this state at all: its own `q` closes that overlay first, so the
+  prompt only ever opens with none of them open.
+- Confirming (`y`/Enter) exits immediately, and `rocm services list --all`
+  afterward still shows the model as `ready`/`running` — quitting never
+  stops it.
+- With nothing being served, `q` exits immediately with no prompt, same as
+  before this behavior existed.
+
+Now reach the same dashboard FROM the launcher instead (`rocm` → `Open full
+dashboard →`), with the same model still managed-serving, and press `q` inside
+that escalated session:
+
+Expected result:
+
+- No prompt appears here — this inner session's own `q` returns straight to
+  the launcher's front-door menu. The launcher's own `q` (pressed again, at
+  that menu) is what asks "May still be serving — quit anyway?", with a fresh,
+  on-disk read of the registry backing that decision. Approving it there is
+  what actually exits the process. Seeing the prompt twice for one quit
+  decision — once inside the dashboard, once more at the launcher, with the
+  first one's "yes" not actually exiting anything — is the bug this fixes
+  (issue #145).
+
 ## 5. ComfyUI Verification
 
 ComfyUI is managed as an app surface. It should start a local web server and
@@ -634,3 +710,27 @@ To turn provider-assisted planning back off:
 ```powershell
 rocm config clear-planner-provider
 ```
+
+## 8. Uninstall
+
+Run this last, on a machine installed with the release installer (not a
+`cargo` build, whose binaries uninstall leaves alone):
+
+```powershell
+rocm uninstall --dry-run
+rocm uninstall
+```
+
+Expected result:
+
+- The dry run lists the binaries (on Windows, `rocm.exe` is marked as deleted
+  as the command exits) and, under
+  `PATH changes from the installer that would be undone:`, the shell profile
+  (Linux) or the user `PATH` entry (Windows). It removes nothing.
+- After confirming, the install folder holds no `rocm`/`rocmd` files, and a new
+  terminal no longer gets the install folder on `PATH` from the installer's
+  change.
+- If another program lives in the install folder, the review instead says
+  `PATH change left in place` and names it, and the `PATH` change stays.
+- With `rocm uninstall --keep-binaries`, the review says the `PATH` change
+  stays too, and it does.

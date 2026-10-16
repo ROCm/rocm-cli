@@ -2297,6 +2297,8 @@ fn child_path_string(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use crate::chat;
     use rocm_core::{runtime_python_executable_in_env, runtime_rocm_library_filename};
     use std::net::TcpListener;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -4285,7 +4287,7 @@ mod tests {
         // The summary the assistant answers with after a status tool call
         // passes the note on too.
         // Another tool's output ahead of it in the same text keeps its notes.
-        let summary = crate::deterministic_comfyui_tool_summary(&format!(
+        let summary = chat::deterministic_comfyui_tool_summary(&format!(
             "Engines\n  note: another tool's note\n\n{status}"
         ))
         .context("a status summary")?;
@@ -4308,7 +4310,7 @@ mod tests {
         let answer = render_chat_status_answer(&paths)?;
         assert!(!answer.contains("interrupted"), "{answer}");
         assert!(answer.contains("run `rocm comfyui start`"), "{answer}");
-        let summary = crate::deterministic_comfyui_tool_summary(&render_status(&paths, &config)?)
+        let summary = chat::deterministic_comfyui_tool_summary(&render_status(&paths, &config)?)
             .context("a status summary")?;
         assert!(!summary.contains("Note:"), "{summary}");
         assert!(render_status(&paths, &config)?.contains("next step: rocm comfyui start"));
@@ -4663,7 +4665,7 @@ mod tests {
         // sums that up as its running state, not as a note.
         assert!(status.contains("  note: starting\n"), "{status}");
         let summary =
-            crate::deterministic_comfyui_tool_summary(&status).context("a status summary")?;
+            chat::deterministic_comfyui_tool_summary(&status).context("a status summary")?;
         assert!(summary.contains("  Running: starting."), "{summary}");
         assert!(!summary.contains("Note:"), "{summary}");
         assert!(!answer.contains("URL:"), "{answer}");
@@ -4920,6 +4922,19 @@ mod archive_properties {
                 .name,
                 name,
                 "name {} was moved",
+                String::from_utf8_lossy(name)
+            );
+            // An absolute-named symlink is left whole: its relative target
+            // does not gain the `../` a moved link gets.
+            let link = moved_one_level_down(Entry {
+                name: name.to_vec(),
+                kind: Kind::Symlink(b"t".to_vec()),
+                mode: 0o777,
+            });
+            assert_eq!(link.name, name, "name {}", String::from_utf8_lossy(name));
+            assert!(
+                matches!(&link.kind, Kind::Symlink(t) if t == b"t"),
+                "target of {} was rewritten",
                 String::from_utf8_lossy(name)
             );
         }

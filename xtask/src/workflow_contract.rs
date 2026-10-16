@@ -866,32 +866,35 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
         }
     }
 
-    /// The nightly WSL lane's `runs-on` must track the per-PR lane's, byte for
-    /// byte: both jobs claim to run on the same DevLab Dispatch pool host
-    /// (`e2e-wsl-nightly`'s header comment, docs/ci-hardware-testing.md), and
-    /// nothing else pins that claim -- reverting `e2e-wsl-nightly` to its old
-    /// static `[self-hosted, linux, strix-halo, wsl]` labels (its pre-migration
-    /// runs-on; `native` never applied to this job, only to the two
-    /// `e2e-gpu-nightly-strix*` lanes) would leave every other assertion in
-    /// this file green while the doc and the comment both quietly went false
-    /// again.
+    /// Each nightly DevLab Dispatch lane's `runs-on` must track its per-PR
+    /// counterpart's, byte for byte: both jobs in each pair claim to run on
+    /// the same pool host (the nightly job's header comment,
+    /// docs/ci-hardware-testing.md), and nothing else pins that claim --
+    /// reverting a nightly job to its old static `native`/`wsl` labels would
+    /// leave every other assertion in this file green while the doc and the
+    /// comment both quietly went false again.
     #[test]
-    fn nightly_wsl_lane_shares_the_per_pr_pool_labels() {
+    fn nightly_devlab_dispatch_lanes_share_the_per_pr_pool_labels() {
         let sh = read_workflow("e2e-selfhosted.yml");
         let nightly = read_workflow("nightly.yml");
-        let per_pr = runs_on_values(job_block(&sh, "e2e-wsl"));
-        let nightly_wsl = runs_on_values(job_block(&nightly, "e2e-wsl-nightly"));
-        assert!(!per_pr.is_empty(), "e2e-wsl declares a runs-on");
-        assert!(
-            per_pr.iter().any(|value| value.contains("devlab-dispatch")),
-            "e2e-wsl must actually be on the DevLab Dispatch pool, not just equal to \
-             nightly's (equal-and-empty would pass the assertion below): {per_pr:?}"
-        );
-        assert_eq!(
-            per_pr, nightly_wsl,
-            "e2e-wsl-nightly's runs-on must match e2e-wsl's exactly -- both are documented as \
-             the same DevLab Dispatch pool"
-        );
+        for (per_pr_job, nightly_job) in [
+            ("e2e-wsl", "e2e-wsl-nightly"),
+            ("e2e-gpu-strix-windows", "e2e-gpu-nightly-strix-windows"),
+        ] {
+            let per_pr = runs_on_values(job_block(&sh, per_pr_job));
+            let nightly_values = runs_on_values(job_block(&nightly, nightly_job));
+            assert!(!per_pr.is_empty(), "{per_pr_job} declares a runs-on");
+            assert!(
+                per_pr.iter().any(|value| value.contains("devlab-dispatch")),
+                "{per_pr_job} must actually be on the DevLab Dispatch pool, not just equal to \
+                 {nightly_job}'s (equal-and-empty would pass the assertion below): {per_pr:?}"
+            );
+            assert_eq!(
+                per_pr, nightly_values,
+                "{nightly_job}'s runs-on must match {per_pr_job}'s exactly -- both are \
+                 documented as the same DevLab Dispatch pool"
+            );
+        }
     }
 
     #[test]
@@ -1076,20 +1079,45 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
 
     /// The report artifact a lane's upload step names (`name: e2e-*-report`).
     fn uploaded_report_artifact(workflow: &str, text: &str, job: &str) -> String {
-        let names: Vec<&str> = job_block(text, job)
-            .lines()
-            .filter_map(|line| line.trim().strip_prefix("name: "))
-            .filter(|name| name.starts_with("e2e-") && name.ends_with("-report"))
-            .collect();
-        assert_eq!(
-            names.len(),
-            1,
-            "{workflow} job `{job}` should upload exactly one `e2e-*-report` artifact, \
-             found {names:?}"
-        );
+        // A lane with an `sdk_version` matrix (ROCMAI-430) uploads one artifact
+        // per leg, each behind its own mutually exclusive `if:` — pair every
+        // artifact name with the `if:` directly above it in the same step, then
+        // pick the `current` leg to stand for the whole lane, the same way a
+        // channel axis below is checked through its `release` leg.
+        let mut last_if: Option<&str> = None;
+        let mut candidates: Vec<(&str, Option<&str>)> = Vec::new();
+        for line in job_block(text, job).lines() {
+            let trimmed = line.trim();
+            if let Some(cond) = trimmed.strip_prefix("if: ") {
+                last_if = Some(cond);
+            } else if let Some(name) = trimmed.strip_prefix("name: ")
+                && name.starts_with("e2e-")
+                && name.ends_with("-report")
+            {
+                candidates.push((name, last_if));
+            }
+        }
+        let chosen = match candidates.as_slice() {
+            [(name, _)] => *name,
+            _ => {
+                candidates
+                    .iter()
+                    .find(|(_, cond)| {
+                        cond.is_some_and(|c| c.contains("matrix.sdk_version == 'current'"))
+                    })
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "{workflow} job `{job}` should upload exactly one `e2e-*-report` \
+                             artifact, or one `current`-leg one among an sdk_version matrix, \
+                             found {candidates:?}"
+                        )
+                    })
+                    .0
+            }
+        };
         // The report job has no `matrix` context, so a lane with a channel axis is
         // checked through its `release` leg, which stands for the whole lane.
-        names[0].replace("${{ matrix.channel }}", "release")
+        chosen.replace("${{ matrix.channel }}", "release")
     }
 
     #[test]
@@ -3364,7 +3392,8 @@ fi
             String::from_utf8_lossy(&out.stdout).into_owned()
         };
 
-        let empty = e2e_report::consolidated_summary_markdown_from_reports(&[], &[]);
+        let empty =
+            e2e_report::consolidated_summary_markdown(&e2e_report::load_platform_reports(&[]));
         assert!(
             !run(&empty).contains("REACHED_PUBLISH"),
             "the generator's empty output must stop the publish"
@@ -3637,29 +3666,29 @@ fi
     #[test]
     fn workflows_use_distinct_concurrency_groups() {
         // Isolation comes from the group KEY differing per workflow. Extract the
-        // actual concurrency.group value from each and assert (a) both keep
-        // supersession, (b) both key on github.workflow, and (c) the two group
-        // expressions and workflow names differ — so at runtime the groups are
+        // actual concurrency.group value from each and assert (a) ci.yml keeps
+        // supersession (e2e-selfhosted.yml scopes it to pull_request, see
+        // `self_hosted_supersession_is_scoped_to_pull_requests`), (b) both key on
+        // github.workflow, and (c) the two group expressions and workflow names differ — so at runtime the groups are
         // distinct and an offline-runner stall in one can't hold the other.
         let ci = read_workflow("ci.yml");
         let sh = read_workflow("e2e-selfhosted.yml");
         let ci_group = concurrency_group(&ci);
         let sh_group = concurrency_group(&sh);
 
-        for (label, group, text) in [
-            ("ci.yml", &ci_group, &ci),
-            ("e2e-selfhosted.yml", &sh_group, &sh),
-        ] {
+        for (label, group) in [("ci.yml", &ci_group), ("e2e-selfhosted.yml", &sh_group)] {
             assert!(
                 group.contains("github.workflow"),
                 "{label} concurrency.group must be namespaced by github.workflow \
                  (got `{group}`) (EAI-7548)"
             );
-            assert!(
-                text.contains("cancel-in-progress: true"),
-                "{label} must keep cancel-in-progress: true (EAI-7548)"
-            );
         }
+        // Both keep supersession; e2e-selfhosted.yml narrows it to pull_request
+        // (see `self_hosted_supersession_is_scoped_to_pull_requests`).
+        assert!(
+            ci.contains("cancel-in-progress: true"),
+            "ci.yml must keep cancel-in-progress: true"
+        );
         // The github.workflow-keyed groups resolve via the workflow `name:`; those
         // names must differ for the runtime groups to be distinct.
         assert_ne!(
@@ -4430,6 +4459,114 @@ jobs:
             flattened_list_items("[self-hosted, windows, strix-halo]"),
             "the two sequence spellings must compare equal"
         );
+    }
+
+    /// Extract the top-level `concurrency.cancel-in-progress` value.
+    fn concurrency_cancel_in_progress(text: &str) -> String {
+        top_level_block(text, "concurrency")
+            .lines()
+            .map(strip_comment)
+            .find_map(|line| line.trim().strip_prefix("cancel-in-progress:"))
+            .map(|value| value.trim().to_owned())
+            .expect("concurrency block has a cancel-in-progress: key")
+    }
+
+    #[test]
+    fn self_hosted_supersession_is_scoped_to_pull_requests() {
+        // With one runner per GPU class, a superseded PR run left in the queue
+        // delays every run behind it, so a new push must cancel the PR's older
+        // run. The same must NOT hold for the other triggers: a push or a
+        // merge_group run records a commit that landed, and a dispatch is
+        // deliberate, so none may cancel another or share a group with a PR run.
+        let sh = read_workflow("e2e-selfhosted.yml");
+        let group = concurrency_group(&sh);
+        assert!(
+            group.contains("${{ github.workflow }}-${{ github.event_name }}-"),
+            "the group must carry the event name so runs of different triggers never \
+             share a group (got `{group}`)"
+        );
+        // The key is an `A && x || B && y || z` chain, so the ORDER of the arms
+        // decides behaviour (`format()` is always truthy: moved first, it would
+        // give every PR run a unique group and silently stop supersession).
+        // Pin the whole expression, not each arm, so a reorder fails.
+        // PR number: a new push to the PR supersedes its older run. Dispatch:
+        // unique per run. Ref AND commit for everything else: GitHub replaces a
+        // still-pending run in a shared group even with cancel-in-progress off,
+        // so a ref-only key would let a second push to `main` drop the first.
+        assert_eq!(
+            normalized_whitespace(&group).trim_start_matches(">- "),
+            "${{ github.workflow }}-${{ github.event_name }}-${{ \
+             github.event_name == 'pull_request' && github.event.pull_request.number \
+             || github.event_name == 'workflow_dispatch' && github.run_id \
+             || format('{0}-{1}', github.ref, github.sha) }}",
+            "the concurrency group must be exactly: event name, then PR number \
+             (pull_request), run id (workflow_dispatch), ref and commit (all else), \
+             in that order"
+        );
+        assert_eq!(
+            concurrency_cancel_in_progress(&sh),
+            "${{ github.event_name == 'pull_request' }}",
+            "only pull_request runs may be cancelled by a newer run"
+        );
+    }
+
+    #[test]
+    fn mi300x_lane_is_skipped_in_the_merge_queue() {
+        // The MI300X check is not required for merging, so a merge_group run's
+        // job is never waited for and, behind a single runner, outlives the PR it
+        // was queued for. The other lanes are unaffected.
+        let sh = read_workflow("e2e-selfhosted.yml");
+        // The sibling lanes' "keep running in the queue" check below is vacuous
+        // if the workflow stops triggering on merge_group at all.
+        let triggers = normalized_whitespace(
+            &top_level_block(&sh, "on")
+                .lines()
+                .map(strip_comment)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        assert!(
+            triggers.contains("merge_group: branches: [main] types: [checks_requested]"),
+            "e2e-selfhosted.yml must still trigger on merge_group (checks_requested on main) \
+             so the lanes that stay in the merge queue actually run (got `{triggers}`)"
+        );
+        let gate = |job: &str| {
+            let block = job_block(&sh, job);
+            let start = block
+                .find("    if: >-\n")
+                .unwrap_or_else(|| panic!("`{job}` has a folded `if:` gate"));
+            block[start..]
+                .lines()
+                .skip(1)
+                .take_while(|line| indent_of(line) > 4)
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        assert!(
+            normalized_whitespace(&gate("e2e-gpu")).starts_with(
+                "always() && needs.changes.result == 'success' \
+                 && github.event_name != 'merge_group' && ("
+            ),
+            "e2e-gpu (MI300X) must not run on merge_group events"
+        );
+        assert!(
+            !job_block(&sh, "e2e-gpu").contains("E2E_MERGE_QUEUE"),
+            "e2e-gpu never runs in the merge queue, so it must not opt into @merge-queue scenarios"
+        );
+        for job in [
+            "e2e-gpu-strix-ubuntu",
+            "e2e-gpu-strix-windows",
+            "e2e-wsl",
+            "e2e-gpu-w7900",
+        ] {
+            // Only the dispatch split may look at the event: any other event
+            // condition could silently keep the lane out of the merge queue.
+            let gate = normalized_whitespace(&gate(job));
+            assert!(
+                !gate.contains("merge_group") && !gate.contains("'pull_request'"),
+                "`{job}` must keep running in the merge queue (gate: `{gate}`)"
+            );
+        }
     }
 
     #[test]

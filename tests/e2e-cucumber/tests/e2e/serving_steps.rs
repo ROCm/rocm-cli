@@ -744,6 +744,12 @@ async fn user_lists_services(world: &mut E2eWorld) {
     world.cli_output = Some(stdout);
 }
 
+#[when("the user lists recommended models")]
+async fn user_lists_recommended_models(world: &mut E2eWorld) {
+    let stdout = crate::run_rocm_ok(world, &["model"]);
+    world.cli_output = Some(stdout);
+}
+
 #[when("the user serves a model without specifying an engine")]
 async fn user_serves_default_engine(world: &mut E2eWorld) {
     // This scenario tests automatic *engine selection* — a platform-agnostic
@@ -1302,6 +1308,20 @@ async fn assert_full_model_name(world: &mut E2eWorld) {
     assert!(
         resolved.contains('/'),
         "expected a fully qualified model name (org/model), got '{resolved}'\n\nfull output:\n{output}"
+    );
+}
+
+#[then("the model list output contains only ASCII characters")]
+async fn assert_model_list_is_ascii(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no CLI output");
+    assert!(
+        output.contains("Recommended models"),
+        "expected the `rocm model` header to be present, got:\n{output}"
+    );
+    assert!(
+        output.is_ascii(),
+        "rocm model output must be ASCII-only; non-ASCII punctuation renders as \
+         mojibake on a Windows console using the OEM code page (ROCMAI-543): {output}"
     );
 }
 

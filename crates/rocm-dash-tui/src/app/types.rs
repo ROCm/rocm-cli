@@ -37,6 +37,24 @@ pub struct ResolvedArgs {
     /// exit back to the launcher when the overlay is closed at its root. `None`
     /// (the default) is the normal full dashboard — every path stays unchanged.
     pub focus: Option<Focus>,
+    /// `true` when this session was opened FROM the pre-dashboard launcher
+    /// (`apps/rocm::dash::run_launcher`'s own loop — `LauncherRoute::Dashboard`
+    /// / `LauncherRoute::Chat`), which outlives this session and redraws its
+    /// own menu once it returns. The launcher's own `q`/Esc already shares
+    /// this session's quit-confirm gate (`request_quit`), backed by a fresh
+    /// registry read taken at the top of that menu pass (not a frozen,
+    /// launch-time snapshot — issue #145; see `ui::launcher::launcher_state`'s
+    /// doc comment for why that one read is a `StaticManagedRegistrySnapshot`
+    /// rather than the dashboard's own continuously-live probe), so it is the
+    /// one that actually governs process exit when `true`. This
+    /// session's own `q`/Esc/`/quit`/`/exit`/Esc-menu Quit row must then skip
+    /// its own confirm and exit immediately — otherwise it asks "May still be
+    /// serving — quit anyway?", the user says yes, control returns to the
+    /// launcher loop, and the launcher immediately asks the exact same
+    /// question again on its OWN next `q` — a prompt whose "yes" didn't
+    /// actually exit anything. `false` for a directly-launched `rocm dash` /
+    /// `rocm chat`, which owns its own quit decision outright.
+    pub launcher_hosted: bool,
     /// Chat endpoint base URL, CLI-flag value already merged over config.
     pub chat_url: Option<String>,
     /// Chat model, CLI-flag value already merged over config.
@@ -99,6 +117,32 @@ pub struct ResolvedArgs {
     /// a host whose servers had all failed showed an empty overlay and no sign
     /// that any record existed. 0 when there are none.
     pub services_past_attempts: usize,
+    /// Bin-injected live registry-read seam (issue #145): whether anything is
+    /// currently serving, and which ids a `rocm services stop <id> --yes` can
+    /// actually reach. Read live, at the moment `AppState::has_live_instance`
+    /// / `has_stoppable_managed_instance_with` / `ui::quit_confirm_body_with`
+    /// actually need an answer — never a one-shot snapshot frozen at launch
+    /// the way `services_past_attempts` is. A host whose dashboard-embedded
+    /// daemon client never connects at all (Windows) gets a correct "is
+    /// anything live" answer from this for the entire session rather than
+    /// only a launch-time guess (`has_live_instance`'s own doc comment). On a
+    /// host where the daemon does connect, a model started mid-session (e.g.
+    /// via the Serve wizard) is reflected the next time the *stop-command* or
+    /// `s`-gating questions are consulted — `has_stoppable_managed_instance_with`
+    /// and `quit_confirm_open_services_key` always read this live — but NOT
+    /// the next time "is anything serving" itself is asked: once a real
+    /// daemon snapshot has landed, `has_live_instance_with` stops consulting
+    /// this field for that question and trusts `instances` alone (its own doc
+    /// comment explains why). Injected `Some` on
+    /// every bin path, including `--demo`/`--replay`/`--chat-mock` — this is
+    /// never `None`. `--demo`/`--replay` are made safe by
+    /// `AppState::simulated` short-circuiting `has_live_instance` before
+    /// this is ever consulted; `--chat-mock` is NOT `simulated` (it mocks
+    /// only the chat completion backend, not instance state) and
+    /// deliberately IS live-read, so quitting while a real managed model
+    /// serves still warns (see dash-29). See
+    /// `registry_probe::ManagedRegistryProbe`.
+    pub managed_registry_probe: Option<crate::registry_probe::SharedManagedRegistryProbe>,
 }
 
 impl ResolvedArgs {

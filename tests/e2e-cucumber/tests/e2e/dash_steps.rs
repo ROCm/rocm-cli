@@ -12,7 +12,7 @@ use e2e_cucumber::mock_server::{MetricsMode, MockServer, ServiceRecordOptions};
 use std::time::{Duration, Instant};
 
 use crate::E2eWorld;
-use crate::e2e::tui_driver::{TermSignal, TuiSession, default_timeout};
+use crate::e2e::tui_driver::{QUIT_CONFIRM_MARKER, TermSignal, TuiSession, default_timeout};
 /// The exact prompt `send_managed_model_message` types, and the string the
 /// corresponding `Then` step (`managed_chat_request_carried_prompt`) asserts
 /// the mock actually received — so the two can never silently drift apart.
@@ -103,6 +103,46 @@ async fn running_managed_model(world: &mut E2eWorld) {
     setup_managed_model(world, ServiceRecordOptions::default(), false).await;
 }
 
+/// Re-point "e2e-mock"'s `supervisor_pid`/`engine_pid` at a disposable `sleep`
+/// child instead of this harness's own PID. `register_mock_service_with`
+/// always points those fields at the harness process, which is fine for a
+/// scenario that only ever reads the record — but `dash-28` goes on to run the
+/// literal `rocm services stop e2e-mock --yes` the prompt prints, and that
+/// command signals whatever PID the record names. Without this step it
+/// signals the cucumber harness itself (SIGTERM, `KillScope::Tree`).
+///
+/// Writes the child's own start-time token (`supervisor_start_ticks`)
+/// alongside its pid, the same pair a real launch path writes, so the stop
+/// exercises `identity_state`'s start-time-verified match rather than the
+/// `(None, _) => Matches` best-effort arm a record with no token falls back
+/// to.
+#[given("the managed model's record points at a disposable process")]
+async fn managed_model_record_points_at_disposable_process(world: &mut E2eWorld) {
+    let child = std::process::Command::new("sleep")
+        .arg("300")
+        .spawn()
+        .expect("failed to spawn disposable process for dash-28's stop-command step");
+    let pid = child.id();
+    let supervisor_start_ticks = rocm_core::process_start_ticks(pid);
+    world.recorded_process = Some(child);
+
+    let root = world.isolated_root.as_ref().expect("no isolated root");
+    let services_dir = root.path().join("data").join("services");
+    let model = world.model_name.as_deref().expect("no model name set");
+    let port = world.mock.as_ref().expect("no mock server running").port();
+    e2e_cucumber::mock_server::write_service_record_with(
+        &services_dir,
+        model,
+        port,
+        ServiceRecordOptions {
+            supervisor_pid: pid,
+            engine_pid: Some(pid),
+            supervisor_start_ticks,
+            ..ServiceRecordOptions::default()
+        },
+    );
+}
+
 // ── When ───────────────────────────────────────────────────────────
 
 #[when("the user replays a recording that does not exist")]
@@ -131,6 +171,37 @@ async fn open_dashboard_demo(world: &mut E2eWorld) {
     // populates with no GPU and no daemon — a stable, mock-tier target.
     let session = TuiSession::spawn(world, &["dash", "--demo"])
         .unwrap_or_else(|e| panic!("failed to open the dashboard: {e}"));
+    world.tui = Some(session);
+}
+
+/// The name of a child directory `dash-25` plants under the scenario's cwd;
+/// `existing_folder_browser_shows_scenario_folder` asserts the browser lists
+/// it by this fixed, short label rather than its full path — the browser's
+/// entry list labels children by `file_name()` alone (`build_entries` in
+/// `folder_browser.rs`), so this stays robust however long the host's own
+/// temp directory is, unlike the browser's *header* line, which renders
+/// `current_dir` verbatim in an unwrapped `Paragraph` and would silently
+/// clip (and falsely fail this scenario) on a long enough temp path. The
+/// space in the name is explained in dash-25's scenario comment.
+const ADOPT_SCENARIO_CHILD: &str = "adopt me";
+
+#[when("the user opens the dashboard in a scenario-owned folder")]
+async fn open_dashboard_in_scenario_folder(world: &mut E2eWorld) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .to_path_buf();
+    let child = root.join(ADOPT_SCENARIO_CHILD);
+    std::fs::create_dir_all(&child).unwrap_or_else(|e| {
+        panic!(
+            "failed to create scenario-owned folder {}: {e}",
+            child.display()
+        )
+    });
+    let session = TuiSession::spawn_in(world, &["dash", "--demo"], &root)
+        .unwrap_or_else(|e| panic!("failed to open the dashboard in {}: {e}", root.display()));
     world.tui = Some(session);
 }
 
@@ -417,6 +488,15 @@ async fn choose_install_rocm_sdk(world: &mut E2eWorld) {
         .unwrap_or_else(|e| panic!("failed to choose Install ROCm SDK: {e}"));
 }
 
+#[when("the user chooses to adopt an existing folder")]
+async fn choose_adopt_existing_folder(world: &mut E2eWorld) {
+    // "Adopt an existing ROCm folder" is the choose-menu's second entry, one
+    // `Down` past the default "Install ROCm SDK (pip)".
+    session(world)
+        .send("j\r")
+        .unwrap_or_else(|e| panic!("failed to choose Adopt an existing folder: {e}"));
+}
+
 #[when("the user browses for an install folder")]
 async fn browse_for_install_folder(world: &mut E2eWorld) {
     session(world)
@@ -434,16 +514,63 @@ async fn choose_current_folder(world: &mut E2eWorld) {
 
 #[when("the user closes onboarding setup")]
 async fn close_onboarding_setup(world: &mut E2eWorld) {
-    // Two `Esc`: the first backs Configure out to Choose, the second closes
-    // the wizard entirely — it owns every key while open (see
-    // `draw_onboarding`'s doc comment), so `q` cannot reach the dashboard
-    // until it is gone.
+    // Two `Esc`: the first backs out of whichever sub-view currently has
+    // focus — the SDK Configure channel/pin sub-view (reached via Install
+    // SDK; its own folder browser, opened with `Tab`, is always closed by
+    // the time this step runs, as in dash-23) or the Adopt-path's own folder
+    // browser — the second closes the wizard entirely; it owns every key
+    // while open (see `draw_onboarding`'s doc comment), so `q` cannot reach
+    // the dashboard until it is gone. Each sub-view leaves its own marker on
+    // screen (the Configure sub-view's "Tab browse folder" footer hint, or
+    // the Adopt browser's own popup title); wait for one of them to actually
+    // render — a single snapshot can race a step immediately before this
+    // one that is still mid-repaint — then wait for that marker to clear
+    // before the second `Esc`, or the two `Esc` bytes can land in the same
+    // PTY read and coalesce into one `KeyCode::Esc` (crossterm reads
+    // back-to-back ESC bytes as a single Esc key), which only backs out of
+    // the sub-view and leaves the wizard open. Configure's own folder
+    // browser ("Pick an install folder") is rejected outright rather than
+    // silently waited past: closing it is the caller's job, not this
+    // step's, so seeing it here means a scenario called this step too
+    // early.
+    const CONFIGURE_FOOTER: &str = "Tab browse folder";
+    const ADOPT_BROWSER_TITLE: &str = "Pick an existing ROCm folder";
+    const CONFIGURE_BROWSER_TITLE: &str = "Pick an install folder";
     let tui = session(world);
+    // Recorded from inside the predicate below, not re-read from a second
+    // `screen_text()` call afterward — the screen can keep moving between
+    // the predicate matching and a later read, so only the frame the
+    // predicate actually saw can be trusted to name which marker matched.
+    let mut open_sub_view_marker: Option<&'static str> = None;
+    tui.wait_for_screen_where(
+        &format!("{CONFIGURE_FOOTER:?} or {ADOPT_BROWSER_TITLE:?} to appear"),
+        |screen| {
+            assert!(
+                !screen.contains(CONFIGURE_BROWSER_TITLE),
+                "the install-folder browser is still open; close it before calling this step:\n{screen}"
+            );
+            open_sub_view_marker = if screen.contains(ADOPT_BROWSER_TITLE) {
+                Some(ADOPT_BROWSER_TITLE)
+            } else if screen.contains(CONFIGURE_FOOTER) {
+                Some(CONFIGURE_FOOTER)
+            } else {
+                None
+            };
+            open_sub_view_marker.is_some()
+        },
+        default_timeout(),
+    )
+    .await
+    .unwrap_or_else(|e| {
+        panic!("no sub-view is open, so there is nothing to close before the wizard itself: {e}")
+    });
+    let open_sub_view_marker =
+        open_sub_view_marker.expect("wait_for_screen_where succeeded without recording a marker");
     tui.send("\u{1b}")
-        .unwrap_or_else(|e| panic!("failed to leave Configure: {e}"));
-    tui.wait_until_gone("Tab browse folder", default_timeout())
+        .unwrap_or_else(|e| panic!("failed to leave the open sub-view: {e}"));
+    tui.wait_until_gone(open_sub_view_marker, default_timeout())
         .await
-        .unwrap_or_else(|e| panic!("Configure sub-view did not close: {e}"));
+        .unwrap_or_else(|e| panic!("sub-view did not close: {e}"));
     tui.send("\u{1b}")
         .unwrap_or_else(|e| panic!("failed to close onboarding: {e}"));
     tui.wait_until_gone("Welcome to ROCm — first-run setup", default_timeout())
@@ -494,6 +621,28 @@ async fn send_gpu_message(world: &mut E2eWorld) {
         .unwrap_or_else(|e| panic!("failed to submit the chat message: {e}"));
 }
 
+/// Counterpart of `send_gpu_message` for a chat input that is already
+/// focused — `dash-29`'s `/quit`-then-decline round trip (`try_quit_chat`
+/// presses `i` to focus before typing `/quit`) leaves `chat_focused` set,
+/// since nothing on the decline path blurs it. Sending `send_gpu_message`'s
+/// own leading `i` there would be read as a literal character rather than a
+/// focus gesture (`actions.rs`'s `chat.focused` branch maps `Char('i')` to
+/// `ChatInput('i')`, not `ChatFocus`), corrupting the message into
+/// `"ihow is gpu-2 doing"` — not caught by this scenario only because the
+/// mock replies to anything that isn't the approval-trigger phrase. Mirrors
+/// `send_managed_model_message`'s own already-focused pattern.
+#[when("the user sends a message about GPU health without refocusing the input")]
+async fn send_gpu_message_already_focused(world: &mut E2eWorld) {
+    let tui = session(world);
+    tui.wait_for_screen("No messages yet.", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("chat surface never became ready: {e}"));
+    tui.send("how is gpu-2 doing")
+        .unwrap_or_else(|e| panic!("failed to type the chat message: {e}"));
+    tui.send("\r")
+        .unwrap_or_else(|e| panic!("failed to submit the chat message: {e}"));
+}
+
 #[when("the user sends a message that triggers a tool approval")]
 async fn send_approval_trigger_message(world: &mut E2eWorld) {
     let tui = session(world);
@@ -530,6 +679,307 @@ async fn quit_tui(world: &mut E2eWorld, surface: &str) {
 #[when("the user quits the dashboard")]
 async fn quit_dashboard(world: &mut E2eWorld) {
     quit_tui(world, "the dashboard").await;
+}
+
+/// Send the plain quit gesture and nothing else — unlike `quit_dashboard`,
+/// this does not wait for (or resolve) the quit-confirm prompt that may open
+/// (issue #145), since the point of this step is to observe that prompt.
+#[when("the user tries to quit the dashboard")]
+async fn try_quit_dashboard(world: &mut E2eWorld) {
+    session(world)
+        .send("q")
+        .unwrap_or_else(|e| panic!("failed to send the quit key: {e}"));
+}
+
+/// Deliberately bypasses `quit_and_wait`: that helper's own retry loop
+/// answers "y" to any quit-confirm prompt it finds on screen, so it would
+/// silently paper over a regression that opened the prompt here. `q` with
+/// nothing serving must exit the process outright on the first keystroke; if
+/// the prompt opened instead, nothing resolves it and this times out rather
+/// than passing.
+#[then("the dashboard exits immediately with no quit confirmation")]
+async fn dashboard_exits_without_confirmation(world: &mut E2eWorld) {
+    session(world)
+        .wait_for_exit(default_timeout())
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "`q` with nothing serving must exit immediately, with no \
+                 quit-confirm prompt: {e}"
+            )
+        });
+}
+
+/// Chat counterpart of `try_quit_dashboard`: `/quit` shares the exact same
+/// `request_quit` gate as the dashboard's `q` and the launcher's own `q`
+/// (issue #145) — `rocm chat` is the same dashboard with the Chat tab focused
+/// (`run_chat` calls the same `run_async`) — but had no scenario coverage of
+/// its own before this. Sends `/quit` and nothing else: unlike
+/// `quit_interactive_chat`, this does not resolve the prompt that may open,
+/// since the point of this step is to observe it.
+#[when("the user tries to quit chat")]
+async fn try_quit_chat(world: &mut E2eWorld) {
+    let tui = session(world);
+    // Wait for the accepted, empty chat surface before typing so the input is
+    // ready to receive focus — mirrors `send_gpu_message`'s own wait.
+    tui.wait_for_screen("No messages yet.", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("chat surface never became ready: {e}"));
+    // `i` focuses the input (a fresh session starts unfocused — slash commands
+    // are plain text input, same as a chat message); then the command, then
+    // Enter to submit it (`handle_slash_command` routes `/quit` to the shared
+    // gate, same as a plain `q` keypress on the dashboard).
+    tui.send("i")
+        .unwrap_or_else(|e| panic!("failed to focus the chat input: {e}"));
+    tui.send("/quit")
+        .unwrap_or_else(|e| panic!("failed to type /quit: {e}"));
+    tui.send("\r")
+        .unwrap_or_else(|e| panic!("failed to submit /quit: {e}"));
+}
+
+#[then("the dashboard asks whether to quit while a model is still being served")]
+async fn quit_confirm_is_displayed(world: &mut E2eWorld) {
+    session(world)
+        .wait_for_screen(QUIT_CONFIRM_MARKER, default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("quit-confirm prompt never appeared: {e}"));
+}
+
+/// Proves the prompt's remediation line itself (not just that some prompt
+/// appeared) names a command that is real: the fixture's own managed-service
+/// record always carries `"service_id": "e2e-mock"` (`mock_server.rs`'s
+/// `write_service_record_with`), so this checks for the literal, fillable
+/// `rocm services stop e2e-mock --yes` — not a `<id>` placeholder or a bare
+/// mention of the model name — directly answering AGENTS.md §3's rule that a
+/// remediation command must be asserted, not just its wording.
+///
+/// The command sits on its own screen row (`ui::quit_confirm_body` pushes it
+/// as a separate line from the model-name row above it) rather than trailing
+/// the model name on one combined line, so at this PTY's width it is not
+/// expected to word-wrap. Whitespace is still
+/// collapsed to single spaces before matching — this also merges the row
+/// boundary between the model-name line and the command line into one
+/// contiguous string — so the match is robust to that line break (and to any
+/// wrap that does occur) without depending on exact column positions.
+#[then("the quit prompt shows the real stop command for the managed model")]
+async fn quit_confirm_shows_real_stop_command(world: &mut E2eWorld) {
+    let expected = "rocm services stop e2e-mock --yes";
+    session(world)
+        .wait_for_screen_where(
+            &format!("the quit prompt shows {expected:?}"),
+            |screen| {
+                screen
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .contains(expected)
+            },
+            default_timeout(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+}
+
+/// Issue #145's actual stop action, not just the warning: `s` on the
+/// dashboard's quit-confirm prompt is meant to close it and open the Services
+/// overlay instead of resolving an Approve/Deny/Cancel verdict
+/// (`AppState::quit_confirm_open_services_key`). Sent exactly once — the
+/// prompt is already confirmed open by the preceding `Then` step, so there is
+/// no startup race to retry through, the same reasoning `open_services_overlay`
+/// gives for its own single send.
+#[when("the user presses s to manage the serving model")]
+async fn quit_confirm_presses_s_to_manage(world: &mut E2eWorld) {
+    session(world)
+        .send("s")
+        .unwrap_or_else(|e| panic!("failed to send the manage-service key: {e}"));
+}
+
+/// Proves the hint that makes `s` discoverable is actually on screen before
+/// it's pressed, not just that pressing it happens to work
+/// (`services_overlay_opens_showing_managed_model` only proves the latter).
+/// `quit_confirm_request`'s own `offer_stop_action` doc comment is what gates
+/// this to the dashboard's copy of the prompt — the launcher's copy shares
+/// the same body text but passes `false` and must never show it (see
+/// `rocm_dash_tui::ui::launcher::tests::launcher_renders_the_quit_confirm_prompt_when_open`,
+/// the unit-level counterpart for that half).
+#[then("the quit prompt offers to open Services for the serving model")]
+async fn quit_confirm_offers_services_hint(world: &mut E2eWorld) {
+    session(world)
+        .wait_for_screen("Press s to open Services", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("quit prompt never offered the Services hint: {e}"));
+}
+
+/// Proves `s` actually did something, not just that it was sent: the
+/// quit-confirm prompt's own marker must be gone (it closed, rather than
+/// merely sitting underneath whatever rendered), the Services overlay's own
+/// title must be on screen (`SERVICES_OVERLAY_TITLE`, drawn only by that
+/// overlay), and the overlay's own row must show the fixture's real service
+/// id (`e2e-mock` — `draw_services_manager` renders `r.id` as its own
+/// column, `services_manager.rs`).
+///
+/// The id, not the model name: the model name is already on screen from the
+/// earlier `the managed model is displayed` step and would still read true
+/// from the dimmed Observe background behind a centered modal that doesn't
+/// fully cover it (see `close_services_overlay`'s own comment on exactly
+/// this), so a model-name match alone wouldn't prove the overlay's own
+/// content, only that it rendered on top of something that already had it.
+#[then("the services overlay opens showing the managed model")]
+async fn services_overlay_opens_showing_managed_model(world: &mut E2eWorld) {
+    let tui = session(world);
+    tui.wait_until_gone(QUIT_CONFIRM_MARKER, default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the quit prompt never closed after `s`: {e}"));
+    tui.wait_for_screen(SERVICES_OVERLAY_TITLE, default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("`s` never opened the services overlay: {e}"));
+    tui.wait_for_screen("e2e-mock", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the services overlay did not show its own row: {e}"));
+}
+
+/// Launcher counterpart of `try_quit_dashboard`: the launcher's own `q`/Esc
+/// is a second, independent quit entry point (issue #145) and must not wait
+/// for (or resolve) the prompt it may open, since the point of this step is
+/// to observe that prompt.
+#[when("the user tries to quit the launcher")]
+async fn try_quit_launcher(world: &mut E2eWorld) {
+    session(world)
+        .send("q")
+        .unwrap_or_else(|e| panic!("failed to send the quit key: {e}"));
+}
+
+/// Launcher counterpart of `quit_confirm_is_displayed`: same marker, same
+/// prompt (`ui::launcher::draw`'s own quit_confirm arm renders the identical
+/// `ui::quit_confirm_body`), reached from the launcher's own event loop
+/// instead of the dashboard's.
+#[then("the launcher asks whether to quit while a model is still being served")]
+async fn launcher_quit_confirm_is_displayed(world: &mut E2eWorld) {
+    session(world)
+        .wait_for_screen(QUIT_CONFIRM_MARKER, default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("quit-confirm prompt never appeared: {e}"));
+}
+
+#[when("the user declines the quit prompt")]
+async fn decline_quit_prompt(world: &mut E2eWorld) {
+    session(world)
+        .send("n")
+        .unwrap_or_else(|e| panic!("failed to decline the quit prompt: {e}"));
+    // The prompt's own body names the serving model (`quit_confirm_body` in
+    // `ui/mod.rs`), so the very next assertion — "the managed model is
+    // displayed" (dash-26) or "the launcher shows the model serving"
+    // (dash-27; a different step, same risk) — could pass on the prompt's
+    // own text even if `n` did nothing and the prompt never actually closed.
+    // Wait for it to actually leave the screen so that assertion proves the
+    // decline worked, not just that the model's name is on screen somewhere.
+    session(world)
+        .wait_until_gone(QUIT_CONFIRM_MARKER, default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("quit-confirm prompt never closed after declining: {e}"));
+}
+
+/// Whether `services list --json` currently lists the scenario's model as
+/// `ready`/`running` — the same statuses `Instance::status.is_serving()`
+/// treats as live on the TUI side. Shared by the "still listed as running"
+/// and "no longer listed as running" `Then` steps below so the two assert the
+/// literal opposite of the same live read rather than each re-deriving it
+/// (and risking drifting on what "running" means).
+///
+/// `--json` (no `--all`) rather than the plain `--all` table: `--all` also
+/// keeps stopped/failed records around, so a substring match against it would
+/// pass even if the service had actually stopped and merely left its record
+/// behind.
+fn managed_model_is_listed_as_running(world: &E2eWorld) -> (bool, String) {
+    let (stdout, _, _) = crate::run_rocm(world, &["services", "list", "--json"]);
+    let model = world
+        .model_name
+        .as_deref()
+        .expect("no model name set")
+        .to_lowercase();
+    let records: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("services list --json did not parse: {e}\n{stdout}"));
+    let found = records.as_array().into_iter().flatten().any(|record| {
+        let names_model = [record.get("model_ref"), record.get("canonical_model_id")]
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .any(|v| v.to_lowercase().contains(&model));
+        let is_running = record
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|s| matches!(s, "ready" | "running"));
+        names_model && is_running
+    });
+    (found, stdout)
+}
+
+/// Proves the prompt's own claim ("it may still be running in the background
+/// after you quit") against actual state, not just its wording (AGENTS.md §3) — a
+/// plain CLI check against the managed-service registry, run after the TUI
+/// process has already exited (or, for the declined-prompt assertion earlier
+/// in the same scenario, while it's still open).
+#[then("the managed model is still listed as running")]
+async fn managed_model_still_listed_as_running(world: &mut E2eWorld) {
+    let (found, stdout) = managed_model_is_listed_as_running(world);
+    assert!(
+        found,
+        "model not listed as ready/running — quitting (or declining) must not stop it:\n{stdout}"
+    );
+}
+
+/// Proves the quit prompt's own remediation line — the real, fillable
+/// `rocm services stop <id> --yes` command (`quit_confirm_shows_real_stop_command`
+/// pins the string) — actually clears the condition it warns about, not just
+/// that the text is right (AGENTS.md §3). Runs the exact command a user would
+/// copy from the prompt, as a plain CLI invocation independent of the TUI
+/// under test (the fixture's own managed-service record always carries
+/// `"service_id": "e2e-mock"` — `mock_server.rs`'s `write_service_record_with`).
+#[when("the user runs the quit prompt's stop command")]
+async fn run_quit_prompt_stop_command(world: &mut E2eWorld) {
+    crate::run_rocm_ok(world, &["services", "stop", "e2e-mock", "--yes"]);
+}
+
+/// The negation of `managed_model_still_listed_as_running`: proves the stop
+/// command above actually took effect on the registry `rocm services` itself
+/// reads, not merely that the CLI invocation exited zero.
+#[then("the managed model is no longer listed as running")]
+async fn managed_model_no_longer_listed_as_running(world: &mut E2eWorld) {
+    let (found, stdout) = managed_model_is_listed_as_running(world);
+    assert!(
+        !found,
+        "model still listed as ready/running after running the prompt's own \
+         stop command — the remediation it prints does not actually work:\n{stdout}"
+    );
+}
+
+/// Proves the stop command signalled the real process, not only the
+/// registry record (AGENTS.md §3: "actually clear the condition"). Without
+/// this, a `rocm services stop` that merely rewrote the record's status to
+/// `stopped` without signalling anything would still leave
+/// `managed_model_no_longer_listed_as_running` above green — it only reads
+/// the registry, never the process `dash-28`'s own
+/// "the managed model's record points at a disposable process" step pointed
+/// the record's `supervisor_pid`/`engine_pid` at.
+#[then("the disposable process has exited")]
+async fn disposable_process_has_exited(world: &mut E2eWorld) {
+    let child = world
+        .recorded_process
+        .as_mut()
+        .expect("no disposable process recorded for this scenario");
+    let mut exited = false;
+    for _ in 0..20 {
+        if child.try_wait().ok().flatten().is_some() {
+            exited = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        exited,
+        "the stop command must actually terminate the process it names, not \
+         just rewrite the registry record to stopped"
+    );
 }
 
 #[when("the user quits interactive chat")]
@@ -581,10 +1031,95 @@ async fn quit_back_to_launcher(world: &mut E2eWorld) {
     // session" state where a per-session signal watcher would have gone deaf.
     tui.send("q")
         .unwrap_or_else(|e| panic!("failed to quit the dashboard: {e}"));
+    // A launcher-hosted session (dash-30) must exit on this one `q` with no
+    // confirm prompt of its own, even while a model is serving — only the
+    // launcher's own gate should ever show it. If `AppState::launcher_hosted`
+    // failed to suppress the dashboard's own gate, this session would open
+    // its own quit-confirm prompt instead of exiting, and the launcher front
+    // door below would never come back — the panic message names that
+    // specific failure mode so a timeout here reads as "the double-prompt
+    // regression" rather than an unexplained hang.
     tui.wait_for_screen("Set up this system", default_timeout())
         .await
         .unwrap_or_else(|e| {
-            panic!("the launcher front door did not return after the session: {e}")
+            panic!(
+                "the launcher front door did not return after the session — \
+                 if a quit-confirm prompt is still showing instead, \
+                 `AppState::launcher_hosted` failed to suppress this \
+                 session's own gate (issue #145's double-prompt fix): {e}"
+            )
+        });
+}
+
+#[when("the user opens chat from the launcher")]
+async fn open_chat_from_launcher(world: &mut E2eWorld) {
+    let tui = session(world);
+    // Sync on the launcher front door before sending keys, same rationale as
+    // `open_dashboard_from_launcher`.
+    tui.wait_for_screen("Set up this system", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the launcher front door never appeared: {e}"));
+    // Chat has no single-key shortcut like `d` (`OpenDashboard`'s) — it's the
+    // 4th row (`LauncherChoice::Chat`, after Set up/Serve/Diagnose), reached
+    // by moving down three times from the default (Set up) selection, then
+    // `Enter` (`choice_for(sel)`).
+    tui.send("jjj")
+        .unwrap_or_else(|e| panic!("failed to select Chat in the launcher: {e}"));
+    tui.send("\r")
+        .unwrap_or_else(|e| panic!("failed to open chat from the launcher: {e}"));
+    // Unlike every other chat-opening step in this file, this one can't pass
+    // `--chat-mock`: the bare launcher's own top-level dispatch hardcodes
+    // `run_launcher(false)` (`main.rs`), so there is no flag to carry it
+    // through to the `Chat` escalation. The fixture's mock HTTP endpoint
+    // (`a running managed model is available locally`) is still real enough
+    // for chat's own auto-detection to find, so it always offers the
+    // one-time "use this endpoint?" consent prompt (`ChatConsent::Pending`)
+    // first — accept it before the empty chat surface appears.
+    tui.wait_for_screen("Chat — use this endpoint?", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("chat's endpoint-consent prompt never appeared: {e}"));
+    tui.send("y")
+        .unwrap_or_else(|e| panic!("failed to accept the detected chat endpoint: {e}"));
+    tui.wait_for_screen("No messages yet.", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("chat did not open from the launcher: {e}"));
+}
+
+#[when("the user quits chat back to the launcher")]
+async fn quit_chat_back_to_launcher(world: &mut E2eWorld) {
+    let tui = session(world);
+    // Same `/quit` route `try_quit_chat` uses (`handle_slash_command` routes
+    // it to the shared `request_quit` gate), but unlike that step this one
+    // resolves straight through: a launcher-hosted chat session
+    // (`run_chat`'s own `launcher_hosted`) must exit this inner loop
+    // unconditionally rather than open a quit-confirm prompt of its own —
+    // see `request_quit`'s doc comment.
+    //
+    // No `i` here, unlike `try_quit_chat`: that step's own comment notes "a
+    // fresh session starts unfocused", but `accept_chat_consent` (`app/mod.rs`)
+    // sets `chat_focused = true` as part of accepting the endpoint prompt this
+    // step's caller (`open_chat_from_launcher`) already sent `y` to, so the
+    // input here is already focused. Sending `i` first — as a first attempt
+    // at this step did — typed a literal leading `i` into the box instead of
+    // focusing it, submitting "i/quit" as a chat message rather than running
+    // the slash command at all.
+    tui.send("/quit")
+        .unwrap_or_else(|e| panic!("failed to type /quit: {e}"));
+    tui.send("\r")
+        .unwrap_or_else(|e| panic!("failed to submit /quit: {e}"));
+    // Same failure-mode framing as `quit_back_to_launcher`: if `run_chat`
+    // failed to propagate `launcher_hosted` into `AppState`, this session
+    // would open its own quit-confirm prompt instead of exiting, and the
+    // launcher front door below would never come back.
+    tui.wait_for_screen("Set up this system", default_timeout())
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "the launcher front door did not return after the chat session — \
+                 if a quit-confirm prompt is still showing instead, `run_chat` \
+                 failed to propagate `launcher_hosted` into this session's \
+                 `AppState` (issue #145's double-prompt fix): {e}"
+            )
         });
 }
 
@@ -1068,6 +1603,17 @@ async fn dashboard_menu_is_displayed(world: &mut E2eWorld) {
         .unwrap_or_else(|e| panic!("dashboard menu did not appear: {e}"));
 }
 
+/// Navigates `Modal::Menu`'s items (`["Options", "Help", "Quit"]`,
+/// `ui/modal.rs`) down to "Quit" and activates it — `j` twice from the
+/// default `menu_sel: 0`, then `Enter` (`KeyAction::MenuActivate`). Requires
+/// the menu to already be open (`the dashboard menu is displayed`).
+#[when("the user selects Quit from the dashboard menu")]
+async fn select_quit_from_dashboard_menu(world: &mut E2eWorld) {
+    session(world)
+        .send("jj\r")
+        .unwrap_or_else(|e| panic!("failed to select Quit from the dashboard menu: {e}"));
+}
+
 #[then("the dashboard menu is closed")]
 async fn dashboard_menu_is_closed(world: &mut E2eWorld) {
     // A bare Escape send is not guaranteed to have been acted on yet by the
@@ -1122,19 +1668,36 @@ async fn install_folder_browser_displayed(world: &mut E2eWorld) {
         .unwrap_or_else(|e| panic!("the install-folder browser did not appear: {e}"));
 }
 
+#[then("the existing-folder browser lists the scenario folder's contents")]
+async fn existing_folder_browser_shows_scenario_folder(world: &mut E2eWorld) {
+    // The browser lists `ADOPT_SCENARIO_CHILD` as a child entry only if it's
+    // browsing our scenario's own cwd (seeded from `std::env::current_dir()`
+    // in `onboarding.rs`'s `AdoptExisting` arm) — so this is only reachable if
+    // `spawn_in` actually set the child process's working directory to our
+    // scenario root, exactly as the full path would prove, but without
+    // depending on the host's temp-directory length (see
+    // `ADOPT_SCENARIO_CHILD`'s doc comment).
+    let marker = format!("{ADOPT_SCENARIO_CHILD}/");
+    session(world)
+        .wait_for_screen(&marker, default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the existing-folder browser did not show {marker:?}: {e}"));
+}
+
 #[then("the Configure step shows the chosen folder instead of the placeholder")]
 async fn configure_shows_chosen_folder(world: &mut E2eWorld) {
     session(world)
         .wait_for_screen_where(
-            "the Folder row shows a chosen path rather than the unset placeholder",
+            "the Folder row shows a chosen path rather than the unset placeholder, with the install-folder browser closed",
             |screen| {
                 screen.contains("Folder:")
                     && !screen.contains("default managed folder · Tab to browse")
+                    && !screen.contains("Pick an install folder")
             },
             default_timeout(),
         )
         .await
-        .unwrap_or_else(|e| panic!("the Folder row never showed a chosen path: {e}"));
+        .unwrap_or_else(|e| panic!("the Folder row never showed a chosen path with the browser closed: {e}"));
 }
 
 #[then("the managed model is displayed")]
@@ -1544,4 +2107,52 @@ async fn gen_tps_no_longer_displayed(world: &mut E2eWorld) {
                  unavailable placeholder: {e}"
             )
         });
+}
+
+/// Terminal rows tall enough that the Observe tab's 35%-height GPU sub-panel
+/// (`super::hardware::draw` called from `tabs/observe.rs`) has enough of its
+/// own area to show GPU rows at all. The demo session's 8 GPUs are already far
+/// past `plan_gpu_rows`'s full-panel threshold at this height (that would need
+/// the GPU sub-panel's own area north of 65 rows), so this lands solidly in
+/// its compact one-line-per-GPU layout — the regime `gpu_compact_line` draws.
+/// `grow_rows` keeps the standard 80-column width, comfortably over the 54
+/// columns `gpu_compact_line`'s own truncation budget needs to keep the vram
+/// segment on the line (`gpu_compact_line_vram_truncation_threshold` pins
+/// that exact 54 in `hardware.rs`).
+const GPU_COMPACT_ROWS: u16 = 70;
+
+#[when("the user grows the terminal until the GPU section shows compact rows")]
+async fn grow_for_gpu_compact_rows(world: &mut E2eWorld) {
+    let tui = session(world);
+    tui.grow_rows(GPU_COMPACT_ROWS)
+        .unwrap_or_else(|e| panic!("failed to resize the terminal: {e}"));
+    // The demo replay's GPU telemetry lands asynchronously, same as the
+    // instance table `open_instance_detail` waits on above; wait for a GPU
+    // row's own marker rather than assuming the first post-resize frame
+    // already carries it.
+    tui.wait_for_screen("°C", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("GPU compact rows never rendered: {e}"));
+}
+
+#[then("the GPU section reports VRAM in binary units")]
+async fn gpu_section_reports_binary_units(world: &mut E2eWorld) {
+    let screen = session(world).screen_text();
+    // Scoped to the compact GPU row itself (the line carrying its "°C"
+    // cell) rather than the whole screen: "GiB" alone also appears in the
+    // section header's per-logical-GPU figure and the instances table, so a
+    // screen-wide positive assertion would pass even if this row regressed.
+    let gpu_row = screen
+        .lines()
+        .find(|line| line.contains("°C"))
+        .unwrap_or_else(|| panic!("no compact GPU row on screen:\n{screen}"));
+    assert!(
+        gpu_row.contains("GiB"),
+        "expected the GPU row's VRAM figure in binary (GiB) units, got:\n{gpu_row}"
+    );
+    assert!(
+        !gpu_row.contains(" GB"),
+        "#673 REGRESSION: GPU VRAM is labeled in decimal-looking GB units \
+         instead of binary GiB, got:\n{gpu_row}"
+    );
 }

@@ -408,6 +408,24 @@
       "needs_reboot": false,
       "needs_relogin": false,
       "doc_url": "https://aka.ms/vs/17/release/vc_redist.x64.exe"
+    },
+    {
+      "id": "info-20-gpu-no-rocm-support",
+      "title": "GPU has no ROCm/HIP support (Vulkan backend still works)",
+      "platforms": [
+        {
+          "os": "linux",
+          "class": "diagnose-only"
+        },
+        {
+          "os": "windows",
+          "class": "diagnose-only"
+        }
+      ],
+      "needs_sudo": false,
+      "needs_reboot": false,
+      "needs_relogin": false,
+      "doc_url": "https://rocm.docs.amd.com/projects/install-on-linux/en/latest/reference/system-requirements.html"
     }
   ],
   "exit_codes": {

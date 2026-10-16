@@ -662,8 +662,9 @@ pub const ROCM_MUTATING_TOOL_NAMES: [&str; 6] = [
 
 /// Register every mutating ROCm tool on a Rig `AgentBuilder`, cloning the
 /// optional executor + approval channel + the shared `fired` log into each.
-/// Generic over the builder's model + preamble so both client paths reuse one
-/// registration site (DRY). Called after [`register_rocm_read_tools`].
+/// Generic over the builder's model + preamble so all three backends (Rig,
+/// ChatGPT, Anthropic) reuse one registration site (DRY). Called after
+/// [`register_rocm_read_tools`].
 pub(super) fn register_rocm_mutating_tools<M, P>(
     builder: rig::agent::AgentBuilder<M, P, rig::agent::WithBuilderTools>,
     executor: Option<&SharedRocmToolExecutor>,
@@ -755,10 +756,11 @@ where
 
 /// Register every read-only ROCm tool on a Rig `AgentBuilder`, cloning the
 /// optional executor + the shared `fired` log into each. Kept generic over the
-/// builder's completion model + preamble so both the OpenAI-compatible and
-/// ChatGPT paths reuse one registration site (DRY — the tool list lives in
-/// exactly one place). The builder is already in the `WithBuilderTools` state
-/// because the telemetry/skill tools were registered first.
+/// builder's completion model + preamble so all three backends (the
+/// OpenAI-compatible, ChatGPT, and Anthropic paths) reuse one registration
+/// site (DRY — the tool list lives in exactly one place). The builder is
+/// already in the `WithBuilderTools` state because the telemetry/skill tools
+/// were registered first.
 pub(super) fn register_rocm_read_tools<M, P>(
     builder: rig::agent::AgentBuilder<M, P, rig::agent::WithBuilderTools>,
     executor: Option<&SharedRocmToolExecutor>,
