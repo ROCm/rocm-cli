@@ -17,10 +17,10 @@
 //! the `main.rs` modularization (see `docs/architecture.md`), split across
 //! three PRs given the cluster's size: this module's contents are now parts
 //! 1 and 2's combined slice (types, leaf helpers, and the orchestration
-//! bodies above). The cluster's regression tests still live in `main.rs`'s
-//! shared `mod tests` block, calling back in via `chat::`; moving them, and
-//! auditing which of this module's `pub(crate)` items have no caller outside
-//! it and could be module-private, are the third PR's job.
+//! bodies above), plus the cluster's regression tests, moved out of
+//! `main.rs`'s shared `mod tests` block in part 2. Auditing which of this
+//! module's `pub(crate)` items have no caller outside it and could be
+//! module-private is the third PR's job.
 
 use crate::runtime_install_finalize::empty_as_unknown;
 use crate::runtimes_cmd::render_runtimes_text;
