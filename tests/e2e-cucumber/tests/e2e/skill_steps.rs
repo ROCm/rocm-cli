@@ -13,7 +13,9 @@
 //! `reference.md` is read as the EXPECTED-value fixture. That is a deliberate,
 //! narrow exception to the suite's black-box rule: nothing is imported from the
 //! rocm-cli codebase — a documentation artifact is read as test data, and that
-//! artifact is the thing under test.
+//! artifact is the thing under test. `SKILL.md` is read too, for two
+//! sentences: `skill-07` reads the catalog contract version Phase 0 requires,
+//! and `tests/skill_reference.rs` reads the "The other N ... print-only" count.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -142,6 +144,27 @@ fn reference_md_path() -> PathBuf {
         .join("skills")
         .join("rocm-doctor")
         .join("reference.md")
+}
+
+/// `SKILL.md`, which `skill-07` reads for the one declaration that has to sit
+/// where the agent acts: the catalog contract the skill requires.
+fn skill_md_path() -> PathBuf {
+    reference_md_path().with_file_name("SKILL.md")
+}
+
+/// The phrase `SKILL.md` uses to declare the contract it requires, followed by
+/// the version number: "requires `contract_version` 1 or higher".
+const REQUIRED_CONTRACT_PHRASE: &str = "requires `contract_version` ";
+
+/// The catalog contract version `SKILL.md` says it requires, if it says so.
+///
+/// Whitespace is normalised first, because the sentence is hard-wrapped in the
+/// markdown and the number can land on either side of a line break.
+fn declared_contract_minimum(skill_md: &str) -> Option<u64> {
+    let flat = skill_md.split_whitespace().collect::<Vec<_>>().join(" ");
+    let after = flat.split(REQUIRED_CONTRACT_PHRASE).nth(1)?;
+    let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
 }
 
 /// Read the closed-catalog table out of the skill's reference doc.
@@ -534,6 +557,10 @@ async fn load_skill_reference(world: &mut E2eWorld) {
     let text = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
     world.skill_reference = Some(text);
+    let path = skill_md_path();
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+    world.skill_md = Some(text);
 }
 
 #[given("a user who reports a recognised ROCm failure")]
@@ -806,5 +833,65 @@ async fn assert_known_verdict(world: &mut E2eWorld) {
         "examine reported {status:?}, which the skill does not account for. \
          reference.md enumerates {documented:?}, and an agent that meets a verdict \
          outside that list has no instruction for what to do next."
+    );
+}
+
+#[then("the contract the skill requires is the one the CLI publishes")]
+async fn assert_required_contract_is_published(world: &mut E2eWorld) {
+    // The When step is `diagnose-34`'s ("a tool asks the CLI for its catalog in
+    // machine-readable form"): the probe Phase 0 runs is the one invocation, so
+    // the two scenarios cannot disagree about how to read the manifest.
+    assert_eq!(
+        world.cli_rc,
+        Some(0),
+        "the catalog manifest is the probe Phase 0 relies on; it must exit 0. stderr: {:?}",
+        world.cli_stderr
+    );
+    let output = world
+        .cli_output
+        .as_ref()
+        .expect("no catalog manifest output");
+    let manifest: serde_json::Value =
+        serde_json::from_str(output).expect("fix --json did not emit valid JSON");
+    let published = manifest
+        .get("contract_version")
+        .and_then(serde_json::Value::as_u64)
+        .expect("the manifest has no numeric `contract_version`");
+
+    let text = world
+        .skill_md
+        .as_ref()
+        .expect("SKILL.md not loaded: the scenario must start with the published-skill Given");
+    let required = declared_contract_minimum(text).unwrap_or_else(|| {
+        panic!(
+            "SKILL.md no longer says which catalog contract it requires \
+             (\"{REQUIRED_CONTRACT_PHRASE}<N>\"). Without it the skill cannot tell an \
+             older CLI from a current one, and Phase 0 has nothing to compare against."
+        )
+    });
+
+    assert!(
+        required >= 1,
+        "SKILL.md requires contract version {required}; versions start at 1"
+    );
+    assert!(
+        required <= published,
+        "SKILL.md requires catalog contract version {required}, but the CLI publishes \
+         {published}. Phase 0 would stop on every current CLI. Lower the requirement in \
+         SKILL.md. Only a real breaking change to the catalog contract justifies raising \
+         the published version in crates/rocm-core/src/fix.rs."
+    );
+    // The check in SKILL.md has no upper bound, so a CLI that publishes a higher
+    // number would pass Phase 0. A higher number means the catalog broke
+    // something an older reader relies on, so the skill must be read again
+    // before the two numbers move apart.
+    assert!(
+        required == published,
+        "The CLI now publishes catalog contract version {published}, but SKILL.md still \
+         requires {required}. A raised contract version means the catalog removed or \
+         changed something. Check the entry ids, the auto-applicable set and the exit \
+         codes in SKILL.md and reference.md against the new catalog, then raise the \
+         number in SKILL.md. Raise it only after a release publishes that contract, \
+         because the installer Phase 0 offers installs the release channel."
     );
 }

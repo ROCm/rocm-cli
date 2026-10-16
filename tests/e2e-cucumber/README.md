@@ -266,14 +266,17 @@ return, and where a report goes when nothing matched.
 |  | expected value lives in | catches |
 |---|---|---|
 | `diagnose.feature` | the test suite (e.g. `CATALOG_FIX_IDS`) | the **CLI** drifting |
-| `rocm_doctor_skill.feature` | `skills/rocm-doctor/reference.md` | the **document** drifting |
+| `rocm_doctor_skill.feature` | [reference.md](../../skills/rocm-doctor/reference.md) (and, for `skill-07`, [SKILL.md](../../skills/rocm-doctor/SKILL.md)) | the **document** drifting |
 
 Only the second can notice that a published document has gone stale, and that is
 the whole reason the feature exists. So anything already proven by
 `diagnose.feature` — that a fix for another OS is declined without writing
 anything, that the listing is complete, that a report says plainly whether a
 cause was established — stays there and is **not** restated here. If a scenario
-in this feature does not read `reference.md`, it is in the wrong file.
+in this feature does not read `reference.md`, it is in the wrong file. The one
+exception is `skill-07`, which reads
+[SKILL.md](../../skills/rocm-doctor/SKILL.md) for the catalog contract number
+that Phase 0 requires.
 
 Reading that document as test data is a deliberate, narrow exception to
 **Black-box only** above: nothing is imported from the rocm-cli codebase — a
@@ -285,9 +288,14 @@ constants, so editing one of those in `reference.md` starts being checked with
 no code change, and every one of those parsers asserts it found something — a
 heading it depends on being reworded upstream must fail loudly rather than
 quietly reduce an assertion to a no-op. Free-standing prose outside those
-spots — the failure-mode count in the catalog heading, the Linux-only/
-Windows-only recap line under the table, SKILL.md's "the other N are
-print-only" — is not parsed, so it can drift without failing anything here.
+spots — such as the Linux-only/Windows-only recap line under the table — is
+not parsed, so it can drift without failing anything here. Two counts are
+checked outside this feature by
+[skill_reference.rs](tests/skill_reference.rs): the failure-mode count in the
+catalog heading, and SKILL.md's "The other N ... print-only" count. Two
+sentences in SKILL.md are therefore fixtures. `skill-07` reads the sentence
+that declares the required catalog contract version, so rewording that
+sentence fails the scenario. `skill_reference.rs` reads the print-only count.
 
 Two rules follow:
 

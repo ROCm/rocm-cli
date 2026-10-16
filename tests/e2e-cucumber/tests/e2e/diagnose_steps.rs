@@ -2553,10 +2553,10 @@ async fn assert_exit_codes_published(world: &mut E2eWorld) {
 #[then("the CLI refuses and explains that the two cannot be combined")]
 async fn assert_json_with_fix_id_refused(world: &mut E2eWorld) {
     let stderr = world.cli_stderr.as_ref().expect("no stderr");
-    assert_ne!(
+    assert_eq!(
         world.cli_rc,
-        Some(0),
-        "a request with no answer must not look like it succeeded"
+        Some(1),
+        "a request with no answer must exit 1, as README.md and reference.md document"
     );
     assert!(
         stderr.contains("--json"),
