@@ -18,8 +18,9 @@ separate from the main `ci.yml`. The split is deliberate: a job queued on an
 newer run's merge-required (GitHub-hosted) checks would sit pending forever
 (observed on PR #138). Giving the self-hosted lanes their own workflow — and
 thus their own concurrency group — means an offline runner can only ever stall
-that workflow's own supersession, never `ci.yml`'s required checks. See
-`EAI-7548`. [`workflow_contract.rs`](../xtask/src/workflow_contract.rs)'s
+that workflow's own supersession, never `ci.yml`'s required checks (only
+pull-request runs are superseded there). See `EAI-7548`.
+[`workflow_contract.rs`](../xtask/src/workflow_contract.rs)'s
 `self_hosted_workflow_owns_the_gpu_lanes` test checks that `e2e-gpu`,
 `e2e-gpu-strix-ubuntu`, and `e2e-gpu-strix-windows` still appear as job keys in
 `e2e-selfhosted.yml`, while its sibling `ci_yml_schedules_no_self_hosted_job`
@@ -266,10 +267,17 @@ otherwise `vllm` is only preferred for the `*-dcgpu` families and
 ## Triggers
 
 The GPU jobs (in `e2e-selfhosted.yml`) run automatically on `push`,
-`pull_request`, and `merge_group` when the workflow's own `changes` job's
-`serve` path filter is `true`. `push` fires on `main` and on any `release/**`
-branch, so pushing to a release branch runs the full self-hosted matrix ahead
-of cutting the `v*` tag that `release.yml` builds/publishes from — this is the
+`pull_request`, and `merge_group` (every GPU lane except MI300X, which is not
+required for merging and so is skipped in the merge queue rather than left
+queued on limited runner capacity after its PR has merged) when the workflow's
+own `changes` job's `serve` path filter is `true`. A new push to a pull request
+cancels that PR's older run; push, `merge_group` and manual runs each get a
+group of their own, so none is cancelled or replaced by another. The heavy
+`@merge-queue` serves therefore no longer run on MI300X, the only per-PR vLLM
+lane: they run only on the other lanes, and the only vLLM serve before a change
+lands is the per-PR canary (`serve-05`), which runs when the `serve` filter
+matches. `push` fires on `main` and on any `release/**` branch, so pushing to
+a release branch runs the full self-hosted matrix ahead of cutting the `v*` tag that `release.yml` builds/publishes from — this is the
 release-candidate regression gate; `pull_request` fires against any base
 branch.
 
@@ -298,7 +306,8 @@ plus broad-dependency safety nets), **not** a blanket `**/*.rs`. So a Rust chang
 that cannot affect serving — e.g. a dashboard-only or unrelated-crate PR — skips
 the heavy GPU matrix, while compile coverage for every crate still runs on
 `ci.yml`'s always-on build/test lanes. Off `pull_request` (push/merge_group) the
-filter is forced `true`, so the full matrix always runs there. Unlike the
+filter is forced `true`, so the full matrix (minus MI300X in the merge queue)
+always runs there. Unlike the
 pre-split layout the GPU jobs do **not** gate on the hosted `build-and-test` job
 — cross-workflow `needs` is not possible, so each GPU job builds the `rocm`
 binary itself as its first real step (a broken build fails that job fast and

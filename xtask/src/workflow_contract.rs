@@ -3666,29 +3666,29 @@ fi
     #[test]
     fn workflows_use_distinct_concurrency_groups() {
         // Isolation comes from the group KEY differing per workflow. Extract the
-        // actual concurrency.group value from each and assert (a) both keep
-        // supersession, (b) both key on github.workflow, and (c) the two group
-        // expressions and workflow names differ — so at runtime the groups are
+        // actual concurrency.group value from each and assert (a) ci.yml keeps
+        // supersession (e2e-selfhosted.yml scopes it to pull_request, see
+        // `self_hosted_supersession_is_scoped_to_pull_requests`), (b) both key on
+        // github.workflow, and (c) the two group expressions and workflow names differ — so at runtime the groups are
         // distinct and an offline-runner stall in one can't hold the other.
         let ci = read_workflow("ci.yml");
         let sh = read_workflow("e2e-selfhosted.yml");
         let ci_group = concurrency_group(&ci);
         let sh_group = concurrency_group(&sh);
 
-        for (label, group, text) in [
-            ("ci.yml", &ci_group, &ci),
-            ("e2e-selfhosted.yml", &sh_group, &sh),
-        ] {
+        for (label, group) in [("ci.yml", &ci_group), ("e2e-selfhosted.yml", &sh_group)] {
             assert!(
                 group.contains("github.workflow"),
                 "{label} concurrency.group must be namespaced by github.workflow \
                  (got `{group}`) (EAI-7548)"
             );
-            assert!(
-                text.contains("cancel-in-progress: true"),
-                "{label} must keep cancel-in-progress: true (EAI-7548)"
-            );
         }
+        // Both keep supersession; e2e-selfhosted.yml narrows it to pull_request
+        // (see `self_hosted_supersession_is_scoped_to_pull_requests`).
+        assert!(
+            ci.contains("cancel-in-progress: true"),
+            "ci.yml must keep cancel-in-progress: true"
+        );
         // The github.workflow-keyed groups resolve via the workflow `name:`; those
         // names must differ for the runtime groups to be distinct.
         assert_ne!(
@@ -4459,6 +4459,114 @@ jobs:
             flattened_list_items("[self-hosted, windows, strix-halo]"),
             "the two sequence spellings must compare equal"
         );
+    }
+
+    /// Extract the top-level `concurrency.cancel-in-progress` value.
+    fn concurrency_cancel_in_progress(text: &str) -> String {
+        top_level_block(text, "concurrency")
+            .lines()
+            .map(strip_comment)
+            .find_map(|line| line.trim().strip_prefix("cancel-in-progress:"))
+            .map(|value| value.trim().to_owned())
+            .expect("concurrency block has a cancel-in-progress: key")
+    }
+
+    #[test]
+    fn self_hosted_supersession_is_scoped_to_pull_requests() {
+        // With one runner per GPU class, a superseded PR run left in the queue
+        // delays every run behind it, so a new push must cancel the PR's older
+        // run. The same must NOT hold for the other triggers: a push or a
+        // merge_group run records a commit that landed, and a dispatch is
+        // deliberate, so none may cancel another or share a group with a PR run.
+        let sh = read_workflow("e2e-selfhosted.yml");
+        let group = concurrency_group(&sh);
+        assert!(
+            group.contains("${{ github.workflow }}-${{ github.event_name }}-"),
+            "the group must carry the event name so runs of different triggers never \
+             share a group (got `{group}`)"
+        );
+        // The key is an `A && x || B && y || z` chain, so the ORDER of the arms
+        // decides behaviour (`format()` is always truthy: moved first, it would
+        // give every PR run a unique group and silently stop supersession).
+        // Pin the whole expression, not each arm, so a reorder fails.
+        // PR number: a new push to the PR supersedes its older run. Dispatch:
+        // unique per run. Ref AND commit for everything else: GitHub replaces a
+        // still-pending run in a shared group even with cancel-in-progress off,
+        // so a ref-only key would let a second push to `main` drop the first.
+        assert_eq!(
+            normalized_whitespace(&group).trim_start_matches(">- "),
+            "${{ github.workflow }}-${{ github.event_name }}-${{ \
+             github.event_name == 'pull_request' && github.event.pull_request.number \
+             || github.event_name == 'workflow_dispatch' && github.run_id \
+             || format('{0}-{1}', github.ref, github.sha) }}",
+            "the concurrency group must be exactly: event name, then PR number \
+             (pull_request), run id (workflow_dispatch), ref and commit (all else), \
+             in that order"
+        );
+        assert_eq!(
+            concurrency_cancel_in_progress(&sh),
+            "${{ github.event_name == 'pull_request' }}",
+            "only pull_request runs may be cancelled by a newer run"
+        );
+    }
+
+    #[test]
+    fn mi300x_lane_is_skipped_in_the_merge_queue() {
+        // The MI300X check is not required for merging, so a merge_group run's
+        // job is never waited for and, behind a single runner, outlives the PR it
+        // was queued for. The other lanes are unaffected.
+        let sh = read_workflow("e2e-selfhosted.yml");
+        // The sibling lanes' "keep running in the queue" check below is vacuous
+        // if the workflow stops triggering on merge_group at all.
+        let triggers = normalized_whitespace(
+            &top_level_block(&sh, "on")
+                .lines()
+                .map(strip_comment)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        assert!(
+            triggers.contains("merge_group: branches: [main] types: [checks_requested]"),
+            "e2e-selfhosted.yml must still trigger on merge_group (checks_requested on main) \
+             so the lanes that stay in the merge queue actually run (got `{triggers}`)"
+        );
+        let gate = |job: &str| {
+            let block = job_block(&sh, job);
+            let start = block
+                .find("    if: >-\n")
+                .unwrap_or_else(|| panic!("`{job}` has a folded `if:` gate"));
+            block[start..]
+                .lines()
+                .skip(1)
+                .take_while(|line| indent_of(line) > 4)
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        assert!(
+            normalized_whitespace(&gate("e2e-gpu")).starts_with(
+                "always() && needs.changes.result == 'success' \
+                 && github.event_name != 'merge_group' && ("
+            ),
+            "e2e-gpu (MI300X) must not run on merge_group events"
+        );
+        assert!(
+            !job_block(&sh, "e2e-gpu").contains("E2E_MERGE_QUEUE"),
+            "e2e-gpu never runs in the merge queue, so it must not opt into @merge-queue scenarios"
+        );
+        for job in [
+            "e2e-gpu-strix-ubuntu",
+            "e2e-gpu-strix-windows",
+            "e2e-wsl",
+            "e2e-gpu-w7900",
+        ] {
+            // Only the dispatch split may look at the event: any other event
+            // condition could silently keep the lane out of the merge queue.
+            let gate = normalized_whitespace(&gate(job));
+            assert!(
+                !gate.contains("merge_group") && !gate.contains("'pull_request'"),
+                "`{job}` must keep running in the merge queue (gate: `{gate}`)"
+            );
+        }
     }
 
     #[test]
