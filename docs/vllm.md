@@ -267,6 +267,45 @@ rocm serve <model> --engine vllm --gpu 1 --gpu-memory-utilization 0.5
 rocm diagnose --symptom 'vllm: torch.OutOfMemoryError: HIP out of memory'
 ```
 
+## Engine import failures
+
+A startup failure can also come from the engine failing to import, with no
+memory problem at all. The failure message then names the failing line and
+points at `rocm diagnose --symptom '<the error>'`.
+
+The hint fires only when the log tail has one of two kinds of line. The first
+is a line that contains `libtorch_cuda.so` and also contains `OSError:` or
+`ImportError:`, compared without regard to case. It does not have to start with
+that text, because the real line begins with a process prefix such as
+`(EngineCore pid=412)`. A warning that quotes the exception in its repr form,
+such as `ImportError('libtorch_cuda.so ...')`, does not count. A warning written
+with a colon, such as `... with ImportError: libtorch_cuda.so ...`, does count,
+and it can raise the hint when the real failure is something else. The
+second is a traceback frame, meaning a line that contains `file "` and
+`_optional_torch_c_dlpack`, compared without regard to case. The library line
+wins when both are present, and when several lines name the library the last
+one is quoted. A log line that only mentions the `_optional_torch_c_dlpack`
+module, such as a `UserWarning`, does not fire the hint. Any other startup
+failure prints only the log tail, except an out-of-memory failure, which prints
+the memory hint above. If a failure matches both, both paragraphs are printed,
+the memory hint first.
+
+The printed command quotes the failing line when it can be rendered as one
+intact single-quoted argument and `rocm diagnose` recognises it. Otherwise it
+quotes the canonical import symptom,
+`OSError: libtorch_cuda.so: cannot open shared object file`. A line with an
+apostrophe falls back this way. So does a frame that does not score on its own,
+such as `... in <module>`, which names only the shim module and scores below the
+match threshold. A loader frame that ends in `in load_torch_c_dlpack_extension`
+also names the extension, so it scores on its own and is quoted as it is. When a
+frame alone does not score, the command quotes a canonical symptom that the
+user's log did not contain. The command then always reports a cause, and the
+user's own line stays visible in the message above it.
+
+The command only reports. On Linux and WSL it matches the conditional
+engine-reinstall remediation (`fix-17-torch-dlpack`), which `rocm fix` prints
+and does not run.
+
 ## Tool calling
 
 The TUI chat tab attaches tool definitions to every chat request. vLLM rejects

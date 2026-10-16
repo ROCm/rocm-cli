@@ -719,15 +719,25 @@ async fn assert_json_identifies_match(world: &mut E2eWorld) {
 /// panicking with the raw output if it is absent. Shared by the two `Then`
 /// steps that assert on the vLLM OOM entry.
 fn find_vllm_oom<'a>(report: &'a serde_json::Value, output: &str) -> &'a serde_json::Value {
+    find_matched(report, "fix-16-vllm-oom", output)
+}
+
+/// The entry of the diagnosis's `matched` list with the given id, panicking with
+/// the raw output if it is absent.
+fn find_matched<'a>(
+    report: &'a serde_json::Value,
+    id: &str,
+    output: &str,
+) -> &'a serde_json::Value {
     report
         .get("matched")
         .and_then(serde_json::Value::as_array)
         .and_then(|matches| {
             matches.iter().find(|diagnosis| {
-                diagnosis.get("id").and_then(serde_json::Value::as_str) == Some("fix-16-vllm-oom")
+                diagnosis.get("id").and_then(serde_json::Value::as_str) == Some(id)
             })
         })
-        .unwrap_or_else(|| panic!("expected fix-16-vllm-oom in diagnosis:\n{output}"))
+        .unwrap_or_else(|| panic!("expected {id} in diagnosis:\n{output}"))
 }
 
 #[then("no vLLM startup OOM is reported")]
@@ -791,12 +801,30 @@ async fn assert_named_fix_is_runnable_here(world: &mut E2eWorld) {
         .and_then(serde_json::Value::as_str)
         .unwrap_or_else(|| panic!("the matched cause must name a fix id:\n{output}"))
         .to_owned();
-    let (fix_output, fix_stderr, rc) = crate::run_rocm(world, &["fix", &fix_id]);
+    assert_fix_is_printable_here(world, &fix_id);
+}
+
+#[then("the CLI can act on the fix named for the engine-startup import failure")]
+async fn assert_import_failure_fix_is_runnable_here(world: &mut E2eWorld) {
+    let (report, output) = parsed_diagnosis(world);
+    let fix_id = find_matched(&report, ENGINE_IMPORT_FIX_ID, &output)
+        .pointer("/fix/fix_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| panic!("the matched cause must name a fix id:\n{output}"))
+        .to_owned();
+    assert_fix_is_printable_here(world, &fix_id);
+}
+
+/// Runs `rocm fix <fix_id>` and checks that it prints its advisory plan rather
+/// than refusing on this platform. Shared by the steps that follow a diagnosis
+/// to the fix it named.
+fn assert_fix_is_printable_here(world: &mut E2eWorld, fix_id: &str) {
+    let (fix_output, fix_stderr, rc) = crate::run_rocm(world, &["fix", fix_id]);
     assert_eq!(
         rc,
         0,
         "{}",
-        e2e_cucumber::cli_failure_report(&["fix", &fix_id], rc, &fix_output, &fix_stderr)
+        e2e_cucumber::cli_failure_report(&["fix", fix_id], rc, &fix_output, &fix_stderr)
     );
     assert!(
         fix_output.to_lowercase().contains("print-only"),
