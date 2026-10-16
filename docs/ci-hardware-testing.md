@@ -88,20 +88,21 @@ against the slow DrvFs mount. The distro is deliberately left without ROCm's
 WSL driver bridge — see "What the WSL distro needs" below.
 
 This migration is scoped to the per-PR lanes in this table, plus the nightly
-WSL lane below — not every nightly lane. `nightly.yml`'s Ubuntu and Windows
-Strix lanes (`e2e-gpu-nightly-strix`, `e2e-gpu-nightly-strix-windows`) still
-pin the `native` label and run on the same static, always-on host these per-PR
-lanes moved off of — that label still means what it always did there:
-`native` disambiguates this host from any runner that might carry a bare
-`wsl` label alongside `strix-halo` (the static WSL runner this repo used
-before the WSL lanes below moved to the ephemeral pool). Whether that runner
-remains registered is not something this migration changes either way, since
-nothing here targets a `wsl`-labeled runner anymore. `nightly.yml`'s
-`e2e-wsl-nightly`, however, already moved onto the same DevLab Dispatch pool
-as the per-PR `e2e-wsl` lane above, for the same reason: WSL2 needs no
-dedicated `wsl`-labeled runner, so there is nothing pool-incompatible about
-it. Moving the two `native` nightly lanes onto the pool as well is a
-separate, not-yet-made decision.
+WSL and Windows Strix lanes below — not every nightly lane. `nightly.yml`'s
+Ubuntu Strix lane (`e2e-gpu-nightly-strix`) still pins the `native` label and
+runs on the same static, always-on host these per-PR lanes moved off of —
+that label still means what it always did there: `native` disambiguates this
+host from any runner that might carry a bare `wsl` label alongside
+`strix-halo` (the static WSL runner this repo used before the WSL lanes below
+moved to the ephemeral pool). Whether that runner remains registered is not
+something this migration changes either way, since nothing here targets a
+`wsl`-labeled runner anymore. `nightly.yml`'s `e2e-wsl-nightly` and
+`e2e-gpu-nightly-strix-windows`, however, both moved onto the same DevLab
+Dispatch pool as the per-PR `e2e-wsl`/`e2e-gpu-strix-windows` lanes above, for
+the same reason: neither needs a dedicated `native`- or `wsl`-labeled runner,
+so there is nothing pool-incompatible about either. Moving the remaining
+`native` Ubuntu nightly lane onto the pool as well is a separate, not-yet-made
+decision.
 
 Every label in a `runs-on` must narrow the pool to one kind of hardware. In
 particular the MI300X lane pins `mi300x` rather than `amd-gpu`: `amd-gpu` is
@@ -338,7 +339,9 @@ gh workflow run e2e-selfhosted.yml --ref <ref> -f platform=app-dev-gpu
 Nearly every GPU serve scenario points its `data/runtimes` at one shared,
 pre-warmed managed runtime tree (`E2E_SHARED_RUNTIMES_DIR`), so a multi-GiB
 `rocm install sdk` happens once per runner instead of once per scenario. The tree
-lives on the runner's persistent workspace, survives `git clean`, and is namespaced
+lives on the runner's workspace — persistent across runs on the long-lived
+`native`-labeled hosts, rebuilt by the prewarm step below on each ephemeral
+DevLab Dispatch pool run — survives `git clean`, and is namespaced
 by source-layout generation (`e2e-prewarm-multi-arch-v2`) so a branch using a new
 package layout cannot poison the cache consumed by code that only understands the
 previous layout.
