@@ -10776,8 +10776,16 @@ fn select_auto_gpu_index(
 /// bounds the ordinary stalls only; the unkillable one is prevented by the
 /// pre-flight inside [`rocm_core::amd_smi_json`], not by any timeout.
 ///
-/// Used by `serve` only — [`gpu_vram_usage_amd_smi`] and [`detect_gpu_count`]
-/// are its two consumers and both are reached solely from `serve_cmd::serve`.
+/// Named for `serve` because that is the path the budget is sized for, not
+/// because it is the only one that spends it. [`detect_gpu_count`] is reached
+/// solely from `serve_cmd::serve`, but [`gpu_vram_usage_amd_smi`] is also
+/// reached from [`host_accelerator_memory`], and so from
+/// `assess_model_with_host_paths` on the `--model` readiness path. That path
+/// wants the same answer for the same reason — how much VRAM this host has, to
+/// decide what it can run — so it wants the same budget; the one-shot argument
+/// below applies to it unchanged. It is one probe there rather than two, so the
+/// worst case is 10s, not 20s.
+///
 /// `rocmd`'s watcher has its own, shorter `AMD_SMI_PROBE_TIMEOUT` (2s) for the
 /// same helper: that one fires on a polling cadence where a stalled probe costs
 /// a missed telemetry tick and nothing else, so it can afford to give up early,
