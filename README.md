@@ -490,8 +490,8 @@ Manage multiple side-by-side ROCm runtimes:
 
 ```
 rocm runtimes list
-rocm runtimes activate <runtime-key> [--restart-services] [--yes]
-rocm runtimes rollback [--restart-services] [--yes]
+rocm runtimes activate <runtime-key> [--restart-services [--yes]]
+rocm runtimes rollback [--restart-services [--yes]]
 rocm runtimes uninstall <runtime-key> [--yes] [--dry-run]
 rocm runtimes import <manifest-file> [--replace]
 rocm runtimes adopt --python <path> [--root <path>] [--runtime-id ID]
@@ -583,7 +583,7 @@ updating a few times adds up. `rocm storage` shows where the space went and
 frees the parts that are safe to remove:
 
 ```
-rocm storage [report] [--json]
+rocm storage [report [--json]]
 rocm storage remove-old-installs [--keep N] [--dry-run] [--yes]
 rocm storage remove-downloads [--dry-run] [--yes]
 ```
