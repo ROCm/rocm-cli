@@ -1151,7 +1151,7 @@ const NOT_INVOCATIONS: &[(&str, &str, &str)] = &[
         "heading of the non-interactive launcher report",
     ),
     (
-        "apps/rocm/src/main.rs",
+        "apps/rocm/src/chat.rs",
         "rocm tools: {}",
         "`rocm tools: enabled` status row",
     ),
@@ -1161,27 +1161,27 @@ const NOT_INVOCATIONS: &[(&str, &str, &str)] = &[
         "heading of the model-readiness report, `<command>: <verdict>`, naming what was run",
     ),
     (
-        "apps/rocm/src/main.rs",
+        "apps/rocm/src/chat.rs",
         "rocm install folder",
         "natural-language phrase the planner matches in a request",
     ),
     (
-        "apps/rocm/src/main.rs",
+        "apps/rocm/src/chat.rs",
         "rocm installed at",
         "natural-language phrase the planner matches in a request",
     ),
     (
-        "apps/rocm/src/main.rs",
+        "apps/rocm/src/chat.rs",
         "rocm installed",
         "natural-language phrase the planner matches in a request",
     ),
     (
-        "apps/rocm/src/main.rs",
+        "apps/rocm/src/chat.rs",
         "rocm please",
         "natural-language phrase the planner matches in a request",
     ),
     (
-        "apps/rocm/src/main.rs",
+        "apps/rocm/src/chat.rs",
         "rocm command requires at least one argument",
         "validation error naming the chat `rocm` tool",
     ),
