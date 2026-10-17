@@ -42,8 +42,9 @@ pub fn exe_label(cmd: &str) -> &str {
 /// here rather than keeping a copy: `apps/rocm` already depends on this crate,
 /// so this is the place both can reach without a new crate edge (the reverse,
 /// `rocm-dash-tui -> rocm-core`, is the one `xtask/src/crate_edges.rs`
-/// forbids). The remote `ssh` command line, the CLI's printed `run:` hints and
-/// these approval previews therefore cannot drift apart.
+/// forbids). The remote `ssh` command line, the CLI's printed `run:` hints,
+/// these approval previews and the quit prompt's `rocm services stop` lines
+/// therefore cannot drift apart.
 pub fn quote_display_arg(value: &str) -> String {
     // `=` is left bare because POSIX gives it meaning only in a word ahead of
     // the command name, where `A=b` is an assignment rather than an argument.
