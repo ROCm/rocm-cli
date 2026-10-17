@@ -1418,6 +1418,7 @@ cargo test -p rocm --bin rocm stop_final_write_keeps_what_others_wrote_while_it_
 cargo test -p rocm --bin rocm restart_does_not_start_an_engine_over_an_unconfirmed_stop
 cargo test -p rocm --bin rocm restart_readiness_write_keeps_a_stop_asked_for_while_it_waited
 cargo test -p rocm --bin rocm restart_readiness_write_leaves_a_stop_that_finished_meanwhile
+cargo test -p rocm --bin rocm a_restart_retiring_a_dead_child_keeps_a_stop_asked_for_during_its_check
 cargo test -p rocm --bin rocm restart_reports_a_child_it_could_not_record_and_writes_nothing
 cargo test -p rocm --bin rocm restarted_child_record_names_the_runtime_the_restart_was_pinned_to
 ```

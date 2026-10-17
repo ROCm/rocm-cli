@@ -42,7 +42,8 @@ use crate::serve_summary;
 use crate::service_launch::{
     drop_orphaned_endpoint_key_on_already_running, ensure_background_helper_running_quiet,
     ensure_public_bind_engine_supported, print_managed_launch_plain, resolve_endpoint_auth,
-    run_attached_service, start_managed_service, validate_bind_host,
+    run_attached_service, scripted_managed_engine_startup_failure, start_managed_service,
+    validate_bind_host,
 };
 use crate::{
     cli_progress, collect_serve_notes, detect_gpu_count, device_policy_name, engine_request,
@@ -670,8 +671,12 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     // test reaches Lemonade's backend boundary without real GPU hardware.
     let scripted_backend_failure = cfg!(feature = "e2e-test-hooks")
         && std::env::var_os("ROCM_E2E_LEMONADE_BACKEND_INSTALL_FAILURE").is_some();
+    // The scripted startup-death scenario bypasses the same host precondition, for
+    // the same reason: it asserts what happens *after* a spawn, so it must reach
+    // one without real GPU hardware.
     if !cpu_only
         && !scripted_backend_failure
+        && !scripted_managed_engine_startup_failure()
         && let Some(usable) = visible_gpu_indices.as_deref()
         && usable.is_empty()
     {
@@ -730,8 +735,12 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
             device_policy_name(&device_policy)
         );
     }
+    // Preparation is skipped for the scripted startup-death scenario too: it
+    // asserts the launch, not the install, and a real runtime download is exactly
+    // what the ungated lane cannot do.
     if !matches!(device_policy, DevicePolicy::CpuOnly)
         && engine_manages_own_runtime(&selected_engine)
+        && !scripted_managed_engine_startup_failure()
     {
         ensure_self_managed_engine_ready(&paths, &mut config, &selected_engine)?;
     }
@@ -857,7 +866,7 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
         let mut spinner =
             cli_progress::Spinner::new(format!("Starting {model} on {selected_engine}…"));
         spinner.tick();
-        let report = start_managed_service(
+        let launched = start_managed_service(
             &selected_engine,
             &service_id,
             &model,
@@ -873,7 +882,16 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
             launch_lock,
             require_api_key,
             &mut |_elapsed| spinner.tick(),
-        )?;
+        );
+        // `Spinner` has no `Drop`, so a launch that fails here would otherwise
+        // leave its line painted and the error would print on top of it.
+        let report = match launched {
+            Ok(report) => report,
+            Err(error) => {
+                spinner.clear();
+                return Err(error);
+            }
+        };
         ensure_background_helper_running_quiet(summary_mode)?;
 
         // An equivalent service was already running, so nothing was spawned and the
