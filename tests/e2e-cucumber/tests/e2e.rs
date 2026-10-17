@@ -80,6 +80,10 @@ pub struct E2eWorld {
     /// does not establish that the prune blocked. Set by the When step that
     /// measures it; `None` everywhere else.
     pub cli_elapsed: Option<std::time::Duration>,
+    /// The `ROCM_CLI_DATA_DIR` value a refusal told the user to set, read from
+    /// its stderr by the first step that follows that advice, so later steps
+    /// can follow it again after other commands have replaced `cli_stderr`.
+    pub suggested_data_dir: Option<String>,
     /// Extra environment for `rocm remote` scenarios: a `PATH` carrying the
     /// tailscale stand-in, and the status document it should serve. Set by a
     /// Given step so the When steps stay about what the user does.
@@ -302,6 +306,7 @@ impl Default for E2eWorld {
             cli_stderr: None,
             cli_rc: None,
             cli_elapsed: None,
+            suggested_data_dir: None,
             remote_env: Vec::new(),
             launch_release: None,
             launch_stage: None,
@@ -920,6 +925,44 @@ pub fn run_rocm_with_env(
     for (key, value) in envs {
         cmd.env(key, value);
     }
+    let output = cmd
+        .output()
+        .unwrap_or_else(|e| panic!("failed to run {binary}: {e}"));
+    let rc = output.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    record_command(world.current_scenario.as_deref(), args, rc, &stdout);
+    (
+        stdout,
+        String::from_utf8_lossy(&output.stderr).to_string(),
+        rc,
+    )
+}
+
+/// Like [`run_rocm`], but without `ROCM_CLI_DATA_DIR`, so the CLI has to work
+/// out its data folder from its own settings file as it does for a user who
+/// never set it.
+///
+/// The home directory is pointed inside the scenario's sandbox as well, so the
+/// default data folder the CLI falls back to (`~/.rocm`) is never the real
+/// one on the runner.
+pub fn run_rocm_without_data_dir_override(
+    world: &E2eWorld,
+    args: &[&str],
+) -> (String, String, i32) {
+    let binary = rocm_binary();
+    let home = world
+        .isolated_root
+        .as_ref()
+        .expect("scenario has an isolated root")
+        .path()
+        .join("home");
+    std::fs::create_dir_all(&home).expect("failed to create sandbox home");
+    let mut cmd = std::process::Command::new(&binary);
+    cmd.args(args);
+    world.isolate_cmd(&mut cmd);
+    cmd.env_remove("ROCM_CLI_DATA_DIR");
+    cmd.env("HOME", &home);
+    cmd.env("USERPROFILE", &home);
     let output = cmd
         .output()
         .unwrap_or_else(|e| panic!("failed to run {binary}: {e}"));

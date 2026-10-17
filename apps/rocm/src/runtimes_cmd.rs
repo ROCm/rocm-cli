@@ -445,7 +445,7 @@ impl ActivationSnapshot {
                     .context("active runtime marker path has no parent directory")?;
                 fs::create_dir_all(parent)
                     .with_context(|| format!("failed to create {}", parent.display()))?;
-                therock::write_file_atomically(&path, &bytes)
+                rocm_core::atomic_write::write_file_atomically(&path, &bytes)
                     .with_context(|| format!("failed to restore {}", path.display()))?;
             }
             // Only a regular file is removed: whatever else may sit at that
@@ -1793,7 +1793,7 @@ fn write_active_runtime_marker(paths: &AppPaths, marker: ActiveRuntimeMarker) ->
     // retention holds both read as "nothing is active" — and a failed publish
     // takes its temp file with it, so a retried activation cannot strand one in
     // the folder `rocm runtimes` reads.
-    therock::write_file_atomically(
+    rocm_core::atomic_write::write_file_atomically(
         &path,
         &serde_json::to_vec_pretty(&marker).context("failed to serialize active runtime marker")?,
     )
@@ -4296,5 +4296,79 @@ pub(crate) mod tests {
 
         let _ = fs::remove_dir_all(root);
         Ok(())
+    }
+
+    /// Persisted-state checks for the active-runtime marker. A nested module of
+    /// these tests, rather than part of `therock`'s `persisted_state_props`, so
+    /// it can reach the marker's private writer, reader and fields; named the
+    /// same so `cargo test -p rocm --bin rocm persisted_state_props` still runs
+    /// it.
+    mod persisted_state_props {
+        use std::path::PathBuf;
+
+        use super::super::{
+            ActiveRuntimeMarker, active_runtime_marker_matches, active_runtime_marker_path,
+            write_active_runtime_marker,
+        };
+        use crate::tests::test_paths;
+
+        // ---------------------------------------------------------------------------
+        // Active-runtime marker: which real-output mutations the strict reader rejects.
+        // ---------------------------------------------------------------------------
+
+        /// `active_runtime_marker_matches` (uninstall path) fails loudly on a marker it
+        /// cannot parse; `storage::read_active_runtime_marker` turns the same file into
+        /// "no marker". This enumerates which single-key drops from REAL output put a
+        /// marker into that disagreement, so the reach of the known asymmetry is
+        /// measured rather than assumed.
+        #[test]
+        fn marker_key_drops_that_split_the_two_readers() {
+            let (root, paths) = test_paths("marker-key-drops");
+            write_active_runtime_marker(
+                &paths,
+                ActiveRuntimeMarker {
+                    runtime_id: "therock-release:gfx1151".to_owned(),
+                    runtime_key: "therock-release-gfx1151-7.13.0".to_owned(),
+                    manifest_path: PathBuf::from("/x/registry/k.json"),
+                    install_root: PathBuf::from("/x/r"),
+                    previous_runtime_id: None,
+                    previous_runtime_key: Some("old".to_owned()),
+                    // Realistic, and below u64::MAX on purpose: the mutation below
+                    // goes through `serde_json::Value`, which holds an integer above
+                    // u64::MAX as an f64, and the strict `u128` field then rejects it.
+                    // That would make every mutation look rejected.
+                    activated_at_unix_ms: 1_700_000_000_000,
+                },
+            )
+            .unwrap();
+            let marker_path = active_runtime_marker_path(&paths);
+            let real: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&marker_path).unwrap()).unwrap();
+            assert!(
+                active_runtime_marker_matches(&paths, "therock-release-gfx1151-7.13.0").unwrap()
+            );
+            let mut rejected = Vec::new();
+            for key in real.as_object().unwrap().keys() {
+                let mut mutated = real.clone();
+                mutated.as_object_mut().unwrap().remove(key);
+                std::fs::write(&marker_path, serde_json::to_vec(&mutated).unwrap()).unwrap();
+                if active_runtime_marker_matches(&paths, "therock-release-gfx1151-7.13.0").is_err()
+                {
+                    rejected.push(key.clone());
+                }
+            }
+            let _ = std::fs::remove_dir_all(&root);
+            eprintln!("marker keys whose absence the strict reader rejects: {rejected:?}");
+            assert_eq!(
+                rejected,
+                [
+                    "activated_at_unix_ms",
+                    "install_root",
+                    "manifest_path",
+                    "runtime_id",
+                    "runtime_key",
+                ]
+            );
+        }
     }
 }
