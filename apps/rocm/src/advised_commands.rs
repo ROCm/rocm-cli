@@ -1186,7 +1186,7 @@ const NOT_INVOCATIONS: &[(&str, &str, &str)] = &[
         "validation error naming the chat `rocm` tool",
     ),
     (
-        "apps/rocm/src/main.rs",
+        "apps/rocm/src/chat.rs",
         "rocm command",
         "fallback label for an unrenderable chat tool call",
     ),
