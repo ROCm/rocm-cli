@@ -25,6 +25,7 @@
 use crate::runtime_install_finalize::empty_as_unknown;
 use crate::runtimes_cmd::render_runtimes_text;
 use crate::service_launch::is_loopback_host;
+use crate::shell_quote::has_terminal_control_character;
 use crate::{
     ChatInferenceParams, apply_app_path_env, build_codex_bridge_gpu_snapshot,
     build_codex_bridge_snapshot, builtin_codex_bridge_engine_inventory, cli_version_string,
@@ -2116,9 +2117,16 @@ pub(crate) fn chat_tool_approval_request(
 }
 
 pub(crate) fn validate_chat_tool_call(call: &providers::ChatToolCall) -> Result<()> {
+    // First, because every refusal below names the tool: a model-chosen name
+    // carrying a control character would otherwise reach the terminal inside
+    // the very error that rejects it. This one names nothing.
+    if has_terminal_control_character(&call.name) {
+        bail!("local assistant requested a ROCm tool whose name contains a control character");
+    }
     if !call.arguments.is_object() {
         bail!("ROCm tool `{}` arguments must be a JSON object", call.name);
     }
+    reject_control_characters_in_tool_arguments(&call.name, &call.arguments)?;
     match call.name.as_str() {
         "examine"
         // `doctor` is the dash-side LLM tool + `/doctor` overlay name for the
@@ -2162,6 +2170,86 @@ pub(crate) fn validate_chat_tool_call(call: &providers::ChatToolCall) -> Result<
         _ => {}
     }
     Ok(())
+}
+
+/// The tools exempt from [`reject_control_characters_in_tool_arguments`].
+///
+/// Deny by default: every other tool, including one added later, has its
+/// whole arguments object screened before anything else looks at it. The
+/// criterion that used to pick tools *in* — "its arguments reach the
+/// operator's terminal" — kept missing values that reach it some other way:
+/// `port_status` echoes a refused `host` in its own error, which the CLI
+/// prints. A list of exceptions fails safe when it is forgotten; a list of
+/// guarded tools does not.
+///
+/// `rocm_command` is the one exception, and it is not unscreened: its argv is
+/// checked entry by entry in [`normalized_chat_rocm_command_args`], with the
+/// same predicate, after trimming each entry — so screening the raw object
+/// here would refuse a padded value that path legitimately accepts. Its
+/// `reason` is free-form prose that is never printed.
+///
+/// Pinned by `every_tool_but_the_exempt_one_refuses_a_control_character_anywhere`
+/// (adding a name here turns it red) and
+/// `an_unknown_tool_is_screened_before_it_is_rejected` (going back to an
+/// allow-list turns it red).
+const CHAT_TOOLS_SCREENING_THEIR_OWN_ARGUMENTS: [&str; 1] = ["rocm_command"];
+
+/// Refuse a model-supplied string argument carrying a terminal control or
+/// format character, for every tool not in
+/// [`CHAT_TOOLS_SCREENING_THEIR_OWN_ARGUMENTS`].
+///
+/// Those values are printed: into the command preview an operator approves,
+/// into the `request plan` / `execution` blocks `rocm <request>` emits, into
+/// the plan text `natural_language_plan` returns, into a refusal that echoes
+/// the value it refused, and — for `path_exists` — into a tool-result block
+/// with no gate at all. All of it
+/// reaches a terminal as bytes, so a `\r` returns the cursor to column one and
+/// a CSI sequence erases the line; the model, not this code, then chooses what
+/// the operator reads. Quoting cannot fix that: `'…'` makes the byte literal to
+/// a *shell*, not to a terminal.
+///
+/// Scope note, so the guarantee is not overread: this covers model-supplied
+/// *arguments*, not model-supplied prose. An assistant's reply text is still
+/// printed as it comes; `strip_ansi_sequences` in `comfyui.rs` is the tool for
+/// that surface, and is already used on ComfyUI log output.
+///
+/// Walks the whole arguments object rather than naming fields, so a new
+/// argument on one of these tools inherits the guarantee instead of having to
+/// remember it.
+fn reject_control_characters_in_tool_arguments(
+    tool: &str,
+    arguments: &serde_json::Value,
+) -> Result<()> {
+    if CHAT_TOOLS_SCREENING_THEIR_OWN_ARGUMENTS.contains(&tool) {
+        return Ok(());
+    }
+    reject_control_characters(tool, arguments)
+}
+
+fn reject_control_characters(tool: &str, arguments: &serde_json::Value) -> Result<()> {
+    match arguments {
+        serde_json::Value::String(value) => {
+            if has_terminal_control_character(value) {
+                // The wording is load-bearing for the per-tool test, which
+                // asserts this refusal rather than merely `is_err()` — several
+                // of these tools would refuse a hostile value for some other
+                // reason, and a test that accepted any error would pass with
+                // this guard removed.
+                bail!(
+                    "ROCm tool `{tool}` argument contains a control character; \
+                     it would rewrite what the operator reads"
+                );
+            }
+            Ok(())
+        }
+        serde_json::Value::Array(values) => values
+            .iter()
+            .try_for_each(|value| reject_control_characters(tool, value)),
+        serde_json::Value::Object(entries) => entries
+            .values()
+            .try_for_each(|value| reject_control_characters(tool, value)),
+        _ => Ok(()),
+    }
 }
 
 /// Validate a `proposal_action` chat-tool call: `proposal_id` must be a
@@ -2385,7 +2473,12 @@ pub(crate) fn normalized_chat_rocm_command_args(
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .context("rocm_command `args` entries must be non-empty strings")?;
-        if arg.contains('\0') || arg.contains('\n') || arg.contains('\r') {
+        // Every control character, not only NUL/LF/CR. These args are rendered
+        // into the approval card and the `advanced manual command:` line, which
+        // reach a terminal as bytes — an ESC or a C1 CSI there redraws what the
+        // operator is reading just as effectively as a `\r`, and this list used
+        // to let both through. See `has_terminal_control_character`.
+        if has_terminal_control_character(arg) {
             bail!("rocm_command arguments must not contain control characters");
         }
         if arg.len() > 512 {
@@ -4569,7 +4662,7 @@ endpoint: 127.0.0.1:8001
         assert_eq!(
             rocm_chat_tool_requested_command(&call).as_deref(),
             Some(
-                "rocm install sdk --channel release --format wheel --approve-replacing-active-default --prefix D:\\ROCm\\therock_venvs"
+                "rocm install sdk --channel release --format wheel --approve-replacing-active-default --prefix 'D:\\ROCm\\therock_venvs'"
             )
         );
         let approval = chat_tool_approval_request(
@@ -4769,7 +4862,7 @@ endpoint: 127.0.0.1:8001
         assert_eq!(
             rocm_chat_tool_requested_command(&call).as_deref(),
             Some(
-                "rocm install sdk --channel release --format wheel --prefix D:\\ROCm\\therock_venvs --build-date 06052026 --approve-replacing-active-default"
+                "rocm install sdk --channel release --format wheel --prefix 'D:\\ROCm\\therock_venvs' --build-date 06052026 --approve-replacing-active-default"
             )
         );
         let approval =
@@ -5247,7 +5340,7 @@ model recipes
                     }),
                 },
                 Some(
-                    "rocm install sdk --channel release --format wheel --approve-replacing-active-default --prefix D:\\ROCm\\therock_venvs",
+                    "rocm install sdk --channel release --format wheel --approve-replacing-active-default --prefix 'D:\\ROCm\\therock_venvs'",
                 ),
                 false,
             ),
@@ -7192,5 +7285,645 @@ install therock";
                 "whitespace-only stdin must yield no prompt; input: {input:?}"
             );
         }
+    }
+}
+
+/// Property tests for the command previews an operator consents to.
+///
+/// The invariant under test is one sentence: **the command line shown is the
+/// argv that runs.** It is checked by splitting the rendered preview back the
+/// way a shell word-splitter would and demanding the original argv, because
+/// "looks about right" is exactly the standard that let a `--prefix` path with
+/// a space render as two arguments.
+///
+/// Example-based tests do not find defects here. The shapes that break quoting
+/// — a lone `"`, a bare backslash, an empty argument, a control character — are
+/// the ones nobody writes down, so these draw from a small alphabet that is
+/// mostly metacharacters.
+#[cfg(test)]
+mod command_preview_properties {
+    use super::*;
+    use crate::{
+        ProviderPlannerToolCall, planner_failure_note, provider_planner_response_to_plan,
+        validate_provider_planner_tool_call,
+    };
+    // The one generator, shared with `shell_quote`'s own suite so both are
+    // covered by its reach guard. See `crate::shell_quote::hostile`.
+    use crate::shell_quote::hostile::{arg as hostile_arg, argv as hostile_argv};
+    use proptest::prelude::*;
+
+    /// Characters a terminal acts on rather than prints — the ones that let a
+    /// preview say one thing while a different argv runs.
+    ///
+    /// The last three move no cursor, and are here for that reason: a
+    /// right-to-left override reorders how the rest of the line is drawn, a
+    /// zero-width space hides a difference, and a line separator may start a
+    /// new row.
+    const CONTROL_ALPHABET: &[char] = &[
+        '\n', '\r', '\u{1b}', '\u{8}', '\u{7f}', '\u{9b}', '\0', '\u{202e}', '\u{200b}', '\u{2028}',
+    ];
+
+    /// An argument guaranteed to carry at least one control character.
+    fn control_bearing_arg() -> impl Strategy<Value = String> {
+        (
+            hostile_arg(),
+            proptest::sample::select(CONTROL_ALPHABET),
+            hostile_arg(),
+        )
+            .prop_map(|(head, control, tail)| format!("{head}{control}{tail}"))
+    }
+
+    /// Split a rendered command line the way a POSIX shell would. `None` means
+    /// the preview is not even parseable — a lone unbalanced quote, say.
+    fn split_preview(preview: &str) -> Option<Vec<String>> {
+        shlex::split(preview)
+    }
+
+    fn expect_argv(args: &[String]) -> Vec<String> {
+        std::iter::once("rocm".to_owned())
+            .chain(args.iter().cloned())
+            .collect()
+    }
+
+    /// One case per tool whose arguments carry a string the operator can end
+    /// up reading: its name, and the arguments object that puts a hostile value
+    /// in that field.
+    ///
+    /// These are the realistic shapes — the field each tool actually reads.
+    /// Deny-by-default itself is pinned separately, by
+    /// `every_tool_but_the_exempt_one_refuses_a_control_character_anywhere`,
+    /// which does not depend on which field a tool reads.
+    ///
+    /// Non-hostile fields carry values that pass each tool's own validators, so
+    /// the control character is the only thing under test.
+    #[allow(clippy::type_complexity)]
+    const GUARDED_TOOL_CASES: &[(&str, fn(&str) -> serde_json::Value)] = &[
+        (
+            "install_sdk",
+            |hostile| serde_json::json!({ "channel": "release", "format": "wheel", "prefix": hostile }),
+        ),
+        (
+            "install_sdk_dry_run",
+            |hostile| serde_json::json!({ "channel": "release", "format": "wheel", "prefix": hostile }),
+        ),
+        (
+            "install_engine",
+            |hostile| serde_json::json!({ "engine": hostile }),
+        ),
+        (
+            "launch_server",
+            |hostile| serde_json::json!({ "model": hostile, "host": "127.0.0.1" }),
+        ),
+        (
+            "natural_language_plan",
+            |hostile| serde_json::json!({ "request": hostile }),
+        ),
+        (
+            "path_exists",
+            |hostile| serde_json::json!({ "path": hostile }),
+        ),
+        (
+            "port_status",
+            |hostile| serde_json::json!({ "host": hostile, "port": 8188 }),
+        ),
+        (
+            "proposal_action",
+            |hostile| serde_json::json!({ "proposal_id": hostile, "action": "approve" }),
+        ),
+        (
+            "service_logs",
+            |hostile| serde_json::json!({ "service_id": hostile }),
+        ),
+        (
+            "stop_server",
+            |hostile| serde_json::json!({ "service_id": hostile }),
+        ),
+        (
+            "watcher_disable",
+            |hostile| serde_json::json!({ "watcher": hostile }),
+        ),
+        (
+            "watcher_enable",
+            |hostile| serde_json::json!({ "watcher": hostile }),
+        ),
+    ];
+
+    /// Every tool `validate_chat_tool_call` accepts, written out, minus the
+    /// one in [`CHAT_TOOLS_SCREENING_THEIR_OWN_ARGUMENTS`].
+    ///
+    /// Written out rather than derived, so that exempting a tool is a change
+    /// this list does not follow: it turns
+    /// `every_tool_but_the_exempt_one_refuses_a_control_character_anywhere`
+    /// red instead.
+    const SCREENED_TOOLS: &[&str] = &[
+        "automations",
+        "bridge_snapshot",
+        "doctor",
+        "engines",
+        "examine",
+        "gpu_snapshot",
+        "install_engine",
+        "install_sdk",
+        "install_sdk_dry_run",
+        "launch_server",
+        "natural_language_plan",
+        "path_exists",
+        "port_status",
+        "proposal_action",
+        "service_logs",
+        "services",
+        "stop_server",
+        "update_check",
+        "watcher_disable",
+        "watcher_enable",
+    ];
+
+    fn assert_refused_by_the_guard(call: &providers::ChatToolCall) {
+        let error = validate_chat_tool_call(call)
+            .expect_err(&format!("`{}` accepted {:?}", call.name, call.arguments))
+            .to_string();
+        assert!(
+            error.contains("rewrite what the operator reads"),
+            "`{}` refused {:?} for some other reason ({error}), so this case would \
+             stay green with the control-character guard removed",
+            call.name,
+            call.arguments
+        );
+        assert!(
+            !has_terminal_control_character(&error),
+            "the refusal itself carried the control character: {error:?}"
+        );
+    }
+
+    /// Deny by default: every accepted tool but the self-screening one refuses
+    /// a control character in an argument, whichever argument it is — even one
+    /// the tool never reads.
+    #[test]
+    fn every_tool_but_the_exempt_one_refuses_a_control_character_anywhere() {
+        for tool in SCREENED_TOOLS {
+            assert_refused_by_the_guard(&providers::ChatToolCall {
+                id: None,
+                name: (*tool).to_owned(),
+                arguments: serde_json::json!({ "unexpected": "a\u{1b}[2Kb" }),
+            });
+        }
+    }
+
+    /// A tool nobody has listed anywhere is still screened, before the
+    /// "unsupported tool" refusal — the property an allow-list of guarded
+    /// tools did not have, and the reason the list is now of exemptions.
+    #[test]
+    fn an_unknown_tool_is_screened_before_it_is_rejected() {
+        assert_refused_by_the_guard(&providers::ChatToolCall {
+            id: None,
+            name: "a_tool_added_later".to_owned(),
+            arguments: serde_json::json!({ "target": "x\u{1b}[2Ky" }),
+        });
+    }
+
+    /// The guard walks arrays and nested objects, not only top-level strings,
+    /// so an argument shaped differently from today's is still screened.
+    #[test]
+    fn a_control_character_nested_in_an_array_or_object_is_refused() {
+        for arguments in [
+            serde_json::json!({ "prefix": "/x", "extra": ["a\u{1b}["] }),
+            serde_json::json!({ "prefix": "/x", "extra": { "k": "a\r" } }),
+            serde_json::json!({ "prefix": "/x", "extra": [{ "k": ["a\u{202e}b"] }] }),
+        ] {
+            assert_refused_by_the_guard(&providers::ChatToolCall {
+                id: None,
+                name: "install_sdk".to_owned(),
+                arguments,
+            });
+        }
+    }
+
+    /// A model-chosen tool name is refused without being echoed: every other
+    /// refusal names the tool, and the CLI prints the error.
+    #[test]
+    fn a_tool_name_carrying_a_control_character_is_refused_without_being_echoed() {
+        for name in ["bad\u{1b}[2Ktool", "examine\r", "examine\u{202e}"] {
+            let error = validate_chat_tool_call(&providers::ChatToolCall {
+                id: None,
+                name: name.to_owned(),
+                arguments: serde_json::json!({}),
+            })
+            .expect_err("a tool name carrying a control character must be refused")
+            .to_string();
+            assert!(
+                error.contains("whose name contains a control character"),
+                "refused for the wrong reason: {error:?}"
+            );
+            assert!(!has_terminal_control_character(&error), "{error:?}");
+        }
+    }
+
+    /// `port_status` refuses a non-local host by naming it. A hostile host is
+    /// screened before that refusal can echo it.
+    #[test]
+    fn a_hostile_port_status_host_is_not_echoed_in_its_refusal() {
+        assert_refused_by_the_guard(&providers::ChatToolCall {
+            id: None,
+            name: "port_status".to_owned(),
+            arguments: serde_json::json!({ "host": "x\u{1b}[2Ky", "port": 8188 }),
+        });
+    }
+
+    proptest! {
+        /// The central property, at the renderer: any argv renders to a line
+        /// that splits back to that argv — so, among other things, no argument
+        /// adds or loses a whitespace-delimited word. That `;`, `|` or `>`
+        /// inside a value stay data is a different claim, which `shlex` cannot
+        /// check (it treats none of them as operators); the quoter's real-`sh`
+        /// property in `rocm-dash-tui`'s `ui::exec` does, on unix.
+        #[test]
+        fn a_rendered_tool_call_splits_back_to_its_argv(
+            args in hostile_argv()
+        ) {
+            let preview = format_structured_tool_call("rocm", &args);
+            prop_assert_eq!(
+                split_preview(&preview),
+                Some(expect_argv(&args)),
+                "preview = {:?}",
+                preview
+            );
+        }
+
+        /// The same property end to end through the approval gate: whatever the
+        /// model asks for, either the call is refused, or the `display_command`
+        /// the operator reads splits back to the argv that will be replayed.
+        /// There is no third outcome where it is shown something else.
+        #[test]
+        fn an_approval_preview_denotes_the_argv_it_would_run(
+            prefix in hostile_arg(),
+            version in proptest::option::of(hostile_arg()),
+        ) {
+            let mut arguments = serde_json::json!({
+                "channel": "release",
+                "format": "wheel",
+                "prefix": prefix,
+            });
+            if let Some(version) = version {
+                arguments["version"] = serde_json::Value::String(version);
+            }
+            let call = providers::ChatToolCall {
+                id: None,
+                name: "install_sdk".to_owned(),
+                arguments,
+            };
+            let Ok(request) = chat_tool_approval_request(&call, None) else {
+                // Refused before any preview was built. That is a fine outcome.
+                return Ok(());
+            };
+            let preview = request
+                .display_command
+                .as_deref()
+                .expect("an approval request for install_sdk carries a preview");
+            prop_assert_eq!(
+                split_preview(preview),
+                Some(expect_argv(&request.args)),
+                "preview = {:?}, argv = {:?}",
+                preview,
+                request.args
+            );
+        }
+
+        /// A control character is refused rather than rendered. Quoting cannot
+        /// help: `'…'` is literal to a shell, not to the terminal that is about
+        /// to act on the `\r`.
+        #[test]
+        fn a_control_character_in_a_tool_argument_is_refused(
+            prefix in control_bearing_arg()
+        ) {
+            let call = providers::ChatToolCall {
+                id: None,
+                name: "install_sdk".to_owned(),
+                arguments: serde_json::json!({
+                    "channel": "release",
+                    "format": "wheel",
+                    "prefix": &prefix,
+                }),
+            };
+            prop_assert!(
+                validate_chat_tool_call(&call).is_err(),
+                "a prefix carrying a control character must not reach a preview: {:?}",
+                prefix
+            );
+        }
+
+        /// `rocm_command` screens its own argv rather than going through
+        /// `reject_control_characters_in_tool_arguments` — it also carries a
+        /// free-form `reason` that is never rendered. That check used to name
+        /// `\0`, `\n` and `\r` literally, so an ESC or an 8-bit CSI went
+        /// straight into the approval card and the `advanced manual command:`
+        /// line. It is the broadest argv surface the model has; it must hold
+        /// the same guarantee as the rest.
+        ///
+        /// Stated as "refused, or nothing survives into the preview" rather
+        /// than "refused": this path trims each entry first, so a value whose
+        /// only control characters are at the ends is legitimately accepted —
+        /// with them gone. What must never happen is one reaching the preview.
+        #[test]
+        fn no_control_character_from_a_model_supplied_argv_reaches_the_preview(
+            arg in control_bearing_arg()
+        ) {
+            let call = providers::ChatToolCall {
+                id: None,
+                name: "rocm_command".to_owned(),
+                arguments: serde_json::json!({ "args": ["examine", arg] }),
+            };
+            if validate_chat_tool_call(&call).is_err() {
+                return Ok(());
+            }
+            let preview = rocm_chat_tool_requested_command(&call)
+                .expect("an accepted rocm_command renders a preview");
+            prop_assert!(
+                !has_terminal_control_character(&preview),
+                "arg {:?} put a control character into the preview: {:?}",
+                arg,
+                preview
+            );
+        }
+
+        /// Each tool refuses a control character in the field it actually
+        /// reads, one case per tool in [`GUARDED_TOOL_CASES`].
+        ///
+        /// Asserts the guard's own refusal, not merely an error: `stop_server`
+        /// and `watcher_enable` would reject these values anyway (via
+        /// `ServiceId::new` and the builtin-watcher list), so an `is_err()`
+        /// check would stay green with the guard deleted. And asserts the
+        /// refusal does not carry the character itself, since the CLI prints it.
+        #[test]
+        fn every_guarded_tool_refuses_a_control_character_in_its_rendered_argument(
+            hostile in control_bearing_arg()
+        ) {
+            for (tool, build) in GUARDED_TOOL_CASES {
+                let call = providers::ChatToolCall {
+                    id: None,
+                    name: (*tool).to_owned(),
+                    arguments: build(&hostile),
+                };
+                let error = validate_chat_tool_call(&call)
+                    .expect_err(&format!("`{tool}` accepted {hostile:?}"))
+                    .to_string();
+                prop_assert!(
+                    error.contains("rewrite what the operator reads"),
+                    "`{}` refused {:?} for some other reason ({}), so this case \
+                     would stay green with the control-character guard removed",
+                    tool,
+                    hostile,
+                    error
+                );
+                prop_assert!(!has_terminal_control_character(&error), "{:?}", error);
+            }
+        }
+
+        /// …and the same for the planner's argv, which lands in the `request
+        /// plan` block the operator reads before re-running with `--yes`.
+        #[test]
+        fn a_control_character_from_the_planner_is_refused(
+            arg in control_bearing_arg()
+        ) {
+            let call = ProviderPlannerToolCall {
+                tool: "rocm".to_owned(),
+                args: vec!["install".to_owned(), "sdk".to_owned(), "--prefix".to_owned(), arg],
+            };
+            prop_assert!(validate_provider_planner_tool_call(&call).is_err());
+        }
+
+        /// Whatever survives planner validation renders a plan block whose
+        /// lines are the ones this code wrote — no argument can inject another.
+        ///
+        /// Draws control-bearing arguments on purpose, half the time: the
+        /// shared alphabet's only control character is `\t`, there as
+        /// whitespace, and a test that reached the guard only through it would
+        /// stop doing so the day the alphabet changed.
+        #[test]
+        fn a_validated_planner_argv_cannot_forge_a_plan_line(
+            arg in prop_oneof![hostile_arg(), control_bearing_arg()]
+        ) {
+            let call = ProviderPlannerToolCall {
+                tool: "rocm".to_owned(),
+                args: vec!["install".to_owned(), "sdk".to_owned(), "--prefix".to_owned(), arg],
+            };
+            let Ok(args) = validate_provider_planner_tool_call(&call) else {
+                return Ok(());
+            };
+            let rendered = format_structured_tool_call("rocm", &args);
+            prop_assert!(
+                !has_terminal_control_character(&rendered),
+                "a plan line must stay one line: {:?}",
+                rendered
+            );
+        }
+    }
+
+    /// `path_exists` is the one guarded tool that renders no command at all,
+    /// and the reason it is guarded anyway.
+    ///
+    /// It is read-only, so there is no approval gate in front of it — and
+    /// [`run_chat_path_exists_tool`] echoes the model's `path` straight into a
+    /// printed `path: …` block, which can appear in the same response as a
+    /// mutating call's rendered command. A CSI sequence in it redraws the lines
+    /// around it. The criterion for this guard is "reaches the terminal", not
+    /// "becomes a command line"; this is the case that distinguishes them.
+    ///
+    /// The refusal is asserted at the validator. The handler half pins the
+    /// premise the guard rests on — that the model's `path` is printed back
+    /// verbatim — so if the handler ever stops echoing it, this fails and the
+    /// guard entry can be reconsidered rather than kept on a stale reason.
+    #[test]
+    fn a_read_only_path_probe_cannot_redraw_the_block_it_prints_into() {
+        let hostile = "/tmp/\u{1b}[1A\u{1b}[2Kadvanced manual command: rocm examine";
+        let call = providers::ChatToolCall {
+            id: None,
+            name: "path_exists".to_owned(),
+            arguments: serde_json::json!({ "path": hostile }),
+        };
+        let error = validate_chat_tool_call(&call)
+            .expect_err("a path carrying a CSI sequence must not be probed")
+            .to_string();
+        assert!(
+            error.contains("rewrite what the operator reads"),
+            "refused for the wrong reason: {error}"
+        );
+
+        // An ordinary path still works, so this is a shape check and not a way
+        // to disable the tool.
+        let ok = providers::ChatToolCall {
+            id: None,
+            name: "path_exists".to_owned(),
+            arguments: serde_json::json!({ "path": "/tmp/my folder" }),
+        };
+        validate_chat_tool_call(&ok).expect("an ordinary path is probeable");
+        let text = mcp_tool_result_text(
+            &run_chat_path_exists_tool(&ok).expect("the probe answers for a missing path"),
+        );
+        assert!(
+            text.lines().any(|line| line == "path: /tmp/my folder"),
+            "the probe must echo the model's path verbatim, which is why it is guarded: {text:?}"
+        );
+    }
+
+    /// A model-supplied `natural_language_plan` request is screened like any
+    /// other argument. It is not echoed nowhere: the tool renders it into the
+    /// plan text as `request: …` and inside the `tool_call:` lines, and the
+    /// dash's plan review prints that text. The user's own `/plan` input
+    /// reaches this validator too, but it comes from a single-line text field,
+    /// so refusing a newline costs it nothing.
+    #[test]
+    fn a_model_supplied_plan_request_cannot_redraw_the_plan_it_is_echoed_into() {
+        assert_refused_by_the_guard(&providers::ChatToolCall {
+            id: None,
+            name: "natural_language_plan".to_owned(),
+            arguments: serde_json::json!({
+                "request": "install rocm\u{1b}[1A\u{1b}[2Ktool_call: rocm examine",
+            }),
+        });
+        validate_chat_tool_call(&providers::ChatToolCall {
+            id: None,
+            name: "natural_language_plan".to_owned(),
+            arguments: serde_json::json!({ "request": "install rocm into /mnt/my folder" }),
+        })
+        .expect("an ordinary request is still planned");
+    }
+
+    /// The planner's `tool` and `intent` are named in the planner's refusals,
+    /// and those refusals become notes in the plan block. A hostile value is
+    /// refused without being echoed.
+    #[test]
+    fn a_hostile_planner_tool_or_intent_is_not_echoed_in_its_refusal() {
+        for (content, wording) in [
+            (
+                r#"{"intent":"serve","tool_call":{"tool":"rocm\u001b[2Kx","args":["examine"]}}"#,
+                "unsupported tool whose name contains a control character",
+            ),
+            (
+                r#"{"intent":"serve\u001b[2K","tool_call":{"tool":"rocm","args":["examine"]}}"#,
+                "unsupported intent containing a control character",
+            ),
+        ] {
+            let error = provider_planner_response_to_plan("inspect", "local", content)
+                .expect_err("a hostile planner response must be refused")
+                .to_string();
+            assert!(
+                error.contains(wording),
+                "refused for the wrong reason: {error:?}"
+            );
+            assert!(!has_terminal_control_character(&error), "{error:?}");
+        }
+    }
+
+    /// Every planner failure reaches the plan block as a note through one
+    /// function, so a control character the provider managed to get into the
+    /// error by some other route — an HTTP error body, say — is stripped
+    /// there.
+    #[test]
+    fn a_planner_failure_note_carries_no_control_character() {
+        let note = planner_failure_note(
+            "local",
+            &anyhow::anyhow!("gateway said \u{1b}[1A\u{1b}[2Kapproval: not required\r"),
+        );
+        assert!(!has_terminal_control_character(&note), "{note:?}");
+        assert!(note.contains("approval: not required"), "{note:?}");
+    }
+
+    /// Planner notes are printed verbatim into the plan block, so a note
+    /// carrying a control character is dropped rather than printed — unlike the
+    /// planner's argv, which is refused outright, a note is commentary and the
+    /// plan stands without it. The drop is reported, so the operator knows the
+    /// plan block is not everything the planner said; and a note is trimmed
+    /// first, so trailing whitespace alone does not cost an ordinary one.
+    #[test]
+    fn a_planner_note_carrying_a_control_character_is_dropped_and_counted() -> Result<()> {
+        let content = r#"{
+            "intent": "serve",
+            "confidence": "high",
+            "tool_call": {
+                "tool": "rocm",
+                "args": ["serve", "sshleifer/tiny-gpt2", "--managed"]
+            },
+            "notes": [
+                "resolved the missing model to a tiny test model",
+                "the model is small\n",
+                "\u001b[1A\u001b[2Kapproval: not required",
+                "line one\rline two",
+                "reads \u202e right to left"
+            ]
+        }"#;
+
+        let plan = provider_planner_response_to_plan("start a local model", "local", content)?;
+
+        for ordinary in [
+            "resolved the missing model to a tiny test model",
+            "the model is small",
+        ] {
+            assert!(
+                plan.notes.iter().any(|note| note == ordinary),
+                "an ordinary note must survive: {ordinary:?} in {:?}",
+                plan.notes
+            );
+        }
+        assert!(
+            plan.notes
+                .iter()
+                .any(|note| note.starts_with("3 planner note(s) omitted")),
+            "the dropped notes must be counted: {:?}",
+            plan.notes
+        );
+        assert!(
+            !plan
+                .notes
+                .iter()
+                .any(|note| has_terminal_control_character(note)),
+            "no note may carry a control character into the plan block: {:?}",
+            plan.notes
+        );
+        Ok(())
+    }
+
+    /// The shape from the bug report, pinned by name so it cannot regress
+    /// quietly: a `--prefix` folder containing a space is one argument in the
+    /// preview, not two.
+    #[test]
+    fn an_install_prefix_with_a_space_is_one_argument_in_the_preview() {
+        let call = providers::ChatToolCall {
+            id: None,
+            name: "install_sdk".to_owned(),
+            arguments: serde_json::json!({
+                "channel": "release",
+                "format": "wheel",
+                "prefix": "/mnt/my folder",
+            }),
+        };
+        let request = chat_tool_approval_request(&call, None).expect("install_sdk is approvable");
+        let preview = request.display_command.expect("preview");
+        assert!(
+            preview.contains("--prefix '/mnt/my folder'"),
+            "the folder must be delimited, not left to read as two arguments: {preview}"
+        );
+        assert_eq!(split_preview(&preview), Some(expect_argv(&request.args)));
+    }
+
+    /// A prompt is interpolated into a `run:` line the CLI offers to be copied.
+    /// Unquoted, `$HOME` in it expands in the user's own shell when they paste
+    /// it, so they run a different command from the one they were shown.
+    #[test]
+    fn a_copyable_command_survives_being_pasted() {
+        let args = vec![
+            "chat".to_owned(),
+            "--prompt".to_owned(),
+            "what is $HOME doing?".to_owned(),
+        ];
+        let preview = format_structured_tool_call("rocm", &args);
+        assert_eq!(
+            split_preview(&preview),
+            Some(expect_argv(&args)),
+            "preview = {preview}"
+        );
+        assert!(
+            !preview.contains("\"what is $HOME doing?\""),
+            "a double-quoted form would still expand $HOME on paste: {preview}"
+        );
     }
 }

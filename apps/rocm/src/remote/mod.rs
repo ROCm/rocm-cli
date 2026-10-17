@@ -31,6 +31,7 @@ use anyhow::{Context, Result, bail};
 use clap::Subcommand;
 use rocm_core::{AppPaths, ManagedServiceRecord};
 
+use crate::shell_quote::shell_quote;
 use session::RemoteSessionRecord;
 use transport::{SshTransport, Transport};
 
@@ -545,8 +546,7 @@ fn unwind_partial_serve(
 
     if let Some(service_id) = service_id {
         match transport.exec(&crate::service_hints::remote_service_stop_hint(
-            remote_cli,
-            &shell_quote(service_id),
+            remote_cli, service_id,
         )) {
             Ok(outcome) if outcome.success => {}
             Ok(outcome) => leftovers.push(format!(
@@ -1105,7 +1105,7 @@ fn stop_with_transport(
     let withdrawn = publish::withdraw(transport, record.tailnet_port, record.remote_port);
     let stopped = transport.exec(&crate::service_hints::remote_service_stop_hint(
         &record.remote_cli,
-        &shell_quote(&record.remote_service_id),
+        &record.remote_service_id,
     ));
     let stop_failure = describe_stop_failure(&stopped);
     let model_stopped = stop_failure.is_none();
@@ -1240,22 +1240,6 @@ fn render_stopped(
         }
     }
     output
-}
-
-/// Quote a value for a POSIX remote shell.
-///
-/// Model names and engine flags are user-supplied values being placed into a
-/// command line that a shell on another machine will interpret. Anything not
-/// obviously inert gets single-quoted, with embedded single quotes closed and
-/// re-opened, so no input can end the quoting and start a new command.
-fn shell_quote(value: &str) -> String {
-    let inert = |character: char| {
-        character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | '/' | ':' | '=')
-    };
-    if !value.is_empty() && value.chars().all(inert) {
-        return value.to_owned();
-    }
-    format!("'{}'", value.replace('\'', r"'\''"))
 }
 
 #[cfg(test)]
@@ -1439,35 +1423,9 @@ mod tests {
         assert!(command.contains("--gpu 1"), "{command}");
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn hostile_values_survive_a_real_shell_as_one_literal_argument() {
-        // The property that matters is not the shape of the quoting but what a
-        // shell does with it. Ask one: each value must come back byte-identical,
-        // proving it was neither expanded nor split nor able to start a second
-        // command.
-        for value in [
-            "x'; rm -rf ~; echo '",
-            "$(id)",
-            "`id`",
-            "a b",
-            "it's",
-            "*",
-            "--not-a-flag",
-            "qwen2.5-7b-instruct",
-        ] {
-            let output = std::process::Command::new("sh")
-                .arg("-c")
-                .arg(format!("printf %s {}", shell_quote(value)))
-                .output()
-                .expect("sh should run");
-            assert_eq!(
-                String::from_utf8_lossy(&output.stdout),
-                value,
-                "shell mangled {value:?}"
-            );
-        }
-    }
+    // The quoter's own tests, including a real `sh` reading a hostile value
+    // back, are with the quoter in `rocm-dash-tui`'s `ui::exec`. This one
+    // pins what is specific to this module: that the remote command uses it.
 
     #[test]
     fn a_hostile_model_name_is_quoted_into_the_remote_command() {
@@ -1483,16 +1441,6 @@ mod tests {
         assert!(command.contains(r"'\''"), "{command}");
         // And the flags we control still follow it as real flags.
         assert!(command.contains("--require-api-key"), "{command}");
-    }
-
-    #[test]
-    fn shell_quoting_leaves_ordinary_values_alone_and_wraps_the_rest() {
-        for inert in ["qwen2.5-7b-instruct", "vllm", "/models/a.gguf", "auto"] {
-            assert_eq!(shell_quote(inert), inert);
-        }
-        assert_eq!(shell_quote("a b"), "'a b'");
-        assert_eq!(shell_quote(""), "''");
-        assert_eq!(shell_quote("it's"), r"'it'\''s'");
     }
 
     #[test]
@@ -2078,6 +2026,55 @@ mod tests {
              the hint prints, --yes included: {:?}",
             transport.calls()
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The service ids the two remote stop paths send, split the way the remote
+    /// shell will split them. `remote_service_stop_hint` quotes the id itself,
+    /// so a caller that quoted it again would send the quotes as part of the id.
+    fn sent_stop_argvs(transport: &ScriptedTransport) -> Vec<Vec<String>> {
+        transport
+            .calls()
+            .into_iter()
+            .filter_map(|call| match call {
+                TransportCall::Exec { command, .. } if command.contains("services stop") => {
+                    shlex::split(&command)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn stop_argv(service_id: &str) -> Vec<String> {
+        ["rocm", "services", "stop", service_id, "--yes"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    // Mutation: quoting the id at either call site as well as in the hint
+    // builder, or at neither, fails this.
+    #[test]
+    fn both_remote_stop_paths_send_the_service_id_as_one_word() {
+        let awkward = "svc 'a b'";
+
+        let (root, paths) = temp_paths("unwind-awkward-id");
+        let transport = ScriptedTransport::new(vec![ScriptedStep::ok("services stop", "")]);
+        let leftovers =
+            unwind_partial_serve(&transport, &paths, "sess", "rocm", Some(awkward), None);
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+        assert_eq!(sent_stop_argvs(&transport), vec![stop_argv(awkward)]);
+        let _ = std::fs::remove_dir_all(root);
+
+        let (root, paths) = temp_paths("stop-awkward-id");
+        let mut record = seeded_session(&paths);
+        record.remote_service_id = awkward.to_owned();
+        let transport = ScriptedTransport::new(vec![
+            ScriptedStep::ok("tailscale serve status", "{}"),
+            ScriptedStep::ok("services stop", ""),
+        ]);
+        stop_with_transport(&transport, &paths, &record, false).expect("a confirmed stop succeeds");
+        assert_eq!(sent_stop_argvs(&transport), vec![stop_argv(awkward)]);
         let _ = std::fs::remove_dir_all(root);
     }
 

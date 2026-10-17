@@ -65,6 +65,7 @@ libc.workspace = true
 # example misses. Same version and features as rocm-core's, so no new crate or
 # feature enters the lockfile. Test-only, so it adds nothing to any shipped
 # binary.
+# Also used to check that approval previews split back to the argv that runs.
 proptest = { version = "1", default-features = false, features = ["std"] }
 # Same rig-core as [dependencies], with its `test-utils` feature (gives
 # `MockCompletionModel`/`MockTurn`) added for test builds only. The root
@@ -75,3 +76,4 @@ proptest = { version = "1", default-features = false, features = ["std"] }
 rig = { package = "rig-core", version = "=0.38.1", default-features = false, features = [
     "test-utils",
 ] }
+shlex.workspace = true

@@ -620,10 +620,9 @@ pub(crate) fn install(
         let changes = swap_changes_summary(&swap)
             .map(|summary| format!(" ({summary})"))
             .unwrap_or_default();
-        error.context(format!(
-            "the new ComfyUI code is in place{changes}, but the install did not finish; once \
-             the cause below is fixed, run `rocm comfyui install --runtime-id {}` to finish it",
-            runtime.manifest.runtime_key
+        error.context(unfinished_install_advice(
+            &changes,
+            &runtime.manifest.runtime_key,
         ))
     })?;
 
@@ -759,8 +758,30 @@ fn ensure_source_is_startable(manifest: &ComfyUiManifest) -> Result<()> {
 /// started there finds the swap's marker and completes it.
 fn interrupted_reinstall_advice(runtime_key: &str) -> String {
     format!(
-        "a reinstall was interrupted; run `rocm comfyui install --runtime-id {runtime_key}` to \
-         finish it"
+        "a reinstall was interrupted; run `{}` to finish it",
+        finishing_install_command(runtime_key)
+    )
+}
+
+/// What a failure after the swap says: the new code is in place, what it
+/// changed (`changes`, already rendered with its leading space, or empty), and
+/// the install that finishes it.
+fn unfinished_install_advice(changes: &str, runtime_key: &str) -> String {
+    format!(
+        "the new ComfyUI code is in place{changes}, but the install did not finish; once the \
+         cause below is fixed, run `{}` to finish it",
+        finishing_install_command(runtime_key)
+    )
+}
+
+/// The `rocm comfyui install` line both pieces of advice above tell the user
+/// to run. The key is quoted like every other value in a line the CLI offers
+/// to be copied (see [`crate::shell_quote`]), so the line names exactly the
+/// argv that finishes the install.
+fn finishing_install_command(runtime_key: &str) -> String {
+    format!(
+        "rocm comfyui install --runtime-id {}",
+        crate::shell_quote::shell_quote(runtime_key)
     )
 }
 
@@ -4480,6 +4501,50 @@ mod tests {
         assert_eq!(fs::read_to_string(source.join("main.py"))?, "new main");
         remove_test_root(&paths);
         Ok(())
+    }
+
+    /// Both pieces of advice name an install to run as printed, so the line
+    /// must split back to exactly that argv whatever the runtime key holds.
+    /// The key is read back by stripping the fixed text around it rather than
+    /// splitting on the backticks, which a hostile key may itself contain.
+    /// Mutation: interpolating the key bare in `finishing_install_command`
+    /// fails this for both.
+    #[test]
+    fn finishing_advice_names_the_install_as_its_argv() {
+        use proptest::prelude::*;
+        use proptest::test_runner::{Config, TestRunner};
+
+        let mut runner = TestRunner::new(Config {
+            cases: 256,
+            ..Config::default()
+        });
+        runner
+            .run(&crate::shell_quote::hostile::arg(), |runtime_key| {
+                let expected = ["rocm", "comfyui", "install", "--runtime-id", &runtime_key]
+                    .map(str::to_owned)
+                    .to_vec();
+                for (message, prefix, suffix) in [
+                    (
+                        interrupted_reinstall_advice(&runtime_key),
+                        "a reinstall was interrupted; run `",
+                        "` to finish it",
+                    ),
+                    (
+                        unfinished_install_advice(" (replaced: comfy)", &runtime_key),
+                        "the new ComfyUI code is in place (replaced: comfy), but the install \
+                         did not finish; once the cause below is fixed, run `",
+                        "` to finish it",
+                    ),
+                ] {
+                    let command = message
+                        .strip_prefix(prefix)
+                        .and_then(|rest| rest.strip_suffix(suffix))
+                        .unwrap_or_else(|| panic!("unexpected advice: {message}"));
+                    prop_assert_eq!(shlex::split(command), Some(expected.clone()), "{}", message);
+                }
+                Ok(())
+            })
+            .unwrap();
     }
 
     /// What a failure after the swap says it changed: both kinds of change,
