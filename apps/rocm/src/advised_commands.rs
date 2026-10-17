@@ -2096,6 +2096,25 @@ fn every_command_in_a_shell_list_is_checked() {
     );
 }
 
+/// Prose may follow a command after an em dash, an en dash or an arrow
+/// (`rocm examine — check the host first`). Each marker ends the command, so
+/// the description is not read as arguments; dropping any one of them from
+/// `command_parts` turns that prose into words clap rejects.
+#[test]
+fn a_dash_or_arrow_ends_the_command_before_its_description() {
+    for raw in [
+        "rocm examine — check the host first",
+        "rocm examine – check the host first",
+        "rocm examine → then read the report",
+    ] {
+        assert_eq!(command_parts(raw), vec!["rocm examine"], "{raw}");
+        assert!(
+            findings(&[fixture(raw, Surface::CommandLine)]).is_empty(),
+            "{raw}"
+        );
+    }
+}
+
 /// A double space inside a command is just whitespace; only a help EXAMPLES
 /// row puts a description column after one.
 #[test]
