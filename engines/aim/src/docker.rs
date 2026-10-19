@@ -46,13 +46,7 @@ pub(crate) fn run(
         if let Some(csv) = rocm_engine_protocol::gpu_indices_to_csv(gpu_indices) {
             command.arg("-e").arg(format!("HIP_VISIBLE_DEVICES={csv}"));
         }
-        command
-            .arg("--device=/dev/kfd")
-            .arg("--device=/dev/dri")
-            .arg("--ipc=host");
-        if let Some(gid) = render_gid {
-            command.arg("--group-add").arg(gid.to_string());
-        }
+        command.args(gpu_device_args(rocm_core::is_wsl_host(), render_gid));
     }
 
     command.args(extra_env_args(extra_env));
@@ -70,6 +64,28 @@ pub(crate) fn run(
         );
     }
     Ok(())
+}
+
+/// GPU device/mount args for `docker run`, branched by host. WSL2 exposes the
+/// GPU through the dxcore device model (`/dev/dxg`, with the host's dxcore
+/// libs bind-mounted in since the container image doesn't ship them) — it has
+/// no `/dev/kfd`, `/dev/dri`, or render-group gid, which are native-Linux
+/// kernel concepts that don't apply there.
+fn gpu_device_args(wsl: bool, render_gid: Option<u32>) -> Vec<String> {
+    let mut args = vec!["--ipc=host".to_owned()];
+    if wsl {
+        args.push("--device=/dev/dxg".to_owned());
+        args.push("-v".to_owned());
+        args.push("/usr/lib/wsl/lib:/usr/lib/wsl/lib".to_owned());
+    } else {
+        args.push("--device=/dev/kfd".to_owned());
+        args.push("--device=/dev/dri".to_owned());
+        if let Some(gid) = render_gid {
+            args.push("--group-add".to_owned());
+            args.push(gid.to_string());
+        }
+    }
+    args
 }
 
 /// Resolves the host's `render` group gid dynamically (host-specific, so it
@@ -209,8 +225,35 @@ pub(crate) fn daemon_reachable() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::extra_env_args;
+    use super::{extra_env_args, gpu_device_args};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn gpu_device_args_native_linux_uses_kfd_dri_and_render_gid() {
+        assert_eq!(
+            gpu_device_args(false, Some(993)),
+            vec![
+                "--ipc=host",
+                "--device=/dev/kfd",
+                "--device=/dev/dri",
+                "--group-add",
+                "993"
+            ]
+        );
+    }
+
+    #[test]
+    fn gpu_device_args_wsl2_uses_dxg_device_and_wsl_lib_mount() {
+        assert_eq!(
+            gpu_device_args(true, Some(993)),
+            vec![
+                "--ipc=host",
+                "--device=/dev/dxg",
+                "-v",
+                "/usr/lib/wsl/lib:/usr/lib/wsl/lib"
+            ]
+        );
+    }
 
     #[test]
     fn render_group_gid_parses_getent_format() {
