@@ -635,6 +635,13 @@ async fn setup_lemonade_hf_checkpoint_model(world: &mut E2eWorld) {
 
 #[given("a model is being served on aim")]
 async fn setup_aim_model(world: &mut E2eWorld) {
+    serve_aim_canary(world).await;
+}
+
+/// Serves the same hardware-verified AIM canary [`setup_aim_model`] does.
+/// Factored out so the lifecycle-parity scenario can call it a second time,
+/// after stopping the service, without duplicating the image/profile pin.
+async fn serve_aim_canary(world: &mut E2eWorld) {
     // Serves via the raw AIM Docker image reference rather than the catalog
     // recipe added in ROCMAI-555 — this is a hardware-verified serve+inference
     // canary pinned to one exact image/profile, not a catalog-discovery test.
@@ -667,6 +674,27 @@ async fn setup_aim_model(world: &mut E2eWorld) {
         "Qwen3.5-9B",
     )
     .await;
+}
+
+/// Stops the AIM service this scenario started and asserts the stop actually
+/// took: reuses [`stop_scenario_services`] (itself `crate::stop_managed_services`,
+/// the same real-record stop the serve-retry path and scenario teardown use),
+/// rather than a hardcoded service id — the AIM canary's id comes from a real
+/// `--managed` launch, not a planted record, so there is no fixed id to match.
+#[when("the user stops the AIM service")]
+async fn stop_aim_service(world: &mut E2eWorld) {
+    let status = stop_scenario_services(world);
+    assert!(
+        status.contains(": stopped"),
+        "expected the AIM service to stop cleanly, got: {status}"
+    );
+}
+
+/// Serves the same AIM canary again, proving the engine can be launched a
+/// second time after a stop — the restart half of lifecycle parity.
+#[when("the user serves that same model on aim again")]
+async fn reserve_aim_model(world: &mut E2eWorld) {
+    serve_aim_canary(world).await;
 }
 
 #[given("a large model is being served on GPU")]

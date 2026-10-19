@@ -360,3 +360,20 @@ Feature: Model serving
     When the user sends a chat completion request
     Then the response contains a model reply
     And the response identifies the correct model
+
+  # Lifecycle parity for AIM (ROCMAI-554). AIM's engine integration is new
+  # enough that nothing had yet proven a container-backed service can be
+  # stopped and relaunched like any other managed engine's — this reuses the
+  # same stop path the serve-retry logic and scenario teardown already rely
+  # on (`stop_managed_services`, via the `stop_aim_service` step), and the
+  # same serve+inference fixture `serve-26` uses, rather than adding a new
+  # stop/restart mechanism just for AIM.
+  @id:serve-aim-lifecycle-parity @requires-gpu @requires-engine:aim @serve-timeout:1200
+  Scenario: serve-27 - A stopped AIM service can be restarted and serves inference again
+    Given a managed runtime is active
+    And a model is being served on aim
+    When the user stops the AIM service
+    And the user serves that same model on aim again
+    And the user sends a chat completion request
+    Then the response contains a model reply
+    And the response identifies the correct model
