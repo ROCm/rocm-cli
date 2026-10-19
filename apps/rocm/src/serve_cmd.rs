@@ -1173,6 +1173,7 @@ mod tests {
                 ],
                 notes: vec!["adapter hint".to_owned()],
                 model_id_override: None,
+                image_digest: None,
             },
             rocm_core::ModelRecipeEngineRecord {
                 engine: "lemonade".to_owned(),
@@ -1182,6 +1183,7 @@ mod tests {
                 unsupported_combinations: Vec::new(),
                 notes: Vec::new(),
                 model_id_override: None,
+                image_digest: None,
             },
         ];
 

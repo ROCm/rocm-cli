@@ -19897,6 +19897,7 @@ pub(crate) mod tests {
             }],
             notes: vec!["metadata only; not applied to launches yet".to_owned()],
             model_id_override: None,
+            image_digest: None,
         }];
         let mut output = String::new();
 

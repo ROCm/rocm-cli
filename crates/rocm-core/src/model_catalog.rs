@@ -80,6 +80,12 @@ pub struct ModelRecipeEngineRecord {
     /// id for Lemonade versus a Hugging Face repo id for vLLM).
     #[serde(default)]
     pub model_id_override: Option<String>,
+    /// Pins the container image this engine serves the model from to a specific
+    /// digest (`sha256:...`), rather than a floating tag. Currently informational
+    /// only (no verification against it yet); used by container-based engines
+    /// such as AIM.
+    #[serde(default)]
+    pub image_digest: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
@@ -945,6 +951,7 @@ mod tests {
             }],
             notes: vec!["metadata only; adapter protocol does not consume this yet".to_owned()],
             model_id_override: None,
+            image_digest: None,
         });
         let index = ModelRecipeIndexDocument {
             schema_version: 1,
