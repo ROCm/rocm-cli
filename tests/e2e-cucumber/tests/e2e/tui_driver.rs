@@ -407,6 +407,121 @@ impl TuiSession {
         format!("--- last screen ({cols}x{rows}) ---\n{screen}\n--- end screen ---")
     }
 
+    /// Reconstructs a popup's own body text as one word-wrap-undone string,
+    /// immune to the host's incidental terminal width budget — unlike
+    /// `screen_text()`, which hands back the raw grid with `Wrap`-induced row
+    /// breaks still in it and sibling panels' text still occupying the same
+    /// physical rows the popup's own content wrapped onto (PR #707 review,
+    /// 2026-10-16: a long enough host temp path wrapped a quoted argument
+    /// across rows and a single-row substring match on the raw grid timed
+    /// out even though the popup rendered it correctly).
+    ///
+    /// Stays black-box like the rest of this driver (see the module doc):
+    /// it finds the popup's own left/right content columns from the
+    /// rendered title row itself, not from replicating `centered_rect`'s
+    /// layout math, so it tracks the real geometry regardless of future
+    /// layout changes.
+    ///
+    /// `title_bar` is the exact title text passed to `draw_popup_frame`
+    /// (e.g. `"Review: <req.title>"` for an approval popup) — not the
+    /// popup's whole border row, just the text inside it. The title row is
+    /// rendered `╭─╮<title_bar>╭───...───╮` (`panel::popup`'s "rounded +
+    /// notch" framing: a short decorative notch directly left of the title,
+    /// then the rest of the border running to the box's own right corner),
+    /// so the nearest `╭` to the left of `title_bar` and the nearest `╮` to
+    /// its right — each reached by walking outward through nothing but
+    /// border characters — are this popup's own left/right columns. Body
+    /// rows run from just below the title row to just above the row
+    /// carrying the literal `"Approve ("` button label; each is sliced to
+    /// that same column span, discarding whatever sibling panels draw
+    /// outside it on those same physical rows.
+    ///
+    /// Rejoining those slices is not a uniform single space per break:
+    /// `Wrap` only breaks at a word boundary when the *next* word doesn't
+    /// fit, which leaves that row's own trailing cells blank — so a row
+    /// with no trailing blank was a hard mid-word split instead (a single
+    /// token wider than the whole popup, e.g. a long host path with no
+    /// spaces in it), and concatenating two such slices with an inserted
+    /// space would corrupt the very thing being reconstructed. So: a row
+    /// that ends with trailing blank gets a join space before the next
+    /// row's content; a row that fills every column of its own slice does
+    /// not. (A word-boundary wrap landing exactly flush with zero leftover
+    /// width is the one case this can't tell apart from a hard split, and
+    /// reads as the latter — rare enough, and low-stakes enough for a test
+    /// assertion, not to be worth a more elaborate signal.) The whole
+    /// result is whitespace-normalized afterward regardless, so this makes
+    /// no claim about the exact rendered spacing beyond reconstructing the
+    /// one real space a word-boundary wrap consumed — which is all
+    /// `wait_for_popup_body_where`'s callers need.
+    fn popup_body_text(&self, title_bar: &str) -> Result<String, String> {
+        let (screen, _) = self.screen_snapshot();
+        let rows: Vec<&str> = screen.split('\n').collect();
+        let title_row_idx = rows
+            .iter()
+            .position(|r| r.contains(title_bar))
+            .ok_or_else(|| format!("no row contains the popup title {title_bar:?}"))?;
+        let title_row: Vec<char> = rows[title_row_idx].chars().collect();
+        let title_start_bytes = rows[title_row_idx]
+            .find(title_bar)
+            .expect("just matched via contains");
+        // Byte offset from `find` -> char offset: box-drawing glyphs are
+        // multi-byte UTF-8 but exactly one terminal column each, so the two
+        // only agree on plain ASCII.
+        let title_start = rows[title_row_idx][..title_start_bytes].chars().count();
+
+        const BORDER: [char; 3] = ['─', '╭', '╮'];
+        let mut left = title_start;
+        while left > 0 && BORDER.contains(&title_row[left - 1]) {
+            left -= 1;
+        }
+        if title_row.get(left) != Some(&'╭') {
+            return Err(format!(
+                "expected the popup's own left corner '╭' immediately (through border characters only) before {title_bar:?}, found {:?} at column {left}",
+                title_row.get(left)
+            ));
+        }
+
+        let title_end = title_start + title_bar.chars().count();
+        // Mirrors the right-hand border the same way `panel::popup` draws it:
+        // a `╭` reopens the border right after the title (its own small
+        // right-hand notch, symmetric to the left one above), then dashes,
+        // then the box's true closing `╮` — not a bare run of dashes.
+        let mut right = title_end;
+        while right < title_row.len() && BORDER.contains(&title_row[right]) {
+            right += 1;
+        }
+        right = right.saturating_sub(1);
+        if right < title_end || title_row.get(right) != Some(&'╮') {
+            return Err(format!(
+                "expected the popup's own right corner '╮' immediately (through border characters only) after {title_bar:?}, found {:?} at column {right}",
+                title_row.get(right)
+            ));
+        }
+
+        let mut reconstructed = String::new();
+        let mut pending_join_space = false;
+        for row in rows.iter().skip(title_row_idx + 1) {
+            if row.contains("Approve (") {
+                break;
+            }
+            let chars: Vec<char> = row.chars().collect();
+            if left + 1 >= right || right > chars.len() {
+                continue;
+            }
+            let slice: String = chars[left + 1..right].iter().collect();
+            let trimmed = slice.trim_end();
+            if pending_join_space && !reconstructed.is_empty() {
+                reconstructed.push(' ');
+            }
+            reconstructed.push_str(trimmed);
+            pending_join_space = trimmed.len() < slice.len();
+        }
+        Ok(reconstructed
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" "))
+    }
+
     /// Take the reader thread's recorded panic message, if any, clearing it so
     /// it's only reported once. Checked on every poll in `wait_for_screen`/
     /// `wait_for_exit` so a reader-thread fault surfaces immediately with a
@@ -678,6 +793,53 @@ impl TuiSession {
             }
             if is_ready(&self.screen_text()) {
                 return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "timed out after {timeout:?} waiting until {describe}.\n{}",
+                    self.framed_screen()
+                ));
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+
+    /// Like [`wait_for_screen_where`](Self::wait_for_screen_where), but
+    /// `is_ready` sees [`popup_body_text`](Self::popup_body_text)'s
+    /// word-wrap-undone reconstruction of the popup titled `title_bar`
+    /// instead of the raw screen grid — for a popup whose content can wrap
+    /// across rows depending on the host's own, uncontrollable path
+    /// lengths. A popup not yet open (or not yet matching) is "not ready"
+    /// the same way an absent string is for `wait_for_screen_where`, not a
+    /// hard error — [`popup_body_text`](Self::popup_body_text)'s `Err` only
+    /// means try again next tick, same as the plain substring check above.
+    pub async fn wait_for_popup_body_where(
+        &mut self,
+        describe: &str,
+        title_bar: &str,
+        mut is_ready: impl FnMut(&str) -> bool,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(panic_message) = self.take_reader_panic() {
+                return Err(format!(
+                    "pty reader thread panicked while waiting until {describe}: {panic_message}\n{}",
+                    self.framed_screen()
+                ));
+            }
+            if let Ok(Some(status)) = self.child.try_wait() {
+                self.finished = true;
+                self.record_once(i32::try_from(status.exit_code()).unwrap_or(-1));
+                return Err(format!(
+                    "process exited ({status:?}) before {describe}.\n{}",
+                    self.framed_screen()
+                ));
+            }
+            if let Ok(body) = self.popup_body_text(title_bar) {
+                if is_ready(&body) {
+                    return Ok(());
+                }
             }
             if Instant::now() >= deadline {
                 return Err(format!(

@@ -216,17 +216,17 @@ async fn open_dashboard_in_scenario_folder(world: &mut E2eWorld) {
 /// (`crates/rocm-dash-tui/src/ui/exec.rs`) is supposed to quote for display,
 /// and the one dash-25 never reaches.
 ///
-/// Kept to two short words: the approval preview's command line wraps at
-/// word boundaries (`Wrap { trim: false }` in `draw_approval`) once it
-/// outgrows the popup's own content width, and the popup sits beside other
-/// dashboard panels on the *same* physical terminal rows — so a wrap inside
-/// `--root`'s quoted value splits across a `vt100` row boundary with
-/// unrelated panel text in between on the row that wrapped, which
-/// `approval_preview_quotes_whitespace_root`'s single-row match cannot see
-/// through. A short name keeps the whole `--root "<root>"` segment (prefix
-/// plus the host's own, uncontrollable temp-directory path) on one row with
-/// margin to spare; the `--python <root>/bin/python` tail is long enough to
-/// wrap on its own and is not part of what that step asserts.
+/// Kept to two short words only for readability on screen, not for wrap
+/// avoidance: the approval preview's command line wraps at word boundaries
+/// (`Wrap { trim: false }` in `draw_approval`) once it outgrows the popup's
+/// own content width, and on a long enough host temp path it reliably does,
+/// regardless of how short this constant is (PR #707 review, 2026-10-16: a
+/// runner `_temp` prefix long enough to push even the bare quoted value past
+/// one row). `approval_preview_quotes_whitespace_root` handles that by
+/// reconstructing the popup's own wrapped body
+/// (`TuiSession::popup_body_text`) rather than requiring this value to fit
+/// on one physical row — see that step for why. The `--python
+/// <root>/bin/python` tail is not part of what that step asserts.
 const ADOPT_WHITESPACE_ROOT: &str = "a b";
 
 #[when("the user opens the dashboard in a scenario folder whose own name has a space")]
@@ -1802,25 +1802,30 @@ async fn approval_preview_quotes_whitespace_root(world: &mut E2eWorld) {
     // happens to use today; a future change to the escaping character alone
     // should not read as a regression here.
     //
-    // Matched as one contiguous substring of `screen_text()` deliberately,
-    // not with any whitespace-collapsing across rows: the approval popup is
-    // drawn beside other dashboard panels that occupy the *same* physical
-    // terminal rows, so a row that wrapped mid-argument carries unrelated
-    // panel border text after the wrap point, before the popup's own text
-    // resumes on the next row — collapsing runs of whitespace there would
-    // paste that unrelated text into the middle of our expected string
-    // instead of reconstructing it. `ADOPT_WHITESPACE_ROOT`'s own doc
-    // comment is what actually keeps this segment on one row.
-    let expected_double_quoted = format!("--root \"{}\"", root.display());
-    let expected_single_quoted = format!("--root '{}'", root.display());
+    // Deliberately *without* a `--root ` prefix, and matched against
+    // `TuiSession::popup_body_text` rather than the raw `screen_text()` grid
+    // (PR #707 review, 2026-10-16, and a follow-up review of that fix on the
+    // same date): the popup wraps its command line at word boundaries, and
+    // on a long enough host temp path a plain single-row substring match —
+    // of the `--root ` prefix and its quoted value together, or even of the
+    // quoted value alone — times out even though the product rendered the
+    // path quoted correctly, because the match can't see across the row
+    // break. `popup_body_text` reconstructs the popup's own body across
+    // however many rows it actually wrapped onto, so this holds regardless
+    // of host path length. The quoted value alone is still unambiguous
+    // within that reconstruction: the only other quoted argument in this
+    // body is `--python`, and `quote_display_arg` quotes that argument's
+    // *entire* value (`<root>/bin/python`), so its closing quote never lands
+    // right after `<root>` the way it does for `--root`'s value alone.
+    let expected_double_quoted = format!("\"{}\"", root.display());
+    let expected_single_quoted = format!("'{}'", root.display());
     session(world)
-        .wait_for_screen_where(
+        .wait_for_popup_body_where(
             &format!(
                 "the approval preview to contain {expected_double_quoted:?} or {expected_single_quoted:?}"
             ),
-            |screen| {
-                screen.contains(&expected_double_quoted) || screen.contains(&expected_single_quoted)
-            },
+            ADOPT_APPROVAL_TITLE,
+            |body| body.contains(&expected_double_quoted) || body.contains(&expected_single_quoted),
             default_timeout(),
         )
         .await
