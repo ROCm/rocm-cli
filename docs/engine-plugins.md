@@ -95,8 +95,10 @@ Installer policy:
 - External plugins under the rocm-cli data directory are not touched by
   install or upgrade.
 - `rocm uninstall` removes the data directory by default. Use
-  `rocm uninstall --keep-data` when external plugins, managed runtimes,
-  service records, or model cache entries should be preserved.
+  `rocm uninstall --keep-data --keep-config` when external plugins, managed
+  runtimes, service records, or model cache entries should be preserved. On the
+  default layout the configuration and data directories are the same
+  directory, so both flags are needed.
 
 No fallback engine is selected automatically. If an engine adapter is missing
 or cannot satisfy the requested device policy, the command must fail until the

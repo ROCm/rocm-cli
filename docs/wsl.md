@@ -83,7 +83,7 @@ The equivalent manual steps, for reference or for a host where the CLI is not
 installed yet. Do not skip the `sha256sum -c` line, because `apt install` runs
 the package's maintainer scripts as root. `rocm install driver` checks the
 download against a digest pinned in the ROCm CLI source
-(`ROCDXG_PINNED_DIGESTS` in `apps/rocm/src/driver_install.rs`), which also
+(`ROCDXG_PINNED_DIGESTS` in `apps/rocm/src/main.rs`), which also
 catches a replaced release asset. A digest read from the release page at
 install time catches only a corrupted download. For a version listed in
 `ROCDXG_PINNED_DIGESTS`, use the pinned digest. Set `ROCDXG_VERSION` to the
