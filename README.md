@@ -250,7 +250,7 @@ asks first, because the new install takes over as the active default; see
 for that gate, the flags that approve it without a prompt, and the ROCm 10 and
 newer requirements.
 
-Then serve a model:
+After the install finishes, serve a model:
 
 ```
 rocm serve qwen
