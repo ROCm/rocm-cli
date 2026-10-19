@@ -1506,17 +1506,29 @@ async fn assert_path_fix_used_set_environment_variable(world: &mut E2eWorld) {
         Some(0),
         "expected the real PATH write to succeed:\n{output}"
     );
+    // Scoped to the write, not to the whole command output. `rocm fix <id>`
+    // prints the catalog recipe first, and `fix-6-path`'s notes name
+    // `setx PATH "%PATH%;..."` in order to warn a Windows user off it -- so a
+    // whole-output `!contains("setx ")` reports on the documentation rather
+    // than on what the CLI did, and fails on a correct run. Taking the region
+    // between the plan line and the post-write confirmation asserts both
+    // halves where they mean something: the write went through PowerShell,
+    // and nothing in the write went through `setx`. Obtaining the region at
+    // all is what pins the plan line and the confirmation wording cb9f748d
+    // introduced.
+    let write_region = e2e_cucumber::user_path_write_region(output).unwrap_or_else(|| {
+        panic!(
+            "expected the plan/write region cb9f748d introduced -- a `Plan: prepend ...` line \
+             through a `This only takes effect in NEW shells` confirmation:\n{output}"
+        )
+    });
     assert!(
-        output.contains("[Environment]::SetEnvironmentVariable("),
-        "expected the PowerShell plan/write line cb9f748d introduced, not setx:\n{output}"
+        write_region.contains("[Environment]::SetEnvironmentVariable("),
+        "expected the PowerShell plan/write line cb9f748d introduced, not setx:\n{write_region}"
     );
     assert!(
-        !output.contains("setx "),
-        "setx must not appear now that the write goes through PowerShell:\n{output}"
-    );
-    assert!(
-        output.contains("This only takes effect in NEW shells"),
-        "expected the post-write wording cb9f748d introduced:\n{output}"
+        !write_region.contains("setx "),
+        "setx must not appear in the plan or the write now that it goes through PowerShell:\n{write_region}"
     );
 }
 
