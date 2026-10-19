@@ -6707,34 +6707,6 @@ pub(crate) fn render_services_json(paths: &AppPaths, all: bool) -> Result<String
     Ok(output)
 }
 
-fn render_services_tool_result_text(records: &[ManagedServiceRecord]) -> String {
-    let mut output = String::new();
-    let _ = writeln!(output, "managed_services: {}", records.len());
-    let _ = writeln!(
-        output,
-        "status_meaning: ready/running = running; starting/recovering = starting; failed/stopped = not running; no matching row = not managed by ROCm CLI"
-    );
-    if records.is_empty() {
-        let _ = writeln!(output, "services: none");
-        return output;
-    }
-    let _ = writeln!(output, "services:");
-    for record in records {
-        let _ = writeln!(
-            output,
-            "  - service_id={} engine={} model={} canonical_model={} status={} running_state={} endpoint={}",
-            record.service_id,
-            record.engine,
-            record.model_ref,
-            record.canonical_model_id,
-            record.status,
-            chat::managed_service_running_state(&record.status),
-            record.endpoint_url
-        );
-    }
-    output
-}
-
 pub(crate) fn render_service_logs_text(paths: &AppPaths, service_id: &str) -> Result<String> {
     render_service_logs_text_with_options(paths, service_id, true)
 }
@@ -12845,6 +12817,32 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn serve_negative_sampling_space_form_reaches_range_validator() {
+        // The space form (`--temperature -1`) must reach the value parser and
+        // report a value error, not be rejected by clap as an unexpected argument.
+        // This is the classic negative-number-as-flag gotcha; `allow_negative_numbers`
+        // makes both forms validate identically. `--max-tokens` shares the gotcha even
+        // though it is a positive integer: the ambiguity is at the tokenizer, before the
+        // value parser runs, so the space form must reach `parse_positive_u32` too.
+        for args in [
+            &["--temperature", "-1"][..],
+            &["--temperature=-1"][..],
+            &["--top-p", "-0.5"][..],
+            &["--top-p=-0.5"][..],
+            &["--max-tokens", "-1"][..],
+            &["--max-tokens=-1"][..],
+        ] {
+            assert_eq!(
+                parse_serve(args)
+                    .expect_err("negative sampling value is rejected")
+                    .kind(),
+                clap::error::ErrorKind::ValueValidation,
+                "expected range validation for {args:?}"
+            );
+        }
+    }
+
+    #[test]
     fn chat_negative_sampling_space_form_reaches_range_validator() {
         // Mirrors `serve_negative_sampling_space_form_reaches_range_validator`: the
         // same numeric value flags carry `allow_negative_numbers` on `chat`, so the
@@ -16720,32 +16718,6 @@ pub(crate) mod tests {
         let found = existing_live_managed_service(&paths, "lemonade", "qwen-canonical");
         let _ = fs::remove_dir_all(root);
         assert!(found.is_none());
-    }
-
-    #[test]
-    fn services_tool_result_text_includes_running_interpretation() {
-        let (_root, paths) = test_paths("services-tool-text");
-        let mut record = ManagedServiceRecord::new(
-            &paths,
-            "svc-vllm",
-            "vllm",
-            "Qwen/Qwen3.5",
-            "Qwen/Qwen3.5",
-            "127.0.0.1",
-            11435,
-            "managed",
-            std::process::id(),
-            Some("therock-release".to_owned()),
-            None,
-            Some("gpu_required".to_owned()),
-        );
-        record.status = "ready".to_owned();
-
-        let rendered = render_services_tool_result_text(&[record]);
-
-        assert!(rendered.contains("status_meaning: ready/running = running"));
-        assert!(rendered.contains("engine=vllm"));
-        assert!(rendered.contains("running_state=running"));
     }
 
     #[test]
