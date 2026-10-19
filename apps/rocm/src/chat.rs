@@ -4007,7 +4007,7 @@ fn run_chat_port_status_tool(
     }))
 }
 
-pub(crate) const fn chat_read_only_tool_status_label(is_error: bool) -> &'static str {
+const fn chat_read_only_tool_status_label(is_error: bool) -> &'static str {
     if is_error {
         "reported an error"
     } else {

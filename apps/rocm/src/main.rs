@@ -20789,11 +20789,11 @@ pub(crate) mod tests {
         // The scriptable prompt passthrough stays on the text render path,
         // NOT the dash/TUI.
         assert!(
-            body.contains("render_chat_prompt_text("),
+            body.contains("chat::render_chat_prompt_text("),
             "prompt passthrough must still call render_chat_prompt_text; body:\n{body}"
         );
         assert!(
-            body.contains("render_chat_text("),
+            body.contains("chat::render_chat_text("),
             "non-interactive no-prompt path must still call render_chat_text; body:\n{body}"
         );
     }
@@ -20811,7 +20811,7 @@ pub(crate) mod tests {
         let src = main_rs_source();
         let body = strip_line_comments(&command_chat_handler_body(&src));
         assert!(
-            body.contains("read_piped_prompt("),
+            body.contains("chat::read_piped_prompt("),
             "no-prompt path must read piped stdin via read_piped_prompt; body:\n{body}"
         );
         assert!(
@@ -20819,9 +20819,9 @@ pub(crate) mod tests {
             "the piped read must supply the prompt that is dispatched (and \
              propagate its error), not be a discarded call; body:\n{body}"
         );
-        let read_at = body.find("read_piped_prompt(").expect("asserted above");
+        let read_at = body.find("chat::read_piped_prompt(").expect("asserted above");
         let send_at = body
-            .find("render_chat_prompt_text(")
+            .find("chat::render_chat_prompt_text(")
             .unwrap_or_else(|| panic!("chat handler no longer sends a prompt; body:\n{body}"));
         assert!(
             read_at < send_at,
