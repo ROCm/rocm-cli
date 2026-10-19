@@ -456,6 +456,8 @@ impl TuiSession {
     /// one real space a word-boundary wrap consumed — which is all
     /// `wait_for_popup_body_where`'s callers need.
     fn popup_body_text(&self, title_bar: &str) -> Result<String, String> {
+        const BORDER: [char; 3] = ['─', '╭', '╮'];
+
         let (screen, _) = self.screen_snapshot();
         let rows: Vec<&str> = screen.split('\n').collect();
         let title_row_idx = rows
@@ -471,7 +473,6 @@ impl TuiSession {
         // only agree on plain ASCII.
         let title_start = rows[title_row_idx][..title_start_bytes].chars().count();
 
-        const BORDER: [char; 3] = ['─', '╭', '╮'];
         // Exact, not a walk: `panel::stamp_title` always stamps its left
         // bracket at `area.x + 2` regardless of title length (`lb = area.x +
         // 2` in `crates/rocm-dash-tui/src/ui/panel.rs`), with the true box
@@ -843,12 +844,6 @@ impl TuiSession {
         timeout: Duration,
     ) -> Result<(), String> {
         let deadline = Instant::now() + timeout;
-        // Carries the most recent `popup_body_text` failure into the timeout
-        // message. A popup not yet open is expected early on and not worth
-        // surfacing, but if every single poll fails the same structural way
-        // (e.g. the title/notch assumptions stop holding), that is the real
-        // cause of the timeout and the plain screen dump alone doesn't say so.
-        let mut last_body_err: Option<String> = None;
         loop {
             if let Some(panic_message) = self.take_reader_panic() {
                 return Err(format!(
@@ -864,15 +859,19 @@ impl TuiSession {
                     self.framed_screen()
                 ));
             }
-            match self.popup_body_text(title_bar) {
-                Ok(body) if is_ready(&body) => return Ok(()),
-                Ok(_) => last_body_err = None,
-                Err(e) => last_body_err = Some(e),
+            if matches!(self.popup_body_text(title_bar), Ok(body) if is_ready(&body)) {
+                return Ok(());
             }
             if Instant::now() >= deadline {
-                let extra = last_body_err
-                    .map(|e| format!("\nlast popup_body_text error: {e}"))
-                    .unwrap_or_default();
+                // Re-derive the failure right at the timeout, rather than
+                // threading it through the loop: a popup not yet open is
+                // expected early on and not worth surfacing, but if this
+                // specific call fails, that's the real cause of the timeout
+                // and the plain screen dump alone doesn't say so.
+                let extra = match self.popup_body_text(title_bar) {
+                    Err(e) => format!("\nlast popup_body_text error: {e}"),
+                    Ok(_) => String::new(),
+                };
                 return Err(format!(
                     "timed out after {timeout:?} waiting until {describe}.{extra}\n{}",
                     self.framed_screen()
