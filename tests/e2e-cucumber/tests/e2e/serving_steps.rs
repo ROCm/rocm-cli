@@ -635,9 +635,9 @@ async fn setup_lemonade_hf_checkpoint_model(world: &mut E2eWorld) {
 
 #[given("a model is being served on aim")]
 async fn setup_aim_model(world: &mut E2eWorld) {
-    // AIM has no model catalog in this PR's scope (ROCMAI-555): the model
-    // argument IS the raw AIM Docker image reference, not a short recipe name
-    // like the vLLM/Lemonade scenarios above.
+    // Serves via the raw AIM Docker image reference rather than the catalog
+    // recipe added in ROCMAI-555 — this is a hardware-verified serve+inference
+    // canary pinned to one exact image/profile, not a catalog-discovery test.
     //
     // The `aim-meta-llama-llama-3-2-1b-instruct` image originally used here
     // bundles only Instinct-series (MI300X/MI250X/MI355X/MI325X/MI350X)
