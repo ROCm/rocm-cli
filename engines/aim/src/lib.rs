@@ -208,6 +208,14 @@ pub fn builtin_handle_envelope(envelope: EngineRequestEnvelope) -> EngineRespons
     handle_envelope(envelope)
 }
 
+/// Whether the Docker daemon is reachable on this host.
+///
+/// Exposed so `apps/rocm`'s host-fit gate can rule the `aim` engine out
+/// before a model is served, not just report it after the fact via `Detect`.
+pub fn builtin_docker_daemon_reachable() -> bool {
+    crate::docker::daemon_reachable()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn builtin_serve_http(
     service_id: String,
