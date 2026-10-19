@@ -932,7 +932,7 @@ impl std::fmt::Display for InstallHint {
 /// with `build` when it plans any, otherwise `manual` — followed, for an
 /// unreadable file, by the line that made it so and what to change on it.
 ///
-/// Off Linux this has no non-test caller either — [`install_hint_for_read`],
+/// Off Linux this has no non-test caller — [`install_hint_for_read`],
 /// its only production caller, is itself dead there for the same reason.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn install_hint_for_at(
