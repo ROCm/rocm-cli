@@ -1039,13 +1039,26 @@ fn check_6_path_missing(e: &Examination, symptom: &str) -> Diagnosis {
         return zero("fix-6-path", "ROCm not on PATH");
     }
     let fix = if windows {
+        // The command printed here is the manual-paste twin of the write
+        // `crate::fix::path_export_windows` performs, and is built the same
+        // way: read the *User* scope, put `bin_dir` first, write the User
+        // scope back. `setx PATH "%PATH%;{bin_dir}"` -- what this used to
+        // advertise -- is not an equivalent: setx truncates the value at 1024
+        // characters while still exiting 0, and `%PATH%` expands to the
+        // combined user+system PATH, so pasting it would fold every system
+        // entry into the user's own PATH. The escape is the same one the real
+        // write uses, so an apostrophe in `bin_dir` cannot end the PowerShell
+        // string literal early in the printed copy either.
+        let escaped_bin_dir = crate::fix::ps_single_quote_escape(&bin_dir);
         Fix {
             summary: format!("Add {bin_dir} to your User PATH and reopen the shell."),
             commands: vec![
-                format!("setx PATH \"%PATH%;{bin_dir}\""),
+                format!(
+                    "[Environment]::SetEnvironmentVariable('PATH', '{escaped_bin_dir};' + [Environment]::GetEnvironmentVariable('PATH', 'User'), 'User')"
+                ),
                 "# Or: System Properties -> Environment Variables -> Path -> Edit -> New."
                     .to_owned(),
-                "# `setx` only affects NEW shells; close and reopen this terminal afterwards."
+                "# A PATH change only affects NEW shells; close and reopen this terminal afterwards."
                     .to_owned(),
             ],
             fix_id: "fix-6-path".to_owned(),
