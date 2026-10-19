@@ -15,12 +15,12 @@ SPDX-License-Identifier: MIT
 
 ```{include} ../../README.md
 :start-after: "## Configure ROCm and serve a model"
-:end-before: "Running `rocm install sdk` when a"
+:end-before: "Running `rocm install sdk` when a managed runtime"
 ```
 
-<!-- The prose below is a deliberate copy of the README sentence, with the
-     cross-reference retargeted to this site. The end of the sentence is then
-     reused as the `:start-after:` anchor for the next include, which also
+<!-- The paragraph below is a deliberate copy of the README paragraph, with the
+     cross-reference retargeted to this site. The end of the second sentence is
+     then reused as the `:start-after:` anchor for the next include, which also
      matches the original sentence in README.md; edit both together. -->
 Running `rocm install sdk` when a managed runtime is already the active default
 asks first, because the new install takes over as the active default; see

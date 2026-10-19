@@ -63,10 +63,8 @@ runtime that cannot execute a kernel will fail at serving time.
 
 ## ROCm 10.x wheel discovery
 
-ROCm 10 is a preview and isn't supported yet. **Known issue:**
-`rocm install sdk --version 10.0.0` fails because of a torchaudio mismatch.
-`rocm install sdk --version 10.1.0` works only while 10.1.0 is the newest
-ROCm 10 build on the package index.
+For ROCm 10, as a known issue, `rocm install sdk --version 10.0.0` currently
+fails; `--version 10.1.0` works.
 
 For most ROCm SDK versions, `rocm engines install vllm` pins a fixed vLLM wheel
 and index URL. Any ROCm SDK 10.x version is different: AMD publishes vLLM,

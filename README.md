@@ -238,9 +238,14 @@ This downloads TheRock ROCm wheels and a matching PyTorch stack into a managed
 environment. Running `rocm install sdk` creates a managed runtime alongside any
 legacy install.
 
-ROCm 10 and newer are a preview and aren't supported yet; see the known issue
-under
-[ROCm 10 and newer](https://github.com/ROCm/rocm-cli/blob/main/README.md#rocm-10-and-newer).
+ROCm CLI supports ROCm 7.14 as well as ROCm 10 and newer. Without
+`--version`, `rocm install sdk` currently installs ROCm 7.14. To install
+ROCm 10.1, add `--version 10.1.0`. As a known issue, `--version 10.0.0`
+currently fails.
+
+If ROCm CLI can't tell which exact GPU arch this computer has, or you want a
+different one, also add `--family` with the raw `gfx` code from `rocm examine`.
+For example: `--version 10.1.0 --family gfx1200`.
 
 Running `rocm install sdk` when a managed runtime is already the active default
 asks first, because the new install takes over as the active default; see
@@ -407,8 +412,9 @@ rocm update         [--apply] [--runtime KEY] [--activate] [--dry-run]
 ```
 
 `install sdk` downloads TheRock ROCm wheels into a Python environment managed
-by ROCm CLI. ROCm 10 and newer are a preview and aren't supported yet; see
-ROCm 10 and newer, below.
+by ROCm CLI. ROCm CLI supports ROCm 7.14 as well as ROCm 10 and newer. Without
+`--version`, it currently installs ROCm 7.14. To install ROCm 10.1, add
+`--version 10.1.0`. As a known issue, `--version 10.0.0` currently fails.
 
 To remove ROCm CLI and what it manages, see
 [Logs and cleanup](#logs-and-cleanup).
@@ -468,8 +474,9 @@ active default runtime, not about what a named prefix loses.
 
 #### ROCm 10 and newer
 
-ROCm 10 and newer ship from a different source layout. They are a preview and
-aren't supported yet. You opt in by pinning the version with `--version`. These
+ROCm 10 and newer ship from a different source layout. You opt in by
+pinning the version with `--version`. As a known issue,
+`--version 10.0.0` currently fails, so use `--version 10.1.0`. These
 versions select their device payload by exact
 GPU arch, so when ROCm CLI can't resolve one for this computer (it detects only
 a family of GPUs, or none), or you want to target a different GPU, also pass
@@ -478,12 +485,6 @@ a family of GPUs, or none), or you want to target a different GPU, also pass
 ```
 rocm install sdk --version 10.1.0 --family gfx1200 --dry-run
 ```
-
-> **Known issue:** `rocm install sdk --version 10.0.0` fails because the
-> torchaudio resolution picks a torchaudio built for a different ROCm build.
-> `--version 10.1.0` works while 10.1.0 is the newest ROCm 10 build on the
-> package index. When a newer build publishes torchaudio, `--version 10.1.0`
-> fails the same way.
 
 A family label such as `--family gfx120X-all` is rejected for those versions
 instead of being resolved to a guess, because the ROCm 10 packages publish one
