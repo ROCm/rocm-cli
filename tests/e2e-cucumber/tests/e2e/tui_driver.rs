@@ -427,10 +427,12 @@ impl TuiSession {
     /// popup's whole border row, just the text inside it. The title row is
     /// rendered `╭─╮<title_bar>╭───...───╮` (`panel::popup`'s "rounded +
     /// notch" framing: a short decorative notch directly left of the title,
-    /// then the rest of the border running to the box's own right corner),
-    /// so the nearest `╭` to the left of `title_bar` and the nearest `╮` to
-    /// its right — each reached by walking outward through nothing but
-    /// border characters — are this popup's own left/right columns. Body
+    /// then the rest of the border running to the box's own right corner).
+    /// The left column is found by a fixed 3-column offset from the title
+    /// text, not a walk (see the inline comment on `left` — it is an exact
+    /// invariant of how the notch is stamped); the right column has no such
+    /// invariant and is found by walking forward through border characters
+    /// to the box's own closing corner. Body
     /// rows run from just below the title row to just above the row
     /// carrying the literal `"Approve ("` button label; each is sliced to
     /// that same column span, discarding whatever sibling panels draw
@@ -470,22 +472,42 @@ impl TuiSession {
         let title_start = rows[title_row_idx][..title_start_bytes].chars().count();
 
         const BORDER: [char; 3] = ['─', '╭', '╮'];
-        let mut left = title_start;
-        while left > 0 && BORDER.contains(&title_row[left - 1]) {
-            left -= 1;
-        }
-        if title_row.get(left) != Some(&'╭') {
+        // Exact, not a walk: `panel::stamp_title` always stamps its left
+        // bracket at `area.x + 2` regardless of title length (`lb = area.x +
+        // 2` in `crates/rocm-dash-tui/src/ui/panel.rs`), with the true box
+        // corner at `area.x` and exactly one dash between them — so the true
+        // left corner is always exactly 3 columns before the title text,
+        // never more, regardless of what sits further left on this row (an
+        // outer box's own border could in principle be flush against this
+        // one with no gap; the fixed offset is immune to that, where an
+        // open-ended border-character walk would not be). Fail loudly if a
+        // future rendering change breaks this invariant rather than
+        // silently trusting whatever a walk happened to find.
+        if title_start < 3 {
             return Err(format!(
-                "expected the popup's own left corner '╭' immediately (through border characters only) before {title_bar:?}, found {:?} at column {left}",
-                title_row.get(left)
+                "popup title {title_bar:?} starts at column {title_start}, too close to the row start for the expected 3-column left notch"
+            ));
+        }
+        let left = title_start - 3;
+        if title_row[left..title_start] != ['╭', '─', '╮'] {
+            return Err(format!(
+                "expected the popup's own left notch '╭─╮' immediately before {title_bar:?}, found {:?} at columns {left}..{title_start}",
+                title_row[left..title_start].iter().collect::<String>()
             ));
         }
 
         let title_end = title_start + title_bar.chars().count();
-        // Mirrors the right-hand border the same way `panel::popup` draws it:
-        // a `╭` reopens the border right after the title (its own small
-        // right-hand notch, symmetric to the left one above), then dashes,
-        // then the box's true closing `╮` — not a bare run of dashes.
+        // The right-hand side has no equivalent fixed offset (unlike the
+        // left notch, it depends on the box's own width, which this
+        // black-box driver does not know) — stamp_title's right bracket sits
+        // at `lb + 1 + label_w`, then dashes run to the box's own true right
+        // corner, however far that is. So this walks through border
+        // characters the way the left side used to, with no corresponding
+        // exact-offset check to close the same over-walk gap: if an outer
+        // box's border ever sat flush against this one's right edge with no
+        // gap, this would walk into it undetected. Not currently reachable
+        // (every nested popup in this app leaves a gap), so left as a weaker
+        // check until that stops holding.
         let mut right = title_end;
         while right < title_row.len() && BORDER.contains(&title_row[right]) {
             right += 1;
@@ -821,6 +843,12 @@ impl TuiSession {
         timeout: Duration,
     ) -> Result<(), String> {
         let deadline = Instant::now() + timeout;
+        // Carries the most recent `popup_body_text` failure into the timeout
+        // message. A popup not yet open is expected early on and not worth
+        // surfacing, but if every single poll fails the same structural way
+        // (e.g. the title/notch assumptions stop holding), that is the real
+        // cause of the timeout and the plain screen dump alone doesn't say so.
+        let mut last_body_err: Option<String> = None;
         loop {
             if let Some(panic_message) = self.take_reader_panic() {
                 return Err(format!(
@@ -836,14 +864,17 @@ impl TuiSession {
                     self.framed_screen()
                 ));
             }
-            if let Ok(body) = self.popup_body_text(title_bar) {
-                if is_ready(&body) {
-                    return Ok(());
-                }
+            match self.popup_body_text(title_bar) {
+                Ok(body) if is_ready(&body) => return Ok(()),
+                Ok(_) => last_body_err = None,
+                Err(e) => last_body_err = Some(e),
             }
             if Instant::now() >= deadline {
+                let extra = last_body_err
+                    .map(|e| format!("\nlast popup_body_text error: {e}"))
+                    .unwrap_or_default();
                 return Err(format!(
-                    "timed out after {timeout:?} waiting until {describe}.\n{}",
+                    "timed out after {timeout:?} waiting until {describe}.{extra}\n{}",
                     self.framed_screen()
                 ));
             }
