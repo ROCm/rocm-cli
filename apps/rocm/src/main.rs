@@ -37,6 +37,7 @@ mod storage;
 #[cfg(test)]
 mod test_support;
 mod therock;
+mod transcribe;
 mod uninstall;
 
 // Per-command handlers mechanically relocated into modules — fns, plus the
@@ -353,6 +354,33 @@ enum Command {
         arguments_file: Option<PathBuf>,
         #[arg(long)]
         allow_mutation: bool,
+    },
+    /// Transcribe an audio file with a running speech-to-text server.
+    ///
+    /// Sends the file to a speech-to-text server started with `rocm serve`
+    /// (for example `rocm serve whisper`) and prints what was said. The file is
+    /// only read: nothing is written to disk and no audio is kept. WAV (16 kHz
+    /// mono) is the verified format; other formats are passed to the server
+    /// unchanged.
+    #[command(after_help = "EXAMPLES:\n  \
+rocm transcribe recording.wav\n  \
+rocm transcribe recording.wav --language en --json\n  \
+rocm transcribe recording.wav --service lemonade-whisper-1720000000")]
+    Transcribe {
+        /// Audio file to transcribe.
+        file: PathBuf,
+        /// Use the speech-to-text server running this model.
+        #[arg(long, conflicts_with = "service")]
+        model: Option<String>,
+        /// Use this speech-to-text server (an id from `rocm services list`).
+        #[arg(long)]
+        service: Option<String>,
+        /// Spoken language as an ISO-639-1 code such as `en`; detected when omitted.
+        #[arg(long)]
+        language: Option<String>,
+        /// Print the server's JSON answer instead of the transcript alone.
+        #[arg(long)]
+        json: bool,
     },
     /// [preview] Send a one-shot chat prompt to a configured assistant provider.
     ///
@@ -2292,6 +2320,19 @@ fn dispatch(cli: Cli) -> Result<()> {
             println!("{}", serde_json::to_string(&value)?);
             Ok(())
         }
+        Some(Command::Transcribe {
+            file,
+            model,
+            service,
+            language,
+            json,
+        }) => transcribe::transcribe(transcribe::TranscribeArgs {
+            file,
+            model,
+            service,
+            language,
+            json,
+        }),
         Some(Command::Chat {
             provider,
             model,
@@ -11753,6 +11794,7 @@ fn treat_as_natural_language(args: &[String]) -> bool {
         "daemon",
         "dash",
         "bench",
+        "transcribe",
         "uninstall",
         "help",
         "--help",
@@ -13189,6 +13231,26 @@ pub(crate) mod tests {
                 .expect("completions <shell> should parse via Cli");
             assert!(matches!(cli.command, Some(Command::Completions { .. })));
         }
+    }
+
+    #[test]
+    fn every_subcommand_dispatches_as_a_command_not_a_freeform_request() {
+        // `treat_as_natural_language` keeps its own list of command names; a
+        // subcommand missing from it is unreachable, because `rocm <name> ...`
+        // is handed to the request planner instead (as `rocm transcribe` was).
+        use clap::CommandFactory;
+        let unreachable: Vec<String> = Cli::command()
+            .get_subcommands()
+            .flat_map(|command| {
+                std::iter::once(command.get_name().to_owned())
+                    .chain(command.get_all_aliases().map(str::to_owned))
+            })
+            .filter(|name| treat_as_natural_language(std::slice::from_ref(name)))
+            .collect();
+        assert!(
+            unreachable.is_empty(),
+            "subcommands routed to the request planner: {unreachable:?}"
+        );
     }
 
     #[test]

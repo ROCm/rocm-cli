@@ -514,7 +514,7 @@ const fn local_service_priority(service: &ManagedServiceRecord) -> usize {
     }
 }
 
-fn ready_local_services(paths: &AppPaths) -> Result<Vec<ManagedServiceRecord>> {
+pub(crate) fn ready_local_services(paths: &AppPaths) -> Result<Vec<ManagedServiceRecord>> {
     let services_dir = paths.services_dir();
     if !services_dir.is_dir() {
         return Ok(Vec::new());

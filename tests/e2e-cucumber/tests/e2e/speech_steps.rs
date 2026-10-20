@@ -230,6 +230,25 @@ async fn chat_with_speech_model(world: &mut E2eWorld) {
     record_cli(world, result);
 }
 
+/// A recording whose audio carries a byte pattern nothing else in the
+/// scenario's roots could contain, so a copy of it can be searched for.
+const RECORDING_MARKER: &[u8] = b"rocm-e2e-recording-marker-5d1f";
+
+#[when("the user transcribes a recording")]
+async fn transcribe_recording(world: &mut E2eWorld) {
+    let mut wav = silent_wav();
+    let marker_at = 44 + 1_000;
+    wav[marker_at..marker_at + RECORDING_MARKER.len()].copy_from_slice(RECORDING_MARKER);
+    let recording = tempfile::Builder::new()
+        .suffix(".wav")
+        .tempfile()
+        .expect("failed to create the recording");
+    std::fs::write(recording.path(), &wav).expect("failed to write the recording");
+    let path = recording.path().to_string_lossy().into_owned();
+    let result = crate::run_rocm(world, &["transcribe", &path]);
+    record_cli(world, result);
+}
+
 // ── Then ───────────────────────────────────────────────────────────
 
 #[then("serving is refused because that engine cannot serve speech-to-text models")]
@@ -375,5 +394,77 @@ async fn bench_refused(world: &mut E2eWorld) {
     assert!(
         text.contains("is a speech-to-text model; `rocm bench load` measures chat completions"),
         "the refusal must give the reason:\n{text}"
+    );
+}
+
+#[then("the transcript of the recording is printed")]
+async fn transcript_printed(world: &mut E2eWorld) {
+    let rc = world.cli_rc.expect("no transcribe rc recorded");
+    let text = cli_text(world);
+    assert_eq!(rc, 0, "transcribe failed:\n{text}");
+    assert_eq!(
+        world.cli_output.as_deref().unwrap_or_default().trim(),
+        MOCK_TRANSCRIPT,
+        "the transcript alone is printed"
+    );
+}
+
+#[then("the speech-to-text server received the recording")]
+async fn server_received_recording(world: &mut E2eWorld) {
+    let mock = world.mock.as_ref().expect("no mock server");
+    assert_eq!(
+        mock.transcription_paths()
+            .iter()
+            .filter(|path| *path == "/v1/audio/transcriptions")
+            .count(),
+        // One readiness probe (a second of silence) and the recording itself.
+        2,
+        "expected the readiness probe and the upload: {:?}",
+        mock.transcription_paths()
+    );
+}
+
+#[then("no copy of the recording was written to disk")]
+async fn recording_not_written(world: &mut E2eWorld) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path();
+    let mut stack = vec![root.to_path_buf()];
+    let mut copies = Vec::new();
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if std::fs::read(&path).is_ok_and(|bytes| {
+                bytes
+                    .windows(RECORDING_MARKER.len())
+                    .any(|window| window == RECORDING_MARKER)
+            }) {
+                copies.push(path);
+            }
+        }
+    }
+    assert!(
+        copies.is_empty(),
+        "the recording was written under the CLI's roots: {copies:?}"
+    );
+}
+
+#[then("transcribing is refused because no speech-to-text server is running")]
+async fn transcribe_refused(world: &mut E2eWorld) {
+    let rc = world.cli_rc.expect("no transcribe rc recorded");
+    let text = cli_text(world);
+    assert_ne!(rc, 0, "transcribing must be refused:\n{text}");
+    // That `rocm serve whisper` starts a speech-to-text server is serve-27's
+    // subject (on a GPU lane, with the smallest Whisper recipe).
+    assert!(
+        text.contains("no speech-to-text server is running; start one with `rocm serve whisper`"),
+        "expected the reason and the remedy:\n{text}"
     );
 }

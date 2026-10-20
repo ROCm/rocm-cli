@@ -305,6 +305,10 @@ Expected result:
 - `rocm serve whisper-tiny --engine vllm` is refused before any GPU check and
   names `rocm serve whisper-tiny --engine lemonade`.
 
+`rocm transcribe recording.wav` against the same server prints the recording's
+words alone; with only a chat server running it is refused and names
+`rocm serve whisper`.
+
 Confirm the GPU did the work by watching GPU utilization (`amd-smi metric` on
 Linux, Task Manager's GPU graph on Windows) while transcribing a recording of a
 minute or more. Do not rely on the `device` field of Lemonade's own

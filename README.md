@@ -247,6 +247,7 @@ form works depends on the engine your GPU selects.
 | `rocm install sdk` | Install TheRock ROCm wheels into a managed Python environment |
 | `rocm install driver` | Install the AMD kernel driver on Linux |
 | `rocm serve <model>` | Start a local OpenAI-compatible model server |
+| `rocm transcribe <file>` | Transcribe an audio file with a running speech-to-text server |
 | `rocm remote serve <machine> <model>` | Serve a model on another GPU machine over your private network |
 | `rocm dash` | Open the full-screen telemetry dashboard |
 | `rocm bench load --endpoint <url>` | Load-test a local OpenAI-compatible endpoint |
@@ -712,6 +713,12 @@ prints that endpoint and names the task in place of the chat timing rows, and
 curl http://127.0.0.1:11435/v1/audio/transcriptions \
   -F model=Whisper-Large-v3-Turbo -F file=@recording.wav
 ```
+
+`rocm transcribe recording.wav` does the same from the command line: it sends
+the file to the running speech-to-text server and prints what was said (`--json`
+prints the server's answer; `--service` or `--model` picks a server when more
+than one runs). The file is only read; nothing is written to disk. WAV (16 kHz
+mono) is the verified format.
 
 Lemonade runs Whisper on its ROCm whisper.cpp build, or its Vulkan build when it
 reports ROCm unsupported for the GPU; its CPU build is never selected, and

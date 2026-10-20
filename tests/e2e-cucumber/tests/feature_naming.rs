@@ -51,6 +51,7 @@ const FEATURE_KEYS: &[(&str, &str)] = &[
     ("service_record_cleanup.feature", "service-cleanup"),
     ("service_stop.feature", "service-stop"),
     ("therock_next_generation.feature", "therock-next"),
+    ("transcribe.feature", "transcribe"),
     ("uninstall.feature", "uninstall"),
     ("update.feature", "update"),
 ];

@@ -1809,12 +1809,14 @@ cargo test -p rocm-engine-lemonade speech::
 cargo test -p rocm-engine-vllm refuse_a_speech_to_text_model
 cargo test -p rocm --bin rocm speech_to_text
 cargo test -p rocm-dash-tui speech_to_text
+cargo test -p rocm --bin rocm transcribe::
 ```
 
-The user-facing behaviour is in `serve-26` to `serve-28`, `chat-10`, and
-`bench-07`. All but `serve-27` run on every lane: `serve-26` needs no server at
-all, and the others run against a mock speech-to-text server. `serve-27` serves
-Whisper-Tiny on a real GPU and needs the Lemonade GPU lanes
+The user-facing behaviour is in `serve-26` to `serve-28`, `chat-10`,
+`chat-11`, `bench-07`, and `transcribe-01`/`transcribe-02`. All but `serve-27`
+run against mock servers (or none, for `serve-26`) with no GPU; `chat-11`
+drives the interactive chat pane and so runs on the Linux lanes only.
+`serve-27` serves Whisper-Tiny on a real GPU and needs the Lemonade GPU lanes
 (`@requires-gpu @requires-engine:lemonade`).
 
 Running a subset with `cargo xtask e2e -- -n <pattern>` bypasses the
