@@ -1,0 +1,187 @@
+<!doctype html>
+<!--
+Copyright © Advanced Micro Devices, Inc., or its affiliates.
+
+SPDX-License-Identifier: MIT
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ROCm CLI speech API</title>
+<style>
+  :root { --bg:#0f1115; --panel:#171a21; --line:#2a2f3a; --text:#e6e8ee; --dim:#9aa3b2;
+          --post:#49cc90; --get:#61affe; --accent:#ed1c24; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:15px/1.5 system-ui, sans-serif; background:var(--bg); color:var(--text); }
+  header { padding:24px 32px; border-bottom:1px solid var(--line); }
+  header h1 { margin:0 0 4px; font-size:22px; }
+  header p { margin:0; color:var(--dim); }
+  main { max-width:960px; margin:0 auto; padding:24px 32px 64px; }
+  .server { display:flex; gap:8px; align-items:center; margin-bottom:8px; }
+  .server input { flex:1; }
+  .status { color:var(--dim); font-size:13px; margin-bottom:24px; min-height:20px; }
+  details { background:var(--panel); border:1px solid var(--line); border-radius:6px; margin-bottom:14px; }
+  summary { cursor:pointer; padding:12px 16px; display:flex; gap:12px; align-items:center; list-style:none; }
+  summary::-webkit-details-marker { display:none; }
+  .verb { font-weight:700; font-size:12px; padding:3px 10px; border-radius:4px; color:#0f1115; min-width:56px; text-align:center; }
+  .verb.post { background:var(--post); } .verb.get { background:var(--get); }
+  .path { font-family:ui-monospace, monospace; }
+  .desc { color:var(--dim); margin-left:auto; font-size:13px; }
+  .body { padding:4px 16px 16px; border-top:1px solid var(--line); }
+  label { display:block; font-size:13px; color:var(--dim); margin:12px 0 4px; }
+  input, textarea, select { width:100%; background:#0b0d11; color:var(--text); border:1px solid var(--line);
+          border-radius:4px; padding:8px; font:inherit; }
+  textarea { min-height:90px; resize:vertical; }
+  button { background:var(--accent); color:#fff; border:0; border-radius:4px; padding:9px 18px;
+           font:inherit; font-weight:600; cursor:pointer; margin-top:14px; }
+  button:disabled { opacity:.5; cursor:default; }
+  pre { background:#0b0d11; border:1px solid var(--line); border-radius:4px; padding:10px; overflow:auto;
+        font-size:13px; white-space:pre-wrap; }
+  audio { width:100%; margin-top:12px; }
+  .row { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+  .note { color:var(--dim); font-size:13px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>ROCm CLI speech API</h1>
+  <p>OpenAI-compatible endpoints of a server started with <code>rocm serve</code>. Type, press Speak, and listen.</p>
+</header>
+<main>
+  <label for="base">Server (the <code>endpoint</code> from <code>rocm services list</code>)</label>
+  <div class="server">
+    <input id="base" value="http://127.0.0.1:11435/v1">
+    <button id="connect" style="margin-top:0">Check</button>
+  </div>
+  <div class="status" id="status"></div>
+
+  <details open>
+    <summary><span class="verb post">POST</span><span class="path">/v1/audio/speech</span>
+      <span class="desc">Text to speech</span></summary>
+    <div class="body">
+      <p class="note">Returns a WAV file. Served by <code>rocm serve kokoro</code> (CPU, demo) or <code>rocm serve tts</code> (GPU).</p>
+      <label for="tts-input">input</label>
+      <textarea id="tts-input">Hello from ROCm. This voice comes from a model served on this machine.</textarea>
+      <div class="row">
+        <div><label for="tts-model">model</label><input id="tts-model" value="kokoro-v1"></div>
+        <div><label for="tts-voice">voice</label><input id="tts-voice" value="af_heart"></div>
+      </div>
+      <button id="tts-run">Speak</button>
+      <audio id="tts-audio" controls></audio>
+      <label>Request</label><pre id="tts-curl"></pre>
+      <label>Response</label><pre id="tts-out">-</pre>
+    </div>
+  </details>
+
+  <details>
+    <summary><span class="verb post">POST</span><span class="path">/v1/audio/transcriptions</span>
+      <span class="desc">Speech to text</span></summary>
+    <div class="body">
+      <p class="note">Multipart upload of a WAV file. Served by <code>rocm serve whisper</code> (GPU).</p>
+      <label for="stt-file">file</label><input id="stt-file" type="file" accept="audio/*">
+      <label for="stt-model">model</label><input id="stt-model" value="Whisper-Large-v3-Turbo">
+      <button id="stt-run">Transcribe</button>
+      <label>Response</label><pre id="stt-out">-</pre>
+    </div>
+  </details>
+
+  <details>
+    <summary><span class="verb get">GET</span><span class="path">/v1/models</span>
+      <span class="desc">Models the server knows</span></summary>
+    <div class="body">
+      <button id="models-run">Send</button>
+      <label>Response</label><pre id="models-out">-</pre>
+    </div>
+  </details>
+
+  <details>
+    <summary><span class="verb get">GET</span><span class="path">/v1/health</span>
+      <span class="desc">Loaded models and their backends</span></summary>
+    <div class="body">
+      <button id="health-run">Send</button>
+      <label>Response</label><pre id="health-out">-</pre>
+    </div>
+  </details>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const base = () => $("base").value.replace(/\/+$/, "");
+
+function showCurl() {
+  const body = JSON.stringify({ model: $("tts-model").value, input: $("tts-input").value,
+                                voice: $("tts-voice").value, response_format: "wav" });
+  $("tts-curl").textContent =
+    `curl ${base()}/audio/speech \\\n  -H 'Content-Type: application/json' \\\n  -d '${body.replace(/'/g, "'\\''")}' \\\n  -o speech.wav`;
+}
+["tts-input", "tts-model", "tts-voice", "base"].forEach((id) => $(id).addEventListener("input", showCurl));
+showCurl();
+
+async function getJson(path, out) {
+  out.textContent = "...";
+  try {
+    const r = await fetch(base() + path);
+    out.textContent = `HTTP ${r.status}\n` + JSON.stringify(await r.json(), null, 2);
+  } catch (e) { out.textContent = "Request failed: " + e; }
+}
+
+$("connect").onclick = async () => {
+  $("status").textContent = "Checking...";
+  try {
+    const r = await fetch(base() + "/models");
+    const ids = (await r.json()).data.map((m) => m.id);
+    $("status").textContent = `Connected - models: ${ids.join(", ")}`;
+  } catch (e) {
+    $("status").textContent = "Not reachable. Start a server with `rocm serve kokoro` and paste its endpoint.";
+  }
+};
+$("models-run").onclick = () => getJson("/models", $("models-out"));
+$("health-run").onclick = () => getJson("/health", $("health-out"));
+
+$("tts-run").onclick = async () => {
+  const button = $("tts-run");
+  button.disabled = true;
+  $("tts-out").textContent = "Speaking...";
+  const started = performance.now();
+  try {
+    const r = await fetch(base() + "/audio/speech", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: $("tts-model").value, input: $("tts-input").value,
+                             voice: $("tts-voice").value, response_format: "wav" }),
+    });
+    const blob = await r.blob();
+    const ms = Math.round(performance.now() - started);
+    if (!r.ok) { $("tts-out").textContent = `HTTP ${r.status}\n` + await blob.text(); return; }
+    $("tts-out").textContent = `HTTP ${r.status} ${r.headers.get("content-type")} - ${blob.size} bytes in ${ms} ms`;
+    const audio = $("tts-audio");
+    audio.src = URL.createObjectURL(blob);
+    // Some browsers refuse to autoplay; the player's own button still works.
+    audio.play().catch(() => {
+      $("tts-out").textContent += " - press play on the player to listen";
+    });
+  } catch (e) {
+    $("tts-out").textContent = "Request failed: " + e;
+  } finally { button.disabled = false; }
+};
+
+$("stt-run").onclick = async () => {
+  const file = $("stt-file").files[0];
+  if (!file) { $("stt-out").textContent = "Choose a WAV file first."; return; }
+  const form = new FormData();
+  form.append("model", $("stt-model").value);
+  form.append("file", file);
+  $("stt-out").textContent = "Transcribing...";
+  try {
+    const r = await fetch(base() + "/audio/transcriptions", { method: "POST", body: form });
+    $("stt-out").textContent = `HTTP ${r.status}\n` + JSON.stringify(await r.json(), null, 2);
+  } catch (e) { $("stt-out").textContent = "Request failed: " + e; }
+};
+
+const params = new URLSearchParams(location.search);
+if (params.get("server")) $("base").value = params.get("server");
+showCurl();
+$("connect").click();
+</script>
+</body>
+</html>

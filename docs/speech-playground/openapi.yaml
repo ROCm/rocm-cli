@@ -1,0 +1,69 @@
+# Copyright © Advanced Micro Devices, Inc., or its affiliates.
+#
+# SPDX-License-Identifier: MIT
+
+openapi: 3.0.3
+info:
+  title: ROCm CLI speech API
+  version: "0.1"
+  description: >
+    OpenAI-compatible speech endpoints of a server started with `rocm serve`
+    (`rocm serve kokoro` or `rocm serve tts` for text-to-speech,
+    `rocm serve whisper` for speech-to-text).
+servers:
+  - url: http://127.0.0.1:11435/v1
+paths:
+  /audio/speech:
+    post:
+      summary: Text to speech
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [model, input]
+              properties:
+                model: { type: string, example: kokoro-v1 }
+                input: { type: string, example: Hello from ROCm. }
+                voice: { type: string, example: af_heart }
+                response_format: { type: string, enum: [wav, pcm], default: wav }
+      responses:
+        "200":
+          description: Spoken audio.
+          content:
+            audio/wav:
+              schema: { type: string, format: binary }
+  /audio/transcriptions:
+    post:
+      summary: Speech to text
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [model, file]
+              properties:
+                model: { type: string, example: Whisper-Large-v3-Turbo }
+                file: { type: string, format: binary }
+                language: { type: string, example: en }
+      responses:
+        "200":
+          description: The transcript.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  text: { type: string }
+  /models:
+    get:
+      summary: Models the server knows
+      responses:
+        "200": { description: OpenAI model list. }
+  /health:
+    get:
+      summary: Loaded models and the backend each runs on
+      responses:
+        "200": { description: Lemonade health report. }
