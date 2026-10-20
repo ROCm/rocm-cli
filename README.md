@@ -700,7 +700,7 @@ with an explicit quantization variant, for example,
 safetensors-only id has no GGUF build, so serving it through Lemonade fails
 rather than silently substituting a different model.
 
-#### Speech-to-text models
+#### Speech models
 
 `rocm serve whisper` serves Whisper Large-v3-Turbo through Lemonade
 (`rocm serve whisper-tiny` serves the smallest Whisper model). A
@@ -713,6 +713,12 @@ prints that endpoint and names the task in place of the chat timing rows, and
 curl http://127.0.0.1:11435/v1/audio/transcriptions \
   -F model=Whisper-Large-v3-Turbo -F file=@recording.wav
 ```
+
+`rocm serve tts` serves OpenMOSS-TTS, a text-to-speech model, the same way: it
+answers the OpenAI-compatible `POST /v1/audio/speech` route with a WAV file.
+It is a 12.5 GB download and needs a GPU with about 14 GiB free. Lemonade's
+smaller Kokoro text-to-speech model is not offered, because it runs only on the
+CPU.
 
 `rocm transcribe recording.wav` does the same from the command line: it sends
 the file to the running speech-to-text server and prints what was said (`--json`

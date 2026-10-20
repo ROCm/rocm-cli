@@ -870,6 +870,37 @@ pub fn openai_transcription_status(
     Ok(response.status)
 }
 
+/// The least time a text-to-speech probe is given, whatever the caller passes.
+///
+/// Synthesizing even one word runs the whole model and its audio codec, which
+/// on a large text-to-speech model takes far longer than the token a chat probe
+/// asks for; a chat-sized budget would keep a working server from ever being
+/// called ready. Failed probes are throttled, so this is not paid on every poll.
+pub const SPEECH_PROBE_MIN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Ask a text-to-speech endpoint to say one word and return the HTTP status —
+/// the text-to-speech counterpart of [`openai_chat_completion_status`].
+pub fn openai_speech_status(
+    endpoint_url: &str,
+    model_ref: &str,
+    endpoint_api_key: Option<&str>,
+    timeout: Duration,
+) -> Result<u16> {
+    let body = serde_json::json!({
+        "model": model_ref,
+        "input": "ok",
+        "response_format": "wav",
+    });
+    let response = http_post_json_with_auth(
+        endpoint_url,
+        "/v1/audio/speech",
+        &body,
+        endpoint_api_key,
+        timeout.max(SPEECH_PROBE_MIN_TIMEOUT),
+    )?;
+    Ok(response.status)
+}
+
 /// The smallest real request for a model's task, as an HTTP status.
 pub fn openai_inference_status(
     task: crate::ModelTask,
@@ -884,6 +915,9 @@ pub fn openai_inference_status(
         }
         crate::ModelTask::Transcription => {
             openai_transcription_status(endpoint_url, model_ref, endpoint_api_key, timeout)
+        }
+        crate::ModelTask::Speech => {
+            openai_speech_status(endpoint_url, model_ref, endpoint_api_key, timeout)
         }
         // Readiness is never claimed for a service this build cannot probe.
         crate::ModelTask::Unknown => bail!("no inference probe exists for an unrecognised task"),
@@ -2479,6 +2513,34 @@ mod tests {
                 .is_some_and(|probe| probe.starts_with("POST /v1/audio/transcriptions ")),
             "the 500 must be the transcription probe's answer: {requests:?}"
         );
+        Ok(())
+    }
+    #[test]
+    fn a_text_to_speech_service_is_probed_with_a_speech_request() -> Result<()> {
+        let (port, server) = spawn_canned_http_server(vec![
+            Some(("HTTP/1.1 200 OK", MODELS_OK_BODY)),
+            Some(("HTTP/1.1 200 OK", "RIFF")),
+        ])?;
+        let mut record = probe_test_record(port);
+        record.task = crate::ModelTask::Speech;
+
+        assert_eq!(
+            managed_service_endpoint_readiness(
+                &mut record,
+                None,
+                Duration::from_secs(2),
+                Duration::from_secs(2)
+            )
+            .readiness,
+            EndpointReadiness::Serving
+        );
+        let requests = server.join().expect("server thread should not panic")?;
+        let probe = requests.get(1).expect("an inference probe was sent");
+        assert!(
+            probe.starts_with("POST /v1/audio/speech HTTP/1.1"),
+            "{probe}"
+        );
+        assert!(probe.contains("\"input\":\"ok\""), "{probe}");
         Ok(())
     }
     #[test]

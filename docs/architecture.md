@@ -158,7 +158,7 @@ These modules are private `mod` declarations — [`lib.rs`](../crates/e2e-report
 - [`install.rs`](../engines/lemonade/src/install.rs) — embeddable-runtime archive download/verify/extract, cache locking, and manifest persistence.
 - [`process.rs`](../engines/lemonade/src/process.rs) — `lemond`/llama-server spawn, env/path setup, and readiness/health polling.
 - [`runtime_dir.rs`](../engines/lemonade/src/runtime_dir.rs) — `XDG_RUNTIME_DIR` tier1/2/3 hardening for the spawned child.
-- [`speech.rs`](../engines/lemonade/src/speech.rs) — speech-to-text serving through the `whispercpp` recipe: GPU backend selection, load, and the post-load transcription check.
+- [`speech.rs`](../engines/lemonade/src/speech.rs) — speech model serving: speech-to-text through the `whispercpp` recipe and text-to-speech through `openmoss`, with GPU backend selection, load, and the post-load request check.
 - [`state.rs`](../engines/lemonade/src/state.rs) — service state file I/O, device-policy/GPU-selection parsing, and port/endpoint helpers.
 
 [`lib.rs`](../engines/lemonade/src/lib.rs) keeps only CLI/envelope dispatch and the service-lifecycle orchestration that calls across those modules.

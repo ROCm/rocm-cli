@@ -213,6 +213,16 @@ pub fn run_cli() -> Result<()> {
     Ok(())
 }
 
+/// How `/v1/health` names a loaded speech model's recipe and backend.
+///
+/// Returns the recipe name and the `recipe_options` key that reports the
+/// backend, for callers that judge a speech service's readiness from that
+/// report; `None` for a task that is not served as a speech model.
+#[must_use]
+pub fn speech_model_health_keys(task: ModelTask) -> Option<(&'static str, &'static str)> {
+    crate::speech::speech_recipe(task).map(crate::speech::SpeechRecipe::health_keys)
+}
+
 pub fn builtin_handle_envelope(envelope: EngineRequestEnvelope) -> EngineResponseEnvelope {
     handle_envelope(envelope)
 }
@@ -317,7 +327,7 @@ fn capabilities() -> EngineCapabilities {
         quantized_models:
             "GGUF through Lemonade llama.cpp (ROCm or Vulkan GPU backend auto-selected)".to_owned(),
         reasoning_parser: false,
-        tasks: vec![ModelTask::Chat, ModelTask::Transcription],
+        tasks: vec![ModelTask::Chat, ModelTask::Transcription, ModelTask::Speech],
     }
 }
 
@@ -422,8 +432,9 @@ fn resolve_model_response(request: ResolveModelRequest) -> Result<ResolveModelRe
     let device_policy = crate::state::normalize_device_policy(request.device_policy)?;
     let engine_recipe = crate::state::accepted_engine_recipe(request.engine_recipe)?;
     let canonical_model_id = crate::state::resolve_lemonade_model_ref(&request.model_ref);
-    if request.task == ModelTask::Transcription {
-        return Ok(crate::speech::resolve_transcription_model(
+    if let Some(recipe) = crate::speech::speech_recipe(request.task) {
+        return Ok(crate::speech::resolve_speech_model(
+            recipe,
             canonical_model_id,
             device_policy,
             engine_recipe,
@@ -530,8 +541,14 @@ fn serve_http(mut request: ServeHttpRequest) -> Result<()> {
     process_env.gpu_indices = request.gpu_indices.clone();
     let log_path = request.log_path.as_deref();
     crate::state::write_running_state(&request, &runtime, std::process::id(), None, "starting")?;
-    if request.task == ModelTask::Transcription {
-        return crate::speech::serve_transcription(&request, &runtime, &process_env, log_path);
+    if let Some(recipe) = crate::speech::speech_recipe(request.task) {
+        return crate::speech::serve_speech_model(
+            recipe,
+            &request,
+            &runtime,
+            &process_env,
+            log_path,
+        );
     }
     // A canonical Hugging Face checkpoint (owner/repo:variant) cannot be served under its
     // exact name through Lemonade's model router (Lemonade renames registered models and
@@ -728,17 +745,19 @@ fn healthcheck_service(request: HealthcheckRequest) -> Result<HealthcheckRespons
         && !model_ref.is_empty()
         && endpoint_url
             .as_deref()
-            .map(|endpoint| match task {
-                ModelTask::Chat => {
-                    crate::process::query_loaded_model_endpoint(endpoint, &model_ref, &backend)
-                }
-                ModelTask::Transcription => {
-                    crate::speech::query_loaded_transcription_model(endpoint, &model_ref, &backend)
-                }
-                // Only this adapter writes the task into its state, and only
-                // values it serves; anything else is never reported ready.
-                ModelTask::Unknown => Ok(false),
-            })
+            .map(
+                |endpoint| match (task, crate::speech::speech_recipe(task)) {
+                    (ModelTask::Chat, _) => {
+                        crate::process::query_loaded_model_endpoint(endpoint, &model_ref, &backend)
+                    }
+                    (_, Some(recipe)) => crate::speech::query_loaded_speech_model(
+                        recipe, endpoint, &model_ref, &backend,
+                    ),
+                    // Only this adapter writes the task into its state, and only
+                    // values it serves; anything else is never reported ready.
+                    (_, None) => Ok(false),
+                },
+            )
             .transpose()
             .unwrap_or(None)
             .unwrap_or(false);
@@ -785,6 +804,7 @@ fn supported_routes(task: ModelTask) -> Vec<String> {
     let task_routes: &[&str] = match task {
         ModelTask::Chat => &["/v1/chat/completions", "/v1/completions"],
         ModelTask::Transcription => &["/v1/audio/transcriptions"],
+        ModelTask::Speech => &["/v1/audio/speech"],
         ModelTask::Unknown => &[],
     };
     ["/v1/health", "/v1/models"]

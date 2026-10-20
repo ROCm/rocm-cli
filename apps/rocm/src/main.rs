@@ -11646,9 +11646,9 @@ fn service_http_readiness_response_ready_for_task(
     if status != 200 {
         return false;
     }
-    if task == rocm_core::ModelTask::Transcription {
+    if let Some((recipe, backend_option)) = rocm_engine_lemonade::speech_model_health_keys(task) {
         return (engine, path) == ("lemonade", "/v1/health")
-            && lemonade_health_has_transcription_model(body, canonical_model_id);
+            && lemonade_health_has_speech_model(body, canonical_model_id, recipe, backend_option);
     }
     match (engine, path) {
         ("lemonade", "/v1/health") => lemonade_health_ready_for_model(body, canonical_model_id),
@@ -11676,7 +11676,12 @@ fn lemonade_health_ready_for_model(body: &str, canonical_model_id: &str) -> bool
         })
 }
 
-fn lemonade_health_has_transcription_model(body: &str, canonical_model_id: &str) -> bool {
+fn lemonade_health_has_speech_model(
+    body: &str,
+    canonical_model_id: &str,
+    recipe: &str,
+    backend_option: &str,
+) -> bool {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(body.trim()) else {
         return false;
     };
@@ -11688,10 +11693,10 @@ fn lemonade_health_has_transcription_model(body: &str, canonical_model_id: &str)
                 let field = |key: &str| model.get(key).and_then(serde_json::Value::as_str);
                 field("model_name")
                     .is_some_and(|loaded| service_model_names_match(loaded, canonical_model_id))
-                    && field("recipe") == Some("whispercpp")
+                    && field("recipe") == Some(recipe)
                     && model
                         .get("recipe_options")
-                        .and_then(|options| options.get("whispercpp_backend"))
+                        .and_then(|options| options.get(backend_option))
                         .and_then(serde_json::Value::as_str)
                         .is_some_and(|backend| matches!(backend, "rocm" | "vulkan"))
             })
@@ -13717,6 +13722,32 @@ pub(crate) mod tests {
         );
         drop(server);
         Ok(())
+    }
+
+    #[test]
+    fn a_text_to_speech_model_is_listed_only_when_loaded_on_a_gpu_openmoss_backend() {
+        let health = |recipe: &str, option: &str, backend: &str| {
+            format!(
+                r#"{{"all_models_loaded":[{{"model_name":"OpenMOSS-TTS","recipe":"{recipe}","recipe_options":{{"{option}":"{backend}"}}}}]}}"#
+            )
+        };
+        let ready = |body: &str| {
+            service_http_readiness_response_ready_for_task(
+                rocm_core::ModelTask::Speech,
+                "lemonade",
+                "/v1/health",
+                200,
+                body,
+                "OpenMOSS-TTS",
+            )
+        };
+        assert!(ready(&health("openmoss", "openmoss_backend", "rocm")));
+        assert!(ready(&health("openmoss", "openmoss_backend", "vulkan")));
+        assert!(!ready(&health("openmoss", "openmoss_backend", "cuda")));
+        assert!(
+            !ready(&health("whispercpp", "whispercpp_backend", "rocm")),
+            "a loaded speech-to-text model is not a text-to-speech one"
+        );
     }
 
     #[test]

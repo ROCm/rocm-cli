@@ -309,6 +309,16 @@ Expected result:
 words alone; with only a chat server running it is refused and names
 `rocm serve whisper`.
 
+Text-to-speech, on a GPU with about 14 GiB free (a 12.5 GB download):
+
+```powershell
+rocm serve tts
+curl.exe http://127.0.0.1:11435/v1/audio/speech -H "Content-Type: application/json" -d "{\"model\":\"OpenMOSS-TTS\",\"input\":\"Hello from ROCm.\"}" -o hello.wav
+```
+
+Expected result: `hello.wav` plays the sentence, the summary names the
+`text-to-speech` task, and `rocm services` lists a `text-to-speech endpoint`.
+
 Confirm the GPU did the work by watching GPU utilization (`amd-smi metric` on
 Linux, Task Manager's GPU graph on Windows) while transcribing a recording of a
 minute or more. Do not rely on the `device` field of Lemonade's own

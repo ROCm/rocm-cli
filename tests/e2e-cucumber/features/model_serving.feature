@@ -373,3 +373,14 @@ Feature: Model serving
     When the user lists running services
     Then the service is listed as speech-to-text with its transcription endpoint
     And the listed speech-to-text endpoint reaches that server's transcription route
+
+
+  # Text-to-speech on the GPU: Lemonade's OpenMOSS backend (ROCm, or Vulkan
+  # where ROCm is unsupported; it has no CPU build). Nightly because the model
+  # is a 12.5 GB download, which a per-PR lane cannot afford.
+  @id:serve-text-to-speech-model-speaks-on-the-printed-endpoint @requires-gpu @requires-engine:lemonade @nightly @serve-timeout:2400
+  Scenario: serve-29 - A served text-to-speech model speaks on the endpoint the CLI prints
+    Given a managed runtime is active
+    When the user serves a text-to-speech model on Lemonade
+    Then the CLI prints the text-to-speech endpoint of the served model
+    And text sent to that endpoint comes back as spoken audio

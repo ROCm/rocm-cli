@@ -1813,11 +1813,14 @@ cargo test -p rocm --bin rocm transcribe::
 ```
 
 The user-facing behaviour is in `serve-26` to `serve-28`, `chat-10`,
-`chat-11`, `bench-07`, and `transcribe-01`/`transcribe-02`. All but `serve-27`
+`chat-11`, `bench-07`, `transcribe-01`/`transcribe-02`, and the nightly
+text-to-speech scenario `serve-29`. All but `serve-27` and `serve-29`
 run against mock servers (or none, for `serve-26`) with no GPU; `chat-11`
 drives the interactive chat pane and so runs on the Linux lanes only.
 `serve-27` serves Whisper-Tiny on a real GPU and needs the Lemonade GPU lanes
-(`@requires-gpu @requires-engine:lemonade`).
+(`@requires-gpu @requires-engine:lemonade`); `serve-29` serves OpenMOSS-TTS on
+those lanes too, but only in the nightly run (`E2E_INCLUDE_NIGHTLY=1`), as the
+model is a 12.5 GB download.
 
 Running a subset with `cargo xtask e2e -- -n <pattern>` bypasses the
 capability filter, so a `@requires-gpu` scenario the pattern matches runs, and
