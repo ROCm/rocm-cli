@@ -20819,7 +20819,9 @@ pub(crate) mod tests {
             "the piped read must supply the prompt that is dispatched (and \
              propagate its error), not be a discarded call; body:\n{body}"
         );
-        let read_at = body.find("chat::read_piped_prompt(").expect("asserted above");
+        let read_at = body
+            .find("chat::read_piped_prompt(")
+            .expect("asserted above");
         let send_at = body
             .find("chat::render_chat_prompt_text(")
             .unwrap_or_else(|| panic!("chat handler no longer sends a prompt; body:\n{body}"));
