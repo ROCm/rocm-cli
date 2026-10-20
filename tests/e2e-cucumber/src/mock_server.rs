@@ -794,6 +794,12 @@ pub struct ServiceRecordOptions {
     pub task: Option<&'static str>,
     /// The engine the record names. `None` (the default) keeps `vllm`.
     pub engine: Option<&'static str>,
+    /// The record's service id, which also names its manifest file. `None` (the
+    /// default) keeps `e2e-mock`; set it to plant a second service beside it.
+    pub service_id: Option<&'static str>,
+    /// When the service was created. `None` (the default) keeps the fixed
+    /// historical value; set a later one to make a planted service the newest.
+    pub created_at_unix_ms: Option<u64>,
 }
 
 impl Default for ServiceRecordOptions {
@@ -808,6 +814,8 @@ impl Default for ServiceRecordOptions {
             host: None,
             task: None,
             engine: None,
+            service_id: None,
+            created_at_unix_ms: None,
         }
     }
 }
@@ -841,8 +849,9 @@ pub fn write_service_record_with(
 
     // The CLI only extracts host:port from `endpoint_url` and appends
     // `/v1/models` for its readiness probe, which the mock serves.
+    let service_id = options.service_id.unwrap_or("e2e-mock");
     let mut record = json!({
-        "service_id": "e2e-mock",
+        "service_id": service_id,
         "engine": options.engine.unwrap_or("vllm"),
         "model_ref": model,
         "canonical_model_id": model,
@@ -865,16 +874,16 @@ pub fn write_service_record_with(
         "engine_recipe_json": null,
         "restart_count": 0,
         "last_restart_unix_ms": null,
-        "manifest_path": services_dir.join("e2e-mock.json"),
-        "log_path": services_dir.join("e2e-mock.log"),
-        "engine_state_path": services_dir.join("e2e-mock.state.json"),
-        "created_at_unix_ms": 1_700_000_000_000_u64,
+        "manifest_path": services_dir.join(format!("{service_id}.json")),
+        "log_path": services_dir.join(format!("{service_id}.log")),
+        "engine_state_path": services_dir.join(format!("{service_id}.state.json")),
+        "created_at_unix_ms": options.created_at_unix_ms.unwrap_or(1_700_000_000_000),
     });
     if let Some(task) = options.task {
         record["task"] = json!(task);
     }
     std::fs::write(
-        services_dir.join("e2e-mock.json"),
+        services_dir.join(format!("{service_id}.json")),
         serde_json::to_vec_pretty(&record).expect("failed to serialize record"),
     )
     .expect("failed to write service record");

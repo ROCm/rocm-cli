@@ -39,6 +39,13 @@ pub(crate) const WHISPERCPP_RECIPE: &str = "whispercpp";
 /// transcribing on the CPU.
 const WHISPERCPP_BACKEND_PRIORITY: [&str; 2] = ["rocm", "vulkan"];
 
+/// Shown when the whisper.cpp backend fails to install twice in a row. The
+/// download is retried by every serve that finds the backend missing, so
+/// running the same command again is the step that installs it.
+const WHISPERCPP_INSTALL_ADVICE: &str = "Lemonade could not install its speech-to-text \
+     (whisper.cpp) backend; check the network connection and run the same `rocm serve` \
+     command again, which retries the download";
+
 /// How long `lemond` gets to answer its status query after it is spawned.
 const LEMOND_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -70,7 +77,7 @@ pub(crate) fn resolve_transcription_model(
         engine_recipe,
         warnings: vec![
             "Lemonade runs Whisper on its ROCm whisper.cpp backend, or Vulkan when ROCm is \
-             unsupported on this GPU; CPU is never used under the GPU-required policy"
+             unsupported on this GPU; its CPU build is never selected"
                 .to_owned(),
         ],
     }
@@ -165,16 +172,19 @@ fn prepare_transcription_model(
             "Installing Lemonade {WHISPERCPP_RECIPE}:{} backend...",
             backend.name
         );
-        crate::backend_alignment::install_llamacpp_backend_with_retry(|| {
-            crate::process::run_lemonade_recipe_backend_install(
-                manifest,
-                &request.host,
-                request.port,
-                WHISPERCPP_RECIPE,
-                &backend.name,
-                process_env,
-            )
-        })?;
+        crate::backend_alignment::install_backend_with_retry(
+            || {
+                crate::process::run_lemonade_recipe_backend_install(
+                    manifest,
+                    &request.host,
+                    request.port,
+                    WHISPERCPP_RECIPE,
+                    &backend.name,
+                    process_env,
+                )
+            },
+            WHISPERCPP_INSTALL_ADVICE,
+        )?;
     }
     crate::process::run_lemonade_load_command(
         manifest,
@@ -377,6 +387,53 @@ whispercpp          cpu         installed       v1.8.4                          
                 ("rocm".to_owned(), "unsupported".to_owned()),
                 ("vulkan".to_owned(), "installable".to_owned()),
             ]
+        );
+    }
+
+    #[test]
+    fn rows_of_recipes_listed_after_llamacpp_are_not_attached_to_it() {
+        // 11.5.1 lists `openmoss` and `vllm` after `llamacpp`. Before those
+        // recipes were known, their rows read as more llama.cpp backends.
+        let statuses = crate::backend_alignment::parse_backend_statuses(
+            BACKENDS_NO_ROCM,
+            crate::LLAMACPP_RECIPE,
+        );
+        assert_eq!(
+            statuses,
+            vec![
+                ("cpu".to_owned(), "installable".to_owned()),
+                ("rocm".to_owned(), "unsupported".to_owned()),
+                ("vulkan".to_owned(), "installed".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_failed_whisper_backend_install_is_retried_once_then_names_a_working_remedy() {
+        let mut attempts = 0;
+        let error = crate::backend_alignment::install_backend_with_retry(
+            || {
+                attempts += 1;
+                anyhow::bail!("download interrupted")
+            },
+            WHISPERCPP_INSTALL_ADVICE,
+        )
+        .expect_err("both attempts fail");
+        assert_eq!(attempts, 2);
+        assert!(
+            error
+                .to_string()
+                .contains("run the same `rocm serve` command again"),
+            "{error}"
+        );
+        // The remedy holds because a serve that finds the backend missing
+        // installs it: an `installable` backend is selected as not yet
+        // installed, which is what sends `prepare_transcription_model` down the
+        // install path again.
+        assert!(
+            !select_whispercpp_backend(BACKENDS_NO_ROCM)
+                .expect("vulkan is usable")
+                .already_installed
         );
     }
 

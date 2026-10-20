@@ -362,13 +362,14 @@ Feature: Model serving
     When the user serves a speech-to-text model with the engine the CLI recommended
     Then the CLI prints the speech-to-text endpoint of the served model
     And a recording sent to that endpoint is transcribed
+    And the running service is listed as speech-to-text
 
   # A chat client appends /chat/completions to a listed base URL, which a
-  # speech-to-text server does not have; the list must name the route it does
-  # serve, and that route must actually answer.
+  # speech-to-text server does not have; the list must also name the route it
+  # does serve, and that URL must reach the registered server's route.
   @id:serve-speech-to-text-server-listed-with-its-task
   Scenario: serve-28 - A running speech-to-text server is listed with its task and the endpoint it answers on
     Given a speech-to-text model is being served and registered with the CLI
     When the user lists running services
     Then the service is listed as speech-to-text with its transcription endpoint
-    And a recording sent to the listed endpoint is transcribed
+    And the listed speech-to-text endpoint reaches that server's transcription route

@@ -297,10 +297,11 @@ Expected result:
 - The summary's `endpoint` row ends in `/v1/audio/transcriptions` and a `task`
   row says `speech-to-text`; there are no time-to-first-token or throughput rows.
 - The `curl` call returns JSON whose `text` is the recording's words.
-- `rocm services` lists the server with `task: speech-to-text` and the same
-  transcription endpoint.
+- `rocm services` lists the server with `task: speech-to-text`, its base
+  `endpoint`, and a `speech-to-text endpoint` line with the same transcription
+  URL as the summary.
 - `rocm chat --provider local --model Whisper-Tiny --prompt hi` is refused and
-  says the model is a speech-to-text model; nothing is sent to the server.
+  says the model is a speech-to-text model; no chat request is sent to the server.
 - `rocm serve whisper-tiny --engine vllm` is refused before any GPU check and
   names `rocm serve whisper-tiny --engine lemonade`.
 

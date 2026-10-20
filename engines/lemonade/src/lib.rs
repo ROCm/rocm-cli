@@ -735,6 +735,9 @@ fn healthcheck_service(request: HealthcheckRequest) -> Result<HealthcheckRespons
                 ModelTask::Transcription => {
                     crate::speech::query_loaded_transcription_model(endpoint, &model_ref, &backend)
                 }
+                // Only this adapter writes the task into its state, and only
+                // values it serves; anything else is never reported ready.
+                ModelTask::Unknown => Ok(false),
             })
             .transpose()
             .unwrap_or(None)
@@ -782,6 +785,7 @@ fn supported_routes(task: ModelTask) -> Vec<String> {
     let task_routes: &[&str] = match task {
         ModelTask::Chat => &["/v1/chat/completions", "/v1/completions"],
         ModelTask::Transcription => &["/v1/audio/transcriptions"],
+        ModelTask::Unknown => &[],
     };
     ["/v1/health", "/v1/models"]
         .iter()

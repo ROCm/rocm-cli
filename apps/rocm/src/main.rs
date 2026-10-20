@@ -6665,15 +6665,17 @@ pub(crate) fn render_services_text(paths: &AppPaths, all: bool) -> Result<String
         let _ = writeln!(output, "  status: {}", record.status);
         let _ = writeln!(output, "  engine: {}", record.engine);
         let _ = writeln!(output, "  model: {}", record.model_ref);
-        if record.task.is_chat() {
-            let _ = writeln!(output, "  endpoint: {}", record.endpoint_url);
-        } else {
-            // Chat clients append `/chat/completions` to the base URL; a
-            // speech-to-text server has no such route, so name the one it has.
+        let _ = writeln!(output, "  endpoint: {}", record.endpoint_url);
+        if !record.task.is_chat() {
+            // `endpoint` stays the base URL for every service, so tools that
+            // take one keep working. Chat clients append `/chat/completions` to
+            // it, which a speech-to-text server does not have, so name the
+            // route it does serve.
             let _ = writeln!(output, "  task: {}", record.task.display_name());
             let _ = writeln!(
                 output,
-                "  endpoint: {}{}",
+                "  {} endpoint: {}{}",
+                record.task.display_name(),
                 record.endpoint_url,
                 record.task.api_route()
             );
@@ -7356,7 +7358,8 @@ fn restart_internal_managed_service_with(
     // Recorded before the readiness wait, so a stop issued during it finds the
     // new child rather than the processes already stopped.
     let started = record_restarted_child(paths, &stopped_record, runtime_pin, child_pid)?;
-    let readiness = wait_for_service_http_ready(
+    let readiness = wait_for_task_service_http_ready(
+        started.task,
         &started.engine,
         &started.host,
         started.port,
@@ -11370,6 +11373,7 @@ fn apply_app_path_env(command: &mut ProcessCommand, paths: &AppPaths) {
     }
 }
 
+#[cfg(test)]
 fn wait_for_service_http_ready(
     engine: &str,
     host: &str,
@@ -11378,7 +11382,29 @@ fn wait_for_service_http_ready(
     endpoint_api_key: Option<&str>,
     timeout: Duration,
 ) -> EndpointReadiness {
+    wait_for_task_service_http_ready(
+        rocm_core::ModelTask::Chat,
+        engine,
+        host,
+        port,
+        canonical_model_id,
+        endpoint_api_key,
+        timeout,
+    )
+}
+
+/// [`wait_for_service_http_ready`] for a service of any task.
+fn wait_for_task_service_http_ready(
+    task: rocm_core::ModelTask,
+    engine: &str,
+    host: &str,
+    port: u16,
+    canonical_model_id: &str,
+    endpoint_api_key: Option<&str>,
+    timeout: Duration,
+) -> EndpointReadiness {
     wait_for_service_http_ready_with_progress(
+        task,
         engine,
         host,
         port,
@@ -11404,7 +11430,9 @@ fn wait_for_service_http_ready(
 /// maps each engine to the right listing path. `endpoint_api_key` is sent as a
 /// bearer token so both the listing check and the inference probe still succeed
 /// against a public endpoint that requires authentication.
+#[allow(clippy::too_many_arguments)]
 fn wait_for_service_http_ready_with_progress(
+    task: rocm_core::ModelTask,
     engine: &str,
     host: &str,
     port: u16,
@@ -11426,7 +11454,8 @@ fn wait_for_service_http_ready_with_progress(
                 Duration::from_millis(750),
             )
             .is_ok_and(|(status, body)| {
-                service_http_readiness_response_ready(
+                service_http_readiness_response_ready_for_task(
+                    task,
                     engine,
                     path,
                     status,
@@ -11437,7 +11466,8 @@ fn wait_for_service_http_ready_with_progress(
         });
         if listed {
             best = EndpointReadiness::Listing;
-            if rocm_core::openai_chat_completion_probe(
+            if rocm_core::openai_inference_probe(
+                task,
                 &endpoint,
                 canonical_model_id,
                 endpoint_api_key,
@@ -11541,7 +11571,31 @@ fn http_post_local_service_json(
     Ok((status, body.to_owned()))
 }
 
+#[cfg(test)]
 fn service_http_readiness_response_ready(
+    engine: &str,
+    path: &str,
+    status: u16,
+    body: &str,
+    canonical_model_id: &str,
+) -> bool {
+    service_http_readiness_response_ready_for_task(
+        rocm_core::ModelTask::Chat,
+        engine,
+        path,
+        status,
+        body,
+        canonical_model_id,
+    )
+}
+
+/// Whether one readiness response shows the model loaded, judged for its task.
+///
+/// A speech-to-text model is listed only by Lemonade's `/v1/health`, loaded
+/// through `whispercpp` on a GPU backend. Lemonade's `/v1/models` lists every
+/// downloaded model, loaded or not, so it says nothing about a Whisper model.
+fn service_http_readiness_response_ready_for_task(
+    task: rocm_core::ModelTask,
     engine: &str,
     path: &str,
     status: u16,
@@ -11550,6 +11604,10 @@ fn service_http_readiness_response_ready(
 ) -> bool {
     if status != 200 {
         return false;
+    }
+    if task == rocm_core::ModelTask::Transcription {
+        return (engine, path) == ("lemonade", "/v1/health")
+            && lemonade_health_has_transcription_model(body, canonical_model_id);
     }
     match (engine, path) {
         ("lemonade", "/v1/health") => lemonade_health_ready_for_model(body, canonical_model_id),
@@ -11573,6 +11631,28 @@ fn lemonade_health_ready_for_model(body: &str, canonical_model_id: &str) -> bool
                     .filter_map(|field| model.get(field).and_then(serde_json::Value::as_str))
                     .any(|loaded| service_model_names_match(loaded, canonical_model_id));
                 name_matches && service_model_reports_rocm_backend(model)
+            })
+        })
+}
+
+fn lemonade_health_has_transcription_model(body: &str, canonical_model_id: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body.trim()) else {
+        return false;
+    };
+    value
+        .get("all_models_loaded")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|models| {
+            models.iter().any(|model| {
+                let field = |key: &str| model.get(key).and_then(serde_json::Value::as_str);
+                field("model_name")
+                    .is_some_and(|loaded| service_model_names_match(loaded, canonical_model_id))
+                    && field("recipe") == Some("whispercpp")
+                    && model
+                        .get("recipe_options")
+                        .and_then(|options| options.get("whispercpp_backend"))
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|backend| matches!(backend, "rocm" | "vulkan"))
             })
         })
 }
@@ -13495,6 +13575,122 @@ pub(crate) mod tests {
         assert_eq!(status_for_readiness(readiness), "ready");
         drop(server);
         Ok(())
+    }
+
+    #[test]
+    fn speech_to_text_readiness_waits_for_whisper_and_probes_with_a_transcription() -> Result<()> {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::{Arc, Mutex};
+
+        // Shaped like Lemonade serving Whisper-Tiny on `whispercpp:vulkan`, as
+        // captured from 11.5.1: `/v1/health` lists the model with its backend,
+        // and a chat request to it is refused with 400 — which the old
+        // chat-only wait read as serving.
+        const HEALTH: &str = r#"{"all_models_loaded":[{"model_name":"Whisper-Tiny","recipe":"whispercpp","device":"gpu","type":"transcription","recipe_options":{"ctx_size":4096,"whispercpp_backend":"vulkan"}}]}"#;
+        let listener = TcpListener::bind(("127.0.0.1", 0))?;
+        let port = listener.local_addr()?.port();
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let server_seen = Arc::clone(&seen);
+        let server = thread::spawn(move || {
+            while let Ok((mut stream, _)) = listener.accept() {
+                // Drain the whole request: the probe uploads a WAV file, and
+                // closing on a partial read would fail its write.
+                stream
+                    .set_read_timeout(Some(Duration::from_millis(200)))
+                    .ok();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 8192];
+                while let Ok(read) = stream.read(&mut buffer) {
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                let line = String::from_utf8_lossy(&request)
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned();
+                let (status_line, body) = if line.starts_with("GET /v1/health ") {
+                    ("HTTP/1.1 200 OK", HEALTH)
+                } else if line.starts_with("POST /v1/audio/transcriptions ") {
+                    ("HTTP/1.1 200 OK", r#"{"text":" [BLANK_AUDIO]"}"#)
+                } else if line.starts_with("POST /v1/chat/completions ") {
+                    ("HTTP/1.1 400 Bad Request", r#"{"error":"not an LLM"}"#)
+                } else {
+                    ("HTTP/1.1 404 Not Found", "{}")
+                };
+                server_seen.lock().unwrap().push(line);
+                let _ = write!(
+                    stream,
+                    "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+            }
+        });
+
+        let readiness = wait_for_task_service_http_ready(
+            rocm_core::ModelTask::Transcription,
+            "lemonade",
+            "127.0.0.1",
+            port,
+            "Whisper-Tiny",
+            None,
+            Duration::from_secs(5),
+        );
+
+        assert_eq!(readiness, EndpointReadiness::Serving);
+        assert_eq!(status_for_readiness(readiness), "ready");
+        let seen = seen.lock().unwrap().clone();
+        assert!(
+            seen.iter()
+                .any(|line| line.starts_with("POST /v1/audio/transcriptions ")),
+            "readiness must be proven by a transcription: {seen:?}"
+        );
+        assert!(
+            seen.iter().all(|line| !line.contains("/chat/completions")),
+            "no chat request may be sent to a speech-to-text server: {seen:?}"
+        );
+        drop(server);
+        Ok(())
+    }
+
+    #[test]
+    fn a_whisper_model_on_lemonades_cpu_build_is_not_listed_as_ready() {
+        let health = |backend: &str| {
+            format!(
+                r#"{{"all_models_loaded":[{{"model_name":"Whisper-Tiny","recipe":"whispercpp","recipe_options":{{"whispercpp_backend":"{backend}"}}}}]}}"#
+            )
+        };
+        let ready = |body: &str| {
+            service_http_readiness_response_ready_for_task(
+                rocm_core::ModelTask::Transcription,
+                "lemonade",
+                "/v1/health",
+                200,
+                body,
+                "Whisper-Tiny",
+            )
+        };
+        assert!(ready(&health("rocm")));
+        assert!(ready(&health("vulkan")));
+        assert!(
+            !ready(&health("cpu")),
+            "the CPU build is never a ready GPU service"
+        );
+        assert!(
+            !service_http_readiness_response_ready_for_task(
+                rocm_core::ModelTask::Transcription,
+                "lemonade",
+                "/v1/models",
+                200,
+                r#"{"data":[{"id":"Whisper-Tiny"}]}"#,
+                "Whisper-Tiny",
+            ),
+            "Lemonade lists every downloaded model, so the listing proves nothing"
+        );
     }
 
     #[test]
@@ -18720,6 +18916,69 @@ pub(crate) mod tests {
     }
 
     /// The value following `flag` in an argv, or `None` when the flag is absent.
+    #[test]
+    fn a_restarted_speech_to_text_service_is_relaunched_with_its_task() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "rocm-restart-task-argv-{}",
+            rocm_core::unix_time_millis()
+        ));
+        let paths = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-whisper",
+            "lemonade",
+            "whisper-tiny",
+            "Whisper-Tiny",
+            "127.0.0.1",
+            11435,
+            "managed",
+            0,
+            None,
+            None,
+            Some("gpu_required".to_owned()),
+        );
+        record.task = rocm_core::ModelTask::Transcription;
+        let speech = restart_child_argv(&record)?;
+        record.task = rocm_core::ModelTask::Chat;
+        let chat = restart_child_argv(&record)?;
+
+        assert_eq!(argv_flag_value(&speech, "--task"), Some("transcription"));
+        assert_eq!(
+            argv_flag_value(&chat, "--task"),
+            None,
+            "a chat restart keeps the argv it always had"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_builtin_vllm_child_refuses_a_speech_to_text_model_before_starting() {
+        let error = run_builtin_engine_serve_http(
+            "vllm",
+            "svc".to_owned(),
+            "Whisper-Tiny".to_owned(),
+            "127.0.0.1".to_owned(),
+            0,
+            "gpu_required",
+            Vec::new(),
+            None,
+            None,
+            PathBuf::from("state.json"),
+            None,
+            None,
+            rocm_core::ModelTask::Transcription,
+        )
+        .expect_err("vLLM serves chat models only");
+        assert!(
+            error.to_string().contains("serves chat models only"),
+            "{error}"
+        );
+    }
+
     fn argv_flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
         let index = args.iter().position(|arg| arg == flag)?;
         args.get(index + 1).map(String::as_str)

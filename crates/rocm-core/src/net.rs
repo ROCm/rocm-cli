@@ -797,10 +797,10 @@ fn http_status_code(status_line: &str) -> Option<u16> {
 /// non-empty content would also wrongly fail a reasoning model, which can spend
 /// its whole (tiny) token budget before emitting any content.
 ///
-/// The rule does mean a `404` reads as serving. That is harmless for the engines
-/// shipped today — both implement `/v1/chat/completions`, and a wrong key fails
-/// the model listing that gates this call — but an engine that does not expose an
-/// OpenAI-shaped chat route would need a different signal rather than this one.
+/// The rule does mean a `404` (or Lemonade's `400` for a model that is not an
+/// LLM) reads as serving, so this is only a readiness signal for a chat model.
+/// A service of another task is probed with its own request through
+/// [`openai_inference_probe`], which is what every readiness check calls.
 pub fn openai_chat_completion_probe(
     endpoint_url: &str,
     model_ref: &str,
@@ -885,6 +885,8 @@ pub fn openai_inference_status(
         crate::ModelTask::Transcription => {
             openai_transcription_status(endpoint_url, model_ref, endpoint_api_key, timeout)
         }
+        // Readiness is never claimed for a service this build cannot probe.
+        crate::ModelTask::Unknown => bail!("no inference probe exists for an unrecognised task"),
     }
 }
 
@@ -2470,7 +2472,13 @@ mod tests {
             EndpointReadiness::Listing
         );
         assert!(record.inference_verified_at_unix_ms.is_none());
-        server.join().expect("server thread should not panic")?;
+        let requests = server.join().expect("server thread should not panic")?;
+        assert!(
+            requests
+                .get(1)
+                .is_some_and(|probe| probe.starts_with("POST /v1/audio/transcriptions ")),
+            "the 500 must be the transcription probe's answer: {requests:?}"
+        );
         Ok(())
     }
     #[test]

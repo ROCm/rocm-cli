@@ -304,10 +304,10 @@ impl ModelRecipeIndexDocument {
         let mut refs = BTreeMap::<String, String>::new();
         for recipe in &self.recipes {
             require_nonempty(&recipe.canonical_model_id, "canonical_model_id")?;
+            // A task this build does not know is not checked here: an index
+            // written for a newer rocm-cli must stay loadable, and such a recipe
+            // fails on its own when it is served (`ModelRecipeRecord::model_task`).
             require_nonempty(&recipe.task, "task")?;
-            recipe
-                .model_task()
-                .with_context(|| format!("recipe `{}`", recipe.canonical_model_id))?;
             require_nonempty(&recipe.source, "source")?;
             require_nonempty(&recipe.revision, "revision")?;
             require_nonempty(&recipe.loader, "loader")?;
@@ -1071,25 +1071,30 @@ mod tests {
     }
 
     #[test]
-    fn model_recipe_index_rejects_a_task_this_build_cannot_serve() {
-        let mut recipe = sample_recipe_with_artifact("Qwen/Test-1B", &["test-qwen"]);
-        recipe.task = "embedding".to_owned();
+    fn a_recipe_with_a_task_this_build_cannot_serve_fails_alone() {
+        let mut unservable = sample_recipe_with_artifact("Qwen/Test-1B", &["test-qwen"]);
+        unservable.task = "embedding".to_owned();
+        let chat = sample_recipe_with_artifact("Qwen/Test-2B", &["test-qwen-2"]);
 
-        let error = format!(
-            "{:#}",
-            ModelRecipeIndexDocument {
-                schema_version: 1,
-                source: Some("fixture".to_owned()),
-                generated_at_unix_ms: Some(123),
-                platforms: Vec::new(),
-                recipes: vec![recipe],
-            }
-            .validate()
-            .expect_err("an unservable task should be rejected")
+        ModelRecipeIndexDocument {
+            schema_version: 1,
+            source: Some("fixture".to_owned()),
+            generated_at_unix_ms: Some(123),
+            platforms: Vec::new(),
+            recipes: vec![unservable.clone(), chat.clone()],
+        }
+        .validate()
+        .expect("an index written for a newer rocm-cli stays loadable");
+
+        let error = unservable
+            .model_task()
+            .expect_err("serving the unknown task must fail")
+            .to_string();
+        assert!(
+            error.contains("unsupported model task `embedding`"),
+            "{error}"
         );
-
-        assert!(error.contains("recipe `Qwen/Test-1B`"));
-        assert!(error.contains("unsupported model task `embedding`"));
+        assert_eq!(chat.model_task().expect("chat"), crate::ModelTask::Chat);
     }
 
     #[test]

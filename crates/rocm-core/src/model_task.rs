@@ -23,6 +23,12 @@ pub enum ModelTask {
     Chat,
     /// Speech-to-text: `POST /v1/audio/transcriptions`.
     Transcription,
+    /// A task written by a newer rocm-cli or engine plugin that this build does
+    /// not know. Kept so that one unfamiliar value degrades only the record or
+    /// capability it sits in, instead of failing the whole message: it is not
+    /// chat, and it is never served or probed.
+    #[serde(other)]
+    Unknown,
 }
 
 impl ModelTask {
@@ -32,6 +38,7 @@ impl ModelTask {
         match self {
             Self::Chat => "chat",
             Self::Transcription => "transcription",
+            Self::Unknown => "unknown",
         }
     }
 
@@ -41,15 +48,18 @@ impl ModelTask {
         match self {
             Self::Chat => "chat",
             Self::Transcription => "speech-to-text",
+            Self::Unknown => "unrecognised",
         }
     }
 
     /// The route a client calls, relative to the server's `/v1` base URL.
+    /// Empty for [`ModelTask::Unknown`], whose route this build cannot name.
     #[must_use]
     pub const fn api_route(self) -> &'static str {
         match self {
             Self::Chat => "/chat/completions",
             Self::Transcription => "/audio/transcriptions",
+            Self::Unknown => "",
         }
     }
 
@@ -110,6 +120,18 @@ mod tests {
                 .to_string()
                 .contains("unsupported model task `embedding`")
         );
+    }
+
+    #[test]
+    fn an_unrecognised_task_from_a_newer_writer_degrades_only_its_own_entry() {
+        #[derive(Deserialize)]
+        struct Capabilities {
+            tasks: Vec<ModelTask>,
+        }
+        let parsed: Capabilities =
+            serde_json::from_str(r#"{"tasks":["chat","embedding"]}"#).expect("parse");
+        assert_eq!(parsed.tasks, vec![ModelTask::Chat, ModelTask::Unknown]);
+        assert!(!ModelTask::Unknown.is_chat());
     }
 
     #[test]

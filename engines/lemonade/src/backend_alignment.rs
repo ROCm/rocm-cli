@@ -813,16 +813,28 @@ fn best_llamacpp_backend_for_host(manifest: &LemonadeInstallManifest) -> Result<
 /// completed download when its connection to lemond is interrupted, and a second
 /// call can reuse the backend cache immediately without a delay.
 pub(crate) fn install_llamacpp_backend_with_retry(
+    install: impl FnMut() -> Result<()>,
+) -> Result<()> {
+    install_backend_with_retry(
+        install,
+        "Lemonade backend installation failed again; run `rocm engines install \
+         lemonade --reinstall` and then retry `rocm serve`",
+    )
+}
+
+/// Install a backend, retrying once; see [`install_llamacpp_backend_with_retry`].
+/// `advice` is the remedy shown when the retry fails too. It has to name a step
+/// that actually installs *this* backend: `rocm engines install lemonade
+/// --reinstall` only ever reinstalls the llama.cpp one.
+pub(crate) fn install_backend_with_retry(
     mut install: impl FnMut() -> Result<()>,
+    advice: &'static str,
 ) -> Result<()> {
     match install() {
         Ok(()) => Ok(()),
         Err(first_error) => {
             eprintln!("Lemonade backend installation failed; retrying once: {first_error:#}");
-            install().with_context(|| {
-                "Lemonade backend installation failed again; run `rocm engines install \
-                 lemonade --reinstall` and then retry `rocm serve`"
-            })
+            install().context(advice)
         }
     }
 }

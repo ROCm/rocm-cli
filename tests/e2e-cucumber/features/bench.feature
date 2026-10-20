@@ -76,7 +76,7 @@ Feature: Benchmarking a served endpoint
   # it must refuse up front with the reason, not report a sweep of failures.
   @id:bench-load-refuses-a-speech-to-text-model
   Scenario: bench-07 - Benchmarking a speech-to-text model is refused with the reason
-    Given a speech-to-text model is being served and registered with the CLI
+    Given a speech-to-text model is being served
     When the user benchmarks the served endpoint
     Then the benchmark is refused because the model is a speech-to-text model
     And no chat request reached the speech-to-text server

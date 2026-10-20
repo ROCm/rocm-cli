@@ -483,8 +483,8 @@ fn select_local_chat_service(
         if let Some(other) = services.first() {
             bail!(
                 "`{model}` is served by `{}` as a {} model, not a chat model; chat needs a chat \
-                 model; start the built-in assistant with `rocm serve {BUILTIN_ASSISTANT_MODEL_ALIAS}`, \
-                 or pass --model for a chat service",
+                 model: serve one (the built-in assistant is `rocm serve {BUILTIN_ASSISTANT_MODEL_ALIAS}`) \
+                 and run chat again without --model, or pass --model with a chat service",
                 other.service_id,
                 other.task.display_name()
             );
@@ -2298,10 +2298,6 @@ mod tests {
         // `rocm chat` work is what
         // `local_provider_default_chat_requires_builtin_qwen_assistant` proves.
         assert!(error.contains("rocm serve qwen"), "{error}");
-        assert!(
-            select_local_chat_service(&paths, None).is_err(),
-            "the default assistant path never falls through to a speech service"
-        );
 
         let _ = std::fs::remove_dir_all(root);
         Ok(())

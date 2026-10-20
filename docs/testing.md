@@ -1812,9 +1812,10 @@ cargo test -p rocm-dash-tui speech_to_text
 ```
 
 The user-facing behaviour is in `serve-26` to `serve-28`, `chat-10`, and
-`bench-07`. All but `serve-27` run against a mock speech-to-text server on
-every lane; `serve-27` serves Whisper-Tiny on a real GPU and needs the
-Lemonade GPU lanes (`@requires-gpu @requires-engine:lemonade`).
+`bench-07`. All but `serve-27` run on every lane: `serve-26` needs no server at
+all, and the others run against a mock speech-to-text server. `serve-27` serves
+Whisper-Tiny on a real GPU and needs the Lemonade GPU lanes
+(`@requires-gpu @requires-engine:lemonade`).
 
 Running a subset with `cargo xtask e2e -- -n <pattern>` bypasses the
 capability filter, so a `@requires-gpu` scenario the pattern matches runs, and
