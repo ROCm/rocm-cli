@@ -707,6 +707,7 @@ pub(crate) fn supervise_service(
             env_id.as_deref(),
             engine_recipe_json.as_deref(),
             &record.engine_state_path,
+            record.task,
         ))
         .stdin(Stdio::null())
         .stdout(Stdio::from(log_file))
@@ -836,6 +837,7 @@ fn engine_serve_http_args(
     env_id: Option<&str>,
     engine_recipe_json: Option<&str>,
     state_path: &Path,
+    task: rocm_core::ModelTask,
 ) -> Vec<String> {
     let mut args = vec![
         "__engine-serve-http".to_owned(),
@@ -859,6 +861,11 @@ fn engine_serve_http_args(
         engine_recipe_json,
     ));
     args.extend(["--state-path".to_owned(), state_path.display().to_string()]);
+    // Omitted for chat so a chat restart keeps the argv it always had; a
+    // speech-to-text service must come back as one.
+    if !task.is_chat() {
+        args.extend(["--task".to_owned(), task.as_str().to_owned()]);
+    }
     args
 }
 
@@ -1325,6 +1332,7 @@ mod tests {
             Some("env-1"),
             Some(engine_recipe_json),
             Path::new("state.json"),
+            rocm_core::ModelTask::Chat,
         );
 
         assert!(
@@ -1356,6 +1364,7 @@ mod tests {
             None,
             None,
             Path::new("state.json"),
+            rocm_core::ModelTask::Chat,
         );
 
         assert!(
@@ -1375,6 +1384,7 @@ mod tests {
             None,
             None,
             Path::new("state.json"),
+            rocm_core::ModelTask::Chat,
         );
         assert!(!auto.iter().any(|arg| arg == "--gpu"));
     }

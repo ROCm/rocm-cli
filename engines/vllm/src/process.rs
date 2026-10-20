@@ -34,7 +34,21 @@ const STOP_SCOPE: rocm_core::KillScope = rocm_core::KillScope::Tree;
 /// Default time to wait for vLLM to report readiness before giving up.
 const DEFAULT_VLLM_READY_TIMEOUT: Duration = Duration::from_mins(5);
 
+/// rocm-cli serves only chat models through vLLM. `rocm serve` checks the
+/// engine's advertised tasks before it gets here; this is the engine's own
+/// backstop for a caller that skips that check.
+fn require_chat_task(task: rocm_engine_protocol::ModelTask) -> Result<()> {
+    if task.is_chat() {
+        return Ok(());
+    }
+    bail!(
+        "the vLLM engine in rocm-cli serves chat models only; it cannot serve a {} model",
+        task.display_name()
+    )
+}
+
 pub(crate) fn resolve_model_response(request: ResolveModelRequest) -> Result<ResolveModelResponse> {
+    require_chat_task(request.task)?;
     let device_policy = normalize_vllm_device_policy(request.device_policy)?;
     let engine_recipe = accepted_engine_recipe(request.engine_recipe)?;
     Ok(ResolveModelResponse {
@@ -93,6 +107,7 @@ pub(crate) fn parse_engine_recipe_json(value: Option<String>) -> Result<Option<E
 }
 
 pub(crate) fn launch_service(request: LaunchRequest) -> Result<LaunchResponse> {
+    require_chat_task(request.task)?;
     let device_policy = normalize_vllm_device_policy(request.device_policy)?;
     let engine_recipe = accepted_engine_recipe(request.engine_recipe)?;
     let requested_gpu_indices =
@@ -932,6 +947,7 @@ mod tests {
             device_policy: Some(DevicePolicy::GpuRequired),
             recipe_override: None,
             engine_recipe: None,
+            task: rocm_engine_protocol::ModelTask::Chat,
         })?;
 
         assert!(
@@ -1348,10 +1364,48 @@ mod tests {
             device_policy: Some(DevicePolicy::GpuRequired),
             recipe_override: None,
             engine_recipe: Some(hint.clone()),
+            task: rocm_engine_protocol::ModelTask::Chat,
         })?;
 
         assert_eq!(response.engine_recipe, Some(hint));
         Ok(())
+    }
+    #[test]
+    fn resolve_and_launch_refuse_a_speech_to_text_model() {
+        let error = resolve_model_response(ResolveModelRequest {
+            model_ref: "Whisper-Tiny".to_owned(),
+            runtime_id: None,
+            device_policy: Some(DevicePolicy::GpuRequired),
+            recipe_override: None,
+            engine_recipe: None,
+            task: rocm_engine_protocol::ModelTask::Transcription,
+        })
+        .expect_err("vLLM must not resolve a speech-to-text model");
+        assert!(
+            error
+                .to_string()
+                .contains("serves chat models only; it cannot serve a speech-to-text model"),
+            "{error}"
+        );
+
+        let error = launch_service(LaunchRequest {
+            service_id: "svc".to_owned(),
+            env_id: None,
+            runtime_id: None,
+            model_ref: "Whisper-Tiny".to_owned(),
+            host: "127.0.0.1".to_owned(),
+            port: 0,
+            device_policy: Some(DevicePolicy::GpuRequired),
+            endpoint_mode: None,
+            engine_recipe: None,
+            gpu_selection: None,
+            task: rocm_engine_protocol::ModelTask::Transcription,
+        })
+        .expect_err("vLLM must not launch a speech-to-text model");
+        assert!(
+            error.to_string().contains("serves chat models only"),
+            "{error}"
+        );
     }
     #[test]
     fn resolve_model_rejects_mismatched_engine_recipe() {
@@ -1364,6 +1418,7 @@ mod tests {
                 "lemonade",
                 ENGINE_RECIPE_CONTRACT_VERSION,
             )),
+            task: rocm_engine_protocol::ModelTask::Chat,
         })
         .expect_err("mismatched engine recipe should fail");
 
@@ -1377,6 +1432,7 @@ mod tests {
             device_policy: Some(DevicePolicy::GpuRequired),
             recipe_override: None,
             engine_recipe: Some(test_engine_recipe(ENGINE_NAME, "999.0.0")),
+            task: rocm_engine_protocol::ModelTask::Chat,
         })
         .expect_err("unsupported recipe contract should fail");
 

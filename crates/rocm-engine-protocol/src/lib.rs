@@ -9,6 +9,8 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+pub use rocm_core::ModelTask;
+
 pub const ENGINE_PROTOCOL_VERSION: &str = "0.1.0";
 pub const ENGINE_RECIPE_CONTRACT_VERSION: &str = "0.1.0";
 pub const ENGINE_PLUGIN_BINARY_PREFIX: &str = "rocm-engine-";
@@ -391,6 +393,10 @@ pub struct ResolveModelRequest {
     pub recipe_override: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub engine_recipe: Option<EngineRecipeHint>,
+    /// What the model does. Omitted (and defaulted) for chat, so a request from
+    /// an older CLI and one for a chat model look the same to an engine.
+    #[serde(default, skip_serializing_if = "is_chat_task")]
+    pub task: ModelTask,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -407,6 +413,14 @@ pub struct LaunchRequest {
     pub engine_recipe: Option<EngineRecipeHint>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpu_selection: Option<GpuSelection>,
+    /// What the model does; see [`ResolveModelRequest::task`].
+    #[serde(default, skip_serializing_if = "is_chat_task")]
+    pub task: ModelTask,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde's skip_serializing_if passes a reference
+fn is_chat_task(task: &ModelTask) -> bool {
+    task.is_chat()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -448,6 +462,22 @@ pub struct EngineCapabilities {
     pub tool_calling: bool,
     pub quantized_models: String,
     pub reasoning_parser: bool,
+    /// The model tasks this engine can serve. An engine that predates this
+    /// field served chat models only, which is what the default restores, so
+    /// `rocm serve` refuses to hand it any other kind of model.
+    #[serde(default = "default_engine_tasks")]
+    pub tasks: Vec<ModelTask>,
+}
+
+fn default_engine_tasks() -> Vec<ModelTask> {
+    vec![ModelTask::Chat]
+}
+
+impl EngineCapabilities {
+    #[must_use]
+    pub fn serves(&self, task: ModelTask) -> bool {
+        self.tasks.contains(&task)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -898,6 +928,7 @@ mod tests {
                 }],
                 notes: vec!["signed recipe metadata".to_owned()],
             }),
+            task: ModelTask::Chat,
         };
 
         let serialized = serde_json::to_string(&request).unwrap();
@@ -944,6 +975,7 @@ mod tests {
                 notes: Vec::new(),
             }),
             gpu_selection: None,
+            task: ModelTask::Chat,
         };
 
         let serialized = serde_json::to_string(&request).unwrap();
@@ -1053,5 +1085,49 @@ mod tests {
             "rocm-engine-protocol-{label}-{}-{unique}",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn capabilities_from_an_engine_without_tasks_advertise_chat_only() {
+        let older = serde_json::json!({
+            "cpu": false,
+            "rocm_gpu": true,
+            "openai_compatible": true,
+            "tool_calling": false,
+            "quantized_models": "none",
+            "reasoning_parser": false
+        });
+        let capabilities: EngineCapabilities = serde_json::from_value(older).unwrap();
+        assert_eq!(capabilities.tasks, vec![ModelTask::Chat]);
+        assert!(capabilities.serves(ModelTask::Chat));
+        assert!(!capabilities.serves(ModelTask::Transcription));
+    }
+
+    #[test]
+    fn a_chat_launch_request_serializes_without_a_task_field() {
+        let request = LaunchRequest {
+            service_id: "svc".to_owned(),
+            env_id: None,
+            runtime_id: None,
+            model_ref: "Qwen/Test".to_owned(),
+            host: "127.0.0.1".to_owned(),
+            port: 11435,
+            device_policy: Some(DevicePolicy::GpuRequired),
+            endpoint_mode: None,
+            engine_recipe: None,
+            gpu_selection: None,
+            task: ModelTask::Chat,
+        };
+        let chat = serde_json::to_value(&request).unwrap();
+        assert!(chat.get("task").is_none(), "{chat}");
+
+        let transcription = serde_json::to_value(LaunchRequest {
+            task: ModelTask::Transcription,
+            ..request
+        })
+        .unwrap();
+        assert_eq!(transcription["task"], "transcription");
+        let parsed: LaunchRequest = serde_json::from_value(transcription).unwrap();
+        assert_eq!(parsed.task, ModelTask::Transcription);
     }
 }

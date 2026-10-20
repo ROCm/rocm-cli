@@ -842,7 +842,7 @@ pub(crate) fn ensure_best_llamacpp_backend(
              The GPU-required policy does not fall back to CPU; install a ROCm or Vulkan \
              backend (e.g. `rocm engines install lemonade`) or verify the GPU driver with \
              `rocm examine`.",
-            describe_llamacpp_backends(&backends)
+            describe_backend_statuses(&backends)
         );
     };
     // Record the attempted backend before the fallible install step below, so a caller
@@ -863,15 +863,31 @@ pub(crate) fn ensure_best_llamacpp_backend(
 /// Parse `lemonade backends` table output into `(backend, status)` pairs for the
 /// `llamacpp` recipe only. Status is one of `installed`/`installable`/`unsupported`.
 fn parse_llamacpp_backend_statuses(output: &str) -> Vec<(String, String)> {
-    const RECIPES: [&str; 8] = [
+    parse_backend_statuses(output, LLAMACPP_RECIPE)
+}
+
+/// Parse `lemonade backends` table output into `(backend, status)` pairs for one
+/// recipe. Status is one of `installed`/`installable`/`unsupported`.
+///
+/// Every recipe the table can list must be named here: a row whose first token is
+/// not a known recipe is read as another backend of the recipe above it, so an
+/// unknown recipe's rows would be attributed to its neighbour.
+pub(crate) fn parse_backend_statuses(output: &str, recipe: &str) -> Vec<(String, String)> {
+    const RECIPES: [&str; 14] = [
+        "acestep",
+        "embeddings",
         "flm",
         "kokoro",
         "llamacpp",
+        "moonshine",
+        "onnxruntime",
+        "openmoss",
         "ryzenai-llm",
         "sd-cpp",
+        "thinksound",
+        "trellis",
         "vllm",
         "whispercpp",
-        "embeddings",
     ];
     const STATUSES: [&str; 3] = ["installed", "installable", "unsupported"];
     let mut current_recipe = "";
@@ -898,7 +914,7 @@ fn parse_llamacpp_backend_statuses(output: &str) -> Vec<(String, String)> {
         } else {
             (first, &tokens[1..])
         };
-        if current_recipe != LLAMACPP_RECIPE {
+        if current_recipe != recipe {
             continue;
         }
         if let Some(status) = rest.iter().find(|t| STATUSES.contains(t)) {
@@ -911,10 +927,19 @@ fn parse_llamacpp_backend_statuses(output: &str) -> Vec<(String, String)> {
 /// Choose the highest-priority backend Lemonade considers usable (installed or
 /// installable). Returns `(backend, already_installed)`.
 fn select_best_llamacpp_backend(backends: &[(String, String)]) -> Option<(String, bool)> {
-    for candidate in LLAMACPP_BACKEND_PRIORITY {
+    select_best_backend(backends, &LLAMACPP_BACKEND_PRIORITY)
+}
+
+/// The first backend in `priority` that Lemonade reports as installed or
+/// installable. Returns `(backend, already_installed)`.
+pub(crate) fn select_best_backend(
+    backends: &[(String, String)],
+    priority: &[&str],
+) -> Option<(String, bool)> {
+    for candidate in priority {
         if let Some((name, status)) = backends
             .iter()
-            .find(|(b, s)| b == candidate && (s == "installed" || s == "installable"))
+            .find(|(b, s)| b == *candidate && (s == "installed" || s == "installable"))
         {
             return Some((name.clone(), status == "installed"));
         }
@@ -922,7 +947,7 @@ fn select_best_llamacpp_backend(backends: &[(String, String)]) -> Option<(String
     None
 }
 
-fn describe_llamacpp_backends(backends: &[(String, String)]) -> String {
+pub(crate) fn describe_backend_statuses(backends: &[(String, String)]) -> String {
     if backends.is_empty() {
         return "none reported".to_owned();
     }
@@ -933,7 +958,7 @@ fn describe_llamacpp_backends(backends: &[(String, String)]) -> String {
         .join(", ")
 }
 
-fn run_lemonade_backends_list(
+pub(crate) fn run_lemonade_backends_list(
     manifest: &LemonadeInstallManifest,
     process_env: &LemonadeProcessEnvironment,
 ) -> Result<String> {

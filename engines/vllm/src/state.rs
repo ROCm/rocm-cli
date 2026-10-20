@@ -260,6 +260,7 @@ fn inference_verified(
     model_ref: &str,
 ) -> bool {
     rocm_core::engine_state_inference_verified(
+        rocm_core::ModelTask::Chat,
         state_path,
         state,
         endpoint_url,
