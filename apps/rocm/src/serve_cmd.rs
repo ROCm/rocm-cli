@@ -1061,6 +1061,63 @@ mod tests {
     use rocm_core::resolve_builtin_model_recipe;
 
     #[test]
+    fn a_speech_to_text_model_is_refused_by_an_engine_that_only_serves_chat() {
+        let recipe = resolve_builtin_model_recipe("whisper").expect("whisper recipe");
+        assert_eq!(
+            recipe.model_task().expect("valid task"),
+            rocm_core::ModelTask::Transcription
+        );
+        let root = std::env::temp_dir().join(format!(
+            "rocm-serve-task-check-{}",
+            rocm_core::unix_time_millis()
+        ));
+        let paths = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+
+        let error = ensure_engine_serves_task(
+            &paths,
+            "vllm",
+            rocm_core::ModelTask::Transcription,
+            "whisper",
+            Some(&recipe),
+        )
+        .expect_err("vLLM advertises chat only")
+        .to_string();
+        assert_eq!(
+            error,
+            "`whisper` is a speech-to-text model, which the vllm engine cannot serve; \
+             serve it with `rocm serve whisper --engine lemonade`"
+        );
+        // The named remedy passes this same check; the e2e scenario
+        // `@id:serve-speech-to-text-model-refused-by-chat-only-engine` runs it.
+        ensure_engine_serves_task(
+            &paths,
+            "lemonade",
+            rocm_core::ModelTask::Transcription,
+            "whisper",
+            Some(&recipe),
+        )
+        .expect("Lemonade advertises speech-to-text");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unsupported_task_message_offers_no_engine_when_the_recipe_names_none_other() {
+        assert_eq!(
+            unsupported_task_message(
+                "lemonade",
+                rocm_core::ModelTask::Transcription,
+                "custom-asr",
+                None
+            ),
+            "`custom-asr` is a speech-to-text model, which the lemonade engine cannot serve"
+        );
+    }
+
+    #[test]
     fn serve_engine_selection_uses_shared_recipe_when_no_override_exists() {
         let recipe = resolve_builtin_model_recipe("qwen32b").expect("qwen32b recipe");
 

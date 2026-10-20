@@ -343,3 +343,34 @@ Feature: Model serving
   Scenario: serve-25 - The recommended model list prints ASCII-only text
     When the user lists recommended models
     Then the model list output contains only ASCII characters
+
+  # Speech-to-text models (Whisper) serve only through Lemonade; vLLM advertises
+  # chat only. The refusal is decided by the engine's own advertised tasks
+  # before the GPU gate, so it gates every PR (ungated) and must not be masked
+  # by the no-GPU message on the mock lane. The command it recommends is the
+  # one serve-27 runs on a GPU lane.
+  @id:serve-speech-to-text-model-refused-by-chat-only-engine
+  Scenario: serve-26 - A speech-to-text model sent to a chat-only engine is refused with a working alternative
+    When the user serves a speech-to-text model on an engine that only serves chat
+    Then serving is refused because that engine cannot serve speech-to-text models
+    And the user is told the command that serves it with Lemonade
+
+  # The real thing: Lemonade's whisper.cpp backend on the GPU (ROCm, or Vulkan
+  # where Lemonade reports ROCm unsupported; never CPU). Runs on the Lemonade
+  # GPU lanes. Whisper-Tiny keeps the download under 100 MB.
+  @id:serve-speech-to-text-model-prints-its-transcription-endpoint @requires-gpu @requires-engine:lemonade
+  Scenario: serve-27 - A served speech-to-text model answers on the endpoint the CLI prints
+    Given a managed runtime is active
+    When the user serves a speech-to-text model with the engine the CLI recommended
+    Then the CLI prints the speech-to-text endpoint of the served model
+    And a recording sent to that endpoint is transcribed
+
+  # A chat client appends /chat/completions to a listed base URL, which a
+  # speech-to-text server does not have; the list must name the route it does
+  # serve, and that route must actually answer.
+  @id:serve-speech-to-text-server-listed-with-its-task
+  Scenario: serve-28 - A running speech-to-text server is listed with its task and the endpoint it answers on
+    Given a speech-to-text model is being served and registered with the CLI
+    When the user lists running services
+    Then the service is listed as speech-to-text with its transcription endpoint
+    And a recording sent to the listed endpoint is transcribed

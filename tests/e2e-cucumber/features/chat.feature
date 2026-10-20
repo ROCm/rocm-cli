@@ -107,3 +107,12 @@ Feature: Chat and endpoint detection
     When the user pipes a one-shot chat prompt through the CLI
     Then the CLI prints the assistant's reply
     And the model receives the piped prompt with its whitespace intact
+
+  # A speech-to-text server cannot answer chat. Naming it as the chat model
+  # must fail with the reason, before any chat request is sent to it.
+  @id:chat-refuses-a-speech-to-text-model
+  Scenario: chat-10 - Chat refuses a speech-to-text model and says why
+    Given a speech-to-text model is being served and registered with the CLI
+    When the user asks the chat CLI to use the speech-to-text model
+    Then chat is refused because the model is a speech-to-text model
+    And no chat request reached the speech-to-text server

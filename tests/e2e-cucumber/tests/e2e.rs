@@ -41,6 +41,7 @@ mod e2e {
     pub mod service_stop_steps;
     pub mod serving_steps;
     pub mod skill_steps;
+    pub mod speech_steps;
     pub mod storage_steps;
     pub mod therock_steps;
     pub mod tui_driver;

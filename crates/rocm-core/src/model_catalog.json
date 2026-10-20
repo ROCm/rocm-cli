@@ -508,6 +508,59 @@
       "warnings": [
         "multimodal model; text chat is the default serve path"
       ]
+    },
+    {
+      "canonical_model_id": "Whisper-Large-v3-Turbo",
+      "aliases": [
+        "whisper",
+        "whisper-turbo"
+      ],
+      "task": "transcription",
+      "source": "recipe_index",
+      "revision": "main",
+      "loader": "whispercpp",
+      "trust_remote_code": false,
+      "dtype": "ggml",
+      "device_policy": "gpu_required",
+      "min_gpu_mem_gb": 2,
+      "recommended_system_ram_gb": 8,
+      "quantization": "ggml f16; Lemonade whisper.cpp ROCm or Vulkan backend",
+      "artifact_hint": "Lemonade model id resolved and downloaded by the Lemonade engine",
+      "artifacts": [],
+      "engine_recipes": [],
+      "manual_alternatives": [],
+      "chat_template_mode": "none",
+      "preferred_engines": [
+        "lemonade"
+      ],
+      "warnings": [
+        "speech-to-text; serves POST /v1/audio/transcriptions, not chat"
+      ]
+    },
+    {
+      "canonical_model_id": "Whisper-Tiny",
+      "aliases": [],
+      "task": "transcription",
+      "source": "recipe_index",
+      "revision": "main",
+      "loader": "whispercpp",
+      "trust_remote_code": false,
+      "dtype": "ggml",
+      "device_policy": "gpu_required",
+      "min_gpu_mem_gb": 1,
+      "recommended_system_ram_gb": 4,
+      "quantization": "ggml f16; Lemonade whisper.cpp ROCm or Vulkan backend",
+      "artifact_hint": "Lemonade model id resolved and downloaded by the Lemonade engine",
+      "artifacts": [],
+      "engine_recipes": [],
+      "manual_alternatives": [],
+      "chat_template_mode": "none",
+      "preferred_engines": [
+        "lemonade"
+      ],
+      "warnings": [
+        "speech-to-text; smallest Whisper model, for quick checks rather than accuracy"
+      ]
     }
   ]
 }

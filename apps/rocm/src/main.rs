@@ -6679,7 +6679,19 @@ pub(crate) fn render_services_text(paths: &AppPaths, all: bool) -> Result<String
         let _ = writeln!(output, "  status: {}", record.status);
         let _ = writeln!(output, "  engine: {}", record.engine);
         let _ = writeln!(output, "  model: {}", record.model_ref);
-        let _ = writeln!(output, "  endpoint: {}", record.endpoint_url);
+        if record.task.is_chat() {
+            let _ = writeln!(output, "  endpoint: {}", record.endpoint_url);
+        } else {
+            // Chat clients append `/chat/completions` to the base URL; a
+            // speech-to-text server has no such route, so name the one it has.
+            let _ = writeln!(output, "  task: {}", record.task.display_name());
+            let _ = writeln!(
+                output,
+                "  endpoint: {}{}",
+                record.endpoint_url,
+                record.task.api_route()
+            );
+        }
         if let Some((_, link)) = docs_links
             .iter()
             .find(|(service_id, _)| *service_id == record.service_id)
