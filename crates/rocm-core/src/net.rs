@@ -888,9 +888,11 @@ pub fn openai_inference_status(
     }
 }
 
-/// [`openai_chat_completion_probe`]'s "answered below 500" rule, applied to the
-/// request that matches the model's task. A speech-to-text server has no chat
-/// route, so probing it with a chat request would read its `404` as serving.
+/// Whether the endpoint answers the request that matches the model's task.
+///
+/// The same "answered below 500" rule as [`openai_chat_completion_probe`]. A
+/// speech-to-text server has no chat route, so probing it with a chat request
+/// would read its `404` as serving.
 pub fn openai_inference_probe(
     task: crate::ModelTask,
     endpoint_url: &str,
@@ -908,8 +910,11 @@ pub fn openai_inference_probe(
 pub fn silent_wav_16khz_mono(duration: Duration) -> Vec<u8> {
     const SAMPLE_RATE: u32 = 16_000;
     const BYTES_PER_SAMPLE: u16 = 2;
+    // Keeps the RIFF size field (`36 + data_len`) inside `u32`.
+    const MAX_SAMPLES: u32 = (u32::MAX - 44) / BYTES_PER_SAMPLE as u32;
     let samples = u32::try_from(duration.as_millis() * u128::from(SAMPLE_RATE) / 1000)
-        .unwrap_or(u32::MAX / u32::from(BYTES_PER_SAMPLE));
+        .unwrap_or(MAX_SAMPLES)
+        .min(MAX_SAMPLES);
     let data_len = samples * u32::from(BYTES_PER_SAMPLE);
     let mut wav = Vec::with_capacity(44 + data_len as usize);
     wav.extend_from_slice(b"RIFF");

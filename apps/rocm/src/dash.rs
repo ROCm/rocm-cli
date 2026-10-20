@@ -794,6 +794,24 @@ fn ensure_bench_csv_parent(csv_path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// `rocm bench load` drives chat completions, so a model the catalog knows to be
+/// something else — a speech-to-text model — is refused up front with the
+/// reason, rather than after every request in the sweep has failed.
+fn ensure_bench_model_is_chat(model: &str) -> Result<()> {
+    let Some(recipe) = rocm_core::resolve_model_recipe(model)? else {
+        return Ok(());
+    };
+    let task = recipe.model_task()?;
+    if task.is_chat() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "`{model}` is a {} model; `rocm bench load` measures chat completions and needs a chat \
+         model - pass --model with the chat model the endpoint serves",
+        task.display_name()
+    )
+}
+
 /// Entry point for `rocm bench load`.
 ///
 /// Runs a concurrency sweep against a local http:// endpoint and appends one
@@ -842,6 +860,7 @@ pub fn run_bench(a: BenchLoadArgs) -> Result<()> {
         rocm_dash_tui::llm::pick_first_model(&body)
             .with_context(|| format!("no model found at {models_url} - pass --model explicitly"))?
     };
+    ensure_bench_model_is_chat(&model)?;
 
     // Resolve the output path: default to the same `<data_dir>/bench/results.csv`
     // file the daemon tails. Rows are appended, matching the `CsvBenchTailer`
@@ -1076,6 +1095,20 @@ async fn maybe_spawn_embedded_daemon(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bench_load_refuses_a_speech_to_text_model_and_accepts_chat_models() {
+        let error = ensure_bench_model_is_chat("whisper")
+            .expect_err("a speech-to-text model cannot be load-tested with chat requests")
+            .to_string();
+        assert!(
+            error.contains("`whisper` is a speech-to-text model"),
+            "{error}"
+        );
+        ensure_bench_model_is_chat("qwen").expect("a chat model is accepted");
+        ensure_bench_model_is_chat("some/model-not-in-the-catalog")
+            .expect("a model the catalog does not know is not second-guessed");
+    }
 
     fn cfg() -> RocmCliConfig {
         RocmCliConfig::default()

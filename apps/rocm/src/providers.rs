@@ -477,10 +477,19 @@ fn select_local_chat_service(
             service.canonical_model_id.eq_ignore_ascii_case(model)
                 || service.model_ref.eq_ignore_ascii_case(model)
         });
-        return services
-            .into_iter()
-            .next()
-            .context("local provider has no ready managed service for this request");
+        if let Some(chat) = services.iter().position(|service| service.task.is_chat()) {
+            return Ok(services.swap_remove(chat));
+        }
+        if let Some(other) = services.first() {
+            bail!(
+                "`{model}` is served by `{}` as a {} model, not a chat model; chat needs a chat \
+                 model; start the built-in assistant with `rocm serve {BUILTIN_ASSISTANT_MODEL_ALIAS}`, \
+                 or pass --model for a chat service",
+                other.service_id,
+                other.task.display_name()
+            );
+        }
+        bail!("local provider has no ready managed service for this request");
     }
     services.retain(local_service_is_builtin_assistant);
     services.sort_by_key(local_service_priority);
@@ -493,7 +502,7 @@ fn select_local_chat_service(
 }
 
 const fn local_service_is_builtin_assistant(service: &ManagedServiceRecord) -> bool {
-    local_service_priority(service) != usize::MAX
+    service.task.is_chat() && local_service_priority(service) != usize::MAX
 }
 
 const fn local_service_priority(service: &ManagedServiceRecord) -> usize {
@@ -2250,6 +2259,51 @@ mod tests {
         assert_eq!(audit.category, "provider");
         assert_eq!(audit.actor, "provider:local");
         assert_eq!(audit.action, "chat");
+        Ok(())
+    }
+
+    #[test]
+    fn local_provider_refuses_a_speech_to_text_service_named_as_the_chat_model() -> Result<()> {
+        let (root, paths) = temp_app_paths("local-provider-speech-service");
+        paths.ensure()?;
+        let server = spawn_models_only_server("Whisper-Tiny")?;
+
+        let mut whisper = ManagedServiceRecord::new(
+            &paths,
+            "svc-whisper",
+            "lemonade",
+            "Whisper-Tiny",
+            "Whisper-Tiny",
+            "127.0.0.1",
+            server.port(),
+            "managed",
+            123,
+            None,
+            None,
+            None,
+        );
+        whisper.task = rocm_core::ModelTask::Transcription;
+        whisper.status = "ready".to_owned();
+        whisper.write()?;
+
+        let error = select_local_chat_service(&paths, Some("Whisper-Tiny"))
+            .expect_err("a speech-to-text service is not a chat target")
+            .to_string();
+        assert!(
+            error
+                .contains("is served by `svc-whisper` as a speech-to-text model, not a chat model"),
+            "{error}"
+        );
+        // The remediation names the built-in assistant; that serving it makes
+        // `rocm chat` work is what
+        // `local_provider_default_chat_requires_builtin_qwen_assistant` proves.
+        assert!(error.contains("rocm serve qwen"), "{error}");
+        assert!(
+            select_local_chat_service(&paths, None).is_err(),
+            "the default assistant path never falls through to a speech service"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
         Ok(())
     }
 

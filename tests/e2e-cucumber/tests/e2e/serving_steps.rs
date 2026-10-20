@@ -187,7 +187,7 @@ const ASSISTANT_PORT: u16 = 8001;
 /// (see [`wait_for_free_vram`]). Callers that only need the reset can ignore it;
 /// a serve that then fails to become ready reports it, because "the previous
 /// engine had not released the GPU yet" is otherwise invisible in the log.
-async fn ensure_serve_port_free() -> String {
+pub(crate) async fn ensure_serve_port_free() -> String {
     // Always kill any listener on the shared port — NOT just one that already
     // answers /v1/models. A prior scenario's vLLM that is still LOADING holds the
     // port and GPU memory without yet serving /v1/models; if we only checked HTTP

@@ -419,7 +419,7 @@ pub struct LaunchRequest {
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)] // serde's skip_serializing_if passes a reference
-fn is_chat_task(task: &ModelTask) -> bool {
+const fn is_chat_task(task: &ModelTask) -> bool {
     task.is_chat()
 }
 

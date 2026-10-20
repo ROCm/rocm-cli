@@ -170,7 +170,7 @@ pub(crate) fn pick_managed_chat_endpoint(
             .get("status")
             .and_then(serde_json::Value::as_str)
             .is_some_and(|s| s.eq_ignore_ascii_case("ready"));
-        if !ready {
+        if !ready || !record_serves_chat(record) {
             continue;
         }
         let endpoint_present = record
@@ -211,6 +211,67 @@ pub(crate) fn pick_managed_chat_endpoint(
     Some(ManagedChatEndpoint { base_url, model })
 }
 
+/// Whether a `services` record serves chat. Records written before services
+/// carried a task were all chat services, so a missing task counts as chat.
+fn record_serves_chat(record: &serde_json::Value) -> bool {
+    record
+        .get("task")
+        .and_then(serde_json::Value::as_str)
+        .is_none_or(|task| task.eq_ignore_ascii_case("chat"))
+}
+
+/// Whether a live managed service that does not serve chat — a speech-to-text
+/// server, say — is bound to `base_url`'s port.
+///
+/// The well-known-port fallback finds *a* server and adopts the first model it
+/// lists; on a port held by a speech-to-text server that would set the chat
+/// pane up to send chat requests to Whisper. The registry knows better.
+pub(crate) fn non_chat_service_owns(services_result: &serde_json::Value, base_url: &str) -> bool {
+    let port_of = |url: &str| reqwest::Url::parse(url).ok()?.port_or_known_default();
+    let Some(port) = port_of(base_url) else {
+        return false;
+    };
+    services_result
+        .get("structuredContent")
+        .and_then(|s| s.get("services"))
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|record| !record_serves_chat(record))
+        .filter(|record| {
+            record
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|status| {
+                    ["ready", "running", "starting", "recovering"]
+                        .iter()
+                        .any(|live| status.eq_ignore_ascii_case(live))
+                })
+        })
+        .filter_map(|record| {
+            record
+                .get("endpoint_url")
+                .and_then(serde_json::Value::as_str)
+        })
+        .any(|endpoint| port_of(endpoint) == Some(port))
+}
+
+/// The bin's read-only `services` tool payload. The seam call is blocking, so
+/// it runs off the reactor.
+async fn fetch_services(
+    executor: Option<crate::tool_exec::SharedRocmToolExecutor>,
+) -> Option<serde_json::Value> {
+    let executor = executor?;
+    let outcome =
+        tokio::task::spawn_blocking(move || executor.execute("services", &serde_json::json!({})))
+            .await
+            .ok()?;
+    let crate::tool_exec::RocmToolOutcome::Result(value) = outcome else {
+        return None;
+    };
+    Some(value)
+}
+
 /// Query the bin's read-only `services` tool and, if a ready OpenAI-compatible
 /// managed service exists, return its endpoint as an [`LlmConfig`].
 ///
@@ -220,18 +281,8 @@ pub(crate) fn pick_managed_chat_endpoint(
 /// A best-effort `/v1/models` fetch both confirms the endpoint is live and
 /// supplies the served model id; on fetch failure the registry-reported model
 /// is used (the service was already readiness-verified by the bin).
-pub(super) async fn detect_managed_chat(
-    executor: Option<crate::tool_exec::SharedRocmToolExecutor>,
-) -> Option<crate::llm::LlmConfig> {
-    let executor = executor?;
-    let outcome =
-        tokio::task::spawn_blocking(move || executor.execute("services", &serde_json::json!({})))
-            .await
-            .ok()?;
-    let crate::tool_exec::RocmToolOutcome::Result(value) = outcome else {
-        return None;
-    };
-    let picked = pick_managed_chat_endpoint(&value)?;
+async fn detect_managed_chat(services: &serde_json::Value) -> Option<crate::llm::LlmConfig> {
+    let picked = pick_managed_chat_endpoint(services)?;
     match fetch_first_model(&picked.base_url).await {
         Some(model) => Some(crate::llm::detected_llm_config(&picked.base_url, &model)),
         None => picked
@@ -260,12 +311,21 @@ async fn detect_local_chat_with_probe(
     executor: Option<crate::tool_exec::SharedRocmToolExecutor>,
     probe: impl Fn() -> Option<&'static str> + Send + 'static,
 ) -> Option<crate::llm::LlmConfig> {
-    if let Some(cfg) = detect_managed_chat(executor).await {
+    let services = fetch_services(executor).await;
+    if let Some(services) = services.as_ref()
+        && let Some(cfg) = detect_managed_chat(services).await
+    {
         return Some(cfg);
     }
 
     // TCP probe is blocking; keep it off the async reactor.
     let base = tokio::task::spawn_blocking(probe).await.ok().flatten()?;
+    if services
+        .as_ref()
+        .is_some_and(|services| non_chat_service_owns(services, base))
+    {
+        return None;
+    }
 
     // Best-effort model query; fall back to the neutral default on any failure.
     let model = fetch_first_model(base)
@@ -515,6 +575,74 @@ mod tests {
             pick_managed_chat_endpoint(&serde_json::json!({ "structuredContent": {} })),
             None
         );
+    }
+
+    #[test]
+    fn skips_a_ready_speech_to_text_service() {
+        // The newest ready Lemonade service is a speech-to-text server; the chat
+        // pane must keep the older chat service instead of routing chat to it.
+        let mut whisper = service(
+            "lemonade",
+            "http://127.0.0.1:13306/v1",
+            "ready",
+            "Whisper-Large-v3-Turbo",
+            200,
+        );
+        whisper["task"] = serde_json::json!("transcription");
+        let env = services_envelope(serde_json::json!([
+            service(
+                "lemonade",
+                "http://127.0.0.1:13305/v1",
+                "ready",
+                "qwen",
+                100
+            ),
+            whisper,
+        ]));
+        let picked = pick_managed_chat_endpoint(&env).expect("the chat service");
+        assert_eq!(picked.base_url, "http://127.0.0.1:13305/v1");
+    }
+
+    #[test]
+    fn a_record_without_a_task_is_a_chat_service() {
+        let env = services_envelope(serde_json::json!([service(
+            "lemonade",
+            "http://127.0.0.1:13305/v1",
+            "ready",
+            "qwen",
+            100
+        )]));
+        assert!(pick_managed_chat_endpoint(&env).is_some());
+    }
+
+    #[test]
+    fn a_well_known_port_held_by_a_speech_to_text_service_is_not_a_chat_endpoint() {
+        let mut whisper = service(
+            "lemonade",
+            "http://127.0.0.1:13305/v1",
+            "ready",
+            "Whisper-Tiny",
+            100,
+        );
+        whisper["task"] = serde_json::json!("transcription");
+        let env = services_envelope(serde_json::json!([whisper.clone()]));
+        assert!(non_chat_service_owns(&env, "http://localhost:13305/v1"));
+        assert!(!non_chat_service_owns(&env, "http://127.0.0.1:8000/v1"));
+
+        whisper["status"] = serde_json::json!("stopped");
+        let stopped = services_envelope(serde_json::json!([whisper]));
+        assert!(
+            !non_chat_service_owns(&stopped, "http://127.0.0.1:13305/v1"),
+            "a stopped speech service no longer holds the port"
+        );
+        let chat = services_envelope(serde_json::json!([service(
+            "lemonade",
+            "http://127.0.0.1:13305/v1",
+            "ready",
+            "qwen",
+            100
+        )]));
+        assert!(!non_chat_service_owns(&chat, "http://127.0.0.1:13305/v1"));
     }
 
     #[test]

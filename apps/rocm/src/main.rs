@@ -6661,7 +6661,19 @@ pub(crate) fn render_services_text(paths: &AppPaths, all: bool) -> Result<String
         let _ = writeln!(output, "  status: {}", record.status);
         let _ = writeln!(output, "  engine: {}", record.engine);
         let _ = writeln!(output, "  model: {}", record.model_ref);
-        let _ = writeln!(output, "  endpoint: {}", record.endpoint_url);
+        if record.task.is_chat() {
+            let _ = writeln!(output, "  endpoint: {}", record.endpoint_url);
+        } else {
+            // Chat clients append `/chat/completions` to the base URL; a
+            // speech-to-text server has no such route, so name the one it has.
+            let _ = writeln!(output, "  task: {}", record.task.display_name());
+            let _ = writeln!(
+                output,
+                "  endpoint: {}{}",
+                record.endpoint_url,
+                record.task.api_route()
+            );
+        }
         let _ = writeln!(output, "  logs: rocm services logs {}", record.service_id);
         if matches!(
             record.status.as_str(),
@@ -6726,11 +6738,12 @@ fn render_services_tool_result_text(records: &[ManagedServiceRecord]) -> String 
     for record in records {
         let _ = writeln!(
             output,
-            "  - service_id={} engine={} model={} canonical_model={} status={} running_state={} endpoint={}",
+            "  - service_id={} engine={} model={} canonical_model={} task={} status={} running_state={} endpoint={}",
             record.service_id,
             record.engine,
             record.model_ref,
             record.canonical_model_id,
+            record.task,
             record.status,
             chat::managed_service_running_state(&record.status),
             record.endpoint_url

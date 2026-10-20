@@ -433,6 +433,9 @@ vllm:time_per_output_token_seconds_count{{model=\"mock\"}} {tpot_count}
     }
 }
 
+/// The fixed transcript [`MockServer::start_transcription`] answers with.
+pub const MOCK_TRANSCRIPT: &str = "mock transcript of the uploaded audio";
+
 #[derive(Debug)]
 pub struct MockServer {
     server: ServerHandle,
@@ -442,6 +445,10 @@ pub struct MockServer {
     chat_paths: Arc<Mutex<Vec<String>>>,
     /// `Some` only when started with [`MockServer::start_with_scripted_metrics`].
     scripted: Option<Arc<ScriptedMetrics>>,
+    /// Every URI path a speech-to-text request arrived on. Only
+    /// [`MockServer::start_transcription`] serves that route; every other
+    /// constructor leaves this empty.
+    transcription_paths: Arc<Mutex<Vec<String>>>,
 }
 
 impl MockServer {
@@ -487,6 +494,7 @@ impl MockServer {
             last_chat_request,
             scripted: Some(scripted),
             chat_paths,
+            transcription_paths: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -542,6 +550,7 @@ impl MockServer {
             scripted: None,
             last_chat_request,
             chat_paths,
+            transcription_paths: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -580,7 +589,81 @@ impl MockServer {
             last_chat_request: Arc::new(Mutex::new(None)),
             chat_paths: Arc::new(Mutex::new(Vec::new())),
             scripted: None,
+            transcription_paths: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// A speech-to-text server, shaped like Lemonade serving a Whisper model:
+    /// it lists the model, answers `POST /v1/audio/transcriptions` with a fixed
+    /// transcript, and has no chat route — a chat request is refused with `404`,
+    /// but its path is still recorded so a scenario can prove the CLI never
+    /// sent one.
+    pub async fn start_transcription(model_name: &str) -> Self {
+        #[derive(Clone)]
+        struct TranscriptionState {
+            model_name: String,
+            chat_paths: Arc<Mutex<Vec<String>>>,
+            transcription_paths: Arc<Mutex<Vec<String>>>,
+        }
+        async fn models(State(state): State<TranscriptionState>) -> Json<Value> {
+            Json(json!({
+                "object": "list",
+                "data": [{"id": state.model_name, "object": "model"}]
+            }))
+        }
+        async fn transcribe(
+            State(state): State<TranscriptionState>,
+            uri: axum::http::Uri,
+        ) -> Json<Value> {
+            state
+                .transcription_paths
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(uri.path().to_string());
+            Json(json!({"text": MOCK_TRANSCRIPT}))
+        }
+        async fn refuse_chat(
+            State(state): State<TranscriptionState>,
+            uri: axum::http::Uri,
+        ) -> StatusCode {
+            state
+                .chat_paths
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(uri.path().to_string());
+            StatusCode::NOT_FOUND
+        }
+
+        let chat_paths = Arc::new(Mutex::new(Vec::new()));
+        let transcription_paths = Arc::new(Mutex::new(Vec::new()));
+        let state = TranscriptionState {
+            model_name: model_name.to_string(),
+            chat_paths: Arc::clone(&chat_paths),
+            transcription_paths: Arc::clone(&transcription_paths),
+        };
+        let app = Router::new()
+            .route("/v1/models", get(models))
+            .route("/models", get(models))
+            .route("/v1/audio/transcriptions", post(transcribe))
+            .route("/v1/chat/completions", post(refuse_chat))
+            .route("/chat/completions", post(refuse_chat))
+            .with_state(state);
+        Self {
+            server: http_server::spawn(app).await,
+            last_chat_request: Arc::new(Mutex::new(None)),
+            chat_paths,
+            scripted: None,
+            transcription_paths,
+        }
+    }
+
+    /// Every URI path a speech-to-text request has arrived on, in order.
+    #[must_use]
+    pub fn transcription_paths(&self) -> Vec<String> {
+        self.transcription_paths
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// The OpenAI-compatible API root (`.../v1`) the CLI is pointed at.
@@ -704,6 +787,13 @@ pub struct ServiceRecordOptions {
     /// refused before anything is stopped, which makes a failed restart
     /// observable without an engine.
     pub host: Option<&'static str>,
+    /// What the service does (`"transcription"` for a speech-to-text server).
+    /// `None` (the default) writes no `task` key at all — a record from before
+    /// services carried one, which the CLI reads as a chat service. An explicit
+    /// `null` would not do: the CLI would fail to parse the record and skip it.
+    pub task: Option<&'static str>,
+    /// The engine the record names. `None` (the default) keeps `vllm`.
+    pub engine: Option<&'static str>,
 }
 
 impl Default for ServiceRecordOptions {
@@ -716,6 +806,8 @@ impl Default for ServiceRecordOptions {
             supervisor_start_ticks: None,
             runtime_id: None,
             host: None,
+            task: None,
+            engine: None,
         }
     }
 }
@@ -749,9 +841,9 @@ pub fn write_service_record_with(
 
     // The CLI only extracts host:port from `endpoint_url` and appends
     // `/v1/models` for its readiness probe, which the mock serves.
-    let record = json!({
+    let mut record = json!({
         "service_id": "e2e-mock",
-        "engine": "vllm",
+        "engine": options.engine.unwrap_or("vllm"),
         "model_ref": model,
         "canonical_model_id": model,
         "host": options.host.unwrap_or("127.0.0.1"),
@@ -778,6 +870,9 @@ pub fn write_service_record_with(
         "engine_state_path": services_dir.join("e2e-mock.state.json"),
         "created_at_unix_ms": 1_700_000_000_000_u64,
     });
+    if let Some(task) = options.task {
+        record["task"] = json!(task);
+    }
     std::fs::write(
         services_dir.join("e2e-mock.json"),
         serde_json::to_vec_pretty(&record).expect("failed to serialize record"),
