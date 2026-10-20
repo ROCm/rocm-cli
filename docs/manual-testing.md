@@ -281,6 +281,35 @@ While the log stream is attached, verify detach and stop behave differently:
 - Re-run the serve command and press `Ctrl+C` instead. The server shuts down and
   `rocm services` no longer lists it as running.
 
+### Speech-to-text on Lemonade
+
+Serve the smallest Whisper model and transcribe a recording through the
+endpoint the summary prints:
+
+```powershell
+rocm serve whisper-tiny
+curl.exe http://127.0.0.1:11435/v1/audio/transcriptions -F model=Whisper-Tiny -F file=@recording.wav
+rocm services
+```
+
+Expected result:
+
+- The summary's `endpoint` row ends in `/v1/audio/transcriptions` and a `task`
+  row says `speech-to-text`; there are no time-to-first-token or throughput rows.
+- The `curl` call returns JSON whose `text` is the recording's words.
+- `rocm services` lists the server with `task: speech-to-text` and the same
+  transcription endpoint.
+- `rocm chat --provider local --model Whisper-Tiny --prompt hi` is refused and
+  says the model is a speech-to-text model; nothing is sent to the server.
+- `rocm serve whisper-tiny --engine vllm` is refused before any GPU check and
+  names `rocm serve whisper-tiny --engine lemonade`.
+
+Confirm the GPU did the work by watching GPU utilization (`amd-smi metric` on
+Linux, Task Manager's GPU graph on Windows) while transcribing a recording of a
+minute or more. Do not rely on the `device` field of Lemonade's own
+`/api/v1/health`: Lemonade 11.5.1 derives it from the backend name and reports
+a ROCm Whisper model as `cpu`.
+
 ## 4. Local Server Records
 
 After a managed or foreground serve attempt, inspect local server records:
