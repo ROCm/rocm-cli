@@ -626,4 +626,29 @@ mod tests {
         }
         Ok(())
     }
+
+    #[test]
+    fn a_record_written_before_tasks_existed_is_a_chat_service() {
+        let (_root, paths) = temp_app_paths("record-without-task");
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-old",
+            "lemonade",
+            "qwen",
+            "Qwen3-4B-Instruct-2507-GGUF",
+            "127.0.0.1",
+            11435,
+            "managed",
+            1,
+            None,
+            None,
+            None,
+        );
+        record.task = crate::ModelTask::Transcription;
+        let mut json = serde_json::to_value(&record).expect("serialize");
+        json.as_object_mut().expect("object").remove("task");
+
+        let older: ManagedServiceRecord = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(older.task, crate::ModelTask::Chat);
+    }
 }

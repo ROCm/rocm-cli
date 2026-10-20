@@ -833,17 +833,18 @@ instead of silently substituting a different model.
 `rocm serve whisper` serves Whisper Large-v3-Turbo through Lemonade
 (`rocm serve whisper-tiny` serves the smallest Whisper model). A
 speech-to-text server answers the OpenAI-compatible
-`POST /v1/audio/transcriptions` route instead of chat, so the deployment summary
-and `rocm services list` print that endpoint, and the summary names the task in
-place of the chat timing rows:
+`POST /v1/audio/transcriptions` route instead of chat. The deployment summary
+prints that endpoint and names the task in place of the chat timing rows, and
+`rocm services list` prints it beside the server's base URL:
 
 ```
 curl http://127.0.0.1:11435/v1/audio/transcriptions \
   -F model=Whisper-Large-v3-Turbo -F file=@recording.wav
 ```
 
-Lemonade runs Whisper on its ROCm whisper.cpp backend, or on Vulkan when it
-reports ROCm unsupported for the GPU, and never on the CPU. vLLM serves chat
+Lemonade runs Whisper on its ROCm whisper.cpp build, or its Vulkan build when it
+reports ROCm unsupported for the GPU; its CPU build is never selected, and
+`rocm serve` refuses to start without a usable AMD GPU. vLLM serves chat
 models only, so `rocm serve whisper --engine vllm` is refused with the command
 that works. `rocm chat`, the Console chat pane, and `rocm bench load` need a
 chat model: they do not use a speech-to-text server, and say so when you name

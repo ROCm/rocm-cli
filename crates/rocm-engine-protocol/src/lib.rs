@@ -647,6 +647,8 @@ pub const fn task_routes(task: ModelTask) -> &'static [&'static str] {
     match task {
         ModelTask::Chat => &OPENAI_CHAT_ROUTES,
         ModelTask::Transcription => &OPENAI_TRANSCRIPTION_ROUTES,
+        // A task this build does not know: only the route every server has.
+        ModelTask::Unknown => &["/v1/models"],
     }
 }
 

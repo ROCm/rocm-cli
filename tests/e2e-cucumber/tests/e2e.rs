@@ -54,6 +54,9 @@ mod e2e {
 #[derive(Debug, cucumber::World)]
 pub struct E2eWorld {
     pub mock: Option<MockServer>,
+    /// A speech-to-text server planted beside `mock`, for scenarios that need
+    /// both a chat and a speech-to-text service running at once.
+    pub speech_mock: Option<MockServer>,
     /// Loopback file server used by artifact-prefetch scenarios. Kept on the
     /// World so it remains alive while the real `rocmd` subprocess downloads.
     pub artifact_server: Option<LoopbackServer>,
@@ -304,6 +307,7 @@ impl Default for E2eWorld {
 
         Self {
             mock: None,
+            speech_mock: None,
             artifact_server: None,
             paced_download_server: None,
             comfyui_port_listener: None,
@@ -671,6 +675,9 @@ impl Drop for E2eWorld {
             let _ = helper.wait();
         }
         if let Some(mock) = self.mock.take() {
+            mock.stop();
+        }
+        if let Some(mock) = self.speech_mock.take() {
             mock.stop();
         }
         self.artifact_server.take();

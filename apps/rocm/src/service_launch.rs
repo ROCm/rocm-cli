@@ -588,6 +588,7 @@ pub(crate) fn start_managed_service(
     thread::sleep(Duration::from_millis(200));
 
     let readiness = wait_for_service_http_ready_with_progress(
+        task,
         engine,
         host,
         port,
@@ -962,8 +963,20 @@ pub(crate) fn run_attached_service(
     // printed as the "serve plan" block in `serve()`; extend it with the launch
     // coordinates and the streaming hint rather than repeating it.
     let endpoint = format!("{}/v1", format_http_base_url(host, port));
+    // Printed beside `endpoint`, never instead of it, so the base URL keeps one
+    // meaning on every surface; see `render_services_text`.
+    let task_endpoint_line = (!task.is_chat()).then(|| {
+        format!(
+            "  {} endpoint: {endpoint}{}",
+            task.display_name(),
+            task.api_route()
+        )
+    });
     println!("  service_id: {service_id}");
     println!("  endpoint: {endpoint}");
+    if let Some(line) = &task_endpoint_line {
+        println!("{line}");
+    }
     let docs_link = crate::api_docs_link::service_docs_link(
         &paths,
         &service_id,
@@ -990,6 +1003,9 @@ pub(crate) fn run_attached_service(
             println!("detached - server still running");
             println!("  service_id: {service_id}");
             println!("  endpoint: {endpoint}");
+            if let Some(line) = &task_endpoint_line {
+                println!("{line}");
+            }
             if let Some(link) = docs_link.as_deref() {
                 println!("  docs: {link}");
             }

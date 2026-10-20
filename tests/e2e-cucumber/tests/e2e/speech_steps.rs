@@ -91,19 +91,69 @@ fn printed_url(output: &str, label: &str) -> Option<String> {
 
 // ── Given ──────────────────────────────────────────────────────────
 
-/// A speech-to-text server the CLI knows about, as `rocm serve whisper` would
-/// leave behind: a Lemonade record carrying the transcription task.
-#[given("a speech-to-text model is being served and registered with the CLI")]
-async fn speech_model_registered(world: &mut E2eWorld) {
+/// A speech-to-text server the CLI has no record of, reached by its URL.
+#[given("a speech-to-text model is being served")]
+async fn speech_model_served(world: &mut E2eWorld) {
     let mock = MockServer::start_transcription(SPEECH_MODEL_ID).await;
     world.endpoint = Some(mock.base_url());
     world.model_name = Some(SPEECH_MODEL_ID.to_owned());
     world.mock = Some(mock);
+}
+
+/// A speech-to-text server the CLI knows about, as `rocm serve whisper` would
+/// leave behind: a Lemonade record carrying the transcription task.
+#[given("a speech-to-text model is being served and registered with the CLI")]
+async fn speech_model_registered(world: &mut E2eWorld) {
+    speech_model_served(world).await;
     world.register_mock_service_with(ServiceRecordOptions {
         task: Some("transcription"),
         engine: Some("lemonade"),
         ..ServiceRecordOptions::default()
     });
+}
+
+/// A speech-to-text service started after the scenario's chat service, so it is
+/// the newest ready Lemonade service — the one a pick by recency alone would
+/// choose.
+#[given("a newer speech-to-text service is also running")]
+async fn newer_speech_service(world: &mut E2eWorld) {
+    // The record names a disposable process, never this harness: anything that
+    // stops the service (the dashboard's helper, teardown's `services stop`)
+    // signals the PID the record names. See dash-28's step for the same fix.
+    let child = std::process::Command::new("sleep")
+        .arg("300")
+        .spawn()
+        .expect("failed to spawn the speech service's stand-in process");
+    let pid = child.id();
+    assert!(
+        world.recorded_process.is_none(),
+        "this step owns the scenario's one disposable process"
+    );
+    world.recorded_process = Some(child);
+    let mock = MockServer::start_transcription(SPEECH_MODEL_ID).await;
+    let services = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("data")
+        .join("services");
+    e2e_cucumber::mock_server::write_service_record_with(
+        &services,
+        SPEECH_MODEL_ID,
+        mock.port(),
+        ServiceRecordOptions {
+            supervisor_pid: pid,
+            supervisor_start_ticks: rocm_core::process_start_ticks(pid),
+            engine_pid: Some(pid),
+            task: Some("transcription"),
+            engine: Some("lemonade"),
+            service_id: Some("e2e-speech"),
+            created_at_unix_ms: Some(1_800_000_000_000),
+            ..ServiceRecordOptions::default()
+        },
+    );
+    world.speech_mock = Some(mock);
 }
 
 // ── When ───────────────────────────────────────────────────────────
@@ -118,11 +168,48 @@ async fn serve_speech_model_on_chat_only_engine(world: &mut E2eWorld) {
 
 /// Exactly the command the chat-only refusal recommends, so this scenario is
 /// also the proof that the recommendation works.
+///
+/// The serve's own readiness wait is short, and a cold lane spends longer than
+/// that downloading the model and the whisper.cpp backend, so a launch that
+/// returns before it is ready is followed by polling `rocm services list`,
+/// whose readiness check sends a transcription, until the service reports
+/// ready or the scenario's serve timeout runs out.
 #[when("the user serves a speech-to-text model with the engine the CLI recommended")]
 async fn serve_speech_model_on_lemonade(world: &mut E2eWorld) {
-    crate::e2e::serving_steps::ensure_serve_port_free().await;
-    let result = crate::run_rocm(world, &["serve", SPEECH_MODEL_REF, "--engine", "lemonade"]);
-    record_cli(world, result);
+    let device_state = crate::e2e::serving_steps::ensure_serve_port_free().await;
+    let args = ["serve", SPEECH_MODEL_REF, "--engine", "lemonade"];
+    let (stdout, stderr, rc) = crate::run_rocm(world, &args);
+    let timeout =
+        std::time::Duration::from_secs(crate::e2e::serving_steps::serve_timeout_for(world));
+    let started = std::time::Instant::now();
+    let mut ready = rc == 0 && stdout.lines().any(|line| line.trim() == "readiness: ready");
+    while rc == 0 && !ready && started.elapsed() < timeout {
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        let (listing, _, _) = crate::run_rocm(world, &["services", "list"]);
+        ready = listing.contains("status: ready") && listing.contains("task: speech-to-text");
+    }
+    if !ready {
+        let outcome = if rc == 0 {
+            format!(
+                "exited 0 but the service was not ready within {}s",
+                timeout.as_secs()
+            )
+        } else {
+            format!("failed (rc={rc})")
+        };
+        let headline = format!("`rocm {}` {outcome}", args.join(" "));
+        panic!(
+            "{}",
+            crate::e2e::serving_steps::serve_failure_evidence(
+                world,
+                &headline,
+                &device_state,
+                &stdout,
+                &stderr
+            )
+        );
+    }
+    record_cli(world, (stdout, stderr, rc));
     world.model_name = Some(SPEECH_MODEL_ID.to_owned());
 }
 
@@ -209,16 +296,19 @@ async fn listed_as_speech(world: &mut E2eWorld) {
         output.contains("task: speech-to-text"),
         "the services list must say what the server does:\n{output}"
     );
-    let url =
+    let base =
         printed_url(&output, "endpoint").unwrap_or_else(|| panic!("no endpoint listed:\n{output}"));
-    assert!(
-        url.ends_with("/v1/audio/transcriptions"),
-        "a speech-to-text server must be listed with the route it serves, got {url}"
+    let url = printed_url(&output, "speech-to-text endpoint")
+        .unwrap_or_else(|| panic!("no speech-to-text endpoint listed:\n{output}"));
+    assert_eq!(
+        url,
+        format!("{}/audio/transcriptions", base.trim_end_matches('/')),
+        "the speech-to-text endpoint is the server's base URL plus the route it serves"
     );
     world.endpoint = Some(url);
 }
 
-#[then("a recording sent to the listed endpoint is transcribed")]
+#[then("the listed speech-to-text endpoint reaches that server's transcription route")]
 async fn recording_transcribed_at_listed_endpoint(world: &mut E2eWorld) {
     let url = world.endpoint.clone().expect("no listed endpoint recorded");
     let (status, body) = transcribe(&url, SPEECH_MODEL_ID).await;
@@ -233,6 +323,15 @@ async fn recording_transcribed_at_listed_endpoint(world: &mut E2eWorld) {
     );
 }
 
+#[then("the running service is listed as speech-to-text")]
+async fn running_service_listed_as_speech(world: &mut E2eWorld) {
+    let (listing, _, _) = crate::run_rocm(world, &["services", "list"]);
+    assert!(
+        listing.contains("task: speech-to-text") && listing.contains("status: ready"),
+        "the served model must be listed as a ready speech-to-text service:\n{listing}"
+    );
+}
+
 #[then("chat is refused because the model is a speech-to-text model")]
 async fn chat_refused(world: &mut E2eWorld) {
     let rc = world.cli_rc.expect("no chat rc recorded");
@@ -242,8 +341,9 @@ async fn chat_refused(world: &mut E2eWorld) {
         text.contains("as a speech-to-text model, not a chat model"),
         "the refusal must give the reason:\n{text}"
     );
-    // That serving the built-in assistant makes `rocm chat` work is chat-03's
-    // and chat-08's subject; here it is enough that the advice names it.
+    // That a served built-in assistant is what `rocm chat` picks once
+    // `--model` is dropped is proven by the unit test
+    // `local_provider_default_chat_requires_builtin_qwen_assistant`.
     assert!(
         text.contains("rocm serve qwen"),
         "expected the remedy in:\n{text}"
@@ -252,7 +352,11 @@ async fn chat_refused(world: &mut E2eWorld) {
 
 #[then("no chat request reached the speech-to-text server")]
 async fn no_chat_request_reached(world: &mut E2eWorld) {
-    let mock = world.mock.as_ref().expect("no mock server");
+    let mock = world
+        .speech_mock
+        .as_ref()
+        .or(world.mock.as_ref())
+        .expect("no mock server");
     assert_eq!(
         mock.chat_paths(),
         Vec::<String>::new(),
