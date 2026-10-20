@@ -11646,11 +11646,17 @@ fn service_http_readiness_response_ready_for_task(
     if status != 200 {
         return false;
     }
-    if let Some((recipe, backend_option)) =
+    if let Some((recipe, backend_option, backends)) =
         rocm_engine_lemonade::speech_model_health_keys(task, canonical_model_id)
     {
         return (engine, path) == ("lemonade", "/v1/health")
-            && lemonade_health_has_speech_model(body, canonical_model_id, recipe, backend_option);
+            && lemonade_health_has_speech_model(
+                body,
+                canonical_model_id,
+                recipe,
+                backend_option,
+                backends,
+            );
     }
     match (engine, path) {
         ("lemonade", "/v1/health") => lemonade_health_ready_for_model(body, canonical_model_id),
@@ -11683,6 +11689,7 @@ fn lemonade_health_has_speech_model(
     canonical_model_id: &str,
     recipe: &str,
     backend_option: Option<&str>,
+    backends: &[&str],
 ) -> bool {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(body.trim()) else {
         return false;
@@ -11701,7 +11708,7 @@ fn lemonade_health_has_speech_model(
                             .get("recipe_options")
                             .and_then(|options| options.get(option))
                             .and_then(serde_json::Value::as_str)
-                            .is_some_and(|backend| matches!(backend, "rocm" | "vulkan"))
+                            .is_some_and(|backend| backends.contains(&backend))
                     })
             })
         })

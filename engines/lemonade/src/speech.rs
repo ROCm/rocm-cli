@@ -99,9 +99,29 @@ pub(crate) const KOKORO: SpeechRecipe = SpeechRecipe {
                      retries the download",
 };
 
+/// Lemonade's Whisper-Base on its CPU whisper.cpp build. Served only as an
+/// explicit demo exception, for hosts without a GPU.
+pub(crate) const WHISPER_CPU: SpeechRecipe = SpeechRecipe {
+    task: ModelTask::Transcription,
+    recipe: "whispercpp",
+    load_flag: Some("--whispercpp"),
+    backend_option: Some("whispercpp_backend"),
+    backends: &["cpu"],
+    cpu: true,
+    estimated_memory: "about 0.3 GiB of system memory (runs on the CPU)",
+    install_advice: "Lemonade could not install its CPU speech-to-text (whisper.cpp) \
+                     backend; check the network connection and run the same `rocm serve` \
+                     command again, which retries the download",
+};
+
+/// The model served by [`WHISPER_CPU`].
+const WHISPER_CPU_MODEL: &str = "Whisper-Base";
+
 impl SpeechRecipe {
-    pub(crate) const fn health_keys(&self) -> (&'static str, Option<&'static str>) {
-        (self.recipe, self.backend_option)
+    pub(crate) const fn health_keys(
+        &self,
+    ) -> (&'static str, Option<&'static str>, &'static [&'static str]) {
+        (self.recipe, self.backend_option, self.backends)
     }
 }
 
@@ -109,6 +129,9 @@ impl SpeechRecipe {
 pub(crate) fn speech_recipe_for(task: ModelTask, model_ref: &str) -> Option<&'static SpeechRecipe> {
     if task == ModelTask::Speech && model_ref.to_ascii_lowercase().contains("kokoro") {
         return Some(&KOKORO);
+    }
+    if task == ModelTask::Transcription && model_ref.eq_ignore_ascii_case(WHISPER_CPU_MODEL) {
+        return Some(&WHISPER_CPU);
     }
     speech_recipe(task)
 }

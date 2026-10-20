@@ -206,7 +206,11 @@ fn render_transcription(service_id: &str, status: u16, body: &str, json: bool) -
         .with_context(|| {
             format!("the speech-to-text server `{service_id}` answered without a transcript")
         })?;
-    Ok(format!("{}\n", text.trim()))
+    // Whisper breaks long transcripts across lines mid-sentence; print one line.
+    Ok(format!(
+        "{}\n",
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
+    ))
 }
 
 #[cfg(test)]

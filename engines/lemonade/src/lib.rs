@@ -222,7 +222,7 @@ pub fn run_cli() -> Result<()> {
 pub fn speech_model_health_keys(
     task: ModelTask,
     model_ref: &str,
-) -> Option<(&'static str, Option<&'static str>)> {
+) -> Option<(&'static str, Option<&'static str>, &'static [&'static str])> {
     crate::speech::speech_recipe_for(task, model_ref).map(crate::speech::SpeechRecipe::health_keys)
 }
 

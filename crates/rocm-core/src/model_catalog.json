@@ -615,6 +615,32 @@
       "warnings": [
         "text-to-speech on the CPU: a demo exception to the GPU-only policy; serves POST /v1/audio/speech"
       ]
+    },
+    {
+      "canonical_model_id": "Whisper-Base",
+      "aliases": [
+        "whisper-cpu"
+      ],
+      "task": "transcription",
+      "source": "recipe_index",
+      "revision": "main",
+      "loader": "whispercpp",
+      "trust_remote_code": false,
+      "dtype": "ggml",
+      "device_policy": "cpu_only",
+      "recommended_system_ram_gb": 4,
+      "quantization": "ggml f16; Lemonade whisper.cpp CPU backend",
+      "artifact_hint": "Lemonade model id resolved and downloaded by the Lemonade engine",
+      "artifacts": [],
+      "engine_recipes": [],
+      "manual_alternatives": [],
+      "chat_template_mode": "none",
+      "preferred_engines": [
+        "lemonade"
+      ],
+      "warnings": [
+        "speech-to-text on the CPU: a demo exception to the GPU-only policy; serves POST /v1/audio/transcriptions"
+      ]
     }
   ]
 }
