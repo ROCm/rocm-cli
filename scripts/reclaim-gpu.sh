@@ -532,10 +532,8 @@ DECOY
 # Spawn a decoy carrying the record delimiters INSIDE one argument — a newline
 # and a tab, as a `--chat-template` or `--prompt` value does.
 #
-# Not spawn_decoy with an extra argument: that decoy is `bash -c <loop>`, and
-# bash reads the argument after the loop as $0, which is not what lands in the
-# record under test. This needs something that ignores what it is handed and
-# stays alive.
+# A helper of its own because spawn_decoy passes no arguments through. Like that
+# decoy, it ignores what it is handed and stays alive.
 #
 # Ordinary in every other respect — it must die on SIGTERM, so it is the stubborn
 # decoy's body without the trap. Its `sleep 1` children name no E2E root, so they

@@ -2907,6 +2907,12 @@ fi
         std::fs::copy("/bin/bash", &decoy).expect("copy /bin/bash as the decoy");
         let mut child = std::process::Command::new(&decoy)
             .args(["-c", "for _ in {1..300}; do sleep 1; done"])
+            // Detached, as in the script: a `sleep 1` child outlives the
+            // SIGKILL below by up to a second and would hold the test's
+            // inherited stdio open meanwhile.
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .spawn()
             .expect("spawn the decoy engine process");
         let decoy_pid = child.id();
