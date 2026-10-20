@@ -479,10 +479,14 @@ rocm model --verbose"
     /// stream engine logs in this terminal instead. When streaming, press Ctrl-D to detach and leave the
     /// server running, or Ctrl-C to stop it. Inspect or stop servers later with
     /// `rocm services`.
+    ///
+    /// Speech-to-text models such as `whisper` are served through Lemonade and answer
+    /// on `/v1/audio/transcriptions` instead of chat; the summary prints that endpoint.
     #[command(after_help = "EXAMPLES:\n  \
 rocm serve qwen\n  \
 rocm serve qwen --engine vllm --port 8000\n  \
-rocm serve qwen --verbose --device gpu_required")]
+rocm serve qwen --verbose --device gpu_required\n  \
+rocm serve whisper")]
     Serve {
         /// Model name, alias, or local model file path.
         model: String,

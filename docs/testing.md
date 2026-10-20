@@ -1940,6 +1940,29 @@ The gate itself is held by unit tests in
 neighbours) and by the Windows manual check in
 [manual-testing.md](manual-testing.md), in the Ryzen 4000/5000 section.
 
+## Speech-to-text Serving
+
+Focused coverage for model tasks and speech-to-text serving:
+
+```bash
+cargo test -p rocm-core model_task
+cargo test -p rocm-core speech_to_text
+cargo test -p rocm-engine-protocol capabilities_from_an_engine_without_tasks
+cargo test -p rocm-engine-lemonade speech::
+cargo test -p rocm-engine-vllm refuse_a_speech_to_text_model
+cargo test -p rocm --bin rocm speech_to_text
+cargo test -p rocm-dash-tui speech_to_text
+```
+
+The user-facing behaviour is in `serve-26` to `serve-28`, `chat-10`, and
+`bench-07`. All but `serve-27` run against a mock speech-to-text server on
+every lane; `serve-27` serves Whisper-Tiny on a real GPU and needs the
+Lemonade GPU lanes (`@requires-gpu @requires-engine:lemonade`).
+
+Running a subset with `cargo xtask e2e -- -n <pattern>` bypasses the
+capability filter, so a `@requires-gpu` scenario the pattern matches runs, and
+fails, on a host without a GPU. Read its failure as "not applicable here".
+
 ## Model Fit Preflight
 
 `rocm diagnose --model <ref>` answers whether a curated model will run on this

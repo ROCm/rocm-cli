@@ -800,7 +800,9 @@ By default the server runs in the background under ROCm CLI's supervision and
 prints a deployment summary: a progress indicator while it starts, then a table
 with the status, the full inference endpoint, a link to the server's API docs
 (see API docs below), the API-qualified model name, and a
-quick smoke test (time to first token and approximate tokens per second). Control
+quick smoke test (time to first token and approximate tokens per second; a
+speech-to-text model is checked with a test transcription before it reports
+ready, and its summary names the task instead). Control
 returns to your shell with the server still running; manage it later with `rocm
 services` (below).
 
@@ -825,6 +827,27 @@ The vLLM engine (Instinct) serves
 **safetensors** repos, such as `rocm serve Qwen/Qwen2.5-1.5B-Instruct`.
 A safetensors-only id has no GGUF build, so serving it through Lemonade fails
 instead of silently substituting a different model.
+
+#### Speech-to-text models
+
+`rocm serve whisper` serves Whisper Large-v3-Turbo through Lemonade
+(`rocm serve whisper-tiny` serves the smallest Whisper model). A
+speech-to-text server answers the OpenAI-compatible
+`POST /v1/audio/transcriptions` route instead of chat, so the deployment summary
+and `rocm services list` print that endpoint, and the summary names the task in
+place of the chat timing rows:
+
+```
+curl http://127.0.0.1:11435/v1/audio/transcriptions \
+  -F model=Whisper-Large-v3-Turbo -F file=@recording.wav
+```
+
+Lemonade runs Whisper on its ROCm whisper.cpp backend, or on Vulkan when it
+reports ROCm unsupported for the GPU, and never on the CPU. vLLM serves chat
+models only, so `rocm serve whisper --engine vllm` is refused with the command
+that works. `rocm chat`, the Console chat pane, and `rocm bench load` need a
+chat model: they do not use a speech-to-text server, and say so when you name
+one.
 
 Some models (such as Llama) are gated and require Hugging Face authentication.
 Log in with `huggingface-cli login` or set `HF_TOKEN` in your environment
