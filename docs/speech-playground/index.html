@@ -122,7 +122,14 @@ async function getJson(path, out) {
   try {
     const r = await fetch(base() + path);
     out.textContent = `HTTP ${r.status}\n` + JSON.stringify(await r.json(), null, 2);
-  } catch (e) { out.textContent = "Request failed: " + e; }
+  } catch (e) { out.textContent = unreachable(e); }
+}
+
+// A network failure carries no detail in the browser; say what to check.
+function unreachable(error) {
+  return `Could not reach ${base()} (${error.message}).\n` +
+    "Check that a server is running and that this is its endpoint: " +
+    "`rocm services list` prints it.";
 }
 
 $("connect").onclick = async () => {
@@ -161,7 +168,7 @@ $("tts-run").onclick = async () => {
       $("tts-out").textContent += " - press play on the player to listen";
     });
   } catch (e) {
-    $("tts-out").textContent = "Request failed: " + e;
+    $("tts-out").textContent = unreachable(e);
   } finally { button.disabled = false; }
 };
 
@@ -175,7 +182,7 @@ $("stt-run").onclick = async () => {
   try {
     const r = await fetch(base() + "/audio/transcriptions", { method: "POST", body: form });
     $("stt-out").textContent = `HTTP ${r.status}\n` + JSON.stringify(await r.json(), null, 2);
-  } catch (e) { $("stt-out").textContent = "Request failed: " + e; }
+  } catch (e) { $("stt-out").textContent = unreachable(e); }
 };
 
 const params = new URLSearchParams(location.search);
