@@ -234,6 +234,13 @@ pub struct ModelRecipeRecord {
 }
 
 impl ModelRecipeRecord {
+    /// The recipe's task, parsed. [`ModelRecipeIndexDocument::validate`] rejects
+    /// a recipe whose task does not parse, so this only errors for a record
+    /// that bypassed validation.
+    pub fn model_task(&self) -> Result<crate::ModelTask> {
+        crate::ModelTask::parse(&self.task)
+    }
+
     pub fn matches_ref(&self, model_ref: &str) -> bool {
         let normalized = normalize_model_ref(model_ref);
         normalize_model_ref(&self.canonical_model_id) == normalized
@@ -298,6 +305,9 @@ impl ModelRecipeIndexDocument {
         for recipe in &self.recipes {
             require_nonempty(&recipe.canonical_model_id, "canonical_model_id")?;
             require_nonempty(&recipe.task, "task")?;
+            recipe
+                .model_task()
+                .with_context(|| format!("recipe `{}`", recipe.canonical_model_id))?;
             require_nonempty(&recipe.source, "source")?;
             require_nonempty(&recipe.revision, "revision")?;
             require_nonempty(&recipe.loader, "loader")?;
@@ -1058,6 +1068,28 @@ mod tests {
 
         assert!(error.contains("engine recipe for `vllm`"));
         assert!(error.contains("must not be empty"));
+    }
+
+    #[test]
+    fn model_recipe_index_rejects_a_task_this_build_cannot_serve() {
+        let mut recipe = sample_recipe_with_artifact("Qwen/Test-1B", &["test-qwen"]);
+        recipe.task = "embedding".to_owned();
+
+        let error = format!(
+            "{:#}",
+            ModelRecipeIndexDocument {
+                schema_version: 1,
+                source: Some("fixture".to_owned()),
+                generated_at_unix_ms: Some(123),
+                platforms: Vec::new(),
+                recipes: vec![recipe],
+            }
+            .validate()
+            .expect_err("an unservable task should be rejected")
+        );
+
+        assert!(error.contains("recipe `Qwen/Test-1B`"));
+        assert!(error.contains("unsupported model task `embedding`"));
     }
 
     #[test]

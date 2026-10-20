@@ -321,6 +321,18 @@ pub(crate) fn run_lemonade_backend_install(
     backend: &str,
     process_env: &LemonadeProcessEnvironment,
 ) -> Result<()> {
+    run_lemonade_recipe_backend_install(manifest, host, port, LLAMACPP_RECIPE, backend, process_env)
+}
+
+/// `lemonade backends install <recipe>:<backend>` against a running server.
+pub(crate) fn run_lemonade_recipe_backend_install(
+    manifest: &LemonadeInstallManifest,
+    host: &str,
+    port: u16,
+    recipe: &str,
+    backend: &str,
+    process_env: &LemonadeProcessEnvironment,
+) -> Result<()> {
     let mut command = ProcessCommand::new(&manifest.lemonade);
     command
         .arg("--host")
@@ -329,7 +341,7 @@ pub(crate) fn run_lemonade_backend_install(
         .arg(port.to_string())
         .arg("backends")
         .arg("install")
-        .arg(format!("{LLAMACPP_RECIPE}:{backend}"))
+        .arg(format!("{recipe}:{backend}"))
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
@@ -404,16 +416,24 @@ pub(crate) fn run_lemonade_model_load(
     log_path: Option<&Path>,
     process_env: &LemonadeProcessEnvironment,
 ) -> Result<()> {
+    run_lemonade_load_command(
+        manifest,
+        &lemonade_model_load_args(host, port, model_ref, backend, engine_recipe),
+        log_path,
+        process_env,
+    )
+}
+
+/// Run a `lemonade ... load ...` invocation, sending its output to the service
+/// log when there is one.
+pub(crate) fn run_lemonade_load_command(
+    manifest: &LemonadeInstallManifest,
+    args: &[String],
+    log_path: Option<&Path>,
+    process_env: &LemonadeProcessEnvironment,
+) -> Result<()> {
     let mut command = ProcessCommand::new(&manifest.lemonade);
-    command
-        .args(lemonade_model_load_args(
-            host,
-            port,
-            model_ref,
-            backend,
-            engine_recipe,
-        ))
-        .stdin(Stdio::null());
+    command.args(args).stdin(Stdio::null());
     if let Some(log_path) = log_path {
         let log = fs::OpenOptions::new()
             .create(true)
@@ -702,7 +722,7 @@ fn lemonade_model_load_args(
     args
 }
 
-fn query_health_json(host: &str, port: u16) -> Result<Value> {
+pub(crate) fn query_health_json(host: &str, port: u16) -> Result<Value> {
     let endpoint = format_http_base_url(host, port);
     let endpoint_api_key = rocm_engine_protocol::resolve_endpoint_api_key();
     let body = http_get_text_with_auth(

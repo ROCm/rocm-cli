@@ -151,6 +151,7 @@ pub fn run_cli() -> Result<()> {
                     .transpose()?,
                 recipe_override: None,
                 engine_recipe: None,
+                task: rocm_engine_protocol::ModelTask::Chat,
             },
         )?)?,
         CommandKind::Launch {
@@ -175,6 +176,7 @@ pub fn run_cli() -> Result<()> {
             endpoint_mode: Some("openai".to_owned()),
             engine_recipe: None,
             gpu_selection: crate::process::parse_gpu_selection_arg(gpu.as_deref())?,
+            task: rocm_engine_protocol::ModelTask::Chat,
         })?)?,
         CommandKind::Stdio => {
             let envelope = read_request()?;
@@ -359,6 +361,7 @@ pub(crate) fn capabilities() -> EngineCapabilities {
         tool_calling: false,
         quantized_models: "vllm-supported".to_owned(),
         reasoning_parser: false,
+        tasks: vec![rocm_engine_protocol::ModelTask::Chat],
     }
 }
 

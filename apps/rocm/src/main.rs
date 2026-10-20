@@ -327,6 +327,8 @@ enum Command {
         log_path: Option<PathBuf>,
         #[arg(long)]
         engine_recipe_json: Option<String>,
+        #[arg(long, default_value = "chat")]
+        task: String,
     },
     #[command(name = "__engine-stdio", hide = true)]
     EngineStdio { engine: String },
@@ -2237,6 +2239,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             state_path,
             log_path,
             engine_recipe_json,
+            task,
         }) => run_builtin_engine_serve_http(
             &engine,
             service_id,
@@ -2250,6 +2253,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             state_path,
             log_path,
             parse_engine_recipe_json_arg(engine_recipe_json)?,
+            rocm_core::ModelTask::parse(&task)?,
         ),
         Some(Command::EngineStdio { engine }) => run_builtin_engine_stdio(&engine),
         Some(Command::InternalStatus) => {
@@ -7180,6 +7184,7 @@ fn restart_child_argv(record: &ManagedServiceRecord) -> Result<Vec<String>> {
         recipe.as_ref(),
         &record.engine_state_path,
         Some(&record.log_path),
+        record.task,
     )
 }
 
@@ -10289,8 +10294,15 @@ fn run_builtin_engine_serve_http(
     state_path: PathBuf,
     log_path: Option<PathBuf>,
     engine_recipe: Option<EngineRecipeHint>,
+    task: rocm_core::ModelTask,
 ) -> Result<()> {
     let parsed_policy = parse_device_policy(Some(device_policy))?;
+    if engine == "vllm" && !task.is_chat() {
+        bail!(
+            "the vLLM engine in rocm-cli serves chat models only; it cannot serve a {} model",
+            task.display_name()
+        );
+    }
     match engine {
         "lemonade" => rocm_engine_lemonade::builtin_serve_http(
             service_id,
@@ -10304,6 +10316,7 @@ fn run_builtin_engine_serve_http(
             state_path,
             log_path,
             engine_recipe,
+            task,
         ),
         "vllm" => rocm_engine_vllm::builtin_serve_http(
             service_id,
@@ -10336,6 +10349,7 @@ fn builtin_engine_serve_http_args(
     engine_recipe: Option<&EngineRecipeHint>,
     state_path: &Path,
     log_path: Option<&Path>,
+    task: rocm_core::ModelTask,
 ) -> Result<Vec<String>> {
     let mut args = vec![
         "__engine-serve-http".to_owned(),
@@ -10360,6 +10374,10 @@ fn builtin_engine_serve_http_args(
     args.extend(["--state-path".to_owned(), state_path.display().to_string()]);
     if let Some(log_path) = log_path {
         args.extend(["--log-path".to_owned(), log_path.display().to_string()]);
+    }
+    // Omitted for chat so a chat launch keeps the argv it always had.
+    if !task.is_chat() {
+        args.extend(["--task".to_owned(), task.as_str().to_owned()]);
     }
     Ok(args)
 }
@@ -19503,6 +19521,7 @@ pub(crate) mod tests {
                 tool_calling: false,
                 quantized_models: "vllm-supported".to_owned(),
                 reasoning_parser: false,
+                tasks: vec![rocm_core::ModelTask::Chat],
             },
             notes: Vec::new(),
         };

@@ -327,6 +327,7 @@ fn spawn_managed_engine_child(
     env_id: Option<&str>,
     engine_recipe: Option<&EngineRecipeHint>,
     require_api_key: bool,
+    task: rocm_core::ModelTask,
 ) -> Result<ManagedSpawn> {
     paths.ensure()?;
     fs::create_dir_all(paths.services_dir())?;
@@ -415,6 +416,7 @@ fn spawn_managed_engine_child(
     );
     record.gpu_indices = gpu_indices.to_vec();
     record.engine_recipe_json = requested_recipe_json;
+    record.task = task;
     // The flag the user actually passed, carried through rather than re-derived.
     //
     // Deriving it from key-file presence looked equivalent and was not:
@@ -451,6 +453,7 @@ fn spawn_managed_engine_child(
         engine_recipe,
         &record.engine_state_path,
         Some(&record.log_path),
+        task,
     )?;
     let engine_envs_root = env_root_for_service(paths, engine, runtime_id, env_id)?;
     // Hand the child the *path* to the endpoint key file (public bind only) via the
@@ -552,6 +555,7 @@ pub(crate) fn start_managed_service(
     endpoint_api_key: Option<&str>,
     launch_lock: rocm_core::FileLock,
     require_api_key: bool,
+    task: rocm_core::ModelTask,
     on_wait_tick: &mut dyn FnMut(Duration),
 ) -> Result<ManagedLaunchReport> {
     let paths = AppPaths::discover()?;
@@ -569,6 +573,7 @@ pub(crate) fn start_managed_service(
         env_id,
         engine_recipe,
         require_api_key,
+        task,
     )? {
         ManagedSpawn::AlreadyRunning(report) => return Ok(report),
         ManagedSpawn::Spawned { record, child_pid } => (*record, child_pid),
@@ -890,6 +895,7 @@ pub(crate) fn run_attached_service(
     endpoint_api_key: Option<&str>,
     launch_lock: rocm_core::FileLock,
     require_api_key: bool,
+    task: rocm_core::ModelTask,
 ) -> Result<()> {
     let paths = AppPaths::discover()?;
 
@@ -907,6 +913,7 @@ pub(crate) fn run_attached_service(
         env_id,
         resolve.engine_recipe.as_ref(),
         require_api_key,
+        task,
     )?;
     // The claiming record is persisted (or an existing service was found), so the
     // selected GPU is now visible to concurrent auto-selection. Release the launch
@@ -1284,6 +1291,7 @@ mod tests {
             None,
             Some(&requested_recipe),
             false,
+            rocm_core::ModelTask::Chat,
         );
         let _ = fs::remove_dir_all(root);
 
@@ -1368,6 +1376,7 @@ mod tests {
             None,
             // The demand that used to be silently discarded.
             true,
+            rocm_core::ModelTask::Chat,
         );
         let _ = fs::remove_dir_all(root);
 
@@ -1453,6 +1462,7 @@ mod tests {
             None,
             None,
             true,
+            rocm_core::ModelTask::Chat,
         );
         let _ = fs::remove_dir_all(root);
 

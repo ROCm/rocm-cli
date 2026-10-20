@@ -31,6 +31,11 @@ pub struct ManagedServiceRecord {
     pub engine: String,
     pub model_ref: String,
     pub canonical_model_id: String,
+    /// What the served model does, which decides its client route and whether
+    /// chat commands may use it. Records written before this field existed all
+    /// served chat models, which is what the default restores.
+    #[serde(default)]
+    pub task: crate::ModelTask,
     pub host: String,
     pub port: u16,
     pub endpoint_url: String,
@@ -134,6 +139,7 @@ impl ManagedServiceRecord {
             engine,
             model_ref: model_ref.into(),
             canonical_model_id: canonical_model_id.into(),
+            task: crate::ModelTask::Chat,
             host,
             port,
             mode: mode.into(),
