@@ -38,10 +38,17 @@ pub(crate) struct SpeechRecipe {
     pub(crate) task: ModelTask,
     /// Lemonade's recipe name, as `lemonade backends` and `/v1/health` report it.
     pub(crate) recipe: &'static str,
-    /// The `lemonade load` flag that names the backend.
-    load_flag: &'static str,
-    /// The `recipe_options` key that reports the backend a model was loaded on.
-    backend_option: &'static str,
+    /// The `lemonade load` flag that names the backend; `None` for a recipe
+    /// with a single backend.
+    load_flag: Option<&'static str>,
+    /// The `recipe_options` key that reports the backend a model was loaded
+    /// on; `None` for a recipe with a single backend.
+    backend_option: Option<&'static str>,
+    /// Backends that may serve it, best first.
+    backends: &'static [&'static str],
+    /// Runs on the CPU. Only Kokoro, as an explicit, labelled demo exception
+    /// to the GPU-only policy; the GPU check is skipped for it alone.
+    pub(crate) cpu: bool,
     /// What the user is told about the model's memory needs.
     estimated_memory: &'static str,
     /// Shown when the backend fails to install twice in a row. The download is
@@ -53,8 +60,10 @@ pub(crate) struct SpeechRecipe {
 pub(crate) const TRANSCRIPTION: SpeechRecipe = SpeechRecipe {
     task: ModelTask::Transcription,
     recipe: "whispercpp",
-    load_flag: "--whispercpp",
-    backend_option: "whispercpp_backend",
+    load_flag: Some("--whispercpp"),
+    backend_option: Some("whispercpp_backend"),
+    backends: &SPEECH_BACKEND_PRIORITY,
+    cpu: false,
     estimated_memory: "under 2 GiB for Whisper Large-v3-Turbo; well under 1 GiB for the \
                        smaller Whisper models",
     install_advice: "Lemonade could not install its speech-to-text (whisper.cpp) backend; \
@@ -65,18 +74,43 @@ pub(crate) const TRANSCRIPTION: SpeechRecipe = SpeechRecipe {
 pub(crate) const SPEECH: SpeechRecipe = SpeechRecipe {
     task: ModelTask::Speech,
     recipe: "openmoss",
-    load_flag: "--openmoss",
-    backend_option: "openmoss_backend",
+    load_flag: Some("--openmoss"),
+    backend_option: Some("openmoss_backend"),
+    backends: &SPEECH_BACKEND_PRIORITY,
+    cpu: false,
     estimated_memory: "about 13 GiB for OpenMOSS-TTS (8-bit)",
     install_advice: "Lemonade could not install its text-to-speech (OpenMOSS) backend; \
                      check the network connection and run the same `rocm serve` command \
                      again, which retries the download",
 };
 
+/// Lemonade's small Kokoro text-to-speech model. CPU only: Lemonade ships no
+/// GPU build of it. Served only as an explicit demo exception.
+pub(crate) const KOKORO: SpeechRecipe = SpeechRecipe {
+    task: ModelTask::Speech,
+    recipe: "kokoro",
+    load_flag: None,
+    backend_option: None,
+    backends: &["cpu"],
+    cpu: true,
+    estimated_memory: "about 0.4 GiB of system memory (runs on the CPU)",
+    install_advice: "Lemonade could not install its Kokoro text-to-speech backend; check the \
+                     network connection and run the same `rocm serve` command again, which \
+                     retries the download",
+};
+
 impl SpeechRecipe {
-    pub(crate) const fn health_keys(&self) -> (&'static str, &'static str) {
+    pub(crate) const fn health_keys(&self) -> (&'static str, Option<&'static str>) {
         (self.recipe, self.backend_option)
     }
+}
+
+/// The recipe for a speech model, by task and model name.
+pub(crate) fn speech_recipe_for(task: ModelTask, model_ref: &str) -> Option<&'static SpeechRecipe> {
+    if task == ModelTask::Speech && model_ref.to_ascii_lowercase().contains("kokoro") {
+        return Some(&KOKORO);
+    }
+    speech_recipe(task)
 }
 
 /// The recipe a speech task is served with, or `None` for one that is not a
@@ -121,9 +155,17 @@ pub(crate) fn resolve_speech_model(
         }),
         engine_recipe,
         warnings: vec![format!(
-            "Lemonade runs this model on its ROCm {recipe} backend, or Vulkan when ROCm is \
-             unsupported on this GPU; a CPU build is never selected",
-            recipe = recipe.recipe
+            "{}",
+            if recipe.cpu {
+                "this model runs on the CPU: a labelled demo exception to the GPU-only policy"
+                    .to_owned()
+            } else {
+                format!(
+                    "Lemonade runs this model on its ROCm {} backend, or Vulkan when ROCm is \
+                     unsupported on this GPU; a CPU build is never selected",
+                    recipe.recipe
+                )
+            }
         )],
     }
 }
@@ -167,7 +209,7 @@ pub(crate) fn serve_speech_model(
                 "status": "loaded",
                 "method": "lemonade-cli",
                 "model_name": request.model_ref,
-                recipe.backend_option: backend
+                "backend": backend
             },
         }),
     )?;
@@ -294,8 +336,8 @@ struct SelectedBackend {
 fn select_backend(recipe: &SpeechRecipe, listing: &str) -> Result<SelectedBackend> {
     let statuses = crate::backend_alignment::parse_backend_statuses(listing, recipe.recipe);
     let (name, already_installed) =
-        crate::backend_alignment::select_best_backend(&statuses, &SPEECH_BACKEND_PRIORITY)
-            .ok_or_else(|| {
+        crate::backend_alignment::select_best_backend(&statuses, recipe.backends).ok_or_else(
+            || {
                 anyhow!(
                     "Lemonade reports no supported GPU {} backend for this host (status: {}). \
                      The GPU-required policy does not fall back to CPU; check the GPU driver \
@@ -303,7 +345,8 @@ fn select_backend(recipe: &SpeechRecipe, listing: &str) -> Result<SelectedBacken
                     recipe.task.display_name(),
                     crate::backend_alignment::describe_backend_statuses(&statuses)
                 )
-            })?;
+            },
+        )?;
     Ok(SelectedBackend {
         name,
         already_installed,
@@ -317,17 +360,19 @@ fn load_args(
     model_ref: &str,
     backend: &str,
 ) -> Vec<String> {
-    vec![
+    let mut args = vec![
         "--host".to_owned(),
         host.to_owned(),
         "--port".to_owned(),
         port.to_string(),
         "load".to_owned(),
         model_ref.to_owned(),
-        recipe.load_flag.to_owned(),
-        backend.to_owned(),
-        "--save-options".to_owned(),
-    ]
+    ];
+    if let Some(flag) = recipe.load_flag {
+        args.extend([flag.to_owned(), backend.to_owned()]);
+    }
+    args.push("--save-options".to_owned());
+    args
 }
 
 /// Whether Lemonade reports `model_ref` loaded through the recipe on exactly
@@ -346,11 +391,13 @@ fn health_has_model(recipe: &SpeechRecipe, health: &Value, model_ref: &str, back
             let str_field = |key: &str| model.get(key).and_then(Value::as_str);
             str_field("model_name").is_some_and(|name| name.eq_ignore_ascii_case(model_ref))
                 && str_field("recipe") == Some(recipe.recipe)
-                && model
-                    .get("recipe_options")
-                    .and_then(|options| options.get(recipe.backend_option))
-                    .and_then(Value::as_str)
-                    == Some(backend)
+                && recipe.backend_option.is_none_or(|option| {
+                    model
+                        .get("recipe_options")
+                        .and_then(|options| options.get(option))
+                        .and_then(Value::as_str)
+                        == Some(backend)
+                })
         })
 }
 

@@ -589,6 +589,32 @@
       "warnings": [
         "text-to-speech; serves POST /v1/audio/speech, not chat; a 12.5 GB download"
       ]
+    },
+    {
+      "canonical_model_id": "kokoro-v1",
+      "aliases": [
+        "kokoro"
+      ],
+      "task": "speech",
+      "source": "recipe_index",
+      "revision": "main",
+      "loader": "kokoro",
+      "trust_remote_code": false,
+      "dtype": "onnx",
+      "device_policy": "cpu_only",
+      "recommended_system_ram_gb": 4,
+      "quantization": "ONNX; Lemonade Kokoro CPU backend",
+      "artifact_hint": "Lemonade model id resolved and downloaded by the Lemonade engine",
+      "artifacts": [],
+      "engine_recipes": [],
+      "manual_alternatives": [],
+      "chat_template_mode": "none",
+      "preferred_engines": [
+        "lemonade"
+      ],
+      "warnings": [
+        "text-to-speech on the CPU: a demo exception to the GPU-only policy; serves POST /v1/audio/speech"
+      ]
     }
   ]
 }

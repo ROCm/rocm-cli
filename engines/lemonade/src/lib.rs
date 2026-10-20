@@ -219,8 +219,11 @@ pub fn run_cli() -> Result<()> {
 /// backend, for callers that judge a speech service's readiness from that
 /// report; `None` for a task that is not served as a speech model.
 #[must_use]
-pub fn speech_model_health_keys(task: ModelTask) -> Option<(&'static str, &'static str)> {
-    crate::speech::speech_recipe(task).map(crate::speech::SpeechRecipe::health_keys)
+pub fn speech_model_health_keys(
+    task: ModelTask,
+    model_ref: &str,
+) -> Option<(&'static str, Option<&'static str>)> {
+    crate::speech::speech_recipe_for(task, model_ref).map(crate::speech::SpeechRecipe::health_keys)
 }
 
 pub fn builtin_handle_envelope(envelope: EngineRequestEnvelope) -> EngineResponseEnvelope {
@@ -432,7 +435,7 @@ fn resolve_model_response(request: ResolveModelRequest) -> Result<ResolveModelRe
     let device_policy = crate::state::normalize_device_policy(request.device_policy)?;
     let engine_recipe = crate::state::accepted_engine_recipe(request.engine_recipe)?;
     let canonical_model_id = crate::state::resolve_lemonade_model_ref(&request.model_ref);
-    if let Some(recipe) = crate::speech::speech_recipe(request.task) {
+    if let Some(recipe) = crate::speech::speech_recipe_for(request.task, &canonical_model_id) {
         return Ok(crate::speech::resolve_speech_model(
             recipe,
             canonical_model_id,
@@ -535,13 +538,18 @@ fn serve_http(mut request: ServeHttpRequest) -> Result<()> {
     // devices fails fast, `auto` resolves to the first present device (never an
     // assumed device 0), and an explicit `--gpu` index is rejected when it is not
     // actually present. This runs before any server process is spawned.
-    request.gpu_indices = crate::state::resolve_serve_gpu_indices(&request.gpu_indices)?;
+    // The one CPU speech model (Kokoro, a labelled demo exception) needs no GPU.
+    let runs_on_cpu = crate::speech::speech_recipe_for(request.task, &request.model_ref)
+        .is_some_and(|recipe| recipe.cpu);
+    if !runs_on_cpu {
+        request.gpu_indices = crate::state::resolve_serve_gpu_indices(&request.gpu_indices)?;
+    }
     let mut runtime = crate::backend_alignment::resolve_runtime()?;
     let mut process_env = crate::process::lemonade_process_environment()?;
     process_env.gpu_indices = request.gpu_indices.clone();
     let log_path = request.log_path.as_deref();
     crate::state::write_running_state(&request, &runtime, std::process::id(), None, "starting")?;
-    if let Some(recipe) = crate::speech::speech_recipe(request.task) {
+    if let Some(recipe) = crate::speech::speech_recipe_for(request.task, &request.model_ref) {
         return crate::speech::serve_speech_model(
             recipe,
             &request,

@@ -661,7 +661,17 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     // CPU-only serving never pins a GPU, so skip GPU resolution entirely and
     // surface the explicit `--gpu` as ignored rather than printing a device the
     // server will not use.
-    let cpu_only = matches!(device_policy, DevicePolicy::CpuOnly);
+    // A recipe that declares itself CPU-only (Kokoro text-to-speech, a labelled
+    // demo exception to the GPU-only policy) skips the GPU checks below.
+    let recipe_runs_on_cpu = shared_recipe
+        .as_ref()
+        .is_some_and(|recipe| recipe.device_policy == "cpu_only");
+    if recipe_runs_on_cpu {
+        eprintln!(
+            "note: `{model}` runs on the CPU - a demo exception to rocm-cli's GPU-only policy"
+        );
+    }
+    let cpu_only = matches!(device_policy, DevicePolicy::CpuOnly) || recipe_runs_on_cpu;
     // AMD GPU ordinals still usable after the active visibility mask
     // (`HIP_VISIBLE_DEVICES`, then `ROCR_VISIBLE_DEVICES`) is applied, in HIP
     // ordinal space — the space `--gpu` is validated and exported through. A
