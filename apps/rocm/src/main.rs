@@ -480,13 +480,15 @@ rocm model --verbose"
     /// server running, or Ctrl-C to stop it. Inspect or stop servers later with
     /// `rocm services`.
     ///
-    /// Speech-to-text models such as `whisper` are served through Lemonade and answer
-    /// on `/v1/audio/transcriptions` instead of chat; the summary prints that endpoint.
+    /// Speech-to-text models such as `whisper` and text-to-speech models such as `tts`
+    /// are served through Lemonade and answer on `/v1/audio/transcriptions` or
+    /// `/v1/audio/speech` instead of chat; the summary prints that endpoint.
     #[command(after_help = "EXAMPLES:\n  \
 rocm serve qwen\n  \
 rocm serve qwen --engine vllm --port 8000\n  \
 rocm serve qwen --verbose --device gpu_required\n  \
-rocm serve whisper")]
+rocm serve whisper\n  \
+rocm serve tts")]
     Serve {
         /// Model name, alias, or local model file path.
         model: String,
@@ -4645,7 +4647,8 @@ fn apply_service_prune_plan(
 /// age floor can — the window is not short and is not bounded, because
 /// `spawn_managed_engine_child`'s idempotency guard runs `load_managed_services`
 /// first, and that refreshes every `ready`/`running` record through a 750ms
-/// listing plus an up-to-8s inference probe ([`rocm_core::INFERENCE_PROBE_TIMEOUT`]),
+/// listing plus an inference probe of up to 8s, or 30s for text-to-speech
+/// ([`rocm_core::inference_probe_timeout`]),
 /// sequentially, over a record count the user controls.
 ///
 /// **Scope: the whole operation, not just the scan.** Holding it across
@@ -6687,8 +6690,8 @@ pub(crate) fn render_services_text(paths: &AppPaths, all: bool) -> Result<String
         if !record.task.is_chat() {
             // `endpoint` stays the base URL for every service, so tools that
             // take one keep working. Chat clients append `/chat/completions` to
-            // it, which a speech-to-text server does not have, so name the
-            // route it does serve.
+            // it, which a speech-to-text or text-to-speech server does not
+            // have, so name the route it does serve.
             let _ = writeln!(output, "  task: {}", record.task.display_name());
             if let Some(line) = service_hints::task_endpoint_line(record.task, &record.endpoint_url)
             {
@@ -8309,7 +8312,7 @@ fn refresh_managed_service_runtime_liveness(
             record,
             endpoint_api_key.as_deref(),
             SERVICE_LIVENESS_CHECK_TIMEOUT,
-            rocm_core::INFERENCE_PROBE_TIMEOUT,
+            rocm_core::inference_probe_timeout(record.task),
         )
     } else {
         EndpointReadinessOutcome {
@@ -8319,8 +8322,9 @@ fn refresh_managed_service_runtime_liveness(
     };
     let readiness = outcome.readiness;
     if readiness == EndpointReadiness::Serving {
-        // Mirror `providers.rs::ready_local_services()`: a live, probe-passing
-        // service should be persisted as "ready", not left stuck at "running".
+        // As `providers.rs::ready_local_services()` does for chat services: a
+        // live, probe-passing service should be persisted as "ready", not left
+        // stuck at "running".
         if record.status == "running" {
             record.status = "ready".to_owned();
             return true;
@@ -11464,12 +11468,19 @@ fn wait_for_service_http_ready_with_progress(
         });
         if listed {
             best = EndpointReadiness::Listing;
+            // The task's probe budget, cut to what is left of this wait (at
+            // least a second, so a probe is never sent with no time at all): a
+            // text-to-speech probe would otherwise overrun the deadline by up
+            // to its whole 30 s.
+            let probe_timeout = rocm_core::inference_probe_timeout(task)
+                .min(timeout.saturating_sub(start.elapsed()))
+                .max(Duration::from_secs(1));
             if rocm_core::openai_inference_probe(
                 task,
                 &endpoint,
                 canonical_model_id,
                 endpoint_api_key,
-                rocm_core::INFERENCE_PROBE_TIMEOUT,
+                probe_timeout,
             )
             .unwrap_or(false)
             {
@@ -11589,12 +11600,13 @@ fn service_http_readiness_response_ready(
 
 /// Whether one readiness response shows the model loaded, judged for its task.
 ///
-/// On Lemonade a speech-to-text model is listed only by `/v1/health`, loaded
-/// through `whispercpp` on a GPU backend: Lemonade's `/v1/models` lists every
-/// downloaded model, loaded or not, so it says nothing about a Whisper model.
-/// Any other engine that advertises speech-to-text is judged by its
-/// `/v1/models`, as its chat models are; either way the transcription probe
-/// that follows decides whether it actually serves.
+/// On Lemonade a speech model (speech-to-text or text-to-speech) is listed only
+/// by `/v1/health`, loaded through its speech recipe (`whispercpp`,
+/// `openmoss`) on a GPU backend: Lemonade's `/v1/models` lists every downloaded
+/// model, loaded or not, so it says nothing about one. Any other engine that
+/// advertises a speech task is judged by its `/v1/models`, as its chat models
+/// are; either way the probe for the task that follows decides whether it
+/// actually serves.
 fn service_http_readiness_response_ready_for_task(
     task: rocm_core::ModelTask,
     engine: &str,
@@ -11606,9 +11618,11 @@ fn service_http_readiness_response_ready_for_task(
     if status != 200 {
         return false;
     }
-    if task == rocm_core::ModelTask::Transcription && engine == "lemonade" {
+    if engine == "lemonade"
+        && let Some((recipe, backend_option)) = rocm_engine_lemonade::speech_model_health_keys(task)
+    {
         return path == "/v1/health"
-            && lemonade_health_has_transcription_model(body, canonical_model_id);
+            && lemonade_health_has_speech_model(body, canonical_model_id, recipe, backend_option);
     }
     match (engine, path) {
         ("lemonade", "/v1/health") => lemonade_health_ready_for_model(body, canonical_model_id),
@@ -11636,7 +11650,12 @@ fn lemonade_health_ready_for_model(body: &str, canonical_model_id: &str) -> bool
         })
 }
 
-fn lemonade_health_has_transcription_model(body: &str, canonical_model_id: &str) -> bool {
+fn lemonade_health_has_speech_model(
+    body: &str,
+    canonical_model_id: &str,
+    recipe: &str,
+    backend_option: &str,
+) -> bool {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(body.trim()) else {
         return false;
     };
@@ -11648,10 +11667,10 @@ fn lemonade_health_has_transcription_model(body: &str, canonical_model_id: &str)
                 let field = |key: &str| model.get(key).and_then(serde_json::Value::as_str);
                 field("model_name")
                     .is_some_and(|loaded| service_model_names_match(loaded, canonical_model_id))
-                    && field("recipe") == Some("whispercpp")
+                    && field("recipe") == Some(recipe)
                     && model
                         .get("recipe_options")
-                        .and_then(|options| options.get("whispercpp_backend"))
+                        .and_then(|options| options.get(backend_option))
                         .and_then(serde_json::Value::as_str)
                         .is_some_and(|backend| matches!(backend, "rocm" | "vulkan"))
             })
@@ -13641,6 +13660,32 @@ pub(crate) mod tests {
         );
         drop(server);
         Ok(())
+    }
+
+    #[test]
+    fn a_text_to_speech_model_is_listed_only_when_loaded_on_a_gpu_openmoss_backend() {
+        let health = |recipe: &str, option: &str, backend: &str| {
+            format!(
+                r#"{{"all_models_loaded":[{{"model_name":"OpenMOSS-TTS","recipe":"{recipe}","recipe_options":{{"{option}":"{backend}"}}}}]}}"#
+            )
+        };
+        let ready = |body: &str| {
+            service_http_readiness_response_ready_for_task(
+                rocm_core::ModelTask::Speech,
+                "lemonade",
+                "/v1/health",
+                200,
+                body,
+                "OpenMOSS-TTS",
+            )
+        };
+        assert!(ready(&health("openmoss", "openmoss_backend", "rocm")));
+        assert!(ready(&health("openmoss", "openmoss_backend", "vulkan")));
+        assert!(!ready(&health("openmoss", "openmoss_backend", "cuda")));
+        assert!(
+            !ready(&health("whispercpp", "whispercpp_backend", "rocm")),
+            "a loaded speech-to-text model is not a text-to-speech one"
+        );
     }
 
     #[test]

@@ -1101,6 +1101,50 @@ mod tests {
     }
 
     #[test]
+    fn a_text_to_speech_model_is_refused_by_vllm_and_its_named_remedy_passes() {
+        let recipe = resolve_builtin_model_recipe("tts").expect("tts recipe");
+        assert_eq!(
+            recipe.model_task().expect("valid task"),
+            rocm_core::ModelTask::Speech
+        );
+        let root = std::env::temp_dir().join(format!(
+            "rocm-serve-tts-task-check-{}",
+            rocm_core::unix_time_millis()
+        ));
+        let paths = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+
+        let error = ensure_engine_serves_task(
+            &paths,
+            "vllm",
+            rocm_core::ModelTask::Speech,
+            "tts",
+            Some(&recipe),
+        )
+        .expect_err("vLLM advertises chat only")
+        .to_string();
+        assert_eq!(
+            error,
+            "`tts` is a text-to-speech model, which the vllm engine cannot serve; \
+             serve it with `rocm serve tts --engine lemonade`"
+        );
+        // The named remedy passes this same check; the nightly GPU scenario
+        // `@id:serve-text-to-speech-model-speaks-on-the-printed-endpoint` runs it.
+        ensure_engine_serves_task(
+            &paths,
+            "lemonade",
+            rocm_core::ModelTask::Speech,
+            "tts",
+            Some(&recipe),
+        )
+        .expect("Lemonade advertises text-to-speech");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn unsupported_task_message_offers_no_engine_when_the_recipe_names_none_other() {
         assert_eq!(
             unsupported_task_message(

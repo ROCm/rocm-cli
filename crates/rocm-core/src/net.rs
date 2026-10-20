@@ -677,11 +677,13 @@ pub const INFERENCE_PROBE_ATTEMPTED_STATE_KEY: &str = "inference_probe_attempted
 /// Minimum gap between inference probes against a service that is still loading.
 ///
 /// Only a *successful* probe latches, so without this a warming model would be
-/// re-probed by every readiness poll — and each attempt costs up to
-/// [`INFERENCE_PROBE_TIMEOUT`], which is the whole poll's latency. The
+/// re-probed by every readiness poll — and each attempt costs up to its probe
+/// budget ([`inference_probe_timeout`]), which is the whole poll's latency. The
 /// supervisor ticks every few seconds and `services list` sits in front of a
 /// user, so the unthrottled cost lands exactly where it is most visible. The
-/// price of throttling is that readiness can be noticed up to this late.
+/// price of throttling is that readiness can be noticed up to this late. This is
+/// the floor; [`inference_probe_retry_interval`] lengthens it for a task whose
+/// probe takes longer.
 pub const INFERENCE_PROBE_RETRY_INTERVAL: Duration = Duration::from_secs(15);
 
 /// Merge `patch`'s top-level keys into the JSON object stored at `path`.
@@ -716,7 +718,7 @@ pub fn merge_json_state_file(path: &Path, patch: &serde_json::Value) -> Result<(
 
 /// Whether inference has been confirmed for a service, from its engine state
 /// file — probing at most once, and at most once per
-/// [`INFERENCE_PROBE_RETRY_INTERVAL`] while it is still loading.
+/// [`inference_probe_retry_interval`] while it is still loading.
 ///
 /// Shared by the engine adapters so the latch and backoff bookkeeping has one
 /// implementation: the engines differ in how they decide a model is *listed*,
@@ -746,7 +748,8 @@ pub fn engine_state_inference_verified(
     }
     let now = unix_time_millis() as u64;
     if let Some(attempted_at) = state_u64(INFERENCE_PROBE_ATTEMPTED_STATE_KEY)
-        && now.saturating_sub(attempted_at) < INFERENCE_PROBE_RETRY_INTERVAL.as_millis() as u64
+        && u128::from(now.saturating_sub(attempted_at))
+            < inference_probe_retry_interval(task).as_millis()
     {
         return false;
     }
@@ -759,7 +762,7 @@ pub fn engine_state_inference_verified(
         endpoint_url,
         model_ref,
         endpoint_api_key,
-        INFERENCE_PROBE_TIMEOUT,
+        inference_probe_timeout(task),
     )
     .unwrap_or(false)
     {
@@ -870,6 +873,58 @@ pub fn openai_transcription_status(
     Ok(response.status)
 }
 
+/// The budget for a text-to-speech probe.
+///
+/// Synthesizing even one word runs the whole model and its audio codec, which
+/// on a large text-to-speech model takes far longer than the token a chat probe
+/// asks for; a chat-sized budget would keep a working server from ever being
+/// called ready. [`inference_probe_retry_interval`] spaces failed probes so
+/// that this is not paid on every poll.
+pub const SPEECH_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The budget for one inference probe of a server for `task`.
+#[must_use]
+pub const fn inference_probe_timeout(task: crate::ModelTask) -> Duration {
+    match task {
+        crate::ModelTask::Speech => SPEECH_PROBE_TIMEOUT,
+        _ => INFERENCE_PROBE_TIMEOUT,
+    }
+}
+
+/// The least time between two inference probes of a server for `task`.
+///
+/// That is [`INFERENCE_PROBE_RETRY_INTERVAL`], or twice the probe's own budget
+/// when that is longer, for a server still coming up. A probe that used its
+/// whole budget must not be due again by the time it returns, or every
+/// readiness poll would pay it.
+#[must_use]
+pub fn inference_probe_retry_interval(task: crate::ModelTask) -> Duration {
+    INFERENCE_PROBE_RETRY_INTERVAL.max(inference_probe_timeout(task) * 2)
+}
+
+/// Ask a text-to-speech endpoint to say one word and return the HTTP status —
+/// the text-to-speech counterpart of [`openai_chat_completion_status`].
+pub fn openai_speech_status(
+    endpoint_url: &str,
+    model_ref: &str,
+    endpoint_api_key: Option<&str>,
+    timeout: Duration,
+) -> Result<u16> {
+    let body = serde_json::json!({
+        "model": model_ref,
+        "input": "ok",
+        "response_format": "wav",
+    });
+    let response = http_post_json_with_auth(
+        endpoint_url,
+        "/v1/audio/speech",
+        &body,
+        endpoint_api_key,
+        timeout,
+    )?;
+    Ok(response.status)
+}
+
 /// The smallest real request for a model's task, as an HTTP status.
 pub fn openai_inference_status(
     task: crate::ModelTask,
@@ -885,6 +940,9 @@ pub fn openai_inference_status(
         crate::ModelTask::Transcription => {
             openai_transcription_status(endpoint_url, model_ref, endpoint_api_key, timeout)
         }
+        crate::ModelTask::Speech => {
+            openai_speech_status(endpoint_url, model_ref, endpoint_api_key, timeout)
+        }
         // Readiness is never claimed for a service this build cannot probe.
         crate::ModelTask::Unknown => bail!("no inference probe exists for an unrecognised task"),
     }
@@ -893,9 +951,10 @@ pub fn openai_inference_status(
 /// Whether the endpoint answers the request that matches the model's task.
 ///
 /// A chat server counts as serving on the same "answered below 500" rule as
-/// [`openai_chat_completion_probe`]. A speech-to-text server must answer 200:
-/// the probe sends a valid recording, so a 4xx means the route or the model is
-/// not there (a model not loaded, a decode failure), not that it is serving.
+/// [`openai_chat_completion_probe`]. A speech-to-text or text-to-speech server
+/// must answer 200: the probe sends a valid recording or sentence, so a 4xx
+/// means the route or the model is not there (a model not loaded, a decode
+/// failure), not that it is serving.
 /// Probing a speech-to-text server with a chat request would instead read its
 /// `404` as serving.
 pub fn openai_inference_probe(
@@ -907,7 +966,7 @@ pub fn openai_inference_probe(
 ) -> Result<bool> {
     let status = openai_inference_status(task, endpoint_url, model_ref, endpoint_api_key, timeout)?;
     Ok(match task {
-        crate::ModelTask::Transcription => status == 200,
+        crate::ModelTask::Transcription | crate::ModelTask::Speech => status == 200,
         _ => status < 500,
     })
 }
@@ -1019,7 +1078,7 @@ pub struct EndpointReadinessOutcome {
 /// as before this check existed.
 ///
 /// A *failed* probe cannot latch, so those are throttled instead: a still-loading
-/// service is re-probed at most once per [`INFERENCE_PROBE_RETRY_INTERVAL`],
+/// service is re-probed at most once per [`inference_probe_retry_interval`],
 /// which keeps a warming model from costing every caller a full
 /// `probe_timeout`.
 ///
@@ -1046,7 +1105,8 @@ pub fn managed_service_endpoint_readiness(
     }
     let now = unix_time_millis() as u64;
     if let Some(attempted_at) = record.inference_probe_attempted_at_unix_ms
-        && now.saturating_sub(attempted_at) < INFERENCE_PROBE_RETRY_INTERVAL.as_millis() as u64
+        && u128::from(now.saturating_sub(attempted_at))
+            < inference_probe_retry_interval(record.task).as_millis()
     {
         return outcome(EndpointReadiness::Listing, false);
     }
@@ -2488,6 +2548,34 @@ mod tests {
         Ok(())
     }
     #[test]
+    fn a_text_to_speech_service_is_probed_with_a_speech_request() -> Result<()> {
+        let (port, server) = spawn_canned_http_server(vec![
+            Some(("HTTP/1.1 200 OK", MODELS_OK_BODY)),
+            Some(("HTTP/1.1 200 OK", "RIFF")),
+        ])?;
+        let mut record = probe_test_record(port);
+        record.task = crate::ModelTask::Speech;
+
+        assert_eq!(
+            managed_service_endpoint_readiness(
+                &mut record,
+                None,
+                Duration::from_secs(2),
+                Duration::from_secs(2)
+            )
+            .readiness,
+            EndpointReadiness::Serving
+        );
+        let requests = server.join().expect("server thread should not panic")?;
+        let probe = requests.get(1).expect("an inference probe was sent");
+        assert!(
+            probe.starts_with("POST /v1/audio/speech HTTP/1.1"),
+            "{probe}"
+        );
+        assert!(probe.contains("\"input\":\"ok\""), "{probe}");
+        Ok(())
+    }
+    #[test]
     fn silent_wav_is_a_well_formed_16khz_mono_pcm_file() {
         let wav = silent_wav_16khz_mono(Duration::from_secs(1));
         assert_eq!(wav.len(), 44 + 32_000);
@@ -2593,28 +2681,135 @@ mod tests {
         Ok(())
     }
     #[test]
-    fn a_speech_to_text_probe_needs_a_transcript_not_just_an_answer() -> Result<()> {
-        for (status_line, serving) in [
-            ("HTTP/1.1 200 OK", true),
-            ("HTTP/1.1 404 Not Found", false),
-            ("HTTP/1.1 400 Bad Request", false),
-        ] {
-            let (port, server) =
-                spawn_canned_http_server(vec![Some((status_line, r#"{"text":""}"#))])?;
-            assert_eq!(
-                openai_inference_probe(
-                    crate::ModelTask::Transcription,
-                    &format!("http://127.0.0.1:{port}/v1"),
-                    "Whisper-Tiny",
-                    None,
-                    Duration::from_secs(2),
-                )?,
-                serving,
-                "{status_line}"
-            );
-            server.join().expect("server thread should not panic")?;
+    fn a_speech_probe_needs_a_200_not_just_an_answer() -> Result<()> {
+        for task in [crate::ModelTask::Transcription, crate::ModelTask::Speech] {
+            for (status_line, serving) in [
+                ("HTTP/1.1 200 OK", true),
+                ("HTTP/1.1 404 Not Found", false),
+                ("HTTP/1.1 400 Bad Request", false),
+            ] {
+                let (port, server) =
+                    spawn_canned_http_server(vec![Some((status_line, r#"{"text":""}"#))])?;
+                assert_eq!(
+                    openai_inference_probe(
+                        task,
+                        &format!("http://127.0.0.1:{port}/v1"),
+                        "model",
+                        None,
+                        Duration::from_secs(2),
+                    )?,
+                    serving,
+                    "{task} {status_line}"
+                );
+                server.join().expect("server thread should not panic")?;
+            }
         }
         Ok(())
+    }
+    #[test]
+    fn a_failed_speech_probe_is_retried_later_than_a_failed_chat_probe() -> Result<()> {
+        // 20 s after a failed attempt: past the chat retry interval, inside the
+        // text-to-speech one, which must be at least twice its 30 s probe.
+        let attempted = (unix_time_millis() as u64).saturating_sub(20_000);
+        for (task, reprobed) in [
+            (crate::ModelTask::Chat, true),
+            (crate::ModelTask::Speech, false),
+        ] {
+            // A second answer is always on offer, so a probe that should not
+            // happen would be answered, and seen, rather than refused.
+            let (port, server) = spawn_canned_http_server(vec![
+                Some(("HTTP/1.1 200 OK", MODELS_OK_BODY)),
+                Some(("HTTP/1.1 200 OK", CHAT_OK_BODY)),
+            ])?;
+            let mut record = probe_test_record(port);
+            record.task = task;
+            record.inference_probe_attempted_at_unix_ms = Some(attempted);
+            let readiness = managed_service_endpoint_readiness(
+                &mut record,
+                None,
+                Duration::from_secs(2),
+                Duration::from_secs(2),
+            )
+            .readiness;
+            if !reprobed {
+                // Take the second answer so the stand-in server can finish.
+                if let Ok(mut sentinel) = std::net::TcpStream::connect(("127.0.0.1", port)) {
+                    let _ = sentinel.write_all(b"GET /sentinel HTTP/1.1\r\n\r\n");
+                    // Read the answer before closing, so the stand-in server's
+                    // write never meets a closed socket.
+                    let _ = sentinel.set_read_timeout(Some(Duration::from_secs(2)));
+                    let _ = sentinel.read_to_end(&mut Vec::new());
+                }
+            }
+            let requests = server.join().expect("server thread should not panic")?;
+            if reprobed {
+                assert_eq!(readiness, EndpointReadiness::Serving, "{task}");
+            } else {
+                assert_eq!(readiness, EndpointReadiness::Listing, "{task}");
+                assert!(
+                    requests.iter().all(|request| !request.starts_with("POST ")),
+                    "a text-to-speech probe is not due again yet: {requests:?}"
+                );
+            }
+        }
+        Ok(())
+    }
+    #[test]
+    fn an_engine_does_not_reprobe_a_speech_server_inside_its_retry_interval() -> Result<()> {
+        let state_path = std::env::temp_dir().join(format!(
+            "rocm-speech-throttle-{}-{}.json",
+            std::process::id(),
+            unix_time_millis()
+        ));
+        let attempted = (unix_time_millis() as u64).saturating_sub(20_000);
+        let state = serde_json::json!({ INFERENCE_PROBE_ATTEMPTED_STATE_KEY: attempted });
+        for (task, reprobed) in [
+            (crate::ModelTask::Chat, true),
+            (crate::ModelTask::Speech, false),
+        ] {
+            let (port, server) =
+                spawn_canned_http_server(vec![Some(("HTTP/1.1 200 OK", CHAT_OK_BODY))])?;
+            let verified = engine_state_inference_verified(
+                task,
+                &state_path,
+                Some(&state),
+                &format!("http://127.0.0.1:{port}"),
+                "model",
+                None,
+            );
+            if !reprobed && let Ok(mut sentinel) = std::net::TcpStream::connect(("127.0.0.1", port))
+            {
+                let _ = sentinel.write_all(b"GET /sentinel HTTP/1.1\r\n\r\n");
+                // Read the answer before closing, so the stand-in server's
+                // write never meets a closed socket.
+                let _ = sentinel.set_read_timeout(Some(Duration::from_secs(2)));
+                let _ = sentinel.read_to_end(&mut Vec::new());
+            }
+            let requests = server.join().expect("server thread should not panic")?;
+            assert_eq!(verified, reprobed, "{task}");
+            assert_eq!(
+                requests.iter().any(|request| request.starts_with("POST ")),
+                reprobed,
+                "{task}: {requests:?}"
+            );
+        }
+        let _ = fs::remove_file(&state_path);
+        Ok(())
+    }
+    #[test]
+    fn a_probe_that_used_its_whole_budget_is_not_due_again_when_it_returns() {
+        for task in [
+            crate::ModelTask::Chat,
+            crate::ModelTask::Transcription,
+            crate::ModelTask::Speech,
+        ] {
+            assert!(
+                inference_probe_retry_interval(task) >= inference_probe_timeout(task) * 2,
+                "{task}"
+            );
+            assert!(inference_probe_retry_interval(task) >= INFERENCE_PROBE_RETRY_INTERVAL);
+        }
+        assert!(inference_probe_timeout(crate::ModelTask::Speech) > INFERENCE_PROBE_TIMEOUT);
     }
     #[test]
     fn inference_probe_sends_the_service_key_to_a_protected_endpoint() -> Result<()> {

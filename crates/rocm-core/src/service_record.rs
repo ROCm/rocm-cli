@@ -89,7 +89,7 @@ pub struct ManagedServiceRecord {
     pub stop_requested_unix_ms: Option<u128>,
     /// When the last inference probe was attempted. Throttles re-probing of a
     /// service that is listed but still loading — see
-    /// [`crate::INFERENCE_PROBE_RETRY_INTERVAL`]. Absent on records written before
+    /// [`crate::inference_probe_retry_interval`]. Absent on records written before
     /// readiness was gated on inference.
     #[serde(default)]
     pub inference_probe_attempted_at_unix_ms: Option<u64>,

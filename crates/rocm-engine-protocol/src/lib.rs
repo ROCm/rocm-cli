@@ -640,6 +640,9 @@ pub const OPENAI_CHAT_ROUTES: [&str; 3] = ["/v1/models", "/v1/chat/completions",
 /// The OpenAI-compatible routes every speech-to-text server answers.
 pub const OPENAI_TRANSCRIPTION_ROUTES: [&str; 2] = ["/v1/models", "/v1/audio/transcriptions"];
 
+/// The OpenAI-compatible routes every text-to-speech server answers.
+pub const OPENAI_SPEECH_ROUTES: [&str; 2] = ["/v1/models", "/v1/audio/speech"];
+
 /// The OpenAI-compatible routes a server for `task` answers, besides its
 /// health route.
 #[must_use]
@@ -647,6 +650,7 @@ pub const fn task_routes(task: ModelTask) -> &'static [&'static str] {
     match task {
         ModelTask::Chat => &OPENAI_CHAT_ROUTES,
         ModelTask::Transcription => &OPENAI_TRANSCRIPTION_ROUTES,
+        ModelTask::Speech => &OPENAI_SPEECH_ROUTES,
         // A task this build does not know: only the route every server has.
         ModelTask::Unknown => &["/v1/models"],
     }
@@ -1139,6 +1143,10 @@ mod tests {
         assert_eq!(
             supported_routes("/v1/health", ModelTask::Transcription),
             ["/v1/health", "/v1/models", "/v1/audio/transcriptions"]
+        );
+        assert_eq!(
+            supported_routes("/v1/health", ModelTask::Speech),
+            ["/v1/health", "/v1/models", "/v1/audio/speech"]
         );
         // A task this build cannot name: only the routes every server has.
         assert_eq!(

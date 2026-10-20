@@ -396,7 +396,8 @@ impl ManagedRegistryProbe for LiveManagedRegistryProbe {
 ///    `managed_service_endpoint_readiness`, which probes the endpoint — a model
 ///    listing bounded by `SERVICE_LIVENESS_CHECK_TIMEOUT`, and for a record
 ///    that lists but has not latched a verification, a real inference request
-///    bounded by `INFERENCE_PROBE_TIMEOUT` (8s). Those are per record and would
+///    bounded by `inference_probe_timeout` (8s, or 30s for text-to-speech).
+///    Those are per record and would
 ///    be paid serially on the plain synchronous thread that `resolved_args`
 ///    runs on, delaying the dashboard's first paint by seconds on exactly the
 ///    hosts that serve models. It also *writes* records, which launching a

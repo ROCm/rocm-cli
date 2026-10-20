@@ -13,6 +13,9 @@ use crate::E2eWorld;
 /// The speech-to-text model the scenarios use: the smallest Whisper recipe, so
 /// the GPU scenario's download stays small.
 const SPEECH_MODEL_REF: &str = "whisper-tiny";
+/// The text-to-speech model serve-29 serves on a GPU lane and serve-30 names
+/// in its refusal.
+const TTS_MODEL_REF: &str = "tts";
 const SPEECH_MODEL_ID: &str = "Whisper-Tiny";
 
 fn cli_text(world: &E2eWorld) -> String {
@@ -225,28 +228,27 @@ async fn serve_speech_model_on_chat_only_engine(world: &mut E2eWorld) {
     record_cli(world, result);
 }
 
-/// Exactly the command the chat-only refusal recommends, so this scenario is
-/// also the proof that the recommendation works.
+/// Serve a speech model on Lemonade and wait until it is ready.
 ///
 /// The serve's own readiness wait is short, and a cold lane spends longer than
-/// that downloading the model and the whisper.cpp backend, so a launch that
-/// returns before it is ready is followed by polling `rocm services list`,
-/// whose readiness check sends a transcription, until the service reports
-/// ready or the scenario's serve timeout runs out.
-#[when("the user serves a speech-to-text model with the engine the CLI recommended")]
-async fn serve_speech_model_on_lemonade(world: &mut E2eWorld) {
+/// that downloading the model and its backend, so a launch that returns before
+/// it is ready is followed by polling `rocm services list` (whose readiness
+/// check sends a real request for the task) until the service reports ready or
+/// the scenario's serve timeout runs out.
+async fn serve_speech_model(world: &mut E2eWorld, model_ref: &str, model_id: &str, task: &str) {
     let device_state = crate::e2e::serving_steps::ensure_serve_port_free().await;
     crate::e2e::service_docs_steps::give_api_docs_a_port_of_their_own(world);
-    let args = ["serve", SPEECH_MODEL_REF, "--engine", "lemonade"];
+    let args = ["serve", model_ref, "--engine", "lemonade"];
     let (stdout, stderr, rc) = crate::run_rocm(world, &args);
     let timeout =
         std::time::Duration::from_secs(crate::e2e::serving_steps::serve_timeout_for(world));
     let started = std::time::Instant::now();
+    let listed_task = format!("task: {task}");
     let mut ready = rc == 0 && stdout.lines().any(|line| line.trim() == "readiness: ready");
     while rc == 0 && !ready && started.elapsed() < timeout {
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         let (listing, _, _) = crate::run_rocm(world, &["services", "list"]);
-        ready = listing.contains("status: ready") && listing.contains("task: speech-to-text");
+        ready = listing.contains("status: ready") && listing.contains(&listed_task);
     }
     if !ready {
         let outcome = if rc == 0 {
@@ -271,7 +273,19 @@ async fn serve_speech_model_on_lemonade(world: &mut E2eWorld) {
     }
     world.serve_stdout = Some(stdout.clone());
     record_cli(world, (stdout, stderr, rc));
-    world.model_name = Some(SPEECH_MODEL_ID.to_owned());
+    world.model_name = Some(model_id.to_owned());
+}
+
+/// Exactly the command the chat-only refusal recommends, so this scenario is
+/// also the proof that the recommendation works.
+#[when("the user serves a speech-to-text model with the engine the CLI recommended")]
+async fn serve_speech_model_on_lemonade(world: &mut E2eWorld) {
+    serve_speech_model(world, SPEECH_MODEL_REF, SPEECH_MODEL_ID, "speech-to-text").await;
+}
+
+#[when("the user serves a text-to-speech model on Lemonade")]
+async fn serve_tts_model_on_lemonade(world: &mut E2eWorld) {
+    serve_speech_model(world, TTS_MODEL_REF, "OpenMOSS-TTS", "text-to-speech").await;
 }
 
 #[when("the user asks the chat CLI to use the speech-to-text model")]
@@ -292,6 +306,48 @@ async fn chat_with_speech_model(world: &mut E2eWorld) {
 }
 
 // ── Then ───────────────────────────────────────────────────────────
+
+#[when("the user serves a text-to-speech model on an engine that only serves chat")]
+async fn serve_tts_model_on_chat_only_engine(world: &mut E2eWorld) {
+    let result = crate::run_rocm(world, &["serve", TTS_MODEL_REF, "--engine", "vllm"]);
+    record_cli(world, result);
+}
+
+#[then("serving is refused because that engine cannot serve text-to-speech models")]
+async fn tts_refused_for_engine(world: &mut E2eWorld) {
+    let rc = world.cli_rc.expect("no serve rc recorded");
+    let text = cli_text(world);
+    assert_ne!(rc, 0, "serving must be refused:\n{text}");
+    assert!(
+        text.contains("is a text-to-speech model, which the vllm engine cannot serve"),
+        "the refusal must give the reason:\n{text}"
+    );
+    assert!(
+        !text.to_lowercase().contains("no usable amd gpu"),
+        "the reason must not be hidden behind the GPU check:\n{text}"
+    );
+}
+
+#[then("the user is told the command that serves the text-to-speech model with Lemonade")]
+async fn told_tts_lemonade_command(world: &mut E2eWorld) {
+    let text = cli_text(world);
+    // serve-29 runs this exact command on the nightly GPU lane and hears it.
+    assert!(
+        text.contains(&format!("rocm serve {TTS_MODEL_REF} --engine lemonade")),
+        "expected the working command in:\n{text}"
+    );
+}
+
+#[then("the running service is listed as text-to-speech")]
+async fn running_service_listed_as_tts(world: &mut E2eWorld) {
+    let (listing, _, _) = crate::run_rocm(world, &["services", "list"]);
+    assert!(
+        listing.contains("task: text-to-speech")
+            && listing.contains("text-to-speech endpoint:")
+            && listing.contains("status: ready"),
+        "the served model must be listed as a ready text-to-speech service:\n{listing}"
+    );
+}
 
 #[then("serving is refused because that engine cannot serve speech-to-text models")]
 async fn refused_for_engine(world: &mut E2eWorld) {
@@ -333,6 +389,54 @@ async fn prints_speech_endpoint(world: &mut E2eWorld) {
         "the printed endpoint must be the transcription route, got {url}"
     );
     world.endpoint = Some(url);
+}
+
+#[then("the CLI prints the text-to-speech endpoint of the served model")]
+async fn prints_tts_endpoint(world: &mut E2eWorld) {
+    let text = cli_text(world);
+    let url = printed_url(
+        world.cli_output.as_deref().unwrap_or_default(),
+        "text-to-speech endpoint",
+    )
+    .unwrap_or_else(|| panic!("no text-to-speech endpoint printed:\n{text}"));
+    assert!(
+        url.ends_with("/v1/audio/speech"),
+        "the printed endpoint must be the speech route, got {url}"
+    );
+    world.endpoint = Some(url);
+}
+
+#[then("text sent to that endpoint comes back as spoken audio")]
+async fn text_comes_back_as_audio(world: &mut E2eWorld) {
+    let url = world
+        .endpoint
+        .clone()
+        .expect("no printed endpoint recorded");
+    let model = world.model_name.clone().expect("no model name recorded");
+    let response = reqwest::Client::new()
+        .post(&url)
+        .json(&serde_json::json!({
+            "model": model,
+            "input": "Hello from ROCm.",
+            "response_format": "wav"
+        }))
+        .timeout(std::time::Duration::from_mins(5))
+        .send()
+        .await
+        .unwrap_or_else(|error| panic!("speech request to {url} failed: {error:?}"));
+    let status = response.status().as_u16();
+    let audio = response.bytes().await.unwrap_or_default();
+    assert_eq!(
+        status,
+        200,
+        "speech at {url} failed: {}",
+        String::from_utf8_lossy(&audio)
+    );
+    assert!(
+        audio.starts_with(b"RIFF") && audio.len() > 44,
+        "expected a WAV file with samples, got {} bytes",
+        audio.len()
+    );
 }
 
 #[then("a recording sent to that endpoint is transcribed")]

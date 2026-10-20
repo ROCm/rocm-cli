@@ -541,6 +541,16 @@ fn ready_local_services(paths: &AppPaths) -> Result<Vec<ManagedServiceRecord>> {
         if record.refresh_from_engine_state().unwrap_or(false) {
             let _ = record.write();
         }
+        // Chat never uses another kind of server, so it is never probed here:
+        // a speech probe can take far longer than a chat one, and every chat
+        // command would wait on it. It is still returned by its recorded
+        // status, so naming it as the chat model is refused with the reason.
+        if !record.task.is_chat() {
+            if matches!(record.status.as_str(), "ready" | "running") {
+                services.push(record);
+            }
+            continue;
+        }
         // Probe with the service's key so a protected public service is not
         // filtered out here (an anonymous /v1/models would 401) before
         // `LocalProvider` can send the bearer token.
@@ -2262,6 +2272,50 @@ mod tests {
         assert_eq!(audit.category, "provider");
         assert_eq!(audit.actor, "provider:local");
         assert_eq!(audit.action, "chat");
+        Ok(())
+    }
+
+    #[test]
+    fn chat_never_contacts_a_text_to_speech_service_yet_refuses_it_by_name() -> Result<()> {
+        let (root, paths) = temp_app_paths("local-provider-tts-service");
+        paths.ensure()?;
+        let server = spawn_models_only_server("OpenMOSS-TTS")?;
+
+        let mut tts = ManagedServiceRecord::new(
+            &paths,
+            "svc-tts",
+            "lemonade",
+            "tts",
+            "OpenMOSS-TTS",
+            "127.0.0.1",
+            server.port(),
+            "managed",
+            123,
+            None,
+            None,
+            None,
+        );
+        tts.task = rocm_core::ModelTask::Speech;
+        tts.status = "ready".to_owned();
+        tts.write()?;
+
+        let error = select_local_chat_service(&paths, Some("OpenMOSS-TTS"))
+            .expect_err("a text-to-speech service is not a chat target")
+            .to_string();
+        let status = LocalProvider { paths: &paths }.status()?;
+        let contacted = server.stop()?;
+        let _ = std::fs::remove_dir_all(root);
+
+        assert!(
+            error.contains("is served by `svc-tts` as a text-to-speech model, not a chat model"),
+            "{error}"
+        );
+        assert!(status.models.is_empty(), "{:?}", status.models);
+        // A text-to-speech probe can take 30 s; chat must not pay it.
+        assert_eq!(
+            contacted, 0,
+            "chat sent requests to the text-to-speech server"
+        );
         Ok(())
     }
 

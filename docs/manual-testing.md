@@ -309,6 +309,16 @@ Expected result:
 - `rocm serve whisper-tiny --engine vllm` is refused before any GPU check and
   names `rocm serve whisper-tiny --engine lemonade`.
 
+Text-to-speech, on a GPU with about 14 GiB free (a 12.5 GB download):
+
+```powershell
+rocm serve tts
+curl.exe http://127.0.0.1:11435/v1/audio/speech -H "Content-Type: application/json" -d "{\"model\":\"OpenMOSS-TTS\",\"input\":\"Hello from ROCm.\",\"response_format\":\"wav\"}" -o hello.wav
+```
+
+Expected result: `hello.wav` plays the sentence, the summary names the
+`text-to-speech` task, and `rocm services` lists a `text-to-speech endpoint`.
+
 Confirm the GPU did the work by watching GPU utilization (`amd-smi metric` on
 Linux, Task Manager's GPU graph on Windows) while transcribing a recording of a
 minute or more. Do not rely on the `device` field of Lemonade's own
@@ -659,6 +669,10 @@ Expected result:
 - For a speech-to-text server (`rocm serve whisper`), the page lists
   `POST /v1/audio/transcriptions` and no chat routes; choosing a WAV file under
   "Try it out" and pressing "Execute" returns its transcript.
+- For a text-to-speech server (`rocm serve tts`), the page lists
+  `POST /v1/audio/speech`; "Execute" with the example body returns audio the
+  page offers as a download (`speech.wav`), and the downloaded file plays the
+  sentence.
 - For a server started with `--require-api-key` (an endpoint key), "Execute"
   is refused until the key is entered under "Authorize".
 - After `rocm services stop <service-id> --yes`, reloading the page says the
