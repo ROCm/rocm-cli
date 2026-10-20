@@ -213,6 +213,66 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn a_failed_send_is_returned_without_waiting() {
+        let mut waits = 0;
+        let error = quit_and_wait(
+            &mut waits,
+            "q",
+            RetryTiming {
+                timeout: Duration::from_secs(1),
+                resend_interval: Duration::from_millis(10),
+            },
+            |_| false,
+            |_, _| Err("pty closed".to_string()),
+            |waits, _| {
+                *waits += 1;
+                Box::pin(async { ExitPoll::Running })
+            },
+        )
+        .await
+        .expect_err("a failed send must fail");
+
+        assert_eq!(error, QuitError::Failed("pty closed".to_string()));
+        assert_eq!(
+            waits, 0,
+            "nothing was sent, so there is nothing to wait for"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_wait_longer_than_the_time_left_is_cut_to_the_deadline() {
+        // Without the clamp a wait runs its whole interval past the deadline,
+        // and with doubling that can be as long as the timeout itself.
+        let timeout = Duration::from_millis(100);
+        let started = Instant::now();
+        let error = quit_and_wait(
+            &mut (),
+            "q",
+            RetryTiming {
+                timeout,
+                resend_interval: Duration::from_secs(5),
+            },
+            |()| false,
+            |(), _| Ok(()),
+            |(), budget| {
+                Box::pin(async move {
+                    tokio::time::sleep(budget).await;
+                    ExitPoll::Running
+                })
+            },
+        )
+        .await
+        .expect_err("a child that never exits must time out");
+
+        assert_eq!(error, QuitError::TimedOut);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the wait must stop at the {timeout:?} deadline, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn a_child_that_never_exits_times_out() {
         let error = quit_and_wait(
             &mut (),
