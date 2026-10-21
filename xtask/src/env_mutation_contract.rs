@@ -20,7 +20,7 @@
 //!
 //! "the Linux lanes use nextest" would be too strong: `coverage`
 //! (`cargo llvm-cov`, no `--nextest`) and `e2e` (`cargo test -p e2e-cucumber
-//! --lib`) are threaded single-process harnesses on `ubuntu-latest` too. They
+//! --lib`) are threaded single-process harnesses on the hosted Ubuntu runners too. They
 //! happen not to reach the crates that raced, which is luck rather than
 //! design — so this guard covers the whole tree rather than one crate.
 //!
