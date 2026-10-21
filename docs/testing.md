@@ -1596,6 +1596,35 @@ rocm --bin rocm wsl_rocdxg`). Running it end to end needs a WSL2 host with
 `/dev/dxg` and dxcore present, since the plan refuses before installing
 otherwise.
 
+## Bare-metal driver install
+
+On Linux bare metal, `rocm install driver` defaults to the floating `latest`
+amdgpu release; `ROCM_CLI_AMDGPU_DRIVER_VERSION` overrides it (replacing the
+retired `ROCM_CLI_AMDGPU_VERSION`/`ROCM_CLI_AMDGPU_PACKAGE_RELEASE` pair). An
+override that isn't a plain version token is refused rather than silently
+falling back, since it is interpolated into privileged shell commands:
+
+```bash
+cargo test -p rocm --bin rocm driver_install
+```
+
+`driver-install-04` in
+[driver_install.feature](../tests/e2e-cucumber/features/driver_install.feature)
+asserts the apt repo file and signing key this plan writes on a real bare-metal
+Linux host. `examine --json`'s `rocm_install_method` also renamed
+`amdgpu-install` to `repo-native` and `tarball-or-other` to
+`runfile-or-tarball`; see `examine-29` in
+[examine.feature](../tests/e2e-cucumber/features/examine.feature).
+
+On Ubuntu 26.04, `repo.radeon.com` does not yet publish a matching `resolute`
+DKMS repo (the amdgpu driver ships in-tree instead), so the plan comes back
+`supported: false` and directs the user to `apt install rocm`. This arm is
+covered at the unit level by
+`driver_plan_ubuntu_2604_uses_native_archive_guidance` and its two neighbors in
+`driver_install.rs`, but has no e2e/Gherkin coverage: `read_os_release()` reads
+the live `/etc/os-release` with no override, so no lane or host running a
+different Ubuntu release can reach this arm through the CLI itself.
+
 ## /etc/os-release
 
 Every Rust reader of `/etc/os-release` parses it with

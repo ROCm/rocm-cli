@@ -18,6 +18,49 @@ async fn preview_wsl_driver_install(world: &mut E2eWorld) {
     world.cli_rc = Some(rc);
 }
 
+#[when("the user previews driver installation on this host")]
+async fn preview_driver_install_on_this_host(world: &mut E2eWorld) {
+    // `--dkms` is required here: every driver-plan builder gates its entire
+    // command list (repo setup, signing key, package install) behind
+    // `dkms`, so a plan built without it is empty and the apt-repo-file/key
+    // assertion below would have nothing to find.
+    let (stdout, stderr, rc) =
+        crate::run_rocm_with_env(world, &["install", "driver", "--dkms", "--dry-run"], &[]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the driver plan writes an apt repo file with AMD's signing key")]
+async fn assert_apt_repo_file_and_key(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no driver plan output");
+    // The runner may already be root (the self-hosted WSL runner always is),
+    // in which case the plan omits the `sudo ` prefix entirely.
+    let sudo = if rocm_core::openmpi::running_as_root() {
+        ""
+    } else {
+        "sudo "
+    };
+    assert!(
+        output.contains("policy: linux_official_amd_dkms_wrapper"),
+        "{output}"
+    );
+    assert!(
+        output.contains(&format!(
+            "curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key | {sudo}gpg --dearmor -o /etc/apt/keyrings/rocm.gpg"
+        )),
+        "{output}"
+    );
+    assert!(
+        output.contains("signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/amdgpu/"),
+        "{output}"
+    );
+    assert!(
+        output.contains("tee /etc/apt/sources.list.d/amdgpu.list >/dev/null"),
+        "{output}"
+    );
+}
+
 #[when("the user reviews driver installation on this WSL host without approval")]
 async fn review_wsl_driver_install_without_approval(world: &mut E2eWorld) {
     let (stdout, stderr, rc) = crate::run_rocm_with_env(world, &["install", "driver"], &[]);

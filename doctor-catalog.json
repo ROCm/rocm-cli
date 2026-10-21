@@ -187,7 +187,7 @@
     },
     {
       "id": "fix-12-installer",
-      "title": "Reset amdgpu-install state and reinstall",
+      "title": "Reset repo-native install state and reinstall",
       "platforms": [
         {
           "os": "linux",

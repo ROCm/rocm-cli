@@ -321,7 +321,7 @@ const RECIPES: &[FixRecipe] = &[
     FixRecipe {
         fix_id: "fix-3-rocm-kernel",
         title: "ROCm/distro/kernel triple unsupported",
-        rationale: "ROCm is installed but your kernel/distro combination is outside the supported matrix. Match the kernel to the matrix before reinstalling, or rerun with --no-dkms and accept the risk.",
+        rationale: "ROCm is installed but your kernel/distro combination is outside the supported matrix. Match the kernel to the matrix first, then rerun `rocm install driver --dkms`. To avoid the DKMS build entirely, use `rocm install sdk` instead: it installs the userspace ROCm stack without touching the kernel module.",
         commands: &[
             "# Cross-check the live AMD matrix before changing anything:",
             "#   https://rocm.docs.amd.com/projects/install-on-linux/en/latest/reference/system-requirements.html",
@@ -330,7 +330,7 @@ const RECIPES: &[FixRecipe] = &[
         needs_sudo: false,
         needs_reboot: true,
         needs_relogin: false,
-        verify: "lsmod | grep amdgpu && rocminfo | head -n 5",
+        verify: "lsmod | grep amdgpu && rocminfo | head -n 20",
         notes: &[],
         doc_url: Some(
             "https://rocm.docs.amd.com/projects/install-on-linux/en/latest/reference/system-requirements.html",
@@ -406,15 +406,24 @@ const RECIPES: &[FixRecipe] = &[
         title: "Quarantine duplicate AMD repos",
         rationale: "More than one ROCm/AMDGPU repo file exists. The package manager is mixing versions; quarantine the extras before reinstalling.",
         commands: &[
-            "ls /etc/apt/sources.list.d/ | grep -iE 'rocm|amdgpu|radeon'",
+            "# Run only the line matching your package manager:",
+            "ls /etc/apt/sources.list.d/ | grep -iE 'rocm|amdgpu|radeon' || true   # Debian/Ubuntu",
+            "ls /etc/yum.repos.d/ | grep -iE 'rocm|amdgpu|radeon' || true          # RHEL/Fedora/Rocky/Alma/Oracle",
+            "ls /etc/zypp/repos.d/ | grep -iE 'rocm|amdgpu|radeon' || true         # SLES/openSUSE",
             "# For each duplicate file:",
-            "sudo mv /etc/apt/sources.list.d/<file>.list /etc/apt/sources.list.d/<file>.list.bak",
-            "sudo apt update",
+            "sudo mv /etc/apt/sources.list.d/<file>.list /etc/apt/sources.list.d/<file>.list.bak   # or the yum/zypp equivalent",
+            "# Run only the line matching your package manager:",
+            "sudo apt update      # Debian/Ubuntu",
+            "sudo dnf clean all   # RHEL/Fedora/Rocky/Alma/Oracle",
+            "sudo zypper refresh  # SLES/openSUSE",
         ],
         needs_sudo: true,
         needs_reboot: false,
         needs_relogin: false,
-        verify: "sudo apt update 2>&1 | tail -n 20",
+        verify: "Run only the line matching your package manager:\n\
+                 sudo apt update 2>&1 | tail -n 20      # Debian/Ubuntu\n\
+                 sudo dnf clean all 2>&1 | tail -n 20   # RHEL/Fedora/Rocky/Alma/Oracle\n\
+                 sudo zypper refresh 2>&1 | tail -n 20  # SLES/openSUSE",
         notes: &[],
         doc_url: None,
         applies_on: PRINT_ON_LINUX,
@@ -513,20 +522,30 @@ const RECIPES: &[FixRecipe] = &[
     },
     FixRecipe {
         fix_id: "fix-12-installer",
-        title: "Reset amdgpu-install state and reinstall",
-        rationale: "amdgpu-install left a half-configured DKMS / repo state. Run the documented uninstall, clean up, and reinstall without the flag that broke things (commonly --accept-eula on newer installers).",
+        title: "Reset repo-native install state and reinstall",
+        rationale: "The repo-native package-manager install left a half-configured DKMS / repo state. Clear the broken package state, quarantine the repo files rocm-cli's install wrote, let the package manager forget the broken state, then reinstall via rocm-cli's own repo-native flow.",
         commands: &[
-            "sudo amdgpu-install --uninstall",
-            "sudo apt autoremove --purge -y",
-            "sudo apt update",
-            "sudo amdgpu-install --usecase=rocm,hip",
+            "# Run only the block matching your package manager. On Debian/Ubuntu, run all",
+            "# three lines even if an earlier one reports an error -- the purge must not",
+            "# be skipped just because the half-configured state made `install -f` fail:",
+            "sudo dpkg --configure -a      # Debian/Ubuntu",
+            "sudo apt-get install -f       # Debian/Ubuntu",
+            "sudo apt-get purge -y amdgpu-dkms   # Debian/Ubuntu",
+            "sudo dnf remove -y amdgpu-dkms                                                             # RHEL/Fedora/Rocky/Alma/Oracle",
+            "sudo zypper remove -y amdgpu-dkms                                                          # SLES/openSUSE",
+            "# sudo mv /etc/apt/sources.list.d/amdgpu.list /etc/apt/sources.list.d/amdgpu.list.bak       # or the yum/zypp equivalent; quarantine, do not delete yet",
+            "# Run only the line matching your package manager:",
+            "sudo apt update      # Debian/Ubuntu",
+            "sudo dnf clean all   # RHEL/Fedora/Rocky/Alma/Oracle",
+            "sudo zypper refresh  # SLES/openSUSE",
+            "rocm install driver --dkms --yes",
         ],
         needs_sudo: true,
         needs_reboot: true,
         needs_relogin: false,
-        verify: "dpkg -l | grep -E 'rocm|amdgpu' | head -n 20 && rocminfo | head -n 5",
+        verify: "(dpkg -l 2>/dev/null | grep -qE 'rocm|amdgpu' || rpm -qa 2>/dev/null | grep -qE 'rocm|amdgpu') && rocminfo | head -n 5",
         notes: &[
-            "If `apt autoremove --purge` warns it will remove unrelated packages, stop and resolve those by hand before continuing.",
+            "If the purge/remove step warns it will take unrelated packages with it, stop and resolve those by hand before continuing.",
         ],
         doc_url: None,
         applies_on: PRINT_ON_LINUX,
@@ -3638,6 +3657,215 @@ mod tests {
             named.iter().any(|f| f.contains("--device-index")),
             "the catalog knows which argument fix-9-igpu-dgpu waits for, so the flags line \
              has to say it: {named:?}"
+        );
+    }
+
+    #[test]
+    fn fix_7_apt_commands_match_the_diagnose_copy_verbatim() {
+        // Same drift guard as fix_12_apt_commands_match_the_diagnose_copy_verbatim:
+        // diagnose.rs builds its own per-family command list for fix-7 rather than
+        // reusing this recipe, so drive diagnose() itself instead of comparing
+        // against a hardcoded literal that can't detect diagnose.rs drifting.
+        let e = crate::examine::Examination {
+            os_family: "linux".to_owned(),
+            distro_id: "ubuntu".to_owned(),
+            rocm_repos_seen: vec![
+                "/etc/apt/sources.list.d/rocm.list".to_owned(),
+                "/etc/apt/sources.list.d/amdgpu.list".to_owned(),
+            ],
+            ..crate::examine::Examination::default()
+        };
+        let report = crate::diagnose::diagnose(&e, "stale repo conflict");
+        let hit = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-7-stale-repos")
+            .expect("duplicate repo files should be diagnosed");
+        let diagnose_apt_list_cmd = hit
+            .fix
+            .as_ref()
+            .unwrap()
+            .commands
+            .first()
+            .expect("fix-7 always lists the repo dir first on a recognized family")
+            .as_str();
+
+        let recipe = RECIPES
+            .iter()
+            .find(|r| r.fix_id == "fix-7-stale-repos")
+            .expect("fix-7-stale-repos recipe must exist");
+        let recipe_apt_list_cmd = recipe
+            .commands
+            .iter()
+            .find(|c| c.trim_end().ends_with("# Debian/Ubuntu") && c.contains("ls /etc/apt"))
+            .map(|c| c.split('#').next().unwrap().trim_end())
+            .expect("recipe must have a commented apt list line");
+        assert_eq!(
+            recipe_apt_list_cmd, diagnose_apt_list_cmd,
+            "this recipe's apt list command must match what diagnose.rs's apt family actually emits for fix-7-stale-repos"
+        );
+
+        // `verify` must also track diagnose.rs's per-family text, not just
+        // `commands`: diagnose.rs varies `verify` by family too, so compare
+        // each family's line against what diagnose() actually emits for it.
+        for (family_repo_dir, marker) in [
+            ("/etc/apt/sources.list.d/", "# Debian/Ubuntu"),
+            ("/etc/yum.repos.d/", "# RHEL/Fedora/Rocky/Alma/Oracle"),
+            ("/etc/zypp/repos.d/", "# SLES/openSUSE"),
+        ] {
+            let e = crate::examine::Examination {
+                os_family: "linux".to_owned(),
+                distro_id: "ubuntu".to_owned(),
+                rocm_repos_seen: vec![
+                    format!("{family_repo_dir}rocm.repo"),
+                    format!("{family_repo_dir}amdgpu.repo"),
+                ],
+                ..crate::examine::Examination::default()
+            };
+            let report = crate::diagnose::diagnose(&e, "stale repo conflict");
+            let hit = report
+                .matched
+                .iter()
+                .find(|d| d.id == "fix-7-stale-repos")
+                .expect("duplicate repo files should be diagnosed");
+            let diagnose_verify = hit.fix.as_ref().unwrap().verify.as_str();
+
+            let recipe_verify_line = recipe
+                .verify
+                .lines()
+                .find(|l| l.trim_end().ends_with(marker))
+                .map_or_else(
+                    || panic!("recipe verify must have a line for {marker}"),
+                    |l| l.split('#').next().unwrap().trim(),
+                );
+            assert_eq!(
+                recipe_verify_line, diagnose_verify,
+                "this recipe's {marker} verify line must match what diagnose.rs emits for fix-7-stale-repos"
+            );
+        }
+    }
+
+    #[test]
+    fn fix_12_recipe_clears_state_before_reinstall_and_keeps_mv_commented() {
+        let recipe = RECIPES
+            .iter()
+            .find(|r| r.fix_id == "fix-12-installer")
+            .expect("fix-12-installer recipe must exist");
+        let commands = recipe.commands.join("\n");
+        assert!(
+            commands.contains("dpkg --configure -a"),
+            "must clear the half-configured dpkg state before reinstalling: {commands}"
+        );
+        assert!(
+            commands.contains("purge -y amdgpu-dkms"),
+            "must purge the broken driver package: {commands}"
+        );
+        assert!(
+            commands.contains("# sudo mv /etc/apt/sources.list.d/amdgpu.list"),
+            "repo quarantine command must be commented out, not ready-to-run: {commands}"
+        );
+        assert!(
+            commands.contains("rocm install driver --dkms --yes"),
+            "reinstall command must actually install (bare 'rocm install driver' is a non-mutating preflight no-op): {commands}"
+        );
+        assert!(
+            recipe.verify.contains("dpkg") && recipe.verify.contains("rpm"),
+            "verify must query real dpkg/rpm package state, not the self-reported \
+             rocm_install_method marker (that marker is set from repo-file presence \
+             before the package actually installs): {}",
+            recipe.verify
+        );
+        assert!(
+            !recipe
+                .commands
+                .iter()
+                .any(|c| c.contains("configure -a &&") || c.contains("install -f &&")),
+            "the apt block must not chain configure/install -f into the purge with `&&`: \
+             a failure there must not skip the purge: {commands}"
+        );
+    }
+
+    #[test]
+    fn fix_3_verify_matches_the_diagnose_copy_verbatim() {
+        // No drift guard previously existed between this recipe and
+        // diagnose.rs's `check_3_rocm_kernel_unsupported` for fix-3 (unlike
+        // fix-7/fix-12's `commands`, fix-3's `commands` legitimately differ --
+        // diagnose.rs injects the host's live kernel/distro/rocm values into a
+        // comment this host-unaware recipe can't know -- but `verify` has no
+        // such excuse to diverge).
+        let e = crate::examine::Examination {
+            os_family: "linux".to_owned(),
+            rocm_version: "6.4.1".to_owned(),
+            amdgpu_loaded: Some(false),
+            ..crate::examine::Examination::default()
+        };
+        let report = crate::diagnose::diagnose(&e, "");
+        let hit = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-3-rocm-kernel")
+            .expect("rocm installed with amdgpu not loaded should be diagnosed");
+        let diagnose_verify = hit.fix.as_ref().unwrap().verify.as_str();
+
+        let recipe = RECIPES
+            .iter()
+            .find(|r| r.fix_id == "fix-3-rocm-kernel")
+            .expect("fix-3-rocm-kernel recipe must exist");
+        assert_eq!(
+            recipe.verify, diagnose_verify,
+            "this recipe's verify step must match what diagnose.rs emits for fix-3-rocm-kernel"
+        );
+    }
+
+    #[test]
+    fn fix_12_apt_commands_match_the_diagnose_copy_verbatim() {
+        // `crate::diagnose` builds its own apt command list for fix-12 rather
+        // than reusing this recipe (it branches per detected package-manager
+        // family, which this catalog entry cannot do -- it prints guidance for
+        // every family at once). Drive `diagnose()` itself so a drift between
+        // the two copies actually fails this test, rather than comparing
+        // against a hardcoded literal that can't detect diagnose.rs changing
+        // out from under it.
+        let e = crate::examine::Examination {
+            os_family: "linux".to_owned(),
+            distro_id: "ubuntu".to_owned(),
+            rocm_install_method: "repo-native".to_owned(),
+            ..crate::examine::Examination::default()
+        };
+        let report = crate::diagnose::diagnose(
+            &e,
+            "dpkg: error processing package amdgpu-dkms (half-configured)",
+        );
+        let hit = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-12-installer")
+            .expect("repo-native broken state should be diagnosed");
+        let diagnose_apt_commands: Vec<&str> = hit
+            .fix
+            .as_ref()
+            .unwrap()
+            .commands
+            .iter()
+            .map(String::as_str)
+            .filter(|c| !c.trim_start().starts_with('#'))
+            .take(3)
+            .collect();
+
+        let recipe = RECIPES
+            .iter()
+            .find(|r| r.fix_id == "fix-12-installer")
+            .expect("fix-12-installer recipe must exist");
+        let apt_commands_without_trailing_comment: Vec<&str> = recipe
+            .commands
+            .iter()
+            .filter(|c| c.trim_end().ends_with("# Debian/Ubuntu"))
+            .map(|c| c.split('#').next().unwrap().trim_end())
+            .take(3)
+            .collect();
+        assert_eq!(
+            apt_commands_without_trailing_comment, diagnose_apt_commands,
+            "this recipe's apt lines must match what diagnose.rs's apt family actually emits for fix-12-installer"
         );
     }
 }
