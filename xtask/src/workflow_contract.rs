@@ -1064,6 +1064,232 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
         }
     }
 
+    /// Every workflow file as `(file name, text)`, read from the directory
+    /// rather than from a list, so a workflow added later is covered too.
+    fn all_workflows() -> Vec<(String, String)> {
+        let dir = repo_root().join(".github/workflows");
+        let mut names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", dir.display()))
+            .map(|entry| entry.expect("workflow dir entry").file_name())
+            .map(|name| name.to_string_lossy().into_owned())
+            .filter(|name| {
+                Path::new(name).extension().is_some_and(|ext| {
+                    ext.eq_ignore_ascii_case("yml") || ext.eq_ignore_ascii_case("yaml")
+                })
+            })
+            .collect();
+        names.sort();
+        names
+            .into_iter()
+            .map(|name| {
+                let text = read_workflow(&name);
+                (name, text)
+            })
+            .collect()
+    }
+
+    /// The ids of every job in a workflow's `jobs:` block, in file order.
+    fn workflow_job_ids(text: &str) -> Vec<String> {
+        top_level_block(text, "jobs")
+            .lines()
+            .filter(|line| indent_of(line) == 2 && !line.trim_start().starts_with('#'))
+            .filter_map(|line| line.trim().strip_suffix(':'))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// `(line number, line)` for every line naming `ubuntu-latest` outside a
+    /// comment, wherever it sits: a `runs-on`, a matrix list, an `include`.
+    fn moving_ubuntu_label_lines(text: &str) -> Vec<(usize, String)> {
+        text.lines()
+            .enumerate()
+            .filter(|(_, line)| !line.trim_start().starts_with('#'))
+            .filter(|(_, line)| strip_comment(line).contains("ubuntu-latest"))
+            .map(|(i, line)| (i + 1, line.trim().to_owned()))
+            .collect()
+    }
+
+    /// No hosted job may run on `ubuntu-latest`.
+    ///
+    /// The label moves. When GitHub repointed it from ubuntu-24.04 to
+    /// ubuntu-26.04, every merge-group run went red overnight on a change
+    /// nobody in this repository made: 26.04's uutils coreutils broke the
+    /// reclaim decoys. Linux jobs name their images instead — the test and build
+    /// jobs run on both LTS releases, the rest on one — so a new release is
+    /// adopted by an edit to this repository, which CI then exercises.
+    #[test]
+    fn no_workflow_runs_on_the_moving_ubuntu_latest_label() {
+        let workflows = all_workflows();
+        assert!(
+            workflows.iter().any(|(name, _)| name == "ci.yml"),
+            "expected ci.yml among the workflows (directory scan sanity check)"
+        );
+        for (name, text) in workflows {
+            let hits = moving_ubuntu_label_lines(&text);
+            assert!(
+                hits.is_empty(),
+                "{name} names `ubuntu-latest`, which GitHub repoints to each new Ubuntu \
+                 release without notice; name `ubuntu-24.04` and/or `ubuntu-26.04` instead \
+                 (lines: {hits:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn moving_ubuntu_label_detector_flags_values_but_not_comments() {
+        let yaml = "\
+jobs:
+  # ubuntu-latest moved under us once; see the contract test.
+  a:
+    runs-on: ubuntu-24.04 # not ubuntu-latest
+  b:
+    runs-on: ubuntu-latest
+  c:
+    strategy:
+      matrix:
+        os: [ubuntu-24.04, ubuntu-latest]
+";
+        let hits = moving_ubuntu_label_lines(yaml);
+        assert_eq!(
+            hits,
+            vec![
+                (6, "runs-on: ubuntu-latest".to_owned()),
+                (10, "os: [ubuntu-24.04, ubuntu-latest]".to_owned()),
+            ]
+        );
+    }
+
+    /// The `ci.yml` jobs that run on both Ubuntu LTS images, with the name each
+    /// reported before the split. Branch protection requires these names
+    /// verbatim, so the 24.04 leg must keep reporting them.
+    const LTS_SPLIT_JOBS: [(&str, &str); 4] = [
+        ("build-and-test", "build-and-test"),
+        ("test", "Test (affected crates)"),
+        ("e2e", "E2E tests"),
+        ("remote-ssh", "remote control channel (containerised)"),
+    ];
+
+    /// A split job keeps its required check, and also runs on 26.04.
+    ///
+    /// A plain matrix renames every leg to `<name> (<os>)`, so the bare name
+    /// branch protection waits for would never report and every pull request
+    /// would sit on a missing required check. The 24.04 leg therefore keeps the
+    /// bare name and only the 26.04 leg gets a suffix.
+    #[test]
+    fn lts_split_jobs_keep_their_required_name_on_24_04() {
+        let ci = read_workflow("ci.yml");
+        for (job, context) in LTS_SPLIT_JOBS {
+            let block = job_block(&ci, job);
+            let expected = format!(
+                "name: ${{{{ matrix.os == 'ubuntu-24.04' && '{context}' || \
+                 format('{context} ({{0}})', matrix.os) }}}}"
+            );
+            assert!(
+                block.lines().any(|line| line.trim() == expected),
+                "ci.yml job `{job}` must report as `{context}` on ubuntu-24.04 — the name \
+                 branch protection requires — and with an image suffix on ubuntu-26.04; \
+                 expected the line `{expected}`"
+            );
+            assert_eq!(
+                flattened_values(block, "runs-on"),
+                vec!["${{ matrix.os }}".to_owned()],
+                "ci.yml job `{job}` must run on its matrix image"
+            );
+            let os = flattened_values(block, "os");
+            assert_eq!(
+                os.len(),
+                1,
+                "ci.yml job `{job}` declares one `os` matrix axis"
+            );
+            assert_eq!(
+                flattened_list_items(&os[0]),
+                vec!["ubuntu-24.04".to_owned(), "ubuntu-26.04".to_owned()],
+                "ci.yml job `{job}` must run on both Ubuntu LTS images"
+            );
+            assert!(
+                block.lines().any(|line| line.trim() == "fail-fast: false"),
+                "ci.yml job `{job}`: one image failing must not cancel the other's leg"
+            );
+        }
+    }
+
+    /// The runner image a hosted Linux job's caches must be keyed by, as it
+    /// appears in a key: the literal image, or `matrix.os` for a split job.
+    /// `None` for a job that is not a hosted Linux job.
+    fn hosted_linux_image_token(job_block_text: &str) -> Option<String> {
+        let runs_on = flattened_values(job_block_text, "runs-on");
+        let value = runs_on.first()?;
+        if value == "${{ matrix.os }}" {
+            Some("matrix.os".to_owned())
+        } else if value.starts_with("ubuntu-") {
+            Some(value.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Every compiled-artifact cache on a hosted Linux job is keyed by the
+    /// runner image.
+    ///
+    /// rust-cache keys on the OS family and architecture only ("Linux-x64"),
+    /// and sccache on the compiler binary, which is the same rustup download on
+    /// every image. Without the image in the key, a target dir or a proc macro
+    /// linked against 26.04's glibc is restored on 24.04, where it cannot load.
+    /// Covers `setup-rust-toolchain`'s `cache-key` (unless caching is off), the
+    /// sccache key prefix, and `actions/cache` keys over cargo output; the
+    /// manylinux release caches are exempt, as those builds run in a container.
+    #[test]
+    fn hosted_linux_compile_caches_are_keyed_by_runner_image() {
+        let mut checked = 0;
+        for (name, text) in all_workflows() {
+            for job in workflow_job_ids(&text) {
+                let block = job_block(&text, &job);
+                let Some(image) = hosted_linux_image_token(block) else {
+                    continue;
+                };
+                for (at, _) in block.match_indices("actions-rust-lang/setup-rust-toolchain@") {
+                    let step = &block[at..];
+                    let step = step.find("\n      - ").map_or(step, |end| &step[..end]);
+                    if step.lines().any(|line| line.trim() == "cache: false") {
+                        continue;
+                    }
+                    checked += 1;
+                    let keys = flattened_values(step, "cache-key");
+                    assert!(
+                        keys.iter().any(|key| key.contains(&image)),
+                        "{name} job `{job}`: setup-rust-toolchain's rust-cache must carry \
+                         `cache-key` naming the runner image ({image}); its own key is only \
+                         \"Linux-x64\", so a target dir built on another Ubuntu release \
+                         would be restored here. Found: {keys:?}"
+                    );
+                }
+                for prefix in flattened_values(block, "SCCACHE_AZURE_KEY_PREFIX") {
+                    checked += 1;
+                    assert!(
+                        prefix.contains(&image),
+                        "{name} job `{job}`: SCCACHE_AZURE_KEY_PREFIX `{prefix}` must name \
+                         the runner image ({image})"
+                    );
+                }
+                for key in flattened_values(block, "key") {
+                    if !key.contains("cargo") || key.contains("manylinux") {
+                        continue;
+                    }
+                    checked += 1;
+                    assert!(
+                        key.contains(&image),
+                        "{name} job `{job}`: cache key `{key}` holds cargo output and must \
+                         name the runner image ({image})"
+                    );
+                }
+            }
+        }
+        assert!(
+            checked > 0,
+            "no hosted Linux compile cache found (extractor sanity check)"
+        );
+    }
+
     #[test]
     fn self_hosted_workflow_owns_the_gpu_lanes() {
         let sh = read_workflow("e2e-selfhosted.yml");
@@ -4459,21 +4685,49 @@ fi
     const JOBS_OUTSIDE_THE_WINDOWS_LANE: &[&str] = &["powershell-lint"];
 
     /// Every job in the Windows lane, other than the `windows-build-and-test`
-    /// aggregator: any job not on a literal `ubuntu-*` runner, bar the ones listed
-    /// above. A job is presumed to be Windows unless it is shown to be Linux, so a
-    /// `runs-on` spelled as a matrix expression, a self-hosted label list or
-    /// anything else cannot slip past the aggregator tests. A new such job fails
-    /// them until it is either awaited by the aggregator or listed above on purpose.
+    /// aggregator: any job not shown to run on `ubuntu-*` runners only, bar the
+    /// ones listed above. A job is presumed to be Windows unless it is shown to be
+    /// Linux, so a self-hosted label list, a matrix expression over anything but
+    /// a plain list of `ubuntu-*` images, or anything else cannot slip past the
+    /// aggregator tests. A new such job fails them until it is either awaited by
+    /// the aggregator or listed above on purpose.
     fn windows_work_jobs(ci: &str) -> Vec<(String, String)> {
         ci_jobs(ci)
             .into_iter()
             .filter(|(id, block)| {
                 id != "windows-build-and-test"
                     && !JOBS_OUTSIDE_THE_WINDOWS_LANE.contains(&id.as_str())
-                    && !yaml_value_at(block, 4, "runs-on")
-                        .is_some_and(|runner| runner.starts_with("ubuntu-"))
+                    && !runs_only_on_ubuntu(block)
             })
             .collect()
+    }
+
+    /// Whether a job is shown to run on hosted Ubuntu only: a literal `ubuntu-*`
+    /// runner, or `runs-on: ${{ matrix.os }}` over a single `os` axis whose every
+    /// image is `ubuntu-*` (the LTS split jobs). A matrix `include:`, which can
+    /// add images of its own, or a second `os` key makes it unproven.
+    fn runs_only_on_ubuntu(block: &str) -> bool {
+        let Some(runner) = yaml_value_at(block, 4, "runs-on") else {
+            return false;
+        };
+        if runner.starts_with("ubuntu-") {
+            return true;
+        }
+        if runner.trim() != "${{ matrix.os }}" {
+            return false;
+        }
+        if block
+            .lines()
+            .any(|line| strip_comment(line).trim_start().starts_with("include:"))
+        {
+            return false;
+        }
+        let os = flattened_values(block, "os");
+        let [axis] = os.as_slice() else {
+            return false;
+        };
+        let images = flattened_list_items(axis);
+        !images.is_empty() && images.iter().all(|image| image.starts_with("ubuntu-"))
     }
 
     /// `text` with every YAML or shell comment removed, one output line per input
@@ -4646,7 +4900,7 @@ fi
         );
         assert_eq!(
             yaml_value_at(&aggregator, 4, "runs-on").as_deref(),
-            Some("ubuntu-latest"),
+            Some("ubuntu-24.04"),
             "the aggregator must run on a Linux runner so the script's `bash` is the one \
              the script test executes"
         );
@@ -4688,6 +4942,23 @@ fi
                   \x20   runs-on: ubuntu-24.04\n\
                   \x20 matrix:\n\
                   \x20   runs-on: ${{ matrix.os }}\n\
+                  \x20 lts:\n\
+                  \x20   strategy:\n\
+                  \x20     matrix:\n\
+                  \x20       os: [ubuntu-24.04, ubuntu-26.04]\n\
+                  \x20   runs-on: ${{ matrix.os }}\n\
+                  \x20 mixed:\n\
+                  \x20   strategy:\n\
+                  \x20     matrix:\n\
+                  \x20       os: [ubuntu-24.04, windows-latest]\n\
+                  \x20   runs-on: ${{ matrix.os }}\n\
+                  \x20 included:\n\
+                  \x20   strategy:\n\
+                  \x20     matrix:\n\
+                  \x20       os: [ubuntu-24.04]\n\
+                  \x20       include:\n\
+                  \x20         - os: windows-latest\n\
+                  \x20   runs-on: ${{ matrix.os }}\n\
                   \x20 selfhosted:\n\
                   \x20   runs-on: [self-hosted, linux]\n\
                   \x20 windows:\n\
@@ -4700,7 +4971,10 @@ fi
             .into_iter()
             .map(|(id, _)| id)
             .collect();
-        assert_eq!(ids, ["matrix", "selfhosted", "windows"]);
+        assert_eq!(
+            ids,
+            ["matrix", "mixed", "included", "selfhosted", "windows"]
+        );
     }
 
     /// Whether the Windows jobs run is decided once, as the `changes` job's
