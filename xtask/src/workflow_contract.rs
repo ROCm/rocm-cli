@@ -1497,8 +1497,9 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
     }
 
     /// Where a step's block-scalar `run:` opens: the index of its `run:` line
-    /// in `lines`, that line's indent, and whether the block is folded (`>`)
-    /// rather than literal (`|`).
+    /// in `lines`, the column of the `run` key, and whether the block is
+    /// folded (`>`) rather than literal (`|`). The key may be the step's
+    /// first (`- run: |`), two columns in from the dash.
     ///
     /// Any block-scalar header counts — `|` or `>`, with or without a
     /// chomping (`-`/`+`) or indentation (digit) indicator, and with or
@@ -1506,7 +1507,12 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
     /// multi-line script.
     fn run_block_header(lines: &[&str]) -> Option<(usize, usize, bool)> {
         lines.iter().enumerate().find_map(|(at, line)| {
-            let indicator = strip_comment(line).trim().strip_prefix("run:")?.trim();
+            let code = strip_comment(line).trim();
+            let (key, key_column) = match code.strip_prefix("- ") {
+                Some(rest) => (rest.trim_start(), indent_of(line) + 2),
+                None => (code, indent_of(line)),
+            };
+            let indicator = key.strip_prefix("run:")?.trim();
             let folded = match indicator.chars().next()? {
                 '|' => false,
                 '>' => true,
@@ -1515,7 +1521,7 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
             indicator[1..]
                 .chars()
                 .all(|c| c == '-' || c == '+' || c.is_ascii_digit())
-                .then_some((at, indent_of(line), folded))
+                .then_some((at, key_column, folded))
         })
     }
 
@@ -5092,20 +5098,34 @@ permissions:
 
     /// Every `shell: pwsh` step in `text` as `(name, step block)`.
     ///
-    /// The step is found from its `shell: pwsh` line by walking up to the
-    /// nearest `- ` item shallower than it, so the key order inside the step
-    /// does not matter.
+    /// The step is found from its `shell: pwsh` line: that line itself when
+    /// `shell:` is the step's first key (`- shell: pwsh`), and otherwise by
+    /// walking up to the nearest `- ` item shallower than it, so the key order
+    /// inside the step does not matter.
     fn pwsh_steps(text: &str) -> Vec<(String, String)> {
         let lines: Vec<&str> = text.lines().collect();
         let mut steps = Vec::new();
         for (at, line) in lines.iter().enumerate() {
-            if strip_comment(line).trim() != "shell: pwsh" {
+            let code = strip_comment(line).trim();
+            let (key, is_item) = match code.strip_prefix("- ") {
+                Some(rest) => (rest.trim_start(), true),
+                None => (code, false),
+            };
+            if key
+                .strip_prefix("shell:")
+                .is_none_or(|shell| strip_quotes(shell.trim()) != "pwsh")
+            {
                 continue;
             }
             let shell_indent = indent_of(line);
-            let Some(start) = (0..at).rev().find(|&i| {
-                indent_of(lines[i]) < shell_indent && lines[i].trim_start().starts_with("- ")
-            }) else {
+            let start = if is_item {
+                Some(at)
+            } else {
+                (0..at).rev().find(|&i| {
+                    indent_of(lines[i]) < shell_indent && lines[i].trim_start().starts_with("- ")
+                })
+            };
+            let Some(start) = start else {
                 continue;
             };
             let step = step_block(&lines, start);
@@ -5618,5 +5638,34 @@ permissions:
             ]
         );
         assert!(unchecked_native_commands_in_step(step).is_empty());
+    }
+
+    /// `shell:` and `run:` can each be a step's first key, on its `- ` line;
+    /// the step is pwsh, and its script checked, just the same. Matched only
+    /// as sibling keys, `- shell: pwsh` was never found as a pwsh step and
+    /// `- run: |` read as no script at all.
+    #[test]
+    fn a_pwsh_step_is_checked_whichever_key_comes_first() {
+        let script = "            python a.py --self-test\n            \
+                      python b.py --self-test\n";
+        for step in [
+            format!("      - shell: pwsh\n        name: Self-tests\n        run: |\n{script}"),
+            format!("      - shell: 'pwsh'\n        name: Self-tests\n        run: |\n{script}"),
+            format!("      - run: |\n{script}        shell: pwsh\n        name: Self-tests\n"),
+        ] {
+            let text = format!("jobs:\n  win:\n    runs-on: windows-latest\n    steps:\n{step}");
+            let found: Vec<(String, Vec<String>)> = pwsh_steps(&text)
+                .into_iter()
+                .map(|(name, step)| (name, unchecked_native_commands_in_step(&step)))
+                .collect();
+            assert_eq!(
+                found,
+                [(
+                    "Self-tests".to_owned(),
+                    vec!["python a.py --self-test".to_owned()]
+                )],
+                "{step}"
+            );
+        }
     }
 }
