@@ -481,8 +481,8 @@ pub(crate) fn persist_spawned_engine_child(
     })?;
     if !recorded {
         bail!(
-            "managed service `{}` changed on disk while it was launching — stopped, restarted \
-             or removed — so the engine it started (pid {child_pid}) was not recorded on it",
+            "managed service `{}` changed on disk while it was launching (stopped, restarted \
+             or removed), so the engine it started (pid {child_pid}) was not recorded on it",
             launch.record.service_id
         );
     }
@@ -1110,7 +1110,7 @@ fn spawn_managed_engine_child(
     if !launch.update(|current| current.status = "running".to_owned())? {
         bail!(
             "managed service `{}` changed on disk while its engine (pid {child_pid}) was \
-             starting — stopped, restarted or removed — so the launch did not mark it running",
+             starting (stopped, restarted or removed), so the launch did not mark it running",
             launch.record.service_id
         );
     }
@@ -2581,6 +2581,56 @@ mod tests {
             (after.status.as_str(), after.supervisor_pid),
             ("stopped", stand_in_child_pid()),
             "the stop's verdict stands; the launch does not retire over it"
+        );
+        Ok(())
+    }
+
+    /// A stop that confirmed after the startup check sampled the child alive, but
+    /// before the launch promoted it, has written `"stopped"`. The launch must
+    /// not promote the stopped service to `"running"` and go on to wait for it:
+    /// it fails, saying it did not mark the service running, and the stop's
+    /// record stands — still naming the child, so nothing is left unreachable.
+    #[test]
+    fn a_launch_does_not_mark_running_a_service_stopped_after_its_check() -> Result<()> {
+        let (root, paths) = test_paths("managed-launch-stopped-after-check");
+        paths.ensure()?;
+        let manifest_path = paths.service_manifest_path("lemonade-qwen-3000");
+        let spawn = {
+            let manifest_path = manifest_path.clone();
+            move |_request: &ManagedEngineSpawnRequest<'_>| -> Result<SpawnedManagedEngine> {
+                let manifest_path = manifest_path.clone();
+                Ok(SpawnedManagedEngine {
+                    pid: stand_in_child_pid(),
+                    startup: ManagedEngineStartupCheck::Pending(Box::new(move || {
+                        let mut stopped = manifest_on_disk(&manifest_path)
+                            .expect("the child is on record before its check");
+                        stopped.status = "stopped".to_owned();
+                        stopped.write()?;
+                        Ok(None)
+                    })),
+                })
+            }
+        };
+
+        let outcome = launch_qwen_on_lemonade(&paths, 11541, &spawn);
+        let after = manifest_on_disk(&manifest_path);
+        let _ = fs::remove_dir_all(root);
+
+        let Err(error) = outcome else {
+            panic!("a launch whose service was stopped under it must fail")
+        };
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("did not mark it running")
+                && message.contains(&stand_in_child_pid().to_string()),
+            "{message}"
+        );
+        // The claim in that message, checked against the record it describes.
+        let after = after.expect("the record is still on disk");
+        assert_eq!(
+            (after.status.as_str(), after.supervisor_pid),
+            ("stopped", stand_in_child_pid()),
+            "the stop's record stands, still naming the child"
         );
         Ok(())
     }
