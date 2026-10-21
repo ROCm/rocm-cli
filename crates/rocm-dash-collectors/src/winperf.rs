@@ -19,7 +19,13 @@ use rocm_dash_core::metrics::{GpuMetrics, GpuSystemInfo};
 use tokio::process::Command;
 use tokio::time::timeout;
 
-const RUN_TIMEOUT: Duration = Duration::from_secs(5);
+// 5s was too tight: on real hardware `powershell.exe` child-process spawn
+// (not the Get-Counter query itself, which returns near-instantly once
+// running) can take well over 5s — observed consistently timing out every
+// tick on a Strix Halo laptop while the identical script ran fine
+// interactively. 15s gives real-world spawn latency room without masking an
+// actually-hung process forever.
+const RUN_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// `kind<TAB>key<TAB>value[<TAB>value2]` lines: per-engine utilization,
 /// per-adapter dedicated VRAM usage, and a best-effort adapter inventory
@@ -42,18 +48,13 @@ impl WinPerfCollector {
         Self
     }
 
-    pub async fn metrics(&self) -> io::Result<Vec<GpuMetrics>> {
+    /// One `powershell.exe` spawn covers both metrics and system info (the
+    /// script already emits both sections) — calling `metrics()` and
+    /// `system_info()` separately each tick would shell out twice for the
+    /// same output, doubling exposure to spawn latency for nothing.
+    pub async fn snapshot(&self) -> io::Result<(Vec<GpuMetrics>, GpuSystemInfo)> {
         let out = Self::run_script().await?;
-        Ok(parse_metrics(&out))
-    }
-
-    /// Best-effort; never fails the caller — an unreachable perf-counter
-    /// provider just yields an empty/default `GpuSystemInfo`.
-    pub async fn system_info(&self) -> GpuSystemInfo {
-        Self::run_script()
-            .await
-            .map(|out| parse_system_info(&out))
-            .unwrap_or_default()
+        Ok((parse_metrics(&out), parse_system_info(&out)))
     }
 
     async fn run_script() -> io::Result<String> {

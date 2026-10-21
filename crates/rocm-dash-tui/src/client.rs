@@ -188,7 +188,7 @@ async fn connect_and_run(connect: &str, tx: UnboundedSender<ClientMsg>) -> anyho
 async fn connect_and_run(connect: &str, tx: UnboundedSender<ClientMsg>) -> anyhow::Result<()> {
     use rocm_dash_collectors::host::HostCollector;
     use rocm_dash_collectors::winperf::WinPerfCollector;
-    use rocm_dash_core::metrics::Snapshot;
+    use rocm_dash_core::metrics::{GpuSystemInfo, Snapshot};
 
     info!(
         connect,
@@ -206,15 +206,15 @@ async fn connect_and_run(connect: &str, tx: UnboundedSender<ClientMsg>) -> anyho
 
     loop {
         ticker.tick().await;
-        let gpus = gpu.metrics().await.unwrap_or_else(|e| {
+        let (gpus, gpu_system_info) = gpu.snapshot().await.unwrap_or_else(|e| {
             warn!(error = %e, "windows GPU perf-counter query failed");
-            Vec::new()
+            (Vec::new(), GpuSystemInfo::default())
         });
         let snapshot = Snapshot {
             timestamp: chrono::Utc::now(),
             host: host.tick(),
             gpus,
-            gpu_system_info: Some(gpu.system_info().await),
+            gpu_system_info: Some(gpu_system_info),
             instances: Vec::new(),
             warnings: Vec::new(),
         };
