@@ -317,9 +317,10 @@ under `/sys/class/kfd`, the DRM cards under `/sys/class/drm`,
 `/sys/module/amdgpu` and its `version` file, `/proc/version`, `/proc/cpuinfo`,
 `/proc/meminfo`, `/proc/cmdline`, `/proc/modules`, `/proc/1/cgroup`, the
 container markers `/.dockerenv` and `/run/.containerenv`, the `/etc/os-release`
-behind the distro name `rocm examine` reports, the modprobe configuration
-directories `/etc/modprobe.d`, `/usr/lib/modprobe.d` and `/run/modprobe.d`, the
-WSL plumbing under `/usr/lib/wsl` (the `lib` directory and
+(falling back to `/usr/lib/os-release` when absent, per `os-release(5)`) behind
+the distro fields and name `rocm examine` reports, the modprobe
+configuration directories `/etc/modprobe.d`, `/usr/lib/modprobe.d` and
+`/run/modprobe.d`, the WSL plumbing under `/usr/lib/wsl` (the `lib` directory and
 `lib/libdxcore.so`), and the WSL ROCDXG capability check, which looks for
 `lib/librocdxg.so` and `share/rocdxg/dids.conf` under `/opt/rocm` and under each
 discovered ROCm install. The E2E suite can point those reads at a directory it populated with a
@@ -350,9 +351,10 @@ Some reads stay on the real machine even in a hook build:
   two files under each discovered install's path inside the simulated root.
 - The `/usr/lib/wsl/lib` loader entry an engine is launched with, and programs
   the probes execute, such as `ldconfig`.
-- Every package-manager plan, which reads the real `/etc/os-release`: the
-  OpenMPI install hints, and the driver, OpenMPI and runtime-library installs
-  `rocm` runs before serving. Their commands run against the real machine, so a
+- Every package-manager plan, which reads the real `/etc/os-release` (with the
+  same `/usr/lib/os-release` fallback): the OpenMPI, libatomic and libnuma
+  install hints, and the driver, OpenMPI and runtime-library installs `rocm`
+  runs before serving. Their commands run against the real machine, so a
   simulated host must not pick the distro they are built for.
 - Process liveness under `/proc/<pid>` and `/dev/shm` sizing. Both describe
   this process's own environment, not the hardware.

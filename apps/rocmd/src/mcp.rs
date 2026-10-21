@@ -742,10 +742,7 @@ pub(crate) fn handle_mcp_tool_call(paths: &AppPaths, params: &Value) -> Result<V
                 .and_then(Value::as_str)
                 .context("stop_server requires `service_id`")?;
             let stopped = crate::service::stop_managed_service(paths, service_id)?;
-            Ok(tool_success(
-                format!("Stopped managed service `{service_id}`."),
-                stopped,
-            ))
+            Ok(mcp_stop_server_reply(service_id, stopped))
         }
         "watcher_enable" => {
             let argv = build_watcher_enable_args(&arguments)?;
@@ -793,6 +790,24 @@ fn tool_success(text: String, structured: Value) -> Value {
         "structuredContent": structured,
         "isError": false,
     })
+}
+
+/// The `stop_server` MCP tool's answer for a [`crate::service::stop_managed_service`] report.
+fn mcp_stop_server_reply(service_id: &str, stopped: Value) -> Value {
+    if crate::service::stop_report_confirmed(&stopped) {
+        tool_success(format!("Stopped managed service `{service_id}`."), stopped)
+    } else {
+        // Not a success: a recorded process may still be running and holding
+        // the device. `stop_managed_service` keeps the record's PIDs and the
+        // endpoint key for exactly that case, and `pid_outcomes` in the
+        // structured result names the PID that could not be confirmed.
+        tool_error(
+            format!(
+                "Could not confirm that managed service `{service_id}` stopped; a recorded process may still be running. Its recorded PIDs and any endpoint key were kept so a later stop can still reach it; see `pid_outcomes`."
+            ),
+            stopped,
+        )
+    }
 }
 
 fn tool_error(text: String, structured: Value) -> Value {
@@ -1141,7 +1156,11 @@ fn system_prefix_requires_ack(prefix: &std::path::Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::workspace_test_artifact_dir;
+    use crate::test_support::{
+        assert_unconfirmed_stop_kept_the_service, seed_keyed_service, stop_with_outcome,
+        temp_app_paths, workspace_test_artifact_dir,
+    };
+    use crate::watchers::load_service_record;
     use std::fs;
     use std::path::PathBuf;
 
@@ -1544,6 +1563,105 @@ mod tests {
                 "contained".to_owned()
             ]
         );
+        Ok(())
+    }
+
+    fn mcp_stop_server(paths: &AppPaths, service_id: &str) -> Result<Value> {
+        handle_mcp_tool_call(
+            paths,
+            &json!({
+                "name": "stop_server",
+                "arguments": { "service_id": service_id },
+            }),
+        )
+    }
+
+    fn mcp_result_text(value: &Value) -> &str {
+        value
+            .get("content")
+            .and_then(Value::as_array)
+            .and_then(|content| content.first())
+            .and_then(|entry| entry.get("text"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+    }
+
+    /// The MCP tool used to answer "Stopped managed service" with
+    /// `isError: false` whatever the stop found. A client acting on that would
+    /// assume the device was free while the engine might still hold it.
+    #[test]
+    fn mcp_stop_server_reports_an_unconfirmed_stop_as_an_error() -> Result<()> {
+        let (root, paths) = temp_app_paths("mcp-stop-unconfirmed");
+        paths.ensure()?;
+        let service_id = "svc-mcp-stop-unconfirmed";
+        let key_path = seed_keyed_service(&paths, service_id, 11446)?;
+
+        // The handler is `stop_managed_service` feeding `mcp_stop_server_reply`;
+        // the confirmed-stop test below drives that whole handler for real.
+        let result = stop_with_outcome(&paths, service_id, rocm_core::TerminationOutcome::TimedOut)
+            .map(|stopped| mcp_stop_server_reply(service_id, stopped));
+        let key_kept = key_path.exists();
+        let reloaded = load_service_record(&paths, service_id);
+        fs::remove_dir_all(root).ok();
+
+        let value = result?;
+        assert_eq!(
+            value.get("isError").and_then(Value::as_bool),
+            Some(true),
+            "{value}"
+        );
+        let text = mcp_result_text(&value);
+        assert!(
+            text.starts_with("Could not confirm that managed service"),
+            "{text}"
+        );
+        assert!(!text.contains("Stopped managed service"), "{text}");
+        assert_eq!(
+            value
+                .pointer("/structuredContent/stopped")
+                .and_then(Value::as_bool),
+            Some(false),
+            "{value}"
+        );
+        assert_eq!(
+            value
+                .pointer("/structuredContent/pid_outcomes/0/outcome")
+                .and_then(Value::as_str),
+            Some("timed_out"),
+            "the PID the message points at must be named: {value}"
+        );
+        // The message claims the PIDs and key were kept; prove it.
+        assert_unconfirmed_stop_kept_the_service(&reloaded?, key_kept);
+        Ok(())
+    }
+
+    #[test]
+    fn mcp_stop_server_reports_a_confirmed_stop_as_success() -> Result<()> {
+        let (root, paths) = temp_app_paths("mcp-stop-confirmed");
+        paths.ensure()?;
+        let service_id = "svc-mcp-stop-confirmed";
+        // Not running, so the real stop path confirms it without signalling.
+        let key_path = seed_keyed_service(&paths, service_id, 11447)?;
+
+        let result = mcp_stop_server(&paths, service_id);
+        let key_removed = !key_path.exists();
+        let reloaded = load_service_record(&paths, service_id);
+        fs::remove_dir_all(root).ok();
+
+        let value = result?;
+        assert_eq!(
+            value.get("isError").and_then(Value::as_bool),
+            Some(false),
+            "{value}"
+        );
+        assert_eq!(
+            mcp_result_text(&value),
+            format!("Stopped managed service `{service_id}`.")
+        );
+        let reloaded = reloaded?;
+        assert_eq!(reloaded.status, "stopped");
+        assert_eq!(reloaded.supervisor_pid, 0);
+        assert!(key_removed, "a confirmed stop must drop the endpoint key");
         Ok(())
     }
 }

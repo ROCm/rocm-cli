@@ -6,13 +6,13 @@ use anyhow::{Context, Result, bail};
 use rocm_core::{
     AppPaths, ManagedToolConfig, RUNTIME_LIBRARY_PATH_ENV, RocmCliConfig, detect_host_gfx_target,
     detect_host_gpu_diagnostics, detect_legacy_rocm_summary, detect_managed_therock_family,
-    disk_space, ensure_uv_binary, extract_first_gfx_token, interactive_terminal,
-    known_therock_families, managed_tools_dir, normalize_runtime_path_for_host,
-    normalize_runtime_path_for_storage, normalize_runtime_path_text_for_host,
-    normalize_runtime_path_text_for_storage, normalize_therock_family, runtime_is_windows,
-    runtime_os_name, runtime_path_for_windows_child, runtime_path_list_split,
-    runtime_python_executable_in_env, unix_time_millis, uv_command_env, uv_pip_install_base,
-    uv_venv_args, verify_rsa_pkcs1_sha256_signature,
+    disk_space, ensure_uv_binary, extract_first_gfx_token, gfx_target_has_no_rocm_build,
+    interactive_terminal, known_therock_families, managed_tools_dir,
+    normalize_runtime_path_for_host, normalize_runtime_path_for_storage,
+    normalize_runtime_path_text_for_host, normalize_runtime_path_text_for_storage,
+    normalize_therock_family, runtime_is_windows, runtime_os_name, runtime_path_for_windows_child,
+    runtime_path_list_split, runtime_python_executable_in_env, unix_time_millis, uv_command_env,
+    uv_pip_install_base, uv_venv_args, verify_rsa_pkcs1_sha256_signature,
 };
 #[cfg(test)]
 use rocm_core::{
@@ -521,6 +521,10 @@ struct PipRuntimeResolution {
     /// `None` on the canonical layout, which picks versions by scraping each
     /// package's simple index rather than by resolving a requirement set.
     version_resolution_specs: Option<Vec<String>>,
+    /// How the torchaudio in `version_resolution_specs` was chosen, kept so the
+    /// plan can say whether it is the hardware-verified build. `None` on the
+    /// canonical layout, which pins no torchaudio before resolving.
+    torchaudio_pin: Option<TorchaudioPin>,
     package_versions: TheRockPipPackageVersions,
     /// The device payload the resolved source must supply for this host,
     /// decided against the targets that source actually publishes.
@@ -1907,6 +1911,11 @@ fn install_wheel_runtime(
     if let Some(specs) = resolution.version_resolution_specs.as_ref() {
         let _ = writeln!(output, "  version_resolution_specs: {}", specs.join(" "));
     }
+    // Printed from the same value that chose the pin, so the line cannot claim
+    // a verified build the requirements above do not name.
+    if let Some(pin) = resolution.torchaudio_pin.as_ref() {
+        let _ = writeln!(output, "  torchaudio_selection: {}", pin.describe());
+    }
     let _ = writeln!(
         output,
         "  package_specs: {}",
@@ -1965,6 +1974,13 @@ fn install_wheel_runtime(
     // on the real install path too, not only in the dry-run plan.
     if let Some(warning) = no_wheel_warning.as_deref() {
         progress_line(format!("Warning: {warning}"));
+    }
+    if let Some(note) = resolution
+        .torchaudio_pin
+        .as_ref()
+        .and_then(unverified_torchaudio_note)
+    {
+        progress_line(note);
     }
 
     // Explain, in the visible install log, why an older TheRock ROCm is chosen
@@ -2183,14 +2199,22 @@ const fn therock_sdk_extras(include_devel: bool) -> &'static str {
 /// The requirement lines handed to `uv pip compile` to pick a mutually
 /// installable version set on the ROCm 10 (`next`) layout.
 ///
-/// Unversioned for torch/torchvision/torchaudio on purpose: choosing those
-/// versions is what the resolve is for. The `rocm` extras, though, must match
-/// the ones [`therock_pip_package_specs`] will install — resolving against
-/// `devel` for someone who did not ask for it constrains the chosen versions by
-/// a toolchain they declined, and can fail the whole install with a
-/// toolchain-resolution error on a default `rocm install sdk`.
+/// torch and torchvision are unversioned on purpose: choosing those versions is
+/// what the resolve is for, and their published metadata depends on the exact
+/// `rocm` build, so the `rocm` pin carries them to the matching `+rocm<build>`.
+/// torchaudio's metadata names no `rocm` build, so left unversioned it resolves
+/// to the newest build on the index — which is a different ROCm build for every
+/// pin but the newest — and the caller pins it to `torchaudio_version`, already
+/// chosen from this build's published torchaudio wheels.
+///
+/// The `rocm` extras must match the ones [`therock_pip_package_specs`] will
+/// install — resolving against `devel` for someone who did not ask for it
+/// constrains the chosen versions by a toolchain they declined, and can fail the
+/// whole install with a toolchain-resolution error on a default
+/// `rocm install sdk`.
 fn published_pip_requirements(
     rocm_version: &str,
+    torchaudio_version: &str,
     device_target: &str,
     include_devel: bool,
 ) -> Vec<String> {
@@ -2202,7 +2226,7 @@ fn published_pip_requirements(
         ),
         format!("torch[{device_extra}]"),
         format!("torchvision[{device_extra}]"),
-        "torchaudio".to_owned(),
+        format!("torchaudio=={torchaudio_version}"),
     ]
 }
 
@@ -3069,6 +3093,7 @@ fn resolve_pip_runtime_from_index(
 ) -> Result<PipRuntimeResolution> {
     let index_url = source.index_url.as_str();
     let mut version_resolution_specs = None;
+    let mut torchaudio_selection = None;
     let rocm_versions =
         load_simple_index_versions(paths, index_url, "rocm", None, download_timeout_secs)?;
     if matches!(channel, TheRockChannel::Release)
@@ -3098,14 +3123,31 @@ fn resolve_pip_runtime_from_index(
                 );
                 format!("no TheRock rocm package was found for {requested} in {index_url}")
             })?;
+        // Chosen here, not by `uv`: see `published_pip_requirements`.
+        let torchaudio_versions = load_simple_index_versions(
+            paths,
+            index_url,
+            "torchaudio",
+            Some(wheel_compatibility),
+            download_timeout_secs,
+        )?;
+        let pin = torchaudio_pin(
+            &torchaudio_versions,
+            &rocm_version,
+            rocm_engine_vllm::verified_torchaudio_release(&rocm_version),
+            index_url,
+        )?;
         // The canonical branch below budgets one `download_timeout_secs` per
         // package (rocm, then torch, torchvision, torchaudio: 4 sequential HTTP
-        // fetches). `uv pip compile` resolves that same four-package metadata
-        // set in one subprocess call, so it needs a comparable aggregate
-        // budget, not the single-fetch one — reusing the bare per-fetch value
-        // here would make a startup check that budgets 2s per fetch reliably
-        // time out a call doing 4 fetches' worth of work.
-        let requirements = published_pip_requirements(&rocm_version, device_target, include_devel);
+        // fetches). `uv pip compile` still fetches metadata for all four
+        // packages in one subprocess call — the torchaudio listing above only
+        // chose its version — so it needs a comparable aggregate budget, not
+        // the single-fetch one: reusing the bare per-fetch value here would make
+        // a startup check that budgets 2s per fetch reliably time out a call
+        // doing 4 fetches' worth of work. That listing is one more fetch on top,
+        // with its own single-fetch budget.
+        let requirements =
+            published_pip_requirements(&rocm_version, &pin.version, device_target, include_devel);
         let versions = resolve_published_pip_package_versions(
             paths,
             index_url,
@@ -3114,6 +3156,7 @@ fn resolve_pip_runtime_from_index(
             download_timeout_secs.map(|secs| secs.saturating_mul(4)),
         )?;
         version_resolution_specs = Some(requirements);
+        torchaudio_selection = Some(pin);
         versions
     } else {
         let torch_versions = load_simple_index_versions(
@@ -3174,6 +3217,7 @@ fn resolve_pip_runtime_from_index(
         latest_version,
         newest_repo_version,
         version_resolution_specs,
+        torchaudio_pin: torchaudio_selection,
         package_versions,
         device_target: source.device_target.clone(),
         published_device_targets: source.published_device_targets.clone(),
@@ -3362,24 +3406,51 @@ fn raw_arch_agreeing_with_family(raw_arch: Option<String>, family: &str) -> Opti
 }
 
 fn resolve_family(paths: &AppPaths, family_override: Option<&str>) -> Result<FamilyResolution> {
-    if let Some(value) = family_override
-        && let Some(family) = normalize_therock_family(value)
-    {
-        return Ok(FamilyResolution {
-            family,
-            source: "manifest".to_owned(),
-            raw_arch: family_override_raw_arch(value),
-        });
+    let env_override = std::env::var("ROCM_CLI_THEROCK_FAMILY").ok();
+
+    // An explicitly asked-for target that ROCm publishes no build for is
+    // refused here rather than normalized. `normalize_therock_family` answers
+    // `None` for gfx90c, and `None` from this branch means "fall through", so
+    // without this the user's `--family gfx90c` would be dropped and whatever
+    // GPU this host happens to have would be installed for instead.
+    // Unrecognized spellings keep falling through to detection, which is the
+    // long-standing behavior for a typo.
+    //
+    // The guard sits inside each source's own branch, not ahead of both, so a
+    // source is only ever refused when it is actually the one being consulted:
+    // a valid `--family` must resolve even if a stale `ROCM_CLI_THEROCK_FAMILY`
+    // left over from an earlier session happens to name gfx90c, and the
+    // reverse for an env value once `--family` isn't the one in play.
+    if let Some(value) = family_override {
+        if gfx_target_has_no_rocm_build(value) {
+            bail!(unsupported_requested_target_message(
+                value.trim(),
+                "--family"
+            ));
+        }
+        if let Some(family) = normalize_therock_family(value) {
+            return Ok(FamilyResolution {
+                family,
+                source: "manifest".to_owned(),
+                raw_arch: family_override_raw_arch(value),
+            });
+        }
     }
 
-    if let Some(value) = std::env::var("ROCM_CLI_THEROCK_FAMILY").ok()
-        && let Some(family) = normalize_therock_family(&value)
-    {
-        return Ok(FamilyResolution {
-            family,
-            source: "env".to_owned(),
-            raw_arch: family_override_raw_arch(&value),
-        });
+    if let Some(value) = env_override.as_deref() {
+        if gfx_target_has_no_rocm_build(value) {
+            bail!(unsupported_requested_target_message(
+                value.trim(),
+                "ROCM_CLI_THEROCK_FAMILY"
+            ));
+        }
+        if let Some(family) = normalize_therock_family(value) {
+            return Ok(FamilyResolution {
+                family,
+                source: "env".to_owned(),
+                raw_arch: family_override_raw_arch(value),
+            });
+        }
     }
 
     if let Some(family) = detect_managed_therock_family(paths) {
@@ -3391,14 +3462,28 @@ fn resolve_family(paths: &AppPaths, family_override: Option<&str>) -> Result<Fam
         });
     }
 
-    if let Some(raw_arch) = detect_host_gfx_target()
-        && let Some(family) = normalize_therock_family(&raw_arch)
+    let host_arch = detect_host_gfx_target();
+    if let Some(raw_arch) = host_arch.as_deref()
+        && let Some(family) = normalize_therock_family(raw_arch)
     {
         return Ok(FamilyResolution {
             family,
             source: "host".to_owned(),
-            raw_arch: Some(raw_arch),
+            raw_arch: Some(raw_arch.to_owned()),
         });
+    }
+
+    // A GPU was detected that is known to have no package family: the gfx90c
+    // Vega iGPU in Renoir/Cezanne APUs. Listing the recognized families would
+    // invite installing a build for different silicon, so say plainly that
+    // there is nothing to install for this GPU. Other unmapped targets keep the
+    // generic error below, which points at `--family`.
+    if let Some(raw_arch) = host_arch.as_deref()
+        && gfx_target_has_no_rocm_build(raw_arch)
+    {
+        let message = unsupported_host_gpu_message(raw_arch);
+        let diagnostics = detect_host_gpu_diagnostics();
+        bail!("{message}\n\n{diagnostics}");
     }
 
     bail!(
@@ -3407,6 +3492,34 @@ fn resolve_family(paths: &AppPaths, family_override: Option<&str>) -> Result<Fam
          Recognized families: {}.\n\n{}",
         known_therock_families().join(", "),
         detect_host_gpu_diagnostics()
+    )
+}
+
+/// The install error for a detected GPU target that no TheRock package family
+/// covers. It deliberately does not list `--family` values: none of them was
+/// built for this GPU.
+fn unsupported_host_gpu_message(raw_arch: &str) -> String {
+    format!(
+        "no ROCm SDK build exists for the detected GPU target `{raw_arch}`, so \
+         `rocm install sdk` has nothing to install for it.\n\
+         The GPU is detected but is not supported by ROCm; \
+         the Vulkan backend can still be used."
+    )
+}
+
+/// The install error for a target the user asked for by name that no TheRock
+/// package family covers.
+///
+/// Separate from [`unsupported_host_gpu_message`] because nothing was detected
+/// here: the user named the target, so the error names where it came from and
+/// does not claim a GPU is present. Like that message it offers no `--family`
+/// values, since none of them was built for this GPU.
+fn unsupported_requested_target_message(value: &str, source: &str) -> String {
+    format!(
+        "no ROCm SDK build exists for the GPU target `{value}` requested by \
+         {source}, so `rocm install sdk` has nothing to install for it.\n\
+         That GPU is not supported by ROCm; the Vulkan backend can still be \
+         used. Nothing was installed and no other family was substituted."
     )
 }
 
@@ -3702,6 +3815,287 @@ fn select_latest_stack_package(
         .collect::<Vec<_>>();
     candidates.sort_by(|left, right| compare_version_strings(left, right));
     candidates.pop()
+}
+
+/// The torchaudio build pinned for a ROCm 10 install, and why it was chosen.
+/// The plan line and install-log note are both [`TorchaudioPin::describe`], so
+/// what is printed is derived from the decision rather than restated beside it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TorchaudioPin {
+    /// The published version pinned, `+rocm…` label included.
+    version: String,
+    /// The ROCm build `version` was chosen for.
+    rocm_version: String,
+    basis: TorchaudioPinBasis,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TorchaudioPinBasis {
+    /// `version` is the hardware-verified release for this ROCm line.
+    Verified,
+    /// A verified release is recorded for this ROCm line, but the index
+    /// publishes no build of it labelled for this exact ROCm build (`+rocm`
+    /// label) for this Python and platform, so `version` is the newest build
+    /// instead.
+    VerifiedNotPublished {
+        release: &'static str,
+        /// A build of `release` this Python and platform can install, labelled
+        /// for another ROCm build, when one is published. The verified release
+        /// is matched by ROCm line, so a `10.1.1` request can find it published
+        /// only as `+rocm10.1.0`; the reason must then name the ROCm build, not
+        /// the Python or platform.
+        other_build: Option<String>,
+    },
+    /// No verified release is recorded for this ROCm line, so `version` is the
+    /// newest build.
+    NoVerifiedRelease,
+}
+
+impl TorchaudioPin {
+    const fn is_verified(&self) -> bool {
+        matches!(self.basis, TorchaudioPinBasis::Verified)
+    }
+
+    fn describe(&self) -> String {
+        let Self {
+            version,
+            rocm_version,
+            basis,
+        } = self;
+        match basis {
+            TorchaudioPinBasis::Verified => format!(
+                "torchaudio {version}, the build verified on hardware for ROCm {rocm_version}"
+            ),
+            TorchaudioPinBasis::VerifiedNotPublished {
+                release,
+                other_build: None,
+            } => format!(
+                "torchaudio {version}, the newest build published for ROCm {rocm_version}; it is not hardware-verified, because the verified release, {release}, is not published for this Python and platform"
+            ),
+            TorchaudioPinBasis::VerifiedNotPublished {
+                release,
+                other_build: Some(other_build),
+            } => format!(
+                "torchaudio {version}, the newest build published for ROCm {rocm_version}; it is not hardware-verified, because the verified release, {release}, is published for this Python and platform only for another ROCm build ({other_build}), not for ROCm {rocm_version}"
+            ),
+            TorchaudioPinBasis::NoVerifiedRelease => format!(
+                "torchaudio {version}, the newest build published for ROCm {rocm_version}; it is not hardware-verified, because no torchaudio release is recorded as verified for this ROCm line"
+            ),
+        }
+    }
+}
+
+/// The install-log line for a torchaudio pin that is not hardware-verified, or
+/// `None` for one that is.
+///
+/// An unverified torchaudio is the one stack choice ROCm CLI makes on its own
+/// judgement, so a real install says so in the install log, not only in the
+/// plan's `torchaudio_selection:` line. A verified pin needs no such warning.
+/// The text is [`TorchaudioPin::describe`], so it cannot disagree with the pin.
+fn unverified_torchaudio_note(pin: &TorchaudioPin) -> Option<String> {
+    (!pin.is_verified()).then(|| format!("Note: {}", pin.describe()))
+}
+
+/// The torchaudio build to pin for `rocm_version`, from `published` (this
+/// Python and platform's builds on the index).
+///
+/// `verified_release` comes first: it is the release confirmed on hardware for
+/// this ROCm line ([`rocm_engine_vllm::verified_torchaudio_release`], read from
+/// the vLLM ROCm 10.x discover-build table so the SDK and its vLLM install pin
+/// the same build). Recency alone is not a safe choice among builds sharing a
+/// `+rocm<version>` label: `whl-next` publishes `2.11.0`, `2.11.0.2` and
+/// `2.11.0.3` all as `+rocm10.1.0`, and `2.11.0` is a CPU-only rebuild with no
+/// HIP kernels, which nothing in the version or label distinguishes. Only when
+/// no verified release is recorded, or it is not published here, does this fall
+/// back to [`latest_build_for_rocm`], and the returned basis says so.
+///
+/// Refuses when no build for `rocm_version` is published at all, or when none of
+/// the published builds' versions can be read — the second is not the first,
+/// and reporting it as "none published" would send the user to the wrong place.
+fn torchaudio_pin(
+    published: &[String],
+    rocm_version: &str,
+    verified_release: Option<&'static str>,
+    index_url: &str,
+) -> Result<TorchaudioPin> {
+    let built_for_rocm = package_versions_matching_rocm(published, rocm_version);
+    if built_for_rocm.is_empty() {
+        bail!(
+            "no torchaudio built for ROCm {rocm_version} is published for this Python and platform in {index_url}"
+        );
+    }
+    let pin = |version, basis| TorchaudioPin {
+        version,
+        rocm_version: rocm_version.to_owned(),
+        basis,
+    };
+    let basis = match verified_release {
+        Some(release) => match published_build_of(&built_for_rocm, release) {
+            Some(version) => return Ok(pin(version, TorchaudioPinBasis::Verified)),
+            // Not among `built_for_rocm`, so a labelled build of it in the
+            // whole listing is one for another ROCm build.
+            None => TorchaudioPinBasis::VerifiedNotPublished {
+                release,
+                other_build: published_build_of(
+                    &published
+                        .iter()
+                        .filter(|version| package_rocm_suffix(version).is_some())
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                    release,
+                ),
+            },
+        },
+        None => TorchaudioPinBasis::NoVerifiedRelease,
+    };
+    let newest = latest_build_for_rocm(published, rocm_version).with_context(|| {
+        format!(
+            "torchaudio builds for ROCm {rocm_version} are published in {index_url}, but none has a PEP 440 version ROCm CLI can order: {}",
+            built_for_rocm.join(", ")
+        )
+    })?;
+    Ok(pin(newest, basis))
+}
+
+/// The build in `versions` whose public version is `release` under PEP 440
+/// (local label ignored, trailing zeros insignificant), as `uv` would match
+/// `torchaudio=={release}`. Not a prefix match: `2.11.0` must not find
+/// `2.11.0.2`.
+fn published_build_of(versions: &[String], release: &str) -> Option<String> {
+    let wanted = package_release_key(release)?;
+    versions
+        .iter()
+        .find(|version| package_release_key(version).as_ref() == Some(&wanted))
+        .cloned()
+}
+
+/// The newest of `versions` built for exactly `rocm_version`, chosen the way
+/// `uv` would choose among them: in PEP 440 order, with final releases ahead of
+/// any pre-release.
+///
+/// The fallback for [`torchaudio_pin`] only, never the first choice: newest is
+/// not a safe discriminator among builds sharing a `+rocm<version>` label (see
+/// there for the CPU-only `2.11.0+rocm10.1.0` precedent, and the vLLM engine's
+/// ROCm 10.x discover-build table, which pins `2.11.0.2` exactly for the same
+/// reason). Nothing on the index pairs a torchaudio build with a torch build,
+/// so this assumes the newest torchaudio of a ROCm build is the one built
+/// against that build's torch — the same choice `uv` made unaided when the
+/// pinned build was also the newest one on the index.
+///
+/// Not [`select_latest_stack_package`]: [`parse_version`] reads only
+/// `major.minor.patch` and rejects the rest, and torchaudio publishes rebuilds
+/// as extra release segments (`2.11.0.2`, `2.11.0.3`), so that would drop every
+/// rebuild and settle on the original `2.11.0` build.
+fn latest_build_for_rocm(versions: &[String], rocm_version: &str) -> Option<String> {
+    package_versions_matching_rocm(versions, rocm_version)
+        .into_iter()
+        .filter_map(|version| package_release_key(&version).map(|key| (key, version)))
+        .max_by(|(left, _), (right, _)| (left.is_final(), left).cmp(&(right.is_final(), right)))
+        .map(|(_, version)| version)
+}
+
+/// A PEP 440 version, less its `+local` label, as a value whose derived order is
+/// PEP 440's: field order is comparison order, and each enum's variants are
+/// declared lowest first.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct PackageReleaseKey {
+    epoch: u64,
+    /// Trailing zeros dropped, so `2.11` and `2.11.0` compare equal.
+    release: Vec<u64>,
+    pre: PreRelease,
+    post: Option<u64>,
+    dev: DevRelease,
+}
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum PreRelease {
+    /// `X.devN` with no pre- or post-release sorts below every `X` pre-release.
+    DevOnly,
+    /// `a` = 0, `b` = 1, `rc` = 2.
+    Pre(u8, u64),
+    Final,
+}
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum DevRelease {
+    Dev(u64),
+    Absent,
+}
+
+impl PackageReleaseKey {
+    /// `uv` only picks a pre-release (including any `.devN`) when no final
+    /// release is available; a post-release counts as final.
+    fn is_final(&self) -> bool {
+        self.pre == PreRelease::Final && self.dev == DevRelease::Absent
+    }
+}
+
+/// Parses the normalized PEP 440 form a package index publishes
+/// (`[N!]N(.N)*[{a|b|rc}N][.postN][.devN][+local]`), already percent-decoded
+/// by [`parse_simple_index_versions`]. Anything else is `None`, and is skipped
+/// rather than guessed at.
+fn package_release_key(version: &str) -> Option<PackageReleaseKey> {
+    fn number(rest: &mut &str) -> Option<u64> {
+        let len = rest.chars().take_while(char::is_ascii_digit).count();
+        let (digits, tail) = rest.split_at(len);
+        *rest = tail;
+        digits.parse().ok()
+    }
+
+    let public = version.split('+').next().unwrap_or_default();
+    let (epoch, mut rest) = match public.split_once('!') {
+        Some((epoch, rest)) => (epoch.parse().ok()?, rest),
+        None => (0, public),
+    };
+
+    let mut release = vec![number(&mut rest)?];
+    while let Some(tail) = rest.strip_prefix('.')
+        && tail.starts_with(|ch: char| ch.is_ascii_digit())
+    {
+        rest = tail;
+        release.push(number(&mut rest)?);
+    }
+    while release.len() > 1 && release.last() == Some(&0) {
+        release.pop();
+    }
+
+    let mut pre = None;
+    for (tag, kind) in [("rc", 2), ("a", 0), ("b", 1)] {
+        if let Some(tail) = rest.strip_prefix(tag) {
+            rest = tail;
+            pre = Some((kind, number(&mut rest)?));
+            break;
+        }
+    }
+    let post = match rest.strip_prefix(".post") {
+        Some(tail) => {
+            rest = tail;
+            Some(number(&mut rest)?)
+        }
+        None => None,
+    };
+    let dev = match rest.strip_prefix(".dev") {
+        Some(tail) => {
+            rest = tail;
+            Some(number(&mut rest)?)
+        }
+        None => None,
+    };
+    if !rest.is_empty() {
+        return None;
+    }
+
+    Some(PackageReleaseKey {
+        epoch,
+        release,
+        pre: match (pre, post, dev) {
+            (Some((kind, number)), ..) => PreRelease::Pre(kind, number),
+            (None, None, Some(_)) => PreRelease::DevOnly,
+            (None, ..) => PreRelease::Final,
+        },
+        post,
+        dev: dev.map_or(DevRelease::Absent, DevRelease::Dev),
+    })
 }
 
 fn package_versions_matching_rocm(versions: &[String], rocm_version: &str) -> Vec<String> {
@@ -5129,7 +5523,7 @@ try:
         # `Requires-Dist` entries carry environment markers after ';'. Only the
         # requirement itself matters here.
         requirement = raw.split(";")[0].strip()
-        # The distribution name runs up to the first specifier, extra or space —
+        # The distribution name runs up to the first specifier, extra or space -
         # and there is usually no space at all, as in `torch==2.11.0+gitd0c8b1f`.
         matched = re.match(r"[A-Za-z0-9._-]+", requirement)
         if matched is None:
@@ -7583,6 +7977,108 @@ mod tests {
     }
 
     #[test]
+    fn gfx90c_resolves_to_no_family_instead_of_the_datacenter_one() {
+        // gfx90c is the Vega iGPU in Renoir/Cezanne APUs. It used to normalize to
+        // `gfx90X-dcgpu`, so a plain `rocm install sdk` targeted data-center
+        // packages and the error listed that family as a `--family` choice.
+        assert_eq!(normalize_therock_family("gfx90c"), None);
+    }
+
+    #[test]
+    fn unsupported_gpu_error_names_the_gpu_and_does_not_suggest_families() {
+        let message = unsupported_host_gpu_message("gfx90c");
+        assert!(message.contains("no ROCm SDK build"), "{message}");
+        assert!(message.contains("`gfx90c`"), "{message}");
+        assert!(message.contains("Vulkan"), "{message}");
+        assert!(!message.contains("--family"), "{message}");
+        for family in known_therock_families() {
+            assert!(
+                !message.contains(family),
+                "the error must not offer `{family}` for an unsupported GPU: {message}"
+            );
+        }
+    }
+
+    /// Asking for gfx90c by name must fail, not quietly install for some other
+    /// GPU.
+    ///
+    /// `normalize_therock_family("gfx90c")` is `None`, and in `resolve_family`
+    /// `None` from the override branch means "keep looking" — so before the
+    /// explicit-target guard, `--family gfx90c` was dropped on the floor and
+    /// the host's own family was installed instead. That is worse than the
+    /// data-center mapping this change removed: the user named a target and
+    /// got a different one with no warning.
+    ///
+    /// Reaching detection at all would make this test depend on the machine it
+    /// runs on, so a failure here is also the signal that the guard moved below
+    /// the branches it has to precede.
+    #[test]
+    fn requesting_gfx90c_by_name_fails_instead_of_installing_another_family() {
+        let (_root, paths) = test_paths("resolve-family-gfx90c-override");
+        let error = resolve_family(&paths, Some("gfx90c"))
+            .expect_err("--family gfx90c must not resolve to any package family");
+        let message = error.to_string();
+        assert!(message.contains("no ROCm SDK build"), "{message}");
+        assert!(message.contains("`gfx90c`"), "{message}");
+        assert!(message.contains("--family"), "{message}");
+        assert!(
+            message.contains("no other family was substituted"),
+            "{message}"
+        );
+        for family in known_therock_families() {
+            assert!(
+                !message.contains(family),
+                "asking for gfx90c must not resolve or offer `{family}`: {message}"
+            );
+        }
+    }
+
+    /// A valid `--family` must resolve even if `ROCM_CLI_THEROCK_FAMILY` is
+    /// stale and happens to name gfx90c.
+    ///
+    /// The no-build guard used to run ahead of both sources regardless of
+    /// which one would actually be consulted, so a leftover env value with no
+    /// bearing on this invocation could refuse an otherwise-valid `--family`.
+    /// The guard now lives inside each source's own branch, so it only fires
+    /// for the source actually being read.
+    #[test]
+    #[allow(unsafe_code)] // std::env::set_var is unsafe in edition 2024
+    fn cli_family_overrides_a_stale_env_value_naming_an_unsupported_gpu() {
+        let _guard = PROCESS_ENV_TEST_LOCK.lock().unwrap();
+        let old_env = std::env::var_os("ROCM_CLI_THEROCK_FAMILY");
+        unsafe {
+            std::env::set_var("ROCM_CLI_THEROCK_FAMILY", "gfx90c");
+        }
+
+        let (_root, paths) = test_paths("resolve-family-cli-overrides-stale-env");
+        let resolution = resolve_family(&paths, Some("gfx1103"));
+
+        unsafe {
+            match old_env {
+                Some(value) => std::env::set_var("ROCM_CLI_THEROCK_FAMILY", value),
+                None => std::env::remove_var("ROCM_CLI_THEROCK_FAMILY"),
+            }
+        }
+
+        let resolution = resolution
+            .expect("a valid --family must resolve even with an unrelated gfx90c env override set");
+        assert_eq!(resolution.family, "gfx110X-all");
+        assert_eq!(resolution.source, "manifest");
+    }
+
+    #[test]
+    fn requested_target_error_names_where_the_target_came_from() {
+        let message = unsupported_requested_target_message("gfx90c", "--family");
+        assert!(message.contains("`gfx90c`"), "{message}");
+        assert!(message.contains("--family"), "{message}");
+        // The user named it; nothing was detected, so the error must not say so.
+        assert!(!message.contains("detected"), "{message}");
+
+        let message = unsupported_requested_target_message("gfx90c", "ROCM_CLI_THEROCK_FAMILY");
+        assert!(message.contains("ROCM_CLI_THEROCK_FAMILY"), "{message}");
+    }
+
+    #[test]
     fn release_channel_prefers_stable_versions() {
         let versions = vec![
             "7.11.0".to_owned(),
@@ -8096,6 +8592,347 @@ mod tests {
         Ok(())
     }
 
+    /// The live ROCm 10 index publishes torchaudio rebuilds as a fourth release
+    /// segment beside the original build, for more than one ROCm build at once.
+    #[test]
+    fn torchaudio_pin_is_the_newest_rebuild_of_the_requested_rocm_build() {
+        let published = [
+            "2.11.0+rocm10.0.0",
+            "2.11.0.2+rocm10.0.0",
+            "2.11.0+rocm10.1.0",
+            "2.11.0.2+rocm10.1.0",
+            "2.11.0.3+rocm10.1.0",
+        ]
+        .map(str::to_owned);
+
+        assert_eq!(
+            latest_build_for_rocm(&published, "10.0.0").as_deref(),
+            Some("2.11.0.2+rocm10.0.0")
+        );
+        assert_eq!(
+            latest_build_for_rocm(&published, "10.1.0").as_deref(),
+            Some("2.11.0.3+rocm10.1.0")
+        );
+        assert_eq!(latest_build_for_rocm(&published, "10.2.0"), None);
+    }
+
+    /// Mirrors uv's default: a pre-release is only chosen when no final
+    /// release exists for that build, and a post-release counts as final.
+    #[test]
+    fn torchaudio_pin_prefers_final_releases_like_uv() {
+        let published = [
+            "2.12.0a0+rocm10.0.0",
+            "2.11.0.2+rocm10.0.0",
+            "2.11.0+rocm10.0.0",
+        ]
+        .map(str::to_owned);
+        assert_eq!(
+            latest_build_for_rocm(&published, "10.0.0").as_deref(),
+            Some("2.11.0.2+rocm10.0.0")
+        );
+
+        let only_pre = ["2.12.0a0+rocm10.0.0", "2.12.0a1+rocm10.0.0"].map(str::to_owned);
+        assert_eq!(
+            latest_build_for_rocm(&only_pre, "10.0.0").as_deref(),
+            Some("2.12.0a1+rocm10.0.0")
+        );
+
+        let post = ["2.11.0+rocm10.0.0", "2.11.0.post1+rocm10.0.0"].map(str::to_owned);
+        assert_eq!(
+            latest_build_for_rocm(&post, "10.0.0").as_deref(),
+            Some("2.11.0.post1+rocm10.0.0")
+        );
+    }
+
+    /// Each PEP 440 suffix number compares as a number, and the suffixes rank
+    /// `.devN` < `aN` < `bN` < `rcN` < final < `.postN`, with a `.devN` on any
+    /// of them ranking just below it. Pairs are `(older, newer)`.
+    #[test]
+    fn torchaudio_pin_orders_versions_as_pep_440_does() {
+        for (older, newer) in [
+            ("2.12.0a9", "2.12.0a10"),
+            ("2.12.0rc2", "2.12.0rc10"),
+            ("2.11.0.post9", "2.11.0.post10"),
+            ("2.12.0.dev1", "2.12.0.dev2"),
+            ("2.12.0.dev1", "2.12.0a1"),
+            ("2.12.0a1", "2.12.0b1"),
+            ("2.12.0b1", "2.12.0rc1"),
+            ("2.12.0rc1.dev3", "2.12.0rc1"),
+            ("2.11.0.post1.dev0", "2.11.0.post1"),
+            ("2.11.0", "2.11.0.post1.dev0"),
+            ("2.11", "2.11.0.1"),
+            ("9.0.0", "1!2.0.0"),
+        ] {
+            assert!(
+                package_release_key(&format!("{older}+rocm10.0.0"))
+                    < package_release_key(&format!("{newer}+rocm10.0.0")),
+                "{older} must order below {newer}"
+            );
+        }
+        assert_eq!(
+            package_release_key("2.11+rocm10.0.0"),
+            package_release_key("2.11.0+rocm10.0.0"),
+            "trailing zero release segments are insignificant"
+        );
+    }
+
+    /// The live `whl-next` shape for `+rocm10.1.0`: a CPU-only `2.11.0`, the
+    /// hardware-verified `2.11.0.2`, and a newer `2.11.0.3` sharing the label.
+    fn rocm10_1_torchaudio_builds() -> Vec<String> {
+        [
+            "2.11.0+rocm10.1.0",
+            "2.11.0.2+rocm10.1.0",
+            "2.11.0.3+rocm10.1.0",
+            "2.11.0.2+rocm10.0.0",
+        ]
+        .map(str::to_owned)
+        .to_vec()
+    }
+
+    /// A verified release that is published wins over a newer build with the
+    /// same `+rocm` label, and the printed line says it is the verified one.
+    #[test]
+    fn torchaudio_pin_takes_the_published_verified_release_over_a_newer_build() -> Result<()> {
+        let pin = torchaudio_pin(
+            &rocm10_1_torchaudio_builds(),
+            "10.1.0",
+            Some("2.11.0.2"),
+            "https://index.test",
+        )?;
+        assert_eq!(pin.version, "2.11.0.2+rocm10.1.0");
+        assert_eq!(pin.basis, TorchaudioPinBasis::Verified);
+        assert!(pin.is_verified());
+        let line = pin.describe();
+        assert!(
+            line.contains("torchaudio 2.11.0.2+rocm10.1.0, the build verified on hardware")
+                && !line.contains("not hardware-verified"),
+            "{line}"
+        );
+        // The requirement handed to `uv` names the same build the line does.
+        assert_eq!(
+            published_pip_requirements("10.1.0", &pin.version, "gfx1200", false)[3],
+            "torchaudio==2.11.0.2+rocm10.1.0"
+        );
+        Ok(())
+    }
+
+    /// The verified release is matched as a whole PEP 440 version, never a
+    /// prefix: a verified `2.11.0` must not be satisfied by `2.11.0.2`.
+    #[test]
+    fn torchaudio_pin_matches_the_verified_release_exactly() -> Result<()> {
+        let published = ["2.11.0.2+rocm10.1.0", "2.11.0.3+rocm10.1.0"].map(str::to_owned);
+        let pin = torchaudio_pin(&published, "10.1.0", Some("2.11.0"), "https://index.test")?;
+        assert_eq!(
+            pin.basis,
+            TorchaudioPinBasis::VerifiedNotPublished {
+                release: "2.11.0",
+                other_build: None,
+            }
+        );
+        assert_eq!(pin.version, "2.11.0.3+rocm10.1.0");
+        Ok(())
+    }
+
+    /// A verified release published only for another ROCm build falls back to
+    /// the newest build for the requested one, and the printed reason names the
+    /// ROCm build as the cause, not the Python or platform: the verified release
+    /// is matched by ROCm line, so it can be published here under another label
+    /// of the same line.
+    #[test]
+    fn torchaudio_pin_falls_back_to_newest_when_the_verified_release_is_published_for_another_rocm_build()
+    -> Result<()> {
+        let published = [
+            "2.11.0+rocm10.1.1",
+            "2.11.0.3+rocm10.1.1",
+            "2.11.0.2+rocm10.1.0",
+        ]
+        .map(str::to_owned);
+        let pin = torchaudio_pin(&published, "10.1.1", Some("2.11.0.2"), "https://index.test")?;
+        assert_eq!(pin.version, "2.11.0.3+rocm10.1.1");
+        assert_eq!(
+            pin.basis,
+            TorchaudioPinBasis::VerifiedNotPublished {
+                release: "2.11.0.2",
+                other_build: Some("2.11.0.2+rocm10.1.0".to_owned()),
+            }
+        );
+        assert!(!pin.is_verified());
+        let line = pin.describe();
+        assert!(
+            line.contains(
+                "torchaudio 2.11.0.3+rocm10.1.1, the newest build published for ROCm 10.1.1"
+            ) && line.contains("not hardware-verified")
+                && line.contains(
+                    "the verified release, 2.11.0.2, is published for this Python and platform only for another ROCm build (2.11.0.2+rocm10.1.0), not for ROCm 10.1.1"
+                )
+                && !line.contains("is not published for this Python and platform"),
+            "{line}"
+        );
+        Ok(())
+    }
+
+    /// A verified release with no build at all for this Python and platform
+    /// falls back to the newest build, and the printed line says the release is
+    /// not published here. An unlabelled build is not a ROCm build, so it does
+    /// not count as one "for another ROCm build".
+    #[test]
+    fn torchaudio_pin_falls_back_to_newest_when_the_verified_release_is_unpublished() -> Result<()>
+    {
+        let published = ["2.11.0+rocm10.1.0", "2.11.0.3+rocm10.1.0", "2.11.0.2"].map(str::to_owned);
+        let pin = torchaudio_pin(&published, "10.1.0", Some("2.11.0.2"), "https://index.test")?;
+        assert_eq!(pin.version, "2.11.0.3+rocm10.1.0");
+        assert_eq!(
+            pin.basis,
+            TorchaudioPinBasis::VerifiedNotPublished {
+                release: "2.11.0.2",
+                other_build: None,
+            }
+        );
+        assert!(!pin.is_verified());
+        let line = pin.describe();
+        assert!(
+            line.contains(
+                "torchaudio 2.11.0.3+rocm10.1.0, the newest build published for ROCm 10.1.0"
+            ) && line.contains("not hardware-verified")
+                && line.contains(
+                    "the verified release, 2.11.0.2, is not published for this Python and platform"
+                ),
+            "{line}"
+        );
+        Ok(())
+    }
+
+    /// A real install notes an unverified torchaudio in its install log, for
+    /// both reasons a pin can be unverified, and stays quiet for a verified
+    /// one. The note is the pin's own `describe()` line, so it states the
+    /// decision that was actually taken.
+    #[test]
+    fn unverified_torchaudio_note_is_logged_only_for_an_unverified_pin() -> Result<()> {
+        let builds = rocm10_1_torchaudio_builds();
+        let verified = torchaudio_pin(&builds, "10.1.0", Some("2.11.0.2"), "https://index.test")?;
+        let not_published =
+            torchaudio_pin(&builds, "10.1.0", Some("2.11.0.9"), "https://index.test")?;
+        let no_verified_release = torchaudio_pin(&builds, "10.1.0", None, "https://index.test")?;
+        assert_eq!(verified.basis, TorchaudioPinBasis::Verified);
+        assert!(matches!(
+            not_published.basis,
+            TorchaudioPinBasis::VerifiedNotPublished { .. }
+        ));
+        assert_eq!(
+            no_verified_release.basis,
+            TorchaudioPinBasis::NoVerifiedRelease
+        );
+
+        assert_eq!(unverified_torchaudio_note(&verified), None);
+        for pin in [&not_published, &no_verified_release] {
+            let note = unverified_torchaudio_note(pin);
+            assert_eq!(note, Some(format!("Note: {}", pin.describe())));
+            assert!(
+                note.as_deref()
+                    .is_some_and(|note| note.contains("torchaudio 2.11.0.3+rocm10.1.0")
+                        && note.contains("not hardware-verified")),
+                "{note:?}"
+            );
+        }
+        Ok(())
+    }
+
+    /// With no verified release recorded for the line, the newest build is
+    /// pinned, and the printed line says it is not hardware-verified.
+    #[test]
+    fn torchaudio_pin_falls_back_to_newest_when_no_release_is_verified() -> Result<()> {
+        let pin = torchaudio_pin(
+            &rocm10_1_torchaudio_builds(),
+            "10.1.0",
+            None,
+            "https://index.test",
+        )?;
+        assert_eq!(pin.version, "2.11.0.3+rocm10.1.0");
+        assert_eq!(pin.basis, TorchaudioPinBasis::NoVerifiedRelease);
+        assert!(!pin.is_verified());
+        let line = pin.describe();
+        assert!(
+            line.contains(
+                "torchaudio 2.11.0.3+rocm10.1.0, the newest build published for ROCm 10.1.0"
+            ) && line.contains("not hardware-verified")
+                && line.contains("no torchaudio release is recorded as verified"),
+            "{line}"
+        );
+        Ok(())
+    }
+
+    /// The verified release the SDK reads is the vLLM engine's: 10.1 has one,
+    /// 10.0 has none yet. Pins the wiring, not the table (which the engine's
+    /// own tests own), so a change to it is seen here as a deliberate choice.
+    #[test]
+    fn torchaudio_verified_release_comes_from_the_vllm_discover_table() {
+        assert_eq!(
+            rocm_engine_vllm::verified_torchaudio_release("10.1.0"),
+            Some("2.11.0.2")
+        );
+        assert_eq!(
+            rocm_engine_vllm::verified_torchaudio_release("10.0.0"),
+            None
+        );
+    }
+
+    /// A version the parser cannot read is left out, never guessed at: a newer
+    /// unreadable build must not win the pin.
+    #[test]
+    fn torchaudio_pin_skips_versions_it_cannot_read() -> Result<()> {
+        let published = [
+            "2.11.0+rocm10.0.0",
+            "2.12.0-local-hack+rocm10.0.0",
+            "2.11.0.2+rocm10.0.0",
+        ]
+        .map(str::to_owned);
+        assert_eq!(
+            torchaudio_pin(&published, "10.0.0", None, "https://index.test")?.version,
+            "2.11.0.2+rocm10.0.0"
+        );
+        Ok(())
+    }
+
+    /// The two refusals name different problems, so each says which one it is.
+    #[test]
+    fn torchaudio_pin_refusal_says_whether_the_build_is_missing_or_unreadable() {
+        let other_build = ["2.11.0.3+rocm10.1.0"].map(str::to_owned);
+        let missing = torchaudio_pin(
+            &other_build,
+            "10.0.0",
+            Some("2.11.0.2"),
+            "https://index.test",
+        )
+        .expect_err("no torchaudio for the pinned build must refuse")
+        .to_string();
+        assert!(
+            missing.contains("no torchaudio built for ROCm 10.0.0 is published"),
+            "{missing}"
+        );
+
+        let unreadable = ["2.12.0-local-hack+rocm10.0.0"].map(str::to_owned);
+        let unreadable = torchaudio_pin(&unreadable, "10.0.0", None, "https://index.test")
+            .expect_err("an unreadable-only build must refuse")
+            .to_string();
+        assert!(
+            unreadable.contains("none has a PEP 440 version")
+                && unreadable.contains("2.12.0-local-hack+rocm10.0.0")
+                && !unreadable.contains("no torchaudio built"),
+            "{unreadable}"
+        );
+    }
+
+    /// A post-release that is itself a dev build is still a pre-release to
+    /// `uv`, so a final release wins over it.
+    #[test]
+    fn torchaudio_pin_treats_a_dev_post_release_as_a_pre_release() {
+        let published = ["2.11.0+rocm10.0.0", "2.11.0.post1.dev0+rocm10.0.0"].map(str::to_owned);
+        assert_eq!(
+            latest_build_for_rocm(&published, "10.0.0").as_deref(),
+            Some("2.11.0+rocm10.0.0")
+        );
+    }
+
     #[test]
     fn uv_metadata_plan_rejects_mixed_rocm_builds() {
         let error = parse_uv_compiled_package_versions(
@@ -8348,6 +9185,7 @@ mod tests {
             latest_version: "7.13.0".to_owned(),
             newest_repo_version: None,
             version_resolution_specs: None,
+            torchaudio_pin: None,
             package_versions: TheRockPipPackageVersions {
                 rocm: "7.13.0".to_owned(),
                 torch: "2.11.0+rocm7.13.0".to_owned(),
@@ -8406,21 +9244,24 @@ mod tests {
     /// extras.
     #[test]
     fn version_resolution_requests_the_toolchain_only_when_asked() {
-        let runtime_only = published_pip_requirements("10.0.0", "gfx1200", false);
+        let runtime_only =
+            published_pip_requirements("10.0.0", "2.11.0.2+rocm10.0.0", "gfx1200", false);
         assert_eq!(
             runtime_only[0], "rocm[libraries,device-gfx1200]==10.0.0",
             "a default install must not resolve against the toolchain: {runtime_only:?}"
         );
 
-        let with_devel = published_pip_requirements("10.0.0", "gfx1200", true);
+        let with_devel =
+            published_pip_requirements("10.0.0", "2.11.0.2+rocm10.0.0", "gfx1200", true);
         assert_eq!(
             with_devel[0], "rocm[libraries,devel,device-gfx1200]==10.0.0",
             "--devel must reach the resolved requirements: {with_devel:?}"
         );
 
-        // Only the `rocm` requirement carries the toolchain axis; the torch
-        // stack is unversioned here because choosing those versions is what the
-        // resolve is for.
+        // Only the `rocm` requirement carries the toolchain axis. torch and
+        // torchvision are unversioned because choosing those versions is what
+        // the resolve is for; torchaudio is pinned because its metadata does not
+        // follow the `rocm` pin (see `published_pip_requirements`).
         assert_eq!(
             runtime_only[1..],
             with_devel[1..],
@@ -8431,7 +9272,7 @@ mod tests {
             [
                 "torch[device-gfx1200]".to_owned(),
                 "torchvision[device-gfx1200]".to_owned(),
-                "torchaudio".to_owned(),
+                "torchaudio==2.11.0.2+rocm10.0.0".to_owned(),
             ]
         );
     }
@@ -8448,6 +9289,7 @@ mod tests {
         for include_devel in [false, true] {
             let requirements = published_pip_requirements(
                 &resolution.package_versions.rocm,
+                &resolution.package_versions.torchaudio,
                 "gfx942",
                 include_devel,
             );
@@ -8458,6 +9300,13 @@ mod tests {
                 "resolution and install must request the same rocm extras for \
                  include_devel={include_devel}: {requirements:?} vs {:?}",
                 composition.package_specs
+            );
+            // torchaudio is the one stack package resolution pins rather than
+            // leaving to `uv`, so it has to be the very build install names.
+            assert_eq!(
+                requirements[3], composition.package_specs[3],
+                "resolution and install must name the same torchaudio for \
+                 include_devel={include_devel}"
             );
         }
     }

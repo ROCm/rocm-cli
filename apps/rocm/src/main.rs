@@ -9,6 +9,7 @@
 mod archive_props;
 mod automations;
 mod bootstrap;
+mod chat;
 mod chat_host_facts;
 mod cli_progress;
 mod cli_report;
@@ -62,16 +63,15 @@ use crate::engines_cmd::{
     engine_manages_own_runtime, engines, env_root_for_service, runtime_manifest_for_selector,
 };
 use crate::runtime_install_finalize::{
-    SdkInstallConsents, empty_as_unknown, ensure_libatomic_for_torch, ensure_libnuma_for_torch,
+    SdkInstallConsents, ensure_libatomic_for_torch, ensure_libnuma_for_torch,
     finalize_successful_sdk_install, finish_sdk_install, maybe_auto_install_sdk_preferred_engine,
     print_sdk_install_success,
 };
 use crate::runtimes_cmd::{
     RuntimeActivationResult, activate_runtime, active_runtime_marker_path,
     current_runtime_manifest, default_runtime_id_matches, recover_setup_runtime_registration,
-    render_runtimes_text, runtime_keys_text, runtime_usability_status, runtimes,
-    select_runtime_manifest, setup_runtime_paths, toolchain_state_text,
-    validate_runtime_manifest_for_activation,
+    runtime_keys_text, runtime_usability_status, runtimes, select_runtime_manifest,
+    setup_runtime_paths, toolchain_state_text, validate_runtime_manifest_for_activation,
 };
 use crate::serve_cmd::{ServeArgs, select_serve_engine, serve};
 #[cfg(not(windows))]
@@ -94,16 +94,15 @@ use rocm_core::{
     DEFAULT_LOCAL_HOST, EndpointReadiness, EndpointReadinessOutcome, ExamineSummary,
     ManagedServiceRecord, ModelRecipeRecord, ModelRecipeRegistry, ModelRecipeRegistrySource,
     PERMISSIONS_MODE_ASK, PERMISSIONS_MODE_FULL_ACCESS, RocmCliConfig, TELEMETRY_MODE_LOCAL,
-    TELEMETRY_MODE_OFF, WatcherMode, append_audit_event, builtin_model_recipes, builtin_watcher,
-    builtin_watchers, command_failure_detail, connect_tcp_stream, daemon_binary_path,
-    default_engine_for_platform, detect_host_gfx_target, detect_host_gpu_summary,
-    engine_binary_path, engine_plugin_dirs, format_host_port, format_http_base_url,
-    interactive_terminal, load_model_recipe_registry, load_recent_audit_events,
-    load_recent_automation_events, load_recent_automation_proposals, managed_pip_cache_dir,
-    managed_service_endpoint_readiness, model_artifact_cache_status, model_catalog_platforms,
-    model_recipe_featured, model_recipe_target_platform_label, normalize_therock_family,
-    platform_matches_gfx_family, process_is_running, read_http_response_bounded,
-    resolve_builtin_model_recipe, runtime_install_root_is_protected, uv_cache_source,
+    TELEMETRY_MODE_OFF, WatcherMode, append_audit_event, builtin_model_recipes, builtin_watchers,
+    connect_tcp_stream, daemon_binary_path, default_engine_for_platform, detect_host_gfx_target,
+    detect_host_gpu_summary, engine_binary_path, engine_plugin_dirs, format_host_port,
+    format_http_base_url, interactive_terminal, load_model_recipe_registry,
+    load_recent_audit_events, load_recent_automation_events, load_recent_automation_proposals,
+    managed_pip_cache_dir, managed_service_endpoint_readiness, model_artifact_cache_status,
+    model_catalog_platforms, model_recipe_featured, model_recipe_target_platform_label,
+    normalize_therock_family, platform_matches_gfx_family, process_is_running,
+    read_http_response_bounded, resolve_builtin_model_recipe, uv_cache_source,
     write_all_tcp_stream,
 };
 use rocm_engine_protocol::{
@@ -118,7 +117,6 @@ use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, BufRead, Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 #[cfg(all(test, not(windows)))]
@@ -167,6 +165,12 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Command {
     /// Check this computer's GPU, ROCm install, engines, and setup folders.
+    ///
+    /// A GPU that is recognized but has no ROCm build at all - `gfx90c`, the
+    /// Vega iGPU in Renoir, Lucienne, Cezanne and Barcelo APUs - is reported on
+    /// a `rocm_support` line saying so, so that an empty
+    /// `compatible_therock_family` does not read as a failed probe. Such a GPU
+    /// still works through the Vulkan backend.
     Examine {
         /// Emit the machine-readable Examination JSON (for diagnosis tooling).
         #[arg(long)]
@@ -187,7 +191,7 @@ enum Command {
     ///
     /// Matches this machine against a fixed catalog of known misconfigurations and
     /// ranks what it finds. It can only recognise failure modes that are in the
-    /// catalog: no match means "not recognised", not "nothing is wrong" — in that
+    /// catalog: no match means "not recognised", not "nothing is wrong" - in that
     /// case it points you at where to report the symptom.
     ///
     /// Each cause is printed with an `id:` and an `apply with:` command. The
@@ -214,7 +218,7 @@ enum Command {
         /// Takes a curated model name or alias (see `rocm model`). Nothing is
         /// fetched: the answer comes from the recipe and this host's GPU. A
         /// model the catalog does not carry is reported as undetermined rather
-        /// than blocked — `rocm serve` still accepts it, this just cannot say
+        /// than blocked - `rocm serve` still accepts it, this just cannot say
         /// in advance whether it fits.
         ///
         /// A flag rather than a positional: `diagnose` takes no positional
@@ -249,7 +253,7 @@ enum Command {
     },
     /// Apply a known fix by id (see `rocm diagnose`); run with no id to list fixes.
     ///
-    /// Takes the `id:` that `rocm diagnose` reports against a cause — not the
+    /// Takes the `id:` that `rocm diagnose` reports against a cause - not the
     /// `#1`/`#2` ranking position, which belongs to one report and is not a name.
     /// With no id it lists the whole catalog.
     ///
@@ -257,9 +261,10 @@ enum Command {
     /// you: AUTO means this command carries the change out; NEEDS-ARG means it
     /// will, once told what to act on; PRINT-ONLY means it prints the steps for
     /// you to run yourself (typically because they need sudo or a reboot); and
-    /// DIAGNOSE-ONLY means no reliable fix exists and nothing will be changed
-    /// (no catalog entry carries this marker today; it is reserved for a
-    /// future detect-but-cannot-repair failure).
+    /// DIAGNOSE-ONLY means no reliable fix exists, so running it names the
+    /// problem and changes nothing (`info-20-gpu-no-rocm-support` is the entry
+    /// marked that way today: a GPU ROCm has no runtime build for is a fact
+    /// about the hardware, not something to put right).
     /// Use `--dry-run` to see any fix's plan without changing anything.
     Fix {
         /// Fix id, e.g. fix-4-render-group. Omit to list available fixes.
@@ -378,13 +383,13 @@ echo \"Summarize this\" | rocm chat --provider anthropic")]
         // an unexpected argument. clap only treats a `-…` token as a number when the whole
         // remainder parses as one, so a missing value (`--temperature --top-p 0.5`) or a
         // malformed token (`--temperature -0.5abc`) still errors at parse time.
-        #[arg(long, allow_negative_numbers = true, value_parser = parse_non_negative_temperature)]
+        #[arg(long, allow_negative_numbers = true, value_parser = chat::parse_non_negative_temperature)]
         temperature: Option<f32>,
         /// Nucleus sampling probability to send with the request (0.0-1.0).
-        #[arg(long = "top-p", allow_negative_numbers = true, value_parser = parse_unit_interval)]
+        #[arg(long = "top-p", allow_negative_numbers = true, value_parser = chat::parse_unit_interval)]
         top_p: Option<f32>,
         /// Maximum number of tokens to generate in the response.
-        #[arg(long = "max-tokens", allow_negative_numbers = true, value_parser = parse_positive_u32)]
+        #[arg(long = "max-tokens", allow_negative_numbers = true, value_parser = chat::parse_positive_u32)]
         max_tokens: Option<u32>,
         #[arg(
             long,
@@ -518,7 +523,7 @@ rocm serve qwen --verbose --device gpu_required")]
         ///
         /// Loopback serving is credential-free because only this machine can
         /// reach it. That stops being true when something else republishes the
-        /// port — a tailnet publish, a reverse proxy, a container port map — at
+        /// port - a tailnet publish, a reverse proxy, a container port map - at
         /// which point the bind address no longer describes who can call it.
         /// Pass this to keep the endpoint authenticated anyway. `rocm remote`
         /// sets it on every session it starts.
@@ -547,13 +552,13 @@ rocm serve qwen --verbose --device gpu_required")]
         // an unexpected argument. clap only treats a `-…` token as a number when the whole
         // remainder parses as one, so a missing value (`--temperature --top-p 0.5`) or a
         // malformed token (`--temperature -0.5abc`) still errors at parse time.
-        #[arg(long, allow_negative_numbers = true, value_parser = parse_non_negative_temperature)]
+        #[arg(long, allow_negative_numbers = true, value_parser = chat::parse_non_negative_temperature)]
         temperature: Option<f32>,
         /// Default nucleus sampling probability for generation (0.0-1.0).
-        #[arg(long = "top-p", allow_negative_numbers = true, value_parser = parse_unit_interval)]
+        #[arg(long = "top-p", allow_negative_numbers = true, value_parser = chat::parse_unit_interval)]
         top_p: Option<f32>,
         /// Default maximum number of tokens to generate per response.
-        #[arg(long = "max-tokens", allow_negative_numbers = true, value_parser = parse_positive_u32)]
+        #[arg(long = "max-tokens", allow_negative_numbers = true, value_parser = chat::parse_positive_u32)]
         max_tokens: Option<u32>,
         /// API key that clients must present to a public (non-loopback) endpoint.
         /// When binding a public interface and this is omitted, a strong key is
@@ -647,6 +652,12 @@ rocm logs --search error timeout")]
         command: BenchCommand,
     },
     /// Remove ROCm CLI-managed files from this computer.
+    ///
+    /// Removes the config, data, and cache directories and the installed
+    /// binaries, including the running rocm.exe on Windows. It also undoes the
+    /// PATH change the installer made (its marked shell-profile block, or the
+    /// user PATH entry it recorded adding on Windows), unless other programs
+    /// share the install folder.
     Uninstall {
         /// Do not ask for interactive confirmation.
         #[arg(long)]
@@ -654,7 +665,7 @@ rocm logs --search error timeout")]
         /// Show what would be removed without deleting anything.
         #[arg(long)]
         dry_run: bool,
-        /// Keep installed rocm-cli binaries.
+        /// Keep installed rocm-cli binaries, and the installer's PATH change.
         #[arg(long)]
         keep_binaries: bool,
         /// Keep saved settings.
@@ -677,7 +688,7 @@ rocm logs --search error timeout")]
 #[derive(Subcommand, Debug)]
 enum BenchCommand {
     /// Run a concurrency sweep (RAW serving throughput, synthetic single-shot
-    /// requests — not agent-shaped, not comparable to *-agent-bench harnesses).
+    /// requests - not agent-shaped, not comparable to *-agent-bench harnesses).
     ///
     /// Measures RAW serving throughput (synthetic single-shot requests, vLLM
     /// benchmark_serving shape). It does NOT reproduce agent-shaped, multi-turn,
@@ -741,6 +752,12 @@ rocm install sdk --devel")]
         #[arg(long, value_name = "YYYY-MM-DD", conflicts_with = "version")]
         build_date: Option<String>,
         /// TheRock GPU package family to install, such as gfx110X-all.
+        ///
+        /// A GPU target ROCm publishes no build for is refused rather than
+        /// mapped to a near neighbour: `--family gfx90c` - the Vega iGPU in
+        /// Renoir, Lucienne, Cezanne and Barcelo APUs - fails and installs
+        /// nothing, instead of substituting another family. A plain `rocm
+        /// install sdk` reports the same refusal when it detects such a GPU.
         #[arg(long)]
         family: Option<String>,
         /// Also install the ROCm compiler, headers, and static libraries for
@@ -761,7 +778,7 @@ rocm install sdk --devel")]
         /// Approve replacing the current active default ROCm runtime (and
         /// required system-package installs such as OpenMPI for vLLM) without
         /// prompting; required outside an interactive terminal whenever a
-        /// managed runtime is already the active default — including when this
+        /// managed runtime is already the active default - including when this
         /// install targets a different GPU family or channel, which takes over
         /// the active default just the same. An install with no active default
         /// runtime never prompts.
@@ -857,7 +874,7 @@ enum RuntimesCommand {
     },
     /// Switch back to the previously selected ROCm runtime.
     #[command(
-        after_help = "NOTE: rollback has no history — it remembers only the runtime you just \
+        after_help = "NOTE: rollback has no history - it remembers only the runtime you just \
 left, so it cannot undo more than one activation."
     )]
     Rollback {
@@ -970,7 +987,17 @@ enum ComfyuiCommand {
         /// ROCm runtime key or id to use (see `rocm runtimes list`).
         #[arg(long)]
         runtime_id: Option<String>,
-        /// Reinstall even if ComfyUI already exists.
+        /// Replace ComfyUI's code even if it is already installed. Only what the installed
+        /// ComfyUI release shipped is deleted. Models, user (saved workflows), output, input,
+        /// custom_nodes, datasets and extra_model_paths.yaml are kept, and anything else of
+        /// yours is left in place; an entry of yours named like code the new release adds is
+        /// renamed to `<name>.rocm-cli-kept-<time>`. An install made before rocm-cli recorded
+        /// what its release shipped instead replaces whatever has the names the new release
+        /// ships, and lists it. Refused while the ComfyUI started by `rocm comfyui start` is
+        /// running or still starting, checked before the download and again just before the code
+        /// is replaced, unless rocm-cli's saved record of it cannot be read, which it then says.
+        /// Over an existing install, a download that is not a ComfyUI release (no main.py) is
+        /// discarded and the install is left as it was.
         #[arg(long)]
         reinstall: bool,
         /// Show what would happen without changing files.
@@ -1039,6 +1066,10 @@ enum ServicesCommand {
         yes: bool,
     },
     /// Restart a local model server.
+    ///
+    /// Stops the server first, and starts it again only once every process it
+    /// recorded is confirmed gone. If the stop cannot confirm that, nothing is
+    /// started and the stop request stays recorded on the server.
     Restart {
         /// Service id from `rocm services list --all`.
         service_id: String,
@@ -1071,8 +1102,8 @@ enum ServicesCommand {
     Prune {
         /// Only remove records and files untouched for at least this many hours.
         ///
-        /// Age is measured from when the record file was last written — a stop,
-        /// a restart, or a status correction all count as touching it — so a
+        /// Age is measured from when the record file was last written - a stop,
+        /// a restart, or a status correction all count as touching it - so a
         /// server that has only just stopped keeps its log and stays
         /// restartable. Pass 0 to include everything that is not running.
         #[arg(long, default_value_t = DEFAULT_SERVICE_PRUNE_MIN_AGE_HOURS)]
@@ -1216,7 +1247,7 @@ enum FrameworkArg {
     /// Probe llama.cpp only.
     #[value(name = "llama-cpp", alias = "llamacpp")]
     LlamaCpp,
-    /// Probe no framework at all — fastest, and enough for GPU and driver questions.
+    /// Probe no framework at all - fastest, and enough for GPU and driver questions.
     Skip,
 }
 
@@ -1787,7 +1818,7 @@ fn render_setup_status_text(paths: &AppPaths, config: &RocmCliConfig) -> Result<
     } else if config.onboarding_dismissed {
         "setup dismissed"
     } else {
-        "first-time setup available — open manually via `rocm dash`'s Observe tab with `n`"
+        "first-time setup available - open manually via `rocm dash`'s Observe tab with `n`"
     };
 
     let mut output = String::new();
@@ -1821,7 +1852,7 @@ fn reset_setup_prompt_state(paths: &AppPaths, config: &mut RocmCliConfig) -> Res
     config.setup.completed = false;
     config.save(paths)?;
     Ok([
-        "Onboarding will not reopen automatically — open it from `rocm dash`'s Observe tab with `n`.",
+        "Onboarding will not reopen automatically - open it from `rocm dash`'s Observe tab with `n`.",
         "ROCm installs were not deleted.",
         "Installed ROCm folders, API keys, and provider settings were kept.",
         "",
@@ -1965,7 +1996,7 @@ fn apply_freeform_execution_consent(args: &mut Vec<String>) -> bool {
     let already_present = args
         .iter()
         .any(|arg| arg == "--approve-replacing-active-default");
-    ensure_flag(args, "--approve-replacing-active-default");
+    chat::ensure_flag(args, "--approve-replacing-active-default");
     !already_present
 }
 
@@ -2034,7 +2065,7 @@ fn render_freeform_read_only_answer(
             render_freeform_examine_answer(request, paths, config).map(Some)
         }
         [command, subcommand] if command == "comfyui" && subcommand == "status" => {
-            render_freeform_comfyui_status_answer(paths, config).map(Some)
+            comfyui::render_chat_status_answer(paths).map(Some)
         }
         [command, subcommand] if command == "comfyui" && subcommand == "logs" => {
             let logs = comfyui::render_logs(paths, DEFAULT_LOG_TAIL_LINES)?;
@@ -2054,7 +2085,7 @@ fn render_freeform_examine_answer(
     let manifests = therock::load_runtime_manifests(paths)?;
     let active = current_runtime_manifest(config, &manifests);
     let lower = request.to_ascii_lowercase();
-    let asks_where = any_substring(&lower, &["where", "folder", "path"]);
+    let asks_where = chat::any_substring(&lower, &["where", "folder", "path"]);
     let mut output = String::new();
     let _ = writeln!(
         output,
@@ -2139,45 +2170,12 @@ fn render_freeform_examine_answer(
     Ok(output)
 }
 
-fn render_freeform_comfyui_status_answer(
-    paths: &AppPaths,
-    config: &RocmCliConfig,
-) -> Result<String> {
-    let status = comfyui::render_status(paths, config)?;
-    let installed = status.contains("  installed: yes");
-    let running = status.contains("  status: running");
-    let starting = status.contains("  status: starting");
-    let mut output = String::new();
-    let _ = writeln!(output, "ComfyUI status");
-    let _ = writeln!(output);
-    if installed {
-        let _ = writeln!(output, "ComfyUI: installed");
-    } else {
-        let _ = writeln!(output, "ComfyUI: not installed yet");
-    }
-    if running {
-        let url = chat_tool_value(&status, "url").unwrap_or_else(|| "<unknown>".to_owned());
-        let _ = writeln!(output, "Running: yes");
-        let _ = writeln!(output, "URL: {url}");
-    } else if starting {
-        let _ = writeln!(output, "Running: starting");
-    } else {
-        let _ = writeln!(output, "Running: no");
-    }
-    if !installed {
-        let _ = writeln!(
-            output,
-            "To install it, ask `can you setup ComfyUI for me` or run `rocm comfyui install`."
-        );
-    } else if !running {
-        let _ = writeln!(
-            output,
-            "To open it, ask `can you start ComfyUI` or run `rocm comfyui start`."
-        );
-    }
-    let _ = writeln!(output);
-    let _ = writeln!(output, "Nothing was changed.");
-    Ok(output)
+/// Sampling controls a caller can pass through to the underlying chat request.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ChatInferenceParams {
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub max_tokens: Option<u32>,
 }
 
 fn dispatch(cli: Cli) -> Result<()> {
@@ -2287,7 +2285,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             };
             let arguments = serde_json::from_str(arguments_json.trim_start_matches('\u{feff}'))
                 .with_context(|| format!("failed to parse arguments JSON for `{name}`"))?;
-            let value = run_internal_mcp_call(&paths, &name, arguments, allow_mutation)?;
+            let value = chat::run_internal_mcp_call(&paths, &name, arguments, allow_mutation)?;
             println!("{}", serde_json::to_string(&value)?);
             Ok(())
         }
@@ -2322,6 +2320,7 @@ fn dispatch(cli: Cli) -> Result<()> {
                         top_p,
                         max_tokens,
                     },
+                    false,
                 );
             }
             // Resolve the prompt from `--prompt` or, when it is omitted and
@@ -2334,12 +2333,12 @@ fn dispatch(cli: Cli) -> Result<()> {
             // — an empty pipe or `< /dev/null`.
             let prompt = match prompt {
                 Some(prompt) => Some(prompt),
-                None => read_piped_prompt()?,
+                None => chat::read_piped_prompt()?,
             };
             match prompt {
                 Some(prompt) => print!(
                     "{}",
-                    render_chat_prompt_text(
+                    chat::render_chat_prompt_text(
                         &paths,
                         provider.map_or("local", provider_name),
                         model.as_deref(),
@@ -2354,7 +2353,7 @@ fn dispatch(cli: Cli) -> Result<()> {
                 ),
                 None => print!(
                     "{}",
-                    render_chat_text(&paths, provider.map_or("local", provider_name))?
+                    chat::render_chat_text(&paths, provider.map_or("local", provider_name))?
                 ),
             }
             Ok(())
@@ -2588,7 +2587,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             replay,
             demo,
             chat_mock,
-        }) => dash::run(replay, demo, chat_mock),
+        }) => dash::run(replay, demo, chat_mock, false),
         Some(Command::Bench { command }) => match command {
             BenchCommand::Load {
                 endpoint,
@@ -3517,7 +3516,7 @@ fn install(target: InstallTarget) -> Result<()> {
                 .map_or_else(|| "<managed>".to_owned(), |path| path.display().to_string());
             match therock::install_sdk(
                 &paths,
-                sdk_install_request(
+                chat::sdk_install_request(
                     &channel,
                     format_name,
                     prefix,
@@ -4414,7 +4413,7 @@ fn build_service_prune_plan(
         if managed_service_record_is_in_use(&record) {
             plan.skipped_live += 1;
             plan.skipped.push(format!(
-                "{} is {} — stop it first with `{}`",
+                "{} is {} - stop it first with `{}`",
                 record.service_id,
                 record.status,
                 service_hints::service_stop_hint(&record.service_id)
@@ -4987,4063 +4986,6 @@ pub(crate) fn render_launch_summary(paths: &AppPaths, config: &RocmCliConfig) ->
     output
 }
 
-/// Read a one-shot chat prompt from standard input when it is piped in.
-///
-/// Backs the documented `echo "…" | rocm chat` path: when `--prompt` is omitted
-/// and stdin is not a terminal, the piped text becomes the prompt. Returns
-/// `None` when stdin is an interactive TTY or the piped input is blank, so the
-/// caller falls back to the status screen instead of blocking on input nobody
-/// can supply.
-///
-/// The read runs to EOF — the conventional filter contract that
-/// `read_provider_key_from_user` already follows. A caller that hands us a pipe
-/// it never writes to and never closes therefore waits, exactly as `cat` would;
-/// the TTY guard is what keeps that off an interactive user, and a
-/// non-interactive caller with no prompt to send should pass `/dev/null` (as
-/// `scripts/smoke_local.py` does) rather than an idle pipe. A read error — a
-/// closed or non-UTF-8 fd 0 — is reported instead of being folded into "no
-/// prompt", so text that was piped but could not be decoded fails loudly rather
-/// than silently becoming a status screen and a zero exit.
-fn read_piped_prompt() -> Result<Option<String>> {
-    use std::io::IsTerminal as _;
-
-    if std::io::stdin().is_terminal() {
-        return Ok(None);
-    }
-    let mut buf = String::new();
-    std::io::stdin()
-        .read_to_string(&mut buf)
-        .context("failed to read chat prompt from standard input")?;
-    Ok(piped_prompt_from_input(&buf))
-}
-
-/// Turn raw piped stdin into a chat prompt, or `None` when there is nothing to
-/// send.
-///
-/// `--prompt` reaches the send path verbatim, so a piped prompt must too:
-/// leading indentation and trailing spaces or tabs carry meaning for a model and
-/// are preserved byte for byte. The only thing removed is the line ending the
-/// writer appends — a single trailing `\n`, plus the `\r` in front of it on
-/// Windows — because `echo "…" |` and `printf '…\n' |` add it, not the user.
-/// Further blank lines stay: the second newline of `printf 'a\n\n'` is authored
-/// content, not shell punctuation.
-///
-/// `trim()` is used only to classify the input: whitespace-only stdin (an empty
-/// pipe, or a bare newline) holds no prompt and yields `None`. That is the one
-/// deliberate divergence from `--prompt`, which forwards `"   "` as written: a
-/// bare `rocm chat` under any redirect — `< /dev/null`, a closed heredoc, a CI
-/// step with no stdin — has to keep printing the status screen rather than send
-/// a blank turn to a model, and a caller who really means to send whitespace
-/// can still say so with `--prompt`.
-fn piped_prompt_from_input(input: &str) -> Option<String> {
-    if input.trim().is_empty() {
-        return None;
-    }
-    let prompt = match input.strip_suffix('\n') {
-        Some(rest) => rest.strip_suffix('\r').unwrap_or(rest),
-        None => input,
-    };
-    Some(prompt.to_owned())
-}
-
-pub(crate) fn render_chat_text(paths: &AppPaths, provider: &str) -> Result<String> {
-    let status = providers::provider_status(paths, provider)?;
-    let mut output = String::new();
-    let _ = writeln!(output, "Chat assistant");
-    let _ = writeln!(output);
-    let _ = writeln!(
-        output,
-        "Assistant source: {}",
-        if status.provider == "local" {
-            "local model on this computer"
-        } else {
-            status.provider.as_str()
-        }
-    );
-    let _ = writeln!(
-        output,
-        "Status: {}",
-        plain_provider_auth_status(&status.auth_status)
-    );
-    let _ = writeln!(
-        output,
-        "ROCm help: {}",
-        if status.tool_call_schema.is_empty() {
-            "not available"
-        } else {
-            "available"
-        }
-    );
-    if status.models.is_empty() {
-        let _ = writeln!(output, "Models: none found yet");
-    } else {
-        let _ = writeln!(output, "Models:");
-        for model in status.models {
-            let _ = writeln!(output, "  - {model}");
-        }
-    }
-    let _ = writeln!(output);
-    let _ = writeln!(
-        output,
-        "Choose Chat source to switch between local and remote assistants."
-    );
-    let _ = writeln!(output, "Choose Settings to manage saved keys and defaults.");
-    Ok(output)
-}
-
-fn plain_provider_auth_status(status: &str) -> String {
-    if status == "ready" {
-        "Ready".to_owned()
-    } else if status == "no_ready_local_service" {
-        "No local model server is ready".to_owned()
-    } else if status.starts_with("disabled:") {
-        "Disabled until you enable this provider".to_owned()
-    } else {
-        status.replace('_', " ")
-    }
-}
-
-pub(crate) fn render_chat_prompt_text(
-    paths: &AppPaths,
-    provider: &str,
-    model: Option<&str>,
-    prompt: &str,
-    rocm_tools: bool,
-    params: ChatInferenceParams,
-) -> Result<String> {
-    Ok(render_chat_prompt_result_with_progress(
-        paths, provider, model, prompt, rocm_tools, params, None,
-    )?
-    .rendered)
-}
-
-/// Sampling controls a caller can pass through to the underlying chat request.
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct ChatInferenceParams {
-    pub temperature: Option<f32>,
-    pub top_p: Option<f32>,
-    pub max_tokens: Option<u32>,
-}
-
-/// Parse a `--temperature` value: a finite number greater than or equal to 0.
-fn parse_non_negative_temperature(value: &str) -> Result<f32, String> {
-    let parsed: f32 = value
-        .parse()
-        .map_err(|_| format!("`{value}` is not a valid number"))?;
-    if !parsed.is_finite() || parsed < 0.0 {
-        return Err("temperature must be a finite value >= 0.0".to_owned());
-    }
-    Ok(parsed)
-}
-
-/// Parse a `--top-p` value: a finite number in the inclusive range 0.0..=1.0.
-fn parse_unit_interval(value: &str) -> Result<f32, String> {
-    let parsed: f32 = value
-        .parse()
-        .map_err(|_| format!("`{value}` is not a valid number"))?;
-    if !parsed.is_finite() || !(0.0..=1.0).contains(&parsed) {
-        return Err("top-p must be between 0.0 and 1.0".to_owned());
-    }
-    Ok(parsed)
-}
-
-fn parse_positive_u32(value: &str) -> Result<u32, String> {
-    let parsed: u32 = value
-        .parse()
-        .map_err(|_| format!("`{value}` is not a valid positive integer"))?;
-    if parsed == 0 {
-        return Err("max-tokens must be greater than 0".to_owned());
-    }
-    Ok(parsed)
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub(crate) struct ChatToolApprovalRequest {
-    pub pending_title: String,
-    pub command_title: String,
-    pub args: Vec<String>,
-    pub display_command: Option<String>,
-    pub explanation: Option<String>,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub(crate) struct ChatPromptResult {
-    pub rendered: String,
-    pub approval: Option<ChatToolApprovalRequest>,
-}
-
-struct ChatToolRunResult {
-    approval: Option<ChatToolApprovalRequest>,
-    follow_up_text: String,
-    ran_read_only_tool: bool,
-    read_only_tool_error: bool,
-    needs_install_folder: bool,
-}
-
-/// Convenience wrapper used by tests that do not exercise sampling controls.
-#[cfg(test)]
-pub(crate) fn render_chat_prompt_result(
-    paths: &AppPaths,
-    provider: &str,
-    model: Option<&str>,
-    prompt: &str,
-    rocm_tools: bool,
-) -> Result<ChatPromptResult> {
-    render_chat_prompt_result_with_progress(
-        paths,
-        provider,
-        model,
-        prompt,
-        rocm_tools,
-        ChatInferenceParams::default(),
-        None,
-    )
-}
-
-pub(crate) fn render_chat_prompt_result_with_progress(
-    paths: &AppPaths,
-    provider: &str,
-    model: Option<&str>,
-    prompt: &str,
-    rocm_tools: bool,
-    params: ChatInferenceParams,
-    progress: Option<&mut dyn FnMut(String)>,
-) -> Result<ChatPromptResult> {
-    let mut progress = progress;
-    let user_prompt = latest_user_chat_message(prompt);
-    let assistant_model = local_rocm_tools_assistant_model(provider, rocm_tools).or(model);
-    let service_needed_model = if local_rocm_tools_assistant_model(provider, rocm_tools).is_some() {
-        None
-    } else {
-        model
-    };
-    if rocm_tools && let Some(approval) = install_sdk_without_prefix_chat_approval(user_prompt) {
-        report_chat_tool_progress(&mut progress, "Asking the assistant.");
-        report_chat_tool_progress(&mut progress, "Review needed: Install ROCm");
-        report_chat_tool_progress(&mut progress, "Waiting for the ROCm install folder.");
-        return Ok(ChatPromptResult {
-            rendered: render_install_sdk_folder_needed_chat_text(user_prompt, &approval.args),
-            approval: Some(approval),
-        });
-    }
-    let mut messages = Vec::new();
-    if rocm_tools {
-        messages.push(providers::ChatMessage {
-            role: "system".to_owned(),
-            content: rocm_chat_tool_system_prompt_for_host(Some(paths)),
-        });
-    }
-    messages.push(providers::ChatMessage {
-        role: "user".to_owned(),
-        content: prompt.to_owned(),
-    });
-    let mut response = if rocm_tools {
-        report_chat_tool_progress(&mut progress, "Asking the assistant.");
-        if let Some(call) = deterministic_mutating_tool_call_for_prompt(user_prompt)? {
-            report_chat_tool_progress(&mut progress, "Preparing a review card.");
-            providers::ChatResponse {
-                provider: provider.to_owned(),
-                model: assistant_model.unwrap_or("local").to_owned(),
-                content: deterministic_mutating_tool_intro(&call),
-                tool_calls: vec![call],
-            }
-        } else if !local_assistant_service_ready_for_chat(paths, assistant_model)
-            && let Some(response) =
-                local_read_only_fallback_response_for_prompt(provider, assistant_model, user_prompt)
-        {
-            report_chat_tool_progress(&mut progress, "Running ROCm status check.");
-            response
-        } else {
-            match providers::provider_chat(
-                paths,
-                provider,
-                &providers::ChatRequest {
-                    model: assistant_model.map(str::to_owned),
-                    messages: messages.clone(),
-                    max_tokens: params.max_tokens,
-                    temperature: params.temperature,
-                    top_p: params.top_p,
-                    rocm_tools,
-                },
-            ) {
-                Ok(response) => response,
-                Err(error)
-                    if provider == "local" && local_provider_missing_service_error(&error) =>
-                {
-                    if let Some(response) = local_read_only_fallback_response_for_prompt(
-                        provider,
-                        assistant_model,
-                        user_prompt,
-                    ) {
-                        report_chat_tool_progress(&mut progress, "Running ROCm status check.");
-                        response
-                    } else {
-                        return Ok(ChatPromptResult {
-                            rendered: local_chat_service_needed_text(
-                                service_needed_model,
-                                user_prompt,
-                                rocm_tools,
-                            ),
-                            approval: None,
-                        });
-                    }
-                }
-                Err(error) => return Err(error),
-            }
-        }
-    } else {
-        report_chat_tool_progress(&mut progress, "Asking the assistant.");
-        match providers::provider_chat(
-            paths,
-            provider,
-            &providers::ChatRequest {
-                model: assistant_model.map(str::to_owned),
-                messages: messages.clone(),
-                max_tokens: params.max_tokens,
-                temperature: params.temperature,
-                top_p: params.top_p,
-                rocm_tools,
-            },
-        ) {
-            Ok(response) => response,
-            Err(error) if provider == "local" && local_provider_missing_service_error(&error) => {
-                return Ok(ChatPromptResult {
-                    rendered: local_chat_service_needed_text(
-                        service_needed_model,
-                        user_prompt,
-                        rocm_tools,
-                    ),
-                    approval: None,
-                });
-            }
-            Err(error) => return Err(error),
-        }
-    };
-    let fallback_tool_call = if rocm_tools && response.tool_calls.is_empty() {
-        fallback_rocm_tool_call_for_prompt(user_prompt)
-    } else {
-        None
-    };
-    let fallback_tool_call_used = fallback_tool_call.is_some();
-    if let Some(call) = fallback_tool_call {
-        response.tool_calls.push(call);
-    }
-    if rocm_tools
-        && let Some(call) =
-            supplemental_read_only_tool_call_for_prompt(user_prompt, &response.tool_calls)
-    {
-        response.tool_calls.push(call);
-    }
-    let mut output = String::new();
-    let _ = writeln!(output, "chat response");
-    let _ = writeln!(output, "  provider: {}", response.provider);
-    let _ = writeln!(output, "  model: {}", response.model);
-    let _ = writeln!(
-        output,
-        "  rocm tools: {}",
-        if rocm_tools { "enabled" } else { "off" }
-    );
-    let _ = writeln!(output);
-    let initial_content_is_intermediate = fallback_tool_call_used
-        || local_tool_call_content_is_intermediate(provider, rocm_tools, &response);
-    let initial_content = visible_chat_content(&response.content);
-    if initial_content_is_intermediate {
-        let _ = writeln!(output, "Assistant is preparing the next step.");
-    } else if !initial_content.trim().is_empty() {
-        let _ = writeln!(output, "{initial_content}");
-    }
-    let tool_result = if rocm_tools {
-        let explanation = (!fallback_tool_call_used && !initial_content.trim().is_empty())
-            .then_some(initial_content.as_str());
-        append_chat_tool_results(paths, &response, &mut output, explanation, &mut progress)?
-    } else {
-        ChatToolRunResult {
-            approval: None,
-            follow_up_text: String::new(),
-            ran_read_only_tool: false,
-            read_only_tool_error: false,
-            needs_install_folder: false,
-        }
-    };
-    let deterministic_summary = deterministic_chat_tool_summary(&tool_result.follow_up_text);
-    if let Some(summary) = deterministic_summary.as_deref() {
-        let _ = writeln!(output);
-        let _ = writeln!(output, "ROCm CLI summary");
-        let _ = writeln!(output, "{summary}");
-    }
-    let follow_up_blocking_summary = deterministic_summary
-        .as_deref()
-        .filter(|_| deterministic_summary_can_stand_alone(&tool_result.follow_up_text));
-    if should_request_local_tool_follow_up(provider, &tool_result, follow_up_blocking_summary) {
-        let follow_up_messages = vec![
-            providers::ChatMessage {
-                role: "system".to_owned(),
-                content: "You are ROCm CLI's local assistant. ROCm tools have already been checked for this turn. Use the supplied tool results for local facts about this machine. For service results, ready/running means running, starting/recovering means starting, failed/stopped means not running, and no matching service row means ROCm CLI is not managing that service as running. If the tool results do not contain enough information to answer the whole question, say what is known from the results and then answer the rest normally from your own model knowledge. Do not request another tool call. Do not invent local paths, GPU names, versions, or install state that are not shown in the tool results. Keep the answer concise.".to_owned(),
-            },
-            providers::ChatMessage {
-                role: "user".to_owned(),
-                content: format!(
-                    "Original request:\n{}\n\nROCm tool results:\n{}\n\nAnswer the original request. Use the ROCm tool results for this machine's facts; if they are incomplete, answer the remaining part generally.",
-                    user_prompt.trim(),
-                    tool_result.follow_up_text.trim()
-                ),
-            },
-        ];
-        let follow_up = providers::provider_chat(
-            paths,
-            provider,
-            &providers::ChatRequest {
-                model: assistant_model.map(str::to_owned),
-                messages: follow_up_messages,
-                max_tokens: params.max_tokens.or(Some(256)),
-                temperature: params.temperature,
-                top_p: params.top_p,
-                rocm_tools: false,
-            },
-        )?;
-        if follow_up.tool_calls.is_empty() {
-            let follow_up_content = visible_chat_content(&follow_up.content);
-            if local_follow_up_content_is_final(&follow_up) && !follow_up_content.trim().is_empty()
-            {
-                let _ = writeln!(output);
-                let _ = writeln!(output, "Assistant after ROCm checks");
-                let _ = writeln!(output, "{}", follow_up_content.trim());
-            }
-        } else {
-            let _ = writeln!(output);
-            let _ = writeln!(
-                output,
-                "Assistant asked for another ROCm check after the first tool results."
-            );
-            let _ = writeln!(
-                output,
-                "rocm-cli stopped there so the answer is not based on another guess. Nothing was changed."
-            );
-        }
-    } else if tool_result.read_only_tool_error {
-        let _ = writeln!(output);
-        let _ = writeln!(
-            output,
-            "Assistant did not answer from this result because a ROCm check reported an error."
-        );
-        let _ = writeln!(output, "Nothing was changed.");
-    } else if tool_result.needs_install_folder {
-        let _ = writeln!(output);
-        let _ = writeln!(output, "Assistant after ROCm checks");
-        let _ = writeln!(
-            output,
-            "I can install ROCm/TheRock, but I need the install folder first. Type the folder you want to use, for example D:\\ROCm\\therock_venvs. Nothing will download until ROCm CLI shows a review card and you approve it."
-        );
-    }
-    if tool_result.approval.is_none()
-        && tool_result.ran_read_only_tool
-        && !output.contains("Nothing was changed.")
-    {
-        let _ = writeln!(output);
-        let _ = writeln!(output, "Nothing was changed.");
-    }
-    Ok(ChatPromptResult {
-        rendered: output,
-        approval: tool_result.approval,
-    })
-}
-
-fn report_chat_tool_progress(progress: &mut Option<&mut dyn FnMut(String)>, message: &str) {
-    if let Some(progress) = progress.as_deref_mut() {
-        progress(message.to_owned());
-    }
-}
-
-fn latest_user_chat_message(prompt: &str) -> &str {
-    const MARKER: &str = "\nNew message:\n";
-    prompt
-        .rfind(MARKER)
-        .map_or(prompt, |index| &prompt[index + MARKER.len()..])
-        .trim()
-}
-
-fn deterministic_mutating_tool_call_for_prompt(
-    prompt: &str,
-) -> Result<Option<providers::ChatToolCall>> {
-    let Some(call) = fallback_rocm_tool_call_for_prompt(prompt) else {
-        return Ok(None);
-    };
-    validate_chat_tool_call(&call)?;
-    if chat_tool_call_is_read_only(&call) {
-        Ok(None)
-    } else {
-        Ok(Some(call))
-    }
-}
-
-fn supplemental_read_only_tool_call_for_prompt(
-    prompt: &str,
-    existing_calls: &[providers::ChatToolCall],
-) -> Option<providers::ChatToolCall> {
-    let normalized = latest_user_chat_message(prompt).to_ascii_lowercase();
-    if prompt_mentions_serving_engine_or_service(&normalized)
-        && prompt_asks_running_or_status(&normalized)
-        && prompt_asks_engine_install_state(&normalized)
-    {
-        for call in [
-            fallback_services_list_tool_call(),
-            fallback_engine_list_tool_call(),
-        ] {
-            if !chat_tool_calls_include_equivalent(existing_calls, &call) {
-                return Some(call);
-            }
-        }
-        return None;
-    }
-    let call = fallback_rocm_tool_call_for_prompt(prompt)?;
-    if !chat_tool_call_is_read_only(&call)
-        || chat_tool_calls_include_equivalent(existing_calls, &call)
-    {
-        return None;
-    }
-    Some(call)
-}
-
-fn chat_tool_calls_include_equivalent(
-    existing_calls: &[providers::ChatToolCall],
-    required: &providers::ChatToolCall,
-) -> bool {
-    existing_calls.iter().any(|existing| {
-        if existing.name != required.name {
-            return false;
-        }
-        if required.name == "rocm_command" {
-            return normalized_chat_rocm_command_args(existing).ok()
-                == normalized_chat_rocm_command_args(required).ok();
-        }
-        if required.name == "port_status" {
-            return chat_port_status_tool_calls_equivalent(existing, required);
-        }
-        existing.arguments == required.arguments
-    })
-}
-
-fn chat_port_status_tool_calls_equivalent(
-    left: &providers::ChatToolCall,
-    right: &providers::ChatToolCall,
-) -> bool {
-    let Some(left_object) = left.arguments.as_object() else {
-        return false;
-    };
-    let Some(right_object) = right.arguments.as_object() else {
-        return false;
-    };
-    let left_port = left_object.get("port").and_then(serde_json::Value::as_u64);
-    let right_port = right_object.get("port").and_then(serde_json::Value::as_u64);
-    if left_port != right_port {
-        return false;
-    }
-    let left_host =
-        json_string(left_object, "host").unwrap_or_else(|| DEFAULT_LOCAL_HOST.to_owned());
-    let right_host =
-        json_string(right_object, "host").unwrap_or_else(|| DEFAULT_LOCAL_HOST.to_owned());
-    loopback_host_key(&left_host) == loopback_host_key(&right_host)
-}
-
-fn loopback_host_key(host: &str) -> String {
-    match host.trim().to_ascii_lowercase().as_str() {
-        "localhost" | "127.0.0.1" => "127.0.0.1".to_owned(),
-        "::1" | "[::1]" => "::1".to_owned(),
-        other => other.to_owned(),
-    }
-}
-
-fn deterministic_mutating_tool_intro(call: &providers::ChatToolCall) -> String {
-    match chat_tool_approval_request(call, None) {
-        Ok(approval) if approval.pending_title == "Install ROCm" => {
-            "I can install ROCm/TheRock into the folder you chose. Review the card before anything downloads or changes."
-                .to_owned()
-        }
-        Ok(approval) if approval.pending_title == "Install ComfyUI" => {
-            "I can install ComfyUI into ROCm CLI's managed app folder. Review the card before anything downloads or changes."
-                .to_owned()
-        }
-        Ok(approval) if approval.pending_title == "Start ComfyUI" => {
-            "I can start ComfyUI for you. Review the card before ROCm CLI launches it."
-                .to_owned()
-        }
-        Ok(approval) if approval.pending_title == "Start local model server" => {
-            "I can start the recommended local model server on the GPU. Review the card before ROCm CLI launches it."
-                .to_owned()
-        }
-        Ok(approval) => format!(
-            "I can prepare this ROCm change: {}. Review the card before anything runs.",
-            approval.pending_title
-        ),
-        Err(_) => {
-            "I can prepare this ROCm change. Review the card before anything runs.".to_owned()
-        }
-    }
-}
-
-fn local_tool_call_content_is_intermediate(
-    provider: &str,
-    rocm_tools: bool,
-    response: &providers::ChatResponse,
-) -> bool {
-    provider == "local"
-        && rocm_tools
-        && !response.tool_calls.is_empty()
-        && !response.content.trim().is_empty()
-}
-
-fn local_follow_up_content_is_final(response: &providers::ChatResponse) -> bool {
-    response.tool_calls.is_empty() && !response.content.trim().is_empty()
-}
-
-fn local_read_only_fallback_response_for_prompt(
-    provider: &str,
-    assistant_model: Option<&str>,
-    prompt: &str,
-) -> Option<providers::ChatResponse> {
-    if provider != "local" || !prompt_can_use_read_only_without_local_assistant(prompt) {
-        return None;
-    }
-    let call = fallback_rocm_tool_call_for_prompt(prompt)?;
-    if !chat_tool_call_is_read_only(&call) {
-        return None;
-    }
-    Some(providers::ChatResponse {
-        provider: provider.to_owned(),
-        model: assistant_model.unwrap_or("local").to_owned(),
-        content: String::new(),
-        tool_calls: vec![call],
-    })
-}
-
-fn local_assistant_service_ready_for_chat(paths: &AppPaths, assistant_model: Option<&str>) -> bool {
-    let model = assistant_model.unwrap_or(providers::BUILTIN_ASSISTANT_MODEL_ID);
-    load_managed_services(paths).is_ok_and(|records| {
-        records.iter().any(|record| {
-            matches!(record.status.as_str(), "ready" | "running")
-                && (service_model_names_match(&record.canonical_model_id, model)
-                    || service_model_names_match(&record.model_ref, model))
-        })
-    })
-}
-
-fn prompt_can_use_read_only_without_local_assistant(prompt: &str) -> bool {
-    let normalized = latest_user_chat_message(prompt).to_ascii_lowercase();
-    let mentions_status_subject = any_substring(
-        &normalized,
-        &[
-            "comfyui",
-            "comfy ui",
-            "comfy",
-            "vllm",
-            "lemonade",
-            "llama.cpp",
-            "llama cpp",
-            "qwen",
-            "model server",
-            "local server",
-            "local model server",
-            "assistant server",
-            "port",
-            "8188",
-            "therock",
-            "rocm",
-        ],
-    );
-    mentions_status_subject
-        && (prompt_asks_running_or_status(&normalized)
-            || any_substring(
-                &normalized,
-                &["installed", "available", "detected", "engine status"],
-            ))
-}
-
-fn prompt_mentions_serving_engine_or_service(normalized_prompt: &str) -> bool {
-    any_substring(
-        normalized_prompt,
-        &[
-            "vllm",
-            "lemonade",
-            "llama.cpp",
-            "llama cpp",
-            "qwen",
-            "model server",
-            "local server",
-            "local model server",
-            "assistant server",
-        ],
-    )
-}
-
-fn prompt_asks_engine_install_state(normalized_prompt: &str) -> bool {
-    any_substring(
-        normalized_prompt,
-        &["installed", "available", "detected", "engine status"],
-    )
-}
-
-fn fallback_engine_list_tool_call() -> providers::ChatToolCall {
-    providers::ChatToolCall {
-        id: Some("fallback-engine-list".to_owned()),
-        name: "rocm_command".to_owned(),
-        arguments: serde_json::json!({ "args": ["engines", "list"] }),
-    }
-}
-
-fn fallback_services_list_tool_call() -> providers::ChatToolCall {
-    providers::ChatToolCall {
-        id: Some("fallback-services-list".to_owned()),
-        name: "rocm_command".to_owned(),
-        arguments: serde_json::json!({ "args": ["services", "list", "--all"] }),
-    }
-}
-
-fn fallback_rocm_tool_call_for_prompt(prompt: &str) -> Option<providers::ChatToolCall> {
-    let prompt = latest_user_chat_message(prompt);
-    let normalized = prompt.to_ascii_lowercase();
-    let asks_running_or_status = prompt_asks_running_or_status(&normalized);
-    let mentions_comfyui = any_substring(&normalized, &["comfyui", "comfy ui", "comfy"]);
-    if asks_running_or_status
-        && !mentions_comfyui
-        && any_substring(&normalized, &["8188", "port 8188"])
-    {
-        return Some(providers::ChatToolCall {
-            id: Some("fallback-port-8188-status".to_owned()),
-            name: "port_status".to_owned(),
-            arguments: serde_json::json!({ "host": DEFAULT_LOCAL_HOST, "port": 8188 }),
-        });
-    }
-    let mentions_serving_engine_or_service = prompt_mentions_serving_engine_or_service(&normalized);
-    if mentions_serving_engine_or_service && prompt_asks_engine_install_state(&normalized) {
-        return Some(fallback_engine_list_tool_call());
-    }
-    if mentions_serving_engine_or_service && asks_running_or_status {
-        return Some(fallback_services_list_tool_call());
-    }
-    let mentions_llm_or_model = any_substring(
-        &normalized,
-        &["llm", "llms", "model", "models", "assistant"],
-    );
-    let asks_support_or_fit = any_substring(
-        &normalized,
-        &[
-            "support",
-            "supported",
-            "run",
-            "runs",
-            "fit",
-            "fits",
-            "can my machine",
-            "can this machine",
-        ],
-    );
-    if mentions_llm_or_model && asks_support_or_fit {
-        return Some(providers::ChatToolCall {
-            id: Some("fallback-rocm-model".to_owned()),
-            name: "rocm_command".to_owned(),
-            arguments: serde_json::json!({ "args": ["model"] }),
-        });
-    }
-
-    if mentions_comfyui {
-        if any_substring(&normalized, &["log", "logs"]) {
-            return Some(providers::ChatToolCall {
-                id: Some("fallback-comfyui-logs".to_owned()),
-                name: "rocm_command".to_owned(),
-                arguments: serde_json::json!({ "args": ["comfyui", "logs"] }),
-            });
-        }
-        if asks_running_or_status {
-            return Some(providers::ChatToolCall {
-                id: Some("fallback-comfyui-status".to_owned()),
-                name: "rocm_command".to_owned(),
-                arguments: serde_json::json!({ "args": ["comfyui", "status"] }),
-            });
-        }
-        if any_substring(&normalized, &["start", "run", "launch", "open"]) {
-            return Some(providers::ChatToolCall {
-                id: Some("fallback-comfyui-start".to_owned()),
-                name: "rocm_command".to_owned(),
-                arguments: serde_json::json!({
-                    "args": ["comfyui", "start"],
-                    "reason": "Start ComfyUI locally after the user approves it."
-                }),
-            });
-        }
-        if any_substring(
-            &normalized,
-            &[
-                "can you setup",
-                "can you set up",
-                "please setup",
-                "please set up",
-                "setup comfyui for me",
-                "set up comfyui for me",
-                "install comfyui",
-                "download comfyui",
-            ],
-        ) {
-            return Some(providers::ChatToolCall {
-                id: Some("fallback-comfyui-install".to_owned()),
-                name: "rocm_command".to_owned(),
-                arguments: serde_json::json!({
-                    "args": ["comfyui", "install"],
-                    "reason": "Install ComfyUI into ROCm CLI's managed app folder after the user approves it."
-                }),
-            });
-        }
-        return Some(providers::ChatToolCall {
-            id: Some("fallback-comfyui-status".to_owned()),
-            name: "rocm_command".to_owned(),
-            arguments: serde_json::json!({ "args": ["comfyui", "status"] }),
-        });
-    }
-
-    if let Some(call) = fallback_config_tool_call_for_prompt(&normalized) {
-        return Some(call);
-    }
-
-    if mentions_llm_or_model
-        && any_substring(
-            &normalized,
-            &[
-                "serve",
-                "server",
-                "start",
-                "setup and serve",
-                "set up and serve",
-                "run locally",
-                "local model",
-                "local assistant",
-            ],
-        )
-    {
-        return Some(providers::ChatToolCall {
-            id: Some("fallback-serve-qwen".to_owned()),
-            name: "rocm_command".to_owned(),
-            arguments: serde_json::json!({
-                "args": ["serve", "qwen", "--engine", "lemonade", "--device", "gpu_required", "--managed"],
-                "reason": "Start the recommended local assistant after the user approves it."
-            }),
-        });
-    }
-
-    let mentions_setup = any_substring(&normalized, &["setup", "set up", "install"]);
-    let asks_how = any_substring(&normalized, &["how", "help", "what do i need"]);
-    let mentions_rocm_or_therock = any_substring(&normalized, &["therock", "rocm"]);
-    let requested_install_prefix = requested_install_prefix_from_prompt(prompt);
-    if requested_install_prefix.is_none()
-        && let Some(approval) = install_sdk_without_prefix_chat_approval(prompt)
-    {
-        return Some(providers::ChatToolCall {
-            id: Some("fallback-therock-install-folder".to_owned()),
-            name: "rocm_command".to_owned(),
-            arguments: serde_json::json!({
-                "args": approval.args,
-                "reason": "Ask the user to choose the ROCm/TheRock install folder before installing."
-            }),
-        });
-    }
-    if mentions_rocm_or_therock
-        && prompt_requests_install_action(&normalized)
-        && let Some(prefix) = requested_install_prefix
-    {
-        let mut args = vec![
-            "install".to_owned(),
-            "sdk".to_owned(),
-            "--channel".to_owned(),
-            "release".to_owned(),
-            "--format".to_owned(),
-            "wheel".to_owned(),
-            "--prefix".to_owned(),
-            prefix,
-        ];
-        if let Some(build_date) = requested_therock_build_date_from_prompt(&normalized) {
-            args.push("--build-date".to_owned());
-            args.push(build_date);
-        } else if let Some(version) = requested_therock_version_from_prompt(&normalized) {
-            args.push("--version".to_owned());
-            args.push(version);
-        }
-        return Some(providers::ChatToolCall {
-            id: Some("fallback-therock-install".to_owned()),
-            name: "rocm_command".to_owned(),
-            arguments: serde_json::json!({
-                "args": args,
-                "reason": "Install TheRock ROCm into the user-selected folder after the user approves it."
-            }),
-        });
-    }
-    if asks_how && mentions_setup && any_substring(&normalized, &["therock", "rocm"]) {
-        return Some(providers::ChatToolCall {
-            id: Some("fallback-therock-examine".to_owned()),
-            name: "examine".to_owned(),
-            arguments: serde_json::json!({}),
-        });
-    }
-
-    let asks_where_installed = any_substring(
-        &normalized,
-        &[
-            "where is rocm",
-            "where's rocm",
-            "where is therock",
-            "where's therock",
-            "where did rocm",
-            "where did therock",
-            "where rocm is installed",
-            "where therock is installed",
-            "rocm install folder",
-            "therock install folder",
-            "rocm installed at",
-            "therock installed at",
-        ],
-    );
-    let asks_status = asks_where_installed
-        || any_substring(
-            &normalized,
-            &[
-                "is rocm installed",
-                "is therock installed",
-                "is therock setup",
-                "is therock set up",
-                "rocm installed",
-                "therock installed",
-                "check this rocm setup",
-                "which gpu",
-                "what gpu",
-                "gpu is on",
-                "gpu do i have",
-                "my machine",
-            ],
-        );
-    if asks_status && any_substring(&normalized, &["gpu", "rocm", "therock", "setup"]) {
-        return Some(providers::ChatToolCall {
-            id: Some("fallback-examine".to_owned()),
-            name: "examine".to_owned(),
-            arguments: serde_json::json!({}),
-        });
-    }
-
-    None
-}
-
-fn prompt_asks_running_or_status(normalized: &str) -> bool {
-    any_substring(
-        normalized,
-        &[
-            "running",
-            "is it up",
-            "is this up",
-            "is there",
-            "are there",
-            "status",
-            "started",
-            "listening",
-            "on port",
-            "port ",
-        ],
-    )
-}
-
-fn fallback_config_tool_call_for_prompt(normalized: &str) -> Option<providers::ChatToolCall> {
-    if !any_substring(
-        normalized,
-        &[
-            "config",
-            "setting",
-            "settings",
-            "default engine",
-            "telemetry",
-        ],
-    ) {
-        return None;
-    }
-    if any_substring(normalized, &["show", "check", "what", "current", "list"]) {
-        return Some(providers::ChatToolCall {
-            id: Some("fallback-config-show".to_owned()),
-            name: "rocm_command".to_owned(),
-            arguments: serde_json::json!({ "args": ["config", "show"] }),
-        });
-    }
-    if any_substring(normalized, &["default engine", "set engine", "use engine"]) {
-        for engine in ["lemonade", "vllm"] {
-            if normalized.contains(engine) {
-                return Some(providers::ChatToolCall {
-                    id: Some("fallback-config-default-engine".to_owned()),
-                    name: "rocm_command".to_owned(),
-                    arguments: serde_json::json!({
-                        "args": ["config", "set-default-engine", engine],
-                        "reason": "Change ROCm CLI's default engine after the user approves it."
-                    }),
-                });
-            }
-        }
-    }
-    if normalized.contains("telemetry") {
-        if any_substring(normalized, &["off", "disable", "disabled"]) {
-            return Some(providers::ChatToolCall {
-                id: Some("fallback-config-telemetry-off".to_owned()),
-                name: "rocm_command".to_owned(),
-                arguments: serde_json::json!({
-                    "args": ["config", "set-telemetry", "off"],
-                    "reason": "Turn ROCm CLI telemetry off after the user approves it."
-                }),
-            });
-        }
-        if any_substring(normalized, &["local", "on", "enable", "enabled"]) {
-            return Some(providers::ChatToolCall {
-                id: Some("fallback-config-telemetry-local".to_owned()),
-                name: "rocm_command".to_owned(),
-                arguments: serde_json::json!({
-                    "args": ["config", "set-telemetry", "local"],
-                    "reason": "Enable local-only ROCm inspection after the user approves it."
-                }),
-            });
-        }
-    }
-    None
-}
-
-fn any_substring(haystack: &str, needles: &[&str]) -> bool {
-    needles.iter().any(|needle| haystack.contains(needle))
-}
-
-pub(crate) fn install_sdk_without_prefix_chat_approval(
-    prompt: &str,
-) -> Option<ChatToolApprovalRequest> {
-    install_sdk_chat_approval_for_prompt(prompt).and_then(|approval| {
-        chat_cli_arg_value(&approval.args, "--prefix")
-            .is_none()
-            .then_some(approval)
-    })
-}
-
-pub(crate) fn install_sdk_chat_approval_for_prompt(
-    prompt: &str,
-) -> Option<ChatToolApprovalRequest> {
-    let prompt = latest_user_chat_message(prompt);
-    let normalized = prompt.to_ascii_lowercase();
-    if !prompt_requests_rocm_install_or_setup(&normalized) {
-        return None;
-    }
-    let mut args = vec![
-        "install".to_owned(),
-        "sdk".to_owned(),
-        "--channel".to_owned(),
-        if normalized.contains("nightly") {
-            "nightly".to_owned()
-        } else {
-            "release".to_owned()
-        },
-        "--format".to_owned(),
-        "wheel".to_owned(),
-    ];
-    if let Some(prefix) = requested_install_prefix_from_prompt(prompt) {
-        args.push("--prefix".to_owned());
-        args.push(prefix);
-    }
-    if let Some(build_date) = requested_therock_build_date_from_prompt(&normalized) {
-        args.push("--build-date".to_owned());
-        args.push(build_date);
-    } else if let Some(version) = requested_therock_version_from_prompt(&normalized) {
-        args.push("--version".to_owned());
-        args.push(version);
-    }
-    Some(ChatToolApprovalRequest {
-        pending_title: "Install ROCm".to_owned(),
-        command_title: "Install".to_owned(),
-        display_command: Some(format_structured_tool_call("rocm", &args)),
-        args,
-        explanation: Some(
-            "Install ROCm/TheRock after the user chooses the install folder.".to_owned(),
-        ),
-    })
-}
-
-fn render_install_sdk_folder_needed_chat_text(prompt: &str, args: &[String]) -> String {
-    let mut output = String::new();
-    let _ = writeln!(output, "ROCm install");
-    let _ = writeln!(output);
-    let _ = writeln!(output, "I can install ROCm/TheRock for you.");
-    let _ = writeln!(
-        output,
-        "First choose the folder where ROCm CLI should put the Python environment."
-    );
-    let _ = writeln!(
-        output,
-        "Nothing will download or change until you review and approve the install."
-    );
-    if let Some(date) = chat_cli_arg_value(args, "--build-date") {
-        let _ = writeln!(output);
-        let _ = writeln!(output, "Requested build date: {date}");
-    }
-    if let Some(version) = chat_cli_arg_value(args, "--version") {
-        let _ = writeln!(output);
-        let _ = writeln!(output, "Requested version: {version}");
-    }
-    let _ = writeln!(output);
-    let _ = writeln!(output, "Your request");
-    let _ = writeln!(output, "  {}", prompt.trim());
-    output.trim_end().to_owned()
-}
-
-fn prompt_requests_rocm_install_or_setup(normalized: &str) -> bool {
-    let mentions_rocm_stack = any_substring(
-        normalized,
-        &[
-            "rocm",
-            "therock",
-            "the rock",
-            "amd gpu package",
-            "amd gpu ready",
-            "local ai",
-        ],
-    );
-    if !mentions_rocm_stack {
-        return false;
-    }
-    prompt_requests_install_action(normalized)
-        || any_substring(
-            normalized,
-            &[
-                "need rocm",
-                "need therock",
-                "need the rock",
-                "need to get rocm",
-                "need to get therock",
-                "get rocm installed",
-                "get therock installed",
-                "get the rock installed",
-                "make rocm work",
-                "make therock work",
-                "make the rock work",
-                "prepare rocm",
-                "prepare therock",
-                "prepare the rock",
-                "set up my amd gpu",
-                "setup my amd gpu",
-                "set up local ai",
-                "setup local ai",
-                "get local ai working",
-                "make local ai work",
-                "rocm please",
-                "make my amd gpu ready",
-                "make my gpu ready",
-                "get my amd gpu ready",
-                "get my gpu ready",
-            ],
-        )
-}
-
-fn prompt_requests_install_action(normalized: &str) -> bool {
-    any_substring(
-        normalized,
-        &[
-            "install this",
-            "install specific",
-            "install the",
-            "install rocm",
-            "install therock",
-            "install the rock",
-            "install amd gpu package",
-            "install local ai",
-            "can you install",
-            "please install",
-            "rocm please",
-            "therock please",
-            "the rock please",
-            "need to install",
-            "want to install",
-            "i need rocm",
-            "i need therock",
-            "i need the rock",
-            "get me rocm",
-            "get me therock",
-            "get my gpu ready",
-            "make my gpu ready",
-            "make my amd gpu ready",
-            "get installed",
-            "setup for me",
-            "set up for me",
-            "setup rocm",
-            "set up rocm",
-            "setup therock",
-            "set up therock",
-            "setup the rock",
-            "set up the rock",
-            "setup my gpu",
-            "set up my gpu",
-            "setup amd gpu",
-            "set up amd gpu",
-        ],
-    )
-}
-
-fn requested_install_prefix_from_prompt(prompt: &str) -> Option<String> {
-    let lower = prompt.to_ascii_lowercase();
-    for phrase in [
-        "--prefix=",
-        "--prefix ",
-        " into folder ",
-        " into ",
-        " in folder ",
-        " in ",
-        " to folder ",
-        " to ",
-        " under ",
-        " at ",
-        " use folder ",
-        " use ",
-        "use ",
-        " folder is ",
-        " folder: ",
-        "folder:",
-    ] {
-        let mut search_start = 0;
-        while let Some(relative_index) = lower[search_start..].find(phrase) {
-            let value_start = search_start + relative_index + phrase.len();
-            if let Some(prefix) = clean_requested_install_prefix(&prompt[value_start..]) {
-                return Some(prefix);
-            }
-            search_start = value_start;
-        }
-    }
-    requested_bare_install_prefix_from_prompt(prompt)
-}
-
-fn requested_bare_install_prefix_from_prompt(prompt: &str) -> Option<String> {
-    for quote in ['"', '\''] {
-        let mut remaining = prompt;
-        while let Some(start) = remaining.find(quote) {
-            let after_start = &remaining[start + quote.len_utf8()..];
-            let Some(end) = after_start.find(quote) else {
-                break;
-            };
-            if let Some(prefix) = clean_requested_install_prefix(&after_start[..end]) {
-                return Some(prefix);
-            }
-            remaining = &after_start[end + quote.len_utf8()..];
-        }
-    }
-    prompt.split_whitespace().find_map(|token| {
-        clean_requested_install_prefix(
-            token.trim_matches(|ch: char| {
-                matches!(ch, '"' | '\'' | '`' | ',' | ';' | '.' | ')' | ']')
-            }),
-        )
-    })
-}
-
-fn clean_requested_install_prefix(candidate: &str) -> Option<String> {
-    let trimmed = candidate.trim_start();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let mut chars = trimmed.chars();
-    let first = chars.next()?;
-    let extracted = if first == '"' || first == '\'' {
-        let close = trimmed[first.len_utf8()..].find(first)?;
-        &trimmed[first.len_utf8()..first.len_utf8().saturating_add(close)]
-    } else {
-        trimmed
-            .split(['\r', '\n', ',', ';'])
-            .next()
-            .unwrap_or_default()
-            .split(" and ")
-            .next()
-            .unwrap_or_default()
-            .split(" with ")
-            .next()
-            .unwrap_or_default()
-            .split(" then ")
-            .next()
-            .unwrap_or_default()
-            .trim_end_matches(['.', ')', ']'])
-    };
-    let prefix = extracted.trim();
-    if prefix.is_empty() || !looks_like_user_path(prefix) {
-        return None;
-    }
-    Some(prefix.to_owned())
-}
-
-fn looks_like_user_path(value: &str) -> bool {
-    value.starts_with('/')
-        || value.starts_with('~')
-        || value.starts_with("\\\\")
-        || value.contains(":\\")
-        || value.contains(":/")
-        || value.contains('\\')
-}
-
-fn requested_therock_build_date_from_prompt(normalized: &str) -> Option<String> {
-    normalized
-        .split(|ch: char| !ch.is_ascii_alphanumeric())
-        .filter(|token| token.len() == 8 && token.chars().all(|ch| ch.is_ascii_digit()))
-        .find_map(
-            |token| match therock::RuntimeVersionSelector::build_date(token).ok()? {
-                therock::RuntimeVersionSelector::BuildDate(date) => Some(date),
-                therock::RuntimeVersionSelector::Version(_) => None,
-            },
-        )
-        .or_else(|| {
-            normalized
-                .split_whitespace()
-                .map(|token| {
-                    token.trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-')
-                })
-                .find_map(|token| {
-                    match therock::RuntimeVersionSelector::build_date(token).ok()? {
-                        therock::RuntimeVersionSelector::BuildDate(date) => Some(date),
-                        therock::RuntimeVersionSelector::Version(_) => None,
-                    }
-                })
-        })
-}
-
-fn requested_therock_version_from_prompt(normalized: &str) -> Option<String> {
-    normalized
-        .split(|ch: char| !(ch.is_ascii_alphanumeric() || matches!(ch, '.' | '+' | '-' | '_')))
-        .filter(|token| looks_like_therock_runtime_version(token))
-        .find_map(|token| {
-            therock::RuntimeVersionSelector::version(token)
-                .ok()
-                .map(|_| token.to_owned())
-        })
-}
-
-fn looks_like_therock_runtime_version(token: &str) -> bool {
-    let Some((prefix, date)) = token.rsplit_once('a') else {
-        return false;
-    };
-    !prefix.is_empty()
-        && prefix.chars().next().is_some_and(|ch| ch.is_ascii_digit())
-        && prefix.contains('.')
-        && date.len() == 8
-        && date.chars().all(|ch| ch.is_ascii_digit())
-        && therock::RuntimeVersionSelector::build_date(date).is_ok()
-}
-
-fn visible_chat_content(content: &str) -> String {
-    let mut output = String::new();
-    let mut remaining = content;
-    while let Some(start) = find_ascii_case_insensitive(remaining, "<think>") {
-        output.push_str(&remaining[..start]);
-        let after_start = &remaining[start + "<think>".len()..];
-        let Some(end) = find_ascii_case_insensitive(after_start, "</think>") else {
-            remaining = "";
-            break;
-        };
-        remaining = &after_start[end + "</think>".len()..];
-    }
-    output.push_str(remaining);
-    output.trim().to_owned()
-}
-
-fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
-    let needle = needle.as_bytes();
-    haystack
-        .as_bytes()
-        .windows(needle.len())
-        .position(|window| window.eq_ignore_ascii_case(needle))
-}
-
-/// The host-independent half of the assistant prompt.
-///
-/// Statements that are only true on *some* hosts do not belong here — they used
-/// to, and a WSL user was told "on native Windows, vLLM is skipped" while vLLM
-/// was in fact their supported path. Anything host-dependent now comes from
-/// [`chat_host_facts::HostFacts`], which knows which machine it is describing.
-const ROCM_CHAT_TOOL_SYSTEM_PROMPT: &str = "You are ROCm CLI's local assistant. Speak in simple English for non-technical users. Use the provided ROCm tools when you need to inspect this machine, preview setup, read service logs, check updates, inspect automations, install or start ROCm-managed apps, or request ROCm/TheRock, config, engine, app, and local model server changes. For simple greetings or thanks like hello, hi, hey, ok, or thank you, reply normally; do not inspect ROCm, do not call tools, and do not launch or propose a model server. Tool-use rules: inspect first with read-only tools; call rocm_command only with argv-style args and no shell text; use natural_language_plan for ROCm requests that do not fit another read-only tool; ask for a mutating tool call only after explaining why it is needed; summarize tool results after they are returned. Read-only tools may run immediately. Tools that install, launch, stop, delete, or change state require user approval; request rocm_command and explain why. For 'is X running?', 'what is running?', status, or port questions, inspect before answering and do not start, stop, install, or serve anything. For ComfyUI or port 8188 use [\"comfyui\",\"status\"] or port_status. For vLLM, Lemonade, qwen, or local model servers use [\"services\",\"list\",\"--all\"] for running state and [\"engines\",\"list\"] for installed/available engine state. Treat ready/running as running, starting/recovering as starting, failed/stopped as not running, and no matching record as unknown or not managed by ROCm CLI. Interpret Examine carefully: active_runtime_status=ready means ROCm CLI has an active managed TheRock/ROCm runtime; legacy_rocm_status=not_detected only means no global system ROCm install was found. If active_runtime_status=ready, tell the user ROCm/TheRock is installed and active for ROCm CLI. For 'is TheRock installed', 'is ROCm installed', or 'which GPU is on this machine', use examine or gpu_snapshot before answering. For 'how do I setup TheRock' or install/setup requests, guide the user to choose an install folder first; do not answer with only a status check. For 'which LLMs can this machine support', use rocm_command args [\"model\"] or natural_language_plan before answering. For TheRock installs, always let the user choose the install folder. If the user names a folder or prefix, preserve that exact folder with [\"--prefix\",\"PATH\"]; you may call path_exists first to check whether that user-provided folder or its parent exists. If the user asks you to install TheRock/ROCm but has not named a folder, ask for the folder or let the guided setup folder picker collect it; do not invent a hidden default folder and do not request an install command without --prefix. Use rocm_command args [\"install\",\"sdk\",\"--channel\",\"release\",\"--format\",\"wheel\",\"--prefix\",\"PATH\"] only when the user asks you to install it and a folder is known; for a requested build date add [\"--build-date\",\"YYYY-MM-DD\"] and for a requested exact version add [\"--version\",\"VERSION\"]. For config changes, inspect with [\"config\",\"show\"] first when useful, then request config subcommands such as [\"config\",\"set-default-engine\",\"lemonade\"], [\"config\",\"set-default-runtime\",\"RUNTIME_KEY\"], or [\"config\",\"set-telemetry\",\"local\"] only after explaining why. For ComfyUI, use rocm_command with args like [\"comfyui\",\"status\"], [\"comfyui\",\"logs\"], [\"comfyui\",\"install\"], [\"comfyui\",\"start\"], or [\"comfyui\",\"stop\"]. First-time setup is the same thing as bootstrap in ROCm CLI; it is a deterministic ROCm setup flow, not a separate model chat. The built-in local assistant is fixed to qwen, which maps to Qwen3-4B-Instruct-2507-GGUF served by Lemonade with gpu_required. vLLM and Lemonade are the general serving engines; inspect or manage them when the user asks about general model serving, but do not switch the built-in assistant away from Lemonade. Use qwen-smoke only for a quick server smoke test. For vLLM management, inspect engines first and use [\"engines\",\"install\",\"vllm\"] or [\"serve\",\"MODEL\",\"--engine\",\"vllm\",\"--device\",\"gpu_required\",\"--managed\"] only where the host supports it. Do not invent shell commands and do not request CPU fallback.";
-const ROCM_CHAT_TOOL_SKILL: &str = include_str!("../../../skills/rocm-cli-assistant/SKILL.md");
-
-fn rocm_chat_tool_system_prompt() -> String {
-    format!("{ROCM_CHAT_TOOL_SYSTEM_PROMPT}\n\nROCm CLI assistant skill:\n{ROCM_CHAT_TOOL_SKILL}")
-}
-
-/// The assistant prompt grounded in the machine it will answer for.
-///
-/// The single composition point: both chat surfaces (`rocm chat --prompt
-/// --tools` in this bin, and the dashboard chat via
-/// [`crate::dash::resolved_args`]) send this, so neither can drift into
-/// answering platform questions from pretraining alone.
-pub(crate) fn rocm_chat_tool_system_prompt_for_host(paths: Option<&AppPaths>) -> String {
-    let facts = chat_host_facts::HostFacts::detect(paths);
-    format!("{}\n\n{}", rocm_chat_tool_system_prompt(), facts.render())
-}
-
-fn local_provider_missing_service_error(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        cause
-            .to_string()
-            .contains("local provider has no ready managed service")
-    })
-}
-
-fn local_rocm_tools_assistant_model(provider: &str, rocm_tools: bool) -> Option<&'static str> {
-    (provider == "local" && rocm_tools).then_some(providers::BUILTIN_ASSISTANT_MODEL_ID)
-}
-
-pub(crate) fn local_chat_service_needed_text(
-    model: Option<&str>,
-    prompt: &str,
-    rocm_tools: bool,
-) -> String {
-    let mut output = String::new();
-    let _ = writeln!(output, "No local assistant is running yet.");
-    let _ = writeln!(output);
-    let _ = writeln!(
-        output,
-        "To use LLM-assisted ROCm commands, start a ROCm GPU local model server first."
-    );
-    let _ = writeln!(
-        output,
-        "First-time ROCm setup does not need an LLM; run `rocm` and use Set Up ROCm for that."
-    );
-    let _ = writeln!(output);
-    let _ = writeln!(
-        output,
-        "Recommended path:\n  run `rocm`, choose Start a local model, use the recommended assistant model, then start it"
-    );
-    let _ = writeln!(output);
-    if let Some(model) = model.filter(|value| !value.trim().is_empty()) {
-        let args = vec![
-            "serve".to_owned(),
-            model.to_owned(),
-            "--device".to_owned(),
-            "gpu_required".to_owned(),
-            "--managed".to_owned(),
-        ];
-        let _ = writeln!(
-            output,
-            "Advanced manual command for the selected model:\n  {}",
-            format_structured_tool_call("rocm", &args)
-        );
-    } else {
-        let example_args = vec![
-            "serve".to_owned(),
-            providers::LEMONADE_ASSISTANT_MODEL_ID.to_owned(),
-            "--engine".to_owned(),
-            "lemonade".to_owned(),
-            "--device".to_owned(),
-            "gpu_required".to_owned(),
-            "--managed".to_owned(),
-        ];
-        let _ = writeln!(
-            output,
-            "Advanced manual command for the recommended assistant model:\n  {}",
-            format_structured_tool_call("rocm", &example_args)
-        );
-    }
-    let mut chat_args = vec!["chat".to_owned()];
-    if rocm_tools {
-        chat_args.push("--tools".to_owned());
-    }
-    chat_args.push("--provider".to_owned());
-    chat_args.push("local".to_owned());
-    if let Some(model) = model.filter(|value| !value.trim().is_empty()) {
-        chat_args.push("--model".to_owned());
-        chat_args.push(model.to_owned());
-    }
-    if !prompt.trim().is_empty() {
-        chat_args.push("--prompt".to_owned());
-        chat_args.push(prompt.to_owned());
-    }
-    let _ = writeln!(output);
-    let _ = writeln!(
-        output,
-        "After the server is ready, run:\n  {}",
-        format_structured_tool_call("rocm", &chat_args)
-    );
-    let _ = writeln!(output);
-    let _ = writeln!(
-        output,
-        "For the guided flow, run `rocm`, choose Start a local model, start a model, then choose Chat."
-    );
-    let _ = writeln!(output, "Nothing was changed.");
-    output.trim_end().to_owned()
-}
-
-fn append_chat_tool_results(
-    paths: &AppPaths,
-    response: &providers::ChatResponse,
-    output: &mut String,
-    assistant_explanation: Option<&str>,
-    progress: &mut Option<&mut dyn FnMut(String)>,
-) -> Result<ChatToolRunResult> {
-    if response.tool_calls.is_empty() {
-        let _ = writeln!(output, "ROCm checks used");
-        let _ = writeln!(output, "  none requested");
-        return Ok(ChatToolRunResult {
-            approval: None,
-            follow_up_text: String::new(),
-            ran_read_only_tool: false,
-            read_only_tool_error: false,
-            needs_install_folder: false,
-        });
-    }
-
-    let _ = writeln!(output, "ROCm checks used");
-    let mut approval = None;
-    let mut follow_up_text = String::new();
-    let mut ran_read_only_tool = false;
-    let mut read_only_tool_error = false;
-    let mut needs_install_folder = false;
-    for call in &response.tool_calls {
-        if chat_tool_call_requests_therock_install_without_prefix(call) {
-            needs_install_folder = true;
-            report_chat_tool_progress(progress, "Waiting for the ROCm install folder.");
-            let _ = writeln!(output, "  Install ROCm: needs install folder");
-            let _ = writeln!(
-                output,
-                "    not run: choose an install folder before the review card"
-            );
-            continue;
-        }
-        validate_chat_tool_call(call)?;
-        let label = chat_tool_call_display_label(call);
-        if chat_tool_call_is_read_only(call) {
-            report_chat_tool_progress(progress, &format!("Running ROCm check: {label}."));
-            let result = run_chat_read_only_tool(paths, call)?;
-            ran_read_only_tool = true;
-            let is_error = mcp_tool_result_is_error(&result);
-            read_only_tool_error |= is_error;
-            report_chat_tool_progress(
-                progress,
-                &format!(
-                    "ROCm check finished: {label} ({})",
-                    chat_read_only_tool_status_label(is_error)
-                ),
-            );
-            let _ = writeln!(
-                output,
-                "  {}: {}",
-                label,
-                chat_read_only_tool_status_label(is_error)
-            );
-            let result_text = mcp_tool_result_text(&result);
-            let _ = writeln!(follow_up_text, "{}:", call.name);
-            let _ = writeln!(follow_up_text, "{result_text}");
-            for line in result_text.lines() {
-                let _ = writeln!(output, "    {line}");
-            }
-        } else {
-            report_chat_tool_progress(progress, &format!("Review needed: {label}."));
-            let _ = writeln!(output, "  {label}: needs your review");
-            let _ = writeln!(
-                output,
-                "    not run: review the approval card before anything runs"
-            );
-            if let Some(command) = rocm_chat_tool_requested_command(call) {
-                let _ = writeln!(output, "    advanced manual command: {command}");
-            }
-            if approval.is_none() {
-                approval = Some(chat_tool_approval_request(call, assistant_explanation)?);
-            }
-        }
-    }
-    Ok(ChatToolRunResult {
-        approval,
-        follow_up_text,
-        ran_read_only_tool,
-        read_only_tool_error,
-        needs_install_folder,
-    })
-}
-
-fn chat_tool_call_requests_therock_install_without_prefix(call: &providers::ChatToolCall) -> bool {
-    let Some(object) = call.arguments.as_object() else {
-        return false;
-    };
-    match call.name.as_str() {
-        "install_sdk" => json_string(object, "prefix").is_none(),
-        "rocm_command" => rocm_command_args_install_sdk_without_prefix(object),
-        _ => false,
-    }
-}
-
-fn rocm_command_args_install_sdk_without_prefix(
-    object: &serde_json::Map<String, serde_json::Value>,
-) -> bool {
-    let Some(args) = object.get("args").and_then(serde_json::Value::as_array) else {
-        return false;
-    };
-    let args = args
-        .iter()
-        .filter_map(serde_json::Value::as_str)
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    args.first()
-        .is_some_and(|arg| arg.eq_ignore_ascii_case("install"))
-        && args
-            .get(1)
-            .is_some_and(|arg| arg.eq_ignore_ascii_case("sdk"))
-        && chat_cli_arg_value(&args, "--prefix").is_none()
-}
-
-pub(crate) fn chat_tool_approval_request(
-    call: &providers::ChatToolCall,
-    assistant_explanation: Option<&str>,
-) -> Result<ChatToolApprovalRequest> {
-    validate_chat_tool_call(call)?;
-    if call.name == "rocm_command" {
-        let ChatRocmCommandAction::Approval {
-            args,
-            pending_title,
-            command_title,
-        } = chat_rocm_command_action(call)?
-        else {
-            bail!("ROCm command tool is read-only and does not need approval");
-        };
-        return Ok(ChatToolApprovalRequest {
-            pending_title,
-            command_title,
-            display_command: Some(format_structured_tool_call("rocm", &args)),
-            args,
-            explanation: assistant_explanation
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_owned),
-        });
-    }
-    // `proposal_action` (approve/reject) executes in-process in
-    // `run_internal_mcp_call` — it has NO CLI argv, so build its approval
-    // request directly rather than through `rocm_chat_tool_requested_args`.
-    if call.name == "proposal_action" {
-        let object = call
-            .arguments
-            .as_object()
-            .context("proposal_action arguments must be a JSON object")?;
-        let proposal_id = json_string(object, "proposal_id")
-            .context("proposal_action requires non-empty `proposal_id`")?;
-        let action =
-            json_string(object, "action").context("proposal_action requires non-empty `action`")?;
-        let pending_title = match action.as_str() {
-            "approve" => "Approve proposal",
-            "reject" => "Reject proposal",
-            other => bail!("proposal_action `{other}` does not require approval"),
-        };
-        return Ok(ChatToolApprovalRequest {
-            pending_title: pending_title.to_owned(),
-            command_title: "Reviews".to_owned(),
-            display_command: Some(format!("proposal {proposal_id}")),
-            args: Vec::new(),
-            explanation: assistant_explanation
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_owned),
-        });
-    }
-    let args = rocm_chat_tool_requested_args(call)
-        .with_context(|| format!("ROCm tool `{}` is missing required arguments", call.name))?;
-    let (pending_title, command_title) = match call.name.as_str() {
-        "install_sdk" => ("Install ROCm", "Install"),
-        "install_engine" => ("Install engine", "Engine"),
-        "launch_server" => ("Start local model server", "Serve"),
-        "stop_server" => ("Stop local model server", "Services"),
-        "watcher_enable" => ("Enable automation", "Automations"),
-        "watcher_disable" => ("Disable automation", "Automations"),
-        other => bail!("ROCm tool `{other}` is read-only or unsupported for approval"),
-    };
-    Ok(ChatToolApprovalRequest {
-        pending_title: pending_title.to_owned(),
-        command_title: command_title.to_owned(),
-        display_command: rocm_chat_tool_requested_command(call),
-        args,
-        explanation: assistant_explanation
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_owned),
-    })
-}
-
-pub(crate) fn validate_chat_tool_call(call: &providers::ChatToolCall) -> Result<()> {
-    if !call.arguments.is_object() {
-        bail!("ROCm tool `{}` arguments must be a JSON object", call.name);
-    }
-    match call.name.as_str() {
-        "examine"
-        // `doctor` is the dash-side LLM tool + `/doctor` overlay name for the
-        // same machine inspection the bin exposes as `examine`. Accept it as an
-        // alias so a model-issued `doctor` call resolves end-to-end.
-        | "doctor"
-        | "bridge_snapshot"
-        | "gpu_snapshot"
-        | "engines"
-        | "services"
-        | "service_logs"
-        | "automations"
-        | "natural_language_plan"
-        | "path_exists"
-        | "port_status"
-        | "rocm_command"
-        | "update_check"
-        | "install_sdk_dry_run"
-        | "install_sdk"
-        | "install_engine"
-        | "launch_server"
-        | "stop_server"
-        | "watcher_enable"
-        | "watcher_disable"
-        | "proposal_action" => {}
-        other => bail!("local assistant requested unsupported ROCm tool `{other}`"),
-    }
-    match call.name.as_str() {
-        "install_sdk" => validate_chat_install_sdk_tool_call(call)?,
-        "install_engine" => validate_required_chat_string(call, "engine")?,
-        "launch_server" => validate_chat_launch_server_tool_call(call)?,
-        "service_logs" | "stop_server" => validate_chat_service_tool_call(call)?,
-        "automations" => validate_optional_chat_integer(call, "event_limit", 1, 64)?,
-        "natural_language_plan" => validate_required_chat_string(call, "request")?,
-        "path_exists" => validate_required_chat_string(call, "path")?,
-        "port_status" => validate_chat_port_status_tool_call(call)?,
-        "rocm_command" => validate_chat_rocm_command_tool_call(call)?,
-        "watcher_enable" => validate_chat_watcher_tool_call(call, true)?,
-        "watcher_disable" => validate_chat_watcher_tool_call(call, false)?,
-        "proposal_action" => validate_chat_proposal_action_tool_call(call)?,
-        _ => {}
-    }
-    Ok(())
-}
-
-/// Validate a `proposal_action` chat-tool call: `proposal_id` must be a
-/// non-empty string and `action` must be one of show | approve | reject.
-fn validate_chat_proposal_action_tool_call(call: &providers::ChatToolCall) -> Result<()> {
-    let object = call
-        .arguments
-        .as_object()
-        .context("proposal_action arguments must be a JSON object")?;
-    let proposal_id = json_string(object, "proposal_id")
-        .context("proposal_action requires non-empty `proposal_id`")?;
-    if proposal_id.len() > 128 {
-        bail!("proposal_id too long");
-    }
-    let action =
-        json_string(object, "action").context("proposal_action requires non-empty `action`")?;
-    if !matches!(action.as_str(), "show" | "approve" | "reject") {
-        bail!("proposal_action `action` must be one of show, approve, reject");
-    }
-    Ok(())
-}
-
-fn validate_chat_install_sdk_tool_call(call: &providers::ChatToolCall) -> Result<()> {
-    let object = call
-        .arguments
-        .as_object()
-        .context("install_sdk arguments must be a JSON object")?;
-    let channel = json_string(object, "channel").unwrap_or_else(|| "release".to_owned());
-    if !matches!(channel.as_str(), "release" | "nightly") {
-        bail!("local assistant requested unsupported TheRock channel `{channel}`");
-    }
-    let format = json_string(object, "format").unwrap_or_else(|| "wheel".to_owned());
-    if !matches!(format.as_str(), "wheel" | "tarball") {
-        bail!("local assistant requested unsupported TheRock install format `{format}`");
-    }
-    if rocm_core::runtime_is_windows() && format != "wheel" {
-        bail!("local assistant cannot request `{format}` installs on Windows; use wheel");
-    }
-    let version = json_string(object, "version");
-    let build_date = json_string(object, "build_date");
-    if version.is_some() && build_date.is_some() {
-        bail!("local assistant cannot request both `version` and `build_date`");
-    }
-    if format != "wheel" && (version.is_some() || build_date.is_some()) {
-        bail!(
-            "local assistant can only request specific TheRock wheel versions for wheel installs"
-        );
-    }
-    if let Some(version) = version {
-        therock::RuntimeVersionSelector::version(version)?;
-    }
-    if let Some(build_date) = build_date {
-        therock::RuntimeVersionSelector::build_date(build_date)?;
-    }
-    let Some(prefix) = json_string(object, "prefix") else {
-        bail!(
-            "local assistant must ask the user for a ROCm/TheRock install folder before requesting install_sdk"
-        );
-    };
-    let prefix_path = Path::new(&prefix);
-    if chat_install_prefix_is_system(prefix_path) {
-        bail!(
-            "local assistant cannot request system install folder `{}`",
-            prefix_path.display()
-        );
-    }
-    Ok(())
-}
-
-fn validate_chat_launch_server_tool_call(call: &providers::ChatToolCall) -> Result<()> {
-    let object = call
-        .arguments
-        .as_object()
-        .context("launch_server arguments must be a JSON object")?;
-    if object
-        .get("allow_public_bind")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-    {
-        bail!("local assistant cannot request public network binding");
-    }
-    let host = json_string(object, "host").unwrap_or_else(|| DEFAULT_LOCAL_HOST.to_owned());
-    if !is_loopback_host(&host) {
-        bail!("local assistant cannot request non-local host `{host}`");
-    }
-    if object
-        .get("device")
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|device| device.to_ascii_lowercase().contains("cpu"))
-    {
-        bail!("local assistant cannot request CPU execution; ROCm GPU execution is required");
-    }
-    Ok(())
-}
-
-fn validate_chat_service_tool_call(call: &providers::ChatToolCall) -> Result<()> {
-    let object = call
-        .arguments
-        .as_object()
-        .context("service tool arguments must be a JSON object")?;
-    let service_id =
-        json_string(object, "service_id").context("service tool requires `service_id`")?;
-    validate_service_id(&service_id)?;
-    if call.name == "service_logs" {
-        validate_optional_chat_integer(call, "lines", 1, 500)?;
-    }
-    Ok(())
-}
-
-fn validate_chat_watcher_tool_call(call: &providers::ChatToolCall, allow_mode: bool) -> Result<()> {
-    let object = call
-        .arguments
-        .as_object()
-        .context("watcher tool arguments must be a JSON object")?;
-    let watcher = json_string(object, "watcher").context("watcher tool requires `watcher`")?;
-    if watcher.len() > 128 {
-        bail!("watcher id too long");
-    }
-    if builtin_watcher(&watcher).is_none() {
-        bail!("local assistant requested unknown watcher `{watcher}`");
-    }
-    if let Some(mode) = json_string(object, "mode") {
-        if !allow_mode {
-            bail!("local assistant cannot set `mode` when disabling a watcher");
-        }
-        if !matches!(mode.as_str(), "observe" | "propose" | "contained") {
-            bail!("local assistant requested unsupported watcher mode `{mode}`");
-        }
-    }
-    Ok(())
-}
-
-fn validate_chat_port_status_tool_call(call: &providers::ChatToolCall) -> Result<()> {
-    let object = call
-        .arguments
-        .as_object()
-        .context("port_status arguments must be a JSON object")?;
-    let host = json_string(object, "host").unwrap_or_else(|| DEFAULT_LOCAL_HOST.to_owned());
-    if !is_loopback_host(&host) {
-        bail!("local assistant cannot inspect non-local host `{host}`");
-    }
-    let Some(port) = object.get("port").and_then(serde_json::Value::as_u64) else {
-        bail!("ROCm tool `port_status` requires integer `port`");
-    };
-    if !(1..=u64::from(u16::MAX)).contains(&port) {
-        bail!("ROCm tool `port_status` argument `port` must be between 1 and 65535");
-    }
-    Ok(())
-}
-
-fn validate_required_chat_string(call: &providers::ChatToolCall, key: &str) -> Result<()> {
-    let object = call
-        .arguments
-        .as_object()
-        .context("tool arguments must be a JSON object")?;
-    json_string(object, key)
-        .with_context(|| format!("ROCm tool `{}` requires non-empty `{key}`", call.name))?;
-    Ok(())
-}
-
-fn validate_optional_chat_integer(
-    call: &providers::ChatToolCall,
-    key: &str,
-    min: u64,
-    max: u64,
-) -> Result<()> {
-    let object = call
-        .arguments
-        .as_object()
-        .context("tool arguments must be a JSON object")?;
-    let Some(value) = object.get(key) else {
-        return Ok(());
-    };
-    let Some(value) = value.as_u64() else {
-        bail!(
-            "ROCm tool `{}` argument `{key}` must be an integer",
-            call.name
-        );
-    };
-    if value < min || value > max {
-        bail!(
-            "ROCm tool `{}` argument `{key}` must be between {min} and {max}",
-            call.name
-        );
-    }
-    Ok(())
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-enum ChatRocmCommandAction {
-    ReadOnly(Vec<String>),
-    Approval {
-        args: Vec<String>,
-        pending_title: String,
-        command_title: String,
-    },
-}
-
-fn validate_chat_rocm_command_tool_call(call: &providers::ChatToolCall) -> Result<()> {
-    chat_rocm_command_action(call).map(|_| ())
-}
-
-fn chat_rocm_command_action(call: &providers::ChatToolCall) -> Result<ChatRocmCommandAction> {
-    let args = normalized_chat_rocm_command_args(call)?;
-    chat_rocm_command_action_from_args(args)
-}
-
-fn normalized_chat_rocm_command_args(call: &providers::ChatToolCall) -> Result<Vec<String>> {
-    let object = call
-        .arguments
-        .as_object()
-        .context("rocm_command arguments must be a JSON object")?;
-    let values = object
-        .get("args")
-        .and_then(serde_json::Value::as_array)
-        .context("rocm_command requires `args`")?;
-    if values.is_empty() || values.len() > 64 {
-        bail!("rocm_command `args` must contain 1 to 64 strings");
-    }
-    let mut args = Vec::with_capacity(values.len());
-    for value in values {
-        let arg = value
-            .as_str()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .context("rocm_command `args` entries must be non-empty strings")?;
-        if arg.contains('\0') || arg.contains('\n') || arg.contains('\r') {
-            bail!("rocm_command arguments must not contain control characters");
-        }
-        if arg.len() > 512 {
-            bail!("rocm_command argument is too long");
-        }
-        args.push(arg.to_owned());
-    }
-    if args
-        .first()
-        .is_some_and(|arg| arg.eq_ignore_ascii_case("rocm"))
-    {
-        args.remove(0);
-    }
-    if args.is_empty() {
-        bail!("rocm_command args should omit the leading `rocm` program name");
-    }
-    if let Some(reason) = object.get("reason")
-        && !reason.is_string()
-    {
-        bail!("rocm_command `reason` must be a string when present");
-    }
-    Ok(args)
-}
-
-fn chat_rocm_command_action_from_args(mut args: Vec<String>) -> Result<ChatRocmCommandAction> {
-    canonicalize_chat_rocm_command(&mut args)?;
-    validate_chat_rocm_command_safety(&args)?;
-    let first = args.first().map(|value| value.to_ascii_lowercase());
-    let second = args.get(1).map(|value| value.to_ascii_lowercase());
-    match first.as_deref() {
-        Some("examine" | "version" | "model" | "models" | "daemon" | "logs") => {
-            Ok(ChatRocmCommandAction::ReadOnly(args))
-        }
-        Some("update") if !args.iter().any(|arg| arg == "--apply") => {
-            Ok(ChatRocmCommandAction::ReadOnly(args))
-        }
-        Some("runtimes") if second.as_deref().is_none_or(|value| value == "list") => {
-            Ok(ChatRocmCommandAction::ReadOnly(args))
-        }
-        Some("engines") if second.as_deref().is_some_and(|value| value == "list") => {
-            Ok(ChatRocmCommandAction::ReadOnly(args))
-        }
-        Some("services")
-            if second
-                .as_deref()
-                .is_none_or(|value| matches!(value, "list" | "logs")) =>
-        {
-            Ok(ChatRocmCommandAction::ReadOnly(args))
-        }
-        Some("automations") if second.as_deref().is_none_or(|value| value == "list") => {
-            Ok(ChatRocmCommandAction::ReadOnly(args))
-        }
-        Some("config") if second.as_deref() == Some("show") => {
-            Ok(ChatRocmCommandAction::ReadOnly(args))
-        }
-        Some("comfyui")
-            if second
-                .as_deref()
-                .is_none_or(|value| matches!(value, "status" | "logs" | "log")) =>
-        {
-            Ok(ChatRocmCommandAction::ReadOnly(args))
-        }
-        Some("install") if second.as_deref() == Some("sdk") => {
-            // The chat/MCP surfaces spawn `rocm` with null stdin, so
-            // `interactive_terminal()` is false and the consent prompt would
-            // refuse with a "re-run with `--approve-replacing-active-default`"
-            // error, which the schema-constrained `install_sdk` tool gives the
-            // user no way to answer.
-            //
-            // Not `--yes`: that flag also approves system-package installs, and
-            // this spawn has no terminal on which to answer the `sudo` password
-            // prompt such an install can raise. Granting it here would make the
-            // vLLM/OpenMPI step run a sudo it cannot complete and abort the
-            // engine auto-install that previously warned and continued. The
-            // narrow flag grants exactly the consent the prompt is asking for.
-            //
-            // `--yes` is stripped rather than merely not added, because the
-            // generic `rocm_command` tool takes a model-supplied argv: a
-            // model-emitted `--yes` would otherwise reach this null-stdin spawn
-            // and re-grant the system-package consent `76c6aa3c` removed. The
-            // strip runs before the argv is rendered for human approval, so what
-            // is shown is still what runs.
-            //
-            // The `--yes=...` form is stripped too. Clap rejects an attached
-            // value on this flag today, so an exact-match strip happens to be
-            // airtight — but only by borrowing a property of clap's error
-            // taxonomy that nothing here owns. Giving `--yes` `num_args`, or a
-            // clap release that starts accepting `--yes=true` on a bare `bool`,
-            // would silently restore the sudo consent this strip exists to
-            // remove. Matching the prefix keeps the guarantee local to this
-            // function.
-            args.retain(|arg| arg != "--yes" && !arg.starts_with("--yes="));
-            // Withheld on `--dry-run`, which returns before the consent gate and
-            // so needs no consent: `rocmd` and dash-tui omit it there for the
-            // same reason, and a preview should not be recorded as carrying an
-            // approval it never used.
-            if !args.iter().any(|arg| arg == "--dry-run") {
-                ensure_flag(&mut args, "--approve-replacing-active-default");
-            }
-            Ok(ChatRocmCommandAction::Approval {
-                args,
-                pending_title: "Install ROCm".to_owned(),
-                command_title: "Install".to_owned(),
-            })
-        }
-        Some("install") if second.as_deref() == Some("driver") => {
-            ensure_flag(&mut args, "--yes");
-            Ok(ChatRocmCommandAction::Approval {
-                args,
-                pending_title: "Install driver".to_owned(),
-                command_title: "Install".to_owned(),
-            })
-        }
-        Some("update") if args.iter().any(|arg| arg == "--apply") => {
-            ensure_flag(&mut args, "--yes");
-            Ok(ChatRocmCommandAction::Approval {
-                args,
-                pending_title: "Apply ROCm update".to_owned(),
-                command_title: "Update".to_owned(),
-            })
-        }
-        Some("runtimes")
-            if second
-                .as_deref()
-                .is_some_and(|value| value == "uninstall" || value == "remove")
-                && args.iter().any(|arg| arg == "--dry-run") =>
-        {
-            Ok(ChatRocmCommandAction::ReadOnly(args))
-        }
-        Some("runtimes")
-            if second
-                .as_deref()
-                .is_some_and(|value| value == "uninstall" || value == "remove") =>
-        {
-            ensure_flag(&mut args, "--yes");
-            Ok(ChatRocmCommandAction::Approval {
-                args,
-                pending_title: "Remove ROCm install".to_owned(),
-                command_title: "Runtimes".to_owned(),
-            })
-        }
-        Some("runtimes") => Ok(ChatRocmCommandAction::Approval {
-            args,
-            pending_title: "Change ROCm runtime".to_owned(),
-            command_title: "Runtimes".to_owned(),
-        }),
-        Some("engines") if second.as_deref() == Some("install") => {
-            Ok(ChatRocmCommandAction::Approval {
-                args,
-                pending_title: "Install engine".to_owned(),
-                command_title: "Engine".to_owned(),
-            })
-        }
-        Some("serve") => Ok(ChatRocmCommandAction::Approval {
-            args,
-            pending_title: "Start local model server".to_owned(),
-            command_title: "Serve".to_owned(),
-        }),
-        Some("services")
-            if second
-                .as_deref()
-                .is_some_and(|value| matches!(value, "stop" | "restart")) =>
-        {
-            ensure_flag(&mut args, "--yes");
-            Ok(ChatRocmCommandAction::Approval {
-                args,
-                pending_title: "Change local model server".to_owned(),
-                command_title: "Services".to_owned(),
-            })
-        }
-        Some("automations")
-            if second
-                .as_deref()
-                .is_some_and(|value| matches!(value, "enable" | "disable")) =>
-        {
-            Ok(ChatRocmCommandAction::Approval {
-                args,
-                pending_title: "Change automation".to_owned(),
-                command_title: "Automations".to_owned(),
-            })
-        }
-        Some("config") => Ok(ChatRocmCommandAction::Approval {
-            args,
-            pending_title: "Change settings".to_owned(),
-            command_title: "Config".to_owned(),
-        }),
-        Some("uninstall") if args.iter().any(|arg| arg == "--dry-run") => {
-            Ok(ChatRocmCommandAction::ReadOnly(args))
-        }
-        Some("uninstall") => {
-            ensure_flag(&mut args, "--yes");
-            Ok(ChatRocmCommandAction::Approval {
-                args,
-                pending_title: "Uninstall ROCm CLI".to_owned(),
-                command_title: "Uninstall".to_owned(),
-            })
-        }
-        // `storage report` (the default subcommand) only measures folders, so
-        // the assistant can run it directly. The two `remove-*` verbs delete
-        // multi-gigabyte trees and go through the approval UI.
-        Some("storage") if second.as_deref().is_none_or(|value| value == "report") => {
-            Ok(ChatRocmCommandAction::ReadOnly(args))
-        }
-        Some("storage") => {
-            ensure_flag(&mut args, "--yes");
-            Ok(ChatRocmCommandAction::Approval {
-                args,
-                pending_title: "Free up disk space".to_owned(),
-                command_title: "Storage".to_owned(),
-            })
-        }
-        Some("comfyui") if second.as_deref() == Some("install") => {
-            ensure_flag(&mut args, "--yes");
-            Ok(ChatRocmCommandAction::Approval {
-                args,
-                pending_title: "Install ComfyUI".to_owned(),
-                command_title: "ComfyUI".to_owned(),
-            })
-        }
-        Some("comfyui") if second.as_deref() == Some("start") => {
-            ensure_flag(&mut args, "--yes");
-            Ok(ChatRocmCommandAction::Approval {
-                args,
-                pending_title: "Start ComfyUI".to_owned(),
-                command_title: "ComfyUI".to_owned(),
-            })
-        }
-        Some("comfyui") if second.as_deref() == Some("stop") => {
-            ensure_flag(&mut args, "--yes");
-            Ok(ChatRocmCommandAction::Approval {
-                args,
-                pending_title: "Stop ComfyUI".to_owned(),
-                command_title: "ComfyUI".to_owned(),
-            })
-        }
-        Some("setup") if second.as_deref().is_none_or(|value| value == "status") => {
-            Ok(ChatRocmCommandAction::ReadOnly(args))
-        }
-        Some("setup") if second.as_deref() == Some("reset") => {
-            ensure_flag(&mut args, "--yes");
-            Ok(ChatRocmCommandAction::Approval {
-                args,
-                pending_title: "Reset first-time setup".to_owned(),
-                command_title: "Setup".to_owned(),
-            })
-        }
-        // Mirrors the daemon's `ensure_rocm_command_is_read_only`, which admits
-        // the same three verbs. The daemon's arm carries the reasoning; the
-        // invariant is that the two agree, and this PR added the arm there
-        // first, so the two disagreed until this was written.
-        Some("remote")
-            if second
-                .as_deref()
-                .is_some_and(|value| matches!(value, "targets" | "doctor" | "status")) =>
-        {
-            Ok(ChatRocmCommandAction::ReadOnly(args))
-        }
-        // `serve`, `attach` and `stop` start, publish or tear down something on
-        // another machine, so they go through approval like any other mutation.
-        Some("remote")
-            if second
-                .as_deref()
-                .is_some_and(|value| matches!(value, "serve" | "attach" | "stop")) =>
-        {
-            let verb = second.as_deref().unwrap_or_default().to_owned();
-            Ok(ChatRocmCommandAction::Approval {
-                args,
-                pending_title: format!("Remote {verb}"),
-                command_title: "Remote".to_owned(),
-            })
-        }
-        Some(command) => bail!("local assistant cannot use unsupported rocm command `{command}`"),
-        None => bail!("rocm_command requires at least one argument"),
-    }
-}
-
-fn canonicalize_chat_rocm_command(args: &mut [String]) -> Result<()> {
-    if args
-        .first()
-        .is_some_and(|arg| arg.eq_ignore_ascii_case("comfy"))
-    {
-        args[0] = "comfyui".to_owned();
-    }
-    if args
-        .first()
-        .is_some_and(|arg| arg.eq_ignore_ascii_case("engine"))
-    {
-        bail!("use `engines` for rocm engine commands");
-    }
-    Ok(())
-}
-
-fn validate_chat_rocm_command_safety(args: &[String]) -> Result<()> {
-    if let Some(first) = args.first()
-        && first.eq_ignore_ascii_case("serve")
-    {
-        if chat_cli_has_flag(args, "--allow-public-bind") {
-            bail!("local assistant cannot request public network binding");
-        }
-        if serve_args_request_cpu_device(args) {
-            bail!("local assistant cannot request CPU execution; ROCm GPU execution is required");
-        }
-        if let Some(host) = chat_cli_arg_value(args, "--host")
-            && !is_loopback_host(host)
-        {
-            bail!("local assistant cannot request non-local host `{host}`");
-        }
-        if chat_cli_has_flag(args, "--foreground") || !chat_cli_has_flag(args, "--managed") {
-            bail!("local assistant must request managed serving with --managed");
-        }
-    }
-    if args
-        .first()
-        .is_some_and(|arg| arg.eq_ignore_ascii_case("comfyui"))
-        && args
-            .get(1)
-            .is_some_and(|arg| arg.eq_ignore_ascii_case("start"))
-        && let Some(host) = chat_cli_arg_value(args, "--host")
-        && !is_loopback_host(host)
-    {
-        bail!("local assistant cannot start ComfyUI on non-local host `{host}`");
-    }
-    if args
-        .first()
-        .is_some_and(|arg| arg.eq_ignore_ascii_case("install"))
-        && args
-            .get(1)
-            .is_some_and(|arg| arg.eq_ignore_ascii_case("sdk"))
-    {
-        if rocm_core::runtime_is_windows()
-            && chat_cli_arg_value(args, "--format")
-                .is_some_and(|value| !value.eq_ignore_ascii_case("wheel"))
-        {
-            bail!("local assistant cannot request non-wheel ROCm installs on Windows");
-        }
-        let version = chat_cli_arg_value_checked(args, "--version")?;
-        let build_date = chat_cli_arg_value_checked(args, "--build-date")?;
-        if version.is_some() && build_date.is_some() {
-            bail!("local assistant cannot request both --version and --build-date");
-        }
-        if version.is_some() || build_date.is_some() {
-            let format = chat_cli_arg_value(args, "--format").unwrap_or("wheel");
-            if !format.eq_ignore_ascii_case("wheel") {
-                bail!(
-                    "local assistant can only request specific TheRock wheel versions for wheel installs"
-                );
-            }
-        }
-        if let Some(version) = version {
-            therock::RuntimeVersionSelector::version(version)?;
-        }
-        if let Some(build_date) = build_date {
-            therock::RuntimeVersionSelector::build_date(build_date)?;
-        }
-        let Some(prefix) = chat_cli_arg_value_checked(args, "--prefix")? else {
-            bail!(
-                "local assistant must ask the user for a ROCm/TheRock install folder before requesting `rocm install sdk`"
-            );
-        };
-        let prefix_path = Path::new(prefix);
-        if chat_install_prefix_is_system(prefix_path) {
-            bail!(
-                "local assistant cannot request system install folder `{}`",
-                prefix_path.display()
-            );
-        }
-    }
-    Ok(())
-}
-
-fn ensure_flag(args: &mut Vec<String>, flag: &str) {
-    if !args.iter().any(|arg| arg == flag) {
-        args.push(flag.to_owned());
-    }
-}
-
-fn chat_cli_arg_value<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
-    let mut index = 0;
-    while index < args.len() {
-        let arg = args[index].as_str();
-        if let Some((option, value)) = arg.split_once('=')
-            && option == name
-        {
-            return Some(value);
-        }
-        if arg == name {
-            return args.get(index + 1).map(String::as_str);
-        }
-        index += 1;
-    }
-    None
-}
-
-fn chat_cli_arg_value_checked<'a>(args: &'a [String], name: &str) -> Result<Option<&'a str>> {
-    let mut index = 0;
-    while index < args.len() {
-        let arg = args[index].as_str();
-        if let Some((option, value)) = arg.split_once('=')
-            && option == name
-        {
-            if value.trim().is_empty() {
-                bail!("local assistant provided empty value for {name}");
-            }
-            return Ok(Some(value));
-        }
-        if arg == name {
-            let Some(value) = args.get(index + 1).map(String::as_str) else {
-                bail!("local assistant omitted the value for {name}");
-            };
-            if value.starts_with("--") || value.trim().is_empty() {
-                bail!("local assistant omitted the value for {name}");
-            }
-            return Ok(Some(value));
-        }
-        index += 1;
-    }
-    Ok(None)
-}
-
-fn chat_cli_has_flag(args: &[String], name: &str) -> bool {
-    args.iter().any(|arg| {
-        arg == name
-            || arg
-                .strip_prefix(name)
-                .is_some_and(|rest| rest.starts_with('='))
-    })
-}
-
-fn chat_install_prefix_is_system(prefix: &Path) -> bool {
-    prefix.as_os_str().is_empty() || runtime_install_root_is_protected(prefix)
-}
-
-pub(crate) fn chat_tool_call_is_read_only(call: &providers::ChatToolCall) -> bool {
-    if call.name == "rocm_command" {
-        return matches!(
-            chat_rocm_command_action(call),
-            Ok(ChatRocmCommandAction::ReadOnly(_))
-        );
-    }
-    // `proposal_action` is read-only only when showing a proposal; approve/reject
-    // mutate the proposal status and must route through approval.
-    if call.name == "proposal_action" {
-        return call
-            .arguments
-            .as_object()
-            .and_then(|object| json_string(object, "action"))
-            .as_deref()
-            == Some("show");
-    }
-    matches!(
-        call.name.as_str(),
-        "examine"
-            | "doctor"
-            | "bridge_snapshot"
-            | "gpu_snapshot"
-            | "engines"
-            | "services"
-            | "service_logs"
-            | "automations"
-            | "natural_language_plan"
-            | "path_exists"
-            | "port_status"
-            | "update_check"
-            | "install_sdk_dry_run"
-    )
-}
-
-fn deterministic_rocm_tool_summary(tool_text: &str) -> Option<String> {
-    if !tool_text.contains("examine:") {
-        return None;
-    }
-    let mut lines = Vec::new();
-    let gpu = chat_tool_value(tool_text, "driver_detail")
-        .filter(|value| value != "<unknown>")
-        .or_else(|| {
-            let target = chat_tool_value(tool_text, "detected_gfx_target")?;
-            Some(format!("AMD GPU target {target}"))
-        });
-    if let Some(gpu) = gpu {
-        lines.push(format!("  GPU: {gpu}"));
-    }
-
-    let active_status = chat_tool_value(tool_text, "active_runtime_status");
-    if active_status.as_deref() == Some("ready") {
-        let family = chat_tool_value(tool_text, "active_runtime_family")
-            .filter(|value| value != "<unset>" && value != "<unknown>");
-        let version = chat_tool_value(tool_text, "active_runtime_version")
-            .filter(|value| value != "<unset>" && value != "<unknown>");
-        let mut detail = "installed and active for ROCm CLI".to_owned();
-        if let Some(family) = family {
-            let _ = write!(detail, " ({family})");
-        }
-        if let Some(version) = version {
-            let _ = write!(detail, ", {version}");
-        }
-        lines.push(format!("  ROCm/TheRock: {detail}"));
-        if let Some(root) = chat_tool_value(tool_text, "active_runtime_root")
-            .or_else(|| chat_tool_value(tool_text, "setup_runtime_root"))
-            .filter(|value| value != "<unset>" && value != "<unknown>" && value != "<none>")
-        {
-            lines.push(format!("  Install folder: {root}"));
-        }
-        if let Some(cache) = chat_tool_value(tool_text, "active_runtime_pip_cache_dir")
-            .or_else(|| chat_tool_value(tool_text, "setup_runtime_pip_cache_dir"))
-            .filter(|value| value != "<unset>" && value != "<unknown>" && value != "<none>")
-        {
-            lines.push(format!("  Downloads/cache: {cache}"));
-        }
-    } else if let Some(status) = active_status.as_deref() {
-        lines.push(format!("  ROCm/TheRock: active runtime status is {status}"));
-        if let Some(root) = chat_tool_value(tool_text, "setup_runtime_root")
-            .filter(|value| value != "<unset>" && value != "<unknown>" && value != "<none>")
-        {
-            lines.push(format!("  Selected setup folder: {root}"));
-        }
-        if let Some(cache) = chat_tool_value(tool_text, "setup_runtime_pip_cache_dir")
-            .filter(|value| value != "<unset>" && value != "<unknown>" && value != "<none>")
-        {
-            lines.push(format!("  Downloads/cache: {cache}"));
-        }
-    }
-
-    if chat_tool_value(tool_text, "legacy_rocm_status").as_deref() == Some("not_detected")
-        && active_status.as_deref() == Some("ready")
-    {
-        lines.push(
-            "  Note: no global legacy ROCm install was found; ROCm CLI is using its managed TheRock runtime."
-                .to_owned(),
-        );
-    }
-
-    (!lines.is_empty()).then(|| lines.join("\n"))
-}
-
-fn deterministic_chat_tool_summary(tool_text: &str) -> Option<String> {
-    deterministic_rocm_tool_summary(tool_text)
-        .or_else(|| deterministic_model_tool_summary(tool_text))
-        .or_else(|| deterministic_combined_status_tool_summary(tool_text))
-}
-
-fn deterministic_combined_status_tool_summary(tool_text: &str) -> Option<String> {
-    let summaries = [
-        deterministic_comfyui_tool_summary(tool_text),
-        deterministic_port_status_tool_summary(tool_text),
-        deterministic_engine_inventory_tool_summary(tool_text),
-        deterministic_services_tool_summary(tool_text),
-    ]
-    .into_iter()
-    .flatten()
-    .collect::<Vec<_>>();
-    (!summaries.is_empty()).then(|| summaries.join("\n"))
-}
-
-fn deterministic_summary_can_stand_alone(tool_text: &str) -> bool {
-    !tool_text.contains("model recipes")
-}
-
-#[derive(Debug, Default)]
-struct DeterministicModelRecipe {
-    canonical_id: String,
-    min_gpu_mem_gib: Option<u32>,
-    engines: Vec<String>,
-    engine_statuses: Vec<String>,
-    warnings: Vec<String>,
-}
-
-fn deterministic_model_tool_summary(tool_text: &str) -> Option<String> {
-    if !tool_text.contains("model recipes") {
-        return None;
-    }
-    let recipes = parse_deterministic_model_recipes(tool_text);
-    if recipes.is_empty() {
-        return None;
-    }
-
-    let mut lines = Vec::new();
-    if let Some(recipe) = recipes
-        .iter()
-        .find(|recipe| recipe.canonical_id == providers::LEMONADE_ASSISTANT_MODEL_ID)
-    {
-        lines.push(format!(
-            "  Recommended local assistant: qwen ({})",
-            recipe.canonical_id
-        ));
-        lines.push(format!(
-            "    Fit: needs about {} GPU memory.",
-            recipe
-                .min_gpu_mem_gib
-                .map_or_else(|| "unknown".to_owned(), |value| format!("{value} GiB"))
-        ));
-        lines.push(format!(
-            "    Engine: {}",
-            deterministic_engine_fit_summary(recipe, "lemonade")
-        ));
-    }
-
-    if let Some(recipe) = recipes
-        .iter()
-        .find(|recipe| recipe.canonical_id == "Qwen3-0.6B-GGUF")
-    {
-        lines.push(format!(
-            "  Tiny smoke test: qwen-smoke ({})",
-            recipe.canonical_id
-        ));
-        lines.push(
-            "    Use this only to check that GPU serving starts; it is not the default assistant."
-                .to_owned(),
-        );
-    }
-
-    if let Some(recipe) = recipes
-        .iter()
-        .find(|recipe| recipe.canonical_id == "meta-llama/Llama-3.2-3B-Instruct")
-    {
-        lines.push(format!(
-            "  8 GiB-class option: llama ({})",
-            recipe.canonical_id
-        ));
-        lines.push(format!(
-            "    Fit: asks for {}; this can be tight on APUs and depends on available shared GPU memory.",
-            recipe
-                .min_gpu_mem_gib.map_or_else(|| "unknown GPU memory".to_owned(), |value| format!("{value} GiB"))
-        ));
-        lines.push(format!(
-            "    Engines: {}",
-            deterministic_available_engine_names(recipe).join(", ")
-        ));
-    }
-
-    let larger = recipes
-        .iter()
-        .filter(|recipe| recipe.min_gpu_mem_gib.is_some_and(|value| value > 8))
-        .filter(|recipe| recipe.canonical_id != providers::BUILTIN_ASSISTANT_MODEL_ID)
-        .map(|recipe| {
-            format!(
-                "{} asks for {}",
-                recipe.canonical_id,
-                recipe.min_gpu_mem_gib.map_or_else(
-                    || "more GPU memory".to_owned(),
-                    |value| format!("{value} GiB")
-                )
-            )
-        })
-        .collect::<Vec<_>>();
-    if !larger.is_empty() {
-        lines.push(format!(
-            "  Larger recipes are not low-VRAM defaults: {}.",
-            larger.join("; ")
-        ));
-    }
-
-    let linux_wsl_only = recipes
-        .iter()
-        .flat_map(|recipe| {
-            recipe
-                .engine_statuses
-                .iter()
-                .filter(|status| {
-                    status.contains("unsupported_native_windows")
-                        || status.to_ascii_lowercase().contains("wsl/linux")
-                        || status.to_ascii_lowercase().contains("linux/wsl")
-                })
-                .filter_map(|status| {
-                    let (engine, _) = status.split_once(':')?;
-                    Some(format!(
-                        "{} uses {} through WSL/Linux on Windows",
-                        recipe.canonical_id, engine
-                    ))
-                })
-        })
-        .collect::<Vec<_>>();
-    if !linux_wsl_only.is_empty() {
-        lines.push(format!(
-            "  Native Windows note: {}.",
-            linux_wsl_only.join("; ")
-        ));
-    }
-
-    if !lines.is_empty() {
-        lines.push(
-            "  Run `rocm examine` to refresh GPU memory details before starting anything large."
-                .to_owned(),
-        );
-    }
-    (!lines.is_empty()).then(|| lines.join("\n"))
-}
-
-fn parse_deterministic_model_recipes(tool_text: &str) -> Vec<DeterministicModelRecipe> {
-    let mut recipes = Vec::new();
-    let mut current: Option<DeterministicModelRecipe> = None;
-    for line in tool_text.lines() {
-        let trimmed = line.trim();
-        if let Some(recipe) = parse_model_recipe_header(trimmed) {
-            if let Some(previous) = current.replace(recipe) {
-                recipes.push(previous);
-            }
-            continue;
-        }
-        let Some(recipe) = current.as_mut() else {
-            continue;
-        };
-        if is_engine_status_line(trimmed) {
-            recipe.engine_statuses.push(trimmed.to_owned());
-        } else if let Some(warning) = trimmed.strip_prefix("warning:") {
-            recipe.warnings.push(warning.trim().to_owned());
-        }
-    }
-    if let Some(recipe) = current {
-        recipes.push(recipe);
-    }
-    recipes
-}
-
-fn parse_model_recipe_header(line: &str) -> Option<DeterministicModelRecipe> {
-    if !line.contains(" aliases=[") || !line.contains("min_gpu_mem=") {
-        return None;
-    }
-    let canonical_id = line.split_whitespace().next()?.to_owned();
-    let engines = parse_bracketed_csv(line, "engines=[", "]");
-    let min_gpu_mem_gib = line
-        .split_once("min_gpu_mem=")
-        .and_then(|(_, rest)| rest.split_whitespace().next())
-        .and_then(|value| value.parse::<u32>().ok());
-    Some(DeterministicModelRecipe {
-        canonical_id,
-        min_gpu_mem_gib,
-        engines,
-        engine_statuses: Vec::new(),
-        warnings: Vec::new(),
-    })
-}
-
-fn parse_bracketed_csv(line: &str, start: &str, end: &str) -> Vec<String> {
-    line.split_once(start)
-        .and_then(|(_, rest)| rest.split_once(end))
-        .map(|(values, _)| {
-            values
-                .split(',')
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_owned)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn is_engine_status_line(line: &str) -> bool {
-    matches!(
-        line.split_once(':').map(|(engine, _)| engine),
-        Some("lemonade" | "vllm")
-    )
-}
-
-fn deterministic_engine_fit_summary(recipe: &DeterministicModelRecipe, engine: &str) -> String {
-    let status = recipe
-        .engine_statuses
-        .iter()
-        .find(|status| status.starts_with(&format!("{engine}:")))
-        .map(std::string::String::as_str);
-    match status {
-        Some(status) if status.contains("unsupported_native_windows") => {
-            format!("{engine}: WSL/Linux only on Windows")
-        }
-        Some(status)
-            if status.split_once(':').is_some_and(|(_, rest)| {
-                rest.trim_start().starts_with("available")
-                    || rest.trim_start().starts_with("adapter_available")
-            }) =>
-        {
-            format!("{engine}: available")
-        }
-        Some(status) => status.to_owned(),
-        None if recipe.engines.iter().any(|candidate| candidate == engine) => {
-            format!("{engine}: listed")
-        }
-        None => format!("{engine}: not listed"),
-    }
-}
-
-fn deterministic_available_engine_names(recipe: &DeterministicModelRecipe) -> Vec<String> {
-    let engines = recipe
-        .engine_statuses
-        .iter()
-        .filter_map(|status| {
-            let (engine, rest) = status.split_once(':')?;
-            (rest.trim_start().starts_with("available")
-                || rest.trim_start().starts_with("adapter_available"))
-            .then_some(engine.to_owned())
-        })
-        .collect::<Vec<_>>();
-    if engines.is_empty() {
-        recipe.engines.clone()
-    } else {
-        engines
-    }
-}
-
-fn deterministic_comfyui_tool_summary(tool_text: &str) -> Option<String> {
-    if !tool_text.contains("ComfyUI") || !tool_text.contains("Running") {
-        return None;
-    }
-    let mut lines = Vec::new();
-    match chat_tool_value(tool_text, "installed").as_deref() {
-        Some("yes") => lines.push("  ComfyUI: installed.".to_owned()),
-        Some("no") => lines.push("  ComfyUI: not installed.".to_owned()),
-        Some(value) => lines.push(format!("  ComfyUI: installed status is {value}.")),
-        None => {}
-    }
-    if let Some(status) = chat_tool_value(tool_text, "status") {
-        let running_text = if status.eq_ignore_ascii_case("running") {
-            "running".to_owned()
-        } else if status.eq_ignore_ascii_case("starting") {
-            "starting".to_owned()
-        } else {
-            format!("not running ({status})")
-        };
-        lines.push(format!("  Running: {running_text}."));
-    }
-    if let Some(models_path) = chat_tool_value(tool_text, "models path") {
-        lines.push(format!("  Models folder: {models_path}."));
-    }
-    (!lines.is_empty()).then(|| lines.join("\n"))
-}
-
-#[derive(Debug, Default)]
-struct DeterministicServiceRow {
-    service_id: String,
-    engine: String,
-    model: String,
-    status: String,
-    running_state: String,
-    endpoint: String,
-}
-
-fn deterministic_services_tool_summary(tool_text: &str) -> Option<String> {
-    if !tool_text.contains("Local Servers")
-        && !tool_text.contains("managed_services:")
-        && !tool_text.contains("services:")
-    {
-        return None;
-    }
-    let rows = parse_deterministic_service_rows(tool_text);
-    let mut lines = Vec::new();
-    let live = rows
-        .iter()
-        .filter(|row| matches!(row.running_state.as_str(), "running" | "starting"))
-        .collect::<Vec<_>>();
-    if live.is_empty() {
-        lines.push("  Local model servers: none running under ROCm CLI.".to_owned());
-    } else {
-        lines.push(format!(
-            "  Local model servers running/starting: {}.",
-            live.len()
-        ));
-        for row in live.iter().take(4) {
-            lines.push(format!(
-                "    {} {} ({}) at {}.",
-                row.engine,
-                row.model,
-                row.running_state,
-                empty_as_unknown(&row.endpoint)
-            ));
-        }
-    }
-    let past = rows
-        .iter()
-        .filter(|row| !matches!(row.running_state.as_str(), "running" | "starting"))
-        .take(3)
-        .map(|row| {
-            format!(
-                "{} {} {}",
-                empty_as_unknown(&row.engine),
-                empty_as_unknown(&row.model),
-                empty_as_unknown(&row.status)
-            )
-        })
-        .collect::<Vec<_>>();
-    if !past.is_empty() {
-        lines.push(format!("  Past/non-running records: {}.", past.join("; ")));
-    }
-    (!lines.is_empty()).then(|| lines.join("\n"))
-}
-
-fn parse_deterministic_service_rows(tool_text: &str) -> Vec<DeterministicServiceRow> {
-    let mut rows = Vec::new();
-    let mut current: Option<DeterministicServiceRow> = None;
-    for line in tool_text.lines() {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix("- service_id=") {
-            if let Some(row) = current.take() {
-                rows.push(row);
-            }
-            let mut row = DeterministicServiceRow::default();
-            for token in rest.split_whitespace() {
-                if let Some((key, value)) = token.split_once('=') {
-                    match key {
-                        "service_id" => row.service_id = value.to_owned(),
-                        "engine" => row.engine = value.to_owned(),
-                        "model" => row.model = value.to_owned(),
-                        "status" => row.status = value.to_owned(),
-                        "running_state" => row.running_state = value.to_owned(),
-                        "endpoint" => row.endpoint = value.to_owned(),
-                        _ => {}
-                    }
-                }
-            }
-            if row.running_state.is_empty() {
-                row.running_state = managed_service_running_state(&row.status).to_owned();
-            }
-            current = Some(row);
-            continue;
-        }
-        if let Some(service_id) = trimmed.strip_prefix("- ") {
-            if let Some(row) = current.take() {
-                rows.push(row);
-            }
-            current = Some(DeterministicServiceRow {
-                service_id: service_id.to_owned(),
-                ..Default::default()
-            });
-            continue;
-        }
-        let Some(row) = current.as_mut() else {
-            continue;
-        };
-        if let Some(value) = trimmed.strip_prefix("status:") {
-            row.status = value.trim().to_owned();
-            row.running_state = managed_service_running_state(&row.status).to_owned();
-        } else if let Some(value) = trimmed.strip_prefix("engine:") {
-            row.engine = value.trim().to_owned();
-        } else if let Some(value) = trimmed.strip_prefix("model:") {
-            row.model = value.trim().to_owned();
-        } else if let Some(value) = trimmed.strip_prefix("endpoint:") {
-            row.endpoint = value.trim().to_owned();
-        }
-    }
-    if let Some(row) = current {
-        rows.push(row);
-    }
-    rows
-}
-
-fn deterministic_port_status_tool_summary(tool_text: &str) -> Option<String> {
-    if !tool_text.contains("port_status:") && !tool_text.contains("listening:") {
-        return None;
-    }
-    let port = chat_tool_value(tool_text, "port")?;
-    let listening = chat_tool_value(tool_text, "listening").unwrap_or_else(|| "unknown".to_owned());
-    let mut lines = Vec::new();
-    let state = match listening.as_str() {
-        "true" => "listening",
-        "false" => "not listening",
-        _ => "unknown",
-    };
-    lines.push(format!("  Port {port}: {state}."));
-    if let Some(hint) = chat_tool_value(tool_text, "hint") {
-        lines.push(format!("  Hint: {hint}."));
-    }
-    if chat_tool_value(tool_text, "managed_service").as_deref() == Some("none") {
-        lines.push("  Managed service: none on that endpoint.".to_owned());
-    }
-    Some(lines.join("\n"))
-}
-
-#[derive(Debug, Default)]
-struct DeterministicEngineRow {
-    engine: String,
-    runtime: String,
-    note: String,
-}
-
-fn deterministic_engine_inventory_tool_summary(tool_text: &str) -> Option<String> {
-    if !tool_text.contains("Local model engines") {
-        return None;
-    }
-    let rows = parse_deterministic_engine_rows(tool_text);
-    if rows.is_empty() {
-        return None;
-    }
-    let mut lines = vec!["  Engine runtimes:".to_owned()];
-    for row in rows {
-        let mut line = format!(
-            "    {}: {}",
-            friendly_engine_label(&row.engine),
-            empty_as_unknown(&row.runtime)
-        );
-        if !row.note.trim().is_empty() {
-            let _ = write!(line, " ({})", row.note.trim());
-        }
-        line.push('.');
-        lines.push(line);
-    }
-    Some(lines.join("\n"))
-}
-
-fn parse_deterministic_engine_rows(tool_text: &str) -> Vec<DeterministicEngineRow> {
-    let mut rows = Vec::new();
-    let mut current: Option<DeterministicEngineRow> = None;
-    for line in tool_text.lines() {
-        let trimmed = line.trim().trim_start_matches("* ").trim_start();
-        if let Some(engine) = engine_name_from_inventory_line(trimmed) {
-            if let Some(row) = current.take() {
-                rows.push(row);
-            }
-            current = Some(DeterministicEngineRow {
-                engine: engine.to_owned(),
-                ..Default::default()
-            });
-            continue;
-        }
-        let Some(row) = current.as_mut() else {
-            continue;
-        };
-        if let Some(runtime) = trimmed.strip_prefix("runtime:") {
-            row.runtime = runtime.trim().to_owned();
-        } else if let Some(note) = trimmed.strip_prefix("note:") {
-            row.note = note.trim().to_owned();
-        }
-    }
-    if let Some(row) = current {
-        rows.push(row);
-    }
-    rows
-}
-
-fn engine_name_from_inventory_line(line: &str) -> Option<&'static str> {
-    ["lemonade", "vllm"].into_iter().find(|engine| {
-        line == *engine
-            || line
-                .strip_prefix(*engine)
-                .is_some_and(|rest| rest.starts_with(char::is_whitespace))
-    })
-}
-
-fn should_request_local_tool_follow_up(
-    provider: &str,
-    tool_result: &ChatToolRunResult,
-    deterministic_summary: Option<&str>,
-) -> bool {
-    provider == "local"
-        && deterministic_summary.is_none()
-        && tool_result.approval.is_none()
-        && tool_result.ran_read_only_tool
-        && !tool_result.read_only_tool_error
-        && !tool_result.follow_up_text.trim().is_empty()
-}
-
-fn chat_tool_value(tool_text: &str, key: &str) -> Option<String> {
-    let prefix = format!("{key}:");
-    tool_text.lines().find_map(|line| {
-        line.trim()
-            .strip_prefix(&prefix)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_owned)
-    })
-}
-
-// pub(crate): used by the dash execution seam (dash_seam.rs)
-pub(crate) fn run_internal_mcp_call(
-    paths: &AppPaths,
-    name: &str,
-    arguments: serde_json::Value,
-    allow_mutation: bool,
-) -> Result<serde_json::Value> {
-    let arguments = internal_mcp_arguments(arguments);
-    let call = providers::ChatToolCall {
-        id: None,
-        name: name.to_owned(),
-        arguments: serde_json::Value::Object(arguments.clone()),
-    };
-    validate_chat_tool_call(&call)?;
-    if !chat_tool_call_is_read_only(&call) && !allow_mutation {
-        bail!(
-            "MCP tool `{name}` changes local ROCm state; rerun `rocm mcp-call {name}` with --allow-mutation only after explicit user approval"
-        );
-    }
-
-    match name {
-        "examine" | "doctor" => {
-            let examine = ExamineSummary::gather()?;
-            let text = render_examine_text()?;
-            Ok(internal_mcp_tool_success(text, serde_json::json!(examine)))
-        }
-        "bridge_snapshot" => {
-            let snapshot = build_codex_bridge_snapshot(paths)?;
-            Ok(internal_mcp_tool_success(
-                format!(
-                    "Captured bridge snapshot for {} / {} with default engine `{}`.",
-                    snapshot.examine.os, snapshot.examine.arch, snapshot.examine.default_engine
-                ),
-                serde_json::json!(snapshot),
-            ))
-        }
-        "gpu_snapshot" => {
-            let config = RocmCliConfig::load(paths).unwrap_or_default();
-            let gpu = build_codex_bridge_gpu_snapshot(&config);
-            let status = if !config.telemetry.local_inspection_enabled() {
-                "GPU telemetry is disabled by rocm-cli config."
-            } else if gpu.amd_smi_available {
-                "Captured amd-smi GPU snapshot."
-            } else {
-                "Use `rocm examine` for the current local AMD GPU summary."
-            };
-            Ok(internal_mcp_tool_success(
-                status.to_owned(),
-                serde_json::json!(gpu),
-            ))
-        }
-        "engines" => {
-            let engines = builtin_codex_bridge_engine_inventory();
-            Ok(internal_mcp_tool_success(
-                format!("Found {} engine entries.", engines.len()),
-                serde_json::json!({ "engines": engines }),
-            ))
-        }
-        "services" => {
-            let services = load_managed_services(paths)?;
-            Ok(internal_mcp_tool_success(
-                render_services_tool_result_text(&services),
-                serde_json::json!({ "services": services }),
-            ))
-        }
-        "port_status" => run_chat_port_status_tool(paths, &call),
-        "service_logs" => {
-            let service_id = json_string(&arguments, "service_id")
-                .context("service_logs requires `service_id`")?;
-            let lines = arguments
-                .get("lines")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(80)
-                .clamp(1, 500) as usize;
-            let record = load_managed_services(paths)?
-                .into_iter()
-                .find(|service| service.service_id == service_id)
-                .with_context(|| format!("managed service `{service_id}` not found"))?;
-            let tail = read_tail_lines(&record.log_path, lines, "service log")?.join("\n");
-            Ok(internal_mcp_tool_success(
-                format!(
-                    "Read the last {} line(s) from service `{}`.",
-                    lines, record.service_id
-                ),
-                serde_json::json!({
-                    "service": record,
-                    "lines": lines,
-                    "tail": tail,
-                }),
-            ))
-        }
-        "automations" => {
-            let event_limit = arguments
-                .get("event_limit")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(10)
-                .clamp(1, 64) as usize;
-            let runtime = AutomationRuntimeState::load(paths)?;
-            let events = load_recent_automation_events(paths, event_limit)?;
-            Ok(internal_mcp_tool_success(
-                format!(
-                    "Loaded automation runtime and {} recent events.",
-                    events.len()
-                ),
-                serde_json::json!({
-                    "runtime": runtime,
-                    "recent_events": events,
-                }),
-            ))
-        }
-        "natural_language_plan" => {
-            let request = json_string(&arguments, "request")
-                .context("natural_language_plan requires `request`")?;
-            let config = RocmCliConfig::load(paths).unwrap_or_default();
-            let text = render_freeform_plan(&request, paths, &config);
-            let action =
-                freeform_plan_next_action_with_context(&request, paths, &config).map(|action| {
-                    serde_json::json!({
-                        "args": action.args,
-                        "approval_required": action.approval_required,
-                        "has_placeholders": action.has_placeholders,
-                        "provider_assisted": action.provider_assisted,
-                    })
-                });
-            Ok(internal_mcp_tool_success(
-                "Planned the ROCm request.".to_owned(),
-                serde_json::json!({
-                    "request": request,
-                    "text": text,
-                    "action": action,
-                }),
-            ))
-        }
-        "rocm_command" => {
-            let action = chat_rocm_command_action(&call)?;
-            let output = match action {
-                ChatRocmCommandAction::ReadOnly(args) => {
-                    run_rocm_command_for_paths(paths, &args, Duration::from_mins(2))?
-                }
-                ChatRocmCommandAction::Approval { args, .. } if allow_mutation => {
-                    let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
-                    run_rocm_capture_for_paths(paths, &refs, Duration::from_mins(2))?
-                }
-                ChatRocmCommandAction::Approval { .. } => {
-                    bail!("rocm_command changes local ROCm state and needs approval")
-                }
-            };
-            Ok(internal_mcp_tool_result_from_command(
-                "Ran `rocm` command.",
-                output,
-                false,
-            ))
-        }
-        "update_check" => {
-            let output =
-                run_rocm_command_for_paths(paths, &["update".to_owned()], Duration::from_mins(1))?;
-            Ok(internal_mcp_tool_result_from_command(
-                "Ran `rocm update`.",
-                output,
-                false,
-            ))
-        }
-        "install_sdk_dry_run" => {
-            let args = internal_mcp_install_sdk_args(&arguments, true)?;
-            let output = run_rocm_command_for_paths(paths, &args, Duration::from_mins(2))?;
-            Ok(internal_mcp_tool_result_from_command(
-                "Ran `rocm install sdk --dry-run`.",
-                output,
-                false,
-            ))
-        }
-        "path_exists" => run_chat_path_exists_tool(&call),
-        "proposal_action" => {
-            // Executes IN-PROCESS (no CLI subprocess): show loads a proposal;
-            // approve/reject mutate its status (allow_mutation already enforced
-            // by the read-only split above). proposal_action executes in-process
-            // (via update_automation_proposal_status); it never delegates to the
-            // subprocess arm.
-            let proposal_id = json_string(&arguments, "proposal_id")
-                .context("proposal_action requires `proposal_id`")?;
-            let action =
-                json_string(&arguments, "action").context("proposal_action requires `action`")?;
-            match action.as_str() {
-                "show" => {
-                    let proposal = rocm_core::find_automation_proposal(paths, &proposal_id)
-                        .with_context(|| {
-                            format!("automation proposal `{proposal_id}` not found")
-                        })?;
-                    Ok(internal_mcp_tool_success(
-                        format!(
-                            "Proposal {} ({}): {}",
-                            proposal.proposal_id, proposal.status, proposal.title
-                        ),
-                        serde_json::json!({
-                            "id": proposal.proposal_id,
-                            "status": proposal.status,
-                            "summary": proposal.title,
-                            "reason": proposal.message,
-                        }),
-                    ))
-                }
-                "approve" | "reject" => {
-                    let status = if action == "approve" {
-                        "approved"
-                    } else {
-                        "rejected"
-                    };
-                    let updated =
-                        rocm_core::update_automation_proposal_status(paths, &proposal_id, status)?;
-                    record_cli_audit_event(
-                        paths,
-                        "automations",
-                        if action == "approve" {
-                            "proposal_approved"
-                        } else {
-                            "proposal_rejected"
-                        },
-                        "info",
-                        format!("proposal {proposal_id} {status}"),
-                        None,
-                    );
-                    Ok(internal_mcp_tool_success(
-                        format!("Proposal {proposal_id} {status}."),
-                        serde_json::json!({
-                            "id": updated.proposal_id,
-                            "status": updated.status,
-                            "summary": updated.title,
-                            "reason": updated.message,
-                        }),
-                    ))
-                }
-                other => bail!("proposal_action `{other}` is not supported"),
-            }
-        }
-        "install_sdk" | "install_engine" | "launch_server" | "stop_server" | "watcher_enable"
-        | "watcher_disable" => {
-            let args = rocm_chat_tool_requested_args(&call)
-                .with_context(|| format!("MCP tool `{name}` is missing required arguments"))?;
-            let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
-            let output = run_rocm_capture_for_paths(paths, &refs, Duration::from_mins(2))?;
-            Ok(internal_mcp_tool_result_from_command(
-                "Ran approved `rocm` command.",
-                output,
-                false,
-            ))
-        }
-        other => bail!("unsupported MCP tool `{other}`"),
-    }
-}
-
-fn internal_mcp_arguments(value: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
-    if let Some(arguments) = value
-        .get("arguments")
-        .and_then(serde_json::Value::as_object)
-    {
-        return arguments.clone();
-    }
-    value.as_object().cloned().unwrap_or_default()
-}
-
-fn internal_mcp_tool_success(text: String, structured: serde_json::Value) -> serde_json::Value {
-    serde_json::json!({
-        "content": [
-            {
-                "type": "text",
-                "text": text,
-            }
-        ],
-        "structuredContent": structured,
-        "isError": false,
-    })
-}
-
-fn internal_mcp_tool_result_from_command(
-    prefix: &str,
-    output: CommandCapture,
-    is_error: bool,
-) -> serde_json::Value {
-    let text = format!("{prefix}\n\n{}", command_capture_text(&output));
-    serde_json::json!({
-        "content": [
-            {
-                "type": "text",
-                "text": text,
-            }
-        ],
-        "structuredContent": {
-            "argv": output.argv,
-            "exit_status": output.exit_status,
-            "stdout": output.stdout,
-            "stderr": output.stderr,
-        },
-        "isError": is_error || output.exit_status != 0,
-    })
-}
-
-fn command_capture_text(output: &CommandCapture) -> String {
-    if output.stderr.trim().is_empty() {
-        output.stdout.trim().to_owned()
-    } else if output.stdout.trim().is_empty() {
-        format!("stderr:\n{}", output.stderr.trim())
-    } else {
-        format!(
-            "stdout:\n{}\n\nstderr:\n{}",
-            output.stdout.trim(),
-            output.stderr.trim()
-        )
-    }
-}
-
-#[derive(Debug)]
-struct CommandCapture {
-    argv: Vec<String>,
-    exit_status: i32,
-    stdout: String,
-    stderr: String,
-}
-
-fn run_rocm_capture_for_paths(
-    paths: &AppPaths,
-    args: &[&str],
-    timeout: Duration,
-) -> Result<CommandCapture> {
-    let rocm_binary = daemon_binary_path()?;
-    let mut command = ProcessCommand::new(&rocm_binary);
-    command
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    apply_app_path_env(&mut command, paths);
-    let output = run_command_with_timeout(command, timeout)
-        .with_context(|| format!("failed to run {}", rocm_binary.display()))?;
-    Ok(CommandCapture {
-        argv: std::iter::once(rocm_binary.display().to_string())
-            .chain(args.iter().map(|value| (*value).to_owned()))
-            .collect(),
-        exit_status: output.status.code().unwrap_or(1),
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-    })
-}
-
-fn run_rocm_command_for_paths(
-    paths: &AppPaths,
-    args: &[String],
-    _timeout: Duration,
-) -> Result<CommandCapture> {
-    match run_rocm_read_only_in_process(paths, args) {
-        Ok(stdout) => Ok(CommandCapture {
-            argv: std::iter::once("rocm".to_owned())
-                .chain(args.iter().cloned())
-                .collect(),
-            exit_status: 0,
-            stdout,
-            stderr: String::new(),
-        }),
-        Err(error) => Err(error).with_context(|| {
-            format!(
-                "read-only assistant command is not implemented in-process: {}",
-                format_structured_tool_call("rocm", args)
-            )
-        }),
-    }
-}
-
-fn run_rocm_read_only_in_process(paths: &AppPaths, args: &[String]) -> Result<String> {
-    let config = RocmCliConfig::load(paths).unwrap_or_default();
-    match args {
-        [] => bail!("rocm command requires at least one argument"),
-        [command] if command.eq_ignore_ascii_case("examine") => {
-            render_examine_text_with_paths(paths, &config)
-        }
-        [command]
-            if command.eq_ignore_ascii_case("version")
-                || command == "--version"
-                || command == "-V" =>
-        {
-            Ok(format!("rocm-cli {}\n", cli_version_string()))
-        }
-        [command]
-            if command.eq_ignore_ascii_case("model") || command.eq_ignore_ascii_case("models") =>
-        {
-            Ok(render_model_registry_verbose_text_with_context_and_host(
-                Some(paths),
-                None,
-                None,
-            ))
-        }
-        [command] if command.eq_ignore_ascii_case("daemon") => {
-            Ok(render_daemon_text(paths, &config))
-        }
-        [command] if command.eq_ignore_ascii_case("logs") => Ok(render_logs_text(paths)),
-        [command, rest @ ..] if command.eq_ignore_ascii_case("logs") => {
-            let query = parse_optional_query(rest)?;
-            Ok(render_logs_browser_text(paths, query.as_deref()))
-        }
-        [command] if command.eq_ignore_ascii_case("runtimes") => {
-            render_runtimes_text(paths, &config)
-        }
-        [command, subcommand]
-            if command.eq_ignore_ascii_case("runtimes")
-                && subcommand.eq_ignore_ascii_case("list") =>
-        {
-            render_runtimes_text(paths, &config)
-        }
-        [command, subcommand]
-            if command.eq_ignore_ascii_case("engines")
-                && subcommand.eq_ignore_ascii_case("list") =>
-        {
-            Ok(render_engine_inventory_text_with_paths(Some(paths)))
-        }
-        [command] if command.eq_ignore_ascii_case("services") => render_services_text(paths, false),
-        [command, subcommand]
-            if command.eq_ignore_ascii_case("services")
-                && subcommand.eq_ignore_ascii_case("list") =>
-        {
-            render_services_text(paths, false)
-        }
-        [command, subcommand, flag]
-            if command.eq_ignore_ascii_case("services")
-                && subcommand.eq_ignore_ascii_case("list")
-                && matches!(flag.as_str(), "-a" | "--all") =>
-        {
-            render_services_text(paths, true)
-        }
-        [command, subcommand, service_id]
-            if command.eq_ignore_ascii_case("services")
-                && matches!(subcommand.to_ascii_lowercase().as_str(), "logs" | "log") =>
-        {
-            render_service_logs_text(paths, service_id)
-        }
-        [command] if command.eq_ignore_ascii_case("automations") => {
-            render_automations_text(paths, &config)
-        }
-        [command, subcommand]
-            if command.eq_ignore_ascii_case("automations")
-                && subcommand.eq_ignore_ascii_case("list") =>
-        {
-            render_automations_text(paths, &config)
-        }
-        [command, subcommand]
-            if command.eq_ignore_ascii_case("config")
-                && subcommand.eq_ignore_ascii_case("show") =>
-        {
-            Ok(render_config_text(paths, &config))
-        }
-        [command] if command.eq_ignore_ascii_case("comfyui") => {
-            comfyui::render_status(paths, &config)
-        }
-        [command, subcommand]
-            if command.eq_ignore_ascii_case("comfyui")
-                && subcommand.eq_ignore_ascii_case("status") =>
-        {
-            comfyui::render_status(paths, &config)
-        }
-        [command, subcommand, rest @ ..]
-            if command.eq_ignore_ascii_case("comfyui")
-                && matches!(subcommand.to_ascii_lowercase().as_str(), "logs" | "log") =>
-        {
-            comfyui::render_logs(
-                paths,
-                parse_optional_lines(rest).unwrap_or(DEFAULT_LOG_TAIL_LINES),
-            )
-        }
-        [command, rest @ ..]
-            if command.eq_ignore_ascii_case("update")
-                && !rest.iter().any(|arg| arg.eq_ignore_ascii_case("--apply")) =>
-        {
-            render_update_text(paths)
-        }
-        [command, subcommand, rest @ ..]
-            if command.eq_ignore_ascii_case("install")
-                && subcommand.eq_ignore_ascii_case("sdk")
-                && rest.iter().any(|arg| arg.eq_ignore_ascii_case("--dry-run")) =>
-        {
-            render_install_sdk_dry_run_for_args(paths, rest)
-        }
-        [command, rest @ ..]
-            if command.eq_ignore_ascii_case("uninstall")
-                && rest.iter().any(|arg| arg.eq_ignore_ascii_case("--dry-run")) =>
-        {
-            render_uninstall_dry_run(paths)
-        }
-        [command] if command.eq_ignore_ascii_case("setup") => {
-            render_setup_status_text(paths, &config)
-        }
-        [command, subcommand]
-            if command.eq_ignore_ascii_case("setup")
-                && subcommand.eq_ignore_ascii_case("status") =>
-        {
-            render_setup_status_text(paths, &config)
-        }
-        _ => bail!(
-            "unsupported in-process read-only rocm command: {}",
-            format_structured_tool_call("rocm", args)
-        ),
-    }
-}
-
-fn parse_optional_query(args: &[String]) -> Result<Option<String>> {
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--query" | "-q" => {
-                let value = args
-                    .get(index + 1)
-                    .context("logs query flag requires a value")?;
-                return Ok(Some(value.to_owned()));
-            }
-            value if value.starts_with("--") => {}
-            value => return Ok(Some(value.to_owned())),
-        }
-        index += 1;
-    }
-    Ok(None)
-}
-
-fn parse_optional_lines(args: &[String]) -> Result<usize> {
-    let mut index = 0;
-    while index < args.len() {
-        if matches!(args[index].as_str(), "--lines" | "-n") {
-            let value = args.get(index + 1).context("lines flag requires a value")?;
-            return value
-                .parse::<usize>()
-                .context("lines flag must be a positive number");
-        }
-        index += 1;
-    }
-    Ok(DEFAULT_LOG_TAIL_LINES)
-}
-
-/// Map the parsed `install sdk` arguments onto the install request.
-///
-/// Extracted from the command arm so this mapping has a seam. `include_devel`
-/// is the field that most needs one: nothing downstream re-derives it, so if
-/// the flag stopped being forwarded here the install would silently go back to
-/// pulling the compiler toolchain and every other assertion would still pass.
-#[allow(clippy::too_many_arguments)]
-const fn sdk_install_request<'a>(
-    channel: &'a str,
-    format: &'a str,
-    prefix: Option<PathBuf>,
-    version_selector: Option<therock::RuntimeVersionSelector>,
-    family_override: Option<&'a str>,
-    dry_run: bool,
-    devel: bool,
-    consent: therock::SdkInstallConsent,
-) -> therock::SdkInstallRequest<'a> {
-    therock::SdkInstallRequest {
-        channel,
-        format,
-        prefix,
-        version_selector,
-        family_override,
-        dry_run,
-        include_devel: devel,
-        consent,
-    }
-}
-
-fn render_install_sdk_dry_run_for_args(paths: &AppPaths, args: &[String]) -> Result<String> {
-    let channel = chat_cli_arg_value(args, "--channel").unwrap_or("release");
-    let format = chat_cli_arg_value(args, "--format").unwrap_or("wheel");
-    let prefix = chat_cli_arg_value(args, "--prefix").map(PathBuf::from);
-    let version = chat_cli_arg_value(args, "--version").map(str::to_owned);
-    let build_date = chat_cli_arg_value(args, "--build-date").map(str::to_owned);
-    let selector = therock_install_version_selector(version, build_date)?;
-    let devel = chat_cli_has_flag(args, "--devel");
-    // Dry run, so nothing is displaced and the consent gate is never reached;
-    // the narrow consent is what this chat surface would pass for a real
-    // install, and passing `--yes`'s source here would be a lie waiting to be
-    // printed if the preview ever grew a gate.
-    Ok(therock::install_sdk(
-        paths,
-        therock::SdkInstallRequest {
-            channel,
-            format,
-            prefix,
-            version_selector: selector,
-            dry_run: true,
-            include_devel: devel,
-            consent: therock::SdkInstallConsent::Preapproved(
-                therock::SdkInstallApprovalSource::ApproveReplacingActiveDefault,
-            ),
-            ..therock::SdkInstallRequest::default()
-        },
-    )?
-    .output)
-}
-
-fn run_command_with_timeout(
-    mut command: ProcessCommand,
-    timeout: Duration,
-) -> Result<std::process::Output> {
-    let mut child = command.spawn().context("failed to spawn child process")?;
-    let started = std::time::Instant::now();
-    loop {
-        if child
-            .try_wait()
-            .context("failed to poll child process")?
-            .is_some()
-        {
-            return child
-                .wait_with_output()
-                .context("failed to collect child process output");
-        }
-        if started.elapsed() >= timeout {
-            let _ = child.kill();
-            let output = child
-                .wait_with_output()
-                .context("failed to collect timed-out child process output")?;
-            bail!(
-                "process exceeded {}s timeout: {}",
-                timeout.as_secs(),
-                command_failure_detail(&output)
-            );
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-}
-
-fn internal_mcp_install_sdk_args(
-    arguments: &serde_json::Map<String, serde_json::Value>,
-    dry_run: bool,
-) -> Result<Vec<String>> {
-    let channel = json_string(arguments, "channel").unwrap_or_else(|| "release".to_owned());
-    let format = json_string(arguments, "format").unwrap_or_else(|| "wheel".to_owned());
-    let mut argv = vec![
-        "install".to_owned(),
-        "sdk".to_owned(),
-        "--channel".to_owned(),
-        channel,
-        "--format".to_owned(),
-        format,
-    ];
-    if let Some(prefix) = json_string(arguments, "prefix") {
-        let prefix_path = Path::new(&prefix);
-        if chat_install_prefix_is_system(prefix_path) {
-            bail!(
-                "install_sdk prefix `{}` is a system folder; choose a user folder instead",
-                prefix_path.display()
-            );
-        }
-        argv.push("--prefix".to_owned());
-        argv.push(prefix);
-    }
-    if let Some(version) = json_string(arguments, "version") {
-        argv.push("--version".to_owned());
-        argv.push(version);
-    }
-    if let Some(build_date) = json_string(arguments, "build_date") {
-        argv.push("--build-date".to_owned());
-        argv.push(build_date);
-    }
-    if dry_run {
-        argv.push("--dry-run".to_owned());
-    }
-    Ok(argv)
-}
-
-fn run_chat_read_only_tool(
-    paths: &AppPaths,
-    call: &providers::ChatToolCall,
-) -> Result<serde_json::Value> {
-    match call.name.as_str() {
-        "path_exists" => run_chat_path_exists_tool(call),
-        "port_status" => run_chat_port_status_tool(paths, call),
-        "rocm_command" => {
-            let action = chat_rocm_command_action(call)?;
-            let ChatRocmCommandAction::ReadOnly(args) = action else {
-                bail!("assistant read-only path cannot run mutating rocm_command");
-            };
-            let output = run_rocm_command_for_paths(paths, &args, Duration::from_mins(2))?;
-            Ok(internal_mcp_tool_result_from_command(
-                "Ran `rocm` command.",
-                output,
-                false,
-            ))
-        }
-        "update_check" => {
-            let output =
-                run_rocm_command_for_paths(paths, &["update".to_owned()], Duration::from_mins(1))?;
-            Ok(internal_mcp_tool_result_from_command(
-                "Ran `rocm update`.",
-                output,
-                false,
-            ))
-        }
-        "install_sdk_dry_run" => {
-            let arguments = internal_mcp_arguments(call.arguments.clone());
-            let args = internal_mcp_install_sdk_args(&arguments, true)?;
-            let output = run_rocm_command_for_paths(paths, &args, Duration::from_mins(2))?;
-            Ok(internal_mcp_tool_result_from_command(
-                "Ran `rocm install sdk --dry-run`.",
-                output,
-                false,
-            ))
-        }
-        _ => run_internal_mcp_call(paths, &call.name, call.arguments.clone(), false),
-    }
-}
-
-fn run_chat_path_exists_tool(call: &providers::ChatToolCall) -> Result<serde_json::Value> {
-    let object = call
-        .arguments
-        .as_object()
-        .context("path_exists arguments must be a JSON object")?;
-    let path = json_string(object, "path").context("path_exists requires path")?;
-    let path = Path::new(&path);
-    let metadata = path.metadata().ok();
-    let path_kind = metadata.as_ref().map_or("missing", |metadata| {
-        if metadata.is_dir() {
-            "directory"
-        } else if metadata.is_file() {
-            "file"
-        } else {
-            "other"
-        }
-    });
-    let parent = path.parent();
-    let parent_exists = parent.is_some_and(Path::exists);
-    let parent_display = parent.map_or_else(
-        || "<none>".to_owned(),
-        |parent| parent.display().to_string(),
-    );
-    let text = format!(
-        "path: {}\nexists: {}\nkind: {}\nparent: {}\nparent_exists: {}",
-        path.display(),
-        metadata.is_some(),
-        path_kind,
-        parent_display,
-        parent_exists
-    );
-    Ok(serde_json::json!({
-        "content": [{
-            "type": "text",
-            "text": text,
-        }]
-    }))
-}
-
-fn run_chat_port_status_tool(
-    paths: &AppPaths,
-    call: &providers::ChatToolCall,
-) -> Result<serde_json::Value> {
-    let object = call
-        .arguments
-        .as_object()
-        .context("port_status arguments must be a JSON object")?;
-    let host = json_string(object, "host").unwrap_or_else(|| DEFAULT_LOCAL_HOST.to_owned());
-    let port = object
-        .get("port")
-        .and_then(serde_json::Value::as_u64)
-        .context("port_status requires port")? as u16;
-    let reachable = loopback_tcp_port_is_reachable(&host, port);
-    let host_key = loopback_host_key(&host);
-    let matching_services = load_managed_services(paths)?
-        .into_iter()
-        .filter(|record| {
-            record.port == port
-                && loopback_host_key(&record.host) == host_key
-                && managed_service_is_live(record)
-        })
-        .collect::<Vec<_>>();
-    let app_hint = if port == comfyui::default_port() {
-        Some("ComfyUI default port")
-    } else if port == rocm_core::DEFAULT_LOCAL_PORT {
-        Some("ROCm local model server default port")
-    } else {
-        None
-    };
-    let mut text = String::new();
-    let _ = writeln!(text, "host: {host}");
-    let _ = writeln!(text, "port: {port}");
-    let _ = writeln!(text, "listening: {reachable}");
-    if let Some(app_hint) = app_hint {
-        let _ = writeln!(text, "hint: {app_hint}");
-    }
-    if matching_services.is_empty() {
-        let _ = writeln!(text, "managed_service: none");
-    } else {
-        let _ = writeln!(text, "managed_services:");
-        for service in &matching_services {
-            let _ = writeln!(
-                text,
-                "  - service_id={} engine={} model={} status={} running_state={} endpoint={}",
-                service.service_id,
-                service.engine,
-                service.model_ref,
-                service.status,
-                managed_service_running_state(&service.status),
-                service.endpoint_url
-            );
-        }
-    }
-    Ok(serde_json::json!({
-        "content": [{
-            "type": "text",
-            "text": text,
-        }],
-        "structuredContent": {
-            "host": host,
-            "port": port,
-            "listening": reachable,
-            "hint": app_hint,
-            "managed_services": matching_services,
-        },
-        "isError": false,
-    }))
-}
-
-fn loopback_tcp_port_is_reachable(host: &str, port: u16) -> bool {
-    let Ok(addresses) = (host, port).to_socket_addrs() else {
-        return false;
-    };
-    addresses
-        .into_iter()
-        .any(|address| TcpStream::connect_timeout(&address, Duration::from_millis(200)).is_ok())
-}
-
-fn mcp_tool_result_text(value: &serde_json::Value) -> String {
-    value
-        .get("content")
-        .and_then(serde_json::Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| {
-                    (item.get("type").and_then(serde_json::Value::as_str) == Some("text"))
-                        .then(|| item.get("text").and_then(serde_json::Value::as_str))
-                        .flatten()
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        })
-        .filter(|text| !text.trim().is_empty())
-        .unwrap_or_else(|| value.to_string())
-}
-
-fn mcp_tool_result_is_error(value: &serde_json::Value) -> bool {
-    value
-        .get("isError")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-}
-
-const fn chat_read_only_tool_status_label(is_error: bool) -> &'static str {
-    if is_error {
-        "reported an error"
-    } else {
-        "done"
-    }
-}
-
-fn chat_tool_display_label(name: &str) -> String {
-    match name {
-        "examine" => "Checked this computer".to_owned(),
-        "gpu_snapshot" => "Checked GPU status".to_owned(),
-        "engines" => "Checked local engines".to_owned(),
-        "services" => "Checked model servers".to_owned(),
-        "bridge_snapshot" => "Checked ROCm state".to_owned(),
-        "service_logs" => "Read server logs".to_owned(),
-        "automations" => "Checked automations".to_owned(),
-        "natural_language_plan" => "Planned ROCm request".to_owned(),
-        "path_exists" => "Checked folder path".to_owned(),
-        "port_status" => "Checked local port".to_owned(),
-        "update_check" => "Checked for ROCm updates".to_owned(),
-        "install_sdk_dry_run" => "Previewed ROCm install".to_owned(),
-        "install_sdk" => "Install ROCm".to_owned(),
-        "install_engine" => "Install engine".to_owned(),
-        "launch_server" => "Start local model server".to_owned(),
-        "stop_server" => "Stop local model server".to_owned(),
-        "watcher_enable" => "Enable automation".to_owned(),
-        "watcher_disable" => "Disable automation".to_owned(),
-        other => other.replace('_', " "),
-    }
-}
-
-fn chat_tool_call_display_label(call: &providers::ChatToolCall) -> String {
-    if call.name != "rocm_command" {
-        return chat_tool_display_label(&call.name);
-    }
-    let Some(args) = normalized_chat_rocm_command_args(call).ok() else {
-        return "rocm command".to_owned();
-    };
-    match args.as_slice() {
-        [command] if command.eq_ignore_ascii_case("examine") => "Checked this computer".to_owned(),
-        [command]
-            if command.eq_ignore_ascii_case("model") || command.eq_ignore_ascii_case("models") =>
-        {
-            "Checked model recipes".to_owned()
-        }
-        [command, subcommand]
-            if command.eq_ignore_ascii_case("engines")
-                && subcommand.eq_ignore_ascii_case("list") =>
-        {
-            "Checked local engines".to_owned()
-        }
-        [command] if command.eq_ignore_ascii_case("services") => "Checked model servers".to_owned(),
-        [command, subcommand, rest @ ..]
-            if command.eq_ignore_ascii_case("services")
-                && subcommand.eq_ignore_ascii_case("list")
-                && rest
-                    .iter()
-                    .all(|arg| matches!(arg.as_str(), "-a" | "--all")) =>
-        {
-            "Checked model servers".to_owned()
-        }
-        [command] if command.eq_ignore_ascii_case("comfyui") => "Checked ComfyUI".to_owned(),
-        [command, subcommand]
-            if command.eq_ignore_ascii_case("comfyui")
-                && subcommand.eq_ignore_ascii_case("status") =>
-        {
-            "Checked ComfyUI".to_owned()
-        }
-        [command, subcommand, ..]
-            if command.eq_ignore_ascii_case("comfyui")
-                && matches!(subcommand.to_ascii_lowercase().as_str(), "logs" | "log") =>
-        {
-            "Read ComfyUI logs".to_owned()
-        }
-        [command, subcommand]
-            if command.eq_ignore_ascii_case("config")
-                && subcommand.eq_ignore_ascii_case("show") =>
-        {
-            "Checked ROCm config".to_owned()
-        }
-        _ => "rocm command".to_owned(),
-    }
-}
-
-fn rocm_chat_tool_requested_command(call: &providers::ChatToolCall) -> Option<String> {
-    let args = rocm_chat_tool_requested_args(call)?;
-    Some(format_structured_tool_call("rocm", &args))
-}
-
-fn rocm_chat_tool_requested_args(call: &providers::ChatToolCall) -> Option<Vec<String>> {
-    let object = call.arguments.as_object()?;
-    match call.name.as_str() {
-        "install_sdk" => {
-            let mut args = vec![
-                "install".to_owned(),
-                "sdk".to_owned(),
-                "--channel".to_owned(),
-                json_string(object, "channel").unwrap_or_else(|| "release".to_owned()),
-                "--format".to_owned(),
-                json_string(object, "format").unwrap_or_else(|| "wheel".to_owned()),
-                // The MCP surface runs `rocm` with null stdin, so the consent
-                // prompt would refuse. This keeps the tool non-interactive,
-                // matching the chat `install sdk` arm. Deliberately not `--yes`:
-                // that would additionally approve a `sudo` system-package
-                // install this spawn has no terminal to answer.
-                "--approve-replacing-active-default".to_owned(),
-            ];
-            if let Some(prefix) = json_string(object, "prefix") {
-                args.push("--prefix".to_owned());
-                args.push(prefix);
-            }
-            if let Some(version) = json_string(object, "version") {
-                args.push("--version".to_owned());
-                args.push(version);
-            }
-            if let Some(build_date) = json_string(object, "build_date") {
-                args.push("--build-date".to_owned());
-                args.push(build_date);
-            }
-            Some(args)
-        }
-        "install_engine" => {
-            let engine = json_string(object, "engine")?;
-            let mut args = vec!["engines".to_owned(), "install".to_owned(), engine];
-            if let Some(runtime_id) = json_string(object, "runtime_id") {
-                args.push("--runtime-id".to_owned());
-                args.push(runtime_id);
-            }
-            if let Some(python_version) = json_string(object, "python_version") {
-                args.push("--python-version".to_owned());
-                args.push(python_version);
-            }
-            if object
-                .get("reinstall")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false)
-            {
-                args.push("--reinstall".to_owned());
-            }
-            Some(args)
-        }
-        "launch_server" => {
-            let model = json_string(object, "model")?;
-            let mut args = vec!["serve".to_owned(), model, "--managed".to_owned()];
-            push_optional_json_cli_arg(&mut args, object, "--engine", "engine");
-            push_optional_json_cli_arg(&mut args, object, "--device", "device");
-            push_optional_json_cli_arg(&mut args, object, "--runtime-id", "runtime_id");
-            push_optional_json_cli_arg(&mut args, object, "--env-id", "env_id");
-            push_optional_json_cli_arg(&mut args, object, "--host", "host");
-            if let Some(port) = object.get("port").and_then(serde_json::Value::as_u64) {
-                args.push("--port".to_owned());
-                args.push(port.to_string());
-            }
-            Some(args)
-        }
-        "stop_server" => {
-            let service_id = json_string(object, "service_id")?;
-            Some(vec![
-                "services".to_owned(),
-                "stop".to_owned(),
-                service_id,
-                "--yes".to_owned(),
-            ])
-        }
-        "watcher_enable" => {
-            let watcher = json_string(object, "watcher")?;
-            let mut args = vec!["automations".to_owned(), "enable".to_owned(), watcher];
-            push_optional_json_cli_arg(&mut args, object, "--mode", "mode");
-            Some(args)
-        }
-        "watcher_disable" => {
-            let watcher = json_string(object, "watcher")?;
-            Some(vec![
-                "automations".to_owned(),
-                "disable".to_owned(),
-                watcher,
-            ])
-        }
-        "rocm_command" => match chat_rocm_command_action(call).ok()? {
-            ChatRocmCommandAction::Approval { args, .. }
-            | ChatRocmCommandAction::ReadOnly(args) => Some(args),
-        },
-        _ => None,
-    }
-}
-
-fn push_optional_json_cli_arg(
-    args: &mut Vec<String>,
-    object: &serde_json::Map<String, serde_json::Value>,
-    flag: &str,
-    key: &str,
-) {
-    if let Some(value) = json_string(object, key) {
-        args.push(flag.to_owned());
-        args.push(value);
-    }
-}
-
-fn json_string(object: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<String> {
-    object
-        .get(key)
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_owned)
-        .filter(|value| !value.trim().is_empty())
-}
-
 pub(crate) fn render_examine_text() -> Result<String> {
     let paths = AppPaths::discover()?;
     let config = RocmCliConfig::load(&paths).unwrap_or_default();
@@ -9386,6 +5328,22 @@ fn append_examine_engine_inventory(
     }
 }
 
+/// The per-hardware-group heading in `rocm model`, carrying the "this is the
+/// box you are on" marker when the group matches the detected host GPU.
+///
+/// Split out of [`render_model_registry_text_with_context_and_host`] only so
+/// the marked branch is reachable from a test. Taking it in situ needs a host
+/// whose real gfx target matches a catalog platform, which the default no-GPU
+/// CI lane never provides — leaving the marker (`←` before ROCMAI-543) as the
+/// one ASCII conversion on this surface that nothing guards.
+fn model_catalog_platform_heading(label: &str, your_gpu: bool) -> String {
+    if your_gpu {
+        format!("{label} <- your GPU")
+    } else {
+        label.to_owned()
+    }
+}
+
 #[allow(dead_code)]
 pub(crate) fn render_model_registry_text_with_context_and_host(
     _paths: Option<&AppPaths>,
@@ -9432,11 +5390,7 @@ pub(crate) fn render_model_registry_text_with_context_and_host(
         let your_gpu = host_gfx_family
             .as_deref()
             .is_some_and(|family| platform_matches_gfx_family(platform, family));
-        let heading = if your_gpu {
-            format!("{} \u{2190} your GPU", platform.label)
-        } else {
-            platform.label.clone()
-        };
+        let heading = model_catalog_platform_heading(&platform.label, your_gpu);
         let _ = writeln!(output, "\n{heading}");
         for recipe in group {
             // Show the canonical Hugging Face id (the reliable serve target) and
@@ -9461,7 +5415,7 @@ pub(crate) fn render_model_registry_text_with_context_and_host(
     if matches!(registry.source, ModelRecipeRegistrySource::BuiltIn) {
         let _ = writeln!(
             output,
-            "\nThese are recommendations — you can serve any compatible Hugging Face model:\n  \
+            "\nThese are recommendations - you can serve any compatible Hugging Face model:\n  \
              rocm serve <owner/repo>          # vLLM, e.g. Qwen/Qwen3.6-27B\n  \
              rocm serve <owner/repo>:<quant>  # Lemonade GGUF, e.g. unsloth/Qwen3.6-35B-A3B-GGUF:Q4_K_M\n\
              \nUse `rocm model --verbose` for details."
@@ -9571,11 +5525,11 @@ pub(crate) fn render_model_registry_verbose_text_with_context_and_host(
 fn model_catalog_header(registry: &ModelRecipeRegistry) -> String {
     match &registry.source {
         ModelRecipeRegistrySource::BuiltIn => {
-            "Recommended models — run one with `rocm serve <model>`".to_owned()
+            "Recommended models - run one with `rocm serve <model>`".to_owned()
         }
         ModelRecipeRegistrySource::SignedIndex { index_path, .. } => {
             format!(
-                "Recommended models — from recipe index {}",
+                "Recommended models - from recipe index {}",
                 index_path.display()
             )
         }
@@ -9803,9 +5757,9 @@ fn artifact_source_policy_label(policy: &str) -> &str {
     }
 }
 
-/// Human-readable size. `rocm storage` reports caches that are routinely tens
-/// of megabytes, so the intermediate tiers matter: a bare byte count is
-/// unreadable at the sizes this reports.
+/// Human-readable size, for `rocm storage`'s cache report and the automations
+/// proposal history. Both report values routinely in the tens of megabytes,
+/// so the intermediate tiers matter: a bare byte count is unreadable there.
 fn format_bytes(bytes: u64) -> String {
     const KIB: f64 = 1024.0;
     // `{:.1}` rounds, so from 1023.95 of a unit upwards the text already reads
@@ -10758,34 +6712,6 @@ pub(crate) fn render_services_json(paths: &AppPaths, all: bool) -> Result<String
     Ok(output)
 }
 
-fn render_services_tool_result_text(records: &[ManagedServiceRecord]) -> String {
-    let mut output = String::new();
-    let _ = writeln!(output, "managed_services: {}", records.len());
-    let _ = writeln!(
-        output,
-        "status_meaning: ready/running = running; starting/recovering = starting; failed/stopped = not running; no matching row = not managed by ROCm CLI"
-    );
-    if records.is_empty() {
-        let _ = writeln!(output, "services: none");
-        return output;
-    }
-    let _ = writeln!(output, "services:");
-    for record in records {
-        let _ = writeln!(
-            output,
-            "  - service_id={} engine={} model={} canonical_model={} status={} running_state={} endpoint={}",
-            record.service_id,
-            record.engine,
-            record.model_ref,
-            record.canonical_model_id,
-            record.status,
-            managed_service_running_state(&record.status),
-            record.endpoint_url
-        );
-    }
-    output
-}
-
 pub(crate) fn render_service_logs_text(paths: &AppPaths, service_id: &str) -> Result<String> {
     render_service_logs_text_with_options(paths, service_id, true)
 }
@@ -10872,7 +6798,12 @@ fn render_service_action_result(tool: &str, value: &serde_json::Value) -> String
     text
 }
 
-fn load_managed_service(paths: &AppPaths, service_id: &str) -> Result<ManagedServiceRecord> {
+/// A managed service's record exactly as it is on disk, without the engine-state
+/// and liveness refresh [`load_managed_service`] applies (and may persist).
+fn read_managed_service_manifest(
+    paths: &AppPaths,
+    service_id: &str,
+) -> Result<(ManagedServiceRecord, PathBuf)> {
     validate_service_id(service_id)?;
     let manifest_path = paths.service_manifest_path(service_id);
     let bytes = fs::read(&manifest_path).with_context(|| {
@@ -10884,6 +6815,11 @@ fn load_managed_service(paths: &AppPaths, service_id: &str) -> Result<ManagedSer
     let mut record = serde_json::from_slice::<ManagedServiceRecord>(&bytes)
         .with_context(|| format!("failed to parse {}", manifest_path.display()))?;
     record.normalize_paths_for_host();
+    Ok((record, manifest_path))
+}
+
+fn load_managed_service(paths: &AppPaths, service_id: &str) -> Result<ManagedServiceRecord> {
+    let (mut record, manifest_path) = read_managed_service_manifest(paths, service_id)?;
     let refreshed_from_engine = record.refresh_from_engine_state().unwrap_or(false);
     let refreshed_liveness = refresh_managed_service_runtime_liveness(paths, &mut record);
     if refreshed_from_engine || refreshed_liveness {
@@ -11032,38 +6968,90 @@ fn terminate_recorded_service_pids(record: &ManagedServiceRecord) -> (Vec<u32>, 
 }
 
 fn stop_internal_managed_service(paths: &AppPaths, service_id: &str) -> Result<serde_json::Value> {
-    let mut record = load_managed_service(paths, service_id)?;
-    let engine_stop = if record.engine == "lemonade" {
-        unload_lemonade_service_model(&record).map(|()| StopResponse {
+    stop_internal_managed_service_with(paths, service_id, terminate_recorded_service_pids)
+}
+
+/// [`stop_internal_managed_service`], with the termination of the recorded
+/// processes supplied by the caller. Production passes
+/// [`terminate_recorded_service_pids`]; a test passes a stand-in that observes
+/// what is on disk at the moment the processes would be signalled. Everything
+/// else — the engine stop, the manifest writes, the key cleanup — runs for real.
+fn stop_internal_managed_service_with(
+    paths: &AppPaths,
+    service_id: &str,
+    terminate: impl FnOnce(&ManagedServiceRecord) -> (Vec<u32>, bool),
+) -> Result<serde_json::Value> {
+    stop_internal_managed_service_confirmed_with(paths, service_id, terminate)
+        .map(|(report, _)| report)
+}
+
+/// [`stop_internal_managed_service_with`], also returning whether the stop is
+/// confirmed: every process it handled is gone and the record still names
+/// them. The report's `status` cannot carry that on its own — a record that
+/// already read `stopped` keeps that status through a stop that confirmed
+/// nothing.
+fn stop_internal_managed_service_confirmed_with(
+    paths: &AppPaths,
+    service_id: &str,
+    terminate: impl FnOnce(&ManagedServiceRecord) -> (Vec<u32>, bool),
+) -> Result<(serde_json::Value, bool)> {
+    let mut stopping = load_managed_service(paths, service_id)?;
+    // Record the request on disk before anything is stopped, not only after.
+    // From the engine `Stop` below until the last recorded process is confirmed
+    // gone, the record still reads `ready`/`running` while its endpoint stops
+    // answering — exactly what the daemon's `server-recover` watcher restarts.
+    // That watcher skips a record carrying this marker, so it has to be on disk
+    // for the whole stop. Same order as `rocmd`'s `stop_managed_service_with`.
+    let requested_at = rocm_core::unix_time_millis();
+    stopping.stop_requested_unix_ms = Some(requested_at);
+    stopping.write()?;
+    let engine_stop = if stopping.engine == "lemonade" {
+        unload_lemonade_service_model(&stopping).map(|()| StopResponse {
             stopped: true,
             graceful: true,
         })
     } else {
         engine_request::<_, StopResponse>(
             Some(paths),
-            &record.engine,
+            &stopping.engine,
             EngineMethod::Stop,
             &StopRequest {
-                service_id: record.service_id.clone(),
+                service_id: stopping.service_id.clone(),
                 force: true,
             },
         )
     };
-    let (signaled_pids, all_stopped) = terminate_recorded_service_pids(&record);
-    // Only claim "stopped" when every recorded process is confirmed gone. When a
-    // stop cannot confirm termination (rare: SIGKILL-resistant or unverifiable
-    // PID), leave the prior status so the standard liveness refresh reconciles it
-    // to "stopped" once the process actually dies — rather than asserting a stop
-    // that did not happen.
+    let (signaled_pids, terminated_all) = terminate(&stopping);
+    // Re-read the record rather than write back the copy loaded before the
+    // stop, which can be some forty seconds old by now: `write` replaces the
+    // whole file, and a supervisor, the daemon's restart or another stop may
+    // have written in the meantime. Only this stop's own changes are applied to
+    // what is there now — the same discipline as `rocmd`'s
+    // `stop_managed_service_with`. Read as-is: `load_managed_service`'s
+    // liveness refresh would act on this stop's own marker before the verdict
+    // below has been reached.
+    let (mut record, _) = read_managed_service_manifest(paths, service_id)?;
+    // Only claim "stopped" when every recorded process is confirmed gone, and
+    // only for the processes this stop handled. If the record names different
+    // ones now — a restart recorded its new supervisor while the stop ran —
+    // the verdict says nothing about them, and claiming the service stopped or
+    // dropping the key it serves with would both be false.
+    //
+    // When a stop cannot confirm termination (rare: SIGKILL-resistant or
+    // unverifiable PID), leave the status so the standard liveness refresh
+    // reconciles it to "stopped" once the process actually dies — rather than
+    // asserting a stop that did not happen.
+    let all_stopped = terminated_all && stopping.names_same_processes(&record);
     if all_stopped {
         record.status = "stopped".to_owned();
         record.stop_requested_unix_ms = None;
     } else {
-        // Record that a stop was *asked for* even though it could not be
-        // confirmed. `refresh_managed_service_runtime_liveness` needs this to
-        // tell a service the operator stopped from one that merely crashed: only
-        // the former should lose its endpoint key once its processes are gone.
-        record.stop_requested_unix_ms = Some(rocm_core::unix_time_millis());
+        // The marker records that a stop was *asked for* even though it could
+        // not be confirmed. `refresh_managed_service_runtime_liveness` needs it
+        // to tell a service the operator stopped from one that merely crashed:
+        // only the former should lose its endpoint key once its processes are
+        // gone. Re-stamped, because a restart that ran meanwhile clears it.
+        record.stop_requested_unix_ms = Some(requested_at);
     }
     record.write()?;
     // Drop the endpoint key with the service by deleting its 0600 key file.
@@ -11089,12 +7077,13 @@ fn stop_internal_managed_service(paths: &AppPaths, service_id: &str) -> Result<s
             "error": error.to_string(),
         }),
     };
-    Ok(serde_json::json!({
+    let report = serde_json::json!({
         "service_id": service_id,
         "status": record.status,
         "engine_stop": engine_stop,
         "signaled_pids": signaled_pids,
-    }))
+    });
+    Ok((report, all_stopped))
 }
 
 fn unload_lemonade_service_model(record: &ManagedServiceRecord) -> Result<()> {
@@ -11193,7 +7182,23 @@ fn restart_internal_managed_service(
     service_id: &str,
     runtime_pin: Option<&str>,
 ) -> Result<ManagedServiceRecord> {
-    let mut record = load_service_for_restart(paths, service_id, runtime_pin)?;
+    restart_internal_managed_service_with(
+        paths,
+        service_id,
+        runtime_pin,
+        terminate_recorded_service_pids,
+    )
+}
+
+/// [`restart_internal_managed_service`], with the termination of the recorded
+/// processes supplied by the caller — see [`stop_internal_managed_service_with`].
+fn restart_internal_managed_service_with(
+    paths: &AppPaths,
+    service_id: &str,
+    runtime_pin: Option<&str>,
+    terminate: impl FnOnce(&ManagedServiceRecord) -> (Vec<u32>, bool),
+) -> Result<ManagedServiceRecord> {
+    let record = load_service_for_restart(paths, service_id, runtime_pin)?;
     // Preserve the endpoint key across the restart: `stop_internal_managed_service`
     // deletes the key file (correct on a real stop), but a restart must bring the
     // service back on the same public host with the same auth. Capture it first and
@@ -11206,16 +7211,34 @@ fn restart_internal_managed_service(
         preserved_endpoint_key.is_some(),
         record.requires_api_key,
     )?;
-    let _ = stop_internal_managed_service(paths, service_id);
+    let (stop_report, stopped) =
+        stop_internal_managed_service_confirmed_with(paths, service_id, terminate)
+            .with_context(|| format!("failed to stop `{service_id}` before restarting it"))?;
+    // Starting a new engine is only safe once the old one is confirmed gone: a
+    // survivor still holds the port and the GPU, so the new child would fail to
+    // bind or contend for the device, and recording it would hide the survivor
+    // from the next stop. The unconfirmed stop has already re-stamped its
+    // marker and kept the endpoint key, so the liveness refresh finishes the
+    // stop once the process does exit.
+    if !stopped {
+        bail!(
+            "did not restart `{service_id}`: its stop could not confirm that every recorded \
+             process exited (signalled pids: {}), so no new engine was started; the stop \
+             request stays recorded on the service",
+            stop_report["signaled_pids"]
+        );
+    }
     if let Some(key) = preserved_endpoint_key.as_deref() {
         endpoint_keys::store_endpoint_api_key(paths, service_id, key)?;
     }
-    // The stop above may have recorded an unconfirmed-stop marker; a successful
-    // restart supersedes it. Leaving it set would let the next liveness refresh
-    // delete the key of the service we are bringing back up. Reaches disk with
-    // the record writes below; if the restart bails before one of those, the
-    // marker stays set on disk — correct, since then the stop is what stands.
-    record.stop_requested_unix_ms = None;
+    // What the confirmed stop left on disk. Every later write is applied to the
+    // record as it is then, guarded on it still being this — never a write-back
+    // of the copy loaded before the stop, which would erase a stop marker or
+    // anything else written while this restart ran. The confirmed stop cleared
+    // its own marker, so a restart supersedes every stop asked for before it;
+    // one asked for since is someone else's, and none of the writes below
+    // touches it.
+    let (stopped_record, _) = read_managed_service_manifest(paths, service_id)?;
     // Still after the stop, like the device-policy refusal inside it always was:
     // the callers' "stopped by the attempt" report and pin restore both cover a
     // restart that gets this far and fails.
@@ -11273,8 +7296,9 @@ fn restart_internal_managed_service(
             .try_wait()
             .context("failed to check restarted engine startup state")?
         {
-            record.status = "failed".to_owned();
-            record.write()?;
+            update_restarting_record(paths, &stopped_record, |current| {
+                current.status = "failed".to_owned();
+            })?;
             bail!(
                 "{}",
                 managed_engine_startup_failure_detail(status, &record.log_path)
@@ -11284,29 +7308,105 @@ fn restart_internal_managed_service(
     };
     #[cfg(windows)]
     thread::sleep(Duration::from_millis(200));
-    record.status = "running".to_owned();
-    record.supervisor_pid = child_pid;
-    record.engine_pid = Some(child_pid);
-    // Refresh the identity token in lockstep with the restarted child's PID.
-    record.supervisor_start_ticks = rocm_core::process_start_ticks(child_pid);
-    // Counts the restart and drops the previous run's inference verification —
-    // the new child has an unloaded model, so the old verdict says nothing about
-    // it.
-    record.reset_for_restart();
+    // Recorded before the readiness wait, so a stop issued during it finds the
+    // new child rather than the processes already stopped.
+    let started = record_restarted_child(paths, &stopped_record, runtime_pin, child_pid)?;
     let readiness = wait_for_service_http_ready(
-        &record.engine,
-        &record.host,
-        record.port,
-        &record.canonical_model_id,
+        &started.engine,
+        &started.host,
+        started.port,
+        &started.canonical_model_id,
         endpoint_api_key.as_deref(),
         Duration::from_secs(45),
     );
-    record.status = status_for_readiness(readiness).to_owned();
-    if readiness == EndpointReadiness::Serving {
-        record.inference_verified_at_unix_ms = Some(rocm_core::unix_time_millis() as u64);
+    record_restart_readiness(paths, &started, readiness)
+}
+
+/// Apply one of a restart's own changes to the record as it is on disk now,
+/// rather than writing back a copy the restart holds. `write` replaces the
+/// whole file, and a stop records `stop_requested_unix_ms` before it signals
+/// anything — the same hazard `rocmd`'s `update_supervised_record` guards
+/// against for the supervisor's writes.
+///
+/// Nothing is written, and `None` returned, when the record no longer reads
+/// as `expected` left it — it is gone, names other processes, or has another
+/// status: whoever wrote since holds a truer view than this restart. `update`
+/// never touches the stop marker, so a stop asked for meanwhile survives.
+fn update_restarting_record(
+    paths: &AppPaths,
+    expected: &ManagedServiceRecord,
+    update: impl FnOnce(&mut ManagedServiceRecord),
+) -> Result<Option<ManagedServiceRecord>> {
+    if !paths.service_manifest_path(&expected.service_id).exists() {
+        return Ok(None);
     }
-    record.write()?;
-    Ok(record)
+    let (mut current, _) = read_managed_service_manifest(paths, &expected.service_id)?;
+    if !current.names_same_processes(expected) || current.status != expected.status {
+        return Ok(None);
+    }
+    update(&mut current);
+    current.write()?;
+    Ok(Some(current))
+}
+
+/// Record the child a restart just started, over the record its confirmed
+/// stop left (`stopped`). Fails when that record has changed since: the child
+/// is then running but unrecorded, and the caller has to hear that rather than
+/// a claim that the service restarted.
+///
+/// `runtime_pin` is re-applied here because the record on disk does not carry
+/// it: the restart's own load refreshed the record from the outgoing process's
+/// engine state and persisted that, re-adopting the previous `runtime_id` and
+/// `env_id` over the pin `runtime_services::pin_service_record_to_runtime`
+/// wrote. The child was launched with the pin (see [`restart_child_argv`]), so
+/// the record that names it has to say the same runtime.
+fn record_restarted_child(
+    paths: &AppPaths,
+    stopped: &ManagedServiceRecord,
+    runtime_pin: Option<&str>,
+    child_pid: u32,
+) -> Result<ManagedServiceRecord> {
+    update_restarting_record(paths, stopped, |current| {
+        apply_restart_runtime_pin(current, runtime_pin);
+        current.status = "running".to_owned();
+        // Both roles move to the restarted child, each with its own token —
+        // see `spawn_managed_engine_child`.
+        current.record_supervisor_identity(child_pid);
+        current.record_engine_identity(child_pid);
+        // Counts the restart and drops the previous run's inference
+        // verification — the new child has an unloaded model, so the old
+        // verdict says nothing about it.
+        current.reset_for_restart();
+    })?
+    .with_context(|| {
+        format!(
+            "service `{}` changed on disk while it was restarting, so the restarted engine \
+             (pid {child_pid}) was not recorded on it",
+            stopped.service_id
+        )
+    })
+}
+
+/// The restart's last write: what the readiness wait found. Applied only while
+/// the record still reads as [`record_restarted_child`] left it; otherwise a
+/// stop or another restart has written since, and the record as it is now is
+/// returned untouched.
+fn record_restart_readiness(
+    paths: &AppPaths,
+    started: &ManagedServiceRecord,
+    readiness: EndpointReadiness,
+) -> Result<ManagedServiceRecord> {
+    let updated = update_restarting_record(paths, started, |current| {
+        current.status = status_for_readiness(readiness).to_owned();
+        if readiness == EndpointReadiness::Serving {
+            current.inference_verified_at_unix_ms = Some(rocm_core::unix_time_millis() as u64);
+        }
+    })?;
+    match updated {
+        Some(record) => Ok(record),
+        None => Ok(read_managed_service_manifest(paths, &started.service_id)
+            .map_or_else(|_| started.clone(), |(record, _)| record)),
+    }
 }
 
 fn validate_service_id(service_id: &str) -> Result<()> {
@@ -11620,7 +7720,7 @@ fn apply_runtime_update(
 /// `append_update_activate_summary`, and `render_sdk_install_success` for the
 /// call sites.
 const ROLLBACK_RECOVERY_HINT: &str = "  next step: if this causes problems, run `rocm runtimes rollback` \
-(no history — undoes only this one activation)";
+(no history - undoes only this one activation)";
 
 /// Appends the `--activate` branch of the `update --apply` summary. The
 /// rollback hint is only shown when a previous runtime was actually recorded —
@@ -11790,7 +7890,7 @@ pub(crate) fn render_automations_text(paths: &AppPaths, config: &RocmCliConfig) 
                     .arguments
                     .get("artifact_max_bytes")
                     .and_then(serde_json::Value::as_u64)
-                    .map_or_else(|| "not set".to_owned(), format_bytes_for_user);
+                    .map_or_else(|| "not set".to_owned(), format_bytes);
                 let _ = writeln!(output, "      download: approved up to {limit}");
             } else if proposal_kind(&proposal) == ProposalKind::PrefetchArtifact {
                 let _ = writeln!(output, "      download: not approved yet");
@@ -11923,26 +8023,6 @@ fn audit_event_plain_summary(event: &AuditEventRecord) -> &'static str {
         "engine" => "Engine activity was recorded.",
         _ => "Background activity was recorded.",
     }
-}
-
-fn format_bytes_for_user(bytes: u64) -> String {
-    const UNITS: [&str; 3] = ["KB", "MB", "GB"];
-    // Below 1 KB the count is printed whole, so no rounding can disagree with
-    // the comparison.
-    if bytes < 1024 {
-        return format!("{bytes} bytes");
-    }
-    let mut value = bytes as f64 / 1024.0;
-    let mut unit = 0;
-    // Promote while the value AS PRINTED would reach 1024, not merely while the
-    // raw value does: 1_048_575 bytes is 1023.999… KB, which `{:.1}` renders as
-    // "1024.0 KB". Comparing the rounded tenths, as `rocm_core::format_bytes`
-    // does, keeps every size in the unit it belongs to.
-    while unit + 1 < UNITS.len() && (value * 10.0).round() >= 10_240.0 {
-        value /= 1024.0;
-        unit += 1;
-    }
-    format!("{value:.1} {}", UNITS[unit])
 }
 
 const fn watcher_mode_plain_label(mode: WatcherMode) -> &'static str {
@@ -12119,15 +8199,6 @@ fn existing_live_managed_service(
                 && record.canonical_model_id == canonical_model_id
                 && managed_service_is_live(record)
         })
-}
-
-fn managed_service_running_state(status: &str) -> &'static str {
-    match status {
-        "ready" | "running" => "running",
-        "starting" | "recovering" => "starting",
-        "failed" | "stopped" => "not_running",
-        _ => "unknown",
-    }
 }
 
 const SERVICE_LIVENESS_CHECK_TIMEOUT: Duration = Duration::from_millis(750);
@@ -12637,7 +8708,7 @@ fn build_freeform_plan_with_recipes(
     }
 
     if planner_mentions_comfyui(&lower) {
-        if any_substring(&lower, &["log", "logs"]) {
+        if chat::any_substring(&lower, &["log", "logs"]) {
             return StructuredRequestPlan {
                 request: trimmed.to_owned(),
                 planner: "hybrid-parser-v1".to_owned(),
@@ -12654,7 +8725,7 @@ fn build_freeform_plan_with_recipes(
                 notes: Vec::new(),
             };
         }
-        if any_substring(&lower, &["start", "run", "launch", "open"]) {
+        if chat::any_substring(&lower, &["start", "run", "launch", "open"]) {
             return StructuredRequestPlan {
                 request: trimmed.to_owned(),
                 planner: "hybrid-parser-v1".to_owned(),
@@ -12711,8 +8782,8 @@ fn build_freeform_plan_with_recipes(
         } else {
             "release"
         };
-        let build_date = requested_therock_build_date_from_prompt(&lower);
-        let Some(prefix) = requested_install_prefix_from_prompt(trimmed) else {
+        let build_date = chat::requested_therock_build_date_from_prompt(&lower);
+        let Some(prefix) = chat::requested_install_prefix_from_prompt(trimmed) else {
             let mut parsed = vec![
                 ("channel".to_owned(), channel.to_owned()),
                 ("format".to_owned(), "wheel".to_owned()),
@@ -13155,12 +9226,12 @@ fn validate_provider_planner_tool_call(call: &ProviderPlannerToolCall) -> Result
         [command] if command == "examine" => {}
         [command, subcommand] if command == "engines" && subcommand == "list" => {}
         [command, subcommand, ..] if command == "install" && subcommand == "sdk" => {
-            validate_chat_rocm_command_safety(&call.args)?;
+            chat::validate_chat_rocm_command_safety(&call.args)?;
         }
         [command, subcommand, ..] if command == "install" && subcommand == "driver" => {}
         [command, ..] if command == "update" => {}
         [command, ..] if command == "serve" => {
-            if chat_cli_has_flag(&call.args, "--allow-public-bind") {
+            if chat::chat_cli_has_flag(&call.args, "--allow-public-bind") {
                 bail!("provider planner cannot request public network binding");
             }
             if serve_args_request_cpu_device(&call.args) {
@@ -13168,13 +9239,13 @@ fn validate_provider_planner_tool_call(call: &ProviderPlannerToolCall) -> Result
                     "provider planner cannot request CPU execution; rocm-cli requires ROCm GPU execution"
                 );
             }
-            if let Some(host) = chat_cli_arg_value(&call.args, "--host")
+            if let Some(host) = chat::chat_cli_arg_value(&call.args, "--host")
                 && !is_loopback_host(host)
             {
                 bail!("provider planner cannot request non-local host `{host}`");
             }
-            if chat_cli_has_flag(&call.args, "--foreground")
-                || !chat_cli_has_flag(&call.args, "--managed")
+            if chat::chat_cli_has_flag(&call.args, "--foreground")
+                || !chat::chat_cli_has_flag(&call.args, "--managed")
             {
                 bail!("provider planner must request managed serving with --managed");
             }
@@ -13333,11 +9404,11 @@ fn planner_is_inspect_request(lower: &str) -> bool {
 }
 
 fn planner_mentions_comfyui(lower: &str) -> bool {
-    any_substring(lower, &["comfyui", "comfy ui", "comfy"])
+    chat::any_substring(lower, &["comfyui", "comfy ui", "comfy"])
 }
 
 fn planner_requests_comfyui_install(lower: &str) -> bool {
-    any_substring(
+    chat::any_substring(
         lower,
         &[
             "can you setup",
@@ -13427,38 +9498,24 @@ struct UninstallPlan {
     actions: Vec<UninstallPlanEntry>,
     skipped: Vec<String>,
     warnings: Vec<String>,
+    /// Installer PATH changes `rocm uninstall` undoes.
+    path_edits: Vec<uninstall::PathEdit>,
+    /// The installer's record of its PATH change, removed once that change is
+    /// undone.
+    path_record: Option<PathBuf>,
+    /// The running executable, on Windows, which is deleted as the command exits.
+    self_delete: Option<PathBuf>,
 }
 
 fn build_uninstall_plan(paths: &AppPaths, options: &UninstallOptions) -> Result<UninstallPlan> {
     let mut plan = UninstallPlan::default();
 
-    if options.keep_binaries {
-        plan.skipped
-            .push("binary removal disabled by --keep-binaries".to_owned());
-    } else {
-        let current_exe =
-            daemon_binary_path().context("failed to discover current rocm executable")?;
-        if is_dev_binary_layout(&current_exe) && !options.force_dev_binaries {
-            plan.skipped.push(format!(
-                "binary removal skipped because {} looks like a cargo target build; pass --force-dev-binaries to remove sibling debug/release binaries",
-                current_exe.display()
-            ));
-        } else {
-            for path in collect_installed_binary_candidates(&current_exe)? {
-                if rocm_core::runtime_is_windows() && path == current_exe {
-                    plan.skipped.push(format!(
-                        "skipping running executable on Windows: {}",
-                        path.display()
-                    ));
-                    continue;
-                }
-                plan.actions.push(UninstallPlanEntry {
-                    kind: "binary",
-                    path,
-                });
-            }
-        }
-    }
+    plan_installed_binaries(
+        &mut plan,
+        options,
+        || daemon_binary_path().context("failed to discover current rocm executable"),
+        rocm_core::runtime_home_dir().as_deref(),
+    )?;
 
     for (keep, kind, path) in [
         (options.keep_config, "config", paths.config_dir.clone()),
@@ -13528,7 +9585,7 @@ fn build_uninstall_plan(paths: &AppPaths, options: &UninstallOptions) -> Result<
         plan.warnings.push(format!(
             "{} remote session record(s) exist under {}; their models keep running on the \
              remote machines and their endpoints stay published. Removing these records only \
-             loses track of them — run `rocm remote stop <session>` for each first: {}",
+             loses track of them - run `rocm remote stop <session>` for each first: {}",
             remote_sessions.len(),
             paths.remote_sessions_dir().display(),
             remote_sessions
@@ -13545,6 +9602,76 @@ fn build_uninstall_plan(paths: &AppPaths, options: &UninstallOptions) -> Result<
     Ok(plan)
 }
 
+/// Plan removing the installed binaries beside the running one, which
+/// `current_exe` names, and undoing the installer's PATH change for their
+/// folder. `--keep-binaries` keeps both, and so does a cargo build's folder.
+fn plan_installed_binaries(
+    plan: &mut UninstallPlan,
+    options: &UninstallOptions,
+    current_exe: impl FnOnce() -> Result<PathBuf>,
+    home: Option<&Path>,
+) -> Result<()> {
+    if options.keep_binaries {
+        // The PATH change only serves the binaries, so it stays with them.
+        plan.skipped.push(
+            "binary removal disabled by --keep-binaries, so any PATH change the installer made \
+             stays too"
+                .to_owned(),
+        );
+        return Ok(());
+    }
+    let current_exe = current_exe()?;
+    if is_dev_binary_layout(&current_exe) && !options.force_dev_binaries {
+        plan.skipped.push(format!(
+            "binary removal skipped because {} looks like a cargo target build; pass --force-dev-binaries to remove sibling debug/release binaries",
+            current_exe.display()
+        ));
+        return Ok(());
+    }
+    let binaries = collect_installed_binary_candidates(&current_exe)?;
+    for path in &binaries {
+        // Windows will not unlink a running image; it is deleted as the
+        // command exits instead.
+        if is_running_executable(path, &current_exe, cfg!(windows)) {
+            plan.self_delete = Some(path.clone());
+            continue;
+        }
+        // The PATH record goes only once its change is undone; see
+        // `uninstall::plan_path_edits`.
+        if path.file_name().and_then(|name| name.to_str()) == Some(uninstall::PATH_EDIT_RECORD) {
+            continue;
+        }
+        plan.actions.push(UninstallPlanEntry {
+            kind: "binary",
+            path: path.clone(),
+        });
+    }
+    if let Some(bin_dir) = current_exe.parent() {
+        uninstall::plan_path_edits(plan, bin_dir, &binaries, home);
+    }
+    Ok(())
+}
+
+/// Whether `path`, an entry of the running executable's folder, is the running
+/// executable itself, which only Windows has to treat specially. Windows names
+/// are case-insensitive, and the running image may report its own name in
+/// another case, or in its 8.3 short form (`ROCM.EXE`), than the folder listing
+/// does; missing it would plan an ordinary removal that Windows refuses.
+fn is_running_executable(path: &Path, current_exe: &Path, windows: bool) -> bool {
+    if !windows {
+        return false;
+    }
+    path == current_exe
+        || (path.parent() == current_exe.parent()
+            && path
+                .file_name()
+                .zip(current_exe.file_name())
+                .is_some_and(|(name, exe)| {
+                    name.to_string_lossy()
+                        .eq_ignore_ascii_case(&exe.to_string_lossy())
+                }))
+}
+
 pub(crate) fn render_uninstall_dry_run(paths: &AppPaths) -> Result<String> {
     let options = UninstallOptions {
         dry_run: true,
@@ -13558,14 +9685,16 @@ fn render_uninstall_plan(plan: &UninstallPlan, options: &UninstallOptions) -> St
     let mut output = String::new();
     let _ = writeln!(output, "Uninstall review");
     let _ = writeln!(output);
-    if plan.actions.is_empty() {
+    let removals = uninstall::removal_count(plan);
+    if uninstall::plan_is_empty(plan) {
         let _ = writeln!(output, "Nothing managed by rocm-cli would be removed.");
-    } else {
-        let _ = writeln!(output, "{} item(s) would be removed:", plan.actions.len());
+    } else if removals > 0 {
+        let _ = writeln!(output, "{removals} item(s) would be removed:");
         for entry in &plan.actions {
             let _ = writeln!(output, "  - {}: {}", entry.kind, entry.path.display());
         }
     }
+    uninstall::render_extra_plan(&mut output, plan);
     if !plan.warnings.is_empty() {
         let _ = writeln!(output);
         let _ = writeln!(output, "Please review:");
@@ -13695,7 +9824,7 @@ fn collect_installed_binary_candidates(current_exe: &Path) -> Result<Vec<PathBuf
 }
 
 fn is_rocm_install_entry_name(name: &str) -> bool {
-    if name == ".rocm-cli-manifest" {
+    if name == ".rocm-cli-manifest" || name == uninstall::PATH_EDIT_RECORD {
         return true;
     }
     let normalized = name.strip_suffix(".exe").unwrap_or(name);
@@ -15830,9 +11959,7 @@ pub(crate) mod tests {
     use super::*;
     use serde_json::json;
 
-    use crate::runtime_install_finalize::tests::{
-        consents_for_install_sdk_argv, finish_sdk_install_with,
-    };
+    use crate::runtime_install_finalize::tests::finish_sdk_install_with;
     use crate::runtimes_cmd::runtime_manifest_path;
     use crate::test_support::write_test_pip_runtime;
 
@@ -16120,12 +12247,30 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn out_of_scope_commands_are_marked_preview_in_help() {
+        let help = Cli::command().render_long_help().to_string();
+        for command in ["chat", "comfyui", "automations"] {
+            let line = help
+                .lines()
+                .find(|line| line.trim_start().starts_with(command))
+                .unwrap_or_else(|| panic!("`{command}` missing from help:\n{help}"));
+            assert!(
+                line.contains("[preview]"),
+                "`{command}` is outside the Tech Preview scope and must say so:\n{line}"
+            );
+        }
+    }
+
+    #[test]
     fn runtimes_help_uses_the_runtime_noun_throughout() {
         // `comfyui install`'s selection errors steer the user to `rocm runtimes`
         // and say "ROCm runtime". The help for the command they land on must use
         // the same noun — including its own about line, which `rocm runtimes
         // --help` prints above the subcommand list and which the rename missed
-        // while every subcommand below it already said "runtime".
+        // while every subcommand below it already said "runtime". The approval
+        // modal raised by a mutating `rocm runtimes …` from chat says the same
+        // noun too, but clap doesn't render that title — see
+        // `chat::tests::runtimes_activate_approval_modal_uses_the_runtime_noun`.
         let help = Cli::command()
             .find_subcommand_mut("runtimes")
             .expect("runtimes subcommand")
@@ -16139,39 +12284,6 @@ pub(crate) mod tests {
             !help.contains("ROCm install"),
             "`rocm runtimes --help` must not reintroduce the `ROCm install` noun:\n{help}"
         );
-
-        // The help is not the only `runtimes` string a user reads: running a
-        // mutating `rocm runtimes …` from chat raises an approval modal whose
-        // title is written here, not by clap, so the help assertions above
-        // cannot reach it. It said "Change ROCm install" until this rename.
-        let action = chat_rocm_command_action_from_args(vec![
-            "runtimes".to_owned(),
-            "activate".to_owned(),
-            "some-runtime-key".to_owned(),
-        ])
-        .expect("a mutating runtimes command classifies");
-        let ChatRocmCommandAction::Approval { pending_title, .. } = action else {
-            panic!("`rocm runtimes activate` must require approval, got {action:?}");
-        };
-        assert!(
-            pending_title.contains("runtime") && !pending_title.contains("install"),
-            "the `runtimes` approval modal must use the `runtime` noun, got {pending_title:?}"
-        );
-    }
-
-    #[test]
-    fn out_of_scope_commands_are_marked_preview_in_help() {
-        let help = Cli::command().render_long_help().to_string();
-        for command in ["chat", "comfyui", "automations"] {
-            let line = help
-                .lines()
-                .find(|line| line.trim_start().starts_with(command))
-                .unwrap_or_else(|| panic!("`{command}` missing from help:\n{help}"));
-            assert!(
-                line.contains("[preview]"),
-                "`{command}` is outside the Tech Preview scope and must say so:\n{line}"
-            );
-        }
     }
 
     #[test]
@@ -18479,959 +14591,37 @@ pub(crate) mod tests {
         }
     }
 
-    #[test]
-    fn chat_tool_call_mutating_install_maps_to_reviewable_rocm_command() {
-        let call = providers::ChatToolCall {
-            id: Some("call-1".to_owned()),
-            name: "install_sdk".to_owned(),
-            arguments: serde_json::json!({
-                "channel": "release",
-                "format": "wheel",
-                "prefix": "D:\\ROCm\\therock_venvs"
-            }),
-        };
-
-        assert!(!chat_tool_call_is_read_only(&call));
-        validate_chat_tool_call(&call).expect("install request should validate for review");
-        assert_eq!(
-            rocm_chat_tool_requested_command(&call).as_deref(),
-            Some(
-                "rocm install sdk --channel release --format wheel --approve-replacing-active-default --prefix D:\\ROCm\\therock_venvs"
-            )
-        );
-        let approval = chat_tool_approval_request(
-            &call,
-            Some("TheRock is not installed yet, so I need to install ROCm first."),
-        )
-        .expect("approval should be built");
-        assert_eq!(approval.pending_title, "Install ROCm");
-        assert_eq!(approval.command_title, "Install");
-        assert_eq!(
-            approval.explanation.as_deref(),
-            Some("TheRock is not installed yet, so I need to install ROCm first.")
-        );
-        assert_eq!(
-            approval.args,
-            vec![
-                "install".to_owned(),
-                "sdk".to_owned(),
-                "--channel".to_owned(),
-                "release".to_owned(),
-                "--format".to_owned(),
-                "wheel".to_owned(),
-                "--approve-replacing-active-default".to_owned(),
-                "--prefix".to_owned(),
-                "D:\\ROCm\\therock_venvs".to_owned(),
-            ]
-        );
-    }
-
-    #[test]
-    fn chat_install_sdk_strips_model_supplied_yes_and_skips_consent_on_dry_run() {
-        // `rocm_command` carries a model-supplied argv that nothing else filters,
-        // so `--yes` can arrive here. This arm exists to grant the narrow consent
-        // only; letting `--yes` through would re-grant the system-package/sudo
-        // consent on a spawn with no terminal to answer a password prompt.
-        let classify = |args: &[&str]| -> Vec<String> {
-            let action = chat_rocm_command_action_from_args(
-                args.iter().copied().map(str::to_owned).collect(),
-            )
-            .expect("install sdk should classify");
-            let ChatRocmCommandAction::Approval { args, .. } = action else {
-                panic!("install sdk is a mutating command");
-            };
-            args
-        };
-
-        assert_eq!(
-            classify(&["install", "sdk", "--prefix", "/tmp/therock", "--yes"]),
-            vec![
-                "install".to_owned(),
-                "sdk".to_owned(),
-                "--prefix".to_owned(),
-                "/tmp/therock".to_owned(),
-                "--approve-replacing-active-default".to_owned(),
-            ]
-        );
-
-        // A dry run returns before the consent gate, so it is not given a consent
-        // it never uses — matching the dry-run-aware sibling arms.
-        assert_eq!(
-            classify(&["install", "sdk", "--prefix", "/tmp/therock", "--dry-run"]),
-            vec![
-                "install".to_owned(),
-                "sdk".to_owned(),
-                "--prefix".to_owned(),
-                "/tmp/therock".to_owned(),
-                "--dry-run".to_owned(),
-            ]
-        );
-
-        // Both together: the strip is unconditional, so `--yes` still does not
-        // survive into a preview spawn, and the dry run still gains no consent.
-        // A model that emits both must not end up with either flag.
-        assert_eq!(
-            classify(&[
-                "install",
-                "sdk",
-                "--prefix",
-                "/tmp/therock",
-                "--yes",
-                "--dry-run",
-            ]),
-            vec![
-                "install".to_owned(),
-                "sdk".to_owned(),
-                "--prefix".to_owned(),
-                "/tmp/therock".to_owned(),
-                "--dry-run".to_owned(),
-            ]
-        );
-    }
-
-    #[test]
-    fn chat_install_sdk_strips_a_model_supplied_yes_in_both_its_bare_and_attached_forms() {
-        // `--yes` and `--yes=true` are both model-supplied argv that reach the
-        // chat arm intact: neither `canonicalize_chat_rocm_command` nor
-        // `validate_chat_rocm_command_safety` splits or rejects either. Whichever
-        // form survives re-grants into a null-stdin spawn the system-package/sudo
-        // consent `76c6aa3c` removed, with no terminal to answer the password
-        // prompt, so the strip has to catch both.
-        let classify = |args: &[&str]| -> Vec<String> {
-            let action = chat_rocm_command_action_from_args(
-                args.iter().copied().map(str::to_owned).collect(),
-            )
-            .expect("install sdk should classify");
-            let ChatRocmCommandAction::Approval { args, .. } = action else {
-                panic!("install sdk is a mutating command");
-            };
-            args
-        };
-
-        // Both terms of `arg != "--yes" && !arg.starts_with("--yes=")` are driven
-        // here, and each alone: the bare form is caught only by the first, the
-        // `=` forms only by the second, so dropping either term reddens this test
-        // on its own rather than leaving one half to a sibling.
-        for supplied in ["--yes", "--yes=true", "--yes=1", "--yes=false"] {
-            let args = classify(&["install", "sdk", "--prefix", "/tmp/therock", supplied]);
-            assert!(
-                !args.iter().any(|arg| arg.starts_with("--yes")),
-                "`{supplied}` must not survive the chat strip, got {args:?}"
-            );
-            assert_eq!(
-                args,
-                vec![
-                    "install".to_owned(),
-                    "sdk".to_owned(),
-                    "--prefix".to_owned(),
-                    "/tmp/therock".to_owned(),
-                    "--approve-replacing-active-default".to_owned(),
-                ],
-                "stripping `{supplied}` must leave the rest of the argv and the narrow consent alone"
-            );
-        }
-
-        // Future-proofing, not a guard on the `--yes=` term this test's other
-        // assertions pin: `--yes-not-a-flag` survives both the exact-match strip
-        // that preceded that term and the two-term strip that replaced it, so it
-        // would pass on either. What it does catch is the next edit — widening
-        // the second term to `starts_with("--yes")` to "simplify" it would start
-        // eating every argv token that merely begins the same way, silently
-        // dropping arguments the model legitimately sent.
-        let args = classify(&[
-            "install",
-            "sdk",
-            "--prefix",
-            "/tmp/therock",
-            "--yes-not-a-flag",
-        ]);
-        assert!(
-            args.iter().any(|arg| arg == "--yes-not-a-flag"),
-            "the strip must match `--yes` and `--yes=…`, not every token starting with \
-             `--yes`, got {args:?}"
-        );
-
-        // Second layer, and only the second: clap also refuses an attached value
-        // on this flag, so even an unstripped `--yes=true` would not parse today.
-        // That is what the strip above deliberately stops depending on — pinned
-        // here so a later `num_args` on `--yes` shows up as a failure of the
-        // backstop rather than passing unnoticed.
-        for attached in ["--yes=true", "--yes=1", "--yes=false"] {
-            let error = match Cli::try_parse_from(["rocm", "install", "sdk", attached]) {
-                Ok(cli) => panic!("`{attached}` must not parse, got {cli:?}"),
-                Err(error) => error,
-            };
-            assert_eq!(
-                error.kind(),
-                clap::error::ErrorKind::TooManyValues,
-                "expected clap to reject the attached value on {attached}: {error}"
-            );
-        }
-
-        // Control: the bare form does parse, so the assertions above are about
-        // the `=`-form and not about `--yes` being rejected outright.
-        let cli = Cli::try_parse_from(["rocm", "install", "sdk", "--yes"])
-            .expect("the bare flag is the form the chat arm strips");
-        match cli.command {
-            Some(Command::Install {
-                target: InstallTarget::Sdk { yes, .. },
-            }) => assert!(yes),
-            other => panic!("expected `install sdk`, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn chat_tool_call_mutating_install_accepts_requested_build_date() {
-        let call = providers::ChatToolCall {
-            id: Some("call-date".to_owned()),
-            name: "rocm_command".to_owned(),
-            arguments: serde_json::json!({
-                "args": ["install", "sdk", "--channel", "release", "--format", "wheel", "--prefix", "D:\\ROCm\\therock_venvs", "--build-date", "06052026"],
-                "reason": "The user asked for the TheRock build from 2026-06-05."
-            }),
-        };
-
-        validate_chat_tool_call(&call).expect("date-specific install should validate for review");
-        assert!(!chat_tool_call_is_read_only(&call));
-        assert_eq!(
-            rocm_chat_tool_requested_command(&call).as_deref(),
-            Some(
-                "rocm install sdk --channel release --format wheel --prefix D:\\ROCm\\therock_venvs --build-date 06052026 --approve-replacing-active-default"
-            )
-        );
-        let approval =
-            chat_tool_approval_request(&call, Some("Install the requested TheRock build."))
-                .expect("approval should be built");
-        assert_eq!(approval.pending_title, "Install ROCm");
-        assert_eq!(
-            approval.args,
-            vec![
-                "install".to_owned(),
-                "sdk".to_owned(),
-                "--channel".to_owned(),
-                "release".to_owned(),
-                "--format".to_owned(),
-                "wheel".to_owned(),
-                "--prefix".to_owned(),
-                "D:\\ROCm\\therock_venvs".to_owned(),
-                "--build-date".to_owned(),
-                "06052026".to_owned(),
-                "--approve-replacing-active-default".to_owned(),
-            ]
-        );
-    }
-
-    #[test]
-    fn chat_tool_call_rejects_mutating_install_without_user_folder() {
-        let structured = providers::ChatToolCall {
-            id: Some("call-missing-prefix".to_owned()),
-            name: "install_sdk".to_owned(),
-            arguments: serde_json::json!({
-                "channel": "release",
-                "format": "wheel"
-            }),
-        };
-        let error = validate_chat_tool_call(&structured)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("ask the user"), "unexpected error: {error}");
-
-        let command = providers::ChatToolCall {
-            id: Some("call-command-missing-prefix".to_owned()),
-            name: "rocm_command".to_owned(),
-            arguments: serde_json::json!({
-                "args": ["install", "sdk", "--channel", "release", "--format", "wheel"],
-                "reason": "Install ROCm."
-            }),
-        };
-        let error = validate_chat_tool_call(&command).unwrap_err().to_string();
-        assert!(error.contains("ask the user"), "unexpected error: {error}");
-    }
-
-    #[test]
-    fn chat_tool_call_service_and_watcher_changes_map_to_reviewable_rocm_commands() {
-        let stop = providers::ChatToolCall {
-            id: Some("call-stop".to_owned()),
-            name: "stop_server".to_owned(),
-            arguments: serde_json::json!({ "service_id": "svc-qwen" }),
-        };
-        validate_chat_tool_call(&stop).expect("stop request should validate for review");
-        assert_eq!(
-            rocm_chat_tool_requested_command(&stop).as_deref(),
-            Some("rocm services stop svc-qwen --yes")
-        );
-        let approval =
-            chat_tool_approval_request(&stop, Some("This server is using memory we need."))
-                .expect("stop approval should be built");
-        assert_eq!(approval.pending_title, "Stop local model server");
-        assert_eq!(approval.command_title, "Services");
-        assert_eq!(
-            approval.args,
-            vec![
-                "services".to_owned(),
-                "stop".to_owned(),
-                "svc-qwen".to_owned(),
-                "--yes".to_owned(),
-            ]
-        );
-        assert_eq!(
-            approval.explanation.as_deref(),
-            Some("This server is using memory we need.")
-        );
-
-        let enable = providers::ChatToolCall {
-            id: Some("call-watch".to_owned()),
-            name: "watcher_enable".to_owned(),
-            arguments: serde_json::json!({
-                "watcher": "server-recover",
-                "mode": "propose"
-            }),
-        };
-        validate_chat_tool_call(&enable).expect("watcher enable should validate for review");
-        assert_eq!(
-            rocm_chat_tool_requested_command(&enable).as_deref(),
-            Some("rocm automations enable server-recover --mode propose")
-        );
-        let approval =
-            chat_tool_approval_request(&enable, Some("Recovering failed servers would help."))
-                .expect("watcher approval should be built");
-        assert_eq!(approval.pending_title, "Enable automation");
-        assert_eq!(approval.command_title, "Automations");
-        assert_eq!(
-            approval.args,
-            vec![
-                "automations".to_owned(),
-                "enable".to_owned(),
-                "server-recover".to_owned(),
-                "--mode".to_owned(),
-                "propose".to_owned(),
-            ]
-        );
-
-        let disable = providers::ChatToolCall {
-            id: Some("call-disable".to_owned()),
-            name: "watcher_disable".to_owned(),
-            arguments: serde_json::json!({ "watcher": "server-recover" }),
-        };
-        validate_chat_tool_call(&disable).expect("watcher disable should validate for review");
-        assert_eq!(
-            rocm_chat_tool_requested_command(&disable).as_deref(),
-            Some("rocm automations disable server-recover")
-        );
-    }
-
-    #[test]
-    fn proposal_action_rejects_over_long_proposal_id() {
-        let call = providers::ChatToolCall {
-            id: None,
-            name: "proposal_action".to_owned(),
-            arguments: serde_json::json!({
-                "proposal_id": "p".repeat(129),
-                "action": "show"
-            }),
-        };
-        let err = validate_chat_proposal_action_tool_call(&call)
-            .expect_err("over-long proposal_id must be rejected");
-        assert!(err.to_string().contains("proposal_id too long"));
-    }
-
-    #[test]
-    fn chat_tool_call_accepts_expanded_read_only_bridge_tools() {
-        for call in [
-            providers::ChatToolCall {
-                id: None,
-                name: "bridge_snapshot".to_owned(),
-                arguments: serde_json::json!({}),
-            },
-            providers::ChatToolCall {
-                id: None,
-                name: "service_logs".to_owned(),
-                arguments: serde_json::json!({
-                    "service_id": "svc-qwen",
-                    "lines": 120
-                }),
-            },
-            providers::ChatToolCall {
-                id: None,
-                name: "automations".to_owned(),
-                arguments: serde_json::json!({ "event_limit": 12 }),
-            },
-            providers::ChatToolCall {
-                id: None,
-                name: "natural_language_plan".to_owned(),
-                arguments: serde_json::json!({ "request": "check whether ROCm needs an update" }),
-            },
-            providers::ChatToolCall {
-                id: None,
-                name: "port_status".to_owned(),
-                arguments: serde_json::json!({ "host": "127.0.0.1", "port": 8188 }),
-            },
-            providers::ChatToolCall {
-                id: None,
-                name: "update_check".to_owned(),
-                arguments: serde_json::json!({}),
-            },
-        ] {
-            validate_chat_tool_call(&call).expect("read-only bridge tool should validate");
-            assert!(
-                chat_tool_call_is_read_only(&call),
-                "{} should be read-only",
-                call.name
-            );
-        }
-    }
-
-    #[test]
-    fn local_assistant_prompt_instructions_cover_core_support_questions() {
-        let prompt = rocm_chat_tool_system_prompt();
-        for expected in [
-            "is TheRock installed",
-            "which GPU is on this machine",
-            "active_runtime_status=ready",
-            "legacy_rocm_status=not_detected",
-            "[\"model\"]",
-            "--build-date",
-            "always let the user choose the install folder",
-            "--prefix",
-            "do not invent a hidden default folder",
-            "config",
-            "comfyui",
-            "First-time setup is the same thing as bootstrap",
-            "vllm",
-            "Qwen3-4B-Instruct-2507-GGUF",
-            "fixed to qwen",
-            "served by Lemonade",
-            "port_status",
-            "[\"services\",\"list\",\"--all\"]",
-            "qwen-smoke",
-            "Do not invent shell commands",
-            "ROCm CLI Assistant Skill",
-            "Treat `localhost` and `127.0.0.1` as the same loopback endpoint",
-        ] {
-            assert!(
-                prompt.contains(expected),
-                "system prompt should mention {expected}"
-            );
-        }
-    }
-
-    /// The reported bug: asked "What can ROCm do on Windows?", the assistant
-    /// answered that ROCm is Windows-incompatible and suggested CUDA/DirectX —
-    /// because nothing ever told it which machine it was on. The prompt the CLI
-    /// actually sends must carry the host.
-    #[test]
-    fn assistant_prompt_states_the_host_it_is_answering_for() {
-        let prompt = rocm_chat_tool_system_prompt_for_host(None);
-
-        // The tool-use rules survive the composition (this is the same prompt,
-        // grounded — not a replacement for it).
-        assert!(
-            prompt.contains("You are ROCm CLI's local assistant"),
-            "the ROCm tool-use prompt must still be there:\n{prompt}"
-        );
-
-        // …and it now names this machine's OS and GPU state.
-        let expected_os = if cfg!(windows) {
-            "- Operating system: Windows"
-        } else {
-            "- Operating system: Linux"
-        };
-        assert!(
-            prompt.contains(expected_os),
-            "the prompt must state this machine's operating system:\n{prompt}"
-        );
-        assert!(
-            prompt.contains("- AMD GPU: "),
-            "the prompt must state what GPU was detected (or that none was):\n{prompt}"
-        );
-        assert!(
-            prompt.contains("Never tell the user ROCm is unavailable on their platform"),
-            "the prompt must refuse the reported answer:\n{prompt}"
-        );
-    }
-
-    /// The static prompt asserted two Windows-only facts at every host, which is
-    /// how a WSL user — where vLLM IS the supported path — was told to go use
-    /// WSL. Platform claims now come from the detected facts instead.
-    #[test]
-    fn assistant_prompt_makes_no_unconditional_windows_claims() {
-        let prompt = rocm_chat_tool_system_prompt();
-        assert!(
-            !prompt.contains("non-technical Windows users"),
-            "the audience is not assumed to be on Windows:\n{prompt}"
-        );
-        assert!(
-            !prompt.contains("On native Windows, vLLM is skipped"),
-            "the vLLM caveat belongs in the host facts, not the static prompt:\n{prompt}"
-        );
-
-        // Stated only where it is true: present on Windows, absent elsewhere.
-        let grounded = rocm_chat_tool_system_prompt_for_host(None);
-        assert_eq!(
-            grounded.contains("vLLM is skipped on native Windows"),
-            cfg!(windows),
-            "the vLLM caveat must track the host:\n{grounded}"
-        );
-    }
-
-    /// The prompt tells the model to "use examine … before answering". The dash
-    /// registers its machine check as `doctor`, so before the alias that
-    /// sentence named a tool absent from the dash's schema.
-    #[test]
-    fn every_tool_the_prompt_names_exists_in_the_dash_schema() {
-        let prompt = rocm_chat_tool_system_prompt();
-        for named in [
-            "examine",
-            "gpu_snapshot",
-            "port_status",
-            "natural_language_plan",
-        ] {
-            assert!(prompt.contains(named), "prompt should mention {named}");
-            assert!(
-                rocm_dash_tui::agent::ROCM_READ_TOOL_NAMES.contains(&named),
-                "the prompt names `{named}` but the dash never registers it, so a \
-                 model that obeys the prompt calls a tool the schema does not offer"
-            );
-        }
-    }
-
-    #[test]
-    fn deterministic_rocm_tool_summary_interprets_managed_runtime_as_installed() {
-        let summary = deterministic_rocm_tool_summary(
-            "\
-examine:
-  driver_detail: AMD Radeon RX 9070 XT driver 32.0.23033.1002
-  legacy_rocm_status: not_detected
-runtime_state:
-  active_runtime_status: ready
-  active_runtime_root: D:\\ROCm\\therock_venvs
-  active_runtime_pip_cache_dir: D:\\ROCm\\therock_venvs\\pip-cache
-  active_runtime_version: 7.13.0a20260511 (build 2026-05-11)
-  active_runtime_family: gfx120X-all
-",
-        )
-        .expect("examine output should summarize");
-
-        assert!(summary.contains("GPU: AMD Radeon RX 9070 XT driver 32.0.23033.1002"));
-        assert!(summary.contains("ROCm/TheRock: installed and active for ROCm CLI"));
-        assert!(summary.contains("gfx120X-all"));
-        assert!(summary.contains(r"Install folder: D:\ROCm\therock_venvs"));
-        assert!(summary.contains(r"Downloads/cache: D:\ROCm\therock_venvs\pip-cache"));
-        assert!(summary.contains("no global legacy ROCm install was found"));
-    }
-
-    #[test]
-    fn fallback_tool_call_routes_where_installed_to_read_only_examine() {
-        for prompt in [
-            "where is rocm installed?",
-            "where is TheRock installed?",
-            "what is the ROCm install folder?",
-            "where did rocm install to?",
-        ] {
-            let call = fallback_rocm_tool_call_for_prompt(prompt).unwrap();
-            assert_eq!(call.name, "examine", "{prompt}");
-            assert!(chat_tool_call_is_read_only(&call), "{prompt}");
-        }
-    }
-
-    #[test]
-    fn deterministic_rocm_tool_summary_suppresses_extra_local_model_follow_up() {
-        let tool_result = ChatToolRunResult {
-            approval: None,
-            follow_up_text: "\
-examine:
-  legacy_rocm_status: not_detected
-runtime_state:
-  active_runtime_status: ready
-"
-            .to_owned(),
-            ran_read_only_tool: true,
-            read_only_tool_error: false,
-            needs_install_folder: false,
-        };
-        let summary = deterministic_rocm_tool_summary(&tool_result.follow_up_text);
-
-        assert!(summary.is_some());
-        assert!(!should_request_local_tool_follow_up(
-            "local",
-            &tool_result,
-            summary.as_deref()
-        ));
-
-        let mut model_list_result = tool_result;
-        model_list_result.follow_up_text = "rocm_command:\nmodel recipes\n  qwen\n".to_owned();
-        assert!(should_request_local_tool_follow_up(
-            "local",
-            &model_list_result,
-            None
-        ));
-    }
-
-    #[test]
-    fn deterministic_model_tool_summary_identifies_low_vram_assistant() {
-        let summary = deterministic_model_tool_summary(
-            "\
-rocm_command:
-model recipes
-  Qwen3-4B-Instruct-2507-GGUF aliases=[qwen, lemonade-qwen] task=chat dtype=gguf device=gpu_required min_gpu_mem=4 GiB engines=[lemonade]
-      engine_support:
-        lemonade: available path=D:\\rocm\\rocm-engine-lemonade.exe
-      warning: recommended Lemonade GGUF assistant for ROCm machines
-  Qwen3-0.6B-GGUF aliases=[qwen-smoke, lemonade-tiny] task=chat dtype=gguf device=gpu_required min_gpu_mem=2 GiB engines=[lemonade]
-      engine_support:
-        lemonade: available path=D:\\rocm\\rocm-engine-lemonade.exe
-      warning: tiny Lemonade GGUF smoke-test model; not the default assistant
-  Qwen/Qwen2.5-0.5B-Instruct aliases=[qwen-tiny] task=chat dtype=float16 device=gpu_required min_gpu_mem=4 GiB engines=[lemonade]
-      engine_support:
-        lemonade: available path=D:\\rocm\\rocm-engine-lemonade.exe
-  Qwen/Qwen3.5-4B aliases=[qwen3.5] task=chat dtype=bfloat16 device=gpu_preferred min_gpu_mem=12 GiB engines=[vllm]
-      engine_support:
-        vllm: adapter_available path=D:\\rocm\\rocm-engine-vllm.exe runtime_status=unsupported_native_windows reason=native Windows skipped; use WSL/Linux vLLM ROCm
-  meta-llama/Llama-3.2-3B-Instruct aliases=[llama] task=chat dtype=bfloat16 device=gpu_preferred min_gpu_mem=8 GiB engines=[lemonade, vllm]
-      engine_support:
-        lemonade: available path=D:\\rocm\\rocm-engine-lemonade.exe
-        vllm: available path=D:\\rocm\\rocm-engine-vllm.exe
-",
-        )
-        .expect("model output should summarize");
-
-        assert!(summary.contains("Recommended local assistant: qwen"));
-        assert!(summary.contains("Qwen3-4B-Instruct-2507-GGUF"));
-        assert!(summary.contains("4 GiB"));
-        assert!(summary.contains("Tiny smoke test: qwen-smoke"));
-        assert!(summary.contains("Qwen3-0.6B-GGUF"));
-        assert!(summary.contains("8 GiB-class option: llama"));
-        assert!(summary.contains("lemonade, vllm"));
-        assert!(summary.contains("Qwen/Qwen3.5-4B asks for 12 GiB"));
-        assert!(summary.contains("Native Windows note"));
-        assert!(summary.contains("Run `rocm examine`"));
-    }
-
-    #[test]
-    fn deterministic_model_tool_summary_suppresses_extra_local_model_follow_up() {
-        let tool_result = ChatToolRunResult {
-            approval: None,
-            follow_up_text: "\
-rocm_command:
-model recipes
-  Qwen3-4B-Instruct-2507-GGUF aliases=[qwen] task=chat dtype=gguf device=gpu_required min_gpu_mem=4 GiB engines=[lemonade]
-      engine_support:
-        lemonade: available path=D:\\rocm\\rocm-engine-lemonade.exe
-"
-            .to_owned(),
-            ran_read_only_tool: true,
-            read_only_tool_error: false,
-            needs_install_folder: false,
-        };
-        let summary = deterministic_chat_tool_summary(&tool_result.follow_up_text);
-
-        assert!(summary.is_some());
-        assert!(!should_request_local_tool_follow_up(
-            "local",
-            &tool_result,
-            summary.as_deref()
-        ));
-    }
-
-    #[test]
-    fn chat_tool_call_accepts_assistant_support_command_shapes() {
-        for (call, expected_command, read_only) in [
-            (
-                providers::ChatToolCall {
-                    id: None,
-                    name: "rocm_command".to_owned(),
-                    arguments: serde_json::json!({ "args": ["examine"] }),
-                },
-                Some("rocm examine"),
-                true,
-            ),
-            (
-                providers::ChatToolCall {
-                    id: None,
-                    name: "gpu_snapshot".to_owned(),
-                    arguments: serde_json::json!({}),
-                },
-                None,
-                true,
-            ),
-            (
-                providers::ChatToolCall {
-                    id: None,
-                    name: "rocm_command".to_owned(),
-                    arguments: serde_json::json!({ "args": ["model"] }),
-                },
-                Some("rocm model"),
-                true,
-            ),
-            (
-                providers::ChatToolCall {
-                    id: None,
-                    name: "install_sdk".to_owned(),
-                    arguments: serde_json::json!({
-                        "channel": "release",
-                        "format": "wheel",
-                        "prefix": "D:\\ROCm\\therock_venvs"
-                    }),
-                },
-                Some(
-                    "rocm install sdk --channel release --format wheel --approve-replacing-active-default --prefix D:\\ROCm\\therock_venvs",
-                ),
-                false,
-            ),
-            (
-                providers::ChatToolCall {
-                    id: None,
-                    name: "rocm_command".to_owned(),
-                    arguments: serde_json::json!({ "args": ["comfyui", "install"] }),
-                },
-                Some("rocm comfyui install --yes"),
-                false,
-            ),
-            (
-                providers::ChatToolCall {
-                    id: None,
-                    name: "launch_server".to_owned(),
-                    arguments: serde_json::json!({
-                        "model": "qwen",
-                        "engine": "vllm",
-                        "device": "gpu_required"
-                    }),
-                },
-                Some("rocm serve qwen --managed --engine vllm --device gpu_required"),
-                false,
-            ),
-        ] {
-            validate_chat_tool_call(&call).expect("assistant support tool should validate");
-            assert_eq!(
-                chat_tool_call_is_read_only(&call),
-                read_only,
-                "{}",
-                call.name
-            );
-            if let Some(expected_command) = expected_command {
-                assert_eq!(
-                    rocm_chat_tool_requested_command(&call).as_deref(),
-                    Some(expected_command)
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn chat_rocm_command_routes_comfyui_and_engine_actions() {
-        let comfy_install = providers::ChatToolCall {
-            id: Some("call-comfy".to_owned()),
-            name: "rocm_command".to_owned(),
-            arguments: serde_json::json!({
-                "args": ["comfyui", "install"],
-                "reason": "The user asked me to install ComfyUI."
-            }),
-        };
-        validate_chat_tool_call(&comfy_install).expect("ComfyUI install should validate");
-        assert!(!chat_tool_call_is_read_only(&comfy_install));
-        assert_eq!(
-            rocm_chat_tool_requested_command(&comfy_install).as_deref(),
-            Some("rocm comfyui install --yes")
-        );
-        let approval = chat_tool_approval_request(&comfy_install, Some("Install ComfyUI now."))
-            .expect("approval should be built");
-        assert_eq!(approval.pending_title, "Install ComfyUI");
-        assert_eq!(approval.command_title, "ComfyUI");
-        assert_eq!(
-            approval.args,
-            vec![
-                "comfyui".to_owned(),
-                "install".to_owned(),
-                "--yes".to_owned()
-            ]
-        );
-
-        let lemonade = providers::ChatToolCall {
-            id: Some("call-lemonade".to_owned()),
-            name: "rocm_command".to_owned(),
-            arguments: serde_json::json!({
-                "args": ["engines", "install", "lemonade"]
-            }),
-        };
-        validate_chat_tool_call(&lemonade).expect("lemonade engine install should validate");
-        assert!(!chat_tool_call_is_read_only(&lemonade));
-        assert_eq!(
-            rocm_chat_tool_requested_command(&lemonade).as_deref(),
-            Some("rocm engines install lemonade")
-        );
-        let approval =
-            chat_tool_approval_request(&lemonade, Some("Install Lemonade for local serving."))
-                .expect("approval should be built");
-        assert_eq!(approval.pending_title, "Install engine");
-        assert_eq!(approval.command_title, "Engine");
-
-        let vllm = providers::ChatToolCall {
-            id: Some("call-vllm".to_owned()),
-            name: "rocm_command".to_owned(),
-            arguments: serde_json::json!({
-                "args": ["engines", "install", "vllm"]
-            }),
-        };
-        validate_chat_tool_call(&vllm).expect("vLLM engine install should validate");
-        assert!(!chat_tool_call_is_read_only(&vllm));
-        assert_eq!(
-            rocm_chat_tool_requested_command(&vllm).as_deref(),
-            Some("rocm engines install vllm")
-        );
-        let approval = chat_tool_approval_request(&vllm, Some("Install vLLM for Linux/WSL."))
-            .expect("approval should be built");
-        assert_eq!(approval.pending_title, "Install engine");
-        assert_eq!(approval.command_title, "Engine");
-
-        let comfy_start = providers::ChatToolCall {
-            id: Some("call-comfy-start".to_owned()),
-            name: "rocm_command".to_owned(),
-            arguments: serde_json::json!({
-                "args": ["comfyui", "start"]
-            }),
-        };
-        validate_chat_tool_call(&comfy_start).expect("ComfyUI start should validate");
-        assert!(!chat_tool_call_is_read_only(&comfy_start));
-        let approval = chat_tool_approval_request(&comfy_start, Some("Start ComfyUI locally."))
-            .expect("approval should be built");
-        assert_eq!(approval.pending_title, "Start ComfyUI");
-        assert_eq!(approval.command_title, "ComfyUI");
-
-        let serve = providers::ChatToolCall {
-            id: Some("call-serve".to_owned()),
-            name: "rocm_command".to_owned(),
-            arguments: serde_json::json!({
-                "args": ["serve", "qwen", "--engine", "vllm", "--device", "gpu_required", "--managed"]
-            }),
-        };
-        validate_chat_tool_call(&serve).expect("managed serve should validate");
-        assert!(!chat_tool_call_is_read_only(&serve));
-        assert_eq!(
-            rocm_chat_tool_requested_command(&serve).as_deref(),
-            Some("rocm serve qwen --engine vllm --device gpu_required --managed")
-        );
-        let approval = chat_tool_approval_request(&serve, Some("Start the recommended assistant."))
-            .expect("approval should be built");
-        assert_eq!(approval.pending_title, "Start local model server");
-        assert_eq!(approval.command_title, "Serve");
-
-        let vllm_serve = providers::ChatToolCall {
-            id: Some("call-vllm-serve".to_owned()),
-            name: "rocm_command".to_owned(),
-            arguments: serde_json::json!({
-                "args": ["serve", "Qwen/Qwen3.5-4B", "--engine", "vllm", "--device", "gpu_required", "--managed"]
-            }),
-        };
-        validate_chat_tool_call(&vllm_serve).expect("managed vLLM serve should validate");
-        assert!(!chat_tool_call_is_read_only(&vllm_serve));
-        assert_eq!(
-            rocm_chat_tool_requested_command(&vllm_serve).as_deref(),
-            Some("rocm serve Qwen/Qwen3.5-4B --engine vllm --device gpu_required --managed")
-        );
-
-        let config = providers::ChatToolCall {
-            id: Some("call-config".to_owned()),
-            name: "rocm_command".to_owned(),
-            arguments: serde_json::json!({
-                "args": ["config", "set-default-engine", "vllm"]
-            }),
-        };
-        validate_chat_tool_call(&config).expect("config change should validate");
-        assert!(!chat_tool_call_is_read_only(&config));
-        let approval = chat_tool_approval_request(&config, Some("Use vLLM as the default engine."))
-            .expect("approval should be built");
-        assert_eq!(approval.pending_title, "Change settings");
-        assert_eq!(approval.command_title, "Config");
-    }
-
-    #[test]
-    fn setup_status_is_read_only() {
-        for args in [
-            vec!["setup".to_owned()],
-            vec!["setup".to_owned(), "status".to_owned()],
-        ] {
-            let action =
-                chat_rocm_command_action_from_args(args.clone()).expect("setup status classifies");
-            assert!(
-                matches!(action, ChatRocmCommandAction::ReadOnly(_)),
-                "setup {args:?} should be read-only, got {action:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn storage_report_is_read_only_and_removal_requires_approval() {
-        for args in [
-            vec!["storage".to_owned()],
-            vec!["storage".to_owned(), "report".to_owned()],
-        ] {
-            let action = chat_rocm_command_action_from_args(args.clone())
-                .expect("storage report classifies");
-            assert!(
-                matches!(action, ChatRocmCommandAction::ReadOnly(_)),
-                "storage {args:?} only measures folders, so it should be read-only, got {action:?}"
-            );
-        }
-
-        for verb in ["remove-old-installs", "remove-downloads"] {
-            let action =
-                chat_rocm_command_action_from_args(vec!["storage".to_owned(), verb.to_owned()])
-                    .expect("storage removal classifies");
-            match action {
-                ChatRocmCommandAction::Approval { args, .. } => {
-                    assert!(
-                        args.iter().any(|arg| arg == "--yes"),
-                        "approved removal runs non-interactively: {args:?}"
-                    );
-                }
-                other @ ChatRocmCommandAction::ReadOnly(_) => {
-                    panic!("storage {verb} must require approval, got {other:?}")
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn format_bytes_steps_up_instead_of_printing_1024_of_the_smaller_unit() {
-        assert_eq!(format_bytes(1023), "1023 bytes");
-        assert_eq!(format_bytes(1024), "1.0 KiB");
-        // One byte short of the next unit used to round to "1024.0 KiB".
-        assert_eq!(format_bytes(1_048_575), "1.0 MiB");
-        assert_eq!(format_bytes(1_048_576), "1.0 MiB");
-        assert_eq!(format_bytes(1_073_741_823), "1.0 GiB");
-    }
-
     /// Just below a unit boundary the value rounds up to a full 1024 of the
     /// SMALLER unit, which has to be reported as 1.0 of the larger one — the
     /// same defect `rocm_core::format_bytes` had. Each pair is the last input
     /// that still belongs to the smaller unit and the first that `{:.1}` rounds
-    /// up to 1024.0 of it; the second used to print "1024.0 KB" / "1024.0 MB".
+    /// up to 1024.0 of it; the second used to print "1024.0 KiB" / "1024.0 MiB".
     #[test]
-    fn format_bytes_for_user_promotes_a_value_that_rounds_up_to_a_full_unit() {
-        assert_eq!(format_bytes_for_user(1023), "1023 bytes");
-        assert_eq!(format_bytes_for_user(1024), "1.0 KB");
-        assert_eq!(format_bytes_for_user(1_048_524), "1023.9 KB");
-        assert_eq!(format_bytes_for_user(1_048_525), "1.0 MB");
-        assert_eq!(format_bytes_for_user(1_048_575), "1.0 MB");
-        assert_eq!(format_bytes_for_user(1_048_576), "1.0 MB");
-        assert_eq!(format_bytes_for_user(1_073_689_395), "1023.9 MB");
-        assert_eq!(format_bytes_for_user(1_073_689_396), "1.0 GB");
-        assert_eq!(format_bytes_for_user(1_073_741_823), "1.0 GB");
-        // GB is the top unit: nothing to promote to, so 1024 GB stays in it.
-        assert_eq!(format_bytes_for_user(1_099_511_627_776), "1024.0 GB");
+    fn format_bytes_steps_up_instead_of_printing_1024_of_the_smaller_unit() {
+        assert_eq!(format_bytes(1023), "1023 bytes");
+        assert_eq!(format_bytes(1024), "1.0 KiB");
+        assert_eq!(format_bytes(1_048_524), "1023.9 KiB");
+        assert_eq!(format_bytes(1_048_525), "1.0 MiB");
+        assert_eq!(format_bytes(1_048_575), "1.0 MiB");
+        assert_eq!(format_bytes(1_048_576), "1.0 MiB");
+        assert_eq!(format_bytes(1_073_689_395), "1023.9 MiB");
+        assert_eq!(format_bytes(1_073_689_396), "1.0 GiB");
+        assert_eq!(format_bytes(1_073_741_823), "1.0 GiB");
+        // GiB is the top unit: nothing to promote to, so 1024 GiB stays in it.
+        assert_eq!(format_bytes(1_099_511_627_776), "1024.0 GiB");
     }
 
-    /// The units `format_bytes_for_user` prints, smallest first.
-    const USER_BYTE_UNITS: [&str; 4] = ["bytes", "KB", "MB", "GB"];
+    /// The units `format_bytes` prints, smallest first.
+    const BYTE_UNITS: [&str; 4] = ["bytes", "KiB", "MiB", "GiB"];
 
     /// Byte counts that actually visit the unit boundaries. A uniform `u64`
     /// almost always lands far above the top unit, so on its own it never
     /// samples the band where `{:.1}` rounding reaches 1024.0. The other arms
     /// draw uniformly within one unit's range, and from a window just below
-    /// each rounded boundary (KB→MB, MB→GB) that scales with the boundary, as
-    /// the band does — see `rocm_core::disk_space`'s generator for the full
+    /// each rounded boundary (KiB→MiB, MiB→GiB) that scales with the boundary,
+    /// as the band does — see `rocm_core::disk_space`'s generator for the full
     /// reasoning.
-    fn user_byte_count_strategy() -> impl proptest::strategy::Strategy<Value = u64> {
+    fn byte_count_strategy() -> impl proptest::strategy::Strategy<Value = u64> {
         use proptest::prelude::*;
         prop_oneof![
             any::<u64>(),
@@ -19463,20 +14653,20 @@ model recipes
         /// Both edges compare the mantissa as printed, in tenths: that is the
         /// quantity a reader sees, so it is the one the scaling has to decide on.
         #[test]
-        fn format_bytes_for_user_renders_a_size_in_its_own_unit(
-            bytes in user_byte_count_strategy(),
+        fn format_bytes_renders_a_size_in_its_own_unit(
+            bytes in byte_count_strategy(),
         ) {
-            let rendered = format_bytes_for_user(bytes);
+            let rendered = format_bytes(bytes);
             let (value, unit) = rendered
                 .split_once(' ')
                 .expect("rendered size is `<number> <unit>`");
             let value: f64 = value.parse().expect("numeric part parses");
             let tenths = (value * 10.0).round();
-            let exponent = USER_BYTE_UNITS
+            let exponent = BYTE_UNITS
                 .iter()
                 .position(|name| *name == unit)
                 .expect("rendered unit is one of the known units");
-            if exponent + 1 < USER_BYTE_UNITS.len() {
+            if exponent + 1 < BYTE_UNITS.len() {
                 proptest::prop_assert!(
                     tenths < 10_240.0,
                     "{bytes} rendered as {rendered}, which should have been \
@@ -19496,213 +14686,8 @@ model recipes
                     (smaller * 10.0).round() >= 10_240.0,
                     "{bytes} rendered as {rendered}, but still fits the smaller \
                      unit as {smaller:.1} {}",
-                    USER_BYTE_UNITS[exponent - 1],
+                    BYTE_UNITS[exponent - 1],
                 );
-            }
-        }
-    }
-
-    #[test]
-    fn setup_reset_requires_approval() {
-        let action =
-            chat_rocm_command_action_from_args(vec!["setup".to_owned(), "reset".to_owned()])
-                .expect("setup reset classifies");
-        match action {
-            ChatRocmCommandAction::Approval {
-                pending_title,
-                command_title,
-                ..
-            } => {
-                assert_eq!(pending_title, "Reset first-time setup");
-                assert_eq!(command_title, "Setup");
-            }
-            other @ ChatRocmCommandAction::ReadOnly(_) => {
-                panic!("setup reset should require approval, got {other:?}")
-            }
-        }
-    }
-
-    #[test]
-    fn proposal_action_show_is_read_only() {
-        let call = providers::ChatToolCall {
-            id: None,
-            name: "proposal_action".to_owned(),
-            arguments: serde_json::json!({ "proposal_id": "p1", "action": "show" }),
-        };
-        validate_chat_tool_call(&call).expect("show validates");
-        assert!(
-            chat_tool_call_is_read_only(&call),
-            "proposal_action show must be read-only"
-        );
-    }
-
-    #[test]
-    fn proposal_action_approve_requires_approval() {
-        for action in ["approve", "reject"] {
-            let call = providers::ChatToolCall {
-                id: None,
-                name: "proposal_action".to_owned(),
-                arguments: serde_json::json!({ "proposal_id": "p1", "action": action }),
-            };
-            validate_chat_tool_call(&call).expect("approve/reject validates");
-            assert!(
-                !chat_tool_call_is_read_only(&call),
-                "proposal_action {action} must NOT be read-only"
-            );
-            let req = chat_tool_approval_request(&call, None).unwrap_or_else(|err| {
-                panic!("proposal_action {action} should need approval: {err}")
-            });
-            assert_eq!(req.command_title, "Reviews");
-            assert!(
-                req.pending_title.contains("proposal") || req.pending_title.contains("Proposal")
-            );
-            assert!(
-                req.display_command
-                    .as_deref()
-                    .unwrap_or_default()
-                    .contains("p1"),
-                "display command should show the proposal id"
-            );
-        }
-    }
-
-    #[test]
-    fn proposal_action_rejects_unknown_action() {
-        let call = providers::ChatToolCall {
-            id: None,
-            name: "proposal_action".to_owned(),
-            arguments: serde_json::json!({ "proposal_id": "p1", "action": "delete" }),
-        };
-        assert!(
-            validate_chat_tool_call(&call).is_err(),
-            "unknown proposal_action `action` must be rejected"
-        );
-    }
-
-    #[test]
-    fn proposal_action_approve_updates_status() {
-        let (root, paths) = test_paths("proposal-approve");
-        // Seed a pending proposal.
-        let proposal = rocm_core::AutomationProposalRecord {
-            at_unix_ms: rocm_core::unix_time_millis(),
-            proposal_id: "prop-approve-1".to_owned(),
-            watcher_id: "therock-update".to_owned(),
-            action: "prepare_driver_plan".to_owned(),
-            title: "Apply driver plan".to_owned(),
-            message: "A reviewed driver plan is ready.".to_owned(),
-            status: "pending".to_owned(),
-            service_id: None,
-            tool: None,
-            arguments: serde_json::Value::Null,
-            reviewed_at_unix_ms: None,
-        };
-        rocm_core::append_automation_proposal(&paths, &proposal).expect("seed proposal");
-
-        // show is read-only and returns the proposal.
-        let shown = run_internal_mcp_call(
-            &paths,
-            "proposal_action",
-            serde_json::json!({ "proposal_id": "prop-approve-1", "action": "show" }),
-            false,
-        )
-        .expect("show ok");
-        assert_eq!(shown["structuredContent"]["status"], "pending");
-
-        // approve requires allow_mutation.
-        assert!(
-            run_internal_mcp_call(
-                &paths,
-                "proposal_action",
-                serde_json::json!({ "proposal_id": "prop-approve-1", "action": "approve" }),
-                false,
-            )
-            .is_err(),
-            "approve without allow_mutation must bail"
-        );
-
-        // approve with allow_mutation sets status to approved.
-        let approved = run_internal_mcp_call(
-            &paths,
-            "proposal_action",
-            serde_json::json!({ "proposal_id": "prop-approve-1", "action": "approve" }),
-            true,
-        )
-        .expect("approve ok");
-        assert_eq!(approved["structuredContent"]["status"], "approved");
-        let stored = rocm_core::find_automation_proposal(&paths, "prop-approve-1")
-            .expect("proposal still present");
-        assert_eq!(stored.status, "approved");
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn proposal_action_reject_updates_status() {
-        let (root, paths) = test_paths("proposal-reject");
-        let proposal = rocm_core::AutomationProposalRecord {
-            at_unix_ms: rocm_core::unix_time_millis(),
-            proposal_id: "prop-reject-1".to_owned(),
-            watcher_id: "server-recover".to_owned(),
-            action: "queue_stop_server_proposal".to_owned(),
-            title: "Stop overheating server".to_owned(),
-            message: "GPU thermal pressure detected.".to_owned(),
-            status: "pending".to_owned(),
-            service_id: None,
-            tool: None,
-            arguments: serde_json::Value::Null,
-            reviewed_at_unix_ms: None,
-        };
-        rocm_core::append_automation_proposal(&paths, &proposal).expect("seed proposal");
-
-        let rejected = run_internal_mcp_call(
-            &paths,
-            "proposal_action",
-            serde_json::json!({ "proposal_id": "prop-reject-1", "action": "reject" }),
-            true,
-        )
-        .expect("reject ok");
-        assert_eq!(rejected["structuredContent"]["status"], "rejected");
-        let stored = rocm_core::find_automation_proposal(&paths, "prop-reject-1")
-            .expect("proposal still present");
-        assert_eq!(stored.status, "rejected");
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn proposal_action_show_missing_proposal_errors() {
-        let (root, paths) = test_paths("proposal-missing");
-        assert!(
-            run_internal_mcp_call(
-                &paths,
-                "proposal_action",
-                serde_json::json!({ "proposal_id": "nope", "action": "show" }),
-                false,
-            )
-            .is_err(),
-            "showing a missing proposal must error"
-        );
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn config_set_permissions_classifies_as_approval() {
-        // Permission escalation MUST route through approval — the classifier
-        // routes any `config <sub>` (catch-all) to Approval. Verify both modes.
-        for mode in ["full_access", "ask"] {
-            let action = chat_rocm_command_action_from_args(vec![
-                "config".to_owned(),
-                "set-permissions".to_owned(),
-                mode.to_owned(),
-            ])
-            .expect("config set-permissions classifies");
-            match action {
-                ChatRocmCommandAction::Approval { command_title, .. } => {
-                    assert_eq!(command_title, "Config");
-                }
-                other @ ChatRocmCommandAction::ReadOnly(_) => {
-                    panic!("config set-permissions {mode} must need approval, got {other:?}")
-                }
             }
         }
     }
@@ -19729,1375 +14714,6 @@ model recipes
         let reloaded = RocmCliConfig::load(&paths).expect("reload config");
         assert_eq!(reloaded.permissions.mode_label(), PERMISSIONS_MODE_ASK);
         let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn watcher_validator_rejects_unknown_and_invalid_mode() {
-        // Unknown watcher id → rejected.
-        let unknown = providers::ChatToolCall {
-            id: None,
-            name: "watcher_enable".to_owned(),
-            arguments: serde_json::json!({ "watcher": "no-such-watcher" }),
-        };
-        assert!(
-            validate_chat_watcher_tool_call(&unknown, true).is_err(),
-            "unknown watcher must be rejected"
-        );
-        // Invalid mode → rejected.
-        let bad_mode = providers::ChatToolCall {
-            id: None,
-            name: "watcher_enable".to_owned(),
-            arguments: serde_json::json!({ "watcher": "therock-update", "mode": "rampage" }),
-        };
-        assert!(
-            validate_chat_watcher_tool_call(&bad_mode, true).is_err(),
-            "invalid watcher mode must be rejected"
-        );
-        // Valid watcher + valid mode → accepted.
-        let ok = providers::ChatToolCall {
-            id: None,
-            name: "watcher_enable".to_owned(),
-            arguments: serde_json::json!({ "watcher": "therock-update", "mode": "observe" }),
-        };
-        validate_chat_watcher_tool_call(&ok, true).expect("valid watcher+mode accepted");
-        // Disable must reject a `mode`.
-        let disable_with_mode = providers::ChatToolCall {
-            id: None,
-            name: "watcher_disable".to_owned(),
-            arguments: serde_json::json!({ "watcher": "therock-update", "mode": "observe" }),
-        };
-        assert!(
-            validate_chat_watcher_tool_call(&disable_with_mode, false).is_err(),
-            "disable must reject a mode argument"
-        );
-    }
-
-    #[test]
-    fn lifecycle_read_mutate_split_is_honest() {
-        let read_only = [
-            vec!["update".to_owned()],
-            vec!["comfyui".to_owned(), "status".to_owned()],
-            vec!["comfyui".to_owned(), "logs".to_owned()],
-            vec!["uninstall".to_owned(), "--dry-run".to_owned()],
-            vec!["setup".to_owned(), "status".to_owned()],
-            vec![
-                "runtimes".to_owned(),
-                "uninstall".to_owned(),
-                "old-runtime".to_owned(),
-                "--dry-run".to_owned(),
-            ],
-            vec![
-                "runtimes".to_owned(),
-                "remove".to_owned(),
-                "old-runtime".to_owned(),
-                "--dry-run".to_owned(),
-            ],
-            // Must agree with the daemon's `ensure_rocm_command_is_read_only`.
-            // Its comment claims the two are mirrored, and nothing enforced
-            // that — the arm was added there and not here, and the classifiers
-            // disagreed until a reviewer noticed.
-            vec!["remote".to_owned(), "targets".to_owned()],
-            vec![
-                "remote".to_owned(),
-                "doctor".to_owned(),
-                "gpu-box".to_owned(),
-            ],
-            vec!["remote".to_owned(), "status".to_owned()],
-        ];
-        for args in read_only {
-            let action = chat_rocm_command_action_from_args(args.clone())
-                .unwrap_or_else(|err| panic!("{args:?} should classify: {err}"));
-            assert!(
-                matches!(action, ChatRocmCommandAction::ReadOnly(_)),
-                "{args:?} should be read-only, got {action:?}"
-            );
-        }
-
-        // Paired with whether the command has a `--yes` to inject. The flag
-        // exists to keep a consent prompt from hanging a null-stdin spawn, so
-        // the demand only makes sense for commands that would prompt — and
-        // injecting it where clap defines no such flag would make the spawn fail
-        // to parse rather than succeed unattended.
-        let mutating = [
-            (vec!["update".to_owned(), "--apply".to_owned()], true),
-            // These start, publish or tear down on another machine. They take no
-            // `--yes` because they never prompt: consent is the approval step
-            // itself, and every destructive choice they make is already settled
-            // by an explicit flag (`remote stop --force`). Give any of them an
-            // interactive prompt and it needs a consent flag here too.
-            (
-                vec![
-                    "remote".to_owned(),
-                    "serve".to_owned(),
-                    "gpu-box".to_owned(),
-                    "m".to_owned(),
-                ],
-                false,
-            ),
-            (
-                vec!["remote".to_owned(), "attach".to_owned(), "sess".to_owned()],
-                false,
-            ),
-            (
-                vec!["remote".to_owned(), "stop".to_owned(), "sess".to_owned()],
-                false,
-            ),
-            (vec!["comfyui".to_owned(), "install".to_owned()], true),
-            (vec!["comfyui".to_owned(), "start".to_owned()], true),
-            (vec!["comfyui".to_owned(), "stop".to_owned()], true),
-            (vec!["uninstall".to_owned()], true),
-            (vec!["setup".to_owned(), "reset".to_owned()], true),
-            (
-                vec![
-                    "runtimes".to_owned(),
-                    "uninstall".to_owned(),
-                    "old-runtime".to_owned(),
-                ],
-                true,
-            ),
-            (
-                vec![
-                    "runtimes".to_owned(),
-                    "remove".to_owned(),
-                    "old-runtime".to_owned(),
-                ],
-                true,
-            ),
-        ];
-        for (args, expects_yes) in mutating {
-            let action = chat_rocm_command_action_from_args(args.clone())
-                .unwrap_or_else(|err| panic!("{args:?} should classify: {err}"));
-            match &action {
-                ChatRocmCommandAction::Approval { args, .. } => {
-                    assert_eq!(
-                        args.iter().any(|arg| arg == "--yes"),
-                        expects_yes,
-                        "{args:?} disagrees with whether the approval path should \
-                         carry --yes"
-                    );
-                }
-                other @ ChatRocmCommandAction::ReadOnly(_) => {
-                    panic!("{args:?} should require approval, got {other:?}")
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn install_sdk_chat_and_mcp_args_approve_the_replacement_for_a_non_interactive_spawn() {
-        // The chat/MCP surfaces spawn `rocm` with null stdin, so the consent
-        // prompt would refuse with "re-run with
-        // `--approve-replacing-active-default`" — a flag the user has no way to
-        // supply from chat or the dashboard. Both the chat classifier
-        // arm and the MCP tool-args builder must inject the consent so an
-        // install over the active default runtime is not silently refused.
-        let action = chat_rocm_command_action_from_args(vec![
-            "install".to_owned(),
-            "sdk".to_owned(),
-            "--channel".to_owned(),
-            "release".to_owned(),
-            // The classifier requires a user-chosen (non-system) install folder.
-            "--prefix".to_owned(),
-            "/home/tester/rocm-managed".to_owned(),
-        ])
-        .expect("install sdk classifies");
-        let chat_args = match action {
-            ChatRocmCommandAction::Approval { args, .. } => args,
-            other @ ChatRocmCommandAction::ReadOnly(_) => {
-                panic!("install sdk must require approval, got {other:?}")
-            }
-        };
-
-        // The MCP `install_sdk` tool builds its own argv (it does not route
-        // through the classifier above), so it must add the flag independently.
-        let call = providers::ChatToolCall {
-            id: None,
-            name: "install_sdk".to_owned(),
-            arguments: serde_json::json!({ "channel": "release", "format": "wheel" }),
-        };
-        let mcp_args = rocm_chat_tool_requested_args(&call).expect("install_sdk tool builds args");
-
-        for args in [&chat_args, &mcp_args] {
-            assert_eq!(
-                consents_for_install_sdk_argv(args).replace_active_default,
-                therock::SdkInstallConsent::Preapproved(
-                    therock::SdkInstallApprovalSource::ApproveReplacingActiveDefault
-                ),
-                "the spawn must approve replacing the active default, and be credited \
-                 to the flag it actually passed rather than to --yes, got {args:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn chat_rocm_command_runs_read_only_and_rejects_risky_shapes() {
-        let status = providers::ChatToolCall {
-            id: None,
-            name: "rocm_command".to_owned(),
-            arguments: serde_json::json!({
-                "args": ["rocm", "comfy", "status"]
-            }),
-        };
-        validate_chat_tool_call(&status).expect("ComfyUI status should validate");
-        assert!(chat_tool_call_is_read_only(&status));
-        assert_eq!(
-            rocm_chat_tool_requested_command(&status).as_deref(),
-            Some("rocm comfyui status")
-        );
-
-        let logs = providers::ChatToolCall {
-            id: None,
-            name: "rocm_command".to_owned(),
-            arguments: serde_json::json!({
-                "args": ["comfyui", "logs"]
-            }),
-        };
-        validate_chat_tool_call(&logs).expect("ComfyUI logs should validate");
-        assert!(chat_tool_call_is_read_only(&logs));
-        assert_eq!(
-            rocm_chat_tool_requested_command(&logs).as_deref(),
-            Some("rocm comfyui logs")
-        );
-
-        let cpu = providers::ChatToolCall {
-            id: None,
-            name: "rocm_command".to_owned(),
-            arguments: serde_json::json!({
-                "args": ["serve", "tiny.gguf", "--engine", "vllm", "--device", "cpu"]
-            }),
-        };
-        let error = validate_chat_tool_call(&cpu).unwrap_err().to_string();
-        assert!(error.contains("CPU execution"));
-
-        let public_flag = providers::ChatToolCall {
-            id: None,
-            name: "rocm_command".to_owned(),
-            arguments: serde_json::json!({
-                "args": ["serve", "tiny.gguf", "--engine", "vllm", "--allow-public-bind", "--managed"]
-            }),
-        };
-        let error = validate_chat_tool_call(&public_flag)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("public network binding"));
-
-        let foreground = providers::ChatToolCall {
-            id: None,
-            name: "rocm_command".to_owned(),
-            arguments: serde_json::json!({
-                "args": ["serve", "qwen", "--engine", "vllm", "--foreground"]
-            }),
-        };
-        let error = validate_chat_tool_call(&foreground)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("--managed"));
-
-        let shell = providers::ChatToolCall {
-            id: None,
-            name: "rocm_command".to_owned(),
-            arguments: serde_json::json!({
-                "args": ["powershell", "-Command", "whoami"]
-            }),
-        };
-        let error = validate_chat_tool_call(&shell).unwrap_err().to_string();
-        assert!(error.contains("unsupported rocm command"));
-    }
-
-    #[test]
-    fn assistant_read_only_rocm_commands_do_not_fallback_to_child_process() {
-        let (_root, paths) = test_paths("readonly-rocm-in-process-only");
-        let args = vec!["services".to_owned(), "status".to_owned()];
-
-        let error = run_rocm_command_for_paths(&paths, &args, Duration::from_secs(1))
-            .unwrap_err()
-            .to_string();
-
-        assert!(error.contains("read-only assistant command is not implemented in-process"));
-        assert!(error.contains("rocm services status"));
-        assert!(!paths.data_dir.join("logs").exists());
-    }
-
-    #[test]
-    fn internal_mcp_read_only_rocm_command_runs_in_process() {
-        let (_root, paths) = test_paths("mcp-readonly-rocm-in-process");
-
-        let result = run_internal_mcp_call(
-            &paths,
-            "rocm_command",
-            serde_json::json!({ "args": ["version"] }),
-            false,
-        )
-        .expect("read-only rocm mcp-call should run");
-
-        assert_eq!(
-            result.get("isError").and_then(serde_json::Value::as_bool),
-            Some(false)
-        );
-        assert_eq!(
-            result
-                .pointer("/structuredContent/argv/0")
-                .and_then(serde_json::Value::as_str),
-            Some("rocm")
-        );
-        assert!(mcp_tool_result_text(&result).contains(env!("CARGO_PKG_VERSION")));
-    }
-
-    #[test]
-    fn natural_language_plan_returns_structured_mutating_action() {
-        let (_root, paths) = test_paths("nl-plan-structured-mutating");
-
-        let result = run_internal_mcp_call(
-            &paths,
-            "natural_language_plan",
-            serde_json::json!({
-                "request": "install TheRock into /opt/rocm-target"
-            }),
-            false,
-        )
-        .expect("natural_language_plan should plan the request");
-
-        assert_eq!(
-            result.get("isError").and_then(serde_json::Value::as_bool),
-            Some(false)
-        );
-        // text (rendered plan) preserved.
-        assert!(
-            !result
-                .pointer("/structuredContent/text")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default()
-                .trim()
-                .is_empty()
-        );
-        // A known install folder yields a mutating, placeholder-free action.
-        assert_eq!(
-            result
-                .pointer("/structuredContent/action/approval_required")
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
-        assert_eq!(
-            result
-                .pointer("/structuredContent/action/has_placeholders")
-                .and_then(serde_json::Value::as_bool),
-            Some(false)
-        );
-        let args = result
-            .pointer("/structuredContent/action/args")
-            .and_then(serde_json::Value::as_array)
-            .expect("action args should be present");
-        assert!(args.iter().any(|arg| arg.as_str() == Some("install")));
-        assert!(args.iter().any(|arg| arg.as_str() == Some("--prefix")));
-    }
-
-    #[test]
-    fn natural_language_plan_returns_placeholder_action_when_incomplete() {
-        let (_root, paths) = test_paths("nl-plan-structured-placeholder");
-
-        let result = run_internal_mcp_call(
-            &paths,
-            "natural_language_plan",
-            serde_json::json!({ "request": "serve" }),
-            false,
-        )
-        .expect("natural_language_plan should plan the request");
-
-        assert_eq!(
-            result
-                .pointer("/structuredContent/action/has_placeholders")
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
-    }
-
-    #[test]
-    fn setup_status_renders_in_process() {
-        let (_root, paths) = test_paths("setup-status-in-process");
-
-        for args in [
-            vec!["setup".to_owned()],
-            vec!["setup".to_owned(), "status".to_owned()],
-        ] {
-            let text = run_rocm_read_only_in_process(&paths, &args)
-                .expect("setup status read path should render in-process");
-            assert!(
-                !text.trim().is_empty(),
-                "setup status text should be non-empty for {args:?}"
-            );
-            assert!(
-                text.contains("ROCm setup"),
-                "setup status text should be reached for {args:?}: {text}"
-            );
-        }
-    }
-
-    #[test]
-    fn chat_tool_call_rejects_bad_service_and_watcher_suggestions() {
-        for (call, expected) in [
-            (
-                providers::ChatToolCall {
-                    id: None,
-                    name: "service_logs".to_owned(),
-                    arguments: serde_json::json!({ "service_id": "bad/name" }),
-                },
-                "must not contain path separators",
-            ),
-            (
-                providers::ChatToolCall {
-                    id: None,
-                    name: "automations".to_owned(),
-                    arguments: serde_json::json!({ "event_limit": 1000 }),
-                },
-                "between 1 and 64",
-            ),
-            (
-                providers::ChatToolCall {
-                    id: None,
-                    name: "watcher_enable".to_owned(),
-                    arguments: serde_json::json!({
-                        "watcher": "unknown",
-                        "mode": "propose"
-                    }),
-                },
-                "unknown watcher",
-            ),
-            (
-                providers::ChatToolCall {
-                    id: None,
-                    name: "watcher_disable".to_owned(),
-                    arguments: serde_json::json!({
-                        "watcher": "server-recover",
-                        "mode": "propose"
-                    }),
-                },
-                "cannot set `mode`",
-            ),
-        ] {
-            let error = validate_chat_tool_call(&call).unwrap_err().to_string();
-            assert!(error.contains(expected), "unexpected error: {error}");
-        }
-    }
-
-    #[test]
-    fn chat_tool_call_rejects_cpu_and_public_bind_server_requests() {
-        let cpu = providers::ChatToolCall {
-            id: None,
-            name: "launch_server".to_owned(),
-            arguments: serde_json::json!({
-                "model": "tiny.gguf",
-                "engine": "vllm",
-                "device": "cpu"
-            }),
-        };
-        let error = validate_chat_tool_call(&cpu).unwrap_err().to_string();
-        assert!(error.contains("CPU execution"));
-
-        let public = providers::ChatToolCall {
-            id: None,
-            name: "launch_server".to_owned(),
-            arguments: serde_json::json!({
-                "model": "tiny.gguf",
-                "engine": "vllm",
-                "host": "0.0.0.0",
-                "allow_public_bind": true
-            }),
-        };
-        let error = validate_chat_tool_call(&public).unwrap_err().to_string();
-        assert!(error.contains("public network binding"));
-
-        let host = providers::ChatToolCall {
-            id: None,
-            name: "launch_server".to_owned(),
-            arguments: serde_json::json!({
-                "model": "tiny.gguf",
-                "engine": "vllm",
-                "host": "0.0.0.0"
-            }),
-        };
-        let error = validate_chat_tool_call(&host).unwrap_err().to_string();
-        assert!(error.contains("non-local host"));
-    }
-
-    #[test]
-    fn chat_tool_call_rejects_bad_install_suggestions() {
-        for (arguments, expected) in [
-            (
-                serde_json::json!({ "channel": "stable" }),
-                "unsupported TheRock channel",
-            ),
-            (
-                serde_json::json!({ "format": "zip" }),
-                "unsupported TheRock install format",
-            ),
-            (
-                serde_json::json!({
-                    "prefix": if cfg!(windows) { "C:\\Windows\\rocm" } else { "/opt/rocm" }
-                }),
-                "system install folder",
-            ),
-            (
-                serde_json::json!({
-                    "version": "7.13.0a20260605",
-                    "build_date": "2026-06-05"
-                }),
-                "both `version` and `build_date`",
-            ),
-            (
-                serde_json::json!({ "build_date": "not-a-date" }),
-                "build date",
-            ),
-            (
-                serde_json::json!({
-                    "format": "tarball",
-                    "build_date": "2026-06-05"
-                }),
-                if cfg!(windows) {
-                    "tarball` installs on Windows"
-                } else {
-                    "specific TheRock wheel versions"
-                },
-            ),
-        ] {
-            let call = providers::ChatToolCall {
-                id: None,
-                name: "install_sdk".to_owned(),
-                arguments,
-            };
-            let error = validate_chat_tool_call(&call).unwrap_err().to_string();
-            assert!(error.contains(expected), "unexpected error: {error}");
-        }
-    }
-
-    /// Guard: every read-only tool the dash side registers must have a home in
-    /// the bin's accept-list. A name-only tool (the `doctor` regression caught
-    /// in review) would otherwise fail end-to-end as "unsupported ROCm tool"
-    /// while passing the dash-side, name-against-itself completeness checks.
-    ///
-    /// We assert the NAME is accepted — not that empty args validate — so the
-    /// check stays hermetic (no real `BinToolExecutor::execute` / live I/O) and
-    /// independent of each tool's argument schema.
-    #[test]
-    fn read_tool_names_are_subset_of_bin_accept_list() {
-        for name in rocm_dash_tui::agent::ROCM_READ_TOOL_NAMES {
-            let call = providers::ChatToolCall {
-                id: None,
-                name: name.to_owned(),
-                arguments: serde_json::json!({}),
-            };
-            if let Err(error) = validate_chat_tool_call(&call) {
-                let message = error.to_string();
-                assert!(
-                    !message.contains("unsupported ROCm tool"),
-                    "ROCM_READ_TOOL_NAMES advertises `{name}` but the bin rejects \
-                     the name as unsupported: {message}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn chat_tool_call_refusal_prioritizes_safe_review_wording() -> Result<()> {
-        let mut output = String::new();
-        let (_root, paths) = test_paths("chat-tool-refusal");
-        let response = providers::ChatResponse {
-            provider: "local".to_owned(),
-            model: "tiny.gguf".to_owned(),
-            content: "I can install ROCm.".to_owned(),
-            tool_calls: vec![providers::ChatToolCall {
-                id: None,
-                name: "install_sdk".to_owned(),
-                arguments: serde_json::json!({
-                    "channel": "release",
-                    "format": "wheel",
-                    "prefix": "D:\\ROCm\\therock_venvs"
-                }),
-            }],
-        };
-
-        let mut progress = None;
-        append_chat_tool_results(
-            &paths,
-            &response,
-            &mut output,
-            Some("I can install ROCm."),
-            &mut progress,
-        )?;
-
-        assert!(output.contains("Install ROCm: needs your review"));
-        assert!(!output.contains("install_sdk: approval required"));
-        assert!(output.contains("not run: review the approval card before anything runs"));
-        assert!(output.contains("advanced manual command: rocm install sdk"));
-        assert!(!output.contains("run the shown ROCm command"));
-        Ok(())
-    }
-
-    #[test]
-    fn fallback_tool_call_runs_model_support_checks() {
-        let call =
-            fallback_rocm_tool_call_for_prompt("Which LLMs can this machine support?").unwrap();
-        assert_eq!(call.name, "rocm_command");
-        assert_eq!(
-            normalized_chat_rocm_command_args(&call).unwrap(),
-            vec!["model".to_owned()]
-        );
-
-        assert!(fallback_rocm_tool_call_for_prompt("Which LLM are you using?").is_none());
-    }
-
-    #[test]
-    fn local_rocm_tools_chat_uses_fixed_lemonade_qwen_assistant() {
-        assert_eq!(
-            local_rocm_tools_assistant_model("local", true),
-            Some(providers::BUILTIN_ASSISTANT_MODEL_ID)
-        );
-        assert_eq!(local_rocm_tools_assistant_model("local", false), None);
-        assert_eq!(local_rocm_tools_assistant_model("openai", true), None);
-    }
-
-    #[test]
-    fn fallback_tool_call_routes_running_questions_to_status_tools() {
-        let comfy = fallback_rocm_tool_call_for_prompt("Is ComfyUI running?").unwrap();
-        assert_eq!(comfy.name, "rocm_command");
-        assert_eq!(
-            normalized_chat_rocm_command_args(&comfy).unwrap(),
-            vec!["comfyui".to_owned(), "status".to_owned()]
-        );
-        assert!(chat_tool_call_is_read_only(&comfy));
-
-        let comfy_port =
-            fallback_rocm_tool_call_for_prompt("Is ComfyUI running on port 8188?").unwrap();
-        assert_eq!(comfy_port.name, "rocm_command");
-        assert_eq!(
-            normalized_chat_rocm_command_args(&comfy_port).unwrap(),
-            vec!["comfyui".to_owned(), "status".to_owned()]
-        );
-        assert!(chat_tool_call_is_read_only(&comfy_port));
-
-        for prompt in [
-            "Is vLLM running?",
-            "is lemonade running?",
-            "is the model server running?",
-            "is qwen running?",
-        ] {
-            let call = fallback_rocm_tool_call_for_prompt(prompt).unwrap();
-            assert_eq!(call.name, "rocm_command", "{prompt}");
-            assert_eq!(
-                normalized_chat_rocm_command_args(&call).unwrap(),
-                vec!["services".to_owned(), "list".to_owned(), "--all".to_owned(),],
-                "{prompt}"
-            );
-            assert!(chat_tool_call_is_read_only(&call), "{prompt}");
-        }
-
-        let port = fallback_rocm_tool_call_for_prompt("what is running on port 8188?").unwrap();
-        assert_eq!(port.name, "port_status");
-        assert_eq!(
-            port.arguments,
-            serde_json::json!({ "host": DEFAULT_LOCAL_HOST, "port": 8188 })
-        );
-        assert!(chat_tool_call_is_read_only(&port));
-    }
-
-    #[test]
-    fn fallback_tool_call_routes_engine_install_state_to_engines_list() {
-        for prompt in ["is vLLM installed?", "is Lemonade available?"] {
-            let call = fallback_rocm_tool_call_for_prompt(prompt).unwrap();
-            assert_eq!(call.name, "rocm_command", "{prompt}");
-            assert_eq!(
-                normalized_chat_rocm_command_args(&call).unwrap(),
-                vec!["engines".to_owned(), "list".to_owned()],
-                "{prompt}"
-            );
-            assert!(chat_tool_call_is_read_only(&call), "{prompt}");
-        }
-    }
-
-    #[test]
-    fn supplemental_tool_call_adds_missing_specific_status_check() {
-        let generic_services = providers::ChatToolCall {
-            id: Some("model-picked-services".to_owned()),
-            name: "services".to_owned(),
-            arguments: serde_json::json!({}),
-        };
-
-        let call =
-            supplemental_read_only_tool_call_for_prompt("Is ComfyUI running?", &[generic_services])
-                .unwrap();
-
-        assert_eq!(call.name, "rocm_command");
-        assert_eq!(
-            normalized_chat_rocm_command_args(&call).unwrap(),
-            vec!["comfyui".to_owned(), "status".to_owned()]
-        );
-        assert!(chat_tool_call_is_read_only(&call));
-    }
-
-    #[test]
-    fn supplemental_tool_call_does_not_duplicate_equivalent_status_check() {
-        let comfy_status = fallback_rocm_tool_call_for_prompt("Is ComfyUI running?").unwrap();
-
-        assert!(
-            supplemental_read_only_tool_call_for_prompt("Is ComfyUI running?", &[comfy_status])
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn supplemental_tool_call_adds_running_state_for_engine_install_question() {
-        let engine_inventory =
-            fallback_rocm_tool_call_for_prompt("Is vLLM installed and is it running?").unwrap();
-        assert_eq!(
-            normalized_chat_rocm_command_args(&engine_inventory).unwrap(),
-            vec!["engines".to_owned(), "list".to_owned()]
-        );
-
-        let services = supplemental_read_only_tool_call_for_prompt(
-            "Is vLLM installed and is it running?",
-            &[engine_inventory],
-        )
-        .unwrap();
-
-        assert_eq!(services.name, "rocm_command");
-        assert_eq!(
-            normalized_chat_rocm_command_args(&services).unwrap(),
-            vec!["services".to_owned(), "list".to_owned(), "--all".to_owned()]
-        );
-        assert!(chat_tool_call_is_read_only(&services));
-    }
-
-    #[test]
-    fn supplemental_tool_call_treats_loopback_port_checks_as_equivalent() {
-        let model_port_check = providers::ChatToolCall {
-            id: Some("model-picked-port".to_owned()),
-            name: "port_status".to_owned(),
-            arguments: serde_json::json!({ "host": "localhost", "port": 8188 }),
-        };
-
-        assert!(
-            supplemental_read_only_tool_call_for_prompt(
-                "what is running on port 8188?",
-                &[model_port_check]
-            )
-            .is_none()
-        );
-    }
-
-    #[test]
-    fn fallback_tool_call_runs_status_checks() {
-        for prompt in [
-            "Which GPU is on my machine, and is ROCm installed?",
-            "Is TheRock setup on my machine?",
-            "Check this ROCm setup.",
-        ] {
-            let call = fallback_rocm_tool_call_for_prompt(prompt).unwrap();
-            assert_eq!(call.name, "examine");
-            assert_eq!(call.arguments, serde_json::json!({}));
-        }
-    }
-
-    #[test]
-    fn fallback_tool_call_routes_therock_setup_to_install_folder_flow() {
-        let call = fallback_rocm_tool_call_for_prompt("How do I setup TheRock?").unwrap();
-        assert_eq!(call.name, "rocm_command");
-        assert_eq!(
-            normalized_chat_rocm_command_args(&call).unwrap(),
-            vec![
-                "install".to_owned(),
-                "sdk".to_owned(),
-                "--channel".to_owned(),
-                "release".to_owned(),
-                "--format".to_owned(),
-                "wheel".to_owned(),
-            ]
-        );
-        assert!(!chat_tool_call_is_read_only(&call));
-    }
-
-    #[test]
-    fn fallback_tool_call_preserves_requested_therock_install_prefix() {
-        for (prompt, expected_prefix) in [
-            (
-                "install TheRock for me in D:\\ROCm\\therock_venvs",
-                "D:\\ROCm\\therock_venvs",
-            ),
-            ("install ROCm to D:\\ROCm\\temp", "D:\\ROCm\\temp"),
-        ] {
-            let call = fallback_rocm_tool_call_for_prompt(prompt).unwrap();
-            assert_eq!(call.name, "rocm_command");
-            assert_eq!(
-                normalized_chat_rocm_command_args(&call).unwrap(),
-                vec![
-                    "install".to_owned(),
-                    "sdk".to_owned(),
-                    "--channel".to_owned(),
-                    "release".to_owned(),
-                    "--format".to_owned(),
-                    "wheel".to_owned(),
-                    "--prefix".to_owned(),
-                    expected_prefix.to_owned(),
-                ]
-            );
-            assert!(!chat_tool_call_is_read_only(&call));
-        }
-    }
-
-    #[test]
-    fn fallback_tool_call_routes_requested_therock_build_date_install() {
-        for (prompt, expected_prefix) in [
-            (
-                "Install this specific TheRock wheel from date 06052026 into D:\\ROCm\\therock_venvs",
-                "D:\\ROCm\\therock_venvs",
-            ),
-            (
-                "install ROCm at D:\\ROCm\\temp with build date 2026-06-05",
-                "D:\\ROCm\\temp",
-            ),
-        ] {
-            let call = fallback_rocm_tool_call_for_prompt(prompt).unwrap();
-            assert_eq!(call.name, "rocm_command");
-            assert_eq!(
-                normalized_chat_rocm_command_args(&call).unwrap(),
-                vec![
-                    "install".to_owned(),
-                    "sdk".to_owned(),
-                    "--channel".to_owned(),
-                    "release".to_owned(),
-                    "--format".to_owned(),
-                    "wheel".to_owned(),
-                    "--prefix".to_owned(),
-                    expected_prefix.to_owned(),
-                    "--build-date".to_owned(),
-                    "2026-06-05".to_owned(),
-                ],
-                "{prompt}"
-            );
-            assert!(!chat_tool_call_is_read_only(&call));
-        }
-    }
-
-    #[test]
-    fn fallback_tool_call_does_not_install_therock_without_folder() {
-        let call = fallback_rocm_tool_call_for_prompt(
-            "Install this specific TheRock wheel from date 06052026",
-        )
-        .unwrap();
-        assert_eq!(call.name, "rocm_command");
-        assert_eq!(
-            normalized_chat_rocm_command_args(&call).unwrap(),
-            vec![
-                "install".to_owned(),
-                "sdk".to_owned(),
-                "--channel".to_owned(),
-                "release".to_owned(),
-                "--format".to_owned(),
-                "wheel".to_owned(),
-                "--build-date".to_owned(),
-                "2026-06-05".to_owned(),
-            ]
-        );
-        assert!(!chat_tool_call_is_read_only(&call));
-    }
-
-    #[test]
-    fn chat_install_intent_without_folder_uses_folder_picker_not_rocm_check() -> Result<()> {
-        let (_root, paths) = test_paths("chat-install-intent-folder-picker");
-        for prompt in [
-            "i need to install rocm",
-            "How do I setup TheRock?",
-            "install therock",
-            "How do I get it to install therock?",
-            "rocm please",
-            "make my AMD GPU ready",
-            "get TheRock installed for local AI",
-            "set up my AMD GPU for local AI",
-            "install this specific TheRock wheel from date 06052026",
-        ] {
-            let result = render_chat_prompt_result(&paths, "local", None, prompt, true)?;
-            let approval = result
-                .approval
-                .as_ref()
-                .expect("install should need folder");
-            assert_eq!(approval.pending_title, "Install ROCm", "{prompt}");
-            assert_eq!(
-                approval.args[..6],
-                [
-                    "install".to_owned(),
-                    "sdk".to_owned(),
-                    "--channel".to_owned(),
-                    "release".to_owned(),
-                    "--format".to_owned(),
-                    "wheel".to_owned(),
-                ],
-                "{prompt}"
-            );
-            assert!(
-                !approval.args.iter().any(|arg| arg == "--prefix"),
-                "{prompt}"
-            );
-            assert!(
-                result.rendered.contains("First choose the folder"),
-                "{prompt}: {}",
-                result.rendered
-            );
-            assert!(
-                !result.rendered.contains("I checked ROCm"),
-                "{prompt}: {}",
-                result.rendered
-            );
-            assert!(
-                !result.rendered.contains("ROCm CLI summary"),
-                "{prompt}: {}",
-                result.rendered
-            );
-            if prompt.contains("06052026") {
-                assert!(approval.args.contains(&"--build-date".to_owned()));
-                assert!(approval.args.contains(&"2026-06-05".to_owned()));
-            }
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn chat_install_intent_ignores_old_conversation_words() -> Result<()> {
-        let (_root, paths) = test_paths("chat-install-intent-latest-message");
-        let prompt = "\
-Conversation so far:
-Assistant: Use /examine to refresh actual GPU memory fit before starting anything large.
-Assistant: Native Windows note: models may use WSL/Linux through Windows.
-
-New message:
-install therock";
-
-        let result = render_chat_prompt_result(&paths, "local", None, prompt, true)?;
-        let approval = result
-            .approval
-            .as_ref()
-            .expect("direct latest install request should need a folder");
-
-        assert_eq!(approval.pending_title, "Install ROCm");
-        assert!(!approval.args.iter().any(|arg| arg == "--prefix"));
-        assert!(result.rendered.contains("I can install ROCm/TheRock"));
-        assert!(result.rendered.contains("First choose the folder"));
-        assert!(!result.rendered.contains("I checked ROCm"));
-        assert!(!result.rendered.contains("ROCm CLI summary"));
-        Ok(())
-    }
-
-    #[test]
-    fn chat_how_to_setup_question_opens_install_folder_flow() {
-        assert!(
-            install_sdk_without_prefix_chat_approval("How do I setup TheRock?").is_some(),
-            "a setup question should ask for the install folder"
-        );
-        assert!(
-            install_sdk_without_prefix_chat_approval("install therock").is_some(),
-            "a direct install command should open the folder picker"
-        );
-    }
-
-    #[test]
-    fn chat_install_intent_preserves_bare_folder_path() {
-        let approval =
-            install_sdk_chat_approval_for_prompt("install therock D:\\ROCm\\therock_venvs")
-                .expect("direct install prompt should be recognized");
-
-        assert_eq!(
-            approval.args,
-            vec![
-                "install".to_owned(),
-                "sdk".to_owned(),
-                "--channel".to_owned(),
-                "release".to_owned(),
-                "--format".to_owned(),
-                "wheel".to_owned(),
-                "--prefix".to_owned(),
-                "D:\\ROCm\\therock_venvs".to_owned(),
-            ]
-        );
-    }
-
-    #[test]
-    fn fallback_tool_call_routes_requested_therock_exact_version_install() {
-        let call = fallback_rocm_tool_call_for_prompt(
-            "Install the TheRock ROCm wheel version 7.13.0a20260605 into D:\\ROCm\\therock_venvs",
-        )
-        .unwrap();
-        assert_eq!(call.name, "rocm_command");
-        assert_eq!(
-            normalized_chat_rocm_command_args(&call).unwrap(),
-            vec![
-                "install".to_owned(),
-                "sdk".to_owned(),
-                "--channel".to_owned(),
-                "release".to_owned(),
-                "--format".to_owned(),
-                "wheel".to_owned(),
-                "--prefix".to_owned(),
-                "D:\\ROCm\\therock_venvs".to_owned(),
-                "--version".to_owned(),
-                "7.13.0a20260605".to_owned(),
-            ]
-        );
-        assert!(!chat_tool_call_is_read_only(&call));
-    }
-
-    #[test]
-    fn path_exists_chat_tool_is_read_only() {
-        let call = providers::ChatToolCall {
-            id: Some("path-check".to_owned()),
-            name: "path_exists".to_owned(),
-            arguments: serde_json::json!({ "path": "D:\\ROCm\\temp" }),
-        };
-
-        validate_chat_tool_call(&call).unwrap();
-        assert!(chat_tool_call_is_read_only(&call));
-    }
-
-    #[test]
-    fn port_status_chat_tool_is_read_only_and_loopback_only() {
-        let call = providers::ChatToolCall {
-            id: Some("port-check".to_owned()),
-            name: "port_status".to_owned(),
-            arguments: serde_json::json!({ "host": "127.0.0.1", "port": 8188 }),
-        };
-
-        validate_chat_tool_call(&call).unwrap();
-        assert!(chat_tool_call_is_read_only(&call));
-
-        let public = providers::ChatToolCall {
-            id: Some("public-port-check".to_owned()),
-            name: "port_status".to_owned(),
-            arguments: serde_json::json!({ "host": "192.168.1.10", "port": 8188 }),
-        };
-        let error = validate_chat_tool_call(&public).unwrap_err().to_string();
-        assert!(error.contains("non-local host"), "{error}");
-    }
-
-    #[test]
-    fn port_status_matches_loopback_managed_services() -> Result<()> {
-        let (root, paths) = test_paths("port-status-loopback");
-        paths.ensure()?;
-        let mut record = ManagedServiceRecord::new(
-            &paths,
-            "svc-comfyui",
-            "comfyui",
-            "ComfyUI",
-            "ComfyUI",
-            "127.0.0.1",
-            18188,
-            "managed",
-            std::process::id(),
-            Some("therock-release".to_owned()),
-            None,
-            Some("gpu_required".to_owned()),
-        );
-        record.status = "ready".to_owned();
-        record.write()?;
-
-        let call = providers::ChatToolCall {
-            id: Some("port-check".to_owned()),
-            name: "port_status".to_owned(),
-            arguments: serde_json::json!({ "host": "localhost", "port": 18188 }),
-        };
-        let result = run_chat_port_status_tool(&paths, &call)?;
-        let text = mcp_tool_result_text(&result);
-        let managed_service_count = result
-            .get("structuredContent")
-            .and_then(|content| content.get("managed_services"))
-            .and_then(serde_json::Value::as_array)
-            .map_or(0, Vec::len);
-        let _ = fs::remove_dir_all(root);
-
-        assert_eq!(managed_service_count, 1);
-        assert!(text.contains("managed_services:"), "{text}");
-        assert!(text.contains("service_id=svc-comfyui"), "{text}");
-        assert!(text.contains("running_state=starting"), "{text}");
-        Ok(())
-    }
-
-    #[test]
-    fn fallback_tool_call_routes_simple_config_changes() {
-        let show = fallback_rocm_tool_call_for_prompt("Show current ROCm CLI config").unwrap();
-        assert_eq!(
-            normalized_chat_rocm_command_args(&show).unwrap(),
-            vec!["config".to_owned(), "show".to_owned()]
-        );
-        assert!(chat_tool_call_is_read_only(&show));
-
-        let engine = fallback_rocm_tool_call_for_prompt("Set the default engine to vllm").unwrap();
-        assert_eq!(
-            normalized_chat_rocm_command_args(&engine).unwrap(),
-            vec![
-                "config".to_owned(),
-                "set-default-engine".to_owned(),
-                "vllm".to_owned(),
-            ]
-        );
-        assert!(!chat_tool_call_is_read_only(&engine));
-
-        let telemetry =
-            fallback_rocm_tool_call_for_prompt("Disable telemetry in settings").unwrap();
-        assert_eq!(
-            normalized_chat_rocm_command_args(&telemetry).unwrap(),
-            vec![
-                "config".to_owned(),
-                "set-telemetry".to_owned(),
-                "off".to_owned(),
-            ]
-        );
-        assert!(!chat_tool_call_is_read_only(&telemetry));
-    }
-
-    #[test]
-    fn fallback_tool_call_routes_comfyui_support_and_actions() {
-        let status = fallback_rocm_tool_call_for_prompt("How do I setup ComfyUI?").unwrap();
-        assert_eq!(status.name, "rocm_command");
-        assert_eq!(
-            normalized_chat_rocm_command_args(&status).unwrap(),
-            vec!["comfyui".to_owned(), "status".to_owned()]
-        );
-        assert!(chat_tool_call_is_read_only(&status));
-
-        let install = fallback_rocm_tool_call_for_prompt("Can you setup ComfyUI for me?").unwrap();
-        assert_eq!(
-            normalized_chat_rocm_command_args(&install).unwrap(),
-            vec!["comfyui".to_owned(), "install".to_owned()]
-        );
-        assert!(!chat_tool_call_is_read_only(&install));
-        let approval =
-            chat_tool_approval_request(&install, Some("Install ComfyUI after approval.")).unwrap();
-        assert_eq!(approval.pending_title, "Install ComfyUI");
-
-        let start = fallback_rocm_tool_call_for_prompt("Can you start ComfyUI?").unwrap();
-        assert_eq!(
-            normalized_chat_rocm_command_args(&start).unwrap(),
-            vec!["comfyui".to_owned(), "start".to_owned()]
-        );
-        assert!(!chat_tool_call_is_read_only(&start));
-        let approval =
-            chat_tool_approval_request(&start, Some("Start ComfyUI after approval.")).unwrap();
-        assert_eq!(approval.pending_title, "Start ComfyUI");
-    }
-
-    #[test]
-    fn fallback_tool_call_routes_local_llm_serve_requests() {
-        let call =
-            fallback_rocm_tool_call_for_prompt("Can you setup and serve an LLM for me?").unwrap();
-        assert_eq!(call.name, "rocm_command");
-        assert_eq!(
-            normalized_chat_rocm_command_args(&call).unwrap(),
-            vec![
-                "serve".to_owned(),
-                "qwen".to_owned(),
-                "--engine".to_owned(),
-                "lemonade".to_owned(),
-                "--device".to_owned(),
-                "gpu_required".to_owned(),
-                "--managed".to_owned(),
-            ]
-        );
-        assert!(!chat_tool_call_is_read_only(&call));
-        let approval =
-            chat_tool_approval_request(&call, Some("Start qwen after approval.")).unwrap();
-        assert_eq!(approval.pending_title, "Start local model server");
-        assert_eq!(
-            rocm_chat_tool_requested_command(&call).as_deref(),
-            Some("rocm serve qwen --engine lemonade --device gpu_required --managed")
-        );
-    }
-
-    #[test]
-    fn local_chat_tool_call_content_is_treated_as_intermediate() {
-        let response = providers::ChatResponse {
-            provider: "local".to_owned(),
-            model: "Qwen/Qwen3-0.6B".to_owned(),
-            content: "The active runtime root is /opt/rocm.".to_owned(),
-            tool_calls: vec![providers::ChatToolCall {
-                id: Some("call-1".to_owned()),
-                name: "examine".to_owned(),
-                arguments: serde_json::json!({}),
-            }],
-        };
-
-        assert!(local_tool_call_content_is_intermediate(
-            "local", true, &response
-        ));
-        assert!(!local_tool_call_content_is_intermediate(
-            "openai", true, &response
-        ));
-        assert!(!local_tool_call_content_is_intermediate(
-            "local", false, &response
-        ));
-
-        let without_tools = providers::ChatResponse {
-            tool_calls: Vec::new(),
-            ..response
-        };
-        assert!(!local_tool_call_content_is_intermediate(
-            "local",
-            true,
-            &without_tools
-        ));
-    }
-
-    #[test]
-    fn local_chat_follow_up_with_tool_call_is_not_final_answer() {
-        let response = providers::ChatResponse {
-            provider: "local".to_owned(),
-            model: "Qwen/Qwen3-0.6B".to_owned(),
-            content: "The runtime root is /opt/rocml.".to_owned(),
-            tool_calls: vec![providers::ChatToolCall {
-                id: Some("call-2".to_owned()),
-                name: "examine".to_owned(),
-                arguments: serde_json::json!({}),
-            }],
-        };
-
-        assert!(!local_follow_up_content_is_final(&response));
-
-        let final_answer = providers::ChatResponse {
-            tool_calls: Vec::new(),
-            content: "The runtime root is D:\\ROCm\\therock_venvs.".to_owned(),
-            ..response
-        };
-        assert!(local_follow_up_content_is_final(&final_answer));
-    }
-
-    #[test]
-    fn visible_chat_content_removes_reasoning_blocks() {
-        assert_eq!(
-            visible_chat_content(
-                "<think>\nchecking the tool output\n</think>\nThe runtime root is D:\\ROCm\\temp."
-            ),
-            "The runtime root is D:\\ROCm\\temp."
-        );
-        assert_eq!(
-            visible_chat_content("Before\n<THINK>hidden</THINK>\nAfter"),
-            "Before\n\nAfter"
-        );
-        assert_eq!(visible_chat_content("<think>unfinished"), "");
-    }
-
-    #[test]
-    fn chat_tool_result_errors_use_plain_failure_wording() {
-        assert_eq!(chat_read_only_tool_status_label(false), "done");
-        assert_eq!(chat_read_only_tool_status_label(true), "reported an error");
-        assert_eq!(chat_tool_display_label("examine"), "Checked this computer");
-        assert_eq!(
-            chat_tool_display_label("gpu_snapshot"),
-            "Checked GPU status"
-        );
-        assert_eq!(chat_tool_display_label("install_sdk"), "Install ROCm");
-        assert!(mcp_tool_result_is_error(&serde_json::json!({
-            "isError": true
-        })));
-        assert!(!mcp_tool_result_is_error(&serde_json::json!({
-            "isError": false
-        })));
-        assert!(!mcp_tool_result_is_error(&serde_json::json!({})));
-    }
-
-    #[test]
-    fn local_chat_without_service_explains_serve_before_chat_without_llm_setup() {
-        let (_root, paths) = test_paths("local-chat-no-service-guidance");
-        let result =
-            render_chat_prompt_result(&paths, "local", None, "Check this ROCm setup", true)
-                .expect("missing local assistant should render guidance");
-        assert!(result.approval.is_none());
-        let rendered = result.rendered;
-
-        assert!(rendered.contains("No local assistant is running yet."));
-        assert!(rendered.contains("First-time ROCm setup does not need an LLM"));
-        assert!(rendered.contains("Recommended path:"));
-        assert!(rendered.contains("Advanced manual command"));
-        assert!(rendered.contains(
-            "rocm serve Qwen3-4B-Instruct-2507-GGUF --engine lemonade --device gpu_required --managed"
-        ));
-        assert!(!rendered.contains("sshleifer/tiny-gpt2"));
-        assert!(rendered.contains("rocm chat --tools --provider local --prompt"));
-        assert!(rendered.contains("Nothing was changed."));
-        assert!(!rendered.contains("install sdk"));
-        assert!(!rendered.contains("setup TheRock with an LLM"));
-    }
-
-    #[test]
-    fn local_chat_status_prompts_use_read_only_tools_without_assistant() -> Result<()> {
-        let (_root, paths) = test_paths("local-chat-status-fallback");
-
-        let running =
-            render_chat_prompt_result(&paths, "local", None, "Is vLLM running?", true)?.rendered;
-        assert!(!running.contains("No local assistant is running yet."));
-        assert!(running.contains("Checked model servers: done"), "{running}");
-        assert!(running.contains("ROCm CLI summary"), "{running}");
-        assert!(
-            running.contains("Local model servers: none running under ROCm CLI."),
-            "{running}"
-        );
-        assert!(running.contains("Nothing was changed."));
-
-        let installed =
-            render_chat_prompt_result(&paths, "local", None, "Is vLLM installed?", true)?.rendered;
-        assert!(!installed.contains("No local assistant is running yet."));
-        assert!(installed.contains("Engine runtimes:"), "{installed}");
-        assert!(installed.contains("vLLM:"), "{installed}");
-
-        let installed_and_running = render_chat_prompt_result(
-            &paths,
-            "local",
-            None,
-            "Is vLLM installed and is it running?",
-            true,
-        )?
-        .rendered;
-        assert!(
-            installed_and_running.contains("Checked local engines: done"),
-            "{installed_and_running}"
-        );
-        assert!(
-            installed_and_running.contains("Checked model servers: done"),
-            "{installed_and_running}"
-        );
-        assert!(
-            installed_and_running.contains("Engine runtimes:"),
-            "{installed_and_running}"
-        );
-        assert!(
-            installed_and_running.contains("Local model servers: none running under ROCm CLI."),
-            "{installed_and_running}"
-        );
-
-        let port = render_chat_prompt_result(
-            &paths,
-            "local",
-            None,
-            "What is running on port 8188?",
-            true,
-        )?
-        .rendered;
-        assert!(!port.contains("No local assistant is running yet."));
-        assert!(port.contains("Checked local port: done"), "{port}");
-        assert!(port.contains("Port 8188:"), "{port}");
-        Ok(())
-    }
-
-    #[test]
-    fn chat_tools_anthropic_reaches_provider_opt_in_boundary() {
-        let (_root, paths) = test_paths("anthropic-chat-tools-opt-in");
-
-        let error = render_chat_prompt_result(
-            &paths,
-            "anthropic",
-            Some("claude-test"),
-            "Check this ROCm setup",
-            true,
-        )
-        .unwrap_err()
-        .to_string();
-
-        assert!(error.contains("cloud provider `anthropic` is disabled"));
-        assert!(error.contains("rocm config enable-provider anthropic"));
-        assert!(!error.contains("OpenAI-compatible provider"));
     }
 
     #[test]
@@ -22025,6 +15641,16 @@ install therock";
             "the skip reason must name the stop command:\n{}",
             outcome.text
         );
+        // ROCMAI-543: the skip line is built by `build_service_prune_plan` as
+        // "<id> is <status> - stop it first with `<cmd>`" and printed verbatim.
+        // Asserting the whole rendered plan rather than that one sentence also
+        // covers the counts, the headings, and any line added to the plan later.
+        assert!(
+            outcome.text.is_ascii(),
+            "`rocm services prune` output must be ASCII-only; non-ASCII punctuation renders \
+             as mojibake on a Windows console using the OEM code page (ROCMAI-543):\n{}",
+            outcome.text
+        );
         Ok(())
     }
 
@@ -22664,6 +16290,70 @@ install therock";
         Ok(())
     }
 
+    /// `rocm uninstall`'s review warns that a remote session keeps running on
+    /// someone else's machine, and names the command that stops it properly.
+    ///
+    /// Nothing exercised that warning before: no test planted a remote session
+    /// record, so the whole sentence -- including the ASCII punctuation this
+    /// change put in it (ROCMAI-543) -- shipped uncovered. The remediation is
+    /// asserted alongside the encoding because a warning that stops naming
+    /// `rocm remote stop` leaves the user with no way to act on it.
+    #[test]
+    fn uninstall_warns_about_remote_sessions_in_ascii_and_names_the_stop_command() -> Result<()> {
+        let (root, paths) = test_paths("uninstall-remote-session-warning");
+        paths.ensure()?;
+        let session = crate::remote::session::RemoteSessionRecord {
+            session_id: crate::remote::session::RemoteSessionRecord::id_for("dev-box", 8000),
+            target: "dev-box".to_owned(),
+            peer_host: "dev-box".to_owned(),
+            ssh_port: None,
+            model: "qwen".to_owned(),
+            remote_service_id: "svc-remote".to_owned(),
+            remote_cli: "rocm".to_owned(),
+            remote_port: 8000,
+            tailnet_port: 8000,
+            base_url: "http://dev-box:8000/v1".to_owned(),
+            created_at_unix_ms: 1,
+        };
+        session.write(&paths)?;
+
+        // `keep_binaries` so the plan never reaches outside the sandbox: the
+        // binary paths are the host's real ones and have nothing to do with
+        // this warning.
+        let options = UninstallOptions {
+            dry_run: true,
+            keep_binaries: true,
+            ..UninstallOptions::default()
+        };
+        let plan = build_uninstall_plan(&paths, &options);
+        let _ = fs::remove_dir_all(&root);
+        let plan = plan?;
+
+        let warning = plan
+            .warnings
+            .iter()
+            .find(|warning| warning.contains("remote session record(s)"))
+            .unwrap_or_else(|| {
+                panic!("a planted remote session must be warned about: {plan:#?}");
+            });
+        assert!(
+            warning.contains(&session.session_id),
+            "the warning must name the session it found: {warning}"
+        );
+        assert!(
+            warning.contains("rocm remote stop <session>"),
+            "the warning must name the command that stops the remote model: {warning}"
+        );
+        // ROCMAI-543: printed verbatim by `render_uninstall_plan`, so non-ASCII
+        // punctuation here renders as mojibake like "ΓÇö" on a Windows console
+        // using the OEM code page.
+        assert!(
+            warning.is_ascii(),
+            "the remote-session warning must be ASCII-only (ROCMAI-543): {warning}"
+        );
+        Ok(())
+    }
+
     /// A file `prune` cannot delete must be *reported*, not swallowed and not
     /// propagated: the plan, the per-record progress and the audit event all
     /// have to survive it, because a destructive command that loses its own
@@ -23061,32 +16751,6 @@ install therock";
     }
 
     #[test]
-    fn services_tool_result_text_includes_running_interpretation() {
-        let (_root, paths) = test_paths("services-tool-text");
-        let mut record = ManagedServiceRecord::new(
-            &paths,
-            "svc-vllm",
-            "vllm",
-            "Qwen/Qwen3.5",
-            "Qwen/Qwen3.5",
-            "127.0.0.1",
-            11435,
-            "managed",
-            std::process::id(),
-            Some("therock-release".to_owned()),
-            None,
-            Some("gpu_required".to_owned()),
-        );
-        record.status = "ready".to_owned();
-
-        let rendered = render_services_tool_result_text(&[record]);
-
-        assert!(rendered.contains("status_meaning: ready/running = running"));
-        assert!(rendered.contains("engine=vllm"));
-        assert!(rendered.contains("running_state=running"));
-    }
-
-    #[test]
     fn service_actions_require_yes_and_render_sandbox_result() {
         let (_root, paths) = test_paths("services-action-approval");
         let error = run_approved_service_action(&paths, "stop_server", "svc-qwen", false)
@@ -23235,80 +16899,6 @@ install therock";
         }
     }
 
-    /// The half the parse test above cannot reach: that the parsed flag is what
-    /// the install request carries.
-    ///
-    /// `install()` is not callable here — it needs `uv`, a live index and a real
-    /// probe — so the mapping is extracted into `sdk_install_request` and pinned
-    /// directly. Hardcoding `include_devel` at that mapping is the change this
-    /// catches and the clap test does not.
-    #[test]
-    fn install_sdk_request_forwards_the_parsed_devel_flag() {
-        for devel in [false, true] {
-            let request = sdk_install_request(
-                "release",
-                "wheel",
-                None,
-                None,
-                None,
-                false,
-                devel,
-                therock::SdkInstallConsent::Ask,
-            );
-            assert_eq!(
-                request.include_devel, devel,
-                "the parsed --devel flag must reach the install request"
-            );
-        }
-
-        // And the flag must not be confused with the neighbouring bool.
-        let dry_run_only = sdk_install_request(
-            "release",
-            "wheel",
-            None,
-            None,
-            None,
-            true,
-            false,
-            therock::SdkInstallConsent::Ask,
-        );
-        assert!(dry_run_only.dry_run);
-        assert!(!dry_run_only.include_devel);
-    }
-
-    /// End to end across the two seams a `rocm install sdk --devel` traverses:
-    /// clap parse, then the request mapping. Neither alone proves the flag
-    /// survives the trip.
-    #[test]
-    fn parsed_install_sdk_arguments_reach_the_request_with_devel_intact() {
-        for (args, expected) in [
-            (vec!["rocm", "install", "sdk"], false),
-            (vec!["rocm", "install", "sdk", "--devel"], true),
-        ] {
-            let cli = Cli::try_parse_from(&args).expect("install sdk should parse");
-            let Some(Command::Install {
-                target: InstallTarget::Sdk { devel, .. },
-            }) = cli.command
-            else {
-                panic!("expected an install sdk target for {args:?}");
-            };
-            let request = sdk_install_request(
-                "release",
-                "wheel",
-                None,
-                None,
-                None,
-                false,
-                devel,
-                therock::SdkInstallConsent::Ask,
-            );
-            assert_eq!(
-                request.include_devel, expected,
-                "--devel did not survive parse -> request for {args:?}"
-            );
-        }
-    }
-
     #[test]
     fn top_level_cli_commands_are_not_treated_as_freeform() {
         for command in [
@@ -23405,6 +16995,15 @@ install therock";
         assert!(rendered.contains("Onboarding will not reopen automatically"));
         assert!(rendered.contains("ROCm installs were not deleted"));
         assert!(rendered.contains("API keys"));
+        // ROCMAI-543: the assertions above stop before the ` - open it from
+        // `rocm dash`'s Observe tab` clause, so they stay green with the em
+        // dash put back. This covers the whole block that `rocm setup --reset`
+        // prints, including any line added to it later.
+        assert!(
+            rendered.is_ascii(),
+            "the setup-reset prompt must be ASCII-only; non-ASCII punctuation renders as \
+             mojibake on a Windows console using the OEM code page (ROCMAI-543): {rendered}"
+        );
         assert!(!rendered.contains("request plan"));
         assert!(!rendered.contains("planner:"));
         assert!(!rendered.contains("tool_schema"));
@@ -23476,7 +17075,7 @@ install therock";
         // See the pointer comment in
         // `setup_reset_cli_output_is_plain_and_persists_first_time_prompt`
         // above: this only guards the string, not the underlying behavior.
-        assert!(rendered.contains("status: first-time setup available — open manually"));
+        assert!(rendered.contains("status: first-time setup available - open manually"));
         assert!(rendered.contains("active_runtime_status: <unset>"));
         Ok(())
     }
@@ -23677,6 +17276,345 @@ install therock";
         assert_eq!(endpoint_keys::endpoint_api_key(&paths, service_id), None);
         assert_eq!(record.stop_requested_unix_ms, None);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stop_records_its_marker_on_disk_before_any_process_is_signalled() {
+        // The daemon's `server-recover` watcher restarts a managed service whose
+        // endpoint stops answering unless the record carries a stop marker. A
+        // stop that wrote the marker only after terminating the processes would
+        // leave that whole window — the engine `Stop`, then up to the grace
+        // period per PID — open for the daemon to bring the service back. So at
+        // the moment the processes are signalled the marker must already be on
+        // disk, not just in the stop's in-memory copy.
+        let (root, paths) = test_paths("stop-marker-before-signal");
+        paths.ensure().unwrap();
+        let service_id = "svc-stop-marker-order";
+        // A port nothing listens on, so the lemonade unload fails fast instead
+        // of reaching a real server.
+        let port = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            service_id,
+            "lemonade",
+            "model-ref",
+            "canonical/model",
+            "127.0.0.1",
+            port,
+            "managed",
+            999_999_999,
+            None,
+            None,
+            None,
+        );
+        record.status = "ready".to_owned();
+        record.write().unwrap();
+
+        // Read the file as-is: `load_managed_service` runs the liveness refresh,
+        // which would consume the marker of a record whose PIDs are dead.
+        let on_disk = || {
+            serde_json::from_slice::<ManagedServiceRecord>(
+                &fs::read(paths.service_manifest_path(service_id)).unwrap(),
+            )
+            .unwrap()
+        };
+        let seen_at_signal = std::cell::Cell::new(None);
+        let report = stop_internal_managed_service_with(&paths, service_id, |_| {
+            let on_disk = on_disk();
+            seen_at_signal.set(Some(on_disk.stop_requested_unix_ms));
+            (Vec::new(), false)
+        })
+        .unwrap();
+
+        assert!(
+            matches!(seen_at_signal.get(), Some(Some(_))),
+            "the stop marker must be persisted before the processes are signalled, \
+             saw {:?}",
+            seen_at_signal.get()
+        );
+        // The final-state gating is unchanged: an unconfirmed stop keeps the
+        // marker it wrote up front.
+        assert!(on_disk().stop_requested_unix_ms.is_some());
+        assert_eq!(report["signaled_pids"], serde_json::json!([]));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A stopped-lemonade record on a port nothing listens on, so the stop's
+    /// unload fails fast instead of reaching a real server.
+    fn stop_test_record(paths: &AppPaths, service_id: &str) -> ManagedServiceRecord {
+        let port = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let mut record = ManagedServiceRecord::new(
+            paths,
+            service_id,
+            "lemonade",
+            "model-ref",
+            "canonical/model",
+            "127.0.0.1",
+            port,
+            "managed",
+            999_999_999,
+            None,
+            None,
+            None,
+        );
+        record.status = "ready".to_owned();
+        record
+    }
+
+    /// The manifest as it is on disk, without `load_managed_service`'s refresh.
+    fn raw_manifest(paths: &AppPaths, service_id: &str) -> ManagedServiceRecord {
+        serde_json::from_slice(&fs::read(paths.service_manifest_path(service_id)).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn stop_does_not_confirm_when_a_restart_recorded_new_processes_meanwhile() {
+        // A stop's verdict covers the processes it read and signalled. A restart
+        // landing while it ran records a new supervisor and clears the marker;
+        // claiming that service stopped, or deleting the key it serves with,
+        // would be false. Here every process the stop handled is confirmed gone,
+        // so only the re-read can tell.
+        let (root, paths) = test_paths("stop-restart-meanwhile");
+        paths.ensure().unwrap();
+        let service_id = "svc-stop-restart-meanwhile";
+        stop_test_record(&paths, service_id).write().unwrap();
+        endpoint_keys::store_endpoint_api_key(&paths, service_id, "key-123").unwrap();
+
+        let report = stop_internal_managed_service_with(&paths, service_id, |_| {
+            let mut restarted = raw_manifest(&paths, service_id);
+            restarted.status = "recovering".to_owned();
+            restarted.supervisor_pid = 4_242_424;
+            restarted.supervisor_start_ticks = Some(7);
+            restarted.stop_requested_unix_ms = None;
+            restarted.write().unwrap();
+            (Vec::new(), true)
+        })
+        .unwrap();
+
+        let on_disk = raw_manifest(&paths, service_id);
+        let key = endpoint_keys::endpoint_api_key(&paths, service_id);
+        let _ = fs::remove_dir_all(root);
+        assert_eq!(report["status"], "recovering", "{report}");
+        assert_eq!(on_disk.status, "recovering");
+        assert_eq!(on_disk.supervisor_pid, 4_242_424, "the restart's PID stays");
+        assert!(
+            on_disk.stop_requested_unix_ms.is_some(),
+            "an unconfirmed stop re-stamps the marker the restart cleared"
+        );
+        assert_eq!(key.as_deref(), Some("key-123"), "the key is kept");
+    }
+
+    #[test]
+    fn stop_final_write_keeps_what_others_wrote_while_it_ran() {
+        // The stop's last write applies its own fields to the record as it is
+        // now, not to the copy it loaded before the engine stop and the wait.
+        let (root, paths) = test_paths("stop-final-write-rereads");
+        paths.ensure().unwrap();
+        let service_id = "svc-stop-final-write-rereads";
+        stop_test_record(&paths, service_id).write().unwrap();
+        endpoint_keys::store_endpoint_api_key(&paths, service_id, "key-123").unwrap();
+
+        let report = stop_internal_managed_service_with(&paths, service_id, |_| {
+            let mut meanwhile = raw_manifest(&paths, service_id);
+            meanwhile.restart_count = 7;
+            meanwhile.write().unwrap();
+            (Vec::new(), true)
+        })
+        .unwrap();
+
+        let on_disk = raw_manifest(&paths, service_id);
+        let key = endpoint_keys::endpoint_api_key(&paths, service_id);
+        let _ = fs::remove_dir_all(root);
+        assert_eq!(report["status"], "stopped", "{report}");
+        assert_eq!(on_disk.status, "stopped");
+        assert_eq!(on_disk.stop_requested_unix_ms, None);
+        assert_eq!(on_disk.restart_count, 7, "a concurrent write survives");
+        assert_eq!(key, None, "a confirmed stop drops the key");
+    }
+
+    #[test]
+    fn restart_does_not_start_an_engine_over_an_unconfirmed_stop() {
+        // A restart used to discard its stop's result and start the new engine
+        // regardless, next to a survivor still holding the port and the GPU.
+        // Here the stop cannot confirm termination: the restart must say so,
+        // start nothing, and leave the stop's own state standing.
+        let (root, paths) = test_paths("restart-unconfirmed-stop");
+        paths.ensure().unwrap();
+        let service_id = "svc-restart-unconfirmed-stop";
+        let record = stop_test_record(&paths, service_id);
+        record.write().unwrap();
+        endpoint_keys::store_endpoint_api_key(&paths, service_id, "key-123").unwrap();
+
+        let result = restart_internal_managed_service_with(&paths, service_id, None, |_| {
+            (vec![999_999_999], false)
+        });
+
+        let on_disk = raw_manifest(&paths, service_id);
+        let key = endpoint_keys::endpoint_api_key(&paths, service_id);
+        let log_created = record.log_path.exists();
+        let _ = fs::remove_dir_all(root);
+        let error = result.expect_err("an unconfirmed stop must not be restarted over");
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("could not confirm"), "{rendered}");
+        assert!(rendered.contains("no new engine was started"), "{rendered}");
+        assert!(rendered.contains("999999999"), "names the pids: {rendered}");
+        // The claims in that message, checked against the state they describe.
+        assert!(
+            !log_created,
+            "nothing was started: the restart never opened the new run's log"
+        );
+        assert_eq!(on_disk.restart_count, 0, "no restart was recorded");
+        assert_eq!(
+            on_disk.supervisor_pid, 999_999_999,
+            "the record still names the survivor"
+        );
+        assert!(
+            on_disk.stop_requested_unix_ms.is_some(),
+            "the stop request stays recorded on the service"
+        );
+        assert_eq!(
+            key.as_deref(),
+            Some("key-123"),
+            "the key stays with the survivor"
+        );
+    }
+
+    /// A record as a restart's confirmed stop leaves it, on disk.
+    fn stopped_restart_record(paths: &AppPaths, service_id: &str) -> ManagedServiceRecord {
+        let mut record = stop_test_record(paths, service_id);
+        record.status = "stopped".to_owned();
+        record.write().unwrap();
+        raw_manifest(paths, service_id)
+    }
+
+    #[test]
+    fn restart_readiness_write_keeps_a_stop_asked_for_while_it_waited() {
+        // The restart's last write lands after a readiness wait of up to 45
+        // seconds. A stop asked for in that window persists its marker before
+        // it signals anything; writing the restart's own copy back erased it.
+        let (root, paths) = test_paths("restart-readiness-keeps-marker");
+        paths.ensure().unwrap();
+        let service_id = "svc-restart-readiness-keeps-marker";
+        let stopped = stopped_restart_record(&paths, service_id);
+        let started = record_restarted_child(&paths, &stopped, None, std::process::id()).unwrap();
+
+        let mut stopping = raw_manifest(&paths, service_id);
+        stopping.stop_requested_unix_ms = Some(1_234);
+        stopping.write().unwrap();
+
+        let returned =
+            record_restart_readiness(&paths, &started, EndpointReadiness::Unreachable).unwrap();
+        let on_disk = raw_manifest(&paths, service_id);
+        let _ = fs::remove_dir_all(root);
+        assert_eq!(
+            on_disk.stop_requested_unix_ms,
+            Some(1_234),
+            "the stop survives"
+        );
+        assert_eq!(on_disk.supervisor_pid, std::process::id());
+        assert_eq!(on_disk.restart_count, 1);
+        assert_eq!(returned.stop_requested_unix_ms, Some(1_234));
+    }
+
+    #[test]
+    fn restart_readiness_write_leaves_a_stop_that_finished_meanwhile() {
+        // A stop that confirmed the new child gone during the wait wrote
+        // "stopped"; the restart's verdict on a process that no longer exists
+        // must not overwrite it.
+        let (root, paths) = test_paths("restart-readiness-after-stop");
+        paths.ensure().unwrap();
+        let service_id = "svc-restart-readiness-after-stop";
+        let stopped = stopped_restart_record(&paths, service_id);
+        let started = record_restarted_child(&paths, &stopped, None, std::process::id()).unwrap();
+
+        let mut finished = raw_manifest(&paths, service_id);
+        finished.status = "stopped".to_owned();
+        finished.write().unwrap();
+
+        let returned =
+            record_restart_readiness(&paths, &started, EndpointReadiness::Serving).unwrap();
+        let on_disk = raw_manifest(&paths, service_id);
+        let _ = fs::remove_dir_all(root);
+        assert_eq!(on_disk.status, "stopped");
+        assert_eq!(on_disk.inference_verified_at_unix_ms, None);
+        assert_eq!(
+            returned.status, "stopped",
+            "the caller sees the record as it is"
+        );
+    }
+
+    #[test]
+    fn restarted_child_record_names_the_runtime_the_restart_was_pinned_to() {
+        // A move (`rocm runtimes activate --restart-services`) launches the
+        // child on the pinned runtime, but the restart's own load re-adopted the
+        // outgoing process's `runtime_id`/`env_id` from its engine state and
+        // persisted them over the pin. The record the restart writes for its
+        // child is built from disk, so it has to carry the pin again or it
+        // names the runtime the service just left.
+        let (root, paths) = test_paths("restart-child-runtime-pin");
+        paths.ensure().unwrap();
+        let service_id = "svc-restart-child-runtime-pin";
+        let mut stopped = stop_test_record(&paths, service_id);
+        stopped.status = "stopped".to_owned();
+        stopped.runtime_id = Some("runtime-old".to_owned());
+        stopped.env_id = Some("env-old".to_owned());
+        stopped.write().unwrap();
+        let stopped = raw_manifest(&paths, service_id);
+
+        let started =
+            record_restarted_child(&paths, &stopped, Some("runtime-new"), std::process::id())
+                .unwrap();
+        let on_disk = raw_manifest(&paths, service_id);
+        let _ = fs::remove_dir_all(root);
+        assert_eq!(on_disk.runtime_id.as_deref(), Some("runtime-new"));
+        assert_eq!(
+            on_disk.env_id, None,
+            "the pin drops the env, as a move does"
+        );
+        assert_eq!(started.runtime_id.as_deref(), Some("runtime-new"));
+        assert_eq!(on_disk.supervisor_pid, std::process::id());
+    }
+
+    #[test]
+    fn restart_reports_a_child_it_could_not_record_and_writes_nothing() {
+        // Between the restart's stop and its spawn, another restart recorded
+        // its own processes. Writing this child over them would hide theirs;
+        // the restart has to report its child unrecorded instead.
+        let (root, paths) = test_paths("restart-child-unrecorded");
+        paths.ensure().unwrap();
+        let service_id = "svc-restart-child-unrecorded";
+        let stopped = stopped_restart_record(&paths, service_id);
+
+        let mut other = raw_manifest(&paths, service_id);
+        other.status = "running".to_owned();
+        other.supervisor_pid = 4_242_424;
+        other.supervisor_start_ticks = Some(7);
+        other.write().unwrap();
+
+        let result = record_restarted_child(&paths, &stopped, None, std::process::id());
+        let on_disk = raw_manifest(&paths, service_id);
+        let _ = fs::remove_dir_all(root);
+        let rendered = format!(
+            "{:#}",
+            result.expect_err("a changed record must be reported")
+        );
+        assert!(rendered.contains("was not recorded"), "{rendered}");
+        assert!(
+            rendered.contains(&std::process::id().to_string()),
+            "{rendered}"
+        );
+        assert_eq!(
+            on_disk.supervisor_pid, 4_242_424,
+            "the other restart's PID stays"
+        );
+        assert_eq!(on_disk.restart_count, 0, "nothing was written");
     }
 
     #[test]
@@ -25114,35 +19052,6 @@ install therock";
         Ok(())
     }
 
-    /// The same question — "is this a system location?" — also keeps the local
-    /// assistant from installing into one, and there the folder arrives as
-    /// free-form JSON from a model rather than from a file the user wrote. A
-    /// trailing separator is exactly the sort of thing generated text carries,
-    /// so the refusal has to survive every spelling here too.
-    #[test]
-    #[cfg(unix)]
-    fn the_assistant_cannot_name_a_system_install_folder_by_respelling_it() {
-        let home = rocm_core::runtime_home_dir().expect("a home directory");
-        let home = home.display().to_string();
-        let spellings = [
-            "/usr/".to_owned(),
-            "/opt/".to_owned(),
-            "//usr".to_owned(),
-            "/./opt".to_owned(),
-            format!("{home}/../../usr"),
-        ];
-
-        let accepted: Vec<String> = spellings
-            .into_iter()
-            .filter(|text| !chat_install_prefix_is_system(Path::new(text)))
-            .collect();
-
-        assert!(
-            accepted.is_empty(),
-            "accepted as a user install folder: {accepted:?}"
-        );
-    }
-
     #[test]
     fn engine_plugin_discovery_finds_runtime_binary() -> Result<()> {
         let (root, paths) = test_paths("engine-plugin");
@@ -25478,8 +19387,9 @@ install therock";
                     "artifact_ref": "tiny/model#gguf",
                     "allow_artifact_download": true,
                     // One byte under 1 MiB: `{:.1}` rounds it up to a full
-                    // 1024 KB, so the approved cap must read as "1.0 MB", not
-                    // "1024.0 KB".
+                    // 1024 KiB, so the approved cap must read as "1.0 MiB",
+                    // not "1024.0 KiB". It must also read as `MiB`, not `MB`
+                    // — this is base-1024 math, not base-1000 (issue #190).
                     "artifact_max_bytes": 1_048_575
                 }),
                 reviewed_at_unix_ms: None,
@@ -25522,7 +19432,7 @@ install therock";
         assert!(rendered.contains("server: svc-plain"));
         assert!(rendered.contains("proposal-file [waiting for review] Prepare a model file"));
         assert!(rendered.contains("model file: tiny/model#gguf"));
-        assert!(rendered.contains("download: approved up to 1.0 MB"));
+        assert!(rendered.contains("download: approved up to 1.0 MiB"));
         assert!(rendered.contains(
             "controls: /automations approve proposal-plain | /automations reject proposal-plain"
         ));
@@ -25654,15 +19564,94 @@ install therock";
     }
 
     #[test]
+    fn model_catalog_platform_heading_marks_the_host_gpu_in_ascii() {
+        assert_eq!(
+            model_catalog_platform_heading("AMD Instinct - MI300X", false),
+            "AMD Instinct - MI300X",
+            "an unmatched platform heading is the bare label"
+        );
+
+        // ROCMAI-543: this marker was `←` (U+2190), which a Windows console on
+        // the OEM code page renders as mojibake. `render_model_registry_text_*`
+        // only reaches this branch on a host whose real gfx target matches a
+        // catalog platform, so the default no-GPU CI lane never covers it.
+        // Asserting the exact string (not `contains`) is what makes a revert of
+        // the punctuation alone fail, which a substring check would not.
+        let marked = model_catalog_platform_heading("AMD Instinct - MI300X", true);
+        assert_eq!(marked, "AMD Instinct - MI300X <- your GPU");
+        assert!(
+            marked.is_ascii(),
+            "the host-GPU marker must be ASCII (ROCMAI-543): {marked}"
+        );
+    }
+
+    /// ROCMAI-543: the clap doc comments are the largest single surface of
+    /// user-facing text this fix rewrote, and nothing exercised them — no test
+    /// renders `--help` at all. Walking the whole command tree, rather than
+    /// only the top-level `--help`, is what makes this cover the edits that
+    /// were actually made: every one of them sits on a nested subcommand's
+    /// field or variant (`rocm runtime install --family`, `rocm services
+    /// prune --older-than-hours`, `rocm runtime rollback`'s `after_help`,
+    /// ...), none of which the top-level help renders. Asserting on the
+    /// rendered help rather than on individual strings means a future option
+    /// added anywhere in the tree is covered the day it lands.
+    #[test]
+    fn every_help_text_in_the_command_tree_is_ascii() {
+        fn assert_ascii_help(cmd: &mut clap::Command, path: &str) {
+            // Both renderings: `-h` and `--help` draw from different fields
+            // (`about` vs `long_about`, and clap truncates the short form at
+            // the first paragraph), so a non-ASCII character in a later
+            // paragraph is only visible in the long form.
+            for rendered in [cmd.render_help(), cmd.render_long_help()] {
+                let rendered = rendered.to_string();
+                assert!(
+                    rendered.is_ascii(),
+                    "`{path} --help` must be ASCII-only; non-ASCII punctuation renders as \
+                     mojibake on a Windows console using the OEM code page (ROCMAI-543): \
+                     {rendered}"
+                );
+            }
+            // Collect first: `find_subcommand_mut` needs a mutable borrow that
+            // cannot overlap the iterator borrowing `cmd`.
+            let names: Vec<String> = cmd
+                .get_subcommands()
+                .map(|sub| sub.get_name().to_owned())
+                .collect();
+            for name in names {
+                let child_path = format!("{path} {name}");
+                let child = cmd
+                    .find_subcommand_mut(&name)
+                    .expect("subcommand name was just enumerated from this command");
+                assert_ascii_help(child, &child_path);
+            }
+        }
+
+        assert_ascii_help(&mut Cli::command(), "rocm");
+    }
+
+    #[test]
     fn render_model_registry_text_lists_builtin_recipes() {
         let rendered = render_model_registry_text_with_context_and_host(None, None, None);
 
+        // ROCMAI-543: a Windows console on the OEM code page (437) renders a
+        // UTF-8 em dash (and other non-ASCII punctuation) as mojibake like
+        // "ΓÇö" instead of transliterating it, so user-facing CLI output must
+        // stick to ASCII. `is_ascii()` is strictly stronger than a single
+        // em-dash check: it also catches smart quotes, ellipses, and arrows
+        // reintroduced anywhere in this output (a new catalog label, a new
+        // hint line, a "your GPU" heading), not just U+2014.
+        assert!(
+            rendered.is_ascii(),
+            "rocm model output must be ASCII-only; non-ASCII punctuation renders as \
+             mojibake on a Windows console using the OEM code page (ROCMAI-543): {rendered}"
+        );
+
         // Clean header: what the list is + the one action, no implementation jargon.
-        assert!(rendered.contains("Recommended models — run one with `rocm serve <model>`"));
+        assert!(rendered.contains("Recommended models - run one with `rocm serve <model>`"));
         // Featured current models are grouped under their hardware target, each
         // with the quant that fits a single GPU.
-        assert!(rendered.contains("AMD Ryzen AI — Strix Halo (Lemonade / llama.cpp)"));
-        assert!(rendered.contains("AMD Instinct — MI300X, MI350X, MI355X (vLLM)"));
+        assert!(rendered.contains("AMD Ryzen AI - Strix Halo (Lemonade / llama.cpp)"));
+        assert!(rendered.contains("AMD Instinct - MI300X, MI350X, MI355X (vLLM)"));
         // Strix Halo GGUF entries carry the servable owner/repo:variant ref.
         assert!(rendered.contains("unsloth/Qwen3.6-35B-A3B-GGUF:Q4_K_M"));
         assert!(rendered.contains("Q4_K_M GGUF"));
@@ -25708,7 +19697,7 @@ install therock";
         let header = model_catalog_header(&builtin);
         assert_eq!(
             header,
-            "Recommended models — run one with `rocm serve <model>`"
+            "Recommended models - run one with `rocm serve <model>`"
         );
         assert!(!header.contains("built-in"));
         assert!(!header.contains("fallback"));
@@ -25725,8 +19714,12 @@ install therock";
         };
         assert_eq!(
             model_catalog_header(&configured),
-            "Recommended models — from recipe index /etc/rocm/recipes.json"
+            "Recommended models - from recipe index /etc/rocm/recipes.json"
         );
+        // ROCMAI-543: both header variants are printed verbatim, so neither may
+        // carry non-ASCII punctuation that mojibakes on a Windows OEM code page.
+        assert!(model_catalog_header(&builtin).is_ascii());
+        assert!(model_catalog_header(&configured).is_ascii());
     }
 
     #[test]
@@ -25750,9 +19743,16 @@ install therock";
         assert!(rendered.contains("source: built-in recipe registry"));
         // Verbose keeps every recipe (including hidden ones) and annotates each
         // with its curated catalog placement.
-        assert!(rendered.contains("catalog: AMD Instinct — MI300X, MI350X, MI355X (vLLM)"));
+        assert!(rendered.contains("catalog: AMD Instinct - MI300X, MI350X, MI355X (vLLM)"));
         assert!(rendered.contains("catalog: hidden (resolvable via rocm serve"));
         assert!(rendered.contains("sshleifer/tiny-gpt2"));
+        // ROCMAI-543: `rocm model --verbose` output must stick to ASCII too, not
+        // only the default non-verbose listing.
+        assert!(
+            rendered.is_ascii(),
+            "rocm model --verbose output must be ASCII-only; non-ASCII punctuation renders \
+             as mojibake on a Windows console using the OEM code page (ROCMAI-543): {rendered}"
+        );
     }
 
     #[test]
@@ -26746,7 +20746,7 @@ install therock";
         // interactive target). Coercing to the fn pointer fails to compile if
         // the entrypoint is removed or its signature drifts; casting the pointer
         // to an address gives the binding a real effect (no underscore-bind).
-        let target: fn(bool, ChatInferenceParams) -> Result<()> = dash::run_chat;
+        let target: fn(bool, ChatInferenceParams, bool) -> Result<()> = dash::run_chat;
         assert_ne!(target as usize, 0);
     }
 
@@ -26819,11 +20819,11 @@ install therock";
         // The scriptable prompt passthrough stays on the text render path,
         // NOT the dash/TUI.
         assert!(
-            body.contains("render_chat_prompt_text("),
+            body.contains("chat::render_chat_prompt_text("),
             "prompt passthrough must still call render_chat_prompt_text; body:\n{body}"
         );
         assert!(
-            body.contains("render_chat_text("),
+            body.contains("chat::render_chat_text("),
             "non-interactive no-prompt path must still call render_chat_text; body:\n{body}"
         );
     }
@@ -26841,76 +20841,25 @@ install therock";
         let src = main_rs_source();
         let body = strip_line_comments(&command_chat_handler_body(&src));
         assert!(
-            body.contains("read_piped_prompt("),
+            body.contains("chat::read_piped_prompt("),
             "no-prompt path must read piped stdin via read_piped_prompt; body:\n{body}"
         );
         assert!(
-            body.contains("None => read_piped_prompt()?"),
+            body.contains("None => chat::read_piped_prompt()?"),
             "the piped read must supply the prompt that is dispatched (and \
              propagate its error), not be a discarded call; body:\n{body}"
         );
-        let read_at = body.find("read_piped_prompt(").expect("asserted above");
+        let read_at = body
+            .find("chat::read_piped_prompt(")
+            .expect("asserted above");
         let send_at = body
-            .find("render_chat_prompt_text(")
+            .find("chat::render_chat_prompt_text(")
             .unwrap_or_else(|| panic!("chat handler no longer sends a prompt; body:\n{body}"));
         assert!(
             read_at < send_at,
             "stdin must be read before the send/status-screen decision, or a \
              piped prompt cannot influence it; body:\n{body}"
         );
-    }
-
-    #[test]
-    fn piped_prompt_keeps_everything_but_the_trailing_line_ending() {
-        // A piped prompt must reach the send path byte-identical to the same
-        // text passed with `--prompt`, which is forwarded verbatim. Only the
-        // line ending the writer appends is dropped; indentation and trailing
-        // spaces or tabs are content and have to survive.
-        assert_eq!(
-            piped_prompt_from_input("    indented line\n"),
-            Some("    indented line".to_owned()),
-            "leading indentation must survive; only the trailing newline goes"
-        );
-        assert_eq!(
-            piped_prompt_from_input("trailing spaces matter   \n"),
-            Some("trailing spaces matter   ".to_owned()),
-            "trailing spaces must survive the trailing-newline strip"
-        );
-        assert_eq!(
-            piped_prompt_from_input("\tleading tab"),
-            Some("\tleading tab".to_owned()),
-            "input without a trailing newline must pass through unchanged"
-        );
-        assert_eq!(
-            piped_prompt_from_input("crlf line\r\n"),
-            Some("crlf line".to_owned()),
-            "a Windows line ending must be stripped as one unit"
-        );
-        assert_eq!(
-            piped_prompt_from_input("fn main() {\n    body\n}\n"),
-            Some("fn main() {\n    body\n}".to_owned()),
-            "interior newlines and indentation must survive"
-        );
-        assert_eq!(
-            piped_prompt_from_input("blank line below\n\n"),
-            Some("blank line below\n".to_owned()),
-            "only one trailing line ending is shell punctuation; the rest is content"
-        );
-    }
-
-    #[test]
-    fn piped_prompt_treats_whitespace_only_input_as_no_prompt() {
-        // The fallback that keeps the no-argument behavior intact: an empty
-        // pipe, a bare newline, or blank padding carries no prompt, so the
-        // caller must see `None` and render the status screen instead of
-        // sending whitespace to a model.
-        for input in ["", "\n", "\r\n", "   ", "  \t \n\n", "\n\n\n"] {
-            assert_eq!(
-                piped_prompt_from_input(input),
-                None,
-                "whitespace-only stdin must yield no prompt; input: {input:?}"
-            );
-        }
     }
 
     /// Hosts whose engine choice differs, so the assertion below is exercised on

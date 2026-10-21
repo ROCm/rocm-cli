@@ -87,6 +87,12 @@ SDK's own `+rocmX.Y` torch from. vLLM's discovery is independent of that: it
 resolves its own torch, torchvision, and torchaudio pins fresh from the row's
 own static version prefixes, instead of reusing what the SDK install resolved.
 The SDK install might have resolved a different torch version than the row pins.
+
+One value flows the other way. A row's exact torchaudio pin, where it has one
+instead of a series, is also the hardware-verified build `rocm install sdk` pins
+for that ROCm line. The install reads it from this table instead of copying it,
+so set an exact torchaudio only for a build confirmed on hardware.
+
 Patch and any dev or pre-release suffix are still ignored within a row, because
 AMD rotates those constantly.
 

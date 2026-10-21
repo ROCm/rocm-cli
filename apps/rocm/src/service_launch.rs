@@ -520,11 +520,13 @@ fn spawn_managed_engine_child(
         }
         child_pid
     };
-    record.supervisor_pid = child_pid;
-    record.engine_pid = Some(child_pid);
-    // Capture the identity token while the child is alive, so a later stop
-    // verifies this exact process rather than a recycled PID.
-    record.supervisor_start_ticks = rocm_core::process_start_ticks(child_pid);
+    // The child is both roles until the engine state file names a separate
+    // server process. Each role gets its own token, captured while the child is
+    // alive: a stop pairs every recorded PID with its own token, and the two
+    // PIDs diverge as soon as `rocmd` restarts the service — at which point an
+    // engine PID recorded without one could only be signalled blind.
+    record.record_supervisor_identity(child_pid);
+    record.record_engine_identity(child_pid);
     record.status = "running".to_owned();
     record.write()?;
 
@@ -674,7 +676,7 @@ fn render_endpoint_client_config(endpoint_url: &str, api_key: &str) -> String {
     let _ = writeln!(out, "  api key: {api_key}");
     let _ = writeln!(
         out,
-        "  note: this key is shown only now — clients must send `Authorization: Bearer <key>`"
+        "  note: this key is shown only now - clients must send `Authorization: Bearer <key>`"
     );
     let _ = writeln!(
         out,
@@ -940,7 +942,7 @@ pub(crate) fn run_attached_service(
         // codeql[rust/cleartext-logging]
         print!("{}", render_endpoint_client_config(&endpoint, key));
     }
-    println!("  streaming engine logs — Ctrl-D detaches (leaves it running), Ctrl-C stops it");
+    println!("  streaming engine logs - Ctrl-D detaches (leaves it running), Ctrl-C stops it");
     println!();
 
     let outcome = stream_attached_logs(&log_path, child_pid)?;
@@ -948,7 +950,7 @@ pub(crate) fn run_attached_service(
 
     match outcome {
         AttachOutcome::Detach => {
-            println!("detached — server still running");
+            println!("detached - server still running");
             println!("  service_id: {service_id}");
             println!("  endpoint: {endpoint}");
             println!("  list: rocm services");
@@ -965,7 +967,7 @@ pub(crate) fn run_attached_service(
             Ok(())
         }
         AttachOutcome::Stop => {
-            println!("stopping server…");
+            println!("stopping server...");
             match run_internal_sandbox_tool(
                 &paths,
                 SandboxToolArg::StopServer,

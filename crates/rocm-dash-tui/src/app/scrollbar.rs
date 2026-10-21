@@ -20,8 +20,8 @@ use super::{ActiveTab, AppState, Modal};
 
 /// Convert a displayed position to the target's own offset units. Dock logs are
 /// tail-anchored, so their displayed top-to-bottom position is inverted.
-fn target_offset(h: &ScrollbarHandle, displayed: usize) -> usize {
-    if h.target == ScrollTarget::DockLogs {
+const fn target_offset(h: &ScrollbarHandle, displayed: usize) -> usize {
+    if h.target.is_tail_anchored() {
         h.max_position().saturating_sub(displayed)
     } else {
         displayed
@@ -29,14 +29,17 @@ fn target_offset(h: &ScrollbarHandle, displayed: usize) -> usize {
 }
 
 fn target_position(state: &AppState, h: &ScrollbarHandle) -> usize {
-    let position = match h.target {
+    let raw = match h.target {
         ScrollTarget::Console => usize::from(state.console_scroll),
         ScrollTarget::ConsoleH => usize::from(state.console_hscroll),
         ScrollTarget::Chat => usize::from(state.chat_scroll),
-        ScrollTarget::DockLogs => h
-            .max_position()
-            .saturating_sub(usize::from(state.dock_logs_scroll)),
+        ScrollTarget::DockLogs => usize::from(state.dock_logs_scroll),
         ScrollTarget::InstanceDetail => usize::from(state.instance_detail_scroll),
+    };
+    let position = if h.target.is_tail_anchored() {
+        h.max_position().saturating_sub(raw)
+    } else {
+        raw
     };
     position.min(h.max_position())
 }
@@ -60,15 +63,17 @@ pub(crate) fn resolve_mouse(me: MouseEvent, state: &AppState) -> KeyAction {
     // A held drag on a scrollbar keeps updating that offset until release, even
     // when the pointer slides off the narrow track.
     if me.kind == MouseEventKind::Drag(MouseButton::Left) {
-        // A drag can start before an approval becomes pending (it's only
-        // gated at the click that starts it, via `scrollbar_hit`'s own
-        // `approval_pending()` check below) and then have an approval land
-        // asynchronously mid-drag. Swallow it here too, or the drag would
-        // keep mutating a scroll position hidden behind the approval modal —
-        // "a pending approval owns the body with no exception" (see the
-        // wheel-scroll swallow further down) applies to an in-flight drag
-        // just as much as to input that starts fresh.
-        if state.approval_pending() {
+        // A drag can start before an approval or quit-confirm prompt becomes
+        // pending (it's only gated at the click that starts it, via this same
+        // fn's own `blocks_body_absolutely()` check in the `Down` branch
+        // below — not inside `scrollbar_hit`, which has no gate of its own)
+        // and then have one land asynchronously mid-drag. Swallow it here too, or
+        // the drag would keep mutating a scroll position hidden behind the
+        // modal — "a pending approval owns the body with no exception" (see
+        // the wheel-scroll swallow further down) applies to an in-flight drag
+        // just as much as to input that starts fresh, and to the quit-confirm
+        // prompt the same way (issue #145).
+        if state.blocks_body_absolutely() {
             return KeyAction::Nothing;
         }
         if let Some(drag) = state.scroll_drag
@@ -98,15 +103,20 @@ pub(crate) fn resolve_mouse(me: MouseEvent, state: &AppState) -> KeyAction {
     }
 
     if me.kind == MouseEventKind::Down(MouseButton::Left) {
+        // A pending approval or quit-confirm prompt (issue #145) owns the
+        // body with no exception — including the tab bar and footer-legend
+        // chips below, not just the scrollbar track: neither modal registers
+        // any of the three for itself, so a hit on any of them belongs to
+        // content underneath it. Swallowing only the scrollbar check here
+        // once let a tab-bar click still land `SwitchTab` and change tabs
+        // behind the open prompt, bypassing it entirely (mirrors the
+        // wheel-scroll swallow further down).
+        if state.blocks_body_absolutely() {
+            return KeyAction::Nothing;
+        }
         // Scrollbar tracks win over a plain open overlay (incl. its console
-        // bar), so a click on the bar grabs it instead of falling through —
-        // but NOT over a pending approval: nothing registers a scrollbar for
-        // the approval modal itself, so any handle on screen while one is
-        // pending belongs to content underneath it, which the swallow below
-        // must still catch rather than let a scrollbar drag bypass it.
-        if !state.approval_pending()
-            && let Some(a) = scrollbar_hit(state, me.column, me.row)
-        {
+        // bar), so a click on the bar grabs it instead of falling through.
+        if let Some(a) = scrollbar_hit(state, me.column, me.row) {
             return a;
         }
         if let Some(area) = state.last_tab_bar_area
@@ -118,14 +128,16 @@ pub(crate) fn resolve_mouse(me: MouseEvent, state: &AppState) -> KeyAction {
         if let Some(chip) = footer_chip_hit(&state.last_footer_chips, me.column, me.row) {
             return chip;
         }
-        // While an operational manager is open — or a chat tool-call approval
-        // is pending — it owns the body: swallow body clicks so they can't
-        // fall THROUGH to the obscured Actions/Details list (which would
-        // silently change the selection, re-open a verb, or switch tabs
-        // underneath the approval modal). Tab-bar and footer-chip clicks
-        // above still work, matching the manager-overlay swallow this
-        // mirrors (see the analogous `overlay_or_approval()` check in
-        // ui/mod.rs's footer-chip gating).
+        // While an operational manager is open it owns the body: swallow body
+        // clicks so they can't fall THROUGH to the obscured Actions/Details
+        // list (which would silently change the selection or re-open a
+        // verb). The approval/quit-confirm half of `overlay_or_approval()`
+        // never actually reaches here — the `blocks_body_absolutely()` return
+        // above already caught it, tab bar and footer chips included — so by
+        // the time this check runs it has reduced to `has_open_overlay()`;
+        // written via `overlay_or_approval()` anyway so this can't silently
+        // drift from the manager-overlay swallow it mirrors (see the
+        // analogous check in ui/mod.rs's footer-chip gating).
         if state.overlay_or_approval() {
             return KeyAction::Nothing;
         }
@@ -162,10 +174,11 @@ pub(crate) fn resolve_mouse(me: MouseEvent, state: &AppState) -> KeyAction {
         _ => return KeyAction::Nothing,
     };
 
-    // A pending approval owns the body with no exception (mirrors the click
-    // swallow a few lines above) — unlike a plain manager overlay, it never
-    // has its own console to pan, so there is nothing to fall through to.
-    if state.approval_pending() {
+    // A pending approval or quit-confirm prompt (issue #145) owns the body
+    // with no exception (mirrors the click swallow a few lines above) —
+    // unlike a plain manager overlay, neither has its own console to pan, so
+    // there is nothing to fall through to.
+    if state.blocks_body_absolutely() {
         return KeyAction::Nothing;
     }
     // An open manager owns the body. When it is showing its job console, the
@@ -400,10 +413,12 @@ mod tests {
     use super::*;
     use ratatui::layout::Rect;
 
+    use super::super::test_support::st;
+
     #[test]
     fn body_clicks_are_swallowed_while_a_manager_is_open() {
         use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         s.active_tab = ActiveTab::Rocm;
         s.last_body_area = Some(Rect::new(2, 4, 150, 30));
         let click = MouseEvent {
@@ -422,7 +437,7 @@ mod tests {
     #[test]
     fn body_clicks_are_swallowed_while_an_approval_is_pending() {
         use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         s.active_tab = ActiveTab::Rocm;
         s.last_body_area = Some(Rect::new(2, 4, 150, 30));
         let click = MouseEvent {
@@ -458,6 +473,24 @@ mod tests {
         }
     }
 
+    /// The one `AppState` field each `ScrollTarget` variant owns, read
+    /// directly (no inversion) — the canonical oracle every test that needs
+    /// "whatever field this target writes/reads" should call, instead of
+    /// re-deriving it with an ad hoc `if target == ScrollTarget::Foo` that
+    /// only distinguishes the couple of variants that one test happens to
+    /// exercise. An exhaustive `match`, no wildcard arm: see
+    /// `scroll_target_variants_round_trip_through_dispatch`'s doc comment for
+    /// why that matters.
+    fn canonical_field(state: &AppState, target: ScrollTarget) -> usize {
+        match target {
+            ScrollTarget::Console => usize::from(state.console_scroll),
+            ScrollTarget::ConsoleH => usize::from(state.console_hscroll),
+            ScrollTarget::Chat => usize::from(state.chat_scroll),
+            ScrollTarget::DockLogs => usize::from(state.dock_logs_scroll),
+            ScrollTarget::InstanceDetail => usize::from(state.instance_detail_scroll),
+        }
+    }
+
     #[test]
     fn scrollbar_position_maps_proportionally() {
         let h = ScrollbarHandle {
@@ -475,7 +508,7 @@ mod tests {
 
     #[test]
     fn scrollbar_click_grabs_drag_scrolls_then_releases() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         s.scrollbars.borrow_mut().push(ScrollbarHandle {
             track: Rect::new(60, 0, 1, 10),
             horizontal: false,
@@ -512,7 +545,7 @@ mod tests {
 
     #[test]
     fn scrollbar_hit_is_swallowed_while_an_approval_is_pending() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         s.scrollbars.borrow_mut().push(ScrollbarHandle {
             track: Rect::new(60, 0, 1, 10),
             horizontal: false,
@@ -541,6 +574,68 @@ mod tests {
     }
 
     #[test]
+    fn scrollbar_hit_is_swallowed_while_quit_confirm_is_pending() {
+        // Issue #145: the quit-confirm prompt owns the body the same way an
+        // approval does — this is the same scenario as
+        // `scrollbar_hit_is_swallowed_while_an_approval_is_pending` with the
+        // other gate.
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.scrollbars.borrow_mut().push(ScrollbarHandle {
+            track: Rect::new(60, 0, 1, 10),
+            horizontal: false,
+            content_len: 100,
+            viewport_len: 10,
+            target: ScrollTarget::Console,
+        });
+        let click = wheel(MouseEventKind::Down(MouseButton::Left), 60, 9);
+        assert_eq!(
+            resolve_mouse(click, &s),
+            KeyAction::ScrollGrab(ScrollTarget::Console, 90, 0)
+        );
+        s.open_quit_confirm();
+        assert_eq!(resolve_mouse(click, &s), KeyAction::Nothing);
+    }
+
+    #[test]
+    fn tab_bar_click_is_swallowed_while_quit_confirm_is_pending() {
+        // A click on the tab bar was never gated by `blocks_body_absolutely()`
+        // the way the scrollbar check above is — it still resolved to
+        // `SwitchTab` and `apply_action` applied it, changing tabs/focus
+        // behind the open quit-confirm prompt (issue #145).
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.last_tab_bar_area = Some(Rect::new(0, 0, 80, 1));
+        let click = wheel(MouseEventKind::Down(MouseButton::Left), 15, 0);
+        assert_eq!(
+            resolve_mouse(click, &s),
+            KeyAction::SwitchTab(ActiveTab::Rocm)
+        );
+        s.open_quit_confirm();
+        assert_eq!(resolve_mouse(click, &s), KeyAction::Nothing);
+    }
+
+    #[test]
+    fn tab_bar_click_is_swallowed_while_an_approval_is_pending() {
+        // Twin of the quit-confirm case above: `blocks_body_absolutely()` is
+        // `approval_pending() || quit_confirm_pending()`, so the same gap
+        // applied to a pending chat-tool-call approval too, not just
+        // quit-confirm — the fix is the same one `if` for both.
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.last_tab_bar_area = Some(Rect::new(0, 0, 80, 1));
+        let click = wheel(MouseEventKind::Down(MouseButton::Left), 15, 0);
+        assert_eq!(
+            resolve_mouse(click, &s),
+            KeyAction::SwitchTab(ActiveTab::Rocm)
+        );
+        s.open_approval(crate::tool_exec::ApprovalIntent {
+            title: "run a command".into(),
+            body: vec!["echo hi".into()],
+            name: "shell".into(),
+            arguments: serde_json::Value::Null,
+        });
+        assert_eq!(resolve_mouse(click, &s), KeyAction::Nothing);
+    }
+
+    #[test]
     fn drag_is_swallowed_once_an_approval_becomes_pending_mid_drag() {
         // A drag can only start while no approval is pending (the click that
         // starts it goes through `scrollbar_hit`, which is itself gated), but
@@ -549,7 +644,7 @@ mod tests {
         // updating the scroll position once that happens — "a pending
         // approval owns the body with no exception" applies to an in-flight
         // drag, not just to input that starts fresh.
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         s.scrollbars.borrow_mut().push(ScrollbarHandle {
             track: Rect::new(60, 0, 1, 10),
             horizontal: false,
@@ -579,12 +674,38 @@ mod tests {
     }
 
     #[test]
+    fn drag_is_swallowed_once_quit_confirm_becomes_pending_mid_drag() {
+        // Issue #145 counterpart to `drag_is_swallowed_once_an_approval_becomes_pending_mid_drag`.
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.scrollbars.borrow_mut().push(ScrollbarHandle {
+            track: Rect::new(60, 0, 1, 10),
+            horizontal: false,
+            content_len: 100,
+            viewport_len: 10,
+            target: ScrollTarget::Console,
+        });
+        let down = wheel(MouseEventKind::Down(MouseButton::Left), 60, 9);
+        let a = resolve_mouse(down, &s);
+        apply_action(&mut s, a);
+        assert!(s.scroll_drag.is_some(), "drag must have started");
+
+        s.open_quit_confirm();
+
+        let drag = wheel(MouseEventKind::Drag(MouseButton::Left), 40, 0);
+        assert_eq!(
+            resolve_mouse(drag, &s),
+            KeyAction::Nothing,
+            "a drag in flight when quit-confirm becomes pending must be swallowed"
+        );
+    }
+
+    #[test]
     fn rendered_thumb_cells_are_grabbable() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
 
         for horizontal in [false, true] {
-            let mut s = AppState::new("t".into(), "default-dark".into());
+            let mut s = st();
             let area = if horizontal {
                 Rect::new(0, 0, 4, 2)
             } else {
@@ -665,7 +786,7 @@ mod tests {
     #[test]
     fn stationary_thumb_drag_preserves_logical_position() {
         for target in [ScrollTarget::Console, ScrollTarget::DockLogs] {
-            let mut s = AppState::new("t".into(), "default-dark".into());
+            let mut s = st();
             s.console_scroll = 5;
             s.dock_logs_scroll = 5;
             s.scrollbars.borrow_mut().push(ScrollbarHandle {
@@ -678,26 +799,18 @@ mod tests {
             let down = wheel(MouseEventKind::Down(MouseButton::Left), 60, 4);
             let action = resolve_mouse(down, &s);
             apply_action(&mut s, action);
-            let before = if target == ScrollTarget::DockLogs {
-                s.dock_logs_scroll
-            } else {
-                s.console_scroll
-            };
+            let before = canonical_field(&s, target);
             let drag = wheel(MouseEventKind::Drag(MouseButton::Left), 60, 4);
             let action = resolve_mouse(drag, &s);
             apply_action(&mut s, action);
-            let after = if target == ScrollTarget::DockLogs {
-                s.dock_logs_scroll
-            } else {
-                s.console_scroll
-            };
+            let after = canonical_field(&s, target);
             assert_eq!(after, before, "stationary {target:?} drag moved");
         }
     }
 
     #[test]
     fn horizontal_thumb_drag_tracks_pointer_column() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         s.console_hscroll = 20;
         s.scrollbars.borrow_mut().push(ScrollbarHandle {
             track: Rect::new(10, 20, 20, 1),
@@ -716,7 +829,7 @@ mod tests {
 
     #[test]
     fn dock_scrollbar_grab_inverts_tail_anchored_offset() {
-        let s = AppState::new("t".into(), "default-dark".into());
+        let s = st();
         s.scrollbars.borrow_mut().push(ScrollbarHandle {
             track: Rect::new(0, 0, 1, 10),
             horizontal: false,
@@ -734,7 +847,7 @@ mod tests {
 
     #[test]
     fn wheel_over_actions_list_moves_selection_by_one() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         s.active_tab = ActiveTab::Rocm;
         s.last_body_area = Some(Rect::new(2, 4, 150, 30));
         // Left column (Actions) is the first ~46% — a low column is over the list.
@@ -746,7 +859,7 @@ mod tests {
 
     #[test]
     fn wheel_over_details_pane_does_not_move_the_list() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         s.active_tab = ActiveTab::Serving;
         s.last_body_area = Some(Rect::new(2, 4, 150, 30));
         // A high column lands in the Details pane (right ~54%) → no list move.
@@ -756,7 +869,7 @@ mod tests {
 
     #[test]
     fn wheel_over_open_console_pans_the_log_not_the_list() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         s.active_tab = ActiveTab::Rocm;
         s.last_body_area = Some(Rect::new(2, 4, 150, 30));
         s.logs_view = Some(crate::ui::logs_view::LogsViewState {
@@ -777,7 +890,7 @@ mod tests {
 
     #[test]
     fn wheel_over_logs_dock_scrolls_the_dock() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         s.active_tab = ActiveTab::Serving;
         // A recorded dock rect off to the right of the body.
         s.last_dock_area = Some(Rect::new(160, 4, 52, 30));
@@ -797,7 +910,7 @@ mod tests {
         // `ScrollTarget::InstanceDetail` wiring added for mouse-drag support
         // actually moves `instance_detail_scroll`, not just that the bar
         // renders.
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         s.scrollbars.borrow_mut().push(ScrollbarHandle {
             track: Rect::new(60, 0, 1, 10),
             horizontal: false,
@@ -827,7 +940,7 @@ mod tests {
 
     #[test]
     fn wheel_over_form_screen_overlay_is_swallowed() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         s.active_tab = ActiveTab::Rocm;
         s.last_body_area = Some(Rect::new(2, 4, 150, 30));
         // Overlay open but on its form (no active_job) → nothing to pan, and the
@@ -841,7 +954,7 @@ mod tests {
 
     #[test]
     fn wheel_is_swallowed_while_an_approval_is_pending() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         s.active_tab = ActiveTab::Rocm;
         s.last_body_area = Some(Rect::new(2, 4, 150, 30));
         s.open_approval(crate::tool_exec::ApprovalIntent {
@@ -855,6 +968,20 @@ mod tests {
         // instead of falling through to whatever's obscured underneath, the
         // same gap the click path was already fixed for (see
         // `body_clicks_are_swallowed_while_an_approval_is_pending`).
+        assert!(!s.has_open_overlay());
+        assert_eq!(
+            resolve_mouse(wheel(MouseEventKind::ScrollDown, 10, 12), &s),
+            KeyAction::Nothing
+        );
+    }
+
+    #[test]
+    fn wheel_is_swallowed_while_quit_confirm_is_pending() {
+        // Issue #145 counterpart to `wheel_is_swallowed_while_an_approval_is_pending`.
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.active_tab = ActiveTab::Rocm;
+        s.last_body_area = Some(Rect::new(2, 4, 150, 30));
+        s.open_quit_confirm();
         assert!(!s.has_open_overlay());
         assert_eq!(
             resolve_mouse(wheel(MouseEventKind::ScrollDown, 10, 12), &s),
@@ -889,7 +1016,7 @@ mod tests {
 
     #[test]
     fn chat_scrollbar_grab_updates_follow_state() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         s.chat_max_scroll = 20;
         s.chat_scroll = 20;
 
@@ -900,5 +1027,71 @@ mod tests {
         s.apply_scroll_grab(ScrollTarget::Chat, 20, 0);
         assert_eq!(s.chat_scroll, 20);
         assert!(s.chat_follow, "dragging to the bottom restores follow");
+    }
+
+    /// Issue #645 (ROCMAI-483 residual risk): `target_position` (this file,
+    /// reads the current offset) and `apply_scroll_grab` (`mod.rs`, writes a
+    /// new one) each `match` exhaustively over `ScrollTarget`, so the
+    /// compiler already forces a new arm in both the moment a variant is
+    /// added. That proves nothing about whether the two arms *agree* — a
+    /// typo'd field in one arm still compiles as long as its own match is
+    /// exhaustive. This test binds both sides to the one canonical
+    /// field-per-variant table, `canonical_field` (above, shared with
+    /// `stationary_thumb_drag_preserves_logical_position`), which is itself
+    /// an exhaustive `match` with no wildcard arm: adding a `ScrollTarget`
+    /// variant without adding a case there fails to compile. Iterates
+    /// `ScrollTarget::ALL` rather than its own copy of the variant list — see
+    /// that const's doc comment for why it's a convention, not a second
+    /// compiler guarantee, and why having one shared list beats each call
+    /// site re-typing (and risking drifting) its own.
+    #[test]
+    fn scroll_target_variants_round_trip_through_dispatch() {
+        const POS: usize = 7;
+        // Large enough that `max_position()` (`content_len - viewport_len`)
+        // comfortably exceeds `POS`, so `DockLogs`'s inversion in
+        // `target_position` doesn't saturate the subtraction to 0.
+        const CONTENT_LEN: usize = 100;
+        const VIEWPORT_LEN: usize = 10;
+
+        for target in ScrollTarget::ALL {
+            let mut s = AppState::new("t".into(), "default-dark".into());
+            // Chat's write is clamped to `chat_max_scroll` (default 0); every
+            // other target's field is an unclamped raw offset.
+            s.chat_max_scroll = u16::try_from(POS).unwrap();
+
+            // Write side: through the real dispatch path (`actions.rs`'s
+            // `KeyAction::ScrollGrab` arm → `apply_scroll_grab`), not a
+            // direct call — a future special case added only in `actions.rs`
+            // would otherwise go unexercised.
+            apply_action(&mut s, KeyAction::ScrollGrab(target, POS, 0));
+            assert_eq!(
+                canonical_field(&s, target),
+                POS,
+                "ScrollGrab({target:?}, {POS}, _) through apply_action didn't \
+                 reach the field this test treats as canonical for it"
+            );
+
+            // Read side: `target_position` must report back the same
+            // position it was just given, undoing `DockLogs`'s tail-anchored
+            // inversion for everything else and applying it for `DockLogs`.
+            let h = ScrollbarHandle {
+                track: Rect::new(0, 0, 1, 1),
+                horizontal: false,
+                content_len: CONTENT_LEN,
+                viewport_len: VIEWPORT_LEN,
+                target,
+            };
+            let expected_displayed = if target.is_tail_anchored() {
+                h.max_position().saturating_sub(POS)
+            } else {
+                POS
+            };
+            assert_eq!(
+                target_position(&s, &h),
+                expected_displayed,
+                "target_position({target:?}) disagreed with the field \
+                 apply_scroll_grab just wrote for it"
+            );
+        }
     }
 }

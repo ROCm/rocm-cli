@@ -44,11 +44,17 @@ pub fn run(artifacts_dir: &Path, html_out: &Path) -> Result<()> {
         event: std::env::var("GITHUB_EVENT_NAME").ok(),
     };
 
-    e2e_report::generate_consolidated(&inputs, html_out, &meta)
+    // Builds the shared `PlatformReports` bundle once for both outputs below
+    // (ROCMAI-484); see `generate_consolidated`'s and
+    // `consolidated_summary_markdown`'s docs for what each output still uses
+    // `inputs` for independently of the parsed reports.
+    let bundle = e2e_report::load_platform_reports(&inputs);
+
+    e2e_report::generate_consolidated(&bundle, html_out, &meta)
         .with_context(|| format!("writing consolidated report to {}", html_out.display()))?;
 
     // Printed to stdout so CI can redirect it into $GITHUB_STEP_SUMMARY.
-    print!("{}", e2e_report::consolidated_summary_markdown(&inputs));
+    print!("{}", e2e_report::consolidated_summary_markdown(&bundle));
 
     eprintln!(
         "Consolidated {} platform report(s) -> {}",
@@ -133,6 +139,10 @@ fn label_for_root_report(dir: &Path) -> String {
         Some("mi300x") => "e2e-gpu-report".to_owned(),
         Some("gfx1201") => "e2e-gpu-rad3-report".to_owned(),
         Some("mi350p") => "e2e-gpu-mi350p-report".to_owned(),
+        // Like gfx1201 above, gfx1100 has no product-name mapping in
+        // `platform_hardware_slug` — the raw gfx target IS the slug — so the
+        // sidecar carries `gfx1100` for the W7900 lane.
+        Some("gfx1100") => "e2e-gpu-w7900-report".to_owned(),
         Some("strix-halo-linux") => "e2e-gpu-strix-ubuntu-report".to_owned(),
         Some("strix-halo-windows") => "e2e-gpu-strix-windows-report".to_owned(),
         // This workflow is statically pinned to the Strix WSL runner. A bare
@@ -197,14 +207,33 @@ mod tests {
     /// `parse_descriptor` maps it to Unknown/Unknown precisely so it escapes the
     /// Linux default. No workflow can name it, so a workflow that did would be
     /// claiming an identity it has no business asserting.
+    ///
+    /// The `-n-1`/`-n-2` entries are the non-`current` legs of the self-hosted
+    /// `sdk_version` matrix (ROCMAI-430): each per-PR GPU job in
+    /// `e2e-selfhosted.yml` uploads those legs under a distinct name so they
+    /// don't collide with the `current` leg, whose name is left exactly as it
+    /// was before the matrix existed. `rad3`/`mi350p` are nightly-only lanes
+    /// (ROCMAI-125) and don't run the matrix, so they have no `-n-1`/`-n-2`
+    /// entries.
     const CANONICAL_REPORT_ARTIFACTS: &[&str] = &[
         "e2e-report",
         "e2e-gpu-report",
+        "e2e-gpu-n-1-report",
+        "e2e-gpu-n-2-report",
         "e2e-gpu-rad3-report",
         "e2e-gpu-mi350p-report",
+        "e2e-gpu-w7900-report",
+        "e2e-gpu-w7900-n-1-report",
+        "e2e-gpu-w7900-n-2-report",
         "e2e-gpu-strix-ubuntu-report",
+        "e2e-gpu-strix-ubuntu-n-1-report",
+        "e2e-gpu-strix-ubuntu-n-2-report",
         "e2e-gpu-strix-windows-report",
+        "e2e-gpu-strix-windows-n-1-report",
+        "e2e-gpu-strix-windows-n-2-report",
         "e2e-gpu-strix-wsl-report",
+        "e2e-gpu-strix-wsl-n-1-report",
+        "e2e-gpu-strix-wsl-n-2-report",
     ];
 
     /// Every workflow in `.github/workflows`, so a new one cannot upload under a
@@ -266,6 +295,11 @@ mod tests {
         // skips (e.g. rad3, mi350p -- ROCMAI-125). If a per-PR platform ever
         // stopped running nightly, the nightly grid would be silently
         // comparing different hardware than the PR grid.
+        //
+        // Nightly doesn't run the sdk_version matrix (ROCMAI-430) — it has its
+        // own breadth-over-versions tradeoff — so strip the `-n-1`/`-n-2` legs
+        // before comparing; the `current` leg's name is unaffected by the matrix
+        // and must still match nightly's.
         let lanes = |file: &str| {
             let names = uploaded_e2e_artifacts(
                 &Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -279,6 +313,17 @@ mod tests {
                 .filter(|n| !n.starts_with("e2e-consolidated-report"))
                 .map(|n| without_channel_matrix_segment(&n))
                 .collect();
+            // Nightly doesn't run the sdk_version matrix (ROCMAI-430) -- it has
+            // its own breadth-over-versions tradeoff -- so strip the `-n-1`/
+            // `-n-2` legs before comparing; the `current` leg's name is
+            // unaffected by the matrix and must still match nightly's.
+            for suffix in ["-n-1-report", "-n-2-report"] {
+                for name in &mut names {
+                    if let Some(rest) = name.strip_suffix(suffix) {
+                        *name = format!("{rest}-report");
+                    }
+                }
+            }
             names.sort();
             // Each lane's `name:` line appears once in the workflow source with
             // the literal `${{ matrix.channel }}` template (this scan does not
@@ -338,6 +383,7 @@ mod tests {
             ("mi300x", "e2e-gpu-report"),
             ("gfx1201", "e2e-gpu-rad3-report"),
             ("mi350p", "e2e-gpu-mi350p-report"),
+            ("gfx1100", "e2e-gpu-w7900-report"),
             ("strix-halo-linux", "e2e-gpu-strix-ubuntu-report"),
             ("strix-halo-windows", "e2e-gpu-strix-windows-report"),
             ("strix-halo-wsl", "e2e-gpu-strix-wsl-report"),

@@ -275,3 +275,156 @@ Feature: GPU detection and system inspection
     Given a managed runtime is active
     When the user inspects the system in machine-readable form
     Then the inspection attributes a code object manager library to that runtime
+
+  # The distro fields are read from `/etc/os-release` as `sh` reads it (see
+  # `rocm_core::os_release`). These plant the file under a simulated host root
+  # (`ROCM_CLI_TEST_HOST_ROOT`, honoured only by the `e2e-test-hooks` build that
+  # `cargo xtask e2e` and every prebuilt full-suite lane use), so they describe a
+  # machine other than the runner. The driver plan cannot be exercised this way:
+  # `rocm install driver` builds a plan that runs against the real machine, so it
+  # deliberately reads the real `/etc/os-release` (see `real_os_release`); its
+  # parsing is covered by the unit tests in `driver_install.rs`.
+  #
+  # The planted distributions are ones no CI runner or developer host here runs,
+  # so a probe that read the real file instead would report a different one.
+  #
+  # `@requires-os:linux` because only the Linux probe reads `/etc/os-release`.
+  # On WSL the planted root holds no WSL signals, so the inspection reads the
+  # planted file the same way there.
+  @id:examine-reads-single-quoted-os-release @requires-os:linux
+  Scenario: examine-20 - The inspection names a distribution whose release file uses single quotes
+    Given a machine whose release file quotes every value in single quotes
+    When the user inspects that machine in machine-readable form
+    Then the inspection reports the distribution "rhel" version "9.4" named "Red Hat Enterprise Linux 9.4 (Plow)"
+    And the inspection reports no trouble reading the release file
+
+  @id:examine-reads-last-os-release-assignment @requires-os:linux
+  Scenario: examine-21 - The inspection names the distribution a repeated release-file entry ends on
+    Given a machine whose release file names one distribution and then another
+    When the user inspects that machine in machine-readable form
+    Then the inspection reports the distribution "rocky" version "9.5" named "Rocky Linux 9.5 (Blue Onyx)"
+    And the inspection reports no trouble reading the release file
+
+  @id:examine-reports-unreadable-os-release @requires-os:linux
+  Scenario: examine-22 - The inspection says which line of an unreadable release file it could not read
+    Given a machine whose release file runs a command on line 3
+    When the user inspects that machine in machine-readable form
+    Then the inspection reports no distribution
+    And the inspection says line 3 of the release file is not a plain assignment, in its failures and in the distribution name
+
+  # The verdict needs a GPU to degrade from: without one it is `no-amd-gpu`
+  # whatever the release file says. The planted root supplies one through the
+  # kernel topology (a KFD node, which the topology probe reads under the
+  # simulated root), and a stand-in `lspci` on PATH reports an empty PCI bus so a
+  # runner without `lspci` does not add a failure of its own. A real GPU's
+  # `lspci` entry would not match the planted node's address either way. So this
+  # runs on every Linux lane, GPU or not, and the release file is the only thing
+  # that can degrade the verdict.
+  @id:examine-degrades-on-unreadable-os-release @requires-os:linux
+  Scenario: examine-23 - An unreadable release file degrades the verdict on a machine with a GPU
+    Given a GPU machine whose release file runs a command on line 3
+    When the user inspects that machine in machine-readable form
+    Then the inspection's verdict is degraded, and its only failure is line 3 of the release file
+
+  # ROCMAI-448. `rocmd` captured child output by waiting for the child to exit
+  # and only then draining its pipes, so a child that wrote more than one OS
+  # pipe buffer (~64KiB) blocked in `write`, never exited, and was killed at the
+  # timeout. The probe runs under a 2s budget, so on a multi-GPU host -- where
+  # `amd-smi static -a -g all --json` comfortably clears that buffer -- GPU
+  # telemetry reported `amd_smi_available: false`, permanently, with a note
+  # reading `failed to launch amd-smi static -a -g all --json`. The note blamed
+  # the launch rather than the timeout that actually happened, because
+  # `gather_gpu_snapshot` rendered only the outermost context; it now uses
+  # `{error:#}` and carries the cause. That answer feeds `rocmd
+  # bridge-snapshot`, the `gpu_snapshot` and `bridge_snapshot` MCP tools, and
+  # the automation watcher. (Not `examine_snapshot`: that sandbox tool returns
+  # an `ExamineSummary` only and never reads this snapshot.)
+  #
+  # The size of the output is the whole premise, so the stub emits ~203KiB --
+  # over three buffers. A stub that printed a few hundred bytes would pass
+  # against the defect and test nothing.
+  #
+  # No GPU needed, and deliberately so: the symptom needs a multi-GPU host to
+  # occur naturally, which would strand this on a lane that does not run per-PR.
+  # A stub `amd-smi` on `PATH` reaches the same code, but only because the step
+  # also points `HOME` at the isolated root. `resolve_amd_smi_binary` tries
+  # `default_data_dir()/runtimes/registry` and then the home fallbacks, and both
+  # resolve through `runtime_home_dir()` -- the real `$HOME`. `isolate_env` does
+  # set `ROCM_CLI_DATA_DIR`, but that does not redirect any of this:
+  # `default_data_dir()` never reads that variable. Without the overridden
+  # `HOME`, a host with a managed SDK under `~/.rocm` would run the real
+  # `amd-smi` and this scenario would fail for an unrelated reason.
+  # Linux-only because the stub is a shell script.
+  @id:examine-telemetry-survives-large-amd-smi-output @requires-os:linux
+  Scenario: examine-24 - GPU telemetry survives an amd-smi that outruns the pipe buffer
+    Given amd-smi reports more output than a pipe buffer holds
+    When the daemon gathers a bridge snapshot
+    Then the snapshot reports amd-smi as available and carries every GPU it described
+
+  # The other side of examine-24's note, and the reason the note needs a size
+  # limit. When the probe really does time out, `{error:#}` renders the whole
+  # chain -- including `run_with_timeout`'s quote of what the child printed.
+  # With an amd-smi that prints a snapshot's worth of JSON and only then
+  # stalls, that quote is the entire payload, and the note is not a terminal
+  # message: `record_gpu_metrics` copies it into the automation-event and audit
+  # JSONL files every 60s, and both append helpers rewrite the whole file each
+  # time. Unbounded, the logs grew by the payload's size every minute and each
+  # write cost more than the last. So the note must name the timeout, keep
+  # enough of the child's output to be worth reading, say that it was shortened
+  # -- and stay small.
+  #
+  # Asserted here rather than only as a unit test because the note's journey is
+  # the point: the bound lives in `rocm-core`'s `run_with_timeout` and the
+  # claim being made is about what `rocmd` finally reports.
+  #
+  # Same stub mechanics and the same `HOME` caveat as examine-24 above.
+  @id:examine-telemetry-note-is-bounded-when-amd-smi-stalls @requires-os:linux
+  Scenario: examine-25 - A stalled amd-smi leaves a bounded note that names the timeout
+    Given amd-smi prints more than a pipe buffer holds and then stalls
+    When the daemon gathers a bridge snapshot
+    Then the snapshot reports amd-smi as unavailable with a bounded note naming the timeout
+
+  # The snapshot asks amd-smi twice -- `static`, then `monitor` -- and reports
+  # the first failure it meets. examine-25 covers a `static` that stalls, which
+  # returns before `monitor` is ever run; this is the other branch, and it is
+  # the one a real multi-GPU host hits more often, because `monitor -g all`
+  # carries per-GPU telemetry for every device.
+  #
+  # The result is a half-degraded snapshot rather than an absent one: amd-smi
+  # answered, so it is available and its `static` data stands; only the second
+  # probe is missing, and the note is the sole record of why. That note goes to
+  # the same automation and audit logs on the same 60s cycle, so it needs the
+  # same bound and the same account of the cause -- naming the launch alone
+  # would send a reader looking for a missing binary.
+  #
+  # Same stub mechanics and the same `HOME` caveat as examine-24 above, except
+  # that the stub answers the two probes differently.
+  @id:examine-telemetry-note-names-the-stalled-monitor-probe @requires-os:linux
+  Scenario: examine-26 - A stalled monitor probe keeps the static data and explains itself
+    Given amd-smi answers the first probe and then stalls on the second
+    When the daemon gathers a bridge snapshot
+    Then the snapshot keeps the first probe's GPUs and explains the second with a bounded note naming the timeout
+
+  # `os-release(5)` says to read `/etc/os-release` and, if it does not exist,
+  # fall back to `/usr/lib/os-release`. This plants a simulated host root with
+  # only the fallback path populated, so a reader that stopped after the first
+  # candidate would see no file at all and report an unknown distribution.
+  @id:examine-falls-back-to-usr-lib-os-release @requires-os:linux
+  Scenario: examine-27 - The inspection falls back to /usr/lib/os-release when /etc/os-release is absent
+    Given a machine whose release file exists only at /usr/lib/os-release
+    When the user inspects that machine in machine-readable form
+    Then the inspection reports the distribution "ubuntu" version "24.04" named "Ubuntu 24.04 LTS"
+    And the inspection reports no trouble reading the release file
+
+  # Before this change, a release file that exists but cannot be read (not
+  # absent, so no fallback candidate is tried either) silently produced an
+  # empty, unreported distro with no failure recorded. It now reports the
+  # file as itself, distinctly from both an unknown distribution and a
+  # malformed line it never reached. A directory in place of the file is a
+  # non-`NotFound` read error that needs no root privilege, unlike a
+  # mode-000 file, which CI running as root would read anyway.
+  @id:examine-degrades-on-unreadable-release-file @requires-os:linux
+  Scenario: examine-28 - An unreadable release file degrades the verdict on a machine with a GPU
+    Given a GPU machine whose release file cannot be read
+    When the user inspects that machine in machine-readable form
+    Then the inspection's verdict is degraded, and its only failure says the release file could not be read

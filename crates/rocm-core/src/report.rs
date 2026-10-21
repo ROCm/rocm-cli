@@ -616,6 +616,9 @@ mod tests {
             rocm_path: "/SENTINEL-PATH/rocm".to_owned(),
             kernel_cmdline: "SENTINEL-CMDLINE".to_owned(),
             hip_sdk_path: "C:/SENTINEL-PATH".to_owned(),
+            // A real shape with a marker in the tail. The runtime version is not
+            // an approved report field: it narrows toward one machine.
+            msvc_redist_version: "14.29.SENTINEL-RUNTIME".to_owned(),
             cpu_model: "SENTINEL-CPU".to_owned(),
             distro_id: "SENTINEL-DISTRO".to_owned(),
             rocminfo_status: "SENTINEL-ERROR-TEXT".to_owned(),
@@ -654,6 +657,7 @@ mod tests {
         "SENTINEL-PCI",
         "SENTINEL-ROCM-BUILD",
         "SENTINEL-ENGINE-BUILD",
+        "SENTINEL-RUNTIME",
     ];
 
     /// An architecture no product will ever have.

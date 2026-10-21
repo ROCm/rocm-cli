@@ -25,7 +25,7 @@ use rocm_core::{AppPaths, ExamineSummary, shell_command_for_host};
 use serde::{Deserialize, Serialize};
 
 use crate::cli_report;
-use crate::runtime_install_finalize::{empty_as_unknown, parse_os_release_field, read_os_release};
+use crate::runtime_install_finalize::{empty_as_unknown, real_os_release};
 
 pub(crate) fn install_driver(
     paths: &AppPaths,
@@ -35,11 +35,11 @@ pub(crate) fn install_driver(
 ) -> std::result::Result<DriverInstallResult, DriverInstallError> {
     let examine =
         ExamineSummary::gather().map_err(|source| DriverInstallError::new(source, false))?;
-    let os_release = read_os_release().unwrap_or_default();
+    let os_release = real_os_release();
     // The only place the real privilege level is read; every builder below takes
     // it as a parameter so both branches stay testable on any host.
     let plan =
-        build_driver_install_plan(&examine, &os_release, dkms, PrivilegeEscalation::detect());
+        build_driver_install_plan_read(&examine, &os_release, dkms, PrivilegeEscalation::detect());
     let mut output = render_driver_install_plan(&plan, yes, dry_run);
     if !yes || dry_run || !plan.supported || !plan.mutating {
         return Ok(DriverInstallResult {
@@ -798,8 +798,36 @@ fn wsl_rocdxg_driver_plan(escalation: PrivilegeEscalation) -> DriverInstallPlan 
     }
 }
 
-fn build_driver_install_plan(
+/// The plan for a release file that cannot be read as a distro at all — a
+/// malformed line ([`build_driver_install_plan_at`]'s own early return) or a
+/// file that exists but could not be read
+/// ([`build_driver_install_plan_read`]'s `Unreadable` branch). Both name
+/// `reason`, never a distro, and differ only in it: shared here, including
+/// `repo_version`'s own resolution, so a new early branch — or a bumped
+/// default — added to one is not silently absent from the other.
+fn unreadable_os_release_plan(reason: String) -> DriverInstallPlan {
+    DriverInstallPlan {
+        supported: false,
+        mutating: false,
+        policy: "unreadable_os_release".to_owned(),
+        os_id: String::new(),
+        version_id: String::new(),
+        codename: String::new(),
+        repo_version: resolve_shell_default_template("${ROCM_CLI_AMDGPU_VERSION:-7.2.4}"),
+        reason,
+        preflight_checks: Vec::new(),
+        commands: Vec::new(),
+        checks: vec!["rocm examine".to_owned()],
+        reboot_required: false,
+    }
+}
+
+/// The driver install plan for `examine` and the os-release `os_release_text`
+/// read from `os_release_path`, naming that path in any unreadable-line
+/// message.
+fn build_driver_install_plan_at(
     examine: &ExamineSummary,
+    os_release_path: &str,
     os_release_text: &str,
     dkms: bool,
     escalation: PrivilegeEscalation,
@@ -835,13 +863,27 @@ fn build_driver_install_plan(
         return wsl_rocdxg_driver_plan(escalation);
     }
 
-    let os_id = parse_os_release_field(os_release_text, "ID").unwrap_or_default();
-    let version_id = parse_os_release_field(os_release_text, "VERSION_ID").unwrap_or_default();
-    let codename = parse_os_release_field(os_release_text, "VERSION_CODENAME")
-        .or_else(|| parse_os_release_field(os_release_text, "UBUNTU_CODENAME"))
+    // An unreadable file is reported as itself, naming the line, rather than
+    // falling through to "this distro is not supported" — which would send the
+    // user looking for a support matrix when the fix is one line of a file.
+    let os_release = match rocm_core::os_release::parse(os_release_text) {
+        Ok(fields) => fields,
+        Err(unreadable) => {
+            return unreadable_os_release_plan(format!(
+                "{os_release_path} {unreadable}; no driver commands were planned \
+                 because the distro cannot be read. To fix it, {}.",
+                unreadable.fix()
+            ));
+        }
+    };
+    let field = |key: &str| os_release.get(key).cloned();
+    let os_id = field("ID").unwrap_or_default();
+    let version_id = field("VERSION_ID").unwrap_or_default();
+    let codename = field("VERSION_CODENAME")
+        .or_else(|| field("UBUNTU_CODENAME"))
         .or_else(|| codename_for_version(&os_id, &version_id).map(str::to_owned))
         .unwrap_or_default();
-    let id_like = parse_os_release_field(os_release_text, "ID_LIKE").unwrap_or_default();
+    let id_like = field("ID_LIKE").unwrap_or_default();
 
     match (os_id.as_str(), version_id.as_str()) {
         ("ubuntu", "22.04" | "24.04") => apt_driver_plan(
@@ -942,6 +984,36 @@ fn build_driver_install_plan(
             reboot_required: true,
         }),
     }
+}
+
+/// [`build_driver_install_plan_at`] for `read`, naming the file actually read
+/// in an unreadable-line message, and reporting a file that exists but could
+/// not be read as itself rather than as an unknown distribution.
+///
+/// Without the latter, a host whose `/etc/os-release` is merely unreadable
+/// (permission denied, a directory in its place) would plan nothing and say
+/// "no commands were guessed for this distro" — the same message an actually
+/// unsupported distribution gets — sending the user looking for a support
+/// gap instead of a filesystem problem. The Windows and WSL branches never
+/// reach the os-release parse at all, so they are unaffected either way and
+/// are left to the normal call below.
+fn build_driver_install_plan_read(
+    examine: &ExamineSummary,
+    read: &rocm_core::hardware_root::OsRelease,
+    dkms: bool,
+    escalation: PrivilegeEscalation,
+) -> DriverInstallPlan {
+    let reaches_os_release_parse =
+        examine.os != "windows" && !examine.wsl.as_ref().is_some_and(|wsl| wsl.is_wsl);
+    if reaches_os_release_parse
+        && let rocm_core::hardware_root::OsRelease::Unreadable { path, error } = read
+    {
+        return unreadable_os_release_plan(format!(
+            "{}; no driver commands were planned because the distro cannot be read.",
+            rocm_core::hardware_root::unreadable_prefix(path, error)
+        ));
+    }
+    build_driver_install_plan_at(examine, read.path(), read.text(), dkms, escalation)
 }
 
 /// Select a driver install plan for a distro whose `/etc/os-release` `ID` is not
@@ -1709,6 +1781,18 @@ mod tests {
         }
     }
 
+    /// `text` as if read from `/etc/os-release`, for tests that only care
+    /// about the content and not the path — `rocm_core::hardware_root::OsRelease::found`
+    /// is `pub(crate)` inside `rocm-core`, so it isn't visible from this crate's
+    /// tests; this is the `apps/rocm`-side equivalent, used in place of
+    /// repeating the `OsRelease::Found { .. }` literal at every call site.
+    fn os_release_found(text: &str) -> rocm_core::hardware_root::OsRelease {
+        rocm_core::hardware_root::OsRelease::Found {
+            path: "/etc/os-release",
+            text: text.to_owned(),
+        }
+    }
+
     /// Every distro whose plan actually emits privileged commands, so the
     /// escalation tests below sweep all of them rather than whichever one was
     /// remembered. Adding a distro to the planner without adding it here would
@@ -1733,11 +1817,303 @@ mod tests {
     }
 
     fn plan_commands(os_release: &str, escalation: PrivilegeEscalation) -> Vec<String> {
-        build_driver_install_plan(&test_examine("linux", false), os_release, true, escalation)
-            .commands
-            .into_iter()
-            .map(|command| command.command)
-            .collect()
+        build_driver_install_plan_read(
+            &test_examine("linux", false),
+            &os_release_found(os_release),
+            true,
+            escalation,
+        )
+        .commands
+        .into_iter()
+        .map(|command| command.command)
+        .collect()
+    }
+
+    /// Rewrite every `KEY=value` / `KEY="value"` line of an os-release fixture
+    /// in single quotes, which `os-release(5)` permits just as it does double.
+    fn single_quoted(os_release: &str) -> String {
+        os_release
+            .lines()
+            .map(|line| match line.split_once('=') {
+                Some((key, value)) => format!("{key}='{}'", value.trim_matches('"')),
+                None => line.to_owned(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// How a distro quotes its `/etc/os-release` must not change the plan.
+    ///
+    /// `os-release(5)` allows single or double quotes, so every supported
+    /// distro, rewritten in single quotes, must plan exactly as it does in
+    /// double quotes.
+    #[test]
+    fn a_single_quoted_os_release_builds_the_same_plan() {
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
+        for (label, os_release) in dkms_planning_os_releases() {
+            let plan = |text: &str| {
+                build_driver_install_plan_read(
+                    &test_examine("linux", false),
+                    &os_release_found(text),
+                    true,
+                    PrivilegeEscalation::Sudo,
+                )
+            };
+            let double = plan(os_release);
+            let single = plan(&single_quoted(os_release));
+            assert!(
+                single.supported,
+                "{label}: unsupported when single-quoted: {}\n{}",
+                single.reason,
+                single_quoted(os_release)
+            );
+            assert_eq!(
+                (single.os_id.as_str(), single.version_id.as_str()),
+                (double.os_id.as_str(), double.version_id.as_str()),
+                "{label}: quote style changed the distro read"
+            );
+            assert_eq!(
+                single.execution_commands(),
+                double.execution_commands(),
+                "{label}: quote style changed the planned commands"
+            );
+        }
+    }
+
+    /// An unreadable os-release is refused as itself: the reason names the
+    /// offending line, and it is asserted together with what it claims — no
+    /// distro, no commands, nothing that mutates — and against an "unsupported
+    /// distro" reason, which would blame the distro instead.
+    #[test]
+    fn an_unreadable_os_release_names_its_line_and_plans_nothing() {
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
+        let plan = build_driver_install_plan_read(
+            &test_examine("linux", false),
+            &os_release_found(
+                "ID=ubuntu\nVERSION_ID=\"24.04\"\nVERSION_CODENAME=noble\nunset ID\n",
+            ),
+            true,
+            PrivilegeEscalation::Sudo,
+        );
+        assert_eq!(
+            plan.reason,
+            "/etc/os-release line 4 is not a plain assignment: \"unset ID\"; no driver \
+             commands were planned because the distro cannot be read. To fix it, remove \
+             that line or rewrite it as NAME=value."
+        );
+        assert!(!plan.supported);
+        assert!(plan.commands.is_empty(), "{:?}", plan.commands);
+        assert_eq!(plan.policy, "unreadable_os_release");
+        // Nothing about the distro is claimed — not the `ubuntu`, `24.04` or
+        // `noble` the file assigns before the command — and the plan changes
+        // nothing, so it neither mutates nor needs a reboot. The one check it
+        // offers is the command that names the line.
+        assert_eq!(
+            (
+                plan.os_id.as_str(),
+                plan.version_id.as_str(),
+                plan.codename.as_str()
+            ),
+            ("", "", "")
+        );
+        assert!(!plan.mutating);
+        assert!(!plan.reboot_required);
+        assert!(
+            plan.preflight_checks.is_empty(),
+            "{:?}",
+            plan.preflight_checks
+        );
+        assert_eq!(plan.checks, vec!["rocm examine".to_owned()]);
+
+        // The rendered plan says so on one line, and does not also claim the
+        // distro is unsupported.
+        let rendered = render_driver_install_plan(&plan, false, true);
+        assert!(
+            rendered.contains("reason: /etc/os-release line 4 is not a plain assignment"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("AMD-documented"), "{rendered}");
+        assert!(
+            rendered.contains("execution_commands: <none>"),
+            "{rendered}"
+        );
+    }
+
+    /// `build_driver_install_plan_read` is the one seam `install_driver` hands
+    /// its `real_os_release()` result to. Both are now one-line delegations
+    /// to `hardware_root::read_os_release`, so reverting either back to a raw
+    /// `/etc/os-release` read is a type error here, not a silent regression.
+    /// This still pins the behaviour at the seam itself: an `OsRelease` that
+    /// says the fallback path was read plans exactly what a primary-path read
+    /// with the same content would.
+    #[test]
+    fn a_fallback_read_plans_exactly_like_a_primary_read() {
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
+        let examine = test_examine("linux", false);
+        let fallback = rocm_core::hardware_root::OsRelease::Found {
+            path: "/usr/lib/os-release",
+            text: "ID=ubuntu\nVERSION_ID=\"24.04\"\nVERSION_CODENAME=noble\n".to_owned(),
+        };
+        let primary = rocm_core::hardware_root::OsRelease::Found {
+            path: "/etc/os-release",
+            text: "ID=ubuntu\nVERSION_ID=\"24.04\"\nVERSION_CODENAME=noble\n".to_owned(),
+        };
+
+        let from_fallback =
+            build_driver_install_plan_read(&examine, &fallback, true, PrivilegeEscalation::Sudo);
+        let from_primary =
+            build_driver_install_plan_read(&examine, &primary, true, PrivilegeEscalation::Sudo);
+        assert_eq!(from_fallback.os_id, "ubuntu");
+        assert_eq!(
+            (
+                from_fallback.os_id.clone(),
+                from_fallback.version_id.clone(),
+                from_fallback.codename.clone(),
+                from_fallback.reason.clone(),
+                from_fallback.execution_commands(),
+            ),
+            (
+                from_primary.os_id.clone(),
+                from_primary.version_id.clone(),
+                from_primary.codename.clone(),
+                from_primary.reason.clone(),
+                from_primary.execution_commands(),
+            ),
+        );
+    }
+
+    /// A file that exists but could not be read plans nothing and names
+    /// itself, distinctly from both an unreadable *line* (which still comes
+    /// from a file that was read, see
+    /// [`an_unreadable_os_release_names_its_line_and_plans_nothing`]) and from
+    /// an unsupported distribution — which would send the user looking for a
+    /// support gap instead of a filesystem problem.
+    #[test]
+    fn an_unreadable_file_plans_nothing_and_names_itself() {
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
+        let read = rocm_core::hardware_root::OsRelease::Unreadable {
+            path: "/usr/lib/os-release",
+            error: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied"),
+        };
+        let plan = build_driver_install_plan_read(
+            &test_examine("linux", false),
+            &read,
+            true,
+            PrivilegeEscalation::Sudo,
+        );
+        assert_eq!(plan.policy, "unreadable_os_release");
+        assert!(!plan.supported);
+        assert!(plan.commands.is_empty(), "{:?}", plan.commands);
+        assert_eq!(
+            plan.reason,
+            "/usr/lib/os-release could not be read: denied; no driver commands were planned \
+             because the distro cannot be read."
+        );
+    }
+
+    /// The same malformed line as
+    /// [`an_unreadable_os_release_names_its_line_and_plans_nothing`], but read
+    /// through the fallback path: the reason must name `/usr/lib/os-release`,
+    /// not `/etc/os-release`. That test only exercises
+    /// [`os_release_found`]'s hardcoded `/etc/os-release` path, so a
+    /// regression that hardcoded the path back into
+    /// `build_driver_install_plan_read` would still pass it.
+    #[test]
+    fn a_fallback_reads_malformed_line_names_the_fallback_path() {
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
+        let read = rocm_core::hardware_root::OsRelease::Found {
+            path: "/usr/lib/os-release",
+            text: "ID=ubuntu\nVERSION_ID=\"24.04\"\nVERSION_CODENAME=noble\nunset ID\n".to_owned(),
+        };
+        let plan = build_driver_install_plan_read(
+            &test_examine("linux", false),
+            &read,
+            true,
+            PrivilegeEscalation::Sudo,
+        );
+        assert_eq!(
+            plan.reason,
+            "/usr/lib/os-release line 4 is not a plain assignment: \"unset ID\"; no driver \
+             commands were planned because the distro cannot be read. To fix it, remove \
+             that line or rewrite it as NAME=value."
+        );
+        assert!(!plan.supported);
+        assert!(plan.commands.is_empty(), "{:?}", plan.commands);
+        assert_eq!(plan.policy, "unreadable_os_release");
+    }
+
+    /// On WSL, `build_driver_install_plan_read`'s `Unreadable` branch must
+    /// not fire at all: WSL has its own guest-side os-release probe (see
+    /// `examine.rs`'s `WSL_REMOTE_PROBE`), so the local Rust-side read this
+    /// function receives is never authoritative for a WSL host, and the plan
+    /// must stay the ordinary `wsl_rocdxg` one — not `unreadable_os_release` —
+    /// regardless of what it says. Without the `reaches_os_release_parse`
+    /// guard this would plan nothing on a WSL host whose local read happens
+    /// to come back `Unreadable`, even though the guest-side probe may read
+    /// the distro just fine.
+    #[test]
+    fn a_wsl_host_ignores_an_unreadable_local_os_release_read() {
+        let _env = scoped_rocdxg_env();
+        let read = rocm_core::hardware_root::OsRelease::Unreadable {
+            path: "/usr/lib/os-release",
+            error: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied"),
+        };
+        let plan = build_driver_install_plan_read(
+            &test_examine("linux", true),
+            &read,
+            true,
+            PrivilegeEscalation::Sudo,
+        );
+        assert_eq!(plan.policy, "wsl_rocdxg");
+        assert!(plan.supported);
+        assert!(plan.mutating);
+    }
+
+    /// The Windows half of the same `reaches_os_release_parse` guard: a
+    /// native Windows host's driver install is `windows_validate_only`
+    /// regardless of what the local read says, since the Linux driver
+    /// install this plan guards is never attempted there. Without this half
+    /// of the guard, a Windows host whose `real_os_release()` happens to come
+    /// back `Unreadable` would wrongly take the Linux-only
+    /// `unreadable_os_release` policy instead.
+    #[test]
+    fn a_windows_host_ignores_an_unreadable_local_os_release_read() {
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
+        let read = rocm_core::hardware_root::OsRelease::Unreadable {
+            path: "/usr/lib/os-release",
+            error: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied"),
+        };
+        let plan = build_driver_install_plan_read(
+            &test_examine("windows", false),
+            &read,
+            true,
+            PrivilegeEscalation::Sudo,
+        );
+        assert_eq!(plan.policy, "windows_validate_only");
+        assert!(!plan.supported);
+        assert!(!plan.mutating);
+    }
+
+    /// With a duplicated key, the plan is built from the last assignment — the
+    /// one a shell keeps, and the one `rocm examine` reports, since both read
+    /// through `rocm_core::os_release`.
+    #[test]
+    fn a_duplicated_os_release_key_is_planned_from_its_last_assignment() {
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
+        let text = "ID=debian\nVERSION_ID=\"12\"\nID=ubuntu\nVERSION_ID=\"24.04\"\n\
+                    VERSION_CODENAME=noble\n";
+        let plan = build_driver_install_plan_read(
+            &test_examine("linux", false),
+            &os_release_found(text),
+            true,
+            PrivilegeEscalation::Sudo,
+        );
+        assert_eq!(
+            (plan.os_id.as_str(), plan.version_id.as_str()),
+            ("ubuntu", "24.04"),
+            "planned for the first assignment instead of the last"
+        );
+        assert!(plan.supported, "{}", plan.reason);
     }
 
     #[test]
@@ -1769,9 +2145,9 @@ mod tests {
         // read-only probes and are deliberately unprivileged, so only the
         // mutating phases are required to escalate.
         for (label, os_release) in dkms_planning_os_releases() {
-            let plan = build_driver_install_plan(
+            let plan = build_driver_install_plan_read(
                 &test_examine("linux", false),
-                os_release,
+                &os_release_found(os_release),
                 true,
                 PrivilegeEscalation::Sudo,
             );
@@ -1823,9 +2199,9 @@ mod tests {
         // the escalation the plan was built under, or the recorded history
         // describes commands that never ran.
         let ubuntu = "ID=ubuntu\nVERSION_ID=\"24.04\"\nVERSION_CODENAME=noble\n";
-        let as_root = build_driver_install_plan(
+        let as_root = build_driver_install_plan_read(
             &test_examine("linux", false),
-            ubuntu,
+            &os_release_found(ubuntu),
             true,
             PrivilegeEscalation::AlreadyRoot,
         );
@@ -1836,9 +2212,9 @@ mod tests {
                 .all(|command| !command.contains("sudo")),
             "state.json must not record sudo commands for a root run"
         );
-        let off_root = build_driver_install_plan(
+        let off_root = build_driver_install_plan_read(
             &test_examine("linux", false),
-            ubuntu,
+            &os_release_found(ubuntu),
             true,
             PrivilegeEscalation::Sudo,
         );
@@ -1857,9 +2233,9 @@ mod tests {
         // longer uses it — the same contradiction the bug report called out
         // between the stated preconditions and what execution actually did.
         for (label, os_release) in dkms_planning_os_releases() {
-            let as_root = build_driver_install_plan(
+            let as_root = build_driver_install_plan_read(
                 &test_examine("linux", false),
-                os_release,
+                &os_release_found(os_release),
                 true,
                 PrivilegeEscalation::AlreadyRoot,
             );
@@ -1871,9 +2247,9 @@ mod tests {
                 "{label}: a root plan must not require a sudo binary: {:?}",
                 as_root.preflight_checks
             );
-            let off_root = build_driver_install_plan(
+            let off_root = build_driver_install_plan_read(
                 &test_examine("linux", false),
-                os_release,
+                &os_release_found(os_release),
                 true,
                 PrivilegeEscalation::Sudo,
             );
@@ -1895,9 +2271,9 @@ ID=ubuntu
 VERSION_ID="24.04"
 VERSION_CODENAME=noble
 "#;
-        let plan = build_driver_install_plan(
+        let plan = build_driver_install_plan_read(
             &test_examine("linux", false),
-            os_release,
+            &os_release_found(os_release),
             true,
             PrivilegeEscalation::Sudo,
         );
@@ -1987,9 +2363,9 @@ VERSION_CODENAME=noble
 
     #[test]
     fn driver_plan_executor_defers_verify_when_reboot_is_required() -> Result<()> {
-        let plan = build_driver_install_plan(
+        let plan = build_driver_install_plan_read(
             &test_examine("linux", false),
-            "ID=ubuntu\nVERSION_ID=\"24.04\"\nVERSION_CODENAME=noble\n",
+            &os_release_found("ID=ubuntu\nVERSION_ID=\"24.04\"\nVERSION_CODENAME=noble\n"),
             true,
             PrivilegeEscalation::Sudo,
         );
@@ -2298,9 +2674,9 @@ ID=ubuntu
 VERSION_ID="24.04"
 VERSION_CODENAME=noble
 "#;
-        let plan = build_driver_install_plan(
+        let plan = build_driver_install_plan_read(
             &test_examine("linux", false),
-            os_release,
+            &os_release_found(os_release),
             false,
             PrivilegeEscalation::Sudo,
         );
@@ -2384,9 +2760,9 @@ VERSION_CODENAME=noble
 ID=rhel
 VERSION_ID="9.7"
 "#;
-        let plan = build_driver_install_plan(
+        let plan = build_driver_install_plan_read(
             &test_examine("linux", false),
-            os_release,
+            &os_release_found(os_release),
             true,
             PrivilegeEscalation::Sudo,
         );
@@ -2404,9 +2780,9 @@ ID=debian
 VERSION_ID="12"
 VERSION_CODENAME=bookworm
 "#;
-        let plan = build_driver_install_plan(
+        let plan = build_driver_install_plan_read(
             &test_examine("linux", false),
-            os_release,
+            &os_release_found(os_release),
             true,
             PrivilegeEscalation::Sudo,
         );
@@ -2427,9 +2803,9 @@ VERSION_CODENAME=bookworm
 ID=rhel
 VERSION_ID="9.7"
 "#;
-        let plan = build_driver_install_plan(
+        let plan = build_driver_install_plan_read(
             &test_examine("linux", false),
-            os_release,
+            &os_release_found(os_release),
             true,
             PrivilegeEscalation::Sudo,
         );
@@ -2455,9 +2831,9 @@ VERSION_ID="9.7"
 ID=ol
 VERSION_ID="10.1"
 "#;
-        let plan = build_driver_install_plan(
+        let plan = build_driver_install_plan_read(
             &test_examine("linux", false),
-            os_release,
+            &os_release_found(os_release),
             true,
             PrivilegeEscalation::Sudo,
         );
@@ -2478,9 +2854,9 @@ VERSION_ID="10.1"
 ID=rocky
 VERSION_ID="9.7"
 "#;
-        let plan = build_driver_install_plan(
+        let plan = build_driver_install_plan_read(
             &test_examine("linux", false),
-            os_release,
+            &os_release_found(os_release),
             true,
             PrivilegeEscalation::Sudo,
         );
@@ -2503,9 +2879,9 @@ VERSION_ID="9.7"
 ID=rocky
 VERSION_ID="9.4"
 "#;
-        let plan = build_driver_install_plan(
+        let plan = build_driver_install_plan_read(
             &test_examine("linux", false),
-            os_release,
+            &os_release_found(os_release),
             true,
             PrivilegeEscalation::Sudo,
         );
@@ -2524,9 +2900,9 @@ VERSION_ID="9.4"
         // AMD documents Rocky Linux 9 only; keep the driver matrix scoped to 9.x.
         for version in ["8.10", "10.0"] {
             let os_release = format!("\nID=rocky\nVERSION_ID=\"{version}\"\n");
-            let plan = build_driver_install_plan(
+            let plan = build_driver_install_plan_read(
                 &test_examine("linux", false),
-                &os_release,
+                &os_release_found(&os_release),
                 true,
                 PrivilegeEscalation::Sudo,
             );
@@ -2550,9 +2926,9 @@ ID=debian
 VERSION_ID="12"
 VERSION_CODENAME=bookworm
 "#;
-        let plan = build_driver_install_plan(
+        let plan = build_driver_install_plan_read(
             &test_examine("linux", false),
-            os_release,
+            &os_release_found(os_release),
             true,
             PrivilegeEscalation::Sudo,
         );
@@ -2574,9 +2950,9 @@ VERSION_CODENAME=bookworm
 ID=sles
 VERSION_ID="15.7"
 "#;
-        let plan = build_driver_install_plan(
+        let plan = build_driver_install_plan_read(
             &test_examine("linux", false),
-            os_release,
+            &os_release_found(os_release),
             true,
             PrivilegeEscalation::Sudo,
         );
@@ -2600,9 +2976,9 @@ VERSION_ID="15.7"
 ID=fedora
 VERSION_ID="41"
 "#;
-        let plan = build_driver_install_plan(
+        let plan = build_driver_install_plan_read(
             &test_examine("linux", false),
-            os_release,
+            &os_release_found(os_release),
             true,
             PrivilegeEscalation::Sudo,
         );
@@ -2619,9 +2995,9 @@ VERSION_ID="41"
     #[test]
     fn windows_install_driver_is_validate_only() {
         let _env = ScopedTestEnv::with_amd_overrides_cleared();
-        let plan = build_driver_install_plan(
+        let plan = build_driver_install_plan_read(
             &test_examine("windows", false),
-            "",
+            &os_release_found(""),
             true,
             PrivilegeEscalation::Sudo,
         );
@@ -2643,16 +3019,16 @@ VERSION_ID="41"
         // `dkms: true` is passed deliberately: WSL2 has no kernel module to
         // build, so the flag must not pull in the bare-metal path.
         //
-        // `build_driver_install_plan` resolves `${ROCM_CLI_AMDGPU_VERSION:-...}`
+        // `build_driver_install_plan_at` resolves `${ROCM_CLI_AMDGPU_VERSION:-...}`
         // from process env before it reaches the WSL branch, and the WSL branch
         // then reads the three ROCDXG vars — an exported
         // `ROCM_CLI_ROCDXG_VERSION` would steer this plan into a refusal and
         // fail the `plan.supported` assertion below. So this reader takes the
         // guard that clears both sets.
         let _env = scoped_rocdxg_env();
-        let plan = build_driver_install_plan(
+        let plan = build_driver_install_plan_read(
             &test_examine("linux", true),
-            "",
+            &os_release_found(""),
             true,
             PrivilegeEscalation::Sudo,
         );
@@ -2762,7 +3138,7 @@ VERSION_ID="41"
     /// that is asserting on the default.
     ///
     /// Builds on [`ScopedTestEnv::with_amd_overrides_cleared`] rather than
-    /// `new` because a WSL plan reached through `build_driver_install_plan`
+    /// `new` because a WSL plan reached through `build_driver_install_plan_read`
     /// resolves the bare-metal AMDGPU overrides before it dispatches to the WSL
     /// branch: a caller needing one of these two guards needs both, and one
     /// helper spares every test from picking the wrong half.
@@ -3091,9 +3467,9 @@ VERSION_ID="41"
         assert!(rendered.contains("post_install_checks:"));
         assert!(!rendered.contains("post_reboot"));
 
-        let bare_metal = build_driver_install_plan(
+        let bare_metal = build_driver_install_plan_read(
             &test_examine("linux", false),
-            "ID=ubuntu\nVERSION_ID=\"24.04\"\nVERSION_CODENAME=noble\n",
+            &os_release_found("ID=ubuntu\nVERSION_ID=\"24.04\"\nVERSION_CODENAME=noble\n"),
             true,
             PrivilegeEscalation::Sudo,
         );
@@ -3169,9 +3545,9 @@ VERSION_ID="22.04"
 VERSION_CODENAME=jammy
 ID_LIKE="ubuntu debian"
 "#;
-        let plan = build_driver_install_plan(
+        let plan = build_driver_install_plan_read(
             &test_examine("linux", false),
-            os_release,
+            &os_release_found(os_release),
             true,
             PrivilegeEscalation::Sudo,
         );
@@ -3195,9 +3571,9 @@ ID=lmde
 VERSION_ID="12"
 ID_LIKE=debian
 "#;
-        let plan = build_driver_install_plan(
+        let plan = build_driver_install_plan_read(
             &test_examine("linux", false),
-            os_release,
+            &os_release_found(os_release),
             true,
             PrivilegeEscalation::Sudo,
         );
@@ -3219,9 +3595,9 @@ ID=almalinux
 VERSION_ID="9.6"
 ID_LIKE="rhel centos fedora"
 "#;
-        let plan = build_driver_install_plan(
+        let plan = build_driver_install_plan_read(
             &test_examine("linux", false),
-            os_release,
+            &os_release_found(os_release),
             true,
             PrivilegeEscalation::Sudo,
         );
@@ -3247,9 +3623,9 @@ ID=almalinux
 VERSION_ID="8.10"
 ID_LIKE="rhel centos fedora"
 "#;
-        let plan = build_driver_install_plan(
+        let plan = build_driver_install_plan_read(
             &test_examine("linux", false),
-            os_release,
+            &os_release_found(os_release),
             true,
             PrivilegeEscalation::Sudo,
         );
@@ -3274,9 +3650,9 @@ ID=lmde
 VERSION_ID="6"
 ID_LIKE=debian
 "#;
-        let plan = build_driver_install_plan(
+        let plan = build_driver_install_plan_read(
             &test_examine("linux", false),
-            os_release,
+            &os_release_found(os_release),
             true,
             PrivilegeEscalation::Sudo,
         );
@@ -3297,9 +3673,9 @@ ID=rhel
 VERSION_ID="9.7"
 ID_LIKE=fedora
 "#;
-        let plan = build_driver_install_plan(
+        let plan = build_driver_install_plan_read(
             &test_examine("linux", false),
-            os_release,
+            &os_release_found(os_release),
             true,
             PrivilegeEscalation::Sudo,
         );
@@ -3321,9 +3697,9 @@ ID=ol
 VERSION_ID="9.6"
 ID_LIKE=fedora
 "#;
-        let plan = build_driver_install_plan(
+        let plan = build_driver_install_plan_read(
             &test_examine("linux", false),
-            os_release,
+            &os_release_found(os_release),
             true,
             PrivilegeEscalation::Sudo,
         );
@@ -3346,9 +3722,9 @@ ID=opensuse-leap
 VERSION_ID="15.7"
 ID_LIKE="suse opensuse"
 "#;
-        let plan = build_driver_install_plan(
+        let plan = build_driver_install_plan_read(
             &test_examine("linux", false),
-            os_release,
+            &os_release_found(os_release),
             true,
             PrivilegeEscalation::Sudo,
         );

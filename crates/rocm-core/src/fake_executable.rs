@@ -23,6 +23,13 @@
 //! writing in this process at all: a short-lived single-threaded child writes
 //! it, and that child has exited — taking the only write fd with it — before
 //! this function returns.
+//!
+//! The module is plain `pub`, not `#[cfg(test)]` and not behind a feature
+//! such as `e2e-test-hooks`, because every caller is test code in *another*
+//! crate (`apps/rocm`, the engines, `rocm-dash-daemon`, `xtask`, the e2e
+//! harness): those crates cannot see rocm-core's `cfg(test)` items, and a
+//! feature gate would have to be switched on in each consumer's
+//! `[dev-dependencies]` entry for rocm-core.
 
 use std::io;
 use std::path::Path;
@@ -57,15 +64,17 @@ pub fn write_fake_executable(path: &Path, contents: impl AsRef<[u8]>) -> io::Res
         // Absolute, because some tests narrow `PATH` for the code under test.
         .env("PATH", "/usr/bin:/bin")
         .stdin(Stdio::piped())
-        .stdout(Stdio::null())
         .stderr(Stdio::piped())
-        .spawn()?;
+        .spawn()
+        .map_err(|error| step_error(path, "spawn the writer", &error))?;
     let write_result = writer
         .stdin
         .take()
         .expect("stdin was requested as a pipe")
         .write_all(contents.as_ref());
-    let output = writer.wait_with_output()?;
+    let output = writer
+        .wait_with_output()
+        .map_err(|error| step_error(path, "wait for the writer", &error))?;
     if !output.status.success() {
         return Err(io::Error::other(format!(
             "failed to write {}: writer exited with {}: {}",
@@ -74,8 +83,20 @@ pub fn write_fake_executable(path: &Path, contents: impl AsRef<[u8]>) -> io::Res
             String::from_utf8_lossy(&output.stderr).trim()
         )));
     }
-    write_result?;
+    write_result.map_err(|error| step_error(path, "send the contents", &error))?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+        .map_err(|error| step_error(path, "mark it executable", &error))
+}
+
+/// Name the path and the step that failed, keeping the original error kind,
+/// so a caller's one `.expect("plant the fake …")` still says whether the
+/// write or the `chmod` went wrong.
+#[cfg(unix)]
+fn step_error(path: &Path, step: &str, error: &io::Error) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        format!("failed to write {}: {step}: {error}", path.display()),
+    )
 }
 
 /// Off unix there is no `ETXTBSY` to avoid, and no mode bit to set: a plain
@@ -125,6 +146,25 @@ mod tests {
             error.to_string().contains(&path.display().to_string()),
             "the error must name the path: {error}"
         );
+    }
+
+    /// The write succeeds but the `chmod` cannot: `path` is a symlink to
+    /// `/dev/null`, which an unprivileged user may write but not chmod. The
+    /// error must say which step failed, not just pass the bare `EPERM` up.
+    #[test]
+    fn a_failed_chmod_names_the_path_and_the_step() {
+        if crate::openmpi::running_as_root() {
+            // Root may chmod `/dev/null`; there is no failure to observe.
+            return;
+        }
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("fake");
+        std::os::unix::fs::symlink("/dev/null", &path).expect("symlink to /dev/null");
+        let error = write_fake_executable(&path, "#!/bin/sh\n").expect_err("chmod /dev/null");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        let message = error.to_string();
+        assert!(message.contains(&path.display().to_string()), "{message}");
+        assert!(message.contains("mark it executable"), "{message}");
     }
 
     /// The regression this helper exists for: many threads each plant a fake
