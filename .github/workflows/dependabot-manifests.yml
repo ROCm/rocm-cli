@@ -50,7 +50,7 @@ jobs:
   generate:
     name: Regenerate manifests
     if: github.actor == 'dependabot[bot]'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04 # one LTS: regenerates manifests, nothing here depends on the image
     permissions:
       contents: read
     steps:
@@ -61,6 +61,10 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha }}
 
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          # rust-cache keys on "Linux-x64" only; name the image so a target dir
+          # built against one Ubuntu release's glibc is never restored on another.
+          cache-key: ubuntu-24.04
 
       # Same version and cache key as ci.yml's third-party-notices job: the
       # notices must be byte-identical to what that job's `--check` regenerates,
@@ -70,7 +74,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cargo/bin/cargo-about
-          key: ${{ runner.os }}-cargo-about-0.9.1
+          key: ${{ runner.os }}-ubuntu-24.04-cargo-about-0.9.1
 
       - name: Install cargo-about
         if: steps.cache-cargo-about.outputs.cache-hit != 'true'

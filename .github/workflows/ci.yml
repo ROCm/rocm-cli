@@ -77,7 +77,7 @@ jobs:
   # queue forever — see the `commit-signatures` note below). Each output folds in
   # `.github/workflows/**`, so any change to CI itself triggers a full run.
   changes:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04 # one LTS: path filter only, nothing here depends on the image
     timeout-minutes: 20
     # paths-filter reads the PR's changed-file list from the API on
     # pull_request events; that needs pull-requests:read on top of the
@@ -232,7 +232,7 @@ jobs:
   # advisory only, and deliberately NOT a required check.
   xfail-hint:
     name: Stale xfail hint (advisory)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04 # one LTS: advisory text check, nothing here depends on the image
     timeout-minutes: 20
     if: github.event_name == 'pull_request'
     steps:
@@ -256,7 +256,15 @@ jobs:
             --commits-file /tmp/pr-commits.txt >> "$GITHUB_STEP_SUMMARY"
 
   build-and-test:
-    runs-on: ubuntu-latest
+    # Runs on both Ubuntu LTS images. The 24.04 leg keeps the bare name,
+    # which is what branch protection requires; the 26.04 leg reports as
+    # "build-and-test (ubuntu-26.04)".
+    name: ${{ matrix.os == 'ubuntu-24.04' && 'build-and-test' || format('build-and-test ({0})', matrix.os) }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-26.04]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     # sccache caches each rustc invocation (keyed by source + deps + flags) in an
     # Azure blob container, so unchanged workspace crates are restored instead of
@@ -302,7 +310,10 @@ jobs:
       SCCACHE_AZURE_BLOB_CONTAINER: cache
       # Namespaced so the Linux and Windows lanes cannot collide, and so the
       # container stays legible if it is ever shared with another consumer.
-      SCCACHE_AZURE_KEY_PREFIX: rocm-cli/build-and-test
+      # Per image too: sccache keys on the compiler binary, which is the same
+      # rustup download on every image, so a proc macro linked against one
+      # Ubuntu release's glibc would otherwise be served to the other.
+      SCCACHE_AZURE_KEY_PREFIX: rocm-cli/build-and-test/${{ matrix.os }}
       SCCACHE_AZURE_RW_MODE: ${{ (github.event_name == 'push' || github.event_name == 'merge_group') && 'READ_WRITE' || 'READ_ONLY' }}
     # Don't spend per-OS build/test cycles unless the cheap lint gate is green.
     needs: [changes, clippy, prek]
@@ -387,6 +398,10 @@ jobs:
 
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         if: needs.changes.outputs.heavy == 'true'
+        with:
+          # rust-cache keys on "Linux-x64" only; name the image so a target dir
+          # built against one Ubuntu release's glibc is never restored on another.
+          cache-key: ${{ matrix.os }}
 
       # Build the runtime binaries the smoke + acceptance steps below need (every
       # engine binary; smoke hard-fails on a missing one). Unit/integration tests
@@ -479,8 +494,15 @@ jobs:
   # rust-cache lane (`cache-key` above) for the same reason. Revisit if this job
   # becomes a bottleneck.
   test:
-    name: Test (affected crates)
-    runs-on: ubuntu-latest
+    # Runs on both Ubuntu LTS images. The 24.04 leg keeps the bare name,
+    # which is what branch protection requires; the 26.04 leg reports as
+    # "Test (affected crates) (ubuntu-26.04)".
+    name: ${{ matrix.os == 'ubuntu-24.04' && 'Test (affected crates)' || format('Test (affected crates) ({0})', matrix.os) }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-26.04]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     # Same lint gate as the OS build jobs: don't spend a test cycle until the
     # cheap checks are green.
@@ -506,7 +528,9 @@ jobs:
           # cache lanes. A subset build resolves Cargo features differently than
           # the whole workspace, so a shared cache would make the two evict and
           # recompile each other's artifacts on every alternation.
-          cache-key: ${{ github.event_name == 'pull_request' && 'affected-pr' || 'full' }}
+          # The runner image is part of the lane too, for the reason the other
+          # rust-cache keys in this workflow give.
+          cache-key: ${{ matrix.os }}-${{ github.event_name == 'pull_request' && 'affected-pr' || 'full' }}
 
       - name: Install cargo-nextest
         if: needs.changes.outputs.rust == 'true'
@@ -864,7 +888,7 @@ jobs:
   # per-run artifacts for manual testing, not a publication.
   pr-linux-binaries:
     name: Build Linux PR binaries
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04 # one LTS: the binaries are built in the manylinux container, not on the image
     # 30min: a cold containerised release build (image pull, yum install,
     # rustup install, then `cargo build --release` for 3 crates) plus none of
     # its steps below are individually bounded -- see the convention comment
@@ -891,6 +915,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          # rust-cache keys on "Linux-x64" only; name the image so a target dir
+          # built against one Ubuntu release's glibc is never restored on another.
+          cache-key: ubuntu-24.04
 
       - name: Cache Cargo home and build artifacts
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -970,7 +998,7 @@ jobs:
     # their own jobs (clippy, build-and-test, license-headers, docs-links,
     # powershell-lint, commit-signatures).
     name: prek (lint / hygiene)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04 # one LTS: lint/hygiene only, nothing here depends on the image
     timeout-minutes: 20
     # Always-on: prek is the cheapest gate (no compile) and its hygiene hooks run
     # on every file type, so it is relevant to any change — including docs-only
@@ -1013,8 +1041,15 @@ jobs:
     #
     # No GPU, no ROCm, no tailnet: the remote's `rocm` and `tailscale` are
     # stand-ins that answer in the shapes the real tools do.
-    name: remote control channel (containerised)
-    runs-on: ubuntu-latest
+    # Runs on both Ubuntu LTS images. The 24.04 leg keeps the bare name,
+    # which is what branch protection requires; the 26.04 leg reports as
+    # "remote control channel (containerised) (ubuntu-26.04)".
+    name: ${{ matrix.os == 'ubuntu-24.04' && 'remote control channel (containerised)' || format('remote control channel (containerised) ({0})', matrix.os) }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-26.04]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     # Gated like every other heavy job here: a fast lint failure should
     # short-circuit before this spends 30 minutes on a container and a cold
@@ -1024,8 +1059,8 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # Docker and the OpenSSH client are both present on ubuntu-latest; jq is
-      # the only extra, and only for asserting on JSON contracts.
+      # Docker and the OpenSSH client are both present on the hosted Ubuntu
+      # images; jq is the only extra, and only for asserting on JSON contracts.
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
 
@@ -1037,6 +1072,10 @@ jobs:
       # whole workspace cold against a different compiler from the rest of CI,
       # inside a 30-minute timeout.
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          # rust-cache keys on "Linux-x64" only; name the image so a target dir
+          # built against one Ubuntu release's glibc is never restored on another.
+          cache-key: ${{ matrix.os }}
 
       # The same container, driven by the real binary this time: discover a
       # target, probe it, serve, publish, reconcile status, re-publish after an
@@ -1051,7 +1090,7 @@ jobs:
         run: tests/remote-ssh/run-e2e.sh
 
   clippy:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04 # one LTS: compile-only lint with the pinned toolchain; the image does not change its result
     timeout-minutes: 20
     # sccache caches each rustc invocation across runs (see build-and-test for the
     # choice of backend and the probe). clippy compiles the whole workspace with
@@ -1065,12 +1104,13 @@ jobs:
     # build job's, and workspace crates go through clippy-driver, whose hash
     # differs from rustc's. Crates that must be fully linked for both (proc
     # macros, and anything a build script needs) do hit. Sharing cannot poison
-    # either job: the compiler binary is part of every key.
+    # either job: the compiler binary is part of every key. It is the 24.04
+    # leg's prefix specifically, since this job runs on that image.
     env:
       RUSTC_WRAPPER: sccache
       SCCACHE_AZURE_CONNECTION_STRING: ${{ secrets.CACHE_AZURE_CONNECTION_STRING }}
       SCCACHE_AZURE_BLOB_CONTAINER: cache
-      SCCACHE_AZURE_KEY_PREFIX: rocm-cli/build-and-test
+      SCCACHE_AZURE_KEY_PREFIX: rocm-cli/build-and-test/ubuntu-24.04
       SCCACHE_AZURE_RW_MODE: ${{ (github.event_name == 'push' || github.event_name == 'merge_group') && 'READ_WRITE' || 'READ_ONLY' }}
     needs: changes
     # A manual E2E dispatch only exercises the E2E jobs; skip the rest.
@@ -1125,6 +1165,10 @@ jobs:
 
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         if: needs.changes.outputs.rust == 'true'
+        with:
+          # rust-cache keys on "Linux-x64" only; name the image so a target dir
+          # built against one Ubuntu release's glibc is never restored on another.
+          cache-key: ubuntu-24.04
 
       - name: Clippy
         if: needs.changes.outputs.rust == 'true'
@@ -1161,7 +1205,7 @@ jobs:
 
   third-party-notices:
     name: Third-party notices current
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04 # one LTS: generated-manifest check, nothing here depends on the image
     timeout-minutes: 20
     needs: changes
     # A manual E2E dispatch only exercises the E2E jobs; skip the rest.
@@ -1171,6 +1215,10 @@ jobs:
 
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         if: needs.changes.outputs.tpn == 'true'
+        with:
+          # rust-cache keys on "Linux-x64" only; name the image so a target dir
+          # built against one Ubuntu release's glibc is never restored on another.
+          cache-key: ubuntu-24.04
 
       # Pin the cargo-about version so the check compares against the exact same
       # generator contributors use; a different version can format the notices
@@ -1184,7 +1232,9 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cargo/bin/cargo-about
-          key: ${{ runner.os }}-cargo-about-0.9.1
+          # The image is in the key: this caches a binary `cargo install` linked
+          # against the image's glibc.
+          key: ${{ runner.os }}-ubuntu-24.04-cargo-about-0.9.1
 
       - name: Install cargo-about
         if: needs.changes.outputs.tpn == 'true' && steps.cache-cargo-about.outputs.cache-hit != 'true'
@@ -1202,7 +1252,7 @@ jobs:
     # request waiting on a check that can no longer report. Rename and update
     # protection together, as their own change.
     name: Coverage (rocm-dash crates, ratcheted)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04 # one LTS: one measurement against the committed floors; Test (affected crates) runs the tests on both LTSes
     # Raised from 20: the gate now instruments the whole workspace rather than
     # four crates, so the build it waits on is several times larger.
     timeout-minutes: 45
@@ -1235,9 +1285,11 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-cov-${{ hashFiles('**/Cargo.lock') }}
+          # The image is in the key: target/ holds build scripts and proc macros
+          # linked against the image's glibc.
+          key: ${{ runner.os }}-ubuntu-24.04-cargo-cov-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-cov-
+            ${{ runner.os }}-ubuntu-24.04-cargo-cov-
 
       # Per-crate floors over every workspace crate, pinned in
       # `coverage-floors.toml` and enforced by the xtask. The crate list lives
@@ -1317,7 +1369,7 @@ jobs:
   # prompt.
   skill-evals:
     name: Skill checks (skillscope)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04 # one LTS: lint/hygiene only, nothing here depends on the image
     timeout-minutes: 10
     needs: changes
     # A manual E2E dispatch only exercises the E2E jobs; skip the rest.
@@ -1374,7 +1426,7 @@ jobs:
 
   license-headers:
     name: License header check (hawkeye)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04 # one LTS: lint/hygiene only, nothing here depends on the image
     timeout-minutes: 20
     env:
       # Install a pinned prebuilt hawkeye binary instead of pulling the
@@ -1418,7 +1470,7 @@ jobs:
 
   docs-links:
     name: Markdown links resolve (lychee)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04 # one LTS: lint/hygiene only, nothing here depends on the image
     timeout-minutes: 20
     # Deliberately NOT gated by the `changes` path filter: a markdown link can
     # go stale when the file or heading it points at moves, without the
@@ -1440,7 +1492,7 @@ jobs:
 
   docs-build:
     name: Sphinx docs build (-W)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04 # one LTS: docs build only, nothing here depends on the image
     timeout-minutes: 20
     needs: [changes]
     # A manual E2E dispatch only exercises the E2E jobs; skip the rest. Off a
@@ -1471,7 +1523,7 @@ jobs:
 
   commit-signatures:
     name: Commit signatures + sign-off
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04 # one LTS: commit metadata check, nothing here depends on the image
     timeout-minutes: 20
     # Runs on pull requests and in the merge queue. Both define a base that
     # bounds the commit range. Handling `merge_group` matters once this is a
@@ -1493,6 +1545,10 @@ jobs:
           ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
 
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          # rust-cache keys on "Linux-x64" only; name the image so a target dir
+          # built against one Ubuntu release's glibc is never restored on another.
+          cache-key: ubuntu-24.04
 
       - name: Verify commits are signed and signed-off
         # `--require-verified` shells out to the `gh` CLI; pass the job token so
@@ -1527,9 +1583,16 @@ jobs:
   # scenarios resolve to skip here; known bugs resolve to xfail from
   # expectations.toml.
   e2e:
-    name: E2E tests
     timeout-minutes: 15
-    runs-on: ubuntu-latest
+    # Runs on both Ubuntu LTS images. The 24.04 leg keeps the bare name,
+    # which is what branch protection requires; the 26.04 leg reports as
+    # "E2E tests (ubuntu-26.04)".
+    name: ${{ matrix.os == 'ubuntu-24.04' && 'E2E tests' || format('E2E tests ({0})', matrix.os) }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-26.04]
+    runs-on: ${{ matrix.os }}
     needs: [changes, build-and-test]
     # This is a REQUIRED check, so — like every sibling required job — the job
     # itself must always run (except on a manual dispatch that didn't select the
@@ -1546,15 +1609,21 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Whether the real work runs this time. On push/PR/merge_group: only when
-      # build-and-test succeeded and the change is heavy. On workflow_dispatch:
-      # build-and-test is skipped, so tolerate that and rely on the job-level
-      # platform gate above.
+      # build-and-test ran to a verdict and the change is heavy. On
+      # workflow_dispatch: build-and-test is skipped, so tolerate that and rely
+      # on the job-level platform gate above.
+      #
+      # "Ran to a verdict", not "succeeded": build-and-test is a matrix over
+      # both images and its result is the aggregate, so a failure on one image
+      # would otherwise skip this job's work on the other too — and the required
+      # 24.04 leg would report green without having run a scenario.
       - name: Decide whether to run
         id: gate
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "run=true" >> "$GITHUB_OUTPUT"
-          elif [ "${{ needs.build-and-test.result }}" = "success" ] \
+          elif { [ "${{ needs.build-and-test.result }}" = "success" ] \
+              || [ "${{ needs.build-and-test.result }}" = "failure" ]; } \
             && [ "${{ needs.changes.outputs.heavy }}" = "true" ]; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
@@ -1567,6 +1636,10 @@ jobs:
 
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         if: steps.gate.outputs.run == 'true'
+        with:
+          # rust-cache keys on "Linux-x64" only; name the image so a target dir
+          # built against one Ubuntu release's glibc is never restored on another.
+          cache-key: ${{ matrix.os }}
 
       # The workspace test job selects only affected crates and runs the cucumber
       # harness, not the library's own unit tests — run the capability/expectation
@@ -1587,11 +1660,26 @@ jobs:
           E2E_INCLUDE_DOCKER: "1"
         run: cargo xtask e2e
 
+      # One upload step per image rather than one templated `name:`, as in
+      # e2e-selfhosted.yml: the artifact-name contract in `xtask::e2e_report`
+      # reads `name: e2e-*` lines literally. Artifact names are unique per run.
+      # The 24.04 leg keeps `e2e-report`, which the consolidated report below
+      # picks up through its `*-report` glob. The 26.04 leg's artifact is named
+      # outside both that glob and the `e2e-` namespace: the report has one
+      # mock platform, and two inputs labelled as it would collide. It is
+      # uploaded for inspection only.
       - name: Upload E2E report
-        if: always() && steps.gate.outputs.run == 'true'
+        if: always() && steps.gate.outputs.run == 'true' && matrix.os == 'ubuntu-24.04'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: e2e-report
+          path: tests/e2e-cucumber/results/
+
+      - name: Upload E2E results (ubuntu-26.04)
+        if: always() && steps.gate.outputs.run == 'true' && matrix.os == 'ubuntu-26.04'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ubuntu-26.04-e2e-results
           path: tests/e2e-cucumber/results/
 
   # Consolidate the mock (GitHub-hosted) platform's report into the cross-platform
@@ -1605,7 +1693,7 @@ jobs:
   # glob still auto-includes any new GitHub-hosted platform added here.
   e2e-report:
     name: E2E consolidated report
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04 # one LTS: only merges report.json files
     # Bound the job (like every E2E job) so a stalled artifact download can't hang
     # a hosted runner indefinitely.
     timeout-minutes: 15
@@ -1622,6 +1710,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          # rust-cache keys on "Linux-x64" only; name the image so a target dir
+          # built against one Ubuntu release's glibc is never restored on another.
+          cache-key: ubuntu-24.04
 
       # Pull every e2e artifact matching the glob. `xtask e2e-report` turns each
       # into one labeled platform and the `*-report` glob makes new platforms
