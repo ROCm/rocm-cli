@@ -5052,9 +5052,14 @@ permissions:
     }
 
     /// PowerShell words that open a statement but are not a program to run.
-    const PWSH_KEYWORDS: [&str; 15] = [
+    ///
+    /// Every entry is a keyword to pwsh's own tokenizer
+    /// (`TokenTraits::HasTrait(kind, TokenFlags::Keyword)`), so none can name
+    /// a program at the start of a statement.
+    const PWSH_KEYWORDS: [&str; 22] = [
         "if", "elseif", "else", "foreach", "for", "while", "do", "switch", "function", "try",
-        "catch", "finally", "throw", "exit", "return",
+        "catch", "finally", "throw", "exit", "return", "break", "continue", "begin", "process",
+        "end", "param", "trap",
     ];
 
     /// Whether a trimmed, comment-free pwsh statement runs an external
@@ -5197,10 +5202,17 @@ permissions:
                 is_native_command_line(line)
                     && statements
                         .get(i + 1)
-                        .is_some_and(|next| !next.contains("$LASTEXITCODE"))
+                        .is_some_and(|next| !reads_last_exit_code(next))
             })
             .map(|(_, line)| line.clone())
             .collect()
+    }
+
+    /// Whether a pwsh statement mentions `$LASTEXITCODE`. PowerShell variable
+    /// names are case-insensitive, so `$LastExitCode` and `$lastexitcode` are
+    /// the same variable and count just the same.
+    fn reads_last_exit_code(statement: &str) -> bool {
+        statement.to_ascii_lowercase().contains("$lastexitcode")
     }
 
     /// [`unchecked_native_commands`] over a pwsh step's script: its `run: |`
@@ -5444,5 +5456,46 @@ permissions:
             "{:?}",
             pwsh_statements(&mismatched)
         );
+    }
+
+    /// PowerShell variable names are case-insensitive: a check spelled
+    /// `$LastExitCode` reads the same variable as `$LASTEXITCODE`.
+    #[test]
+    fn unchecked_native_commands_reads_last_exit_code_in_any_case() {
+        for check in [
+            "if ($LastExitCode -ne 0) { exit $LastExitCode }",
+            "if ($lastexitcode -ne 0) { exit 1 }",
+        ] {
+            let body = ["cargo build", check, "cargo xtask e2e"];
+            assert!(
+                unchecked_native_commands(&body).is_empty(),
+                "{check:?} reads the status: {:?}",
+                unchecked_native_commands(&body)
+            );
+        }
+    }
+
+    /// A statement that opens with a PowerShell keyword runs no program, so
+    /// it is not a native command left unchecked before `cargo xtask e2e`.
+    #[test]
+    fn a_statement_opening_with_a_pwsh_keyword_is_not_a_native_command() {
+        for statement in [
+            "break",
+            "continue",
+            "begin {",
+            "process {",
+            "end {",
+            "param([string] $Target)",
+            "trap { Write-Output 'trapped' }",
+        ] {
+            assert!(
+                !is_native_command_line(statement),
+                "{statement:?} reads as a native command"
+            );
+            assert!(
+                unchecked_native_commands(&[statement, "cargo xtask e2e"]).is_empty(),
+                "{statement:?}"
+            );
+        }
     }
 }
