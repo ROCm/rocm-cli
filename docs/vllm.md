@@ -83,7 +83,12 @@ same `whl-next` index, which is where `rocm install sdk` resolves either SDK's
 own `+rocmX.Y` torch from, but vLLM's discovery is independent of that: it
 resolves its own torch/torchvision/torchaudio pins fresh from the row's own
 static version prefixes, rather than reusing whatever the SDK install
-resolved, which may be a different torch version than this row pins. Patch
+resolved, which may be a different torch version than this row pins. One
+value flows the other way: a row's exact torchaudio pin, where it has one rather
+than a series, is
+also the hardware-verified build `rocm install sdk` pins for that ROCm line,
+read from this table rather than copied, so set an exact torchaudio only for a
+build confirmed on hardware. Patch
 and any dev/pre-release suffix are still ignored within a row, since AMD
 rotates those constantly.
 

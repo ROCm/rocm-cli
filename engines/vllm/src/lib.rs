@@ -24,6 +24,17 @@ mod state;
 
 pub(crate) const ENGINE_NAME: &str = "vllm";
 
+/// The torchaudio release (no `+rocm…` local label) confirmed on hardware for
+/// `rocm_sdk_version`'s ROCm `major.minor` line, if one is recorded.
+///
+/// The single source of truth is this crate's ROCm 10.x discover-build table,
+/// which pins it for the vLLM install; `rocm install sdk` reads it here so the
+/// SDK pins the same build instead of keeping a second copy. `None` means no
+/// build has been verified for that line, not that none works.
+pub fn verified_torchaudio_release(rocm_sdk_version: &str) -> Option<&'static str> {
+    install::verified_torchaudio_release(rocm_sdk_version)
+}
+
 pub(crate) const DEFAULT_HOST: &str = "127.0.0.1";
 
 #[derive(Parser, Debug)]
