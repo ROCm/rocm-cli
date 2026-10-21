@@ -2923,6 +2923,7 @@ mod tests {
                 chat_endpoint: "http://127.0.0.1:8000/v1/chat/completions".to_owned(),
                 service_id: "svc-ready".to_owned(),
                 status: "ready".to_owned(),
+                device: None,
                 already_running: false,
                 metrics,
                 api_key: None,

@@ -43,6 +43,7 @@ Feature: Model serving
     When the user sends a chat completion request
     Then the response contains a model reply
     And the response identifies the correct model
+    And the services list reports the engine's actual backend device
 
   # Large-model coverage (dogfooding W9): serve a representative large model for
   # each GPU platform end-to-end at least once. The model follows the lane's serve
@@ -62,6 +63,14 @@ Feature: Model serving
   # Lemonade serve + inference (GGUF model). Engine coverage: Lemonade. The
   # lemonade per-PR canary: one real lemonade serve runs on every PR (the
   # counterpart to the vLLM canary above).
+  #
+  # ROCMAI-550's device-reporting Then is listed here for the lanes that run it,
+  # but it is NOT coverage on lemonade+linux: the whole scenario is xfail'd there
+  # (EAI-7423 -- the managed serve reaches ready then shuts down ~0.08s later),
+  # so no step of it is a live assertion on that lane. Moving the Then earlier
+  # would not change that: the service is gone before a healthcheck could report
+  # a device. The vLLM canary (serve-05) is what actually exercises device
+  # reporting on every PR today.
   @id:serve-lemonade-inference @requires-gpu @requires-engine:lemonade
   Scenario: serve-07 - A model served on lemonade responds to inference requests
     Given a managed runtime is active
@@ -69,6 +78,7 @@ Feature: Model serving
     When the user sends a chat completion request
     Then the response contains a model reply
     And the response identifies the correct model
+    And the services list reports the engine's actual backend device
 
   # HF-checkpoint direct-serve canary (EAI-8026). An `owner/repo:variant` ref
   # bypasses Lemonade's model router and runs a packaged llama-server directly
