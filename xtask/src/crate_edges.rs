@@ -57,6 +57,7 @@ const ALLOWLIST: &[(&str, &str)] = &[
     ("rocm-dash-collectors", "rocm-dash-core"),
     ("rocm-dash-daemon", "rocm-dash-core"),
     ("rocm-dash-daemon", "rocm-dash-collectors"),
+    ("rocm-dash-tui", "rocm-dash-collectors"),
     ("rocm-dash-tui", "rocm-dash-core"),
     ("rocm-dash-tui", "rocm-deps"),
     ("rocm-engine-lemonade", "rocm-core"),
