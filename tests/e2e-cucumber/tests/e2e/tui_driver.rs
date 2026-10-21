@@ -32,6 +32,7 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system}
 
 use e2e_cucumber::paced_download::is_intermediate_download_progress_frame;
 use e2e_cucumber::panic_capture::panic_message;
+use e2e_cucumber::quit_and_wait::{ExitPoll, QuitError, quit_and_wait as retry_quit_and_wait};
 use e2e_cucumber::reader_failure::{ReaderFailure, ReaderFailureObservation};
 use e2e_cucumber::send_until::{RetryTiming, TerminalState, send_until as retry_send_until};
 
@@ -889,13 +890,14 @@ impl TuiSession {
     /// the app has finished acting on whatever came just before it (e.g. right
     /// after an unsynchronized `send` like the Escape key), it can be consumed
     /// by that transient state and never reach the quit handler — the process
-    /// then never exits and this hangs until `timeout`. Re-sending on a short
-    /// cadence closes that gap the same way [`send_until`] does for screen
-    /// markers: if the first attempt landed (the common case), the process
-    /// has already exited by the first check and the loop below never reaches
-    /// a second send. What's resent each pass isn't always the same literal
-    /// `gesture` either — see the quit-confirm handling below, which switches
-    /// to `"y"` once the prompt is on screen.
+    /// then never exits and this hangs until `timeout`. Re-sending closes that
+    /// gap the same way [`send_until`] does for screen markers: if the first
+    /// attempt landed (the common case), the process has already exited by the
+    /// first check and the loop never reaches a second send. What's resent
+    /// each pass isn't always the same literal `gesture` either — see the
+    /// quit-confirm handling below, which switches to `"y"` once the prompt is
+    /// on screen — and the wait between sends doubles each pass, for the
+    /// reason [`e2e_cucumber::quit_and_wait::quit_and_wait`] gives.
     pub async fn quit_and_wait(&mut self, timeout: Duration) -> Result<(), String> {
         // Several fixtures leave a model serving (`simulated`/demo sessions
         // never do — `AppState::has_live_instance` always returns `false`
@@ -911,38 +913,44 @@ impl TuiSession {
         // for `/quit\r` — type "uit" into chat as a message once the leading
         // `q` cancels the prompt. Either way it never exits.
         let gesture = if self.is_chat { "/quit\r" } else { "q" };
-        let deadline = Instant::now() + timeout;
-        loop {
-            let confirming = self.screen_snapshot().0.contains(QUIT_CONFIRM_MARKER);
-            self.send(if confirming { "y" } else { gesture })?;
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            let attempt = KEY_RESEND_INTERVAL.min(remaining);
-            match self.wait_for_exit_code_within(attempt).await {
-                Some(code) => {
-                    return if code == 0 {
-                        Ok(())
-                    } else {
-                        Err(format!(
-                            "TUI exited unsuccessfully (code {code}).\n{}",
-                            self.framed_screen()
-                        ))
-                    };
-                }
-                None => {
-                    if let Some(panic_message) = self.take_reader_panic() {
-                        return Err(format!(
-                            "pty reader thread panicked while waiting to quit: {panic_message}\n{}",
-                            self.framed_screen()
-                        ));
-                    }
-                }
-            }
-            if Instant::now() >= deadline {
-                return Err(format!(
-                    "timed out after {timeout:?} waiting for the TUI to exit after repeating {gesture:?}.\n{}",
+        let result = retry_quit_and_wait(
+            self,
+            gesture,
+            RetryTiming {
+                timeout,
+                resend_interval: KEY_RESEND_INTERVAL,
+            },
+            |session| session.screen_snapshot().0.contains(QUIT_CONFIRM_MARKER),
+            Self::send,
+            |session, attempt| Box::pin(session.exit_poll_within(attempt)),
+        )
+        .await;
+        match result {
+            Ok(()) => Ok(()),
+            Err(QuitError::Failed(error)) => Err(error),
+            Err(QuitError::TimedOut) => Err(format!(
+                "timed out after {timeout:?} waiting for the TUI to exit after repeating {gesture:?}.\n{}",
+                self.framed_screen()
+            )),
+        }
+    }
+
+    /// One bounded wait of [`quit_and_wait`](Self::quit_and_wait): whether the
+    /// child exited within `budget` (and how), or the reader thread failed.
+    async fn exit_poll_within(&mut self, budget: Duration) -> ExitPoll {
+        match self.wait_for_exit_code_within(budget).await {
+            Some(0) => ExitPoll::Finished(Ok(())),
+            Some(code) => ExitPoll::Finished(Err(format!(
+                "TUI exited unsuccessfully (code {code}).\n{}",
+                self.framed_screen()
+            ))),
+            None => match self.take_reader_panic() {
+                Some(panic_message) => ExitPoll::Finished(Err(format!(
+                    "pty reader thread panicked while waiting to quit: {panic_message}\n{}",
                     self.framed_screen()
-                ));
-            }
+                ))),
+                None => ExitPoll::Running,
+            },
         }
     }
 
