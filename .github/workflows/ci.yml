@@ -730,7 +730,9 @@ jobs:
 
       # One command per step: pwsh carries on past a failing native command and
       # the step reports only the last command's exit code, so a multi-line
-      # block would let an early self-test fail unseen.
+      # block would let an early self-test fail unseen. Enforced for every pwsh
+      # step by `no_pwsh_step_lets_a_failing_native_command_pass_unseen` in
+      # xtask/src/workflow_contract.rs.
       - name: Acceptance harness self-test (ComfyUI)
         if: needs.changes.outputs.heavy == 'true'
         shell: pwsh
