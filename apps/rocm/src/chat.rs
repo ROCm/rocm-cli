@@ -2,16 +2,17 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Chat/assistant tool-call support: the chat/MCP-bridge cluster's
-//! `pub(crate)` types (`ChatRocmCommandAction`, `CommandCapture`,
-//! `DeterministicModelRecipe`, `DeterministicServiceRow`,
-//! `DeterministicEngineRow`), its tool-call validation/approval/execution
-//! logic (`validate_chat_tool_call` and the `validate_chat_*_tool_call`
-//! family), deterministic tool-output summarization, and the MCP
-//! tool-bridge entry points (`run_internal_mcp_call` and its helpers).
-//! Every call site in `main.rs`, `dash.rs`, `dash_seam.rs`, `comfyui.rs`,
-//! and `runtime_install_finalize.rs` goes through the `chat::` module
-//! boundary.
+//! Chat/assistant tool-call support: the chat/MCP-bridge cluster's types
+//! (`ChatRocmCommandAction`, `CommandCapture`, `DeterministicModelRecipe`,
+//! `DeterministicServiceRow`, `DeterministicEngineRow`, and others — all
+//! module-private except `ChatToolApprovalRequest`, reached by
+//! `dash_seam.rs` as `chat_tool_approval_request`'s return type), its
+//! tool-call validation/approval/execution logic (`validate_chat_tool_call`
+//! and the `validate_chat_*_tool_call` family), deterministic tool-output
+//! summarization, and the MCP tool-bridge entry points
+//! (`run_internal_mcp_call` and its helpers). Every call site in `main.rs`,
+//! `dash.rs`, `dash_seam.rs`, `comfyui.rs`, and `runtime_install_finalize.rs`
+//! goes through the `chat::` module boundary.
 //!
 //! Full domain extraction, mirroring `providers.rs`. Phase 6d (ROCMAI-88) of
 //! the `main.rs` modularization (see `docs/architecture.md`), split across
@@ -19,7 +20,9 @@
 //! combined slice of all three (types and leaf helpers, the orchestration
 //! bodies, and the cluster's regression tests moved out of `main.rs`'s
 //! shared `mod tests` block), plus the third PR's own visibility audit —
-//! every item still `pub(crate)` has a confirmed caller outside this module.
+//! every function still `pub(crate)` has a confirmed caller outside this
+//! module; none of the module's types need to be, bar the one exception
+//! above.
 
 use crate::runtime_install_finalize::empty_as_unknown;
 use crate::runtimes_cmd::render_runtimes_text;
@@ -53,7 +56,7 @@ use std::process::Command as ProcessCommand;
 use std::time::Duration;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub(crate) enum ChatRocmCommandAction {
+enum ChatRocmCommandAction {
     ReadOnly(Vec<String>),
     Approval {
         args: Vec<String>,
@@ -63,7 +66,7 @@ pub(crate) enum ChatRocmCommandAction {
 }
 
 #[derive(Debug)]
-pub(crate) struct CommandCapture {
+struct CommandCapture {
     pub(crate) argv: Vec<String>,
     pub(crate) exit_status: i32,
     pub(crate) stdout: String,
@@ -249,7 +252,7 @@ fn json_string(object: &serde_json::Map<String, serde_json::Value>, key: &str) -
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct DeterministicModelRecipe {
+struct DeterministicModelRecipe {
     pub(crate) canonical_id: String,
     pub(crate) min_gpu_mem_gib: Option<u32>,
     pub(crate) engines: Vec<String>,
@@ -324,7 +327,7 @@ fn is_engine_status_line(line: &str) -> bool {
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct DeterministicServiceRow {
+struct DeterministicServiceRow {
     pub(crate) service_id: String,
     pub(crate) engine: String,
     pub(crate) model: String,
@@ -393,7 +396,7 @@ fn parse_deterministic_service_rows(tool_text: &str) -> Vec<DeterministicService
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct DeterministicEngineRow {
+struct DeterministicEngineRow {
     pub(crate) engine: String,
     pub(crate) runtime: String,
     pub(crate) note: String,
@@ -610,12 +613,12 @@ pub(crate) struct ChatToolApprovalRequest {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub(crate) struct ChatPromptResult {
+struct ChatPromptResult {
     pub rendered: String,
     pub approval: Option<ChatToolApprovalRequest>,
 }
 
-pub(crate) struct ChatToolRunResult {
+struct ChatToolRunResult {
     pub(crate) approval: Option<ChatToolApprovalRequest>,
     pub(crate) follow_up_text: String,
     pub(crate) ran_read_only_tool: bool,
@@ -3283,7 +3286,8 @@ fn chat_tool_value(tool_text: &str, key: &str) -> Option<String> {
     })
 }
 
-// pub(crate): used by the dash execution seam (dash_seam.rs)
+// pub(crate): called from main.rs's own MCP dispatch and from the dash
+// execution seam (dash_seam.rs)
 pub(crate) fn run_internal_mcp_call(
     paths: &AppPaths,
     name: &str,
@@ -4123,7 +4127,7 @@ mod tests {
     use crate::runtime_install_finalize::tests::consents_for_install_sdk_argv;
     use crate::tests::test_paths;
     use crate::{Cli, Command, InstallTarget};
-    use clap::{CommandFactory, Parser};
+    use clap::Parser;
     use rocm_core::ManagedServiceRecord;
     use std::fs;
     use std::net::TcpListener;
@@ -4173,30 +4177,13 @@ mod tests {
     }
 
     #[test]
-    fn runtimes_help_uses_the_runtime_noun_throughout() {
+    fn runtimes_activate_approval_modal_uses_the_runtime_noun() {
         // `comfyui install`'s selection errors steer the user to `rocm runtimes`
-        // and say "ROCm runtime". The help for the command they land on must use
-        // the same noun — including its own about line, which `rocm runtimes
-        // --help` prints above the subcommand list and which the rename missed
-        // while every subcommand below it already said "runtime".
-        let help = Cli::command()
-            .find_subcommand_mut("runtimes")
-            .expect("runtimes subcommand")
-            .render_long_help()
-            .to_string();
-        assert!(
-            help.contains("ROCm runtimes"),
-            "`rocm runtimes --help` should describe itself with the `runtime` noun:\n{help}"
-        );
-        assert!(
-            !help.contains("ROCm install"),
-            "`rocm runtimes --help` must not reintroduce the `ROCm install` noun:\n{help}"
-        );
-
-        // The help is not the only `runtimes` string a user reads: running a
-        // mutating `rocm runtimes …` from chat raises an approval modal whose
-        // title is written here, not by clap, so the help assertions above
-        // cannot reach it. It said "Change ROCm install" until this rename.
+        // and say "ROCm runtime". Running a mutating `rocm runtimes …` from chat
+        // raises an approval modal whose title is written here, not by clap, so
+        // `main.rs`'s `runtimes_help_uses_the_runtime_noun_throughout` (which
+        // covers `--help` text) cannot reach it. It said "Change ROCm install"
+        // until this rename.
         let action = chat_rocm_command_action_from_args(vec![
             "runtimes".to_owned(),
             "activate".to_owned(),

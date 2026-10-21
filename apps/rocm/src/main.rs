@@ -12257,6 +12257,31 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn runtimes_help_uses_the_runtime_noun_throughout() {
+        // `comfyui install`'s selection errors steer the user to `rocm runtimes`
+        // and say "ROCm runtime". The help for the command they land on must use
+        // the same noun — including its own about line, which `rocm runtimes
+        // --help` prints above the subcommand list and which the rename missed
+        // while every subcommand below it already said "runtime". The approval
+        // modal raised by a mutating `rocm runtimes …` from chat says the same
+        // noun too, but clap doesn't render that title — see
+        // `chat::tests::runtimes_activate_approval_modal_uses_the_runtime_noun`.
+        let help = Cli::command()
+            .find_subcommand_mut("runtimes")
+            .expect("runtimes subcommand")
+            .render_long_help()
+            .to_string();
+        assert!(
+            help.contains("ROCm runtimes"),
+            "`rocm runtimes --help` should describe itself with the `runtime` noun:\n{help}"
+        );
+        assert!(
+            !help.contains("ROCm install"),
+            "`rocm runtimes --help` must not reintroduce the `ROCm install` noun:\n{help}"
+        );
+    }
+
+    #[test]
     fn the_preview_marker_is_explained_and_not_contradicted() {
         let help = Cli::command().render_long_help().to_string();
         // A marker nobody can interpret is no better than no marker.
