@@ -543,7 +543,11 @@ const RECIPES: &[FixRecipe] = &[
         needs_sudo: true,
         needs_reboot: true,
         needs_relogin: false,
-        verify: "(dpkg -l 2>/dev/null | grep -qE 'rocm|amdgpu' || rpm -qa 2>/dev/null | grep -qE 'rocm|amdgpu') && rocminfo | head -n 5",
+        // See the matching comment on this fix's `verify` in diagnose.rs:
+        // the status column (`^ii`) must be checked, not just that a
+        // rocm/amdgpu package name appears, or a half-configured package
+        // (this fix's own target symptom) passes before any remediation.
+        verify: "(dpkg -l 2>/dev/null | grep -E '^ii' | grep -qE 'rocm|amdgpu' || rpm -qa 2>/dev/null | grep -qE 'rocm|amdgpu') && rocminfo | head -n 5",
         notes: &[
             "If the purge/remove step warns it will take unrelated packages with it, stop and resolve those by hand before continuing.",
         ],

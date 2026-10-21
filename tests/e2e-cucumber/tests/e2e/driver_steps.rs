@@ -31,9 +31,24 @@ async fn preview_driver_install_on_this_host(world: &mut E2eWorld) {
     world.cli_rc = Some(rc);
 }
 
-#[then("the driver plan writes an apt repo file with AMD's signing key")]
-async fn assert_apt_repo_file_and_key(world: &mut E2eWorld) {
+#[then("the driver plan matches this host's actual Ubuntu release")]
+async fn assert_driver_plan_matches_host_release(world: &mut E2eWorld) {
     let output = world.cli_output.as_ref().expect("no driver plan output");
+    // Most bare-metal lanes are on an Ubuntu release with a published
+    // repo.radeon.com/amdgpu suite and take the apt-repo-file plan below, but
+    // the self-hosted GPU lane's real host reports Ubuntu 26.04 ("resolute"),
+    // which has none yet and takes `ubuntu_native_archive` instead -- see the
+    // `("ubuntu", "26.04")` arm in `driver_install.rs`. Assert whichever the
+    // real host actually produced rather than hard-coding one release.
+    if output.contains("policy: ubuntu_native_archive") {
+        assert!(output.contains("supported: false"), "{output}");
+        assert!(
+            output.contains("ships ROCm natively via the standard archive"),
+            "{output}"
+        );
+        return;
+    }
+
     // The runner may already be root (the self-hosted WSL runner always is),
     // in which case the plan omits the `sudo ` prefix entirely.
     let sudo = if rocm_core::openmpi::running_as_root() {

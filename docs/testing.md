@@ -1621,7 +1621,8 @@ DKMS repo (the amdgpu driver ships in-tree instead), so the plan comes back
 `supported: false` and directs the user to `apt install rocm`. This arm is
 covered at the unit level by
 `driver_plan_ubuntu_2604_uses_native_archive_guidance` and its two neighbors in
-`driver_install.rs`, but has no e2e/Gherkin coverage: `read_os_release()` reads
+[driver_install.rs](../apps/rocm/src/driver_install.rs), but has no e2e/Gherkin
+coverage: `read_os_release()` reads
 the live `/etc/os-release` with no override, so no lane or host running a
 different Ubuntu release can reach this arm through the CLI itself.
 

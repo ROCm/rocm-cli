@@ -215,9 +215,18 @@ pub struct Examination {
     pub distro_id: String,
     pub distro_version: String,
     /// `/etc/os-release` `ID_LIKE`, for `openmpi::resolve_package_manager`
-    /// fallback matching. Not part of the examine.py wire contract, so it's
-    /// excluded from JSON.
-    #[serde(skip)]
+    /// fallback matching. Not part of the examine.py wire contract, but
+    /// included in JSON anyway (like the `comgr_*`/`hip_*` fields below):
+    /// `rocm remote doctor` diagnoses a remote host by deserializing its
+    /// `examine --json` output, and `repo_pkg_family`'s fallback needs this
+    /// field populated on that deserialized value, not just on a freshly
+    /// probed local `Examination`.
+    ///
+    /// `#[serde(default)]`: a remote on an older CLI version won't have
+    /// printed this field at all, and `parse_examination` must keep accepting
+    /// that document rather than failing outright over one missing field it
+    /// can safely fall back to "" (unknown) for.
+    #[serde(default)]
     pub distro_id_like: String,
     pub kernel_release: String,
     pub kernel_cmdline: String,
@@ -3374,8 +3383,9 @@ mod tests {
 
     /// `ID_LIKE` is parsed into `distro_id_like` for
     /// `repo_pkg_family`/`openmpi::resolve_package_manager`'s fallback
-    /// matching, same as `ID`/`VERSION_ID`, even though it's `#[serde(skip)]`
-    /// and so never shows up by just inspecting the JSON examine output.
+    /// matching, same as `ID`/`VERSION_ID`, and round-trips through JSON the
+    /// same way so `rocm remote doctor` gets it from a deserialized remote
+    /// `examine --json` output too.
     #[test]
     fn id_like_is_parsed_into_distro_id_like() {
         let mut e = linux_host_with_a_gpu();
@@ -4055,6 +4065,11 @@ mod tests {
             "os_version",
             "distro_id",
             "distro_version",
+            // CLI addition beyond examine.py, added deliberately: `ID_LIKE`,
+            // so `rocm remote doctor` can resolve a remote host's package
+            // manager family from its deserialized `examine --json` output,
+            // not only from a freshly probed local `Examination`.
+            "distro_id_like",
             "kernel_release",
             "kernel_cmdline",
             "is_wsl",

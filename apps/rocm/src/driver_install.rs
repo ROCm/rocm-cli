@@ -854,7 +854,12 @@ fn resolve_repo_version_expr() -> Result<String, Box<DriverInstallPlan>> {
     // release should see why it did not take effect, not an unexplained
     // `latest`.
     match std::env::var("ROCM_CLI_AMDGPU_DRIVER_VERSION") {
+        // Set-but-empty is treated the same as unset, matching every other
+        // optional override in this file (`resolve_rocdxg_verification`,
+        // `resolve_shell_default_template`): a blank env var is how an env
+        // file clears an override, not a request to refuse the plan.
         Err(_) => Ok("latest".to_owned()),
+        Ok(v) if v.is_empty() => Ok("latest".to_owned()),
         Ok(v) if is_safe_shell_token(&v) => Ok(v),
         Ok(v) => Err(Box::new(DriverInstallPlan {
             supported: false,
@@ -984,18 +989,15 @@ fn build_driver_install_plan_at(
         // to apt_driver_plan(..., true) once it exists, the same way
         // 22.04/24.04 are handled.
         //
-        // No Gherkin/e2e scenario covers this arm's output (AGENTS.md #3),
-        // and that is not one of #3's two named exceptions (a gated lane, or
-        // a purely internal change) -- this is user-observable `rocm install
-        // driver` output on a real OS release. The unit level is NOT the gap:
-        // `build_driver_install_plan` takes `os_release_text: &str` as a
-        // plain parameter rather than calling `read_os_release()` itself, so
-        // this arm is already driven by a hand-written fixture in
+        // This arm IS reachable through the CLI on a real host -- this PR's
+        // own self-hosted bare-metal CI runner's `/etc/os-release` reports
+        // Ubuntu 26.04, which is exactly how `driver-install-04` in
+        // `driver_install.feature` caught this arm silently taking over that
+        // scenario's apt-plan premise mid-review. That scenario now asserts
+        // whichever arm the real host actually falls into, so this one has
+        // e2e coverage too, alongside the unit fixture in
         // `driver_plan_ubuntu_2604_uses_native_archive_guidance` and its two
-        // neighbors below. The gap is only the e2e path: the real `rocm`
-        // binary's `read_os_release()` reads `/etc/os-release` with no
-        // override, so no lane or test host can reach this arm through the
-        // CLI itself.
+        // neighbors below.
         ("ubuntu", "26.04") => {
             let sudo = escalation.prefix();
             DriverInstallPlan {
@@ -2808,6 +2810,26 @@ VERSION_CODENAME=noble
                 .iter()
                 .all(|command| !command.command.contains("pwned"))
         );
+    }
+
+    #[test]
+    fn driver_plan_treats_empty_version_override_as_unset() {
+        let mut env = ScopedTestEnv::with_amd_overrides_cleared();
+        env.set("ROCM_CLI_AMDGPU_DRIVER_VERSION", "");
+        let os_release = r#"
+ID=ubuntu
+VERSION_ID="24.04"
+VERSION_CODENAME=noble
+"#;
+        let plan = build_driver_install_plan_read(
+            &test_examine("linux", false),
+            &os_release_found(os_release),
+            true,
+            PrivilegeEscalation::Sudo,
+        );
+
+        assert_ne!(plan.policy, "invalid_driver_version_override");
+        assert_eq!(plan.repo_version_expr, "latest");
     }
 
     #[test]

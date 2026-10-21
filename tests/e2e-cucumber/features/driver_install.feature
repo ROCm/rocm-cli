@@ -30,16 +30,21 @@ Feature: Driver installation planning
     When the user previews driver installation for a ROCDXG release with no known digest
     Then the driver plan refuses rather than installing an unverified package
 
-  # Every bare-metal Linux lane in this repo (the GitHub-hosted mock job and
-  # every self-hosted GPU lane) runs Ubuntu, so this is always the apt plan in
-  # practice -- not the dnf or zypper arms, which have no CI host to run on.
-  # `--dry-run` previews the plan without writing anything, so this is safe on
-  # a shared CI host: it asserts on the real `apt_driver_plan` command text
-  # this binary would use to write /etc/apt/sources.list.d/amdgpu.list and
-  # import AMD's signing key, the same commands the unit fixtures in
-  # `driver_install.rs` exercise with a hand-written os-release rather than a
-  # real one.
+  # Every bare-metal Linux lane in this repo runs Ubuntu, but not always the
+  # same release -- the self-hosted GPU lane's real /etc/os-release reports
+  # 26.04 ("resolute"), which `build_driver_install_plan` routes to the
+  # `ubuntu_native_archive` arm instead of the apt one (no repo.radeon.com/
+  # amdgpu suite published for "resolute" yet; see the `("ubuntu", "26.04")`
+  # arm in `driver_install.rs`). `--dry-run` previews the plan without writing
+  # anything, so this is safe on a shared CI host either way: on an apt-arm
+  # release it asserts the real `apt_driver_plan` command text this binary
+  # would use to write /etc/apt/sources.list.d/amdgpu.list and import AMD's
+  # signing key, the same commands the unit fixtures in `driver_install.rs`
+  # exercise with a hand-written os-release; on 26.04 it asserts the
+  # native-archive refusal instead, so the scenario proves the CLI's actual
+  # output on whichever release the lane happens to run rather than
+  # hard-coding an apt-arm premise a lane can silently outgrow.
   @id:driver-install-apt-repo-file-and-key-content @requires-os:linux @requires-bare-metal
-  Scenario: driver-install-04 - Previewing the driver install on a real apt host plans the repo file and signing key
+  Scenario: driver-install-04 - Previewing the driver install on a real bare-metal host plans release-appropriate driver setup
     When the user previews driver installation on this host
-    Then the driver plan writes an apt repo file with AMD's signing key
+    Then the driver plan matches this host's actual Ubuntu release

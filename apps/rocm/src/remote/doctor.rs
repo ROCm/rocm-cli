@@ -287,6 +287,21 @@ mod tests {
     }
 
     #[test]
+    fn distro_id_like_survives_the_remote_round_trip() {
+        // `repo_pkg_family`'s ID_LIKE fallback only ever runs against a
+        // deserialized remote examination, never a freshly probed local one --
+        // so if this field didn't round-trip through JSON, the fallback would
+        // silently and permanently never fire for `rocm remote doctor`.
+        let mut value: serde_json::Value = serde_json::from_str(&examine_json()).unwrap();
+        value.as_object_mut().unwrap().insert(
+            "distro_id_like".to_owned(),
+            serde_json::json!("rhel fedora"),
+        );
+        let parsed = parse_examination(&value.to_string()).expect("examined");
+        assert_eq!(parsed.distro_id_like, "rhel fedora");
+    }
+
+    #[test]
     fn a_remote_on_another_version_says_so_instead_of_failing_obscurely() {
         let error = parse_examination(r#"{"unexpected": true}"#)
             .unwrap_err()

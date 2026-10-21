@@ -1142,7 +1142,18 @@ fn check_7_stale_repos(e: &Examination, symptom: &str) -> Diagnosis {
         "apt" => "sudo apt update 2>&1 | tail -n 20".to_owned(),
         "dnf" => "sudo dnf clean all 2>&1 | tail -n 20".to_owned(),
         "zypper" => "sudo zypper refresh 2>&1 | tail -n 20".to_owned(),
-        _ => "rocm examine --json | grep -q '\"rocm_install_method\"'".to_owned(),
+        // No package manager to refresh on this host, so the only real
+        // post-condition the suggested (commented-out) `mv ... .bak`
+        // commands above leave behind is that the flagged repo files are
+        // gone from their original paths -- unlike
+        // `rocm examine --json | grep -q '"rocm_install_method"'`, which is
+        // present in every `examine --json` output regardless of host state
+        // and so can never fail.
+        _ => repos
+            .iter()
+            .map(|r| format!("! test -e '{r}'"))
+            .collect::<Vec<_>>()
+            .join(" && "),
     };
     let fix = Fix {
         summary: "Quarantine duplicate ROCm/AMDGPU repo files and resolve the package manager before re-running any installer.".to_owned(),
@@ -1563,7 +1574,14 @@ fn check_12_repo_native_broken(e: &Examination, symptom: &str) -> Diagnosis {
         // `probe_rocm_install`), so a repo file left behind by a failed
         // `install --dkms` keeps the marker true even though the package
         // never actually installed.
-        verify: "(dpkg -l 2>/dev/null | grep -qE 'rocm|amdgpu' || rpm -qa 2>/dev/null | grep -qE 'rocm|amdgpu') && rocminfo | head -n 5".to_owned(),
+        //
+        // Must check dpkg's *status* column (`^ii`), not just that a
+        // rocm/amdgpu package name appears at all: a half-configured package
+        // (the exact symptom this fix targets) still shows up in `dpkg -l`
+        // under a non-`ii` status (e.g. `iF`), so a bare name grep is already
+        // true before the fix runs. `rpm -qa` has no equivalent half-broken
+        // listing, so it's left as a plain name grep.
+        verify: "(dpkg -l 2>/dev/null | grep -E '^ii' | grep -qE 'rocm|amdgpu' || rpm -qa 2>/dev/null | grep -qE 'rocm|amdgpu') && rocminfo | head -n 5".to_owned(),
         notes: vec!["If the purge/remove step warns it will take unrelated packages with it, stop and resolve those by hand before continuing.".to_owned()],
         ..Fix::default()
     };
@@ -7118,6 +7136,20 @@ mod tests {
             "verify step must not assume a foreign package manager on a pacman host: {}",
             fix.verify
         );
+        // Not just "no foreign package manager" -- the verify must be a real,
+        // falsifiable post-condition. `rocm examine --json | grep -q
+        // '"rocm_install_method"'` is present in every `examine --json` output
+        // regardless of host state, so it would pass this assertion too while
+        // never actually being able to fail. Pin it to the one thing the
+        // suggested (commented) `mv {r} {r}.bak` commands actually change: the
+        // flagged repo files no longer existing at their original paths.
+        for r in &e.rocm_repos_seen {
+            assert!(
+                fix.verify.contains(r),
+                "verify must check each flagged repo file is gone, not a tautology: {}",
+                fix.verify
+            );
+        }
     }
 
     #[test]
@@ -7153,6 +7185,34 @@ mod tests {
                 && !c.contains("dnf")
                 && !c.contains("zypper")),
             "must not print a foreign package manager's commands on an unresolved/pacman host: {commands:?}"
+        );
+    }
+
+    #[test]
+    fn repo_native_broken_verify_requires_dpkg_status_not_just_name_presence() {
+        // `method == "apt"` here is the exact pre-fix state `is_repo_native_installed`
+        // treats as already repo-native-installed (see its doc comment): the dpkg/rpm
+        // query fallback found an amdgpu/rocm package by name, with no distinction
+        // between a healthy install and a half-configured one. If `verify` only
+        // re-ran that same bare name grep, it would already be true here, before any
+        // of this fix's remediation commands run.
+        let mut e = linux_base();
+        e.rocm_install_method = "apt".to_owned();
+        let report = diagnose(
+            &e,
+            "dpkg: error processing package amdgpu-dkms (half-configured)",
+        );
+        let hit = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-12-installer")
+            .expect("repo-native broken state should be diagnosed");
+        let verify = &hit.fix.as_ref().unwrap().verify;
+        assert!(
+            verify.contains("grep -E '^ii'"),
+            "verify must check dpkg's installed-status column (`^ii`), not just that the \
+             package name appears -- a half-configured package (this fix's own target \
+             symptom) already matches a bare name grep before any remediation runs: {verify}"
         );
     }
 
