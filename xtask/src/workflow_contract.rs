@@ -2897,12 +2897,22 @@ fi
 
         // argv[0] names an E2E root and an engine marker, which is what the
         // rule matches, and sits under the scope so nothing else can.
+        //
+        // A copy of bash running a loop, for the reasons `spawn_decoy` in
+        // reclaim-gpu.sh gives: a copied multicall `sleep` exits at once as an
+        // unknown program, and bash would exec a lone `sleep 300` in place.
         let decoy_dir = scope.path().join("e2e-prewarm/bin");
         std::fs::create_dir_all(&decoy_dir).expect("decoy dir");
         let decoy = decoy_dir.join("llama-server");
-        std::fs::copy("/bin/sleep", &decoy).expect("copy /bin/sleep as the decoy");
+        std::fs::copy("/bin/bash", &decoy).expect("copy /bin/bash as the decoy");
         let mut child = std::process::Command::new(&decoy)
-            .arg("300")
+            .args(["-c", "for _ in {1..300}; do sleep 1; done"])
+            // Detached, as in the script: a `sleep 1` child outlives the
+            // SIGKILL below by up to a second and would hold the test's
+            // inherited stdio open meanwhile.
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .spawn()
             .expect("spawn the decoy engine process");
         let decoy_pid = child.id();
@@ -2913,8 +2923,8 @@ fi
             &env,
             &reclaim,
         );
-        // Reaped before any assertion: a panic here must not leave a `sleep
-        // 300` behind on a self-hosted runner, of all things.
+        // Reaped before any assertion: a panic here must not leave a 300s
+        // decoy behind on a self-hosted runner, of all things.
         let _ = child.kill();
         let _ = child.wait();
         let (code, log) = got;
