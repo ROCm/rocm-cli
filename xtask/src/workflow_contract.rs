@@ -2842,6 +2842,70 @@ fi
         Path::new("/proc/self/cmdline").exists()
     }
 
+    /// Starts a stand-in engine process whose command line begins with
+    /// `argv0`, and returns it only once it is seen alive under that name.
+    ///
+    /// The rule `--assert-clear` applies reads `/proc/<pid>/cmdline`, so the
+    /// decoy only has to present the path there. It is `/bin/sh` run under that
+    /// argv[0], parked in the `read` builtin on a pipe this test holds.
+    ///
+    /// Nothing is copied, so nothing depends on how coreutils is built. A copy
+    /// of `/bin/sleep` named `llama-server` exits at once on ubuntu-26.04, whose
+    /// `/bin/sleep` is the uutils multicall binary (`coreutils: unknown program
+    /// 'llama-server'`); and `CommandExt::arg0` on the real `sleep` is no way
+    /// out, because uutils dispatches on argv[0] on some targets and on the
+    /// executed path on others. Ubuntu's `/bin/sh` is dash, which ignores its
+    /// argv[0].
+    ///
+    /// `read` is a builtin, so the shell forks nothing and killing this one
+    /// pid leaves no orphan. If the test dies before killing it, dropping the
+    /// `Child` closes the pipe, `read` sees end of file, and the shell exits on
+    /// its own.
+    #[cfg(unix)]
+    fn spawn_decoy_engine(argv0: &Path) -> std::process::Child {
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+
+        let mut child = Command::new("/bin/sh")
+            .arg0(argv0)
+            .args(["-c", "read -r _"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn the decoy engine process");
+        // Long enough for a decoy that cannot run under this name to have
+        // exited: the multicall `sleep` above is gone in a few milliseconds.
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        let pid = child.id();
+        let exited = child.try_wait().expect("poll the decoy engine process");
+        let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+        let named = cmdline
+            .split(|&b| b == 0)
+            .next()
+            .is_some_and(|first| first == argv0.as_os_str().as_encoded_bytes());
+        if exited.is_some() || !named {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        if let Some(status) = exited {
+            panic!(
+                "the decoy engine process (pid={pid}) exited at spawn ({status}), so there \
+                 is nothing for --assert-clear to find; the runner's `/bin/sh` cannot run \
+                 under argv[0] {}. This is the fixture failing, not the gate",
+                argv0.display()
+            );
+        }
+        assert!(
+            named,
+            "the decoy engine process (pid={pid}) is alive but its command line does not \
+             start with {}, so the rule cannot match it; read: {:?}",
+            argv0.display(),
+            String::from_utf8_lossy(&cmdline)
+        );
+        child
+    }
+
     /// The preflight must run the REAL `reclaim-gpu.sh --assert-clear`, the way
     /// it runs it in CI, in both directions.
     ///
@@ -2912,24 +2976,8 @@ fi
 
         // argv[0] names an E2E root and an engine marker, which is what the
         // rule matches, and sits under the scope so nothing else can.
-        //
-        // A copy of bash running a loop, for the reasons `spawn_decoy` in
-        // reclaim-gpu.sh gives: a copied multicall `sleep` exits at once as an
-        // unknown program, and bash would exec a lone `sleep 300` in place.
-        let decoy_dir = scope.path().join("e2e-prewarm/bin");
-        std::fs::create_dir_all(&decoy_dir).expect("decoy dir");
-        let decoy = decoy_dir.join("llama-server");
-        std::fs::copy("/bin/bash", &decoy).expect("copy /bin/bash as the decoy");
-        let mut child = std::process::Command::new(&decoy)
-            .args(["-c", "for _ in {1..300}; do sleep 1; done"])
-            // Detached, as in the script: a `sleep 1` child outlives the
-            // SIGKILL below by up to a second and would hold the test's
-            // inherited stdio open meanwhile.
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("spawn the decoy engine process");
+        let decoy = scope.path().join("e2e-prewarm/bin/llama-server");
+        let mut child = spawn_decoy_engine(&decoy);
         let decoy_pid = child.id();
         let got = run_preflight_with_reclaim(
             &shared_preflight_script(),
@@ -2938,8 +2986,11 @@ fi
             &env,
             &reclaim,
         );
-        // Reaped before any assertion: a panic here must not leave a 300s
-        // decoy behind on a self-hosted runner, of all things.
+        // Asked before the kill: a decoy that died during the scan would make
+        // a clear verdict correct, and the assertion below would blame the gate.
+        let alive_after_scan = matches!(child.try_wait(), Ok(None));
+        // Reaped before any assertion: a panic here must not leave the decoy
+        // behind on a self-hosted runner, of all things.
         let _ = child.kill();
         let _ = child.wait();
         let (code, log) = got;
@@ -2947,6 +2998,11 @@ fi
             eprintln!("skipping: the real /proc scan did not finish inside the gate's 15s bound");
             return;
         }
+        assert!(
+            alive_after_scan,
+            "the decoy engine process (pid={decoy_pid}) exited while the preflight was \
+             scanning, so its verdict says nothing about the gate; logged:\n{log}"
+        );
         assert_eq!(
             code, 1,
             "a real leaked engine process was running and the preflight passed; logged:\n{log}"
