@@ -1475,15 +1475,16 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
         step
     }
 
-    /// The lines of a step's `run: |` block, still indented.
+    /// The lines of a step's block-scalar `run:` (`run: |`, `|-`, `>`, `>-`,
+    /// …), still indented and, for a folded `>` block, not yet folded: see
+    /// [`run_script`] for the script the shell is handed.
     ///
     /// Trailing blank lines are dropped: they are the separator `step_block`
     /// lets through, not part of the script, and keeping them would make two
     /// identical scripts compare unequal over the spacing between steps.
     fn run_block(step: &str) -> Option<Vec<&str>> {
         let lines: Vec<&str> = step.lines().collect();
-        let run_at = lines.iter().position(|l| l.trim() == "run: |")?;
-        let run_indent = indent_of(lines[run_at]);
+        let (run_at, run_indent, _) = run_block_header(&lines)?;
         let mut body: Vec<&str> = lines[run_at + 1..]
             .iter()
             .take_while(|l| l.trim().is_empty() || indent_of(l) > run_indent)
@@ -1493,6 +1494,68 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
             body.pop();
         }
         Some(body)
+    }
+
+    /// Where a step's block-scalar `run:` opens: the index of its `run:` line
+    /// in `lines`, that line's indent, and whether the block is folded (`>`)
+    /// rather than literal (`|`).
+    ///
+    /// Any block-scalar header counts — `|` or `>`, with or without a
+    /// chomping (`-`/`+`) or indentation (digit) indicator, and with or
+    /// without a trailing comment — since every one of them hands the step a
+    /// multi-line script.
+    fn run_block_header(lines: &[&str]) -> Option<(usize, usize, bool)> {
+        lines.iter().enumerate().find_map(|(at, line)| {
+            let indicator = strip_comment(line).trim().strip_prefix("run:")?.trim();
+            let folded = match indicator.chars().next()? {
+                '|' => false,
+                '>' => true,
+                _ => return None,
+            };
+            indicator[1..]
+                .chars()
+                .all(|c| c == '-' || c == '+' || c.is_ascii_digit())
+                .then_some((at, indent_of(line), folded))
+        })
+    }
+
+    /// The script a step's block-scalar `run:` hands its shell, one entry per
+    /// line: [`run_block`]'s lines, folded the way YAML folds a `>` block.
+    ///
+    /// In a folded block a line break between two lines at the block's own
+    /// indent becomes a space, so two such lines are ONE line of script; a
+    /// blank line ends the line, and a more-indented line keeps the breaks
+    /// around it. A literal `|` block is the script as written.
+    fn run_script(step: &str) -> Option<Vec<String>> {
+        let lines: Vec<&str> = step.lines().collect();
+        let (_, _, folded) = run_block_header(&lines)?;
+        let body = run_block(step)?;
+        if !folded {
+            return Some(body.iter().map(|line| (*line).to_owned()).collect());
+        }
+        let indent = body
+            .iter()
+            .find(|line| !line.trim().is_empty())
+            .map_or(0, |line| indent_of(line));
+        let mut script: Vec<String> = Vec::new();
+        let mut folds_onto_last = false;
+        for line in body {
+            if line.trim().is_empty() {
+                script.push(String::new());
+                folds_onto_last = false;
+                continue;
+            }
+            let at_block_indent = indent_of(line) == indent;
+            match script.last_mut() {
+                Some(last) if at_block_indent && folds_onto_last => {
+                    last.push(' ');
+                    last.push_str(line.trim_start());
+                }
+                _ => script.push(line.to_owned()),
+            }
+            folds_onto_last = at_block_indent;
+        }
+        Some(script)
     }
 
     /// The non-comment lines of a step's `run: |` block, joined.
@@ -5215,12 +5278,15 @@ permissions:
         statement.to_ascii_lowercase().contains("$lastexitcode")
     }
 
-    /// [`unchecked_native_commands`] over a pwsh step's script: its `run: |`
-    /// block, or its one-line `run:` value, which can chain statements with
-    /// `;` just the same.
+    /// [`unchecked_native_commands`] over a pwsh step's script: its
+    /// block-scalar `run:` (`|`, `|-`, `>`, `>-`, …, folded as YAML folds it),
+    /// or its one-line `run:` value, which can chain statements with `;` just
+    /// the same.
     fn unchecked_native_commands_in_step(step: &str) -> Vec<String> {
-        match run_block(step) {
-            Some(body) => unchecked_native_commands(&body),
+        match run_script(step) {
+            Some(script) => {
+                unchecked_native_commands(&script.iter().map(String::as_str).collect::<Vec<_>>())
+            }
             None => unchecked_native_commands(&[step_key(step, "run").as_str()]),
         }
     }
@@ -5497,5 +5563,60 @@ permissions:
                 "{statement:?}"
             );
         }
+    }
+
+    /// Every block-scalar form of `run:` hands a pwsh step a script, so every
+    /// form is checked. Read only as `run: |`, a `run: |-`, `run: >` or
+    /// `run: >-` step fell through to the one-line reading, whose value is the
+    /// bare indicator, and so escaped the contract whatever its script did.
+    #[test]
+    fn unchecked_native_commands_reads_every_block_scalar_run_form() {
+        // Literal forms: each line is a line of script.
+        for header in ["run: |", "run: |-", "run: |+", "run: |2", "run: |-  # note"] {
+            let step = format!(
+                "      - name: Self-tests\n        shell: pwsh\n        {header}\n          \
+                 python a.py --self-test\n          python b.py --self-test\n"
+            );
+            assert_eq!(
+                unchecked_native_commands_in_step(&step),
+                ["python a.py --self-test"],
+                "{header}"
+            );
+        }
+        // Folded forms: a blank line separates two lines of script.
+        for header in ["run: >", "run: >-", "run: >+"] {
+            let step = format!(
+                "      - name: Self-tests\n        shell: pwsh\n        {header}\n          \
+                 python a.py --self-test\n\n          python b.py --self-test\n"
+            );
+            assert_eq!(
+                unchecked_native_commands_in_step(&step),
+                ["python a.py --self-test"],
+                "{header}"
+            );
+        }
+    }
+
+    /// A folded `run: >` block is read as YAML folds it: lines at the block's
+    /// indent join with a space into one line of script, a blank line starts
+    /// a new one, and a more-indented line keeps its own line. Taken line by
+    /// line instead, the first two lines below would read as two commands and
+    /// the first as unchecked, where pwsh is handed one `cargo` command.
+    #[test]
+    fn a_folded_run_block_is_read_as_yaml_folds_it() {
+        let step = "      - shell: pwsh\n        name: Build\n        run: >-\n          \
+                    cargo build\n          --locked\n\n          if ($LASTEXITCODE) {\n            \
+                    exit 1\n          }\n";
+        assert_eq!(
+            run_script(step).expect("the step has a block-scalar run"),
+            [
+                "          cargo build --locked",
+                "",
+                "          if ($LASTEXITCODE) {",
+                "            exit 1",
+                "          }",
+            ]
+        );
+        assert!(unchecked_native_commands_in_step(step).is_empty());
     }
 }
