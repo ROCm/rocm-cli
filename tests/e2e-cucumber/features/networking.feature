@@ -39,3 +39,16 @@ Feature: Native HTTP networking
     When the user serves a model bound to a public interface without allowing public binding
     Then serving is refused before any engine starts
     And the user is told to allow public binding first
+
+  # Collision-safe ports (serve-port rewrite). Automatic port selection proves a
+  # port is free by probing it on loopback before the engine starts; that proof
+  # only applies to the canonical default host (127.0.0.1), so any other host
+  # name (even a loopback alias like `localhost` that needs no public-bind
+  # opt-in) must come with an explicit `--port`. This check runs in
+  # `validate_port_request`, before any engine or GPU work, so it needs no GPU
+  # and runs on the mock lane every PR.
+  @id:networking-custom-host-needs-explicit-port
+  Scenario: networking-04 - A non-canonical host without an explicit port is refused up front
+    When the user serves a model bound to a non-canonical host without an explicit port
+    Then serving is refused before any engine starts
+    And the user is told to pass an explicit port for that host

@@ -322,6 +322,38 @@ impl ManagedServiceRecord {
         Ok(self.status != previous)
     }
 
+    /// Whether this record still reserves its port: the sole definition of
+    /// "live" shared between the CLI's launch-time port check and `rocmd`'s
+    /// recovery. Same predicate, not same data: the CLI's `load_managed_services`
+    /// refreshes each record's PID/endpoint liveness before this runs, while
+    /// `rocmd::persistence::load_managed_services` reads the file as-is. A
+    /// record whose process has died since its last write can therefore still
+    /// read `is_live()` to `rocmd` after the CLI would have refreshed it to
+    /// `"stopped"`. That fails safe — recovery defers rather than racing a
+    /// collision — but it can stall on a stale record until something else
+    /// rewrites it.
+    #[must_use]
+    pub fn is_live(&self) -> bool {
+        matches!(
+            self.status.as_str(),
+            "ready" | "running" | "starting" | "recovering"
+        )
+    }
+
+    /// Whether this live record reserves `port` — the sole collision check
+    /// shared by the CLI's restart re-check and `rocmd`'s recovery re-check.
+    /// See [`Self::is_live`]'s doc for the data-freshness gap between the two
+    /// callers.
+    ///
+    /// Deliberately host-blind: a `0.0.0.0` (or `localhost`) listener also
+    /// blocks the loopback address a competing bind would target, so comparing
+    /// hosts would under-detect a real collision rather than merely cost one
+    /// skipped candidate.
+    #[must_use]
+    pub fn blocks_port(&self, port: u16) -> bool {
+        self.is_live() && self.port == port
+    }
+
     fn with_storage_paths(&self) -> Self {
         let mut record = self.clone();
         record.manifest_path = normalize_runtime_path_for_storage(&record.manifest_path);
