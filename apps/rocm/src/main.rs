@@ -469,6 +469,18 @@ rocm model --verbose"
     /// logs in this terminal instead. When streaming, press Ctrl-D to detach and leave the
     /// server running, or Ctrl-C to stop it. Inspect or stop servers later with
     /// `rocm services`.
+    ///
+    /// When a vLLM server THIS command launched fails to become ready and its engine log
+    /// shows an out-of-memory failure, the deployment summary adds a note naming
+    /// --gpu-memory-utilization and --gpu, warning that lowering the reservation will not
+    /// help if the model does not fit, and printing a `rocm diagnose --symptom` command
+    /// for your own failing line. That note belongs to the interactive summary only: a
+    /// piped or redirected run prints the plain machine-readable form, which carries no
+    /// post-launch notes (it still prints the pre-launch planning ones), and --verbose
+    /// streams the traceback itself. It is never shown for a healthy or
+    /// still-loading server, for a non-memory failure, or for a run that reused an
+    /// already-running server rather than launching one; read that server's own log with
+    /// `rocm services logs <service-id>`.
     #[command(after_help = "EXAMPLES:\n  \
 rocm serve qwen\n  \
 rocm serve qwen --engine vllm --port 8000\n  \
@@ -3714,6 +3726,106 @@ fn collect_serve_notes(
                 notes.push(rocm_core::VLLM_GPU_MEMORY_UTILIZATION_HINT.to_owned());
             }
         }
+    }
+    notes
+}
+
+/// Appends the actionable memory-knob note when a managed serve failed to become
+/// ready and its engine log carries an out-of-memory signature.
+///
+/// This is the post-failure companion to the pre-launch low-VRAM warning in
+/// [`collect_serve_notes`]. The reported low-VRAM environment ships no
+/// rocm-smi/amd-smi, so that telemetry-driven warning never fires there; reading
+/// the failed serve's own log tail is the reliable signal that the launch died on
+/// VRAM. Gated on vLLM (the only engine exposing `--gpu-memory-utilization`), on
+/// the launch having actually *failed to become ready*
+/// ([`serve_summary::serve_failed_to_become_ready`] — a healthy still-loading
+/// `running` service is not a failure), and on this invocation actually having
+/// launched the process (`already_running` is excluded) so healthy deployments,
+/// unrelated failures, and an unrelated invocation that merely reused an
+/// already-live service are never misattributed. The OOM-signature check in
+/// [`serve_summary::oom_memory_note`] narrows it further.
+///
+/// The `already_running` exclusion is deliberately kept even though today's only
+/// producer of `already_running: true` — `spawn_managed_engine_child`'s reuse
+/// short-circuit — also reports `log_path: None`, so the `log_path` guard below
+/// would already catch that one case. The two say different things: `log_path`
+/// is a local "there is no log to read", while `already_running` is the
+/// attribution rule this function exists to enforce, and it must survive any
+/// future reuse path that does carry the reused service's log. The unit test
+/// `append_oom_serve_note_ignores_an_already_running_services_log` discriminates
+/// it directly — it passes a log path that *does* contain an OOM signature
+/// together with `already_running: true` — so dropping the clause turns that
+/// test red. No E2E scenario can discriminate it: every real reuse path reports
+/// `log_path: None`, so the note is already withheld on that ground alone and an
+/// end-to-end assertion on the reuse summary would be vacuous.
+///
+/// When the pre-launch low-VRAM warning already put the shared
+/// `--gpu-memory-utilization` hint in `notes`, the *fragment* is dropped from
+/// the new note rather than the note being suppressed: low VRAM leading to an
+/// OOM is exactly the case this note exists for, and everything else it carries
+/// — the confirmation that this attempt really did run out of GPU memory, the
+/// "if the model doesn't fit, lowering the reservation won't help" branch, and
+/// the `rocm diagnose --symptom` command with the user's real failing line — is
+/// absent from the pre-launch guess.
+fn append_oom_serve_note(
+    mut notes: Vec<String>,
+    engine: &str,
+    already_running: bool,
+    status: &str,
+    log_path: Option<&Path>,
+) -> Vec<String> {
+    // Takes the engine *name*, not a pre-computed "is vLLM" boolean, and that is
+    // deliberate: the caller holds `selected_engine` either way, and a bool
+    // argument is a seam no test here can hold. Forcing it to `true` at the call
+    // site left the whole suite green while handing a failed *Lemonade* launch
+    // vLLM's `--gpu-memory-utilization` advice, because the only engine whose
+    // managed launch any lane can fail is vLLM (Lemonade manages its own runtime,
+    // so a fault-injected Lemonade launch would have to install one first).
+    // Deriving the gate from the value it is about — AGENTS.md section 3's "a
+    // message computed from the decision cannot disagree with it" — moves the
+    // branch inside, where `append_oom_serve_note_is_withheld_when_it_does_not_apply`
+    // kills it.
+    if !engine.eq_ignore_ascii_case("vllm")
+        || already_running
+        || !serve_summary::serve_failed_to_become_ready(status)
+    {
+        return notes;
+    }
+    // Whether the pre-launch low-VRAM warning already printed the shared hint.
+    // This de-duplicates that one fragment at composition time; it is not a
+    // reason to skip the note, which carries the OOM confirmation and the
+    // diagnose command the pre-launch warning has no way to know about.
+    let already_hinted = notes
+        .iter()
+        .any(|note| note.contains(rocm_core::VLLM_GPU_MEMORY_UTILIZATION_HINT));
+    let Some(log_path) = log_path else {
+        return notes;
+    };
+    // The same tail *budget* the engine's own OOM surfaces use
+    // (`rocm_engine_protocol::DEFAULT_LOG_TAIL_LINES`), so the two surfaces do
+    // not drift apart on independent magic literals.
+    //
+    // Equal budgets are NOT equal windows, and the difference is a measured gap
+    // rather than a theoretical one. The engine scans the last N *raw* lines and
+    // then bails; the supervisor appends that whole bail — a header, the tail
+    // echoed as rendered rows, and the hint — to the same shared log. This read
+    // happens afterwards, so the same N lines reach strictly further back in the
+    // engine's view than in this one, and when the bail is itself longer than N
+    // rows the window here holds nothing the engine wrote directly. An OOM line
+    // sitting near the *start* of the engine's window is therefore diagnosed by
+    // the engine and missed here: measured, an OOM followed by 77 further lines
+    // gives `engine_hinted = true` and no note at all. Pinned as a known gap by
+    // `the_cli_window_can_miss_an_oom_the_engine_saw` in `engines/vllm`; the
+    // README's "absence is not evidence" list names this condition.
+    let log_tail = read_optional_tail_lines(
+        log_path,
+        rocm_engine_protocol::DEFAULT_LOG_TAIL_LINES,
+        "service log",
+    )
+    .join("\n");
+    if let Some(note) = serve_summary::oom_memory_note(status, &log_tail, already_hinted) {
+        notes.push(note);
     }
     notes
 }
@@ -17717,6 +17829,224 @@ pub(crate) mod tests {
                 .iter()
                 .any(|entry| entry.contains("--gpu-memory-utilization")),
             "nothing to report when the flag was honored: {quiet:?}"
+        );
+    }
+
+    #[test]
+    fn append_oom_serve_note_reads_the_failed_serve_log_and_names_the_knobs() {
+        // A managed vLLM serve that died on VRAM lands not-ready with the OOM
+        // traceback only in its log; the note must be recovered from that log.
+        let log_path =
+            std::env::temp_dir().join(format!("rocm-oom-note-{}-hit.log", std::process::id()));
+        fs::write(
+            &log_path,
+            "loading weights\ntorch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.\n",
+        )
+        .expect("write log");
+        let notes = append_oom_serve_note(Vec::new(), "vllm", false, "starting", Some(&log_path));
+        let _ = fs::remove_file(&log_path);
+        assert!(
+            notes
+                .iter()
+                .any(|entry| entry.contains("--gpu-memory-utilization")
+                    && entry.contains("--gpu <index>")),
+            "the OOM note must name both memory knobs: {notes:?}"
+        );
+    }
+
+    #[test]
+    fn append_oom_serve_note_is_withheld_when_it_does_not_apply() {
+        let log_path =
+            std::env::temp_dir().join(format!("rocm-oom-note-{}-miss.log", std::process::id()));
+        fs::write(&log_path, "torch.OutOfMemoryError: HIP out of memory\n").expect("write log");
+
+        // A ready serve is healthy even if the log mentions memory.
+        assert!(
+            append_oom_serve_note(Vec::new(), "vllm", false, "ready", Some(&log_path)).is_empty()
+        );
+        // A non-vLLM engine has no `--gpu-memory-utilization` to reach for, so a
+        // failed Lemonade launch whose log happens to carry an allocator OOM
+        // signature — a kernel OOM killer, a sibling process, ROCm's own
+        // allocator under a different engine — must be given no note at all.
+        // This is the regression that stayed green while the gate was a boolean
+        // the caller computed: showing a Lemonade failure a flag Lemonade does
+        // not accept. The engine name is the only input distinguishing the two
+        // calls below, so this pair kills the gate.
+        assert!(
+            append_oom_serve_note(Vec::new(), "lemonade", false, "starting", Some(&log_path))
+                .is_empty(),
+            "a failed non-vLLM launch must never be shown vLLM's memory knobs"
+        );
+        assert!(
+            !append_oom_serve_note(Vec::new(), "vllm", false, "starting", Some(&log_path))
+                .is_empty(),
+            "the same log under vLLM must produce the note, or the line above proves nothing"
+        );
+        // A missing log gives no signal to branch on.
+        assert!(append_oom_serve_note(Vec::new(), "vllm", false, "starting", None).is_empty());
+
+        // A failure whose log carries no OOM signature is left alone.
+        fs::write(&log_path, "OSError: model weights not found\n").expect("rewrite log");
+        assert!(
+            append_oom_serve_note(Vec::new(), "vllm", false, "starting", Some(&log_path))
+                .is_empty()
+        );
+        let _ = fs::remove_file(&log_path);
+    }
+
+    #[test]
+    fn append_oom_serve_note_is_withheld_for_a_healthy_still_loading_service() {
+        // `running` means the endpoint is up and the model is still loading
+        // normally — a healthy state deliberately kept distinct from `starting`
+        // so `rocmd` does not restart a slow-loading model. An OOM string left in
+        // its log tail (e.g. from an earlier probe) must NOT be reported as this
+        // serve having "run out of GPU memory".
+        let log_path =
+            std::env::temp_dir().join(format!("rocm-oom-note-{}-running.log", std::process::id()));
+        fs::write(
+            &log_path,
+            "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.\n",
+        )
+        .expect("write log");
+        let notes = append_oom_serve_note(Vec::new(), "vllm", false, "running", Some(&log_path));
+        let _ = fs::remove_file(&log_path);
+        assert!(
+            notes.is_empty(),
+            "a healthy still-loading `running` service must not get the OOM note: {notes:?}"
+        );
+    }
+
+    #[test]
+    fn append_oom_serve_note_ignores_an_already_running_services_log() {
+        // Re-issuing `serve` against a service another invocation already
+        // launched must never blame *this* invocation for that other process's
+        // failure — even when its log carries a real OOM signature and the
+        // reused record's status is not yet "ready".
+        let log_path = std::env::temp_dir().join(format!(
+            "rocm-oom-note-{}-already-running.log",
+            std::process::id()
+        ));
+        fs::write(
+            &log_path,
+            "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.\n",
+        )
+        .expect("write log");
+        let notes = append_oom_serve_note(Vec::new(), "vllm", true, "starting", Some(&log_path));
+        let _ = fs::remove_file(&log_path);
+        assert!(
+            notes.is_empty(),
+            "an already-running service's log must not be attributed to this invocation: {notes:?}"
+        );
+    }
+
+    #[test]
+    fn append_oom_serve_note_prints_the_shared_hint_exactly_once() {
+        // The pre-launch low-VRAM warning fired, the user proceeded, and the
+        // launch then OOMed -- the exact causal chain this note exists for. The
+        // shared hint must not be printed twice, but the note itself must still
+        // appear: it is the only place that confirms the attempt *did* run out
+        // of GPU memory, carries the model-too-large branch, and hands over the
+        // diagnose command with the user's own failing line.
+        let log_path =
+            std::env::temp_dir().join(format!("rocm-oom-note-{}-dedup.log", std::process::id()));
+        fs::write(
+            &log_path,
+            "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.\n",
+        )
+        .expect("write log");
+        let pre_launch_notes = vec![
+            "selected GPU 0 has low free VRAM".to_owned(),
+            rocm_core::VLLM_GPU_MEMORY_UTILIZATION_HINT.to_owned(),
+        ];
+        let notes = append_oom_serve_note(
+            pre_launch_notes.clone(),
+            "vllm",
+            false,
+            "starting",
+            Some(&log_path),
+        );
+        let _ = fs::remove_file(&log_path);
+
+        // The hint text appears exactly once across the whole summary.
+        let hinting = notes
+            .iter()
+            .filter(|note| note.contains(rocm_core::VLLM_GPU_MEMORY_UTILIZATION_HINT))
+            .count();
+        assert_eq!(
+            hinting, 1,
+            "the shared hint must be printed exactly once: {notes:?}"
+        );
+
+        // ...and the OOM note is still added, with the content the pre-launch
+        // warning cannot carry.
+        assert_eq!(
+            notes.len(),
+            pre_launch_notes.len() + 1,
+            "the OOM note must still be appended, not suppressed: {notes:?}"
+        );
+        let oom_note = notes.last().expect("the OOM note is the appended note");
+        assert!(
+            oom_note.contains("ran out of GPU memory"),
+            "the note must confirm this attempt really did OOM: {oom_note}"
+        );
+        assert!(
+            oom_note.contains("smaller or quantized model"),
+            "the model-too-large branch must survive de-duplication: {oom_note}"
+        );
+        assert!(
+            oom_note.contains(
+                "rocm diagnose --symptom 'vllm: torch.OutOfMemoryError: HIP out of memory."
+            ),
+            "the note must route the user's real failing line to diagnose: {oom_note}"
+        );
+    }
+
+    #[test]
+    fn append_oom_serve_note_reads_the_shared_engine_tail_budget() {
+        // The serve summary must read the same tail budget the engine's own OOM
+        // surfaces use (`rocm_engine_protocol::DEFAULT_LOG_TAIL_LINES`) so the two
+        // surfaces never disagree on what counts as "the tail" of a failed
+        // launch. Plant the OOM signature on the oldest line still inside that
+        // window (it must fire), then push it one line past the window (it must
+        // fall silent) — pinning the read to the shared constant rather than a
+        // drifting literal.
+        let budget = rocm_engine_protocol::DEFAULT_LOG_TAIL_LINES;
+        let oom_line = "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.";
+
+        // OOM on the oldest line that still fits in the last `budget` lines.
+        let in_window = std::iter::once(oom_line)
+            .chain(std::iter::repeat_n("shutting down worker", budget - 1))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let log_path = std::env::temp_dir().join(format!(
+            "rocm-oom-note-{}-in-window.log",
+            std::process::id()
+        ));
+        fs::write(&log_path, format!("{in_window}\n")).expect("write log");
+        let notes = append_oom_serve_note(Vec::new(), "vllm", false, "starting", Some(&log_path));
+        let _ = fs::remove_file(&log_path);
+        assert!(
+            notes
+                .iter()
+                .any(|entry| entry.contains("--gpu-memory-utilization")),
+            "an OOM line inside the shared tail budget must still surface the note: {notes:?}"
+        );
+
+        // Push the OOM line one row past the window: it must scroll out of view.
+        let out_of_window = std::iter::once(oom_line)
+            .chain(std::iter::repeat_n("shutting down worker", budget))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let log_path = std::env::temp_dir().join(format!(
+            "rocm-oom-note-{}-out-window.log",
+            std::process::id()
+        ));
+        fs::write(&log_path, format!("{out_of_window}\n")).expect("write log");
+        let notes = append_oom_serve_note(Vec::new(), "vllm", false, "starting", Some(&log_path));
+        let _ = fs::remove_file(&log_path);
+        assert!(
+            notes.is_empty(),
+            "an OOM line beyond the shared tail budget must not surface the note: {notes:?}"
         );
     }
 

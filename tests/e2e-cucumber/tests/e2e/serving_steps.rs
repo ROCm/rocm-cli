@@ -9,11 +9,25 @@ use std::time::{Duration, Instant};
 use cucumber::{given, then, when};
 
 use crate::E2eWorld;
+use crate::e2e::tui_driver::{TuiSession, default_timeout};
 use e2e_cucumber::mock_server::{MockServer, ServiceRecordOptions};
 use e2e_cucumber::serve_log::{
     ServeAttempt, archive_service_log, serve_attempt_report, service_log_tail,
 };
 
+/// How long to wait for an interactive (PTY) serve summary to render and exit.
+///
+/// Routed through the suite-wide [`default_timeout`] rather than a fixed literal
+/// so an operator can raise it with `E2E_TUI_TIMEOUT_SECS` on a contended
+/// self-hosted lane without a code change — the same reason every other PTY wait
+/// uses it.
+fn interactive_summary_timeout() -> Duration {
+    default_timeout()
+}
+/// Model id for the OOM-launch scenario, kept distinct from every other e2e
+/// serve model so its service records can never collide with another
+/// scenario's.
+const OOM_LAUNCH_MODEL: &str = "e2e/oom-launch-model";
 /// How long to wait for a freshly served model's endpoint to become ready.
 ///
 /// On real GPU hardware the first serve of a model downloads its weights and
@@ -1275,6 +1289,136 @@ async fn assert_absent_index_message(world: &mut E2eWorld) {
         "expected the absent GPU index to be reported unavailable, got:\n{}",
         serve_output(world)
     );
+}
+
+#[given("a managed vLLM launch will run out of GPU memory")]
+async fn plant_oom_launch(world: &mut E2eWorld) {
+    // Nothing to plant on disk: unlike the reuse case, this scenario drives a
+    // real `rocm serve` launch. The launch's failed-with-OOM state (an owned log
+    // carrying a real allocator signature, status "starting", nothing reused) is
+    // fabricated inside the CLI by the test-only `e2e-oom-fault-injection` hook.
+    //
+    // Arming that hook is what this `Given` does, via the World's `command_env`
+    // fixture channel — the premise belongs to the premise step, and the `When`
+    // below stays a plain user action with no mechanism in it. It previously sat
+    // in the `When`, which left this step a no-op whose deletion changed nothing.
+    //
+    // The consumer of this variable is `e2e_simulate_oom_launch` in
+    // `apps/rocm/src/service_launch.rs`. Unlike `OOM_FAULT_INJECTION_ENV` (shared
+    // through `e2e-report`, whose producer and consumer are both test-side), the
+    // consumer here is the shipped binary's crate, which must not depend on the
+    // e2e harness — so the name is spelled out on both sides. A typo fails loudly
+    // rather than silently skipping: the fault injection would not arm, the real
+    // GPU pre-flight would bail, and the `Then` steps would fail.
+    world
+        .command_env
+        .push(("ROCM_E2E_SIMULATE_OOM_LAUNCH", "1".into()));
+}
+
+#[when("the user opens the interactive serve summary for that launch")]
+async fn open_oom_launch_summary(world: &mut E2eWorld) {
+    // A plain user action. The fault injection the premise arms (see the `Given`
+    // above) rides along on the World's `command_env`, which `TuiSession::spawn`
+    // applies per-child. With it armed, the GPU-required pre-flight is bypassed
+    // for the simulated launch, so no GPU is touched; the launch resolves the
+    // model, "spawns", writes an OOM log it owns, and reports `starting` —
+    // exactly the state the memory-guidance note keys on.
+    let mut session = TuiSession::spawn(
+        world,
+        &[
+            "serve",
+            OOM_LAUNCH_MODEL,
+            "--engine",
+            "vllm",
+            "--env-id",
+            "e2e-oom-launch",
+        ],
+    )
+    .unwrap_or_else(|error| panic!("failed to open interactive serve summary: {error}"));
+    session
+        .wait_for_exit(interactive_summary_timeout())
+        .await
+        .unwrap_or_else(|error| panic!("interactive serve summary failed: {error}"));
+    world.tui = Some(session);
+}
+
+#[then("the deployment summary blames this launch for GPU memory")]
+async fn assert_oom_launch_memory_guidance(world: &mut E2eWorld) {
+    let screen = world
+        .tui
+        .as_ref()
+        .expect("no interactive serve summary")
+        .screen_text();
+    // The note is a long line the 80-column PTY wraps across grid rows, so match
+    // whitespace-insensitively — otherwise a soft wrap between "GPU" and "memory"
+    // would break a literal `contains` and mask a rendered note.
+    assert!(
+        screen_without_whitespace(&screen).contains("ranoutofGPUmemory"),
+        "a managed launch that OOM'd must be blamed for GPU memory in its own \
+         deployment summary:\n{screen}"
+    );
+}
+
+#[then("the deployment summary names the GPU memory knobs")]
+async fn assert_oom_launch_names_knobs(world: &mut E2eWorld) {
+    let screen = world
+        .tui
+        .as_ref()
+        .expect("no interactive serve summary")
+        .screen_text();
+    // The actionable fix: lower the reservation or move to a less-busy device.
+    // Assert on the flag names (whitespace-insensitive, since an 80-column wrap
+    // can split a token across rows) so a reworded preamble does not mask a
+    // dropped remediation. Both knobs the step promises are checked — the step
+    // passed while only `--gpu-memory-utilization` was asserted, so dropping
+    // `--gpu <index>` from the guidance would not have failed anything.
+    let flattened = screen_without_whitespace(&screen);
+    assert!(
+        flattened.contains("--gpu-memory-utilization"),
+        "the OOM summary must name the memory knob `--gpu-memory-utilization`:\n{screen}"
+    );
+    assert!(
+        flattened.contains("--gpu<index>"),
+        "the OOM summary must also name the other knob it advertises, `--gpu <index>`:\n{screen}"
+    );
+}
+
+#[then("the deployment summary quotes the engine's own failing line")]
+async fn assert_oom_launch_quotes_the_real_line(world: &mut E2eWorld) {
+    let screen = world
+        .tui
+        .as_ref()
+        .expect("no interactive serve summary")
+        .screen_text();
+    // The only assertion in this scenario that can fail on the symptom
+    // *selection*. The other two Then steps match text `oom_memory_note` emits
+    // unconditionally, so deleting the `is_rocm_authored_log_line` filter — or
+    // dropping the `rocm diagnose` sentence altogether — left serve-26 green
+    // while the note silently fell back to the canonical symptom. That is the
+    // bug the fixture's engine-error block was added to expose, and nothing
+    // asserted it.
+    //
+    // `Tried to allocate 7.21 GiB.` is what discriminates: the fixture's real
+    // line carries it and `VLLM_OOM_CANONICAL_SYMPTOM` does not, so a fallback
+    // fails here rather than passing as a near-match. Whitespace-collapsed for
+    // the same reason as its siblings — the command is long and the 80-column
+    // PTY wraps it across grid rows.
+    let flattened = screen_without_whitespace(&screen);
+    assert!(
+        flattened.contains(
+            "--symptom'vllm:torch.OutOfMemoryError:HIPoutofmemory.Triedtoallocate7.21GiB.'"
+        ),
+        "the summary must print `rocm diagnose --symptom` quoting the engine's own failing \
+         line, not rocm-cli's own hint and not the canonical fallback:\n{screen}"
+    );
+}
+
+/// Collapse a rendered PTY screen to its non-whitespace characters, so an
+/// assertion survives the terminal soft-wrapping a long line across grid rows
+/// (which inserts row breaks mid-phrase / mid-token). Only meaningful for
+/// needles that themselves contain no whitespace once collapsed.
+fn screen_without_whitespace(screen: &str) -> String {
+    screen.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
 #[then("the user is told the pinned GPU is unavailable")]

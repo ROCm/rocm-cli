@@ -3,13 +3,11 @@
 // SPDX-License-Identifier: MIT
 
 use anyhow::{Context, Result, anyhow, bail};
-use rocm_core::terminal::{
-    is_control_or_format, is_control_or_line_separator, strip_terminal_control_sequences,
-};
 use rocm_core::{AppPaths, DEFAULT_LOCAL_PORT, require_nonempty};
 use rocm_engine_protocol::{
-    DevicePolicy, ENGINE_RECIPE_CONTRACT_VERSION, EngineRecipeHint, GpuSelection, LaunchRequest,
-    LaunchResponse, ResolveModelRequest, ResolveModelResponse, StopRequest, StopResponse,
+    DEFAULT_LOG_TAIL_LINES, DevicePolicy, ENGINE_RECIPE_CONTRACT_VERSION, EngineRecipeHint,
+    GpuSelection, LaunchRequest, LaunchResponse, ResolveModelRequest, ResolveModelResponse,
+    StopRequest, StopResponse,
 };
 use serde_json::json;
 use std::ffi::OsString;
@@ -24,7 +22,13 @@ use crate::runtime::{
 };
 use crate::{ServeHttpRequest, engine_recipe_launch_args};
 
-const STARTUP_FAILURE_LOG_TAIL_LINES: usize = 80;
+/// Tail budget for the startup-failure summary (and its OOM hint).
+///
+/// Derived from [`DEFAULT_LOG_TAIL_LINES`] rather than spelled as its own
+/// literal so this surface and the CLI's serve summary — which reads the same
+/// protocol constant in `append_oom_serve_note` — cannot drift on what counts as
+/// "the tail" of a failed launch. A change to the protocol budget moves both.
+const STARTUP_FAILURE_LOG_TAIL_LINES: usize = DEFAULT_LOG_TAIL_LINES;
 
 /// How long a stop waits for the server to actually exit after each signal
 /// before reporting a timeout (or, under `force`, escalating to `SIGKILL`).
@@ -613,10 +617,27 @@ fn prepend_path_entries(entries: &[PathBuf], current: Option<OsString>) -> Resul
 /// output and this whole string is `bail!`-ed to the user's terminal, so
 /// stripping control bytes out of the one echoed line further down while
 /// printing the raw tail a few lines above would have left the escapes a clear
-/// path to the terminal inside the same message. Stripping is per line so the
-/// tail keeps its shape; `oom_utilization_hint` still reads the *raw* tail,
-/// because what it selects from it is quoted into a command and has its own,
-/// stricter admissibility test.
+/// path to the terminal inside the same message. `oom_utilization_hint` still
+/// reads the *raw* tail, because what it selects from it is quoted into a
+/// command and has its own, stricter admissibility test.
+///
+/// Sanitizing with [`rocm_core::terminal::rendered_lines`] rather than
+/// `strip_terminal_control_sequences` is load-bearing, not a stylistic
+/// preference. Stripping deletes every line-break token (`\r`, `ESC[1A`, `NEL`,
+/// `VT`, `U+2028`…) *with no separator in its place*, so a progress-bar repaint
+/// — `Loading weights: 90%\rtorch.OutOfMemoryError: HIP out of memory.`, which
+/// vLLM emits as one `\n` line — was echoed as the single welded line
+/// `Loading weights: 90%torch.OutOfMemoryError: HIP out of memory.`. That is
+/// text the engine never printed, and it is worse than cosmetic: a managed
+/// launch shares one log between the supervisor and the engine, so the CLI
+/// writes this whole bail back into the same file, and the next read finds the
+/// welded line, scores it as a genuine OOM, finds it quotable (the control bytes
+/// are gone) and prints it inside the `rocm diagnose --symptom '…'` command the
+/// serve summary invites the user to paste. Expanding each physical line into
+/// the rows a terminal would have drawn keeps the echo faithful, keeps the
+/// tail's shape, and leaves nothing weldable behind for the second read.
+///
+/// Pinned by `the_echoed_tail_never_welds_two_rendered_rows_into_one_line`.
 fn startup_log_context(log_path: Option<&Path>) -> String {
     let summary = log_path
         .and_then(|p| summarize_startup_log_tail(p, STARTUP_FAILURE_LOG_TAIL_LINES).ok())
@@ -627,10 +648,20 @@ fn startup_log_context(log_path: Option<&Path>) -> String {
     let hint = oom_utilization_hint(&summary);
     let summary = summary
         .lines()
-        .map(strip_terminal_control_sequences)
+        .flat_map(rocm_core::terminal::rendered_lines)
         .collect::<Vec<_>>()
         .join("\n");
-    format!("\n\nLast {STARTUP_FAILURE_LOG_TAIL_LINES} lines of startup log:\n{summary}{hint}")
+    // The count is the *read* budget — how many physical lines of the log were
+    // taken — not how many rows are printed below. Those differ, and can differ
+    // a lot: each `\r` repaint of a progress bar expands into its own rendered
+    // row, so three physical lines carrying 300 repaints are echoed as 300-odd
+    // rows. Saying "last N lines" and then printing more of them is the kind of
+    // small lie that costs a reader their trust in the rest of the message, so
+    // the sentence says which N it means.
+    format!(
+        "\n\nStartup log, last {STARTUP_FAILURE_LOG_TAIL_LINES} lines as the terminal drew \
+         them:\n{summary}{hint}"
+    )
 }
 
 /// Appends [`rocm_core::VLLM_GPU_MEMORY_UTILIZATION_HINT`] when the startup-log
@@ -639,86 +670,60 @@ fn startup_log_context(log_path: Option<&Path>) -> String {
 /// with the `rocm` CLI's pre-launch low-VRAM note so both surfaces point the
 /// user at the same fix rather than drifting into different phrasing.
 fn oom_utilization_hint(log_tail: &str) -> String {
-    if !log_tail_shows_oom(log_tail) {
-        return String::new();
-    }
     // Route the user's *actual* failing line into the `--symptom` example when
-    // the diagnose checker would actually score it *and* it can be rendered as
-    // one intact single-quoted argument; otherwise fall back to the canonical
-    // symptom so the printed command always reports a cause. The detector here
-    // is a coarse substring scan that accepts lines the scorer rates
-    // sub-threshold (e.g. a bare "... out of memory"), so without this fallback
-    // the diagnose command could report nothing -- which reads as "the tool
-    // checked and there's no known cause", worse than not printing it.
-    // `.rev()` is deliberate, not incidental: when several lines of the tail
-    // mention running out of memory, the *last* one is the proximate failure —
-    // the point where the process actually gave up — and the earlier ones are
-    // usually the allocator's own retry chatter leading up to it. The cost is
-    // real and worth stating: on a tail like "torch.OutOfMemoryError: ... Tried
-    // to allocate 7.21 GiB. GPU 0 has a total capacity of 24.00 GiB." followed
-    // by a bare "RuntimeError: ... killed: out of memory", the vaguer line wins
-    // even though the first carries the allocation size and the capacity. Both
-    // are diagnosable, so this picks which line is quoted, never whether one is.
-    // The user still sees every line: the log tail is printed above this hint.
-    let raw_line = log_tail
-        .lines()
-        .rev()
-        .map(str::trim)
-        .find(|line| !line.is_empty() && log_tail_shows_oom(line))
-        .unwrap_or("out of memory");
+    // it can be rendered as one intact single-quoted argument; otherwise fall
+    // back to the canonical symptom so the printed command always reports a
+    // cause rather than reading as "the tool checked and there's no known
+    // cause". Selecting the line is the shared helper's job, so this surface and
+    // the `rocm` CLI serve summary apply one selection *rule* to `rocm diagnose`
+    // instead of hand-rolling it twice; it classifies each line with the *same*
+    // rule the diagnose checker uses. One rule is not one answer: the two read
+    // the shared log at different points, with this bail's own sanitized echo
+    // written into it in between, so for a colourised line they can print
+    // different (both sound) `--symptom` arguments -- this one the canonical
+    // symptom, the CLI the rendered row. See `rocm_core::vllm_log_segments` for
+    // the measurement. Its guarantee is specifically that
+    // a line passing `quotable_in_single_quotes` is diagnosable -- not that
+    // every returned line is -- which is exactly what the branch below needs,
+    // since the non-quotable branch substitutes the canonical symptom anyway.
+    //
+    // No line means the tail carries no OOM, so the helper's `None` is the OOM
+    // gate too; there is no separate classifier predicate to ask first.
+    //
+    // The helper also skips lines rocm-cli wrote into the log itself, which
+    // matters precisely here: this hint is rendered into the engine's bail, the
+    // CLI writes that whole error back into the same shared log, and the hint
+    // quotes the user's line and names the allocator keywords, so it scores as
+    // an OOM just as strongly as the real line does. Being last, it would win
+    // the newest-first scan on the next read — and it contains `'`, so the
+    // printed command would fall back to the canonical symptom in every real
+    // run. That is why the two markers below come from shared constants rather
+    // than being spelled out here.
+    let Some(symptom) = rocm_core::vllm_oom_diagnose_symptom(log_tail) else {
+        return String::new();
+    };
     // The line is subprocess output, so it is echoed only after the terminal
-    // control bytes vLLM's colourised logger emits are removed.
-    let symptom_line = strip_terminal_control_sequences(raw_line);
-    let candidate = format!("vllm: {raw_line}");
-    let symptom = if quotable_in_single_quotes(&candidate)
-        && rocm_core::vllm_oom_symptom_is_diagnosable(&candidate)
-    {
-        candidate
+    // control bytes vLLM's colourised logger emits are removed -- but removing
+    // them is not enough on its own. A break token deleted with nothing in its
+    // place welds the two rows either side of it into a line the engine never
+    // printed (`Loading weights: 90%torch.OutOfMemoryError: ...`), which would
+    // then be presented here as the user's own output. The shared helper returns
+    // the rendered row that actually scored, which is one row the terminal
+    // really drew.
+    let symptom_line =
+        rocm_core::vllm_oom_display_line(symptom.strip_prefix("vllm: ").unwrap_or(&symptom));
+    let symptom = if rocm_core::quotable_in_single_quotes(&symptom) {
+        symptom
     } else {
         rocm_core::VLLM_OOM_CANONICAL_SYMPTOM.to_owned()
     };
     format!(
-        "\n\nDetected an out-of-memory failure ({symptom_line}). {}\n\
-         For conditional remediation, run `rocm diagnose --symptom '{symptom}'`.",
-        rocm_core::VLLM_GPU_MEMORY_UTILIZATION_HINT
+        "\n\n{}{symptom_line}). {}\n\
+         For conditional remediation, run `{} '{symptom}'`.",
+        rocm_core::VLLM_OOM_DETECTED_PREFIX,
+        rocm_core::VLLM_GPU_MEMORY_UTILIZATION_HINT,
+        rocm_core::VLLM_OOM_DIAGNOSE_COMMAND,
     )
-}
-
-/// Whether `symptom` can be placed inside a `'...'` shell word verbatim.
-///
-/// The value is untrusted subprocess output (the vLLM startup log tail) and the
-/// message it lands in invites the user to paste the command into a shell, so a
-/// bare `'` would close the quote and let text nobody vetted become shell
-/// syntax. An apostrophe is routine in Python error text (`can't allocate`,
-/// `model 'foo'`), and a line only has to mention running out of memory to be
-/// selected, so this is an ordinary case rather than an exotic one.
-///
-/// Rejecting instead of escaping (`'` -> `'\''`) is deliberate. Escaping keeps
-/// the exact bytes but yields a command a reader cannot check by eye, and a
-/// wrong escape is *runnable* and misleading rather than obviously broken;
-/// control bytes would still reach the terminal. The canonical fallback is the
-/// branch that already exists for "this line cannot be used", and it is
-/// guaranteed to report a cause. The user's own line stays visible in the
-/// human-readable sentence above the command (and in the log tail printed with
-/// it), so nothing is lost but the copy-paste convenience.
-///
-/// The character test is [`is_control_or_format`] together with
-/// [`is_control_or_line_separator`], because each covers scalars the other does
-/// not and `symptom` is the *raw* log line, not the stripped one: a `Cf` bidi
-/// override reordered how the printed command renders, and a `Zl` line
-/// separator broke it across two rows.
-fn quotable_in_single_quotes(symptom: &str) -> bool {
-    !symptom.contains('\'')
-        && !symptom
-            .chars()
-            .any(|c| is_control_or_format(c) || is_control_or_line_separator(c))
-}
-
-/// Case-insensitive scan for the out-of-memory signatures vLLM/PyTorch emit on a
-/// HIP allocation failure (e.g. `torch.OutOfMemoryError: HIP out of memory`).
-fn log_tail_shows_oom(log_tail: &str) -> bool {
-    let lower = log_tail.to_ascii_lowercase();
-    lower.contains("out of memory") || lower.contains("outofmemory")
 }
 
 /// Polls the vLLM endpoint until it reports the model is loaded, or times out.
@@ -788,6 +793,7 @@ mod tests {
     use crate::ENGINE_NAME;
     use crate::runtime::VllmRuntime;
     use crate::state::current_unix_millis;
+    use std::fmt::Write as _;
 
     /// A throwaway directory for the shebang cases. Scoped per test and per
     /// thread so the suite can keep running these concurrently.
@@ -944,11 +950,51 @@ mod tests {
         );
         Ok(())
     }
+    /// The OOM gate [`oom_utilization_hint`] itself uses. There is no separate
+    /// classifier predicate in `rocm-core`: the selector returning `Some` *is*
+    /// the gate, so these tests assert against the function that ships.
+    fn detects_oom(log: &str) -> bool {
+        rocm_core::vllm_oom_diagnose_symptom(log).is_some()
+    }
+
+    #[test]
+    fn the_hint_never_quotes_itself_back_on_a_second_read_of_the_shared_log() {
+        // A managed launch shares one log between the supervisor and the engine.
+        // The engine bails with `startup_log_context`, which embeds *this* hint,
+        // and the CLI then writes that whole error back into the same file. So
+        // on the read that drives the serve summary the hint is in the log, it
+        // is last, and it scores as an OOM just as strongly as the real line.
+        //
+        // That is the end-to-end shape of the bug: the newest-first scan picked
+        // this sentence, which contains `'`, the quoting guard rejected it, and
+        // the note fell back to the canonical symptom in every real run — so the
+        // "we quote your own failing line" promise never once held in the field.
+        // A unit test on the hint alone cannot see it; only feeding the hint
+        // back through the selector can.
+        let real_line = "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.";
+        let hint = oom_utilization_hint(real_line);
+        assert!(!hint.is_empty(), "the real line must produce a hint");
+
+        let second_read = format!("{real_line}\nError: launch failed{hint}\n");
+        let symptom = rocm_core::vllm_oom_diagnose_symptom(&second_read)
+            .expect("the real OOM line must still be found under the hint");
+        assert_eq!(
+            symptom,
+            format!("vllm: {real_line}"),
+            "the user's own line must win over the hint rocm-cli wrote itself"
+        );
+        assert!(
+            rocm_core::quotable_in_single_quotes(&symptom),
+            "and it must survive the quoting guard, or the printed command falls \
+             back to the canonical symptom exactly as it did before this fix"
+        );
+    }
+
     #[test]
     fn oom_utilization_hint_fires_on_out_of_memory_log_tails() {
         // The exact PyTorch/HIP signature from the field report.
         let torch = "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.";
-        assert!(log_tail_shows_oom(torch));
+        assert!(detects_oom(torch));
         let hint = oom_utilization_hint(torch);
         assert!(
             hint.contains("--gpu-memory-utilization"),
@@ -967,17 +1013,19 @@ mod tests {
         );
 
         // Detection is case-insensitive and also matches the spaced phrasing.
-        assert!(log_tail_shows_oom("HIP OUT OF MEMORY"));
-        assert!(log_tail_shows_oom("RuntimeError: CUDA out of memory"));
+        assert!(detects_oom("HIP OUT OF MEMORY"));
+        assert!(detects_oom("RuntimeError: CUDA out of memory"));
     }
 
     #[test]
     fn every_emitted_oom_symptom_is_diagnosable_and_names_the_branch_that_produced_it() {
         // Closes the loop between the two layers: the engine prints
         // `rocm diagnose --symptom '<symptom>'`, so whatever it emits must
-        // actually score for the diagnose checker -- including for lines the
-        // coarse substring detector accepts but the scorer rates sub-threshold
-        // on their own (those fall back to the canonical symptom).
+        // actually score for the diagnose checker. What makes that true is the
+        // pair of branches, not the selector alone: a *quotable* selected line
+        // is diagnosable because the selector scores with the checker's own
+        // rule, and a non-quotable one is replaced by the canonical symptom,
+        // which is diagnosable by definition. This guards both branches.
         //
         // Each case pins the *exact* symptom, not just that one is diagnosable.
         // Diagnosability alone cannot fail for the defect this test is named
@@ -987,9 +1035,17 @@ mod tests {
         // every such assertion. Naming the expected symptom per line is what
         // makes the routing branch and the fallback branch separately
         // falsifiable -- and it is why the table below deliberately mixes the
-        // two: three lines score on their own and must be quoted verbatim,
-        // three do not and must fall back.
+        // two.
+        //
+        // Since the detector was reconciled with the checker, the fallback is no
+        // longer reached by sub-threshold scoring (those lines now produce no
+        // hint at all -- see `sub_threshold_lines_carry_no_hint_at_all`); it is
+        // reached by a line that scores but cannot be rendered as one intact
+        // single-quoted argument. So the fallback rows here are the
+        // *unquotable* ones, which is also what keeps the admissibility guard
+        // falsifiable through the surface that actually prints the command.
         let accepted_lines = [
+            // Score and are quotable: the user's own line must be quoted verbatim.
             (
                 "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.",
                 "vllm: torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.",
@@ -998,47 +1054,97 @@ mod tests {
                 "RuntimeError: hipErrorOutOfMemory",
                 "vllm: RuntimeError: hipErrorOutOfMemory",
             ),
+            (
+                "torch.cuda.OutOfMemoryError: CUDA out of memory",
+                "vllm: torch.cuda.OutOfMemoryError: CUDA out of memory",
+            ),
             ("CUDA out of memory", "vllm: CUDA out of memory"),
-            // Sub-threshold on their own: the class name with no allocator
-            // message, the allocator message with no class name, and a bare
-            // kill notice. These must reach the canonical fallback.
+            // Score but are inadmissible in a single-quoted word, so they must
+            // reach the canonical fallback: an apostrophe (which would close the
+            // quote), a colourised line (control bytes), and a bidi override
+            // (a `Cf` format character, which `char::is_control` does not catch
+            // and which reorders how the printed command renders).
             (
-                "torch.cuda.OutOfMemoryError",
+                "torch.OutOfMemoryError: HIP out of memory. GPU 0 can't allocate the model's weights.",
                 rocm_core::VLLM_OOM_CANONICAL_SYMPTOM,
             ),
             (
-                "HIP error: out of memory",
+                "\u{1b}[31mtorch.OutOfMemoryError: HIP out of memory\u{1b}[0m",
                 rocm_core::VLLM_OOM_CANONICAL_SYMPTOM,
             ),
             (
-                "the process was killed: out of memory",
+                "torch.OutOfMemoryError: \u{202e}HIP out of memory. Tried to allocate 7.21 GiB.",
                 rocm_core::VLLM_OOM_CANONICAL_SYMPTOM,
             ),
         ];
         let mut routed_verbatim = 0;
+        let mut fell_back = 0;
         for (line, expected) in accepted_lines {
-            assert!(log_tail_shows_oom(line), "detector must accept: {line}");
+            assert!(detects_oom(line), "detector must accept: {line:?}");
             let hint = oom_utilization_hint(line);
             let symptom = quoted_symptom_argument(&hint);
             assert_eq!(
                 symptom, expected,
                 "wrong branch for {line:?}: the engine must quote the user's own line when \
-                 the checker scores it and fall back to the canonical symptom only when it \
-                 does not"
+                 it can be rendered as one intact single-quoted argument and fall back to \
+                 the canonical symptom only when it cannot"
             );
             assert!(
                 rocm_core::vllm_oom_symptom_is_diagnosable(symptom),
                 "emitted symptom must be diagnosable, got {symptom:?} for line {line:?}"
             );
-            if symptom != rocm_core::VLLM_OOM_CANONICAL_SYMPTOM {
+            if symptom == rocm_core::VLLM_OOM_CANONICAL_SYMPTOM {
+                fell_back += 1;
+            } else {
                 routed_verbatim += 1;
             }
         }
+        // Both counters, not just the verbatim one: a table that drifted until
+        // every row took the same branch would still satisfy every per-row
+        // assertion above, which is the vacuity this test was written to close.
         assert_eq!(
-            routed_verbatim, 3,
-            "the table must keep exercising both branches; if a scoring change moved a line \
-             across the threshold, re-pick the fixture rather than relaxing the expectation"
+            (routed_verbatim, fell_back),
+            (4, 3),
+            "the table must keep exercising both branches; if an admissibility change \
+             moved a line across the quotability boundary, re-pick the fixture rather than \
+             relaxing the expectation. Scoring is not what separates these rows — every row \
+             here is comfortably accepted by the detector, and the three fallbacks are \
+             fallbacks purely because they cannot be rendered as one single-quoted word"
         );
+    }
+
+    #[test]
+    fn sub_threshold_lines_carry_no_hint_at_all() {
+        // The reconciled detector rejects sub-threshold lines the loose scan used
+        // to accept -- exactly the false positives the diagnose checker's
+        // threshold guards against. Rejecting them here keeps the two layers from
+        // disagreeing (the engine must not print a `--symptom` the checker would
+        // then score as "no known cause").
+        //
+        // This is a different property from the one above: there the question is
+        // *which* symptom an emitted hint carries, here it is whether a hint is
+        // emitted at all. Before the detector was reconciled these lines reached
+        // the canonical fallback instead; now they produce nothing, and printing
+        // a memory hint for them would be a regression the symptom table cannot
+        // see.
+        let rejected_lines = [
+            // The bare exception class every PyTorch OOM raises, uncorroborated.
+            "torch.cuda.OutOfMemoryError",
+            // A spaced "out of memory" with no allocator anchor phrase.
+            "HIP error: out of memory",
+            // A kernel OOM-killer line from an unrelated subprocess.
+            "the process was killed: out of memory",
+        ];
+        for line in rejected_lines {
+            assert!(
+                !detects_oom(line),
+                "detector must reject sub-threshold line: {line}"
+            );
+            assert!(
+                oom_utilization_hint(line).is_empty(),
+                "a sub-threshold line must not carry a memory hint: {line}"
+            );
+        }
     }
 
     /// The `--symptom` value the hint actually hands the user, read back out of
@@ -1061,7 +1167,7 @@ mod tests {
             "ERROR 09-14 12:00:01 engine.py:389] torch.OutOfMemoryError: HIP out of memory. ",
             "Tried to allocate 7.21 GiB. GPU 0 can't allocate the model's weights."
         );
-        assert!(log_tail_shows_oom(log_tail));
+        assert!(detects_oom(log_tail));
         let hint = oom_utilization_hint(log_tail);
 
         // The rendered command must be one intact single-quoted argument: no
@@ -1102,8 +1208,12 @@ mod tests {
         let log_tail = "\u{1b}[31mRuntimeError: HIP out of memory\u{1b}[0m\u{7}";
         let hint = oom_utilization_hint(log_tail);
         assert!(
-            !hint.chars().any(|c| c.is_control() && c != '\n'),
-            "no control byte may survive into the printed hint: {hint:?}"
+            !hint
+                .chars()
+                .any(|c| c.is_control() && c != '\n' && c != '\t'),
+            "no cursor-moving control byte may survive into the printed hint — `\\t` is \
+             exempt because `rendered_lines` keeps it deliberately, as intra-line \
+             whitespace that moves along the row it is already on: {hint:?}"
         );
         // Pin the exact rendering rather than the absence of a few fragments.
         // Absence checks cannot fail for the defect they name: a stripper that
@@ -1111,7 +1221,7 @@ mod tests {
         // leaves `31m`/`0m` behind, which contains neither `[31m` nor `[0m` and
         // carries no control byte, so every absence check still passes.
         assert_eq!(
-            strip_terminal_control_sequences(log_tail),
+            rocm_core::strip_terminal_control_sequences(log_tail),
             "RuntimeError: HIP out of memory",
             "the ANSI sequence must be removed whole, not just its escape byte"
         );
@@ -1127,129 +1237,6 @@ mod tests {
                 rocm_core::VLLM_OOM_CANONICAL_SYMPTOM
             ),
             "the echoed line must render exactly, with the whole escape sequence gone"
-        );
-    }
-
-    #[test]
-    fn the_stripper_follows_the_escape_grammar_not_just_the_colour_case() {
-        // The `'m'`-terminated SGR case above is the *easy* one, and on its own
-        // it pins almost nothing: narrowing the CSI final-byte range from
-        // `0x40..=0x7E` to just `'m'` leaves it green. These cases pin the
-        // range, the parameter/intermediate classes, and the introducers.
-        //
-        // They are not academic. This input is a *killed* process's output, so
-        // truncated and interleaved sequences are the normal case on this code
-        // path, and every one of them used to corrupt the message the user
-        // reads -- the failures are quoted per case below.
-        for (raw, expected, defect) in [
-            // Non-`m` CSI finals: `K` (erase-in-line) and `A` (cursor-up) are
-            // ordinary logger output, and narrowing the final-byte range to
-            // `'m'` leaves them in the message verbatim.
-            (
-                "\u{1b}[2KRuntimeError: HIP out of memory",
-                "RuntimeError: HIP out of memory",
-                "a non-`m` CSI final must terminate the sequence",
-            ),
-            (
-                "\u{1b}[1ARuntimeError: HIP out of memory",
-                "RuntimeError: HIP out of memory",
-                "a non-`m` CSI final must terminate the sequence",
-            ),
-            // Truncated CSI immediately followed by a well-formed one: the old
-            // scan consumed the second sequence's `ESC [` as the first one's
-            // parameters and stopped at `0`, yielding "0mKilled: out of memory".
-            (
-                "\u{1b}[1;2\u{1b}[0mKilled: out of memory",
-                "Killed: out of memory",
-                "a truncated CSI must not swallow the next sequence's introducer",
-            ),
-            // A multi-byte scalar can never be in `0x40..=0x7E`, so the old scan
-            // ran past it and ate to the next byte that happened to land in
-            // range -- this yielded "ut of memory", losing the `o`.
-            (
-                "\u{1b}[12\u{e9} out of memory",
-                "\u{e9} out of memory",
-                "an invalid CSI byte must end the sequence, not be scanned past",
-            ),
-            // `ESC ESC`: the old code dropped the second `ESC` as the first
-            // one's argument, then emitted `[0m` as literal text.
-            (
-                "\u{1b}\u{1b}[0mRuntimeError: HIP out of memory",
-                "RuntimeError: HIP out of memory",
-                "a stray ESC must not consume the next sequence's introducer",
-            ),
-            // OSC: the old code took the `else` branch on `]`, so the window
-            // title leaked into the message as "0;titleRuntimeError: ...".
-            (
-                "\u{1b}]0;title\u{7}RuntimeError: HIP out of memory",
-                "RuntimeError: HIP out of memory",
-                "an OSC body must not be emitted as text",
-            ),
-            // ...and with the ST terminator (`ESC \`) rather than BEL.
-            (
-                "\u{1b}]0;title\u{1b}\\RuntimeError: HIP out of memory",
-                "RuntimeError: HIP out of memory",
-                "an OSC terminated by ST must be consumed whole",
-            ),
-            // A two-character escape with no CSI at all.
-            (
-                "\u{1b}7RuntimeError: HIP out of memory",
-                "RuntimeError: HIP out of memory",
-                "a simple escape must consume exactly its final byte",
-            ),
-            // Cf format characters: `char::is_control` is category Cc only, so
-            // U+202E survived and reversed how the rest of the line renders.
-            (
-                "RuntimeError: \u{202e}HIP out of memory",
-                "RuntimeError: HIP out of memory",
-                "a bidi override must not survive into the message",
-            ),
-            // The `Zl`/`Zp` pair that `is_control_or_line_separator` adds to
-            // `char::is_control`: drop it from that predicate and both of these
-            // go red, as do the quoting assertions below.
-            (
-                "RuntimeError: HIP\u{2028}out of memory",
-                "RuntimeError: HIPout of memory",
-                "a line separator must not survive into the message",
-            ),
-            (
-                "RuntimeError: HIP\u{2029}out of memory",
-                "RuntimeError: HIPout of memory",
-                "a paragraph separator must not survive into the message",
-            ),
-            // The text-only control: nothing is removed from a clean line.
-            (
-                "RuntimeError: HIP out of memory",
-                "RuntimeError: HIP out of memory",
-                "a clean line must pass through untouched",
-            ),
-        ] {
-            assert_eq!(
-                strip_terminal_control_sequences(raw),
-                expected,
-                "{defect}: {raw:?}"
-            );
-        }
-
-        // Every one of those scalars must also be inadmissible in the quoted
-        // command, not merely stripped from the echoed sentence: the candidate
-        // the guard sees is built from the raw line, not the stripped one, so
-        // the second call site needs its own pins.
-        assert!(
-            !quotable_in_single_quotes("vllm: \u{202e}HIP out of memory"),
-            "a bidi override must make a line unquotable, not ride into the command"
-        );
-        assert!(
-            !quotable_in_single_quotes("vllm: HIP\u{2028}out of memory"),
-            "a line separator must make a line unquotable, not ride into the command"
-        );
-        assert!(
-            !quotable_in_single_quotes("vllm: HIP\u{2029}out of memory"),
-            "a paragraph separator must make a line unquotable, not ride into the command"
-        );
-        assert!(
-            quotable_in_single_quotes("vllm: HIP out of memory"),
-            "the rejection must not be so broad that ordinary lines stop qualifying"
         );
     }
 
@@ -1273,8 +1260,11 @@ mod tests {
         fs::remove_file(&path).ok();
 
         assert!(
-            !context.chars().any(|c| c.is_control() && c != '\n'),
-            "no control byte may survive into the printed failure message: {context:?}"
+            !context
+                .chars()
+                .any(|c| c.is_control() && c != '\n' && c != '\t'),
+            "no cursor-moving control byte may survive into the printed failure message — \
+             `\\t` is exempt, see the hint assertion above: {context:?}"
         );
         assert!(
             !context.contains("pwned"),
@@ -1282,7 +1272,7 @@ mod tests {
         );
         assert_eq!(
             context
-                .split("startup log:\n")
+                .split("as the terminal drew them:\n")
                 .nth(1)
                 .and_then(|rest| rest.split("\n\nDetected").next()),
             Some("INFO starting\nRuntimeError: HIP out of memory"),
@@ -1292,12 +1282,342 @@ mod tests {
     }
 
     #[test]
+    fn the_echoed_tail_never_welds_two_rendered_rows_into_one_line() -> Result<()> {
+        // vLLM draws its progress bar with bare carriage returns, so a real OOM
+        // arrives as ONE `\n` line carrying two rows the terminal drew. The echo
+        // used to sanitize with `strip_terminal_control_sequences`, which drops
+        // the break with nothing in its place and welds them together.
+        //
+        // That is not cosmetic. A managed launch shares one log between the
+        // supervisor and the engine: the CLI writes this whole bail back into
+        // the same file, so the *second* read sees the welded line, scores it as
+        // a genuine OOM, finds it quotable (the control bytes are gone) and
+        // quotes it into the `rocm diagnose --symptom '...'` command the serve
+        // summary invites the user to paste. The user would be told to paste a
+        // line vLLM never printed.
+        let exception = "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.";
+        let welded = format!("Loading weights: 90%{exception}");
+        let path = std::env::temp_dir().join(format!(
+            "rocm-vllm-weld-{}-{}.log",
+            std::process::id(),
+            current_unix_millis()
+        ));
+        fs::write(&path, format!("Loading weights: 90%\r{exception}\n"))?;
+        let context = startup_log_context(Some(path.as_path()));
+        fs::remove_file(&path).ok();
+
+        assert!(
+            !context.contains(&welded),
+            "the echoed tail must not weld the progress bar onto the exception: {context:?}"
+        );
+        assert!(
+            context.contains(&format!("Loading weights: 90%\n{exception}")),
+            "each row the terminal drew must be echoed on its own line: {context:?}"
+        );
+        // The displayed line beside the hint is the scoring row, not the segment
+        // with its breaks deleted.
+        assert!(
+            context.contains(&format!(
+                "{}{exception})",
+                rocm_core::VLLM_OOM_DETECTED_PREFIX
+            )),
+            "the hint must name the exception row alone: {context:?}"
+        );
+        assert!(
+            !context
+                .chars()
+                .any(|c| c.is_control() && c != '\n' && c != '\t'),
+            "no cursor-moving control byte may survive into the printed failure message — \
+             `\\t` is exempt, see the hint assertion above: {context:?}"
+        );
+
+        // Now the second read: rebuild the shared log exactly as the supervisor
+        // leaves it (the raw engine output, then the CLI's `Error:` echo of this
+        // bail) and confirm the selector still picks the engine's real row.
+        let second_read = format!(
+            "Loading weights: 90%\r{exception}\n\
+             Error: vLLM server process exited before becoming ready (status: exit status: 1)\
+             {context}\n"
+        );
+        assert_eq!(
+            rocm_core::vllm_oom_diagnose_symptom(&second_read).as_deref(),
+            Some(format!("vllm: {exception}").as_str()),
+            "the welded echo must never become the symptom the user is told to paste"
+        );
+        Ok(())
+    }
+
+    /// Two branches `the_echoed_tail_never_welds…` cannot reach, because its
+    /// fixture breaks on a bare `\r` and so its *selected segment* is already
+    /// one row by the time either branch runs. Both survived a mutation run
+    /// against the whole `process.rs` suite before this test existed:
+    ///
+    ///   - computing `oom_utilization_hint` from the sanitized summary instead
+    ///     of the raw tail (103 passed, exit 0), and
+    ///   - swapping `vllm_oom_display_line` for
+    ///     `strip_terminal_control_sequences` (103 passed, exit 0).
+    ///
+    /// `ESC[2K` is the discriminator. [`rocm_core::terminal::rendered_lines`]
+    /// ends a row on it, but `vllm_log_segments` does not split on it at all, so
+    /// the segment reaching both branches really does carry two rows and an
+    /// escape — which is what vLLM's colourised progress bar actually emits.
+    #[test]
+    fn the_hint_reads_the_raw_tail_and_displays_the_row_that_scored() -> Result<()> {
+        let exception = "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.";
+        let repaint = format!("Loading weights: 90%\u{1b}[2K{exception}");
+        let path = std::env::temp_dir().join(format!(
+            "rocm-vllm-repaint-{}-{}.log",
+            std::process::id(),
+            current_unix_millis()
+        ));
+        fs::write(&path, format!("{repaint}\n"))?;
+        let context = startup_log_context(Some(path.as_path()));
+        fs::remove_file(&path).ok();
+
+        // Branch 1 — the hint is computed from the *raw* tail. There the segment
+        // still carries the `ESC[2K`, so the quoting guard rejects it and the
+        // printed command names the canonical symptom. Computed from the
+        // sanitized summary instead, the escape is gone, the guard accepts, and
+        // the exception would be quoted verbatim.
+        assert!(
+            context.contains(&format!(
+                "`{} '{}'`",
+                rocm_core::VLLM_OOM_DIAGNOSE_COMMAND,
+                rocm_core::VLLM_OOM_CANONICAL_SYMPTOM
+            )),
+            "an escape-bearing segment must fall back to the canonical symptom: {context:?}"
+        );
+        assert!(
+            !context.contains(&format!("'vllm: {exception}'")),
+            "the raw segment is not quotable, so its rendered row must not be quoted: {context:?}"
+        );
+
+        // Branch 2 — the displayed line is the row that scored. Stripping the
+        // segment instead welds the progress bar onto the exception, producing a
+        // line vLLM never printed.
+        assert!(
+            context.contains(&format!(
+                "{}{exception})",
+                rocm_core::VLLM_OOM_DETECTED_PREFIX
+            )),
+            "the hint must display the scoring row alone: {context:?}"
+        );
+        assert!(
+            !context.contains(&format!("Loading weights: 90%{exception}")),
+            "the displayed line must never weld the progress bar onto the exception: {context:?}"
+        );
+        Ok(())
+    }
+
+    /// The end-to-end bound on the raw-split guarantee, measured rather than
+    /// assumed — and the reason the obvious tightening is not available.
+    ///
+    /// `vllm_log_segments` keeps raw bytes so a colourised OOM line is refused
+    /// by the quoting guard rather than printed as a stripped lookalike. That
+    /// holds for each surface on the text it reads. It does not survive the
+    /// engine's own bail: the echo here is necessarily sanitized (it goes to a
+    /// terminal), the supervisor appends the bail to the same shared log, and
+    /// the raw line then falls out of the CLI's `DEFAULT_LOG_TAIL_LINES` window.
+    /// So the two surfaces can print different `--symptom` arguments for one
+    /// failure. This pins both halves: that the difference exists and is
+    /// harmless, and that filtering the echo out would cost the note entirely.
+    #[test]
+    fn the_colourised_round_trip_quotes_the_row_the_terminal_drew() -> Result<()> {
+        let exception = "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.";
+        let coloured = format!("\u{1b}[31m{exception}\u{1b}[0m");
+        let mut log = String::new();
+        for shard in 0..200 {
+            writeln!(log, "INFO vllm.engine loading shard {shard}").expect("write to String");
+        }
+        writeln!(log, "{coloured}").expect("write to String");
+        let path = std::env::temp_dir().join(format!(
+            "rocm-vllm-roundtrip-{}-{}.log",
+            std::process::id(),
+            current_unix_millis()
+        ));
+        fs::write(&path, &log)?;
+
+        // Read 1 — the engine. The raw segment carries escapes, so the guard
+        // rejects it and the canonical symptom is printed.
+        let context = startup_log_context(Some(path.as_path()));
+        assert!(
+            context.contains(&format!(
+                "`{} '{}'`",
+                rocm_core::VLLM_OOM_DIAGNOSE_COMMAND,
+                rocm_core::VLLM_OOM_CANONICAL_SYMPTOM
+            )),
+            "the engine must refuse the colourised line and fall back: {context:?}"
+        );
+
+        // The supervisor appends the whole bail to the same log.
+        fs::write(
+            &path,
+            format!(
+                "{log}Error: vLLM server process exited before becoming ready \
+                 (status: exit status: 1){context}\n"
+            ),
+        )?;
+        let tail = rocm_core::tail_lines(
+            &path,
+            STARTUP_FAILURE_LOG_TAIL_LINES,
+            crate::state::MAX_TAIL_READ,
+        )?
+        .join("\n");
+        fs::remove_file(&path).ok();
+
+        // The measurement the bound rests on: the engine's raw line is no longer
+        // in the window the CLI reads. Only the sanitized echo of it is.
+        assert!(
+            !tail.contains(&coloured),
+            "the raw colourised line must be out of the window, or this test proves nothing"
+        );
+
+        // Read 2 — the CLI. It quotes the rendered row, not the canonical
+        // symptom. Different from read 1, and sound: the row is text the
+        // terminal drew, it is quotable, and quotable implies diagnosable.
+        let symptom = rocm_core::vllm_oom_diagnose_symptom(&tail)
+            .expect("the echoed tail must still carry a detectable OOM");
+        assert_eq!(symptom, format!("vllm: {exception}"));
+        assert!(rocm_core::quotable_in_single_quotes(&symptom));
+        assert!(rocm_core::vllm_oom_symptom_is_diagnosable(&symptom));
+
+        // And the half that forecloses the tightening. The echo is a full tail
+        // window plus the hint, so by the time the CLI reads, the window has
+        // scrolled past the `Startup log, last N lines` header entirely: it holds
+        // echoed rows and rocm-cli's own hint, and nothing the engine wrote
+        // directly. A filter anchored on that header therefore never fires.
+        let header = format!(
+            "Startup log, last {STARTUP_FAILURE_LOG_TAIL_LINES} lines as the terminal drew them:"
+        );
+        assert!(
+            !tail.contains(header.as_str()),
+            "the echo header must have scrolled out, or the window still holds raw engine output"
+        );
+        // Anchored on the hint instead and scanning newest-first — the only
+        // other marker available — suppression swallows the whole window and
+        // the serve summary's note disappears for every real managed launch.
+        let mut inside_echo = false;
+        let still_selectable: Vec<&str> = tail
+            .lines()
+            .flat_map(|line| line.split('\r'))
+            .map(str::trim)
+            .filter(|segment| !segment.is_empty())
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .filter(|segment| {
+                if segment.contains(rocm_core::VLLM_OOM_DIAGNOSE_COMMAND) {
+                    inside_echo = true;
+                }
+                !inside_echo
+            })
+            .collect();
+        assert!(
+            still_selectable
+                .iter()
+                .all(|segment| rocm_core::vllm_oom_diagnose_symptom(segment).is_none()),
+            "keeping the echo out of the CLI's selection leaves no OOM line at all: \
+             {still_selectable:?}"
+        );
+        Ok(())
+    }
+
+    /// Pins a **known gap**, not desired behaviour: when the OOM line sits near
+    /// the start of the window this engine scans, the `rocm serve` summary's
+    /// note disappears even though this engine diagnosed the OOM.
+    ///
+    /// Both surfaces use the same tail *budget*
+    /// (`rocm_engine_protocol::DEFAULT_LOG_TAIL_LINES`), but not the same
+    /// window. This engine scans the last N raw lines and bails; the supervisor
+    /// appends that whole bail — a header, the tail echoed as rendered rows, and
+    /// the hint — to the same shared log; the CLI then reads N lines of the
+    /// *longer* file. So the CLI's window always reaches less far back into the
+    /// original log than this one did, and when the bail is itself longer than N
+    /// rows it holds nothing the engine wrote directly. With the OOM line
+    /// followed by 77 further lines it is diagnosed here and invisible there.
+    ///
+    /// Closing it is a design decision rather than a tweak, which is why it is
+    /// pinned instead of fixed. Re-windowing the CLI to the N lines *before* the
+    /// bail would restore agreement, but the raw colourised line comes back into
+    /// view with it and the note stops quoting the user's own rendered row —
+    /// trading this gap for the regression
+    /// `the_colourised_round_trip_quotes_the_row_the_terminal_drew` exists to
+    /// prevent. Recording the engine's selected symptom as structured data
+    /// alongside the log would remove the class. **Update this test when the gap
+    /// closes; do not delete it.**
+    #[test]
+    fn the_cli_window_can_miss_an_oom_the_engine_saw() -> Result<()> {
+        let exception = "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.";
+        let mut log = String::new();
+        for shard in 0..200 {
+            writeln!(log, "INFO vllm.engine loading shard {shard}").expect("write to String");
+        }
+        writeln!(log, "{exception}").expect("write to String");
+        // Enough trailing lines that the OOM still sits inside this engine's
+        // window (78 lines from the end, budget 80) but far enough from the end
+        // that the appended bail pushes its echo out of the CLI's.
+        for worker in 0..77 {
+            writeln!(log, "INFO vllm.engine shutting down worker {worker}")
+                .expect("write to String");
+        }
+        let path = std::env::temp_dir().join(format!(
+            "rocm-vllm-window-{}-{}.log",
+            std::process::id(),
+            current_unix_millis()
+        ));
+        fs::write(&path, &log)?;
+
+        // Read 1 — the engine. It sees the OOM and says so.
+        let context = startup_log_context(Some(path.as_path()));
+        assert!(
+            context.contains(rocm_core::VLLM_OOM_DETECTED_PREFIX),
+            "the engine must diagnose this OOM, or the test proves nothing: {context:?}"
+        );
+
+        // The supervisor appends the whole bail to the same log.
+        fs::write(
+            &path,
+            format!(
+                "{log}Error: vLLM server process exited before becoming ready \
+                 (status: exit status: 1){context}\n"
+            ),
+        )?;
+        let tail = rocm_core::tail_lines(
+            &path,
+            STARTUP_FAILURE_LOG_TAIL_LINES,
+            crate::state::MAX_TAIL_READ,
+        )?
+        .join("\n");
+        fs::remove_file(&path).ok();
+
+        // Read 2 — the CLI, same budget, later file. The gap.
+        assert!(
+            rocm_core::vllm_oom_diagnose_symptom(&tail).is_none(),
+            "this test pins the known window gap; if the CLI now finds the OOM the gap is \
+             closed — update the test, `append_oom_serve_note`'s comment and the README's \
+             \"absence is not evidence\" list together: {tail:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn oom_utilization_hint_stays_quiet_for_unrelated_failures() {
         let unrelated = "ValueError: model architecture 'FooForCausalLM' is not supported";
-        assert!(!log_tail_shows_oom(unrelated));
+        assert!(!detects_oom(unrelated));
         assert!(
             oom_utilization_hint(unrelated).is_empty(),
             "non-OOM failures must not carry a memory hint"
+        );
+
+        // vLLM's generic EngineCore wrapper is the terminal line for *any*
+        // startup crash (unsupported arch, shm size, TP misconfig, missing
+        // weights, OOM, ...); treating it as an OOM signature would misreport
+        // those unrelated failures as memory exhaustion.
+        let wrapper_only = "ERROR Engine core initialization failed";
+        assert!(!detects_oom(wrapper_only));
+        assert!(
+            oom_utilization_hint(wrapper_only).is_empty(),
+            "the generic EngineCore wrapper alone must not be treated as OOM"
         );
     }
 

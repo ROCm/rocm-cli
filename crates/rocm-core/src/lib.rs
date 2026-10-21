@@ -46,6 +46,7 @@ mod test_env;
 #[cfg(test)]
 mod test_support;
 pub mod uv;
+pub mod vllm_oom;
 pub use automation::{
     AuditEventRecord, AutomationEventRecord, AutomationProposalRecord, AutomationRuntimeState,
     AutomationTriggerEvent, BuiltinWatcherSpec, WatcherRuntimeSnapshot, append_audit_event,
@@ -172,11 +173,16 @@ pub use runtime::{
     runtime_rocm_library_filename, shell_command_for_host, user_runtime_dir,
 };
 pub use service_record::ManagedServiceRecord;
+pub use terminal::{quotable_in_single_quotes, strip_terminal_control_sequences};
 pub use uv::{
     DEFAULT_UV_TIMEOUT_SECS, DependencyViolation, UV_CACHE_DIR_ENV, UV_CACHE_DIR_OVERRIDE_ENV,
     UvCacheSource, ViolationSubject, check_dependencies, ensure_uv_binary, split_local_version,
     uv_binary_name, uv_cache_source, uv_command_env, uv_http_timeout_secs, uv_pip_check_args,
     uv_pip_freeze_args, uv_pip_install_base, uv_venv_args, violation_subject, violations_requiring,
+};
+pub use vllm_oom::{
+    VLLM_OOM_DETECTED_PREFIX, VLLM_OOM_DIAGNOSE_COMMAND, vllm_oom_diagnose_symptom,
+    vllm_oom_display_line,
 };
 
 /// The variable that opts a machine out of rocm-cli choosing its runtime's torch.
@@ -327,9 +333,17 @@ pub fn resolve_amd_smi_binary() -> OsString {
 /// weights of most models people actually serve, so it trades one startup
 /// failure for another. Pinned by
 /// `the_utilization_hint_example_matches_the_recipe_command`.
+///
+/// The stated bound must be the one `rocm serve` actually accepts:
+/// `parse_gpu_memory_utilization` rejects `<= 0` and accepts `1`, so the domain
+/// is `(0, 1]` and the older `<0-1>` wording wrongly advertised `0`. Pinned by
+/// `the_utilization_hint_states_the_bound_the_parser_accepts`, because this
+/// wording has already been reverted once by a merge that resolved the line from
+/// a pre-fix tree.
 pub const VLLM_GPU_MEMORY_UTILIZATION_HINT: &str = "vLLM reserves ~90% of the GPU's total VRAM by default; on a shared or busy GPU this can \
      collide with memory already in use. Lower the reservation with `--gpu-memory-utilization \
-     <0-1>` (e.g. 0.5 for a small model), or target a less-busy GPU with `--gpu <index>`.";
+     <fraction greater than 0 and at most 1>` (e.g. 0.5 for a small model), or target a less-busy \
+     GPU with `--gpu <index>`.";
 
 /// Locate `amd-smi` inside the bin directories of the newest managed ROCm SDK
 /// runtime recorded in the registry. The binary ships with the TheRock wheel
