@@ -3777,6 +3777,7 @@ dependencies = [
  "ratatui",
  "reqwest 0.13.4",
  "rig-core",
+ "rocm-dash-collectors",
  "rocm-dash-core",
  "rocm-deps",
  "serde",

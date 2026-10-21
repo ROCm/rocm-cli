@@ -20,3 +20,4 @@ pub mod proc_scan;
 pub mod sysfs;
 pub mod vllm_log;
 pub mod vllm_prom;
+pub mod winperf;

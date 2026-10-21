@@ -178,12 +178,52 @@ async fn connect_and_run(connect: &str, tx: UnboundedSender<ClientMsg>) -> anyho
     Ok(())
 }
 
+/// Windows has no rocmdashd socket yet, so this builds `Snapshot`s in-process
+/// instead of connecting anywhere: `HostCollector` (already cross-platform)
+/// for CPU/memory, `WinPerfCollector` (OS perf counters, no AMD tool needed)
+/// for GPU. Same `ClientMsg` sequence the unix arm produces
+/// (`Connected` then a stream of `Event::Snapshot`), so the app loop doesn't
+/// need to know which platform it's on.
 #[cfg(windows)]
-// Mirrors the signature of the `cfg(unix)` arm, which callers `.await`;
-// dropping `async` here would not compile on Windows.
-#[allow(clippy::unused_async)]
-async fn connect_and_run(connect: &str, _tx: UnboundedSender<ClientMsg>) -> anyhow::Result<()> {
-    Err(anyhow!(
-        "rocm-dash TUI requires Unix domain sockets; not supported on Windows yet (connect={connect})"
-    ))
+async fn connect_and_run(connect: &str, tx: UnboundedSender<ClientMsg>) -> anyhow::Result<()> {
+    use rocm_dash_collectors::host::HostCollector;
+    use rocm_dash_collectors::winperf::WinPerfCollector;
+    use rocm_dash_core::metrics::Snapshot;
+
+    info!(
+        connect,
+        "windows: collecting metrics in-process (no daemon socket)"
+    );
+    let _ = tx.send(ClientMsg::Connected {
+        host: "localhost".into(),
+        daemon_version: format!("in-process/{}", env!("CARGO_PKG_VERSION")),
+    });
+
+    let mut host = HostCollector::new();
+    let gpu = WinPerfCollector::new();
+    // Mirrors the daemon's `gpu_tick` cadence (rocm_dash_daemon::runner::RunnerOptions::default()).
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
+
+    loop {
+        ticker.tick().await;
+        let gpus = gpu.metrics().await.unwrap_or_else(|e| {
+            warn!(error = %e, "windows GPU perf-counter query failed");
+            Vec::new()
+        });
+        let snapshot = Snapshot {
+            timestamp: chrono::Utc::now(),
+            host: host.tick(),
+            gpus,
+            gpu_system_info: Some(gpu.system_info().await),
+            instances: Vec::new(),
+            warnings: Vec::new(),
+        };
+        if tx
+            .send(ClientMsg::Event(Box::new(Event::Snapshot(snapshot))))
+            .is_err()
+        {
+            break;
+        }
+    }
+    Ok(())
 }

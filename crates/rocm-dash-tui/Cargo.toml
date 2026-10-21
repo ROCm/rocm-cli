@@ -16,6 +16,10 @@ path = "src/lib.rs"
 
 [dependencies]
 rocm-dash-core = { path = "../rocm-dash-core" }
+# Windows-only: the in-process metrics ticker in `client.rs` reuses
+# `HostCollector`/`WinPerfCollector` instead of a socket (no rocmdashd on
+# Windows yet). Builds on every platform like the rest of the crate.
+rocm-dash-collectors = { path = "../rocm-dash-collectors" }
 rocm-deps = { path = "../rocm-deps" }
 # Unified dashboard TUI base: ratatui 0.30 + crossterm 0.28. This is the only
 # ratatui in the workspace — the `rocm` binary no longer carries a (dead) 0.29
