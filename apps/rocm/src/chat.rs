@@ -2,25 +2,27 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Chat/assistant tool-call support: the chat/MCP-bridge cluster's
-//! `pub(crate)` types (`ChatRocmCommandAction`, `CommandCapture`,
-//! `DeterministicModelRecipe`, `DeterministicServiceRow`,
-//! `DeterministicEngineRow`), its tool-call validation/approval/execution
-//! logic (`validate_chat_tool_call` and the `validate_chat_*_tool_call`
-//! family), deterministic tool-output summarization, and the MCP
-//! tool-bridge entry points (`run_internal_mcp_call` and its helpers).
-//! Every call site in `main.rs`, `dash.rs`, `dash_seam.rs`, `comfyui.rs`,
-//! and `runtime_install_finalize.rs` goes through the `chat::` module
-//! boundary.
+//! Chat/assistant tool-call support: the chat/MCP-bridge cluster's types
+//! (`ChatRocmCommandAction`, `CommandCapture`, `DeterministicModelRecipe`,
+//! `DeterministicServiceRow`, `DeterministicEngineRow`, and others — all
+//! module-private except `ChatToolApprovalRequest`, reached by
+//! `dash_seam.rs` as `chat_tool_approval_request`'s return type), its
+//! tool-call validation/approval/execution logic (`validate_chat_tool_call`
+//! and the `validate_chat_*_tool_call` family), deterministic tool-output
+//! summarization, and the MCP tool-bridge entry points
+//! (`run_internal_mcp_call` and its helpers). Every call site in `main.rs`,
+//! `dash.rs`, `dash_seam.rs`, `comfyui.rs`, and `runtime_install_finalize.rs`
+//! goes through the `chat::` module boundary.
 //!
 //! Full domain extraction, mirroring `providers.rs`. Phase 6d (ROCMAI-88) of
 //! the `main.rs` modularization (see `docs/architecture.md`), split across
-//! three PRs given the cluster's size: this module's contents are now parts
-//! 1 and 2's combined slice (types, leaf helpers, and the orchestration
-//! bodies above), plus the cluster's regression tests, moved out of
-//! `main.rs`'s shared `mod tests` block in part 2. Auditing which of this
-//! module's `pub(crate)` items have no caller outside it and could be
-//! module-private is the third PR's job.
+//! three PRs given the cluster's size: this module's contents are the
+//! combined slice of all three (types and leaf helpers, the orchestration
+//! bodies, and the cluster's regression tests moved out of `main.rs`'s
+//! shared `mod tests` block), plus the third PR's own visibility audit —
+//! every function still `pub(crate)` has a confirmed caller outside this
+//! module; none of the module's types need to be, bar the one exception
+//! above.
 
 use crate::runtime_install_finalize::empty_as_unknown;
 use crate::runtimes_cmd::render_runtimes_text;
@@ -34,15 +36,15 @@ use crate::{
     render_engine_inventory_text_with_paths, render_examine_text, render_examine_text_with_paths,
     render_freeform_plan, render_logs_browser_text, render_logs_text,
     render_model_registry_verbose_text_with_context_and_host, render_service_logs_text,
-    render_services_text, render_services_tool_result_text, render_setup_status_text,
-    render_uninstall_dry_run, render_update_text, serve_args_request_cpu_device,
-    service_model_names_match, therock_install_version_selector, validate_service_id,
+    render_services_text, render_setup_status_text, render_uninstall_dry_run, render_update_text,
+    serve_args_request_cpu_device, service_model_names_match, therock_install_version_selector,
+    validate_service_id,
 };
 use crate::{chat_host_facts, comfyui, providers, therock};
 use anyhow::{Context, Result, bail};
 use rocm_core::{
-    AppPaths, AutomationRuntimeState, DEFAULT_LOCAL_HOST, ExamineSummary, RocmCliConfig,
-    builtin_watcher, daemon_binary_path, load_recent_automation_events,
+    AppPaths, AutomationRuntimeState, DEFAULT_LOCAL_HOST, ExamineSummary, ManagedServiceRecord,
+    RocmCliConfig, builtin_watcher, daemon_binary_path, load_recent_automation_events,
     runtime_install_root_is_protected,
 };
 use rocm_engine_protocol::DEFAULT_LOG_TAIL_LINES;
@@ -54,7 +56,7 @@ use std::process::Command as ProcessCommand;
 use std::time::Duration;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub(crate) enum ChatRocmCommandAction {
+enum ChatRocmCommandAction {
     ReadOnly(Vec<String>),
     Approval {
         args: Vec<String>,
@@ -64,14 +66,14 @@ pub(crate) enum ChatRocmCommandAction {
 }
 
 #[derive(Debug)]
-pub(crate) struct CommandCapture {
+struct CommandCapture {
     pub(crate) argv: Vec<String>,
     pub(crate) exit_status: i32,
     pub(crate) stdout: String,
     pub(crate) stderr: String,
 }
 
-pub(crate) fn command_capture_text(output: &CommandCapture) -> String {
+fn command_capture_text(output: &CommandCapture) -> String {
     if output.stderr.trim().is_empty() {
         output.stdout.trim().to_owned()
     } else if output.stdout.trim().is_empty() {
@@ -85,7 +87,7 @@ pub(crate) fn command_capture_text(output: &CommandCapture) -> String {
     }
 }
 
-pub(crate) fn mcp_tool_result_text(value: &serde_json::Value) -> String {
+fn mcp_tool_result_text(value: &serde_json::Value) -> String {
     value
         .get("content")
         .and_then(serde_json::Value::as_array)
@@ -104,14 +106,14 @@ pub(crate) fn mcp_tool_result_text(value: &serde_json::Value) -> String {
         .unwrap_or_else(|| value.to_string())
 }
 
-pub(crate) fn mcp_tool_result_is_error(value: &serde_json::Value) -> bool {
+fn mcp_tool_result_is_error(value: &serde_json::Value) -> bool {
     value
         .get("isError")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false)
 }
 
-pub(crate) fn chat_tool_display_label(name: &str) -> String {
+fn chat_tool_display_label(name: &str) -> String {
     match name {
         "examine" => "Checked this computer".to_owned(),
         "gpu_snapshot" => "Checked GPU status".to_owned(),
@@ -135,7 +137,7 @@ pub(crate) fn chat_tool_display_label(name: &str) -> String {
     }
 }
 
-pub(crate) fn chat_tool_call_display_label(call: &providers::ChatToolCall) -> String {
+fn chat_tool_call_display_label(call: &providers::ChatToolCall) -> String {
     if call.name != "rocm_command" {
         return chat_tool_display_label(&call.name);
     }
@@ -188,7 +190,7 @@ pub(crate) fn chat_tool_call_display_label(call: &providers::ChatToolCall) -> St
     }
 }
 
-pub(crate) fn loopback_tcp_port_is_reachable(host: &str, port: u16) -> bool {
+fn loopback_tcp_port_is_reachable(host: &str, port: u16) -> bool {
     let Ok(addresses) = (host, port).to_socket_addrs() else {
         return false;
     };
@@ -197,7 +199,7 @@ pub(crate) fn loopback_tcp_port_is_reachable(host: &str, port: u16) -> bool {
         .any(|address| TcpStream::connect_timeout(&address, Duration::from_millis(200)).is_ok())
 }
 
-pub(crate) fn parse_optional_query(args: &[String]) -> Result<Option<String>> {
+fn parse_optional_query(args: &[String]) -> Result<Option<String>> {
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -215,7 +217,7 @@ pub(crate) fn parse_optional_query(args: &[String]) -> Result<Option<String>> {
     Ok(None)
 }
 
-pub(crate) fn parse_optional_lines(args: &[String]) -> Result<usize> {
+fn parse_optional_lines(args: &[String]) -> Result<usize> {
     let mut index = 0;
     while index < args.len() {
         if matches!(args[index].as_str(), "--lines" | "-n") {
@@ -229,7 +231,7 @@ pub(crate) fn parse_optional_lines(args: &[String]) -> Result<usize> {
     Ok(DEFAULT_LOG_TAIL_LINES)
 }
 
-pub(crate) fn push_optional_json_cli_arg(
+fn push_optional_json_cli_arg(
     args: &mut Vec<String>,
     object: &serde_json::Map<String, serde_json::Value>,
     flag: &str,
@@ -241,10 +243,7 @@ pub(crate) fn push_optional_json_cli_arg(
     }
 }
 
-pub(crate) fn json_string(
-    object: &serde_json::Map<String, serde_json::Value>,
-    key: &str,
-) -> Option<String> {
+fn json_string(object: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<String> {
     object
         .get(key)
         .and_then(serde_json::Value::as_str)
@@ -253,7 +252,7 @@ pub(crate) fn json_string(
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct DeterministicModelRecipe {
+struct DeterministicModelRecipe {
     pub(crate) canonical_id: String,
     pub(crate) min_gpu_mem_gib: Option<u32>,
     pub(crate) engines: Vec<String>,
@@ -261,7 +260,7 @@ pub(crate) struct DeterministicModelRecipe {
     pub(crate) warnings: Vec<String>,
 }
 
-pub(crate) fn parse_deterministic_model_recipes(tool_text: &str) -> Vec<DeterministicModelRecipe> {
+fn parse_deterministic_model_recipes(tool_text: &str) -> Vec<DeterministicModelRecipe> {
     let mut recipes = Vec::new();
     let mut current: Option<DeterministicModelRecipe> = None;
     for line in tool_text.lines() {
@@ -328,7 +327,7 @@ fn is_engine_status_line(line: &str) -> bool {
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct DeterministicServiceRow {
+struct DeterministicServiceRow {
     pub(crate) service_id: String,
     pub(crate) engine: String,
     pub(crate) model: String,
@@ -337,7 +336,7 @@ pub(crate) struct DeterministicServiceRow {
     pub(crate) endpoint: String,
 }
 
-pub(crate) fn parse_deterministic_service_rows(tool_text: &str) -> Vec<DeterministicServiceRow> {
+fn parse_deterministic_service_rows(tool_text: &str) -> Vec<DeterministicServiceRow> {
     let mut rows = Vec::new();
     let mut current: Option<DeterministicServiceRow> = None;
     for line in tool_text.lines() {
@@ -397,13 +396,13 @@ pub(crate) fn parse_deterministic_service_rows(tool_text: &str) -> Vec<Determini
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct DeterministicEngineRow {
+struct DeterministicEngineRow {
     pub(crate) engine: String,
     pub(crate) runtime: String,
     pub(crate) note: String,
 }
 
-pub(crate) fn parse_deterministic_engine_rows(tool_text: &str) -> Vec<DeterministicEngineRow> {
+fn parse_deterministic_engine_rows(tool_text: &str) -> Vec<DeterministicEngineRow> {
     let mut rows = Vec::new();
     let mut current: Option<DeterministicEngineRow> = None;
     for line in tool_text.lines() {
@@ -490,7 +489,7 @@ pub(crate) fn read_piped_prompt() -> Result<Option<String>> {
 /// step with no stdin — has to keep printing the status screen rather than send
 /// a blank turn to a model, and a caller who really means to send whitespace
 /// can still say so with `--prompt`.
-pub(crate) fn piped_prompt_from_input(input: &str) -> Option<String> {
+fn piped_prompt_from_input(input: &str) -> Option<String> {
     if input.trim().is_empty() {
         return None;
     }
@@ -614,12 +613,12 @@ pub(crate) struct ChatToolApprovalRequest {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub(crate) struct ChatPromptResult {
+struct ChatPromptResult {
     pub rendered: String,
     pub approval: Option<ChatToolApprovalRequest>,
 }
 
-pub(crate) struct ChatToolRunResult {
+struct ChatToolRunResult {
     pub(crate) approval: Option<ChatToolApprovalRequest>,
     pub(crate) follow_up_text: String,
     pub(crate) ran_read_only_tool: bool,
@@ -629,7 +628,7 @@ pub(crate) struct ChatToolRunResult {
 
 /// Convenience wrapper used by tests that do not exercise sampling controls.
 #[cfg(test)]
-pub(crate) fn render_chat_prompt_result(
+fn render_chat_prompt_result(
     paths: &AppPaths,
     provider: &str,
     model: Option<&str>,
@@ -647,7 +646,7 @@ pub(crate) fn render_chat_prompt_result(
     )
 }
 
-pub(crate) fn render_chat_prompt_result_with_progress(
+fn render_chat_prompt_result_with_progress(
     paths: &AppPaths,
     provider: &str,
     model: Option<&str>,
@@ -923,7 +922,7 @@ fn deterministic_mutating_tool_call_for_prompt(
     }
 }
 
-pub(crate) fn supplemental_read_only_tool_call_for_prompt(
+fn supplemental_read_only_tool_call_for_prompt(
     prompt: &str,
     existing_calls: &[providers::ChatToolCall],
 ) -> Option<providers::ChatToolCall> {
@@ -1028,7 +1027,7 @@ fn deterministic_mutating_tool_intro(call: &providers::ChatToolCall) -> String {
     }
 }
 
-pub(crate) fn local_tool_call_content_is_intermediate(
+fn local_tool_call_content_is_intermediate(
     provider: &str,
     rocm_tools: bool,
     response: &providers::ChatResponse,
@@ -1039,7 +1038,7 @@ pub(crate) fn local_tool_call_content_is_intermediate(
         && !response.content.trim().is_empty()
 }
 
-pub(crate) fn local_follow_up_content_is_final(response: &providers::ChatResponse) -> bool {
+fn local_follow_up_content_is_final(response: &providers::ChatResponse) -> bool {
     response.tool_calls.is_empty() && !response.content.trim().is_empty()
 }
 
@@ -1145,7 +1144,7 @@ fn fallback_services_list_tool_call() -> providers::ChatToolCall {
     }
 }
 
-pub(crate) fn fallback_rocm_tool_call_for_prompt(prompt: &str) -> Option<providers::ChatToolCall> {
+fn fallback_rocm_tool_call_for_prompt(prompt: &str) -> Option<providers::ChatToolCall> {
     let prompt = latest_user_chat_message(prompt);
     let normalized = prompt.to_ascii_lowercase();
     let asks_running_or_status = prompt_asks_running_or_status(&normalized);
@@ -1456,9 +1455,7 @@ pub(crate) fn any_substring(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| haystack.contains(needle))
 }
 
-pub(crate) fn install_sdk_without_prefix_chat_approval(
-    prompt: &str,
-) -> Option<ChatToolApprovalRequest> {
+fn install_sdk_without_prefix_chat_approval(prompt: &str) -> Option<ChatToolApprovalRequest> {
     install_sdk_chat_approval_for_prompt(prompt).and_then(|approval| {
         chat_cli_arg_value(&approval.args, "--prefix")
             .is_none()
@@ -1466,9 +1463,7 @@ pub(crate) fn install_sdk_without_prefix_chat_approval(
     })
 }
 
-pub(crate) fn install_sdk_chat_approval_for_prompt(
-    prompt: &str,
-) -> Option<ChatToolApprovalRequest> {
+fn install_sdk_chat_approval_for_prompt(prompt: &str) -> Option<ChatToolApprovalRequest> {
     let prompt = latest_user_chat_message(prompt);
     let normalized = prompt.to_ascii_lowercase();
     if !prompt_requests_rocm_install_or_setup(&normalized) {
@@ -1772,7 +1767,7 @@ fn looks_like_therock_runtime_version(token: &str) -> bool {
         && therock::RuntimeVersionSelector::build_date(date).is_ok()
 }
 
-pub(crate) fn visible_chat_content(content: &str) -> String {
+fn visible_chat_content(content: &str) -> String {
     let mut output = String::new();
     let mut remaining = content;
     while let Some(start) = find_ascii_case_insensitive(remaining, "<think>") {
@@ -1805,7 +1800,7 @@ fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
 const ROCM_CHAT_TOOL_SYSTEM_PROMPT: &str = "You are ROCm CLI's local assistant. Speak in simple English for non-technical users. Use the provided ROCm tools when you need to inspect this machine, preview setup, read service logs, check updates, inspect automations, install or start ROCm-managed apps, or request ROCm/TheRock, config, engine, app, and local model server changes. For simple greetings or thanks like hello, hi, hey, ok, or thank you, reply normally; do not inspect ROCm, do not call tools, and do not launch or propose a model server. Tool-use rules: inspect first with read-only tools; call rocm_command only with argv-style args and no shell text; use natural_language_plan for ROCm requests that do not fit another read-only tool; ask for a mutating tool call only after explaining why it is needed; summarize tool results after they are returned. Read-only tools may run immediately. Tools that install, launch, stop, delete, or change state require user approval; request rocm_command and explain why. For 'is X running?', 'what is running?', status, or port questions, inspect before answering and do not start, stop, install, or serve anything. For ComfyUI or port 8188 use [\"comfyui\",\"status\"] or port_status. For vLLM, Lemonade, qwen, or local model servers use [\"services\",\"list\",\"--all\"] for running state and [\"engines\",\"list\"] for installed/available engine state. Treat ready/running as running, starting/recovering as starting, failed/stopped as not running, and no matching record as unknown or not managed by ROCm CLI. Interpret Examine carefully: active_runtime_status=ready means ROCm CLI has an active managed TheRock/ROCm runtime; legacy_rocm_status=not_detected only means no global system ROCm install was found. If active_runtime_status=ready, tell the user ROCm/TheRock is installed and active for ROCm CLI. For 'is TheRock installed', 'is ROCm installed', or 'which GPU is on this machine', use examine or gpu_snapshot before answering. For 'how do I setup TheRock' or install/setup requests, guide the user to choose an install folder first; do not answer with only a status check. For 'which LLMs can this machine support', use rocm_command args [\"model\"] or natural_language_plan before answering. For TheRock installs, always let the user choose the install folder. If the user names a folder or prefix, preserve that exact folder with [\"--prefix\",\"PATH\"]; you may call path_exists first to check whether that user-provided folder or its parent exists. If the user asks you to install TheRock/ROCm but has not named a folder, ask for the folder or let the guided setup folder picker collect it; do not invent a hidden default folder and do not request an install command without --prefix. Use rocm_command args [\"install\",\"sdk\",\"--channel\",\"release\",\"--format\",\"wheel\",\"--prefix\",\"PATH\"] only when the user asks you to install it and a folder is known; for a requested build date add [\"--build-date\",\"YYYY-MM-DD\"] and for a requested exact version add [\"--version\",\"VERSION\"]. For config changes, inspect with [\"config\",\"show\"] first when useful, then request config subcommands such as [\"config\",\"set-default-engine\",\"lemonade\"], [\"config\",\"set-default-runtime\",\"RUNTIME_KEY\"], or [\"config\",\"set-telemetry\",\"local\"] only after explaining why. For ComfyUI, use rocm_command with args like [\"comfyui\",\"status\"], [\"comfyui\",\"logs\"], [\"comfyui\",\"install\"], [\"comfyui\",\"start\"], or [\"comfyui\",\"stop\"]. First-time setup is the same thing as bootstrap in ROCm CLI; it is a deterministic ROCm setup flow, not a separate model chat. The built-in local assistant is fixed to qwen, which maps to Qwen3-4B-Instruct-2507-GGUF served by Lemonade with gpu_required. vLLM and Lemonade are the general serving engines; inspect or manage them when the user asks about general model serving, but do not switch the built-in assistant away from Lemonade. Use qwen-smoke only for a quick server smoke test. For vLLM management, inspect engines first and use [\"engines\",\"install\",\"vllm\"] or [\"serve\",\"MODEL\",\"--engine\",\"vllm\",\"--device\",\"gpu_required\",\"--managed\"] only where the host supports it. Do not invent shell commands and do not request CPU fallback.";
 const ROCM_CHAT_TOOL_SKILL: &str = include_str!("../../../skills/rocm-cli-assistant/SKILL.md");
 
-pub(crate) fn rocm_chat_tool_system_prompt() -> String {
+fn rocm_chat_tool_system_prompt() -> String {
     format!("{ROCM_CHAT_TOOL_SYSTEM_PROMPT}\n\nROCm CLI assistant skill:\n{ROCM_CHAT_TOOL_SKILL}")
 }
 
@@ -1828,18 +1823,11 @@ fn local_provider_missing_service_error(error: &anyhow::Error) -> bool {
     })
 }
 
-pub(crate) fn local_rocm_tools_assistant_model(
-    provider: &str,
-    rocm_tools: bool,
-) -> Option<&'static str> {
+fn local_rocm_tools_assistant_model(provider: &str, rocm_tools: bool) -> Option<&'static str> {
     (provider == "local" && rocm_tools).then_some(providers::BUILTIN_ASSISTANT_MODEL_ID)
 }
 
-pub(crate) fn local_chat_service_needed_text(
-    model: Option<&str>,
-    prompt: &str,
-    rocm_tools: bool,
-) -> String {
+fn local_chat_service_needed_text(model: Option<&str>, prompt: &str, rocm_tools: bool) -> String {
     let mut output = String::new();
     let _ = writeln!(output, "No local assistant is running yet.");
     let _ = writeln!(output);
@@ -1915,7 +1903,7 @@ pub(crate) fn local_chat_service_needed_text(
     output.trim_end().to_owned()
 }
 
-pub(crate) fn append_chat_tool_results(
+fn append_chat_tool_results(
     paths: &AppPaths,
     response: &providers::ChatResponse,
     output: &mut String,
@@ -2166,9 +2154,7 @@ pub(crate) fn validate_chat_tool_call(call: &providers::ChatToolCall) -> Result<
 
 /// Validate a `proposal_action` chat-tool call: `proposal_id` must be a
 /// non-empty string and `action` must be one of show | approve | reject.
-pub(crate) fn validate_chat_proposal_action_tool_call(
-    call: &providers::ChatToolCall,
-) -> Result<()> {
+fn validate_chat_proposal_action_tool_call(call: &providers::ChatToolCall) -> Result<()> {
     let object = call
         .arguments
         .as_object()
@@ -2273,10 +2259,7 @@ fn validate_chat_service_tool_call(call: &providers::ChatToolCall) -> Result<()>
     Ok(())
 }
 
-pub(crate) fn validate_chat_watcher_tool_call(
-    call: &providers::ChatToolCall,
-    allow_mode: bool,
-) -> Result<()> {
+fn validate_chat_watcher_tool_call(call: &providers::ChatToolCall, allow_mode: bool) -> Result<()> {
     let object = call
         .arguments
         .as_object()
@@ -2364,9 +2347,7 @@ fn chat_rocm_command_action(call: &providers::ChatToolCall) -> Result<ChatRocmCo
     chat_rocm_command_action_from_args(args)
 }
 
-pub(crate) fn normalized_chat_rocm_command_args(
-    call: &providers::ChatToolCall,
-) -> Result<Vec<String>> {
+fn normalized_chat_rocm_command_args(call: &providers::ChatToolCall) -> Result<Vec<String>> {
     let object = call
         .arguments
         .as_object()
@@ -2410,7 +2391,7 @@ pub(crate) fn normalized_chat_rocm_command_args(
     Ok(args)
 }
 
-pub(crate) fn managed_service_running_state(status: &str) -> &'static str {
+fn managed_service_running_state(status: &str) -> &'static str {
     match status {
         "ready" | "running" => "running",
         "starting" | "recovering" => "starting",
@@ -2419,9 +2400,35 @@ pub(crate) fn managed_service_running_state(status: &str) -> &'static str {
     }
 }
 
-pub(crate) fn chat_rocm_command_action_from_args(
-    mut args: Vec<String>,
-) -> Result<ChatRocmCommandAction> {
+fn render_services_tool_result_text(records: &[ManagedServiceRecord]) -> String {
+    let mut output = String::new();
+    let _ = writeln!(output, "managed_services: {}", records.len());
+    let _ = writeln!(
+        output,
+        "status_meaning: ready/running = running; starting/recovering = starting; failed/stopped = not running; no matching row = not managed by ROCm CLI"
+    );
+    if records.is_empty() {
+        let _ = writeln!(output, "services: none");
+        return output;
+    }
+    let _ = writeln!(output, "services:");
+    for record in records {
+        let _ = writeln!(
+            output,
+            "  - service_id={} engine={} model={} canonical_model={} status={} running_state={} endpoint={}",
+            record.service_id,
+            record.engine,
+            record.model_ref,
+            record.canonical_model_id,
+            record.status,
+            managed_service_running_state(&record.status),
+            record.endpoint_url
+        );
+    }
+    output
+}
+
+fn chat_rocm_command_action_from_args(mut args: Vec<String>) -> Result<ChatRocmCommandAction> {
     canonicalize_chat_rocm_command(&mut args)?;
     validate_chat_rocm_command_safety(&args)?;
     let first = args.first().map(|value| value.to_ascii_lowercase());
@@ -2825,7 +2832,7 @@ pub(crate) fn chat_cli_has_flag(args: &[String], name: &str) -> bool {
     })
 }
 
-pub(crate) fn chat_install_prefix_is_system(prefix: &Path) -> bool {
+fn chat_install_prefix_is_system(prefix: &Path) -> bool {
     prefix.as_os_str().is_empty() || runtime_install_root_is_protected(prefix)
 }
 
@@ -2864,7 +2871,7 @@ pub(crate) fn chat_tool_call_is_read_only(call: &providers::ChatToolCall) -> boo
     )
 }
 
-pub(crate) fn deterministic_rocm_tool_summary(tool_text: &str) -> Option<String> {
+fn deterministic_rocm_tool_summary(tool_text: &str) -> Option<String> {
     if !tool_text.contains("examine:") {
         return None;
     }
@@ -2931,7 +2938,7 @@ pub(crate) fn deterministic_rocm_tool_summary(tool_text: &str) -> Option<String>
     (!lines.is_empty()).then(|| lines.join("\n"))
 }
 
-pub(crate) fn deterministic_chat_tool_summary(tool_text: &str) -> Option<String> {
+fn deterministic_chat_tool_summary(tool_text: &str) -> Option<String> {
     deterministic_rocm_tool_summary(tool_text)
         .or_else(|| deterministic_model_tool_summary(tool_text))
         .or_else(|| deterministic_combined_status_tool_summary(tool_text))
@@ -2954,7 +2961,7 @@ fn deterministic_summary_can_stand_alone(tool_text: &str) -> bool {
     !tool_text.contains("model recipes")
 }
 
-pub(crate) fn deterministic_model_tool_summary(tool_text: &str) -> Option<String> {
+fn deterministic_model_tool_summary(tool_text: &str) -> Option<String> {
     if !tool_text.contains("model recipes") {
         return None;
     }
@@ -3255,7 +3262,7 @@ fn deterministic_engine_inventory_tool_summary(tool_text: &str) -> Option<String
     Some(lines.join("\n"))
 }
 
-pub(crate) fn should_request_local_tool_follow_up(
+fn should_request_local_tool_follow_up(
     provider: &str,
     tool_result: &ChatToolRunResult,
     deterministic_summary: Option<&str>,
@@ -3279,7 +3286,8 @@ fn chat_tool_value(tool_text: &str, key: &str) -> Option<String> {
     })
 }
 
-// pub(crate): used by the dash execution seam (dash_seam.rs)
+// pub(crate): called from main.rs's own MCP dispatch and from the dash
+// execution seam (dash_seam.rs)
 pub(crate) fn run_internal_mcp_call(
     paths: &AppPaths,
     name: &str,
@@ -3597,7 +3605,7 @@ fn run_rocm_capture_for_paths(
     })
 }
 
-pub(crate) fn run_rocm_command_for_paths(
+fn run_rocm_command_for_paths(
     paths: &AppPaths,
     args: &[String],
     _timeout: Duration,
@@ -3620,7 +3628,7 @@ pub(crate) fn run_rocm_command_for_paths(
     }
 }
 
-pub(crate) fn run_rocm_read_only_in_process(paths: &AppPaths, args: &[String]) -> Result<String> {
+fn run_rocm_read_only_in_process(paths: &AppPaths, args: &[String]) -> Result<String> {
     let config = RocmCliConfig::load(paths).unwrap_or_default();
     match args {
         [] => bail!("rocm command requires at least one argument"),
@@ -3933,7 +3941,7 @@ fn run_chat_path_exists_tool(call: &providers::ChatToolCall) -> Result<serde_jso
     }))
 }
 
-pub(crate) fn run_chat_port_status_tool(
+fn run_chat_port_status_tool(
     paths: &AppPaths,
     call: &providers::ChatToolCall,
 ) -> Result<serde_json::Value> {
@@ -4003,7 +4011,7 @@ pub(crate) fn run_chat_port_status_tool(
     }))
 }
 
-pub(crate) const fn chat_read_only_tool_status_label(is_error: bool) -> &'static str {
+const fn chat_read_only_tool_status_label(is_error: bool) -> &'static str {
     if is_error {
         "reported an error"
     } else {
@@ -4011,7 +4019,7 @@ pub(crate) const fn chat_read_only_tool_status_label(is_error: bool) -> &'static
     }
 }
 
-pub(crate) fn rocm_chat_tool_requested_command(call: &providers::ChatToolCall) -> Option<String> {
+fn rocm_chat_tool_requested_command(call: &providers::ChatToolCall) -> Option<String> {
     let args = rocm_chat_tool_requested_args(call)?;
     Some(format_structured_tool_call("rocm", &args))
 }
@@ -4165,6 +4173,29 @@ mod tests {
         assert_eq!(
             command_capture_text(&output),
             "stdout:\nout\n\nstderr:\nerr"
+        );
+    }
+
+    #[test]
+    fn runtimes_activate_approval_modal_uses_the_runtime_noun() {
+        // `comfyui install`'s selection errors steer the user to `rocm runtimes`
+        // and say "ROCm runtime". Running a mutating `rocm runtimes …` from chat
+        // raises an approval modal whose title is written here, not by clap, so
+        // `main.rs`'s `runtimes_help_uses_the_runtime_noun_throughout` (which
+        // covers `--help` text) cannot reach it. It said "Change ROCm install"
+        // until this rename.
+        let action = chat_rocm_command_action_from_args(vec![
+            "runtimes".to_owned(),
+            "activate".to_owned(),
+            "some-runtime-key".to_owned(),
+        ])
+        .expect("a mutating runtimes command classifies");
+        let ChatRocmCommandAction::Approval { pending_title, .. } = action else {
+            panic!("`rocm runtimes activate` must require approval, got {action:?}");
+        };
+        assert!(
+            pending_title.contains("runtime") && !pending_title.contains("install"),
+            "the `runtimes` approval modal must use the `runtime` noun, got {pending_title:?}"
         );
     }
 
@@ -4550,6 +4581,32 @@ endpoint: 127.0.0.1:8001
         assert_eq!(managed_service_running_state("failed"), "not_running");
         assert_eq!(managed_service_running_state("stopped"), "not_running");
         assert_eq!(managed_service_running_state("anything-else"), "unknown");
+    }
+
+    #[test]
+    fn services_tool_result_text_includes_running_interpretation() {
+        let (_root, paths) = test_paths("services-tool-text");
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-vllm",
+            "vllm",
+            "Qwen/Qwen3.5",
+            "Qwen/Qwen3.5",
+            "127.0.0.1",
+            11435,
+            "managed",
+            std::process::id(),
+            Some("therock-release".to_owned()),
+            None,
+            Some("gpu_required".to_owned()),
+        );
+        record.status = "ready".to_owned();
+
+        let rendered = render_services_tool_result_text(&[record]);
+
+        assert!(rendered.contains("status_meaning: ready/running = running"));
+        assert!(rendered.contains("engine=vllm"));
+        assert!(rendered.contains("running_state=running"));
     }
 
     #[test]
