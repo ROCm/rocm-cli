@@ -76,10 +76,14 @@ impl WinPerfCollector {
     }
 }
 
-/// `GPU Engine`/`GPU Adapter Memory` instance names are per-engine
-/// (`luid_0x..._0x..._phys_0_eng_0_engtype_3d`) or per-adapter
-/// (`luid_0x..._0x..._phys_0`); the LUID+phys prefix identifies the device.
+/// `GPU Engine` instances are per-process-per-engine
+/// (`pid_1234_luid_0x..._0x..._phys_0_eng_0_engtype_3d`); `GPU Adapter
+/// Memory` instances are per-adapter only (`luid_0x..._0x..._phys_0`, no
+/// pid). Strip any `pid_NNNN_` prefix before keying so both counter
+/// families collapse onto the same per-adapter key — otherwise every
+/// process using the GPU looks like a distinct phantom device.
 fn device_key(instance: &str) -> &str {
+    let instance = instance.find("luid_").map_or(instance, |i| &instance[i..]);
     instance.split("_phys_").next().unwrap_or(instance)
 }
 
@@ -188,7 +192,9 @@ fn parse_system_info(raw: &str) -> GpuSystemInfo {
 mod tests {
     use super::*;
 
-    const SAMPLE: &str = "UTIL\tluid_0x00000000_0x0000b3a4_phys_0_eng_0_engtype_3d\t12.5\nUTIL\tluid_0x00000000_0x0000b3a4_phys_0_eng_1_engtype_video\t4.0\nVRAM\tluid_0x00000000_0x0000b3a4_phys_0\t8589934592\nGPU\tAMD Radeon(TM) Graphics\t17179869184\t31.0.21021.1000";
+    // Real `GPU Engine` instances are per-process (`pid_NNNN_luid_...`); mix
+    // in a pid prefix here so the tests actually exercise that shape.
+    const SAMPLE: &str = "UTIL\tpid_1234_luid_0x00000000_0x0000b3a4_phys_0_eng_0_engtype_3d\t12.5\nUTIL\tpid_1234_luid_0x00000000_0x0000b3a4_phys_0_eng_1_engtype_video\t4.0\nVRAM\tluid_0x00000000_0x0000b3a4_phys_0\t8589934592\nGPU\tAMD Radeon(TM) Graphics\t17179869184\t31.0.21021.1000";
 
     #[test]
     fn parses_single_adapter_metrics_with_total_ram() {
@@ -217,6 +223,19 @@ mod tests {
         let metrics = parse_metrics(&two_adapters);
         assert_eq!(metrics.len(), 2);
         assert!(metrics.iter().all(|g| g.vram_total_mb == 0));
+    }
+
+    #[test]
+    fn multiple_processes_on_one_adapter_collapse_to_one_device() {
+        // Two different pids hitting the same adapter's engines, plus a
+        // single per-adapter VRAM sample (as Windows actually reports it).
+        let sample = "UTIL\tpid_111_luid_0x00000000_0x0002ff2a_phys_0_eng_0_engtype_3d\t0.682\nUTIL\tpid_222_luid_0x00000000_0x0002ff2a_phys_0_eng_0_engtype_3d\t0.514\nVRAM\tluid_0x00000000_0x0002ff2a_phys_0\t902787072\nGPU\tAMD Radeon 780M Graphics\t1073741824\t32.0.31041.1004";
+        let metrics = parse_metrics(sample);
+        assert_eq!(metrics.len(), 1);
+        let gpu = &metrics[0];
+        assert!((gpu.gpu_utilization_pct - 0.682).abs() < 0.001);
+        assert_eq!(gpu.vram_used_mb, 902_787_072 / (1024 * 1024));
+        assert_eq!(gpu.vram_total_mb, 1_073_741_824 / (1024 * 1024));
     }
 
     #[test]
