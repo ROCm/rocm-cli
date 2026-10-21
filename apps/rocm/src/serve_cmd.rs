@@ -882,9 +882,13 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
             launch_lock,
             require_api_key,
             &mut |_elapsed| spinner.tick(),
-        );
-        // `Spinner` has no `Drop`, so a launch that fails here would otherwise
-        // leave its line painted and the error would print on top of it.
+        )
+        .and_then(|report| ensure_background_helper_running_quiet(summary_mode).map(|()| report));
+        // `Spinner` has no `Drop`, so a launch that fails here — or the background
+        // helper it starts — would otherwise leave its line painted and the error
+        // would print on top of it. Both steps fold into `launched` so this one
+        // clear covers each; nothing fallible runs between here and the clears
+        // below.
         let report = match launched {
             Ok(report) => report,
             Err(error) => {
@@ -892,7 +896,6 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
                 return Err(error);
             }
         };
-        ensure_background_helper_running_quiet(summary_mode)?;
 
         // An equivalent service was already running, so nothing was spawned and the
         // freshly generated key is unused — drop it rather than leave it orphaned in
