@@ -81,7 +81,8 @@ use crate::runtimes_cmd::{
 use crate::serve_cmd::{ServeArgs, select_serve_engine, serve};
 use crate::service_launch::{
     ManagedEngineSpawnRequest, ManagedStartupRecord, SpawnManagedEngine,
-    adopt_spawned_engine_child, spawn_managed_engine_process, watch_managed_engine_startup,
+    adopt_spawned_engine_child, spawn_managed_engine_process, update_managed_record_on_disk,
+    watch_managed_engine_startup,
 };
 #[cfg(test)]
 use crate::service_launch::{ManagedEngineStartupCheck, SpawnedManagedEngine};
@@ -7416,30 +7417,28 @@ impl ManagedStartupRecord for RestartStartupRecord<'_> {
 }
 
 /// Apply one of a restart's own changes to the record as it is on disk now,
-/// rather than writing back a copy the restart holds. `write` replaces the
-/// whole file, and a stop records `stop_requested_unix_ms` before it signals
-/// anything — the same hazard `rocmd`'s `update_supervised_record` guards
-/// against for the supervisor's writes.
+/// through the guard the launch shares, [`update_managed_record_on_disk`].
 ///
 /// Nothing is written, and `None` returned, when the record no longer reads
 /// as `expected` left it — it is gone, names other processes, or has another
 /// status: whoever wrote since holds a truer view than this restart. `update`
 /// never touches the stop marker, so a stop asked for meanwhile survives.
+///
+/// Stricter than the launch's ownership test, which lets the status and the
+/// engine pid move: a restart's first write lands on the `"stopped"` record its
+/// own stop left, which is not live, so "still owned" cannot mean "still live"
+/// here — it has to mean "exactly as this restart last saw it".
 fn update_restarting_record(
     paths: &AppPaths,
     expected: &ManagedServiceRecord,
     update: impl FnOnce(&mut ManagedServiceRecord),
 ) -> Result<Option<ManagedServiceRecord>> {
-    if !paths.service_manifest_path(&expected.service_id).exists() {
-        return Ok(None);
-    }
-    let (mut current, _) = read_managed_service_manifest(paths, &expected.service_id)?;
-    if !current.names_same_processes(expected) || current.status != expected.status {
-        return Ok(None);
-    }
-    update(&mut current);
-    current.write()?;
-    Ok(Some(current))
+    update_managed_record_on_disk(
+        paths,
+        &expected.service_id,
+        |current| current.names_same_processes(expected) && current.status == expected.status,
+        update,
+    )
 }
 
 /// Record the child a restart just started as `"starting"`, over the record its
@@ -18978,6 +18977,73 @@ pub(crate) mod tests {
             (after.status.as_str(), after.restart_count),
             ("stopped", 0),
             "the stop's `stopped` stands, and nothing was restarted"
+        );
+        Ok(())
+    }
+
+    /// The restart's half of `a_launch_names_its_child_on_record_before_the_startup_check`
+    /// in `service_launch.rs`: a startup check that cannot answer — a Unix
+    /// `try_wait` error — fails the restart with that error, and leaves the new
+    /// child on record as `"starting"`, restart counted and no stop marker put
+    /// back. Not retired: the child's state is unknown, and freeing the engine +
+    /// model could put a rival engine on its port. Named, so a stop can reach
+    /// it and the liveness refresh can reconcile it, rather than the previous
+    /// run's pids, which a refresh would read as a finished stop.
+    #[test]
+    fn a_restart_whose_startup_check_cannot_answer_keeps_the_child_on_record() -> Result<()> {
+        let (root, paths) = test_paths("managed-restart-check-cannot-answer");
+        paths.ensure()?;
+        let service_id = "lemonade-qwen-restart-7";
+        previous_lemonade_run(&paths, service_id, 11539)?;
+        let manifest_path = paths.service_manifest_path(service_id);
+        let seen_at_check = std::rc::Rc::default();
+        let spawn = stand_in_spawn(
+            manifest_path.clone(),
+            std::rc::Rc::clone(&seen_at_check),
+            || bail!("cannot query the child"),
+        );
+
+        let outcome = restart_internal_managed_service_with(
+            &paths,
+            service_id,
+            None,
+            terminate_recorded_service_pids,
+            &spawn,
+            &readiness_must_not_be_reached,
+        );
+        let after = manifest_on_disk(&manifest_path);
+        let _ = fs::remove_dir_all(root);
+
+        let error = outcome.expect_err("a restart whose startup check cannot answer must fail");
+        assert!(
+            format!("{error:#}").contains("cannot query the child"),
+            "the query failure is what reaches the user: {error:#}"
+        );
+        let expected = ("starting", stand_in_child_pid(), 1, None);
+        let at_check = seen_at_check
+            .borrow_mut()
+            .take()
+            .expect("the record was on disk when the check ran");
+        assert_eq!(
+            (
+                at_check.status.as_str(),
+                at_check.supervisor_pid,
+                at_check.restart_count,
+                at_check.stop_requested_unix_ms,
+            ),
+            expected,
+            "the record must name the new child before its startup check runs"
+        );
+        let after = after.expect("the record is still on disk");
+        assert_eq!(
+            (
+                after.status.as_str(),
+                after.supervisor_pid,
+                after.restart_count,
+                after.stop_requested_unix_ms,
+            ),
+            expected,
+            "a check that cannot answer must leave the child on record, not retire it"
         );
         Ok(())
     }
