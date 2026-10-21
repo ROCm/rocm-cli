@@ -61,8 +61,10 @@ use std::time::{Duration, Instant};
 pub struct DetachedSpawn {
     /// PID of the spawned process.
     pub pid: u32,
-    /// `Some(code)` if the process had already exited when the observation window
-    /// elapsed, `None` if it was still running. `None` is also reported if the
+    /// `Some(code)` if the process exited at any point within the observation
+    /// window — known as soon as it exits, since the wait returns then rather
+    /// than at the end of the window — and `None` if it was still running when
+    /// the window ran out. `None` is also reported if the wait failed or the
     /// exit code could not be read, which degrades to the unwatched behaviour
     /// rather than inventing a failure.
     pub early_exit_code: Option<u32>,
@@ -92,8 +94,8 @@ pub fn spawn_detached_no_inherit(
 ///
 /// Creation flags and handle inheritance are identical to
 /// [`spawn_detached_no_inherit`]: the child stays fully detached and outlives this
-/// process. The wait is bounded and only delays the caller by `settle`; it is not
-/// a join.
+/// process. The wait is bounded and delays the caller by at most `settle` — less
+/// when the child exits sooner; it is not a join.
 ///
 /// This exists because the detached spawn primitives hand back a bare PID rather
 /// than a `std::process::Child`, so a caller has no equivalent of `try_wait()` to
@@ -1136,20 +1138,33 @@ mod tests {
     /// Watching a detached spawn must surface a child that died during startup.
     /// Only meaningful on Windows: the detached spawn primitives return a bare
     /// PID there, so this wait is the only chance to notice the exit.
+    ///
+    /// It also pins what `DetachedSpawn::early_exit_code` documents: the exit is
+    /// reported when it happens, not when the window runs out. The window is far
+    /// longer than `cmd /C exit` takes, so a wait that sat it out fails the
+    /// elapsed-time check rather than passing slowly.
     #[cfg(windows)]
     #[test]
     fn watched_detached_spawn_reports_a_child_that_exits_immediately() {
+        let window = Duration::from_secs(30);
+        let started = std::time::Instant::now();
         // Each token is a separate argument so the assembled command line needs no
         // quoting, keeping `cmd.exe`'s quote-stripping rules out of the test.
         let spawn = spawn_detached_no_inherit_watching_startup(
             &test_system32_tool("cmd.exe"),
             &["/C".to_owned(), "exit".to_owned(), "7".to_owned()],
             &[],
-            Duration::from_secs(10),
+            window,
         )
         .expect("spawn should succeed");
+        let elapsed = started.elapsed();
         assert_eq!(spawn.early_exit_code, Some(7));
         assert_ne!(spawn.pid, 0);
+        assert!(
+            elapsed < window / 2,
+            "the exit must be reported as soon as the child exits, not at the end of \
+             the {window:?} window (took {elapsed:?})"
+        );
     }
 
     /// The converse: a child that is still running must not be reported as a
