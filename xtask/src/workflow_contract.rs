@@ -5615,4 +5615,30 @@ permissions:
             .collect();
         assert_eq!(scripts, ["echo wrapped", "echo plain"]);
     }
+
+    /// The pwsh contract keys its allow-list on a step's name, so a pwsh step
+    /// whose name is wrapped into a block scalar must come back under its
+    /// wrapped text, not as `>-`: read literally, every such step would share
+    /// the one name `>-`, and an allow-list entry could never match it.
+    #[test]
+    fn a_pwsh_step_with_a_block_scalar_name_is_read_from_its_wrapped_lines() {
+        let workflow = "jobs:\n\
+                        \x20 win:\n\
+                        \x20   runs-on: windows-latest\n\
+                        \x20   steps:\n\
+                        \x20     - name: >-\n\
+                        \x20         Package Windows\n\
+                        \x20         bundle\n\
+                        \x20       shell: pwsh\n\
+                        \x20       run: |\n\
+                        \x20         cargo xtask package\n\
+                        \x20     - name: Plain\n\
+                        \x20       shell: pwsh\n\
+                        \x20       run: cargo test\n";
+        let names: Vec<String> = pwsh_steps(workflow)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(names, ["Package Windows bundle", "Plain"]);
+    }
 }
