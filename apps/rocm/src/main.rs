@@ -186,16 +186,17 @@ enum Command {
         /// architecture check.
         #[arg(long, conflicts_with = "distro")]
         report: bool,
-        /// Also offer the prefilled issue form, so the report can be filed.
+        /// Also offer a prefilled mail, so the report can be sent.
         ///
-        /// Still sends nothing. This opens the form with the same content
-        /// `--report` printed, already filled in; it reaches the tracker only
-        /// when you submit it yourself. On a machine with no desktop, or one
-        /// reached over SSH, the link is printed instead of opened.
+        /// Still sends nothing. This opens a mail to ROCmCLI@amd.com with the
+        /// same content `--report` printed, already filled in; it leaves your
+        /// machine only when you send it yourself. On a machine with no
+        /// desktop, or one reached over SSH, the link is printed instead of
+        /// opened.
         ///
         /// Requires `--report`, so the content is always shown before the
-        /// form is offered. Not combinable with `--json`, which is for
-        /// scripts, and a script is not a person who can read a form.
+        /// mail is offered. Not combinable with `--json`, which is for
+        /// scripts, and a script is not a person who can read and send a mail.
         #[arg(long, requires = "report", conflicts_with = "json")]
         send: bool,
     },
@@ -300,11 +301,14 @@ enum Command {
         #[arg(long)]
         allow_mutation: bool,
     },
-    /// [preview] Send a one-shot chat prompt to a configured assistant provider.
+    /// [preview] Chat with a configured assistant provider.
     ///
-    /// Reads the prompt from --prompt or, if omitted, from standard input. Use
-    /// `rocm config enable-provider` and `rocm config set-provider-key` first to
-    /// configure a remote provider; the `local` provider talks to a running server.
+    /// In a terminal with no --prompt, opens the interactive chat (switch
+    /// providers there with /provider; --provider, --model, and --tools don't
+    /// apply). With --prompt, or a prompt piped on standard input, sends that one
+    /// prompt and prints the reply. Use `rocm config enable-provider` and
+    /// `rocm config set-provider-key` first to configure a remote provider; the
+    /// `local` provider talks to a running server.
     #[command(after_help = "EXAMPLES:\n  \
 rocm chat --prompt \"Explain ROCm in one sentence\"\n  \
 rocm chat --provider local --model qwen --prompt \"Hello\"\n  \
@@ -316,7 +320,8 @@ echo \"Summarize this\" | rocm chat --provider anthropic")]
         /// Model name to request from the provider, such as qwen.
         #[arg(long)]
         model: Option<String>,
-        /// Prompt to send. If omitted, rocm-cli reads from standard input when possible.
+        /// Prompt to send. If omitted, a terminal opens the interactive chat and
+        /// piped input is read from standard input.
         #[arg(long)]
         prompt: Option<String>,
         /// Sampling temperature to send with the request (>= 0.0). Higher is more random.
