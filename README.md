@@ -38,9 +38,10 @@ for Lemonade and vLLM.
 
 For WSL2 setup and diagnosis, see [docs/wsl.md](docs/wsl.md).
 
-Live dashboard telemetry requires Linux or WSL2 (see
-[Interactive interfaces](#interactive-interfaces)). vLLM serving is Linux or WSL2
-only (see [docs/vllm.md](docs/vllm.md)).
+Live dashboard telemetry works on Windows too, but shows only GPU/CPU/memory —
+the serving-instance registry view needs the `rocmdashd` unix socket, so it's
+Linux/WSL2 only (see [Interactive interfaces](#interactive-interfaces)). vLLM
+serving is Linux or WSL2 only (see [docs/vllm.md](docs/vllm.md)).
 
 The minimum supported Linux release, native or under WSL2, is Ubuntu 24.04. On
 other distributions the equivalent requirement is glibc 2.38 with
@@ -226,9 +227,10 @@ five tabs (switch with `Tab`/`Shift+Tab` or number keys `1`–`5`):
 | **Observe** | Live GPU utilization, instances, and benchmark telemetry |
 | **Chat** | Assistant chat backed by a local server or configured provider |
 
-Live mode reads telemetry over a Unix domain socket, so it requires Linux or
-WSL2. Use `rocm dash --demo` for a synthetic session that runs anywhere without a
-GPU or daemon.
+Live mode works on Windows too, but shows only GPU/CPU/memory — the
+serving-instance registry needs the Unix domain socket telemetry, so that view
+is Linux/WSL2 only. Use `rocm dash --demo` for a synthetic session that runs
+anywhere without a GPU or daemon.
 
 ## Configure ROCm and serve a model
 

@@ -193,9 +193,10 @@ async fn connect_and_run(connect: &str, tx: UnboundedSender<ClientMsg>) -> anyho
 /// Windows has no rocmdashd socket yet, so this builds `Snapshot`s in-process
 /// instead of connecting anywhere: `HostCollector` (already cross-platform)
 /// for CPU/memory, `WinPerfCollector` (OS perf counters, no AMD tool needed)
-/// for GPU. Same `ClientMsg` sequence the unix arm produces
-/// (`Connected` then a stream of `Event::Snapshot`), so the app loop doesn't
-/// need to know which platform it's on.
+/// for GPU. Sends `Connected` like the unix arm, but then a stream of
+/// `ClientMsg::HostGpuSnapshot` rather than `Event::Snapshot` — deliberately
+/// not routed through `Event::Snapshot`, to avoid disturbing the "quit while
+/// serving" confirmation prompt (see `AppState::push_host_gpu_snapshot`).
 #[cfg(windows)]
 async fn connect_and_run(connect: &str, tx: UnboundedSender<ClientMsg>) -> anyhow::Result<()> {
     use rocm_dash_collectors::host::HostCollector;
@@ -222,17 +223,29 @@ async fn connect_and_run(connect: &str, tx: UnboundedSender<ClientMsg>) -> anyho
 
     loop {
         ticker.tick().await;
-        let (gpus, gpu_system_info) = gpu.snapshot().await.unwrap_or_else(|e| {
-            warn!(error = %e, "windows GPU perf-counter query failed");
-            (Vec::new(), GpuSystemInfo::default())
-        });
+        // Sampled before the GPU query, not after: `host.tick()`'s CPU
+        // reading would otherwise include the window spent spawning and
+        // waiting on `powershell.exe` for the GPU counters, inflating the
+        // dashboard's own CPU% with its own collection cost.
+        let host_metrics = host.tick();
+        let (gpus, gpu_system_info, warnings) = match gpu.snapshot().await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(error = %e, "windows GPU perf-counter query failed");
+                (
+                    Vec::new(),
+                    GpuSystemInfo::default(),
+                    vec![format!("windows GPU perf-counter query failed: {e}")],
+                )
+            }
+        };
         let snapshot = Snapshot {
             timestamp: chrono::Utc::now(),
-            host: host.tick(),
+            host: host_metrics,
             gpus,
             gpu_system_info: Some(gpu_system_info),
             instances: Vec::new(),
-            warnings: Vec::new(),
+            warnings,
         };
         if tx
             .send(ClientMsg::HostGpuSnapshot(Box::new(snapshot)))

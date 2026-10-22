@@ -1284,6 +1284,38 @@ async fn home_view_displayed(world: &mut E2eWorld) {
     );
 }
 
+#[then("the hero reports no GPU telemetry available")]
+async fn hero_reports_no_gpu_telemetry(world: &mut E2eWorld) {
+    let tui = session(world);
+    // The VRAM/TEMP/POWER mini-sparks only draw in the hero's wide layout
+    // (`draw_hero_band`'s `hero.width >= 8 && hero.height >= 6` gate).
+    tui.use_wide_size()
+        .unwrap_or_else(|e| panic!("failed to enlarge the dashboard: {e}"));
+
+    // `use_wide_size` only resizes the pty; the TUI redraws asynchronously
+    // once it processes the resulting SIGWINCH. Wait for that redraw by
+    // polling for the hero's wide-layout content, not just "Unknown GPU"
+    // (already visible pre-resize from the title bar alone).
+    tui.wait_for_screen_where(
+        "the hero's wide VRAM/TEMP/POWER layout",
+        |screen| screen.contains("Unknown GPU") && screen.contains("VRAM"),
+        default_timeout(),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("the no-GPU hero did not render: {e}"));
+    let screen = tui.screen_text();
+    for label in ["VRAM", "TEMP", "POWER"] {
+        let row = screen
+            .lines()
+            .find(|line| line.contains(label))
+            .unwrap_or_else(|| panic!("no {label} row on screen:\n{screen}"));
+        assert!(
+            row.contains('—'),
+            "{label} row should show the \"—\" placeholder, not a fake reading:\n{row}"
+        );
+    }
+}
+
 #[then("the dashboard reports live GPU telemetry")]
 async fn gpu_telemetry_displayed(world: &mut E2eWorld) {
     let tui = session(world);

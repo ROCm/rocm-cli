@@ -68,12 +68,21 @@ const fn node_load_label(hist_empty: bool, simulated: bool) -> &'static str {
     }
 }
 
-/// True until the first GPU telemetry snapshot actually carries any GPUs —
-/// distinct from a snapshot that arrived with a legitimately-zero field
-/// (e.g. `vram_total_mb == 0`, see `vram_used_pct`). Drives the hero's
-/// "still detecting" placeholders so startup/a stalled tick doesn't read as
-/// "0% / 0°C / 0W", which looks broken rather than loading.
-fn gpu_telemetry_pending(state: &AppState) -> bool {
+/// True until the first snapshot has arrived at all. Drives only the hero
+/// title's "Detecting GPU…" placeholder — a snapshot that arrived but
+/// carries no GPUs (or a legitimately-zero field) is a known state, not a
+/// still-loading one, and reads "Unknown GPU" instead (see
+/// `node_throughput_title`). For the numeric "—" placeholders, see
+/// `gpu_data_unavailable`.
+const fn gpu_telemetry_pending(state: &AppState) -> bool {
+    state.latest.is_none()
+}
+
+/// True when there's no usable per-GPU data to show a number for: either no
+/// snapshot has arrived yet, or one arrived but carries no GPUs at all.
+/// Drives the headline util/vram/temp/power "—" placeholders — distinct
+/// from `gpu_telemetry_pending`, which only gates the hero title.
+fn gpu_data_unavailable(state: &AppState) -> bool {
     state.latest.as_ref().is_none_or(|s| s.gpus.is_empty())
 }
 
@@ -289,7 +298,7 @@ fn draw_hero_left(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         lh[0],
     );
     let util = state.latest.as_ref().map_or(0.0, snap_util);
-    let util_label = if gpu_telemetry_pending(state) {
+    let util_label = if gpu_data_unavailable(state) {
         "—".to_string()
     } else {
         format::pct(util as f32)
@@ -380,8 +389,9 @@ fn draw_hero_right(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         rh[0],
     );
     let latest = state.latest.as_ref();
-    let pending = gpu_telemetry_pending(state);
+    let unavailable = gpu_data_unavailable(state);
     let vram = latest.map_or(0.0, vram_used_pct);
+    let vram_total: u64 = latest.map_or(0, |s| s.gpus.iter().map(|g| g.vram_total_mb).sum());
     let temp = latest.map_or(0.0, |s| {
         s.gpus
             .iter()
@@ -391,19 +401,25 @@ fn draw_hero_right(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let power: f64 = latest.map_or(0.0, |s| {
         s.gpus.iter().map(|g| f64::from(g.power_w)).sum::<f64>()
     });
-    // While no GPU telemetry has arrived yet, show "—" rather than 0%/0°C/0W
-    // — those look like real (broken) readings rather than a loading state.
-    let vram_label = if pending {
+    // While there's no GPU telemetry at all, show "—" rather than 0%/0°C/0W
+    // — those look like real (broken) readings rather than a loading/unknown
+    // state. The same applies per-metric once data has arrived but a given
+    // metric reads exactly zero: a multi-adapter Windows host can't
+    // correlate VRAM totals per-device (`vram_total_mb == 0`, see
+    // `vram_used_pct`), and temp/power read 0.0 with no ADLX reading — a
+    // real GPU is never actually at 0°C/0W, so an exact zero there means
+    // "not measured", not "measured as zero".
+    let vram_label = if unavailable || vram_total == 0 {
         "—".to_string()
     } else {
         format::pct(vram as f32)
     };
-    let temp_label = if pending {
+    let temp_label = if unavailable || temp == 0.0 {
         "—".to_string()
     } else {
         format::celsius(temp as f32)
     };
-    let power_label = if pending {
+    let power_label = if unavailable || power == 0.0 {
         "—".to_string()
     } else {
         format::watts(power as f32)
@@ -747,16 +763,102 @@ mod tests {
     }
 
     #[test]
-    fn gpu_telemetry_pending_distinguishes_no_data_from_legitimate_zero() {
-        // Nothing has arrived yet → pending.
+    fn gpu_telemetry_pending_only_tracks_whether_anything_arrived() {
+        // Nothing has arrived yet → pending (drives the hero title).
         let empty = AppState::new("t".into(), "default-dark".into());
         assert!(gpu_telemetry_pending(&empty));
-        // A snapshot with no GPUs at all → still pending.
+        // A snapshot with no GPUs at all is a known state, not "still
+        // loading" — the title falls back to "Unknown GPU", not "Detecting".
         let mut no_gpus = AppState::new("t".into(), "default-dark".into());
         no_gpus.latest = Some(Snapshot::default());
-        assert!(gpu_telemetry_pending(&no_gpus));
-        // A real GPU present (even with legitimately-zero fields) → not pending.
+        assert!(!gpu_telemetry_pending(&no_gpus));
         assert!(!gpu_telemetry_pending(&state_with_gpu()));
+    }
+
+    #[test]
+    fn gpu_data_unavailable_distinguishes_no_data_from_legitimate_zero() {
+        // Nothing has arrived yet → unavailable.
+        let empty = AppState::new("t".into(), "default-dark".into());
+        assert!(gpu_data_unavailable(&empty));
+        // A snapshot with no GPUs at all → still unavailable (no number to show).
+        let mut no_gpus = AppState::new("t".into(), "default-dark".into());
+        no_gpus.latest = Some(Snapshot::default());
+        assert!(gpu_data_unavailable(&no_gpus));
+        // A real GPU present (even with legitimately-zero fields) → available.
+        assert!(!gpu_data_unavailable(&state_with_gpu()));
+    }
+
+    #[test]
+    fn hero_shows_dash_placeholders_not_fake_zeros_when_metrics_are_unmeasured() {
+        // A real GPU is present (so the title isn't "Detecting GPU…"), but
+        // vram_total/temp/power all read exactly zero — e.g. a Windows
+        // multi-adapter host that can't correlate per-device VRAM totals,
+        // or no ADLX reading for temp/power. Each must show "—", not a
+        // fake-looking "0%"/"0°C"/"0W".
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.active_tab = ActiveTab::Home;
+        s.latest = Some(Snapshot {
+            host: SystemMetrics::default(),
+            gpus: vec![GpuMetrics {
+                device_id: "GPU0".into(),
+                vram_used_mb: 0,
+                vram_total_mb: 0,
+                gpu_utilization_pct: 12.0,
+                temperature_c: 0.0,
+                power_w: 0.0,
+                clock_mhz: None,
+            }],
+            gpu_system_info: Some(GpuSystemInfo {
+                gpu_model: "Some GPU".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let out = render(&s, 160, 30);
+        // The buffer is row-major with no row separators, so bound each
+        // check to the segment between consecutive labels — otherwise an
+        // unrelated "0%"-shaped substring earlier in the row (e.g. the
+        // "12.0%" utilization gauge) would false-positive the negative
+        // assertions below.
+        let vram_segment = out
+            .split("VRAM")
+            .nth(1)
+            .and_then(|s| s.split("TEMP").next());
+        let temp_segment = out
+            .split("TEMP")
+            .nth(1)
+            .and_then(|s| s.split("POWER").next());
+        let power_segment = out
+            .split("POWER")
+            .nth(1)
+            .and_then(|s| s.split("T/S").next());
+        let vram_segment = vram_segment.unwrap_or_else(|| panic!("vram row missing: {out:?}"));
+        let temp_segment = temp_segment.unwrap_or_else(|| panic!("temp row missing: {out:?}"));
+        let power_segment = power_segment.unwrap_or_else(|| panic!("power row missing: {out:?}"));
+        assert!(
+            vram_segment.contains('—'),
+            "vram should read —: {vram_segment:?}"
+        );
+        assert!(
+            !vram_segment.contains('%'),
+            "vram should not show a fake 0%: {vram_segment:?}"
+        );
+        assert!(
+            temp_segment.contains('—'),
+            "temp should read —: {temp_segment:?}"
+        );
+        assert!(
+            !temp_segment.contains('°'),
+            "temp should not show a fake 0°C: {temp_segment:?}"
+        );
+        assert!(
+            power_segment.contains('—'),
+            "power should read —: {power_segment:?}"
+        );
+        assert!(
+            !power_segment.contains('W'),
+            "power should not show a fake 0W: {power_segment:?}"
+        );
     }
 
     #[test]

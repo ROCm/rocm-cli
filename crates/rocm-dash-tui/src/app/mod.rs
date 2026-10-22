@@ -1484,12 +1484,7 @@ impl AppState {
             self.instances
                 .insert(inst.container_id.clone(), inst.clone());
         }
-        if self.history.len() == HISTORY_CAP {
-            self.history.pop_front();
-        }
-        self.history.push_back(snap.clone());
-        self.latest = Some(snap);
-        self.clamp_selectors();
+        self.push_history_and_latest(snap);
     }
 
     /// Windows sibling of [`push_snapshot`](Self::push_snapshot) for
@@ -1502,6 +1497,14 @@ impl AppState {
     /// blind the issue #145 quit-confirm prompt to models actually being
     /// served — see `has_live_instance_with`'s Windows note.
     pub(crate) fn push_host_gpu_snapshot(&mut self, snap: Snapshot) {
+        self.push_history_and_latest(snap);
+    }
+
+    /// Shared tail of [`push_snapshot`](Self::push_snapshot) and
+    /// [`push_host_gpu_snapshot`](Self::push_host_gpu_snapshot): the
+    /// history/latest bookkeeping both share, independent of how (or
+    /// whether) `instances` gets updated.
+    fn push_history_and_latest(&mut self, snap: Snapshot) {
         if self.history.len() == HISTORY_CAP {
             self.history.pop_front();
         }
@@ -3447,6 +3450,51 @@ mod tests {
             !s.has_live_instance(),
             "a real (even empty) snapshot must retire the registry-read fallback"
         );
+    }
+
+    #[test]
+    fn push_host_gpu_snapshot_leaves_instances_and_has_received_snapshot_untouched() {
+        // Mirrors push_snapshot's issue #145 authority handoff, but for the
+        // Windows in-process path: a HostGpuSnapshot must still land
+        // host/GPU metrics for charts/history, while leaving `instances` and
+        // `has_received_snapshot` exactly as they were — see
+        // `push_host_gpu_snapshot`'s doc comment for why.
+        let mut s = st();
+        s.instances.insert(
+            "id0".to_string(),
+            rocm_dash_core::metrics::Instance {
+                container_id: "id0".to_string(),
+                ..Default::default()
+            },
+        );
+        assert!(!s.has_received_snapshot);
+
+        let snap = Snapshot {
+            warnings: vec!["gpu-warning".to_string()],
+            instances: vec![rocm_dash_core::metrics::Instance {
+                container_id: "phantom".to_string(),
+                ..Default::default()
+            }],
+            ..Snapshot::default()
+        };
+        s.push_host_gpu_snapshot(snap);
+
+        assert!(
+            !s.has_received_snapshot,
+            "a HostGpuSnapshot must never flip has_received_snapshot"
+        );
+        assert_eq!(
+            s.instances.len(),
+            1,
+            "instances must stay exactly as seeded, ignoring the snapshot's own (always-empty-in-practice) instances"
+        );
+        assert!(s.instances.contains_key("id0"));
+        assert_eq!(
+            s.latest.as_ref().map(|s| s.warnings.clone()),
+            Some(vec!["gpu-warning".to_string()]),
+            "host/GPU metrics must still land for charts/history"
+        );
+        assert_eq!(s.history.len(), 1);
     }
 
     #[test]

@@ -1102,9 +1102,11 @@ mod tests {
     #[test]
     fn quit_confirm_body_prints_the_stop_command_during_the_startup_fallback_when_the_registry_names_an_id()
      {
-        // On a host whose dashboard-embedded daemon client never connects at
-        // all (Windows — `has_received_snapshot` never flips for the whole
-        // session), `instances` never fills, so without this the quit prompt
+        // On a host whose daemon client never sends an instance snapshot
+        // (Windows — it connects and streams live GPU/CPU/memory every tick,
+        // but has no `rocmdashd` socket to source an instance list from, so
+        // `has_received_snapshot` never flips for the whole session),
+        // `instances` never fills, so without this the quit prompt
         // could only ever print the generic "a model was serving" sentence —
         // no model name (expected: `instances` is the only source for that),
         // but also no stop command and no id, even though the live registry
