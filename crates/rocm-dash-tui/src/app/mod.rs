@@ -1490,6 +1490,24 @@ impl AppState {
         self.clamp_selectors();
     }
 
+    /// Windows sibling of [`push_snapshot`](Self::push_snapshot) for
+    /// `ClientMsg::HostGpuSnapshot`: applies host/GPU metrics for
+    /// charts/history exactly like a real snapshot, but deliberately leaves
+    /// `instances` and `has_received_snapshot` untouched. The Windows
+    /// in-process ticker (`client.rs`) always sends an empty `instances`
+    /// stand-in (no instance-registry daemon exists there yet), so treating
+    /// it as authoritative the way `push_snapshot` does would permanently
+    /// blind the issue #145 quit-confirm prompt to models actually being
+    /// served — see `has_live_instance_with`'s Windows note.
+    pub(crate) fn push_host_gpu_snapshot(&mut self, snap: Snapshot) {
+        if self.history.len() == HISTORY_CAP {
+            self.history.pop_front();
+        }
+        self.history.push_back(snap.clone());
+        self.latest = Some(snap);
+        self.clamp_selectors();
+    }
+
     fn upsert_instance(&mut self, inst: Instance) {
         self.instances.insert(inst.container_id.clone(), inst);
         self.clamp_selectors();

@@ -13,6 +13,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, anyhow};
+use rocm_dash_core::metrics::Snapshot;
 use rocm_dash_core::protocol::{Command, Event, PROTOCOL_VERSION};
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::sync::mpsc::UnboundedSender;
@@ -33,6 +34,15 @@ pub enum ClientMsg {
         reason: String,
     },
     Event(Box<Event>),
+    /// Windows in-process synthetic tick (`#[cfg(windows)] connect_and_run`):
+    /// host/GPU metrics sourced from local collectors, not a real daemon.
+    /// Deliberately NOT `Event(Snapshot)` — that path treats `instances` as
+    /// authoritative truth and latches `has_received_snapshot` forever, but
+    /// this snapshot's `instances` is always an empty stand-in (Windows has
+    /// no instance registry daemon yet), so routing it through there would
+    /// permanently blind the issue #145 quit-confirm prompt to models
+    /// actually being served. See `AppState::push_host_gpu_snapshot`.
+    HostGpuSnapshot(Box<Snapshot>),
     /// Replay-only: the scrubber jumped backward. The TUI must wipe any
     /// state derived from past events before the burst-emitted events for
     /// the new playhead position arrive.
@@ -188,7 +198,7 @@ async fn connect_and_run(connect: &str, tx: UnboundedSender<ClientMsg>) -> anyho
 async fn connect_and_run(connect: &str, tx: UnboundedSender<ClientMsg>) -> anyhow::Result<()> {
     use rocm_dash_collectors::host::HostCollector;
     use rocm_dash_collectors::winperf::WinPerfCollector;
-    use rocm_dash_core::metrics::{GpuSystemInfo, Snapshot};
+    use rocm_dash_core::metrics::GpuSystemInfo;
 
     info!(
         connect,
@@ -219,7 +229,7 @@ async fn connect_and_run(connect: &str, tx: UnboundedSender<ClientMsg>) -> anyho
             warnings: Vec::new(),
         };
         if tx
-            .send(ClientMsg::Event(Box::new(Event::Snapshot(snapshot))))
+            .send(ClientMsg::HostGpuSnapshot(Box::new(snapshot)))
             .is_err()
         {
             break;
