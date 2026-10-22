@@ -1702,12 +1702,6 @@ jobs:
       - nightly
       - windows-nightly
       - e2e-report-nightly
-      - e2e-gpu-nightly
-      - e2e-gpu-nightly-rad3
-      - e2e-gpu-nightly-mi350p
-      - e2e-gpu-nightly-strix
-      - e2e-gpu-nightly-strix-windows
-      - e2e-wsl-nightly
     if: ${{ !cancelled() }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1736,12 +1730,7 @@ jobs:
             --e2e-report consolidated/support-matrix.md \
             --nightly-result "${{ needs.nightly.result }}" \
             --windows-result "${{ needs.windows-nightly.result }}" \
-            --e2e-lane-result "MI300X=${{ needs.e2e-gpu-nightly.result }}" \
-            --e2e-lane-result "RAD3=${{ needs.e2e-gpu-nightly-rad3.result }}" \
-            --e2e-lane-result "MI350P=${{ needs.e2e-gpu-nightly-mi350p.result }}" \
-            --e2e-lane-result "Strix-Halo=${{ needs.e2e-gpu-nightly-strix.result }}" \
-            --e2e-lane-result "Strix-Halo-Windows=${{ needs.e2e-gpu-nightly-strix-windows.result }}" \
-            --e2e-lane-result "WSL=${{ needs.e2e-wsl-nightly.result }}" \
+            --e2e-report-job-result "${{ needs.e2e-report-nightly.result }}" \
             --out release-readiness/facts.json \
             --table-out release-readiness/table.md
           cat release-readiness/table.md >> "$GITHUB_STEP_SUMMARY"
@@ -1809,10 +1798,12 @@ jobs:
 
       - name: Draft narrative
         id: draft
-        # `actions/ai-inference` tags its releases as bare majors (`v3`, not
-        # `v3.0.0`); this SHA is exactly what `v3` points to and predates the
-        # repo's current `main`, so it's a frozen release like any other
-        # pin here, not a moving `vX` alias.
+        # `actions/ai-inference` tags full semver releases (`v1.0.0`,
+        # `v2.1.1`, ...) alongside a floating major alias (`v1`, `v2`, `v3`)
+        # that moves forward as new patches release. Pinning by SHA freezes
+        # this exact commit regardless of where `v3` points later; the
+        # `# v3` suffix is just a human-readable label for which major line
+        # this SHA came from.
         uses: actions/ai-inference@2c43c91ae16266ca159d311430343c67a5ffa222 # v3
         env:
           COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_PAT }}
@@ -1841,9 +1832,11 @@ jobs:
           path: release-readiness/narrative.md
           if-no-files-found: ignore
 
-  # Mirrors publish-e2e-wiki: same branch/repo guard, same degenerate-output
-  # guard, same wiki clone/commit/push. Publishes the mechanical table plus
-  # the narrative (if the narrative job produced one) to its own wiki page.
+  # Same branch/repo guard and wiki clone/commit/push as publish-e2e-wiki,
+  # but unlike that job this one also runs (and publishes an explicit
+  # "evidence unavailable" notice) when release-readiness-nightly fails
+  # outright, rather than just skipping and leaving the wiki showing
+  # whatever verdict the last successful run left there.
   publish-release-readiness-wiki:
     name: Publish release readiness to wiki
     runs-on: ubuntu-latest
@@ -1853,13 +1846,19 @@ jobs:
     needs:
       - release-readiness-nightly
       - release-readiness-narrative
-    if: ${{ !cancelled() && needs.release-readiness-nightly.result == 'success' && github.repository == 'ROCm/rocm-cli' && github.ref == 'refs/heads/main' }}
+    if: ${{ !cancelled() && needs.release-readiness-nightly.result != 'skipped' && github.repository == 'ROCm/rocm-cli' && github.ref == 'refs/heads/main' }}
     concurrency:
       group: publish-release-readiness-wiki
       cancel-in-progress: false
     steps:
       - name: Download release-readiness table
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        # release-readiness-nightly may have failed before writing or
+        # uploading anything (bad `git describe`, `gh issue list` auth
+        # failure, xtask crash); the script below handles a missing
+        # table.md explicitly instead of failing this job on a missing
+        # artifact.
+        continue-on-error: true
         with:
           name: release-readiness-nightly
           path: release-readiness
@@ -1878,36 +1877,59 @@ jobs:
           COMMIT_URL: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}
         run: |
           set -euo pipefail
-          # Same reasoning as publish-e2e-wiki: publish only when the status
-          # table is present, so any degenerate output leaves the last good
-          # page in place.
-          if ! grep -q '^| Area | Evidence | Status |' release-readiness/table.md; then
+          page=Release-Readiness.md
+          if [ ! -f release-readiness/table.md ]; then
+            # release-readiness-nightly failed before writing a table at all
+            # (bad `git describe`, `gh issue list` auth failure, xtask
+            # crash). Publishing nothing here would leave the wiki showing
+            # whatever verdict the last successful run left behind --
+            # possibly a stale GO -- with no indication it's stale.
+            echo "::warning::release-readiness-nightly produced no table this run; publishing a stale-evidence notice instead."
+            {
+              echo "# Release readiness (latest nightly)"
+              echo
+              echo "## Release Readiness — ⚠️ EVIDENCE UNAVAILABLE"
+              echo
+              echo "release-readiness-nightly failed before it could compute a verdict for run [${GITHUB_RUN_NUMBER}](${RUN_URL}), commit [\`${GITHUB_SHA::12}\`](${COMMIT_URL})."
+              echo
+              echo "_Any verdict below this line predates this run and does not reflect it._"
+            } > "/tmp/${page}"
+          elif ! grep -q '^| Area | Evidence | Status |' release-readiness/table.md; then
+            # Same reasoning as publish-e2e-wiki: publish only when the status
+            # table is present, so any degenerate output leaves the last good
+            # page in place.
             echo "::warning::No status table in the release-readiness output; leaving the wiki page unchanged."
             exit 0
-          fi
-          page=Release-Readiness.md
-          {
-            echo "# Release readiness (latest nightly)"
-            echo
-            echo "_Overwritten by the nightly workflow; do not edit by hand._"
-            echo
-            echo "- Run: [${GITHUB_RUN_NUMBER}](${RUN_URL})"
-            echo "- Commit: [\`${GITHUB_SHA::12}\`](${COMMIT_URL})"
-            echo "- Date: $(date -u +'%Y-%m-%d %H:%M UTC')"
-            echo
-            cat release-readiness/table.md
-            echo
-            if [ -f release-readiness/narrative.md ]; then
-              echo "## Narrative"
+          else
+            {
+              echo "# Release readiness (latest nightly)"
               echo
-              # The narrative is LLM-drafted from untrusted issue/commit text;
-              # strip markdown links/images so it can't smuggle a redirect or
-              # tracking pixel onto the public wiki page.
-              sed -E 's/!?\[([^]]*)\]\([^)]*\)/\1/g' release-readiness/narrative.md
-            else
-              echo "_Narrative generation did not complete this run; see the mechanical table above._"
-            fi
-          } > "/tmp/${page}"
+              echo "_Overwritten by the nightly workflow; do not edit by hand._"
+              echo
+              echo "- Run: [${GITHUB_RUN_NUMBER}](${RUN_URL})"
+              echo "- Commit: [\`${GITHUB_SHA::12}\`](${COMMIT_URL})"
+              echo "- Date: $(date -u +'%Y-%m-%d %H:%M UTC')"
+              echo
+              cat release-readiness/table.md
+              echo
+              if [ -f release-readiness/narrative.md ]; then
+                echo "## Narrative"
+                echo
+                # The narrative is LLM-drafted from untrusted issue/commit text,
+                # so it may contain copied markdown links/images, reference-style
+                # links, or raw HTML (e.g. an <img> tag). Escaping every `[`/`]`
+                # and `<`/`>` renders all of that as inert text instead of live
+                # markup: unlike a link-stripping regex, this has no nesting
+                # problem, because an escaped bracket can no longer be parsed as
+                # link/image syntax in the first place, however it's nested.
+                # This does not stop GitHub's bare-URL autolinking (a visible
+                # plain URL, not a disguised link) — an accepted residual gap.
+                sed -e 's/\[/\\[/g' -e 's/\]/\\]/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' release-readiness/narrative.md
+              else
+                echo "_Narrative generation did not complete this run; see the mechanical table above._"
+              fi
+            } > "/tmp/${page}"
+          fi
 
           wiki="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.wiki.git"
           # GitHub creates the wiki's git repo only when the first page is

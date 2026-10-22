@@ -78,7 +78,7 @@ pub fn run(
     e2e_report: &Path,
     nightly_result: &str,
     windows_result: &str,
-    e2e_lane_results: &[String],
+    e2e_report_job_result: &str,
     out: &Path,
     table_out: &Path,
 ) -> Result<()> {
@@ -97,7 +97,7 @@ pub fn run(
         e2e_fail_total,
         nightly_result,
         windows_result,
-        e2e_lane_results,
+        e2e_report_job_result,
     );
 
     write_parented(out, &serde_json::to_string_pretty(&facts)?)?;
@@ -115,7 +115,7 @@ fn assemble_facts(
     e2e_fail_total: Option<u64>,
     nightly_result: &str,
     windows_result: &str,
-    e2e_lane_results: &[String],
+    e2e_report_job_result: &str,
 ) -> Facts {
     let mut failing_gates = Vec::new();
     // `skipped` is a legitimate outcome on a no-op night (e.g.
@@ -134,13 +134,15 @@ fn assemble_facts(
     // The Total row above only counts platforms whose `report.json` actually
     // got uploaded — a GPU lane that dies before uploading (preflight
     // failure, timeout, runner loss) just drops out of it, silently reading
-    // as zero failures. Gate on the lane jobs' own results too, so a lane
-    // that never reported still fails the release-readiness gate.
-    for pair in e2e_lane_results {
-        let (name, result) = pair.split_once('=').unwrap_or((pair.as_str(), ""));
-        if !matches!(result, "success" | "skipped") {
-            failing_gates.push(format!("E2E lane {name} ({result})"));
-        }
+    // as zero failures. Every lane is `continue-on-error`, so the lane job's
+    // own `needs.<job>.result` reads `success` even when it failed; gating on
+    // that (as an earlier version of this code did) can never fire. Gate on
+    // `e2e-report-nightly`'s result instead: its "every lane that ran
+    // uploaded its report" check (`nightly.yml`, `LANE_REPORTS`) already
+    // fails that job when a lane is silently missing, covering every lane in
+    // `LANE_REPORTS` — including ones added later — for free.
+    if !matches!(e2e_report_job_result, "success" | "skipped") {
+        failing_gates.push(format!("E2E (lane report check: {e2e_report_job_result})"));
     }
 
     let verdict = if failing_gates.is_empty() {
@@ -278,11 +280,6 @@ fn split_trailing_pr_reference(text: &str) -> (Option<u64>, &str) {
     (Some(number), trimmed[..start].trim_end())
 }
 
-#[cfg(test)]
-fn extract_pr_number(subject: &str) -> Option<u64> {
-    split_trailing_pr_reference(subject).0
-}
-
 #[derive(serde::Deserialize)]
 struct RawReactionGroup {
     #[serde(default)]
@@ -338,14 +335,18 @@ fn collect_known_issues() -> Result<Vec<KnownIssue>> {
 
     let raw: Vec<RawIssue> =
         serde_json::from_slice(&output.stdout).context("parsing `gh issue list` JSON output")?;
+    Ok(build_known_issues(raw))
+}
 
+/// Maps `gh issue list` JSON into `KnownIssue`s, ranked by 👍 reaction count
+/// (ties broken by issue number). Only counts 👍 as a vote of "this affects
+/// me"; other reactions (👎, 😕, etc.) shouldn't boost an issue's rank.
+fn build_known_issues(raw: Vec<RawIssue>) -> Vec<KnownIssue> {
     let mut issues: Vec<KnownIssue> = raw
         .into_iter()
         .map(|i| KnownIssue {
             number: i.number,
             title: i.title,
-            // Only count 👍 as a vote of "this affects me"; other reactions
-            // (👎, 😕, etc.) shouldn't boost an issue's rank.
             reactions: i
                 .reaction_groups
                 .iter()
@@ -356,7 +357,7 @@ fn collect_known_issues() -> Result<Vec<KnownIssue>> {
         })
         .collect();
     issues.sort_by(|a, b| b.reactions.cmp(&a.reactions).then(a.number.cmp(&b.number)));
-    Ok(issues)
+    issues
 }
 
 /// First `max_chars` characters of `text`, collapsed to a single line.
@@ -440,6 +441,19 @@ pub(crate) fn render_table(facts: &Facts) -> String {
         if e2e_failing { "❌" } else { "✅" }
     );
     out.push('\n');
+
+    // The status table above only has room for a glyph per row, which is
+    // ambiguous on its own (e.g. a cancelled E2E lane renders as
+    // "0 failure(s)" with a red ❌, which looks contradictory). Spell out
+    // the actual gate strings `assemble_facts` computed so the reason is
+    // never left implicit.
+    if !facts.failing_gates.is_empty() {
+        out.push_str("Failing gates:\n");
+        for gate in &facts.failing_gates {
+            let _ = writeln!(out, "- {}", escape_markdown(gate));
+        }
+        out.push('\n');
+    }
 
     let section = |out: &mut String, title: &str, entries: &[CommitEntry]| {
         let _ = writeln!(out, "### {title} ({})\n", entries.len());
@@ -555,17 +569,34 @@ mod tests {
     }
 
     #[test]
-    fn extract_pr_number_reads_trailing_reference() {
+    fn split_trailing_pr_reference_reads_trailing_reference() {
         assert_eq!(
-            extract_pr_number("fix: correct VRAM probe (#124)"),
-            Some(124)
+            split_trailing_pr_reference("fix: correct VRAM probe (#124)"),
+            (Some(124), "fix: correct VRAM probe")
         );
-        assert_eq!(extract_pr_number("fix: correct VRAM probe"), None);
+        assert_eq!(
+            split_trailing_pr_reference("fix: correct VRAM probe"),
+            (None, "fix: correct VRAM probe")
+        );
     }
 
     #[test]
-    fn extract_pr_number_ignores_a_parenthetical_mid_sentence() {
-        assert_eq!(extract_pr_number("fix: handle (#12) refs"), None);
+    fn split_trailing_pr_reference_ignores_a_parenthetical_mid_sentence() {
+        assert_eq!(
+            split_trailing_pr_reference("fix: handle (#12) refs"),
+            (None, "fix: handle (#12) refs")
+        );
+    }
+
+    #[test]
+    fn split_trailing_pr_reference_handles_multibyte_text_before_the_reference() {
+        // `(#NNN)` is matched by byte offset via `rfind`/`len() - 1`; both
+        // land on ASCII bytes here, so this must not panic on a non-char-
+        // boundary slice even when the text before it is multibyte.
+        assert_eq!(
+            split_trailing_pr_reference("修复 VRAM 探测 (#124)"),
+            (Some(124), "修复 VRAM 探测")
+        );
     }
 
     #[test]
@@ -601,7 +632,7 @@ mod tests {
             Some(0),
             "success",
             "success",
-            &[],
+            "success",
         );
         assert_eq!(facts.verdict, Verdict::Go);
         assert!(facts.failing_gates.is_empty());
@@ -616,10 +647,25 @@ mod tests {
             None,
             "success",
             "success",
-            &[],
+            "success",
         );
         assert_eq!(facts.verdict, Verdict::NoGo);
         assert_eq!(facts.failing_gates, vec!["E2E (report unreadable)"]);
+    }
+
+    #[test]
+    fn assemble_facts_treats_a_skipped_nightly_build_as_passing() {
+        let facts = assemble_facts(
+            "v1.0.0",
+            CommitBuckets::default(),
+            vec![],
+            Some(0),
+            "skipped",
+            "success",
+            "success",
+        );
+        assert_eq!(facts.verdict, Verdict::Go);
+        assert!(facts.failing_gates.is_empty());
     }
 
     #[test]
@@ -631,7 +677,7 @@ mod tests {
             Some(0),
             "success",
             "skipped",
-            &[],
+            "success",
         );
         assert_eq!(facts.verdict, Verdict::Go);
         assert!(facts.failing_gates.is_empty());
@@ -646,7 +692,7 @@ mod tests {
             Some(0),
             "success",
             "failure",
-            &[],
+            "success",
         );
         assert_eq!(facts.verdict, Verdict::NoGo);
         assert_eq!(facts.failing_gates, vec!["windows build (failure)"]);
@@ -661,10 +707,27 @@ mod tests {
             Some(3),
             "success",
             "success",
-            &[],
+            "success",
         );
         assert_eq!(facts.verdict, Verdict::NoGo);
         assert_eq!(facts.failing_gates, vec!["E2E (3 failure(s))"]);
+    }
+
+    #[test]
+    fn assemble_facts_is_no_go_at_exactly_one_e2e_failure() {
+        // Pins the gate boundary at `n > 0`: a nonzero-failures test using a
+        // larger count (e.g. 3) would still pass under a mutated `n > 1`.
+        let facts = assemble_facts(
+            "v1.0.0",
+            CommitBuckets::default(),
+            vec![],
+            Some(1),
+            "success",
+            "success",
+            "success",
+        );
+        assert_eq!(facts.verdict, Verdict::NoGo);
+        assert_eq!(facts.failing_gates, vec!["E2E (1 failure(s))"]);
     }
 
     #[test]
@@ -676,14 +739,14 @@ mod tests {
             Some(0),
             "failure",
             "success",
-            &[],
+            "success",
         );
         assert_eq!(facts.verdict, Verdict::NoGo);
         assert_eq!(facts.failing_gates, vec!["nightly build (failure)"]);
     }
 
     #[test]
-    fn assemble_facts_is_no_go_when_an_e2e_lane_did_not_report() {
+    fn assemble_facts_is_no_go_when_the_e2e_report_job_fails() {
         let facts = assemble_facts(
             "v1.0.0",
             CommitBuckets::default(),
@@ -691,10 +754,82 @@ mod tests {
             Some(0),
             "success",
             "success",
-            &["MI300X=failure".to_string(), "RAD3=success".to_string()],
+            "failure",
         );
         assert_eq!(facts.verdict, Verdict::NoGo);
-        assert_eq!(facts.failing_gates, vec!["E2E lane MI300X (failure)"]);
+        assert_eq!(
+            facts.failing_gates,
+            vec!["E2E (lane report check: failure)"]
+        );
+    }
+
+    #[test]
+    fn assemble_facts_treats_a_skipped_e2e_report_job_as_passing() {
+        let facts = assemble_facts(
+            "v1.0.0",
+            CommitBuckets::default(),
+            vec![],
+            Some(0),
+            "success",
+            "success",
+            "skipped",
+        );
+        assert_eq!(facts.verdict, Verdict::Go);
+        assert!(facts.failing_gates.is_empty());
+    }
+
+    #[test]
+    fn render_table_renders_the_verdict_headline_for_go_and_no_go() {
+        let go = assemble_facts(
+            "v1.0.0",
+            CommitBuckets::default(),
+            vec![],
+            Some(0),
+            "success",
+            "success",
+            "success",
+        );
+        assert!(render_table(&go).contains("## Release Readiness — ✅ GO\n"));
+
+        let no_go = assemble_facts(
+            "v1.0.0",
+            CommitBuckets::default(),
+            vec![],
+            Some(0),
+            "failure",
+            "success",
+            "success",
+        );
+        assert!(render_table(&no_go).contains("## Release Readiness — ❌ NO-GO\n"));
+    }
+
+    #[test]
+    fn render_table_renders_pr_number_suffix_only_when_present() {
+        let facts = assemble_facts(
+            "v1.0.0",
+            CommitBuckets {
+                features: vec![
+                    CommitEntry {
+                        pr: Some(42),
+                        subject: "add widget".to_string(),
+                    },
+                    CommitEntry {
+                        pr: None,
+                        subject: "add gadget".to_string(),
+                    },
+                ],
+                ..CommitBuckets::default()
+            },
+            vec![],
+            Some(0),
+            "success",
+            "success",
+            "success",
+        );
+        let table = render_table(&facts);
+        assert!(table.contains("- add widget (#42)\n"));
+        assert!(table.contains("- add gadget\n"));
+        assert!(!table.contains("- add gadget (#"));
     }
 
     #[test]
@@ -706,7 +841,7 @@ mod tests {
             None,
             "success",
             "success",
-            &[],
+            "success",
         );
         let table = render_table(&facts);
         assert!(table.contains("| Area | Evidence | Status |"));
@@ -722,7 +857,7 @@ mod tests {
             Some(0),
             "failure",
             "success",
-            &[],
+            "success",
         );
         let table = render_table(&facts);
         assert!(
@@ -730,6 +865,41 @@ mod tests {
                 "| Build (Linux + Windows nightly) | nightly / windows-nightly jobs | ❌ |"
             )
         );
+    }
+
+    #[test]
+    fn render_table_lists_the_failing_gate_reasons_when_a_lane_is_cancelled() {
+        // A cancelled E2E lane renders "0 failure(s)" with a red ❌ in the
+        // status table, which looks contradictory on its own; the gate
+        // string must spell out *why* it's failing.
+        let facts = assemble_facts(
+            "v1.0.0",
+            CommitBuckets::default(),
+            vec![],
+            Some(0),
+            "success",
+            "success",
+            "cancelled",
+        );
+        let table = render_table(&facts);
+        assert!(table.contains("| E2E | 0 failure(s) across all platforms | ❌ |"));
+        assert!(table.contains("Failing gates:"));
+        assert!(table.contains("- E2E (lane report check: cancelled)"));
+    }
+
+    #[test]
+    fn render_table_omits_the_failing_gates_section_on_a_go_verdict() {
+        let facts = assemble_facts(
+            "v1.0.0",
+            CommitBuckets::default(),
+            vec![],
+            Some(0),
+            "success",
+            "success",
+            "success",
+        );
+        let table = render_table(&facts);
+        assert!(!table.contains("Failing gates:"));
     }
 
     #[test]
@@ -741,7 +911,7 @@ mod tests {
             Some(2),
             "success",
             "success",
-            &[],
+            "success",
         );
         let table = render_table(&facts);
         assert!(table.contains("| E2E | 2 failure(s) across all platforms | ❌ |"));
@@ -761,7 +931,7 @@ mod tests {
             Some(0),
             "success",
             "success",
-            &[],
+            "success",
         );
         let table = render_table(&facts);
         assert!(table.contains("| Area | Evidence | Status |"));
@@ -784,7 +954,7 @@ mod tests {
             Some(0),
             "success",
             "success",
-            &[],
+            "success",
         );
         let table = render_table(&facts);
         assert!(table.contains(r"add \[evil\](link) \| row"));
@@ -794,6 +964,12 @@ mod tests {
     #[test]
     fn escape_markdown_doubles_a_literal_backslash() {
         assert_eq!(escape_markdown(r"a\b"), r"a\\b");
+    }
+
+    #[test]
+    fn escape_markdown_collapses_newlines_and_escapes_angle_brackets() {
+        assert_eq!(escape_markdown("line one\nline two"), "line one line two");
+        assert_eq!(escape_markdown("<script>"), r"\<script\>");
     }
 
     #[test]
@@ -815,15 +991,21 @@ mod tests {
 
     #[test]
     fn collect_known_issues_counts_only_thumbs_up_reactions() {
-        let raw: Vec<RawReactionGroup> = serde_json::from_str(
-            r#"[{"content":"THUMBS_UP","users":{"totalCount":3}},{"content":"THUMBS_DOWN","users":{"totalCount":5}}]"#,
+        let raw: Vec<RawIssue> = serde_json::from_str(
+            r#"[
+                {"number": 1, "title": "low vote", "body": "", "reactionGroups":
+                    [{"content":"THUMBS_UP","users":{"totalCount":3}},{"content":"THUMBS_DOWN","users":{"totalCount":5}}]},
+                {"number": 2, "title": "high vote", "body": "", "reactionGroups":
+                    [{"content":"THUMBS_UP","users":{"totalCount":4}}]}
+            ]"#,
         )
         .unwrap();
-        let total: u64 = raw
-            .iter()
-            .filter(|g| g.content == "THUMBS_UP")
-            .map(|g| g.users.total_count)
-            .sum();
-        assert_eq!(total, 3);
+
+        let issues = build_known_issues(raw);
+
+        assert_eq!(issues[0].number, 2, "higher 👍 count must rank first");
+        assert_eq!(issues[0].reactions, 4);
+        assert_eq!(issues[1].number, 1);
+        assert_eq!(issues[1].reactions, 3, "👎 must not count toward the rank");
     }
 }

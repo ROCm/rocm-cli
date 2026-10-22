@@ -3409,20 +3409,27 @@ fi
     }
 
     /// Mirrors `wiki_publish_guard_stops_on_the_generators_empty_output`, but
-    /// for the release-readiness wiki job: runs its real status-table guard
-    /// against `render_table`'s actual output, both for unreadable E2E
-    /// evidence (`e2e_fail_total: None`) and a well-formed table, so a
-    /// regression in either the guard or the renderer's degenerate case is
-    /// caught by behavior rather than a pinned string.
+    /// for the release-readiness wiki job: runs its real three-way guard
+    /// (missing table.md / degenerate table.md / well-formed table.md)
+    /// against `render_table`'s actual output, so a regression in the guard
+    /// or the renderer's degenerate case is caught by behavior rather than a
+    /// pinned string.
+    ///
+    /// A missing table.md means release-readiness-nightly failed outright
+    /// (bad `git describe`, `gh issue list` auth failure, xtask crash)
+    /// before writing anything -- this must still reach the publish step, but
+    /// with an explicit "evidence unavailable" notice instead of the real
+    /// table, so the wiki never silently keeps a stale verdict with no sign
+    /// it's stale.
     ///
     /// Unreadable E2E evidence is itself a NO-GO signal, not a reason to hide
     /// the page: `render_table` always emits the status-table header, so
     /// this case reaches the publish step the same as a well-formed table.
-    /// Only a truly empty/degenerate table (no `facts.json` at all) trips
-    /// the guard.
+    /// Only a present-but-degenerate table (no status-table header at all)
+    /// trips the guard and leaves the last good page in place.
     #[cfg(unix)]
     #[test]
-    fn release_readiness_wiki_publish_guard_only_stops_on_a_missing_table() {
+    fn release_readiness_wiki_publish_guard_handles_missing_degenerate_and_well_formed_tables() {
         use crate::release_readiness::{CommitBuckets, Facts, Verdict, render_table};
 
         let nightly = read_workflow("nightly.yml");
@@ -3432,31 +3439,76 @@ fi
             .iter()
             .position(|l| {
                 l.trim_start()
-                    .starts_with("if ! grep -q '^| Area | Evidence | Status |'")
+                    .starts_with("if [ ! -f release-readiness/table.md ]")
             })
-            .expect("publish job has the status-table guard");
-        let end = start
-            + lines[start..]
-                .iter()
-                .position(|l| l.trim() == "fi")
-                .expect("guard is closed by fi");
+            .expect("publish job has the missing-table guard");
+        let mut depth = 0i32;
+        let mut end = start;
+        for (i, l) in lines[start..].iter().enumerate() {
+            let t = l.trim();
+            if t.starts_with("if ") {
+                depth += 1;
+            } else if t == "fi" {
+                depth -= 1;
+                if depth == 0 {
+                    end = start + i;
+                    break;
+                }
+            }
+        }
+        assert!(end > start, "guard block must close with a matching fi");
         let guard = lines[start..=end].join("\n");
 
-        let run = |table: &str| -> String {
+        // table: None simulates release-readiness-nightly failing before
+        // writing anything at all; Some(s) simulates a table.md with
+        // content `s`. Returns (stdout, published page content).
+        let run = |table: Option<&str>| -> (String, String) {
             let tmp = tempfile::tempdir().unwrap();
             let dir = tmp.path();
             std::fs::create_dir_all(dir.join("release-readiness")).unwrap();
-            std::fs::write(dir.join("release-readiness/table.md"), table).unwrap();
-            let script = format!("set -euo pipefail\n{guard}\necho REACHED_PUBLISH\n");
+            if let Some(s) = table {
+                std::fs::write(dir.join("release-readiness/table.md"), s).unwrap();
+            }
+            let page = format!(
+                "release-readiness-wiki-guard-test-{}.md",
+                dir.file_name().unwrap().to_string_lossy()
+            );
+            let script = format!("set -euo pipefail\npage={page}\n{guard}\necho REACHED_PUBLISH\n");
             let out = std::process::Command::new("bash")
                 .arg("-c")
-                .arg(script)
+                .arg(&script)
                 .current_dir(dir)
+                .env("GITHUB_RUN_NUMBER", "42")
+                .env("RUN_URL", "https://example.invalid/run/42")
+                .env("GITHUB_SHA", "0123456789abcdef0123456789abcdef01234567")
+                .env("COMMIT_URL", "https://example.invalid/commit/0123456789ab")
                 .output()
                 .expect("run bash");
             assert!(out.status.success(), "guard script failed: {out:?}");
-            String::from_utf8_lossy(&out.stdout).into_owned()
+            let page_path = format!("/tmp/{page}");
+            let page_content = std::fs::read_to_string(&page_path).unwrap_or_default();
+            let _ = std::fs::remove_file(&page_path);
+            (
+                String::from_utf8_lossy(&out.stdout).into_owned(),
+                page_content,
+            )
         };
+
+        let (missing_stdout, missing_page) = run(None);
+        assert!(
+            missing_stdout.contains("REACHED_PUBLISH"),
+            "a missing table.md (nightly job failed outright) must still reach the publish step"
+        );
+        assert!(
+            missing_page.contains("EVIDENCE UNAVAILABLE"),
+            "a missing table.md must publish an explicit stale-evidence notice, not silently keep the old page"
+        );
+
+        let (degenerate_stdout, _) = run(Some(""));
+        assert!(
+            !degenerate_stdout.contains("REACHED_PUBLISH"),
+            "a present-but-degenerate table.md (no status-table header) must still stop the publish and leave the last good page in place"
+        );
 
         let unreadable = render_table(&Facts {
             since_tag: "v1.0.0".to_string(),
@@ -3466,14 +3518,14 @@ fi
             commits: CommitBuckets::default(),
             known_issues: vec![],
         });
+        let (unreadable_stdout, unreadable_page) = run(Some(&unreadable));
         assert!(
-            run(&unreadable).contains("REACHED_PUBLISH"),
+            unreadable_stdout.contains("REACHED_PUBLISH"),
             "unreadable E2E evidence is a NO-GO verdict, not a reason to hide the wiki page"
         );
-
         assert!(
-            !run("").contains("REACHED_PUBLISH"),
-            "a missing/empty table.md must still stop the release-readiness wiki publish"
+            !unreadable_page.contains("EVIDENCE UNAVAILABLE"),
+            "a readable (if NO-GO) table must publish the real table, not the missing-table notice"
         );
 
         let well_formed = render_table(&Facts {
@@ -3484,9 +3536,108 @@ fi
             commits: CommitBuckets::default(),
             known_issues: vec![],
         });
+        let (well_formed_stdout, well_formed_page) = run(Some(&well_formed));
         assert!(
-            run(&well_formed).contains("REACHED_PUBLISH"),
+            well_formed_stdout.contains("REACHED_PUBLISH"),
             "a well-formed table must reach the publish step"
+        );
+        assert!(
+            well_formed_page.contains("Area | Evidence | Status"),
+            "a well-formed table's content must actually make it into the published page"
+        );
+    }
+
+    /// The narrative published to the wiki is LLM-drafted from untrusted
+    /// issue/commit text, so it can contain copied markdown links, images,
+    /// reference-style links, or raw HTML. Runs the job's real escaping
+    /// command (not a copy of its regex) against the three bypasses an
+    /// earlier link-stripping regex let through unchanged, so a regression
+    /// back to naive link-stripping is caught by behavior.
+    #[test]
+    fn publish_release_readiness_wiki_escapes_markdown_link_and_html_syntax() {
+        let nightly = read_workflow("nightly.yml");
+        let job = job_block(&nightly, "publish-release-readiness-wiki");
+        let line = job
+            .lines()
+            .find(|l| l.trim_start().starts_with("sed ") && l.contains("narrative.md"))
+            .expect("publish job escapes narrative.md with a sed command");
+
+        let run = |input: &str| -> String {
+            let dir = tempfile::tempdir().expect("create temp dir");
+            std::fs::create_dir(dir.path().join("release-readiness"))
+                .expect("create release-readiness dir");
+            std::fs::write(dir.path().join("release-readiness/narrative.md"), input)
+                .expect("write narrative.md");
+            let out = std::process::Command::new("bash")
+                .arg("-c")
+                .arg(line)
+                .current_dir(dir.path())
+                .output()
+                .expect("run bash");
+            assert!(out.status.success(), "sed command failed: {out:?}");
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+
+        assert_eq!(
+            run(r#"<img src="https://example.com/p.png">"#),
+            r#"&lt;img src="https://example.com/p.png"&gt;"#,
+            "a raw <img> tag must render as inert text, not a live image"
+        );
+        assert_eq!(
+            run("[a][1]\n[1]: https://example.com/x"),
+            "\\[a\\]\\[1\\]\n\\[1\\]: https://example.com/x",
+            "a reference-style link must render as inert text, not a live link"
+        );
+        assert_eq!(
+            run("[outer [inner](https://a.example)](https://b.example)"),
+            r"\[outer \[inner\](https://a.example)\](https://b.example)",
+            "every bracket in a nested link must be escaped, leaving no live link"
+        );
+    }
+
+    /// `release-readiness-nightly` must gate E2E lane coverage through
+    /// `e2e-report-nightly`'s own result, not through each lane job's own
+    /// `continue-on-error: true`-masked result (which is always `success`
+    /// regardless of what actually happened). Ties the gate to the one place
+    /// that already fails correctly when a lane silently drops out — see
+    /// `every_lane_that_runs_is_checked_for_its_report_artifact`, which pins
+    /// that `e2e-report-nightly` itself is driven by `LANE_REPORTS` and so
+    /// covers every lane, including ones added later, without this job
+    /// needing its own copy of the lane list.
+    #[test]
+    fn release_readiness_nightly_gates_on_the_e2e_report_job_not_individual_lanes() {
+        let nightly = read_workflow("nightly.yml");
+        let job = job_block(&nightly, "release-readiness-nightly");
+
+        let needs = flattened_values(job, "needs")
+            .into_iter()
+            .flat_map(|v| flattened_list_items(&v))
+            .collect::<Vec<_>>();
+        assert!(
+            needs.contains(&"e2e-report-nightly".to_string()),
+            "release-readiness-nightly must depend on e2e-report-nightly's result; needs: {needs:?}"
+        );
+        for lane in [
+            "e2e-gpu-nightly",
+            "e2e-gpu-nightly-rad3",
+            "e2e-gpu-nightly-mi350p",
+            "e2e-gpu-nightly-strix",
+            "e2e-gpu-nightly-strix-windows",
+            "e2e-gpu-nightly-w7900",
+            "e2e-wsl-nightly",
+        ] {
+            assert!(
+                !needs.contains(&lane.to_string()),
+                "release-readiness-nightly must not depend on individual E2E lane job `{lane}` \
+                 directly: continue-on-error on that job means its own `result` is always \
+                 `success`, so gating on it can never fire"
+            );
+        }
+
+        assert!(
+            job.contains("--e2e-report-job-result \"${{ needs.e2e-report-nightly.result }}\""),
+            "release-readiness-nightly's xtask invocation must pass e2e-report-nightly's result \
+             as --e2e-report-job-result"
         );
     }
 

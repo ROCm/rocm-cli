@@ -273,7 +273,7 @@ pub(crate) enum Command {
     ReleaseReadiness {
         /// Baseline tag for `git log <tag>..HEAD` (e.g. the last published
         /// release tag, resolved by the caller via `git describe --tags
-        /// --abbrev=0 --match 'v*'`).
+        /// --abbrev=0 --match 'v*' --exclude 'v*-*'`).
         #[arg(long)]
         since_tag: String,
         /// Path to the consolidated E2E `support-matrix.md` produced by
@@ -288,15 +288,15 @@ pub(crate) enum Command {
         /// (`needs.windows-nightly.result`).
         #[arg(long)]
         windows_result: String,
-        /// One `NAME=RESULT` pair per E2E GPU/WSL lane job (e.g.
-        /// `MI300X=${{ needs.e2e-gpu-nightly.result }}`), repeatable. A lane
-        /// that dies before uploading its `report.json` (preflight failure,
-        /// timeout, runner loss) would otherwise just vanish from the
-        /// consolidated E2E report's totals, reading as zero failures; this
-        /// gates on the lane job's own result so a silently-missing lane
-        /// still fails the release-readiness verdict.
-        #[arg(long = "e2e-lane-result")]
-        e2e_lane_results: Vec<String>,
+        /// The calling workflow's `e2e-report-nightly` job result (`needs.e2e-report-nightly.result`).
+        /// That job already fails if any E2E lane that ran didn't upload its
+        /// `report.json` (preflight failure, timeout, runner loss), which would
+        /// otherwise just vanish from the consolidated E2E report's totals,
+        /// reading as zero failures. Gating on this job's result (rather than
+        /// each lane job's own `continue-on-error`-masked result, which is
+        /// always `success`) covers every lane, present and future, for free.
+        #[arg(long)]
+        e2e_report_job_result: String,
         /// Path to write the structured facts JSON (input to the narrative step).
         #[arg(long)]
         out: PathBuf,
@@ -398,7 +398,7 @@ fn run() -> Result<()> {
             e2e_report,
             nightly_result,
             windows_result,
-            e2e_lane_results,
+            e2e_report_job_result,
             out,
             table_out,
         } => release_readiness::run(
@@ -406,7 +406,7 @@ fn run() -> Result<()> {
             &e2e_report,
             &nightly_result,
             &windows_result,
-            &e2e_lane_results,
+            &e2e_report_job_result,
             &out,
             &table_out,
         )?,
