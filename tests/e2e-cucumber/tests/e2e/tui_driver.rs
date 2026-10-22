@@ -896,8 +896,9 @@ impl TuiSession {
     /// first check and the loop never reaches a second send. What's resent
     /// each pass isn't always the same literal `gesture` either — see the
     /// quit-confirm handling below, which switches to `"y"` once the prompt is
-    /// on screen — and the wait between sends doubles each pass, for the
-    /// reason [`e2e_cucumber::quit_and_wait::quit_and_wait`] gives.
+    /// on screen — and the wait between sends doubles each pass. Time the
+    /// harness spends not polling this step does not count against `timeout`.
+    /// [`e2e_cucumber::quit_and_wait::quit_and_wait`] gives the reasons for both.
     pub async fn quit_and_wait(&mut self, timeout: Duration) -> Result<(), String> {
         // Several fixtures leave a model serving (`simulated`/demo sessions
         // never do — `AppState::has_live_instance` always returns `false`
@@ -928,8 +929,9 @@ impl TuiSession {
         match result {
             Ok(()) => Ok(()),
             Err(QuitError::Failed(error)) => Err(error),
-            Err(QuitError::TimedOut) => Err(format!(
-                "timed out after {timeout:?} waiting for the TUI to exit after repeating {gesture:?}.\n{}",
+            Err(QuitError::TimedOut { stalled }) => Err(format!(
+                "timed out after {timeout:?} waiting for the TUI to exit after repeating {gesture:?} \
+                 (plus {stalled:?} while the harness did not poll this step).\n{}",
                 self.framed_screen()
             )),
         }
