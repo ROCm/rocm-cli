@@ -550,3 +550,29 @@ Feature: Interactive dashboard
     When the user quits the dashboard
     Then the dashboard exits successfully
     And the managed model is still listed as running
+
+  @id:dash-serve-wizard-opens-collapsed @requires-os:linux
+  Scenario: dash-35 - Opening the serve wizard shows only the model, Advanced settings, and Launch
+    When the user opens the dashboard with demo data
+    And the user opens the Observe view
+    And the user opens the serve wizard
+    Then the serve wizard shows only the model, Advanced settings, and Launch
+    When the user presses Escape
+    Then the serve wizard is closed
+    When the user quits the dashboard
+    Then the dashboard exits successfully
+
+  @id:dash-serve-wizard-escape-cancels-edit-without-closing @requires-os:linux
+  Scenario: dash-36 - Escape cancels an in-progress host edit without closing the serve wizard
+    When the user opens the dashboard with demo data
+    And the user opens the Observe view
+    And the user opens the serve wizard
+    And the user expands the serve wizard's Advanced settings
+    And the user starts editing the serve wizard's Host field
+    And the user types "nope" into the serve wizard
+    And the user presses Escape
+    Then the serve wizard is still open with the host unchanged
+    When the user presses Escape
+    Then the serve wizard is closed
+    When the user quits the dashboard
+    Then the dashboard exits successfully

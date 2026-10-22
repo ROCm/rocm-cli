@@ -1132,6 +1132,31 @@ async fn user_serves_explicit_reserved_port(world: &mut E2eWorld) {
     world.cli_rc = Some(rc);
 }
 
+/// Same CLI invocation as [`user_serves_explicit_reserved_port`]; the two
+/// scenarios differ only in what is holding the port (a plain listener here,
+/// vs. a live managed-service record there), which `resolve_serve_port`
+/// routes to two different refusal messages.
+#[when("the user serves a model explicitly on the occupied port")]
+async fn user_serves_explicit_occupied_port(world: &mut E2eWorld) {
+    let (model, engine, _) = host_serve_target();
+    let port = SERVE_PORT.to_string();
+    let (stdout, stderr, rc) = crate::run_rocm(
+        world,
+        &[
+            "serve",
+            model,
+            "--engine",
+            engine,
+            "--managed",
+            "--port",
+            &port,
+        ],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
 /// Serve naming both a runtime and an environment. These are mutually exclusive
 /// selectors, rejected during argument parsing before any engine or GPU work, so
 /// the refusal is observable with no GPU (mock lane).
@@ -1250,6 +1275,17 @@ async fn assert_port_reserved_message(world: &mut E2eWorld) {
         output.contains("is already reserved by managed service e2e-mock")
             && output.contains("rocm services stop e2e-mock --yes"),
         "expected the port-reserved message naming e2e-mock, got:\n{output}"
+    );
+}
+
+#[then("the user is told the port is already in use by another process")]
+async fn assert_port_in_use_message(world: &mut E2eWorld) {
+    let output = serve_output(world);
+    assert!(
+        output.contains(&format!(
+            "127.0.0.1:{SERVE_PORT} is already in use by another process"
+        )) && output.contains("Choose a free `--port`"),
+        "expected the port-in-use message, got:\n{output}"
     );
 }
 
@@ -1562,9 +1598,17 @@ async fn assert_next_automatic_port(world: &mut E2eWorld) {
         )
     );
     let expected = format!("endpoint: http://127.0.0.1:{}/v1", SERVE_PORT + 1);
+    let disclosure_line = stdout
+        .lines()
+        .position(|line| line.trim() == "Port: automatic; endpoint shown after launch");
+    let endpoint_line = stdout.lines().position(|line| line.trim() == expected);
     assert!(
-        stdout.lines().any(|line| line.trim() == expected),
+        endpoint_line.is_some(),
         "expected `{expected}` in real serve output:\n{stdout}"
+    );
+    assert!(
+        disclosure_line.is_some_and(|d| d < endpoint_line.unwrap()),
+        "the automatic-port disclosure must print before the resolved endpoint:\n{stdout}"
     );
 }
 

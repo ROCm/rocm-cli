@@ -606,6 +606,8 @@ fn spawn_managed_engine_child(
         runtime_id,
         env_id,
         engine_recipe,
+        #[cfg(not(windows))]
+        None,
     ) {
         Ok(child_pid) => Ok(ManagedSpawn::Spawned {
             record: Box::new(record),
@@ -629,6 +631,9 @@ fn spawn_managed_engine_child(
 /// Split out of [`spawn_managed_engine_child`] so that *every* failure below the
 /// record's first write is funnelled through one cleanup path before the
 /// launch lock is released. Returns the child pid.
+#[cfg(not(windows))]
+type SpawnOverride<'a> = dyn Fn(&mut ProcessCommand) -> io::Result<std::process::Child> + 'a;
+
 #[allow(clippy::too_many_arguments)]
 fn launch_managed_engine_child_locked(
     paths: &AppPaths,
@@ -643,6 +648,10 @@ fn launch_managed_engine_child_locked(
     runtime_id: Option<&str>,
     env_id: Option<&str>,
     engine_recipe: Option<&EngineRecipeHint>,
+    // Test-only seam: lets a test assert the leased port is actually bindable
+    // (i.e. released) at the exact point production would spawn the child,
+    // without needing to fake or intercept the real spawn mechanics.
+    #[cfg(not(windows))] spawn_override: Option<&SpawnOverride<'_>>,
 ) -> Result<u32> {
     let port = record.port;
     if let Some(parent) = record.engine_state_path.parent() {
@@ -736,9 +745,11 @@ fn launch_managed_engine_child_locked(
         if let Some(key_file) = endpoint_key_file.as_deref() {
             command.env(rocm_engine_protocol::ENDPOINT_API_KEY_FILE_ENV, key_file);
         }
-        let mut child = command
-            .spawn()
-            .context("failed to launch managed engine process")?;
+        let mut child = match spawn_override {
+            Some(spawn) => spawn(&mut command),
+            None => command.spawn(),
+        }
+        .context("failed to launch managed engine process")?;
         let child_pid = child.id();
         // Set before the immediate-exit check below, so a bail! here still leaves
         // `record.engine_pid` telling cleanup that a child was spawned.
@@ -2675,8 +2686,14 @@ mod tests {
             "unexpected result while still running: {still_reserved:?}"
         );
 
-        holder.status = "stopped".to_owned();
-        holder.write()?;
+        // Go through the real stop path (`rocm services stop <id> --yes`'s own
+        // implementation) rather than writing `status = "stopped"` to disk
+        // directly, so this test actually proves the advice serve-28 pins: that
+        // running the stop command frees the port. The termination closure is
+        // the same seam production injects a real signal through; here it just
+        // confirms every recorded process gone without touching the test
+        // process itself.
+        crate::stop_internal_managed_service_with(&paths, "lemonade-a-1", |_| (Vec::new(), true))?;
 
         let decision = resolve_managed_port_in_transaction(
             &paths,
@@ -3043,6 +3060,98 @@ mod tests {
             persisted.status, "failed",
             "a spawned child's record must be marked failed, not deleted"
         );
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn launch_releases_the_leased_port_before_spawning_the_child() -> Result<()> {
+        // `lease.release()` must run before the child is spawned, not after,
+        // or the engine is handed a port the CLI is still holding open.
+        // Proven via the injected `spawn_override` seam: it asserts a fresh
+        // bind on the leased port succeeds at the exact instant production
+        // would spawn, which only holds if the lease was already released.
+        let (root, paths) = test_paths("launch-releases-port-before-spawn");
+        paths.ensure()?;
+        fs::create_dir_all(paths.services_dir())?;
+
+        let port = 11_599_u16;
+        let lease = rocm_core::lease_loopback_port(port)?;
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "lemonade-release-before-spawn",
+            "lemonade",
+            "qwen",
+            "qwen-canonical",
+            "127.0.0.1",
+            port,
+            "managed",
+            0,
+            None,
+            None,
+            None,
+        );
+        record.write()?;
+
+        let resolve = ResolveModelResponse {
+            canonical_model_id: "qwen-canonical".to_owned(),
+            task: "chat".to_owned(),
+            source: "hf".to_owned(),
+            revision: "main".to_owned(),
+            loader: "llama.cpp".to_owned(),
+            trust_remote_code: false,
+            chat_template_mode: "auto".to_owned(),
+            dtype: "auto".to_owned(),
+            device_policy: DevicePolicy::GpuPreferred,
+            estimated_memory: "unknown".to_owned(),
+            launch_defaults: serde_json::json!({}),
+            engine_recipe: None,
+            warnings: Vec::new(),
+        };
+
+        let bind_succeeded = std::cell::Cell::new(false);
+        let spawn_override: &dyn Fn(&mut ProcessCommand) -> io::Result<std::process::Child> =
+            &|_command| {
+                bind_succeeded.set(std::net::TcpListener::bind(("127.0.0.1", port)).is_ok());
+                // A long-lived no-op child stands in for the engine: `_command`
+                // carries real serve args this test binary cannot execute as
+                // itself (see `managed_launch_cleanup_sleeper_child`).
+                ProcessCommand::new(std::env::current_exe().expect("test binary"))
+                    .arg("service_launch::tests::managed_launch_cleanup_sleeper_child")
+                    .arg("--exact")
+                    .arg("--ignored")
+                    .env("ROCM_TEST_SLEEPER_CHILD", "1")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+            };
+
+        let result = launch_managed_engine_child_locked(
+            &paths,
+            &mut record,
+            lease,
+            "lemonade",
+            "lemonade-release-before-spawn",
+            &resolve,
+            "127.0.0.1",
+            &resolve.device_policy,
+            &[],
+            None,
+            None,
+            None,
+            Some(spawn_override),
+        );
+        if let Ok(child_pid) = result.as_ref() {
+            let _ = rocm_core::terminate_process(*child_pid);
+        }
+        let _ = fs::remove_dir_all(root);
+
+        assert!(
+            bind_succeeded.get(),
+            "the port must already be bindable (released) by the time the child is spawned"
+        );
+        result?;
         Ok(())
     }
 }

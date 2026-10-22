@@ -1491,6 +1491,22 @@ pub(crate) fn restart_managed_service(
     paths: &AppPaths,
     record: &mut ManagedServiceRecord,
 ) -> Result<()> {
+    restart_managed_service_with(paths, record, None)
+}
+
+/// [`restart_managed_service`], with the supervisor spawn interceptable.
+///
+/// `spawn_override`, when set, replaces the real `command.spawn()` call below
+/// (falling back to it when `None`) — a test-only seam so a test can assert
+/// the leased port is already bindable (released) at the exact instant
+/// production would spawn, without faking the whole spawn.
+type SpawnOverride<'a> = dyn Fn(&mut ProcessCommand) -> std::io::Result<std::process::Child> + 'a;
+
+fn restart_managed_service_with(
+    paths: &AppPaths,
+    record: &mut ManagedServiceRecord,
+    spawn_override: Option<&SpawnOverride<'_>>,
+) -> Result<()> {
     let _launch_lock = rocm_core::FileLock::acquire_bounded(
         paths.managed_launch_lock_path(),
         rocm_core::MANAGED_LAUNCH_LOCK_TIMEOUT,
@@ -1596,22 +1612,30 @@ pub(crate) fn restart_managed_service(
         lease.release();
     }
 
-    let mut child = detached_rocmd_command(&rocmd_binary)
+    let recovering_snapshot = record.clone();
+    let mut command = detached_rocmd_command(&rocmd_binary);
+    command
         .args(recovery_supervise_args(record))
         .stdin(Stdio::null())
         .stdout(Stdio::from(log_file))
-        .stderr(Stdio::from(log_file_err))
-        .spawn()
-        .context("failed to spawn recovery supervisor")?;
+        .stderr(Stdio::from(log_file_err));
+    let mut child = match spawn_override {
+        Some(spawn) => spawn(&mut command),
+        None => command.spawn(),
+    }
+    .context("failed to spawn recovery supervisor")?;
 
     if let Err(error) = record_spawned_supervisor(paths, record, child.id()) {
         // The supervisor is alive but unrecorded: it would hold the port while
         // being invisible to every stop/recovery path. Kill it, then put the
-        // prior truthful record back.
+        // prior truthful fields back. Not a blind `record.write()` of `prior`:
+        // the same discipline as `update_supervised_record` elsewhere in this
+        // function applies here too, so a stop marker a concurrent stop
+        // persisted while the spawn was in flight is not reverted by this
+        // rollback.
         terminate_recovery_supervisor(&mut child);
-        *record = prior;
         let error = error.context("failed to publish the recovering service record");
-        if let Err(rollback) = record.write() {
+        if let Err(rollback) = rollback_recovering_record(paths, &recovering_snapshot, &prior) {
             // Both writes failed: the on-disk record now still claims
             // `recovering` for a supervisor that no longer exists. That is worse
             // than the original failure and must not be swallowed — the watcher
@@ -1622,6 +1646,7 @@ pub(crate) fn restart_managed_service(
                 record.service_id
             )));
         }
+        *record = prior;
         return Err(error);
     }
 
@@ -1649,6 +1674,20 @@ pub(crate) fn restart_managed_service(
 /// record could not be published. Short: it is milliseconds old.
 const RECOVERY_CLEANUP_GRACE: Duration = Duration::from_secs(2);
 
+// Test-only, thread-scoped call counter: `restart_managed_service`'s rollback
+// branch asserts this to prove the kill is actually reached (not just that the
+// record comes back truthful), since that branch's own supervisor is a
+// re-exec'd test binary that exits on its own almost immediately regardless of
+// whether it is killed, so `process_is_running` on it would not catch the call
+// being dropped. Thread-local, not a global counter: cargo runs tests
+// concurrently on separate threads, and this function has another, unrelated
+// direct caller (`terminate_recovery_supervisor_kills_and_reaps_the_child`).
+#[cfg(test)]
+thread_local! {
+    static TERMINATE_RECOVERY_SUPERVISOR_CALLS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
 /// Terminate and reap a recovery supervisor that could not be recorded.
 ///
 /// Tree scope, forced: the supervisor may already have started an engine child,
@@ -1656,6 +1695,8 @@ const RECOVERY_CLEANUP_GRACE: Duration = Duration::from_secs(2);
 /// no stop or recovery path can find. Reaping afterwards keeps the daemon free
 /// of zombies.
 fn terminate_recovery_supervisor(child: &mut std::process::Child) {
+    #[cfg(test)]
+    TERMINATE_RECOVERY_SUPERVISOR_CALLS.with(|calls| calls.set(calls.get() + 1));
     let _outcome = rocm_core::terminate_verified(
         &rocm_core::ProcessIdentity::capture(child.id()),
         rocm_core::KillScope::Tree,
@@ -1691,6 +1732,49 @@ fn record_spawned_supervisor(
         current.supervisor_pid = supervisor_pid;
         current.supervisor_start_ticks = supervisor_start_ticks;
     })
+}
+
+/// Restore only the fields [`restart_managed_service`]'s transaction owns,
+/// after `record_spawned_supervisor` failed to publish them. The same
+/// discipline as `update_supervised_record` elsewhere in that function: a
+/// stop marker a concurrent stop persisted on the live record must survive
+/// this rollback, not be overwritten by a blind copy of `restore`.
+///
+/// Differs from that helper in one case: when the manifest cannot be parsed
+/// at all (as opposed to merely naming a different supervisor), there is no
+/// live data left to selectively preserve, so this falls back to writing
+/// `restore` in full rather than no-op'ing.
+/// `restart_rolls_back_and_kills_the_supervisor_when_the_second_write_cannot_be_read`
+/// exercises exactly that fallback.
+fn rollback_recovering_record(
+    paths: &AppPaths,
+    recovering_snapshot: &ManagedServiceRecord,
+    restore: &ManagedServiceRecord,
+) -> Result<()> {
+    let manifest_path = paths.service_manifest_path(&recovering_snapshot.service_id);
+    if !manifest_path.exists() {
+        return Ok(());
+    }
+    match load_service_record(paths, &recovering_snapshot.service_id) {
+        Ok(mut current)
+            if current.supervisor_pid == recovering_snapshot.supervisor_pid
+                && current.supervisor_start_ticks == recovering_snapshot.supervisor_start_ticks =>
+        {
+            current.status = restore.status.clone();
+            current.supervisor_pid = restore.supervisor_pid;
+            current.supervisor_start_ticks = restore.supervisor_start_ticks;
+            current.engine_pid = restore.engine_pid;
+            current.engine_start_ticks = restore.engine_start_ticks;
+            current.restart_count = restore.restart_count;
+            current.last_restart_unix_ms = restore.last_restart_unix_ms;
+            current.inference_verified_at_unix_ms = restore.inference_verified_at_unix_ms;
+            current.inference_probe_attempted_at_unix_ms =
+                restore.inference_probe_attempted_at_unix_ms;
+            current.write()
+        }
+        Ok(_) => Ok(()),
+        Err(_) => restore.write(),
+    }
 }
 
 fn recovery_supervise_args(record: &ManagedServiceRecord) -> Vec<String> {
@@ -3530,6 +3614,80 @@ mod tests {
     }
 
     #[test]
+    fn recovery_is_not_blocked_by_a_stopped_or_failed_record_on_the_same_port() -> Result<()> {
+        // The mirror image of the refusal above: `blocks_port` is
+        // `is_live() && port == port`, so a `stopped` or `failed` record on
+        // the same port must not count as a collision. Mutation-proof: if
+        // `blocks_port` regressed to ignore status, either sibling below
+        // would trip the "claimed that port" bail and this test would go red.
+        let (root, paths) = temp_app_paths("recovery-non-live-same-port");
+        paths.ensure()?;
+        fs::create_dir_all(paths.services_dir())?;
+
+        let port = 21_778_u16;
+        let mut stopped_sibling = ManagedServiceRecord::new(
+            &paths,
+            "lemonade-stopped-sibling",
+            "lemonade",
+            "other-model",
+            "other-model-canonical".to_owned(),
+            rocm_core::DEFAULT_LOCAL_HOST,
+            port,
+            "managed",
+            0,
+            None,
+            None,
+            None,
+        );
+        stopped_sibling.status = "stopped".to_owned();
+        stopped_sibling.write()?;
+
+        let mut failed_sibling = ManagedServiceRecord::new(
+            &paths,
+            "lemonade-failed-sibling",
+            "lemonade",
+            "other-model-2",
+            "other-model-2-canonical".to_owned(),
+            rocm_core::DEFAULT_LOCAL_HOST,
+            port,
+            "managed",
+            0,
+            None,
+            None,
+            None,
+        );
+        failed_sibling.status = "failed".to_owned();
+        failed_sibling.write()?;
+
+        let mut record = identity_probe_record(&paths, "lemonade-recover-non-live", port);
+        record.status = "failed".to_owned();
+        record.write()?;
+
+        // The re-exec'd "supervisor" is this very test binary, which cannot
+        // actually run as `rocmd supervise` and exits almost immediately; the
+        // same limitation `restart_managed_service_persists_the_supervisor_identity_token`
+        // works around. What this proves is that the spawn was ever reached:
+        // a wrongly-blocking `blocks_port` would bail before `record.write()`
+        // below ever runs, leaving `supervisor_start_ticks` at `None`.
+        let result = restart_managed_service(&paths, &mut record);
+        let persisted = load_service_record(&paths, "lemonade-recover-non-live");
+        fs::remove_dir_all(root).ok();
+
+        if let Err(error) = &result {
+            let message = format!("{error:#}");
+            assert!(
+                !message.contains("claimed that port"),
+                "a stopped or failed sibling on the same port must not be treated as a collision: {message}"
+            );
+        }
+        assert!(
+            persisted?.supervisor_start_ticks.is_some(),
+            "recovery must reach the spawn, proving neither sibling blocked it"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn contained_recovery_survives_a_failed_restart_and_backs_off() -> Result<()> {
         use std::net::TcpListener;
 
@@ -3747,6 +3905,49 @@ mod tests {
         Ok(())
     }
 
+    /// Mirrors `launch_releases_the_leased_port_before_spawning_the_child` in
+    /// `apps/rocm/src/service_launch.rs`: the probe lease on the recorded port
+    /// must already be released by the time the recovery supervisor is
+    /// spawned, or the supervisor's own bind of that port would fail.
+    #[test]
+    fn restart_releases_the_leased_port_before_spawning_the_supervisor() -> Result<()> {
+        use std::cell::Cell;
+        use std::net::TcpListener;
+
+        let (root, paths) = temp_app_paths("restart-releases-lease");
+        paths.ensure()?;
+        fs::create_dir_all(paths.services_dir())?;
+
+        let probe = TcpListener::bind(("127.0.0.1", 0))?;
+        let port = probe.local_addr()?.port();
+        drop(probe);
+
+        let service_id = "svc-restart-releases-lease";
+        let mut record = identity_probe_record(&paths, service_id, port);
+        record.status = "failed".to_owned();
+        record.write()?;
+
+        let bind_succeeded = Cell::new(false);
+        let spawn_override =
+            |command: &mut ProcessCommand| -> std::io::Result<std::process::Child> {
+                bind_succeeded.set(TcpListener::bind(("127.0.0.1", port)).is_ok());
+                command.spawn()
+            };
+
+        // The re-exec'd "supervise" args are rejected by this test binary,
+        // which exits at once (see
+        // restart_managed_service_persists_the_supervisor_identity_token), so
+        // the restart itself is expected to report failure here.
+        let _ = restart_managed_service_with(&paths, &mut record, Some(&spawn_override));
+        fs::remove_dir_all(root).ok();
+
+        assert!(
+            bind_succeeded.get(),
+            "the leased port must already be bindable (released) by the time the supervisor is spawned"
+        );
+        Ok(())
+    }
+
     /// An unconfirmed stop leaves the status at `ready` on purpose, which is
     /// exactly what the daemon's recovery scan looks for. The stop request it
     /// records is the only thing telling it apart from a crash, so recovery
@@ -3957,6 +4158,14 @@ mod tests {
     /// supervisor and restore the prior record — and the rollback write itself
     /// must still land, since corrupting *content* leaves the file a writable
     /// regular file.
+    ///
+    /// The spawned supervisor here is a re-exec of this very test binary,
+    /// which rejects its `supervise` arguments and exits on its own almost
+    /// immediately regardless of whether anything kills it, so asserting
+    /// `process_is_running` on it afterward would not catch the kill being
+    /// dropped. `TERMINATE_RECOVERY_SUPERVISOR_CALLS` asserts the call itself
+    /// is reached instead; `terminate_recovery_supervisor_kills_and_reaps_the_child`
+    /// below proves what that call does against a real long-lived process.
     #[test]
     fn restart_rolls_back_and_kills_the_supervisor_when_the_second_write_cannot_be_read()
     -> Result<()> {
@@ -3970,6 +4179,7 @@ mod tests {
         record.write()?;
         let prior = record.clone();
 
+        let terminate_calls_before = TERMINATE_RECOVERY_SUPERVISOR_CALLS.with(std::cell::Cell::get);
         let manifest_path = paths.service_manifest_path(service_id);
         let corrupt = thread::spawn(move || -> bool {
             let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -4009,6 +4219,12 @@ mod tests {
             !message.contains("rollback also failed"),
             "corrupting content, not permissions, leaves the rollback write itself able to \
              land: {message}"
+        );
+        let terminate_calls_after = TERMINATE_RECOVERY_SUPERVISOR_CALLS.with(std::cell::Cell::get);
+        assert_eq!(
+            terminate_calls_after,
+            terminate_calls_before + 1,
+            "an unreadable second write must still kill the spawned supervisor"
         );
         assert_eq!(
             record.status, prior.status,

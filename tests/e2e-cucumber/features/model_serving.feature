@@ -381,3 +381,21 @@ Feature: Model serving
     When the user serves a model explicitly on the reserved port
     Then serving is refused before any engine starts
     And the user is told to stop the service holding that port
+
+  # Collision-safe explicit ports, untracked-process case (serve-port rewrite,
+  # sibling of serve-28). No managed-service record exists here, so
+  # `resolve_serve_port` never reaches the "reserved by managed service" branch
+  # and instead gets a plain OS-level `AddrInUse` back from the bind probe,
+  # routing to `explicit_bind_error`'s "already in use by another process"
+  # message. Needs the same `@requires-gpu` as serve-28 for the same reason:
+  # `resolve_serve_port` only runs once `spawn_managed_engine_child` has a
+  # completed model/GPU resolution in hand (GPU indices are selected earlier in
+  # `serve_cmd.rs`, under the launch lock, before any port is ever probed), and
+  # `serve` has no CPU fallback that gets there.
+  @id:serve-explicit-port-in-use-by-untracked-process @requires-gpu @merge-queue
+  Scenario: serve-29 - Serving on a port an untracked process already holds is refused
+    Given a managed runtime is active
+    And the default serve port is occupied
+    When the user serves a model explicitly on the occupied port
+    Then serving is refused before any engine starts
+    And the user is told the port is already in use by another process

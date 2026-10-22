@@ -2255,7 +2255,7 @@ fn validate_chat_launch_server_tool_call(call: &providers::ChatToolCall) -> Resu
     // only to have the argv builder silently drop it and fall through to
     // automatic port selection.
     let port = match object.get("port") {
-        None => None,
+        None | Some(serde_json::Value::Null) => None,
         Some(value) => {
             let port = value
                 .as_u64()

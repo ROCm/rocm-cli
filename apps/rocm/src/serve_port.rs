@@ -185,8 +185,14 @@ pub(crate) fn resolve_serve_port(
                 }
                 match probe(port) {
                     Ok(lease) => return Ok(lease),
-                    // Occupied is the only outcome that advances the scan.
+                    // Occupied is the only outcome that advances the scan. On
+                    // Windows, a port inside an excluded range (Hyper-V, WSL,
+                    // Docker) or held with exclusive-address-use fails with
+                    // WSAEACCES, which Rust reports as `PermissionDenied`, not
+                    // `AddrInUse` — treat it the same as occupied there.
                     Err(error) if error.kind() == io::ErrorKind::AddrInUse => {}
+                    #[cfg(windows)]
+                    Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {}
                     Err(error) => bail!(
                         "failed to reserve {DEFAULT_LOCAL_HOST}:{port} while choosing an \
                          automatic port: {error}"
@@ -411,16 +417,39 @@ mod tests {
 
     #[test]
     fn automatic_stops_immediately_on_a_non_collision_bind_error() {
-        for kind in [
-            io::ErrorKind::PermissionDenied,
-            io::ErrorKind::AddrNotAvailable,
-        ] {
-            let mut probe = scripted(vec![(11_435, kind)]);
-            let error = resolve_serve_port(DEFAULT_LOCAL_HOST, PortRequest::Auto, &[], &mut probe)
-                .expect_err("only AddrInUse may advance the scan");
-            let message = format!("{error:#}");
-            assert!(message.contains("127.0.0.1:11435"), "{message}");
-        }
+        // `PermissionDenied` is excluded here: on Windows it is how a reserved
+        // range or an exclusive-address-use holder reports occupied, so it
+        // advances the scan there (see the Windows-only test below). On every
+        // other platform it means what it says, and the other-platform half
+        // of that behavior is covered by
+        // `permission_denied_does_not_advance_the_scan_off_windows`.
+        let mut probe = scripted(vec![(11_435, io::ErrorKind::AddrNotAvailable)]);
+        let error = resolve_serve_port(DEFAULT_LOCAL_HOST, PortRequest::Auto, &[], &mut probe)
+            .expect_err("only AddrInUse (or, on Windows, PermissionDenied) may advance the scan");
+        let message = format!("{error:#}");
+        assert!(message.contains("127.0.0.1:11435"), "{message}");
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn permission_denied_does_not_advance_the_scan_off_windows() {
+        let mut probe = scripted(vec![(11_435, io::ErrorKind::PermissionDenied)]);
+        let error = resolve_serve_port(DEFAULT_LOCAL_HOST, PortRequest::Auto, &[], &mut probe)
+            .expect_err("a permission error must not be papered over by choosing another port");
+        let message = format!("{error:#}");
+        assert!(message.contains("127.0.0.1:11435"), "{message}");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn permission_denied_advances_the_scan_on_windows() {
+        // WSAEACCES (reserved range or exclusive-address-use) surfaces as
+        // `PermissionDenied`, not `AddrInUse`; one such candidate must not
+        // abort automatic selection on a platform #239 asks to support.
+        let mut probe = scripted(vec![(11_435, io::ErrorKind::PermissionDenied)]);
+        let lease = resolve_serve_port(DEFAULT_LOCAL_HOST, PortRequest::Auto, &[], &mut probe)
+            .expect("the scan advances past a Windows-reserved candidate");
+        assert_eq!(lease.port(), 11_436);
     }
 
     #[test]

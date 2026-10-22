@@ -664,10 +664,11 @@ output, or the Dash approval card) shows `Port: automatic; endpoint shown
 after launch` while the launch is in flight and prints the concrete endpoint
 once the port is actually leased; the interactive deployment summary table
 only ever shows the final resolved endpoint. Pass `--port` explicitly to pin
-one; an explicit loopback port already reserved by another managed service is
-rejected up front, naming that service and how to free it (`rocm services stop
-<service-id> --yes`). A port held by an untracked process is rejected too, but
-without naming the holder. `--host` to anything other than the default
+one; on `127.0.0.1`, an explicit loopback port already reserved by another
+managed service is rejected up front, naming that service and how to free it
+(`rocm services stop <service-id> --yes`). A port held by an untracked process
+is rejected too, but without naming the holder. `--host` to anything other
+than the default
 loopback address (`localhost`, `::1`, `0.0.0.0`, or any other address)
 requires an explicit `--port`: automatic selection only probes `127.0.0.1` and
 cannot promise a free port anywhere else.

@@ -7010,7 +7010,10 @@ fn stop_internal_managed_service(paths: &AppPaths, service_id: &str) -> Result<s
 /// [`terminate_recorded_service_pids`]; a test passes a stand-in that observes
 /// what is on disk at the moment the processes would be signalled. Everything
 /// else — the engine stop, the manifest writes, the key cleanup — runs for real.
-fn stop_internal_managed_service_with(
+///
+/// `pub(crate)` so `service_launch`'s tests can drive the real stop path too,
+/// rather than writing a stopped status to disk themselves.
+pub(crate) fn stop_internal_managed_service_with(
     paths: &AppPaths,
     service_id: &str,
     terminate: impl FnOnce(&ManagedServiceRecord) -> (Vec<u32>, bool),
@@ -17797,6 +17800,70 @@ pub(crate) mod tests {
             result.expect_err("a port actually bound by someone else must refuse the restart");
         let rendered = format!("{error:#}");
         assert!(rendered.contains("its port is in use"), "{rendered}");
+        Ok(())
+    }
+
+    #[test]
+    fn restart_is_not_blocked_by_a_stopped_or_failed_record_on_the_same_port() -> Result<()> {
+        // Mirror of `restart_refuses_a_port_a_launch_claimed...`: `blocks_port` is
+        // `is_live() && port == port`, so a `stopped`/`failed` sibling on the same
+        // port must not trip the "claimed that port" refusal. Mutation-proof: if
+        // `blocks_port` regressed to ignore status, the restart would bail there
+        // instead of reaching the real (and, in this test harness, doomed) child
+        // spawn below.
+        let (root, paths) = test_paths("restart-non-live-same-port");
+        paths.ensure()?;
+        let service_id = "svc-restart-non-live-same-port";
+        let record = stop_test_record(&paths, service_id);
+        let host = record.host.clone();
+        let port = record.port;
+        record.write()?;
+
+        let mut stopped_sibling = ManagedServiceRecord::new(
+            &paths,
+            "svc-stopped-sibling",
+            "lemonade",
+            "other-model",
+            "other-model-canonical",
+            &host,
+            port,
+            "managed",
+            0,
+            None,
+            None,
+            None,
+        );
+        stopped_sibling.status = "stopped".to_owned();
+        stopped_sibling.write()?;
+
+        let mut failed_sibling = ManagedServiceRecord::new(
+            &paths,
+            "svc-failed-sibling",
+            "lemonade",
+            "other-model-2",
+            "other-model-2-canonical",
+            &host,
+            port,
+            "managed",
+            0,
+            None,
+            None,
+            None,
+        );
+        failed_sibling.status = "failed".to_owned();
+        failed_sibling.write()?;
+
+        let result =
+            restart_internal_managed_service_with(&paths, service_id, None, |_| (Vec::new(), true));
+
+        let _ = fs::remove_dir_all(root);
+        if let Err(error) = &result {
+            let rendered = format!("{error:#}");
+            assert!(
+                !rendered.contains("claimed that port"),
+                "a stopped or failed sibling on the same port must not be treated as a collision: {rendered}"
+            );
+        }
         Ok(())
     }
 
