@@ -68,6 +68,15 @@ const fn node_load_label(hist_empty: bool, simulated: bool) -> &'static str {
     }
 }
 
+/// True until the first GPU telemetry snapshot actually carries any GPUs —
+/// distinct from a snapshot that arrived with a legitimately-zero field
+/// (e.g. `vram_total_mb == 0`, see `vram_used_pct`). Drives the hero's
+/// "still detecting" placeholders so startup/a stalled tick doesn't read as
+/// "0% / 0°C / 0W", which looks broken rather than loading.
+fn gpu_telemetry_pending(state: &AppState) -> bool {
+    state.latest.as_ref().is_none_or(|s| s.gpus.is_empty())
+}
+
 /// Peak GPU utilization across the GPUs in a snapshot (the headline metric).
 fn snap_util(s: &rocm_dash_core::metrics::Snapshot) -> f64 {
     s.gpus
@@ -122,9 +131,14 @@ fn mini_spark(
 }
 
 /// Hero card title in the mock's form: `Node throughput · N × MODEL · ROCm V`.
-/// Falls back to `Unknown GPU` when no GPU model is detected, and drops the
-/// count/ROCm segments that aren't known rather than inventing them.
+/// Falls back to `Detecting GPU…` while no telemetry has arrived at all yet
+/// (see `gpu_telemetry_pending`), or to `Unknown GPU` when telemetry arrived
+/// but didn't carry a model name — and drops the count/ROCm segments that
+/// aren't known rather than inventing them.
 fn node_throughput_title(state: &AppState) -> String {
+    if gpu_telemetry_pending(state) {
+        return "Node throughput · Detecting GPU…".to_string();
+    }
     let info = state
         .latest
         .as_ref()
@@ -275,7 +289,11 @@ fn draw_hero_left(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         lh[0],
     );
     let util = state.latest.as_ref().map_or(0.0, snap_util);
-    let util_label = format::pct(util as f32);
+    let util_label = if gpu_telemetry_pending(state) {
+        "—".to_string()
+    } else {
+        format::pct(util as f32)
+    };
     let g = GradientGauge::new(util / 100.0)
         .stops(theme.ok, theme.warn, theme.err)
         .track_bg(theme.surface_2)
@@ -362,6 +380,7 @@ fn draw_hero_right(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         rh[0],
     );
     let latest = state.latest.as_ref();
+    let pending = gpu_telemetry_pending(state);
     let vram = latest.map_or(0.0, vram_used_pct);
     let temp = latest.map_or(0.0, |s| {
         s.gpus
@@ -372,11 +391,28 @@ fn draw_hero_right(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let power: f64 = latest.map_or(0.0, |s| {
         s.gpus.iter().map(|g| f64::from(g.power_w)).sum::<f64>()
     });
+    // While no GPU telemetry has arrived yet, show "—" rather than 0%/0°C/0W
+    // — those look like real (broken) readings rather than a loading state.
+    let vram_label = if pending {
+        "—".to_string()
+    } else {
+        format::pct(vram as f32)
+    };
+    let temp_label = if pending {
+        "—".to_string()
+    } else {
+        format::celsius(temp as f32)
+    };
+    let power_label = if pending {
+        "—".to_string()
+    } else {
+        format::watts(power as f32)
+    };
     mini_spark(
         f,
         rh[1],
         "VRAM ",
-        &format::pct(vram as f32),
+        &vram_label,
         &history(state, vram_used_pct),
         false,
         theme,
@@ -385,7 +421,7 @@ fn draw_hero_right(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         f,
         rh[2],
         "TEMP ",
-        &format::celsius(temp as f32),
+        &temp_label,
         &history(state, |s| {
             s.gpus
                 .iter()
@@ -399,7 +435,7 @@ fn draw_hero_right(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         f,
         rh[3],
         "POWER",
-        &format::watts(power as f32),
+        &power_label,
         // Power can exceed 100; scale to a nominal 1kW ceiling for the trace.
         &history(state, |s| {
             s.gpus.iter().map(|g| f64::from(g.power_w)).sum::<f64>() / 10.0
@@ -681,10 +717,46 @@ mod tests {
         assert!(t.starts_with("Node throughput · "), "prefix: {t}");
         assert!(t.contains("Instinct MI355X"), "model: {t}");
         assert!(t.contains("ROCm 6.2"), "rocm version: {t}");
-        // No telemetry → Unknown GPU, no fabricated count/version.
+        // No telemetry at all yet → "detecting", not a bogus "Unknown GPU".
         let empty = AppState::new("t".into(), "default-dark".into());
         let t2 = node_throughput_title(&empty);
-        assert_eq!(t2, "Node throughput · Unknown GPU");
+        assert_eq!(t2, "Node throughput · Detecting GPU…");
+    }
+
+    #[test]
+    fn node_throughput_title_unknown_gpu_only_when_telemetry_present_but_unnamed() {
+        // Telemetry arrived (a GPU is present) but carried no model name —
+        // distinct from "nothing has arrived yet" and must still read
+        // "Unknown GPU", not the pending/detecting placeholder.
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.latest = Some(Snapshot {
+            host: SystemMetrics::default(),
+            gpus: vec![GpuMetrics {
+                device_id: "GPU0".into(),
+                vram_used_mb: 0,
+                vram_total_mb: 0,
+                gpu_utilization_pct: 0.0,
+                temperature_c: 0.0,
+                power_w: 0.0,
+                clock_mhz: None,
+            }],
+            gpu_system_info: None,
+            ..Default::default()
+        });
+        assert_eq!(node_throughput_title(&s), "Node throughput · Unknown GPU");
+    }
+
+    #[test]
+    fn gpu_telemetry_pending_distinguishes_no_data_from_legitimate_zero() {
+        // Nothing has arrived yet → pending.
+        let empty = AppState::new("t".into(), "default-dark".into());
+        assert!(gpu_telemetry_pending(&empty));
+        // A snapshot with no GPUs at all → still pending.
+        let mut no_gpus = AppState::new("t".into(), "default-dark".into());
+        no_gpus.latest = Some(Snapshot::default());
+        assert!(gpu_telemetry_pending(&no_gpus));
+        // A real GPU present (even with legitimately-zero fields) → not pending.
+        assert!(!gpu_telemetry_pending(&state_with_gpu()));
     }
 
     #[test]
