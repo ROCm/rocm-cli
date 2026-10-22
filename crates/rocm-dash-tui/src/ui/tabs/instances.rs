@@ -325,6 +325,50 @@ pub(crate) fn build_kv_heatmap_rows(
     out
 }
 
+/// Max rows shown in the detail modal's "recent activity" summary.
+const RECENT_ACTIVITY_CAP: usize = 5;
+
+/// One historical tick where an instance was actually generating tokens.
+pub(crate) struct ActivityRow {
+    pub(crate) ts: DateTime<Utc>,
+    pub(crate) gen_tps: Option<f64>,
+    pub(crate) ttft_ms: Option<f64>,
+    pub(crate) tpot_ms: Option<f64>,
+}
+
+/// Scan `history` (oldest-to-newest) for the most recent ticks where
+/// `container_id` had non-zero generation throughput — i.e. was actually
+/// serving, not idle. The live "gen:" gauge in `render_summary` already
+/// covers the steady-state idle case (ROCMAI-196: "Gen mostly shows 0 tok/s
+/// with minor spikes"), so idle ticks would only dilute this list; only the
+/// spikes are worth surfacing. Returns up to `cap` rows, newest first.
+/// Pure — exposed for tests.
+pub(crate) fn recent_activity_rows(
+    history: &std::collections::VecDeque<rocm_dash_core::metrics::Snapshot>,
+    container_id: &str,
+    cap: usize,
+) -> Vec<ActivityRow> {
+    history
+        .iter()
+        .rev()
+        .filter_map(|snap| {
+            let inst = snap
+                .instances
+                .iter()
+                .find(|i| i.container_id == container_id)?;
+            inst.gen_tps
+                .is_some_and(|v| v.is_finite() && v > 0.0)
+                .then_some(ActivityRow {
+                    ts: snap.timestamp,
+                    gen_tps: inst.gen_tps,
+                    ttft_ms: inst.ttft_ms,
+                    tpot_ms: inst.tpot_ms,
+                })
+        })
+        .take(cap)
+        .collect()
+}
+
 const fn pick_cols(width: u16) -> usize {
     if width >= 160 {
         3
@@ -651,21 +695,94 @@ pub fn draw_detail(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) -
     }
 
     // Vertical: summary (4 lines: status/id/port/tp · model/gpus/tpw/gen · partition/quant/vram · freshness)
-    // | body (min) | footer (1)
+    // | recent activity (recent non-idle ticks, ROCMAI-196) | body (min) | footer (1)
     let snap_ts = state.latest.as_ref().map(|s| s.timestamp);
+    let activity = recent_activity_rows(&state.history, &inst.container_id, RECENT_ACTIVITY_CAP);
+    // 2 border rows + (1 header row + 1 per entry), or 1 placeholder row when there's none yet.
+    let activity_h = 2 + if activity.is_empty() {
+        1
+    } else {
+        1 + activity.len() as u16
+    };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(4),
+            Constraint::Length(activity_h),
             Constraint::Min(0),
             Constraint::Length(1),
         ])
         .split(inner);
 
     render_summary(f, chunks[0], inst, snap_ts, theme);
-    let max_scroll = render_body(f, chunks[1], inst, state, theme);
-    render_footer(f, chunks[2], inst, theme, max_scroll > 0);
+    render_recent_activity(f, chunks[1], &activity, snap_ts, theme);
+    let max_scroll = render_body(f, chunks[2], inst, state, theme);
+    render_footer(f, chunks[3], inst, theme, max_scroll > 0);
     max_scroll
+}
+
+/// Renders the "recent activity" panel: the last few ticks where the
+/// instance recorded non-zero throughput, each with tok/s + TTFT/TPOT at
+/// that time — the "rolling summary of recent serving runs" from ROCMAI-196.
+fn render_recent_activity(
+    f: &mut Frame,
+    area: Rect,
+    rows: &[ActivityRow],
+    snap_ts: Option<DateTime<Utc>>,
+    theme: &Theme,
+) {
+    let inner = panel::bento(
+        f,
+        area,
+        Some("recent activity"),
+        BoxRole::Secondary,
+        false,
+        theme,
+    );
+    if inner.height == 0 {
+        return;
+    }
+    if rows.is_empty() {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "no recent activity — instance has been idle",
+                Style::default().fg(theme.muted),
+            ))),
+            inner,
+        );
+        return;
+    }
+
+    let dash = "—";
+    let header = Row::new(["TIME", "TOK/S", "TTFT", "TPOT"]).style(
+        Style::default()
+            .fg(theme.muted)
+            .add_modifier(Modifier::BOLD),
+    );
+    let table_rows = rows.iter().map(|r| {
+        let age_s = snap_ts.map_or(0, |ts| (ts - r.ts).num_seconds().max(0));
+        let time = format!("{age_s}s ago");
+        let tps = format::tps_opt(r.gen_tps);
+        let ttft = r
+            .ttft_ms
+            .filter(|v| v.is_finite())
+            .map_or_else(|| dash.to_string(), |v| format!("{v:.0}ms"));
+        let tpot = r
+            .tpot_ms
+            .filter(|v| v.is_finite())
+            .map_or_else(|| dash.to_string(), |v| format!("{v:.0}ms"));
+        Row::new([time, tps, ttft, tpot]).style(Style::default().fg(theme.fg))
+    });
+    let widths = [
+        Constraint::Length(10),
+        Constraint::Length(14),
+        Constraint::Length(7),
+        Constraint::Length(7),
+    ];
+    let table = Table::new(table_rows, widths)
+        .header(header)
+        .column_spacing(1);
+    f.render_widget(table, inner);
 }
 
 fn render_summary(
@@ -2277,6 +2394,103 @@ mod tests {
         assert!(
             out.contains("unknown"),
             "detail for legacy (None metadata) must say 'unknown'; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn recent_activity_rows_skips_idle_ticks_and_orders_newest_first() {
+        let mut busy_old = mk_inst("x");
+        busy_old.gen_tps = Some(10.0);
+        let mut idle = mk_inst("x");
+        idle.gen_tps = Some(0.0);
+        let mut no_sample = mk_inst("x");
+        no_sample.gen_tps = None;
+        let mut busy_new = mk_inst("x");
+        busy_new.gen_tps = Some(86.0);
+
+        let mut history: std::collections::VecDeque<_> = std::collections::VecDeque::new();
+        let mut snap = mk_snap(vec![busy_old]);
+        snap.timestamp = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        history.push_back(snap);
+        let mut snap = mk_snap(vec![idle]);
+        snap.timestamp = Utc.timestamp_opt(1_700_000_030, 0).unwrap();
+        history.push_back(snap);
+        let mut snap = mk_snap(vec![no_sample]);
+        snap.timestamp = Utc.timestamp_opt(1_700_000_045, 0).unwrap();
+        history.push_back(snap);
+        let mut snap = mk_snap(vec![busy_new]);
+        snap.timestamp = Utc.timestamp_opt(1_700_000_060, 0).unwrap();
+        history.push_back(snap);
+
+        let rows = recent_activity_rows(&history, "id-x", RECENT_ACTIVITY_CAP);
+        assert_eq!(rows.len(), 2, "idle and sample-less ticks must be skipped");
+        assert_eq!(
+            rows[0].gen_tps,
+            Some(86.0),
+            "newest activity must come first"
+        );
+        assert_eq!(rows[1].gen_tps, Some(10.0));
+    }
+
+    #[test]
+    fn recent_activity_rows_caps_to_requested_len() {
+        let mut history: std::collections::VecDeque<_> = std::collections::VecDeque::new();
+        for s in 0..10i64 {
+            let mut i = mk_inst("x");
+            i.gen_tps = Some(5.0);
+            let mut snap = mk_snap(vec![i]);
+            snap.timestamp = Utc.timestamp_opt(1_700_000_000 + s, 0).unwrap();
+            history.push_back(snap);
+        }
+        let rows = recent_activity_rows(&history, "id-x", 3);
+        assert_eq!(rows.len(), 3);
+    }
+
+    #[test]
+    fn detail_modal_shows_idle_placeholder_when_no_recent_activity() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let inst = mk_inst_obs("idle-detail", None, None);
+        let state = state_with_snap(inst);
+        let mut term = Terminal::new(TestBackend::new(160, 48)).unwrap();
+        term.draw(|f| {
+            draw_detail(f, f.area(), &state, &state.theme);
+        })
+        .unwrap();
+        let out = buffer_text(&term);
+        assert!(
+            out.contains("no recent activity"),
+            "detail with empty history must show the idle placeholder; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn detail_modal_shows_recent_activity_row() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let inst = mk_inst_obs("burst-detail", Some(0.0), None);
+        let mut state = state_with_snap(inst.clone());
+        let mut burst = inst;
+        burst.gen_tps = Some(86.0);
+        let mut snap = mk_snap(vec![burst]);
+        snap.timestamp = Utc.timestamp_opt(SNAP_SECS - 30, 0).unwrap();
+        state.history.push_back(snap);
+
+        let mut term = Terminal::new(TestBackend::new(160, 48)).unwrap();
+        term.draw(|f| {
+            draw_detail(f, f.area(), &state, &state.theme);
+        })
+        .unwrap();
+        let out = buffer_text(&term);
+        assert!(
+            out.contains("86.0 tok/s"),
+            "must show the historical burst's tok/s; got:\n{out}"
+        );
+        assert!(
+            out.contains("30s ago"),
+            "must show the burst's age relative to the live snapshot; got:\n{out}"
         );
     }
 }
