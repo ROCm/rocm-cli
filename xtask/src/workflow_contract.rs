@@ -3104,12 +3104,18 @@ fi
         // exited: the multicall `sleep` above is gone in a few milliseconds.
         std::thread::sleep(std::time::Duration::from_millis(250));
         let pid = child.id();
-        let exited = child.try_wait().expect("poll the decoy engine process");
+        let mut exited = child.try_wait().expect("poll the decoy engine process");
         let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
         let named = cmdline
             .split(|&b| b == 0)
             .next()
             .is_some_and(|first| first == argv0.as_os_str().as_encoded_bytes());
+        // Polled again when the name is wrong: a decoy that exited between the
+        // poll above and the read has an empty command line, and must be
+        // reported as having exited rather than as running under another name.
+        if exited.is_none() && !named {
+            exited = child.try_wait().expect("poll the decoy engine process");
+        }
         if exited.is_some() || !named {
             let _ = child.kill();
             let _ = child.wait();
