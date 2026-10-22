@@ -328,6 +328,10 @@ pub(crate) fn build_kv_heatmap_rows(
 /// Max rows shown in the detail modal's "recent activity" summary.
 const RECENT_ACTIVITY_CAP: usize = 5;
 
+/// Rows the detail body needs reserved below it (border pair + a content row)
+/// so its scrollbar can still render when the recent-activity panel is capped.
+const BODY_FLOOR: u16 = 3;
+
 /// One historical tick where an instance was actually generating tokens.
 pub(crate) struct ActivityRow {
     pub(crate) ts: DateTime<Utc>,
@@ -704,6 +708,11 @@ pub fn draw_detail(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) -
     } else {
         1 + activity.len() as u16
     };
+    // Cap so a short terminal still leaves the body its own border pair plus a
+    // content row (the minimum `vertical_scrollbar_impl` needs to draw at all) —
+    // otherwise this fixed-height panel starves `Min(0)` down to 0 and the body's
+    // scrollbar silently stops rendering while the footer's hint still fires.
+    let activity_h = activity_h.min(inner.height.saturating_sub(4 + 1 + BODY_FLOOR));
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
