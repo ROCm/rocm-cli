@@ -589,6 +589,19 @@ mod tests {
     }
 
     #[test]
+    fn split_trailing_pr_reference_does_not_panic_on_multibyte_text_trailing_a_mid_sentence_reference()
+     {
+        // Without the `ends_with(')')` guard, `rfind("(#")` would still find
+        // the mid-sentence `(#12)` here, and slicing up to `trimmed.len() - 1`
+        // would land mid-character (the trailing text is multibyte) and
+        // panic. The guard must reject this input before that slice runs.
+        assert_eq!(
+            split_trailing_pr_reference("fix: handle (#12) 文字"),
+            (None, "fix: handle (#12) 文字")
+        );
+    }
+
+    #[test]
     fn split_trailing_pr_reference_handles_multibyte_text_before_the_reference() {
         // `(#NNN)` is matched by byte offset via `rfind`/`len() - 1`; both
         // land on ASCII bytes here, so this must not panic on a non-char-
