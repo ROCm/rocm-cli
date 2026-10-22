@@ -23,8 +23,8 @@
 //! capture helpers onto it is tracked in
 //! [#623](https://github.com/ROCm/rocm-cli/issues/623).
 
-use anyhow::{Context, Result, bail};
 use crate::DEFAULT_LOCAL_HOST;
+use anyhow::{Context, Result, bail};
 #[cfg(windows)]
 use std::collections::BTreeMap;
 #[cfg(windows)]

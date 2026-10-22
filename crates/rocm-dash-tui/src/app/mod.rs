@@ -1816,9 +1816,32 @@ mod tests {
             !state.should_pane_back_out(crossterm::event::KeyCode::Esc),
             "Esc must reach the inline editor instead of closing the wizard"
         );
+
+        // Drive Esc through the real dispatch (mirrors event_loop.rs's
+        // `state.serve_wizard.is_some()` arm) instead of only checking the
+        // routing predicate above, so a removed `editor_key` Esc arm turns
+        // this test red.
+        let key = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+        );
+        let _ = crate::ui::serve_wizard::on_key(
+            &mut state.serve_wizard,
+            &mut state.jobs,
+            &state.model_recipes,
+            key,
+        );
+
+        let wizard = state
+            .serve_wizard
+            .as_ref()
+            .expect("Esc must not close the wizard");
+        assert!(
+            wizard.editor.is_none(),
+            "Esc must discard the inline editor"
+        );
         assert_eq!(
-            state.serve_wizard.as_ref().unwrap().model,
-            "typed-model",
+            wizard.model, "typed-model",
             "the in-progress form remains available to the editor handler"
         );
     }

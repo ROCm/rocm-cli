@@ -34,7 +34,7 @@ Feature: Model serving
   # endpoint must advance to the next candidate rather than failing late in the
   # engine. Runs in the merge queue because it launches a real model server.
   @id:serve-auto-port-skips-occupied @requires-gpu @merge-queue
-  Scenario: 15 - Automatic serving skips an occupied default port
+  Scenario: serve-05 - Automatic serving skips an occupied default port
     Given a managed runtime is active
     And the default serve port is occupied
     When the user serves a model with automatic port selection
@@ -48,7 +48,7 @@ Feature: Model serving
   # (`serve-default-engine-working-endpoint`, `serve-default-engine-inference`,
   # and `serve-readiness-contract`) run only in the merge queue (not on MI300X).
   @id:serve-vllm-inference @requires-gpu @requires-engine:vllm
-  Scenario: serve-05 - A served model responds to inference requests on vLLM
+  Scenario: serve-06 - A served model responds to inference requests on vLLM
     Given a managed runtime is active
     And a model is being served on GPU
     When the user sends a chat completion request
@@ -63,7 +63,7 @@ Feature: Model serving
   # ordinary per-PR path, and the longer readiness timeout also gives the first
   # inference request enough time to complete.
   @id:serve-large-model-inference @requires-gpu @serve-timeout:2400 @nightly
-  Scenario: serve-06 - A large platform-specific model serves and responds to inference
+  Scenario: serve-07 - A large platform-specific model serves and responds to inference
     Given a managed runtime is active
     And a large model is being served on GPU
     When the user sends a chat completion request
@@ -74,7 +74,7 @@ Feature: Model serving
   # lemonade per-PR canary: one real lemonade serve runs on every PR (the
   # counterpart to the vLLM canary above).
   @id:serve-lemonade-inference @requires-gpu @requires-engine:lemonade
-  Scenario: serve-07 - A model served on lemonade responds to inference requests
+  Scenario: serve-08 - A model served on lemonade responds to inference requests
     Given a managed runtime is active
     And a GGUF model is being served on lemonade
     When the user sends a chat completion request
@@ -90,7 +90,7 @@ Feature: Model serving
   # `serve-lemonade-inference` (cache-shared, no extra download) so this stays a
   # fast per-PR canary rather than needing the @nightly large-checkpoint path.
   @id:serve-hf-checkpoint-inference @requires-gpu @requires-engine:lemonade
-  Scenario: serve-08 - A canonical Hugging Face checkpoint serves and responds to inference
+  Scenario: serve-09 - A canonical Hugging Face checkpoint serves and responds to inference
     Given a managed runtime is active
     And a canonical Hugging Face GGUF checkpoint is being served on lemonade
     When the user sends a chat completion request
@@ -101,15 +101,15 @@ Feature: Model serving
   # default from the capability probe, so this covers whichever engine the host
   # would actually pick.
   @id:serve-default-engine-working-endpoint @requires-gpu @merge-queue
-  Scenario: serve-09 - Serving a model without specifying an engine produces a working endpoint
+  Scenario: serve-10 - Serving a model without specifying an engine produces a working endpoint
     Given a managed runtime is active
     When the user serves a model without specifying an engine
     Then an engine is selected automatically
     And the model is reachable
 
-  # The inference half of serve-09.
+  # The inference half of serve-10.
   @id:serve-default-engine-inference @requires-gpu @merge-queue
-  Scenario: serve-10 - A default-engine served model responds to inference requests
+  Scenario: serve-11 - A default-engine served model responds to inference requests
     Given a managed runtime is active
     When the user serves a model without specifying an engine
     Then the model responds to inference requests
@@ -121,7 +121,7 @@ Feature: Model serving
   # skips it on lemonade-default hosts (Strix Halo), where asserting a vLLM
   # default would be a guaranteed false failure.
   @id:serve-vllm-default-on-instinct @requires-gpu @requires-engine:vllm
-  Scenario: serve-11 - vLLM is the default serving engine on Instinct
+  Scenario: serve-12 - vLLM is the default serving engine on Instinct
     Given a managed runtime is active
     When the user serves a vLLM-capable model without specifying an engine
     Then vLLM is selected as the default engine
@@ -132,7 +132,7 @@ Feature: Model serving
   # platform that runs it (the merge queue skips MI300X). Readiness is gated on a real inference probe, which is what makes
   # this contract hold rather than race the model load.
   @id:serve-readiness-contract @requires-gpu @merge-queue
-  Scenario: serve-12 - A service reported ready can immediately serve inference
+  Scenario: serve-13 - A service reported ready can immediately serve inference
     Given a managed runtime is active
     And a model is being served on GPU
     When the CLI reports the service as ready
@@ -143,7 +143,7 @@ Feature: Model serving
   # launched — with an actionable message, never a CPU or device-0 fallback. Runs
   # on the no-GPU mock host, so it gates every PR (@requires-no-gpu, no GPU needed).
   @id:serve-no-gpu-fails-fast @requires-no-gpu
-  Scenario: serve-13 - Serving is refused on a host with no AMD GPU
+  Scenario: serve-14 - Serving is refused on a host with no AMD GPU
     When the user serves a model under the GPU-required default
     Then serving is refused before any engine starts
     And the user is told no AMD GPU was detected
@@ -153,7 +153,7 @@ Feature: Model serving
   # check runs inside argument parsing, before engine selection or any GPU
   # pre-flight, so it needs no GPU and no engine and gates every PR (ungated).
   @id:serve-negative-temperature-rejected
-  Scenario: serve-14 - Serving with a temperature below zero is refused with a clear reason
+  Scenario: serve-15 - Serving with a temperature below zero is refused with a clear reason
     When the user serves a model with a negative sampling temperature
     Then serving is refused before any engine starts
     And the CLI explains that temperature cannot be negative
@@ -162,7 +162,7 @@ Feature: Model serving
   # GPU-required serve must treat it as "no GPU" and refuse, not fall back. Runs on
   # GPU hardware (Strix Halo / Instinct).
   @id:serve-masked-devices-fail @requires-gpu @requires-os:linux
-  Scenario: serve-15 - Serving is refused when every GPU is masked from view
+  Scenario: serve-16 - Serving is refused when every GPU is masked from view
     When the user serves a model with every GPU masked from view
     Then serving is refused before any engine starts
     And the user is told no AMD GPU was detected
@@ -175,12 +175,12 @@ Feature: Model serving
   #
   # This is the live coverage for an index the host does not have. The *masked*
   # sub-case — an index that exists but is hidden by an active visibility mask —
-  # is a different refusal and owns its own scenarios, serve-19 and serve-20.
+  # is a different refusal and owns its own scenarios, serve-20 and serve-21.
   # The step here accepts several refusal wordings only because which authority
   # answers depends on the lane: the visible set when it could be enumerated,
   # the raw amd-smi count when it could not.
   @id:serve-absent-gpu-index-rejected @requires-gpu @requires-os:linux
-  Scenario: serve-16 - Serving pinned to a GPU that does not exist is refused
+  Scenario: serve-17 - Serving pinned to a GPU that does not exist is refused
     When the user serves a model pinned to a GPU index that does not exist
     Then serving is refused before any engine starts
     And the user is told that GPU index is unavailable
@@ -190,7 +190,7 @@ Feature: Model serving
   # during argument parsing — before any engine or GPU work. No device needed, so
   # this runs on the mock lane every PR.
   @id:serve-runtime-and-env-selectors-conflict
-  Scenario: serve-17 - Selecting both a runtime and an environment at once is refused
+  Scenario: serve-18 - Selecting both a runtime and an environment at once is refused
     When the user serves a model selecting both a runtime and an environment
     Then serving is refused before any engine starts
     And the user is told the two selectors cannot be combined
@@ -201,7 +201,7 @@ Feature: Model serving
   # deterministic on the blocking no-GPU lane rather than relying on a real 3 GiB
   # transfer to fail at just the right moment.
   @id:serve-lemonade-preparation-recovery @requires-no-gpu
-  Scenario: serve-18 - Repeated Lemonade preparation failure gives the user a recovery path
+  Scenario: serve-19 - Repeated Lemonade preparation failure gives the user a recovery path
     Given Lemonade preparation cannot complete
     When the user serves a model with Lemonade
     Then serving stops after one automatic retry
@@ -216,12 +216,12 @@ Feature: Model serving
   # `HIP_VISIBLE_DEVICES=0` is in range but masked, exercising the visible-set
   # rejection directly. It holds on a single-GPU host too, so this stays ungated:
   # the mask names device 0, which exists there, so the visible set still resolves
-  # to [0] and ordinal 1 is refused against it. (Contrast serve-20, whose mask
+  # to [0] and ordinal 1 is refused against it. (Contrast serve-21, whose mask
   # names a device a single-GPU host does not have — see the note there.) Either
   # way an honest refusal rather than a remap, which is what this asserts. Runs on
   # GPU hardware.
   @id:serve-masked-gpu-index-rejected @requires-gpu @requires-os:linux
-  Scenario: serve-19 - Serving pinned to a GPU hidden by the visibility mask is refused
+  Scenario: serve-20 - Serving pinned to a GPU hidden by the visibility mask is refused
     When the user serves a model pinned to a GPU hidden by the visibility mask
     Then serving is refused before any engine starts
     And the user is told the pinned GPU is unavailable
@@ -251,11 +251,11 @@ Feature: Model serving
   # outcome on one GPU turns on whether amd-smi happens to be present, and only a
   # second device makes the refusal follow from the mask itself. The permissive
   # unknown-mask fallback is deliberate (an unprobeable host must not be blocked
-  # from serving) and EAI-7194 does not change it. Sibling scenario serve-19 uses
+  # from serving) and EAI-7194 does not change it. Sibling scenario serve-20 uses
   # a `HIP_VISIBLE_DEVICES` mask naming a device that DOES exist, so its visible
   # set resolves on one GPU too and it stays ungated.
   @id:serve-rocr-reindexed-gpu-index-rejected @requires-gpu @requires-multi-gpu @requires-os:linux
-  Scenario: serve-20 - Serving pinned past the ROCR-reindexed visible set is refused
+  Scenario: serve-21 - Serving pinned past the ROCR-reindexed visible set is refused
     When the user serves a model pinned past the ROCR-reindexed visible set
     Then serving is refused before any engine starts
     And the user is told the pinned GPU is unavailable
@@ -264,13 +264,13 @@ Feature: Model serving
   # alternatives. ROCr applies first and HIP only re-indexes and selects among the
   # survivors, so `ROCR_VISIBLE_DEVICES=` (hide everything) leaves HIP nothing to
   # see and `HIP_VISIBLE_DEVICES=0` cannot bring a device back. The GPU-required
-  # serve must therefore refuse, exactly as serve-15 does for a HIP-only empty
+  # serve must therefore refuse, exactly as serve-16 does for a HIP-only empty
   # mask. Before the fix the probe preferred the HIP mask and discarded the ROCR
   # one entirely, resolved the visible set to [0], and let the serve proceed onto a
   # device the runtime had already hidden. Runs on GPU hardware: on a no-GPU host
   # the same refusal fires for having no device at all and would prove nothing.
   @id:serve-rocr-empty-mask-beats-hip-mask @requires-gpu @requires-os:linux
-  Scenario: serve-21 - Serving is refused when ROCR hides every GPU a HIP mask names
+  Scenario: serve-22 - Serving is refused when ROCR hides every GPU a HIP mask names
     When the user serves a model with ROCR hiding every GPU a HIP mask names
     Then serving is refused before any engine starts
     And the user is told no AMD GPU was detected
@@ -283,7 +283,7 @@ Feature: Model serving
   # what it hides and names the two commands that reach it. No GPU and no real
   # serve: the record is planted, so this runs on every lane.
   @id:serve-past-attempts-surfaced
-  Scenario: serve-22 - A failed local server is counted in the default list
+  Scenario: serve-23 - A failed local server is counted in the default list
     Given a local server attempt has failed
     When the user lists running services
     Then the list reports the attempt and how to look at it
@@ -301,7 +301,7 @@ Feature: Model serving
   # runtime is active — hence the same `a managed runtime is active` precondition
   # every other real-serve scenario on this lane opens with.
   @id:serve-vllm-low-vram-oom-guidance @requires-gpu @requires-engine:vllm @requires-os:linux
-  Scenario: serve-23 - A vLLM serve plan on a nearly-full GPU points at the memory knob
+  Scenario: serve-24 - A vLLM serve plan on a nearly-full GPU points at the memory knob
     Given a managed runtime is active
     And the selected GPU is reported nearly out of VRAM
     When the user previews a vLLM serve plan pinned to that GPU
@@ -327,7 +327,7 @@ Feature: Model serving
   # Windows detached-spawn primitive), so this scenario cannot reach the
   # refusal it exercises there.
   @id:serve-require-api-key-refuses-unauthenticated-reuse @requires-gpu @requires-engine:lemonade @requires-os:linux
-  Scenario: serve-24 - Reusing a running server without a key refuses a --require-api-key request
+  Scenario: serve-25 - Reusing a running server without a key refuses a --require-api-key request
     Given a managed runtime is active
     And an unauthenticated Lemonade service is already running for that model
     When the user serves that same model again with --require-api-key
@@ -349,16 +349,16 @@ Feature: Model serving
   # match a narrower wording would make this scenario weaker than the
   # whole-tree contract in xtask/src/ascii_output_contract.rs that it mirrors.
   @id:serve-model-list-output-is-ascii
-  Scenario: serve-25 - The recommended model list prints ASCII-only text
+  Scenario: serve-26 - The recommended model list prints ASCII-only text
     When the user lists recommended models
     Then the model list output contains only ASCII characters
 
   # Parse-time refusal (serve-port rewrite): an out-of-range `--port` (0 here;
   # 65536 and non-numeric values share the same parser and message) is rejected
   # before any engine or GPU work, so it needs no GPU and gates every PR
-  # (ungated), like its sibling serve-14.
+  # (ungated), like its sibling serve-15.
   @id:serve-invalid-port-rejected
-  Scenario: serve-26 - Serving with an out-of-range port is refused with a clear reason
+  Scenario: serve-27 - Serving with an out-of-range port is refused with a clear reason
     When the user serves a model with an out-of-range port
     Then serving is refused before any engine starts
     And the user is told the port must be between 1 and 65535
@@ -375,9 +375,27 @@ Feature: Model serving
   # apps/rocm/src/service_launch.rs, per AGENTS.md section 3.
   # Runs in the merge queue, like its automatic-port sibling serve-auto-port-skips-occupied.
   @id:serve-explicit-port-reserved @requires-gpu @merge-queue
-  Scenario: serve-27 - Serving on a port another managed service already holds is refused
+  Scenario: serve-28 - Serving on a port another managed service already holds is refused
     Given a managed runtime is active
     And another managed service already reserves the default serve port
     When the user serves a model explicitly on the reserved port
     Then serving is refused before any engine starts
     And the user is told to stop the service holding that port
+
+  # Collision-safe explicit ports, untracked-process case (serve-port rewrite,
+  # sibling of serve-28). No managed-service record exists here, so
+  # `resolve_serve_port` never reaches the "reserved by managed service" branch
+  # and instead gets a plain OS-level `AddrInUse` back from the bind probe,
+  # routing to `explicit_bind_error`'s "already in use by another process"
+  # message. Needs the same `@requires-gpu` as serve-28 for the same reason:
+  # `resolve_serve_port` only runs once `spawn_managed_engine_child` has a
+  # completed model/GPU resolution in hand (GPU indices are selected earlier in
+  # `serve_cmd.rs`, under the launch lock, before any port is ever probed), and
+  # `serve` has no CPU fallback that gets there.
+  @id:serve-explicit-port-in-use-by-untracked-process @requires-gpu @merge-queue
+  Scenario: serve-29 - Serving on a port an untracked process already holds is refused
+    Given a managed runtime is active
+    And the default serve port is occupied
+    When the user serves a model explicitly on the occupied port
+    Then serving is refused before any engine starts
+    And the user is told the port is already in use by another process

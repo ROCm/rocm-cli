@@ -1094,11 +1094,28 @@ fn build_launch_server_args(arguments: &serde_json::Map<String, Value>) -> Resul
             "launch_server host `{host}` is not loopback; require `allow_public_bind=true` before binding a non-local interface"
         );
     }
+    // Validate the same way the argv builder reads it
+    // (`arguments.get("port").and_then(Value::as_u64)`), so a malformed
+    // `port` (wrong type, out of range) can't slip past this check only to
+    // have the argv builder silently drop it and fall through to automatic
+    // port selection.
+    let port = match arguments.get("port") {
+        None | Some(Value::Null) => None,
+        Some(value) => {
+            let port = value
+                .as_u64()
+                .context("launch_server argument `port` must be an integer")?;
+            if !(1..=u64::from(u16::MAX)).contains(&port) {
+                bail!("launch_server argument `port` must be between 1 and 65535");
+            }
+            Some(port)
+        }
+    };
     // `rocm serve` proves a port is free only on the exact default host; every
     // other spelling (including the loopback aliases `localhost`/`::1` the
     // check above still accepts) needs an explicit port or the CLI call
     // refuses later with a less actionable error. See `is_canonical_loopback_host`.
-    if arguments.get("port").is_none() && !rocm_core::is_canonical_loopback_host(host) {
+    if port.is_none() && !rocm_core::is_canonical_loopback_host(host) {
         bail!(
             "launch_server host `{host}` needs an explicit `port`; automatic port selection is \
              only supported on the default host {DEFAULT_LOCAL_HOST}"
@@ -1127,7 +1144,7 @@ fn build_launch_server_args(arguments: &serde_json::Map<String, Value>) -> Resul
     if allow_public_bind {
         argv.push("--allow-public-bind".to_owned());
     }
-    if let Some(port) = arguments.get("port").and_then(Value::as_u64) {
+    if let Some(port) = port {
         argv.push("--port".to_owned());
         argv.push(port.to_string());
     }
