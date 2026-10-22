@@ -629,12 +629,16 @@ pub(crate) fn start_managed_service(
 pub(crate) fn print_managed_launch_plain(
     report: &ManagedLaunchReport,
     endpoint_api_key: Option<&str>,
+    docs_link: Option<&str>,
 ) {
     if report.already_running {
         println!("managed service already running");
         println!("  service_id: {}", report.service_id);
         println!("  endpoint: {}", report.endpoint_url);
         println!("  status: {}", report.status);
+        if let Some(link) = docs_link {
+            println!("  docs: {link}");
+        }
         println!("  note: existing service detected; no second process spawned");
         return;
     }
@@ -664,6 +668,9 @@ pub(crate) fn print_managed_launch_plain(
         println!("  manifest_path: {}", manifest_path.display());
     }
     println!("  readiness: {}", report.status);
+    if let Some(link) = docs_link {
+        println!("  docs: {link}");
+    }
 }
 
 /// Render the one-time secure client configuration for a public, authenticated
@@ -702,16 +709,21 @@ fn background_helper_already_running(paths: &AppPaths) -> Result<bool> {
 /// itself (`command.spawn()` / `spawn_detached_no_inherit`) is logged rather than
 /// propagated; setup errors (path discovery, stdio attach) still return `Err`.
 pub(crate) fn ensure_background_helper_running() -> Result<()> {
-    ensure_background_helper_running_quiet(false)
+    ensure_background_helper_running_quiet(false).map(drop)
 }
 
 /// As [`ensure_background_helper_running`], but suppresses the stdout status line
 /// when `quiet` is set. The interactive `rocm serve` summary path uses `quiet` so
 /// the daemon-spawn note does not appear above the deployment summary table.
-pub(crate) fn ensure_background_helper_running_quiet(quiet: bool) -> Result<()> {
+///
+/// Returns whether a helper is still starting up — spawned by this call or by a
+/// concurrent one — as opposed to one that was already running (or could not be
+/// spawned). Only a starting helper is worth waiting for before probing its API
+/// docs.
+pub(crate) fn ensure_background_helper_running_quiet(quiet: bool) -> Result<bool> {
     let paths = AppPaths::discover()?;
     if background_helper_already_running(&paths)? {
-        return Ok(());
+        return Ok(false);
     }
 
     // The check above and the spawn below are a TOCTOU window: two concurrent
@@ -722,7 +734,7 @@ pub(crate) fn ensure_background_helper_running_quiet(quiet: bool) -> Result<()> 
     // already-running case lock-free.
     let _autostart_lock = rocm_core::FileLock::acquire(paths.automation_autostart_lock_path())?;
     if background_helper_already_running(&paths)? {
-        return Ok(());
+        return Ok(false);
     }
 
     // The lock alone does not close the window: the spawned daemon does not
@@ -738,7 +750,7 @@ pub(crate) fn ensure_background_helper_running_quiet(quiet: bool) -> Result<()> 
         AUTOSTART_CLAIM_TTL_MS,
         rocm_core::process_is_running,
     ) {
-        return Ok(());
+        return Ok(true);
     }
 
     let exe = managed_service_launcher_path()
@@ -759,6 +771,7 @@ pub(crate) fn ensure_background_helper_running_quiet(quiet: bool) -> Result<()> 
         apply_app_path_env(&mut command, &paths);
         command.spawn().map(|child| child.id())
     };
+    let spawned = spawn_result.is_ok();
     match spawn_result {
         Ok(daemon_pid) => {
             // Record the claim before returning (and thus releasing the lock) so a
@@ -780,7 +793,7 @@ pub(crate) fn ensure_background_helper_running_quiet(quiet: bool) -> Result<()> 
         }
         Err(_) => {}
     }
-    Ok(())
+    Ok(spawned)
 }
 
 /// How long an autostart claim is honoured before it is treated as stale even if
@@ -909,6 +922,14 @@ pub(crate) fn run_attached_service(
             println!("  service_id: {}", report.service_id);
             println!("  endpoint: {}", report.endpoint_url);
             println!("  status: {}", report.status);
+            if let Some(link) = crate::api_docs_link::service_docs_link(
+                &paths,
+                &report.service_id,
+                std::time::Duration::ZERO,
+                &mut || {},
+            ) {
+                println!("  docs: {link}");
+            }
             println!("  logs: rocm logs {}", report.service_id);
             println!(
                 "  stop: {}",
@@ -928,7 +949,7 @@ pub(crate) fn run_attached_service(
     // server's record, and feeds the dashboard. Match the background ordering
     // (spawn, then ensure the helper) and keep it quiet so no status line breaks
     // into the log stream.
-    ensure_background_helper_running_quiet(true)?;
+    let helper_starting = ensure_background_helper_running_quiet(true)?;
 
     // The resolution detail (model, engine, runtime, GPU, warnings) was already
     // printed as the "serve plan" block in `serve()`; extend it with the launch
@@ -936,6 +957,15 @@ pub(crate) fn run_attached_service(
     let endpoint = format!("{}/v1", format_http_base_url(host, port));
     println!("  service_id: {service_id}");
     println!("  endpoint: {endpoint}");
+    let docs_link = crate::api_docs_link::service_docs_link(
+        &paths,
+        &service_id,
+        crate::api_docs_link::serve_docs_wait(helper_starting),
+        &mut || {},
+    );
+    if let Some(link) = docs_link.as_deref() {
+        println!("  docs: {link}");
+    }
     if let Some(key) = endpoint_api_key {
         // Same intentional one-time key display as `print_managed_launch_plain`
         // above; see its rationale for why the tag below is currently inert.
@@ -953,6 +983,9 @@ pub(crate) fn run_attached_service(
             println!("detached - server still running");
             println!("  service_id: {service_id}");
             println!("  endpoint: {endpoint}");
+            if let Some(link) = docs_link.as_deref() {
+                println!("  docs: {link}");
+            }
             println!("  list: rocm services");
             println!("  logs: rocm logs {service_id}");
             println!("  stop: {}", service_hints::service_stop_hint(&service_id));

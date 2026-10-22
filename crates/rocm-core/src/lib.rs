@@ -56,10 +56,11 @@ pub use automation::{
 };
 pub use binary_paths::{daemon_binary_path, engine_binary_path, sibling_binary_path};
 pub use config::{
-    AutomationsConfig, DashboardConfig, DashboardDaemonConfig, DashboardTuiConfig,
-    EngineUserConfig, ManagedToolConfig, PERMISSIONS_MODE_ASK, PERMISSIONS_MODE_FULL_ACCESS,
-    PermissionsConfig, ProviderUserConfig, RocmCliConfig, SetupConfig, TELEMETRY_MODE_LOCAL,
-    TELEMETRY_MODE_OFF, TelemetryConfig, WatcherMode, WatcherUserConfig,
+    ApiDocsConfig, AutomationsConfig, DEFAULT_API_DOCS_PORT, DashboardConfig,
+    DashboardDaemonConfig, DashboardTuiConfig, EngineUserConfig, ManagedToolConfig,
+    PERMISSIONS_MODE_ASK, PERMISSIONS_MODE_FULL_ACCESS, PermissionsConfig, ProviderUserConfig,
+    RocmCliConfig, SetupConfig, TELEMETRY_MODE_LOCAL, TELEMETRY_MODE_OFF, TelemetryConfig,
+    WatcherMode, WatcherUserConfig,
 };
 pub use crypto::{
     generate_rsa_signing_keypair, sign_rsa_pkcs1_sha256_signature,

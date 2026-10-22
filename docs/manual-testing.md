@@ -614,6 +614,27 @@ Expected result:
 On an 80x24 terminal, repeat the steps up to the dialog: the card shows the
 outcome (report ready or refusal) without scrolling.
 
+### 4b. API docs
+
+With a model served by `rocm serve <model>` (any engine):
+
+Expected result:
+
+- The deployment summary has a `docs` row under `endpoint`, and `rocm services
+  list` shows the same `docs:` link for that server.
+- Opening the link in a browser shows the server's routes. Under
+  `POST /v1/chat/completions`, "Try it out" then "Execute" returns a chat
+  completion from the served model; the example body already names that model.
+- The page loads with the network disconnected (the docs need no CDN).
+- For a server started with `--require-api-key` (an endpoint key), "Execute"
+  is refused until the key is entered under "Authorize".
+- After `rocm services stop <service-id> --yes`, reloading the page says the
+  server is not running, and `rocm services list` prints no docs link.
+- With `"api_docs": { "enabled": false }` in `config.json` and the helper
+  restarted, `rocm serve` prints no docs link.
+- With `HTTP_PROXY` set to an address nothing listens on before the helper
+  starts, "Try it out" still reaches the server.
+
 ## 5. ComfyUI Verification
 
 ComfyUI is managed as an app surface. It should start a local web server and

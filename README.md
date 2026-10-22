@@ -798,7 +798,8 @@ services stop <service-id> --yes`) or match the original flags.
 
 By default the server runs in the background under ROCm CLI's supervision and
 prints a deployment summary: a progress indicator while it starts, then a table
-with the status, the full inference endpoint, the API-qualified model name, and a
+with the status, the full inference endpoint, a link to the server's API docs
+(see API docs below), the API-qualified model name, and a
 quick smoke test (time to first token and approximate tokens per second). Control
 returns to your shell with the server still running; manage it later with `rocm
 services` (below).
@@ -883,6 +884,42 @@ started while a `prune` is scanning waits for the prune.
 
 `--json` prints the service records verbatim, for scripting and for the remote
 orchestration below.
+
+#### API docs
+
+Every running model server gets interactive API docs, served by the background
+helper that `rocm serve` starts. Nothing extra needs to be run: once the docs
+answer, `rocm serve` prints a `docs` link next to the endpoint, and `rocm
+services list` repeats it for each running server (`--json` prints the records
+alone, without it):
+
+```
+  endpoint  http://127.0.0.1:11435/v1/chat/completions
+  docs      http://127.0.0.1:11430/services/<service-id>/docs/
+```
+
+The page lists the routes the server answers (the model list, chat and text
+completions, and the engine's health check), with request examples already
+filled in with the served model. "Try it out" sends the request through the
+docs page to the server, so it works for every engine without enabling
+cross-origin access on the server; for a server started with an endpoint key,
+enter the key under "Authorize" (it is kept only until the page is closed).
+`http://127.0.0.1:11430/` lists every running server. vLLM also documents its
+full API at its own `/docs` page, which the docs link to.
+
+The docs listen on loopback only, accept requests only from pages served on
+this machine, and work offline. Change the port, or turn them off, in
+`config.json` (`rocm config show` prints where it is):
+
+```json
+{ "api_docs": { "enabled": true, "port": 11430 } }
+```
+
+The helper reads this when it starts. A `docs` link is printed only once the
+docs answer for that server, so there is none when the docs are off, when
+another program holds the port, or while the helper that is running was started
+by a version of ROCm CLI without API docs or before the port changed; once that
+helper exits, the next `rocm serve` starts a new one.
 
 ### Remote machines (preview)
 

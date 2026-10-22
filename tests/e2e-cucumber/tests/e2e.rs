@@ -37,6 +37,7 @@ mod e2e {
     pub mod runtime_lifecycle_steps;
     pub mod runtime_steps;
     pub mod service_cleanup_steps;
+    pub mod service_docs_steps;
     pub mod service_stop_steps;
     pub mod serving_steps;
     pub mod skill_steps;
@@ -170,6 +171,14 @@ pub struct E2eWorld {
     /// refusal envelope (it carries a `refused` key). Recorded when the preview
     /// is read, so a later step can check the card against what the CLI said.
     pub dash_report_refused: Option<bool>,
+    /// A `rocm daemon` a scenario started so its API docs answer; killed at
+    /// teardown, before the isolated tree it reads is removed.
+    pub background_helper: Option<std::process::Child>,
+    /// The API docs link a `service-docs` scenario read from the CLI.
+    pub docs_link: Option<String>,
+    /// What a successful real `rocm serve` printed, for steps that check the
+    /// launch output after the server came up.
+    pub serve_stdout: Option<String>,
 }
 
 /// One scenario's resolved expectation plus the identity needed to report it.
@@ -323,6 +332,9 @@ impl Default for E2eWorld {
             skill_symptom: None,
             recorded_process: None,
             dash_report_refused: None,
+            background_helper: None,
+            docs_link: None,
+            serve_stdout: None,
         }
     }
 }
@@ -652,6 +664,10 @@ impl Drop for E2eWorld {
         if let Some(mut process) = self.recorded_process.take() {
             let _ = process.kill();
             let _ = process.wait();
+        }
+        if let Some(mut helper) = self.background_helper.take() {
+            let _ = helper.kill();
+            let _ = helper.wait();
         }
         if let Some(mock) = self.mock.take() {
             mock.stop();

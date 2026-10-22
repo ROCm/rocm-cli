@@ -4,6 +4,7 @@
 
 #[cfg(test)]
 mod advised_commands;
+mod api_docs_link;
 /// Shared archive generator and filesystem oracle for the extraction property
 /// tests in `comfyui` and `therock`.
 #[cfg(all(test, unix))]
@@ -472,8 +473,8 @@ rocm model --verbose"
     ///
     /// Picks an engine and ROCm runtime automatically unless overridden. By default the
     /// server runs as a managed background service and prints a deployment summary
-    /// (status, endpoint, model, and smoke-test metrics); use --verbose to stream engine
-    /// logs in this terminal instead. When streaming, press Ctrl-D to detach and leave the
+    /// (status, endpoint, API docs link, model, and smoke-test metrics); use --verbose to
+    /// stream engine logs in this terminal instead. When streaming, press Ctrl-D to detach and leave the
     /// server running, or Ctrl-C to stop it. Inspect or stop servers later with
     /// `rocm services`.
     #[command(after_help = "EXAMPLES:\n  \
@@ -624,6 +625,9 @@ rocm logs --search error timeout")]
     ///   - collects GPU thermal/VRAM metrics every 60s for the TUI dashboard
     ///   - listens on a local webhook port for automation events from other
     ///     `rocm` commands
+    ///   - serves API docs for running model servers on 127.0.0.1 (port
+    ///     11430 by default; `api_docs` in config.json), forwarding their
+    ///     "Try it out" requests to the server
     ///
     /// It is normally started on demand by `rocm automations enable` and
     /// `rocm serve --managed`, so you rarely need to launch it yourself. Run it
@@ -6658,6 +6662,13 @@ pub(crate) fn render_services_text(paths: &AppPaths, all: bool) -> Result<String
         return Ok(output);
     }
 
+    let docs_links = api_docs_link::service_docs_links(
+        paths,
+        records
+            .iter()
+            .filter(|record| managed_service_is_live(record))
+            .map(|record| record.service_id.as_str()),
+    );
     let _ = writeln!(output, "Servers");
     for record in records {
         let _ = writeln!(output, "- {}", record.service_id);
@@ -6665,6 +6676,12 @@ pub(crate) fn render_services_text(paths: &AppPaths, all: bool) -> Result<String
         let _ = writeln!(output, "  engine: {}", record.engine);
         let _ = writeln!(output, "  model: {}", record.model_ref);
         let _ = writeln!(output, "  endpoint: {}", record.endpoint_url);
+        if let Some((_, link)) = docs_links
+            .iter()
+            .find(|(service_id, _)| *service_id == record.service_id)
+        {
+            let _ = writeln!(output, "  docs: {link}");
+        }
         let _ = writeln!(output, "  logs: rocm services logs {}", record.service_id);
         if matches!(
             record.status.as_str(),

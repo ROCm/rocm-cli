@@ -600,6 +600,22 @@ impl HealthcheckResponse {
     }
 }
 
+/// The OpenAI-compatible routes every chat server answers.
+///
+/// Each engine reports them, after its own health route, in
+/// [`EndpointResponse::supported_routes`]; the daemon's API docs are tested
+/// against [`chat_supported_routes`] so the two lists agree.
+pub const OPENAI_CHAT_ROUTES: [&str; 3] = ["/v1/models", "/v1/chat/completions", "/v1/completions"];
+
+/// `supported_routes` for a chat server whose health route is `health_route`.
+#[must_use]
+pub fn chat_supported_routes(health_route: &str) -> Vec<String> {
+    std::iter::once(health_route)
+        .chain(OPENAI_CHAT_ROUTES)
+        .map(str::to_owned)
+        .collect()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EndpointResponse {
     pub endpoint_url: String,
