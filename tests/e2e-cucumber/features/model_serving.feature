@@ -365,6 +365,7 @@ Feature: Model serving
     Then the CLI prints the speech-to-text endpoint of the served model
     And a recording sent to that endpoint is transcribed
     And the running service is listed as speech-to-text
+    And the API docs link printed when it started opens the server's API docs
 
   # A chat client appends /chat/completions to a listed base URL, which a
   # speech-to-text server does not have; the list must also name the route it

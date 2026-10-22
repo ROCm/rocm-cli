@@ -195,6 +195,16 @@ async fn user_tries_chat_route(world: &mut E2eWorld) {
     world.cli_output = Some(format!("{status}\n{answer}"));
 }
 
+#[when("the user opens the server's API docs from the services list")]
+async fn user_opens_docs_from_list(world: &mut E2eWorld) {
+    let listing = crate::run_rocm_ok(world, &["services", "list"]);
+    let link = docs_link_in(&listing)
+        .unwrap_or_else(|| panic!("no API docs link in the services list:\n{listing}"));
+    let page = get(&link).await;
+    assert!(page.status().is_success(), "the docs page did not open");
+    world.docs_link = Some(link);
+}
+
 #[when("the user stops the managed model")]
 async fn user_stops_managed_model(world: &mut E2eWorld) {
     crate::run_rocm_ok(world, &["services", "stop", "e2e-mock", "--yes"]);
@@ -292,12 +302,12 @@ async fn serve_printed_docs_link_opens(world: &mut E2eWorld) {
     let link = docs_link_in_serve_output(stdout)
         .unwrap_or_else(|| panic!("`rocm serve` printed no API docs link:\n{stdout}"));
     let (origin, openapi) = openapi_behind(&link).await;
-    for route in ["/v1/models", "/v1/chat/completions", "/v1/completions"] {
-        assert!(
-            openapi["paths"].get(route).is_some(),
-            "the docs do not list {route}:\n{openapi:#}"
-        );
-    }
+    // Every kind of server lists its models; which other routes it lists
+    // depends on its task and is covered by the service-docs scenarios.
+    assert!(
+        openapi["paths"].get("/v1/models").is_some(),
+        "the docs do not list /v1/models:\n{openapi:#}"
+    );
     // The docs' "Try it out" reaches the real engine: list its models through
     // the docs page.
     let server = openapi["servers"][0]["url"]
@@ -308,5 +318,47 @@ async fn serve_printed_docs_link_opens(world: &mut E2eWorld) {
         models.status().is_success(),
         "try-it through the docs did not reach the engine: {}",
         models.status()
+    );
+}
+
+#[then("the API docs list the transcription route and no chat routes")]
+async fn docs_list_transcription_only(world: &mut E2eWorld) {
+    let link = world.docs_link.clone().expect("no docs link");
+    let (_, openapi) = openapi_behind(&link).await;
+    let upload = &openapi["paths"]["/v1/audio/transcriptions"]["post"]["requestBody"]["content"]["multipart/form-data"]
+        ["schema"]["properties"];
+    assert_eq!(
+        upload["file"]["format"], "binary",
+        "the transcription route offers no audio upload:\n{openapi:#}"
+    );
+    for chat_route in ["/v1/chat/completions", "/v1/completions"] {
+        assert!(
+            openapi["paths"].get(chat_route).is_none(),
+            "a speech-to-text server's docs list {chat_route}:\n{openapi:#}"
+        );
+    }
+}
+
+#[then("a recording uploaded through the API docs is transcribed")]
+async fn recording_uploaded_through_docs(world: &mut E2eWorld) {
+    let link = world.docs_link.clone().expect("no docs link");
+    let (origin, openapi) = openapi_behind(&link).await;
+    let server = openapi["servers"][0]["url"]
+        .as_str()
+        .expect("the docs name a server to send requests to");
+    let model = openapi["paths"]["/v1/audio/transcriptions"]["post"]["requestBody"]["content"]
+        ["multipart/form-data"]["schema"]["properties"]["model"]["default"]
+        .as_str()
+        .expect("the upload form fills in the model")
+        .to_owned();
+    let (status, body) = crate::e2e::speech_steps::transcribe(
+        &format!("{origin}{server}/v1/audio/transcriptions"),
+        &model,
+    )
+    .await;
+    assert_eq!(status, 200, "the upload through the docs failed: {body}");
+    assert!(
+        body.get("text").is_some_and(Value::is_string),
+        "the answer is not a transcript: {body}"
     );
 }

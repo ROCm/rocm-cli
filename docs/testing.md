@@ -327,9 +327,14 @@ only (`@requires-os:linux`):
 cargo xtask e2e -- -n "service-docs-"
 ```
 
+`service-docs-05` covers a speech-to-text server: its docs list the
+transcription route with an audio upload and no chat routes, and an upload
+through them is transcribed.
+
 The link `rocm serve` itself prints, and a try-it request through it to a real
 engine, are checked by the GPU serve canaries `serve-05` (vLLM) and `serve-07`
-(Lemonade), which only run on GPU lanes. On Linux Lemonade lanes `serve-07` is
+(Lemonade), and for a speech-to-text server by `serve-27`, which only run on
+GPU lanes. On Linux Lemonade lanes `serve-07` is
 an expected failure for an unrelated known issue, so there a broken docs link
 would not turn the lane red: the Lemonade check is effective on the Windows
 Lemonade lanes, and `serve-05` on the vLLM lanes.

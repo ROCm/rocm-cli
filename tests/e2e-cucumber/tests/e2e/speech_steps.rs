@@ -51,7 +51,7 @@ fn silent_wav() -> Vec<u8> {
 
 /// POST a recording to an OpenAI-compatible transcription URL, the way an app
 /// would, and return the HTTP status and parsed body.
-async fn transcribe(url: &str, model: &str) -> (u16, serde_json::Value) {
+pub(crate) async fn transcribe(url: &str, model: &str) -> (u16, serde_json::Value) {
     const BOUNDARY: &str = "e2e-speech-boundary";
     let mut body = format!(
         "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n{model}\r\n\
@@ -177,6 +177,7 @@ async fn serve_speech_model_on_chat_only_engine(world: &mut E2eWorld) {
 #[when("the user serves a speech-to-text model with the engine the CLI recommended")]
 async fn serve_speech_model_on_lemonade(world: &mut E2eWorld) {
     let device_state = crate::e2e::serving_steps::ensure_serve_port_free().await;
+    crate::e2e::service_docs_steps::give_api_docs_a_port_of_their_own(world);
     let args = ["serve", SPEECH_MODEL_REF, "--engine", "lemonade"];
     let (stdout, stderr, rc) = crate::run_rocm(world, &args);
     let timeout =
@@ -209,6 +210,7 @@ async fn serve_speech_model_on_lemonade(world: &mut E2eWorld) {
             )
         );
     }
+    world.serve_stdout = Some(stdout.clone());
     record_cli(world, (stdout, stderr, rc));
     world.model_name = Some(SPEECH_MODEL_ID.to_owned());
 }

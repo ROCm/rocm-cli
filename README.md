@@ -922,9 +922,10 @@ alone, without it):
   docs      http://127.0.0.1:11430/services/<service-id>/docs/
 ```
 
-The page lists the routes the server answers (the model list, chat and text
-completions, and the engine's health check), with request examples already
-filled in with the served model. "Try it out" sends the request through the
+The page lists the routes the server answers (the model list, the engine's
+health check, and chat and text completions, or for a speech-to-text server the
+transcription route, whose "Try it out" takes an audio file upload), with
+request examples already filled in with the served model. "Try it out" sends the request through the
 docs page to the server, so it works for every engine without enabling
 cross-origin access on the server; for a server started with an endpoint key,
 enter the key under "Authorize" (it is kept only until the page is closed).

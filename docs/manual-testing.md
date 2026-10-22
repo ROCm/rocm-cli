@@ -656,6 +656,9 @@ Expected result:
   `POST /v1/chat/completions`, "Try it out" then "Execute" returns a chat
   completion from the served model; the example body already names that model.
 - The page loads with the network disconnected (the docs need no CDN).
+- For a speech-to-text server (`rocm serve whisper`), the page lists
+  `POST /v1/audio/transcriptions` and no chat routes; choosing a WAV file under
+  "Try it out" and pressing "Execute" returns its transcript.
 - For a server started with `--require-api-key` (an endpoint key), "Execute"
   is refused until the key is entered under "Authorize".
 - After `rocm services stop <service-id> --yes`, reloading the page says the
