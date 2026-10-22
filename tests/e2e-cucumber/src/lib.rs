@@ -15,6 +15,7 @@ pub mod model_id;
 pub mod monotonic_clock;
 pub mod paced_download;
 pub mod panic_capture;
+pub mod polled_deadline;
 pub mod quit_and_wait;
 pub mod reader_failure;
 pub mod send_until;
