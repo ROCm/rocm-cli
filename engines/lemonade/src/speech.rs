@@ -17,8 +17,11 @@
 //! no Vulkan device and ran on the CPU. So the field proves nothing either way
 //! and is not consulted. What is checked is the backend Lemonade actually loaded
 //! (`recipe_options.whispercpp_backend`), exactly as the chat path checks
-//! `llamacpp_backend`; the GPU itself is guaranteed by `rocm serve`'s
-//! usable-AMD-GPU gate, which runs before any engine is started.
+//! `llamacpp_backend`. `rocm serve`'s usable-AMD-GPU gate, which runs before
+//! any engine is started, ensures an AMD GPU is present, but not that a Vulkan
+//! whisper.cpp build can use it: with no Vulkan device it may run on the CPU
+//! unreported. That gap is shared with the chat path's Vulkan llama.cpp and is
+//! documented in docs/engine-plugins.md.
 
 use anyhow::{Context, Result, anyhow, bail};
 use rocm_core::format_http_base_url;

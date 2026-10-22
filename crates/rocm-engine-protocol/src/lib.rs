@@ -634,7 +634,7 @@ impl HealthcheckResponse {
 ///
 /// Each engine reports them, after its own health route, in
 /// [`EndpointResponse::supported_routes`]; the daemon's API docs are tested
-/// against [`chat_supported_routes`] so the two lists agree.
+/// against [`supported_routes`] for every task, so the lists agree.
 pub const OPENAI_CHAT_ROUTES: [&str; 3] = ["/v1/models", "/v1/chat/completions", "/v1/completions"];
 
 /// The OpenAI-compatible routes every speech-to-text server answers.
@@ -1123,6 +1123,28 @@ mod tests {
             "rocm-engine-protocol-{label}-{}-{unique}",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn each_task_reports_its_routes_after_the_health_route() {
+        assert_eq!(
+            chat_supported_routes("/health"),
+            [
+                "/health",
+                "/v1/models",
+                "/v1/chat/completions",
+                "/v1/completions"
+            ]
+        );
+        assert_eq!(
+            supported_routes("/v1/health", ModelTask::Transcription),
+            ["/v1/health", "/v1/models", "/v1/audio/transcriptions"]
+        );
+        // A task this build cannot name: only the routes every server has.
+        assert_eq!(
+            supported_routes("/v1/health", ModelTask::Unknown),
+            ["/v1/health", "/v1/models"]
+        );
     }
 
     #[test]

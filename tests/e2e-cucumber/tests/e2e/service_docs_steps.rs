@@ -296,20 +296,25 @@ async fn running_server_has_no_docs_link(world: &mut E2eWorld) {
     assert_eq!(docs_link_in(listing), None, "{listing}");
 }
 
-#[then("the API docs link printed when it started opens the server's API docs")]
-async fn serve_printed_docs_link_opens(world: &mut E2eWorld) {
-    let stdout = world.serve_stdout.as_deref().expect("no serve output");
+/// Opens the docs link `rocm serve` printed, checks the docs list exactly
+/// `routes` besides the health route, and lists the models through the docs
+/// page so "Try it out" is proven to reach the real engine.
+async fn serve_printed_docs_link_opens(stdout: &str, routes: &[&str], absent: &[&str]) {
     let link = docs_link_in_serve_output(stdout)
         .unwrap_or_else(|| panic!("`rocm serve` printed no API docs link:\n{stdout}"));
     let (origin, openapi) = openapi_behind(&link).await;
-    // Every kind of server lists its models; which other routes it lists
-    // depends on its task and is covered by the service-docs scenarios.
-    assert!(
-        openapi["paths"].get("/v1/models").is_some(),
-        "the docs do not list /v1/models:\n{openapi:#}"
-    );
-    // The docs' "Try it out" reaches the real engine: list its models through
-    // the docs page.
+    for route in routes {
+        assert!(
+            openapi["paths"].get(*route).is_some(),
+            "the docs do not list {route}:\n{openapi:#}"
+        );
+    }
+    for route in absent {
+        assert!(
+            openapi["paths"].get(*route).is_none(),
+            "the docs list {route}, which this server does not serve:\n{openapi:#}"
+        );
+    }
     let server = openapi["servers"][0]["url"]
         .as_str()
         .expect("the docs name a server to send requests to");
@@ -319,6 +324,28 @@ async fn serve_printed_docs_link_opens(world: &mut E2eWorld) {
         "try-it through the docs did not reach the engine: {}",
         models.status()
     );
+}
+
+#[then("the API docs link printed when it started opens the server's chat API docs")]
+async fn serve_printed_chat_docs_link_opens(world: &mut E2eWorld) {
+    let stdout = world.serve_stdout.clone().expect("no serve output");
+    serve_printed_docs_link_opens(
+        &stdout,
+        &["/v1/models", "/v1/chat/completions", "/v1/completions"],
+        &["/v1/audio/transcriptions"],
+    )
+    .await;
+}
+
+#[then("the API docs link printed when it started opens the server's speech-to-text API docs")]
+async fn serve_printed_speech_docs_link_opens(world: &mut E2eWorld) {
+    let stdout = world.serve_stdout.clone().expect("no serve output");
+    serve_printed_docs_link_opens(
+        &stdout,
+        &["/v1/models", "/v1/audio/transcriptions"],
+        &["/v1/chat/completions", "/v1/completions"],
+    )
+    .await;
 }
 
 #[then("the API docs list the transcription route and no chat routes")]

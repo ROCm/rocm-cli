@@ -56,13 +56,15 @@ pub(crate) fn inference_verified(
 }
 
 /// The task recorded in service state. State written before the task existed
-/// belongs to a chat service, and an unparsable value is treated the same way
-/// because the serving path only ever writes values that parse.
+/// belongs to a chat service; a value this build cannot parse was written by a
+/// newer one and reads as [`ModelTask::Unknown`], never as chat, so the
+/// service is not probed as a chat model.
 pub(crate) fn task_from_state(state: Option<&Value>) -> ModelTask {
     state
         .and_then(|value| value_string(value, "task"))
-        .and_then(|task| ModelTask::parse(&task).ok())
-        .unwrap_or_default()
+        .map_or(ModelTask::Chat, |task| {
+            ModelTask::parse(&task).unwrap_or(ModelTask::Unknown)
+        })
 }
 
 /// The device string reported once a model is loaded. Reflects the backend that
@@ -784,6 +786,14 @@ mod tests {
         assert_eq!(
             task_from_state(Some(&json!({"task": "transcription"}))),
             ModelTask::Transcription
+        );
+    }
+
+    #[test]
+    fn a_task_this_build_cannot_name_is_not_read_as_chat() {
+        assert_eq!(
+            task_from_state(Some(&json!({"task": "text-to-speech"}))),
+            ModelTask::Unknown
         );
     }
 }

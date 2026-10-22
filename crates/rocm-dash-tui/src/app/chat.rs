@@ -766,6 +766,50 @@ mod tests {
         assert_eq!(cfg.base_url, PROBED);
     }
 
+    /// An executor whose read-only `services` tool reports `services`.
+    #[derive(Debug)]
+    struct ServicesOnly(serde_json::Value);
+
+    impl crate::tool_exec::RocmToolExecutor for ServicesOnly {
+        fn execute(
+            &self,
+            _name: &str,
+            _args: &serde_json::Value,
+        ) -> crate::tool_exec::RocmToolOutcome {
+            crate::tool_exec::RocmToolOutcome::Result(serde_json::json!({
+                "structuredContent": { "services": self.0.clone() }
+            }))
+        }
+
+        fn execute_approved(
+            &self,
+            name: &str,
+            args: &serde_json::Value,
+        ) -> crate::tool_exec::RocmToolOutcome {
+            self.execute(name, args)
+        }
+    }
+
+    #[tokio::test]
+    async fn the_port_fallback_does_not_adopt_a_speech_to_text_server() {
+        // The well-known-port probe finds a server on the port a running
+        // speech-to-text service is recorded on: the chat pane must not be set
+        // up to send chat requests to it.
+        const PROBED: &str = "http://127.0.0.1:1/v1";
+        let executor: crate::tool_exec::SharedRocmToolExecutor =
+            std::sync::Arc::new(ServicesOnly(serde_json::json!([{
+                "service_id": "svc-whisper",
+                "task": "transcription",
+                "status": "ready",
+                "endpoint_url": PROBED,
+            }])));
+        assert!(
+            detect_local_chat_with_probe(Some(executor), || Some(PROBED))
+                .await
+                .is_none()
+        );
+    }
+
     #[test]
     fn should_detect_only_when_no_url_env_or_key_configured() {
         // The clean slate: nothing configured → auto-detect a local engine.

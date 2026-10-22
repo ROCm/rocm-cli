@@ -1105,6 +1105,9 @@ mod tests {
             error.contains("`whisper` is a speech-to-text model"),
             "{error}"
         );
+        // Without --model the guard sees the id the endpoint's /models lists,
+        // which is the canonical one rather than the alias.
+        assert!(ensure_bench_model_is_chat("Whisper-Tiny").is_err());
         ensure_bench_model_is_chat("qwen").expect("a chat model is accepted");
         ensure_bench_model_is_chat("some/model-not-in-the-catalog")
             .expect("a model the catalog does not know is not second-guessed");

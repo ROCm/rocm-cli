@@ -892,9 +892,12 @@ pub fn openai_inference_status(
 
 /// Whether the endpoint answers the request that matches the model's task.
 ///
-/// The same "answered below 500" rule as [`openai_chat_completion_probe`]. A
-/// speech-to-text server has no chat route, so probing it with a chat request
-/// would read its `404` as serving.
+/// A chat server counts as serving on the same "answered below 500" rule as
+/// [`openai_chat_completion_probe`]. A speech-to-text server must answer 200:
+/// the probe sends a valid recording, so a 4xx means the route or the model is
+/// not there (a model not loaded, a decode failure), not that it is serving.
+/// Probing a speech-to-text server with a chat request would instead read its
+/// `404` as serving.
 pub fn openai_inference_probe(
     task: crate::ModelTask,
     endpoint_url: &str,
@@ -903,7 +906,10 @@ pub fn openai_inference_probe(
     timeout: Duration,
 ) -> Result<bool> {
     let status = openai_inference_status(task, endpoint_url, model_ref, endpoint_api_key, timeout)?;
-    Ok(status < 500)
+    Ok(match task {
+        crate::ModelTask::Transcription => status == 200,
+        _ => status < 500,
+    })
 }
 
 /// A PCM WAV file of `duration` of silence, 16 kHz mono 16-bit — the input
@@ -2584,6 +2590,30 @@ mod tests {
         );
 
         server.join().expect("server thread should not panic")?;
+        Ok(())
+    }
+    #[test]
+    fn a_speech_to_text_probe_needs_a_transcript_not_just_an_answer() -> Result<()> {
+        for (status_line, serving) in [
+            ("HTTP/1.1 200 OK", true),
+            ("HTTP/1.1 404 Not Found", false),
+            ("HTTP/1.1 400 Bad Request", false),
+        ] {
+            let (port, server) =
+                spawn_canned_http_server(vec![Some((status_line, r#"{"text":""}"#))])?;
+            assert_eq!(
+                openai_inference_probe(
+                    crate::ModelTask::Transcription,
+                    &format!("http://127.0.0.1:{port}/v1"),
+                    "Whisper-Tiny",
+                    None,
+                    Duration::from_secs(2),
+                )?,
+                serving,
+                "{status_line}"
+            );
+            server.join().expect("server thread should not panic")?;
+        }
         Ok(())
     }
     #[test]

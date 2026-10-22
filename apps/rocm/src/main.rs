@@ -6690,13 +6690,10 @@ pub(crate) fn render_services_text(paths: &AppPaths, all: bool) -> Result<String
             // it, which a speech-to-text server does not have, so name the
             // route it does serve.
             let _ = writeln!(output, "  task: {}", record.task.display_name());
-            let _ = writeln!(
-                output,
-                "  {} endpoint: {}{}",
-                record.task.display_name(),
-                record.endpoint_url,
-                record.task.api_route()
-            );
+            if let Some(line) = service_hints::task_endpoint_line(record.task, &record.endpoint_url)
+            {
+                let _ = writeln!(output, "{line}");
+            }
         }
         if let Some((_, link)) = docs_links
             .iter()
@@ -7241,6 +7238,12 @@ fn restart_internal_managed_service_with(
     terminate: impl FnOnce(&ManagedServiceRecord) -> (Vec<u32>, bool),
 ) -> Result<ManagedServiceRecord> {
     let record = load_service_for_restart(paths, service_id, runtime_pin)?;
+    // Before the stop, so a restart this build cannot finish leaves the
+    // server running.
+    record
+        .task
+        .ensure_servable()
+        .with_context(|| format!("did not restart `{service_id}`"))?;
     // Preserve the endpoint key across the restart: `stop_internal_managed_service`
     // deletes the key file (correct on a real stop), but a restart must bring the
     // service back on the same public host with the same auth. Capture it first and
@@ -11586,9 +11589,12 @@ fn service_http_readiness_response_ready(
 
 /// Whether one readiness response shows the model loaded, judged for its task.
 ///
-/// A speech-to-text model is listed only by Lemonade's `/v1/health`, loaded
-/// through `whispercpp` on a GPU backend. Lemonade's `/v1/models` lists every
+/// On Lemonade a speech-to-text model is listed only by `/v1/health`, loaded
+/// through `whispercpp` on a GPU backend: Lemonade's `/v1/models` lists every
 /// downloaded model, loaded or not, so it says nothing about a Whisper model.
+/// Any other engine that advertises speech-to-text is judged by its
+/// `/v1/models`, as its chat models are; either way the transcription probe
+/// that follows decides whether it actually serves.
 fn service_http_readiness_response_ready_for_task(
     task: rocm_core::ModelTask,
     engine: &str,
@@ -11600,8 +11606,8 @@ fn service_http_readiness_response_ready_for_task(
     if status != 200 {
         return false;
     }
-    if task == rocm_core::ModelTask::Transcription {
-        return (engine, path) == ("lemonade", "/v1/health")
+    if task == rocm_core::ModelTask::Transcription && engine == "lemonade" {
+        return path == "/v1/health"
             && lemonade_health_has_transcription_model(body, canonical_model_id);
     }
     match (engine, path) {
@@ -13671,6 +13677,16 @@ pub(crate) mod tests {
             ),
             "Lemonade lists every downloaded model, so the listing proves nothing"
         );
+        // Another engine that advertises speech-to-text is judged by its model
+        // list, as its chat models are, before the transcription probe runs.
+        assert!(service_http_readiness_response_ready_for_task(
+            rocm_core::ModelTask::Transcription,
+            "example-plugin",
+            "/v1/models",
+            200,
+            r#"{"data":[{"id":"Whisper-Tiny"}]}"#,
+            "Whisper-Tiny",
+        ));
     }
 
     #[test]
@@ -17421,6 +17437,37 @@ pub(crate) mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn restart_refuses_a_task_from_a_newer_rocm_cli_before_stopping_it() {
+        // A task this build cannot name has no serve path here: stopping the
+        // server first would take it down for good.
+        let (root, paths) = test_paths("restart-unknown-task");
+        paths.ensure().unwrap();
+        let service_id = "svc-newer-task";
+        let mut record = stop_test_record(&paths, service_id);
+        record.task = rocm_core::ModelTask::Unknown;
+        record.write().unwrap();
+
+        let mut stopped = false;
+        let error = restart_internal_managed_service_with(&paths, service_id, None, |_| {
+            stopped = true;
+            (Vec::new(), true)
+        })
+        .expect_err("a task this build does not know cannot be restarted");
+        let rendered = format!("{error:#}");
+        let on_disk = raw_manifest(&paths, service_id);
+        let _ = fs::remove_dir_all(root);
+        assert!(
+            rendered.contains("did not restart `svc-newer-task`"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("a newer rocm-cli"), "{rendered}");
+        // The claims in that message, checked against the state they describe.
+        assert!(!stopped, "nothing was stopped");
+        assert_eq!(on_disk.restart_count, 0, "no restart was recorded");
+        assert_eq!(on_disk.task, rocm_core::ModelTask::Unknown);
+    }
+
     /// A public record with a dead pid and a stored endpoint key, for the
     /// liveness-refresh cases below. The port is one nothing listens on, so the
     /// refresh's endpoint probe fails and it falls through to the pid check.
@@ -18869,7 +18916,6 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    /// The value following `flag` in an argv, or `None` when the flag is absent.
     #[test]
     fn a_restarted_speech_to_text_service_is_relaunched_with_its_task() -> Result<()> {
         let root = std::env::temp_dir().join(format!(
@@ -18933,6 +18979,7 @@ pub(crate) mod tests {
         );
     }
 
+    /// The value following `flag` in an argv, or `None` when the flag is absent.
     fn argv_flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
         let index = args.iter().position(|arg| arg == flag)?;
         args.get(index + 1).map(String::as_str)

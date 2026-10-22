@@ -55,9 +55,12 @@ the CPU one. Before reporting ready it checks that Lemonade loaded the model on
 that backend and that a test transcription returns HTTP 200. It does not trust
 the per-model `device` field of Lemonade's health report: Lemonade 11.5.1
 derives it from the backend name, labelling a ROCm Whisper model `cpu`, and a
-Vulkan one `gpu` even where whisper.cpp found no Vulkan device. The GPU itself
-is guaranteed by `rocm serve`'s usable-AMD-GPU check, which runs before the
-engine starts.
+Vulkan one `gpu` even where whisper.cpp found no Vulkan device. `rocm serve`'s
+usable-AMD-GPU check, which runs before the engine starts, ensures an AMD GPU
+is present, but not that a Vulkan whisper.cpp build can use it: where the
+Vulkan driver exposes no device, that build may run on the CPU without
+reporting it. This is a known gap, shared with the chat path's Vulkan
+llama.cpp; the ROCm backend is not affected.
 
 ## Lemonade backend alignment on engine install
 

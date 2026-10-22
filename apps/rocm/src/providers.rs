@@ -281,8 +281,11 @@ impl ProviderAdapter for LocalProvider<'_> {
     fn status(&self) -> Result<ProviderStatus> {
         let services = ready_local_services(self.paths)?;
         let builtin_ready = services.iter().any(local_service_is_builtin_assistant);
+        // Only chat models: this lists what chat can use, and a speech-to-text
+        // server listed here would be offered as one.
         let mut models = services
             .into_iter()
+            .filter(|record| record.task.is_chat())
             .map(|record| record.canonical_model_id)
             .collect::<Vec<_>>();
         models.sort();
@@ -2299,6 +2302,11 @@ mod tests {
         // `local_provider_default_chat_requires_builtin_qwen_assistant` proves.
         assert!(error.contains("rocm serve qwen"), "{error}");
 
+        // Nor is it listed among the models the local chat provider offers.
+        let status = LocalProvider { paths: &paths }.status()?;
+        assert!(status.models.is_empty(), "{:?}", status.models);
+        assert_eq!(status.auth_status, "no_ready_local_service");
+
         let _ = std::fs::remove_dir_all(root);
         Ok(())
     }
@@ -3236,6 +3244,15 @@ mod tests {
                         let request = read_http_request(&mut stream)?;
                         if request.starts_with("GET /v1/models ") {
                             write_models_response(&mut stream, &model_id)?;
+                        } else if request.starts_with("POST /v1/audio/transcriptions ") {
+                            // A speech-to-text readiness probe needs a
+                            // transcript, as a real server gives it.
+                            let body = r#"{"text":""}"#;
+                            write!(
+                                stream,
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            )?;
                         } else {
                             write_not_found_response(&mut stream)?;
                         }

@@ -721,6 +721,13 @@ pub(crate) fn supervise_service(
     // clients from then on. The registry is the only place the task is kept
     // between runs, so a record that is not there yet is a chat service.
     record.task = existing.map(|existing| existing.task).unwrap_or_default();
+    // Before the manifest write, so an unrecoverable record keeps the task a
+    // newer rocm-cli wrote instead of being relaunched with one this build
+    // cannot name.
+    record
+        .task
+        .ensure_servable()
+        .with_context(|| format!("not recovering `{}`", record.service_id))?;
     // Refuse a keyless public respawn before the manifest write, so a refused
     // attempt leaves the recorded restart_count and timestamps intact instead of
     // clobbering them with a record no live process will ever back. The spawn
@@ -2225,6 +2232,49 @@ mod tests {
 
         assert!(outcome.is_err(), "the log path is a directory");
         assert_eq!(persisted?.task, rocm_core::ModelTask::Transcription);
+        Ok(())
+    }
+
+    #[test]
+    fn supervise_service_does_not_recover_a_task_from_a_newer_rocm_cli() -> Result<()> {
+        let (root, paths) = temp_app_paths("supervise-unknown-task");
+        paths.ensure()?;
+        fs::create_dir_all(paths.services_dir())?;
+
+        let service_id = "svc-supervise-unknown-task";
+        let mut seeded = identity_probe_record(&paths, service_id, 11450);
+        seeded.task = rocm_core::ModelTask::Unknown;
+        seeded.restart_count = 3;
+        seeded.write()?;
+
+        let outcome = supervise_service(
+            &paths,
+            service_id.to_owned(),
+            "lemonade".to_owned(),
+            "future-model".to_owned(),
+            "future-model".to_owned(),
+            None,
+            None,
+            "127.0.0.1".to_owned(),
+            11450,
+            "gpu_required".to_owned(),
+            None,
+            None,
+        );
+        let persisted = load_service_record(&paths, service_id)?;
+        let log_created = seeded.log_path.exists();
+        fs::remove_dir_all(root).ok();
+
+        let error = format!(
+            "{:#}",
+            outcome.expect_err("an unknown task is not recovered")
+        );
+        assert!(error.contains("not recovering"), "{error}");
+        assert!(error.contains("a newer rocm-cli"), "{error}");
+        // Refused before the record was rewritten or anything launched.
+        assert_eq!(persisted.task, rocm_core::ModelTask::Unknown);
+        assert_eq!(persisted.restart_count, 3);
+        assert!(!log_created, "no engine was started");
         Ok(())
     }
 

@@ -51,6 +51,10 @@ fn silent_wav() -> Vec<u8> {
 
 /// POST a recording to an OpenAI-compatible transcription URL, the way an app
 /// would, and return the HTTP status and parsed body.
+///
+/// Sent from a blocking thread, not the harness's runtime: steps block that
+/// runtime's workers on CLI subprocesses, and with a full lane of scenarios an
+/// async request can wait out its whole timeout without being polled.
 pub(crate) async fn transcribe(url: &str, model: &str) -> (u16, serde_json::Value) {
     const BOUNDARY: &str = "e2e-speech-boundary";
     let mut body = format!(
@@ -61,21 +65,76 @@ pub(crate) async fn transcribe(url: &str, model: &str) -> (u16, serde_json::Valu
     .into_bytes();
     body.extend_from_slice(&silent_wav());
     body.extend_from_slice(format!("\r\n--{BOUNDARY}--\r\n").as_bytes());
-    let response = reqwest::Client::new()
-        .post(url)
-        .header(
-            "Content-Type",
-            format!("multipart/form-data; boundary={BOUNDARY}"),
-        )
-        .body(body)
-        .timeout(std::time::Duration::from_mins(2))
-        .send()
-        .await
-        .unwrap_or_else(|error| panic!("transcription request to {url} failed: {error}"));
-    let status = response.status().as_u16();
-    let text = response.text().await.unwrap_or_default();
+    let content_type = format!("multipart/form-data; boundary={BOUNDARY}");
+    let target = url.to_owned();
+    let (status, text) =
+        tokio::task::spawn_blocking(move || blocking_post(&target, &content_type, &body))
+            .await
+            .expect("the transcription request thread panicked")
+            .unwrap_or_else(|error| panic!("transcription request to {url} failed: {error}"));
     let json = serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text));
     (status, json)
+}
+
+/// A plain HTTP/1.1 POST over a socket, with its own two-minute deadline.
+/// Returns the status and the body, de-chunked when the server streamed it.
+fn blocking_post(url: &str, content_type: &str, body: &[u8]) -> std::io::Result<(u16, String)> {
+    use std::io::{Read, Write};
+    let invalid = |what: String| std::io::Error::new(std::io::ErrorKind::InvalidData, what);
+    let parsed = reqwest::Url::parse(url).map_err(|error| invalid(error.to_string()))?;
+    let host = parsed.host_str().unwrap_or("127.0.0.1").to_owned();
+    let port = parsed.port_or_known_default().unwrap_or(80);
+    let deadline = std::time::Duration::from_mins(2);
+    let mut stream = std::net::TcpStream::connect((host.as_str(), port))?;
+    stream.set_read_timeout(Some(deadline))?;
+    stream.set_write_timeout(Some(deadline))?;
+    let path = match parsed.query() {
+        Some(query) => format!("{}?{query}", parsed.path()),
+        None => parsed.path().to_owned(),
+    };
+    write!(
+        stream,
+        "POST {path} HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: {content_type}\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )?;
+    stream.write_all(body)?;
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw)?;
+    let text = String::from_utf8_lossy(&raw);
+    let (headers, payload) = text
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| invalid(format!("no HTTP header terminator in: {text}")))?;
+    let status = headers
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .ok_or_else(|| invalid(format!("no HTTP status in: {headers}")))?;
+    let chunked = headers
+        .lines()
+        .any(|line| line.to_ascii_lowercase().replace(' ', "") == "transfer-encoding:chunked");
+    let body = if chunked {
+        dechunk(payload)
+    } else {
+        payload.to_owned()
+    };
+    Ok((status, body))
+}
+
+/// The payload of a `Transfer-Encoding: chunked` body.
+fn dechunk(mut payload: &str) -> String {
+    let mut body = String::new();
+    while let Some((size, rest)) = payload.split_once("\r\n") {
+        let Ok(size) = usize::from_str_radix(size.trim(), 16) else {
+            break;
+        };
+        if size == 0 || rest.len() < size {
+            break;
+        }
+        body.push_str(&rest[..size]);
+        payload = rest[size..].trim_start_matches("\r\n");
+    }
+    body
 }
 
 /// The URL on the output line `<label>: <url>`, if the CLI printed one.
@@ -94,7 +153,7 @@ fn printed_url(output: &str, label: &str) -> Option<String> {
 /// A speech-to-text server the CLI has no record of, reached by its URL.
 #[given("a speech-to-text model is being served")]
 async fn speech_model_served(world: &mut E2eWorld) {
-    let mock = MockServer::start_transcription(SPEECH_MODEL_ID).await;
+    let mock = MockServer::start_transcription(SPEECH_MODEL_ID);
     world.endpoint = Some(mock.base_url());
     world.model_name = Some(SPEECH_MODEL_ID.to_owned());
     world.mock = Some(mock);
@@ -130,7 +189,7 @@ async fn newer_speech_service(world: &mut E2eWorld) {
         "this step owns the scenario's one disposable process"
     );
     world.recorded_process = Some(child);
-    let mock = MockServer::start_transcription(SPEECH_MODEL_ID).await;
+    let mock = MockServer::start_transcription(SPEECH_MODEL_ID);
     let services = world
         .isolated_root
         .as_ref()

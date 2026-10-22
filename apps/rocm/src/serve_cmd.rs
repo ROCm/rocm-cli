@@ -977,13 +977,9 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
         } else {
             spinner.clear();
             print_managed_launch_plain(&report, launched_key.as_deref(), docs_link.as_deref());
-            if !task.is_chat() {
-                println!(
-                    "  {} endpoint: {}{}",
-                    task.display_name(),
-                    report.endpoint_url,
-                    task.api_route()
-                );
+            if let Some(line) = crate::service_hints::task_endpoint_line(task, &report.endpoint_url)
+            {
+                println!("{line}");
             }
         }
         return Ok(());

@@ -847,8 +847,8 @@ reports ROCm unsupported for the GPU; its CPU build is never selected, and
 `rocm serve` refuses to start without a usable AMD GPU. vLLM serves chat
 models only, so `rocm serve whisper --engine vllm` is refused with the command
 that works. `rocm chat`, the Console chat pane, and `rocm bench load` need a
-chat model: they do not use a speech-to-text server, and say so when you name
-one.
+chat model: they do not use a speech-to-text server. `rocm chat` and `rocm
+bench load` say so when you name one; the Console chat pane skips it.
 
 Some models (such as Llama) are gated and require Hugging Face authentication.
 Log in with `huggingface-cli login` or set `HF_TOKEN` in your environment

@@ -68,6 +68,19 @@ impl ModelTask {
         matches!(self, Self::Chat)
     }
 
+    /// Refuse to serve, restart or recover a server for a task this build does
+    /// not know. Such a task was recorded by a newer rocm-cli; serving it as
+    /// anything this build knows would serve the wrong thing.
+    pub fn ensure_servable(self) -> Result<()> {
+        if matches!(self, Self::Unknown) {
+            bail!(
+                "this rocm-cli does not know the model task recorded for this server; a newer \
+                 rocm-cli recorded it and is needed to serve it"
+            );
+        }
+        Ok(())
+    }
+
     /// Parse a recipe's `task` string.
     ///
     /// Unknown values are an error rather than a silent `Chat`: a recipe that

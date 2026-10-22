@@ -419,6 +419,7 @@ fn install_response(request: InstallRequest) -> Result<InstallResponse> {
 }
 
 fn resolve_model_response(request: ResolveModelRequest) -> Result<ResolveModelResponse> {
+    request.task.ensure_servable()?;
     let device_policy = crate::state::normalize_device_policy(request.device_policy)?;
     let engine_recipe = crate::state::accepted_engine_recipe(request.engine_recipe)?;
     let canonical_model_id = crate::state::resolve_lemonade_model_ref(&request.model_ref);
@@ -453,6 +454,7 @@ fn resolve_model_response(request: ResolveModelRequest) -> Result<ResolveModelRe
 }
 
 fn launch_service(mut request: LaunchRequest) -> Result<LaunchResponse> {
+    request.task.ensure_servable()?;
     rocm_core::require_nonempty(&request.service_id, "service_id")?;
     rocm_core::require_nonempty(&request.model_ref, "model_ref")?;
     request.device_policy = Some(crate::state::normalize_device_policy(
@@ -735,8 +737,9 @@ fn healthcheck_service(request: HealthcheckRequest) -> Result<HealthcheckRespons
                 ModelTask::Transcription => {
                     crate::speech::query_loaded_transcription_model(endpoint, &model_ref, &backend)
                 }
-                // Only this adapter writes the task into its state, and only
-                // values it serves; anything else is never reported ready.
+                // A task this build cannot name was written by a newer one
+                // (`task_from_state`); it has no probe here, so it is never
+                // reported ready.
                 ModelTask::Unknown => Ok(false),
             })
             .transpose()
@@ -848,6 +851,20 @@ fn print_json<T: Serialize>(value: &T) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_task_from_a_newer_rocm_cli_is_not_resolved_as_any_known_task() {
+        let error = resolve_model_response(ResolveModelRequest {
+            model_ref: "future-model".to_owned(),
+            runtime_id: None,
+            device_policy: None,
+            recipe_override: None,
+            engine_recipe: None,
+            task: ModelTask::Unknown,
+        })
+        .expect_err("an unknown task is refused, not served as chat");
+        assert!(error.to_string().contains("a newer rocm-cli"), "{error}");
+    }
 
     #[test]
     fn stop_scope_targets_only_the_recorded_lemonade_server() {

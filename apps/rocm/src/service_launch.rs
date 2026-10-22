@@ -965,13 +965,7 @@ pub(crate) fn run_attached_service(
     let endpoint = format!("{}/v1", format_http_base_url(host, port));
     // Printed beside `endpoint`, never instead of it, so the base URL keeps one
     // meaning on every surface; see `render_services_text`.
-    let task_endpoint_line = (!task.is_chat()).then(|| {
-        format!(
-            "  {} endpoint: {endpoint}{}",
-            task.display_name(),
-            task.api_route()
-        )
-    });
+    let task_endpoint_line = service_hints::task_endpoint_line(task, &endpoint);
     println!("  service_id: {service_id}");
     println!("  endpoint: {endpoint}");
     if let Some(line) = &task_endpoint_line {

@@ -598,7 +598,7 @@ impl MockServer {
     /// transcript, and has no chat route — a chat request is refused with `404`,
     /// but its path is still recorded so a scenario can prove the CLI never
     /// sent one.
-    pub async fn start_transcription(model_name: &str) -> Self {
+    pub fn start_transcription(model_name: &str) -> Self {
         #[derive(Clone)]
         struct TranscriptionState {
             model_name: String,
@@ -611,16 +611,29 @@ impl MockServer {
                 "data": [{"id": state.model_name, "object": "model"}]
             }))
         }
+        /// Answers only what a real transcription server would: a multipart
+        /// upload with a non-empty `file` part and this server's `model`.
+        /// Anything else is a 400, so a request mangled on its way here (a
+        /// lost boundary, a dropped body, the wrong model) cannot pass for a
+        /// transcription.
         async fn transcribe(
             State(state): State<TranscriptionState>,
             uri: axum::http::Uri,
-        ) -> Json<Value> {
+            headers: axum::http::HeaderMap,
+            body: axum::body::Bytes,
+        ) -> (StatusCode, Json<Value>) {
             state
                 .transcription_paths
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(uri.path().to_string());
-            Json(json!({"text": MOCK_TRANSCRIPT}))
+            match transcription_upload_problem(&headers, &body, &state.model_name) {
+                None => (StatusCode::OK, Json(json!({"text": MOCK_TRANSCRIPT}))),
+                Some(problem) => (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": {"message": problem}})),
+                ),
+            }
         }
         async fn refuse_chat(
             State(state): State<TranscriptionState>,
@@ -649,7 +662,11 @@ impl MockServer {
             .route("/chat/completions", post(refuse_chat))
             .with_state(state);
         Self {
-            server: http_server::spawn(app).await,
+            // Its own thread and runtime, not the harness's: steps block the
+            // harness's workers on CLI subprocesses, and with many scenarios
+            // running at once a request to this server could sit unserved
+            // until the client gave up.
+            server: http_server::spawn_on_own_thread(app),
             last_chat_request: Arc::new(Mutex::new(None)),
             chat_paths,
             scripted: None,
@@ -830,6 +847,49 @@ impl Default for ServiceRecordOptions {
 /// rocm-cli crates.
 pub fn write_service_record(services_dir: &Path, model: &str, port: u16) {
     write_service_record_with(services_dir, model, port, ServiceRecordOptions::default());
+}
+
+/// Why a transcription request is not a valid upload for `model`, or `None`
+/// when it is.
+fn transcription_upload_problem(
+    headers: &axum::http::HeaderMap,
+    body: &[u8],
+    model: &str,
+) -> Option<String> {
+    let content_type = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    let Some(boundary) = content_type
+        .strip_prefix("multipart/form-data")
+        .and_then(|rest| rest.split("boundary=").nth(1))
+        .map(|boundary| boundary.trim_matches('"'))
+        .filter(|boundary| !boundary.is_empty())
+    else {
+        return Some(format!("expected a multipart upload, got `{content_type}`"));
+    };
+    let body = String::from_utf8_lossy(body);
+    let mut file_bytes = None;
+    let mut sent_model = None;
+    for part in body.split(&format!("--{boundary}")) {
+        let Some((part_headers, content)) = part.split_once("\r\n\r\n") else {
+            continue;
+        };
+        let content = content.strip_suffix("\r\n").unwrap_or(content);
+        if part_headers.contains("name=\"file\"") {
+            file_bytes = Some(content.len());
+        } else if part_headers.contains("name=\"model\"") {
+            sent_model = Some(content.to_owned());
+        }
+    }
+    match (file_bytes, sent_model) {
+        (None | Some(0), _) => Some("the upload has no audio in its `file` part".to_owned()),
+        (_, None) => Some("the upload names no `model`".to_owned()),
+        (_, Some(sent)) if sent != model => {
+            Some(format!("this server serves `{model}`, not `{sent}`"))
+        }
+        _ => None,
+    }
 }
 
 /// Like [`write_service_record`], but with caller-specified lifecycle fields.

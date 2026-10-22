@@ -43,7 +43,7 @@ Feature: Model serving
     When the user sends a chat completion request
     Then the response contains a model reply
     And the response identifies the correct model
-    And the API docs link printed when it started opens the server's API docs
+    And the API docs link printed when it started opens the server's chat API docs
 
   # Large-model coverage (dogfooding W9): serve a representative large model for
   # each GPU platform end-to-end at least once. The model follows the lane's serve
@@ -70,7 +70,7 @@ Feature: Model serving
     When the user sends a chat completion request
     Then the response contains a model reply
     And the response identifies the correct model
-    And the API docs link printed when it started opens the server's API docs
+    And the API docs link printed when it started opens the server's chat API docs
 
   # HF-checkpoint direct-serve canary (EAI-8026). An `owner/repo:variant` ref
   # bypasses Lemonade's model router and runs a packaged llama-server directly
@@ -356,7 +356,8 @@ Feature: Model serving
     And the user is told the command that serves it with Lemonade
 
   # The real thing: Lemonade's whisper.cpp backend on the GPU (ROCm, or Vulkan
-  # where Lemonade reports ROCm unsupported; never CPU). Runs on the Lemonade
+  # where Lemonade reports ROCm unsupported; its CPU build is never selected).
+  # Runs on the Lemonade
   # GPU lanes. Whisper-Tiny keeps the download under 100 MB.
   @id:serve-speech-to-text-model-prints-its-transcription-endpoint @requires-gpu @requires-engine:lemonade
   Scenario: serve-27 - A served speech-to-text model answers on the endpoint the CLI prints
@@ -365,7 +366,7 @@ Feature: Model serving
     Then the CLI prints the speech-to-text endpoint of the served model
     And a recording sent to that endpoint is transcribed
     And the running service is listed as speech-to-text
-    And the API docs link printed when it started opens the server's API docs
+    And the API docs link printed when it started opens the server's speech-to-text API docs
 
   # A chat client appends /chat/completions to a listed base URL, which a
   # speech-to-text server does not have; the list must also name the route it
