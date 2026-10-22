@@ -244,7 +244,10 @@ fn adlx_readings() -> Vec<AdlxReading> {
         let services = system.performance_monitoring_services().ok()?;
         Some(
             gpus.iter()
-                .filter_map(|gpu| Some((gpu, services.current_gpu_metrics(gpu).ok()?)))
+                .filter_map(|gpu| {
+                    let m = services.current_gpu_metrics(&gpu).ok()?;
+                    Some((gpu, m))
+                })
                 .map(|(gpu, m)| AdlxReading {
                     temperature_c: m.temperature().unwrap_or(0.0) as f32,
                     power_w: m.power().unwrap_or(0.0) as f32,
