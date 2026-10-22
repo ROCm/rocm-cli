@@ -1077,7 +1077,10 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
             .collect()
     }
 
-    /// The report artifact a lane's upload step names (`name: e2e-*-report`).
+    /// The report artifact(s) a lane's upload step names (`name:
+    /// e2e-*-report`), comma-separated when the lane carries a `channel`
+    /// axis: both the `release` and `nightly` leg must have uploaded, since
+    /// either can independently die before writing its own report.
     fn uploaded_report_artifact(workflow: &str, text: &str, job: &str) -> String {
         // A lane with an `sdk_version` matrix (ROCMAI-430) uploads one artifact
         // per leg, each behind its own mutually exclusive `if:` — pair every
@@ -1115,9 +1118,18 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
                     .0
             }
         };
-        // The report job has no `matrix` context, so a lane with a channel axis is
-        // checked through its `release` leg, which stands for the whole lane.
-        chosen.replace("${{ matrix.channel }}", "release")
+        // The report job has no `matrix` context, so a lane with a channel
+        // axis is checked through both its legs explicitly, rather than
+        // reading `release` alone as a stand-in for the whole lane.
+        if chosen.contains("${{ matrix.channel }}") {
+            format!(
+                "{},{}",
+                chosen.replace("${{ matrix.channel }}", "release"),
+                chosen.replace("${{ matrix.channel }}", "nightly")
+            )
+        } else {
+            chosen.to_string()
+        }
     }
 
     #[test]
@@ -1290,7 +1302,10 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
             })
             .collect();
         let jobs: Vec<&str> = lanes.iter().map(|(job, _)| job.as_str()).collect();
-        let every_artifact: Vec<&str> = lanes.iter().map(|(_, a)| a.as_str()).collect();
+        // A channel-axis lane's value is comma-joined (its `release` and
+        // `nightly` legs); flatten to the individual artifact names the real
+        // upload steps would produce, matching what `gh api` would list.
+        let every_artifact: Vec<&str> = lanes.iter().flat_map(|(_, a)| a.split(',')).collect();
         let (victim, victim_artifact) = (&lanes[0].0, &lanes[0].1);
         let all = |result: &'static str| -> Vec<(&str, &str)> {
             jobs.iter().map(|job| (*job, result)).collect()
@@ -1385,6 +1400,36 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
                 "every missing lane must be named, including `{lane}`:\n{log}\n{summary}"
             );
         }
+
+        // A channel-axis lane's `release` and `nightly` legs are checked
+        // independently: missing just one must still fail, naming only that
+        // leg, not the lane's other (present) one.
+        let (channel_job, channel_artifacts) = lanes
+            .iter()
+            .find(|(_, a)| a.contains(','))
+            .expect("e2e-selfhosted.yml has a channel-matrixed lane");
+        let (present_leg, missing_leg) = channel_artifacts
+            .split_once(',')
+            .expect("a channel lane's value is its two legs, comma-separated");
+        let one_leg_missing: Vec<&str> = every_artifact
+            .iter()
+            .copied()
+            .filter(|a| *a != missing_leg)
+            .collect();
+        let (code, log, _) = run_report_check(&step, &all("success"), Some(&one_leg_missing));
+        assert_eq!(
+            code, 1,
+            "a channel lane missing one leg must still fail:\n{log}"
+        );
+        assert!(
+            log.contains(&format!("::error::lane {channel_job} ran"))
+                && log.contains(&format!("uploaded no {missing_leg}")),
+            "the annotation must name the missing leg specifically:\n{log}"
+        );
+        assert!(
+            !log.contains(&format!("uploaded no {present_leg}")),
+            "the present leg must not be flagged as missing:\n{log}"
+        );
 
         // A lane absent from `needs` has no result to say it was skipped, so
         // it is checked rather than waved through.
@@ -3553,6 +3598,7 @@ fi
     /// command (not a copy of its regex) against the three bypasses an
     /// earlier link-stripping regex let through unchanged, so a regression
     /// back to naive link-stripping is caught by behavior.
+    #[cfg(unix)]
     #[test]
     fn publish_release_readiness_wiki_escapes_markdown_link_and_html_syntax() {
         let nightly = read_workflow("nightly.yml");
@@ -3592,6 +3638,12 @@ fi
             run("[outer [inner](https://a.example)](https://b.example)"),
             r"\[outer \[inner\](https://a.example)\](https://b.example)",
             "every bracket in a nested link must be escaped, leaving no live link"
+        );
+        assert_eq!(
+            run(r"\[click\](https://evil.example)"),
+            r"\\\[click\\\](https://evil.example)",
+            "a narrative pre-escaping its own brackets must not produce a live link: \
+             the literal backslash must itself be escaped before `[`/`]` are"
         );
     }
 
@@ -3638,6 +3690,82 @@ fi
             job.contains("--e2e-report-job-result \"${{ needs.e2e-report-nightly.result }}\""),
             "release-readiness-nightly's xtask invocation must pass e2e-report-nightly's result \
              as --e2e-report-job-result"
+        );
+        assert!(
+            job.contains("--windows-result \"${{ needs.windows-nightly.result }}\""),
+            "release-readiness-nightly must read --windows-result from \
+             needs.windows-nightly.result, not needs.nightly.result (the Linux build's own \
+             result) -- otherwise a failed Windows nightly build never fails the gate"
+        );
+    }
+
+    #[test]
+    fn release_readiness_nightly_runs_even_if_an_upstream_job_failed() {
+        let nightly = read_workflow("nightly.yml");
+        let job = job_block(&nightly, "release-readiness-nightly");
+        assert!(
+            job.contains("if: ${{ !cancelled() }}"),
+            "release-readiness-nightly must still run when e2e-report-nightly or a build job \
+             failed (the default `if` would skip it instead, leaving the wiki showing a stale \
+             GO from the last run that did succeed): {job}"
+        );
+    }
+
+    #[test]
+    fn publish_release_readiness_wiki_guard_is_exact() {
+        let nightly = read_workflow("nightly.yml");
+        let job = job_block(&nightly, "publish-release-readiness-wiki");
+        assert!(
+            job.contains(
+                "if: ${{ !cancelled() && needs.release-readiness-nightly.result != 'skipped' \
+                 && github.repository == 'ROCm/rocm-cli' && github.ref == 'refs/heads/main' }}"
+            ),
+            "publish-release-readiness-wiki's guard must stay exactly this: `!cancelled()` so \
+             it still runs (and publishes the stale-evidence notice) when release-readiness-\
+             nightly failed outright, `!= 'skipped'` rather than `== 'success'` so that failure \
+             still publishes rather than being skipped, and the repo/main-branch guards: {job}"
+        );
+    }
+
+    #[test]
+    fn release_readiness_jobs_checkout_without_persisting_credentials() {
+        let nightly = read_workflow("nightly.yml");
+        for job_name in ["release-readiness-nightly", "release-readiness-narrative"] {
+            let job = job_block(&nightly, job_name);
+            assert!(
+                job.contains("persist-credentials: false"),
+                "{job_name}'s checkout must not persist credentials: these jobs shell out over \
+                 untrusted issue/commit text, and a leaked GITHUB_TOKEN would let anything \
+                 injected into that text push with repo write access"
+            );
+        }
+    }
+
+    #[test]
+    fn release_readiness_narrative_delimiter_is_random_not_fixed() {
+        let nightly = read_workflow("nightly.yml");
+        let job = job_block(&nightly, "release-readiness-narrative");
+        assert!(
+            job.contains("delimiter=\"$(openssl rand -hex 8)\"")
+                && job.contains("echo \"json<<${delimiter}\"")
+                && job.contains("echo \"${delimiter}\""),
+            "the GITHUB_OUTPUT heredoc delimiter must stay randomly generated: facts.json \
+             embeds untrusted GitHub issue titles, and a fixed delimiter (e.g. `EOF`) would let \
+             one that happens to contain that token terminate the heredoc early and inject \
+             further GITHUB_OUTPUT assignments: {job}"
+        );
+    }
+
+    #[test]
+    fn release_readiness_narrative_reaches_the_shell_only_through_env() {
+        let nightly = read_workflow("nightly.yml");
+        let job = job_block(&nightly, "release-readiness-narrative");
+        assert!(
+            job.contains("NARRATIVE: ${{ steps.draft.outputs.response }}")
+                && job.contains("run: printf '%s\\n' \"$NARRATIVE\""),
+            "the LLM-drafted narrative must reach the shell only through the $NARRATIVE env \
+             var, never inlined as `${{ steps.draft.outputs.response }}` directly in `run:` -- \
+             that would let the narrative's own text execute as shell: {job}"
         );
     }
 

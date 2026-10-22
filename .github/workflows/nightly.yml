@@ -1572,9 +1572,11 @@ jobs:
       # flattens a single match into the root and loses its name. The list also
       # holds earlier attempts' artifacts, so a re-run that uploads nothing can
       # pass on the first attempt's report: this can miss a lane, but never
-      # flags one that did upload. Every lane carries a `matrix.channel` axis and is
-      # checked through its `release` leg (the matrix context does not exist in
-      # this job), which stands for the whole lane. LANE_REPORTS, and this script's behaviour,
+      # flags one that did upload. Every lane carries a `matrix.channel` axis;
+      # its `release` and `nightly` legs upload separate artifacts and either
+      # can independently die before writing its own, so both are listed and
+      # checked explicitly, comma-separated, rather than reading one leg as a
+      # stand-in for the whole lane. LANE_REPORTS, and this script's behaviour,
       # are pinned by xtask's workflow contract tests. The annotation quotes the
       # lane's `needs` result verbatim; on a `continue-on-error` lane it may read
       # `success` even though the lane failed, so the absent artifact is the
@@ -1586,13 +1588,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           NEEDS: ${{ toJSON(needs) }}
           LANE_REPORTS: |
-            e2e-gpu-nightly=e2e-gpu-release-report
-            e2e-gpu-nightly-rad3=e2e-gpu-rad3-release-report
-            e2e-gpu-nightly-mi350p=e2e-gpu-mi350p-release-report
-            e2e-gpu-nightly-w7900=e2e-gpu-w7900-release-report
-            e2e-gpu-nightly-strix=e2e-gpu-strix-ubuntu-release-report
-            e2e-gpu-nightly-strix-windows=e2e-gpu-strix-windows-release-report
-            e2e-wsl-nightly=e2e-gpu-strix-wsl-release-report
+            e2e-gpu-nightly=e2e-gpu-release-report,e2e-gpu-nightly-report
+            e2e-gpu-nightly-rad3=e2e-gpu-rad3-release-report,e2e-gpu-rad3-nightly-report
+            e2e-gpu-nightly-mi350p=e2e-gpu-mi350p-release-report,e2e-gpu-mi350p-nightly-report
+            e2e-gpu-nightly-w7900=e2e-gpu-w7900-release-report,e2e-gpu-w7900-nightly-report
+            e2e-gpu-nightly-strix=e2e-gpu-strix-ubuntu-release-report,e2e-gpu-strix-ubuntu-nightly-report
+            e2e-gpu-nightly-strix-windows=e2e-gpu-strix-windows-release-report,e2e-gpu-strix-windows-nightly-report
+            e2e-wsl-nightly=e2e-gpu-strix-wsl-release-report,e2e-gpu-strix-wsl-nightly-report
         run: |
           uploaded=$(gh api --paginate \
             "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts" \
@@ -1601,15 +1603,18 @@ jobs:
             exit 1
           }
           missing=0
-          while IFS='=' read -r job artifact; do
+          while IFS='=' read -r job artifacts; do
             [ -n "$job" ] || continue
             result=$(jq -r --arg job "$job" '.[$job].result // "absent"' <<<"$NEEDS")
             [ "$result" = skipped ] && continue
-            if ! grep -qxF "$artifact" <<<"$uploaded"; then
-              echo "::error::lane $job ran (needs result: $result) but uploaded no $artifact, so it is missing from the consolidated report"
-              echo "- :x: \`$job\` ran (needs result: $result) but uploaded no \`$artifact\`; it is missing from the grid above" >> "$GITHUB_STEP_SUMMARY"
-              missing=1
-            fi
+            IFS=',' read -ra wanted <<<"$artifacts"
+            for artifact in "${wanted[@]}"; do
+              if ! grep -qxF "$artifact" <<<"$uploaded"; then
+                echo "::error::lane $job ran (needs result: $result) but uploaded no $artifact, so it is missing from the consolidated report"
+                echo "- :x: \`$job\` ran (needs result: $result) but uploaded no \`$artifact\`; it is missing from the grid above" >> "$GITHUB_STEP_SUMMARY"
+                missing=1
+              fi
+            done
           done <<<"$LANE_REPORTS"
           exit "$missing"
 
@@ -1798,16 +1803,17 @@ jobs:
 
       - name: Draft narrative
         id: draft
-        # `actions/ai-inference` tags full semver releases (`v1.0.0`,
-        # `v2.1.1`, ...) alongside a floating major alias (`v1`, `v2`, `v3`)
-        # that moves forward as new patches release. Pinning by SHA freezes
-        # this exact commit regardless of where `v3` points later; the
-        # `# v3` suffix is just a human-readable label for which major line
-        # this SHA came from.
-        uses: actions/ai-inference@2c43c91ae16266ca159d311430343c67a5ffa222 # v3
+        # v3 is a floating major alias with no semver tag yet (only v1.x/
+        # v2.x have one); pinned to v2.1.1 instead per AGENTS.md's
+        # full-semver-tag policy. v2.1.1's default provider is
+        # `github-models`, not `copilot` (v3 flipped the default), so
+        # `provider: copilot` below is required here, not just
+        # documentation.
+        uses: actions/ai-inference@a7805884c80886efc241e94a5351df715968a0ad # v2.1.1
         env:
           COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_PAT }}
         with:
+          provider: copilot
           # Copilot CLI's --model slugs use dots, not the Anthropic API's
           # hyphenated IDs. claude-sonnet-4.5 was retired when Claude Sonnet
           # 5.5 went GA; claude-sonnet-5.5 is the current slug.
@@ -1892,7 +1898,7 @@ jobs:
               echo
               echo "release-readiness-nightly failed before it could compute a verdict for run [${GITHUB_RUN_NUMBER}](${RUN_URL}), commit [\`${GITHUB_SHA::12}\`](${COMMIT_URL})."
               echo
-              echo "_Any verdict below this line predates this run and does not reflect it._"
+              echo "_No verdict was computed for this run._"
             } > "/tmp/${page}"
           elif ! grep -q '^| Area | Evidence | Status |' release-readiness/table.md; then
             # Same reasoning as publish-e2e-wiki: publish only when the status
@@ -1922,9 +1928,12 @@ jobs:
                 # markup: unlike a link-stripping regex, this has no nesting
                 # problem, because an escaped bracket can no longer be parsed as
                 # link/image syntax in the first place, however it's nested.
+                # The backslash itself is doubled first, so a narrative
+                # containing a literal `\[` can't smuggle a live link past the
+                # bracket-escaping step by pre-escaping its own brackets.
                 # This does not stop GitHub's bare-URL autolinking (a visible
                 # plain URL, not a disguised link) — an accepted residual gap.
-                sed -e 's/\[/\\[/g' -e 's/\]/\\]/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' release-readiness/narrative.md
+                sed -e 's/\\/\\\\/g' -e 's/\[/\\[/g' -e 's/\]/\\]/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' release-readiness/narrative.md
               else
                 echo "_Narrative generation did not complete this run; see the mechanical table above._"
               fi

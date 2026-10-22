@@ -374,16 +374,49 @@ fn excerpt(text: &str, max_chars: usize) -> String {
 
 /// Sum of the `Fail` column across the consolidated E2E markdown's `**Total**`
 /// row (`crates/e2e-report`'s `consolidated_summary_markdown` format: `|
-/// Platform | OS | Total | Pass | Fail | Skip | Xfail | Status |`). Parsing
-/// the already-rendered totals row, rather than re-deriving per-platform
+/// Platform | OS | Total | Pass | Fail | Skip | Xfail | Status |`), plus one
+/// for every per-platform row that reports a non-`PASS` `Status` with a `Fail`
+/// cell of `0`.
+///
+/// The second part exists because an `EMPTY` platform (no `report.json`, or
+/// one that's empty/unparseable) contributes `0` to every numeric column —
+/// including `Fail` — so the Total row's own Fail cell has no record that the
+/// platform was ever there at all. A genuine `FAIL` status always has a
+/// nonzero own `Fail` cell (already folded into the Total row), so this only
+/// adds for platforms the Total row would otherwise read as having zero
+/// failures.
+///
+/// Parsing the already-rendered rows, rather than re-deriving per-platform
 /// pass/fail here, keeps this in lockstep with that crate's known-bugs/xfail
 /// handling instead of duplicating it.
 fn total_e2e_failures(markdown: &str) -> Option<u64> {
-    markdown
+    let total_row_fails = markdown
         .lines()
         .find(|l| l.trim_start().starts_with("| **Total**"))
         .and_then(|line| line.split('|').nth(5))
-        .and_then(|cell| cell.trim().parse().ok())
+        .and_then(|cell| cell.trim().parse::<u64>().ok())?;
+
+    let silently_empty_platforms = markdown
+        .lines()
+        .filter(|l| {
+            let t = l.trim_start();
+            t.starts_with('|')
+                && !t.starts_with("| Platform")
+                && !t.starts_with("|---")
+                && !t.starts_with("| **Total**")
+        })
+        .filter(|l| {
+            let cells: Vec<&str> = l.split('|').collect();
+            let status = cells.get(8).map(|c| c.trim());
+            let fail = cells
+                .get(5)
+                .and_then(|c| c.trim().parse::<u64>().ok())
+                .unwrap_or(0);
+            !matches!(status, Some("PASS" | "") | None) && fail == 0
+        })
+        .count() as u64;
+
+    Some(total_row_fails + silently_empty_platforms)
 }
 
 /// Neutralize markdown syntax in untrusted text (GitHub issue titles) before
@@ -634,6 +667,18 @@ mod tests {
     #[test]
     fn total_e2e_failures_returns_none_without_a_totals_row() {
         assert_eq!(total_e2e_failures("no table here"), None);
+    }
+
+    #[test]
+    fn total_e2e_failures_catches_a_silently_empty_platform() {
+        // A missing/unparseable report.json renders every numeric column as
+        // 0, so the Total row's own Fail cell has no idea the platform was
+        // ever there — only the per-row Status cell reveals it.
+        let md = "| Platform | OS | Total | Pass | Fail | Skip | Xfail | Status |\n\
+                   |---|---|--:|--:|--:|--:|--:|:--|\n\
+                   | Windows | Windows | 0 | 0 | 0 | 0 | n/a | EMPTY |\n\
+                   | **Total** | | 0 | 0 | 0 | 0 | 0 | |\n";
+        assert_eq!(total_e2e_failures(md), Some(1));
     }
 
     #[test]
@@ -986,6 +1031,19 @@ mod tests {
     }
 
     #[test]
+    fn escape_markdown_escapes_emphasis_and_code_markers() {
+        assert_eq!(
+            escape_markdown("*bold* _em_ `code`"),
+            r"\*bold\* \_em\_ \`code\`"
+        );
+    }
+
+    #[test]
+    fn escape_markdown_collapses_a_bare_carriage_return() {
+        assert_eq!(escape_markdown("line one\rline two"), "line one line two");
+    }
+
+    #[test]
     fn categorize_does_not_treat_a_bang_on_other_types_as_breaking() {
         let subjects = vec!["docs!: rewrite the README".to_string()];
         let got = categorize(&subjects);
@@ -1000,6 +1058,25 @@ mod tests {
         let got = categorize(&subjects);
         assert_eq!(got.fixes[0].subject, "correct VRAM probe");
         assert!(!got.fixes[0].subject.contains("(#124)"));
+    }
+
+    #[test]
+    fn categorize_drops_a_breaking_commit_scoped_entirely_to_internal_tooling() {
+        // The scope must be read off `head_no_bang`, not `head`: the raw
+        // head still has the trailing `!`, so `head[i+1..]` after `(` ends in
+        // `ci)!` rather than `ci)` and `strip_suffix(')')` would miss,
+        // leaking an internal-only breaking change into the Breaking bucket.
+        let subjects = vec!["fix(nightly)!: rewrite the release-readiness gate".to_string()];
+        let got = categorize(&subjects);
+        assert!(got.breaking.is_empty());
+        assert!(got.fixes.is_empty());
+    }
+
+    #[test]
+    fn categorize_trims_whitespace_around_scope_names() {
+        let subjects = vec!["fix(nightly, ci): tidy up the dispatch matrix".to_string()];
+        let got = categorize(&subjects);
+        assert!(got.fixes.is_empty());
     }
 
     #[test]
