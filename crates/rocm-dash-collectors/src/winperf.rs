@@ -92,11 +92,18 @@ fn device_key(instance: &str) -> &str {
 /// output. Utilization is the max across that adapter's engines (3D/copy/
 /// video/etc.) — the same "overall GPU" reading Task Manager shows.
 ///
-/// `vram_total_mb` is only filled in when there is exactly one adapter: with
-/// more than one, correlating a `GPU Adapter Memory` LUID to a specific
-/// `Win32_VideoController` entry isn't reliably possible without vendor-
-/// specific APIs, so it's left at 0 (every TUI consumer already guards
-/// `vram_total_mb > 0` before dividing).
+/// Windows can report more than one `GPU Adapter Memory` LUID for a single
+/// physical GPU (stale instances left behind by a display-mode switch, or
+/// separate WDDM engine nodes) — on an integrated APU this shows up as a
+/// "3 GPUs" readout with two phantom zero-VRAM devices. When
+/// `Win32_VideoController` says there's exactly one real adapter, collapse
+/// every LUID into that one device instead of reporting one per LUID: sum
+/// VRAM used (a phantom LUID contributes 0), take the max utilization.
+///
+/// With more than one real adapter, correlating a `GPU Adapter Memory` LUID
+/// to a specific `Win32_VideoController` entry isn't reliably possible
+/// without vendor-specific APIs, so `vram_total_mb` is left at 0 (every TUI
+/// consumer already guards `vram_total_mb > 0` before dividing).
 /// ponytail: single-adapter case (the realistic target: an integrated AMD
 /// APU) gets an exact total; multi-GPU hosts degrade to 0 instead of a wrong
 /// number. Upgrade path: WMI `MSPower_DeviceEnable`/DXGI LUID correlation if
@@ -136,10 +143,22 @@ fn parse_metrics(raw: &str) -> Vec<GpuMetrics> {
     }
 
     let adapters = parse_adapters(raw);
-    let single_adapter_ram_mb = match (order.len(), adapters.len()) {
-        (1, 1) => adapters[0].ram_bytes / (1024 * 1024),
-        _ => 0,
-    };
+    if let [adapter] = adapters.as_slice() {
+        if order.is_empty() {
+            return Vec::new();
+        }
+        let vram_used_mb: u64 = vram_mb.values().sum();
+        let gpu_utilization_pct = util.values().copied().fold(0.0f32, f32::max).min(100.0);
+        return vec![GpuMetrics {
+            device_id: "win-gpu-0".to_string(),
+            vram_used_mb,
+            vram_total_mb: adapter.ram_bytes / (1024 * 1024),
+            gpu_utilization_pct,
+            temperature_c: 0.0,
+            power_w: 0.0,
+            clock_mhz: None,
+        }];
+    }
 
     order
         .into_iter()
@@ -147,7 +166,7 @@ fn parse_metrics(raw: &str) -> Vec<GpuMetrics> {
         .map(|(i, key)| GpuMetrics {
             device_id: format!("win-gpu-{i}"),
             vram_used_mb: vram_mb.get(key).copied().unwrap_or(0),
-            vram_total_mb: single_adapter_ram_mb,
+            vram_total_mb: 0,
             gpu_utilization_pct: util.get(key).copied().unwrap_or(0.0).min(100.0),
             temperature_c: 0.0,
             power_w: 0.0,
@@ -236,6 +255,21 @@ mod tests {
         let gpu = &metrics[0];
         assert!((gpu.gpu_utilization_pct - 0.682).abs() < 0.001);
         assert_eq!(gpu.vram_used_mb, 902_787_072 / (1024 * 1024));
+        assert_eq!(gpu.vram_total_mb, 1_073_741_824 / (1024 * 1024));
+    }
+
+    #[test]
+    fn phantom_adapter_memory_luids_collapse_to_one_device_when_only_one_real_adapter() {
+        // Real-world capture from an AMD Radeon 780M laptop: Windows reports
+        // 3 distinct `GPU Adapter Memory` LUIDs (2 of them permanently
+        // zero-VRAM phantoms) for the single physical adapter
+        // `Win32_VideoController` actually lists.
+        let sample = "UTIL\tpid_1234_luid_0x00000000_0x0002ff2a_phys_0_eng_0_engtype_3d\t0.5\nVRAM\tluid_0x00000000_0x0002ff2a_phys_0\t897261568\nVRAM\tluid_0x00000000_0x000325a2_phys_0\t0\nVRAM\tluid_0x00000000_0x000325f9_phys_0\t0\nGPU\tAMD Radeon 780M Graphics\t1073741824\t32.0.31041.1004";
+        let metrics = parse_metrics(sample);
+        assert_eq!(metrics.len(), 1);
+        let gpu = &metrics[0];
+        assert!((gpu.gpu_utilization_pct - 0.5).abs() < 0.001);
+        assert_eq!(gpu.vram_used_mb, 897_261_568 / (1024 * 1024));
         assert_eq!(gpu.vram_total_mb, 1_073_741_824 / (1024 * 1024));
     }
 

@@ -350,8 +350,12 @@ fn draw_hero_right(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let latest = state.latest.as_ref();
     let vram = latest.map_or(0.0, |s| {
         let used: u64 = s.gpus.iter().map(|g| g.vram_used_mb).sum();
-        let total: u64 = s.gpus.iter().map(|g| g.vram_total_mb).sum::<u64>().max(1);
-        used as f64 / total as f64 * 100.0
+        let total: u64 = s.gpus.iter().map(|g| g.vram_total_mb).sum();
+        if total > 0 {
+            used as f64 / total as f64 * 100.0
+        } else {
+            0.0
+        }
     });
     let temp = latest.map_or(0.0, |s| {
         s.gpus
@@ -369,8 +373,12 @@ fn draw_hero_right(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         &format::pct(vram as f32),
         &history(state, |s| {
             let used: u64 = s.gpus.iter().map(|g| g.vram_used_mb).sum();
-            let total: u64 = s.gpus.iter().map(|g| g.vram_total_mb).sum::<u64>().max(1);
-            used as f64 / total as f64 * 100.0
+            let total: u64 = s.gpus.iter().map(|g| g.vram_total_mb).sum();
+            if total > 0 {
+                used as f64 / total as f64 * 100.0
+            } else {
+                0.0
+            }
         }),
         false,
         theme,
@@ -679,6 +687,31 @@ mod tests {
         let empty = AppState::new("t".into(), "default-dark".into());
         let t2 = node_throughput_title(&empty);
         assert_eq!(t2, "Node throughput · Unknown GPU");
+    }
+
+    #[test]
+    fn hero_vram_pct_is_zero_not_garbage_when_total_is_unknown() {
+        // vram_total_mb == 0 is a legitimate state (e.g. the Windows
+        // collector can't correlate a multi-adapter host to specific VRAM
+        // sizes) — must render "0.0%", not `used / 1 * 100`.
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.active_tab = ActiveTab::Home;
+        s.latest = Some(Snapshot {
+            host: SystemMetrics::default(),
+            gpus: vec![GpuMetrics {
+                device_id: "GPU0".into(),
+                vram_used_mb: 808,
+                vram_total_mb: 0,
+                gpu_utilization_pct: 0.5,
+                temperature_c: 0.0,
+                power_w: 0.0,
+                clock_mhz: None,
+            }],
+            ..Default::default()
+        });
+        let out = render(&s, 160, 30);
+        assert!(out.contains("0.0%"), "expected 0.0% VRAM: {out:?}");
+        assert!(!out.contains("80800"), "garbage VRAM pct leaked: {out:?}");
     }
 
     #[test]
