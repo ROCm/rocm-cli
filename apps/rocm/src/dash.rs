@@ -339,11 +339,12 @@ pub fn resolved_args(
 /// Re-reads `services_dir` fresh on every [`snapshot`](ManagedRegistryProbe::snapshot)
 /// call: a local JSON-file read, no daemon round-trip, no network I/O — cheap
 /// enough for the quit-confirm gate to call on every render while the prompt
-/// is open, and the only source of truth at all on a host whose
-/// dashboard-embedded daemon client never connects (Windows —
-/// `rocm_dash_tui::client`'s connect path and `maybe_spawn_embedded_daemon`
-/// are unix-only, so `AppState::instances` never gets a first snapshot
-/// there).
+/// is open, and the only source of truth at all on Windows, where
+/// `rocm_dash_tui::client`'s `#[cfg(windows)]` arm does connect and stream
+/// live GPU/CPU/memory every tick but — by design, there being no
+/// `rocmdashd` unix socket to source one from (`maybe_spawn_embedded_daemon`
+/// is unix-only) — never sends an instance snapshot, so
+/// `AppState::instances` never gets a first one there.
 ///
 /// **Known divergence, same shape as [`services_past_attempts`]'s:** this
 /// reads the record's raw on-disk `status`, not process liveness. A service

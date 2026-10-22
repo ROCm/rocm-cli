@@ -6,8 +6,10 @@
 //! forwards everything (including connect/disconnect transitions) to the app loop
 //! via an mpsc channel.
 
-// On Windows the connection is a #[cfg(unix)] stub, so the unix-socket imports
-// below are only used on unix; silence the resulting unused-import noise there.
+// On Windows there's no `rocmdashd` unix socket to connect to, so the
+// `#[cfg(windows)]` arm builds snapshots in-process instead (see
+// `connect_and_run`); the unix-socket imports below are only used on unix,
+// so silence the resulting unused-import noise there.
 #![cfg_attr(windows, allow(unused_imports))]
 
 use std::path::PathBuf;
@@ -213,6 +215,10 @@ async fn connect_and_run(connect: &str, tx: UnboundedSender<ClientMsg>) -> anyho
     let gpu = WinPerfCollector::new();
     // Mirrors the daemon's `gpu_tick` cadence (rocm_dash_daemon::runner::RunnerOptions::default()).
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
+    // A slow powershell/ADLX tick (see `WinPerfCollector::snapshot`) must not
+    // queue up a burst of catch-up ticks once it returns; matches
+    // `rocm-dash-daemon/src/runner.rs`'s existing explicit choice.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         ticker.tick().await;

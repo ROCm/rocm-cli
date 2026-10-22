@@ -23,6 +23,7 @@ use std::time::Duration;
 
 use rocm_dash_core::metrics::{GpuMetrics, GpuSystemInfo};
 use tokio::process::Command;
+use tokio::task;
 use tokio::time::timeout;
 
 // 5s was too tight: on real hardware `powershell.exe` child-process spawn
@@ -60,10 +61,13 @@ impl WinPerfCollector {
     /// same output, doubling exposure to spawn latency for nothing.
     pub async fn snapshot(&self) -> io::Result<(Vec<GpuMetrics>, GpuSystemInfo)> {
         let out = Self::run_script().await?;
-        Ok((
-            parse_metrics(&out, &adlx_readings()),
-            parse_system_info(&out),
-        ))
+        // adlx_readings() calls into amdadlx64.dll via FFI, which blocks on
+        // driver I/O — running it directly here would stall a tokio worker
+        // thread, same hazard run_script() avoids by using an async Command.
+        let adlx = task::spawn_blocking(adlx_readings)
+            .await
+            .unwrap_or_default();
+        Ok((parse_metrics(&out, &adlx), parse_system_info(&out)))
     }
 
     async fn run_script() -> io::Result<String> {
@@ -71,6 +75,10 @@ impl WinPerfCollector {
             RUN_TIMEOUT,
             Command::new("powershell.exe")
                 .args(["-NoProfile", "-NonInteractive", "-Command", WINPERF_SCRIPT])
+                // Dropping the child on timeout must actually kill it, or a
+                // hung powershell.exe (and its driver query) leaks forever
+                // instead of exiting with the future that gave up on it.
+                .kill_on_drop(true)
                 .output(),
         )
         .await
@@ -115,8 +123,8 @@ fn device_key(instance: &str) -> &str {
 /// consumer already guards `vram_total_mb > 0` before dividing).
 /// ponytail: single-adapter case (the realistic target: an integrated AMD
 /// APU) gets an exact total; multi-GPU hosts degrade to 0 instead of a wrong
-/// number. Upgrade path: WMI `MSPower_DeviceEnable`/DXGI LUID correlation if
-/// multi-GPU Windows hosts become a real target.
+/// number. Upgrade path: DXGI/LUID-based adapter correlation if multi-GPU
+/// Windows hosts become a real target.
 ///
 /// `adlx` is a parameter (rather than this function calling `adlx_readings()`
 /// itself) so tests can exercise the ADLX-matching/VRAM-fallback logic below
@@ -163,7 +171,14 @@ fn parse_metrics(raw: &str, adlx: &[AdlxReading]) -> Vec<GpuMetrics> {
         }
         let vram_used_mb: u64 = vram_mb.values().sum();
         let gpu_utilization_pct = util.values().copied().fold(0.0f32, f32::max).min(100.0);
-        let (temperature_c, power_w, clock_mhz) = apply_adlx(adlx.first());
+        // ADLX's GPU list isn't otherwise correlated to the perf-counter
+        // LUIDs here, so it's only trusted at all when there's exactly one
+        // ADLX reading to match this one real adapter against — same
+        // single-reading guard `vram_total_mb` below already uses.
+        let (temperature_c, power_w, clock_mhz) = match adlx {
+            [reading] => apply_adlx(Some(reading)),
+            _ => apply_adlx(None),
+        };
         // `Win32_VideoController.AdapterRAM` is a 32-bit WMI field: any card
         // with >=4GiB VRAM truncates/overflows there. ADLX's own VRAM query
         // isn't subject to that, so prefer it when exactly one ADLX GPU
@@ -186,28 +201,32 @@ fn parse_metrics(raw: &str, adlx: &[AdlxReading]) -> Vec<GpuMetrics> {
         }];
     }
 
+    // More than one real adapter: an ADLX GPU-list index has no reliable
+    // correlation to a specific perf-counter LUID (same reason
+    // `vram_total_mb` is left at 0 below), so every slot degrades to
+    // ADLX-absent defaults rather than risk reporting one GPU's temp/power/
+    // clock under a different GPU's device_id.
+    let (temperature_c, power_w, clock_mhz) = apply_adlx(None);
     order
         .into_iter()
         .enumerate()
-        .map(|(i, key)| {
-            let (temperature_c, power_w, clock_mhz) = apply_adlx(adlx.get(i));
-            GpuMetrics {
-                device_id: format!("win-gpu-{i}"),
-                vram_used_mb: vram_mb.get(key).copied().unwrap_or(0),
-                vram_total_mb: 0,
-                gpu_utilization_pct: util.get(key).copied().unwrap_or(0.0).min(100.0),
-                temperature_c,
-                power_w,
-                clock_mhz,
-            }
+        .map(|(i, key)| GpuMetrics {
+            device_id: format!("win-gpu-{i}"),
+            vram_used_mb: vram_mb.get(key).copied().unwrap_or(0),
+            vram_total_mb: 0,
+            gpu_utilization_pct: util.get(key).copied().unwrap_or(0.0).min(100.0),
+            temperature_c,
+            power_w,
+            clock_mhz,
         })
         .collect()
 }
 
-/// Per-GPU temperature/power/clock reading from ADLX. Each field is a plain
-/// value (not `Option`): `adlx_readings` only emits an entry for a GPU once
-/// `current_gpu_metrics` has already succeeded for it, so unsupported
-/// individual metrics on that entry fall back to 0.0/None right there.
+/// Per-GPU temperature/power/clock reading from ADLX. `adlx_readings` emits
+/// exactly one entry per GPU in ADLX's list, whether or not
+/// `current_gpu_metrics` succeeded for it, so a failure degrades the fields
+/// to 0.0/None in place rather than shifting every later GPU's reading out
+/// of position.
 struct AdlxReading {
     temperature_c: f32,
     power_w: f32,
@@ -220,10 +239,11 @@ struct AdlxReading {
     total_vram_mb: Option<u32>,
 }
 
-/// Matches an ADLX reading to a `parse_metrics` device slot by index (ADLX's
-/// GPU list order isn't otherwise correlated to the perf-counter LUIDs here).
-/// No reading for that slot, or a 0.0/None `AdlxReading`, degrades to the
-/// same defaults `parse_metrics` used before ADLX existed.
+/// `None` (no device-identity correlation to trust, or ADLX unavailable)
+/// degrades to the same 0.0/None defaults `parse_metrics` used before ADLX
+/// existed. Callers only pass `Some` when there's exactly one real adapter
+/// and exactly one ADLX reading — the only case this file can match an ADLX
+/// reading to a device without index-based guessing.
 fn apply_adlx(reading: Option<&AdlxReading>) -> (f32, f32, Option<f32>) {
     (
         reading.map_or(0.0, |r| r.temperature_c),
@@ -233,10 +253,30 @@ fn apply_adlx(reading: Option<&AdlxReading>) -> (f32, f32, Option<f32>) {
 }
 
 /// `AdlxHelper::new()` fails cleanly (`Err`, not a panic) when
-/// `amdadlx64.dll` isn't found, so every step here can just bail to an empty
-/// Vec via `.ok()?` — same graceful-degrade shape as the rest of this file.
+/// `amdadlx64.dll` isn't found, so a total init failure can just bail to an
+/// empty Vec via `.ok()?` — same graceful-degrade shape as the rest of this
+/// file. A single GPU's metrics query failing, though, must NOT drop that
+/// GPU's slot (a `filter_map` here would shift every later GPU's reading one
+/// position to the left, silently misattributing it in `parse_metrics`'s
+/// index-based correlation) — it degrades to a zeroed `AdlxReading` instead,
+/// keeping one slot per GPU.
 #[cfg(windows)]
 fn adlx_readings() -> Vec<AdlxReading> {
+    // `adlx::helper::AdlxHelper::new()` loads `amdadlx64.dll` by bare name
+    // (`libloading::Library::new("amdadlx64.dll")`, no search-order
+    // hardening, no way to pass flags into the vendored crate). Restricting
+    // the process-wide default DLL search path to System32 closes the
+    // planted-DLL-in-PATH/cwd hijack vector for that unflagged load. Must
+    // run before the first `AdlxHelper::new()` call; `Once` makes repeated
+    // per-tick calls to this function a no-op after the first.
+    static HARDEN_DLL_SEARCH_PATH: std::sync::Once = std::sync::Once::new();
+    #[allow(unsafe_code)] // Win32 FFI
+    HARDEN_DLL_SEARCH_PATH.call_once(|| unsafe {
+        windows_sys::Win32::System::LibraryLoader::SetDefaultDllDirectories(
+            windows_sys::Win32::System::LibraryLoader::LOAD_LIBRARY_SEARCH_SYSTEM32,
+        );
+    });
+
     (|| -> Option<Vec<AdlxReading>> {
         let helper = adlx::helper::AdlxHelper::new().ok()?;
         let system = helper.system();
@@ -244,15 +284,19 @@ fn adlx_readings() -> Vec<AdlxReading> {
         let services = system.performance_monitoring_services().ok()?;
         Some(
             gpus.iter()
-                .filter_map(|gpu| {
-                    let m = services.current_gpu_metrics(&gpu).ok()?;
-                    Some((gpu, m))
-                })
-                .map(|(gpu, m)| AdlxReading {
-                    temperature_c: m.temperature().unwrap_or(0.0) as f32,
-                    power_w: m.power().unwrap_or(0.0) as f32,
-                    clock_mhz: m.clock_speed().ok().map(|c| c as f32),
-                    total_vram_mb: gpu.total_vram().ok(),
+                .map(|gpu| match services.current_gpu_metrics(&gpu) {
+                    Ok(m) => AdlxReading {
+                        temperature_c: m.temperature().unwrap_or(0.0) as f32,
+                        power_w: m.power().unwrap_or(0.0) as f32,
+                        clock_mhz: m.clock_speed().ok().map(|c| c as f32),
+                        total_vram_mb: gpu.total_vram().ok(),
+                    },
+                    Err(_) => AdlxReading {
+                        temperature_c: 0.0,
+                        power_w: 0.0,
+                        clock_mhz: None,
+                        total_vram_mb: None,
+                    },
                 })
                 .collect(),
         )
@@ -304,7 +348,10 @@ mod tests {
 
     // Real `GPU Engine` instances are per-process (`pid_NNNN_luid_...`); mix
     // in a pid prefix here so the tests actually exercise that shape.
-    const SAMPLE: &str = "UTIL\tpid_1234_luid_0x00000000_0x0000b3a4_phys_0_eng_0_engtype_3d\t12.5\nUTIL\tpid_1234_luid_0x00000000_0x0000b3a4_phys_0_eng_1_engtype_video\t4.0\nVRAM\tluid_0x00000000_0x0000b3a4_phys_0\t8589934592\nGPU\tAMD Radeon(TM) Graphics\t17179869184\t31.0.21021.1000";
+    // 3221225472 (3GiB) and 1073741824 (1GiB) are both representable in the
+    // real 32-bit `AdapterRAM` WMI field (unlike 16GiB, which would already
+    // have overflowed it).
+    const SAMPLE: &str = "UTIL\tpid_1234_luid_0x00000000_0x0000b3a4_phys_0_eng_0_engtype_3d\t12.5\nUTIL\tpid_1234_luid_0x00000000_0x0000b3a4_phys_0_eng_1_engtype_video\t4.0\nVRAM\tluid_0x00000000_0x0000b3a4_phys_0\t1073741824\nGPU\tAMD Radeon(TM) Graphics\t3221225472\t31.0.21021.1000";
 
     #[test]
     fn parses_single_adapter_metrics_with_total_ram() {
@@ -313,8 +360,8 @@ mod tests {
         let gpu = &metrics[0];
         // Max across the two engine readings, not the sum.
         assert!((gpu.gpu_utilization_pct - 12.5).abs() < 0.01);
-        assert_eq!(gpu.vram_used_mb, 8192);
-        assert_eq!(gpu.vram_total_mb, 16384);
+        assert_eq!(gpu.vram_used_mb, 1024);
+        assert_eq!(gpu.vram_total_mb, 3072);
     }
 
     #[test]
@@ -338,14 +385,44 @@ mod tests {
     #[test]
     fn multiple_processes_on_one_adapter_collapse_to_one_device() {
         // Two different pids hitting the same adapter's engines, plus a
-        // single per-adapter VRAM sample (as Windows actually reports it).
-        let sample = "UTIL\tpid_111_luid_0x00000000_0x0002ff2a_phys_0_eng_0_engtype_3d\t0.682\nUTIL\tpid_222_luid_0x00000000_0x0002ff2a_phys_0_eng_0_engtype_3d\t0.514\nVRAM\tluid_0x00000000_0x0002ff2a_phys_0\t902787072\nGPU\tAMD Radeon 780M Graphics\t1073741824\t32.0.31041.1004";
+        // *second*, unrelated real adapter. With only one real adapter (as
+        // the original fixture had), the single-real-adapter collapse rescue
+        // below would also force everything to one device, masking whether
+        // this is actually testing `device_key`'s pid-prefix stripping; with
+        // two real adapters that rescue never fires (its pattern match
+        // requires exactly one), isolating the two code paths.
+        let sample = "UTIL\tpid_111_luid_0x00000000_0x0002ff2a_phys_0_eng_0_engtype_3d\t0.682\nUTIL\tpid_222_luid_0x00000000_0x0002ff2a_phys_0_eng_0_engtype_3d\t0.514\nVRAM\tluid_0x00000000_0x0002ff2a_phys_0\t902787072\nUTIL\tluid_0x00000000_0x0000cafe_phys_0_eng_0_engtype_3d\t0.1\nVRAM\tluid_0x00000000_0x0000cafe_phys_0\t1048576\nGPU\tAMD Radeon 780M Graphics\t1073741824\t32.0.31041.1004\nGPU\tOther GPU\t4294967296\t1.0";
         let metrics = parse_metrics(sample, &[]);
-        assert_eq!(metrics.len(), 1);
+        assert_eq!(metrics.len(), 2);
         let gpu = &metrics[0];
         assert!((gpu.gpu_utilization_pct - 0.682).abs() < 0.001);
         assert_eq!(gpu.vram_used_mb, 902_787_072 / (1024 * 1024));
-        assert_eq!(gpu.vram_total_mb, 1_073_741_824 / (1024 * 1024));
+        // Multi-real-adapter case: vram_total_mb always 0, no LUID correlation.
+        assert_eq!(gpu.vram_total_mb, 0);
+    }
+
+    #[test]
+    fn single_real_adapter_sums_vram_used_across_distinct_luids() {
+        // Two *distinct* non-zero per-LUID VRAM readings on the one real
+        // adapter — unlike the phantom-LUID fixture below (0 + 0 + real),
+        // this is the only fixture where summing vram_used_mb actually
+        // differs from taking its max, so a sum->max mutation would be
+        // caught here.
+        let sample = "UTIL\tluid_0x00000000_0x0002ff2a_phys_0_eng_0_engtype_3d\t1.0\nVRAM\tluid_0x00000000_0x0002ff2a_phys_0\t536870912\nVRAM\tluid_0x00000000_0x000325a2_phys_0\t268435456\nGPU\tAMD Radeon 780M Graphics\t1073741824\t32.0.31041.1004";
+        let metrics = parse_metrics(sample, &[]);
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(metrics[0].vram_used_mb, 512 + 256);
+    }
+
+    #[test]
+    fn gpu_inventory_without_counter_samples_yields_no_metrics() {
+        // A real adapter shows up in Win32_VideoController but Get-Counter
+        // returned nothing for it (e.g. a locale where Get-Counter's
+        // -ErrorAction silently swallows a localized-path mismatch) — must
+        // not fabricate a zeroed phantom device for it.
+        let sample = "GPU\tAMD Radeon 780M Graphics\t1073741824\t32.0.31041.1004";
+        assert!(parse_metrics(sample, &[]).is_empty());
+        assert_eq!(parse_system_info(sample).physical_gpu_count, 1);
     }
 
     #[test]
@@ -364,6 +441,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn single_adapter_prefers_adlx_vram_over_wmi_truncated_value() {
         // WMI's AdapterRAM here (4294967296 = exactly 4GiB) is the classic
         // 32-bit-field overflow case; ADLX's own query reports the real
@@ -372,12 +450,15 @@ mod tests {
         let adlx = [AdlxReading {
             temperature_c: 50.0,
             power_w: 10.0,
-            clock_mhz: None,
+            clock_mhz: Some(1800.0),
             total_vram_mb: Some(8192),
         }];
         let metrics = parse_metrics(sample, &adlx);
         assert_eq!(metrics.len(), 1);
         assert_eq!(metrics[0].vram_total_mb, 8192);
+        assert_eq!(metrics[0].temperature_c, 50.0);
+        assert_eq!(metrics[0].power_w, 10.0);
+        assert_eq!(metrics[0].clock_mhz, Some(1800.0));
     }
 
     #[test]
@@ -388,34 +469,75 @@ mod tests {
         let adlx = [AdlxReading {
             temperature_c: 50.0,
             power_w: 10.0,
-            clock_mhz: None,
+            clock_mhz: Some(1800.0),
             total_vram_mb: Some(8192),
         }];
         let metrics = parse_metrics(&two_adapters, &adlx);
         assert_eq!(metrics.len(), 2);
         assert!(metrics.iter().all(|g| g.vram_total_mb == 0));
+        assert!(
+            metrics
+                .iter()
+                .all(|g| g.temperature_c == 0.0 && g.power_w == 0.0 && g.clock_mhz.is_none())
+        );
     }
 
     #[test]
+    fn multiple_adapters_never_trust_adlx_even_when_reading_count_matches_adapter_count() {
+        // Two ADLX readings for two real adapters: if `parse_metrics` ever
+        // started correlating by list position again, this is exactly the
+        // shape that would make it look like it "worked" by coincidence.
+        let two_adapters = format!(
+            "{SAMPLE}\nUTIL\tluid_0x00000000_0x0000cafe_phys_0_eng_0_engtype_3d\t1.0\nVRAM\tluid_0x00000000_0x0000cafe_phys_0\t1048576\nGPU\tOther GPU\t4294967296\t1.0"
+        );
+        let two_adlx = [
+            AdlxReading {
+                temperature_c: 50.0,
+                power_w: 10.0,
+                clock_mhz: Some(1800.0),
+                total_vram_mb: Some(8192),
+            },
+            AdlxReading {
+                temperature_c: 40.0,
+                power_w: 8.0,
+                clock_mhz: Some(1200.0),
+                total_vram_mb: Some(4096),
+            },
+        ];
+        let metrics = parse_metrics(&two_adapters, &two_adlx);
+        assert_eq!(metrics.len(), 2);
+        assert!(metrics.iter().all(|g| g.vram_total_mb == 0));
+        assert!(
+            metrics
+                .iter()
+                .all(|g| g.temperature_c == 0.0 && g.power_w == 0.0 && g.clock_mhz.is_none())
+        );
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
     fn single_adapter_falls_back_to_wmi_vram_when_adlx_reading_count_mismatches() {
         let sample = "UTIL\tluid_0x00000000_0x0000b3a4_phys_0_eng_0_engtype_3d\t1.0\nVRAM\tluid_0x00000000_0x0000b3a4_phys_0\t1048576\nGPU\tDiscrete GPU\t4294967296\t1.0";
         let two_adlx = [
             AdlxReading {
                 temperature_c: 50.0,
                 power_w: 10.0,
-                clock_mhz: None,
+                clock_mhz: Some(1800.0),
                 total_vram_mb: Some(8192),
             },
             AdlxReading {
                 temperature_c: 40.0,
                 power_w: 8.0,
-                clock_mhz: None,
+                clock_mhz: Some(1200.0),
                 total_vram_mb: Some(4096),
             },
         ];
         let metrics = parse_metrics(sample, &two_adlx);
         assert_eq!(metrics.len(), 1);
         assert_eq!(metrics[0].vram_total_mb, 4_294_967_296 / (1024 * 1024));
+        assert_eq!(metrics[0].temperature_c, 0.0);
+        assert_eq!(metrics[0].power_w, 0.0);
+        assert_eq!(metrics[0].clock_mhz, None);
     }
 
     #[test]

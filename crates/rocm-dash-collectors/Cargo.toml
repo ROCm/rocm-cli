@@ -37,3 +37,4 @@ wiremock = "0.6"
 # the DLL isn't present (no AMD driver, non-AMD GPU), same as elsewhere.
 [target.'cfg(windows)'.dependencies]
 adlx = "0.0.0-alpha.1"
+windows-sys = { version = "0.61", features = ["Win32_System_LibraryLoader"] }

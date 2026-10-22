@@ -30,6 +30,20 @@ use crate::ui::panel::{self, BoxRole};
 use crate::ui::sparkline::BrailleSparkline;
 use crate::ui::theme::Theme;
 
+/// Summed VRAM used / summed VRAM total across all GPUs, as a percentage.
+/// `total == 0` is a legitimate state (e.g. the Windows collector can't
+/// correlate a multi-adapter host to specific VRAM sizes) — must read as
+/// `0.0`, not `used / 1 * 100`.
+fn vram_used_pct(snap: &rocm_dash_core::metrics::Snapshot) -> f64 {
+    let used: u64 = snap.gpus.iter().map(|g| g.vram_used_mb).sum();
+    let total: u64 = snap.gpus.iter().map(|g| g.vram_total_mb).sum();
+    if total > 0 {
+        used as f64 / total as f64 * 100.0
+    } else {
+        0.0
+    }
+}
+
 /// History series helper: map each snapshot to a 0..=100 magnitude via `pick`.
 fn history<F: Fn(&rocm_dash_core::metrics::Snapshot) -> f64>(
     state: &AppState,
@@ -348,15 +362,7 @@ fn draw_hero_right(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         rh[0],
     );
     let latest = state.latest.as_ref();
-    let vram = latest.map_or(0.0, |s| {
-        let used: u64 = s.gpus.iter().map(|g| g.vram_used_mb).sum();
-        let total: u64 = s.gpus.iter().map(|g| g.vram_total_mb).sum();
-        if total > 0 {
-            used as f64 / total as f64 * 100.0
-        } else {
-            0.0
-        }
-    });
+    let vram = latest.map_or(0.0, vram_used_pct);
     let temp = latest.map_or(0.0, |s| {
         s.gpus
             .iter()
@@ -371,15 +377,7 @@ fn draw_hero_right(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         rh[1],
         "VRAM ",
         &format::pct(vram as f32),
-        &history(state, |s| {
-            let used: u64 = s.gpus.iter().map(|g| g.vram_used_mb).sum();
-            let total: u64 = s.gpus.iter().map(|g| g.vram_total_mb).sum();
-            if total > 0 {
-                used as f64 / total as f64 * 100.0
-            } else {
-                0.0
-            }
-        }),
+        &history(state, vram_used_pct),
         false,
         theme,
     );
@@ -690,13 +688,12 @@ mod tests {
     }
 
     #[test]
-    fn hero_vram_pct_is_zero_not_garbage_when_total_is_unknown() {
+    #[allow(clippy::float_cmp)]
+    fn vram_used_pct_is_zero_not_garbage_when_total_is_unknown() {
         // vram_total_mb == 0 is a legitimate state (e.g. the Windows
         // collector can't correlate a multi-adapter host to specific VRAM
-        // sizes) — must render "0.0%", not `used / 1 * 100`.
-        let mut s = AppState::new("t".into(), "default-dark".into());
-        s.active_tab = ActiveTab::Home;
-        s.latest = Some(Snapshot {
+        // sizes) — must read as 0.0, not `used / 1 * 100` (would be 80800.0).
+        let snap = Snapshot {
             host: SystemMetrics::default(),
             gpus: vec![GpuMetrics {
                 device_id: "GPU0".into(),
@@ -708,10 +705,8 @@ mod tests {
                 clock_mhz: None,
             }],
             ..Default::default()
-        });
-        let out = render(&s, 160, 30);
-        assert!(out.contains("0.0%"), "expected 0.0% VRAM: {out:?}");
-        assert!(!out.contains("80800"), "garbage VRAM pct leaked: {out:?}");
+        };
+        assert_eq!(vram_used_pct(&snap), 0.0);
     }
 
     #[test]

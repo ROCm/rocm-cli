@@ -649,12 +649,14 @@ impl AppState {
     /// populated once that snapshot arrives (see `push_snapshot`), so a `q`
     /// pressed in that startup window would otherwise see this return `false`
     /// even though a model actually was being served, simply because the live
-    /// state hadn't arrived yet. On a host whose dashboard-embedded daemon
-    /// client never connects at all (Windows — `client.rs`'s connect path is
-    /// unix-only), `has_received_snapshot` never flips, so the live read
-    /// stays authoritative for the entire session rather than only a brief
-    /// startup window — the registry read is cheap and re-run every time this
-    /// is called, so there is no staleness to outlive. Once a snapshot lands
+    /// state hadn't arrived yet. On Windows, `client.rs`'s `#[cfg(windows)]`
+    /// arm does connect and stream live GPU/CPU/memory every tick, but by
+    /// design never sends an instance snapshot (there's no `rocmdashd` unix
+    /// socket to source one from), so `has_received_snapshot` never flips
+    /// there either — the live read stays authoritative for the entire
+    /// session rather than only a brief startup window — the registry read is
+    /// cheap and re-run every time this is called, so there is no staleness
+    /// to outlive. Once a snapshot lands
     /// on a host where the daemon does connect, `instances` is authoritative
     /// and the read's *result* is no longer consulted for THIS question (a
     /// model that legitimately stops later in the session is still reflected
