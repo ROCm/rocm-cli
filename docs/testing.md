@@ -1610,21 +1610,20 @@ cargo test -p rocm --bin rocm driver_install
 
 `driver-install-04` in
 [driver_install.feature](../tests/e2e-cucumber/features/driver_install.feature)
-asserts the apt repo file and signing key this plan writes on a real bare-metal
-Linux host. `examine --json`'s `rocm_install_method` also renamed
-`amdgpu-install` to `repo-native` and `tarball-or-other` to
-`runfile-or-tarball`; see `examine-29` in
-[examine.feature](../tests/e2e-cucumber/features/examine.feature).
+asserts whichever plan a real bare-metal Linux host actually produces: the apt
+repo file and signing key on a release with a published
+repo.radeon.com/amdgpu suite, or the native-archive refusal below on one
+without.
 
 On Ubuntu 26.04, `repo.radeon.com` does not yet publish a matching `resolute`
 DKMS repo (the amdgpu driver ships in-tree instead), so the plan comes back
 `supported: false` and directs the user to `apt install rocm`. This arm is
 covered at the unit level by
 `driver_plan_ubuntu_2604_uses_native_archive_guidance` and its two neighbors in
-[driver_install.rs](../apps/rocm/src/driver_install.rs), but has no e2e/Gherkin
-coverage: `read_os_release()` reads
-the live `/etc/os-release` with no override, so no lane or host running a
-different Ubuntu release can reach this arm through the CLI itself.
+[driver_install.rs](../apps/rocm/src/driver_install.rs), and at the e2e level
+by `driver-install-04` above: the hosted `E2E tests` job's `ubuntu-26.04` image
+reaches this arm through the CLI itself, while the self-hosted GPU lane's
+24.04 host exercises the apt arm instead.
 
 ## /etc/os-release
 

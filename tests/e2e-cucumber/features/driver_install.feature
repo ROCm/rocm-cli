@@ -31,20 +31,36 @@ Feature: Driver installation planning
     Then the driver plan refuses rather than installing an unverified package
 
   # Every bare-metal Linux lane in this repo runs Ubuntu, but not always the
-  # same release -- the self-hosted GPU lane's real /etc/os-release reports
+  # same release -- the hosted `E2E tests` job's `ubuntu-26.04` image reports
   # 26.04 ("resolute"), which `build_driver_install_plan` routes to the
   # `ubuntu_native_archive` arm instead of the apt one (no repo.radeon.com/
   # amdgpu suite published for "resolute" yet; see the `("ubuntu", "26.04")`
-  # arm in `driver_install.rs`). `--dry-run` previews the plan without writing
-  # anything, so this is safe on a shared CI host either way: on an apt-arm
-  # release it asserts the real `apt_driver_plan` command text this binary
-  # would use to write /etc/apt/sources.list.d/amdgpu.list and import AMD's
-  # signing key, the same commands the unit fixtures in `driver_install.rs`
-  # exercise with a hand-written os-release; on 26.04 it asserts the
-  # native-archive refusal instead, so the scenario proves the CLI's actual
-  # output on whichever release the lane happens to run rather than
-  # hard-coding an apt-arm premise a lane can silently outgrow.
-  @id:driver-install-apt-repo-file-and-key-content @requires-os:linux @requires-bare-metal
+  # arm in `driver_install.rs`), while the self-hosted GPU lane's real
+  # /etc/os-release reports 24.04 and takes the apt arm. `--dry-run` previews
+  # the plan without writing anything, so this is safe on a shared CI host
+  # either way: on an apt-arm release it asserts the real `apt_driver_plan`
+  # command text this binary would use to write
+  # /etc/apt/sources.list.d/amdgpu.list and import AMD's signing key, the
+  # same commands the unit fixtures in `driver_install.rs` exercise with a
+  # hand-written os-release; on 26.04 it asserts the native-archive refusal
+  # instead, so the scenario proves the CLI's actual output on whichever
+  # release the lane happens to run rather than hard-coding an apt-arm
+  # premise a lane can silently outgrow.
+  @id:driver-install-bare-metal-host-plan @requires-os:linux @requires-bare-metal
   Scenario: driver-install-04 - Previewing the driver install on a real bare-metal host plans release-appropriate driver setup
     When the user previews driver installation on this host
     Then the driver plan matches this host's actual Ubuntu release
+
+  # The override is interpolated into privileged shell commands, so a value
+  # that fails the shell-token allow-list must refuse the plan rather than
+  # silently falling back to "latest" -- user-observable as a
+  # `supported: false` plan naming the variable. `ROCM_CLI_AMDGPU_DRIVER_VERSION`
+  # is only consulted by the Linux DKMS arm, though: `build_driver_install_plan_at`
+  # checks `is_wsl_host()` and returns the WSL/ROCDXG plan before this override is
+  # ever resolved, so a WSL host has no premise here (it would hit
+  # `wsl_rocdxg_driver_plan` regardless of the override and the scenario would
+  # fail by construction) -- same WSL-vs-bare-metal split as driver-install-04.
+  @id:driver-install-invalid-version-override-refused @requires-os:linux @requires-bare-metal
+  Scenario: driver-install-05 - An invalid ROCM_CLI_AMDGPU_DRIVER_VERSION override refuses the plan
+    When the user previews driver installation with an invalid version override
+    Then the driver plan refuses the invalid version override and plans no commands

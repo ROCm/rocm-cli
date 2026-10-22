@@ -1989,9 +1989,32 @@ fn repo_native_method_from_markers(existing: &[&str]) -> Option<(&'static str, V
 // `name` is already lowercased by the caller, so a plain suffix match is fine.
 #[allow(clippy::case_sensitive_file_extension_comparisons)]
 fn is_live_rocm_repo_file_name(name: &str) -> bool {
-    let quarantined =
-        name.ends_with(".bak") || name.ends_with(".save") || name.ends_with(".disabled");
-    !quarantined && (name.contains("rocm") || name.contains("amdgpu") || name.contains("radeon"))
+    // Allowlist the known repo-file extensions (apt's `.list`, dnf/zypper's
+    // `.repo`) rather than denylist known quarantine suffixes: quarantining
+    // appends to the name (`amdgpu.list` -> `amdgpu.list.bak`), so this also
+    // excludes any quarantine convention this file doesn't know about, and
+    // stops an unrelated file that merely mentions "rocm"/"amdgpu" in its
+    // name (a note, a log) from being swept up as a live repo file.
+    (name.ends_with(".list") || name.ends_with(".repo"))
+        && (name.contains("rocm") || name.contains("amdgpu") || name.contains("radeon"))
+}
+
+/// Full paths of live (non-quarantined) ROCm/AMDGPU repo files directly inside
+/// `dir`, split out from `probe_rocm_install` so the `.bak`/`.save`/`.disabled`
+/// skip actually gets exercised against a real directory listing, not just the
+/// pure `is_live_rocm_repo_file_name` name check in isolation. Silently empty
+/// when `dir` does not exist or is not a directory.
+fn live_rocm_repo_paths_in_dir(dir: &str) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter(|entry| {
+            is_live_rocm_repo_file_name(&entry.file_name().to_string_lossy().to_lowercase())
+        })
+        .map(|entry| entry.path().to_string_lossy().into_owned())
+        .collect()
 }
 
 fn probe_rocm_install(e: &mut Examination) {
@@ -2045,16 +2068,9 @@ fn probe_rocm_install(e: &mut Examination) {
         "/etc/yum.repos.d",
         "/etc/zypp/repos.d",
     ] {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_lowercase();
-            if is_live_rocm_repo_file_name(&name) {
-                let full = entry.path().to_string_lossy().into_owned();
-                if !e.rocm_repos_seen.contains(&full) {
-                    e.rocm_repos_seen.push(full);
-                }
+        for full in live_rocm_repo_paths_in_dir(dir) {
+            if !e.rocm_repos_seen.contains(&full) {
+                e.rocm_repos_seen.push(full);
             }
         }
     }
@@ -3327,6 +3343,29 @@ mod tests {
         assert!(!is_live_rocm_repo_file_name("amdgpu.list.save"));
         assert!(!is_live_rocm_repo_file_name("amdgpu.list.disabled"));
         assert!(!is_live_rocm_repo_file_name("unrelated.list"));
+        // Allowlisted by extension, not just denylisted by quarantine suffix:
+        // a stray file that merely mentions "rocm" isn't a repo file.
+        assert!(!is_live_rocm_repo_file_name("rocm-notes.txt"));
+    }
+
+    #[test]
+    fn live_rocm_repo_paths_in_dir_skips_a_real_bak_file_on_disk() {
+        // `is_live_rocm_repo_file_name` above only proves the name filter is
+        // correct in isolation; this drives an actual `.bak` file (the kind
+        // fix-7/fix-12 quarantine advice produces) through the directory scan
+        // `probe_rocm_install` runs, closing the gap where only the live file
+        // being listed first would still pass if the `.bak` skip were deleted.
+        let dir = tempfile::tempdir().expect("create temp dir");
+        std::fs::write(dir.path().join("amdgpu.list"), "deb ...\n").expect("write live repo");
+        std::fs::write(dir.path().join("amdgpu.list.bak"), "deb ...\n")
+            .expect("write quarantined repo");
+        std::fs::write(dir.path().join("unrelated.list"), "deb ...\n").expect("write unrelated");
+
+        let mut seen = live_rocm_repo_paths_in_dir(&dir.path().to_string_lossy());
+        seen.sort();
+
+        assert_eq!(seen.len(), 1, "seen: {seen:?}");
+        assert!(seen[0].ends_with("amdgpu.list"));
     }
 
     /// A Linux host with an AMD GPU, so `compute_status` turns on the probe

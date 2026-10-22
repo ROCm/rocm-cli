@@ -33,14 +33,35 @@ async fn preview_driver_install_on_this_host(world: &mut E2eWorld) {
 
 #[then("the driver plan matches this host's actual Ubuntu release")]
 async fn assert_driver_plan_matches_host_release(world: &mut E2eWorld) {
+    assert_eq!(world.cli_rc, Some(0), "driver dry-run should succeed");
     let output = world.cli_output.as_ref().expect("no driver plan output");
-    // Most bare-metal lanes are on an Ubuntu release with a published
-    // repo.radeon.com/amdgpu suite and take the apt-repo-file plan below, but
-    // the self-hosted GPU lane's real host reports Ubuntu 26.04 ("resolute"),
-    // which has none yet and takes `ubuntu_native_archive` instead -- see the
-    // `("ubuntu", "26.04")` arm in `driver_install.rs`. Assert whichever the
-    // real host actually produced rather than hard-coding one release.
-    if output.contains("policy: ubuntu_native_archive") {
+
+    // Derived from the host's own `/etc/os-release`, not from `output` --
+    // asserting against the very thing being checked would let a change that
+    // breaks the arm-selection logic pass by construction. The hosted
+    // `ubuntu-26.04` E2E image reports 26.04 ("resolute"), which has no
+    // published repo.radeon.com/amdgpu suite yet and takes
+    // `ubuntu_native_archive`; the self-hosted GPU lane reports 24.04 and
+    // takes the apt arm. See the `("ubuntu", "26.04")` arm in
+    // `driver_install.rs`.
+    let os_release_text =
+        rocm_core::hardware_root::read_os_release(rocm_core::hardware_root::identity_path_for_str)
+            .text()
+            .to_owned();
+    let Ok(os_release) = rocm_core::os_release::parse(&os_release_text) else {
+        panic!("host's /etc/os-release is unreadable:\n{output}");
+    };
+    if os_release.get("ID").map(String::as_str) != Some("ubuntu") {
+        // Every bare-metal Linux lane in this repo runs Ubuntu today, but
+        // this scenario's premise is Ubuntu specifically (every assertion
+        // below hard-codes Ubuntu's apt/native-archive command text), so a
+        // future non-Ubuntu bare-metal lane has no premise here rather than
+        // failing against text it was never meant to produce.
+        return;
+    }
+
+    if os_release.get("VERSION_ID").map(String::as_str) == Some("26.04") {
+        assert!(output.contains("policy: ubuntu_native_archive"), "{output}");
         assert!(output.contains("supported: false"), "{output}");
         assert!(
             output.contains("ships ROCm natively via the standard archive"),
@@ -198,4 +219,35 @@ async fn assert_driver_plan_refuses_unverified(world: &mut E2eWorld) {
         !output.contains("apt-get install"),
         "a refusal must not offer install commands:\n{output}"
     );
+}
+
+#[when("the user previews driver installation with an invalid version override")]
+async fn preview_driver_install_invalid_override(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm_with_env(
+        world,
+        &["install", "driver", "--dkms", "--dry-run"],
+        &[(
+            "ROCM_CLI_AMDGPU_DRIVER_VERSION",
+            "'; touch /tmp/pwned; echo '",
+        )],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the driver plan refuses the invalid version override and plans no commands")]
+async fn assert_driver_plan_refuses_invalid_override(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no driver plan output");
+    assert!(
+        output.contains("policy: invalid_driver_version_override"),
+        "{output}"
+    );
+    assert!(output.contains("supported: false"), "{output}");
+    assert!(output.contains("mutating: false"), "{output}");
+    assert!(
+        output.contains("ROCM_CLI_AMDGPU_DRIVER_VERSION"),
+        "{output}"
+    );
+    assert!(output.contains("execution_commands: <none>"), "{output}");
 }

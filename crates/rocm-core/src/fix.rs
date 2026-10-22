@@ -421,9 +421,9 @@ const RECIPES: &[FixRecipe] = &[
         needs_reboot: false,
         needs_relogin: false,
         verify: "Run only the line matching your package manager:\n\
-                 sudo apt update 2>&1 | tail -n 20      # Debian/Ubuntu\n\
-                 sudo dnf clean all 2>&1 | tail -n 20   # RHEL/Fedora/Rocky/Alma/Oracle\n\
-                 sudo zypper refresh 2>&1 | tail -n 20  # SLES/openSUSE",
+                 bash -c 'set -o pipefail; sudo apt update 2>&1 | tail -n 20'      # Debian/Ubuntu\n\
+                 bash -c 'set -o pipefail; sudo dnf clean all 2>&1 | tail -n 20'   # RHEL/Fedora/Rocky/Alma/Oracle\n\
+                 bash -c 'set -o pipefail; sudo zypper refresh 2>&1 | tail -n 20'  # SLES/openSUSE",
         notes: &[],
         doc_url: None,
         applies_on: PRINT_ON_LINUX,
@@ -544,10 +544,13 @@ const RECIPES: &[FixRecipe] = &[
         needs_reboot: true,
         needs_relogin: false,
         // See the matching comment on this fix's `verify` in diagnose.rs:
-        // the status column (`^ii`) must be checked, not just that a
-        // rocm/amdgpu package name appears, or a half-configured package
-        // (this fix's own target symptom) passes before any remediation.
-        verify: "(dpkg -l 2>/dev/null | grep -E '^ii' | grep -qE 'rocm|amdgpu' || rpm -qa 2>/dev/null | grep -qE 'rocm|amdgpu') && rocminfo | head -n 5",
+        // must query the targeted amdgpu-dkms package's installed status
+        // (not a bare rocm/amdgpu name grep), confirm dkms reports the
+        // module built, and check rocminfo's own exit code directly.
+        verify: "(dpkg-query -W -f='${Status}' amdgpu-dkms 2>/dev/null | grep -q 'install ok installed' \
+                 || rpm -q amdgpu-dkms >/dev/null 2>&1) \
+                 && dkms status amdgpu 2>/dev/null | grep -q installed \
+                 && rocminfo >/dev/null 2>&1",
         notes: &[
             "If the purge/remove step warns it will take unrelated packages with it, stop and resolve those by hand before continuing.",
         ],

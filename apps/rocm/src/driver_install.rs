@@ -692,7 +692,7 @@ fn wsl_rocdxg_driver_plan(escalation: PrivilegeEscalation) -> DriverInstallPlan 
     if !rocdxg_version_is_well_formed(&version) {
         return wsl_rocdxg_refusal_plan(
             // The rejected value is still rendered into the plan's
-            // `repo_version:` line so the user can see what was refused — but
+            // `repo_version_expr:` line so the user can see what was refused — but
             // that line is part of a plan a human reads to decide, and a raw
             // value containing a newline could forge further lines in it. The
             // debug form escapes newlines and makes trailing space visible,
@@ -835,6 +835,27 @@ fn unreadable_os_release_plan(reason: String, repo_version_expr: String) -> Driv
     }
 }
 
+/// The refusal plan `resolve_repo_version_expr` returns for any
+/// `ROCM_CLI_AMDGPU_DRIVER_VERSION` value that cannot be safely interpolated
+/// into a shell command -- whether it failed [`is_safe_shell_token`] or could
+/// not even be decoded as UTF-8.
+fn invalid_driver_version_override_plan(value_debug: String) -> DriverInstallPlan {
+    DriverInstallPlan {
+        supported: false,
+        mutating: false,
+        policy: "invalid_driver_version_override".to_owned(),
+        os_id: String::new(),
+        version_id: String::new(),
+        codename: String::new(),
+        repo_version_expr: value_debug,
+        reason: "ROCM_CLI_AMDGPU_DRIVER_VERSION is not a well-formed amdgpu driver release. It is interpolated into privileged shell commands, so only letters, digits, and `. _ -` are accepted.".to_owned(),
+        preflight_checks: Vec::new(),
+        commands: Vec::new(),
+        checks: vec!["rocm examine".to_owned()],
+        reboot_required: false,
+    }
+}
+
 /// Resolves and validates `ROCM_CLI_AMDGPU_DRIVER_VERSION`, shared between
 /// [`build_driver_install_plan_at`] (reached whenever the os-release text
 /// itself was readable) and [`build_driver_install_plan_read`]'s `Unreadable`
@@ -858,27 +879,29 @@ fn resolve_repo_version_expr() -> Result<String, Box<DriverInstallPlan>> {
         // optional override in this file (`resolve_rocdxg_verification`,
         // `resolve_shell_default_template`): a blank env var is how an env
         // file clears an override, not a request to refuse the plan.
-        Err(_) => Ok("latest".to_owned()),
+        Err(std::env::VarError::NotPresent) => Ok("latest".to_owned()),
         Ok(v) if v.is_empty() => Ok("latest".to_owned()),
         Ok(v) if is_safe_shell_token(&v) => Ok(v),
-        Ok(v) => Err(Box::new(DriverInstallPlan {
-            supported: false,
-            mutating: false,
-            policy: "invalid_driver_version_override".to_owned(),
-            os_id: String::new(),
-            version_id: String::new(),
-            codename: String::new(),
-            repo_version_expr: format!("{v:?}"),
-            reason: "ROCM_CLI_AMDGPU_DRIVER_VERSION is not a well-formed amdgpu driver release. It is interpolated into privileged shell commands, so only letters, digits, and `. _ -` are accepted.".to_owned(),
-            preflight_checks: Vec::new(),
-            commands: Vec::new(),
-            checks: vec!["rocm examine".to_owned()],
-            reboot_required: false,
-        })),
+        Ok(v) => Err(Box::new(invalid_driver_version_override_plan(format!(
+            "{v:?}"
+        )))),
+        // A non-UTF-8 value can never pass `is_safe_shell_token` anyway, but
+        // routing it through the same refusal as a malformed value (instead
+        // of folding it into the NotPresent/empty "unset" case) keeps the
+        // same "refuse, don't silently fall back to latest" guarantee for a
+        // user who set this to something `env::var` cannot even decode.
+        Err(std::env::VarError::NotUnicode(v)) => {
+            // Debug, not `v.display()`, is deliberate here: this is the one
+            // value worth escaping rather than rendering lossily, since the
+            // whole reason it reached this arm is that it isn't valid UTF-8.
+            #[allow(clippy::unnecessary_debug_formatting)]
+            let value_debug = format!("{v:?}");
+            Err(Box::new(invalid_driver_version_override_plan(value_debug)))
+        }
     }
 }
 
-/// [`build_driver_install_plan`], naming `os_release_path` instead of always
+/// [`build_driver_install_plan_read`], naming `os_release_path` instead of always
 /// `/etc/os-release` in an unreadable-line message.
 fn build_driver_install_plan_at(
     examine: &ExamineSummary,
@@ -989,15 +1012,12 @@ fn build_driver_install_plan_at(
         // to apt_driver_plan(..., true) once it exists, the same way
         // 22.04/24.04 are handled.
         //
-        // This arm IS reachable through the CLI on a real host -- this PR's
-        // own self-hosted bare-metal CI runner's `/etc/os-release` reports
-        // Ubuntu 26.04, which is exactly how `driver-install-04` in
-        // `driver_install.feature` caught this arm silently taking over that
-        // scenario's apt-plan premise mid-review. That scenario now asserts
-        // whichever arm the real host actually falls into, so this one has
-        // e2e coverage too, alongside the unit fixture in
-        // `driver_plan_ubuntu_2604_uses_native_archive_guidance` and its two
-        // neighbors below.
+        // This arm IS reachable through the CLI on a real host: the hosted
+        // `E2E tests` job's `ubuntu-26.04` image runs `driver-install-04` in
+        // `driver_install.feature`, which asserts whichever arm the real host
+        // actually falls into, so this one has e2e coverage too, alongside
+        // the unit fixture in `driver_plan_ubuntu_2604_uses_native_archive_guidance`
+        // and its two neighbors below.
         ("ubuntu", "26.04") => {
             let sudo = escalation.prefix();
             DriverInstallPlan {
@@ -2140,6 +2160,34 @@ mod tests {
         );
     }
 
+    /// The unreadable-os-release branch resolves `repo_version_expr` via the
+    /// same [`resolve_repo_version_expr`] call the normal path uses, before
+    /// it ever builds an `unreadable_os_release_plan`. A malformed override
+    /// must still be refused here, not silently dropped because the distro
+    /// itself could not be identified.
+    #[test]
+    fn an_unreadable_os_release_still_refuses_a_malformed_version_override() {
+        let mut env = ScopedTestEnv::with_amd_overrides_cleared();
+        env.set(
+            "ROCM_CLI_AMDGPU_DRIVER_VERSION",
+            "'; touch /tmp/pwned; echo '",
+        );
+        let read = rocm_core::hardware_root::OsRelease::Unreadable {
+            path: "/usr/lib/os-release",
+            error: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied"),
+        };
+        let plan = build_driver_install_plan_read(
+            &test_examine("linux", false),
+            &read,
+            true,
+            PrivilegeEscalation::Sudo,
+        );
+        assert!(!plan.supported);
+        assert_eq!(plan.policy, "invalid_driver_version_override");
+        assert!(plan.reason.contains("ROCM_CLI_AMDGPU_DRIVER_VERSION"));
+        assert!(plan.commands.is_empty());
+    }
+
     /// The same malformed line as
     /// [`an_unreadable_os_release_names_its_line_and_plans_nothing`], but read
     /// through the fallback path: the reason must name `/usr/lib/os-release`,
@@ -2252,6 +2300,7 @@ mod tests {
         // before any driver work. This asserts the ABSENCE of `sudo` across every
         // distro rather than checking known commands one by one — a templating
         // site missed on some distro fails here instead of shipping.
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
         for (label, os_release) in dkms_planning_os_releases() {
             let commands = plan_commands(os_release, PrivilegeEscalation::AlreadyRoot);
             assert!(
@@ -2273,6 +2322,7 @@ mod tests {
         // it when a normal user runs the same plan. Verify-phase commands are
         // read-only probes and are deliberately unprivileged, so only the
         // mutating phases are required to escalate.
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
         for (label, os_release) in dkms_planning_os_releases() {
             let plan = build_driver_install_plan_read(
                 &test_examine("linux", false),
@@ -2306,6 +2356,7 @@ mod tests {
         // `sudo` also appears mid-pipeline (`| sudo tee`, `| sudo gpg`), which a
         // naive "strip a leading prefix" fix would miss. The pipeline must survive
         // with the escalation removed from the right-hand side only.
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
         let ubuntu = "ID=ubuntu\nVERSION_ID=\"24.04\"\nVERSION_CODENAME=noble\n";
         let commands = plan_commands(ubuntu, PrivilegeEscalation::AlreadyRoot);
         assert!(
@@ -2327,6 +2378,7 @@ mod tests {
         // `execution_commands()` is what lands in state.json. It must agree with
         // the escalation the plan was built under, or the recorded history
         // describes commands that never ran.
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
         let ubuntu = "ID=ubuntu\nVERSION_ID=\"24.04\"\nVERSION_CODENAME=noble\n";
         let as_root = build_driver_install_plan_read(
             &test_examine("linux", false),
@@ -2361,6 +2413,7 @@ mod tests {
         // The preflight claimed `sudo` must be installed even when the plan no
         // longer uses it — the same contradiction the bug report called out
         // between the stated preconditions and what execution actually did.
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
         for (label, os_release) in dkms_planning_os_releases() {
             let as_root = build_driver_install_plan_read(
                 &test_examine("linux", false),
@@ -2552,6 +2605,7 @@ VERSION_CODENAME=noble
 
     #[test]
     fn driver_plan_executor_defers_verify_when_reboot_is_required() -> Result<()> {
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
         let plan = build_driver_install_plan_read(
             &test_examine("linux", false),
             &os_release_found("ID=ubuntu\nVERSION_ID=\"24.04\"\nVERSION_CODENAME=noble\n"),
@@ -2726,6 +2780,9 @@ VERSION_CODENAME=resolute
         assert!(rendered.contains("sudo apt install rocm"));
         assert!(!rendered.contains("amdgpu-dkms"));
         assert!(plan.commands.is_empty());
+        // The kernel driver ships in-tree on 26.04, so this arm must not
+        // claim a reboot is needed for `apt install rocm` (userspace only).
+        assert!(!plan.reboot_required);
         // `checks` renders as `post_reboot_checks:` and must hold verification
         // targets only -- the mutating install guidance belongs in `reason`.
         assert!(
@@ -2782,6 +2839,38 @@ VERSION_ID="26.04"
         assert_eq!(plan.policy, "ubuntu_native_archive");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn driver_plan_rejects_a_non_utf8_version_override() {
+        // `std::env::var` reports a non-UTF-8 value as `Err(VarError::NotUnicode)`,
+        // which `resolve_repo_version_expr` must not fold into the
+        // `NotPresent`/empty "unset" case -- that would silently use "latest"
+        // for a user who explicitly set this to something.
+        use std::os::unix::ffi::OsStrExt;
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
+        let invalid = std::ffi::OsStr::from_bytes(&[0x66, 0xFF, 0x66]);
+        #[allow(unsafe_code)] // std::env::set_var is unsafe in edition 2024
+        unsafe {
+            std::env::set_var("ROCM_CLI_AMDGPU_DRIVER_VERSION", invalid);
+        }
+        let os_release = r#"
+ID=ubuntu
+VERSION_ID="24.04"
+VERSION_CODENAME=noble
+"#;
+        let plan = build_driver_install_plan_read(
+            &test_examine("linux", false),
+            &os_release_found(os_release),
+            true,
+            PrivilegeEscalation::Sudo,
+        );
+
+        assert!(!plan.supported);
+        assert_eq!(plan.policy, "invalid_driver_version_override");
+        assert!(plan.reason.contains("ROCM_CLI_AMDGPU_DRIVER_VERSION"));
+        assert!(plan.commands.is_empty());
+    }
+
     #[test]
     fn driver_plan_rejects_shell_metacharacters_in_version_override() {
         let mut env = ScopedTestEnv::with_amd_overrides_cleared();
@@ -2804,12 +2893,35 @@ VERSION_CODENAME=noble
         assert!(!plan.supported);
         assert_eq!(plan.policy, "invalid_driver_version_override");
         assert!(plan.reason.contains("ROCM_CLI_AMDGPU_DRIVER_VERSION"));
+        // Already proves no command can contain "pwned": a vacuous check over
+        // commands would be redundant with this.
         assert!(plan.commands.is_empty());
-        assert!(
-            plan.commands
-                .iter()
-                .all(|command| !command.command.contains("pwned"))
+    }
+
+    #[test]
+    fn driver_plan_rejects_a_space_free_shell_injection_payload() {
+        // The metacharacter test above uses a payload full of spaces, which
+        // `is_safe_shell_token` already rejects on its own -- so it proves
+        // nothing about whether `$`, backticks, or `()` are actually in the
+        // denylist. Use a payload with no spaces at all so the rejection can
+        // only come from the metacharacters themselves.
+        let mut env = ScopedTestEnv::with_amd_overrides_cleared();
+        env.set("ROCM_CLI_AMDGPU_DRIVER_VERSION", "$(id)");
+        let os_release = r#"
+ID=ubuntu
+VERSION_ID="24.04"
+VERSION_CODENAME=noble
+"#;
+        let plan = build_driver_install_plan_read(
+            &test_examine("linux", false),
+            &os_release_found(os_release),
+            true,
+            PrivilegeEscalation::Sudo,
         );
+
+        assert!(!plan.supported);
+        assert_eq!(plan.policy, "invalid_driver_version_override");
+        assert!(plan.commands.is_empty());
     }
 
     #[test]
@@ -2897,6 +3009,94 @@ VERSION_CODENAME=noble
             plan.commands
                 .iter()
                 .all(|command| !command.command.contains("pwned"))
+        );
+    }
+
+    #[test]
+    fn driver_plan_falls_back_on_a_space_free_hostile_codename() {
+        // The payload above is full of spaces, which `is_safe_shell_token`
+        // already rejects on its own -- it proves nothing about whether the
+        // metacharacters themselves are denylisted. Use a space-free payload
+        // so rejection can only come from the metacharacters.
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
+        // Single-quoted so the os-release parser (which refuses an unquoted
+        // `$`/`(`/`)` outright, making the whole file unreadable rather than
+        // just this field) accepts the line and hands `$(id)` to
+        // `is_safe_shell_token` to reject on its own merits.
+        let os_release = r#"
+ID=ubuntu
+VERSION_ID="24.04"
+VERSION_CODENAME='$(id)'
+"#;
+        let plan = build_driver_install_plan_read(
+            &test_examine("linux", false),
+            &os_release_found(os_release),
+            true,
+            PrivilegeEscalation::Sudo,
+        );
+
+        assert_eq!(plan.codename, "noble");
+        assert!(
+            plan.commands
+                .iter()
+                .all(|command| !command.command.contains("$(id)"))
+        );
+    }
+
+    #[test]
+    fn driver_plan_falls_back_on_a_space_free_malformed_version_id() {
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
+        // Single-quoted for the same reason as the codename test above: a
+        // bare/double-quoted `$(id)` makes the whole os-release file
+        // unreadable, which would pass this test's assertions (empty
+        // version_id, unsupported) without ever reaching `is_safe_shell_token`.
+        let os_release = r"
+ID=ubuntu
+VERSION_ID='$(id)'
+VERSION_CODENAME=noble
+";
+        let plan = build_driver_install_plan_read(
+            &test_examine("linux", false),
+            &os_release_found(os_release),
+            true,
+            PrivilegeEscalation::Sudo,
+        );
+
+        assert_eq!(plan.version_id, "");
+        assert!(!plan.supported);
+        assert!(
+            plan.commands
+                .iter()
+                .all(|command| !command.command.contains("$(id)"))
+        );
+    }
+
+    #[test]
+    fn driver_plan_falls_back_on_a_space_free_hostile_os_id() {
+        // Closes the gap where `os_id`'s `is_safe_shell_token` filter (the
+        // `field("ID").filter(...)` call above `codename_for_version`) had no
+        // dedicated test at all: deleting that filter left every other test
+        // green, since none of them feed a hostile `ID` value.
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
+        let os_release = r#"
+ID='$(id)'
+VERSION_ID="24.04"
+VERSION_CODENAME=noble
+"#;
+        let plan = build_driver_install_plan_read(
+            &test_examine("linux", false),
+            &os_release_found(os_release),
+            true,
+            PrivilegeEscalation::Sudo,
+        );
+
+        assert_eq!(plan.os_id, "");
+        assert_eq!(plan.policy, "unsupported_linux_dkms_plan");
+        assert!(!plan.supported);
+        assert!(
+            plan.commands
+                .iter()
+                .all(|command| !command.command.contains("$(id)"))
         );
     }
 
@@ -3153,6 +3353,9 @@ VERSION_ID="10.1"
         assert!(plan.supported);
         assert!(rendered.contains("approval: not required"));
         assert!(rendered.contains("kernel-uek-devel-$(uname -r)"));
+        // `rpm --import` is pushed once after the distro-specific match, not
+        // inside the RHEL/Generic arm -- Oracle's flow must get it too.
+        assert!(rendered.contains("sudo rpm --import https://repo.radeon.com/rocm/rocm.gpg.key"));
         assert!(
             rendered.contains("baseurl=https://repo.radeon.com/amdgpu/latest/el/10/main/x86_64")
         );
