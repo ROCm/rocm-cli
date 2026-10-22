@@ -6,7 +6,7 @@ Feature: Model catalog listing
   # so exercising `model --verbose` covers the epic's "rocm model or rocm
   # models" wording either way.
   @id:model-catalog-lists-aim-recipe
-  Scenario: Discovering available AIM images via rocm model
+  Scenario: model-catalog-01 - Discovering available AIM images via rocm model
     When the user asks for the model catalog in verbose detail
     Then the catalog lists an AIM engine recipe
 
@@ -18,6 +18,6 @@ Feature: Model catalog listing
   # probe rather than hardcoding "unavailable", so it stays honest on a host
   # (e.g. the Strix Halo AIM runner) where Docker really is reachable.
   @id:model-catalog-flags-aim-unavailable-without-docker
-  Scenario: Host cannot run a listed AIM image
+  Scenario: model-catalog-02 - Host cannot run a listed AIM image
     When the user asks for the model catalog in verbose detail
     Then the catalog's AIM entry matches this host's real Docker availability

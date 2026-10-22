@@ -672,7 +672,7 @@ fn parse_engines_list(text: &str) -> Vec<String> {
             continue;
         }
         let first = trimmed.split_whitespace().next().unwrap_or("");
-        if matches!(first, "lemonade" | "vllm") && !engines.iter().any(|e| e == first) {
+        if matches!(first, "lemonade" | "vllm" | "aim") && !engines.iter().any(|e| e == first) {
             engines.push(first.to_owned());
         }
     }
