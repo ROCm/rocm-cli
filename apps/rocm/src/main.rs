@@ -4,6 +4,7 @@
 
 #[cfg(test)]
 mod advised_commands;
+mod api_docs_link;
 /// Shared archive generator and filesystem oracle for the extraction property
 /// tests in `comfyui` and `therock`.
 #[cfg(all(test, unix))]
@@ -506,8 +507,8 @@ rocm model --verbose"
     ///
     /// Picks an engine and ROCm runtime automatically unless overridden. By default the
     /// server runs as a managed background service and prints a deployment summary
-    /// (status, endpoint, model, and smoke-test metrics); use --verbose to stream engine
-    /// logs in this terminal instead. When streaming, press Ctrl-D to detach and leave the
+    /// (status, endpoint, API docs link, model, and smoke-test metrics); use --verbose to
+    /// stream engine logs in this terminal instead. When streaming, press Ctrl-D to detach and leave the
     /// server running, or Ctrl-C to stop it. Inspect or stop servers later with
     /// `rocm services`.
     ///
@@ -681,6 +682,9 @@ rocm logs --search error timeout")]
     ///   - collects GPU thermal/VRAM metrics every 60s for the TUI dashboard
     ///   - listens on a local webhook port for automation events from other
     ///     `rocm` commands
+    ///   - serves API docs for running model servers on 127.0.0.1 (port
+    ///     11430 by default; `api_docs` in config.json), forwarding their
+    ///     "Try it out" requests to the server
     ///
     /// It is normally started on demand by `rocm automations enable` and
     /// `rocm serve --managed`, so you rarely need to launch it yourself. Run it

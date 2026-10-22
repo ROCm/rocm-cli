@@ -431,6 +431,13 @@ pub(crate) fn render_services_text(paths: &AppPaths, all: bool) -> Result<String
         return Ok(output);
     }
 
+    let docs_links = crate::api_docs_link::service_docs_links(
+        paths,
+        records
+            .iter()
+            .filter(|record| managed_service_is_live(record))
+            .map(|record| record.service_id.as_str()),
+    );
     let _ = writeln!(output, "Servers");
     for record in records {
         let _ = writeln!(output, "- {}", record.service_id);
@@ -438,6 +445,12 @@ pub(crate) fn render_services_text(paths: &AppPaths, all: bool) -> Result<String
         let _ = writeln!(output, "  engine: {}", record.engine);
         let _ = writeln!(output, "  model: {}", record.model_ref);
         let _ = writeln!(output, "  endpoint: {}", record.endpoint_url);
+        if let Some((_, link)) = docs_links
+            .iter()
+            .find(|(service_id, _)| *service_id == record.service_id)
+        {
+            let _ = writeln!(output, "  docs: {link}");
+        }
         let _ = writeln!(output, "  logs: rocm services logs {}", record.service_id);
         if matches!(
             record.status.as_str(),

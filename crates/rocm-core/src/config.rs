@@ -69,6 +69,66 @@ pub struct AutomationsConfig {
     pub watchers: BTreeMap<String, WatcherUserConfig>,
 }
 
+/// Port the background daemon serves API docs on when `config.json` sets none.
+/// Kept clear of `DEFAULT_LOCAL_PORT` and the ports above it that consecutive
+/// `rocm serve` launches pick.
+pub const DEFAULT_API_DOCS_PORT: u16 = 11_430;
+
+/// API docs for running model servers, served by the background daemon on
+/// loopback. Described in: README.md's API docs section, docs/testing.md and
+/// docs/manual-testing.md.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApiDocsConfig {
+    #[serde(default = "default_api_docs_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_api_docs_port")]
+    pub port: u16,
+}
+
+impl Default for ApiDocsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_api_docs_enabled(),
+            port: default_api_docs_port(),
+        }
+    }
+}
+
+const fn default_api_docs_enabled() -> bool {
+    true
+}
+
+const fn default_api_docs_port() -> u16 {
+    DEFAULT_API_DOCS_PORT
+}
+
+impl ApiDocsConfig {
+    /// The port the docs are served on, or `None` when they are off: turned off
+    /// in `config.json`, or set to port 0, which would bind a random port no
+    /// link could name.
+    #[must_use]
+    pub const fn served_port(&self) -> Option<u16> {
+        if self.enabled && self.port != 0 {
+            Some(self.port)
+        } else {
+            None
+        }
+    }
+
+    /// The docs server's root: `GET` lists every running server.
+    #[must_use]
+    pub fn base_url(&self) -> String {
+        crate::format_http_base_url(crate::DEFAULT_LOCAL_HOST, self.port)
+    }
+
+    /// Swagger UI for one running server. The trailing slash is part of the
+    /// address: the page loads its assets relative to it.
+    #[must_use]
+    pub fn service_docs_url(&self, service_id: &str) -> String {
+        format!("{}/services/{service_id}/docs/", self.base_url())
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProviderUserConfig {
     #[serde(default)]
@@ -210,6 +270,8 @@ pub struct RocmCliConfig {
     pub engines: BTreeMap<String, EngineUserConfig>,
     #[serde(default)]
     pub automations: AutomationsConfig,
+    #[serde(default)]
+    pub api_docs: ApiDocsConfig,
     /// rocm-dash telemetry/dashboard knobs. Nested as a sub-config
     /// so it never collides with the rocm-cli `telemetry` analytics policy on
     /// rebase. Every field defaults, so the section is fully optional.

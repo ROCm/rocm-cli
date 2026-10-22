@@ -13,6 +13,40 @@ use tokio::time::{self, MissedTickBehavior};
 
 const WATCHER_TICK_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Start the API docs server for running model servers, unless `config.json`
+/// turns it off. A taken port leaves docs off and is recorded as an
+/// `api_docs_unavailable` automation event; the daemon's own work carries on
+/// either way.
+pub(crate) fn start_api_docs(
+    paths: &AppPaths,
+    config: &RocmCliConfig,
+    state: &mut AutomationRuntimeState,
+) -> Result<Option<crate::api_docs::ApiDocsServer>> {
+    let Some(port) = config.api_docs.served_port() else {
+        println!("  api_docs: disabled");
+        return Ok(None);
+    };
+    match crate::api_docs::start_api_docs_server(paths.clone(), port) {
+        Ok(server) => {
+            println!("  api_docs: {}", server.base_url);
+            Ok(Some(server))
+        }
+        Err(error) => {
+            println!("  api_docs: off ({error:#})");
+            crate::persistence::record_event(
+                paths,
+                state,
+                "rocmd",
+                "warn",
+                "api_docs_unavailable",
+                &format!("API docs for running model servers are off: {error:#}"),
+                None,
+            )?;
+            Ok(None)
+        }
+    }
+}
+
 pub(crate) async fn run_daemon(
     paths: &AppPaths,
     automations_enabled: bool,
@@ -77,6 +111,10 @@ pub(crate) async fn run_daemon(
     }
 
     paths.ensure()?;
+    // Before the first state write: that write is what tells `rocm serve` a
+    // helper is already running, and a serve that reads it then probes the
+    // docs once, without waiting for them.
+    let api_docs = start_api_docs(paths, &config, &mut state)?;
     state.write(paths)?;
     crate::persistence::record_event(
         paths,
@@ -179,6 +217,9 @@ pub(crate) async fn run_daemon(
     if let Some(task) = local_webhook_task {
         task.abort();
     }
+    if let Some(server) = api_docs {
+        server.stop();
+    }
     Ok(())
 }
 
@@ -248,7 +289,7 @@ pub(crate) fn print_status(paths: &AppPaths) -> Result<()> {
     Ok(())
 }
 
-fn build_runtime_state(
+pub(crate) fn build_runtime_state(
     config: &RocmCliConfig,
     automations_enabled: bool,
 ) -> AutomationRuntimeState {

@@ -84,12 +84,7 @@ pub(crate) fn endpoint_response(request: EndpointRequest) -> Result<EndpointResp
     Ok(EndpointResponse {
         endpoint_url,
         api_style: "openai".to_owned(),
-        supported_routes: vec![
-            "/health".to_owned(),
-            "/v1/models".to_owned(),
-            "/v1/chat/completions".to_owned(),
-            "/v1/completions".to_owned(),
-        ],
+        supported_routes: rocm_engine_protocol::chat_supported_routes("/health"),
     })
 }
 

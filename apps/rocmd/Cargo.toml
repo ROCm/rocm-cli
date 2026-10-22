@@ -16,6 +16,10 @@ e2e-test-hooks = ["rocm-core/e2e-test-hooks"]
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
+# Forwards the API docs' try-it requests to the model server. Plain HTTP to
+# loopback only, so no TLS stack; `stream` relays streamed completions as
+# they arrive.
+reqwest = { version = "0.12", default-features = false, features = ["stream"] }
 clap.workspace = true
 rocm-core = { path = "../../crates/rocm-core" }
 rocm-engine-protocol = { path = "../../crates/rocm-engine-protocol" }
@@ -24,6 +28,11 @@ serde_json.workspace = true
 sha2 = "0.10"
 tokio.workspace = true
 ureq = { version = "2.12", features = ["native-certs"] }
+# API docs for running model servers: OpenAPI model + Swagger UI. `vendored`
+# compiles the Swagger UI assets in, so the build downloads nothing and the
+# page works offline.
+utoipa = "6"
+utoipa-swagger-ui = { version = "10", default-features = false, features = ["vendored"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
