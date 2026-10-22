@@ -2,7 +2,13 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Live Windows GPU metrics via OS performance counters, no AMD tool needed.
+//! Live Windows GPU metrics via OS performance counters, no AMD tool needed
+//! for utilization/VRAM.
+//!
+//! Temperature, power, and clock speed additionally use ADLX (AMD Device
+//! Library eXtra, via the `adlx` crate) when the AMD driver's bundled
+//! `amdadlx64.dll` is present; absence (no AMD driver, non-AMD GPU) degrades
+//! those three fields to 0.0/None rather than failing the whole snapshot.
 //!
 //! Reads the `GPU Engine`/`GPU Adapter Memory` categories — the same
 //! WDDM/DXGK-backed source Task Manager's GPU tab reads. Mirrors
@@ -142,6 +148,7 @@ fn parse_metrics(raw: &str) -> Vec<GpuMetrics> {
         }
     }
 
+    let adlx = adlx_readings();
     let adapters = parse_adapters(raw);
     if let [adapter] = adapters.as_slice() {
         if order.is_empty() {
@@ -149,30 +156,85 @@ fn parse_metrics(raw: &str) -> Vec<GpuMetrics> {
         }
         let vram_used_mb: u64 = vram_mb.values().sum();
         let gpu_utilization_pct = util.values().copied().fold(0.0f32, f32::max).min(100.0);
+        let (temperature_c, power_w, clock_mhz) = apply_adlx(adlx.first());
         return vec![GpuMetrics {
             device_id: "win-gpu-0".to_string(),
             vram_used_mb,
             vram_total_mb: adapter.ram_bytes / (1024 * 1024),
             gpu_utilization_pct,
-            temperature_c: 0.0,
-            power_w: 0.0,
-            clock_mhz: None,
+            temperature_c,
+            power_w,
+            clock_mhz,
         }];
     }
 
     order
         .into_iter()
         .enumerate()
-        .map(|(i, key)| GpuMetrics {
-            device_id: format!("win-gpu-{i}"),
-            vram_used_mb: vram_mb.get(key).copied().unwrap_or(0),
-            vram_total_mb: 0,
-            gpu_utilization_pct: util.get(key).copied().unwrap_or(0.0).min(100.0),
-            temperature_c: 0.0,
-            power_w: 0.0,
-            clock_mhz: None,
+        .map(|(i, key)| {
+            let (temperature_c, power_w, clock_mhz) = apply_adlx(adlx.get(i));
+            GpuMetrics {
+                device_id: format!("win-gpu-{i}"),
+                vram_used_mb: vram_mb.get(key).copied().unwrap_or(0),
+                vram_total_mb: 0,
+                gpu_utilization_pct: util.get(key).copied().unwrap_or(0.0).min(100.0),
+                temperature_c,
+                power_w,
+                clock_mhz,
+            }
         })
         .collect()
+}
+
+/// Per-GPU temperature/power/clock reading from ADLX. Each field is a plain
+/// value (not `Option`): `adlx_readings` only emits an entry for a GPU once
+/// `current_gpu_metrics` has already succeeded for it, so unsupported
+/// individual metrics on that entry fall back to 0.0/None right there.
+struct AdlxReading {
+    temperature_c: f32,
+    power_w: f32,
+    clock_mhz: Option<f32>,
+}
+
+/// Matches an ADLX reading to a `parse_metrics` device slot by index (ADLX's
+/// GPU list order isn't otherwise correlated to the perf-counter LUIDs here).
+/// No reading for that slot, or a 0.0/None `AdlxReading`, degrades to the
+/// same defaults `parse_metrics` used before ADLX existed.
+fn apply_adlx(reading: Option<&AdlxReading>) -> (f32, f32, Option<f32>) {
+    (
+        reading.map_or(0.0, |r| r.temperature_c),
+        reading.map_or(0.0, |r| r.power_w),
+        reading.and_then(|r| r.clock_mhz),
+    )
+}
+
+/// `AdlxHelper::new()` fails cleanly (`Err`, not a panic) when
+/// `amdadlx64.dll` isn't found, so every step here can just bail to an empty
+/// Vec via `.ok()?` — same graceful-degrade shape as the rest of this file.
+#[cfg(windows)]
+fn adlx_readings() -> Vec<AdlxReading> {
+    (|| -> Option<Vec<AdlxReading>> {
+        let helper = adlx::helper::AdlxHelper::new().ok()?;
+        let system = helper.system();
+        let gpus = system.gpus().ok()?;
+        let services = system.performance_monitoring_services().ok()?;
+        Some(
+            gpus.iter()
+                .filter_map(|gpu| services.current_gpu_metrics(&gpu).ok())
+                .map(|m| AdlxReading {
+                    temperature_c: m.temperature().unwrap_or(0.0) as f32,
+                    power_w: m.power().unwrap_or(0.0) as f32,
+                    clock_mhz: m.clock_speed().ok().map(|c| c as f32),
+                })
+                .collect(),
+        )
+    })()
+    .unwrap_or_default()
+}
+
+#[cfg(not(windows))]
+const fn adlx_readings() -> Vec<AdlxReading> {
+    Vec::new()
 }
 
 struct Adapter {
@@ -278,4 +340,24 @@ mod tests {
         assert!(parse_metrics("").is_empty());
         assert_eq!(parse_system_info("").physical_gpu_count, 0);
     }
+
+    #[test]
+    fn apply_adlx_falls_back_to_defaults_when_missing() {
+        assert_eq!(apply_adlx(None), (0.0, 0.0, None));
+    }
+
+    #[test]
+    fn apply_adlx_uses_reading_when_present() {
+        let reading = AdlxReading {
+            temperature_c: 65.0,
+            power_w: 12.5,
+            clock_mhz: Some(1900.0),
+        };
+        assert_eq!(apply_adlx(Some(&reading)), (65.0, 12.5, Some(1900.0)));
+    }
+
+    // adlx_readings() itself (the real ADLX FFI chain) is Windows-only and
+    // hardware/driver-dependent — not unit-testable here; CI's
+    // windows-build-and-test job covers compilation of the #[cfg(windows)]
+    // path, and apply_adlx above covers the pure mapping logic.
 }
