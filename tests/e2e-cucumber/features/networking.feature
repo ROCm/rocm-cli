@@ -4,8 +4,8 @@ Feature: Native HTTP networking
   # certificate store), replacing the generated PowerShell script that used to
   # run under `powershell.exe -ExecutionPolicy Bypass` on Windows. These
   # scenarios drive the real `rocm` binary end-to-end against the mock server so a
-  # GET/round-trip reaches a local endpoint over the native stack. They run on the
-  # mock (no GPU) on every platform the suite runs on, so a regression back to a
+  # GET/round-trip reaches a local endpoint over the native stack. All but
+  # networking-04 run on the mock (no GPU) on every platform the suite runs on, so a regression back to a
   # shell-out networking backend surfaces here rather than only in the field.
 
   # `rocm services list` extracts host:port from the service record and issues a
@@ -39,3 +39,32 @@ Feature: Native HTTP networking
     When the user serves a model bound to a public interface without allowing public binding
     Then serving is refused before any engine starts
     And the user is told to allow public binding first
+
+  # The other half of the EAI-7409 contract, and the security property the ticket
+  # calls out first: opting in to a public bind must not produce an open endpoint.
+  # The CLI issues an API key, shows it exactly once, and hands the serving engine
+  # a key file to enforce — so the endpoint must reject callers without the key and
+  # with the wrong key, while accepting the key it just issued.
+  #
+  # GPU lane: the ENGINE enforces the key (the CLI only issues and hands it over),
+  # so proving enforcement needs a real engine serving a real model. `serve` has no
+  # plan-only mode that would let the mock lane observe it. The pure key-resolution
+  # rules (loopback stays credential-free even when a key is passed) are already
+  # unit-tested in the CLI, so this pins only what a unit test cannot: that a live
+  # public endpoint actually authenticates.
+  #
+  # `@requires-engine:vllm` (same precedent as `serve-vllm-default-on-instinct`) is
+  # load-bearing, not incidental: on a native-Windows host the effective serve engine
+  # is lemonade, and the CLI deliberately REFUSES a public bind there because the
+  # endpoint key cannot be enforced through Windows lemonade. Without this tag the
+  # scenario would drive that refusal and fail on the Strix-Windows lane — a
+  # designed-in behaviour, not a bug, so it wants a tag rather than an xfail row. It
+  # also keeps this cold serve off the time-capped Strix lanes entirely.
+  @id:networking-public-bind-endpoint-enforces-key @requires-gpu @requires-engine:vllm
+  Scenario: networking-04 - A public endpoint issues a key once and then enforces it
+    Given a managed runtime is active
+    When the user serves a model on a public interface with public binding allowed
+    Then the CLI shows the endpoint key once and how to send it
+    And a request without the key is refused as unauthorized
+    And a request with the wrong key is refused as unauthorized
+    And a request carrying the issued key is accepted
