@@ -69,6 +69,9 @@ pub struct Facts {
     /// zero failures, since a missing row more often means the report is
     /// broken than that E2E had a perfect run.
     pub e2e_fail_total: Option<u64>,
+    /// Whether the nightly or Windows build gate was skipped (a legitimate
+    /// no-op-night outcome, not a failure) rather than actually run.
+    pub build_skipped: bool,
     pub commits: CommitBuckets,
     pub known_issues: Vec<KnownIssue>,
 }
@@ -156,6 +159,7 @@ fn assemble_facts(
         verdict,
         failing_gates,
         e2e_fail_total,
+        build_skipped: nightly_result == "skipped" || windows_result == "skipped",
         commits,
         known_issues,
     }
@@ -231,9 +235,9 @@ pub fn categorize(subjects: &[String]) -> CommitBuckets {
         let rest = subject[colon + 1..].trim();
         let head_no_bang = head.trim_end_matches('!');
         let kind = head_no_bang.split('(').next().unwrap_or("");
-        // Only `feat!`/`fix!` denote a breaking change in Conventional
-        // Commits; a bare `!` after e.g. `chore` or `docs` isn't one.
-        let breaking = head.ends_with('!') && matches!(kind, "feat" | "fix");
+        // Conventional Commits allows `!` on any type, not just `feat`/`fix`,
+        // to denote a breaking change.
+        let breaking = head.ends_with('!');
         let scope = head_no_bang
             .find('(')
             .and_then(|i| head_no_bang[i + 1..].strip_suffix(')'));
@@ -309,7 +313,16 @@ struct RawIssue {
 /// can sort or cut down to a top-N by itself; it only ranks by reaction count
 /// as a readability order for the raw list in `table.md`.
 fn collect_known_issues() -> Result<Vec<KnownIssue>> {
+    collect_known_issues_in(Path::new("."))
+}
+
+/// `collect_known_issues`, with the directory `gh` resolves its repo context
+/// from as a seam: lets a test force the "`gh issue list` failed" path (a
+/// directory with no GitHub remote) without touching the process environment
+/// or `PATH`.
+fn collect_known_issues_in(dir: &Path) -> Result<Vec<KnownIssue>> {
     let output = Command::new("gh")
+        .current_dir(dir)
         .args([
             "issue",
             "list",
@@ -390,20 +403,29 @@ fn excerpt(text: &str, max_chars: usize) -> String {
 /// pass/fail here, keeps this in lockstep with that crate's known-bugs/xfail
 /// handling instead of duplicating it.
 fn total_e2e_failures(markdown: &str) -> Option<u64> {
-    let total_row_fails = markdown
-        .lines()
-        .find(|l| l.trim_start().starts_with("| **Total**"))
-        .and_then(|line| line.split('|').nth(5))
+    // Scope strictly to the summary table's own row range — the document
+    // keeps going after it with an expectation grid and a command-coverage
+    // table, whose `|`-rows have a different column layout and used to get
+    // misread as platform rows here (a `n/a`/`❌` cell landing on the Status
+    // column's index by coincidence looked like a non-PASS platform).
+    let lines: Vec<&str> = markdown.lines().collect();
+    let header_idx = lines
+        .iter()
+        .position(|l| l.trim_start().starts_with("| Platform"))?;
+    let total_idx = lines
+        .iter()
+        .position(|l| l.trim_start().starts_with("| **Total**"))?;
+
+    let total_row_fails = lines[total_idx]
+        .split('|')
+        .nth(5)
         .and_then(|cell| cell.trim().parse::<u64>().ok())?;
 
-    let silently_empty_platforms = markdown
-        .lines()
+    let silently_empty_platforms = lines[header_idx + 1..total_idx]
+        .iter()
         .filter(|l| {
             let t = l.trim_start();
-            t.starts_with('|')
-                && !t.starts_with("| Platform")
-                && !t.starts_with("|---")
-                && !t.starts_with("| **Total**")
+            t.starts_with('|') && !t.starts_with("|---")
         })
         .filter(|l| {
             let cells: Vec<&str> = l.split('|').collect();
@@ -464,6 +486,8 @@ pub(crate) fn render_table(facts: &Facts) -> String {
         "| Build (Linux + Windows nightly) | nightly / windows-nightly jobs | {} |",
         if facts.failing_gates.iter().any(|g| g.contains("build")) {
             "❌"
+        } else if facts.build_skipped {
+            "not run"
         } else {
             "✅"
         }
@@ -679,6 +703,62 @@ mod tests {
                    | Windows | Windows | 0 | 0 | 0 | 0 | n/a | EMPTY |\n\
                    | **Total** | | 0 | 0 | 0 | 0 | 0 | |\n";
         assert_eq!(total_e2e_failures(md), Some(1));
+    }
+
+    #[test]
+    fn total_e2e_failures_ignores_the_expectation_grid_and_command_coverage_tables() {
+        // Regression: the scan used to run over every `|`-prefixed line in the
+        // whole document, not just the summary table. Real consolidated
+        // markdown keeps going after the summary table with an expectation
+        // grid and a command-coverage table, whose rows have a different
+        // column layout — a `n/a`/`❌` cell landing on index 8 by coincidence
+        // used to get counted as a phantom platform failure. Build real
+        // multi-platform producer output (enough platform columns for the
+        // command-coverage table to reach column 8) and confirm the parser
+        // reads only the summary table's own Total row.
+        fn feature_json(scenario: &str) -> String {
+            format!(
+                r#"[{{"name":"F","uri":"f.feature","elements":[{{"name":"{scenario}","tags":[],"steps":[{{"keyword":"Given ","name":"x","result":{{"status":"passed"}}}}]}}]}}]"#
+            )
+        }
+
+        let dirs: Vec<_> = (0..6)
+            .map(|i| {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let report = dir.path().join("report.json");
+                std::fs::write(&report, feature_json(&format!("s{i}"))).expect("write report");
+                (dir, report)
+            })
+            .collect();
+        // A commands.jsonl sidecar on one platform only: command-coverage
+        // still lists every platform as a column (populated or `n/a`), so
+        // this alone is enough to grow a downstream row past column 8.
+        std::fs::write(
+            dirs[0].1.with_file_name("commands.jsonl"),
+            r#"{"scenario":"s0","subcommand":"serve","command":"rocm serve x","engine":"vllm","engine_is_default":false}"#,
+        )
+        .expect("write commands.jsonl");
+
+        let inputs = vec![
+            ("e2e-report".to_string(), dirs[0].1.clone()),
+            ("e2e-gpu-report".to_string(), dirs[1].1.clone()),
+            ("e2e-gpu-rad3-report".to_string(), dirs[2].1.clone()),
+            ("e2e-gpu-mi350p-report".to_string(), dirs[3].1.clone()),
+            ("e2e-gpu-w7900-report".to_string(), dirs[4].1.clone()),
+            ("e2e-gpu-strix-ubuntu-report".to_string(), dirs[5].1.clone()),
+        ];
+        let md =
+            e2e_report::consolidated_summary_markdown(&e2e_report::load_platform_reports(&inputs));
+        assert!(
+            md.contains("### Command coverage"),
+            "expected a command-coverage table in:\n{md}"
+        );
+        assert_eq!(
+            total_e2e_failures(&md),
+            Some(0),
+            "real producer output with 0 actual failures must read as 0, not inflated by \
+             downstream tables:\n{md}"
+        );
     }
 
     #[test]
@@ -926,6 +1006,23 @@ mod tests {
     }
 
     #[test]
+    fn render_table_marks_the_build_row_not_run_on_a_skipped_windows_build() {
+        let facts = assemble_facts(
+            "v1.0.0",
+            CommitBuckets::default(),
+            vec![],
+            Some(0),
+            "success",
+            "skipped",
+            "success",
+        );
+        let table = render_table(&facts);
+        assert!(table.contains(
+            "| Build (Linux + Windows nightly) | nightly / windows-nightly jobs | not run |"
+        ));
+    }
+
+    #[test]
     fn render_table_lists_the_failing_gate_reasons_when_a_lane_is_cancelled() {
         // A cancelled E2E lane renders "0 failure(s)" with a red ❌ in the
         // status table, which looks contradictory on its own; the gate
@@ -1044,10 +1141,16 @@ mod tests {
     }
 
     #[test]
-    fn categorize_does_not_treat_a_bang_on_other_types_as_breaking() {
+    fn categorize_treats_a_bang_on_any_type_as_breaking() {
         let subjects = vec!["docs!: rewrite the README".to_string()];
         let got = categorize(&subjects);
-        assert!(got.breaking.is_empty());
+        assert_eq!(
+            got.breaking,
+            vec![CommitEntry {
+                pr: None,
+                subject: "rewrite the README".to_string(),
+            }]
+        );
         assert!(got.features.is_empty());
         assert!(got.fixes.is_empty());
     }
@@ -1097,5 +1200,84 @@ mod tests {
         assert_eq!(issues[0].reactions, 4);
         assert_eq!(issues[1].number, 1);
         assert_eq!(issues[1].reactions, 3, "👎 must not count toward the rank");
+    }
+
+    #[test]
+    fn collect_commit_subjects_fails_on_a_bogus_since_tag() {
+        let err = collect_commit_subjects("this-tag-definitely-does-not-exist-zzz").unwrap_err();
+        assert!(
+            err.to_string().contains("git log"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn collect_known_issues_in_fails_outside_a_github_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = collect_known_issues_in(dir.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("gh issue list"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn assemble_facts_is_no_go_when_nightly_build_is_cancelled() {
+        let facts = assemble_facts(
+            "v1.0.0",
+            CommitBuckets::default(),
+            vec![],
+            Some(0),
+            "cancelled",
+            "success",
+            "success",
+        );
+        assert_eq!(facts.verdict, Verdict::NoGo);
+        assert_eq!(facts.failing_gates, vec!["nightly build (cancelled)"]);
+    }
+
+    #[test]
+    fn assemble_facts_is_no_go_when_nightly_build_times_out() {
+        let facts = assemble_facts(
+            "v1.0.0",
+            CommitBuckets::default(),
+            vec![],
+            Some(0),
+            "timed_out",
+            "success",
+            "success",
+        );
+        assert_eq!(facts.verdict, Verdict::NoGo);
+        assert_eq!(facts.failing_gates, vec!["nightly build (timed_out)"]);
+    }
+
+    #[test]
+    fn assemble_facts_is_no_go_when_windows_build_is_cancelled() {
+        let facts = assemble_facts(
+            "v1.0.0",
+            CommitBuckets::default(),
+            vec![],
+            Some(0),
+            "success",
+            "cancelled",
+            "success",
+        );
+        assert_eq!(facts.verdict, Verdict::NoGo);
+        assert_eq!(facts.failing_gates, vec!["windows build (cancelled)"]);
+    }
+
+    #[test]
+    fn assemble_facts_is_no_go_when_windows_build_times_out() {
+        let facts = assemble_facts(
+            "v1.0.0",
+            CommitBuckets::default(),
+            vec![],
+            Some(0),
+            "success",
+            "timed_out",
+            "success",
+        );
+        assert_eq!(facts.verdict, Verdict::NoGo);
+        assert_eq!(facts.failing_gates, vec!["windows build (timed_out)"]);
     }
 }

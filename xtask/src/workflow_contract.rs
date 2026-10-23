@@ -1085,8 +1085,9 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
         // A lane with an `sdk_version` matrix (ROCMAI-430) uploads one artifact
         // per leg, each behind its own mutually exclusive `if:` — pair every
         // artifact name with the `if:` directly above it in the same step, then
-        // pick the `current` leg to stand for the whole lane, the same way a
-        // channel axis below is checked through its `release` leg.
+        // pick the `current` leg to stand for the whole lane. (A channel axis,
+        // unlike this `sdk_version` axis, is checked by requiring both its
+        // `release` and `nightly` legs — see the doc comment above.)
         let mut last_if: Option<&str> = None;
         let mut candidates: Vec<(&str, Option<&str>)> = Vec::new();
         for line in job_block(text, job).lines() {
@@ -3560,6 +3561,7 @@ fi
             verdict: Verdict::NoGo,
             failing_gates: vec!["E2E (report unreadable)".to_string()],
             e2e_fail_total: None,
+            build_skipped: false,
             commits: CommitBuckets::default(),
             known_issues: vec![],
         });
@@ -3578,6 +3580,7 @@ fi
             verdict: Verdict::Go,
             failing_gates: vec![],
             e2e_fail_total: Some(0),
+            build_skipped: false,
             commits: CommitBuckets::default(),
             known_issues: vec![],
         });
@@ -3692,6 +3695,12 @@ fi
              as --e2e-report-job-result"
         );
         assert!(
+            job.contains("--nightly-result \"${{ needs.nightly.result }}\""),
+            "release-readiness-nightly must read --nightly-result from needs.nightly.result, \
+             not a hard-coded value -- otherwise a failed Linux nightly build never fails the \
+             gate: {job}"
+        );
+        assert!(
             job.contains("--windows-result \"${{ needs.windows-nightly.result }}\""),
             "release-readiness-nightly must read --windows-result from \
              needs.windows-nightly.result, not needs.nightly.result (the Linux build's own \
@@ -3735,8 +3744,9 @@ fi
             assert!(
                 job.contains("persist-credentials: false"),
                 "{job_name}'s checkout must not persist credentials: these jobs shell out over \
-                 untrusted issue/commit text, and a leaked GITHUB_TOKEN would let anything \
-                 injected into that text push with repo write access"
+                 untrusted issue/commit text, and a persisted, readable GITHUB_TOKEN would be \
+                 reachable by anything injected into that text in a later step (both jobs hold \
+                 only `contents: read`, so the exposure is token readability, not write access)"
             );
         }
     }
@@ -3766,6 +3776,89 @@ fi
             "the LLM-drafted narrative must reach the shell only through the $NARRATIVE env \
              var, never inlined as `${{ steps.draft.outputs.response }}` directly in `run:` -- \
              that would let the narrative's own text execute as shell: {job}"
+        );
+
+        // The two assertions above only check that the safe lines exist; they
+        // can't fail on a *second*, unsafe occurrence added elsewhere (e.g. a
+        // later step inlining `${{ steps.draft.outputs.response }}` straight
+        // into its own `run:`). Pin every occurrence in the job to the two
+        // known-safe spots: the "Save narrative" step's `if:` guard, and the
+        // `NARRATIVE:` env line feeding it to the shell.
+        let offending: Vec<&str> = job
+            .lines()
+            .filter(|l| l.contains("steps.draft.outputs.response"))
+            .filter(|l| {
+                let t = l.trim();
+                t != "if: always() && steps.draft.outputs.response"
+                    && t != "NARRATIVE: ${{ steps.draft.outputs.response }}"
+            })
+            .collect();
+        assert!(
+            offending.is_empty(),
+            "steps.draft.outputs.response must appear nowhere in the job except the \"Save \
+             narrative\" step's `if:` guard and its NARRATIVE env line: found it in {offending:?}"
+        );
+    }
+
+    #[test]
+    fn release_readiness_nightly_checkout_fetches_full_history() {
+        let nightly = read_workflow("nightly.yml");
+        let job = job_block(&nightly, "release-readiness-nightly");
+        assert!(
+            job.contains("fetch-depth: 0"),
+            "release-readiness-nightly's checkout must fetch full history (fetch-depth: 0): \
+             `git describe --tags` and the commit range since the last release tag both need \
+             it, and the default shallow clone would make `git describe` fail every night: {job}"
+        );
+    }
+
+    #[test]
+    fn publish_release_readiness_wiki_needs_both_upstream_jobs() {
+        let nightly = read_workflow("nightly.yml");
+        let job = job_block(&nightly, "publish-release-readiness-wiki");
+        let needs = flattened_values(job, "needs")
+            .into_iter()
+            .flat_map(|v| flattened_list_items(&v))
+            .collect::<Vec<_>>();
+        for required in ["release-readiness-nightly", "release-readiness-narrative"] {
+            assert!(
+                needs.contains(&required.to_string()),
+                "publish-release-readiness-wiki must depend on `{required}`: dropping \
+                 `release-readiness-narrative` from `needs` would let the publish job race the \
+                 narrative download instead of waiting for it; needs: {needs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn publish_release_readiness_wiki_artifact_downloads_tolerate_a_missing_artifact() {
+        let nightly = read_workflow("nightly.yml");
+        let job = job_block(&nightly, "publish-release-readiness-wiki");
+        assert_eq!(
+            job.matches("continue-on-error: true").count(),
+            2,
+            "both artifact-download steps in publish-release-readiness-wiki (the \
+             release-readiness table and the narrative) must set `continue-on-error: true`: \
+             without it, a missing artifact (no table because release-readiness-nightly failed \
+             outright, or no narrative because COPILOT_PAT doesn't exist yet) would fail \
+             download-artifact and make this job's own fallback handling unreachable: {job}"
+        );
+    }
+
+    #[test]
+    fn release_readiness_wiki_page_does_not_collide_with_the_e2e_matrix_page() {
+        let nightly = read_workflow("nightly.yml");
+        let publish_e2e = job_block(&nightly, "publish-e2e-wiki");
+        let publish_readiness = job_block(&nightly, "publish-release-readiness-wiki");
+        assert!(
+            publish_e2e.contains("page=E2E-Support-Matrix.md"),
+            "publish-e2e-wiki's page name changed out from under this test; update it: {publish_e2e}"
+        );
+        assert!(
+            publish_readiness.contains("page=Release-Readiness.md"),
+            "publish-release-readiness-wiki must keep publishing to a distinct wiki page name; \
+             renaming it to collide with E2E-Support-Matrix.md would silently overwrite the E2E \
+             support matrix page instead: {publish_readiness}"
         );
     }
 
