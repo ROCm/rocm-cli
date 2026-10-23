@@ -1304,6 +1304,29 @@ async fn gpu_telemetry_displayed(world: &mut E2eWorld) {
     .unwrap_or_else(|e| panic!("GPU telemetry did not appear: {e}"));
 }
 
+#[when("the user selects the ROCm diagnose action")]
+async fn select_rocm_diagnose_action(world: &mut E2eWorld) {
+    // The ROCm actions list opens on "Set up / Install ROCm"; "Diagnose & fix"
+    // is two rows down, after "Check for updates".
+    session(world)
+        .send("jj")
+        .unwrap_or_else(|e| panic!("failed to move to the diagnose action: {e}"));
+}
+
+#[then("the diagnose action says it runs rocm examine")]
+async fn diagnose_action_runs_examine(world: &mut E2eWorld) {
+    let tui = session(world);
+    tui.wait_for_screen("Runs: rocm examine", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the diagnose action's `Runs:` line did not appear: {e}"));
+    let screen = tui.screen_text();
+    assert!(
+        screen.contains("Diagnose & fix") && !screen.contains("rocm doctor"),
+        "the `Runs:` line must belong to the diagnose action and name a real \
+         subcommand, not `rocm doctor`:\n{screen}"
+    );
+}
+
 #[then("ROCm setup actions are displayed")]
 async fn rocm_actions_displayed(world: &mut E2eWorld) {
     session(world)
