@@ -128,6 +128,7 @@ const CATALOG_FIX_IDS: &[&str] = &[
     "fix-18-comgr-conflict",
     "fix-19-shm-too-small",
     "fix-21-msvc-redist-outdated",
+    "fix-22-display-driver-old",
     // The catalog's one DIAGNOSE-ONLY entry, carrying an `info-` id because it
     // has no fix to offer. It is in the catalog all the same: `rocm diagnose`
     // prints `apply with: rocm fix info-20-gpu-no-rocm-support` for it, so
@@ -2670,6 +2671,16 @@ async fn user_diagnoses_planted_machine(world: &mut E2eWorld) {
     world.cli_rc = Some(rc);
 }
 
+// ── Windows display driver advice ──────────────────────────────────
+
+#[when("the user diagnoses this machine in machine-readable form, with no symptom")]
+async fn user_diagnoses_without_symptom(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["diagnose", "--json"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
 /// The reported cause block for `info-20-gpu-no-rocm-support`: the `#N (id)`
 /// header line and everything under it up to the blank line that ends it.
 fn unsupported_gpu_cause(output: &str) -> Vec<&str> {
@@ -2793,4 +2804,45 @@ async fn assert_no_hip_sdk_advice(world: &mut E2eWorld) {
         !output.contains("fix-13-hip-sdk-missing"),
         "a host whose only engine is Vulkan has nothing to gain from a HIP SDK:\n{output}"
     );
+}
+
+#[then(
+    "the diagnosis offers the old display driver advice only when the inspection reports an old driver"
+)]
+async fn assert_old_driver_advice_follows_the_inspection(world: &mut E2eWorld) {
+    const FIX_ID: &str = "fix-22-display-driver-old";
+    let diagnosis: serde_json::Value =
+        serde_json::from_str(world.cli_output.as_ref().expect("no diagnosis"))
+            .expect("`diagnose --json` did not emit valid JSON");
+    let (examine_json, _, _) = crate::run_rocm(world, &["examine", "--json"]);
+    let examine: serde_json::Value =
+        serde_json::from_str(&examine_json).expect("`examine --json` did not emit valid JSON");
+    // Required, as `examine-29` requires it: a CLI without the driver record
+    // must fail here, not read as "no old driver".
+    let record = super::examine_steps::windows_driver_record(&examine).unwrap_or_else(|| {
+        panic!("the machine-readable inspection carries no Windows driver record:\n{examine:#}")
+    });
+    let old =
+        record.get("age").and_then(serde_json::Value::as_str) == Some("predates_first_hip_sdk");
+    let row = diagnosis["matched"]
+        .as_array()
+        .expect("matched is a list")
+        .iter()
+        .find(|entry| entry["id"] == FIX_ID);
+    assert_eq!(
+        row.is_some(),
+        old,
+        "advice present: {}, driver old: {old}\n{diagnosis:#}",
+        row.is_some()
+    );
+    // Advice, never an established cause.
+    if let Some(row) = row {
+        let score = row["score"]
+            .as_i64()
+            .unwrap_or_else(|| panic!("the advice row has no numeric score:\n{row:#}"));
+        let threshold = diagnosis["min_score_for_match"]
+            .as_i64()
+            .unwrap_or_else(|| panic!("the diagnosis has no numeric threshold:\n{diagnosis:#}"));
+        assert!(score < threshold, "{row:#}");
+    }
 }
