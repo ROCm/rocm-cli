@@ -608,3 +608,34 @@ Feature: Interactive dashboard
     When the user denies the adopt approval and closes onboarding setup
     And the user quits the dashboard
     Then the dashboard exits successfully
+
+  # The Diagnose screen offers the same Doctor report the CLI prepares, and the
+  # review comes first. Whether a report can be prepared is a property of the
+  # machine, not of the dashboard: hardware that is not on AMD's published list,
+  # an architecture that cannot be read, and a WSL host all get a refusal, and
+  # only an approved architecture gets a report. So this scenario does not pin
+  # which outcome this machine produces. It reads whether the CLI refused from
+  # the preview, then checks the card against that: a report is offered for
+  # sending exactly when the CLI printed one, and a refusal shows the CLI's own
+  # explanation. The card puts that outcome first. This scenario runs at the
+  # detail size that "the user opens the Observe view" selects (120x40); the
+  # cramped 80x24 case is covered by the unit test in
+  # `crates/rocm-dash-tui/src/ui/examine_manager.rs`.
+  #
+  # The scenario never presses `s` and never approves a send, so no mail client
+  # is ever opened from a test. The approve and decline paths, and the promise
+  # that no send starts before an approve, are asserted where the key sequence
+  # can be driven directly: the unit tests in
+  # `crates/rocm-dash-tui/src/ui/examine_manager.rs`.
+  @id:dash-doctor-report-is-reviewed-before-sending @requires-os:linux
+  Scenario: dash-37 - A user reviews a Doctor report in the dashboard before anything is sent
+    When the user opens the dashboard with demo data
+    And the user opens the Observe view
+    And the user opens the Diagnose screen
+    And the user prepares a Doctor report
+    Then the report is displayed for review
+    When the user leaves the report review
+    Then the dashboard offers to send a report only if the CLI prepared one
+    When the user closes the Diagnose screen
+    And the user quits the dashboard
+    Then the dashboard exits successfully

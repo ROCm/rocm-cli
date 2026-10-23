@@ -962,7 +962,7 @@ impl AppState {
             && self
                 .examine_manager
                 .as_ref()
-                .is_none_or(|m| m.active_job.is_none())
+                .is_none_or(|m| m.approval.is_none() && m.active_job.is_none())
             && self
                 .logs_view
                 .as_ref()
@@ -1932,8 +1932,13 @@ mod tests {
         } = AutomationsManagerState::default();
         assert!(approval.is_none() && active_job.is_none());
 
-        let ExamineManagerState { active_job } = ExamineManagerState::default();
-        assert!(active_job.is_none());
+        let ExamineManagerState {
+            active_job,
+            report: _,
+            approval,
+            message: _,
+        } = ExamineManagerState::default();
+        assert!(approval.is_none() && active_job.is_none());
 
         let LogsViewState {
             query: _,
