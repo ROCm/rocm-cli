@@ -23,12 +23,17 @@
 
 use std::fmt::Write as _;
 use std::path::Path;
+use std::time::Duration;
 
 use cucumber::{given, then, when};
 use e2e_cucumber::cli_failure_report;
 use e2e_cucumber::loopback_http::LoopbackServer;
+use e2e_cucumber::paced_download::{
+    PacedDownloadServer, build_gzip_tarball, deterministic_payload,
+};
 
 use crate::E2eWorld;
+use crate::e2e::tui_driver::TuiSession;
 
 /// The exact GFX arch the next layout needs. Not a group label: the aggregate
 /// source publishes one `rocm-sdk-device-<arch>` payload per arch, and
@@ -43,6 +48,36 @@ const NEXT_TORCH_VERSION: &str = "2.10.0+rocm10.0.0";
 const NEXT_TORCHVISION_VERSION: &str = "0.25.0+rocm10.0.0";
 const NEXT_TORCHAUDIO_VERSION: &str = "2.9.1+rocm10.0.0";
 
+/// A newer ROCm 10 build published beside `NEXT_ROCM_VERSION`, for the scenario
+/// that pins the older one.
+const NEWER_NEXT_ROCM_VERSION: &str = "10.1.0";
+const NEWER_NEXT_TORCH_VERSION: &str = "2.11.0+rocm10.1.0";
+const NEWER_NEXT_TORCHVISION_VERSION: &str = "0.26.0+rocm10.1.0";
+/// The newer build's torchaudio, shaped like the live `whl-next` index's
+/// `+rocm10.1.0` builds: an original release (CPU-only on the live index), the
+/// hardware-verified rebuild, and a newer rebuild sharing the same label. The
+/// verified one is the release `rocm_engine_vllm::verified_torchaudio_release`
+/// records for ROCm 10.1 (the vLLM ROCm 10.x discover-build table's exact
+/// torchaudio pin); this fixture has to change with it.
+const NEWER_NEXT_TORCHAUDIO_ORIGINAL_VERSION: &str = "2.11.0+rocm10.1.0";
+const NEWER_NEXT_TORCHAUDIO_VERIFIED_VERSION: &str = "2.11.0.2+rocm10.1.0";
+const NEWER_NEXT_TORCHAUDIO_NEWEST_VERSION: &str = "2.11.0.3+rocm10.1.0";
+const NEWER_NEXT_TORCHAUDIO_VERSIONS: [&str; 3] = [
+    NEWER_NEXT_TORCHAUDIO_ORIGINAL_VERSION,
+    NEWER_NEXT_TORCHAUDIO_VERIFIED_VERSION,
+    NEWER_NEXT_TORCHAUDIO_NEWEST_VERSION,
+];
+/// A rebuild of `NEXT_TORCHAUDIO_VERSION`, published the way the live index
+/// publishes torchaudio rebuilds: as a fourth release segment.
+const NEXT_TORCHAUDIO_REBUILD_VERSION: &str = "2.9.1.2+rocm10.0.0";
+/// A still newer rebuild of the same build, published only as a wheel no host
+/// running this suite can install (another CPython and OS).
+const NEXT_TORCHAUDIO_FOREIGN_WHEEL_VERSION: &str = "2.9.1.3+rocm10.0.0";
+
+/// The tag every fixture wheel carries unless a scenario says otherwise.
+const ANY_WHEEL_TAG: &str = "py3-none-any";
+const FOREIGN_WHEEL_TAG: &str = "cp39-cp39-macosx_11_0_arm64";
+
 const CURRENT_ROCM_VERSION: &str = "7.10.0";
 const CURRENT_TORCH_VERSION: &str = "2.9.0+rocm7.10.0";
 const CURRENT_TORCHVISION_VERSION: &str = "0.24.0+rocm7.10.0";
@@ -52,6 +87,14 @@ const NEXT_REAL_TARBALL: &str = "therock-dist-linux-gfx120X-all-10.0.0.tar.gz";
 /// The non-release sibling the live catalog publishes beside the real archive.
 const NEXT_TESTS_TARBALL: &str = "therock-dist-linux-gfx120X-all-tests-10.0.0.tar.gz";
 const CURRENT_TARBALL: &str = "therock-dist-linux-gfx120X-all-7.10.0.tar.gz";
+
+/// How many leading bytes of `"Downloading {CURRENT_TARBALL}"` to check for in
+/// [`assert_spinner_lines_cleared`] below. Comfortably under the ~48-column
+/// label budget `assemble_status_line` leaves on an 80-column terminal even at
+/// the widest realistic progress suffix (see that assertion's comment) — the
+/// full string would never fully render while the line is live, so a prefix
+/// this short is what actually needs to disappear on clear.
+const DOWNLOADING_PREFIX_LEN: usize = 30;
 
 /// The `current/` fixture's served base, i.e. what the canonical release
 /// overrides are pointed at.
@@ -114,21 +157,37 @@ fn aggregate_root_html() -> String {
 /// One PEP 503 package page with PEP 658 metadata. The metadata lets uv resolve
 /// the published dependency contract without downloading a wheel.
 fn write_wheel_index(served: &Path, package: &str, version: &str, requires: &[String]) {
-    let file_name = format!("{package}-{version}-py3-none-any.whl");
-    let html =
-        format!("<a href=\"{file_name}\" data-dist-info-metadata=\"true\">{file_name}</a>\n");
+    write_wheel_index_builds(
+        served,
+        package,
+        &[(version, ANY_WHEEL_TAG, requires.to_vec())],
+    );
+}
+
+/// [`write_wheel_index`] for a page that lists several published builds, each
+/// as `(version, wheel tag, requirements)`.
+fn write_wheel_index_builds(served: &Path, package: &str, builds: &[(&str, &str, Vec<String>)]) {
+    let mut html = String::new();
+    for (version, wheel_tag, requires) in builds {
+        let file_name = format!("{package}-{version}-{wheel_tag}.whl");
+        writeln!(
+            html,
+            "<a href=\"{file_name}\" data-dist-info-metadata=\"true\">{file_name}</a>"
+        )
+        .expect("write fixture HTML");
+        let mut metadata = format!("Metadata-Version: 2.3\nName: {package}\nVersion: {version}\n");
+        if matches!(package, "rocm" | "torch" | "torchvision") {
+            metadata.push_str("Provides-Extra: device-gfx1200\n");
+        }
+        if package == "rocm" {
+            metadata.push_str("Provides-Extra: libraries\nProvides-Extra: devel\n");
+        }
+        for requirement in requires {
+            writeln!(metadata, "Requires-Dist: {requirement}").expect("write fixture metadata");
+        }
+        write_fixture(&served.join(format!("{file_name}.metadata")), &metadata);
+    }
     write_fixture(&served.join("index.html"), &html);
-    let mut metadata = format!("Metadata-Version: 2.3\nName: {package}\nVersion: {version}\n");
-    if matches!(package, "rocm" | "torch" | "torchvision") {
-        metadata.push_str("Provides-Extra: device-gfx1200\n");
-    }
-    if package == "rocm" {
-        metadata.push_str("Provides-Extra: libraries\nProvides-Extra: devel\n");
-    }
-    for requirement in requires {
-        writeln!(metadata, "Requires-Dist: {requirement}").expect("write fixture metadata");
-    }
-    write_fixture(&served.join(format!("{file_name}.metadata")), &metadata);
 }
 
 fn write_pip_index(served: &Path, versions: [(&str, &str); 4]) {
@@ -185,6 +244,13 @@ async fn pip_index_fixtures(world: &mut E2eWorld) {
             ("torchaudio", NEXT_TORCHAUDIO_VERSION),
         ],
     );
+    serve_pip_fixtures(world);
+}
+
+/// Serves `therock-pip-fixtures/` and points both the canonical release and
+/// the ROCm 10 pip bases at it, through the explicit trust gate.
+fn serve_pip_fixtures(world: &mut E2eWorld) {
+    let served = root(world).join("therock-pip-fixtures");
     world.artifact_server = Some(LoopbackServer::start(&served));
     allow_base_overrides(world);
     let current = current_pip_base(world);
@@ -195,6 +261,83 @@ async fn pip_index_fixtures(world: &mut E2eWorld) {
     world
         .command_env
         .push(("ROCM_CLI_THEROCK_NEXT_PIP_BASE", next.into()));
+}
+
+/// Two ROCm 10 builds on one ROCm 10 index, with each package's dependency
+/// contract shaped like the live preview index's: torch requires its exact
+/// `rocm` build and torchvision its exact torch, so pinning `rocm` carries both
+/// — but torchaudio requires neither, so nothing in its metadata ties it to a
+/// build. `torchaudio` lists the torchaudio builds the index publishes, each
+/// with its wheel tag.
+fn serve_two_next_builds(world: &mut E2eWorld, torchaudio: &[(&str, &str)]) {
+    let served = root(world).join("therock-pip-fixtures").join("next");
+    write_fixture(&served.join("index.html"), &aggregate_root_html());
+    let builds = [
+        (
+            NEXT_ROCM_VERSION,
+            NEXT_TORCH_VERSION,
+            NEXT_TORCHVISION_VERSION,
+        ),
+        (
+            NEWER_NEXT_ROCM_VERSION,
+            NEWER_NEXT_TORCH_VERSION,
+            NEWER_NEXT_TORCHVISION_VERSION,
+        ),
+    ];
+    let rocm = builds.map(|(rocm, ..)| (rocm, ANY_WHEEL_TAG, Vec::new()));
+    let torch =
+        builds.map(|(rocm, torch, _)| (torch, ANY_WHEEL_TAG, vec![format!("rocm=={rocm}")]));
+    let torchvision = builds.map(|(_, torch, torchvision)| {
+        (torchvision, ANY_WHEEL_TAG, vec![format!("torch=={torch}")])
+    });
+    let torchaudio = torchaudio
+        .iter()
+        .map(|(version, wheel_tag)| (*version, *wheel_tag, Vec::new()))
+        .collect::<Vec<_>>();
+    write_wheel_index_builds(&served.join("rocm"), "rocm", &rocm);
+    write_wheel_index_builds(&served.join("torch"), "torch", &torch);
+    write_wheel_index_builds(&served.join("torchvision"), "torchvision", &torchvision);
+    write_wheel_index_builds(&served.join("torchaudio"), "torchaudio", &torchaudio);
+    serve_pip_fixtures(world);
+}
+
+/// The older build also carries a torchaudio rebuild, as the live index does,
+/// and a newer rebuild still that this host cannot install. The newer build
+/// carries a hardware-verified torchaudio with a newer rebuild beside it.
+fn serve_two_next_builds_with_torchaudio_rebuilds(world: &mut E2eWorld) {
+    let mut torchaudio = vec![
+        (NEXT_TORCHAUDIO_VERSION, ANY_WHEEL_TAG),
+        (NEXT_TORCHAUDIO_REBUILD_VERSION, ANY_WHEEL_TAG),
+        (NEXT_TORCHAUDIO_FOREIGN_WHEEL_VERSION, FOREIGN_WHEEL_TAG),
+    ];
+    torchaudio.extend(NEWER_NEXT_TORCHAUDIO_VERSIONS.map(|version| (version, ANY_WHEEL_TAG)));
+    serve_two_next_builds(world, &torchaudio);
+}
+
+#[given("a ROCm 10 pip index fixture that also publishes a newer ROCm 10 build")]
+async fn pip_index_fixture_with_newer_next_build(world: &mut E2eWorld) {
+    serve_two_next_builds_with_torchaudio_rebuilds(world);
+}
+
+/// The same index as the newer-build fixture, named for what the
+/// verified-torchaudio scenario needs from it: ROCm 10.1.0's original
+/// torchaudio release, its hardware-verified rebuild and a newer rebuild all
+/// share the `+rocm10.1.0` label.
+#[given("a ROCm 10 pip index fixture where several torchaudio rebuilds share one ROCm label")]
+async fn pip_index_fixture_with_torchaudio_rebuilds_sharing_a_label(world: &mut E2eWorld) {
+    serve_two_next_builds_with_torchaudio_rebuilds(world);
+}
+
+/// The pinned build's only torchaudio is a wheel this host cannot install, so
+/// for this Python and platform it publishes none; the newer build publishes
+/// installable ones.
+#[given(
+    "a ROCm 10 pip index fixture whose ROCm 10.0.0 torchaudio is only a wheel this host cannot install"
+)]
+async fn pip_index_fixture_without_pinned_torchaudio(world: &mut E2eWorld) {
+    let mut torchaudio = vec![(NEXT_TORCHAUDIO_FOREIGN_WHEEL_VERSION, FOREIGN_WHEEL_TAG)];
+    torchaudio.extend(NEWER_NEXT_TORCHAUDIO_VERSIONS.map(|version| (version, ANY_WHEEL_TAG)));
+    serve_two_next_builds(world, &torchaudio);
 }
 
 /// Registry key for the planted manifest below. Filename-safe (no `:`), same
@@ -249,6 +392,92 @@ async fn registered_next_wheel_runtime_with_grouped_family(world: &mut E2eWorld)
         manifest,
     )
     .expect("failed to write runtime manifest");
+}
+
+/// Makes the planted ROCm 10 runtime the active default, so a real install
+/// without consent reaches the non-interactive refusal: past every point where
+/// the plan is chosen and announced, but before `uv`, any download or any
+/// change on disk.
+#[given("that runtime is the active default")]
+async fn planted_runtime_is_the_active_default(world: &mut E2eWorld) {
+    // Black-box: plain JSON matching the CLI's on-disk config schema, as
+    // `examine_steps.rs` plants it. Every field defaults.
+    let config_dir = root(world).join("config");
+    std::fs::create_dir_all(&config_dir).expect("failed to create config dir");
+    let config = serde_json::json!({ "active_runtime_key": NEXT_GROUPED_FAMILY_RUNTIME_KEY });
+    std::fs::write(
+        config_dir.join("config.json"),
+        serde_json::to_string_pretty(&config).expect("failed to serialize config"),
+    )
+    .expect("failed to write config");
+}
+
+#[when("the user installs a wheel SDK for arch gfx1200 pinned to ROCm 10.0.0 without confirming")]
+async fn install_pinned_wheel_without_confirming(world: &mut E2eWorld) {
+    // No `--dry-run`: the install-log note is printed only past the preview.
+    preview(
+        world,
+        &[
+            "install",
+            "sdk",
+            "--channel",
+            "release",
+            "--format",
+            "wheel",
+            "--family",
+            RAW_ARCH,
+            "--version",
+            NEXT_ROCM_VERSION,
+        ],
+    );
+}
+
+#[then("the install is refused without replacing the active default runtime")]
+async fn install_refused_before_replacing_active_default(world: &mut E2eWorld) {
+    let rc = world.cli_rc.expect("no recorded exit code");
+    let reported = format!(
+        "{}\n{}",
+        stdout(world),
+        world.cli_stderr.as_deref().unwrap_or_default()
+    );
+    assert!(
+        rc != 0 && reported.contains("--approve-replacing-active-default"),
+        "expected the non-interactive refusal (rc {rc}):\n{reported}"
+    );
+    // The refusal comes before `uv` creates an environment: nothing installed.
+    assert!(
+        !reported.contains("Creating Python environment"),
+        "the install went past the refusal:\n{reported}"
+    );
+    let registry = root(world).join("data").join("runtimes").join("registry");
+    let registered = std::fs::read_dir(&registry)
+        .expect("failed to read the runtime registry")
+        .map(|entry| entry.expect("bad registry entry").file_name())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        registered,
+        [std::ffi::OsString::from(format!(
+            "{NEXT_GROUPED_FAMILY_RUNTIME_KEY}.json"
+        ))],
+        "the refused install registered a runtime"
+    );
+}
+
+#[then(
+    "the install log notes that its torchaudio is the newest build for ROCm 10.0.0 and not hardware-verified"
+)]
+async fn install_log_notes_unverified_torchaudio(world: &mut E2eWorld) {
+    // The same build therock-next-11's preview pins on this fixture, so the
+    // note names the build the install would have taken, not another one.
+    assert_contains(
+        world,
+        &format!(
+            "Note: torchaudio {NEXT_TORCHAUDIO_REBUILD_VERSION}, the newest build published for \
+             ROCm {NEXT_ROCM_VERSION}; it is not hardware-verified, because no torchaudio release \
+             is recorded as verified for this ROCm line"
+        ),
+        "unverified torchaudio install-log note",
+    );
 }
 
 #[when("the user previews applying the pending update to that runtime")]
@@ -313,6 +542,205 @@ async fn tarball_index_fixtures(world: &mut E2eWorld) {
         .push(("ROCM_CLI_THEROCK_NEXT_TARBALL_BASE", next.into()));
 }
 
+/// Size and pacing for the paced tarball fixture below: large enough (versus
+/// the chunk size) that several chunk boundaries — and therefore several
+/// observable progress frames — land before the transfer completes, and slow
+/// enough per chunk that the PTY's poll cadence reliably samples an
+/// intermediate, sub-100% frame rather than racing straight to completion.
+///
+/// The payload is tens of MB, not a few hundred KB, so that `tar -xf`
+/// (spawned synchronously once the download completes — see
+/// `extract_tarball`) takes long enough, via its own subprocess-spawn and
+/// real disk I/O over a ~20MB archive, for the "Extracting …" spinner frame
+/// to still be on screen the next time the PTY's poll checks it — the poll
+/// cadence only governs how often the already-rendered screen is sampled, not
+/// how fast extraction itself runs. The chunk size scales with the payload,
+/// so the number of paced chunks — and therefore the download's observed
+/// wall time — stays the same as before.
+const PACED_TARBALL_PAYLOAD_BYTES: usize = 20_000_000;
+const PACED_TARBALL_CHUNK_BYTES: usize = 1_600_000;
+const PACED_TARBALL_CHUNK_DELAY: Duration = Duration::from_millis(150);
+/// Wait budget for the PTY-driven download scenario below, mirroring
+/// `engines_steps.rs`'s file-local `SCREEN_TIMEOUT` convention.
+const PTY_SCREEN_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[given("a paced canonical release tarball fixture")]
+async fn paced_tarball_fixture(world: &mut E2eWorld) {
+    let served = root(world).join("therock-paced-tarball-fixture");
+    write_fixture(
+        &served.join("tarball").join("current").join("index.html"),
+        &tarball_index_html(&[(CURRENT_TARBALL, 1_787_000_000.0)]),
+    );
+
+    // Build a real gzip tarball so `extract_tarball` (auto-detecting `-xf`) has
+    // a genuine archive to unpack once the paced download completes. The
+    // payload bytes come from a seeded CSPRNG (`StdRng`) rather than a simple
+    // multiplicative-hash sequence: the latter looked scrambled but gzip still
+    // crushed it down to under 2 KB (well under one paced chunk), collapsing
+    // the whole "transfer" into a single unpaced chunk and defeating the
+    // pacing entirely. `StdRng` output is high-entropy enough that gzip
+    // cannot shrink it, keeping the wire transfer close to
+    // `PACED_TARBALL_PAYLOAD_BYTES`.
+    let build_dir = root(world).join("therock-paced-tarball-build");
+    let payload_dir = build_dir.join("payload");
+    std::fs::create_dir_all(&payload_dir).expect("failed to create tarball payload directory");
+    let payload = deterministic_payload(PACED_TARBALL_PAYLOAD_BYTES);
+    std::fs::write(payload_dir.join("payload.bin"), &payload)
+        .expect("failed to write tarball payload");
+    let contents = build_gzip_tarball(&build_dir, CURRENT_TARBALL, "payload").await;
+
+    world.paced_download_server = Some(PacedDownloadServer::start(
+        &served,
+        &format!("tarball/current/{CURRENT_TARBALL}"),
+        contents,
+        PACED_TARBALL_CHUNK_BYTES,
+        PACED_TARBALL_CHUNK_DELAY,
+    ));
+    allow_base_overrides(world);
+    let base = world
+        .paced_download_server
+        .as_ref()
+        .expect("paced download server was just started")
+        .base_url();
+    world.command_env.push((
+        "ROCM_CLI_THEROCK_RELEASE_TARBALL_BASE",
+        format!("{base}/tarball/current/").into(),
+    ));
+}
+
+#[when("the user installs the tarball SDK for family gfx120X-all under a real terminal")]
+async fn install_tarball_sdk_under_pty(world: &mut E2eWorld) {
+    // No `--version`: tarball installs only accept an explicit version pin for
+    // a stable ROCm 10+ selector (see `resolve_tarball_artifact_with_timeout`'s
+    // rejection message), so an unpinned request is what reaches the canonical
+    // release catalog here — which the given-step populated with exactly one
+    // candidate, `CURRENT_TARBALL`.
+    //
+    // This scenario is testing the download spinner, not the post-install
+    // torch-runtime-dependency setup — but a real SDK install completing
+    // successfully triggers `ensure_libatomic_for_torch`/`ensure_libnuma_for_torch`,
+    // which install a missing PyTorch runtime library through the real system
+    // package manager whenever the test host happens to lack it. That is slow,
+    // network-dependent, and mutates host state, none of which this scenario
+    // should depend on, so disable it here.
+    world
+        .command_env
+        .push(("ROCM_CLI_DISABLE_TORCH_RUNTIME_DEP_CHECKS", "1".into()));
+    let session = TuiSession::spawn(
+        world,
+        &[
+            "install",
+            "sdk",
+            "--channel",
+            "release",
+            "--format",
+            "tarball",
+            "--family",
+            GROUP_FAMILY,
+            "--yes",
+        ],
+    )
+    .unwrap_or_else(|e| panic!("failed to spawn `rocm install sdk` under a pty: {e}"));
+    world.tui = Some(session);
+    // A successful install's summary is ~20 lines; on the default 24-row
+    // screen (no scrollback) it would scroll the download/extraction spinner
+    // rows off the top before `assert_spinner_lines_cleared` ever reads them,
+    // turning that assertion into a tautology regardless of whether
+    // `Spinner::clear` actually ran. Grow rows only — not `use_detail_size`,
+    // which also widens the terminal and would stop the label from
+    // truncating, defeating the whole point of this scenario.
+    //
+    // Issued immediately after spawn with no synchronization point: this
+    // assumes the child process's fork/exec and first spinner repaint take
+    // longer than this resize call, so the grow always lands before more
+    // than 24 lines could have been written. True at real process-startup
+    // timings; there's no signal to wait on that would prove it instead.
+    world
+        .tui
+        .as_mut()
+        .expect("tui session was just set")
+        .grow_rows(60)
+        .unwrap_or_else(|e| panic!("failed to grow the pty's row count: {e}"));
+}
+
+#[then("the terminal shows an intermediate download progress frame")]
+async fn assert_intermediate_download_progress_frame(world: &mut E2eWorld) {
+    let session = world
+        .tui
+        .as_mut()
+        .expect("no pty session for the tarball install");
+    session
+        .assert_intermediate_download_progress_frame("the tarball install", PTY_SCREEN_TIMEOUT)
+        .await;
+}
+
+#[then("the terminal shows the archive being extracted")]
+async fn assert_extraction_frame_is_shown(world: &mut E2eWorld) {
+    let session = world
+        .tui
+        .as_mut()
+        .expect("no pty session for the tarball install");
+    session
+        .wait_for_screen(&format!("Extracting {CURRENT_TARBALL}"), PTY_SCREEN_TIMEOUT)
+        .await
+        .unwrap_or_else(|e| panic!("extraction spinner frame never appeared: {e}"));
+}
+
+#[then("the tarball install exits cleanly")]
+async fn assert_tarball_install_exits_cleanly(world: &mut E2eWorld) {
+    let session = world
+        .tui
+        .as_mut()
+        .expect("no pty session for the tarball install");
+    session
+        .assert_exits_cleanly("the tarball install", PTY_SCREEN_TIMEOUT)
+        .await;
+}
+
+#[then("the final terminal screen shows neither spinner line")]
+async fn assert_spinner_lines_cleared(world: &mut E2eWorld) {
+    let session = world
+        .tui
+        .as_ref()
+        .expect("no pty session for the tarball install");
+    let screen = session.screen_text();
+    // A live progress suffix (kept intact by `assemble_status_line`) can
+    // truncate this label to a fraction of its length on an 80-column
+    // terminal, so the download line never actually contains the full
+    // "Downloading {CURRENT_TARBALL}" string while it's showing — checking
+    // for that full string here would pass trivially whether or not the line
+    // was cleared. Truncation always keeps the label's head intact and cuts
+    // its tail, so a short prefix is present whenever the line is live and
+    // gone once `Spinner::clear` erases it.
+    //
+    // Note this download-line check by itself can't distinguish a real
+    // `Drop`-time clear from the extraction spinner's first repaint simply
+    // overwriting the same row with `Clear(CurrentLine)` — it would pass
+    // either way, since extraction always starts once the download spinner
+    // stops. The extraction assertion just below, and the ComfyUI scenario's
+    // equivalent check (a spinner with nothing after it to overwrite its
+    // row), are what actually prove `Spinner::clear` runs on `Drop`.
+    let downloading = format!("Downloading {CURRENT_TARBALL}");
+    let downloading_prefix = downloading
+        .get(..DOWNLOADING_PREFIX_LEN)
+        .unwrap_or_else(|| {
+            panic!(
+                "DOWNLOADING_PREFIX_LEN ({DOWNLOADING_PREFIX_LEN}) is not a char boundary in \
+             {downloading:?} — pick a length that lands on one, otherwise this assertion \
+             would silently degrade to checking the untruncated label, which a live \
+             truncated line never shows"
+            )
+        });
+    assert!(
+        !screen.contains(downloading_prefix),
+        "download spinner line was not cleared on completion:\n{screen}"
+    );
+    assert!(
+        !screen.contains(&format!("Extracting {CURRENT_TARBALL}")),
+        "extract spinner line was not cleared on completion:\n{screen}"
+    );
+}
+
 fn preview(world: &mut E2eWorld, args: &[&str]) -> i32 {
     let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(world, args);
     world.cli_output = Some(stdout);
@@ -373,6 +801,44 @@ async fn preview_pinned_wheel_install(world: &mut E2eWorld) {
     );
 }
 
+#[when(
+    "the user previews a wheel SDK install for arch gfx1200 pinned to ROCm 10.0.0 with the toolchain"
+)]
+async fn preview_pinned_wheel_install_with_devel(world: &mut E2eWorld) {
+    preview_ok(
+        world,
+        &[
+            "install",
+            "sdk",
+            "--channel",
+            "release",
+            "--format",
+            "wheel",
+            "--family",
+            RAW_ARCH,
+            "--version",
+            NEXT_ROCM_VERSION,
+            "--devel",
+            "--dry-run",
+        ],
+    );
+}
+
+#[then("the preview requests the gfx1200 device extras with the toolchain")]
+async fn preview_requests_device_extras_with_devel(world: &mut E2eWorld) {
+    // The opt-in half of the same assertion. Whole line for the same reason:
+    // `devel` has to be added to the rocm extras without disturbing the device
+    // payload on any of the four requirements.
+    let expected = format!(
+        "package_specs: rocm[libraries,devel,device-{RAW_ARCH}]=={NEXT_ROCM_VERSION} \
+         torch[device-{RAW_ARCH}]=={NEXT_TORCH_VERSION} \
+         torchvision[device-{RAW_ARCH}]=={NEXT_TORCHVISION_VERSION} \
+         torchaudio=={NEXT_TORCHAUDIO_VERSION}"
+    );
+    assert_contains(world, &expected, "device extras with devel");
+    assert_version_resolution_extras(world, true);
+}
+
 /// Distinct from [`preview_pinned_wheel_install`]: this scenario's whole point
 /// is that the override is ignored and resolution falls through to the real
 /// `DEFAULT_NEXT_RELEASE_PIP_BASE`, so the pin has to be a version that source
@@ -415,6 +881,46 @@ async fn preview_pinned_wheel_install_with_group_family(world: &mut E2eWorld) {
             "wheel",
             "--family",
             GROUP_FAMILY,
+            "--version",
+            NEXT_ROCM_VERSION,
+            "--dry-run",
+        ],
+    );
+}
+
+#[when("the user previews a wheel SDK install for arch gfx1200 pinned to ROCm 10.1.0")]
+async fn preview_newer_pinned_wheel_install(world: &mut E2eWorld) {
+    preview_ok(
+        world,
+        &[
+            "install",
+            "sdk",
+            "--channel",
+            "release",
+            "--format",
+            "wheel",
+            "--family",
+            RAW_ARCH,
+            "--version",
+            NEWER_NEXT_ROCM_VERSION,
+            "--dry-run",
+        ],
+    );
+}
+
+#[when("the user tries to preview a wheel SDK install for arch gfx1200 pinned to ROCm 10.0.0")]
+async fn try_preview_pinned_wheel_install(world: &mut E2eWorld) {
+    preview(
+        world,
+        &[
+            "install",
+            "sdk",
+            "--channel",
+            "release",
+            "--format",
+            "wheel",
+            "--family",
+            RAW_ARCH,
             "--version",
             NEXT_ROCM_VERSION,
             "--dry-run",
@@ -566,16 +1072,110 @@ async fn preview_requests_device_extras(world: &mut E2eWorld) {
     // and torchvision and none for torchaudio, which only the whole spec list
     // shows. A group-bucket or `device-all` regression still matches any subset.
     let expected = format!(
-        "package_specs: rocm[libraries,devel,device-{RAW_ARCH}]=={NEXT_ROCM_VERSION} \
+        "package_specs: rocm[libraries,device-{RAW_ARCH}]=={NEXT_ROCM_VERSION} \
          torch[device-{RAW_ARCH}]=={NEXT_TORCH_VERSION} \
          torchvision[device-{RAW_ARCH}]=={NEXT_TORCHVISION_VERSION} \
          torchaudio=={NEXT_TORCHAUDIO_VERSION}"
     );
     assert_contains(world, &expected, "device extras");
+    assert_version_resolution_extras(world, false);
     assert_contains(
         world,
         &format!("device_target: {RAW_ARCH}"),
         "device target",
+    );
+}
+
+/// What version resolution asked `uv pip compile` for, as opposed to what the
+/// install plan says it will install.
+///
+/// These are produced by two different code paths from one `include_devel`, and
+/// only this assertion covers the first. `package_specs` alone passed while the
+/// requirements handed to `uv` were hardcoded to `rocm[libraries,devel,...]`,
+/// which constrained the chosen versions by a toolchain a default install never
+/// asked for.
+fn assert_version_resolution_extras(world: &mut E2eWorld, include_devel: bool) {
+    let extras = if include_devel {
+        "libraries,devel"
+    } else {
+        "libraries"
+    };
+    let expected = format!(
+        "version_resolution_specs: rocm[{extras},device-{RAW_ARCH}]=={NEXT_ROCM_VERSION} \
+         torch[device-{RAW_ARCH}] torchvision[device-{RAW_ARCH}] \
+         torchaudio=={NEXT_TORCHAUDIO_VERSION}"
+    );
+    assert_contains(world, &expected, "version resolution extras");
+}
+
+#[then("every package in the preview is built for ROCm 10.0.0")]
+async fn preview_installs_one_rocm_build(world: &mut E2eWorld) {
+    // The whole line: one package from the newer build is the regression, and
+    // which package drifts depends on whose metadata fails to name its build.
+    // torchaudio is the build's newest rebuild, not its original release.
+    let expected = format!(
+        "package_specs: rocm[libraries,device-{RAW_ARCH}]=={NEXT_ROCM_VERSION} \
+         torch[device-{RAW_ARCH}]=={NEXT_TORCH_VERSION} \
+         torchvision[device-{RAW_ARCH}]=={NEXT_TORCHVISION_VERSION} \
+         torchaudio=={NEXT_TORCHAUDIO_REBUILD_VERSION}"
+    );
+    assert_contains(world, &expected, "single ROCm build");
+}
+
+/// The `torchaudio_selection:` line, which must name the very torchaudio the
+/// `package_specs:` line installs: the two are asserted together so a note that
+/// describes one build while the plan installs another fails here.
+fn assert_torchaudio_selection(world: &E2eWorld, torchaudio: &str, description: &str) {
+    assert_contains(
+        world,
+        &format!("torchaudio=={torchaudio}"),
+        "torchaudio in the install plan",
+    );
+    assert_contains(
+        world,
+        &format!("torchaudio_selection: torchaudio {torchaudio}, {description}"),
+        "torchaudio selection note",
+    );
+}
+
+#[then(
+    "the preview says its torchaudio is the newest build for ROCm 10.0.0 and not hardware-verified"
+)]
+async fn preview_notes_unverified_torchaudio(world: &mut E2eWorld) {
+    // ROCm 10.0 has no verified torchaudio recorded, so the newest build is
+    // pinned and the plan says that is all it is.
+    assert_torchaudio_selection(
+        world,
+        NEXT_TORCHAUDIO_REBUILD_VERSION,
+        &format!(
+            "the newest build published for ROCm {NEXT_ROCM_VERSION}; it is not hardware-verified, \
+             because no torchaudio release is recorded as verified for this ROCm line"
+        ),
+    );
+}
+
+#[then(
+    "the preview installs the hardware-verified torchaudio for ROCm 10.1.0, not the newer rebuild"
+)]
+async fn preview_installs_verified_torchaudio(world: &mut E2eWorld) {
+    let expected = format!(
+        "package_specs: rocm[libraries,device-{RAW_ARCH}]=={NEWER_NEXT_ROCM_VERSION} \
+         torch[device-{RAW_ARCH}]=={NEWER_NEXT_TORCH_VERSION} \
+         torchvision[device-{RAW_ARCH}]=={NEWER_NEXT_TORCHVISION_VERSION} \
+         torchaudio=={NEWER_NEXT_TORCHAUDIO_VERIFIED_VERSION}"
+    );
+    assert_contains(world, &expected, "verified torchaudio plan");
+    assert_torchaudio_selection(
+        world,
+        NEWER_NEXT_TORCHAUDIO_VERIFIED_VERSION,
+        &format!("the build verified on hardware for ROCm {NEWER_NEXT_ROCM_VERSION}"),
+    );
+    // Recency picked the newer rebuild before; it must appear nowhere now.
+    assert!(
+        !stdout(world).contains(NEWER_NEXT_TORCHAUDIO_NEWEST_VERSION)
+            && !stdout(world).contains("not hardware-verified"),
+        "the preview still names the newer rebuild or an unverified note:\n{}",
+        stdout(world)
     );
 }
 
@@ -624,6 +1224,43 @@ async fn install_fails(world: &mut E2eWorld) {
         rc != 0,
         "expected a refusal, but the install succeeded:\n{}",
         stdout(world)
+    );
+}
+
+#[then(
+    "the failure says no torchaudio for ROCm 10.0.0 is published for this platform, without falling back to another"
+)]
+async fn failure_names_the_missing_torchaudio_build(world: &mut E2eWorld) {
+    let reported = format!(
+        "{}\n{}",
+        stdout(world),
+        world.cli_stderr.as_deref().unwrap_or_default()
+    );
+    // This sentence is only produced where the torchaudio pin is chosen, before
+    // `uv` runs, so it places the failure there rather than at any later check.
+    assert!(
+        reported.contains(&format!(
+            "no torchaudio built for ROCm {NEXT_ROCM_VERSION} is published for this Python and platform"
+        )),
+        "the refusal did not name the missing torchaudio build:\n{reported}"
+    );
+    // The sentence above is what tells the pin refused; these are a second,
+    // cheaper guard. The refusal names no version, so neither fallback build —
+    // the pinned ROCm build's wheel for another platform, or the newer ROCm
+    // build's — can appear unless the pin error was swallowed and resolution
+    // carried on with one of them.
+    for fallback in
+        std::iter::once(NEXT_TORCHAUDIO_FOREIGN_WHEEL_VERSION).chain(NEWER_NEXT_TORCHAUDIO_VERSIONS)
+    {
+        assert!(
+            !reported.contains(fallback),
+            "resolution continued with torchaudio {fallback}:\n{reported}"
+        );
+    }
+    // Likewise for a swallowed error: no install plan was printed.
+    assert!(
+        !reported.contains("package_specs:"),
+        "the refusal still printed an install plan:\n{reported}"
     );
 }
 
@@ -810,6 +1447,29 @@ print(json.dumps({"rocm_sdk": rocm_sdk.__version__, "torch": torch.__version__, 
         result.status,
         String::from_utf8_lossy(&result.stdout),
         String::from_utf8_lossy(&result.stderr)
+    );
+}
+
+#[then("the ROCm 10 runtime provisioned a cp314 Python interpreter")]
+async fn assert_next_runtime_provisioned_cp314(world: &mut E2eWorld) {
+    let install_output = stdout(world);
+    let python = install_output
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("python_executable: "))
+        .expect("live install did not report its managed Python executable");
+    let result = std::process::Command::new(python)
+        .args([
+            "-c",
+            "import sys; print(f'cp{sys.version_info[0]}{sys.version_info[1]}')",
+        ])
+        .output()
+        .unwrap_or_else(|error| panic!("failed to launch managed Python {python}: {error}"));
+    assert!(result.status.success(), "failed to read {python}'s tag");
+    let tag = String::from_utf8_lossy(&result.stdout).trim().to_owned();
+    assert_eq!(
+        tag, "cp314",
+        "ROCm 10.x's vLLM/flash-attn/amd-aiter wheels are cp314-only, but the runtime \
+         provisioned {python} as {tag}"
     );
 }
 

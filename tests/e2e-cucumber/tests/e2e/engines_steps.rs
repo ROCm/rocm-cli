@@ -30,16 +30,17 @@ fn planted_env_path(world: &E2eWorld) -> PathBuf {
     root.path().join("engine-env")
 }
 
-/// Plant the files `rocm engines install` leaves behind — an environment tree
-/// with an interpreter and an activation script, plus the manifest naming them —
-/// so a scenario reaches the shell-launch path with no multi-GiB engine install
-/// and no GPU. Black-box: plain JSON matching the CLI's on-disk schema, not a
+/// Plant an environment tree with an interpreter and an activation script, plus a
+/// manifest naming them, so a scenario reaches the shell-launch path with no
+/// multi-GiB engine install and no GPU. Black-box: plain JSON matching the CLI's on-disk schema, not a
 /// typed import from the product crates.
 ///
-/// `recorded_env_path` is what the manifest claims the environment is, which is
-/// NOT always the environment root: the vLLM install records the directory
-/// holding the engine command instead (`command.parent()` in
-/// `engines/vllm/src/lib.rs`). Callers choose the shape they need.
+/// `recorded_env_path` is the env_path the shell is handed, which is NOT always
+/// the environment root: the vLLM install RESPONSE reports the directory holding
+/// the engine command (`command.parent()` in `engines/vllm/src/install.rs`),
+/// while Lemonade reports the root. No install writes this manifest to disk; it
+/// stands in for that response so the shell is reachable without an install.
+/// Callers choose the shape they need.
 fn plant_engine_env_recorded_as(world: &E2eWorld, recorded_env_path: &std::path::Path) {
     let root = world.isolated_root.as_ref().expect("no isolated root");
     let env_path = planted_env_path(world);
@@ -47,14 +48,11 @@ fn plant_engine_env_recorded_as(world: &E2eWorld, recorded_env_path: &std::path:
     std::fs::create_dir_all(&bin).expect("failed to create the planted engine env");
 
     let python = bin.join("python");
-    std::fs::write(&python, "#!/bin/sh\necho planted-engine-python\n")
-        .expect("failed to write the planted interpreter");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755))
-            .expect("failed to mark the planted interpreter executable");
-    }
+    rocm_core::fake_executable::write_fake_executable(
+        &python,
+        "#!/bin/sh\necho planted-engine-python\n",
+    )
+    .expect("failed to write the planted interpreter");
     // A real environment ships the activation script next to its interpreter.
     // Planting it is what makes "the hint names a file that exists" a statement
     // about the CLI rather than about how thorough this fixture was.
@@ -89,7 +87,7 @@ async fn plant_engine_env(world: &mut E2eWorld) {
 
 #[given("a machine with an engine environment installed the way the engine records it")]
 async fn plant_engine_env_as_installed(world: &mut E2eWorld) {
-    // Same tree, but the manifest records what the vLLM install records: the
+    // Same tree, but env_path is what the vLLM install response reports: the
     // directory the engine command lives in, one level inside the environment.
     let bin = planted_env_path(world).join("bin");
     plant_engine_env_recorded_as(world, &bin);
@@ -122,22 +120,24 @@ async fn assert_prompt_marked(world: &mut E2eWorld) {
     let marker = format!("(rocm:{ENGINE})");
     // The marker must be on the rendered prompt line, which is what the user
     // actually sees — not merely somewhere in the informational block above it.
-    session
-        .wait_for_screen(&marker, SCREEN_TIMEOUT)
-        .await
-        .unwrap_or_else(|e| panic!("engine shell prompt was not marked: {e}"));
-
-    let screen = session.screen_text();
+    // That block names the marker too ("your prompt is now prefixed
+    // (rocm:vllm)") and is printed before bash starts, so waiting for the bare
+    // marker returns before any prompt exists; wait for the prompt line itself.
     // `$` for a normal user's prompt, `#` for root's -- this suite runs as root
     // on the WSL2 hardware lane, so both are genuine prompt lines.
-    let on_a_prompt_line = screen
-        .lines()
-        .filter(|line| line.contains(&marker))
-        .any(|line| line.contains('$') || line.contains('#'));
-    assert!(
-        on_a_prompt_line,
-        "the marker never reached a prompt line:\n{screen}"
-    );
+    session
+        .wait_for_screen_where(
+            "the marker is on a prompt line",
+            |screen| {
+                screen
+                    .lines()
+                    .filter(|line| line.contains(&marker))
+                    .any(|line| line.contains('$') || line.contains('#'))
+            },
+            SCREEN_TIMEOUT,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("the marker never reached a prompt line: {e}"));
 }
 
 #[then("the engine environment's interpreter is the one that runs")]

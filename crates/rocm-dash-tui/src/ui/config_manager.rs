@@ -28,7 +28,7 @@ use rocm_dash_core::state::{SideEffect, State, StateEvent};
 use crate::ui::approval::{
     ApprovalChoice, ApprovalRequest, ApprovalVerdict, approval_key, draw_approval,
 };
-use crate::ui::exec::{exe_label, resolve_exe};
+use crate::ui::exec::{display_args, exe_label, resolve_exe};
 use crate::ui::job_console::{ConsoleOutcome, on_console_key};
 use crate::ui::panel::{self, BoxRole};
 use crate::ui::theme::Theme;
@@ -162,7 +162,7 @@ fn activate_selected(c: &mut ConfigManagerState, jobs: &mut State) -> Vec<SideEf
             let request = ApprovalRequest::new(
                 format!("{} {}", action.label().to_lowercase(), provider),
                 vec![
-                    format!("{} {}", exe_label(&cmd), args.join(" ")),
+                    format!("{} {}", exe_label(&cmd), display_args(&args)),
                     String::new(),
                     "This changes which assistant providers are enabled. No API key \
                      is entered or stored — keys are read from the environment only."

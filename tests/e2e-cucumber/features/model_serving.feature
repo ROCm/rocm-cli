@@ -35,7 +35,7 @@ Feature: Model serving
   # vLLM per-PR canary: one real vLLM serve runs on every PR so a broken serve is
   # caught before merge, while the heavier `@merge-queue` serves
   # (`serve-default-engine-working-endpoint`, `serve-default-engine-inference`,
-  # and `serve-readiness-contract`) run only in the merge queue.
+  # and `serve-readiness-contract`) run only in the merge queue (not on MI300X).
   @id:serve-vllm-inference @requires-gpu @requires-engine:vllm
   Scenario: serve-05 - A served model responds to inference requests on vLLM
     Given a managed runtime is active
@@ -45,11 +45,12 @@ Feature: Model serving
     And the response identifies the correct model
 
   # Large-model coverage (dogfooding W9): serve a representative large model for
-  # each GPU platform end-to-end at least once. MI300X uses Qwen/Qwen3.6-27B through
-  # vLLM; Strix Halo uses the hardware-verified
-  # unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_XL checkpoint through Lemonade. These slow
-  # loads stay off the ordinary per-PR path, and the longer readiness timeout also
-  # gives the first inference request enough time to complete.
+  # each GPU platform end-to-end at least once. The model follows the lane's serve
+  # engine: the vLLM lanes (MI300X, MI350P) use Qwen/Qwen3.6-27B; the Lemonade lanes
+  # (Strix Halo, R9700, W7900) use the unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_XL
+  # checkpoint, hardware-verified on Strix Halo. These slow loads stay off the
+  # ordinary per-PR path, and the longer readiness timeout also gives the first
+  # inference request enough time to complete.
   @id:serve-large-model-inference @requires-gpu @serve-timeout:2400 @nightly
   Scenario: serve-06 - A large platform-specific model serves and responds to inference
     Given a managed runtime is active
@@ -117,7 +118,7 @@ Feature: Model serving
   # Readiness contract: when the CLI reports a service ready, inference must work.
   # Engine-agnostic — the served model+engine follow the host (see
   # `a model is being served on GPU`), so this holds the contract on every GPU
-  # platform. Readiness is gated on a real inference probe, which is what makes
+  # platform that runs it (the merge queue skips MI300X). Readiness is gated on a real inference probe, which is what makes
   # this contract hold rather than race the model load.
   @id:serve-readiness-contract @requires-gpu @merge-queue
   Scenario: serve-12 - A service reported ready can immediately serve inference
@@ -160,6 +161,13 @@ Feature: Model serving
   # fallback). Runs on GPU hardware: on a no-GPU host the GPU-required pre-flight
   # refuses ("no usable AMD GPU") before the index is ever validated, so the
   # index-specific rejection can only be observed where a real device is present.
+  #
+  # This is the live coverage for an index the host does not have. The *masked*
+  # sub-case — an index that exists but is hidden by an active visibility mask —
+  # is a different refusal and owns its own scenarios, serve-19 and serve-20.
+  # The step here accepts several refusal wordings only because which authority
+  # answers depends on the lane: the visible set when it could be enumerated,
+  # the raw amd-smi count when it could not.
   @id:serve-absent-gpu-index-rejected @requires-gpu @requires-os:linux
   Scenario: serve-16 - Serving pinned to a GPU that does not exist is refused
     When the user serves a model pinned to a GPU index that does not exist
@@ -255,3 +263,81 @@ Feature: Model serving
     When the user serves a model with ROCR hiding every GPU a HIP mask names
     Then serving is refused before any engine starts
     And the user is told no AMD GPU was detected
+
+  # A managed serve that fails leaves its record on disk, and the default
+  # `rocm services list` hides it because it is not live. The header then read
+  # "none ready", the list was empty, and nothing on screen said a record
+  # existed or how to read its log - so a user whose serve failed saw the same
+  # screen as a user who had never served at all. The default view now counts
+  # what it hides and names the two commands that reach it. No GPU and no real
+  # serve: the record is planted, so this runs on every lane.
+  @id:serve-past-attempts-surfaced
+  Scenario: serve-22 - A failed local server is counted in the default list
+    Given a local server attempt has failed
+    When the user lists running services
+    Then the list reports the attempt and how to look at it
+
+  # Pre-launch OOM guidance (EAI-8058). When the GPU a serve is pinned to is
+  # nearly out of VRAM, the plan must warn before launch and — for vLLM — name the
+  # `--gpu-memory-utilization` knob that avoids the OOM, closing the loop with the
+  # `diagnose`/`fix` catalog. The GPU lane's real cards are comfortably free, so the
+  # near-full reading is injected via `ROCM_E2E_FORCE_LOW_VRAM` in debug/test builds:
+  # a single synthetic device on this non-APU host keeps the warning honest, while
+  # the engine still launches against the real, free device. Runs on the vLLM GPU
+  # lane; the mock lane has no GPU to pin, and an APU's shared-memory carveout would
+  # legitimately withhold the warning. `--managed` serves under the GPU-required
+  # device policy, which refuses before it ever builds a plan unless a ROCm
+  # runtime is active — hence the same `a managed runtime is active` precondition
+  # every other real-serve scenario on this lane opens with.
+  @id:serve-vllm-low-vram-oom-guidance @requires-gpu @requires-engine:vllm @requires-os:linux
+  Scenario: serve-23 - A vLLM serve plan on a nearly-full GPU points at the memory knob
+    Given a managed runtime is active
+    And the selected GPU is reported nearly out of VRAM
+    When the user previews a vLLM serve plan pinned to that GPU
+    Then the serve plan warns the GPU is low on VRAM
+    And the serve plan explains how to lower vLLM's memory reservation
+
+  # `--require-api-key` reuse refusal (#604). A running server's key is read once
+  # at launch; reuse cannot retroactively satisfy a demand for auth the server
+  # never got, so the idempotency guard refuses instead of upgrading the record
+  # in place (see `spawn_managed_engine_child` in `service_launch.rs`). This is the
+  # local-side proof that the printed stop hint is not just present but correct
+  # and directly runnable: the scenario stops the service with it and checks the
+  # record is left `stopped`, the same proof `@id:service-stop-yes-stops-a-
+  # running-service` gives the summary's own hint. The idempotency match is keyed
+  # on (engine, canonical model id) only — not a real listening port or process —
+  # so a planted record is enough; no actual Lemonade load is needed. Runs on the
+  # Lemonade GPU lane because `--managed` serve still refuses before reaching
+  # this guard without a live GPU, same as every other `@requires-gpu` scenario
+  # on this lane. Linux-only: `--require-api-key` forces auth even on a loopback
+  # bind, and the serve path's `ensure_public_bind_engine_supported` guard
+  # (defined in `service_launch.rs`, called from `serve_cmd.rs`) refuses that combination
+  # for Lemonade on Windows (its server can't receive the key through the
+  # Windows detached-spawn primitive), so this scenario cannot reach the
+  # refusal it exercises there.
+  @id:serve-require-api-key-refuses-unauthenticated-reuse @requires-gpu @requires-engine:lemonade @requires-os:linux
+  Scenario: serve-24 - Reusing a running server without a key refuses a --require-api-key request
+    Given a managed runtime is active
+    And an unauthenticated Lemonade service is already running for that model
+    When the user serves that same model again with --require-api-key
+    Then the CLI refuses and names the exact command to stop the existing service
+    And running that command actually stops the service
+
+  # ROCMAI-543: a Windows console on the OEM code page (437) renders a UTF-8 em
+  # dash, and other non-ASCII punctuation, as mojibake (e.g. "ΓÇö") instead of
+  # transliterating it. `rocm model` is the flagship instance of that bug class;
+  # this pins the fix at the CLI-output level (not just the internal renderer
+  # unit tests in apps/rocm/src/main.rs) so a future catalog label or hint line
+  # cannot reintroduce it unnoticed. No GPU needed: the command only reads the
+  # built-in catalog.
+  #
+  # The step says ASCII-only rather than punctuation-only because that is what
+  # it enforces: the rule is about the *bytes* on a redirected stream, so a
+  # non-ASCII letter or CJK label would be exactly as unreadable on code page
+  # 437 as an em dash is. Narrowing the assertion to a punctuation class to
+  # match a narrower wording would make this scenario weaker than the
+  # whole-tree contract in xtask/src/ascii_output_contract.rs that it mirrors.
+  @id:serve-model-list-output-is-ascii
+  Scenario: serve-25 - The recommended model list prints ASCII-only text
+    When the user lists recommended models
+    Then the model list output contains only ASCII characters

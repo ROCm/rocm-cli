@@ -123,6 +123,10 @@ pub struct HostCapability {
     /// Stable platform identity derived from hardware, not from an artifact name:
     /// "mock" (no AMD GPU), else the family/target (e.g. "mi300x", "strix-halo").
     pub platform_slug: String,
+    /// Whether two file names differing only in letter case are two files under
+    /// the temp root the scenarios' isolated roots are created in. Gates
+    /// `@requires-case-sensitive-fs`; see [`probe_case_sensitive_fs`].
+    pub case_sensitive_fs: bool,
 }
 
 impl HostCapability {
@@ -165,6 +169,11 @@ pub struct PlatformVersions {
     /// Installed lemonade server version, e.g. "10.6.0" (`lemond --version`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lemonade: Option<String>,
+    /// Release channel ("release" | "nightly") the active runtime was installed
+    /// under, read from its registry record — never a workflow-passed label, so
+    /// a mislabeled `--channel` flag can't misreport what's actually installed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
 }
 
 /// Collect component versions for the report from the installed managed runtime.
@@ -192,8 +201,9 @@ pub fn collect_versions(runtimes_dir: Option<&std::path::Path>) -> PlatformVersi
     // ROCm/vLLM/lemonade versions come from the installed managed runtime. Only
     // available when CI provides a persistent runtimes dir (E2E_SHARED_RUNTIMES_DIR)
     // — mock has no runtime, and per-scenario isolated installs are gone by now.
-    if let Some((rocm, root)) = runtimes_dir.and_then(active_runtime_install_root) {
+    if let Some((rocm, channel, root)) = runtimes_dir.and_then(active_runtime_install_root) {
         v.rocm = Some(rocm);
+        v.channel = channel;
         // vLLM: parse the version out of `.../site-packages/vllm-<ver>.dist-info`.
         v.vllm = vllm_version_from_venv(&root);
         // lemonade: `<root>/engines/lemonade/runtime/lemond --version`.
@@ -203,8 +213,9 @@ pub fn collect_versions(runtimes_dir: Option<&std::path::Path>) -> PlatformVersi
     v
 }
 
-/// Read the active managed runtime's `(version, install_root)` from the runtimes
-/// registry. Returns `None` when the tree names no single runtime.
+/// Read the active managed runtime's `(version, channel, install_root)` from the
+/// runtimes registry. Returns `None` when the tree names no single runtime.
+/// `channel` is `None` for a registry record predating the field.
 ///
 /// Which runtime that is comes from [`crate::shared_runtime::runtime_key_to_activate`],
 /// the same answer the scenarios activate — so the version this report attributes
@@ -235,12 +246,16 @@ pub fn collect_versions(runtimes_dir: Option<&std::path::Path>) -> PlatformVersi
 /// reads as unknown, which is the honest outcome; a wrong version reads as fact.
 fn active_runtime_install_root(
     runtimes_dir: &std::path::Path,
-) -> Option<(String, std::path::PathBuf)> {
+) -> Option<(String, Option<String>, std::path::PathBuf)> {
     let key = crate::shared_runtime::runtime_key_to_activate(runtimes_dir)?;
     let manifest = runtimes_dir.join("registry").join(format!("{key}.json"));
     let json: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(manifest).ok()?).ok()?;
     let version = json.get("version")?.as_str()?.to_owned();
+    let channel = json
+        .get("channel")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
     // Resolve the root inside the shared tree first; fall back to the manifest's
     // recorded install_root only if that derived path doesn't exist.
     let derived = runtimes_dir.join("wheel").join(&key);
@@ -249,7 +264,7 @@ fn active_runtime_install_root(
     } else {
         std::path::PathBuf::from(json.get("install_root")?.as_str()?)
     };
-    Some((version, root))
+    Some((version, channel, root))
 }
 
 /// Select the canonical aggregate wheel runtime from `rocm runtimes list` output.
@@ -361,6 +376,7 @@ fn probe_host_capability() -> HostCapability {
     let effective_serve_engine = effective_serve_engine(gfx_target.as_deref(), &os_family);
     let platform_slug =
         derive_platform_slug(has_amd_gpu, gfx_target.as_deref(), &os_family, is_wsl);
+    let case_sensitive_fs = probe_case_sensitive_fs(root);
 
     HostCapability {
         os_family,
@@ -371,7 +387,33 @@ fn probe_host_capability() -> HostCapability {
         available_engines,
         effective_serve_engine,
         platform_slug,
+        case_sensitive_fs,
     }
+}
+
+/// Whether `dir`'s filesystem keeps two names that differ only in letter case
+/// apart.
+///
+/// Probed rather than inferred from the OS: the scenarios' isolated roots are
+/// `TempDir`s, which follow `$TMPDIR`, and on Linux that can be a casefolded
+/// directory or a mounted Windows/exFAT path — still `os_family` `linux`. The
+/// probe's own temp dir is created the same way, so it answers for the same
+/// filesystem the scenarios write to.
+///
+/// Writes a lower-case and an upper-case name, then re-reads the lower-case
+/// one: on a case-insensitive filesystem the second write landed on the first
+/// file. Checking only that the upper-case path exists would not do, because
+/// there it resolves to the lower-case file. Any I/O error answers `false`: the
+/// premise has not been shown to hold.
+fn probe_case_sensitive_fs(dir: &std::path::Path) -> bool {
+    let probe = || -> std::io::Result<bool> {
+        let dir = dir.join("case-probe");
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(dir.join("case-twin"), "lower")?;
+        std::fs::write(dir.join("CASE-TWIN"), "upper")?;
+        Ok(std::fs::read_to_string(dir.join("case-twin"))? == "lower")
+    };
+    probe().unwrap_or(false)
 }
 
 /// Run `rocm <args>` with an isolated config/data/cache root, returning stdout
@@ -510,6 +552,10 @@ fn probe_amd_gpu_count() -> Option<usize> {
 /// Off Linux the product's own probe returns `None` too, so the count is
 /// unknown and every `@requires-multi-gpu` scenario resolves to skip.
 #[cfg(not(target_os = "linux"))]
+// Platform stub. The `cfg` sibling calls non-const code, so making only this
+// arm `const` would give the two platforms different signatures and push
+// `missing_const_for_fn` onto every caller in turn.
+#[allow(clippy::missing_const_for_fn)]
 fn probe_amd_gpu_count() -> Option<usize> {
     None
 }
@@ -755,6 +801,7 @@ mod tests {
             available_engines: vec!["lemonade".to_owned(), "vllm".to_owned()],
             effective_serve_engine: "lemonade".to_owned(),
             platform_slug: "strix-halo".to_owned(),
+            case_sensitive_fs: false,
         };
         assert!(strix.engine_available("lemonade"));
         // vLLM adapter is "built-in" but cannot start on Windows / non-dcgpu.
@@ -769,6 +816,7 @@ mod tests {
             available_engines: vec!["lemonade".to_owned(), "vllm".to_owned()],
             effective_serve_engine: "vllm".to_owned(),
             platform_slug: "mi300x".to_owned(),
+            case_sensitive_fs: true,
         };
         assert!(mi300x.engine_available("vllm"));
         assert!(mi300x.engine_available("lemonade"));
@@ -954,6 +1002,19 @@ Local model engines
             ("gfx950:sramecc+:xnack-", "mi350p"),
             ("gfx942", "mi300x"),
             ("gfx94X-dcgpu", "mi300x"),
+            // The consumer/workstation RDNA parts slug as themselves, and the
+            // rad3 (R9700) and W7900 lanes both depend on that: their report
+            // artifacts are keyed off the bare family in
+            // `xtask::e2e_report::label_for_root_report`.
+            //
+            // Pinned because the fallthrough is the absence of a rule, which no
+            // other assertion here would notice losing. `rocm_core`'s
+            // similarly-named `normalize_therock_family` DOES fold these into
+            // `gfx110X-all`/`gfx120X-all` for wheel selection; aligning the two
+            // would send both lanes' artifacts to `e2e-unknown-report` with
+            // every test still green.
+            ("gfx1100", "gfx1100"),
+            ("gfx1201", "gfx1201"),
         ] {
             assert_eq!(
                 derive_platform_slug(true, Some(gfx_target), "linux", false),
@@ -981,6 +1042,15 @@ Local model engines
     }
 
     fn write_manifest(runtimes_dir: &std::path::Path, key: &str, version: &str) {
+        write_manifest_with_channel(runtimes_dir, key, version, "release");
+    }
+
+    fn write_manifest_with_channel(
+        runtimes_dir: &std::path::Path,
+        key: &str,
+        version: &str,
+        channel: &str,
+    ) {
         let registry = runtimes_dir.join("registry");
         std::fs::create_dir_all(&registry).expect("create registry");
         let install_root = runtimes_dir.join("wheel").join(key);
@@ -991,6 +1061,7 @@ Local model engines
                 "runtime_key": key,
                 "version": version,
                 "install_root": install_root,
+                "channel": channel,
             })
             .to_string(),
         )
@@ -1006,15 +1077,17 @@ Local model engines
         let tmp = tempfile::TempDir::with_prefix("capability-").expect("temp dir");
         let dir = tmp.path();
         write_manifest(dir, "release-wheel-gfx94x-dcgpu-7-13-0", "7.13.0");
-        write_manifest(dir, "release-wheel-multi-arch-7-14-0", "7.14.0");
+        write_manifest_with_channel(dir, "release-wheel-multi-arch-7-14-0", "7.14.0", "nightly");
         std::fs::write(
             dir.join("active.json"),
             r#"{"runtime_key": "release-wheel-multi-arch-7-14-0"}"#,
         )
         .expect("write marker");
 
-        let (version, root) = active_runtime_install_root(dir).expect("a runtime is named");
+        let (version, channel, root) =
+            active_runtime_install_root(dir).expect("a runtime is named");
         assert_eq!(version, "7.14.0");
+        assert_eq!(channel.as_deref(), Some("nightly"));
         assert_eq!(
             root,
             dir.join("wheel").join("release-wheel-multi-arch-7-14-0")
@@ -1031,5 +1104,34 @@ Local model engines
         write_manifest(dir, "release-wheel-multi-arch-7-14-0", "7.14.0");
 
         assert!(active_runtime_install_root(dir).is_none());
+    }
+
+    /// The answer the scenarios rely on wherever they normally run: a Linux temp
+    /// dir keeps case twins apart. Native Windows temp dirs fold case, so this
+    /// has no premise there.
+    #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "needs a case-sensitive temp dir, which only Linux provides by default"
+    )]
+    fn case_probe_reports_a_case_sensitive_temp_dir() {
+        let tmp = tempfile::TempDir::with_prefix("capability-").expect("temp dir");
+        assert!(probe_case_sensitive_fs(tmp.path()));
+        // Both twins were written as separate files, which is the exact premise
+        // the gated scenario needs.
+        let entries = std::fs::read_dir(tmp.path().join("case-probe"))
+            .expect("probe dir")
+            .count();
+        assert_eq!(entries, 2);
+    }
+
+    /// A probe that cannot write has not shown the premise holds, so the gate
+    /// must skip rather than let the scenario fail on a fixture it never had.
+    #[test]
+    fn case_probe_answers_false_when_it_cannot_write() {
+        let tmp = tempfile::TempDir::with_prefix("capability-").expect("temp dir");
+        let not_a_dir = tmp.path().join("plain-file");
+        std::fs::write(&not_a_dir, "").expect("write file");
+        assert!(!probe_case_sensitive_fs(&not_a_dir));
     }
 }

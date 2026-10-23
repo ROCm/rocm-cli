@@ -202,12 +202,22 @@ reason = "`automations list` publishes no usable identifier, so the checks it li
 
 # --- EAI-8049: the engine shell's activation hint names a path that is not there ---
 # `engines shell` builds the hint by appending the interpreter directory to the
-# manifest's env_path, but the vLLM install records env_path as the directory
-# CONTAINING the command, so the hint doubles that segment and points at a file
-# nobody can source. Container-measured: with a vLLM-shaped manifest the hint
-# named `<env>/bin/bin/activate` (absent) while a root-shaped one named
-# `<env>/bin/activate` (present). Remove this row once the two agree.
+# resolved env_path. Users reach it through the auto-install branch of
+# `resolve_engine_env`, which uses the install response's env_path live, and the
+# vLLM install reports that as the directory CONTAINING the command
+# (`command.parent()`, engines/vllm/src/install.rs) while Lemonade reports the
+# root. The hint therefore doubles the segment and points at a file nobody can
+# source. Container-measured: with a bin-shaped env_path the hint named
+# `<env>/bin/bin/activate` (absent) while a root-shaped one named
+# `<env>/bin/activate` (present).
+#
+# The scenario plants a bin-shaped manifest as a stand-in for that response: no
+# install writes such a manifest to disk, it is only the cheapest way to hand the
+# shell the value the vLLM install reports. A fix in engines/vllm that reports the
+# environment root therefore closes EAI-8049 but does NOT flip this row, since the
+# planted manifest is unchanged; delete the row and rewrite or delete the
+# scenario together with that fix. Only a fix to the hint composition flips it. ---
 [["engine-shell-activation-hint-is-usable"]]
 when = {}
 bug = "EAI-8049"
-reason = "`engines shell` prints an activation hint whose path does not exist, because the recorded env_path already includes the interpreter directory. The scenario plants a manifest in that recorded shape, so it clears only when the hint is composed correctly for an already-recorded env_path — changing what a fresh install writes does not on its own repair the environments already on disk."
+reason = "`engines shell` prints an activation hint whose path does not exist, because the env_path it is given (as reported by the vLLM install response) already includes the interpreter directory."

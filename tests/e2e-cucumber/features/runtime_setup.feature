@@ -1,5 +1,15 @@
 Feature: Runtime configuration
 
+  # The acceptance criterion for the runtime-only default, kept engine-agnostic
+  # on purpose: every GPU lane must check that a fresh install registers,
+  # activates, still carries an inference engine, and omits the compiler
+  # toolchain. Pinning this to one engine would drop that check on the lanes
+  # where that engine is not the effective one.
+  #
+  # The last two Thens are the same fact from the two surfaces that can
+  # disagree: what the install recorded, and what the diagnostic tells the user
+  # it recorded. The toolchain is now something a user can end up without, so
+  # `rocm examine` staying silent about it is its own defect.
   @id:runtime-install-sdk-active @requires-gpu @nightly
   Scenario: runtime-01 - Installing the SDK makes it the active runtime
     Given a machine with no CLI-managed runtimes
@@ -7,6 +17,8 @@ Feature: Runtime configuration
     Then a runtime is registered
     And the runtime is set as active
     And the runtime includes an inference engine
+    And the runtime excludes the compiler toolchain
+    And the inspection reports the active runtime has no compiler toolchain
 
   # Dogfooding #17: re-provisioning was observed writing inside the previous
   # runtime, producing a recursively nested `runtimes/wheel/.../runtimes/wheel/`
@@ -321,7 +333,7 @@ Feature: Runtime configuration
   # environment and has no llama.cpp backend to align; `@nightly` for the same
   # reason as the vLLM torch-alignment scenarios above -- a real managed SDK
   # and a real backend download, not something to repeat on every PR.
-  @id:runtime-lemonade-backend-alignment-reported @requires-gpu @requires-engine:lemonade @nightly
+  @id:runtime-lemonade-backend-alignment-reported @requires-gpu @requires-os:windows @requires-engine:lemonade @nightly
   Scenario: runtime-16 - Reinstalling Lemonade reports whether its ROCm backend was aligned
     Given a managed runtime is active
     When the user reinstalls the lemonade engine
@@ -345,3 +357,61 @@ Feature: Runtime configuration
     When the user reinstalls the lemonade engine
     Then the CLI reports that Lemonade's backend alignment was skipped by the opt-out
     And the packaged pin survives the install
+
+  # The other half: that a runtime installed without the toolchain can actually
+  # serve. vLLM compiles Triton kernels at runtime, which is the case most
+  # likely to need `devel`, so it is the one worth proving end to end.
+  @id:runtime-install-sdk-serves-without-toolchain @requires-gpu @requires-engine:vllm @nightly
+  Scenario: runtime-18 - A runtime-only SDK install serves vLLM inference
+    Given a machine with no CLI-managed runtimes
+    When the user installs the SDK
+    Then the runtime excludes the compiler toolchain
+    When the user serves a model on GPU from the installed runtime
+    And the user sends a chat completion request
+    Then the response contains a model reply
+    And the response identifies the correct model
+
+  # gfx90c -- the Vega iGPU in Renoir/Lucienne/Cezanne/Barcelo APUs -- has no
+  # TheRock build. It used to normalize through the loose `gfx90` arm to the
+  # data-center family `gfx90X-dcgpu`, so on a Ryzen 4000/5000 laptop a plain
+  # `rocm install sdk` resolved a data-center SDK for a mobile iGPU.
+  #
+  # The honest scenario would run on such a laptop, and there is no lane with
+  # one: no CI runner has a Vega APU, and detection reads real sysfs/WMI with no
+  # override to fake a target with (see `detect_host_gfx_target`). What is
+  # reachable from any lane is the refusal through the other door the user can
+  # open -- naming the target explicitly. The two doors do not print the same
+  # sentence (`unsupported_host_gpu_message` says "detected"; this one names
+  # where the target was asked from), but they share the wording the Thens pin
+  # and both are gated on the same `gfx_target_has_no_rocm_build`.
+  #
+  # So this scenario is evidence that the refusal reaches the user intact
+  # through the `--family` door. The detected-host door -- the one a real Ryzen
+  # 4000/5000 laptop opens -- has no end-to-end lane at all; it is covered at
+  # unit level only.
+  #
+  # The scenario is evidence about the *mapping* too, but only transitively,
+  # and only because of how the predicate is written: it answers `true` only
+  # when `normalize_therock_family` also answers `None`, so deleting the gfx90c
+  # arm there turns the refusal off at both doors at once. Were the predicate to
+  # name gfx90c on its own, the explicit door would keep refusing from its own
+  # copy of the target name and this scenario would stay green through exactly
+  # the regression it exists to catch. Both halves of that are measured, not
+  # assumed -- see the mutant list under "GPU targets with no ROCm build" in
+  # docs/testing.md. The direct, non-transitive evidence about the mapping is
+  # the unit tests, and `no_rocm_build_implies_no_therock_family` is what keeps
+  # the predicate from drifting away from it.
+  #
+  # Asserting only that the command fails would pass on the old code too: an
+  # unrecognized `--family` already fell through to host detection and failed on
+  # the no-GPU lane for an unrelated reason. So the Thens pin which refusal it
+  # is. The first catches a reopened catch-all: with the gfx90c arm gone the
+  # target resolves to `gfx90X-dcgpu` and no refusal is printed, so "no ROCm SDK
+  # build" is absent however the run then ends. The second guards the weaker
+  # failure where a refusal is printed but still dangles a family name in front
+  # of the user.
+  @id:runtime-install-sdk-refuses-unsupported-gpu-target
+  Scenario: runtime-19 - Asking for a GPU target ROCm does not build is refused outright
+    When the user dry-runs an SDK install for the gfx90c Vega iGPU
+    Then the install is refused as having no ROCm build for that GPU
+    And the refusal offers no package family to install instead

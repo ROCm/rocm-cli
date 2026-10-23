@@ -181,7 +181,11 @@ pub fn running_as_root() -> bool {
 
 /// Whether the current process is running as root. Always false off Linux.
 #[cfg(not(target_os = "linux"))]
-pub const fn running_as_root() -> bool {
+// Platform stub. The `cfg` sibling calls non-const code, so making only this
+// arm `const` would give the two platforms different signatures and push
+// `missing_const_for_fn` onto every caller in turn.
+#[allow(clippy::missing_const_for_fn)]
+pub fn running_as_root() -> bool {
     false
 }
 
@@ -819,99 +823,272 @@ pub fn build_libnuma_install_plan(os_id: &str, id_like: &str) -> SystemPackageIn
     }
 }
 
+/// One of the `build_*_install_plan` functions: a distribution's `ID` and
+/// `ID_LIKE` to the plan that installs one runtime on it.
+pub type InstallPlanBuilder = fn(&str, &str) -> SystemPackageInstallPlan;
+
+/// `build`'s plan for the distribution the os-release `text` at `path`
+/// declares, naming `path` instead of always `/etc/os-release` in an
+/// unreadable-line message.
+///
+/// Unit tests that fixture bare `text` (never the real host) construct an
+/// [`crate::hardware_root::OsRelease`] with
+/// [`crate::hardware_root::OsRelease::found`] and call
+/// [`plan_for_os_release_read`]; every production call site knows the real
+/// path it read and calls this function or [`plan_for_os_release_read`]
+/// directly.
+///
+/// An unreadable file (see [`crate::os_release`]) plans nothing, and the
+/// reason names the line that made it unreadable and what to change on it,
+/// ahead of `build`'s own manual-install advice for an unknown distribution.
+/// Without that, the plan would blame the distribution for what is a fixable
+/// line in the file.
+#[must_use]
+pub fn plan_for_os_release_at(
+    path: &str,
+    text: &str,
+    build: InstallPlanBuilder,
+) -> SystemPackageInstallPlan {
+    match crate::os_release::id_and_id_like(text) {
+        Ok((os_id, id_like)) => build(&os_id, &id_like),
+        Err(unreadable) => {
+            let mut plan = build("", "");
+            plan.reason = format!(
+                "{path} {unreadable}, so the distribution cannot be read; to fix it, {}. {}",
+                unreadable.fix(),
+                plan.reason
+            );
+            plan
+        }
+    }
+}
+
+/// [`plan_for_os_release_at`] for `read`.
+///
+/// Names the file actually read in an unreadable-line message, and reports a
+/// file that exists but could not be read as itself rather than as an unknown
+/// distribution. Without the latter, a host whose `/etc/os-release` is merely
+/// unreadable (permission denied, a directory in its place) would say only
+/// "Could not map distribution (ID=)" — the same message an actually unknown
+/// distribution gets, sending the user looking for a support gap instead of
+/// a filesystem problem. The real cause is now prepended ahead of that
+/// generic message, not substituted for it — `build("", "")` still produces
+/// it, since nothing else identifies the distribution either.
+#[must_use]
+pub fn plan_for_os_release_read(
+    read: &crate::hardware_root::OsRelease,
+    build: InstallPlanBuilder,
+) -> SystemPackageInstallPlan {
+    if let crate::hardware_root::OsRelease::Unreadable { path, error } = read {
+        let mut plan = build("", "");
+        plan.reason = format!(
+            "{}, so the distribution cannot be read. {}",
+            crate::hardware_root::unreadable_prefix(path, error),
+            plan.reason
+        );
+        return plan;
+    }
+    plan_for_os_release_at(read.path(), read.text(), build)
+}
+
+/// What a user missing a runtime is told to do, and whether the plan behind
+/// the advice installs anything.
+///
+/// `rocm engines install vllm --yes` runs the same plan
+/// ([`plan_for_os_release_read`] over the same builder and the same real
+/// file), so
+/// a message may offer that command only when [`InstallHint::plan_installs`]
+/// is true; [`InstallHint::or`] does the offering.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstallHint {
+    /// The commands the plan runs, or the manual-install advice.
+    pub text: String,
+    /// Whether the plan is supported and has commands to run.
+    pub plan_installs: bool,
+}
+
+impl InstallHint {
+    /// The hint, followed by `, or {alternative}` only when the plan installs
+    /// something. For an unknown distribution or an unreadable file, an
+    /// installer that would plan nothing is not offered.
+    #[must_use]
+    pub fn or(&self, alternative: &str) -> String {
+        if self.plan_installs {
+            format!("{}, or {alternative}", self.text)
+        } else {
+            self.text.clone()
+        }
+    }
+}
+
+impl std::fmt::Display for InstallHint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
+/// The hint for os-release `text` read from `path`, naming that path in any
+/// unreadable-line message: the commands [`plan_for_os_release_at`] plans
+/// with `build` when it plans any, otherwise `manual` — followed, for an
+/// unreadable file, by the line that made it so and what to change on it.
+///
+/// Off Linux this has no non-test caller — [`install_hint_for_read`],
+/// its only production caller, is itself dead there for the same reason.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn install_hint_for_at(
+    path: &str,
+    text: &str,
+    build: InstallPlanBuilder,
+    manual: &str,
+) -> InstallHint {
+    if let Err(unreadable) = crate::os_release::id_and_id_like(text) {
+        return InstallHint {
+            text: format!(
+                "{manual}; {path} {unreadable}, so the distribution cannot be read; \
+                 to fix it, {}",
+                unreadable.fix()
+            ),
+            plan_installs: false,
+        };
+    }
+    let plan = plan_for_os_release_at(path, text, build);
+    if plan.supported && !plan.commands.is_empty() {
+        let rendered = plan
+            .commands
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(" && ");
+        return InstallHint {
+            text: format!("install it with `{rendered}`"),
+            plan_installs: true,
+        };
+    }
+    InstallHint {
+        text: manual.to_owned(),
+        plan_installs: false,
+    }
+}
+
+/// [`install_hint_for_at`] for `read`, naming the file actually read, and
+/// reporting a file that exists but could not be read as itself rather than
+/// as an unknown distribution — the same reasoning as
+/// [`plan_for_os_release_read`], for the hint rather than the plan.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn install_hint_for_read(
+    read: &crate::hardware_root::OsRelease,
+    build: InstallPlanBuilder,
+    manual: &str,
+) -> InstallHint {
+    if let crate::hardware_root::OsRelease::Unreadable { path, error } = read {
+        return InstallHint {
+            text: format!(
+                "{manual}; {}, so the distribution cannot be read",
+                crate::hardware_root::unreadable_prefix(path, error)
+            ),
+            plan_installs: false,
+        };
+    }
+    install_hint_for_at(read.path(), read.text(), build, manual)
+}
+
+/// The real host's `/etc/os-release`, falling back to `/usr/lib/os-release`
+/// when the former is absent (per `os-release(5)`).
+///
+/// Not routed through [`crate::host_path`]: the hints name package-manager
+/// commands for the real machine, so a simulated host root must not choose
+/// their distribution.
+#[cfg(target_os = "linux")]
+fn real_os_release() -> crate::hardware_root::OsRelease {
+    crate::hardware_root::read_os_release(crate::hardware_root::identity_path_for_str)
+}
+
+const OPENMPI_MANUAL_HINT: &str = "install your distribution's OpenMPI runtime package (providing libmpi.so / libmpi_cxx.so and mpirun)";
+const LIBATOMIC_MANUAL_HINT: &str =
+    "install your distribution's libatomic runtime package (providing libatomic.so.1)";
+const LIBNUMA_MANUAL_HINT: &str =
+    "install your distribution's numactl runtime package (providing libnuma.so.1)";
+
+/// Build a short, distro-aware hint describing how to install the OpenMPI
 /// runtime that vLLM requires, for embedding in user-facing error messages.
 ///
-/// On Linux it reads `/etc/os-release` and returns the package-manager command
+/// On Linux it reads `/etc/os-release` (falling back to `/usr/lib/os-release`
+/// per `os-release(5)`) and returns the package-manager command
 /// from [`build_openmpi_install_plan`] when the distribution is recognized,
 /// otherwise a generic instruction. Off Linux it returns a generic message,
 /// since the OpenMPI path is not exercised there.
-pub fn install_hint() -> String {
+/// [`InstallHint::or`] offers an automatic install only when that plan
+/// installs something.
+pub fn install_hint() -> InstallHint {
     #[cfg(target_os = "linux")]
     {
-        let os_release = std::fs::read_to_string("/etc/os-release").unwrap_or_default();
-        let field = |key: &str| parse_os_release_field(&os_release, key).unwrap_or_default();
-        let plan = build_openmpi_install_plan(&field("ID"), &field("ID_LIKE"));
-        if plan.supported && !plan.commands.is_empty() {
-            let rendered = plan
-                .commands
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(" && ");
-            return format!("install it with `{rendered}`");
+        install_hint_for_read(
+            &real_os_release(),
+            build_openmpi_install_plan,
+            OPENMPI_MANUAL_HINT,
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        InstallHint {
+            text: OPENMPI_MANUAL_HINT.to_owned(),
+            plan_installs: false,
         }
     }
-    "install your distribution's OpenMPI runtime package (providing libmpi.so / libmpi_cxx.so and mpirun)".to_owned()
 }
 
 /// Build a short, distro-aware hint describing how to install the `libatomic`
 /// runtime that vLLM requires, for embedding in user-facing error messages.
 ///
-/// On Linux it reads `/etc/os-release` and returns the package-manager command
+/// On Linux it reads `/etc/os-release` (falling back to `/usr/lib/os-release`
+/// per `os-release(5)`) and returns the package-manager command
 /// from [`build_libatomic_install_plan`] when the distribution is recognized,
 /// otherwise a generic instruction. Off Linux it returns a generic message.
-pub fn libatomic_install_hint() -> String {
+/// [`InstallHint::or`] offers an automatic install only when that plan
+/// installs something.
+pub fn libatomic_install_hint() -> InstallHint {
     #[cfg(target_os = "linux")]
     {
-        let os_release = std::fs::read_to_string("/etc/os-release").unwrap_or_default();
-        let field = |key: &str| parse_os_release_field(&os_release, key).unwrap_or_default();
-        let plan = build_libatomic_install_plan(&field("ID"), &field("ID_LIKE"));
-        if plan.supported && !plan.commands.is_empty() {
-            let rendered = plan
-                .commands
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(" && ");
-            return format!("install it with `{rendered}`");
+        install_hint_for_read(
+            &real_os_release(),
+            build_libatomic_install_plan,
+            LIBATOMIC_MANUAL_HINT,
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        InstallHint {
+            text: LIBATOMIC_MANUAL_HINT.to_owned(),
+            plan_installs: false,
         }
     }
-    "install your distribution's libatomic runtime package (providing libatomic.so.1)".to_owned()
 }
 
 /// Build a short, distro-aware hint describing how to install the real `libnuma`
 /// runtime that PyTorch requires, for embedding in user-facing error messages.
 ///
-/// On Linux it reads `/etc/os-release` and returns the package-manager command
+/// On Linux it reads `/etc/os-release` (falling back to `/usr/lib/os-release`
+/// per `os-release(5)`) and returns the package-manager command
 /// from [`build_libnuma_install_plan`] when the distribution is recognized,
 /// otherwise a generic instruction. Off Linux it returns a generic message.
-pub fn libnuma_install_hint() -> String {
+/// [`InstallHint::or`] offers an automatic install only when that plan
+/// installs something.
+pub fn libnuma_install_hint() -> InstallHint {
     #[cfg(target_os = "linux")]
     {
-        let os_release = std::fs::read_to_string("/etc/os-release").unwrap_or_default();
-        let field = |key: &str| parse_os_release_field(&os_release, key).unwrap_or_default();
-        let plan = build_libnuma_install_plan(&field("ID"), &field("ID_LIKE"));
-        if plan.supported && !plan.commands.is_empty() {
-            let rendered = plan
-                .commands
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(" && ");
-            return format!("install it with `{rendered}`");
+        install_hint_for_read(
+            &real_os_release(),
+            build_libnuma_install_plan,
+            LIBNUMA_MANUAL_HINT,
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        InstallHint {
+            text: LIBNUMA_MANUAL_HINT.to_owned(),
+            plan_installs: false,
         }
     }
-    "install your distribution's numactl runtime package (providing libnuma.so.1)".to_owned()
-}
-
-/// Parse a single `KEY=VALUE` field from `/etc/os-release` contents, stripping
-/// optional surrounding quotes. Returns `None` when the key is absent.
-// Only the Linux `install_hint` path calls this at runtime; off Linux it is
-// exercised solely by cross-platform unit tests.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub(crate) fn parse_os_release_field(text: &str, key: &str) -> Option<String> {
-    for line in text.lines() {
-        let line = line.trim();
-        let Some((name, value)) = line.split_once('=') else {
-            continue;
-        };
-        if name.trim() != key {
-            continue;
-        }
-        let value = value.trim().trim_matches('"').trim_matches('\'');
-        return Some(value.to_owned());
-    }
-    None
 }
 
 /// Build a non-mutating apt invocation for a planned `apt-get install` command.
@@ -1078,28 +1255,352 @@ mod tests {
     }
 
     #[test]
-    fn parses_os_release_fields_with_and_without_quotes() {
-        let text =
-            "NAME=\"Red Hat Enterprise Linux\"\nID=rhel\nID_LIKE=fedora\nVERSION_ID=\"9.4\"\n";
-        assert_eq!(parse_os_release_field(text, "ID").as_deref(), Some("rhel"));
-        assert_eq!(
-            parse_os_release_field(text, "ID_LIKE").as_deref(),
-            Some("fedora")
-        );
-        assert_eq!(
-            parse_os_release_field(text, "VERSION_ID").as_deref(),
-            Some("9.4")
-        );
-        assert_eq!(parse_os_release_field(text, "MISSING"), None);
-    }
-
-    #[test]
     fn install_hint_is_non_empty_and_actionable() {
         // The hint is embedded in the serve preflight error, so it must always
         // give the user something to act on regardless of host distribution.
-        let hint = install_hint();
+        let hint = install_hint().text;
         assert!(!hint.trim().is_empty());
         assert!(hint.to_ascii_lowercase().contains("install"));
+    }
+
+    /// Every builder, as the package plans and hints call it.
+    const BUILDERS: [(&str, InstallPlanBuilder, &str); 3] = [
+        ("openmpi", build_openmpi_install_plan, OPENMPI_MANUAL_HINT),
+        (
+            "libatomic",
+            build_libatomic_install_plan,
+            LIBATOMIC_MANUAL_HINT,
+        ),
+        ("libnuma", build_libnuma_install_plan, LIBNUMA_MANUAL_HINT),
+    ];
+
+    /// The commands a hint names, joined as the hint joins them.
+    fn joined_commands(plan: &SystemPackageInstallPlan) -> String {
+        plan.commands
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(" && ")
+    }
+
+    /// The plan comes from the file's `ID` — and from `ID_LIKE` when `ID` names
+    /// a derivative — read as `sh` reads them: single quotes, and the last of
+    /// a duplicated key. The derivatives include a multi-word `ID_LIKE`, which
+    /// only resolves when `ID` and `ID_LIKE` reach the builder in that order.
+    #[test]
+    fn a_plan_is_built_for_the_distribution_the_file_declares() {
+        for (label, build, _) in BUILDERS {
+            let apt = build("ubuntu", "");
+            let dnf = build("fedora", "");
+            assert_ne!(apt.package_manager, dnf.package_manager, "{label}");
+            assert!(dnf.supported && !dnf.commands.is_empty(), "{label}");
+            for (text, expected) in [
+                ("ID='ubuntu'\n", &apt),
+                ("ID=fedora\nID=ubuntu\n", &apt),
+                // A derivative `ID` resolves through `ID_LIKE`.
+                ("ID=derivative\nID_LIKE='fedora'\n", &dnf),
+                ("ID=derivative\nID_LIKE=\"rhel fedora\"\n", &dnf),
+            ] {
+                assert_eq!(
+                    &plan_for_os_release_read(&crate::hardware_root::OsRelease::found(text), build),
+                    expected,
+                    "{label}: {text:?}"
+                );
+                // And the hint names exactly the commands the plan would run.
+                assert_eq!(
+                    install_hint_for_read(
+                        &crate::hardware_root::OsRelease::found(text),
+                        build,
+                        "manual"
+                    ),
+                    InstallHint {
+                        text: format!("install it with `{}`", joined_commands(expected)),
+                        plan_installs: true,
+                    },
+                    "{label}: {text:?}"
+                );
+            }
+            assert_eq!(
+                install_hint_for_read(
+                    &crate::hardware_root::OsRelease::found("ID=plan9\n"),
+                    build,
+                    "manual"
+                ),
+                InstallHint {
+                    text: "manual".to_owned(),
+                    plan_installs: false,
+                },
+                "{label}"
+            );
+        }
+    }
+
+    /// Each public hint uses its own runtime's builder and manual advice,
+    /// against fixed text rather than the host's file.
+    #[test]
+    fn each_hint_names_its_own_runtime() {
+        let apt = |packages: &str| {
+            format!("install it with `sudo apt-get update && sudo apt-get install -y {packages}`")
+        };
+        assert_eq!(
+            install_hint_for_read(
+                &crate::hardware_root::OsRelease::found("ID=ubuntu\n"),
+                build_openmpi_install_plan,
+                OPENMPI_MANUAL_HINT
+            )
+            .text,
+            apt("openmpi-bin libopenmpi-dev")
+        );
+        assert_eq!(
+            install_hint_for_read(
+                &crate::hardware_root::OsRelease::found("ID=ubuntu\n"),
+                build_libatomic_install_plan,
+                LIBATOMIC_MANUAL_HINT
+            )
+            .text,
+            apt("libatomic1")
+        );
+        assert_eq!(
+            install_hint_for_read(
+                &crate::hardware_root::OsRelease::found("ID=ubuntu\n"),
+                build_libnuma_install_plan,
+                LIBNUMA_MANUAL_HINT
+            )
+            .text,
+            apt("libnuma1")
+        );
+        // And each one's own manual advice for a distribution it cannot map.
+        assert_eq!(
+            install_hint_for_read(
+                &crate::hardware_root::OsRelease::found("ID=plan9\n"),
+                build_openmpi_install_plan,
+                OPENMPI_MANUAL_HINT
+            )
+            .text,
+            "install your distribution's OpenMPI runtime package \
+             (providing libmpi.so / libmpi_cxx.so and mpirun)"
+        );
+        assert_eq!(
+            install_hint_for_read(
+                &crate::hardware_root::OsRelease::found("ID=plan9\n"),
+                build_libatomic_install_plan,
+                LIBATOMIC_MANUAL_HINT
+            )
+            .text,
+            "install your distribution's libatomic runtime package (providing libatomic.so.1)"
+        );
+        assert_eq!(
+            install_hint_for_read(
+                &crate::hardware_root::OsRelease::found("ID=plan9\n"),
+                build_libnuma_install_plan,
+                LIBNUMA_MANUAL_HINT
+            )
+            .text,
+            "install your distribution's numactl runtime package (providing libnuma.so.1)"
+        );
+    }
+
+    /// [`install_hint_for_read`] and [`plan_for_os_release_read`] report a
+    /// file that exists but could not be read as itself, not as an unknown
+    /// distribution — the gap `install_hint_for_at`/`plan_for_os_release_at`
+    /// alone cannot close, since by the time they see `text` the distinction
+    /// between "absent" and "unreadable" is already lost.
+    #[test]
+    fn an_unreadable_file_is_reported_as_itself_not_an_unknown_distribution() {
+        let read = crate::hardware_root::OsRelease::Unreadable {
+            path: "/usr/lib/os-release",
+            error: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied"),
+        };
+        let hint = install_hint_for_read(&read, build_openmpi_install_plan, OPENMPI_MANUAL_HINT);
+        assert_eq!(
+            hint.text,
+            format!(
+                "{OPENMPI_MANUAL_HINT}; /usr/lib/os-release could not be read: denied, so the \
+                 distribution cannot be read"
+            )
+        );
+        assert!(!hint.plan_installs);
+
+        let plan = plan_for_os_release_read(&read, build_openmpi_install_plan);
+        assert!(!plan.supported);
+        assert!(plan.commands.is_empty());
+        assert!(
+            plan.reason
+                .starts_with("/usr/lib/os-release could not be read: denied"),
+            "{}",
+            plan.reason
+        );
+    }
+
+    /// `install_hint_for_read`/`plan_for_os_release_read` are the one seam
+    /// `openmpi::real_os_release()` and `runtime_install_finalize::real_os_release()`
+    /// hand their result to — both now one-line delegations to
+    /// `hardware_root::read_os_release`, so reverting either back to a raw
+    /// `/etc/os-release` read is a type error here, not a silent regression.
+    /// This still pins the behaviour at the seam itself: an `OsRelease` that
+    /// says the fallback path was read produces the same plan and hint a
+    /// primary-path read with the same content would.
+    #[test]
+    fn a_fallback_read_plans_and_hints_exactly_like_a_primary_read() {
+        let fallback = crate::hardware_root::OsRelease::Found {
+            path: "/usr/lib/os-release",
+            text: "ID=ubuntu\n".to_owned(),
+        };
+        let primary = crate::hardware_root::OsRelease::found("ID=ubuntu\n");
+
+        assert_eq!(
+            plan_for_os_release_read(&fallback, build_openmpi_install_plan),
+            plan_for_os_release_read(&primary, build_openmpi_install_plan),
+        );
+        assert_eq!(
+            install_hint_for_read(&fallback, build_openmpi_install_plan, OPENMPI_MANUAL_HINT),
+            install_hint_for_read(&primary, build_openmpi_install_plan, OPENMPI_MANUAL_HINT),
+        );
+        assert_eq!(
+            install_hint_for_read(&fallback, build_openmpi_install_plan, OPENMPI_MANUAL_HINT).text,
+            "install it with `sudo apt-get update && sudo apt-get install -y openmpi-bin libopenmpi-dev`"
+        );
+    }
+
+    /// The message and the plan it describes, together: an unreadable file
+    /// plans nothing, and both the plan's reason and the hint name the line
+    /// and what to change on it, rather than blaming an unknown distribution.
+    /// The hint does not offer the automatic install, because the plan that
+    /// install runs is this one, and it has no commands.
+    #[test]
+    fn an_unreadable_file_plans_nothing_and_names_its_line() {
+        let text = "ID=ubuntu\nexport ID=debian\n";
+        for (label, build, manual) in BUILDERS {
+            let plan =
+                plan_for_os_release_read(&crate::hardware_root::OsRelease::found(text), build);
+            assert!(!plan.supported, "{label}");
+            assert_eq!(plan.package_manager, None, "{label}");
+            assert!(plan.commands.is_empty(), "{label}");
+            assert!(plan.packages.is_empty(), "{label}");
+            assert!(
+                plan.reason.starts_with(
+                    "/etc/os-release line 2 is not a plain assignment: \"export ID=debian\", \
+                     so the distribution cannot be read; to fix it, remove that line or \
+                     rewrite it as NAME=value. Could not map distribution"
+                ),
+                "{label}: {}",
+                plan.reason
+            );
+            let hint =
+                install_hint_for_read(&crate::hardware_root::OsRelease::found(text), build, manual);
+            assert_eq!(
+                hint,
+                InstallHint {
+                    text: format!(
+                        "{manual}; /etc/os-release line 2 is not a plain assignment: \
+                         \"export ID=debian\", so the distribution cannot be read; to fix it, \
+                         remove that line or rewrite it as NAME=value"
+                    ),
+                    plan_installs: false,
+                },
+                "{label}"
+            );
+            assert_eq!(hint.or("rerun with --yes"), hint.text, "{label}");
+        }
+    }
+
+    /// The same malformed line as
+    /// [`an_unreadable_file_plans_nothing_and_names_its_line`], but read
+    /// through the fallback path: both the plan's reason and the hint must
+    /// name `/usr/lib/os-release`, not `/etc/os-release`. Every malformed-line
+    /// test before this one went through either the bare, hardcoded-`/etc`
+    /// functions or [`crate::hardware_root::OsRelease::found`] (which also
+    /// hardcodes `/etc/os-release`), so a regression that hardcoded the path
+    /// back into `plan_for_os_release_read`/`install_hint_for_read` would
+    /// have passed every one of them.
+    #[test]
+    fn a_fallback_reads_malformed_line_names_the_fallback_path() {
+        let read = crate::hardware_root::OsRelease::Found {
+            path: "/usr/lib/os-release",
+            text: "ID=ubuntu\nexport ID=debian\n".to_owned(),
+        };
+        for (label, build, manual) in BUILDERS {
+            let plan = plan_for_os_release_read(&read, build);
+            assert!(!plan.supported, "{label}");
+            assert!(
+                plan.reason.starts_with(
+                    "/usr/lib/os-release line 2 is not a plain assignment: \
+                     \"export ID=debian\", so the distribution cannot be read; to fix \
+                     it, remove that line or rewrite it as NAME=value. Could not map \
+                     distribution"
+                ),
+                "{label}: {}",
+                plan.reason
+            );
+
+            let hint = install_hint_for_read(&read, build, manual);
+            assert_eq!(
+                hint.text,
+                format!(
+                    "{manual}; /usr/lib/os-release line 2 is not a plain assignment: \
+                     \"export ID=debian\", so the distribution cannot be read; to fix it, \
+                     remove that line or rewrite it as NAME=value"
+                ),
+                "{label}"
+            );
+            assert!(!hint.plan_installs, "{label}");
+        }
+    }
+
+    /// An automatic install is offered exactly when the plan it would run
+    /// installs something: for a recognised distribution, and not for an
+    /// unknown one or an unreadable file.
+    #[test]
+    fn the_automatic_install_is_offered_only_when_its_plan_installs() {
+        for (label, build, manual) in BUILDERS {
+            for text in [
+                "ID=ubuntu\n",
+                "ID=plan9\n",
+                "ID=ubuntu\nNAME=a b\n",
+                "ID=ubuntu\r\n",
+            ] {
+                let plan =
+                    plan_for_os_release_read(&crate::hardware_root::OsRelease::found(text), build);
+                let hint = install_hint_for_read(
+                    &crate::hardware_root::OsRelease::found(text),
+                    build,
+                    manual,
+                );
+                let offered = hint.or("rerun with --yes");
+                let installs = plan.supported && !plan.commands.is_empty();
+                assert_eq!(
+                    offered.ends_with(", or rerun with --yes"),
+                    installs,
+                    "{label}: {text:?}: {offered}"
+                );
+                assert_eq!(hint.plan_installs, installs, "{label}: {text:?}");
+            }
+        }
+        // The unreadable cases say what to change on the line.
+        let crlf = install_hint_for_read(
+            &crate::hardware_root::OsRelease::found("ID=ubuntu\r\n"),
+            build_openmpi_install_plan,
+            "manual",
+        );
+        assert!(
+            crlf.text.ends_with(
+                "to fix it, save the file with LF line endings and no control characters"
+            ),
+            "{}",
+            crlf.text
+        );
+        let unquoted = install_hint_for_read(
+            &crate::hardware_root::OsRelease::found("NAME=a b\n"),
+            build_openmpi_install_plan,
+            "manual",
+        );
+        assert!(
+            unquoted
+                .text
+                .ends_with("to fix it, put that line's value in single quotes"),
+            "{}",
+            unquoted.text
+        );
     }
 
     #[cfg(target_os = "linux")]

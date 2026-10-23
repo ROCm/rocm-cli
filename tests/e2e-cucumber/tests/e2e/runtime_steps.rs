@@ -849,7 +849,7 @@ async fn assert_release_device_payload(world: &mut E2eWorld) {
     );
     assert_eq!(
         requested_rocm_extras(preview_rocm_spec(output)),
-        format!("libraries,devel,device-{detected}"),
+        format!("libraries,device-{detected}"),
         "the install does not request exactly this host's device payload:\n{output}"
     );
 
@@ -927,6 +927,135 @@ async fn assert_runtime_has_stack(world: &mut E2eWorld) {
     assert!(
         stdout.contains("torch") || stdout.contains("vllm"),
         "no inference stack found in runtime:\n{stdout}"
+    );
+}
+
+#[then("the runtime excludes the compiler toolchain")]
+async fn assert_runtime_excludes_devel(world: &mut E2eWorld) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("scenario has no isolated state root")
+        .path();
+    let registry = root.join("data/runtimes/registry");
+    let entries = std::fs::read_dir(&registry).unwrap_or_else(|error| {
+        panic!(
+            "failed to read runtime registry {}: {error}",
+            registry.display()
+        )
+    });
+    let manifests = entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        manifests.len(),
+        1,
+        "expected one freshly installed runtime manifest in {}: {manifests:?}",
+        registry.display()
+    );
+
+    let manifest_path = &manifests[0];
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(manifest_path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", manifest_path.display())),
+    )
+    .unwrap_or_else(|error| panic!("failed to parse {}: {error}", manifest_path.display()));
+    assert_eq!(
+        manifest.get("devel").and_then(serde_json::Value::as_bool),
+        Some(false),
+        "default SDK install recorded the compiler toolchain as present: {manifest}"
+    );
+
+    // The specs are the authoritative record — they are what `uv` was handed,
+    // and `InstalledRuntimeManifest::includes_devel` reads the answer back out
+    // of them. Asserting the `devel` field alone would miss the install args
+    // and the manifest disagreeing, which is the drift this guards.
+    //
+    // `wheel_composition` is legitimately absent on a tarball install and on an
+    // adopted runtime, so an unwrap here would report a reachable manifest
+    // state as a missing-field crash the moment this step is reused outside a
+    // wheel install. Name the precondition instead: the failure a future
+    // scenario author needs to read is "this step only applies to wheel
+    // installs", not "Option::unwrap on a None value".
+    let format = manifest
+        .get("format")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("<absent>");
+    let specs = manifest
+        .get("wheel_composition")
+        .and_then(|composition| composition.get("package_specs"))
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or_else(|| {
+            panic!(
+                "this step reads the extras a wheel install requested, but runtime {} \
+                 (format={format}) records no wheel_composition.package_specs. Tarball \
+                 installs and adopted runtimes have none — use this step only on a \
+                 wheel-format install.\n{manifest}",
+                manifest_path.display()
+            )
+        });
+    let rocm_spec = specs
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .find(|spec| spec.starts_with("rocm["))
+        .expect("no rocm requirement in the recorded package_specs");
+    let extras = rocm_spec
+        .strip_prefix("rocm[")
+        .and_then(|rest| rest.split_once(']'))
+        .map(|(extras, _)| extras)
+        .expect("malformed rocm requirement in the recorded package_specs");
+    assert!(
+        !extras
+            .split(',')
+            .map(str::trim)
+            .any(|extra| extra == "devel"),
+        "default SDK install requested the toolchain: {rocm_spec}"
+    );
+
+    let python = manifest
+        .get("python_executable")
+        .and_then(serde_json::Value::as_str)
+        .expect("wheel runtime manifest has no python_executable");
+    let output = std::process::Command::new(python)
+        .args([
+            "-c",
+            "import importlib.metadata as m; print('present' if any(d.metadata['Name'].lower() == 'rocm-sdk-devel' for d in m.distributions()) else 'absent')",
+        ])
+        .output()
+        .unwrap_or_else(|error| {
+            panic!("failed to inspect the installed runtime with {python}: {error}")
+        });
+    assert!(
+        output.status.success(),
+        "failed to enumerate installed runtime packages:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "absent",
+        "default SDK install pulled rocm-sdk-devel back transitively"
+    );
+}
+
+/// The manifest half of this is `the runtime excludes the compiler toolchain`,
+/// which reads the recorded specs directly. This is the half a user can see:
+/// `rocm examine` is where someone looks when a build cannot find `hipcc`, and
+/// a manifest that records the right thing while the diagnostic stays silent
+/// about it is indistinguishable, from the outside, from one that does not.
+#[then("the inspection reports the active runtime has no compiler toolchain")]
+async fn assert_examine_reports_no_toolchain(world: &mut E2eWorld) {
+    let examine = crate::run_rocm_ok(world, &["examine"]);
+    let reported = super::examine_steps::field_value(&examine, "active_runtime_toolchain")
+        .unwrap_or_else(|| {
+            panic!("`rocm examine` reported no toolchain state for the active runtime:\n{examine}")
+        });
+    assert_eq!(
+        reported, "excluded",
+        "the SDK was installed without --devel, but `rocm examine` reports the active \
+         runtime's toolchain as `{reported}`:\n{examine}"
     );
 }
 
@@ -1261,4 +1390,70 @@ async fn assert_freeform_execution_discloses_consent(world: &mut E2eWorld) {
         "the operator is shown a consent flag the plan above did not carry, with \
          nothing saying where it came from:\n{execution}"
     );
+}
+
+/// Ask to install for gfx90c by name, and keep stdout, stderr and the exit code.
+///
+/// `--dry-run` is deliberate: the refusal has to come from family resolution,
+/// before anything is downloaded or written, so the scenario needs no network
+/// and leaves nothing behind. All three streams are kept because the claim
+/// under test is split across them — the message goes to stderr, while a
+/// *resolved* plan (the old behaviour) would go to stdout.
+#[when("the user dry-runs an SDK install for the gfx90c Vega iGPU")]
+async fn user_dry_runs_unsupported_family(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(
+        world,
+        &["install", "sdk", "--family", "gfx90c", "--dry-run"],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+/// Everything the previous step captured, as one string to search.
+fn unsupported_family_attempt(world: &E2eWorld) -> String {
+    format!(
+        "{}\n{}",
+        world.cli_output.as_deref().unwrap_or_default(),
+        world.cli_stderr.as_deref().unwrap_or_default()
+    )
+}
+
+#[then("the install is refused as having no ROCm build for that GPU")]
+async fn assert_unsupported_family_refused(world: &mut E2eWorld) {
+    let rc = world.cli_rc.expect("no SDK install attempt was recorded");
+    let output = unsupported_family_attempt(world);
+    assert!(rc != 0, "the install should have failed:\n{output}");
+    assert!(
+        output.contains("no ROCm SDK build"),
+        "the refusal should say no ROCm SDK build exists:\n{output}"
+    );
+    assert!(
+        output.contains("gfx90c"),
+        "the refusal should name the GPU target that was asked for:\n{output}"
+    );
+}
+
+/// The refusal must not name a package family.
+///
+/// The weaker of the two halves, and worth keeping for the case the stronger
+/// one misses: the generic "unable to resolve a supported family" error lists
+/// every recognized family as a `--family` suggestion, and the old mapping
+/// printed a plan naming `gfx90X-dcgpu`. Either way a family name reaches the
+/// user and invites installing a build for different silicon. Only the
+/// dedicated refusal names none.
+///
+/// A regression in the gfx90c mapping itself is caught by the step above, whose
+/// "no ROCm SDK build" cannot appear once `normalize_therock_family` maps the
+/// target again — see `gfx_target_has_no_rocm_build`, which is conjoined with
+/// that mapping precisely so this scenario cannot pass without it.
+#[then("the refusal offers no package family to install instead")]
+async fn assert_unsupported_family_offers_nothing(world: &mut E2eWorld) {
+    let output = unsupported_family_attempt(world);
+    for family in rocm_core::known_therock_families() {
+        assert!(
+            !output.contains(family),
+            "the refusal must not offer `{family}` for a GPU with no ROCm build:\n{output}"
+        );
+    }
 }

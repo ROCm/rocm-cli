@@ -19,6 +19,7 @@ use ratatui::widgets::Paragraph;
 use rocm_dash_core::state::{JobState, JobStatus, SideEffect, State, StateEvent};
 
 use crate::app::{ScrollTarget, ScrollbarHandle};
+use crate::ui::exec::display_args;
 use crate::ui::modal::{centered_rect, draw_popup_frame};
 use crate::ui::theme::{Theme, readable_text_on};
 
@@ -93,7 +94,7 @@ pub fn draw_job_console(
     theme: &Theme,
 ) -> Vec<ScrollbarHandle> {
     let popup = centered_rect(90, 84, 140, 40, area);
-    let title = format!("{} {}", job.cmd, job.args.join(" "));
+    let title = format!("{} {}", job.cmd, display_args(&job.args));
     let inner = draw_popup_frame(f, popup, title.trim(), theme);
     if inner.height == 0 {
         return Vec::new();

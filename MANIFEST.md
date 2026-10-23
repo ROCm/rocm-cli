@@ -353,6 +353,7 @@ repository.
 | proc-macro-crate | 3.5.0 | MIT OR Apache-2.0 |
 | proc-macro2 | 1.0.106 | MIT OR Apache-2.0 |
 | proc-macro2-diagnostics | 0.10.1 | MIT/Apache-2.0 |
+| proptest | 1.11.0 | MIT OR Apache-2.0 |
 | quick-xml | 0.39.4 | MIT |
 | quinn | 0.11.11 | MIT OR Apache-2.0 |
 | quinn-proto | 0.11.15 | MIT OR Apache-2.0 |
@@ -366,6 +367,7 @@ repository.
 | rand_chacha | 0.9.0 | MIT OR Apache-2.0 |
 | rand_core | 0.6.4 | MIT OR Apache-2.0 |
 | rand_core | 0.9.5 | MIT OR Apache-2.0 |
+| rand_xorshift | 0.4.0 | MIT OR Apache-2.0 |
 | ratatui | 0.30.2 | MIT |
 | ratatui-core | 0.1.2 | MIT |
 | ratatui-crossterm | 0.1.2 | MIT |
@@ -412,6 +414,7 @@ repository.
 | security-framework | 2.11.1 | MIT OR Apache-2.0 |
 | security-framework | 3.7.0 | MIT OR Apache-2.0 |
 | security-framework-sys | 2.17.0 | MIT OR Apache-2.0 |
+| self-replace | 1.5.0 | Apache-2.0 |
 | semver | 1.0.28 | MIT OR Apache-2.0 |
 | serde | 1.0.228 | MIT OR Apache-2.0 |
 | serde_core | 1.0.228 | MIT OR Apache-2.0 |
@@ -420,7 +423,7 @@ repository.
 | serde_json | 1.0.150 | MIT OR Apache-2.0 |
 | serde_path_to_error | 0.1.20 | MIT OR Apache-2.0 |
 | serde_repr | 0.1.20 | MIT OR Apache-2.0 |
-| serde_spanned | 0.6.9 | MIT OR Apache-2.0 |
+| serde_spanned | 1.1.1 | MIT OR Apache-2.0 |
 | serde_urlencoded | 0.7.1 | MIT/Apache-2.0 |
 | serde_with | 3.21.0 | MIT OR Apache-2.0 |
 | serde_with_macros | 3.21.0 | MIT OR Apache-2.0 |
@@ -487,13 +490,11 @@ repository.
 | tokio-rustls | 0.26.4 | MIT OR Apache-2.0 |
 | tokio-tungstenite | 0.28.0 | MIT |
 | tokio-util | 0.7.18 | MIT |
-| toml | 0.8.23 | MIT OR Apache-2.0 |
-| toml_datetime | 0.6.11 | MIT OR Apache-2.0 |
+| toml | 1.1.6+spec-1.1.0 | MIT OR Apache-2.0 |
 | toml_datetime | 1.1.1+spec-1.1.0 | MIT OR Apache-2.0 |
-| toml_edit | 0.22.27 | MIT OR Apache-2.0 |
 | toml_edit | 0.25.12+spec-1.1.0 | MIT OR Apache-2.0 |
-| toml_parser | 1.1.2+spec-1.1.0 | MIT OR Apache-2.0 |
-| toml_write | 0.1.2 | MIT OR Apache-2.0 |
+| toml_parser | 1.1.3+spec-1.1.0 | MIT OR Apache-2.0 |
+| toml_writer | 1.1.2+spec-1.1.0 | MIT OR Apache-2.0 |
 | tower | 0.5.3 | MIT |
 | tower-http | 0.6.11 | MIT |
 | tower-layer | 0.3.3 | MIT |
@@ -514,6 +515,7 @@ repository.
 | typenum | 1.20.1 | MIT OR Apache-2.0 |
 | ucd-trie | 0.1.7 | MIT OR Apache-2.0 |
 | uds_windows | 1.2.1 | MIT |
+| unarray | 0.1.4 | MIT OR Apache-2.0 |
 | unicase | 2.9.0 | MIT OR Apache-2.0 |
 | unicode-ident | 1.0.24 | (MIT OR Apache-2.0) AND Unicode-3.0 |
 | unicode-linebreak | 0.1.5 | Apache-2.0 |
@@ -593,7 +595,6 @@ repository.
 | windows_x86_64_gnullvm | 0.53.1 | MIT OR Apache-2.0 |
 | windows_x86_64_msvc | 0.52.6 | MIT OR Apache-2.0 |
 | windows_x86_64_msvc | 0.53.1 | MIT OR Apache-2.0 |
-| winnow | 0.7.15 | MIT |
 | winnow | 1.0.3 | MIT |
 | winreg | 0.10.1 | MIT |
 | wiremock | 0.6.5 | MIT/Apache-2.0 |
@@ -682,8 +683,10 @@ filesystem: a bind mount or `subPath` volume is enough to make Linux refuse the
 hardlink, and `uv` then silently copies. This cache holds every wheel `uv`
 downloads — the ROCm SDK and the torch stack included — so it is typically the
 largest directory rocm-cli manages, on the order of several GB per SDK version
-installed. It is removed by `rocm uninstall` unless `--keep-data` is passed, and
-its location can be overridden with `ROCM_CLI_UV_CACHE_DIR`.
+installed. It is removed by `rocm uninstall`. On the default layout, the
+configuration and data directories are both `~/.rocm`, so keeping it takes
+`--keep-data` and `--keep-config` together. Its location can be overridden
+with `ROCM_CLI_UV_CACHE_DIR`.
 
 ### Lemonade Embeddable Runtime
 

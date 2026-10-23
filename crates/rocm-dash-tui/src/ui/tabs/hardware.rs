@@ -15,7 +15,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Paragraph, Wrap};
 
 use rocm_dash_core::metrics::{GpuMetrics, GpuSystemInfo, Snapshot};
 
@@ -245,7 +245,7 @@ fn draw_gpus(f: &mut Frame, area: Rect, state: &AppState, snap: &Snapshot, theme
             )
         };
         let inner = panel::bento(f, area, Some("GPUs"), role, false, theme);
-        f.render_widget(Paragraph::new(lines), inner);
+        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
         return;
     }
 
@@ -413,9 +413,7 @@ pub fn gpu_compact_line(
         ),
     ];
     let base_w: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-    let used_g = g.vram_used_mb as f64 / 1024.0;
-    let tot_g = g.vram_total_mb as f64 / 1024.0;
-    let vram = format!("  {used_g:.0}/{tot_g:.0} GB");
+    let vram = format!("  {}", format::mib_pair(g.vram_used_mb, g.vram_total_mb));
     if base_w + vram.chars().count() <= width as usize {
         spans.push(Span::styled(vram, Style::default().fg(theme.muted)));
     }
@@ -751,10 +749,26 @@ mod tests {
         assert_eq!(temp_span.style.fg, Some(theme.err));
         assert_eq!(pow_span.style.fg, Some(theme.err));
         // wide → vram segment included
-        assert!(line.spans.iter().any(|s| s.content.contains("GB")));
+        assert!(line.spans.iter().any(|s| s.content.contains("GiB")));
         // narrow → vram segment dropped (truncation by omission)
         let narrow = gpu_compact_line(&hot, &theme, 24, false);
-        assert!(!narrow.spans.iter().any(|s| s.content.contains("GB")));
+        assert!(!narrow.spans.iter().any(|s| s.content.contains("GiB")));
+    }
+
+    #[test]
+    fn gpu_compact_line_vram_truncation_threshold() {
+        // Pins the exact width at which the vram segment starts fitting, since
+        // mib_pair's longer rendering ("142.0 / 192.0 GiB" vs the old
+        // "142/192 GB") moved that threshold up by 7 columns (from 47 to 54)
+        // for this fixture: base_w is 35 (id+marker 9, util bar 9, util% 5,
+        // temp 6, power 6), and the vram string is 19 chars, so the segment
+        // fits once `base_w + vram.len() <= width`, i.e. width >= 54.
+        let theme = Theme::default_dark();
+        let hot = mk_gpu("gpu-2", 95.0, 88.0, 740.0);
+        let just_under = gpu_compact_line(&hot, &theme, 53, false);
+        assert!(!just_under.spans.iter().any(|s| s.content.contains("GiB")));
+        let exact_fit = gpu_compact_line(&hot, &theme, 54, false);
+        assert!(exact_fit.spans.iter().any(|s| s.content.contains("GiB")));
     }
 
     #[test]
@@ -921,6 +935,24 @@ mod tests {
                 let _ = render_to_string(&s4, w, h);
             }
         }
+    }
+
+    #[test]
+    fn draw_wraps_long_warning_text_instead_of_clipping() {
+        let long_warning = "amd-smi is missing, unresolvable, or failed to run, even though a \
+             GPU was detected by other means (WSL ROCDXG bridge) — if it is installed, this GPU \
+             model may not be supported by the installed amd-smi/ROCm, or not supported on WSL \
+             yet"
+        .to_string();
+        let snap = Snapshot {
+            warnings: vec![long_warning],
+            ..Default::default()
+        };
+        let out = render_to_string(&state_with_snapshot(snap), 40, 45);
+        assert!(
+            out.contains("WSL yet"),
+            "warning tail must survive wrapping at a narrow panel width instead of being clipped: {out:?}"
+        );
     }
 
     #[test]

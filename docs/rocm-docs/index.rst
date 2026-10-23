@@ -17,7 +17,7 @@ adapters for Lemonade and vLLM.
 .. important::
 
    **Tech Preview:** This software is provided as-is, without warranty or
-   guarantee of stability. APIs, commands, and behavior may change without
+   guarantee of stability. APIs, commands, and behavior might change without
    notice. Intended for experimentation and early feedback only.
 
 The ROCm CLI public repository is located at
@@ -26,18 +26,17 @@ The ROCm CLI public repository is located at
 .. grid:: 2
    :gutter: 3
 
-   .. grid-item-card:: Demos
-
-      * :doc:`See ROCm CLI in action <demos>`
-
    .. grid-item-card:: Install
 
       * :doc:`Installing ROCm CLI <install/installation>`
+      * :doc:`ROCm CLI on WSL2 <install/wsl>`
 
    .. grid-item-card:: Getting started
 
       * :doc:`Getting started with ROCm CLI <getting-started>`
+      * :doc:`See ROCm CLI in action <demos>`
 
-   .. grid-item-card:: Commands
+   .. grid-item-card:: Use ROCm CLI
 
       * :doc:`Command reference <commands>`
+      * :doc:`vLLM adapter <engines/vllm>`

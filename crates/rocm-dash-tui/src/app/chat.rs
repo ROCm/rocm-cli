@@ -7,9 +7,9 @@
 //! The provider→agent factory ([`build_chat_agent`]), the local-engine probe
 //! ([`detect_local_chat`] + [`fetch_first_model`]), and the config persistence
 //! for an accepted endpoint ([`persist_chat_endpoint`] + [`config_with_chat`]).
-//! Split out of `app/mod.rs` to keep the core reducer + event loop focused. The
-//! one reducer method here, [`AppState::set_chat_config`], lives with the rest
-//! of the chat-backend resolution group it configures.
+//! Split out of `app/mod.rs` to keep the core reducer focused. The one
+//! reducer method here, [`AppState::set_chat_config`], lives with the rest of
+//! the chat-backend resolution group it configures.
 
 use tokio::sync::mpsc;
 

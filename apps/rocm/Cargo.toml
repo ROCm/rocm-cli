@@ -11,7 +11,11 @@ publish.workspace = true
 workspace = true
 
 [features]
-e2e-test-hooks = ["rocm-engine-lemonade/e2e-test-hooks"]
+e2e-test-hooks = [
+    "rocm-core/e2e-test-hooks",
+    "rocm-engine-lemonade/e2e-test-hooks",
+    "rocm-engine-vllm/e2e-test-hooks",
+]
 
 [dependencies]
 anyhow.workspace = true
@@ -50,6 +54,7 @@ ureq = { version = "2.12", features = ["native-certs"] }
 libc.workspace = true
 
 [target.'cfg(windows)'.dependencies]
+self-replace = "1.5"
 windows-native-keyring-store = "1.1"
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
@@ -58,3 +63,14 @@ apple-native-keyring-store = { version = "1.0", features = ["keychain"] }
 
 [target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"))'.dependencies]
 zbus-secret-service-keyring-store = { version = "1.0", features = ["rt-tokio-crypto-rust"] }
+
+[dev-dependencies]
+# Property-based tests for the byte-size formatter behind the `download:
+# approved up to …` line. "A size is printed in its own unit" has to hold at
+# every unit boundary, and the narrow band where `{:.1}` rounding reaches 1024.0
+# is exactly the input a hand-picked example misses. Same version and features
+# as rocm-core's, so no new crate or feature enters the lockfile.
+# Test-only, so it adds nothing to any shipped binary.
+# Also used for the recursive-deletion paths in deletion_properties.
+proptest = { version = "1", default-features = false, features = ["std"] }
+tempfile = "3"

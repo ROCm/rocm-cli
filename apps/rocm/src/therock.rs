@@ -2,17 +2,23 @@
 //
 // SPDX-License-Identifier: MIT
 
+/// Property-based tests for version ordering and update-source selection.
+/// A child module so it can reach this module's private comparators directly.
+#[cfg(test)]
+#[path = "therock_version_proptests.rs"]
+mod version_proptests;
+
 use anyhow::{Context, Result, bail};
 use rocm_core::{
     AppPaths, ManagedToolConfig, RUNTIME_LIBRARY_PATH_ENV, RocmCliConfig, detect_host_gfx_target,
     detect_host_gpu_diagnostics, detect_legacy_rocm_summary, detect_managed_therock_family,
-    disk_space, ensure_uv_binary, extract_first_gfx_token, interactive_terminal,
-    known_therock_families, managed_tools_dir, normalize_runtime_path_for_host,
-    normalize_runtime_path_for_storage, normalize_runtime_path_text_for_host,
-    normalize_runtime_path_text_for_storage, normalize_therock_family, runtime_is_windows,
-    runtime_os_name, runtime_path_for_windows_child, runtime_path_list_split,
-    runtime_python_executable_in_env, unix_time_millis, uv_command_env, uv_pip_install_base,
-    uv_venv_args, verify_rsa_pkcs1_sha256_signature,
+    disk_space, ensure_uv_binary, extract_first_gfx_token, gfx_target_has_no_rocm_build,
+    interactive_terminal, known_therock_families, managed_tools_dir,
+    normalize_runtime_path_for_host, normalize_runtime_path_for_storage,
+    normalize_runtime_path_text_for_host, normalize_runtime_path_text_for_storage,
+    normalize_therock_family, runtime_is_windows, runtime_os_name, runtime_path_for_windows_child,
+    runtime_path_list_split, runtime_python_executable_in_env, unix_time_millis, uv_command_env,
+    uv_pip_install_base, uv_venv_args, verify_rsa_pkcs1_sha256_signature,
 };
 #[cfg(test)]
 use rocm_core::{
@@ -53,6 +59,9 @@ const THEROCK_NEXT_LAYOUT_GENERATION: &str = "next-v1";
 /// therefore the only thing that selects [`SourceLayout::Next`].
 const THEROCK_NEXT_MIN_MAJOR: u32 = 10;
 const DEFAULT_MANAGED_PYTHON_VERSION: &str = "3.12";
+/// Interpreter `uv` provisions for a [`SourceLayout::Next`] install. See
+/// [`python_requirement`] for why this differs from the canonical default.
+const NEXT_MANAGED_PYTHON_VERSION: &str = "3.14";
 const STARTUP_UPDATE_CHECK_INTERVAL_MS: u128 = 12 * 60 * 60 * 1_000;
 const STARTUP_UPDATE_CHECK_TIMEOUT_SECS: u64 = 2;
 /// Timeout for the best-effort HEAD probe that sizes a download before starting it.
@@ -511,6 +520,17 @@ struct PipRuntimeResolution {
     /// installed (no wheels) and we warn about it. `None` when a specific version
     /// was requested (the "latest" concept does not apply).
     newest_repo_version: Option<String>,
+    /// The exact requirement lines handed to `uv pip compile` to choose this
+    /// version set. This is the value that was sent, not a re-derivation of it,
+    /// so the preview can show what resolution actually asked for and an
+    /// acceptance test can hold it to the same extras the install plan names.
+    /// `None` on the canonical layout, which picks versions by scraping each
+    /// package's simple index rather than by resolving a requirement set.
+    version_resolution_specs: Option<Vec<String>>,
+    /// How the torchaudio in `version_resolution_specs` was chosen, kept so the
+    /// plan can say whether it is the hardware-verified build. `None` on the
+    /// canonical layout, which pins no torchaudio before resolving.
+    torchaudio_pin: Option<TorchaudioPin>,
     package_versions: TheRockPipPackageVersions,
     /// The device payload the resolved source must supply for this host,
     /// decided against the targets that source actually publishes.
@@ -736,10 +756,33 @@ pub(crate) struct InstalledRuntimeManifest {
     pub read_only: bool,
     #[serde(default)]
     pub imported_from: Option<PathBuf>,
+    /// Whether the compiler toolchain (`devel`) is part of this install, so an
+    /// update reinstalls the same thing the user originally chose.
+    #[serde(default = "devel_default_for_legacy_manifest")]
+    pub devel: bool,
     pub installed_at_unix_ms: u128,
 }
 
+/// Manifests written before `devel` became opt-in always included the
+/// toolchain, so a missing field means it is present. Defaulting to `false`
+/// here would silently strip it on the next update.
+const fn devel_default_for_legacy_manifest() -> bool {
+    true
+}
+
 impl InstalledRuntimeManifest {
+    /// Whether this runtime has the compiler toolchain.
+    ///
+    /// Prefers the recorded `wheel_composition`, because those specs are what
+    /// `uv` was actually given — so the answer cannot drift from the install
+    /// the way a separately-written flag can. `devel` is the fallback for
+    /// tarball installs and for manifests written before compositions were
+    /// recorded; on a manifest older still it defaults to `true`, since every
+    /// install predating the flag shipped the toolchain.
+    pub(crate) fn includes_devel(&self) -> bool {
+        wheel_composition_includes_devel(self.wheel_composition.as_ref()).unwrap_or(self.devel)
+    }
+
     fn normalize_host_paths(mut self) -> Self {
         self.install_root = normalize_manifest_path(self.install_root);
         self.python_launcher = self
@@ -909,20 +952,57 @@ struct TarballIndexFile {
     mtime: f64,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
+/// What [`parse_version`]'s strict grammar gate yields: only the parts a
+/// caller reads. The patch and stage number are still parsed, so a malformed
+/// one still fails the gate, but nothing orders by them here — ordering goes
+/// through [`VersionOrderKey`].
+#[derive(Debug, Clone)]
 struct ParsedVersion {
     major: u32,
     minor: u32,
-    patch: u32,
+    stage: VersionStage,
+}
+
+/// A version's position in the PEP 440 order, as produced by
+/// [`parse_version_for_ordering`].
+///
+/// Separate from [`ParsedVersion`] because the two answer different questions.
+/// `ParsedVersion` is what [`parse_version`]'s strict grammar gate yields, and
+/// is never compared: the PyTorch stack matchers read its `major`, `minor` and
+/// `stage`, and the layout selection its `major`. This one exists only to be
+/// compared, so its release segment is a vector and it has no fields a caller
+/// would reach into.
+///
+/// Field order is the comparison order, and it is PEP 440's: release segment
+/// first, then stage, then the stage's number.
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
+struct VersionOrderKey {
+    /// Release components, trailing zeros removed so that `7.9`, `7.9.0` and
+    /// `7.9.0.0` share one key and plain `Vec` ordering matches PEP 440's
+    /// zero-padded comparison.
+    release: Vec<u64>,
     stage: VersionStage,
     stage_number: u64,
 }
 
+/// Where a version sits within its release.
+///
+/// Declaration order is the ordering, and it is PEP 440's: a dev release
+/// precedes its alpha, which precedes beta, release candidate, the final
+/// release, and finally any post-release of that final release.
+///
+/// [`parse_version`] only ever yields `Alpha`, `Rc` or `Stable` — it is the
+/// strict grammar gate for "a version shape this tool will route an install
+/// on", not an ordering parser. The remaining variants come from
+/// [`parse_version_for_ordering`].
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
 enum VersionStage {
+    Dev,
     Alpha,
+    Beta,
     Rc,
     Stable,
+    Post,
 }
 
 /// Outcome of an `install sdk` request.
@@ -959,25 +1039,63 @@ struct InstallSourceOverride<'a> {
     layout: Option<SourceLayout>,
 }
 
-/// Install a TheRock SDK runtime.
+/// What to install, as resolved from the `rocm install sdk` arguments.
 ///
-/// `consent` carries the *source* of any up-front approval rather than a bare
-/// bool, because the progress line names it: `--yes` and
-/// `--approve-replacing-active-default` both clear this gate, but only the
-/// former also approves a `sudo` system-package install, so collapsing them
-/// would print "Approved by --yes" on every install ROCm CLI's own
-/// terminal-less surfaces make.
-#[allow(clippy::too_many_arguments)]
+/// A struct rather than a parameter list: with `include_devel` added this is
+/// past the point where positional `bool`s at a call site say anything about
+/// what they mean.
+#[derive(Debug)]
+pub(crate) struct SdkInstallRequest<'a> {
+    pub channel: &'a str,
+    pub format: &'a str,
+    pub prefix: Option<PathBuf>,
+    pub version_selector: Option<RuntimeVersionSelector>,
+    pub family_override: Option<&'a str>,
+    pub dry_run: bool,
+    /// Install the compiler and headers alongside the runtime libraries.
+    pub include_devel: bool,
+    /// The *source* of any up-front approval rather than a bare bool, because
+    /// the progress line names it: `--yes` and
+    /// `--approve-replacing-active-default` both clear this gate, but only the
+    /// former also approves a `sudo` system-package install, so collapsing them
+    /// would print "Approved by --yes" on every install ROCm CLI's own
+    /// terminal-less surfaces make.
+    pub consent: SdkInstallConsent,
+}
+
+impl Default for SdkInstallRequest<'_> {
+    fn default() -> Self {
+        Self {
+            channel: "",
+            format: "",
+            prefix: None,
+            version_selector: None,
+            family_override: None,
+            dry_run: false,
+            include_devel: false,
+            // Withholding consent is the safe default: a caller that leaves it
+            // unset has granted nothing, so the gate prompts or refuses rather
+            // than silently displacing the active default runtime.
+            consent: SdkInstallConsent::Ask,
+        }
+    }
+}
+
+/// Install a TheRock SDK runtime.
 pub(crate) fn install_sdk(
     paths: &AppPaths,
-    channel: &str,
-    format: &str,
-    prefix: Option<PathBuf>,
-    version_selector: Option<RuntimeVersionSelector>,
-    family_override: Option<&str>,
-    dry_run: bool,
-    consent: SdkInstallConsent,
+    request: SdkInstallRequest<'_>,
 ) -> Result<SdkInstallResult> {
+    let SdkInstallRequest {
+        channel,
+        format,
+        prefix,
+        version_selector,
+        family_override,
+        dry_run,
+        include_devel,
+        consent,
+    } = request;
     let channel = TheRockChannel::parse(channel)?;
     ensure_install_format_supported(format)?;
     match format {
@@ -991,6 +1109,7 @@ pub(crate) fn install_sdk(
             },
             version_selector.as_ref(),
             dry_run,
+            include_devel,
             consent,
         ),
         "tarball" => {
@@ -1042,6 +1161,7 @@ pub(crate) fn install_sdk_for_update(
     family: &str,
     device_target: Option<&str>,
     source_layout_generation: Option<&str>,
+    include_devel: bool,
     dry_run: bool,
     activate_after_install: bool,
 ) -> Result<SdkInstallResult> {
@@ -1063,6 +1183,7 @@ pub(crate) fn install_sdk_for_update(
             },
             None,
             dry_run,
+            include_devel,
             consent,
         ),
         "tarball" => install_tarball_runtime(
@@ -1285,7 +1406,10 @@ fn runtime_freshness(
     required_composition: Option<&WheelRuntimeComposition>,
     target_runtime_key: &str,
 ) -> RuntimeFreshness {
-    match compare_version_strings(&manifest.version, latest_version) {
+    let Some(relation) = version_relation(&manifest.version, latest_version) else {
+        return RuntimeFreshness::AheadOfIndex;
+    };
+    match relation {
         Ordering::Less => RuntimeFreshness::UpdateAvailable,
         Ordering::Greater => RuntimeFreshness::AheadOfIndex,
         Ordering::Equal
@@ -1298,6 +1422,40 @@ fn runtime_freshness(
         }
         Ordering::Equal => RuntimeFreshness::UpToDate,
     }
+}
+
+/// How two versions relate *as versions*, for the callers asking "is this a
+/// different build?" rather than "where does this sort?".
+///
+/// Those are not the same question, and [`compare_version_strings`] only
+/// answers the second. It is a total order over *strings*, which is what
+/// sorting needs, and it gets there two ways this caller must not inherit:
+///
+/// * Its last tiebreak is the raw string, so two spellings of one version sort
+///   apart. `7.0.0-rc1` and `7.0.0rc1` are the same version — that is why the
+///   parser accepts both — but they are different strings. Treating that as a
+///   difference offers an update that re-downloads the runtime already
+///   installed. PyPI normalises versions, so an index can serve one spelling
+///   while an older manifest recorded the other.
+/// * A string it cannot read sorts below everything readable. That is the safe
+///   end for the "newest candidate" pickers, which take a maximum, and the
+///   wrong end here, where the unreadable string is the *installed* version and
+///   "lowest" reads as "older than the index" — an offer that could be a
+///   downgrade. A runtime adopted from an existing environment carries whatever
+///   its probe reported, so this is reachable without any index being odd.
+///
+/// So: compare the parsed keys, which are equal exactly when the two strings
+/// denote one version, and return `None` when either side cannot be identified
+/// at all. Byte-identical strings short-circuit, which keeps the
+/// repair/up-to-date path working for a runtime whose version this tool cannot
+/// parse but which plainly matches what the index offers.
+fn version_relation(left: &str, right: &str) -> Option<Ordering> {
+    if left == right {
+        return Some(Ordering::Equal);
+    }
+    let left_key = parse_version_for_ordering(left)?;
+    let right_key = parse_version_for_ordering(right)?;
+    Some(left_key.cmp(&right_key))
 }
 
 fn runtime_freshness_with_manifests(
@@ -1411,18 +1569,24 @@ fn resolve_latest_for_manifest(
     let layout = manifest_source_layout(manifest)?;
     match manifest.format.as_str() {
         "wheel" => {
+            // A runtime updated across a layout change needs the new layout's
+            // interpreter, so the recorded one is re-checked rather than trusted
+            // on `is_file()` alone; otherwise a canonical cp312 venv would carry
+            // into a next-layout update and resolve nothing.
+            let requirement = python_requirement(layout);
             let manifest_python = manifest
                 .python_executable
                 .as_deref()
                 .map(PathBuf::from)
                 .filter(|path| path.is_file())
+                .filter(|path| python_launcher_install_ready(path, requirement).is_ok())
                 .map(|executable| PythonLauncher {
                     executable,
                     source: "manifest",
                 });
             let python_executable = match manifest_python {
                 Some(python) => python,
-                None => resolve_python_launcher(paths)?,
+                None => resolve_python_launcher(paths, requirement)?,
             };
             let wheel_compatibility =
                 wheel_compatibility_for_python(&python_executable.executable)?;
@@ -1434,6 +1598,9 @@ fn resolve_latest_for_manifest(
                 &wheel_compatibility,
                 None,
                 Some(layout),
+                // An update re-resolves for the install it will reinstall, so it
+                // must resolve against the extras that runtime already has.
+                manifest.includes_devel(),
                 download_timeout_secs,
             )?;
             // Prefer the device payload this runtime was actually built with over
@@ -1455,9 +1622,11 @@ fn resolve_latest_for_manifest(
             // falls back to the version comparison rather than demanding a repair
             // this host could not perform.
             let wheel_composition = match &device_target {
-                AggregateDeviceTarget::Exact(_) => {
-                    Some(wheel_runtime_composition(&resolution, &device_target))
-                }
+                AggregateDeviceTarget::Exact(_) => Some(wheel_runtime_composition(
+                    &resolution,
+                    &device_target,
+                    manifest.includes_devel(),
+                )),
                 AggregateDeviceTarget::Undetermined(_) => None,
             };
             let target_runtime_key = wheel_composition.as_ref().map_or_else(
@@ -1640,6 +1809,7 @@ fn install_wheel_runtime(
     source_override: InstallSourceOverride<'_>,
     version_selector: Option<&RuntimeVersionSelector>,
     dry_run: bool,
+    include_devel: bool,
     consent: SdkInstallConsent,
 ) -> Result<SdkInstallResult> {
     let InstallSourceOverride {
@@ -1647,11 +1817,45 @@ fn install_wheel_runtime(
         device_target: device_target_override,
         layout: layout_override,
     } = source_override;
+    // `device_target_override` (an update apply's exact recorded arch) is only
+    // otherwise consulted after `resolve_pip_runtime` returns — too late for the
+    // channel/arch check below, which needs an exact arch before it can run at
+    // all. Recover it into the family override up front, same as `resolve_pip_runtime`
+    // does internally.
+    let recovered_family_override = family_override
+        .map(|family| family_override_or_recovered_arch(family, device_target_override));
+    // Fail fast on a request `resolve_pip_runtime` could only ever reject (wrong
+    // channel, or a grouped family with no exact arch) before paying for Python
+    // provisioning below, which can mean a real download for a layout this host
+    // or channel can never actually use.
+    select_source_layout(
+        channel,
+        &resolve_family(paths, recovered_family_override.as_deref())?,
+        version_selector,
+    )?;
+    // The interpreter has to be picked before `resolve_pip_runtime`, which
+    // selects wheels using that interpreter's own tags. `requested_source_layout`
+    // only answers from the *request*: an explicit stable ROCm 10+ pin already
+    // routes to `Next` and gets `cp314` that way, but a plain auto-select or a
+    // nightly build-date/prerelease pin always reports `Canonical`, even once
+    // the canonical/nightly feed's own "latest" has rotated past that major on
+    // its own, with no `Next` routing involved. `canonical_auto_select_needs_next_python`
+    // peeks the channel's own `rocm` listing to catch that case.
+    let python_requirement = match requested_source_layout(layout_override, version_selector) {
+        SourceLayout::Next => python_requirement(SourceLayout::Next),
+        SourceLayout::Canonical => {
+            if canonical_auto_select_needs_next_python(paths, channel, version_selector)? {
+                python_requirement(SourceLayout::Next)
+            } else {
+                python_requirement(SourceLayout::Canonical)
+            }
+        }
+    };
     progress_line(format!(
         "Checking Python for the ROCm install; if needed, ROCm CLI will prepare Python {}.",
-        managed_python_version()
+        managed_python_version(python_requirement)
     ));
-    let python_launcher = resolve_python_launcher(paths)?;
+    let python_launcher = resolve_python_launcher(paths, python_requirement)?;
     progress_line(match python_launcher.source {
         "path" => format!(
             "Using Python from PATH: {}.",
@@ -1675,12 +1879,6 @@ fn install_wheel_runtime(
         "Checking TheRock {} packages for this AMD GPU...",
         channel.as_str()
     ));
-    // `device_target_override` (an update apply's exact recorded arch) is only
-    // otherwise consulted below, after `resolve_pip_runtime` returns — too late
-    // for the next layout, which needs an exact arch before it can query
-    // package metadata at all. Recover it into the family override up front.
-    let recovered_family_override = family_override
-        .map(|family| family_override_or_recovered_arch(family, device_target_override));
     let resolution = resolve_pip_runtime(
         paths,
         channel,
@@ -1688,6 +1886,7 @@ fn install_wheel_runtime(
         &wheel_compatibility,
         version_selector,
         layout_override,
+        include_devel,
     )?;
     let device_target = device_target_override.map_or_else(
         || resolution.device_target.clone(),
@@ -1704,7 +1903,7 @@ fn install_wheel_runtime(
     // usable target still composes a key here — from the `<undetermined>` extras
     // — which no real install can ever produce, and the refusal below stops it
     // from reaching a manifest.
-    let wheel_composition = wheel_runtime_composition(&resolution, &device_target);
+    let wheel_composition = wheel_runtime_composition(&resolution, &device_target, include_devel);
     progress_line(format!(
         "Found canonical TheRock aggregate version {} with a matching PyTorch stack for target family {}.",
         resolution.latest_version, resolution.family
@@ -1783,6 +1982,20 @@ fn install_wheel_runtime(
         "  platform_wheel_tags: {}",
         wheel_compatibility.platform_tags.join(",")
     );
+    // What resolution asked for, printed beside what the install will ask for.
+    // The two are produced by different code paths from the same `include_devel`
+    // and must name the same extras; showing only the second would hide a
+    // resolve that constrained the version choice by a toolchain the user
+    // declined. Absent on the canonical layout, which resolves by scraping each
+    // package's index instead of compiling a requirement set.
+    if let Some(specs) = resolution.version_resolution_specs.as_ref() {
+        let _ = writeln!(output, "  version_resolution_specs: {}", specs.join(" "));
+    }
+    // Printed from the same value that chose the pin, so the line cannot claim
+    // a verified build the requirements above do not name.
+    if let Some(pin) = resolution.torchaudio_pin.as_ref() {
+        let _ = writeln!(output, "  torchaudio_selection: {}", pin.describe());
+    }
     let _ = writeln!(
         output,
         "  package_specs: {}",
@@ -1841,6 +2054,13 @@ fn install_wheel_runtime(
     // on the real install path too, not only in the dry-run plan.
     if let Some(warning) = no_wheel_warning.as_deref() {
         progress_line(format!("Warning: {warning}"));
+    }
+    if let Some(note) = resolution
+        .torchaudio_pin
+        .as_ref()
+        .and_then(unverified_torchaudio_note)
+    {
+        progress_line(note);
     }
 
     // Explain, in the visible install log, why an older TheRock ROCm is chosen
@@ -1954,7 +2174,14 @@ fn install_wheel_runtime(
             .map(String::as_str)
             .collect::<Vec<_>>()
             .as_slice(),
-        "install TheRock devel SDK, torch stack, and resolved dependencies",
+        // Read back out of the specs `uv` is being handed on this very call
+        // rather than off `include_devel` a second time, so the line a user
+        // watches cannot name a toolchain the install is not requesting.
+        if wheel_composition_includes_devel(Some(&wheel_composition)).unwrap_or(include_devel) {
+            "install TheRock SDK with the compiler toolchain, torch stack, and resolved dependencies"
+        } else {
+            "install TheRock SDK, torch stack, and resolved dependencies"
+        },
     )?;
 
     progress_line("Checking the installed ROCm SDK...");
@@ -1987,6 +2214,7 @@ fn install_wheel_runtime(
         wheel_composition: Some(wheel_composition),
         read_only: false,
         imported_from: None,
+        devel: include_devel,
         installed_at_unix_ms: unix_time_millis(),
     };
     save_runtime_manifest(paths, &manifest)?;
@@ -2020,16 +2248,82 @@ fn install_wheel_runtime(
     Ok(SdkInstallResult::installed(output))
 }
 
-fn therock_pip_package_specs(
-    package_versions: &TheRockPipPackageVersions,
+/// The `rocm` wheel extras a given install asks for, excluding the device payload.
+///
+/// `devel` adds the compiler, headers, and static libraries — roughly doubling
+/// the download — and is only needed to *build* GPU code. Running models needs
+/// `libraries` alone, so the toolchain is installed only when asked for.
+///
+/// Two callers, and they are the two that must agree:
+///
+/// - [`therock_pip_package_specs`], which produces the specs `uv` installs and
+///   the specs recorded in the manifest, and
+/// - [`published_pip_requirements`], the requirement set `uv pip compile` is
+///   asked to resolve versions against on the ROCm 10 (`next`) layout.
+///
+/// Version resolution and install composition are separate code paths —
+/// resolution runs first and decides which versions exist, composition runs
+/// second and decides what is installed — so a flag threaded correctly through
+/// one says nothing about the other. Both go through this helper for that
+/// reason. Everything else that names the toolchain (the install progress line,
+/// `runtimes list`, `InstalledRuntimeManifest::includes_devel`) reads it back
+/// out of the composed specs rather than re-deciding it.
+const fn therock_sdk_extras(include_devel: bool) -> &'static str {
+    if include_devel {
+        "libraries,devel"
+    } else {
+        "libraries"
+    }
+}
+
+/// The requirement lines handed to `uv pip compile` to pick a mutually
+/// installable version set on the ROCm 10 (`next`) layout.
+///
+/// torch and torchvision are unversioned on purpose: choosing those versions is
+/// what the resolve is for, and their published metadata depends on the exact
+/// `rocm` build, so the `rocm` pin carries them to the matching `+rocm<build>`.
+/// torchaudio's metadata names no `rocm` build, so left unversioned it resolves
+/// to the newest build on the index — which is a different ROCm build for every
+/// pin but the newest — and the caller pins it to `torchaudio_version`, already
+/// chosen from this build's published torchaudio wheels.
+///
+/// The `rocm` extras must match the ones [`therock_pip_package_specs`] will
+/// install — resolving against `devel` for someone who did not ask for it
+/// constrains the chosen versions by a toolchain they declined, and can fail the
+/// whole install with a toolchain-resolution error on a default
+/// `rocm install sdk`.
+fn published_pip_requirements(
+    rocm_version: &str,
+    torchaudio_version: &str,
     device_target: &str,
+    include_devel: bool,
 ) -> Vec<String> {
     let device_extra = format!("device-{device_target}");
     vec![
         format!(
-            "rocm[libraries,devel,{device_extra}]=={}",
-            package_versions.rocm
+            "rocm[{},{device_extra}]=={rocm_version}",
+            therock_sdk_extras(include_devel)
         ),
+        format!("torch[{device_extra}]"),
+        format!("torchvision[{device_extra}]"),
+        format!("torchaudio=={torchaudio_version}"),
+    ]
+}
+
+/// Package specs for a wheel SDK install.
+///
+/// The `device-<target>` extra is separate from [`therock_sdk_extras`] and
+/// always present: it selects which GPU payload the wheels carry, not whether
+/// the toolchain comes with them.
+fn therock_pip_package_specs(
+    package_versions: &TheRockPipPackageVersions,
+    device_target: &str,
+    include_devel: bool,
+) -> Vec<String> {
+    let device_extra = format!("device-{device_target}");
+    let rocm_extras = format!("{},{device_extra}", therock_sdk_extras(include_devel));
+    vec![
+        format!("rocm[{rocm_extras}]=={}", package_versions.rocm),
         format!("torch[{device_extra}]=={}", package_versions.torch),
         format!(
             "torchvision[{device_extra}]=={}",
@@ -2045,16 +2339,39 @@ fn therock_pip_package_specs(
 fn wheel_runtime_composition(
     resolution: &PipRuntimeResolution,
     device_target: &AggregateDeviceTarget,
+    include_devel: bool,
 ) -> WheelRuntimeComposition {
     WheelRuntimeComposition {
         source_layout_generation: resolution.layout.generation().to_owned(),
         package_specs: therock_pip_package_specs(
             &resolution.package_versions,
             device_target.as_str(),
+            include_devel,
         ),
         rocm_sdk_target: matches!(device_target, AggregateDeviceTarget::Exact(_))
             .then(|| device_target.as_str().to_owned()),
     }
+}
+
+/// Whether a recorded composition installed the compiler toolchain, read back
+/// out of its `rocm[...]` extras.
+///
+/// Same reasoning as [`wheel_composition_device_target`]: the specs are stored
+/// verbatim, so the answer is derivable from what was actually installed and
+/// cannot drift from a second field. `None` for a manifest with no recorded
+/// composition — see [`InstalledRuntimeManifest::includes_devel`] for how that
+/// legacy case is resolved.
+fn wheel_composition_includes_devel(composition: Option<&WheelRuntimeComposition>) -> Option<bool> {
+    let composition = composition?;
+    composition.package_specs.iter().find_map(|spec| {
+        let extras = spec.strip_prefix("rocm[")?.split_once(']')?.0;
+        Some(
+            extras
+                .split(',')
+                .map(str::trim)
+                .any(|extra| extra == "devel"),
+        )
+    })
 }
 
 /// The GFX target a recorded composition installed, read back out of its
@@ -2295,7 +2612,15 @@ fn active_default_relation_text(
     resolved_version: &str,
 ) -> String {
     if active.family == family && active.channel == channel.as_str() {
-        let relation = match compare_version_strings(resolved_version, &active.version) {
+        // "reinstall" is a claim about versions, not strings: `7.0.0-rc1` and
+        // `7.0.0rc1` are one version and must not read as an upgrade. When
+        // either side cannot be identified (`version_relation` is `None`) there
+        // is no better word available here, so the total order still decides
+        // rather than inventing a fourth one; an unreadable version sorts below
+        // every readable one, so it reads as the older side.
+        let relation = match version_relation(resolved_version, &active.version)
+            .unwrap_or_else(|| compare_version_strings(resolved_version, &active.version))
+        {
             Ordering::Greater => "upgrade",
             Ordering::Less => "downgrade",
             Ordering::Equal => "reinstall",
@@ -2330,15 +2655,20 @@ fn host_rocm_version_newer_than(resolved_version: &str) -> Option<String> {
 fn host_version_newer_than(host_version: Option<String>, resolved_version: &str) -> Option<String> {
     let host_version = host_version?;
     // Only claim the host is newer when BOTH versions parse and the host is
-    // strictly greater. `parse_host_version` normalises the shapes hosts
-    // actually report — a build suffix (`7.2.4-98` -> 7.2.4) and a
-    // two-component report (`7.4` -> 7.4.0) — so those are compared, not
-    // discarded. Only a string that still fails to parse is "can't tell", and
+    // strictly greater. Only a string that fails to parse is "can't tell", and
     // "can't tell" is never "newer". Falling back to a lexicographic compare
     // here wrongly ranks e.g. `7.2.4-98` above `7.13.0` (because '2' > '1' at
     // the third char), inventing a host-newer note that misleads the user.
+    //
+    // Each side is read with the parser for where it came from.
+    // `parse_host_version` additionally drops the packaging build number a
+    // legacy ROCm reports (`7.2.4-98` -> 7.2.4); a two-component report
+    // (`7.4` -> 7.4.0) and a `-rc1` pre-release are read the same way by both.
+    // `resolved_version` is not a host string: it is the version resolved from
+    // the index or the tarball catalogue, so it is read exactly as the
+    // comparator that picked it reads it.
     let host_parsed = parse_host_version(&host_version)?;
-    let resolved_parsed = parse_host_version(resolved_version)?;
+    let resolved_parsed = parse_version_for_ordering(resolved_version)?;
     (host_parsed > resolved_parsed).then_some(host_version)
 }
 
@@ -2377,10 +2707,15 @@ fn repo_version_without_wheels(
     resolved_version: &str,
 ) -> Option<String> {
     let newest = newest_repo?;
-    match compare_version_strings(newest, resolved_version) {
-        Ordering::Greater => Some(newest.to_owned()),
-        _ => None,
-    }
+    // "Is there a genuinely newer version?", not "which string sorts higher?".
+    // Two spellings of one version would otherwise produce a warning naming the
+    // same version on both sides of "installing X instead", and a pair this
+    // tool cannot identify would produce one it cannot justify.
+    matches!(
+        version_relation(newest, resolved_version),
+        Some(Ordering::Greater)
+    )
+    .then(|| newest.to_owned())
 }
 
 /// Where an already-granted approval for displacing the active default came
@@ -2733,6 +3068,8 @@ fn install_tarball_runtime(
         wheel_composition: None,
         read_only: false,
         imported_from: None,
+        // Tarball artifacts ship the whole SDK; the extra is a wheel concept.
+        devel: true,
         installed_at_unix_ms: unix_time_millis(),
     };
     save_runtime_manifest(paths, &manifest)?;
@@ -2749,6 +3086,7 @@ fn resolve_pip_runtime(
     wheel_compatibility: &WheelCompatibility,
     version_selector: Option<&RuntimeVersionSelector>,
     layout_override: Option<SourceLayout>,
+    include_devel: bool,
 ) -> Result<PipRuntimeResolution> {
     resolve_pip_runtime_with_timeout(
         paths,
@@ -2757,6 +3095,7 @@ fn resolve_pip_runtime(
         wheel_compatibility,
         version_selector,
         layout_override,
+        include_devel,
         None,
     )
 }
@@ -2771,6 +3110,7 @@ fn resolve_pip_runtime_with_timeout(
     wheel_compatibility: &WheelCompatibility,
     version_selector: Option<&RuntimeVersionSelector>,
     layout_override: Option<SourceLayout>,
+    include_devel: bool,
     download_timeout_secs: Option<u64>,
 ) -> Result<PipRuntimeResolution> {
     let family_resolution = resolve_family(paths, family_override)?;
@@ -2822,6 +3162,7 @@ fn resolve_pip_runtime_with_timeout(
         &source,
         wheel_compatibility,
         version_selector,
+        include_devel,
         download_timeout_secs,
     )
     .with_context(|| {
@@ -2834,6 +3175,10 @@ fn resolve_pip_runtime_with_timeout(
     })
 }
 
+/// `include_devel` reaches this far because version resolution, not only install
+/// composition, has to ask for the extras the caller actually requested — see
+/// [`published_pip_requirements`].
+#[allow(clippy::too_many_arguments)]
 fn resolve_pip_runtime_from_index(
     paths: &AppPaths,
     channel: TheRockChannel,
@@ -2841,9 +3186,12 @@ fn resolve_pip_runtime_from_index(
     source: &ResolvedAggregateWheelSource,
     wheel_compatibility: &WheelCompatibility,
     version_selector: Option<&RuntimeVersionSelector>,
+    include_devel: bool,
     download_timeout_secs: Option<u64>,
 ) -> Result<PipRuntimeResolution> {
     let index_url = source.index_url.as_str();
+    let mut version_resolution_specs = None;
+    let mut torchaudio_selection = None;
     let rocm_versions =
         load_simple_index_versions(paths, index_url, "rocm", None, download_timeout_secs)?;
     if matches!(channel, TheRockChannel::Release)
@@ -2873,21 +3221,41 @@ fn resolve_pip_runtime_from_index(
                 );
                 format!("no TheRock rocm package was found for {requested} in {index_url}")
             })?;
-        // The canonical branch below budgets one `download_timeout_secs` per
-        // package (rocm, then torch, torchvision, torchaudio: 4 sequential HTTP
-        // fetches). `uv pip compile` resolves that same four-package metadata
-        // set in one subprocess call, so it needs a comparable aggregate
-        // budget, not the single-fetch one — reusing the bare per-fetch value
-        // here would make a startup check that budgets 2s per fetch reliably
-        // time out a call doing 4 fetches' worth of work.
-        resolve_published_pip_package_versions(
+        // Chosen here, not by `uv`: see `published_pip_requirements`.
+        let torchaudio_versions = load_simple_index_versions(
             paths,
             index_url,
+            "torchaudio",
+            Some(wheel_compatibility),
+            download_timeout_secs,
+        )?;
+        let pin = torchaudio_pin(
+            &torchaudio_versions,
             &rocm_version,
-            device_target,
+            rocm_engine_vllm::verified_torchaudio_release(&rocm_version),
+            index_url,
+        )?;
+        // The canonical branch below budgets one `download_timeout_secs` per
+        // package (rocm, then torch, torchvision, torchaudio: 4 sequential HTTP
+        // fetches). `uv pip compile` still fetches metadata for all four
+        // packages in one subprocess call — the torchaudio listing above only
+        // chose its version — so it needs a comparable aggregate budget, not
+        // the single-fetch one: reusing the bare per-fetch value here would make
+        // a startup check that budgets 2s per fetch reliably time out a call
+        // doing 4 fetches' worth of work. That listing is one more fetch on top,
+        // with its own single-fetch budget.
+        let requirements =
+            published_pip_requirements(&rocm_version, &pin.version, device_target, include_devel);
+        let versions = resolve_published_pip_package_versions(
+            paths,
+            index_url,
+            &requirements,
             wheel_compatibility,
             download_timeout_secs.map(|secs| secs.saturating_mul(4)),
-        )?
+        )?;
+        version_resolution_specs = Some(requirements);
+        torchaudio_selection = Some(pin);
+        versions
     } else {
         let torch_versions = load_simple_index_versions(
             paths,
@@ -2946,6 +3314,8 @@ fn resolve_pip_runtime_from_index(
         layout: source.layout,
         latest_version,
         newest_repo_version,
+        version_resolution_specs,
+        torchaudio_pin: torchaudio_selection,
         package_versions,
         device_target: source.device_target.clone(),
         published_device_targets: source.published_device_targets.clone(),
@@ -3134,24 +3504,51 @@ fn raw_arch_agreeing_with_family(raw_arch: Option<String>, family: &str) -> Opti
 }
 
 fn resolve_family(paths: &AppPaths, family_override: Option<&str>) -> Result<FamilyResolution> {
-    if let Some(value) = family_override
-        && let Some(family) = normalize_therock_family(value)
-    {
-        return Ok(FamilyResolution {
-            family,
-            source: "manifest".to_owned(),
-            raw_arch: family_override_raw_arch(value),
-        });
+    let env_override = std::env::var("ROCM_CLI_THEROCK_FAMILY").ok();
+
+    // An explicitly asked-for target that ROCm publishes no build for is
+    // refused here rather than normalized. `normalize_therock_family` answers
+    // `None` for gfx90c, and `None` from this branch means "fall through", so
+    // without this the user's `--family gfx90c` would be dropped and whatever
+    // GPU this host happens to have would be installed for instead.
+    // Unrecognized spellings keep falling through to detection, which is the
+    // long-standing behavior for a typo.
+    //
+    // The guard sits inside each source's own branch, not ahead of both, so a
+    // source is only ever refused when it is actually the one being consulted:
+    // a valid `--family` must resolve even if a stale `ROCM_CLI_THEROCK_FAMILY`
+    // left over from an earlier session happens to name gfx90c, and the
+    // reverse for an env value once `--family` isn't the one in play.
+    if let Some(value) = family_override {
+        if gfx_target_has_no_rocm_build(value) {
+            bail!(unsupported_requested_target_message(
+                value.trim(),
+                "--family"
+            ));
+        }
+        if let Some(family) = normalize_therock_family(value) {
+            return Ok(FamilyResolution {
+                family,
+                source: "manifest".to_owned(),
+                raw_arch: family_override_raw_arch(value),
+            });
+        }
     }
 
-    if let Some(value) = std::env::var("ROCM_CLI_THEROCK_FAMILY").ok()
-        && let Some(family) = normalize_therock_family(&value)
-    {
-        return Ok(FamilyResolution {
-            family,
-            source: "env".to_owned(),
-            raw_arch: family_override_raw_arch(&value),
-        });
+    if let Some(value) = env_override.as_deref() {
+        if gfx_target_has_no_rocm_build(value) {
+            bail!(unsupported_requested_target_message(
+                value.trim(),
+                "ROCM_CLI_THEROCK_FAMILY"
+            ));
+        }
+        if let Some(family) = normalize_therock_family(value) {
+            return Ok(FamilyResolution {
+                family,
+                source: "env".to_owned(),
+                raw_arch: family_override_raw_arch(value),
+            });
+        }
     }
 
     if let Some(family) = detect_managed_therock_family(paths) {
@@ -3163,14 +3560,28 @@ fn resolve_family(paths: &AppPaths, family_override: Option<&str>) -> Result<Fam
         });
     }
 
-    if let Some(raw_arch) = detect_host_gfx_target()
-        && let Some(family) = normalize_therock_family(&raw_arch)
+    let host_arch = detect_host_gfx_target();
+    if let Some(raw_arch) = host_arch.as_deref()
+        && let Some(family) = normalize_therock_family(raw_arch)
     {
         return Ok(FamilyResolution {
             family,
             source: "host".to_owned(),
-            raw_arch: Some(raw_arch),
+            raw_arch: Some(raw_arch.to_owned()),
         });
+    }
+
+    // A GPU was detected that is known to have no package family: the gfx90c
+    // Vega iGPU in Renoir/Cezanne APUs. Listing the recognized families would
+    // invite installing a build for different silicon, so say plainly that
+    // there is nothing to install for this GPU. Other unmapped targets keep the
+    // generic error below, which points at `--family`.
+    if let Some(raw_arch) = host_arch.as_deref()
+        && gfx_target_has_no_rocm_build(raw_arch)
+    {
+        let message = unsupported_host_gpu_message(raw_arch);
+        let diagnostics = detect_host_gpu_diagnostics();
+        bail!("{message}\n\n{diagnostics}");
     }
 
     bail!(
@@ -3179,6 +3590,34 @@ fn resolve_family(paths: &AppPaths, family_override: Option<&str>) -> Result<Fam
          Recognized families: {}.\n\n{}",
         known_therock_families().join(", "),
         detect_host_gpu_diagnostics()
+    )
+}
+
+/// The install error for a detected GPU target that no TheRock package family
+/// covers. It deliberately does not list `--family` values: none of them was
+/// built for this GPU.
+fn unsupported_host_gpu_message(raw_arch: &str) -> String {
+    format!(
+        "no ROCm SDK build exists for the detected GPU target `{raw_arch}`, so \
+         `rocm install sdk` has nothing to install for it.\n\
+         The GPU is detected but is not supported by ROCm; \
+         the Vulkan backend can still be used."
+    )
+}
+
+/// The install error for a target the user asked for by name that no TheRock
+/// package family covers.
+///
+/// Separate from [`unsupported_host_gpu_message`] because nothing was detected
+/// here: the user named the target, so the error names where it came from and
+/// does not claim a GPU is present. Like that message it offers no `--family`
+/// values, since none of them was built for this GPU.
+fn unsupported_requested_target_message(value: &str, source: &str) -> String {
+    format!(
+        "no ROCm SDK build exists for the GPU target `{value}` requested by \
+         {source}, so `rocm install sdk` has nothing to install for it.\n\
+         That GPU is not supported by ROCm; the Vulkan backend can still be \
+         used. Nothing was installed and no other family was substituted."
     )
 }
 
@@ -3333,11 +3772,13 @@ fn wait_with_output_bounded(mut child: Child, timeout: Option<Duration>) -> Resu
     }
 }
 
+/// `requirements` is passed in rather than composed here so that the lines sent
+/// to `uv` and the lines the resolution reports back (and the preview prints)
+/// are one value, not two that can disagree.
 fn resolve_published_pip_package_versions(
     paths: &AppPaths,
     index_url: &str,
-    rocm_version: &str,
-    device_target: &str,
+    requirements: &[String],
     compatibility: &WheelCompatibility,
     download_timeout_secs: Option<u64>,
 ) -> Result<TheRockPipPackageVersions> {
@@ -3345,10 +3786,7 @@ fn resolve_published_pip_package_versions(
         ensure_uv_binary(paths).context("failed to acquire uv for ROCm X metadata resolution")?;
     let python_version = uv_python_version(compatibility)?;
     let python_platform = uv_python_platform(compatibility)?;
-    let device_extra = format!("device-{device_target}");
-    let requirements = format!(
-        "rocm[libraries,devel,{device_extra}]=={rocm_version}\ntorch[{device_extra}]\ntorchvision[{device_extra}]\ntorchaudio\n"
-    );
+    let requirements = format!("{}\n", requirements.join("\n"));
     let mut child = Command::new(&uv)
         .args([
             "pip",
@@ -3475,6 +3913,287 @@ fn select_latest_stack_package(
         .collect::<Vec<_>>();
     candidates.sort_by(|left, right| compare_version_strings(left, right));
     candidates.pop()
+}
+
+/// The torchaudio build pinned for a ROCm 10 install, and why it was chosen.
+/// The plan line and install-log note are both [`TorchaudioPin::describe`], so
+/// what is printed is derived from the decision rather than restated beside it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TorchaudioPin {
+    /// The published version pinned, `+rocm…` label included.
+    version: String,
+    /// The ROCm build `version` was chosen for.
+    rocm_version: String,
+    basis: TorchaudioPinBasis,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TorchaudioPinBasis {
+    /// `version` is the hardware-verified release for this ROCm line.
+    Verified,
+    /// A verified release is recorded for this ROCm line, but the index
+    /// publishes no build of it labelled for this exact ROCm build (`+rocm`
+    /// label) for this Python and platform, so `version` is the newest build
+    /// instead.
+    VerifiedNotPublished {
+        release: &'static str,
+        /// A build of `release` this Python and platform can install, labelled
+        /// for another ROCm build, when one is published. The verified release
+        /// is matched by ROCm line, so a `10.1.1` request can find it published
+        /// only as `+rocm10.1.0`; the reason must then name the ROCm build, not
+        /// the Python or platform.
+        other_build: Option<String>,
+    },
+    /// No verified release is recorded for this ROCm line, so `version` is the
+    /// newest build.
+    NoVerifiedRelease,
+}
+
+impl TorchaudioPin {
+    const fn is_verified(&self) -> bool {
+        matches!(self.basis, TorchaudioPinBasis::Verified)
+    }
+
+    fn describe(&self) -> String {
+        let Self {
+            version,
+            rocm_version,
+            basis,
+        } = self;
+        match basis {
+            TorchaudioPinBasis::Verified => format!(
+                "torchaudio {version}, the build verified on hardware for ROCm {rocm_version}"
+            ),
+            TorchaudioPinBasis::VerifiedNotPublished {
+                release,
+                other_build: None,
+            } => format!(
+                "torchaudio {version}, the newest build published for ROCm {rocm_version}; it is not hardware-verified, because the verified release, {release}, is not published for this Python and platform"
+            ),
+            TorchaudioPinBasis::VerifiedNotPublished {
+                release,
+                other_build: Some(other_build),
+            } => format!(
+                "torchaudio {version}, the newest build published for ROCm {rocm_version}; it is not hardware-verified, because the verified release, {release}, is published for this Python and platform only for another ROCm build ({other_build}), not for ROCm {rocm_version}"
+            ),
+            TorchaudioPinBasis::NoVerifiedRelease => format!(
+                "torchaudio {version}, the newest build published for ROCm {rocm_version}; it is not hardware-verified, because no torchaudio release is recorded as verified for this ROCm line"
+            ),
+        }
+    }
+}
+
+/// The install-log line for a torchaudio pin that is not hardware-verified, or
+/// `None` for one that is.
+///
+/// An unverified torchaudio is the one stack choice ROCm CLI makes on its own
+/// judgement, so a real install says so in the install log, not only in the
+/// plan's `torchaudio_selection:` line. A verified pin needs no such warning.
+/// The text is [`TorchaudioPin::describe`], so it cannot disagree with the pin.
+fn unverified_torchaudio_note(pin: &TorchaudioPin) -> Option<String> {
+    (!pin.is_verified()).then(|| format!("Note: {}", pin.describe()))
+}
+
+/// The torchaudio build to pin for `rocm_version`, from `published` (this
+/// Python and platform's builds on the index).
+///
+/// `verified_release` comes first: it is the release confirmed on hardware for
+/// this ROCm line ([`rocm_engine_vllm::verified_torchaudio_release`], read from
+/// the vLLM ROCm 10.x discover-build table so the SDK and its vLLM install pin
+/// the same build). Recency alone is not a safe choice among builds sharing a
+/// `+rocm<version>` label: `whl-next` publishes `2.11.0`, `2.11.0.2` and
+/// `2.11.0.3` all as `+rocm10.1.0`, and `2.11.0` is a CPU-only rebuild with no
+/// HIP kernels, which nothing in the version or label distinguishes. Only when
+/// no verified release is recorded, or it is not published here, does this fall
+/// back to [`latest_build_for_rocm`], and the returned basis says so.
+///
+/// Refuses when no build for `rocm_version` is published at all, or when none of
+/// the published builds' versions can be read — the second is not the first,
+/// and reporting it as "none published" would send the user to the wrong place.
+fn torchaudio_pin(
+    published: &[String],
+    rocm_version: &str,
+    verified_release: Option<&'static str>,
+    index_url: &str,
+) -> Result<TorchaudioPin> {
+    let built_for_rocm = package_versions_matching_rocm(published, rocm_version);
+    if built_for_rocm.is_empty() {
+        bail!(
+            "no torchaudio built for ROCm {rocm_version} is published for this Python and platform in {index_url}"
+        );
+    }
+    let pin = |version, basis| TorchaudioPin {
+        version,
+        rocm_version: rocm_version.to_owned(),
+        basis,
+    };
+    let basis = match verified_release {
+        Some(release) => match published_build_of(&built_for_rocm, release) {
+            Some(version) => return Ok(pin(version, TorchaudioPinBasis::Verified)),
+            // Not among `built_for_rocm`, so a labelled build of it in the
+            // whole listing is one for another ROCm build.
+            None => TorchaudioPinBasis::VerifiedNotPublished {
+                release,
+                other_build: published_build_of(
+                    &published
+                        .iter()
+                        .filter(|version| package_rocm_suffix(version).is_some())
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                    release,
+                ),
+            },
+        },
+        None => TorchaudioPinBasis::NoVerifiedRelease,
+    };
+    let newest = latest_build_for_rocm(published, rocm_version).with_context(|| {
+        format!(
+            "torchaudio builds for ROCm {rocm_version} are published in {index_url}, but none has a PEP 440 version ROCm CLI can order: {}",
+            built_for_rocm.join(", ")
+        )
+    })?;
+    Ok(pin(newest, basis))
+}
+
+/// The build in `versions` whose public version is `release` under PEP 440
+/// (local label ignored, trailing zeros insignificant), as `uv` would match
+/// `torchaudio=={release}`. Not a prefix match: `2.11.0` must not find
+/// `2.11.0.2`.
+fn published_build_of(versions: &[String], release: &str) -> Option<String> {
+    let wanted = package_release_key(release)?;
+    versions
+        .iter()
+        .find(|version| package_release_key(version).as_ref() == Some(&wanted))
+        .cloned()
+}
+
+/// The newest of `versions` built for exactly `rocm_version`, chosen the way
+/// `uv` would choose among them: in PEP 440 order, with final releases ahead of
+/// any pre-release.
+///
+/// The fallback for [`torchaudio_pin`] only, never the first choice: newest is
+/// not a safe discriminator among builds sharing a `+rocm<version>` label (see
+/// there for the CPU-only `2.11.0+rocm10.1.0` precedent, and the vLLM engine's
+/// ROCm 10.x discover-build table, which pins `2.11.0.2` exactly for the same
+/// reason). Nothing on the index pairs a torchaudio build with a torch build,
+/// so this assumes the newest torchaudio of a ROCm build is the one built
+/// against that build's torch — the same choice `uv` made unaided when the
+/// pinned build was also the newest one on the index.
+///
+/// Not [`select_latest_stack_package`]: [`parse_version`] reads only
+/// `major.minor.patch` and rejects the rest, and torchaudio publishes rebuilds
+/// as extra release segments (`2.11.0.2`, `2.11.0.3`), so that would drop every
+/// rebuild and settle on the original `2.11.0` build.
+fn latest_build_for_rocm(versions: &[String], rocm_version: &str) -> Option<String> {
+    package_versions_matching_rocm(versions, rocm_version)
+        .into_iter()
+        .filter_map(|version| package_release_key(&version).map(|key| (key, version)))
+        .max_by(|(left, _), (right, _)| (left.is_final(), left).cmp(&(right.is_final(), right)))
+        .map(|(_, version)| version)
+}
+
+/// A PEP 440 version, less its `+local` label, as a value whose derived order is
+/// PEP 440's: field order is comparison order, and each enum's variants are
+/// declared lowest first.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct PackageReleaseKey {
+    epoch: u64,
+    /// Trailing zeros dropped, so `2.11` and `2.11.0` compare equal.
+    release: Vec<u64>,
+    pre: PreRelease,
+    post: Option<u64>,
+    dev: DevRelease,
+}
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum PreRelease {
+    /// `X.devN` with no pre- or post-release sorts below every `X` pre-release.
+    DevOnly,
+    /// `a` = 0, `b` = 1, `rc` = 2.
+    Pre(u8, u64),
+    Final,
+}
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum DevRelease {
+    Dev(u64),
+    Absent,
+}
+
+impl PackageReleaseKey {
+    /// `uv` only picks a pre-release (including any `.devN`) when no final
+    /// release is available; a post-release counts as final.
+    fn is_final(&self) -> bool {
+        self.pre == PreRelease::Final && self.dev == DevRelease::Absent
+    }
+}
+
+/// Parses the normalized PEP 440 form a package index publishes
+/// (`[N!]N(.N)*[{a|b|rc}N][.postN][.devN][+local]`), already percent-decoded
+/// by [`parse_simple_index_versions`]. Anything else is `None`, and is skipped
+/// rather than guessed at.
+fn package_release_key(version: &str) -> Option<PackageReleaseKey> {
+    fn number(rest: &mut &str) -> Option<u64> {
+        let len = rest.chars().take_while(char::is_ascii_digit).count();
+        let (digits, tail) = rest.split_at(len);
+        *rest = tail;
+        digits.parse().ok()
+    }
+
+    let public = version.split('+').next().unwrap_or_default();
+    let (epoch, mut rest) = match public.split_once('!') {
+        Some((epoch, rest)) => (epoch.parse().ok()?, rest),
+        None => (0, public),
+    };
+
+    let mut release = vec![number(&mut rest)?];
+    while let Some(tail) = rest.strip_prefix('.')
+        && tail.starts_with(|ch: char| ch.is_ascii_digit())
+    {
+        rest = tail;
+        release.push(number(&mut rest)?);
+    }
+    while release.len() > 1 && release.last() == Some(&0) {
+        release.pop();
+    }
+
+    let mut pre = None;
+    for (tag, kind) in [("rc", 2), ("a", 0), ("b", 1)] {
+        if let Some(tail) = rest.strip_prefix(tag) {
+            rest = tail;
+            pre = Some((kind, number(&mut rest)?));
+            break;
+        }
+    }
+    let post = match rest.strip_prefix(".post") {
+        Some(tail) => {
+            rest = tail;
+            Some(number(&mut rest)?)
+        }
+        None => None,
+    };
+    let dev = match rest.strip_prefix(".dev") {
+        Some(tail) => {
+            rest = tail;
+            Some(number(&mut rest)?)
+        }
+        None => None,
+    };
+    if !rest.is_empty() {
+        return None;
+    }
+
+    Some(PackageReleaseKey {
+        epoch,
+        release,
+        pre: match (pre, post, dev) {
+            (Some((kind, number)), ..) => PreRelease::Pre(kind, number),
+            (None, None, Some(_)) => PreRelease::DevOnly,
+            (None, ..) => PreRelease::Final,
+        },
+        post,
+        dev: dev.map_or(DevRelease::Absent, DevRelease::Dev),
+    })
 }
 
 fn package_versions_matching_rocm(versions: &[String], rocm_version: &str) -> Vec<String> {
@@ -4420,7 +5139,7 @@ fn temp_sibling_path(path: &Path, suffix: &OsStr) -> Result<PathBuf> {
     Ok(parent.join(file_name))
 }
 
-fn write_file_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_file_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
     let temp_id = format!("{}-{}", std::process::id(), unix_time_millis());
     write_file_atomically_with(
         path,
@@ -4646,19 +5365,29 @@ fn ensure_uv_venv(
 ) -> Result<()> {
     let env_python = venv_python_path(install_root);
     if env_python.is_file() {
-        if run_command(
+        let reusable = run_command(
             &env_python,
             &["--version"],
             "verify existing managed TheRock runtime Python",
         )
         .is_ok()
-        {
+            && wheel_compatibility_for_python(&env_python).is_ok_and(|existing| {
+                wheel_compatibility_for_python(python_launcher)
+                    .is_ok_and(|required| existing.python_tag == required.python_tag)
+            });
+        if reusable {
             return Ok(());
         }
-        progress_line("Existing Python environment is incomplete; recreating it.");
+        // Same `install_root` can be reused across reinstalls (it's keyed on
+        // resolved version/build date, not on the interpreter), so an existing
+        // venv left over from a lower-tag requirement must not be mistaken for
+        // a compatible one just because it still runs.
+        progress_line(
+            "Existing Python environment does not match the required interpreter; recreating it.",
+        );
         fs::remove_dir_all(install_root).with_context(|| {
             format!(
-                "failed to remove incomplete Python environment at {}",
+                "failed to remove incompatible Python environment at {}",
                 install_root.display()
             )
         })?;
@@ -4892,7 +5621,7 @@ try:
         # `Requires-Dist` entries carry environment markers after ';'. Only the
         # requirement itself matters here.
         requirement = raw.split(";")[0].strip()
-        # The distribution name runs up to the first specifier, extra or space —
+        # The distribution name runs up to the first specifier, extra or space -
         # and there is usually no space at all, as in `torch==2.11.0+gitd0c8b1f`.
         matched = re.match(r"[A-Za-z0-9._-]+", requirement)
         if matched is None:
@@ -5509,24 +6238,127 @@ fn managed_python_bootstrap_disabled() -> bool {
         })
 }
 
-fn managed_python_version() -> String {
+/// The interpreter a runtime's wheels require.
+///
+/// ROCm >= [`THEROCK_NEXT_MIN_MAJOR`] publishes its framework wheels (notably
+/// vLLM, flash-attn and amd-aiter) for one CPython version only, and it is not
+/// the one the canonical stream uses. Both fields move together, so they travel
+/// together: `version` is what `uv` provisions, `tag` is what an already-present
+/// interpreter is checked against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PythonRequirement {
+    tag: &'static str,
+    version: &'static str,
+}
+
+/// The interpreter required to install from `layout`.
+///
+/// Keyed on the layout rather than on a resolved ROCm version because the
+/// interpreter has to be chosen *before* resolution: `resolve_pip_runtime` picks
+/// wheels using the interpreter's own tags, so the resolved version is not
+/// available yet. The layout is an honest stand-in only when it was decided
+/// from an explicit stable pin (`next_layout_requested`); a fresh install with
+/// no pin, or a nightly build-date/prerelease pin, needs
+/// [`canonical_auto_select_needs_next_python`] to check whether the channel's
+/// own "latest" has rotated past [`THEROCK_NEXT_MIN_MAJOR`] on its own.
+const fn python_requirement(layout: SourceLayout) -> PythonRequirement {
+    match layout {
+        SourceLayout::Next => PythonRequirement {
+            tag: "cp314",
+            version: NEXT_MANAGED_PYTHON_VERSION,
+        },
+        SourceLayout::Canonical => PythonRequirement {
+            tag: "cp312",
+            version: DEFAULT_MANAGED_PYTHON_VERSION,
+        },
+    }
+}
+
+/// The layout an install or update will read from, as far as is knowable before
+/// an interpreter has been chosen. An update passes its manifest's recorded
+/// layout; a fresh install passes its request and lets the pin decide.
+fn requested_source_layout(
+    layout_override: Option<SourceLayout>,
+    version_selector: Option<&RuntimeVersionSelector>,
+) -> SourceLayout {
+    match layout_override {
+        Some(layout) => layout,
+        None if version_selector.is_some_and(next_layout_requested) => SourceLayout::Next,
+        None => SourceLayout::Canonical,
+    }
+}
+
+/// Whether a `Canonical`-layout install (auto-select, or a nightly
+/// build-date/prerelease pin) will actually resolve a ROCm build at major >=
+/// [`THEROCK_NEXT_MIN_MAJOR`], regardless of [`VersionStage`].
+///
+/// `requested_source_layout` only answers from the shape of the request: an
+/// explicit *stable* pin at ROCm >= `THEROCK_NEXT_MIN_MAJOR` routes to `Next`
+/// and gets `cp314` that way, but the canonical/nightly feed can resolve a
+/// ROCm >= `THEROCK_NEXT_MIN_MAJOR` build (stable or prerelease) on its own,
+/// with no `Next` routing involved — and the `cp314` requirement is a property
+/// of the build itself, not of which index served it. Fetching the channel's
+/// own interpreter-agnostic `rocm` listing ahead of interpreter selection is
+/// the only way to know; `resolve_pip_runtime` re-fetches the same URL for the
+/// real resolution afterwards and shares this call's cache entry, so this
+/// costs no extra network round trip.
+fn canonical_auto_select_needs_next_python(
+    paths: &AppPaths,
+    channel: TheRockChannel,
+    version_selector: Option<&RuntimeVersionSelector>,
+) -> Result<bool> {
+    let source = resolve_source(channel, SourceLayout::Canonical);
+    let rocm_versions = load_simple_index_versions(paths, &source.wheel_index, "rocm", None, None)?;
+    Ok(highest_candidate_needs_next_python(
+        &rocm_versions,
+        channel,
+        version_selector,
+    ))
+}
+
+/// Pure decision core of [`canonical_auto_select_needs_next_python`], split out
+/// so it can be tested without a network fetch.
+fn highest_candidate_needs_next_python(
+    rocm_versions: &[String],
+    channel: TheRockChannel,
+    version_selector: Option<&RuntimeVersionSelector>,
+) -> bool {
+    let mut candidates = channel_rocm_candidates(rocm_versions, channel);
+    if let Some(selector) = version_selector {
+        candidates.retain(|version| selector.matches_version(version));
+    }
+    candidates
+        .last()
+        .and_then(|version| parse_version(version))
+        .is_some_and(|parsed| parsed.major >= THEROCK_NEXT_MIN_MAJOR)
+}
+
+fn managed_python_version(requirement: PythonRequirement) -> String {
     std::env::var("ROCM_CLI_MANAGED_PYTHON_VERSION")
         .ok()
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_MANAGED_PYTHON_VERSION.to_owned())
+        .unwrap_or_else(|| requirement.version.to_owned())
 }
 
-fn ensure_managed_python(paths: &AppPaths) -> Result<PythonLauncher> {
-    let version = managed_python_version();
+fn ensure_managed_python(
+    paths: &AppPaths,
+    requirement: PythonRequirement,
+) -> Result<PythonLauncher> {
+    let version = managed_python_version(requirement);
     progress_line(format!("Preparing Python {version}..."));
 
     let uv = ensure_uv_binary(paths)?;
 
     // Check the manifest first — if the recorded executable is still usable, skip the install.
+    // ponytail: this manifest holds one version at a time, so alternating between a
+    // canonical (3.12) and a `Next` (3.14) install re-runs `uv python install` on every
+    // switch instead of keeping both cached — `uv` itself still short-circuits the
+    // re-download, so this costs a subprocess round trip, not a real reinstall. Upgrade
+    // to a version-keyed manifest if that alternation turns out to be a common pattern.
     if let Ok(Some(manifest)) = load_managed_python_manifest(paths)
         && manifest.version == version
         && manifest.executable.is_file()
-        && python_launcher_install_ready(&manifest.executable).is_ok()
+        && python_launcher_install_ready(&manifest.executable, requirement).is_ok()
     {
         progress_line(format!(
             "Using existing Python {version} at {}.",
@@ -5589,9 +6421,9 @@ fn ensure_managed_python(paths: &AppPaths) -> Result<PythonLauncher> {
         );
     }
 
-    python_launcher_install_ready(&executable).with_context(|| {
+    python_launcher_install_ready(&executable, requirement).with_context(|| {
         format!(
-            "Python {version} at {} could not create a virtual environment",
+            "Python {version} at {} is not usable for this ROCm install",
             executable.display()
         )
     })?;
@@ -5638,13 +6470,20 @@ impl PythonResolverEnv {
     }
 }
 
-fn resolve_python_launcher(paths: &AppPaths) -> Result<PythonLauncher> {
-    resolve_python_launcher_in(paths, &PythonResolverEnv::from_process_env())
+fn resolve_python_launcher(
+    paths: &AppPaths,
+    requirement: PythonRequirement,
+) -> Result<PythonLauncher> {
+    resolve_python_launcher_in(paths, &PythonResolverEnv::from_process_env(), requirement)
 }
 
-fn resolve_python_launcher_in(paths: &AppPaths, env: &PythonResolverEnv) -> Result<PythonLauncher> {
+fn resolve_python_launcher_in(
+    paths: &AppPaths,
+    env: &PythonResolverEnv,
+    requirement: PythonRequirement,
+) -> Result<PythonLauncher> {
     if let Some(value) = env.python_override.as_deref() {
-        python_launcher_install_ready(Path::new(value))
+        python_launcher_install_ready(Path::new(value), requirement)
             .with_context(|| format!("ROCM_CLI_PYTHON is not usable for ROCm setup: {value}"))?;
         return Ok(PythonLauncher {
             executable: PathBuf::from(value),
@@ -5654,7 +6493,7 @@ fn resolve_python_launcher_in(paths: &AppPaths, env: &PythonResolverEnv) -> Resu
 
     let mut skipped_path_python = false;
     for candidate in python_path_candidates(&env.search_dirs) {
-        match python_launcher_install_ready(&candidate) {
+        match python_launcher_install_ready(&candidate, requirement) {
             Ok(()) => {
                 return Ok(PythonLauncher {
                     executable: candidate,
@@ -5667,23 +6506,25 @@ fn resolve_python_launcher_in(paths: &AppPaths, env: &PythonResolverEnv) -> Resu
         }
     }
     if skipped_path_python {
-        progress_line(
-            "Python from PATH cannot create a virtual environment; using ROCm CLI's managed Python.",
-        );
+        progress_line(format!(
+            "Python from PATH is not usable for this ROCm install ({} is required); using ROCm CLI's managed Python.",
+            requirement.tag
+        ));
     }
 
     if let Some(manifest) = load_managed_python_manifest(paths)?
         && manifest.executable.is_file()
     {
-        if python_launcher_install_ready(&manifest.executable).is_ok() {
+        if python_launcher_install_ready(&manifest.executable, requirement).is_ok() {
             return Ok(PythonLauncher {
                 executable: manifest.executable,
                 source: "managed",
             });
         }
-        progress_line(
-            "Saved managed Python cannot create a virtual environment; preparing Python again.",
-        );
+        progress_line(format!(
+            "Saved managed Python is not usable for this ROCm install ({} is required); preparing Python again.",
+            requirement.tag
+        ));
     }
 
     if managed_python_bootstrap_disabled() {
@@ -5691,7 +6532,7 @@ fn resolve_python_launcher_in(paths: &AppPaths, env: &PythonResolverEnv) -> Resu
             "unable to locate Python, and managed Python bootstrap is disabled by ROCM_CLI_DISABLE_MANAGED_PYTHON_BOOTSTRAP"
         );
     }
-    ensure_managed_python(paths)
+    ensure_managed_python(paths, requirement)
 }
 
 fn python_path_candidates(search_dirs: &[PathBuf]) -> Vec<PathBuf> {
@@ -5740,15 +6581,16 @@ fn program_path_candidates(program: &str) -> Vec<String> {
     names
 }
 
-fn python_launcher_install_ready(program: &Path) -> Result<()> {
+fn python_launcher_install_ready(program: &Path, requirement: PythonRequirement) -> Result<()> {
     let compatibility = wheel_compatibility_for_python(program)?;
-    if compatibility.python_tag != "cp312" {
+    if compatibility.python_tag != requirement.tag {
         bail!(
-            "Python wheel tag {} is not supported; cp312 is required",
-            compatibility.python_tag
+            "Python wheel tag {} is not supported by this ROCm install; {} is required",
+            compatibility.python_tag,
+            requirement.tag
         );
     }
-    verify_python_can_create_venv(program)
+    verify_python_can_create_venv(program).context("Python could not create a virtual environment")
 }
 
 fn verify_python_can_create_venv(program: &Path) -> Result<()> {
@@ -5836,13 +6678,210 @@ fn validate_tarball_file_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Total order over published version strings — the total order used for
+/// sorting candidates in this module's "which build does the user get?"
+/// decisions. It is not always the first key: [`select_tarball_candidate`]
+/// orders by upload time first and uses this only to break ties.
+///
+/// Ordering is PEP 440's, because these strings come from a Python simple
+/// index: within one release `7.0.0.dev1` < `7.0.0a1` < `7.0.0b1` <
+/// `7.0.0rc1` < `7.0.0` < `7.0.0.post1`. The release segment is compared
+/// component-wise with the shorter side zero-padded, so `7.9` is `7.9.0` and
+/// precedes `7.10.0`, and `7.2.4.70204` — the shape ROCm's own packages are
+/// named with — is above `7.2.4` and below `7.2.5`.
+///
+/// Where this is not PEP 440, it declines to answer rather than guessing: an
+/// epoch (`1!2.0`), a combined stage suffix (`7.0.0rc1.dev1`) and anything else
+/// unreadable all return `None` from [`parse_version_for_ordering`]. Local
+/// version metadata is dropped rather than ordered, so `7.9.0+local` ties with
+/// `7.9.0` and is separated by the string tiebreak below.
+///
+/// A string that cannot be read keeps a *defined* position instead of switching
+/// the comparator to a different relation: it sorts below everything readable,
+/// and unreadable strings are ordered against each other by the string itself.
+/// Sorting below is the safe end for the "newest candidate" pickers, which take
+/// the maximum: an unreadable string can only win when every candidate is
+/// unreadable, rather than beating a real release by being lexicographically
+/// longer. It would cut the *other* way for [`runtime_freshness`], where the
+/// unreadable string is the installed version and "lowest" would read as "older
+/// than the index" — an offer that could be a downgrade.
+///
+/// Versions that are equal but textually different (`7.9` and `7.9.0`,
+/// `7.0.0-rc1` and `7.0.0rc1`, `7.9.0` and `7.9.0+local`) are separated by the
+/// raw string, so no two distinct strings compare `Equal` and `sort_by` is
+/// deterministic. That tiebreak is right for sorting and wrong for deciding
+/// whether a build is new: a caller asking "is there a newer runtime?" must use
+/// [`version_relation`], which compares the parsed keys, so that a spelling
+/// difference is not mistaken for an update.
+///
+/// This replaces an implementation that compared numerically only when *both*
+/// sides matched [`parse_version`]'s grammar and fell back to a byte-wise
+/// string compare otherwise. Mixing two relations in one comparator is not
+/// transitive — `7.0.0 < 7.0.0b1`, `7.0.0b1 < 7.0.0rc1`, yet `7.0.0 >
+/// 7.0.0rc1` — so `sort_by` had no defined result, "newest" depended on the
+/// order the index listed its candidates in, and `runtime_freshness` could
+/// offer a downgrade as an update.
 fn compare_version_strings(left: &str, right: &str) -> Ordering {
-    match (parse_version(left), parse_version(right)) {
+    match (
+        parse_version_for_ordering(left),
+        parse_version_for_ordering(right),
+    ) {
         (Some(left_parsed), Some(right_parsed)) => {
             left_parsed.cmp(&right_parsed).then_with(|| left.cmp(right))
         }
-        _ => left.cmp(right),
+        (Some(_), None) => Ordering::Greater,
+        (None, Some(_)) => Ordering::Less,
+        (None, None) => left.cmp(right),
     }
+}
+
+/// Lenient parse of a published version string, for ordering only.
+///
+/// Reads a PEP 440 public version: a release segment of any length, followed by
+/// at most one `dev`/`a`/`b`/`rc`/`post` stage. Because the module declares the
+/// order is PEP 440's, the spellings PEP 440 treats as equal are accepted as
+/// equal — case (`7.0.0RC1`), any of `.`, `-`, `_` or nothing as the separator
+/// before a stage label (`7.0.0-rc1`, `7.0.0_rc1`, `7.0.0rc1`), the alias
+/// labels (`alpha`, `beta`, `c`, `pre`, `preview`, `rev`, `r`), an omitted
+/// stage numeral (`7.0.0rc` is `rc0`), and a leading `v`.
+///
+/// The release segment is a *vector*, not three fixed components, because a
+/// four-component version is a shape this project really meets: ROCm's own
+/// packages are named `7.2.4.70204`. Folding that onto `7.2.4`, or rejecting
+/// it, both put it in the wrong place relative to a plain `6.4.3`.
+///
+/// Returns `None` rather than approximating where this stops being PEP 440,
+/// because a shape read *approximately* is a silently wrong order while `None`
+/// lands in the position [`compare_version_strings`] documents:
+/// * An epoch (`1!2.0`), which changes what the release numbers mean.
+/// * A combined stage suffix (`7.0.0rc1.dev1`).
+/// * PEP 440's implicit post-release (`7.2.4-98` meaning `7.2.4.post98`).
+///   That spelling collides with the packaging build number a system ROCm
+///   reports, which [`parse_host_version`] must read as plain `7.2.4`.
+///   Implementing the PEP 440 reading here would put the two parsers back into
+///   disagreement about one string, which is the defect this shared parser
+///   exists to remove; leaving it unreadable keeps them consistent and costs
+///   only a defined position.
+///
+///   What makes the two sides agree is that [`parse_host_version`] strips a
+///   `-` suffix only when it is *numeric*. A host `7.2.4-98` is reduced to
+///   `7.2.4` before it reaches here, so this function never sees that shape
+///   from the host; and `7.0.0-rc1` is left intact, so both sides read it as a
+///   release candidate. Widening either side of that rule re-opens the
+///   disagreement.
+///
+/// Local version metadata is dropped rather than ordered, so `7.9.0+local` and
+/// `7.9.0` produce the same key and [`compare_version_strings`] separates them
+/// by the string. PEP 440 would sort the local version above the plain one;
+/// nothing here depends on that, and the string tiebreak happens to agree.
+fn parse_version_for_ordering(value: &str) -> Option<VersionOrderKey> {
+    // Drop local version metadata: `7.9.0+local` -> `7.9.0`.
+    let value = value.split('+').next().unwrap_or(value).trim();
+    // PEP 440 is case-insensitive (`7.0.0RC1` is `7.0.0rc1`).
+    let value = value.to_ascii_lowercase();
+    let value = value.strip_prefix('v').unwrap_or(&value);
+    if value.is_empty() {
+        return None;
+    }
+
+    // An epoch (`1!2.0`) changes what the release numbers mean, so a version
+    // carrying one must not be ordered as though it did not. This check is
+    // redundant today and kept as documentation: the `!` is neither a release
+    // digit nor a stage label, so `parse_version_stage` below rejects every
+    // epoch anyway. That rejection is incidental, though; this is the line
+    // that states the rule, and it keeps holding if the stage parser ever
+    // accepts more.
+    if value.contains('!') {
+        return None;
+    }
+
+    let mut release = Vec::new();
+    let mut rest = value;
+    loop {
+        let (number, tail) = split_leading_number(rest)?;
+        release.push(number);
+        match tail.strip_prefix('.') {
+            // Another release component only if a digit follows the dot;
+            // `.post1` and `.dev1` are stages, not components.
+            Some(next) if next.starts_with(|ch: char| ch.is_ascii_digit()) => rest = next,
+            _ => {
+                rest = tail;
+                break;
+            }
+        }
+    }
+    // `7.9`, `7.9.0` and `7.9.0.0` are one release. Stripping trailing zeros
+    // makes the plain `Vec` comparison below agree with PEP 440's rule of
+    // zero-padding the shorter release to the longer one.
+    while release.last() == Some(&0) {
+        release.pop();
+    }
+
+    let (stage, stage_number) = parse_version_stage(rest)?;
+    Some(VersionOrderKey {
+        release,
+        stage,
+        stage_number,
+    })
+}
+
+/// Split a leading run of ASCII digits off `value`, returning it and the rest.
+/// `None` when `value` does not start with a digit, or the digits overflow.
+fn split_leading_number(value: &str) -> Option<(u64, &str)> {
+    let digits = value.chars().take_while(char::is_ascii_digit).count();
+    if digits == 0 {
+        return None;
+    }
+    Some((value[..digits].parse().ok()?, &value[digits..]))
+}
+
+/// Map a PEP 440 stage suffix onto its [`VersionStage`] and number.
+///
+/// Accepts the spellings PEP 440 normalises away: any of `.`, `-`, `_` or no
+/// separator before the label, the alias labels (`alpha`, `beta`, `c`, `pre`,
+/// `preview`, `rev`, `r`), and an omitted numeral, which PEP 440 defines as
+/// zero. `value` is already lowercased by the caller.
+///
+/// A combined suffix (`7.0.0rc1.dev1`) is rejected rather than folded onto the
+/// first stage it happens to match: an approximate position is a silently wrong
+/// order, while `None` lands in the place [`compare_version_strings`]
+/// documents.
+fn parse_version_stage(suffix: &str) -> Option<(VersionStage, u64)> {
+    if suffix.is_empty() {
+        return Some((VersionStage::Stable, 0));
+    }
+    let label = suffix.strip_prefix(['.', '-', '_']).unwrap_or(suffix);
+    // Longest spelling first: `a` would otherwise swallow `alpha`, and `r`
+    // would swallow `rev`, matching and then failing on the leftover letters.
+    for (prefix, stage) in [
+        ("preview", VersionStage::Rc),
+        ("alpha", VersionStage::Alpha),
+        ("beta", VersionStage::Beta),
+        ("post", VersionStage::Post),
+        ("pre", VersionStage::Rc),
+        ("dev", VersionStage::Dev),
+        ("rev", VersionStage::Post),
+        ("rc", VersionStage::Rc),
+        ("a", VersionStage::Alpha),
+        ("b", VersionStage::Beta),
+        ("c", VersionStage::Rc),
+        ("r", VersionStage::Post),
+    ] {
+        let Some(number) = label.strip_prefix(prefix) else {
+            continue;
+        };
+        // PEP 440: an omitted numeral is zero, so `7.0.0rc` is `7.0.0rc0`.
+        let number = number.trim_start_matches(['.', '-', '_']);
+        return Some((
+            stage,
+            if number.is_empty() {
+                0
+            } else {
+                number.parse().ok()?
+            },
+        ));
+    }
+    None
 }
 
 fn parse_version(value: &str) -> Option<ParsedVersion> {
@@ -5859,15 +6898,18 @@ fn parse_version(value: &str) -> Option<ParsedVersion> {
     if patch_len == 0 {
         return None;
     }
-    let patch = patch_and_rest[..patch_len].parse().ok()?;
+    // Parsed only to be validated: nothing reads the patch or stage number.
+    patch_and_rest[..patch_len].parse::<u32>().ok()?;
     let suffix = &patch_and_rest[patch_len..];
 
-    let (stage, stage_number) = if suffix.is_empty() {
-        (VersionStage::Stable, 0)
+    let stage = if suffix.is_empty() {
+        VersionStage::Stable
     } else if let Some(rest) = suffix.strip_prefix("rc") {
-        (VersionStage::Rc, rest.parse().ok()?)
+        rest.parse::<u64>().ok()?;
+        VersionStage::Rc
     } else if let Some(rest) = suffix.strip_prefix('a') {
-        (VersionStage::Alpha, rest.parse().ok()?)
+        rest.parse::<u64>().ok()?;
+        VersionStage::Alpha
     } else {
         return None;
     };
@@ -5875,58 +6917,35 @@ fn parse_version(value: &str) -> Option<ParsedVersion> {
     Some(ParsedVersion {
         major,
         minor,
-        patch,
         stage,
-        stage_number,
     })
 }
 
 /// Lenient parse of a host-reported ROCm version for the "is the host newer?"
-/// decision. Unlike [`parse_version`], this tolerates the shapes a legacy/system
-/// ROCm actually reports: a build suffix (`7.2.4-98`) and a missing patch
-/// component (`7.4`). Major and minor are required; patch defaults to 0 when
-/// absent and may still carry an `rc`/`a` stage suffix. Returns `None` when
-/// major/minor cannot be read so an unparseable host string is treated as
-/// "can't tell" instead of being compared lexicographically.
-fn parse_host_version(value: &str) -> Option<ParsedVersion> {
-    // Drop build/local metadata: `7.2.4-98`, `7.2.4+local` -> `7.2.4`.
-    let value = value.split(['+', '-']).next().unwrap_or(value).trim();
-    let mut parts = value.splitn(3, '.');
-    let major = parts.next()?.parse().ok()?;
-    let minor = parts.next()?.parse().ok()?;
-    let (patch, stage, stage_number) = match parts.next() {
-        // Two-component report (`7.4`) -> treat as `7.4.0`.
-        None => (0, VersionStage::Stable, 0),
-        Some(patch_and_rest) => {
-            let patch_len = patch_and_rest
-                .chars()
-                .take_while(char::is_ascii_digit)
-                .count();
-            if patch_len == 0 {
-                return None;
-            }
-            let patch = patch_and_rest[..patch_len].parse().ok()?;
-            let suffix = &patch_and_rest[patch_len..];
-            let (stage, stage_number) = if suffix.is_empty() {
-                (VersionStage::Stable, 0)
-            } else if let Some(rest) = suffix.strip_prefix("rc") {
-                (VersionStage::Rc, rest.parse().ok()?)
-            } else if let Some(rest) = suffix.strip_prefix('a') {
-                (VersionStage::Alpha, rest.parse().ok()?)
-            } else {
-                return None;
-            };
-            (patch, stage, stage_number)
-        }
+/// decision.
+///
+/// [`parse_version_for_ordering`] already handles every shape this needs except
+/// one: a legacy/system ROCm reports a packaging build number as `7.2.4-98`,
+/// which is not a PEP 440 spelling of anything.
+///
+/// Only a *numeric* `-` suffix is dropped. `-` is also a PEP 440 pre-release
+/// separator, so stripping it unconditionally would read `7.0.0-rc1` as the
+/// final `7.0.0` — and then this function and the comparator would disagree
+/// about that string, which is exactly the self-contradiction the shared parser
+/// exists to remove.
+///
+/// Sharing the parser is the point: a host version and an index version are
+/// compared against each other, and the two must not disagree about which is
+/// newer. Returns `None` when the string still cannot be read, so an
+/// unparseable host string is "can't tell" rather than a lexicographic guess.
+fn parse_host_version(value: &str) -> Option<VersionOrderKey> {
+    // `7.2.4-98` -> `7.2.4`, but `7.0.0-rc1` is left for the PEP 440 parser.
+    let trimmed = value.trim();
+    let candidate = match trimmed.split_once('-') {
+        Some((head, tail)) if tail.starts_with(|ch: char| ch.is_ascii_digit()) => head,
+        _ => trimmed,
     };
-
-    Some(ParsedVersion {
-        major,
-        minor,
-        patch,
-        stage,
-        stage_number,
-    })
+    parse_version_for_ordering(candidate)
 }
 
 /// Recovery guidance appended to family/index resolution failures so a clean
@@ -6176,9 +7195,29 @@ fn load_runtime_manifests_reporting_unparsed(
             Err(_) => unparsed.push(path),
         }
     }
-    manifests.sort_by_key(|manifest| std::cmp::Reverse(manifest.installed_at_unix_ms));
+    sort_manifests_newest_install_first(&mut manifests);
     unparsed.sort();
     Ok((manifests, unparsed))
+}
+
+/// Order installed runtimes newest install first, breaking ties on the runtime
+/// key.
+///
+/// The tiebreak is what makes this a function of the registry contents rather
+/// than of the order `read_dir` happened to return them in. Two runtimes can
+/// share an `installed_at_unix_ms` — a `--devel` install and its plain sibling
+/// land in the same millisecond, and the field is only millisecond-resolution —
+/// and `select_startup_update_manifest` falls back to the first entry when no
+/// active runtime key is configured, so without it the filesystem decided which
+/// runtime the startup update check looked at. `select_runtimes_to_remove`
+/// already applies the same rule to its retention groups.
+fn sort_manifests_newest_install_first(manifests: &mut [InstalledRuntimeManifest]) {
+    manifests.sort_by(|left, right| {
+        right
+            .installed_at_unix_ms
+            .cmp(&left.installed_at_unix_ms)
+            .then_with(|| left.runtime_key.cmp(&right.runtime_key))
+    });
 }
 
 fn has_nontrivial_directory_contents(path: &Path) -> Result<bool> {
@@ -6677,8 +7716,8 @@ mod tests {
         // python is a non-executable stub fails
         // `python_launcher_install_ready`, so `resolve_python_launcher_in`
         // falls back to the managed-Python path and calls
-        // `progress_line("Python from PATH cannot create a virtual
-        // environment; using ROCm CLI's managed Python.")` before bailing out
+        // `progress_line("Python from PATH is not usable for this ROCm
+        // install ...; using ROCm CLI's managed Python.")` before bailing out
         // (managed bootstrap is disabled here, so the whole thing stays
         // network-free). If `render_update_json` stopped installing the
         // guard, that call would land in `PROGRESS_LINE_SINK` instead of
@@ -7233,6 +8272,108 @@ mod tests {
     }
 
     #[test]
+    fn gfx90c_resolves_to_no_family_instead_of_the_datacenter_one() {
+        // gfx90c is the Vega iGPU in Renoir/Cezanne APUs. It used to normalize to
+        // `gfx90X-dcgpu`, so a plain `rocm install sdk` targeted data-center
+        // packages and the error listed that family as a `--family` choice.
+        assert_eq!(normalize_therock_family("gfx90c"), None);
+    }
+
+    #[test]
+    fn unsupported_gpu_error_names_the_gpu_and_does_not_suggest_families() {
+        let message = unsupported_host_gpu_message("gfx90c");
+        assert!(message.contains("no ROCm SDK build"), "{message}");
+        assert!(message.contains("`gfx90c`"), "{message}");
+        assert!(message.contains("Vulkan"), "{message}");
+        assert!(!message.contains("--family"), "{message}");
+        for family in known_therock_families() {
+            assert!(
+                !message.contains(family),
+                "the error must not offer `{family}` for an unsupported GPU: {message}"
+            );
+        }
+    }
+
+    /// Asking for gfx90c by name must fail, not quietly install for some other
+    /// GPU.
+    ///
+    /// `normalize_therock_family("gfx90c")` is `None`, and in `resolve_family`
+    /// `None` from the override branch means "keep looking" — so before the
+    /// explicit-target guard, `--family gfx90c` was dropped on the floor and
+    /// the host's own family was installed instead. That is worse than the
+    /// data-center mapping this change removed: the user named a target and
+    /// got a different one with no warning.
+    ///
+    /// Reaching detection at all would make this test depend on the machine it
+    /// runs on, so a failure here is also the signal that the guard moved below
+    /// the branches it has to precede.
+    #[test]
+    fn requesting_gfx90c_by_name_fails_instead_of_installing_another_family() {
+        let (_root, paths) = test_paths("resolve-family-gfx90c-override");
+        let error = resolve_family(&paths, Some("gfx90c"))
+            .expect_err("--family gfx90c must not resolve to any package family");
+        let message = error.to_string();
+        assert!(message.contains("no ROCm SDK build"), "{message}");
+        assert!(message.contains("`gfx90c`"), "{message}");
+        assert!(message.contains("--family"), "{message}");
+        assert!(
+            message.contains("no other family was substituted"),
+            "{message}"
+        );
+        for family in known_therock_families() {
+            assert!(
+                !message.contains(family),
+                "asking for gfx90c must not resolve or offer `{family}`: {message}"
+            );
+        }
+    }
+
+    /// A valid `--family` must resolve even if `ROCM_CLI_THEROCK_FAMILY` is
+    /// stale and happens to name gfx90c.
+    ///
+    /// The no-build guard used to run ahead of both sources regardless of
+    /// which one would actually be consulted, so a leftover env value with no
+    /// bearing on this invocation could refuse an otherwise-valid `--family`.
+    /// The guard now lives inside each source's own branch, so it only fires
+    /// for the source actually being read.
+    #[test]
+    #[allow(unsafe_code)] // std::env::set_var is unsafe in edition 2024
+    fn cli_family_overrides_a_stale_env_value_naming_an_unsupported_gpu() {
+        let _guard = PROCESS_ENV_TEST_LOCK.lock().unwrap();
+        let old_env = std::env::var_os("ROCM_CLI_THEROCK_FAMILY");
+        unsafe {
+            std::env::set_var("ROCM_CLI_THEROCK_FAMILY", "gfx90c");
+        }
+
+        let (_root, paths) = test_paths("resolve-family-cli-overrides-stale-env");
+        let resolution = resolve_family(&paths, Some("gfx1103"));
+
+        unsafe {
+            match old_env {
+                Some(value) => std::env::set_var("ROCM_CLI_THEROCK_FAMILY", value),
+                None => std::env::remove_var("ROCM_CLI_THEROCK_FAMILY"),
+            }
+        }
+
+        let resolution = resolution
+            .expect("a valid --family must resolve even with an unrelated gfx90c env override set");
+        assert_eq!(resolution.family, "gfx110X-all");
+        assert_eq!(resolution.source, "manifest");
+    }
+
+    #[test]
+    fn requested_target_error_names_where_the_target_came_from() {
+        let message = unsupported_requested_target_message("gfx90c", "--family");
+        assert!(message.contains("`gfx90c`"), "{message}");
+        assert!(message.contains("--family"), "{message}");
+        // The user named it; nothing was detected, so the error must not say so.
+        assert!(!message.contains("detected"), "{message}");
+
+        let message = unsupported_requested_target_message("gfx90c", "ROCM_CLI_THEROCK_FAMILY");
+        assert!(message.contains("ROCM_CLI_THEROCK_FAMILY"), "{message}");
+    }
+
+    #[test]
     fn release_channel_prefers_stable_versions() {
         let versions = vec![
             "7.11.0".to_owned(),
@@ -7292,6 +8433,25 @@ mod tests {
         .expect("future nightly major should resolve");
 
         assert_eq!(selected.rocm, "10.1.0a20260822");
+    }
+
+    #[test]
+    fn auto_select_landing_on_next_major_needs_next_python() {
+        // Same feed as `nightly_accepts_future_prerelease_major_without_cli_changes`:
+        // auto-select reaches ROCm 10.1.0a20260822, which needs cp314, not cp312,
+        // even though it's a prerelease served from the ordinary canonical/nightly
+        // index rather than `Next`'s separately hosted one.
+        assert!(highest_candidate_needs_next_python(
+            &["10.1.0a20260822".to_owned()],
+            TheRockChannel::Nightly,
+            None,
+        ));
+
+        assert!(!highest_candidate_needs_next_python(
+            &["7.14.0".to_owned()],
+            TheRockChannel::Nightly,
+            None,
+        ));
     }
 
     #[test]
@@ -7701,7 +8861,7 @@ mod tests {
             torchaudio: "2.10.0+rocm7.13.0a20260513".to_owned(),
             compatibility_key: "7.13.0a20260513".to_owned(),
         };
-        let package_specs = therock_pip_package_specs(&package_versions, "gfx942");
+        let package_specs = therock_pip_package_specs(&package_versions, "gfx942", true);
 
         assert_eq!(
             package_specs,
@@ -7725,6 +8885,347 @@ mod tests {
         assert_eq!(plan.torchvision, "0.28.0+rocm10.0.0");
         assert_eq!(plan.torchaudio, "2.11.0.2+rocm10.0.0");
         Ok(())
+    }
+
+    /// The live ROCm 10 index publishes torchaudio rebuilds as a fourth release
+    /// segment beside the original build, for more than one ROCm build at once.
+    #[test]
+    fn torchaudio_pin_is_the_newest_rebuild_of_the_requested_rocm_build() {
+        let published = [
+            "2.11.0+rocm10.0.0",
+            "2.11.0.2+rocm10.0.0",
+            "2.11.0+rocm10.1.0",
+            "2.11.0.2+rocm10.1.0",
+            "2.11.0.3+rocm10.1.0",
+        ]
+        .map(str::to_owned);
+
+        assert_eq!(
+            latest_build_for_rocm(&published, "10.0.0").as_deref(),
+            Some("2.11.0.2+rocm10.0.0")
+        );
+        assert_eq!(
+            latest_build_for_rocm(&published, "10.1.0").as_deref(),
+            Some("2.11.0.3+rocm10.1.0")
+        );
+        assert_eq!(latest_build_for_rocm(&published, "10.2.0"), None);
+    }
+
+    /// Mirrors uv's default: a pre-release is only chosen when no final
+    /// release exists for that build, and a post-release counts as final.
+    #[test]
+    fn torchaudio_pin_prefers_final_releases_like_uv() {
+        let published = [
+            "2.12.0a0+rocm10.0.0",
+            "2.11.0.2+rocm10.0.0",
+            "2.11.0+rocm10.0.0",
+        ]
+        .map(str::to_owned);
+        assert_eq!(
+            latest_build_for_rocm(&published, "10.0.0").as_deref(),
+            Some("2.11.0.2+rocm10.0.0")
+        );
+
+        let only_pre = ["2.12.0a0+rocm10.0.0", "2.12.0a1+rocm10.0.0"].map(str::to_owned);
+        assert_eq!(
+            latest_build_for_rocm(&only_pre, "10.0.0").as_deref(),
+            Some("2.12.0a1+rocm10.0.0")
+        );
+
+        let post = ["2.11.0+rocm10.0.0", "2.11.0.post1+rocm10.0.0"].map(str::to_owned);
+        assert_eq!(
+            latest_build_for_rocm(&post, "10.0.0").as_deref(),
+            Some("2.11.0.post1+rocm10.0.0")
+        );
+    }
+
+    /// Each PEP 440 suffix number compares as a number, and the suffixes rank
+    /// `.devN` < `aN` < `bN` < `rcN` < final < `.postN`, with a `.devN` on any
+    /// of them ranking just below it. Pairs are `(older, newer)`.
+    #[test]
+    fn torchaudio_pin_orders_versions_as_pep_440_does() {
+        for (older, newer) in [
+            ("2.12.0a9", "2.12.0a10"),
+            ("2.12.0rc2", "2.12.0rc10"),
+            ("2.11.0.post9", "2.11.0.post10"),
+            ("2.12.0.dev1", "2.12.0.dev2"),
+            ("2.12.0.dev1", "2.12.0a1"),
+            ("2.12.0a1", "2.12.0b1"),
+            ("2.12.0b1", "2.12.0rc1"),
+            ("2.12.0rc1.dev3", "2.12.0rc1"),
+            ("2.11.0.post1.dev0", "2.11.0.post1"),
+            ("2.11.0", "2.11.0.post1.dev0"),
+            ("2.11", "2.11.0.1"),
+            ("9.0.0", "1!2.0.0"),
+        ] {
+            assert!(
+                package_release_key(&format!("{older}+rocm10.0.0"))
+                    < package_release_key(&format!("{newer}+rocm10.0.0")),
+                "{older} must order below {newer}"
+            );
+        }
+        assert_eq!(
+            package_release_key("2.11+rocm10.0.0"),
+            package_release_key("2.11.0+rocm10.0.0"),
+            "trailing zero release segments are insignificant"
+        );
+    }
+
+    /// The live `whl-next` shape for `+rocm10.1.0`: a CPU-only `2.11.0`, the
+    /// hardware-verified `2.11.0.2`, and a newer `2.11.0.3` sharing the label.
+    fn rocm10_1_torchaudio_builds() -> Vec<String> {
+        [
+            "2.11.0+rocm10.1.0",
+            "2.11.0.2+rocm10.1.0",
+            "2.11.0.3+rocm10.1.0",
+            "2.11.0.2+rocm10.0.0",
+        ]
+        .map(str::to_owned)
+        .to_vec()
+    }
+
+    /// A verified release that is published wins over a newer build with the
+    /// same `+rocm` label, and the printed line says it is the verified one.
+    #[test]
+    fn torchaudio_pin_takes_the_published_verified_release_over_a_newer_build() -> Result<()> {
+        let pin = torchaudio_pin(
+            &rocm10_1_torchaudio_builds(),
+            "10.1.0",
+            Some("2.11.0.2"),
+            "https://index.test",
+        )?;
+        assert_eq!(pin.version, "2.11.0.2+rocm10.1.0");
+        assert_eq!(pin.basis, TorchaudioPinBasis::Verified);
+        assert!(pin.is_verified());
+        let line = pin.describe();
+        assert!(
+            line.contains("torchaudio 2.11.0.2+rocm10.1.0, the build verified on hardware")
+                && !line.contains("not hardware-verified"),
+            "{line}"
+        );
+        // The requirement handed to `uv` names the same build the line does.
+        assert_eq!(
+            published_pip_requirements("10.1.0", &pin.version, "gfx1200", false)[3],
+            "torchaudio==2.11.0.2+rocm10.1.0"
+        );
+        Ok(())
+    }
+
+    /// The verified release is matched as a whole PEP 440 version, never a
+    /// prefix: a verified `2.11.0` must not be satisfied by `2.11.0.2`.
+    #[test]
+    fn torchaudio_pin_matches_the_verified_release_exactly() -> Result<()> {
+        let published = ["2.11.0.2+rocm10.1.0", "2.11.0.3+rocm10.1.0"].map(str::to_owned);
+        let pin = torchaudio_pin(&published, "10.1.0", Some("2.11.0"), "https://index.test")?;
+        assert_eq!(
+            pin.basis,
+            TorchaudioPinBasis::VerifiedNotPublished {
+                release: "2.11.0",
+                other_build: None,
+            }
+        );
+        assert_eq!(pin.version, "2.11.0.3+rocm10.1.0");
+        Ok(())
+    }
+
+    /// A verified release published only for another ROCm build falls back to
+    /// the newest build for the requested one, and the printed reason names the
+    /// ROCm build as the cause, not the Python or platform: the verified release
+    /// is matched by ROCm line, so it can be published here under another label
+    /// of the same line.
+    #[test]
+    fn torchaudio_pin_falls_back_to_newest_when_the_verified_release_is_published_for_another_rocm_build()
+    -> Result<()> {
+        let published = [
+            "2.11.0+rocm10.1.1",
+            "2.11.0.3+rocm10.1.1",
+            "2.11.0.2+rocm10.1.0",
+        ]
+        .map(str::to_owned);
+        let pin = torchaudio_pin(&published, "10.1.1", Some("2.11.0.2"), "https://index.test")?;
+        assert_eq!(pin.version, "2.11.0.3+rocm10.1.1");
+        assert_eq!(
+            pin.basis,
+            TorchaudioPinBasis::VerifiedNotPublished {
+                release: "2.11.0.2",
+                other_build: Some("2.11.0.2+rocm10.1.0".to_owned()),
+            }
+        );
+        assert!(!pin.is_verified());
+        let line = pin.describe();
+        assert!(
+            line.contains(
+                "torchaudio 2.11.0.3+rocm10.1.1, the newest build published for ROCm 10.1.1"
+            ) && line.contains("not hardware-verified")
+                && line.contains(
+                    "the verified release, 2.11.0.2, is published for this Python and platform only for another ROCm build (2.11.0.2+rocm10.1.0), not for ROCm 10.1.1"
+                )
+                && !line.contains("is not published for this Python and platform"),
+            "{line}"
+        );
+        Ok(())
+    }
+
+    /// A verified release with no build at all for this Python and platform
+    /// falls back to the newest build, and the printed line says the release is
+    /// not published here. An unlabelled build is not a ROCm build, so it does
+    /// not count as one "for another ROCm build".
+    #[test]
+    fn torchaudio_pin_falls_back_to_newest_when_the_verified_release_is_unpublished() -> Result<()>
+    {
+        let published = ["2.11.0+rocm10.1.0", "2.11.0.3+rocm10.1.0", "2.11.0.2"].map(str::to_owned);
+        let pin = torchaudio_pin(&published, "10.1.0", Some("2.11.0.2"), "https://index.test")?;
+        assert_eq!(pin.version, "2.11.0.3+rocm10.1.0");
+        assert_eq!(
+            pin.basis,
+            TorchaudioPinBasis::VerifiedNotPublished {
+                release: "2.11.0.2",
+                other_build: None,
+            }
+        );
+        assert!(!pin.is_verified());
+        let line = pin.describe();
+        assert!(
+            line.contains(
+                "torchaudio 2.11.0.3+rocm10.1.0, the newest build published for ROCm 10.1.0"
+            ) && line.contains("not hardware-verified")
+                && line.contains(
+                    "the verified release, 2.11.0.2, is not published for this Python and platform"
+                ),
+            "{line}"
+        );
+        Ok(())
+    }
+
+    /// A real install notes an unverified torchaudio in its install log, for
+    /// both reasons a pin can be unverified, and stays quiet for a verified
+    /// one. The note is the pin's own `describe()` line, so it states the
+    /// decision that was actually taken.
+    #[test]
+    fn unverified_torchaudio_note_is_logged_only_for_an_unverified_pin() -> Result<()> {
+        let builds = rocm10_1_torchaudio_builds();
+        let verified = torchaudio_pin(&builds, "10.1.0", Some("2.11.0.2"), "https://index.test")?;
+        let not_published =
+            torchaudio_pin(&builds, "10.1.0", Some("2.11.0.9"), "https://index.test")?;
+        let no_verified_release = torchaudio_pin(&builds, "10.1.0", None, "https://index.test")?;
+        assert_eq!(verified.basis, TorchaudioPinBasis::Verified);
+        assert!(matches!(
+            not_published.basis,
+            TorchaudioPinBasis::VerifiedNotPublished { .. }
+        ));
+        assert_eq!(
+            no_verified_release.basis,
+            TorchaudioPinBasis::NoVerifiedRelease
+        );
+
+        assert_eq!(unverified_torchaudio_note(&verified), None);
+        for pin in [&not_published, &no_verified_release] {
+            let note = unverified_torchaudio_note(pin);
+            assert_eq!(note, Some(format!("Note: {}", pin.describe())));
+            assert!(
+                note.as_deref()
+                    .is_some_and(|note| note.contains("torchaudio 2.11.0.3+rocm10.1.0")
+                        && note.contains("not hardware-verified")),
+                "{note:?}"
+            );
+        }
+        Ok(())
+    }
+
+    /// With no verified release recorded for the line, the newest build is
+    /// pinned, and the printed line says it is not hardware-verified.
+    #[test]
+    fn torchaudio_pin_falls_back_to_newest_when_no_release_is_verified() -> Result<()> {
+        let pin = torchaudio_pin(
+            &rocm10_1_torchaudio_builds(),
+            "10.1.0",
+            None,
+            "https://index.test",
+        )?;
+        assert_eq!(pin.version, "2.11.0.3+rocm10.1.0");
+        assert_eq!(pin.basis, TorchaudioPinBasis::NoVerifiedRelease);
+        assert!(!pin.is_verified());
+        let line = pin.describe();
+        assert!(
+            line.contains(
+                "torchaudio 2.11.0.3+rocm10.1.0, the newest build published for ROCm 10.1.0"
+            ) && line.contains("not hardware-verified")
+                && line.contains("no torchaudio release is recorded as verified"),
+            "{line}"
+        );
+        Ok(())
+    }
+
+    /// The verified release the SDK reads is the vLLM engine's: 10.1 has one,
+    /// 10.0 has none yet. Pins the wiring, not the table (which the engine's
+    /// own tests own), so a change to it is seen here as a deliberate choice.
+    #[test]
+    fn torchaudio_verified_release_comes_from_the_vllm_discover_table() {
+        assert_eq!(
+            rocm_engine_vllm::verified_torchaudio_release("10.1.0"),
+            Some("2.11.0.2")
+        );
+        assert_eq!(
+            rocm_engine_vllm::verified_torchaudio_release("10.0.0"),
+            None
+        );
+    }
+
+    /// A version the parser cannot read is left out, never guessed at: a newer
+    /// unreadable build must not win the pin.
+    #[test]
+    fn torchaudio_pin_skips_versions_it_cannot_read() -> Result<()> {
+        let published = [
+            "2.11.0+rocm10.0.0",
+            "2.12.0-local-hack+rocm10.0.0",
+            "2.11.0.2+rocm10.0.0",
+        ]
+        .map(str::to_owned);
+        assert_eq!(
+            torchaudio_pin(&published, "10.0.0", None, "https://index.test")?.version,
+            "2.11.0.2+rocm10.0.0"
+        );
+        Ok(())
+    }
+
+    /// The two refusals name different problems, so each says which one it is.
+    #[test]
+    fn torchaudio_pin_refusal_says_whether_the_build_is_missing_or_unreadable() {
+        let other_build = ["2.11.0.3+rocm10.1.0"].map(str::to_owned);
+        let missing = torchaudio_pin(
+            &other_build,
+            "10.0.0",
+            Some("2.11.0.2"),
+            "https://index.test",
+        )
+        .expect_err("no torchaudio for the pinned build must refuse")
+        .to_string();
+        assert!(
+            missing.contains("no torchaudio built for ROCm 10.0.0 is published"),
+            "{missing}"
+        );
+
+        let unreadable = ["2.12.0-local-hack+rocm10.0.0"].map(str::to_owned);
+        let unreadable = torchaudio_pin(&unreadable, "10.0.0", None, "https://index.test")
+            .expect_err("an unreadable-only build must refuse")
+            .to_string();
+        assert!(
+            unreadable.contains("none has a PEP 440 version")
+                && unreadable.contains("2.12.0-local-hack+rocm10.0.0")
+                && !unreadable.contains("no torchaudio built"),
+            "{unreadable}"
+        );
+    }
+
+    /// A post-release that is itself a dev build is still a pre-release to
+    /// `uv`, so a final release wins over it.
+    #[test]
+    fn torchaudio_pin_treats_a_dev_post_release_as_a_pre_release() {
+        let published = ["2.11.0+rocm10.0.0", "2.11.0.post1.dev0+rocm10.0.0"].map(str::to_owned);
+        assert_eq!(
+            latest_build_for_rocm(&published, "10.0.0").as_deref(),
+            Some("2.11.0+rocm10.0.0")
+        );
     }
 
     #[test]
@@ -7940,6 +9441,373 @@ mod tests {
         Ok(())
     }
 
+    /// The default install skips the compiler toolchain, which is roughly half
+    /// the download and is only needed to build GPU code. The torch stack is
+    /// unaffected.
+    #[test]
+    fn pip_runtime_omits_devel_extra_by_default() {
+        let package_versions = TheRockPipPackageVersions {
+            rocm: "7.13.0a20260513".to_owned(),
+            torch: "2.10.0+rocm7.13.0a20260513".to_owned(),
+            torchvision: "0.25.0+rocm7.13.0a20260513".to_owned(),
+            torchaudio: "2.10.0+rocm7.13.0a20260513".to_owned(),
+            compatibility_key: "7.13.0a20260513".to_owned(),
+        };
+
+        let package_specs = therock_pip_package_specs(&package_versions, "gfx942", false);
+
+        assert_eq!(
+            package_specs,
+            vec![
+                "rocm[libraries,device-gfx942]==7.13.0a20260513".to_owned(),
+                "torch[device-gfx942]==2.10.0+rocm7.13.0a20260513".to_owned(),
+                "torchvision[device-gfx942]==0.25.0+rocm7.13.0a20260513".to_owned(),
+                "torchaudio==2.10.0+rocm7.13.0a20260513".to_owned(),
+            ]
+        );
+        assert!(
+            !package_specs[0].contains("devel"),
+            "default install must not request the toolchain: {package_specs:?}"
+        );
+    }
+
+    fn devel_test_resolution() -> PipRuntimeResolution {
+        PipRuntimeResolution {
+            family: "gfx94X-dcgpu".to_owned(),
+            family_source: "detected".to_owned(),
+            index_url: "https://example.invalid/simple".to_owned(),
+            layout: SourceLayout::Canonical,
+            latest_version: "7.13.0".to_owned(),
+            newest_repo_version: None,
+            version_resolution_specs: None,
+            torchaudio_pin: None,
+            package_versions: TheRockPipPackageVersions {
+                rocm: "7.13.0".to_owned(),
+                torch: "2.11.0+rocm7.13.0".to_owned(),
+                torchvision: "0.26.0+rocm7.13.0".to_owned(),
+                torchaudio: "2.11.0+rocm7.13.0".to_owned(),
+                compatibility_key: "7.13.0".to_owned(),
+            },
+            device_target: AggregateDeviceTarget::Exact("gfx942".to_owned()),
+            published_device_targets: vec!["gfx942".to_owned()],
+        }
+    }
+
+    /// The seam the `--devel` flag actually travels through.
+    ///
+    /// `wheel_runtime_composition` produces the specs handed to `uv` AND the
+    /// specs recorded in the manifest, so hardcoding either polarity here is
+    /// the single change that would silently restore the old behaviour. Both
+    /// directions are pinned, and the device extra is asserted alongside so a
+    /// fix to one axis cannot quietly drop the other.
+    #[test]
+    fn wheel_composition_requests_the_toolchain_only_when_asked() {
+        let resolution = devel_test_resolution();
+        let target = AggregateDeviceTarget::Exact("gfx942".to_owned());
+
+        let runtime_only = wheel_runtime_composition(&resolution, &target, false);
+        assert_eq!(
+            runtime_only.package_specs[0], "rocm[libraries,device-gfx942]==7.13.0",
+            "a default install must not request the toolchain: {:?}",
+            runtime_only.package_specs
+        );
+
+        let with_devel = wheel_runtime_composition(&resolution, &target, true);
+        assert_eq!(
+            with_devel.package_specs[0], "rocm[libraries,devel,device-gfx942]==7.13.0",
+            "--devel must reach the specs: {:?}",
+            with_devel.package_specs
+        );
+
+        // The two axes are independent: opting into the toolchain must not
+        // disturb the device payload, and vice versa.
+        assert_eq!(
+            runtime_only.package_specs[1..],
+            with_devel.package_specs[1..],
+            "devel must only affect the rocm spec"
+        );
+        assert_eq!(runtime_only.rocm_sdk_target, with_devel.rocm_sdk_target);
+    }
+
+    /// The other half of the same claim, on the *resolution* path.
+    ///
+    /// `uv pip compile` decides which versions exist before anything is
+    /// composed, so asking it for `devel` on a default install constrains the
+    /// version choice by a toolchain the user declined — and fails the install
+    /// outright when no version can satisfy it. That is a separate code path
+    /// from `wheel_runtime_composition` above, and the two must name the same
+    /// extras.
+    #[test]
+    fn version_resolution_requests_the_toolchain_only_when_asked() {
+        let runtime_only =
+            published_pip_requirements("10.0.0", "2.11.0.2+rocm10.0.0", "gfx1200", false);
+        assert_eq!(
+            runtime_only[0], "rocm[libraries,device-gfx1200]==10.0.0",
+            "a default install must not resolve against the toolchain: {runtime_only:?}"
+        );
+
+        let with_devel =
+            published_pip_requirements("10.0.0", "2.11.0.2+rocm10.0.0", "gfx1200", true);
+        assert_eq!(
+            with_devel[0], "rocm[libraries,devel,device-gfx1200]==10.0.0",
+            "--devel must reach the resolved requirements: {with_devel:?}"
+        );
+
+        // Only the `rocm` requirement carries the toolchain axis. torch and
+        // torchvision are unversioned because choosing those versions is what
+        // the resolve is for; torchaudio is pinned because its metadata does not
+        // follow the `rocm` pin (see `published_pip_requirements`).
+        assert_eq!(
+            runtime_only[1..],
+            with_devel[1..],
+            "devel must only affect the rocm requirement"
+        );
+        assert_eq!(
+            runtime_only[1..],
+            [
+                "torch[device-gfx1200]".to_owned(),
+                "torchvision[device-gfx1200]".to_owned(),
+                "torchaudio==2.11.0.2+rocm10.0.0".to_owned(),
+            ]
+        );
+    }
+
+    /// Resolution and composition are two code paths reading one flag, and the
+    /// bug this pins is them disagreeing: the requirements handed to `uv` were
+    /// hardcoded to `devel` while the plan printed and installed `libraries`.
+    /// Asserting each in isolation cannot catch that; asserting they agree can.
+    #[test]
+    fn resolution_and_install_name_the_same_rocm_extras() {
+        let resolution = devel_test_resolution();
+        let target = AggregateDeviceTarget::Exact("gfx942".to_owned());
+
+        for include_devel in [false, true] {
+            let requirements = published_pip_requirements(
+                &resolution.package_versions.rocm,
+                &resolution.package_versions.torchaudio,
+                "gfx942",
+                include_devel,
+            );
+            let composition = wheel_runtime_composition(&resolution, &target, include_devel);
+            assert_eq!(
+                rocm_requirement_extras(&requirements[0]),
+                rocm_requirement_extras(&composition.package_specs[0]),
+                "resolution and install must request the same rocm extras for \
+                 include_devel={include_devel}: {requirements:?} vs {:?}",
+                composition.package_specs
+            );
+            // torchaudio is the one stack package resolution pins rather than
+            // leaving to `uv`, so it has to be the very build install names.
+            assert_eq!(
+                requirements[3], composition.package_specs[3],
+                "resolution and install must name the same torchaudio for \
+                 include_devel={include_devel}"
+            );
+        }
+    }
+
+    /// The `...` of a `rocm[...]==version` requirement.
+    fn rocm_requirement_extras(requirement: &str) -> &str {
+        requirement
+            .strip_prefix("rocm[")
+            .and_then(|rest| rest.split_once(']'))
+            .map_or_else(
+                || panic!("not a rocm extras requirement: {requirement}"),
+                |(extras, _)| extras,
+            )
+    }
+
+    /// The manifest answer is derived from the specs that were installed, so a
+    /// recorded composition and the `devel` field can never disagree.
+    #[test]
+    fn manifest_reads_devel_back_out_of_the_recorded_composition() {
+        let resolution = devel_test_resolution();
+        let target = AggregateDeviceTarget::Exact("gfx942".to_owned());
+
+        for include_devel in [false, true] {
+            let composition = wheel_runtime_composition(&resolution, &target, include_devel);
+            assert_eq!(
+                wheel_composition_includes_devel(Some(&composition)),
+                Some(include_devel),
+                "composition round-trip failed for include_devel={include_devel}"
+            );
+
+            // Even when the `devel` field contradicts the specs, the specs win:
+            // they are what `uv` was given.
+            let manifest = InstalledRuntimeManifest {
+                wheel_composition: Some(composition),
+                devel: !include_devel,
+                ..test_runtime_manifest(
+                    "release-wheel-gfx94X-dcgpu-7.13.0",
+                    "therock-release:gfx94X-dcgpu",
+                    1,
+                )
+            };
+            assert_eq!(
+                manifest.includes_devel(),
+                include_devel,
+                "the recorded specs must outrank a stale devel field"
+            );
+        }
+    }
+
+    /// A manifest from before compositions were recorded has only the field,
+    /// and one older still has neither — those installs all had the toolchain.
+    #[test]
+    fn manifest_without_a_composition_falls_back_to_the_devel_field() {
+        let without_composition = InstalledRuntimeManifest {
+            wheel_composition: None,
+            devel: false,
+            ..test_runtime_manifest(
+                "release-wheel-gfx94X-dcgpu-7.13.0",
+                "therock-release:gfx94X-dcgpu",
+                1,
+            )
+        };
+        assert!(!without_composition.includes_devel());
+
+        let legacy = InstalledRuntimeManifest {
+            wheel_composition: None,
+            devel: devel_default_for_legacy_manifest(),
+            ..test_runtime_manifest(
+                "release-wheel-gfx94X-dcgpu-7.13.0",
+                "therock-release:gfx94X-dcgpu",
+                1,
+            )
+        };
+        assert!(
+            legacy.includes_devel(),
+            "a manifest predating the flag must be treated as a toolchain install"
+        );
+    }
+
+    /// Writing a manifest over an existing one for the same `runtime_key`
+    /// REPLACES it — `devel` included — rather than merging with what was on
+    /// disk. That is the storage half of the reinstall-drift case: a user who
+    /// installed with `--devel` and later reinstalls without it keeps
+    /// `hipcc`/headers on disk while the manifest records `devel: false`, and
+    /// `apply_runtime_update` reinstalls from that field on the next `rocm
+    /// update`. Left as-is rather than fixed — the flag reflects what the most
+    /// recent install asked for, which is arguably correct; the drift risk is
+    /// that neither `rocm runtimes list` nor `rocm examine` surfaces `devel`,
+    /// so the state is invisible.
+    ///
+    /// LIMIT: this covers `save_runtime_manifest` only. It does NOT reach
+    /// `install_sdk`, which is what actually threads `include_devel` into the
+    /// manifest — that call needs `uv`, a live index, and a real `rocm_sdk`
+    /// probe, so it has no unit coverage here. Hardcoding `devel: true` at that
+    /// write site passes this test and the rest of the suite.
+    #[test]
+    fn save_runtime_manifest_replaces_devel_rather_than_merging() -> Result<()> {
+        let (root, paths) = test_paths("manifest-replaces-devel");
+        let install_root = root.join("install-root");
+        fs::create_dir_all(&install_root)?;
+        let with_devel = InstalledRuntimeManifest {
+            install_root,
+            ..test_runtime_manifest(
+                "release-wheel-gfx110X-all-7.13.0",
+                "therock-release:gfx110X-all",
+                1,
+            )
+        };
+        assert!(
+            with_devel.devel,
+            "test fixture should start with devel: true"
+        );
+        save_runtime_manifest(&paths, &with_devel)?;
+
+        let without_devel = InstalledRuntimeManifest {
+            devel: false,
+            installed_at_unix_ms: 2,
+            ..with_devel.clone()
+        };
+        save_runtime_manifest(&paths, &without_devel)?;
+
+        let manifests = load_runtime_manifests(&paths)?;
+        let reloaded = manifests
+            .iter()
+            .find(|manifest| manifest.runtime_key == with_devel.runtime_key)
+            .expect("manifest should still be registered under the same runtime_key");
+        assert!(
+            !reloaded.devel,
+            "saving a manifest must replace devel, not merge with the prior one"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    /// The registry load itself breaks install-time ties on the runtime key,
+    /// not only the sort helper it calls: the startup update check and
+    /// `runtimes_cmd::newest_installed_runtime_manifest` both take the first
+    /// entry `load_runtime_manifests` returns, and neither re-sorts.
+    ///
+    /// Both pairings of file name and runtime key are written, so whichever
+    /// file `read_dir` returns first holds `bbb` in one of them: a load that
+    /// kept the read order for a tie picks the wrong runtime there.
+    #[test]
+    fn registry_load_breaks_install_time_ties_on_the_runtime_key() -> Result<()> {
+        for (first_file_key, second_file_key) in [("aaa", "bbb"), ("bbb", "aaa")] {
+            let (root, paths) = test_paths("registry-load-tie");
+            let registry = runtime_registry_dir(&paths);
+            fs::create_dir_all(&registry)?;
+            for (file, key) in [("first", first_file_key), ("second", second_file_key)] {
+                fs::write(
+                    registry.join(format!("{file}.json")),
+                    serde_json::to_vec_pretty(&test_runtime_manifest(
+                        key,
+                        "therock-release:gfx120X-all",
+                        2_000,
+                    ))?,
+                )?;
+            }
+            let pairing = format!("files first={first_file_key}, second={second_file_key}");
+
+            let keys = load_runtime_manifests(&paths)?
+                .into_iter()
+                .map(|manifest| manifest.runtime_key)
+                .collect::<Vec<_>>();
+            assert_eq!(keys, ["aaa", "bbb"], "{pairing}");
+            assert_eq!(
+                crate::runtimes_cmd::newest_installed_runtime_manifest(&paths)?
+                    .map(|manifest| manifest.runtime_key)
+                    .as_deref(),
+                Some("aaa"),
+                "{pairing}"
+            );
+
+            let _ = fs::remove_dir_all(&root);
+        }
+        Ok(())
+    }
+
+    /// A manifest written before `devel` became opt-in has no such field, and
+    /// those installs all had the toolchain. Reading one back must not claim
+    /// otherwise, or the next update would silently strip it.
+    #[test]
+    fn legacy_manifest_without_devel_field_is_treated_as_having_it() {
+        let json = r#"{
+            "runtime_key": "release-wheel-gfx110X-all-7.13.0",
+            "runtime_id": "therock-release:gfx110X-all",
+            "channel": "release",
+            "format": "wheel",
+            "family": "gfx110X-all",
+            "family_source": "detected",
+            "version": "7.13.0",
+            "install_root": "/tmp/rocm-runtime",
+            "selected_artifact_url": "https://example.invalid/simple",
+            "installed_at_unix_ms": 1
+        }"#;
+
+        let manifest: InstalledRuntimeManifest =
+            serde_json::from_str(json).expect("legacy manifest should still parse");
+
+        assert!(
+            manifest.devel,
+            "a manifest predating the flag must be treated as a toolchain install"
+        );
+    }
+
     #[test]
     fn pip_runtime_selects_latest_common_rocm_suffix_not_latest_rocm_package() {
         let rocm_versions = vec![
@@ -8099,9 +9967,8 @@ mod tests {
     #[cfg(unix)]
     fn linked_runtimes_paths(name: &str) -> (PathBuf, AppPaths, PathBuf) {
         let root = std::env::temp_dir().join(format!(
-            "rocm-cli-linked-runtimes-{name}-{}-{}",
-            std::process::id(),
-            unix_time_millis()
+            "rocm-cli-linked-runtimes-{name}-{}",
+            crate::test_support::unique_suffix()
         ));
         fs::create_dir_all(root.join("data")).unwrap();
         let root = root.canonicalize().unwrap();
@@ -8114,6 +9981,14 @@ mod tests {
             cache_dir: root.join("cache"),
         };
         (root, paths, real)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_runtimes_paths_gives_each_call_its_own_root_even_for_one_label() {
+        crate::test_support::assert_each_call_gets_its_own_root(|| {
+            linked_runtimes_paths("same-label").0
+        });
     }
 
     #[test]
@@ -8228,6 +10103,73 @@ mod tests {
         assert_eq!(DEFAULT_MANAGED_PYTHON_VERSION, "3.12");
     }
 
+    /// ROCm 10.x framework wheels (vLLM, flash-attn, amd-aiter) are published
+    /// cp314-only, so the next layout must provision 3.14 while everything else
+    /// stays on 3.12.
+    #[test]
+    fn python_requirement_follows_the_source_layout() {
+        let canonical = python_requirement(SourceLayout::Canonical);
+        assert_eq!(canonical.tag, "cp312");
+        assert_eq!(canonical.version, "3.12");
+
+        let next = python_requirement(SourceLayout::Next);
+        assert_eq!(next.tag, "cp314");
+        assert_eq!(next.version, "3.14");
+    }
+
+    /// The requirement is read before `resolve_pip_runtime` runs, so it has to
+    /// be derivable from the request alone. Only an explicit stable ROCm >= 10
+    /// pin reaches the next layout; a build-date pin, an older pin, or no
+    /// selector at all must stay canonical so nothing that installs today
+    /// starts demanding a different interpreter.
+    #[test]
+    fn requested_source_layout_reads_the_request_not_the_resolution() {
+        let next_pin = RuntimeVersionSelector::Version("10.1.0".to_owned());
+        assert_eq!(
+            requested_source_layout(None, Some(&next_pin)),
+            SourceLayout::Next
+        );
+
+        let old_pin = RuntimeVersionSelector::Version("7.2.3".to_owned());
+        assert_eq!(
+            requested_source_layout(None, Some(&old_pin)),
+            SourceLayout::Canonical
+        );
+        assert_eq!(requested_source_layout(None, None), SourceLayout::Canonical);
+
+        // An update supplies its manifest's layout, which wins over the (absent)
+        // selector so the runtime keeps the interpreter its stream needs.
+        assert_eq!(
+            requested_source_layout(Some(SourceLayout::Next), None),
+            SourceLayout::Next
+        );
+    }
+
+    /// A tag mismatch and a broken venv are different failures with different
+    /// fixes, so the gate must not report one as the other.
+    #[cfg(unix)]
+    #[test]
+    fn python_gate_rejects_the_wrong_tag_without_blaming_the_venv() -> Result<()> {
+        let (root, _paths) = test_paths("python-gate-tag-mismatch");
+        let bin_dir = root.join("bin");
+        fs::create_dir_all(&bin_dir)?;
+        // A real, working cp312 interpreter: the venv probe would succeed.
+        let python = write_fake_python_with_venv(&bin_dir, "python")?;
+
+        python_launcher_install_ready(&python, python_requirement(SourceLayout::Canonical))
+            .expect("a cp312 python satisfies a canonical install");
+
+        let err = python_launcher_install_ready(&python, python_requirement(SourceLayout::Next))
+            .expect_err("a cp312 python cannot serve a next-layout install");
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("cp314"), "{rendered}");
+        assert!(
+            !rendered.contains("virtual environment"),
+            "a tag mismatch must not be reported as a venv failure: {rendered}"
+        );
+        Ok(())
+    }
+
     #[test]
     fn managed_python_manifest_round_trips() -> Result<()> {
         let (root, paths) = test_paths("managed-python-manifest");
@@ -8282,6 +10224,7 @@ mod tests {
                 python_override: None,
                 search_dirs: vec![bin_dir],
             },
+            python_requirement(SourceLayout::Canonical),
         )?;
         assert_eq!(launcher.source, "path");
         assert!(
@@ -8383,6 +10326,7 @@ mod tests {
                 python_override: None,
                 search_dirs: vec![bin_dir],
             },
+            python_requirement(SourceLayout::Canonical),
         )?;
 
         assert_eq!(launcher.source, "path");
@@ -8425,7 +10369,7 @@ mod tests {
 
     #[cfg(unix)]
     fn write_fake_python_with_venv(dir: &Path, name: &str) -> Result<PathBuf> {
-        use std::os::unix::fs::PermissionsExt;
+        use rocm_core::fake_executable::write_fake_executable;
         let path = dir.join(name);
         let script = r#"#!/bin/sh
 if [ "$1" = "-c" ]; then
@@ -8443,9 +10387,96 @@ PY
 fi
 echo Python 3.12.10
 "#;
-        fs::write(&path, script)?;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
+        write_fake_executable(&path, script)?;
         Ok(path)
+    }
+
+    #[cfg(unix)]
+    fn write_fake_python_reporting(
+        dir: &Path,
+        name: &str,
+        tag: &str,
+        version: &str,
+    ) -> Result<PathBuf> {
+        use rocm_core::fake_executable::write_fake_executable;
+        let path = dir.join(name);
+        let script = format!(
+            "#!/bin/sh\nif [ \"$1\" = \"-c\" ]; then\n  echo {tag}\n  exit 0\nfi\necho {version}\n"
+        );
+        write_fake_executable(&path, script)?;
+        Ok(path)
+    }
+
+    #[cfg(unix)]
+    fn write_fake_uv_creating_venv(
+        dir: &Path,
+        name: &str,
+        tag: &str,
+        version: &str,
+    ) -> Result<PathBuf> {
+        use rocm_core::fake_executable::write_fake_executable;
+        let path = dir.join(name);
+        let script = format!(
+            r#"#!/bin/sh
+if [ "$1" = "venv" ] && [ "$2" = "--python" ]; then
+  /bin/mkdir -p "$4/bin"
+  /bin/cat > "$4/bin/python" <<PY
+#!/bin/sh
+if [ "\$1" = "-c" ]; then
+  echo {tag}
+  exit 0
+fi
+echo {version}
+PY
+  /bin/chmod +x "$4/bin/python"
+  exit 0
+fi
+exit 1
+"#
+        );
+        write_fake_executable(&path, script)?;
+        Ok(path)
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn ensure_uv_venv_recreates_on_interpreter_tag_mismatch() {
+        // `install_root` is keyed on resolved version/build date, not on the
+        // interpreter, so a reinstall that now requires cp314 must not reuse a
+        // stale cp312 venv left over from before this tag check existed.
+        let root = std::env::temp_dir().join(format!(
+            "rocm-cli-ensure-uv-venv-{}-{}",
+            std::process::id(),
+            unix_time_millis()
+        ));
+        fs::create_dir_all(root.join("data")).unwrap();
+        fs::create_dir_all(root.join("cache")).unwrap();
+        let root = root.canonicalize().unwrap();
+        let paths = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+
+        let install_root = root.join("install");
+        let stale_bin = install_root.join("bin");
+        fs::create_dir_all(&stale_bin).unwrap();
+        write_fake_python_reporting(&stale_bin, "python", "cp312", "Python 3.12.10").unwrap();
+
+        let python_launcher =
+            write_fake_python_reporting(&root, "python3.14", "cp314", "Python 3.14.5").unwrap();
+        let uv = write_fake_uv_creating_venv(&root, "uv", "cp314", "Python 3.14.5").unwrap();
+
+        ensure_uv_venv(&paths, &uv, &python_launcher, &install_root).unwrap();
+
+        let env_python = venv_python_path(&install_root);
+        let compat = wheel_compatibility_for_python(&env_python).unwrap();
+        assert_eq!(
+            compat.python_tag, "cp314",
+            "stale cp312 venv must be recreated, not silently reused"
+        );
+
+        fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -9309,8 +11340,10 @@ echo Python 3.12.10
     #[cfg(windows)]
     #[test]
     fn install_sdk_rejects_tarball_on_windows_before_resolution() {
-        let root = workspace_test_artifact_dir()
-            .join(format!("rocm-cli-therock-test-{}", unix_time_millis()));
+        let root = workspace_test_artifact_dir().join(format!(
+            "rocm-cli-therock-test-{}",
+            crate::test_support::unique_suffix()
+        ));
         let paths = AppPaths {
             config_dir: root.join("config"),
             data_dir: root.join("data"),
@@ -9319,13 +11352,13 @@ echo Python 3.12.10
 
         let error = install_sdk(
             &paths,
-            "release",
-            "tarball",
-            None,
-            None,
-            None,
-            true,
-            SdkInstallConsent::Preapproved(SdkInstallApprovalSource::AssumeYes),
+            SdkInstallRequest {
+                channel: "release",
+                format: "tarball",
+                dry_run: true,
+                consent: SdkInstallConsent::Preapproved(SdkInstallApprovalSource::AssumeYes),
+                ..SdkInstallRequest::default()
+            },
         )
         .unwrap_err()
         .to_string();
@@ -10108,9 +12141,8 @@ echo Python 3.12.10
 
     fn test_paths(name: &str) -> (PathBuf, AppPaths) {
         let root = workspace_test_artifact_dir().join(format!(
-            "rocm-cli-therock-test-{name}-{}-{}",
-            std::process::id(),
-            unix_time_millis()
+            "rocm-cli-therock-test-{name}-{}",
+            crate::test_support::unique_suffix()
         ));
         (
             root.clone(),
@@ -10120,6 +12152,11 @@ echo Python 3.12.10
                 cache_dir: root.join("cache"),
             },
         )
+    }
+
+    #[test]
+    fn test_paths_gives_each_call_its_own_root_even_for_one_label() {
+        crate::test_support::assert_each_call_gets_its_own_root(|| test_paths("same-label").0);
     }
 
     fn workspace_test_artifact_dir() -> PathBuf {
@@ -10174,6 +12211,7 @@ echo Python 3.12.10
             wheel_composition: None,
             read_only: false,
             imported_from: None,
+            devel: true,
             installed_at_unix_ms,
         }
     }
@@ -10331,5 +12369,58 @@ echo Python 3.12.10
             !kernel_section.contains(r#"out["device_count"] ="#),
             "a kernel failure must preserve the enumerated device count"
         );
+    }
+}
+
+/// Property tests for the SDK tarball unpack, judged on the filesystem by
+/// `crate::archive_props`. Extraction is the system `tar` resolved from
+/// `PATH` (GNU tar on the Linux CI runners), so these pin what that `tar`
+/// guarantees through `extract_tarball_and_discard_archive`.
+#[cfg(all(test, unix))]
+mod archive_properties {
+    use super::extract_tarball_and_discard_archive;
+    use crate::archive_props::{
+        Expect, Modes, entries, note_mode_scope, run_case, run_property, run_round_trip,
+        tar_gz_bytes,
+    };
+
+    /// No escape, and no setuid/setgid or world-writable entry. The modes are
+    /// what the system `tar` gives an unprivileged user, so they are not
+    /// judged when this runs as root (see `Modes`).
+    #[test]
+    fn sdk_tarball_unpack_never_writes_outside_the_install_root() {
+        let expect = Expect {
+            modes: Modes::SafeUnlessRoot,
+            no_outward_links: false,
+        };
+        note_mode_scope("therock", expect.modes);
+        run_property("therock", 256, entries(), Some(5), |layout, entries| {
+            run_case(
+                layout,
+                "sdk.tar.gz",
+                &tar_gz_bytes(entries),
+                &[&layout.dest],
+                &layout.dest,
+                |layout, archive| {
+                    extract_tarball_and_discard_archive(archive, &layout.dest).map(|_| ())
+                },
+            )
+            .judge(expect)
+        })
+        .unwrap();
+    }
+
+    /// The other direction: a well-formed tarball is extracted in full, into
+    /// the install root it was given. An unpack that wrote somewhere else
+    /// entirely escapes the oracle above; this catches it.
+    #[test]
+    fn sdk_tarball_unpack_extracts_a_benign_tarball_into_the_install_root() {
+        run_round_trip("therock-benign", |layout, entries| {
+            let archive = layout.base.join("sdk.tar.gz");
+            std::fs::write(&archive, tar_gz_bytes(entries))?;
+            extract_tarball_and_discard_archive(&archive, &layout.dest)?;
+            Ok(layout.dest.join("top"))
+        })
+        .unwrap();
     }
 }

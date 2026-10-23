@@ -23,12 +23,18 @@ Feature: Engine shell
     When the user leaves the engine shell
     Then the engine shell exits successfully
 
-  # The engine environment here is planted in the shape the vLLM install actually
-  # records — its manifest names the directory holding the engine command, not the
-  # environment root (engines/vllm/src/lib.rs derives it as `command.parent()`).
-  # That distinction is the whole scenario: the shell composes its activation hint
-  # by appending the interpreter directory to whatever the manifest recorded, so a
-  # manifest that already points inside it yields a path nobody can source.
+  # The env_path is planted bin-shaped, the way the vLLM install RESPONSE reports it
+  # (`command.parent()` in engines/vllm/src/install.rs; users reach it through the
+  # auto-install branch of resolve_engine_env). No install writes such a manifest
+  # to disk — planting one is only the cheapest way to hand the shell that value
+  # without a multi-GiB install. The shell composes its activation hint by
+  # appending the interpreter directory to whatever env_path it is given, so a
+  # value that already points inside it yields a path nobody can source.
+  #
+  # Consequence for whoever fixes this: a fix in engines/vllm (report the env root)
+  # closes EAI-8049 but leaves this fixture unchanged, so the scenario must then be
+  # rewritten or deleted along with its expectation row. Only a fix to the hint
+  # composition itself makes this row go stale.
   #
   # Phrased as "the file it names is there", not as "the path is not doubled": the
   # first survives whichever way the mismatch is repaired, the second would go

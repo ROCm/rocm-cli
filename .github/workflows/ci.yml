@@ -94,6 +94,7 @@ jobs:
       lint: ${{ steps.filter.outputs.lint || steps.all.outputs.forced }}
       tpn: ${{ steps.filter.outputs.tpn || steps.all.outputs.forced }}
       docs: ${{ steps.filter.outputs.docs || steps.all.outputs.forced }}
+      skills: ${{ steps.filter.outputs.skills || steps.all.outputs.forced }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -109,11 +110,42 @@ jobs:
               - '**/Cargo.toml'
               - 'Cargo.lock'
               - 'rust-toolchain*'
-              # clippy runs `cargo xtask manifest --check` against this file.
+              # clippy runs `cargo xtask manifest --check` against this file;
+              # pinned_tool_versions_match_across_docs_and_workflows (xtask)
+              # also reads its cargo-about pin.
               - 'MANIFEST.md'
+              # The committed per-crate coverage floors. Listed so that lowering
+              # a floor re-runs the gate that floor controls, instead of being
+              # the one edit the coverage job never sees.
+              - 'coverage-floors.toml'
               # rocm-deps compiles the pins into constants, so a pin change is a
               # source change even though no *.rs file moved.
               - 'runtime-deps.toml'
+              # pinned_tool_versions_match_across_docs_and_workflows (xtask) reads
+              # this file's hawkeye/cargo-about pins. This entry only gates
+              # whether the rust-flagged jobs run at all; `cargo xtask affected`
+              # treats Markdown as ignorable by default and would otherwise skip
+              # the `Test (nextest)` step for a pin-only edit here (the coverage
+              # job isn't affected-narrowed, so it alone would still catch a
+              # drift, but invisibly). CONTRIBUTING.md is listed in
+              # `forces_full_workspace` (xtask/src/affected.rs) for the same
+              # reason MANIFEST.md already is, so nextest runs too.
+              - 'CONTRIBUTING.md'
+              # hardware_testing_docs_cover_all_self_hosted_platforms (xtask)
+              # reads this file and the one below it; same
+              # `Selection::Empty`/invisible-coverage gap as CONTRIBUTING.md
+              # above, so both are in `forces_full_workspace` too and need the
+              # same rust-filter entry. tests/e2e-cucumber/README.md also
+              # matches `heavy` below, so the Windows lane's full workspace
+              # run backstops this entry on its own; it's listed here anyway
+              # so the Linux `test` job (which is `rust`-gated, not
+              # `heavy`-gated) doesn't silently skip the test that reads it.
+              - 'docs/ci-hardware-testing.md'
+              - 'tests/e2e-cucumber/README.md'
+              # license_headers_hook_has_no_file_type_filter (xtask) reads this
+              # file's license-headers hook config; an edit here that reopens the
+              # file-type-filter gap must still run that test on the PR.
+              - '.pre-commit-config.yaml'
               - '.github/workflows/**'
             # build-and-test runs cargo AND the python/shell smoke steps plus the
             # install-lifecycle E2E (`cargo xtask package` + the real installer),
@@ -133,6 +165,14 @@ jobs:
               - '**/*.ps1'
               - '**/*.feature'
               - 'tests/e2e-cucumber/**'
+              # The containerised control-channel lane; its Dockerfile matches
+              # none of the extension globs above.
+              - 'tests/remote-ssh/**'
+              # skills/rocm-doctor/reference.md is an e2e FIXTURE: the
+              # rocm_doctor_skill.feature scenarios parse its catalog table and
+              # compare it to `rocm fix`. A skill-only edit must therefore run
+              # the E2E job, which gates on `heavy`.
+              - 'skills/**'
               - 'install*'
               # Pinned-key consistency compares docs/keys/* against the installers,
               # so a canonical-key-only change must trigger the heavy job that runs
@@ -160,14 +200,24 @@ jobs:
               - 'ruff.toml'
               - 'PSScriptAnalyzerSettings.psd1'
               - '.github/workflows/**'
-            # Sphinx docs site: the doc sources themselves, plus README.md and
-            # CONTRIBUTING.md, which several pages single-source via MyST
-            # `{include}` directives, plus the build config/toolchain pins.
+            # Sphinx docs site: the doc sources themselves, plus README.md,
+            # CONTRIBUTING.md, docs/vllm.md and docs/wsl.md, which pages
+            # single-source via MyST `{include}` directives, plus the build
+            # config/toolchain pins.
             docs:
               - 'docs/rocm-docs/**'
               - 'README.md'
               - 'CONTRIBUTING.md'
+              - 'docs/vllm.md'
+              - 'docs/wsl.md'
               - '.readthedocs.yaml'
+              - '.github/workflows/**'
+
+            # Published Agent Skills, graded by skillscope. The dataset and the
+            # skill's prose are one unit — a prompt can stop matching because the
+            # description changed — so any edit under skills/ re-runs the check.
+            skills:
+              - 'skills/**'
               - '.github/workflows/**'
 
       - name: Force full run off pull requests
@@ -374,6 +424,22 @@ jobs:
         if: needs.changes.outputs.heavy == 'true'
         run: bash scripts/setup-wsl-portable-build-deps.sh --self-test
 
+      # Runs here, on the GitHub-hosted lane, rather than on the GPU runners the
+      # reclaim protects: the matching rules are what regress, and they are
+      # provable against decoy processes with no GPU present.
+      - name: GPU reclaim self-test
+        if: needs.changes.outputs.heavy == 'true'
+        # Twice, because one of the rules is conditional on the environment.
+        # The scenario root follows TMPDIR, and the self-test can only assert
+        # the redirected form when the shell running it actually has one — a
+        # hosted runner does not, so a single plain run reports that arm as
+        # "not exercised" and the nightly Strix lane's redirect would be the
+        # first place a break showed up. The second run supplies the redirect.
+        run: |
+          bash scripts/reclaim-gpu.sh --self-test
+          mkdir -p "${RUNNER_TEMP}/redirected-tmp"
+          TMPDIR="${RUNNER_TEMP}/redirected-tmp" bash scripts/reclaim-gpu.sh --self-test
+
       - name: Release readiness self-test
         if: needs.changes.outputs.heavy == 'true'
         run: python scripts/release_readiness.py --self-test
@@ -471,6 +537,39 @@ jobs:
         # several `-p <crate>` flags that must word-split into separate argv
         # entries. The values are crate names from our own tool, not user input.
         run: cargo nextest run ${{ steps.sel.outputs.sel }}
+
+      - name: Test rocm-core with e2e-test-hooks
+        # The simulated-host-root tests (`hardware_root.rs`, and the planted-root
+        # probe tests in `examine.rs`) only exist with this feature, which no
+        # other unit-test, nextest or clippy invocation enables. Without this
+        # step they are not even compiled in CI, so a probe reverted to a raw
+        # path would pass everything automated. Runs only when rocm-core is in
+        # the affected selection (or the whole workspace is), since nothing
+        # outside the crate can change these results.
+        #
+        # This is a sample, not full coverage of the routed reads. The probe
+        # tests assert only the KFD topology (GPU node count and gfx target),
+        # `/dev/kfd` via `stat_device`, `/proc/version` and `/dev/dxg` via
+        # `is_wsl_host`, `/run/.containerenv` and `/proc/1/cgroup` via
+        # `probe_container`, and both `/etc/os-release` reads (the distro
+        # fields and the distro name, in
+        # `os_release_reads_follow_the_simulated_host_root` and, for the
+        # `/usr/lib/os-release` fallback, in
+        # `os_release_reads_fall_back_to_usr_lib_when_etc_is_absent`). The other routed
+        # reads (`/dev/dri`, `/sys/class/drm`, `/sys/module/amdgpu`, the other
+        # `/proc` files, the modprobe directories, the `/usr/lib/wsl/lib` and
+        # ROCDXG checks) have no planted-root unit assertion; they are covered
+        # end to end only by the follow-up's simulated-machine scenarios.
+        #
+        # nextest, like the step above, so each test is its own process: the
+        # planted-root test sets the root for the whole process while it runs,
+        # and under a threaded `cargo test` any other test probing the host in
+        # that window would read the simulated machine.
+        if: >-
+          needs.changes.outputs.rust == 'true'
+          && (steps.sel.outputs.sel == '--workspace'
+              || contains(format('{0} ', steps.sel.outputs.sel), '-p rocm-core '))
+        run: cargo nextest run --locked -p rocm-core --lib --features e2e-test-hooks
 
   windows-build-and-test:
     runs-on: windows-latest
@@ -574,12 +673,40 @@ jobs:
         with:
           cache-on-failure: true
 
+      # The `clippy` job runs on Linux only, so it compiles the `cfg(unix)` side
+      # of every platform conditional and never sees the `cfg(windows)` side.
+      # Windows-gated code was therefore outside the warnings-as-errors gate
+      # entirely — not merely under-linted — so a lint could land there and no
+      # check in the set could fail. This mirrors the two invocations the Linux
+      # `clippy` job runs; the second is separate because the `e2e` target sets
+      # `test = false`, so `--all-targets` does not build it.
+      #
+      # Runs before the build so a lint failure costs seconds rather than the
+      # full build/test/package cycle, matching why this job `needs: clippy`.
+      #
+      # One cargo command per step, here and in Build below: `shell: pwsh` does
+      # not stop on a failing native command, and the step's result is only the
+      # LAST command's exit code — so a second command that passes would turn a
+      # failing first one green.
+      - name: Clippy (Windows targets)
+        if: needs.changes.outputs.heavy == 'true'
+        shell: pwsh
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: Clippy (Windows, e2e harness + steps)
+        if: needs.changes.outputs.heavy == 'true'
+        shell: pwsh
+        run: cargo clippy --locked -p e2e-cucumber --test e2e -- -D warnings
+
       - name: Build
         if: needs.changes.outputs.heavy == 'true'
         shell: pwsh
-        run: |
-          cargo build --workspace --all-targets
-          cargo build --release -p rocm -p rocmd -p rocm-engine-lemonade -p rocm-engine-vllm -p xtask
+        run: cargo build --workspace --all-targets
+
+      - name: Build (release)
+        if: needs.changes.outputs.heavy == 'true'
+        shell: pwsh
+        run: cargo build --release -p rocm -p rocmd -p rocm-engine-lemonade -p rocm-engine-vllm -p xtask
 
       - name: Test
         if: needs.changes.outputs.heavy == 'true'
@@ -601,13 +728,25 @@ jobs:
         shell: pwsh
         run: python .\scripts\smoke_local.py --skip-build
 
-      - name: Acceptance harness self-tests
+      # One command per step: pwsh carries on past a failing native command and
+      # the step reports only the last command's exit code, so a multi-line
+      # block would let an early self-test fail unseen. Enforced for every pwsh
+      # step by `no_pwsh_step_lets_a_failing_native_command_pass_unseen` in
+      # xtask/src/workflow_contract.rs.
+      - name: Acceptance harness self-test (ComfyUI)
         if: needs.changes.outputs.heavy == 'true'
         shell: pwsh
-        run: |
-          python .\scripts\comfyui_therock_gpu_test.py --self-test
-          python .\scripts\local_assistant_therock_gpu_test.py --self-test
-          python .\scripts\vllm_therock_gpu_test.py --self-test
+        run: python .\scripts\comfyui_therock_gpu_test.py --self-test
+
+      - name: Acceptance harness self-test (local assistant)
+        if: needs.changes.outputs.heavy == 'true'
+        shell: pwsh
+        run: python .\scripts\local_assistant_therock_gpu_test.py --self-test
+
+      - name: Acceptance harness self-test (vLLM)
+        if: needs.changes.outputs.heavy == 'true'
+        shell: pwsh
+        run: python .\scripts\vllm_therock_gpu_test.py --self-test
 
       - name: Release readiness self-test
         if: needs.changes.outputs.heavy == 'true'
@@ -827,8 +966,9 @@ jobs:
     # single source of truth in .pre-commit-config.yaml — hygiene + Python (ruff)
     # + Shell (shellcheck) + cargo fmt (rustfmt only, no compile).
     # `--no-group local-tools` skips the hooks that need a full Rust compile,
-    # hawkeye, or PowerShell — those have their own jobs (clippy, build-and-test,
-    # license-headers, powershell-lint).
+    # hawkeye, lychee, PowerShell, or commit-history/signing access — those have
+    # their own jobs (clippy, build-and-test, license-headers, docs-links,
+    # powershell-lint, commit-signatures).
     name: prek (lint / hygiene)
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -857,6 +997,58 @@ jobs:
         with:
           prek-version: 0.4.5
           extra-args: --all-files --no-group local-tools
+
+  remote-ssh:
+    # `rocm remote` drives ssh, scp, and the remote's service/serve tooling. Its
+    # unit tests use a scripted stand-in, which proves the control flow but
+    # assumes the real tools behave a certain way. This job checks that
+    # assumption against a real OpenSSH server in a container: argument
+    # handling, exit-code propagation, stdin delivery of a credential, file
+    # copy, batch-mode refusal, the shape Tailscale Funnel takes in the serve
+    # config (including that the fake refuses the ports the real daemon
+    # refuses), and — the one that matters most — that withdrawing a published
+    # endpoint actually removes it. A publish is configuration rather than a
+    # process, so it survives reboots, and a withdrawal that silently does
+    # nothing leaves a GPU endpoint exposed with nothing tracking it.
+    #
+    # No GPU, no ROCm, no tailnet: the remote's `rocm` and `tailscale` are
+    # stand-ins that answer in the shapes the real tools do.
+    name: remote control channel (containerised)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Gated like every other heavy job here: a fast lint failure should
+    # short-circuit before this spends 30 minutes on a container and a cold
+    # cargo build, and a manual dispatch should stay a fast loop.
+    needs: [changes, clippy, prek]
+    if: github.event_name != 'workflow_dispatch' && needs.changes.outputs.heavy == 'true'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Docker and the OpenSSH client are both present on ubuntu-latest; jq is
+      # the only extra, and only for asserting on JSON contracts.
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Check the control-channel contracts
+        run: tests/remote-ssh/run.sh
+
+      # The pinned toolchain, and the rust-cache that comes with it, as every
+      # other cargo job in this workflow uses. Without it this lane builds the
+      # whole workspace cold against a different compiler from the rest of CI,
+      # inside a 30-minute timeout.
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+
+      # The same container, driven by the real binary this time: discover a
+      # target, probe it, serve, publish, reconcile status, re-publish after an
+      # out-of-band withdrawal, tear down, and refuse to publish over a
+      # Funnel-exposed port. Catches the orchestration mistakes a scripted
+      # stand-in cannot — an argument the CLI builds wrongly, a session record
+      # it fails to clean up.
+      - name: Build the CLI for the end-to-end run
+        run: cargo build -p rocm
+
+      - name: Drive rocm remote end to end
+        run: tests/remote-ssh/run-e2e.sh
 
   clippy:
     runs-on: ubuntu-latest
@@ -954,6 +1146,10 @@ jobs:
         if: needs.changes.outputs.rust == 'true'
         run: cargo xtask check-crate-edges
 
+      - name: Published Doctor catalog is current
+        if: needs.changes.outputs.rust == 'true'
+        run: cargo xtask catalog --check
+
       # Surface the cache hit rate for the clippy compile so the effect is visible
       # in the logs, on the local-only path too — see build-and-test for why this
       # is gated on sccache being present rather than on the remote backend being
@@ -999,9 +1195,17 @@ jobs:
         run: cargo xtask tpn --check
 
   coverage:
+    # The name is stale — this gate covers every workspace crate, not just the
+    # rocm-dash ones — but it is a required status check on `main`, and GitHub
+    # matches required checks by job name. Renaming it here without updating
+    # branch protection in the same moment would leave every subsequent pull
+    # request waiting on a check that can no longer report. Rename and update
+    # protection together, as their own change.
     name: Coverage (rocm-dash crates, ratcheted)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # Raised from 20: the gate now instruments the whole workspace rather than
+    # four crates, so the build it waits on is several times larger.
+    timeout-minutes: 45
     needs: changes
     # A manual E2E dispatch only exercises the E2E jobs; skip the rest.
     if: github.event_name != 'workflow_dispatch'
@@ -1035,19 +1239,17 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-cov-
 
-      # Ratcheted, fail-on-regression floor scoped to the transplanted rocm-dash
-      # crates (the clean anchor) — deliberately NOT the whole workspace, so the
-      # gate does not over-claim coverage of the large untyped rocm-cli core
-      # Baseline measured 2026-06-11: 73.7% lines across the four
-      # crates. Floor set just below measured; ratchet upward as the larger TUI
-      # tab files (bench/overview/modal) gain tests.
-      - name: Coverage gate (rocm-dash crates, >= 70% lines)
+      # Per-crate floors over every workspace crate, pinned in
+      # `coverage-floors.toml` and enforced by the xtask. The crate list lives
+      # in the xtask rather than here so a new workspace member cannot land
+      # outside the gate by nobody remembering to edit this file — the check
+      # fails on a crate with no floor.
+      #
+      # See `xtask/src/coverage.rs` for why the floors are per crate, and what
+      # this metric does and does not measure.
+      - name: Coverage floors (every crate)
         if: needs.changes.outputs.rust == 'true'
-        run: |
-          cargo llvm-cov --no-cfg-coverage \
-            -p rocm-dash-core -p rocm-dash-collectors \
-            -p rocm-dash-daemon -p rocm-dash-tui \
-            --fail-under-lines 70
+        run: cargo xtask coverage
 
   powershell-lint:
     # Runs the prek `powershell-script-analyzer` hook's logic (cargo xtask
@@ -1087,6 +1289,88 @@ jobs:
       - name: PSScriptAnalyzer (Windows PowerShell 5.1)
         if: needs.changes.outputs.lint == 'true'
         run: cargo xtask powershell-lint --shell powershell
+
+  # Grades the published Agent Skills under skills/ with AMD's skillscope
+  # harness. Only the `structural` command runs: it needs no agent, no API key
+  # and no network beyond the install, so a red run is never wrong for a
+  # reason of its own. It is advisory today, not blocking: `Skill checks
+  # (skillscope)` (this job's `name:`, not the `skill-evals` job id) is not a
+  # required status check in branch protection, so a failing run does not
+  # stop a merge. An admin must add that exact context to make it blocking.
+  # It checks the frontmatter an agent runtime
+  # parses (a `name` that disagrees with the folder makes the skill unloadable),
+  # the dataset's coverage bar, and every internal markdown reference — a link
+  # into a renamed file is not cosmetic here, because the agent follows it,
+  # finds nothing, and improvises.
+  #
+  # `routing` and `behavioral` are deliberately NOT run: both need an
+  # authenticated `claude` CLI and an ANTHROPIC_API_KEY, and this repo has no
+  # such secret. Turning them on is a caller change to skillscope's
+  # `skill-evals.yml` reusable workflow once one exists — they are the half of
+  # the question that asks whether the skill actually fires, so this job is not
+  # a substitute for them.
+  #
+  # skills/rocm-cli-assistant/ is deliberately out of scope. Despite its path it
+  # is not a published skill: apps/rocm/src/main.rs embeds it verbatim into the
+  # chat assistant's system prompt with include_str!, so giving it the YAML
+  # frontmatter this check requires would inject that frontmatter into a live
+  # prompt.
+  skill-evals:
+    name: Skill checks (skillscope)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: changes
+    # A manual E2E dispatch only exercises the E2E jobs; skip the rest.
+    if: github.event_name != 'workflow_dispatch' && needs.changes.outputs.skills == 'true'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The `skillscope` step below names skills/rocm-doctor explicitly, so a
+      # third skills/<name>/ folder added later would pass this job green
+      # while never being graded -- the same silent-non-grading failure this
+      # job exists to catch, just one level deeper. Fail loudly instead: any
+      # directory under skills/ that isn't graded above or excluded by design
+      # (rocm-cli-assistant -- see AGENTS.md #7) forces a deliberate edit here.
+      - name: Guard against an ungraded skills/ directory
+        run: |
+          set -euo pipefail
+          # Without nullglob, a skills/ with no subdirectories leaves the
+          # pattern unexpanded and the loop runs once on the literal
+          # `skills/*/`, reporting `skills/* is neither graded ...` -- a
+          # made-up skill name, from a tree that has no ungraded skill in it.
+          # With it the loop simply does not run, which is the right answer for
+          # "nothing to grade".
+          shopt -s nullglob
+          known="rocm-doctor rocm-cli-assistant"
+          for dir in skills/*/; do
+            name="${dir%/}"
+            name="${name#skills/}"
+            case " $known " in
+              *" $name "*) ;;
+              *)
+                echo "::error::skills/$name is neither graded by skill-evals nor excluded by design ($known). Add it to the skillscope step's 'skills:' input, or add it to this guard's exclusion list with the reason, before merging." >&2
+                exit 1
+                ;;
+            esac
+          done
+
+      # The action is only a launcher: it sets up Python and uv, resolves which
+      # build of the harness to run, and execs it. It imports nothing from
+      # skillscope, so pinning it to a release SHA cannot break on a payload
+      # version it predates. What the pin does NOT cover: the composite's own
+      # steps (setup-python, setup-uv, setup-node) are on their own moving
+      # tags, and the harness itself is resolved at runtime via
+      # `uvx --from git+.../skillscope@<ref>` with no lockfile. Unlike this
+      # repo's usual SHA pin (AGENTS.md #6), this one does not reach the code
+      # that actually runs. install-claude stays off; structural needs no
+      # agent.
+      - name: Check skill structure, dataset, and references
+        uses: amd/skillscope@6dde8e8a34ad5456d3c2ff3418bc81c2cd9d5d69 # v0.1.0
+        with:
+          command: structural
+          skills: skills/rocm-doctor
+          args: --skill-files skill-card.md --skill-sections Description,Owner,License
+          install-claude: "false"
 
   license-headers:
     name: License header check (hawkeye)
@@ -1131,6 +1415,28 @@ jobs:
       - name: Check license headers
         run: |
           "${HAWKEYE_INSTALL_DIR}/hawkeye" check
+
+  docs-links:
+    name: Markdown links resolve (lychee)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Deliberately NOT gated by the `changes` path filter: a markdown link can
+    # go stale when the file or heading it points at moves, without the
+    # markdown file itself changing. Run unconditionally instead.
+    #
+    # A manual E2E dispatch only exercises the E2E jobs; skip the rest.
+    if: github.event_name != 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Check markdown links
+        uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
+        with:
+          args: --config lychee.toml './**/*.md'
+          fail: true
+          # Explicit, so an action bump can't silently drift from the version
+          # CONTRIBUTING.md pins for the local `lychee` prek hook — bump both.
+          lycheeVersion: v0.24.2
 
   docs-build:
     name: Sphinx docs build (-W)
@@ -1271,6 +1577,14 @@ jobs:
 
       - name: Run E2E tests
         if: steps.gate.outputs.run == 'true'
+        # E2E_INCLUDE_DOCKER turns on the `rocm remote` scenarios that need a
+        # second machine, stood up as a container. This is the only lane that
+        # opts in: GitHub-hosted runners can build the fixture image, while the
+        # self-hosted GPU runners have a daemon but no route to the package
+        # mirror it installs from, so they skip rather than fail on an image
+        # they could never build.
+        env:
+          E2E_INCLUDE_DOCKER: "1"
         run: cargo xtask e2e
 
       - name: Upload E2E report
