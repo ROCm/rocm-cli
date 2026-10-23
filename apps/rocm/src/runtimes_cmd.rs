@@ -1201,14 +1201,9 @@ fn import_runtime_manifest(
 pub(crate) fn newest_installed_runtime_manifest(
     paths: &AppPaths,
 ) -> Result<Option<therock::InstalledRuntimeManifest>> {
-    let mut manifests = therock::load_runtime_manifests(paths)?;
-    manifests.sort_by(|left, right| {
-        right
-            .installed_at_unix_ms
-            .cmp(&left.installed_at_unix_ms)
-            .then_with(|| left.runtime_key.cmp(&right.runtime_key))
-    });
-    Ok(manifests.into_iter().next())
+    // `load_runtime_manifests` already returns newest install first with ties
+    // broken on the runtime key, so re-sorting here would be a no-op.
+    Ok(therock::load_runtime_manifests(paths)?.into_iter().next())
 }
 
 #[derive(Debug, Clone)]
