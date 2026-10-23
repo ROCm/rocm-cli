@@ -600,3 +600,22 @@ Feature: Interactive dashboard
     When the user denies the adopt approval and closes onboarding setup
     And the user quits the dashboard
     Then the dashboard exits successfully
+
+  # Exercises the hero's "no GPU telemetry" rendering (see
+  # `gpu_data_unavailable`/`node_throughput_title` in
+  # `crates/rocm-dash-tui/src/ui/tabs/home.rs`) with a *real* embedded daemon,
+  # not `--demo` (whose fixture always has 8 GPUs and can never reach this
+  # state). This CI runner has no AMD GPU, so the real collector's first
+  # snapshot — and every one after it — reports zero GPUs, making "unavailable"
+  # a stable, permanent state here rather than a race. The other half of that
+  # state machine, the transient "pending" placeholder shown before the first
+  # snapshot arrives at all, is not covered: it closes in well under a second
+  # and there's no hook to freeze the daemon mid-handshake, so asserting on it
+  # would be asserting on a race.
+  @id:dash-reports-no-gpu-telemetry @requires-os:linux
+  Scenario: dash-37 - The hero shows placeholders, not fake zeros, when no GPU is detected
+    When the user opens the dashboard
+    Then the dashboard home view is displayed
+    And the hero reports no GPU telemetry available
+    When the user quits the dashboard
+    Then the dashboard exits successfully

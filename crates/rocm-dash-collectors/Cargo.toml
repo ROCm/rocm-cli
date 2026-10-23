@@ -30,3 +30,11 @@ reqwest = { version = "0.12", default-features = false }
 tokio = { version = "1", features = ["full"] }
 tempfile = "3"
 wiremock = "0.6"
+
+# ADLX binds dynamically to the AMD driver's bundled amdadlx64.dll at
+# runtime (not a build-time link), so this only makes sense on Windows;
+# winperf.rs's `AdlxHelper::new()` call already degrades to 0.0/None when
+# the DLL isn't present (no AMD driver, non-AMD GPU), same as elsewhere.
+[target.'cfg(windows)'.dependencies]
+adlx = "0.0.0-alpha.1"
+windows-sys = { version = "0.61", features = ["Win32_System_LibraryLoader"] }

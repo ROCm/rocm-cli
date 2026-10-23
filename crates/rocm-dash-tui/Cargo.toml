@@ -16,6 +16,11 @@ path = "src/lib.rs"
 
 [dependencies]
 rocm-dash-core = { path = "../rocm-dash-core" }
+# Unconditional dependency, but only exercised by `client.rs`'s
+# `#[cfg(windows)]` arm: the in-process metrics ticker there reuses
+# `HostCollector`/`WinPerfCollector` instead of a socket (no rocmdashd on
+# Windows yet).
+rocm-dash-collectors = { path = "../rocm-dash-collectors" }
 rocm-deps = { path = "../rocm-deps" }
 # Unified dashboard TUI base: ratatui 0.30 + crossterm 0.28. This is the only
 # ratatui in the workspace — the `rocm` binary no longer carries a (dead) 0.29
