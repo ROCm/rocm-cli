@@ -152,9 +152,8 @@ pub(crate) const fn empty_as_unknown(value: &str) -> &str {
 /// when the former is absent (per `os-release(5)`).
 ///
 /// Deliberately not routed through `rocm_core::host_path`: every caller builds
-/// a package-manager plan (`apt`, `dnf`, `amdgpu-install`) that then runs
-/// against the real machine, so a simulated host root must not choose its
-/// distro. The descriptive distro name `examine` reports comes from
+/// a package-manager plan (`apt`, `dnf`, `zypper`) that then runs against the
+/// real machine, so a simulated host root must not choose its distro. The descriptive distro name `examine` reports comes from
 /// `ExamineSummary::gather`'s `distro` field, which does follow a simulated
 /// root.
 pub(crate) fn real_os_release() -> rocm_core::hardware_root::OsRelease {
