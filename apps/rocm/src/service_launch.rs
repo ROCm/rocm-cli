@@ -199,18 +199,18 @@ pub(crate) fn ensure_public_service_has_endpoint_key(
             "managed service was launched with `--require-api-key` but has no endpoint API key, \
              so restarting it would reopen it without authentication. Something outside this \
              machine may still be publishing its port. The key is dropped when a service stops \
-             and cannot be recovered. Launch it again with \
-             `rocm serve --require-api-key` (add `--api-key <key>`, or set ROCM_SERVE_API_KEY, \
-             to choose the key instead of generating one)."
+             and cannot be recovered. Launch it again with `{}` {}.",
+            rocm_engine_protocol::relaunch_command(host, true),
+            rocm_engine_protocol::RELAUNCH_KEY_CHOICE
         );
     }
     if rocm_engine_protocol::is_public_bind_host(host) && !key_present {
         bail!(
             "managed service is bound to the public host `{host}` but has no endpoint API key, \
              so restarting it would reopen it without authentication. The key is dropped when a \
-             service stops and cannot be recovered. Launch it again with \
-             `rocm serve --host {host} --allow-public-bind` (add `--api-key <key>`, or set \
-             ROCM_SERVE_API_KEY, to choose the key instead of generating one)."
+             service stops and cannot be recovered. Launch it again with `{}` {}.",
+            rocm_engine_protocol::relaunch_command(host, false),
+            rocm_engine_protocol::RELAUNCH_KEY_CHOICE
         );
     }
     Ok(())
@@ -1149,7 +1149,7 @@ fn stream_attached_logs_no_tty(log_path: &Path, child_pid: u32) -> Result<Attach
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::tests::test_paths;
 
@@ -1577,9 +1577,26 @@ mod tests {
         // And the loopback-with-forced-auth case still reports its own reason.
         let error = ensure_public_service_has_endpoint_key("127.0.0.1", false, true)
             .expect_err("a service that demanded auth must not come back without it");
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("--require-api-key"), "{rendered}");
+        // The relaunch command has to be one that can be run: it names the model
+        // and port to fill in, and the recorded host, like its public-bind sibling.
         assert!(
-            format!("{error:#}").contains("--require-api-key"),
-            "{error:#}"
+            rendered.contains("rocm serve <model> --host 127.0.0.1 --port <port>"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("--allow-public-bind"),
+            "a loopback service is not told to open a public bind: {rendered}"
+        );
+
+        // A public host that also demanded auth is told how to bind publicly.
+        let error = ensure_public_service_has_endpoint_key("0.0.0.0", false, true)
+            .expect_err("a public service that demanded auth must not come back without it");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("--host 0.0.0.0 --port <port> --allow-public-bind --require-api-key"),
+            "{rendered}"
         );
     }
 
@@ -1641,11 +1658,15 @@ mod tests {
     }
 
     /// Build an `AutomationRuntimeState` for the no-double-spawn guard tests.
-    fn runtime_state(running: bool, daemon_pid: u32) -> AutomationRuntimeState {
+    ///
+    /// `daemon_start_ticks` is left unrecorded; tests that care about the
+    /// daemon's identity set it explicitly.
+    pub(crate) fn runtime_state(running: bool, daemon_pid: u32) -> AutomationRuntimeState {
         AutomationRuntimeState {
             running,
             automations_enabled: true,
             daemon_pid,
+            daemon_start_ticks: None,
             started_at_unix_ms: 1,
             last_tick_unix_ms: 1,
             local_webhook_endpoint: None,

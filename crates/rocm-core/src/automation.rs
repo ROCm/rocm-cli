@@ -10,7 +10,7 @@
 //! (`AutomationEventRecord`), audit log entries, and review proposals, and
 //! the accessors used to read them back. Every write to the JSONL stores —
 //! an appended record or a full rewrite on proposal status update — goes
-//! through `write_atomic`, so a crash or full disk mid-write never leaves a
+//! through `write_file_atomically`, so a crash or full disk mid-write never leaves a
 //! truncated store. `AutomationTriggerEvent` is also defined here, but this
 //! module persists none of it: it is the in-memory trigger type passed
 //! between `rocmd`'s watcher and webhook plumbing (`apps/rocmd/src/watchers.rs`,
@@ -26,6 +26,7 @@ use crate::AppPaths;
 use crate::WatcherMode;
 use crate::require_nonempty;
 use crate::unix_time_millis;
+use crate::write_file_atomically;
 
 #[derive(Debug, Clone, Copy)]
 pub struct BuiltinWatcherSpec {
@@ -106,6 +107,28 @@ pub struct AutomationRuntimeState {
     pub running: bool,
     pub automations_enabled: bool,
     pub daemon_pid: u32,
+    /// The daemon's kernel start-time, captured at spawn, so `daemon_pid` can be
+    /// checked for PID recycling before anything signals it.
+    ///
+    /// `daemon_pid` alone is not safe to kill: this file survives a crash,
+    /// OOM-kill or reboot with `running` still true, after which the OS can
+    /// reissue that PID to an unrelated process. Pairing the PID with its
+    /// start-time makes a recycled PID detectable ([`identity_state`]).
+    ///
+    /// `None` on two very different occasions, which callers must not conflate:
+    /// a state file written before this field existed, and a platform where
+    /// [`process_start_ticks`] can never return anything.
+    ///
+    /// Conflating them is a live hazard, because [`identity_state`] maps a `None`
+    /// recorded value to [`IdentityState::Matches`] — the legacy best-effort arm
+    /// — so **no recycling check happens at all** and a caller that signals on
+    /// that verdict is killing on a bare pid. Both supported platforms (Linux
+    /// `/proc`, Windows `GetProcessTimes`) can record a start-time, so there an
+    /// absent value means the record predates the field or its writer never
+    /// stamped it, and the pid is unverifiable. Only an unsupported platform
+    /// (neither source, i.e. macOS) can never produce one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_start_ticks: Option<u64>,
     pub started_at_unix_ms: u128,
     pub last_tick_unix_ms: u128,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -127,15 +150,21 @@ impl AutomationRuntimeState {
         Ok(Some(state))
     }
 
+    /// Publish the runtime state atomically.
+    ///
+    /// Written on every daemon tick, and read by `rocm uninstall` to decide
+    /// whether a background helper is still up. A plain `fs::write` leaves a
+    /// truncated file if the daemon dies mid-write, and uninstall has to treat an
+    /// unreadable state file as "cannot confirm the helper is stopped" — so a
+    /// crash at the wrong moment would block uninstall until the operator
+    /// repaired the file by hand.
     pub fn write(&self, paths: &AppPaths) -> Result<()> {
         paths.ensure()?;
         let path = paths.automation_state_path();
-        fs::write(
-            &path,
-            serde_json::to_vec_pretty(self)
-                .context("failed to serialize automation runtime state")?,
-        )
-        .with_context(|| format!("failed to write {}", path.display()))?;
+        let bytes = serde_json::to_vec_pretty(self)
+            .context("failed to serialize automation runtime state")?;
+        write_file_atomically(&path, &bytes)
+            .with_context(|| format!("failed to write {}", path.display()))?;
         Ok(())
     }
 
@@ -209,7 +238,7 @@ pub struct AuditEventRecord {
 
 /// Append one JSONL `record` to `path`: read the existing content (if any),
 /// append the serialized record plus a newline, and replace the file via
-/// `write_atomic`.
+/// `write_file_atomically`.
 fn append_jsonl_record<T: Serialize>(path: &Path, record: &T, context_label: &str) -> Result<()> {
     let mut line = serde_json::to_string(record)
         .with_context(|| format!("failed to serialize {context_label}"))?;
@@ -220,7 +249,7 @@ fn append_jsonl_record<T: Serialize>(path: &Path, record: &T, context_label: &st
         String::new()
     };
     existing.push_str(&line);
-    crate::write_atomic(path, existing.as_bytes(), "jsonl")
+    crate::write_file_atomically(path, existing.as_bytes())
 }
 
 /// Read every JSONL record from `path` and keep only the most recent `limit`
@@ -365,7 +394,7 @@ fn write_automation_proposals(
         );
         text.push('\n');
     }
-    crate::write_atomic(&path, text.as_bytes(), "jsonl")
+    crate::write_file_atomically(&path, text.as_bytes())
 }
 
 fn normalize_proposal_identity(proposal: &mut AutomationProposalRecord, index: usize) {

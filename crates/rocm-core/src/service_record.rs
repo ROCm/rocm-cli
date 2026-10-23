@@ -23,6 +23,7 @@ use crate::AppPaths;
 use crate::INFERENCE_VERIFIED_STATE_KEY;
 use crate::format_http_base_url;
 use crate::unix_time_millis;
+use crate::write_file_atomically;
 use crate::{normalize_runtime_path_for_host, normalize_runtime_path_for_storage};
 
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
@@ -330,24 +331,25 @@ impl ManagedServiceRecord {
         record
     }
 
+    /// Persist the record, atomically.
+    ///
+    /// Staged next to the manifest and published over it, so a concurrent reader
+    /// sees either the old record or the new one, never a half-written file. A
+    /// plain overwrite left a window in which a reader (`load_managed_services`,
+    /// or the uninstall gate that treats an unparseable manifest as a live server
+    /// it cannot account for) could observe a truncated record and act on it.
+    ///
+    /// Uses the workspace's one [`write_file_atomically`] rather than a local
+    /// rename: this runs on every status transition, including the ones the
+    /// uninstall stop pass performs, where a failed publish aborts the uninstall.
     pub fn write(&self) -> Result<()> {
         let mut host_record = self.clone();
         host_record.normalize_paths_for_host();
-        let parent = host_record
-            .manifest_path
-            .parent()
-            .context("service manifest path must have a parent directory")?;
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
         let storage_record = host_record.with_storage_paths();
         let bytes = serde_json::to_vec_pretty(&storage_record)
             .context("failed to serialize service record")?;
-        crate::write_atomic(&host_record.manifest_path, &bytes, "json").with_context(|| {
-            format!(
-                "failed to write service manifest {}",
-                host_record.manifest_path.display()
-            )
-        })
+        write_file_atomically(&host_record.manifest_path, &bytes)
+            .with_context(|| format!("failed to write {}", host_record.manifest_path.display()))
     }
 }
 

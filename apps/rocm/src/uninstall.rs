@@ -9,7 +9,10 @@
 //! only uninstall does on top of removing files:
 //!
 //! - undoing the PATH change the installer recorded making;
-//! - deleting the running `rocm.exe` on Windows, which cannot unlink itself.
+//! - deleting the running `rocm.exe` on Windows, which cannot unlink itself;
+//! - stopping the servers this machine manages before any of that, and
+//!   refusing to remove anything when a stop cannot be confirmed (EAI-8014),
+//!   plus the report for a removal that stops partway.
 
 use std::ffi::OsString;
 use std::fmt::Write as _;
@@ -20,9 +23,12 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use rocm_core::{AppPaths, interactive_terminal};
 
+use crate::uninstall_gate::{
+    ManagedServiceStopReport, stop_managed_services_before_uninstall, uninstall_removal_gate,
+};
 use crate::{
     UninstallOptions, UninstallPlan, build_uninstall_plan, confirm_uninstall,
-    is_rocm_install_entry_name, remove_path, render_uninstall_plan,
+    is_rocm_install_entry_name, plan_removes_recovery_tooling, remove_path, render_uninstall_plan,
 };
 
 /// The file, next to the installed binaries, in which `install.sh` and
@@ -65,8 +71,17 @@ impl PathEdit {
 
 pub(crate) fn uninstall(options: UninstallOptions) -> Result<()> {
     let paths = AppPaths::discover()?;
-    let plan = build_uninstall_plan(&paths, &options)?;
-    print!("{}", render_uninstall_plan(&plan, &options));
+    uninstall_with_paths(&paths, &options)
+}
+
+/// The whole `uninstall` command against a given [`AppPaths`].
+///
+/// Split from [`uninstall`] only so a test can drive the real command — plan,
+/// confirm gate, stop pass, removal — against an isolated root, instead of
+/// exercising the pieces separately and taking the wiring between them on faith.
+pub(crate) fn uninstall_with_paths(paths: &AppPaths, options: &UninstallOptions) -> Result<()> {
+    let plan = build_uninstall_plan(paths, options)?;
+    print!("{}", render_uninstall_plan(&plan, options));
 
     if plan_is_empty(&plan) || options.dry_run {
         return Ok(());
@@ -82,7 +97,73 @@ pub(crate) fn uninstall(options: UninstallOptions) -> Result<()> {
         }
     }
 
-    execute_plan(&plan, &mut |line| println!("{line}"))?;
+    // Only an uninstall that takes away the means of stopping a server has to
+    // stop it first; a cache-only run leaves `rocm services stop` and every
+    // service record in place.
+    let removes_recovery_tooling = plan_removes_recovery_tooling(&plan, paths);
+    stop_managed_services_then_remove(&plan, || {
+        if removes_recovery_tooling {
+            stop_managed_services_before_uninstall(paths)
+        } else {
+            Ok(ManagedServiceStopReport::default())
+        }
+    })
+}
+
+/// Stop the servers this machine manages, then remove the planned paths — in
+/// that order, and only if every stop was confirmed.
+///
+/// Uninstall used to report success while a publicly-bound, GPU-holding endpoint
+/// kept serving, then delete the tooling needed to stop it (EAI-8014). The stop
+/// runs first and the gate aborts on any unconfirmed stop, so the recovery
+/// tooling stays in place.
+///
+/// The stop pass is a parameter, not a direct call, so the ordering guarantee is
+/// testable rather than merely inspectable: a test can hand in a stop that fails
+/// — which no test can reliably provoke from a real process — and assert that
+/// not one planned path was removed. Deleting the stop from this function makes
+/// those tests fail.
+fn stop_managed_services_then_remove(
+    plan: &UninstallPlan,
+    stop_managed_services: impl FnOnce() -> Result<ManagedServiceStopReport>,
+) -> Result<()> {
+    stop_then_remove_with(plan, stop_managed_services, remove_path)
+}
+
+/// [`stop_managed_services_then_remove`] with the removal of one path supplied,
+/// so a test can make it fail partway, which a real filesystem does not do on
+/// demand.
+fn stop_then_remove_with(
+    plan: &UninstallPlan,
+    stop_managed_services: impl FnOnce() -> Result<ManagedServiceStopReport>,
+    remove: impl Fn(&Path) -> Result<()>,
+) -> Result<()> {
+    stop_then_remove_writing_to(plan, stop_managed_services, remove, &mut std::io::stderr())
+}
+
+/// [`stop_then_remove_with`] with the stream the stop pass's warnings go to, so
+/// a test can read what the operator would see on stderr and in which order
+/// relative to the abort.
+fn stop_then_remove_writing_to(
+    plan: &UninstallPlan,
+    stop_managed_services: impl FnOnce() -> Result<ManagedServiceStopReport>,
+    remove: impl Fn(&Path) -> Result<()>,
+    warnings_out: &mut impl std::io::Write,
+) -> Result<()> {
+    let stop_report = stop_managed_services()?;
+    // Every fail-open the stop pass took, on stderr rather than stdout: these
+    // are the places uninstall proceeded without proving the port was free, so
+    // they have to survive the operator piping its output somewhere. Printed
+    // before the gate, so they are on screen whether or not it aborts.
+    write_stop_warnings(warnings_out, &stop_report);
+    if let Some(line) = uninstall_removal_gate(&stop_report)? {
+        println!("{line}");
+    }
+
+    // PATH changes, the planned entries and the running executable go through
+    // `execute_plan_with`, which says exactly what is and is not removed when a
+    // step fails partway.
+    execute_plan_with(plan, &mut |line| println!("{line}"), &remove)?;
     println!("uninstall complete");
     Ok(())
 }
@@ -95,7 +176,24 @@ pub(crate) fn uninstall(options: UninstallOptions) -> Result<()> {
 /// the record of the change are all still there to retry with. Then the
 /// config, data, and cache go, while `rocm` is still there to retry a failure
 /// with; then the binaries, and the record only once every change is undone.
+#[cfg(all(test, unix))]
 fn execute_plan(plan: &UninstallPlan, report: &mut dyn FnMut(String)) -> Result<()> {
+    execute_plan_with(plan, report, &remove_path)
+}
+
+/// [`execute_plan`] with the removal of one path supplied, so a test can make it
+/// fail partway, which a real filesystem does not do on demand.
+///
+/// The removal is not transactional: there is no rollback, so a failure partway
+/// can leave the binaries and service records gone while a server the gate judged
+/// stopped is not. The error therefore says what was removed, what failed (and
+/// may be partly removed, since a directory is deleted child by child), and what
+/// was not attempted, instead of a bare "failed to remove".
+fn execute_plan_with(
+    plan: &UninstallPlan,
+    report: &mut dyn FnMut(String),
+    remove: &dyn Fn(&Path) -> Result<()>,
+) -> Result<()> {
     for edit in &plan.path_edits {
         match apply_path_edit(edit) {
             Ok(line) => report(line),
@@ -110,20 +208,78 @@ fn execute_plan(plan: &UninstallPlan, report: &mut dyn FnMut(String)) -> Result<
     let is_binary = |kind: &str| kind == "binary";
     let non_binaries = plan.actions.iter().filter(|entry| !is_binary(entry.kind));
     let binaries = plan.actions.iter().filter(|entry| is_binary(entry.kind));
-    for entry in non_binaries.chain(binaries) {
-        remove_path(&entry.path)
-            .with_context(|| format!("failed to remove {}", entry.path.display()))?;
-        report(format!("removed {} {}", entry.kind, entry.path.display()));
-    }
+    // Every step in the order it runs, named as the operator will read it.
+    let mut steps: Vec<(String, PathBuf)> = non_binaries
+        .chain(binaries)
+        .map(|entry| {
+            (
+                format!("{} {}", entry.kind, entry.path.display()),
+                entry.path.clone(),
+            )
+        })
+        .collect();
     if let Some(record) = &plan.path_record {
-        remove_path(record).with_context(|| format!("failed to remove {}", record.display()))?;
-        report(format!("removed install record {}", record.display()));
+        steps.push((
+            format!("install record {}", record.display()),
+            record.clone(),
+        ));
+    }
+    let mut removed: Vec<String> = Vec::new();
+    for (index, (name, path)) in steps.iter().enumerate() {
+        if let Err(error) = remove(path) {
+            let untouched: Vec<String> = steps[index + 1..]
+                .iter()
+                .map(|(name, _)| name.clone())
+                .chain(
+                    plan.self_delete
+                        .iter()
+                        .map(|exe| format!("binary {} (the running program)", exe.display())),
+                )
+                .collect();
+            return Err(error
+                .context(format!("failed to remove {}", path.display()))
+                .context(partial_removal_note(&removed, name, &untouched)));
+        }
+        report(format!("removed {name}"));
+        removed.push(name.clone());
     }
 
     if let Some(exe) = &plan.self_delete {
         report(delete_running_executable(exe)?);
     }
     Ok(())
+}
+
+/// One `warning:` line per fail-open the stop pass took, on `out`.
+fn write_stop_warnings(out: &mut impl std::io::Write, report: &ManagedServiceStopReport) {
+    for warning in &report.warnings {
+        let _ = writeln!(out, "warning: {warning}");
+    }
+}
+
+/// What a removal that stopped partway has to tell its operator.
+///
+/// The entry that failed is reported apart from the untouched ones: removing a
+/// directory deletes its children one by one, so it can fail after deleting
+/// some of them, and "still present" would then overstate what is left.
+fn partial_removal_note(removed: &[String], failed: &str, untouched: &[String]) -> String {
+    let removed_part = if removed.is_empty() {
+        "no entry was removed completely".to_owned()
+    } else {
+        format!("Already removed: {}", removed.join(", "))
+    };
+    let untouched_part = if untouched.is_empty() {
+        String::new()
+    } else {
+        format!(". Not attempted: {}", untouched.join(", "))
+    };
+    format!(
+        "uninstall stopped partway. {removed_part}. Failed, and may be partly removed: \
+         {failed}{untouched_part}. What was already removed can include the `rocm`/`rocmd` \
+         binaries and the service records, so `rocm services stop` may no longer work; if a \
+         managed server may still be running, find and stop it by hand, then re-run \
+         uninstall (or delete what is left) once the cause is fixed"
+    )
 }
 
 pub(crate) const fn plan_is_empty(plan: &UninstallPlan) -> bool {
@@ -1325,5 +1481,755 @@ mod tests {
             assert_eq!(fs::metadata(&real)?.permissions().mode() & 0o777, 0o640);
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod stop_gate_tests {
+    use std::fs;
+    use std::path::PathBuf;
+
+    use anyhow::bail;
+
+    use super::{
+        stop_managed_services_then_remove, stop_then_remove_with, stop_then_remove_writing_to,
+        write_stop_warnings,
+    };
+    use crate::uninstall_gate::{
+        FailedManagedServiceStop, ManagedServiceStopReport, StopFailureRemedy,
+    };
+    use crate::{UninstallPlan, UninstallPlanEntry};
+
+    /// A port nothing can ever be serving on.
+    ///
+    /// These tests need a record whose endpoint reads as dead, and the gate
+    /// really does probe it. Port 0 resolves — so the probe runs rather than
+    /// being skipped by a resolution failure — and the connect always fails,
+    /// on every platform. Binding an ephemeral port and dropping it would leave
+    /// a window in which something else on a busy runner grabs the port and
+    /// fails these tests through the gate's own probe.
+    ///
+    /// Both users are Linux-only, so the constant is too — `-D warnings` makes
+    /// dead code a build failure on the other platforms.
+    #[cfg(target_os = "linux")]
+    const UNSERVABLE_PORT: u16 = 0;
+
+    /// An isolated root and a plan whose one action removes a real file in it.
+    ///
+    /// The file is what makes these tests assertions about *removal* rather than
+    /// about return values: it exists before the call, and its presence
+    /// afterwards is the evidence that the abort happened before the removal
+    /// loop, not after it.
+    fn plan_removing_one_file(name: &str) -> (PathBuf, UninstallPlan) {
+        let root = std::env::temp_dir().join(format!(
+            "rocm-cli-uninstall-test-{name}-{}-{}",
+            std::process::id(),
+            rocm_core::unix_time_millis()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("failed to create the test root");
+        let doomed = root.join("rocm");
+        fs::write(&doomed, b"binary").expect("failed to seed the file the plan removes");
+        (
+            root,
+            UninstallPlan {
+                actions: vec![UninstallPlanEntry {
+                    kind: "binary",
+                    path: doomed,
+                }],
+                skipped: Vec::new(),
+                warnings: Vec::new(),
+                ..UninstallPlan::default()
+            },
+        )
+    }
+
+    #[test]
+    fn a_removal_that_fails_partway_says_what_is_gone_and_what_is_left() {
+        // The removal is not transactional, so a failure after the first entry
+        // leaves that entry gone and the next one behind (config, data and cache
+        // go before the binaries). The error has to say so, and the report must
+        // match what is actually on disk.
+        let root = std::env::temp_dir().join(format!(
+            "rocm-cli-uninstall-test-partial-{}-{}",
+            std::process::id(),
+            rocm_core::unix_time_millis()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create the test root");
+        let binary = root.join("config.toml");
+        let data = root.join("data");
+        fs::write(&binary, b"binary").expect("seed binary");
+        fs::create_dir_all(&data).expect("seed data");
+        let plan = UninstallPlan {
+            actions: vec![
+                UninstallPlanEntry {
+                    kind: "config",
+                    path: binary.clone(),
+                },
+                UninstallPlanEntry {
+                    kind: "data",
+                    path: data.clone(),
+                },
+            ],
+            skipped: Vec::new(),
+            warnings: Vec::new(),
+            ..UninstallPlan::default()
+        };
+
+        let error = stop_then_remove_with(
+            &plan,
+            || Ok(ManagedServiceStopReport::default()),
+            |path| {
+                if path == data {
+                    bail!("directory not empty")
+                }
+                fs::remove_file(path)?;
+                Ok(())
+            },
+        )
+        .expect_err("a failing removal must fail the uninstall");
+
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(&format!("Already removed: config {}", binary.display())),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!(
+                "Failed, and may be partly removed: data {}",
+                data.display()
+            )),
+            "{message}"
+        );
+        assert!(message.contains("directory not empty"), "{message}");
+        assert!(
+            message.contains("`rocm services stop` may no longer work"),
+            "{message}"
+        );
+        // The text above is only true if the disk agrees with it.
+        assert!(!binary.exists(), "the entry the note calls removed is gone");
+        assert!(
+            data.exists(),
+            "the data the note calls present is still there"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_removal_failing_in_the_middle_names_the_later_entries_as_not_attempted() {
+        let root = std::env::temp_dir().join(format!(
+            "rocm-cli-uninstall-test-three-{}-{}",
+            std::process::id(),
+            rocm_core::unix_time_millis()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create the test root");
+        let first = root.join("config.toml");
+        let middle = root.join("data");
+        let last = root.join("cache");
+        fs::write(&first, b"config").expect("seed first");
+        fs::create_dir_all(&middle).expect("seed middle");
+        fs::create_dir_all(&last).expect("seed last");
+        let entry = |kind: &'static str, path: &PathBuf| UninstallPlanEntry {
+            kind,
+            path: path.clone(),
+        };
+        let plan = UninstallPlan {
+            actions: vec![
+                entry("config", &first),
+                entry("data", &middle),
+                entry("cache", &last),
+            ],
+            skipped: Vec::new(),
+            warnings: Vec::new(),
+            ..UninstallPlan::default()
+        };
+
+        let error = stop_then_remove_with(
+            &plan,
+            || Ok(ManagedServiceStopReport::default()),
+            |path| {
+                if path == middle {
+                    bail!("directory not empty")
+                }
+                if path.is_dir() {
+                    fs::remove_dir_all(path)?;
+                } else {
+                    fs::remove_file(path)?;
+                }
+                Ok(())
+            },
+        )
+        .expect_err("a failing removal must fail the uninstall");
+
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(&format!("Already removed: config {}", first.display())),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("Not attempted: cache {}", last.display())),
+            "{message}"
+        );
+        assert!(
+            !message.contains("Not attempted: data"),
+            "the failed entry is reported apart from the untouched ones: {message}"
+        );
+        assert!(!first.exists(), "removed, as the note says");
+        assert!(middle.exists(), "the failed entry is still there");
+        assert!(last.exists(), "the not-attempted entry is still on disk");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_removal_that_fails_first_reports_the_failed_entry_as_possibly_partial() {
+        let (root, plan) = plan_removing_one_file("fails-first");
+        let doomed = plan.actions[0].path.clone();
+
+        let error = stop_then_remove_with(
+            &plan,
+            || Ok(ManagedServiceStopReport::default()),
+            |_| bail!("permission denied"),
+        )
+        .expect_err("a failing removal must fail the uninstall");
+
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("no entry was removed completely"),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!(
+                "Failed, and may be partly removed: {} {}",
+                plan.actions[0].kind,
+                doomed.display()
+            )),
+            "{message}"
+        );
+        assert!(doomed.is_file(), "nothing was removed, as the note says");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_directory_removal_that_deletes_some_children_then_fails_is_reported_as_partial() {
+        let root = std::env::temp_dir().join(format!(
+            "rocm-cli-uninstall-test-partial-dir-{}-{}",
+            std::process::id(),
+            rocm_core::unix_time_millis()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let data = root.join("data");
+        fs::create_dir_all(&data).expect("seed data");
+        fs::write(data.join("a"), b"a").expect("seed a");
+        fs::write(data.join("b"), b"b").expect("seed b");
+        let plan = UninstallPlan {
+            actions: vec![UninstallPlanEntry {
+                kind: "data",
+                path: data.clone(),
+            }],
+            skipped: Vec::new(),
+            warnings: Vec::new(),
+            ..UninstallPlan::default()
+        };
+
+        let error = stop_then_remove_with(
+            &plan,
+            || Ok(ManagedServiceStopReport::default()),
+            |path| {
+                // Like `remove_dir_all` failing midway: one child is gone, the
+                // directory is not.
+                fs::remove_file(path.join("a"))?;
+                bail!("directory not empty")
+            },
+        )
+        .expect_err("a failing removal must fail the uninstall");
+
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(&format!(
+                "Failed, and may be partly removed: data {}",
+                data.display()
+            )),
+            "{message}"
+        );
+        assert!(!data.join("a").exists() && data.join("b").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn every_fail_open_the_stop_pass_took_is_written_as_a_warning_line() {
+        let report = ManagedServiceStopReport {
+            warnings: vec!["first fail-open".to_owned(), "second fail-open".to_owned()],
+            ..ManagedServiceStopReport::default()
+        };
+        let mut out = Vec::new();
+        write_stop_warnings(&mut out, &report);
+        assert_eq!(
+            String::from_utf8(out).expect("utf8"),
+            "warning: first fail-open\nwarning: second fail-open\n"
+        );
+    }
+
+    #[test]
+    fn the_stop_warnings_reach_the_operator_whether_or_not_the_run_aborts() {
+        // `write_stop_warnings` is tested on its own above; this pins the call
+        // site in the command, which a no-op there would otherwise leave green:
+        // the fail-opens are the only disclosure that uninstall proceeded without
+        // proving a port was free.
+        let (root, plan) = plan_removing_one_file("warnings-proceed");
+        let mut out = Vec::new();
+        stop_then_remove_writing_to(
+            &plan,
+            || {
+                Ok(ManagedServiceStopReport {
+                    warnings: vec!["could not check port 9".to_owned()],
+                    ..ManagedServiceStopReport::default()
+                })
+            },
+            |path| {
+                fs::remove_file(path)?;
+                Ok(())
+            },
+            &mut out,
+        )
+        .expect("a run with only fail-open warnings proceeds");
+        assert_eq!(
+            String::from_utf8(out).expect("utf8"),
+            "warning: could not check port 9\n"
+        );
+        let _ = fs::remove_dir_all(root);
+
+        // And on the abort path: printed before the gate refuses, so they are on
+        // screen even though nothing was removed.
+        let (root, plan) = plan_removing_one_file("warnings-abort");
+        let doomed = plan.actions[0].path.clone();
+        let mut out = Vec::new();
+        let error = stop_then_remove_writing_to(
+            &plan,
+            || {
+                Ok(ManagedServiceStopReport {
+                    failed: vec![FailedManagedServiceStop {
+                        service_id: "svc-stuck".to_owned(),
+                        reason: "still \"ready\"".to_owned(),
+                        remedy: StopFailureRemedy::StopTheService,
+                    }],
+                    warnings: vec!["could not check port 9".to_owned()],
+                    ..ManagedServiceStopReport::default()
+                })
+            },
+            |_| panic!("an aborted run removes nothing"),
+            &mut out,
+        )
+        .expect_err("a failed stop aborts");
+        assert!(format!("{error:#}").contains("svc-stuck"));
+        assert_eq!(
+            String::from_utf8(out).expect("utf8"),
+            "warning: could not check port 9\n"
+        );
+        assert!(doomed.is_file(), "nothing was removed");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_service_that_cannot_be_stopped_leaves_every_planned_path_in_place() {
+        // The EAI-8014 guarantee itself: while a managed server may still be
+        // serving, uninstall removes NOTHING — not the binaries, not the service
+        // records — so `rocm services stop` is still there to recover with.
+        let (root, plan) = plan_removing_one_file("stop-unconfirmed");
+        let doomed = plan.actions[0].path.clone();
+
+        let error = stop_managed_services_then_remove(&plan, || {
+            Ok(ManagedServiceStopReport {
+                stopped: Vec::new(),
+                failed: vec![FailedManagedServiceStop {
+                    service_id: "svc-stuck".to_owned(),
+                    reason: "still \"ready\" after the stop attempt".to_owned(),
+                    remedy: StopFailureRemedy::StopTheService,
+                }],
+                warnings: Vec::new(),
+                helper_stopped: false,
+                ..ManagedServiceStopReport::default()
+            })
+        })
+        .expect_err("an unconfirmed stop must abort uninstall");
+
+        let message = format!("{error:#}");
+        // Assert on text the GATE owns first. `svc-stuck` alone would be this
+        // test reading back its own input — the id is folded into the detail
+        // whatever the remedy is, so that assertion survives swapping the
+        // remedy to the daemon variant and would leave this branch of the
+        // remedy selection unexercised while reading as its coverage.
+        assert!(
+            message.contains("rocm services stop <id> --yes"),
+            "the abort must carry the service remedy, not a generic one: {message}"
+        );
+        assert!(
+            !message.contains("restarts managed services on its own"),
+            "a service is not the background helper, so its remedy must not be offered: {message}"
+        );
+        assert!(
+            message.contains("svc-stuck"),
+            "the abort still names which service: {message}"
+        );
+        assert!(
+            doomed.is_file(),
+            "the planned path must survive an aborted uninstall"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_background_helper_that_cannot_be_stopped_leaves_every_planned_path_in_place() {
+        // The daemon is the one failure class that is not a service: it restarts
+        // managed servers on its own, so removing the tooling while it is up
+        // recreates EAI-8014 from the other end. When its identity cannot be
+        // verified it is deliberately left running, which must abort the
+        // uninstall rather than quietly proceed.
+        let (root, plan) = plan_removing_one_file("daemon-unconfirmed");
+        let doomed = plan.actions[0].path.clone();
+
+        let error = stop_managed_services_then_remove(&plan, || {
+            Ok(ManagedServiceStopReport {
+                stopped: Vec::new(),
+                failed: vec![FailedManagedServiceStop {
+                    service_id: "rocmd (pid 4321)".to_owned(),
+                    reason: "the background helper's identity could not be verified".to_owned(),
+                    remedy: StopFailureRemedy::StopTheDaemon,
+                }],
+                warnings: Vec::new(),
+                helper_stopped: false,
+                ..ManagedServiceStopReport::default()
+            })
+        })
+        .expect_err("an unstopped background helper must abort uninstall");
+
+        let message = format!("{error:#}");
+        // Assert on text the GATE owns, not on the strings this test handed it.
+        // The service id and reason above are folded into the detail whatever
+        // the remedy is, so asserting they appear only proves the input reached
+        // the output — it passes with the remedy swapped to the service variant,
+        // which would leave this remedy branch unexercised while reading as its
+        // coverage. The daemon remedy's own sentence is what distinguishes it.
+        assert!(
+            message.contains("restarts managed services on its own"),
+            "the abort must carry the daemon remedy, not a generic one: {message}"
+        );
+        assert!(
+            !message.contains("rocm services stop <id> --yes"),
+            "the daemon is not a service, so the service remedy must not be offered: {message}"
+        );
+        assert!(
+            message.contains("rocmd (pid 4321)"),
+            "the abort still names which helper: {message}"
+        );
+        assert!(
+            doomed.is_file(),
+            "the planned path must survive an aborted uninstall"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_stop_pass_that_cannot_run_leaves_every_planned_path_in_place() {
+        // Discovery failing (an unreadable services directory) is the same class
+        // of danger as a stop failing: uninstall would be removing the tooling
+        // while blind to what it manages.
+        let (root, plan) = plan_removing_one_file("stop-undiscoverable");
+        let doomed = plan.actions[0].path.clone();
+
+        let error = stop_managed_services_then_remove(&plan, || {
+            bail!("failed to read the services directory")
+        })
+        .expect_err("a stop pass that cannot run must abort uninstall");
+
+        // Unlike the two remedy tests above, there is no gate-owned text to
+        // assert on here: a discovery failure never reaches the gate, it is
+        // propagated by the `?` on the stop pass. So this substring is
+        // deliberately the test's own input, and it pins exactly one thing —
+        // that the cause is carried through rather than swallowed or replaced
+        // by a generic "uninstall aborted", which is the `.ok()` defect an
+        // earlier round found on this path. The survival assertion below is
+        // what pins the abort itself.
+        assert!(
+            error.to_string().contains("services directory"),
+            "the abort carries the discovery failure verbatim: {error:#}"
+        );
+        assert!(
+            doomed.is_file(),
+            "the planned path must survive an aborted uninstall"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // The bounded-exit assertion and its budget are shared with the crate root's
+    // test module rather than copied here. Two near-identical copies, carrying
+    // near-identical comments, is exactly what made it easy to believe both
+    // process-based tests were bounded when only one of them actually was.
+    #[cfg(target_os = "linux")]
+    use crate::tests::assert_stopped_within_grace;
+
+    /// Gated to Linux because it spawns a real stand-in process and relies on the
+    /// zombie-state detection in `terminate_verified`, which is implemented only there.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_cache_only_uninstall_leaves_a_live_server_running() {
+        // The other direction of the recovery-tooling predicate, pinned through
+        // the command rather than on the predicate alone. `--keep-binaries
+        // --keep-data` leaves `rocm services stop` and every service record in
+        // place, so there is nothing to protect by force-stopping a live server
+        // — and doing it anyway would kill a user's running model for a run that
+        // only clears a cache.
+        //
+        // Unit tests already assert `plan_removes_recovery_tooling` is false for
+        // a cache-only plan, but nothing checked the wiring: forcing that
+        // predicate true left every other test green, because they all uninstall
+        // something that *does* remove the tooling.
+        let root = std::env::temp_dir().join(format!(
+            "rocm-cli-uninstall-cache-only-{}-{}",
+            std::process::id(),
+            rocm_core::unix_time_millis()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let paths = rocm_core::AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+        paths.ensure().expect("create the app directories");
+        fs::write(paths.cache_dir.join("blob"), b"cached").expect("seed a cache file");
+
+        let mut server = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("failed to spawn the managed server");
+        let pid = server.id();
+        let mut record = rocm_core::ManagedServiceRecord::new(
+            &paths,
+            "svc-cache-only",
+            "vllm",
+            "m",
+            "m",
+            "127.0.0.1",
+            UNSERVABLE_PORT,
+            "managed",
+            pid,
+            None,
+            None,
+            None,
+        );
+        record.engine_pid = Some(pid);
+        record.supervisor_start_ticks = rocm_core::process_start_ticks(pid);
+        record.status = "ready".to_owned();
+        record.write().expect("failed to write the service record");
+
+        super::uninstall_with_paths(
+            &paths,
+            &crate::UninstallOptions {
+                yes: true,
+                keep_binaries: true,
+                keep_data: true,
+                ..crate::UninstallOptions::default()
+            },
+        )
+        .expect("a cache-only uninstall must succeed");
+
+        assert!(
+            server.try_wait().expect("poll the server").is_none(),
+            "a cache-only uninstall must not stop a live managed server"
+        );
+        assert!(
+            record.manifest_path.is_file(),
+            "a cache-only uninstall keeps the service records"
+        );
+        let _ = server.kill();
+        let _ = server.wait();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn removal_proceeds_once_every_managed_server_is_confirmed_stopped() {
+        let (root, plan) = plan_removing_one_file("stop-confirmed");
+        let doomed = plan.actions[0].path.clone();
+
+        stop_managed_services_then_remove(&plan, || {
+            Ok(ManagedServiceStopReport {
+                stopped: vec!["svc-stopped".to_owned()],
+                failed: Vec::new(),
+                warnings: Vec::new(),
+                helper_stopped: false,
+                ..ManagedServiceStopReport::default()
+            })
+        })
+        .expect("a confirmed stop must let uninstall proceed");
+
+        assert!(
+            !doomed.exists(),
+            "the planned path must be removed once nothing is left serving"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Gated to Linux: relies on a spawned stand-in and on
+    /// the zombie-state detection in `terminate_verified`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_live_managed_server_is_stopped_before_the_planned_paths_are_removed() {
+        // The whole ordering, driven through the real stop pass rather than an
+        // injected report: a live server dies first, and only then do the files
+        // go.
+        //
+        // The mutation this is sensitive to is the ordering inversion — running
+        // the removal loop before the stop pass. That only bites because the
+        // plan below also removes the *services directory*: remove-first deletes
+        // the record, so the stop pass then finds nothing to stop, the stand-in
+        // survives its deadline and the assertion fails. With the plan removing
+        // only an unrelated file (as it did originally) the record survived the
+        // inversion, the stop still ran, and this test passed under exactly the
+        // defect it claims to guard.
+        let (root, mut plan) = plan_removing_one_file("live-server");
+        let doomed = plan.actions[0].path.clone();
+        let paths = rocm_core::AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+        plan.actions.push(crate::UninstallPlanEntry {
+            kind: "data",
+            path: paths.data_dir.join("services"),
+        });
+        let child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("failed to spawn the managed server");
+        let pid = child.id();
+        let free_port = UNSERVABLE_PORT;
+        let mut record = rocm_core::ManagedServiceRecord::new(
+            &paths,
+            "svc-live",
+            "vllm",
+            "m",
+            "m",
+            "127.0.0.1",
+            free_port,
+            "managed",
+            pid,
+            None,
+            None,
+            None,
+        );
+        record.engine_pid = Some(pid);
+        record.supervisor_start_ticks = rocm_core::process_start_ticks(pid);
+        record.status = "ready".to_owned();
+        record.write().expect("failed to write the service record");
+
+        stop_managed_services_then_remove(&plan, || {
+            crate::uninstall_gate::stop_managed_services_before_uninstall(&paths)
+        })
+        .expect("a server that stops must not block uninstall");
+
+        // The stand-in is our own child, so its exit is observable directly —
+        // and bounded, so this pins that uninstall killed it rather than that it
+        // outlived the test.
+        let mut child = child;
+        assert_stopped_within_grace(
+            &mut child,
+            "the managed server must be stopped by uninstall",
+        );
+        assert!(
+            !rocm_core::process_is_running(pid),
+            "the managed server must be stopped by uninstall"
+        );
+        assert!(
+            !doomed.exists(),
+            "the planned path must be removed once the server is stopped"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Gated to Linux for the same reason as the test above: a spawned stand-in
+    /// and zombie-state detection.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_uninstall_command_itself_stops_a_managed_server_before_removing_anything() {
+        // Drives the real command end to end — plan, confirm gate, stop pass,
+        // removal — rather than the pieces separately.
+        //
+        // Two distinct claims, and it is worth being exact about which is which,
+        // because an earlier version of this comment claimed both and only
+        // delivered one. ORDERING: inlining the old remove-first loop back into
+        // `uninstall_with_paths` fails here even though every narrower test
+        // still passes. STOPPING: the assertion below is bounded, so skipping
+        // the stop pass fails it instead of merely making the suite take as long
+        // as the stand-in lives.
+        let root = std::env::temp_dir().join(format!(
+            "rocm-cli-uninstall-cmd-test-{}-{}",
+            std::process::id(),
+            rocm_core::unix_time_millis()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let paths = rocm_core::AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+        for dir in [&paths.config_dir, &paths.data_dir, &paths.cache_dir] {
+            fs::create_dir_all(dir).expect("seed an isolated dir the plan will remove");
+        }
+        let marker = paths.data_dir.join("state.json");
+        fs::write(&marker, b"{}").expect("seed state the removal must delete");
+
+        let server = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn the managed server");
+        let pid = server.id();
+        let free_port = UNSERVABLE_PORT;
+        let mut record = rocm_core::ManagedServiceRecord::new(
+            &paths,
+            "svc-cmd-live",
+            "vllm",
+            "m",
+            "m",
+            "127.0.0.1",
+            free_port,
+            "managed",
+            pid,
+            None,
+            None,
+            None,
+        );
+        record.engine_pid = Some(pid);
+        record.supervisor_start_ticks = rocm_core::process_start_ticks(pid);
+        record.status = "ready".to_owned();
+        record.write().expect("write the service record");
+
+        // `--keep-binaries` keeps the test off the real executable-discovery
+        // path; removing the data dir still takes the service records away, so
+        // the stop pass is required to run.
+        super::uninstall_with_paths(
+            &paths,
+            &crate::UninstallOptions {
+                yes: true,
+                keep_binaries: true,
+                ..crate::UninstallOptions::default()
+            },
+        )
+        .expect("uninstall should succeed once the server is stopped");
+
+        let mut server = server;
+        assert_stopped_within_grace(
+            &mut server,
+            "`rocm uninstall` must stop the server it manages",
+        );
+        assert!(
+            !rocm_core::process_is_running(pid),
+            "`rocm uninstall` must stop the server it manages"
+        );
+        assert!(
+            !marker.exists(),
+            "`rocm uninstall` must remove the planned state once the server is stopped"
+        );
+        let _ = fs::remove_dir_all(root);
     }
 }

@@ -48,6 +48,84 @@ pub fn is_public_bind_host(host: &str) -> bool {
     !matches!(host, "127.0.0.1" | "localhost" | "::1")
 }
 
+/// The `rocm serve` invocation that brings back a service whose endpoint key
+/// was dropped, for the refusals and the uninstall abort that tell an operator
+/// to launch it again.
+///
+/// One builder for every place that prints it (the `rocm serve` and `rocmd`
+/// refusals and the uninstall abort, one command per stopped service), so they
+/// cannot drift: a public host needs `--allow-public-bind`, and a service that
+/// asked for authentication needs `--require-api-key` even on loopback. The key
+/// itself is optional ([`RELAUNCH_KEY_CHOICE`]).
+#[must_use]
+pub fn relaunch_command(host: &str, require_api_key: bool) -> String {
+    let public_flag = if is_public_bind_host(host) {
+        " --allow-public-bind"
+    } else {
+        ""
+    };
+    let key_flag = if require_api_key {
+        " --require-api-key"
+    } else {
+        ""
+    };
+    // The flags are appended, not interpolated after `<port>`: the advised-command
+    // parse test reads this literal as source, and a placeholder glued to
+    // `{public_flag}` would substitute the port value into it.
+    let mut command = format!("rocm serve <model> --host {host} --port <port>");
+    command.push_str(public_flag);
+    command.push_str(key_flag);
+    command
+}
+
+/// [`relaunch_command`] filled in for one concrete service.
+///
+/// The template stays the single source of the flag set; this substitutes its
+/// model and port placeholders and appends the engine, so the advice runs as printed.
+#[must_use]
+pub fn relaunch_command_for(
+    model: &str,
+    engine: &str,
+    host: &str,
+    port: u16,
+    require_api_key: bool,
+) -> String {
+    let mut command = relaunch_command(host, require_api_key)
+        .replacen("<model>", &shell_word(model), 1)
+        .replacen("<port>", &port.to_string(), 1);
+    if !engine.is_empty() {
+        command.push_str(" --engine ");
+        command.push_str(&shell_word(engine));
+    }
+    command
+}
+
+/// The running platform's shell: PowerShell on Windows, POSIX `sh` elsewhere.
+fn shell_word(value: &str) -> String {
+    shell_word_for(value, cfg!(windows))
+}
+
+/// Leave a plain word as is and single-quote anything the shell would split or
+/// expand. An apostrophe inside is doubled for PowerShell and closed-escaped-
+/// reopened (`'\''`) for POSIX `sh`; each is wrong in the other shell.
+fn shell_word_for(value: &str, powershell: bool) -> String {
+    let plain = !value.is_empty()
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._/:@=+,-".contains(c));
+    if plain {
+        value.to_owned()
+    } else if powershell {
+        format!("'{}'", value.replace('\'', "''"))
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
+/// The parenthetical that follows a [`relaunch_command`]: supplying a key is
+/// optional, and the environment variable keeps it out of shell history.
+pub const RELAUNCH_KEY_CHOICE: &str = "(add `--api-key <key>`, or set ROCM_SERVE_API_KEY, to choose the key instead of generating one)";
+
 /// Resolve the endpoint API key an engine adapter must enforce, if any.
 ///
 /// Reads the key file named by [`ENDPOINT_API_KEY_FILE_ENV`]. Returns `None` when
@@ -769,6 +847,57 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         assert_eq!(endpoint_key_file_if_present(&paths, service_id), None);
         std::fs::remove_dir_all(&paths.data_dir).ok();
+    }
+
+    #[test]
+    fn relaunch_command_carries_exactly_the_flags_the_service_needs() {
+        assert_eq!(
+            relaunch_command("127.0.0.1", false),
+            "rocm serve <model> --host 127.0.0.1 --port <port>"
+        );
+        assert_eq!(
+            relaunch_command("127.0.0.1", true),
+            "rocm serve <model> --host 127.0.0.1 --port <port> --require-api-key"
+        );
+        assert_eq!(
+            relaunch_command("0.0.0.0", false),
+            "rocm serve <model> --host 0.0.0.0 --port <port> --allow-public-bind"
+        );
+        assert_eq!(
+            relaunch_command("0.0.0.0", true),
+            "rocm serve <model> --host 0.0.0.0 --port <port> --allow-public-bind --require-api-key"
+        );
+    }
+
+    #[test]
+    fn relaunch_command_for_fills_in_the_service_it_was_given() {
+        assert_eq!(
+            relaunch_command_for("amd/Model-7B", "vllm", "0.0.0.0", 8123, true),
+            "rocm serve amd/Model-7B --host 0.0.0.0 --port 8123 --allow-public-bind --require-api-key --engine vllm"
+        );
+        assert_eq!(
+            relaunch_command_for("/models/my model.gguf", "", "127.0.0.1", 8000, false),
+            "rocm serve '/models/my model.gguf' --host 127.0.0.1 --port 8000"
+        );
+        assert!(!relaunch_command_for("m", "vllm", "127.0.0.1", 1, false).contains('<'));
+    }
+
+    #[test]
+    fn an_apostrophe_in_a_model_path_is_escaped_for_the_shell_that_will_read_it() {
+        let model = "/models/O'Brien's model.gguf";
+        assert_eq!(
+            shell_word_for(model, false),
+            "'/models/O'\\''Brien'\\''s model.gguf'"
+        );
+        assert_eq!(
+            shell_word_for(model, true),
+            "'/models/O''Brien''s model.gguf'"
+        );
+        let command = relaunch_command_for(model, "vllm", "127.0.0.1", 8000, false);
+        assert!(
+            command.contains(&shell_word_for(model, cfg!(windows))),
+            "{command}"
+        );
     }
 
     #[test]

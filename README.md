@@ -1160,6 +1160,25 @@ be, nothing is removed, so you can fix the cause and run `rocm uninstall` again.
 Each step is reported as it finishes, so if a later step fails, the output
 still shows what was already removed.
 
+`rocm uninstall` stops any managed model server that is still running before it
+removes anything, and also stops the background helper (`rocmd`), which is
+force-stopped (on Linux its whole process tree, on Windows only the recorded
+process) because it would otherwise restart the servers.
+If a server cannot be stopped (or its service record cannot be read), the
+command exits non-zero, leaves every file in place, and says what to repair or
+stop by hand, so the tooling needed to stop it is never deleted out from under
+a running server. A live server or helper recorded without a start time (written
+by an older version) cannot be proven to be ours, so it is refused rather than
+killed: stop it yourself, then re-run. The same refusal applies when the
+helper's runtime state file cannot be read. The plan shows the refusal before
+you confirm it. The stop pass is not atomic: if it aborts after stopping some
+servers (or the helper), those stay stopped and their endpoint keys are gone;
+the error names each one and the `rocm serve` command that brings it back. A
+run that keeps the binaries and data (`--keep-binaries --keep-data`) leaves
+running servers and the helper alone.
+If a removal fails partway, the error lists what was removed and what is left,
+because the binaries and service records may already be gone.
+
 On Linux, if a config, data, or cache folder is a link to somewhere else (for
 example a cache moved to a bigger disk), `rocm uninstall` removes the link and
 leaves the folder it points to alone, whether or not the setting ends in a `/`.

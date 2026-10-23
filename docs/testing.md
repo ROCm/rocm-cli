@@ -1483,7 +1483,13 @@ generated public-key PEM installer verification; verify first-install PATH setup
 Linux writes the shell profile); reinstall stale-manifest purge and config
 preservation; a Windows loopback-HTTP install; isolated installed-binary
 directory smoke checks (`rocm examine` must read only the isolated
-config/data/cache, never the real user `.rocm` state); and uninstall: a full
+config/data/cache, never the real user `.rocm` state); and uninstall: stopping the local server it manages
+(lifecycle-10 and lifecycle-24, Linux and Windows), the background helper
+(lifecycle-26), an uninstall that keeps the binaries and data leaving the
+server running and its record in place (lifecycle-27), refusing to remove
+anything while a managed service record cannot be read (lifecycle-25), while a
+live server it cannot prove is ours has no recorded start time (lifecycle-28),
+and while the helper's runtime state cannot be read (lifecycle-29); and a full
 purge that also restores the shell profile, the Windows user `PATH` taken back
 off with its other entries and its registry type kept, the `PATH` change kept while another program shares the install folder or
 with `--keep-binaries`, a `PATH` change that cannot be undone removing nothing
