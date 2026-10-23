@@ -13,7 +13,14 @@ active-implementation-log.md
 current-user-asks.md
 __pycache__/
 /.hawkeye-bin/
+# skillscope writes its JSON run reports here.
+/.skillscope/
 /.claude
+/.supergoal/
 /plans/
 /workspace/
 /e2e-consolidated-report.md
+
+# Sphinx docs: _toc.yml is generated from _toc.yml.in at build time
+docs/rocm-docs/sphinx/_toc.yml
+docs/rocm-docs/_build/

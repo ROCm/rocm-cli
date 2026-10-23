@@ -5,19 +5,27 @@
 //! Repository task runner.
 //!
 //! Provides release-artifact signing, the MANIFEST.md dependency-table
-//! generator, third-party-notices generation, commit-trust verification, and
-//! PowerShell linting. Each command's implementation lives in its own module;
-//! this file holds only the CLI definition and dispatch. Run via the workspace
-//! alias `cargo xtask <command>`.
+//! generator, third-party-notices generation, commit-trust verification,
+//! PowerShell linting, and markdown-link checking. Each command's
+//! implementation lives in its own module; this file holds only the CLI
+//! definition and dispatch. Run via the workspace alias `cargo xtask <command>`.
 
 mod affected;
+mod ascii_output_contract;
+mod catalog;
+mod coverage;
+mod crate_edges;
 mod demos;
 mod e2e;
+mod e2e_prewarm;
 mod e2e_report;
+mod env_mutation_contract;
+mod lychee;
 mod manifest;
 mod package;
 mod paths;
 mod powershell;
+mod rocm_releases;
 mod signing;
 mod tpn;
 mod verify_commits;
@@ -32,13 +40,13 @@ use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(name = "xtask", about = "rocm-cli repository tasks")]
-struct Cli {
+pub(crate) struct Cli {
     #[command(subcommand)]
     command: Command,
 }
 
 #[derive(Subcommand)]
-enum Command {
+pub(crate) enum Command {
     /// Generate a 2048-bit RSA signing keypair (PKCS#8 private + SPKI public PEM).
     Keygen {
         /// Path to write the PKCS#8 private-key PEM.
@@ -94,6 +102,30 @@ enum Command {
         #[arg(long)]
         base: Option<String>,
     },
+    /// Fail if any first-party crate has gained a normal/build dependency
+    /// edge outside the allowlist pinned in `xtask/src/crate_edges.rs`.
+    /// Dev-dependency edges are exempt (Cargo permits those to cycle).
+    CheckCrateEdges,
+    /// Regenerate the published Doctor catalog manifest from the compiled catalog.
+    Catalog {
+        /// Verify the published manifest is current without writing; exit
+        /// non-zero if it would change.
+        #[arg(long)]
+        check: bool,
+    },
+    /// Verify every workspace crate's line coverage against the per-crate
+    /// floors committed in `coverage-floors.toml`.
+    ///
+    /// Fails naming each crate that dropped below its floor, each crate with no
+    /// floor at all (so a new workspace member cannot land outside the gate),
+    /// and each floor whose crate no longer reports coverage. Requires
+    /// `cargo-llvm-cov`.
+    Coverage {
+        /// Rewrite `coverage-floors.toml` from the current measurement instead
+        /// of checking against it. Use after adding tests to ratchet a floor up.
+        #[arg(long)]
+        bless: bool,
+    },
     /// Regenerate the Cargo dependency table in MANIFEST.md from `cargo metadata`.
     Manifest {
         /// Verify the table is up to date without writing; exit non-zero if it would change.
@@ -109,6 +141,14 @@ enum Command {
         /// Skip silently when cargo-about is missing or not the pinned version, instead of
         /// failing. For the local git hook; conflicts with --check so CI's gate always runs.
         #[arg(long, conflicts_with = "check")]
+        if_available: bool,
+    },
+    /// Check that every local markdown link resolves, with lychee and the committed
+    /// `lychee.toml` (the local counterpart of the `docs-links` CI job).
+    Lychee {
+        /// Warn and pass when lychee is not installed, instead of failing. For the
+        /// local git hook; the `docs-links` CI job stays the gate.
+        #[arg(long)]
         if_available: bool,
     },
     /// Verify that commits in a range are cryptographically signed and carry a
@@ -171,6 +211,47 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Prepare the shared managed runtime the GPU E2E lanes serve against,
+    /// refreshing it when the channel index has published a newer version.
+    ///
+    /// Replaces the lanes' existence-only pre-warm guard, which never reinstalled
+    /// and so froze every GPU lane on whatever runtime was installed first. The
+    /// tree stays a cache: an install happens only when nothing is present for the
+    /// channel, an in-place side-by-side update only when the index is genuinely
+    /// ahead, and anything unclear (an unreachable index) reuses what is there.
+    /// `--version`/`--build-date` override all of that: a pin is served if already
+    /// installed, else freshly installed side-by-side — the index's latest is
+    /// never consulted while a pin is set.
+    E2ePrewarm {
+        /// TheRock package channel the shared runtime should track.
+        #[arg(long, default_value = "release")]
+        channel: String,
+        /// Recent installs to keep per channel, format, GPU family, and
+        /// toolchain choice when pruning after an install or update.
+        #[arg(long, default_value_t = 2)]
+        keep: usize,
+        /// Pre-warm root holding `config/`, `data/`, and `cache/`. Its
+        /// `data/runtimes` is what the lanes export as `E2E_SHARED_RUNTIMES_DIR`.
+        #[arg(long)]
+        prewarm_dir: PathBuf,
+        /// Pin the pre-warmed SDK to this exact TheRock package version instead
+        /// of tracking the channel's latest.
+        #[arg(long, conflicts_with_all = ["build_date", "release_label"])]
+        version: Option<String>,
+        /// Pin the pre-warmed SDK to the TheRock package built on this date.
+        #[arg(
+            long,
+            value_name = "YYYY-MM-DD",
+            conflicts_with_all = ["version", "release_label"]
+        )]
+        build_date: Option<String>,
+        /// Pin the pre-warmed SDK to one of the official release list's three
+        /// most recent versions (see `rocm_releases`), for the self-hosted
+        /// sdk_version matrix. `current` tracks the channel's latest, same as
+        /// omitting `--version`/`--build-date` entirely.
+        #[arg(long, conflicts_with_all = ["version", "build_date"])]
+        release_label: Option<rocm_releases::ReleaseLabel>,
+    },
     /// Consolidate per-platform E2E `report.json` files (one per CI job/runner)
     /// into a single cross-platform HTML report, and print a summary matrix to
     /// stdout for `$GITHUB_STEP_SUMMARY`.
@@ -219,11 +300,15 @@ fn run() -> Result<()> {
         } => signing::verify(public_key.as_deref(), &input, &signature)?,
         Command::VerifyPinnedKeys => verify_pinned_keys::run()?,
         Command::Affected { base } => affected::run(base)?,
+        Command::CheckCrateEdges => crate_edges::run()?,
+        Command::Catalog { check } => catalog::run(check)?,
+        Command::Coverage { bless } => coverage::run(bless)?,
         Command::Manifest { check } => manifest::run(check)?,
         Command::Tpn {
             check,
             if_available,
         } => tpn::run(check, if_available)?,
+        Command::Lychee { if_available } => lychee::run(if_available)?,
         Command::VerifyCommits {
             base,
             require_verified,
@@ -245,6 +330,26 @@ fn run() -> Result<()> {
             target,
         } => package::run(&dist_name, &output_dir, target.as_deref())?,
         Command::E2e { args } => e2e::run(&args)?,
+        Command::E2ePrewarm {
+            channel,
+            keep,
+            prewarm_dir,
+            version,
+            build_date,
+            release_label,
+        } => {
+            let resolved_version = match release_label {
+                Some(label) => label.pin().map(str::to_owned),
+                None => version,
+            };
+            e2e_prewarm::run(
+                &channel,
+                keep,
+                &prewarm_dir,
+                resolved_version.as_deref(),
+                build_date.as_deref(),
+            )?;
+        }
         Command::E2eReport {
             artifacts_dir,
             html_out,

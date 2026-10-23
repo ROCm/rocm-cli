@@ -1,27 +1,34 @@
 Feature: GPU detection and system inspection
 
   @id:examine-version
-  Scenario: 1 - The CLI reports its version
-    When the user asks for the version
-    Then a version string is returned
+  Scenario: examine-01 - The CLI reports its version
+    When the user asks for the version through every CLI surface
+    Then matching traceable version strings are returned
 
   @id:examine-engines-list
-  Scenario: 2 - The CLI lists all supported engines
+  Scenario: examine-02 - The CLI lists all supported engines
     When the user lists available engines
     Then all supported engines are listed
 
   # EAI-7383: keep the top-level command list alphabetized so it remains easy to
   # scan as commands are added or reordered in the source declaration.
-  @id:help-lists-subcommands-alphabetically
-  Scenario: 5 - The help output lists subcommands in alphabetical order
+  @id:examine-help-lists-subcommands-alphabetically
+  Scenario: examine-03 - The help output lists subcommands in alphabetical order
     When the user asks for help
     Then the subcommands are listed in alphabetical order
 
+  # The target assertion is a cross-check, not a tautology: the expectation comes
+  # from the KFD topology in sysfs, while `examine` reaches its answer through the
+  # CLI's own probe. Detection used to look for `gfx_target_version` as a standalone
+  # file, which no kernel exposes, and silently fell back to decoding a GC IP
+  # version -- naming an MI300X `gfx943` instead of `gfx942`. Only the GPU lane can
+  # exercise this; there is no KFD topology to read on the mock lane.
   @id:examine-detects-gpu-and-driver @requires-gpu
-  Scenario: 3 - System inspection detects the GPU and driver
+  Scenario: examine-04 - System inspection detects the GPU and driver
     Given a machine with an AMD GPU
     When the user inspects the system
     Then the inspection reports which GPU is installed
+    And the inspection names the GPU target that the kernel reports
     And the inspection reports that the driver is available
 
   # `examine` used to report a hardcoded platform constant as the default engine,
@@ -32,7 +39,7 @@ Feature: GPU detection and system inspection
   # naming either. The harness derives its answer from the GPU probe rather than
   # from `examine`, so this is a cross-check and not a tautology.
   @id:examine-reports-host-default-engine
-  Scenario: 6 - System inspection names the engine this machine serves on
+  Scenario: examine-05 - System inspection names the engine this machine serves on
     When the user inspects the system
     Then the inspection names the engine this host serves on by default
 
@@ -42,7 +49,7 @@ Feature: GPU detection and system inspection
   # hardware. Dropping `@requires-gpu` gains per-PR mock-lane coverage for the
   # reporting this scenario exists to pin.
   @id:examine-distinguishes-unmanaged-rocm
-  Scenario: 4 - System inspection distinguishes CLI-managed from pre-existing ROCm
+  Scenario: examine-06 - System inspection distinguishes CLI-managed from pre-existing ROCm
     Given a machine with a ROCm install that was not set up by the CLI
     When the user inspects the system
     Then the inspection reports the install as pre-existing
@@ -59,7 +66,7 @@ Feature: GPU detection and system inspection
   # level: tooling reads this one, and it must not drift back into being the
   # weaker of the two.
   @id:examine-machine-readable-report
-  Scenario: 7 - What the inspection tells a tool matches what it tells a person
+  Scenario: examine-07 - What the inspection tells a tool matches what it tells a person
     When the user inspects the system both for reading and for scripting
     Then the machine-readable form states everything the readable one does
 
@@ -72,7 +79,7 @@ Feature: GPU detection and system inspection
   # expectation silently resolves against the wrong host. Since fixed; this is
   # the guard that keeps it fixed.
   @id:examine-both-forms-agree-on-gpu
-  Scenario: 8 - Both forms of the inspection agree about the GPU
+  Scenario: examine-08 - Both forms of the inspection agree about the GPU
     When the user inspects the system both for reading and for scripting
     Then both reports agree on whether this machine has an AMD GPU
     And both reports agree on whether this platform is in scope
@@ -81,7 +88,7 @@ Feature: GPU detection and system inspection
   # whether it liked what it saw. Finding no GPU is a finding, not a failure.
   # This is the mock lane's to prove — it is the one lane with nothing to find.
   @id:examine-reports-without-failing
-  Scenario: 9 - Inspecting a machine reports what it finds without failing
+  Scenario: examine-09 - Inspecting a machine reports what it finds without failing
     When the user inspects the system
     Then the inspection completes successfully
     And it states a verdict for this machine
@@ -97,7 +104,7 @@ Feature: GPU detection and system inspection
   # the choice is reachable, and it cannot answer that where no choice is acted
   # on at all.
   @id:examine-can-skip-framework-probing @requires-bare-metal
-  Scenario: 10 - The user can leave the frameworks out of the inspection
+  Scenario: examine-10 - The user can leave the frameworks out of the inspection
     When the user inspects the system without probing frameworks
     Then the inspection reports that it skipped the frameworks
     And it still states a verdict for this machine
@@ -106,8 +113,318 @@ Feature: GPU detection and system inspection
   # so `@requires-os:linux` cannot express "only where the host really is WSL".
   # Runs only on the WSL lane; everywhere else the premise does not exist.
   @id:examine-detects-wsl @requires-wsl
-  Scenario: 11 - System inspection recognizes a WSL host
+  Scenario: examine-11 - System inspection recognizes a WSL host
     Given the CLI is running in WSL
     When the user inspects the system
     Then the inspection reports Linux as the operating system
     And the inspection reports that the host is WSL
+
+  # The dry-run plan used to print the raw `${ROCM_CLI_AMDGPU_VERSION:-...}` shell
+  # placeholder on its `repo_version:` line instead of the effective version, so
+  # the preview a user reviews before approving disagreed with what the install
+  # would actually pull. The plan is rendered on every Linux host regardless of
+  # GPU (the driver is not yet installed when you preview it), so the mock lane
+  # pins this without hardware.
+  @id:examine-install-driver-dry-run-resolves-repo-version @requires-os:linux
+  Scenario: examine-12 - The driver install dry-run shows the effective repo version
+    When the user previews the driver install plan
+    Then the plan's repo version is a concrete version, not a shell placeholder
+
+  # `rocm engines list` prefixes the engine this machine serves on with `*`,
+  # with nothing else on the page explaining what it means. This asserts the
+  # printed legend actually names the glyph, and that the marked engine
+  # matches the host's independently-derived default, so the rendered marker
+  # and its explanation can't drift apart silently.
+  @id:examine-engines-list-shows-default-engine-legend
+  Scenario: examine-13 - Listing engines explains the default-engine marker
+    When the user lists available engines
+    Then the engine listing explains the default-engine marker
+    And the host's default engine is marked in the listing
+
+  # `rocm examine`'s own engine_inventory block prefixes the effective default
+  # engine with the same `*` marker, via a renderer separate from `engines
+  # list`'s (see `append_examine_engine_inventory` vs
+  # `render_engine_inventory_text_with_paths` in apps/rocm/src/main.rs) — the
+  # two used to be able to drift apart. examine-13 only ever drove `engines
+  # list`, leaving this second renderer's legend unexercised end-to-end.
+  @id:examine-shows-default-engine-legend
+  Scenario: examine-14 - Inspecting the system explains the default-engine marker
+    When the user inspects the system
+    Then the inspection explains the default-engine marker
+    And the host's default engine is marked in the inspection's engine inventory
+
+  # In the managed configuration torch is installed only inside the active
+  # runtime, so a probe that resolves its interpreter from `PATH` reports
+  # `framework: unknown` for a machine that has a working one — and the
+  # machine-readable form is the only surface that reports a framework at all,
+  # so there is nothing to cross-check it against.
+  #
+  # `Given a managed runtime is active` is what lets this scenario fail. Without
+  # it the world's `<data>/runtimes` stays isolated and empty by design (see
+  # `E2eWorld::default`), no interpreter resolves, and any assertion would land
+  # on the `PATH` fallback — holding whether the fix is present or reverted.
+  # That precondition is also why this is `@requires-gpu`: the step installs the
+  # SDK, so only a GPU lane exercises it.
+  #
+  # `framework_source` is what check_8 reads to decide whether comparing this
+  # torch against the *system* ROCm means anything, so it is the field worth
+  # pinning rather than the versions themselves.
+  @id:examine-framework-names-the-interpreter-that-answered @requires-gpu
+  Scenario: examine-15 - The framework report describes the runtime the engines will use
+    Given a managed runtime is active
+    When the user inspects the system both for reading and for scripting
+    Then the framework report names the runtime's interpreter
+  # EAI-8950. The text form repairs a lost registry entry from the install tree
+  # before rendering (`recover_setup_runtime_registration`), so it names the
+  # folder; `--json` skips that call because it writes, and used to answer
+  # `active_runtime_root: null` with no folder anywhere in the document. The
+  # folder is reachable from config without the registry and without writing,
+  # which is what these fields carry.
+  #
+  # The order of the two runs is load-bearing: the `Given` plants an install
+  # tree the text form CAN repair from, so running it first would hand `--json`
+  # an `active_runtime_root` it is supposed to have no way to resolve. The
+  # machine-readable form goes FIRST, while the registry is still empty; the
+  # text form follows so the two answers can be held against each other.
+  #
+  # No GPU needed: config and install tree are planted, and the isolated
+  # registry is empty by design (see `E2eWorld::default`) — which is precisely
+  # the missing-entry state under test.
+  @id:examine-json-names-the-setup-runtime-folder
+  Scenario: examine-16 - The scripting form names the setup runtime folder unaided
+    Given setup names a runtime folder the registry has forgotten
+    When the user inspects the system for scripting before reading
+    Then the machine-readable form names the setup runtime folder
+    And it does not pass that folder off as the active runtime's
+
+  # EAI-8449: Instinct parts enumerate under PCI class 1200 ("Processing
+  # accelerators") rather than a display class, so the lspci probe skipped them
+  # and the machine-readable form fell back to a single topology-sourced entry
+  # carrying no PCI address -- one row for an eight-GPU MI300X host. Neither
+  # examine-04 nor examine-08 noticed, because both assert `detected_gfx_target`
+  # and `has_amd_gpu`, which that fallback still satisfied. So this reads
+  # `gpus[]` itself, cross-checked against the kernel's own GPU node count
+  # rather than against a fixed number, which keeps it host-agnostic.
+  #
+  # It also reads `gpus[].gfx_target`, which is the observable end of the second
+  # half of that fix: `lspci` resolves a target from the marketing name, and on
+  # an Instinct host `pci.ids` frequently spells that "Device 74a1", so without
+  # `rocminfo` the per-node target the kernel reports is the only thing that can
+  # fill the field.
+  #
+  # The step no-ops where a premise does not hold -- no readable KFD topology,
+  # no `lspci` to supply PCI addresses, or a topology whose nodes disagree on a
+  # target -- because on such a host the answer it would otherwise flag is the
+  # correct one.
+  @id:examine-lists-every-gpu-with-its-address-and-target @requires-gpu
+  Scenario: examine-17 - The machine-readable report lists every GPU the kernel sees
+    Given a machine with an AMD GPU
+    When the user inspects the system both for reading and for scripting
+    Then it lists one AMD GPU per kernel GPU node, each with its PCI address and gfx target
+
+  # HIP compiles device code at run time through a library a machine can hold
+  # more than one copy of — a system ROCm install and a ROCm Python wheel each
+  # ship one, and this CLI installs the second itself. When the copy that loads
+  # is not the one the active runtime needs, compilation fails with an error
+  # naming neither the library nor the second copy. Nothing looked past the
+  # first match before, so the second copy could not be seen at all.
+  #
+  # No GPU needed: the suite cannot install a second ROCm stack, so it cannot
+  # prove the two-copy case. What every lane can prove is that the inspection
+  # answers the question at all rather than staying silent, and that finding
+  # none is reported as a finding rather than a failure — which is the case
+  # the mock lane actually has. The two-copy behaviour is proven by unit tests
+  # that build the directory layout directly.
+  #
+  # `@requires-os:linux` because `probe_comgr` only runs for `os_family`
+  # "linux" or "wsl" (see `examine.rs`); on native Windows it is never called,
+  # so `comgr_paths: []` and `comgr_selected: null` would hold by nothing more
+  # than `Examination`'s own defaults, and the assertions below would pass
+  # whether the probe ran and found nothing or never ran at all. WSL reports
+  # `os_family` "linux" (see `expectation.rs`), so this still runs there.
+  @id:examine-reports-code-object-manager-copies @requires-os:linux
+  Scenario: examine-18 - The inspection says which code object manager libraries the machine holds
+    When the user inspects the system in machine-readable form
+    Then the inspection lists the code object manager libraries it found
+    And it names which of them would load, or says it found none
+    And it lists the HIP runtime libraries the machine holds the same way
+    And it names which HIP runtime copy would load, or says it found none
+
+  # The copy this CLI installs itself, which is the case the whole entry exists
+  # for: the install path puts ROCm wheels into a managed environment, so a user
+  # on a host that already carries system ROCm ends up holding both copies
+  # having done nothing unusual.
+  #
+  # `@requires-gpu` because the precondition installs the SDK, and only a GPU
+  # lane does that. This is the half the unit tests cannot reach: they build the
+  # directory layout by hand, so they prove the search understands a layout we
+  # described, not that it matches the one the installer actually produces. A
+  # real managed runtime is the only thing that distinguishes those.
+  #
+  # `@requires-os:linux` because `probe_comgr` only ever looks for `libamd_comgr`
+  # and `libamdhip64` -- ELF shared-object names, found via `LD_LIBRARY_PATH`,
+  # the loader cache, or an install root's `lib/` tree. None of that exists on
+  # native Windows, which ships `.dll`s under other names, so the assertion
+  # that a managed runtime's library must be found does not hold there. WSL
+  # reports `os_family` "linux" (see `expectation.rs`), so this still runs on
+  # the WSL lane, where the managed runtime really does carry a `.so`. This
+  # matches `check_18_comgr_conflict`'s own `&["linux", "wsl"]` gate in
+  # diagnose.rs -- the same boundary, stated once there and once here.
+  @id:examine-finds-the-managed-runtimes-own-compilation-library @requires-gpu @requires-os:linux
+  Scenario: examine-19 - The inspection finds the compilation library the CLI installed itself
+    Given a managed runtime is active
+    When the user inspects the system in machine-readable form
+    Then the inspection attributes a code object manager library to that runtime
+
+  # The distro fields are read from `/etc/os-release` as `sh` reads it (see
+  # `rocm_core::os_release`). These plant the file under a simulated host root
+  # (`ROCM_CLI_TEST_HOST_ROOT`, honoured only by the `e2e-test-hooks` build that
+  # `cargo xtask e2e` and every prebuilt full-suite lane use), so they describe a
+  # machine other than the runner. The driver plan cannot be exercised this way:
+  # `rocm install driver` builds a plan that runs against the real machine, so it
+  # deliberately reads the real `/etc/os-release` (see `real_os_release`); its
+  # parsing is covered by the unit tests in `driver_install.rs`.
+  #
+  # The planted distributions are ones no CI runner or developer host here runs,
+  # so a probe that read the real file instead would report a different one.
+  #
+  # `@requires-os:linux` because only the Linux probe reads `/etc/os-release`.
+  # On WSL the planted root holds no WSL signals, so the inspection reads the
+  # planted file the same way there.
+  @id:examine-reads-single-quoted-os-release @requires-os:linux
+  Scenario: examine-20 - The inspection names a distribution whose release file uses single quotes
+    Given a machine whose release file quotes every value in single quotes
+    When the user inspects that machine in machine-readable form
+    Then the inspection reports the distribution "rhel" version "9.4" named "Red Hat Enterprise Linux 9.4 (Plow)"
+    And the inspection reports no trouble reading the release file
+
+  @id:examine-reads-last-os-release-assignment @requires-os:linux
+  Scenario: examine-21 - The inspection names the distribution a repeated release-file entry ends on
+    Given a machine whose release file names one distribution and then another
+    When the user inspects that machine in machine-readable form
+    Then the inspection reports the distribution "rocky" version "9.5" named "Rocky Linux 9.5 (Blue Onyx)"
+    And the inspection reports no trouble reading the release file
+
+  @id:examine-reports-unreadable-os-release @requires-os:linux
+  Scenario: examine-22 - The inspection says which line of an unreadable release file it could not read
+    Given a machine whose release file runs a command on line 3
+    When the user inspects that machine in machine-readable form
+    Then the inspection reports no distribution
+    And the inspection says line 3 of the release file is not a plain assignment, in its failures and in the distribution name
+
+  # The verdict needs a GPU to degrade from: without one it is `no-amd-gpu`
+  # whatever the release file says. The planted root supplies one through the
+  # kernel topology (a KFD node, which the topology probe reads under the
+  # simulated root), and a stand-in `lspci` on PATH reports an empty PCI bus so a
+  # runner without `lspci` does not add a failure of its own. A real GPU's
+  # `lspci` entry would not match the planted node's address either way. So this
+  # runs on every Linux lane, GPU or not, and the release file is the only thing
+  # that can degrade the verdict.
+  @id:examine-degrades-on-unreadable-os-release @requires-os:linux
+  Scenario: examine-23 - An unreadable release file degrades the verdict on a machine with a GPU
+    Given a GPU machine whose release file runs a command on line 3
+    When the user inspects that machine in machine-readable form
+    Then the inspection's verdict is degraded, and its only failure is line 3 of the release file
+
+  # ROCMAI-448. `rocmd` captured child output by waiting for the child to exit
+  # and only then draining its pipes, so a child that wrote more than one OS
+  # pipe buffer (~64KiB) blocked in `write`, never exited, and was killed at the
+  # timeout. The probe runs under a 2s budget, so on a multi-GPU host -- where
+  # `amd-smi static -a -g all --json` comfortably clears that buffer -- GPU
+  # telemetry reported `amd_smi_available: false`, permanently, with a note
+  # reading `failed to launch amd-smi static -a -g all --json`. The note blamed
+  # the launch rather than the timeout that actually happened, because
+  # `gather_gpu_snapshot` rendered only the outermost context; it now uses
+  # `{error:#}` and carries the cause. That answer feeds `rocmd
+  # bridge-snapshot`, the `gpu_snapshot` and `bridge_snapshot` MCP tools, and
+  # the automation watcher. (Not `examine_snapshot`: that sandbox tool returns
+  # an `ExamineSummary` only and never reads this snapshot.)
+  #
+  # The size of the output is the whole premise, so the stub emits ~203KiB --
+  # over three buffers. A stub that printed a few hundred bytes would pass
+  # against the defect and test nothing.
+  #
+  # No GPU needed, and deliberately so: the symptom needs a multi-GPU host to
+  # occur naturally, which would strand this on a lane that does not run per-PR.
+  # A stub `amd-smi` on `PATH` reaches the same code, but only because the step
+  # also points `HOME` at the isolated root. `resolve_amd_smi_binary` tries
+  # `default_data_dir()/runtimes/registry` and then the home fallbacks, and both
+  # resolve through `runtime_home_dir()` -- the real `$HOME`. `isolate_env` does
+  # set `ROCM_CLI_DATA_DIR`, but that does not redirect any of this:
+  # `default_data_dir()` never reads that variable. Without the overridden
+  # `HOME`, a host with a managed SDK under `~/.rocm` would run the real
+  # `amd-smi` and this scenario would fail for an unrelated reason.
+  # Linux-only because the stub is a shell script.
+  @id:examine-telemetry-survives-large-amd-smi-output @requires-os:linux
+  Scenario: examine-24 - GPU telemetry survives an amd-smi that outruns the pipe buffer
+    Given amd-smi reports more output than a pipe buffer holds
+    When the daemon gathers a bridge snapshot
+    Then the snapshot reports amd-smi as available and carries every GPU it described
+
+  # The other side of examine-24's note, and the reason the note needs a size
+  # limit. When the probe really does time out, `{error:#}` renders the whole
+  # chain -- including `run_with_timeout`'s quote of what the child printed.
+  # With an amd-smi that prints a snapshot's worth of JSON and only then
+  # stalls, that quote is the entire payload, and the note is not a terminal
+  # message: `record_gpu_metrics` copies it into the automation-event and audit
+  # JSONL files every 60s, and both append helpers rewrite the whole file each
+  # time. Unbounded, the logs grew by the payload's size every minute and each
+  # write cost more than the last. So the note must name the timeout, keep
+  # enough of the child's output to be worth reading, say that it was shortened
+  # -- and stay small.
+  #
+  # Asserted here rather than only as a unit test because the note's journey is
+  # the point: the bound lives in `rocm-core`'s `run_with_timeout` and the
+  # claim being made is about what `rocmd` finally reports.
+  #
+  # Same stub mechanics and the same `HOME` caveat as examine-24 above.
+  @id:examine-telemetry-note-is-bounded-when-amd-smi-stalls @requires-os:linux
+  Scenario: examine-25 - A stalled amd-smi leaves a bounded note that names the timeout
+    Given amd-smi prints more than a pipe buffer holds and then stalls
+    When the daemon gathers a bridge snapshot
+    Then the snapshot reports amd-smi as unavailable with a bounded note naming the timeout
+
+  # The snapshot asks amd-smi twice -- `static`, then `monitor` -- and reports
+  # the first failure it meets. examine-25 covers a `static` that stalls, which
+  # returns before `monitor` is ever run; this is the other branch, and it is
+  # the one a real multi-GPU host hits more often, because `monitor -g all`
+  # carries per-GPU telemetry for every device.
+  #
+  # The result is a half-degraded snapshot rather than an absent one: amd-smi
+  # answered, so it is available and its `static` data stands; only the second
+  # probe is missing, and the note is the sole record of why. That note goes to
+  # the same automation and audit logs on the same 60s cycle, so it needs the
+  # same bound and the same account of the cause -- naming the launch alone
+  # would send a reader looking for a missing binary.
+  #
+  # Same stub mechanics and the same `HOME` caveat as examine-24 above, except
+  # that the stub answers the two probes differently.
+  @id:examine-telemetry-note-names-the-stalled-monitor-probe @requires-os:linux
+  Scenario: examine-26 - A stalled monitor probe keeps the static data and explains itself
+    Given amd-smi answers the first probe and then stalls on the second
+    When the daemon gathers a bridge snapshot
+    Then the snapshot keeps the first probe's GPUs and explains the second with a bounded note naming the timeout
+
+  # `os-release(5)` says to read `/etc/os-release` and, if it does not exist,
+  # fall back to `/usr/lib/os-release`. This plants a simulated host root with
+  # only the fallback path populated, so a reader that stopped after the first
+  # candidate would see no file at all and report an unknown distribution.
+  @id:examine-falls-back-to-usr-lib-os-release @requires-os:linux
+  Scenario: examine-27 - The inspection falls back to /usr/lib/os-release when /etc/os-release is absent
+    Given a machine whose release file exists only at /usr/lib/os-release
+    When the user inspects that machine in machine-readable form
+    Then the inspection reports the distribution "ubuntu" version "24.04" named "Ubuntu 24.04 LTS"
+    And the inspection reports no trouble reading the release file
+
+  # Before this change, a release file that exists but cannot be read (not
+  # absent, so no fallback candidate is tried either) silently produced an
+  # empty, unreported distro with no failure recorded. It now reports the
+  # file as itself, distinctly from both an unknown distribution and a
+  # malformed line it never reached. A directory in place of the file is a
+  # non-`NotFound` read error that needs no root privilege, unlike a
+  # mode-000 file, which CI running as root would read anyway.
+  @id:examine-degrades-on-unreadable-release-file @requires-os:linux
+  Scenario: examine-28 - An unreadable release file degrades the verdict on a machine with a GPU
+    Given a GPU machine whose release file cannot be read
+    When the user inspects that machine in machine-readable form
+    Then the inspection's verdict is degraded, and its only failure says the release file could not be read

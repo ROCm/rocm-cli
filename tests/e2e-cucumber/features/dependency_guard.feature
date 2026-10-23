@@ -18,7 +18,7 @@ Feature: System dependency installs preserve ROCm
   # assert; move this behind a package-manager capability gate if such a lane
   # is ever added.
   @id:deps-guard-refuses-rocm-removal @requires-os:linux
-  Scenario: 1 - Installing a dependency never silently removes ROCm
+  Scenario: deps-guard-01 - Installing a dependency never silently removes ROCm
     Given a machine with a registered ROCm runtime
     And installing OpenMPI would remove the ROCm packages
     When the user installs the vLLM engine and approves system changes

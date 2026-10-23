@@ -207,7 +207,7 @@ pub fn terminate_verified(
     // For a tree this binds each descendant PID to its own start-time, so a PID
     // recycled during the wait is never mistaken for a survivor.
     let members: Vec<ProcessIdentity> = if tree {
-        crate::process_tree_pids(id.pid)
+        crate::process::process_tree_pids(id.pid)
             .into_iter()
             .map(ProcessIdentity::capture)
             .collect()
@@ -289,7 +289,7 @@ fn send_signal(pid: u32, signal: Signal, tree: bool) -> bool {
         Signal::Term => libc::SIGTERM,
         Signal::Kill => libc::SIGKILL,
     };
-    crate::signal_process_scope(pid, raw, tree)
+    crate::process::signal_process_scope(pid, raw, tree)
 }
 
 #[cfg(windows)]
@@ -311,6 +311,10 @@ pub fn process_start_ticks(pid: u32) -> Option<u64> {
 
 #[cfg(not(target_os = "linux"))]
 #[must_use]
+// Platform stub. The `cfg` sibling calls non-const code, so making only this
+// arm `const` would give the two platforms different signatures and push
+// `missing_const_for_fn` onto every caller in turn.
+#[allow(clippy::missing_const_for_fn)]
 pub fn process_start_ticks(_pid: u32) -> Option<u64> {
     None
 }
@@ -332,6 +336,10 @@ fn process_has_exited(pid: u32) -> bool {
 }
 
 #[cfg(not(target_os = "linux"))]
+// Platform stub. The `cfg` sibling calls non-const code, so making only this
+// arm `const` would give the two platforms different signatures and push
+// `missing_const_for_fn` onto every caller in turn.
+#[allow(clippy::missing_const_for_fn)]
 fn process_has_exited(_pid: u32) -> bool {
     false
 }
