@@ -927,24 +927,12 @@ impl std::fmt::Display for InstallHint {
     }
 }
 
-/// The hint for os-release `text`, naming `/etc/os-release` in any
+/// The hint for os-release `text` read from `path`, naming that path in any
 /// unreadable-line message: the commands [`plan_for_os_release_at`] plans
 /// with `build` when it plans any, otherwise `manual` — followed, for an
 /// unreadable file, by the line that made it so and what to change on it.
 ///
-/// Delegates to [`install_hint_for_at`]; only the cross-platform unit tests,
-/// which fixture bare `text`, use this one — every production call site
-/// knows the real path it read and calls [`install_hint_for_at`] or
-/// [`install_hint_for_read`] directly.
-#[cfg(test)]
-fn install_hint_for(text: &str, build: InstallPlanBuilder, manual: &str) -> InstallHint {
-    install_hint_for_at("/etc/os-release", text, build, manual)
-}
-
-/// [`install_hint_for`], naming `path` instead of always `/etc/os-release` in
-/// an unreadable-line message.
-///
-/// Off Linux this has no non-test caller either — [`install_hint_for_read`],
+/// Off Linux this has no non-test caller — [`install_hint_for_read`],
 /// its only production caller, is itself dead there for the same reason.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn install_hint_for_at(
@@ -1320,7 +1308,11 @@ mod tests {
                 );
                 // And the hint names exactly the commands the plan would run.
                 assert_eq!(
-                    install_hint_for(text, build, "manual"),
+                    install_hint_for_read(
+                        &crate::hardware_root::OsRelease::found(text),
+                        build,
+                        "manual"
+                    ),
                     InstallHint {
                         text: format!("install it with `{}`", joined_commands(expected)),
                         plan_installs: true,
@@ -1329,7 +1321,11 @@ mod tests {
                 );
             }
             assert_eq!(
-                install_hint_for("ID=plan9\n", build, "manual"),
+                install_hint_for_read(
+                    &crate::hardware_root::OsRelease::found("ID=plan9\n"),
+                    build,
+                    "manual"
+                ),
                 InstallHint {
                     text: "manual".to_owned(),
                     plan_installs: false,
@@ -1347,8 +1343,8 @@ mod tests {
             format!("install it with `sudo apt-get update && sudo apt-get install -y {packages}`")
         };
         assert_eq!(
-            install_hint_for(
-                "ID=ubuntu\n",
+            install_hint_for_read(
+                &crate::hardware_root::OsRelease::found("ID=ubuntu\n"),
                 build_openmpi_install_plan,
                 OPENMPI_MANUAL_HINT
             )
@@ -1356,8 +1352,8 @@ mod tests {
             apt("openmpi-bin libopenmpi-dev")
         );
         assert_eq!(
-            install_hint_for(
-                "ID=ubuntu\n",
+            install_hint_for_read(
+                &crate::hardware_root::OsRelease::found("ID=ubuntu\n"),
                 build_libatomic_install_plan,
                 LIBATOMIC_MANUAL_HINT
             )
@@ -1365,8 +1361,8 @@ mod tests {
             apt("libatomic1")
         );
         assert_eq!(
-            install_hint_for(
-                "ID=ubuntu\n",
+            install_hint_for_read(
+                &crate::hardware_root::OsRelease::found("ID=ubuntu\n"),
                 build_libnuma_install_plan,
                 LIBNUMA_MANUAL_HINT
             )
@@ -1375,8 +1371,8 @@ mod tests {
         );
         // And each one's own manual advice for a distribution it cannot map.
         assert_eq!(
-            install_hint_for(
-                "ID=plan9\n",
+            install_hint_for_read(
+                &crate::hardware_root::OsRelease::found("ID=plan9\n"),
                 build_openmpi_install_plan,
                 OPENMPI_MANUAL_HINT
             )
@@ -1385,8 +1381,8 @@ mod tests {
              (providing libmpi.so / libmpi_cxx.so and mpirun)"
         );
         assert_eq!(
-            install_hint_for(
-                "ID=plan9\n",
+            install_hint_for_read(
+                &crate::hardware_root::OsRelease::found("ID=plan9\n"),
                 build_libatomic_install_plan,
                 LIBATOMIC_MANUAL_HINT
             )
@@ -1394,8 +1390,8 @@ mod tests {
             "install your distribution's libatomic runtime package (providing libatomic.so.1)"
         );
         assert_eq!(
-            install_hint_for(
-                "ID=plan9\n",
+            install_hint_for_read(
+                &crate::hardware_root::OsRelease::found("ID=plan9\n"),
                 build_libnuma_install_plan,
                 LIBNUMA_MANUAL_HINT
             )
@@ -1406,7 +1402,7 @@ mod tests {
 
     /// [`install_hint_for_read`] and [`plan_for_os_release_read`] report a
     /// file that exists but could not be read as itself, not as an unknown
-    /// distribution — the gap `install_hint_for`/`plan_for_os_release_at`
+    /// distribution — the gap `install_hint_for_at`/`plan_for_os_release_at`
     /// alone cannot close, since by the time they see `text` the distinction
     /// between "absent" and "unreadable" is already lost.
     #[test]
@@ -1490,7 +1486,8 @@ mod tests {
                 "{label}: {}",
                 plan.reason
             );
-            let hint = install_hint_for(text, build, manual);
+            let hint =
+                install_hint_for_read(&crate::hardware_root::OsRelease::found(text), build, manual);
             assert_eq!(
                 hint,
                 InstallHint {
@@ -1564,7 +1561,11 @@ mod tests {
             ] {
                 let plan =
                     plan_for_os_release_read(&crate::hardware_root::OsRelease::found(text), build);
-                let hint = install_hint_for(text, build, manual);
+                let hint = install_hint_for_read(
+                    &crate::hardware_root::OsRelease::found(text),
+                    build,
+                    manual,
+                );
                 let offered = hint.or("rerun with --yes");
                 let installs = plan.supported && !plan.commands.is_empty();
                 assert_eq!(
@@ -1576,7 +1577,11 @@ mod tests {
             }
         }
         // The unreadable cases say what to change on the line.
-        let crlf = install_hint_for("ID=ubuntu\r\n", build_openmpi_install_plan, "manual");
+        let crlf = install_hint_for_read(
+            &crate::hardware_root::OsRelease::found("ID=ubuntu\r\n"),
+            build_openmpi_install_plan,
+            "manual",
+        );
         assert!(
             crlf.text.ends_with(
                 "to fix it, save the file with LF line endings and no control characters"
@@ -1584,7 +1589,11 @@ mod tests {
             "{}",
             crlf.text
         );
-        let unquoted = install_hint_for("NAME=a b\n", build_openmpi_install_plan, "manual");
+        let unquoted = install_hint_for_read(
+            &crate::hardware_root::OsRelease::found("NAME=a b\n"),
+            build_openmpi_install_plan,
+            "manual",
+        );
         assert!(
             unquoted
                 .text

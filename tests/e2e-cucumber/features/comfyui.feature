@@ -10,9 +10,8 @@ Feature: ComfyUI install reports progress and makes failures actionable
   #
   # The runtime, its rocm_sdk probe, the Python interpreter and `uv` itself are
   # all planted so the scenario is hermetic: no GPU, no network, no real
-  # package resolution. Linux-only because the planted shims are POSIX shell
-  # scripts.
-  @id:comfyui-uv-install-failure-names-log @requires-os:linux
+  # package resolution.
+  @id:comfyui-uv-install-failure-names-log
   Scenario: comfyui-01 - A failed dependency install names the log it wrote
     Given a ready ROCm runtime with a ComfyUI checkout pending dependencies
     And the ComfyUI dependency install with uv fails
@@ -32,7 +31,7 @@ Feature: ComfyUI install reports progress and makes failures actionable
   # both `install` and `status` output -- a user-observable line that AGENTS.md
   # requires a Gherkin scenario for, not just the unit tests that assert each
   # command's `folder:` line in isolation.
-  @id:comfyui-uv-install-progress-streamed @requires-os:linux
+  @id:comfyui-uv-install-progress-streamed
   Scenario: comfyui-02 - A dependency install streams progress output
     Given a ready ROCm runtime with a ComfyUI checkout pending dependencies
     And the ComfyUI dependency install with uv prints progress and succeeds
@@ -60,9 +59,8 @@ Feature: ComfyUI install reports progress and makes failures actionable
   #
   # No GPU is needed: runtime readiness is filesystem + manifest state, so the
   # scenario plants two ready wheel runtimes and asserts the refusal names every
-  # remediation and lists both keys. Linux-only because the planted rocm_sdk stub
-  # uses `.so` library names; the selection logic it exercises is platform-agnostic.
-  @id:comfyui-ambiguous-runtime-actionable @requires-os:linux
+  # remediation and lists both keys.
+  @id:comfyui-ambiguous-runtime-actionable
   Scenario: comfyui-03 - ComfyUI install refuses an ambiguous runtime choice and names every remediation
     Given two ready ROCm runtimes and no active default
     When the user installs ComfyUI without choosing a runtime
@@ -89,6 +87,11 @@ Feature: ComfyUI install reports progress and makes failures actionable
   # label-truncation fix in `cli_progress::assemble_status_line` — the
   # tarball scenario in `download_progress_pty.feature` is the regression
   # test for that.
+  # Linux-only: this scenario drives `rocm` under a real PTY, the same
+  # suite-wide limitation `dash.feature`'s header comment documents
+  # (portable-pty compiles on Windows via ConPTY, but that path isn't yet
+  # promoted to a blocking contract) — unrelated to this file's other
+  # scenarios, whose own Linux gate is explained below.
   @id:comfyui-source-download-shows-live-progress @requires-os:linux @serial
   Scenario: comfyui-04 - The source-archive download spinner renders progress and clears on completion
     Given a paced ComfyUI source archive fixture
@@ -109,8 +112,17 @@ Feature: ComfyUI install reports progress and makes failures actionable
   # started during the download), an interrupted reinstall, a user's entry set
   # aside, a failure after the new code is in place, and a download that is
   # not a ComfyUI release. Each asserts what the CLI prints together with what
-  # is actually on disk afterwards. Linux-only because the planted runtime
-  # uses `.so` names and a POSIX-shell Python stand-in.
+  # is actually on disk afterwards. Only three of these still need the POSIX
+  # shell: comfyui-11's GPU-check failing transition plants a `#!/bin/sh`
+  # script (its passing-again half uses the Windows-portable `fake-python`
+  # stand-in, like every other scenario here), and comfyui-08/comfyui-12 each
+  # start their stand-in running ComfyUI process through `sh -c` (see
+  # `spawn_stand_in`). comfyui-05/-06/-07/-09/-10/-13 plant the same
+  # Windows-portable `fake-python` stand-in `comfyui-01`/`-02`/`-03` use and
+  # have no shell dependency of their own, but stay `@requires-os:linux` too:
+  # their reinstall behavior has not been run on Windows yet. Ungating them
+  # is tracked separately (#697), to keep this fix scoped to #629's
+  # comfyui-01/02/03 ask.
   #
   # rocm-cli's saved record of a ComfyUI it started is unreadable here. `stop`
   # cannot read it either, so it must not block the reinstall; the reinstall

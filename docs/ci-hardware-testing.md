@@ -18,8 +18,9 @@ separate from the main `ci.yml`. The split is deliberate: a job queued on an
 newer run's merge-required (GitHub-hosted) checks would sit pending forever
 (observed on PR #138). Giving the self-hosted lanes their own workflow — and
 thus their own concurrency group — means an offline runner can only ever stall
-that workflow's own supersession, never `ci.yml`'s required checks. See
-`EAI-7548`. [`workflow_contract.rs`](../xtask/src/workflow_contract.rs)'s
+that workflow's own supersession, never `ci.yml`'s required checks (only
+pull-request runs are superseded there). See `EAI-7548`.
+[`workflow_contract.rs`](../xtask/src/workflow_contract.rs)'s
 `self_hosted_workflow_owns_the_gpu_lanes` test checks that `e2e-gpu`,
 `e2e-gpu-strix-ubuntu`, and `e2e-gpu-strix-windows` still appear as job keys in
 `e2e-selfhosted.yml`, while its sibling `ci_yml_schedules_no_self_hosted_job`
@@ -45,15 +46,10 @@ rung instead of being removed outright.
 
 The release-candidate rung's `release/**` trigger merged in PR #415, so
 `e2e-selfhosted.yml` on `main` already triggers on `push: branches: [main,
-"release/**"]`. `cargo xtask e2e-prewarm` has no `--version`/`--build-date`
-pin today — every lane, including this one, tracks whatever build the channel
-index currently serves (see the pre-warm section below for the exact,
-unpinned invocation). Pinning it to hold at `n-1`/`n-2` instead of
-always-latest, and wiring an actual `sdk_version: [current, n-1, n-2]` matrix
-axis into the release-branch trigger, is pending work (ROCMAI-430): nothing
-in this repo today maps "n-1"/"n-2" to a concrete SDK version
-([`therock.rs`](../apps/rocm/src/therock.rs)'s `parse_simple_index_versions`
-is private).
+"release/**"]`. On that trigger, every self-hosted GPU job additionally pins
+`cargo xtask e2e-prewarm --release-label` to hold at `n-1`/`n-2` instead of
+always tracking the channel's latest build (ROCMAI-430; see "Triggers"
+below for the full `sdk_version: [current, n-1, n-2]` matrix mechanism).
 
 ## Platforms
 
@@ -93,20 +89,21 @@ against the slow DrvFs mount. The distro is deliberately left without ROCm's
 WSL driver bridge — see "What the WSL distro needs" below.
 
 This migration is scoped to the per-PR lanes in this table, plus the nightly
-WSL lane below — not every nightly lane. `nightly.yml`'s Ubuntu and Windows
-Strix lanes (`e2e-gpu-nightly-strix`, `e2e-gpu-nightly-strix-windows`) still
-pin the `native` label and run on the same static, always-on host these per-PR
-lanes moved off of — that label still means what it always did there:
-`native` disambiguates this host from any runner that might carry a bare
-`wsl` label alongside `strix-halo` (the static WSL runner this repo used
-before the WSL lanes below moved to the ephemeral pool). Whether that runner
-remains registered is not something this migration changes either way, since
-nothing here targets a `wsl`-labeled runner anymore. `nightly.yml`'s
-`e2e-wsl-nightly`, however, already moved onto the same DevLab Dispatch pool
-as the per-PR `e2e-wsl` lane above, for the same reason: WSL2 needs no
-dedicated `wsl`-labeled runner, so there is nothing pool-incompatible about
-it. Moving the two `native` nightly lanes onto the pool as well is a
-separate, not-yet-made decision.
+WSL and Windows Strix lanes below — not every nightly lane. `nightly.yml`'s
+Ubuntu Strix lane (`e2e-gpu-nightly-strix`) still pins the `native` label and
+runs on the same static, always-on host these per-PR lanes moved off of —
+that label still means what it always did there: `native` disambiguates this
+host from any runner that might carry a bare `wsl` label alongside
+`strix-halo` (the static WSL runner this repo used before the WSL lanes below
+moved to the ephemeral pool). Whether that runner remains registered is not
+something this migration changes either way, since nothing here targets a
+`wsl`-labeled runner anymore. `nightly.yml`'s `e2e-wsl-nightly` and
+`e2e-gpu-nightly-strix-windows`, however, both moved onto the same DevLab
+Dispatch pool as the per-PR `e2e-wsl`/`e2e-gpu-strix-windows` lanes above, for
+the same reason: neither needs a dedicated `native`- or `wsl`-labeled runner,
+so there is nothing pool-incompatible about either. Moving the remaining
+`native` Ubuntu nightly lane onto the pool as well is a separate, not-yet-made
+decision.
 
 Every label in a `runs-on` must narrow the pool to one kind of hardware. In
 particular the MI300X lane pins `mi300x` rather than `amd-gpu`: `amd-gpu` is
@@ -199,12 +196,21 @@ setup: enable the wiki and save its first page in the GitHub web UI, because
 GitHub does not create the wiki's git repository until then and the job fails
 with that explanation until it exists.
 
-The lane artifacts are named canonically (`e2e-report`, `e2e-gpu-report`,
-`e2e-gpu-rad3-report`, `e2e-gpu-mi350p-report`, `e2e-gpu-w7900-report`,
-`e2e-gpu-strix-ubuntu-report`, `e2e-gpu-strix-windows-report`,
-`e2e-gpu-strix-wsl-report`) in `ci.yml` and
+The lane artifacts are named canonically (`e2e-gpu-mi350p-report`,
+`e2e-gpu-n-1-report`, `e2e-gpu-n-2-report`, `e2e-gpu-rad3-report`,
+`e2e-gpu-report`, `e2e-gpu-strix-ubuntu-n-1-report`,
+`e2e-gpu-strix-ubuntu-n-2-report`, `e2e-gpu-strix-ubuntu-report`,
+`e2e-gpu-strix-windows-n-1-report`, `e2e-gpu-strix-windows-n-2-report`,
+`e2e-gpu-strix-windows-report`, `e2e-gpu-strix-wsl-n-1-report`,
+`e2e-gpu-strix-wsl-n-2-report`, `e2e-gpu-strix-wsl-report`,
+`e2e-gpu-w7900-n-1-report`, `e2e-gpu-w7900-n-2-report`,
+`e2e-gpu-w7900-report`, `e2e-report`) in `ci.yml` and
 `e2e-selfhosted.yml`, because the report derives each platform's name and OS
-from the artifact name. `nightly.yml`'s self-hosted lanes run a `channel:
+from the artifact name. The `-n-1`/`-n-2` suffixes are the non-`current` legs
+of the per-PR `sdk_version` matrix (below, under "Triggers"); a `current`-leg
+artifact keeps its pre-matrix name unchanged. `rad3`/`mi350p` are nightly-only
+lanes (ROCMAI-125) and don't run that matrix, so they have no `-n-1`/`-n-2`
+entries. `nightly.yml`'s self-hosted lanes run a `channel:
 [release, nightly]` matrix and append the channel as the final segment before
 the `-report` affix (e.g. `e2e-gpu-strix-windows-nightly-report`); the report
 strips that segment before matching, so the platform/OS derivation is
@@ -261,19 +267,47 @@ otherwise `vllm` is only preferred for the `*-dcgpu` families and
 ## Triggers
 
 The GPU jobs (in `e2e-selfhosted.yml`) run automatically on `push`,
-`pull_request`, and `merge_group` when the workflow's own `changes` job's
-`serve` path filter is `true`. `push` fires on `main` and on any `release/**`
-branch, so pushing to a release branch runs the full self-hosted matrix ahead
-of cutting the `v*` tag that `release.yml` builds/publishes from — this is the
+`pull_request`, and `merge_group` (every GPU lane except MI300X, which is not
+required for merging and so is skipped in the merge queue rather than left
+queued on limited runner capacity after its PR has merged) when the workflow's
+own `changes` job's `serve` path filter is `true`. A new push to a pull request
+cancels that PR's older run; push, `merge_group` and manual runs each get a
+group of their own, so none is cancelled or replaced by another. The heavy
+`@merge-queue` serves therefore no longer run on MI300X, the only per-PR vLLM
+lane: they run only on the other lanes, and the only vLLM serve before a change
+lands is the per-PR canary (`serve-05`), which runs when the `serve` filter
+matches. `push` fires on `main` and on any `release/**` branch, so pushing to
+a release branch runs the full self-hosted matrix ahead of cutting the `v*` tag that `release.yml` builds/publishes from — this is the
 release-candidate regression gate; `pull_request` fires against any base
-branch. `serve` is narrower than `heavy`: it matches only
+branch.
+
+On a release-branch push, every self-hosted GPU job additionally expands into
+a `strategy.matrix.sdk_version` of `[current, n-1, n-2]` (ROCMAI-430) — three
+legs, each pinning `cargo xtask e2e-prewarm --release-label <leg>` to a
+different TheRock SDK version (`current` tracks the channel's latest;
+`n-1`/`n-2` pin the prior two released versions from
+[`xtask/src/rocm_releases.rs`](../xtask/src/rocm_releases.rs), a static table
+seeded from the official
+[release list](https://rocm.docs.amd.com/en/latest/release/versions.html)).
+Off a release-branch push the matrix resolves to `[current]` only, so an
+ordinary PR run is unaffected. Each leg uploads its own artifact (the
+`-n-1`/`-n-2` suffix above); the pre-warm's runtime-key design lets all three
+versions share one pre-warmed runtime tree rather than needing separate ones.
+`e2e-gpu-strix-ubuntu` layers this `sdk_version` axis alongside its
+pre-existing `channel` axis (ROCMAI-125) rather than replacing it, so a
+release-branch push runs all six `channel` × `sdk_version` combinations on
+that lane; `rad3`/`mi350p` are nightly-only (above) and don't run this matrix
+at all.
+
+`serve` is narrower than `heavy`: it matches only
 paths that can change serve *behaviour* or the GPU E2E harness (the engines, the
 serve code path in `apps/rocm`/`apps/rocmd`, `rocm-core`, the e2e-cucumber crate,
 plus broad-dependency safety nets), **not** a blanket `**/*.rs`. So a Rust change
 that cannot affect serving — e.g. a dashboard-only or unrelated-crate PR — skips
 the heavy GPU matrix, while compile coverage for every crate still runs on
 `ci.yml`'s always-on build/test lanes. Off `pull_request` (push/merge_group) the
-filter is forced `true`, so the full matrix always runs there. Unlike the
+filter is forced `true`, so the full matrix (minus MI300X in the merge queue)
+always runs there. Unlike the
 pre-split layout the GPU jobs do **not** gate on the hosted `build-and-test` job
 — cross-workflow `needs` is not possible, so each GPU job builds the `rocm`
 binary itself as its first real step (a broken build fails that job fast and
@@ -314,7 +348,9 @@ gh workflow run e2e-selfhosted.yml --ref <ref> -f platform=app-dev-gpu
 Nearly every GPU serve scenario points its `data/runtimes` at one shared,
 pre-warmed managed runtime tree (`E2E_SHARED_RUNTIMES_DIR`), so a multi-GiB
 `rocm install sdk` happens once per runner instead of once per scenario. The tree
-lives on the runner's persistent workspace, survives `git clean`, and is namespaced
+lives on the runner's workspace — persistent across runs on the long-lived
+`native`-labeled hosts, rebuilt by the prewarm step below on each ephemeral
+DevLab Dispatch pool run — survives `git clean`, and is namespaced
 by source-layout generation (`e2e-prewarm-multi-arch-v2`) so a branch using a new
 package layout cannot poison the cache consumed by code that only understands the
 previous layout.

@@ -92,7 +92,7 @@ impl StopFailureRemedy {
                                      first."
                 .to_owned(),
             Self::StopWhatHoldsThePort => format!(
-                "Every process recorded for {} is gone, yet the endpoint still answers — the \
+                "Every process recorded for {} is gone, yet the endpoint still answers; the \
                  engine outlived its supervisor, so `rocm services stop` has nothing left to \
                  kill. Find what holds that port (`ss -ltnp` on Linux, `Get-NetTCPConnection \
                  -LocalPort <port>` on Windows), stop it, then re-run uninstall.",
@@ -980,7 +980,7 @@ fn probe_records_for_survivors(
                             report.warnings.push(format!(
                                 "{}:{} still accepts connections and answered the identity probe \
                                  with an empty model list, so it cannot be told from an unrelated \
-                                 service; {} is already recorded stopped — proceeding. An engine \
+                                 service; {} is already recorded stopped; proceeding. An engine \
                                  still loading or unloading looks like this. If that is a server \
                                  of yours, it has to be found and stopped by hand: this uninstall \
                                  does not wait for you to.",
@@ -991,7 +991,7 @@ fn probe_records_for_survivors(
                             report.warnings.push(format!(
                                 "{}:{} still accepts connections but did not answer the identity \
                                  probe with a usable model list, and service {} is already \
-                                 recorded stopped — proceeding. That can be a wedged engine, an \
+                                 recorded stopped; proceeding. That can be a wedged engine, an \
                                  unrelated server on the port, or a stale endpoint key. If it is \
                                  a server of yours, it has to be found and stopped by hand: this \
                                  uninstall does not wait for you to.",

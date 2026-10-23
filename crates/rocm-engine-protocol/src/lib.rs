@@ -69,7 +69,13 @@ pub fn relaunch_command(host: &str, require_api_key: bool) -> String {
     } else {
         ""
     };
-    format!("rocm serve <model> --host {host} --port <port>{public_flag}{key_flag}")
+    // The flags are appended, not interpolated after `<port>`: the advised-command
+    // parse test reads this literal as source, and a placeholder glued to
+    // `{public_flag}` would substitute the port value into it.
+    let mut command = format!("rocm serve <model> --host {host} --port <port>");
+    command.push_str(public_flag);
+    command.push_str(key_flag);
+    command
 }
 
 /// The parenthetical that follows a [`relaunch_command`]: supplying a key is

@@ -634,10 +634,10 @@ fn engine_shell(
     // reported.
     println!();
     if prompt_marked {
-        println!("Entering the {engine} engine shell — your prompt is now prefixed {prompt}");
+        println!("Entering the {engine} engine shell - your prompt is now prefixed {prompt}");
     } else {
         println!(
-            "Entering the {engine} engine shell — your prompt may look unchanged; \
+            "Entering the {engine} engine shell - your prompt may look unchanged; \
              run `echo $ROCM_CLI_ENGINE` to confirm you are inside it."
         );
     }

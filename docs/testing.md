@@ -127,6 +127,89 @@ child write the file instead, so this process never holds a write fd on it. The
 same applies to E2E steps: scenarios run concurrently in one process, and the
 `rocm` child that runs the shim can be the one refused.
 
+### Advised commands must parse
+
+`apps/rocm/src/advised_commands.rs` checks the `rocm`/`rocmd` commands that the
+CLI and its docs tell a user to run against the real parser. It is a text
+scanner: it finds commands by a leading `rocm ` or `rocmd ` word in these
+places, and checks only what it finds:
+
+- the `--help` of every visible command: lines that start with a command
+  (EXAMPLES rows) and inline backtick spans
+- production Rust string literals: backtick spans, literals that start with a
+  command, and labelled lines such as `next step: rocm …`. Whole-line `//`
+  comments, items gated on `cfg(test)` or `cfg(all(test, …))`, and whole
+  files declared only as test modules (following `#[path]`) are skipped; a
+  trailing `// …` comment or a `/* … */` block on a line of code is still
+  scanned.
+- `README.md`, `docs/` and `skills/`: inline backtick spans and fenced
+  code-block lines
+- the VHS tapes under `docs/tapes/`
+
+Each line is split into the commands of a shell list (at `&&`, `||`, `;` and a
+`|` standing between spaces, but not inside quotes, `<…>`, `[…]` or `{…}`), and
+every command that runs `rocm` or `rocmd` is checked; commands for other tools
+are skipped. A command ends at a shell comment, a redirection, or where
+trailing prose starts (` (`, ` —`, ` → `, ` then `). A double space does not
+end it, except on an indented EXAMPLES row, where the description column
+follows one.
+
+It fills in placeholders such as `<model>` and `{}`, drops one that stands for
+options described elsewhere (`<case-appropriate options above>`), tries each
+`[--flag]` group and `a|b` alternative (a nested group such as
+`[--restart-services [--yes]]` is tried with and without its inner part), then
+routes each command the way `rocm` itself does. `rocmd` commands go through
+`rocmd`'s own parser, with nothing run.
+These fail the test:
+
+- a command that clap rejects
+- a command that ends up at the natural-language planner, unless the advice
+  itself is a multi-word request: its first request word is a quoted request
+  (`rocm "start a local model"`) or a placeholder that names one
+  (`rocm --yes <natural language request>`). Only the first word counts, as in
+  real routing, and a placeholder filled in with several words does not count,
+  so a removed subcommand that took a text argument (`frobnicate <TEXT>`,
+  `frobnicate "two words"`) still fails.
+- a command that leaves out a required argument or subcommand, when it is a
+  line meant to be run as written: a fenced code line, a string literal that
+  starts with a command, a labelled `next step:`/`Try:` line, or a help
+  EXAMPLES row
+
+Only an inline backtick span in prose (``pass `rocm serve --engine` ``) may name
+a command without its values, or a command that marks the gap with `…`.
+
+`every_source_is_scanned` requires each of the four sources to still yield a
+named command (the `rocm examine` EXAMPLES row, the dashboard's `rocm update`
+literal, README's fenced `rocm install sdk` and inline `rocm examine`, the CLI
+tape's `rocm examine`) and a minimum count per source and surface, so a broken
+extractor cannot pass silently.
+
+Known gaps of the text scanner. Advice written these ways is not checked, or
+not checked as written:
+
+- a Rust raw string (`r#"…"#`) or a string literal that spans lines without a
+  trailing `\` is not read as one literal
+- a backtick span that wraps across lines in a Rust string is not seen
+  (Markdown and `--help` text join wrapped spans; Rust source does not)
+- an EXAMPLES row in `--help` that wraps onto a second line is checked only up
+  to the wrap (clap is built without `wrap_help`, so this happens only where an
+  author breaks the line)
+- a `{` or `}` inside a string in a `#[cfg(test)]` item can end the skipped
+  item early or late
+- templated advice whose verb is a format argument (the `services` hint in
+  `service_hints.rs`, whose verb is `{action}`, and the `runtimes` retry line
+  in `runtime_services.rs`, whose subcommand is `{command}`) is excluded and
+  checked through the functions that build it instead
+
+When it fails, fix the advice (or the CLI). Add text to `NOT_INVOCATIONS`, with
+a reason, only when the text starts with `rocm` but is not advice to run
+anything, such as a log line or an error message that names the command. To see
+every command it found and the result for each:
+
+```bash
+cargo test -p rocm --bin rocm advised_commands::dump_advised_invocations -- --ignored --nocapture
+```
+
 Run the cross-platform smoke test:
 
 ```bash
@@ -1511,7 +1594,7 @@ local curl smoke and accepted fields.
 vLLM TheRock GPU acceptance:
 
 ```bash
-cargo test -p rocm-engine-vllm running_state_records_managed_therock_env_for_gpu_verification
+cargo test -p rocm-engine-vllm write_running_state_records_managed_therock_env_for_gpu_verification
 cargo test -p rocm-engine-vllm managed_env_reflects_managed_runtime_manifest_source
 cargo test -p rocm-engine-vllm resolve_model_omits_gpu_memory_utilization_default
 python -m py_compile scripts/vllm_therock_gpu_test.py
@@ -1669,10 +1752,14 @@ examine`'s distro fields and distro name via `record_distro` and
 `distro_name_from_os_release`, which both take the whole `OsRelease` directly.
 The three `_read`-suffixed functions are the one seam the real call site
 hands its result to, and each delegates to the matching `_at` function with
-the path it actually read. `install_hint_for`/`build_driver_install_plan`
-are bare-text siblings of `_at` — not something `_read` delegates through —
-kept only for the unit tests below, which fixture text directly and have no
-`OsRelease` of their own to construct.
+the path it actually read. The unit tests below call the `_read` functions
+directly too, constructing an `OsRelease` from fixture text instead of going
+through a bare-text sibling — `crate::hardware_root::OsRelease::found` in
+[openmpi.rs](../crates/rocm-core/src/openmpi.rs)'s tests, and the equivalent
+`os_release_found` test helper in
+[driver_install.rs](../apps/rocm/src/driver_install.rs)'s (the former is
+`#[cfg(test)] pub(crate)` inside `rocm-core` and so not visible from
+`apps/rocm`'s own tests).
 
 ```bash
 cargo test -p rocm-core --lib os_release
@@ -1765,6 +1852,39 @@ scenarios (`skill-catalog-ids-match-cli` and its neighbours) do list and
 compare the new entry on every lane. A
 scenario that runs the check itself would need the Windows lane and a host
 with an old runtime installed.
+
+### A GPU with no ROCm build
+
+`info-20-gpu-no-rocm-support` is the catalog's one `DIAGNOSE-ONLY` entry: every
+AMD GPU on the host identifies as a target ROCm has never shipped a runtime
+build for (today only `gfx90c`, the Vega iGPU in Renoir / Lucienne / Cezanne /
+Barcelo). `rocm fix` still answers for the id — by naming the problem, changing
+nothing and exiting 0 — because `diagnose` prints `apply with: rocm fix <id>`
+for every cause it reports.
+
+`diagnose-40` covers it end to end. The host is simulated rather than required:
+a KFD node planted under the scenario's own root reports `gfx_target_version
+90012`, so it runs on **every** Linux lane, WSL2 included — `@requires-os:linux`
+matches a host whose `os_family` is `linux`, and WSL2's is. Every `rocm` call in
+that scenario therefore has to carry `ROCM_CLI_TEST_HOST_ROOT`: `rocm fix` gates
+on the OS, and `fix::current_os` resolves WSL *through* the host root, so an
+unrooted call on a WSL2 runner is read as `wsl` — an OS this entry deliberately
+does not apply on — and exits 3.
+
+```bash
+cargo xtask e2e -- -n '(diagnose-40)'
+```
+
+The other half of the same change — `fix-13-hip-sdk-missing` no longer firing
+just because no HIP SDK is installed — has **no** end-to-end coverage and cannot
+have any. `check_13_hip_sdk_missing` returns early on every non-Windows host, so
+on a Linux lane that early return alone satisfies "no cause tells this user to
+install the HIP SDK"; the assertion would still hold with `check_20` deleted.
+The gate itself is held by unit tests in
+[diagnose.rs](../crates/rocm-core/src/diagnose.rs)
+(`fix_13_does_not_fire_on_a_lemonade_vulkan_host_with_no_hip_evidence` and its
+neighbours) and by the Windows manual check in
+[manual-testing.md](manual-testing.md), in the Ryzen 4000/5000 section.
 
 ## Model Fit Preflight
 

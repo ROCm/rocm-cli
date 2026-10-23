@@ -226,6 +226,28 @@ fn refresh_update_status(state: &mut AppState) -> Vec<rocm_dash_core::state::Sid
     fx
 }
 
+/// Hand off `ResolvedArgs`'s live registry-read seam and launcher-hosted flag
+/// onto `AppState` (issue #145). This crate's own `event_loop` calls this
+/// directly (rather than inlining the two assignments) so the
+/// field-assignment logic itself has a synchronous unit test
+/// (`seed_registry_probe_and_hosting_wires_both_fields_onto_state`) instead of
+/// needing to spin up the full async terminal loop to reach it.
+///
+/// That unit test calls this function directly, so it does **not** cover the
+/// call site in `event_loop` dropping the hand-off entirely, or passing the
+/// wrong field — `run`/`event_loop` are only reachable through the full async
+/// terminal loop, which only the `@requires-os:linux` e2e lane
+/// (`tests/e2e-cucumber/features/dash.feature`, any scenario that opens a real
+/// dashboard or chat session with a managed model present) actually drives.
+fn seed_registry_probe_and_hosting(
+    state: &mut AppState,
+    managed_registry_probe: Option<crate::registry_probe::SharedManagedRegistryProbe>,
+    launcher_hosted: bool,
+) {
+    state.managed_registry_probe = managed_registry_probe;
+    state.launcher_hosted = launcher_hosted;
+}
+
 /// The dashboard's entire startup gate: an overlay opens only when an
 /// explicit `Focus` was resolved from the command line. `event_loop` calls
 /// this directly (rather than inlining the `match`) so a regression test can
@@ -802,6 +824,12 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
     state.bench_results_dir = args.bench_results_dir.clone();
     // Managed-service records that are no longer running, counted by the bin.
     state.services_past_attempts = args.services_past_attempts;
+    // Live registry-read seam and launcher-hosting flag (issue #145).
+    seed_registry_probe_and_hosting(
+        &mut state,
+        args.managed_registry_probe.clone(),
+        args.launcher_hosted,
+    );
     // Focused host: open exactly the overlay for the requested flow (Examine
     // also auto-runs its read-only job). `Focus::Setup` opens the onboarding
     // overlay — the same wizard `rocm bootstrap setup` routes to.
@@ -1129,6 +1157,28 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
                                 state.on_approval_declined();
                             }
                             None => { /* cursor moved or key ignored — modal stays open */ }
+                        }
+                    }
+                    // The quit-confirm prompt (issue #145), when open, owns
+                    // every remaining key the same way the approval modal
+                    // above does — nothing behind it can pre-empt the
+                    // decision. Only the Ctrl-C arm above outranks it, for
+                    // the same reason it outranks the approval modal.
+                    Some(Ok(CtEvent::Key(k))) if state.quit_confirm_pending() => {
+                        // `s`: jump to the Services overlay and stop it there,
+                        // rather than only resolving an Approve/Deny/Cancel
+                        // verdict. Checked first so it can't be shadowed by
+                        // `resolve_quit_confirm_key`'s own key handling; it
+                        // already mutated `state` (prompt closed, overlay
+                        // opened) when it returns `true`, so there is nothing
+                        // further to resolve for this key.
+                        //
+                        // `Some(false)`: Deny/Cancel already closed the prompt.
+                        // `None`: cursor moved or key ignored — prompt stays open.
+                        if !state.quit_confirm_open_services_key(k.code)
+                            && state.resolve_quit_confirm_key(k.code) == Some(true)
+                        {
+                            break;
                         }
                     }
                     // De-modal back-out: on any tab, when an inline manager is
@@ -2131,6 +2181,41 @@ mod tests {
     }
 
     #[test]
+    fn seed_registry_probe_and_hosting_wires_both_fields_onto_state() {
+        // Covers only `seed_registry_probe_and_hosting` itself — that it
+        // assigns `managed_registry_probe` and `launcher_hosted` onto the
+        // right fields, not swapped or dropped. It does NOT cover whether
+        // `run_async` actually calls this at its own call site with the
+        // right arguments: that would need the full async `event_loop` run,
+        // which only the `@requires-os:linux` e2e lane drives (any
+        // `dash.feature` scenario that opens a real dashboard/chat session
+        // with a managed model present exercises it for real). Each half
+        // (the bin producing the probe, `AppState::has_live_instance`/
+        // `ui::quit_confirm_body` consuming it) is tested elsewhere; this is
+        // only the field-assignment logic in between.
+        use crate::registry_probe::{ManagedRegistrySnapshot, StaticManagedRegistrySnapshot};
+
+        let mut s = st();
+        assert!(s.managed_registry_probe.is_none());
+        assert!(!s.launcher_hosted);
+
+        let probe: crate::registry_probe::SharedManagedRegistryProbe =
+            std::sync::Arc::new(StaticManagedRegistrySnapshot(ManagedRegistrySnapshot {
+                has_live_service: true,
+                managed_ids: std::iter::once("svc-a".to_string()).collect(),
+            }));
+        seed_registry_probe_and_hosting(&mut s, Some(probe.clone()), true);
+
+        assert!(s.launcher_hosted);
+        assert_eq!(
+            s.managed_registry_probe
+                .as_ref()
+                .map(|p| std::sync::Arc::ptr_eq(p, &probe)),
+            Some(true)
+        );
+    }
+
+    #[test]
     fn should_skip_daemon_predicate_matches_focus() {
         // The dashboard (focus=None) keeps the daemon client + chat backend; any
         // focus skips both. The render branch reuses this same predicate.
@@ -2224,6 +2309,40 @@ mod tests {
         assert!(
             s.focused_should_exit(Some(Focus::Examine)),
             "closed at root → return to the launcher"
+        );
+    }
+
+    #[test]
+    fn focused_should_exit_stays_shut_while_quit_confirm_is_pending() {
+        // `open_quit_confirm` closes every manager overlay via `close_overlays`,
+        // so `has_open_overlay()` goes false the instant it is called. Without
+        // `focused_should_exit` also checking `quit_confirm_pending()`, a
+        // focused host reaching `actions::request_quit` would hit this gate on
+        // the very next loop iteration and exit before `draw_focused` ever drew
+        // the prompt — silently, instead of showing it.
+        let mut s = st();
+        let _ = open_overlay_for_focus(&mut s, Focus::Serve);
+        assert!(s.has_open_overlay());
+
+        s.open_quit_confirm();
+        assert!(
+            !s.has_open_overlay(),
+            "open_quit_confirm closes every manager overlay"
+        );
+        assert!(
+            !s.focused_should_exit(Some(Focus::Serve)),
+            "a pending quit-confirm must hold the focused-exit gate shut"
+        );
+
+        // Decline (Esc cancels) resolves the prompt without exiting.
+        assert_eq!(
+            s.resolve_quit_confirm_key(KeyCode::Esc),
+            Some(false),
+            "Esc cancels the quit-confirm prompt rather than exiting"
+        );
+        assert!(
+            s.focused_should_exit(Some(Focus::Serve)),
+            "once the prompt is resolved and no overlay is open, the gate opens again"
         );
     }
 

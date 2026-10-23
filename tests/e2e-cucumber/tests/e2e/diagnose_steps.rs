@@ -128,6 +128,12 @@ const CATALOG_FIX_IDS: &[&str] = &[
     "fix-18-comgr-conflict",
     "fix-19-shm-too-small",
     "fix-21-msvc-redist-outdated",
+    // The catalog's one DIAGNOSE-ONLY entry, carrying an `info-` id because it
+    // has no fix to offer. It is in the catalog all the same: `rocm diagnose`
+    // prints `apply with: rocm fix info-20-gpu-no-rocm-support` for it, so
+    // `rocm fix` has to resolve that id -- by naming the problem and changing
+    // nothing. Leaving it out here would let the two published forms drift.
+    "info-20-gpu-no-rocm-support",
 ];
 
 /// The fixes the CLI carries out itself **on the host running the suite**.
@@ -1500,17 +1506,29 @@ async fn assert_path_fix_used_set_environment_variable(world: &mut E2eWorld) {
         Some(0),
         "expected the real PATH write to succeed:\n{output}"
     );
+    // Scoped to the write, not to the whole command output. `rocm fix <id>`
+    // prints the catalog recipe first, and `fix-6-path`'s notes name
+    // `setx PATH "%PATH%;..."` in order to warn a Windows user off it -- so a
+    // whole-output `!contains("setx ")` reports on the documentation rather
+    // than on what the CLI did, and fails on a correct run. Taking the region
+    // between the plan line and the post-write confirmation asserts both
+    // halves where they mean something: the write went through PowerShell,
+    // and nothing in the write went through `setx`. Obtaining the region at
+    // all is what pins the plan line and the confirmation wording cb9f748d
+    // introduced.
+    let write_region = e2e_cucumber::user_path_write_region(output).unwrap_or_else(|| {
+        panic!(
+            "expected the plan/write region cb9f748d introduced -- a `Plan: prepend ...` line \
+             through a `This only takes effect in NEW shells` confirmation:\n{output}"
+        )
+    });
     assert!(
-        output.contains("[Environment]::SetEnvironmentVariable("),
-        "expected the PowerShell plan/write line cb9f748d introduced, not setx:\n{output}"
+        write_region.contains("[Environment]::SetEnvironmentVariable("),
+        "expected the PowerShell plan/write line cb9f748d introduced, not setx:\n{write_region}"
     );
     assert!(
-        !output.contains("setx "),
-        "setx must not appear now that the write goes through PowerShell:\n{output}"
-    );
-    assert!(
-        output.contains("This only takes effect in NEW shells"),
-        "expected the post-write wording cb9f748d introduced:\n{output}"
+        !write_region.contains("setx "),
+        "setx must not appear in the plan or the write now that it goes through PowerShell:\n{write_region}"
     );
 }
 
@@ -2567,5 +2585,184 @@ async fn assert_json_with_fix_id_refused(world: &mut E2eWorld) {
     assert!(
         serde_json::from_str::<serde_json::Value>(stdout).is_err(),
         "a refused request still produced machine-readable output:\n{stdout}"
+    );
+}
+
+// ── A GPU ROCm has no build for ────────────────────────────────────
+
+#[given("a machine whose only GPU is one ROCm has no build for")]
+async fn machine_with_an_unsupported_gpu(world: &mut E2eWorld) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .to_owned();
+    // One GPU node in the kernel topology, reporting gfx_target_version 90012.
+    // That decodes to gfx90c -- the Vega iGPU in Renoir / Lucienne / Cezanne /
+    // Barcelo, and the one architecture the catalog says has no ROCm build.
+    // `cpu_cores_count 0` with a nonzero `simd_count` is what makes the node a
+    // GPU rather than a CPU node.
+    let node = root.join("host-root/sys/class/kfd/kfd/topology/nodes/1");
+    std::fs::create_dir_all(&node).expect("failed to create planted KFD node");
+    std::fs::write(
+        node.join("properties"),
+        "cpu_cores_count 0\nsimd_count 56\ngfx_target_version 90012\n",
+    )
+    .expect("failed to write planted KFD node properties");
+    world
+        .command_env
+        .push(("ROCM_CLI_TEST_HOST_ROOT", root.join("host-root").into()));
+    // An `lspci` that lists an empty bus, ahead of any real one, so the PCI
+    // probe succeeds on every runner without describing the runner's cards --
+    // a second, supported GPU would make the whole-machine claim false and the
+    // cause would correctly not fire.
+    let bin = root.join("unsupported-gpu-bin");
+    std::fs::create_dir_all(&bin).expect("failed to create the fake PATH dir");
+    rocm_core::fake_executable::write_fake_executable(&bin.join("lspci"), "#!/bin/sh\nexit 0\n")
+        .expect("failed to write the fake lspci");
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .expect("PATH entries cannot hold a separator");
+    world.command_env.push(("PATH", path));
+}
+
+#[when("the user asks the CLI to diagnose that machine's state")]
+async fn user_diagnoses_planted_machine(world: &mut E2eWorld) {
+    // No `--symptom`: the finding is about the hardware, and the user on this
+    // host has no error to paste -- Vulkan inference works. `--top 20` so the
+    // assertions below read the whole ranking rather than the default five.
+    // Where the cause ranks is a separate question from whether it is reported
+    // at all, and the runner's own state can add causes above it.
+    let (stdout, stderr, rc) =
+        crate::run_rocm_with_scenario_env(world, &["diagnose", "--top", "20"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+/// The reported cause block for `info-20-gpu-no-rocm-support`: the `#N (id)`
+/// header line and everything under it up to the blank line that ends it.
+fn unsupported_gpu_cause(output: &str) -> Vec<&str> {
+    output
+        .lines()
+        .skip_while(|line| !line.contains("(info-20-gpu-no-rocm-support)"))
+        .take_while(|line| !line.trim().is_empty())
+        .collect()
+}
+
+#[then("the diagnosis names the architecture and says Vulkan still works")]
+async fn assert_unsupported_gpu_named(world: &mut E2eWorld) {
+    assert_eq!(world.cli_rc, Some(0), "`rocm diagnose` always exits 0");
+    let output = world.cli_output.as_ref().expect("no diagnose output");
+    let cause = unsupported_gpu_cause(output);
+    assert!(
+        !cause.is_empty(),
+        "the planted gfx90c host must be told why ROCm will not work on it:\n{output}"
+    );
+    let text = cause.join("\n");
+    assert!(
+        text.contains("gfx90c"),
+        "naming the architecture is the acceptance criterion; a bare \"unsupported\" \
+         leaves the user unable to check it:\n{text}"
+    );
+    assert!(
+        text.contains("Vulkan"),
+        "and the usable path has to be named, or the report reads as \"this machine \
+         cannot do inference\":\n{text}"
+    );
+}
+
+#[then("that cause offers no fix to apply, and says so")]
+async fn assert_unsupported_gpu_has_no_fix(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no diagnose output");
+    let text = unsupported_gpu_cause(output).join("\n");
+    assert!(
+        text.contains("no reliable fix"),
+        "the flags line has to say there is nothing to apply, or `apply with:` below it \
+         reads as a repair:\n{text}"
+    );
+    // The `apply with:` line is still printed, and still works: the id is a
+    // DIAGNOSE-ONLY catalog entry, so `rocm fix` answers for it by naming the
+    // problem and changing nothing. Dropping the line for this one id would
+    // have made README and `--help` false for it.
+    assert!(
+        text.contains("apply with: rocm fix info-20-gpu-no-rocm-support"),
+        "every cause carries the command that acts on it, this one included:\n{text}"
+    );
+    // Run against the SAME simulated host the diagnosis was made on, not the
+    // runner's own machine. `run_rocm_with_scenario_env` in the When step
+    // consumes `world.command_env` by design, so the host root is re-applied
+    // here explicitly rather than by reaching into a drained field.
+    //
+    // This is not cosmetic. `rocm fix` gates on `fix::current_os`, which
+    // resolves WSL by probing `/dev/dxg` and `/proc/version` *through* the host
+    // root. On a WSL2 runner -- which `@requires-os:linux` selects, because WSL2
+    // reports an `os_family` of `linux` -- the unrooted command is read as os
+    // `wsl`, which this entry deliberately does not apply on, and it exits 3 for
+    // a reason that has nothing to do with the behaviour under test.
+    let host_root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("host-root");
+    let (fix_stdout, _, rc) = crate::run_rocm_with_env(
+        world,
+        &["fix", "info-20-gpu-no-rocm-support", "--yes"],
+        &[(
+            "ROCM_CLI_TEST_HOST_ROOT",
+            host_root.to_string_lossy().as_ref(),
+        )],
+    );
+    assert_eq!(
+        rc, 0,
+        "the id the report told the user to run must be one `rocm fix` accepts:\n{fix_stdout}"
+    );
+    // Exit 0 alone is also what a PRINT-ONLY routing produces, and that one
+    // hands the user commands to run. What the report promised is that there is
+    // nothing to apply, so the promise is what gets asserted -- AGENTS.md §3.
+    assert!(
+        fix_stdout.contains("no reliable fix, so this command changes nothing"),
+        "a DIAGNOSE-ONLY id has to say it changed nothing; exit 0 on its own would \
+         equally describe a print-only fix handing over steps to carry out:\n{fix_stdout}"
+    );
+    assert!(
+        !fix_stdout.contains("Copy the commands above"),
+        "and it must not route through the print-only path, which asks for steps to be \
+         run that this entry does not have:\n{fix_stdout}"
+    );
+}
+
+#[then("no cause tells this user to install the HIP SDK")]
+async fn assert_no_hip_sdk_advice(world: &mut E2eWorld) {
+    // DELIBERATELY WEAKER THAN ITS NAME SUGGESTS, and a reader should know
+    // which half of the change it covers.
+    //
+    // `check_13_hip_sdk_missing` opens with `if e.os_family != "windows" {
+    // return zero(..) }`, which predates this change. On a Linux lane that
+    // early return alone makes this assertion hold, so it would still pass with
+    // `check_20` deleted. What it is worth is the general form: a guard that
+    // nothing *else* ever starts proposing an SDK install on a Vulkan-only
+    // host, and that the Windows gate above is not removed without a
+    // replacement. It is not proof of the Windows regression.
+    //
+    // That regression has no end-to-end coverage, and cannot have any today.
+    // The host-simulation seam (`rocm_core::hardware_root`, via
+    // `ROCM_CLI_TEST_HOST_ROOT`) re-roots Linux sysfs/procfs/device paths only;
+    // the Windows GPU probe shells out to `Win32_VideoController` and has no
+    // seam, so a Windows-shaped gfx90c host cannot be planted at all. The
+    // Windows lane that runs per PR is restricted to `@lifecycle` scenarios by
+    // `E2E_ONLY_LIFECYCLE=1`, and the self-hosted Windows lanes run on real
+    // Strix Halo (gfx1151, supported), where `check_20` correctly stays silent.
+    // The stated substitute is the unit test
+    // `fix_13_does_not_fire_on_a_lemonade_vulkan_host_with_no_hip_evidence` in
+    // `rocm-core::diagnose`, which drives the whole `diagnose()` pipeline on
+    // the ticket's exact Windows/gfx90c host shape.
+    let output = world.cli_output.as_ref().expect("no diagnose output");
+    assert!(
+        !output.contains("fix-13-hip-sdk-missing"),
+        "a host whose only engine is Vulkan has nothing to gain from a HIP SDK:\n{output}"
     );
 }

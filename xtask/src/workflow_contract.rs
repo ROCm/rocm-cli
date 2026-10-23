@@ -866,32 +866,35 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
         }
     }
 
-    /// The nightly WSL lane's `runs-on` must track the per-PR lane's, byte for
-    /// byte: both jobs claim to run on the same DevLab Dispatch pool host
-    /// (`e2e-wsl-nightly`'s header comment, docs/ci-hardware-testing.md), and
-    /// nothing else pins that claim -- reverting `e2e-wsl-nightly` to its old
-    /// static `[self-hosted, linux, strix-halo, wsl]` labels (its pre-migration
-    /// runs-on; `native` never applied to this job, only to the two
-    /// `e2e-gpu-nightly-strix*` lanes) would leave every other assertion in
-    /// this file green while the doc and the comment both quietly went false
-    /// again.
+    /// Each nightly DevLab Dispatch lane's `runs-on` must track its per-PR
+    /// counterpart's, byte for byte: both jobs in each pair claim to run on
+    /// the same pool host (the nightly job's header comment,
+    /// docs/ci-hardware-testing.md), and nothing else pins that claim --
+    /// reverting a nightly job to its old static `native`/`wsl` labels would
+    /// leave every other assertion in this file green while the doc and the
+    /// comment both quietly went false again.
     #[test]
-    fn nightly_wsl_lane_shares_the_per_pr_pool_labels() {
+    fn nightly_devlab_dispatch_lanes_share_the_per_pr_pool_labels() {
         let sh = read_workflow("e2e-selfhosted.yml");
         let nightly = read_workflow("nightly.yml");
-        let per_pr = runs_on_values(job_block(&sh, "e2e-wsl"));
-        let nightly_wsl = runs_on_values(job_block(&nightly, "e2e-wsl-nightly"));
-        assert!(!per_pr.is_empty(), "e2e-wsl declares a runs-on");
-        assert!(
-            per_pr.iter().any(|value| value.contains("devlab-dispatch")),
-            "e2e-wsl must actually be on the DevLab Dispatch pool, not just equal to \
-             nightly's (equal-and-empty would pass the assertion below): {per_pr:?}"
-        );
-        assert_eq!(
-            per_pr, nightly_wsl,
-            "e2e-wsl-nightly's runs-on must match e2e-wsl's exactly -- both are documented as \
-             the same DevLab Dispatch pool"
-        );
+        for (per_pr_job, nightly_job) in [
+            ("e2e-wsl", "e2e-wsl-nightly"),
+            ("e2e-gpu-strix-windows", "e2e-gpu-nightly-strix-windows"),
+        ] {
+            let per_pr = runs_on_values(job_block(&sh, per_pr_job));
+            let nightly_values = runs_on_values(job_block(&nightly, nightly_job));
+            assert!(!per_pr.is_empty(), "{per_pr_job} declares a runs-on");
+            assert!(
+                per_pr.iter().any(|value| value.contains("devlab-dispatch")),
+                "{per_pr_job} must actually be on the DevLab Dispatch pool, not just equal to \
+                 {nightly_job}'s (equal-and-empty would pass the assertion below): {per_pr:?}"
+            );
+            assert_eq!(
+                per_pr, nightly_values,
+                "{nightly_job}'s runs-on must match {per_pr_job}'s exactly -- both are \
+                 documented as the same DevLab Dispatch pool"
+            );
+        }
     }
 
     #[test]
@@ -999,23 +1002,7 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
                 continue;
             }
             let step = step_block(&lines, i);
-            // `name:` is either the item's own first key (`- name: …`) or one
-            // of its sibling keys, two columns in from the dash.
-            let name = step
-                .lines()
-                .find_map(|l| {
-                    let key_line = if indent_of(l) == item_indent {
-                        l.trim_start().strip_prefix("- ")?
-                    } else if indent_of(l) == item_indent + 2 {
-                        l.trim_start()
-                    } else {
-                        return None;
-                    };
-                    key_line.strip_prefix("name:")
-                })
-                .map(|value| strip_quotes(strip_comment(value).trim()))
-                .unwrap_or_default();
-            steps.push((name, step));
+            steps.push((step_name(&step), step));
         }
         Some(steps)
     }
@@ -1076,20 +1063,45 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
 
     /// The report artifact a lane's upload step names (`name: e2e-*-report`).
     fn uploaded_report_artifact(workflow: &str, text: &str, job: &str) -> String {
-        let names: Vec<&str> = job_block(text, job)
-            .lines()
-            .filter_map(|line| line.trim().strip_prefix("name: "))
-            .filter(|name| name.starts_with("e2e-") && name.ends_with("-report"))
-            .collect();
-        assert_eq!(
-            names.len(),
-            1,
-            "{workflow} job `{job}` should upload exactly one `e2e-*-report` artifact, \
-             found {names:?}"
-        );
+        // A lane with an `sdk_version` matrix (ROCMAI-430) uploads one artifact
+        // per leg, each behind its own mutually exclusive `if:` — pair every
+        // artifact name with the `if:` directly above it in the same step, then
+        // pick the `current` leg to stand for the whole lane, the same way a
+        // channel axis below is checked through its `release` leg.
+        let mut last_if: Option<&str> = None;
+        let mut candidates: Vec<(&str, Option<&str>)> = Vec::new();
+        for line in job_block(text, job).lines() {
+            let trimmed = line.trim();
+            if let Some(cond) = trimmed.strip_prefix("if: ") {
+                last_if = Some(cond);
+            } else if let Some(name) = trimmed.strip_prefix("name: ")
+                && name.starts_with("e2e-")
+                && name.ends_with("-report")
+            {
+                candidates.push((name, last_if));
+            }
+        }
+        let chosen = match candidates.as_slice() {
+            [(name, _)] => *name,
+            _ => {
+                candidates
+                    .iter()
+                    .find(|(_, cond)| {
+                        cond.is_some_and(|c| c.contains("matrix.sdk_version == 'current'"))
+                    })
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "{workflow} job `{job}` should upload exactly one `e2e-*-report` \
+                             artifact, or one `current`-leg one among an sdk_version matrix, \
+                             found {candidates:?}"
+                        )
+                    })
+                    .0
+            }
+        };
         // The report job has no `matrix` context, so a lane with a channel axis is
         // checked through its `release` leg, which stands for the whole lane.
-        names[0].replace("${{ matrix.channel }}", "release")
+        chosen.replace("${{ matrix.channel }}", "release")
     }
 
     #[test]
@@ -1400,6 +1412,37 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
             log.contains("could not list this run's artifacts"),
             "an API failure must say so rather than fail silently:\n{log}"
         );
+    }
+
+    /// The `name:` of `step`, a block as `step_block` returns it (its first
+    /// line is the step's `- ` item line); empty when the step has none.
+    fn step_name(step: &str) -> String {
+        step_key(step, "name")
+    }
+
+    /// The one-line value of `step`'s own `{key}:`, unquoted and without a
+    /// trailing comment; empty when the step has no such key.
+    ///
+    /// The key is either the item's own first key (`- name: …`) or one of
+    /// its sibling keys, two columns in from the dash. Keys any deeper — a
+    /// `with:` input called `name`, a `name:` line inside the step's script —
+    /// are not the step's.
+    fn step_key(step: &str, key: &str) -> String {
+        let marker = format!("{key}:");
+        let item_indent = step.lines().next().map_or(0, indent_of);
+        step.lines()
+            .find_map(|l| {
+                let key_line = if indent_of(l) == item_indent {
+                    l.trim_start().strip_prefix("- ")?
+                } else if indent_of(l) == item_indent + 2 {
+                    l.trim_start()
+                } else {
+                    return None;
+                };
+                key_line.strip_prefix(&marker)
+            })
+            .map(|value| strip_quotes(strip_comment(value).trim()))
+            .unwrap_or_default()
     }
 
     /// Every `GPU preflight` step block in `text`, in file order.
@@ -2869,12 +2912,22 @@ fi
 
         // argv[0] names an E2E root and an engine marker, which is what the
         // rule matches, and sits under the scope so nothing else can.
+        //
+        // A copy of bash running a loop, for the reasons `spawn_decoy` in
+        // reclaim-gpu.sh gives: a copied multicall `sleep` exits at once as an
+        // unknown program, and bash would exec a lone `sleep 300` in place.
         let decoy_dir = scope.path().join("e2e-prewarm/bin");
         std::fs::create_dir_all(&decoy_dir).expect("decoy dir");
         let decoy = decoy_dir.join("llama-server");
-        std::fs::copy("/bin/sleep", &decoy).expect("copy /bin/sleep as the decoy");
+        std::fs::copy("/bin/bash", &decoy).expect("copy /bin/bash as the decoy");
         let mut child = std::process::Command::new(&decoy)
-            .arg("300")
+            .args(["-c", "for _ in {1..300}; do sleep 1; done"])
+            // Detached, as in the script: a `sleep 1` child outlives the
+            // SIGKILL below by up to a second and would hold the test's
+            // inherited stdio open meanwhile.
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .spawn()
             .expect("spawn the decoy engine process");
         let decoy_pid = child.id();
@@ -2885,8 +2938,8 @@ fi
             &env,
             &reclaim,
         );
-        // Reaped before any assertion: a panic here must not leave a `sleep
-        // 300` behind on a self-hosted runner, of all things.
+        // Reaped before any assertion: a panic here must not leave a 300s
+        // decoy behind on a self-hosted runner, of all things.
         let _ = child.kill();
         let _ = child.wait();
         let (code, log) = got;
@@ -3364,7 +3417,8 @@ fi
             String::from_utf8_lossy(&out.stdout).into_owned()
         };
 
-        let empty = e2e_report::consolidated_summary_markdown_from_reports(&[], &[]);
+        let empty =
+            e2e_report::consolidated_summary_markdown(&e2e_report::load_platform_reports(&[]));
         assert!(
             !run(&empty).contains("REACHED_PUBLISH"),
             "the generator's empty output must stop the publish"
@@ -3637,29 +3691,29 @@ fi
     #[test]
     fn workflows_use_distinct_concurrency_groups() {
         // Isolation comes from the group KEY differing per workflow. Extract the
-        // actual concurrency.group value from each and assert (a) both keep
-        // supersession, (b) both key on github.workflow, and (c) the two group
-        // expressions and workflow names differ — so at runtime the groups are
+        // actual concurrency.group value from each and assert (a) ci.yml keeps
+        // supersession (e2e-selfhosted.yml scopes it to pull_request, see
+        // `self_hosted_supersession_is_scoped_to_pull_requests`), (b) both key on
+        // github.workflow, and (c) the two group expressions and workflow names differ — so at runtime the groups are
         // distinct and an offline-runner stall in one can't hold the other.
         let ci = read_workflow("ci.yml");
         let sh = read_workflow("e2e-selfhosted.yml");
         let ci_group = concurrency_group(&ci);
         let sh_group = concurrency_group(&sh);
 
-        for (label, group, text) in [
-            ("ci.yml", &ci_group, &ci),
-            ("e2e-selfhosted.yml", &sh_group, &sh),
-        ] {
+        for (label, group) in [("ci.yml", &ci_group), ("e2e-selfhosted.yml", &sh_group)] {
             assert!(
                 group.contains("github.workflow"),
                 "{label} concurrency.group must be namespaced by github.workflow \
                  (got `{group}`) (EAI-7548)"
             );
-            assert!(
-                text.contains("cancel-in-progress: true"),
-                "{label} must keep cancel-in-progress: true (EAI-7548)"
-            );
         }
+        // Both keep supersession; e2e-selfhosted.yml narrows it to pull_request
+        // (see `self_hosted_supersession_is_scoped_to_pull_requests`).
+        assert!(
+            ci.contains("cancel-in-progress: true"),
+            "ci.yml must keep cancel-in-progress: true"
+        );
         // The github.workflow-keyed groups resolve via the workflow `name:`; those
         // names must differ for the runtime groups to be distinct.
         assert_ne!(
@@ -4432,6 +4486,114 @@ jobs:
         );
     }
 
+    /// Extract the top-level `concurrency.cancel-in-progress` value.
+    fn concurrency_cancel_in_progress(text: &str) -> String {
+        top_level_block(text, "concurrency")
+            .lines()
+            .map(strip_comment)
+            .find_map(|line| line.trim().strip_prefix("cancel-in-progress:"))
+            .map(|value| value.trim().to_owned())
+            .expect("concurrency block has a cancel-in-progress: key")
+    }
+
+    #[test]
+    fn self_hosted_supersession_is_scoped_to_pull_requests() {
+        // With one runner per GPU class, a superseded PR run left in the queue
+        // delays every run behind it, so a new push must cancel the PR's older
+        // run. The same must NOT hold for the other triggers: a push or a
+        // merge_group run records a commit that landed, and a dispatch is
+        // deliberate, so none may cancel another or share a group with a PR run.
+        let sh = read_workflow("e2e-selfhosted.yml");
+        let group = concurrency_group(&sh);
+        assert!(
+            group.contains("${{ github.workflow }}-${{ github.event_name }}-"),
+            "the group must carry the event name so runs of different triggers never \
+             share a group (got `{group}`)"
+        );
+        // The key is an `A && x || B && y || z` chain, so the ORDER of the arms
+        // decides behaviour (`format()` is always truthy: moved first, it would
+        // give every PR run a unique group and silently stop supersession).
+        // Pin the whole expression, not each arm, so a reorder fails.
+        // PR number: a new push to the PR supersedes its older run. Dispatch:
+        // unique per run. Ref AND commit for everything else: GitHub replaces a
+        // still-pending run in a shared group even with cancel-in-progress off,
+        // so a ref-only key would let a second push to `main` drop the first.
+        assert_eq!(
+            normalized_whitespace(&group).trim_start_matches(">- "),
+            "${{ github.workflow }}-${{ github.event_name }}-${{ \
+             github.event_name == 'pull_request' && github.event.pull_request.number \
+             || github.event_name == 'workflow_dispatch' && github.run_id \
+             || format('{0}-{1}', github.ref, github.sha) }}",
+            "the concurrency group must be exactly: event name, then PR number \
+             (pull_request), run id (workflow_dispatch), ref and commit (all else), \
+             in that order"
+        );
+        assert_eq!(
+            concurrency_cancel_in_progress(&sh),
+            "${{ github.event_name == 'pull_request' }}",
+            "only pull_request runs may be cancelled by a newer run"
+        );
+    }
+
+    #[test]
+    fn mi300x_lane_is_skipped_in_the_merge_queue() {
+        // The MI300X check is not required for merging, so a merge_group run's
+        // job is never waited for and, behind a single runner, outlives the PR it
+        // was queued for. The other lanes are unaffected.
+        let sh = read_workflow("e2e-selfhosted.yml");
+        // The sibling lanes' "keep running in the queue" check below is vacuous
+        // if the workflow stops triggering on merge_group at all.
+        let triggers = normalized_whitespace(
+            &top_level_block(&sh, "on")
+                .lines()
+                .map(strip_comment)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        assert!(
+            triggers.contains("merge_group: branches: [main] types: [checks_requested]"),
+            "e2e-selfhosted.yml must still trigger on merge_group (checks_requested on main) \
+             so the lanes that stay in the merge queue actually run (got `{triggers}`)"
+        );
+        let gate = |job: &str| {
+            let block = job_block(&sh, job);
+            let start = block
+                .find("    if: >-\n")
+                .unwrap_or_else(|| panic!("`{job}` has a folded `if:` gate"));
+            block[start..]
+                .lines()
+                .skip(1)
+                .take_while(|line| indent_of(line) > 4)
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        assert!(
+            normalized_whitespace(&gate("e2e-gpu")).starts_with(
+                "always() && needs.changes.result == 'success' \
+                 && github.event_name != 'merge_group' && ("
+            ),
+            "e2e-gpu (MI300X) must not run on merge_group events"
+        );
+        assert!(
+            !job_block(&sh, "e2e-gpu").contains("E2E_MERGE_QUEUE"),
+            "e2e-gpu never runs in the merge queue, so it must not opt into @merge-queue scenarios"
+        );
+        for job in [
+            "e2e-gpu-strix-ubuntu",
+            "e2e-gpu-strix-windows",
+            "e2e-wsl",
+            "e2e-gpu-w7900",
+        ] {
+            // Only the dispatch split may look at the event: any other event
+            // condition could silently keep the lane out of the merge queue.
+            let gate = normalized_whitespace(&gate(job));
+            assert!(
+                !gate.contains("merge_group") && !gate.contains("'pull_request'"),
+                "`{job}` must keep running in the merge queue (gate: `{gate}`)"
+            );
+        }
+    }
+
     #[test]
     fn concurrency_group_extractor_reads_folded_value() {
         let yaml = "\
@@ -4863,5 +5025,424 @@ permissions:
                  is now dead code (EAI-8751)"
             );
         }
+    }
+
+    /// Every `shell: pwsh` step in `text` as `(name, step block)`.
+    ///
+    /// The step is found from its `shell: pwsh` line by walking up to the
+    /// nearest `- ` item shallower than it, so the key order inside the step
+    /// does not matter.
+    fn pwsh_steps(text: &str) -> Vec<(String, String)> {
+        let lines: Vec<&str> = text.lines().collect();
+        let mut steps = Vec::new();
+        for (at, line) in lines.iter().enumerate() {
+            if strip_comment(line).trim() != "shell: pwsh" {
+                continue;
+            }
+            let shell_indent = indent_of(line);
+            let Some(start) = (0..at).rev().find(|&i| {
+                indent_of(lines[i]) < shell_indent && lines[i].trim_start().starts_with("- ")
+            }) else {
+                continue;
+            };
+            let step = step_block(&lines, start);
+            steps.push((step_name(&step), step));
+        }
+        steps
+    }
+
+    /// PowerShell words that open a statement but are not a program to run.
+    const PWSH_KEYWORDS: [&str; 15] = [
+        "if", "elseif", "else", "foreach", "for", "while", "do", "switch", "function", "try",
+        "catch", "finally", "throw", "exit", "return",
+    ];
+
+    /// Whether a trimmed, comment-free pwsh statement runs an external
+    /// program: `python …`, `cargo …`, `gh …`, `.\tool.exe`, `& $exe …`.
+    ///
+    /// Deliberately rough, and erring towards "native": assignments and
+    /// variables (`$x = …`), keywords, braces, string literals piped
+    /// somewhere (`"k=v" | Out-File …`) and cmdlets (`Verb-Noun`, which start
+    /// upper-case) are not; a lower-case first word that is not a keyword is.
+    fn is_native_command_line(line: &str) -> bool {
+        let line = line.trim();
+        if line.starts_with('&') {
+            return true;
+        }
+        let first = line
+            .split(|c: char| c.is_whitespace() || c == '(' || c == '{')
+            .next()
+            .unwrap_or_default();
+        let Some(lead) = first.chars().next() else {
+            return false;
+        };
+        (lead.is_ascii_lowercase() || lead == '.')
+            && !PWSH_KEYWORDS.contains(&first.to_ascii_lowercase().as_str())
+    }
+
+    /// The statements of a pwsh `run: |` body, in order.
+    ///
+    /// A line is split at its top-level `;`s (see
+    /// [`split_top_level_statements`]), so `Write-Output 'ok'; sccache
+    /// --start-server` is two statements. A backtick continuation is joined
+    /// onto the line it continues. A here-string (`@'`/`@"` … `'@`/`"@`)
+    /// stands in as `@'…'@` for the statement it opens, and whatever follows
+    /// the closing marker on its line is analysed as the rest of that
+    /// statement: `'@ | Out-File x; cargo build` still yields `cargo build`.
+    /// Comments and blank lines are dropped.
+    fn pwsh_statements(body: &[&str]) -> Vec<String> {
+        let mut statements = Vec::new();
+        // The logical line built so far: a line plus any continuation and
+        // here-string it carries on into.
+        let mut pending = String::new();
+        let mut here_string_close: Option<&str> = None;
+        for raw in body {
+            let line = raw.trim();
+            if let Some(close) = here_string_close {
+                // Only a line that starts with the opener's own closing
+                // marker ends a here-string; anything else is its text.
+                let Some(rest) = line.strip_prefix(close) else {
+                    continue;
+                };
+                here_string_close = None;
+                pending.push('…');
+                pending.push_str(close);
+                pending.push_str(rest);
+            } else {
+                if pending.is_empty() && (line.is_empty() || line.starts_with('#')) {
+                    continue;
+                }
+                if !pending.is_empty() {
+                    pending.push(' ');
+                }
+                pending.push_str(line);
+            }
+            if let Some(continued) = pending.strip_suffix('`') {
+                pending = continued.trim_end().to_owned();
+                continue;
+            }
+            if pending.ends_with("@'") {
+                here_string_close = Some("'@");
+                continue;
+            }
+            if pending.ends_with("@\"") {
+                here_string_close = Some("\"@");
+                continue;
+            }
+            statements.extend(split_top_level_statements(&pending));
+            pending.clear();
+        }
+        statements.extend(split_top_level_statements(&pending));
+        statements
+    }
+
+    /// One logical pwsh line split at each `;` that ends a statement: those
+    /// outside quotes, outside `(…)`/`{…}` (script blocks, hashtables,
+    /// subexpressions — `@{ a = 1; b = 2 }` is one statement), not escaped
+    /// with a backtick, and before any `#` comment, which is dropped. Each
+    /// statement comes back trimmed; empty ones are skipped.
+    fn split_top_level_statements(line: &str) -> Vec<String> {
+        let mut statements = Vec::new();
+        let mut current = String::new();
+        let mut depth = 0usize;
+        let mut quote: Option<char> = None;
+        // A `#` opens a comment only where a token can start.
+        let mut at_token_start = true;
+        let mut chars = line.chars();
+        while let Some(c) = chars.next() {
+            match (quote, c) {
+                // Inside '…' nothing is special; `''` is two adjacent strings
+                // as far as splitting is concerned, which is the same thing.
+                (Some('\''), '\'') | (Some('"'), '"') => quote = None,
+                (Some('"') | None, '`') => {
+                    current.push(c);
+                    if let Some(escaped) = chars.next() {
+                        current.push(escaped);
+                    }
+                    at_token_start = false;
+                    continue;
+                }
+                (Some(_), _) => {}
+                (None, '\'' | '"') => quote = Some(c),
+                (None, '#') if at_token_start => break,
+                (None, '(' | '{') => depth += 1,
+                (None, ')' | '}') => depth = depth.saturating_sub(1),
+                (None, ';') if depth == 0 => {
+                    statements.push(std::mem::take(&mut current));
+                    at_token_start = true;
+                    continue;
+                }
+                (None, _) => {}
+            }
+            current.push(c);
+            at_token_start = quote.is_none() && (c.is_whitespace() || "({;|".contains(c));
+        }
+        statements.push(current);
+        statements
+            .into_iter()
+            .map(|statement| statement.trim().to_owned())
+            .filter(|statement| !statement.is_empty())
+            .collect()
+    }
+
+    /// The native-command statements in a pwsh body whose exit status
+    /// nothing reads: not the body's last statement, and not followed by a
+    /// statement that inspects `$LASTEXITCODE`.
+    fn unchecked_native_commands(body: &[&str]) -> Vec<String> {
+        let statements = pwsh_statements(body);
+        statements
+            .iter()
+            .enumerate()
+            .filter(|(i, line)| {
+                is_native_command_line(line)
+                    && statements
+                        .get(i + 1)
+                        .is_some_and(|next| !next.contains("$LASTEXITCODE"))
+            })
+            .map(|(_, line)| line.clone())
+            .collect()
+    }
+
+    /// [`unchecked_native_commands`] over a pwsh step's script: its `run: |`
+    /// block, or its one-line `run:` value, which can chain statements with
+    /// `;` just the same.
+    fn unchecked_native_commands_in_step(step: &str) -> Vec<String> {
+        match run_block(step) {
+            Some(body) => unchecked_native_commands(&body),
+            None => unchecked_native_commands(&[step_key(step, "run").as_str()]),
+        }
+    }
+
+    /// pwsh steps allowed to run a native command whose status is unread,
+    /// keyed by `(workflow, step name)`, each with the reason it is safe.
+    const PWSH_UNCHECKED_NATIVE_ALLOWED: [(&str, &str, &str); 3] = [
+        (
+            "ci.yml",
+            "Probe sccache cache backend",
+            "the probe decides for itself and ends in `exit 0`; the one unread \
+             status is a best-effort `sccache --stop-server` cleanup",
+        ),
+        (
+            "nightly.yml",
+            "Package Windows bundle",
+            "a failed `cargo xtask package` leaves no zip or signature, so the \
+             `Copy-Item`/`throw` on its outputs stops the step under the runner's \
+             `$ErrorActionPreference = 'stop'`",
+        ),
+        (
+            "release.yml",
+            "Package Windows bundle",
+            "a failed `cargo xtask package` leaves no zip or signature, so the \
+             `Copy-Item`/`throw` on its outputs stops the step under the runner's \
+             `$ErrorActionPreference = 'stop'`",
+        ),
+    ];
+
+    /// GitHub runs a `shell: pwsh` body with `$ErrorActionPreference = 'stop'`
+    /// and then `exit $LASTEXITCODE`. A failing *cmdlet* stops the step, but a
+    /// failing *native command* does not: the script carries on, and only the
+    /// last native command's status decides the step. So in
+    ///
+    /// ```text
+    /// python a.py --self-test   # exits 1
+    /// python b.py --self-test   # exits 0
+    /// ```
+    ///
+    /// the step is green. Every native command that is not the body's last
+    /// statement must therefore have its `$LASTEXITCODE` read on the next
+    /// line, or be split into its own step (#633), or be allow-listed above
+    /// with the reason its failure still surfaces.
+    #[test]
+    fn no_pwsh_step_lets_a_failing_native_command_pass_unseen() {
+        let dir = repo_root().join(".github/workflows");
+        let mut workflows: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", dir.display()))
+            .map(|entry| entry.expect("workflow dir entry").path())
+            .filter(|path| {
+                path.extension().is_some_and(|ext| {
+                    ext.eq_ignore_ascii_case("yml") || ext.eq_ignore_ascii_case("yaml")
+                })
+            })
+            .map(|path| {
+                path.file_name()
+                    .expect("a read_dir entry has a file name")
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        workflows.sort();
+
+        let mut offenders = Vec::new();
+        let mut allowed_seen = Vec::new();
+        for workflow in &workflows {
+            let text = read_workflow(workflow);
+            for (name, step) in pwsh_steps(&text) {
+                let unchecked = unchecked_native_commands_in_step(&step);
+                if unchecked.is_empty() {
+                    continue;
+                }
+                if PWSH_UNCHECKED_NATIVE_ALLOWED
+                    .iter()
+                    .any(|(w, n, _)| w == workflow && *n == name)
+                {
+                    allowed_seen.push((workflow.clone(), name));
+                    continue;
+                }
+                offenders.push(format!("{workflow} step {name:?}: {unchecked:?}"));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "these `shell: pwsh` steps run a native command whose failure the step \
+             would not report, because pwsh carries on and the step takes only the last \
+             command's exit code — split each into its own step, or check \
+             `$LASTEXITCODE` right after it:\n  {}",
+            offenders.join("\n  ")
+        );
+        // An allow-list entry that no longer matches anything exempts nothing
+        // and would quietly cover the next step to take that name.
+        for (workflow, name, _) in PWSH_UNCHECKED_NATIVE_ALLOWED {
+            assert!(
+                allowed_seen.iter().any(|(w, n)| w == workflow && n == name),
+                "{workflow} step {name:?} is allow-listed in \
+                 PWSH_UNCHECKED_NATIVE_ALLOWED but no longer has an unchecked native \
+                 command; drop the entry"
+            );
+        }
+    }
+
+    /// The masking shape #633 removed is still caught, and the shapes that
+    /// read the status are not.
+    #[test]
+    fn unchecked_native_commands_finds_the_masking_shape() {
+        let merged = [
+            "python .\\scripts\\comfyui_therock_gpu_test.py --self-test",
+            "python .\\scripts\\local_assistant_therock_gpu_test.py --self-test",
+            "python .\\scripts\\vllm_therock_gpu_test.py --self-test",
+        ];
+        assert_eq!(unchecked_native_commands(&merged), merged[..2].to_vec());
+
+        let checked = [
+            "$targetDir = if ($env:X) { $env:X } else { \"target\" }",
+            "# a comment",
+            "sccache --start-server",
+            "if ($LASTEXITCODE -ne 0) {",
+            "  Write-Output \"::warning::no cache\"",
+            "}",
+            "@'",
+            "cargo build   # inside a here-string, not a command",
+            "'@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY",
+            "cargo xtask e2e",
+            "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
+            "python .\\scripts\\release_readiness.py `",
+            "  --dist dist",
+        ];
+        assert!(
+            unchecked_native_commands(&checked).is_empty(),
+            "{:?}",
+            unchecked_native_commands(&checked)
+        );
+    }
+
+    /// A `;` ends a statement, so a native command chained before another
+    /// statement on one line is checked like one on a line of its own — but
+    /// only a top-level `;`: not one in a string, a hashtable or script
+    /// block, a comment, or escaped with a backtick.
+    #[test]
+    fn unchecked_native_commands_splits_statements_at_top_level_semicolons() {
+        let chained = [
+            "Write-Output 'ok'; sccache --start-server",
+            "cargo xtask e2e",
+        ];
+        assert_eq!(
+            unchecked_native_commands(&chained),
+            ["sccache --start-server"]
+        );
+        assert_eq!(
+            unchecked_native_commands(&["cargo build; cargo test"]),
+            ["cargo build"]
+        );
+        assert!(
+            unchecked_native_commands(&["cargo build; if ($LASTEXITCODE -ne 0) { exit 1 }"])
+                .is_empty()
+        );
+
+        // Each of these is ONE statement; splitting it would leave a
+        // lower-case fragment (`cargo`, `b`, `then`) that reads as a native
+        // command and, followed by `cargo xtask e2e`, as an unchecked one.
+        for line in [
+            "Write-Output \"done; cargo is next\"",
+            "Write-Output 'done; cargo is next'",
+            "Write-Output \"it`\"s done; cargo is next\"",
+            "$h = @{ a = 1; b = 2 }",
+            "$v = $(Get-Date; Get-Location)",
+            "Write-Output done # then; cargo",
+            "Write-Output done`; then",
+        ] {
+            let body = [line, "cargo xtask e2e"];
+            assert!(
+                unchecked_native_commands(&body).is_empty(),
+                "{line:?} split into {:?}",
+                pwsh_statements(&body)
+            );
+        }
+
+        // A one-line `run:` chains statements just the same.
+        let step = "      - name: Lint\n        shell: pwsh\n        \
+                    run: cargo fmt --check; cargo clippy  # both\n";
+        assert_eq!(
+            unchecked_native_commands_in_step(step),
+            ["cargo fmt --check"]
+        );
+    }
+
+    /// Only the closing marker of a here-string is skipped: the rest of its
+    /// line is the tail of the statement the here-string opened, and any
+    /// statement chained after it is checked.
+    #[test]
+    fn unchecked_native_commands_reads_on_past_a_here_string_close() {
+        let body = [
+            "@'",
+            "## Summary",
+            "'@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY; sccache --start-server",
+            "cargo xtask e2e",
+        ];
+        assert_eq!(
+            pwsh_statements(&body),
+            [
+                "@'…'@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY",
+                "sccache --start-server",
+                "cargo xtask e2e",
+            ]
+        );
+        assert_eq!(unchecked_native_commands(&body), ["sccache --start-server"]);
+
+        // A here-string inside the statement that reads the status leaves
+        // that statement whole: `if ($LASTEXITCODE …) { throw @"…"@ }`.
+        let checked = [
+            "cargo build",
+            "if ($LASTEXITCODE -ne 0) { throw @\"",
+            "build failed",
+            "\"@ }",
+            "cargo xtask e2e",
+        ];
+        assert!(
+            unchecked_native_commands(&checked).is_empty(),
+            "{:?}",
+            pwsh_statements(&checked)
+        );
+
+        // `"@` does not close a `@'` here-string: its text runs on to `'@`.
+        let mismatched = [
+            "@'",
+            "\"@; cargo inside the text",
+            "'@ | Out-File x",
+            "cargo xtask e2e",
+        ];
+        assert!(
+            unchecked_native_commands(&mismatched).is_empty(),
+            "{:?}",
+            pwsh_statements(&mismatched)
+        );
     }
 }

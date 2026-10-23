@@ -24,6 +24,17 @@ mod state;
 
 pub(crate) const ENGINE_NAME: &str = "vllm";
 
+/// The torchaudio release (no `+rocm…` local label) confirmed on hardware for
+/// `rocm_sdk_version`'s ROCm `major.minor` line, if one is recorded.
+///
+/// The single source of truth is this crate's ROCm 10.x discover-build table,
+/// which pins it for the vLLM install; `rocm install sdk` reads it here so the
+/// SDK pins the same build instead of keeping a second copy. `None` means no
+/// build has been verified for that line, not that none works.
+pub fn verified_torchaudio_release(rocm_sdk_version: &str) -> Option<&'static str> {
+    install::verified_torchaudio_release(rocm_sdk_version)
+}
+
 pub(crate) const DEFAULT_HOST: &str = "127.0.0.1";
 
 #[derive(Parser, Debug)]
@@ -85,6 +96,32 @@ enum CommandKind {
         #[arg(long)]
         engine_recipe_json: Option<String>,
     },
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ServeHttpRequest {
+    pub(crate) service_id: String,
+    pub(crate) model_ref: String,
+    pub(crate) host: String,
+    pub(crate) port: u16,
+    pub(crate) device_policy: DevicePolicy,
+    pub(crate) gpu_indices: Vec<u32>,
+    pub(crate) runtime_id: Option<String>,
+    pub(crate) env_id: Option<String>,
+    pub(crate) state_path: PathBuf,
+    pub(crate) log_path: Option<PathBuf>,
+    pub(crate) engine_recipe: Option<EngineRecipeHint>,
+}
+
+/// Required launch flags an accepted engine recipe carries for `vllm serve`.
+///
+/// Shared by `process.rs` (building the actual argv) and `state.rs` (mirroring
+/// those flags into the running-state payload) so neither has to depend on the
+/// other for it.
+pub(crate) fn engine_recipe_launch_args(engine_recipe: Option<&EngineRecipeHint>) -> Vec<String> {
+    engine_recipe
+        .map(|hint| hint.required_flags.clone())
+        .unwrap_or_default()
 }
 
 pub fn run_cli() -> Result<()> {
@@ -158,7 +195,7 @@ pub fn run_cli() -> Result<()> {
             let log_path = AppPaths::discover()?
                 .engine_logs_dir(ENGINE_NAME)
                 .join(format!("{service_id}.log"));
-            crate::process::serve_http(crate::process::ServeHttpRequest {
+            crate::process::serve_http(ServeHttpRequest {
                 service_id,
                 model_ref,
                 host,
@@ -194,7 +231,7 @@ pub fn builtin_serve_http(
     log_path: Option<PathBuf>,
     engine_recipe: Option<EngineRecipeHint>,
 ) -> Result<()> {
-    crate::process::serve_http(crate::process::ServeHttpRequest {
+    crate::process::serve_http(ServeHttpRequest {
         service_id,
         model_ref,
         host,
@@ -348,7 +385,24 @@ fn print_json<T: Serialize>(value: &T) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rocm_engine_protocol::ENGINE_RECIPE_CONTRACT_VERSION;
     use serde_json::json;
+
+    #[test]
+    fn engine_recipe_launch_args_forward_required_flags() {
+        let hint = EngineRecipeHint {
+            contract_version: ENGINE_RECIPE_CONTRACT_VERSION.to_owned(),
+            engine: ENGINE_NAME.to_owned(),
+            required_flags: vec!["--enable-auto-tool-choice".to_owned()],
+            notes: vec!["test recipe".to_owned()],
+            ..EngineRecipeHint::default()
+        };
+
+        assert_eq!(
+            engine_recipe_launch_args(Some(&hint)),
+            vec!["--enable-auto-tool-choice".to_owned()]
+        );
+    }
 
     #[test]
     fn stdio_protocol_routes_all_methods_without_side_effects() {

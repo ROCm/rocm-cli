@@ -35,7 +35,7 @@ Feature: Model serving
   # vLLM per-PR canary: one real vLLM serve runs on every PR so a broken serve is
   # caught before merge, while the heavier `@merge-queue` serves
   # (`serve-default-engine-working-endpoint`, `serve-default-engine-inference`,
-  # and `serve-readiness-contract`) run only in the merge queue.
+  # and `serve-readiness-contract`) run only in the merge queue (not on MI300X).
   @id:serve-vllm-inference @requires-gpu @requires-engine:vllm
   Scenario: serve-05 - A served model responds to inference requests on vLLM
     Given a managed runtime is active
@@ -118,7 +118,7 @@ Feature: Model serving
   # Readiness contract: when the CLI reports a service ready, inference must work.
   # Engine-agnostic — the served model+engine follow the host (see
   # `a model is being served on GPU`), so this holds the contract on every GPU
-  # platform. Readiness is gated on a real inference probe, which is what makes
+  # platform that runs it (the merge queue skips MI300X). Readiness is gated on a real inference probe, which is what makes
   # this contract hold rather than race the model load.
   @id:serve-readiness-contract @requires-gpu @merge-queue
   Scenario: serve-12 - A service reported ready can immediately serve inference
@@ -322,3 +322,22 @@ Feature: Model serving
     When the user serves that same model again with --require-api-key
     Then the CLI refuses and names the exact command to stop the existing service
     And running that command actually stops the service
+
+  # ROCMAI-543: a Windows console on the OEM code page (437) renders a UTF-8 em
+  # dash, and other non-ASCII punctuation, as mojibake (e.g. "ΓÇö") instead of
+  # transliterating it. `rocm model` is the flagship instance of that bug class;
+  # this pins the fix at the CLI-output level (not just the internal renderer
+  # unit tests in apps/rocm/src/main.rs) so a future catalog label or hint line
+  # cannot reintroduce it unnoticed. No GPU needed: the command only reads the
+  # built-in catalog.
+  #
+  # The step says ASCII-only rather than punctuation-only because that is what
+  # it enforces: the rule is about the *bytes* on a redirected stream, so a
+  # non-ASCII letter or CJK label would be exactly as unreadable on code page
+  # 437 as an em dash is. Narrowing the assertion to a punctuation class to
+  # match a narrower wording would make this scenario weaker than the
+  # whole-tree contract in xtask/src/ascii_output_contract.rs that it mirrors.
+  @id:serve-model-list-output-is-ascii
+  Scenario: serve-25 - The recommended model list prints ASCII-only text
+    When the user lists recommended models
+    Then the model list output contains only ASCII characters
