@@ -915,7 +915,9 @@ impl TuiSession {
     /// added to the deadline, up to a wall-clock cap of
     /// [`WALL_CLOCK_CAP_FACTOR`](e2e_cucumber::polled_deadline::WALL_CLOCK_CAP_FACTOR)
     /// times `timeout`.
-    /// [`e2e_cucumber::quit_and_wait::quit_and_wait`] gives the reasons for both.
+    /// [`e2e_cucumber::quit_and_wait::quit_and_wait`] explains why the gesture
+    /// is resent, why the wait doubles, and why the deadline counts only
+    /// polled time.
     pub async fn quit_and_wait(&mut self, timeout: Duration) -> Result<(), String> {
         // Several fixtures leave a model serving (`simulated`/demo sessions
         // never do — `AppState::has_live_instance` always returns `false`

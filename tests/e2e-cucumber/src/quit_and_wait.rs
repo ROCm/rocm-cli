@@ -288,6 +288,20 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_wait_is_cut_to_the_wall_clock_cap_when_stalls_push_the_deadline_past_it() {
+        // A 380 ms stall in the first wait moves the 100 ms deadline to 425 ms,
+        // past the 400 ms cap. The doubled 10 s interval must then be cut to
+        // the cap, not to the deadline, so the loop ends at 400 ms on the cap.
+        let (error, elapsed) = never_exits(timing(100, 5000), Duration::from_millis(380)).await;
+
+        assert!(
+            matches!(error, QuitError::TimedOut(Expiry::WallClock { .. })),
+            "{error:?}"
+        );
+        assert_eq!(elapsed, Duration::from_millis(400));
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn a_child_that_never_exits_times_out() {
         let (error, _) = never_exits(timing(60, 10), Duration::ZERO).await;
 

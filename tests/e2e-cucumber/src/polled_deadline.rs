@@ -197,13 +197,19 @@ pub(crate) mod test_support {
     /// A wait that re-checks `done` every [`TICK`] for up to `budget`, after
     /// first going unpolled for `stall` (as when another scenario's
     /// synchronous step holds cucumber's task). Returns whether `done` held.
+    ///
+    /// A wait that gives up without having slept at all sleeps one [`TICK`]
+    /// first. Then a loop that keeps handing out empty budgets, because its
+    /// deadline is broken, still advances the paused clock, and the test's
+    /// outer `tokio::time::timeout` fails it instead of spinning forever.
     pub async fn ticking_wait(
         budget: Duration,
         stall: Duration,
         mut done: impl FnMut() -> bool,
     ) -> bool {
         let deadline = Instant::now() + budget;
-        if !stall.is_zero() {
+        let mut slept = !stall.is_zero();
+        if slept {
             tokio::time::sleep(stall).await;
         }
         loop {
@@ -211,9 +217,13 @@ pub(crate) mod test_support {
                 return true;
             }
             if Instant::now() >= deadline {
+                if !slept {
+                    tokio::time::sleep(TICK).await;
+                }
                 return false;
             }
             tokio::time::sleep(TICK).await;
+            slept = true;
         }
     }
 
@@ -314,18 +324,62 @@ mod tests {
     async fn the_wall_clock_cap_ends_a_loop_that_keeps_stalling() {
         // Every wait stalls for 1 s against a 100 ms timeout, so each one moves
         // the deadline past the time it took, and only the 400 ms cap ends it.
+        // The outer timeout fails the test, instead of hanging it, if the cap
+        // never fires.
         let mut deadline = PolledDeadline::start(timing(100));
         let cap = Duration::from_millis(100) * WALL_CLOCK_CAP_FACTOR;
-        while deadline.expired().is_none() {
-            let budget = deadline.budget(Duration::from_millis(10));
-            deadline
-                .run(ticking_wait(budget, Duration::from_secs(1), || false))
-                .await;
-        }
+        let run = async {
+            while deadline.expired().is_none() {
+                let budget = deadline.budget(Duration::from_millis(10));
+                deadline
+                    .run(ticking_wait(budget, Duration::from_secs(1), || false))
+                    .await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .expect("the wall-clock cap must end the loop");
         let Some(Expiry::WallClock { cap: reported, .. }) = deadline.expired() else {
             panic!("expected the wall-clock cap, got {:?}", deadline.expired());
         };
         assert_eq!(reported, cap);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_budget_is_cut_to_the_wall_clock_cap_once_stalls_pass_it() {
+        // A 380 ms stall against a 100 ms timeout credits 325 ms, so the
+        // deadline is 425 ms, past the 400 ms cap. A wait that asks for 10 s
+        // must get only the 20 ms left before the cap, and end there; cut to
+        // the deadline alone, it would get 45 ms and end at 425 ms.
+        let mut deadline = PolledDeadline::start(timing(100));
+        let started = Instant::now();
+        let cap = Duration::from_millis(100) * WALL_CLOCK_CAP_FACTOR;
+        let stall = Duration::from_millis(380);
+        deadline
+            .run(ticking_wait(Duration::ZERO, stall, || false))
+            .await;
+        assert!(
+            deadline.deadline > started + cap,
+            "the stall must push the deadline past the cap"
+        );
+        assert_eq!(deadline.expired(), None);
+
+        let budget = deadline.budget(Duration::from_secs(10));
+        assert_eq!(
+            budget,
+            Duration::from_millis(20),
+            "the 20 ms left before the cap"
+        );
+        deadline
+            .run(ticking_wait(budget, Duration::ZERO, || false))
+            .await;
+
+        assert_eq!(started.elapsed(), cap);
+        assert!(
+            matches!(deadline.expired(), Some(Expiry::WallClock { .. })),
+            "{:?}",
+            deadline.expired()
+        );
     }
 
     #[test]

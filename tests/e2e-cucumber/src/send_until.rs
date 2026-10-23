@@ -76,6 +76,7 @@ mod tests {
     use crate::reader_failure::{ReaderFailure, ReaderFailureObservation};
     use std::sync::{Arc, mpsc};
     use std::time::Duration;
+    use tokio::time::Instant;
 
     #[derive(Default)]
     struct TestState {
@@ -362,6 +363,30 @@ mod tests {
 
         assert_eq!(result, Ok(()));
         assert_eq!(screen.sends, 2);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_wait_longer_than_the_time_left_is_cut_to_the_deadline() {
+        // The resend interval is 50 times the timeout. Without the cut, the
+        // first wait runs its whole 5 s interval past the 100 ms deadline.
+        let mut screen = LossyScreen {
+            lost: usize::MAX,
+            sends: 0,
+        };
+        let started = Instant::now();
+
+        let error = send_into(&mut screen, timing_with_resend(100, 5000), || {
+            Duration::ZERO
+        })
+        .await
+        .expect_err("a marker that never appears must time out");
+
+        let elapsed = started.elapsed();
+        assert!(error.starts_with("timed out after 100ms "), "{error}");
+        assert!(
+            elapsed <= Duration::from_millis(100) + TICK,
+            "the wait must stop at the 100ms deadline, took {elapsed:?}"
+        );
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
