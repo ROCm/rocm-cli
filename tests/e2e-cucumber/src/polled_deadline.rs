@@ -13,22 +13,36 @@
 //!
 //! [`PolledDeadline`] measures the gaps between polls of each wait instead. A
 //! wait is expected to be polled at least every `poll_interval` (the cadence
-//! of its own re-check loop); a gap longer than twice that is a stall, and
-//! everything past one `poll_interval` of it is added to the deadline. So the
-//! timeout is the time the loop's waits were actually polled, whether a stall
-//! lands inside a wait's budget or runs past it. A wall-clock cap of
-//! [`WALL_CLOCK_CAP_FACTOR`] times the timeout bounds how far stalls can push
-//! the deadline, so a pathological stall still fails the step rather than the
-//! whole job.
+//! of its own re-check loop), and its timer may fire up to [`TIMER_SLACK`]
+//! late; whatever a gap runs past both is a stall, and is added to the
+//! deadline. So the timeout is the time the loop's waits were actually
+//! polled, whether a stall lands inside a wait's budget or runs past it. A
+//! wall-clock cap of [`WALL_CLOCK_CAP_FACTOR`] times the timeout bounds how far
+//! stalls can push the deadline, so a pathological stall still fails the step
+//! rather than the whole job.
+//!
+//! Time is read from [`tokio::time::Instant`]: the host clock in the harness,
+//! and a paused, virtual one in the unit tests below, so their timing
+//! assertions do not depend on how precisely the host's timers fire.
 
 use std::fmt;
 use std::future::{Future, poll_fn};
 use std::pin::Pin;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use tokio::time::Instant;
 
 /// How many times the timeout a loop may run in wall-clock time, however much
 /// of it was stalled.
 pub const WALL_CLOCK_CAP_FACTOR: u32 = 4;
+
+/// How late a wait's timer may fire and still count as polling, not a stall.
+///
+/// A sleep on Windows ends on a tick of its default 15.6 ms timer, and a
+/// loaded host can miss that tick by another one or two; this is about three
+/// ticks. Real harness stalls (another scenario running `rocm` synchronously)
+/// last hundreds of milliseconds or more, so they still register.
+pub const TIMER_SLACK: Duration = Duration::from_millis(50);
 
 /// Deadline and per-attempt wait shared by the retry loops.
 #[derive(Clone, Copy, Debug)]
@@ -37,9 +51,8 @@ pub struct RetryTiming {
     pub timeout: Duration,
     /// Wait for one attempt to take effect before acting again.
     pub resend_interval: Duration,
-    /// Longest gap between two polls of a wait that is not a stall: the
-    /// cadence at which the wait re-checks its condition. A gap longer than
-    /// twice this counts as a stall.
+    /// Cadence at which a wait re-checks its condition. A gap between two
+    /// polls of the wait that runs past this plus [`TIMER_SLACK`] is a stall.
     pub poll_interval: Duration,
 }
 
@@ -155,26 +168,31 @@ impl PolledDeadline {
     }
 }
 
-/// How much of a `gap` between two polls of a wait was a stall. The wait
-/// sleeps `poll_interval` between checks, and a timer can fire a little late,
-/// so a gap up to twice that is polling and none of it is a stall. Past that,
-/// all but the one `poll_interval` the wait meant to sleep is.
+/// How much of a `gap` between two polls of a wait was a stall: whatever it
+/// ran past the `poll_interval` the wait meant to sleep plus the
+/// [`TIMER_SLACK`] its timer may fire late by. Neither is the harness stalling,
+/// so a wait whose timer is coarse (as on Windows) is never reported as one.
 fn stall_in(gap: Duration, poll_interval: Duration) -> Duration {
-    if gap > poll_interval.saturating_mul(2) {
-        gap.saturating_sub(poll_interval)
-    } else {
-        Duration::ZERO
-    }
+    gap.saturating_sub(poll_interval + TIMER_SLACK)
 }
 
-/// Test doubles shared by the retry loops' unit tests.
+/// Test doubles shared by the retry loops' unit tests. They run on tokio's
+/// paused clock (`start_paused = true`), so a sleep advances time by exactly
+/// what it asks for and the tests' timing assertions are exact on every host.
 #[cfg(test)]
 pub(crate) mod test_support {
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
+    use tokio::time::Instant;
 
     /// Poll cadence of [`ticking_wait`], and the `poll_interval` the tests
     /// give the loops.
     pub const TICK: Duration = Duration::from_millis(5);
+
+    /// What a `stall`, as [`ticking_wait`] takes it, adds to the deadline:
+    /// all of it except the tick and timer slack of ordinary polling.
+    pub fn credited(stall: Duration) -> Duration {
+        stall.saturating_sub(TICK + super::TIMER_SLACK)
+    }
 
     /// A wait that re-checks `done` every [`TICK`] for up to `budget`, after
     /// first going unpolled for `stall` (as when another scenario's
@@ -214,9 +232,12 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::{TICK, ticking_wait};
-    use super::{Expiry, PolledDeadline, RetryTiming, WALL_CLOCK_CAP_FACTOR, stall_in};
+    use super::test_support::{TICK, credited, ticking_wait};
+    use super::{
+        Expiry, PolledDeadline, RetryTiming, TIMER_SLACK, WALL_CLOCK_CAP_FACTOR, stall_in,
+    };
     use std::time::Duration;
+    use tokio::time::Instant;
 
     fn timing(timeout_ms: u64) -> RetryTiming {
         RetryTiming {
@@ -228,11 +249,13 @@ mod tests {
 
     #[test]
     fn polling_slack_is_not_a_stall() {
-        // `wait_for_exit_code_within` notices its budget only after the sleep
-        // that runs one tick past it, and a timer can fire a little late: both
-        // are polling, and must not be reported as the harness stalling.
+        // The harness polls every 20 ms. A wait sleeps that long, and its timer
+        // can fire late: on Windows a 20 ms sleep ends on a 15.6 ms tick, after
+        // two or three of them (31 or 47 ms), and `wait_for_exit_code_within`
+        // notices its budget only after the sleep that runs one tick past it.
+        // All of that is polling, not the harness stalling.
         let tick = Duration::from_millis(20);
-        for gap in [0, 20, 23, 40] {
+        for gap in [0, 20, 23, 31, 40, 47, 70] {
             assert_eq!(
                 stall_in(Duration::from_millis(gap), tick),
                 Duration::ZERO,
@@ -240,41 +263,63 @@ mod tests {
             );
         }
         assert_eq!(
-            stall_in(Duration::from_millis(41), tick),
-            Duration::from_millis(21)
+            stall_in(Duration::from_millis(71), tick),
+            Duration::from_millis(1)
         );
         assert_eq!(
             stall_in(Duration::from_secs(102), tick),
-            Duration::from_secs(102).saturating_sub(tick)
+            Duration::from_secs(102).saturating_sub(tick + TIMER_SLACK)
         );
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn a_stall_inside_the_budget_moves_the_deadline() {
         // The stall ends well inside the wait's 200 ms budget, so the wait itself
-        // comes back on time; the stall must still be credited.
+        // comes back on time; the stall must still be credited, once.
         let mut deadline = PolledDeadline::start(timing(10_000));
         let before = deadline.deadline;
         let stall = Duration::from_millis(150);
         deadline
             .run(ticking_wait(Duration::from_millis(200), stall, || false))
             .await;
-        assert!(
-            deadline.stalled >= stall.saturating_sub(TICK) && deadline.stalled < stall + 4 * TICK,
-            "stalled {:?} for a {stall:?} stall",
-            deadline.stalled
-        );
-        assert_eq!(deadline.deadline - before, deadline.stalled);
+        assert_eq!(deadline.stalled, credited(stall));
+        assert_eq!(deadline.deadline - before, credited(stall));
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_coarse_timer_is_not_a_stall() {
+        // A wait polling every 20 ms on a host whose timer only fires on a
+        // 15.625 ms tick, and late by a tick: every sleep lasts three ticks.
+        let poll_interval = Duration::from_millis(20);
+        let coarse = Duration::from_micros(3 * 15_625);
+        let mut deadline = PolledDeadline::start(RetryTiming {
+            timeout: Duration::from_secs(10),
+            resend_interval: Duration::from_secs(1),
+            poll_interval,
+        });
+        let before = deadline.deadline;
+        let started = Instant::now();
+        deadline
+            .run(async {
+                while started.elapsed() < Duration::from_secs(1) {
+                    tokio::time::sleep(coarse).await;
+                }
+            })
+            .await;
+        assert_eq!(deadline.stalled, Duration::ZERO);
+        assert_eq!(deadline.deadline, before);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn the_wall_clock_cap_ends_a_loop_that_keeps_stalling() {
-        let mut deadline = PolledDeadline::start(timing(20));
-        let cap = Duration::from_millis(20) * WALL_CLOCK_CAP_FACTOR;
+        // Every wait stalls for 1 s against a 100 ms timeout, so each one moves
+        // the deadline past the time it took, and only the 400 ms cap ends it.
+        let mut deadline = PolledDeadline::start(timing(100));
+        let cap = Duration::from_millis(100) * WALL_CLOCK_CAP_FACTOR;
         while deadline.expired().is_none() {
             let budget = deadline.budget(Duration::from_millis(10));
             deadline
-                .run(ticking_wait(budget, Duration::from_millis(30), || false))
+                .run(ticking_wait(budget, Duration::from_secs(1), || false))
                 .await;
         }
         let Some(Expiry::WallClock { cap: reported, .. }) = deadline.expired() else {

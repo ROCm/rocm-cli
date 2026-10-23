@@ -76,6 +76,11 @@ vt100 = "0.16"
 # below, nothing under `src/` touches it, and `xtask check-crate-edges` exempts
 # dev edges by design — so keeping it here needs no allowlist entry.
 rocm-core = { path = "../../crates/rocm-core" }
+# `test-util` pauses tokio's clock in the retry loops' unit tests
+# (`#[tokio::test(start_paused = true)]`), so their timing assertions read a
+# virtual clock that sleeps advance exactly, not the host timer, whose
+# granularity varies by platform (about 15.6 ms on Windows).
+tokio = { workspace = true, features = ["test-util"] }
 
 # `fcntl(F_GETFL)` only, to read (never modify) the `O_NONBLOCK` state of the
 # suite's own stdio for the diagnostics log (see `src/harness_diagnostics.rs`).

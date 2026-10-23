@@ -72,7 +72,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::{RetryTiming, TerminalState, send_until};
-    use crate::polled_deadline::test_support::{TICK, stalls_once, ticking_wait};
+    use crate::polled_deadline::test_support::{TICK, credited, stalls_once, ticking_wait};
     use crate::reader_failure::{ReaderFailure, ReaderFailureObservation};
     use std::sync::{Arc, mpsc};
     use std::time::Duration;
@@ -85,7 +85,7 @@ mod tests {
         waits: usize,
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn captured_reader_panic_stops_retry_before_reader_thread_finishes() {
         const PANIC_ERROR: &str = "captured reader panic error";
 
@@ -134,7 +134,7 @@ mod tests {
         assert_eq!(state.waits, 1, "terminal failure must not wait again");
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn terminal_error_published_as_wait_times_out_wins_over_marker_timeout() {
         const PANIC_ERROR: &str = "captured reader panic error";
         const MARKER_TIMEOUT: &str = "marker timeout";
@@ -201,7 +201,7 @@ mod tests {
         assert_eq!(state.waits, 1, "terminal failure must not wait again");
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn terminal_error_published_between_former_take_and_check_is_preserved() {
         const PANIC_ERROR: &str = "captured reader panic error";
         const MARKER_TIMEOUT: &str = "marker timeout";
@@ -315,14 +315,18 @@ mod tests {
     }
 
     fn timing(timeout_ms: u64) -> RetryTiming {
+        timing_with_resend(timeout_ms, 50)
+    }
+
+    fn timing_with_resend(timeout_ms: u64, resend_ms: u64) -> RetryTiming {
         RetryTiming {
             timeout: Duration::from_millis(timeout_ms),
-            resend_interval: Duration::from_millis(50),
+            resend_interval: Duration::from_millis(resend_ms),
             poll_interval: TICK,
         }
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn a_lost_key_is_resent_after_a_stall_longer_than_the_timeout() {
         // The first key is lost, and the first wait comes back only after the
         // whole timeout. Counting that stall gives up before the resend that
@@ -340,7 +344,27 @@ mod tests {
         assert_eq!(screen.sends, 2);
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_lost_key_is_resent_after_a_stall_inside_a_long_budget() {
+        // The resend interval outlasts the 300 ms timeout, so the first wait's
+        // budget is the whole timeout, and a 250 ms stall lands inside it: the
+        // wait comes back on time, never past its budget, with the first key
+        // lost. The stall must still be credited, or the timeout has passed
+        // and the loop gives up before the resend.
+        let mut screen = LossyScreen { lost: 1, sends: 0 };
+
+        let result = send_into(
+            &mut screen,
+            timing_with_resend(300, 400),
+            stalls_once(Duration::from_millis(250)),
+        )
+        .await;
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(screen.sends, 2);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn a_marker_that_never_appears_times_out_and_names_the_stall() {
         let mut screen = LossyScreen {
             lost: usize::MAX,
@@ -355,8 +379,11 @@ mod tests {
         .await
         .expect_err("a marker that never appears must time out");
 
+        let stalled = credited(Duration::from_millis(150));
         assert!(
-            error.starts_with("timed out after 100ms of polling, not counting "),
+            error.starts_with(&format!(
+                "timed out after 100ms of polling, not counting {stalled:?} the harness left this step unpolled"
+            )),
             "{error}"
         );
         assert!(error.ends_with("last attempt: marker timeout"), "{error}");

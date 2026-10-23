@@ -90,12 +90,14 @@ where
 #[cfg(test)]
 mod tests {
     use super::{ExitPoll, QUIT_CONFIRM_KEY, QuitError, quit_and_wait};
-    use crate::polled_deadline::test_support::{TICK, stalls_once, ticking_wait};
+    use crate::polled_deadline::test_support::{TICK, credited, stalls_once, ticking_wait};
     use crate::polled_deadline::{Expiry, RetryTiming};
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
+    use tokio::time::Instant;
 
     /// Outer bound on every test here, so a deadline that keeps moving fails
-    /// the test instead of hanging it.
+    /// the test instead of hanging it. The tests run on tokio's paused clock,
+    /// so reaching it takes no real time.
     const HANG: Duration = Duration::from_secs(5);
 
     fn timing(timeout_ms: u64, resend_ms: u64) -> RetryTiming {
@@ -203,7 +205,7 @@ mod tests {
         (error, started.elapsed())
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn a_prompt_that_renders_within_the_resend_interval_is_confirmed() {
         let mut dashboard = SlowDashboard::new(Duration::from_millis(10));
 
@@ -214,7 +216,7 @@ mod tests {
         assert_eq!(dashboard.keys(), ["q", QUIT_CONFIRM_KEY]);
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn a_prompt_slower_than_the_resend_interval_is_still_confirmed() {
         // Each key takes between one and two resend intervals to show, so a
         // fixed cadence always has exactly one `q` in flight when it decides:
@@ -227,7 +229,7 @@ mod tests {
         assert_eq!(result, Ok(()), "keys sent: {:?}", dashboard.keys());
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn an_unsuccessful_exit_is_returned_without_resending() {
         let mut sends = 0;
         let error = quit_and_wait(
@@ -248,7 +250,7 @@ mod tests {
         assert_eq!(sends, 1);
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn a_failed_send_is_returned_without_waiting() {
         let mut waits = 0;
         let error = quit_and_wait(
@@ -272,7 +274,7 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn a_wait_longer_than_the_time_left_is_cut_to_the_deadline() {
         // Without the clamp a wait runs its whole interval past the deadline,
         // and with doubling that can be as long as the timeout itself.
@@ -280,12 +282,12 @@ mod tests {
 
         assert!(matches!(error, QuitError::TimedOut(_)), "{error:?}");
         assert!(
-            elapsed < Duration::from_millis(300),
+            elapsed <= Duration::from_millis(100) + TICK,
             "the wait must stop at the 100ms deadline, took {elapsed:?}"
         );
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn a_child_that_never_exits_times_out() {
         let (error, _) = never_exits(timing(60, 10), Duration::ZERO).await;
 
@@ -295,7 +297,7 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn a_stall_longer_than_the_timeout_still_answers_the_prompt() {
         // The prompt is on screen within 10 ms of `q`, but the first wait comes
         // back only after the whole timeout has passed. Counting that stall
@@ -313,7 +315,7 @@ mod tests {
         assert_eq!(dashboard.keys(), ["q", QUIT_CONFIRM_KEY]);
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn a_stall_inside_a_long_budget_still_answers_the_prompt() {
         // The first wait's budget is the whole 300 ms timeout, and a 250 ms
         // stall lands inside it: the wait comes back on time, never past its
@@ -333,47 +335,50 @@ mod tests {
         assert_eq!(dashboard.keys(), ["q", QUIT_CONFIRM_KEY]);
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn a_stalled_child_that_never_exits_moves_the_deadline_by_the_stall_once() {
-        // A credited stall is the gap minus one poll interval, so the loop ends
-        // no earlier than `timeout + stall - TICK`. Missing the credit ends it
-        // near `timeout`; crediting the stall twice ends it near
-        // `timeout + 2 * stall`. Both fall outside the window.
+        // The stall moves the deadline by its credited part, once, so the loop
+        // ends within one tick after `timeout + credited(stall)`. Missing the
+        // credit ends it near `timeout`; crediting the stall twice, or counting
+        // every poll as a stall, ends it later. All fall outside the window.
         let timeout = Duration::from_millis(200);
         let stall = Duration::from_millis(150);
-        let slack = Duration::from_millis(100);
 
         let (error, elapsed) = never_exits(timing(200, 10), stall).await;
 
         let QuitError::TimedOut(Expiry::Polled { stalled, .. }) = error else {
             panic!("expected a polled-time timeout, got {error:?}");
         };
+        assert_eq!(
+            stalled,
+            credited(stall),
+            "reported stall for a {stall:?} stall"
+        );
+        let moved = timeout + credited(stall);
         assert!(
-            stalled >= stall.saturating_sub(TICK) && stalled < stall + slack,
-            "reported stall {stalled:?} for a {stall:?} stall"
+            elapsed >= moved,
+            "the stall must move the deadline to {moved:?}: ended after {elapsed:?}"
         );
         assert!(
-            elapsed >= (timeout + stall).saturating_sub(TICK),
-            "the stall must move the deadline: ended after {elapsed:?}"
-        );
-        assert!(
-            elapsed < timeout + stall + slack,
-            "the stall must move the deadline once: ended after {elapsed:?}"
+            elapsed <= moved + TICK,
+            "the stall must move the deadline once, to {moved:?}: ended after {elapsed:?}"
         );
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn a_stall_past_the_wall_clock_cap_fails_the_step() {
-        // 4x a 50 ms timeout is a 200 ms cap; a 300 ms stall overruns it.
-        let (error, elapsed) = never_exits(timing(50, 10), Duration::from_millis(300)).await;
+        // 4x a 100 ms timeout is a 400 ms cap. A 500 ms stall overruns it, and
+        // moves the deadline past it, so only the cap can end the loop.
+        let stall = Duration::from_millis(500);
+        let (error, elapsed) = never_exits(timing(100, 10), stall).await;
 
         assert!(
             matches!(
                 error,
-                QuitError::TimedOut(Expiry::WallClock { cap, .. }) if cap == Duration::from_millis(200)
+                QuitError::TimedOut(Expiry::WallClock { cap, .. }) if cap == Duration::from_millis(400)
             ),
             "{error:?}"
         );
-        assert!(elapsed < Duration::from_millis(400), "took {elapsed:?}");
+        assert!(elapsed <= stall + TICK, "took {elapsed:?}");
     }
 }
