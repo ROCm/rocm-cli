@@ -796,7 +796,13 @@ pub(crate) fn stop_managed_services_with_helper_stop(
                 report.relaunch.push(format!(
                     "{}: `{}`",
                     record.service_id,
-                    rocm_engine_protocol::relaunch_command(&record.host, record.requires_api_key)
+                    rocm_engine_protocol::relaunch_command_for(
+                        &record.model_ref,
+                        &record.engine,
+                        &record.host,
+                        record.port,
+                        record.requires_api_key,
+                    )
                 ));
             }
             Ok((result, false)) => {

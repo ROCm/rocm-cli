@@ -78,6 +78,41 @@ pub fn relaunch_command(host: &str, require_api_key: bool) -> String {
     command
 }
 
+/// [`relaunch_command`] filled in for one concrete service.
+///
+/// The template stays the single source of the flag set; this substitutes its
+/// model and port placeholders and appends the engine, so the advice runs as printed.
+#[must_use]
+pub fn relaunch_command_for(
+    model: &str,
+    engine: &str,
+    host: &str,
+    port: u16,
+    require_api_key: bool,
+) -> String {
+    let mut command = relaunch_command(host, require_api_key)
+        .replacen("<model>", &shell_word(model), 1)
+        .replacen("<port>", &port.to_string(), 1);
+    if !engine.is_empty() {
+        command.push_str(" --engine ");
+        command.push_str(&shell_word(engine));
+    }
+    command
+}
+
+/// Leave a plain word as is and single-quote anything a shell would split or expand.
+fn shell_word(value: &str) -> String {
+    let plain = !value.is_empty()
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._/:@=+,-".contains(c));
+    if plain {
+        value.to_owned()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
 /// The parenthetical that follows a [`relaunch_command`]: supplying a key is
 /// optional, and the environment variable keeps it out of shell history.
 pub const RELAUNCH_KEY_CHOICE: &str = "(add `--api-key <key>`, or set ROCM_SERVE_API_KEY, to choose the key instead of generating one)";
@@ -823,6 +858,19 @@ mod tests {
             relaunch_command("0.0.0.0", true),
             "rocm serve <model> --host 0.0.0.0 --port <port> --allow-public-bind --require-api-key"
         );
+    }
+
+    #[test]
+    fn relaunch_command_for_fills_in_the_service_it_was_given() {
+        assert_eq!(
+            relaunch_command_for("amd/Model-7B", "vllm", "0.0.0.0", 8123, true),
+            "rocm serve amd/Model-7B --host 0.0.0.0 --port 8123 --allow-public-bind --require-api-key --engine vllm"
+        );
+        assert_eq!(
+            relaunch_command_for("/models/my model.gguf", "", "127.0.0.1", 8000, false),
+            "rocm serve '/models/my model.gguf' --host 127.0.0.1 --port 8000"
+        );
+        assert!(!relaunch_command_for("m", "vllm", "127.0.0.1", 1, false).contains('<'));
     }
 
     #[test]

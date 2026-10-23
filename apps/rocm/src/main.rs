@@ -22678,6 +22678,62 @@ pub(crate) mod tests {
         );
     }
 
+    // Gated to Linux with its siblings: loopback HTTP plus an injected stop.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_abort_advice_for_a_stopped_service_carries_its_own_model_engine_and_port() {
+        // The production stop pass builds `report.relaunch` from the stopped
+        // record; a failure recorded afterwards (a later service that would not
+        // stop) is what turns the pass into an abort that prints it.
+        let endpoint = std::sync::Mutex::new(Some(ServingEndpoint::serving("amd/org-model-7b")));
+        let port = endpoint.lock().unwrap().as_ref().unwrap().port;
+        let (root, paths) = test_paths("uninstall-relaunch-advice");
+        let make = |id: &str, host: &str, port: u16| {
+            let mut record = ManagedServiceRecord::new(
+                &paths,
+                id,
+                "vllm",
+                "amd/org-model-7b",
+                "amd/org-model-7b",
+                host,
+                port,
+                "managed",
+                0,
+                None,
+                None,
+                None,
+            );
+            record.status = "ready".to_owned();
+            record.requires_api_key = true;
+            record.write().expect("write record");
+        };
+        make("svc-ok", "0.0.0.0", port);
+
+        let mut report = stop_managed_services_with(&paths, |_, _| {
+            drop(endpoint.lock().unwrap().take());
+            Ok(serde_json::json!({ "status": "stopped" }))
+        })
+        .expect("the pass succeeds");
+        report.failed.push(FailedManagedServiceStop {
+            service_id: "svc-later".to_owned(),
+            reason: "r".to_owned(),
+            remedy: StopFailureRemedy::StopTheService,
+        });
+
+        let expected = format!(
+            "svc-ok: `rocm serve amd/org-model-7b --host 0.0.0.0 --port {port} \
+             --allow-public-bind --require-api-key --engine vllm`"
+        );
+        assert_eq!(report.relaunch, vec![expected.clone()], "{report:?}");
+        let message = format!("{:#}", uninstall_removal_gate(&report).unwrap_err());
+        assert!(message.contains(&expected), "{message}");
+        assert!(
+            !message.contains("<model>") && !message.contains("<port>"),
+            "the advice must be runnable as printed: {message}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn a_survivor_behind_an_already_stopped_record_dooms_the_run_before_anything_is_stopped() {
