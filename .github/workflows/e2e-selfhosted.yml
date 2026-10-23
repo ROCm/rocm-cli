@@ -86,7 +86,7 @@ jobs:
   # GPU lanes on a doc-only PR. Off pull_request (push/merge_group) heavy is
   # forced true, matching ci.yml.
   changes:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04 # one LTS: path filter only, nothing here depends on the image
     permissions:
       contents: read
       pull-requests: read
@@ -1631,7 +1631,7 @@ jobs:
   # so a failing/skipped self-hosted platform still appears in the grid.
   e2e-report:
     name: E2E consolidated report (self-hosted)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04 # one LTS: only merges report.json files
     timeout-minutes: 15
     # `actions: read` lets the missing-report check list this run's artifacts.
     permissions:
@@ -1656,6 +1656,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          # rust-cache keys on "Linux-x64" only; name the image so a target dir
+          # built against one Ubuntu release's glibc is never restored on another.
+          cache-key: ubuntu-24.04
 
       # Pull every self-hosted e2e artifact matching the glob; `xtask e2e-report`
       # turns each into one labeled platform and the `*-report` glob picks up any

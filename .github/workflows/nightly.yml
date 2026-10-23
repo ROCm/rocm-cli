@@ -32,7 +32,7 @@ env:
 jobs:
   nightly:
     name: Build Linux nightly assets
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04 # one LTS: the assets are built in the manylinux container, not on the image
     outputs:
       skip: ${{ steps.check.outputs.skip }}
       date: ${{ steps.meta.outputs.date }}
@@ -47,6 +47,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          # rust-cache keys on "Linux-x64" only; name the image so a target dir
+          # built against one Ubuntu release's glibc is never restored on another.
+          cache-key: ubuntu-24.04
 
       - name: Verify pinned keys match the signing key
         run: cargo xtask verify-pinned-keys
@@ -274,7 +278,7 @@ jobs:
 
   publish-nightly:
     name: Publish nightly
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04 # one LTS: publishing only
     needs:
       - nightly
       - windows-nightly
@@ -343,7 +347,7 @@ jobs:
 
   cleanup-staging-nightly:
     name: Clean failed nightly staging release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04 # one LTS: release cleanup only
     needs:
       - nightly
       - windows-nightly
@@ -1513,7 +1517,7 @@ jobs:
   # already does (e2e-selfhosted.yml), against the nightly artifacts.
   e2e-report-nightly:
     name: E2E consolidated report (nightly)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04 # one LTS: only merges report.json files
     timeout-minutes: 15
     # Narrower than the workflow-level `contents: write`, which exists for the
     # release-publishing jobs. This one checks out, downloads artifacts, runs an
@@ -1539,6 +1543,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          # rust-cache keys on "Linux-x64" only; name the image so a target dir
+          # built against one Ubuntu release's glibc is never restored on another.
+          cache-key: ubuntu-24.04
 
       # `*-report` matches the artifacts above, and will pick up any
       # nightly platform added later without a change here — provided it is
@@ -1627,7 +1635,7 @@ jobs:
   # branch cannot overwrite the page, and never from an empty or cancelled run.
   publish-e2e-wiki:
     name: Publish E2E support matrix to wiki
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04 # one LTS: publishing only
     timeout-minutes: 10
     permissions:
       contents: write
