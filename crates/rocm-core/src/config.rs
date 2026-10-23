@@ -10,7 +10,7 @@
 //! rocm-dash dashboard sub-config (daemon + TUI), including its one-shot
 //! legacy-TOML migration.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
@@ -530,34 +530,62 @@ struct LegacyDashTui {
 }
 
 impl RocmCliConfig {
+    /// Read `config.json`, or the defaults when there is none yet.
+    ///
+    /// Only a file that is not there means "no settings yet". Anything else
+    /// that stops the read — a directory where the file should be, a
+    /// permission problem, a symlink loop — is an error, just as unparseable
+    /// contents are: answering with defaults would let the next save replace
+    /// the user's settings with them. Data-dir discovery draws the same line.
     pub fn load(paths: &AppPaths) -> Result<Self> {
         let path = paths.config_path();
-        if !path.is_file() {
-            return Ok(Self::default());
-        }
-
-        let bytes =
-            fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default());
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to read {}", path.display()));
+            }
+        };
         serde_json::from_slice(&bytes)
             .with_context(|| format!("failed to parse {}", path.display()))
     }
 
-    /// Persist the config by replacing it via the shared `write_atomic`
-    /// helper (write a sibling temp file, then rename it over `config.json`;
-    /// see that helper's own doc for the write/rename/cleanup guarantees).
+    /// Write the config so that [`Self::load`] can always read it back.
     ///
-    /// The destination is never removed first, because `load` reads a
-    /// missing `config.json` as "no config" and answers with defaults — a
-    /// removed-then-not-yet-replaced window would lose every setting without
-    /// so much as an error.
+    /// Two ways a save used to leave a file `load` rejects, both closed here:
+    ///
+    /// - an interrupted write (a full disk mid-install is the usual one) left
+    ///   a truncated file, because a plain `fs::write` truncates first. The
+    ///   write is now atomic: a reader sees the old file or the new one.
+    /// - a value that serializes but does not deserialize, such as a
+    ///   non-finite `f64` (JSON has no NaN, so it is written as `null`). The
+    ///   bytes are parsed back before anything is written, and the save fails
+    ///   with the existing file left as it was.
+    ///
+    /// Not guaranteed, on Windows:
+    /// - Replacing a `config.json` that another process holds open without
+    ///   delete sharing. The replace then fails with a sharing violation, the
+    ///   save returns that error, and the old config stays in place.
+    /// - A replace that fails part-way. `ReplaceFileW` can move the old file
+    ///   off the `config.json` name and then fail to move the new one on; the
+    ///   writer retries once with a plain rename, and if that fails too the new
+    ///   contents stay in the `config.json.tmp-*` file the error names. Until
+    ///   it is renamed back there is no `config.json`, which `load` reads as
+    ///   "no settings".
     pub fn save(&self, paths: &AppPaths) -> Result<()> {
         let path = paths.config_path();
-        fs::create_dir_all(&paths.config_dir)
-            .with_context(|| format!("failed to create {}", paths.config_dir.display()))?;
         let bytes =
             serde_json::to_vec_pretty(self).context("failed to serialize rocm-cli config")?;
-        crate::write_atomic(&path, &bytes, "json")
-            .with_context(|| format!("failed to save rocm-cli config to {}", path.display()))
+        serde_json::from_slice::<Self>(&bytes).with_context(|| {
+            format!(
+                "refusing to write {}: the new contents would not load back",
+                path.display()
+            )
+        })?;
+        crate::atomic_write::write_file_atomically(&path, &bytes)
+            .with_context(|| format!("failed to write {}", path.display()))
     }
 
     pub fn engine_config(&self, engine: &str) -> Option<&EngineUserConfig> {
@@ -650,6 +678,29 @@ impl RocmCliConfig {
 
         // Dashboard-specific knobs map into the new sub-config.
         let d = &parsed.daemon;
+        // rocm-dash's own reader (`rocm_dash_core::config`) rejects a tick that
+        // is not a valid `Duration` — NaN, infinite, negative, or too large —
+        // so it already treats this file as unreadable. Migrating it anyway
+        // would also write a non-finite value as JSON `null`, which `load`
+        // rejects. Refuse on the same rule, leaving the TOML untouched.
+        for (key, value) in [
+            ("gpu_tick", d.gpu_tick),
+            ("discovery_tick", d.discovery_tick),
+            ("instance_tick", d.instance_tick),
+        ] {
+            if let Some(secs) = value
+                && let Err(error) = Duration::try_from_secs_f64(secs)
+            {
+                bail!(
+                    "legacy config {} sets daemon.{key} = {secs}, which is not a valid tick \
+                     ({error}); set it to a finite, non-negative number of seconds to migrate the file. \
+                     Migration only runs while {} does not exist, so fix it before any rocm command \
+                     saves settings, or re-enter the dashboard settings by hand afterwards",
+                    legacy.display(),
+                    paths.config_path().display()
+                );
+            }
+        }
         if let Some(v) = &d.listen {
             config.dashboard.daemon.listen = v.clone();
         }
@@ -804,6 +855,39 @@ mod tests {
         let tool = loaded.tools.get("python").expect("python tool should load");
         assert!(tool.managed);
         assert_eq!(tool.path.as_deref(), Some(python.as_path()));
+        Ok(())
+    }
+
+    /// A value that serializes but cannot be read back (a non-finite tick is
+    /// written as JSON `null`) must fail the save and leave the existing file
+    /// exactly as it was, rather than replace a good config with one `load`
+    /// rejects.
+    #[test]
+    fn config_save_refuses_contents_load_would_reject_and_keeps_the_old_file() -> Result<()> {
+        let (root, paths) = temp_app_paths("config-save-refuses");
+        let good = RocmCliConfig {
+            active_runtime_key: Some("kept-runtime".to_owned()),
+            ..RocmCliConfig::default()
+        };
+        good.save(&paths)?;
+        let before = fs::read(paths.config_path())?;
+
+        let mut bad = good;
+        bad.dashboard.daemon.gpu_tick_secs = f64::NAN;
+        let error = bad
+            .save(&paths)
+            .expect_err("a config load would reject must not be saved");
+        let after = fs::read(paths.config_path())?;
+        let reloaded = RocmCliConfig::load(&paths)?;
+        fs::remove_dir_all(root).ok();
+
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("refusing to write") && rendered.contains("config.json"),
+            "unexpected error: {rendered}"
+        );
+        assert_eq!(after, before, "the existing config.json was changed");
+        assert_eq!(reloaded.active_runtime_key.as_deref(), Some("kept-runtime"));
         Ok(())
     }
 
@@ -1023,6 +1107,89 @@ last_installed_runtime_id = "therock-release"
         Ok(())
     }
 
+    /// A tick that is not a valid duration is refused, naming the key, and the
+    /// refusal writes nothing: no `config.json` appears and the TOML is
+    /// unchanged, so the startup notice "skipped legacy dashboard config
+    /// migration" is true and fixing the value lets the next run migrate —
+    /// provided nothing has created `config.json` meanwhile, which the refusal
+    /// itself warns about.
+    #[test]
+    fn migrate_legacy_dashboard_toml_refuses_an_invalid_tick_and_writes_nothing() -> Result<()> {
+        for (value, rendered) in [
+            ("nan", "NaN"),
+            ("inf", "inf"),
+            ("-inf", "-inf"),
+            ("-1.0", "-1"),
+        ] {
+            let (root, paths) = temp_app_paths("migrate-dash-bad-tick");
+            fs::create_dir_all(&root)?;
+            let legacy = root.join("legacy-config.toml");
+            let text = format!(
+                "default_engine = \"vllm\"\n[daemon]\ndiscovery_tick = {value}\n[tui]\ntheme = \"nord\"\n"
+            );
+            fs::write(&legacy, &text)?;
+
+            let error = RocmCliConfig::migrate_legacy_dashboard_toml_from(&paths, &legacy)
+                .expect_err("an invalid tick must not migrate");
+            let config_written = paths.config_path().exists();
+            let legacy_after = fs::read_to_string(&legacy)?;
+            let _ = fs::remove_dir_all(&root);
+
+            let message = format!("{error:#}");
+            assert!(
+                message.contains(&format!("daemon.discovery_tick = {rendered}")),
+                "{value}: unexpected error: {message}"
+            );
+            assert!(!config_written, "{value}: config.json was written");
+            assert_eq!(legacy_after, text, "{value}: the legacy TOML was modified");
+        }
+
+        // The refusal warns that the window closes once config.json exists —
+        // and it does: after any save, the still-broken legacy file is skipped
+        // without a word, and fixing it later no longer migrates it either.
+        let (root, paths) = temp_app_paths("migrate-dash-window-closes");
+        fs::create_dir_all(&root)?;
+        let legacy = root.join("legacy-config.toml");
+        fs::write(
+            &legacy,
+            "[daemon]\ngpu_tick = nan\n[tui]\ntheme = \"nord\"\n",
+        )?;
+        let error = RocmCliConfig::migrate_legacy_dashboard_toml_from(&paths, &legacy)
+            .expect_err("an invalid tick must not migrate");
+        let message = format!("{error:#}");
+        RocmCliConfig::default().save(&paths)?;
+        let while_broken = RocmCliConfig::migrate_legacy_dashboard_toml_from(&paths, &legacy)?;
+        fs::write(
+            &legacy,
+            "[daemon]\ngpu_tick = 1.0\n[tui]\ntheme = \"nord\"\n",
+        )?;
+        let once_fixed = RocmCliConfig::migrate_legacy_dashboard_toml_from(&paths, &legacy)?;
+        let theme = RocmCliConfig::load(&paths)?.dashboard.tui.theme;
+        let _ = fs::remove_dir_all(&root);
+        assert!(
+            message.contains(&format!(
+                "Migration only runs while {} does not exist",
+                paths.config_path().display()
+            )) && message.contains("re-enter the dashboard settings by hand"),
+            "unexpected error: {message}"
+        );
+        assert_eq!(while_broken, None);
+        assert_eq!(once_fixed, None);
+        assert_ne!(theme, "nord", "the legacy theme was migrated after all");
+
+        // Zero is a valid duration for rocm-dash too, so it still migrates.
+        let (root, paths) = temp_app_paths("migrate-dash-zero-tick");
+        fs::create_dir_all(&root)?;
+        let legacy = root.join("legacy-config.toml");
+        fs::write(&legacy, "[daemon]\ngpu_tick = 0\n")?;
+        let migrated = RocmCliConfig::migrate_legacy_dashboard_toml_from(&paths, &legacy)?;
+        let loaded = RocmCliConfig::load(&paths);
+        let _ = fs::remove_dir_all(&root);
+        assert!(migrated.is_some());
+        assert!(loaded.is_ok());
+        Ok(())
+    }
+
     #[test]
     fn migrate_legacy_dashboard_toml_without_legacy_is_noop() -> Result<()> {
         let (root, paths) = temp_app_paths("migrate-dash-absent");
@@ -1035,15 +1202,16 @@ last_installed_runtime_id = "therock-release"
         Ok(())
     }
 
-    /// The `inspect_err` cleanup on the rename, which the happy-path test above
-    /// cannot reach: it only ever asserts that a SUCCESSFUL save leaves nothing
-    /// behind, so deleting the cleanup would go unnoticed until a user with a
-    /// failing disk accumulated one `config.json.tmp-<ts>-<pid>` per attempt.
+    /// The atomic writer's cleanup of a temp file it could not publish, seen
+    /// through `save`, which the happy-path test above cannot reach: it only
+    /// ever asserts that a SUCCESSFUL save leaves nothing behind, so a save that
+    /// bypassed the writer's cleanup would go unnoticed until a user with a
+    /// failing disk accumulated one `config.json.tmp-*` per attempt.
     ///
-    /// A directory at the destination is what makes the rename fail on both
+    /// A directory at the destination is what makes the publish fail on both
     /// supported platforms without needing permissions a root CI lane ignores —
     /// the same device `write_file_atomically_cleans_up_temp_when_the_rename_fails`
-    /// uses in `apps/rocm`.
+    /// uses in `atomic_write.rs`.
     #[test]
     fn a_config_save_that_cannot_publish_cleans_up_its_temp_file() -> Result<()> {
         let (root, paths) = temp_app_paths("config-save-rename-fails");
@@ -1126,11 +1294,17 @@ last_installed_runtime_id = "therock-release"
         };
         config.save(&paths)?;
         let before = fs::metadata(paths.config_path())?.ino();
+        let before_bytes = fs::read(paths.config_path())?;
+        // A second name for the old file: if the save rewrote it in place, the
+        // new contents would show through this link too.
+        let witness = root.join("config-before-save.json");
+        fs::hard_link(paths.config_path(), &witness)?;
 
         config.default_engine = Some("lemonade".to_owned());
         config.save(&paths)?;
         let after = fs::metadata(paths.config_path())?.ino();
 
+        let witnessed = fs::read(&witness)?;
         let loaded = RocmCliConfig::load(&paths)?;
         let _ = fs::remove_dir_all(&root);
 
@@ -1138,6 +1312,10 @@ last_installed_runtime_id = "therock-release"
             before, after,
             "an overwrite that keeps the same inode rewrote the live config in \
              place, so an interrupted save can leave it truncated"
+        );
+        assert_eq!(
+            witnessed, before_bytes,
+            "save rewrote the existing config.json in place"
         );
         assert_eq!(loaded.default_engine.as_deref(), Some("lemonade"));
         Ok(())
