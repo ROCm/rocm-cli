@@ -149,6 +149,13 @@ pub fn tps_opt(value: Option<f64>) -> String {
     }
 }
 
+/// Latency in milliseconds (TTFT/TPOT). `123ms`. `—` when None or non-finite.
+pub fn ms_opt(value: Option<f64>) -> String {
+    value
+        .filter(|v| v.is_finite())
+        .map_or_else(|| "—".to_string(), |v| format!("{v:.0}ms"))
+}
+
 /// Energy efficiency: generation throughput per watt. `0.42 tok/W`. `-` when
 /// None or non-finite (no throughput sample or no GPU power telemetry).
 pub fn tokens_per_watt(value: Option<f64>) -> String {
