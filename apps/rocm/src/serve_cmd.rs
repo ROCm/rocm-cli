@@ -517,6 +517,39 @@ pub(crate) struct ServeArgs {
     pub(crate) api_key: Option<String>,
 }
 
+/// The progress line a background launch paints while it waits.
+trait LaunchProgress {
+    /// Erases the line so whatever prints next starts on a clean one.
+    fn clear(&mut self);
+}
+
+impl LaunchProgress for cli_progress::Spinner {
+    fn clear(&mut self) {
+        Self::clear(self);
+    }
+}
+
+/// Runs a background serve's managed launch, then starts the background
+/// helper, and erases `progress` if either step fails.
+///
+/// `Spinner` has no `Drop`, so an error returned past a painted line would
+/// print on top of it. Both steps are fallible and run back to back, so they
+/// share one clear-on-error here instead of each call site guarding its own.
+/// The helper is not started when the launch fails. On success `progress` is
+/// left painted: the caller still uses it (the smoke test relabels it) and
+/// clears it itself.
+fn launch_then_start_helper<P: LaunchProgress, T>(
+    progress: &mut P,
+    launch: impl FnOnce(&mut P) -> Result<T>,
+    start_helper: impl FnOnce() -> Result<()>,
+) -> Result<T> {
+    let launched = launch(progress).and_then(|report| start_helper().map(|()| report));
+    if launched.is_err() {
+        progress.clear();
+    }
+    launched
+}
+
 pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     let ServeArgs {
         model,
@@ -866,36 +899,31 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
         let mut spinner =
             cli_progress::Spinner::new(format!("Starting {model} on {selected_engine}…"));
         spinner.tick();
-        let launched = start_managed_service(
-            &selected_engine,
-            &service_id,
-            &model,
-            &resolve,
-            &host,
-            port,
-            &resolve.device_policy,
-            &gpu_indices,
-            managed_runtime_id.as_deref(),
-            managed_env_id.as_deref(),
-            resolve.engine_recipe.as_ref(),
-            endpoint_auth.as_deref(),
-            launch_lock,
-            require_api_key,
-            &mut |_elapsed| spinner.tick(),
-        )
-        .and_then(|report| ensure_background_helper_running_quiet(summary_mode).map(|()| report));
-        // `Spinner` has no `Drop`, so a launch that fails here — or the background
-        // helper it starts — would otherwise leave its line painted and the error
-        // would print on top of it. Both steps fold into `launched` so this one
-        // clear covers each; nothing fallible runs between here and the clears
-        // below.
-        let report = match launched {
-            Ok(report) => report,
-            Err(error) => {
-                spinner.clear();
-                return Err(error);
-            }
-        };
+        // Nothing fallible runs between this and the clears below, so on every
+        // path the spinner line is erased before anything else prints.
+        let report = launch_then_start_helper(
+            &mut spinner,
+            |spinner| {
+                start_managed_service(
+                    &selected_engine,
+                    &service_id,
+                    &model,
+                    &resolve,
+                    &host,
+                    port,
+                    &resolve.device_policy,
+                    &gpu_indices,
+                    managed_runtime_id.as_deref(),
+                    managed_env_id.as_deref(),
+                    resolve.engine_recipe.as_ref(),
+                    endpoint_auth.as_deref(),
+                    launch_lock,
+                    require_api_key,
+                    &mut |_elapsed| spinner.tick(),
+                )
+            },
+            || ensure_background_helper_running_quiet(summary_mode),
+        )?;
 
         // An equivalent service was already running, so nothing was spawned and the
         // freshly generated key is unused — drop it rather than leave it orphaned in
@@ -1595,5 +1623,86 @@ mod tests {
         assert!(!engine_recipe_enables_tool_choice(Some(&without)));
         let with = engine_recipe_with_tool_call_override("vllm", None, Some("hermes"));
         assert!(engine_recipe_enables_tool_choice(with.as_ref()));
+    }
+
+    /// Records what a background launch did to its progress line.
+    #[derive(Default)]
+    struct RecordedProgress {
+        ticks: usize,
+        clears: usize,
+    }
+
+    impl LaunchProgress for RecordedProgress {
+        fn clear(&mut self) {
+            self.clears += 1;
+        }
+    }
+
+    #[test]
+    fn a_background_helper_that_fails_to_start_clears_the_launch_progress() {
+        let mut progress = RecordedProgress::default();
+
+        let result = launch_then_start_helper(
+            &mut progress,
+            |progress| {
+                progress.ticks += 1;
+                Ok("report")
+            },
+            || anyhow::bail!("background helper did not start"),
+        );
+
+        let error = result.expect_err("the helper's failure is the launch's failure");
+        assert_eq!(error.to_string(), "background helper did not start");
+        assert_eq!(progress.ticks, 1, "the launch ran before the helper");
+        assert_eq!(
+            progress.clears, 1,
+            "the painted line is erased before the error prints"
+        );
+    }
+
+    #[test]
+    fn a_failed_launch_clears_its_progress_and_never_starts_the_helper() {
+        let mut progress = RecordedProgress::default();
+        let mut helper_started = false;
+
+        let result: Result<()> = launch_then_start_helper(
+            &mut progress,
+            |_| anyhow::bail!("engine died at startup"),
+            || {
+                helper_started = true;
+                Ok(())
+            },
+        );
+
+        let error = result.expect_err("the launch failed");
+        assert_eq!(error.to_string(), "engine died at startup");
+        assert!(
+            !helper_started,
+            "no helper is started for a launch that failed"
+        );
+        assert_eq!(progress.clears, 1);
+    }
+
+    #[test]
+    fn a_successful_launch_leaves_its_progress_for_the_caller_to_clear() {
+        let mut progress = RecordedProgress::default();
+        let mut helper_started = false;
+
+        let report = launch_then_start_helper(
+            &mut progress,
+            |_| Ok("report"),
+            || {
+                helper_started = true;
+                Ok(())
+            },
+        )
+        .expect("both steps succeed");
+
+        assert_eq!(report, "report");
+        assert!(helper_started);
+        assert_eq!(
+            progress.clears, 0,
+            "the smoke test still relabels the line, so the caller clears it"
+        );
     }
 }
