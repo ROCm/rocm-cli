@@ -325,17 +325,11 @@ mod tests {
     /// This is what lets the docs guard assert against the workflow instead of
     /// against a list copied into the test source: add a lane and the derived
     /// list grows, so the documentation assertions fail until the docs follow.
-    ///
-    /// The job-id scan is scoped to the `jobs:` block, because top-level keys
-    /// like `push:` (under `on:`) and `group:` (under `concurrency:`) sit at the
-    /// same indent and would otherwise read as job ids.
     fn self_hosted_e2e_jobs(text: &str) -> Vec<(String, String)> {
-        let jobs = top_level_block(text, "jobs");
-        jobs.lines()
-            .filter(|line| indent_of(line) == 2 && !line.trim_start().starts_with('#'))
-            .filter_map(|line| line.trim().strip_suffix(':'))
+        job_ids(text)
+            .into_iter()
             .filter_map(|job| {
-                let mut values = runs_on_values(job_block(text, job));
+                let mut values = runs_on_values(job_block(text, &job));
                 assert!(
                     values.len() <= 1,
                     "job `{job}` declares more than one runs-on"
@@ -347,9 +341,35 @@ mod tests {
                 SELF_HOSTED_LABELS
                     .iter()
                     .any(|self_hosted| labels.iter().any(|label| label == self_hosted))
-                    .then_some((job.to_owned(), runs_on))
+                    .then_some((job, runs_on))
             })
             .collect()
+    }
+
+    /// Every job id in `text`'s `jobs:` block, in file order.
+    ///
+    /// Scoped to the `jobs:` block, because top-level keys like `push:` (under
+    /// `on:`) and `group:` (under `concurrency:`) sit at the same indent and
+    /// would otherwise read as job ids.
+    fn job_ids(text: &str) -> Vec<String> {
+        top_level_block(text, "jobs")
+            .lines()
+            .filter(|line| indent_of(line) == 2 && !line.trim_start().starts_with('#'))
+            .filter_map(|line| line.trim().strip_suffix(':'))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn a_column_zero_comment_does_not_end_the_jobs_block() {
+        let text = "on: push\njobs:\n  first:\n    runs-on: x\n# ---- later lanes ----\n  second:\n    runs-on: y\nenv:\n  A: b\n";
+        assert_eq!(job_ids(text), ["first", "second"]);
+
+        // A comment directly above the next top-level key belongs to that key.
+        let text = "jobs:\n  only:\n    runs-on: x\n\n# shared settings\nenv:\n  A: b\n";
+        let jobs = top_level_block(text, "jobs");
+        assert!(!jobs.contains("shared settings"), "{jobs:?}");
+        assert!(jobs.trim_end().ends_with("runs-on: x"), "{jobs:?}");
     }
 
     /// Extract the direct scalar entries from a named job-level mapping such as
@@ -456,7 +476,9 @@ mod tests {
     }
 
     /// Extract a top-level YAML value/block, stopping at the next column-zero
-    /// key or comment. This is deliberately small: workflow contract tests
+    /// key. Column-zero comments inside the block do not end it, and comment
+    /// and blank lines directly above the next key are left out. This is
+    /// deliberately small: workflow contract tests
     /// inspect only checked-in files with the repository's established layout.
     fn top_level_block(text: &str, key: &str) -> String {
         let marker = format!("{key}:");
@@ -467,8 +489,18 @@ mod tests {
             .unwrap_or_else(|| panic!("workflow declares a top-level {marker}"));
         let end = lines[start + 1..]
             .iter()
-            .position(|line| !line.is_empty() && !line.starts_with(char::is_whitespace))
+            // A column-0 `#` comment is not a key: it must not end the block,
+            // or every job after a section-divider comment would drop out.
+            .position(|line| {
+                !line.is_empty() && !line.starts_with(char::is_whitespace) && !line.starts_with('#')
+            })
             .map_or(lines.len(), |offset| start + 1 + offset);
+        // A comment just above the next key belongs to that key, not to this
+        // block, so trailing comment and blank lines are left out.
+        let mut end = end;
+        while end > start + 1 && (lines[end - 1].is_empty() || lines[end - 1].starts_with('#')) {
+            end -= 1;
+        }
         let mut block = lines[start]
             .strip_prefix(&marker)
             .expect("top-level key prefix was just matched")
@@ -710,14 +742,9 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
     #[test]
     fn every_ci_job_declares_a_timeout() {
         let ci = read_workflow("ci.yml");
-        let jobs = top_level_block(&ci, "jobs");
-        let job_ids: Vec<&str> = jobs
-            .lines()
-            .filter(|line| indent_of(line) == 2 && !line.trim_start().starts_with('#'))
-            .filter_map(|line| line.trim().strip_suffix(':'))
-            .collect();
+        let job_ids = job_ids(&ci);
         assert!(!job_ids.is_empty(), "expected at least one job in ci.yml");
-        for job in job_ids {
+        for job in &job_ids {
             let block = job_block(&ci, job);
             assert!(
                 block
@@ -963,8 +990,10 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
                 };
                 assert!(
                     run_block(step).is_some_and(|body| body.iter().any(|l| !l.trim().is_empty())),
-                    "{workflow} job `{job}` names a GPU preflight step but it has no \
-                     `run: |` script, so it waits for nothing"
+                    "{workflow} job `{job}` names a GPU preflight step but no non-empty \
+                     `run: |` block was found in it, so as far as this check can tell it \
+                     waits for nothing. Only the literal `run: |` form is recognised: a \
+                     `run: |-`, `run: >` or one-line `run:` script reads as missing here"
                 );
             }
         }
@@ -1416,43 +1445,75 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
 
     /// The `name:` of `step`, a block as `step_block` returns it (its first
     /// line is the step's `- ` item line); empty when the step has none.
+    ///
+    /// A block scalar (`name: >`, `name: |-`, …) is read from the
+    /// more-indented lines that follow, joined with single spaces, so a
+    /// wrapped name is not mistaken for the indicator.
+    /// That only approximates YAML, which keeps a `|` name's line breaks and
+    /// folds a blank line in a `>` one to a newline; callers only match a
+    /// name's prefix or print it.
     fn step_name(step: &str) -> String {
-        step_key(step, "name")
+        let Some((at, value)) = step_key_line(step, "name") else {
+            return String::new();
+        };
+        let value = strip_comment(value).trim();
+        if !value.starts_with(['>', '|']) {
+            return strip_quotes(value);
+        }
+        let key_indent = step.lines().next().map_or(0, indent_of) + 2;
+        step.lines()
+            .skip(at + 1)
+            .take_while(|l| l.trim().is_empty() || indent_of(l) > key_indent)
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     /// The one-line value of `step`'s own `{key}:`, unquoted and without a
     /// trailing comment; empty when the step has no such key.
+    fn step_key(step: &str, key: &str) -> String {
+        step_key_line(step, key)
+            .map(|(_, value)| strip_quotes(strip_comment(value).trim()))
+            .unwrap_or_default()
+    }
+
+    /// Where `step`'s own `{key}:` is: the index of its line within `step`,
+    /// and the raw text after the colon.
     ///
     /// The key is either the item's own first key (`- name: …`) or one of
     /// its sibling keys, two columns in from the dash. Keys any deeper — a
     /// `with:` input called `name`, a `name:` line inside the step's script —
     /// are not the step's.
-    fn step_key(step: &str, key: &str) -> String {
+    fn step_key_line<'a>(step: &'a str, key: &str) -> Option<(usize, &'a str)> {
         let marker = format!("{key}:");
         let item_indent = step.lines().next().map_or(0, indent_of);
-        step.lines()
-            .find_map(|l| {
-                let key_line = if indent_of(l) == item_indent {
-                    l.trim_start().strip_prefix("- ")?
-                } else if indent_of(l) == item_indent + 2 {
-                    l.trim_start()
-                } else {
-                    return None;
-                };
-                key_line.strip_prefix(&marker)
-            })
-            .map(|value| strip_quotes(strip_comment(value).trim()))
-            .unwrap_or_default()
+        step.lines().enumerate().find_map(|(at, l)| {
+            let key_line = if indent_of(l) == item_indent {
+                l.trim_start().strip_prefix("- ")?
+            } else if indent_of(l) == item_indent + 2 {
+                l.trim_start()
+            } else {
+                return None;
+            };
+            Some((at, key_line.strip_prefix(&marker)?))
+        })
     }
 
-    /// Every `GPU preflight` step block in `text`, in file order.
+    /// Every `GPU preflight` step block in `text`, in file order: each job's
+    /// `steps:` items whose name starts `GPU preflight`, jobs in file order.
+    ///
+    /// Found through `job_steps`/`step_name`, the parser the preflight presence
+    /// check uses, so the two cannot disagree about what a step is: a name
+    /// wrapped into a block scalar (`name: >-`) is found exactly like a one-line
+    /// one, and a `- name: GPU preflight` line in a comment or some step's
+    /// script is not a step. A job with no `steps:` list contributes nothing.
     fn gpu_preflight_steps(text: &str) -> Vec<String> {
-        let lines: Vec<&str> = text.lines().collect();
-        lines
-            .iter()
-            .enumerate()
-            .filter(|(_, line)| line.trim_start().starts_with("- name: GPU preflight"))
-            .map(|(i, _)| step_block(&lines, i))
+        job_ids(text)
+            .into_iter()
+            .flat_map(|job| job_steps(job_block(text, &job)).unwrap_or_default())
+            .filter(|(name, _)| name.starts_with("GPU preflight"))
+            .map(|(_, step)| step)
             .collect()
     }
 
@@ -1476,6 +1537,11 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
     }
 
     /// The lines of a step's `run: |` block, still indented.
+    ///
+    /// Only the literal `run: |` form is recognised. `run: |-`, `run: >` and a
+    /// one-line `run: cmd` all read as no block, so a check that asserts a step
+    /// *has* a script relies on every workflow in this repo using `run: |`, and
+    /// has to say so in its failure message rather than claim the step is empty.
     ///
     /// Trailing blank lines are dropped: they are the separator `step_block`
     /// lets through, not part of the script, and keeping them would make two
@@ -1677,7 +1743,8 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
     ///
     /// Two shapes carry shell: a plain `run: |` step, and the WSL lanes, which
     /// hand a here-string to `Invoke-WslBash.ps1`. A step that is PowerShell end
-    /// to end yields `None`; `preflight_powershell_script` carries those.
+    /// to end yields `None`; `preflight_powershell_script` carries those. Like
+    /// every caller of [`run_block`], only the literal `run: |` form is read.
     fn preflight_shell_script(step: &str) -> Option<String> {
         let body = run_block(step)?;
         let body = match body
@@ -2106,7 +2173,12 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
             let step = step_block(&lines, settle);
             let body = run_block(&step)
                 .and_then(|block| dedent(&block))
-                .unwrap_or_else(|| panic!("{workflow}'s clock-settling step has no `run: |` body"));
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{workflow}'s clock-settling step has no `run: |` body (only the literal \
+                         `run: |` form is read; `run: |-`, `run: >` and one-line `run:` are not)"
+                    )
+                });
             bodies.push((workflow, body));
         }
         let [(first, first_body), (second, second_body)] = bodies.as_slice() else {
@@ -5444,5 +5516,129 @@ permissions:
             "{:?}",
             pwsh_statements(&mismatched)
         );
+    }
+
+    /// A wrapped step name must not read as its block-scalar indicator: with
+    /// `name: >` taken literally, the GPU-preflight lookup would report the
+    /// step missing from a job that has it. A blank line among or after the
+    /// wrapped lines does not end the name. This parser joins the lines with
+    /// single spaces, so `Spaced out` is its reading where YAML would fold the
+    /// blank line to a newline; callers only match a name's prefix.
+    #[test]
+    fn a_block_scalar_step_name_is_read_from_its_wrapped_lines() {
+        let block = "    steps:\n\
+                     \x20     - name: >-\n\
+                     \x20         GPU preflight\n\
+                     \x20         (bounded wait)\n\
+                     \x20       run: |\n\
+                     \x20         echo wait\n\
+                     \x20     - name: >-\n\
+                     \x20         Spaced\n\
+                     \n\
+                     \x20         out\n\
+                     \n\
+                     \x20       run: |\n\
+                     \x20         echo spaced\n\
+                     \x20     - uses: actions/checkout@v4\n\
+                     \x20       name: |\n\
+                     \x20         Check out\n\
+                     \x20     - name: Plain # trailing comment\n\
+                     \x20       run: |\n\
+                     \x20         echo plain\n";
+        let names: Vec<String> = job_steps(block)
+            .expect("the block has a steps: list")
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "GPU preflight (bounded wait)",
+                "Spaced out",
+                "Check out",
+                "Plain"
+            ]
+        );
+    }
+
+    /// The preflight lookup every script check reads from must see a wrapped
+    /// name exactly like a one-line one. Matched on the raw `- name:` text, a
+    /// preflight named through `name: >-` is not found, and the checks that
+    /// read the lookup then fail on a block count or an `.expect` that points
+    /// at a removed lane or the extractor, not at the name's form.
+    ///
+    /// It must return only preflight steps, and only real ones: a step with
+    /// another name, a commented-out preflight, and a `- name: GPU preflight`
+    /// line inside some step's script are all left out, and a job with no
+    /// `steps:` list (one that only `uses:` a reusable workflow) adds nothing.
+    #[test]
+    fn a_gpu_preflight_with_a_block_scalar_name_is_still_found() {
+        let workflow = "on: push\n\
+                        jobs:\n\
+                        \x20 wrapped:\n\
+                        \x20   runs-on: [self-hosted]\n\
+                        \x20   steps:\n\
+                        \x20     - uses: actions/checkout@v4\n\
+                        \x20   # a comment at the steps: indent does not end them\n\
+                        \x20     - name: >-\n\
+                        \x20         GPU preflight\n\
+                        \n\
+                        \x20         (bounded wait)\n\
+                        \x20       run: |\n\
+                        \x20         echo wrapped\n\
+                        \x20     # - name: GPU preflight (disabled)\n\
+                        \x20     - name: Generate the report\n\
+                        \x20       run: |\n\
+                        \x20         cat <<'YAML'\n\
+                        \x20         - name: GPU preflight (inside a script)\n\
+                        \x20         YAML\n\
+                        \x20 reusable:\n\
+                        \x20   uses: ./.github/workflows/other.yml\n\
+                        \x20 plain:\n\
+                        \x20   runs-on: [self-hosted]\n\
+                        \x20   steps:\n\
+                        \x20     - name: GPU preflight (bounded wait)\n\
+                        \x20       run: |\n\
+                        \x20         echo plain\n\
+                        \x20     - name: Run the suite\n\
+                        \x20       run: |\n\
+                        \x20         echo suite\n";
+        let scripts: Vec<String> = gpu_preflight_steps(workflow)
+            .iter()
+            .map(|step| {
+                run_block(step)
+                    .expect("every preflight step here has a `run: |` block")
+                    .join("\n")
+                    .trim()
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(scripts, ["echo wrapped", "echo plain"]);
+    }
+
+    /// The pwsh contract keys its allow-list on a step's name, so a pwsh step
+    /// whose name is wrapped into a block scalar must come back under its
+    /// wrapped text, not as `>-`: read literally, every such step would share
+    /// the one name `>-`, and an allow-list entry could never match it.
+    #[test]
+    fn a_pwsh_step_with_a_block_scalar_name_is_read_from_its_wrapped_lines() {
+        let workflow = "jobs:\n\
+                        \x20 win:\n\
+                        \x20   runs-on: windows-latest\n\
+                        \x20   steps:\n\
+                        \x20     - name: >-\n\
+                        \x20         Package Windows\n\
+                        \x20         bundle\n\
+                        \x20       shell: pwsh\n\
+                        \x20       run: |\n\
+                        \x20         cargo xtask package\n\
+                        \x20     - name: Plain\n\
+                        \x20       shell: pwsh\n\
+                        \x20       run: cargo test\n";
+        let names: Vec<String> = pwsh_steps(workflow)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(names, ["Package Windows bundle", "Plain"]);
     }
 }
