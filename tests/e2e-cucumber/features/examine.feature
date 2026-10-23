@@ -120,7 +120,7 @@ Feature: GPU detection and system inspection
     And the inspection reports that the host is WSL
 
   # The dry-run plan used to print the raw `${ROCM_CLI_AMDGPU_VERSION:-7.2.4}`
-  # shell placeholder on its `repo_version_expr:` line instead of the effective version,
+  # shell placeholder on its `repo_version:` line instead of the effective version,
   # so the preview a user reviews before approving disagreed with what the install
   # would actually pull. The plan is rendered on every Linux host regardless of
   # GPU (the driver is not yet installed when you preview it), so the mock lane
@@ -431,9 +431,11 @@ Feature: GPU detection and system inspection
 
   # `rocm_install_method` used to report "amdgpu-install"/"tarball-or-other";
   # renamed to "repo-native"/"runfile-or-tarball" alongside the switch away
-  # from the amdgpu-install wrapper. It also drives fix-12's remediation
-  # choice, so a silent revert of the rename would misfire there without any
-  # test catching it -- this pins the JSON contract directly rather than only
+  # from the amdgpu-install wrapper. It also feeds fix-12's applicability
+  # score (not which remediation commands it renders -- that comes from the
+  # package family and distro, not this field), so a silent revert of the
+  # rename would misfire there without any test catching it -- this pins the
+  # JSON contract directly rather than only
   # asserting the human-readable form (examine-06), which never named it. A
   # whitelist rather than one pinned value keeps this hermetic: which method
   # actually fires depends on this host's real ROCm repo markers (some

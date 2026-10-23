@@ -692,7 +692,7 @@ fn wsl_rocdxg_driver_plan(escalation: PrivilegeEscalation) -> DriverInstallPlan 
     if !rocdxg_version_is_well_formed(&version) {
         return wsl_rocdxg_refusal_plan(
             // The rejected value is still rendered into the plan's
-            // `repo_version_expr:` line so the user can see what was refused — but
+            // `repo_version:` line so the user can see what was refused — but
             // that line is part of a plan a human reads to decide, and a raw
             // value containing a newline could forge further lines in it. The
             // debug form escapes newlines and makes trailing space visible,
@@ -923,7 +923,7 @@ fn build_driver_install_plan_at(
             // Always "latest" even if `ROCM_CLI_AMDGPU_DRIVER_VERSION` names
             // something else or is malformed: unlike the Linux arms below,
             // this value has not gone through `resolve_repo_version_expr()`,
-            // so do not read the printed `repo_version_expr:` line here (or in
+            // so do not read the printed `repo_version:` line here (or in
             // `--dry-run` output) as confirmation that an override was seen or
             // accepted.
             repo_version_expr: "latest".to_owned(),
@@ -1318,7 +1318,7 @@ fn apt_driver_plan(
             driver_command(
                 DriverCommandPhase::Prepare,
                 &format!(
-                    "curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key | {sudo}gpg --dearmor -o /etc/apt/keyrings/rocm.gpg"
+                    "curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key | {sudo}gpg --batch --yes --dearmor -o /etc/apt/keyrings/rocm.gpg"
                 ),
             ),
             driver_command(
@@ -2366,9 +2366,8 @@ mod tests {
             "the apt-source pipeline must still tee, unprefixed: {commands:?}"
         );
         assert!(
-            commands
-                .iter()
-                .any(|command| command.contains("| gpg --dearmor -o /etc/apt/keyrings/rocm.gpg")),
+            commands.iter().any(|command| command
+                .contains("| gpg --batch --yes --dearmor -o /etc/apt/keyrings/rocm.gpg")),
             "the keyring pipeline must still call gpg, unprefixed: {commands:?}"
         );
     }
@@ -2503,6 +2502,28 @@ mod tests {
             resolve_shell_default_template("${ROCM_CLI_TEST_UNSET_A:-${ROCM_CLI_TEST_UNSET_B:-x}}"),
             "${ROCM_CLI_TEST_UNSET_A:-${ROCM_CLI_TEST_UNSET_B:-x}}"
         );
+    }
+
+    #[test]
+    fn driver_plan_dry_run_repo_version_line_is_resolved() {
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
+        // Regression for the dry-run output leaking the wrong field (or, under
+        // the old shell-template scheme this replaced, a raw unresolved
+        // placeholder) on the `repo_version:` line instead of the version the
+        // plan actually resolved.
+        let os_release = r#"
+ID=rhel
+VERSION_ID="9.7"
+"#;
+        let plan = build_driver_install_plan_read(
+            &test_examine("linux", false),
+            &os_release_found(os_release),
+            true,
+            PrivilegeEscalation::Sudo,
+        );
+        let rendered = render_driver_install_plan(&plan, false, true);
+
+        assert!(rendered.contains("  repo_version: latest"), "{rendered}");
     }
 
     #[test]
@@ -3101,6 +3122,22 @@ VERSION_CODENAME=noble
     }
 
     #[test]
+    fn is_safe_shell_token_rejects_quote_and_semicolon_payloads() {
+        // The hostile-codename/version-id/os-id tests above only ever send
+        // `$(id)` through this filter, which proves the metacharacter
+        // denylist works for *that* payload -- but a widened character class
+        // that happened to still reject `$`, `(`, `)` while now accepting
+        // `'`/`;` would pass every one of them undetected. `'` breaks out of
+        // this value's enclosing single-quoted shell string outright, and
+        // `;` chains a second command once out, so both must be checked
+        // directly against the function itself, not only indirectly.
+        assert!(!is_safe_shell_token("6.2.1'"));
+        assert!(!is_safe_shell_token("6.2.1;rm"));
+        assert!(!is_safe_shell_token("';rm -rf /;'"));
+        assert!(is_safe_shell_token("6.2.1"));
+    }
+
+    #[test]
     fn driver_reconcile_without_state_gives_non_privileged_guidance() -> Result<()> {
         let (root, paths) = test_paths("driver-reconcile-empty");
 
@@ -3382,6 +3419,10 @@ VERSION_ID="9.7"
             rendered
                 .contains("sudo dnf install -y kernel-headers kernel-devel kernel-devel-matched")
         );
+        // Rocky is `Generic`, not `Rhel`, in `DnfDriverDistro` -- confirms the
+        // `rpm --import` push is unconditional across the dnf match arms, not
+        // only wired for the `Rhel`/`Oracle` arms the other two tests cover.
+        assert!(rendered.contains("sudo rpm --import https://repo.radeon.com/rocm/rocm.gpg.key"));
         assert!(
             rendered.contains("baseurl=https://repo.radeon.com/amdgpu/latest/el/9.7/main/x86_64")
         );
@@ -3406,6 +3447,7 @@ VERSION_ID="9.4"
 
         assert!(plan.supported);
         assert!(plan.mutating);
+        assert!(rendered.contains("sudo rpm --import https://repo.radeon.com/rocm/rocm.gpg.key"));
         assert!(
             rendered.contains("baseurl=https://repo.radeon.com/amdgpu/latest/el/9.4/main/x86_64")
         );
@@ -3494,6 +3536,47 @@ VERSION_ID="15.7"
         );
         assert!(rendered.contains("Execute: sudo zypper --non-interactive install -y amdgpu-dkms"));
         assert!(rendered.contains("approval: required"));
+    }
+
+    #[test]
+    fn sles_repo_baseurl_uses_the_given_repo_version_expr_not_a_hardcoded_latest() {
+        // Mutation-proofs the parameter wiring itself: a mutation that
+        // hardcoded `latest` into this function's body left every existing
+        // SLES test green because their default env override also resolves
+        // to `latest`, so none of them could tell "wired correctly" apart
+        // from "hardcoded to the same value the default happens to be".
+        assert_eq!(
+            sles_repo_baseurl("6.2.1", "15.7"),
+            "https://repo.radeon.com/amdgpu/6.2.1/sle/15.7/main/x86_64"
+        );
+        assert_eq!(
+            sles_repo_baseurl("latest", "15.7"),
+            "https://repo.radeon.com/amdgpu/latest/sle/15.7/main/x86_64"
+        );
+    }
+
+    #[test]
+    fn driver_plan_sles_overrides_the_repo_version_via_the_driver_version_env() {
+        let mut env = ScopedTestEnv::with_amd_overrides_cleared();
+        env.set("ROCM_CLI_AMDGPU_DRIVER_VERSION", "6.2.1");
+        let os_release = r#"
+ID=sles
+VERSION_ID="15.7"
+"#;
+        let plan = build_driver_install_plan_read(
+            &test_examine("linux", false),
+            &os_release_found(os_release),
+            true,
+            PrivilegeEscalation::Sudo,
+        );
+        let rendered = render_driver_install_plan(&plan, false, false);
+
+        assert!(plan.supported);
+        assert!(
+            rendered.contains("baseurl=https://repo.radeon.com/amdgpu/6.2.1/sle/15.7/main/x86_64"),
+            "an overridden ROCM_CLI_AMDGPU_DRIVER_VERSION must reach the SLES repo baseurl, \
+             not a hardcoded `latest`: {rendered}"
+        );
     }
 
     #[test]
@@ -4140,6 +4223,7 @@ ID_LIKE="rhel centos fedora"
         assert!(!rendered.contains("/rhel/9.6/"));
         // el9 uses the version-aware standard-kernel prepare commands.
         assert!(rendered.contains("kernel-devel-matched-$(uname -r)"));
+        assert!(rendered.contains("sudo rpm --import https://repo.radeon.com/rocm/rocm.gpg.key"));
         assert!(rendered.contains("Execute: sudo dnf install -y amdgpu-dkms"));
     }
 
@@ -4167,6 +4251,7 @@ ID_LIKE="rhel centos fedora"
         // el8 has no kernel-devel-matched package.
         assert!(!rendered.contains("kernel-devel-matched"));
         assert!(rendered.contains("kernel-devel-$(uname -r)"));
+        assert!(rendered.contains("sudo rpm --import https://repo.radeon.com/rocm/rocm.gpg.key"));
     }
 
     #[test]

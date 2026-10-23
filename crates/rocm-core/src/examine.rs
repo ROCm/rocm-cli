@@ -1989,13 +1989,14 @@ fn repo_native_method_from_markers(existing: &[&str]) -> Option<(&'static str, V
 // `name` is already lowercased by the caller, so a plain suffix match is fine.
 #[allow(clippy::case_sensitive_file_extension_comparisons)]
 fn is_live_rocm_repo_file_name(name: &str) -> bool {
-    // Allowlist the known repo-file extensions (apt's `.list`, dnf/zypper's
-    // `.repo`) rather than denylist known quarantine suffixes: quarantining
-    // appends to the name (`amdgpu.list` -> `amdgpu.list.bak`), so this also
-    // excludes any quarantine convention this file doesn't know about, and
-    // stops an unrelated file that merely mentions "rocm"/"amdgpu" in its
-    // name (a note, a log) from being swept up as a live repo file.
-    (name.ends_with(".list") || name.ends_with(".repo"))
+    // Allowlist the known repo-file extensions (apt's one-line-style `.list`,
+    // apt's deb822-style `.sources`, dnf/zypper's `.repo`) rather than
+    // denylist known quarantine suffixes: quarantining appends to the name
+    // (`amdgpu.list` -> `amdgpu.list.bak`), so this also excludes any
+    // quarantine convention this file doesn't know about, and stops an
+    // unrelated file that merely mentions "rocm"/"amdgpu" in its name (a
+    // note, a log) from being swept up as a live repo file.
+    (name.ends_with(".list") || name.ends_with(".repo") || name.ends_with(".sources"))
         && (name.contains("rocm") || name.contains("amdgpu") || name.contains("radeon"))
 }
 
@@ -2063,11 +2064,25 @@ fn probe_rocm_install(e: &mut Examination) {
         };
     }
 
-    for dir in [
-        "/etc/apt/sources.list.d",
-        "/etc/yum.repos.d",
-        "/etc/zypp/repos.d",
-    ] {
+    merge_live_repo_paths(e, &REPO_SCAN_DIRS);
+}
+
+/// The repo directories `probe_rocm_install` scans for live (non-quarantined)
+/// ROCm/AMDGPU repo files, named so a test can assert each family's directory
+/// is actually present rather than only being provable by reading real system
+/// paths (SLES repo detection via `/etc/zypp/repos.d` is new in this PR).
+const REPO_SCAN_DIRS: [&str; 3] = [
+    "/etc/apt/sources.list.d",
+    "/etc/yum.repos.d",
+    "/etc/zypp/repos.d",
+];
+
+/// Split out from `probe_rocm_install` so the directory loop itself -- not
+/// just `is_live_rocm_repo_file_name` and `live_rocm_repo_paths_in_dir` in
+/// isolation -- is driven by a test against real (temp) directories standing
+/// in for each family's repo path.
+fn merge_live_repo_paths(e: &mut Examination, dirs: &[&str]) {
+    for dir in dirs {
         for full in live_rocm_repo_paths_in_dir(dir) {
             if !e.rocm_repos_seen.contains(&full) {
                 e.rocm_repos_seen.push(full);
@@ -3349,6 +3364,16 @@ mod tests {
     }
 
     #[test]
+    fn is_live_rocm_repo_file_name_recognizes_deb822_sources_files() {
+        // Newer apt defaults to the deb822 `.sources` format (as opposed to
+        // the one-line-style `.list`); fix-7's own `ls | grep` advice has no
+        // extension filter and already matches these, so this filter must
+        // not be the one place that silently misses them.
+        assert!(is_live_rocm_repo_file_name("amdgpu.sources"));
+        assert!(!is_live_rocm_repo_file_name("amdgpu.sources.bak"));
+    }
+
+    #[test]
     fn live_rocm_repo_paths_in_dir_skips_a_real_bak_file_on_disk() {
         // `is_live_rocm_repo_file_name` above only proves the name filter is
         // correct in isolation; this drives an actual `.bak` file (the kind
@@ -3366,6 +3391,75 @@ mod tests {
 
         assert_eq!(seen.len(), 1, "seen: {seen:?}");
         assert!(seen[0].ends_with("amdgpu.list"));
+    }
+
+    #[test]
+    fn repo_scan_dirs_covers_all_three_package_families() {
+        // Mutation-proofs the literal dir list `probe_rocm_install` scans:
+        // deleting the `/etc/zypp/repos.d` entry (SLES repo detection, new in
+        // this PR) left every existing test green because nothing previously
+        // asserted this list's contents directly.
+        assert!(REPO_SCAN_DIRS.contains(&"/etc/apt/sources.list.d"));
+        assert!(REPO_SCAN_DIRS.contains(&"/etc/yum.repos.d"));
+        assert!(REPO_SCAN_DIRS.contains(&"/etc/zypp/repos.d"));
+    }
+
+    #[test]
+    fn merge_live_repo_paths_scans_every_family_dir_including_zypp() {
+        // Drives `probe_rocm_install`'s actual scan loop (not just its two
+        // helpers in isolation) across temp directories standing in for all
+        // three package families, including the zypp one a mutation run
+        // showed was silently unscanned by every pre-existing test.
+        let apt_dir = tempfile::tempdir().expect("create apt temp dir");
+        let yum_dir = tempfile::tempdir().expect("create yum temp dir");
+        let zypp_dir = tempfile::tempdir().expect("create zypp temp dir");
+        std::fs::write(apt_dir.path().join("amdgpu.list"), "deb ...\n").expect("write apt repo");
+        std::fs::write(yum_dir.path().join("amdgpu.repo"), "[amdgpu]\n").expect("write yum repo");
+        std::fs::write(zypp_dir.path().join("amdgpu.repo"), "[amdgpu]\n").expect("write zypp repo");
+
+        let mut e = Examination::default();
+        let dirs = [
+            apt_dir.path().to_string_lossy().into_owned(),
+            yum_dir.path().to_string_lossy().into_owned(),
+            zypp_dir.path().to_string_lossy().into_owned(),
+        ];
+        let dir_refs: Vec<&str> = dirs.iter().map(String::as_str).collect();
+        merge_live_repo_paths(&mut e, &dir_refs);
+
+        assert_eq!(e.rocm_repos_seen.len(), 3, "seen: {:?}", e.rocm_repos_seen);
+        assert!(
+            e.rocm_repos_seen
+                .iter()
+                .any(|p| p.starts_with(dirs[0].as_str()))
+        );
+        assert!(
+            e.rocm_repos_seen
+                .iter()
+                .any(|p| p.starts_with(dirs[1].as_str()))
+        );
+        assert!(
+            e.rocm_repos_seen
+                .iter()
+                .any(|p| p.starts_with(dirs[2].as_str()))
+        );
+    }
+
+    #[test]
+    fn merge_live_repo_paths_does_not_duplicate_an_already_seen_path() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        std::fs::write(dir.path().join("amdgpu.repo"), "[amdgpu]\n").expect("write repo");
+        let dir_str = dir.path().to_string_lossy().into_owned();
+
+        let mut e = Examination::default();
+        e.rocm_repos_seen.push(format!("{dir_str}/amdgpu.repo"));
+        merge_live_repo_paths(&mut e, &[dir_str.as_str()]);
+
+        assert_eq!(
+            e.rocm_repos_seen.len(),
+            1,
+            "an already-recorded path must not be duplicated: {:?}",
+            e.rocm_repos_seen
+        );
     }
 
     /// A Linux host with an AMD GPU, so `compute_status` turns on the probe

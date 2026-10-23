@@ -330,7 +330,9 @@ const RECIPES: &[FixRecipe] = &[
         needs_sudo: false,
         needs_reboot: true,
         needs_relogin: false,
-        verify: "lsmod | grep amdgpu && rocminfo | head -n 20",
+        verify: "# Run only the line matching the path you took above:\n\
+                 lsmod | grep amdgpu && rocminfo | head -n 20   # drive reinstall path\n\
+                 rocminfo | head -n 20                         # `rocm install sdk` (userspace-only) path",
         notes: &[],
         doc_url: Some(
             "https://rocm.docs.amd.com/projects/install-on-linux/en/latest/reference/system-requirements.html",
@@ -414,15 +416,15 @@ const RECIPES: &[FixRecipe] = &[
             "sudo mv /etc/apt/sources.list.d/<file>.list /etc/apt/sources.list.d/<file>.list.bak   # or the yum/zypp equivalent",
             "# Run only the line matching your package manager:",
             "sudo apt update      # Debian/Ubuntu",
-            "sudo dnf clean all   # RHEL/Fedora/Rocky/Alma/Oracle",
+            "sudo dnf makecache   # RHEL/Fedora/Rocky/Alma/Oracle",
             "sudo zypper refresh  # SLES/openSUSE",
         ],
         needs_sudo: true,
         needs_reboot: false,
         needs_relogin: false,
-        verify: "Run only the line matching your package manager:\n\
+        verify: "# Run only the line matching your package manager:\n\
                  bash -c 'set -o pipefail; sudo apt update 2>&1 | tail -n 20'      # Debian/Ubuntu\n\
-                 bash -c 'set -o pipefail; sudo dnf clean all 2>&1 | tail -n 20'   # RHEL/Fedora/Rocky/Alma/Oracle\n\
+                 bash -c 'set -o pipefail; sudo dnf makecache 2>&1 | tail -n 20'   # RHEL/Fedora/Rocky/Alma/Oracle\n\
                  bash -c 'set -o pipefail; sudo zypper refresh 2>&1 | tail -n 20'  # SLES/openSUSE",
         notes: &[],
         doc_url: None,
@@ -523,7 +525,7 @@ const RECIPES: &[FixRecipe] = &[
     FixRecipe {
         fix_id: "fix-12-installer",
         title: "Reset repo-native install state and reinstall",
-        rationale: "The repo-native package-manager install left a half-configured DKMS / repo state. Clear the broken package state, quarantine the repo files rocm-cli's install wrote, let the package manager forget the broken state, then reinstall via rocm-cli's own repo-native flow.",
+        rationale: "The repo-native package-manager install left a half-configured DKMS / repo state. Clear the broken package state, quarantine the ROCm/AMDGPU repo files found on this host, let the package manager forget the broken state, then reinstall via rocm-cli's own repo-native flow.",
         commands: &[
             "# Run only the block matching your package manager. On Debian/Ubuntu, run all",
             "# three lines even if an earlier one reports an error -- the purge must not",
@@ -536,7 +538,7 @@ const RECIPES: &[FixRecipe] = &[
             "# sudo mv /etc/apt/sources.list.d/amdgpu.list /etc/apt/sources.list.d/amdgpu.list.bak       # or the yum/zypp equivalent; quarantine, do not delete yet",
             "# Run only the line matching your package manager:",
             "sudo apt update      # Debian/Ubuntu",
-            "sudo dnf clean all   # RHEL/Fedora/Rocky/Alma/Oracle",
+            "sudo dnf makecache   # RHEL/Fedora/Rocky/Alma/Oracle",
             "sudo zypper refresh  # SLES/openSUSE",
             "rocm install driver --dkms --yes",
         ],
@@ -3715,6 +3717,9 @@ mod tests {
         // `verify` must also track diagnose.rs's per-family text, not just
         // `commands`: diagnose.rs varies `verify` by family too, so compare
         // each family's line against what diagnose() actually emits for it.
+        // The dnf/zypper `ls` lines get the same treatment as apt above --
+        // only asserting the apt one left those two families' list commands
+        // able to drift from the recipe undetected.
         for (family_repo_dir, marker) in [
             ("/etc/apt/sources.list.d/", "# Debian/Ubuntu"),
             ("/etc/yum.repos.d/", "# RHEL/Fedora/Rocky/Alma/Oracle"),
@@ -3735,7 +3740,26 @@ mod tests {
                 .iter()
                 .find(|d| d.id == "fix-7-stale-repos")
                 .expect("duplicate repo files should be diagnosed");
-            let diagnose_verify = hit.fix.as_ref().unwrap().verify.as_str();
+            let fix = hit.fix.as_ref().unwrap();
+            let diagnose_list_cmd = fix
+                .commands
+                .first()
+                .expect("fix-7 always lists the repo dir first on a recognized family")
+                .as_str();
+            let diagnose_verify = fix.verify.as_str();
+
+            let recipe_list_cmd = recipe
+                .commands
+                .iter()
+                .find(|c| c.trim_end().ends_with(marker) && c.contains("ls /"))
+                .map_or_else(
+                    || panic!("recipe must have a commented list line for {marker}"),
+                    |c| c.split('#').next().unwrap().trim_end(),
+                );
+            assert_eq!(
+                recipe_list_cmd, diagnose_list_cmd,
+                "this recipe's {marker} list command must match what diagnose.rs emits for fix-7-stale-repos"
+            );
 
             let recipe_verify_line = recipe
                 .verify

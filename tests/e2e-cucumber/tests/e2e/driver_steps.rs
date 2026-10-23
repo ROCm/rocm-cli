@@ -83,7 +83,7 @@ async fn assert_driver_plan_matches_host_release(world: &mut E2eWorld) {
     );
     assert!(
         output.contains(&format!(
-            "curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key | {sudo}gpg --dearmor -o /etc/apt/keyrings/rocm.gpg"
+            "curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key | {sudo}gpg --batch --yes --dearmor -o /etc/apt/keyrings/rocm.gpg"
         )),
         "{output}"
     );
