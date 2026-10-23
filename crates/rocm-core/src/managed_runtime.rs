@@ -195,8 +195,37 @@ fn select_active_managed_therock_record(
         return Some(record.clone());
     }
 
-    records.sort_by_key(|(_, record)| std::cmp::Reverse(record.installed_at_unix_ms.unwrap_or(0)));
+    sort_records_newest_install_first(&mut records);
     records.into_iter().next().map(|(_, record)| record)
+}
+
+/// Order registry records newest install first, breaking ties on the runtime
+/// key and then on the record's path.
+///
+/// Without a tiebreak the order of records that share an
+/// `installed_at_unix_ms` is whatever `read_dir` returned, so "the most recently
+/// installed runtime" would be chosen by the filesystem. Ties are ordinary: a
+/// `--devel` install and its plain sibling land in the same millisecond, and a
+/// record written before the field existed reads as `0`. `rocm`'s own registry
+/// load breaks the same tie on the runtime key, ascending, so this uses the
+/// same tiebreak among the records this crate considers. The two sides do not
+/// consider the same records, though: these fallbacks only see records
+/// [`managed_therock_environment_records`] accepts (a TheRock runtime whose
+/// `rocm_sdk` probe imported), while the CLI's startup update check takes the
+/// first of every parsed manifest. So the rule is shared, not the pick: with
+/// no active key, a tarball runtime installed after a wheel one is what the
+/// CLI reports on, while this falls back to the wheel. Shared by all three
+/// registry fallbacks: the active-runtime fallback, the `amd-smi` binary
+/// resolver, and the SDK probe candidate list.
+pub(crate) fn sort_records_newest_install_first(records: &mut [(PathBuf, TheRockFamilyManifest)]) {
+    records.sort_by(|(left_path, left), (right_path, right)| {
+        right
+            .installed_at_unix_ms
+            .unwrap_or(0)
+            .cmp(&left.installed_at_unix_ms.unwrap_or(0))
+            .then_with(|| left.runtime_key.cmp(&right.runtime_key))
+            .then_with(|| left_path.cmp(right_path))
+    });
 }
 
 pub fn prepend_runtime_paths(
@@ -510,6 +539,168 @@ mod tests {
         let config = RocmCliConfig::default();
         assert_eq!(active_managed_therock_channel(&paths, &config)?, None);
         fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn registry_records_tie_on_install_time_is_broken_on_the_runtime_key() {
+        // The file name mirrors the key's letters (`aaa` -> `zzz.json`), so
+        // path order is the reverse of key order: a sort that fell through to
+        // the path tiebreak without consulting the key would fail here.
+        let record = |key: &str, installed_at: u128| {
+            let mirrored: String = key
+                .bytes()
+                .map(|byte| char::from(b'a' + b'z' - byte))
+                .collect();
+            (
+                PathBuf::from(format!("{mirrored}.json")),
+                serde_json::from_value::<TheRockFamilyManifest>(serde_json::json!({
+                    "runtime_key": key,
+                    "installed_at_unix_ms": installed_at,
+                }))
+                .expect("record"),
+            )
+        };
+        let keys = |records: &[(PathBuf, TheRockFamilyManifest)]| {
+            records
+                .iter()
+                .map(|(_, record)| record.runtime_key.clone().unwrap_or_default())
+                .collect::<Vec<_>>()
+        };
+
+        // Same millisecond, both read orders: the smaller key comes first, as
+        // in `rocm`'s registry load, so the fallback cannot depend on `read_dir`.
+        for mut records in [
+            vec![
+                record("bbb", 2_000),
+                record("aaa", 2_000),
+                record("old", 1_000),
+            ],
+            vec![
+                record("aaa", 2_000),
+                record("bbb", 2_000),
+                record("old", 1_000),
+            ],
+        ] {
+            sort_records_newest_install_first(&mut records);
+            assert_eq!(keys(&records), ["aaa", "bbb", "old"]);
+        }
+
+        // The install time still decides first.
+        let mut records = vec![record("aaa", 1_000), record("zzz", 2_000)];
+        sort_records_newest_install_first(&mut records);
+        assert_eq!(keys(&records), ["zzz", "aaa"]);
+    }
+
+    #[test]
+    fn registry_records_without_a_key_or_a_time_still_sort_deterministically() {
+        let record = |path: &str, fields: serde_json::Value| {
+            (
+                PathBuf::from(path),
+                serde_json::from_value::<TheRockFamilyManifest>(fields).expect("record"),
+            )
+        };
+        let paths = |records: &[(PathBuf, TheRockFamilyManifest)]| {
+            records
+                .iter()
+                .map(|(path, _)| path.display().to_string())
+                .collect::<Vec<_>>()
+        };
+
+        // Two keyless records in the same millisecond differ only in their
+        // path, so the path is the last tiebreak and decides in both input
+        // orders.
+        for mut records in [
+            vec![
+                record(
+                    "b.json",
+                    serde_json::json!({ "installed_at_unix_ms": 2_000 }),
+                ),
+                record(
+                    "a.json",
+                    serde_json::json!({ "installed_at_unix_ms": 2_000 }),
+                ),
+            ],
+            vec![
+                record(
+                    "a.json",
+                    serde_json::json!({ "installed_at_unix_ms": 2_000 }),
+                ),
+                record(
+                    "b.json",
+                    serde_json::json!({ "installed_at_unix_ms": 2_000 }),
+                ),
+            ],
+        ] {
+            sort_records_newest_install_first(&mut records);
+            assert_eq!(paths(&records), ["a.json", "b.json"]);
+        }
+
+        // A record written before `installed_at_unix_ms` existed reads as
+        // installed at 0: it ties with an explicit 0 (so the key decides) and
+        // sorts below any real install time.
+        for mut records in [
+            vec![
+                record("untimed.json", serde_json::json!({ "runtime_key": "aaa" })),
+                record(
+                    "zero.json",
+                    serde_json::json!({ "runtime_key": "bbb", "installed_at_unix_ms": 0 }),
+                ),
+                record(
+                    "timed.json",
+                    serde_json::json!({ "runtime_key": "zzz", "installed_at_unix_ms": 1 }),
+                ),
+            ],
+            vec![
+                record(
+                    "timed.json",
+                    serde_json::json!({ "runtime_key": "zzz", "installed_at_unix_ms": 1 }),
+                ),
+                record(
+                    "zero.json",
+                    serde_json::json!({ "runtime_key": "bbb", "installed_at_unix_ms": 0 }),
+                ),
+                record("untimed.json", serde_json::json!({ "runtime_key": "aaa" })),
+            ],
+        ] {
+            sort_records_newest_install_first(&mut records);
+            assert_eq!(paths(&records), ["timed.json", "untimed.json", "zero.json"]);
+        }
+    }
+
+    #[test]
+    fn active_managed_therock_fallback_breaks_install_time_ties_on_the_runtime_key() -> Result<()> {
+        // Two runtimes installed in the same millisecond, written under both
+        // pairings of file name and runtime key. Whichever file `read_dir`
+        // returns first holds `bbb` in one of the two pairings, so a fallback
+        // that kept the read order picks the wrong runtime in that one.
+        for (first_file_key, second_file_key) in [("aaa", "bbb"), ("bbb", "aaa")] {
+            let (root, paths) = temp_app_paths("active-therock-tie");
+            let registry = paths.data_dir.join("runtimes").join("registry");
+            fs::create_dir_all(&registry)?;
+            for (file, key) in [("first", first_file_key), ("second", second_file_key)] {
+                fs::write(
+                    registry.join(format!("{file}.json")),
+                    serde_json::to_vec_pretty(&serde_json::json!({
+                        "runtime_key": key,
+                        "runtime_id": "therock-release:gfx120X-all",
+                        "family": "gfx120X-all",
+                        "channel": "release",
+                        "version": format!("version-of-{key}"),
+                        "installed_at_unix_ms": 2_000,
+                        "rocm_sdk": { "import_ok": true }
+                    }))?,
+                )?;
+            }
+
+            let config = RocmCliConfig::default();
+            assert_eq!(
+                active_managed_therock_version(&paths, &config)?,
+                Some("version-of-aaa".to_owned()),
+                "files first={first_file_key}, second={second_file_key}"
+            );
+            fs::remove_dir_all(root).ok();
+        }
         Ok(())
     }
 
