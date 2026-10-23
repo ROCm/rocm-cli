@@ -100,6 +100,16 @@ reason = "Lemonade managed serve reaches ready then shuts down immediately, so i
 serve_timeout_secs = 90
 flaky = true
 
+# The dashboard journey does the same real lemonade serve as serve-lemonade-inference,
+# so on a Linux lemonade host it is just as intermittent. The bounded serve timeout
+# makes a stuck serve fail this one scenario instead of stalling the whole lane.
+[["dash-lemonade-managed-inference-journey"]]
+when = { effective_engine = "lemonade", os = "linux" }
+bug = "EAI-7423"
+reason = "The managed Lemonade serve on Linux is intermittent: it can reach ready and then shut down, or never become ready, so the journey cannot be relied on to complete."
+serve_timeout_secs = 90
+flaky = true
+
 # --- EAI-7223: chat requests with tool definitions rejected (vLLM path) ---
 [["chat-tool-definitions-accepted"]]
 when = { effective_engine = "vllm" }

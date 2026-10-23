@@ -9,20 +9,19 @@
 //!   `time_to_first_token`, `tokens_per_second`, `input_tokens`, `output_tokens`,
 //!   `prompt_tokens`, `decode_token_times[]`. (No KV-cache / running / waiting —
 //!   Lemonade does not expose those; those `InstanceSample` fields stay `None`.)
-//! - `GET /api/v1/health` → `status` + `model_loaded` (most-recent model name).
+//! - `GET /api/v1/health` → `status` + `all_models_loaded`. Legacy servers
+//!   report only `model_loaded` (most recent access, including load/inference).
 //!
-//! The parsers (`parse_stats`, `parse_health_model`) are **pure** (serde only)
+//! The parsers (`parse_stats`, `parse_health`) are **pure** (serde only)
 //! and the deterministic, fixture-tested anchor. The async scrape
-//! ([`LemonadeCollector`]) fetches those bodies over HTTP and degrades to
-//! "not reachable" (never panics) so a host with no Lemonade endpoint is a no-op.
+//! ([`LemonadeCollector`]) fetches those bodies over HTTP and returns transport
+//! errors to the runner, which supplies endpoint context in snapshot warnings.
+//! Discovery of a never-seen absent external endpoint remains a quiet no-op.
 
 use std::time::Duration;
 
 use reqwest::Client;
-use rocm_dash_core::metrics::Instance;
-use rocm_dash_core::traits::{
-    CollectorError, DiscoveredService, InstanceSample, Result, merge_instance,
-};
+use rocm_dash_core::traits::{CollectorError, DiscoveredService, InstanceSample, Result};
 use serde::Deserialize;
 
 /// Lemonade's default OpenAI-compatible port. Mirrors `rocm_dash_tui::skills`
@@ -51,18 +50,101 @@ pub struct LemonadeStats {
     pub decode_token_times: Option<Vec<f64>>,
 }
 
-/// `/api/v1/health` response — liveness + the most-recently-loaded model name.
+/// Lemonade health response. `all_models_loaded`, when present, is the
+/// authoritative loaded set. Older servers report only `model_loaded`.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct LemonadeHealth {
     #[serde(default)]
     pub status: Option<String>,
     #[serde(default)]
     pub model_loaded: Option<String>,
+    #[serde(default)]
+    pub all_models_loaded: Option<Vec<serde_json::Value>>,
+}
+
+impl LemonadeHealth {
+    /// Sorted, deduplicated loaded model names, only from a healthy response.
+    /// An empty router is healthy but does not constitute a serving model.
+    pub fn loaded_models(&self) -> Vec<String> {
+        if self.status.as_deref() != Some("ok") {
+            return Vec::new();
+        }
+        let names: Vec<&str> = match &self.all_models_loaded {
+            Some(models) => models
+                .iter()
+                .filter_map(|model| {
+                    model.as_str().or_else(|| {
+                        ["model_name", "id", "name"]
+                            .into_iter()
+                            .filter_map(|field| {
+                                model.get(field).and_then(serde_json::Value::as_str)
+                            })
+                            .find(|name| !name.trim().is_empty())
+                    })
+                })
+                .collect(),
+            None => self.model_loaded.as_deref().into_iter().collect(),
+        };
+        names
+            .into_iter()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    /// Singleton attribution for server-global last-request stats. Health's
+    /// `model_loaded` means last access (load OR inference), not last request,
+    /// so it cannot disambiguate multiple loaded models. A conflicting explicit
+    /// name also rejects the singleton fallback.
+    pub fn stats_model(&self) -> Option<String> {
+        let loaded = self.loaded_models();
+        if loaded.len() != 1 {
+            return None;
+        }
+        if let Some(last) = self
+            .model_loaded
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            return loaded.into_iter().find(|name| name == last);
+        }
+        loaded.into_iter().next()
+    }
+}
+
+/// Map a failed request to a [`CollectorError`]. A refused or unanswered
+/// connection becomes `Io(ConnectionRefused)`, the typed marker for "nothing is
+/// listening" that [`is_connect_error`] reads; every other failure stays a
+/// `Transport` error. A timeout counts as unanswered because Windows does not
+/// refuse a connection to a closed local port: the attempt hangs until the
+/// request timeout.
+fn send_error(url: &str, error: &reqwest::Error) -> CollectorError {
+    let message = format!("GET {url}: {error}");
+    if error.is_connect() || error.is_timeout() {
+        CollectorError::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            message,
+        ))
+    } else {
+        CollectorError::Transport(message)
+    }
+}
+
+/// True when `error` means no server accepted the connection, as opposed to a
+/// server that answered with an HTTP status or a broken body.
+pub fn is_connect_error(error: &CollectorError) -> bool {
+    matches!(error, CollectorError::Io(io) if io.kind() == std::io::ErrorKind::ConnectionRefused)
 }
 
 /// PURE: parse a `/api/v1/stats` body into an [`InstanceSample`].
 ///
-/// Lemonade reports an instantaneous `tokens_per_second` rate (mapped to `gen_tps`) rather than a
+/// Lemonade reports the `tokens_per_second` rate of the most recent request (mapped to `gen_tps`;
+/// it is not a live rate: the same value is reported until another request completes, so the
+/// dashboard keeps showing the last request's rate until a new request replaces it) rather than a
 /// cumulative counter; it exposes no KV-cache / running / waiting metrics, so
 /// those stay `None`. Malformed/empty JSON → an all-`None` default, never panics.
 pub fn parse_stats(body: &str) -> InstanceSample {
@@ -89,11 +171,18 @@ pub fn parse_stats_struct(body: &str) -> LemonadeStats {
     object_or_default(body)
 }
 
-/// PURE: extract the loaded model name from a `/api/v1/health` body, if present
-/// and non-empty. Malformed JSON → `None`, never panics.
-pub fn parse_health_model(body: &str) -> Option<String> {
-    let health: LemonadeHealth = object_or_default(body);
-    health.model_loaded.filter(|s| !s.is_empty())
+/// PURE: parse a health body, rejecting invalid/wrong-shape input to default.
+pub fn parse_health(body: &str) -> LemonadeHealth {
+    let Ok(value @ serde_json::Value::Object(_)) = serde_json::from_str(body) else {
+        return LemonadeHealth::default();
+    };
+    if value
+        .get("all_models_loaded")
+        .is_some_and(|models| !models.is_array())
+    {
+        return LemonadeHealth::default();
+    }
+    serde_json::from_value(value).unwrap_or_default()
 }
 
 /// Deserialize a JSON **object** body into `T`, returning `T::default()` for any
@@ -115,22 +204,27 @@ pub fn lemonade_container_id(host: &str, port: u16) -> String {
     format!("lemonade-{host}-{port}")
 }
 
-/// PURE: build a `DiscoveredService` for a Lemonade endpoint. Lemonade is a
-/// single local server (no tensor-parallel sharding metadata), so TP = 1.
+/// A model identity within an external endpoint. Encoding the model's UTF-8
+/// bytes avoids separator collisions and keeps identity stable across reorder.
+pub fn lemonade_model_id(host: &str, port: u16, model_name: &str) -> String {
+    use std::fmt::Write as _;
+    let mut id = format!("{}-model-", lemonade_container_id(host, port));
+    for byte in model_name.as_bytes() {
+        let _ = write!(id, "{byte:02x}");
+    }
+    id
+}
+
+/// PURE: build metadata for an external loaded model.
 ///
-/// Every call site only constructs this after `/api/v1/health` has already
-/// answered (see `LemonadeCollector::discover`), so a successfully-built
-/// service is by definition reachable and serving — mark it `Ready` rather
-/// than the generic `Running`.
+/// Callers must establish healthy loaded-model evidence first; answering HTTP
+/// alone is insufficient. `model_name` must be a trimmed, non-empty name, as
+/// produced by [`LemonadeHealth::loaded_models`]. Lemonade exposes no TP metadata.
 pub fn lemonade_service(host: &str, port: u16, model_name: &str) -> DiscoveredService {
     DiscoveredService {
-        container_id: lemonade_container_id(host, port),
+        container_id: lemonade_model_id(host, port, model_name),
         container_name: "lemonade".to_string(),
-        model_name: if model_name.is_empty() {
-            "lemonade".to_string()
-        } else {
-            model_name.to_string()
-        },
+        model_name: model_name.to_string(),
         port: Some(port),
         tensor_parallel_size: 1,
         status: rocm_dash_core::metrics::InstanceStatus::Ready,
@@ -138,18 +232,23 @@ pub fn lemonade_service(host: &str, port: u16, model_name: &str) -> DiscoveredSe
     }
 }
 
-/// PURE: build a finished `Instance` from a Lemonade `/health` model name + a `/stats` body.
-///
-/// This is the fixture→Instance anchor (no network). `gen_tps` flows from
-/// `tokens_per_second`; KV/req fields stay `None` (Lemonade does not report them).
-pub fn lemonade_instance(host: &str, port: u16, model_name: &str, stats_body: &str) -> Instance {
-    let svc = lemonade_service(host, port, model_name);
-    let sample = parse_stats(stats_body);
-    merge_instance(&svc, &sample, 0, 0)
+/// PURE: map a health payload to one discovered service per loaded model.
+/// Invalid, unhealthy or empty payloads yield no rows. The daemon runner and
+/// the tests both use this single mapping.
+pub fn services_from_health(
+    host: &str,
+    port: u16,
+    health: &LemonadeHealth,
+) -> Vec<DiscoveredService> {
+    health
+        .loaded_models()
+        .iter()
+        .map(|model| lemonade_service(host, port, model))
+        .collect()
 }
 
 /// Async scrape of a local Lemonade endpoint. Network/parse failure degrades to
-/// `Err`/`None` ("not reachable") — never a panic. The pure parsers above do the
+/// transport errors or an empty loaded set, never a panic. The pure parsers above do the
 /// actual mapping; this only does I/O.
 #[derive(Debug, Clone)]
 pub struct LemonadeCollector {
@@ -172,17 +271,47 @@ impl LemonadeCollector {
     }
 
     fn url(&self, path: &str) -> String {
-        format!("http://{}:{}{path}", self.host, self.port)
+        let host = if self.host.contains(':') && !self.host.starts_with('[') {
+            format!("[{}]", self.host)
+        } else {
+            self.host.clone()
+        };
+        format!("http://{host}:{}{path}", self.port)
     }
 
-    async fn get_text(&self, path: &str) -> Result<String> {
-        let url = self.url(path);
-        let resp = self
+    /// GET `path`, falling back to the legacy route on a 404. `Ok(None)` means
+    /// neither route exists: the server does not speak the Lemonade protocol.
+    async fn get_text_opt(&self, path: &str, auth_optional: bool) -> Result<Option<String>> {
+        let mut url = self.url(path);
+        let mut resp = self
             .client
             .get(&url)
             .send()
             .await
-            .map_err(|e| CollectorError::Transport(format!("GET {url}: {e}")))?;
+            .map_err(|e| send_error(&url, &e))?;
+        // Router versions expose either /api/v1 or /v1. Only a missing route
+        // warrants compatibility fallback, never an authentication or health
+        // failure. This does not add a llama-server metrics protocol.
+        if resp.status() == reqwest::StatusCode::NOT_FOUND
+            && let Some(legacy_path) = path.strip_prefix("/api")
+        {
+            url = self.url(legacy_path);
+            resp = self
+                .client
+                .get(&url)
+                .send()
+                .await
+                .map_err(|e| send_error(&url, &e))?;
+        }
+        if resp.status() == reqwest::StatusCode::NOT_FOUND
+            || (auth_optional
+                && matches!(
+                    resp.status(),
+                    reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+                ))
+        {
+            return Ok(None);
+        }
         if !resp.status().is_success() {
             return Err(CollectorError::Transport(format!(
                 "GET {url}: status {}",
@@ -191,7 +320,14 @@ impl LemonadeCollector {
         }
         resp.text()
             .await
+            .map(Some)
             .map_err(|e| CollectorError::Transport(format!("body {url}: {e}")))
+    }
+
+    async fn get_text(&self, path: &str) -> Result<String> {
+        self.get_text_opt(path, false).await?.ok_or_else(|| {
+            CollectorError::Transport(format!("GET {}: status 404 Not Found", self.url(path)))
+        })
     }
 
     /// Scrape `/api/v1/stats` → an `InstanceSample` (rate → `gen_tps`).
@@ -199,31 +335,49 @@ impl LemonadeCollector {
         Ok(parse_stats(&self.get_text(LEMONADE_STATS_PATH).await?))
     }
 
-    /// Scrape `/api/v1/health` → the loaded model name (if any).
-    pub async fn fetch_health_model(&self) -> Result<Option<String>> {
-        Ok(parse_health_model(
-            &self.get_text(LEMONADE_HEALTH_PATH).await?,
-        ))
+    /// Registry-target lookup: `Ok(None)` if the Lemonade health route is absent
+    /// or requires credentials (401/403). The registry still supplies ownership
+    /// and status; this does not establish health or permit a stats scrape.
+    /// Transport failures and 5xx responses are still errors. External discovery
+    /// uses [`Self::fetch_health`] instead, where auth rejection remains an error.
+    pub async fn fetch_health_if_router(&self) -> Result<Option<LemonadeHealth>> {
+        Ok(self
+            .get_text_opt(LEMONADE_HEALTH_PATH, true)
+            .await?
+            .map(|body| parse_health(&body)))
     }
 
-    /// Probe the endpoint: if `/api/v1/health` answers, return a `DiscoveredService`
-    /// for it (model name from health, falling back to "lemonade"); otherwise
-    /// `None` (endpoint absent/unreachable) — a clean no-op, no panic.
-    pub async fn discover(&self) -> Option<DiscoveredService> {
-        match self.fetch_health_model().await {
-            Ok(model) => Some(lemonade_service(
-                &self.host,
-                self.port,
-                model.as_deref().unwrap_or(""),
-            )),
-            Err(_) => None,
-        }
+    /// Fetch the health payload. Invalid payloads carry no loaded models.
+    pub async fn fetch_health(&self) -> Result<LemonadeHealth> {
+        Ok(parse_health(&self.get_text(LEMONADE_HEALTH_PATH).await?))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An IPv6 host is bracketed in the URL exactly once; IPv4 and names are not.
+    /// Pure, so it runs on hosts where the daemon's IPv6 tests cannot bind.
+    #[test]
+    fn url_brackets_an_ipv6_host_once() {
+        let url = |host: &str| {
+            LemonadeCollector::new(host, 13305, std::time::Duration::from_secs(1))
+                .url("/api/v1/health")
+        };
+        assert_eq!(url("::1"), "http://[::1]:13305/api/v1/health");
+        assert_eq!(url("[::1]"), "http://[::1]:13305/api/v1/health");
+        assert_eq!(url("127.0.0.1"), "http://127.0.0.1:13305/api/v1/health");
+        assert_eq!(url("localhost"), "http://localhost:13305/api/v1/health");
+    }
+
+    /// Same path the daemon runner takes: health fetch, then the shared mapping.
+    async fn discovered(collector: &LemonadeCollector) -> Vec<DiscoveredService> {
+        match collector.fetch_health().await {
+            Ok(health) => services_from_health(&collector.host, collector.port, &health),
+            Err(_) => Vec::new(),
+        }
+    }
 
     // Representative `/api/v1/stats` response (lemonade-server.ai/docs/api).
     const STATS_FIXTURE: &str = r#"{
@@ -240,8 +394,135 @@ mod tests {
         "status": "ok",
         "version": "9.3.3",
         "model_loaded": "Llama-3.2-1B-Instruct-Hybrid",
-        "all_models_loaded": []
+        "all_models_loaded": [{"model_name":"Llama-3.2-1B-Instruct-Hybrid"}]
     }"#;
+
+    #[test]
+    fn loaded_set_and_stats_attribution_are_conservative() {
+        let health = parse_health(
+            r#"{"status":"ok","all_models_loaded":[" Model-B ",{"id":"Model-A"},{"name":"Model-B"},{"model_name":"","id":"Model-C"},null,7,{}]}"#,
+        );
+        assert_eq!(health.loaded_models(), ["Model-A", "Model-B", "Model-C"]);
+        assert_eq!(health.stats_model(), None);
+        let health = parse_health(
+            r#"{"status":"ok","model_loaded":"Model-B","all_models_loaded":["Model-A","Model-B"]}"#,
+        );
+        assert_eq!(
+            health.stats_model(),
+            None,
+            "last access can be a load, not a request"
+        );
+        for body in [
+            r#"{"status":"ok","all_models_loaded":["Model-A"]}"#,
+            r#"{"status":"ok","model_loaded":"Model-A"}"#,
+        ] {
+            assert_eq!(parse_health(body).stats_model().as_deref(), Some("Model-A"));
+        }
+        assert_eq!(
+            parse_health(
+                r#"{"status":"ok","model_loaded":"Model-B","all_models_loaded":["Model-A"]}"#
+            )
+            .stats_model(),
+            None
+        );
+        for body in [
+            r#"{"status":"ok","all_models_loaded":{},"model_loaded":"Model-A"}"#,
+            r#"{"status":"bad","model_loaded":"Model-A"}"#,
+            r#"{"model_loaded":"Model-A"}"#,
+        ] {
+            assert!(parse_health(body).loaded_models().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn health_if_router_distinguishes_missing_route_from_failure() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        // A plain llama-server: neither Lemonade health route exists.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/health"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"status":"ok"}"#))
+            .mount(&server)
+            .await;
+        let collector =
+            LemonadeCollector::new("127.0.0.1", server.address().port(), Duration::from_secs(1));
+        assert!(
+            collector
+                .fetch_health_if_router()
+                .await
+                .expect("missing routes are not an error")
+                .is_none()
+        );
+        assert!(collector.fetch_health().await.is_err());
+        // A router answering on the legacy route is still a router.
+        server.reset().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/health"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"status":"ok","model_loaded":"Model-A"}"#),
+            )
+            .mount(&server)
+            .await;
+        let health = collector.fetch_health_if_router().await.unwrap().unwrap();
+        assert_eq!(health.loaded_models(), ["Model-A"]);
+        // Only registry lookup tolerates auth rejection, without claiming health.
+        for status in [401, 403] {
+            server.reset().await;
+            Mock::given(method("GET"))
+                .and(path(LEMONADE_HEALTH_PATH))
+                .respond_with(ResponseTemplate::new(status))
+                .mount(&server)
+                .await;
+            assert!(collector.fetch_health_if_router().await.unwrap().is_none());
+            assert!(collector.fetch_health().await.is_err());
+        }
+        // Unrelated server failures must still warn.
+        for status in [500, 503] {
+            server.reset().await;
+            Mock::given(method("GET"))
+                .and(path(LEMONADE_HEALTH_PATH))
+                .respond_with(ResponseTemplate::new(status))
+                .mount(&server)
+                .await;
+            assert!(
+                collector.fetch_health_if_router().await.is_err(),
+                "status {status} must stay an error"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn health_http_failure_never_falls_back_to_successful_route() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        for status in [401, 403, 500, 503] {
+            server.reset().await;
+            Mock::given(method("GET"))
+                .and(path(LEMONADE_HEALTH_PATH))
+                .respond_with(ResponseTemplate::new(status))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/v1/health"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_string(r#"{"status":"ok","model_loaded":"Model-A"}"#),
+                )
+                .expect(0)
+                .mount(&server)
+                .await;
+            let collector = LemonadeCollector::new(
+                "127.0.0.1",
+                server.address().port(),
+                Duration::from_secs(1),
+            );
+            assert!(discovered(&collector).await.is_empty());
+            server.verify().await;
+        }
+    }
 
     #[test]
     fn parse_stats_maps_tokens_per_second_to_gen_tps() {
@@ -266,9 +547,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_health_model_extracts_loaded_model() {
+    fn parse_health_extracts_loaded_model() {
         assert_eq!(
-            parse_health_model(HEALTH_FIXTURE).as_deref(),
+            parse_health(HEALTH_FIXTURE).stats_model().as_deref(),
             Some("Llama-3.2-1B-Instruct-Hybrid")
         );
     }
@@ -287,19 +568,27 @@ mod tests {
             assert_eq!(sample.gen_tps, None, "body {body:?}");
             assert!(sample.kv_cache_usage_pct.is_none());
         }
-        assert_eq!(parse_health_model("not json"), None);
-        assert_eq!(parse_health_model(r#"{"model_loaded": ""}"#), None);
+        assert!(parse_health("not json").loaded_models().is_empty());
+        assert!(
+            parse_health(r#"{"model_loaded": ""}"#)
+                .loaded_models()
+                .is_empty()
+        );
     }
 
     #[test]
     fn fixture_stats_plus_health_becomes_an_instance() {
         // The fixture→Instance anchor: no network. Health gives the model name,
         // /stats gives the live rate → an Instances-tab row.
-        let model = parse_health_model(HEALTH_FIXTURE).expect("model");
-        let inst = lemonade_instance("127.0.0.1", LEMONADE_PORT, &model, STATS_FIXTURE);
+        let model = parse_health(HEALTH_FIXTURE).stats_model().expect("model");
+        let svc = lemonade_service("127.0.0.1", LEMONADE_PORT, &model);
+        let inst = rocm_dash_core::traits::merge_instance(&svc, &parse_stats(STATS_FIXTURE), 0, 0);
         assert_eq!(inst.model_name, "Llama-3.2-1B-Instruct-Hybrid");
         assert_eq!(inst.container_name, "lemonade");
-        assert_eq!(inst.container_id, "lemonade-127.0.0.1-13305");
+        assert_eq!(
+            inst.container_id,
+            lemonade_model_id("127.0.0.1", 13305, &model)
+        );
         assert_eq!(inst.port, Some(13305));
         assert_eq!(inst.gen_tps, Some(33.33));
         assert_eq!(inst.status, rocm_dash_core::metrics::InstanceStatus::Ready);
@@ -309,12 +598,175 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn discover_is_clean_noop_when_endpoint_absent() {
-        // Probe a port with no server → connection refused → None, no panic.
-        // (Port 0 is never a live listener; the GET fails fast.)
-        let collector = LemonadeCollector::new("127.0.0.1", 1, Duration::from_millis(200));
-        assert!(collector.discover().await.is_none());
+    async fn discovery_rejects_invalid_health_and_healthy_empty_router() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let collector =
+            LemonadeCollector::new("127.0.0.1", server.address().port(), Duration::from_secs(1));
+        for body in [
+            "not json",
+            "{}",
+            "[]",
+            "null",
+            r#"{"status":"error","model_loaded":"Model-A"}"#,
+            r#"{"status":"ok","all_models_loaded":[]}"#,
+            r#"{"status":"ok","all_models_loaded":[],"model_loaded":"Old-Model"}"#,
+            r#"{"status":"ok","model_loaded":"   "}"#,
+        ] {
+            server.reset().await;
+            Mock::given(method("GET"))
+                .and(path(LEMONADE_HEALTH_PATH))
+                .respond_with(ResponseTemplate::new(200).set_body_string(body))
+                .mount(&server)
+                .await;
+            assert!(
+                discovered(&collector).await.is_empty(),
+                "health {body:?} must not advertise a serving model"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn discovery_recognizes_modern_loaded_model_without_legacy_field() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(LEMONADE_HEALTH_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"status":"ok","all_models_loaded":[{"model_name":"Model-A"}]}"#,
+            ))
+            .mount(&server)
+            .await;
+        let collector =
+            LemonadeCollector::new("127.0.0.1", server.address().port(), Duration::from_secs(1));
+        assert_eq!(discovered(&collector).await[0].model_name, "Model-A");
+    }
+
+    #[tokio::test]
+    async fn discovery_accepts_v1_health_only_when_api_prefix_is_absent() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/health"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"status":"ok","model_loaded":"Model-A"}"#),
+            )
+            .mount(&server)
+            .await;
+        let collector =
+            LemonadeCollector::new("127.0.0.1", server.address().port(), Duration::from_secs(1));
+        assert_eq!(discovered(&collector).await[0].model_name, "Model-A");
+    }
+
+    #[tokio::test]
+    async fn v1_fallback_status_failure_names_the_requested_v1_url() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(LEMONADE_HEALTH_PATH))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/health"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let port = server.address().port();
+        let collector = LemonadeCollector::new("127.0.0.1", port, Duration::from_secs(1));
+        let error = collector.fetch_health().await.unwrap_err().to_string();
+        let wanted = format!("http://127.0.0.1:{port}/v1/health");
+        assert!(error.contains(&wanted), "{error}");
+        assert!(!error.contains("/api/v1/health"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn v1_fallback_transport_failure_names_host_port_and_path() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        // 404 on the primary route, then the retry is cut off by the client
+        // timeout so it fails at the transport level.
+        Mock::given(method("GET"))
+            .and(path(LEMONADE_HEALTH_PATH))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/health"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(2)))
+            .mount(&server)
+            .await;
+        let port = server.address().port();
+        let collector = LemonadeCollector::new("127.0.0.1", port, Duration::from_millis(200));
+        let error = collector.fetch_health().await.unwrap_err().to_string();
+        let wanted = format!("GET http://127.0.0.1:{port}/v1/health");
+        assert!(error.contains(&wanted), "{error}");
+    }
+
+    #[tokio::test]
+    async fn health_and_stats_return_transport_errors_when_endpoint_absent() {
+        // Reserve then release a random port: an absent listener yields health
+        // and stats transport errors, never a panic.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let collector = LemonadeCollector::new("127.0.0.1", port, Duration::from_millis(200));
+        assert!(collector.fetch_health().await.is_err());
         assert!(collector.fetch_stats().await.is_err());
+    }
+
+    /// Windows does not refuse a connection to a closed local port: the attempt
+    /// hangs until the request timeout. Both outcomes mean nothing answered, so
+    /// both must read as "absent" and not as a broken server.
+    #[tokio::test]
+    async fn closed_and_unanswered_endpoints_both_read_as_nothing_listening() {
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let closed_port = closed.local_addr().unwrap().port();
+        drop(closed);
+        let refused = LemonadeCollector::new("127.0.0.1", closed_port, Duration::from_millis(200))
+            .fetch_health()
+            .await
+            .unwrap_err();
+        assert!(is_connect_error(&refused), "{refused}");
+
+        // Accepts the connection at the kernel level but never answers.
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let silent_port = silent.local_addr().unwrap().port();
+        let timed_out =
+            LemonadeCollector::new("127.0.0.1", silent_port, Duration::from_millis(200))
+                .fetch_health()
+                .await
+                .unwrap_err();
+        assert!(is_connect_error(&timed_out), "{timed_out}");
+        drop(silent);
+    }
+
+    /// An HTTP status error is a server that answered, so it is not "absent".
+    #[tokio::test]
+    async fn an_answering_server_with_an_error_status_is_not_nothing_listening() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let error =
+            LemonadeCollector::new("127.0.0.1", server.address().port(), Duration::from_secs(1))
+                .fetch_health()
+                .await
+                .unwrap_err();
+        assert!(!is_connect_error(&error), "{error}");
     }
 
     /// Integration-gated: scrape a REAL local Lemonade server (start it first via
@@ -324,7 +776,8 @@ mod tests {
     async fn live_lemonade_scrape_produces_instance() {
         let collector =
             LemonadeCollector::new("127.0.0.1", LEMONADE_PORT, Duration::from_millis(1500));
-        let svc = collector.discover().await.expect("lemonade reachable");
+        let svcs = discovered(&collector).await;
+        let svc = svcs.first().expect("lemonade reachable");
         assert_eq!(svc.port, Some(LEMONADE_PORT));
         // A stats scrape returns a sample (gen_tps may be None until an inference).
         let _sample = collector.fetch_stats().await.expect("stats scrape");

@@ -255,10 +255,10 @@ fn quit_confirm_body(state: &AppState) -> Vec<String> {
     quit_confirm_body_with(state, &snapshot)
 }
 
-/// Body text for the quit-confirm prompt: name the models still serving
-/// (mirroring the Serving tab's "Running now" listing in
-/// `tabs::pane::live_lines`'s `OpenServices` arm, as plain lines instead of
-/// styled spans), and how to stop each one that this host's own registry
+/// Body text for the quit-confirm prompt: name every model still serving,
+/// managed or not (the Serving tab's "Managed running" listing in
+/// `tabs::pane::live_lines`'s `OpenServices` arm is managed-only, so this
+/// listing can be longer than it), and how to stop each one that this host's own registry
 /// manages (a live read, passed in as `snapshot` so the caller controls how
 /// many times the registry is actually read — see `quit_confirm_request`) —
 /// not a blanket command, since a Docker- or Lemonade-discovered instance
@@ -351,10 +351,10 @@ fn quit_confirm_body_with(
         // `values()` happened to yield, so the listing is at least stable
         // across renders. `s` does not focus "the Nth instance named here":
         // `quit_confirm_open_services_key` always focuses the FIRST managed,
-        // still-serving row in `service_rows`' own order, which can include
-        // an unmanaged (Docker/Lemonade) entry this listing also shows ahead
-        // of it — so the row `s` focuses need not be the Nth line printed
-        // below.
+        // still-serving row in `service_rows`' own order, and `service_rows`
+        // lists managed services only — so the row `s` focuses need not be the
+        // Nth line printed below, because this listing can also show an
+        // unmanaged (Docker/Lemonade) entry that the overlay does not.
         let mut sorted: Vec<_> = running().collect();
         sorted.sort_by(|a, b| a.container_id.cmp(&b.container_id));
         for i in sorted.into_iter().take(5) {
@@ -1343,6 +1343,7 @@ mod tests {
             Instance {
                 container_id: "svc-managed".to_string(),
                 status: InstanceStatus::Running,
+                managed: true,
                 ..Default::default()
             },
         );

@@ -132,6 +132,9 @@ pub struct GenerationObservationTracker {
     /// `current_value` is `None`. Set only on successful rate computation or
     /// valid direct-rate injection; never set on missing/transient data.
     last_observed_at: Option<DateTime<Utc>>,
+    /// True once a rate was injected with [`Self::observe_direct`]: the value is an
+    /// endpoint-reported rate of the most recent request, not a live counter rate.
+    direct: bool,
 }
 
 impl GenerationObservationTracker {
@@ -150,7 +153,14 @@ impl GenerationObservationTracker {
             samples: VecDeque::with_capacity(capacity.min(16)),
             current_value: None,
             last_observed_at: None,
+            direct: false,
         }
+    }
+
+    /// Whether the rate comes from an endpoint-reported last-request figure
+    /// ([`Self::observe_direct`]) rather than a cumulative counter.
+    pub const fn is_direct(&self) -> bool {
+        self.direct
     }
 
     /// The rolling rate-computation window.
@@ -252,6 +262,7 @@ impl GenerationObservationTracker {
         }
         self.current_value = Some(rate);
         self.last_observed_at = Some(observed_at);
+        self.direct = true;
     }
 
     /// Return the current rate and observation metadata for the given `now`.
