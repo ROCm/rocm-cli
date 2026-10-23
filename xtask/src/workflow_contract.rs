@@ -1061,13 +1061,17 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
             .collect()
     }
 
-    /// The report artifact a lane's upload step names (`name: e2e-*-report`).
+    /// The report artifact(s) a lane's upload step names (`name:
+    /// e2e-*-report`), comma-separated when the lane carries a `channel`
+    /// axis: both the `release` and `nightly` leg must have uploaded, since
+    /// either can independently die before writing its own report.
     fn uploaded_report_artifact(workflow: &str, text: &str, job: &str) -> String {
         // A lane with an `sdk_version` matrix (ROCMAI-430) uploads one artifact
         // per leg, each behind its own mutually exclusive `if:` — pair every
         // artifact name with the `if:` directly above it in the same step, then
-        // pick the `current` leg to stand for the whole lane, the same way a
-        // channel axis below is checked through its `release` leg.
+        // pick the `current` leg to stand for the whole lane. (A channel axis,
+        // unlike this `sdk_version` axis, is checked by requiring both its
+        // `release` and `nightly` legs — see the doc comment above.)
         let mut last_if: Option<&str> = None;
         let mut candidates: Vec<(&str, Option<&str>)> = Vec::new();
         for line in job_block(text, job).lines() {
@@ -1099,9 +1103,18 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
                     .0
             }
         };
-        // The report job has no `matrix` context, so a lane with a channel axis is
-        // checked through its `release` leg, which stands for the whole lane.
-        chosen.replace("${{ matrix.channel }}", "release")
+        // The report job has no `matrix` context, so a lane with a channel
+        // axis is checked through both its legs explicitly, rather than
+        // reading `release` alone as a stand-in for the whole lane.
+        if chosen.contains("${{ matrix.channel }}") {
+            format!(
+                "{},{}",
+                chosen.replace("${{ matrix.channel }}", "release"),
+                chosen.replace("${{ matrix.channel }}", "nightly")
+            )
+        } else {
+            chosen.to_string()
+        }
     }
 
     #[test]
@@ -1274,7 +1287,10 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
             })
             .collect();
         let jobs: Vec<&str> = lanes.iter().map(|(job, _)| job.as_str()).collect();
-        let every_artifact: Vec<&str> = lanes.iter().map(|(_, a)| a.as_str()).collect();
+        // A channel-axis lane's value is comma-joined (its `release` and
+        // `nightly` legs); flatten to the individual artifact names the real
+        // upload steps would produce, matching what `gh api` would list.
+        let every_artifact: Vec<&str> = lanes.iter().flat_map(|(_, a)| a.split(',')).collect();
         let (victim, victim_artifact) = (&lanes[0].0, &lanes[0].1);
         let all = |result: &'static str| -> Vec<(&str, &str)> {
             jobs.iter().map(|job| (*job, result)).collect()
@@ -1369,6 +1385,36 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
                 "every missing lane must be named, including `{lane}`:\n{log}\n{summary}"
             );
         }
+
+        // A channel-axis lane's `release` and `nightly` legs are checked
+        // independently: missing just one must still fail, naming only that
+        // leg, not the lane's other (present) one.
+        let (channel_job, channel_artifacts) = lanes
+            .iter()
+            .find(|(_, a)| a.contains(','))
+            .expect("e2e-selfhosted.yml has a channel-matrixed lane");
+        let (present_leg, missing_leg) = channel_artifacts
+            .split_once(',')
+            .expect("a channel lane's value is its two legs, comma-separated");
+        let one_leg_missing: Vec<&str> = every_artifact
+            .iter()
+            .copied()
+            .filter(|a| *a != missing_leg)
+            .collect();
+        let (code, log, _) = run_report_check(&step, &all("success"), Some(&one_leg_missing));
+        assert_eq!(
+            code, 1,
+            "a channel lane missing one leg must still fail:\n{log}"
+        );
+        assert!(
+            log.contains(&format!("::error::lane {channel_job} ran"))
+                && log.contains(&format!("uploaded no {missing_leg}")),
+            "the annotation must name the missing leg specifically:\n{log}"
+        );
+        assert!(
+            !log.contains(&format!("uploaded no {present_leg}")),
+            "the present leg must not be flagged as missing:\n{log}"
+        );
 
         // A lane absent from `needs` has no result to say it was skipped, so
         // it is checked rather than waved through.
@@ -3430,6 +3476,414 @@ fi
         assert!(
             run("## E2E consolidated report\n\n| Platform | OS |\n").contains("REACHED_PUBLISH"),
             "a matrix with platforms must reach the publish step"
+        );
+    }
+
+    /// Mirrors `wiki_publish_guard_stops_on_the_generators_empty_output`, but
+    /// for the release-readiness wiki job: runs its real three-way guard
+    /// (missing table.md / degenerate table.md / well-formed table.md)
+    /// against `render_table`'s actual output, so a regression in the guard
+    /// or the renderer's degenerate case is caught by behavior rather than a
+    /// pinned string.
+    ///
+    /// A missing table.md means release-readiness-nightly failed outright
+    /// (bad `git describe`, `gh issue list` auth failure, xtask crash)
+    /// before writing anything -- this must still reach the publish step, but
+    /// with an explicit "evidence unavailable" notice instead of the real
+    /// table, so the wiki never silently keeps a stale verdict with no sign
+    /// it's stale.
+    ///
+    /// Unreadable E2E evidence is itself a NO-GO signal, not a reason to hide
+    /// the page: `render_table` always emits the status-table header, so
+    /// this case reaches the publish step the same as a well-formed table.
+    /// Only a present-but-degenerate table (no status-table header at all)
+    /// trips the guard and leaves the last good page in place.
+    #[cfg(unix)]
+    #[test]
+    fn release_readiness_wiki_publish_guard_handles_missing_degenerate_and_well_formed_tables() {
+        use crate::release_readiness::{CommitBuckets, Facts, Verdict, render_table};
+
+        let nightly = read_workflow("nightly.yml");
+        let publish = job_block(&nightly, "publish-release-readiness-wiki");
+        let lines: Vec<&str> = publish.lines().collect();
+        let start = lines
+            .iter()
+            .position(|l| {
+                l.trim_start()
+                    .starts_with("if [ ! -f release-readiness/table.md ]")
+            })
+            .expect("publish job has the missing-table guard");
+        let mut depth = 0i32;
+        let mut end = start;
+        for (i, l) in lines[start..].iter().enumerate() {
+            let t = l.trim();
+            if t.starts_with("if ") {
+                depth += 1;
+            } else if t == "fi" {
+                depth -= 1;
+                if depth == 0 {
+                    end = start + i;
+                    break;
+                }
+            }
+        }
+        assert!(end > start, "guard block must close with a matching fi");
+        let guard = lines[start..=end].join("\n");
+
+        // table: None simulates release-readiness-nightly failing before
+        // writing anything at all; Some(s) simulates a table.md with
+        // content `s`. Returns (stdout, published page content).
+        let run = |table: Option<&str>| -> (String, String) {
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = tmp.path();
+            std::fs::create_dir_all(dir.join("release-readiness")).unwrap();
+            if let Some(s) = table {
+                std::fs::write(dir.join("release-readiness/table.md"), s).unwrap();
+            }
+            let page = format!(
+                "release-readiness-wiki-guard-test-{}.md",
+                dir.file_name().unwrap().to_string_lossy()
+            );
+            let script = format!("set -euo pipefail\npage={page}\n{guard}\necho REACHED_PUBLISH\n");
+            let out = std::process::Command::new("bash")
+                .arg("-c")
+                .arg(&script)
+                .current_dir(dir)
+                .env("GITHUB_RUN_NUMBER", "42")
+                .env("RUN_URL", "https://example.invalid/run/42")
+                .env("GITHUB_SHA", "0123456789abcdef0123456789abcdef01234567")
+                .env("COMMIT_URL", "https://example.invalid/commit/0123456789ab")
+                .output()
+                .expect("run bash");
+            assert!(out.status.success(), "guard script failed: {out:?}");
+            let page_path = format!("/tmp/{page}");
+            let page_content = std::fs::read_to_string(&page_path).unwrap_or_default();
+            let _ = std::fs::remove_file(&page_path);
+            (
+                String::from_utf8_lossy(&out.stdout).into_owned(),
+                page_content,
+            )
+        };
+
+        let (missing_stdout, missing_page) = run(None);
+        assert!(
+            missing_stdout.contains("REACHED_PUBLISH"),
+            "a missing table.md (nightly job failed outright) must still reach the publish step"
+        );
+        assert!(
+            missing_page.contains("EVIDENCE UNAVAILABLE"),
+            "a missing table.md must publish an explicit stale-evidence notice, not silently keep the old page"
+        );
+
+        let (degenerate_stdout, _) = run(Some(""));
+        assert!(
+            !degenerate_stdout.contains("REACHED_PUBLISH"),
+            "a present-but-degenerate table.md (no status-table header) must still stop the publish and leave the last good page in place"
+        );
+
+        let unreadable = render_table(&Facts {
+            since_tag: "v1.0.0".to_string(),
+            verdict: Verdict::NoGo,
+            failing_gates: vec!["E2E (report unreadable)".to_string()],
+            e2e_fail_total: None,
+            build_skipped: false,
+            commits: CommitBuckets::default(),
+            known_issues: vec![],
+        });
+        let (unreadable_stdout, unreadable_page) = run(Some(&unreadable));
+        assert!(
+            unreadable_stdout.contains("REACHED_PUBLISH"),
+            "unreadable E2E evidence is a NO-GO verdict, not a reason to hide the wiki page"
+        );
+        assert!(
+            !unreadable_page.contains("EVIDENCE UNAVAILABLE"),
+            "a readable (if NO-GO) table must publish the real table, not the missing-table notice"
+        );
+
+        let well_formed = render_table(&Facts {
+            since_tag: "v1.0.0".to_string(),
+            verdict: Verdict::Go,
+            failing_gates: vec![],
+            e2e_fail_total: Some(0),
+            build_skipped: false,
+            commits: CommitBuckets::default(),
+            known_issues: vec![],
+        });
+        let (well_formed_stdout, well_formed_page) = run(Some(&well_formed));
+        assert!(
+            well_formed_stdout.contains("REACHED_PUBLISH"),
+            "a well-formed table must reach the publish step"
+        );
+        assert!(
+            well_formed_page.contains("Area | Evidence | Status"),
+            "a well-formed table's content must actually make it into the published page"
+        );
+    }
+
+    /// The narrative published to the wiki is LLM-drafted from untrusted
+    /// issue/commit text, so it can contain copied markdown links, images,
+    /// reference-style links, or raw HTML. Runs the job's real escaping
+    /// command (not a copy of its regex) against the three bypasses an
+    /// earlier link-stripping regex let through unchanged, so a regression
+    /// back to naive link-stripping is caught by behavior.
+    #[cfg(unix)]
+    #[test]
+    fn publish_release_readiness_wiki_escapes_markdown_link_and_html_syntax() {
+        let nightly = read_workflow("nightly.yml");
+        let job = job_block(&nightly, "publish-release-readiness-wiki");
+        let line = job
+            .lines()
+            .find(|l| l.trim_start().starts_with("sed ") && l.contains("narrative.md"))
+            .expect("publish job escapes narrative.md with a sed command");
+
+        let run = |input: &str| -> String {
+            let dir = tempfile::tempdir().expect("create temp dir");
+            std::fs::create_dir(dir.path().join("release-readiness"))
+                .expect("create release-readiness dir");
+            std::fs::write(dir.path().join("release-readiness/narrative.md"), input)
+                .expect("write narrative.md");
+            let out = std::process::Command::new("bash")
+                .arg("-c")
+                .arg(line)
+                .current_dir(dir.path())
+                .output()
+                .expect("run bash");
+            assert!(out.status.success(), "sed command failed: {out:?}");
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+
+        assert_eq!(
+            run(r#"<img src="https://example.com/p.png">"#),
+            r#"&lt;img src="https://example.com/p.png"&gt;"#,
+            "a raw <img> tag must render as inert text, not a live image"
+        );
+        assert_eq!(
+            run("[a][1]\n[1]: https://example.com/x"),
+            "\\[a\\]\\[1\\]\n\\[1\\]: https://example.com/x",
+            "a reference-style link must render as inert text, not a live link"
+        );
+        assert_eq!(
+            run("[outer [inner](https://a.example)](https://b.example)"),
+            r"\[outer \[inner\](https://a.example)\](https://b.example)",
+            "every bracket in a nested link must be escaped, leaving no live link"
+        );
+        assert_eq!(
+            run(r"\[click\](https://evil.example)"),
+            r"\\\[click\\\](https://evil.example)",
+            "a narrative pre-escaping its own brackets must not produce a live link: \
+             the literal backslash must itself be escaped before `[`/`]` are"
+        );
+    }
+
+    /// `release-readiness-nightly` must gate E2E lane coverage through
+    /// `e2e-report-nightly`'s own result, not through each lane job's own
+    /// `continue-on-error: true`-masked result (which is always `success`
+    /// regardless of what actually happened). Ties the gate to the one place
+    /// that already fails correctly when a lane silently drops out — see
+    /// `every_lane_that_runs_is_checked_for_its_report_artifact`, which pins
+    /// that `e2e-report-nightly` itself is driven by `LANE_REPORTS` and so
+    /// covers every lane, including ones added later, without this job
+    /// needing its own copy of the lane list.
+    #[test]
+    fn release_readiness_nightly_gates_on_the_e2e_report_job_not_individual_lanes() {
+        let nightly = read_workflow("nightly.yml");
+        let job = job_block(&nightly, "release-readiness-nightly");
+
+        let needs = flattened_values(job, "needs")
+            .into_iter()
+            .flat_map(|v| flattened_list_items(&v))
+            .collect::<Vec<_>>();
+        assert!(
+            needs.contains(&"e2e-report-nightly".to_string()),
+            "release-readiness-nightly must depend on e2e-report-nightly's result; needs: {needs:?}"
+        );
+        for lane in [
+            "e2e-gpu-nightly",
+            "e2e-gpu-nightly-rad3",
+            "e2e-gpu-nightly-mi350p",
+            "e2e-gpu-nightly-strix",
+            "e2e-gpu-nightly-strix-windows",
+            "e2e-gpu-nightly-w7900",
+            "e2e-wsl-nightly",
+        ] {
+            assert!(
+                !needs.contains(&lane.to_string()),
+                "release-readiness-nightly must not depend on individual E2E lane job `{lane}` \
+                 directly: continue-on-error on that job means its own `result` is always \
+                 `success`, so gating on it can never fire"
+            );
+        }
+
+        assert!(
+            job.contains("--e2e-report-job-result \"${{ needs.e2e-report-nightly.result }}\""),
+            "release-readiness-nightly's xtask invocation must pass e2e-report-nightly's result \
+             as --e2e-report-job-result"
+        );
+        assert!(
+            job.contains("--nightly-result \"${{ needs.nightly.result }}\""),
+            "release-readiness-nightly must read --nightly-result from needs.nightly.result, \
+             not a hard-coded value -- otherwise a failed Linux nightly build never fails the \
+             gate: {job}"
+        );
+        assert!(
+            job.contains("--windows-result \"${{ needs.windows-nightly.result }}\""),
+            "release-readiness-nightly must read --windows-result from \
+             needs.windows-nightly.result, not needs.nightly.result (the Linux build's own \
+             result) -- otherwise a failed Windows nightly build never fails the gate"
+        );
+    }
+
+    #[test]
+    fn release_readiness_nightly_runs_even_if_an_upstream_job_failed() {
+        let nightly = read_workflow("nightly.yml");
+        let job = job_block(&nightly, "release-readiness-nightly");
+        assert!(
+            job.contains("if: ${{ !cancelled() }}"),
+            "release-readiness-nightly must still run when e2e-report-nightly or a build job \
+             failed (the default `if` would skip it instead, leaving the wiki showing a stale \
+             GO from the last run that did succeed): {job}"
+        );
+    }
+
+    #[test]
+    fn publish_release_readiness_wiki_guard_is_exact() {
+        let nightly = read_workflow("nightly.yml");
+        let job = job_block(&nightly, "publish-release-readiness-wiki");
+        assert!(
+            job.contains(
+                "if: ${{ !cancelled() && needs.release-readiness-nightly.result != 'skipped' \
+                 && github.repository == 'ROCm/rocm-cli' && github.ref == 'refs/heads/main' }}"
+            ),
+            "publish-release-readiness-wiki's guard must stay exactly this: `!cancelled()` so \
+             it still runs (and publishes the stale-evidence notice) when release-readiness-\
+             nightly failed outright, `!= 'skipped'` rather than `== 'success'` so that failure \
+             still publishes rather than being skipped, and the repo/main-branch guards: {job}"
+        );
+    }
+
+    #[test]
+    fn release_readiness_jobs_checkout_without_persisting_credentials() {
+        let nightly = read_workflow("nightly.yml");
+        for job_name in ["release-readiness-nightly", "release-readiness-narrative"] {
+            let job = job_block(&nightly, job_name);
+            assert!(
+                job.contains("persist-credentials: false"),
+                "{job_name}'s checkout must not persist credentials: these jobs shell out over \
+                 untrusted issue/commit text, and a persisted, readable GITHUB_TOKEN would be \
+                 reachable by anything injected into that text in a later step (both jobs hold \
+                 only `contents: read`, so the exposure is token readability, not write access)"
+            );
+        }
+    }
+
+    #[test]
+    fn release_readiness_narrative_delimiter_is_random_not_fixed() {
+        let nightly = read_workflow("nightly.yml");
+        let job = job_block(&nightly, "release-readiness-narrative");
+        assert!(
+            job.contains("delimiter=\"$(openssl rand -hex 8)\"")
+                && job.contains("echo \"json<<${delimiter}\"")
+                && job.contains("echo \"${delimiter}\""),
+            "the GITHUB_OUTPUT heredoc delimiter must stay randomly generated: facts.json \
+             embeds untrusted GitHub issue titles, and a fixed delimiter (e.g. `EOF`) would let \
+             one that happens to contain that token terminate the heredoc early and inject \
+             further GITHUB_OUTPUT assignments: {job}"
+        );
+    }
+
+    #[test]
+    fn release_readiness_narrative_reaches_the_shell_only_through_env() {
+        let nightly = read_workflow("nightly.yml");
+        let job = job_block(&nightly, "release-readiness-narrative");
+        assert!(
+            job.contains("NARRATIVE: ${{ steps.draft.outputs.response }}")
+                && job.contains("run: printf '%s\\n' \"$NARRATIVE\""),
+            "the LLM-drafted narrative must reach the shell only through the $NARRATIVE env \
+             var, never inlined as `${{ steps.draft.outputs.response }}` directly in `run:` -- \
+             that would let the narrative's own text execute as shell: {job}"
+        );
+
+        // The two assertions above only check that the safe lines exist; they
+        // can't fail on a *second*, unsafe occurrence added elsewhere (e.g. a
+        // later step inlining `${{ steps.draft.outputs.response }}` straight
+        // into its own `run:`). Pin every occurrence in the job to the two
+        // known-safe spots: the "Save narrative" step's `if:` guard, and the
+        // `NARRATIVE:` env line feeding it to the shell.
+        let offending: Vec<&str> = job
+            .lines()
+            .filter(|l| l.contains("steps.draft.outputs.response"))
+            .filter(|l| {
+                let t = l.trim();
+                t != "if: always() && steps.draft.outputs.response"
+                    && t != "NARRATIVE: ${{ steps.draft.outputs.response }}"
+            })
+            .collect();
+        assert!(
+            offending.is_empty(),
+            "steps.draft.outputs.response must appear nowhere in the job except the \"Save \
+             narrative\" step's `if:` guard and its NARRATIVE env line: found it in {offending:?}"
+        );
+    }
+
+    #[test]
+    fn release_readiness_nightly_checkout_fetches_full_history() {
+        let nightly = read_workflow("nightly.yml");
+        let job = job_block(&nightly, "release-readiness-nightly");
+        assert!(
+            job.contains("fetch-depth: 0"),
+            "release-readiness-nightly's checkout must fetch full history (fetch-depth: 0): \
+             `git describe --tags` and the commit range since the last release tag both need \
+             it, and the default shallow clone would make `git describe` fail every night: {job}"
+        );
+    }
+
+    #[test]
+    fn publish_release_readiness_wiki_needs_both_upstream_jobs() {
+        let nightly = read_workflow("nightly.yml");
+        let job = job_block(&nightly, "publish-release-readiness-wiki");
+        let needs = flattened_values(job, "needs")
+            .into_iter()
+            .flat_map(|v| flattened_list_items(&v))
+            .collect::<Vec<_>>();
+        for required in ["release-readiness-nightly", "release-readiness-narrative"] {
+            assert!(
+                needs.contains(&required.to_string()),
+                "publish-release-readiness-wiki must depend on `{required}`: dropping \
+                 `release-readiness-narrative` from `needs` would let the publish job race the \
+                 narrative download instead of waiting for it; needs: {needs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn publish_release_readiness_wiki_artifact_downloads_tolerate_a_missing_artifact() {
+        let nightly = read_workflow("nightly.yml");
+        let job = job_block(&nightly, "publish-release-readiness-wiki");
+        assert_eq!(
+            job.matches("continue-on-error: true").count(),
+            2,
+            "both artifact-download steps in publish-release-readiness-wiki (the \
+             release-readiness table and the narrative) must set `continue-on-error: true`: \
+             without it, a missing artifact (no table because release-readiness-nightly failed \
+             outright, or no narrative because COPILOT_PAT doesn't exist yet) would fail \
+             download-artifact and make this job's own fallback handling unreachable: {job}"
+        );
+    }
+
+    #[test]
+    fn release_readiness_wiki_page_does_not_collide_with_the_e2e_matrix_page() {
+        let nightly = read_workflow("nightly.yml");
+        let publish_e2e = job_block(&nightly, "publish-e2e-wiki");
+        let publish_readiness = job_block(&nightly, "publish-release-readiness-wiki");
+        assert!(
+            publish_e2e.contains("page=E2E-Support-Matrix.md"),
+            "publish-e2e-wiki's page name changed out from under this test; update it: {publish_e2e}"
+        );
+        assert!(
+            publish_readiness.contains("page=Release-Readiness.md"),
+            "publish-release-readiness-wiki must keep publishing to a distinct wiki page name; \
+             renaming it to collide with E2E-Support-Matrix.md would silently overwrite the E2E \
+             support matrix page instead: {publish_readiness}"
         );
     }
 

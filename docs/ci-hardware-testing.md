@@ -196,6 +196,25 @@ setup: enable the wiki and save its first page in the GitHub web UI, because
 GitHub does not create the wiki's git repository until then and the job fails
 with that explanation until it exists.
 
+`nightly.yml` also computes a mechanical GO/NO-GO release-readiness verdict
+via `cargo xtask release-readiness`: it gates on the nightly Linux/Windows
+build results, the consolidated E2E failure total, and the `e2e-report-nightly`
+job's own result (so a lane that dies before uploading a report still fails
+the gate), and buckets commits since the last release tag into
+features/fixes/breaking changes. Unlike the wiki-publish jobs above, the
+`release-readiness-nightly` and `release-readiness-narrative` jobs have no
+`main`/repo guard — they run on any branch this workflow is dispatched on.
+The narrative job drafts prose from those facts via `actions/ai-inference`
+(needs a Copilot-licensed PAT in the `COPILOT_PAT` repo secret; allowed to
+fail without blocking the table). `publish-release-readiness-wiki` then
+publishes the verdict table, plus the narrative if one was produced, to the
+`Release-Readiness` wiki page, gated on `main`/repo like `publish-e2e-wiki`
+and sharing its one-time wiki setup and skip-on-degenerate-table guard — but
+unlike `publish-e2e-wiki`, it still runs (and publishes an explicit
+"evidence unavailable" notice) when `release-readiness-nightly` fails
+outright, instead of leaving the wiki showing a stale verdict with no sign
+it's stale.
+
 The lane artifacts are named canonically (`e2e-gpu-mi350p-report`,
 `e2e-gpu-n-1-report`, `e2e-gpu-n-2-report`, `e2e-gpu-rad3-report`,
 `e2e-gpu-report`, `e2e-gpu-strix-ubuntu-n-1-report`,
