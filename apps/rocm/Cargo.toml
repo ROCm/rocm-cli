@@ -74,3 +74,4 @@ zbus-secret-service-keyring-store = { version = "1.0", features = ["rt-tokio-cry
 # Also used for the recursive-deletion paths in deletion_properties.
 proptest = { version = "1", default-features = false, features = ["std"] }
 tempfile = "3"
+shlex.workspace = true
