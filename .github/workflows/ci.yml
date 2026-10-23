@@ -109,6 +109,10 @@ jobs:
               - '**/*.rs'
               - '**/Cargo.toml'
               - 'Cargo.lock'
+              # `cargo xtask eval-fixtures --check` compares these recordings with
+              # what the compiled catalog says. A hand edit to one must run that
+              # check, though no *.rs file moved.
+              - 'skills/rocm-doctor/evals/fixtures/**'
               - 'rust-toolchain*'
               # clippy runs `cargo xtask manifest --check` against this file;
               # pinned_tool_versions_match_across_docs_and_workflows (xtask)
@@ -1149,6 +1153,10 @@ jobs:
       - name: Published Doctor catalog is current
         if: needs.changes.outputs.rust == 'true'
         run: cargo xtask catalog --check
+
+      - name: Recorded rocm output the skill evals replay is current
+        if: needs.changes.outputs.rust == 'true'
+        run: cargo xtask eval-fixtures --check
 
       # Surface the cache hit rate for the clippy compile so the effect is visible
       # in the logs, on the local-only path too — see build-and-test for why this
