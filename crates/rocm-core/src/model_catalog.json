@@ -10,7 +10,7 @@
     },
     {
       "label": "AMD Radeon - RX 7000/9000, Radeon PRO (Lemonade / llama.cpp)",
-      "engines": ["lemonade", "llama.cpp", "llamacpp"],
+      "engines": ["lemonade", "llama.cpp", "llamacpp", "aim"],
       "gfx_families": ["gfx110X-all", "gfx120X-all"]
     },
     {
@@ -507,6 +507,47 @@
       ],
       "warnings": [
         "multimodal model; text chat is the default serve path"
+      ]
+    },
+    {
+      "canonical_model_id": "Qwen/Qwen3.5-9B",
+      "aliases": [
+        "qwen3.5-9b",
+        "aim-qwen3.5-9b"
+      ],
+      "task": "chat",
+      "source": "recipe_index",
+      "revision": "main",
+      "loader": "aim",
+      "trust_remote_code": false,
+      "dtype": "auto",
+      "device_policy": "gpu_required",
+      "min_gpu_mem_gb": 24,
+      "recommended_system_ram_gb": 32,
+      "quantization": "none; served as-is by the AIM image's bundled vLLM",
+      "artifact_hint": "AMD Enterprise AI (AIM) pre-built Docker image; pulled and run by the aim engine, not by Hugging Face resolution",
+      "artifacts": [],
+      "engine_recipes": [
+        {
+          "engine": "aim",
+          "required_flags": [],
+          "parser_settings": {},
+          "preferred_endpoint": null,
+          "unsupported_combinations": [],
+          "notes": [
+            "requires --engine-env AIM_PROFILE_ID=vllm-w7900-bf16-tp1-latency; Radeon profile auto-selection isn't reliable yet",
+            "requires a reachable Docker daemon; the image is pulled on first serve"
+          ],
+          "model_id_override": "amdenterpriseai/aim-radeon-qwen-qwen3-5-9b:0.12.0-preview"
+        }
+      ],
+      "manual_alternatives": [],
+      "chat_template_mode": "auto",
+      "preferred_engines": [
+        "aim"
+      ],
+      "warnings": [
+        "Radeon-targeted AIM image; requires Docker and an explicit AIM_PROFILE_ID"
       ]
     }
   ]

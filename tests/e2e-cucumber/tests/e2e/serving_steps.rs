@@ -633,6 +633,70 @@ async fn setup_lemonade_hf_checkpoint_model(world: &mut E2eWorld) {
     .await;
 }
 
+#[given("a model is being served on aim")]
+async fn setup_aim_model(world: &mut E2eWorld) {
+    serve_aim_canary(world).await;
+}
+
+/// Serves the same hardware-verified AIM canary [`setup_aim_model`] does.
+/// Factored out so the lifecycle-parity scenario can call it a second time,
+/// after stopping the service, without duplicating the image/profile pin.
+async fn serve_aim_canary(world: &mut E2eWorld) {
+    // Serves via the raw AIM Docker image reference rather than the catalog
+    // recipe added in ROCMAI-555 — this is a hardware-verified serve+inference
+    // canary pinned to one exact image/profile, not a catalog-discovery test.
+    //
+    // The `aim-meta-llama-llama-3-2-1b-instruct` image originally used here
+    // bundles only Instinct-series (MI300X/MI250X/MI355X/MI325X/MI350X)
+    // profiles — confirmed via its container logs to report "Found 0
+    // compatible profiles" on Strix Halo/gfx1151, the only runner this
+    // scenario executes on. `aim-radeon-qwen-qwen3-5-9b` is a Radeon-targeted
+    // image, hardware-verified serving real inference on Strix Halo; its
+    // profile still needs an explicit pick via `--engine-env` because
+    // auto-selection isn't reliable for Radeon targets yet.
+    let image = "amdenterpriseai/aim-radeon-qwen-qwen3-5-9b:0.12.0-preview";
+    // The container bundles vLLM, which echoes the model's baked-in HF id
+    // (not the Docker image reference) as `model` — confirmed live on Strix
+    // Halo.
+    let model = "Qwen/Qwen3.5-9B";
+    serve_and_wait(
+        world,
+        &[
+            "serve",
+            image,
+            "--engine",
+            "aim",
+            "--engine-env",
+            "AIM_PROFILE_ID=vllm-w7900-bf16-tp1-latency",
+            "--managed",
+        ],
+        model,
+        "Qwen3.5-9B",
+    )
+    .await;
+}
+
+/// Stops the AIM service this scenario started and asserts the stop actually
+/// took: reuses [`stop_scenario_services`] (itself `crate::stop_managed_services`,
+/// the same real-record stop the serve-retry path and scenario teardown use),
+/// rather than a hardcoded service id — the AIM canary's id comes from a real
+/// `--managed` launch, not a planted record, so there is no fixed id to match.
+#[when("the user stops the AIM service")]
+async fn stop_aim_service(world: &mut E2eWorld) {
+    let status = stop_scenario_services(world);
+    assert!(
+        status.contains(": stopped"),
+        "expected the AIM service to stop cleanly, got: {status}"
+    );
+}
+
+/// Serves the same AIM canary again, proving the engine can be launched a
+/// second time after a stop — the restart half of lifecycle parity.
+#[when("the user serves that same model on aim again")]
+async fn reserve_aim_model(world: &mut E2eWorld) {
+    serve_aim_canary(world).await;
+}
+
 #[given("a large model is being served on GPU")]
 async fn setup_large_gpu_model(world: &mut E2eWorld) {
     // Large-model nightly coverage follows the host's serving path. vLLM hosts

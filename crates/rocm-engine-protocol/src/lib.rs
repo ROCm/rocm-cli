@@ -511,6 +511,11 @@ pub struct EngineRecipeHint {
     pub required_flags: Vec<String>,
     #[serde(default)]
     pub parser_settings: BTreeMap<String, String>,
+    /// Engine-specific environment variables to pass through verbatim to the
+    /// engine's own process/container (e.g. AIM's `AIM_PROFILE_ID` override).
+    /// Generic by design — only `engines/aim` currently reads this.
+    #[serde(default)]
+    pub extra_env: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preferred_endpoint: Option<EngineRecipeEndpointHint>,
     #[serde(default)]
@@ -888,6 +893,7 @@ mod tests {
                     "reasoning_parser".to_owned(),
                     "qwen3".to_owned(),
                 )]),
+                extra_env: BTreeMap::from([("AIM_PROFILE_ID".to_owned(), "foo".to_owned())]),
                 preferred_endpoint: Some(EngineRecipeEndpointHint {
                     endpoint_mode: "openai".to_owned(),
                     settings: BTreeMap::from([("streaming".to_owned(), "true".to_owned())]),
@@ -921,6 +927,10 @@ mod tests {
         );
         assert_eq!(hint.unsupported_combinations.len(), 1);
         assert_eq!(hint.notes, vec!["signed recipe metadata"]);
+        assert_eq!(
+            hint.extra_env.get("AIM_PROFILE_ID").map(String::as_str),
+            Some("foo")
+        );
     }
 
     #[test]
@@ -939,6 +949,7 @@ mod tests {
                 engine: "vllm".to_owned(),
                 required_flags: vec!["--enable-auto-tool-choice".to_owned()],
                 parser_settings: BTreeMap::new(),
+                extra_env: BTreeMap::new(),
                 preferred_endpoint: None,
                 unsupported_combinations: Vec::new(),
                 notes: Vec::new(),

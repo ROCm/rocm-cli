@@ -131,7 +131,7 @@ static BUILTIN_ENGINE_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 /// User-selectable serving engines, in the order shown in `--help` and shell
 /// completions. Used as the clap `value_parser` for every user-facing `--engine`
 /// argument so the possible values stay in sync across the CLI surface.
-const SUPPORTED_ENGINES: [&str; 2] = ["lemonade", "vllm"];
+const SUPPORTED_ENGINES: [&str; 3] = ["lemonade", "vllm", "aim"];
 
 #[derive(Parser, Debug)]
 #[command(
@@ -569,6 +569,12 @@ rocm serve qwen --verbose --device gpu_required")]
         /// authenticated too.
         #[arg(long)]
         api_key: Option<String>,
+        /// Extra `KEY=VALUE` environment variable to pass through to the engine's
+        /// own process/container (repeatable). Engine-specific; currently only
+        /// `--engine aim` reads these (e.g. `AIM_PROFILE_ID`). Ignored by engines
+        /// that don't consume engine-env overrides.
+        #[arg(long = "engine-env", value_name = "KEY=VALUE")]
+        engine_env: Vec<String>,
     },
     /// [preview] Install, start, stop, or inspect ComfyUI.
     #[command(alias = "comfy")]
@@ -2515,6 +2521,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             top_p,
             max_tokens,
             api_key,
+            engine_env,
         }) => serve(ServeArgs {
             model,
             engine,
@@ -2536,6 +2543,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             top_p,
             max_tokens,
             api_key,
+            engine_env,
         }),
         Some(Command::Comfyui { command }) => comfyui(command),
         Some(Command::Services { command }) => services(command),
@@ -2768,6 +2776,10 @@ const fn builtin_engine_inventory() -> &'static [(&'static str, &'static str)] {
         (
             "vllm",
             "Linux/WSL ROCm GPU serving engine through external vLLM",
+        ),
+        (
+            "aim",
+            "AMD Enterprise AI pre-built Docker serving containers",
         ),
     ]
 }
@@ -3176,8 +3188,10 @@ fn assess_model_for_host(
 ///
 /// One place, so the `/model` adapter-availability note and the readiness
 /// verdict cannot answer differently about the same host and engine.
-const fn engine_ruled_out_by_platform(engine: &str) -> bool {
-    rocm_core::runtime_is_windows() && engine.eq_ignore_ascii_case("vllm")
+fn engine_ruled_out_by_platform(engine: &str) -> bool {
+    (rocm_core::runtime_is_windows() && engine.eq_ignore_ascii_case("vllm"))
+        || (engine.eq_ignore_ascii_case("aim")
+            && !rocm_engine_aim::builtin_docker_daemon_reachable())
 }
 
 /// The `unsupported_here` message for an engine, given whether the platform
@@ -3190,8 +3204,13 @@ const fn engine_ruled_out_by_platform(engine: &str) -> bool {
 /// exercise the "ruled out" branch on Linux CI and the "allowed" branch on a
 /// Windows runner without either one being unreachable.
 fn unsupported_here_for(engine: &str, ruled_out: bool) -> Option<String> {
-    ruled_out
-        .then(|| format!("{engine} has no adapter on native Windows; serve it from WSL or Linux"))
+    ruled_out.then(|| {
+        if engine.eq_ignore_ascii_case("aim") {
+            format!("{engine} needs a reachable Docker daemon to serve; start Docker or choose a different engine")
+        } else {
+            format!("{engine} has no adapter on native Windows; serve it from WSL or Linux")
+        }
+    })
 }
 
 /// The catalog entry a report should name, and whether a fix was offered for it.
@@ -6059,13 +6078,18 @@ fn append_model_engine_support_lines(
 }
 
 #[allow(dead_code)]
-const fn model_registry_adapter_availability_note(engine: &str) -> Option<&'static str> {
-    if engine_ruled_out_by_platform(engine) {
+fn model_registry_adapter_availability_note(engine: &str) -> Option<&'static str> {
+    if !engine_ruled_out_by_platform(engine) {
+        return None;
+    }
+    if engine.eq_ignore_ascii_case("aim") {
+        Some(
+            "runtime_status=unsupported_docker_unavailable reason=Docker daemon not reachable; start Docker or choose a different engine; run /engine for adapter details",
+        )
+    } else {
         Some(
             "runtime_status=unsupported_native_windows reason=native Windows skipped; use WSL/Linux vLLM ROCm; gpu_execution_required=true; run /engine for adapter details",
         )
-    } else {
-        None
     }
 }
 
@@ -8142,6 +8166,7 @@ fn friendly_engine_label(engine: &str) -> &str {
     match engine {
         "lemonade" => "Lemonade",
         "vllm" => "vLLM",
+        "aim" => "AIM",
         other => other,
     }
 }
@@ -9942,11 +9967,15 @@ pub(crate) const fn engine_inventory() -> &'static [(&'static str, &'static str)
             "vllm",
             "Linux/WSL ROCm GPU serving engine through external vLLM",
         ),
+        (
+            "aim",
+            "AMD Enterprise AI pre-built Docker serving containers",
+        ),
     ]
 }
 
 fn infer_engine_from_request(lower: &str) -> Option<&'static str> {
-    ["lemonade", "vllm"]
+    ["lemonade", "vllm", "aim"]
         .into_iter()
         .find(|engine| lower.contains(*engine))
 }
@@ -10235,6 +10264,7 @@ fn builtin_engine_request(
             envelope.clone(),
         )),
         "vllm" => Some(rocm_engine_vllm::builtin_handle_envelope(envelope.clone())),
+        "aim" => Some(rocm_engine_aim::builtin_handle_envelope(envelope.clone())),
         _ => None,
     }
 }
@@ -10253,7 +10283,7 @@ fn run_builtin_engine_stdio(engine: &str) -> Result<()> {
 }
 
 fn builtin_engine_available(engine: &str) -> bool {
-    matches!(engine, "lemonade" | "vllm")
+    matches!(engine, "lemonade" | "vllm" | "aim")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -10287,6 +10317,19 @@ fn run_builtin_engine_serve_http(
             engine_recipe,
         ),
         "vllm" => rocm_engine_vllm::builtin_serve_http(
+            service_id,
+            model_ref,
+            host,
+            port,
+            parsed_policy,
+            gpu_indices,
+            runtime_id,
+            env_id,
+            state_path,
+            log_path,
+            engine_recipe,
+        ),
+        "aim" => rocm_engine_aim::builtin_serve_http(
             service_id,
             model_ref,
             host,
@@ -19790,6 +19833,7 @@ pub(crate) mod tests {
             }],
             notes: vec!["metadata only; not applied to launches yet".to_owned()],
             model_id_override: None,
+            image_digest: None,
         }];
         let mut output = String::new();
 
@@ -20973,6 +21017,17 @@ pub(crate) mod tests {
     fn unsupported_here_for_is_none_when_allowed() {
         assert_eq!(unsupported_here_for("vllm", false), None);
         assert_eq!(unsupported_here_for("llamacpp", false), None);
+    }
+
+    /// `aim` is ruled out for a different reason than `vllm` on Windows
+    /// (Docker, not the OS), so the message has to say Docker, not WSL.
+    #[test]
+    fn unsupported_here_for_names_docker_for_aim() {
+        let message = unsupported_here_for("aim", true).expect("a ruled-out engine gets a message");
+        assert!(
+            message.to_lowercase().contains("docker"),
+            "the message has to name the actual reason, Docker: {message:?}"
+        );
     }
 
     /// Regression test for the engine-consistency bug: `assess_model_on_this_host`
