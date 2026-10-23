@@ -198,6 +198,24 @@ async fn ensure_serve_port_free() -> String {
     // server too. Best-effort; then wait for the socket to actually close.
     // Also kill the CLI's auto-started lemonade assistant — it hogs a GPU core on
     // Vulkan (EAI-7052) and starves the vLLM serve under test; no scenario needs it.
+    free_serve_ports().await;
+    // The port closing does NOT mean the prior serve's VRAM is back: a killed
+    // vLLM releases ~tens of GiB of device memory only as the process fully
+    // exits, which lags the socket close. The next `rocm serve` reads free VRAM
+    // at startup and demands vLLM's `gpu-memory-utilization` fraction of the
+    // TOTAL (rocm-cli passes no value, so vLLM's own default applies) — after a
+    // large model (e.g. 27B ~54 GiB) the residue can drop free memory below that
+    // request, so the next serve dies with "Free memory ... less than desired GPU
+    // memory utilization" (engine core init failed). Wait for the device to
+    // actually drain before returning.
+    wait_for_free_vram().await
+}
+
+/// The port half of [`ensure_serve_port_free`]: kill any listener on the
+/// shared serve port and the built-in assistant's port, then wait (bounded) for
+/// the serve port to close. Does not wait for the device to drain, so a step
+/// whose serve never loads a model can use it without paying for that wait.
+async fn free_serve_ports() {
     kill_listeners_on_port(SERVE_PORT);
     kill_listeners_on_port(ASSISTANT_PORT);
     let deadline = Instant::now() + Duration::from_mins(1);
@@ -213,16 +231,6 @@ async fn ensure_serve_port_free() -> String {
         kill_listeners_on_port(ASSISTANT_PORT);
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
-    // The port closing does NOT mean the prior serve's VRAM is back: a killed
-    // vLLM releases ~tens of GiB of device memory only as the process fully
-    // exits, which lags the socket close. The next `rocm serve` reads free VRAM
-    // at startup and demands vLLM's `gpu-memory-utilization` fraction of the
-    // TOTAL (rocm-cli passes no value, so vLLM's own default applies) — after a
-    // large model (e.g. 27B ~54 GiB) the residue can drop free memory below that
-    // request, so the next serve dies with "Free memory ... less than desired GPU
-    // memory utilization" (engine core init failed). Wait for the device to
-    // actually drain before returning.
-    wait_for_free_vram().await
 }
 
 /// Upper bound on the free-VRAM floor (MiB). Sized so the largest single
@@ -843,6 +851,15 @@ async fn lemonade_preparation_cannot_complete(world: &mut E2eWorld) {
 
 #[when("the user serves a model with Lemonade")]
 async fn user_serves_with_lemonade(world: &mut E2eWorld) {
+    // Free the shared ports as the engine-starting serve steps do, so a later
+    // scenario that reuses this step for a real launch does not start on a
+    // prior scenario's leaked server. Neither current user (serve-18, serve-26)
+    // gets as far as loading a model — one fails at backend install, the other's
+    // engine exits at startup — so the device-drain wait in
+    // `ensure_serve_port_free` would only cost lane time here; a scenario that
+    // does load a model through this step should switch to it. The retry step
+    // below reaches this through its call.
+    free_serve_ports().await;
     let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(
         world,
         &[
