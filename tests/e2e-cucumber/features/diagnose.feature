@@ -621,3 +621,37 @@ Feature: Diagnosing failures and listing fixes
     Then the diagnosis names the architecture and says Vulkan still works
     And that cause offers no fix to apply, and says so
     And no cause tells this user to install the HIP SDK
+
+  # The verify line of the MSVC runtime fix is shown to users of Windows
+  # PowerShell 5.1 and of cmd. `&&` and `||` are syntax errors in the first, a
+  # bare `where` is `Where-Object` there, it does not expand `%NAME%`, and in a
+  # `powershell -Command "..."` body it takes neither `\"` as an escaped quote
+  # nor `$_` (the outer shell expands it).
+  # Deliberately not OS-gated: the plan is printed before the fix's platform
+  # gate, so the text is the same on every lane, and the scenario asserts the
+  # printed lines and not the exit code. It does not run the line. The test
+  # `the_msvc_verify_runs_in_cmd_and_powershell` in
+  # crates/rocm-core/src/fix.rs does that, and only on Windows.
+  @id:diagnose-msvc-verify-line-text-is-powershell-safe
+  Scenario: diagnose-41 - The lines printed for the MSVC runtime fix avoid the constructs known to break in Windows PowerShell, and the verify line is a PowerShell command
+    Given a user who has chosen the fix for the missing MSVC runtime
+    When the user previews that fix without applying it
+    Then the printed commands and verify line avoid the constructs known to break in Windows PowerShell
+    And the printed verify command is a PowerShell command that selects FileVersion
+
+  # The same check for the two other fixes whose lines are shown on Windows
+  # and were written for one shell: the override fix's verify line used
+  # `env | grep ... ||`, and the PATH fix's verify line used `rocminfo | head
+  # && ...`. Text only, like diagnose-41. `the_override_verify_runs_in_cmd_and_powershell`
+  # in crates/rocm-core/src/fix.rs runs the override line, on Windows.
+  @id:diagnose-override-fix-lines-are-powershell-safe
+  Scenario: diagnose-42 - The lines printed for the GPU override fix avoid the constructs known to break in Windows PowerShell
+    Given a user who has chosen the fix for the GPU override
+    When the user previews that fix without applying it
+    Then the printed commands and verify line avoid the constructs known to break in Windows PowerShell
+
+  @id:diagnose-path-fix-lines-are-powershell-safe
+  Scenario: diagnose-43 - The lines printed for the PATH fix avoid the constructs known to break in Windows PowerShell
+    Given a user who has chosen the fix for ROCm missing from PATH
+    When the user previews that fix without applying it
+    Then the printed commands and verify line avoid the constructs known to break in Windows PowerShell
