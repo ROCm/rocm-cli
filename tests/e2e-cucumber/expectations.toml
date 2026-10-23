@@ -181,7 +181,7 @@ when = { is_wsl = true, therock_family = "gfx*" }
 bug = "EAI-7998"
 reason = "`examine --json` reports has_amd_gpu:false on a WSL2 host whose own summary names a gfx target."
 
-# -- Second README-walkthrough batch (EAI-8050) --
+# -- README-walkthrough defects (EAI-8047, EAI-8049) --
 # Defects found walking the CLI on an MI300X app-dev pod, each pinned by a
 # scenario asserting the CORRECT behaviour. Both are in code paths with no
 # hardware, engine or network dependency, and both were re-confirmed in a plain

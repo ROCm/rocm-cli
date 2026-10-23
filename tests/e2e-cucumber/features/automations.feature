@@ -66,4 +66,4 @@ Feature: Automation watchers
   Scenario: automations-06 - Every background check that is listed can be turned on
     Given a machine with no background checks turned on
     When the user lists the background checks
-    Then every listed check can be turned on by name
+    Then every listed check can be turned on from what the listing shows
