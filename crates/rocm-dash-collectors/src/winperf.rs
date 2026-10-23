@@ -420,7 +420,7 @@ fn counter_samples_missing_warning(raw: &str, metrics: &[GpuMetrics]) -> Option<
     if metrics.is_empty() && !parse_adapters(raw).is_empty() {
         Some(
             "Windows GPU utilization/VRAM counters returned no samples (possible non-English \
-             Windows locale — Get-Counter counter paths are localized)"
+             Windows locale - Get-Counter counter paths are localized)"
                 .to_string(),
         )
     } else {
