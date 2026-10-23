@@ -10747,6 +10747,43 @@ fn select_auto_gpu_index(
     vec![reported[0]]
 }
 
+/// How long the `serve` path waits on `amd-smi` before giving up on it. Both
+/// probes below are advisory — GPU auto-selection degrades to service state
+/// alone without them — so a stalled `amd-smi` must not hold up a launch. This
+/// bounds the ordinary stalls only; the unkillable one is prevented by the
+/// pre-flight inside [`rocm_core::amd_smi_json`], not by any timeout.
+///
+/// Named for `serve` because that is the path the budget is sized for, not
+/// because it is the only one that spends it. [`detect_gpu_count`] is reached
+/// solely from `serve_cmd::serve`, but [`gpu_vram_usage_amd_smi`] is also
+/// reached from [`host_accelerator_memory`], and so from
+/// `assess_model_with_host_paths` on the `--model` readiness path. That path
+/// wants the same answer for the same reason — how much VRAM this host has, to
+/// decide what it can run — so it wants the same budget; the one-shot argument
+/// below applies to it unchanged. It is one probe there rather than two, so the
+/// worst case is 10s, not 20s.
+///
+/// `rocmd`'s watcher has its own, shorter `AMD_SMI_PROBE_TIMEOUT` (2s) for the
+/// same helper: that one fires on a polling cadence where a stalled probe costs
+/// a missed telemetry tick and nothing else, so it can afford to give up early,
+/// while a serve launch gets exactly one chance to learn the GPU layout and
+/// giving up early there degrades the placement decision itself.
+///
+/// Worst-case latency, deliberately accepted rather than parallelised: `serve`
+/// runs the two probes sequentially — `gpu_vram_usage` before the launch lock,
+/// `detect_gpu_count` either in the `--gpu <index>` validation or inside the
+/// lock for `--gpu auto` — so a host where `amd-smi` passes the KFD gate and
+/// then stalls both times adds up to ~20s to an interactive launch. Before this
+/// bound existed both probes called `.output()` with no timeout at all, so that
+/// same host hung indefinitely; 20s is the ceiling replacing "forever", not a
+/// new cost. Running them concurrently is not free: `detect_gpu_count` is
+/// invoked inside [`select_gpu_indices_under_launch_lock`] precisely so the
+/// cpu-only and pinned paths never pay for the subprocess, and hoisting it out
+/// to overlap with the VRAM probe would make every `rocm serve --cpu-only` spawn
+/// an `amd-smi` it has no use for. The stall is rare, the extra spawn would be
+/// unconditional.
+const AMD_SMI_SERVE_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Best-effort per-GPU VRAM occupancy. Prefers `amd-smi metric --json`; when
 /// amd-smi is not installed (e.g. a shared node or container that ships no
 /// amd-smi — this never tries `rocm-smi`) it falls back to the amdgpu DRM sysfs
@@ -10793,22 +10830,10 @@ fn simulated_low_vram_usage() -> Option<Vec<GpuVramUsage>> {
     }])
 }
 
-/// Per-GPU VRAM occupancy via `amd-smi metric --json`. Returns `None` when
-/// amd-smi is unavailable or its output cannot be parsed.
+/// The `amd-smi` half of [`gpu_vram_usage`], routed through the guarded
+/// launcher so a missing `/dev/kfd` declines the spawn instead of stalling.
 fn gpu_vram_usage_amd_smi() -> Option<Vec<GpuVramUsage>> {
-    let binary = rocm_core::resolve_amd_smi_binary();
-    let output = ProcessCommand::new(&binary)
-        .arg("metric")
-        .arg("--json")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let value: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    let value = rocm_core::amd_smi_json(&["metric", "--json"], AMD_SMI_SERVE_PROBE_TIMEOUT).ok()?;
     let rows = parse_gpu_vram_usage(&value);
     if rows.is_empty() { None } else { Some(rows) }
 }
@@ -11071,19 +11096,7 @@ fn busy_gpu_indices(paths: &AppPaths) -> Vec<u32> {
 /// amd-smi is unavailable or its output cannot be parsed (callers then fall
 /// back to conservative defaults).
 fn detect_gpu_count() -> Option<usize> {
-    let binary = rocm_core::resolve_amd_smi_binary();
-    let output = ProcessCommand::new(&binary)
-        .arg("list")
-        .arg("--json")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let value: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    let value = rocm_core::amd_smi_json(&["list", "--json"], AMD_SMI_SERVE_PROBE_TIMEOUT).ok()?;
     let count = value.as_array().map(Vec::len)?;
     if count == 0 { None } else { Some(count) }
 }

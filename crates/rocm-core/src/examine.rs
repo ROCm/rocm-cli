@@ -2849,8 +2849,10 @@ fn managed_runtime_roots() -> Vec<(std::path::PathBuf, Vec<std::path::PathBuf>)>
 /// truncated. Slices on char boundaries (matching Python's `value[:n]`); a byte
 /// slice would panic when the cut lands inside a multibyte character.
 ///
-/// `pub(crate)` because [`crate::process`] bounds its timeout quote with the
-/// same marker, and a second copy here would be free to drift from it.
+/// `pub(crate)` because two other places bound a quote with the same marker and
+/// a second copy here would be free to drift from them: [`crate::process`] for
+/// its timeout quote, and `lib.rs` for the `amd-smi` failure quote, which bounds
+/// raw child output for the same reason the examination bounds captured text.
 /// (`host_gpu.rs`'s `truncate_diagnostic_line` is a different function with a
 /// different marker — plain `...` — not a third copy of this one.)
 pub(crate) fn truncate_to_chars(value: String, max_chars: usize) -> String {
