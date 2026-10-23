@@ -6216,13 +6216,29 @@ fn friendly_engine_detect_note_fallback(note: &str) -> String {
 }
 
 fn engine_runtime_status_label(engine: &str, detect: &DetectResponse) -> &'static str {
-    if detect.installed {
+    if detect.installed
+        && engine.eq_ignore_ascii_case("vllm")
+        && !engine_runtime_is_native_windows_unsupported(engine, detect)
+        && engine_reports_unusable_device(detect)
+    {
+        "installed, not usable"
+    } else if detect.installed {
         "ready"
     } else if engine_runtime_is_native_windows_unsupported(engine, detect) {
         "unsupported_native_windows"
     } else {
         "not found"
     }
+}
+
+/// An installed vLLM whose own detect says its GPU path cannot run: its
+/// compiled extensions do not import. Reporting that as `ready` sends
+/// the user to a serve that is certain to fail.
+fn engine_reports_unusable_device(detect: &DetectResponse) -> bool {
+    detect
+        .available_devices
+        .iter()
+        .any(|device| !device.available && device.reason.is_some())
 }
 
 fn engine_runtime_is_native_windows_unsupported(engine: &str, detect: &DetectResponse) -> bool {
@@ -19503,6 +19519,64 @@ pub(crate) mod tests {
         }
     }
 
+    #[test]
+    fn installed_vllm_whose_extensions_do_not_import_is_not_reported_ready() {
+        let detect = |installed: bool, available: bool, reason: Option<&str>| DetectResponse {
+            installed,
+            env_id: None,
+            runtime_kind: None,
+            runtime_executable: None,
+            managed_env: None,
+            python_version: None,
+            torch_version: None,
+            transformers_version: None,
+            available_devices: vec![rocm_engine_protocol::EngineDeviceAvailability {
+                kind: "rocm_gpu".to_owned(),
+                available,
+                reason: reason.map(str::to_owned),
+            }],
+            capabilities: rocm_engine_protocol::EngineCapabilities {
+                cpu: false,
+                rocm_gpu: true,
+                openai_compatible: true,
+                tool_calling: false,
+                quantized_models: "vllm-supported".to_owned(),
+                reasoning_parser: false,
+            },
+            notes: Vec::new(),
+        };
+        if cfg!(windows) {
+            return;
+        }
+        assert_eq!(
+            engine_runtime_status_label("vllm", &detect(true, true, None)),
+            "ready"
+        );
+        assert_eq!(
+            engine_runtime_status_label(
+                "vllm",
+                &detect(true, false, Some("compiled extensions do not import"))
+            ),
+            "installed, not usable"
+        );
+        assert_eq!(
+            engine_runtime_status_label("vllm", &detect(false, false, Some("not installed"))),
+            "not found"
+        );
+        // Only vLLM runs the extension check: another engine stays `ready`, and
+        // an unavailable device with no stated reason is not a vLLM problem.
+        assert_eq!(
+            engine_runtime_status_label(
+                "lemonade",
+                &detect(true, false, Some("compiled extensions do not import"))
+            ),
+            "ready"
+        );
+        assert_eq!(
+            engine_runtime_status_label("vllm", &detect(true, false, None)),
+            "ready"
+        );
+    }
     #[test]
     fn record_cli_audit_event_writes_cli_lifecycle_record() -> Result<()> {
         let (root, paths) = test_paths("cli-audit");
