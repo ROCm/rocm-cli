@@ -100,14 +100,23 @@ pub fn relaunch_command_for(
     command
 }
 
-/// Leave a plain word as is and single-quote anything a shell would split or expand.
+/// The running platform's shell: PowerShell on Windows, POSIX `sh` elsewhere.
 fn shell_word(value: &str) -> String {
+    shell_word_for(value, cfg!(windows))
+}
+
+/// Leave a plain word as is and single-quote anything the shell would split or
+/// expand. An apostrophe inside is doubled for PowerShell and closed-escaped-
+/// reopened (`'\''`) for POSIX `sh`; each is wrong in the other shell.
+fn shell_word_for(value: &str, powershell: bool) -> String {
     let plain = !value.is_empty()
         && value
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || "._/:@=+,-".contains(c));
     if plain {
         value.to_owned()
+    } else if powershell {
+        format!("'{}'", value.replace('\'', "''"))
     } else {
         format!("'{}'", value.replace('\'', "'\\''"))
     }
@@ -871,6 +880,24 @@ mod tests {
             "rocm serve '/models/my model.gguf' --host 127.0.0.1 --port 8000"
         );
         assert!(!relaunch_command_for("m", "vllm", "127.0.0.1", 1, false).contains('<'));
+    }
+
+    #[test]
+    fn an_apostrophe_in_a_model_path_is_escaped_for_the_shell_that_will_read_it() {
+        let model = "/models/O'Brien's model.gguf";
+        assert_eq!(
+            shell_word_for(model, false),
+            "'/models/O'\\''Brien'\\''s model.gguf'"
+        );
+        assert_eq!(
+            shell_word_for(model, true),
+            "'/models/O''Brien''s model.gguf'"
+        );
+        let command = relaunch_command_for(model, "vllm", "127.0.0.1", 8000, false);
+        assert!(
+            command.contains(&shell_word_for(model, cfg!(windows))),
+            "{command}"
+        );
     }
 
     #[test]
