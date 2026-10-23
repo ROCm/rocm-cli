@@ -19,11 +19,15 @@ use cucumber::{then, when};
 use crate::E2eWorld;
 use e2e_cucumber::serve_log::service_log_tail;
 
-use crate::e2e::serving_steps::{ensure_serve_port_free, host_serve_target, serve_timeout_for};
+use crate::e2e::serving_steps::{
+    SERVE_BASE_URL, ensure_serve_port_free, host_serve_target, serve_timeout_for,
+};
 
-/// The port every serve scenario shares (see `serving_steps::SERVE_PORT`). A public
-/// bind listens on all interfaces, so the test still reaches it over loopback.
-const ENDPOINT_URL: &str = "http://127.0.0.1:11435/v1";
+/// A public bind listens on all interfaces, so the test still reaches the shared
+/// serve port over loopback.
+fn endpoint_url() -> &'static str {
+    SERVE_BASE_URL.as_str()
+}
 
 /// Pull the issued endpoint key out of the launch output. `serve` prints it as
 /// `  api key: <key>` exactly once, alongside the note and curl example.
@@ -44,7 +48,7 @@ async fn try_models_status(bearer: Option<&str>) -> Option<reqwest::StatusCode> 
         .timeout(Duration::from_secs(30))
         .build()
         .expect("failed to build HTTP client");
-    let mut request = client.get(format!("{ENDPOINT_URL}/models"));
+    let mut request = client.get(format!("{}/models", endpoint_url()));
     if let Some(token) = bearer {
         request = request.bearer_auth(token);
     }
@@ -55,9 +59,12 @@ async fn try_models_status(bearer: Option<&str>) -> Option<reqwest::StatusCode> 
 /// assertions, which only run once the endpoint has already answered — so at that
 /// point a refused connection is a genuine failure, not a startup race.
 async fn get_models_status(bearer: Option<&str>) -> reqwest::StatusCode {
-    try_models_status(bearer)
-        .await
-        .unwrap_or_else(|| panic!("GET {ENDPOINT_URL}/models did not reach the served endpoint"))
+    try_models_status(bearer).await.unwrap_or_else(|| {
+        panic!(
+            "GET {}/models did not reach the served endpoint",
+            endpoint_url()
+        )
+    })
 }
 
 /// Wait until the authenticated endpoint answers, so the assertions run against a
@@ -82,9 +89,10 @@ async fn wait_for_authenticated_endpoint(key: &str, timeout_secs: u64, serve_std
             Some(status) => format!("endpoint answered {status} to the issued key"),
             None => "connection refused / timed out".to_owned(),
         };
+        let endpoint = endpoint_url();
         assert!(
             Instant::now() < deadline,
-            "public endpoint {ENDPOINT_URL} did not answer an authenticated request within \
+            "public endpoint {endpoint} did not answer an authenticated request within \
              {timeout_secs}s\nlast observed: {last_seen}\n--- SERVE STDOUT ---\n{serve_stdout}\
              \n--- SERVICE LOG (tail) ---\n{}",
             service_log_tail(serve_stdout)
@@ -116,7 +124,7 @@ async fn serve_public_bind(world: &mut E2eWorld) {
     let key = issued_api_key(&stdout)
         .unwrap_or_else(|| panic!("serve did not print an endpoint api key:\n{stdout}"));
     wait_for_authenticated_endpoint(&key, serve_timeout_for(world), &stdout).await;
-    world.endpoint = Some(ENDPOINT_URL.to_owned());
+    world.endpoint = Some(endpoint_url().to_owned());
     world.endpoint_api_key = Some(key);
     world.model_name = Some(model.to_owned());
     world.cli_output = Some(stdout);

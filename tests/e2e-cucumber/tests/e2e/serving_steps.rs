@@ -75,7 +75,7 @@ pub(crate) async fn model_is_ready(
 
 /// The OpenAI-compatible base URL every GPU serve scenario serves on (see
 /// [`SERVE_PORT`]), and the model listing readiness is judged by.
-static SERVE_BASE_URL: LazyLock<String> =
+pub(crate) static SERVE_BASE_URL: LazyLock<String> =
     LazyLock::new(|| format!("http://127.0.0.1:{SERVE_PORT}/v1"));
 static MODELS_URL: LazyLock<String> =
     LazyLock::new(|| format!("http://127.0.0.1:{SERVE_PORT}/v1/models"));

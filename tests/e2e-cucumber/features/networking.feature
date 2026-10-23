@@ -4,8 +4,8 @@ Feature: Native HTTP networking
   # certificate store), replacing the generated PowerShell script that used to
   # run under `powershell.exe -ExecutionPolicy Bypass` on Windows. These
   # scenarios drive the real `rocm` binary end-to-end against the mock server so a
-  # GET/round-trip reaches a local endpoint over the native stack. They run on the
-  # mock (no GPU) on every platform the suite runs on, so a regression back to a
+  # GET/round-trip reaches a local endpoint over the native stack. All but
+  # networking-04 run on the mock (no GPU) on every platform the suite runs on, so a regression back to a
   # shell-out networking backend surfaces here rather than only in the field.
 
   # `rocm services list` extracts host:port from the service record and issues a
@@ -61,7 +61,7 @@ Feature: Native HTTP networking
   # designed-in behaviour, not a bug, so it wants a tag rather than an xfail row. It
   # also keeps this cold serve off the time-capped Strix lanes entirely.
   @id:networking-public-bind-endpoint-enforces-key @requires-gpu @requires-engine:vllm
-  Scenario: 4 - A public endpoint issues a key once and then enforces it
+  Scenario: networking-04 - A public endpoint issues a key once and then enforces it
     Given a managed runtime is active
     When the user serves a model on a public interface with public binding allowed
     Then the CLI shows the endpoint key once and how to send it
