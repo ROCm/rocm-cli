@@ -605,13 +605,18 @@ Feature: Interactive dashboard
   # `gpu_data_unavailable`/`node_throughput_title` in
   # `crates/rocm-dash-tui/src/ui/tabs/home.rs`) with a *real* embedded daemon,
   # not `--demo` (whose fixture always has 8 GPUs and can never reach this
-  # state). This CI runner has no AMD GPU, so the real collector's first
-  # snapshot — and every one after it — reports zero GPUs, making "unavailable"
-  # a stable, permanent state here rather than a race. The other half of that
-  # state machine, the transient "pending" placeholder shown before the first
-  # snapshot arrives at all, is not covered: it closes in well under a second
-  # and there's no hook to freeze the daemon mid-handshake, so asserting on it
-  # would be asserting on a race.
+  # state). The real reason this is a stable, permanent state here rather
+  # than a race isn't "no AMD GPU" on the runner — it's that the daemon's
+  # mandatory `/dev/kfd` pre-flight (`amd_smi::device_accessible`,
+  # `preflight_passes`) fails for this harness process (no read access to the
+  # device node, or it isn't visible to it at all), the same way it would on
+  # a real host without render/video group membership. So `detect_with_binary`
+  # returns `None` and every snapshot reports zero GPUs, regardless of
+  # whether the GPU lane's runner itself has real hardware. The other half of
+  # that state machine, the transient "pending" placeholder shown before the
+  # first snapshot arrives at all, is not covered: it closes in well under a
+  # second and there's no hook to freeze the daemon mid-handshake, so
+  # asserting on it would be asserting on a race.
   @id:dash-reports-no-gpu-telemetry @requires-os:linux
   Scenario: dash-37 - The hero shows placeholders, not fake zeros, when no GPU is detected
     When the user opens the dashboard

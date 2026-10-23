@@ -1309,8 +1309,16 @@ async fn hero_reports_no_gpu_telemetry(world: &mut E2eWorld) {
             .lines()
             .find(|line| line.contains(label))
             .unwrap_or_else(|| panic!("no {label} row on screen:\n{screen}"));
+        // Check the text *after* the label, not the whole row: the
+        // utilization gauge on the same row draws its own "—" placeholder,
+        // which would make this pass even if this mini-spark's value were a
+        // fake reading instead of the placeholder.
+        let after_label = row
+            .split_once(label)
+            .map(|(_, rest)| rest)
+            .unwrap_or_else(|| panic!("no text after {label} on row:\n{row}"));
         assert!(
-            row.contains('—'),
+            after_label.contains('—'),
             "{label} row should show the \"—\" placeholder, not a fake reading:\n{row}"
         );
     }

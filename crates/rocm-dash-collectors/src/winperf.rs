@@ -13,9 +13,14 @@
 //! Reads the `GPU Engine`/`GPU Adapter Memory` categories — the same
 //! WDDM/DXGK-backed source Task Manager's GPU tab reads. Mirrors
 //! `amd_smi.rs`'s subprocess + pure-parse shape, shelling out to
-//! `powershell.exe` instead of `amd-smi`. Not `#[cfg(windows)]`-gated: the
-//! shellout fails cleanly (`powershell.exe` not found) on other platforms,
-//! same as `amd_smi.rs` when `amd-smi` isn't installed.
+//! `powershell.exe` instead of `amd-smi`. Not `#[cfg(windows)]`-gated at the
+//! module level, but `snapshot()`'s only caller today is itself
+//! `#[cfg(windows)]` (see `client.rs`'s `connect_and_run`). On a plain Linux
+//! host `powershell.exe` isn't on `PATH` and this fails cleanly like
+//! `amd_smi.rs` does when `amd-smi` is missing — but under WSL interop,
+//! `powershell.exe` *is* on `PATH` and this would run against the Windows
+//! host's GPUs, so don't add a Linux-reachable caller without reconsidering
+//! that.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -33,6 +38,12 @@ use tokio::time::timeout;
 // interactively. 15s gives real-world spawn latency room without masking an
 // actually-hung process forever.
 const RUN_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// ADLX init/read/terminate shouldn't normally take anywhere near this, but a
+/// wedged driver call must not freeze CPU/memory updates forever alongside it
+/// — same reasoning as `RUN_TIMEOUT`, just a tighter bound since there's no
+/// process spawn latency to absorb here.
+const ADLX_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// `kind<TAB>key<TAB>value[<TAB>value2]` lines: per-engine utilization,
 /// per-adapter dedicated VRAM usage, and a best-effort adapter inventory
@@ -68,12 +79,22 @@ impl WinPerfCollector {
         // adlx_readings() calls into amdadlx64.dll via FFI, which blocks on
         // driver I/O — running it directly here would stall a tokio worker
         // thread, same hazard run_script() avoids by using an async Command.
-        let adlx = task::spawn_blocking(adlx_readings)
-            .await
-            .unwrap_or_default();
+        // Timed out the same way: a wedged driver call must not freeze every
+        // other metric this tick forever, and either failure mode is
+        // surfaced as a warning rather than silently degrading to defaults.
+        let (adlx, adlx_warning) =
+            match timeout(ADLX_TIMEOUT, task::spawn_blocking(adlx_readings)).await {
+                Ok(Ok(readings)) => (readings, None),
+                Ok(Err(_)) => (Vec::new(), Some("ADLX reading task panicked".to_string())),
+                Err(_) => (
+                    Vec::new(),
+                    Some(format!("ADLX query timed out after {ADLX_TIMEOUT:?}")),
+                ),
+            };
         let metrics = parse_metrics(&out, &adlx);
         let warnings = counter_samples_missing_warning(&out, &metrics)
             .into_iter()
+            .chain(adlx_warning)
             .collect();
         Ok((metrics, parse_system_info(&out), warnings))
     }
@@ -636,6 +657,26 @@ mod tests {
                 .iter()
                 .all(|g| g.temperature_c == 0.0 && g.power_w == 0.0 && g.clock_mhz.is_none())
         );
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn multi_adapter_utilization_clamps_to_100_when_summed_processes_exceed_it() {
+        // Two processes both drawing on the same engine of the same adapter
+        // (summed per the doc comment on `engine_util`) push the raw total
+        // past 100 on a *second real adapter* alongside the one in `SAMPLE` —
+        // the multi-adapter branch's own clamp must still catch it, same as
+        // the single-adapter branch above it.
+        let two_adapters = format!(
+            "{SAMPLE}\nUTIL\tpid_9998_luid_0x00000000_0x0000cafe_phys_0_eng_2_engtype_3d\t95.0\nUTIL\tpid_9999_luid_0x00000000_0x0000cafe_phys_0_eng_3_engtype_3d\t95.0\nGPU\tOther GPU\t4293918720\t1.0"
+        );
+        let metrics = parse_metrics(&two_adapters, &[]);
+        assert_eq!(metrics.len(), 2);
+        let gpu = metrics
+            .iter()
+            .find(|g| g.vram_used_mb == 0)
+            .expect("the cafe device's metrics");
+        assert_eq!(gpu.gpu_utilization_pct, 100.0);
     }
 
     #[test]

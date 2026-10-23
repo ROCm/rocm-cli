@@ -172,6 +172,16 @@ pub enum ConnState {
     },
 }
 
+impl ConnState {
+    /// True for the Windows in-process collector (see
+    /// `client::connect_and_run`'s `#[cfg(windows)]` arm), which tags its
+    /// `daemon_version` this way since there's no real `rocmdashd` behind
+    /// it — and so no instance registry it could ever populate.
+    pub fn is_in_process(&self) -> bool {
+        matches!(self, Self::Connected { version, .. } if version.starts_with("in-process/"))
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ActiveTab {
     // 5-tab IA. Home is the default; ROCm and Serving are the two domain tabs

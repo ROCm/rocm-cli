@@ -375,11 +375,15 @@ const fn status_role(status: InstanceStatus) -> BoxRole {
 }
 
 fn draw_empty(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
-    let body = match &state.conn {
-        ConnState::Connected { .. } => {
-            "no instances · start daemon with --enable-docker on a host with vLLM containers"
+    let body = if state.conn.is_in_process() {
+        "no instance registry on this platform · vLLM containers aren't available here"
+    } else {
+        match &state.conn {
+            ConnState::Connected { .. } => {
+                "no instances · start daemon with --enable-docker on a host with vLLM containers"
+            }
+            _ => "waiting for daemon…",
         }
-        _ => "waiting for daemon…",
     };
     let inner = panel::bento(f, area, Some("Instances"), BoxRole::Neutral, false, theme);
     let p = Paragraph::new(Line::from(Span::styled(
@@ -1352,6 +1356,33 @@ mod tests {
             out.push('\n');
         }
         out
+    }
+
+    #[test]
+    fn draw_empty_names_the_platform_reason_for_the_in_process_collector() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        // The Windows in-process collector (see `ConnState::is_in_process`)
+        // has no instance registry at all, ever — distinct from "a real
+        // daemon is connected but nothing is running" or "still connecting".
+        let mut state = mk_state(HashMap::new(), 0);
+        state.conn = ConnState::Connected {
+            host: "localhost".into(),
+            version: "in-process/0.0.0".into(),
+        };
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        term.draw(|f| draw(f, f.area(), &state, &state.theme))
+            .unwrap();
+        let grid = buffer_text(&term);
+        assert!(
+            grid.contains("no instance registry on this platform"),
+            "should name the platform limitation, not claim a daemon could be started; got:\n{grid}"
+        );
+        assert!(
+            !grid.contains("start daemon"),
+            "must not suggest starting a daemon that doesn't exist on this platform; got:\n{grid}"
+        );
     }
 
     #[test]

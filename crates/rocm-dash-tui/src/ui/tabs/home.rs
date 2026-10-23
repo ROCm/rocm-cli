@@ -23,7 +23,7 @@ use ratatui::widgets::Paragraph;
 
 use rocm_dash_core::state::JobStatus;
 
-use crate::app::{AppState, UpdateStatus};
+use crate::app::{AppState, ConnState, UpdateStatus};
 use crate::ui::format;
 use crate::ui::gradient::GradientGauge;
 use crate::ui::panel::{self, BoxRole};
@@ -72,10 +72,14 @@ const fn node_load_label(hist_empty: bool, simulated: bool) -> &'static str {
 /// title's "Detecting GPU…" placeholder — a snapshot that arrived but
 /// carries no GPUs (or a legitimately-zero field) is a known state, not a
 /// still-loading one, and reads "Unknown GPU" instead (see
-/// `node_throughput_title`). For the numeric "—" placeholders, see
-/// `gpu_data_unavailable`.
+/// `node_throughput_title`). Gated on the connection still being in its
+/// initial handshake: `latest` is also wiped on disconnect
+/// (`ClientMsg::Disconnected`, including end-of-`--replay`) and on a replay
+/// seek, neither of which means detection restarted — those read "Unknown
+/// GPU" too rather than reverting to "still loading". For the numeric "—"
+/// placeholders, see `gpu_data_unavailable`.
 const fn gpu_telemetry_pending(state: &AppState) -> bool {
-    state.latest.is_none()
+    state.latest.is_none() && matches!(state.conn, ConnState::Initial | ConnState::Connecting)
 }
 
 /// True when there's no usable per-GPU data to show a number for: either no
@@ -859,6 +863,50 @@ mod tests {
             !power_segment.contains('W'),
             "power should not show a fake 0W: {power_segment:?}"
         );
+    }
+
+    #[test]
+    fn gpu_utilization_gauge_shows_dash_not_a_fake_zero_percent_when_no_gpus_are_reported() {
+        // A snapshot arrived but carries no GPUs at all (`gpu_data_unavailable`
+        // true) — the gauge label must read "—", not a fake "0.0%"
+        // (draw_hero_left's `gpu_data_unavailable` branch).
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.active_tab = ActiveTab::Home;
+        s.latest = Some(Snapshot::default());
+        let out = render(&s, 160, 30);
+        let segment = out
+            .split("GPU UTILIZATION")
+            .nth(1)
+            .and_then(|s| s.split("tokens / watt").next())
+            .unwrap_or_else(|| panic!("gpu utilization row missing: {out:?}"));
+        assert!(
+            segment.contains('—'),
+            "gpu utilization should read —, not a fake 0.0%: {segment:?}"
+        );
+        assert!(
+            !segment.contains("0.0%"),
+            "gpu utilization should not show a fake 0.0%: {segment:?}"
+        );
+    }
+
+    #[test]
+    fn gpu_telemetry_pending_does_not_resume_after_a_disconnect_or_replay_end() {
+        // Once connected, losing the connection (end of `--replay`, a daemon
+        // drop, ClientMsg::Disconnected) wipes `latest` but must not look
+        // like detection restarted — the title should stay on "Unknown GPU",
+        // never flip back to "Detecting GPU…".
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.conn = ConnState::Connected {
+            host: "x".into(),
+            version: "1".into(),
+        };
+        s.latest = Some(Snapshot::default());
+        s.conn = ConnState::Disconnected {
+            reason: "end of recording".into(),
+        };
+        s.latest = None;
+        assert!(!gpu_telemetry_pending(&s));
+        assert_eq!(node_throughput_title(&s), "Node throughput · Unknown GPU");
     }
 
     #[test]

@@ -223,10 +223,6 @@ async fn connect_and_run(connect: &str, tx: UnboundedSender<ClientMsg>) -> anyho
 
     loop {
         ticker.tick().await;
-        // Sampled before the GPU query, not after: `host.tick()`'s CPU
-        // reading would otherwise include the window spent spawning and
-        // waiting on `powershell.exe` for the GPU counters, inflating the
-        // dashboard's own CPU% with its own collection cost.
         let host_metrics = host.tick();
         let (gpus, gpu_system_info, warnings) = match gpu.snapshot().await {
             Ok(v) => v,
