@@ -30,12 +30,18 @@ fn planted_env_path(world: &E2eWorld) -> PathBuf {
     root.path().join("engine-env")
 }
 
-#[given("a machine with an installed engine environment")]
-async fn plant_engine_env(world: &mut E2eWorld) {
-    // Plant the manifest `rocm engines install` would have written, plus a stub
-    // interpreter, so the scenario reaches the shell-launch path without a
-    // multi-GiB engine install or a GPU. Black-box: plain JSON matching the
-    // CLI's on-disk schema, not a typed import from the product crates.
+/// Plant an environment tree with an interpreter and an activation script, plus a
+/// manifest naming them, so a scenario reaches the shell-launch path with no
+/// multi-GiB engine install and no GPU. Black-box: plain JSON matching the CLI's on-disk schema, not a
+/// typed import from the product crates.
+///
+/// `recorded_env_path` is the env_path the shell is handed, which is NOT always
+/// the environment root: the vLLM install RESPONSE reports the directory holding
+/// the engine command (`command.parent()` in `engines/vllm/src/install.rs`),
+/// while Lemonade reports the root. No install writes this manifest to disk; it
+/// stands in for that response so the shell is reachable without an install.
+/// Callers choose the shape they need.
+fn plant_engine_env_recorded_as(world: &E2eWorld, recorded_env_path: &std::path::Path) {
     let root = world.isolated_root.as_ref().expect("no isolated root");
     let env_path = planted_env_path(world);
     let bin = env_path.join("bin");
@@ -47,6 +53,11 @@ async fn plant_engine_env(world: &mut E2eWorld) {
         "#!/bin/sh\necho planted-engine-python\n",
     )
     .expect("failed to write the planted interpreter");
+    // A real environment ships the activation script next to its interpreter.
+    // Planting it is what makes "the hint names a file that exists" a statement
+    // about the CLI rather than about how thorough this fixture was.
+    std::fs::write(bin.join("activate"), "# planted engine env activation\n")
+        .expect("failed to write the planted activation script");
 
     let manifests = root
         .path()
@@ -59,13 +70,27 @@ async fn plant_engine_env(world: &mut E2eWorld) {
         "env_id": ENV_ID,
         "runtime_id": "therock-release:gfx94X-dcgpu",
         "python_executable": python.display().to_string(),
-        "env_path": env_path.display().to_string(),
+        "env_path": recorded_env_path.display().to_string(),
     });
     std::fs::write(
         manifests.join(format!("{ENV_ID}.json")),
         serde_json::to_vec_pretty(&manifest).expect("manifest serialises"),
     )
     .expect("failed to write the engine env manifest");
+}
+
+#[given("a machine with an installed engine environment")]
+async fn plant_engine_env(world: &mut E2eWorld) {
+    let env_path = planted_env_path(world);
+    plant_engine_env_recorded_as(world, &env_path);
+}
+
+#[given("a machine with an engine environment installed the way the engine records it")]
+async fn plant_engine_env_as_installed(world: &mut E2eWorld) {
+    // Same tree, but env_path is what the vLLM install response reports: the
+    // directory the engine command lives in, one level inside the environment.
+    let bin = planted_env_path(world).join("bin");
+    plant_engine_env_recorded_as(world, &bin);
 }
 
 #[when("the user opens a shell for that engine")]
@@ -133,6 +158,40 @@ async fn assert_engine_interpreter(world: &mut E2eWorld) {
                 expected.display()
             )
         });
+}
+
+#[then("the printed activation hint names a file that exists")]
+async fn assert_activation_hint_resolves(world: &mut E2eWorld) {
+    const HINT_LABEL: &str = "activate_hint:";
+
+    let session = world.tui.as_mut().expect("no engine shell session");
+    session
+        .wait_for_screen(HINT_LABEL, SCREEN_TIMEOUT)
+        .await
+        .unwrap_or_else(|e| panic!("the engine shell printed no activation hint: {e}"));
+
+    // Read LOGICAL lines: the hint carries a path long enough to soft-wrap at the
+    // terminal width, and a truncated path would fail the assertion below for a
+    // reason that has nothing to do with the product.
+    let lines = session.screen_logical_lines();
+    let screen = session.screen_text();
+    let hint = lines
+        .iter()
+        .find_map(|line| line.split_once(HINT_LABEL))
+        .map_or_else(
+            || panic!("no activation hint on screen:\n{screen}"),
+            |(_, rest)| rest.trim(),
+        );
+    // `runtime_python_activation_hint` prints `source <path>` on Unix.
+    let path = hint.strip_prefix("source ").unwrap_or(hint).trim();
+    assert!(
+        !path.is_empty(),
+        "the activation hint named no path:\n{screen}"
+    );
+    assert!(
+        std::path::Path::new(path).exists(),
+        "the engine shell told the user to activate {path:?}, which does not exist:\n{screen}"
+    );
 }
 
 #[when("the user leaves the engine shell")]
