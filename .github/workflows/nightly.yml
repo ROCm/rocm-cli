@@ -1805,7 +1805,7 @@ jobs:
         id: draft
         # v3 is a floating major alias with no semver tag yet (only v1.x/
         # v2.x have one); pinned to v2.1.1 instead per AGENTS.md's
-        # full-semver-tag policy. v2.1.1's default provider is
+        # pin-to-full-commit-SHA policy. v2.1.1's default provider is
         # `github-models`, not `copilot` (v3 flipped the default), so
         # `provider: copilot` below is required here, not just
         # documentation.

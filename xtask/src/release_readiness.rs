@@ -60,9 +60,9 @@ pub enum Verdict {
 pub struct Facts {
     pub since_tag: String,
     pub verdict: Verdict,
-    /// Named gates that did not pass (build/windows-build job results, or
-    /// "E2E" if any platform reported a failure or the report couldn't be
-    /// read). Empty iff `verdict` is `Go`.
+    /// Named gates that did not pass (build/windows-build job results, the
+    /// E2E failure count or unreadable report, or the `e2e-report-nightly`
+    /// lane report check). Empty iff `verdict` is `Go`.
     pub failing_gates: Vec<String>,
     /// `None` when the E2E report's `**Total**` row couldn't be found or
     /// parsed — treated as a failing gate rather than silently reading as
@@ -103,7 +103,11 @@ pub fn run(
         e2e_report_job_result,
     );
 
-    write_parented(out, &serde_json::to_string_pretty(&facts)?)?;
+    // Trailing newline so the `facts.json` → `$GITHUB_OUTPUT` heredoc in
+    // nightly.yml's "Read facts for prompt" step always lands its closing
+    // delimiter on its own line, even if that step's own `echo` guard is
+    // ever dropped.
+    write_parented(out, &format!("{}\n", serde_json::to_string_pretty(&facts)?))?;
     write_parented(table_out, &render_table(&facts))?;
     Ok(())
 }
@@ -143,8 +147,10 @@ fn assemble_facts(
     // `e2e-report-nightly`'s result instead: its "every lane that ran
     // uploaded its report" check (`nightly.yml`, `LANE_REPORTS`) already
     // fails that job when a lane is silently missing, covering every lane in
-    // `LANE_REPORTS` — including ones added later — for free.
-    if !matches!(e2e_report_job_result, "success" | "skipped") {
+    // `LANE_REPORTS` — including ones added later — for free. Unlike the
+    // build gates, this job is `if: always()` and has no legitimate
+    // no-op-night skip, so `skipped` isn't accepted here.
+    if e2e_report_job_result != "success" {
         failing_gates.push(format!("E2E (lane report check: {e2e_report_job_result})"));
     }
 
@@ -412,9 +418,11 @@ fn total_e2e_failures(markdown: &str) -> Option<u64> {
     let header_idx = lines
         .iter()
         .position(|l| l.trim_start().starts_with("| Platform"))?;
-    let total_idx = lines
-        .iter()
-        .position(|l| l.trim_start().starts_with("| **Total**"))?;
+    let total_idx = header_idx
+        + 1
+        + lines[header_idx + 1..]
+            .iter()
+            .position(|l| l.trim_start().starts_with("| **Total**"))?;
 
     let total_row_fails = lines[total_idx]
         .split('|')
@@ -434,7 +442,7 @@ fn total_e2e_failures(markdown: &str) -> Option<u64> {
                 .get(5)
                 .and_then(|c| c.trim().parse::<u64>().ok())
                 .unwrap_or(0);
-            !matches!(status, Some("PASS" | "") | None) && fail == 0
+            !matches!(status, Some("PASS") | None) && fail == 0
         })
         .count() as u64;
 
@@ -680,6 +688,13 @@ mod tests {
     }
 
     #[test]
+    fn excerpt_does_not_truncate_at_exactly_the_character_limit() {
+        let exactly_five = "abcde";
+        assert_eq!(excerpt(exactly_five, 5), "abcde");
+        assert_eq!(excerpt("abcdef", 5), "abcde…");
+    }
+
+    #[test]
     fn total_e2e_failures_reads_the_totals_row() {
         let md = "| Platform | OS | Total | Pass | Fail | Skip | Xfail | Status |\n\
                    |---|---|--:|--:|--:|--:|--:|:--|\n\
@@ -691,6 +706,17 @@ mod tests {
     #[test]
     fn total_e2e_failures_returns_none_without_a_totals_row() {
         assert_eq!(total_e2e_failures("no table here"), None);
+    }
+
+    #[test]
+    fn total_e2e_failures_returns_none_instead_of_panicking_when_total_precedes_header() {
+        // A `**Total**` line before the `| Platform` header (e.g. a document
+        // that embeds the summary table out of order) must fail closed via
+        // `None`, not panic on a reversed slice range.
+        let md = "| **Total** | | 0 | 0 | 0 | 0 | 0 | |\n\
+                   | Platform | OS | Total | Pass | Fail | Skip | Xfail | Status |\n\
+                   |---|---|--:|--:|--:|--:|--:|:--|\n";
+        assert_eq!(total_e2e_failures(md), None);
     }
 
     #[test]
@@ -804,6 +830,10 @@ mod tests {
         );
         assert_eq!(facts.verdict, Verdict::Go);
         assert!(facts.failing_gates.is_empty());
+        assert!(
+            facts.build_skipped,
+            "a skipped nightly build must set build_skipped"
+        );
     }
 
     #[test]
@@ -819,6 +849,10 @@ mod tests {
         );
         assert_eq!(facts.verdict, Verdict::Go);
         assert!(facts.failing_gates.is_empty());
+        assert!(
+            facts.build_skipped,
+            "a skipped windows build must set build_skipped"
+        );
     }
 
     #[test]
@@ -902,7 +936,7 @@ mod tests {
     }
 
     #[test]
-    fn assemble_facts_treats_a_skipped_e2e_report_job_as_passing() {
+    fn assemble_facts_treats_a_skipped_e2e_report_job_as_a_failing_gate() {
         let facts = assemble_facts(
             "v1.0.0",
             CommitBuckets::default(),
@@ -912,8 +946,11 @@ mod tests {
             "success",
             "skipped",
         );
-        assert_eq!(facts.verdict, Verdict::Go);
-        assert!(facts.failing_gates.is_empty());
+        assert_eq!(facts.verdict, Verdict::NoGo);
+        assert_eq!(
+            facts.failing_gates,
+            vec!["E2E (lane report check: skipped)"]
+        );
     }
 
     #[test]
@@ -1203,6 +1240,27 @@ mod tests {
     }
 
     #[test]
+    fn build_known_issues_breaks_a_reaction_tie_by_ascending_issue_number() {
+        let raw: Vec<RawIssue> = serde_json::from_str(
+            r#"[
+                {"number": 9, "title": "later", "body": "", "reactionGroups":
+                    [{"content":"THUMBS_UP","users":{"totalCount":2}}]},
+                {"number": 3, "title": "earlier", "body": "", "reactionGroups":
+                    [{"content":"THUMBS_UP","users":{"totalCount":2}}]}
+            ]"#,
+        )
+        .unwrap();
+
+        let issues = build_known_issues(raw);
+
+        assert_eq!(
+            issues.iter().map(|i| i.number).collect::<Vec<_>>(),
+            vec![3, 9],
+            "equal reaction counts must break ties by ascending issue number"
+        );
+    }
+
+    #[test]
     fn collect_commit_subjects_fails_on_a_bogus_since_tag() {
         let err = collect_commit_subjects("this-tag-definitely-does-not-exist-zzz").unwrap_err();
         assert!(
@@ -1216,7 +1274,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let err = collect_known_issues_in(dir.path()).unwrap_err();
         assert!(
-            err.to_string().contains("gh issue list"),
+            err.to_string().contains("`gh issue list` failed"),
             "unexpected error: {err}"
         );
     }

@@ -201,7 +201,7 @@ via `cargo xtask release-readiness`: it gates on the nightly Linux/Windows
 build results, the consolidated E2E failure total, and the `e2e-report-nightly`
 job's own result (so a lane that dies before uploading a report still fails
 the gate), and buckets commits since the last release tag into
-features/fixes/breaking changes. Unlike the wiki-publish jobs below, the
+features/fixes/breaking changes. Unlike the wiki-publish jobs above, the
 `release-readiness-nightly` and `release-readiness-narrative` jobs have no
 `main`/repo guard — they run on any branch this workflow is dispatched on.
 The narrative job drafts prose from those facts via `actions/ai-inference`
