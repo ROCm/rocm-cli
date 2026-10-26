@@ -84,7 +84,7 @@ fn path_fix_bin_dir(world: &E2eWorld) -> std::path::PathBuf {
 /// A real pre-existing User PATH value containing an apostrophe, the way
 /// `C:\Users\O'Brien\bin` would appear on a host with that username. Not a
 /// contrived edge case -- see `ps_single_quote_escape`'s doc comment in
-/// `crates/rocm-core/src/fix.rs` -- and chosen so [`assert_path_fix_prepended_with_apostrophe_intact`]
+/// `crates/rocm-core/src/quoting.rs` -- and chosen so [`assert_path_fix_prepended_with_apostrophe_intact`]
 /// can prove the escaped write script still parses correctly against a real
 /// `powershell.exe`, not just the unit test's simulated one.
 const PATH_FIX_EXISTING_USER_PATH: &str = r"C:\Users\O'Brien\bin;C:\Windows\System32";
