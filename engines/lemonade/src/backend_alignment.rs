@@ -1972,6 +1972,40 @@ vllm                rocm        unsupported     Requires Linux                  
         );
     }
 
+    /// The E2E fake runtime's `lemonade backends` table must drive this engine
+    /// to attempt a `llamacpp:rocm` install: that attempt is the whole premise
+    /// of `@id:serve-lemonade-preparation-recovery`, which then fails it.
+    ///
+    /// The table is read out of the fixture's own source rather than copied, so
+    /// editing it there is checked here, on every lane that runs unit tests. A
+    /// parser change that stopped accepting it would otherwise make the
+    /// scenario stop reaching the failure it asserts, with no unit test
+    /// noticing.
+    #[test]
+    fn the_e2e_fake_runtime_table_drives_a_rocm_backend_install() {
+        const FIXTURE: &str = include_str!("../../../tests/e2e-cucumber/src/bin/fake-lemonade.rs");
+        let table = FIXTURE
+            .split_once("const BACKENDS_TABLE: &str = r\"")
+            .and_then(|(_, rest)| rest.split_once("\";"))
+            .map(|(table, _)| table)
+            .expect("fake-lemonade.rs must declare BACKENDS_TABLE as a raw string literal without hashes");
+        let backends = parse_llamacpp_backend_statuses(table);
+        assert_eq!(
+            backends,
+            vec![
+                ("rocm".to_owned(), "installable".to_owned()),
+                ("vulkan".to_owned(), "unsupported".to_owned()),
+            ]
+        );
+        // `false` = not already installed, which is what makes the engine run
+        // the install the fixture then refuses. `installed` would skip it, and
+        // the scenario would never see a failure.
+        assert_eq!(
+            select_best_llamacpp_backend(&backends),
+            Some(("rocm".to_owned(), false))
+        );
+    }
+
     #[test]
     fn selects_vulkan_when_rocm_unsupported() {
         let backends = vec![

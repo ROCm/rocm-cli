@@ -331,9 +331,9 @@ jobs:
           # CARGO_TARGET_DIR set above.
           #
           # `--features rocm/e2e-test-hooks` must match what `cargo xtask e2e`
-          # builds when it builds for itself. The suite's deterministic failure
-          # seams (e.g. the scripted Lemonade backend-install failure) are
-          # compiled out without it, so a pre-built binary that omits the feature
+          # builds when it builds for itself. The suite's test seams (e.g. the
+          # simulated host root, ROCM_CLI_TEST_HOST_ROOT) are compiled out
+          # without it, so a pre-built binary that omits the feature
           # leaves those scenarios unable to reach their premise — they then fail
           # as regressions on whichever lane happens to select them. Every lane
           # that pre-builds and exports ROCM_CLI_BINARY must pass it.

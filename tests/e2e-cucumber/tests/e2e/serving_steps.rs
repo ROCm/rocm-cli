@@ -835,10 +835,10 @@ async fn user_serves_vllm_capable_default(world: &mut E2eWorld) {
 
 #[given("Lemonade preparation cannot complete")]
 async fn lemonade_preparation_cannot_complete(world: &mut E2eWorld) {
-    world.command_env.push((
-        "ROCM_E2E_LEMONADE_BACKEND_INSTALL_FAILURE",
-        "repeated".into(),
-    ));
+    // A planted runtime whose `lemonade backends install` always exits
+    // non-zero, on a simulated host with one GPU: the CLI fails at the boundary
+    // a broken install fails at, rather than at a branch compiled into it.
+    world.plant_failing_lemonade_runtime();
 }
 
 #[when("the user serves a model with Lemonade")]
@@ -1155,15 +1155,16 @@ async fn assert_lemonade_preparation_retry_is_bounded(world: &mut E2eWorld) {
         Some(0),
         "serve unexpectedly succeeded:\n{output}"
     );
-    // The scripted failure seam also waives serve's no-GPU pre-flight, so this
-    // refusal can only appear when the seam is compiled out. Name that cause:
-    // otherwise a lane that pre-builds `rocm` without the feature reports a
-    // baffling "no retry announcement" instead of its real misconfiguration.
+    // The pre-flight counts the GPU planted under the simulated host root, which
+    // only an `e2e-test-hooks` build honours. Name that cause: otherwise a lane
+    // that pre-builds `rocm` without the feature reports a baffling "no retry
+    // announcement" instead of its real misconfiguration.
     assert!(
         !output.contains("no usable AMD GPU detected"),
-        "serve stopped at the no-GPU pre-flight, so the binary under test was \
-         built without the `rocm/e2e-test-hooks` feature and never reached \
-         Lemonade preparation. E2E lanes that pre-build `rocm` and export \
+        "serve stopped at the no-GPU pre-flight, so the binary under test did not \
+         see the GPU planted under ROCM_CLI_TEST_HOST_ROOT and never reached \
+         Lemonade preparation. It was probably built without the \
+         `rocm/e2e-test-hooks` feature: E2E lanes that pre-build `rocm` and export \
          ROCM_CLI_BINARY must pass `--features rocm/e2e-test-hooks`, matching \
          what `cargo xtask e2e` builds for itself:\n{output}"
     );

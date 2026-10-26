@@ -1246,6 +1246,51 @@ serve_timeout_secs = 90
         }
     }
 
+    /// `serve-18`'s gate decides which lanes exercise Lemonade's preparation
+    /// retry, so it is pinned against the REAL tag line: a tag edit must fail a
+    /// test rather than quietly move the scenario.
+    ///
+    /// It runs on every Linux lane, GPU or not -- the harness plants the GPU the
+    /// pre-flight needs under a simulated host root -- which keeps the cadence
+    /// the old compiled-in seam gave it on the GPU-less every-PR lane. It must
+    /// not run on Windows, where the host root re-roots nothing and `rocm serve`
+    /// does not notice a managed engine dying at startup (#467).
+    #[test]
+    fn the_lemonade_recovery_scenario_runs_on_every_linux_lane_and_not_on_windows() {
+        let feature = include_str!("../features/model_serving.feature");
+        let m = Expectations::default();
+        let decl = ScenarioDecl::from_tags(&feature_tags(
+            feature,
+            "serve-lemonade-preparation-recovery",
+        ));
+        let gpu_less_linux = HostCapability {
+            gfx_target: None,
+            has_amd_gpu: false,
+            amd_gpu_count: Some(0),
+            platform_slug: "mock".into(),
+            ..cap("strix-ubuntu")
+        };
+        for (host, capability) in [
+            ("GPU-less Linux", gpu_less_linux),
+            ("strix-ubuntu", cap("strix-ubuntu")),
+            ("mi300x", cap("mi300x")),
+            ("wsl2", cap("wsl2")),
+        ] {
+            assert_eq!(
+                resolve(&decl, &capability, &m, Included::default()),
+                Expectation::ExpectPass,
+                "{host} must run serve-18"
+            );
+        }
+        assert!(
+            matches!(
+                resolve(&decl, &cap("strix-windows"), &m, Included::default()),
+                Expectation::Skip { .. }
+            ),
+            "Windows must skip serve-18"
+        );
+    }
+
     /// The single-GPU skip must name the count, not just repeat the `@requires-gpu`
     /// reason: on Strix Halo a GPU *is* present, so "none detected" would send a
     /// reader of the report looking for a missing device that is right there.

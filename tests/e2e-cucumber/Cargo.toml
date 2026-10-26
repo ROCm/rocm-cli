@@ -33,6 +33,13 @@ path = "src/bin/fake-uv.rs"
 name = "fake-python"
 path = "src/bin/fake-python.rs"
 
+# Stand-in for a Lemonade runtime's `lemonade` and `lemond` executables, planted
+# by the serve-preparation-recovery scenario so Lemonade's backend install fails
+# at a real child process rather than at a seam compiled into the engine.
+[[bin]]
+name = "fake-lemonade"
+path = "src/bin/fake-lemonade.rs"
+
 [dependencies]
 axum.workspace = true
 cucumber = { version = "0.23", features = ["output-json", "output-junit"] }
@@ -81,6 +88,11 @@ rocm-core = { path = "../../crates/rocm-core" }
 # virtual clock that sleeps advance exactly, not the host timer, whose
 # granularity varies by platform (about 15.6 ms on Windows).
 tokio = { workspace = true, features = ["test-util"] }
+# The pinned Lemonade version, so the planted Lemonade runtime's `env_id` is
+# derived from the same constant `rocm` builds its expected runtime id from,
+# rather than a copy a version bump would silently invalidate. Used only by the
+# `e2e` test target, so a dev edge, which `xtask check-crate-edges` exempts.
+rocm-deps = { path = "../../crates/rocm-deps" }
 
 # `fcntl(F_GETFL)` only, to read (never modify) the `O_NONBLOCK` state of the
 # suite's own stdio for the diagnostics log (see `src/harness_diagnostics.rs`).
