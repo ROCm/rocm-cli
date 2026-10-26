@@ -1818,11 +1818,28 @@ impl WindowsExamineInventory {
 }
 
 impl ExamineSummary {
+    /// The full host summary, including the Windows display driver version and
+    /// date. Everything that prints the summary, or serializes it for a client
+    /// (`rocm examine`, the MCP and bridge snapshots), wants this one.
     pub fn gather() -> Result<Self> {
+        Self::gather_scoped(true)
+    }
+
+    /// The host summary without the Windows driver version and date, for a
+    /// caller that reads neither. On an AMD Windows host that skips the
+    /// PowerShell video-controller query `gather` adds for them; the GPU
+    /// target, CPU, RAM and every other field are the same.
+    pub fn gather_without_driver_facts() -> Result<Self> {
+        Self::gather_scoped(false)
+    }
+
+    fn gather_scoped(driver_facts: bool) -> Result<Self> {
         let paths = AppPaths::discover()?;
-        // Summary callers show the driver version and date. Startup and engine
-        // selection use the fast inventory without this extra fact query.
-        let windows_inventory = detect_windows_examine_inventory_with_driver_facts();
+        let windows_inventory = if driver_facts {
+            detect_windows_examine_inventory_with_driver_facts()
+        } else {
+            detect_windows_examine_inventory()
+        };
         let wsl = detect_wsl_summary();
         let detected_gfx_target = detect_examine_gfx_target_fast(windows_inventory.as_ref());
         let compatible_therock_family = detected_gfx_target
@@ -5241,6 +5258,29 @@ Class Name:                Display
         );
         // The behaviour that follows: no version, so nothing to flag or print.
         assert_eq!(inventory.amd_display_driver_info(), None);
+    }
+
+    /// `gather_without_driver_facts` is `gather` minus the driver version and
+    /// date: the GPU target a caller reads is the same, and it never carries a
+    /// driver record the full summary lacks. That it starts no PowerShell query
+    /// for them is the `the_startup_paths_do_not_start_the_driver_fact_query`
+    /// test, which counts the sources the same scope runs.
+    #[test]
+    fn the_summary_without_driver_facts_keeps_the_gpu_target() {
+        let full = ExamineSummary::gather().expect("full summary");
+        let lean = ExamineSummary::gather_without_driver_facts().expect("lean summary");
+        assert_eq!(lean.os, full.os);
+        assert_eq!(lean.detected_gfx_target, full.detected_gfx_target);
+        assert_eq!(
+            lean.compatible_therock_family,
+            full.compatible_therock_family
+        );
+        assert!(
+            lean.driver.windows.is_none() || lean.driver.windows == full.driver.windows,
+            "{:?} vs {:?}",
+            lean.driver.windows,
+            full.driver.windows
+        );
     }
 
     #[test]

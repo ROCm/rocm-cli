@@ -1538,7 +1538,8 @@ enum HostGpu {
 }
 
 fn detect_host_gpu() -> HostGpu {
-    match ExamineSummary::gather() {
+    // Reads only the GPU target, so it skips the driver version and date query.
+    match ExamineSummary::gather_without_driver_facts() {
         Ok(summary) if summary.detected_gfx_target.is_some() => HostGpu::Detected,
         Ok(_) => HostGpu::Absent,
         Err(error) => HostGpu::NotVerified(format!("{error:#}")),
