@@ -1979,10 +1979,18 @@ async fn assert_examine_reports_driver_version_and_date(world: &mut E2eWorld) {
         .unwrap_or_default();
     assert!(!version.is_empty(), "{record:#}");
     assert_eq!(field_value(text, "driver_version"), Some(version), "{text}");
+    // A version with no date would map to "unknown", and the age steps of this
+    // scenario, `diagnose-41` and `driver-install-04` would all stay green on
+    // it. The probe reads the date from the same device record as the
+    // version, so on the lane it must be there.
     let date = record
         .get("date")
         .and_then(serde_json::Value::as_str)
-        .unwrap_or("<unknown>");
+        .unwrap_or_default();
+    assert!(
+        date.len() == 10 && date.as_bytes()[4] == b'-' && date.as_bytes()[7] == b'-',
+        "a driver version was read but no yyyy-MM-dd date came with it: {record:#}"
+    );
     assert_eq!(field_value(text, "driver_date"), Some(date), "{text}");
 }
 
