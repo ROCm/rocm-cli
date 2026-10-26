@@ -667,3 +667,22 @@ Feature: Interactive dashboard
     Then the warning text is no longer displayed
     When the user quits the dashboard
     Then the dashboard exits successfully
+
+  # ROCMAI-196: the instance detail modal's "recent throughput" panel is
+  # fed from the dashboard's snapshot history, which the demo replay cannot
+  # exercise (demo instances report a constant positive gen_tps with no
+  # observation). The scripted-metrics managed model gives it real
+  # non-zero scraped ticks, so the populated rows are reachable here. The
+  # no-data/idle placeholder wording and the short-terminal collapse are
+  # pinned by render tests in `ui/tabs/instances.rs`.
+  @id:dash-instance-detail-recent-throughput @requires-os:linux
+  Scenario: dash-39 - Instance detail lists recent throughput samples for a serving model
+    Given a managed model exposes scripted serving metrics
+    When the user opens the dashboard
+    And the user opens the Observe view
+    Then positive generation throughput is displayed for the managed model
+    When the user opens instance detail
+    Then instance details are displayed
+    And the instance detail lists recent throughput samples
+    When the user quits the dashboard
+    Then the dashboard exits successfully

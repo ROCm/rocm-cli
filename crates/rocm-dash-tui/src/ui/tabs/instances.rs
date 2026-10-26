@@ -14,7 +14,7 @@ use ratatui::widgets::{Cell, Paragraph, Row, Table, Wrap};
 
 use rocm_dash_core::metrics::{Instance, InstanceStatus, ObservationFreshness};
 
-use crate::app::{AppState, ConnState, HISTORY_CAP, KeyAction, ScrollTarget};
+use crate::app::{AppState, ConnState, KeyAction, ScrollTarget};
 use crate::ui::format;
 use crate::ui::modal::{centered_rect, draw_popup_frame, grey_overlay};
 use crate::ui::panel::{self, BoxRole};
@@ -335,12 +335,11 @@ pub(crate) struct ActivityRow {
     pub(crate) tpot_ms: Option<f64>,
 }
 
-/// Scan `history` (oldest-to-newest) for the most recent ticks where
+/// Scan `history` (oldest-to-newest) for the most recent snapshot ticks where
 /// `container_id` had non-zero generation throughput — i.e. was actually
-/// serving, not idle. The live "gen:" gauge in `render_summary` already
-/// covers the steady-state idle case (ROCMAI-196: "Gen mostly shows 0 tok/s
-/// with minor spikes"), so idle ticks would only dilute this list; only the
-/// spikes are worth surfacing. Returns up to `cap` rows, newest first.
+/// serving, not idle. These are per-tick samples, not discrete serving runs.
+/// The live "gen:" gauge in `render_summary` already covers the idle case, so
+/// idle ticks are skipped. Returns up to `cap` rows, newest first.
 /// Pure — exposed for tests.
 pub(crate) fn recent_activity_rows(
     history: &std::collections::VecDeque<rocm_dash_core::metrics::Snapshot>,
@@ -735,6 +734,11 @@ pub fn draw_detail(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) -
     // otherwise this fixed-height panel starves `Min(0)` down to 0 and the body's
     // scrollbar silently stops rendering while the footer's hint still fires.
     let activity_h = activity_h.min(inner.height.saturating_sub(4 + 1 + BODY_FLOOR));
+    // A box too short for its header plus one row (or the placeholder line)
+    // would read as an empty table, or render nothing at all and swallow the
+    // placeholder; collapse it entirely so the body gets the rows instead.
+    let min_h = if activity.is_empty() { 3 } else { 4 };
+    let activity_h = if activity_h < min_h { 0 } else { activity_h };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -759,11 +763,11 @@ pub fn draw_detail(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) -
     max_scroll
 }
 
-/// Renders the "recent throughput" panel: the last few ticks where the
-/// instance recorded non-zero throughput, each with tok/s + TTFT/TPOT at
-/// that time — the "rolling summary of recent serving runs" from ROCMAI-196.
-/// Named distinctly from the Home tab's "Activity · node" panel (jobs/actions
-/// feed) so the two aren't mistaken for the same concept.
+/// Renders the "recent throughput" panel: the last few snapshot ticks where
+/// the instance recorded non-zero throughput, each with tok/s + TTFT/TPOT at
+/// that time (partial coverage of ROCMAI-196; no token counts). Named
+/// distinctly from the Home tab's "Activity · node" panel (jobs/actions feed)
+/// so the two aren't mistaken for the same concept.
 fn render_recent_activity(
     f: &mut Frame,
     area: Rect,
@@ -787,7 +791,7 @@ fn render_recent_activity(
         let msg = if has_observed_throughput {
             "no recent throughput — instance has been idle".to_string()
         } else {
-            format!("no throughput data in the last {HISTORY_CAP}s")
+            "no throughput data observed yet".to_string()
         };
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
@@ -2513,8 +2517,12 @@ mod tests {
         .unwrap();
         let out = buffer_text(&term);
         assert!(
-            out.contains("no throughput data"),
+            out.contains("no throughput data observed yet"),
             "detail with no observed sample must not claim 'idle'; got:\n{out}"
+        );
+        assert!(
+            !out.contains("240"),
+            "must not claim an observation window it never had; got:\n{out}"
         );
         assert!(
             !out.contains("has been idle"),
@@ -2677,6 +2685,80 @@ mod tests {
             out.contains('█'),
             "overflowing body must still render a scrollbar thumb on a short \
              terminal even with a full activity panel; got:\n{out}"
+        );
+        // The panel must never render as a bare header over an empty table:
+        // either its data rows are visible or it is collapsed away.
+        assert!(
+            !out.contains("TOK/S") || out.contains("105"),
+            "short terminal must not show a header-only activity panel; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn detail_modal_activity_row_shows_ttft_and_tpot_in_their_own_columns() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let inst = mk_inst_obs("ttft-tpot-detail", Some(0.0), None);
+        let mut state = state_with_snap(inst.clone());
+        let mut burst = inst;
+        burst.gen_tps = Some(86.0);
+        burst.ttft_ms = Some(123.0);
+        burst.tpot_ms = Some(45.0);
+        let mut snap = mk_snap(vec![burst]);
+        snap.timestamp = Utc.timestamp_opt(SNAP_SECS - 30, 0).unwrap();
+        state.history.push_back(snap);
+
+        let mut term = Terminal::new(TestBackend::new(160, 48)).unwrap();
+        term.draw(|f| {
+            draw_detail(f, f.area(), &state, &state.theme);
+        })
+        .unwrap();
+        let out = buffer_text(&term);
+        let row = out
+            .lines()
+            .find(|l| l.contains("30s ago"))
+            .unwrap_or_else(|| panic!("no activity row; got:\n{out}"));
+        let fields: Vec<&str> = row.split_whitespace().collect();
+        let at = fields.iter().position(|f| *f == "ago").unwrap();
+        assert_eq!(
+            fields.get(at + 2).copied(),
+            Some("123ms"),
+            "TTFT column; row: {row}"
+        );
+        assert_eq!(
+            fields.get(at + 3).copied(),
+            Some("45ms"),
+            "TPOT column; row: {row}"
+        );
+    }
+
+    #[test]
+    fn detail_modal_shows_no_data_placeholder_when_history_has_only_non_finite_samples() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let inst = mk_inst_obs("inf-detail", None, None);
+        let mut state = state_with_snap(inst.clone());
+        let mut inf = inst;
+        inf.gen_tps = Some(f64::INFINITY);
+        let mut snap = mk_snap(vec![inf]);
+        snap.timestamp = Utc.timestamp_opt(SNAP_SECS - 30, 0).unwrap();
+        state.history.push_back(snap);
+
+        let mut term = Terminal::new(TestBackend::new(160, 48)).unwrap();
+        term.draw(|f| {
+            draw_detail(f, f.area(), &state, &state.theme);
+        })
+        .unwrap();
+        let out = buffer_text(&term);
+        assert!(
+            out.contains("no throughput data observed yet"),
+            "non-finite samples are not observations; got:\n{out}"
+        );
+        assert!(
+            !out.contains("has been idle"),
+            "must not claim idle from non-finite samples; got:\n{out}"
         );
     }
 }

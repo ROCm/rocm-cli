@@ -1710,6 +1710,25 @@ async fn instance_details_displayed(world: &mut E2eWorld) {
         .unwrap_or_else(|e| panic!("instance details did not appear: {e}"));
 }
 
+#[then("the instance detail lists recent throughput samples")]
+async fn detail_lists_recent_throughput_samples(world: &mut E2eWorld) {
+    // A populated row carries an "Ns ago" age; the placeholders ("no
+    // throughput data observed yet" / "has been idle") do not, and the panel
+    // title alone would also be present on them.
+    session(world)
+        .wait_for_screen_where(
+            "the detail modal's recent throughput panel lists an 'Ns ago' row",
+            |screen| {
+                screen.contains("recent throughput")
+                    && screen.contains(" ago")
+                    && !screen.contains("no throughput data")
+            },
+            default_timeout(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("recent throughput samples never appeared: {e}"));
+}
+
 #[then("the instance detail footer shows the scroll hint")]
 async fn detail_footer_shows_scroll_hint(world: &mut E2eWorld) {
     session(world)
