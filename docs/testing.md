@@ -1414,6 +1414,23 @@ The plain proposal history test verifies that `/automations` and
 server/artifact details, and approve/reject controls instead of raw backend
 action or restricted-tool names.
 
+Automation history stores (events, audit, proposals):
+
+```bash
+cargo test -p rocm-core automation::tests
+```
+
+These cover the three JSONL stores in
+[automation.rs](../crates/rocm-core/src/automation.rs): concurrent writers
+across threads and processes losing no records, size-based rotation of the
+event and audit logs under the same lock (no record lost or duplicated while
+writers rotate, recent reads spanning the rollover, a failed rotation still
+keeping the record, lock-free readers never reading a file twice or skipping a
+generation), and proposal compaction keeping every pending proposal, the
+newest reviewed ones, and legacy proposal ids. The user-visible side is
+`automations-06` and `automations-07` in
+[automations.feature](../tests/e2e-cucumber/features/automations.feature).
+
 Natural-language plan handoff tests:
 
 ```bash

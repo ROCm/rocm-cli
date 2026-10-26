@@ -164,6 +164,33 @@ Invoke-RestMethod `
   http://127.0.0.1:18080/automation-events
 ```
 
+## History And Retention
+
+Automations keep three local histories under the rocm-cli data directory
+(`~/.rocm` by default):
+
+- `automations/events.jsonl`: what each watcher did.
+- `audit/events.jsonl`: the audit log, written by both `rocm` and `rocmd`.
+- `automations/proposals.jsonl`: review requests and their status.
+
+The event log and the audit log are capped by size. When one reaches 8 MiB,
+the next write renames it to `events.jsonl.1` (shifting an existing `.1` to
+`.2`, and so on) and starts a new file. Four rotated files are kept, so each
+log holds at most about 40 MiB; the oldest is deleted by the next rotation.
+With the `gpu-metrics` watcher enabled, the busiest writer, that is roughly
+two months of history; without it, considerably more. `rocm automations` and
+the dashboard read across the rotated files, so recent activity stays visible
+right after a rotation.
+
+A log that already grew past 8 MiB before this cap existed is rotated aside
+whole, so it can take up to four more rotations before that oversized file is
+deleted and the log falls under the cap.
+
+Review requests are never rotated away, because a pending request must stay
+available to approve or reject. Instead, approving or rejecting a request
+trims the history: every pending request is kept, along with the 200 most
+recently reviewed ones, and older reviewed requests are removed.
+
 ## Artifact Prefetch Action
 
 The reviewed artifact-prefetch action keeps downloads disabled unless the caller
