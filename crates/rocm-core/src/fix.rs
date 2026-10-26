@@ -3158,6 +3158,15 @@ mod tests {
         assert_eq!(recipe.applies_on[0].os, "windows");
         assert_eq!(recipe.applies_on[0].class, FixClass::PrintOnly);
         assert!(recipe.rationale.contains("not established"));
+        // The rationale spells the cutoff out in prose; it must name the same
+        // day as the constant the comparison uses.
+        let cutoff = crate::windows_driver::FIRST_HIP_SDK_FOR_WINDOWS;
+        assert_eq!(
+            (cutoff.year, cutoff.month, cutoff.day),
+            (2023, 7, 27),
+            "the cutoff moved: update the \"27 July 2023\" prose in this recipe, README.md,              skills/rocm-doctor/reference.md, docs/testing.md and docs/manual-testing.md"
+        );
+        assert!(recipe.rationale.contains("27 July 2023"));
         // The literal URL in the commands is the shared constant.
         let url_line = format!("#   {}", crate::windows_driver::AMD_SUPPORT_URL);
         assert!(recipe.commands.contains(&url_line.as_str()));
