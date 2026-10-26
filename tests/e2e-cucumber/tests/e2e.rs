@@ -167,6 +167,10 @@ pub struct E2eWorld {
     /// reads the record, but a real `rocm services stop e2e-mock --yes` would
     /// then signal the harness process itself.
     pub recorded_process: Option<std::process::Child>,
+    /// Whether the Doctor report preview in the dashboard console was the CLI's
+    /// refusal envelope (it carries a `refused` key). Recorded when the preview
+    /// is read, so a later step can check the card against what the CLI said.
+    pub dash_report_refused: Option<bool>,
 }
 
 /// One scenario's resolved expectation plus the identity needed to report it.
@@ -319,6 +323,7 @@ impl Default for E2eWorld {
             skill_reference: None,
             skill_symptom: None,
             recorded_process: None,
+            dash_report_refused: None,
         }
     }
 }

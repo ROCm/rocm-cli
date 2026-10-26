@@ -694,7 +694,8 @@ pub(crate) fn handle_key(
         KeyCode::Char('w') if current == ActiveTab::Observe => KeyAction::OpenServeWizard,
         // Engine manager: use/install/reinstall serving engines.
         KeyCode::Char('e') if current == ActiveTab::Observe => KeyAction::OpenEngineManager,
-        // Examine: read-only environment check.
+        // Examine: environment check, plus a Doctor report that is sent only
+        // after approval.
         KeyCode::Char('d') if current == ActiveTab::Observe => KeyAction::OpenExamine,
         // Update: check/preview/apply ROCm package updates.
         KeyCode::Char('u') if current == ActiveTab::Observe => KeyAction::OpenUpdate,

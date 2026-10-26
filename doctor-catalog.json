@@ -264,6 +264,10 @@
         {
           "os": "linux",
           "class": "print-only"
+        },
+        {
+          "os": "wsl",
+          "class": "print-only"
         }
       ],
       "needs_sudo": false,

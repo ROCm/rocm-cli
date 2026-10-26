@@ -2,6 +2,8 @@
 //
 // SPDX-License-Identifier: MIT
 
+#[cfg(test)]
+mod advised_commands;
 /// Shared archive generator and filesystem oracle for the extraction property
 /// tests in `comfyui` and `therock`.
 #[cfg(all(test, unix))]
@@ -237,16 +239,17 @@ enum Command {
         /// architecture check.
         #[arg(long, conflicts_with = "distro")]
         report: bool,
-        /// Also offer the prefilled issue form, so the report can be filed.
+        /// Also offer a prefilled mail, so the report can be sent.
         ///
-        /// Still sends nothing. This opens the form with the same content
-        /// `--report` printed, already filled in; it reaches the tracker only
-        /// when you submit it yourself. On a machine with no desktop, or one
-        /// reached over SSH, the link is printed instead of opened.
+        /// Still sends nothing. This opens a mail to ROCmCLI@amd.com with the
+        /// same content `--report` printed, already filled in; it leaves your
+        /// machine only when you send it yourself. On a machine with no
+        /// desktop, or one reached over SSH, the link is printed instead of
+        /// opened.
         ///
         /// Requires `--report`, so the content is always shown before the
-        /// form is offered. Not combinable with `--json`, which is for
-        /// scripts, and a script is not a person who can read a form.
+        /// mail is offered. Not combinable with `--json`, which is for
+        /// scripts, and a script is not a person who can read and send a mail.
         #[arg(long, requires = "report", conflicts_with = "json")]
         send: bool,
     },
@@ -352,11 +355,14 @@ enum Command {
         #[arg(long)]
         allow_mutation: bool,
     },
-    /// [preview] Send a one-shot chat prompt to a configured assistant provider.
+    /// [preview] Chat with a configured assistant provider.
     ///
-    /// Reads the prompt from --prompt or, if omitted, from standard input. Use
-    /// `rocm config enable-provider` and `rocm config set-provider-key` first to
-    /// configure a remote provider; the `local` provider talks to a running server.
+    /// In a terminal with no --prompt, opens the interactive chat (switch
+    /// providers there with /provider; --provider, --model, and --tools don't
+    /// apply). With --prompt, or a prompt piped on standard input, sends that one
+    /// prompt and prints the reply. Use `rocm config enable-provider` and
+    /// `rocm config set-provider-key` first to configure a remote provider; the
+    /// `local` provider talks to a running server.
     #[command(after_help = "EXAMPLES:\n  \
 rocm chat --prompt \"Explain ROCm in one sentence\"\n  \
 rocm chat --provider local --model qwen --prompt \"Hello\"\n  \
@@ -368,7 +374,8 @@ echo \"Summarize this\" | rocm chat --provider anthropic")]
         /// Model name to request from the provider, such as qwen.
         #[arg(long)]
         model: Option<String>,
-        /// Prompt to send. If omitted, rocm-cli reads from standard input when possible.
+        /// Prompt to send. If omitted, a terminal opens the interactive chat and
+        /// piped input is read from standard input.
         #[arg(long)]
         prompt: Option<String>,
         /// Sampling temperature to send with the request (>= 0.0). Higher is more random.
@@ -6755,34 +6762,6 @@ pub(crate) fn render_services_json(paths: &AppPaths, all: bool) -> Result<String
     Ok(output)
 }
 
-fn render_services_tool_result_text(records: &[ManagedServiceRecord]) -> String {
-    let mut output = String::new();
-    let _ = writeln!(output, "managed_services: {}", records.len());
-    let _ = writeln!(
-        output,
-        "status_meaning: ready/running = running; starting/recovering = starting; failed/stopped = not running; no matching row = not managed by ROCm CLI"
-    );
-    if records.is_empty() {
-        let _ = writeln!(output, "services: none");
-        return output;
-    }
-    let _ = writeln!(output, "services:");
-    for record in records {
-        let _ = writeln!(
-            output,
-            "  - service_id={} engine={} model={} canonical_model={} status={} running_state={} endpoint={}",
-            record.service_id,
-            record.engine,
-            record.model_ref,
-            record.canonical_model_id,
-            record.status,
-            chat::managed_service_running_state(&record.status),
-            record.endpoint_url
-        );
-    }
-    output
-}
-
 pub(crate) fn render_service_logs_text(paths: &AppPaths, service_id: &str) -> Result<String> {
     render_service_logs_text_with_options(paths, service_id, true)
 }
@@ -12362,12 +12341,30 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn out_of_scope_commands_are_marked_preview_in_help() {
+        let help = Cli::command().render_long_help().to_string();
+        for command in ["chat", "comfyui", "automations"] {
+            let line = help
+                .lines()
+                .find(|line| line.trim_start().starts_with(command))
+                .unwrap_or_else(|| panic!("`{command}` missing from help:\n{help}"));
+            assert!(
+                line.contains("[preview]"),
+                "`{command}` is outside the Tech Preview scope and must say so:\n{line}"
+            );
+        }
+    }
+
+    #[test]
     fn runtimes_help_uses_the_runtime_noun_throughout() {
         // `comfyui install`'s selection errors steer the user to `rocm runtimes`
         // and say "ROCm runtime". The help for the command they land on must use
         // the same noun — including its own about line, which `rocm runtimes
         // --help` prints above the subcommand list and which the rename missed
-        // while every subcommand below it already said "runtime".
+        // while every subcommand below it already said "runtime". The approval
+        // modal raised by a mutating `rocm runtimes …` from chat says the same
+        // noun too, but clap doesn't render that title — see
+        // `chat::tests::runtimes_activate_approval_modal_uses_the_runtime_noun`.
         let help = Cli::command()
             .find_subcommand_mut("runtimes")
             .expect("runtimes subcommand")
@@ -12381,39 +12378,6 @@ pub(crate) mod tests {
             !help.contains("ROCm install"),
             "`rocm runtimes --help` must not reintroduce the `ROCm install` noun:\n{help}"
         );
-
-        // The help is not the only `runtimes` string a user reads: running a
-        // mutating `rocm runtimes …` from chat raises an approval modal whose
-        // title is written here, not by clap, so the help assertions above
-        // cannot reach it. It said "Change ROCm install" until this rename.
-        let action = chat::chat_rocm_command_action_from_args(vec![
-            "runtimes".to_owned(),
-            "activate".to_owned(),
-            "some-runtime-key".to_owned(),
-        ])
-        .expect("a mutating runtimes command classifies");
-        let chat::ChatRocmCommandAction::Approval { pending_title, .. } = action else {
-            panic!("`rocm runtimes activate` must require approval, got {action:?}");
-        };
-        assert!(
-            pending_title.contains("runtime") && !pending_title.contains("install"),
-            "the `runtimes` approval modal must use the `runtime` noun, got {pending_title:?}"
-        );
-    }
-
-    #[test]
-    fn out_of_scope_commands_are_marked_preview_in_help() {
-        let help = Cli::command().render_long_help().to_string();
-        for command in ["chat", "comfyui", "automations"] {
-            let line = help
-                .lines()
-                .find(|line| line.trim_start().starts_with(command))
-                .unwrap_or_else(|| panic!("`{command}` missing from help:\n{help}"));
-            assert!(
-                line.contains("[preview]"),
-                "`{command}` is outside the Tech Preview scope and must say so:\n{line}"
-            );
-        }
     }
 
     #[test]
@@ -16878,32 +16842,6 @@ pub(crate) mod tests {
         let found = existing_live_managed_service(&paths, "lemonade", "qwen-canonical");
         let _ = fs::remove_dir_all(root);
         assert!(found.is_none());
-    }
-
-    #[test]
-    fn services_tool_result_text_includes_running_interpretation() {
-        let (_root, paths) = test_paths("services-tool-text");
-        let mut record = ManagedServiceRecord::new(
-            &paths,
-            "svc-vllm",
-            "vllm",
-            "Qwen/Qwen3.5",
-            "Qwen/Qwen3.5",
-            "127.0.0.1",
-            11435,
-            "managed",
-            std::process::id(),
-            Some("therock-release".to_owned()),
-            None,
-            Some("gpu_required".to_owned()),
-        );
-        record.status = "ready".to_owned();
-
-        let rendered = render_services_tool_result_text(&[record]);
-
-        assert!(rendered.contains("status_meaning: ready/running = running"));
-        assert!(rendered.contains("engine=vllm"));
-        assert!(rendered.contains("running_state=running"));
     }
 
     #[test]

@@ -101,6 +101,11 @@ pub(crate) struct VllmRocmDiscoverBuild {
     /// match takes the newest, i.e. the rebuild for some *other* row's torch.
     /// [`DiscoverVersion::Series`] is only safe on an index that serves one
     /// build per series.
+    ///
+    /// An [`DiscoverVersion::Exact`] torchaudio is also the hardware-verified
+    /// build for the row's ROCm line, and `rocm install sdk` pins it too, via
+    /// [`verified_torchaudio_release`]: set one only for a build confirmed to
+    /// load against the row's torch on real hardware, never as a guess.
     torchaudio_version: DiscoverVersion,
 }
 
@@ -122,6 +127,7 @@ const VLLM_ROCM_DISCOVER_BUILD_TABLE: &[VllmRocmDiscoverBuild] = &[
         // rejects. Left as-is rather than pinned blind -- which torchaudio
         // rebuild pairs with 10.0's torch 2.12 needs a live 10.0 box to
         // establish, and this row has no coverage on the self-hosted lanes.
+        // `rocm install sdk` reads this field too: see `torchaudio_version`.
         torchaudio_version: DiscoverVersion::Series("2.11"),
     },
     VllmRocmDiscoverBuild {
@@ -155,7 +161,8 @@ const VLLM_ROCM_DISCOVER_BUILD_TABLE: &[VllmRocmDiscoverBuild] = &[
         // box: torch 2.13.0+rocm10.1.0 exports both symbols as `T`, and
         // torchaudio 2.11.0.2 imports them as `U`); a series match would
         // resolve the newest, `2.11.0.3`, so pin the lower of the two
-        // confirmed-working builds instead.
+        // confirmed-working builds instead. `rocm install sdk` pins this same
+        // build for the 10.1 line: see `torchaudio_version`.
         torchaudio_version: DiscoverVersion::Exact("2.11.0.2"),
     },
 ];
@@ -179,6 +186,19 @@ pub(crate) fn vllm_rocm_discover_build(
     VLLM_ROCM_DISCOVER_BUILD_TABLE
         .iter()
         .find(|build| rocm_sdk_series_matches(rocm_sdk_version, build.rocm_sdk_version))
+}
+/// The torchaudio release confirmed on hardware for `rocm_sdk_version`'s ROCm
+/// `major.minor` line: the row's [`DiscoverVersion::Exact`] torchaudio, if it
+/// has one. `None` for a line with no row, or whose row still matches a series,
+/// because nothing has verified which build of that series works.
+///
+/// Read by `rocm install sdk` as well as by this crate's discovery, so the SDK
+/// and its vLLM install pin the same torchaudio from this one table.
+pub(crate) fn verified_torchaudio_release(rocm_sdk_version: &str) -> Option<&'static str> {
+    match vllm_rocm_discover_build(rocm_sdk_version)?.torchaudio_version {
+        DiscoverVersion::Exact(release) => Some(release),
+        DiscoverVersion::Series(_) => None,
+    }
 }
 /// Whether `recorded` (a runtime manifest's live `rocm_sdk.__version__` probe)
 /// and `table_key` (a literal key in [`VLLM_ROCM_DISCOVER_BUILD_TABLE`]) share
@@ -2004,6 +2024,20 @@ mod tests {
         // An unpublished line must not borrow another line's wheels.
         assert!(vllm_rocm_discover_build("10.2.0").is_none());
         assert!(vllm_rocm_discover_build("7.2.3").is_none());
+    }
+    /// Only an exact torchaudio pin counts as verified: the 10.1 row's
+    /// `2.11.0.2` is, the 10.0 row's `2.11` series is not, and a line with no
+    /// row has nothing to offer. `rocm install sdk` reads this same answer.
+    #[test]
+    fn verified_torchaudio_release_is_only_an_exact_row_pin() {
+        assert_eq!(verified_torchaudio_release("10.1.0"), Some("2.11.0.2"));
+        assert_eq!(
+            verified_torchaudio_release("10.1.0a20260928"),
+            Some("2.11.0.2")
+        );
+        assert_eq!(verified_torchaudio_release("10.0.0"), None);
+        assert_eq!(verified_torchaudio_release("10.2.0"), None);
+        assert_eq!(verified_torchaudio_release("7.2.3"), None);
     }
     /// An unknown 10.x line fails closed rather than silently resolving the
     /// static table's 7.2.3 pin, which is the whole point of keeping
