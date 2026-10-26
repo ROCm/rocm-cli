@@ -63,8 +63,9 @@
 //! `engine_request`; `parse_engine_recipe_json_arg` is `pub(crate)`, read
 //! from `main.rs`'s `dispatch()` and `services_text.rs`'s `restart_child_argv`.
 //! `app_path_env_vars`/`apply_app_path_env` are `pub(crate)`, read from
-//! `engine_ipc.rs`, and `apply_app_path_env` is also read from `chat.rs`,
-//! `engines_cmd.rs`, `service_launch.rs`, and `services_text.rs`'s
+//! `engine_ipc.rs`, `app_path_env_vars` is also read from `chat.rs`, and
+//! `apply_app_path_env` is also read from `engines_cmd.rs`,
+//! `service_launch.rs`, and `services_text.rs`'s
 //! `restart_internal_managed_service_with`; `app_path_env_var_values`/
 //! `app_path_env_var_refs` are `pub(crate)`, read from `service_launch.rs`
 //! and `services_text.rs`'s `restart_internal_managed_service_with`.

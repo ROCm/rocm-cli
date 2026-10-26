@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT
 
 //! Chat/assistant tool-call support: the chat/MCP-bridge cluster's types
-//! (`ChatRocmCommandAction`, `CommandCapture`, `DeterministicModelRecipe`,
+//! (`ChatRocmCommandAction`, `DeterministicModelRecipe`,
 //! `DeterministicServiceRow`, `DeterministicEngineRow`, and others — all
 //! module-private except `ChatToolApprovalRequest`, reached by
 //! `dash_seam.rs` as `chat_tool_approval_request`'s return type), its
@@ -25,7 +25,7 @@
 //! above.
 
 use crate::automations::{render_automations_text, render_daemon_text};
-use crate::engine_runtime_select::{apply_app_path_env, service_model_names_match};
+use crate::engine_runtime_select::{app_path_env_vars, service_model_names_match};
 use crate::freeform_planner::{
     format_structured_tool_call, infer_engine_from_request, plan_freeform_request_with_context,
     serve_args_request_cpu_device,
@@ -52,16 +52,15 @@ use crate::{chat_host_facts, comfyui, providers, therock};
 use anyhow::{Context, Result, bail};
 use rocm_core::placeholder::empty_as_unknown;
 use rocm_core::{
-    AppPaths, AutomationRuntimeState, DEFAULT_LOCAL_HOST, ExamineSummary, ManagedServiceRecord,
-    RocmCliConfig, builtin_watcher, daemon_binary_path, load_recent_automation_events,
-    runtime_install_root_is_protected,
+    AppPaths, AutomationRuntimeState, CommandCapture, DEFAULT_LOCAL_HOST, ExamineSummary,
+    ManagedServiceRecord, RocmCliConfig, builtin_watcher, command_capture_text,
+    load_recent_automation_events, runtime_install_root_is_protected,
 };
 use rocm_engine_protocol::DEFAULT_LOG_TAIL_LINES;
 use std::fmt::Write as _;
 use std::io::Read as _;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::process::Command as ProcessCommand;
 use std::time::Duration;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -72,28 +71,6 @@ pub(crate) enum ChatRocmCommandAction {
         pending_title: String,
         command_title: String,
     },
-}
-
-#[derive(Debug)]
-struct CommandCapture {
-    pub(crate) argv: Vec<String>,
-    pub(crate) exit_status: i32,
-    pub(crate) stdout: String,
-    pub(crate) stderr: String,
-}
-
-fn command_capture_text(output: &CommandCapture) -> String {
-    if output.stderr.trim().is_empty() {
-        output.stdout.trim().to_owned()
-    } else if output.stdout.trim().is_empty() {
-        format!("stderr:\n{}", output.stderr.trim())
-    } else {
-        format!(
-            "stdout:\n{}\n\nstderr:\n{}",
-            output.stdout.trim(),
-            output.stderr.trim()
-        )
-    }
 }
 
 fn mcp_tool_result_text(value: &serde_json::Value) -> String {
@@ -3623,21 +3600,7 @@ fn run_rocm_capture_for_paths(
     args: &[&str],
     timeout: Duration,
 ) -> Result<CommandCapture> {
-    let rocm_binary = daemon_binary_path()?;
-    let mut command = ProcessCommand::new(&rocm_binary);
-    // Stdio left to `run_with_timeout`, which sets it itself.
-    command.args(args);
-    apply_app_path_env(&mut command, paths);
-    let output = rocm_core::process::run_with_timeout(command, timeout, "process")
-        .with_context(|| format!("failed to run {}", rocm_binary.display()))?;
-    Ok(CommandCapture {
-        argv: std::iter::once(rocm_binary.display().to_string())
-            .chain(args.iter().map(|value| (*value).to_owned()))
-            .collect(),
-        exit_status: output.status.code().unwrap_or(1),
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-    })
+    rocm_core::run_rocm_capture_with_env(args, &app_path_env_vars(paths), timeout)
 }
 
 fn run_rocm_command_for_paths(
@@ -4192,42 +4155,6 @@ mod tests {
             name: "rocm_command".to_owned(),
             arguments: serde_json::json!({ "args": args }),
         }
-    }
-
-    #[test]
-    fn command_capture_text_prefers_stdout_only_when_stderr_is_blank() {
-        let output = CommandCapture {
-            argv: vec!["rocm".to_owned()],
-            exit_status: 0,
-            stdout: "  all good  \n".to_owned(),
-            stderr: "  \n".to_owned(),
-        };
-        assert_eq!(command_capture_text(&output), "all good");
-    }
-
-    #[test]
-    fn command_capture_text_falls_back_to_stderr_when_stdout_is_blank() {
-        let output = CommandCapture {
-            argv: vec!["rocm".to_owned()],
-            exit_status: 1,
-            stdout: "   ".to_owned(),
-            stderr: "boom".to_owned(),
-        };
-        assert_eq!(command_capture_text(&output), "stderr:\nboom");
-    }
-
-    #[test]
-    fn command_capture_text_joins_both_streams_when_present() {
-        let output = CommandCapture {
-            argv: vec!["rocm".to_owned()],
-            exit_status: 1,
-            stdout: "out".to_owned(),
-            stderr: "err".to_owned(),
-        };
-        assert_eq!(
-            command_capture_text(&output),
-            "stdout:\nout\n\nstderr:\nerr"
-        );
     }
 
     #[test]
