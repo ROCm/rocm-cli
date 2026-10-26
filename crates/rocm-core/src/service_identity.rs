@@ -177,9 +177,11 @@ mod tests {
     fn generate_endpoint_api_key_is_random_and_alphanumeric() {
         let key = generate_endpoint_api_key();
         assert_eq!(key.len(), ENDPOINT_API_KEY_LEN);
+        // The message deliberately omits the key: it is a credential, and a
+        // failing assertion's message ends up in CI logs.
         assert!(
             key.chars().all(|c| c.is_ascii_alphanumeric()),
-            "key must be URL-safe alphanumeric, got {key:?}"
+            "key must be URL-safe alphanumeric"
         );
         // Two draws must differ — a constant key would be catastrophic for auth.
         assert_ne!(generate_endpoint_api_key(), generate_endpoint_api_key());
