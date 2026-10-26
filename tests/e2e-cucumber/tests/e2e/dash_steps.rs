@@ -2331,3 +2331,105 @@ async fn gpu_section_reports_binary_units(world: &mut E2eWorld) {
          instead of binary GiB, got:\n{gpu_row}"
     );
 }
+
+// ── Doctor report ──────────────────────────────────────────────────
+
+/// The Diagnose screen's own panel title, drawn by `draw_examine_manager`. It is
+/// on screen exactly while the screen is open, so it proves the screen opened
+/// and, as an absence, that it closed.
+const DIAGNOSE_SCREEN_TITLE: &str = "Examine — environment check";
+
+#[when("the user opens the Diagnose screen")]
+async fn open_diagnose_screen(world: &mut E2eWorld) {
+    // `d` opens it from the Observe tab (`KeyAction::OpenExamine`). Resent until
+    // it takes, for the same reason `open_observe_view` resends: nothing before
+    // this proves the event loop is reading input yet.
+    session(world)
+        .send_until("d", DIAGNOSE_SCREEN_TITLE, default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("failed to open the Diagnose screen: {e}"));
+}
+
+#[when("the user prepares a Doctor report")]
+async fn prepare_doctor_report(world: &mut E2eWorld) {
+    session(world)
+        .send("p")
+        .unwrap_or_else(|e| panic!("failed to ask for a Doctor report: {e}"));
+}
+
+#[then("the report is displayed for review")]
+async fn report_displayed_for_review(world: &mut E2eWorld) {
+    let tui = session(world);
+    // Whichever way this machine goes, the command prints one JSON object that
+    // carries a `schema`: the report, or the refusal envelope.
+    tui.wait_for_screen("\"schema\"", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the report preview did not appear: {e}"));
+    // The console's dismiss hint appears only once the job has finished, so
+    // the key that follows cannot land on a job still running.
+    tui.wait_for_screen("Enter/Esc dismiss", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the report preview never finished: {e}"));
+    // What the CLI said, read from its own output on the console: the refusal
+    // envelope is the one with a `refused` key. The card is checked against it
+    // after the console is left.
+    world.dash_report_refused = Some(tui.screen_text().contains("\"refused\""));
+}
+
+#[when("the user leaves the report review")]
+async fn leave_report_review(world: &mut E2eWorld) {
+    let tui = session(world);
+    tui.send("\r")
+        .unwrap_or_else(|e| panic!("failed to leave the report review: {e}"));
+    tui.wait_for_screen("Prepare a Doctor report", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the Diagnose screen did not come back: {e}"));
+}
+
+#[then("the dashboard offers to send a report only if the CLI prepared one")]
+async fn dashboard_offers_send_only_if_the_cli_prepared_one(world: &mut E2eWorld) {
+    let refused = world
+        .dash_report_refused
+        .expect("the preview step records whether the CLI refused");
+    let screen = session(world).screen_text();
+    let ready = screen.contains("A report is ready");
+    let offers_send = screen.contains("· s review & send");
+    // The CLI decides. A report is ready exactly when the CLI printed one, and
+    // the dashboard may offer to send exactly then.
+    assert_eq!(
+        ready, !refused,
+        "the card must say a report is ready exactly when the CLI did not refuse \
+         (CLI refused: {refused}, card ready: {ready}):\n{screen}"
+    );
+    assert_eq!(
+        offers_send, !refused,
+        "send must be offered exactly when the CLI did not refuse \
+         (CLI refused: {refused}, send offered: {offers_send}):\n{screen}"
+    );
+    // A refusal reaches the card as the CLI's own explanation, not as the
+    // dashboard's "could not be read". Every refusal the CLI gives says that no
+    // report was prepared. The card puts the outcome first, so a short terminal
+    // does not cut it off.
+    if refused {
+        assert!(
+            screen.contains("prepared"),
+            "the CLI's explanation did not reach the card:\n{screen}"
+        );
+        assert!(
+            !screen.contains("could not be read"),
+            "a refusal was shown as unreadable output:\n{screen}"
+        );
+    }
+}
+
+#[when("the user closes the Diagnose screen")]
+async fn close_diagnose_screen(world: &mut E2eWorld) {
+    // An open overlay eats the quit key, so a scenario that opened one closes it
+    // before the quit step.
+    let tui = session(world);
+    tui.send("\u{1b}")
+        .unwrap_or_else(|e| panic!("failed to close the Diagnose screen: {e}"));
+    tui.wait_until_gone(DIAGNOSE_SCREEN_TITLE, default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the Diagnose screen is still open after Escape: {e}"));
+}
