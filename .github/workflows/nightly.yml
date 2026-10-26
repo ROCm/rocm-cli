@@ -1578,9 +1578,11 @@ jobs:
       # flattens a single match into the root and loses its name. The list also
       # holds earlier attempts' artifacts, so a re-run that uploads nothing can
       # pass on the first attempt's report: this can miss a lane, but never
-      # flags one that did upload. Every lane carries a `matrix.channel` axis and is
-      # checked through its `release` leg (the matrix context does not exist in
-      # this job), which stands for the whole lane. LANE_REPORTS, and this script's behaviour,
+      # flags one that did upload. Every lane carries a `matrix.channel` axis;
+      # its `release` and `nightly` legs upload separate artifacts and either
+      # can independently die before writing its own, so both are listed and
+      # checked explicitly, comma-separated, rather than reading one leg as a
+      # stand-in for the whole lane. LANE_REPORTS, and this script's behaviour,
       # are pinned by xtask's workflow contract tests. The annotation quotes the
       # lane's `needs` result verbatim; on a `continue-on-error` lane it may read
       # `success` even though the lane failed, so the absent artifact is the
@@ -1592,13 +1594,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           NEEDS: ${{ toJSON(needs) }}
           LANE_REPORTS: |
-            e2e-gpu-nightly=e2e-gpu-release-report
-            e2e-gpu-nightly-rad3=e2e-gpu-rad3-release-report
-            e2e-gpu-nightly-mi350p=e2e-gpu-mi350p-release-report
-            e2e-gpu-nightly-w7900=e2e-gpu-w7900-release-report
-            e2e-gpu-nightly-strix=e2e-gpu-strix-ubuntu-release-report
-            e2e-gpu-nightly-strix-windows=e2e-gpu-strix-windows-release-report
-            e2e-wsl-nightly=e2e-gpu-strix-wsl-release-report
+            e2e-gpu-nightly=e2e-gpu-release-report,e2e-gpu-nightly-report
+            e2e-gpu-nightly-rad3=e2e-gpu-rad3-release-report,e2e-gpu-rad3-nightly-report
+            e2e-gpu-nightly-mi350p=e2e-gpu-mi350p-release-report,e2e-gpu-mi350p-nightly-report
+            e2e-gpu-nightly-w7900=e2e-gpu-w7900-release-report,e2e-gpu-w7900-nightly-report
+            e2e-gpu-nightly-strix=e2e-gpu-strix-ubuntu-release-report,e2e-gpu-strix-ubuntu-nightly-report
+            e2e-gpu-nightly-strix-windows=e2e-gpu-strix-windows-release-report,e2e-gpu-strix-windows-nightly-report
+            e2e-wsl-nightly=e2e-gpu-strix-wsl-release-report,e2e-gpu-strix-wsl-nightly-report
         run: |
           uploaded=$(gh api --paginate \
             "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts" \
@@ -1607,15 +1609,18 @@ jobs:
             exit 1
           }
           missing=0
-          while IFS='=' read -r job artifact; do
+          while IFS='=' read -r job artifacts; do
             [ -n "$job" ] || continue
             result=$(jq -r --arg job "$job" '.[$job].result // "absent"' <<<"$NEEDS")
             [ "$result" = skipped ] && continue
-            if ! grep -qxF "$artifact" <<<"$uploaded"; then
-              echo "::error::lane $job ran (needs result: $result) but uploaded no $artifact, so it is missing from the consolidated report"
-              echo "- :x: \`$job\` ran (needs result: $result) but uploaded no \`$artifact\`; it is missing from the grid above" >> "$GITHUB_STEP_SUMMARY"
-              missing=1
-            fi
+            IFS=',' read -ra wanted <<<"$artifacts"
+            for artifact in "${wanted[@]}"; do
+              if ! grep -qxF "$artifact" <<<"$uploaded"; then
+                echo "::error::lane $job ran (needs result: $result) but uploaded no $artifact, so it is missing from the consolidated report"
+                echo "- :x: \`$job\` ran (needs result: $result) but uploaded no \`$artifact\`; it is missing from the grid above" >> "$GITHUB_STEP_SUMMARY"
+                missing=1
+              fi
+            done
           done <<<"$LANE_REPORTS"
           exit "$missing"
 
@@ -1690,4 +1695,276 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add "$page"
           git commit -m "Update E2E support matrix from nightly run ${GITHUB_RUN_NUMBER}"
+          git push origin HEAD
+
+  # Computes a mechanical GO/NO-GO release-readiness verdict and status table
+  # from this run's own build/E2E results and the commits/known issues since
+  # the last release tag (`cargo xtask release-readiness`). The verdict and
+  # table never depend on the narrative job below, so a failed or skipped
+  # narrative still gets a correct, if less readable, page published.
+  release-readiness-nightly:
+    name: Release readiness (facts + table)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      issues: read
+    needs:
+      - nightly
+      - windows-nightly
+      - e2e-report-nightly
+    if: ${{ !cancelled() }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # `git describe --tags` and the commit range since the last release
+          # tag both need the full history, not the default shallow clone.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+
+      - name: Download consolidated nightly report
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: e2e-consolidated-report-nightly
+          path: consolidated
+
+      - name: Compute release-readiness facts + table
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p release-readiness
+          since_tag=$(git describe --tags --abbrev=0 --match 'v*' --exclude 'v*-*')
+          cargo xtask release-readiness \
+            --since-tag "$since_tag" \
+            --e2e-report consolidated/support-matrix.md \
+            --nightly-result "${{ needs.nightly.result }}" \
+            --windows-result "${{ needs.windows-nightly.result }}" \
+            --e2e-report-job-result "${{ needs.e2e-report-nightly.result }}" \
+            --out release-readiness/facts.json \
+            --table-out release-readiness/table.md
+          cat release-readiness/table.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload release-readiness facts + table
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-readiness-nightly
+          path: release-readiness/
+
+  # Drafts prose (feature/fix summaries, a "Considerations for Next Release"
+  # paragraph) from the facts computed above; never counts, PR numbers, or the
+  # verdict, which stay 100% mechanical. Allowed to fail without blocking the
+  # table from publishing — the next job tolerates a missing narrative.md.
+  #
+  # Needs a Copilot-licensed PAT in the `COPILOT_PAT` secret: the Copilot CLI
+  # that actions/ai-inference shells out to does not accept a bare
+  # `GITHUB_TOKEN`. See .github/prompts/release-readiness-narrative.txt for
+  # the system prompt.
+  release-readiness-narrative:
+    name: Release readiness (narrative)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    permissions:
+      contents: read
+    needs: release-readiness-nightly
+    if: ${{ !cancelled() && needs.release-readiness-nightly.result == 'success' }}
+    steps:
+      # Needed because the prompt below is read from the repo
+      # (system-prompt-file), not just the downloaded facts artifact.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download release-readiness facts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-readiness-nightly
+          path: release-readiness
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+
+      - name: Install GitHub Copilot CLI
+        run: npm install -g @github/copilot@1.0.97
+
+      # `{{var}}`/`file_input` templating only applies to a structured
+      # `.prompt.yml` loaded via `prompt-file` — it is silently ignored for
+      # an inline `prompt:` string, which is what this job uses. Inline the
+      # facts JSON into a step output instead (random delimiter since
+      # facts.json embeds untrusted GitHub issue titles).
+      - name: Read facts for prompt
+        id: facts
+        run: |
+          delimiter="$(openssl rand -hex 8)"
+          {
+            echo "json<<${delimiter}"
+            # The model never needs the mechanical verdict, and must not be
+            # handed one it could echo back as a forged heading. Issues are
+            # already reaction-ranked; the cap keeps the prompt, which reaches
+            # the CLI as one argument, far under Linux's 128 KiB limit.
+            jq 'del(.verdict) | .known_issues |= .[:100]' release-readiness/facts.json
+            echo
+            echo "${delimiter}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Draft narrative
+        id: draft
+        # v3 is a floating major alias with no semver tag yet (only v1.x/
+        # v2.x have one); pinned to v2.1.1 instead per AGENTS.md's
+        # pin-to-full-commit-SHA policy. v2.1.1's default provider is
+        # `github-models`, not `copilot` (v3 flipped the default), so
+        # `provider: copilot` below is required here, not just
+        # documentation.
+        uses: actions/ai-inference@a7805884c80886efc241e94a5351df715968a0ad # v2.1.1
+        env:
+          COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_PAT }}
+        with:
+          provider: copilot
+          # Copilot CLI's --model slugs use dots, not the Anthropic API's
+          # hyphenated IDs. claude-sonnet-4.5 was retired when Claude Sonnet
+          # 5.5 went GA; claude-sonnet-5.5 is the current slug.
+          model: claude-sonnet-5.5
+          system-prompt-file: .github/prompts/release-readiness-narrative.txt
+          prompt: ${{ steps.facts.outputs.json }}
+
+      # `response-file` is an *output* of ai-inference (a path it already
+      # wrote the response to), not an input — write it to the path the next
+      # job expects instead of guessing the action picked that path itself.
+      - name: Save narrative
+        if: always() && steps.draft.outputs.response
+        run: printf '%s\n' "$NARRATIVE" > release-readiness/narrative.md
+        env:
+          NARRATIVE: ${{ steps.draft.outputs.response }}
+
+      - name: Upload narrative
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-readiness-narrative
+          path: release-readiness/narrative.md
+          if-no-files-found: ignore
+
+  # Same branch/repo guard and wiki clone/commit/push as publish-e2e-wiki,
+  # but unlike that job this one also runs (and publishes an explicit
+  # "evidence unavailable" notice) when release-readiness-nightly fails
+  # outright, rather than just skipping and leaving the wiki showing
+  # whatever verdict the last successful run left there.
+  publish-release-readiness-wiki:
+    name: Publish release readiness to wiki
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    needs:
+      - release-readiness-nightly
+      - release-readiness-narrative
+    if: ${{ !cancelled() && needs.release-readiness-nightly.result != 'skipped' && github.repository == 'ROCm/rocm-cli' && github.ref == 'refs/heads/main' }}
+    concurrency:
+      group: publish-release-readiness-wiki
+      cancel-in-progress: false
+    steps:
+      - name: Download release-readiness table
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        # release-readiness-nightly may have failed before writing or
+        # uploading anything (bad `git describe`, `gh issue list` auth
+        # failure, xtask crash); the script below handles a missing
+        # table.md explicitly instead of failing this job on a missing
+        # artifact.
+        continue-on-error: true
+        with:
+          name: release-readiness-nightly
+          path: release-readiness
+
+      - name: Download narrative (if the narrative job produced one)
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        continue-on-error: true
+        with:
+          name: release-readiness-narrative
+          path: release-readiness
+
+      - name: Push page to the wiki
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          COMMIT_URL: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}
+        run: |
+          set -euo pipefail
+          page=Release-Readiness.md
+          if [ ! -f release-readiness/table.md ]; then
+            # release-readiness-nightly failed before writing a table at all
+            # (bad `git describe`, `gh issue list` auth failure, xtask
+            # crash). Publishing nothing here would leave the wiki showing
+            # whatever verdict the last successful run left behind --
+            # possibly a stale GO -- with no indication it's stale.
+            echo "::warning::release-readiness-nightly produced no table this run; publishing a stale-evidence notice instead."
+            {
+              echo "# Release readiness (latest nightly)"
+              echo
+              echo "## Release Readiness — ⚠️ EVIDENCE UNAVAILABLE"
+              echo
+              echo "release-readiness-nightly failed before it could compute a verdict for run [${GITHUB_RUN_NUMBER}](${RUN_URL}), commit [\`${GITHUB_SHA::12}\`](${COMMIT_URL})."
+              echo
+              echo "_No verdict was computed for this run._"
+            } > "/tmp/${page}"
+          elif ! grep -q '^| Area | Evidence | Status |' release-readiness/table.md; then
+            # Same reasoning as publish-e2e-wiki: publish only when the status
+            # table is present, so any degenerate output leaves the last good
+            # page in place.
+            echo "::warning::No status table in the release-readiness output; leaving the wiki page unchanged."
+            exit 0
+          else
+            {
+              echo "# Release readiness (latest nightly)"
+              echo
+              echo "_Overwritten by the nightly workflow; do not edit by hand._"
+              echo
+              echo "- Run: [${GITHUB_RUN_NUMBER}](${RUN_URL})"
+              echo "- Commit: [\`${GITHUB_SHA::12}\`](${COMMIT_URL})"
+              echo "- Date: $(date -u +'%Y-%m-%d %H:%M UTC')"
+              echo
+              cat release-readiness/table.md
+              echo
+              if [ -f release-readiness/narrative.md ]; then
+                echo "## Narrative (drafted by an LLM from public issue and commit text; not the verdict)"
+                echo
+                # The narrative is LLM-drafted from untrusted issue/commit text,
+                # so it may contain copied markdown links/images, reference-style
+                # links, or raw HTML (e.g. an <img> tag). Escaping every `[`/`]`
+                # and `<`/`>` renders all of that as inert text instead of live
+                # markup: unlike a link-stripping regex, this has no nesting
+                # problem, because an escaped bracket can no longer be parsed as
+                # link/image syntax in the first place, however it's nested.
+                # The backslash itself is doubled first, so a narrative
+                # containing a literal `\[` can't smuggle a live link past the
+                # bracket-escaping step by pre-escaping its own brackets.
+                # This does not stop GitHub's bare-URL autolinking (a visible
+                # plain URL, not a disguised link) — an accepted residual gap.
+                # The final expression quotes every line so line-leading `#`,
+                # `|`, `*` and `_` can't forge a top-level verdict heading,
+                # status table, or bold "all gates passed" line.
+                sed -e 's/\\/\\\\/g' -e 's/\[/\\[/g' -e 's/\]/\\]/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/^/> /' release-readiness/narrative.md
+              else
+                echo "_Narrative generation did not complete this run; see the mechanical table above._"
+              fi
+            } > "/tmp/${page}"
+          fi
+
+          wiki="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.wiki.git"
+          # GitHub creates the wiki's git repo only when the first page is
+          # saved in the web UI, so a never-used wiki cannot be cloned or
+          # pushed to. Fail with the prerequisite rather than a bare 128.
+          if ! git clone --depth 1 "$wiki" wiki; then
+            echo "::error::Cannot clone the wiki. If this is the first run, enable the wiki in repo settings and create its first page once in the web UI (GitHub does not create the wiki git repo until then); otherwise it may be a transient network failure, so re-run the job."
+            exit 1
+          fi
+          cp "/tmp/${page}" "wiki/${page}"
+          cd wiki
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$page"
+          git commit -m "Update release readiness from nightly run ${GITHUB_RUN_NUMBER}"
           git push origin HEAD
