@@ -1752,7 +1752,7 @@ fn run_freeform(request: String, approve: bool) -> Result<()> {
         freeform_planner::render_structured_request_plan(&plan, &paths)
     );
     if approve {
-        execute_freeform_next_action(&request, &paths, &config)?;
+        execute_freeform_next_action(plan)?;
     }
     Ok(())
 }
@@ -1896,12 +1896,15 @@ fn should_treat_as_freeform(invocation: &FreeformInvocation) -> bool {
     treat_as_natural_language(&invocation.request_args)
 }
 
-fn execute_freeform_next_action(
-    request: &str,
-    paths: &AppPaths,
-    config: &RocmCliConfig,
-) -> Result<()> {
-    let execution = prepare_freeform_execution(request, paths, config)?;
+/// Takes the `StructuredRequestPlan` the caller already built (and already
+/// rendered to the operator) and dispatches its next action — never rebuilds
+/// it. A second, independent build here could call out to a configured cloud
+/// `planner_provider` a second time; since that call is not guaranteed
+/// deterministic, the plan the operator saw and the plan actually dispatched
+/// could silently diverge. Reusing the one `plan` the caller already has
+/// closes that gap.
+fn execute_freeform_next_action(plan: freeform_planner::StructuredRequestPlan) -> Result<()> {
+    let execution = prepare_freeform_execution(plan)?;
     print!("{}", render_freeform_execution_header(&execution));
 
     let mut argv = vec!["rocm".to_owned()];
@@ -1917,26 +1920,29 @@ fn execute_freeform_next_action(
 /// execution header uses it to tell the operator *why* its `tool_call:` differs
 /// from the one in the request plan above. Looking for the flag in the final
 /// argv would report "added here" for a plan that already carried it.
+#[derive(Debug)]
 pub(crate) struct FreeformExecution {
     pub action: freeform_planner::FreeformPlanAction,
     pub consent_added: bool,
 }
 
 /// Everything `execute_freeform_next_action` decides before it hands the argv to
-/// clap: plan, refuse what must not run unattended, and grant the consent the
-/// outer `--yes` already carries.
+/// clap: derive the next action from the already-built `plan`, refuse what
+/// must not run unattended, and grant the consent the outer `--yes` already
+/// carries.
 ///
 /// Split out so the consent injection is reachable from a test without
 /// dispatching a real install — the header render and the `dispatch` call are
-/// all that is left above it.
+/// all that is left above it. Takes the plan by value rather than rebuilding
+/// it from `request`/`paths`/`config`: the caller already built it once (and
+/// already rendered it to the operator), and a second build is exactly the
+/// bug this signature closes — see `execute_freeform_next_action`'s doc
+/// comment.
 fn prepare_freeform_execution(
-    request: &str,
-    paths: &AppPaths,
-    config: &RocmCliConfig,
+    plan: freeform_planner::StructuredRequestPlan,
 ) -> Result<FreeformExecution> {
-    let mut action =
-        freeform_planner::freeform_plan_next_action_with_context(request, paths, config)
-            .context("natural-language plan did not produce a structured tool call")?;
+    let mut action = freeform_planner::plan_next_action(plan)
+        .context("natural-language plan did not produce a structured tool call")?;
     validate_freeform_execution_action(&action)?;
     let consent_added = apply_freeform_execution_consent(&mut action.args);
     Ok(FreeformExecution {
@@ -12726,8 +12732,13 @@ pub(crate) mod tests {
         let request =
             "install the latest TheRock nightly for this GPU into D:\\ROCm\\therock_venvs";
         let config = RocmCliConfig::default();
+        let paths = test_app_paths();
 
-        let planned = freeform_planner::freeform_plan_next_action(request, &config)
+        // Built exactly once, the way `run_freeform` builds it: the same
+        // `plan` value is checked below and then handed to
+        // `prepare_freeform_execution`, never rebuilt.
+        let plan = freeform_planner::build_freeform_plan_with_context(request, &paths, &config);
+        let planned = freeform_planner::plan_next_action(plan.clone())
             .expect("install request should have next action");
         assert!(
             !planned
@@ -12742,7 +12753,7 @@ pub(crate) mod tests {
         // Through the real pre-dispatch path, not the injector in isolation:
         // `execute_freeform_next_action` is this plus the header render and
         // `dispatch`, so dropping the injection from the pipeline fails here.
-        let execution = prepare_freeform_execution(request, &test_app_paths(), &config)
+        let execution = prepare_freeform_execution(plan)
             .expect("install request should prepare for execution");
         let action = &execution.action;
 
