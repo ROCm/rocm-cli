@@ -697,8 +697,9 @@ The running guard is tested against a ComfyUI answering on its port
 (`starting`).
 
 The e2e scenarios `comfyui-05` to `comfyui-13`
-([comfyui.feature](../tests/e2e-cucumber/features/comfyui.feature), Linux, no
-GPU) cover the same through the built binary: what is kept, replaced and left
+([comfyui.feature](../tests/e2e-cucumber/features/comfyui.feature), no GPU;
+only `comfyui-08`, `-11` and `-12` stay Linux-only, the rest also run on
+Windows) cover the same through the built binary: what is kept, replaced and left
 in place (also when the saved run state is unreadable), a failed download, the
 dry run, a reinstall refused while ComfyUI runs (which the dry run says
 first, and which is refused before anything is downloaded), `start` refusing a half-replaced folder until the command it names is
