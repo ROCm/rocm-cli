@@ -337,6 +337,17 @@ async fn serve_printed_chat_docs_link_opens(world: &mut E2eWorld) {
     .await;
 }
 
+#[then("the API docs link printed when it started opens the server's text-to-speech API docs")]
+async fn serve_printed_tts_docs_link_opens(world: &mut E2eWorld) {
+    let stdout = world.serve_stdout.clone().expect("no serve output");
+    serve_printed_docs_link_opens(
+        &stdout,
+        &["/v1/models", "/v1/audio/speech"],
+        &["/v1/chat/completions", "/v1/audio/transcriptions"],
+    )
+    .await;
+}
+
 #[then("the API docs link printed when it started opens the server's speech-to-text API docs")]
 async fn serve_printed_speech_docs_link_opens(world: &mut E2eWorld) {
     let stdout = world.serve_stdout.clone().expect("no serve output");

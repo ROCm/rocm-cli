@@ -127,7 +127,7 @@ pub(crate) fn render_summary(summary: &DeploymentSummary) -> String {
         ]
     };
 
-    // Token timings describe text generation. A speech-to-text server has none
+    // Token timings describe text generation. A speech server has none
     // to report, and two permanent `n/a` rows would read as a failed
     // measurement; it names its task instead, since its endpoint is not the one
     // chat clients expect.

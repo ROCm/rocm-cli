@@ -561,6 +561,34 @@
       "warnings": [
         "speech-to-text; smallest Whisper model, for quick checks rather than accuracy"
       ]
+    },
+    {
+      "canonical_model_id": "OpenMOSS-TTS",
+      "aliases": [
+        "tts",
+        "moss-tts"
+      ],
+      "task": "speech",
+      "source": "recipe_index",
+      "revision": "main",
+      "loader": "openmoss",
+      "trust_remote_code": false,
+      "dtype": "gguf",
+      "device_policy": "gpu_required",
+      "min_gpu_mem_gb": 14,
+      "recommended_system_ram_gb": 24,
+      "quantization": "GGUF Q8_0; Lemonade OpenMOSS ROCm or Vulkan backend",
+      "artifact_hint": "Lemonade model id resolved and downloaded by the Lemonade engine",
+      "artifacts": [],
+      "engine_recipes": [],
+      "manual_alternatives": [],
+      "chat_template_mode": "none",
+      "preferred_engines": [
+        "lemonade"
+      ],
+      "warnings": [
+        "text-to-speech; serves POST /v1/audio/speech, not chat; a 12.5 GB download"
+      ]
     }
   ]
 }

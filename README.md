@@ -801,8 +801,9 @@ prints a deployment summary: a progress indicator while it starts, then a table
 with the status, the full inference endpoint, a link to the server's API docs
 (see API docs below), the API-qualified model name, and a
 quick smoke test (time to first token and approximate tokens per second; a
-speech-to-text model is checked with a test transcription before it reports
-ready, and its summary names the task instead). Control
+speech-to-text or text-to-speech model is checked with a test transcription or
+one spoken word before it reports ready, and its summary names the task
+instead). Control
 returns to your shell with the server still running; manage it later with `rocm
 services` (below).
 
@@ -828,7 +829,7 @@ The vLLM engine (Instinct) serves
 A safetensors-only id has no GGUF build, so serving it through Lemonade fails
 instead of silently substituting a different model.
 
-#### Speech-to-text models
+#### Speech models
 
 `rocm serve whisper` serves Whisper Large-v3-Turbo through Lemonade
 (`rocm serve whisper-tiny` serves the smallest Whisper model). A
@@ -842,13 +843,21 @@ curl http://127.0.0.1:11435/v1/audio/transcriptions \
   -F model=Whisper-Large-v3-Turbo -F file=@recording.wav
 ```
 
-Lemonade runs Whisper on its ROCm whisper.cpp build, or its Vulkan build when it
-reports ROCm unsupported for the GPU; its CPU build is never selected, and
+`rocm serve tts` serves OpenMOSS-TTS, a text-to-speech model, the same way: it
+answers the OpenAI-compatible `POST /v1/audio/speech` route with audio (ask for
+`"response_format": "wav"` to get a WAV file).
+It is a 12.5 GB download and needs a GPU with about 14 GiB free. Lemonade's
+smaller Kokoro text-to-speech model is not offered, because it runs only on the
+CPU.
+
+Lemonade runs Whisper and OpenMOSS-TTS on its ROCm build, or its Vulkan build
+when it reports ROCm unsupported for the GPU; a CPU build is never selected, and
 `rocm serve` refuses to start without a usable AMD GPU. vLLM serves chat
-models only, so `rocm serve whisper --engine vllm` is refused with the command
-that works. `rocm chat`, the Console chat pane, and `rocm bench load` need a
-chat model: they do not use a speech-to-text server. `rocm chat` and `rocm
-bench load` say so when you name one; the Console chat pane skips it.
+models only, so `rocm serve whisper --engine vllm` (or `tts`) is refused with
+the command that works. `rocm chat`, the Console chat pane, and `rocm bench
+load` need a chat model: they do not use a speech-to-text or text-to-speech
+server. `rocm chat` and `rocm bench load` say so when you name one; the Console
+chat pane skips it.
 
 Some models (such as Llama) are gated and require Hugging Face authentication.
 Log in with `huggingface-cli login` or set `HF_TOKEN` in your environment
@@ -923,8 +932,9 @@ alone, without it):
 ```
 
 The page lists the routes the server answers (the model list, the engine's
-health check, and chat and text completions, or for a speech-to-text server the
-transcription route, whose "Try it out" takes an audio file upload), with
+health check, and chat and text completions; for a speech-to-text server the
+transcription route, whose "Try it out" takes an audio file upload; for a
+text-to-speech server the speech route, whose audio the page offers as a download), with
 request examples already filled in with the served model. "Try it out" sends the request through the
 docs page to the server, so it works for every engine without enabling
 cross-origin access on the server; for a server started with an endpoint key,

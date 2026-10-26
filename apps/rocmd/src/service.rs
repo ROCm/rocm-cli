@@ -918,7 +918,7 @@ fn engine_serve_http_args(
     ));
     args.extend(["--state-path".to_owned(), state_path.display().to_string()]);
     // Omitted for chat so a chat restart keeps the argv it always had; a
-    // speech-to-text service must come back as one.
+    // speech-to-text or text-to-speech service must come back as one.
     if !task.is_chat() {
         args.extend(["--task".to_owned(), task.as_str().to_owned()]);
     }

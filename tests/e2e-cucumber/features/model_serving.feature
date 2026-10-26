@@ -377,3 +377,24 @@ Feature: Model serving
     When the user lists running services
     Then the service is listed as speech-to-text with its transcription endpoint
     And the listed speech-to-text endpoint reaches that server's transcription route
+
+
+  # Text-to-speech on the GPU: Lemonade's OpenMOSS backend (ROCm, or Vulkan
+  # where ROCm is unsupported; it has no CPU build). Nightly because the model
+  # is a 12.5 GB download, which a per-PR lane cannot afford.
+  @id:serve-text-to-speech-model-speaks-on-the-printed-endpoint @requires-gpu @requires-engine:lemonade @nightly @serve-timeout:2400
+  Scenario: serve-29 - A served text-to-speech model speaks on the endpoint the CLI prints
+    Given a managed runtime is active
+    When the user serves a text-to-speech model on Lemonade
+    Then the CLI prints the text-to-speech endpoint of the served model
+    And text sent to that endpoint comes back as spoken audio
+    And the running service is listed as text-to-speech
+    And the API docs link printed when it started opens the server's text-to-speech API docs
+
+  # The text-to-speech counterpart of serve-26: refused before the GPU gate, so
+  # it runs on every lane. The command it recommends is the one serve-29 runs.
+  @id:serve-text-to-speech-model-refused-by-chat-only-engine
+  Scenario: serve-30 - A text-to-speech model sent to a chat-only engine is refused with a working alternative
+    When the user serves a text-to-speech model on an engine that only serves chat
+    Then serving is refused because that engine cannot serve text-to-speech models
+    And the user is told the command that serves the text-to-speech model with Lemonade

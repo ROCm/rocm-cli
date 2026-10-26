@@ -365,6 +365,15 @@ async fn forward(
             let content_type = answer.headers().get(header::CONTENT_TYPE).cloned();
             let mut response = Response::new(Body::from_stream(answer.bytes_stream()));
             *response.status_mut() = status;
+            if let Some(disposition) = content_type
+                .as_ref()
+                .and_then(|value| value.to_str().ok())
+                .and_then(audio_attachment)
+            {
+                response
+                    .headers_mut()
+                    .insert(header::CONTENT_DISPOSITION, disposition);
+            }
             if let Some(content_type) = content_type {
                 response
                     .headers_mut()
@@ -388,6 +397,24 @@ async fn forward(
         )
             .into_response(),
     }
+}
+
+/// A `Content-Disposition` that makes Swagger UI offer an audio answer as a
+/// download. Without it Swagger renders an audio player pointed back at the
+/// request URL, which re-sends it as a `GET` the speech route does not answer,
+/// so the audio the server made could be neither played nor saved.
+fn audio_attachment(content_type: &str) -> Option<HeaderValue> {
+    let media_type = content_type.split(';').next()?.trim().to_ascii_lowercase();
+    let subtype = media_type.strip_prefix("audio/")?;
+    let extension = match subtype {
+        "wav" | "x-wav" | "wave" | "vnd.wave" => "wav",
+        "mpeg" | "mp3" => "mp3",
+        "x-flac" | "flac" => "flac",
+        "ogg" | "opus" | "aac" => subtype,
+        "l16" | "pcm" => "pcm",
+        _ => "audio",
+    };
+    HeaderValue::from_str(&format!("attachment; filename=\"speech.{extension}\"")).ok()
 }
 
 /// The part of `/services/<id>/api/<path>` after `api/`, still percent-encoded.
@@ -422,6 +449,8 @@ struct RouteDoc {
     summary: &'static str,
     description: &'static str,
     body: RouteBody,
+    /// What the server answers with.
+    answer_type: &'static str,
 }
 
 /// What a route's request carries, as "Try it out" should offer it.
@@ -449,6 +478,7 @@ fn routes_for(record: &ManagedServiceRecord) -> Vec<RouteDoc> {
             path: health_path,
             summary: "Check the server is up",
             description: "Answers 200 once the server accepts requests.",
+            answer_type: "application/json",
             body: RouteBody::None,
         },
         RouteDoc {
@@ -457,6 +487,7 @@ fn routes_for(record: &ManagedServiceRecord) -> Vec<RouteDoc> {
             summary: "List the served models",
             description: "OpenAI-compatible model list. The `id` of each entry is the \
                           `model` value requests use.",
+            answer_type: "application/json",
             body: RouteBody::None,
         },
     ];
@@ -469,7 +500,17 @@ fn routes_for(record: &ManagedServiceRecord) -> Vec<RouteDoc> {
             description: "OpenAI-compatible speech-to-text. Upload an audio file as `file` \
                           (WAV is accepted by every backend); the answer's `text` is the \
                           transcript.",
+            answer_type: "application/json",
             body: RouteBody::AudioUpload,
+        }),
+        ModelTask::Speech => routes.push(RouteDoc {
+            method: HttpMethod::Post,
+            path: "/v1/audio/speech",
+            summary: "Speak text",
+            description: "OpenAI-compatible text-to-speech. The answer is the spoken `input` \
+                          as a WAV file, which the page offers to download.",
+            answer_type: "audio/wav",
+            body: RouteBody::Json(speech_example),
         }),
         // A task this build does not know: only the routes every server has.
         ModelTask::Unknown => {}
@@ -485,6 +526,7 @@ fn chat_routes() -> [RouteDoc; 2] {
             summary: "Chat completion",
             description: "OpenAI-compatible chat completion. Set `stream` to `true` to \
                           receive server-sent events as tokens are generated.",
+            answer_type: "application/json",
             body: RouteBody::Json(chat_completion_example),
         },
         RouteDoc {
@@ -492,6 +534,7 @@ fn chat_routes() -> [RouteDoc; 2] {
             path: "/v1/completions",
             summary: "Text completion",
             description: "OpenAI-compatible text completion of a raw prompt.",
+            answer_type: "application/json",
             body: RouteBody::Json(completion_example),
         },
     ]
@@ -516,6 +559,14 @@ fn audio_upload_schema(model: &str) -> ObjectBuilder {
                 .default(Some(json!(model))),
         )
         .required("model")
+}
+
+fn speech_example(model: &str) -> Value {
+    json!({
+        "model": model,
+        "input": "Hello from ROCm.",
+        "response_format": "wav",
+    })
 }
 
 fn chat_completion_example(model: &str) -> Value {
@@ -564,7 +615,7 @@ fn service_openapi(record: &ManagedServiceRecord) -> OpenApi {
                 "200",
                 ResponseBuilder::new()
                     .description("The server's answer")
-                    .content("application/json", ContentBuilder::new().build()),
+                    .content(route.answer_type, ContentBuilder::new().build()),
             );
         let request_body = match route.body {
             RouteBody::None => None,
@@ -742,6 +793,7 @@ mod tests {
             for task in [
                 ModelTask::Chat,
                 ModelTask::Transcription,
+                ModelTask::Speech,
                 ModelTask::Unknown,
             ] {
                 let mut server = record(&paths, "svc-1", engine, 9);
@@ -758,6 +810,28 @@ mod tests {
             }
         }
         fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn audio_answers_are_offered_as_downloads() {
+        assert_eq!(
+            audio_attachment("audio/wav").unwrap(),
+            "attachment; filename=\"speech.wav\""
+        );
+        assert_eq!(
+            audio_attachment("audio/mpeg; charset=binary").unwrap(),
+            "attachment; filename=\"speech.mp3\""
+        );
+        assert_eq!(
+            audio_attachment("Audio/WAV").unwrap(),
+            "attachment; filename=\"speech.wav\""
+        );
+        assert_eq!(
+            audio_attachment("audio/L16; rate=24000").unwrap(),
+            "attachment; filename=\"speech.pcm\""
+        );
+        assert!(audio_attachment("application/json").is_none());
+        assert!(audio_attachment("text/plain").is_none());
     }
 
     #[test]
@@ -871,6 +945,30 @@ mod tests {
     }
 
     #[test]
+    fn text_to_speech_docs_offer_the_speech_route_answering_with_audio() {
+        let (root, paths) = temp_app_paths("api-docs-speech");
+        let mut tts = record(&paths, "svc-tts", "lemonade", 9);
+        tts.task = ModelTask::Speech;
+        tts.canonical_model_id = "OpenMOSS-TTS".to_owned();
+        let openapi = serde_json::to_value(service_openapi(&tts)).unwrap();
+        let mut listed = operation_paths(&openapi);
+        listed.sort();
+        assert_eq!(listed, ["/v1/audio/speech", "/v1/health", "/v1/models"]);
+        let speech = &openapi["paths"]["/v1/audio/speech"]["post"];
+        assert_eq!(
+            speech["requestBody"]["content"]["application/json"]["example"]["model"],
+            "OpenMOSS-TTS"
+        );
+        assert!(
+            speech["responses"]["200"]["content"]
+                .get("audio/wav")
+                .is_some(),
+            "the answer is documented as audio: {speech:#}"
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn keyed_server_docs_ask_for_the_endpoint_key() {
         let (root, paths) = temp_app_paths("api-docs-keyed");
         let mut keyed = record(&paths, "svc-1", "vllm", 9);
@@ -935,24 +1033,32 @@ mod tests {
         );
     }
 
+    /// What the stand-in text-to-speech route answers: binary, not UTF-8.
+    const SPOKEN_WAV: &[u8] = b"RIFF\x24\x00\x00\x00WAVEfmt \xff\x00\x80";
+
     /// A stand-in model server that echoes what reached it, so the test can
     /// see exactly what the forwarder passed on.
     async fn start_echo_model_server() -> u16 {
         let listener = TcpListener::bind((DEFAULT_LOCAL_HOST, 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let app = Router::new().route(
-            "/v1/chat/completions",
-            post(|headers: HeaderMap, uri: Uri, body: Bytes| async move {
-                Json(json!({
-                    "query": uri.query(),
-                    "authorization": headers
-                        .get(header::AUTHORIZATION)
-                        .and_then(|value| value.to_str().ok()),
-                    "cookie": headers.get(header::COOKIE).and_then(|value| value.to_str().ok()),
-                    "body": String::from_utf8_lossy(&body),
-                }))
-            }),
-        );
+        let app = Router::new()
+            .route(
+                "/v1/chat/completions",
+                post(|headers: HeaderMap, uri: Uri, body: Bytes| async move {
+                    Json(json!({
+                        "query": uri.query(),
+                        "authorization": headers
+                            .get(header::AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok()),
+                        "cookie": headers.get(header::COOKIE).and_then(|value| value.to_str().ok()),
+                        "body": String::from_utf8_lossy(&body),
+                    }))
+                }),
+            )
+            .route(
+                "/v1/audio/speech",
+                post(|| async { ([(header::CONTENT_TYPE, "audio/wav")], SPOKEN_WAV) }),
+            );
         tokio::spawn(async move { axum::serve(listener, app).await.ok() });
         port
     }
@@ -1146,6 +1252,39 @@ mod tests {
                 .map(|response| response.status())
         })?;
         assert_eq!(status, StatusCode::OK, "try-it went to the proxy");
+        server.stop();
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn spoken_audio_comes_through_the_docs_intact_and_as_a_download() -> Result<()> {
+        let (root, paths) = temp_app_paths("api-docs-speech-forward");
+        paths.ensure()?;
+        fs::create_dir_all(paths.services_dir())?;
+        let model_port = start_echo_model_server().await;
+        let mut tts = record(&paths, "svc-tts", "lemonade", model_port);
+        tts.task = ModelTask::Speech;
+        tts.write()?;
+        let server = start_api_docs_server(paths.clone(), 0)?;
+
+        let answer = test_client()
+            .post(format!(
+                "{}/services/svc-tts/api/v1/audio/speech",
+                server.base_url
+            ))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(r#"{"model":"Qwen/Qwen3.5","input":"hi"}"#)
+            .send()
+            .await?;
+        assert_eq!(answer.status(), StatusCode::OK);
+        assert_eq!(answer.headers()[header::CONTENT_TYPE], "audio/wav");
+        assert_eq!(
+            answer.headers()[header::CONTENT_DISPOSITION],
+            "attachment; filename=\"speech.wav\""
+        );
+        assert_eq!(answer.bytes().await?.as_ref(), SPOKEN_WAV);
+
         server.stop();
         fs::remove_dir_all(root).ok();
         Ok(())

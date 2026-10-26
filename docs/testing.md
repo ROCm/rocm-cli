@@ -333,8 +333,8 @@ through them is transcribed.
 
 The link `rocm serve` itself prints, and a try-it request through it to a real
 engine, are checked by the GPU serve canaries `serve-05` (vLLM) and `serve-07`
-(Lemonade), and for a speech-to-text server by `serve-27`, which only run on
-GPU lanes. On Linux Lemonade lanes `serve-07` is
+(Lemonade), for a speech-to-text server by `serve-27`, and for a text-to-speech
+server by the nightly `serve-29`, all of which only run on GPU lanes. On Linux Lemonade lanes `serve-07` is
 an expected failure for an unrelated known issue, so there a broken docs link
 would not turn the lane red: the Lemonade check is effective on the Windows
 Lemonade lanes, and `serve-05` on the vLLM lanes.
@@ -1945,25 +1945,34 @@ The gate itself is held by unit tests in
 neighbours) and by the Windows manual check in
 [manual-testing.md](manual-testing.md), in the Ryzen 4000/5000 section.
 
-## Speech-to-text Serving
+## Speech Serving
 
-Focused coverage for model tasks and speech-to-text serving:
+Focused coverage for model tasks, speech-to-text and text-to-speech serving:
 
 ```bash
 cargo test -p rocm-core model_task
 cargo test -p rocm-core speech_to_text
+cargo test -p rocm-core speech
 cargo test -p rocm-engine-protocol capabilities_from_an_engine_without_tasks
-cargo test -p rocm-engine-lemonade speech::
+cargo test -p rocm-engine-lemonade speech
 cargo test -p rocm-engine-vllm refuse_a_speech_to_text_model
-cargo test -p rocm --bin rocm speech_to_text
+cargo test -p rocm --bin rocm speech
 cargo test -p rocm-dash-tui speech_to_text
+cargo test -p rocmd text_to_speech
 ```
 
-The user-facing behaviour is in `serve-26` to `serve-28`, `chat-10`, and
-`bench-07`. All but `serve-27` run on every lane: `serve-26` needs no server at
-all, and the others run against a mock speech-to-text server. `serve-27` serves
-Whisper-Tiny on a real GPU and needs the Lemonade GPU lanes
-(`@requires-gpu @requires-engine:lemonade`).
+`cargo test -p rocm-core speech` includes the probe timing: a text-to-speech
+probe's longer budget, and that a failed one is not retried before twice that
+budget has passed.
+
+The user-facing behaviour is in `serve-26` to `serve-28` and `serve-30`,
+`chat-10`, `chat-11`, `bench-07`, and the nightly text-to-speech scenario
+`serve-29`. All but `serve-27` and `serve-29` run against mock servers (or none,
+for `serve-26` and `serve-30`) with no GPU; `chat-11` drives the interactive chat pane and so runs
+on the Linux lanes only. `serve-27` serves Whisper-Tiny on a real GPU and needs
+the Lemonade GPU lanes (`@requires-gpu @requires-engine:lemonade`); `serve-29`
+serves OpenMOSS-TTS on those lanes too, but only in the nightly run
+(`E2E_INCLUDE_NIGHTLY=1`), as the model is a 12.5 GB download.
 
 Running a subset with `cargo xtask e2e -- -n <pattern>` bypasses the
 capability filter, so a `@requires-gpu` scenario the pattern matches runs, and

@@ -2,12 +2,13 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! What a served model does: answer chat requests or transcribe speech.
+//! What a served model does: answer chat requests, transcribe speech, or speak
+//! text aloud.
 //!
 //! The task decides which OpenAI-compatible route a server exposes, how its
 //! readiness is probed, and which commands may use it — `rocm chat` and the
-//! dashboard chat pane need a chat model, and a speech-to-text server cannot
-//! stand in for one.
+//! dashboard chat pane need a chat model, and a speech-to-text or text-to-speech
+//! server cannot stand in for one.
 //!
 //! Records written before the task existed carry none, and every model served
 //! then was a chat model, so a missing task deserializes as [`ModelTask::Chat`].
@@ -23,6 +24,8 @@ pub enum ModelTask {
     Chat,
     /// Speech-to-text: `POST /v1/audio/transcriptions`.
     Transcription,
+    /// Text-to-speech: `POST /v1/audio/speech`.
+    Speech,
     /// A task written by a newer rocm-cli or engine plugin that this build does
     /// not know. Kept so that one unfamiliar value degrades only the record or
     /// capability it sits in, instead of failing the whole message: it is not
@@ -38,6 +41,7 @@ impl ModelTask {
         match self {
             Self::Chat => "chat",
             Self::Transcription => "transcription",
+            Self::Speech => "speech",
             Self::Unknown => "unknown",
         }
     }
@@ -48,6 +52,7 @@ impl ModelTask {
         match self {
             Self::Chat => "chat",
             Self::Transcription => "speech-to-text",
+            Self::Speech => "text-to-speech",
             Self::Unknown => "unrecognised",
         }
     }
@@ -59,6 +64,7 @@ impl ModelTask {
         match self {
             Self::Chat => "/chat/completions",
             Self::Transcription => "/audio/transcriptions",
+            Self::Speech => "/audio/speech",
             Self::Unknown => "",
         }
     }
@@ -90,7 +96,10 @@ impl ModelTask {
         match value.trim().to_ascii_lowercase().as_str() {
             "chat" => Ok(Self::Chat),
             "transcription" => Ok(Self::Transcription),
-            other => bail!("unsupported model task `{other}`; expected `chat` or `transcription`"),
+            "speech" => Ok(Self::Speech),
+            other => bail!(
+                "unsupported model task `{other}`; expected `chat`, `transcription`, or `speech`"
+            ),
         }
     }
 }
@@ -118,7 +127,7 @@ mod tests {
 
     #[test]
     fn task_round_trips_through_its_wire_name() {
-        for task in [ModelTask::Chat, ModelTask::Transcription] {
+        for task in [ModelTask::Chat, ModelTask::Transcription, ModelTask::Speech] {
             let json = serde_json::to_string(&task).expect("serialize");
             assert_eq!(json, format!("\"{}\"", task.as_str()));
             assert_eq!(ModelTask::parse(task.as_str()).expect("parse"), task);
@@ -154,5 +163,6 @@ mod tests {
             ModelTask::Transcription.api_route(),
             "/audio/transcriptions"
         );
+        assert_eq!(ModelTask::Speech.api_route(), "/audio/speech");
     }
 }
