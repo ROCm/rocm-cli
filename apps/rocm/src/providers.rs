@@ -2423,10 +2423,13 @@ mod tests {
         paths.ensure()?;
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let port = listener.local_addr()?.port();
-        // Only one response: if `prepare_freeform_execution` rebuilt the plan,
-        // it would need a second one and this server would never see the
-        // request that consumes it, so `server.join()` below would hang
-        // instead of quietly passing.
+        // Only one response: the server's accept loop exits and drops the
+        // listener as soon as it has served that one request, so if
+        // `prepare_freeform_execution` rebuilt the plan, that second
+        // `build_freeform_plan_with_context` call would hit a closed port and
+        // fail fast with a connection error -- surfacing as a different
+        // error than the "reviewed interactively" one asserted below, not as
+        // a hang.
         let bodies = vec![planner_chat_completion_body(
             r#"{"intent":"inspect","tool_call":{"tool":"rocm","args":["examine"]}}"#,
         )];
