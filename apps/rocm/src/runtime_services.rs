@@ -27,7 +27,7 @@ use rocm_core::{AppPaths, ManagedServiceRecord};
 use crate::{
     engine_manages_own_runtime, load_managed_service, load_managed_services,
     managed_service_is_live, restart_internal_managed_service, runtime_manifest_for_selector,
-    therock,
+    shell_quote::shell_quote, therock,
 };
 
 /// Where one live local server stands relative to the runtime being activated.
@@ -286,7 +286,9 @@ pub(crate) fn render_runtime_service_reconciliation(
             let _ = writeln!(
                 output,
                 "    - {} status={} (check `rocm services logs {}` if it does not come up)",
-                entry.service_id, entry.status, entry.service_id
+                entry.service_id,
+                entry.status,
+                shell_quote(&entry.service_id)
             );
         }
     }
@@ -318,8 +320,8 @@ pub(crate) fn render_runtime_service_reconciliation(
         let _ = writeln!(
             output,
             "  note: those keep serving on their recorded runtime until they are restarted; \
-             run `rocm runtimes activate {active_runtime_key} --restart-services --yes` to \
-             move them"
+             run `rocm runtimes activate {} --restart-services --yes` to move them",
+            shell_quote(active_runtime_key)
         );
     }
     output
@@ -684,6 +686,51 @@ mod tests {
     // loads the new runtime.
     // Mutation: rendering `unconfirmed` entries under the `services_restarted`
     // header, or not rendering them, fails these assertions.
+    // The two commands this report offers to be copied name a service id and a
+    // runtime key, so each must split back to exactly the argv it names.
+    // Mutation: interpolating either value bare fails this.
+    #[test]
+    fn the_report_commands_denote_the_argv_they_name() {
+        let awkward_id = "svc 'a' $b";
+        let awkward_key = "rt key;x";
+        let services = RuntimeServiceReconciliation {
+            stale: vec![RuntimeServiceEntry {
+                service_id: "svc-old".to_owned(),
+                engine: "vllm".to_owned(),
+                recorded_runtime: Some("rt-old".to_owned()),
+            }],
+            unconfirmed: vec![unconfirmed(awkward_id, "starting")],
+            ..RuntimeServiceReconciliation::default()
+        };
+
+        let rendered = render_runtime_service_reconciliation(&services, awkward_key);
+        let commands: Vec<Vec<String>> = rendered
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .map(|command| shlex::split(command).expect("a copyable command must parse"))
+            .collect();
+
+        assert_eq!(
+            commands,
+            vec![
+                vec!["rocm", "services", "logs", awkward_id],
+                vec![
+                    "rocm",
+                    "runtimes",
+                    "activate",
+                    awkward_key,
+                    "--restart-services",
+                    "--yes"
+                ],
+            ]
+            .into_iter()
+            .map(|argv| argv.into_iter().map(str::to_owned).collect::<Vec<_>>())
+            .collect::<Vec<_>>(),
+            "{rendered}"
+        );
+    }
+
     #[test]
     fn a_restart_not_yet_serving_is_rendered_apart_from_a_confirmed_one() {
         let services = RuntimeServiceReconciliation {

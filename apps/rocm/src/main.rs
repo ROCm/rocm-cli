@@ -35,6 +35,7 @@ mod serve_cmd;
 mod serve_summary;
 mod service_hints;
 mod service_launch;
+mod shell_quote;
 mod storage;
 #[cfg(test)]
 mod test_support;
@@ -82,6 +83,7 @@ use crate::service_launch::{
     managed_service_process_command,
 };
 use crate::service_launch::{ensure_public_service_has_endpoint_key, is_loopback_host};
+use crate::shell_quote::{has_terminal_control_character, shell_quote};
 use crate::uninstall::uninstall;
 
 use anyhow::{Context, Result, bail};
@@ -4202,7 +4204,8 @@ fn remove_managed_service_record(paths: &AppPaths, service_id: &str, yes: bool) 
     let _ = writeln!(output, "  log: {}", artifacts.log.display());
     let _ = writeln!(
         output,
-        "After this, `rocm services logs {service_id}` and `{}` no longer work.",
+        "After this, `rocm services logs {}` and `{}` no longer work.",
+        shell_quote(service_id),
         service_hints::service_action_hint("restart", service_id)
     );
     let _ = writeln!(output);
@@ -9034,9 +9037,9 @@ fn build_freeform_plan_with_context(
     match resolve_freeform_plan_with_provider(request, paths, config, provider, &deterministic) {
         Ok(plan) => plan,
         Err(error) => {
-            deterministic.notes.push(format!(
-                "Provider-assisted planner `{provider}` could not resolve this request: {error}"
-            ));
+            deterministic
+                .notes
+                .push(planner_failure_note(provider, &error));
             deterministic.notes.push(
                 "No provider-produced tool call was used. Fill the placeholder values or run /chat for help."
                     .to_owned(),
@@ -9044,6 +9047,17 @@ fn build_freeform_plan_with_context(
             deterministic
         }
     }
+}
+
+/// The plan-block note for a provider-assisted planning failure.
+///
+/// The plan block prints notes verbatim, and this error can carry text that
+/// came from the provider — an HTTP failure body, or a value its response
+/// named. The planner's own refusals do not echo a hostile value, but this is
+/// the one place every failure passes through, so it is stripped here too.
+fn planner_failure_note(provider: &str, error: &anyhow::Error) -> String {
+    let error = rocm_core::terminal::strip_terminal_control_sequences(&format!("{error}"));
+    format!("Provider-assisted planner `{provider}` could not resolve this request: {error}")
 }
 
 fn configured_planner_provider(config: &RocmCliConfig) -> Option<&str> {
@@ -9160,12 +9174,28 @@ fn provider_planner_response_to_plan(
         "The provider output was reduced to a validated rocm tool call; no shell command is executed."
             .to_owned(),
     ];
-    notes.extend(
-        response
-            .notes
-            .into_iter()
-            .filter(|note| !note.trim().is_empty()),
-    );
+    // Same reason as the argv above: a note is printed verbatim into the plan
+    // block, so a control character in one lets the planner redraw the lines
+    // around it. Such a note is dropped rather than refused — it is commentary,
+    // and the plan stands without it — but not silently: the count of dropped
+    // notes is reported in a note this code writes.
+    let mut omitted = 0_usize;
+    for note in response.notes {
+        let note = note.trim();
+        if note.is_empty() {
+            continue;
+        }
+        if has_terminal_control_character(note) {
+            omitted += 1;
+            continue;
+        }
+        notes.push(note.to_owned());
+    }
+    if omitted > 0 {
+        notes.push(format!(
+            "{omitted} planner note(s) omitted: they contained terminal control characters."
+        ));
+    }
     Ok(StructuredRequestPlan {
         request: request.trim().to_owned(),
         planner: format!("hybrid-parser-v1 + provider:{provider}"),
@@ -9206,17 +9236,30 @@ fn strip_json_fence(content: &str) -> &str {
 
 fn validate_provider_planner_tool_call(call: &ProviderPlannerToolCall) -> Result<Vec<String>> {
     if call.tool != "rocm" {
+        // Not echoed when it carries a control character: this error ends up
+        // in the plan block's notes, which reach the terminal as bytes.
+        if has_terminal_control_character(&call.tool) {
+            bail!(
+                "provider planner returned an unsupported tool whose name contains a control character"
+            );
+        }
         bail!("provider planner returned unsupported tool `{}`", call.tool);
     }
     if call.args.is_empty() {
         bail!("provider planner returned an empty tool call");
     }
+    // Control characters, not just NUL. These args are rendered straight into
+    // the `request plan` block `rocm <request>` prints to a terminal, and that
+    // block is the only thing the operator reads before re-running with
+    // `--yes`. A `\r` or a CSI sequence in an argument lets the planner's
+    // response decide what that block looks like, independently of the argv it
+    // would run. See `reject_control_characters_in_tool_arguments`.
     if call
         .args
         .iter()
-        .any(|arg| arg.trim().is_empty() || arg.contains('\0'))
+        .any(|arg| arg.trim().is_empty() || has_terminal_control_character(arg))
     {
-        bail!("provider planner returned an invalid empty or NUL argument");
+        bail!("provider planner returned an empty argument or one carrying a control character");
     }
     let argv = std::iter::once("rocm".to_owned())
         .chain(call.args.iter().cloned())
@@ -9270,6 +9313,11 @@ fn planner_intent_from_provider_response(intent: &str, args: &[String]) -> Resul
         "update" => PlannerIntent::Update,
         "uninstall" => PlannerIntent::Uninstall,
         "inspect" | "examine" => PlannerIntent::Inspect,
+        // Not echoed when it carries a control character, for the same reason
+        // as an unsupported tool name in `validate_provider_planner_tool_call`.
+        _ if has_terminal_control_character(intent) => {
+            bail!("provider planner returned an unsupported intent containing a control character")
+        }
         _ => bail!("provider planner returned unsupported intent `{intent}`"),
     };
     if declared != args_intent {
@@ -9463,19 +9511,24 @@ fn infer_device_policy_from_request(lower: &str) -> Option<&'static str> {
     }
 }
 
+/// Render an argv as the command line a human is shown for it.
+///
+/// This is the only thing an operator sees before approving a mutating tool
+/// call, and some of its output (`rocm chat --prompt …`, the `install command:`
+/// line) is offered to be copied and run. So it has to denote the argv it was
+/// built from: quoted with [`shell_quote`], every argument splits back to
+/// itself under a shell's own word-splitting, and nothing inside a value can
+/// read as a second command.
+///
+/// Values carrying terminal control characters never get here — they are
+/// refused at validation ([`shell_quote::has_terminal_control_character`]),
+/// because no amount of quoting stops a `\r` from rewriting the line the
+/// operator is reading.
 fn format_structured_tool_call(tool: &str, args: &[String]) -> String {
     let mut parts = Vec::with_capacity(args.len() + 1);
     parts.push(tool.to_owned());
-    parts.extend(args.iter().map(|arg| quote_tool_arg(arg)));
+    parts.extend(args.iter().map(|arg| shell_quote(arg)));
     parts.join(" ")
-}
-
-fn quote_tool_arg(value: &str) -> String {
-    if value.is_empty() || value.chars().any(char::is_whitespace) {
-        format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
-    } else {
-        value.to_owned()
-    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -14119,7 +14172,9 @@ pub(crate) mod tests {
 
         assert!(action.has_placeholders);
         assert!(error.contains("placeholder values"));
-        assert!(error.contains("rocm serve <model>"));
+        // Quoted: `<` and `>` are redirects, so an unquoted placeholder would
+        // read as a redirect rather than as the value the operator must supply.
+        assert!(error.contains("rocm serve '<model>'"), "{error}");
     }
 
     #[test]
@@ -14169,7 +14224,7 @@ pub(crate) mod tests {
         assert_eq!(
             format_structured_tool_call("rocm", &action.args),
             "rocm install sdk --channel nightly --format wheel --prefix \
-             D:\\ROCm\\therock_venvs --approve-replacing-active-default"
+             'D:\\ROCm\\therock_venvs' --approve-replacing-active-default"
         );
         // The narrow flag, never `--yes`: this surface has no terminal promise to
         // make about a sudo password prompt for system packages.
@@ -15515,6 +15570,44 @@ pub(crate) mod tests {
         assert!(
             rendered.contains(&format!("  log: {}", record.log_path.display())),
             "the log path must be printed before the delete:\n{rendered}"
+        );
+        Ok(())
+    }
+
+    // The two commands the removal says stop working name the service, so
+    // each must split back to exactly that argv for an id that is not one
+    // inert word. Mutation: interpolating the id bare in either fails this.
+    #[test]
+    fn services_remove_names_the_commands_it_disables_as_their_argv() -> Result<()> {
+        let service_id = "svc 'a b'";
+        let (root, paths) = test_paths("services-remove-awkward-id");
+        paths.ensure()?;
+        plant_service_record(&paths, service_id, "failed", 999_999_999)?;
+
+        let rendered = remove_managed_service_record(&paths, service_id, true);
+        let _ = fs::remove_dir_all(&root);
+        let rendered = rendered?;
+
+        let line = rendered
+            .lines()
+            .find(|line| line.starts_with("After this,"))
+            .expect("the removal names the commands it disables");
+        let commands: Vec<Vec<String>> = line
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .map(|command| shlex::split(command).expect("a named command must parse"))
+            .collect();
+        let argv = |words: &[&str]| -> Vec<String> {
+            words.iter().map(|word| (*word).to_owned()).collect()
+        };
+        assert_eq!(
+            commands,
+            vec![
+                argv(&["rocm", "services", "logs", service_id]),
+                argv(&["rocm", "services", "restart", service_id, "--yes"]),
+            ],
+            "{rendered}"
         );
         Ok(())
     }

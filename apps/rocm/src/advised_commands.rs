@@ -1239,7 +1239,7 @@ const NOT_INVOCATIONS: &[(&str, &str, &str)] = &[
     ),
     (
         "apps/rocm/src/service_hints.rs",
-        "rocm services {action} {service_id} --yes",
+        "rocm services {action} {} --yes",
         "the verb is a format argument; every value it takes is checked against the \
          real hint by `service_action_retry_advice_parses_for_generated_ids` (the \
          `run_approved_service_action` verbs) and `every_service_action_hint_verb_parses` \
