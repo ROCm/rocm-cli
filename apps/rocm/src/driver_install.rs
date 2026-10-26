@@ -39,6 +39,13 @@ pub(crate) fn host_install_driver_only_reports() -> bool {
     install_driver_only_reports_on(std::env::consts::OS)
 }
 
+/// Whether `rocm install driver` goes on to run the plan's commands. Pure so
+/// the gate that keeps native Windows from installing anything (its plan is
+/// neither `supported` nor `mutating`) is testable on any host.
+const fn should_execute(plan: &DriverInstallPlan, yes: bool, dry_run: bool) -> bool {
+    yes && !dry_run && plan.supported && plan.mutating
+}
+
 pub(crate) fn install_driver(
     paths: &AppPaths,
     dkms: bool,
@@ -53,7 +60,7 @@ pub(crate) fn install_driver(
     let plan =
         build_driver_install_plan_read(&examine, &os_release, dkms, PrivilegeEscalation::detect());
     let mut output = render_driver_install_plan(&plan, yes, dry_run);
-    if !yes || dry_run || !plan.supported || !plan.mutating {
+    if !should_execute(&plan, yes, dry_run) {
         return Ok(DriverInstallResult {
             output,
             executed: false,
@@ -3123,6 +3130,29 @@ VERSION_ID="41"
         assert!(rendered.contains("could not be read; run `rocm examine`"));
         assert!(rendered.contains("rocm diagnose"));
         assert!(plan.commands.is_empty());
+    }
+
+    /// The gate behind "installs nothing on Windows": approval does not make a
+    /// Windows plan execute, while the same flags do execute a supported,
+    /// mutating plan, so the assertion cannot pass by always returning false.
+    #[test]
+    fn should_execute_never_runs_a_windows_plan() {
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
+        let windows = build_driver_install_plan_read(
+            &test_examine("windows", false),
+            &os_release_found(""),
+            true,
+            PrivilegeEscalation::Sudo,
+        );
+        assert!(!should_execute(&windows, true, false));
+        assert!(!should_execute(&windows, false, false));
+
+        let mut mutating = windows;
+        mutating.supported = true;
+        mutating.mutating = true;
+        assert!(should_execute(&mutating, true, false));
+        assert!(!should_execute(&mutating, false, false));
+        assert!(!should_execute(&mutating, true, true));
     }
 
     fn windows_examine_with_driver(version: &str, date: &str) -> ExamineSummary {
