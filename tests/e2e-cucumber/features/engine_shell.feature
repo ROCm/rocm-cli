@@ -36,6 +36,11 @@ Feature: Engine shell
   # rewritten or deleted along with its expectation row. Only a fix to the hint
   # composition itself makes this row go stale.
   #
+  # The interpreter step is here because the same doubled path also sets a wrong
+  # VIRTUAL_ENV and puts a nonexistent bin/bin on PATH: a fix to the hint text
+  # alone would otherwise flip this row while the shell still runs the wrong
+  # python. The row flips only once the user's actual problem is fixed.
+  #
   # Phrased as "the file it names is there", not as "the path is not doubled": the
   # first survives whichever way the mismatch is repaired, the second would go
   # stale the moment it is.
@@ -44,5 +49,6 @@ Feature: Engine shell
     Given a machine with an engine environment installed the way the engine records it
     When the user opens a shell for that engine
     Then the printed activation hint names a file that exists
+    And the engine environment's interpreter is the one that runs
     When the user leaves the engine shell
     Then the engine shell exits successfully
