@@ -414,6 +414,7 @@ fn spawn_managed_engine_child(
         Some(device_policy_name(device_policy).to_owned()),
     );
     record.gpu_indices = gpu_indices.to_vec();
+    record.served_model_id = resolve.served_model_id.clone();
     record.engine_recipe_json = requested_recipe_json;
     // The flag the user actually passed, carried through rather than re-derived.
     //
@@ -586,7 +587,7 @@ pub(crate) fn start_managed_service(
         engine,
         host,
         port,
-        &resolve.canonical_model_id,
+        resolve.served_model_name(),
         endpoint_api_key,
         Duration::from_secs(45),
         on_wait_tick,
@@ -1217,6 +1218,7 @@ mod tests {
 
         let resolve = ResolveModelResponse {
             canonical_model_id: "qwen-canonical".to_owned(),
+            served_model_id: None,
             task: "chat".to_owned(),
             source: "hf".to_owned(),
             revision: "main".to_owned(),
@@ -1306,6 +1308,7 @@ mod tests {
 
         let resolve = ResolveModelResponse {
             canonical_model_id: "qwen-canonical".to_owned(),
+            served_model_id: None,
             task: "chat".to_owned(),
             source: "hf".to_owned(),
             revision: "main".to_owned(),
@@ -1390,6 +1393,7 @@ mod tests {
 
         let resolve = ResolveModelResponse {
             canonical_model_id: "qwen-canonical".to_owned(),
+            served_model_id: None,
             task: "chat".to_owned(),
             source: "hf".to_owned(),
             revision: "main".to_owned(),

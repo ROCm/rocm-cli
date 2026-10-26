@@ -163,9 +163,9 @@ These modules are private `mod` declarations — [`lib.rs`](../crates/e2e-report
 `engines/aim` runs models as Docker containers instead of a host process:
 
 - [`docker.rs`](../engines/aim/src/docker.rs) — thin wrapper around the `docker` CLI binary; no `bollard`/Docker API dependency.
-- [`registry.rs`](../engines/aim/src/registry.rs) — Docker Hub v2 registry client for AIM image metadata (image ref normalization, tag/digest parsing).
-- [`process.rs`](../engines/aim/src/process.rs) — container run/readiness/stop lifecycle.
-- [`state.rs`](../engines/aim/src/state.rs) — service state file I/O.
+- [`registry.rs`](../engines/aim/src/registry.rs) — AIM image metadata (`Env`/`Labels`): read from the local daemon once the image is pulled, which works for any registry, with a best-effort Docker Hub v2 lookup as a pre-pull hint (image ref normalization, tag/digest parsing). The hint is optional; its failure never blocks a launch.
+- [`process.rs`](../engines/aim/src/process.rs) — container run/readiness/stop lifecycle. `serve_http` is the process rocmd supervises: it blocks for the container's lifetime and records how it ended (`failed` and a non-zero exit for a crash or a vanished container, so recovery runs). A stale container is removed before a re-run, and a stop removes the container so its name and downloaded weights are released.
+- [`state.rs`](../engines/aim/src/state.rs) — service state file I/O, including the model name the container actually serves (`served_model_id`), which differs from the image reference.
 - [`install.rs`](../engines/aim/src/install.rs) — much smaller than vLLM's/Lemonade's `install.rs`: there is no venv, wheel, or runtime archive to manage, only a Docker-reachability check.
 
 [`lib.rs`](../engines/aim/src/lib.rs) keeps only CLI/envelope dispatch.

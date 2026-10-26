@@ -19,10 +19,6 @@ pub enum EngineKind {
     Vllm,
     /// Lemonade Server — JSON `/api/v1/stats`.
     Lemonade,
-    /// AMD Enterprise AI AIM — bundles vLLM, so its `/metrics` surface is
-    /// presumed identical; unconfirmed against a real container until the
-    /// Strix Halo validation pass.
-    Aim,
 }
 
 impl EngineKind {
@@ -31,7 +27,6 @@ impl EngineKind {
         match self {
             Self::Vllm => "vllm",
             Self::Lemonade => "lemonade",
-            Self::Aim => "aim",
         }
     }
 
@@ -41,7 +36,7 @@ impl EngineKind {
     /// unmanaged/external discovery where no registry record exists.
     pub const fn default_port(self) -> u16 {
         match self {
-            Self::Vllm | Self::Aim => 8000,
+            Self::Vllm => 8000,
             Self::Lemonade => crate::lemonade::LEMONADE_PORT, // 13305
         }
     }
@@ -51,18 +46,16 @@ impl EngineKind {
         match label.trim().to_ascii_lowercase().as_str() {
             "vllm" => Some(Self::Vllm),
             "lemonade" => Some(Self::Lemonade),
-            "aim" => Some(Self::Aim),
             _ => None,
         }
     }
 
     /// Parse this engine's raw scrape body into an [`InstanceSample`] using the
     /// engine-appropriate parser. vLLM dispatches to the **unchanged**
-    /// `vllm_prom::parse`; Lemonade to `lemonade::parse_stats`; AIM reuses the
-    /// vLLM parser since AIM images bundle vLLM.
+    /// `vllm_prom::parse`; Lemonade to `lemonade::parse_stats`.
     pub fn parse_sample(self, body: &str) -> InstanceSample {
         match self {
-            Self::Vllm | Self::Aim => crate::vllm_prom::parse(body),
+            Self::Vllm => crate::vllm_prom::parse(body),
             Self::Lemonade => crate::lemonade::parse_stats(body),
         }
     }
@@ -74,7 +67,7 @@ mod tests {
 
     #[test]
     fn engine_kind_labels_and_ports_and_from_label_roundtrip() {
-        for kind in [EngineKind::Vllm, EngineKind::Lemonade, EngineKind::Aim] {
+        for kind in [EngineKind::Vllm, EngineKind::Lemonade] {
             assert_eq!(EngineKind::from_label(kind.label()), Some(kind));
         }
         assert_eq!(EngineKind::Lemonade.default_port(), 13305);

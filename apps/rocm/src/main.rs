@@ -564,11 +564,13 @@ rocm serve qwen --verbose --device gpu_required")]
         /// authenticated too.
         #[arg(long)]
         api_key: Option<String>,
-        /// Extra `KEY=VALUE` environment variable to pass through to the engine's
-        /// own process/container (repeatable). Engine-specific; currently only
-        /// `--engine aim` reads these (e.g. `AIM_PROFILE_ID`). Ignored by engines
-        /// that don't consume engine-env overrides.
-        #[arg(long = "engine-env", value_name = "KEY=VALUE")]
+        /// Extra environment variable for the engine's container (repeatable).
+        /// Engine-specific; currently only `--engine aim` reads these (e.g.
+        /// `AIM_PROFILE_ID=...`) and other engines ignore it. `KEY=VALUE` is
+        /// recorded with the service, so for a secret such as `HF_TOKEN` pass a
+        /// bare `KEY` instead: it is forwarded from your environment and never
+        /// stored.
+        #[arg(long = "engine-env", value_name = "KEY[=VALUE]")]
         engine_env: Vec<String>,
     },
     /// [preview] Install, start, stop, or inspect ComfyUI.
@@ -3189,6 +3191,8 @@ fn assess_model_for_host(
 enum PlatformRuleOut {
     Allowed,
     NativeWindowsVllm,
+    /// AIM's Docker GPU passthrough exists only for Linux and WSL2.
+    NativeWindowsAim,
     AimDockerUnavailable,
 }
 
@@ -3196,6 +3200,8 @@ enum PlatformRuleOut {
 fn engine_ruled_out_by_platform(engine: &str) -> PlatformRuleOut {
     if rocm_core::runtime_is_windows() && engine.eq_ignore_ascii_case("vllm") {
         PlatformRuleOut::NativeWindowsVllm
+    } else if rocm_core::runtime_is_windows() && engine.eq_ignore_ascii_case("aim") {
+        PlatformRuleOut::NativeWindowsAim
     } else if engine.eq_ignore_ascii_case("aim")
         && !rocm_engine_aim::builtin_docker_daemon_reachable()
     {
@@ -3220,7 +3226,7 @@ fn unsupported_here_for(engine: &str, ruled_out: PlatformRuleOut) -> Option<Stri
         PlatformRuleOut::AimDockerUnavailable => Some(format!(
             "{engine} needs a reachable Docker daemon to serve; start Docker or choose a different engine"
         )),
-        PlatformRuleOut::NativeWindowsVllm => Some(format!(
+        PlatformRuleOut::NativeWindowsVllm | PlatformRuleOut::NativeWindowsAim => Some(format!(
             "{engine} has no adapter on native Windows; serve it from WSL or Linux"
         )),
     }
@@ -6100,6 +6106,9 @@ fn model_registry_adapter_availability_note(engine: &str) -> Option<&'static str
         PlatformRuleOut::NativeWindowsVllm => Some(
             "runtime_status=unsupported_native_windows reason=native Windows skipped; use WSL/Linux vLLM ROCm; gpu_execution_required=true; run /engine for adapter details",
         ),
+        PlatformRuleOut::NativeWindowsAim => Some(
+            "runtime_status=unsupported_native_windows reason=native Windows skipped; AIM GPU serving is Linux/WSL2 only; run /engine for adapter details",
+        ),
     }
 }
 
@@ -7377,7 +7386,7 @@ fn restart_internal_managed_service_with(
         &started.engine,
         &started.host,
         started.port,
-        &started.canonical_model_id,
+        started.served_model_name(),
         endpoint_api_key.as_deref(),
         Duration::from_secs(45),
     );
@@ -21118,6 +21127,19 @@ pub(crate) mod tests {
     /// When the platform gate allows an engine, there is nothing to report --
     /// asserted directly against the pure helper, not by relying on whichever
     /// OS this test happens to run on.
+    /// AIM's Docker GPU passthrough only exists on Linux/WSL2, so native
+    /// Windows must be ruled out (the Docker-reachability gate alone would pass
+    /// on Docker Desktop and launch on CPU).
+    #[test]
+    fn unsupported_here_for_names_wsl_for_aim_on_native_windows() {
+        let message = unsupported_here_for("aim", PlatformRuleOut::NativeWindowsAim)
+            .expect("a ruled-out engine gets a message");
+        assert!(
+            message.contains("aim") && message.contains("WSL"),
+            "{message:?}"
+        );
+    }
+
     #[test]
     fn unsupported_here_for_is_none_when_allowed() {
         assert_eq!(unsupported_here_for("vllm", PlatformRuleOut::Allowed), None);

@@ -30,24 +30,6 @@ async fn catalog_lists_aim_recipe(world: &mut E2eWorld) {
     );
 }
 
-#[then("the catalog's AIM entry matches this host's real Docker availability")]
-async fn catalog_aim_entry_matches_docker_availability(world: &mut E2eWorld) {
-    let output = world.cli_output.as_ref().expect("no model catalog output");
-    let aim_available = e2e_cucumber::capability::host_capability().engine_available("aim");
-    if aim_available {
-        assert!(
-            !output.contains("unsupported_docker_unavailable"),
-            "Docker is reachable on this host, so the AIM entry should not be flagged unavailable:\n{output}"
-        );
-    } else {
-        assert!(
-            output.contains("unsupported_docker_unavailable")
-                && output.contains("Docker daemon not reachable"),
-            "Docker is unreachable on this host, so the AIM entry should name the reason:\n{output}"
-        );
-    }
-}
-
 /// Plant a `docker` on `PATH` that always fails, so the catalog's
 /// Docker-unavailable gate is exercised deterministically regardless of
 /// whether this host actually has Docker.

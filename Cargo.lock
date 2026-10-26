@@ -3807,6 +3807,7 @@ dependencies = [
  "rocm-engine-protocol",
  "serde",
  "serde_json",
+ "tempfile",
  "ureq",
 ]
 

@@ -14,21 +14,12 @@ Feature: Model catalog listing
   # unsupported GPU family, or no Docker. Only the Docker check runs at the
   # catalog layer today (see `engine_ruled_out_by_platform` in main.rs);
   # GPU-family fit is a `rocm serve`/`rocm diagnose --model` readiness check,
-  # not a catalog property. This cross-checks against the harness's own Docker
-  # probe rather than hardcoding "unavailable", so it stays honest on a host
-  # (e.g. the Strix Halo AIM runner) where Docker really is reachable.
-  @id:model-catalog-flags-aim-unavailable-without-docker
-  Scenario: model-catalog-02 - Host cannot run a listed AIM image
-    When the user asks for the model catalog in verbose detail
-    Then the catalog's AIM entry matches this host's real Docker availability
-
-  # model-catalog-02 cross-checks the harness's own `docker info` probe, which
-  # only proves the two probes agree, not that the gating logic itself is
-  # correct — it stays green even if the "no Docker" branch were deleted
-  # entirely on a Docker-reachable host. This plants a `docker` that always
-  # fails so the unavailable branch is exercised regardless of host state.
+  # not a catalog property. This plants a `docker` that always fails so the
+  # unavailable branch is exercised deterministically on every host, including
+  # ones where Docker really is reachable (an earlier variant compared against
+  # the host's real Docker state, which asserted a different outcome per host).
   @id:model-catalog-flags-aim-unavailable-with-no-docker-daemon
-  Scenario: model-catalog-03 - AIM image is flagged unavailable with no Docker daemon
+  Scenario: model-catalog-02 - AIM image is flagged unavailable with no Docker daemon
     Given no Docker daemon is reachable
     When the user asks for the model catalog in verbose detail
     Then the catalog's AIM entry is flagged unavailable for lack of Docker

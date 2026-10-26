@@ -1414,17 +1414,16 @@ fn fallback_config_tool_call_for_prompt(normalized: &str) -> Option<providers::C
         });
     }
     if any_substring(normalized, &["default engine", "set engine", "use engine"]) {
-        for engine in ["lemonade", "vllm", "aim"] {
-            if normalized.contains(engine) {
-                return Some(providers::ChatToolCall {
-                    id: Some("fallback-config-default-engine".to_owned()),
-                    name: "rocm_command".to_owned(),
-                    arguments: serde_json::json!({
-                        "args": ["config", "set-default-engine", engine],
-                        "reason": "Change ROCm CLI's default engine after the user approves it."
-                    }),
-                });
-            }
+        // Word-boundary inference: a bare `contains("aim")` matched "aiming".
+        if let Some(engine) = crate::infer_engine_from_request(normalized) {
+            return Some(providers::ChatToolCall {
+                id: Some("fallback-config-default-engine".to_owned()),
+                name: "rocm_command".to_owned(),
+                arguments: serde_json::json!({
+                    "args": ["config", "set-default-engine", engine],
+                    "reason": "Change ROCm CLI's default engine after the user approves it."
+                }),
+            });
         }
     }
     if normalized.contains("telemetry") {
@@ -5415,6 +5414,32 @@ model recipes
             .expect("approval should be built");
         assert_eq!(approval.pending_title, "Change settings");
         assert_eq!(approval.command_title, "Config");
+    }
+
+    #[test]
+    fn default_engine_fallback_matches_aim_only_as_a_word() {
+        let proposed = |prompt: &str| {
+            fallback_config_tool_call_for_prompt(prompt).map(|call| {
+                call.arguments["args"][2]
+                    .as_str()
+                    .expect("engine arg")
+                    .to_owned()
+            })
+        };
+        assert_eq!(
+            proposed("change the default engine to aim").as_deref(),
+            Some("aim")
+        );
+        assert_eq!(
+            proposed("change the default engine to vllm, aiming for low latency").as_deref(),
+            Some("vllm")
+        );
+        assert_eq!(
+            proposed(
+                "change the default engine so I can maintain my claim, aiming for low latency"
+            ),
+            None
+        );
     }
 
     #[test]

@@ -800,13 +800,7 @@ pub fn managed_service_endpoint_model_ready(
     if record.endpoint_url.trim().is_empty() {
         return Ok(false);
     }
-    let expected = if !record.canonical_model_id.trim().is_empty() {
-        Some(record.canonical_model_id.as_str())
-    } else if !record.model_ref.trim().is_empty() {
-        Some(record.model_ref.as_str())
-    } else {
-        None
-    };
+    let expected = Some(record.served_model_name()).filter(|name| !name.trim().is_empty());
     openai_models_endpoint_has_model(&record.endpoint_url, expected, endpoint_api_key, timeout)
 }
 
@@ -880,15 +874,11 @@ pub fn managed_service_endpoint_readiness(
     {
         return outcome(EndpointReadiness::Listing, false);
     }
-    let model_ref = if record.canonical_model_id.trim().is_empty() {
-        record.model_ref.as_str()
-    } else {
-        record.canonical_model_id.as_str()
-    };
+    let model_ref = record.served_model_name().to_owned();
     record.inference_probe_attempted_at_unix_ms = Some(now);
     if !openai_chat_completion_probe(
         &record.endpoint_url,
-        model_ref,
+        &model_ref,
         endpoint_api_key,
         probe_timeout,
     )

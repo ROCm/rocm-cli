@@ -488,19 +488,22 @@ fn parse_gpu_memory_utilization(value: Option<&str>) -> Result<Option<f64>> {
     Ok(Some(parsed))
 }
 
-/// Applies `--engine-env KEY=VALUE` overrides to the engine recipe's `extra_env`
-/// map. Generic by design (not gated to a specific engine): the mechanism exists
-/// so any engine that reads `EngineRecipeHint::extra_env` (currently only
-/// `engines/aim`, for overrides like `AIM_PROFILE_ID`) can accept host-specific
-/// env tweaks without a dedicated flag per variable. A minimal hint is
-/// synthesized when none exists. With no `--engine-env` the hint passes through
-/// unchanged.
+/// Env vars the engine sets itself, which `--engine-env` may not override.
+const RESERVED_ENGINE_ENV_KEYS: [&str; 2] = ["HIP_VISIBLE_DEVICES", "VLLM_API_KEY"];
+
+/// Applies `--engine-env` overrides to the engine recipe's `extra_env` map, for
+/// the one engine that consumes it (`aim`, e.g. `AIM_PROFILE_ID`): `KEY=VALUE`
+/// sets a value, and a bare `KEY` forwards `KEY` from the engine process's own
+/// environment so a secret such as `HF_TOKEN` never lands in argv or the
+/// service record (recorded as an empty value, meaning "forward"). Other engines
+/// ignore the flag (see [`engine_env_ignored_note`]) and get their hint back
+/// unchanged. A minimal hint is synthesized when none exists.
 fn engine_recipe_with_extra_env(
     engine: &str,
     hint: Option<EngineRecipeHint>,
     engine_env: &[String],
 ) -> Result<Option<EngineRecipeHint>> {
-    if engine_env.is_empty() {
+    if engine_env.is_empty() || !engine.eq_ignore_ascii_case("aim") {
         return Ok(hint);
     }
     let mut hint = hint.unwrap_or_else(|| EngineRecipeHint {
@@ -509,11 +512,18 @@ fn engine_recipe_with_extra_env(
         ..EngineRecipeHint::default()
     });
     for entry in engine_env {
-        let (key, value) = entry
-            .split_once('=')
-            .ok_or_else(|| anyhow::anyhow!("--engine-env expects `KEY=VALUE`; got `{entry}`"))?;
-        if key.is_empty() {
-            bail!("--engine-env expects `KEY=VALUE` with a non-empty key; got `{entry}`");
+        let (key, value) = entry.split_once('=').unwrap_or((entry.as_str(), ""));
+        if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            bail!(
+                "--engine-env expects `KEY=VALUE` (or a bare `KEY` to forward it from the \
+                 environment) with a non-empty name of letters, digits and `_`; got `{entry}`"
+            );
+        }
+        if RESERVED_ENGINE_ENV_KEYS.contains(&key) {
+            bail!("--engine-env cannot set `{key}`; rocm-cli manages it for the engine");
+        }
+        if value.contains(['\n', '\r']) {
+            bail!("--engine-env value for `{key}` cannot contain newlines");
         }
         hint.extra_env.insert(key.to_owned(), value.to_owned());
     }
@@ -959,7 +969,7 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
                 // 0600 key file by service id, so the smoke test authenticates
                 // against a protected public endpoint without threading the secret
                 // through here.
-                serve_summary::run_smoke_test(&paths, &resolve.canonical_model_id)
+                serve_summary::run_smoke_test(&paths, resolve.served_model_name())
             } else {
                 serve_summary::SmokeMetrics::default()
             };
@@ -981,7 +991,7 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
             let summary = serve_summary::DeploymentSummary {
                 engine: selected_engine.clone(),
                 requested_model: model,
-                api_model: resolve.canonical_model_id,
+                api_model: resolve.served_model_name().to_owned(),
                 chat_endpoint: format!("{}/chat/completions", report.endpoint_url),
                 service_id: report.service_id.clone(),
                 status: report.status.clone(),
@@ -1131,19 +1141,56 @@ mod tests {
     }
 
     #[test]
-    fn serve_model_ref_for_engine_pins_image_digest_when_set() {
-        let mut recipe = resolve_builtin_model_recipe("qwen32b").expect("qwen32b recipe");
-        let vllm_recipe = recipe
-            .engine_recipes
-            .iter_mut()
-            .find(|engine_recipe| engine_recipe.engine == "vllm")
-            .expect("qwen32b has a vllm engine recipe");
-        vllm_recipe.image_digest = Some("sha256:abcd1234".to_owned());
-
+    fn serve_model_ref_for_engine_pins_the_shipped_aim_image_to_its_digest() {
+        let recipe = resolve_builtin_model_recipe("aim-qwen3.5-9b").expect("aim catalog entry");
+        let pinned = serve_model_ref_for_engine("aim-qwen3.5-9b", Some(&recipe), "aim");
+        let (image, digest) = pinned
+            .split_once('@')
+            .expect("the AIM entry must be pinned");
         assert_eq!(
-            serve_model_ref_for_engine("qwen32b", Some(&recipe), "vllm"),
-            "Qwen/Qwen3-32B-FP8@sha256:abcd1234"
+            image,
+            "amdenterpriseai/aim-radeon-qwen-qwen3-5-9b:0.12.0-preview"
         );
+        assert!(
+            digest.starts_with("sha256:") && digest.len() == "sha256:".len() + 64,
+            "{digest}"
+        );
+        // Other engines are unaffected by the AIM entry's pin.
+        let qwen32b = resolve_builtin_model_recipe("qwen32b").expect("qwen32b recipe");
+        assert_eq!(
+            serve_model_ref_for_engine("qwen32b", Some(&qwen32b), "vllm"),
+            "Qwen/Qwen3-32B-FP8"
+        );
+    }
+
+    #[test]
+    fn catalog_extra_env_reaches_the_aim_hint_and_engine_env_overrides_it() {
+        let recipe = resolve_builtin_model_recipe("aim-qwen3.5-9b").expect("aim catalog entry");
+        let hint = protocol_engine_recipe_hint(&recipe, "aim").expect("aim hint");
+        assert_eq!(
+            hint.extra_env.get("AIM_PROFILE_ID").map(String::as_str),
+            Some("vllm-w7900-bf16-tp1-latency")
+        );
+
+        let overridden = engine_recipe_with_extra_env(
+            "aim",
+            Some(hint),
+            &[
+                "AIM_PROFILE_ID=vllm-other".to_owned(),
+                "HF_TOKEN".to_owned(),
+            ],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            overridden
+                .extra_env
+                .get("AIM_PROFILE_ID")
+                .map(String::as_str),
+            Some("vllm-other"),
+            "`--engine-env` must beat the catalog's value"
+        );
+        assert_eq!(overridden.extra_env.get("HF_TOKEN"), Some(&String::new()));
     }
 
     #[test]
@@ -1722,17 +1769,37 @@ mod tests {
     }
 
     #[test]
-    fn extra_env_rejects_entry_with_no_equals_sign() {
-        let error =
-            engine_recipe_with_extra_env("aim", None, &["AIM_PROFILE_ID".to_owned()]).unwrap_err();
-        assert!(error.to_string().contains("KEY=VALUE"));
+    fn extra_env_bare_key_forwards_from_the_environment_without_recording_a_value() {
+        let hint = engine_recipe_with_extra_env("aim", None, &["HF_TOKEN".to_owned()])
+            .unwrap()
+            .unwrap();
+        assert_eq!(hint.extra_env.get("HF_TOKEN"), Some(&String::new()));
     }
 
     #[test]
-    fn extra_env_rejects_entry_with_empty_key() {
-        let error =
-            engine_recipe_with_extra_env("aim", None, &["=some-value".to_owned()]).unwrap_err();
-        assert!(error.to_string().contains("non-empty key"));
+    fn extra_env_rejects_entry_with_empty_or_malformed_key() {
+        for entry in ["=some-value", "", "BAD KEY=1", "A-B=1"] {
+            let error = engine_recipe_with_extra_env("aim", None, &[entry.to_owned()]).unwrap_err();
+            assert!(error.to_string().contains("KEY=VALUE"), "{entry}: {error}");
+        }
+    }
+
+    #[test]
+    fn extra_env_rejects_reserved_keys_and_newlines() {
+        for entry in ["VLLM_API_KEY=x", "HIP_VISIBLE_DEVICES=0", "VLLM_API_KEY"] {
+            let error = engine_recipe_with_extra_env("aim", None, &[entry.to_owned()]).unwrap_err();
+            assert!(error.to_string().contains("manages it"), "{entry}: {error}");
+        }
+        assert!(engine_recipe_with_extra_env("aim", None, &["A=b\nc".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn extra_env_leaves_the_hint_alone_for_engines_that_ignore_it() {
+        assert_eq!(
+            engine_recipe_with_extra_env("vllm", None, &["FOO=bar".to_owned()]).unwrap(),
+            None,
+            "a flag reported as ignored must not change what the engine is sent"
+        );
     }
 
     #[test]

@@ -24,7 +24,11 @@ pub(crate) fn healthcheck_service(request: HealthcheckRequest) -> Result<Healthc
         .as_ref()
         .and_then(endpoint_url_from_state)
         .unwrap_or_default();
-    let model_ref = state.as_ref().and_then(|s| value_string(s, "model_ref"));
+    // The name the container lists in `/v1/models`, which is not the image ref
+    // `model_ref` holds (see `process::resolve_model_response`).
+    let model_ref = state
+        .as_ref()
+        .and_then(|s| value_string(s, "served_model_id").or_else(|| value_string(s, "model_ref")));
     let state_status = state
         .as_ref()
         .and_then(|s| value_string(s, "status"))
@@ -99,9 +103,12 @@ fn redact_engine_recipe_extra_env(hint: &EngineRecipeHint) -> EngineRecipeHint {
     hint
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn write_running_state(
+    state_path: &Path,
     service_id: &str,
     model_ref: &str,
+    served_model_id: Option<&str>,
     host: &str,
     port: u16,
     device_policy: DevicePolicy,
@@ -114,13 +121,14 @@ pub(crate) fn write_running_state(
     // before writing it to disk while keeping the keys for visibility.
     let engine_recipe = engine_recipe.map(redact_engine_recipe_extra_env);
     write_state(
-        &state_path(service_id),
+        state_path,
         &json!({
             "service_id": service_id,
             "engine": crate::ENGINE_NAME,
             "status": "running",
             "container_name": crate::process::container_name(service_id),
             "model_ref": model_ref,
+            "served_model_id": served_model_id,
             "host": host,
             "port": port,
             "endpoint_url": endpoint,
@@ -129,6 +137,28 @@ pub(crate) fn write_running_state(
             "started_at_unix_ms": current_unix_millis(),
         }),
     )
+}
+
+/// Records the model name the running container actually serves under.
+pub(crate) fn record_served_model_id(state_path: &Path, served_model_id: &str) -> Result<()> {
+    merge_state_field(state_path, "served_model_id", json!(served_model_id))
+}
+
+/// Sets a non-terminal status (`stopping`) without stamping `stopped_at`.
+pub(crate) fn write_status(state_path: &Path, status: &str) -> Result<()> {
+    merge_state_field(state_path, "status", json!(status))
+}
+
+pub(crate) fn read_status(state_path: &Path) -> Option<String> {
+    value_string(&read_service_state(state_path).ok()?, "status")
+}
+
+fn merge_state_field(state_path: &Path, key: &str, value: Value) -> Result<()> {
+    let mut state = read_service_state(state_path).unwrap_or_else(|_| json!({}));
+    if let Some(object) = state.as_object_mut() {
+        object.insert(key.to_owned(), value);
+    }
+    write_state(state_path, &state)
 }
 
 pub(crate) fn write_terminal_state(state_path: &Path, status: &str) -> Result<()> {
@@ -178,6 +208,29 @@ pub(crate) fn query_loaded_model_endpoint(
         endpoint_api_key.as_deref(),
         Duration::from_millis(HEALTHCHECK_TIMEOUT_MS),
     )
+}
+
+/// The first model the endpoint lists, for images that don't label the name
+/// they serve under.
+pub(crate) fn discover_served_model(endpoint_url: &str) -> Option<String> {
+    let endpoint_api_key = rocm_engine_protocol::resolve_endpoint_api_key();
+    let body = rocm_core::http_get_text_with_auth(
+        endpoint_url,
+        "/v1/models",
+        endpoint_api_key.as_deref(),
+        Duration::from_millis(HEALTHCHECK_TIMEOUT_MS),
+    )
+    .ok()?;
+    first_listed_model_id(&body)
+}
+
+fn first_listed_model_id(body: &str) -> Option<String> {
+    serde_json::from_str::<Value>(body.trim())
+        .ok()?
+        .get("data")?
+        .as_array()?
+        .iter()
+        .find_map(|item| value_string(item, "id").filter(|id| !id.trim().is_empty()))
 }
 
 pub(crate) fn query_inference_probe_endpoint(endpoint_url: &str, model_ref: &str) -> Result<bool> {
@@ -275,12 +328,8 @@ mod tests {
 
     #[test]
     fn write_running_state_never_persists_extra_env_secrets_to_disk() {
-        let dir = std::env::temp_dir().join(format!(
-            "rocm-aim-state-secret-test-{}-{}",
-            std::process::id(),
-            current_unix_millis()
-        ));
-        let service_id = format!("svc-secret-{}", current_unix_millis());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("svc-secret.json");
         let hint = EngineRecipeHint {
             contract_version: "0.1.0".to_owned(),
             engine: "aim".to_owned(),
@@ -290,13 +339,11 @@ mod tests {
             )]),
             ..EngineRecipeHint::default()
         };
-        let path = state_path(&service_id);
-        // `write_running_state` always writes under `state_path(service_id)`, which
-        // lives outside `dir`; only `dir` is cleaned up below, matching the other
-        // tests in this module that leave the real state dir alone.
         write_running_state(
-            &service_id,
+            &path,
+            "svc-secret",
             "some/model",
+            Some("Org/Served"),
             "127.0.0.1",
             8000,
             DevicePolicy::GpuPreferred,
@@ -306,8 +353,32 @@ mod tests {
         let on_disk = fs::read_to_string(&path).unwrap();
         assert!(!on_disk.contains("hf_super_secret"));
         assert!(on_disk.contains("HF_TOKEN"));
-        let _ = fs::remove_file(&path);
-        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn status_helpers_round_trip_and_keep_other_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("svc.json");
+        assert_eq!(read_status(&path), None);
+        write_status(&path, "stopping").unwrap();
+        assert_eq!(read_status(&path).as_deref(), Some("stopping"));
+        record_served_model_id(&path, "Org/Served").unwrap();
+        let state = read_service_state(&path).unwrap();
+        assert_eq!(value_string(&state, "status").as_deref(), Some("stopping"));
+        assert_eq!(
+            value_string(&state, "served_model_id").as_deref(),
+            Some("Org/Served")
+        );
+    }
+
+    #[test]
+    fn first_listed_model_id_reads_the_first_nonempty_id() {
+        assert_eq!(
+            first_listed_model_id(r#"{"data":[{"id":""},{"id":"a/b"},{"id":"c"}]}"#).as_deref(),
+            Some("a/b")
+        );
+        assert_eq!(first_listed_model_id(r#"{"data":[]}"#), None);
+        assert_eq!(first_listed_model_id("not json"), None);
     }
 
     #[test]

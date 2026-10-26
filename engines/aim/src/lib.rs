@@ -4,7 +4,6 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use rocm_core::AppPaths;
 use rocm_engine_protocol::{
     DetectRequest, DetectResponse, DevicePolicy, EngineCapabilities, EngineDeviceAvailability,
     EngineMethod, EngineRecipeHint, EngineRequestEnvelope, EngineResponseEnvelope, InstallRequest,
@@ -99,15 +98,7 @@ pub(crate) struct ServeHttpRequest {
     pub port: u16,
     pub device_policy: DevicePolicy,
     pub gpu_indices: Vec<u32>,
-    #[allow(dead_code)] // ponytail: accepted for protocol-shape parity; AIM has no runtime concept
-    pub runtime_id: Option<String>,
-    #[allow(dead_code)]
-    // ponytail: accepted for protocol-shape parity; AIM has no managed-env concept
-    pub env_id: Option<String>,
     pub state_path: PathBuf,
-    #[allow(dead_code)]
-    // ponytail: no host-side log file in `docker run -d` mode; logs come from `docker logs`
-    pub log_path: Option<PathBuf>,
     pub engine_recipe: Option<EngineRecipeHint>,
 }
 
@@ -176,17 +167,13 @@ pub fn run_cli() -> Result<()> {
             port,
             device_policy,
             gpu,
-            runtime_id,
-            env_id,
+            // AIM has no managed runtime or env; accepted for protocol-shape parity.
+            runtime_id: _,
+            env_id: _,
             state_path,
             engine_recipe_json,
         } => {
             let gpu_indices = crate::process::parse_gpu_indices_arg(gpu.as_deref())?;
-            let log_path = Some(
-                AppPaths::discover()?
-                    .engine_logs_dir(ENGINE_NAME)
-                    .join(format!("{service_id}.log")),
-            );
             crate::process::serve_http(ServeHttpRequest {
                 service_id,
                 model_ref,
@@ -194,10 +181,7 @@ pub fn run_cli() -> Result<()> {
                 port,
                 device_policy: crate::process::parse_device_policy_arg(&device_policy)?,
                 gpu_indices,
-                runtime_id,
-                env_id,
                 state_path,
-                log_path,
                 engine_recipe: crate::process::parse_engine_recipe_json(engine_recipe_json)?,
             })
         }
@@ -224,10 +208,12 @@ pub fn builtin_serve_http(
     port: u16,
     device_policy: DevicePolicy,
     gpu_indices: Vec<u32>,
-    runtime_id: Option<String>,
-    env_id: Option<String>,
+    // AIM has no managed runtime, env or host-side log file (container logs come
+    // from `docker logs`); accepted for parity with the other built-in engines.
+    _runtime_id: Option<String>,
+    _env_id: Option<String>,
     state_path: PathBuf,
-    log_path: Option<PathBuf>,
+    _log_path: Option<PathBuf>,
     engine_recipe: Option<EngineRecipeHint>,
 ) -> Result<()> {
     crate::process::serve_http(ServeHttpRequest {
@@ -237,10 +223,7 @@ pub fn builtin_serve_http(
         port,
         device_policy,
         gpu_indices,
-        runtime_id,
-        env_id,
         state_path,
-        log_path,
         engine_recipe,
     })
 }

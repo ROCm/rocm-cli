@@ -39,6 +39,7 @@ pub(crate) fn resolve_model_response(request: ResolveModelRequest) -> Result<Res
     let engine_recipe = accepted_engine_recipe(request.engine_recipe)?;
     Ok(ResolveModelResponse {
         canonical_model_id: request.model_ref,
+        served_model_id: None,
         task: "text-generation".to_owned(),
         source: "huggingface_or_local".to_owned(),
         revision: "main".to_owned(),

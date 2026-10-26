@@ -488,6 +488,12 @@ pub struct InstallResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResolveModelResponse {
     pub canonical_model_id: String,
+    /// The model name the running server advertises in `/v1/models` and accepts
+    /// in requests, when it differs from `canonical_model_id` (a container
+    /// engine's `canonical_model_id` is the image to pull, not the served name).
+    /// `None` means they are the same.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub served_model_id: Option<String>,
     pub task: String,
     pub source: String,
     pub revision: String,
@@ -501,6 +507,18 @@ pub struct ResolveModelResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub engine_recipe: Option<EngineRecipeHint>,
     pub warnings: Vec<String>,
+}
+
+impl ResolveModelResponse {
+    /// The model name the running server answers to: `served_model_id` when the
+    /// engine reported one, else `canonical_model_id`.
+    #[must_use]
+    pub fn served_model_name(&self) -> &str {
+        self.served_model_id
+            .as_deref()
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or(&self.canonical_model_id)
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]

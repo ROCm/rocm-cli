@@ -538,6 +538,7 @@
             "requires a reachable Docker daemon; the image is pulled on first serve"
           ],
           "model_id_override": "amdenterpriseai/aim-radeon-qwen-qwen3-5-9b:0.12.0-preview",
+          "image_digest": "sha256:ee1201261f358be881318de5930ce9505d17309486f747a83147d7d042fc95ce",
           "extra_env": {
             "AIM_PROFILE_ID": "vllm-w7900-bf16-tp1-latency"
           }

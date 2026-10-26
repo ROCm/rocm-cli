@@ -3,19 +3,31 @@
 // SPDX-License-Identifier: MIT
 
 use anyhow::{Context, Result, bail};
-use rocm_core::{AppPaths, require_nonempty};
+use rocm_core::require_nonempty;
 use rocm_engine_protocol::{
     DevicePolicy, ENGINE_RECIPE_CONTRACT_VERSION, EngineRecipeHint, GpuSelection, LaunchRequest,
     LaunchResponse, ResolveModelRequest, ResolveModelResponse, StopRequest, StopResponse,
 };
 use serde_json::json;
+use std::collections::BTreeMap;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use crate::ServeHttpRequest;
+use crate::docker::ContainerState;
+use crate::registry::AimImageMetadata;
 
 const STOP_GRACE: Duration = Duration::from_secs(10);
 const READY_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const DEFAULT_READY_TIMEOUT: Duration = Duration::from_mins(5);
+/// Consecutive failed `docker inspect` calls (daemon down or erroring, as
+/// opposed to a container that is definitively gone) tolerated before the
+/// supervisor gives up: 60 polls is about 30 seconds.
+const MAX_CONSECUTIVE_INSPECT_ERRORS: u32 = 60;
+
+/// Env vars this engine sets itself; a caller-supplied `extra_env` may not
+/// override them.
+const RESERVED_ENV_KEYS: [&str; 2] = ["HIP_VISIBLE_DEVICES", "VLLM_API_KEY"];
 
 /// Time to wait for the AIM container to become ready before reporting failure.
 ///
@@ -35,13 +47,10 @@ fn resolve_aim_ready_timeout(override_value: Option<String>) -> Duration {
 }
 
 /// Deterministic, Docker-name-sanitized container identity for a service.
-/// This *is* the service's identity for the AIM engine — no PID/start-ticks
-/// tracking, since `docker run -d` leaves no long-lived client process to
-/// supervise. Unlike vLLM/Lemonade, this engine never signals a client
-/// process at all: the container is stopped by name (`docker stop`/`kill`),
-/// which sidesteps the SIGKILL-orphan hazard those engines have to guard
-/// against (a killed `docker run` client would otherwise leave the container
-/// running, with nothing left to track it by).
+/// The container is stopped and removed by name (`docker kill`/`rm -f`), never
+/// by signalling a client process, so it cannot be orphaned by a killed
+/// `docker run` client. `serve_http` is the long-lived process rocmd
+/// supervises: it blocks until the container exits and records how it ended.
 pub(crate) fn container_name(service_id: &str) -> String {
     let sanitized: String = service_id
         .chars()
@@ -56,23 +65,47 @@ pub(crate) fn container_name(service_id: &str) -> String {
     format!("rocm-aim-{sanitized}")
 }
 
+/// Image metadata for the pre-launch `ResolveModel` step: the local daemon's
+/// copy when the image is already present, otherwise a best-effort Docker Hub
+/// lookup. Both are hints; callers must tolerate failure.
+fn lookup_image_metadata(image_ref: &str) -> Result<AimImageMetadata> {
+    let image_ref = crate::registry::normalize_image_ref(image_ref);
+    if let Some(local) = crate::registry::local_image_metadata(&image_ref) {
+        return Ok(local);
+    }
+    crate::registry::fetch_image_metadata(&image_ref)
+}
+
 pub(crate) fn resolve_model_response(request: ResolveModelRequest) -> Result<ResolveModelResponse> {
+    resolve_model_response_with(request, lookup_image_metadata)
+}
+
+fn resolve_model_response_with(
+    request: ResolveModelRequest,
+    lookup: impl FnOnce(&str) -> Result<AimImageMetadata>,
+) -> Result<ResolveModelResponse> {
     require_nonempty(&request.model_ref, "model_ref")?;
     let engine_recipe = accepted_engine_recipe(request.engine_recipe)?;
 
-    let metadata = crate::registry::fetch_image_metadata(&request.model_ref)?;
     let mut warnings = Vec::new();
+    let metadata = lookup(&request.model_ref).unwrap_or_else(|error| {
+        warnings.push(format!(
+            "could not read AIM image metadata for `{}` ({error:#}); it will be read from the \
+             image after the pull",
+            request.model_ref
+        ));
+        AimImageMetadata::default()
+    });
 
-    let device_policy = match metadata.accelerator_type.as_deref() {
-        Some("gpu") => DevicePolicy::GpuRequired,
-        Some("cpu") => DevicePolicy::CpuOnly,
-        _ => {
-            warnings.push(
-                "AIM image did not report AIM_ACCELERATOR_TYPE; assuming GPU-preferred".to_owned(),
-            );
-            DevicePolicy::GpuPreferred
-        }
-    };
+    // The caller's `--device` wins; image metadata only fills in when none was given.
+    let device_policy =
+        request
+            .device_policy
+            .unwrap_or(match metadata.accelerator_type.as_deref() {
+                Some("gpu") => DevicePolicy::GpuRequired,
+                Some("cpu") => DevicePolicy::CpuOnly,
+                _ => DevicePolicy::GpuPreferred,
+            });
 
     if device_policy != DevicePolicy::CpuOnly
         && let Some(host_gfx) = rocm_core::detect_host_gfx_target()
@@ -89,15 +122,14 @@ pub(crate) fn resolve_model_response(request: ResolveModelRequest) -> Result<Res
     }
 
     Ok(ResolveModelResponse {
-        // Must stay the Docker image reference, not `metadata.canonical_name`'s
-        // human-readable HF-style id: `apps/rocm` re-threads `canonical_model_id`
-        // back into Launch/ServeHttp as `model_ref` (service id generation,
-        // `__engine-serve-http` argv, `docker pull`/`docker run`) for every
-        // built-in engine uniformly. For vLLM/Lemonade that coincides with the
-        // resolved HF repo id; for AIM it would swap in a non-pullable display
-        // string instead of the image (found via live Strix Halo validation:
-        // `docker pull meta-llama/Llama-3.2-1B-Instruct` failed outright).
+        // Must stay the Docker image reference: `apps/rocm` re-threads
+        // `canonical_model_id` back into Launch/ServeHttp as `model_ref`
+        // (service id generation, `__engine-serve-http` argv, `docker pull`/`run`)
+        // for every built-in engine uniformly. The name the container serves
+        // under (the image's HF-style canonical name) is reported separately in
+        // `served_model_id`, which readiness, the smoke test and the summary use.
         canonical_model_id: request.model_ref,
+        served_model_id: metadata.canonical_name,
         task: "text-generation".to_owned(),
         source: "docker_registry".to_owned(),
         revision: "main".to_owned(),
@@ -149,12 +181,9 @@ pub(crate) fn launch_service(request: LaunchRequest) -> Result<LaunchResponse> {
     let gpu_indices = rocm_engine_protocol::launch_gpu_indices(request.gpu_selection.as_ref());
     let device_policy = request.device_policy.unwrap_or(DevicePolicy::GpuPreferred);
 
-    let paths = AppPaths::discover()?;
-    let state_path = paths
-        .engine_state_dir(crate::ENGINE_NAME)
-        .join(format!("{}.json", request.service_id));
+    let state_path = crate::state::state_path(&request.service_id);
 
-    run_container(
+    let served_model_id = run_container(
         &request.service_id,
         &request.model_ref,
         &request.host,
@@ -165,8 +194,10 @@ pub(crate) fn launch_service(request: LaunchRequest) -> Result<LaunchResponse> {
     )?;
     let endpoint_url = endpoint_url(&request.host, request.port);
     crate::state::write_running_state(
+        &state_path,
         &request.service_id,
         &request.model_ref,
+        served_model_id.as_deref(),
         &request.host,
         request.port,
         device_policy,
@@ -176,8 +207,8 @@ pub(crate) fn launch_service(request: LaunchRequest) -> Result<LaunchResponse> {
     let log_path = format!("docker://{}", container_name(&request.service_id));
     Ok(LaunchResponse {
         service_id: request.service_id,
-        // ponytail: `docker run -d` backgrounds the container itself — there is
-        // no long-lived client process to report a real PID for.
+        // ponytail: `docker run -d` backgrounds the container itself, so there is
+        // no client process to report a real PID for.
         pid: 0,
         endpoint_url,
         log_path,
@@ -185,55 +216,107 @@ pub(crate) fn launch_service(request: LaunchRequest) -> Result<LaunchResponse> {
     })
 }
 
-/// Starts the named service's container if it isn't already running.
-/// Container names are globally unique in Docker (unlike host PIDs), so
-/// unconditionally calling `docker run --name X` twice for the same service
-/// fails with a name conflict — `launch_service` and `serve_http` must agree
-/// on "already running? skip `docker run`" instead of vLLM's host-process
-/// model, where two independent spawns are safe because each gets its own PID.
+/// Which GPUs, if any, the container may use.
+#[derive(Debug, PartialEq, Eq)]
+struct GpuPlan {
+    available: bool,
+    indices: Vec<u32>,
+}
+
+/// Resolves the caller's GPU request against what the host can actually use,
+/// the way `engines/vllm` does: an authoritative empty probe means no usable
+/// GPU, an empty request picks the first usable device, and an unknown probe
+/// (WSL and other unprobeable surfaces) stays permissive. Native Windows has no
+/// GPU passthrough shape (`docker::gpu_device_args`), so it never has a GPU.
+fn plan_gpus(requested: &[u32], usable: Option<Vec<u32>>, windows: bool) -> Result<GpuPlan> {
+    let none = GpuPlan {
+        available: false,
+        indices: Vec::new(),
+    };
+    if windows {
+        return Ok(none);
+    }
+    let Some(usable) = usable else {
+        return Ok(GpuPlan {
+            available: true,
+            indices: requested.to_vec(),
+        });
+    };
+    if usable.is_empty() {
+        return Ok(none);
+    }
+    if requested.is_empty() {
+        return Ok(GpuPlan {
+            available: true,
+            indices: vec![usable[0]],
+        });
+    }
+    if let Some(missing) = requested.iter().find(|index| !usable.contains(index)) {
+        bail!(
+            "requested GPU {missing} is not available on this host; usable GPU indices: {usable:?}"
+        );
+    }
+    Ok(GpuPlan {
+        available: true,
+        indices: requested.to_vec(),
+    })
+}
+
+/// Starts the named service's container unless it is already running, and
+/// returns the model name the image says it serves under, if known.
+///
+/// Container names are unique in Docker, so `docker run --name X` against a
+/// name still held by an exited container (a crash, a reboot, a failed
+/// readiness check) would fail with "name already in use" forever; a stale
+/// container is therefore removed first.
 fn run_container(
     service_id: &str,
     model_ref: &str,
     host: &str,
     port: u16,
     device_policy: &DevicePolicy,
-    gpu_indices: &[u32],
-    extra_env: Option<&std::collections::BTreeMap<String, String>>,
+    requested_gpus: &[u32],
+    extra_env: Option<&BTreeMap<String, String>>,
 ) -> Result<Option<String>> {
     let name = container_name(service_id);
-    // Normalize once and reuse everywhere below: metadata and the actual
-    // `docker pull`/`run` must resolve the exact same image, or the fetched
-    // accelerator/GPU-arch metadata silently describes a different image
-    // than the one that runs (ROCMAI-554 review finding).
+    // Normalize once so the pull, the metadata and the run all use the same image.
     let image_ref = crate::registry::normalize_image_ref(model_ref);
-    let metadata = crate::registry::fetch_image_metadata(&image_ref).unwrap_or_else(|error| {
-        eprintln!(
-            "Warning: could not fetch AIM image metadata for `{image_ref}`: {error:#}; \
-             assuming GPU-preferred with no accelerator-arch check."
-        );
-        crate::registry::AimImageMetadata::default()
-    });
-    if crate::docker::inspect_running(&name)?.unwrap_or(false) {
-        return Ok(metadata.canonical_name);
+
+    match crate::docker::container_state(&name)? {
+        ContainerState::Running => {
+            return Ok(crate::registry::local_image_metadata(&image_ref)
+                .and_then(|metadata| metadata.canonical_name));
+        }
+        ContainerState::Exited(_) => crate::docker::remove(&name)?,
+        ContainerState::Missing => {}
     }
 
     if !crate::docker::image_present(&image_ref)? {
         crate::docker::pull(&image_ref)?;
     }
+    // Read from the pulled image itself, so this works for any registry and
+    // offline, unlike the Docker Hub lookup.
+    let metadata = crate::registry::local_image_metadata(&image_ref).unwrap_or_default();
 
-    // `crate::docker::gpu_device_args` has no native-Windows device shape, and
-    // an image reporting AIM_ACCELERATOR_TYPE=cpu has nothing to pass GPU args
-    // to, so neither counts as "a GPU is usable" regardless of what the caller
-    // selected.
-    let gpu_usable = !cfg!(windows) && !gpu_indices.is_empty();
+    let gpus = plan_gpus(
+        requested_gpus,
+        rocm_core::usable_amd_gpu_indices(),
+        cfg!(windows),
+    )?;
     let image_wants_cpu = metadata.accelerator_type.as_deref() == Some("cpu");
     let use_gpu = resolve_use_gpu(
         service_id,
         &image_ref,
         device_policy,
-        gpu_usable,
+        gpus.available,
         image_wants_cpu,
     )?;
+    if !use_gpu && matches!(device_policy, DevicePolicy::GpuPreferred) {
+        eprintln!(
+            "Warning: AIM service `{service_id}` will run on CPU (device_policy=gpu_preferred \
+             and no usable GPU for `{image_ref}`); pass `--device gpu` to require a GPU."
+        );
+    }
     let render_gid = if use_gpu {
         crate::docker::render_group_gid()
     } else {
@@ -241,24 +324,28 @@ fn run_container(
     };
 
     let mut env = extra_env.cloned().unwrap_or_default();
-    // AIM images bundle vLLM's OpenAI server, so it is `VLLM_API_KEY` — the
-    // same variable `engines/vllm` sets on its own child process — that this
+    if let Some(key) = RESERVED_ENV_KEYS.iter().find(|key| env.contains_key(**key)) {
+        bail!("engine env `{key}` is managed by rocm-cli and cannot be overridden");
+    }
+    // AIM images bundle vLLM's OpenAI server, so it is `VLLM_API_KEY` that this
     // engine's actual server enforces. The container is the only process this
-    // engine ever runs, so without this the require-api-key setting a public
-    // `rocm serve --engine aim` was given is silently never enforced.
+    // engine runs, so without this the require-api-key setting a public
+    // `rocm serve --engine aim` was given is silently never enforced. The value
+    // reaches docker through a private env file, never argv.
     if let Some(api_key) = rocm_engine_protocol::resolve_endpoint_api_key() {
         env.insert("VLLM_API_KEY".to_owned(), api_key);
     }
-    crate::docker::run(
-        &name,
-        &image_ref,
+    crate::docker::run(&crate::docker::RunSpec {
+        name: &name,
+        image: &image_ref,
         host,
         port,
-        crate::DEFAULT_AIM_PORT,
-        if use_gpu { gpu_indices } else { &[] },
+        container_port: crate::DEFAULT_AIM_PORT,
+        use_gpu,
+        gpu_indices: if use_gpu { &gpus.indices } else { &[] },
         render_gid,
-        &env,
-    )?;
+        env: &env,
+    })?;
     Ok(metadata.canonical_name)
 }
 
@@ -278,8 +365,8 @@ fn resolve_use_gpu(
             if !gpu_usable || image_wants_cpu {
                 bail!(
                     "AIM service `{service_id}` has device_policy=gpu_required but no GPU is \
-                     usable for `{model_ref}` (native Windows has no GPU passthrough, no GPU \
-                     indices were selected, or the image reports AIM_ACCELERATOR_TYPE=cpu)"
+                     usable for `{model_ref}` (native Windows has no GPU passthrough, the host \
+                     reports no usable GPU, or the image reports AIM_ACCELERATOR_TYPE=cpu)"
                 );
             }
             true
@@ -289,7 +376,8 @@ fn resolve_use_gpu(
 }
 
 pub(crate) fn serve_http(request: ServeHttpRequest) -> Result<()> {
-    let canonical_name = run_container(
+    let name = container_name(&request.service_id);
+    let label_name = run_container(
         &request.service_id,
         &request.model_ref,
         &request.host,
@@ -300,76 +388,140 @@ pub(crate) fn serve_http(request: ServeHttpRequest) -> Result<()> {
     )?;
 
     crate::state::write_running_state(
+        &request.state_path,
         &request.service_id,
         &request.model_ref,
+        label_name.as_deref(),
         &request.host,
         request.port,
         request.device_policy,
         request.engine_recipe.as_ref(),
     )?;
 
-    let name = container_name(&request.service_id);
-    let timeout = aim_ready_timeout();
-    // The container self-reports under the registry's HF-style canonical name
-    // (e.g. `meta-llama/Llama-3.2-1B-Instruct`), not the Docker image reference
-    // used for `docker pull`/`run` — matching `/v1/models` against the image ref
-    // would never find it. Fall back to the image ref only when the registry
-    // didn't advertise a canonical name.
-    let expected_model_id = canonical_name.as_deref().unwrap_or(&request.model_ref);
+    // The container serves under the image's HF-style canonical name, not the
+    // Docker image reference used for `docker pull`/`run`. When the image didn't
+    // label one, wait for the container to list whatever it serves instead.
     match wait_for_container_ready(
         &name,
         &request.host,
         request.port,
-        expected_model_id,
-        timeout,
+        label_name.as_deref(),
+        aim_ready_timeout(),
     ) {
-        Ok(()) => block_until_container_stops(&name, &request.state_path),
+        Ok(served_model_id) => {
+            crate::state::record_served_model_id(&request.state_path, &served_model_id)?;
+            let exit = wait_for_exit(
+                || crate::docker::container_state(&name),
+                || std::thread::sleep(READY_POLL_INTERVAL),
+            );
+            finish_after_exit(&name, &request.state_path, exit)
+        }
         Err(error) => {
-            // A readiness timeout (unlike an early container exit) leaves the
-            // container running; stop it so a failed launch doesn't leak an
-            // orphaned container nothing will ever signal again (the service
-            // record is about to be marked `failed`, not `running`, so
-            // `apps/rocmd`'s own stop path will never find it).
-            let _ = crate::docker::stop(&name, true, STOP_GRACE);
+            // The logs are already in `error`; remove the container so a failed
+            // launch leaks neither a running container nothing will signal
+            // again nor the stopped one that would hold its name.
+            let _ = crate::docker::remove(&name);
             crate::state::write_terminal_state(&request.state_path, "failed")?;
             Err(error)
         }
     }
 }
 
-/// Blocks for the container's remaining lifetime, mirroring `engines/vllm`
-/// and `engines/lemonade`'s blocking `child.wait()`: `apps/rocmd`'s generic
-/// supervisor (`supervise_service`) treats this process's exit as the
-/// service's exit, so returning right after readiness (as this used to)
-/// made a still-running, actively-serving container read `stopped` the
-/// instant it became ready. A transient `docker inspect` failure is treated
-/// as "still running" rather than ending the loop, matching this file's
-/// other `unwrap_or`-style tolerance of CLI hiccups elsewhere.
-fn block_until_container_stops(name: &str, state_path: &std::path::Path) -> Result<()> {
-    while crate::docker::inspect_running(name).unwrap_or(Some(true)) != Some(false) {
-        std::thread::sleep(READY_POLL_INTERVAL);
+/// How a supervised container ended.
+#[derive(Debug, PartialEq, Eq)]
+enum ContainerExit {
+    Code(i32),
+    /// Removed out from under the supervisor (`docker rm -f`, `docker system prune`).
+    Gone,
+    /// The daemon stayed unreachable past the tolerance.
+    DaemonLost,
+}
+
+/// Blocks until the container stops, mirroring `engines/vllm` and
+/// `engines/lemonade`'s blocking `child.wait()`: `apps/rocmd`'s generic
+/// supervisor treats this process's exit as the service's exit, so returning
+/// early would make a live container read `stopped`. A definitively missing
+/// container ends the wait; transient `docker inspect` errors are tolerated
+/// only [`MAX_CONSECUTIVE_INSPECT_ERRORS`] times in a row.
+fn wait_for_exit(
+    mut poll: impl FnMut() -> Result<ContainerState>,
+    mut pause: impl FnMut(),
+) -> ContainerExit {
+    let mut consecutive_errors = 0;
+    loop {
+        match poll() {
+            Ok(ContainerState::Running) => consecutive_errors = 0,
+            Ok(ContainerState::Exited(code)) => return ContainerExit::Code(code),
+            Ok(ContainerState::Missing) => return ContainerExit::Gone,
+            Err(_) => {
+                consecutive_errors += 1;
+                if consecutive_errors >= MAX_CONSECUTIVE_INSPECT_ERRORS {
+                    return ContainerExit::DaemonLost;
+                }
+            }
+        }
+        pause();
     }
-    crate::state::write_terminal_state(state_path, "stopped")
+}
+
+/// Records how the container ended, as `engines/vllm` does for its child: a
+/// deliberate stop or clean exit is `stopped`; anything else is `failed` and
+/// surfaces as an error (non-zero exit) so rocmd's recovery sees a crash.
+fn finish_after_exit(name: &str, state_path: &Path, exit: ContainerExit) -> Result<()> {
+    // `stop_service` records its intent before killing, so a kill (exit 137)
+    // it caused is not mistaken for a crash.
+    let deliberate = matches!(
+        crate::state::read_status(state_path).as_deref(),
+        Some("stopping" | "stopped")
+    );
+    if deliberate || exit == ContainerExit::Code(0) {
+        let _ = crate::docker::remove(name);
+        return crate::state::write_terminal_state(state_path, "stopped");
+    }
+    crate::state::write_terminal_state(state_path, "failed")?;
+    match exit {
+        ContainerExit::Code(code) => bail!("AIM container `{name}` exited with code {code}"),
+        ContainerExit::Gone => bail!(
+            "AIM container `{name}` was removed while it was serving (`docker rm` or a prune?)"
+        ),
+        ContainerExit::DaemonLost => {
+            bail!("lost contact with the Docker daemon while supervising AIM container `{name}`")
+        }
+    }
 }
 
 /// Mirrors `engines/vllm/src/process.rs`'s `wait_for_vllm_ready` architecture:
 /// early-exit check, monotonic timeout, listed-then-inference-verified gate.
-/// `docker::inspect_running` replaces `child.try_wait()` since there is no
-/// `std::process::Child` for a detached container.
+/// Returns the model name the server serves under (`expected_model` when the
+/// image labelled one, otherwise whatever the server lists).
 fn wait_for_container_ready(
     name: &str,
     host: &str,
     port: u16,
-    model_ref: &str,
+    expected_model: Option<&str>,
     timeout: Duration,
-) -> Result<()> {
+) -> Result<String> {
     let start = Instant::now();
     let endpoint = endpoint_url(host, port);
+    let mut consecutive_errors = 0;
     loop {
-        if crate::docker::inspect_running(name)?.is_some_and(|running| !running) {
-            let exit_code = crate::docker::inspect_exit_code(name)?.unwrap_or(-1);
-            let tail = crate::docker::logs(name, 80).unwrap_or_default().join("\n");
-            bail!("AIM container `{name}` exited early (exit code {exit_code}):\n{tail}");
+        match crate::docker::container_state(name) {
+            Ok(ContainerState::Running) => consecutive_errors = 0,
+            Ok(ContainerState::Exited(exit_code)) => {
+                let tail = crate::docker::logs(name, 80).unwrap_or_default().join("\n");
+                bail!("AIM container `{name}` exited early (exit code {exit_code}):\n{tail}");
+            }
+            Ok(ContainerState::Missing) => {
+                bail!("AIM container `{name}` no longer exists; it was removed during startup")
+            }
+            Err(error) => {
+                consecutive_errors += 1;
+                if consecutive_errors >= MAX_CONSECUTIVE_INSPECT_ERRORS {
+                    return Err(error.context(format!(
+                        "lost contact with the Docker daemon while starting AIM container `{name}`"
+                    )));
+                }
+            }
         }
         if start.elapsed() > timeout {
             let tail = crate::docker::logs(name, 80).unwrap_or_default().join("\n");
@@ -379,12 +531,16 @@ fn wait_for_container_ready(
             );
         }
 
-        let listed =
-            crate::state::query_loaded_model_endpoint(&endpoint, Some(model_ref)).unwrap_or(false);
-        if listed
-            && crate::state::query_inference_probe_endpoint(&endpoint, model_ref).unwrap_or(false)
+        let served = match expected_model {
+            Some(model) => crate::state::query_loaded_model_endpoint(&endpoint, Some(model))
+                .unwrap_or(false)
+                .then(|| model.to_owned()),
+            None => crate::state::discover_served_model(&endpoint),
+        };
+        if let Some(model) = served
+            && crate::state::query_inference_probe_endpoint(&endpoint, &model).unwrap_or(false)
         {
-            return Ok(());
+            return Ok(model);
         }
 
         std::thread::sleep(READY_POLL_INTERVAL);
@@ -394,13 +550,24 @@ fn wait_for_container_ready(
 pub(crate) fn stop_service(request: StopRequest) -> Result<StopResponse> {
     require_nonempty(&request.service_id, "service_id")?;
     let name = container_name(&request.service_id);
-    let stopped = crate::docker::stop(&name, request.force, STOP_GRACE)?;
-    if stopped {
-        let state_path = AppPaths::discover()?
-            .engine_state_dir(crate::ENGINE_NAME)
-            .join(format!("{}.json", request.service_id));
-        crate::state::write_terminal_state(&state_path, "stopped")?;
-    }
+    let state_path = crate::state::state_path(&request.service_id);
+    let prior_status = crate::state::read_status(&state_path);
+    // Record the intent first: the container's supervisor (`serve_http`) sees the
+    // exit within a poll interval and must read a deliberate stop, not a crash.
+    crate::state::write_status(&state_path, "stopping")?;
+    let stopped = match crate::docker::stop(&name, request.force, STOP_GRACE) {
+        Ok(stopped) => stopped,
+        Err(error) => {
+            if let Some(status) = prior_status {
+                let _ = crate::state::write_status(&state_path, &status);
+            }
+            return Err(error);
+        }
+    };
+    // Release the name and the writable layer (downloaded weights) so a later
+    // restart can `docker run` the same name again.
+    crate::docker::remove(&name)?;
+    crate::state::write_terminal_state(&state_path, "stopped")?;
     Ok(StopResponse {
         stopped,
         graceful: stopped && !request.force,
@@ -435,6 +602,25 @@ pub(crate) fn parse_gpu_indices_arg(value: Option<&str>) -> Result<Vec<u32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+
+    fn resolve_request(device_policy: Option<DevicePolicy>) -> ResolveModelRequest {
+        ResolveModelRequest {
+            model_ref: "org/aim-foo:1".to_owned(),
+            runtime_id: None,
+            device_policy,
+            recipe_override: None,
+            engine_recipe: None,
+        }
+    }
+
+    fn metadata(accelerator_type: Option<&str>, canonical_name: Option<&str>) -> AimImageMetadata {
+        AimImageMetadata {
+            accelerator_type: accelerator_type.map(ToOwned::to_owned),
+            canonical_name: canonical_name.map(ToOwned::to_owned),
+            ..AimImageMetadata::default()
+        }
+    }
 
     #[test]
     fn aim_ready_timeout_uses_default_without_override() {
@@ -516,144 +702,485 @@ mod tests {
         assert!(!resolve_use_gpu("svc", "model", &DevicePolicy::GpuPreferred, true, true).unwrap());
         assert!(resolve_use_gpu("svc", "model", &DevicePolicy::GpuPreferred, true, false).unwrap());
     }
+
+    #[test]
+    fn plan_gpus_resolves_an_empty_request_to_the_first_usable_gpu() {
+        assert_eq!(
+            plan_gpus(&[], Some(vec![1, 2]), false).unwrap(),
+            GpuPlan {
+                available: true,
+                indices: vec![1]
+            }
+        );
+    }
+
+    #[test]
+    fn plan_gpus_keeps_a_valid_request_and_rejects_an_unusable_one() {
+        assert_eq!(
+            plan_gpus(&[2], Some(vec![1, 2]), false).unwrap().indices,
+            vec![2]
+        );
+        assert!(plan_gpus(&[5], Some(vec![1, 2]), false).is_err());
+    }
+
+    #[test]
+    fn plan_gpus_reports_no_gpu_for_an_empty_probe_and_on_windows() {
+        assert!(!plan_gpus(&[], Some(vec![]), false).unwrap().available);
+        assert!(!plan_gpus(&[0], Some(vec![0]), true).unwrap().available);
+    }
+
+    #[test]
+    fn plan_gpus_stays_permissive_when_the_probe_is_unavailable() {
+        assert_eq!(
+            plan_gpus(&[], None, false).unwrap(),
+            GpuPlan {
+                available: true,
+                indices: vec![]
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_reports_the_served_name_and_keeps_the_image_ref_as_canonical() {
+        let response = resolve_model_response_with(resolve_request(None), |_| {
+            Ok(metadata(Some("gpu"), Some("Org/Served-Model")))
+        })
+        .unwrap();
+        assert_eq!(response.canonical_model_id, "org/aim-foo:1");
+        assert_eq!(
+            response.served_model_id.as_deref(),
+            Some("Org/Served-Model")
+        );
+        assert_eq!(response.device_policy, DevicePolicy::GpuRequired);
+    }
+
+    #[test]
+    fn resolve_honors_the_callers_device_policy_over_image_metadata() {
+        let response =
+            resolve_model_response_with(resolve_request(Some(DevicePolicy::CpuOnly)), |_| {
+                Ok(metadata(Some("gpu"), None))
+            })
+            .unwrap();
+        assert_eq!(response.device_policy, DevicePolicy::CpuOnly);
+    }
+
+    #[test]
+    fn resolve_tolerates_a_failed_metadata_lookup_with_a_warning() {
+        let response =
+            resolve_model_response_with(resolve_request(None), |_| anyhow::bail!("offline"))
+                .unwrap();
+        assert_eq!(response.served_model_id, None);
+        assert_eq!(response.device_policy, DevicePolicy::GpuPreferred);
+        assert!(
+            response
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("offline")),
+            "{:?}",
+            response.warnings
+        );
+    }
+
+    #[test]
+    fn wait_for_exit_returns_the_exit_code() {
+        let mut states = vec![
+            Ok(ContainerState::Running),
+            Ok(ContainerState::Running),
+            Ok(ContainerState::Exited(137)),
+        ]
+        .into_iter();
+        let exit = wait_for_exit(|| states.next().unwrap(), || {});
+        assert_eq!(exit, ContainerExit::Code(137));
+    }
+
+    #[test]
+    fn wait_for_exit_ends_when_the_container_is_removed_instead_of_spinning() {
+        let mut states = vec![Ok(ContainerState::Running), Ok(ContainerState::Missing)].into_iter();
+        assert_eq!(
+            wait_for_exit(|| states.next().unwrap(), || {}),
+            ContainerExit::Gone
+        );
+    }
+
+    #[test]
+    fn wait_for_exit_tolerates_a_few_transient_errors_but_not_a_dead_daemon() {
+        let calls = Cell::new(0);
+        let transient = wait_for_exit(
+            || {
+                calls.set(calls.get() + 1);
+                match calls.get() {
+                    1..=3 => anyhow::bail!("daemon hiccup"),
+                    4 => Ok(ContainerState::Running),
+                    _ => Ok(ContainerState::Exited(0)),
+                }
+            },
+            || {},
+        );
+        assert_eq!(transient, ContainerExit::Code(0));
+
+        let polls = Cell::new(0);
+        let dead = wait_for_exit(
+            || {
+                polls.set(polls.get() + 1);
+                anyhow::bail!("daemon down")
+            },
+            || {},
+        );
+        assert_eq!(dead, ContainerExit::DaemonLost);
+        assert_eq!(polls.get(), MAX_CONSECUTIVE_INSPECT_ERRORS);
+    }
+
+    #[test]
+    fn finish_after_exit_records_failed_for_a_crash_and_stopped_for_a_clean_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("svc.json");
+        crate::state::write_status(&path, "running").unwrap();
+
+        // `docker rm` is best-effort here and may not exist on the test host.
+        let error = finish_after_exit("aim-x", &path, ContainerExit::Code(137))
+            .expect_err("a crash must surface as an error so recovery runs");
+        assert!(error.to_string().contains("137"), "{error}");
+        assert_eq!(crate::state::read_status(&path).as_deref(), Some("failed"));
+
+        finish_after_exit("aim-x", &path, ContainerExit::Code(0)).unwrap();
+        assert_eq!(crate::state::read_status(&path).as_deref(), Some("stopped"));
+    }
+
+    #[test]
+    fn finish_after_exit_treats_a_deliberate_stop_as_stopped_even_after_a_kill() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("svc.json");
+        crate::state::write_status(&path, "stopping").unwrap();
+        finish_after_exit("aim-x", &path, ContainerExit::Code(137)).unwrap();
+        assert_eq!(crate::state::read_status(&path).as_deref(), Some("stopped"));
+
+        crate::state::write_status(&path, "stopping").unwrap();
+        finish_after_exit("aim-x", &path, ContainerExit::Gone).unwrap();
+        assert_eq!(crate::state::read_status(&path).as_deref(), Some("stopped"));
+    }
+
+    #[test]
+    fn finish_after_exit_fails_when_the_container_vanished_unexpectedly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("svc.json");
+        crate::state::write_status(&path, "running").unwrap();
+        assert!(finish_after_exit("aim-x", &path, ContainerExit::Gone).is_err());
+        assert_eq!(crate::state::read_status(&path).as_deref(), Some("failed"));
+        assert!(finish_after_exit("aim-x", &path, ContainerExit::DaemonLost).is_err());
+    }
 }
 
 /// `run_container`/`wait_for_container_ready`/`serve_http`/`stop_service` all
-/// shell out to `docker`, so (same reasoning as `docker.rs`'s
-/// `subprocess_tests`) each scenario below re-spawns this test binary with a
-/// fake `docker` on `PATH`. `fetch_image_metadata` (called unconditionally by
-/// `run_container`) hits the real Docker Hub registry for a deliberately
-/// bogus image and is expected to 404; that failure is already handled by a
-/// production fallback (`unwrap_or_else` to `AimImageMetadata::default()`),
-/// so no mock/seam is needed, just the real ~1s network round trip.
+/// shell out to `docker`, so each scenario re-spawns this test binary with the
+/// shared fake `docker` on `PATH` (see `docker::subprocess_tests`), a data dir
+/// under the scratch dir, and, where readiness is reached, a minimal in-process
+/// OpenAI-compatible server on loopback. `docker image inspect` is answered by
+/// the fake, so nothing here touches the network or the real data dir.
 #[cfg(all(test, unix))]
 mod subprocess_tests {
     use super::*;
-    use rocm_core::fake_executable::write_fake_executable;
-    use std::process::{Command, Stdio};
+    use crate::docker::subprocess_tests::{in_subprocess, run_with_fake_docker};
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
 
-    const SENTINEL: &str = "ROCM_AIM_PROCESS_SUBPROCESS_TEST";
+    const IMAGE: &str = "org/aim-fixture:1";
+    const SERVED: &str = "Org/Served-Model";
 
-    const FAKE_DOCKER_SCRIPT: &str = r#"#!/bin/sh
-case "$1" in
-  run)
-    [ -n "$FAKE_DOCKER_RUN_STDERR" ] && echo "$FAKE_DOCKER_RUN_STDERR" >&2
-    exit "${FAKE_DOCKER_RUN_EXIT:-0}"
-    ;;
-  kill|stop)
-    if [ -n "$FAKE_DOCKER_STOP_NO_SUCH_CONTAINER" ]; then
-      echo "Error response from daemon: No such container: fake" >&2
-      exit 1
-    fi
-    exit "${FAKE_DOCKER_STOP_EXIT:-0}"
-    ;;
-  inspect)
-    case "$3" in
-      *Running*) echo "${FAKE_DOCKER_RUNNING:-false}" ;;
-      *ExitCode*) echo "${FAKE_DOCKER_EXIT_CODE:-0}" ;;
-    esac
-    exit 0
-    ;;
-  image)
-    exit "${FAKE_DOCKER_IMAGE_PRESENT_EXIT:-1}"
-    ;;
-  pull)
-    exit "${FAKE_DOCKER_PULL_EXIT:-0}"
-    ;;
-  logs)
-    [ -n "$FAKE_DOCKER_LOGS" ] && echo "$FAKE_DOCKER_LOGS"
-    exit 0
-    ;;
-esac
-exit 0
-"#;
-
-    fn in_subprocess() -> bool {
-        std::env::var_os(SENTINEL).is_some()
+    /// Serves `GET /v1/models` (listing `model`) and `POST /v1/chat/completions`
+    /// (always 200) on an ephemeral loopback port; returns the port.
+    fn spawn_fake_openai(model: &'static str) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut request_line = String::new();
+                    reader.read_line(&mut request_line).ok();
+                    let mut content_length = 0usize;
+                    loop {
+                        let mut header = String::new();
+                        if reader.read_line(&mut header).unwrap_or(0) == 0 || header == "\r\n" {
+                            break;
+                        }
+                        if let Some(value) =
+                            header.to_ascii_lowercase().strip_prefix("content-length:")
+                        {
+                            content_length = value.trim().parse().unwrap_or(0);
+                        }
+                    }
+                    let mut body = vec![0; content_length];
+                    reader.read_exact(&mut body).ok();
+                    let payload = if request_line.starts_with("GET /v1/models") {
+                        format!(r#"{{"data":[{{"id":"{model}"}}]}}"#)
+                    } else {
+                        r#"{"choices":[]}"#.to_owned()
+                    };
+                    let mut stream = stream;
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                        payload.len()
+                    );
+                });
+            }
+        });
+        port
     }
 
-    fn run_with_fake_docker(test_path: &str, extra_env: &[(&str, &str)]) {
-        let dir = std::env::temp_dir().join(format!(
-            "aim-process-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let fake_bin = dir.join("bin");
-        std::fs::create_dir_all(&fake_bin).unwrap();
-        write_fake_executable(&fake_bin.join("docker"), FAKE_DOCKER_SCRIPT).unwrap();
+    fn data_dir() -> std::path::PathBuf {
+        std::path::PathBuf::from(std::env::var_os("ROCM_CLI_DATA_DIR").expect("data dir"))
+    }
 
-        let mut entries = vec![fake_bin];
-        entries.extend(std::env::split_paths(
-            &std::env::var_os("PATH").unwrap_or_default(),
-        ));
-
-        let mut command = Command::new(std::env::current_exe().unwrap());
-        command
-            .args(["--exact", test_path, "--nocapture"])
-            .env(SENTINEL, "1")
-            .env("PATH", std::env::join_paths(entries).unwrap())
-            .stdin(Stdio::null());
-        for (key, value) in extra_env {
-            command.env(key, value);
+    fn serve_request(
+        service_id: &str,
+        port: u16,
+        state_path: std::path::PathBuf,
+    ) -> ServeHttpRequest {
+        ServeHttpRequest {
+            service_id: service_id.to_owned(),
+            model_ref: IMAGE.to_owned(),
+            host: "127.0.0.1".to_owned(),
+            port,
+            device_policy: DevicePolicy::CpuOnly,
+            gpu_indices: vec![],
+            state_path,
+            engine_recipe: None,
         }
-        let status = command.status().unwrap();
-        assert!(status.success(), "helper subprocess failed for {test_path}");
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
-    const BOGUS_IMAGE: &str = "rocm-cli-test/does-not-exist-on-docker-hub-aim-fixture";
+    fn status_of(path: &Path) -> Option<String> {
+        crate::state::read_status(path)
+    }
+
+    const LABELLED_IMAGE: (&str, &str) = (
+        "FAKE_DOCKER_IMAGE_CONFIG",
+        r#"{"Env":["AIM_ACCELERATOR_TYPE=cpu"],"Labels":{"com.amd.aim.model.canonicalName":"Org/Served-Model"}}"#,
+    );
+
+    #[test]
+    fn serve_http_reaches_ready_then_marks_a_clean_container_exit_stopped() {
+        if in_subprocess() {
+            let port = spawn_fake_openai(SERVED);
+            let state_path = data_dir().join("svc.json");
+            serve_http(serve_request("svc-clean", port, state_path.clone())).unwrap();
+            assert_eq!(status_of(&state_path).as_deref(), Some("stopped"));
+            let state = crate::state::read_service_state(&state_path).unwrap();
+            assert_eq!(state["served_model_id"], SERVED);
+            return;
+        }
+        let fixture = run_with_fake_docker(
+            "process::subprocess_tests::serve_http_reaches_ready_then_marks_a_clean_container_exit_stopped",
+            &[
+                LABELLED_IMAGE,
+                ("FAKE_DOCKER_IMAGE_PRESENT_EXIT", "0"),
+                (
+                    "FAKE_DOCKER_INSPECT_SEQUENCE",
+                    "missing,true 0,true 0,false 0",
+                ),
+            ],
+        );
+        let argv = fixture.argv();
+        assert!(
+            argv.iter()
+                .any(|line| line.starts_with("run -d --name rocm-aim-svc-clean")),
+            "{argv:?}"
+        );
+        assert!(
+            argv.contains(&"rm -f rocm-aim-svc-clean".to_owned()),
+            "{argv:?}"
+        );
+    }
+
+    #[test]
+    fn serve_http_discovers_the_served_name_when_the_image_has_no_label() {
+        if in_subprocess() {
+            let port = spawn_fake_openai(SERVED);
+            let state_path = data_dir().join("svc.json");
+            serve_http(serve_request("svc-discover", port, state_path.clone())).unwrap();
+            let state = crate::state::read_service_state(&state_path).unwrap();
+            assert_eq!(state["served_model_id"], SERVED);
+            return;
+        }
+        run_with_fake_docker(
+            "process::subprocess_tests::serve_http_discovers_the_served_name_when_the_image_has_no_label",
+            &[
+                ("FAKE_DOCKER_IMAGE_CONFIG", r#"{"Env":[]}"#),
+                ("FAKE_DOCKER_IMAGE_PRESENT_EXIT", "0"),
+                (
+                    "FAKE_DOCKER_INSPECT_SEQUENCE",
+                    "missing,true 0,true 0,false 0",
+                ),
+            ],
+        );
+    }
+
+    #[test]
+    fn serve_http_records_failed_and_errors_when_the_container_crashes_after_ready() {
+        if in_subprocess() {
+            let port = spawn_fake_openai(SERVED);
+            let state_path = data_dir().join("svc.json");
+            let error = serve_http(serve_request("svc-crash", port, state_path.clone()))
+                .expect_err("a crash after readiness must be an error so rocmd recovers it");
+            assert!(error.to_string().contains("137"), "{error}");
+            assert_eq!(status_of(&state_path).as_deref(), Some("failed"));
+            return;
+        }
+        run_with_fake_docker(
+            "process::subprocess_tests::serve_http_records_failed_and_errors_when_the_container_crashes_after_ready",
+            &[
+                LABELLED_IMAGE,
+                ("FAKE_DOCKER_IMAGE_PRESENT_EXIT", "0"),
+                (
+                    "FAKE_DOCKER_INSPECT_SEQUENCE",
+                    "missing,true 0,true 0,false 137",
+                ),
+            ],
+        );
+    }
+
+    #[test]
+    fn serve_http_records_failed_when_the_container_is_removed_while_serving() {
+        if in_subprocess() {
+            let port = spawn_fake_openai(SERVED);
+            let state_path = data_dir().join("svc.json");
+            serve_http(serve_request("svc-gone", port, state_path.clone()))
+                .expect_err("a vanished container must end the supervisor, not spin");
+            assert_eq!(status_of(&state_path).as_deref(), Some("failed"));
+            return;
+        }
+        run_with_fake_docker(
+            "process::subprocess_tests::serve_http_records_failed_when_the_container_is_removed_while_serving",
+            &[
+                LABELLED_IMAGE,
+                ("FAKE_DOCKER_IMAGE_PRESENT_EXIT", "0"),
+                (
+                    "FAKE_DOCKER_INSPECT_SEQUENCE",
+                    "missing,true 0,true 0,missing",
+                ),
+            ],
+        );
+    }
+
+    #[test]
+    fn serve_http_removes_the_container_and_marks_failed_on_readiness_failure() {
+        if in_subprocess() {
+            let state_path = data_dir().join("svc.json");
+            serve_http(serve_request("svc-not-ready", 18084, state_path.clone()))
+                .expect_err("readiness failure should surface as an error");
+            assert_eq!(status_of(&state_path).as_deref(), Some("failed"));
+            return;
+        }
+        let fixture = run_with_fake_docker(
+            "process::subprocess_tests::serve_http_removes_the_container_and_marks_failed_on_readiness_failure",
+            &[
+                LABELLED_IMAGE,
+                ("FAKE_DOCKER_IMAGE_PRESENT_EXIT", "0"),
+                ("FAKE_DOCKER_INSPECT_SEQUENCE", "missing,false 1"),
+                ("FAKE_DOCKER_LOGS", "widget crashed"),
+            ],
+        );
+        assert!(
+            fixture
+                .argv()
+                .contains(&"rm -f rocm-aim-svc-not-ready".to_owned()),
+            "{:?}",
+            fixture.argv()
+        );
+    }
+
+    #[test]
+    fn run_container_removes_a_stale_exited_container_before_running_again() {
+        if in_subprocess() {
+            run_container(
+                "svc-stale",
+                IMAGE,
+                "127.0.0.1",
+                18085,
+                &DevicePolicy::CpuOnly,
+                &[],
+                None,
+            )
+            .unwrap();
+            return;
+        }
+        let fixture = run_with_fake_docker(
+            "process::subprocess_tests::run_container_removes_a_stale_exited_container_before_running_again",
+            &[
+                ("FAKE_DOCKER_IMAGE_PRESENT_EXIT", "0"),
+                ("FAKE_DOCKER_INSPECT_SEQUENCE", "false 137"),
+            ],
+        );
+        let argv = fixture.argv();
+        let rm = argv
+            .iter()
+            .position(|line| line == "rm -f rocm-aim-svc-stale");
+        let run = argv
+            .iter()
+            .position(|line| line.starts_with("run -d --name rocm-aim-svc-stale"));
+        assert!(
+            matches!((rm, run), (Some(rm), Some(run)) if rm < run),
+            "the stale container must be removed before `docker run`: {argv:?}"
+        );
+    }
 
     #[test]
     fn run_container_skips_docker_run_when_already_running() {
         if in_subprocess() {
-            let result = run_container(
+            run_container(
                 "svc-already-running",
-                BOGUS_IMAGE,
+                IMAGE,
                 "127.0.0.1",
                 18080,
                 &DevicePolicy::GpuPreferred,
                 &[],
                 None,
-            );
-            assert!(result.is_ok(), "{result:?}");
+            )
+            .unwrap();
             return;
         }
-        run_with_fake_docker(
+        let fixture = run_with_fake_docker(
             "process::subprocess_tests::run_container_skips_docker_run_when_already_running",
             &[
-                ("FAKE_DOCKER_RUNNING", "true"),
+                ("FAKE_DOCKER_INSPECT_SEQUENCE", "true 0"),
                 ("FAKE_DOCKER_PULL_EXIT", "1"),
                 ("FAKE_DOCKER_RUN_EXIT", "1"),
             ],
+        );
+        assert!(
+            !fixture.argv().iter().any(|line| line.starts_with("run ")),
+            "{:?}",
+            fixture.argv()
         );
     }
 
     #[test]
     fn run_container_pulls_when_image_absent_then_runs() {
         if in_subprocess() {
-            let result = run_container(
+            run_container(
                 "svc-pull-then-run",
-                BOGUS_IMAGE,
+                IMAGE,
                 "127.0.0.1",
                 18081,
-                &DevicePolicy::GpuPreferred,
+                &DevicePolicy::CpuOnly,
                 &[],
                 None,
-            );
-            assert!(result.is_ok(), "{result:?}");
+            )
+            .unwrap();
             return;
         }
-        run_with_fake_docker(
+        let fixture = run_with_fake_docker(
             "process::subprocess_tests::run_container_pulls_when_image_absent_then_runs",
             &[
+                ("FAKE_DOCKER_INSPECT_SEQUENCE", "missing"),
                 ("FAKE_DOCKER_IMAGE_PRESENT_EXIT", "1"),
-                ("FAKE_DOCKER_PULL_EXIT", "0"),
-                ("FAKE_DOCKER_RUN_EXIT", "0"),
             ],
+        );
+        assert!(
+            fixture
+                .argv()
+                .iter()
+                .any(|line| line == "pull org/aim-fixture:1")
         );
     }
 
@@ -662,7 +1189,7 @@ exit 0
         if in_subprocess() {
             let error = run_container(
                 "svc-pull-fails",
-                BOGUS_IMAGE,
+                IMAGE,
                 "127.0.0.1",
                 18082,
                 &DevicePolicy::GpuPreferred,
@@ -676,6 +1203,7 @@ exit 0
         run_with_fake_docker(
             "process::subprocess_tests::run_container_bails_when_pull_fails",
             &[
+                ("FAKE_DOCKER_INSPECT_SEQUENCE", "missing"),
                 ("FAKE_DOCKER_IMAGE_PRESENT_EXIT", "1"),
                 ("FAKE_DOCKER_PULL_EXIT", "1"),
             ],
@@ -687,10 +1215,10 @@ exit 0
         if in_subprocess() {
             let error = run_container(
                 "svc-run-fails",
-                BOGUS_IMAGE,
+                IMAGE,
                 "127.0.0.1",
                 18083,
-                &DevicePolicy::GpuPreferred,
+                &DevicePolicy::CpuOnly,
                 &[],
                 None,
             )
@@ -703,10 +1231,70 @@ exit 0
         run_with_fake_docker(
             "process::subprocess_tests::run_container_bails_when_docker_run_fails",
             &[
+                ("FAKE_DOCKER_INSPECT_SEQUENCE", "missing"),
                 ("FAKE_DOCKER_IMAGE_PRESENT_EXIT", "0"),
                 ("FAKE_DOCKER_RUN_EXIT", "1"),
                 ("FAKE_DOCKER_RUN_STDERR", "boom"),
             ],
+        );
+    }
+
+    #[test]
+    fn run_container_rejects_reserved_env_overrides_before_running_docker() {
+        if in_subprocess() {
+            for key in ["VLLM_API_KEY", "HIP_VISIBLE_DEVICES"] {
+                let env = BTreeMap::from([(key.to_owned(), "x".to_owned())]);
+                let error = run_container(
+                    "svc-reserved",
+                    IMAGE,
+                    "127.0.0.1",
+                    18086,
+                    &DevicePolicy::CpuOnly,
+                    &[],
+                    Some(&env),
+                )
+                .expect_err("reserved key must be rejected");
+                assert!(error.to_string().contains(key), "{error}");
+            }
+            return;
+        }
+        let fixture = run_with_fake_docker(
+            "process::subprocess_tests::run_container_rejects_reserved_env_overrides_before_running_docker",
+            &[
+                ("FAKE_DOCKER_INSPECT_SEQUENCE", "missing"),
+                ("FAKE_DOCKER_IMAGE_PRESENT_EXIT", "0"),
+            ],
+        );
+        assert!(!fixture.argv().iter().any(|line| line.starts_with("run ")));
+    }
+
+    #[test]
+    fn run_container_passes_the_catalog_env_through_the_env_file_not_argv() {
+        if in_subprocess() {
+            let env = BTreeMap::from([("AIM_PROFILE_ID".to_owned(), "vllm-profile".to_owned())]);
+            run_container(
+                "svc-env",
+                IMAGE,
+                "127.0.0.1",
+                18087,
+                &DevicePolicy::CpuOnly,
+                &[],
+                Some(&env),
+            )
+            .unwrap();
+            return;
+        }
+        let fixture = run_with_fake_docker(
+            "process::subprocess_tests::run_container_passes_the_catalog_env_through_the_env_file_not_argv",
+            &[
+                ("FAKE_DOCKER_INSPECT_SEQUENCE", "missing"),
+                ("FAKE_DOCKER_IMAGE_PRESENT_EXIT", "0"),
+            ],
+        );
+        assert!(!fixture.argv().join("\n").contains("vllm-profile"));
+        assert_eq!(
+            fixture.env_copy().as_deref(),
+            Some("AIM_PROFILE_ID=vllm-profile\n")
         );
     }
 
@@ -717,7 +1305,7 @@ exit 0
                 "fake-container",
                 "127.0.0.1",
                 19999,
-                "model-x",
+                Some("model-x"),
                 Duration::from_secs(5),
             )
             .expect_err("early container exit should bail");
@@ -738,17 +1326,34 @@ exit 0
     }
 
     #[test]
+    fn wait_for_container_ready_bails_when_the_container_is_removed() {
+        if in_subprocess() {
+            let error = wait_for_container_ready(
+                "fake-container",
+                "127.0.0.1",
+                19998,
+                Some("model-x"),
+                Duration::from_secs(5),
+            )
+            .expect_err("a missing container should bail");
+            assert!(error.to_string().contains("no longer exists"), "{error}");
+            return;
+        }
+        run_with_fake_docker(
+            "process::subprocess_tests::wait_for_container_ready_bails_when_the_container_is_removed",
+            &[("FAKE_DOCKER_INSPECT_MISSING", "1")],
+        );
+    }
+
+    #[test]
     fn wait_for_container_ready_bails_on_timeout() {
         if in_subprocess() {
-            // Unbound port: the readiness HTTP probe fails fast (connection
-            // refused), so this only exercises the timeout bookkeeping, not a
-            // real OpenAI-compatible server (left as a judgment call — see the
-            // PR summary).
+            // Unbound port: the readiness HTTP probe fails fast (connection refused).
             let error = wait_for_container_ready(
                 "fake-container",
                 "127.0.0.1",
                 59123,
-                "model-x",
+                Some("model-x"),
                 Duration::from_millis(10),
             )
             .expect_err("timeout should bail");
@@ -765,49 +1370,7 @@ exit 0
     }
 
     #[test]
-    fn serve_http_stops_container_and_marks_state_failed_on_readiness_failure() {
-        if in_subprocess() {
-            let dir = std::env::temp_dir().join(format!(
-                "aim-serve-http-test-{}",
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
-            let state_path = dir.join("svc.json");
-
-            let request = ServeHttpRequest {
-                service_id: "svc-serve-http-fails".to_owned(),
-                model_ref: BOGUS_IMAGE.to_owned(),
-                host: "127.0.0.1".to_owned(),
-                port: 18084,
-                device_policy: DevicePolicy::GpuPreferred,
-                gpu_indices: vec![],
-                runtime_id: None,
-                env_id: None,
-                state_path: state_path.clone(),
-                log_path: None,
-                engine_recipe: None,
-            };
-            serve_http(request).expect_err("readiness failure should surface as an error");
-
-            let state = crate::state::read_service_state(&state_path).unwrap();
-            assert_eq!(state.get("status").and_then(|v| v.as_str()), Some("failed"));
-
-            std::fs::remove_dir_all(&dir).ok();
-            return;
-        }
-        run_with_fake_docker(
-            "process::subprocess_tests::serve_http_stops_container_and_marks_state_failed_on_readiness_failure",
-            &[
-                ("FAKE_DOCKER_RUNNING", "false"),
-                ("FAKE_DOCKER_EXIT_CODE", "1"),
-            ],
-        );
-    }
-
-    #[test]
-    fn stop_service_force_stop_succeeds_and_writes_stopped_state() {
+    fn stop_service_records_intent_kills_removes_and_writes_stopped_state() {
         if in_subprocess() {
             let response = stop_service(StopRequest {
                 service_id: "svc-stop-succeeds".to_owned(),
@@ -816,32 +1379,25 @@ exit 0
             .unwrap();
             assert!(response.stopped);
             assert!(!response.graceful);
-
             let state_path = crate::state::state_path("svc-stop-succeeds");
-            let state = crate::state::read_service_state(&state_path).unwrap();
-            assert_eq!(
-                state.get("status").and_then(|v| v.as_str()),
-                Some("stopped")
-            );
+            assert_eq!(status_of(&state_path).as_deref(), Some("stopped"));
             return;
         }
-        let dir = std::env::temp_dir().join(format!(
-            "aim-stop-service-test-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        run_with_fake_docker(
-            "process::subprocess_tests::stop_service_force_stop_succeeds_and_writes_stopped_state",
-            &[("ROCM_CLI_DATA_DIR", dir.to_str().unwrap())],
+        let fixture = run_with_fake_docker(
+            "process::subprocess_tests::stop_service_records_intent_kills_removes_and_writes_stopped_state",
+            &[],
         );
-        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(
+            fixture.argv(),
+            vec![
+                "kill rocm-aim-svc-stop-succeeds",
+                "rm -f rocm-aim-svc-stop-succeeds"
+            ]
+        );
     }
 
     #[test]
-    fn stop_service_missing_container_reports_not_stopped_without_writing_state() {
+    fn stop_service_of_a_missing_container_reports_not_stopped_but_still_cleans_up() {
         if in_subprocess() {
             let response = stop_service(StopRequest {
                 service_id: "svc-stop-missing".to_owned(),
@@ -850,26 +1406,37 @@ exit 0
             .unwrap();
             assert!(!response.stopped);
             assert!(!response.graceful);
-
-            let state_path = crate::state::state_path("svc-stop-missing");
-            assert!(!state_path.exists());
             return;
         }
-        let dir = std::env::temp_dir().join(format!(
-            "aim-stop-service-missing-test-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
         run_with_fake_docker(
-            "process::subprocess_tests::stop_service_missing_container_reports_not_stopped_without_writing_state",
+            "process::subprocess_tests::stop_service_of_a_missing_container_reports_not_stopped_but_still_cleans_up",
             &[
-                ("ROCM_CLI_DATA_DIR", dir.to_str().unwrap()),
                 ("FAKE_DOCKER_STOP_NO_SUCH_CONTAINER", "1"),
+                ("FAKE_DOCKER_RM_NO_SUCH_CONTAINER", "1"),
             ],
         );
-        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn stop_service_failure_restores_the_prior_status_and_keeps_the_container() {
+        if in_subprocess() {
+            let state_path = crate::state::state_path("svc-stop-fails");
+            crate::state::write_status(&state_path, "running").unwrap();
+            stop_service(StopRequest {
+                service_id: "svc-stop-fails".to_owned(),
+                force: true,
+            })
+            .expect_err("a failed kill must be reported, not swallowed");
+            assert_eq!(status_of(&state_path).as_deref(), Some("running"));
+            return;
+        }
+        let fixture = run_with_fake_docker(
+            "process::subprocess_tests::stop_service_failure_restores_the_prior_status_and_keeps_the_container",
+            &[
+                ("FAKE_DOCKER_STOP_EXIT", "1"),
+                ("FAKE_DOCKER_STOP_STDERR", "permission denied"),
+            ],
+        );
+        assert!(!fixture.argv().iter().any(|line| line.starts_with("rm ")));
     }
 }
