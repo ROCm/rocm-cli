@@ -21,7 +21,6 @@
 //! to `service_launch.rs` in ROCMAI-91 (Phase 6b), along with its test module;
 //! this file's `use` list below points there now instead of at the crate root.
 
-use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use anyhow::{Result, bail};
@@ -130,16 +129,21 @@ fn serve_model_ref_for_engine(
     else {
         return model.to_owned();
     };
-    if let Some(override_id) = recipe
+    let engine_recipe = recipe
         .engine_recipes
         .iter()
-        .find(|engine_recipe| engine_recipe.engine.eq_ignore_ascii_case(selected_engine))
+        .find(|engine_recipe| engine_recipe.engine.eq_ignore_ascii_case(selected_engine));
+    let base = engine_recipe
         .and_then(|engine_recipe| engine_recipe.model_id_override.as_deref())
         .filter(|value| !value.trim().is_empty())
-    {
-        return override_id.to_owned();
+        .map_or_else(|| recipe.canonical_model_id.clone(), ToOwned::to_owned);
+    // Pins a container-based engine (e.g. AIM) to the catalog's `image_digest`
+    // rather than a floating tag, so a `docker pull`/`run` keyed on this ref
+    // actually enforces it instead of the field being purely informational.
+    match engine_recipe.and_then(|engine_recipe| engine_recipe.image_digest.as_deref()) {
+        Some(digest) if !digest.trim().is_empty() => format!("{base}@{digest}"),
+        _ => base,
     }
-    recipe.canonical_model_id.clone()
 }
 
 fn serve_engine_selection_line(selection: &ServeEngineSelection) -> String {
@@ -181,7 +185,7 @@ fn protocol_engine_recipe_hint(
             engine: engine_recipe.engine.clone(),
             required_flags: engine_recipe.required_flags.clone(),
             parser_settings: engine_recipe.parser_settings.clone(),
-            extra_env: BTreeMap::new(),
+            extra_env: engine_recipe.extra_env.clone(),
             preferred_endpoint: engine_recipe.preferred_endpoint.as_ref().map(|endpoint| {
                 EngineRecipeEndpointHint {
                     endpoint_mode: endpoint.endpoint_mode.clone(),
@@ -277,8 +281,7 @@ fn engine_recipe_with_generation_defaults(
         engine: engine.to_owned(),
         ..EngineRecipeHint::default()
     });
-    if engine.eq_ignore_ascii_case("vllm") || engine.eq_ignore_ascii_case("aim") {
-        // AIM images bundle vLLM, so its `--override-generation-config` flag applies unchanged.
+    if engine.eq_ignore_ascii_case("vllm") {
         let mut overrides = serde_json::Map::new();
         if let Some(temperature) = defaults.temperature {
             overrides.insert("temperature".to_owned(), serde_json::json!(temperature));
@@ -517,6 +520,16 @@ fn engine_recipe_with_extra_env(
     Ok(Some(hint))
 }
 
+/// `--engine-env` note shown when the flag was passed but the selected engine
+/// never consumes `EngineRecipeHint::extra_env` (only `aim` does; see
+/// `engine_recipe_with_extra_env`), so the override would otherwise be silently
+/// dropped with no indication to the user.
+fn engine_env_ignored_note(engine: &str, engine_env: &[String]) -> Option<String> {
+    (!engine_env.is_empty() && !engine.eq_ignore_ascii_case("aim")).then(|| {
+        format!("--engine-env applies only to engine 'aim'; ignored for engine '{engine}'")
+    })
+}
+
 /// Whether the resolved engine recipe launches vLLM with tool calling enabled.
 fn engine_recipe_enables_tool_choice(hint: Option<&EngineRecipeHint>) -> bool {
     hint.is_some_and(|hint| {
@@ -664,6 +677,7 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
         generation_defaults,
     )?;
     let engine_recipe = engine_recipe_with_extra_env(&selected_engine, engine_recipe, &engine_env)?;
+    let engine_env_note = engine_env_ignored_note(&selected_engine, &engine_env);
     let tool_call_note = if tool_call_parser.is_some() && !engine_serves_vllm {
         Some(format!(
             "note: --tool-call-parser applies only to vLLM; ignored for engine '{selected_engine}'"
@@ -879,6 +893,9 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
         if let Some(note) = &gpu_memory_utilization_note {
             println!("  note: {note}");
         }
+        if let Some(note) = &engine_env_note {
+            println!("  note: {note}");
+        }
     }
 
     let managed_runtime_id = resolved_selection.runtime_id.clone();
@@ -948,7 +965,7 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
             };
             spinner.clear();
 
-            let notes = collect_serve_notes(
+            let mut notes = collect_serve_notes(
                 cpu_only,
                 &gpu_selection,
                 rocr_visible_devices_set,
@@ -958,6 +975,9 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
                 host_gpu_summary.as_ref(),
                 engine_serves_vllm,
             );
+            if let Some(note) = &engine_env_note {
+                notes.push(note.clone());
+            }
             let summary = serve_summary::DeploymentSummary {
                 engine: selected_engine.clone(),
                 requested_model: model,
@@ -1111,6 +1131,22 @@ mod tests {
     }
 
     #[test]
+    fn serve_model_ref_for_engine_pins_image_digest_when_set() {
+        let mut recipe = resolve_builtin_model_recipe("qwen32b").expect("qwen32b recipe");
+        let vllm_recipe = recipe
+            .engine_recipes
+            .iter_mut()
+            .find(|engine_recipe| engine_recipe.engine == "vllm")
+            .expect("qwen32b has a vllm engine recipe");
+        vllm_recipe.image_digest = Some("sha256:abcd1234".to_owned());
+
+        assert_eq!(
+            serve_model_ref_for_engine("qwen32b", Some(&recipe), "vllm"),
+            "Qwen/Qwen3-32B-FP8@sha256:abcd1234"
+        );
+    }
+
+    #[test]
     fn explicit_engine_override_keeps_alias_when_shared_recipe_is_for_another_engine() {
         // `qwen-smoke` is a Lemonade-only GGUF recipe (no vLLM engine recipe).
         let recipe = resolve_builtin_model_recipe("qwen-smoke").expect("qwen-smoke recipe");
@@ -1124,6 +1160,22 @@ mod tests {
         assert_eq!(
             serve_model_ref_for_engine("qwen-smoke", Some(&recipe), "vllm"),
             "qwen-smoke"
+        );
+    }
+
+    #[test]
+    fn serve_model_ref_for_engine_ignores_blank_image_digest() {
+        let mut recipe = resolve_builtin_model_recipe("qwen32b").expect("qwen32b recipe");
+        recipe
+            .engine_recipes
+            .iter_mut()
+            .find(|engine_recipe| engine_recipe.engine == "vllm")
+            .expect("vllm engine recipe")
+            .image_digest = Some("   ".to_owned());
+
+        assert_eq!(
+            serve_model_ref_for_engine("qwen32b", Some(&recipe), "vllm"),
+            "Qwen/Qwen3-32B-FP8"
         );
     }
 
@@ -1174,6 +1226,7 @@ mod tests {
                 notes: vec!["adapter hint".to_owned()],
                 model_id_override: None,
                 image_digest: None,
+                extra_env: BTreeMap::new(),
             },
             rocm_core::ModelRecipeEngineRecord {
                 engine: "lemonade".to_owned(),
@@ -1184,6 +1237,7 @@ mod tests {
                 notes: Vec::new(),
                 model_id_override: None,
                 image_digest: None,
+                extra_env: BTreeMap::new(),
             },
         ];
 
@@ -1549,6 +1603,26 @@ mod tests {
     }
 
     #[test]
+    fn generation_defaults_reject_aim_instead_of_silently_dropping() {
+        // AIM's engine code only ever reads `extra_env`, never `required_flags` — a
+        // container launch has no argv to carry `--override-generation-config`
+        // into, unlike vLLM's own host process. Writing it into `required_flags`
+        // anyway would silently drop `--temperature`/`--top-p`/`--max-tokens` for
+        // `rocm serve --engine aim`, so this must fail fast instead.
+        let error = engine_recipe_with_generation_defaults(
+            "aim",
+            None,
+            ServeGenerationDefaults {
+                temperature: Some(0.5),
+                top_p: None,
+                max_tokens: None,
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("aim"));
+    }
+
+    #[test]
     fn generation_defaults_translate_to_lemonade_llama_server_flags() {
         let hint = engine_recipe_with_generation_defaults(
             "lemonade",
@@ -1600,6 +1674,87 @@ mod tests {
             hint.required_flags,
             ["--top-p", "0.9", "--temperature", "0.5"]
         );
+    }
+
+    #[test]
+    fn extra_env_absent_passes_hint_through_unchanged() {
+        assert!(
+            engine_recipe_with_extra_env("aim", None, &[])
+                .unwrap()
+                .is_none()
+        );
+
+        let authored = EngineRecipeHint {
+            contract_version: ENGINE_RECIPE_CONTRACT_VERSION.to_owned(),
+            engine: "aim".to_owned(),
+            ..EngineRecipeHint::default()
+        };
+        let hint = engine_recipe_with_extra_env("aim", Some(authored.clone()), &[]).unwrap();
+        assert_eq!(hint, Some(authored));
+    }
+
+    #[test]
+    fn extra_env_synthesizes_hint_and_merges_into_authored_one() {
+        let hint = engine_recipe_with_extra_env("aim", None, &["AIM_PROFILE_ID=foo".to_owned()])
+            .unwrap()
+            .expect("--engine-env should synthesize a hint");
+        assert_eq!(hint.engine, "aim");
+        assert_eq!(
+            hint.extra_env.get("AIM_PROFILE_ID"),
+            Some(&"foo".to_owned())
+        );
+
+        let authored = EngineRecipeHint {
+            contract_version: ENGINE_RECIPE_CONTRACT_VERSION.to_owned(),
+            engine: "aim".to_owned(),
+            extra_env: BTreeMap::from([("EXISTING".to_owned(), "kept".to_owned())]),
+            ..EngineRecipeHint::default()
+        };
+        let hint =
+            engine_recipe_with_extra_env("aim", Some(authored), &["AIM_PROFILE_ID=foo".to_owned()])
+                .unwrap()
+                .unwrap();
+        assert_eq!(hint.extra_env.get("EXISTING"), Some(&"kept".to_owned()));
+        assert_eq!(
+            hint.extra_env.get("AIM_PROFILE_ID"),
+            Some(&"foo".to_owned())
+        );
+    }
+
+    #[test]
+    fn extra_env_rejects_entry_with_no_equals_sign() {
+        let error =
+            engine_recipe_with_extra_env("aim", None, &["AIM_PROFILE_ID".to_owned()]).unwrap_err();
+        assert!(error.to_string().contains("KEY=VALUE"));
+    }
+
+    #[test]
+    fn extra_env_rejects_entry_with_empty_key() {
+        let error =
+            engine_recipe_with_extra_env("aim", None, &["=some-value".to_owned()]).unwrap_err();
+        assert!(error.to_string().contains("non-empty key"));
+    }
+
+    #[test]
+    fn engine_env_ignored_note_is_none_for_aim() {
+        assert_eq!(
+            engine_env_ignored_note("aim", &["AIM_PROFILE_ID=foo".to_owned()]),
+            None
+        );
+    }
+
+    #[test]
+    fn engine_env_ignored_note_is_none_when_engine_env_is_empty() {
+        assert_eq!(engine_env_ignored_note("vllm", &[]), None);
+    }
+
+    #[test]
+    fn engine_env_ignored_note_warns_for_engines_that_do_not_consume_it() {
+        let note = engine_env_ignored_note("vllm", &["FOO=bar".to_owned()])
+            .expect("vllm does not consume extra_env");
+        assert!(note.contains("--engine-env"));
+        assert!(note.contains("'aim'"));
+        assert!(note.contains("'vllm'"));
     }
 
     #[test]

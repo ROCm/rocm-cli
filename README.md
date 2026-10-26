@@ -618,7 +618,7 @@ rocm engines install <engine> [--runtime-id KEY] [--python-version X.Y] [--reins
 rocm engines shell <engine>   [--runtime-id KEY | --env-id ID] [--shell PATH]
 ```
 
-Supported engines: `lemonade`, `vllm`.
+Supported engines: `lemonade`, `vllm`, `aim`.
 
 ### Will a model run here?
 
@@ -646,7 +646,7 @@ outside the catalog, this just cannot tell you in advance how it will go.
 Start a local OpenAI-compatible model server:
 
 ```
-rocm serve <model> [--engine lemonade|vllm]
+rocm serve <model> [--engine lemonade|vllm|aim]
                    [--device gpu_required|gpu_preferred]
                    [--gpu auto|<index>]
                    [--runtime-id KEY | --env-id ID]
@@ -655,7 +655,14 @@ rocm serve <model> [--engine lemonade|vllm]
                    [--no-smoke-test]
                    [--allow-public-bind]
                    [--temperature TEMP] [--top-p PROB] [--max-tokens N]
+                   [--engine-env KEY=VALUE]...
 ```
+
+`--engine aim` runs the model in a Docker container instead of a host
+process; it requires a reachable Docker daemon and is Linux/WSL2 only.
+`--engine-env` passes an extra `KEY=VALUE` environment variable through to
+the engine's own process/container (repeatable); currently only `aim`
+consumes these (e.g. `AIM_PROFILE_ID`).
 
 `--temperature` (>= 0.0), `--top-p` (0.0-1.0), and `--max-tokens` (> 0) set
 server-wide sampling defaults for the launched engine. They apply only to

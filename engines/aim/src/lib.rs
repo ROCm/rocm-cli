@@ -114,7 +114,7 @@ pub(crate) struct ServeHttpRequest {
 pub fn run_cli() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        CommandKind::Detect => print_json(&detect_response()),
+        CommandKind::Detect => print_json(&detect_response(None)),
         CommandKind::Capabilities => print_json(&capabilities()),
         CommandKind::Install {
             runtime_id,
@@ -248,8 +248,8 @@ pub fn builtin_serve_http(
 fn handle_envelope(envelope: EngineRequestEnvelope) -> EngineResponseEnvelope {
     match envelope.method {
         EngineMethod::Detect => {
-            deserialize_and_respond::<DetectRequest, _, _>(envelope.payload, |_request| {
-                Ok(detect_response())
+            deserialize_and_respond::<DetectRequest, _, _>(envelope.payload, |request| {
+                Ok(detect_response(request.runtime_id))
             })
         }
         EngineMethod::Capabilities => EngineResponseEnvelope::success(capabilities()),
@@ -295,7 +295,11 @@ where
     }
 }
 
-fn detect_response() -> DetectResponse {
+/// `env_id` echoes back `runtime_id` when Docker is reachable, matching what
+/// `install_response` reports for the same `runtime_id` -- aim has no actual
+/// install step beyond "Docker is present", so Detect and Install have to
+/// agree on readiness or every serve re-runs Install for nothing.
+fn detect_response(runtime_id: Option<String>) -> DetectResponse {
     let reachable = crate::docker::daemon_reachable();
     let mut notes = Vec::new();
     if !reachable {
@@ -306,7 +310,7 @@ fn detect_response() -> DetectResponse {
     }
     DetectResponse {
         installed: reachable,
-        env_id: None,
+        env_id: reachable.then_some(runtime_id).flatten(),
         runtime_kind: Some("docker".to_owned()),
         runtime_executable: Some("docker".to_owned()),
         managed_env: Some(false),
@@ -315,8 +319,10 @@ fn detect_response() -> DetectResponse {
         transformers_version: None,
         available_devices: vec![EngineDeviceAvailability {
             kind: "rocm_gpu".to_owned(),
-            available: reachable,
-            reason: if reachable {
+            available: reachable && !cfg!(windows),
+            reason: if cfg!(windows) {
+                Some(windows_gpu_unsupported_message().to_owned())
+            } else if reachable {
                 None
             } else {
                 Some("docker daemon unreachable".to_owned())
@@ -327,15 +333,101 @@ fn detect_response() -> DetectResponse {
     }
 }
 
+#[cfg(all(test, unix))]
+mod detect_tests {
+    use super::detect_response;
+    use rocm_core::fake_executable::write_fake_executable;
+    use std::path::PathBuf;
+    use std::process::{Command, Stdio};
+
+    const DOCKER_REACHABLE_TEST_DIR: &str = "ROCM_AIM_DOCKER_REACHABLE_TEST_DIR";
+
+    /// Child half of [`detect_response_echoes_runtime_id_as_env_id_when_docker_is_reachable`].
+    ///
+    /// Runs in its own process so the `PATH` override (a fake `docker` that
+    /// always succeeds) can be set with `Command::env` -- mutating `PATH`
+    /// in-process would need `unsafe`, which the workspace denies.
+    #[test]
+    fn docker_reachable_subprocess_helper() {
+        if std::env::var_os(DOCKER_REACHABLE_TEST_DIR).is_none() {
+            return;
+        }
+        let response = detect_response(Some("aim".to_owned()));
+        assert_eq!(
+            response.env_id,
+            Some("aim".to_owned()),
+            "env_id must echo the requested runtime_id once Detect reports installed, or \
+             `ensure_self_managed_engine_ready` will treat aim as never installed"
+        );
+    }
+
+    /// Fix for the review finding that `ensure_self_managed_engine_ready`
+    /// re-runs Install on every aim serve: Detect always reported `env_id:
+    /// None`, which could never equal the `runtime_id` the caller compares it
+    /// against.
+    #[test]
+    fn detect_response_echoes_runtime_id_as_env_id_when_docker_is_reachable() {
+        let dir = std::env::temp_dir().join(format!(
+            "aim-detect-docker-reachable-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let fake_bin = dir.join("bin");
+        std::fs::create_dir_all(&fake_bin).unwrap();
+        write_fake_executable(&fake_bin.join("docker"), "#!/bin/sh\nexit 0\n").unwrap();
+
+        let mut entries = vec![fake_bin];
+        entries.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "detect_tests::docker_reachable_subprocess_helper",
+                "--nocapture",
+            ])
+            .env(DOCKER_REACHABLE_TEST_DIR, PathBuf::from("1"))
+            .env("PATH", std::env::join_paths(entries).unwrap())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "helper subprocess failed");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn detect_response_has_no_env_id_when_runtime_id_is_absent() {
+        // Standalone CLI mode (`rocm-engine-aim detect`) passes no runtime_id;
+        // there is nothing to echo back regardless of Docker reachability.
+        assert_eq!(detect_response(None).env_id, None);
+    }
+}
+
 pub(crate) fn capabilities() -> EngineCapabilities {
     EngineCapabilities {
         cpu: true,
-        rocm_gpu: true,
+        // `crate::docker::gpu_device_args` only knows WSL2 (`/dev/dxg`) and
+        // assumed-native-Linux (`/dev/kfd`/`/dev/dri`) device shapes; native
+        // Windows has neither, so GPU passthrough is unimplemented there
+        // (mirrors `engines/vllm`'s `rocm_gpu: !cfg!(windows)`).
+        rocm_gpu: !cfg!(windows),
         openai_compatible: true,
         tool_calling: false,
         quantized_models: "image-reported".to_owned(),
         reasoning_parser: false,
     }
+}
+
+pub(crate) const fn windows_gpu_unsupported_message() -> &'static str {
+    "AIM GPU passthrough is supported by rocm-cli only on Linux/WSL; native Windows AIM GPU \
+serving is skipped."
 }
 
 fn read_request() -> Result<EngineRequestEnvelope> {

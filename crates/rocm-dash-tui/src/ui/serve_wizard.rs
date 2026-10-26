@@ -38,7 +38,7 @@ use crate::ui::theme::Theme;
 
 /// Engine inventory — names mirror `apps/rocm` `engine_inventory()`. Kept
 /// TUI-local (a stable, small list) so this layer needs no `rocm-core` dep.
-pub const ENGINES: &[&str] = &["lemonade", "vllm"];
+pub const ENGINES: &[&str] = &["lemonade", "vllm", "aim"];
 
 /// Device-policy choices. Index 0 omits `--device` entirely (engine default);
 /// the rest mirror `rocm-core`'s validated `gpu_required|gpu_preferred|cpu_only`.

@@ -7,6 +7,7 @@ use rocm_core::{
     AppPaths, AutomationRuntimeState, ManagedServiceRecord, RocmCliConfig, WatcherRuntimeSnapshot,
     builtin_watchers, daemon_binary_path, unix_time_millis,
 };
+use rocm_engine_protocol::{EngineMethod, StopRequest, StopResponse};
 use serde_json::Value;
 use serde_json::json;
 use std::fs;
@@ -48,6 +49,24 @@ pub(crate) fn stop_managed_service_with(
     let requested_at = rocm_core::unix_time_millis();
     stopping.stop_requested_unix_ms = Some(requested_at);
     stopping.write()?;
+    // Ask the engine to stop before signalling recorded PIDs. For a
+    // PID-supervised engine (vLLM, Lemonade) this redundantly re-signals the
+    // same PID `terminate_recorded_service_pids` below already handles —
+    // harmless, same as `rocm services stop` (`stop_internal_managed_service`)
+    // already does unconditionally. For a container-backed engine like `aim`,
+    // this is the only thing that actually stops the container: its recorded
+    // PIDs belong to a short-lived launcher, not the container itself, so PID
+    // signalling alone leaks it running.
+    let _ = crate::common::engine_request::<_, StopResponse>(
+        paths,
+        &stopping.engine,
+        service_id,
+        EngineMethod::Stop,
+        &StopRequest {
+            service_id: stopping.service_id.clone(),
+            force: true,
+        },
+    );
     let stops = terminate_recorded_service_pids(&stopping, terminate);
     let pids_where = |keep: fn(&RecordedPidStop) -> bool| -> Vec<u32> {
         stops

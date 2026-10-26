@@ -205,7 +205,7 @@ Current workspace members:
 
 - apps: `apps/rocm`, `apps/rocmd`
 - shared crates: `crates/rocm-core`, `crates/rocm-engine-protocol`
-- engine crates: `engines/lemonade`, `engines/vllm`
+- engine crates: `engines/lemonade`, `engines/vllm`, `engines/aim`
 
 Shared UI components — reuse rather than hand-rolling new ones:
 `apps/rocm/src/cli_progress.rs`'s `Spinner` for a caller-driven indicator that

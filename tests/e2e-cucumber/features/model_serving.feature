@@ -346,9 +346,11 @@ Feature: Model serving
   # serves via the raw AIM Docker image reference rather than the catalog
   # recipe added in ROCMAI-555 — it's a hardware-verified canary pinned to one
   # exact image/profile, not a catalog-discovery test. `@requires-engine:aim`
-  # only skips here when Docker itself is unreachable (see
-  # `HostCapability::engine_available`'s "aim" arm); a Strix Halo self-hosted
-  # runner with Docker is where this actually runs. `@serve-timeout:1200`
+  # skips here when Docker is unreachable OR the gfx family isn't one aim is
+  # verified on (see `HostCapability::engine_available`'s "aim" arm — Radeon
+  # gfx110X/120X and Strix Halo gfx1151, not Instinct); a Strix Halo
+  # self-hosted runner with Docker is where this actually runs.
+  # `@serve-timeout:1200`
   # widens both the harness's readiness poll and the CLI's own
   # ROCM_CLI_AIM_READY_TIMEOUT_SECS (see isolate_cmd) — a cold-start HF weight
   # download for this 9B model legitimately exceeds the engine's default

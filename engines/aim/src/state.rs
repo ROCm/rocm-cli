@@ -90,6 +90,15 @@ pub(crate) fn state_path(service_id: &str) -> PathBuf {
     )
 }
 
+/// Replaces every `extra_env` value with a redaction marker, keeping the keys.
+fn redact_engine_recipe_extra_env(hint: &EngineRecipeHint) -> EngineRecipeHint {
+    let mut hint = hint.clone();
+    for value in hint.extra_env.values_mut() {
+        *value = "[redacted]".to_owned();
+    }
+    hint
+}
+
 pub(crate) fn write_running_state(
     service_id: &str,
     model_ref: &str,
@@ -99,6 +108,11 @@ pub(crate) fn write_running_state(
     engine_recipe: Option<&EngineRecipeHint>,
 ) -> Result<()> {
     let endpoint = crate::process::endpoint_url(host, port);
+    // `extra_env` can carry secrets (e.g. an HF token passed via `--engine-env`);
+    // this state file is status/introspection only (never read back to relaunch
+    // the container, see `crate::process::launch_service`), so redact values
+    // before writing it to disk while keeping the keys for visibility.
+    let engine_recipe = engine_recipe.map(redact_engine_recipe_extra_env);
     write_state(
         &state_path(service_id),
         &json!({
@@ -228,6 +242,72 @@ mod tests {
             endpoint_url_from_state(&state).as_deref(),
             Some("http://example.test/v1")
         );
+    }
+
+    #[test]
+    fn healthcheck_reports_unknown_for_a_service_with_no_state_file() {
+        let response = healthcheck_service(HealthcheckRequest {
+            service_id: format!("svc-never-tracked-{}", current_unix_millis()),
+        })
+        .unwrap();
+        assert!(!response.model_loaded);
+        assert_eq!(response.status, "unknown");
+        assert_eq!(response.device, "unknown");
+    }
+
+    #[test]
+    fn redact_engine_recipe_extra_env_masks_values_but_keeps_keys() {
+        let hint = EngineRecipeHint {
+            contract_version: "0.1.0".to_owned(),
+            engine: "aim".to_owned(),
+            extra_env: std::collections::BTreeMap::from([(
+                "HF_TOKEN".to_owned(),
+                "hf_super_secret".to_owned(),
+            )]),
+            ..EngineRecipeHint::default()
+        };
+        let redacted = redact_engine_recipe_extra_env(&hint);
+        assert_eq!(
+            redacted.extra_env.get("HF_TOKEN").map(String::as_str),
+            Some("[redacted]")
+        );
+    }
+
+    #[test]
+    fn write_running_state_never_persists_extra_env_secrets_to_disk() {
+        let dir = std::env::temp_dir().join(format!(
+            "rocm-aim-state-secret-test-{}-{}",
+            std::process::id(),
+            current_unix_millis()
+        ));
+        let service_id = format!("svc-secret-{}", current_unix_millis());
+        let hint = EngineRecipeHint {
+            contract_version: "0.1.0".to_owned(),
+            engine: "aim".to_owned(),
+            extra_env: std::collections::BTreeMap::from([(
+                "HF_TOKEN".to_owned(),
+                "hf_super_secret".to_owned(),
+            )]),
+            ..EngineRecipeHint::default()
+        };
+        let path = state_path(&service_id);
+        // `write_running_state` always writes under `state_path(service_id)`, which
+        // lives outside `dir`; only `dir` is cleaned up below, matching the other
+        // tests in this module that leave the real state dir alone.
+        write_running_state(
+            &service_id,
+            "some/model",
+            "127.0.0.1",
+            8000,
+            DevicePolicy::GpuPreferred,
+            Some(&hint),
+        )
+        .unwrap();
+        let on_disk = fs::read_to_string(&path).unwrap();
+        assert!(!on_disk.contains("hf_super_secret"));
+        assert!(on_disk.contains("HF_TOKEN"));
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

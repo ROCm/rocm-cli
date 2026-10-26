@@ -69,6 +69,11 @@ pub struct ModelRecipeEngineRecord {
     pub required_flags: Vec<String>,
     #[serde(default)]
     pub parser_settings: BTreeMap<String, String>,
+    /// Environment variables this engine recipe requires at launch (for example
+    /// AIM's `AIM_PROFILE_ID`), carried into the launched [`EngineRecipeHint`]'s
+    /// `extra_env` alongside any `--engine-env` CLI overrides.
+    #[serde(default)]
+    pub extra_env: BTreeMap<String, String>,
     #[serde(default)]
     pub preferred_endpoint: Option<ModelRecipeEndpointRecord>,
     #[serde(default)]
@@ -81,9 +86,9 @@ pub struct ModelRecipeEngineRecord {
     #[serde(default)]
     pub model_id_override: Option<String>,
     /// Pins the container image this engine serves the model from to a specific
-    /// digest (`sha256:...`), rather than a floating tag. Currently informational
-    /// only (no verification against it yet); used by container-based engines
-    /// such as AIM.
+    /// digest (`sha256:...`), rather than a floating tag. Enforced by appending
+    /// `@{digest}` to the resolved model ref in `serve_model_ref_for_engine`;
+    /// used by container-based engines such as AIM.
     #[serde(default)]
     pub image_digest: Option<String>,
 }
@@ -659,6 +664,10 @@ fn validate_model_recipe_engine_record(
         require_nonempty(key, "engine parser setting key")?;
         require_nonempty(value, "engine parser setting value")?;
     }
+    for (key, value) in &engine_recipe.extra_env {
+        require_nonempty(key, "engine extra_env key")?;
+        require_nonempty(value, "engine extra_env value")?;
+    }
     if let Some(endpoint) = engine_recipe.preferred_endpoint.as_ref() {
         require_nonempty(&endpoint.endpoint_mode, "engine preferred endpoint mode")?;
         for (key, value) in &endpoint.settings {
@@ -843,7 +852,7 @@ mod tests {
         let strix = resolve_builtin_model_recipe("qwen").expect("qwen assistant");
         assert_eq!(
             model_recipe_target_platform_label(&strix, &platforms),
-            "AMD Ryzen AI - Strix Halo (Lemonade / llama.cpp)"
+            "AMD Ryzen AI - Strix Halo (Lemonade / llama.cpp / AIM)"
         );
         let mi300x = resolve_builtin_model_recipe("qwen3.6-27b").expect("qwen3.6-27b");
         assert_eq!(
@@ -941,6 +950,7 @@ mod tests {
             engine: "vllm".to_owned(),
             required_flags: vec!["--enable-auto-tool-choice".to_owned()],
             parser_settings: BTreeMap::from([("reasoning_parser".to_owned(), "qwen3".to_owned())]),
+            extra_env: BTreeMap::new(),
             preferred_endpoint: Some(ModelRecipeEndpointRecord {
                 endpoint_mode: "openai".to_owned(),
                 settings: BTreeMap::from([("streaming".to_owned(), "true".to_owned())]),

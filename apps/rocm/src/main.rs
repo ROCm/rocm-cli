@@ -3179,33 +3179,51 @@ fn assess_model_for_host(
     rocm_core::model_readiness::assess_model_readiness(model_ref, catalog, host, &engine_for)
 }
 
-/// Whether the platform gate rules this engine out on this host.
+/// Why the platform gate rules an engine out on this host, if it does.
 ///
-/// One place, so the `/model` adapter-availability note and the readiness
-/// verdict cannot answer differently about the same host and engine.
-fn engine_ruled_out_by_platform(engine: &str) -> bool {
-    (rocm_core::runtime_is_windows() && engine.eq_ignore_ascii_case("vllm"))
-        || (engine.eq_ignore_ascii_case("aim")
-            && !rocm_engine_aim::builtin_docker_daemon_reachable())
+/// Returned by [`engine_ruled_out_by_platform`], the one place that decides
+/// *why*, so the `/model` adapter-availability note and the readiness verdict
+/// -- which only decide how to word it -- cannot disagree about the same host
+/// and engine.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PlatformRuleOut {
+    Allowed,
+    NativeWindowsVllm,
+    AimDockerUnavailable,
 }
 
-/// The `unsupported_here` message for an engine, given whether the platform
-/// gate already ruled it out.
+/// Whether, and why, the platform gate rules this engine out on this host.
+fn engine_ruled_out_by_platform(engine: &str) -> PlatformRuleOut {
+    if rocm_core::runtime_is_windows() && engine.eq_ignore_ascii_case("vllm") {
+        PlatformRuleOut::NativeWindowsVllm
+    } else if engine.eq_ignore_ascii_case("aim")
+        && !rocm_engine_aim::builtin_docker_daemon_reachable()
+    {
+        PlatformRuleOut::AimDockerUnavailable
+    } else {
+        PlatformRuleOut::Allowed
+    }
+}
+
+/// The `unsupported_here` message for an engine, given why the platform gate
+/// already ruled it out.
 ///
 /// Split out from the `engine_for` closure in [`assess_model_for_host`] so it
 /// can be unit-tested on both branches directly, instead of only indirectly
-/// through whichever platform the test happens to run on. `ruled_out` is a
-/// plain `bool` rather than re-deriving it from `engine` here, so a test can
+/// through whichever platform the test happens to run on. `ruled_out` is
+/// passed in rather than re-derived from `engine` here, so a test can
 /// exercise the "ruled out" branch on Linux CI and the "allowed" branch on a
 /// Windows runner without either one being unreachable.
-fn unsupported_here_for(engine: &str, ruled_out: bool) -> Option<String> {
-    ruled_out.then(|| {
-        if engine.eq_ignore_ascii_case("aim") {
-            format!("{engine} needs a reachable Docker daemon to serve; start Docker or choose a different engine")
-        } else {
-            format!("{engine} has no adapter on native Windows; serve it from WSL or Linux")
-        }
-    })
+fn unsupported_here_for(engine: &str, ruled_out: PlatformRuleOut) -> Option<String> {
+    match ruled_out {
+        PlatformRuleOut::Allowed => None,
+        PlatformRuleOut::AimDockerUnavailable => Some(format!(
+            "{engine} needs a reachable Docker daemon to serve; start Docker or choose a different engine"
+        )),
+        PlatformRuleOut::NativeWindowsVllm => Some(format!(
+            "{engine} has no adapter on native Windows; serve it from WSL or Linux"
+        )),
+    }
 }
 
 /// The catalog entry a report should name, and whether a fix was offered for it.
@@ -6074,17 +6092,14 @@ fn append_model_engine_support_lines(
 
 #[allow(dead_code)]
 fn model_registry_adapter_availability_note(engine: &str) -> Option<&'static str> {
-    if !engine_ruled_out_by_platform(engine) {
-        return None;
-    }
-    if engine.eq_ignore_ascii_case("aim") {
-        Some(
+    match engine_ruled_out_by_platform(engine) {
+        PlatformRuleOut::Allowed => None,
+        PlatformRuleOut::AimDockerUnavailable => Some(
             "runtime_status=unsupported_docker_unavailable reason=Docker daemon not reachable; start Docker or choose a different engine; run /engine for adapter details",
-        )
-    } else {
-        Some(
+        ),
+        PlatformRuleOut::NativeWindowsVllm => Some(
             "runtime_status=unsupported_native_windows reason=native Windows skipped; use WSL/Linux vLLM ROCm; gpu_execution_required=true; run /engine for adapter details",
-        )
+        ),
     }
 }
 
@@ -9998,9 +10013,16 @@ pub(crate) const fn engine_inventory() -> &'static [(&'static str, &'static str)
 }
 
 fn infer_engine_from_request(lower: &str) -> Option<&'static str> {
+    // Word-boundary match, not substring: "aim" as a bare `.contains` also
+    // matches "aiming"/"claim"/"maintain", silently steering an unrelated
+    // chat request onto the Docker-backed AIM engine.
+    let words: std::collections::HashSet<&str> = lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect();
     ["lemonade", "vllm", "aim"]
         .into_iter()
-        .find(|engine| lower.contains(*engine))
+        .find(|engine| words.contains(engine))
 }
 
 fn infer_model_from_request(request: &str) -> Option<&str> {
@@ -12028,6 +12050,24 @@ pub(crate) mod tests {
     use crate::runtime_install_finalize::tests::finish_sdk_install_with;
     use crate::runtimes_cmd::runtime_manifest_path;
     use crate::test_support::write_test_pip_runtime;
+
+    /// "aim" must match as its own word, not as a substring of an unrelated
+    /// word like "aiming"/"claim"/"maintain" in a free-text chat request.
+    #[test]
+    fn infer_engine_from_request_does_not_match_aim_as_a_substring() {
+        assert_eq!(
+            infer_engine_from_request("serve a small model, aiming for low latency"),
+            None
+        );
+        assert_eq!(
+            infer_engine_from_request("please explain how to maintain a claim"),
+            None
+        );
+        assert_eq!(
+            infer_engine_from_request("serve qwen3.5-9b with aim"),
+            Some("aim")
+        );
+    }
 
     /// Serializes and isolates tests that read or mutate process-global env vars.
     ///
@@ -19757,7 +19797,7 @@ pub(crate) mod tests {
         assert!(rendered.contains("Recommended models - run one with `rocm serve <model>`"));
         // Featured current models are grouped under their hardware target, each
         // with the quant that fits a single GPU.
-        assert!(rendered.contains("AMD Ryzen AI - Strix Halo (Lemonade / llama.cpp)"));
+        assert!(rendered.contains("AMD Ryzen AI - Strix Halo (Lemonade / llama.cpp / AIM)"));
         assert!(rendered.contains("AMD Instinct - MI300X, MI350X, MI355X (vLLM)"));
         // Strix Halo GGUF entries carry the servable owner/repo:variant ref.
         assert!(rendered.contains("unsloth/Qwen3.6-35B-A3B-GGUF:Q4_K_M"));
@@ -19898,6 +19938,7 @@ pub(crate) mod tests {
             notes: vec!["metadata only; not applied to launches yet".to_owned()],
             model_id_override: None,
             image_digest: None,
+            extra_env: BTreeMap::new(),
         }];
         let mut output = String::new();
 
@@ -21062,8 +21103,8 @@ pub(crate) mod tests {
     /// points at WSL/Linux -- the actual escape hatch, not a guess.
     #[test]
     fn unsupported_here_for_names_the_engine_when_ruled_out() {
-        let message =
-            unsupported_here_for("vllm", true).expect("a ruled-out engine gets a message");
+        let message = unsupported_here_for("vllm", PlatformRuleOut::NativeWindowsVllm)
+            .expect("a ruled-out engine gets a message");
         assert!(
             message.contains("vllm"),
             "the message has to name the engine it is talking about: {message:?}"
@@ -21079,19 +21120,96 @@ pub(crate) mod tests {
     /// OS this test happens to run on.
     #[test]
     fn unsupported_here_for_is_none_when_allowed() {
-        assert_eq!(unsupported_here_for("vllm", false), None);
-        assert_eq!(unsupported_here_for("llamacpp", false), None);
+        assert_eq!(unsupported_here_for("vllm", PlatformRuleOut::Allowed), None);
+        assert_eq!(
+            unsupported_here_for("llamacpp", PlatformRuleOut::Allowed),
+            None
+        );
     }
 
     /// `aim` is ruled out for a different reason than `vllm` on Windows
     /// (Docker, not the OS), so the message has to say Docker, not WSL.
     #[test]
     fn unsupported_here_for_names_docker_for_aim() {
-        let message = unsupported_here_for("aim", true).expect("a ruled-out engine gets a message");
+        let message = unsupported_here_for("aim", PlatformRuleOut::AimDockerUnavailable)
+            .expect("a ruled-out engine gets a message");
         assert!(
             message.to_lowercase().contains("docker"),
             "the message has to name the actual reason, Docker: {message:?}"
         );
+    }
+
+    /// Child half of [`engine_ruled_out_by_platform_gates_aim_on_docker_reachability`].
+    ///
+    /// Runs in its own process so the hostile `PATH` (a fake `docker` that
+    /// always fails) can be set with `Command::env` -- mutating `PATH`
+    /// in-process would need `unsafe`, which the workspace denies.
+    #[test]
+    fn docker_unreachable_subprocess_helper() {
+        if std::env::var_os("ROCM_AIM_DOCKER_UNREACHABLE_TEST_DIR").is_none() {
+            return;
+        }
+        assert_eq!(
+            engine_ruled_out_by_platform("aim"),
+            PlatformRuleOut::AimDockerUnavailable,
+            "docker is unreachable, so the platform gate must rule aim out"
+        );
+        let message =
+            unsupported_here_for("aim", engine_ruled_out_by_platform("aim")).expect("ruled out");
+        assert!(
+            message.to_lowercase().contains("docker"),
+            "the gate and its message must agree: {message:?}"
+        );
+    }
+
+    /// Fix for the review finding that `unsupported_here_for_names_docker_for_aim`
+    /// only pinned the message's wording, never the real
+    /// `engine_ruled_out_by_platform("aim")` gate it is paired with in
+    /// `assess_model_for_host`. This drives the gate itself against a `docker`
+    /// that always fails, rather than hand-feeding it `ruled_out: true`.
+    #[cfg(unix)]
+    #[test]
+    fn engine_ruled_out_by_platform_gates_aim_on_docker_reachability() {
+        let dir = std::env::temp_dir().join(format!(
+            "rocm-aim-docker-unreachable-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let fake_bin = dir.join("bin");
+        std::fs::create_dir_all(&fake_bin).unwrap();
+        rocm_core::fake_executable::write_fake_executable(
+            &fake_bin.join("docker"),
+            "#!/bin/sh\nexit 1\n",
+        )
+        .unwrap();
+
+        let mut entries = vec![fake_bin];
+        entries.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::docker_unreachable_subprocess_helper",
+                "--nocapture",
+            ])
+            .env(
+                "ROCM_AIM_DOCKER_UNREACHABLE_TEST_DIR",
+                std::path::PathBuf::from("1"),
+            )
+            .env("PATH", std::env::join_paths(entries).unwrap())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "helper subprocess failed");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Regression test for the engine-consistency bug: `assess_model_on_this_host`

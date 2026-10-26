@@ -99,8 +99,11 @@ pub(crate) fn render_group_gid() -> Option<u32> {
     if !output.status.success() {
         return None;
     }
-    let text = String::from_utf8_lossy(&output.stdout);
-    // `getent group render` prints `render:x:<gid>:<members>`.
+    parse_getent_gid(&String::from_utf8_lossy(&output.stdout))
+}
+
+// `getent group render` prints `render:x:<gid>:<members>`.
+fn parse_getent_gid(text: &str) -> Option<u32> {
     text.trim().split(':').nth(2)?.parse().ok()
 }
 
@@ -213,19 +216,21 @@ pub(crate) fn pull(image: &str) -> Result<()> {
     Ok(())
 }
 
+/// Bounds `docker info` so a wedged daemon cannot hang this probe (and every
+/// caller that gates on it, like `rocm model --verbose`/`rocm diagnose
+/// --model`) for the OS's own TCP/socket-connect timeout.
+const DAEMON_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
 pub(crate) fn daemon_reachable() -> bool {
-    Command::new(DOCKER_BIN)
-        .arg("info")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+    let mut command = Command::new(DOCKER_BIN);
+    command.arg("info");
+    rocm_core::process::run_with_timeout(command, DAEMON_PROBE_TIMEOUT, "docker info")
+        .is_ok_and(|output| output.status.success())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{extra_env_args, gpu_device_args};
+    use super::{extra_env_args, gpu_device_args, parse_getent_gid};
     use std::collections::BTreeMap;
 
     #[test]
@@ -257,9 +262,9 @@ mod tests {
 
     #[test]
     fn render_group_gid_parses_getent_format() {
-        let line = "render:x:993:";
-        let gid: Option<u32> = line.trim().split(':').nth(2).and_then(|s| s.parse().ok());
-        assert_eq!(gid, Some(993));
+        assert_eq!(parse_getent_gid("render:x:993:"), Some(993));
+        assert_eq!(parse_getent_gid("render:x:not-a-number:"), None);
+        assert_eq!(parse_getent_gid(""), None);
     }
 
     #[test]
@@ -272,6 +277,236 @@ mod tests {
         assert_eq!(
             extra_env_args(&extra_env),
             vec!["-e", "AIM_PROFILE_ID=vllm-foo", "-e", "ANOTHER=x"]
+        );
+    }
+}
+
+/// Exercises the `Command`-invoking functions (`run`/`stop`/`inspect_*`/`pull`/
+/// `image_present`) against a fake `docker` on `PATH`, mirroring `install.rs`'s
+/// subprocess pattern: mutating `PATH` for the *current* process needs
+/// `unsafe` (denied workspace-wide), so each scenario re-spawns this test
+/// binary filtered to just itself, with a hostile `PATH` set via the safe
+/// `Command::env` on that child.
+#[cfg(all(test, unix))]
+mod subprocess_tests {
+    use super::{image_present, inspect_exit_code, inspect_running, pull, run, stop};
+    use rocm_core::fake_executable::write_fake_executable;
+    use std::collections::BTreeMap;
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    const SENTINEL: &str = "ROCM_AIM_DOCKER_SUBPROCESS_TEST";
+
+    /// One parameterized fake `docker`, driven entirely by inherited env vars,
+    /// reused by every scenario below instead of planting N bespoke scripts.
+    const FAKE_DOCKER_SCRIPT: &str = r#"#!/bin/sh
+case "$1" in
+  run)
+    [ -n "$FAKE_DOCKER_RUN_STDERR" ] && echo "$FAKE_DOCKER_RUN_STDERR" >&2
+    exit "${FAKE_DOCKER_RUN_EXIT:-0}"
+    ;;
+  kill|stop)
+    if [ -n "$FAKE_DOCKER_STOP_NO_SUCH_CONTAINER" ]; then
+      echo "Error response from daemon: No such container: fake" >&2
+      exit 1
+    fi
+    [ -n "$FAKE_DOCKER_STOP_STDERR" ] && echo "$FAKE_DOCKER_STOP_STDERR" >&2
+    exit "${FAKE_DOCKER_STOP_EXIT:-0}"
+    ;;
+  inspect)
+    case "$3" in
+      *Running*) echo "${FAKE_DOCKER_RUNNING:-false}" ;;
+      *ExitCode*) echo "${FAKE_DOCKER_EXIT_CODE:-0}" ;;
+    esac
+    exit 0
+    ;;
+  image)
+    exit "${FAKE_DOCKER_IMAGE_PRESENT_EXIT:-1}"
+    ;;
+  pull)
+    exit "${FAKE_DOCKER_PULL_EXIT:-0}"
+    ;;
+  logs)
+    [ -n "$FAKE_DOCKER_LOGS" ] && echo "$FAKE_DOCKER_LOGS"
+    exit 0
+    ;;
+  info)
+    exit "${FAKE_DOCKER_INFO_EXIT:-0}"
+    ;;
+esac
+exit 0
+"#;
+
+    fn in_subprocess() -> bool {
+        std::env::var_os(SENTINEL).is_some()
+    }
+
+    /// Plants the fake `docker`, re-execs this test binary with just
+    /// `test_path` selected and `extra_env` set, and asserts it succeeded.
+    fn run_with_fake_docker(test_path: &str, extra_env: &[(&str, &str)]) {
+        let dir = std::env::temp_dir().join(format!(
+            "aim-docker-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let fake_bin = dir.join("bin");
+        std::fs::create_dir_all(&fake_bin).unwrap();
+        write_fake_executable(&fake_bin.join("docker"), FAKE_DOCKER_SCRIPT).unwrap();
+
+        let mut entries = vec![fake_bin];
+        entries.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", test_path, "--nocapture"])
+            .env(SENTINEL, "1")
+            .env("PATH", std::env::join_paths(entries).unwrap())
+            .stdin(Stdio::null());
+        for (key, value) in extra_env {
+            command.env(key, value);
+        }
+        let status = command.status().unwrap();
+        assert!(status.success(), "helper subprocess failed for {test_path}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn run_succeeds_against_fake_docker() {
+        if in_subprocess() {
+            run(
+                "fake-container",
+                "fake-image",
+                "127.0.0.1",
+                8080,
+                8000,
+                &[],
+                None,
+                &BTreeMap::new(),
+            )
+            .expect("fake docker run should succeed");
+            return;
+        }
+        run_with_fake_docker(
+            "docker::subprocess_tests::run_succeeds_against_fake_docker",
+            &[],
+        );
+    }
+
+    #[test]
+    fn run_bails_with_container_name_and_detail_on_failure() {
+        if in_subprocess() {
+            let error = run(
+                "fake-container",
+                "fake-image",
+                "127.0.0.1",
+                8080,
+                8000,
+                &[],
+                None,
+                &BTreeMap::new(),
+            )
+            .expect_err("fake docker run should fail");
+            let message = error.to_string();
+            assert!(message.contains("fake-container"), "{message}");
+            assert!(message.contains("boom"), "{message}");
+            return;
+        }
+        run_with_fake_docker(
+            "docker::subprocess_tests::run_bails_with_container_name_and_detail_on_failure",
+            &[
+                ("FAKE_DOCKER_RUN_EXIT", "1"),
+                ("FAKE_DOCKER_RUN_STDERR", "boom"),
+            ],
+        );
+    }
+
+    #[test]
+    fn stop_force_kill_and_graceful_stop_both_succeed() {
+        if in_subprocess() {
+            assert!(stop("fake-container", true, Duration::from_secs(1)).unwrap());
+            assert!(stop("fake-container", false, Duration::from_secs(1)).unwrap());
+            return;
+        }
+        run_with_fake_docker(
+            "docker::subprocess_tests::stop_force_kill_and_graceful_stop_both_succeed",
+            &[],
+        );
+    }
+
+    #[test]
+    fn stop_missing_container_returns_false_not_error() {
+        if in_subprocess() {
+            let stopped = stop("fake-container", true, Duration::from_secs(1)).unwrap();
+            assert!(!stopped);
+            return;
+        }
+        run_with_fake_docker(
+            "docker::subprocess_tests::stop_missing_container_returns_false_not_error",
+            &[("FAKE_DOCKER_STOP_NO_SUCH_CONTAINER", "1")],
+        );
+    }
+
+    #[test]
+    fn stop_generic_failure_bails_with_detail() {
+        if in_subprocess() {
+            let error =
+                stop("fake-container", true, Duration::from_secs(1)).expect_err("should fail");
+            assert!(error.to_string().contains("disk full"), "{error}");
+            return;
+        }
+        run_with_fake_docker(
+            "docker::subprocess_tests::stop_generic_failure_bails_with_detail",
+            &[
+                ("FAKE_DOCKER_STOP_EXIT", "1"),
+                ("FAKE_DOCKER_STOP_STDERR", "disk full"),
+            ],
+        );
+    }
+
+    #[test]
+    fn inspect_running_and_exit_code_parse_fake_docker_output() {
+        if in_subprocess() {
+            assert_eq!(inspect_running("fake-container").unwrap(), Some(true));
+            assert_eq!(inspect_exit_code("fake-container").unwrap(), Some(137));
+            return;
+        }
+        run_with_fake_docker(
+            "docker::subprocess_tests::inspect_running_and_exit_code_parse_fake_docker_output",
+            &[
+                ("FAKE_DOCKER_RUNNING", "true"),
+                ("FAKE_DOCKER_EXIT_CODE", "137"),
+            ],
+        );
+    }
+
+    #[test]
+    fn pull_bails_on_failure() {
+        if in_subprocess() {
+            let error = pull("fake-image").expect_err("fake docker pull should fail");
+            assert!(error.to_string().contains("fake-image"), "{error}");
+            return;
+        }
+        run_with_fake_docker(
+            "docker::subprocess_tests::pull_bails_on_failure",
+            &[("FAKE_DOCKER_PULL_EXIT", "1")],
+        );
+    }
+
+    #[test]
+    fn image_present_reports_true_when_fake_docker_reports_it() {
+        if in_subprocess() {
+            assert!(image_present("fake-image").unwrap());
+            return;
+        }
+        run_with_fake_docker(
+            "docker::subprocess_tests::image_present_reports_true_when_fake_docker_reports_it",
+            &[("FAKE_DOCKER_IMAGE_PRESENT_EXIT", "0")],
         );
     }
 }

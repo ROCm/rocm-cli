@@ -82,7 +82,7 @@ before running it:
 ```
 
 The assistant can request installing a serving engine through the existing
-engine surface. The supported engines are `lemonade` and `vllm`:
+engine surface. The supported engines are `lemonade`, `vllm`, and `aim`:
 
 ```json
 {"name":"rocm_command","arguments":{"args":["engines","install","vllm"],"reason":"Install the vLLM serving engine."}}

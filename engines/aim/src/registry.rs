@@ -23,16 +23,34 @@ pub(crate) struct AimImageMetadata {
     pub canonical_name: Option<String>,
 }
 
-/// Splits `org/repo:tag` (or bare `repo:tag`, defaulting to [`DEFAULT_ORG`])
-/// into `(repo, tag)` where `repo` includes the org prefix Docker Hub expects.
-fn split_image_ref(image_ref: &str) -> (String, String) {
-    let (name, tag) = image_ref.split_once(':').unwrap_or((image_ref, "latest"));
-    let repo = if name.contains('/') {
-        name.to_owned()
+/// Normalizes a user- or catalog-supplied image reference so the registry
+/// metadata lookup and the real `docker pull`/`run` always resolve the exact
+/// same image. A bare (org-less) name defaults to [`DEFAULT_ORG`], matching
+/// this engine's own catalog convention — Docker's own bare-name default
+/// (`library/`) would silently point at an unrelated official image instead.
+pub(crate) fn normalize_image_ref(image_ref: &str) -> String {
+    if image_ref.contains('/') {
+        image_ref.to_owned()
     } else {
-        format!("{DEFAULT_ORG}/{name}")
-    };
-    (repo, tag.to_owned())
+        format!("{DEFAULT_ORG}/{image_ref}")
+    }
+}
+
+/// Splits a normalized (see [`normalize_image_ref`]) `org/repo[:tag|@digest]`
+/// ref into `(repo, reference)`. Treats `@sha256:...` as a digest suffix, and
+/// only looks for a tag's `:` after the last `/`, so a `host:port/repo` or
+/// `repo@sha256:...` ref isn't mis-split by a naive first-`:` search.
+fn split_image_ref(image_ref: &str) -> (String, String) {
+    if let Some((name, digest)) = image_ref.split_once('@') {
+        return (name.to_owned(), digest.to_owned());
+    }
+    let tag_sep = image_ref
+        .rfind(':')
+        .filter(|&i| i > image_ref.rfind('/').unwrap_or(0));
+    match tag_sep {
+        Some(i) => (image_ref[..i].to_owned(), image_ref[i + 1..].to_owned()),
+        None => (image_ref.to_owned(), "latest".to_owned()),
+    }
 }
 
 fn agent() -> ureq::Agent {
@@ -60,10 +78,11 @@ fn anonymous_pull_token(repo: &str) -> Result<String> {
 }
 
 pub(crate) fn fetch_image_metadata(image_ref: &str) -> Result<AimImageMetadata> {
-    let (repo, tag) = split_image_ref(image_ref);
+    let normalized = normalize_image_ref(image_ref);
+    let (repo, reference) = split_image_ref(&normalized);
     let token = anonymous_pull_token(&repo)?;
 
-    let manifest_url = format!("https://{REGISTRY_HOST}/v2/{repo}/manifests/{tag}");
+    let manifest_url = format!("https://{REGISTRY_HOST}/v2/{repo}/manifests/{reference}");
     let manifest: Value = agent()
         .get(&manifest_url)
         .set("User-Agent", "rocm-cli")
@@ -132,13 +151,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn split_image_ref_defaults_org_for_bare_repo() {
+    fn normalize_image_ref_defaults_org_for_bare_name() {
         assert_eq!(
-            split_image_ref("aim-meta-llama-llama-3-2-1b-instruct:0.11.1"),
-            (
-                "amdenterpriseai/aim-meta-llama-llama-3-2-1b-instruct".to_owned(),
-                "0.11.1".to_owned()
-            )
+            normalize_image_ref("aim-meta-llama-llama-3-2-1b-instruct:0.11.1"),
+            "amdenterpriseai/aim-meta-llama-llama-3-2-1b-instruct:0.11.1"
+        );
+    }
+
+    #[test]
+    fn normalize_image_ref_preserves_explicit_org_or_registry() {
+        assert_eq!(
+            normalize_image_ref("amdenterpriseai/aim-foo:latest"),
+            "amdenterpriseai/aim-foo:latest"
+        );
+        assert_eq!(
+            normalize_image_ref("myregistry.example.com:5000/aim-foo:latest"),
+            "myregistry.example.com:5000/aim-foo:latest"
         );
     }
 
@@ -155,6 +183,31 @@ mod tests {
         assert_eq!(
             split_image_ref("amdenterpriseai/aim-foo"),
             ("amdenterpriseai/aim-foo".to_owned(), "latest".to_owned())
+        );
+    }
+
+    #[test]
+    fn split_image_ref_handles_digest_refs() {
+        assert_eq!(
+            split_image_ref("amdenterpriseai/aim-foo@sha256:abcd1234"),
+            (
+                "amdenterpriseai/aim-foo".to_owned(),
+                "sha256:abcd1234".to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn split_image_ref_handles_registry_host_with_port() {
+        // The first `:` here belongs to the registry host's port, not a tag
+        // separator — a naive `split_once(':')` would mis-parse this as
+        // repo="myregistry.example.com", tag="5000/aim-foo:v1".
+        assert_eq!(
+            split_image_ref("myregistry.example.com:5000/aim-foo:v1"),
+            (
+                "myregistry.example.com:5000/aim-foo".to_owned(),
+                "v1".to_owned()
+            )
         );
     }
 

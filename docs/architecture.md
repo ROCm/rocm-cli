@@ -138,7 +138,7 @@ Modularized (EAI-8032, Phase 1 of EAI-7768's sequencing):
 
 These modules are private `mod` declarations — [`lib.rs`](../crates/e2e-report/src/lib.rs) re-exports only the selected public API surface (`XfailReport`, `evaluate_xfail`, `scenario_results_by_id`, `generate`, `RunMeta`, `PlatformReports`, `load_platform_reports`, `generate_consolidated`, `consolidated_summary_markdown`) via `pub use`, so consumers reach it through the crate root rather than through module-qualified paths like `e2e_report::parse::...`. `generate_consolidated` and `consolidated_summary_markdown` take the opaque `PlatformReports` bundle [`load_platform_reports`](../crates/e2e-report/src/consolidated.rs) returns (ROCMAI-484 / ROCm/rocm-cli#640) — bundling the parsed reports with the `inputs` they came from means a caller producing both outputs can no longer pass the two out of sync with each other, and `PlatformReport` itself went back to `pub(crate)` once the bundle was the only thing outside callers needed. This is a deliberate encapsulation choice tighter than the full-domain-extraction convention's `pub mod x;` + `pub use x::{...};` default described above — nothing outside this crate needs the module paths themselves, only the re-exported items. Unlike [`components.rs`](../crates/e2e-report/src/components.rs), which, as noted above, keeps the module graph acyclic by depending only on [`parse.rs`](../crates/e2e-report/src/parse.rs), [`command_coverage.rs`](../crates/e2e-report/src/command_coverage.rs) and [`consolidated.rs`](../crates/e2e-report/src/consolidated.rs) depend on each other — [`consolidated.rs`](../crates/e2e-report/src/consolidated.rs) calls `command_coverage::command_coverage_markdown`, and [`command_coverage.rs`](../crates/e2e-report/src/command_coverage.rs) consumes `consolidated::PlatformReport` (via its `commands`, `label` and `scenario_pass_map()`) — a back-edge the split introduces without eliminating.
 
-### `engines/lemonade`, `engines/vllm` — inference engine adapters
+### `engines/lemonade`, `engines/vllm`, `engines/aim` — inference engine adapters
 
 `engines/vllm` follows full domain extraction:
 
@@ -159,3 +159,13 @@ These modules are private `mod` declarations — [`lib.rs`](../crates/e2e-report
 - [`state.rs`](../engines/lemonade/src/state.rs) — service state file I/O, device-policy/GPU-selection parsing, and port/endpoint helpers.
 
 [`lib.rs`](../engines/lemonade/src/lib.rs) keeps only CLI/envelope dispatch and the service-lifecycle orchestration that calls across those modules.
+
+`engines/aim` runs models as Docker containers instead of a host process:
+
+- [`docker.rs`](../engines/aim/src/docker.rs) — thin wrapper around the `docker` CLI binary; no `bollard`/Docker API dependency.
+- [`registry.rs`](../engines/aim/src/registry.rs) — Docker Hub v2 registry client for AIM image metadata (image ref normalization, tag/digest parsing).
+- [`process.rs`](../engines/aim/src/process.rs) — container run/readiness/stop lifecycle.
+- [`state.rs`](../engines/aim/src/state.rs) — service state file I/O.
+- [`install.rs`](../engines/aim/src/install.rs) — much smaller than vLLM's/Lemonade's `install.rs`: there is no venv, wheel, or runtime archive to manage, only a Docker-reachability check.
+
+[`lib.rs`](../engines/aim/src/lib.rs) keeps only CLI/envelope dispatch.

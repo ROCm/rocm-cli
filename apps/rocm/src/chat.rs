@@ -323,7 +323,7 @@ fn parse_bracketed_csv(line: &str, start: &str, end: &str) -> Vec<String> {
 fn is_engine_status_line(line: &str) -> bool {
     matches!(
         line.split_once(':').map(|(engine, _)| engine),
-        Some("lemonade" | "vllm")
+        Some("lemonade" | "vllm" | "aim")
     )
 }
 
@@ -434,7 +434,7 @@ pub(crate) fn parse_deterministic_engine_rows(tool_text: &str) -> Vec<Determinis
 }
 
 fn engine_name_from_inventory_line(line: &str) -> Option<&'static str> {
-    ["lemonade", "vllm"].into_iter().find(|engine| {
+    ["lemonade", "vllm", "aim"].into_iter().find(|engine| {
         line == *engine
             || line
                 .strip_prefix(*engine)
@@ -1414,7 +1414,7 @@ fn fallback_config_tool_call_for_prompt(normalized: &str) -> Option<providers::C
         });
     }
     if any_substring(normalized, &["default engine", "set engine", "use engine"]) {
-        for engine in ["lemonade", "vllm"] {
+        for engine in ["lemonade", "vllm", "aim"] {
             if normalized.contains(engine) {
                 return Some(providers::ChatToolCall {
                     id: Some("fallback-config-default-engine".to_owned()),

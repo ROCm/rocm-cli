@@ -721,3 +721,25 @@ Expected result:
   `PATH change left in place` and names it, and the `PATH` change stays.
 - With `rocm uninstall --keep-binaries`, the review says the `PATH` change
   stays too, and it does.
+
+## 9. AIM (Docker) Engine Verification
+
+Linux/WSL2 only, and requires a reachable Docker daemon (`docker info` must
+succeed).
+
+```bash
+rocm serve Qwen/Qwen3.5-9B --engine aim --managed
+rocm services list --all
+rocm services stop qwen3.5-9b
+```
+
+Expected result:
+
+- The command pulls/starts an AIM Docker container (first run takes longer
+  while the image is pulled) and the model is reachable on the printed port
+  once the service shows `ready`.
+- `rocm services list --all` shows the service's engine as `aim`.
+- Stopping the service stops and removes the container; `docker ps -a` no
+  longer lists it.
+- On native Windows, the same command fails explicitly instead of falling
+  back to another engine.

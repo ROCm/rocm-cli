@@ -4,12 +4,12 @@
   "generated_at_unix_ms": null,
   "platforms": [
     {
-      "label": "AMD Ryzen AI - Strix Halo (Lemonade / llama.cpp)",
-      "engines": ["lemonade", "llama.cpp", "llamacpp"],
+      "label": "AMD Ryzen AI - Strix Halo (Lemonade / llama.cpp / AIM)",
+      "engines": ["lemonade", "llama.cpp", "llamacpp", "aim"],
       "gfx_families": ["gfx1151"]
     },
     {
-      "label": "AMD Radeon - RX 7000/9000, Radeon PRO (Lemonade / llama.cpp)",
+      "label": "AMD Radeon - RX 7000/9000, Radeon PRO (Lemonade / llama.cpp / AIM)",
       "engines": ["lemonade", "llama.cpp", "llamacpp", "aim"],
       "gfx_families": ["gfx110X-all", "gfx120X-all"]
     },
@@ -510,10 +510,9 @@
       ]
     },
     {
-      "canonical_model_id": "Qwen/Qwen3.5-9B",
+      "canonical_model_id": "aim-qwen3.5-9b",
       "aliases": [
-        "qwen3.5-9b",
-        "aim-qwen3.5-9b"
+        "amdenterpriseai/aim-radeon-qwen-qwen3-5-9b"
       ],
       "task": "chat",
       "source": "recipe_index",
@@ -535,10 +534,13 @@
           "preferred_endpoint": null,
           "unsupported_combinations": [],
           "notes": [
-            "requires --engine-env AIM_PROFILE_ID=vllm-w7900-bf16-tp1-latency; Radeon profile auto-selection isn't reliable yet",
+            "pins AIM_PROFILE_ID=vllm-w7900-bf16-tp1-latency via extra_env; Radeon profile auto-selection isn't reliable yet, override with --engine-env if needed",
             "requires a reachable Docker daemon; the image is pulled on first serve"
           ],
-          "model_id_override": "amdenterpriseai/aim-radeon-qwen-qwen3-5-9b:0.12.0-preview"
+          "model_id_override": "amdenterpriseai/aim-radeon-qwen-qwen3-5-9b:0.12.0-preview",
+          "extra_env": {
+            "AIM_PROFILE_ID": "vllm-w7900-bf16-tp1-latency"
+          }
         }
       ],
       "manual_alternatives": [],

@@ -164,7 +164,16 @@ impl HostCapability {
                 !self.os_family.eq_ignore_ascii_case("windows")
                     && family_prefers_vllm(self.gfx_target.as_deref())
             }
-            "aim" => self.available_engines.iter().any(|e| e == engine) && docker_available(),
+            "aim" => {
+                self.available_engines.iter().any(|e| e == engine)
+                    && docker_available()
+                    // aim's verified hardware is Radeon (gfx110X/120X) and
+                    // Strix Halo (gfx1151) — exactly the families
+                    // `family_prefers_vllm` excludes. Without this, a
+                    // Docker-equipped Instinct lane would run the Radeon aim
+                    // image with a W7900 profile.
+                    && !family_prefers_vllm(self.gfx_target.as_deref())
+            }
             _ => self.available_engines.iter().any(|e| e == engine),
         }
     }
