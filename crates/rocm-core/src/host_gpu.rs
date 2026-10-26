@@ -34,7 +34,7 @@ use std::time::{Duration, Instant};
 
 const OPTIONAL_COMMAND_TIMEOUT: Duration = Duration::from_millis(1_500);
 const WINDOWS_INVENTORY_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
-const WINDOWS_VIDEO_CONTROLLER_INVENTORY_SCRIPT: &str = r#"$gpus = Get-CimInstance -ClassName Win32_VideoController -Property Name,DriverVersion,DriverDate,PNPDeviceID,AdapterCompatibility | Where-Object { $_.PNPDeviceID -match 'VEN_1002' -or $_.AdapterCompatibility -match 'AMD|Advanced Micro Devices' -or $_.Name -match 'AMD|Radeon|Instinct' }; foreach ($gpu in $gpus) { $date = ''; if ($gpu.DriverDate) { $date = $gpu.DriverDate.ToString('yyyy-MM-dd', [System.Globalization.CultureInfo]::InvariantCulture) }; "GPU`t$($gpu.Name)`t$($gpu.DriverVersion)`t$($gpu.PNPDeviceID)`t$date" }"#;
+const WINDOWS_VIDEO_CONTROLLER_INVENTORY_SCRIPT: &str = r#"$gpus = Get-CimInstance -ClassName Win32_VideoController -Property Name,DriverVersion,DriverDate,PNPDeviceID,AdapterCompatibility | Where-Object { $_.PNPDeviceID -match 'VEN_1002' -or $_.AdapterCompatibility -match 'AMD|Advanced Micro Devices' -or $_.Name -match 'AMD|Radeon|Instinct' }; foreach ($gpu in $gpus) { $date = ''; if ($gpu.DriverDate) { $date = $gpu.DriverDate.ToUniversalTime().ToString('yyyy-MM-dd', [System.Globalization.CultureInfo]::InvariantCulture) }; "GPU`t$($gpu.Name)`t$($gpu.DriverVersion)`t$($gpu.PNPDeviceID)`t$date" }"#;
 #[cfg(windows)]
 const WINDOWS_PNP_ENTITY_INVENTORY_SCRIPT: &str = r#"$displayGuid = '{4d36e968-e325-11ce-bfc1-08002be10318}'; $gpus = Get-CimInstance -ClassName Win32_PnPEntity -Property Name,DeviceID,PNPClass,ClassGuid,Manufacturer | Where-Object { (($_.PNPClass -eq 'Display' -or $_.ClassGuid -eq $displayGuid) -and ($_.DeviceID -match 'VEN_1002' -or $_.Name -match 'AMD|Radeon|Instinct|Graphics' -or $_.Manufacturer -match 'AMD|Advanced Micro Devices')) -or ($_.DeviceID -match 'PCI\\VEN_1002' -and $_.Name -match 'Radeon|Instinct|Graphics') }; foreach ($gpu in $gpus) { "GPU`t$($gpu.Name)`t`t$($gpu.DeviceID)" }"#;
 #[cfg(windows)]
@@ -5094,6 +5094,19 @@ Class Name:                Display
         assert!(!rendered.contains("driver_version:"));
         assert!(!rendered.contains("driver_age:"));
         assert!(rendered.contains("driver_detail: AMD Radeon(TM) Graphics driver"));
+    }
+
+    /// The CIM driver date is a local-time `DateTime` for an instant that is
+    /// midnight UTC, so formatting it unconverted gives the previous day west of
+    /// UTC and would flag a driver dated exactly on the cutoff. This pins the
+    /// script text only; the behaviour was checked by converting a real
+    /// `DriverDate` into a UTC-8 zone in PowerShell (previous day without the
+    /// conversion, the INF day with it).
+    #[test]
+    fn the_inventory_script_formats_the_driver_date_in_utc() {
+        assert!(WINDOWS_VIDEO_CONTROLLER_INVENTORY_SCRIPT.contains(
+            "$gpu.DriverDate.ToUniversalTime().ToString('yyyy-MM-dd', [System.Globalization.CultureInfo]::InvariantCulture)"
+        ));
     }
 
     #[test]
