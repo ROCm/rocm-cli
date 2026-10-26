@@ -140,13 +140,13 @@ pub use proc_lifecycle::{
     IdentityState, KillScope, ProcessIdentity, TerminationOutcome, identity_state,
     process_start_ticks, terminate_verified,
 };
-pub use process::{
-    FileLock, detach_command_session, process_is_running, terminate_process, terminate_process_tree,
-};
 #[cfg(windows)]
 pub use process::{
-    spawn_detached_no_inherit, spawn_hidden_console_no_inherit, spawn_hidden_console_with_log,
-    wait_for_process_exit,
+    DetachedSpawn, spawn_detached_no_inherit, spawn_detached_no_inherit_watching_startup,
+    spawn_hidden_console_no_inherit, spawn_hidden_console_with_log, wait_for_process_exit,
+};
+pub use process::{
+    FileLock, detach_command_session, process_is_running, terminate_process, terminate_process_tree,
 };
 pub use report::{
     APPROVED_ARCHITECTURES, APPROVED_ARCHITECTURES_SOURCE, REPORT_SCHEMA_VERSION, ReadOutcome,
@@ -181,6 +181,14 @@ pub use uv::{
     uv_binary_name, uv_cache_source, uv_command_env, uv_http_timeout_secs, uv_pip_check_args,
     uv_pip_freeze_args, uv_pip_install_base, uv_venv_args, violation_subject, violations_requiring,
 };
+
+/// E2E-only switch that makes `rocm serve`'s managed engine die during startup.
+///
+/// Honoured only by a `rocm` binary built with the `e2e-test-hooks` feature; a
+/// release build has no code that reads it. Defined here, rather than in the
+/// binary that reads it, because the E2E suite sets it from another crate: one
+/// constant both sides name cannot drift the way two copies of the string could.
+pub const MANAGED_ENGINE_STARTUP_FAILURE_TEST_ENV: &str = "ROCM_E2E_MANAGED_ENGINE_STARTUP_FAILURE";
 
 /// The variable that opts a machine out of rocm-cli choosing its runtime's torch.
 pub const TORCH_ALIGNMENT_DISABLED_ENV: &str = "ROCM_CLI_DISABLE_TORCH_ALIGNMENT";

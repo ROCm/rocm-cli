@@ -2191,7 +2191,7 @@ pub(crate) mod tests {
 
     /// Register both runtimes and make `OLD_RUNTIME_KEY` the active one, which
     /// is the state every "switch away from it" test starts from.
-    fn activate_old_runtime(paths: &AppPaths) -> Result<RocmCliConfig> {
+    pub(crate) fn activate_old_runtime(paths: &AppPaths) -> Result<RocmCliConfig> {
         write_test_pip_runtime(
             paths,
             OLD_RUNTIME_KEY,
