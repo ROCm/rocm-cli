@@ -1715,7 +1715,7 @@ fn run_shell_command_with_stdin(command: &str, stdin: Stdio) -> Result<()> {
     Ok(())
 }
 
-fn driver_install_state_path(paths: &AppPaths) -> PathBuf {
+pub(crate) fn driver_install_state_path(paths: &AppPaths) -> PathBuf {
     paths.data_dir.join("driver").join("state.json")
 }
 
