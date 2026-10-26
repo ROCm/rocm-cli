@@ -581,14 +581,6 @@ fn engine_recipe_enables_tool_choice(hint: Option<&EngineRecipeHint>) -> bool {
 /// policy, on a host the probe *authoritatively* reports as having no usable
 /// AMD GPU.
 ///
-/// Not "exactly when the bail fires", and the difference is only in test-hook
-/// builds: the bail also requires `!scripted_backend_failure` (see the `if`
-/// below it), which is `cfg!(feature = "e2e-test-hooks")`/env-gated. Under that
-/// scenario the gate can open while the bail cannot fire. That is deliberate —
-/// the hook stands in for the GPU the lane does not have, so the reuse path it
-/// exercises must still behave as it would on a real GPU-less host — and it
-/// costs nothing in a shipped binary, where the term can never be true.
-///
 /// `host_has_no_usable_gpu` is therefore the bail's own predicate, computed once
 /// by the caller and handed to both, so the two cannot drift apart. They did:
 /// keying the gate on the live-service check alone pulled all of that work ahead
@@ -976,21 +968,17 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     //
     // Skipped for cpu_only and when reusing an already-running service (nothing is
     // launched); permissive when availability cannot be probed on this platform
-    // (probe returns `None`). The E2E-only
-    // backend-failure scenario bypasses this host precondition so the black-box
-    // test reaches Lemonade's backend boundary without real GPU hardware.
-    let scripted_backend_failure = cfg!(feature = "e2e-test-hooks")
-        && std::env::var_os("ROCM_E2E_LEMONADE_BACKEND_INSTALL_FAILURE").is_some();
-    if !cpu_only && !scripted_backend_failure && !reuse_existing && host_has_no_usable_gpu {
+    // (probe returns `None`).
+    if !cpu_only && !reuse_existing && host_has_no_usable_gpu {
         bail!("{}", no_usable_gpu_refusal(&device_policy));
     }
     // Whether the refusal above was waived *only* because a live service was
     // expected to be reused. `reuse_existing` already implies `!cpu_only` and
-    // `host_has_no_usable_gpu` (the pre-gate requires both), so the scripted
-    // backend failure is the one remaining term. Handed to the spawn, which
-    // re-checks reuse authoritatively under the launch lock and raises the
-    // refusal itself if the service is gone by then.
-    let gpu_refusal_waived_for_reuse = reuse_existing && !scripted_backend_failure;
+    // `host_has_no_usable_gpu` (the pre-gate requires both), so it is the whole
+    // condition. Handed to the spawn, which re-checks reuse authoritatively
+    // under the launch lock and raises the refusal itself if the service is
+    // gone by then.
+    let gpu_refusal_waived_for_reuse = reuse_existing;
     // `--gpu` selects by the amd-smi `gpu` ordinal but is exported via
     // `HIP_VISIBLE_DEVICES`; those orderings can diverge when
     // `ROCR_VISIBLE_DEVICES`/partitioning is in play, so warn at serve time.
