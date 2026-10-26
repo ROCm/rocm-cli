@@ -597,8 +597,12 @@ fn spawn_windows_no_inherit(
 ///
 /// # Safety
 ///
-/// `process` must be a live process handle granting `SYNCHRONIZE` and
-/// `PROCESS_QUERY_INFORMATION` access. The handle is not closed here.
+/// `process` must be an open process handle that is not closed for the duration
+/// of the call; this function does not close it. The only caller passes the
+/// `hProcess` that `CreateProcessW` just returned, which carries full access
+/// (`PROCESS_ALL_ACCESS`), so the rights the two calls need are always present:
+/// `SYNCHRONIZE` for `WaitForSingleObject`, and `PROCESS_QUERY_LIMITED_INFORMATION`
+/// (or the broader `PROCESS_QUERY_INFORMATION`) for `GetExitCodeProcess`.
 #[cfg(windows)]
 #[allow(unsafe_code)] // Win32 FFI
 unsafe fn observe_early_exit(
