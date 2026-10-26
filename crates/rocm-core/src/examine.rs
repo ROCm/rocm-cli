@@ -1737,10 +1737,12 @@ fn apply_kernel_gpu_membership(e: &mut Examination, nodes: &[crate::KfdGpuNode])
                 gfx_target: node.gfx_target.clone(),
                 pci_id: node.pci_id.clone(),
                 is_amd: true,
-                // Left unset rather than guessed, for the same reason
-                // `probe_gpus_sysfs_fallback` leaves it unset: KFD gives the
-                // target, not the packaging.
-                is_apu: None,
+                // The target is enough to answer the family question, and every
+                // gfx115x part is an APU. Packaging (which SKU, which VRAM
+                // carve-out) still needs a name; `has_apu` only needs the
+                // family, so leaving this unset hid kernel-visible APUs on
+                // hosts without `lspci`.
+                is_apu: Some(gfx_is_apu_family(&node.gfx_target)),
             });
             continue;
         };
@@ -1753,6 +1755,14 @@ fn apply_kernel_gpu_membership(e: &mut Examination, nodes: &[crate::KfdGpuNode])
         // there is nothing to compare it against.
         if gpu.gfx_target.is_empty() {
             gpu.gfx_target = node.gfx_target.clone();
+            // `lspci` did not resolve a target from the name, so the `is_apu`
+            // carried over from the PCI scan was a failed name lookup, not a
+            // verdict about the part. KFD's target is the first real evidence,
+            // and `gfx_is_apu_family` answers for the family -- on gfx1151 the
+            // old path reported an APU with `has_apu: false`.
+            if gpu.is_apu != Some(true) {
+                gpu.is_apu = Some(gfx_is_apu_family(&gpu.gfx_target));
+            }
         }
         gpus.push(gpu);
     }
@@ -5395,6 +5405,66 @@ mod tests {
             "an unnamed entry must say so: {:?}",
             e.notes
         );
+    }
+
+    #[test]
+    fn a_kernel_target_classifies_an_unnamed_apu() {
+        // Strix Halo: `pci.ids` does not know 1002:1586, so lspci prints
+        // "... [AMD/ATI] Device", `classify_amd_marketing_name` resolves no
+        // target, and the PCI scan stamped `is_apu: false` from that failed
+        // lookup. KFD still names the part. Before this, `examine` reported
+        // `gfx_target: gfx1151` next to `has_apu: false`.
+        let mut e = Examination {
+            gpus: vec![Gpu {
+                name: "Advanced Micro Devices, Inc. [AMD/ATI] Device".to_owned(),
+                gfx_target: String::new(),
+                pci_id: "0000:c5:00.0".to_owned(),
+                is_amd: true,
+                is_apu: Some(false),
+            }],
+            ..Examination::default()
+        };
+        apply_kernel_gpu_membership(
+            &mut e,
+            &[crate::KfdGpuNode {
+                pci_id: "0000:c5:00.0".to_owned(),
+                gfx_target: "gfx1151".to_owned(),
+            }],
+        );
+
+        assert_eq!(e.gpus[0].gfx_target, "gfx1151");
+        assert_eq!(
+            e.gpus[0].is_apu,
+            Some(true),
+            "the kernel target is the first real evidence when the name resolved none"
+        );
+    }
+
+    #[test]
+    fn a_kernel_only_apu_node_is_classified_from_its_target() {
+        // The same host without `lspci`: the membership pass is the only probe
+        // that sees the GPU, so it must not leave the verdict unset.
+        let mut e = Examination::default();
+        apply_kernel_gpu_membership(
+            &mut e,
+            &[crate::KfdGpuNode {
+                pci_id: "0000:c5:00.0".to_owned(),
+                gfx_target: "gfx1151".to_owned(),
+            }],
+        );
+
+        assert_eq!(e.gpus.len(), 1);
+        assert_eq!(e.gpus[0].is_apu, Some(true));
+        // ... while a discrete target still lands on the other side.
+        let mut d = Examination::default();
+        apply_kernel_gpu_membership(
+            &mut d,
+            &[crate::KfdGpuNode {
+                pci_id: "0000:03:00.0".to_owned(),
+                gfx_target: "gfx1100".to_owned(),
+            }],
+        );
+        assert_eq!(d.gpus[0].is_apu, Some(false));
     }
 
     #[test]

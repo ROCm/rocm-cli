@@ -464,3 +464,21 @@ Feature: GPU detection and system inspection
     Given a machine with a ROCm install that was not set up by the CLI
     When the user inspects the system in machine-readable form
     Then the inspection reports a current install-method name
+
+  # #449: `pci.ids` predates Strix Halo, so `lspci` prints the bare word "Device"
+  # and the PCI scan cannot resolve a target -- but it still stamped
+  # `is_apu: false` from that failed name lookup. The kernel's own topology names
+  # the part (gfx1151), and a kernel target is enough to answer the family
+  # question, so the machine came out as `has_apu: false` + `has_discrete_amd:
+  # true` on a unified-memory APU.
+  #
+  # Simulated host rather than `@requires-gpu`: the premise is a *kernel* node
+  # plus a PCI name the id table does not know, both planted under the scenario's
+  # own root, so every Linux lane can drive it. The `rocminfo` stub is
+  # load-bearing -- on a runner with ROCm installed the real probe resolves the
+  # APU on its own (it already classifies by target) and would mask the defect.
+  @id:examine-classifies-an-apu-the-pci-name-cannot @requires-os:linux
+  Scenario: examine-31 - A GPU whose PCI name is unrecognised is still classified as an APU
+    Given a machine whose PCI name for its APU is unrecognised
+    When the user inspects the system in machine-readable form
+    Then the inspection classifies the kernel-visible GPU as an APU
