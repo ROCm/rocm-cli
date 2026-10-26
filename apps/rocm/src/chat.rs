@@ -24,21 +24,23 @@
 //! module; none of the module's types need to be, bar the one exception
 //! above.
 
+use crate::freeform_planner::{
+    format_structured_tool_call, freeform_plan_next_action_with_context, render_freeform_plan,
+    serve_args_request_cpu_device,
+};
 use crate::runtime_install_finalize::empty_as_unknown;
 use crate::runtimes_cmd::render_runtimes_text;
 use crate::service_launch::is_loopback_host;
 use crate::{
     ChatInferenceParams, apply_app_path_env, build_codex_bridge_gpu_snapshot,
     build_codex_bridge_snapshot, builtin_codex_bridge_engine_inventory, cli_version_string,
-    format_structured_tool_call, freeform_plan_next_action_with_context, friendly_engine_label,
-    load_managed_services, managed_service_is_live, read_tail_lines, record_cli_audit_event,
-    render_automations_text, render_config_text, render_daemon_text,
+    friendly_engine_label, load_managed_services, managed_service_is_live, read_tail_lines,
+    record_cli_audit_event, render_automations_text, render_config_text, render_daemon_text,
     render_engine_inventory_text_with_paths, render_examine_text, render_examine_text_with_paths,
-    render_freeform_plan, render_logs_browser_text, render_logs_text,
+    render_logs_browser_text, render_logs_text,
     render_model_registry_verbose_text_with_context_and_host, render_service_logs_text,
     render_services_text, render_setup_status_text, render_uninstall_dry_run, render_update_text,
-    serve_args_request_cpu_device, service_model_names_match, therock_install_version_selector,
-    validate_service_id,
+    service_model_names_match, therock_install_version_selector, validate_service_id,
 };
 use crate::{chat_host_facts, comfyui, providers, therock};
 use anyhow::{Context, Result, bail};
