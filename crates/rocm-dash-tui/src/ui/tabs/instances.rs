@@ -1105,6 +1105,7 @@ mod tests {
             bench_rows: std::collections::VecDeque::new(),
             instances,
             has_received_snapshot: false,
+            has_received_gpu_snapshot: false,
             active_tab: crate::app::ActiveTab::Observe,
             modal: crate::app::Modal::None,
             menu_sel: 0,

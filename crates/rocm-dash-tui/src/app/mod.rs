@@ -77,6 +77,11 @@ pub struct AppState {
     /// arrived yet — which is what `has_live_instance` consults a live
     /// registry read for (issue #145).
     pub(crate) has_received_snapshot: bool,
+    /// Sticky: set by the first GPU-bearing snapshot of any kind (daemon or
+    /// Windows in-process), never cleared by a disconnect, reconnect, or
+    /// replay seek. Drives the hero's "Detecting GPU…" placeholder, which
+    /// must not reappear once detection has produced a result.
+    pub(crate) has_received_gpu_snapshot: bool,
     pub active_tab: ActiveTab,
     pub modal: Modal,
     /// Cursor into the Esc main-menu rows (Options / Help / Quit).
@@ -330,6 +335,7 @@ impl AppState {
             bench_rows: VecDeque::with_capacity(BENCH_CAP),
             instances: HashMap::new(),
             has_received_snapshot: false,
+            has_received_gpu_snapshot: false,
             active_tab: ActiveTab::default(),
             modal: Modal::None,
             menu_sel: 0,
@@ -1505,6 +1511,7 @@ impl AppState {
     /// history/latest bookkeeping both share, independent of how (or
     /// whether) `instances` gets updated.
     fn push_history_and_latest(&mut self, snap: Snapshot) {
+        self.has_received_gpu_snapshot = true;
         if self.history.len() == HISTORY_CAP {
             self.history.pop_front();
         }

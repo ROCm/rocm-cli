@@ -23,7 +23,7 @@ use ratatui::widgets::Paragraph;
 
 use rocm_dash_core::state::JobStatus;
 
-use crate::app::{AppState, ConnState, UpdateStatus};
+use crate::app::{AppState, UpdateStatus};
 use crate::ui::format;
 use crate::ui::gradient::GradientGauge;
 use crate::ui::panel::{self, BoxRole};
@@ -72,14 +72,13 @@ const fn node_load_label(hist_empty: bool, simulated: bool) -> &'static str {
 /// title's "Detecting GPU…" placeholder — a snapshot that arrived but
 /// carries no GPUs (or a legitimately-zero field) is a known state, not a
 /// still-loading one, and reads "Unknown GPU" instead (see
-/// `node_throughput_title`). Gated on the connection still being in its
-/// initial handshake: `latest` is also wiped on disconnect
-/// (`ClientMsg::Disconnected`, including end-of-`--replay`) and on a replay
-/// seek, neither of which means detection restarted — those read "Unknown
-/// GPU" too rather than reverting to "still loading". For the numeric "—"
-/// placeholders, see `gpu_data_unavailable`.
+/// `node_throughput_title`). Uses the sticky `has_received_gpu_snapshot`
+/// rather than `latest`/`conn`: `ClientMsg::Connected` arrives before the
+/// first snapshot (so `conn` can't gate it), and `latest` is wiped on
+/// disconnect, replay end, and seek, none of which mean detection
+/// restarted. For the numeric "—" placeholders, see `gpu_data_unavailable`.
 const fn gpu_telemetry_pending(state: &AppState) -> bool {
-    state.latest.is_none() && matches!(state.conn, ConnState::Initial | ConnState::Connecting)
+    !state.has_received_gpu_snapshot && state.latest.is_none()
 }
 
 /// True when there's no usable per-GPU data to show a number for: either no
@@ -890,6 +889,20 @@ mod tests {
     }
 
     #[test]
+    fn gpu_telemetry_pending_while_connected_but_no_snapshot_yet() {
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.conn = ConnState::Connected {
+            host: "x".into(),
+            version: "1".into(),
+        };
+        assert!(gpu_telemetry_pending(&s));
+        assert_eq!(
+            node_throughput_title(&s),
+            "Node throughput · Detecting GPU…"
+        );
+    }
+
+    #[test]
     fn gpu_telemetry_pending_does_not_resume_after_a_disconnect_or_replay_end() {
         // Once connected, losing the connection (end of `--replay`, a daemon
         // drop, ClientMsg::Disconnected) wipes `latest` but must not look
@@ -904,8 +917,11 @@ mod tests {
         s.conn = ConnState::Disconnected {
             reason: "end of recording".into(),
         };
+        s.push_host_gpu_snapshot(Snapshot::default());
         s.latest = None;
         assert!(!gpu_telemetry_pending(&s));
+        s.conn = ConnState::Connecting;
+        assert!(!gpu_telemetry_pending(&s), "reconnect must not revert");
         assert_eq!(node_throughput_title(&s), "Node throughput · Unknown GPU");
     }
 

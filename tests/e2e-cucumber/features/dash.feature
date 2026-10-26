@@ -626,7 +626,7 @@ Feature: Interactive dashboard
   # second and there's no hook to freeze the daemon mid-handshake, so
   # asserting on it would be asserting on a race.
   @id:dash-reports-no-gpu-telemetry @requires-os:linux
-  Scenario: dash-38 - The hero shows placeholders, not fake zeros, when no GPU is detected
+  Scenario: dash-37 - The hero shows placeholders, not fake zeros, when no GPU is detected
     When the user opens the dashboard
     Then the dashboard home view is displayed
     And the hero reports no GPU telemetry available
@@ -652,7 +652,7 @@ Feature: Interactive dashboard
   # can be driven directly: the unit tests in
   # `crates/rocm-dash-tui/src/ui/examine_manager.rs`.
   @id:dash-doctor-report-is-reviewed-before-sending @requires-os:linux
-  Scenario: dash-37 - A user reviews a Doctor report in the dashboard before anything is sent
+  Scenario: dash-38 - A user reviews a Doctor report in the dashboard before anything is sent
     When the user opens the dashboard with demo data
     And the user opens the Observe view
     And the user opens the Diagnose screen
