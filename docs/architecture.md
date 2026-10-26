@@ -821,6 +821,7 @@ Gherkin `.feature` files under `features/` backed by Rust step functions that dr
 | File | Responsibility | Class |
 | --- | --- | --- |
 | [`src/bin/fake-docker.rs`](../tests/e2e-cucumber/src/bin/fake-docker.rs) | A `docker` stand-in that always fails, optionally logging its arguments, for the AIM Docker-unavailable scenarios. | flat |
+| [`src/bin/fake-lemonade.rs`](../tests/e2e-cucumber/src/bin/fake-lemonade.rs) | The `lemonade` CLI and `lemond` server of a planted Lemonade runtime, chosen by `argv[0]`: `lemond` stays alive for a bounded time, and `lemonade backends install` fails, for `@id:serve-lemonade-preparation-recovery`. | flat |
 | [`src/bin/fake-python.rs`](../tests/e2e-cucumber/src/bin/fake-python.rs) | A stand-in for the runtime's Python that answers the ComfyUI install's torch-stack probe and post-install GPU check. | flat |
 | [`src/bin/fake-tailscale.rs`](../tests/e2e-cucumber/src/bin/fake-tailscale.rs) | A Tailscale CLI stand-in that serves the status document named by `FAKE_TAILSCALE_STATUS`, for the `rocm remote` scenarios. | flat |
 | [`src/bin/fake-uv.rs`](../tests/e2e-cucumber/src/bin/fake-uv.rs) | A `uv` stand-in whose output, exit code, argument log and stdin handling are set by `FAKE_UV_*` variables, for the ComfyUI scenarios. | flat |
