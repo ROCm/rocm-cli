@@ -5,12 +5,13 @@
 //! Spawn, attach to, and stream logs from a managed background service
 //! process, plus the endpoint-key/auth checks that gate it.
 //!
-//! Mechanically relocated from `main.rs` with no behavior change. This module
+//! Relocated from `main.rs`, since extended with the port-allocation and
+//! launch-lock transaction. This module
 //! is the managed-service-spawning tail that was deliberately deferred out of
 //! the Phase 6a (ROCMAI-82) split: `start_managed_service`,
 //! `run_attached_service`, `spawn_managed_engine_child`, `stream_attached_logs`,
 //! and the rest of this file. It was entangled with crate-root launch helpers
-//! — `record_cli_audit_event`, `existing_live_managed_service`, and the stop
+//! — `record_cli_audit_event`, `existing_live_managed_service_in`, and the stop
 //! action of the service-record-management cluster (this module reaches only
 //! stop, via `AttachOutcome::Stop`; restart/remove/prune are not called here)
 //! — and this later pass (ROCMAI-91, Phase 6b) separates the spawning tail out
@@ -21,7 +22,7 @@
 //! `ServicesCommand`/`services()` stay in `main.rs` (a dedicated clap
 //! subcommand's enum and dispatch function usually do, per
 //! `docs/architecture.md`'s convention note). `record_cli_audit_event`,
-//! `existing_live_managed_service`, and the broader "service record management"
+//! `existing_live_managed_service_in`, and the broader "service record management"
 //! cluster (stop/restart/remove/prune, reached from `services()`; stop/restart
 //! are also reachable from the chat/LLM sandbox tool-calling path) stay at the
 //! crate root too — reached via `crate::`, same as other mechanically relocated
@@ -622,6 +623,9 @@ fn spawn_managed_engine_child(
     }
 }
 
+#[cfg(not(windows))]
+type SpawnOverride<'a> = dyn Fn(&mut ProcessCommand) -> io::Result<std::process::Child> + 'a;
+
 /// The side-effecting half of the launch transaction: create the log, prepare
 /// concrete argv, hand the leased port to the child, spawn it, reject a child
 /// that has already exited, and publish the running record.
@@ -629,9 +633,6 @@ fn spawn_managed_engine_child(
 /// Split out of [`spawn_managed_engine_child`] so that *every* failure below the
 /// record's first write is funnelled through one cleanup path before the
 /// launch lock is released. Returns the child pid.
-#[cfg(not(windows))]
-type SpawnOverride<'a> = dyn Fn(&mut ProcessCommand) -> io::Result<std::process::Child> + 'a;
-
 #[allow(clippy::too_many_arguments)]
 fn launch_managed_engine_child_locked(
     paths: &AppPaths,
@@ -767,11 +768,6 @@ fn launch_managed_engine_child_locked(
         }
         child_pid
     };
-    // The child is both roles until the engine state file names a separate
-    // server process. Each role gets its own token, captured while the child is
-    // alive: a stop pairs every recorded PID with its own token, and the two
-    // PIDs diverge as soon as `rocmd` restarts the service — at which point an
-    // engine PID recorded without one could only be signalled blind.
     // The child is both roles until the engine state file names a separate
     // server process. Each role gets its own token, captured while the child is
     // alive: a stop pairs every recorded PID with its own token, and the two
@@ -2675,7 +2671,7 @@ mod tests {
 
         // Go through the real stop path (`rocm services stop <id> --yes`'s own
         // implementation) rather than writing `status = "stopped"` to disk
-        // directly, so this test actually proves the advice serve-28 pins: that
+        // directly, so this test actually proves the advice serve-27 pins: that
         // running the stop command frees the port. The termination closure is
         // the same seam production injects a real signal through; here it just
         // confirms every recorded process gone without touching the test
@@ -3039,7 +3035,11 @@ mod tests {
         paths.ensure()?;
         fs::create_dir_all(paths.services_dir())?;
 
-        let port = 11_599_u16;
+        // Ephemeral, not a fixed number in the automatic range, which a real
+        // `rocm serve` on the developer's machine could be holding.
+        let port = std::net::TcpListener::bind(("127.0.0.1", 0))?
+            .local_addr()?
+            .port();
         let lease = rocm_core::lease_loopback_port(port)?;
         let mut record = ManagedServiceRecord::new(
             &paths,

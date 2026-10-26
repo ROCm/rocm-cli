@@ -142,8 +142,9 @@ pub use proc_lifecycle::{
 };
 pub use process::{
     FileLock, LoopbackPortLease, MANAGED_LAUNCH_LOCK_TIMEOUT, detach_command_session,
-    is_canonical_loopback_host, lease_loopback_port, lease_loopback_port_or_bind_error,
-    process_is_running, terminate_process, terminate_process_tree,
+    is_canonical_loopback_host, launch_port_argument, lease_loopback_port,
+    lease_loopback_port_or_bind_error, process_is_running, terminate_process,
+    terminate_process_tree,
 };
 #[cfg(windows)]
 pub use process::{

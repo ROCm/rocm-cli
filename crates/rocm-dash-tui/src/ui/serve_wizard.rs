@@ -585,7 +585,14 @@ fn editor_key(w: &mut ServeWizardState, code: KeyCode) {
             // The form's host/port are only written on Enter, so discarding
             // the editor here never mutates them.
             w.editor = None;
-            recompute_message(w);
+            // Keep the complaint only while it is still true; a different one
+            // (about a field this Esc never touched) is cleared, not surfaced
+            // or focused. `request_launch` still reports it on launch.
+            if let Some(current) = w.message.take()
+                && w.validate().is_err_and(|(_, msg)| msg == current)
+            {
+                w.message = Some(current);
+            }
         }
         KeyCode::Left | KeyCode::Right => {
             let delta = if code == KeyCode::Left { -1 } else { 1 };
@@ -649,22 +656,6 @@ fn editor_key(w: &mut ServeWizardState, code: KeyCode) {
             }
         }
         _ => {}
-    }
-}
-
-/// Esc discards an edit without ever writing it to the form, so whatever
-/// `validate()` says now was equally true before the editor opened. Safe to
-/// unconditionally re-state (and re-focus, if the complaint has moved) since
-/// nothing new was introduced.
-fn recompute_message(w: &mut ServeWizardState) {
-    if w.message.is_some() {
-        match w.validate() {
-            Ok(_) => w.message = None,
-            Err((field, msg)) => {
-                w.focus(field);
-                w.message = Some(msg);
-            }
-        }
     }
 }
 
@@ -1733,6 +1724,29 @@ mod tests {
     }
 
     #[test]
+    fn escaping_a_host_editor_error_does_not_surface_or_focus_another_fields_complaint() {
+        // Host edit -> blank Enter -> Esc, with the model still empty: the Host
+        // complaint is gone after Esc, and "model is required" must not replace
+        // it or pull focus off Host.
+        let mut wiz = Some(ServeWizardState {
+            advanced_expanded: true,
+            ..Default::default()
+        });
+        let mut jobs = State::default();
+        focus_field(wiz.as_mut().unwrap(), Field::Host);
+        feed(
+            &mut wiz,
+            &mut jobs,
+            &[KeyCode::Enter, KeyCode::Backspace, KeyCode::Enter],
+        );
+        assert!(wiz.as_ref().unwrap().message.is_some());
+        feed(&mut wiz, &mut jobs, &[KeyCode::Esc]);
+        let w = wiz.as_ref().unwrap();
+        assert!(w.message.is_none(), "{:?}", w.message);
+        assert_eq!(w.current_field(), Field::Host);
+    }
+
+    #[test]
     fn committing_a_host_edit_that_surfaces_an_unrelated_port_complaint_clears_it_instead() {
         // An outstanding complaint about the Host row (blank host) is fixed by
         // typing a loopback host the CLI accepts — but that host also needs a
@@ -1844,7 +1858,7 @@ mod tests {
 
     // This only pins the shared constant into the approval body; the CLI's own
     // plan output proves the phrase actually appears before the resolved
-    // endpoint, in `serve-auto-port-skips-occupied` (serve-26).
+    // endpoint, in `serve-auto-port-skips-occupied` (serve-29).
     #[test]
     fn approval_shows_exact_argv_and_the_automatic_port_phrase() {
         let mut w = ServeWizardState {

@@ -485,27 +485,28 @@ mod tests {
 
     #[test]
     fn automatic_selects_against_real_loopback_listeners() {
-        // Real sockets, not a script: hold the first two candidates with live
-        // listeners and prove the production probe walks past them. If either is
-        // already owned by something outside this test the scenario cannot be set
-        // up deterministically, so skip rather than assert on a moving target.
-        let (Ok(first), Ok(second)) = (
-            TcpListener::bind(("127.0.0.1", AUTO_PORT_FIRST)),
-            TcpListener::bind(("127.0.0.1", AUTO_PORT_FIRST + 1)),
-        ) else {
-            return;
+        // Real sockets, not a script: two live listeners hold the first two
+        // candidates and the production probe must walk past them. The
+        // candidates are remapped onto ephemeral ports so a real `rocm serve`
+        // sitting in 11435-11535 on this machine can neither fail nor
+        // vacuously skip the test.
+        let first = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let second = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let free = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let targets = [
+            first.local_addr().expect("addr").port(),
+            second.local_addr().expect("addr").port(),
+            free.local_addr().expect("addr").port(),
+        ];
+        drop(free);
+        let mut probe = |candidate: u16| {
+            let index = usize::from(candidate - AUTO_PORT_FIRST);
+            loopback_bind_probe(targets[index.min(targets.len() - 1)])
         };
-        let mut probe = loopback_bind_probe;
         let lease = resolve_serve_port(DEFAULT_LOCAL_HOST, PortRequest::Auto, &[], &mut probe)
-            .expect("a candidate above the held ones is free");
-        assert!(
-            lease.port() >= AUTO_PORT_FIRST + 2,
-            "selected {} while {AUTO_PORT_FIRST} and {} were held",
-            lease.port(),
-            AUTO_PORT_FIRST + 1
-        );
+            .expect("the third candidate is free");
+        assert_eq!(lease.port(), targets[2], "must walk past both held ports");
         assert!(lease.is_held(), "the production probe must hold the socket");
-        // Guards outlive every assertion above.
         drop((first, second));
     }
 }

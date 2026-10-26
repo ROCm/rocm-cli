@@ -543,6 +543,7 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     let port_request = serve_port::PortRequest::from_flag(port);
     let _ = managed; // background is now the default; --managed is accepted as an explicit synonym.
     validate_bind_host(&host, allow_public_bind)?;
+    serve_port::validate_port_request(&host, port_request)?;
     // Loopback stays credential-free; a public bind must be authenticated. Resolve
     // (or generate) the endpoint key now so every downstream path — engine spawn,
     // readiness probe, smoke test, and the client-config we print — shares one value.

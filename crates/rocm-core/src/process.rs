@@ -402,13 +402,8 @@ pub struct FileLock {
 }
 
 impl FileLock {
-    /// Acquire an exclusive lock on `path`, creating the lock file and any
-    /// missing parent directories first. Blocks until the lock is available.
-    ///
-    /// The lock file itself carries no data; it is a rendezvous point, so an
-    /// existing file is reused (never truncated) and its contents are ignored.
-    pub fn acquire(path: impl Into<PathBuf>) -> Result<Self> {
-        let path = path.into();
+    /// Create (never truncate) the lock file and any missing parent directories.
+    fn open(path: PathBuf) -> Result<(PathBuf, fs::File)> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create lock directory {}", parent.display()))?;
@@ -420,6 +415,16 @@ impl FileLock {
             .truncate(false)
             .open(&path)
             .with_context(|| format!("failed to open lock file {}", path.display()))?;
+        Ok((path, file))
+    }
+
+    /// Acquire an exclusive lock on `path`, creating the lock file and any
+    /// missing parent directories first. Blocks until the lock is available.
+    ///
+    /// The lock file itself carries no data; it is a rendezvous point, so an
+    /// existing file is reused (never truncated) and its contents are ignored.
+    pub fn acquire(path: impl Into<PathBuf>) -> Result<Self> {
+        let (path, file) = Self::open(path.into())?;
         file.lock()
             .with_context(|| format!("failed to acquire lock {}", path.display()))?;
         Ok(Self { file, path })
@@ -446,18 +451,7 @@ impl FileLock {
     /// Fails when the lock file cannot be created/locked, or when another
     /// holder keeps it for the whole timeout.
     pub fn acquire_bounded(path: impl Into<PathBuf>, timeout: Duration) -> Result<Self> {
-        let path = path.into();
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create lock directory {}", parent.display()))?;
-        }
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)
-            .with_context(|| format!("failed to open lock file {}", path.display()))?;
+        let (path, file) = Self::open(path.into())?;
         let deadline = Instant::now() + timeout;
         loop {
             match file.try_lock() {
@@ -514,6 +508,28 @@ pub const MANAGED_LAUNCH_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 #[must_use]
 pub fn is_canonical_loopback_host(host: &str) -> bool {
     host.trim() == DEFAULT_LOCAL_HOST
+}
+
+/// Validate the optional `port` argument of a `launch_server` tool call.
+///
+/// `None` and JSON `null` mean "not supplied" (automatic selection). Anything
+/// else must be an integer in 1-65535: a malformed value must not be read as
+/// "not supplied" and silently fall through to automatic port selection.
+/// Shared by the chat assistant and the MCP server so the two cannot drift.
+///
+/// # Errors
+/// Returns the reason, to be prefixed with the caller's own argument name.
+pub fn launch_port_argument(
+    value: Option<&serde_json::Value>,
+) -> Result<Option<u16>, &'static str> {
+    let Some(value) = value.filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let port = value.as_u64().ok_or("must be an integer")?;
+    match u16::try_from(port) {
+        Ok(port) if port != 0 => Ok(Some(port)),
+        _ => Err("must be between 1 and 65535"),
+    }
 }
 
 /// A real, held `127.0.0.1:<port>` listener proving the port is bindable now.
@@ -2406,5 +2422,47 @@ mod tests {
         );
 
         assert_the_child_is_given_an_empty_stdin(fixture.command());
+    }
+}
+
+#[cfg(test)]
+mod launch_port_argument_tests {
+    use super::launch_port_argument;
+    use serde_json::json;
+
+    #[test]
+    fn absent_or_null_means_automatic() {
+        assert_eq!(launch_port_argument(None), Ok(None));
+        assert_eq!(launch_port_argument(Some(&json!(null))), Ok(None));
+    }
+
+    #[test]
+    fn accepts_the_full_valid_range() {
+        assert_eq!(launch_port_argument(Some(&json!(1))), Ok(Some(1)));
+        assert_eq!(launch_port_argument(Some(&json!(65535))), Ok(Some(65535)));
+    }
+
+    #[test]
+    fn rejects_malformed_values_instead_of_treating_them_as_absent() {
+        for value in [
+            json!("8000"),
+            json!(8000.5),
+            json!(-1),
+            json!(true),
+            json!([8000]),
+        ] {
+            assert_eq!(
+                launch_port_argument(Some(&value)),
+                Err("must be an integer"),
+                "{value}"
+            );
+        }
+        for value in [json!(0), json!(65536), json!(u64::MAX)] {
+            assert_eq!(
+                launch_port_argument(Some(&value)),
+                Err("must be between 1 and 65535"),
+                "{value}"
+            );
+        }
     }
 }

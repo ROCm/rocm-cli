@@ -519,7 +519,11 @@ async fn open_serve_wizard(world: &mut E2eWorld) {
 
 #[then("the serve wizard shows only the model, Advanced settings, and Launch")]
 async fn serve_wizard_shows_only_basic_fields(world: &mut E2eWorld) {
-    let screen = session(world).screen_text();
+    let tui = session(world);
+    tui.wait_for_screen("[ Launch ]", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("serve wizard did not finish drawing: {e}"));
+    let screen = tui.screen_text();
     assert!(
         screen.contains("Model   ")
             && screen.contains("Advanced settings ▸ Automatic")
@@ -578,7 +582,11 @@ async fn type_into_serve_wizard(world: &mut E2eWorld, text: String) {
 
 #[then("the serve wizard is still open with the host unchanged")]
 async fn serve_wizard_still_open_host_unchanged(world: &mut E2eWorld) {
-    let screen = session(world).screen_text();
+    let tui = session(world);
+    tui.wait_until_gone("editing host", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("Host edit was not cancelled by Escape: {e}"));
+    let screen = tui.screen_text();
     assert!(
         screen.contains("Serve a model")
             && screen.contains("[127.0.0.1]")

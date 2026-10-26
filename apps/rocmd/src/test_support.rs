@@ -94,6 +94,18 @@ pub(crate) fn assert_each_call_gets_its_own_root(make_root: impl Fn() -> PathBuf
     );
 }
 
+/// A loopback port the OS just handed out and nothing holds now.
+///
+/// For tests that make the code under test bind the port for real: a fixed
+/// number inside the automatic range 11435-11535 fails whenever a real
+/// `rocm serve` is running on the developer's machine.
+pub(crate) fn free_loopback_port() -> u16 {
+    std::net::TcpListener::bind(("127.0.0.1", 0))
+        .and_then(|listener| listener.local_addr())
+        .expect("bind an ephemeral loopback port")
+        .port()
+}
+
 /// Build the record a supervisor would construct for `service_id`, to learn
 /// the paths it derives before the real call does. Not platform-gated:
 /// the supervisor exit-write tests use it on every platform.

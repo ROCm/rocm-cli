@@ -2235,23 +2235,10 @@ fn validate_chat_launch_server_tool_call(call: &providers::ChatToolCall) -> Resu
     if !is_loopback_host(&host) {
         bail!("local assistant cannot request non-local host `{host}`");
     }
-    // Validate the same way the argv builder reads it
-    // (`object.get("port").and_then(serde_json::Value::as_u64)`), so a
-    // malformed `port` (wrong type, out of range) can't slip past this check
-    // only to have the argv builder silently drop it and fall through to
-    // automatic port selection.
-    let port = match object.get("port") {
-        None | Some(serde_json::Value::Null) => None,
-        Some(value) => {
-            let port = value
-                .as_u64()
-                .context("ROCm tool `launch_server` argument `port` must be an integer")?;
-            if !(1..=u64::from(u16::MAX)).contains(&port) {
-                bail!("ROCm tool `launch_server` argument `port` must be between 1 and 65535");
-            }
-            Some(port)
-        }
-    };
+    // A malformed `port` must be rejected here, not silently dropped by the
+    // argv builder and left to fall through to automatic port selection.
+    let port = rocm_core::launch_port_argument(object.get("port"))
+        .map_err(|reason| anyhow::anyhow!("ROCm tool `launch_server` argument `port` {reason}"))?;
     // `rocm serve` proves a port is free only on the exact default host; every
     // other spelling (including the loopback aliases `localhost`/`::1` this
     // check still accepts) needs an explicit port or the CLI call refuses

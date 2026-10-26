@@ -1494,14 +1494,12 @@ pub(crate) fn restart_managed_service(
     restart_managed_service_with(paths, record, None)
 }
 
-/// [`restart_managed_service`], with the supervisor spawn interceptable.
-///
-/// `spawn_override`, when set, replaces the real `command.spawn()` call below
-/// (falling back to it when `None`) — a test-only seam so a test can assert
-/// the leased port is already bindable (released) at the exact instant
-/// production would spawn, without faking the whole spawn.
+/// Replaces the real `command.spawn()` of a recovery supervisor: a test-only
+/// seam for asserting on state at the exact instant production would spawn.
 type SpawnOverride<'a> = dyn Fn(&mut ProcessCommand) -> std::io::Result<std::process::Child> + 'a;
 
+/// [`restart_managed_service`], with the supervisor spawn interceptable via
+/// `spawn_override` (the real `command.spawn()` when `None`).
 fn restart_managed_service_with(
     paths: &AppPaths,
     record: &mut ManagedServiceRecord,
@@ -1564,12 +1562,11 @@ fn restart_managed_service_with(
         .try_clone()
         .context("failed to clone service log file handle")?;
 
-    // The truthful state to fall back to. The publish and
-    // `record_spawned_supervisor` failure paths below restore this rather than
-    // leave a half-applied `recovering` row, and the latter also makes sure a
-    // supervisor that exists is never left running unrecorded. The spawn and
-    // `try_wait` failure paths after that do not restore it: they return before
-    // any rollback runs, so `recovering` can still be left standing on disk.
+    // The truthful state to fall back to. Every failure after the `recovering`
+    // write below (spawn, `try_wait`, recording the supervisor) restores this
+    // through `fail_recovery` rather than leave a half-applied `recovering` row
+    // that would keep reserving the port, and a supervisor that exists is never
+    // left running unrecorded.
     let prior = record.clone();
 
     record.status = "recovering".to_owned();
@@ -1620,42 +1617,55 @@ fn restart_managed_service_with(
         .stdin(Stdio::null())
         .stdout(Stdio::from(log_file))
         .stderr(Stdio::from(log_file_err));
-    let mut child = match spawn_override {
+    let spawned = match spawn_override {
         Some(spawn) => spawn(&mut command),
         None => command.spawn(),
-    }
-    .context("failed to spawn recovery supervisor")?;
+    };
+    let mut child = match spawned {
+        Ok(child) => child,
+        Err(error) => {
+            let error = anyhow::Error::new(error).context("failed to spawn recovery supervisor");
+            return Err(fail_recovery(
+                paths,
+                record,
+                &recovering_snapshot,
+                prior,
+                error,
+            ));
+        }
+    };
 
     if let Err(error) = record_spawned_supervisor(paths, record, child.id()) {
         // The supervisor is alive but unrecorded: it would hold the port while
-        // being invisible to every stop/recovery path. Kill it, then put the
-        // prior truthful fields back. Not a blind `record.write()` of `prior`:
-        // the same discipline as `update_supervised_record` elsewhere in this
-        // function applies here too, so a stop marker a concurrent stop
-        // persisted while the spawn was in flight is not reverted by this
-        // rollback.
+        // being invisible to every stop/recovery path. Kill it first.
         terminate_recovery_supervisor(&mut child);
         let error = error.context("failed to publish the recovering service record");
-        if let Err(rollback) = rollback_recovering_record(paths, &recovering_snapshot, &prior) {
-            // Both writes failed: the on-disk record now still claims
-            // `recovering` for a supervisor that no longer exists. That is worse
-            // than the original failure and must not be swallowed — the watcher
-            // and the manual restart tool both surface whatever comes back.
-            return Err(error.context(format!(
-                "rollback also failed: managed service {} is left recorded as recovering \
-                 with no supervisor ({rollback:#})",
-                record.service_id
-            )));
-        }
-        *record = prior;
-        return Err(error);
+        return Err(fail_recovery(
+            paths,
+            record,
+            &recovering_snapshot,
+            prior,
+            error,
+        ));
     }
 
     thread::sleep(Duration::from_millis(200));
-    if let Some(status) = child
-        .try_wait()
-        .context("failed to check recovery supervisor startup state")?
-    {
+    let exited = match child.try_wait() {
+        Ok(exited) => exited,
+        Err(error) => {
+            terminate_recovery_supervisor(&mut child);
+            let error = anyhow::Error::new(error)
+                .context("failed to check recovery supervisor startup state");
+            return Err(fail_recovery(
+                paths,
+                record,
+                &recovering_snapshot,
+                prior,
+                error,
+            ));
+        }
+    };
+    if let Some(status) = exited {
         // Not a write-back of `record`: a stop issued since the spawn has
         // persisted its marker, and a `failed` record without one is what
         // recovery restarts. Same discipline as the supervisor's own writes.
@@ -1671,8 +1681,33 @@ fn restart_managed_service_with(
     Ok(())
 }
 
-/// Record the supervisor [`restart_managed_service`] just spawned, as `pid`.
+/// Undo [`restart_managed_service`]'s `recovering` publication after a later
+/// step failed, and return the error to report.
 ///
+/// Not a blind `record.write()` of `prior`: the same discipline as
+/// `update_supervised_record` applies, so a stop marker a concurrent stop
+/// persisted since the first write is not reverted. When the rollback itself
+/// fails the on-disk record still claims `recovering` for a supervisor that no
+/// longer exists, which is worse than the original failure and is reported with
+/// it rather than swallowed.
+fn fail_recovery(
+    paths: &AppPaths,
+    record: &mut ManagedServiceRecord,
+    recovering_snapshot: &ManagedServiceRecord,
+    prior: ManagedServiceRecord,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    if let Err(rollback) = rollback_recovering_record(paths, recovering_snapshot, &prior) {
+        return error.context(format!(
+            "rollback also failed: managed service {} is left recorded as recovering \
+             with no supervisor ({rollback:#})",
+            record.service_id
+        ));
+    }
+    *record = prior;
+    error
+}
+
 /// Grace given to a recovery supervisor that must be terminated because its
 /// record could not be published. Short: it is milliseconds old.
 const RECOVERY_CLEANUP_GRACE: Duration = Duration::from_secs(2);
@@ -1903,10 +1938,10 @@ fn detached_rocmd_command(rocmd_binary: &std::path::Path) -> ProcessCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::identity_probe_record;
     use crate::test_support::{
         UNCONFIRMED_STOP_PID, seed_keyed_service, stop_with_outcome, temp_app_paths,
     };
+    use crate::test_support::{free_loopback_port, identity_probe_record};
     use rocm_core::{AuditEventRecord, AutomationEventRecord};
 
     fn test_watcher_snapshot(
@@ -3449,7 +3484,7 @@ mod tests {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
 
-        // The gap Finding #2 closes: a crashed service's port is simultaneously
+        // The gap this closes: a crashed service's port is simultaneously
         // "free" to a brand-new `rocm serve --gpu auto` launch (which only
         // checks *live* records) and "needs recovery" to this function (which
         // used to only probe the raw OS bind). Neither process's engine binds
@@ -3541,6 +3576,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn recovery_is_not_blocked_by_a_stopped_or_failed_record_on_the_same_port() -> Result<()> {
         // The mirror image of the refusal above: `blocks_port` is
@@ -3815,7 +3851,12 @@ mod tests {
         let bind_succeeded = Cell::new(false);
         let spawn_override =
             |command: &mut ProcessCommand| -> std::io::Result<std::process::Child> {
-                bind_succeeded.set(TcpListener::bind(("127.0.0.1", port)).is_ok());
+                // Retry briefly: a sibling test's concurrent fork can hold a
+                // copy of the just-released socket until its exec closes it.
+                let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                while !bind_succeeded.get() && std::time::Instant::now() < deadline {
+                    bind_succeeded.set(TcpListener::bind(("127.0.0.1", port)).is_ok());
+                }
                 command.spawn()
             };
 
@@ -4101,7 +4142,7 @@ mod tests {
         let (root, paths) = temp_app_paths("restart-rollback-first-write");
         paths.ensure()?;
         let service_id = "svc-restart-rollback-first-write";
-        let mut record = identity_probe_record(&paths, service_id, 11459);
+        let mut record = identity_probe_record(&paths, service_id, free_loopback_port());
         record.status = "failed".to_owned();
         record.write()?;
 
@@ -4141,8 +4182,8 @@ mod tests {
 
     /// The first-write rollback above covers a failure before anything is
     /// spawned; this one covers the second write, after the supervisor exists.
-    /// A thread races the restart: as soon as the first write lands
-    /// (`recovering`, no supervisor yet), it corrupts the manifest's content so
+    /// The spawn seam corrupts the manifest's content right after the first
+    /// write (`recovering`, no supervisor yet), so
     /// `record_spawned_supervisor`'s read fails. That must kill the spawned
     /// supervisor and restore the prior record — and the rollback write itself
     /// must still land, since corrupting *content* leaves the file a writable
@@ -4163,41 +4204,23 @@ mod tests {
         fs::create_dir_all(paths.services_dir())?;
 
         let service_id = "svc-restart-rollback-second-write-unreadable";
-        let mut record = identity_probe_record(&paths, service_id, 11461);
+        let mut record = identity_probe_record(&paths, service_id, free_loopback_port());
         record.status = "failed".to_owned();
         record.write()?;
         let prior = record.clone();
 
         let terminate_calls_before = TERMINATE_RECOVERY_SUPERVISOR_CALLS.with(std::cell::Cell::get);
         let manifest_path = paths.service_manifest_path(service_id);
-        let corrupt = thread::spawn(move || -> bool {
-            let deadline = std::time::Instant::now() + Duration::from_secs(10);
-            while std::time::Instant::now() < deadline {
-                if let Ok(bytes) = fs::read(&manifest_path)
-                    && let Ok(on_disk) = serde_json::from_slice::<ManagedServiceRecord>(&bytes)
-                    && on_disk.status == "recovering"
-                    && on_disk.supervisor_pid == 0
-                {
-                    let _ = fs::write(&manifest_path, b"not json");
-                    return true;
-                }
-                // Busy-spin: the window this races (between the restart's
-                // first write and its spawned child's own write) is only as
-                // long as a `fork`+`exec`, far shorter than any sleep tick
-                // could reliably catch.
-                std::hint::spin_loop();
-            }
-            false
-        });
-        let outcome = restart_managed_service(&paths, &mut record);
-        let corrupted_in_time = corrupt.join().expect("corrupt thread");
+        // The spawn seam runs after the restart's first write and before
+        // `record_spawned_supervisor`, which is exactly the window to corrupt.
+        let corrupt = |command: &mut ProcessCommand| -> std::io::Result<std::process::Child> {
+            fs::write(&manifest_path, b"not json")?;
+            command.spawn()
+        };
+        let outcome = restart_managed_service_with(&paths, &mut record, Some(&corrupt));
         let persisted = load_service_record(&paths, service_id);
         fs::remove_dir_all(root).ok();
 
-        assert!(
-            corrupted_in_time,
-            "precondition: the race won before the second write ran"
-        );
         let error = outcome.expect_err("an unreadable second write must fail the restart");
         let message = format!("{error:#}");
         assert!(
@@ -4252,44 +4275,22 @@ mod tests {
         fs::create_dir_all(paths.services_dir())?;
 
         let service_id = "svc-restart-rollback-also-fails";
-        let mut record = identity_probe_record(&paths, service_id, 11462);
+        let mut record = identity_probe_record(&paths, service_id, free_loopback_port());
         record.status = "failed".to_owned();
         record.write()?;
 
-        let manifest_path = paths.service_manifest_path(service_id);
         let services_dir = paths.services_dir();
-        let lock = {
-            let services_dir = services_dir.clone();
-            thread::spawn(move || -> bool {
-                let deadline = std::time::Instant::now() + Duration::from_secs(10);
-                while std::time::Instant::now() < deadline {
-                    if let Ok(bytes) = fs::read(&manifest_path)
-                        && let Ok(on_disk) = serde_json::from_slice::<ManagedServiceRecord>(&bytes)
-                        && on_disk.status == "recovering"
-                        && on_disk.supervisor_pid == 0
-                        && fs::set_permissions(
-                            &services_dir,
-                            std::fs::Permissions::from_mode(0o555),
-                        )
-                        .is_ok()
-                    {
-                        return true;
-                    }
-                    std::hint::spin_loop();
-                }
-                false
-            })
+        // Same seam as above: deny directory writes once the first write has
+        // landed, so the second write and its rollback both fail.
+        let lock = |command: &mut ProcessCommand| -> std::io::Result<std::process::Child> {
+            fs::set_permissions(&services_dir, std::fs::Permissions::from_mode(0o555))?;
+            command.spawn()
         };
-        let outcome = restart_managed_service(&paths, &mut record);
-        let locked_in_time = lock.join().expect("lock thread");
+        let outcome = restart_managed_service_with(&paths, &mut record, Some(&lock));
         fs::set_permissions(&services_dir, std::fs::Permissions::from_mode(0o755))?;
         let persisted = load_service_record(&paths, service_id);
         fs::remove_dir_all(root).ok();
 
-        assert!(
-            locked_in_time,
-            "precondition: the race won before the second write ran"
-        );
         let error = outcome.expect_err("a read-only manifest must fail both writes");
         let message = format!("{error:#}");
         assert!(
@@ -4303,6 +4304,142 @@ mod tests {
         // Left exactly as the second write's failure found it: `recovering`
         // with no supervisor, matching the "no supervisor" the error names.
         assert_eq!(persisted?.status, "recovering");
+        Ok(())
+    }
+
+    /// A spawn that fails after the `recovering` write must not leave that
+    /// write behind: `is_live` counts `recovering`, and rocmd reads records
+    /// without refreshing them, so a stale one would reserve the port.
+    #[test]
+    fn restart_rolls_back_the_recovering_record_when_the_spawn_fails() -> Result<()> {
+        let (root, paths) = temp_app_paths("restart-spawn-fails-rolls-back");
+        paths.ensure()?;
+        fs::create_dir_all(paths.services_dir())?;
+
+        let service_id = "svc-restart-spawn-fails";
+        let mut record = identity_probe_record(&paths, service_id, free_loopback_port());
+        record.status = "failed".to_owned();
+        record.write()?;
+
+        let failing = |_command: &mut ProcessCommand| -> std::io::Result<std::process::Child> {
+            Err(std::io::Error::other("spawn refused by test"))
+        };
+        let outcome = restart_managed_service_with(&paths, &mut record, Some(&failing));
+        let persisted = load_service_record(&paths, service_id);
+        fs::remove_dir_all(root).ok();
+
+        let message = format!(
+            "{:#}",
+            outcome.expect_err("a failed spawn fails the restart")
+        );
+        assert!(
+            message.contains("failed to spawn recovery supervisor"),
+            "{message}"
+        );
+        assert_eq!(
+            persisted?.status, "failed",
+            "the on-disk record must not stay `recovering`"
+        );
+        assert_eq!(
+            record.status, "failed",
+            "the in-memory record must be restored too"
+        );
+        Ok(())
+    }
+
+    /// The disk re-check excludes the service's own record: rocmd reads records
+    /// as-is, so a crashed service can still read `running` on its own port, and
+    /// counting that as a competitor would make it impossible to ever recover.
+    #[test]
+    fn recovery_ignores_its_own_live_looking_record_on_its_own_port() -> Result<()> {
+        use std::net::TcpListener;
+
+        let (root, paths) = temp_app_paths("recovery-self-exclusion");
+        paths.ensure()?;
+        fs::create_dir_all(paths.services_dir())?;
+
+        let probe = TcpListener::bind(("127.0.0.1", 0))?;
+        let port = probe.local_addr()?.port();
+        drop(probe);
+
+        let service_id = "svc-recovery-self-exclusion";
+        let mut record = identity_probe_record(&paths, service_id, port);
+        record.status = "running".to_owned();
+        record.write()?;
+
+        let failing = |_command: &mut ProcessCommand| -> std::io::Result<std::process::Child> {
+            Err(std::io::Error::other("spawn refused by test"))
+        };
+        let outcome = restart_managed_service_with(&paths, &mut record, Some(&failing));
+        fs::remove_dir_all(root).ok();
+
+        let message = format!("{:#}", outcome.expect_err("the intercepted spawn fails"));
+        assert!(
+            message.contains("spawn refused by test"),
+            "recovery must reach the spawn, not refuse over its own record: {message}"
+        );
+        Ok(())
+    }
+
+    /// The rollback merges onto the live record: a stop marker persisted since
+    /// the first write survives, and the restart's own fields are restored.
+    #[test]
+    fn rollback_keeps_a_concurrent_stop_marker_and_restores_the_restarts_fields() -> Result<()> {
+        let (root, paths) = temp_app_paths("rollback-merge");
+        paths.ensure()?;
+        fs::create_dir_all(paths.services_dir())?;
+
+        let mut prior = identity_probe_record(&paths, "svc-rollback-merge", 11464);
+        prior.status = "failed".to_owned();
+        let mut recovering = prior.clone();
+        recovering.status = "recovering".to_owned();
+        recovering.supervisor_pid = 0;
+        // What a concurrent stop persisted on the live `recovering` record.
+        let mut on_disk = recovering.clone();
+        on_disk.stop_requested_unix_ms = Some(1_234);
+        on_disk.write()?;
+
+        rollback_recovering_record(&paths, &recovering, &prior)?;
+        let persisted = load_service_record(&paths, "svc-rollback-merge");
+        fs::remove_dir_all(root).ok();
+
+        let persisted = persisted?;
+        assert_eq!(persisted.status, "failed");
+        assert_eq!(
+            persisted.stop_requested_unix_ms,
+            Some(1_234),
+            "a stop marker persisted meanwhile must survive the rollback"
+        );
+        Ok(())
+    }
+
+    /// If another writer has since recorded a different supervisor, that
+    /// record is truer than this restart's view and the rollback leaves it.
+    #[test]
+    fn rollback_leaves_a_record_that_names_a_different_supervisor() -> Result<()> {
+        let (root, paths) = temp_app_paths("rollback-other-supervisor");
+        paths.ensure()?;
+        fs::create_dir_all(paths.services_dir())?;
+
+        let mut prior = identity_probe_record(&paths, "svc-rollback-other", 11465);
+        prior.status = "failed".to_owned();
+        let mut recovering = prior.clone();
+        recovering.status = "recovering".to_owned();
+        recovering.supervisor_pid = 0;
+        let mut on_disk = recovering.clone();
+        on_disk.supervisor_pid = 4_242_424;
+        on_disk.write()?;
+
+        rollback_recovering_record(&paths, &recovering, &prior)?;
+        let persisted = load_service_record(&paths, "svc-rollback-other");
+        fs::remove_dir_all(root).ok();
+
+        let persisted = persisted?;
+        assert_eq!(
+            persisted.status, "recovering",
+            "must not be blindly restored"
+        );
+        assert_eq!(persisted.supervisor_pid, 4_242_424);
         Ok(())
     }
 
