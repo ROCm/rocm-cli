@@ -26,7 +26,7 @@ pub const VERBS: &[Verb] = &[
         steps: &[
             "Pick a model",
             "Leave the rest automatic, or open Advanced settings",
-            "GPU is required — ROCm never falls back to CPU",
+            "GPU is required: ROCm never falls back to CPU",
             "Launch on a local endpoint picked for you and watch it come up",
         ],
         cmd: "rocm serve <model>",

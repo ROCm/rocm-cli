@@ -395,7 +395,7 @@ impl ServeWizardState {
                 let shown = self.port.trim();
                 return Err((
                     Field::Port,
-                    format!("port `{shown}` is not a valid 1–65535 value"),
+                    format!("port `{shown}` is not a valid 1-65535 value"),
                 ));
             };
             return Ok(Some(port));
@@ -633,7 +633,7 @@ fn editor_key(w: &mut ServeWizardState, code: KeyCode) {
                         // Mirror the Host rule: an empty custom port is not a
                         // value, so keep the editor open with a plain fix.
                         w.message = Some(
-                            "port cannot be empty; type a 1–65535 value or press Esc to cancel"
+                            "port cannot be empty; type a 1-65535 value or press Esc to cancel"
                                 .to_string(),
                         );
                         return;
@@ -1146,7 +1146,7 @@ mod tests {
             };
             let (field, msg) = w.build_args().unwrap_err();
             assert_eq!(field, Field::Port, "{bad:?}");
-            assert!(msg.contains("1–65535"), "{bad:?}: {msg}");
+            assert!(msg.contains("1-65535"), "{bad:?}: {msg}");
         }
     }
 
@@ -1259,7 +1259,7 @@ mod tests {
     }
 
     #[test]
-    fn is_loopback_host_matches_the_cli_exactly() {
+    fn is_loopback_host_accepts_only_the_documented_spellings() {
         for ok in ["127.0.0.1", "localhost", "::1"] {
             assert!(is_loopback_host(ok), "{ok}");
         }
@@ -1673,7 +1673,7 @@ mod tests {
             assert_eq!(w.port, "11435", "form untouched");
             let msg = w.message.as_deref().unwrap();
             assert!(msg.contains("port cannot be empty"), "{msg}");
-            assert!(msg.contains("1–65535"), "{msg}");
+            assert!(msg.contains("1-65535"), "{msg}");
         }
         // Typing a real value accepts normally and clears the complaint.
         for k in typed("9001") {

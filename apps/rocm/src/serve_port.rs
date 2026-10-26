@@ -90,7 +90,7 @@ pub(crate) struct ReservedPort {
 /// silently produce an endpoint nobody asked for.
 ///
 /// # Errors
-/// Returns a user-facing message for anything outside 1–65535.
+/// Returns a user-facing message for anything outside 1-65535.
 pub(crate) fn parse_serve_port(value: &str) -> Result<u16, String> {
     match value.trim().parse::<u16>() {
         Ok(0) | Err(_) => Err(format!(
