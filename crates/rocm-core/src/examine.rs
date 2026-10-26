@@ -466,9 +466,10 @@ pub enum FrameworkProbe {
 }
 
 impl Examination {
-    /// Record the AMD display driver, from the one probe result that
-    /// `rocm examine` and `rocm install driver` also read. `None` leaves the
-    /// fields empty, which no check treats as an old driver.
+    /// Record the AMD display driver from a read of the Windows device
+    /// inventory, which chooses the adapter the same way `rocm examine` and
+    /// `rocm install driver` do. Each command makes its own read. `None` leaves
+    /// the fields empty, which no check treats as an old driver.
     pub fn set_windows_driver(&mut self, info: Option<&crate::windows_driver::WindowsDriverInfo>) {
         let Some(info) = info else {
             return;

@@ -1252,9 +1252,10 @@ tests, because the Linux CI lane cannot simulate a Windows host:
 cargo test -p rocm-core -- windows_driver:: windows_driver_fills windows_driver_version_date \
   display_driver old_driver driver_age driver_fact driver_date driver_from_the_inventory \
   driver_without_the_cpu second_query version_less no_date basic_display same_adapter \
-  local_host_driver_probe
-cargo test -p rocm --bin rocm -- windows_install_driver the_fix_id_the_install_text \
-  planners_describe the_chat_entry the_production_planner provider_plans
+  local_host_driver_probe formats_the_driver_date_in_utc diagnosis_remediation_matches_the_fix_catalog_for_shared_fix_ids \
+  needs_reboot_true_fix_ids_match_the_known_set every_recipe_id_is_unique_and_covers_the_catalog
+cargo test -p rocm --bin rocm -- windows_install_driver should_execute_never \
+  the_fix_id_the_install_text planners_describe the_chat_entry the_production_planner provider_plans
 ```
 
 The filters are plain name fragments, because the tests sit in five modules and
