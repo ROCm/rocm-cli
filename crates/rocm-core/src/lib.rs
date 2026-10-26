@@ -149,7 +149,7 @@ pub use process::{
     spawn_detached_no_inherit, spawn_hidden_console_no_inherit, spawn_hidden_console_with_log,
     wait_for_process_exit,
 };
-pub use quoting::{posix_shell_quote, powershell_quote, ps_single_quote_escape};
+pub use quoting::{posix_shell_quote, powershell_quote};
 pub use report::{
     APPROVED_ARCHITECTURES, APPROVED_ARCHITECTURES_SOURCE, REPORT_SCHEMA_VERSION, ReadOutcome,
     Refusal as ReportRefusal, Report, is_rocm_supported, prepare_report, read_report,

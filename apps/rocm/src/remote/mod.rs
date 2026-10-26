@@ -1246,12 +1246,6 @@ fn render_stopped(
     output
 }
 
-/// Quote a value for a POSIX remote shell.
-///
-/// Model names and engine flags are user-supplied values being placed into a
-/// command line that a shell on another machine will interpret. Anything not
-/// obviously inert gets single-quoted, with embedded single quotes closed and
-/// re-opened, so no input can end the quoting and start a new command.
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -48,12 +48,13 @@
 /// matching printed copy of that same command. A path containing an
 /// apostrophe (`C:\Users\O'Brien\bin` is an ordinary Windows path, not a
 /// contrived edge case) would otherwise split the generated `-Command`
-/// script mid-statement.
+/// script mid-statement -- this is the ROCMAI-449 bug, present on both
+/// surfaces until the write and the printed copy shared this one escape.
 ///
 /// See also [`powershell_quote`], which wraps this escape in the surrounding
 /// `'...'` delimiters for the common case of quoting a whole argument rather
 /// than splicing an escaped fragment into an existing literal.
-pub fn ps_single_quote_escape(value: &str) -> String {
+pub(crate) fn ps_single_quote_escape(value: &str) -> String {
     value.replace('\'', "''")
 }
 
