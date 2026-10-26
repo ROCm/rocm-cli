@@ -1845,6 +1845,37 @@ for them, including for the fallback; their parsing is covered by the unit
 tests above, and the fallback itself by `hardware_root`'s own unit tests,
 since both now read through the same helper with an identity resolver.
 
+## Integrated Or Discrete GPU
+
+`rocm examine` reports each AMD GPU's `gfx_target` and `is_apu`, and two things
+a user sees follow from `is_apu`: `rocm serve` withholds its low-VRAM warning
+on a single-APU host, whose "VRAM" is a BIOS carve-out of system RAM, and
+`rocm diagnose` raises `fix-9-igpu-dgpu` only when a host has both an
+integrated and a discrete AMD GPU.
+
+`examine-29` in [examine.feature](../tests/e2e-cucumber/features/examine.feature)
+covers the PCI scan end to end on every Linux lane, GPU or not. It puts a
+stand-in `lspci` and an empty `rocminfo` on `PATH` and points the simulated host
+root at an empty tree, so the five planted rows are the only GPUs: one each
+classified by marketing name, by device id alone (the `Device` row `lspci`
+prints when `pci.ids` has no name), by both, and by codename.
+
+```bash
+RUSTC_WRAPPER= cargo xtask e2e -- -n 'examine-29 '
+```
+
+What `rocminfo` and `hipInfo` add is covered one level down, in
+[examine_gpu_proptests.rs](../crates/rocm-core/src/examine_gpu_proptests.rs):
+a target nothing classifies must leave an earlier verdict standing
+(`gfx_apu_verdict` answers `None` for it). That rule cannot be reached end to
+end today, because a real `rocminfo` prints ISA `Name:` lines that make the
+parser drop every agent (#393). The property harness asserts floors on how much
+of each corpus its generators reach, and prints the measured rates:
+
+```bash
+cargo test -p rocm-core --lib -- examine::gpu_proptests --nocapture
+```
+
 ## Windows Runtime Preflight
 
 On Windows, `rocm diagnose` compares the Visual C++ runtime in `System32`
