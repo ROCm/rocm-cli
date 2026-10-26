@@ -1155,6 +1155,11 @@ pub(crate) fn format_structured_tool_call(tool: &str, args: &[String]) -> String
     parts.join(" ")
 }
 
+/// Quotes `value` for rendered plan text and LLM prompt text only -- never
+/// executed directly. Deliberately kept separate from `rocm_core::quoting`'s
+/// shell/PowerShell quoting (ROCMAI-727): see that module's doc comment for
+/// why display/log/prompt-text helpers with no execution stakes are not
+/// merged with the ones that do.
 fn quote_tool_arg(value: &str) -> String {
     if value.is_empty() || value.chars().any(char::is_whitespace) {
         format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))

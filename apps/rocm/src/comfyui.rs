@@ -11,9 +11,9 @@ use flate2::read::GzDecoder;
 use rocm_core::browser::{Opener, SystemOpener};
 use rocm_core::{
     AppPaths, RocmCliConfig, download_file_to_path_with_progress, ensure_uv_binary,
-    format_http_base_url, runtime_is_linux, runtime_is_windows, runtime_path_for_windows_child,
-    runtime_path_list_join, runtime_path_list_split, runtime_paths_equivalent, unix_time_millis,
-    uv_command_env, uv_pip_install_base,
+    format_http_base_url, powershell_quote, runtime_is_linux, runtime_is_windows,
+    runtime_path_for_windows_child, runtime_path_list_join, runtime_path_list_split,
+    runtime_paths_equivalent, unix_time_millis, uv_command_env, uv_pip_install_base,
 };
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
@@ -1001,10 +1001,6 @@ fn spawn_comfyui_background_windows(
         .parse::<u32>()
         .context("PowerShell launcher returned an invalid process id")?;
     Ok(pid)
-}
-
-fn powershell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
 }
 
 fn app_root(paths: &AppPaths) -> PathBuf {
@@ -2276,6 +2272,12 @@ fn create_temp_dir_under(root: &Path, label: &str) -> Result<PathBuf> {
     bail!("failed to allocate a temporary command capture directory")
 }
 
+/// Quotes `value` for log text only, using Rust's own `{value:?}`
+/// Debug-format escaping; the real args passed to `Command::args` alongside
+/// this are unquoted. Deliberately kept separate from `rocm_core::quoting`'s
+/// shell/PowerShell quoting (ROCMAI-727): see that module's doc comment for
+/// why display/log/prompt-text helpers with no execution stakes are not
+/// merged with the ones that do.
 fn quote_log_arg(value: &str) -> String {
     if value
         .chars()

@@ -221,7 +221,7 @@ fn is_stateful_sequence(fix: &rocm_core::diagnose::Fix) -> bool {
 /// it in a second layer would only make an already-correct line unreadable, and
 /// these lines exist to be read and pasted.
 fn remote_invocation(target: &str, command: &str) -> String {
-    format!("ssh {target} -- {}", super::shell_quote(command))
+    format!("ssh {target} -- {}", rocm_core::posix_shell_quote(command))
 }
 
 /// Rewrite every backtick-quoted `rocm …` so it names the target machine.
