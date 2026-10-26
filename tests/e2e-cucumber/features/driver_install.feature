@@ -32,7 +32,7 @@ Feature: Driver installation planning
 
   # Every bare-metal Linux lane in this repo runs Ubuntu, but not always the
   # same release -- the hosted `E2E tests` job's `ubuntu-26.04` image reports
-  # 26.04 ("resolute"), which `build_driver_install_plan` routes to the
+  # 26.04 ("resolute"), which `build_driver_install_plan_at` routes to the
   # `ubuntu_native_archive` arm instead of the apt one (no repo.radeon.com/
   # amdgpu suite published for "resolute" yet; see the `("ubuntu", "26.04")`
   # arm in `driver_install.rs`), while the self-hosted GPU lane's real
@@ -56,7 +56,7 @@ Feature: Driver installation planning
   # silently falling back to "latest" -- user-observable as a
   # `supported: false` plan naming the variable. `ROCM_CLI_AMDGPU_DRIVER_VERSION`
   # is only consulted by the Linux DKMS arm, though: `build_driver_install_plan_at`
-  # checks `is_wsl_host()` and returns the WSL/ROCDXG plan before this override is
+  # checks `examine.wsl.is_wsl` and returns the WSL/ROCDXG plan before this override is
   # ever resolved, so a WSL host has no premise here (it would hit
   # `wsl_rocdxg_driver_plan` regardless of the override and the scenario would
   # fail by construction) -- same WSL-vs-bare-metal split as driver-install-04.

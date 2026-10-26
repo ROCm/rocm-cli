@@ -447,7 +447,8 @@ active default runtime, not about what a named prefix loses.
 package. On bare metal it defaults to the floating `latest` amdgpu release;
 set `ROCM_CLI_AMDGPU_DRIVER_VERSION` to pin a specific one. This replaces the
 older `ROCM_CLI_AMDGPU_VERSION`/`ROCM_CLI_AMDGPU_PACKAGE_RELEASE` pair, which
-pinned a fixed default and are no longer read.
+pinned a fixed default and are no longer read; the plan is refused while either is still set,
+so an old pin is never silently turned into `latest`.
 
 On Ubuntu 26.04, the amdgpu driver ships in-tree and `repo.radeon.com` does not
 yet publish a matching DKMS repo, so `install driver` reports a non-mutating

@@ -3445,13 +3445,31 @@ mod tests {
     }
 
     #[test]
+    fn repo_scan_dirs_cover_every_package_family() {
+        for dir in [
+            "/etc/apt/sources.list.d",
+            "/etc/yum.repos.d",
+            "/etc/zypp/repos.d",
+        ] {
+            assert!(REPO_SCAN_DIRS.contains(&dir), "missing {dir}");
+        }
+    }
+
+    #[test]
     fn merge_live_repo_paths_does_not_duplicate_an_already_seen_path() {
         let dir = tempfile::tempdir().expect("create temp dir");
         std::fs::write(dir.path().join("amdgpu.repo"), "[amdgpu]\n").expect("write repo");
         let dir_str = dir.path().to_string_lossy().into_owned();
 
         let mut e = Examination::default();
-        e.rocm_repos_seen.push(format!("{dir_str}/amdgpu.repo"));
+        // `join`, not a hardcoded `/`: the scan records `entry.path()`, which
+        // uses the platform separator.
+        e.rocm_repos_seen.push(
+            dir.path()
+                .join("amdgpu.repo")
+                .to_string_lossy()
+                .into_owned(),
+        );
         merge_live_repo_paths(&mut e, &[dir_str.as_str()]);
 
         assert_eq!(

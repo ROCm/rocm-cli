@@ -321,7 +321,7 @@ const RECIPES: &[FixRecipe] = &[
     FixRecipe {
         fix_id: "fix-3-rocm-kernel",
         title: "ROCm/distro/kernel triple unsupported",
-        rationale: "ROCm is installed but your kernel/distro combination is outside the supported matrix. Match the kernel to the matrix first, then rerun `rocm install driver --dkms`. To avoid the DKMS build entirely, use `rocm install sdk` instead: it installs the userspace ROCm stack without touching the kernel module.",
+        rationale: "ROCm is installed but your kernel/distro combination is outside the supported matrix. Match the kernel to the matrix first, then rerun `rocm install driver --dkms`.",
         commands: &[
             "# Cross-check the live AMD matrix before changing anything:",
             "#   https://rocm.docs.amd.com/projects/install-on-linux/en/latest/reference/system-requirements.html",
@@ -330,9 +330,7 @@ const RECIPES: &[FixRecipe] = &[
         needs_sudo: false,
         needs_reboot: true,
         needs_relogin: false,
-        verify: "# Run only the line matching the path you took above:\n\
-                 lsmod | grep amdgpu && rocminfo | head -n 20   # drive reinstall path\n\
-                 rocminfo | head -n 20                         # `rocm install sdk` (userspace-only) path",
+        verify: "lsmod | grep amdgpu && rocminfo >/dev/null 2>&1",
         notes: &[],
         doc_url: Some(
             "https://rocm.docs.amd.com/projects/install-on-linux/en/latest/reference/system-requirements.html",
@@ -527,6 +525,10 @@ const RECIPES: &[FixRecipe] = &[
         title: "Reset repo-native install state and reinstall",
         rationale: "The repo-native package-manager install left a half-configured DKMS / repo state. Clear the broken package state, quarantine the ROCm/AMDGPU repo files found on this host, let the package manager forget the broken state, then reinstall via rocm-cli's own repo-native flow.",
         commands: &[
+            "# Applies only where `rocm install driver --dkms` plans a reinstall (AMD-documented",
+            "# distros). On Ubuntu 26.04 the driver is in-tree: skip the purge/remove, the DKMS",
+            "# reinstall and the DKMS verify, and run `sudo apt install rocm` instead. On any other",
+            "# distro it plans nothing: skip the purge/remove and reinstall per AMD's install docs.",
             "# Run only the block matching your package manager. On Debian/Ubuntu, run all",
             "# three lines even if an earlier one reports an error -- the purge must not",
             "# be skipped just because the half-configured state made `install -f` fail:",
@@ -3860,6 +3862,7 @@ mod tests {
         let e = crate::examine::Examination {
             os_family: "linux".to_owned(),
             distro_id: "ubuntu".to_owned(),
+            distro_version: "24.04".to_owned(),
             rocm_install_method: "repo-native".to_owned(),
             ..crate::examine::Examination::default()
         };

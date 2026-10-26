@@ -204,7 +204,7 @@ async fn assert_driver_plan_repo_version_resolved(world: &mut E2eWorld) {
     // The default, unoverridden value is the literal "latest" (ROCM_CLI_AMDGPU_DRIVER_VERSION
     // is unset on a normal test host) -- not a numeric ROCm version -- so only
     // non-empty and metacharacter-safe are asserted here, matching the same
-    // filter build_driver_install_plan applies before this value ever reaches
+    // filter build_driver_install_plan_at applies before this value ever reaches
     // a single-quoted shell command.
     assert!(!repo_version.is_empty(), "repo_version is empty:\n{output}");
     assert!(

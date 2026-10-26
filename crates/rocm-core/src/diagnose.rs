@@ -844,7 +844,7 @@ fn check_3_rocm_kernel_unsupported(e: &Examination, symptom: &str) -> Diagnosis 
         "#   https://rocm.docs.amd.com/projects/install-on-linux/en/latest/reference/system-requirements.html".to_owned(),
     ];
     if ubuntu_driver_is_native_archive(e) {
-        commands.push("# Not on Ubuntu 26.04: the amdgpu driver ships in-tree there, so `rocm install driver --dkms` plans nothing; run `sudo apt install rocm` instead.".to_owned());
+        commands.push("# Note on Ubuntu 26.04: the amdgpu driver ships in-tree there, so `rocm install driver --dkms` plans nothing; run `apt install rocm` (with sudo if not root) instead.".to_owned());
     } else if dkms_driver_plan_is_supported(e) {
         commands.push("# If your kernel is above the supported range, install the HWE".to_owned());
         commands.push(
@@ -855,23 +855,14 @@ fn check_3_rocm_kernel_unsupported(e: &Examination, symptom: &str) -> Diagnosis 
             "# `rocm install driver --dkms` plans nothing on {distro} {distro_v}: it isn't one of the AMD-documented distros/versions above, so rerunning it won't fix this."
         ));
     }
-    commands.push("# To avoid the DKMS build entirely, use `rocm install sdk` instead:".to_owned());
-    commands.push(
-        "# it installs the userspace ROCm stack without touching the kernel module.".to_owned(),
-    );
     let fix = Fix {
         summary: "Cross-check your kernel/distro against the live AMD compatibility matrix before reinstalling.".to_owned(),
         commands,
         fix_id: "fix-3-rocm-kernel".to_owned(),
         needs_reboot: true,
-        // `rocm install sdk` deliberately never loads the amdgpu kernel
-        // module (that's the point of avoiding the DKMS build), so a
-        // `lsmod | grep amdgpu` requirement would fail that path even when it
-        // worked; only require it if you took the driver-reinstall path above.
-        verify: "# Run only the line matching the path you took above:\n\
-                 lsmod | grep amdgpu && rocminfo | head -n 20   # drive reinstall path\n\
-                 rocminfo | head -n 20                         # `rocm install sdk` (userspace-only) path"
-            .to_owned(),
+        // Check rocminfo's own exit code: piping through `head` would report
+        // the pipeline's last stage and mask a missing/failing `rocminfo`.
+        verify: "lsmod | grep amdgpu && rocminfo >/dev/null 2>&1".to_owned(),
         ..Fix::default()
     };
     finalize(
@@ -1573,7 +1564,7 @@ fn is_repo_native_installed(method: &str) -> bool {
 
 /// Whether `rocm install driver --dkms` has nothing to reinstall on this
 /// host. Ubuntu 26.04 ships the amdgpu kernel driver in-tree and
-/// `build_driver_install_plan` in `apps/rocm/src/driver_install.rs` plans no
+/// `build_driver_install_plan_at` in `apps/rocm/src/driver_install.rs` plans no
 /// DKMS repo install there (see the `("ubuntu", "26.04")` arm); `rocm-core`
 /// can't call that plan builder directly (`apps/rocm` depends on
 /// `rocm-core`, not the reverse), so this mirrors just that one condition.
@@ -1583,8 +1574,9 @@ fn ubuntu_driver_is_native_archive(e: &Examination) -> bool {
     e.distro_id.eq_ignore_ascii_case("ubuntu") && e.distro_version == "26.04"
 }
 
-/// Whether `rocm install driver --dkms` plans any commands at all for this
-/// host, mirroring the full `(os_id, version_id)` / `ID_LIKE`-derivative
+/// Whether `rocm install driver --dkms` plans any commands for this host.
+///
+/// Mirrors the full `(os_id, version_id)` / `ID_LIKE`-derivative
 /// matrix in `apps/rocm/src/driver_install.rs::build_driver_install_plan_at`
 /// (`rocm-core` can't call that plan builder directly -- see
 /// `ubuntu_driver_is_native_archive` above for why). Ubuntu 26.04 is
@@ -1592,7 +1584,7 @@ fn ubuntu_driver_is_native_archive(e: &Examination) -> bool {
 /// commands": that host has its own guidance (native archive, `apt install
 /// rocm`), handled separately via `ubuntu_driver_is_native_archive`, not the
 /// "no plan was guessed for this distro at all" case this function reports.
-fn dkms_driver_plan_is_supported(e: &Examination) -> bool {
+pub fn dkms_driver_plan_is_supported(e: &Examination) -> bool {
     let os_id = e.distro_id.to_ascii_lowercase();
     let version_id = e.distro_version.as_str();
     match (os_id.as_str(), version_id) {
@@ -1636,15 +1628,23 @@ fn check_12_repo_native_broken(e: &Examination, symptom: &str) -> Diagnosis {
         return zero("fix-12-installer", "repo-native install broken state");
     }
     let family = repo_pkg_family(e);
+    // Purging `amdgpu-dkms` is only the first half of purge-then-reinstall:
+    // where rocm-cli plans no reinstall (undocumented distro) it would strip
+    // the driver with nothing to put back, so that step is withheld there.
+    let reinstall_planned = ubuntu_driver_is_native_archive(e) || dkms_driver_plan_is_supported(e);
     let mut commands = vec!["# Clear the half-configured package/DKMS state first.".to_owned()];
     match family {
         "apt" => {
             commands.push("sudo dpkg --configure -a".to_owned());
             commands.push("sudo apt-get install -f".to_owned());
-            commands.push("sudo apt-get purge -y amdgpu-dkms".to_owned());
+            if reinstall_planned {
+                commands.push("sudo apt-get purge -y amdgpu-dkms".to_owned());
+            }
         }
-        "dnf" => commands.push("sudo dnf remove -y amdgpu-dkms".to_owned()),
-        "zypper" => commands.push("sudo zypper remove -y amdgpu-dkms".to_owned()),
+        "dnf" if reinstall_planned => commands.push("sudo dnf remove -y amdgpu-dkms".to_owned()),
+        "zypper" if reinstall_planned => {
+            commands.push("sudo zypper remove -y amdgpu-dkms".to_owned());
+        }
         _ => {}
     }
     commands.push(
@@ -7215,7 +7215,7 @@ mod tests {
             .expect("unsupported kernel triple should be diagnosed");
         let commands = hit.fix.as_ref().unwrap().commands.join("\n");
         assert!(
-            commands.contains("Not on Ubuntu 26.04") && commands.contains("sudo apt install rocm"),
+            commands.contains("Note on Ubuntu 26.04") && commands.contains("apt install rocm"),
             "Ubuntu 26.04 must be told to use the native archive path, not a DKMS rerun: {commands}"
         );
         assert!(
@@ -7662,6 +7662,7 @@ mod tests {
     fn repo_native_broken_on_a_dnf_host_gets_dnf_commands_not_apt() {
         let mut e = linux_base();
         e.distro_id = "rocky".to_owned();
+        e.distro_version = "9.6".to_owned();
         e.rocm_install_method = "repo-native".to_owned();
         e.rocm_repos_seen = vec!["/etc/yum.repos.d/amdgpu.repo".to_owned()];
         let report = diagnose(
@@ -7689,6 +7690,7 @@ mod tests {
     fn repo_native_broken_on_a_zypper_host_gets_zypper_commands_not_apt() {
         let mut e = linux_base();
         e.distro_id = "sles".to_owned();
+        e.distro_version = "15.7".to_owned();
         e.rocm_install_method = "repo-native".to_owned();
         e.rocm_repos_seen = vec!["/etc/zypp/repos.d/amdgpu.repo".to_owned()];
         let report = diagnose(
@@ -7846,5 +7848,81 @@ mod tests {
             report.matched.iter().any(|d| d.id == "fix-12-installer"),
             "dpkg keyword evidence alone should still surface fix-12"
         );
+    }
+
+    #[test]
+    fn dkms_driver_plan_support_matrix_covers_every_arm() {
+        // (distro_id, distro_version, distro_id_like, supported). Kept in step
+        // with `build_driver_install_plan_at` by
+        // `driver_plan_support_matches_rocm_core_diagnose` in
+        // `apps/rocm/src/driver_install.rs`.
+        let table = [
+            ("ubuntu", "22.04", "debian", true),
+            ("ubuntu", "24.04", "debian", true),
+            ("ubuntu", "26.04", "debian", false),
+            ("debian", "12", "", true),
+            ("debian", "13", "", true),
+            ("rhel", "9.7", "fedora", true),
+            ("rhel", "10.0", "fedora", true),
+            ("ol", "9.7", "fedora", true),
+            ("rocky", "9.6", "rhel centos fedora", true),
+            ("sles", "15.7", "suse", true),
+            ("sle", "15.7", "suse", true),
+            ("almalinux", "9.6", "rhel centos fedora", true),
+            ("pop", "24.04", "ubuntu debian", true),
+            ("ol", "9.7", "rhel fedora", true),
+            ("ol", "9.5", "rhel fedora", false),
+            ("fedora", "41", "", false),
+            ("opensuse-leap", "15.7", "suse opensuse", false),
+            ("linuxmint", "22", "ubuntu debian", false),
+        ];
+        for (id, version, like, expected) in table {
+            let mut e = linux_base();
+            e.distro_id = id.to_owned();
+            e.distro_version = version.to_owned();
+            e.distro_id_like = like.to_owned();
+            assert_eq!(
+                dkms_driver_plan_is_supported(&e),
+                expected,
+                "{id} {version} (ID_LIKE={like})"
+            );
+        }
+    }
+
+    #[test]
+    fn repo_native_broken_on_an_undocumented_distro_does_not_purge_the_driver() {
+        let mut e = linux_base();
+        e.distro_id = "fedora".to_owned();
+        e.distro_version = "41".to_owned();
+        e.rocm_install_method = "repo-native".to_owned();
+        let report = diagnose(&e, "dpkg: error processing package amdgpu-dkms");
+        let hit = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-12-installer")
+            .expect("repo-native broken state should be diagnosed");
+        let commands = hit.fix.as_ref().unwrap().commands.join("\n");
+        assert!(
+            !commands.contains("amdgpu-dkms") && !commands.contains("rocm install driver"),
+            "no purge without a planned reinstall: {commands}"
+        );
+    }
+
+    #[test]
+    fn kernel_unsupported_does_not_offer_the_sdk_install_or_a_maskable_verify() {
+        let mut e = linux_base();
+        e.distro_id = "ubuntu".to_owned();
+        e.distro_version = "24.04".to_owned();
+        e.rocm_version = "7.0.0".to_owned();
+        e.amdgpu_loaded = Some(false);
+        let report = diagnose(&e, "kernel/rocm mismatch");
+        let fix = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-3-rocm-kernel")
+            .and_then(|d| d.fix.as_ref())
+            .expect("unsupported kernel triple should be diagnosed");
+        assert!(!fix.commands.join("\n").contains("rocm install sdk"));
+        assert!(!fix.verify.contains("| head"), "{}", fix.verify);
     }
 }

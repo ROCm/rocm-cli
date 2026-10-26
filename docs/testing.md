@@ -1600,7 +1600,7 @@ otherwise.
 
 On Linux bare metal, `rocm install driver` defaults to the floating `latest`
 amdgpu release; `ROCM_CLI_AMDGPU_DRIVER_VERSION` overrides it (replacing the
-retired `ROCM_CLI_AMDGPU_VERSION`/`ROCM_CLI_AMDGPU_PACKAGE_RELEASE` pair). An
+retired `ROCM_CLI_AMDGPU_VERSION`/`ROCM_CLI_AMDGPU_PACKAGE_RELEASE` pair, which the plan refuses while either is still set). An
 override that isn't a plain version token is refused rather than silently
 falling back, since it is interpolated into privileged shell commands:
 

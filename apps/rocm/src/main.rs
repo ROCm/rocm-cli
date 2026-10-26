@@ -12019,6 +12019,8 @@ pub(crate) mod tests {
         pub(crate) fn with_amd_overrides_cleared() -> Self {
             let mut env = Self::new();
             env.clear("ROCM_CLI_AMDGPU_DRIVER_VERSION");
+            env.clear("ROCM_CLI_AMDGPU_VERSION");
+            env.clear("ROCM_CLI_AMDGPU_PACKAGE_RELEASE");
             env
         }
 

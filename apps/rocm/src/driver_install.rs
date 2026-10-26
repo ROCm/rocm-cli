@@ -835,6 +835,9 @@ fn unreadable_os_release_plan(reason: String, repo_version_expr: String) -> Driv
     }
 }
 
+const RETIRED_DRIVER_VERSION_VARS: [&str; 2] =
+    ["ROCM_CLI_AMDGPU_VERSION", "ROCM_CLI_AMDGPU_PACKAGE_RELEASE"];
+
 /// The refusal plan `resolve_repo_version_expr` returns for any
 /// `ROCM_CLI_AMDGPU_DRIVER_VERSION` value that cannot be safely interpolated
 /// into a shell command -- whether it failed [`is_safe_shell_token`] or could
@@ -863,6 +866,18 @@ fn invalid_driver_version_override_plan(value_debug: String) -> DriverInstallPla
 /// `invalid_driver_version_override` plan on a malformed override rather than
 /// one of them silently falling back to `latest`.
 fn resolve_repo_version_expr() -> Result<String, Box<DriverInstallPlan>> {
+    // The pre-`latest` pin variables are no longer read; refuse rather than
+    // install a floating `latest` for a user who still exports one.
+    for retired in RETIRED_DRIVER_VERSION_VARS {
+        if std::env::var_os(retired).is_some_and(|v| !v.is_empty()) {
+            let mut plan = invalid_driver_version_override_plan(format!("{retired} is set"));
+            plan.policy = "retired_driver_version_override".to_owned();
+            plan.reason = format!(
+                "{retired} is no longer read; unset it, and set ROCM_CLI_AMDGPU_DRIVER_VERSION to pin an amdgpu driver release."
+            );
+            return Err(Box::new(plan));
+        }
+    }
     // Resolved here rather than left as a shell `${VAR:-default}` expression:
     // these commands are built with `printf '%s\n' '...'` (single-quoted) so the
     // written repo file has a working baseurl regardless of shell. The value is
@@ -3134,6 +3149,9 @@ VERSION_CODENAME=noble
         assert!(!is_safe_shell_token("6.2.1'"));
         assert!(!is_safe_shell_token("6.2.1;rm"));
         assert!(!is_safe_shell_token("';rm -rf /;'"));
+        // `/` cannot break out of the quotes, but it would let the override
+        // rewrite the repo URL path.
+        assert!(!is_safe_shell_token("6.2.1/../x"));
         assert!(is_safe_shell_token("6.2.1"));
     }
 
@@ -3556,6 +3574,96 @@ VERSION_ID="15.7"
     }
 
     #[test]
+    fn driver_plan_dnf_overrides_the_repo_version_via_the_driver_version_env() {
+        let mut env = ScopedTestEnv::with_amd_overrides_cleared();
+        env.set("ROCM_CLI_AMDGPU_DRIVER_VERSION", "30.10");
+        let os_release = "ID=rhel\nVERSION_ID=\"9.7\"\n";
+        let plan = build_driver_install_plan_read(
+            &test_examine("linux", false),
+            &os_release_found(os_release),
+            true,
+            PrivilegeEscalation::Sudo,
+        );
+        let rendered = render_driver_install_plan(&plan, false, false);
+
+        assert!(plan.supported);
+        assert!(
+            rendered.contains("amdgpu/30.10/rhel/9.7/"),
+            "an overridden ROCM_CLI_AMDGPU_DRIVER_VERSION must reach the dnf repo baseurl, \
+             not a hardcoded `latest`: {rendered}"
+        );
+    }
+
+    #[test]
+    fn driver_plan_refuses_a_retired_version_pin_variable() {
+        for retired in RETIRED_DRIVER_VERSION_VARS {
+            let mut env = ScopedTestEnv::with_amd_overrides_cleared();
+            env.set(retired, "7.2.4");
+            let plan = build_driver_install_plan_read(
+                &test_examine("linux", false),
+                &os_release_found("ID=ubuntu\nVERSION_ID=\"24.04\"\nVERSION_CODENAME=noble\n"),
+                true,
+                PrivilegeEscalation::Sudo,
+            );
+
+            assert!(!plan.supported && !plan.mutating, "{retired}");
+            assert_eq!(plan.policy, "retired_driver_version_override");
+            assert!(plan.reason.contains("ROCM_CLI_AMDGPU_DRIVER_VERSION"));
+        }
+    }
+
+    #[test]
+    fn driver_plan_support_matches_rocm_core_diagnose() {
+        // `rocm-core` cannot call the plan builder, so diagnose keeps its own
+        // copy of the support matrix (`dkms_driver_plan_is_supported`); this
+        // fails if the two disagree on any host.
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
+        let hosts = [
+            ("ubuntu", "22.04", "debian"),
+            ("ubuntu", "24.04", "debian"),
+            ("ubuntu", "26.04", "debian"),
+            ("debian", "12", ""),
+            ("debian", "13", ""),
+            ("rhel", "9.7", "fedora"),
+            ("rhel", "10.0", "fedora"),
+            ("ol", "9.7", "fedora"),
+            ("ol", "9.7", "rhel fedora"),
+            ("ol", "9.5", "rhel fedora"),
+            ("rocky", "9.6", "rhel centos fedora"),
+            ("almalinux", "9.6", "rhel centos fedora"),
+            ("sles", "15.7", "suse"),
+            ("sle", "15.7", "suse"),
+            ("pop", "24.04", "ubuntu debian"),
+            ("linuxmint", "22", "ubuntu debian"),
+            ("fedora", "41", ""),
+            ("opensuse-leap", "15.7", "suse opensuse"),
+        ];
+        for (id, version, like) in hosts {
+            let os_release = format!(
+                "ID={id}\nVERSION_ID=\"{version}\"\nID_LIKE=\"{like}\"\nVERSION_CODENAME=noble\n"
+            );
+            let plan = build_driver_install_plan_read(
+                &test_examine("linux", false),
+                &os_release_found(&os_release),
+                true,
+                PrivilegeEscalation::Sudo,
+            );
+            let host = rocm_core::examine::Examination {
+                distro_id: id.to_owned(),
+                distro_version: version.to_owned(),
+                distro_id_like: like.to_owned(),
+                ..rocm_core::examine::Examination::default()
+            };
+            assert_eq!(
+                plan.supported,
+                rocm_core::diagnose::dkms_driver_plan_is_supported(&host),
+                "{id} {version} (ID_LIKE={like}): plan policy {}",
+                plan.policy
+            );
+        }
+    }
+
+    #[test]
     fn driver_plan_sles_overrides_the_repo_version_via_the_driver_version_env() {
         let mut env = ScopedTestEnv::with_amd_overrides_cleared();
         env.set("ROCM_CLI_AMDGPU_DRIVER_VERSION", "6.2.1");
@@ -3749,7 +3857,7 @@ VERSION_ID="41"
     ///
     /// Builds on [`ScopedTestEnv::with_amd_overrides_cleared`] rather than
     /// `new` so a caller that also exercises the bare-metal AMDGPU override
-    /// through the same `build_driver_install_plan` call doesn't need a
+    /// through the same `build_driver_install_plan_at` call doesn't need a
     /// second guard: one helper covers both input sets regardless of which
     /// branch actually reads them.
     fn scoped_rocdxg_env() -> ScopedTestEnv {
