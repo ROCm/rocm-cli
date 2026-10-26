@@ -715,6 +715,8 @@ fn validate_model_recipe_engine_record(
         && engine_recipe.unsupported_combinations.is_empty()
         && engine_recipe.notes.is_empty()
         && engine_recipe.model_id_override.is_none()
+        && engine_recipe.image_digest.is_none()
+        && engine_recipe.extra_env.is_empty()
     {
         bail!(
             "engine recipe for `{}` on `{canonical_model_id}` must not be empty",

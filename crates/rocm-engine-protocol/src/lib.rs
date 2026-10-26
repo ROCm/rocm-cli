@@ -644,6 +644,32 @@ pub struct LogsResponse {
 
 #[cfg(test)]
 mod tests {
+    fn resolve_response(served: Option<&str>) -> ResolveModelResponse {
+        ResolveModelResponse {
+            canonical_model_id: "image:tag".to_owned(),
+            served_model_id: served.map(str::to_owned),
+            task: "chat".to_owned(),
+            source: "s".to_owned(),
+            revision: "r".to_owned(),
+            loader: "l".to_owned(),
+            trust_remote_code: false,
+            chat_template_mode: "auto".to_owned(),
+            dtype: "auto".to_owned(),
+            device_policy: DevicePolicy::GpuRequired,
+            estimated_memory: "1 GiB".to_owned(),
+            launch_defaults: Value::Null,
+            engine_recipe: None,
+            warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn served_model_name_prefers_a_non_blank_served_id() {
+        assert_eq!(resolve_response(Some("qwen")).served_model_name(), "qwen");
+        assert_eq!(resolve_response(Some(" ")).served_model_name(), "image:tag");
+        assert_eq!(resolve_response(None).served_model_name(), "image:tag");
+    }
+
     use super::*;
 
     #[test]
