@@ -28,7 +28,6 @@ use crate::freeform_planner::{
     format_structured_tool_call, freeform_plan_next_action_with_context, render_freeform_plan,
     serve_args_request_cpu_device,
 };
-use crate::runtime_install_finalize::empty_as_unknown;
 use crate::runtimes_cmd::render_runtimes_text;
 use crate::service_launch::is_loopback_host;
 use crate::{
@@ -44,6 +43,7 @@ use crate::{
 };
 use crate::{chat_host_facts, comfyui, providers, therock};
 use anyhow::{Context, Result, bail};
+use rocm_core::placeholder::empty_as_unknown;
 use rocm_core::{
     AppPaths, AutomationRuntimeState, DEFAULT_LOCAL_HOST, ExamineSummary, ManagedServiceRecord,
     RocmCliConfig, builtin_watcher, daemon_binary_path, load_recent_automation_events,

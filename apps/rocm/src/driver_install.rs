@@ -21,11 +21,12 @@ use std::path::PathBuf;
 use std::process::{Command as ProcessCommand, Stdio};
 
 use anyhow::{Context, Result, bail};
+use rocm_core::placeholder::empty_as_unknown;
 use rocm_core::{AppPaths, ExamineSummary, shell_command_for_host};
 use serde::{Deserialize, Serialize};
 
 use crate::cli_report;
-use crate::runtime_install_finalize::{empty_as_unknown, real_os_release};
+use crate::runtime_install_finalize::real_os_release;
 
 pub(crate) fn install_driver(
     paths: &AppPaths,
