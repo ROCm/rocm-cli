@@ -3309,3 +3309,6 @@ mod tests {
         crate::test_support::assert_each_call_gets_its_own_root(|| temp_app_paths("same-label").0);
     }
 }
+
+#[cfg(test)]
+mod sse_emitter_proptests;

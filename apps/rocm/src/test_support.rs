@@ -32,6 +32,37 @@ pub(crate) fn unique_suffix() -> String {
     )
 }
 
+/// Case count for a property test: `PROPTEST_CASES` (proptest's own knob,
+/// which an explicit `with_cases` would otherwise override) when it is set and
+/// above `default`, otherwise `default`.
+///
+/// Never below `default`: the counts are chosen so a property catches the
+/// defects it targets with near certainty, and some of those are hit by a
+/// small share of cases, so a lower count would pass with them present. `0`
+/// would pass vacuously.
+pub(crate) fn proptest_cases(default: u32) -> u32 {
+    std::env::var("PROPTEST_CASES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .map_or(default, |requested: u32| requested.max(default))
+}
+
+/// Split `bytes` at the given (unsorted, possibly duplicated) offsets, each
+/// taken modulo `bytes.len() + 1`.
+pub(crate) fn split_at_offsets<'a>(bytes: &'a [u8], offsets: &[usize]) -> Vec<&'a [u8]> {
+    let mut cuts: Vec<usize> = offsets.iter().map(|o| o % (bytes.len() + 1)).collect();
+    cuts.sort_unstable();
+    cuts.dedup();
+    let mut pieces = Vec::new();
+    let mut start = 0;
+    for cut in cuts {
+        pieces.push(&bytes[start..cut]);
+        start = cut;
+    }
+    pieces.push(&bytes[start..]);
+    pieces
+}
+
 /// Call `make_root` from many threads at once, remove what it made, and
 /// assert no two calls returned the same root.
 ///
