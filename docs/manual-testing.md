@@ -272,6 +272,29 @@ On Ubuntu 22.04, 24.04 and 26.04 the apt source line names the matching suite
 first prepare command prints a "from a previous installation" warning; confirm
 nothing is removed (`dpkg -s amdgpu-dkms` still reports installed afterwards).
 
+## 2c. Integrated or discrete
+
+On a machine with an AMD integrated GPU, check what `rocm examine --json`
+reports for it under `gpus`:
+
+```bash
+rocm examine --framework skip --json
+```
+
+Expected result:
+
+- Each AMD GPU carries a `gfx_target`, and an integrated one carries
+  `is_apu: true`. On a Ryzen 7000 or later desktop the iGPU is `gfx1036`; on a
+  Ryzen 6000 laptop `gfx1035`; on a Krackan Point laptop (Radeon 860M or 840M)
+  `gfx1152`, never `gfx1150`; on a Ryzen 4000 or 5000 machine `gfx90c`.
+- A discrete card beside it carries `is_apu: false`, and `has_apu` and
+  `has_discrete_amd` are both `true`. An iGPU reported with `is_apu: false`, or
+  an iGPU-only machine with `has_discrete_amd: true`, is a regression unless
+  the GPU's `gfx_target` is empty (an unidentified row is reported as discrete
+  on purpose).
+- On a machine whose only GPU is the iGPU, `rocm serve` does not warn about low
+  VRAM.
+
 ## 3. Lemonade GPU Verification
 
 Lemonade is the default local assistant/server engine. Serve a small assistant
