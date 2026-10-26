@@ -182,6 +182,14 @@ pub use uv::{
     uv_pip_freeze_args, uv_pip_install_base, uv_venv_args, violation_subject, violations_requiring,
 };
 
+/// E2E-only switch that makes `rocm serve`'s managed engine die during startup.
+///
+/// Honoured only by a `rocm` binary built with the `e2e-test-hooks` feature; a
+/// release build has no code that reads it. Defined here, rather than in the
+/// binary that reads it, because the E2E suite sets it from another crate: one
+/// constant both sides name cannot drift the way two copies of the string could.
+pub const MANAGED_ENGINE_STARTUP_FAILURE_TEST_ENV: &str = "ROCM_E2E_MANAGED_ENGINE_STARTUP_FAILURE";
+
 /// The variable that opts a machine out of rocm-cli choosing its runtime's torch.
 pub const TORCH_ALIGNMENT_DISABLED_ENV: &str = "ROCM_CLI_DISABLE_TORCH_ALIGNMENT";
 

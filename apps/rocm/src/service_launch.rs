@@ -255,21 +255,20 @@ pub(crate) fn attach_background_stdio(
 /// load) passes the check, and the launch is reported as still starting.
 pub(crate) const MANAGED_ENGINE_STARTUP_SETTLE: Duration = Duration::from_millis(200);
 
-/// E2E-only switch that makes the managed engine die during startup, so the
-/// black-box suite can assert what a user sees when it does.
+/// Whether the E2E-only switch that makes the managed engine die during startup
+/// is armed, so the black-box suite can assert what a user sees when it does.
 ///
-/// Read in the *parent*, which is what spawns the engine, so nothing test-only
+/// The switch is read in the *parent*, which is what spawns the engine, so nothing test-only
 /// leaks into the child's own code path. The child is the real `rocm` binary,
 /// really spawned and really dead — only its arguments are swapped for ones the
 /// CLI rejects outright, so the launch takes exactly the path a broken engine
 /// takes.
-#[cfg(feature = "e2e-test-hooks")]
-const MANAGED_ENGINE_STARTUP_FAILURE_TEST_ENV: &str = "ROCM_E2E_MANAGED_ENGINE_STARTUP_FAILURE";
-
-/// Whether the E2E startup-failure switch is armed.
+///
+/// Armed by [`rocm_core::MANAGED_ENGINE_STARTUP_FAILURE_TEST_ENV`], which the
+/// E2E suite names too.
 #[cfg(feature = "e2e-test-hooks")]
 pub(crate) fn scripted_managed_engine_startup_failure() -> bool {
-    std::env::var_os(MANAGED_ENGINE_STARTUP_FAILURE_TEST_ENV).is_some()
+    std::env::var_os(rocm_core::MANAGED_ENGINE_STARTUP_FAILURE_TEST_ENV).is_some()
 }
 
 /// Release builds do not enable `e2e-test-hooks`, so the switch does not exist

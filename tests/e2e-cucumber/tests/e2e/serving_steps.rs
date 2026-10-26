@@ -1728,12 +1728,11 @@ async fn assert_stop_hint_clears_the_service(world: &mut E2eWorld) {
 /// neither GPU hardware nor an installed runtime.
 #[given("the managed engine dies during startup")]
 async fn managed_engine_dies_during_startup(world: &mut E2eWorld) {
-    world
-        .command_env
-        .push((MANAGED_ENGINE_STARTUP_FAILURE_ENV, "1".into()));
+    world.command_env.push((
+        rocm_core::MANAGED_ENGINE_STARTUP_FAILURE_TEST_ENV,
+        "1".into(),
+    ));
 }
-
-const MANAGED_ENGINE_STARTUP_FAILURE_ENV: &str = "ROCM_E2E_MANAGED_ENGINE_STARTUP_FAILURE";
 
 #[then("serving fails and names the engine's own log")]
 async fn assert_startup_death_names_log(world: &mut E2eWorld) {
@@ -1841,9 +1840,10 @@ async fn assert_startup_death_names_log(world: &mut E2eWorld) {
 async fn user_serves_the_same_model_again(world: &mut E2eWorld) {
     // Re-arm the scripted death: the runner consumes the scenario env on each
     // invocation, and the retry has to die the same way to be recognisable.
-    world
-        .command_env
-        .push((MANAGED_ENGINE_STARTUP_FAILURE_ENV, "1".into()));
+    world.command_env.push((
+        rocm_core::MANAGED_ENGINE_STARTUP_FAILURE_TEST_ENV,
+        "1".into(),
+    ));
     user_serves_with_lemonade(world).await;
 }
 
