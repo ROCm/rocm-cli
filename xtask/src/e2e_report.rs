@@ -136,6 +136,7 @@ fn label_for_root_report(dir: &Path) -> String {
         });
     match slug.as_deref() {
         Some("mock") => "e2e-report".to_owned(),
+        Some("mock-windows") => "e2e-windows-report".to_owned(),
         Some("mi300x") => "e2e-gpu-report".to_owned(),
         Some("gfx1201") => "e2e-gpu-rad3-report".to_owned(),
         Some("mi350p") => "e2e-gpu-mi350p-report".to_owned(),
@@ -217,6 +218,7 @@ mod tests {
     /// entries.
     const CANONICAL_REPORT_ARTIFACTS: &[&str] = &[
         "e2e-report",
+        "e2e-windows-report",
         "e2e-gpu-report",
         "e2e-gpu-n-1-report",
         "e2e-gpu-n-2-report",
@@ -388,6 +390,7 @@ mod tests {
             ("strix-halo-windows", "e2e-gpu-strix-windows-report"),
             ("strix-halo-wsl", "e2e-gpu-strix-wsl-report"),
             ("mock", "e2e-report"),
+            ("mock-windows", "e2e-windows-report"),
         ] {
             let tmp = tempfile::tempdir().expect("tempdir");
             let root = tmp.path();
