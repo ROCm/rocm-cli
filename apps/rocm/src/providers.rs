@@ -2353,8 +2353,11 @@ mod tests {
                 r#"{"intent":"inspect","tool_call":{"tool":"rocm","args":["examine"]}}"#,
             ),
         ];
-        let server =
-            spawn_sequenced_local_provider_test_server(listener, LEMONADE_ASSISTANT_MODEL_ID, bodies);
+        let server = spawn_sequenced_local_provider_test_server(
+            listener,
+            LEMONADE_ASSISTANT_MODEL_ID,
+            bodies,
+        );
         ready_builtin_planner_service(&paths, port)?;
 
         let config = RocmCliConfig {
@@ -2372,7 +2375,8 @@ mod tests {
             crate::freeform_planner::build_freeform_plan_with_context("serve", &paths, &config);
         let executed_plan =
             crate::freeform_planner::build_freeform_plan_with_context("serve", &paths, &config);
-        let shown_text = crate::freeform_planner::render_structured_request_plan(&shown_plan, &paths);
+        let shown_text =
+            crate::freeform_planner::render_structured_request_plan(&shown_plan, &paths);
         let executed_action = crate::freeform_planner::plan_next_action(executed_plan)
             .expect("provider-resolved plan should produce a next action");
         let executed_tool_call =
@@ -2433,8 +2437,11 @@ mod tests {
         let bodies = vec![planner_chat_completion_body(
             r#"{"intent":"inspect","tool_call":{"tool":"rocm","args":["examine"]}}"#,
         )];
-        let server =
-            spawn_sequenced_local_provider_test_server(listener, LEMONADE_ASSISTANT_MODEL_ID, bodies);
+        let server = spawn_sequenced_local_provider_test_server(
+            listener,
+            LEMONADE_ASSISTANT_MODEL_ID,
+            bodies,
+        );
         ready_builtin_planner_service(&paths, port)?;
 
         let config = RocmCliConfig {

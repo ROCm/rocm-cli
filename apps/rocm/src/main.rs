@@ -12753,8 +12753,8 @@ pub(crate) mod tests {
         // Through the real pre-dispatch path, not the injector in isolation:
         // `execute_freeform_next_action` is this plus the header render and
         // `dispatch`, so dropping the injection from the pipeline fails here.
-        let execution = prepare_freeform_execution(plan)
-            .expect("install request should prepare for execution");
+        let execution =
+            prepare_freeform_execution(plan).expect("install request should prepare for execution");
         let action = &execution.action;
 
         assert_eq!(
