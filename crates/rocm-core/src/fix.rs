@@ -668,7 +668,12 @@ const RECIPES: &[FixRecipe] = &[
             "A service that failed at startup is hidden from a plain `rocm services list`; pass --all to recover its id.",
         ],
         doc_url: None,
-        applies_on: PRINT_ON_LINUX,
+        // Matches `check_17_torch_dlpack_cuda_variant`'s `["linux", "wsl"]`
+        // registration. vLLM is supported on WSL2 and its engine runs the same
+        // ELF import there, so the diagnosis the engine hint points at has to
+        // be reachable there too. Pinned by
+        // `every_checker_platform_is_covered_by_its_recipe`.
+        applies_on: PRINT_ON_LINUX_AND_WSL,
         runner: None,
     },
     FixRecipe {

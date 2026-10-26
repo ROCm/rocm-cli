@@ -5,12 +5,20 @@ Feature: Interactive dashboard
   # only for now: portable-pty compiles on Windows via ConPTY, but that path is
   # not yet promoted to a blocking contract (tracked as a follow-up).
 
+  # #534: the ROCm view's `Runs:` line is a command a user can copy into a
+  # shell, and it named `rocm doctor`, a subcommand that does not exist. The
+  # unit test beside the action list checks each label against what its screen
+  # runs; the diagnose steps here check the line the user actually sees. They
+  # extend this journey rather than open another dashboard session, which would
+  # add load to the no-GPU lane's timing-sensitive dash scenarios.
   @id:dash-opens-and-navigates @requires-os:linux
   Scenario: dash-01 - A user opens the dashboard and navigates to ROCm setup
     When the user opens the dashboard with demo data
     Then the dashboard home view is displayed
     When the user opens the ROCm view
     Then ROCm setup actions are displayed
+    When the user selects the ROCm diagnose action
+    Then the diagnose action says it runs rocm examine
     When the user quits the dashboard
     Then the dashboard exits successfully
 
@@ -618,9 +626,40 @@ Feature: Interactive dashboard
   # second and there's no hook to freeze the daemon mid-handshake, so
   # asserting on it would be asserting on a race.
   @id:dash-reports-no-gpu-telemetry @requires-os:linux
-  Scenario: dash-37 - The hero shows placeholders, not fake zeros, when no GPU is detected
+  Scenario: dash-38 - The hero shows placeholders, not fake zeros, when no GPU is detected
     When the user opens the dashboard
     Then the dashboard home view is displayed
     And the hero reports no GPU telemetry available
     When the user quits the dashboard
+    Then the dashboard exits successfully
+
+  # The Diagnose screen offers the same Doctor report the CLI prepares, and the
+  # review comes first. Whether a report can be prepared is a property of the
+  # machine, not of the dashboard: hardware that is not on AMD's published list,
+  # an architecture that cannot be read, and a WSL host all get a refusal, and
+  # only an approved architecture gets a report. So this scenario does not pin
+  # which outcome this machine produces. It reads whether the CLI refused from
+  # the preview, then checks the card against that: a report is offered for
+  # sending exactly when the CLI printed one, and a refusal shows the CLI's own
+  # explanation. The card puts that outcome first. This scenario runs at the
+  # detail size that "the user opens the Observe view" selects (120x40); the
+  # cramped 80x24 case is covered by the unit test in
+  # `crates/rocm-dash-tui/src/ui/examine_manager.rs`.
+  #
+  # The scenario never presses `s` and never approves a send, so no mail client
+  # is ever opened from a test. The approve and decline paths, and the promise
+  # that no send starts before an approve, are asserted where the key sequence
+  # can be driven directly: the unit tests in
+  # `crates/rocm-dash-tui/src/ui/examine_manager.rs`.
+  @id:dash-doctor-report-is-reviewed-before-sending @requires-os:linux
+  Scenario: dash-37 - A user reviews a Doctor report in the dashboard before anything is sent
+    When the user opens the dashboard with demo data
+    And the user opens the Observe view
+    And the user opens the Diagnose screen
+    And the user prepares a Doctor report
+    Then the report is displayed for review
+    When the user leaves the report review
+    Then the dashboard offers to send a report only if the CLI prepared one
+    When the user closes the Diagnose screen
+    And the user quits the dashboard
     Then the dashboard exits successfully

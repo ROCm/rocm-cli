@@ -40,27 +40,49 @@ use crate::{
     runtime_services,
 };
 
+/// Refuse `--restart-services` without `--yes`, naming the command the user
+/// ran (`activate <runtime>` or `rollback`) in the retry hint, so following it
+/// repeats the same activation or rollback with the approval added.
+pub(crate) fn ensure_runtime_service_restart_approved(command: &RuntimesCommand) -> Result<()> {
+    match command {
+        RuntimesCommand::Activate {
+            runtime,
+            restart_services,
+            yes,
+        } => runtime_services::ensure_service_restart_approved(
+            *restart_services,
+            *yes,
+            &format!("activate {runtime}"),
+        ),
+        RuntimesCommand::Rollback {
+            restart_services,
+            yes,
+        } => runtime_services::ensure_service_restart_approved(*restart_services, *yes, "rollback"),
+        RuntimesCommand::List
+        | RuntimesCommand::Uninstall { .. }
+        | RuntimesCommand::Import { .. }
+        | RuntimesCommand::Adopt { .. } => Ok(()),
+    }
+}
+
 pub(crate) fn runtimes(command: Option<RuntimesCommand>) -> Result<()> {
     let paths = AppPaths::discover()?;
     let mut config = RocmCliConfig::load(&paths)?;
+    let command = command.unwrap_or(RuntimesCommand::List);
+    // Checked before anything is written: a refused restart must leave the
+    // previously active runtime in place, not switch the runtime and then
+    // decline the half of the job the user actually asked for.
+    ensure_runtime_service_restart_approved(&command)?;
 
-    match command.unwrap_or(RuntimesCommand::List) {
+    match command {
         RuntimesCommand::List => {
             print!("{}", render_runtimes_text(&paths, &config)?);
         }
         RuntimesCommand::Activate {
             runtime,
             restart_services,
-            yes,
+            yes: _,
         } => {
-            // Checked before anything is written: a refused restart must leave
-            // the previously active runtime in place, not switch the runtime and
-            // then decline the half of the job the user actually asked for.
-            runtime_services::ensure_service_restart_approved(
-                restart_services,
-                yes,
-                &format!("activate {runtime}"),
-            )?;
             let mut result = activate_runtime(&paths, &mut config, &runtime)?;
             if restart_services {
                 runtime_services::restart_stale_runtime_services(
@@ -110,9 +132,8 @@ pub(crate) fn runtimes(command: Option<RuntimesCommand>) -> Result<()> {
         }
         RuntimesCommand::Rollback {
             restart_services,
-            yes,
+            yes: _,
         } => {
-            runtime_services::ensure_service_restart_approved(restart_services, yes, "rollback")?;
             let mut result = rollback_runtime(&paths, &mut config)?;
             if restart_services {
                 runtime_services::restart_stale_runtime_services(
@@ -1180,14 +1201,9 @@ fn import_runtime_manifest(
 pub(crate) fn newest_installed_runtime_manifest(
     paths: &AppPaths,
 ) -> Result<Option<therock::InstalledRuntimeManifest>> {
-    let mut manifests = therock::load_runtime_manifests(paths)?;
-    manifests.sort_by(|left, right| {
-        right
-            .installed_at_unix_ms
-            .cmp(&left.installed_at_unix_ms)
-            .then_with(|| left.runtime_key.cmp(&right.runtime_key))
-    });
-    Ok(manifests.into_iter().next())
+    // `load_runtime_manifests` already returns newest install first with ties
+    // broken on the runtime key, so re-sorting here would be a no-op.
+    Ok(therock::load_runtime_manifests(paths)?.into_iter().next())
 }
 
 #[derive(Debug, Clone)]

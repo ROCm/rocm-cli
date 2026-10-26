@@ -574,6 +574,46 @@ Expected result:
   first one's "yes" not actually exiting anything — is the bug this fixes
   (issue #145).
 
+### 4a. Dashboard Doctor Report
+
+On a machine whose hardware `rocm diagnose --report` can describe (see
+`rocm diagnose --report --json` for what it says on yours), open the dashboard
+and go to the Observe tab, then press `d` to open the Diagnose screen:
+
+```powershell
+rocm dash
+```
+
+Expected result:
+
+- The Diagnose card ends with `Prepare a Doctor report (p). It is shown first,
+  and nothing is sent.` The footer reads `Enter/r run · p report · Esc close`.
+  There is no send hint yet.
+- `p` runs the read-only preview (`rocm diagnose --report --json`) in a console
+  and prints the report. Press Enter or Esc to dismiss the console.
+- If the CLI prepared a report, the card now says `A report is ready` and the
+  footer adds `s review & send`. If the CLI refused (hardware that is not on the
+  published list, an unreadable architecture, a WSL host), the card shows the
+  CLI's own explanation, says no report was prepared, and the footer has no
+  `s review & send`. Pressing `s` then does nothing.
+- `s` does not send. It opens a review dialog titled `Report this diagnosis`
+  that shows the full report, and `Deny` is the selected button. Check that
+  nothing else happened: no mail client opened and no job started.
+- In the dialog, PgUp and PgDn scroll one page, Home and End jump to the top and
+  the bottom. A muted `More to read` line with the row position appears only
+  while the report is longer than the dialog. Up and Down do not scroll.
+- Decline with `n`, Esc, `q`, or Enter on `Deny`. The dialog closes, no mail
+  client opens, and the report is still ready: press `s` to review it again.
+- Approve with `y` (or Tab to `Approve`, then Enter). Only now does the
+  dashboard run `rocm diagnose --report --send`, which opens a prefilled mail in
+  your mail client, or on a machine with no mail client prints the address and
+  the link. The mail is not sent until you send it from the mail client. The
+  send examines the machine again, so the mail can differ slightly from the
+  preview if the machine changed in between.
+
+On an 80x24 terminal, repeat the steps up to the dialog: the card shows the
+outcome (report ready or refusal) without scrolling.
+
 ## 5. ComfyUI Verification
 
 ComfyUI is managed as an app surface. It should start a local web server and

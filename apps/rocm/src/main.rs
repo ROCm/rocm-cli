@@ -2,6 +2,8 @@
 //
 // SPDX-License-Identifier: MIT
 
+#[cfg(test)]
+mod advised_commands;
 /// Shared archive generator and filesystem oracle for the extraction property
 /// tests in `comfyui` and `therock`.
 #[cfg(all(test, unix))]

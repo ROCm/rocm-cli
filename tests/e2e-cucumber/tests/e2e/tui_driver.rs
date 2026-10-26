@@ -73,12 +73,20 @@ const KEY_RESEND_INTERVAL: Duration = Duration::from_millis(500);
 /// process exits. This is bounded so a misbehaving PTY cannot stall a scenario.
 const DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 
-/// Default wall-clock budget for a single wait. Generous enough for a cold dash
-/// start plus the embedded-daemon connect, while still turning a genuine hang
-/// into a prompt, diagnosable failure rather than a CI-timeout.
+/// Default budget for a single wait. Generous enough for a cold dash start
+/// plus the embedded-daemon connect, while still turning a genuine hang into a
+/// prompt, diagnosable failure rather than a CI-timeout.
+///
+/// Most waits spend it in wall-clock time. [`TuiSession::send_until`] and
+/// [`TuiSession::quit_and_wait`] act on what they read, so they spend it in
+/// time they were polled: time the harness leaves them unpolled is added to
+/// their deadline, up to a wall-clock cap of
+/// [`WALL_CLOCK_CAP_FACTOR`](e2e_cucumber::polled_deadline::WALL_CLOCK_CAP_FACTOR)
+/// times the budget.
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 
-/// Wall-clock budget for a single wait, overridable with `E2E_TUI_TIMEOUT_SECS`.
+/// Budget for a single wait, overridable with `E2E_TUI_TIMEOUT_SECS`; see
+/// [`DEFAULT_TIMEOUT_SECS`] for which waits spend it in wall-clock time.
 ///
 /// Mirrors `E2E_SERVE_TIMEOUT_SECS` in `serving_steps.rs`: the assertion is
 /// right, the budget is what varies by host. The self-hosted Strix lanes share
@@ -670,6 +678,11 @@ impl TuiSession {
     /// the application having acted on the key rather than on it having been
     /// ready when the key was written.
     ///
+    /// Like [`quit_and_wait`](Self::quit_and_wait), `timeout` is time this step
+    /// was polled, up to a wall-clock cap of
+    /// [`WALL_CLOCK_CAP_FACTOR`](e2e_cucumber::polled_deadline::WALL_CLOCK_CAP_FACTOR)
+    /// times `timeout`.
+    ///
     /// Only safe for idempotent keys (a tab jump, not a toggle): the key is
     /// always sent at least once, and further copies may still be queued in the
     /// terminal when the marker appears, so the application may act on it again
@@ -687,6 +700,7 @@ impl TuiSession {
             RetryTiming {
                 timeout,
                 resend_interval: KEY_RESEND_INTERVAL,
+                poll_interval: POLL_INTERVAL,
             },
             Self::send,
             |session, marker, attempt| Box::pin(session.wait_for_screen(marker, attempt)),
@@ -896,8 +910,14 @@ impl TuiSession {
     /// first check and the loop never reaches a second send. What's resent
     /// each pass isn't always the same literal `gesture` either — see the
     /// quit-confirm handling below, which switches to `"y"` once the prompt is
-    /// on screen — and the wait between sends doubles each pass, for the
-    /// reason [`e2e_cucumber::quit_and_wait::quit_and_wait`] gives.
+    /// on screen — and the wait between sends doubles each pass. `timeout`
+    /// is time this step was polled: time the harness leaves it unpolled is
+    /// added to the deadline, up to a wall-clock cap of
+    /// [`WALL_CLOCK_CAP_FACTOR`](e2e_cucumber::polled_deadline::WALL_CLOCK_CAP_FACTOR)
+    /// times `timeout`.
+    /// [`e2e_cucumber::quit_and_wait::quit_and_wait`] explains why the gesture
+    /// is resent, why the wait doubles, and why the deadline counts only
+    /// polled time.
     pub async fn quit_and_wait(&mut self, timeout: Duration) -> Result<(), String> {
         // Several fixtures leave a model serving (`simulated`/demo sessions
         // never do — `AppState::has_live_instance` always returns `false`
@@ -919,6 +939,7 @@ impl TuiSession {
             RetryTiming {
                 timeout,
                 resend_interval: KEY_RESEND_INTERVAL,
+                poll_interval: POLL_INTERVAL,
             },
             |session| session.screen_snapshot().0.contains(QUIT_CONFIRM_MARKER),
             Self::send,
@@ -928,8 +949,8 @@ impl TuiSession {
         match result {
             Ok(()) => Ok(()),
             Err(QuitError::Failed(error)) => Err(error),
-            Err(QuitError::TimedOut) => Err(format!(
-                "timed out after {timeout:?} waiting for the TUI to exit after repeating {gesture:?}.\n{}",
+            Err(QuitError::TimedOut(expiry)) => Err(format!(
+                "timed out after {expiry} waiting for the TUI to exit after repeating {gesture:?}.\n{}",
                 self.framed_screen()
             )),
         }

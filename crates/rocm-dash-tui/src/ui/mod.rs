@@ -154,7 +154,7 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
     if state.has_open_overlay() {
         modal::grey_overlay(f);
     }
-    let manager_rect = modal::centered_rect(82, 80, 130, 34, body);
+    let manager_rect = manager_rect(body);
     draw_active_manager(f, manager_rect, state, &theme);
 
     // Approval modal (Phase 4): drawn LAST so it sits on top of every overlay
@@ -445,7 +445,7 @@ pub fn draw_focused(f: &mut Frame, state: &mut AppState) {
         // skipped the wash entirely, leaving the area outside the manager card
         // at plain theme background instead of dimmed).
         modal::grey_overlay(f);
-        let manager_rect = modal::centered_rect(82, 80, 130, 34, body);
+        let manager_rect = manager_rect(body);
         draw_active_manager(f, manager_rect, state, &theme);
     } else {
         f.render_widget(
@@ -472,6 +472,12 @@ pub fn draw_focused(f: &mut Frame, state: &mut AppState) {
         modal::grey_overlay(f);
         approval::draw_approval(f, body, &quit_confirm_request(state, false), choice, &theme);
     }
+}
+
+/// Where an operational manager overlay is drawn inside the dashboard `body`.
+/// One place, so the draw paths and the tests that check what fits agree.
+pub(crate) fn manager_rect(body: Rect) -> Rect {
+    modal::centered_rect(82, 80, 130, 34, body)
 }
 
 /// Draw whichever operational manager is open into `rect`. The managers are

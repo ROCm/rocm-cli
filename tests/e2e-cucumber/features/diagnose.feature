@@ -169,14 +169,18 @@ Feature: Diagnosing failures and listing fixes
   # a test of the runner's health. Clearing the threshold comes from the keyword
   # alone and holds on every host.
   #
-  # @requires-os:linux because the checker is registered linux-only, and
-  # @requires-bare-metal because WSL2 does not run the catalog at all — the two
-  # are not interchangeable, WSL2 reports an os_family of linux.
-  @id:diagnose-recognises-the-engine-import-failure @requires-bare-metal @requires-os:linux
+  # @requires-os:linux because the vLLM engine does not run on native Windows.
+  # The checker is registered for linux and wsl, and it reads only the symptom
+  # text, so the scenario holds on the WSL lane too. It is not tagged
+  # @requires-bare-metal, which would skip it exactly where the WSL entry was
+  # added. Following the diagnosis to the fix it named proves the recipe applies
+  # on the host the report was produced on.
+  @id:diagnose-recognises-the-engine-import-failure @requires-os:linux
   Scenario: diagnose-13 - A vLLM engine-startup import failure is recognised from its error text
     Given a user who hit the vLLM engine-startup import failure
     When the user asks the CLI to diagnose that symptom in machine-readable form
     Then the CLI reports the engine-startup import failure as an established cause
+    And the CLI can act on the fix named for the engine-startup import failure
 
   # Every other recipe in the catalog is a flat sequence for one shell. This one
   # is not: `rocm engines shell vllm` opens an INTERACTIVE subshell, the two
@@ -187,11 +191,12 @@ Feature: Diagnosing failures and listing fixes
   # terminal stdin buffering to land each line in the right shell. What the user
   # can observe is the printed plan, so that is what is asserted.
   #
-  # Deliberately not OS-gated even though the fix is linux-only: the plan is
-  # printed before the fix's own platform gate is reached, so the text under test
-  # is identical on both lanes and the Windows lane exercises it too. The step
-  # therefore asserts the printed block and not the exit code, which does differ
-  # (0 where the fix applies, 3 where it does not).
+  # Deliberately not OS-gated even though the fix applies on Linux and WSL only:
+  # the plan is printed before the fix's own platform gate is reached, so the
+  # text under test is identical on every lane and the Windows lane exercises it
+  # too. The step therefore asserts the printed block and not the exit code,
+  # which does differ (0 on Linux and WSL, where the fix applies, and 3 on
+  # Windows, where it does not).
   @id:diagnose-fix-says-which-shell-each-step-runs-in
   Scenario: diagnose-14 - A fix whose steps span two shells says which shell each step runs in
     Given a user who has chosen the fix for the engine-startup import failure
