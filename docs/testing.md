@@ -953,7 +953,7 @@ which is unavailable on headless serving hosts), and printed once as client
 configuration — it must never appear in `rocm services`, `rocm logs`, or the
 audit log. Verifying that the running server actually *rejects* an
 unauthenticated request requires a live engine: the `networking-04` scenario
-(`tests/e2e-cucumber/features/networking.feature`) serves a model on a public
+([networking.feature](../tests/e2e-cucumber/features/networking.feature)) serves a model on a public
 bind and checks that a request without the key and one with a wrong key get
 401, while the issued key is accepted. It runs on the MI300X vLLM lane only, which
 is not a required check; native Windows and lemonade-default hosts skip it. The

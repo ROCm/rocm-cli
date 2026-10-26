@@ -86,6 +86,13 @@ async fn wait_for_authenticated_endpoint(key: &str, timeout_secs: u64, serve_std
     loop {
         let last_seen = match try_models_status(Some(key)).await {
             Some(status) if status.is_success() => return,
+            // A bound engine rejecting the key it was issued is a contract defect,
+            // not a slow start, so report it now instead of at the deadline.
+            Some(reqwest::StatusCode::UNAUTHORIZED) => panic!(
+                "public endpoint {} rejected the issued key with 401\n--- SERVE STDOUT ---\n{serve_stdout}\n--- SERVICE LOG (tail) ---\n{}",
+                endpoint_url(),
+                service_log_tail(serve_stdout)
+            ),
             Some(status) => format!("endpoint answered {status} to the issued key"),
             None => "connection refused / timed out".to_owned(),
         };
