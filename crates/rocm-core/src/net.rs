@@ -560,6 +560,72 @@ pub fn http_post_json_with_auth(
     endpoint_api_key: Option<&str>,
     timeout: Duration,
 ) -> Result<HttpResponseParts> {
+    let payload = serde_json::to_vec(body).context("failed to serialize HTTP JSON body")?;
+    http_post_bytes_with_auth(
+        endpoint_url,
+        path,
+        "application/json",
+        &payload,
+        endpoint_api_key,
+        timeout,
+    )
+}
+
+/// POST a `multipart/form-data` body of text `fields` plus one file part.
+pub fn http_post_multipart_with_auth(
+    endpoint_url: &str,
+    path: &str,
+    fields: &[(&str, &str)],
+    file: MultipartFile<'_>,
+    endpoint_api_key: Option<&str>,
+    timeout: Duration,
+) -> Result<HttpResponseParts> {
+    const BOUNDARY: &str = "rocm-cli-multipart-boundary-7d3f1c";
+    let mut payload = Vec::new();
+    for (name, value) in fields {
+        payload.extend_from_slice(
+            format!(
+                "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+            )
+            .as_bytes(),
+        );
+    }
+    payload.extend_from_slice(
+        format!(
+            "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"{}\"; filename=\"{}\"\r\nContent-Type: {}\r\n\r\n",
+            file.field, file.filename, file.content_type
+        )
+        .as_bytes(),
+    );
+    payload.extend_from_slice(file.bytes);
+    payload.extend_from_slice(format!("\r\n--{BOUNDARY}--\r\n").as_bytes());
+    http_post_bytes_with_auth(
+        endpoint_url,
+        path,
+        &format!("multipart/form-data; boundary={BOUNDARY}"),
+        &payload,
+        endpoint_api_key,
+        timeout,
+    )
+}
+
+/// The file part of a [`http_post_multipart_with_auth`] request.
+#[derive(Debug, Clone, Copy)]
+pub struct MultipartFile<'a> {
+    pub field: &'a str,
+    pub filename: &'a str,
+    pub content_type: &'a str,
+    pub bytes: &'a [u8],
+}
+
+fn http_post_bytes_with_auth(
+    endpoint_url: &str,
+    path: &str,
+    content_type: &str,
+    payload: &[u8],
+    endpoint_api_key: Option<&str>,
+    timeout: Duration,
+) -> Result<HttpResponseParts> {
     let deadline = Instant::now() + timeout;
     let (host, port) = parse_http_endpoint(endpoint_url)
         .with_context(|| format!("unsupported endpoint URL `{endpoint_url}`"))?;
@@ -569,12 +635,13 @@ pub fn http_post_json_with_auth(
         Some(key) => format!("Authorization: Bearer {key}\r\n"),
         None => String::new(),
     };
-    let payload = serde_json::to_string(body).context("failed to serialize HTTP JSON body")?;
-    let request = format!(
-        "POST {path} HTTP/1.1\r\nHost: {host_header}\r\nContent-Type: application/json\r\nAccept: application/json\r\nContent-Length: {}\r\n{auth_header}Connection: close\r\n\r\n{payload}",
+    let head = format!(
+        "POST {path} HTTP/1.1\r\nHost: {host_header}\r\nContent-Type: {content_type}\r\nAccept: application/json\r\nContent-Length: {}\r\n{auth_header}Connection: close\r\n\r\n",
         payload.len()
     );
-    write_all_tcp_stream(&mut stream, request.as_bytes())
+    let mut request = head.into_bytes();
+    request.extend_from_slice(payload);
+    write_all_tcp_stream(&mut stream, &request)
         .with_context(|| format!("failed to write HTTP POST {path}"))?;
     let response = read_http_response_bounded(&mut stream, deadline)
         .with_context(|| format!("failed to read HTTP POST {path}"))?;
@@ -659,6 +726,7 @@ pub fn merge_json_state_file(path: &Path, patch: &serde_json::Value) -> Result<(
 /// still leaves the throttle in place instead of freeing the next poll to spend
 /// another full timeout.
 pub fn engine_state_inference_verified(
+    task: crate::ModelTask,
     state_path: &Path,
     state: Option<&serde_json::Value>,
     endpoint_url: &str,
@@ -686,7 +754,8 @@ pub fn engine_state_inference_verified(
         state_path,
         &serde_json::json!({ INFERENCE_PROBE_ATTEMPTED_STATE_KEY: now }),
     );
-    if !openai_chat_completion_probe(
+    if !openai_inference_probe(
+        task,
         endpoint_url,
         model_ref,
         endpoint_api_key,
@@ -728,10 +797,10 @@ fn http_status_code(status_line: &str) -> Option<u16> {
 /// non-empty content would also wrongly fail a reasoning model, which can spend
 /// its whole (tiny) token budget before emitting any content.
 ///
-/// The rule does mean a `404` reads as serving. That is harmless for the engines
-/// shipped today — both implement `/v1/chat/completions`, and a wrong key fails
-/// the model listing that gates this call — but an engine that does not expose an
-/// OpenAI-shaped chat route would need a different signal rather than this one.
+/// The rule does mean a `404` (or Lemonade's `400` for a model that is not an
+/// LLM) reads as serving, so this is only a readiness signal for a chat model.
+/// A service of another task is probed with its own request through
+/// [`openai_inference_probe`], which is what every readiness check calls.
 pub fn openai_chat_completion_probe(
     endpoint_url: &str,
     model_ref: &str,
@@ -769,6 +838,107 @@ pub fn openai_chat_completion_status(
         timeout,
     )?;
     Ok(response.status)
+}
+
+/// Ask a speech-to-text endpoint to transcribe one second of silence and
+/// return the HTTP status — the transcription counterpart of
+/// [`openai_chat_completion_status`].
+///
+/// Silence keeps the probe cheap and deterministic: the request exercises the
+/// whole decode path (multipart upload, audio decode, model forward pass)
+/// without depending on what a model makes of real speech.
+pub fn openai_transcription_status(
+    endpoint_url: &str,
+    model_ref: &str,
+    endpoint_api_key: Option<&str>,
+    timeout: Duration,
+) -> Result<u16> {
+    let wav = silent_wav_16khz_mono(Duration::from_secs(1));
+    let response = http_post_multipart_with_auth(
+        endpoint_url,
+        "/v1/audio/transcriptions",
+        &[("model", model_ref)],
+        MultipartFile {
+            field: "file",
+            filename: "silence.wav",
+            content_type: "audio/wav",
+            bytes: &wav,
+        },
+        endpoint_api_key,
+        timeout,
+    )?;
+    Ok(response.status)
+}
+
+/// The smallest real request for a model's task, as an HTTP status.
+pub fn openai_inference_status(
+    task: crate::ModelTask,
+    endpoint_url: &str,
+    model_ref: &str,
+    endpoint_api_key: Option<&str>,
+    timeout: Duration,
+) -> Result<u16> {
+    match task {
+        crate::ModelTask::Chat => {
+            openai_chat_completion_status(endpoint_url, model_ref, endpoint_api_key, timeout)
+        }
+        crate::ModelTask::Transcription => {
+            openai_transcription_status(endpoint_url, model_ref, endpoint_api_key, timeout)
+        }
+        // Readiness is never claimed for a service this build cannot probe.
+        crate::ModelTask::Unknown => bail!("no inference probe exists for an unrecognised task"),
+    }
+}
+
+/// Whether the endpoint answers the request that matches the model's task.
+///
+/// A chat server counts as serving on the same "answered below 500" rule as
+/// [`openai_chat_completion_probe`]. A speech-to-text server must answer 200:
+/// the probe sends a valid recording, so a 4xx means the route or the model is
+/// not there (a model not loaded, a decode failure), not that it is serving.
+/// Probing a speech-to-text server with a chat request would instead read its
+/// `404` as serving.
+pub fn openai_inference_probe(
+    task: crate::ModelTask,
+    endpoint_url: &str,
+    model_ref: &str,
+    endpoint_api_key: Option<&str>,
+    timeout: Duration,
+) -> Result<bool> {
+    let status = openai_inference_status(task, endpoint_url, model_ref, endpoint_api_key, timeout)?;
+    Ok(match task {
+        crate::ModelTask::Transcription => status == 200,
+        _ => status < 500,
+    })
+}
+
+/// A PCM WAV file of `duration` of silence, 16 kHz mono 16-bit — the input
+/// format speech-to-text servers accept without resampling.
+#[must_use]
+pub fn silent_wav_16khz_mono(duration: Duration) -> Vec<u8> {
+    const SAMPLE_RATE: u32 = 16_000;
+    const BYTES_PER_SAMPLE: u16 = 2;
+    // Keeps the RIFF size field (`36 + data_len`) inside `u32`.
+    const MAX_SAMPLES: u32 = (u32::MAX - 44) / BYTES_PER_SAMPLE as u32;
+    let samples = u32::try_from(duration.as_millis() * u128::from(SAMPLE_RATE) / 1000)
+        .unwrap_or(MAX_SAMPLES)
+        .min(MAX_SAMPLES);
+    let data_len = samples * u32::from(BYTES_PER_SAMPLE);
+    let mut wav = Vec::with_capacity(44 + data_len as usize);
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16_u32.to_le_bytes()); // fmt chunk size
+    wav.extend_from_slice(&1_u16.to_le_bytes()); // PCM
+    wav.extend_from_slice(&1_u16.to_le_bytes()); // mono
+    wav.extend_from_slice(&SAMPLE_RATE.to_le_bytes());
+    wav.extend_from_slice(&(SAMPLE_RATE * u32::from(BYTES_PER_SAMPLE)).to_le_bytes());
+    wav.extend_from_slice(&BYTES_PER_SAMPLE.to_le_bytes()); // block align
+    wav.extend_from_slice(&16_u16.to_le_bytes()); // bits per sample
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_len.to_le_bytes());
+    wav.resize(44 + data_len as usize, 0);
+    wav
 }
 
 pub fn openai_models_endpoint_has_model(
@@ -886,7 +1056,8 @@ pub fn managed_service_endpoint_readiness(
         record.canonical_model_id.as_str()
     };
     record.inference_probe_attempted_at_unix_ms = Some(now);
-    if !openai_chat_completion_probe(
+    if !openai_inference_probe(
+        record.task,
         &record.endpoint_url,
         model_ref,
         endpoint_api_key,
@@ -2244,6 +2415,98 @@ mod tests {
         Ok(())
     }
     #[test]
+    fn a_speech_to_text_service_is_probed_with_a_transcription_not_a_chat_request() -> Result<()> {
+        // A speech-to-text server has no chat route; a chat probe would read its
+        // 404 as "serving" without ever touching the model. The probe must send
+        // the request the service actually exists to answer.
+        let (port, server) = spawn_canned_http_server(vec![
+            Some(("HTTP/1.1 200 OK", MODELS_OK_BODY)),
+            Some(("HTTP/1.1 200 OK", r#"{"text":""}"#)),
+        ])?;
+        let mut record = probe_test_record(port);
+        record.task = crate::ModelTask::Transcription;
+
+        assert_eq!(
+            managed_service_endpoint_readiness(
+                &mut record,
+                None,
+                Duration::from_secs(2),
+                Duration::from_secs(2)
+            )
+            .readiness,
+            EndpointReadiness::Serving
+        );
+
+        let requests = server.join().expect("server thread should not panic")?;
+        let probe = requests.get(1).expect("an inference probe was sent");
+        assert!(
+            probe.starts_with("POST /v1/audio/transcriptions HTTP/1.1"),
+            "{probe}"
+        );
+        assert!(probe.contains("multipart/form-data; boundary="));
+        assert!(probe.contains("name=\"model\"\r\n\r\nQwen/Qwen3-0.6B\r\n"));
+        assert!(probe.contains("filename=\"silence.wav\""));
+        assert!(probe.contains("RIFF"), "the uploaded file is a WAV");
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.contains("/v1/chat/completions")),
+            "no chat request may be sent to a speech-to-text service"
+        );
+        Ok(())
+    }
+    #[test]
+    fn a_speech_to_text_service_answering_5xx_is_not_ready() -> Result<()> {
+        let (port, server) = spawn_canned_http_server(vec![
+            Some(("HTTP/1.1 200 OK", MODELS_OK_BODY)),
+            Some((
+                "HTTP/1.1 500 Internal Server Error",
+                r#"{"error":"backend failed to start"}"#,
+            )),
+        ])?;
+        let mut record = probe_test_record(port);
+        record.task = crate::ModelTask::Transcription;
+
+        assert_eq!(
+            managed_service_endpoint_readiness(
+                &mut record,
+                None,
+                Duration::from_secs(2),
+                Duration::from_secs(2)
+            )
+            .readiness,
+            EndpointReadiness::Listing
+        );
+        assert!(record.inference_verified_at_unix_ms.is_none());
+        let requests = server.join().expect("server thread should not panic")?;
+        assert!(
+            requests
+                .get(1)
+                .is_some_and(|probe| probe.starts_with("POST /v1/audio/transcriptions ")),
+            "the 500 must be the transcription probe's answer: {requests:?}"
+        );
+        Ok(())
+    }
+    #[test]
+    fn silent_wav_is_a_well_formed_16khz_mono_pcm_file() {
+        let wav = silent_wav_16khz_mono(Duration::from_secs(1));
+        assert_eq!(wav.len(), 44 + 32_000);
+        assert_eq!(&wav[0..4], b"RIFF");
+        assert_eq!(
+            u32::from_le_bytes(wav[4..8].try_into().unwrap()),
+            36 + 32_000
+        );
+        assert_eq!(&wav[8..16], b"WAVEfmt ");
+        assert_eq!(
+            u16::from_le_bytes(wav[22..24].try_into().unwrap()),
+            1,
+            "mono"
+        );
+        assert_eq!(u32::from_le_bytes(wav[24..28].try_into().unwrap()), 16_000);
+        assert_eq!(&wav[36..40], b"data");
+        assert!(wav[44..].iter().all(|byte| *byte == 0), "silence");
+    }
+    #[test]
     fn a_warming_service_is_not_re_probed_on_every_poll() -> Result<()> {
         // Only a successful probe latches, so a model that is listed but still
         // loading would otherwise be re-probed by every poll — and each attempt
@@ -2327,6 +2590,30 @@ mod tests {
         );
 
         server.join().expect("server thread should not panic")?;
+        Ok(())
+    }
+    #[test]
+    fn a_speech_to_text_probe_needs_a_transcript_not_just_an_answer() -> Result<()> {
+        for (status_line, serving) in [
+            ("HTTP/1.1 200 OK", true),
+            ("HTTP/1.1 404 Not Found", false),
+            ("HTTP/1.1 400 Bad Request", false),
+        ] {
+            let (port, server) =
+                spawn_canned_http_server(vec![Some((status_line, r#"{"text":""}"#))])?;
+            assert_eq!(
+                openai_inference_probe(
+                    crate::ModelTask::Transcription,
+                    &format!("http://127.0.0.1:{port}/v1"),
+                    "Whisper-Tiny",
+                    None,
+                    Duration::from_secs(2),
+                )?,
+                serving,
+                "{status_line}"
+            );
+            server.join().expect("server thread should not panic")?;
+        }
         Ok(())
     }
     #[test]

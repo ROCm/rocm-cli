@@ -33,3 +33,38 @@ pub(crate) fn service_stop_hint(service_id: &str) -> String {
 pub(crate) fn remote_service_stop_hint(remote_cli: &str, service_id: &str) -> String {
     format!("{remote_cli} services stop {service_id} --yes")
 }
+
+/// The `  <task> endpoint: <url>` line printed beside a server's `endpoint`
+/// line when the server does not serve chat: chat clients append
+/// `/chat/completions` to the base URL, which such a server does not have, so
+/// this names the route it does answer. `None` for chat, and for a task this
+/// build cannot name a route for. Every surface that prints it calls this.
+pub(crate) fn task_endpoint_line(task: rocm_core::ModelTask, endpoint_url: &str) -> Option<String> {
+    (!task.is_chat() && !task.api_route().is_empty()).then(|| {
+        format!(
+            "  {} endpoint: {endpoint_url}{}",
+            task.display_name(),
+            task.api_route()
+        )
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rocm_core::ModelTask;
+
+    #[test]
+    fn only_a_server_that_does_not_serve_chat_gets_a_task_endpoint_line() {
+        assert_eq!(
+            task_endpoint_line(ModelTask::Transcription, "http://127.0.0.1:11435/v1").as_deref(),
+            Some("  speech-to-text endpoint: http://127.0.0.1:11435/v1/audio/transcriptions")
+        );
+        assert_eq!(task_endpoint_line(ModelTask::Chat, "http://h/v1"), None);
+        assert_eq!(
+            task_endpoint_line(ModelTask::Unknown, "http://h/v1"),
+            None,
+            "no route to name"
+        );
+    }
+}

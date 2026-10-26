@@ -32,6 +32,36 @@ The `lemonade` adapter uses Lemonade embeddable and prefers Lemonade's
 `llamacpp:rocm` backend, falling back to `llamacpp:vulkan` when ROCm is
 unsupported. rocm-cli does not use a CPU fallback for this path.
 
+## Model tasks
+
+An engine advertises which kinds of model it can serve in the `tasks` field of
+its capabilities: `chat` (`POST /v1/chat/completions`) and `transcription`
+(speech-to-text, `POST /v1/audio/transcriptions`). An engine that does not
+send the field — an external plugin written before it existed — is treated as
+serving `chat` only. `rocm serve` reads each model's task from its catalog
+recipe (a model outside the catalog is a chat model) and refuses, before any
+GPU check or engine preparation, to hand a model to an engine that does not
+advertise its task. The task is passed to the engine as `task` in the
+`ResolveModel` and `Launch` requests, omitted for chat so a request for a chat
+model is unchanged.
+
+`lemonade` advertises `chat` and `transcription`; `vllm` advertises `chat`.
+
+Lemonade serves a speech-to-text model through its router with the
+`whispercpp` recipe. The adapter names the backend explicitly — `rocm`, or
+`vulkan` when Lemonade reports ROCm unsupported, never `cpu` — because
+Lemonade's `auto` picks whichever whisper.cpp build is installed, which can be
+the CPU one. Before reporting ready it checks that Lemonade loaded the model on
+that backend and that a test transcription returns HTTP 200. It does not trust
+the per-model `device` field of Lemonade's health report: Lemonade 11.5.1
+derives it from the backend name, labelling a ROCm Whisper model `cpu`, and a
+Vulkan one `gpu` even where whisper.cpp found no Vulkan device. `rocm serve`'s
+usable-AMD-GPU check, which runs before the engine starts, ensures an AMD GPU
+is present, but not that a Vulkan whisper.cpp build can use it: where the
+Vulkan driver exposes no device, that build may run on the CPU without
+reporting it. This is a known gap, shared with the chat path's Vulkan
+llama.cpp; the ROCm backend is not affected.
+
 ## Lemonade backend alignment on engine install
 
 Lemonade's `resources/backend_versions.json` pins which ROCm SDK version its

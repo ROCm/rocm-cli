@@ -2415,14 +2415,23 @@ fn render_services_tool_result_text(records: &[ManagedServiceRecord]) -> String 
     for record in records {
         let _ = writeln!(
             output,
-            "  - service_id={} engine={} model={} canonical_model={} status={} running_state={} endpoint={}",
+            "  - service_id={} engine={} model={} canonical_model={} task={} status={} running_state={} endpoint={}{}",
             record.service_id,
             record.engine,
             record.model_ref,
             record.canonical_model_id,
+            record.task.display_name(),
             record.status,
             managed_service_running_state(&record.status),
-            record.endpoint_url
+            record.endpoint_url,
+            // A chat client appends its own route to the base URL; any other
+            // server is named by the route it does answer, so the assistant
+            // never builds a chat URL for it.
+            if record.task.is_chat() {
+                ""
+            } else {
+                record.task.api_route()
+            }
         );
     }
     output
@@ -4607,6 +4616,40 @@ endpoint: 127.0.0.1:8001
         assert!(rendered.contains("status_meaning: ready/running = running"));
         assert!(rendered.contains("engine=vllm"));
         assert!(rendered.contains("running_state=running"));
+        assert!(rendered.contains("task=chat"), "{rendered}");
+        assert!(
+            rendered.contains("endpoint=http://127.0.0.1:11435/v1\n"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn services_tool_names_a_speech_to_text_server_by_its_task_and_route() {
+        let (_root, paths) = test_paths("services-tool-speech");
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-whisper",
+            "lemonade",
+            "whisper",
+            "Whisper-Large-v3-Turbo",
+            "127.0.0.1",
+            11436,
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            Some("gpu_required".to_owned()),
+        );
+        record.status = "ready".to_owned();
+        record.task = rocm_core::ModelTask::Transcription;
+
+        let rendered = render_services_tool_result_text(&[record]);
+
+        assert!(rendered.contains("task=speech-to-text"), "{rendered}");
+        assert!(
+            rendered.contains("endpoint=http://127.0.0.1:11436/v1/audio/transcriptions"),
+            "{rendered}"
+        );
     }
 
     #[test]

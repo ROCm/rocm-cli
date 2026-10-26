@@ -31,6 +31,11 @@ pub struct ManagedServiceRecord {
     pub engine: String,
     pub model_ref: String,
     pub canonical_model_id: String,
+    /// What the served model does, which decides its client route and whether
+    /// chat commands may use it. Records written before this field existed all
+    /// served chat models, which is what the default restores.
+    #[serde(default)]
+    pub task: crate::ModelTask,
     pub host: String,
     pub port: u16,
     pub endpoint_url: String,
@@ -134,6 +139,7 @@ impl ManagedServiceRecord {
             engine,
             model_ref: model_ref.into(),
             canonical_model_id: canonical_model_id.into(),
+            task: crate::ModelTask::Chat,
             host,
             port,
             mode: mode.into(),
@@ -619,5 +625,30 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    #[test]
+    fn a_record_written_before_tasks_existed_is_a_chat_service() {
+        let (_root, paths) = temp_app_paths("record-without-task");
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-old",
+            "lemonade",
+            "qwen",
+            "Qwen3-4B-Instruct-2507-GGUF",
+            "127.0.0.1",
+            11435,
+            "managed",
+            1,
+            None,
+            None,
+            None,
+        );
+        record.task = crate::ModelTask::Transcription;
+        let mut json = serde_json::to_value(&record).expect("serialize");
+        json.as_object_mut().expect("object").remove("task");
+
+        let older: ManagedServiceRecord = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(older.task, crate::ModelTask::Chat);
     }
 }

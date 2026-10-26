@@ -281,8 +281,11 @@ impl ProviderAdapter for LocalProvider<'_> {
     fn status(&self) -> Result<ProviderStatus> {
         let services = ready_local_services(self.paths)?;
         let builtin_ready = services.iter().any(local_service_is_builtin_assistant);
+        // Only chat models: this lists what chat can use, and a speech-to-text
+        // server listed here would be offered as one.
         let mut models = services
             .into_iter()
+            .filter(|record| record.task.is_chat())
             .map(|record| record.canonical_model_id)
             .collect::<Vec<_>>();
         models.sort();
@@ -477,10 +480,19 @@ fn select_local_chat_service(
             service.canonical_model_id.eq_ignore_ascii_case(model)
                 || service.model_ref.eq_ignore_ascii_case(model)
         });
-        return services
-            .into_iter()
-            .next()
-            .context("local provider has no ready managed service for this request");
+        if let Some(chat) = services.iter().position(|service| service.task.is_chat()) {
+            return Ok(services.swap_remove(chat));
+        }
+        if let Some(other) = services.first() {
+            bail!(
+                "`{model}` is served by `{}` as a {} model, not a chat model; chat needs a chat \
+                 model: serve one (the built-in assistant is `rocm serve {BUILTIN_ASSISTANT_MODEL_ALIAS}`) \
+                 and run chat again without --model, or pass --model with a chat service",
+                other.service_id,
+                other.task.display_name()
+            );
+        }
+        bail!("local provider has no ready managed service for this request");
     }
     services.retain(local_service_is_builtin_assistant);
     services.sort_by_key(local_service_priority);
@@ -493,7 +505,7 @@ fn select_local_chat_service(
 }
 
 const fn local_service_is_builtin_assistant(service: &ManagedServiceRecord) -> bool {
-    local_service_priority(service) != usize::MAX
+    service.task.is_chat() && local_service_priority(service) != usize::MAX
 }
 
 const fn local_service_priority(service: &ManagedServiceRecord) -> usize {
@@ -2254,6 +2266,52 @@ mod tests {
     }
 
     #[test]
+    fn local_provider_refuses_a_speech_to_text_service_named_as_the_chat_model() -> Result<()> {
+        let (root, paths) = temp_app_paths("local-provider-speech-service");
+        paths.ensure()?;
+        let server = spawn_models_only_server("Whisper-Tiny")?;
+
+        let mut whisper = ManagedServiceRecord::new(
+            &paths,
+            "svc-whisper",
+            "lemonade",
+            "Whisper-Tiny",
+            "Whisper-Tiny",
+            "127.0.0.1",
+            server.port(),
+            "managed",
+            123,
+            None,
+            None,
+            None,
+        );
+        whisper.task = rocm_core::ModelTask::Transcription;
+        whisper.status = "ready".to_owned();
+        whisper.write()?;
+
+        let error = select_local_chat_service(&paths, Some("Whisper-Tiny"))
+            .expect_err("a speech-to-text service is not a chat target")
+            .to_string();
+        assert!(
+            error
+                .contains("is served by `svc-whisper` as a speech-to-text model, not a chat model"),
+            "{error}"
+        );
+        // The remediation names the built-in assistant; that serving it makes
+        // `rocm chat` work is what
+        // `local_provider_default_chat_requires_builtin_qwen_assistant` proves.
+        assert!(error.contains("rocm serve qwen"), "{error}");
+
+        // Nor is it listed among the models the local chat provider offers.
+        let status = LocalProvider { paths: &paths }.status()?;
+        assert!(status.models.is_empty(), "{:?}", status.models);
+        assert_eq!(status.auth_status, "no_ready_local_service");
+
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
     fn local_provider_default_chat_requires_builtin_qwen_assistant() -> Result<()> {
         let (root, paths) = temp_app_paths("local-provider-default-qwen");
         paths.ensure()?;
@@ -2920,7 +2978,8 @@ mod tests {
                 engine: "vllm".to_owned(),
                 requested_model: "Qwen/Qwen3.5".to_owned(),
                 api_model: "Qwen/Qwen3.5".to_owned(),
-                chat_endpoint: "http://127.0.0.1:8000/v1/chat/completions".to_owned(),
+                endpoint: "http://127.0.0.1:8000/v1/chat/completions".to_owned(),
+                task: rocm_core::ModelTask::Chat,
                 service_id: "svc-ready".to_owned(),
                 status: "ready".to_owned(),
                 already_running: false,
@@ -3185,6 +3244,15 @@ mod tests {
                         let request = read_http_request(&mut stream)?;
                         if request.starts_with("GET /v1/models ") {
                             write_models_response(&mut stream, &model_id)?;
+                        } else if request.starts_with("POST /v1/audio/transcriptions ") {
+                            // A speech-to-text readiness probe needs a
+                            // transcript, as a real server gives it.
+                            let body = r#"{"text":""}"#;
+                            write!(
+                                stream,
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            )?;
                         } else {
                             write_not_found_response(&mut stream)?;
                         }

@@ -9,6 +9,8 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+pub use rocm_core::ModelTask;
+
 pub const ENGINE_PROTOCOL_VERSION: &str = "0.1.0";
 pub const ENGINE_RECIPE_CONTRACT_VERSION: &str = "0.1.0";
 pub const ENGINE_PLUGIN_BINARY_PREFIX: &str = "rocm-engine-";
@@ -391,6 +393,10 @@ pub struct ResolveModelRequest {
     pub recipe_override: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub engine_recipe: Option<EngineRecipeHint>,
+    /// What the model does. Omitted (and defaulted) for chat, so a request from
+    /// an older CLI and one for a chat model look the same to an engine.
+    #[serde(default, skip_serializing_if = "is_chat_task")]
+    pub task: ModelTask,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -407,6 +413,14 @@ pub struct LaunchRequest {
     pub engine_recipe: Option<EngineRecipeHint>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpu_selection: Option<GpuSelection>,
+    /// What the model does; see [`ResolveModelRequest::task`].
+    #[serde(default, skip_serializing_if = "is_chat_task")]
+    pub task: ModelTask,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde's skip_serializing_if passes a reference
+const fn is_chat_task(task: &ModelTask) -> bool {
+    task.is_chat()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -448,6 +462,22 @@ pub struct EngineCapabilities {
     pub tool_calling: bool,
     pub quantized_models: String,
     pub reasoning_parser: bool,
+    /// The model tasks this engine can serve. An engine that predates this
+    /// field served chat models only, which is what the default restores, so
+    /// `rocm serve` refuses to hand it any other kind of model.
+    #[serde(default = "default_engine_tasks")]
+    pub tasks: Vec<ModelTask>,
+}
+
+fn default_engine_tasks() -> Vec<ModelTask> {
+    vec![ModelTask::Chat]
+}
+
+impl EngineCapabilities {
+    #[must_use]
+    pub fn serves(&self, task: ModelTask) -> bool {
+        self.tasks.contains(&task)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -604,16 +634,38 @@ impl HealthcheckResponse {
 ///
 /// Each engine reports them, after its own health route, in
 /// [`EndpointResponse::supported_routes`]; the daemon's API docs are tested
-/// against [`chat_supported_routes`] so the two lists agree.
+/// against [`supported_routes`] for every task, so the lists agree.
 pub const OPENAI_CHAT_ROUTES: [&str; 3] = ["/v1/models", "/v1/chat/completions", "/v1/completions"];
+
+/// The OpenAI-compatible routes every speech-to-text server answers.
+pub const OPENAI_TRANSCRIPTION_ROUTES: [&str; 2] = ["/v1/models", "/v1/audio/transcriptions"];
+
+/// The OpenAI-compatible routes a server for `task` answers, besides its
+/// health route.
+#[must_use]
+pub const fn task_routes(task: ModelTask) -> &'static [&'static str] {
+    match task {
+        ModelTask::Chat => &OPENAI_CHAT_ROUTES,
+        ModelTask::Transcription => &OPENAI_TRANSCRIPTION_ROUTES,
+        // A task this build does not know: only the route every server has.
+        ModelTask::Unknown => &["/v1/models"],
+    }
+}
+
+/// `supported_routes` for a server for `task` whose health route is
+/// `health_route`.
+#[must_use]
+pub fn supported_routes(health_route: &str, task: ModelTask) -> Vec<String> {
+    std::iter::once(health_route)
+        .chain(task_routes(task).iter().copied())
+        .map(str::to_owned)
+        .collect()
+}
 
 /// `supported_routes` for a chat server whose health route is `health_route`.
 #[must_use]
 pub fn chat_supported_routes(health_route: &str) -> Vec<String> {
-    std::iter::once(health_route)
-        .chain(OPENAI_CHAT_ROUTES)
-        .map(str::to_owned)
-        .collect()
+    supported_routes(health_route, ModelTask::Chat)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -914,6 +966,7 @@ mod tests {
                 }],
                 notes: vec!["signed recipe metadata".to_owned()],
             }),
+            task: ModelTask::Chat,
         };
 
         let serialized = serde_json::to_string(&request).unwrap();
@@ -960,6 +1013,7 @@ mod tests {
                 notes: Vec::new(),
             }),
             gpu_selection: None,
+            task: ModelTask::Chat,
         };
 
         let serialized = serde_json::to_string(&request).unwrap();
@@ -1069,5 +1123,71 @@ mod tests {
             "rocm-engine-protocol-{label}-{}-{unique}",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn each_task_reports_its_routes_after_the_health_route() {
+        assert_eq!(
+            chat_supported_routes("/health"),
+            [
+                "/health",
+                "/v1/models",
+                "/v1/chat/completions",
+                "/v1/completions"
+            ]
+        );
+        assert_eq!(
+            supported_routes("/v1/health", ModelTask::Transcription),
+            ["/v1/health", "/v1/models", "/v1/audio/transcriptions"]
+        );
+        // A task this build cannot name: only the routes every server has.
+        assert_eq!(
+            supported_routes("/v1/health", ModelTask::Unknown),
+            ["/v1/health", "/v1/models"]
+        );
+    }
+
+    #[test]
+    fn capabilities_from_an_engine_without_tasks_advertise_chat_only() {
+        let older = serde_json::json!({
+            "cpu": false,
+            "rocm_gpu": true,
+            "openai_compatible": true,
+            "tool_calling": false,
+            "quantized_models": "none",
+            "reasoning_parser": false
+        });
+        let capabilities: EngineCapabilities = serde_json::from_value(older).unwrap();
+        assert_eq!(capabilities.tasks, vec![ModelTask::Chat]);
+        assert!(capabilities.serves(ModelTask::Chat));
+        assert!(!capabilities.serves(ModelTask::Transcription));
+    }
+
+    #[test]
+    fn a_chat_launch_request_serializes_without_a_task_field() {
+        let request = LaunchRequest {
+            service_id: "svc".to_owned(),
+            env_id: None,
+            runtime_id: None,
+            model_ref: "Qwen/Test".to_owned(),
+            host: "127.0.0.1".to_owned(),
+            port: 11435,
+            device_policy: Some(DevicePolicy::GpuRequired),
+            endpoint_mode: None,
+            engine_recipe: None,
+            gpu_selection: None,
+            task: ModelTask::Chat,
+        };
+        let chat = serde_json::to_value(&request).unwrap();
+        assert!(chat.get("task").is_none(), "{chat}");
+
+        let transcription = serde_json::to_value(LaunchRequest {
+            task: ModelTask::Transcription,
+            ..request
+        })
+        .unwrap();
+        assert_eq!(transcription["task"], "transcription");
+        let parsed: LaunchRequest = serde_json::from_value(transcription).unwrap();
+        assert_eq!(parsed.task, ModelTask::Transcription);
     }
 }

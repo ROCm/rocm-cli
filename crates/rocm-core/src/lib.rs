@@ -27,6 +27,7 @@ pub mod log_tail;
 pub mod managed_runtime;
 pub mod model_catalog;
 pub mod model_readiness;
+pub mod model_task;
 pub mod net;
 pub mod openmpi;
 pub mod os_release;
@@ -123,18 +124,20 @@ pub use model_catalog::{
     normalize_model_ref, platform_matches_gfx_family, resolve_builtin_model_recipe,
     resolve_model_recipe, resolve_model_recipe_artifact, verify_model_recipe_index_signature,
 };
+pub use model_task::ModelTask;
 pub use net::{
     Backoff, DEFAULT_LOCAL_HOST, DEFAULT_LOCAL_PORT, DOWNLOAD_MAX_ATTEMPTS, DownloadOutcome,
     DownloadRequest, EndpointReadiness, EndpointReadinessOutcome, HttpResponseParts,
     INFERENCE_PROBE_ATTEMPTED_STATE_KEY, INFERENCE_PROBE_RETRY_INTERVAL, INFERENCE_PROBE_TIMEOUT,
-    INFERENCE_VERIFIED_STATE_KEY, connect_tcp_stream, download_file_streaming,
+    INFERENCE_VERIFIED_STATE_KEY, MultipartFile, connect_tcp_stream, download_file_streaming,
     download_file_streaming_with_progress, download_file_to_path,
     download_file_to_path_with_progress, engine_state_inference_verified, format_host_for_url,
     format_host_port, format_http_base_url, http_get_text, http_get_text_with_auth,
-    http_post_json_with_auth, managed_service_endpoint_model_ready,
+    http_post_json_with_auth, http_post_multipart_with_auth, managed_service_endpoint_model_ready,
     managed_service_endpoint_readiness, merge_json_state_file, openai_chat_completion_probe,
-    openai_chat_completion_status, openai_models_endpoint_has_model, parse_http_endpoint,
-    read_http_response_bounded, write_all_tcp_stream,
+    openai_chat_completion_status, openai_inference_probe, openai_inference_status,
+    openai_models_endpoint_has_model, openai_transcription_status, parse_http_endpoint,
+    read_http_response_bounded, silent_wav_16khz_mono, write_all_tcp_stream,
 };
 pub use paths::{AppPaths, engine_plugin_dirs};
 pub use proc_lifecycle::{

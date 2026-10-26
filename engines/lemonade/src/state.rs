@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT
 
 use anyhow::{Context, Result, bail};
-use rocm_core::{AppPaths, format_http_base_url};
+use rocm_core::{AppPaths, ModelTask, format_http_base_url};
 use rocm_engine_protocol::{
     DevicePolicy, ENGINE_RECIPE_CONTRACT_VERSION, EngineDeviceAvailability, EngineRecipeHint,
     GpuSelection,
@@ -46,12 +46,25 @@ pub(crate) fn inference_verified(
         return false;
     };
     rocm_core::engine_state_inference_verified(
+        task_from_state(state),
         state_path,
         state,
         &format_http_base_url(&host, port),
         model_ref,
         rocm_engine_protocol::resolve_endpoint_api_key().as_deref(),
     )
+}
+
+/// The task recorded in service state. State written before the task existed
+/// belongs to a chat service; a value this build cannot parse was written by a
+/// newer one and reads as [`ModelTask::Unknown`], never as chat, so the
+/// service is not probed as a chat model.
+pub(crate) fn task_from_state(state: Option<&Value>) -> ModelTask {
+    state
+        .and_then(|value| value_string(value, "task"))
+        .map_or(ModelTask::Chat, |task| {
+            ModelTask::parse(&task).unwrap_or(ModelTask::Unknown)
+        })
 }
 
 /// The device string reported once a model is loaded. Reflects the backend that
@@ -105,6 +118,9 @@ pub(crate) fn serve_http_command_args(request: &ServeHttpRequest) -> Vec<String>
             "--engine-recipe-json".to_owned(),
             serde_json::to_string(engine_recipe).expect("engine recipe serializes"),
         ]);
+    }
+    if !request.task.is_chat() {
+        args.extend(["--task".to_owned(), request.task.as_str().to_owned()]);
     }
     args
 }
@@ -161,6 +177,7 @@ pub(crate) fn write_running_state(
             "runtime_executable": runtime.manifest.lemond,
             "log_path": request.log_path.as_ref().map(|path| path.display().to_string()),
             "engine_recipe": request.engine_recipe,
+            "task": request.task,
             "started_at_unix_ms": current_unix_millis(),
             // Kernel start-times captured while each PID is alive. Paired with the
             // PIDs, they identify these exact processes across PID recycling so a
@@ -737,6 +754,7 @@ mod tests {
             state_path: PathBuf::from("state.json"),
             log_path: Some(PathBuf::from("service.log")),
             engine_recipe: None,
+            task: ModelTask::Chat,
         };
         let args = serve_http_command_args(&request);
         assert!(args.contains(&"--runtime-id".to_owned()));
@@ -744,5 +762,38 @@ mod tests {
         assert!(args.contains(&"--env-id".to_owned()));
         assert!(args.contains(&"env".to_owned()));
         assert!(!args.iter().any(|arg| arg == "cpu"));
+        assert!(
+            !args.contains(&"--task".to_owned()),
+            "a chat launch keeps the argument list it always had"
+        );
+
+        let transcription = ServeHttpRequest {
+            task: ModelTask::Transcription,
+            ..request
+        };
+        let args = serve_http_command_args(&transcription);
+        let task_at = args
+            .iter()
+            .position(|arg| arg == "--task")
+            .expect("a speech-to-text launch must carry its task to the child");
+        assert_eq!(args[task_at + 1], "transcription");
+    }
+
+    #[test]
+    fn state_without_a_task_belongs_to_a_chat_service() {
+        assert_eq!(task_from_state(None), ModelTask::Chat);
+        assert_eq!(task_from_state(Some(&json!({}))), ModelTask::Chat);
+        assert_eq!(
+            task_from_state(Some(&json!({"task": "transcription"}))),
+            ModelTask::Transcription
+        );
+    }
+
+    #[test]
+    fn a_task_this_build_cannot_name_is_not_read_as_chat() {
+        assert_eq!(
+            task_from_state(Some(&json!({"task": "text-to-speech"}))),
+            ModelTask::Unknown
+        );
     }
 }

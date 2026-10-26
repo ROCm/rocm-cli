@@ -712,7 +712,22 @@ pub(crate) fn supervise_service(
     // set by a stop issued since — and `ManagedServiceRecord::new` starting it
     // at `None` would quietly withdraw that stop and hand the service straight
     // back to the daemon's recovery.
-    record.stop_requested_unix_ms = existing.and_then(|existing| existing.stop_requested_unix_ms);
+    record.stop_requested_unix_ms = existing
+        .as_ref()
+        .and_then(|existing| existing.stop_requested_unix_ms);
+    // The task is carried over for the same reason: `new` starts every record
+    // as chat, and a recovered speech-to-text service relaunched and written
+    // back as chat would be loaded through the chat path and offered to chat
+    // clients from then on. The registry is the only place the task is kept
+    // between runs, so a record that is not there yet is a chat service.
+    record.task = existing.map(|existing| existing.task).unwrap_or_default();
+    // Before the manifest write, so an unrecoverable record keeps the task a
+    // newer rocm-cli wrote instead of being relaunched with one this build
+    // cannot name.
+    record
+        .task
+        .ensure_servable()
+        .with_context(|| format!("not recovering `{}`", record.service_id))?;
     // Refuse a keyless public respawn before the manifest write, so a refused
     // attempt leaves the recorded restart_count and timestamps intact instead of
     // clobbering them with a record no live process will ever back. The spawn
@@ -748,6 +763,7 @@ pub(crate) fn supervise_service(
             env_id.as_deref(),
             engine_recipe_json.as_deref(),
             &record.engine_state_path,
+            record.task,
         ))
         .stdin(Stdio::null())
         .stdout(Stdio::from(log_file))
@@ -877,6 +893,7 @@ fn engine_serve_http_args(
     env_id: Option<&str>,
     engine_recipe_json: Option<&str>,
     state_path: &Path,
+    task: rocm_core::ModelTask,
 ) -> Vec<String> {
     let mut args = vec![
         "__engine-serve-http".to_owned(),
@@ -900,6 +917,11 @@ fn engine_serve_http_args(
         engine_recipe_json,
     ));
     args.extend(["--state-path".to_owned(), state_path.display().to_string()]);
+    // Omitted for chat so a chat restart keeps the argv it always had; a
+    // speech-to-text service must come back as one.
+    if !task.is_chat() {
+        args.extend(["--task".to_owned(), task.as_str().to_owned()]);
+    }
     args
 }
 
@@ -1366,6 +1388,7 @@ mod tests {
             Some("env-1"),
             Some(engine_recipe_json),
             Path::new("state.json"),
+            rocm_core::ModelTask::Chat,
         );
 
         assert!(
@@ -1397,6 +1420,7 @@ mod tests {
             None,
             None,
             Path::new("state.json"),
+            rocm_core::ModelTask::Chat,
         );
 
         assert!(
@@ -1416,6 +1440,7 @@ mod tests {
             None,
             None,
             Path::new("state.json"),
+            rocm_core::ModelTask::Chat,
         );
         assert!(!auto.iter().any(|arg| arg == "--gpu"));
     }
@@ -2168,5 +2193,118 @@ mod tests {
         assert!(outcome.is_err(), "the log path is a directory");
         assert_eq!(persisted?.stop_requested_unix_ms, Some(1));
         Ok(())
+    }
+
+    /// Recovery rebuilds the record from its arguments, and those carry no
+    /// task: the one on disk must survive, or a recovered speech-to-text
+    /// service is relaunched and recorded as a chat service.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn supervise_service_first_write_keeps_a_speech_to_text_task() -> Result<()> {
+        let (root, paths) = temp_app_paths("supervise-first-write-keeps-task");
+        paths.ensure()?;
+        fs::create_dir_all(paths.services_dir())?;
+
+        let service_id = "svc-supervise-first-write-task";
+        let mut seeded = identity_probe_record(&paths, service_id, 11449);
+        seeded.task = rocm_core::ModelTask::Transcription;
+        seeded.write()?;
+        // Stop `supervise_service` right after its first write; see
+        // `supervise_service_persists_the_supervisor_identity_token`.
+        fs::create_dir_all(&seeded.log_path)?;
+
+        let outcome = supervise_service(
+            &paths,
+            service_id.to_owned(),
+            "lemonade".to_owned(),
+            "Whisper-Tiny".to_owned(),
+            "Whisper-Tiny".to_owned(),
+            None,
+            None,
+            "127.0.0.1".to_owned(),
+            11449,
+            "gpu_required".to_owned(),
+            None,
+            None,
+        );
+        let persisted = load_service_record(&paths, service_id);
+        fs::remove_dir_all(root).ok();
+
+        assert!(outcome.is_err(), "the log path is a directory");
+        assert_eq!(persisted?.task, rocm_core::ModelTask::Transcription);
+        Ok(())
+    }
+
+    #[test]
+    fn supervise_service_does_not_recover_a_task_from_a_newer_rocm_cli() -> Result<()> {
+        let (root, paths) = temp_app_paths("supervise-unknown-task");
+        paths.ensure()?;
+        fs::create_dir_all(paths.services_dir())?;
+
+        let service_id = "svc-supervise-unknown-task";
+        let mut seeded = identity_probe_record(&paths, service_id, 11450);
+        seeded.task = rocm_core::ModelTask::Unknown;
+        seeded.restart_count = 3;
+        seeded.write()?;
+
+        let outcome = supervise_service(
+            &paths,
+            service_id.to_owned(),
+            "lemonade".to_owned(),
+            "future-model".to_owned(),
+            "future-model".to_owned(),
+            None,
+            None,
+            "127.0.0.1".to_owned(),
+            11450,
+            "gpu_required".to_owned(),
+            None,
+            None,
+        );
+        let persisted = load_service_record(&paths, service_id)?;
+        let log_created = seeded.log_path.exists();
+        fs::remove_dir_all(root).ok();
+
+        let error = format!(
+            "{:#}",
+            outcome.expect_err("an unknown task is not recovered")
+        );
+        assert!(error.contains("not recovering"), "{error}");
+        assert!(error.contains("a newer rocm-cli"), "{error}");
+        // Refused before the record was rewritten or anything launched.
+        assert_eq!(persisted.task, rocm_core::ModelTask::Unknown);
+        assert_eq!(persisted.restart_count, 3);
+        assert!(!log_created, "no engine was started");
+        Ok(())
+    }
+
+    #[test]
+    fn a_speech_to_text_restart_carries_its_task_to_the_engine_child() {
+        let args = |task| {
+            engine_serve_http_args(
+                "lemonade",
+                "svc",
+                "Whisper-Tiny",
+                "127.0.0.1",
+                11435,
+                "gpu_required",
+                &[],
+                None,
+                None,
+                None,
+                Path::new("state.json"),
+                task,
+            )
+        };
+        let transcription = args(rocm_core::ModelTask::Transcription);
+        let at = transcription
+            .iter()
+            .position(|arg| arg == "--task")
+            .expect("the task must reach the child");
+        assert_eq!(transcription[at + 1], "transcription");
+        assert!(
+            !args(rocm_core::ModelTask::Chat).contains(&"--task".to_owned()),
+            "a chat restart keeps the argv it always had"
+        );
     }
 }

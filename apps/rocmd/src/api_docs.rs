@@ -24,6 +24,7 @@ use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{any, get};
+use rocm_core::ModelTask;
 use rocm_core::{AppPaths, DEFAULT_LOCAL_HOST, ManagedServiceRecord};
 use serde_json::{Value, json};
 use std::fmt::Write as _;
@@ -33,6 +34,7 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use utoipa::openapi::path::{HttpMethod, OperationBuilder, PathItem, PathsBuilder};
 use utoipa::openapi::request_body::RequestBodyBuilder;
+use utoipa::openapi::schema::{KnownFormat, ObjectBuilder, SchemaFormat, Type};
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityRequirement, SecurityScheme};
 use utoipa::openapi::{
     ComponentsBuilder, ContentBuilder, InfoBuilder, OpenApi, OpenApiBuilder, Required,
@@ -419,27 +421,35 @@ struct RouteDoc {
     path: &'static str,
     summary: &'static str,
     description: &'static str,
-    /// An example request body, built for the server's real model id.
-    example_body: Option<fn(&str) -> Value>,
+    body: RouteBody,
+}
+
+/// What a route's request carries, as "Try it out" should offer it.
+enum RouteBody {
+    None,
+    /// JSON, with an example built for the server's real model id.
+    Json(fn(&str) -> Value),
+    /// A multipart audio upload, as the OpenAI transcription API takes it.
+    AudioUpload,
 }
 
 /// The routes each engine's server answers: its health route plus
-/// [`rocm_engine_protocol::OPENAI_CHAT_ROUTES`], the set its plugin reports as
-/// `supported_routes`. The single place the docs learn what a server serves; a
-/// new kind of server extends this.
+/// [`rocm_engine_protocol::task_routes`] for the server's task, the set its
+/// plugin reports as `supported_routes`. The single place the docs learn what a
+/// server serves; a new kind of server extends this.
 fn routes_for(record: &ManagedServiceRecord) -> Vec<RouteDoc> {
     let health_path = if record.engine == "vllm" {
         "/health"
     } else {
         "/v1/health"
     };
-    vec![
+    let mut routes = vec![
         RouteDoc {
             method: HttpMethod::Get,
             path: health_path,
             summary: "Check the server is up",
             description: "Answers 200 once the server accepts requests.",
-            example_body: None,
+            body: RouteBody::None,
         },
         RouteDoc {
             method: HttpMethod::Get,
@@ -447,24 +457,65 @@ fn routes_for(record: &ManagedServiceRecord) -> Vec<RouteDoc> {
             summary: "List the served models",
             description: "OpenAI-compatible model list. The `id` of each entry is the \
                           `model` value requests use.",
-            example_body: None,
+            body: RouteBody::None,
         },
+    ];
+    match record.task {
+        ModelTask::Chat => routes.extend(chat_routes()),
+        ModelTask::Transcription => routes.push(RouteDoc {
+            method: HttpMethod::Post,
+            path: "/v1/audio/transcriptions",
+            summary: "Transcribe speech",
+            description: "OpenAI-compatible speech-to-text. Upload an audio file as `file` \
+                          (WAV is accepted by every backend); the answer's `text` is the \
+                          transcript.",
+            body: RouteBody::AudioUpload,
+        }),
+        // A task this build does not know: only the routes every server has.
+        ModelTask::Unknown => {}
+    }
+    routes
+}
+
+fn chat_routes() -> [RouteDoc; 2] {
+    [
         RouteDoc {
             method: HttpMethod::Post,
             path: "/v1/chat/completions",
             summary: "Chat completion",
             description: "OpenAI-compatible chat completion. Set `stream` to `true` to \
                           receive server-sent events as tokens are generated.",
-            example_body: Some(chat_completion_example),
+            body: RouteBody::Json(chat_completion_example),
         },
         RouteDoc {
             method: HttpMethod::Post,
             path: "/v1/completions",
             summary: "Text completion",
             description: "OpenAI-compatible text completion of a raw prompt.",
-            example_body: Some(completion_example),
+            body: RouteBody::Json(completion_example),
         },
     ]
+}
+
+/// The form "Try it out" shows for a transcription: a file picker for the
+/// audio and the model field already filled in.
+fn audio_upload_schema(model: &str) -> ObjectBuilder {
+    ObjectBuilder::new()
+        .property(
+            "file",
+            ObjectBuilder::new()
+                .schema_type(Type::String)
+                .format(Some(SchemaFormat::KnownFormat(KnownFormat::Binary)))
+                .description(Some("The audio to transcribe, for example a WAV file.")),
+        )
+        .required("file")
+        .property(
+            "model",
+            ObjectBuilder::new()
+                .schema_type(Type::String)
+                .default(Some(json!(model))),
+        )
+        .required("model")
 }
 
 fn chat_completion_example(model: &str) -> Value {
@@ -492,6 +543,8 @@ fn engine_docs_note(record: &ManagedServiceRecord) -> String {
             "vLLM also documents every route it serves, beyond the ones listed here, at \
              [{base}/docs]({base}/docs)."
         )
+    } else if !record.task.is_chat() {
+        String::new()
     } else {
         "On Linux, Lemonade runs chat models with the llama.cpp server, which also answers its \
          own routes; see the \
@@ -513,8 +566,9 @@ fn service_openapi(record: &ManagedServiceRecord) -> OpenApi {
                     .description("The server's answer")
                     .content("application/json", ContentBuilder::new().build()),
             );
-        if let Some(example_body) = route.example_body {
-            operation = operation.request_body(Some(
+        let request_body = match route.body {
+            RouteBody::None => None,
+            RouteBody::Json(example_body) => Some(
                 RequestBodyBuilder::new()
                     .required(Some(Required::True))
                     .content(
@@ -524,14 +578,27 @@ fn service_openapi(record: &ManagedServiceRecord) -> OpenApi {
                             .build(),
                     )
                     .build(),
-            ));
-        }
+            ),
+            RouteBody::AudioUpload => Some(
+                RequestBodyBuilder::new()
+                    .required(Some(Required::True))
+                    .content(
+                        "multipart/form-data",
+                        ContentBuilder::new()
+                            .schema(Some(audio_upload_schema(model)))
+                            .build(),
+                    )
+                    .build(),
+            ),
+        };
+        operation = operation.request_body(request_body);
         paths = paths.path(route.path, PathItem::new(route.method, operation));
     }
 
     let description = format!(
-        "`{model}` served by {engine} at `{endpoint}`.\n\n\
+        "`{model}` ({task}) served by {engine} at `{endpoint}`.\n\n\
          \"Try it out\" sends requests through this page to the server.\n\n{note}",
+        task = record.task.display_name(),
         engine = record.engine,
         endpoint = record.endpoint_url,
         note = engine_docs_note(record),
@@ -672,15 +739,23 @@ mod tests {
     fn documented_routes_are_the_routes_the_engines_report() {
         let (root, paths) = temp_app_paths("api-docs-protocol-routes");
         for (engine, health) in [("vllm", "/health"), ("lemonade", "/v1/health")] {
-            let documented: Vec<String> = routes_for(&record(&paths, "svc-1", engine, 9))
-                .iter()
-                .map(|route| route.path.to_owned())
-                .collect();
-            assert_eq!(
-                documented,
-                rocm_engine_protocol::chat_supported_routes(health),
-                "{engine}"
-            );
+            for task in [
+                ModelTask::Chat,
+                ModelTask::Transcription,
+                ModelTask::Unknown,
+            ] {
+                let mut server = record(&paths, "svc-1", engine, 9);
+                server.task = task;
+                let documented: Vec<String> = routes_for(&server)
+                    .iter()
+                    .map(|route| route.path.to_owned())
+                    .collect();
+                assert_eq!(
+                    documented,
+                    rocm_engine_protocol::supported_routes(health, task),
+                    "{engine} {task}"
+                );
+            }
         }
         fs::remove_dir_all(root).ok();
     }
@@ -763,6 +838,36 @@ mod tests {
         assert!(events.contains("api_docs_unavailable"), "{events}");
         fs::remove_dir_all(root).ok();
         Ok(())
+    }
+
+    #[test]
+    fn speech_to_text_docs_offer_an_audio_upload_and_no_chat_routes() {
+        let (root, paths) = temp_app_paths("api-docs-transcription");
+        let mut whisper = record(&paths, "svc-asr", "lemonade", 9);
+        whisper.task = ModelTask::Transcription;
+        whisper.canonical_model_id = "Whisper-Large-v3-Turbo".to_owned();
+        let openapi = serde_json::to_value(service_openapi(&whisper)).unwrap();
+        let mut listed = operation_paths(&openapi);
+        listed.sort();
+        assert_eq!(
+            listed,
+            ["/v1/audio/transcriptions", "/v1/health", "/v1/models"]
+        );
+        let form = &openapi["paths"]["/v1/audio/transcriptions"]["post"]["requestBody"]["content"]
+            ["multipart/form-data"]["schema"];
+        assert_eq!(form["properties"]["file"]["format"], "binary", "{form:#}");
+        assert_eq!(
+            form["properties"]["model"]["default"], "Whisper-Large-v3-Turbo",
+            "try-it must start from the model the server answers to"
+        );
+        assert!(
+            !openapi["info"]["description"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("llama.cpp"),
+            "the llama.cpp note is about chat models"
+        );
+        fs::remove_dir_all(root).ok();
     }
 
     #[test]

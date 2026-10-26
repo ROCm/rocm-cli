@@ -327,9 +327,14 @@ only (`@requires-os:linux`):
 cargo xtask e2e -- -n "service-docs-"
 ```
 
+`service-docs-05` covers a speech-to-text server: its docs list the
+transcription route with an audio upload and no chat routes, and an upload
+through them is transcribed.
+
 The link `rocm serve` itself prints, and a try-it request through it to a real
 engine, are checked by the GPU serve canaries `serve-05` (vLLM) and `serve-07`
-(Lemonade), which only run on GPU lanes. On Linux Lemonade lanes `serve-07` is
+(Lemonade), and for a speech-to-text server by `serve-27`, which only run on
+GPU lanes. On Linux Lemonade lanes `serve-07` is
 an expected failure for an unrelated known issue, so there a broken docs link
 would not turn the lane red: the Lemonade check is effective on the Windows
 Lemonade lanes, and `serve-05` on the vLLM lanes.
@@ -1939,6 +1944,30 @@ The gate itself is held by unit tests in
 (`fix_13_does_not_fire_on_a_lemonade_vulkan_host_with_no_hip_evidence` and its
 neighbours) and by the Windows manual check in
 [manual-testing.md](manual-testing.md), in the Ryzen 4000/5000 section.
+
+## Speech-to-text Serving
+
+Focused coverage for model tasks and speech-to-text serving:
+
+```bash
+cargo test -p rocm-core model_task
+cargo test -p rocm-core speech_to_text
+cargo test -p rocm-engine-protocol capabilities_from_an_engine_without_tasks
+cargo test -p rocm-engine-lemonade speech::
+cargo test -p rocm-engine-vllm refuse_a_speech_to_text_model
+cargo test -p rocm --bin rocm speech_to_text
+cargo test -p rocm-dash-tui speech_to_text
+```
+
+The user-facing behaviour is in `serve-26` to `serve-28`, `chat-10`, and
+`bench-07`. All but `serve-27` run on every lane: `serve-26` needs no server at
+all, and the others run against a mock speech-to-text server. `serve-27` serves
+Whisper-Tiny on a real GPU and needs the Lemonade GPU lanes
+(`@requires-gpu @requires-engine:lemonade`).
+
+Running a subset with `cargo xtask e2e -- -n <pattern>` bypasses the
+capability filter, so a `@requires-gpu` scenario the pattern matches runs, and
+fails, on a host without a GPU. Read its failure as "not applicable here".
 
 ## Model Fit Preflight
 

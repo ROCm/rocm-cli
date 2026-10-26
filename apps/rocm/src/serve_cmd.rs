@@ -23,16 +23,16 @@
 
 use std::fmt::Write as _;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use rocm_core::{
     AppPaths, ModelRecipeRecord, RocmCliConfig, default_engine_for_platform,
     detect_host_gpu_summary, generate_service_id, preferred_serve_engine_for_host_gpu_summary,
     resolve_model_recipe,
 };
 use rocm_engine_protocol::{
-    DevicePolicy, ENGINE_RECIPE_CONTRACT_VERSION, EngineMethod, EngineRecipeEndpointHint,
-    EngineRecipeHint, EngineRecipeUnsupportedCombinationHint, GpuSelection, ResolveModelRequest,
-    ResolveModelResponse,
+    DevicePolicy, ENGINE_RECIPE_CONTRACT_VERSION, EngineCapabilities, EngineMethod,
+    EngineRecipeEndpointHint, EngineRecipeHint, EngineRecipeUnsupportedCombinationHint,
+    GpuSelection, ResolveModelRequest, ResolveModelResponse,
 };
 
 use crate::DevicePolicyArg;
@@ -577,6 +577,25 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
         host_gpu_summary.as_ref(),
     );
     let selected_engine = serve_engine.engine.clone();
+    // A model outside the catalog keeps the behaviour it always had: it is
+    // served, and probed, as a chat model.
+    let task = shared_recipe
+        .as_ref()
+        .map(ModelRecipeRecord::model_task)
+        .transpose()?
+        .unwrap_or_default();
+    // Before the GPU gate and any engine preparation, so a speech-to-text model
+    // sent to an engine that cannot serve one fails with the reason on every
+    // host — not with a GPU or runtime error that hides it.
+    if !task.is_chat() {
+        ensure_engine_serves_task(
+            &paths,
+            &selected_engine,
+            task,
+            &model,
+            shared_recipe.as_ref(),
+        )?;
+    }
     // Fail closed: a public bind must be authenticated, but Windows managed
     // Lemonade cannot receive the key (see `ensure_public_bind_engine_supported`),
     // so refuse rather than launch an open public server.
@@ -745,6 +764,7 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
             device_policy: Some(device_policy),
             recipe_override: None,
             engine_recipe,
+            task,
         },
     )?;
     // Serialize GPU auto-selection with the managed-service claim: the busy-GPU
@@ -779,6 +799,9 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
         println!("  resolved model: {}", resolve.canonical_model_id);
         println!("  engine: {selected_engine}");
         println!("{}", serve_engine_selection_line(&serve_engine));
+        if !task.is_chat() {
+            println!("  task: {}", task.display_name());
+        }
         println!("  host: {host}");
         println!("  port: {port}");
         if let Some(runtime_id) = resolved_selection.runtime_id.as_deref() {
@@ -872,6 +895,7 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
             endpoint_auth.as_deref(),
             launch_lock,
             require_api_key,
+            task,
             &mut |_elapsed| spinner.tick(),
         )?;
         let helper_starting = ensure_background_helper_running_quiet(summary_mode)?;
@@ -904,7 +928,13 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
             // Best-effort inference smoke test, on by default (opt out with
             // `--no-smoke-test`). Only meaningful for a freshly-ready server we
             // just launched; skipped when metrics could not be shown anyway.
-            let metrics = if !no_smoke_test && !report.already_running && report.status == "ready" {
+            // The smoke test streams a chat completion; a speech-to-text server
+            // was already proven by a test transcription before it reported ready.
+            let metrics = if task.is_chat()
+                && !no_smoke_test
+                && !report.already_running
+                && report.status == "ready"
+            {
                 spinner.set_label("Running smoke test…");
                 // The local provider resolves the endpoint key from the per-service
                 // 0600 key file by service id, so the smoke test authenticates
@@ -930,7 +960,8 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
                 engine: selected_engine.clone(),
                 requested_model: model,
                 api_model: resolve.canonical_model_id,
-                chat_endpoint: format!("{}/chat/completions", report.endpoint_url),
+                endpoint: format!("{}{}", report.endpoint_url, task.api_route()),
+                task,
                 service_id: report.service_id.clone(),
                 status: report.status.clone(),
                 already_running: report.already_running,
@@ -946,6 +977,10 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
         } else {
             spinner.clear();
             print_managed_launch_plain(&report, launched_key.as_deref(), docs_link.as_deref());
+            if let Some(line) = crate::service_hints::task_endpoint_line(task, &report.endpoint_url)
+            {
+                println!("{line}");
+            }
         }
         return Ok(());
     }
@@ -963,7 +998,55 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
         endpoint_auth.as_deref(),
         launch_lock,
         require_api_key,
+        task,
     )
+}
+
+/// Refuse to hand `engine` a model whose task it does not advertise.
+///
+/// The engine's own capabilities decide, so an external plugin that predates
+/// tasks — and therefore reports chat only — is refused here too, rather than
+/// being launched with a model it would treat as a chat model.
+fn ensure_engine_serves_task(
+    paths: &AppPaths,
+    engine: &str,
+    task: rocm_core::ModelTask,
+    model: &str,
+    recipe: Option<&ModelRecipeRecord>,
+) -> Result<()> {
+    let capabilities = engine_request::<_, EngineCapabilities>(
+        Some(paths),
+        engine,
+        EngineMethod::Capabilities,
+        &serde_json::json!({}),
+    )
+    .with_context(|| format!("failed to read the capabilities of engine `{engine}`"))?;
+    if capabilities.serves(task) {
+        return Ok(());
+    }
+    bail!("{}", unsupported_task_message(engine, task, model, recipe))
+}
+
+fn unsupported_task_message(
+    engine: &str,
+    task: rocm_core::ModelTask,
+    model: &str,
+    recipe: Option<&ModelRecipeRecord>,
+) -> String {
+    let kind = task.display_name();
+    let alternative = recipe.and_then(|recipe| {
+        recipe
+            .preferred_engines
+            .iter()
+            .find(|candidate| !candidate.eq_ignore_ascii_case(engine))
+    });
+    match alternative {
+        Some(alternative) => format!(
+            "`{model}` is a {kind} model, which the {engine} engine cannot serve; \
+             serve it with `rocm serve {model} --engine {alternative}`"
+        ),
+        None => format!("`{model}` is a {kind} model, which the {engine} engine cannot serve"),
+    }
 }
 
 #[cfg(test)]
@@ -972,6 +1055,63 @@ mod tests {
 
     use super::*;
     use rocm_core::resolve_builtin_model_recipe;
+
+    #[test]
+    fn a_speech_to_text_model_is_refused_by_an_engine_that_only_serves_chat() {
+        let recipe = resolve_builtin_model_recipe("whisper").expect("whisper recipe");
+        assert_eq!(
+            recipe.model_task().expect("valid task"),
+            rocm_core::ModelTask::Transcription
+        );
+        let root = std::env::temp_dir().join(format!(
+            "rocm-serve-task-check-{}",
+            rocm_core::unix_time_millis()
+        ));
+        let paths = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+
+        let error = ensure_engine_serves_task(
+            &paths,
+            "vllm",
+            rocm_core::ModelTask::Transcription,
+            "whisper",
+            Some(&recipe),
+        )
+        .expect_err("vLLM advertises chat only")
+        .to_string();
+        assert_eq!(
+            error,
+            "`whisper` is a speech-to-text model, which the vllm engine cannot serve; \
+             serve it with `rocm serve whisper --engine lemonade`"
+        );
+        // The named remedy passes this same check; the e2e scenario
+        // `@id:serve-speech-to-text-model-refused-by-chat-only-engine` runs it.
+        ensure_engine_serves_task(
+            &paths,
+            "lemonade",
+            rocm_core::ModelTask::Transcription,
+            "whisper",
+            Some(&recipe),
+        )
+        .expect("Lemonade advertises speech-to-text");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unsupported_task_message_offers_no_engine_when_the_recipe_names_none_other() {
+        assert_eq!(
+            unsupported_task_message(
+                "lemonade",
+                rocm_core::ModelTask::Transcription,
+                "custom-asr",
+                None
+            ),
+            "`custom-asr` is a speech-to-text model, which the lemonade engine cannot serve"
+        );
+    }
 
     #[test]
     fn serve_engine_selection_uses_shared_recipe_when_no_override_exists() {

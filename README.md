@@ -800,7 +800,9 @@ By default the server runs in the background under ROCm CLI's supervision and
 prints a deployment summary: a progress indicator while it starts, then a table
 with the status, the full inference endpoint, a link to the server's API docs
 (see API docs below), the API-qualified model name, and a
-quick smoke test (time to first token and approximate tokens per second). Control
+quick smoke test (time to first token and approximate tokens per second; a
+speech-to-text model is checked with a test transcription before it reports
+ready, and its summary names the task instead). Control
 returns to your shell with the server still running; manage it later with `rocm
 services` (below).
 
@@ -825,6 +827,28 @@ The vLLM engine (Instinct) serves
 **safetensors** repos, such as `rocm serve Qwen/Qwen2.5-1.5B-Instruct`.
 A safetensors-only id has no GGUF build, so serving it through Lemonade fails
 instead of silently substituting a different model.
+
+#### Speech-to-text models
+
+`rocm serve whisper` serves Whisper Large-v3-Turbo through Lemonade
+(`rocm serve whisper-tiny` serves the smallest Whisper model). A
+speech-to-text server answers the OpenAI-compatible
+`POST /v1/audio/transcriptions` route instead of chat. The deployment summary
+prints that endpoint and names the task in place of the chat timing rows, and
+`rocm services list` prints it beside the server's base URL:
+
+```
+curl http://127.0.0.1:11435/v1/audio/transcriptions \
+  -F model=Whisper-Large-v3-Turbo -F file=@recording.wav
+```
+
+Lemonade runs Whisper on its ROCm whisper.cpp build, or its Vulkan build when it
+reports ROCm unsupported for the GPU; its CPU build is never selected, and
+`rocm serve` refuses to start without a usable AMD GPU. vLLM serves chat
+models only, so `rocm serve whisper --engine vllm` is refused with the command
+that works. `rocm chat`, the Console chat pane, and `rocm bench load` need a
+chat model: they do not use a speech-to-text server. `rocm chat` and `rocm
+bench load` say so when you name one; the Console chat pane skips it.
 
 Some models (such as Llama) are gated and require Hugging Face authentication.
 Log in with `huggingface-cli login` or set `HF_TOKEN` in your environment
@@ -898,9 +922,10 @@ alone, without it):
   docs      http://127.0.0.1:11430/services/<service-id>/docs/
 ```
 
-The page lists the routes the server answers (the model list, chat and text
-completions, and the engine's health check), with request examples already
-filled in with the served model. "Try it out" sends the request through the
+The page lists the routes the server answers (the model list, the engine's
+health check, and chat and text completions, or for a speech-to-text server the
+transcription route, whose "Try it out" takes an audio file upload), with
+request examples already filled in with the served model. "Try it out" sends the request through the
 docs page to the server, so it works for every engine without enabling
 cross-origin access on the server; for a server started with an endpoint key,
 enter the key under "Authorize" (it is kept only until the page is closed).

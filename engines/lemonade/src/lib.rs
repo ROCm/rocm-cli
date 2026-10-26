@@ -9,8 +9,8 @@ use rocm_engine_protocol::{
     DetectRequest, DetectResponse, DevicePolicy, EndpointRequest, EndpointResponse,
     EngineCapabilities, EngineMethod, EngineRequestEnvelope, EngineResponseEnvelope,
     HealthcheckRequest, HealthcheckResponse, InstallRequest, InstallResponse, LaunchRequest,
-    LaunchResponse, LogsRequest, LogsResponse, ResolveModelRequest, ResolveModelResponse,
-    StopRequest, StopResponse,
+    LaunchResponse, LogsRequest, LogsResponse, ModelTask, ResolveModelRequest,
+    ResolveModelResponse, StopRequest, StopResponse,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -23,6 +23,7 @@ mod direct_llama;
 mod install;
 mod process;
 mod runtime_dir;
+mod speech;
 mod state;
 #[cfg(test)]
 mod test_support;
@@ -107,6 +108,9 @@ enum CommandKind {
         engine_recipe_json: Option<String>,
         #[arg(long)]
         gpu: Option<String>,
+        /// What the model does: `chat` (default) or `transcription`.
+        #[arg(long, default_value = "chat")]
+        task: String,
     },
 }
 
@@ -123,6 +127,7 @@ pub(crate) struct ServeHttpRequest {
     pub(crate) state_path: PathBuf,
     pub(crate) log_path: Option<PathBuf>,
     pub(crate) engine_recipe: Option<rocm_engine_protocol::EngineRecipeHint>,
+    pub(crate) task: ModelTask,
 }
 
 pub fn run_cli() -> Result<()> {
@@ -146,6 +151,7 @@ pub fn run_cli() -> Result<()> {
                 device_policy: None,
                 recipe_override: None,
                 engine_recipe: None,
+                task: ModelTask::Chat,
             })?)?;
         }
         CommandKind::Launch {
@@ -170,6 +176,7 @@ pub fn run_cli() -> Result<()> {
             endpoint_mode: Some("openai".to_owned()),
             engine_recipe: None,
             gpu_selection: crate::state::parse_gpu_selection_arg(gpu.as_deref())?,
+            task: ModelTask::Chat,
         })?)?,
         CommandKind::Stdio => {
             let envelope = read_request()?;
@@ -187,6 +194,7 @@ pub fn run_cli() -> Result<()> {
             log_path,
             engine_recipe_json,
             gpu,
+            task,
         } => serve_http(ServeHttpRequest {
             service_id,
             model_ref,
@@ -199,6 +207,7 @@ pub fn run_cli() -> Result<()> {
             state_path,
             log_path,
             engine_recipe: crate::state::parse_engine_recipe_json(engine_recipe_json)?,
+            task: ModelTask::parse(&task)?,
         })?,
     }
     Ok(())
@@ -221,6 +230,7 @@ pub fn builtin_serve_http(
     state_path: PathBuf,
     log_path: Option<PathBuf>,
     engine_recipe: Option<rocm_engine_protocol::EngineRecipeHint>,
+    task: ModelTask,
 ) -> Result<()> {
     serve_http(ServeHttpRequest {
         service_id,
@@ -234,6 +244,7 @@ pub fn builtin_serve_http(
         state_path,
         log_path,
         engine_recipe,
+        task,
     })
 }
 
@@ -306,6 +317,7 @@ fn capabilities() -> EngineCapabilities {
         quantized_models:
             "GGUF through Lemonade llama.cpp (ROCm or Vulkan GPU backend auto-selected)".to_owned(),
         reasoning_parser: false,
+        tasks: vec![ModelTask::Chat, ModelTask::Transcription],
     }
 }
 
@@ -407,9 +419,17 @@ fn install_response(request: InstallRequest) -> Result<InstallResponse> {
 }
 
 fn resolve_model_response(request: ResolveModelRequest) -> Result<ResolveModelResponse> {
+    request.task.ensure_servable()?;
     let device_policy = crate::state::normalize_device_policy(request.device_policy)?;
     let engine_recipe = crate::state::accepted_engine_recipe(request.engine_recipe)?;
     let canonical_model_id = crate::state::resolve_lemonade_model_ref(&request.model_ref);
+    if request.task == ModelTask::Transcription {
+        return Ok(crate::speech::resolve_transcription_model(
+            canonical_model_id,
+            device_policy,
+            engine_recipe,
+        ));
+    }
     Ok(ResolveModelResponse {
         canonical_model_id,
         task: "chat-completions".to_owned(),
@@ -434,6 +454,7 @@ fn resolve_model_response(request: ResolveModelRequest) -> Result<ResolveModelRe
 }
 
 fn launch_service(mut request: LaunchRequest) -> Result<LaunchResponse> {
+    request.task.ensure_servable()?;
     rocm_core::require_nonempty(&request.service_id, "service_id")?;
     rocm_core::require_nonempty(&request.model_ref, "model_ref")?;
     request.device_policy = Some(crate::state::normalize_device_policy(
@@ -467,6 +488,7 @@ fn launch_service(mut request: LaunchRequest) -> Result<LaunchResponse> {
         state_path: state_path.clone(),
         log_path: Some(log_path.clone()),
         engine_recipe: request.engine_recipe.clone(),
+        task: request.task,
     };
     let current_exe =
         std::env::current_exe().context("failed to discover current Lemonade engine binary")?;
@@ -510,6 +532,9 @@ fn serve_http(mut request: ServeHttpRequest) -> Result<()> {
     process_env.gpu_indices = request.gpu_indices.clone();
     let log_path = request.log_path.as_deref();
     crate::state::write_running_state(&request, &runtime, std::process::id(), None, "starting")?;
+    if request.task == ModelTask::Transcription {
+        return crate::speech::serve_transcription(&request, &runtime, &process_env, log_path);
+    }
     // A canonical Hugging Face checkpoint (owner/repo:variant) cannot be served under its
     // exact name through Lemonade's model router (Lemonade renames registered models and
     // its registry has several naming quirks). Download the GGUF and run a packaged
@@ -700,12 +725,22 @@ fn healthcheck_service(request: HealthcheckRequest) -> Result<HealthcheckRespons
         .as_ref()
         .and_then(|value| crate::state::value_string(value, "backend_requested"))
         .unwrap_or_else(|| ROCM_BACKEND_NAME.to_owned());
+    let task = crate::state::task_from_state(state.as_ref());
     let listed = state_status == "ready"
         && !model_ref.is_empty()
         && endpoint_url
             .as_deref()
-            .map(|endpoint| {
-                crate::process::query_loaded_model_endpoint(endpoint, &model_ref, &backend)
+            .map(|endpoint| match task {
+                ModelTask::Chat => {
+                    crate::process::query_loaded_model_endpoint(endpoint, &model_ref, &backend)
+                }
+                ModelTask::Transcription => {
+                    crate::speech::query_loaded_transcription_model(endpoint, &model_ref, &backend)
+                }
+                // A task this build cannot name was written by a newer one
+                // (`task_from_state`); it has no probe here, so it is never
+                // reported ready.
+                ModelTask::Unknown => Ok(false),
             })
             .transpose()
             .unwrap_or(None)
@@ -745,7 +780,10 @@ fn endpoint_response(request: EndpointRequest) -> Result<EndpointResponse> {
     Ok(EndpointResponse {
         endpoint_url,
         api_style: "openai".to_owned(),
-        supported_routes: rocm_engine_protocol::chat_supported_routes("/v1/health"),
+        supported_routes: rocm_engine_protocol::supported_routes(
+            "/v1/health",
+            crate::state::task_from_state(Some(&state)),
+        ),
     })
 }
 
@@ -813,6 +851,20 @@ fn print_json<T: Serialize>(value: &T) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_task_from_a_newer_rocm_cli_is_not_resolved_as_any_known_task() {
+        let error = resolve_model_response(ResolveModelRequest {
+            model_ref: "future-model".to_owned(),
+            runtime_id: None,
+            device_policy: None,
+            recipe_override: None,
+            engine_recipe: None,
+            task: ModelTask::Unknown,
+        })
+        .expect_err("an unknown task is refused, not served as chat");
+        assert!(error.to_string().contains("a newer rocm-cli"), "{error}");
+    }
 
     #[test]
     fn stop_scope_targets_only_the_recorded_lemonade_server() {

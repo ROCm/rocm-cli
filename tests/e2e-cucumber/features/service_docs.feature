@@ -49,3 +49,11 @@ Feature: API docs for running model servers
     And the background helper is not running
     When the user checks for running services
     Then the running server has no API docs link
+
+  @id:service-docs-speech-to-text-upload @serial
+  Scenario: service-docs-05 - A speech-to-text server's API docs offer an audio upload instead of chat
+    Given a speech-to-text model is being served and registered with the CLI
+    And the background helper is running
+    When the user opens the server's API docs from the services list
+    Then the API docs list the transcription route and no chat routes
+    And a recording uploaded through the API docs is transcribed

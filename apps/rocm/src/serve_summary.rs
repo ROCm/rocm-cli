@@ -50,8 +50,12 @@ pub(crate) struct DeploymentSummary {
     /// Canonical / API-qualified model id clients pass as `"model"`. May differ
     /// from `requested_model` when a recipe alias resolves to a canonical id.
     pub api_model: String,
-    /// Full chat-completions endpoint, e.g. `http://127.0.0.1:1337/v1/chat/completions`.
-    pub chat_endpoint: String,
+    /// Full endpoint for the model's task, e.g.
+    /// `http://127.0.0.1:1337/v1/chat/completions` for a chat model or
+    /// `http://127.0.0.1:1337/v1/audio/transcriptions` for a speech-to-text one.
+    pub endpoint: String,
+    /// What the model does; decides which rows apply.
+    pub task: rocm_core::ModelTask,
     pub service_id: String,
     /// `"ready"`, `"starting"`, or an existing service's status.
     pub status: String,
@@ -123,21 +127,33 @@ pub(crate) fn render_summary(summary: &DeploymentSummary) -> String {
         ]
     };
 
+    // Token timings describe text generation. A speech-to-text server has none
+    // to report, and two permanent `n/a` rows would read as a failed
+    // measurement; it names its task instead, since its endpoint is not the one
+    // chat clients expect.
+    let task_rows: Vec<(&str, String)> = if summary.task.is_chat() {
+        vec![
+            ("time to first token", format_ttft(summary.metrics.ttft)),
+            ("throughput (approx)", format_tps(summary.metrics.gen_tps)),
+        ]
+    } else {
+        vec![("task", summary.task.display_name().to_owned())]
+    };
+
     let rows: Vec<(&str, String)> = [
         vec![
             ("status", summary.status.clone()),
             ("engine", summary.engine.clone()),
         ],
         model_rows,
-        vec![("endpoint", summary.chat_endpoint.clone())],
+        vec![("endpoint", summary.endpoint.clone())],
         summary
             .docs_url
             .iter()
             .map(|url| ("docs", url.clone()))
             .collect(),
+        task_rows,
         vec![
-            ("time to first token", format_ttft(summary.metrics.ttft)),
-            ("throughput (approx)", format_tps(summary.metrics.gen_tps)),
             ("service", summary.service_id.clone()),
             (
                 "stop",
@@ -269,7 +285,8 @@ mod tests {
             engine: "vllm".to_owned(),
             requested_model: "Qwen/Qwen2.5-7B-Instruct".to_owned(),
             api_model: "Qwen/Qwen2.5-7B-Instruct".to_owned(),
-            chat_endpoint: "http://127.0.0.1:1337/v1/chat/completions".to_owned(),
+            endpoint: "http://127.0.0.1:1337/v1/chat/completions".to_owned(),
+            task: rocm_core::ModelTask::Chat,
             service_id: "vllm-qwen-1720000000".to_owned(),
             status: "ready".to_owned(),
             already_running: false,
@@ -351,6 +368,31 @@ mod tests {
     }
 
     #[test]
+    fn speech_to_text_summary_names_its_task_and_omits_token_timings() {
+        // `serve()` builds `endpoint` from the same task value it launched the
+        // engine with (`ModelTask::api_route`), and skips the chat smoke test
+        // for this task; the e2e scenario
+        // `@id:serve-speech-to-text-model-prints-its-transcription-endpoint`
+        // proves the printed route is the one the running server answers.
+        let summary = DeploymentSummary {
+            engine: "lemonade".to_owned(),
+            requested_model: "whisper".to_owned(),
+            api_model: "Whisper-Large-v3-Turbo".to_owned(),
+            endpoint: "http://127.0.0.1:1337/v1/audio/transcriptions".to_owned(),
+            task: rocm_core::ModelTask::Transcription,
+            metrics: SmokeMetrics::default(),
+            ..base_summary()
+        };
+        let rendered = render_summary(&summary);
+        assert!(rendered.contains("http://127.0.0.1:1337/v1/audio/transcriptions"));
+        assert!(rendered.contains("task"), "{rendered}");
+        assert!(rendered.contains("speech-to-text"), "{rendered}");
+        assert!(!rendered.contains("time to first token"), "{rendered}");
+        assert!(!rendered.contains("throughput"), "{rendered}");
+        assert!(!rendered.contains("chat/completions"), "{rendered}");
+    }
+
+    #[test]
     fn summary_structure_is_identical_across_engines() {
         // The same fields render in the same order regardless of engine; only the
         // engine/model/endpoint values differ. Compare the row *labels*.
@@ -373,7 +415,7 @@ mod tests {
         lemonade.engine = "lemonade".to_owned();
         lemonade.requested_model = "Qwen3-0.6B-GGUF".to_owned();
         lemonade.api_model = "Qwen3-0.6B-GGUF".to_owned();
-        lemonade.chat_endpoint = "http://127.0.0.1:8000/v1/chat/completions".to_owned();
+        lemonade.endpoint = "http://127.0.0.1:8000/v1/chat/completions".to_owned();
         lemonade.metrics = SmokeMetrics::default(); // engine reported no usage
 
         assert_eq!(
