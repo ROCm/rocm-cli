@@ -3,8 +3,9 @@
 // SPDX-License-Identifier: MIT
 
 use crate::cli_progress::AnimatedSpinner;
+use crate::freeform_planner::format_structured_tool_call;
 use crate::runtimes_cmd::runtime_usability_status;
-use crate::{format_structured_tool_call, therock};
+use crate::therock;
 use anyhow::{Context, Result, bail};
 use flate2::read::GzDecoder;
 use rocm_core::browser::{Opener, SystemOpener};
