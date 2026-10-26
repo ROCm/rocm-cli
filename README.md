@@ -571,7 +571,9 @@ package.
 On Windows, `install driver` is validate-only: it installs and changes nothing,
 with or without `--yes`, and it starts no driver command. It prints the AMD
 display driver version and date, and whether the date is older than the first
-HIP SDK for Windows, 27 July 2023 (`outdated: yes`, `no` or `unknown`). For an
+HIP SDK for Windows, 27 July 2023 (`outdated: yes`, `no` or `unknown`). Next to
+`outdated: no` it repeats that the date cannot judge newer GPUs such as
+gfx120X, gfx1150 and gfx1151. For an
 old driver it also names the fix id `fix-22-display-driver-old`. Run
 `rocm diagnose` for the advice. AMD publishes no minimum driver version, so an
 old date is a hint to look at the driver, not a finding that it is broken. See

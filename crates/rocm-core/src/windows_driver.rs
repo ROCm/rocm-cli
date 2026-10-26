@@ -309,6 +309,11 @@ pub fn age_summary(info: &WindowsDriverInfo) -> String {
 ///
 /// Two truths travel together here: what the driver is, and that this command
 /// installs nothing. `info` is `None` when the probe found no AMD driver.
+///
+/// `outdated: no` only says the date is not before the floor, so it carries
+/// [`FLOOR_NOTE`]: a bare `no` would read as a clean bill of health for a GPU
+/// the date cannot judge. `outdated: yes` needs no such caveat; a date before
+/// the floor is old for every GPU.
 #[must_use]
 pub fn install_driver_summary(info: Option<&WindowsDriverInfo>) -> String {
     let Some(info) = info else {
@@ -321,11 +326,15 @@ pub fn install_driver_summary(info: Option<&WindowsDriverInfo>) -> String {
         DriverAge::Predates(_) => format!(
             "outdated: yes, dated before the first HIP SDK for Windows ({FIRST_HIP_SDK_FOR_WINDOWS}); {NO_MINIMUM_NOTE}; fix id {DISPLAY_DRIVER_OLD_FIX_ID}, run `rocm diagnose` for the advice, then update from {AMD_SUPPORT_URL} and restart"
         ),
-        DriverAge::NotOlder(_) => "outdated: no, the date is not older than the first HIP SDK for Windows; the minimum driver version is not established".to_owned(),
+        DriverAge::NotOlder(_) => format!(
+            "outdated: no, the date is not older than the first HIP SDK for Windows; the minimum driver version is not established. {FLOOR_NOTE}"
+        ),
         DriverAge::Unknown => "outdated: unknown, the driver date could not be read".to_owned(),
     };
+    // `outdated: no` ends with the full-stop of `FLOOR_NOTE`; the others get one.
+    let stop = if verdict.ends_with('.') { "" } else { "." };
     format!(
-        "Windows driver install is validate-only in rocm-cli; no driver is installed or changed. AMD display driver version {}, dated {date}, {verdict}.",
+        "Windows driver install is validate-only in rocm-cli; no driver is installed or changed. AMD display driver version {}, dated {date}, {verdict}{stop}",
         info.version
     )
 }
@@ -452,6 +461,26 @@ mod tests {
         }
     }
 
+    /// `rocm examine` and `rocm install driver` both print a "no" verdict for a
+    /// date at or after the floor, and both must say the date cannot judge the
+    /// newer GPUs.
+    #[test]
+    fn every_clean_verdict_carries_the_newer_gpu_caveat() {
+        let current = info("32.0.23033.1002", "2026-05-02");
+        assert!(matches!(current.age(), DriverAge::NotOlder(_)));
+        for text in [
+            age_summary(&current),
+            install_driver_summary(Some(&current)),
+        ] {
+            assert!(text.contains("gfx1151"), "{text}");
+            assert!(text.contains("may need newer drivers"), "{text}");
+        }
+        // The diagnose finding only exists for an old driver; its notes carry
+        // the same floor caveat, so no verdict reaches a user without it.
+        let evidence = old_driver_evidence(&info("30.0.13014.8", "2021-08-04")).expect("old");
+        assert!(!evidence.contains("outdated: no"));
+    }
+
     #[test]
     fn the_install_summary_reports_version_date_verdict_and_fix_id() {
         let old = install_driver_summary(Some(&info("30.0.13014.8", "2021-08-04")));
@@ -463,6 +492,24 @@ mod tests {
 
         let current = install_driver_summary(Some(&info("32.0.23033.1002", "2026-05-02")));
         assert!(current.contains("outdated: no"));
+        // The printed `no` is a claim about the date only, so it carries the
+        // floor caveat; the state behind it is `NotOlder`, which is what the
+        // date cannot judge for gfx1151 and the other newer GPUs.
+        assert!(matches!(
+            info("32.0.23033.1002", "2026-05-02").age(),
+            DriverAge::NotOlder(_)
+        ));
+        assert!(current.contains(FLOOR_NOTE), "{current}");
+        assert!(!current.contains(".."), "{current}");
+        assert!(current.ends_with('.'), "{current}");
+        // The boundary day is not older either, so it reads the same way.
+        let boundary = install_driver_summary(Some(&info("31.0.1.1", "2023-07-27")));
+        assert!(boundary.contains("outdated: no") && boundary.contains(FLOOR_NOTE));
+        // `yes` and `unknown` are not "clean" claims and stay without it.
+        assert!(
+            !old.contains(FLOOR_NOTE)
+                && !install_driver_summary(Some(&info("30.0.13014.8", ""))).contains(FLOOR_NOTE)
+        );
         assert!(
             !current.contains(DISPLAY_DRIVER_OLD_FIX_ID),
             "a current driver must not point at the old-driver advice: {current}"

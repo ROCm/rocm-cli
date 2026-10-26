@@ -311,7 +311,8 @@ Expected result:
 - With a newer driver, `driver_age` says it is not older, and `rocm diagnose`
   does not list `fix-22-display-driver-old`.
 - `rocm install driver` prints the same version and date, an `outdated:` verdict,
-  and the fix id when the driver is old. It installs nothing and prints no
+  and the fix id when the driver is old. Next to `outdated: no` it says the date
+  cannot judge newer GPUs such as gfx120X, gfx1150 and gfx1151. It installs nothing and prints no
   execution commands.
 
 Automated end-to-end scenarios (`examine-29`, `diagnose-41`, `driver-install-04`

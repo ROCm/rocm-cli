@@ -3228,6 +3228,12 @@ VERSION_ID="41"
         let rendered = render_driver_install_plan(&plan, true, false);
         assert!(rendered.contains("version 32.0.23033.1002"), "{rendered}");
         assert!(rendered.contains("outdated: no"), "{rendered}");
+        // The `no` is only about the date, so the plan says what the date
+        // cannot judge; the state behind it is a report-only plan.
+        assert!(
+            rendered.contains(rocm_core::windows_driver::FLOOR_NOTE),
+            "{rendered}"
+        );
         assert!(
             !rendered.contains(rocm_core::windows_driver::DISPLAY_DRIVER_OLD_FIX_ID),
             "{rendered}"

@@ -1266,7 +1266,8 @@ these tests, check the set with the same arguments and `-- --list`.
 
 The `rocm install driver` tests assert the printed version, date, verdict and fix
 id together with the fact that the plan has no commands and stays non-mutating,
-with or without `--yes`.
+with or without `--yes`. A `no` verdict is asserted together with the sentence
+that the date cannot judge newer GPUs such as gfx1151.
 
 Four `@requires-os:windows` scenarios run on the Windows GPU lane
 (`e2e-gpu-strix-windows`): `examine-29` in
