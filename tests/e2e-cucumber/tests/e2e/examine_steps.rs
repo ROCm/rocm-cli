@@ -1157,6 +1157,32 @@ async fn assert_gpus_match_kfd_nodes(world: &mut E2eWorld) {
     }
 }
 
+#[then("the inspection classifies the kernel-visible GPU as an APU")]
+async fn assert_unnamed_gpu_is_apu(world: &mut E2eWorld) {
+    let json = parsed_json(world);
+    assert_eq!(
+        json.get("has_apu").and_then(serde_json::Value::as_bool),
+        Some(true),
+        "the kernel names an APU, so the summary must not call it a discrete card:\n{json:#}"
+    );
+    let gpu = json
+        .get("gpus")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|gpus| gpus.first())
+        .unwrap_or_else(|| panic!("the inspection listed no GPU:\n{json:#}"));
+    assert_eq!(
+        gpu.get("is_apu").and_then(serde_json::Value::as_bool),
+        Some(true),
+        "the PCI name resolved no target, so the kernel's target is the only evidence \
+         about the family:\n{gpu:#}"
+    );
+    assert_eq!(
+        gpu.get("gfx_target").and_then(serde_json::Value::as_str),
+        Some("gfx1151"),
+        "the kernel's target has to reach the entry it classifies:\n{gpu:#}"
+    );
+}
+
 #[then("the inspection lists the code object manager libraries it found")]
 async fn assert_comgr_copies_reported(world: &mut E2eWorld) {
     assert_eq!(
@@ -1702,6 +1728,57 @@ async fn assert_no_amdgpu_fault_evidence(world: &mut E2eWorld) {
             "amdgpu was reported missing though the amdgpu PCI driver is registered: {line}"
         );
     }
+}
+
+#[given("a machine whose PCI name for its APU is unrecognised")]
+async fn unnamed_apu_machine(world: &mut E2eWorld) {
+    plant_unnamed_apu_fixtures(world);
+}
+
+/// #449's host: `pci.ids` predates Strix Halo, so `lspci` names the device only
+/// as "Device" while the kernel still reports gfx1151. Both stubs are part of
+/// the premise:
+///
+/// - `lspci` must answer with the real bus entry, so the PCI scan places the card
+///   and resolves no target from its name -- that failed lookup is what stamped
+///   `is_apu: false`.
+/// - `rocminfo` must answer with nothing, because a runner with ROCm installed
+///   would otherwise resolve the APU through its own probe, which already
+///   classified by target and would hide the defect under test.
+///
+/// The node's address is `0000:c5:00.0`: `location_id 50432` is `0xc500`, the
+/// same encoding a real KFD node uses (`(bus << 8) | devfn`).
+fn plant_unnamed_apu_fixtures(world: &mut E2eWorld) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .to_owned();
+    let node = root.join("host-root/sys/class/kfd/kfd/topology/nodes/1");
+    std::fs::create_dir_all(&node).expect("failed to create planted KFD node");
+    std::fs::write(
+        node.join("properties"),
+        "cpu_cores_count 0\nsimd_count 80\ngfx_target_version 110501\n\
+         domain 0\nlocation_id 50432\n",
+    )
+    .expect("failed to write planted KFD node properties");
+    put_fake_executables_on_path(
+        world,
+        &[
+            (
+                "lspci",
+                "#!/bin/sh\n\
+                 echo '0000:c5:00.0 VGA compatible controller [0300]: Advanced Micro Devices, Inc. \
+                 [AMD/ATI] Device [1002:1586] (rev cb)'\n",
+            ),
+            ("rocminfo", "#!/bin/sh\nexit 0\n"),
+        ],
+    );
+    world.command_env.push((
+        "ROCM_CLI_TEST_HOST_ROOT",
+        root.join("host-root").into_os_string(),
+    ));
 }
 
 #[when("the user inspects that machine in machine-readable form")]
