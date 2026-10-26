@@ -7188,6 +7188,49 @@ mod tests {
         );
     }
 
+    /// The closing "Next step" block picks the first non-advice row when
+    /// nothing reaches HIGH_CONFIDENCE. A LIKELY or WEAK real cause listed
+    /// above the old-driver row must be the one named, never the advice row.
+    #[test]
+    fn a_below_high_real_cause_beside_an_old_driver_is_the_one_named_as_next_step() {
+        for (score, tier) in [(60, "LIKELY"), (30, "WEAK")] {
+            let mut report = diagnose(&old_driver_only_exam(), "");
+            assert_eq!(report.matched.len(), 1, "fixture: only the advice row");
+            report.matched.insert(
+                0,
+                Diagnosis {
+                    id: "fix-99-synthetic-real-cause".to_owned(),
+                    title: "A real cause below HIGH_CONFIDENCE".to_owned(),
+                    score,
+                    evidence: vec!["synthetic".to_owned()],
+                    fix: None,
+                },
+            );
+            assert!(score < HIGH_CONFIDENCE);
+            let text = render_report_text(&report, 5);
+            assert!(
+                text.contains(&format!("[{tier} score={score}/100]")),
+                "{text}"
+            );
+            assert!(
+                text.contains("below the HIGH_CONFIDENCE threshold"),
+                "{text}"
+            );
+            assert!(
+                text.contains(
+                    "run `rocm fix fix-99-synthetic-real-cause` (the highest-scoring match)"
+                ),
+                "{text}"
+            );
+            assert!(
+                !text.contains("run `rocm fix fix-22-display-driver-old` (the highest"),
+                "{text}"
+            );
+            // The advice row is still listed, after the real cause.
+            assert!(text.contains("#2 (fix-22-display-driver-old)"), "{text}");
+        }
+    }
+
     #[test]
     fn an_old_driver_leaves_the_json_report_as_it_was() {
         let report = diagnose(&old_driver_only_exam(), "");
