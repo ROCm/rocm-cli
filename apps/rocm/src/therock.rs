@@ -6764,7 +6764,7 @@ fn compare_version_strings(left: &str, right: &str) -> Ordering {
 ///   only a defined position.
 ///
 ///   What makes the two sides agree is that [`parse_host_version`] strips a
-///   `-` suffix only when it is *numeric*. A host `7.2.4-98` is reduced to
+///   `-` suffix only when it is all digits. A host `7.2.4-98` is reduced to
 ///   `7.2.4` before it reaches here, so this function never sees that shape
 ///   from the host; and `7.0.0-rc1` is left intact, so both sides read it as a
 ///   release candidate. Widening either side of that rule re-opens the
@@ -6928,21 +6928,29 @@ fn parse_version(value: &str) -> Option<ParsedVersion> {
 /// one: a legacy/system ROCm reports a packaging build number as `7.2.4-98`,
 /// which is not a PEP 440 spelling of anything.
 ///
-/// Only a *numeric* `-` suffix is dropped. `-` is also a PEP 440 pre-release
+/// Only an all-digit `-` suffix is dropped. `-` is also a PEP 440 pre-release
 /// separator, so stripping it unconditionally would read `7.0.0-rc1` as the
 /// final `7.0.0` — and then this function and the comparator would disagree
 /// about that string, which is exactly the self-contradiction the shared parser
 /// exists to remove.
+///
+/// Any other suffix stays on the string, and the whole string goes to
+/// [`parse_version_for_ordering`]: `7.0.0-rc1` is read as a release candidate,
+/// and a shape that is neither a build number nor a PEP 440 stage
+/// (`7.2.4-98rc1`) is unreadable, so this returns `None`. Checking only that the
+/// suffix *starts* with a digit would drop `-98rc1` and read that string as the
+/// plain `7.2.4`.
 ///
 /// Sharing the parser is the point: a host version and an index version are
 /// compared against each other, and the two must not disagree about which is
 /// newer. Returns `None` when the string still cannot be read, so an
 /// unparseable host string is "can't tell" rather than a lexicographic guess.
 fn parse_host_version(value: &str) -> Option<VersionOrderKey> {
-    // `7.2.4-98` -> `7.2.4`, but `7.0.0-rc1` is left for the PEP 440 parser.
+    // `7.2.4-98` -> `7.2.4`. `7.0.0-rc1` and `7.2.4-98rc1` are left whole for
+    // the PEP 440 parser, which reads the first and rejects the second.
     let trimmed = value.trim();
     let candidate = match trimmed.split_once('-') {
-        Some((head, tail)) if tail.starts_with(|ch: char| ch.is_ascii_digit()) => head,
+        Some((head, tail)) if !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit()) => head,
         _ => trimmed,
     };
     parse_version_for_ordering(candidate)
@@ -12113,6 +12121,35 @@ exit 1
         );
         // A host string we cannot parse is "can't tell", never "newer".
         assert!(host_version_newer_than(Some("unknown".to_owned()), "7.13.0").is_none());
+    }
+
+    #[test]
+    fn parse_host_version_drops_only_an_all_digit_build_suffix() {
+        // An all-digit tail is a packaging build number and is dropped.
+        assert_eq!(
+            parse_host_version("7.2.4-98"),
+            parse_version_for_ordering("7.2.4")
+        );
+        assert!(parse_host_version("7.2.4-98").is_some());
+        // A PEP 440 pre-release spelled with `-` is kept and read as one.
+        assert_eq!(
+            parse_host_version("7.0.0-rc1"),
+            parse_version_for_ordering("7.0.0rc1")
+        );
+        // A tail that starts with a digit but is not all digits is neither a
+        // build number nor a PEP 440 stage. The whole string goes to the
+        // ordering parser, which cannot read it, so the host version is
+        // unreadable rather than silently read as `7.2.4`.
+        assert_eq!(parse_host_version("7.2.4-98rc1"), None);
+        assert_eq!(parse_version_for_ordering("7.2.4-98rc1"), None);
+        // What the user sees: an unreadable host version is "can't tell", so
+        // no host-newer note, even where the dropped-suffix reading (`7.20.1`)
+        // would have been newer than the version being installed.
+        assert!(host_version_newer_than(Some("7.20.1-33rc1".to_owned()), "7.13.0").is_none());
+        assert_eq!(
+            host_version_newer_than(Some("7.20.1-33".to_owned()), "7.13.0").as_deref(),
+            Some("7.20.1-33")
+        );
     }
 
     #[test]
