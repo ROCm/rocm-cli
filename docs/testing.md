@@ -200,6 +200,10 @@ not checked as written:
   `service_hints.rs`, whose verb is `{action}`, and the `runtimes` retry line
   in `runtime_services.rs`, whose subcommand is `{command}`) is excluded and
   checked through the functions that build it instead
+- separate optional groups are tried one at a time, never together (they can
+  be mutually exclusive, as in `rocm dash [--demo] [--replay <file>]`), so a
+  command that fails only when flags from two of them are combined is not
+  caught
 
 When it fails, fix the advice (or the CLI). Add text to `NOT_INVOCATIONS`, with
 a reason, only when the text starts with `rocm` but is not advice to run
