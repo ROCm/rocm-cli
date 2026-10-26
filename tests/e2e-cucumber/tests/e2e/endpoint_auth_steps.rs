@@ -153,6 +153,20 @@ async fn shows_key_once(world: &mut E2eWorld) {
         shown, 1,
         "expected exactly one dedicated `api key:` line, got {shown}:\n{output}"
     );
+    // The key may appear only on the `api key:` line and in the curl example; any
+    // other line carrying it means it leaked elsewhere in the launch output.
+    let leaked: Vec<&str> = output
+        .lines()
+        .filter(|line| line.contains(key))
+        .filter(|line| {
+            let line = line.trim();
+            !line.starts_with("api key:") && !line.starts_with("example:")
+        })
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "the key leaked onto lines other than the api key line and curl example: {leaked:?}"
+    );
     assert!(
         output.contains("shown only now"),
         "expected the show-once note, got:\n{output}"

@@ -5,8 +5,11 @@ Feature: Native HTTP networking
   # run under `powershell.exe -ExecutionPolicy Bypass` on Windows. These
   # scenarios drive the real `rocm` binary end-to-end against the mock server so a
   # GET/round-trip reaches a local endpoint over the native stack. All but
-  # networking-04 run on the mock (no GPU) on every platform the suite runs on, so a regression back to a
-  # shell-out networking backend surfaces here rather than only in the field.
+  # networking-04 run on the mock (no GPU) on every platform the suite runs on, so
+  # a regression back to a shell-out networking backend surfaces here rather than
+  # only in the field. networking-04 is a GPU serve scenario: it starts a real
+  # engine on a public bind and checks key enforcement from the harness's own
+  # HTTP client, not through the CLI.
 
   # `rocm services list` extracts host:port from the service record and issues a
   # native HTTP GET to `/v1/models` as its readiness probe (served by the mock).
