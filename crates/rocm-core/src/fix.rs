@@ -2633,7 +2633,7 @@ mod tests {
         let count = ids.len();
         ids.dedup();
         assert_eq!(ids.len(), count, "duplicate fix-id in RECIPES");
-        // 21 bare-metal/Windows entries (fix-16-vllm-oom, fix-17-torch-dlpack,
+        // 22 bare-metal/Windows entries (fix-16-vllm-oom, fix-17-torch-dlpack,
         // fix-18-comgr-conflict, fix-19-shm-too-small,
         // fix-21-msvc-redist-outdated, fix-22-display-driver-old and the
         // informational info-20-gpu-no-rocm-support among them) plus the 7 WSL

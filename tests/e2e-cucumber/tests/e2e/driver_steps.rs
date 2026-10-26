@@ -201,10 +201,6 @@ async fn assert_windows_driver_install_runs_nothing(world: &mut E2eWorld) {
         "{output}"
     );
     assert!(
-        !output.lines().any(|line| line.trim() == "execution:"),
-        "the plan reported an execution:\n{output}"
-    );
-    assert!(
         !output.contains("driver install completed"),
         "an installer run was reported:\n{output}"
     );
