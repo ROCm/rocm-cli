@@ -1848,25 +1848,20 @@ fn amdgpu_present_on_host() -> bool {
     crate::host_path("/sys/module/amdgpu").exists()
 }
 
-/// `amdgpu_loaded`: an `amdgpu` module in the list, or amdgpu present on the host.
+/// Whether `name` is loaded or built in: listed in the module list, or present
+/// on the host.
 ///
-/// `modules` is `None` when the module list could not be read; amdgpu being
-/// present on the host still answers `true` then, and nothing else is known.
-fn amdgpu_state(modules: Option<&[&str]>, amdgpu_on_host: bool) -> Option<bool> {
+/// `modules` is `None` when the module list could not be read; the host
+/// answering `true` still answers `true` then, and nothing else is known. The
+/// host probe runs only when the module list has not already answered.
+fn module_or_host_state(
+    modules: Option<&[&str]>,
+    name: &str,
+    on_host: impl FnOnce() -> bool,
+) -> Option<bool> {
     match modules {
-        Some(modules) => Some(modules.contains(&"amdgpu") || amdgpu_on_host),
-        None => amdgpu_on_host.then_some(true),
-    }
-}
-
-/// `amdkfd_loaded`: an `amdkfd` module in the list, or kfd present on the host.
-///
-/// `modules` is `None` when the module list could not be read; kfd being
-/// present on the host still answers `true` then, and nothing else is known.
-fn amdkfd_state(modules: Option<&[&str]>, kfd_on_host: bool) -> Option<bool> {
-    match modules {
-        Some(modules) => Some(modules.contains(&"amdkfd") || kfd_on_host),
-        None => kfd_on_host.then_some(true),
+        Some(modules) => Some(modules.contains(&name) || on_host()),
+        None => on_host().then_some(true),
     }
 }
 
@@ -1883,8 +1878,13 @@ fn probe_modules(e: &mut Examination) {
             .filter_map(|line| line.split_whitespace().next())
             .collect()
     });
-    e.amdgpu_loaded = amdgpu_state(modules.as_deref(), amdgpu_present_on_host());
-    e.amdkfd_loaded = amdkfd_state(modules.as_deref(), kfd_present_on_host());
+    // kfd is linked into amdgpu, so kfd on the host proves amdgpu too: a
+    // container that passes `/dev/kfd` through without `/sys/module` must not
+    // report kfd up and amdgpu down.
+    e.amdgpu_loaded = module_or_host_state(modules.as_deref(), "amdgpu", || {
+        amdgpu_present_on_host() || kfd_present_on_host()
+    });
+    e.amdkfd_loaded = module_or_host_state(modules.as_deref(), "amdkfd", kfd_present_on_host);
 
     for dir in ["/etc/modprobe.d", "/usr/lib/modprobe.d", "/run/modprobe.d"] {
         let Ok(entries) = std::fs::read_dir(crate::host_path(dir)) else {
@@ -6464,55 +6464,57 @@ mod tests {
     }
 
     #[test]
-    fn amdkfd_is_present_when_listed_as_a_module() {
-        assert_eq!(amdkfd_state(Some(&["amdgpu", "amdkfd"]), false), Some(true));
+    fn a_module_is_present_when_listed() {
+        assert_eq!(
+            module_or_host_state(Some(&["amdgpu", "amdkfd"]), "amdkfd", || false),
+            Some(true)
+        );
+        assert_eq!(
+            module_or_host_state(Some(&["amdgpu", "drm"]), "amdgpu", || false),
+            Some(true)
+        );
     }
 
-    /// kfd built into the kernel never appears in the module list.
+    /// Built into the kernel, a driver never appears in the module list.
     #[test]
-    fn amdkfd_is_present_when_built_in_and_absent_from_the_module_list() {
-        assert_eq!(amdkfd_state(Some(&["amdgpu", "drm"]), true), Some(true));
-        assert_eq!(amdkfd_state(Some(&[]), true), Some(true));
-    }
-
-    #[test]
-    fn amdkfd_is_absent_with_neither_a_module_nor_kfd_on_the_host() {
-        assert_eq!(amdkfd_state(Some(&["amdgpu", "drm"]), false), Some(false));
-        assert_eq!(amdkfd_state(Some(&[]), false), Some(false));
-    }
-
-    /// With no module list, kfd on the host still answers; without it the
-    /// field stays unknown rather than claiming `false`.
-    #[test]
-    fn amdkfd_with_an_unreadable_module_list_follows_the_host() {
-        assert_eq!(amdkfd_state(None, true), Some(true));
-        assert_eq!(amdkfd_state(None, false), None);
-    }
-
-    #[test]
-    fn amdgpu_is_present_when_listed_as_a_module() {
-        assert_eq!(amdgpu_state(Some(&["amdgpu", "drm"]), false), Some(true));
-    }
-
-    /// amdgpu built into the kernel never appears in the module list.
-    #[test]
-    fn amdgpu_is_present_when_built_in_and_absent_from_the_module_list() {
-        assert_eq!(amdgpu_state(Some(&["drm"]), true), Some(true));
-        assert_eq!(amdgpu_state(Some(&[]), true), Some(true));
+    fn a_module_is_present_when_built_in_and_absent_from_the_module_list() {
+        assert_eq!(
+            module_or_host_state(Some(&["drm"]), "amdkfd", || true),
+            Some(true)
+        );
+        assert_eq!(
+            module_or_host_state(Some(&[]), "amdgpu", || true),
+            Some(true)
+        );
     }
 
     #[test]
-    fn amdgpu_is_absent_with_neither_a_module_nor_sysfs_on_the_host() {
-        assert_eq!(amdgpu_state(Some(&["drm"]), false), Some(false));
-        assert_eq!(amdgpu_state(Some(&[]), false), Some(false));
+    fn a_module_is_absent_with_neither_a_listing_nor_the_host() {
+        assert_eq!(
+            module_or_host_state(Some(&["drm"]), "amdkfd", || false),
+            Some(false)
+        );
+        assert_eq!(
+            module_or_host_state(Some(&[]), "amdgpu", || false),
+            Some(false)
+        );
     }
 
-    /// With no module list, sysfs on the host still answers; without it the
-    /// field stays unknown rather than claiming `false`.
+    /// With no module list, the host still answers; without it the field
+    /// stays unknown rather than claiming `false`.
     #[test]
-    fn amdgpu_with_an_unreadable_module_list_follows_the_host() {
-        assert_eq!(amdgpu_state(None, true), Some(true));
-        assert_eq!(amdgpu_state(None, false), None);
+    fn an_unreadable_module_list_follows_the_host() {
+        assert_eq!(module_or_host_state(None, "amdgpu", || true), Some(true));
+        assert_eq!(module_or_host_state(None, "amdgpu", || false), None);
+    }
+
+    /// The host probe is skipped once the module list has answered.
+    #[test]
+    fn the_host_probe_is_skipped_when_the_module_list_already_answers() {
+        assert_eq!(
+            module_or_host_state(Some(&["amdgpu"]), "amdgpu", || unreachable!()),
+            Some(true)
+        );
     }
 
     /// The host side of the check, against a planted root.
