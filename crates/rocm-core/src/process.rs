@@ -6,8 +6,9 @@
 //!
 //! Hidden-console/detached spawn and exit-wait on Windows, process/process-tree
 //! termination on both platforms, and the exclusive `FileLock` used to
-//! serialize the daemon autostart path, the managed-launch GPU claim, and
-//! `uv` installs across processes.
+//! serialize check-then-act sequences over shared on-disk state across
+//! processes — e.g. the daemon autostart path, the managed-launch GPU claim,
+//! a `uv` install, and each JSONL store's append/rewrite.
 //!
 //! [`run_with_timeout`] is the bulk of the file: run a command to completion
 //! with both streams captured and a real time bound. A thread per pipe drains
@@ -387,9 +388,11 @@ pub fn process_is_running(pid: u32) -> bool {
 /// Wraps the standard-library file lock (`std::fs::File::lock`), so the exclusion
 /// holds between *separate `rocm` processes*, not just threads: each caller opens
 /// the same lock-file path and only one can hold the lock at a time. It exists to
-/// serialize check-then-act sequences over shared on-disk state — the daemon
-/// autostart decision and the managed-serve GPU select-then-claim — so two
-/// concurrent invocations cannot both pass the same TOCTOU check.
+/// serialize check-then-act sequences over shared on-disk state — e.g. the
+/// daemon autostart decision, the managed-serve GPU select-then-claim, a
+/// `uv` install, and each JSONL store's append-or-repair and read-modify-write
+/// (see `jsonl_lock_path` in `automation.rs`) — so two concurrent invocations
+/// cannot both pass the same check, or interleave a write with another's.
 ///
 /// The lock is released when the guard is dropped, and by the OS if the process
 /// exits while holding it (so a crashed holder never wedges the next caller).
