@@ -17,6 +17,9 @@ concurrency:
   group: demo-gifs
   cancel-in-progress: true
 
+env:
+  RUSTFLAGS: -D warnings
+
 jobs:
   render:
     runs-on: ubuntu-latest

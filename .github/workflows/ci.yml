@@ -59,6 +59,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
 
 # Every job sets `timeout-minutes`. GitHub's default is 360, so a step that hangs
 # rather than fails — an `apt-get` against an unresponsive mirror, a network call

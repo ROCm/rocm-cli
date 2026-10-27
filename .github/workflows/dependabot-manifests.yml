@@ -41,6 +41,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
 
 jobs:
   # Runs the generators, and therefore compiles the bumped dependency graph:

@@ -14,6 +14,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
   # REQUIRED, not dormant: every readiness step below runs --require-signatures,
   # which now means signatures must actually verify, so this is the public key
   # the release is verified against. Removing or blanking the secret fails every
