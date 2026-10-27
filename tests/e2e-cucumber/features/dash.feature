@@ -669,12 +669,11 @@ Feature: Interactive dashboard
     Then the dashboard exits successfully
 
   # ROCMAI-196: the instance detail modal's "recent throughput" panel is
-  # fed from the dashboard's snapshot history, which the demo replay cannot
-  # exercise (demo instances report a constant positive gen_tps with no
-  # observation). The scripted-metrics managed model gives it real
-  # non-zero scraped ticks, so the populated rows are reachable here. The
-  # no-data/idle placeholder wording and the short-terminal collapse are
-  # pinned by render tests in `ui/tabs/instances.rs`.
+  # fed from the dashboard's snapshot history. Demo instances do fill it with
+  # rows, but the demo cannot reach the idle vs no-data split; the scripted-
+  # metrics managed model gives real scraped ticks. The placeholder wording
+  # and the short-terminal collapse are pinned by render tests in
+  # `ui/tabs/instances.rs`.
   @id:dash-instance-detail-recent-throughput @requires-os:linux
   Scenario: dash-39 - Instance detail lists recent throughput samples for a serving model
     Given a managed model exposes scripted serving metrics

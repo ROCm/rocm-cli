@@ -1712,16 +1712,20 @@ async fn instance_details_displayed(world: &mut E2eWorld) {
 
 #[then("the instance detail lists recent throughput samples")]
 async fn detail_lists_recent_throughput_samples(world: &mut E2eWorld) {
-    // A populated row carries an "Ns ago" age; the placeholders ("no
-    // throughput data observed yet" / "has been idle") do not, and the panel
-    // title alone would also be present on them.
+    // A populated row is "<N>s ago" then a numeric tok/s cell. The panel title
+    // and the idle placeholder both contain "recent throughput", and the
+    // summary's freshness line ("held · 1s ago") contains " ago", so neither
+    // substring alone distinguishes rows from the placeholders.
     session(world)
         .wait_for_screen_where(
-            "the detail modal's recent throughput panel lists an 'Ns ago' row",
+            "the detail modal's recent throughput panel lists an 'Ns ago <tok/s>' row",
             |screen| {
-                screen.contains("recent throughput")
-                    && screen.contains(" ago")
-                    && !screen.contains("no throughput data")
+                screen.lines().any(|line| {
+                    line.split_once("s ago").is_some_and(|(head, tail)| {
+                        head.ends_with(|c: char| c.is_ascii_digit())
+                            && tail.trim_start().starts_with(|c: char| c.is_ascii_digit())
+                    })
+                })
             },
             default_timeout(),
         )

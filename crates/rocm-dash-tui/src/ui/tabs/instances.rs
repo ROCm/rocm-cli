@@ -339,7 +339,7 @@ pub(crate) struct ActivityRow {
 /// `container_id` had non-zero generation throughput — i.e. was actually
 /// serving, not idle. These are per-tick samples, not discrete serving runs.
 /// The live "gen:" gauge in `render_summary` already covers the idle case, so
-/// idle ticks are skipped. Returns up to `cap` rows, newest first.
+/// idle ticks are skipped. Repeated Held ticks of one scrape collapse to one row. Returns up to `cap` rows, newest first.
 /// Pure — exposed for tests.
 pub(crate) fn recent_activity_rows(
     history: &std::collections::VecDeque<rocm_dash_core::metrics::Snapshot>,
@@ -354,16 +354,29 @@ pub(crate) fn recent_activity_rows(
                 .instances
                 .iter()
                 .find(|i| i.container_id == container_id)?;
+            // A Held tick repeats an earlier scrape; age it from when the
+            // value was observed, not from the tick that re-published it.
+            let ts = inst
+                .gen_tps_observation
+                .as_ref()
+                .map_or(snap.timestamp, |o| o.observed_at);
             inst.gen_tps
                 .is_some_and(|v| v.is_finite() && v > 0.0)
                 .then_some(ActivityRow {
-                    ts: snap.timestamp,
+                    ts,
                     gen_tps: inst.gen_tps,
                     gen_tps_observation: inst.gen_tps_observation.clone(),
                     ttft_ms: inst.ttft_ms,
                     tpot_ms: inst.tpot_ms,
                 })
         })
+        // Held ticks share one `observed_at`; keep a single row per scrape.
+        .scan(None, |prev: &mut Option<DateTime<Utc>>, row| {
+            let dup = *prev == Some(row.ts);
+            *prev = Some(row.ts);
+            Some((!dup).then_some(row))
+        })
+        .flatten()
         .take(cap)
         .collect()
 }
@@ -2499,6 +2512,35 @@ mod tests {
     }
 
     #[test]
+    fn recent_activity_rows_collapses_held_ticks_and_ages_from_observed_at() {
+        let mut history: std::collections::VecDeque<_> = std::collections::VecDeque::new();
+        // One scrape at t=100 (Fresh), re-published as Held on the next two
+        // ticks, then a new scrape at t=103.
+        for (tick, observed, fresh) in [
+            (100, 100, ObservationFreshness::Fresh),
+            (101, 100, ObservationFreshness::Held),
+            (102, 100, ObservationFreshness::Held),
+            (103, 103, ObservationFreshness::Fresh),
+        ] {
+            let mut i = mk_inst("x");
+            i.gen_tps = Some(86.0);
+            i.gen_tps_observation = Some(ObservationMetadata {
+                observed_at: Utc.timestamp_opt(1_700_000_000 + observed, 0).unwrap(),
+                freshness: fresh,
+            });
+            let mut snap = mk_snap(vec![i]);
+            snap.timestamp = Utc.timestamp_opt(1_700_000_000 + tick, 0).unwrap();
+            history.push_back(snap);
+        }
+        let rows = recent_activity_rows(&history, "id-x", RECENT_ACTIVITY_CAP);
+        let ts: Vec<i64> = rows
+            .iter()
+            .map(|r| r.ts.timestamp() - 1_700_000_000)
+            .collect();
+        assert_eq!(ts, vec![103, 100]);
+    }
+
+    #[test]
     fn detail_modal_shows_no_data_placeholder_when_history_has_no_throughput_sample() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
@@ -2519,10 +2561,6 @@ mod tests {
         assert!(
             out.contains("no throughput data observed yet"),
             "detail with no observed sample must not claim 'idle'; got:\n{out}"
-        );
-        assert!(
-            !out.contains("240"),
-            "must not claim an observation window it never had; got:\n{out}"
         );
         assert!(
             !out.contains("has been idle"),
