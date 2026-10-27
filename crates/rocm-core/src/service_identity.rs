@@ -84,6 +84,16 @@ impl AsRef<str> for ServiceId {
     }
 }
 
+/// Mint a new id for a managed-service launch, as `{engine}-{model-slug}-{millis}`.
+///
+/// Always passes [`ServiceId::new`]: `sanitize_component` strips anything that
+/// validation would reject, and the model slug is capped at 24 characters so a
+/// long model reference cannot produce an unwieldy id.
+///
+/// The trailing `unix_time_millis()` makes every call mint a distinct id, which
+/// callers rely on to tell two launches of the same engine+model apart — never
+/// match on `service_id` to detect a duplicate launch; key on `(engine,
+/// canonical_model_id)` instead.
 pub fn generate_service_id(engine: &str, model_ref: &str) -> String {
     let model_slug = sanitize_component(model_ref)
         .trim_matches('-')
