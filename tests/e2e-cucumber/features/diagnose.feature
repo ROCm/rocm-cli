@@ -622,12 +622,24 @@ Feature: Diagnosing failures and listing fixes
     And that cause offers no fix to apply, and says so
     And no cause tells this user to install the HIP SDK
 
+  # On Windows an AMD display driver dated before 27 July 2023 gets advice, not a
+  # finding: the entry scores below the match threshold. The scenario names no
+  # driver. It holds `diagnose` to what `rocm examine --json` reports on the same
+  # machine, so it passes with a current driver (no advice) and with an old one
+  # (advice present). The old-driver branch needs such a machine and is not
+  # exercised here.
+  @id:diagnose-windows-display-driver-advice-follows-the-inspection @requires-os:windows @requires-gpu
+  Scenario: diagnose-41 - On Windows the diagnosis agrees with the inspection about the old display driver
+    Given a machine with an AMD GPU
+    When the user diagnoses this machine in machine-readable form, with no symptom
+    Then the diagnosis offers the old display driver advice only when the inspection reports an old driver
+
   # Expected to FAIL. `diagnose` and `fix` are two views of the same remedy: the
   # first tells the user what will put the machine right, while the second is the
   # command they are told to run. They must not leave the user with two different
   # definitions of what proves the remedy worked.
   @id:diagnose-and-fix-agree-on-how-to-verify @requires-os:linux
-  Scenario: diagnose-41 - Diagnosing a problem and previewing its fix agree on how to verify it
+  Scenario: diagnose-42 - Diagnosing a problem and previewing its fix agree on how to verify it
     Given a user who hit a device-permission failure
     When the user compares the diagnosis with the matching fix preview
     Then both give the same way to verify that the fix worked
@@ -639,17 +651,17 @@ Feature: Diagnosing failures and listing fixes
   # (the lookup failure now falls back to the conventional group), so this ships
   # as a guard rather than an expected failure.
   @id:diagnose-commands-name-a-real-group @requires-gpu @requires-bare-metal @requires-os:linux
-  Scenario: diagnose-42 - Every group named in a diagnosis is one the machine recognises
+  Scenario: diagnose-43 - Every group named in a diagnosis is one the machine recognises
     Given the GPU device belongs to a group the machine cannot name
     When the user asks the CLI to diagnose a device-permission failure
     Then every group named in the remedy exists on the machine
 
   # Expected to FAIL on a bare-metal GPU host whose device group is not the
   # hard-coded default. The diagnosis promises one command and its matching fix
-  # previews another. This is distinct from scenario diagnose-41:
+  # previews another. This is distinct from scenario diagnose-42:
   # even after the verify text agrees, the actual change must agree too.
   @id:diagnose-and-fix-agree-on-the-remedy-command @requires-gpu @requires-bare-metal @requires-os:linux
-  Scenario: diagnose-43 - Diagnosing a problem and previewing its fix agree on the remedy command
+  Scenario: diagnose-44 - Diagnosing a problem and previewing its fix agree on the remedy command
     Given the GPU device belongs to a recognised non-default group
     When the user compares the diagnosis with the matching fix preview
     Then both give the same command for applying the remedy
@@ -659,7 +671,7 @@ Feature: Diagnosing failures and listing fixes
   # not the outcome. A diagnosis should credit the observable access the user
   # has instead of recommending a permission repair for a usable device.
   @id:diagnose-credits-a-usable-device @requires-gpu @requires-bare-metal @requires-os:linux
-  Scenario: diagnose-44 - A usable GPU device is not diagnosed as a permission failure
+  Scenario: diagnose-45 - A usable GPU device is not diagnosed as a permission failure
     Given the user can already read and write the GPU device
     When the user asks the CLI to diagnose the machine
     Then adding the user to a device group is not offered as a cause

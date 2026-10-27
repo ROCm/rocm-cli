@@ -429,6 +429,21 @@ Feature: GPU detection and system inspection
     When the user inspects that machine in machine-readable form
     Then the inspection's verdict is degraded, and its only failure says the release file could not be read
 
+  # `examine` on Windows adds the AMD display driver's version, date and an age
+  # line. Windows only: the driver comes from the Windows adapter inventory, so
+  # no other platform has these lines. `@requires-gpu` so that a driver exists
+  # to be read. The scenario names no driver: it holds the readable form to the
+  # machine-readable one, and holds the verdict to the date, so it passes on a
+  # machine with an old driver and on one with a current driver, and fails only
+  # if the CLI calls a driver old that is not. Whether a driver dated before
+  # 27 July 2023 is reported as old needs such a machine and is not covered here.
+  @id:examine-windows-driver-version-date-and-age @requires-os:windows @requires-gpu
+  Scenario: examine-29 - On Windows the inspection reports the display driver and judges its age by its date
+    Given a machine with an AMD GPU
+    When the user inspects the system both for reading and for scripting
+    Then the inspection reports the display driver's version and date as the machine-readable form does
+    And the inspection calls the driver old only when its date is before 27 July 2023
+
   # The help's own worked examples are the first thing a new user copies, so a
   # model named there has to be one this CLI can actually serve. The check
   # accepts either form the README documents — a name the model listing knows,
@@ -439,7 +454,7 @@ Feature: GPU detection and system inspection
   # real catalog alias), so this ships as a guard rather than an expected
   # failure.
   @id:examine-help-serve-example-names-a-resolvable-model
-  Scenario: examine-29 - Every model the help offers as an example is one the CLI can resolve
+  Scenario: examine-30 - Every model the help offers as an example is one the CLI can resolve
     When the user reads the serve examples the help offers
     Then every model named there is one the CLI can resolve
 
@@ -451,6 +466,6 @@ Feature: GPU detection and system inspection
   # Since fixed on main (the same EAI-8011 change now describes bare `rocm` as
   # the launcher), so this ships as a guard rather than an expected failure.
   @id:examine-help-describes-the-default-command
-  Scenario: examine-30 - The help tells the two ways of opening a screen apart
+  Scenario: examine-31 - The help tells the two ways of opening a screen apart
     When the user asks for help
     Then running the CLI with no subcommand is not described as the dashboard command
