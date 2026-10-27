@@ -872,28 +872,18 @@ The following component(s) are licensed under Apache License 2.0:
   - windows-strings 0.5.1 <https://github.com/microsoft/windows-rs>
   - windows-sys 0.52.0 <https://github.com/microsoft/windows-rs>
   - windows-sys 0.59.0 <https://github.com/microsoft/windows-rs>
-  - windows-sys 0.60.2 <https://github.com/microsoft/windows-rs>
   - windows-sys 0.61.2 <https://github.com/microsoft/windows-rs>
   - windows-targets 0.52.6 <https://github.com/microsoft/windows-rs>
-  - windows-targets 0.53.5 <https://github.com/microsoft/windows-rs>
   - windows-threading 0.2.1 <https://github.com/microsoft/windows-rs>
   - windows 0.62.2 <https://github.com/microsoft/windows-rs>
   - windows_aarch64_gnullvm 0.52.6 <https://github.com/microsoft/windows-rs>
-  - windows_aarch64_gnullvm 0.53.1 <https://github.com/microsoft/windows-rs>
   - windows_aarch64_msvc 0.52.6 <https://github.com/microsoft/windows-rs>
-  - windows_aarch64_msvc 0.53.1 <https://github.com/microsoft/windows-rs>
   - windows_i686_gnu 0.52.6 <https://github.com/microsoft/windows-rs>
-  - windows_i686_gnu 0.53.1 <https://github.com/microsoft/windows-rs>
   - windows_i686_gnullvm 0.52.6 <https://github.com/microsoft/windows-rs>
-  - windows_i686_gnullvm 0.53.1 <https://github.com/microsoft/windows-rs>
   - windows_i686_msvc 0.52.6 <https://github.com/microsoft/windows-rs>
-  - windows_i686_msvc 0.53.1 <https://github.com/microsoft/windows-rs>
   - windows_x86_64_gnu 0.52.6 <https://github.com/microsoft/windows-rs>
-  - windows_x86_64_gnu 0.53.1 <https://github.com/microsoft/windows-rs>
   - windows_x86_64_gnullvm 0.52.6 <https://github.com/microsoft/windows-rs>
-  - windows_x86_64_gnullvm 0.53.1 <https://github.com/microsoft/windows-rs>
   - windows_x86_64_msvc 0.52.6 <https://github.com/microsoft/windows-rs>
-  - windows_x86_64_msvc 0.53.1 <https://github.com/microsoft/windows-rs>
 
                                  Apache License
                            Version 2.0, January 2004
@@ -7363,7 +7353,6 @@ Apache License 2.0
 The following component(s) are licensed under Apache License 2.0:
   - getrandom 0.2.17 <https://github.com/rust-random/getrandom>
   - getrandom 0.3.4 <https://github.com/rust-random/getrandom>
-  - getrandom 0.4.3 <https://github.com/rust-random/getrandom>
   - rand_chacha 0.3.1 <https://github.com/rust-random/rand>
 
                               Apache License
@@ -8397,7 +8386,6 @@ The following component(s) are licensed under Apache License 2.0:
   - proc-macro2 1.0.106 <https://github.com/dtolnay/proc-macro2>
   - quote 1.0.46 <https://github.com/dtolnay/quote>
   - r-efi 5.3.0 <https://github.com/r-efi/r-efi>
-  - r-efi 6.0.0 <https://github.com/r-efi/r-efi>
   - rand 0.8.7 <https://github.com/rust-random/rand>
   - rand 0.9.4 <https://github.com/rust-random/rand>
   - rand_chacha 0.9.0 <https://github.com/rust-random/rand>
