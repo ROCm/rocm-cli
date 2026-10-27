@@ -4163,7 +4163,7 @@ fn managed_service_record_is_in_use(record: &ManagedServiceRecord) -> bool {
     managed_service_is_live(record)
         || recorded_service_pids(record)
             .iter()
-            .any(|pid| process_is_running(*pid))
+            .any(|id| process_is_running(id.pid))
 }
 
 /// Remove one non-running local server record and everything it owns.
@@ -8209,16 +8209,38 @@ fn existing_live_managed_service(
 
 const SERVICE_LIVENESS_CHECK_TIMEOUT: Duration = Duration::from_millis(750);
 
-/// The real process ids a record tracks.
+/// The real processes a record tracks, each paired with its own start-ticks.
 ///
 /// The launcher pid is always recorded; `engine_pid` is adopted once the engine
 /// state file reports one. A `0` pid is a placeholder, never a real process.
-fn recorded_service_pids(record: &ManagedServiceRecord) -> Vec<u32> {
-    [record.engine_pid, Some(record.supervisor_pid)]
-        .into_iter()
-        .flatten()
-        .filter(|pid| *pid != 0)
-        .collect()
+/// When both name the same pid, the entry keeps whichever start-ticks is known,
+/// so an unknown engine token cannot mask a recycled supervisor pid.
+fn recorded_service_pids(record: &ManagedServiceRecord) -> Vec<rocm_core::ProcessIdentity> {
+    let mut identities: Vec<rocm_core::ProcessIdentity> = Vec::new();
+    for (pid, ticks) in [
+        (record.engine_pid, record.engine_start_ticks),
+        (Some(record.supervisor_pid), record.supervisor_start_ticks),
+    ] {
+        let Some(pid) = pid.filter(|pid| *pid != 0) else {
+            continue;
+        };
+        match identities.iter_mut().find(|id| id.pid == pid) {
+            Some(existing) => existing.start_ticks = existing.start_ticks.or(ticks),
+            None => identities.push(rocm_core::ProcessIdentity::new(pid, ticks)),
+        }
+    }
+    identities
+}
+
+/// Whether a recorded process may still be the one the record started. A pid
+/// now held by a different process (recycled, e.g. after a reboot) is dead;
+/// an unverifiable one is conservatively alive. Legacy records without
+/// start-ticks fall back to plain pid liveness.
+fn recorded_service_process_is_alive(identity: &rocm_core::ProcessIdentity) -> bool {
+    matches!(
+        rocm_core::identity_state(identity),
+        rocm_core::IdentityState::Matches | rocm_core::IdentityState::Indeterminate
+    )
 }
 
 /// Complete a stop that was requested but could not confirm termination, once
@@ -8243,7 +8265,7 @@ fn settle_pending_stop_key_cleanup(paths: &AppPaths, record: &mut ManagedService
     }
     if recorded_service_pids(record)
         .iter()
-        .any(|pid| process_is_running(*pid))
+        .any(recorded_service_process_is_alive)
     {
         return false;
     }
@@ -8302,7 +8324,7 @@ fn refresh_managed_service_runtime_liveness(
 
     let tracked_pids = recorded_service_pids(record);
     let has_tracked_pid = !tracked_pids.is_empty();
-    let has_live_pid = tracked_pids.iter().any(|pid| process_is_running(*pid));
+    let has_live_pid = tracked_pids.iter().any(recorded_service_process_is_alive);
     if has_tracked_pid && !has_live_pid {
         // Reconcile the status only. The endpoint key is *not* dropped here:
         // dead pids alone do not distinguish a stopped service from a crashed
@@ -18840,6 +18862,88 @@ pub(crate) mod tests {
         record.supervisor_pid = pid;
         record.supervisor_start_ticks = start_ticks;
         record
+    }
+
+    /// Run the liveness refresh on a `starting` record whose supervisor and
+    /// engine pid are both a live `sleep` child, recorded with `ticks(real)`.
+    #[cfg(target_os = "linux")]
+    fn refresh_starting_record_for_live_child(
+        name: &str,
+        ticks: impl Fn(u64) -> Option<u64>,
+    ) -> (ManagedServiceRecord, bool) {
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn child");
+        let pid = child.id();
+        let (root, paths) = test_paths(name);
+        let real = rocm_core::process_start_ticks(pid).expect("start-ticks");
+        let mut record = managed_record_for_pid(&paths, pid, ticks(real));
+        record.engine_start_ticks = ticks(real);
+        record.status = "starting".to_owned();
+
+        let changed = refresh_managed_service_runtime_liveness(&paths, &mut record);
+
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = fs::remove_dir_all(root);
+        (record, changed)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn liveness_refresh_demotes_record_whose_pid_was_recycled() {
+        // The recorded pid is alive but is a different process (e.g. after a
+        // reboot): the recorded service is dead and must not stay "starting".
+        let (record, changed) =
+            refresh_starting_record_for_live_child("liveness-recycled", |real| {
+                Some(real.wrapping_add(1))
+            });
+        assert_eq!(record.status, "stopped");
+        assert!(changed);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn liveness_refresh_keeps_record_whose_pid_identity_matches_not_recycled() {
+        let (record, changed) =
+            refresh_starting_record_for_live_child("liveness-not-recycled", Some);
+        assert_eq!(record.status, "starting");
+        assert!(!changed);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn liveness_refresh_keeps_legacy_record_without_start_ticks_not_recycled() {
+        let (record, changed) =
+            refresh_starting_record_for_live_child("liveness-legacy-not-recycled", |_| None);
+        assert_eq!(record.status, "starting");
+        assert!(!changed);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn liveness_refresh_demotes_recycled_supervisor_when_engine_ticks_unknown() {
+        // Before the engine state is adopted, engine_pid can equal the
+        // supervisor pid with no engine token; the supervisor's own token must
+        // still decide, so a recycled pid is not kept live by the unknown one.
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn child");
+        let pid = child.id();
+        let (root, paths) = test_paths("liveness-recycled-engine-unknown");
+        let real = rocm_core::process_start_ticks(pid).expect("start-ticks");
+        let mut record = managed_record_for_pid(&paths, pid, Some(real.wrapping_add(1)));
+        record.status = "starting".to_owned();
+
+        let changed = refresh_managed_service_runtime_liveness(&paths, &mut record);
+
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = fs::remove_dir_all(root);
+        assert_eq!(record.status, "stopped");
+        assert!(changed);
     }
 
     #[cfg(unix)]
