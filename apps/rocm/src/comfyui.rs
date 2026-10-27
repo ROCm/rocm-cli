@@ -2274,10 +2274,8 @@ fn create_temp_dir_under(root: &Path, label: &str) -> Result<PathBuf> {
 
 /// Quotes `value` for log text only, using Rust's own `{value:?}`
 /// Debug-format escaping; the real args passed to `Command::args` alongside
-/// this are unquoted. Deliberately kept separate from `rocm_core::quoting`'s
-/// shell/PowerShell quoting (ROCMAI-727): see that module's doc comment for
-/// why display/log/prompt-text helpers with no execution stakes are not
-/// merged with the ones that do.
+/// this are unquoted. Deliberately kept separate from `rocm_core::quoting`
+/// (ROCMAI-727); see that module's doc comment for why.
 fn quote_log_arg(value: &str) -> String {
     if value
         .chars()

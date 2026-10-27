@@ -6,7 +6,7 @@
 //! embedded into a command string that a shell or interpreter actually runs,
 //! not text a human only reads.
 //!
-//! [`posix_shell_quote`] and [`powershell_quote`]/[`ps_single_quote_escape`]
+//! [`posix_shell_quote`] and [`powershell_quote`]/`ps_single_quote_escape`
 //! are two different escaping domains -- POSIX `sh`/`bash` single-quoting and
 //! PowerShell single-quoting do not share a convention -- that happen to live
 //! in the same module because both have the same kind of stakes:
@@ -15,7 +15,7 @@
 //! `powershell_quote`'s output is written into a `.ps1` script executed via
 //! `powershell.exe -File` (`apps/rocm/src/comfyui.rs`'s Windows runtime
 //! launch) or interpolated into a `-Command` string
-//! ([`crate::fix::path_export_windows`], [`crate::diagnose`]'s matching
+//! (`crate::fix::path_export_windows`, `crate::diagnose`'s matching
 //! printed copy). A mistake in either one is a real command-injection or
 //! script-corruption bug, which is why both carry direct unit coverage here
 //! (ROCMAI-727 consolidated them out of per-call-site near-duplicates).
@@ -45,7 +45,7 @@
 ///
 /// This matters for any value of filesystem/environment origin embedded into
 /// a generated PowerShell command -- for example
-/// [`crate::fix::path_export_windows`]'s write script, built from the real
+/// `crate::fix::path_export_windows`'s write script, built from the real
 /// existing User PATH read back from the host, and `crate::diagnose`'s
 /// matching printed copy of that same command. A path containing an
 /// apostrophe (`C:\Users\O'Brien\bin` is an ordinary Windows path, not a
@@ -62,11 +62,11 @@ pub(crate) fn ps_single_quote_escape(value: &str) -> String {
 
 /// Quote `value` as a single PowerShell argument: wraps it in a
 /// single-quoted string literal (`'...'`), escaping any embedded `'` first
-/// via [`ps_single_quote_escape`].
+/// via `ps_single_quote_escape`.
 ///
 /// Used wherever a value is written into a generated `.ps1` script or
 /// `-Command` string as one argument, rather than spliced into an
-/// already-open literal (that case calls [`ps_single_quote_escape`]
+/// already-open literal (that case calls `ps_single_quote_escape`
 /// directly).
 pub fn powershell_quote(value: &str) -> String {
     format!("'{}'", ps_single_quote_escape(value))

@@ -2394,10 +2394,8 @@ fn wheel_composition_device_target(composition: Option<&WheelRuntimeComposition>
 }
 
 /// Quotes `value` for the dry-run preview line only -- it is never fed to a
-/// real subprocess. Deliberately kept separate from `rocm_core::quoting`'s
-/// shell/PowerShell quoting (ROCMAI-727): see that module's doc comment for
-/// why display/log/prompt-text helpers with no execution stakes are not
-/// merged with the ones that do.
+/// real subprocess. Deliberately kept separate from `rocm_core::quoting`
+/// (ROCMAI-727); see that module's doc comment for why.
 fn quote_display_arg(value: &str) -> String {
     if value.is_empty()
         || value
