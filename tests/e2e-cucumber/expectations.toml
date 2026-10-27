@@ -182,7 +182,7 @@ bug = "EAI-7998"
 reason = "`examine --json` reports has_amd_gpu:false on a WSL2 host whose own summary names a gfx target."
 
 # -- README-walkthrough defects (EAI-8047, EAI-8049) --
-# Defects found walking the CLI on an MI300X app-dev pod, each pinned by a
+# Defects found walking the CLI on an MI300X host, each pinned by a
 # scenario asserting the CORRECT behaviour. Both are in code paths with no
 # hardware, engine or network dependency, and both were re-confirmed in a plain
 # Linux container — so each row is scoped `when = {}` and is expected to go stale
@@ -205,9 +205,8 @@ reason = "`automations list` publishes no usable identifier, so the checks it li
 # resolved env_path. Users reach it through the auto-install branch of
 # `resolve_engine_env`, which uses the install response's env_path live, and the
 # vLLM install reports that as the directory CONTAINING the command
-# (`command.parent()`, engines/vllm/src/install.rs) while Lemonade reports the
-# root. The hint therefore doubles the segment and points at a file nobody can
-# source. Container-measured: with a bin-shaped env_path the hint named
+# (`command.parent()`, engines/vllm/src/install.rs). The hint therefore doubles
+# the segment and points at a file nobody can source. Container-measured: with a bin-shaped env_path the hint named
 # `<env>/bin/bin/activate` (absent) while a root-shaped one named
 # `<env>/bin/activate` (present).
 #

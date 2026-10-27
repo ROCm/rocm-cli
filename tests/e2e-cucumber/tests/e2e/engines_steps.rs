@@ -37,8 +37,8 @@ fn planted_env_path(world: &E2eWorld) -> PathBuf {
 ///
 /// `recorded_env_path` is the env_path the shell is handed, which is NOT always
 /// the environment root: the vLLM install RESPONSE reports the directory holding
-/// the engine command (`command.parent()` in `engines/vllm/src/install.rs`),
-/// while Lemonade reports the root. No install writes this manifest to disk; it
+/// the engine command (`command.parent()` in `engines/vllm/src/install.rs`).
+/// No install writes this manifest to disk; it
 /// stands in for that response so the shell is reachable without an install.
 /// Callers choose the shape they need.
 fn plant_engine_env_recorded_as(world: &E2eWorld, recorded_env_path: &std::path::Path) {
@@ -140,22 +140,32 @@ async fn assert_prompt_marked(world: &mut E2eWorld) {
         .unwrap_or_else(|e| panic!("the marker never reached a prompt line: {e}"));
 }
 
+/// What the planted interpreter prints when it is run (see
+/// `plant_engine_env_recorded_as`). The shell banner never prints it, so seeing it
+/// on screen proves the interpreter actually executed.
+const PLANTED_INTERPRETER_OUTPUT: &str = "planted-engine-python";
+
 #[then("the engine environment's interpreter is the one that runs")]
 async fn assert_engine_interpreter(world: &mut E2eWorld) {
-    // Guards against the prompt shim breaking the activation it decorates: the
-    // shim re-runs the user's startup files, which could otherwise reorder PATH.
-    let expected = planted_env_path(world).join("bin").join("python");
+    // Guards against the prompt shim breaking the activation it decorates, and
+    // against a wrong PATH/VIRTUAL_ENV: the shim re-runs the user's startup files,
+    // which could otherwise reorder PATH.
+    //
+    // This RUNS `python` and waits for the planted interpreter's own output. Do not
+    // wait for the interpreter's path instead: `engine_shell` prints
+    // `python: <path>` in its banner before bash starts, so a path wait is
+    // satisfied by the banner whatever `command -v` would say.
     let session = world.tui.as_mut().expect("no engine shell session");
     session
-        .send("command -v python\n")
-        .unwrap_or_else(|e| panic!("failed to query the interpreter: {e}"));
+        .send("python\n")
+        .unwrap_or_else(|e| panic!("failed to run the interpreter: {e}"));
     session
-        .wait_for_screen(&expected.display().to_string(), SCREEN_TIMEOUT)
+        .wait_for_screen(PLANTED_INTERPRETER_OUTPUT, SCREEN_TIMEOUT)
         .await
         .unwrap_or_else(|e| {
             panic!(
-                "the engine env interpreter did not win on PATH (wanted {}): {e}",
-                expected.display()
+                "running `python` in the engine shell did not run the engine env's interpreter \
+                 (wanted it to print {PLANTED_INTERPRETER_OUTPUT:?}): {e}"
             )
         });
 }
