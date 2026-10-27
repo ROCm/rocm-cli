@@ -7309,8 +7309,8 @@ fn restart_internal_managed_service_inner(
         })
     {
         bail!(
-            "cannot restart `{service_id}` on {}:{}: {} claimed that port while the restart \
-             was waiting for the launch lock",
+            "cannot restart `{service_id}` on {}:{}: managed service {} is recorded on that \
+             port (it may have claimed that port while the restart waited for the launch lock)",
             stopped_record.host,
             stopped_record.port,
             collision.service_id

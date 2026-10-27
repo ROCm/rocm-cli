@@ -127,9 +127,9 @@ pub(crate) fn resolve_endpoint_auth(
     }
 }
 
-/// When an equivalent managed service is already running, the endpoint key
-/// serve() freshly stored for this attempt is unused — drop it so it is not
-/// orphaned in storage. The already-running service keeps its own key.
+/// When an equivalent managed service is already running, or the launch fails
+/// before any record exists, the endpoint key serve() freshly stored for this
+/// attempt is unused — drop it so it is not orphaned in storage. The already-running service keeps its own key.
 /// Best-effort and idempotent; a loopback attempt (`freshly_stored == None`)
 /// is a no-op.
 pub(crate) fn drop_orphaned_endpoint_key_on_already_running(
@@ -399,9 +399,10 @@ const MANAGED_LAUNCH_CLEANUP_GRACE: Duration = Duration::from_secs(2);
 /// Undo a failed managed launch attempt before the launch lock is released,
 /// so no failed transaction leaves a live reservation or a stray endpoint key.
 ///
-/// Order matters: a spawned child is terminated and confirmed dead *first*, so
-/// nothing is still holding the port or writing to the log by the time cleanup
-/// runs. If no child was ever spawned (`record.engine_pid` is still `None`),
+/// Order matters: a spawned child is terminated *first*, so it is not still
+/// holding the port or writing to the log by the time cleanup runs. The
+/// termination outcome is audited but not acted on: the record is marked
+/// `failed` (releasing the port) even when death was not confirmed. If no child was ever spawned (`record.engine_pid` is still `None`),
 /// every artifact this attempt created is removed: there is nothing for
 /// `rocm services`/`rocm logs` to show. If a child did run, its record and log
 /// are kept instead (marked `status = "failed"`), since the error that led here
@@ -507,6 +508,19 @@ fn spawn_managed_engine_child(
                     "managed service `{}` is already running for engine `{engine}` and model `{}` with different serve options (recipe hint, tool-call parser, or generation defaults); stop it and run `rocm serve` again to apply the requested options",
                     existing.service_id,
                     resolve.canonical_model_id
+                );
+            }
+            // An explicit port is a demand, not a hint: reporting success on a
+            // different port than the one asked for would silently drop it.
+            if let Some(port) = port_request.explicit()
+                && port != existing.port
+            {
+                bail!(
+                    "managed service `{}` is already serving engine `{engine}` and model `{}` on port {}, so port {port} would not be used; stop it with `{}` and run the command again to serve on that port",
+                    existing.service_id,
+                    resolve.canonical_model_id,
+                    existing.port,
+                    service_hints::service_stop_hint(&existing.service_id)
                 );
             }
             // Reuse cannot satisfy a demand for auth the running server never got.
@@ -805,6 +819,10 @@ fn launch_managed_engine_child_locked(
     Ok(child_pid)
 }
 
+/// Launch a managed service in the background: run the locked allocation and
+/// spawn transaction, release the launch lock once the record is published,
+/// then wait for HTTP readiness.
+///
 /// Drops the endpoint key `serve()` freshly staged for this attempt if the
 /// launch fails before any `ManagedServiceRecord` exists to own it (port
 /// reserved/in use, range exhausted, other bind error) — such a failure
@@ -1177,7 +1195,7 @@ pub(crate) fn run_attached_service(
         resolve.engine_recipe.as_ref(),
         require_api_key,
     )
-    // Mirrors the background path's cleanup in `serve_cmd.rs`: a pre-spawn
+    // Mirrors `run_attached_service`'s cleanup: a pre-spawn
     // failure (port reserved/in use, range exhausted, other bind error) returns
     // before any service record exists, so nothing else clears the key just
     // stored for this attempt.
@@ -1475,6 +1493,81 @@ mod tests {
         // Other control combos are not detach/stop triggers.
         assert_eq!(detach_key_outcome(true, 'q'), None);
         assert_eq!(detach_key_outcome(true, 'z'), None);
+    }
+
+    #[test]
+    fn spawn_managed_engine_child_refuses_an_explicit_port_a_live_equivalent_does_not_serve()
+    -> Result<()> {
+        let (root, paths) = test_paths("dup-managed-explicit-port-differs");
+        paths.ensure()?;
+        let mut existing = ManagedServiceRecord::new(
+            &paths,
+            "lemonade-qwen-1000",
+            "lemonade",
+            "qwen",
+            "qwen-canonical",
+            "127.0.0.1",
+            11510,
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            None,
+        );
+        existing.status = "ready".to_owned();
+        existing.engine_pid = Some(std::process::id());
+        existing.write()?;
+
+        let resolve = ResolveModelResponse {
+            canonical_model_id: "qwen-canonical".to_owned(),
+            task: "chat".to_owned(),
+            source: "hf".to_owned(),
+            revision: "main".to_owned(),
+            loader: "llama.cpp".to_owned(),
+            trust_remote_code: false,
+            chat_template_mode: "auto".to_owned(),
+            dtype: "auto".to_owned(),
+            device_policy: DevicePolicy::GpuPreferred,
+            estimated_memory: "unknown".to_owned(),
+            launch_defaults: serde_json::json!({}),
+            engine_recipe: None,
+            warnings: Vec::new(),
+        };
+        let launch = |port_request| {
+            spawn_managed_engine_child(
+                &paths,
+                "lemonade",
+                "lemonade-qwen-2000",
+                "qwen",
+                &resolve,
+                "127.0.0.1",
+                port_request,
+                &resolve.device_policy,
+                &[],
+                None,
+                None,
+                None,
+                false,
+            )
+        };
+
+        let different = launch(serve_port::PortRequest::Explicit(11511));
+        // The same port, and no port at all, still reuse the live service.
+        let same = launch(serve_port::PortRequest::Explicit(11510));
+        let auto = launch(serve_port::PortRequest::Auto);
+        let _ = fs::remove_dir_all(root);
+
+        let Err(error) = different else {
+            panic!("a port the live service does not serve must be refused")
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("on port 11510") && message.contains("port 11511 would not be used"),
+            "{message}"
+        );
+        assert!(matches!(same?, ManagedSpawn::AlreadyRunning(_)));
+        assert!(matches!(auto?, ManagedSpawn::AlreadyRunning(_)));
+        Ok(())
     }
 
     #[test]
@@ -1897,8 +1990,8 @@ mod tests {
         // ManagedServiceRecord exists for this attempt, so
         // abandon_failed_managed_launch never runs. Driving the real function
         // end to end (not a simulated call to
-        // drop_orphaned_endpoint_key_on_already_running) proves serve_cmd.rs's
-        // own call site actually wires the cleanup, mirroring how
+        // drop_orphaned_endpoint_key_on_already_running) proves
+        // `start_managed_service`'s own `.inspect_err` actually wires the cleanup, mirroring how
         // attached_launch_failing_before_spawn_leaves_no_orphaned_endpoint_key
         // drives run_attached_service for the foreground path.
         let (root, paths) = test_paths("orphaned-key-on-reserved-port");
@@ -1981,7 +2074,7 @@ mod tests {
 
     #[test]
     fn attached_launch_failing_before_spawn_leaves_no_orphaned_endpoint_key() -> Result<()> {
-        // The background path's cleanup lives in serve_cmd.rs, wrapping
+        // The background path's cleanup is the `.inspect_err` in
         // start_managed_service. run_attached_service is the other caller of
         // spawn_managed_engine_child and needs the identical .inspect_err()
         // cleanup, not a simulated one: drive the real function end to end.

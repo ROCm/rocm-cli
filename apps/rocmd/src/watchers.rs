@@ -1385,6 +1385,15 @@ pub(crate) fn find_recoverable_service(
         if record.mode != "managed" || stop_requested(&record) {
             continue;
         }
+        // A candidate still inside its restart backoff would only be skipped by
+        // the caller; returning it here would starve every service after it
+        // while a refused recovery (e.g. its port was taken) keeps re-stamping.
+        if record
+            .last_restart_unix_ms
+            .is_some_and(|last| now.saturating_sub(last) < SERVER_RECOVER_BACKOFF_MS)
+        {
+            continue;
+        }
         if let Some(reason) = manifest_service_recovery_reason(&record, now) {
             return Ok(Some((record, reason)));
         }

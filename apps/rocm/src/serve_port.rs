@@ -327,6 +327,24 @@ mod tests {
         }
     }
 
+    /// Dash accepts exactly the hosts the CLI treats as non-public, so a form
+    /// Dash approves is never refused by the CLI for lacking
+    /// `--allow-public-bind`.
+    #[test]
+    fn dash_loopback_hosts_match_the_clis_non_public_hosts() {
+        use rocm_dash_tui::ui::serve_wizard::{LOOPBACK_HOSTS, is_loopback_host};
+        for host in LOOPBACK_HOSTS {
+            assert!(!rocm_engine_protocol::is_public_bind_host(host), "{host}");
+        }
+        for host in ["LOCALHOST", "[::1]", "127.0.0.2", "0.0.0.0", "::"] {
+            assert_eq!(
+                is_loopback_host(host),
+                !rocm_engine_protocol::is_public_bind_host(host),
+                "{host}"
+            );
+        }
+    }
+
     #[test]
     fn explicit_loopback_port_outside_the_auto_range_is_retained() {
         let mut probe = scripted(vec![]);
