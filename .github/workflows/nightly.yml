@@ -10,6 +10,13 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # REQUIRED, not dormant: every readiness step below runs --require-signatures,
+  # which now means signatures must actually verify, so this is the public key
+  # the nightly is verified against. Removing or blanking the secret fails every
+  # nightly run — GitHub expands an unset secret to the empty string, which the
+  # gate treats as "no key" and rejects. It is the public half only; the private
+  # signing key stays step-scoped.
+  ROCM_CLI_SIGNING_PUBLIC_KEY_PEM: ${{ secrets.ROCM_CLI_SIGNING_PUBLIC_KEY_PEM }}
   # Production trust gate — dormant until the owner sets the repository variable
   # ROCM_CLI_REQUIRE_PRODUCTION_TRUST (e.g. "1") and provides the trust inputs
   # below. While the variable is unset/falsy, release_readiness.py skips
@@ -18,7 +25,6 @@ env:
   # enabling the gate, the recipe-index inputs also require a step that
   # materializes the hosted index + its .sig into the workspace.
   ROCM_CLI_REQUIRE_PRODUCTION_TRUST: ${{ vars.ROCM_CLI_REQUIRE_PRODUCTION_TRUST }}
-  ROCM_CLI_SIGNING_PUBLIC_KEY_PEM: ${{ secrets.ROCM_CLI_SIGNING_PUBLIC_KEY_PEM }}
   ROCM_CLI_METADATA_PUBLIC_KEY_PEM: ${{ secrets.ROCM_CLI_METADATA_PUBLIC_KEY_PEM }}
   ROCM_CLI_MODEL_RECIPE_INDEX_PATH: ${{ vars.ROCM_CLI_MODEL_RECIPE_INDEX_PATH }}
   ROCM_CLI_MODEL_RECIPE_INDEX_PUBLIC_KEY_PATH: ${{ vars.ROCM_CLI_MODEL_RECIPE_INDEX_PUBLIC_KEY_PATH }}
@@ -32,6 +38,11 @@ jobs:
       date: ${{ steps.meta.outputs.date }}
       short_sha: ${{ steps.meta.outputs.short_sha }}
       staging_tag: ${{ steps.staging.outputs.tag }}
+      # The branch this run resolved to (always "main" in practice: schedule
+      # and an un-overridden workflow_dispatch both default to the repo's
+      # default branch). Exposed so windows-nightly's build can forward the
+      # same ROCM_CLI_RELEASE_REF this job forwards into its own docker build.
+      ref: ${{ github.ref_name }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -95,10 +106,16 @@ jobs:
 
           # Build as the runner user so cached Cargo/rustup files are owned by
           # the runner (the host-side cache save step must be able to read them).
+          #
+          # ROCM_CLI_RELEASE_REF is forwarded explicitly: see release.yml's
+          # Linux build step for why (this container sees none of GitHub's own
+          # GITHUB_REF_* env, which apps/rocm/build.rs would otherwise fall
+          # back to).
           docker run --rm \
             -u "$(id -u):$(id -g)" \
             -e CARGO_HOME=/host-cargo \
             -e RUSTUP_HOME=/host-cargo/rustup \
+            -e ROCM_CLI_RELEASE_REF="${{ github.ref_name }}" \
             -v "$HOME/.cargo":/host-cargo \
             -v "$PWD":/work \
             -w /work \
@@ -205,6 +222,13 @@ jobs:
 
       - name: Build release binaries
         shell: pwsh
+        # See the Linux job's "Build release binaries" step: the release ref
+        # must come from the resolved `nightly` job output, not ambient
+        # GITHUB_REF_* context or local git state (a workflow_dispatch nightly
+        # checks out a detached HEAD, so `git rev-parse --abbrev-ref HEAD`
+        # can't recover the branch name either).
+        env:
+          ROCM_CLI_RELEASE_REF: ${{ needs.nightly.outputs.ref }}
         run: cargo build --release -p rocm -p rocmd -p xtask
 
       - name: Package Windows bundle
@@ -332,15 +356,21 @@ jobs:
         run: gh release delete "${{ needs.nightly.outputs.staging_tag }}" --yes --cleanup-tag 2>/dev/null || true
 
   # Full E2E on app-dev MI300X INCLUDING the expensive `@nightly` scenarios (the
-  # large-model serve), which the per-PR ci.yml `e2e-gpu` job skips to stay fast.
+  # large-model serve), which the per-PR e2e-selfhosted.yml `e2e-gpu` job skips
+  # to stay fast.
   # Runs unconditionally on the schedule/dispatch (independent of the nightly
   # BUILD skip above — a regression run is worth doing even with no new commits).
-  # Non-blocking, mirrors ci.yml's e2e-gpu job but sets E2E_INCLUDE_NIGHTLY.
+  # Non-blocking, mirrors e2e-selfhosted.yml's e2e-gpu job but sets E2E_INCLUDE_NIGHTLY.
   e2e-gpu-nightly:
-    name: E2E tests (GPU, incl. nightly-only)
+    name: E2E tests (MI300X, incl. nightly-only)
     timeout-minutes: 90
-    runs-on: [self-hosted, linux, amd-gpu]
+    # `mi300x`, not `amd-gpu` — see the same pin on e2e-selfhosted.yml's e2e-gpu.
+    runs-on: [self-hosted, linux, mi300x]
     continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        channel: [release, nightly]
     env:
       # Include @nightly scenarios (the large-model serve). See src/expectation.rs.
       E2E_INCLUDE_NIGHTLY: "1"
@@ -350,18 +380,29 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # Reclaim the GPU before running: kill only e2e leftovers scoped to
-      # /tmp/rocm-e2e-* and the e2e-target/e2e-shared trees — never the runner or
-      # any /workload manual-testing processes (see ci.yml e2e-gpu for the same).
+      # Reclaim the GPU before running: a serve leaked by a killed or
+      # timed-out prior run (its Drop teardown never executed) keeps an engine
+      # process on the card and starves this job's serves. Scoped to E2E-owned
+      # trees: a manual /workload serve is matched only if its command line
+      # also names an E2E root — see the exposure documented in
+      # scripts/reclaim-gpu.sh.
       - name: Reclaim GPU from stray E2E processes
+        run: bash scripts/reclaim-gpu.sh
+
+      # GPU preflight: fail fast (~90s) instead of hanging to the job cap when the
+      # GPU is missing, the driver is wedged, or the card is still held by a
+      # leftover serve. Two gates — a bounded poll on free memory, then an
+      # assertion that no leaked E2E engine process survives — because neither
+      # sees what the other does. A serve here needs most of the card, so the
+      # floor is generous; but against a 192 GiB MI300X a 16 GiB floor only trips
+      # past ~176 GiB held, which is why the process gate exists (#446). The
+      # floor stays for the case the process gate cannot see: a non-E2E tenant
+      # exhausting a shared host. See .github/scripts/gpu-preflight.sh.
+      - name: GPU preflight (bounded wait for an available GPU)
+        env:
+          GPU_PREFLIGHT_MIN_FREE_GIB: 16
         run: |
-          pkill -f '/tmp/rocm-e2e.*llama-server' 2>/dev/null || true
-          pkill -f '/tmp/rocm-e2e.*vllm serve' 2>/dev/null || true
-          pkill -f 'e2e-shared.*llama-server' 2>/dev/null || true
-          pkill -f '__engine-serve-http.*rocm-e2e' 2>/dev/null || true
-          pkill -f 'e2e-target/release/rocm daemon' 2>/dev/null || true
-          rm -rf /tmp/rocm-e2e-* 2>/dev/null || true
-          echo "reclaimed"
+          bash .github/scripts/gpu-preflight.sh
 
       # cache: false — this self-hosted runner persists the build cache itself via
       # CARGO_TARGET_DIR (below), so the action's rust-cache is pure overhead.
@@ -373,61 +414,310 @@ jobs:
         run: |
           export CARGO_TARGET_DIR="$RUNNER_WORKSPACE/e2e-target"
           export E2E_SHARED_CACHE_DIR="$RUNNER_WORKSPACE/e2e-shared"
-          # Share uv's wheel cache off the near-full PVC, on the roomy `/` overlay
-          # (see ci.yml e2e-gpu): warm `rocm install sdk` ~34s vs cold ~160s.
-          export E2E_SHARED_UV_CACHE_DIR="/var/tmp/rocm-e2e-uv-cache"
+          # Share uv's wheel cache on the same mount as the runtimes it populates,
+          # so uv hardlinks into them instead of copying (see e2e-selfhosted.yml
+          # e2e-gpu): warm `rocm install sdk` ~34s vs cold ~160s. It must also be
+          # the directory the runner's uv-cache-gc initContainer bounds, or the
+          # cache grows without a floor on the volume holding `.runner`.
+          runner_root="$(dirname "$(dirname "$RUNNER_WORKSPACE")")"
+          export E2E_SHARED_UV_CACHE_DIR="$runner_root/uv-cache"
           # Share ONE installed managed runtime across serve/chat scenarios so
-          # install sdk runs once per runner, not per scenario (see ci.yml e2e-gpu).
+          # install sdk runs once per runner, not per scenario (see e2e-selfhosted.yml e2e-gpu).
           # The shared dir IS the pre-warm's own data/runtimes; NEVER move it — a
           # post-install mv invalidates the absolute paths install sdk bakes into
           # the runtime manifest and every serve fails instantly (run 29320025393).
-          prewarm="$RUNNER_WORKSPACE/e2e-prewarm"
+          prewarm="$RUNNER_WORKSPACE/e2e-prewarm-multi-arch-v2"
           export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
 
           # Build both binaries once; reuse them for pre-warm + suite.
-          cargo build --release -p rocm -p rocmd
+          # See the e2e-gpu lane in e2e-selfhosted.yml for why the
+          # e2e-test-hooks feature must match what `cargo xtask e2e` would build.
+          cargo build --release -p rocm -p rocmd --features rocm/e2e-test-hooks
           export ROCM_CLI_BINARY="$CARGO_TARGET_DIR/release/rocm"
           export ROCM_CLI_ROCMD_BINARY="$CARGO_TARGET_DIR/release/rocmd"
 
-          # Pre-warm the shared runtime once/serially before the suite; skipped
-          # once populated (persists across runs). Install in place (no mv) so the
-          # manifest's absolute paths stay valid. See ci.yml e2e-gpu for rationale.
-          if [ ! -d "$E2E_SHARED_RUNTIMES_DIR/registry" ]; then
-            echo "pre-warming shared runtime (first run on this runner)…"
-            mkdir -p "$prewarm"/{data,config,cache}
-            ROCM_CLI_CONFIG_DIR="$prewarm/config" \
-            ROCM_CLI_DATA_DIR="$prewarm/data" \
-            ROCM_CLI_CACHE_DIR="$prewarm/cache" \
-            HF_HOME="$E2E_SHARED_CACHE_DIR/huggingface" \
-            UV_CACHE_DIR="$E2E_SHARED_UV_CACHE_DIR" \
-              "$ROCM_CLI_BINARY" install sdk
-          fi
+          # Pre-warm the shared runtime once/serially before the suite, refreshing
+          # it when the channel index has a newer version. Install in place (no mv)
+          # so the manifest's absolute paths stay valid. See the e2e-selfhosted.yml
+          # e2e-gpu lane and `xtask e2e-prewarm` for the full rationale (EAI-8057).
+          HF_HOME="$E2E_SHARED_CACHE_DIR/huggingface" \
+          UV_CACHE_DIR="$E2E_SHARED_UV_CACHE_DIR" \
+            cargo xtask e2e-prewarm --channel ${{ matrix.channel }} --prewarm-dir "$prewarm"
 
           cargo xtask e2e
 
-      # Canonical artifact name, matching the per-PR workflow rather than a
-      # `-nightly-` variant. `parse_descriptor` in the e2e-report crate maps
-      # these names to Platform/OS, and an unrecognised one falls back to a
-      # titlecased platform with the OS hardcoded to Linux — which would have
-      # labelled the Windows lane below as Linux. Artifacts are scoped to their
-      # run, so sharing the name with the per-PR workflow collides with nothing.
+      # Channel-suffixed so the release and nightly matrix legs don't collide
+      # within this run (actions/upload-artifact rejects duplicate names).
+      # The manifest's channel field (platform.json's versions.channel) is
+      # authoritative for column identity; this suffix is only the fallback
+      # the report reads when no manifest channel exists, so it must stay in
+      # sync with the values the descriptor parser strips.
       - name: Upload E2E report
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: e2e-gpu-report
+          name: e2e-gpu-${{ matrix.channel }}-report
+          path: tests/e2e-cucumber/results/
+
+  # rad3 R9700 counterpart to e2e-gpu-nightly. Mirrors the per-PR e2e-gpu-rad3
+  # lane in e2e-selfhosted.yml (scale-to-zero runner, r9700 label, shared uv
+  # cache, GPU preflight), with @nightly scenarios enabled. Keep the two in step:
+  # the report crate asserts the nightly lanes publish the same platforms as the
+  # per-PR lanes.
+  e2e-gpu-nightly-rad3:
+    name: E2E tests (rad3 R9700, incl. nightly-only)
+    timeout-minutes: 90
+    runs-on: [self-hosted, linux, r9700]
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        channel: [release, nightly]
+    env:
+      E2E_INCLUDE_NIGHTLY: "1"
+      E2E_SERVE_TIMEOUT_SECS: "300"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Reclaim the GPU before running: a serve leaked by a killed or
+      # timed-out prior run (its Drop teardown never executed) keeps an engine
+      # process on the card and starves this job's serves. Scoped to E2E-owned
+      # trees: a manual /workload serve is matched only if its command line
+      # also names an E2E root — see the exposure documented in
+      # scripts/reclaim-gpu.sh.
+      - name: Reclaim GPU from stray E2E processes
+        run: bash scripts/reclaim-gpu.sh
+
+      # Bounded wait for a free GPU, then an assertion that no leaked E2E engine
+      # process survives. The floor stays at the shared 16 GiB default, a flat
+      # constant rather than a proportion of capacity — high enough to catch a
+      # leftover serve, low enough that a clean pod passes on the first poll; do
+      # NOT scale it down for a smaller part. On a 32GB card it still only trips
+      # past 16 GiB held, so the floor alone would miss a leftover serve holding
+      # less than that; the process gate is what catches it (#446). Same as the
+      # per-PR rad3 lane. See .github/scripts/gpu-preflight.sh.
+      - name: GPU preflight (bounded wait for an available GPU)
+        env:
+          GPU_PREFLIGHT_MIN_FREE_GIB: 16
+        run: |
+          bash .github/scripts/gpu-preflight.sh
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          cache: false
+
+      - name: Run full E2E on rad3 (incl. nightly-only)
+        run: |
+          # $RUNNER_WORKSPACE is on the runner-work PVC, which survives the pod
+          # being scaled away, so the cargo target dir and shared caches stay warm.
+          export CARGO_TARGET_DIR="$RUNNER_WORKSPACE/e2e-target"
+          export E2E_SHARED_CACHE_DIR="$RUNNER_WORKSPACE/e2e-shared"
+          # Same mount as the runtimes it populates, so uv hardlinks into them
+          # instead of copying, and inside the uv-cache-gc initContainer's floor
+          # (see e2e-selfhosted.yml e2e-gpu).
+          runner_root="$(dirname "$(dirname "$RUNNER_WORKSPACE")")"
+          export E2E_SHARED_UV_CACHE_DIR="$runner_root/uv-cache"
+          prewarm="$RUNNER_WORKSPACE/e2e-prewarm-multi-arch-v2"
+          export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
+
+          # See the e2e-gpu lane in e2e-selfhosted.yml for why the
+          # e2e-test-hooks feature must match what `cargo xtask e2e` would build.
+          cargo build --release -p rocm -p rocmd --features rocm/e2e-test-hooks
+          export ROCM_CLI_BINARY="$CARGO_TARGET_DIR/release/rocm"
+          export ROCM_CLI_ROCMD_BINARY="$CARGO_TARGET_DIR/release/rocmd"
+
+          # Pre-warm once, serially, in place (no mv/symlink), and refresh it when
+          # the channel index has published a newer runtime — the tree is a cache,
+          # not a one-shot. See `xtask e2e-prewarm` (EAI-8057).
+          HF_HOME="$E2E_SHARED_CACHE_DIR/huggingface" \
+          UV_CACHE_DIR="$E2E_SHARED_UV_CACHE_DIR" \
+            cargo xtask e2e-prewarm --channel ${{ matrix.channel }} --prewarm-dir "$prewarm"
+
+          cargo xtask e2e
+
+      - name: Upload E2E report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-gpu-rad3-${{ matrix.channel }}-report
+          path: tests/e2e-cucumber/results/
+
+  e2e-gpu-nightly-mi350p:
+    name: E2E tests (MI350P, incl. nightly-only)
+    timeout-minutes: 90
+    runs-on: [self-hosted, linux, mi350p]
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        channel: [release, nightly]
+    env:
+      E2E_INCLUDE_NIGHTLY: "1"
+      E2E_SERVE_TIMEOUT_SECS: "300"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Reclaim the GPU before running: a serve leaked by a killed or
+      # timed-out prior run (its Drop teardown never executed) keeps an engine
+      # process on the card and starves this job's serves. Scoped to E2E-owned
+      # trees: a manual /workload serve is matched only if its command line
+      # also names an E2E root — see the exposure documented in
+      # scripts/reclaim-gpu.sh.
+      - name: Reclaim GPU from stray E2E processes
+        run: bash scripts/reclaim-gpu.sh
+
+      # Bounded wait for a free GPU, then an assertion that no leaked E2E engine
+      # process survives. Floor matches the per-PR MI350P lane and the other
+      # Instinct lane — low enough that a clean pod passes on the first poll,
+      # and against a pool this size it only trips near exhaustion, so the
+      # process gate is what actually catches a leftover serve (#446). See
+      # .github/scripts/gpu-preflight.sh.
+      - name: GPU preflight (bounded wait for an available GPU)
+        env:
+          GPU_PREFLIGHT_MIN_FREE_GIB: 16
+        run: |
+          bash .github/scripts/gpu-preflight.sh
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          cache: false
+
+      - name: Run full E2E on MI350P (incl. nightly-only)
+        run: |
+          # $RUNNER_WORKSPACE is on a volume that survives the runner being scaled
+          # away, so the cargo target dir and shared caches stay warm.
+          export CARGO_TARGET_DIR="$RUNNER_WORKSPACE/e2e-target"
+          export E2E_SHARED_CACHE_DIR="$RUNNER_WORKSPACE/e2e-shared"
+          # Same mount as the runtimes it populates, so uv hardlinks into them
+          # instead of copying, and inside the uv-cache-gc initContainer's floor
+          # (see e2e-selfhosted.yml e2e-gpu).
+          runner_root="$(dirname "$(dirname "$RUNNER_WORKSPACE")")"
+          export E2E_SHARED_UV_CACHE_DIR="$runner_root/uv-cache"
+          prewarm="$RUNNER_WORKSPACE/e2e-prewarm-multi-arch-v2"
+          export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
+
+          # See the e2e-gpu lane in e2e-selfhosted.yml for why the
+          # e2e-test-hooks feature must match what `cargo xtask e2e` would build.
+          cargo build --release -p rocm -p rocmd --features rocm/e2e-test-hooks
+          export ROCM_CLI_BINARY="$CARGO_TARGET_DIR/release/rocm"
+          export ROCM_CLI_ROCMD_BINARY="$CARGO_TARGET_DIR/release/rocmd"
+
+          # Pre-warm once, serially, in place (no mv/symlink), and refresh it when
+          # the channel index has published a newer runtime — the tree is a cache,
+          # not a one-shot. See `xtask e2e-prewarm`.
+          HF_HOME="$E2E_SHARED_CACHE_DIR/huggingface" \
+          UV_CACHE_DIR="$E2E_SHARED_UV_CACHE_DIR" \
+            cargo xtask e2e-prewarm --channel ${{ matrix.channel }} --prewarm-dir "$prewarm"
+
+          cargo xtask e2e
+
+      - name: Upload E2E report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-gpu-mi350p-${{ matrix.channel }}-report
+          path: tests/e2e-cucumber/results/
+
+  # W7900 counterpart to e2e-gpu-nightly. Mirrors the per-PR e2e-gpu-w7900 lane
+  # in e2e-selfhosted.yml (w7900 label, shared uv cache, GPU preflight), with
+  # @nightly scenarios enabled. Keep the two in step: the report crate asserts
+  # the nightly lanes publish the same platforms as the per-PR lanes.
+  e2e-gpu-nightly-w7900:
+    name: E2E tests (W7900, incl. nightly-only)
+    timeout-minutes: 90
+    runs-on: [self-hosted, linux, w7900]
+    strategy:
+      fail-fast: false
+      matrix:
+        channel: [release, nightly]
+    continue-on-error: true
+    env:
+      E2E_INCLUDE_NIGHTLY: "1"
+      E2E_SERVE_TIMEOUT_SECS: "300"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Reclaim the GPU before running: a serve leaked by a killed or
+      # timed-out prior run (its Drop teardown never executed) keeps an engine
+      # process on the card and starves this job's serves. Scoped to E2E-owned
+      # trees: a manual /workload serve is matched only if its command line
+      # also names an E2E root — see the exposure documented in
+      # scripts/reclaim-gpu.sh.
+      - name: Reclaim GPU from stray E2E processes
+        run: bash scripts/reclaim-gpu.sh
+
+      # Bounded wait for a free GPU, then an assertion that no leaked E2E engine
+      # process survives. The floor stays at the shared 16 GiB default, which is
+      # a flat constant rather than a proportion of capacity: it only has to be
+      # high enough to catch a leftover serve still holding the card, and low
+      # enough that a clean host passes on the first poll. Same as the per-PR
+      # W7900 lane — do NOT scale it down for a smaller part. On a 48GB card it
+      # only trips past ~32 GiB held, so the process gate is what catches a
+      # leftover serve holding less (#446). See .github/scripts/gpu-preflight.sh.
+      - name: GPU preflight (bounded wait for an available GPU)
+        env:
+          GPU_PREFLIGHT_MIN_FREE_GIB: 16
+        run: |
+          bash .github/scripts/gpu-preflight.sh
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          cache: false
+
+      - name: Run full E2E on W7900 (incl. nightly-only)
+        run: |
+          # $RUNNER_WORKSPACE is on a volume that outlives any single job, so the
+          # cargo target dir and shared caches stay warm.
+          export CARGO_TARGET_DIR="$RUNNER_WORKSPACE/e2e-target"
+          export E2E_SHARED_CACHE_DIR="$RUNNER_WORKSPACE/e2e-shared"
+          # Same mount as the runtimes it populates, so uv hardlinks into them
+          # instead of copying, and inside the uv-cache-gc initContainer's floor
+          # (see e2e-selfhosted.yml e2e-gpu).
+          runner_root="$(dirname "$(dirname "$RUNNER_WORKSPACE")")"
+          export E2E_SHARED_UV_CACHE_DIR="$runner_root/uv-cache"
+          prewarm="$RUNNER_WORKSPACE/e2e-prewarm-multi-arch-v2"
+          export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
+
+          # See the e2e-gpu lane in e2e-selfhosted.yml for why the
+          # e2e-test-hooks feature must match what `cargo xtask e2e` would build.
+          cargo build --release -p rocm -p rocmd --features rocm/e2e-test-hooks
+          export ROCM_CLI_BINARY="$CARGO_TARGET_DIR/release/rocm"
+          export ROCM_CLI_ROCMD_BINARY="$CARGO_TARGET_DIR/release/rocmd"
+
+          # Pre-warm once, serially, in place (no mv/symlink), and refresh it when
+          # the channel index has published a newer runtime — the tree is a cache,
+          # not a one-shot. See `xtask e2e-prewarm`.
+          HF_HOME="$E2E_SHARED_CACHE_DIR/huggingface" \
+          UV_CACHE_DIR="$E2E_SHARED_UV_CACHE_DIR" \
+            cargo xtask e2e-prewarm --channel ${{ matrix.channel }} --prewarm-dir "$prewarm"
+
+          cargo xtask e2e
+
+      - name: Upload E2E report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-gpu-w7900-${{ matrix.channel }}-report
           path: tests/e2e-cucumber/results/
 
   # Strix Halo counterpart to e2e-gpu-nightly. The same @nightly large-model
   # scenario serves the platform-specific Lemonade GGUF on this host. Keep the
-  # runner's storage and runtime setup aligned with ci.yml's proven Strix Ubuntu job.
+  # runner's storage and runtime setup aligned with e2e-selfhosted.yml's proven
+  # Strix Ubuntu job.
   e2e-gpu-nightly-strix:
     name: E2E tests (Strix Halo, incl. nightly-only)
     timeout-minutes: 90
-    # `native` disambiguates the two Linux Strix runners: the WSL host also
-    # carries `strix-halo`, but the paths below exist only on the native one.
+    # `native` disambiguates this runner from any host that might carry a bare
+    # `wsl` label alongside `strix-halo` (the static WSL runner this repo used
+    # before the WSL lanes moved to the ephemeral pool) -- the paths below
+    # exist only on the native host, whether or not that other runner remains
+    # registered.
     runs-on: [self-hosted, linux, strix-halo, native]
     continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        channel: [release, nightly]
     env:
       HOME: /home/ubuntu/actions-runner/e2e-home
       CARGO_HOME: /home/ubuntu/actions-runner/.cargo
@@ -443,39 +733,22 @@ jobs:
       - name: Prepare writable dirs on the nvme + reclaim GPU from stray E2E procs
         run: |
           mkdir -p "$HOME" "$TMPDIR" "$PIP_CACHE_DIR"
-          pkill -f '/tmp/rocm-e2e.*llama-server' 2>/dev/null || true
-          pkill -f '/tmp/rocm-e2e.*vllm serve' 2>/dev/null || true
-          pkill -f 'e2e-shared.*llama-server' 2>/dev/null || true
-          pkill -f '__engine-serve-http.*rocm-e2e' 2>/dev/null || true
-          rm -rf /tmp/rocm-e2e-* 2>/dev/null || true
-          echo "prepared + reclaimed"
+          echo "prepared"
+          bash scripts/reclaim-gpu.sh
 
+      # Bounded wait for a free GPU, then an assertion that no leaked E2E engine
+      # process survives. gfx1151 shares system memory, so the floor is smaller
+      # than the Instinct lanes' and is applied to GTT whenever the reported
+      # VRAM pool is only a BIOS carveout too small to satisfy it. Against a
+      # whole ~62 GiB aperture an 8 GiB floor trips only past ~54 GiB held, so
+      # the process gate is what notices a serve holding a few GiB (#446); the
+      # floor is kept for the non-E2E tenant it cannot see. Same script as every
+      # other bash lane: .github/scripts/gpu-preflight.sh.
       - name: GPU preflight (bounded wait for an available GPU)
+        env:
+          GPU_PREFLIGHT_MIN_FREE_GIB: 8
         run: |
-          MIN_FREE_GIB="${GPU_PREFLIGHT_MIN_FREE_GIB:-8}"
-          CEILING_SECS="${GPU_PREFLIGHT_CEILING_SECS:-90}"
-          min_free=$(( MIN_FREE_GIB * 1024 * 1024 * 1024 ))
-          deadline=$(( SECONDS + CEILING_SECS ))
-          reason="rocm-smi never returned within its timeout (driver wedged or GPU absent)"
-          while [ "$SECONDS" -lt "$deadline" ]; do
-            out=$(timeout 15 rocm-smi --showmeminfo vram 2>/dev/null) || { sleep 5; continue; }
-            total=$(printf '%s\n' "$out" | grep -i 'VRAM Total Memory' | sed 's/.*: *//' | grep -oE '[0-9]+' | tail -1)
-            used=$(printf '%s\n' "$out" | grep -i 'VRAM Total Used Memory' | sed 's/.*: *//' | grep -oE '[0-9]+' | tail -1)
-            if [ -z "$total" ] || [ -z "$used" ]; then
-              reason="rocm-smi returned no VRAM figures (no AMD GPU detected)"
-              sleep 5; continue
-            fi
-            free=$(( total - used ))
-            if [ "$free" -ge "$min_free" ]; then
-              echo "GPU ready: $(( free / 1024 / 1024 / 1024 )) GiB free (>= ${MIN_FREE_GIB} GiB)."
-              exit 0
-            fi
-            reason="VRAM never dropped below the floor: only $(( free / 1024 / 1024 / 1024 )) GiB free (< ${MIN_FREE_GIB} GiB) — a serve is likely still holding the GPU"
-            echo "waiting: $(( free / 1024 / 1024 / 1024 )) GiB free (< ${MIN_FREE_GIB} GiB)…"
-            sleep 5
-          done
-          echo "::error::GPU preflight failed after ${CEILING_SECS}s: ${reason}"
-          exit 1
+          bash .github/scripts/gpu-preflight.sh
 
       - name: Ensure Rust toolchain
         run: |
@@ -489,29 +762,19 @@ jobs:
         run: |
           export CARGO_TARGET_DIR="$RUNNER_WORKSPACE/e2e-target"
           export E2E_SHARED_CACHE_DIR="$RUNNER_WORKSPACE/e2e-shared"
-          prewarm="$RUNNER_WORKSPACE/e2e-prewarm"
+          prewarm="$RUNNER_WORKSPACE/e2e-prewarm-multi-arch-v2"
           export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
 
-          cargo build --release -p rocm -p rocmd
+          # See the e2e-gpu lane in e2e-selfhosted.yml for why the
+          # e2e-test-hooks feature must match what `cargo xtask e2e` would build.
+          cargo build --release -p rocm -p rocmd --features rocm/e2e-test-hooks
           export ROCM_CLI_BINARY="$CARGO_TARGET_DIR/release/rocm"
           export ROCM_CLI_ROCMD_BINARY="$CARGO_TARGET_DIR/release/rocmd"
 
-          if [ ! -d "$E2E_SHARED_RUNTIMES_DIR/registry" ]; then
-            echo "pre-warming shared runtime (first run on this runner)…"
-            mkdir -p "$prewarm"/{data,config,cache}
-            ROCM_CLI_CONFIG_DIR="$prewarm/config" \
-            ROCM_CLI_DATA_DIR="$prewarm/data" \
-            ROCM_CLI_CACHE_DIR="$prewarm/cache" \
-            HF_HOME="$E2E_SHARED_CACHE_DIR/huggingface" \
-              "$ROCM_CLI_BINARY" install sdk
-            if [ -d "$E2E_SHARED_RUNTIMES_DIR/registry" ]; then
-              echo "shared runtime pre-warmed at $E2E_SHARED_RUNTIMES_DIR"
-            else
-              echo "pre-warm did not produce a runtimes registry; scenarios will install their own" >&2
-            fi
-          else
-            echo "shared runtime already present at $E2E_SHARED_RUNTIMES_DIR — skipping pre-warm"
-          fi
+          # Cache, not a one-shot: refreshed when the channel index has a newer
+          # version. See `xtask e2e-prewarm` (EAI-8057).
+          HF_HOME="$E2E_SHARED_CACHE_DIR/huggingface" \
+            cargo xtask e2e-prewarm --channel ${{ matrix.channel }} --prewarm-dir "$prewarm"
 
           cargo xtask e2e
 
@@ -519,17 +782,24 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: e2e-gpu-strix-ubuntu-report
+          name: e2e-gpu-strix-ubuntu-${{ matrix.channel }}-report
           path: tests/e2e-cucumber/results/
 
   # Windows counterpart to e2e-gpu-nightly-strix. Keep the PowerShell-native
-  # setup aligned with ci.yml's proven Strix Windows job while opting into the
-  # same platform-adaptive @nightly large-model scenario as the Linux runner.
+  # setup aligned with e2e-selfhosted.yml's proven Strix Windows job while
+  # opting into the same platform-adaptive @nightly large-model scenario as the
+  # Linux runner. Same DevLab Dispatch pool as e2e-wsl-nightly below and the
+  # per-PR e2e-gpu-strix-windows/e2e-wsl jobs in e2e-selfhosted.yml — there is
+  # no separate dedicated "native" Windows host registered for this anymore.
   e2e-gpu-nightly-strix-windows:
     name: E2E tests (Strix Halo, Windows, incl. nightly-only)
     timeout-minutes: 90
-    runs-on: [self-hosted, windows, strix-halo, native]
+    runs-on: [self-hosted, windows, devlab-dispatch, strix-halo]
     continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        channel: [release, nightly]
     env:
       E2E_INCLUDE_NIGHTLY: "1"
       E2E_SERVE_TIMEOUT_SECS: "300"
@@ -540,13 +810,49 @@ jobs:
       - name: Reclaim GPU from stray E2E processes
         shell: powershell
         run: |
-          Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
-            Where-Object { $_.CommandLine -match 'rocm-e2e|__engine-serve-http|e2e-target|e2e-shared' -and $_.CommandLine -match 'llama-server|vllm|rocm ' } |
-            ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-          Write-Host "reclaimed"
+          # Mirrors the SHAPE of scripts/reclaim-gpu.sh's rule — an E2E-owned root
+          # AND an engine process — but is not equivalent to it. Native Windows has
+          # no bash, so the rule is restated here rather than shared. Keep the root
+          # alternation in step with the script's E2E_ROOTS (`e2e-prewarm` is the
+          # shared runtime tree the engine binaries actually run from); xtask's
+          # reclaim_roots_are_mirrored_in_the_powershell_reclaims test pins that half.
+          #
+          # The engine half diverges in two pre-existing ways, tracked in EAI-8815.
+          # They fail in OPPOSITE directions, and only one can cost a bystander:
+          #   - a MISS: `rocm ` (literal trailing space) cannot match Windows'
+          #     `rocm.exe daemon`, so such a leak is not reclaimed here;
+          #   - an OVER-MATCH: `__engine-serve-http` sits in the root alternation
+          #     rather than the engine one, so on Windows a non-E2E managed serve
+          #     satisfies the root half from that marker alone and can be killed.
+          # Do not read this as "same markers as the script" until that is fixed.
+          $leaked = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+            Where-Object { $_.CommandLine -match 'rocm-e2e|e2e-prewarm|e2e-shared|e2e-target|__engine-serve-http' -and $_.CommandLine -match 'llama-server|vllm|rocm ' }
+          foreach ($p in $leaked) {
+            Write-Host "reclaim: terminating pid=$($p.ProcessId) cmd=$($p.CommandLine)"
+            Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+          }
+          # SIGNALLED, not terminated, for the same reason the bash summary says
+          # so: -ErrorAction SilentlyContinue swallows a Stop-Process that could
+          # not kill its target, and this count is the SELECTED set, so a
+          # process that survived is still counted. Weaker than the bash line,
+          # which at least counts only what it re-verified before signalling.
+          Write-Host "reclaim: $(@($leaked).Count) process(es) signalled"
 
       # Best-effort when rocm-smi is absent; when present, fail within the bounded
       # ceiling instead of letting a held or wedged GPU consume the full job cap.
+      #
+      # WHAT THIS DOES NOT CATCH, and the Linux lanes now do. This is a
+      # free-memory floor ONLY. A fixed 8 GiB against a whole ~62 GiB gfx1151
+      # aperture trips only past ~54 GiB held, so a leftover llama-server
+      # holding 10-20 GiB clears it — the gap #446 was opened about. The bash
+      # lanes close it by asserting no leaked E2E engine process survives
+      # (`reclaim-gpu.sh --assert-clear`); native Windows has no bash to run
+      # that with, so this copy keeps memory-only semantics. A PowerShell
+      # equivalent, reading Win32_Process the way the reclaim step above
+      # already does, is deliberate follow-up — not something this block
+      # silently already has. Kept as a separate copy for the same reason the
+      # reclaim is (EAI-8751), and pinned against drift by
+      # `apu_preflight_twins_do_not_drift` in xtask/src/workflow_contract.rs.
       - name: GPU preflight (bounded wait for an available GPU)
         shell: powershell
         run: |
@@ -556,24 +862,131 @@ jobs:
             Write-Host "rocm-smi not found on this Windows runner; skipping GPU preflight (best-effort)."
             exit 0
           }
+          # Last match, mirroring the shell helper's `tail -1`, so both read the
+          # same GPU's row on a multi-GPU host. A miss yields an empty string for
+          # the guards below, never a $null dereference — GTT is legitimately
+          # absent on a discrete card.
+          function Get-Pool($text, $label) {
+            $ms = [regex]::Matches($text, "$label \(B\):\s*(\d+)")
+            if ($ms.Count -gt 0) { $ms[$ms.Count - 1].Groups[1].Value } else { "" }
+          }
           $minFree = [int64]$minFreeGiB * 1GB
           $deadline = (Get-Date).AddSeconds($ceilingSecs)
           $reason = "rocm-smi never returned usable VRAM figures"
+          $shown = $false
+          # Both memos describe the host, not the moment, so they are answered
+          # once and reused - see the native Ubuntu lane.
+          $combined = $true
+          $gttAbsent = $false
+          # Unlike the bash lanes, this loop checks the deadline before its
+          # first poll, and that is deliberate. Get-Date has sub-second
+          # precision, so the first poll is skipped only if the step stalls for
+          # the whole ceiling between computing the deadline and entering the
+          # loop, which the production ceiling makes unreachable. The bash lanes
+          # poll first (#608) because $SECONDS counts whole wall-clock seconds,
+          # so a short ceiling there could lapse after a stall of microseconds
+          # (#607).
           while ((Get-Date) -lt $deadline) {
-            $out = (rocm-smi --showmeminfo vram 2>$null | Out-String)
-            $total = ([regex]::Matches($out, 'VRAM Total Memory \(B\):\s*(\d+)') | Select-Object -First 1).Groups[1].Value
-            $used  = ([regex]::Matches($out, 'VRAM Total Used Memory \(B\):\s*(\d+)') | Select-Object -First 1).Groups[1].Value
+            $out = ""
+            if ($combined) {
+              $out = (rocm-smi --showmeminfo vram gtt 2>$null | Out-String)
+              # `-notmatch` is case-insensitive, as `Get-Pool` and the shell
+              # lanes' `grep -i` are, so a casing variant in the tool's output
+              # costs neither a redundant query nor a missed pool.
+              if ($LASTEXITCODE -ne 0 -or $out -notmatch 'VRAM Total Memory \(B\):') {
+                $out = ""
+                # No `timeout` wrapper here, so there is no cut-short status to
+                # exclude as the shell lanes do: a transient failure retires the
+                # two-pool form for the rest of this run. The fallback below
+                # still reaches both pools, so the gate keeps working - it just
+                # pays two calls a tick instead of one.
+                $combined = $false
+              }
+            }
+            # A rocm-smi that rejects the two-pool form: fall back to the
+            # single-pool call this step has always made.
+            if (-not $out) { $out = (rocm-smi --showmeminfo vram 2>$null | Out-String) }
+            $total = Get-Pool $out 'VRAM Total Memory'
+            $used  = Get-Pool $out 'VRAM Total Used Memory'
+            $gttTotal = Get-Pool $out 'GTT Total Memory'
+            $gttUsed  = Get-Pool $out 'GTT Total Used Memory'
             if (-not $total -or -not $used) {
               $reason = "rocm-smi returned no VRAM figures (no AMD GPU detected)"
               Start-Sleep -Seconds 5; continue
             }
+            # Print the raw pools once: without them a failure here cannot be
+            # told apart from a genuinely occupied GPU by reading this log.
+            if (-not $shown) {
+              $gttShown = if ($gttTotal) { "$gttUsed/$gttTotal" } else { "n/a" }
+              Write-Host "rocm-smi pools (used/total bytes): VRAM $used/$total, GTT $gttShown"
+              $shown = $true
+            }
+            # A zero total is a failed reading, not a carveout. Retry instead of
+            # reinterpreting it as an APU and passing the gate on whatever GTT
+            # reports - a wedged driver must not clear this step.
+            if ([int64]$total -le 0) {
+              $reason = "rocm-smi reported a VRAM total of 0 (unparseable or wedged reading)"
+              Start-Sleep -Seconds 5; continue
+            }
+            $pool = "VRAM"
+            if ([int64]$total -lt $minFree) {
+              # An APU has no private VRAM: this total is the fixed BIOS carveout
+              # while the engine allocates out of GTT-backed system RAM, so the
+              # floor is being applied to a pool the engine never draws on - it
+              # fails healthy hosts and stays quiet on starved ones. See
+              # `vram_capacity_is_meaningful` in apps/rocm/src/main.rs, which
+              # withholds the product's equivalent warning for the same reason.
+              # What the floor then means: $minFreeGiB GiB against the whole GTT
+              # aperture, so it trips only near exhaustion and will not notice a
+              # serve holding a few GiB. Same sensitivity this floor had on a
+              # large-carveout host rather than a new gap, but coarse either way
+              # - see #446.
+              if (-not $gttAbsent -and (-not $gttTotal -or -not $gttUsed)) {
+                # The two-pool form above may have been rejected outright, in
+                # which case the fallback query carried no GTT rows. Ask for the
+                # pool on its own before concluding the host has none, or a CLI
+                # quirk fails a healthy APU with the very report this avoids.
+                $gttOut = (rocm-smi --showmeminfo gtt 2>$null | Out-String)
+                $gttRc = $LASTEXITCODE
+                $gttTotal = Get-Pool $gttOut 'GTT Total Memory'
+                $gttUsed  = Get-Pool $gttOut 'GTT Total Used Memory'
+                if ($gttTotal -and $gttUsed) {
+                  # The line printed above necessarily read `GTT n/a` - the
+                  # combined query is what failed. Report what the pool the gate
+                  # now decides on actually holds, or the log contradicts the
+                  # verdict on precisely the hosts this branch exists for.
+                  Write-Host "rocm-smi GTT pool (separate query): $gttUsed/$gttTotal"
+                } elseif ($gttRc -ne 0) {
+                  # A query that failed is not a host without the pool. Keeping
+                  # them apart stops a flaky call being reported as a hardware
+                  # fact, and leaves the memo below for the real thing.
+                  $reason = "VRAM total is $([math]::Floor([int64]$total/1MB)) MiB, under the $minFreeGiB GiB floor, and the GTT query itself failed (rocm-smi exit $gttRc) - the pool was never read"
+                  Start-Sleep -Seconds 5; continue
+                } else {
+                  $gttAbsent = $true
+                }
+              }
+              if (-not $gttTotal -or -not $gttUsed) {
+                $reason = "VRAM total is $([math]::Floor([int64]$total/1MB)) MiB, under the $minFreeGiB GiB floor, and rocm-smi reported no GTT pool - the floor cannot be met from VRAM on this host"
+                Start-Sleep -Seconds 5; continue
+              }
+              # A zero total is a failed reading on this pool too. Without this
+              # the gate reports `0 GiB free ... a serve is likely still holding
+              # the GPU` - the exact false report this step exists to stop, one
+              # pool over from where it was stopped.
+              if ([int64]$gttTotal -le 0) {
+                $reason = "rocm-smi reported a GTT total of 0 (unparseable or wedged reading)"
+                Start-Sleep -Seconds 5; continue
+              }
+              $pool = "GTT"; $total = $gttTotal; $used = $gttUsed
+            }
             $free = [int64]$total - [int64]$used
             if ($free -ge $minFree) {
-              Write-Host "GPU ready: $([math]::Floor($free/1GB)) GiB free (>= $minFreeGiB GiB)."
+              Write-Host "GPU ready: $([math]::Floor($free/1GB)) GiB $pool free (>= $minFreeGiB GiB)."
               exit 0
             }
-            $reason = "VRAM never dropped below the floor: only $([math]::Floor($free/1GB)) GiB free (< $minFreeGiB GiB) - a serve is likely still holding the GPU"
-            Write-Host "waiting: $([math]::Floor($free/1GB)) GiB free (< $minFreeGiB GiB)..."
+            $reason = "$pool never dropped below the floor: only $([math]::Floor($free/1GB)) GiB free (< $minFreeGiB GiB) - a serve is likely still holding the GPU"
+            Write-Host "waiting: $([math]::Floor($free/1GB)) GiB $pool free (< $minFreeGiB GiB)..."
             Start-Sleep -Seconds 5
           }
           Write-Host "::error::GPU preflight failed after ${ceilingSecs}s: $reason"
@@ -593,33 +1006,35 @@ jobs:
         shell: powershell
         run: |
           # Install the shared runtime in place because its manifest contains
-          # absolute paths. The persistent runner workspace keeps those paths valid
-          # across scenarios and subsequent runs.
-          $prewarm = "$env:RUNNER_WORKSPACE\e2e-prewarm"
+          # absolute paths. On the ephemeral DevLab Dispatch pool this host is
+          # destroyed after the job, so the paths only need to stay valid for
+          # this run's scenarios, not across runs.
+          $prewarm = "$env:RUNNER_WORKSPACE\e2e-prewarm-multi-arch-v2"
           $env:E2E_SHARED_RUNTIMES_DIR = "$prewarm\data\runtimes"
 
-          cargo build --release -p rocm -p rocmd
+          # See e2e-gpu-strix-windows in e2e-selfhosted.yml: the harness's own
+          # isolate_env() derives HF_HOME/PIP_CACHE_DIR/ROCM_CLI_CACHE_DIR from
+          # this per scenario. Without it every serve scenario here re-downloads
+          # its model checkpoint cold, which raced serve-08's readiness timeout
+          # (EAI-8031 / #260) on every nightly run — on the ephemeral pool there's
+          # no cache carried over from a prior job, so this is cold every
+          # scenario, and Windows doesn't set HOME by default so the engine's
+          # cache lookup didn't fall back to USERPROFILE either.
+          $env:E2E_SHARED_CACHE_DIR = "$env:RUNNER_WORKSPACE\e2e-shared"
+
+          # See the e2e-gpu lane in e2e-selfhosted.yml for why the
+          # e2e-test-hooks feature must match what `cargo xtask e2e` would build.
+          cargo build --release -p rocm -p rocmd --features rocm/e2e-test-hooks
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $targetDir = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { "target" }
           $env:ROCM_CLI_BINARY = "$targetDir\release\rocm.exe"
           $env:ROCM_CLI_ROCMD_BINARY = "$targetDir\release\rocmd.exe"
 
-          if (-not (Test-Path "$env:E2E_SHARED_RUNTIMES_DIR\registry")) {
-            Write-Host "pre-warming shared runtime (first run on this runner)..."
-            New-Item -ItemType Directory -Force -Path "$prewarm\data","$prewarm\config","$prewarm\cache" | Out-Null
-            $env:ROCM_CLI_CONFIG_DIR = "$prewarm\config"
-            $env:ROCM_CLI_DATA_DIR   = "$prewarm\data"
-            $env:ROCM_CLI_CACHE_DIR  = "$prewarm\cache"
-            & $env:ROCM_CLI_BINARY install sdk
-            Remove-Item Env:\ROCM_CLI_CONFIG_DIR,Env:\ROCM_CLI_DATA_DIR,Env:\ROCM_CLI_CACHE_DIR -ErrorAction SilentlyContinue
-            if (Test-Path "$env:E2E_SHARED_RUNTIMES_DIR\registry") {
-              Write-Host "shared runtime pre-warmed at $env:E2E_SHARED_RUNTIMES_DIR"
-            } else {
-              Write-Host "pre-warm did not produce a runtimes registry; scenarios will install their own"
-            }
-          } else {
-            Write-Host "shared runtime already present at $env:E2E_SHARED_RUNTIMES_DIR - skipping pre-warm"
-          }
+          # Cache, not a one-shot: refreshed when the channel index has a newer
+          # version. The decision lives in `xtask e2e-prewarm` so this lane cannot
+          # drift from the Linux ones (EAI-8057).
+          cargo xtask e2e-prewarm --channel ${{ matrix.channel }} --prewarm-dir "$prewarm"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
           cargo xtask e2e
 
@@ -627,37 +1042,100 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: e2e-gpu-strix-windows-report
+          name: e2e-gpu-strix-windows-${{ matrix.channel }}-report
           path: tests/e2e-cucumber/results/
 
-  # WSL2 counterpart to e2e-gpu-nightly-strix: the same Strix Halo box again, but
-  # reached through an Ubuntu distro under WSL2, so this lane exercises the WSL
-  # host boundary AND whatever GPU access WSL exposes. Mirrors the per-PR
-  # `e2e-wsl` lane in e2e-selfhosted.yml, opting into the same @nightly
-  # large-model scenario as the other nightly lanes. `wsl` in `runs-on`
-  # disambiguates it from the `native` Strix Linux runner; the native lane's
-  # /home/ubuntu/actions-runner paths deliberately are NOT reused, since they do
-  # not exist in the WSL distro.
+  # WSL2 counterpart to e2e-gpu-nightly-strix: an Ubuntu-24.04 distro installed
+  # fresh inside WSL2 on a DevLab Dispatch pool Windows host — the same pool
+  # `e2e-gpu-nightly-strix-windows` above and the per-PR `e2e-gpu-strix-windows`/
+  # `e2e-wsl` jobs use, not a separate `wsl`-labeled runner. Mirrors the per-PR
+  # `e2e-wsl` lane in e2e-selfhosted.yml step for step (see that job's header
+  # comment for the pool maintainer's sign-off), opting into the same @nightly
+  # large-model scenario as the other nightly lanes.
   e2e-wsl-nightly:
     name: E2E tests (Strix Halo, WSL2, incl. nightly-only)
-    timeout-minutes: 90
-    runs-on: [self-hosted, linux, strix-halo, wsl]
+    # See e2e-wsl in e2e-selfhosted.yml: every job here is cold (fresh distro,
+    # fresh build, fresh prewarm) plus the ~5min/job distro-install overhead;
+    # conservative starting budget, tune down after a measured run.
+    timeout-minutes: 120
+    runs-on: [self-hosted, windows, devlab-dispatch, strix-halo]
     continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        channel: [release, nightly]
     env:
+      # wsl.exe emits UTF-16 by default; without this its own error/status text
+      # comes back mangled when captured through PowerShell. Matches the
+      # ubuntu/WSL composite action's own env.
+      WSL_UTF8: "1"
       E2E_INCLUDE_NIGHTLY: "1"
       E2E_SERVE_TIMEOUT_SECS: "300"
-      # The Strix lanes share one physical machine, so a TUI frame that renders
-      # well inside the 30s default on an idle runner can miss it while a sibling
-      # lane loads a model. Raise the wait budget rather than let that read as a
-      # product failure; a genuine hang still fails, just later.
+      # A freshly-provisioned pool host installing WSL2, a distro, and native
+      # build deps from scratch this run can leave a TUI frame that renders
+      # well inside the 30s default arriving late. Raise the wait budget rather
+      # than let that read as a product failure; a genuine hang still fails,
+      # just later.
       E2E_TUI_TIMEOUT_SECS: "90"
+      # apps/rocm/build.rs falls back to GitHub's own GITHUB_HEAD_REF/
+      # GITHUB_REF_NAME when this isn't set, but those never reach the WSL
+      # guest's cargo build (wsl.exe doesn't share the calling process's
+      # environment, and the guest's own checkout is a detached-HEAD clone by
+      # SHA). Same fix this file's own docker build step already uses.
+      ROCM_CLI_RELEASE_REF: "${{ github.ref_name }}"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # See e2e-wsl in e2e-selfhosted.yml for the full rationale behind each
+      # of these steps — this job mirrors it exactly, minus the scoped
+      # name_filter dispatch input this workflow doesn't have.
+      # See e2e-wsl's own comment: winget returns
+      # APPINSTALLER_CLI_ERROR_UPDATE_NOT_APPLICABLE (0x8A15002B) rather than
+      # success when the package is already installed and up to date.
+      - name: Install WSL (pinned Microsoft.WSL)
+        shell: powershell
+        run: |
+          winget install --id Microsoft.WSL --exact --silent `
+            --accept-package-agreements --accept-source-agreements
+          if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne -1978335189) {
+            Write-Host "::error::winget install --id Microsoft.WSL failed with exit code $LASTEXITCODE"
+            exit $LASTEXITCODE
+          }
+          # See e2e-wsl in e2e-selfhosted.yml: GitHub's own PowerShell step
+          # wrapper fails on any left-over non-zero $LASTEXITCODE regardless
+          # of our own tolerant `if` above.
+          exit 0
+
+      - name: Install Ubuntu-24.04 distro
+        shell: powershell
+        run: |
+          # See e2e-wsl in e2e-selfhosted.yml: --shutdown first avoids
+          # wsl.exe's "the file cannot be accessed by the system" against a
+          # VM that is still mid-startup. It also tears down every WSL VM on
+          # the host, not just this job's -- safe only because the pool hands
+          # out one fresh, exclusive host per job; see that job's comment for
+          # the scoped fallback if the pool ever starts packing jobs.
+          wsl --shutdown
+          wsl --unregister Ubuntu-24.04 2>$null | Out-Null
+          wsl --install Ubuntu-24.04 --web-download --no-launch
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::wsl --install Ubuntu-24.04 failed with exit code $LASTEXITCODE"
+            exit $LASTEXITCODE
+          }
+          wsl -d Ubuntu-24.04 -u root -- echo ok
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::distro did not come up after install"
+            exit $LASTEXITCODE
+          }
 
       # Fail fast and loudly if this job ever lands on a native Linux runner:
       # every WSL-tagged scenario would silently resolve to skip instead.
       - name: Verify the host really is WSL2
+        shell: powershell
         run: |
+          # See .github/scripts/Invoke-WslBash.ps1 for why this goes through a
+          # temp file rather than a pipe.
+          & "$env:GITHUB_WORKSPACE\.github\scripts\Invoke-WslBash.ps1" -PipeFail -Script @'
           proc_version=$(cat /proc/version 2>/dev/null || true)
           if [ ! -e /dev/dxg ] \
             && [ -z "${WSL_DISTRO_NAME+x}" ] \
@@ -666,46 +1144,143 @@ jobs:
             exit 1
           fi
           printf 'WSL kernel: %s\n' "$(uname -r)"
+          '@
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      # The native Strix runners come pre-provisioned; a WSL distro often does
-      # not. Install the native build deps only when something is missing, and
-      # only if passwordless sudo is available — otherwise say what is missing
-      # instead of hanging on a password prompt.
-      - name: Ensure native build deps
+      # Same clock hazard as `e2e-wsl` in e2e-selfhosted.yml, which this job
+      # mirrors: a fresh guest whose clock is still being corrected steps
+      # backwards mid-run, and cucumber measures scenario durations with
+      # `SystemTime`. See that job's copy of this step for the full reasoning.
+      # Kept in sync by hand until the two lanes are deduplicated (#294);
+      # `both_wsl_lanes_settle_the_clock_before_running_the_suite` in
+      # xtask/src/workflow_contract.rs fails if either copy goes missing, moves
+      # after the suite, or drifts from the other.
+      - name: Settle the clock before anything times a scenario
+        shell: powershell
         run: |
-          missing=""
-          command -v pkg-config >/dev/null 2>&1 || missing="$missing pkg-config"
-          command -v cc >/dev/null 2>&1 || missing="$missing build-essential"
-          pkg-config --exists libcap 2>/dev/null || missing="$missing libcap-dev"
-          if [ -z "$missing" ]; then
-            echo "native build deps present"
-          elif sudo -n true 2>/dev/null; then
-            echo "installing:$missing"
-            sudo -n apt-get update
-            # shellcheck disable=SC2086
-            sudo -n apt-get install -y $missing
+          # `shell: powershell` runs with $ErrorActionPreference = 'Stop', under
+          # which a native command's stderr becomes a terminating error. `w32tm`
+          # writes there routinely on a machine with no configured time source, so
+          # relax the preference rather than let a best-effort probe abort the
+          # step. Under 'Continue', neither a native command's exit code nor its
+          # stderr can fail this step; their raw output still reaches the log.
+          #
+          # That preference does NOT cover everything, which is why the calls below
+          # are inside a try as well. It governs errors raised by a command that
+          # ran -- not command *resolution*: an unresolvable `w32tm` raises
+          # CommandNotFoundException, which is catchable whatever the preference is
+          # set to. Wrapping makes the step's "never fails the lane" promise
+          # unconditional instead of resting on which statement happens to
+          # terminate.
+          $ErrorActionPreference = 'Continue'
+
+          try {
+            # Host first, and deliberately not concurrently with the guest below:
+            # in WSL2 the guest clock tracks the host, so settling the host is what
+            # gives the guest's own sync an already-correct reference to land on.
+            # Note this pins only the guest side for the rest of the job; the host
+            # keeps its time service running, so a later host-side correction can
+            # still propagate inward. Stopping a service on a shared runner is a
+            # bigger hammer than this hazard warrants.
+            Write-Host "host time before: $((Get-Date).ToUniversalTime().ToString('o'))"
+            & w32tm /resync /force
+            & w32tm /query /status
+            Write-Host "host time after:  $((Get-Date).ToUniversalTime().ToString('o'))"
+
+            # See .github/scripts/Invoke-WslBash.ps1. No -PipeFail: the guest script
+            # below is a sequence of probes that must each be allowed to fail.
+            & "$env:GITHUB_WORKSPACE\.github\scripts\Invoke-WslBash.ps1" -Script @'
+          printf 'guest time before: %s\n' "$(date -u +%FT%T.%NZ)"
+          if command -v timedatectl >/dev/null 2>&1 && timedatectl show >/dev/null 2>&1; then
+            timedatectl show -p NTP -p NTPSynchronized -p TimeUSec || true
+            # Wait for the client to report a completed sync before switching it
+            # off: an unsynchronised clock means a correction is still owed, and
+            # it must land here -- while nothing is timing a scenario -- rather
+            # than arriving mid-suite. Already-synchronised returns immediately,
+            # since then nothing is pending.
+            # 30s: comfortably past a first NTP exchange on a reachable source,
+            # and the whole budget is only spent by a guest that has none -- in
+            # which case nothing was going to step it anyway, so burning it once
+            # per job is cheaper than a correction landing mid-suite.
+            timedatectl set-ntp true 2>/dev/null || true
+            for _ in $(seq 1 30); do
+              [ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" = "yes" ] && break
+              sleep 1
+            done
+            # Then take the stepper out of the picture for the rest of the job.
+            timedatectl set-ntp false 2>/dev/null || true
+            timedatectl show -p NTP -p NTPSynchronized || true
           else
-            echo "::error::missing native build deps:$missing (no passwordless sudo to install them)"
-            exit 1
+            # No systemd in this guest: there is no in-guest NTP client to settle,
+            # so any step the suite sees came from the host. Say so -- the next
+            # failure is read against this line.
+            echo "timedatectl unavailable; no in-guest NTP client to settle"
           fi
+          printf 'guest time after:  %s\n' "$(date -u +%FT%T.%NZ)"
+          '@
+          } catch {
+            Write-Host "guest clock probe did not run: $_"
+          }
+          # Best-effort by design: never fail the lane on a clock it could not settle.
+          exit 0
 
-      - name: Reclaim GPU from stray E2E processes
+      - name: Ensure native build deps
+        shell: powershell
         run: |
-          pkill -f '/tmp/rocm-e2e.*llama-server' 2>/dev/null || true
-          pkill -f '/tmp/rocm-e2e.*vllm serve' 2>/dev/null || true
-          pkill -f 'e2e-shared.*llama-server' 2>/dev/null || true
-          pkill -f '__engine-serve-http.*rocm-e2e' 2>/dev/null || true
-          rm -rf /tmp/rocm-e2e-* 2>/dev/null || true
-          echo "reclaimed"
+          # See .github/scripts/Invoke-WslBash.ps1.
+          & "$env:GITHUB_WORKSPACE\.github\scripts\Invoke-WslBash.ps1" -PipeFail -Script @'
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            pkg-config build-essential libcap-dev git ca-certificates curl sudo
+          '@
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Clone checkout into the WSL guest's native filesystem
+        shell: powershell
+        run: |
+          # See .github/scripts/Invoke-WslBash.ps1.
+          $sha = (git -C $env:GITHUB_WORKSPACE rev-parse HEAD).Trim()
+          # wslpath strips backslashes from Windows path args regardless of
+          # quoting on this pool (see Invoke-WslBash.ps1); build /mnt/<drive> by hand.
+          $wsDrive = $env:GITHUB_WORKSPACE.Substring(0, 1).ToLower()
+          $winPath = "/mnt/$wsDrive" + $env:GITHUB_WORKSPACE.Substring(2).Replace('\', '/')
+          $script = @"
+          set -eo pipefail
+          rm -rf /root/work
+          mkdir -p /root/work
+          git clone --local '$winPath' /root/work/rocm-cli
+          cd /root/work/rocm-cli
+          git checkout --quiet '$sha'
+          "@
+          & "$env:GITHUB_WORKSPACE\.github\scripts\Invoke-WslBash.ps1" -Script $script
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # NO librocdxg provisioning step here, deliberately — see the same note
+      # in e2e-wsl (e2e-selfhosted.yml): installing ROCDXG is the CLI's own job
+      # now, and a lane that pre-installed it would hand the @requires-wsl
+      # driver scenarios a host already in the state they exist to reach.
 
       # GPU preflight, bounded like the native lanes — but ADVISORY here. GPU
       # access under WSL is exactly what this lane is proving out, so an absent
       # rocm-smi is a reported condition, not a job failure: the capability probe
       # then resolves @requires-gpu scenarios to skip and the rest still runs. A
-      # GPU that IS present but stays held by a leftover serve still fails, since
-      # that would corrupt the serve scenarios' results.
+      # GPU that IS present but stays held fails the job, since that would
+      # corrupt the serve scenarios' results.
+      #
+      # What "held" means here is weaker than on the native lanes, and the
+      # difference is the whole of #446. This body keeps only the free-memory
+      # floor; it does not run `reclaim-gpu.sh --assert-clear`, which is what
+      # actually catches a leftover serve. Against a whole GTT aperture the
+      # floor trips only near exhaustion, so a serve holding a few GiB clears
+      # it. The script is not invoked because this body runs inside the WSL
+      # distro through Invoke-WslBash.ps1, where the repo checkout is not at a
+      # path this step can assume. Closing it is follow-up work, tracked with
+      # the equivalent Windows gap.
       - name: GPU preflight (advisory bounded wait)
+        shell: powershell
         run: |
+          # See .github/scripts/Invoke-WslBash.ps1.
+          & "$env:GITHUB_WORKSPACE\.github\scripts\Invoke-WslBash.ps1" -Script @'
           MIN_FREE_GIB="${GPU_PREFLIGHT_MIN_FREE_GIB:-8}"
           CEILING_SECS="${GPU_PREFLIGHT_CEILING_SECS:-90}"
           if ! command -v rocm-smi >/dev/null 2>&1; then
@@ -714,82 +1289,222 @@ jobs:
           fi
           min_free=$(( MIN_FREE_GIB * 1024 * 1024 * 1024 ))
           deadline=$(( SECONDS + CEILING_SECS ))
+          # See the native Ubuntu lane for why the floor moves to GTT when the
+          # VRAM pool is only a BIOS carveout, why `field` anchors on `(B)`, and
+          # why a zero total is treated as a failed reading.
+          field() { printf '%s\n' "$out" | grep -iE "$1 \(B\):" | sed 's/.*: *//' | grep -oE '[0-9]+' | tail -1 || true; }
           saw_vram=0
-          while [ "$SECONDS" -lt "$deadline" ]; do
-            out=$(timeout 15 rocm-smi --showmeminfo vram 2>/dev/null) || { sleep 5; continue; }
-            total=$(printf '%s\n' "$out" | grep -i 'VRAM Total Memory' | sed 's/.*: *//' | grep -oE '[0-9]+' | tail -1)
-            used=$(printf '%s\n' "$out" | grep -i 'VRAM Total Used Memory' | sed 's/.*: *//' | grep -oE '[0-9]+' | tail -1)
+          # `unmeasurable` carries the last COMPLETED measurement, deliberately:
+          # a tick that ends in an early `continue` learned nothing and must not
+          # overwrite it. Every path that could conclude "a serve is holding the
+          # GPU" clears it first, so a held GPU still fails this lane. Clearing
+          # it per tick instead would let one flaky rocm-smi call on the final
+          # tick turn an unmeasurable host into a hard "a serve is likely still
+          # holding the GPU" — the report this whole step exists to stop.
+          unmeasurable=0
+          shown=0
+          pool=VRAM
+          # See the native Ubuntu lane for both memos.
+          combined=1
+          gtt_absent=0
+          # Check the deadline only after a poll, never before the first one.
+          # $SECONDS counts whole wall-clock seconds, so a short ceiling can
+          # lapse before the loop is entered, and the verdict below would then
+          # describe a reading that was never taken.
+          first_poll=1
+          while [ "$first_poll" -eq 1 ] || [ "$SECONDS" -lt "$deadline" ]; do
+            first_poll=0
+            out=""
+            rc=0
+            if [ "$combined" -eq 1 ]; then
+              out=$(timeout 15 rocm-smi --showmeminfo vram gtt 2>/dev/null) || rc=$?
+              if [ "$rc" -ne 0 ] || ! printf '%s\n' "$out" | grep -qi 'VRAM Total Memory (B):'; then
+                out=""
+                [ "$rc" -eq 124 ] || combined=0
+              fi
+            fi
+            if [ -z "$out" ]; then
+              out=$(timeout 15 rocm-smi --showmeminfo vram 2>/dev/null) || { sleep 5; continue; }
+            fi
+            total=$(field 'VRAM Total Memory')
+            used=$(field 'VRAM Total Used Memory')
+            gtt_total=$(field 'GTT Total Memory')
+            gtt_used=$(field 'GTT Total Used Memory')
             if [ -z "$total" ] || [ -z "$used" ]; then
               sleep 5; continue
             fi
+            if [ "$total" -le 0 ]; then
+              # A zero total is a failed reading, not a carveout (see the native
+              # Ubuntu lane). Advisory here, so it stays a non-reading.
+              sleep 5; continue
+            fi
             saw_vram=1
+            if [ "$shown" -eq 0 ]; then
+              echo "rocm-smi pools (used/total bytes): VRAM ${used}/${total}, GTT ${gtt_used:-n/a}/${gtt_total:-n/a}"
+              shown=1
+            fi
+            pool=VRAM
+            if [ "$total" -lt "$min_free" ]; then
+              if [ "$gtt_absent" -eq 0 ] && { [ -z "$gtt_total" ] || [ -z "$gtt_used" ]; }; then
+                # See the native lane: the two-pool form may have been rejected,
+                # so ask for GTT alone before calling the pool unmeasurable. A
+                # failed query and a host without the pool both warn here, so
+                # they need no separate message — only the memo tells them
+                # apart, and a failure must not earn one.
+                rc=0
+                out=$(timeout 15 rocm-smi --showmeminfo gtt 2>/dev/null) || rc=$?
+                gtt_total=$(field 'GTT Total Memory')
+                gtt_used=$(field 'GTT Total Used Memory')
+                if [ -n "$gtt_total" ] && [ -n "$gtt_used" ]; then
+                  echo "rocm-smi GTT pool (separate query): ${gtt_used}/${gtt_total}"
+                elif [ "$rc" -eq 0 ]; then
+                  gtt_absent=1
+                fi
+              fi
+              if [ -z "$gtt_total" ] || [ -z "$gtt_used" ]; then
+                unmeasurable=1
+                sleep 5; continue
+              fi
+              # A zero total is a failed reading on this pool too. Advisory
+              # here, so it joins the unmeasurable set rather than hard-failing
+              # the one lane specified never to fail on a host it cannot read.
+              if [ "$gtt_total" -le 0 ]; then
+                unmeasurable=1
+                sleep 5; continue
+              fi
+              pool=GTT; total="$gtt_total"; used="$gtt_used"
+            fi
+            unmeasurable=0
             free=$(( total - used ))
             if [ "$free" -ge "$min_free" ]; then
-              echo "GPU ready: $(( free / 1024 / 1024 / 1024 )) GiB free (>= ${MIN_FREE_GIB} GiB)."
+              echo "GPU ready: $(( free / 1024 / 1024 / 1024 )) GiB ${pool} free (>= ${MIN_FREE_GIB} GiB)."
               exit 0
             fi
-            echo "waiting: $(( free / 1024 / 1024 / 1024 )) GiB free (< ${MIN_FREE_GIB} GiB)…"
+            echo "waiting: $(( free / 1024 / 1024 / 1024 )) GiB ${pool} free (< ${MIN_FREE_GIB} GiB)…"
             sleep 5
           done
           if [ "$saw_vram" -eq 0 ]; then
             echo "::warning::rocm-smi reported no VRAM figures under WSL — GPU scenarios will resolve to skip"
             exit 0
           fi
-          echo "::error::GPU preflight failed after ${CEILING_SECS}s: VRAM never dropped below the floor — a serve is likely still holding the GPU"
+          if [ "$unmeasurable" -eq 1 ]; then
+            # Advisory lane: an unmeasurable pool is a reported condition, not a
+            # held GPU. Failing here would claim a leftover serve we never saw.
+            echo "::warning::rocm-smi reported a VRAM pool under the ${MIN_FREE_GIB} GiB floor and no usable GTT pool — the free-memory floor could not be applied under WSL"
+            exit 0
+          fi
+          echo "::error::GPU preflight failed after ${CEILING_SECS}s: ${pool} never dropped below the floor — a serve is likely still holding the GPU"
+          # Name what is holding the card instead of leaving the next reader to
+          # reconstruct it: --report-holders prints per-process VRAM and the
+          # engine processes visible here. Never fails the step itself.
+          # From the guest clone, like every sibling step: `wsl -- bash <file>`
+          # gets no --cd, so a bare relative path would resolve against whatever
+          # directory WSL maps the Windows step's cwd to, and `|| true` would
+          # hide a miss.
+          (cd /root/work/rocm-cli && bash scripts/reclaim-gpu.sh --report-holders) || true
           exit 1
+          # This body runs under a bare `bash <file>`: Invoke-WslBash.ps1 adds
+          # `-eo pipefail` only when passed `-PipeFail`, which this step does
+          # not — so there is no `-e` here either. Three other steps in this job
+          # do opt in (two via `-PipeFail`, the clone via `set -eo pipefail`).
+          # The other preflight blocks are plain `run:` steps, which GitHub runs
+          # as `bash -e {0}`: `-e`, but — unlike an explicit `shell: bash` — no
+          # pipefail. Under none of the three does this script lean on the
+          # shell; its own empty-value guard (`[ -z "$total" ] || [ -z "$used" ]`)
+          # is what keeps unrecognized `rocm-smi` output retrying rather than
+          # aborting the step.
+          '@
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       # Bootstrap rustup with --no-modify-path so it never writes $HOME/.profile
       # (setup-rust-toolchain doesn't expose that flag). rust-toolchain.toml pins
       # the exact toolchain, installed on first cargo use. Idempotent.
       - name: Ensure Rust toolchain
+        shell: powershell
         run: |
+          # See .github/scripts/Invoke-WslBash.ps1.
+          & "$env:GITHUB_WORKSPACE\.github\scripts\Invoke-WslBash.ps1" -PipeFail -Script @'
           if ! command -v cargo >/dev/null 2>&1 && [ ! -x "$HOME/.cargo/bin/cargo" ]; then
             curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs \
               | sh -s -- -y --no-modify-path --default-toolchain none
           fi
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          '@
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Run E2E tests on Strix Halo WSL2 (incl. nightly-only)
+        shell: powershell
         run: |
-          export CARGO_TARGET_DIR="$RUNNER_WORKSPACE/e2e-target"
-          export E2E_SHARED_CACHE_DIR="$RUNNER_WORKSPACE/e2e-shared"
+          # See .github/scripts/Invoke-WslBash.ps1.
+          $env:WSLENV = 'E2E_SERVE_TIMEOUT_SECS:E2E_TUI_TIMEOUT_SECS:E2E_INCLUDE_NIGHTLY:ROCM_CLI_RELEASE_REF'
+          & "$env:GITHUB_WORKSPACE\.github\scripts\Invoke-WslBash.ps1" -PipeFail -Script @'
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cd /root/work/rocm-cli
+
+          export CARGO_TARGET_DIR="/root/work/e2e-target"
+          export E2E_SHARED_CACHE_DIR="/root/work/e2e-shared"
           # Share ONE installed managed runtime across serve/chat scenarios and
           # PRE-WARM it in place (mirrors e2e-gpu-nightly-strix). Required for
           # correctness, not speed: `install sdk` bakes ABSOLUTE paths into the
           # runtime manifest, so installing into a per-scenario temp dir leaves
           # every later serve pointing at a deleted install root.
-          prewarm="$RUNNER_WORKSPACE/e2e-prewarm"
+          prewarm="/root/work/e2e-prewarm-multi-arch-v2"
           export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
 
-          cargo build --release -p rocm -p rocmd
+          # See the e2e-gpu lane in e2e-selfhosted.yml for why the
+          # e2e-test-hooks feature must match what `cargo xtask e2e` would build.
+          cargo build --release -p rocm -p rocmd --features rocm/e2e-test-hooks
           export ROCM_CLI_BINARY="$CARGO_TARGET_DIR/release/rocm"
           export ROCM_CLI_ROCMD_BINARY="$CARGO_TARGET_DIR/release/rocmd"
 
-          if [ ! -d "$E2E_SHARED_RUNTIMES_DIR/registry" ]; then
-            echo "pre-warming shared runtime (first run on this runner)…"
-            mkdir -p "$prewarm"/{data,config,cache}
-            ROCM_CLI_CONFIG_DIR="$prewarm/config" \
-            ROCM_CLI_DATA_DIR="$prewarm/data" \
-            ROCM_CLI_CACHE_DIR="$prewarm/cache" \
-            HF_HOME="$E2E_SHARED_CACHE_DIR/huggingface" \
-              "$ROCM_CLI_BINARY" install sdk
-            if [ -d "$E2E_SHARED_RUNTIMES_DIR/registry" ]; then
-              echo "shared runtime pre-warmed at $E2E_SHARED_RUNTIMES_DIR"
-            else
-              echo "pre-warm did not produce a runtimes registry; scenarios will install their own" >&2
-            fi
-          else
-            echo "shared runtime already present at $E2E_SHARED_RUNTIMES_DIR — skipping pre-warm"
-          fi
+          # Cache, not a one-shot: refreshed when the channel index has a newer
+          # version. See `xtask e2e-prewarm` (EAI-8057).
+          HF_HOME="$E2E_SHARED_CACHE_DIR/huggingface" \
+            cargo xtask e2e-prewarm --channel ${{ matrix.channel }} --prewarm-dir "$prewarm"
 
           cargo xtask e2e
+          '@
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Copy E2E results out of the WSL guest
+        if: always()
+        shell: powershell
+        run: |
+          # See .github/scripts/Invoke-WslBash.ps1.
+          # wslpath strips backslashes from Windows path args regardless of
+          # quoting on this pool (see Invoke-WslBash.ps1); build /mnt/<drive> by hand.
+          $wsDrive = $env:GITHUB_WORKSPACE.Substring(0, 1).ToLower()
+          $winPath = "/mnt/$wsDrive" + $env:GITHUB_WORKSPACE.Substring(2).Replace('\', '/')
+          $script = @"
+          mkdir -p '$winPath/tests/e2e-cucumber/results'
+          if [ -d /root/work/rocm-cli/tests/e2e-cucumber/results ]; then
+            cp -a /root/work/rocm-cli/tests/e2e-cucumber/results/. '$winPath/tests/e2e-cucumber/results/'
+          fi
+          "@
+          & "$env:GITHUB_WORKSPACE\.github\scripts\Invoke-WslBash.ps1" -Script $script
+          # Best-effort per the step name: see e2e-wsl in e2e-selfhosted.yml.
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::warning::copy-out of E2E results exited $LASTEXITCODE (best-effort, not fatal)"
+          }
+          exit 0
 
       - name: Upload E2E report
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: e2e-gpu-strix-wsl-report
+          name: e2e-gpu-strix-wsl-${{ matrix.channel }}-report
           path: tests/e2e-cucumber/results/
+          # The copy-out step above is deliberately best-effort (it must not
+          # report red just because an earlier step already failed the job),
+          # so a copy that failed for its own reason leaves results/ empty.
+          # `error` makes that a failed step here, in the lane that owns the
+          # copy, where default `warn` would upload nothing without a word.
+          # The consolidated report job's missing-report check flags the absent
+          # artifact too, and is the only signal on a `continue-on-error` lane:
+          # a failed step there does not turn the lane's check red. Only the
+          # WSL lanes need this guard: every other lane writes report.json
+          # directly in-job, with no guest-to-host copy step that can fail on
+          # its own.
+          if-no-files-found: error
 
   # The nightly lanes each uploaded a report nobody joined up, so reading a
   # nightly meant opening every artifact and comparing them by hand — on the
@@ -803,10 +1518,15 @@ jobs:
     # Narrower than the workflow-level `contents: write`, which exists for the
     # release-publishing jobs. This one checks out, downloads artifacts, runs an
     # xtask and uploads; it has no business being able to write to the repo.
+    # `actions: read` lets the missing-report check list this run's artifacts.
     permissions:
       contents: read
+      actions: read
     needs:
       - e2e-gpu-nightly
+      - e2e-gpu-nightly-rad3
+      - e2e-gpu-nightly-mi350p
+      - e2e-gpu-nightly-w7900
       - e2e-gpu-nightly-strix
       - e2e-gpu-nightly-strix-windows
       - e2e-wsl-nightly
@@ -839,7 +1559,59 @@ jobs:
           mkdir -p consolidated
           cargo xtask e2e-report \
             --artifacts-dir e2e-artifacts \
-            --html-out consolidated/index.html >> "$GITHUB_STEP_SUMMARY"
+            --html-out consolidated/index.html > consolidated/support-matrix.md
+          cat consolidated/support-matrix.md >> "$GITHUB_STEP_SUMMARY"
+
+      # A lane that dies before writing report.json (preflight, build, a crash
+      # before results exist) uploads nothing, and `discover()` can only render
+      # the reports that arrived, so that lane would drop out of the grid with
+      # no row and no FAIL. On a `continue-on-error` lane nothing else is red
+      # either. So check it here: every lane that ran (any `needs` result but
+      # `skipped`) must have uploaded its report artifact. This reads the run's
+      # artifact list rather than e2e-artifacts/, because download-artifact
+      # flattens a single match into the root and loses its name. The list also
+      # holds earlier attempts' artifacts, so a re-run that uploads nothing can
+      # pass on the first attempt's report: this can miss a lane, but never
+      # flags one that did upload. Every lane carries a `matrix.channel` axis and is
+      # checked through its `release` leg (the matrix context does not exist in
+      # this job), which stands for the whole lane. LANE_REPORTS, and this script's behaviour,
+      # are pinned by xtask's workflow contract tests. The annotation quotes the
+      # lane's `needs` result verbatim; on a `continue-on-error` lane it may read
+      # `success` even though the lane failed, so the absent artifact is the
+      # signal, not that value. `!cancelled()`, not `always()`: a run
+      # superseded mid-flight cuts lanes off before upload, which is not a gap.
+      - name: Check every lane that ran uploaded its report
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEEDS: ${{ toJSON(needs) }}
+          LANE_REPORTS: |
+            e2e-gpu-nightly=e2e-gpu-release-report
+            e2e-gpu-nightly-rad3=e2e-gpu-rad3-release-report
+            e2e-gpu-nightly-mi350p=e2e-gpu-mi350p-release-report
+            e2e-gpu-nightly-w7900=e2e-gpu-w7900-release-report
+            e2e-gpu-nightly-strix=e2e-gpu-strix-ubuntu-release-report
+            e2e-gpu-nightly-strix-windows=e2e-gpu-strix-windows-release-report
+            e2e-wsl-nightly=e2e-gpu-strix-wsl-release-report
+        run: |
+          uploaded=$(gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts" \
+            --jq '.artifacts[].name') || {
+            echo "::error::could not list this run's artifacts, so no lane was checked"
+            exit 1
+          }
+          missing=0
+          while IFS='=' read -r job artifact; do
+            [ -n "$job" ] || continue
+            result=$(jq -r --arg job "$job" '.[$job].result // "absent"' <<<"$NEEDS")
+            [ "$result" = skipped ] && continue
+            if ! grep -qxF "$artifact" <<<"$uploaded"; then
+              echo "::error::lane $job ran (needs result: $result) but uploaded no $artifact, so it is missing from the consolidated report"
+              echo "- :x: \`$job\` ran (needs result: $result) but uploaded no \`$artifact\`; it is missing from the grid above" >> "$GITHUB_STEP_SUMMARY"
+              missing=1
+            fi
+          done <<<"$LANE_REPORTS"
+          exit "$missing"
 
       - name: Upload consolidated report
         if: always()
@@ -847,3 +1619,69 @@ jobs:
         with:
           name: e2e-consolidated-report-nightly
           path: consolidated/
+
+  # Publishes the consolidated nightly matrix to the repo wiki so the latest
+  # support matrix is readable without opening a run's artifacts. The page is
+  # overwritten each night; the run link, commit and date in its header say
+  # which run it came from. Main-branch runs only, so a dispatch from another
+  # branch cannot overwrite the page, and never from an empty or cancelled run.
+  publish-e2e-wiki:
+    name: Publish E2E support matrix to wiki
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    needs: e2e-report-nightly
+    if: ${{ !cancelled() && needs.e2e-report-nightly.result == 'success' && github.repository == 'ROCm/rocm-cli' && github.ref == 'refs/heads/main' }}
+    concurrency:
+      group: publish-e2e-wiki
+      cancel-in-progress: false
+    steps:
+      - name: Download consolidated nightly report
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: e2e-consolidated-report-nightly
+          path: consolidated
+
+      - name: Push page to the wiki
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          COMMIT_URL: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}
+        run: |
+          set -euo pipefail
+          # An empty consolidation exits 0 upstream; publish only when the
+          # matrix table is present, so any degenerate output (empty file,
+          # reworded message) leaves the last good page in place.
+          if ! grep -q '^| Platform | OS |' consolidated/support-matrix.md; then
+            echo "::warning::No platform table in the consolidated report; leaving the wiki page unchanged."
+            exit 0
+          fi
+          page=E2E-Support-Matrix.md
+          {
+            echo "# E2E support matrix (latest nightly)"
+            echo
+            echo "_Overwritten by the nightly workflow; do not edit by hand._"
+            echo
+            echo "- Run: [${GITHUB_RUN_NUMBER}](${RUN_URL})"
+            echo "- Commit: [\`${GITHUB_SHA::12}\`](${COMMIT_URL})"
+            echo "- Date: $(date -u +'%Y-%m-%d %H:%M UTC')"
+            echo
+            cat consolidated/support-matrix.md
+          } > "/tmp/${page}"
+
+          wiki="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.wiki.git"
+          # GitHub creates the wiki's git repo only when the first page is
+          # saved in the web UI, so a never-used wiki cannot be cloned or
+          # pushed to. Fail with the prerequisite rather than a bare 128.
+          if ! git clone --depth 1 "$wiki" wiki; then
+            echo "::error::Cannot clone the wiki. If this is the first run, enable the wiki in repo settings and create its first page once in the web UI (GitHub does not create the wiki git repo until then); otherwise it may be a transient network failure, so re-run the job."
+            exit 1
+          fi
+          cp "/tmp/${page}" "wiki/${page}"
+          cd wiki
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$page"
+          git commit -m "Update E2E support matrix from nightly run ${GITHUB_RUN_NUMBER}"
+          git push origin HEAD

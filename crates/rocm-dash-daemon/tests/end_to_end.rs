@@ -319,3 +319,388 @@ async fn scrape_warning_persists_between_scrape_ticks() {
     handle.abort();
     let _ = handle.await;
 }
+
+/// Regression: a slow `amd-smi` startup must NOT delay managed-service discovery.
+///
+/// GPU detection (`amd-smi version` + the first `system_info()`) can take ~15s on
+/// real hardware. It used to run inline before the loop started, so the very
+/// first managed-service discovery + snapshot were blocked behind it and an
+/// already-running model appeared in the dashboard ~15-20s late (while
+/// `rocm services` already listed it). Detection now runs off the critical path,
+/// so a `ready` service surfaces on the first discovery tick while GPU detection
+/// is still in flight.
+///
+/// This asserts on ORDERING rather than wall-clock timing (delivery to an
+/// in-process subscriber can be starved while the fake subprocess runs, which
+/// would make a pure "arrived within Ns" check flaky): the instance MUST appear
+/// in a snapshot whose `gpu_system_info` is still `None`. Post-fix that window
+/// exists (many ~100ms ticks before the 4s fake detection lands). Pre-fix it
+/// cannot: the loop only starts ticking after detection completes, so the very
+/// first snapshot carrying the instance already has `gpu_system_info == Some`.
+///
+/// The fake `amd-smi` is forced through the real detection path via
+/// `amd_smi_skip_device_preflight` (see `RunnerOptions`): otherwise the GPU-device
+/// pre-flight short-circuits to "no GPU" on GPU-less CI, the fake never runs,
+/// and the assertion passes vacuously even with the fix reverted. The surfaced
+/// snapshot must also carry NO "amd-smi unavailable" warning — detection is
+/// still in flight there, so flashing that alarm would be a false alarm the
+/// header ⚠ badge should never show.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn slow_gpu_detection_does_not_delay_service_discovery() {
+    use rocm_core::fake_executable::write_fake_executable;
+
+    let dir = tempfile::tempdir().unwrap();
+
+    // A fake amd-smi that is deliberately slow: whatever the subcommand, sleep
+    // well past the discovery deadline, then emit trivially-valid JSON so both
+    // `version` and the `system_info` `--json` calls "succeed".
+    let fake = dir.path().join("amd-smi-slow");
+    write_fake_executable(&fake, "#!/bin/sh\nsleep 4\necho '{}'\n").unwrap();
+
+    // A ready managed vLLM service on disk — the authority `rocm services` reads.
+    std::fs::write(
+        dir.path().join("svc.json"),
+        r#"{"service_id":"vllm-ready-fast","engine":"vllm","model_ref":"m","canonical_model_id":"m",
+            "host":"127.0.0.1","port":11435,"endpoint_url":"http://127.0.0.1:11435/v1",
+            "mode":"managed","status":"ready","created_at_unix_ms":1}"#,
+    )
+    .unwrap();
+
+    // Roomy channel so buffered early snapshots are never dropped (Lagged) even
+    // if the subscriber is briefly starved while the fake subprocess runs.
+    let (tx, mut rx) = broadcast::channel::<Event>(512);
+    let services_dir = dir.path().to_path_buf();
+    let fake_bin = fake.into_os_string();
+    let handle = tokio::spawn(async move {
+        let opts = runner::RunnerOptions {
+            services_dir: Some(services_dir),
+            amd_smi_binary: Some(fake_bin),
+            // Drive the fake through the real detection path on GPU-less CI:
+            // without this the GPU-device pre-flight would short-circuit before
+            // the fake runs, making the ordering assertion vacuous.
+            amd_smi_skip_device_preflight: true,
+            disable_vllm_metrics: true,
+            ..Default::default()
+        };
+        runner::run_loop(
+            Some(Duration::from_millis(100)),
+            tx,
+            Arc::new(Mutex::new(SnapshotRing::new(512))),
+            Arc::new(Mutex::new(BenchRing::new(4))),
+            None,
+            opts,
+        )
+        .await;
+    });
+
+    // Walk snapshots in order. The FIRST snapshot that carries the instance
+    // decides: post-fix it has no GPU info yet (pass); pre-fix it already has
+    // GPU info because detection ran to completion before the loop started.
+    // The generous timeout covers detection + any subscriber starvation.
+    let mut surfaced_before_gpu = None;
+    let mut surfaced_without_unavailable_warning = None;
+    let overall = Duration::from_secs(15);
+    loop {
+        let ev = match timeout(overall, rx.recv()).await {
+            Ok(Ok(ev)) => ev,
+            Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+            Ok(Err(broadcast::error::RecvError::Closed)) => break,
+            Err(_) => break,
+        };
+        if let Event::Snapshot(snap) = ev
+            && snap
+                .instances
+                .iter()
+                .any(|i| i.container_id == "vllm-ready-fast")
+        {
+            surfaced_before_gpu = Some(snap.gpu_system_info.is_none());
+            surfaced_without_unavailable_warning = Some(
+                !snap
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains("amd-smi unavailable")),
+            );
+            break;
+        }
+    }
+
+    handle.abort();
+    let _ = handle.await;
+
+    match surfaced_before_gpu {
+        Some(true) => {} // instance surfaced while GPU detection was still in flight
+        Some(false) => panic!(
+            "managed service only surfaced after GPU detection completed \
+             (the ~15-20s dashboard startup lag regressed)"
+        ),
+        None => panic!("ready managed service never surfaced in a snapshot"),
+    }
+
+    // Detection is still in flight in that first snapshot, so the honest state
+    // is "GPU pending", never "amd-smi unavailable". Flashing the unavailable
+    // warning here would be a false alarm on healthy hardware.
+    assert_eq!(
+        surfaced_without_unavailable_warning,
+        Some(true),
+        "managed service surfaced with a premature `amd-smi unavailable` warning \
+         while detection was still in flight"
+    );
+}
+
+/// `amd_smi_gpu_reachable: true` (the rocm-core verdict — KFD/DRM on Linux,
+/// ROCDXG bridge on WSL) is a plumbing-presence signal, not proof that amd-smi
+/// can actually enumerate a supported GPU. On WSL, ROCDXG can report ready on
+/// an APU/GPU model ROCm does not support at all, so `amd-smi version` still
+/// fails. That contradiction must produce a warning that says so, distinct
+/// from the bare-metal "device inaccessible" message — the generic message
+/// would flatly contradict what `examine` just told the same user (ready).
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gpu_reachable_but_amd_smi_failing_warns_of_the_contradiction_not_inaccessibility() {
+    use rocm_core::fake_executable::write_fake_executable;
+
+    let dir = tempfile::tempdir().unwrap();
+
+    // Fails immediately, mirroring a real amd-smi's "Drivers not loaded" exit on
+    // a WSL host whose GPU ROCDXG can reach but ROCm does not support.
+    let fake = dir.path().join("amd-smi-broken");
+    write_fake_executable(&fake, "#!/bin/sh\nexit 1\n").unwrap();
+
+    let (tx, mut rx) = broadcast::channel::<Event>(512);
+    let fake_bin = fake.into_os_string();
+    let handle = tokio::spawn(async move {
+        let opts = runner::RunnerOptions {
+            amd_smi_binary: Some(fake_bin),
+            // Force the fake through the real detection path, mirroring how
+            // `apps/rocm` threads `rocm_core::has_usable_amd_gpu()` through:
+            // `amd_smi_gpu_reachable: true` alone satisfies the real pre-flight.
+            amd_smi_skip_device_preflight: false,
+            amd_smi_gpu_reachable: true,
+            disable_vllm_metrics: true,
+            ..Default::default()
+        };
+        runner::run_loop(
+            Some(Duration::from_millis(50)),
+            tx,
+            Arc::new(Mutex::new(SnapshotRing::new(512))),
+            Arc::new(Mutex::new(BenchRing::new(4))),
+            None,
+            opts,
+        )
+        .await;
+    });
+
+    // One outer deadline for the whole wait, not a per-message timeout: the
+    // runner broadcasts a snapshot every 50ms, so a timeout re-armed on each
+    // `rx.recv()` can never elapse while a matching snapshot never arrives,
+    // which would hang this regression guard forever instead of failing red.
+    let overall = Duration::from_secs(10);
+    let mut found = None;
+    let _ = timeout(overall, async {
+        loop {
+            match rx.recv().await {
+                Ok(Event::Snapshot(snap)) if !snap.warnings.is_empty() => {
+                    found = Some(snap.warnings);
+                    break;
+                }
+                Ok(_) => {}
+                Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    })
+    .await;
+
+    handle.abort();
+    let _ = handle.await;
+
+    let warnings = found.expect("a warning-carrying snapshot must arrive within 10s");
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("is missing, unresolvable, or failed to run")
+                && w.contains("detected by other means")),
+        "expected the reachable-but-failing contradiction message, got: {warnings:?}"
+    );
+    assert!(
+        !warnings.iter().any(|w| w
+            == "amd-smi unavailable (not installed, unresolvable, or the GPU device is \
+                inaccessible)"),
+        "must not fall back to the bare-metal inaccessible message when reachability was asserted: {warnings:?}"
+    );
+}
+
+/// The production wiring (`apps/rocm/src/dash.rs` threading
+/// `is_wsl_host() && rocm_core::has_usable_amd_gpu()` into
+/// `RunnerOptions.amd_smi_gpu_reachable`) is only exercised through
+/// `AmdSmiCollector::detect_with_binary`'s real device pre-flight —
+/// `amd_smi_skip_device_preflight: false` here, unlike the tests above.
+/// Without this, the `gpu_reachable` OR-branch in `preflight_passes` could be
+/// reverted and nothing would fail (the branch is a symmetric OR, so swapping
+/// its two `bool` arguments is behaviour-preserving and not something an
+/// integration test at this layer can catch either way).
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gpu_reachable_without_kfd_lets_amd_smi_run_through_the_real_preflight() {
+    use rocm_core::fake_executable::write_fake_executable;
+
+    if std::fs::OpenOptions::new()
+        .read(true)
+        .open("/dev/kfd")
+        .is_ok()
+    {
+        eprintln!(
+            "skipping: this test requires no accessible /dev/kfd, so it exercises the \
+             reachability OR-branch rather than the device-node one"
+        );
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+
+    // Succeeds on every subcommand `version`/`metric --json`/`static --json`/
+    // `topology --json` all get called; only `metric` needs a real payload.
+    let fake = dir.path().join("amd-smi-ok");
+    write_fake_executable(&fake,
+        "#!/bin/sh\ncase \"$1\" in\n  metric) echo '{\"gpu_data\":[{\"gpu\":0}]}' ;;\n  *) echo '{}' ;;\nesac\n",
+    )
+    .unwrap();
+
+    let (tx, mut rx) = broadcast::channel::<Event>(512);
+    let fake_bin = fake.into_os_string();
+    let handle = tokio::spawn(async move {
+        let opts = runner::RunnerOptions {
+            amd_smi_binary: Some(fake_bin),
+            amd_smi_skip_device_preflight: false,
+            amd_smi_gpu_reachable: true,
+            disable_vllm_metrics: true,
+            ..Default::default()
+        };
+        runner::run_loop(
+            Some(Duration::from_millis(50)),
+            tx,
+            Arc::new(Mutex::new(SnapshotRing::new(512))),
+            Arc::new(Mutex::new(BenchRing::new(4))),
+            None,
+            opts,
+        )
+        .await;
+    });
+
+    // See the comment on the same shape above: an outer deadline, not a
+    // per-message timeout, so a reverted preflight (never emitting a
+    // non-empty `gpus`) fails red at 10s instead of hanging forever.
+    let overall = Duration::from_secs(10);
+    let mut found = false;
+    let _ = timeout(overall, async {
+        loop {
+            match rx.recv().await {
+                Ok(Event::Snapshot(snap)) if !snap.gpus.is_empty() => {
+                    found = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    })
+    .await;
+
+    handle.abort();
+    let _ = handle.await;
+
+    assert!(
+        found,
+        "gpu_reachable: true must let the real device pre-flight pass and the fake amd-smi \
+         produce telemetry within 10s, even with no accessible /dev/kfd on this host"
+    );
+}
+
+/// Sibling of the above with `amd_smi_gpu_reachable: false`: pins the negative
+/// direction (reachability false must not let the fake `amd-smi` run without
+/// an accessible `/dev/kfd`). Relies on this test host having no accessible
+/// `/dev/kfd` (true in CI and on this WSL host, which is the whole premise of
+/// the WSL amd-smi detection this PR adds) — on a dev machine with a real,
+/// readable GPU device this precondition doesn't hold, so the test skips
+/// itself instead of failing red.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gpu_unreachable_without_kfd_never_runs_amd_smi() {
+    use rocm_core::fake_executable::write_fake_executable;
+
+    if std::fs::OpenOptions::new()
+        .read(true)
+        .open("/dev/kfd")
+        .is_ok()
+    {
+        eprintln!("skipping: this test requires no accessible /dev/kfd, but this host has one");
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+
+    // Same fake as above: if this ran, it would prove telemetry, but the
+    // pre-flight must reject it first since neither OR-condition holds.
+    let fake = dir.path().join("amd-smi-ok");
+    write_fake_executable(&fake,
+        "#!/bin/sh\ncase \"$1\" in\n  metric) echo '{\"gpu_data\":[{\"gpu\":0}]}' ;;\n  *) echo '{}' ;;\nesac\n",
+    )
+    .unwrap();
+
+    let (tx, mut rx) = broadcast::channel::<Event>(512);
+    let fake_bin = fake.into_os_string();
+    let handle = tokio::spawn(async move {
+        let opts = runner::RunnerOptions {
+            amd_smi_binary: Some(fake_bin),
+            amd_smi_skip_device_preflight: false,
+            amd_smi_gpu_reachable: false,
+            disable_vllm_metrics: true,
+            ..Default::default()
+        };
+        runner::run_loop(
+            Some(Duration::from_millis(50)),
+            tx,
+            Arc::new(Mutex::new(SnapshotRing::new(512))),
+            Arc::new(Mutex::new(BenchRing::new(4))),
+            None,
+            opts,
+        )
+        .await;
+    });
+
+    // One outer deadline for the whole wait, not a per-message timeout: see
+    // the comment on the same shape above these siblings.
+    let overall = Duration::from_secs(10);
+    let mut snapshots_seen = 0;
+    let _ = timeout(overall, async {
+        loop {
+            match rx.recv().await {
+                Ok(Event::Snapshot(snap)) => {
+                    assert!(
+                        snap.gpus.is_empty(),
+                        "amd-smi must never run when neither gpu_reachable nor a readable \
+                         /dev/kfd hold"
+                    );
+                    snapshots_seen += 1;
+                    if snapshots_seen >= 5 {
+                        break;
+                    }
+                }
+                Ok(_) => {}
+                Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    })
+    .await;
+
+    handle.abort();
+    let _ = handle.await;
+
+    assert!(
+        snapshots_seen >= 5,
+        "expected at least 5 snapshot ticks within 10s"
+    );
+}

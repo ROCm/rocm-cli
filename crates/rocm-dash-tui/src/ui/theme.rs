@@ -14,6 +14,7 @@
 //! Pattern borrowed from ctux (see `../../../wiki/sources/ctux.md`).
 
 use ratatui::style::{Color, Modifier, Style};
+use rocm_dash_core::state::JobStatus;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Theme {
@@ -30,7 +31,7 @@ pub struct Theme {
     pub border: Color,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusTone {
     Neutral,
     Muted,
@@ -245,6 +246,48 @@ impl Theme {
             StatusTone::Error | StatusTone::Alert => self.err,
         }
     }
+
+    /// Color for a [`JobStatus`], via [`Self::tone_color`]. The single source
+    /// of truth for job-status color shared by the job console banner and the
+    /// Home tab activity feed — they must not each pick their own mapping.
+    /// The LOGS dock shares the same underlying tone table via
+    /// `log_body_tone` rather than calling this function directly, since it
+    /// needs `Running` to stay neutral instead of accent — see
+    /// `dock::logs_dock` and `log_body_tone`'s doc comment.
+    pub const fn job_status_color(&self, status: &JobStatus) -> Color {
+        self.tone_color(job_status_tone(status))
+    }
+}
+
+/// Tone for a [`JobStatus`], shared by [`Theme::job_status_color`] and
+/// [`log_body_tone`]. Kept as a plain exhaustive `match` (not a method on
+/// `JobStatus` itself) since `StatusTone` lives here in `rocm-dash-tui`, not
+/// in `rocm-dash-core` where `JobStatus` is defined.
+const fn job_status_tone(status: &JobStatus) -> StatusTone {
+    match status {
+        // Accent (cyan) rather than the warning/in-progress tone
+        // `docs/ux-guidelines.md` suggests for "work in progress": a
+        // running job is the thing the user's attention should be on
+        // right now, which is what accent means elsewhere in this app,
+        // and warn/orange is reserved for a job that finished with a
+        // nonzero exit code.
+        JobStatus::Running => StatusTone::Accent,
+        JobStatus::Done { code: 0 } => StatusTone::Success,
+        JobStatus::Done { .. } => StatusTone::Warning,
+        JobStatus::Failed { .. } => StatusTone::Error,
+        JobStatus::Cancelled => StatusTone::Muted,
+    }
+}
+
+/// Like [`job_status_tone`], except `Running` stays neutral — see
+/// `dock::logs_dock`'s doc comment for why a saturated accent tone doesn't
+/// belong on an entire streamed log body. Exhaustive, so a new `JobStatus`
+/// variant forces a decision here instead of silently defaulting to accent.
+pub(crate) const fn log_body_tone(status: &JobStatus) -> StatusTone {
+    match status {
+        JobStatus::Running => StatusTone::Neutral,
+        other => job_status_tone(other),
+    }
 }
 
 impl Default for Theme {
@@ -255,6 +298,56 @@ impl Default for Theme {
 
 const fn rgb(r: u8, g: u8, b: u8) -> Color {
     Color::Rgb(r, g, b)
+}
+
+/// WCAG relative luminance of an sRGB color, in `[0.0, 1.0]`.
+///
+/// <https://www.w3.org/TR/WCAG21/#dfn-relative-luminance>
+fn relative_luminance(r: u8, g: u8, b: u8) -> f64 {
+    fn channel(c: u8) -> f64 {
+        let c = f64::from(c) / 255.0;
+        if c <= 0.03928 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    }
+    0.0722f64.mul_add(
+        channel(b),
+        0.2126f64.mul_add(channel(r), 0.7152 * channel(g)),
+    )
+}
+
+/// Pick whichever of black/white text has the higher WCAG contrast ratio against `bg`.
+///
+/// This avoids assuming the theme's own `bg` color (usually near-black or
+/// near-white) reads fine against an arbitrary status color — which breaks
+/// down for some bundled light themes.
+///
+/// Returns true RGB black/white (`Color::Rgb(0, 0, 0)` / `Color::Rgb(255, 255,
+/// 255)`), not the `Color::Black`/`Color::White` ANSI palette entries — those
+/// are indices into the user's terminal palette and can be remapped to
+/// anything (e.g. Catppuccin Latte's ANSI black is `#5c5f77`, far lighter than
+/// true black), which would silently invalidate the WCAG contrast this
+/// function just computed.
+///
+/// Every color in every bundled theme is built through the `rgb()` helper
+/// above, so `Color::Rgb` is the only arm that actually runs in practice; the
+/// function is still exhaustive over `Color` for correctness, falling back to
+/// true black (a safe, conservative default) for every other variant.
+pub fn readable_text_on(bg: Color) -> Color {
+    let Color::Rgb(r, g, b) = bg else {
+        return Color::Rgb(0, 0, 0);
+    };
+    let l = relative_luminance(r, g, b);
+    // Contrast ratio of white/black text against a background of luminance `l`.
+    let white_contrast = (1.0 + 0.05) / (l + 0.05);
+    let black_contrast = (l + 0.05) / (0.0 + 0.05);
+    if white_contrast > black_contrast {
+        Color::Rgb(255, 255, 255)
+    } else {
+        Color::Rgb(0, 0, 0)
+    }
 }
 
 /// 16-color ANSI palettes. Hex values from each project's canonical source;
@@ -600,5 +693,83 @@ mod tests {
         assert_eq!(t.muted, p.br_black);
         assert_eq!(t.accent, p.br_cyan);
         assert_eq!(t.err, p.red);
+    }
+
+    #[test]
+    fn readable_text_on_white_bg_is_black() {
+        assert_eq!(
+            readable_text_on(Color::Rgb(255, 255, 255)),
+            Color::Rgb(0, 0, 0)
+        );
+    }
+
+    #[test]
+    fn readable_text_on_black_bg_is_white() {
+        assert_eq!(
+            readable_text_on(Color::Rgb(0, 0, 0)),
+            Color::Rgb(255, 255, 255)
+        );
+    }
+
+    #[test]
+    fn readable_text_on_beats_the_old_theme_bg_trick_for_catppuccin_latte() {
+        // Regression guard for the job-console contrast bug: the old code used
+        // `Style::default().fg(theme.bg)` as the text color on top of a status
+        // fill, assuming the theme's own bg (near-black/near-white) always
+        // contrasts well against any status color. That's false for
+        // catppuccin-latte, whose bg is light and whose `ok` green is only
+        // mid-brightness.
+        let t = Theme::catppuccin_latte();
+        assert_eq!(t.bg, Color::Rgb(0xef, 0xf1, 0xf5), "bg is a light color");
+        let old_trick_color = t.bg;
+        let fixed_color = readable_text_on(t.ok);
+        assert_eq!(fixed_color, Color::Rgb(0, 0, 0));
+        assert_ne!(
+            fixed_color, old_trick_color,
+            "the fix should pick a different (and better-contrasting) color than the old bg-based trick"
+        );
+    }
+
+    #[test]
+    fn job_status_tone_covers_all_variants() {
+        let cases = [
+            (JobStatus::Running, StatusTone::Accent),
+            (JobStatus::Done { code: 0 }, StatusTone::Success),
+            (JobStatus::Done { code: 7 }, StatusTone::Warning),
+            (
+                JobStatus::Failed {
+                    message: "boom".into(),
+                },
+                StatusTone::Error,
+            ),
+            (JobStatus::Cancelled, StatusTone::Muted),
+        ];
+        for (status, expected) in cases {
+            assert_eq!(job_status_tone(&status), expected, "{status:?}");
+        }
+    }
+
+    #[test]
+    fn log_body_tone_matches_job_status_tone_except_running() {
+        // `log_body_tone` exists solely to keep `Running` neutral in the LOGS
+        // dock (see `dock::logs_dock`'s doc comment); every other variant
+        // must stay identical to the shared `job_status_tone` mapping.
+        let cases = [
+            JobStatus::Done { code: 0 },
+            JobStatus::Done { code: 7 },
+            JobStatus::Failed {
+                message: "boom".into(),
+            },
+            JobStatus::Cancelled,
+        ];
+        for status in cases {
+            assert_eq!(
+                log_body_tone(&status),
+                job_status_tone(&status),
+                "{status:?}"
+            );
+        }
+        assert_eq!(log_body_tone(&JobStatus::Running), StatusTone::Neutral);
+        assert_ne!(job_status_tone(&JobStatus::Running), StatusTone::Neutral);
     }
 }

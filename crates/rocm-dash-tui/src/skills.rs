@@ -10,7 +10,7 @@
 //! it's already satisfied), and an ordered list of typed `steps`. This module is
 //! the pure model: parse + validate + build an ordered plan + the
 //! detect→config mapping for `auto-config-endpoint`. It has **no rig/reqwest**
-//! dependency (the agent-tool wrappers live in `agent.rs`); execution + I/O live
+//! dependency (the agent-tool wrappers live in `agent/tools.rs`); execution + I/O live
 //! in the `rocm` binary's `skills_cmd`.
 
 use serde::{Deserialize, Serialize};

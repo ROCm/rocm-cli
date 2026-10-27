@@ -10,12 +10,14 @@
 //! pre-screen, not a parallel event loop). Per the latest mocks there is no
 //! image-generation row; "Optimize a model" is display-only with a `soon` badge.
 
+use crossterm::event::KeyCode;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
+use rocm_dash_core::metrics::Instance;
 #[cfg(test)]
 use rocm_dash_core::metrics::InstanceStatus;
 
@@ -83,9 +85,27 @@ pub fn choice_for(sel: usize) -> LauncherChoice {
         .map_or(LauncherChoice::OpenDashboard, |(_, _, _, c)| *c)
 }
 
-/// True when a model is actively serving (drives the running vs idle variant).
+/// Move the selection cursor one step, wrapping around `row_count`.
+///
+/// `forward` selects the next row (Down/j/Right); otherwise the previous row
+/// (Up/k/Left). Pulled out of `run_launcher`'s event loop so the wrapping
+/// arithmetic is unit-testable without a real terminal.
+#[must_use]
+pub const fn move_selection(sel: usize, row_count: usize, forward: bool) -> usize {
+    if forward {
+        (sel + 1) % row_count
+    } else {
+        (sel + row_count - 1) % row_count
+    }
+}
+
+/// True when a model is actively serving (drives the running vs idle
+/// variant). Delegates to [`AppState::has_live_instance`] — the same
+/// predicate the confirm-before-quit gate uses — rather than re-testing
+/// `status.is_serving()` here too, so "what counts as serving" can't drift
+/// between the status strip and the quit gate.
 fn is_running(state: &AppState) -> bool {
-    state.instances.values().any(|i| i.status.is_serving())
+    state.has_live_instance()
 }
 
 pub fn draw(f: &mut Frame, area: Rect, state: &AppState, sel: usize, theme: &Theme) {
@@ -125,6 +145,26 @@ pub fn draw(f: &mut Frame, area: Rect, state: &AppState, sel: usize, theme: &The
     );
 
     draw_menu(f, rows[4], state, sel, theme);
+
+    // Quit-confirm prompt (issue #145): the launcher's own `q`/Esc is a
+    // second, independent quit entry point and shares the dashboard's gate
+    // (`handle_launcher_key`) — so it must also share the dashboard's prompt
+    // rendering (`crate::ui::quit_confirm_request`, the same builder
+    // `ui::draw`'s own quit_confirm arm calls) rather than silently dropping
+    // the decision on the floor once opened, or hand-copying the title text.
+    if let Some(choice) = state.quit_confirm {
+        crate::ui::modal::grey_overlay(f);
+        // `false`: the launcher has no live Services overlay to jump to
+        // (`AppState::quit_confirm_open_services_key` is dashboard-only), so
+        // it must not advertise the `s` hint the dashboard's copy does.
+        crate::ui::approval::draw_approval(
+            f,
+            area,
+            &crate::ui::quit_confirm_request(state, false),
+            choice,
+            theme,
+        );
+    }
 }
 
 fn draw_status_strip(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
@@ -233,10 +273,65 @@ fn draw_menu(f: &mut Frame, area: Rect, state: &AppState, sel: usize, theme: &Th
     ]));
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
-        "↑↓ move   Enter select   d dashboard   q quit",
+        "↑↓←→ move   Enter select   d dashboard   q / Ctrl-C quit",
         Style::default().fg(theme.muted),
     )));
     f.render_widget(Paragraph::new(lines), area);
+}
+
+/// Build the launcher's render state, seeding `instances` from the serving
+/// models the caller discovered in the managed-service registry.
+///
+/// Also seeds a static live-registry probe (`registry_probe::StaticManagedRegistrySnapshot`)
+/// reporting every one of those ids as managed: unlike the full dashboard's
+/// live daemon connection, which can also surface Docker- or
+/// Lemonade-discovered instances from an external daemon, every entry here
+/// came from `apps/rocm::dash::launcher_serving_instances`'s own
+/// `discover_managed_services` call, so all of them are genuinely reachable
+/// with `rocm services stop <id> --yes` — without this, the launcher's own
+/// copy of the quit-confirm prompt (`ui::quit_confirm_body`) would gate that
+/// remediation line on an always-empty set and warn with nothing actionable.
+/// A *static* probe, not a live-reading one, because the caller already did
+/// the live read for this menu-loop pass (`run_launcher`'s own loop re-reads
+/// before every `ui::launcher::run_launcher` call) — there is nothing left
+/// for a second, in-TUI read to catch until the user acts and the loop comes
+/// back around.
+///
+/// Kept separate from the terminal loop so the seeding is unit-testable without
+/// a real terminal: an empty `serving` yields the idle front door, a non-empty
+/// one makes `is_running` report the running model.
+fn launcher_state(theme_name: &str, serving: Vec<Instance>) -> AppState {
+    use crate::registry_probe::{ManagedRegistrySnapshot, StaticManagedRegistrySnapshot};
+
+    let mut state = AppState::new(String::new(), theme_name.to_string());
+    // `run_launcher` (production) calls this with `serving` already filtered
+    // by its own caller (`apps/rocm::dash::launcher_serving_instances`, which
+    // drops a failed/stopped/unbound-port record via
+    // `discover_managed_services`), but tests calling this directly can and
+    // do construct whatever `serving` they like, with no filter of their own
+    // (see `launcher_state_does_not_warn_on_a_starting_only_registry` below).
+    // So `has_live_service` must still apply the same `is_serving()` filter
+    // the live probe (`LiveManagedRegistryProbe::snapshot`) applies, rather
+    // than trust every status a caller passes — otherwise a
+    // `starting`/`recovering`-only registry would trip the "May still be
+    // serving" quit-confirm prompt here but not on the dashboard, which
+    // reads the exact same registry through the live probe instead.
+    let has_live_service = serving.iter().any(|inst| inst.status.is_serving());
+    let managed_ids: std::collections::HashSet<String> = serving
+        .iter()
+        .map(|inst| inst.container_id.clone())
+        .collect();
+    state.managed_registry_probe = Some(std::sync::Arc::new(StaticManagedRegistrySnapshot(
+        ManagedRegistrySnapshot {
+            has_live_service,
+            managed_ids,
+        },
+    )));
+    state.instances = serving
+        .into_iter()
+        .map(|inst| (inst.container_id.clone(), inst))
+        .collect();
+    state
 }
 
 /// Run the launcher as a synchronous pre-dash screen.
@@ -245,20 +340,23 @@ fn draw_menu(f: &mut Frame, area: Rect, state: &AppState, sel: usize, theme: &Th
 /// caller escalates into the existing dash entry points (ponytail: no parallel
 /// async loop here).
 ///
-/// Renders the idle variant from a fresh `AppState` (no live daemon is started
-/// just for the front door); live telemetry appears once the dash is opened.
+/// `serving` seeds the status strip / menu so the front door reflects the models
+/// the managed-service registry reports as running (the same authority
+/// `rocm services` reads) — without starting a live telemetry daemon just for the
+/// front door. Live GPU telemetry still appears once the dash is opened.
 ///
 /// # Errors
 /// Propagates terminal setup / event-read I/O errors.
-pub fn run_launcher(theme_name: &str) -> std::io::Result<Option<LauncherChoice>> {
-    use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-    use crossterm::terminal::{
-        EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-    };
+pub fn run_launcher(
+    theme_name: &str,
+    serving: Vec<Instance>,
+) -> std::io::Result<Option<LauncherChoice>> {
+    use crossterm::event::{self, Event, KeyEventKind};
+    use crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
     use ratatui::Terminal;
     use ratatui::backend::CrosstermBackend;
 
-    let state = AppState::new(String::new(), theme_name.to_string());
+    let mut state = launcher_state(theme_name, serving);
     let theme = state.theme;
 
     enable_raw_mode()?;
@@ -269,29 +367,124 @@ pub fn run_launcher(theme_name: &str) -> std::io::Result<Option<LauncherChoice>>
 
     let mut sel = 0usize;
     let result = loop {
-        terminal.draw(|f| draw(f, f.area(), &state, sel, &theme))?;
+        draw_menu_unless_shutting_down(
+            &mut terminal,
+            &state,
+            sel,
+            &theme,
+            &crate::app::SHUTTING_DOWN,
+        )?;
         let Event::Key(k) = event::read()? else {
             continue;
         };
         if k.kind != KeyEventKind::Press {
             continue;
         }
-        match k.code {
-            KeyCode::Char('q') | KeyCode::Esc => break None,
-            KeyCode::Char('d') => break Some(LauncherChoice::OpenDashboard),
-            KeyCode::Enter => break Some(choice_for(sel)),
-            KeyCode::Down | KeyCode::Char('j') => sel = (sel + 1) % row_count(),
-            KeyCode::Up | KeyCode::Char('k') => {
-                sel = (sel + row_count() - 1) % row_count();
-            }
-            _ => {}
+        // Raw mode delivers a typed Ctrl-C as a key event, not a signal, so the
+        // hub's termination watcher never sees it. This menu is the second of
+        // the process's two key loops; route it through the same
+        // restore-and-exit path a real SIGINT takes, so the gesture cannot mean
+        // one thing inside a session and nothing at all at the front door.
+        if crate::app::is_ctrl_c(k) {
+            crate::app::exit_on_ctrl_c();
+        }
+        if let LauncherKeyOutcome::Exit(outcome) = handle_launcher_key(&mut state, &mut sel, k.code)
+        {
+            break outcome;
         }
     };
 
-    disable_raw_mode()?;
-    crossterm::execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
+    // One shared teardown for the whole crate. This used to be an open-coded
+    // `disable_raw_mode` + `LeaveAlternateScreen` + `show_cursor` — a second
+    // restore implementation that could (and would) drift from the one the
+    // signal watcher and the typed-Ctrl-C path run. `restore_terminal` is
+    // best-effort by design: a vanished controlling terminal must not turn a
+    // clean launcher exit into an `Err`, which the `?`s here previously did.
+    crate::app::restore_terminal();
     Ok(result)
+}
+
+/// What a single launcher key input does: either `run_launcher`'s loop keeps
+/// going (`Continue`) or it should break with this result (`Exit`).
+enum LauncherKeyOutcome {
+    Continue,
+    Exit(Option<LauncherChoice>),
+}
+
+/// What a single launcher key input does. Pure w.r.t. I/O — like
+/// `move_selection` below and the dashboard's own
+/// `app::actions::apply_action` — so the decision is unit-testable without a
+/// real terminal.
+///
+/// While the quit-confirm prompt is open it owns every key, resolved via the
+/// shared [`crate::app::AppState::resolve_quit_confirm_key`] — the same one
+/// the dashboard's event loop calls from its own `quit_confirm_pending` arm —
+/// so nothing else in this match can pre-empt the decision, and the two
+/// loops can't drift on what a verdict does.
+///
+/// `q`/Esc route through the shared [`crate::app::request_quit`] gate
+/// (issue #145) instead of quitting outright — the launcher is a second,
+/// independent quit entry point and must not get to skip the confirm prompt
+/// a model still serving requires.
+fn handle_launcher_key(state: &mut AppState, sel: &mut usize, code: KeyCode) -> LauncherKeyOutcome {
+    if state.quit_confirm_pending() {
+        return match state.resolve_quit_confirm_key(code) {
+            Some(true) => LauncherKeyOutcome::Exit(None),
+            Some(false) | None => LauncherKeyOutcome::Continue,
+        };
+    }
+    match code {
+        KeyCode::Char('q') | KeyCode::Esc => {
+            if crate::app::request_quit(state) {
+                LauncherKeyOutcome::Exit(None)
+            } else {
+                LauncherKeyOutcome::Continue
+            }
+        }
+        KeyCode::Char('d') => LauncherKeyOutcome::Exit(Some(LauncherChoice::OpenDashboard)),
+        KeyCode::Enter => LauncherKeyOutcome::Exit(Some(choice_for(*sel))),
+        KeyCode::Down | KeyCode::Char('j') | KeyCode::Right => {
+            *sel = move_selection(*sel, row_count(), true);
+            LauncherKeyOutcome::Continue
+        }
+        KeyCode::Up | KeyCode::Char('k') | KeyCode::Left => {
+            *sel = move_selection(*sel, row_count(), false);
+            LauncherKeyOutcome::Continue
+        }
+        _ => LauncherKeyOutcome::Continue,
+    }
+}
+
+/// Draw one launcher frame, unless a shutdown has already been claimed on
+/// `latch`.
+///
+/// The hub's signal watcher runs on its own runtime while this menu loop owns
+/// the main thread, so a termination can be in flight concurrently: the terminal
+/// is being restored, and this frame must not land after the restore and undo
+/// it. See the ordering note on `crate::app::restore_terminal`.
+///
+/// As in the dashboard's gate, the latch read is done *under*
+/// `crate::app::lock_terminal_writer`, which is then held for the whole frame:
+/// the lock stops a restore splicing into (or being overtaken by) this frame, and
+/// the latch read under it stops a frame that a restore already beat to the lock.
+/// Neither half is sufficient alone.
+///
+/// Parameterised over the backend and the latch so the gate is testable against
+/// a `TestBackend` — inlined in the loop it was reachable only from a real
+/// terminal, and deleting it turned no test red.
+fn draw_menu_unless_shutting_down<B: ratatui::backend::Backend>(
+    terminal: &mut ratatui::Terminal<B>,
+    state: &AppState,
+    sel: usize,
+    theme: &Theme,
+    latch: &std::sync::atomic::AtomicBool,
+) -> Result<(), <B as ratatui::backend::Backend>::Error> {
+    let _writer = crate::app::lock_terminal_writer();
+    if crate::app::shutdown_claimed_on(latch) {
+        return Ok(());
+    }
+    terminal.draw(|f| draw(f, f.area(), state, sel, theme))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -313,6 +506,150 @@ mod tests {
             .iter()
             .map(ratatui::buffer::Cell::symbol)
             .collect()
+    }
+
+    #[test]
+    fn a_claimed_shutdown_stops_the_launcher_painting_another_frame() {
+        // Same gate as the dashboard's, on the crate's *other* key loop. The hub
+        // menu runs on the main thread while the hub's signal watcher runs on its
+        // own runtime, so a frame started after `restore_terminal()` would hide
+        // the cursor again and repaint the menu over the restored screen.
+        // Local latch, `TestBackend`: asserts painted cells, not the predicate.
+        use std::sync::atomic::AtomicBool;
+
+        let painted = |term: &Terminal<TestBackend>| -> String {
+            term.backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(ratatui::buffer::Cell::symbol)
+                .collect::<String>()
+                .trim()
+                .to_string()
+        };
+
+        let state = base();
+        let theme = state.theme;
+
+        // Control: an unclaimed latch must let the frame through, or the
+        // assertion below would hold for a helper that simply never draws.
+        let open = AtomicBool::new(false);
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        draw_menu_unless_shutting_down(&mut term, &state, 0, &theme, &open)
+            .expect("drawing to a TestBackend cannot fail");
+        assert!(
+            !painted(&term).is_empty(),
+            "with no shutdown claimed the launcher must paint its menu"
+        );
+
+        let claimed = AtomicBool::new(true);
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        draw_menu_unless_shutting_down(&mut term, &state, 0, &theme, &claimed)
+            .expect("the gate must not turn a suppressed frame into an error");
+        assert_eq!(
+            painted(&term),
+            "",
+            "once the shutdown is claimed the launcher must stop painting — a \
+             late frame lands after `restore_terminal()` and undoes it"
+        );
+    }
+
+    #[test]
+    fn a_menu_frame_cannot_paint_while_a_teardown_owns_the_terminal() {
+        // The launcher's half of the fix for the partial restore the WSL2 E2E
+        // lane caught (`alternate_screen=false, cursor_hidden=true`): reading the
+        // latch cannot stop a frame that already passed the gate, and that
+        // frame's trailing `Hide` undoes the restore's `Show`. The menu loop must
+        // therefore take `lock_terminal_writer()` first and read the latch under
+        // it. See the twin test in `app::tests`, which carries the full analysis.
+        use std::sync::atomic::AtomicBool;
+
+        let painted = |term: &Terminal<TestBackend>| -> String {
+            term.backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(ratatui::buffer::Cell::symbol)
+                .collect::<String>()
+                .trim()
+                .to_string()
+        };
+
+        let state = base();
+        let theme = state.theme;
+        let latch = AtomicBool::new(false);
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+        let (drawing_tx, drawing_rx) = std::sync::mpsc::channel::<()>();
+
+        std::thread::scope(|scope| {
+            // `mpsc::Receiver` is `Send` but not `Sync`, so the halves the
+            // teardown thread uses are moved into it; the latch is shared as a
+            // plain reference (the whole point is that both threads see it).
+            let latch = &latch;
+            scope.spawn(move || {
+                // Stands in for `crate::app::restore_terminal()`, which takes this
+                // same lock around its escape bytes.
+                let guard = crate::app::lock_terminal_writer();
+                held_tx.send(()).expect("the drawing thread is alive");
+                drawing_rx.recv().expect("the drawing thread is alive");
+                // Only to make the unfixed code reliably red; the fixed path is
+                // correct for any duration, including zero.
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                latch.store(true, std::sync::atomic::Ordering::SeqCst);
+                drop(guard);
+            });
+
+            held_rx.recv().expect("the teardown thread is alive");
+            drawing_tx.send(()).expect("the teardown thread is alive");
+            draw_menu_unless_shutting_down(&mut term, &state, 0, &theme, latch)
+                .expect("the gate must not turn a suppressed frame into an error");
+        });
+
+        assert_eq!(
+            painted(&term),
+            "",
+            "a menu frame asked for while a teardown owned the terminal must not \
+             paint — its trailing `Hide` would land after the restore's `Show` and \
+             leave the user on the normal screen with an invisible cursor"
+        );
+    }
+
+    #[test]
+    fn the_front_door_comes_back_after_a_session_ends_cleanly() {
+        // The launcher-hub regression, at the seam the e2e scenario
+        // `dash-launcher-sigterm-restores-terminal-across-a-session` exercises
+        // end to end: open a session, quit back to the menu, and the front door
+        // must be there. `app::run`'s clean-quit teardown used to CLAIM the
+        // process-exit latch, which nothing ever releases — so the gate above
+        // suppressed every frame for the rest of the process and the user got a
+        // blank terminal instead of the menu.
+        //
+        // This is the cheap version of a 30-second PTY scenario: run the real
+        // teardown, then ask the real gate for a frame.
+        use std::sync::atomic::AtomicBool;
+
+        let latch = AtomicBool::new(false);
+        let restored = std::cell::Cell::new(false);
+        crate::app::restore_after_session(&latch, || restored.set(true));
+        assert!(restored.get(), "the session must restore the terminal");
+
+        let state = base();
+        let theme = state.theme;
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        draw_menu_unless_shutting_down(&mut term, &state, 0, &theme, &latch)
+            .expect("drawing to a TestBackend cannot fail");
+        let painted: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            painted.contains("Set up this system"),
+            "the launcher front door must repaint once a session returns:\n{painted}"
+        );
     }
 
     fn base() -> AppState {
@@ -398,6 +735,88 @@ mod tests {
     }
 
     #[test]
+    fn launcher_state_seeds_serving_from_registry_instances() {
+        // Regression: the front door built an empty AppState and always showed
+        // "Idle — nothing serving" even when a model was running. Seeding from
+        // the caller's registry-derived instances must make the launcher report
+        // the running model.
+        let serving = vec![Instance {
+            container_id: "vllm-ready".into(),
+            model_name: "Qwen2.5-0.5B".into(),
+            status: InstanceStatus::Ready,
+            port: Some(11435),
+            ..Default::default()
+        }];
+        let running = launcher_state("default-dark", serving);
+        assert!(
+            is_running(&running),
+            "seeded serving instance must make the launcher report running"
+        );
+        let out = render(&running, 0, 100, 24);
+        assert!(out.contains("Serving"), "serve line missing: {out:?}");
+        assert!(
+            out.contains("Qwen2.5-0.5B"),
+            "served model missing: {out:?}"
+        );
+        assert!(out.contains("11435"), "served port missing: {out:?}");
+
+        // With no serving instances the front door stays honestly idle.
+        let idle = launcher_state("default-dark", Vec::new());
+        assert!(!is_running(&idle), "empty seed must render idle");
+    }
+
+    #[test]
+    fn launcher_state_marks_every_seeded_instance_as_managed() {
+        // Regression: `launcher_state` seeded `instances` but never a
+        // registry probe, so the launcher's own copy of the quit-confirm
+        // prompt (`ui::quit_confirm_body`) gated its
+        // `rocm services stop <id> --yes` line on an always-empty set and
+        // warned with nothing actionable — even though every instance here
+        // comes from `launcher_serving_instances`'s own
+        // `discover_managed_services` call and is genuinely stoppable.
+        let serving = vec![
+            Instance {
+                container_id: "vllm-ready".into(),
+                status: InstanceStatus::Ready,
+                ..Default::default()
+            },
+            Instance {
+                container_id: "vllm-second".into(),
+                status: InstanceStatus::Running,
+                ..Default::default()
+            },
+        ];
+        let state = launcher_state("default-dark", serving);
+        assert_eq!(
+            state.live_registry_snapshot().managed_ids,
+            std::collections::HashSet::from(["vllm-ready".to_string(), "vllm-second".to_string()])
+        );
+    }
+
+    #[test]
+    fn launcher_state_does_not_warn_on_a_starting_only_registry() {
+        // Regression: `launcher_serving_instances` (`discover_managed_services`)
+        // already drops a failed/stopped/unbound-port record, but still keeps
+        // one still `Starting` — that status alone isn't enough to exclude
+        // it. The quit-confirm gate (`AppState::has_live_instance`) must apply the
+        // same `is_serving()` filter here that the dashboard's live probe
+        // (`LiveManagedRegistryProbe::snapshot`) applies, or a
+        // starting-only registry would trip "May still be serving — quit
+        // anyway?" on the launcher but not on the dashboard reading the
+        // identical registry.
+        let serving = vec![Instance {
+            container_id: "vllm-starting".into(),
+            status: InstanceStatus::Starting { phase: None },
+            ..Default::default()
+        }];
+        let state = launcher_state("default-dark", serving);
+        assert!(
+            !state.has_live_instance(),
+            "a starting-only (not yet serving) registry must not warn on quit"
+        );
+    }
+
+    #[test]
     fn choice_mapping_and_counts() {
         assert_eq!(row_count(), 5);
         // Row order: 0=Set up, 1=Serve, 2=Diagnose, 3=Chat, 4=Open dashboard.
@@ -413,10 +832,225 @@ mod tests {
     }
 
     #[test]
+    fn left_right_alias_up_down() {
+        // Right must move the selection identically to Down, and Left
+        // identically to Up — `move_selection`'s `forward` flag is the only
+        // thing standing in for the aliased key, so compare it against the
+        // exact wrapping formulas the run_launcher match arms used to inline.
+        let rc = row_count();
+        let mut sel = 0usize;
+        for _ in 0..10 {
+            let via_right = move_selection(sel, rc, true);
+            let via_down = (sel + 1) % rc;
+            assert_eq!(via_right, via_down, "Right must match Down");
+            sel = via_right;
+        }
+        for _ in 0..10 {
+            let via_left = move_selection(sel, rc, false);
+            let via_up = (sel + rc - 1) % rc;
+            assert_eq!(via_left, via_up, "Left must match Up");
+            sel = via_left;
+        }
+    }
+
+    #[test]
     fn launcher_does_not_panic_when_squeezed() {
         let s = base();
         for h in [1u16, 2, 3, 5, 8] {
             let _ = render(&s, 0, 60, h);
         }
+    }
+
+    #[test]
+    fn launcher_renders_the_quit_confirm_prompt_when_open() {
+        // Regression: `handle_launcher_key`'s own tests only assert on
+        // `quit_confirm.is_some()`/`is_none()`; nothing exercised `draw`'s
+        // quit_confirm render arm itself (the `grey_overlay` +
+        // `ApprovalRequest`/`draw_approval` branch added alongside it).
+        //
+        // Seeds a serving instance: the title is derived from the same
+        // "is anything still serving" decision as the body
+        // (`nothing_is_currently_being_served_with`), so an unseeded `base()`
+        // would render the other title ("Nothing to confirm — quit?") here.
+        use crate::registry_probe::{ManagedRegistrySnapshot, StaticManagedRegistrySnapshot};
+        use rocm_dash_core::metrics::{Instance, InstanceStatus};
+        let mut s = base();
+        s.instances.insert(
+            "vllm-1".into(),
+            Instance {
+                container_id: "vllm-1".into(),
+                status: InstanceStatus::Running,
+                ..Default::default()
+            },
+        );
+        // Seed a registry probe reporting `vllm-1` as managed and stoppable —
+        // exactly the data that would make `has_stoppable_managed_instance_with()`
+        // true. If `draw`'s own `quit_confirm_request(state, false)` call ever
+        // regressed to `true`, this is what would make the "Press s" hint
+        // wrongly appear below.
+        s.managed_registry_probe = Some(std::sync::Arc::new(StaticManagedRegistrySnapshot(
+            ManagedRegistrySnapshot {
+                has_live_service: true,
+                managed_ids: std::collections::HashSet::from(["vllm-1".to_string()]),
+            },
+        )));
+        s.open_quit_confirm();
+        let out = render(&s, 0, 100, 24);
+        assert!(
+            out.contains("May still be serving"),
+            "quit-confirm prompt must render: {out:?}"
+        );
+        assert!(
+            !out.contains("Press s"),
+            "the launcher has no live Services overlay to jump to and must \
+             not advertise a key it can't honor, even with a stoppable \
+             managed instance present: {out:?}"
+        );
+        // Must not panic at awkward sizes either, same as the idle menu above.
+        for h in [1u16, 2, 3, 5, 8] {
+            let _ = render(&s, 0, 60, h);
+        }
+    }
+
+    #[test]
+    fn launcher_quit_key_exits_immediately_when_idle() {
+        // Regression guard (issue #145): the overwhelmingly common case —
+        // nothing running — must stay a one-keystroke quit, no prompt, same
+        // as the dashboard's own `quit_exits_immediately_when_nothing_is_serving`.
+        let mut s = base();
+        let mut sel = 0usize;
+        assert!(matches!(
+            handle_launcher_key(&mut s, &mut sel, KeyCode::Char('q')),
+            LauncherKeyOutcome::Exit(None)
+        ));
+        assert!(s.quit_confirm.is_none());
+    }
+
+    #[test]
+    fn launcher_quit_key_opens_confirm_prompt_when_a_model_is_serving() {
+        // Regression (issue #145): the launcher's own `q`/Esc used to bypass
+        // the confirm-before-quit gate entirely — a second, unguarded quit
+        // entry point distinct from the dashboard's. Exiting on this key
+        // must not happen while a model is serving.
+        let mut s = launcher_state(
+            "default-dark",
+            vec![Instance {
+                status: InstanceStatus::Running,
+                ..Default::default()
+            }],
+        );
+        let mut sel = 0usize;
+        assert!(matches!(
+            handle_launcher_key(&mut s, &mut sel, KeyCode::Char('q')),
+            LauncherKeyOutcome::Continue
+        ));
+        assert!(s.quit_confirm.is_some());
+
+        // Esc reaches the same gate.
+        let mut s2 = launcher_state(
+            "default-dark",
+            vec![Instance {
+                status: InstanceStatus::Running,
+                ..Default::default()
+            }],
+        );
+        assert!(matches!(
+            handle_launcher_key(&mut s2, &mut sel, KeyCode::Esc),
+            LauncherKeyOutcome::Continue
+        ));
+        assert!(s2.quit_confirm.is_some());
+    }
+
+    #[test]
+    fn launcher_quit_confirm_approve_exits_deny_and_cancel_stay() {
+        let mut s = launcher_state(
+            "default-dark",
+            vec![Instance {
+                status: InstanceStatus::Running,
+                ..Default::default()
+            }],
+        );
+        let mut sel = 0usize;
+        assert!(matches!(
+            handle_launcher_key(&mut s, &mut sel, KeyCode::Char('q')),
+            LauncherKeyOutcome::Continue
+        ));
+        assert!(s.quit_confirm.is_some());
+
+        // Deny: prompt closes, loop keeps going, back at the idle front door.
+        assert!(matches!(
+            handle_launcher_key(&mut s, &mut sel, KeyCode::Char('n')),
+            LauncherKeyOutcome::Continue
+        ));
+        assert!(s.quit_confirm.is_none());
+
+        // Re-open and approve ('y'): resolves the loop with None (quit).
+        s.open_quit_confirm();
+        assert!(matches!(
+            handle_launcher_key(&mut s, &mut sel, KeyCode::Char('y')),
+            LauncherKeyOutcome::Exit(None)
+        ));
+    }
+
+    #[test]
+    fn launcher_quit_confirm_esc_and_q_also_cancel() {
+        // Regression guard: `launcher_quit_confirm_approve_exits_deny_and_cancel_stay`
+        // (above) sends only `y` and `n` despite its name claiming to cover
+        // Cancel too — Esc and `q` (`approval::approval_key`'s own Cancel
+        // keys) were never actually sent while the prompt was open. Both must
+        // behave like Deny here: close the prompt, keep the loop going.
+        for cancel_key in [KeyCode::Esc, KeyCode::Char('q')] {
+            let mut s = launcher_state(
+                "default-dark",
+                vec![Instance {
+                    status: InstanceStatus::Running,
+                    ..Default::default()
+                }],
+            );
+            let mut sel = 0usize;
+            s.open_quit_confirm();
+            assert!(
+                matches!(
+                    handle_launcher_key(&mut s, &mut sel, cancel_key),
+                    LauncherKeyOutcome::Continue
+                ),
+                "key {cancel_key:?} must cancel, not exit the loop"
+            );
+            assert!(
+                s.quit_confirm.is_none(),
+                "key {cancel_key:?} must close the prompt"
+            );
+        }
+    }
+
+    #[test]
+    fn launcher_quit_confirm_swallows_a_non_verdict_key_while_open() {
+        // Regression guard: `handle_launcher_key`'s early-return guard
+        // (`state.quit_confirm_pending()`) must own every key while the
+        // prompt is open — including `d`, which normally jumps straight to
+        // the dashboard (see the match arm below this fn). A future
+        // refactor of that guard could let `d` fall through and navigate
+        // away while the confirm prompt is still on screen with no test
+        // catching it.
+        let mut s = launcher_state(
+            "default-dark",
+            vec![Instance {
+                status: InstanceStatus::Running,
+                ..Default::default()
+            }],
+        );
+        let mut sel = 0usize;
+        s.open_quit_confirm();
+        assert!(
+            matches!(
+                handle_launcher_key(&mut s, &mut sel, KeyCode::Char('d')),
+                LauncherKeyOutcome::Continue
+            ),
+            "`d` must not exit (or navigate) while the prompt is open"
+        );
+        assert!(
+            s.quit_confirm.is_some(),
+            "`d` is not a verdict key — the prompt must still be open"
+        );
     }
 }
