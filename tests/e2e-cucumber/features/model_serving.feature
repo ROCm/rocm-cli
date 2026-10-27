@@ -341,3 +341,35 @@ Feature: Model serving
   Scenario: serve-25 - The recommended model list prints ASCII-only text
     When the user lists recommended models
     Then the model list output contains only ASCII characters
+
+  # The `/dev/kfd` pre-flight (EAI-8457) is covered by `examine-29` in
+  # `examine.feature`, not here, and this note records why the scenario lives
+  # there rather than alongside the serve probes it also guards.
+  #
+  # The behaviour: on a Linux host where the KFD device cannot be opened,
+  # `rocm_core::amd_smi_json` declines the launch outright, so `serve`'s
+  # `gpu_vram_usage` and `detect_gpu_count` degrade to service state alone where
+  # they previously attempted the spawn. The same chokepoint serves `rocmd`'s
+  # bridge snapshot, and that surface is the one a scenario can observe
+  # directly: the snapshot reports `amd_smi_available` and a note that says why,
+  # as JSON, in one command. `serve`'s probes discard their error with `.ok()?`
+  # by design, so the declined branch is visible there only as the absence of a
+  # GPU-aware placement -- which a GPU-less lane cannot tell apart from having
+  # no GPU. One scenario on the observable surface beats a weaker one here.
+  #
+  # Reaching either branch needs the `e2e-test-hooks` seam
+  # `ROCM_E2E_KFD_DEVICE` (`rocm_core::preflight_kfd_device`), which moves the
+  # device the gate opens. `ROCM_CLI_TEST_HOST_ROOT` cannot substitute: the gate
+  # keeps the real node's veto on purpose, so a simulated root can make it
+  # decline but never allow -- see
+  # `the_kfd_gate_honours_a_simulated_root_but_keeps_the_real_device_veto`.
+  #
+  # Also covered at unit level in `rocm-core`, each confirmed non-vacuous by
+  # mutation: `the_kfd_gate_stops_amd_smi_before_it_is_spawned` asserts the gate
+  # stops the *spawn* (a fake `amd-smi` leaves a marker file that must not
+  # appear), with the same fixture re-run against a readable device to prove the
+  # fake would otherwise have executed;
+  # `the_public_amd_smi_entry_point_gates_on_the_real_kfd_device` pins that the
+  # production wrapper gates on the real device; and
+  # `the_e2e_kfd_path_seam_moves_the_gate_without_disabling_it` pins that the
+  # seam above relocates the probe instead of skipping it.
