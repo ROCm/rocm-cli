@@ -24,12 +24,14 @@
 //! `quote_display_arg` (a dry-run preview line, never executed),
 //! `apps/rocm/src/comfyui.rs`'s `quote_log_arg` (log text, Rust's own
 //! `{value:?}` Debug-format escaping, with the real unquoted args going to
-//! `Command::args` alongside it), and
-//! `apps/rocm/src/freeform_planner.rs`'s `quote_tool_arg` (rendered plan/LLM
-//! prompt text, never executed directly). Each of those uses a materially
-//! different, currently-inconsistent escaping convention for display/log/
-//! prompt text that has zero execution stakes, so forcibly unifying them with
-//! the two functions here would be a silent behavior change to printed/logged
+//! `Command::args` alongside it), `apps/rocm/src/freeform_planner.rs`'s
+//! `quote_tool_arg` (rendered plan/LLM prompt text, never executed
+//! directly), and `crates/rocm-dash-tui/src/ui/exec.rs`'s own
+//! `quote_display_arg` (an approval-preview line, same display-only
+//! contract as `therock.rs`'s). Each of those uses a materially different,
+//! currently-inconsistent escaping convention for display/log/prompt text
+//! that has zero execution stakes, so forcibly unifying them with the two
+//! functions here would be a silent behavior change to printed/logged
 //! output -- out of scope for ROCMAI-727, which only asks to consolidate what
 //! is safely shareable.
 
