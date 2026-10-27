@@ -854,6 +854,18 @@ fn pending_stop_proposal_exists(paths: &AppPaths, service_id: &str) -> Result<bo
         }))
 }
 
+fn pending_restart_proposal_exists(paths: &AppPaths, service_id: &str) -> Result<bool> {
+    Ok(rocm_core::load_recent_automation_proposals(paths, 100)?
+        .into_iter()
+        .any(|proposal| {
+            proposal.status == "pending"
+                && proposal.watcher_id == "server-recover"
+                && proposal.service_id.as_deref() == Some(service_id)
+                && (proposal.action == "queue_restart_proposal"
+                    || proposal.tool.as_deref() == Some("restart_server"))
+        }))
+}
+
 fn handle_cache_warm_event(
     paths: &AppPaths,
     mode: WatcherMode,
@@ -1225,6 +1237,20 @@ fn handle_server_recover_event_with_record(
             Some(record.service_id.clone()),
         ),
         WatcherPolicyAction::QueueProposal => {
+            if pending_restart_proposal_exists(paths, &record.service_id)? {
+                return crate::persistence::record_event(
+                    paths,
+                    state,
+                    "server-recover",
+                    "info",
+                    "restart_proposal_already_pending",
+                    &format!(
+                        "managed service {} needs recovery ({recovery_reason_display}); a reviewed restart request is already waiting",
+                        record.service_id,
+                    ),
+                    Some(record.service_id.clone()),
+                );
+            }
             let message = format!(
                 "managed service {} needs recovery ({recovery_reason_display}); queueing restart proposal",
                 record.service_id,
@@ -2230,6 +2256,68 @@ mod tests {
             events
                 .iter()
                 .any(|event| event.action == "stop_proposal_already_pending")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn server_recover_does_not_duplicate_pending_restart_proposals() -> Result<()> {
+        let (root, paths) = temp_app_paths("server-recover-dedupe");
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-unhealthy",
+            "vllm",
+            "tiny",
+            "Tiny/Test",
+            "127.0.0.1",
+            11436,
+            "managed",
+            123,
+            None,
+            None,
+            None,
+        );
+        record.status = "unreachable".to_owned();
+        record.write()?;
+        let mut state = test_runtime_state(vec![test_watcher_snapshot(
+            "server-recover",
+            WatcherMode::Propose,
+            None,
+        )]);
+        let event = AutomationTriggerEvent {
+            at_unix_ms: 1,
+            kind: "service.manifest_recoverable".to_owned(),
+            source: "managed_service".to_owned(),
+            watcher_hint: Some("server-recover".to_owned()),
+            service_id: Some(record.service_id.clone()),
+            reason: Some("manifest_status_failed".to_owned()),
+            payload: json!({}),
+        };
+
+        handle_server_recover_event_with_record(
+            &paths,
+            WatcherMode::Propose,
+            &mut state,
+            &event,
+            &mut record,
+        )?;
+        handle_server_recover_event_with_record(
+            &paths,
+            WatcherMode::Propose,
+            &mut state,
+            &event,
+            &mut record,
+        )?;
+        let events = rocm_core::load_recent_automation_events(&paths, 2)?;
+        let proposals = rocm_core::load_recent_automation_proposals(&paths, 10)?;
+        fs::remove_dir_all(root).ok();
+
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(proposals[0].tool.as_deref(), Some("restart_server"));
+        assert!(
+            events
+                .iter()
+                .any(|event| event.action == "restart_proposal_already_pending")
         );
         Ok(())
     }
