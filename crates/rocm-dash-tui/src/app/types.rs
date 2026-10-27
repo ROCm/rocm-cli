@@ -173,12 +173,20 @@ pub enum ConnState {
 }
 
 impl ConnState {
+    const IN_PROCESS_PREFIX: &'static str = "in-process/";
+
+    /// The `daemon_version` the Windows in-process collector reports; the one
+    /// producer of the tag [`Self::is_in_process`] looks for.
+    pub fn in_process_version(version: &str) -> String {
+        format!("{}{version}", Self::IN_PROCESS_PREFIX)
+    }
+
     /// True for the Windows in-process collector (see
     /// `client::connect_and_run`'s `#[cfg(windows)]` arm), which tags its
     /// `daemon_version` this way since there's no real `rocmdashd` behind
     /// it — and so no instance registry it could ever populate.
     pub fn is_in_process(&self) -> bool {
-        matches!(self, Self::Connected { version, .. } if version.starts_with("in-process/"))
+        matches!(self, Self::Connected { version, .. } if version.starts_with(Self::IN_PROCESS_PREFIX))
     }
 }
 
@@ -568,6 +576,20 @@ impl ScrollTarget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn in_process_version_is_recognised_by_is_in_process() {
+        let in_process = ConnState::Connected {
+            host: "localhost".into(),
+            version: ConnState::in_process_version("1.2.3"),
+        };
+        assert!(in_process.is_in_process());
+        let daemon = ConnState::Connected {
+            host: "localhost".into(),
+            version: "1.2.3".into(),
+        };
+        assert!(!daemon.is_in_process());
+    }
 
     #[test]
     fn from_digit_maps_five_to_chat() {

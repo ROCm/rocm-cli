@@ -588,6 +588,9 @@ fn draw_header(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         ConnState::Connected { .. } if state.simulated => {
             ("simulated — not live".to_string(), theme.warn)
         }
+        c @ ConnState::Connected { host, .. } if c.is_in_process() => {
+            (format!("live · {host} · local collectors"), theme.ok)
+        }
         ConnState::Connected { host, version } => (
             format!("connected · {host} · rocm daemon {version}"),
             theme.ok,
@@ -959,6 +962,36 @@ mod tests {
     // Shared with `app`'s own test module rather than each carrying its own
     // byte-identical copy — see its doc comment.
     use crate::app::test_support::with_registry_probe;
+
+    #[test]
+    fn header_does_not_claim_a_daemon_for_the_in_process_collector() {
+        use crate::ui::theme::Theme;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let theme = Theme::from_name("default-dark");
+        let mut state = AppState::new("t".into(), "default-dark".into());
+        state.conn = ConnState::Connected {
+            host: "localhost".into(),
+            version: ConnState::in_process_version("1.2.3"),
+        };
+        let mut term = Terminal::new(TestBackend::new(120, 3)).unwrap();
+        term.draw(|f| draw_header(f, f.area(), &state, &theme))
+            .unwrap();
+        let grid: String = (0..3)
+            .flat_map(|y| (0..120).map(move |x| (x, y)))
+            .map(|p| {
+                term.backend()
+                    .buffer()
+                    .cell(p)
+                    .unwrap()
+                    .symbol()
+                    .to_string()
+            })
+            .collect();
+        assert!(grid.contains("local collectors"), "got: {grid}");
+        assert!(!grid.contains("rocm daemon"), "got: {grid}");
+    }
 
     #[test]
     fn wide_triptych_aligns_tabs_with_center_not_far_left() {

@@ -209,7 +209,7 @@ async fn connect_and_run(connect: &str, tx: UnboundedSender<ClientMsg>) -> anyho
     );
     let _ = tx.send(ClientMsg::Connected {
         host: "localhost".into(),
-        daemon_version: format!("in-process/{}", env!("CARGO_PKG_VERSION")),
+        daemon_version: crate::app::ConnState::in_process_version(env!("CARGO_PKG_VERSION")),
     });
 
     let mut host = HostCollector::new();

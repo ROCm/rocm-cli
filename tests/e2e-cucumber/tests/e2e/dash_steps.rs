@@ -261,6 +261,22 @@ async fn open_chat(world: &mut E2eWorld) {
     world.tui = Some(session);
 }
 
+/// An empty simulated host root: no `/dev/kfd`, no WSL signals, so the
+/// dashboard daemon's GPU pre-flight fails whatever the runner really has.
+#[given("a machine with no GPU")]
+async fn machine_with_no_gpu(world: &mut E2eWorld) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("host-root");
+    std::fs::create_dir_all(&root).expect("failed to create the simulated host root");
+    world
+        .command_env
+        .push(("ROCM_CLI_TEST_HOST_ROOT", root.into_os_string()));
+}
+
 #[when("the user opens the dashboard")]
 async fn open_dashboard(world: &mut E2eWorld) {
     let tui = TuiSession::spawn(world, &["dash"])

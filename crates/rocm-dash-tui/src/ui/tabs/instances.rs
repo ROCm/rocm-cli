@@ -1370,7 +1370,7 @@ mod tests {
         let mut state = mk_state(HashMap::new(), 0);
         state.conn = ConnState::Connected {
             host: "localhost".into(),
-            version: "in-process/0.0.0".into(),
+            version: ConnState::in_process_version("0.0.0"),
         };
         let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
         term.draw(|f| draw(f, f.area(), &state, &state.theme))
