@@ -2096,3 +2096,80 @@ approve path needs a host with an approved architecture. The unit tests in
 path everywhere. They also cover a report taller than the approval dialog, which
 scrolls with PgUp, PgDn, Home and End and says when more is below, and a preview
 or send that is already running, which starts nothing and says so.
+
+### Counting received reports
+
+Mail has no query, so reports are counted from an export of the mail. This is
+maintainer tooling, not part of `rocm`, and it sends and files nothing:
+
+```bash
+cargo xtask report-rollup <export-dir>
+cargo xtask report-rollup <export-dir> --json
+cargo xtask report-rollup <export-dir> --verbose
+```
+
+The report address is a group, so every member receives each report, and any
+member's copies can be exported. Every recipient's copy carries the same
+`Message-ID`, so exports from two members' inboxes can share one directory: the
+second copy of each report is removed as a duplicate, not counted twice.
+
+Export each message as an `.eml` file into one directory. Outlook on the web
+and the new Outlook save a message as `.eml`, and the Graph endpoint
+`GET /me/messages/{id}/$value` returns the same bytes, which makes a bulk
+export a short loop. A raw report body saved as `.json` is read too.
+Nothing else is: `.msg`, `.mbox` and text exports are named as unsupported and
+not read. One message per file is the point. A damaged `.eml` is exactly one
+unread report, while an mbox can merge or split messages without any error.
+
+The output is a tree that counts the reports at every level of the group key:
+the catalog entry, then the architecture, the ROCm release, the distribution
+and its major version, and the engine. Read it for the level where one count
+splits into several: the field at that level is the one that separates the
+reports. In the tree under `unrecognised`, for example, a count that stays
+whole down to the architecture and splits at `rocm` says the ROCm release
+separates those reports. The definition of "same
+problem" is `Report::group_key` in
+[report.rs](../crates/rocm-core/src/report.rs), and the counting is in
+[report_rollup.rs](../crates/rocm-core/src/report_rollup.rs).
+
+Every input lands in exactly one bucket, and each bucket is printed:
+
+- A report read and grouped. Those with no recognised cause are counted apart,
+  because a report carries no error text to separate them further.
+- A refusal, counted by the rule that refused.
+- An unread report, from a newer CLI or with a body that is not a report,
+  counted by the schema it declared and never as zero.
+- A message that is not a report: a reply, an automatic reply, a bounce, or
+  unrelated mail. `--verbose` lists each by file name and subject.
+- A duplicate export of a message already counted, matched on its
+  `Message-ID`.
+- A file in a format that is not read, or a folder inside the export. Only one
+  level is read, and each folder is named.
+
+A forwarded report is counted, and the output says how many arrived that way.
+A forward carries a new `Message-ID`, so a report forwarded to the mailbox
+after it was also sent there directly is counted twice. Nothing can remove that
+duplicate, because identical reports from two people are legitimate. A report
+with no `Message-ID` cannot be deduplicated either, and the output says how
+many there were.
+
+Every count is of reports, not of people. A report carries no machine
+identifier, so one person who sends the same report five times counts as five.
+
+The mail around a report identifies its sender, and the report does not. The
+reader keeps only the subject, the content headers and a digest of the
+`Message-ID`, and it reads only the JSON value in the body, so nothing from a
+report's mail headers or signature reaches any output.
+
+The other inputs are the maintainer's own, and the outputs differ in how much of
+them they carry. `--json` carries counts and the group values, and a group value
+is always one the CLI itself writes: a catalog entry, a supported architecture,
+an approved distribution or engine, a release number, or a fallback word such as
+`unknown`. The address takes mail from anyone, so a report holding any other
+value, a name or terminal control characters for instance, is read as unread:
+counted, and grouped nowhere. No free text from the input reaches `--json`, so
+it is the one to pass on. The text output names the files it could not read, and
+`--verbose` adds the file name and subject of each message that is not a
+report. A subject or a file name can name a person, so keep that output to your
+own terminal. The export itself still holds everything. Never commit it, and
+delete it once the rollup is taken.
