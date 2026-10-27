@@ -56,7 +56,6 @@ pub struct GpuSystemInfo {
     pub memory_partition_mode: MemoryPartitionMode,
     pub compute_partition_mode: ComputePartitionMode,
     pub vram_per_logical_gpu_mb: u64,
-    pub lemond_version: Option<String>,
     pub llama_server_build: Option<String>,
     pub ccr_version: Option<String>,
     pub llamacpp_backend: Option<String>,
@@ -178,6 +177,10 @@ pub struct ObservationMetadata {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Instance {
+    /// Lifecycle ownership proven by discovery from a managed-service record.
+    /// Missing ownership in legacy snapshots is not permission to mutate.
+    #[serde(default)]
+    pub managed: bool,
     pub container_id: String,
     pub container_name: String,
     pub status: InstanceStatus,
@@ -201,6 +204,11 @@ pub struct Instance {
     /// Omitted from JSON when `None` to preserve wire back-compat.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gen_tps_observation: Option<ObservationMetadata>,
+    /// True when [`Instance::gen_tps`] is the endpoint's most recent completed
+    /// request rate (Lemonade `/stats`), which stays unchanged while the server is
+    /// idle, rather than a live counter rate. Omitted from JSON when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub gen_tps_last_request: bool,
     /// Efficiency: `gen_tps` ÷ summed power (W) of the GPUs this instance
     /// occupies. `None` when throughput or GPU power telemetry is unavailable.
     #[serde(default)]
@@ -217,6 +225,35 @@ pub struct Instance {
     pub launch_args: Vec<String>,
     pub env_vars: std::collections::BTreeMap<String, String>,
     pub log_file: Option<String>,
+}
+
+impl Instance {
+    /// External Lemonade discovery uses the engine marker, not the instance id.
+    /// This identifies provenance independently of the current serving status.
+    #[must_use]
+    pub fn is_external_lemonade(&self) -> bool {
+        !self.managed && self.container_name == "lemonade"
+    }
+
+    /// The finite throughput that is current, for figures that sum instances.
+    ///
+    /// A rate that is only the endpoint's last completed request
+    /// ([`Instance::gen_tps_last_request`]) is excluded: it stays unchanged while
+    /// the server is idle, so adding it to a node total would show an idle server
+    /// as still generating. The Instances views show such a rate, labelled, and
+    /// so do the Services overlay rows and its quick preview.
+    #[must_use]
+    pub fn live_gen_tps(&self) -> Option<f64> {
+        self.gen_tps
+            .filter(|v| v.is_finite() && !self.gen_tps_last_request)
+    }
+
+    /// [`Instance::tokens_per_watt`] when it derives from live throughput; `None`
+    /// when it derives from a last-request rate (see [`Instance::live_gen_tps`]).
+    #[must_use]
+    pub fn live_tokens_per_watt(&self) -> Option<f64> {
+        self.tokens_per_watt.filter(|_| !self.gen_tps_last_request)
+    }
 }
 
 #[cfg(test)]
@@ -236,11 +273,76 @@ mod tests {
             "log_file": null
         }"#;
         let inst: Instance = serde_json::from_str(legacy).expect("legacy instance must parse");
+        assert!(
+            !inst.managed,
+            "legacy snapshots do not grant lifecycle control"
+        );
         assert_eq!(inst.gen_tps, None);
         assert_eq!(inst.tokens_per_watt, None);
         assert_eq!(inst.ttft_ms, None);
         assert_eq!(inst.tpot_ms, None);
         assert_eq!(inst.kv_cache_usage_pct, Some(42.0));
+    }
+
+    #[test]
+    fn instance_ownership_round_trips_and_defaults_to_false() {
+        assert!(!Instance::default().managed);
+        for managed in [false, true] {
+            let inst = Instance {
+                managed,
+                ..Instance::default()
+            };
+            let json = serde_json::to_value(&inst).expect("serialize");
+            assert_eq!(json["managed"], managed);
+            let back: Instance = serde_json::from_value(json).expect("deserialize");
+            assert_eq!(back.managed, managed);
+        }
+    }
+
+    #[test]
+    fn a_last_request_rate_is_not_live_throughput_or_live_efficiency() {
+        let live = Instance {
+            gen_tps: Some(40.0),
+            tokens_per_watt: Some(0.5),
+            ..Instance::default()
+        };
+        assert_eq!(live.live_gen_tps(), Some(40.0));
+        assert_eq!(live.live_tokens_per_watt(), Some(0.5));
+        let last = Instance {
+            gen_tps_last_request: true,
+            ..live
+        };
+        assert_eq!(last.live_gen_tps(), None);
+        assert_eq!(last.live_tokens_per_watt(), None);
+        // The rate itself is still there for views that label it.
+        assert_eq!(last.gen_tps, Some(40.0));
+        for bad in [f64::NAN, f64::INFINITY] {
+            let inst = Instance {
+                gen_tps: Some(bad),
+                ..Instance::default()
+            };
+            assert_eq!(inst.live_gen_tps(), None);
+        }
+    }
+
+    #[test]
+    fn external_lemonade_predicate_ignores_ids_and_requires_engine_marker() {
+        for id in ["svc-looks-managed", "lemonade-looks-external"] {
+            for managed in [false, true] {
+                for marker in ["lemonade", "vllm", ""] {
+                    let inst = Instance {
+                        managed,
+                        container_id: id.into(),
+                        container_name: marker.into(),
+                        ..Instance::default()
+                    };
+                    assert_eq!(
+                        inst.is_external_lemonade(),
+                        !managed && marker == "lemonade"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -309,6 +411,17 @@ mod tests {
             "WARMUP"
         );
         assert_eq!(InstanceStatus::Ready.label(), "READY");
+    }
+
+    #[test]
+    fn old_recordings_with_a_retired_lemond_version_key_still_load() {
+        // Recorded sessions written before the field was removed still carry
+        // the key. This guards loading them (unknown keys are ignored); it does
+        // not prove the field's removal, which the compiler already enforces.
+        let mut value = serde_json::to_value(GpuSystemInfo::default()).expect("serialize");
+        value["lemond_version"] = serde_json::json!("10.4.0");
+        let info: GpuSystemInfo = serde_json::from_value(value).expect("deserialize old snapshot");
+        assert_eq!(info.llama_server_build, None);
     }
 
     #[test]

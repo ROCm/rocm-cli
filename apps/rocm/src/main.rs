@@ -673,6 +673,11 @@ rocm logs --search error timeout")]
         status: bool,
     },
     /// Launch the unified telemetry dashboard (TUI) with an embedded daemon.
+    ///
+    /// On Linux/WSL, discovers loaded models from local Lemonade at 127.0.0.1:13305
+    /// by default. Configure dashboard.daemon.enable_lemonade, lemonade_host, and
+    /// lemonade_port in config.json. External models have no Services stop/restart
+    /// controls; discovery is read-only and quitting leaves external servers running.
     Dash {
         /// Replay a recorded session NDJSON instead of connecting to a live daemon.
         #[arg(long, value_name = "FILE")]
@@ -5598,6 +5603,30 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn dash_help_scopes_lemonade_discovery_to_linux_and_wsl() {
+        // The embedded daemon that does the discovery is Unix-only, so the help
+        // must not promise it on every platform. README.md says the same.
+        let help = Cli::command()
+            .find_subcommand_mut("dash")
+            .expect("dash subcommand")
+            .render_long_help()
+            .to_string();
+        let flat = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flat.contains("On Linux/WSL, discovers loaded models from local Lemonade"),
+            "{help}"
+        );
+        // This pins the wording only. Scenario
+        // `@id:dash-lemonade-external-protocol-discovery` (dash-40) proves the
+        // claim: the external server receives no request beyond reads after the
+        // dashboard quits.
+        assert!(
+            flat.contains("quitting leaves external servers running"),
+            "{help}"
+        );
+    }
+
+    #[test]
     fn the_framework_choice_is_offered_on_the_command_line() {
         // Guards the actual regression: the variants existed in the library and
         // were unreachable from here. A user must be able to see and pass them.
@@ -7686,6 +7715,32 @@ pub(crate) mod tests {
         assert!(rendered.contains("service: svc-qwen"));
         assert!(rendered.contains("status: stopped"));
         assert!(rendered.contains("stopped processes: 2"));
+    }
+
+    /// The stop report production hands the renderer is the one
+    /// `stop_internal_managed_service` builds: `service_id` and `status` sit
+    /// directly on `result`, not under `result.service`. serve-29 asserts the
+    /// service id in the stop output, so the renderer must print it for this shape.
+    #[test]
+    fn service_stop_render_prints_the_in_process_stop_report_shape() {
+        let rendered = render_service_action_result(
+            "stop_server",
+            &serde_json::json!({
+                "output": {
+                    "result": {
+                        "service_id": "svc-qwen",
+                        "status": "stopped",
+                        "engine_stop": {"attempted": true, "stopped": true, "graceful": true},
+                        "signaled_pids": [1234]
+                    }
+                }
+            }),
+        );
+
+        assert!(rendered.contains("Local server stopped"));
+        assert!(rendered.contains("service: svc-qwen"), "{rendered}");
+        assert!(rendered.contains("status: stopped"), "{rendered}");
+        assert!(rendered.contains("stopped processes: 1"));
     }
 
     #[test]

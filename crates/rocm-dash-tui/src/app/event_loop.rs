@@ -830,6 +830,7 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
         args.managed_registry_probe.clone(),
         args.launcher_hosted,
     );
+    state.lemonade_managed_installed = args.lemonade_managed_installed;
     // Focused host: open exactly the overlay for the requested flow (Examine
     // also auto-runs its read-only job). `Focus::Setup` opens the onboarding
     // overlay — the same wizard `rocm bootstrap setup` routes to.

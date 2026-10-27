@@ -216,14 +216,12 @@ async fn stop_server_tool(world: &mut E2eWorld) {
 
 // ── Then ───────────────────────────────────────────────────────────
 
-// `render_service_action_result` only prints the `service:`/`status:`/
-// `endpoint:` lines when `output.result` carries a nested `service` object
-// (as `restart_server` does); `stop_server`'s result is the flat
-// `service_id`/`status` shape `stop_internal_managed_service` returns, so none
-// of those lines ever print for a stop today. That mismatch is a pre-existing
-// gap in that renderer, unrelated to the summary hint this PR fixes, so this
-// assertion covers only what the command actually prints; the on-disk status
-// below is what proves the stop itself.
+// `render_service_action_result` prints the `service:` and `status:` lines for
+// `stop_server`'s flat `service_id`/`status` result as well as for the nested
+// `service` object `restart_server` returns (unit-tested by
+// `service_stop_render_prints_the_in_process_stop_report_shape`); `endpoint:`
+// still prints only for the nested shape. This step asserts the headline only;
+// the on-disk status below is what proves the stop itself.
 #[then("the CLI reports the service as stopped")]
 async fn reports_stopped(world: &mut E2eWorld) {
     assert_succeeded(world);

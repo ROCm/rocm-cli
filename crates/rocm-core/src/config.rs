@@ -292,6 +292,18 @@ const fn default_instance_tick_secs() -> f64 {
     2.0
 }
 
+fn default_dashboard_lemonade_host() -> String {
+    "127.0.0.1".to_owned()
+}
+
+const fn default_dashboard_lemonade_port() -> u16 {
+    13305
+}
+
+const fn default_dashboard_enable_lemonade() -> bool {
+    true
+}
+
 /// Telemetry daemon operational spec. Tick cadences are stored as f64 seconds in
 /// the unified JSON config; use the `*_tick()` accessors for `Duration`s.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -308,6 +320,14 @@ pub struct DashboardDaemonConfig {
     pub discovery_tick_secs: f64,
     #[serde(default = "default_instance_tick_secs")]
     pub instance_tick_secs: f64,
+    /// Discover loaded models on the configured external Lemonade endpoint.
+    /// Read-only; does not adopt, launch, or stop the external service.
+    #[serde(default = "default_dashboard_enable_lemonade")]
+    pub enable_lemonade: bool,
+    #[serde(default = "default_dashboard_lemonade_host")]
+    pub lemonade_host: String,
+    #[serde(default = "default_dashboard_lemonade_port")]
+    pub lemonade_port: u16,
     /// Watch this file for new normalized benchmark CSV rows. When unset, the
     /// daemon derives `<data_dir>/bench/results.csv` from the current `AppPaths`
     /// at startup so machine-specific paths are never persisted in config.
@@ -323,6 +343,9 @@ impl Default for DashboardDaemonConfig {
             gpu_tick_secs: default_gpu_tick_secs(),
             discovery_tick_secs: default_discovery_tick_secs(),
             instance_tick_secs: default_instance_tick_secs(),
+            enable_lemonade: default_dashboard_enable_lemonade(),
+            lemonade_host: default_dashboard_lemonade_host(),
+            lemonade_port: default_dashboard_lemonade_port(),
             bench_results_dir: None,
         }
     }
@@ -927,6 +950,31 @@ mod tests {
                 "unexpected error for {field}: {error}"
             );
         }
+    }
+
+    #[test]
+    fn dashboard_daemon_defaults_enable_local_lemonade_discovery() {
+        let old_config: DashboardDaemonConfig = serde_json::from_str("{}").unwrap();
+        let json = serde_json::to_value(old_config).unwrap();
+        assert_eq!(json["enable_lemonade"], true);
+        assert_eq!(json["lemonade_host"], "127.0.0.1");
+        assert_eq!(json["lemonade_port"], 13305);
+    }
+
+    #[test]
+    fn dashboard_daemon_lemonade_config_overrides_round_trip() {
+        let config: DashboardDaemonConfig = serde_json::from_str(
+            r#"{
+            "enable_lemonade": false, "lemonade_host": "localhost", "lemonade_port": 14567
+        }"#,
+        )
+        .unwrap();
+        assert!(!config.enable_lemonade);
+        assert_eq!(config.lemonade_host, "localhost");
+        assert_eq!(config.lemonade_port, 14567);
+        let restored: DashboardDaemonConfig =
+            serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
+        assert_eq!(restored, config);
     }
 
     #[test]

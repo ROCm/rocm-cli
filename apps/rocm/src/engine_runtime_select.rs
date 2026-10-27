@@ -18,7 +18,7 @@
 //! `service_http_readiness_paths`, `http_get_local_service`,
 //! `http_post_local_service_json`, `service_http_readiness_response_ready`,
 //! `lemonade_health_ready_for_model`, `model_list_ready_for_model`,
-//! `service_model_gpu_ready`, `service_model_reports_rocm_backend`,
+//! `service_model_gpu_ready`, `service_model_reports_gpu_backend`,
 //! `service_model_names_match`).
 //!
 //! Mechanically relocated from `main.rs` with no behavior change — Phase 6f
@@ -80,7 +80,7 @@
 //! `service_http_readiness_paths`, `http_get_local_service`,
 //! `service_http_readiness_response_ready`, `lemonade_health_ready_for_model`,
 //! `model_list_ready_for_model`, `service_model_gpu_ready`, and
-//! `service_model_reports_rocm_backend` have no callers outside this module
+//! `service_model_reports_gpu_backend` have no callers outside this module
 //! and stay private.
 //!
 //! The cluster's regression tests live in this module's own `mod tests`,
@@ -524,7 +524,7 @@ fn lemonade_health_ready_for_model(body: &str, canonical_model_id: &str) -> bool
                     .into_iter()
                     .filter_map(|field| model.get(field).and_then(serde_json::Value::as_str))
                     .any(|loaded| service_model_names_match(loaded, canonical_model_id));
-                name_matches && service_model_reports_rocm_backend(model)
+                name_matches && service_model_reports_gpu_backend(model)
             })
         })
 }
@@ -554,22 +554,26 @@ fn model_list_ready_for_model(
 /// Whether a lemonade `/v1/models` entry is served on GPU. A stock `llama-server`
 /// (direct-serve) entry has no `recipe_options` and is accepted (that path only runs
 /// GPU backends); a Lemonade-router entry carries `recipe_options`, so it must report a
-/// ROCm backend — which keeps a registered-but-unloaded model (empty `recipe_options`)
+/// GPU backend (ROCm or Vulkan) — which keeps a registered-but-unloaded model (empty `recipe_options`)
 /// from reading as ready.
 fn service_model_gpu_ready(model: &serde_json::Value) -> bool {
     match model.get("recipe_options") {
         None => true,
-        Some(_) => service_model_reports_rocm_backend(model),
+        Some(_) => service_model_reports_gpu_backend(model),
     }
 }
 
-fn service_model_reports_rocm_backend(model: &serde_json::Value) -> bool {
+fn service_model_reports_gpu_backend(model: &serde_json::Value) -> bool {
     model
         .get("recipe_options")
         .and_then(|options| options.get("llamacpp_backend"))
         .or_else(|| model.get("llamacpp_backend"))
         .and_then(serde_json::Value::as_str)
-        .is_some_and(|backend| backend.trim().to_ascii_lowercase().starts_with("rocm"))
+        .is_some_and(|backend| {
+            // The GPU backends the engine can select (ROCm, else Vulkan); never `cpu`.
+            let backend = backend.trim().to_ascii_lowercase();
+            backend.starts_with("rocm") || backend.starts_with("vulkan")
+        })
 }
 
 pub(crate) fn service_model_names_match(left: &str, right: &str) -> bool {
@@ -737,6 +741,49 @@ mod tests {
             &registered,
             "LiquidAI/LFM2.5-230M-GGUF:Q4_0"
         ));
+    }
+
+    #[test]
+    fn lemonade_router_readiness_accepts_any_gpu_backend_the_engine_selects() {
+        // The engine selects ROCm first and Vulkan otherwise, and records either as
+        // `backend_requested`; a router-served model on a Vulkan host must read as
+        // ready on both probe paths. CPU (or no backend) must never read as ready.
+        for (backend, ready) in [
+            ("rocm", true),
+            ("rocm-stable", true),
+            ("vulkan", true),
+            ("Vulkan", true),
+            ("cpu", false),
+            ("", false),
+        ] {
+            let health = json!({
+                "all_models_loaded": [{
+                    "model_name": "Qwen3-0.6B-GGUF",
+                    "recipe_options": { "llamacpp_backend": backend }
+                }]
+            })
+            .to_string();
+            let models = json!({
+                "data": [{
+                    "id": "Qwen3-0.6B-GGUF",
+                    "recipe_options": { "llamacpp_backend": backend }
+                }]
+            })
+            .to_string();
+            for (path, body) in [("/v1/health", &health), ("/v1/models", &models)] {
+                assert_eq!(
+                    service_http_readiness_response_ready(
+                        "lemonade",
+                        path,
+                        200,
+                        body,
+                        "Qwen3-0.6B-GGUF"
+                    ),
+                    ready,
+                    "{path} with backend `{backend}`"
+                );
+            }
+        }
     }
 
     #[test]
