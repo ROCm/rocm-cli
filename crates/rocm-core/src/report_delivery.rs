@@ -23,8 +23,10 @@ use crate::report::{Report, UNRECOGNISED};
 ///
 /// A mailbox rather than an issue tracker. That choice costs the report its
 /// anonymity, because a mail envelope carries the sender's address whatever the
-/// body says, and it costs the ability to count reports, because a mailbox has
-/// no query. Both are recorded where the decision was made rather than here.
+/// body says, and it makes counting reports a manual step, because a mailbox
+/// has no query: a maintainer exports it and runs `cargo xtask report-rollup`,
+/// which reads the body and drops the envelope. Both costs are recorded where
+/// the decision was made rather than here.
 pub const DESTINATION: &str = "ROCmCLI@amd.com";
 
 /// The first word of every subject line, so a mail rule can route the whole set.

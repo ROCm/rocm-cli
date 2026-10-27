@@ -257,6 +257,41 @@ impl Report {
             engine,
         ]
     }
+
+    /// Whether every value [`Report::group_key`] reads is one this CLI writes.
+    ///
+    /// Each check is the writer's own rule run backwards: the catalog for the
+    /// entry, the compatibility matrix for the architecture, the approved lists
+    /// and their fallback words, and the normal form `major_minor` and
+    /// `leading_digits` produce for versions. A report that fails is one no
+    /// version of this CLI that speaks this schema wrote. A reader built from an
+    /// older checkout may also fail a newer report whose catalog entry or
+    /// architecture it does not know yet, which is why rollups are run from the
+    /// current main.
+    pub(crate) fn is_in_vocabulary(&self) -> bool {
+        let release = |value: &str| {
+            value == NONE || value == UNKNOWN || (!value.is_empty() && major_minor(value) == value)
+        };
+        let entry = self.entry == UNRECOGNISED || crate::fix::is_catalog_id(&self.entry);
+        let distro = APPROVED_DISTROS.contains(&self.distro.as_str())
+            || [DISTRO_OTHER, UNKNOWN, "windows", ""].contains(&self.distro.as_str());
+        let os_major = leading_digits(&self.os_major) == self.os_major;
+        // The pair the writer decides together, so it is checked together.
+        let engine = match self.engine.as_str() {
+            NONE | UNKNOWN => self.engine_version == self.engine,
+            name => {
+                APPROVED_ENGINES.contains(&name)
+                    && self.engine_version != NONE
+                    && release(&self.engine_version)
+            }
+        };
+        entry
+            && is_rocm_supported(&self.architecture)
+            && release(&self.rocm)
+            && distro
+            && os_major
+            && engine
+    }
 }
 
 /// What a reader made of a report.
@@ -626,7 +661,15 @@ pub fn read_report(json: &str) -> ReadOutcome {
             ReadOutcome::Unread { schema_seen }
         };
     }
+    // Checked against the vocabulary the writer uses, for the reason the refusal
+    // marker is: a report arrives at an address anyone can write to, so a value
+    // no version of this CLI could have written is a forged or corrupted body.
+    // Taking it would carry its free text, control characters included, into
+    // every count and output built from the report. It reads as unread instead:
+    // counted, so it is never lost, and grouped nowhere.
     serde_json::from_value::<Report>(envelope)
+        .ok()
+        .filter(Report::is_in_vocabulary)
         .map_or(ReadOutcome::Unread { schema_seen }, |report| {
             ReadOutcome::Understood(Box::new(report))
         })
@@ -1275,6 +1318,88 @@ mod tests {
             ReadOutcome::Understood(read_back) => assert_eq!(*read_back, report),
             other => panic!("a genuine report read as {other:?}"),
         }
+    }
+
+    /// Every report the writer produces passes the reader's vocabulary check.
+    ///
+    /// The check is the writer's rules run backwards, so the two must agree on
+    /// every shape the writer can emit: each fallback word, each platform, a
+    /// recognised entry and an unrecognised one. A reader stricter than its
+    /// writer would quietly turn real reports into unread ones.
+    #[test]
+    fn every_report_the_writer_produces_reads_back() {
+        let mut machines = vec![
+            machine("gfx942", ("ubuntu", "22"), "7.1", ("pytorch", "2.5")),
+            machine("gfx1100", ("rhel", "9"), "7.0", ("llama-cpp", "0.9")),
+            machine("gfx90a", ("SENTINEL-DISTRO", "24"), "", ("unknown", "")),
+            machine("gfx942", ("", ""), "SENTINEL", ("skipped", "")),
+            machine_of_sentinels("gfx1100"),
+        ];
+        let mut windows = machine_of_sentinels("gfx1100");
+        windows.os_family = "windows".to_owned();
+        windows.os_version = "Microsoft Windows [Version 10.0.22631.4460]".to_owned();
+        windows.hip_sdk_version = "6.4.1".to_owned();
+        machines.push(windows);
+        let mut localized = machine_of_sentinels("gfx1100");
+        localized.os_family = "windows".to_owned();
+        localized.os_version = "Microsoft Windows [Versie 10.0]".to_owned();
+        machines.push(localized);
+
+        for (nth, machine) in machines.iter().enumerate() {
+            for entry in [None, Some("fix-1-arch")] {
+                let report = prepare_report(machine, entry, entry.is_some())
+                    .expect("a released machine reports");
+                let serialized = serde_json::to_string(&report).expect("a report serializes");
+                assert!(
+                    matches!(read_report(&serialized), ReadOutcome::Understood(_)),
+                    "machine {nth} with entry {entry:?} wrote a report its own reader refuses: \
+                     {serialized}"
+                );
+            }
+        }
+    }
+
+    /// A value no version of this CLI writes makes the report unread.
+    ///
+    /// Reports arrive at an address anyone can write to. A forged body that
+    /// put a name, or terminal control characters, in a grouped field would
+    /// otherwise carry that text into every count built from it.
+    #[test]
+    fn a_report_with_a_value_outside_the_vocabulary_is_not_read() {
+        let genuine = prepare_report(
+            &machine("gfx942", ("ubuntu", "22"), "7.1", ("pytorch", "2.5")),
+            Some("fix-1-arch"),
+            true,
+        )
+        .expect("a released machine reports");
+        let marker = "Jane Doe \u{1b}[31m";
+        for field in [
+            "entry",
+            "architecture",
+            "rocm",
+            "distro",
+            "os_major",
+            "engine",
+            "engine_version",
+        ] {
+            let mut forged = serde_json::to_value(&genuine).expect("a report serializes");
+            forged[field] = serde_json::Value::String(marker.to_owned());
+            assert_eq!(
+                read_report(&forged.to_string()),
+                ReadOutcome::Unread {
+                    schema_seen: REPORT_SCHEMA_VERSION
+                },
+                "a forged `{field}` was read as a report"
+            );
+        }
+        // An engine and a version that do not belong together are not a pair
+        // the writer produces either.
+        let mut mismatched = serde_json::to_value(&genuine).expect("a report serializes");
+        mismatched["engine"] = serde_json::Value::String(NONE.to_owned());
+        assert!(matches!(
+            read_report(&mismatched.to_string()),
+            ReadOutcome::Unread { .. }
+        ));
     }
 
     /// An engine name this build does not recognise is not published.

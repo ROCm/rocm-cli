@@ -84,8 +84,20 @@ impl Rollup {
         }
     }
 
+    /// Group a report, or count it as unread when a value in it is not one the
+    /// CLI writes.
+    ///
+    /// `read_report` already refuses such a report. Checked again here because
+    /// both outputs print the group values as they are, and a `ReadOutcome`
+    /// can be built without going through the reader: free text or terminal
+    /// control characters must not reach either output whichever way a report
+    /// arrived.
     fn add_report(&mut self, report: &Report) {
-        self.understood.add(&report.group_key());
+        if report.is_in_vocabulary() {
+            self.understood.add(&report.group_key());
+        } else {
+            *self.unread.entry(report.schema).or_default() += 1;
+        }
     }
 
     /// Count every report.
@@ -345,7 +357,7 @@ mod tests {
         let outcomes = [
             report("fix-6-path", "gfx942", "7.1", ("ubuntu", "22")),
             report("fix-6-path", "gfx942", "7.1", ("ubuntu", "22")),
-            report("fix-2-group", "gfx942", "7.1", ("ubuntu", "22")),
+            report("fix-2-unset-override", "gfx942", "7.1", ("ubuntu", "22")),
             report(UNRECOGNISED, "gfx942", "7.1", ("ubuntu", "22")),
         ];
         let rollup = Rollup::of(&outcomes);
@@ -372,10 +384,30 @@ mod tests {
         );
     }
 
+    /// A report that did not come through the reader is still held to the
+    /// writer's vocabulary: its text never reaches either output.
+    #[test]
+    fn a_report_built_outside_the_reader_cannot_put_free_text_in_an_output() {
+        let marker = "Jane Doe \u{1b}[31m";
+        let forged = report("fix-6-path", marker, "7.1", ("ubuntu", "22"));
+        let rollup = Rollup::of(&[
+            forged,
+            report("fix-6-path", "gfx942", "7.1", ("ubuntu", "22")),
+        ]);
+
+        assert_eq!(rollup.understood.count, 1);
+        assert_eq!(rollup.unread[&REPORT_SCHEMA_VERSION], 1);
+        let outputs = format!("{}{}", rollup.render_text(), rollup.to_json());
+        assert!(
+            !outputs.contains("Jane Doe") && !outputs.contains('\u{1b}'),
+            "{outputs}"
+        );
+    }
+
     #[test]
     fn the_json_ranks_groups_as_the_text_does() {
         let outcomes = [
-            report("fix-2-group", "gfx942", "7.1", ("ubuntu", "22")),
+            report("fix-2-unset-override", "gfx942", "7.1", ("ubuntu", "22")),
             report("fix-6-path", "gfx942", "7.1", ("ubuntu", "22")),
             report("fix-6-path", "gfx942", "7.1", ("ubuntu", "22")),
         ];
