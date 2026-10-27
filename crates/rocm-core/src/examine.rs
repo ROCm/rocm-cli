@@ -247,7 +247,7 @@ pub struct Examination {
     /// amdgpu is present: listed as a module, or registered as a PCI driver
     /// (`/sys/bus/pci/drivers/amdgpu`), which it is whether amdgpu is loaded
     /// as a module or built into the kernel (where it never appears in
-    /// `lsmod`).
+    /// `lsmod`), or kfd is present on the host (kfd is linked into amdgpu).
     pub amdgpu_loaded: Option<bool>,
     pub amdgpu_blacklisted_in: Vec<String>,
     /// kfd is available: as a separate `amdkfd` module on kernels before 4.20
@@ -1851,6 +1851,14 @@ fn amdgpu_present_on_host() -> bool {
     crate::host_path("/sys/bus/pci/drivers/amdgpu").exists()
 }
 
+/// What the host says about `amdgpu_loaded`: the amdgpu PCI driver is
+/// registered, or kfd is present. kfd is linked into amdgpu, so kfd on the
+/// host proves amdgpu too: a container that passes `/dev/kfd` through without
+/// `/sys/bus/pci` must not report amdkfd up and amdgpu down.
+fn amdgpu_implied_by_host() -> bool {
+    amdgpu_present_on_host() || kfd_present_on_host()
+}
+
 /// Whether `name` is loaded or built in: listed in the module list, or present
 /// on the host.
 ///
@@ -1881,12 +1889,7 @@ fn probe_modules(e: &mut Examination) {
             .filter_map(|line| line.split_whitespace().next())
             .collect()
     });
-    // kfd is linked into amdgpu, so kfd on the host proves amdgpu too: a
-    // container that passes `/dev/kfd` through without `/sys/module` must not
-    // report kfd up and amdgpu down.
-    e.amdgpu_loaded = module_or_host_state(modules.as_deref(), "amdgpu", || {
-        amdgpu_present_on_host() || kfd_present_on_host()
-    });
+    e.amdgpu_loaded = module_or_host_state(modules.as_deref(), "amdgpu", amdgpu_implied_by_host);
     e.amdkfd_loaded = module_or_host_state(modules.as_deref(), "amdkfd", kfd_present_on_host);
 
     for dir in ["/etc/modprobe.d", "/usr/lib/modprobe.d", "/run/modprobe.d"] {
@@ -6621,6 +6624,41 @@ mod tests {
         assert!(!neither, "an empty root has no kfd");
         assert!(sysfs_only, "/sys/class/kfd/kfd alone counts");
         assert!(dev_only, "/dev/kfd alone counts");
+    }
+
+    /// kfd on the host alone answers `amdgpu_loaded`: no amdgpu PCI driver
+    /// directory, only a kfd signal, either one.
+    #[cfg(all(feature = "e2e-test-hooks", target_os = "linux"))]
+    #[test]
+    fn kfd_alone_on_the_host_implies_amdgpu() {
+        use crate::hardware_root::TEST_HOST_ROOT_ENV;
+        use crate::test_env::RestoredEnvVar;
+
+        let root = std::env::temp_dir().join(format!(
+            "rocm-core-kfd-implies-amdgpu-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::create_dir_all(&root).expect("create root");
+        let (neither, sysfs_only, dev_only) = {
+            let _guard = crate::hardware_root::HOST_ROOT_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _root = RestoredEnvVar::set(TEST_HOST_ROOT_ENV, &root);
+            let neither = amdgpu_implied_by_host();
+            std::fs::create_dir_all(root.join("sys/class/kfd/kfd")).expect("plant sysfs");
+            let sysfs_only = amdgpu_implied_by_host();
+            std::fs::remove_dir_all(root.join("sys")).expect("unplant sysfs");
+            std::fs::create_dir_all(root.join("dev")).expect("plant dev");
+            std::fs::write(root.join("dev/kfd"), "").expect("plant /dev/kfd");
+            (neither, sysfs_only, amdgpu_implied_by_host())
+        };
+        std::fs::remove_dir_all(&root).ok();
+        assert!(!neither, "an empty root implies no amdgpu");
+        assert!(sysfs_only, "/sys/class/kfd/kfd alone implies amdgpu");
+        assert!(dev_only, "/dev/kfd alone implies amdgpu");
     }
 
     /// The wiring, not just the helpers: `probe_modules` must consult the host
