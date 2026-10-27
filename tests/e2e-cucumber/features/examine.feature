@@ -428,3 +428,26 @@ Feature: GPU detection and system inspection
     Given a GPU machine whose release file cannot be read
     When the user inspects that machine in machine-readable form
     Then the inspection's verdict is degraded, and its only failure says the release file could not be read
+
+  # Whether a GPU is integrated decides two things a user sees: `rocm serve`
+  # withholds its low-VRAM warning on an APU (whose "VRAM" is a BIOS carve-out
+  # of system RAM), and `rocm diagnose` raises `fix-9-igpu-dgpu` only on a host
+  # with both an integrated and a discrete AMD GPU. Every AMD GPU on this bus
+  # used to be misreported: the PCI scan ignored the `[1002:xxxx]` device id,
+  # so a GPU `pci.ids` cannot name ("Device") got no architecture; `examine`
+  # kept its own name table, which called Krackan Point gfx1150 (it is gfx1152)
+  # and knew the Renoir and Mendocino codenames only as "some APU"; and gfx1037
+  # was not classified as integrated at all.
+  #
+  # The host is simulated, so this runs on every Linux lane, GPU or not. A
+  # stand-in `lspci` on PATH lists the five GPUs as `lspci -nn -D` prints them,
+  # a stand-in `rocminfo` lists no agents, and the simulated host root has no
+  # kernel topology, so the PCI scan alone names every card. (What `rocminfo`
+  # adds is covered one level down: on a real host its agents are dropped by
+  # ROCm/rocm-cli#393, so the folds it feeds cannot be reached from here.)
+  @id:examine-tells-integrated-gpus-from-discrete-ones @requires-os:linux
+  Scenario: examine-29 - The inspection tells integrated GPUs from discrete ones by the part they are
+    Given a machine whose PCI bus lists a Radeon RX 7900 XTX and four integrated AMD GPUs
+    When the user inspects that machine in machine-readable form
+    Then the inspection names each GPU's architecture and reports only the RX 7900 XTX as discrete
+    And the inspection reports the machine as having both an integrated and a discrete AMD GPU

@@ -608,7 +608,7 @@ const fn detect_linux_primary_gpu_name() -> Option<String> {
     None
 }
 
-fn parse_windows_display_gfx_target(text: &str) -> Option<String> {
+pub(crate) fn parse_windows_display_gfx_target(text: &str) -> Option<String> {
     let mut name_fallback = None;
     let mut unsupported_match = None;
     for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
@@ -625,8 +625,17 @@ fn parse_windows_display_gfx_target(text: &str) -> Option<String> {
             }
             return Some(target.to_owned());
         }
-        if name_fallback.is_none() {
-            name_fallback = gfx_target_from_amd_marketing_name(name).map(str::to_owned);
+        if name_fallback.is_none()
+            && let Some(target) = gfx_target_from_amd_marketing_name(name)
+        {
+            // The same rule for a name: the marketing table names gfx90c by its
+            // codenames, and an iGPU recognised that way must not hide a
+            // discrete card further down the list either.
+            if gfx_target_has_no_rocm_build(target) {
+                unsupported_match = unsupported_match.or(Some(target));
+            } else {
+                name_fallback = Some(target.to_owned());
+            }
         }
     }
     name_fallback.or_else(|| unsupported_match.map(str::to_owned))
@@ -683,7 +692,7 @@ fn amd_pci_device_id_from_pnp_id(pnp_id: &str) -> Option<String> {
     }
 }
 
-fn gfx_target_from_amd_pci_device_id(device_id: &str) -> Option<&'static str> {
+pub(crate) fn gfx_target_from_amd_pci_device_id(device_id: &str) -> Option<&'static str> {
     match device_id.to_ascii_lowercase().as_str() {
         // Navi 21 / 22 / 23 / 24: Radeon RX 6000 desktop and mobile ASICs.
         "73a0" | "73a1" | "73a2" | "73a3" | "73a5" | "73a8" | "73a9" | "73ab" | "73ac" | "73ad"
@@ -720,7 +729,13 @@ fn gfx_target_from_amd_pci_device_id(device_id: &str) -> Option<&'static str> {
     }
 }
 
-fn gfx_target_from_amd_marketing_name(name: &str) -> Option<&'static str> {
+/// The gfx target an AMD marketing name or `lspci` codename names, or `None`
+/// when no entry in [`AMD_MARKETING_GFX_TARGETS`] matches.
+///
+/// This is the crate's one name-to-target table: the install-side display
+/// probes and `examine`'s GPU probes both answer from it, so a name resolves to
+/// the same target whichever command reads it.
+pub(crate) fn gfx_target_from_amd_marketing_name(name: &str) -> Option<&'static str> {
     let lower = name.to_ascii_lowercase();
     let normalized = normalize_marketing_name_for_match(&lower);
     for entry in AMD_MARKETING_GFX_TARGETS {
@@ -732,12 +747,12 @@ fn gfx_target_from_amd_marketing_name(name: &str) -> Option<&'static str> {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct AmdMarketingGfxTarget {
-    pattern: &'static str,
-    gfx_target: &'static str,
+pub(crate) struct AmdMarketingGfxTarget {
+    pub(crate) pattern: &'static str,
+    pub(crate) gfx_target: &'static str,
 }
 
-const AMD_MARKETING_GFX_TARGETS: &[AmdMarketingGfxTarget] = &[
+pub(crate) const AMD_MARKETING_GFX_TARGETS: &[AmdMarketingGfxTarget] = &[
     // RDNA4 discrete.
     AmdMarketingGfxTarget {
         pattern: "ai pro r9700",
@@ -886,6 +901,17 @@ const AMD_MARKETING_GFX_TARGETS: &[AmdMarketingGfxTarget] = &[
         pattern: "8040s",
         gfx_target: "gfx1151",
     },
+    // The codename and the product line, as `lspci` and `rocminfo` print them.
+    // There is no "8045S": the three Strix Halo SKU names are 8060S, 8050S and
+    // 8040S (the Ryzen AI Max PRO 380's), so this table never carried one.
+    AmdMarketingGfxTarget {
+        pattern: "strix halo",
+        gfx_target: "gfx1151",
+    },
+    AmdMarketingGfxTarget {
+        pattern: "ryzen ai max",
+        gfx_target: "gfx1151",
+    },
     // RDNA3.5 APUs.
     AmdMarketingGfxTarget {
         pattern: "890m",
@@ -896,11 +922,22 @@ const AMD_MARKETING_GFX_TARGETS: &[AmdMarketingGfxTarget] = &[
         gfx_target: "gfx1150",
     },
     AmdMarketingGfxTarget {
+        pattern: "strix point",
+        gfx_target: "gfx1150",
+    },
+    AmdMarketingGfxTarget {
         pattern: "860m",
         gfx_target: "gfx1152",
     },
     AmdMarketingGfxTarget {
         pattern: "840m",
+        gfx_target: "gfx1152",
+    },
+    // Krackan Point is gfx1152, as its device id (`1114`) and the 860M/840M it
+    // sells as both say. gfx1150 and gfx1152 are separate TheRock families, so
+    // calling it gfx1150 selects the wrong runtime build.
+    AmdMarketingGfxTarget {
+        pattern: "krackan",
         gfx_target: "gfx1152",
     },
     AmdMarketingGfxTarget {
@@ -920,6 +957,32 @@ const AMD_MARKETING_GFX_TARGETS: &[AmdMarketingGfxTarget] = &[
         pattern: "740m",
         gfx_target: "gfx1103",
     },
+    // `lspci` prints the Phoenix codename with a die number (`Phoenix1`,
+    // `Phoenix3`), which is a different token from `phoenix`.
+    AmdMarketingGfxTarget {
+        pattern: "phoenix",
+        gfx_target: "gfx1103",
+    },
+    AmdMarketingGfxTarget {
+        pattern: "phoenix1",
+        gfx_target: "gfx1103",
+    },
+    AmdMarketingGfxTarget {
+        pattern: "phoenix2",
+        gfx_target: "gfx1103",
+    },
+    AmdMarketingGfxTarget {
+        pattern: "phoenix3",
+        gfx_target: "gfx1103",
+    },
+    AmdMarketingGfxTarget {
+        pattern: "phoenix4",
+        gfx_target: "gfx1103",
+    },
+    AmdMarketingGfxTarget {
+        pattern: "hawk point",
+        gfx_target: "gfx1103",
+    },
     // RDNA2 APUs.
     AmdMarketingGfxTarget {
         pattern: "680m",
@@ -930,7 +993,23 @@ const AMD_MARKETING_GFX_TARGETS: &[AmdMarketingGfxTarget] = &[
         gfx_target: "gfx1035",
     },
     AmdMarketingGfxTarget {
+        pattern: "rembrandt",
+        gfx_target: "gfx1035",
+    },
+    // Mendocino (Ryzen 7020 series) sells as a Radeon 610M too, which the row
+    // below answers as gfx1036; only the codename tells the two apart, so it is
+    // listed ahead of that row for `lspci`'s sake. A Windows Mendocino, named
+    // only "Radeon(TM) 610M", still reads as gfx1036 by name.
+    AmdMarketingGfxTarget {
+        pattern: "mendocino",
+        gfx_target: "gfx1037",
+    },
+    AmdMarketingGfxTarget {
         pattern: "610m",
+        gfx_target: "gfx1036",
+    },
+    AmdMarketingGfxTarget {
+        pattern: "raphael",
         gfx_target: "gfx1036",
     },
     AmdMarketingGfxTarget {
@@ -940,6 +1019,37 @@ const AMD_MARKETING_GFX_TARGETS: &[AmdMarketingGfxTarget] = &[
     AmdMarketingGfxTarget {
         pattern: "van gogh",
         gfx_target: "gfx1033",
+    },
+    // `lspci` spells it as one word, and the Steam Deck's own display name is
+    // the part number rather than any Radeon model.
+    AmdMarketingGfxTarget {
+        pattern: "vangogh",
+        gfx_target: "gfx1033",
+    },
+    AmdMarketingGfxTarget {
+        pattern: "custom gpu 0405",
+        gfx_target: "gfx1033",
+    },
+    // Vega iGPUs in Ryzen 4000/5000/7030 parts. They sell as a bare "AMD
+    // Radeon Graphics", so the codename `lspci` prints is the only name that
+    // identifies them. gfx90c has no ROCm build (`gfx_target_has_no_rocm_build`),
+    // which is why the install-side probes rank a name answering it below every
+    // other recognised adapter.
+    AmdMarketingGfxTarget {
+        pattern: "renoir",
+        gfx_target: "gfx90c",
+    },
+    AmdMarketingGfxTarget {
+        pattern: "cezanne",
+        gfx_target: "gfx90c",
+    },
+    AmdMarketingGfxTarget {
+        pattern: "lucienne",
+        gfx_target: "gfx90c",
+    },
+    AmdMarketingGfxTarget {
+        pattern: "barcelo",
+        gfx_target: "gfx90c",
     },
 ];
 
@@ -1715,9 +1825,10 @@ impl WindowsExamineInventory {
             .iter()
             .find(|display| pci_target(display).is_some_and(|t| !gfx_target_has_no_rocm_build(t)))
             .or_else(|| {
-                self.displays
-                    .iter()
-                    .find(|display| gfx_target_from_amd_marketing_name(&display.name).is_some())
+                self.displays.iter().find(|display| {
+                    gfx_target_from_amd_marketing_name(&display.name)
+                        .is_some_and(|t| !gfx_target_has_no_rocm_build(t))
+                })
             })
             // A recognized-but-unsupported iGPU (gfx90c) ranks below every
             // other recognized adapter, so it cannot hide a discrete card.
@@ -3604,6 +3715,50 @@ mod tests {
         assert_eq!(
             parse_windows_display_gfx_target(text),
             Some("gfx90c".to_owned())
+        );
+    }
+
+    /// A gfx90c iGPU recognised by its *name* must not hide a discrete card
+    /// either.
+    ///
+    /// The name table now answers gfx90c for the Vega iGPUs' codenames, which
+    /// is what `examine` needs; on the install side that answer has to rank
+    /// where the PCI-id answer for the same iGPU already does, below every
+    /// other recognised adapter, or the first adapter's name would decide the
+    /// install family for the whole host.
+    #[test]
+    fn windows_display_parser_does_not_let_a_named_vega_igpu_hide_a_discrete_card() {
+        let text = "AMD Radeon(TM) Graphics (Renoir)\t\n\
+                    AMD Radeon RX 6800M\tPCI\\VEN_1002&DEV_9999";
+        assert_eq!(
+            parse_windows_display_gfx_target(text),
+            Some("gfx1031".to_owned())
+        );
+        let text = "AMD Radeon(TM) Graphics (Renoir)\t";
+        assert_eq!(
+            parse_windows_display_gfx_target(text),
+            Some("gfx90c".to_owned()),
+            "alone, the iGPU is still reported as gfx90c"
+        );
+
+        let inventory = WindowsExamineInventory {
+            displays: vec![
+                WindowsDisplayAdapter {
+                    name: "AMD Radeon(TM) Graphics (Renoir)".to_owned(),
+                    driver_version: None,
+                    pnp_device_id: None,
+                },
+                WindowsDisplayAdapter {
+                    name: "AMD Radeon RX 6800M".to_owned(),
+                    driver_version: None,
+                    pnp_device_id: None,
+                },
+            ],
+            ..WindowsExamineInventory::default()
+        };
+        assert_eq!(
+            inventory.amd_display_name().as_deref(),
+            Some("AMD Radeon RX 6800M")
         );
     }
 

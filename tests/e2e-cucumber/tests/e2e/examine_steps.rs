@@ -1457,6 +1457,145 @@ async fn gpu_machine_with_unreadable_release_file(world: &mut E2eWorld) {
     plant_gpu_fixtures(world);
 }
 
+/// The five AMD GPUs `examine-29` puts on the PCI bus, as `lspci -nn -D`
+/// prints them: `(PCI address, gfx target, integrated, lspci line)`.
+///
+/// Each row reaches its answer by a different door, so each one fails alone if
+/// that door regresses: the RX 7900 XTX by its marketing name (its device id is
+/// not in the table), the Raphael iGPU by its device id alone (`pci.ids` has no
+/// name for it here), Krackan Point by both (and the name used to say gfx1150),
+/// Renoir and Mendocino by their codenames.
+const PCI_BUS_GPUS: &[(&str, &str, bool, &str)] = &[
+    (
+        "0000:03:00.0",
+        "gfx1100",
+        false,
+        "0000:03:00.0 VGA compatible controller [0300]: Advanced Micro Devices, Inc. \
+         [AMD/ATI] Navi 31 [Radeon RX 7900 XT/7900 XTX/7900 GRE/7900M] [1002:744c] (rev c8)",
+    ),
+    (
+        "0000:14:00.0",
+        "gfx1036",
+        true,
+        "0000:14:00.0 Display controller [0380]: Advanced Micro Devices, Inc. \
+         [AMD/ATI] Device [1002:164e] (rev c1)",
+    ),
+    (
+        "0000:c5:00.0",
+        "gfx1152",
+        true,
+        "0000:c5:00.0 VGA compatible controller [0300]: Advanced Micro Devices, Inc. \
+         [AMD/ATI] Krackan Point [Radeon 860M] [1002:1114] (rev c1)",
+    ),
+    (
+        "0000:04:00.0",
+        "gfx90c",
+        true,
+        "0000:04:00.0 VGA compatible controller [0300]: Advanced Micro Devices, Inc. \
+         [AMD/ATI] Renoir [1002:1636] (rev c6)",
+    ),
+    (
+        "0000:05:00.0",
+        "gfx1037",
+        true,
+        "0000:05:00.0 VGA compatible controller [0300]: Advanced Micro Devices, Inc. \
+         [AMD/ATI] Mendocino [1002:1506] (rev c1)",
+    ),
+];
+
+#[given("a machine whose PCI bus lists a Radeon RX 7900 XTX and four integrated AMD GPUs")]
+async fn machine_with_five_amd_gpus_on_the_bus(world: &mut E2eWorld) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .to_owned();
+    // An empty simulated host root: no kernel topology, no sysfs GPU, so
+    // nothing but the PCI scan names a card, and no real card on the runner
+    // can join the list.
+    let host_root = root.join("host-root");
+    std::fs::create_dir_all(&host_root).expect("failed to create the simulated host root");
+    let bin = root.join("fake-bin");
+    std::fs::create_dir_all(&bin).expect("failed to create the fake PATH dir");
+    let listing = PCI_BUS_GPUS
+        .iter()
+        .map(|(_, _, _, line)| *line)
+        .collect::<Vec<_>>()
+        .join("\n");
+    rocm_core::fake_executable::write_fake_executable(
+        &bin.join("lspci"),
+        format!("#!/bin/sh\ncat <<'LSPCI'\n{listing}\nLSPCI\n"),
+    )
+    .expect("failed to write the fake lspci");
+    // A `rocminfo` that answers and lists no agents, ahead of any real one, so
+    // a GPU runner's own agents are not paired onto these rows.
+    rocm_core::fake_executable::write_fake_executable(&bin.join("rocminfo"), "#!/bin/sh\nexit 0\n")
+        .expect("failed to write the fake rocminfo");
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .expect("PATH entries cannot hold a separator");
+    world.command_env.push(("PATH", path));
+    world
+        .command_env
+        .push(("ROCM_CLI_TEST_HOST_ROOT", host_root.into_os_string()));
+}
+
+#[then("the inspection names each GPU's architecture and reports only the RX 7900 XTX as discrete")]
+async fn assert_each_gpu_classified(world: &mut E2eWorld) {
+    assert_eq!(world.cli_rc, Some(0), "`rocm examine --json` failed");
+    let json = parsed_json(world);
+    let gpus = json
+        .get("gpus")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or_else(|| panic!("`examine --json` has no gpus array:\n{json:#}"));
+    let amd: Vec<&serde_json::Value> = gpus
+        .iter()
+        .filter(|gpu| gpu.get("is_amd").and_then(serde_json::Value::as_bool) == Some(true))
+        .collect();
+    assert_eq!(
+        amd.len(),
+        PCI_BUS_GPUS.len(),
+        "one AMD GPU per planted PCI row and no other:\n{json:#}"
+    );
+    let mut wrong = Vec::new();
+    for (address, target, integrated, _) in PCI_BUS_GPUS {
+        let Some(gpu) = amd
+            .iter()
+            .find(|gpu| gpu.get("pci_id").and_then(serde_json::Value::as_str) == Some(address))
+        else {
+            wrong.push(format!("{address}: not reported"));
+            continue;
+        };
+        let reported_target = gpu.get("gfx_target").and_then(serde_json::Value::as_str);
+        let reported_integrated = gpu.get("is_apu").and_then(serde_json::Value::as_bool);
+        if reported_target != Some(target) || reported_integrated != Some(*integrated) {
+            wrong.push(format!(
+                "{address}: expected {target}, integrated={integrated}; got \
+                 gfx_target={reported_target:?}, is_apu={reported_integrated:?}"
+            ));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "GPUs reported with the wrong architecture or packaging:\n{}\n{json:#}",
+        wrong.join("\n")
+    );
+}
+
+#[then("the inspection reports the machine as having both an integrated and a discrete AMD GPU")]
+async fn assert_both_gpu_categories(world: &mut E2eWorld) {
+    let json = parsed_json(world);
+    for field in ["has_amd_gpu", "has_apu", "has_discrete_amd"] {
+        assert_eq!(
+            json.get(field).and_then(serde_json::Value::as_bool),
+            Some(true),
+            "{field}:\n{json:#}"
+        );
+    }
+}
+
 #[when("the user inspects that machine in machine-readable form")]
 async fn user_inspects_planted_machine(world: &mut E2eWorld) {
     let (stdout, stderr, rc) =
