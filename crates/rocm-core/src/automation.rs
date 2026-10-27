@@ -2633,6 +2633,81 @@ mod tests {
         Ok(())
     }
 
+    fn event_line(tag: &str) -> String {
+        serde_json::to_string(&event_record(tag)).expect("serialize event record")
+    }
+
+    /// Write `contents` as the automation events store, creating its directory.
+    fn seed_events_store(paths: &AppPaths, contents: &str) -> Result<()> {
+        paths.ensure()?;
+        fs::write(paths.automation_events_path(), contents)?;
+        Ok(())
+    }
+
+    // The rotation tests above all drive `append_jsonl_record` and
+    // `load_recent_jsonl_records` directly with a custom `JsonlRotation`,
+    // which proves the mechanism works but never exercises the wiring that
+    // connects it to the real stores: `append_automation_event` and
+    // `append_audit_event` passing `Some(EVENT_LOG_ROTATION)`, and
+    // `load_recent_automation_events`/`load_recent_audit_events` passing
+    // `EVENT_LOG_ROTATED_GENERATIONS`. Flip either side back to `None`/`0`
+    // and every test above still passes. These two tests close that gap by
+    // going through the public wrappers only, at the real
+    // `EVENT_LOG_ROTATE_BYTES` cap — seeding the live file directly (fast)
+    // rather than looping a real append to size, since it's the one real
+    // append afterward that is under test, not how the filler got there.
+    #[test]
+    fn events_store_rotates_through_the_public_wrapper() -> Result<()> {
+        let (root, paths) = temp_app_paths("events-public-wrapper-rotation");
+        let filler = event_line("filler") + "\n";
+        let repeats = (EVENT_LOG_ROTATE_BYTES as usize).div_ceil(filler.len());
+        seed_events_store(&paths, &filler.repeat(repeats))?;
+
+        append_automation_event(&paths, &event_record("new"))?;
+        let rotated = jsonl_generation_path(&paths.automation_events_path(), 1).exists();
+        let recent = load_recent_automation_events(&paths, 1);
+        fs::remove_dir_all(root).ok();
+
+        assert!(
+            rotated,
+            "the live file was at the cap and should have rotated"
+        );
+        assert_eq!(
+            recent?
+                .into_iter()
+                .map(|event| event.message)
+                .collect::<Vec<_>>(),
+            ["new"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn audit_log_rotates_through_the_public_wrapper() -> Result<()> {
+        let (root, paths) = temp_app_paths("audit-public-wrapper-rotation");
+        let filler = audit_line("filler") + "\n";
+        let repeats = (EVENT_LOG_ROTATE_BYTES as usize).div_ceil(filler.len());
+        seed_audit_store(&paths, &filler.repeat(repeats))?;
+
+        append_audit_event(&paths, &audit_record("new"))?;
+        let rotated = jsonl_generation_path(&paths.audit_events_path(), 1).exists();
+        let recent = load_recent_audit_events(&paths, 1);
+        fs::remove_dir_all(root).ok();
+
+        assert!(
+            rotated,
+            "the live file was at the cap and should have rotated"
+        );
+        assert_eq!(
+            recent?
+                .into_iter()
+                .map(|event| event.message)
+                .collect::<Vec<_>>(),
+            ["new"]
+        );
+        Ok(())
+    }
+
     // Right after a rollover the live file holds fewer records than a reader
     // asks for; the rest must come from the rotated generations, in order.
     #[test]
