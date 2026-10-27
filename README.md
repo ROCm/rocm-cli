@@ -771,9 +771,15 @@ rocm serve <model> [--engine lemonade|vllm|aim]
 
 `--engine aim` runs the model in a Docker container instead of a host
 process; it requires a reachable Docker daemon and is Linux/WSL2 only.
-`--engine-env` passes an extra `KEY=VALUE` environment variable through to
-the engine's own process/container (repeatable); currently only `aim`
-consumes these (e.g. `AIM_PROFILE_ID`).
+`--engine-env` passes an extra environment variable through to the engine's
+own process/container (repeatable); currently only `aim` consumes these (e.g.
+`AIM_PROFILE_ID`). `KEY=VALUE` values are visible in the detached child's
+argv and in `rocm services list --json`, so do not put secrets there; pass a
+bare `KEY` (e.g. `--engine-env HF_TOKEN`) to forward the value from your
+current environment without storing it. A service restarted by the daemon
+after a crash inherits the daemon's environment, not yours, so a forwarded
+secret must also be set there. `ROCM_CLI_AIM_READY_TIMEOUT_SECS` raises the
+5-minute readiness wait for a cold-start model download.
 
 `--gpu-memory-utilization` (a fraction above 0.0 and up to 1.0 of each GPU's
 total VRAM) and `--tool-call-parser` (for example `hermes`, `llama3_json`, or

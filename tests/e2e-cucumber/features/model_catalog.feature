@@ -18,7 +18,9 @@ Feature: Model catalog listing
   # unavailable branch is exercised deterministically on every host, including
   # ones where Docker really is reachable (an earlier variant compared against
   # the host's real Docker state, which asserted a different outcome per host).
-  @id:model-catalog-flags-aim-unavailable-with-no-docker-daemon
+  # Linux only: native Windows rules AIM out for the OS before it asks Docker,
+  # so it reports `unsupported_native_windows`, not the Docker reason asserted here.
+  @id:model-catalog-flags-aim-unavailable-with-no-docker-daemon @requires-os:linux
   Scenario: model-catalog-02 - AIM image is flagged unavailable with no Docker daemon
     Given no Docker daemon is reachable
     When the user asks for the model catalog in verbose detail

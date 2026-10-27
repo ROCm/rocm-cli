@@ -7095,7 +7095,12 @@ fn stop_internal_managed_service_confirmed_with(
     // unverifiable PID), leave the status so the standard liveness refresh
     // reconciles it to "stopped" once the process actually dies — rather than
     // asserting a stop that did not happen.
-    let all_stopped = terminated_all && stopping.names_same_processes(&record);
+    // A container engine is stopped by its engine `Stop`, not by the PID of the
+    // supervisor that follows it, so a failed `Stop` leaves the stop unconfirmed.
+    let engine_stop_confirms =
+        !rocm_core::engine_stop_decides_confirmation(&stopping.engine) || engine_stop.is_ok();
+    let all_stopped =
+        terminated_all && stopping.names_same_processes(&record) && engine_stop_confirms;
     if all_stopped {
         record.status = "stopped".to_owned();
         record.stop_requested_unix_ms = None;
@@ -15801,6 +15806,32 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn stop_of_a_container_engine_is_unconfirmed_when_the_engine_stop_fails() {
+        // For `aim` the recorded PID is only the supervisor; killing it says
+        // nothing about the container. With no aim engine to answer `Stop`, the
+        // PID verdict alone must not mark the service stopped or drop its key.
+        let (root, paths) = test_paths("stop-aim-engine-stop-fails");
+        paths.ensure().unwrap();
+        let service_id = "svc-stop-aim-engine-stop-fails";
+        let mut record = stop_test_record(&paths, service_id);
+        record.engine = "aim".to_owned();
+        record.write().unwrap();
+        endpoint_keys::store_endpoint_api_key(&paths, service_id, "key-123").unwrap();
+
+        let report =
+            stop_internal_managed_service_with(&paths, service_id, |_| (Vec::new(), true)).unwrap();
+
+        let on_disk = raw_manifest(&paths, service_id);
+        let key = endpoint_keys::endpoint_api_key(&paths, service_id);
+        let _ = fs::remove_dir_all(root);
+        assert!(report["engine_stop"]["error"].is_string(), "{report}");
+        // Unconfirmed: the marker is re-stamped and the key kept for the liveness
+        // refresh to settle, rather than cleared as for a confirmed stop.
+        assert!(on_disk.stop_requested_unix_ms.is_some());
+        assert_eq!(key.as_deref(), Some("key-123"), "the key is kept");
+    }
+
+    #[test]
     fn stop_final_write_keeps_what_others_wrote_while_it_ran() {
         // The stop's last write applies its own fields to the record as it is
         // now, not to the copy it loaded before the engine stop and the wait.
@@ -19357,9 +19388,6 @@ pub(crate) mod tests {
         );
     }
 
-    /// When the platform gate allows an engine, there is nothing to report --
-    /// asserted directly against the pure helper, not by relying on whichever
-    /// OS this test happens to run on.
     /// AIM's Docker GPU passthrough only exists on Linux/WSL2, so native
     /// Windows must be ruled out (the Docker-reachability gate alone would pass
     /// on Docker Desktop and launch on CPU).
@@ -19373,6 +19401,9 @@ pub(crate) mod tests {
         );
     }
 
+    /// When the platform gate allows an engine, there is nothing to report --
+    /// asserted directly against the pure helper, not by relying on whichever
+    /// OS this test happens to run on.
     #[test]
     fn unsupported_here_for_is_none_when_allowed() {
         assert_eq!(unsupported_here_for("vllm", PlatformRuleOut::Allowed), None);
@@ -19384,6 +19415,10 @@ pub(crate) mod tests {
 
     /// `aim` is ruled out for a different reason than `vllm` on Windows
     /// (Docker, not the OS), so the message has to say Docker, not WSL.
+    ///
+    /// Pins the wording only; that the gate actually fires on an unreachable
+    /// daemon is proven by
+    /// `engine_ruled_out_by_platform_gates_aim_on_docker_reachability`.
     #[test]
     fn unsupported_here_for_names_docker_for_aim() {
         let message = unsupported_here_for("aim", PlatformRuleOut::AimDockerUnavailable)

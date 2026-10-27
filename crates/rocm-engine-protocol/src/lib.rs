@@ -532,7 +532,9 @@ pub struct EngineRecipeHint {
     /// Engine-specific environment variables to pass through verbatim to the
     /// engine's own process/container (e.g. AIM's `AIM_PROFILE_ID` override).
     /// Generic by design — only `engines/aim` currently reads this.
-    #[serde(default)]
+    /// Omitted when empty so a recipe hint serialises as it did before the
+    /// field existed (duplicate-serve reuse compares the JSON as a string).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra_env: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preferred_endpoint: Option<EngineRecipeEndpointHint>,

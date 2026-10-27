@@ -55,14 +55,6 @@ fn request_engine_stop(paths: &AppPaths, record: &ManagedServiceRecord) -> Resul
     )
 }
 
-/// Engines whose service is a container rather than a recorded process: the
-/// engine `Stop` is the only thing that stops one, so its verdict, not the PID
-/// signalling, decides whether the stop is confirmed. For a PID-supervised
-/// engine the PIDs are authoritative and the engine `Stop` is reported only.
-fn engine_stop_decides_confirmation(engine: &str) -> bool {
-    engine == "aim"
-}
-
 /// [`stop_managed_service_with`], with the engine `Stop` request supplied by the
 /// caller as well, so a test can see what was asked of the engine and make it
 /// fail.
@@ -126,7 +118,7 @@ pub(crate) fn stop_managed_service_via(
     // stop was running — those are processes it never touched, and claiming the
     // service stopped, clearing their PIDs or dropping the key they serve with
     // would each be false.
-    let engine_stop_confirms = !engine_stop_decides_confirmation(&stopping.engine)
+    let engine_stop_confirms = !rocm_core::engine_stop_decides_confirmation(&stopping.engine)
         || engine_stop.as_ref().is_some_and(Result::is_ok);
     let all_stopped = stops.iter().all(|stop| stop.stopped)
         && stopping.names_same_processes(&record)

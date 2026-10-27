@@ -476,6 +476,10 @@ fn select_local_chat_service(
         services.retain(|service| {
             service.canonical_model_id.eq_ignore_ascii_case(model)
                 || service.model_ref.eq_ignore_ascii_case(model)
+                || service
+                    .served_model_id
+                    .as_deref()
+                    .is_some_and(|served| served.eq_ignore_ascii_case(model))
         });
         return services
             .into_iter()
@@ -2250,6 +2254,33 @@ mod tests {
         assert_eq!(audit.category, "provider");
         assert_eq!(audit.actor, "provider:local");
         assert_eq!(audit.action, "chat");
+        Ok(())
+    }
+
+    #[test]
+    fn local_provider_selects_a_service_by_its_served_model_id() -> Result<()> {
+        let (root, paths) = temp_app_paths("local-provider-served-id");
+        paths.ensure()?;
+        let mut aim = ManagedServiceRecord::new(
+            &paths,
+            "svc-aim",
+            "aim",
+            "aim-qwen3.5-9b",
+            "docker.io/org/aim-image:1",
+            "127.0.0.1",
+            8000,
+            "managed",
+            123,
+            None,
+            None,
+            None,
+        );
+        aim.status = "ready".to_owned();
+        aim.served_model_id = Some("Org/Served".to_owned());
+        aim.write()?;
+        let selected = select_local_chat_service(&paths, Some("org/served"))?;
+        fs::remove_dir_all(root).ok();
+        assert_eq!(selected.service_id, "svc-aim");
         Ok(())
     }
 

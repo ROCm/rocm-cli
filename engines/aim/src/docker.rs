@@ -210,8 +210,15 @@ pub(crate) fn stop(name: &str, force: bool, grace: Duration) -> Result<bool> {
     Ok(true)
 }
 
+/// Docker words a missing object as `No such container` or, in newer
+/// releases, `error: no such object`; match both regardless of case.
+fn is_no_such(detail: &str) -> bool {
+    detail.to_ascii_lowercase().contains("no such")
+}
+
 fn is_nothing_to_stop(detail: &str) -> bool {
-    detail.contains("No such container") || detail.contains("is not running")
+    let detail = detail.to_ascii_lowercase();
+    detail.contains("no such container") || detail.contains("is not running")
 }
 
 /// Force-removes the container (stopping it first if needed) so its name and
@@ -224,7 +231,7 @@ pub(crate) fn remove(name: &str) -> Result<()> {
         .with_context(|| format!("failed to run `docker rm` for container `{name}`"))?;
     if !output.status.success() {
         let detail = rocm_core::command_failure_detail(&output);
-        if detail.contains("No such container") {
+        if is_no_such(&detail) {
             return Ok(());
         }
         bail!("failed to remove container `{name}`: {detail}");
@@ -254,7 +261,7 @@ pub(crate) fn container_state(name: &str) -> Result<ContainerState> {
         .with_context(|| format!("failed to run `docker inspect` for container `{name}`"))?;
     if !output.status.success() {
         let detail = rocm_core::command_failure_detail(&output);
-        if detail.contains("No such") {
+        if is_no_such(&detail) {
             return Ok(ContainerState::Missing);
         }
         bail!("`docker inspect {name}` failed: {detail}");
@@ -359,8 +366,8 @@ pub(crate) fn daemon_reachable() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ContainerState, RunSpec, gpu_device_args, is_nothing_to_stop, parse_container_state,
-        parse_getent_gid, run_args, split_env,
+        ContainerState, RunSpec, gpu_device_args, is_no_such, is_nothing_to_stop,
+        parse_container_state, parse_getent_gid, run_args, split_env,
     };
     use std::collections::BTreeMap;
     use std::path::Path;
@@ -497,6 +504,17 @@ mod tests {
     }
 
     #[test]
+    fn is_no_such_matches_every_docker_wording() {
+        assert!(is_no_such("Error: No such object: x"));
+        assert!(is_no_such("error: no such object: x"));
+        assert!(is_no_such(
+            "Error response from daemon: No such container: x"
+        ));
+        assert!(!is_no_such("Cannot connect to the Docker daemon"));
+        assert!(is_nothing_to_stop("error: no such container: x"));
+    }
+
+    #[test]
     fn is_nothing_to_stop_covers_missing_and_already_exited_containers() {
         assert!(is_nothing_to_stop("Error: No such container: x"));
         assert!(is_nothing_to_stop(
@@ -540,6 +558,7 @@ case "$1" in
     exit "${FAKE_DOCKER_RUN_EXIT:-0}"
     ;;
   kill|stop)
+    find "$FAKE_DOCKER_DIR/data" -name '*.json' -exec cat {} + > "$FAKE_DOCKER_DIR/state_at_stop" 2>/dev/null
     if [ -n "$FAKE_DOCKER_STOP_NO_SUCH_CONTAINER" ]; then
       echo "Error response from daemon: No such container: fake" >&2
       exit 1
@@ -565,14 +584,14 @@ case "$1" in
       entry=$(echo "$FAKE_DOCKER_INSPECT_SEQUENCE" | tr ',' '\n' | sed -n "${n}p")
       [ -z "$entry" ] && entry=$(echo "$FAKE_DOCKER_INSPECT_SEQUENCE" | tr ',' '\n' | tail -n 1)
       if [ "$entry" = "missing" ]; then
-        echo "Error: No such object: fake" >&2
+        echo "error: no such object: fake" >&2
         exit 1
       fi
       echo "$entry"
       exit 0
     fi
     if [ -n "$FAKE_DOCKER_INSPECT_MISSING" ]; then
-      echo "Error: No such object: fake" >&2
+      echo "error: no such object: fake" >&2
       exit 1
     fi
     if [ -n "$FAKE_DOCKER_INSPECT_ERROR" ]; then
@@ -620,6 +639,11 @@ exit 0
                 .lines()
                 .map(ToOwned::to_owned)
                 .collect()
+        }
+
+        /// The engine state files as they were when `docker kill`/`stop` ran.
+        pub(crate) fn state_at_stop(&self) -> Option<String> {
+            std::fs::read_to_string(self.dir.join("state_at_stop")).ok()
         }
 
         pub(crate) fn env_copy(&self) -> Option<String> {

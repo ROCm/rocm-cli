@@ -311,12 +311,6 @@ fn run_container(
         gpus.available,
         image_wants_cpu,
     )?;
-    if !use_gpu && matches!(device_policy, DevicePolicy::GpuPreferred) {
-        eprintln!(
-            "Warning: AIM service `{service_id}` will run on CPU (device_policy=gpu_preferred \
-             and no usable GPU for `{image_ref}`); pass `--device gpu` to require a GPU."
-        );
-    }
     let render_gid = if use_gpu {
         crate::docker::render_group_gid()
     } else {
@@ -361,7 +355,10 @@ fn resolve_use_gpu(
 ) -> Result<bool> {
     Ok(match device_policy {
         DevicePolicy::CpuOnly => false,
-        DevicePolicy::GpuRequired => {
+        // `GpuPreferred` is normalised to `GpuRequired`, as the sibling engines
+        // do: no silent CPU fallback (AGENTS.md section 6). CPU is reachable
+        // only through an explicit `CpuOnly`.
+        DevicePolicy::GpuRequired | DevicePolicy::GpuPreferred => {
             if !gpu_usable || image_wants_cpu {
                 bail!(
                     "AIM service `{service_id}` has device_policy=gpu_required but no GPU is \
@@ -371,7 +368,6 @@ fn resolve_use_gpu(
             }
             true
         }
-        DevicePolicy::GpuPreferred => gpu_usable && !image_wants_cpu,
     })
 }
 
@@ -385,7 +381,13 @@ pub(crate) fn serve_http(request: ServeHttpRequest) -> Result<()> {
         &request.device_policy,
         &request.gpu_indices,
         request.engine_recipe.as_ref().map(|hint| &hint.extra_env),
-    )?;
+    )
+    .inspect_err(|_| {
+        // `docker run -d` can create the container and then fail to start it
+        // (port already allocated); service ids are unique, so nothing would
+        // ever reclaim it.
+        let _ = crate::docker::remove(&name);
+    })?;
 
     crate::state::write_running_state(
         &request.state_path,
@@ -695,11 +697,11 @@ mod tests {
     }
 
     #[test]
-    fn resolve_use_gpu_gpu_preferred_falls_back_to_cpu_without_failing() {
+    fn resolve_use_gpu_gpu_preferred_never_falls_back_to_cpu() {
         assert!(
-            !resolve_use_gpu("svc", "model", &DevicePolicy::GpuPreferred, false, false).unwrap()
+            resolve_use_gpu("svc", "model", &DevicePolicy::GpuPreferred, false, false).is_err()
         );
-        assert!(!resolve_use_gpu("svc", "model", &DevicePolicy::GpuPreferred, true, true).unwrap());
+        assert!(resolve_use_gpu("svc", "model", &DevicePolicy::GpuPreferred, true, true).is_err());
         assert!(resolve_use_gpu("svc", "model", &DevicePolicy::GpuPreferred, true, false).unwrap());
     }
 
@@ -1299,6 +1301,65 @@ mod subprocess_tests {
     }
 
     #[test]
+    fn run_container_forwards_the_endpoint_api_key_as_vllm_api_key() {
+        if in_subprocess() {
+            run_container(
+                "svc-key",
+                IMAGE,
+                "127.0.0.1",
+                18088,
+                &DevicePolicy::CpuOnly,
+                &[],
+                None,
+            )
+            .unwrap();
+            return;
+        }
+        let key_file = std::env::temp_dir().join(format!("aim-key-{}", std::process::id()));
+        std::fs::write(&key_file, "s3cret\n").unwrap();
+        let fixture = run_with_fake_docker(
+            "process::subprocess_tests::run_container_forwards_the_endpoint_api_key_as_vllm_api_key",
+            &[
+                ("FAKE_DOCKER_INSPECT_SEQUENCE", "missing"),
+                ("FAKE_DOCKER_IMAGE_PRESENT_EXIT", "0"),
+                (
+                    rocm_engine_protocol::ENDPOINT_API_KEY_FILE_ENV,
+                    key_file.to_str().unwrap(),
+                ),
+            ],
+        );
+        std::fs::remove_file(&key_file).ok();
+        assert!(!fixture.argv().join("\n").contains("s3cret"));
+        assert_eq!(fixture.env_copy().as_deref(), Some("VLLM_API_KEY=s3cret\n"));
+    }
+
+    #[test]
+    fn serve_http_removes_the_container_when_docker_run_fails() {
+        if in_subprocess() {
+            let state_path = data_dir().join("svc.json");
+            serve_http(serve_request("svc-run-leak", 18089, state_path))
+                .expect_err("docker run failure should surface");
+            return;
+        }
+        let fixture = run_with_fake_docker(
+            "process::subprocess_tests::serve_http_removes_the_container_when_docker_run_fails",
+            &[
+                ("FAKE_DOCKER_INSPECT_SEQUENCE", "missing"),
+                ("FAKE_DOCKER_IMAGE_PRESENT_EXIT", "0"),
+                ("FAKE_DOCKER_RUN_EXIT", "1"),
+                ("FAKE_DOCKER_RUN_STDERR", "port is already allocated"),
+            ],
+        );
+        assert!(
+            fixture
+                .argv()
+                .contains(&"rm -f rocm-aim-svc-run-leak".to_owned()),
+            "{:?}",
+            fixture.argv()
+        );
+    }
+
+    #[test]
     fn wait_for_container_ready_bails_when_container_exits_early() {
         if in_subprocess() {
             let error = wait_for_container_ready(
@@ -1394,6 +1455,10 @@ mod subprocess_tests {
                 "rm -f rocm-aim-svc-stop-succeeds"
             ]
         );
+        // The deliberate-stop intent must be on disk before the kill, or the
+        // supervisor reads the container's exit 137 as a crash.
+        let at_stop = fixture.state_at_stop().unwrap_or_default();
+        assert!(at_stop.contains("stopping"), "{at_stop}");
     }
 
     #[test]

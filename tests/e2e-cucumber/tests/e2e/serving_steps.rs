@@ -688,6 +688,17 @@ async fn stop_aim_service(world: &mut E2eWorld) {
         status.contains(": stopped"),
         "expected the AIM service to stop cleanly, got: {status}"
     );
+    // A stop that leaves the container running would let the next serve reuse
+    // it and still pass inference, so check the container is actually gone.
+    let remaining = std::process::Command::new("docker")
+        .args(["ps", "-q", "--filter", "name=rocm-aim-"])
+        .output()
+        .expect("docker ps should run on an AIM host");
+    let remaining = String::from_utf8_lossy(&remaining.stdout);
+    assert!(
+        remaining.trim().is_empty(),
+        "an AIM container is still running after the stop: {remaining}"
+    );
 }
 
 /// Serves the same AIM canary again, proving the engine can be launched a

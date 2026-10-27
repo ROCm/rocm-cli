@@ -112,6 +112,18 @@ pub struct ManagedServiceRecord {
     pub created_at_unix_ms: u128,
 }
 
+/// Whether the engine `Stop` verdict decides that a stop is confirmed.
+///
+/// True for engines whose service is a container rather than a recorded
+/// process: the engine `Stop` is the only thing that stops one, so its verdict,
+/// not the PID signalling, decides. For a PID-supervised
+/// engine the PIDs are authoritative and the engine `Stop` is reported only.
+/// Shared by `rocm` and `rocmd` so the two stop paths cannot disagree.
+#[must_use]
+pub fn engine_stop_decides_confirmation(engine: &str) -> bool {
+    engine == "aim"
+}
+
 impl ManagedServiceRecord {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
