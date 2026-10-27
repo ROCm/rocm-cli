@@ -1049,7 +1049,7 @@ fn check_6_path_missing(e: &Examination, symptom: &str) -> Diagnosis {
         // entry into the user's own PATH. The escape is the same one the real
         // write uses, so an apostrophe in `bin_dir` cannot end the PowerShell
         // string literal early in the printed copy either.
-        let escaped_bin_dir = crate::fix::ps_single_quote_escape(&bin_dir);
+        let escaped_bin_dir = crate::quoting::ps_single_quote_escape(&bin_dir);
         Fix {
             summary: format!("Add {bin_dir} to your User PATH and reopen the shell."),
             commands: vec![

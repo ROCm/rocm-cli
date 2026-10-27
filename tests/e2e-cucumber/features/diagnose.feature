@@ -563,7 +563,7 @@ Feature: Diagnosing failures and listing fixes
     Then no vLLM startup OOM is reported
 
   # Round 2 of ROCMAI-449 (`fix-6-path`): the escaped-write fix
-  # (`ps_single_quote_escape` in crates/rocm-core/src/fix.rs) is unit-tested
+  # (`ps_single_quote_escape` in crates/rocm-core/src/quoting.rs) is unit-tested
   # against the exact script string that gets built, but only a real Windows
   # host with a real `powershell.exe` can prove the escaped script still
   # parses and the value it carries survives the round trip. This also covers

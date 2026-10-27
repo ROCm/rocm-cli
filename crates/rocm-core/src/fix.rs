@@ -15,6 +15,7 @@
 //! place.
 
 use crate::examine::{run, which};
+use crate::quoting::ps_single_quote_escape;
 #[cfg(test)]
 use crate::rocm_install::{
     RocmLayout, discover_rocm_installs_in_layout, discover_rocm_installs_on_host_in,
@@ -1959,31 +1960,6 @@ fn windows_path_prepend(bin_dir: &str, user_path: &str) -> String {
     }
 }
 
-/// Escapes a value for embedding inside a PowerShell single-quoted string
-/// literal. PowerShell single-quoted strings are literal, and the
-/// language's own convention for including a literal `'` in one is to
-/// double it (`''`) -- an unescaped `'` instead ends the literal early, so
-/// whatever follows on the line is parsed as separate PowerShell tokens.
-///
-/// This matters here because the value embedded into
-/// `path_export_windows`'s write script (`new_path`, built by
-/// [`windows_path_prepend`] from `bin_dir` and the real existing User PATH
-/// read back from the host) is filesystem/environment-origin data, not a
-/// literal this code controls. A path containing an apostrophe --
-/// `C:\Users\O'Brien\bin` on the real PATH, or an install root with one in
-/// `bin_dir` -- is an ordinary Windows path, not a contrived edge case, and
-/// without this escape it would split the generated `-Command` script
-/// mid-statement.
-///
-/// `pub(crate)` because the same escape has to apply to the copy of this
-/// command `crate::diagnose` *prints* for the user to paste: the two are one
-/// plan on two surfaces, and a path the write survives but the printed
-/// version breaks on would be the same ROCMAI-449 bug moved from the write to
-/// the documentation.
-pub(crate) fn ps_single_quote_escape(value: &str) -> String {
-    value.replace('\'', "''")
-}
-
 /// Does the read/plan/write work for [`run_path_export_windows`], with the
 /// User-scope PATH read taken as an injected closure rather than calling
 /// `ps_env_scope` directly. That's what makes the "read failed" branch
@@ -3434,19 +3410,6 @@ mod tests {
             new_path.starts_with(bin_dir),
             "a prepend must start with bin_dir, not end with it: got {new_path:?}"
         );
-    }
-
-    /// `ps_single_quote_escape` must double every embedded `'`, per
-    /// PowerShell's own single-quoted-string escaping convention.
-    #[test]
-    fn ps_single_quote_escape_doubles_every_embedded_quote() {
-        assert_eq!(ps_single_quote_escape("plain"), "plain");
-        assert_eq!(ps_single_quote_escape("O'Brien"), "O''Brien");
-        assert_eq!(
-            ps_single_quote_escape("'leading and trailing'"),
-            "''leading and trailing''"
-        );
-        assert_eq!(ps_single_quote_escape("a'b'c"), "a''b''c");
     }
 
     /// Round 2 of ROCMAI-449: an apostrophe anywhere in the real User PATH
