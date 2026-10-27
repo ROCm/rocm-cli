@@ -21,11 +21,31 @@ use std::path::PathBuf;
 use std::process::{Command as ProcessCommand, Stdio};
 
 use anyhow::{Context, Result, bail};
+use rocm_core::placeholder::empty_as_unknown;
 use rocm_core::{AppPaths, ExamineSummary, shell_command_for_host};
 use serde::{Deserialize, Serialize};
 
 use crate::cli_report;
-use crate::runtime_install_finalize::{empty_as_unknown, real_os_release};
+use crate::runtime_install_finalize::real_os_release;
+
+/// Whether `rocm install driver` only reports on this OS. True on native
+/// Windows, where the plan is `windows_validate_only` and runs nothing; the
+/// chat and freeform planners derive their wording and flags from this too.
+pub(crate) fn install_driver_only_reports_on(os: &str) -> bool {
+    os == "windows"
+}
+
+/// [`install_driver_only_reports_on`] for the OS this binary runs on.
+pub(crate) fn host_install_driver_only_reports() -> bool {
+    install_driver_only_reports_on(std::env::consts::OS)
+}
+
+/// Whether `rocm install driver` goes on to run the plan's commands. Pure so
+/// the gate that keeps native Windows from installing anything (its plan is
+/// neither `supported` nor `mutating`) is testable on any host.
+const fn should_execute(plan: &DriverInstallPlan, yes: bool, dry_run: bool) -> bool {
+    yes && !dry_run && plan.supported && plan.mutating
+}
 
 pub(crate) fn install_driver(
     paths: &AppPaths,
@@ -41,7 +61,7 @@ pub(crate) fn install_driver(
     let plan =
         build_driver_install_plan_read(&examine, &os_release, dkms, PrivilegeEscalation::detect());
     let mut output = render_driver_install_plan(&plan, yes, dry_run);
-    if !yes || dry_run || !plan.supported || !plan.mutating {
+    if !should_execute(&plan, yes, dry_run) {
         return Ok(DriverInstallResult {
             output,
             executed: false,
@@ -843,7 +863,7 @@ fn build_driver_install_plan_at(
     let repo_version = resolve_shell_default_template("${ROCM_CLI_AMDGPU_VERSION:-7.2.4}");
     let package_release =
         resolve_shell_default_template("${ROCM_CLI_AMDGPU_PACKAGE_RELEASE:-70204}");
-    if examine.os == "windows" {
+    if install_driver_only_reports_on(&examine.os) {
         return DriverInstallPlan {
             supported: false,
             mutating: false,
@@ -852,11 +872,16 @@ fn build_driver_install_plan_at(
             version_id: String::new(),
             codename: String::new(),
             repo_version,
-            reason: "Windows driver install is validate-only in rocm-cli; use `rocm examine` to inspect the AMD display driver.".to_owned(),
+            // Uses the same inventory and adapter choice as `rocm examine`
+            // and `rocm diagnose`. Separate probes can still fail independently.
+            reason: rocm_core::windows_driver::install_driver_summary(
+                examine.driver.windows.as_ref(),
+            ),
             preflight_checks: Vec::new(),
             commands: Vec::new(),
-            checks: vec!["rocm examine".to_owned()],
-            reboot_required: true,
+            checks: vec!["rocm examine".to_owned(), "rocm diagnose".to_owned()],
+            // The plan installs nothing, so nothing asks for a reboot.
+            reboot_required: false,
         };
     }
     if examine.wsl.as_ref().is_some_and(|wsl| wsl.is_wsl) {
@@ -1691,7 +1716,7 @@ fn run_shell_command_with_stdin(command: &str, stdin: Stdio) -> Result<()> {
     Ok(())
 }
 
-fn driver_install_state_path(paths: &AppPaths) -> PathBuf {
+pub(crate) fn driver_install_state_path(paths: &AppPaths) -> PathBuf {
     paths.data_dir.join("driver").join("state.json")
 }
 
@@ -1754,6 +1779,7 @@ mod tests {
                 policy: "linux_official_amd_dkms_wrapper".to_owned(),
                 status: "amdgpu_missing".to_owned(),
                 detail: Some("/dev/kfd missing".to_owned()),
+                windows: None,
             },
             legacy_rocm: rocm_core::LegacyRocmSummary {
                 status: "not_detected".to_owned(),
@@ -2535,11 +2561,13 @@ VERSION_CODENAME=noble
             policy: "linux_official_amd_dkms_wrapper".to_owned(),
             status: "not_detected".to_owned(),
             detail: None,
+            windows: None,
         };
         let current_driver = rocm_core::DriverSummary {
             policy: "linux_official_amd_dkms_wrapper".to_owned(),
             status: "amdgpu_available".to_owned(),
             detail: Some("/dev/kfd is present".to_owned()),
+            windows: None,
         };
         let mut state = DriverInstallState {
             approved_at_unix_ms: 1,
@@ -2611,6 +2639,7 @@ VERSION_CODENAME=noble
                 policy: "driver-policy".to_owned(),
                 status: "available".to_owned(),
                 detail: None,
+                windows: None,
             };
             let mut state = DriverInstallState {
                 approved_at_unix_ms: 1,
@@ -2992,6 +3021,90 @@ VERSION_ID="41"
         assert!(!rendered.contains("sudo dnf install -y amdgpu-dkms"));
     }
 
+    /// AGENTS.md section 3: the planners' wording is asserted together with what
+    /// the command does on that platform. On Windows the command is
+    /// `windows_validate_only` (no execution), so the plan must be read-only,
+    /// carry no `--yes` and not call itself disruptive; elsewhere the command
+    /// mutates, so the plan keeps approval, `--yes` and the warning.
+    #[test]
+    fn planners_describe_install_driver_as_the_command_behaves_on_each_platform() {
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
+        for os in ["windows", "linux"] {
+            let only_reports = install_driver_only_reports_on(os);
+            let plan = build_driver_install_plan_at(
+                &test_examine(os, false),
+                "/etc/os-release",
+                "",
+                true,
+                PrivilegeEscalation::Sudo,
+            );
+            // The planners and the command agree on the platform decision.
+            assert_eq!(only_reports, plan.policy == "windows_validate_only", "{os}");
+            if only_reports {
+                assert!(!plan.mutating, "{os}");
+            }
+
+            let freeform = crate::freeform_planner::plan_driver_request(
+                "install the driver",
+                "install the driver",
+                only_reports,
+            );
+            let action = freeform.actions.last().expect("a driver action");
+            let chat = crate::chat::chat_install_driver_action(
+                vec!["install".to_owned(), "driver".to_owned()],
+                only_reports,
+            );
+            if only_reports {
+                assert!(!action.args.iter().any(|a| a == "--yes"), "{action:?}");
+                assert!(!action.reason.contains("disruptive"), "{action:?}");
+                assert!(!freeform.approval.starts_with("required"));
+                match chat {
+                    crate::chat::ChatRocmCommandAction::ReadOnly(args) => {
+                        assert!(!args.iter().any(|a| a == "--yes"));
+                    }
+                    crate::chat::ChatRocmCommandAction::Approval { .. } => {
+                        panic!("chat must not ask approval for a report-only command")
+                    }
+                }
+            } else {
+                assert!(action.args.iter().any(|a| a == "--yes"));
+                assert!(action.reason.contains("disruptive"));
+                assert_eq!(freeform.approval, "required before driver changes");
+                match chat {
+                    crate::chat::ChatRocmCommandAction::Approval { args, .. } => {
+                        assert!(args.iter().any(|a| a == "--yes"));
+                    }
+                    crate::chat::ChatRocmCommandAction::ReadOnly(_) => {
+                        panic!("chat must ask approval on a mutating platform")
+                    }
+                }
+            }
+        }
+    }
+
+    /// The chat entry point passes this host's decision to the helper, so a
+    /// hard-coded value fails on one of the two platforms the suite runs on.
+    #[test]
+    fn the_chat_entry_point_follows_the_hosts_install_driver_decision() {
+        let action = crate::chat::chat_rocm_command_action_from_args(vec![
+            "install".to_owned(),
+            "driver".to_owned(),
+        ])
+        .expect("chat action");
+        let reports = std::env::consts::OS == "windows";
+        assert_eq!(host_install_driver_only_reports(), reports);
+        match action {
+            crate::chat::ChatRocmCommandAction::ReadOnly(args) => {
+                assert!(reports, "read-only only where the command only reports");
+                assert!(!args.iter().any(|a| a == "--yes"));
+            }
+            crate::chat::ChatRocmCommandAction::Approval { args, .. } => {
+                assert!(!reports, "approval only where the command installs");
+                assert!(args.iter().any(|a| a == "--yes"));
+            }
+        }
+    }
+
     #[test]
     fn windows_install_driver_is_validate_only() {
         let _env = ScopedTestEnv::with_amd_overrides_cleared();
@@ -3008,10 +3121,202 @@ VERSION_ID="41"
         assert_eq!(plan.policy, "windows_validate_only");
         assert!(rendered.contains("approval: not required"));
         assert!(rendered.contains("execution_commands: <none>"));
-        assert!(rendered.contains("post_reboot_checks:"));
-        assert!(rendered.contains("use `rocm examine`"));
-        assert!(rendered.contains("rocm examine"));
+        // The plan installs nothing, so it asks for no reboot and labels its
+        // checks accordingly.
+        assert!(!plan.reboot_required);
+        assert!(rendered.contains("post_install_checks:"));
+        assert!(!rendered.contains("post_reboot"));
+        // No driver facts in this fixture: the text says so and points at the
+        // commands that exist. Both commands take no flags.
+        assert!(rendered.contains("could not be read; run `rocm examine`"));
+        assert!(rendered.contains("rocm diagnose"));
         assert!(plan.commands.is_empty());
+    }
+
+    /// The gate behind "installs nothing on Windows": approval does not make a
+    /// Windows plan execute, while the same flags do execute a supported,
+    /// mutating plan, so the assertion cannot pass by always returning false.
+    #[test]
+    fn should_execute_never_runs_a_windows_plan() {
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
+        let windows = build_driver_install_plan_read(
+            &test_examine("windows", false),
+            &os_release_found(""),
+            true,
+            PrivilegeEscalation::Sudo,
+        );
+        assert!(!should_execute(&windows, true, false));
+        assert!(!should_execute(&windows, false, false));
+
+        let mut mutating = windows;
+        mutating.supported = true;
+        mutating.mutating = true;
+        assert!(should_execute(&mutating, true, false));
+        assert!(!should_execute(&mutating, false, false));
+        assert!(!should_execute(&mutating, true, true));
+    }
+
+    fn windows_examine_with_driver(version: &str, date: &str) -> ExamineSummary {
+        let mut examine = test_examine("windows", false);
+        examine.driver = rocm_core::DriverSummary {
+            policy: "windows_validate_only".to_owned(),
+            status: "amd_display_driver_detected".to_owned(),
+            detail: Some(format!("AMD Radeon(TM) Graphics driver {version}")),
+            windows: rocm_core::windows_driver::WindowsDriverInfo::from_probe(version, date),
+        };
+        examine
+    }
+
+    /// The text and the behaviour, asserted together: the plan reports the
+    /// driver version, date, verdict and fix id, and the same plan runs
+    /// nothing, even when approval is given.
+    #[test]
+    fn windows_install_driver_reports_an_old_driver_and_installs_nothing() {
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
+        let examine = windows_examine_with_driver("30.0.13014.8", "2021-08-04");
+        let plan = build_driver_install_plan_at(
+            &examine,
+            "/etc/os-release",
+            "",
+            true,
+            PrivilegeEscalation::Sudo,
+        );
+
+        // Behaviour: nothing to execute, however the command is invoked.
+        assert!(!plan.supported);
+        assert!(!plan.mutating);
+        assert!(plan.commands.is_empty());
+        assert!(plan.execution_commands().is_empty());
+        for (yes, dry_run) in [(false, false), (true, false), (true, true)] {
+            let rendered = render_driver_install_plan(&plan, yes, dry_run);
+            assert!(
+                rendered.contains("execution_commands: <none>"),
+                "{rendered}"
+            );
+            assert!(
+                rendered.contains("action: no driver commands will be executed"),
+                "{rendered}"
+            );
+            assert!(!rendered.contains("rerun with --yes"), "{rendered}");
+
+            // Text: what it reports.
+            assert!(rendered.contains("version 30.0.13014.8"), "{rendered}");
+            assert!(rendered.contains("dated 2021-08-04"), "{rendered}");
+            assert!(rendered.contains("outdated: yes"), "{rendered}");
+            assert!(
+                rendered.contains(rocm_core::windows_driver::DISPLAY_DRIVER_OLD_FIX_ID),
+                "{rendered}"
+            );
+            // The promise that nothing is installed.
+            assert!(
+                rendered.contains("no driver is installed or changed"),
+                "{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_install_driver_does_not_call_a_current_driver_outdated() {
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
+        let examine = windows_examine_with_driver("32.0.23033.1002", "2026-05-02");
+        let plan = build_driver_install_plan_at(
+            &examine,
+            "/etc/os-release",
+            "",
+            true,
+            PrivilegeEscalation::Sudo,
+        );
+        let rendered = render_driver_install_plan(&plan, true, false);
+        assert!(rendered.contains("version 32.0.23033.1002"), "{rendered}");
+        assert!(rendered.contains("outdated: no"), "{rendered}");
+        // The `no` is only about the date, so the plan says what the date
+        // cannot judge; the state behind it is a report-only plan.
+        assert!(
+            rendered.contains(rocm_core::windows_driver::FLOOR_NOTE),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains(rocm_core::windows_driver::DISPLAY_DRIVER_OLD_FIX_ID),
+            "{rendered}"
+        );
+        assert!(plan.commands.is_empty() && !plan.mutating);
+    }
+
+    #[test]
+    fn windows_install_driver_says_unknown_when_the_date_is_unreadable() {
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
+        let examine = windows_examine_with_driver("30.0.13014.8", "");
+        let plan = build_driver_install_plan_at(
+            &examine,
+            "/etc/os-release",
+            "",
+            true,
+            PrivilegeEscalation::Sudo,
+        );
+        let rendered = render_driver_install_plan(&plan, false, false);
+        assert!(rendered.contains("outdated: unknown"), "{rendered}");
+        assert!(
+            !rendered.contains(rocm_core::windows_driver::DISPLAY_DRIVER_OLD_FIX_ID),
+            "{rendered}"
+        );
+    }
+
+    /// One probe result, read by both commands. The install text and the
+    /// diagnose result are built from the same `WindowsDriverInfo`, the value
+    /// `rocm examine` reads from the inventory, so a text that names the fix id
+    /// is checked against the command it names. Reverting the `reason` wiring in
+    /// `build_driver_install_plan` makes the install half fail.
+    fn install_text_and_diagnose_ids(
+        info: Option<&rocm_core::windows_driver::WindowsDriverInfo>,
+    ) -> (String, Vec<String>) {
+        let mut examine = test_examine("windows", false);
+        examine.driver.windows = info.cloned();
+        let plan = build_driver_install_plan_at(
+            &examine,
+            "/etc/os-release",
+            "",
+            true,
+            PrivilegeEscalation::Sudo,
+        );
+        let text = render_driver_install_plan(&plan, false, false);
+
+        let mut exam = rocm_core::Examination {
+            os_family: "windows".to_owned(),
+            ..rocm_core::Examination::default()
+        };
+        exam.set_windows_driver(info);
+        let ids = rocm_core::run_diagnose(&exam, "")
+            .matched
+            .into_iter()
+            .map(|d| d.id)
+            .collect();
+        (text, ids)
+    }
+
+    #[test]
+    fn the_fix_id_the_install_text_names_is_the_one_diagnose_raises() {
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
+        let id = rocm_core::windows_driver::DISPLAY_DRIVER_OLD_FIX_ID;
+        let probe =
+            |version, date| rocm_core::windows_driver::WindowsDriverInfo::from_probe(version, date);
+
+        // Old driver: the text names the id, and the command it names raises it.
+        let (text, ids) =
+            install_text_and_diagnose_ids(probe("30.0.13014.8", "2021-08-04").as_ref());
+        assert!(text.contains(id), "{text}");
+        assert!(ids.iter().any(|raised| raised == id), "{ids:?}");
+
+        // Current driver and unreadable date: the text does not name it, and
+        // diagnose does not raise it.
+        for info in [
+            probe("32.0.23033.1002", "2026-05-02"),
+            probe("30.0.13014.8", ""),
+            None,
+        ] {
+            let (text, ids) = install_text_and_diagnose_ids(info.as_ref());
+            assert!(!text.contains(id), "{text}");
+            assert!(ids.iter().all(|raised| raised != id), "{ids:?}");
+        }
     }
 
     #[test]

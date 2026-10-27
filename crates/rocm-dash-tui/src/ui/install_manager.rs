@@ -133,7 +133,7 @@ impl InstallManagerState {
     }
 
     /// Build the `rocm install sdk …` argv, or an error message.
-    fn build_args(&self) -> Result<Vec<String>, String> {
+    pub(crate) fn build_args(&self) -> Result<Vec<String>, String> {
         let channel = self.channel.trim();
         if channel.is_empty() {
             return Err("channel is required (e.g. release)".to_string());
@@ -458,11 +458,8 @@ fn field_line<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-
-    fn key(c: KeyCode) -> KeyEvent {
-        KeyEvent::new(c, KeyModifiers::NONE)
-    }
+    use crate::app::test_support::press as key;
+    use crossterm::event::KeyCode;
 
     #[test]
     fn default_is_dry_run_release_wheel() {

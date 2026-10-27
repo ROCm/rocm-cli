@@ -5,12 +5,20 @@ Feature: Interactive dashboard
   # only for now: portable-pty compiles on Windows via ConPTY, but that path is
   # not yet promoted to a blocking contract (tracked as a follow-up).
 
+  # #534: the ROCm view's `Runs:` line is a command a user can copy into a
+  # shell, and it named `rocm doctor`, a subcommand that does not exist. The
+  # unit test beside the action list checks each label against what its screen
+  # runs; the diagnose steps here check the line the user actually sees. They
+  # extend this journey rather than open another dashboard session, which would
+  # add load to the no-GPU lane's timing-sensitive dash scenarios.
   @id:dash-opens-and-navigates @requires-os:linux
   Scenario: dash-01 - A user opens the dashboard and navigates to ROCm setup
     When the user opens the dashboard with demo data
     Then the dashboard home view is displayed
     When the user opens the ROCm view
     Then ROCm setup actions are displayed
+    When the user selects the ROCm diagnose action
+    Then the diagnose action says it runs rocm examine
     When the user quits the dashboard
     Then the dashboard exits successfully
 
@@ -569,4 +577,65 @@ Feature: Interactive dashboard
     And the user grows the terminal until the GPU section shows compact rows
     Then the GPU section reports VRAM in binary units
     When the user quits the dashboard
+    Then the dashboard exits successfully
+
+  # #693: dash-25 proves `spawn_in` threads a scenario-owned folder into the
+  # real browser, but its whitespace case lives in a CHILD entry under that
+  # folder (`ADOPT_SCENARIO_CHILD`), not in the `spawn_in` cwd itself — so it
+  # never drives #500's `quote_display_arg` fix through the real
+  # approval-preview render a user actually sees. Here the scenario's own
+  # root IS the whitespace path: `spawn_in`'s cwd has a space in its own
+  # name, onboarding's Adopt flow resolves its browser start from that exact
+  # cwd (`std::env::current_dir()` in `activate_choice`), and choosing
+  # "[ use this folder ]" stages an approval whose `--root` argument is that
+  # same whitespace path. #500 already has widget-level `TestBackend`
+  # snapshot coverage of the quoting in isolation
+  # (`approval_snapshot_quotes_args_containing_spaces` in
+  # `crates/rocm-dash-tui/tests/wave0_job_bridge.rs`); this is the missing
+  # black-box proof that the real wizard renders it quoted too.
+  @id:dash-onboarding-adopt-whitespace-cwd-quotes-approval-preview @requires-os:linux
+  Scenario: dash-36 - Adopting a folder whose own path contains a space quotes it in the approval preview
+    When the user opens the dashboard in a scenario folder whose own name has a space
+    And the user opens the Observe view
+    And the user opens onboarding setup
+    Then the onboarding welcome screen is displayed
+    When the user continues past the onboarding welcome screen
+    Then the onboarding setup choices are displayed
+    When the user chooses to adopt an existing folder
+    Then the existing-folder browser is displayed
+    When the user chooses the current folder
+    Then the approval preview quotes the whitespace-containing root path
+    When the user denies the adopt approval and closes onboarding setup
+    And the user quits the dashboard
+    Then the dashboard exits successfully
+
+  # The Diagnose screen offers the same Doctor report the CLI prepares, and the
+  # review comes first. Whether a report can be prepared is a property of the
+  # machine, not of the dashboard: hardware that is not on AMD's published list,
+  # an architecture that cannot be read, and a WSL host all get a refusal, and
+  # only an approved architecture gets a report. So this scenario does not pin
+  # which outcome this machine produces. It reads whether the CLI refused from
+  # the preview, then checks the card against that: a report is offered for
+  # sending exactly when the CLI printed one, and a refusal shows the CLI's own
+  # explanation. The card puts that outcome first. This scenario runs at the
+  # detail size that "the user opens the Observe view" selects (120x40); the
+  # cramped 80x24 case is covered by the unit test in
+  # `crates/rocm-dash-tui/src/ui/examine_manager.rs`.
+  #
+  # The scenario never presses `s` and never approves a send, so no mail client
+  # is ever opened from a test. The approve and decline paths, and the promise
+  # that no send starts before an approve, are asserted where the key sequence
+  # can be driven directly: the unit tests in
+  # `crates/rocm-dash-tui/src/ui/examine_manager.rs`.
+  @id:dash-doctor-report-is-reviewed-before-sending @requires-os:linux
+  Scenario: dash-37 - A user reviews a Doctor report in the dashboard before anything is sent
+    When the user opens the dashboard with demo data
+    And the user opens the Observe view
+    And the user opens the Diagnose screen
+    And the user prepares a Doctor report
+    Then the report is displayed for review
+    When the user leaves the report review
+    Then the dashboard offers to send a report only if the CLI prepared one
+    When the user closes the Diagnose screen
+    And the user quits the dashboard
     Then the dashboard exits successfully

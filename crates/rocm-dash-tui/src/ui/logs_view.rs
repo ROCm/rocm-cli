@@ -139,11 +139,8 @@ pub fn draw_logs_view(f: &mut Frame, area: Rect, l: &LogsViewState, _jobs: &Stat
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-
-    fn key(c: KeyCode) -> KeyEvent {
-        KeyEvent::new(c, KeyModifiers::NONE)
-    }
+    use crate::app::test_support::press as key;
+    use crossterm::event::KeyCode;
 
     #[test]
     fn logs_args_recent_when_no_query() {

@@ -141,3 +141,121 @@ async fn assert_driver_plan_refuses_unverified(world: &mut E2eWorld) {
         "a refusal must not offer install commands:\n{output}"
     );
 }
+
+// ── Windows: the driver install only reports ───────────────────────
+
+/// Refuse any other host before the step runs the CLI. Explicit cucumber
+/// filters bypass the platform tags, and on Linux or WSL `install driver --yes`
+/// approves a real package-manager plan. The OS name is `linux` on WSL.
+fn require_native_windows() {
+    super::host_guard::require_os_is_windows(std::env::consts::OS);
+}
+
+#[when("the user asks to install the driver on this Windows host")]
+async fn ask_windows_driver_install(world: &mut E2eWorld) {
+    // Explicit cucumber filters bypass platform tags. Reject a Linux/WSL host
+    // before invoking its real driver plan, not after it has run.
+    require_native_windows();
+    let (stdout, stderr, rc) = crate::run_rocm_with_env(world, &["install", "driver"], &[]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[when("the user approves the driver install on this Windows host")]
+async fn approve_windows_driver_install(world: &mut E2eWorld) {
+    // On Linux/WSL, --yes approves a real package-manager plan. The host check
+    // must precede every command, even when a name filter bypasses the tags.
+    require_native_windows();
+    let (stdout, stderr, rc) =
+        crate::run_rocm_with_env(world, &["install", "driver", "--yes"], &[]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the CLI says that no driver is installed or changed")]
+async fn assert_windows_driver_install_says_nothing_changes(world: &mut E2eWorld) {
+    assert_eq!(
+        world.cli_rc,
+        Some(0),
+        "driver install should report, not fail"
+    );
+    let output = world.cli_output.as_ref().expect("no driver plan output");
+    assert!(output.contains("policy: windows_validate_only"), "{output}");
+    assert!(
+        output.contains("no driver is installed or changed"),
+        "{output}"
+    );
+}
+
+#[then("no driver command is shown or run, and no installer state is written")]
+async fn assert_windows_driver_install_runs_nothing(world: &mut E2eWorld) {
+    // The promise made in words, asserted together with the state it describes.
+    let output = world.cli_output.as_ref().expect("no driver plan output");
+    assert!(output.contains("supported: false"), "{output}");
+    assert!(output.contains("mutating: false"), "{output}");
+    assert!(output.contains("execution_commands: <none>"), "{output}");
+    assert!(
+        output.contains("action: no driver commands will be executed"),
+        "{output}"
+    );
+    assert!(
+        !output.contains("driver install completed"),
+        "an installer run was reported:\n{output}"
+    );
+    let state_path = world
+        .isolated_root
+        .as_ref()
+        .expect("scenario has no isolated root")
+        .path()
+        .join("data")
+        .join("driver")
+        .join("state.json");
+    assert!(
+        !state_path.exists(),
+        "the driver install wrote execution state at {}",
+        state_path.display()
+    );
+}
+
+#[then("it describes the display driver the inspection reports")]
+async fn assert_windows_driver_install_matches_the_inspection(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no driver plan output");
+    let (examine_json, _, _) = crate::run_rocm(world, &["examine", "--json"]);
+    let json: serde_json::Value = serde_json::from_str(&examine_json).unwrap_or_else(|e| {
+        panic!("`examine --json` did not emit valid JSON ({e}):\n{examine_json}")
+    });
+    let Some(record) = super::examine_steps::windows_driver_record(&json) else {
+        // No AMD display driver was read: the plan says so and installs nothing.
+        assert!(output.contains("could not be read"), "{output}");
+        return;
+    };
+    let version = record
+        .get("version")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    assert!(!version.is_empty(), "{record:#}");
+    assert!(output.contains(&format!("version {version},")), "{output}");
+    let date = record
+        .get("date")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    assert!(output.contains(&format!("dated {date},")), "{output}");
+    let verdict = match record.get("age").and_then(serde_json::Value::as_str) {
+        Some("predates_first_hip_sdk") => "outdated: yes",
+        Some("not_older") => "outdated: no",
+        _ => "outdated: unknown",
+    };
+    assert!(
+        output.contains(verdict),
+        "expected {verdict:?} in:\n{output}"
+    );
+    // The fix id is named only for an old driver, and `rocm diagnose` is the
+    // command that raises it.
+    assert_eq!(
+        output.contains("fix-22-display-driver-old"),
+        verdict == "outdated: yes",
+        "{output}"
+    );
+}

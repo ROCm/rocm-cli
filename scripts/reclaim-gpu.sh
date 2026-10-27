@@ -452,13 +452,21 @@ assert_clear() {
 
 # Spawn a decoy whose argv[0] is a real-shaped path, so the match is tested
 # against the same string a live engine process would present.
+#
+# The executable is a copy of bash, not of sleep: where coreutils is a multicall
+# binary (uutils, the default since Ubuntu 25.10), /bin/sleep picks the tool to
+# run from argv[0], so a copy named llama-server prints "unknown program" and
+# exits before the self-test can see it. bash ignores the name it runs under.
+# The body is a loop, not `sleep 300`, because bash execs a lone simple command
+# in place and argv[0] would become `sleep`. Its `sleep 1` children name no E2E
+# root, so they are never selected, and a TERM still ends the decoy.
 spawn_decoy() {
   local path="$1"
   mkdir -p "$(dirname "${path}")"
-  cp /bin/sleep "${path}"
+  cp "$(command -v bash)" "${path}"
   # Detach stdio: this runs inside a command substitution, and a background
   # child holding the capture pipe open would block the caller until it exits.
-  "${path}" 300 >/dev/null 2>&1 &
+  "${path}" -c 'for _ in {1..300}; do sleep 1; done' >/dev/null 2>&1 &
   echo $!
 }
 
@@ -504,7 +512,7 @@ spawn_zombie() {
 }
 
 # Spawn a decoy that IGNORES SIGTERM, so the TERM -> grace -> KILL escalation is
-# exercised. A plain `cp /bin/sleep` decoy dies on the first TERM and leaves the
+# exercised. A plain spawn_decoy decoy dies on the first TERM and leaves the
 # escalation branch unreached, which is how it went untested.
 spawn_stubborn_decoy() {
   local path="$1"
@@ -524,9 +532,8 @@ DECOY
 # Spawn a decoy carrying the record delimiters INSIDE one argument — a newline
 # and a tab, as a `--chat-template` or `--prompt` value does.
 #
-# Not spawn_decoy with an extra argument: that decoy is `cp /bin/sleep`, and
-# sleep rejects a non-numeric argument and exits before it can be observed. This
-# needs something that ignores what it is handed and stays alive.
+# A helper of its own because spawn_decoy passes no arguments through. Like that
+# decoy, it ignores what it is handed and stays alive.
 #
 # Ordinary in every other respect — it must die on SIGTERM, so it is the stubborn
 # decoy's body without the trap. Its `sleep 1` children name no E2E root, so they

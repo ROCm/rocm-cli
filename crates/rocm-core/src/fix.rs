@@ -15,6 +15,7 @@
 //! place.
 
 use crate::examine::{run, which};
+use crate::quoting::ps_single_quote_escape;
 #[cfg(test)]
 use crate::rocm_install::{
     RocmLayout, discover_rocm_installs_in_layout, discover_rocm_installs_on_host_in,
@@ -668,7 +669,12 @@ const RECIPES: &[FixRecipe] = &[
             "A service that failed at startup is hidden from a plain `rocm services list`; pass --all to recover its id.",
         ],
         doc_url: None,
-        applies_on: PRINT_ON_LINUX,
+        // Matches `check_17_torch_dlpack_cuda_variant`'s `["linux", "wsl"]`
+        // registration. vLLM is supported on WSL2 and its engine runs the same
+        // ELF import there, so the diagnosis the engine hint points at has to
+        // be reachable there too. Pinned by
+        // `every_checker_platform_is_covered_by_its_recipe`.
+        applies_on: PRINT_ON_LINUX_AND_WSL,
         runner: None,
     },
     FixRecipe {
@@ -903,6 +909,30 @@ const RECIPES: &[FixRecipe] = &[
             "14.40 is the first runtime that matches the toolset where the standard library changed. A newer program can still ask for a newer runtime, so install the latest one.",
         ],
         doc_url: Some("https://aka.ms/vs/17/release/vc_redist.x64.exe"),
+        applies_on: PRINT_ON_WINDOWS,
+        runner: None,
+    },
+    FixRecipe {
+        fix_id: crate::windows_driver::DISPLAY_DRIVER_OLD_FIX_ID,
+        title: "Look for a newer AMD display driver (advice only)",
+        rationale: "The AMD display driver on this Windows machine is dated before the first HIP SDK for Windows (27 July 2023). AMD publishes no minimum driver version for the HIP SDK or for the Lemonade Vulkan backend, so the minimum is not established and this is advice, not a finding that anything is broken. rocm-cli never installs drivers on Windows.",
+        commands: &[
+            "# Find the current display driver for this GPU on AMD's support page:",
+            // A literal because a `static` slice cannot format a constant in. The
+            // URL must equal `windows_driver::AMD_SUPPORT_URL`; the display-driver
+            // test below pins it, and the diagnose copy builds the line from the constant.
+            "#   https://www.amd.com/en/support",
+            "# Restart the machine after the driver install.",
+        ],
+        needs_sudo: false,
+        needs_reboot: true,
+        needs_relogin: false,
+        verify: "powershell -NoProfile -Command \"Get-CimInstance Win32_VideoController | Where-Object { $_.Name -like '*AMD*' -or $_.Name -like '*Radeon*' } | Select-Object Name,DriverVersion,DriverDate\"",
+        notes: &[
+            crate::windows_driver::NO_MINIMUM_EXPLANATION,
+            crate::windows_driver::FLOOR_NOTE,
+        ],
+        doc_url: Some(crate::windows_driver::AMD_SUPPORT_URL),
         applies_on: PRINT_ON_WINDOWS,
         runner: None,
     },
@@ -1930,31 +1960,6 @@ fn windows_path_prepend(bin_dir: &str, user_path: &str) -> String {
     }
 }
 
-/// Escapes a value for embedding inside a PowerShell single-quoted string
-/// literal. PowerShell single-quoted strings are literal, and the
-/// language's own convention for including a literal `'` in one is to
-/// double it (`''`) -- an unescaped `'` instead ends the literal early, so
-/// whatever follows on the line is parsed as separate PowerShell tokens.
-///
-/// This matters here because the value embedded into
-/// `path_export_windows`'s write script (`new_path`, built by
-/// [`windows_path_prepend`] from `bin_dir` and the real existing User PATH
-/// read back from the host) is filesystem/environment-origin data, not a
-/// literal this code controls. A path containing an apostrophe --
-/// `C:\Users\O'Brien\bin` on the real PATH, or an install root with one in
-/// `bin_dir` -- is an ordinary Windows path, not a contrived edge case, and
-/// without this escape it would split the generated `-Command` script
-/// mid-statement.
-///
-/// `pub(crate)` because the same escape has to apply to the copy of this
-/// command `crate::diagnose` *prints* for the user to paste: the two are one
-/// plan on two surfaces, and a path the write survives but the printed
-/// version breaks on would be the same ROCMAI-449 bug moved from the write to
-/// the documentation.
-pub(crate) fn ps_single_quote_escape(value: &str) -> String {
-    value.replace('\'', "''")
-}
-
 /// Does the read/plan/write work for [`run_path_export_windows`], with the
 /// User-scope PATH read taken as an injected closure rather than calling
 /// `ps_env_scope` directly. That's what makes the "read failed" branch
@@ -2604,11 +2609,12 @@ mod tests {
         let count = ids.len();
         ids.dedup();
         assert_eq!(ids.len(), count, "duplicate fix-id in RECIPES");
-        // 21 bare-metal/Windows entries (fix-16-vllm-oom, fix-17-torch-dlpack,
+        // 22 bare-metal/Windows entries (fix-16-vllm-oom, fix-17-torch-dlpack,
         // fix-18-comgr-conflict, fix-19-shm-too-small,
-        // fix-21-msvc-redist-outdated and the informational
-        // info-20-gpu-no-rocm-support among them) plus the 7 WSL ones.
-        assert_eq!(count, 28, "expected 28 catalog entries");
+        // fix-21-msvc-redist-outdated, fix-22-display-driver-old and the
+        // informational info-20-gpu-no-rocm-support among them) plus the 7 WSL
+        // ones.
+        assert_eq!(count, 29, "expected 29 catalog entries");
     }
 
     /// `rocm fix fix-21-msvc-redist-outdated` prints the plan and runs nothing.
@@ -3114,9 +3120,39 @@ mod tests {
     }
 
     #[test]
+    fn the_old_display_driver_recipe_is_print_only_advice_on_windows() {
+        let recipe = RECIPES
+            .iter()
+            .find(|r| r.fix_id == crate::windows_driver::DISPLAY_DRIVER_OLD_FIX_ID)
+            .expect("the recipe is registered");
+        // rocm-cli never installs drivers on Windows: every printed line is a
+        // comment, and the only platform is Windows, print-only.
+        assert!(recipe.commands.iter().all(|c| c.starts_with('#')));
+        assert!(recipe.commands.iter().any(|c| c.contains("Restart")));
+        assert!(recipe.runner.is_none());
+        assert_eq!(recipe.applies_on.len(), 1);
+        assert_eq!(recipe.applies_on[0].os, "windows");
+        assert_eq!(recipe.applies_on[0].class, FixClass::PrintOnly);
+        assert!(recipe.rationale.contains("not established"));
+        // The rationale spells the cutoff out in prose; it must name the same
+        // day as the constant the comparison uses.
+        let cutoff = crate::windows_driver::FIRST_HIP_SDK_FOR_WINDOWS;
+        assert_eq!(
+            (cutoff.year, cutoff.month, cutoff.day),
+            (2023, 7, 27),
+            "the cutoff moved: update the \"27 July 2023\" prose in this recipe, README.md,              skills/rocm-doctor/reference.md, docs/testing.md and docs/manual-testing.md"
+        );
+        assert!(recipe.rationale.contains("27 July 2023"));
+        // The literal URL in the commands is the shared constant.
+        let url_line = format!("#   {}", crate::windows_driver::AMD_SUPPORT_URL);
+        assert!(recipe.commands.contains(&url_line.as_str()));
+        assert_eq!(recipe.doc_url, Some(crate::windows_driver::AMD_SUPPORT_URL));
+    }
+
+    #[test]
     fn needs_reboot_true_fix_ids_match_the_known_set() {
         // assert_needs_reboot_matches_the_catalog only ever runs for
-        // fix-5-amdgpu-load, so the other 23 fix-ids' hardcoded needs_reboot
+        // fix-5-amdgpu-load, so every other fix-id's hardcoded needs_reboot
         // literals in diagnose.rs have no guard against drifting from the
         // catalog. This doesn't reach into diagnose.rs, but it does catch an
         // accidental catalog edit and pins the expected set by name so a
@@ -3128,6 +3164,7 @@ mod tests {
             "fix-11-iommu",
             "fix-12-installer",
             "fix-14-adrenalin-too-old",
+            "fix-22-display-driver-old",
         ]
         .into_iter()
         .collect();
@@ -3373,19 +3410,6 @@ mod tests {
             new_path.starts_with(bin_dir),
             "a prepend must start with bin_dir, not end with it: got {new_path:?}"
         );
-    }
-
-    /// `ps_single_quote_escape` must double every embedded `'`, per
-    /// PowerShell's own single-quoted-string escaping convention.
-    #[test]
-    fn ps_single_quote_escape_doubles_every_embedded_quote() {
-        assert_eq!(ps_single_quote_escape("plain"), "plain");
-        assert_eq!(ps_single_quote_escape("O'Brien"), "O''Brien");
-        assert_eq!(
-            ps_single_quote_escape("'leading and trailing'"),
-            "''leading and trailing''"
-        );
-        assert_eq!(ps_single_quote_escape("a'b'c"), "a''b''c");
     }
 
     /// Round 2 of ROCMAI-449: an apostrophe anywhere in the real User PATH

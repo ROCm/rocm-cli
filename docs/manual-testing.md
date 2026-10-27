@@ -162,8 +162,12 @@ Expected result:
 - pip installs pinned `rocm`, `torch`, and `torchvision` requirements with
   exactly one `device-<detected-gfx-target>` extra (`rocm` also requests
   `libraries`, and `devel` only when `--devel` is passed), alongside pinned
-  `torchaudio` from the TheRock index. On a host with no detectable AMD GPU the
-  preview reports `device_target: undetermined` and a real install refuses
+  `torchaudio` from the TheRock index. For ROCm 10, the plan's
+  `torchaudio_selection:` line says whether that torchaudio is the
+  hardware-verified build for the ROCm line (the vLLM ROCm 10.x row's exact
+  torchaudio pin, when that row has one) or the newest published one, which it
+  marks as not hardware-verified (a real install also logs that as a `Note:`).
+  On a host with no detectable AMD GPU the preview reports `device_target: undetermined` and a real install refuses
   rather than pulling every published device payload.
 - rocm-cli chooses the newest exact ROCm build suffix common to the SDK package
   and the PyTorch stack for the current Python/platform wheel tags, then pins
@@ -280,6 +284,42 @@ While the log stream is attached, verify detach and stop behave differently:
   request. Stop it afterward with `rocm services stop <service-id> --yes`.
 - Re-run the serve command and press `Ctrl+C` instead. The server shuts down and
   `rocm services` no longer lists it as running.
+
+### Windows display driver check
+
+On a Windows machine with an AMD GPU, check what the CLI says about the display
+driver:
+
+```powershell
+rocm examine
+rocm diagnose
+rocm install driver
+Get-CimInstance Win32_VideoController | Select-Object Name,DriverVersion,DriverDate
+```
+
+Expected result:
+
+- `rocm examine` prints `driver_version` and `driver_date`. Both match the
+  `DriverVersion` and `DriverDate` that the last command prints.
+- With a driver dated before 27 July 2023 (`FIRST_HIP_SDK_FOR_WINDOWS` in
+  [windows_driver.rs](../crates/rocm-core/src/windows_driver.rs)), `driver_age` says it is older than the
+  first HIP SDK for Windows and that the minimum driver version is not
+  established. `rocm diagnose` lists `fix-22-display-driver-old` with a WEAK
+  score, and its advice is AMD's support page and a restart after the install.
+  The date is only a floor: it cannot judge newer GPUs such as gfx120X,
+  gfx1150 and gfx1151, which may need newer drivers.
+- With a newer driver, `driver_age` says it is not older, and `rocm diagnose`
+  does not list `fix-22-display-driver-old`.
+- `rocm install driver` prints the same version and date, an `outdated:` verdict,
+  and the fix id when the driver is old. Next to `outdated: no` it says the date
+  cannot judge newer GPUs such as gfx120X, gfx1150 and gfx1151. It installs nothing and prints no
+  execution commands.
+
+Automated end-to-end scenarios (`examine-29`, `diagnose-41`, `driver-install-04`
+and `driver-install-05`) cover the lines, the verdict and the "installs nothing"
+promise on the Windows GPU lane with whatever driver that machine has. Only the
+old-driver branch needs this manual check: it needs a machine whose display
+driver is dated before 27 July 2023. The logic is also covered by unit tests.
 
 ## 4. Local Server Records
 
@@ -569,6 +609,46 @@ Expected result:
   decision — once inside the dashboard, once more at the launcher, with the
   first one's "yes" not actually exiting anything — is the bug this fixes
   (issue #145).
+
+### 4a. Dashboard Doctor Report
+
+On a machine whose hardware `rocm diagnose --report` can describe (see
+`rocm diagnose --report --json` for what it says on yours), open the dashboard
+and go to the Observe tab, then press `d` to open the Diagnose screen:
+
+```powershell
+rocm dash
+```
+
+Expected result:
+
+- The Diagnose card ends with `Prepare a Doctor report (p). It is shown first,
+  and nothing is sent.` The footer reads `Enter/r run · p report · Esc close`.
+  There is no send hint yet.
+- `p` runs the read-only preview (`rocm diagnose --report --json`) in a console
+  and prints the report. Press Enter or Esc to dismiss the console.
+- If the CLI prepared a report, the card now says `A report is ready` and the
+  footer adds `s review & send`. If the CLI refused (hardware that is not on the
+  published list, an unreadable architecture, a WSL host), the card shows the
+  CLI's own explanation, says no report was prepared, and the footer has no
+  `s review & send`. Pressing `s` then does nothing.
+- `s` does not send. It opens a review dialog titled `Report this diagnosis`
+  that shows the full report, and `Deny` is the selected button. Check that
+  nothing else happened: no mail client opened and no job started.
+- In the dialog, PgUp and PgDn scroll one page, Home and End jump to the top and
+  the bottom. A muted `More to read` line with the row position appears only
+  while the report is longer than the dialog. Up and Down do not scroll.
+- Decline with `n`, Esc, `q`, or Enter on `Deny`. The dialog closes, no mail
+  client opens, and the report is still ready: press `s` to review it again.
+- Approve with `y` (or Tab to `Approve`, then Enter). Only now does the
+  dashboard run `rocm diagnose --report --send`, which opens a prefilled mail in
+  your mail client, or on a machine with no mail client prints the address and
+  the link. The mail is not sent until you send it from the mail client. The
+  send examines the machine again, so the mail can differ slightly from the
+  preview if the machine changed in between.
+
+On an 80x24 terminal, repeat the steps up to the dialog: the card shows the
+outcome (report ready or refusal) without scrolling.
 
 ## 5. ComfyUI Verification
 
