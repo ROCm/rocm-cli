@@ -21,10 +21,14 @@
 //!   deterministic plan is validated — it can never bypass the GPU-required or
 //!   local-bind-only rules the deterministic path enforces.
 //!
-//! [`render_freeform_plan`]/[`render_structured_request_plan`] render a plan for
-//! the no-`--yes` review path; [`freeform_plan_next_action_with_context`]
-//! reduces a plan to the single next [`FreeformPlanAction`] the dispatch flow
-//! executes. Everything downstream of "is this request freeform at all"
+//! [`render_structured_request_plan`] renders a plan for the no-`--yes` review
+//! path; [`plan_next_action`] reduces a plan to the single next
+//! [`FreeformPlanAction`] the dispatch flow executes.
+//! [`plan_freeform_request_with_context`] builds a plan exactly once and
+//! derives both from that same value, so a provider-assisted plan (not
+//! guaranteed deterministic across calls) can never describe one command to
+//! the caller that renders it and a different one to the caller that executes
+//! it. Everything downstream of "is this request freeform at all"
 //! (`parse_freeform_invocation`/`should_treat_as_freeform`) and "is this action
 //! safe to execute" (`validate_freeform_execution_action`) stays in `main.rs` —
 //! this module only builds and renders the plan.
@@ -41,6 +45,11 @@ use std::fmt::Write as _;
 use crate::service_launch::is_loopback_host;
 use crate::{Cli, chat, providers};
 
+/// Builds the freeform plan once and renders it. Kept for the render-only test
+/// below; production code calls [`plan_freeform_request_with_context`]
+/// instead, which derives both the rendered text and the next action from a
+/// single build so the two can never diverge.
+#[cfg(test)]
 pub(crate) fn render_freeform_plan(
     request: &str,
     paths: &AppPaths,
@@ -69,13 +78,33 @@ pub(crate) fn freeform_plan_next_action(
     plan_next_action(plan)
 }
 
-pub(crate) fn freeform_plan_next_action_with_context(
+/// Builds the freeform plan exactly once, returning both the rendered plan
+/// text and the next action derived from that same plan.
+///
+/// Used by `chat.rs`'s `natural_language_plan` MCP tool, which used to call
+/// `render_freeform_plan` and (the now-removed)
+/// `freeform_plan_next_action_with_context` independently — each building its
+/// own `StructuredRequestPlan`. When the request is ambiguous and a cloud
+/// `planner_provider` is configured, building the plan calls out to that
+/// provider, and the call is not guaranteed deterministic: two independent
+/// builds could return two different plans, so the text shown to the user and
+/// the action reported as "next" could describe different commands. Building
+/// once and deriving both from the same `plan` value makes that impossible.
+///
+/// `main.rs`'s `run_freeform` has the same shape of fix but doesn't call this:
+/// it already needs the built `plan` by itself (to decide whether a read-only
+/// answer short-circuits rendering), so it builds once via
+/// [`build_freeform_plan_with_context`] directly and passes that same `plan`
+/// through to `execute_freeform_next_action`.
+pub(crate) fn plan_freeform_request_with_context(
     request: &str,
     paths: &AppPaths,
     config: &RocmCliConfig,
-) -> Option<FreeformPlanAction> {
+) -> (String, Option<FreeformPlanAction>) {
     let plan = build_freeform_plan_with_context(request, paths, config);
-    plan_next_action(plan)
+    let text = render_structured_request_plan(&plan, paths);
+    let action = plan_next_action(plan);
+    (text, action)
 }
 
 pub(crate) fn plan_next_action(plan: StructuredRequestPlan) -> Option<FreeformPlanAction> {

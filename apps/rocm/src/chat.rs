@@ -25,8 +25,7 @@
 //! above.
 
 use crate::freeform_planner::{
-    format_structured_tool_call, freeform_plan_next_action_with_context, render_freeform_plan,
-    serve_args_request_cpu_device,
+    format_structured_tool_call, plan_freeform_request_with_context, serve_args_request_cpu_device,
 };
 use crate::runtime_install_finalize::empty_as_unknown;
 use crate::runtimes_cmd::render_runtimes_text;
@@ -3426,16 +3425,20 @@ pub(crate) fn run_internal_mcp_call(
             let request = json_string(&arguments, "request")
                 .context("natural_language_plan requires `request`")?;
             let config = RocmCliConfig::load(paths).unwrap_or_default();
-            let text = render_freeform_plan(&request, paths, &config);
-            let action =
-                freeform_plan_next_action_with_context(&request, paths, &config).map(|action| {
-                    serde_json::json!({
-                        "args": action.args,
-                        "approval_required": action.approval_required,
-                        "has_placeholders": action.has_placeholders,
-                        "provider_assisted": action.provider_assisted,
-                    })
-                });
+            // Built exactly once: the text shown to the operator and the
+            // `action` reported as what would run next both come from the
+            // same `StructuredRequestPlan`, so a provider-assisted plan (not
+            // guaranteed deterministic across calls) cannot describe one
+            // command in `text` and a different one in `action`.
+            let (text, action) = plan_freeform_request_with_context(&request, paths, &config);
+            let action = action.map(|action| {
+                serde_json::json!({
+                    "args": action.args,
+                    "approval_required": action.approval_required,
+                    "has_placeholders": action.has_placeholders,
+                    "provider_assisted": action.provider_assisted,
+                })
+            });
             Ok(internal_mcp_tool_success(
                 "Planned the ROCm request.".to_owned(),
                 serde_json::json!({

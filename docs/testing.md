@@ -1333,6 +1333,8 @@ cargo test -p rocm --bin rocm freeform_execution_header_surfaces_explicit_approv
 cargo test -p rocm --bin rocm hybrid_planner_driver_action_includes_yes_for_approved_execution
 cargo test -p rocm --bin rocm render_freeform_plan_exposes_structured_tool_calls
 cargo test -p rocm --bin rocm natural_serve_with_missing_model_does_not_focus_approval
+cargo test -p rocm --bin rocm freeform_plan_dedup_prevents_provider_assisted_divergence
+cargo test -p rocm --bin rocm freeform_execution_reuses_the_rendered_plan_without_rebuilding
 ```
 
 In the TUI, recognized mutating plain-language requests render a plan and then
