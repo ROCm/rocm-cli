@@ -991,10 +991,11 @@ jobs:
       # Supply-chain hardening: the action is pinned to a commit SHA and prek to
       # an exact version. The action ships a hardcoded SHA-256 checksum map
       # (src/known-checksums.ts) and verifies the downloaded prek archive against
-      # it, so a tampered release can't be installed. This commit is past the
-      # v2.0.4 tag because it is the one that added prek 0.4.5 to that map — pin
-      # an earlier commit and the action would not know 0.4.5 and skip the check.
-      - uses: j178/prek-action@44924fe9ef4a6f88253c4b6b1bf11c689d3ce53d # prek 0.4.5 checksums
+      # it, so a tampered release can't be installed. The pin must resolve to a
+      # commit whose checksum map already has an entry for the prek version below
+      # — an earlier commit lacking that entry would make the action skip the
+      # check instead of failing closed.
+      - uses: j178/prek-action@44924fe9ef4a6f88253c4b6b1bf11c689d3ce53d # v3.1.0
         with:
           prek-version: 0.4.5
           extra-args: --all-files --no-group local-tools
