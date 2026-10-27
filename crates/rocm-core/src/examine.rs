@@ -1878,6 +1878,16 @@ fn module_or_host_state(
     }
 }
 
+/// `amdgpu_loaded` and `amdkfd_loaded`, in that order, from the module list
+/// and the host. kfd on the host answers both; the amdgpu PCI driver answers
+/// only `amdgpu_loaded`.
+fn driver_states(modules: Option<&[&str]>) -> (Option<bool>, Option<bool>) {
+    (
+        module_or_host_state(modules, "amdgpu", amdgpu_implied_by_host),
+        module_or_host_state(modules, "amdkfd", kfd_present_on_host),
+    )
+}
+
 fn probe_modules(e: &mut Examination) {
     let (rc, out, _) = run("lsmod", &[], SHORT);
     let module_text = if rc == 0 {
@@ -1891,8 +1901,7 @@ fn probe_modules(e: &mut Examination) {
             .filter_map(|line| line.split_whitespace().next())
             .collect()
     });
-    e.amdgpu_loaded = module_or_host_state(modules.as_deref(), "amdgpu", amdgpu_implied_by_host);
-    e.amdkfd_loaded = module_or_host_state(modules.as_deref(), "amdkfd", kfd_present_on_host);
+    (e.amdgpu_loaded, e.amdkfd_loaded) = driver_states(modules.as_deref());
 
     for dir in ["/etc/modprobe.d", "/usr/lib/modprobe.d", "/run/modprobe.d"] {
         let Ok(entries) = std::fs::read_dir(crate::host_path(dir)) else {
@@ -6564,8 +6573,12 @@ mod tests {
 
     /// The wiring, not just the helpers: `probe_modules` must consult the host
     /// root. The `amdgpu` module line cannot be planted away on a machine that
-    /// has one, so this only asserts the positive: with `/sys/bus/pci/drivers/amdgpu`
-    /// planted the field is `Some(true)` whatever the module list says.
+    /// has one, so this asserts `amdgpu_loaded` only positively: with
+    /// `/sys/bus/pci/drivers/amdgpu` planted it is `Some(true)` whatever the
+    /// module list says. It assumes, like the kfd test below, a runner whose
+    /// kernel lists no `amdkfd` module (none since 4.20); then the driver
+    /// directory alone must not make `amdkfd_loaded` true. `driver_states`
+    /// is tested for the same case without that assumption.
     #[cfg(all(feature = "e2e-test-hooks", target_os = "linux"))]
     #[test]
     fn probe_modules_reports_amdgpu_when_it_is_on_the_host() {
@@ -6580,17 +6593,22 @@ mod tests {
                 .map_or(0, |d| d.as_nanos())
         ));
         std::fs::create_dir_all(root.join("sys/bus/pci/drivers/amdgpu")).expect("plant sysfs");
-        let amdgpu_loaded = {
+        let (amdgpu_loaded, amdkfd_loaded) = {
             let _guard = crate::hardware_root::HOST_ROOT_TEST_LOCK
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let _root = RestoredEnvVar::set(TEST_HOST_ROOT_ENV, &root);
             let mut e = Examination::default();
             probe_modules(&mut e);
-            e.amdgpu_loaded
+            (e.amdgpu_loaded, e.amdkfd_loaded)
         };
         std::fs::remove_dir_all(&root).ok();
         assert_eq!(amdgpu_loaded, Some(true));
+        assert_ne!(
+            amdkfd_loaded,
+            Some(true),
+            "the amdgpu PCI driver does not imply kfd"
+        );
     }
 
     /// The host side of the check, against a planted root: the sysfs class
@@ -6663,9 +6681,80 @@ mod tests {
         assert!(dev_only, "/dev/kfd alone implies amdgpu");
     }
 
+    /// Which host signal answers which field. Each case plants one signal into
+    /// an otherwise empty root and hands over the module list directly, so the
+    /// answer cannot come from the machine the test runs on: kfd alone answers
+    /// both fields, the amdgpu PCI driver alone answers only `amdgpu_loaded`,
+    /// and with the module list unreadable the host still answers.
+    #[cfg(all(feature = "e2e-test-hooks", target_os = "linux"))]
+    #[test]
+    fn driver_states_answer_each_field_from_its_own_host_signal() {
+        use crate::hardware_root::TEST_HOST_ROOT_ENV;
+        use crate::test_env::RestoredEnvVar;
+
+        let root = std::env::temp_dir().join(format!(
+            "rocm-core-driver-states-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::create_dir_all(&root).expect("create root");
+        let (neither, unread_neither, kfd_only, unread_kfd_only, pci_only, unread_pci_only) = {
+            let _guard = crate::hardware_root::HOST_ROOT_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _root = RestoredEnvVar::set(TEST_HOST_ROOT_ENV, &root);
+            let neither = driver_states(Some(&[]));
+            let unread_neither = driver_states(None);
+            std::fs::create_dir_all(root.join("dev")).expect("plant dev");
+            std::fs::write(root.join("dev/kfd"), "").expect("plant /dev/kfd");
+            let kfd_only = driver_states(Some(&[]));
+            let unread_kfd_only = driver_states(None);
+            std::fs::remove_dir_all(root.join("dev")).expect("unplant dev");
+            std::fs::create_dir_all(root.join("sys/bus/pci/drivers/amdgpu")).expect("plant sysfs");
+            (
+                neither,
+                unread_neither,
+                kfd_only,
+                unread_kfd_only,
+                driver_states(Some(&[])),
+                driver_states(None),
+            )
+        };
+        std::fs::remove_dir_all(&root).ok();
+        assert_eq!(
+            neither,
+            (Some(false), Some(false)),
+            "nothing listed, nothing on the host"
+        );
+        assert_eq!(
+            unread_neither,
+            (None, None),
+            "nothing read, nothing on the host"
+        );
+        assert_eq!(kfd_only, (Some(true), Some(true)), "kfd implies amdgpu");
+        assert_eq!(
+            unread_kfd_only,
+            (Some(true), Some(true)),
+            "kfd answers without a module list"
+        );
+        assert_eq!(
+            pci_only,
+            (Some(true), Some(false)),
+            "amdgpu does not imply kfd"
+        );
+        assert_eq!(
+            unread_pci_only,
+            (Some(true), None),
+            "amdgpu does not imply kfd"
+        );
+    }
+
     /// The wiring, not just the helpers: `probe_modules` must consult the host
     /// root. On every machine this runs on, no `amdkfd` module line exists, so
-    /// `Some(true)` can only come from the planted `/dev/kfd`.
+    /// `Some(true)` can only come from the planted `/dev/kfd`, which answers
+    /// `amdgpu_loaded` too.
     #[cfg(all(feature = "e2e-test-hooks", target_os = "linux"))]
     #[test]
     fn probe_modules_reports_amdkfd_when_kfd_is_on_the_host() {
@@ -6681,17 +6770,18 @@ mod tests {
         ));
         std::fs::create_dir_all(root.join("dev")).expect("plant dev");
         std::fs::write(root.join("dev/kfd"), "").expect("plant /dev/kfd");
-        let amdkfd_loaded = {
+        let (amdgpu_loaded, amdkfd_loaded) = {
             let _guard = crate::hardware_root::HOST_ROOT_TEST_LOCK
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let _root = RestoredEnvVar::set(TEST_HOST_ROOT_ENV, &root);
             let mut e = Examination::default();
             probe_modules(&mut e);
-            e.amdkfd_loaded
+            (e.amdgpu_loaded, e.amdkfd_loaded)
         };
         std::fs::remove_dir_all(&root).ok();
         assert_eq!(amdkfd_loaded, Some(true));
+        assert_eq!(amdgpu_loaded, Some(true), "kfd implies amdgpu");
     }
 
     /// The probes themselves, not just `host_path`, answer from a simulated
