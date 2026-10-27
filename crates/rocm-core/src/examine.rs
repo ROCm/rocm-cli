@@ -1833,10 +1833,12 @@ fn summarise_gpu_categories(e: &mut Examination) {
 
 /// Whether the kernel's kfd is present on this host, however it got there.
 ///
-/// kfd is not a module of its own: `HSA_AMD` is a `bool` Kconfig option and
-/// amdkfd is linked into `amdgpu`, so no `amdkfd` line ever appears in the
-/// module list, built in or not. The kernel's own interfaces are the signal:
-/// the `/sys/class/kfd/kfd` class device, or the `/dev/kfd` node.
+/// On current kernels kfd is not a module of its own: `HSA_AMD` is a `bool`
+/// Kconfig option and amdkfd is linked into `amdgpu`, so no `amdkfd` line
+/// appears in the module list, built in or not. (Before 4.20 it was a separate
+/// `amdkfd` module, which the module-list check still covers.) The kernel's own
+/// interfaces are the signal: the `/sys/class/kfd/kfd` class device, or the
+/// `/dev/kfd` node.
 fn kfd_present_on_host() -> bool {
     crate::host_path("/sys/class/kfd/kfd").exists() || crate::host_path("/dev/kfd").exists()
 }
