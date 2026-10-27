@@ -2261,6 +2261,7 @@ mod tests {
     fn local_provider_selects_a_service_by_its_served_model_id() -> Result<()> {
         let (root, paths) = temp_app_paths("local-provider-served-id");
         paths.ensure()?;
+        let server = spawn_models_only_server("Org/Served")?;
         let mut aim = ManagedServiceRecord::new(
             &paths,
             "svc-aim",
@@ -2268,7 +2269,7 @@ mod tests {
             "aim-qwen3.5-9b",
             "docker.io/org/aim-image:1",
             "127.0.0.1",
-            8000,
+            server.port(),
             "managed",
             123,
             None,
