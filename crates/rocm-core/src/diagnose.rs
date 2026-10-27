@@ -2051,11 +2051,7 @@ fn vllm_anchored_lines(symptom: &str) -> String {
 /// a cause rather than reading as "the tool checked and found nothing".
 #[must_use]
 pub fn vllm_oom_symptom_is_diagnosable(symptom: &str) -> bool {
-    let e = Examination {
-        os_family: "linux".to_owned(),
-        ..Examination::default()
-    };
-    check_16_vllm_oom(&e, symptom).score >= MIN_SCORE_FOR_MATCH
+    scores_on_every_engine_host(symptom, "fix-16-vllm-oom", run_all_checks)
 }
 
 /// vLLM ran the GPU out of memory. Keyword-only: an [`Examination`] carries no
@@ -2249,6 +2245,60 @@ fn check_18_comgr_conflict(e: &Examination, symptom: &str) -> Diagnosis {
     finalize(ID, TITLE, score, evidence, fix)
 }
 
+/// A canonical engine-startup import-failure `--symptom` string guaranteed to
+/// clear [`MIN_SCORE_FOR_MATCH`].
+///
+/// `libtorch_cuda.so` is the one token in that traceback that cannot mean
+/// anything else (a ROCm build of torch ships `libtorch_hip.so` and never that
+/// file), and it is worth exactly the threshold on its own on purpose; see
+/// [`KEYWORDS_TORCH_DLPACK_CUDA_VARIANT`]. The vLLM engine falls back to this when
+/// the user's actual failing line would not itself be diagnosable, so the
+/// `rocm diagnose` command it prints always reports a cause.
+pub const VLLM_IMPORT_CANONICAL_SYMPTOM: &str =
+    "OSError: libtorch_cuda.so: cannot open shared object file";
+
+/// Whether `symptom` clears [`MIN_SCORE_FOR_MATCH`] for the engine-startup
+/// import failure.
+///
+/// The vLLM engine calls this to decide whether the user's actual failing line
+/// is worth routing into a `--symptom` example, or whether to fall back to
+/// [`VLLM_IMPORT_CANONICAL_SYMPTOM`] so the printed command is guaranteed to
+/// report a cause rather than reading as "the tool checked and found nothing".
+///
+/// The hint fires on every host the vLLM engine runs on, which is Linux and
+/// WSL2. The symptom therefore has to clear the threshold on each of those
+/// families, run through the same registry `rocm diagnose` uses, so a check
+/// that is registered for one family and not the other cannot make the engine
+/// name a command that finds nothing.
+#[must_use]
+pub fn vllm_import_symptom_is_diagnosable(symptom: &str) -> bool {
+    scores_on_every_engine_host(symptom, "fix-17-torch-dlpack", run_all_checks)
+}
+
+/// Whether the entry `id` clears [`MIN_SCORE_FOR_MATCH`] for `symptom` on every
+/// host family the vLLM engine runs on (Linux and WSL2). `run` is the registry
+/// run for one host. It is a parameter so a test can hand in a registry where
+/// the entry is missing on one family.
+fn scores_on_every_engine_host(
+    symptom: &str,
+    id: &str,
+    run: impl Fn(&Examination, &str) -> Vec<Diagnosis>,
+) -> bool {
+    let linux = Examination {
+        os_family: "linux".to_owned(),
+        ..Examination::default()
+    };
+    let wsl = Examination {
+        is_wsl: true,
+        ..linux.clone()
+    };
+    [linux, wsl].iter().all(|host| {
+        run(host, symptom)
+            .iter()
+            .any(|d| d.id == id && d.score >= MIN_SCORE_FOR_MATCH)
+    })
+}
+
 /// The vLLM engine-startup import failure (EAI-8012).
 ///
 /// Keyword-only, and not by preference. The fact that decides this failure is
@@ -2260,15 +2310,15 @@ fn check_18_comgr_conflict(e: &Examination, symptom: &str) -> Diagnosis {
 /// why the parameter is unused: the user has to supply the error text through
 /// `rocm diagnose --symptom "<pasted error>"`.
 ///
-/// That is the only route to this entry from the symptom, and it is a narrow
-/// one: nothing on the serve or `rocm services` path points at `rocm diagnose`
-/// at all — a service that died at startup renders a `logs:` and a `restart:`
-/// hint and no more — so reaching this requires already knowing to paste the
-/// error into `diagnose`. The recipe is also reachable by name (`rocm fix` lists
-/// it, `rocm fix fix-17-torch-dlpack` prints it), but that needs the id rather
-/// than the symptom. Closing that gap means adding a diagnose hint to the
-/// service-failure output, which changes a shared surface for every failed
-/// service regardless of cause and belongs in its own change.
+/// That is the only route to this entry from the symptom. The vLLM engine's own
+/// startup-failure message now points at it (`import_failure_hint` in
+/// `engines/vllm`, which prints `rocm diagnose --symptom '<the error line>'`),
+/// but only for that engine. A service that died at startup for any other reason
+/// still renders a `logs:` and a `restart:` hint and no more, because adding a
+/// diagnose hint there changes a shared surface for every failed service
+/// regardless of cause and belongs in its own change. The recipe is also
+/// reachable by name (`rocm fix` lists it, `rocm fix fix-17-torch-dlpack` prints
+/// it), but that needs the id rather than the symptom.
 fn check_17_torch_dlpack_cuda_variant(_e: &Examination, symptom: &str) -> Diagnosis {
     let (score, evidence) = keyword_score(symptom, KEYWORDS_TORCH_DLPACK_CUDA_VARIANT);
     if score <= 0 {
@@ -2551,6 +2601,54 @@ fn check_21_msvc_redist_outdated(e: &Examination, symptom: &str) -> Diagnosis {
         ..Fix::default()
     };
     finalize(ID, TITLE, score, evidence, fix)
+}
+
+/// The score for an old display driver.
+///
+/// Below [`MIN_SCORE_FOR_MATCH`] on purpose. The entry is advice to look at the
+/// driver, not a finding that anything is broken: AMD publishes no minimum
+/// driver version for the HIP SDK or for the Lemonade Vulkan backend. A WEAK
+/// row is shown by `rocm diagnose` and does not set `has_match`.
+const DISPLAY_DRIVER_OLD_SCORE: i32 = 25;
+
+/// An AMD display driver dated before the first HIP SDK for Windows.
+///
+/// Separate from [`check_14_adrenalin_too_old`] on purpose. That entry needs a
+/// HIP SDK and a failing `hipInfo` or a symptom. This one needs neither, so it
+/// also covers a machine that only runs the Vulkan backend. Only evidence is
+/// read: the driver date from the examination, never the symptom text.
+fn check_22_display_driver_old(e: &Examination, _symptom: &str) -> Diagnosis {
+    const TITLE: &str = "AMD display driver is older than the first HIP SDK for Windows";
+    let id = crate::windows_driver::DISPLAY_DRIVER_OLD_FIX_ID;
+    if e.os_family != "windows" {
+        return zero(id, TITLE);
+    }
+    let Some(info) = crate::windows_driver::WindowsDriverInfo::from_probe(
+        &e.adrenalin_version,
+        &e.adrenalin_date,
+    ) else {
+        return zero(id, TITLE);
+    };
+    let Some(evidence) = crate::windows_driver::old_driver_evidence(&info) else {
+        return zero(id, TITLE);
+    };
+    let fix = Fix {
+        summary: "Look at AMD's support page for a newer display driver for this GPU. This is advice only: no minimum driver version is established, and rocm-cli does not install drivers on Windows.".to_owned(),
+        commands: vec![
+            "# Find the current display driver for this GPU on AMD's support page:".to_owned(),
+            format!("#   {}", crate::windows_driver::AMD_SUPPORT_URL),
+            "# Restart the machine after the driver install.".to_owned(),
+        ],
+        needs_reboot: true,
+        fix_id: id.to_owned(),
+        verify: "powershell -NoProfile -Command \"Get-CimInstance Win32_VideoController | Where-Object { $_.Name -like '*AMD*' -or $_.Name -like '*Radeon*' } | Select-Object Name,DriverVersion,DriverDate\"".to_owned(),
+        notes: vec![
+            crate::windows_driver::NO_MINIMUM_EXPLANATION.to_owned(),
+            crate::windows_driver::FLOOR_NOTE.to_owned(),
+        ],
+        ..Fix::default()
+    };
+    finalize(id, TITLE, DISPLAY_DRIVER_OLD_SCORE, vec![evidence], fix)
 }
 
 // ---------------------------------------------------------------------------
@@ -3014,11 +3112,13 @@ const CHECKERS: &[Checker] = &[
     (check_14_adrenalin_too_old, &["windows"]),
     (check_15_msvc_redist, &["windows"]),
     (check_16_vllm_oom, &["linux", "wsl"]),
-    // Linux-only: `libtorch_cuda.so` is an ELF name, and the vLLM engine is
-    // gated off native Windows. 17 rather than 16 because the vLLM
-    // out-of-memory entry above already holds 16; the number is a stable
-    // handle, so the two do not get to share one.
-    (check_17_torch_dlpack_cuda_variant, &["linux"]),
+    // Linux and WSL2: `libtorch_cuda.so` is an ELF name, and the vLLM engine is
+    // gated off native Windows but runs on WSL2. The engine's startup-failure
+    // hint fires on both, so the entry it points at must be reachable on both.
+    // 17 rather than 16 because the vLLM out-of-memory entry above already
+    // holds 16; the number is a stable handle, so the two do not get to share
+    // one.
+    (check_17_torch_dlpack_cuda_variant, &["linux", "wsl"]),
     (check_wsl_1_gpu_not_exposed, WSL_ONLY),
     (check_wsl_2_dxcore_missing, WSL_ONLY),
     (check_wsl_3_rocdxg_missing, WSL_ONLY),
@@ -3043,6 +3143,9 @@ const CHECKERS: &[Checker] = &[
     // Windows only: the runtime is read from the Windows System32 folder. A WSL
     // distro is examined as a distro, so it has no such runtime to read.
     (check_21_msvc_redist_outdated, &["windows"]),
+    // Windows only: the driver date comes from the Windows display adapter.
+    // WSL2 reads the host driver through its own entries.
+    (check_22_display_driver_old, &["windows"]),
 ];
 
 const WSL_ONLY: &[&str] = &["wsl"];
@@ -3135,9 +3238,9 @@ pub fn diagnose(e: &Examination, symptom: &str) -> DiagnoseReport {
     // in the catalog now, with its own entries; what keeps the bare-metal checks
     // off it is `platform_family`, not a special case at this level.
     //
-    // `fix-16-vllm-oom` opts into `wsl` in CHECKERS for that reason: it is a
-    // keyword-only check whose failure mode is just as real under WSL2, so it
-    // still answers there alongside the WSL entries.
+    // `fix-16-vllm-oom` and `fix-17-torch-dlpack` opt into `wsl` in CHECKERS for
+    // that reason: they are keyword-only checks whose failure modes are just as
+    // real under WSL2, so they still answer there alongside the WSL entries.
     //
     // `out_of_scope` still exists, for the platforms that genuinely have no
     // entries. That case used to fall through to an empty catalog and report "no
@@ -3208,6 +3311,16 @@ fn uncovered_platform_message(e: &Examination) -> Option<String> {
     ))
 }
 
+/// Whether a catalog entry is advice about the host rather than a candidate
+/// cause of the reported symptom.
+///
+/// Such an entry reads only evidence, never the symptom, so it fires whatever
+/// the user reported. The text report must not call it "the highest-scoring
+/// match" nor let it stand in for the upstream escalation.
+fn is_advice_only(fix_id: &str) -> bool {
+    fix_id == crate::windows_driver::DISPLAY_DRIVER_OLD_FIX_ID
+}
+
 /// Render the human-facing diagnosis view (mirrors `diagnose.py`'s text output).
 #[must_use]
 pub fn render_report_text(report: &DiagnoseReport, top: usize) -> String {
@@ -3219,14 +3332,24 @@ pub fn render_report_text(report: &DiagnoseReport, top: usize) -> String {
         out.push('\n');
         return out;
     }
-    if report.matched.is_empty() {
+    // An advice-only row says something true about the host whatever the user
+    // reported, so it is never an answer to the symptom. When it is all there is,
+    // the upstream escalation still applies: it is printed first and the advice
+    // follows. JSON is unaffected, `matched` and `has_match` stay as built.
+    let answers_symptom = report.matched.iter().any(|d| !is_advice_only(&d.id));
+    if !answers_symptom {
         let route = &report.route_when_no_match;
         out.push_str("rocm diagnose: no known misconfiguration matched.\n\n");
         out.push_str("This is the explicit 'I don't recognise this failure mode' case. Do not speculate; file the symptom + this examination output upstream:\n");
         let _ = writeln!(out, "  {:>12}: {}", route.target, route.url);
         out.push('\n');
         out.push_str("Include the JSON from `rocm examine --json` in your report.\n");
-        return out;
+        if report.matched.is_empty() {
+            return out;
+        }
+        out.push_str(
+            "\nAdvice about this host follows. It does not explain the symptom, and nothing in it is applied automatically.\n\n",
+        );
     }
     for (i, d) in report.matched.iter().take(top).enumerate() {
         let tier = if d.score >= HIGH_CONFIDENCE {
@@ -3300,7 +3423,7 @@ pub fn render_report_text(report: &DiagnoseReport, top: usize) -> String {
 
     if let Some(high) = report.matched.iter().find(|d| d.score >= HIGH_CONFIDENCE) {
         let _ = writeln!(out, "Next step: run `rocm fix {}`.", high.id);
-    } else if let Some(best) = report.matched.first() {
+    } else if let Some(best) = report.matched.iter().find(|d| !is_advice_only(&d.id)) {
         // Below the threshold the caution still stands, but it is advice about
         // confidence -- not a reason to withhold the command. Ending here was the
         // bug: the user was told to confirm more evidence and given nothing to
@@ -4867,6 +4990,17 @@ mod tests {
             .find(|d| d.id == "fix-16-vllm-oom")
             .and_then(|d| d.fix.as_ref())
             .expect("the finding must carry a plan");
+        let commands: Vec<&str> = fix.commands.iter().map(String::as_str).collect();
+        crate::fix::assert_plan_matches_the_catalog_copy(&fix.fix_id, &commands);
+    }
+
+    #[test]
+    fn the_display_driver_old_plan_matches_the_catalog_copy() {
+        // The `diagnose` copy of fix-22 and the `rocm fix` recipe are one plan.
+        let fix =
+            check_22_display_driver_old(&windows_driver_exam("30.0.13014.8", "2021-08-04"), "")
+                .fix
+                .expect("an old driver must carry a plan");
         let commands: Vec<&str> = fix.commands.iter().map(String::as_str).collect();
         crate::fix::assert_plan_matches_the_catalog_copy(&fix.fix_id, &commands);
     }
@@ -6735,6 +6869,81 @@ mod tests {
     }
 
     #[test]
+    fn canonical_vllm_import_symptom_is_diagnosable() {
+        // The engine's fallback symptom must always clear the threshold, so the
+        // `rocm diagnose` command it prints never reports nothing.
+        assert!(vllm_import_symptom_is_diagnosable(
+            VLLM_IMPORT_CANONICAL_SYMPTOM
+        ));
+        // A frame that names only the shim's module, and not the missing library,
+        // is not enough on its own, and the engine has to know that.
+        assert!(!vllm_import_symptom_is_diagnosable(
+            "File \"tvm_ffi/_optional_torch_c_dlpack.py\", line 42, in <module>"
+        ));
+        assert!(!vllm_import_symptom_is_diagnosable("an ordinary failure"));
+    }
+
+    #[test]
+    fn vllm_import_keyword_diagnosis_is_available_on_wsl() {
+        // The engine's import hint fires on WSL2 too, so `rocm diagnose
+        // --symptom` has to answer there. Check 17 used to be registered for
+        // Linux only, and this report had no match.
+        let report = diagnose(&wsl_base(), VLLM_IMPORT_CANONICAL_SYMPTOM);
+        assert!(report.out_of_scope.is_none());
+        assert!(report.has_match());
+        assert_eq!(report.matched[0].id, "fix-17-torch-dlpack");
+    }
+
+    #[test]
+    fn the_engine_host_guard_requires_the_entry_to_score_on_every_host_family() {
+        // A registry stand-in: `listed_on` says which hosts list the entry.
+        fn registry(
+            id: &'static str,
+            listed_on_wsl: bool,
+            listed_on_linux: bool,
+        ) -> impl Fn(&Examination, &str) -> Vec<Diagnosis> {
+            move |host, _symptom| {
+                let listed = if host.is_wsl {
+                    listed_on_wsl
+                } else {
+                    listed_on_linux
+                };
+                if !listed {
+                    return Vec::new();
+                }
+                vec![Diagnosis {
+                    id: id.to_owned(),
+                    score: 100,
+                    ..Diagnosis::default()
+                }]
+            }
+        }
+        let guard = |run| scores_on_every_engine_host("x", "fix-17-torch-dlpack", run);
+        assert!(guard(registry("fix-17-torch-dlpack", true, true)));
+        assert!(
+            !guard(registry("fix-17-torch-dlpack", false, true)),
+            "an entry missing on WSL must not count"
+        );
+        assert!(
+            !guard(registry("fix-17-torch-dlpack", true, false)),
+            "an entry missing on Linux must not count"
+        );
+        assert!(
+            !guard(registry("fix-16-vllm-oom", true, true)),
+            "a different entry scoring is not this entry scoring"
+        );
+        // And the real registry lists both entries on both families.
+        assert!(vllm_import_symptom_is_diagnosable(
+            VLLM_IMPORT_CANONICAL_SYMPTOM
+        ));
+        assert!(vllm_oom_symptom_is_diagnosable(VLLM_OOM_CANONICAL_SYMPTOM));
+        // An ISA error scores on another check, not on this one.
+        assert!(!vllm_import_symptom_is_diagnosable(
+            "hipErrorNoBinaryForGpu: Unable to find code object for all current devices"
+        ));
+    }
+
+    #[test]
     fn canonical_vllm_oom_symptom_is_diagnosable() {
         // The engine's fallback symptom must always clear the threshold, so the
         // `rocm diagnose` command it prints never reports nothing.
@@ -6782,7 +6991,7 @@ mod tests {
 
     #[test]
     fn diagnosis_remediation_matches_the_fix_catalog_for_shared_fix_ids() {
-        // fix-15, fix-16, fix-21 and info-20 live in two places: the `rocm fix`
+        // fix-15, fix-16, fix-21, info-20 and fix-22 live in two places: the `rocm fix`
         // catalog (crate::fix::RECIPES) and the Fix these checks embed in a
         // Diagnosis. The prose *framing* legitimately differs by surface (a
         // catalog rationale vs a diagnosis summary), but the actionable
@@ -6832,12 +7041,26 @@ mod tests {
             },
             "",
         );
-        for diag in [vllm_oom, msvc, msvc_outdated, unsupported_gpu] {
-            assert!(
-                diag.score >= MIN_SCORE_FOR_MATCH,
-                "test setup must yield a real match for {}",
-                diag.id
-            );
+        // fix-22 is advice only: it scores below the match threshold on purpose,
+        // yet a user meets both of its copies, so it is held to the same guard.
+        let display_driver_old =
+            check_22_display_driver_old(&windows_driver_exam("30.0.13014.8", "2021-08-04"), "");
+        for diag in [
+            vllm_oom,
+            msvc,
+            msvc_outdated,
+            unsupported_gpu,
+            display_driver_old,
+        ] {
+            if diag.id == crate::windows_driver::DISPLAY_DRIVER_OLD_FIX_ID {
+                assert_eq!(diag.score, DISPLAY_DRIVER_OLD_SCORE);
+            } else {
+                assert!(
+                    diag.score >= MIN_SCORE_FOR_MATCH,
+                    "test setup must yield a real match for {}",
+                    diag.id
+                );
+            }
             let fix = diag.fix.expect("a matched diagnosis must carry a Fix");
             let (verify, notes, run_commands) =
                 crate::fix::recipe_verify_notes_and_run_commands(&fix.fix_id)
@@ -7924,5 +8147,220 @@ mod tests {
             .expect("unsupported kernel triple should be diagnosed");
         assert!(!fix.commands.join("\n").contains("rocm install sdk"));
         assert!(!fix.verify.contains("| head"), "{}", fix.verify);
+    }
+
+    fn windows_driver_exam(version: &str, date: &str) -> Examination {
+        Examination {
+            os_family: "windows".to_owned(),
+            adrenalin_version: version.to_owned(),
+            adrenalin_date: date.to_owned(),
+            ..Examination::default()
+        }
+    }
+
+    fn old_driver_entry(e: &Examination) -> Option<Diagnosis> {
+        diagnose(e, "")
+            .matched
+            .into_iter()
+            .find(|d| d.id == crate::windows_driver::DISPLAY_DRIVER_OLD_FIX_ID)
+    }
+
+    #[test]
+    fn a_2021_display_driver_is_flagged_as_advice_only() {
+        let hit = old_driver_entry(&windows_driver_exam("30.0.13014.8", "2021-08-04"))
+            .expect("a 2021 driver must be flagged");
+        assert_eq!(hit.score, DISPLAY_DRIVER_OLD_SCORE);
+        assert!(
+            hit.score < MIN_SCORE_FOR_MATCH,
+            "advice must not read as an established cause"
+        );
+        assert!(hit.evidence.iter().any(|ev| ev.contains("30.0.13014.8")));
+        assert!(hit.evidence.iter().any(|ev| ev.contains("2021-08-04")));
+        assert!(hit.evidence.iter().any(|ev| ev.contains("not established")));
+        let fix = hit.fix.expect("fix");
+        assert!(!fix.commands.is_empty());
+        assert!(
+            fix.commands.iter().all(|c| c.starts_with('#')),
+            "the recipe must print no command that installs anything: {:?}",
+            fix.commands
+        );
+        assert!(fix.commands.iter().any(|c| c.contains("Restart")));
+        assert!(
+            fix.commands
+                .iter()
+                .any(|c| c.contains("amd.com/en/support"))
+        );
+    }
+
+    fn old_driver_only_exam() -> Examination {
+        Examination {
+            hip_sdk_path: "C:\\Program Files\\AMD\\ROCm\\6.2".to_owned(),
+            hipinfo_present: true,
+            ..windows_driver_exam("30.0.13014.8", "2021-08-04")
+        }
+    }
+
+    #[test]
+    fn an_old_driver_alone_keeps_the_upstream_escalation_in_the_text_report() {
+        // State: the old-driver row is present, nothing else is, and no
+        // established cause exists.
+        let report = diagnose(&old_driver_only_exam(), "");
+        let ids: Vec<&str> = report.matched.iter().map(|d| d.id.as_str()).collect();
+        assert_eq!(ids, [crate::windows_driver::DISPLAY_DRIVER_OLD_FIX_ID]);
+        assert!(!report.has_match);
+
+        // Text: the symptom was not recognised, so the report says where to
+        // file it, and it does not present the advice as the best match.
+        let text = render_report_text(&report, 5);
+        assert!(text.contains("no known misconfiguration matched"), "{text}");
+        assert!(text.contains(&report.route_when_no_match.url), "{text}");
+        assert!(text.contains("rocm examine --json"), "{text}");
+        assert!(text.contains("fix-22-display-driver-old"), "{text}");
+        assert!(!text.contains("highest-scoring match"), "{text}");
+        assert!(!text.contains("HIGH_CONFIDENCE"), "{text}");
+
+        // The line that introduces the advice makes a promise: nothing in it is
+        // applied automatically. The promise and the behaviour are asserted in
+        // the same test: every command the entry carries is a printed comment
+        // (`a_2021_display_driver_is_flagged_as_advice_only` pins the same for
+        // the recipe), so nothing in the advice can run anything.
+        assert!(
+            text.contains(
+                "Advice about this host follows. It does not explain the symptom, and nothing in it is applied automatically."
+            ),
+            "{text}"
+        );
+        let fix = report.matched[0]
+            .fix
+            .as_ref()
+            .expect("the advice has a fix");
+        assert!(
+            fix.commands.iter().all(|c| c.starts_with('#')),
+            "the advice must apply nothing: {:?}",
+            fix.commands
+        );
+    }
+
+    #[test]
+    fn a_real_cause_beside_an_old_driver_is_still_the_highest_scoring_match() {
+        // The advice row must not be named as the best match, and a real
+        // finding must keep that role.
+        let mut e = old_driver_only_exam();
+        e.msvc_redist_version = "14.29.30133.0".to_owned();
+        let report = diagnose(&e, "");
+        let ids: Vec<&str> = report.matched.iter().map(|d| d.id.as_str()).collect();
+        assert!(ids.contains(&crate::windows_driver::DISPLAY_DRIVER_OLD_FIX_ID));
+        assert!(ids.contains(&"fix-21-msvc-redist-outdated"));
+        let text = render_report_text(&report, 5);
+        assert!(
+            !text.contains("no known misconfiguration matched"),
+            "{text}"
+        );
+        assert!(
+            text.contains("run `rocm fix fix-21-msvc-redist-outdated`"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("run `rocm fix fix-22-display-driver-old` (the highest"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_below_high_real_cause_beside_an_old_driver_is_the_one_named_as_next_step() {
+        for (score, tier) in [(60, "LIKELY"), (30, "WEAK")] {
+            let mut report = diagnose(&old_driver_only_exam(), "");
+            assert_eq!(report.matched.len(), 1, "fixture: only the advice row");
+            report.matched.insert(
+                0,
+                Diagnosis {
+                    id: "fix-99-synthetic-real-cause".to_owned(),
+                    title: "A real cause below HIGH_CONFIDENCE".to_owned(),
+                    score,
+                    evidence: vec!["synthetic".to_owned()],
+                    fix: None,
+                },
+            );
+            assert!(score < HIGH_CONFIDENCE);
+            let text = render_report_text(&report, 5);
+            assert!(
+                text.contains(&format!("[{tier} score={score}/100]")),
+                "{text}"
+            );
+            assert!(
+                text.contains("below the HIGH_CONFIDENCE threshold"),
+                "{text}"
+            );
+            assert!(
+                text.contains(
+                    "run `rocm fix fix-99-synthetic-real-cause` (the highest-scoring match)"
+                ),
+                "{text}"
+            );
+            assert!(
+                !text.contains("run `rocm fix fix-22-display-driver-old` (the highest"),
+                "{text}"
+            );
+            // The advice row is still listed, after the real cause.
+            assert!(text.contains("#2 (fix-22-display-driver-old)"), "{text}");
+        }
+    }
+
+    #[test]
+    fn an_old_driver_leaves_the_json_report_as_it_was() {
+        let report = diagnose(&old_driver_only_exam(), "");
+        let json = serde_json::to_value(&report).expect("serialises");
+        assert_eq!(json["has_match"], false);
+        assert_eq!(json["matched"].as_array().map(Vec::len), Some(1));
+        assert_eq!(json["matched"][0]["id"], "fix-22-display-driver-old");
+        assert!(json["route_when_no_match"]["url"].is_string());
+    }
+
+    #[test]
+    fn a_current_display_driver_is_not_flagged() {
+        assert!(old_driver_entry(&windows_driver_exam("32.0.23033.1002", "2026-05-02")).is_none());
+        // Exactly the cutoff day is not older than it.
+        assert!(old_driver_entry(&windows_driver_exam("32.0.1.1", "2023-07-27")).is_none());
+    }
+
+    #[test]
+    fn a_missing_or_unreadable_display_driver_date_never_flags() {
+        for (version, date) in [
+            ("30.0.13014.8", ""),
+            ("", "2021-08-04"),
+            ("", ""),
+            ("30.0.13014.8", "garbage"),
+        ] {
+            assert!(
+                old_driver_entry(&windows_driver_exam(version, date)).is_none(),
+                "{version:?} {date:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_old_display_driver_entry_never_applies_off_windows() {
+        for family in ["linux", "other"] {
+            let mut e = windows_driver_exam("30.0.13014.8", "2021-08-04");
+            e.os_family = family.to_owned();
+            assert!(old_driver_entry(&e).is_none(), "{family}");
+        }
+        let mut wsl = wsl_base();
+        wsl.adrenalin_version = "30.0.13014.8".to_owned();
+        wsl.adrenalin_date = "2021-08-04".to_owned();
+        assert!(old_driver_entry(&wsl).is_none());
+    }
+
+    #[test]
+    fn the_old_display_driver_entry_does_not_change_fix_14() {
+        // fix-14 keeps its meaning: an old date alone must not raise it.
+        let report = diagnose(&windows_driver_exam("30.0.13014.8", "2021-08-04"), "");
+        assert!(
+            report
+                .matched
+                .iter()
+                .all(|d| d.id != "fix-14-adrenalin-too-old")
+        );
+        assert!(!report.has_match());
     }
 }

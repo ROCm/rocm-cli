@@ -133,7 +133,7 @@ impl InstallManagerState {
     }
 
     /// Build the `rocm install sdk …` argv, or an error message.
-    fn build_args(&self) -> Result<Vec<String>, String> {
+    pub(crate) fn build_args(&self) -> Result<Vec<String>, String> {
         let channel = self.channel.trim();
         if channel.is_empty() {
             return Err("channel is required (e.g. release)".to_string());

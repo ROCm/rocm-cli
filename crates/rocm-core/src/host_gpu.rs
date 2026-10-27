@@ -19,7 +19,8 @@
 use crate::{
     AppPaths, LegacyRocmSummary, TheRockFamilyManifest, detect_legacy_rocm_summary,
     detect_managed_therock_family, discover_rocm_installs, examine, hardware_root, host_path,
-    managed_sdk_tool_path, runtime_is_linux, runtime_is_windows, runtime_os_name, unix_time_millis,
+    managed_sdk_tool_path, runtime_is_linux, runtime_is_windows, runtime_os_name,
+    sort_records_newest_install_first, unix_time_millis,
 };
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -33,7 +34,7 @@ use std::time::{Duration, Instant};
 
 const OPTIONAL_COMMAND_TIMEOUT: Duration = Duration::from_millis(1_500);
 const WINDOWS_INVENTORY_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
-const WINDOWS_VIDEO_CONTROLLER_INVENTORY_SCRIPT: &str = r#"$gpus = Get-CimInstance -ClassName Win32_VideoController -Property Name,DriverVersion,PNPDeviceID,AdapterCompatibility | Where-Object { $_.PNPDeviceID -match 'VEN_1002' -or $_.AdapterCompatibility -match 'AMD|Advanced Micro Devices' -or $_.Name -match 'AMD|Radeon|Instinct' }; foreach ($gpu in $gpus) { "GPU`t$($gpu.Name)`t$($gpu.DriverVersion)`t$($gpu.PNPDeviceID)" }"#;
+const WINDOWS_VIDEO_CONTROLLER_INVENTORY_SCRIPT: &str = r#"$gpus = Get-CimInstance -ClassName Win32_VideoController -Property Name,DriverVersion,DriverDate,PNPDeviceID,AdapterCompatibility | Where-Object { $_.PNPDeviceID -match 'VEN_1002' -or $_.AdapterCompatibility -match 'AMD|Advanced Micro Devices' -or $_.Name -match 'AMD|Radeon|Instinct' }; foreach ($gpu in $gpus) { $date = ''; if ($gpu.DriverDate) { $date = $gpu.DriverDate.ToUniversalTime().ToString('yyyy-MM-dd', [System.Globalization.CultureInfo]::InvariantCulture) }; "GPU`t$($gpu.Name)`t$($gpu.DriverVersion)`t$($gpu.PNPDeviceID)`t$date" }"#;
 #[cfg(windows)]
 const WINDOWS_PNP_ENTITY_INVENTORY_SCRIPT: &str = r#"$displayGuid = '{4d36e968-e325-11ce-bfc1-08002be10318}'; $gpus = Get-CimInstance -ClassName Win32_PnPEntity -Property Name,DeviceID,PNPClass,ClassGuid,Manufacturer | Where-Object { (($_.PNPClass -eq 'Display' -or $_.ClassGuid -eq $displayGuid) -and ($_.DeviceID -match 'VEN_1002' -or $_.Name -match 'AMD|Radeon|Instinct|Graphics' -or $_.Manufacturer -match 'AMD|Advanced Micro Devices')) -or ($_.DeviceID -match 'PCI\\VEN_1002' -and $_.Name -match 'Radeon|Instinct|Graphics') }; foreach ($gpu in $gpus) { "GPU`t$($gpu.Name)`t`t$($gpu.DeviceID)" }"#;
 #[cfg(windows)]
@@ -506,17 +507,27 @@ pub(crate) fn detect_local_windows_host_driver() -> WslHostDriverProbe {
     if !runtime_is_windows() {
         return WslHostDriverProbe::Unreachable;
     }
-    let Some(inventory) = detect_windows_examine_inventory() else {
+    // This one reads the driver version, which `pnputil` never reports, so it
+    // asks for the driver facts. It also keeps the CPU and RAM query: on a host
+    // with no AMD adapter that is what makes the inventory non-empty, and an
+    // empty inventory reads as "could not ask" rather than "no adapter". It is
+    // not a startup path.
+    local_windows_host_driver_probe(detect_windows_examine_inventory_with_driver_facts())
+}
+
+/// Map an inventory result to the host-driver answer. `None` means no source
+/// answered; an inventory without an AMD display means the host answered and has
+/// none.
+fn local_windows_host_driver_probe(
+    inventory: Option<WindowsExamineInventory>,
+) -> WslHostDriverProbe {
+    let Some(inventory) = inventory else {
         return WslHostDriverProbe::Unreachable;
     };
-    inventory
-        .preferred_amd_display()
-        .and_then(|display| display.driver_version.as_deref())
-        .map(str::trim)
-        .filter(|version| !version.is_empty())
-        .map_or(WslHostDriverProbe::NoAmdDisplay, |version| {
-            WslHostDriverProbe::Version(version.to_owned())
-        })
+    inventory.amd_display_driver_version().map_or(
+        WslHostDriverProbe::NoAmdDisplay,
+        WslHostDriverProbe::Version,
+    )
 }
 
 /// Ask the Windows host, from inside the distro, which AMD display driver it runs.
@@ -538,13 +549,11 @@ pub(crate) fn detect_wsl_host_driver() -> WslHostDriverProbe {
         return WslHostDriverProbe::Unreachable;
     };
     parse_windows_examine_inventory(&output)
-        .preferred_amd_display()
-        .and_then(|display| display.driver_version.as_deref())
-        .map(str::trim)
-        .filter(|version| !version.is_empty())
-        .map_or(WslHostDriverProbe::NoAmdDisplay, |version| {
-            WslHostDriverProbe::Version(version.to_owned())
-        })
+        .amd_display_driver_version()
+        .map_or(
+            WslHostDriverProbe::NoAmdDisplay,
+            WslHostDriverProbe::Version,
+        )
 }
 
 fn detect_wsl_windows_display_probe_text() -> Option<String> {
@@ -1602,6 +1611,10 @@ pub struct DriverSummary {
     pub policy: String,
     pub status: String,
     pub detail: Option<String>,
+    /// The Windows AMD display driver's version and date, when both the OS is
+    /// Windows and a version was read. `None` everywhere else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub windows: Option<crate::windows_driver::WindowsDriverInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1635,16 +1648,18 @@ struct WindowsExamineInventory {
 struct WindowsDisplayAdapter {
     name: String,
     driver_version: Option<String>,
+    /// `yyyy-MM-dd`, only when the probe gave a date that parses.
+    driver_date: Option<String>,
     pnp_device_id: Option<String>,
 }
 
 impl WindowsExamineInventory {
-    #[cfg(windows)]
+    #[cfg(any(windows, test))]
     const fn is_empty(&self) -> bool {
         self.cpu_model.is_none() && self.system_ram_gib.is_none() && self.displays.is_empty()
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, test))]
     fn merge_missing_from(&mut self, mut other: Self) {
         if self.cpu_model.is_none() {
             self.cpu_model = other.cpu_model.take();
@@ -1673,6 +1688,9 @@ impl WindowsExamineInventory {
                 if existing.driver_version.is_none() {
                     existing.driver_version = display.driver_version;
                 }
+                if existing.driver_date.is_none() {
+                    existing.driver_date = display.driver_date;
+                }
                 if existing.pnp_device_id.is_none() {
                     existing.pnp_device_id = display.pnp_device_id;
                 }
@@ -1688,11 +1706,59 @@ impl WindowsExamineInventory {
         if name.is_empty() {
             return None;
         }
+        // The Microsoft fallback driver is not an AMD driver, so the legacy
+        // `driver_status` and `driver_detail` fields must not report it as one
+        // either (see `amd_display_driver_info`).
+        if crate::windows_driver::is_microsoft_fallback_driver(
+            name,
+            display.driver_version.as_deref().unwrap_or(""),
+        ) {
+            return None;
+        }
         let detail = format!(
             "{name} driver {}",
             display.driver_version.as_deref().unwrap_or("")
         );
         Some(detail.trim().to_owned())
+    }
+
+    /// The preferred AMD adapter's driver version and date, when a version was
+    /// read. `None` when there is no adapter or its version is unknown.
+    ///
+    /// The one place all three commands (`rocm examine`, `rocm install driver`
+    /// and `rocm diagnose`) read the driver from. The Microsoft fallback driver
+    /// is not an AMD driver, so it gives `None` (see
+    /// [`crate::windows_driver::is_microsoft_fallback_driver`]).
+    fn amd_display_driver_info(&self) -> Option<crate::windows_driver::WindowsDriverInfo> {
+        let display = self.preferred_amd_display()?;
+        let version = display.driver_version.as_deref()?;
+        if crate::windows_driver::is_microsoft_fallback_driver(&display.name, version) {
+            return None;
+        }
+        crate::windows_driver::WindowsDriverInfo::from_probe(
+            version,
+            display.driver_date.as_deref().unwrap_or(""),
+        )
+    }
+
+    /// The preferred AMD adapter's driver version, trimmed, or `None` when it has
+    /// none or it is the Microsoft fallback driver, which is not an AMD driver.
+    /// The host-driver probes read it from here so they apply the same
+    /// exclusion as [`Self::amd_display_driver_info`].
+    fn amd_display_driver_version(&self) -> Option<String> {
+        let display = self.preferred_amd_display()?;
+        let version = display.driver_version.as_deref()?.trim();
+        (!version.is_empty()
+            && !crate::windows_driver::is_microsoft_fallback_driver(&display.name, version))
+        .then(|| version.to_owned())
+    }
+
+    /// Whether the preferred AMD adapter still lacks a version or a date, so a
+    /// second query is worth making.
+    #[cfg(any(windows, test))]
+    fn preferred_amd_display_misses_driver_facts(&self) -> bool {
+        self.preferred_amd_display()
+            .is_some_and(|d| d.driver_version.is_none() || d.driver_date.is_none())
     }
 
     fn amd_display_name(&self) -> Option<String> {
@@ -1752,9 +1818,28 @@ impl WindowsExamineInventory {
 }
 
 impl ExamineSummary {
+    /// The full host summary, including the Windows display driver version and
+    /// date. Everything that prints the summary, or serializes it for a client
+    /// (`rocm examine`, the MCP and bridge snapshots), wants this one.
     pub fn gather() -> Result<Self> {
+        Self::gather_scoped(true)
+    }
+
+    /// The host summary without the Windows driver version and date, for a
+    /// caller that reads neither. On an AMD Windows host that skips the
+    /// PowerShell video-controller query `gather` adds for them; the GPU
+    /// target, CPU, RAM and every other field are the same.
+    pub fn gather_without_driver_facts() -> Result<Self> {
+        Self::gather_scoped(false)
+    }
+
+    fn gather_scoped(driver_facts: bool) -> Result<Self> {
         let paths = AppPaths::discover()?;
-        let windows_inventory = detect_windows_examine_inventory();
+        let windows_inventory = if driver_facts {
+            detect_windows_examine_inventory_with_driver_facts()
+        } else {
+            detect_windows_examine_inventory()
+        };
         let wsl = detect_wsl_summary();
         let detected_gfx_target = detect_examine_gfx_target_fast(windows_inventory.as_ref());
         let compatible_therock_family = detected_gfx_target
@@ -1844,7 +1929,7 @@ impl ExamineSummary {
             "false (this run's output is captured, so the CLI will not prompt)"
         };
         format!(
-            "rocm examine\n  os: {}\n  arch: {}\n  kernel: {}\n  distro: {}\n  cpu: {}\n  system_ram: {}\n  interactive_terminal: {}\n  default_engine: {}\n  detected_gfx_target: {}\n  compatible_therock_family: {}\n{}  detected_therock_family: {}\n  driver_policy: {}\n  driver_status: {}\n  driver_detail: {}\n  legacy_rocm_status: {}\n  legacy_rocm_paths: {}\n  legacy_rocm_version: {}\n  legacy_rocm_detail: {}\n  legacy_rocm_guidance: {}\n  wsl: {}\n  wsl_dxg_device: {}\n  wsl_dxcore: {}\n  wsl_librocdxg: {}\n  wsl_rocdxg_dids: {}\n  wsl_ldconfig_librocdxg: {}\n  wsl_global_rocminfo: {}\n  wsl_cargo: {}\n  wsl_detail: {}\n  managed_runtimes: {}\n  managed_services: {}\n  model_cache_entries: {}\n  config_dir: {}\n  data_dir: {}\n  cache_dir: {}\n",
+            "rocm examine\n  os: {}\n  arch: {}\n  kernel: {}\n  distro: {}\n  cpu: {}\n  system_ram: {}\n  interactive_terminal: {}\n  default_engine: {}\n  detected_gfx_target: {}\n  compatible_therock_family: {}\n{}  detected_therock_family: {}\n  driver_policy: {}\n  driver_status: {}\n  driver_detail: {}\n{}  legacy_rocm_status: {}\n  legacy_rocm_paths: {}\n  legacy_rocm_version: {}\n  legacy_rocm_detail: {}\n  legacy_rocm_guidance: {}\n  wsl: {}\n  wsl_dxg_device: {}\n  wsl_dxcore: {}\n  wsl_librocdxg: {}\n  wsl_rocdxg_dids: {}\n  wsl_ldconfig_librocdxg: {}\n  wsl_global_rocminfo: {}\n  wsl_cargo: {}\n  wsl_detail: {}\n  managed_runtimes: {}\n  managed_services: {}\n  model_cache_entries: {}\n  config_dir: {}\n  data_dir: {}\n  cache_dir: {}\n",
             self.os,
             self.arch,
             self.kernel.as_deref().unwrap_or("<unknown>"),
@@ -1865,6 +1950,7 @@ impl ExamineSummary {
             self.driver.policy,
             self.driver.status,
             self.driver.detail.as_deref().unwrap_or("<unknown>"),
+            self.windows_driver_lines(),
             self.legacy_rocm.status,
             legacy_paths,
             self.legacy_rocm.version.as_deref().unwrap_or("<unknown>"),
@@ -1886,6 +1972,22 @@ impl ExamineSummary {
             self.config_dir.display(),
             self.data_dir.display(),
             self.cache_dir.display(),
+        )
+    }
+
+    /// The `driver_version`, `driver_date` and `driver_age` lines. Empty unless
+    /// this is a Windows host where a driver version was read, so other
+    /// platforms print exactly what they printed before.
+    fn windows_driver_lines(&self) -> String {
+        let Some(info) = self.driver.windows.as_ref() else {
+            return String::new();
+        };
+        format!(
+            "  driver_version: {}\n  driver_date: {}\n  driver_age: {}\n",
+            info.version,
+            info.date
+                .map_or_else(|| "<unknown>".to_owned(), |d| d.to_string()),
+            crate::windows_driver::age_summary(info),
         )
     }
 
@@ -2308,16 +2410,10 @@ fn detect_driver_summary_with_windows_inventory(
     wsl: Option<&WslSummary>,
 ) -> DriverSummary {
     if runtime_is_windows() {
-        let detail = windows_inventory
-            .and_then(WindowsExamineInventory::amd_display_driver_detail)
-            .or_else(|| {
-                if windows_inventory.is_none() {
-                    detect_windows_amd_display_driver()
-                } else {
-                    None
-                }
-            });
-        return windows_driver_summary(detail);
+        return windows_driver_summary_from_inventory(
+            windows_inventory,
+            detect_windows_amd_display_driver,
+        );
     }
 
     if let Some(wsl) = wsl {
@@ -2327,10 +2423,33 @@ fn detect_driver_summary_with_windows_inventory(
     detect_driver_summary()
 }
 
+/// The Windows driver summary for an inventory: the detail line and the driver
+/// version and date, both from the same adapter.
+///
+/// Pure apart from `fallback_detail`, which runs only when there is no
+/// inventory at all. The runtime check stays at the one production call site;
+/// everything it feeds is decided here, so tests cover it on every platform.
+fn windows_driver_summary_from_inventory(
+    windows_inventory: Option<&WindowsExamineInventory>,
+    fallback_detail: impl FnOnce() -> Option<String>,
+) -> DriverSummary {
+    let detail = windows_inventory
+        .and_then(WindowsExamineInventory::amd_display_driver_detail)
+        .or_else(|| {
+            if windows_inventory.is_none() {
+                fallback_detail()
+            } else {
+                None
+            }
+        });
+    let info = windows_inventory.and_then(WindowsExamineInventory::amd_display_driver_info);
+    windows_driver_summary(detail, info)
+}
+
 fn detect_driver_summary() -> DriverSummary {
     if runtime_is_windows() {
         let detail = detect_windows_amd_display_driver();
-        return windows_driver_summary(detail);
+        return windows_driver_summary(detail, None);
     }
 
     if runtime_is_linux() {
@@ -2349,6 +2468,7 @@ fn detect_driver_summary() -> DriverSummary {
             } else {
                 None
             },
+            windows: None,
         };
     }
 
@@ -2356,6 +2476,7 @@ fn detect_driver_summary() -> DriverSummary {
         policy: "inspection_only".to_owned(),
         status: "unsupported_platform".to_owned(),
         detail: None,
+        windows: None,
     }
 }
 
@@ -2431,10 +2552,14 @@ fn wsl_driver_summary(wsl: &WslSummary) -> DriverSummary {
         policy: "wsl_rocdxg".to_owned(),
         status: status.to_owned(),
         detail: wsl.detail.clone(),
+        windows: None,
     }
 }
 
-fn windows_driver_summary(detail: Option<String>) -> DriverSummary {
+fn windows_driver_summary(
+    detail: Option<String>,
+    windows: Option<crate::windows_driver::WindowsDriverInfo>,
+) -> DriverSummary {
     DriverSummary {
         policy: "windows_validate_only".to_owned(),
         status: if detail.is_some() {
@@ -2443,6 +2568,7 @@ fn windows_driver_summary(detail: Option<String>) -> DriverSummary {
             "not_detected".to_owned()
         },
         detail,
+        windows,
     }
 }
 
@@ -2462,32 +2588,161 @@ const fn detect_windows_amd_display_driver() -> Option<String> {
     None
 }
 
+/// Which optional queries one inventory run may start.
+///
+/// The display list always comes from the cheapest source that has it. These
+/// choose what is added on top, so a caller that never shows the driver version
+/// or date does not start a process for it.
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, Copy)]
+struct InventoryScope {
+    /// Fill a missing CPU model or RAM size from a system query.
+    system: bool,
+    /// Ask the video controller for the preferred adapter's driver version and
+    /// date when the first source lacks them.
+    driver_facts: bool,
+}
+
+#[cfg(any(windows, test))]
+impl InventoryScope {
+    /// Startup and engine-selection paths (`detect_host_gpu_summary_fast`, chat
+    /// host facts): no driver facts. `pnputil`, the first
+    /// source, never reports them, so asking for them would start a PowerShell
+    /// process on every AMD host each time.
+    const FAST: Self = Self {
+        system: true,
+        driver_facts: false,
+    };
+    /// `rocm examine` and `rocm install driver`, which print the driver.
+    const SUMMARY: Self = Self {
+        system: true,
+        driver_facts: true,
+    };
+    /// `rocm diagnose`, which needs the driver but not the CPU or RAM.
+    const DRIVER_ONLY: Self = Self {
+        system: false,
+        driver_facts: true,
+    };
+}
+
+/// The queries an inventory is built from, so a test can count which ones run.
+#[cfg(any(windows, test))]
+trait WindowsInventorySources {
+    fn pnputil(&mut self) -> Option<WindowsExamineInventory>;
+    fn video_controller(&mut self) -> Option<WindowsExamineInventory>;
+    fn pnp_entity(&mut self) -> Option<WindowsExamineInventory>;
+    fn system(&mut self) -> Option<WindowsExamineInventory>;
+}
+
 #[cfg(windows)]
-fn detect_windows_examine_inventory() -> Option<WindowsExamineInventory> {
-    if !runtime_is_windows() {
-        return None;
+struct LiveWindowsInventorySources;
+
+#[cfg(windows)]
+impl WindowsInventorySources for LiveWindowsInventorySources {
+    fn pnputil(&mut self) -> Option<WindowsExamineInventory> {
+        detect_windows_examine_inventory_from_pnputil()
     }
+    fn video_controller(&mut self) -> Option<WindowsExamineInventory> {
+        detect_windows_examine_inventory_from_video_controller()
+    }
+    fn pnp_entity(&mut self) -> Option<WindowsExamineInventory> {
+        detect_windows_examine_inventory_from_pnp_entity()
+    }
+    fn system(&mut self) -> Option<WindowsExamineInventory> {
+        detect_windows_system_inventory_from_cim()
+    }
+}
+
+#[cfg(any(windows, test))]
+fn assemble_windows_inventory(
+    sources: &mut impl WindowsInventorySources,
+    scope: InventoryScope,
+) -> Option<WindowsExamineInventory> {
     let mut inventory = WindowsExamineInventory::default();
-    if let Some(pnp_util) = detect_windows_examine_inventory_from_pnputil() {
+    if let Some(pnp_util) = sources.pnputil() {
         inventory.merge_missing_from(pnp_util);
     }
-    if inventory.displays.is_empty()
-        && let Some(video) = detect_windows_examine_inventory_from_video_controller()
-    {
-        inventory.merge_missing_from(video);
+    let mut video_asked = false;
+    if inventory.displays.is_empty() {
+        video_asked = true;
+        if let Some(video) = sources.video_controller() {
+            inventory.merge_missing_from(video);
+        }
     }
     if inventory.displays.is_empty()
-        && let Some(pnp) = detect_windows_examine_inventory_from_pnp_entity()
+        && let Some(pnp) = sources.pnp_entity()
     {
         inventory.merge_missing_from(pnp);
     }
-    if (inventory.cpu_model.is_none() || inventory.system_ram_gib.is_none())
-        && let Some(system) = detect_windows_system_inventory_from_cim()
+    // `pnputil` lists the adapter but not its driver version or date. Only a
+    // caller that shows them asks the video controller for the two facts, and
+    // only when something is still missing and that query has not just run.
+    if scope.driver_facts
+        && !video_asked
+        && inventory.preferred_amd_display_misses_driver_facts()
+        && let Some(video) = sources.video_controller()
+    {
+        inventory.merge_missing_from(video);
+    }
+    if scope.system
+        && (inventory.cpu_model.is_none() || inventory.system_ram_gib.is_none())
+        && let Some(system) = sources.system()
     {
         inventory.merge_missing_from(system);
     }
 
     (!inventory.is_empty()).then_some(inventory)
+}
+
+/// The inventory for startup and engine selection. Starts no query for the
+/// driver version or date; see [`InventoryScope::FAST`].
+#[cfg(windows)]
+fn detect_windows_examine_inventory() -> Option<WindowsExamineInventory> {
+    if !runtime_is_windows() {
+        return None;
+    }
+    assemble_windows_inventory(&mut LiveWindowsInventorySources, InventoryScope::FAST)
+}
+
+/// The inventory for `rocm examine` and `rocm install driver`, with the
+/// driver version and date filled in where the first source lacks them.
+#[cfg(windows)]
+fn detect_windows_examine_inventory_with_driver_facts() -> Option<WindowsExamineInventory> {
+    if !runtime_is_windows() {
+        return None;
+    }
+    assemble_windows_inventory(&mut LiveWindowsInventorySources, InventoryScope::SUMMARY)
+}
+
+/// The inventory for a caller that needs the display driver but not the CPU
+/// or RAM.
+#[cfg(windows)]
+fn detect_windows_driver_inventory() -> Option<WindowsExamineInventory> {
+    if !runtime_is_windows() {
+        return None;
+    }
+    assemble_windows_inventory(
+        &mut LiveWindowsInventorySources,
+        InventoryScope::DRIVER_ONLY,
+    )
+}
+
+#[cfg(not(windows))]
+const fn detect_windows_driver_inventory() -> Option<WindowsExamineInventory> {
+    None
+}
+
+/// The AMD display driver as `rocm examine` reports it, for `rocm diagnose`.
+///
+/// Uses the inventory pipeline and adapter selection of `ExamineSummary::gather`.
+/// Separate calls can observe different inventory results or probe failures.
+pub(crate) fn detect_windows_amd_driver_info() -> Option<crate::windows_driver::WindowsDriverInfo> {
+    detect_windows_driver_inventory()?.amd_display_driver_info()
+}
+
+#[cfg(not(windows))]
+const fn detect_windows_examine_inventory_with_driver_facts() -> Option<WindowsExamineInventory> {
+    None
 }
 
 #[cfg(windows)]
@@ -2602,10 +2857,17 @@ fn parse_windows_examine_inventory(text: &str) -> WindowsExamineInventory {
                     .map(str::trim)
                     .filter(|value| !value.is_empty())
                     .map(str::to_owned);
+                // Optional fifth field. A value that is not a date is dropped,
+                // so an unreadable date is never mistaken for an old one.
+                let driver_date = fields
+                    .next()
+                    .and_then(crate::windows_driver::CalendarDate::parse)
+                    .map(|date| date.to_string());
                 if !name.is_empty() || driver_version.is_some() || pnp_device_id.is_some() {
                     inventory.displays.push(WindowsDisplayAdapter {
                         name,
                         driver_version,
+                        driver_date,
                         pnp_device_id,
                     });
                 }
@@ -2689,6 +2951,7 @@ fn push_windows_pnputil_display(
     inventory.displays.push(WindowsDisplayAdapter {
         name: display_name,
         driver_version: driver,
+        driver_date: None,
         pnp_device_id: pnp,
     });
 }
@@ -3122,7 +3385,7 @@ pub(crate) fn managed_therock_sdk_probe_candidates(
     let Ok(entries) = fs::read_dir(registry_dir) else {
         return Vec::new();
     };
-    let mut candidates = Vec::new();
+    let mut records = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|value| value.to_str()) != Some("json") {
@@ -3137,28 +3400,28 @@ pub(crate) fn managed_therock_sdk_probe_candidates(
         if !record.looks_like_therock() {
             continue;
         }
-        let Some(sdk) = record.rocm_sdk else {
-            continue;
-        };
-        if !sdk.import_ok {
+        let sdk_ready = record
+            .rocm_sdk
+            .as_ref()
+            .is_some_and(|sdk| sdk.import_ok && sdk.root_path.is_some() && sdk.bin_path.is_some());
+        if !sdk_ready {
             continue;
         }
-        let Some(root_path) = sdk.root_path else {
-            continue;
-        };
-        let Some(bin_path) = sdk.bin_path else {
-            continue;
-        };
-        candidates.push(TheRockSdkProbeCandidate {
-            installed_at_unix_ms: record.installed_at_unix_ms.unwrap_or(0),
-            site_packages: sdk.site_packages,
-            root_path,
-            bin_path,
-            library_paths: sdk.library_paths,
-        });
+        records.push((path, record));
     }
-    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.installed_at_unix_ms));
-    candidates
+    sort_records_newest_install_first(&mut records);
+    records
+        .into_iter()
+        .filter_map(|(_, record)| {
+            let sdk = record.rocm_sdk?;
+            Some(TheRockSdkProbeCandidate {
+                site_packages: sdk.site_packages,
+                root_path: sdk.root_path?,
+                bin_path: sdk.bin_path?,
+                library_paths: sdk.library_paths,
+            })
+        })
+        .collect()
 }
 
 fn managed_sdk_ld_library_path(candidate: &TheRockSdkProbeCandidate) -> Option<OsString> {
@@ -3256,7 +3519,6 @@ pub(crate) fn collect_sdk_library_paths(root: &Path, paths: &mut Vec<PathBuf>) {
 
 #[derive(Debug, Clone)]
 pub(crate) struct TheRockSdkProbeCandidate {
-    installed_at_unix_ms: u128,
     site_packages: Option<PathBuf>,
     pub(crate) root_path: PathBuf,
     bin_path: PathBuf,
@@ -3320,6 +3582,54 @@ mod tests {
             Some("gfx1201".to_owned())
         );
         fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn managed_therock_sdk_probe_candidates_break_install_time_ties_on_the_runtime_key()
+    -> Result<()> {
+        // Same shape as the amd-smi and active-runtime fallback tie tests: both
+        // pairings of file name and runtime key, so a read-order pick is wrong
+        // in one of them.
+        for (first_file_key, second_file_key) in [("aaa", "bbb"), ("bbb", "aaa")] {
+            let temp_root = std::env::temp_dir().join(format!(
+                "rocm-cli-sdk-probe-tie-{first_file_key}-{}-{}",
+                std::process::id(),
+                unix_time_millis()
+            ));
+            let registry_dir = temp_root.join("runtimes/registry");
+            fs::create_dir_all(&registry_dir)?;
+            for (file, key) in [("first", first_file_key), ("second", second_file_key)] {
+                let root = temp_root.join(key);
+                let bin = root.join("bin");
+                fs::create_dir_all(&bin)?;
+                fs::write(
+                    registry_dir.join(format!("{file}.json")),
+                    serde_json::to_vec(&serde_json::json!({
+                        "runtime_key": key,
+                        "runtime_id": "therock-stable:gfx94X-dcgpu",
+                        "installed_at_unix_ms": 2_000_u128,
+                        "rocm_sdk": {
+                            "import_ok": true,
+                            "root_path": root,
+                            "bin_path": bin,
+                        },
+                    }))?,
+                )?;
+            }
+
+            let candidates = managed_therock_sdk_probe_candidates(&registry_dir);
+            let expected_bin_path = temp_root.join("aaa").join("bin");
+            let _ = fs::remove_dir_all(&temp_root);
+
+            assert_eq!(
+                candidates
+                    .first()
+                    .map(|candidate| candidate.bin_path.clone()),
+                Some(expected_bin_path),
+                "files first={first_file_key}, second={second_file_key}"
+            );
+        }
         Ok(())
     }
 
@@ -4619,6 +4929,7 @@ Class Name:                Display
                 policy: "windows_validate_only".to_owned(),
                 status: "amd_display_driver_detected".to_owned(),
                 detail: Some("AMD Radeon driver 1.2.3".to_owned()),
+                windows: None,
             },
             legacy_rocm: LegacyRocmSummary {
                 status: "detected_unmanaged".to_owned(),
@@ -4674,7 +4985,43 @@ Class Name:                Display
                 policy: "windows_validate_only".to_owned(),
                 status: "amd_display_driver_detected".to_owned(),
                 detail: None,
+                windows: None,
             },
+            legacy_rocm: LegacyRocmSummary {
+                status: "not_detected".to_owned(),
+                paths: Vec::new(),
+                detail: None,
+                version: None,
+            },
+            wsl: None,
+            managed_runtime_count: 0,
+            managed_service_count: 0,
+            model_cache_entries: 0,
+            config_dir: PathBuf::from("config"),
+            data_dir: PathBuf::from("data"),
+            cache_dir: PathBuf::from("cache"),
+        }
+    }
+
+    fn windows_summary_with_driver(
+        info: Option<crate::windows_driver::WindowsDriverInfo>,
+    ) -> ExamineSummary {
+        ExamineSummary {
+            os: "windows".to_owned(),
+            arch: "x86_64".to_owned(),
+            kernel: None,
+            distro: None,
+            cpu: None,
+            system_ram_gib: None,
+            interactive_terminal: false,
+            default_engine: "lemonade".to_owned(),
+            detected_gfx_target: None,
+            compatible_therock_family: None,
+            detected_therock_family: None,
+            driver: windows_driver_summary(
+                Some("AMD Radeon(TM) Graphics driver 30.0.13014.8".to_owned()),
+                info,
+            ),
             legacy_rocm: LegacyRocmSummary {
                 status: "not_detected".to_owned(),
                 paths: Vec::new(),
@@ -4730,6 +5077,428 @@ Class Name:                Display
     }
 
     #[test]
+    fn examine_shows_the_windows_driver_version_date_and_age() {
+        let old = windows_summary_with_driver(
+            crate::windows_driver::WindowsDriverInfo::from_probe("30.0.13014.8", "2021-08-04"),
+        )
+        .render_text();
+        assert!(old.contains("  driver_version: 30.0.13014.8\n"));
+        assert!(old.contains("  driver_date: 2021-08-04\n"));
+        assert!(old.contains("  driver_age: older than the first HIP SDK for Windows"));
+        assert!(old.contains(crate::windows_driver::DISPLAY_DRIVER_OLD_FIX_ID));
+        assert!(old.contains("not established"));
+
+        let current = windows_summary_with_driver(
+            crate::windows_driver::WindowsDriverInfo::from_probe("32.0.23033.1002", "2026-05-02"),
+        )
+        .render_text();
+        assert!(current.contains("  driver_version: 32.0.23033.1002\n"));
+        assert!(current.contains("  driver_age: not older than"));
+        assert!(!current.contains(crate::windows_driver::DISPLAY_DRIVER_OLD_FIX_ID));
+
+        let undated = windows_summary_with_driver(
+            crate::windows_driver::WindowsDriverInfo::from_probe("30.0.13014.8", ""),
+        )
+        .render_text();
+        assert!(undated.contains("  driver_date: <unknown>\n"));
+        assert!(undated.contains("  driver_age: unknown"));
+        assert!(!undated.contains(crate::windows_driver::DISPLAY_DRIVER_OLD_FIX_ID));
+    }
+
+    #[test]
+    fn examine_prints_no_driver_age_lines_when_no_version_was_read() {
+        let rendered = windows_summary_with_driver(None).render_text();
+        assert!(!rendered.contains("driver_version:"));
+        assert!(!rendered.contains("driver_age:"));
+        assert!(rendered.contains("driver_detail: AMD Radeon(TM) Graphics driver"));
+    }
+
+    /// The CIM driver date is a local-time `DateTime` for an instant that is
+    /// midnight UTC, so formatting it unconverted gives the previous day west of
+    /// UTC and would flag a driver dated exactly on the cutoff. This pins the
+    /// script text only; the behaviour was checked by converting a real
+    /// `DriverDate` into a UTC-8 zone in PowerShell (previous day without the
+    /// conversion, the INF day with it).
+    #[test]
+    fn the_inventory_script_formats_the_driver_date_in_utc() {
+        assert!(WINDOWS_VIDEO_CONTROLLER_INVENTORY_SCRIPT.contains(
+            "$gpu.DriverDate.ToUniversalTime().ToString('yyyy-MM-dd', [System.Globalization.CultureInfo]::InvariantCulture)"
+        ));
+    }
+
+    #[test]
+    fn the_inventory_parser_reads_the_driver_date_and_drops_a_bad_one() {
+        let inventory = parse_windows_examine_inventory(
+            "GPU\tAMD Radeon(TM) Graphics\t30.0.13014.8\tPCI\\VEN_1002&DEV_1636\t2021-08-04\n",
+        );
+        let info = inventory.amd_display_driver_info().expect("info");
+        assert_eq!(info.version, "30.0.13014.8");
+        assert_eq!(
+            info.date.map(|d| d.to_string()).as_deref(),
+            Some("2021-08-04")
+        );
+
+        let bad = parse_windows_examine_inventory(
+            "GPU\tAMD Radeon(TM) Graphics\t30.0.13014.8\tPCI\\VEN_1002&DEV_1636\tnot a date\n",
+        );
+        assert_eq!(bad.amd_display_driver_info().expect("info").date, None);
+
+        let no_date = parse_windows_examine_inventory(
+            "GPU\tAMD Radeon(TM) Graphics\t30.0.13014.8\tPCI\\VEN_1002&DEV_1636\n",
+        );
+        assert_eq!(no_date.amd_display_driver_info().expect("info").date, None);
+    }
+
+    #[test]
+    fn an_adapter_missing_its_version_asks_for_a_second_query() {
+        let from_pnputil = parse_windows_examine_inventory(
+            "GPU\tAMD Radeon(TM) Graphics\t\tPCI\\VEN_1002&DEV_1636\n",
+        );
+        assert!(from_pnputil.preferred_amd_display_misses_driver_facts());
+        let complete = parse_windows_examine_inventory(
+            "GPU\tAMD Radeon(TM) Graphics\t30.0.13014.8\tPCI\\VEN_1002&DEV_1636\t2021-08-04\n",
+        );
+        assert!(!complete.preferred_amd_display_misses_driver_facts());
+    }
+
+    #[test]
+    fn a_version_less_adapter_gives_no_driver_info_and_is_filled_from_the_video_controller() {
+        // The pnputil shape: the adapter is listed with no driver version.
+        let mut inventory = parse_windows_examine_inventory(
+            "GPU\tAMD Radeon(TM) Graphics\t\tPCI\\VEN_1002&DEV_1636\n",
+        );
+        assert_eq!(inventory.amd_display_driver_info(), None);
+        assert_eq!(
+            inventory.amd_display_driver_detail().as_deref(),
+            Some("AMD Radeon(TM) Graphics driver")
+        );
+        // The video controller answers with the same adapter id.
+        inventory.merge_missing_from(parse_windows_examine_inventory(
+            "GPU\tAMD Radeon(TM) Graphics\t30.0.13014.8\tPCI\\VEN_1002&DEV_1636\t2021-08-04\n",
+        ));
+        assert_eq!(
+            inventory.amd_display_driver_detail().as_deref(),
+            Some("AMD Radeon(TM) Graphics driver 30.0.13014.8")
+        );
+        let info = inventory.amd_display_driver_info().expect("filled");
+        assert_eq!(
+            info.date.map(|d| d.to_string()).as_deref(),
+            Some("2021-08-04")
+        );
+        assert_eq!(
+            inventory.displays.len(),
+            1,
+            "the adapter must not duplicate"
+        );
+    }
+
+    // --- the one probe result behind examine, install driver and diagnose ---
+
+    const IGPU_OLD: &str =
+        "GPU\tAMD Radeon(TM) Graphics\t30.0.13014.8\tPCI\\VEN_1002&DEV_1636\t2021-08-04\n";
+    const DGPU_CURRENT: &str =
+        "GPU\tAMD Radeon RX 6600\t32.0.23033.1002\tPCI\\VEN_1002&DEV_73E0\t2026-05-02\n";
+
+    /// Counts the queries an inventory run starts, and answers each with canned
+    /// text. `pnputil` answers like the real one: adapters, no driver facts.
+    #[derive(Default)]
+    struct CountingSources {
+        pnputil: Option<&'static str>,
+        video: Option<&'static str>,
+        pnp_entity: Option<&'static str>,
+        system: Option<&'static str>,
+        calls: Vec<&'static str>,
+    }
+
+    impl CountingSources {
+        fn answer(text: Option<&'static str>) -> Option<WindowsExamineInventory> {
+            text.map(parse_windows_examine_inventory)
+        }
+    }
+
+    impl WindowsInventorySources for CountingSources {
+        fn pnputil(&mut self) -> Option<WindowsExamineInventory> {
+            self.calls.push("pnputil");
+            Self::answer(self.pnputil)
+        }
+        fn video_controller(&mut self) -> Option<WindowsExamineInventory> {
+            self.calls.push("video");
+            Self::answer(self.video)
+        }
+        fn pnp_entity(&mut self) -> Option<WindowsExamineInventory> {
+            self.calls.push("pnp_entity");
+            Self::answer(self.pnp_entity)
+        }
+        fn system(&mut self) -> Option<WindowsExamineInventory> {
+            self.calls.push("system");
+            Self::answer(self.system)
+        }
+    }
+
+    const PNPUTIL_ONLY: &str = "GPU\tAMD Radeon RX 6600\t\tPCI\\VEN_1002&DEV_73E0\n";
+
+    fn pnputil_host() -> CountingSources {
+        CountingSources {
+            pnputil: Some(PNPUTIL_ONLY),
+            video: Some(DGPU_CURRENT),
+            system: Some("CPU\tAMD Ryzen 5 5600\nRAM\t17179869184\n"),
+            ..CountingSources::default()
+        }
+    }
+
+    #[test]
+    fn the_startup_paths_do_not_start_the_driver_fact_query() {
+        let mut sources = pnputil_host();
+        let inventory =
+            assemble_windows_inventory(&mut sources, InventoryScope::FAST).expect("an inventory");
+        assert!(
+            !sources.calls.contains(&"video"),
+            "the fast paths run on every `rocm serve`, chat start and engine pick, and must not start a PowerShell query for a date they never print: {:?}",
+            sources.calls
+        );
+        // The behaviour that follows: no version, so nothing to flag or print.
+        assert_eq!(inventory.amd_display_driver_info(), None);
+    }
+
+    /// `gather_without_driver_facts` is `gather` minus the driver version and
+    /// date: the GPU target a caller reads is the same, and it never carries a
+    /// driver record the full summary lacks. That it starts no PowerShell query
+    /// for them is the `the_startup_paths_do_not_start_the_driver_fact_query`
+    /// test, which counts the sources the same scope runs.
+    #[test]
+    fn the_summary_without_driver_facts_keeps_the_gpu_target() {
+        let full = ExamineSummary::gather().expect("full summary");
+        let lean = ExamineSummary::gather_without_driver_facts().expect("lean summary");
+        assert_eq!(lean.os, full.os);
+        assert_eq!(lean.detected_gfx_target, full.detected_gfx_target);
+        assert_eq!(
+            lean.compatible_therock_family,
+            full.compatible_therock_family
+        );
+        assert!(
+            lean.driver.windows.is_none() || lean.driver.windows == full.driver.windows,
+            "{:?} vs {:?}",
+            lean.driver.windows,
+            full.driver.windows
+        );
+    }
+
+    #[test]
+    fn the_summary_path_starts_the_driver_fact_query_once() {
+        let mut sources = pnputil_host();
+        let inventory = assemble_windows_inventory(&mut sources, InventoryScope::SUMMARY)
+            .expect("an inventory");
+        assert_eq!(
+            sources.calls.iter().filter(|c| **c == "video").count(),
+            1,
+            "{:?}",
+            sources.calls
+        );
+        let info = inventory.amd_display_driver_info().expect("filled");
+        assert_eq!(info.version, "32.0.23033.1002");
+    }
+
+    /// A host that answers but has no AMD adapter reads as `NoAmdDisplay`; a host
+    /// where no source answers reads as `Unreachable`. The CPU and RAM answer is
+    /// what makes the first inventory non-empty, so the local host-driver check
+    /// has to keep that query (a `DRIVER_ONLY` run on the same host is empty and
+    /// reads as unreachable).
+    #[test]
+    fn the_local_host_driver_probe_tells_no_adapter_from_no_answer() {
+        let no_adapter = || CountingSources {
+            system: Some("CPU\tIntel Core i7\nRAM\t17179869184\n"),
+            ..CountingSources::default()
+        };
+        let mut answered = no_adapter();
+        assert_eq!(
+            local_windows_host_driver_probe(assemble_windows_inventory(
+                &mut answered,
+                InventoryScope::SUMMARY
+            )),
+            WslHostDriverProbe::NoAmdDisplay
+        );
+        let mut driver_only = no_adapter();
+        assert_eq!(
+            assemble_windows_inventory(&mut driver_only, InventoryScope::DRIVER_ONLY).map(|_| ()),
+            None,
+            "DRIVER_ONLY asks for no system data, so this host reads as empty"
+        );
+        let mut silent = CountingSources::default();
+        assert_eq!(
+            local_windows_host_driver_probe(assemble_windows_inventory(
+                &mut silent,
+                InventoryScope::SUMMARY
+            )),
+            WslHostDriverProbe::Unreachable
+        );
+        let mut with_adapter = pnputil_host();
+        assert_eq!(
+            local_windows_host_driver_probe(assemble_windows_inventory(
+                &mut with_adapter,
+                InventoryScope::SUMMARY
+            )),
+            WslHostDriverProbe::Version("32.0.23033.1002".to_owned())
+        );
+    }
+
+    #[test]
+    fn the_diagnose_path_gets_the_driver_without_the_cpu_and_ram_query() {
+        let mut sources = pnputil_host();
+        let inventory = assemble_windows_inventory(&mut sources, InventoryScope::DRIVER_ONLY)
+            .expect("an inventory");
+        assert!(!sources.calls.contains(&"system"), "{:?}", sources.calls);
+        assert!(inventory.amd_display_driver_info().is_some());
+    }
+
+    #[test]
+    fn a_complete_first_source_needs_no_second_query_and_none_repeats_one() {
+        let mut complete = CountingSources {
+            pnputil: Some(DGPU_CURRENT),
+            ..CountingSources::default()
+        };
+        assemble_windows_inventory(&mut complete, InventoryScope::SUMMARY);
+        assert!(!complete.calls.contains(&"video"), "{:?}", complete.calls);
+
+        // No adapter from `pnputil`: the video controller is the first source,
+        // and a second ask for the same facts would repeat it.
+        let mut empty_first = CountingSources {
+            video: Some(PNPUTIL_ONLY),
+            ..CountingSources::default()
+        };
+        assemble_windows_inventory(&mut empty_first, InventoryScope::SUMMARY);
+        assert_eq!(
+            empty_first.calls.iter().filter(|c| **c == "video").count(),
+            1,
+            "{:?}",
+            empty_first.calls
+        );
+    }
+
+    /// A version without a date is the shape the date-only branch exists for:
+    /// `|| d.driver_date.is_none()` in the predicate.
+    #[test]
+    fn an_adapter_with_a_version_and_no_date_still_asks_for_the_date() {
+        let version_only = parse_windows_examine_inventory(
+            "GPU\tAMD Radeon RX 6600\t32.0.23033.1002\tPCI\\VEN_1002&DEV_73E0\n",
+        );
+        assert!(version_only.preferred_amd_display_misses_driver_facts());
+
+        let mut sources = CountingSources {
+            pnputil: Some("GPU\tAMD Radeon RX 6600\t32.0.23033.1002\tPCI\\VEN_1002&DEV_73E0\n"),
+            video: Some(DGPU_CURRENT),
+            ..CountingSources::default()
+        };
+        let inventory = assemble_windows_inventory(&mut sources, InventoryScope::SUMMARY)
+            .expect("an inventory");
+        assert!(sources.calls.contains(&"video"), "{:?}", sources.calls);
+        let info = inventory.amd_display_driver_info().expect("info");
+        assert_eq!(
+            info.date.map(|d| d.to_string()).as_deref(),
+            Some("2026-05-02")
+        );
+    }
+
+    /// The runtime check stays at the call site; what it feeds is decided here,
+    /// so it is covered on every platform. Replacing the driver info with `None`
+    /// in this function fails this test.
+    #[test]
+    fn the_windows_summary_carries_the_driver_from_the_inventory() {
+        let inventory = parse_windows_examine_inventory(IGPU_OLD);
+        let summary = windows_driver_summary_from_inventory(Some(&inventory), || {
+            panic!("an inventory was given, so the fallback must not run")
+        });
+        let info = summary.windows.expect("the driver reaches the summary");
+        assert_eq!(info.version, "30.0.13014.8");
+        assert!(matches!(
+            info.age(),
+            crate::windows_driver::DriverAge::Predates(_)
+        ));
+        assert_eq!(summary.status, "amd_display_driver_detected");
+
+        // No inventory: the fallback detail is used and there is no version.
+        let none = windows_driver_summary_from_inventory(None, || {
+            Some("AMD Radeon(TM) Graphics driver".to_owned())
+        });
+        assert_eq!(none.windows, None);
+        assert_eq!(none.status, "amd_display_driver_detected");
+    }
+
+    /// An integrated GPU with an old driver and a supported discrete GPU with a
+    /// recent one: `preferred_amd_display` picks the discrete card, and the
+    /// examine text, the install text and the diagnose result all report it.
+    #[test]
+    fn examine_install_and_diagnose_read_the_same_adapter_on_a_two_adapter_host() {
+        // The iGPU is listed first, which is where a first-match query stops.
+        let inventory = parse_windows_examine_inventory(&format!("{IGPU_OLD}{DGPU_CURRENT}"));
+        let summary = windows_driver_summary_from_inventory(Some(&inventory), || None);
+        let info = summary.windows.expect("a driver");
+        assert_eq!(info.version, "32.0.23033.1002", "the discrete GPU's driver");
+
+        // examine
+        let examine_text = windows_summary_with_driver(Some(info.clone())).render_text();
+        assert!(
+            examine_text.contains("  driver_date: 2026-05-02\n"),
+            "{examine_text}"
+        );
+        assert!(!examine_text.contains(crate::windows_driver::DISPLAY_DRIVER_OLD_FIX_ID));
+
+        // install driver
+        let install = crate::windows_driver::install_driver_summary(Some(&info));
+        assert!(install.contains("outdated: no"), "{install}");
+
+        // diagnose, fed the same probe result
+        let mut exam = crate::examine::Examination {
+            os_family: "windows".to_owned(),
+            ..crate::examine::Examination::default()
+        };
+        exam.set_windows_driver(inventory.amd_display_driver_info().as_ref());
+        assert_eq!(exam.adrenalin_version, "32.0.23033.1002");
+        assert_eq!(exam.adrenalin_date, "2026-05-02");
+        let report = crate::run_diagnose(&exam, "");
+        assert!(
+            report
+                .matched
+                .iter()
+                .all(|d| d.id != crate::windows_driver::DISPLAY_DRIVER_OLD_FIX_ID),
+            "the old iGPU driver must not be raised when the discrete GPU is chosen"
+        );
+    }
+
+    /// Windows loads the Microsoft Basic Display Adapter when no AMD driver is
+    /// installed. It keeps the AMD vendor id, and its placeholder 2006 date is
+    /// after the year-2000 guard. Inputs are recalled from how Windows reports
+    /// it, not observed on a Windows machine.
+    #[test]
+    fn the_microsoft_basic_display_adapter_is_not_an_old_amd_driver() {
+        for text in [
+            "GPU\tMicrosoft Basic Display Adapter\t10.0.26100.1\tPCI\\VEN_1002&DEV_73E0\t2006-06-21\n",
+            // Named like an AMD adapter, with the operating system's version.
+            "GPU\tAMD Radeon RX 6600\t10.0.19041.3636\tPCI\\VEN_1002&DEV_73E0\t2006-06-21\n",
+            // The name alone, with a version that does not look like the OS's.
+            "GPU\tMicrosoft Basic Display Adapter\t1.0.0.0\tPCI\\VEN_1002&DEV_73E0\t2006-06-21\n",
+        ] {
+            let inventory = parse_windows_examine_inventory(text);
+            assert!(inventory.preferred_amd_display().is_some(), "{text}");
+            assert_eq!(inventory.amd_display_driver_info(), None, "{text}");
+            // The WSL and local host-driver probes read the same exclusion, so
+            // a fallback driver is "no AMD display", not an installed version.
+            assert_eq!(
+                local_windows_host_driver_probe(Some(inventory.clone())),
+                WslHostDriverProbe::NoAmdDisplay,
+                "{text}"
+            );
+            let summary = windows_driver_summary_from_inventory(Some(&inventory), || None);
+            assert_eq!(summary.windows, None, "{text}");
+            // The legacy status and detail agree: no AMD driver is detected.
+            assert_eq!(summary.status, "not_detected", "{text}");
+            assert_eq!(summary.detail, None, "{text}");
+            let rendered = windows_summary_with_driver(summary.windows).render_text();
+            assert!(!rendered.contains("driver_age:"), "{rendered}");
+            assert!(!rendered.contains(crate::windows_driver::DISPLAY_DRIVER_OLD_FIX_ID));
+        }
+    }
+
+    #[test]
     fn examine_render_explains_what_interactive_terminal_means() {
         // The same machine reports `true` from a shell and `false` under the
         // dashboard, because the field describes the invocation rather than the
@@ -4751,6 +5520,7 @@ Class Name:                Display
                 policy: "linux_official_amd_dkms_wrapper".to_owned(),
                 status: "amdgpu_available".to_owned(),
                 detail: None,
+                windows: None,
             },
             legacy_rocm: LegacyRocmSummary {
                 status: "not_detected".to_owned(),
@@ -4804,6 +5574,7 @@ Class Name:                Display
                 policy: "linux_official_amd_dkms_wrapper".to_owned(),
                 status: "amdgpu_available".to_owned(),
                 detail: None,
+                windows: None,
             },
             legacy_rocm: LegacyRocmSummary {
                 status: "detected_unmanaged".to_owned(),

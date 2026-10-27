@@ -30,6 +30,26 @@ Feature: Driver installation planning
     When the user previews driver installation for a ROCDXG release with no known digest
     Then the driver plan refuses rather than installing an unverified package
 
+  # Windows has no driver install: the command reports the AMD display driver it
+  # finds and promises to change nothing. The promise is checked as state, not
+  # only as text: the plan lists no command and no installer state is written.
+  # Nothing here names a driver. The report is held to what `rocm examine
+  # --json` reads on the same machine, so it holds on a machine with an old
+  # driver and on one with a current driver. An old driver's `outdated: yes`
+  # branch needs such a machine and is not exercised here.
+  @id:driver-install-windows-reports-and-changes-nothing @requires-os:windows
+  Scenario: driver-install-04 - On Windows the driver install reports the display driver and changes nothing
+    When the user asks to install the driver on this Windows host
+    Then the CLI says that no driver is installed or changed
+    And no driver command is shown or run, and no installer state is written
+    And it describes the display driver the inspection reports
+
+  @id:driver-install-windows-approval-changes-nothing @requires-os:windows
+  Scenario: driver-install-05 - On Windows approving the driver install still changes nothing
+    When the user approves the driver install on this Windows host
+    Then the CLI says that no driver is installed or changed
+    And no driver command is shown or run, and no installer state is written
+
   # Every bare-metal Linux lane in this repo runs Ubuntu, but not always the
   # same release -- the hosted `E2E tests` job's `ubuntu-26.04` image reports
   # 26.04 ("resolute"), which `build_driver_install_plan_at` routes to the
@@ -47,7 +67,7 @@ Feature: Driver installation planning
   # release the lane happens to run rather than hard-coding an apt-arm
   # premise a lane can silently outgrow.
   @id:driver-install-bare-metal-host-plan @requires-os:linux @requires-bare-metal
-  Scenario: driver-install-04 - Previewing the driver install on a real bare-metal host plans release-appropriate driver setup
+  Scenario: driver-install-06 - Previewing the driver install on a real bare-metal host plans release-appropriate driver setup
     When the user previews driver installation on this host
     Then the driver plan matches this host's actual Ubuntu release
 
@@ -59,8 +79,8 @@ Feature: Driver installation planning
   # checks `examine.wsl.is_wsl` and returns the WSL/ROCDXG plan before this override is
   # ever resolved, so a WSL host has no premise here (it would hit
   # `wsl_rocdxg_driver_plan` regardless of the override and the scenario would
-  # fail by construction) -- same WSL-vs-bare-metal split as driver-install-04.
+  # fail by construction) -- same WSL-vs-bare-metal split as driver-install-06.
   @id:driver-install-invalid-version-override-refused @requires-os:linux @requires-bare-metal
-  Scenario: driver-install-05 - An invalid ROCM_CLI_AMDGPU_DRIVER_VERSION override refuses the plan
+  Scenario: driver-install-07 - An invalid ROCM_CLI_AMDGPU_DRIVER_VERSION override refuses the plan
     When the user previews driver installation with an invalid version override
     Then the driver plan refuses the invalid version override and plans no commands

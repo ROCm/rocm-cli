@@ -127,6 +127,93 @@ child write the file instead, so this process never holds a write fd on it. The
 same applies to E2E steps: scenarios run concurrently in one process, and the
 `rocm` child that runs the shim can be the one refused.
 
+### Advised commands must parse
+
+`apps/rocm/src/advised_commands.rs` checks the `rocm`/`rocmd` commands that the
+CLI and its docs tell a user to run against the real parser. It is a text
+scanner: it finds commands by a leading `rocm ` or `rocmd ` word in these
+places, and checks only what it finds:
+
+- the `--help` of every visible command: lines that start with a command
+  (EXAMPLES rows) and inline backtick spans
+- production Rust string literals: backtick spans, literals that start with a
+  command, and labelled lines such as `next step: rocm …`. Whole-line `//`
+  comments, items gated on `cfg(test)` or `cfg(all(test, …))`, and whole
+  files declared only as test modules (following `#[path]`) are skipped; a
+  trailing `// …` comment or a `/* … */` block on a line of code is still
+  scanned.
+- `README.md`, `docs/` and `skills/`: inline backtick spans and fenced
+  code-block lines
+- the VHS tapes under `docs/tapes/`
+
+Each line is split into the commands of a shell list (at `&&`, `||`, `;` and a
+`|` standing between spaces, but not inside quotes, `<…>`, `[…]` or `{…}`), and
+every command that runs `rocm` or `rocmd` is checked; commands for other tools
+are skipped. A command ends at a shell comment, a redirection, or where
+trailing prose starts (` (`, ` —`, ` → `, ` then `). A double space does not
+end it, except on an indented EXAMPLES row, where the description column
+follows one.
+
+It fills in placeholders such as `<model>` and `{}`, drops one that stands for
+options described elsewhere (`<case-appropriate options above>`), tries each
+`[--flag]` group and `a|b` alternative (a nested group such as
+`[--restart-services [--yes]]` is tried with and without its inner part), then
+routes each command the way `rocm` itself does. `rocmd` commands go through
+`rocmd`'s own parser, with nothing run.
+These fail the test:
+
+- a command that clap rejects
+- a command that ends up at the natural-language planner, unless the advice
+  itself is a multi-word request: its first request word is a quoted request
+  (`rocm "start a local model"`) or a placeholder that names one
+  (`rocm --yes <natural language request>`). Only the first word counts, as in
+  real routing, and a placeholder filled in with several words does not count,
+  so a removed subcommand that took a text argument (`frobnicate <TEXT>`,
+  `frobnicate "two words"`) still fails.
+- a command that leaves out a required argument or subcommand, when it is a
+  line meant to be run as written: a fenced code line, a string literal that
+  starts with a command, a labelled `next step:`/`Try:` line, or a help
+  EXAMPLES row
+
+Only an inline backtick span in prose (``pass `rocm serve --engine` ``) may name
+a command without its values, or a command that marks the gap with `…`.
+
+`every_source_is_scanned` requires each of the four sources to still yield a
+named command (the `rocm examine` EXAMPLES row, the dashboard's `rocm update`
+literal, README's fenced `rocm install sdk` and inline `rocm examine`, the CLI
+tape's `rocm examine`) and a minimum count per source and surface, so a broken
+extractor cannot pass silently.
+
+Known gaps of the text scanner. Advice written these ways is not checked, or
+not checked as written:
+
+- a Rust raw string (`r#"…"#`) or a string literal that spans lines without a
+  trailing `\` is not read as one literal
+- a backtick span that wraps across lines in a Rust string is not seen
+  (Markdown and `--help` text join wrapped spans; Rust source does not)
+- an EXAMPLES row in `--help` that wraps onto a second line is checked only up
+  to the wrap (clap is built without `wrap_help`, so this happens only where an
+  author breaks the line)
+- a `{` or `}` inside a string in a `#[cfg(test)]` item can end the skipped
+  item early or late
+- templated advice whose verb is a format argument (the `services` hint in
+  `service_hints.rs`, whose verb is `{action}`, and the `runtimes` retry line
+  in `runtime_services.rs`, whose subcommand is `{command}`) is excluded and
+  checked through the functions that build it instead
+- separate optional groups are tried one at a time, never together (they can
+  be mutually exclusive, as in `rocm dash [--demo] [--replay <file>]`), so a
+  command that fails only when flags from two of them are combined is not
+  caught
+
+When it fails, fix the advice (or the CLI). Add text to `NOT_INVOCATIONS`, with
+a reason, only when the text starts with `rocm` but is not advice to run
+anything, such as a log line or an error message that names the command. To see
+every command it found and the result for each:
+
+```bash
+cargo test -p rocm --bin rocm advised_commands::dump_advised_invocations -- --ignored --nocapture
+```
+
 Run the cross-platform smoke test:
 
 ```bash
@@ -614,8 +701,9 @@ The running guard is tested against a ComfyUI answering on its port
 (`starting`).
 
 The e2e scenarios `comfyui-05` to `comfyui-13`
-([comfyui.feature](../tests/e2e-cucumber/features/comfyui.feature), Linux, no
-GPU) cover the same through the built binary: what is kept, replaced and left
+([comfyui.feature](../tests/e2e-cucumber/features/comfyui.feature), no GPU;
+only `comfyui-08`, `-11` and `-12` stay Linux-only, the rest also run on
+Windows) cover the same through the built binary: what is kept, replaced and left
 in place (also when the saved run state is unreadable), a failed download, the
 dry run, a reinstall refused while ComfyUI runs (which the dry run says
 first, and which is refused before anything is downloaded), `start` refusing a half-replaced folder until the command it names is
@@ -1157,6 +1245,56 @@ while unsupported Linux IDs remain non-mutating instead of guessed. The
 reconcile path is also non-privileged. It refreshes passive checks and persists
 the `total`/`present`/`missing` check summary without running DKMS commands.
 
+Windows display driver checks (`fix-22-display-driver-old`) are covered by unit
+tests, because the Linux CI lane cannot simulate a Windows host:
+
+```bash
+cargo test -p rocm-core -- windows_driver:: windows_driver_fills windows_driver_version_date \
+  display_driver old_driver driver_age driver_fact driver_date driver_from_the_inventory \
+  driver_without_the_cpu second_query version_less no_date basic_display same_adapter \
+  local_host_driver_probe formats_the_driver_date_in_utc diagnosis_remediation_matches_the_fix_catalog_for_shared_fix_ids \
+  needs_reboot_true_fix_ids_match_the_known_set every_recipe_id_is_unique_and_covers_the_catalog
+cargo test -p rocm --bin rocm -- windows_install_driver should_execute_never \
+  the_fix_id_the_install_text planners_describe the_chat_entry the_production_planner provider_plans
+```
+
+The filters are plain name fragments, because the tests sit in five modules and
+share no prefix. They match the fix-22 and driver-age tests, the install-driver
+planner tests, and some neighbouring inventory tests (for example the startup
+paths that must not start the driver query). After adding or renaming one of
+these tests, check the set with the same arguments and `-- --list`.
+
+The `rocm install driver` tests assert the printed version, date, verdict and fix
+id together with the fact that the plan has no commands and stays non-mutating,
+with or without `--yes`. A `no` verdict is asserted together with the sentence
+that the date cannot judge newer GPUs such as gfx1151.
+
+Four `@requires-os:windows` scenarios run on the Windows GPU lane
+(`e2e-gpu-strix-windows`): `examine-29` in
+[examine.feature](../tests/e2e-cucumber/features/examine.feature),
+`diagnose-41` in
+[diagnose.feature](../tests/e2e-cucumber/features/diagnose.feature), and
+`driver-install-04` and `driver-install-05` in
+[driver_install.feature](../tests/e2e-cucumber/features/driver_install.feature).
+They name no driver. The inspection, diagnosis and unapproved install scenarios
+compare their output with `rocm examine --json` on the same machine:
+the version, date and `driver_age` lines match the JSON, the verdict follows the
+date, `rocm install driver` prints that the driver install changes nothing and
+writes no installer state, with or without `--yes`, and `fix-22-display-driver-old`
+appears in `rocm diagnose` only for an old driver. The old-driver branch is
+covered by these scenarios but needs a machine whose display driver is dated
+before 27 July 2023, the value of `FIRST_HIP_SDK_FOR_WINDOWS` in
+[windows_driver.rs](../crates/rocm-core/src/windows_driver.rs). Unit tests cover
+that branch.
+
+Run these scenarios only on Windows. Cucumber's `-n` and `-t` filters replace
+this harness's platform filter, so selecting a Windows scenario by name or tag
+on Linux runs it against Linux behavior instead of skipping it. The Windows
+install steps also require a native Windows build before any CLI invocation.
+[driver_host_guard.rs](../tests/e2e-cucumber/tests/driver_host_guard.rs) checks
+that ordering without running an installer. Do not run these scenarios on a
+non-Windows host.
+
 Provider audit focused test:
 
 ```bash
@@ -1243,6 +1381,32 @@ cargo test -p rocm --bin rocm render_update_text_reports_all_update_surfaces
 `rocm update` must report runtime checks plus CLI, engine, and model-recipe
 surfaces honestly. `rocm update --apply` remains runtime-only until production
 metadata feeds exist for the other surfaces.
+
+Runtime version-ordering tests:
+
+```bash
+cargo test -p rocm --bin rocm version_proptests
+cargo xtask e2e -- -n 'update-0[78]'
+```
+
+Where `rocm install sdk` and `rocm update` compare runtime versions, they
+compare them in one PEP 440 order over published version strings (`7.9` <
+`7.10.0`, `7.0.0b1` < `7.0.0rc1` < `7.0.0` < `7.0.0.post1`, `7.2.4.70204` above
+`7.2.4`). That covers picking the newest ROCm version from a wheel index,
+breaking ties between tarball builds uploaded at the same time, and the
+update-or-not verdict. It does not decide everything on its own: tarball builds
+are picked by upload time first, and on the release channel only a stable
+version in the strict `X.Y.Z` shape is a candidate at all, so a four-component
+release such as `7.2.4.70204` is never picked there. The property tests check
+that the order is total, that picks do not depend on the order the index lists
+versions in, and that the update verdict points the same way as the order. Two
+spellings of one version (`7.0.0-rc1` and `7.0.0rc1`) are not offered as an
+update for a tarball runtime; a wheel runtime for an exact device target,
+installed under one spelling, can still report `repair_available` against an
+index that publishes the other,
+because its runtime key and package specs carry the index's spelling.
+`generator_reach_report` prints how often each hard case is generated (run it
+with `-- --nocapture`), and fails if the generator stops reaching them.
 
 Model recipe engine metadata checks:
 
@@ -1608,7 +1772,7 @@ falling back, since it is interpolated into privileged shell commands:
 cargo test -p rocm --bin rocm driver_install
 ```
 
-`driver-install-04` in
+`driver-install-06` in
 [driver_install.feature](../tests/e2e-cucumber/features/driver_install.feature)
 asserts whichever plan a real bare-metal Linux host actually produces: the apt
 repo file and signing key on a release with a published
@@ -1621,7 +1785,7 @@ DKMS repo (the amdgpu driver ships in-tree instead), so the plan comes back
 covered at the unit level by
 `driver_plan_ubuntu_2604_uses_native_archive_guidance` and its two neighbors in
 [driver_install.rs](../apps/rocm/src/driver_install.rs), and at the e2e level
-by `driver-install-04` above: the hosted `E2E tests` job's `ubuntu-26.04` image
+by `driver-install-06` above: the hosted `E2E tests` job's `ubuntu-26.04` image
 reaches this arm through the CLI itself, while the self-hosted GPU lane's
 24.04 host exercises the apt arm instead.
 
@@ -1923,3 +2087,39 @@ afterwards. `engine`/`engine_version` carry the same distinction: a host a
 probe found no engine on reports `"engine": "none"`, while a host whose engine
 probe never ran (skipped rather than completed) reports `"engine": "unknown"`,
 since a probe that never ran cannot say an engine is absent.
+
+### The same report from the dashboard
+
+The dashboard offers this report on its Diagnose screen. It calls the CLI and
+shows what the CLI prints, so there is nothing to compare by hand except the
+flow.
+
+Open the screen from the Observe tab with `d`, or from the ROCm tab by choosing
+the Diagnose verb and pressing `Enter`. Both open the card and run nothing yet.
+The bare `rocm` launcher's Diagnose & fix entry is different. It starts
+`rocm examine` at once, and `p` is ignored while that console runs, so wait for
+the examine result, then press `p`.
+
+1. On the card, or after the examine result, press `p`. The console runs
+   `rocm diagnose --report --json` and shows the report, or the refusal
+   envelope. Nothing is sent at this step.
+2. Press `Enter` or `Esc` to leave the console. The card starts with "A report is
+   ready" for a report, or with the CLI's own explanation for a refusal. A
+   refusal offers no way to send, and neither does output that could not be read.
+3. Press `s`. An approval shows the report again, with the default button on
+   Deny. `n`, `Esc`, `q`, or `Enter` on Deny starts nothing.
+4. Press `y`, or move to Approve and press `Enter`. The console runs
+   `rocm diagnose --report --send` and shows the CLI's own outcome: a mail
+   client opened, or the address and link printed. The same environment rules
+   as above decide which, so `ROCM_NO_BROWSER=1 rocm dash` forces the printed
+   form on a desktop.
+
+The send examines the machine again. If the machine changed between the preview
+and the approve, the mail carries the second result. The send console prints the
+report again, and the mail client shows the full content before the mail is sent.
+On a WSL host the preview always shows the `platform-not-probed` refusal, so the
+approve path needs a host with an approved architecture. The unit tests in
+[examine_manager.rs](../crates/rocm-dash-tui/src/ui/examine_manager.rs) cover that
+path everywhere. They also cover a report taller than the approval dialog, which
+scrolls with PgUp, PgDn, Home and End and says when more is below, and a preview
+or send that is already running, which starts nothing and says so.

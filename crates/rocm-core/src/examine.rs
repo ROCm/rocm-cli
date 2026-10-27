@@ -331,6 +331,10 @@ pub struct Examination {
     pub hipinfo_present: bool,
     pub hipinfo_status: String,
     pub adrenalin_version: String,
+    /// The display driver's date as `yyyy-MM-dd`. Empty when it was not read
+    /// or did not parse as a date; an empty date is never treated as old.
+    #[serde(default)]
+    pub adrenalin_date: String,
     pub msvc_redist_present: Option<bool>,
     /// File version of the Visual C++ runtime in `System32`, for example
     /// `14.29.30133.0`. When `msvcp140.dll` and `vcruntime140.dll` differ, the
@@ -441,6 +445,7 @@ impl Default for Examination {
             hipinfo_present: false,
             hipinfo_status: String::new(),
             adrenalin_version: String::new(),
+            adrenalin_date: String::new(),
             msvc_redist_present: None,
             msvc_redist_version: String::new(),
             framework: "unknown".to_owned(),
@@ -481,6 +486,18 @@ pub enum FrameworkProbe {
 }
 
 impl Examination {
+    /// Record the AMD display driver from a read of the Windows device
+    /// inventory, which chooses the adapter the same way `rocm examine` and
+    /// `rocm install driver` do. Each command makes its own read. `None` leaves
+    /// the fields empty, which no check treats as an old driver.
+    pub fn set_windows_driver(&mut self, info: Option<&crate::windows_driver::WindowsDriverInfo>) {
+        let Some(info) = info else {
+            return;
+        };
+        self.adrenalin_version.clone_from(&info.version);
+        self.adrenalin_date = info.date.map(|d| d.to_string()).unwrap_or_default();
+    }
+
     /// Probe the host and return the examination. Never fails; probe errors are
     /// recorded in `probe_failures`/`notes` and the relevant fields are left at
     /// their defaults (matching `examine.py`'s degrade-gracefully behavior).
@@ -3270,18 +3287,11 @@ fn fill_unidentified_gpus_from_hipinfo(gpus: &mut [Gpu], hipinfo_stdout: &str) {
     }
 }
 
+/// Fill the driver fields from the same inventory and adapter choice that
+/// `rocm diagnose` and `rocm install driver` use, so the three commands read one
+/// fact.
 fn probe_adrenalin_windows(e: &mut Examination) {
-    let script = "(Get-CimInstance Win32_VideoController | Where-Object { $_.PNPDeviceID -match 'VEN_1002' -or $_.Name -match 'AMD|Radeon|Instinct' } | Select-Object -First 1).DriverVersion";
-    let (rc, out, _) = run("powershell", &["-NoProfile", "-Command", script], MEDIUM);
-    if rc == 0 && !out.trim().is_empty() {
-        e.adrenalin_version = out
-            .trim()
-            .lines()
-            .next()
-            .unwrap_or_default()
-            .trim()
-            .to_owned();
-    }
+    e.set_windows_driver(crate::host_gpu::detect_windows_amd_driver_info().as_ref());
 }
 
 fn probe_msvc_redist_windows(e: &mut Examination) {
@@ -4268,6 +4278,9 @@ mod tests {
             "hipinfo_present",
             "hipinfo_status",
             "adrenalin_version",
+            // CLI addition beyond examine.py, added deliberately: the driver
+            // date, so an old display driver can be told from a current one.
+            "adrenalin_date",
             "msvc_redist_present",
             "msvc_redist_version",
             "framework",
@@ -4324,6 +4337,27 @@ mod tests {
         ] {
             assert_eq!(parse_dotted_version(bad), None, "{bad:?}");
         }
+    }
+
+    #[test]
+    fn the_windows_driver_fills_version_and_date_and_none_changes_nothing() {
+        let mut e = Examination::default();
+        e.set_windows_driver(None);
+        assert_eq!(
+            (e.adrenalin_version.as_str(), e.adrenalin_date.as_str()),
+            ("", "")
+        );
+        let info =
+            crate::windows_driver::WindowsDriverInfo::from_probe("30.0.13014.8", "2021-08-04");
+        e.set_windows_driver(info.as_ref());
+        assert_eq!(e.adrenalin_version, "30.0.13014.8");
+        assert_eq!(e.adrenalin_date, "2021-08-04");
+        // An unreadable date stays empty, never reaching the check as text.
+        let undated = crate::windows_driver::WindowsDriverInfo::from_probe("30.0.13014.8", "soon");
+        let mut e = Examination::default();
+        e.set_windows_driver(undated.as_ref());
+        assert_eq!(e.adrenalin_version, "30.0.13014.8");
+        assert_eq!(e.adrenalin_date, "");
     }
 
     #[test]
