@@ -354,6 +354,10 @@ pub fn unix_time_millis() -> u128 {
 /// temp file and losing one of the two updates.
 ///
 /// Not guaranteed:
+/// - Serializing writers: this takes no lock, so two read-modify-write
+///   cycles that overlap still lose one update (last rename wins). A caller
+///   whose new content depends on the old must hold a lock across the whole
+///   cycle, as the JSONL proposal store does (`automation::jsonl_lock_path`).
 /// - Durability: the bytes are not fsynced before the rename, so a power
 ///   loss can still surface the new name with unflushed contents.
 /// - Replacing a destination another process holds open without delete
