@@ -244,9 +244,10 @@ pub struct Examination {
     pub has_discrete_amd: bool,
 
     // driver / runtime (Linux)
-    /// amdgpu is present: listed as a module, or `/sys/module/amdgpu` exists,
-    /// which it does whether amdgpu is loaded as a module or built into the
-    /// kernel (where it never appears in `lsmod`).
+    /// amdgpu is present: listed as a module, or registered as a PCI driver
+    /// (`/sys/bus/pci/drivers/amdgpu`), which it is whether amdgpu is loaded
+    /// as a module or built into the kernel (where it never appears in
+    /// `lsmod`).
     pub amdgpu_loaded: Option<bool>,
     pub amdgpu_blacklisted_in: Vec<String>,
     /// kfd is available: as a separate `amdkfd` module on kernels before 4.20
@@ -1842,10 +1843,12 @@ fn kfd_present_on_host() -> bool {
 
 /// Whether the amdgpu driver is present on this host, loaded or built in.
 ///
-/// A built-in driver is absent from the module list, but the kernel still
-/// registers `/sys/module/amdgpu` for it, exactly as it does for a loaded one.
+/// A built-in driver is absent from the module list. `/sys/module/amdgpu` is
+/// no answer: the kernel creates it for a built-in driver at an early initcall,
+/// before `amdgpu_init` can bail out (`nomodeset`, `amdgpu.modeset=0`). The PCI
+/// driver directory exists only once `amdgpu_init` registered the driver.
 fn amdgpu_present_on_host() -> bool {
-    crate::host_path("/sys/module/amdgpu").exists()
+    crate::host_path("/sys/bus/pci/drivers/amdgpu").exists()
 }
 
 /// Whether `name` is loaded or built in: listed in the module list, or present
@@ -6520,7 +6523,7 @@ mod tests {
     /// The host side of the check, against a planted root.
     #[cfg(all(feature = "e2e-test-hooks", target_os = "linux"))]
     #[test]
-    fn amdgpu_present_on_host_reads_sysfs_module_dir() {
+    fn amdgpu_present_on_host_reads_the_pci_driver_dir() {
         use crate::hardware_root::TEST_HOST_ROOT_ENV;
         use crate::test_env::RestoredEnvVar;
 
@@ -6532,23 +6535,31 @@ mod tests {
                 .map_or(0, |d| d.as_nanos())
         ));
         std::fs::create_dir_all(&root).expect("create root");
-        let (neither, planted) = {
+        let (neither, module_dir_only, planted) = {
             let _guard = crate::hardware_root::HOST_ROOT_TEST_LOCK
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let _root = RestoredEnvVar::set(TEST_HOST_ROOT_ENV, &root);
             let neither = amdgpu_present_on_host();
+            // The module directory a built-in driver keeps even when it never
+            // bound: not evidence.
             std::fs::create_dir_all(root.join("sys/module/amdgpu")).expect("plant sysfs");
-            (neither, amdgpu_present_on_host())
+            let module_dir_only = amdgpu_present_on_host();
+            std::fs::create_dir_all(root.join("sys/bus/pci/drivers/amdgpu")).expect("plant sysfs");
+            (neither, module_dir_only, amdgpu_present_on_host())
         };
         std::fs::remove_dir_all(&root).ok();
         assert!(!neither, "an empty root has no amdgpu");
-        assert!(planted, "/sys/module/amdgpu counts");
+        assert!(
+            !module_dir_only,
+            "/sys/module/amdgpu alone is not a bound driver"
+        );
+        assert!(planted, "/sys/bus/pci/drivers/amdgpu counts");
     }
 
     /// The wiring, not just the helpers: `probe_modules` must consult the host
     /// root. The `amdgpu` module line cannot be planted away on a machine that
-    /// has one, so this only asserts the positive: with `/sys/module/amdgpu`
+    /// has one, so this only asserts the positive: with `/sys/bus/pci/drivers/amdgpu`
     /// planted the field is `Some(true)` whatever the module list says.
     #[cfg(all(feature = "e2e-test-hooks", target_os = "linux"))]
     #[test]
@@ -6563,7 +6574,7 @@ mod tests {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_nanos())
         ));
-        std::fs::create_dir_all(root.join("sys/module/amdgpu")).expect("plant sysfs");
+        std::fs::create_dir_all(root.join("sys/bus/pci/drivers/amdgpu")).expect("plant sysfs");
         let amdgpu_loaded = {
             let _guard = crate::hardware_root::HOST_ROOT_TEST_LOCK
                 .lock()

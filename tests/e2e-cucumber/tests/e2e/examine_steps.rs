@@ -1544,7 +1544,7 @@ async fn assert_kfd_not_loaded(world: &mut E2eWorld) {
     assert_eq!(json["amdkfd_loaded"], serde_json::json!(false), "{json:#}");
 }
 
-/// A simulated host root with `/sys/module/amdgpu` and a `lsmod` that lists
+/// A simulated host root with `/sys/bus/pci/drivers/amdgpu` and a `lsmod` that lists
 /// neither `amdgpu` nor `amdkfd`: amdgpu built into the kernel. A ROCm install
 /// (`ROCM_PATH`) and a `mokutil` reporting Secure Boot enabled are planted too,
 /// so the three `rocm diagnose` evidence lines that read `amdgpu_loaded` have
@@ -1558,8 +1558,8 @@ async fn machine_with_built_in_amdgpu(world: &mut E2eWorld) {
         .path()
         .to_owned();
     let host = root.join("host-root");
-    std::fs::create_dir_all(host.join("sys/module/amdgpu"))
-        .expect("failed to plant /sys/module/amdgpu");
+    std::fs::create_dir_all(host.join("sys/bus/pci/drivers/amdgpu"))
+        .expect("failed to plant /sys/bus/pci/drivers/amdgpu");
     let rocm = root.join("rocm");
     std::fs::create_dir_all(rocm.join(".info")).expect("failed to plant a ROCm install");
     std::fs::write(rocm.join(".info/version"), "6.4.1\n").expect("failed to plant its version");
@@ -1626,7 +1626,7 @@ async fn assert_no_amdgpu_fault_evidence(world: &mut E2eWorld) {
             !line.contains("amdgpu module is not loaded")
                 && !line.contains("DKMS failed")
                 && !line.contains("Secure Boot is enabled and amdgpu didn't load"),
-            "amdgpu was reported missing though /sys/module/amdgpu exists: {line}"
+            "amdgpu was reported missing though the amdgpu PCI driver is registered: {line}"
         );
     }
 }

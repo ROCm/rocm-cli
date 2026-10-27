@@ -483,7 +483,7 @@ Feature: GPU detection and system inspection
 
   # amdgpu built into the kernel is absent from `lsmod` too, so it was read as
   # "module not loaded" and `rocm diagnose` scored that, plus a DKMS failure
-  # and Secure Boot, as evidence. `/sys/module/amdgpu` exists for a loaded
+  # and Secure Boot, as evidence. `/sys/bus/pci/drivers/amdgpu` exists for a loaded
   # module and a built-in driver alike. The machine also has a ROCm install
   # and Secure Boot enabled, so the evidence lines are reachable if the flag
   # regresses.
