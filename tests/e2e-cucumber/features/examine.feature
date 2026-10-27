@@ -493,3 +493,13 @@ Feature: GPU detection and system inspection
     When the user inspects and diagnoses that machine
     Then the inspection reports amdgpu as loaded
     And the diagnosis cites no missing amdgpu module, DKMS failure or Secure Boot evidence
+
+  # With no module list at all (`lsmod` fails and `/proc/modules` is empty),
+  # the kernel's kfd interfaces still answer: kfd is linked into amdgpu, so
+  # `/dev/kfd` reports both drivers as loaded rather than leaving them unknown.
+  @id:examine-reports-drivers-from-kfd-without-a-module-list @requires-os:linux
+  Scenario: examine-34 - The inspection reports kfd and amdgpu from the kernel's kfd node when no module list can be read
+    Given a machine whose kernel exposes kfd but whose module list cannot be read
+    When the user inspects that machine in machine-readable form
+    Then the inspection reports kfd as loaded
+    And the inspection reports amdgpu as loaded

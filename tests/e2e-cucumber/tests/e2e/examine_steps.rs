@@ -1532,6 +1532,33 @@ async fn machine_without_kfd(world: &mut E2eWorld) {
     plant_machine_without_amdkfd_module(world, false);
 }
 
+/// A simulated host root with `/dev/kfd`, no `/proc/modules`, and a `lsmod`
+/// on `PATH` that fails: no module list can be read at all.
+#[given("a machine whose kernel exposes kfd but whose module list cannot be read")]
+async fn machine_with_kfd_and_no_module_list(world: &mut E2eWorld) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .to_owned();
+    let host = root.join("host-root");
+    std::fs::create_dir_all(host.join("dev")).expect("failed to create planted /dev");
+    std::fs::write(host.join("dev/kfd"), "").expect("failed to plant /dev/kfd");
+    let bin = root.join("fake-bin");
+    std::fs::create_dir_all(&bin).expect("failed to create the fake PATH dir");
+    rocm_core::fake_executable::write_fake_executable(&bin.join("lsmod"), "#!/bin/sh\nexit 1\n")
+        .expect("failed to write the fake lsmod");
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .expect("PATH entries cannot hold a separator");
+    world.command_env.push(("PATH", path));
+    world
+        .command_env
+        .push(("ROCM_CLI_TEST_HOST_ROOT", host.into_os_string()));
+}
+
 #[then("the inspection reports kfd as loaded")]
 async fn assert_kfd_loaded(world: &mut E2eWorld) {
     let json = parsed_json(world);
