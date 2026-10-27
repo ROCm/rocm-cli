@@ -337,9 +337,11 @@ pub fn unix_time_millis() -> u128 {
         .as_millis()
 }
 
-/// Replace `path`'s content by writing a sibling temp file and renaming it
-/// over the destination: an interrupted write (full disk, crash, killed
-/// process) can never leave a truncated file in place, and a reader sees
+/// Replace `path`'s content with `bytes`, atomically.
+///
+/// Writes a sibling temp file and renames it over the destination: an
+/// interrupted write (full disk, crash, killed process) can never leave a
+/// truncated file in place, and a reader sees
 /// either the old content or the new content. The destination is NOT removed
 /// first: `fs::rename` replaces an existing file on both supported platforms
 /// (it is `MoveFileEx` with `MOVEFILE_REPLACE_EXISTING` on Windows), and
@@ -359,7 +361,7 @@ pub fn unix_time_millis() -> u128 {
 /// - Replacing a destination another process holds open without delete
 ///   sharing: on Windows the rename then fails with a sharing violation,
 ///   this returns that error, and the old destination stays in place.
-pub(crate) fn write_atomic(path: &Path, bytes: &[u8], tmp_ext: &str) -> Result<()> {
+pub fn write_atomic(path: &Path, bytes: &[u8], tmp_ext: &str) -> Result<()> {
     let tmp_path = path.with_extension(format!(
         "{tmp_ext}.tmp-{}-{}",
         unix_time_millis(),

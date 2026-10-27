@@ -1059,6 +1059,26 @@ and Lemonade on non-Windows are all fully supported. Teaching the Windows
 detached-spawn primitive to carry a value-typed override (so Windows Lemonade can
 serve public with auth) is tracked as a separate follow-up.
 
+Lemonade backend pin restore focused tests (the restore after a kept alignment
+pin stops installing; `docs/engine-plugins.md`, section "Lemonade backend
+alignment on engine install"):
+
+```bash
+cargo test -p rocm-engine-lemonade restore
+cargo test -p rocm-engine-lemonade equal_pin
+cargo test -p rocm-engine-lemonade failed_retry
+```
+
+They assert each warning together with the real state it describes: the pin
+file, the ROCm backend directories (including a partial build the first attempt
+left), and that a missing or mismatched cached archive triggers no download.
+No Gherkin scenario covers the restore: it needs a runtime tree that already
+holds a stale pin and a live backend download, which only a gated hardware lane
+has. The Windows Strix Halo e2e lane's prewarm step (`rocm engines install
+lemonade` against the shared tree) reaches the restore only on a runner whose
+shared tree still holds a stale pin; on a healthy runner the install succeeds and
+the restore never runs, so a green lane does not show that it works.
+
 Engine recipe adapter contract focused tests:
 
 ```bash

@@ -293,6 +293,23 @@ in `MSVCP140.dll`), the Visual C++ runtime on the machine is probably older than
 fix-21-msvc-redist-outdated` prints the update plan and changes nothing. After
 the update, restart Lemonade and repeat the serve command above.
 
+To check the recovery from a stale Lemonade backend pin (Windows or Linux with
+a managed Lemonade runtime already installed and an active managed ROCm SDK):
+the recovery only runs when the pinned `therock.version` equals the active
+SDK's version; with no active SDK, or a different version, the install takes
+other paths and simply fails or realigns. Edit
+`resources/backend_versions.json` in the Lemonade runtime tree so that
+`therock.version` is the active SDK's version and `llamacpp.rocm-stable` is a
+build tag Lemonade does not ship, add an unrelated key, remove the installed
+ROCm backend directory under `bin/llamacpp/`, and run
+`rocm engines install lemonade`. Expected result:
+
+- A warning says the pinned llama.cpp backend could not be installed and that the
+  pins Lemonade ships were restored; the command exits 0 and installs the
+  packaged backend.
+- `therock.version` and `llamacpp.rocm-stable` in `backend_versions.json` hold the
+  packaged values again, and the unrelated key is still there.
+
 While the log stream is attached, verify detach and stop behave differently:
 
 - Press `Ctrl+D`. The stream ends and the shell prompt returns, printing a
