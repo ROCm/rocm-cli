@@ -1128,6 +1128,37 @@ async fn assert_unnamed_gpu_is_apu(world: &mut E2eWorld) {
     );
 }
 
+#[then("the inspection classifies the kernel-only GPU as an APU")]
+async fn assert_kernel_only_gpu_is_apu(world: &mut E2eWorld) {
+    let json = parsed_json(world);
+    assert_eq!(
+        json.get("has_apu").and_then(serde_json::Value::as_bool),
+        Some(true),
+        "with no PCI entry the kernel target is the only evidence, and it names an APU:\n{json:#}"
+    );
+    assert_eq!(
+        json.get("has_discrete_amd")
+            .and_then(serde_json::Value::as_bool),
+        Some(false),
+        "an APU must not be tallied as a discrete card:\n{json:#}"
+    );
+    let gpu = json
+        .get("gpus")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|gpus| gpus.first())
+        .unwrap_or_else(|| panic!("the inspection listed no GPU:\n{json:#}"));
+    assert_eq!(
+        gpu.get("is_apu").and_then(serde_json::Value::as_bool),
+        Some(true),
+        "the entry the kernel topology supplied has to carry the verdict:\n{gpu:#}"
+    );
+    assert_eq!(
+        gpu.get("gfx_target").and_then(serde_json::Value::as_str),
+        Some("gfx1151"),
+        "the node's target has to reach the entry it classifies:\n{gpu:#}"
+    );
+}
+
 #[then("the inspection lists the code object manager libraries it found")]
 async fn assert_comgr_copies_reported(world: &mut E2eWorld) {
     assert_eq!(
@@ -1564,6 +1595,51 @@ fn plant_unnamed_apu_fixtures(world: &mut E2eWorld) {
          [AMD/ATI] Device [1002:1586] (rev cb)'\n",
     )
     .expect("failed to write the fake lspci");
+    rocm_core::fake_executable::write_fake_executable(&bin.join("rocminfo"), "#!/bin/sh\nexit 0\n")
+        .expect("failed to write the fake rocminfo");
+    put_fake_bin_first_on_path(world, &bin);
+    world.command_env.push((
+        "ROCM_CLI_TEST_HOST_ROOT",
+        root.join("host-root").into_os_string(),
+    ));
+}
+
+#[given("a machine whose kernel exposes an APU the PCI scan cannot see")]
+async fn kernel_only_apu_machine(world: &mut E2eWorld) {
+    plant_kernel_only_apu_fixtures(world);
+}
+
+/// The host shape `rocm examine` exists for: ROCm is not installed yet, so there
+/// is no `lspci` entry to read and the kernel's own topology is the only place
+/// the GPU appears.
+///
+/// The stub `lspci` deliberately reports an empty bus. A real one on the runner
+/// would either add a probe failure of its own or, on a GPU lane, print an entry
+/// that matches nothing here -- and the branch under test is the one taken when
+/// no PCI entry matched at all.
+///
+/// The `rocminfo` stub is load-bearing for the same reason as in examine-29: a
+/// runner with ROCm installed resolves the APU through its own probe first and
+/// would mask the verdict this scenario is about.
+fn plant_kernel_only_apu_fixtures(world: &mut E2eWorld) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .to_owned();
+    let node = root.join("host-root/sys/class/kfd/kfd/topology/nodes/1");
+    std::fs::create_dir_all(&node).expect("failed to create planted KFD node");
+    std::fs::write(
+        node.join("properties"),
+        "cpu_cores_count 0\nsimd_count 80\ngfx_target_version 110501\n\
+         domain 0\nlocation_id 50432\n",
+    )
+    .expect("failed to write planted KFD node properties");
+    let bin = root.join("kernel-only-apu-bin");
+    std::fs::create_dir_all(&bin).expect("failed to create the fake PATH dir");
+    rocm_core::fake_executable::write_fake_executable(&bin.join("lspci"), "#!/bin/sh\nexit 0\n")
+        .expect("failed to write the fake lspci");
     rocm_core::fake_executable::write_fake_executable(&bin.join("rocminfo"), "#!/bin/sh\nexit 0\n")
         .expect("failed to write the fake rocminfo");
     put_fake_bin_first_on_path(world, &bin);

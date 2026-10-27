@@ -723,7 +723,10 @@ fn gfx_target_from_amd_pci_device_id(device_id: &str) -> Option<&'static str> {
         // RDNA3.5 APUs with public PCI IDs that map cleanly to one gfx target.
         "1114" => Some("gfx1152"),
         // Strix Halo: KFD reports gfx_target_version 110501 (gfx1151) for
-        // device 1586, and `pci.ids` still has no name for the id.
+        // device 1586. Upstream `pci.ids` now carries the id as "Strix Halo
+        // [Radeon Graphics / Radeon 8050S Graphics / Radeon 8060S Graphics]",
+        // but older packaged copies predate that entry, which is why this table
+        // answers without reading one.
         "1586" => Some("gfx1151"),
         // Navi 48: Radeon RX 9070 / 9070 XT / 9070 GRE.
         "7550" => Some("gfx1201"),
