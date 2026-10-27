@@ -3098,7 +3098,7 @@ fn append_windows_probe_diagnostics(
         let _ = writeln!(
             output,
             "      gpu: name={} pnp={} driver={} gfx={}",
-            empty_as_unknown(&display.name),
+            crate::placeholder::trimmed_or_unknown(&display.name),
             display.pnp_device_id.as_deref().unwrap_or("<unknown>"),
             display.driver_version.as_deref().unwrap_or("<unknown>"),
             gfx
@@ -3106,12 +3106,6 @@ fn append_windows_probe_diagnostics(
     }
     append_diagnostic_stream(output, "stdout", &result.stdout);
     append_diagnostic_stream(output, "stderr", &result.stderr);
-}
-
-#[cfg(windows)]
-fn empty_as_unknown(value: &str) -> &str {
-    let value = value.trim();
-    if value.is_empty() { "<unknown>" } else { value }
 }
 
 #[derive(Debug)]

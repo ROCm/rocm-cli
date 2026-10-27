@@ -144,10 +144,6 @@ const fn system_package_install_action(
     }
 }
 
-pub(crate) const fn empty_as_unknown(value: &str) -> &str {
-    if value.is_empty() { "<unknown>" } else { value }
-}
-
 /// The real host's `/etc/os-release`, falling back to `/usr/lib/os-release`
 /// when the former is absent (per `os-release(5)`).
 ///

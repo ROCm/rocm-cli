@@ -32,6 +32,7 @@ pub mod net;
 pub mod openmpi;
 pub mod os_release;
 pub mod paths;
+pub mod placeholder;
 pub mod proc_lifecycle;
 pub mod process;
 pub mod quoting;
