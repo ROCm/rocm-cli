@@ -4,6 +4,7 @@
 
 #![allow(clippy::items_after_test_module)]
 
+mod api_docs;
 mod cli;
 mod common;
 mod mcp;

@@ -745,12 +745,7 @@ fn endpoint_response(request: EndpointRequest) -> Result<EndpointResponse> {
     Ok(EndpointResponse {
         endpoint_url,
         api_style: "openai".to_owned(),
-        supported_routes: vec![
-            "/v1/health".to_owned(),
-            "/v1/models".to_owned(),
-            "/v1/chat/completions".to_owned(),
-            "/v1/completions".to_owned(),
-        ],
+        supported_routes: rocm_engine_protocol::chat_supported_routes("/v1/health"),
     })
 }
 

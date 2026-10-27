@@ -145,10 +145,12 @@ fn serve_failure_evidence(
 async fn serve_and_wait(world: &mut E2eWorld, args: &[&str], model: &str, ready_substr: &str) {
     let timeout_secs = serve_timeout_for(world);
     let device_state = ensure_serve_port_free().await;
+    crate::e2e::service_docs_steps::give_api_docs_a_port_of_their_own(world);
     let (stdout, stderr, rc) = crate::run_rocm(world, args);
     if rc == 0 && model_is_ready(&MODELS_URL, Some(ready_substr), timeout_secs).await {
         world.endpoint = Some(SERVE_BASE_URL.to_string());
         world.model_name = Some(model.to_string());
+        world.serve_stdout = Some(stdout);
         return;
     }
     let invocation = format!("`rocm {}`", args.join(" "));
@@ -544,11 +546,13 @@ async fn serve_gpu_model(world: &mut E2eWorld) {
     for attempt in 1..=attempts {
         made = attempt;
         let device_state = ensure_serve_port_free().await;
+        crate::e2e::service_docs_steps::give_api_docs_a_port_of_their_own(world);
         let (stdout, stderr, rc) =
             crate::run_rocm(world, &["serve", model, "--engine", engine, "--managed"]);
         if rc == 0 && model_is_ready(&MODELS_URL, Some(ready_substr), timeout_secs).await {
             world.endpoint = Some(SERVE_BASE_URL.to_string());
             world.model_name = Some(model.to_string());
+            world.serve_stdout = Some(stdout);
             return;
         }
         // `serve_failure_evidence` reads and copies out the log BEFORE it stops
