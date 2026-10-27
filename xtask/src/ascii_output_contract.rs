@@ -271,7 +271,9 @@ mod tests {
                 let skip = path
                     .file_name()
                     .and_then(|name| name.to_str())
-                    .is_none_or(|name| name == "target" || name.starts_with("target-") || name.starts_with('.'));
+                    .is_none_or(|name| {
+                        name == "target" || name.starts_with("target-") || name.starts_with('.')
+                    });
                 if skip {
                     continue;
                 }
