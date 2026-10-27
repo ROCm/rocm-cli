@@ -1534,6 +1534,22 @@ fn restart_managed_service_with(
         );
     }
 
+    // The same re-read must also prove this service's own record is still the
+    // one the caller saw: a `rocm services restart` of this service can finish
+    // while recovery waits for the lock, and writing the stale copy over it
+    // would orphan the restarted engine or start a second supervisor.
+    if let Ok(current) = load_service_record(paths, &record.service_id)
+        && (current.status != record.status
+            || current.supervisor_pid != record.supervisor_pid
+            || current.supervisor_start_ticks != record.supervisor_start_ticks
+            || current.engine_pid != record.engine_pid)
+    {
+        anyhow::bail!(
+            "cannot recover managed service {}: its record changed while recovery was waiting              for the launch lock",
+            record.service_id
+        );
+    }
+
     // On the canonical loopback host, prove the recorded port is genuinely free
     // before publishing `recovering` or spawning anything: a supervisor that
     // cannot bind would replace a truthful record with a lie. Custom hosts keep
@@ -1649,6 +1665,9 @@ fn restart_managed_service_with(
         ));
     }
 
+    // The supervisor's identity is on disk now, so the rollback guard must
+    // compare against this copy, not the one from before it was recorded.
+    let recorded_snapshot = record.clone();
     thread::sleep(Duration::from_millis(200));
     let exited = match child.try_wait() {
         Ok(exited) => exited,
@@ -1659,7 +1678,7 @@ fn restart_managed_service_with(
             return Err(fail_recovery(
                 paths,
                 record,
-                &recovering_snapshot,
+                &recorded_snapshot,
                 prior,
                 error,
             ));
@@ -3806,7 +3825,7 @@ mod tests {
         fs::create_dir_all(paths.services_dir())?;
 
         let service_id = "svc-restart-identity";
-        let mut record = identity_probe_record(&paths, service_id, 11444);
+        let mut record = identity_probe_record(&paths, service_id, free_loopback_port());
         record.status = "failed".to_owned();
         record.write()?;
         assert_eq!(
@@ -3986,7 +4005,7 @@ mod tests {
         fs::create_dir_all(paths.services_dir())?;
 
         let service_id = "svc-restart-drops-engine-pid";
-        let mut record = identity_probe_record(&paths, service_id, 11455);
+        let mut record = identity_probe_record(&paths, service_id, free_loopback_port());
         // The shape `rocm serve --background` writes: one PID in both roles.
         record.supervisor_pid = UNCONFIRMED_STOP_PID;
         record.engine_pid = Some(UNCONFIRMED_STOP_PID);
@@ -4381,6 +4400,68 @@ mod tests {
         Ok(())
     }
 
+    /// A `rocm services restart` that finished while recovery waited for the
+    /// launch lock changed this service's own record; recovery must refuse
+    /// rather than write its stale copy over it.
+    #[test]
+    fn recovery_refuses_when_its_own_record_changed_while_waiting_for_the_lock() -> Result<()> {
+        let (root, paths) = temp_app_paths("recovery-stale-own-record");
+        paths.ensure()?;
+        fs::create_dir_all(paths.services_dir())?;
+
+        let service_id = "svc-recovery-stale-own-record";
+        let mut record = identity_probe_record(&paths, service_id, free_loopback_port());
+        record.status = "failed".to_owned();
+        record.write()?;
+        let mut stale = record.clone();
+
+        // The restart that won the lock: same id, now starting under new pids.
+        record.status = "starting".to_owned();
+        record.supervisor_pid = 4_242_424;
+        record.write()?;
+
+        let never = |_command: &mut ProcessCommand| -> std::io::Result<std::process::Child> {
+            panic!("recovery must not spawn over a restarted record")
+        };
+        let outcome = restart_managed_service_with(&paths, &mut stale, Some(&never));
+        let persisted = load_service_record(&paths, service_id);
+        fs::remove_dir_all(root).ok();
+
+        let message = format!(
+            "{:#}",
+            outcome.expect_err("a changed record refuses recovery")
+        );
+        assert!(message.contains("record changed"), "{message}");
+        let persisted = persisted?;
+        assert_eq!(persisted.status, "starting");
+        assert_eq!(persisted.supervisor_pid, 4_242_424);
+        Ok(())
+    }
+
+    /// The `try_wait` failure path rolls back against the snapshot taken after
+    /// the supervisor was recorded; the pre-record snapshot would mismatch the
+    /// on-disk pid and leave `recovering` behind.
+    #[test]
+    fn rollback_against_the_recorded_snapshot_restores_the_prior_record() -> Result<()> {
+        let (root, paths) = temp_app_paths("rollback-recorded-snapshot");
+        paths.ensure()?;
+        fs::create_dir_all(paths.services_dir())?;
+
+        let mut prior = identity_probe_record(&paths, "svc-rollback-recorded", 11466);
+        prior.status = "failed".to_owned();
+        let mut recorded = prior.clone();
+        recorded.status = "recovering".to_owned();
+        recorded.supervisor_pid = 4_242_424;
+        recorded.write()?;
+
+        rollback_recovering_record(&paths, &recorded, &prior)?;
+        let persisted = load_service_record(&paths, "svc-rollback-recorded");
+        fs::remove_dir_all(root).ok();
+
+        assert_eq!(persisted?.status, "failed");
+        Ok(())
+    }
+
     /// The rollback merges onto the live record: a stop marker persisted since
     /// the first write survives, and the restart's own fields are restored.
     #[test]
@@ -4391,9 +4472,16 @@ mod tests {
 
         let mut prior = identity_probe_record(&paths, "svc-rollback-merge", 11464);
         prior.status = "failed".to_owned();
+        // Distinct values, so a restore that is skipped shows up.
+        prior.restart_count = 7;
+        prior.engine_pid = Some(4_111_111);
+        prior.inference_verified_at_unix_ms = Some(5_555);
         let mut recovering = prior.clone();
         recovering.status = "recovering".to_owned();
         recovering.supervisor_pid = 0;
+        recovering.restart_count = 8;
+        recovering.engine_pid = None;
+        recovering.inference_verified_at_unix_ms = None;
         // What a concurrent stop persisted on the live `recovering` record.
         let mut on_disk = recovering.clone();
         on_disk.stop_requested_unix_ms = Some(1_234);
@@ -4405,6 +4493,9 @@ mod tests {
 
         let persisted = persisted?;
         assert_eq!(persisted.status, "failed");
+        assert_eq!(persisted.restart_count, 7);
+        assert_eq!(persisted.engine_pid, Some(4_111_111));
+        assert_eq!(persisted.inference_verified_at_unix_ms, Some(5_555));
         assert_eq!(
             persisted.stop_requested_unix_ms,
             Some(1_234),
@@ -4463,6 +4554,7 @@ mod tests {
         fs::create_dir_all(paths.services_dir())?;
 
         let service_id = "svc-restart-custom-host";
+        let blocked_port = free_loopback_port();
         let mut record = ManagedServiceRecord::new(
             &paths,
             service_id,
@@ -4470,7 +4562,7 @@ mod tests {
             "a-model",
             "a-model",
             "0.0.0.0",
-            11460,
+            blocked_port,
             "managed",
             std::process::id(),
             None,
@@ -4480,7 +4572,7 @@ mod tests {
         record.status = "failed".to_owned();
         record.write()?;
 
-        let _blocker = std::net::TcpListener::bind(("0.0.0.0", 11460))?;
+        let _blocker = std::net::TcpListener::bind(("0.0.0.0", blocked_port))?;
 
         let outcome = restart_managed_service(&paths, &mut record);
         let persisted = load_service_record(&paths, service_id);

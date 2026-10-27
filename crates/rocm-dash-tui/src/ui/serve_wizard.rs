@@ -351,15 +351,10 @@ impl ServeWizardState {
         if !self.is_customized() {
             return "Automatic";
         }
-        if self.port_mode == PortMode::Custom && parse_port(&self.port).is_none() {
-            "Customized · port needs attention"
-        } else {
-            let host = self.host.trim();
-            if host.is_empty() || !is_loopback_host(host) {
-                "Customized · host needs attention"
-            } else {
-                "Customized"
-            }
+        match self.validate_advanced() {
+            Err((Field::Port, _)) => "Customized · port needs attention",
+            Err((Field::Host, _)) => "Customized · host needs attention",
+            _ => "Customized",
         }
     }
 
@@ -369,6 +364,12 @@ impl ServeWizardState {
         if self.model.trim().is_empty() {
             return Err((Field::Model, "model is required".to_string()));
         }
+        self.validate_advanced()
+    }
+
+    /// The host/port half of [`Self::validate`], independent of the model, so
+    /// the collapsed summary can report a broken hidden override on its own.
+    fn validate_advanced(&self) -> Result<Option<u16>, (Field, String)> {
         let host = self.host.trim();
         if host.is_empty() {
             return Err((
@@ -2175,6 +2176,71 @@ mod tests {
             "read-only device text: {out:?}"
         );
         assert!(!out.contains("Review:"), "no second modal");
+    }
+
+    #[test]
+    fn foreground_only_form_summarises_as_customized() {
+        let w = ServeWizardState {
+            managed: false,
+            ..Default::default()
+        };
+        assert!(w.is_customized());
+        assert_eq!(w.advanced_summary(), "Customized");
+    }
+
+    #[test]
+    fn loopback_name_with_automatic_port_summarises_as_needing_attention() {
+        let w = ServeWizardState {
+            model: "m".into(),
+            host: "localhost".into(),
+            ..Default::default()
+        };
+        assert!(w.build_args().is_err(), "launch is refused");
+        assert_eq!(w.advanced_summary(), "Customized · port needs attention");
+    }
+
+    #[test]
+    fn committing_a_bad_port_restates_the_port_complaint() {
+        let mut wiz = Some(ServeWizardState {
+            model: "m".into(),
+            advanced_expanded: true,
+            port_mode: PortMode::Custom,
+            port: "abc".into(),
+            message: Some("port `abc` is not a valid 1-65535 value".into()),
+            ..Default::default()
+        });
+        let mut jobs = State::default();
+        focus_field(wiz.as_mut().unwrap(), Field::Port);
+        feed(&mut wiz, &mut jobs, &[KeyCode::Enter]);
+        for c in typed("99999") {
+            on_key(&mut wiz, &mut jobs, &[], c);
+        }
+        feed(&mut wiz, &mut jobs, &[KeyCode::Enter]);
+        let w = wiz.as_ref().unwrap();
+        assert_eq!(
+            w.message.as_deref(),
+            Some("port `99999` is not a valid 1-65535 value"),
+            "the complaint is re-stated for the value just committed"
+        );
+    }
+
+    #[test]
+    fn open_editor_renders_the_typed_text() {
+        let mut wiz = Some(ServeWizardState {
+            advanced_expanded: true,
+            ..Default::default()
+        });
+        let mut jobs = State::default();
+        focus_field(wiz.as_mut().unwrap(), Field::Host);
+        feed(&mut wiz, &mut jobs, &[KeyCode::Enter]);
+        for c in typed("nope") {
+            on_key(&mut wiz, &mut jobs, &[], c);
+        }
+        let out = render(wiz.as_ref().unwrap(), &jobs);
+        assert!(
+            out.contains("nope"),
+            "typed text must be on screen: {out:?}"
+        );
     }
 
     #[test]

@@ -665,3 +665,38 @@ Feature: Interactive dashboard
     Then the serve wizard is closed
     When the user quits the dashboard
     Then the dashboard exits successfully
+
+  @id:dash-serve-wizard-automatic-form-stages-bare-serve @requires-os:linux
+  Scenario: dash-40 - An automatic serve form stages a bare serve command with an automatic port
+    When the user opens the dashboard with demo data
+    And the user opens the Observe view
+    And the user opens the serve wizard
+    And the user types "demo-model" into the serve wizard
+    And the user presses Down 2 times in the serve wizard
+    And the user presses Enter in the serve wizard
+    Then the serve wizard asks to approve "serve demo-model" with an automatic port
+    When the user presses Escape
+    And the user presses Escape
+    Then the serve wizard is closed
+    When the user quits the dashboard
+    Then the dashboard exits successfully
+
+  @id:dash-serve-wizard-refuses-custom-host-with-automatic-port @requires-os:linux
+  Scenario: dash-41 - A custom host with an automatic port is refused in the form
+    When the user opens the dashboard with demo data
+    And the user opens the Observe view
+    And the user opens the serve wizard
+    And the user types "demo-model" into the serve wizard
+    And the user presses Down 1 times in the serve wizard
+    And the user presses Enter in the serve wizard
+    And the user presses Down 3 times in the serve wizard
+    And the user presses Enter in the serve wizard
+    And the user types "localhost" into the serve wizard
+    And the user presses Enter in the serve wizard
+    And the user presses Down 3 times in the serve wizard
+    And the user presses Enter in the serve wizard
+    Then the serve wizard refuses to launch and says "set Port to Custom"
+    When the user presses Escape
+    Then the serve wizard is closed
+    When the user quits the dashboard
+    Then the dashboard exits successfully

@@ -595,6 +595,54 @@ async fn serve_wizard_still_open_host_unchanged(world: &mut E2eWorld) {
     );
 }
 
+#[when(expr = "the user presses Down {int} times in the serve wizard")]
+async fn press_down_in_serve_wizard(world: &mut E2eWorld, times: u32) {
+    for _ in 0..times {
+        session(world)
+            .send("\x1b[B")
+            .unwrap_or_else(|e| panic!("failed to move down in the serve wizard: {e}"));
+    }
+}
+
+#[when("the user presses Enter in the serve wizard")]
+async fn press_enter_in_serve_wizard(world: &mut E2eWorld) {
+    session(world)
+        .send("\r")
+        .unwrap_or_else(|e| panic!("failed to press Enter in the serve wizard: {e}"));
+}
+
+// The approval card is what the user is asked to approve, so the staged
+// command line is asserted there: an automatic form stages a bare
+// `serve <model>`, with no engine or port flag the CLI should be choosing.
+#[then(expr = "the serve wizard asks to approve {string} with an automatic port")]
+async fn serve_wizard_asks_to_approve_automatic(world: &mut E2eWorld, command: String) {
+    let tui = session(world);
+    tui.wait_for_screen(
+        "Port: automatic; endpoint shown after launch",
+        default_timeout(),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("the serve wizard did not stage an approval: {e}"));
+    let screen = tui.screen_text();
+    assert!(
+        screen.contains(&command) && !screen.contains("--engine") && !screen.contains("--port"),
+        "expected a bare `{command}` with no engine or port flag:\n{screen}"
+    );
+}
+
+#[then(expr = "the serve wizard refuses to launch and says {string}")]
+async fn serve_wizard_refuses_to_launch(world: &mut E2eWorld, message: String) {
+    let tui = session(world);
+    tui.wait_for_screen(&message, default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the serve wizard did not refuse the launch: {e}"));
+    let screen = tui.screen_text();
+    assert!(
+        screen.contains("Serve a model") && !screen.contains("Port: automatic;"),
+        "a refused launch must leave the form open and stage nothing:\n{screen}"
+    );
+}
+
 #[then("the serve wizard is closed")]
 async fn serve_wizard_closed(world: &mut E2eWorld) {
     session(world)

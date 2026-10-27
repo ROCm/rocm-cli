@@ -623,6 +623,20 @@ fn spawn_managed_engine_child(
     }
 }
 
+// Test-only, thread-scoped spawn interceptor for callers that cannot take a
+// `spawn_override` argument (`start_managed_service`, `run_attached_service`):
+// lets a test observe state at the instant production would spawn the child.
+#[cfg(all(test, not(windows)))]
+thread_local! {
+    static TEST_SPAWN_HOOK: std::cell::RefCell<Option<std::rc::Rc<SpawnOverride<'static>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(test, not(windows)))]
+fn test_spawn_hook() -> Option<std::rc::Rc<SpawnOverride<'static>>> {
+    TEST_SPAWN_HOOK.with(|hook| hook.borrow().clone())
+}
+
 #[cfg(not(windows))]
 type SpawnOverride<'a> = dyn Fn(&mut ProcessCommand) -> io::Result<std::process::Child> + 'a;
 
@@ -744,6 +758,10 @@ fn launch_managed_engine_child_locked(
         if let Some(key_file) = endpoint_key_file.as_deref() {
             command.env(rocm_engine_protocol::ENDPOINT_API_KEY_FILE_ENV, key_file);
         }
+        #[cfg(all(test, not(windows)))]
+        let hook = test_spawn_hook();
+        #[cfg(all(test, not(windows)))]
+        let spawn_override = spawn_override.or(hook.as_deref());
         let mut child = match spawn_override {
             Some(spawn) => spawn(&mut command),
             None => command.spawn(),
@@ -2042,6 +2060,93 @@ mod tests {
         Ok(())
     }
 
+    /// The launch lock must still be held when the child is spawned: it is what
+    /// serializes allocation against publication. Observed through the spawn
+    /// hook, since releasing it early changes nothing else a test can see.
+    #[cfg(not(windows))]
+    #[test]
+    fn start_and_attached_launches_hold_the_launch_lock_until_the_spawn() -> Result<()> {
+        let resolve = ResolveModelResponse {
+            canonical_model_id: "qwen-canonical".to_owned(),
+            task: "chat".to_owned(),
+            source: "hf".to_owned(),
+            revision: "main".to_owned(),
+            loader: "llama.cpp".to_owned(),
+            trust_remote_code: false,
+            chat_template_mode: "auto".to_owned(),
+            dtype: "auto".to_owned(),
+            device_policy: DevicePolicy::GpuPreferred,
+            estimated_memory: "unknown".to_owned(),
+            launch_defaults: serde_json::json!({}),
+            engine_recipe: None,
+            warnings: Vec::new(),
+        };
+        for attached in [false, true] {
+            let (root, paths) = test_paths("launch-lock-held-until-spawn");
+            paths.ensure()?;
+            let lock_path = paths.managed_launch_lock_path();
+            let lock_was_held = std::rc::Rc::new(std::cell::Cell::new(false));
+            let observed = lock_was_held.clone();
+            TEST_SPAWN_HOOK.with(|hook| {
+                *hook.borrow_mut() = Some(std::rc::Rc::new(move |_command| {
+                    observed.set(
+                        rocm_core::FileLock::acquire_bounded(&lock_path, Duration::ZERO).is_err(),
+                    );
+                    Err(io::Error::other("spawn intercepted by test"))
+                }));
+            });
+            let launch_lock = rocm_core::FileLock::acquire(paths.managed_launch_lock_path())?;
+            let result = if attached {
+                run_attached_service(
+                    &paths,
+                    "lemonade",
+                    "lemonade-lock-attached",
+                    "qwen",
+                    &resolve,
+                    "127.0.0.1",
+                    serve_port::PortRequest::Auto,
+                    &[],
+                    None,
+                    None,
+                    None,
+                    launch_lock,
+                    false,
+                )
+            } else {
+                start_managed_service(
+                    &paths,
+                    "lemonade",
+                    "lemonade-lock-start",
+                    "qwen",
+                    &resolve,
+                    "127.0.0.1",
+                    serve_port::PortRequest::Auto,
+                    &resolve.device_policy,
+                    &[],
+                    None,
+                    None,
+                    None,
+                    None,
+                    launch_lock,
+                    false,
+                    &mut |_elapsed| {},
+                )
+                .map(|_| ())
+            };
+            TEST_SPAWN_HOOK.with(|hook| *hook.borrow_mut() = None);
+            let _ = fs::remove_dir_all(root);
+            assert!(
+                format!("{:#}", result.expect_err("the intercepted spawn fails"))
+                    .contains("spawn intercepted by test")
+            );
+            assert!(
+                lock_was_held.get(),
+                "the launch lock must be held at spawn (attached: {attached})"
+            );
+        }
+        Ok(())
+    }
+
     #[test]
     fn resolve_endpoint_auth_loopback_stays_credential_free() {
         // Loopback binds never require auth, even if a key is supplied.
@@ -3076,7 +3181,12 @@ mod tests {
         let bind_succeeded = std::cell::Cell::new(false);
         let spawn_override: &dyn Fn(&mut ProcessCommand) -> io::Result<std::process::Child> =
             &|_command| {
-                bind_succeeded.set(std::net::TcpListener::bind(("127.0.0.1", port)).is_ok());
+                // Retry briefly: a sibling test's concurrent fork can hold a copy
+                // of the just-released socket until its exec closes it.
+                let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                while !bind_succeeded.get() && std::time::Instant::now() < deadline {
+                    bind_succeeded.set(std::net::TcpListener::bind(("127.0.0.1", port)).is_ok());
+                }
                 // A long-lived no-op child stands in for the engine: `_command`
                 // carries real serve args this test binary cannot execute as
                 // itself (see `managed_launch_cleanup_sleeper_child`).

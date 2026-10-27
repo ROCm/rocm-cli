@@ -16100,7 +16100,14 @@ pub(crate) mod tests {
         record.write()?;
 
         let bind_succeeded = std::cell::Cell::new(false);
+        let lock_still_held = std::cell::Cell::new(false);
+        let lock_path = paths.managed_launch_lock_path();
         let spawn: &RestartSpawnOverride<'_> = &|_command| {
+            // The launch lock must outlive the spawn: it is what keeps a
+            // concurrent launch from claiming the port before this record is
+            // republished.
+            lock_still_held
+                .set(rocm_core::FileLock::acquire_bounded(&lock_path, Duration::ZERO).is_err());
             // Retry briefly: a sibling test's concurrent fork can hold a copy of
             // the just-released socket until its exec closes it.
             let deadline = std::time::Instant::now() + Duration::from_secs(2);
@@ -16123,6 +16130,10 @@ pub(crate) mod tests {
         assert!(
             bind_succeeded.get(),
             "the leased port must already be bindable (released) by the time the child is spawned"
+        );
+        assert!(
+            lock_still_held.get(),
+            "the launch lock must still be held when the restart spawns"
         );
         let rendered = format!("{:#}", result.expect_err("the intercepted spawn must fail"));
         assert!(
