@@ -285,6 +285,42 @@ While the log stream is attached, verify detach and stop behave differently:
 - Re-run the serve command and press `Ctrl+C` instead. The server shuts down and
   `rocm services` no longer lists it as running.
 
+### Windows display driver check
+
+On a Windows machine with an AMD GPU, check what the CLI says about the display
+driver:
+
+```powershell
+rocm examine
+rocm diagnose
+rocm install driver
+Get-CimInstance Win32_VideoController | Select-Object Name,DriverVersion,DriverDate
+```
+
+Expected result:
+
+- `rocm examine` prints `driver_version` and `driver_date`. Both match the
+  `DriverVersion` and `DriverDate` that the last command prints.
+- With a driver dated before 27 July 2023 (`FIRST_HIP_SDK_FOR_WINDOWS` in
+  [windows_driver.rs](../crates/rocm-core/src/windows_driver.rs)), `driver_age` says it is older than the
+  first HIP SDK for Windows and that the minimum driver version is not
+  established. `rocm diagnose` lists `fix-22-display-driver-old` with a WEAK
+  score, and its advice is AMD's support page and a restart after the install.
+  The date is only a floor: it cannot judge newer GPUs such as gfx120X,
+  gfx1150 and gfx1151, which may need newer drivers.
+- With a newer driver, `driver_age` says it is not older, and `rocm diagnose`
+  does not list `fix-22-display-driver-old`.
+- `rocm install driver` prints the same version and date, an `outdated:` verdict,
+  and the fix id when the driver is old. Next to `outdated: no` it says the date
+  cannot judge newer GPUs such as gfx120X, gfx1150 and gfx1151. It installs nothing and prints no
+  execution commands.
+
+Automated end-to-end scenarios (`examine-29`, `diagnose-41`, `driver-install-04`
+and `driver-install-05`) cover the lines, the verdict and the "installs nothing"
+promise on the Windows GPU lane with whatever driver that machine has. Only the
+old-driver branch needs this manual check: it needs a machine whose display
+driver is dated before 27 July 2023. The logic is also covered by unit tests.
+
 ## 4. Local Server Records
 
 After a managed or foreground serve attempt, inspect local server records:

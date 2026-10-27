@@ -58,7 +58,7 @@ use std::process::Command as ProcessCommand;
 use std::time::Duration;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
-enum ChatRocmCommandAction {
+pub(crate) enum ChatRocmCommandAction {
     ReadOnly(Vec<String>),
     Approval {
         args: Vec<String>,
@@ -2430,7 +2430,34 @@ fn render_services_tool_result_text(records: &[ManagedServiceRecord]) -> String 
     output
 }
 
-fn chat_rocm_command_action_from_args(mut args: Vec<String>) -> Result<ChatRocmCommandAction> {
+/// The chat action for `rocm install driver`. Where the command only reports
+/// (`only_reports`, the same decision the command itself makes) it is a
+/// read-only call with no `--yes`; elsewhere it needs approval and carries
+/// `--yes`.
+///
+/// A model-supplied `--yes` is stripped in both forms, bare and `--yes=...`,
+/// as the `install sdk` arm does: the approval path appends its own bare
+/// `--yes`, so a stray attached form would otherwise ride along and clap would
+/// refuse the whole command, and the read-only path has no consent to grant.
+pub(crate) fn chat_install_driver_action(
+    mut args: Vec<String>,
+    only_reports: bool,
+) -> ChatRocmCommandAction {
+    args.retain(|arg| arg != "--yes" && !arg.starts_with("--yes="));
+    if only_reports {
+        return ChatRocmCommandAction::ReadOnly(args);
+    }
+    ensure_flag(&mut args, "--yes");
+    ChatRocmCommandAction::Approval {
+        args,
+        pending_title: "Install driver".to_owned(),
+        command_title: "Install".to_owned(),
+    }
+}
+
+pub(crate) fn chat_rocm_command_action_from_args(
+    mut args: Vec<String>,
+) -> Result<ChatRocmCommandAction> {
     canonicalize_chat_rocm_command(&mut args)?;
     validate_chat_rocm_command_safety(&args)?;
     let first = args.first().map(|value| value.to_ascii_lowercase());
@@ -2511,14 +2538,10 @@ fn chat_rocm_command_action_from_args(mut args: Vec<String>) -> Result<ChatRocmC
                 command_title: "Install".to_owned(),
             })
         }
-        Some("install") if second.as_deref() == Some("driver") => {
-            ensure_flag(&mut args, "--yes");
-            Ok(ChatRocmCommandAction::Approval {
-                args,
-                pending_title: "Install driver".to_owned(),
-                command_title: "Install".to_owned(),
-            })
-        }
+        Some("install") if second.as_deref() == Some("driver") => Ok(chat_install_driver_action(
+            args,
+            crate::driver_install::host_install_driver_only_reports(),
+        )),
         Some("update") if args.iter().any(|arg| arg == "--apply") => {
             ensure_flag(&mut args, "--yes");
             Ok(ChatRocmCommandAction::Approval {
@@ -3756,6 +3779,25 @@ fn run_rocm_read_only_in_process(paths: &AppPaths, args: &[String]) -> Result<St
                 && subcommand.eq_ignore_ascii_case("status") =>
         {
             render_setup_status_text(paths, &config)
+        }
+        // `install driver` is a read-only call where the command only reports
+        // (`chat_install_driver_action`). It runs as a dry run that never
+        // executes anything, so a call that reaches it elsewhere cannot change
+        // the host either. `--dry-run` is accepted because it is what this arm
+        // already does; `--reconcile` is not, since it rewrites the saved driver
+        // install state and the command refuses to combine it with the other
+        // flags.
+        [command, subcommand, rest @ ..]
+            if command.eq_ignore_ascii_case("install")
+                && subcommand.eq_ignore_ascii_case("driver")
+                && rest.iter().all(|arg| {
+                    arg.eq_ignore_ascii_case("--dkms") || arg.eq_ignore_ascii_case("--dry-run")
+                }) =>
+        {
+            let dkms = rest.iter().any(|arg| arg.eq_ignore_ascii_case("--dkms"));
+            crate::driver_install::install_driver(paths, dkms, false, true)
+                .map(|result| result.output)
+                .map_err(|error| error.source)
         }
         _ => bail!(
             "unsupported in-process read-only rocm command: {}",
@@ -6106,6 +6148,104 @@ model recipes
                 .and_then(serde_json::Value::as_bool),
             Some(true)
         );
+    }
+
+    /// On Windows `rocm install driver` only reports, and chat plans it as a
+    /// read-only call. That call must run in process: before this arm existed it
+    /// failed with "unsupported in-process read-only rocm command". It is a dry
+    /// run, so it never executes anything on any platform.
+    #[test]
+    fn install_driver_read_only_call_runs_in_process() {
+        let (_root, paths) = test_paths("install-driver-in-process");
+        let args = vec!["install".to_owned(), "driver".to_owned()];
+        let text = run_rocm_read_only_in_process(&paths, &args)
+            .expect("the read-only install driver call should run in process");
+        assert!(text.contains("approval:"), "{text}");
+        assert!(!text.contains("driver install completed"), "{text}");
+        assert!(
+            run_rocm_read_only_in_process(
+                &paths,
+                &[
+                    "install".to_owned(),
+                    "driver".to_owned(),
+                    "--yes".to_owned()
+                ]
+            )
+            .is_err(),
+            "a flag the read-only path does not know is still refused"
+        );
+    }
+
+    /// `--dry-run` is what the in-process arm already does, so it is accepted
+    /// and the call reports a dry run. `--reconcile` writes driver install state
+    /// and stays refused, as does any flag the arm does not know.
+    #[test]
+    fn install_driver_read_only_call_accepts_dry_run_and_refuses_reconcile() {
+        let (_root, paths) = test_paths("install-driver-in-process-dry-run");
+        let run = |extra: &[&str]| {
+            let mut args = vec!["install".to_owned(), "driver".to_owned()];
+            args.extend(extra.iter().map(|arg| (*arg).to_owned()));
+            run_rocm_read_only_in_process(&paths, &args)
+        };
+        for extra in [&["--dry-run"][..], &["--dkms", "--dry-run"], &["--DRY-RUN"]] {
+            let text = run(extra).unwrap_or_else(|error| panic!("{extra:?} must run: {error}"));
+            assert!(text.contains("dry_run: true"), "{extra:?}: {text}");
+            assert!(
+                !text.contains("driver install completed"),
+                "{extra:?}: {text}"
+            );
+        }
+        for extra in [&["--reconcile"][..], &["--dry-run", "--reconcile"]] {
+            assert!(run(extra).is_err(), "{extra:?} must stay refused");
+        }
+        // Refusing `--reconcile` changed nothing on disk: the state file is
+        // written only by a reconcile or an executed install.
+        assert!(
+            !crate::driver_install::driver_install_state_path(&paths).exists(),
+            "a refused call must not create driver install state"
+        );
+    }
+
+    /// The `install driver` chat action strips `--yes` in the attached form too,
+    /// like the `install sdk` arm: read-only where the command only reports, and
+    /// a single bare `--yes` where it installs.
+    #[test]
+    fn chat_install_driver_strips_a_model_supplied_yes_in_both_forms() {
+        for supplied in ["--yes", "--yes=true", "--yes=1", "--yes=false"] {
+            let argv = |extra: &str| -> Vec<String> {
+                ["install", "driver", "--dry-run", extra]
+                    .iter()
+                    .map(|arg| (*arg).to_owned())
+                    .collect()
+            };
+            let ChatRocmCommandAction::ReadOnly(args) =
+                chat_install_driver_action(argv(supplied), true)
+            else {
+                panic!("a report-only platform must stay read-only");
+            };
+            assert_eq!(args, ["install", "driver", "--dry-run"], "{supplied}");
+
+            let ChatRocmCommandAction::Approval { args, .. } =
+                chat_install_driver_action(argv(supplied), false)
+            else {
+                panic!("an installing platform must ask approval");
+            };
+            assert_eq!(
+                args,
+                ["install", "driver", "--dry-run", "--yes"],
+                "{supplied}"
+            );
+        }
+        let ChatRocmCommandAction::ReadOnly(args) = chat_install_driver_action(
+            ["install", "driver", "--yes-not-a-flag"]
+                .iter()
+                .map(|arg| (*arg).to_owned())
+                .collect(),
+            true,
+        ) else {
+            panic!("read-only expected");
+        };
+        assert!(args.iter().any(|arg| arg == "--yes-not-a-flag"), "{args:?}");
     }
 
     #[test]

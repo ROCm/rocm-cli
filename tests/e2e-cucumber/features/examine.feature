@@ -428,3 +428,18 @@ Feature: GPU detection and system inspection
     Given a GPU machine whose release file cannot be read
     When the user inspects that machine in machine-readable form
     Then the inspection's verdict is degraded, and its only failure says the release file could not be read
+
+  # `examine` on Windows adds the AMD display driver's version, date and an age
+  # line. Windows only: the driver comes from the Windows adapter inventory, so
+  # no other platform has these lines. `@requires-gpu` so that a driver exists
+  # to be read. The scenario names no driver: it holds the readable form to the
+  # machine-readable one, and holds the verdict to the date, so it passes on a
+  # machine with an old driver and on one with a current driver, and fails only
+  # if the CLI calls a driver old that is not. Whether a driver dated before
+  # 27 July 2023 is reported as old needs such a machine and is not covered here.
+  @id:examine-windows-driver-version-date-and-age @requires-os:windows @requires-gpu
+  Scenario: examine-29 - On Windows the inspection reports the display driver and judges its age by its date
+    Given a machine with an AMD GPU
+    When the user inspects the system both for reading and for scripting
+    Then the inspection reports the display driver's version and date as the machine-readable form does
+    And the inspection calls the driver old only when its date is before 27 July 2023

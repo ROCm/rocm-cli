@@ -619,6 +619,10 @@ mod tests {
             // A real shape with a marker in the tail. The runtime version is not
             // an approved report field: it narrows toward one machine.
             msvc_redist_version: "14.29.SENTINEL-RUNTIME".to_owned(),
+            // The display driver facts are not approved report fields. A
+            // version and a date narrow toward one machine.
+            adrenalin_version: "SENTINEL-DRIVER-VERSION".to_owned(),
+            adrenalin_date: "SENTINEL-DRIVER-DATE".to_owned(),
             cpu_model: "SENTINEL-CPU".to_owned(),
             distro_id: "SENTINEL-DISTRO".to_owned(),
             rocminfo_status: "SENTINEL-ERROR-TEXT".to_owned(),
@@ -658,6 +662,8 @@ mod tests {
         "SENTINEL-ROCM-BUILD",
         "SENTINEL-ENGINE-BUILD",
         "SENTINEL-RUNTIME",
+        "SENTINEL-DRIVER-VERSION",
+        "SENTINEL-DRIVER-DATE",
     ];
 
     /// An architecture no product will ever have.

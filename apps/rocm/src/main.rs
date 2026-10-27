@@ -795,7 +795,9 @@ rocm install sdk --devel")]
         #[arg(long)]
         approve_replacing_active_default: bool,
     },
-    /// Preview or install Linux AMD driver support.
+    /// Preview or install Linux AMD driver support. On Windows it installs
+    /// nothing: it reports the AMD display driver version and date and whether
+    /// the driver is old.
     Driver {
         /// Use the DKMS driver wrapper flow.
         #[arg(long)]
@@ -11219,6 +11221,7 @@ pub(crate) mod tests {
                 policy: "linux_official_amd_dkms_wrapper".to_owned(),
                 status: "amdgpu_available".to_owned(),
                 detail: None,
+                windows: None,
             },
             legacy_rocm: rocm_core::LegacyRocmSummary {
                 status: legacy_status.to_owned(),
