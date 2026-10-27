@@ -10,6 +10,13 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+mod discovery;
+
+use discovery::{
+    DiscoverySource, DiscoveryState, Reconcile, TelemetryState, registry_read_warning,
+    vllm_scrape_targets,
+};
+
 use crate::bench_ring::BenchRing;
 use crate::persist::SessionWriter;
 use crate::snapshot_ring::SnapshotRing;
@@ -39,6 +46,43 @@ use tracing::{info, trace, warn};
 /// Refresh GPU system info (versions, partition modes) every N seconds.
 const SYSINFO_REFRESH_SECS: u64 = 30;
 
+/// Row identity and accepted model names for singleton Lemonade attribution.
+#[derive(Clone)]
+struct LemonadeRow {
+    id: String,
+    model_names: Vec<String>,
+}
+
+#[derive(Clone)]
+struct LemonadeEndpoint {
+    host: String,
+    port: u16,
+    collector: LemonadeCollector,
+    rows: Vec<LemonadeRow>,
+    /// The endpoint is the external probe (not a registry-managed target). This
+    /// decides how strictly health is read: an external server that starts to
+    /// require credentials is a failure to report, a managed target that does not
+    /// serve the Lemonade protocol is not. It is a property of the endpoint, not
+    /// of the tick.
+    external: bool,
+    /// This tick is a discovery tick: rows are rebuilt from health. External
+    /// endpoints also appear on scrape-only ticks, with this `false`.
+    discover_external: bool,
+}
+
+impl LemonadeEndpoint {
+    fn warning(&self, phase: &str, error: &impl std::fmt::Display) -> String {
+        let mut ids: Vec<&str> = self.rows.iter().map(|row| row.id.as_str()).collect();
+        ids.sort_unstable();
+        format!(
+            "lemonade {phase} {}:{} [{}]: {error}",
+            self.host,
+            self.port,
+            ids.join(", ")
+        )
+    }
+}
+
 /// Options for `run_loop`. Mirrors daemon CLI flags + config.
 #[derive(Debug, Clone)]
 pub struct RunnerOptions {
@@ -58,9 +102,10 @@ pub struct RunnerOptions {
     pub disable_vllm_metrics: bool,
     /// Hostname to scrape; `127.0.0.1` for the typical co-located daemon.
     pub vllm_metrics_host: String,
-    /// Opt-in probe-based Lemonade discovery: when enabled, probe a local
-    /// Lemonade endpoint each discovery tick and surface it as an Instance.
-    /// Off by default so hosts with no Lemonade server never poll a dead port.
+    /// Probe-based Lemonade discovery: when enabled, probe a local Lemonade
+    /// endpoint each discovery tick and surface its healthy loaded models.
+    /// `rocm dash` passes the dashboard config value, which defaults to on;
+    /// only `RunnerOptions::default()` is off, for standalone use and tests.
     pub enable_lemonade: bool,
     /// Lemonade endpoint host + port (defaults `127.0.0.1:13305`).
     pub lemonade_host: String,
@@ -72,7 +117,7 @@ pub struct RunnerOptions {
     /// When set, the daemon reads `ManagedServiceRecord`s each discovery tick and
     /// surfaces live ones as scrape targets (port from the registry), so a model
     /// served via `rocm serve` appears in the dashboard with live `gen_tps`
-    /// without Docker discovery. Off by default.
+    /// without Docker discovery. `None` by default; `rocm dash` sets it.
     pub services_dir: Option<PathBuf>,
     /// Path or command name for the `amd-smi` binary. The managed ROCm SDK
     /// ships it inside the runtime wheel's bin directory rather than on `PATH`,
@@ -318,8 +363,9 @@ pub async fn run_loop(
         None
     };
 
-    // Opt-in Lemonade discovery (probe-based; off unless a Lemonade endpoint is
-    // configured). Distinct from Docker/vLLM discovery — a local server, not a
+    // Probe-based Lemonade discovery, gated on `opts.enable_lemonade` (the
+    // dashboard config default is on; `RunnerOptions::default()` is off).
+    // Distinct from Docker/vLLM discovery — a local server, not a
     // container — so it is tracked separately from the Docker known set.
     let lemonade = if opts.enable_lemonade {
         info!(
@@ -335,6 +381,8 @@ pub async fn run_loop(
     } else {
         None
     };
+    // Persistent endpoint collectors share their reqwest connection pools across cycles.
+    let mut managed_lemonade_collectors: HashMap<(String, u16), LemonadeCollector> = HashMap::new();
     let mut bench = opts.bench_csv.as_ref().map(|p| {
         info!(path = %p.display(), "tailing benchmark CSV");
         CsvBenchTailer::new(p.clone())
@@ -407,6 +455,7 @@ pub async fn run_loop(
     let mut docker_warn: Option<String> = None;
     let mut registry_warn: Option<String> = None;
     let mut scrape_warns: Vec<String> = Vec::new();
+    let mut lemonade_discovery_warn: Option<String> = None;
 
     loop {
         ticker.tick().await;
@@ -577,16 +626,6 @@ pub async fn run_loop(
             }
         }
 
-        // Lemonade discovery — probe the endpoint on the discovery cadence; add a
-        // Lemonade Instance when reachable, emit Gone when it disappears, and stay
-        // a clean no-op (no warning/panic) when no endpoint is configured.
-        if let Some(l) = lemonade.as_ref()
-            && discovery_due
-        {
-            let probed = l.discover().await;
-            reconcile.reconcile_lemonade(probed, &mut discovery.lemonade_id);
-        }
-
         // Managed-service registry discovery — read the rocm-cli
         // `serve` records and surface live ones as scrape targets. The port is
         // the registry's authority; non-vLLM engines are tracked so the vLLM
@@ -611,6 +650,13 @@ pub async fn run_loop(
                     let disc = crate::registry::discover_managed_services(&read.records);
                     discovery.managed_non_vllm = disc.non_vllm;
                     discovery.managed_roots = disc.roots;
+                    let previous =
+                        std::mem::replace(&mut discovery.managed_lemonade, disc.lemonade);
+                    reconcile.reset_moved_lemonade_targets(
+                        &disc.svcs,
+                        &previous,
+                        &discovery.managed_lemonade,
+                    );
                     reconcile.reconcile_set(
                         DiscoverySource::Managed,
                         &disc.svcs,
@@ -624,7 +670,22 @@ pub async fn run_loop(
                     // The records that did read still add and refresh their
                     // services; nothing is retired, because the one that did
                     // not read could be any of the known ones.
-                    let disc = crate::registry::discover_managed_services(&e.partial.records);
+                    let mut disc = crate::registry::discover_managed_services(&e.partial.records);
+                    // Lemonade targets follow the same rule: the ones this pass
+                    // read are refreshed, the others are kept.
+                    let mut next: Vec<_> = discovery
+                        .managed_lemonade
+                        .iter()
+                        .filter(|target| !disc.seen.contains(&target.service_id))
+                        .cloned()
+                        .collect();
+                    next.append(&mut disc.lemonade);
+                    let previous = std::mem::replace(&mut discovery.managed_lemonade, next);
+                    reconcile.reset_moved_lemonade_targets(
+                        &disc.svcs,
+                        &previous,
+                        &discovery.managed_lemonade,
+                    );
                     reconcile.upsert_set(
                         DiscoverySource::Managed,
                         &disc.svcs,
@@ -639,9 +700,219 @@ pub async fn run_loop(
             scrape_warns.clear();
         }
 
-        // Per-instance vLLM metric scrape, parallel, on its own cadence. The
-        // Lemonade instance (if any) is scraped via its own collector below, so
-        // exclude it from the vLLM Prometheus targets. Managed non-vLLM services
+        // Independent endpoints run concurrently, but health always precedes
+        // stats within each endpoint. Last-request stats have no model identity:
+        // only a singleton loaded set matching exactly one row can own the rate.
+        let scrape_now = tick_count.is_multiple_of(instance_ticks);
+        if discovery_due || scrape_now {
+            let managed_endpoint = discovery.managed_lemonade.iter().any(|target| {
+                crate::registry::endpoints_match(
+                    &target.host,
+                    target.port,
+                    &opts.lemonade_host,
+                    opts.lemonade_port,
+                )
+            });
+            let mut endpoints = Vec::new();
+            if let Some(collector) = lemonade.as_ref() {
+                if managed_endpoint && discovery_due {
+                    // Registry binding wins even if its configured model differs
+                    // from health. Never attach external controls to that binding.
+                    Reconcile {
+                        state: &mut runner.state,
+                        telemetry: &mut telemetry,
+                        tx: &tx,
+                        persist: persist.as_ref(),
+                    }
+                    .reconcile_lemonade(&[], &mut discovery.lemonade_ids);
+                    lemonade_discovery_warn = None;
+                } else if !managed_endpoint && (discovery_due || !discovery.lemonade_ids.is_empty())
+                {
+                    endpoints.push(LemonadeEndpoint {
+                        host: opts.lemonade_host.clone(),
+                        port: opts.lemonade_port,
+                        collector: collector.clone(),
+                        rows: discovery
+                            .lemonade_ids
+                            .iter()
+                            .filter_map(|id| {
+                                runner.state.instances.get(id).map(|inst| LemonadeRow {
+                                    id: id.clone(),
+                                    model_names: vec![inst.model_name.clone()],
+                                })
+                            })
+                            .collect(),
+                        external: true,
+                        discover_external: discovery_due,
+                    });
+                }
+            }
+            let mut groups: HashMap<(String, u16), Vec<LemonadeRow>> = HashMap::new();
+            for target in &discovery.managed_lemonade {
+                // Use the registry's endpoint equivalence without rewriting the
+                // selected request host or conflating IPv4 and IPv6 listeners.
+                // Prefer the cached representative so reorder keeps its client.
+                // A cached collector dials a fixed address, so it is reused
+                // only when it would dial the same host as this target.
+                let endpoint = groups
+                    .keys()
+                    .find(|(host, port)| {
+                        crate::registry::endpoints_match(host, *port, &target.host, target.port)
+                            && crate::registry::cached_collector_reusable(host, &target.host)
+                    })
+                    .or_else(|| {
+                        managed_lemonade_collectors.keys().find(|(host, port)| {
+                            crate::registry::endpoints_match(host, *port, &target.host, target.port)
+                                && crate::registry::cached_collector_reusable(host, &target.host)
+                        })
+                    })
+                    .cloned()
+                    .unwrap_or_else(|| (target.host.clone(), target.port));
+                groups.entry(endpoint).or_default().push(LemonadeRow {
+                    id: target.service_id.clone(),
+                    model_names: vec![target.model_ref.clone(), target.canonical_model_id.clone()],
+                });
+            }
+            managed_lemonade_collectors.retain(|endpoint, _| groups.contains_key(endpoint));
+            if scrape_now {
+                for ((host, port), rows) in groups {
+                    let collector = managed_lemonade_collectors
+                        .entry((host.clone(), port))
+                        .or_insert_with(|| {
+                            LemonadeCollector::new(
+                                crate::registry::scrape_host(&host),
+                                port,
+                                Duration::from_millis(1500),
+                            )
+                        })
+                        .clone();
+                    endpoints.push(LemonadeEndpoint {
+                        host,
+                        port,
+                        collector,
+                        rows,
+                        external: false,
+                        discover_external: false,
+                    });
+                }
+            }
+            let results = parallel_scrape(endpoints, move |endpoint| async move {
+                // A managed row can be a server without the Lemonade protocol
+                // (a direct llama-server). It stays listed with throughput
+                // unavailable and no standing warning; real failures still warn.
+                let health = if endpoint.external {
+                    endpoint.collector.fetch_health().await?
+                } else if let Some(health) = endpoint.collector.fetch_health_if_router().await? {
+                    health
+                } else {
+                    return Ok((None, endpoint.rows.clone(), None, None));
+                };
+                let discovered = endpoint.discover_external.then(|| {
+                    rocm_dash_collectors::lemonade::services_from_health(
+                        &endpoint.host,
+                        endpoint.port,
+                        &health,
+                    )
+                });
+                let rows = discovered.as_ref().map_or_else(
+                    || endpoint.rows.clone(),
+                    |services| {
+                        services
+                            .iter()
+                            .map(|service| LemonadeRow {
+                                id: service.container_id.clone(),
+                                model_names: vec![service.model_name.clone()],
+                            })
+                            .collect()
+                    },
+                );
+                let attribution = health.stats_model();
+                let mut matching = rows.iter().filter(|row| {
+                    attribution
+                        .as_ref()
+                        .is_some_and(|model| row.model_names.iter().any(|name| name == model))
+                });
+                let attributed_id = matching
+                    .next()
+                    .filter(|_| matching.next().is_none())
+                    .map(|row| row.id.clone());
+                let stats = if scrape_now && attributed_id.is_some() {
+                    Some(endpoint.collector.fetch_stats().await)
+                } else {
+                    None
+                };
+                Ok::<_, rocm_dash_core::traits::CollectorError>((
+                    discovered,
+                    rows,
+                    attributed_id,
+                    stats,
+                ))
+            })
+            .await;
+            for (endpoint, result) in results {
+                let (discovered, rows, attributed_id, stats) = match result {
+                    Ok(result) => {
+                        if endpoint.discover_external {
+                            lemonade_discovery_warn = None;
+                        }
+                        result
+                    }
+                    Err(error) => {
+                        // A failed external discovery still removes rows immediately,
+                        // but reports why they disappeared. A never-seen endpoint
+                        // with nothing listening stays quiet; one that answers with
+                        // an HTTP or body error warns even on first contact.
+                        // Managed failures retain only the existing hold.
+                        if endpoint.discover_external {
+                            let absent = endpoint.rows.is_empty()
+                                && rocm_dash_collectors::lemonade::is_connect_error(&error);
+                            lemonade_discovery_warn =
+                                (!absent).then(|| endpoint.warning("health", &error));
+                            (Some(Vec::new()), Vec::new(), None, None)
+                        } else {
+                            scrape_warns.push(endpoint.warning("health", &error));
+                            continue;
+                        }
+                    }
+                };
+                if let Some(services) = discovered {
+                    Reconcile {
+                        state: &mut runner.state,
+                        telemetry: &mut telemetry,
+                        tx: &tx,
+                        persist: persist.as_ref(),
+                    }
+                    .reconcile_lemonade(&services, &mut discovery.lemonade_ids);
+                }
+                // Healthy contradictory/ambiguous evidence invalidates prior
+                // attribution immediately, even off the stats cadence.
+                for row in &rows {
+                    if Some(&row.id) != attributed_id.as_ref() {
+                        telemetry.gen_trackers.remove(&row.id);
+                    }
+                }
+                if let Some(stats) = stats {
+                    match stats {
+                        Ok(sample) => {
+                            if let Some(rate) = sample.gen_tps {
+                                telemetry
+                                    .gen_trackers
+                                    .entry(attributed_id.expect("stats require attribution"))
+                                    .or_insert_with(|| {
+                                        GenerationObservationTracker::new(opts.instance_tick)
+                                    })
+                                    .observe_direct(rate, cycle_at);
+                            }
+                        }
+                        Err(error) => scrape_warns.push(endpoint.warning("stats", &error)),
+                    }
+                }
+            }
+        }
+
+        // Per-instance vLLM metric scrape, parallel, on its own cadence.
+        // Lemonade rows are scraped via their endpoint collectors above, so
+        // exclude them from the vLLM Prometheus targets. Managed non-vLLM services
         // are excluded too (their engine uses a different parser).
         if let Some(prom) = vllm.as_ref()
             && !runner.state.instances.is_empty()
@@ -649,7 +920,7 @@ pub async fn run_loop(
         {
             let targets = vllm_scrape_targets(
                 &runner.state.instances,
-                discovery.lemonade_id.as_deref(),
+                &discovery.lemonade_ids,
                 &discovery.managed_non_vllm,
             );
             let prom = prom.clone();
@@ -747,52 +1018,6 @@ pub async fn run_loop(
             }
         }
 
-        // Lemonade per-instance scrape — reports an instantaneous rate directly
-        // (`gen_tps`), so no counter-differencing. A scrape failure leaves the
-        // last-known fields and warns; it never panics.
-        if let (Some(l), Some(id)) = (lemonade.as_ref(), discovery.lemonade_id.clone())
-            && tick_count.is_multiple_of(instance_ticks)
-        {
-            match l.fetch_stats().await {
-                Ok(sample) => {
-                    // EAI-7960: drive the tracker with a direct rate reading when
-                    // the sample carries one. A missing direct rate (None) does not
-                    // erase or refresh the tracker; the held value stays valid until
-                    // the validity window expires.
-                    if let Some(rate) = sample.gen_tps {
-                        telemetry
-                            .gen_trackers
-                            .entry(id.clone())
-                            .or_insert_with(|| {
-                                GenerationObservationTracker::new(opts.instance_tick)
-                            })
-                            .observe_direct(rate, cycle_at);
-                    }
-                    if let Some(mut inst) = runner.state.instances.get(&id).cloned() {
-                        // gen_tps is written in the snapshot assembly below;
-                        // set the KV/request fields immediately so they are
-                        // present in state for subsequent snapshots.
-                        inst.kv_cache_usage_pct = sample.kv_cache_usage_pct;
-                        inst.running_reqs = sample.running_reqs;
-                        inst.waiting_reqs = sample.waiting_reqs;
-                        // See the vLLM scrape-success handler: a successful stats
-                        // fetch proves the instance is serving; promote out of Starting.
-                        if matches!(inst.status, InstanceStatus::Starting { .. }) {
-                            inst.status = InstanceStatus::Ready;
-                        }
-                        runner.state.apply(StateEvent::InstanceUpserted(inst));
-                    }
-                }
-                Err(e) => {
-                    trace!(id = %id, error = %e, "lemonade scrape failed");
-                    scrape_warns.push(format!("lemonade scrape: {e}"));
-                    // EAI-7960: retain tracker during validity window on failure.
-                    // gen_tps is assembled from the tracker snapshot below;
-                    // no explicit clearing needed here.
-                }
-            }
-        }
-
         // Per-process VRAM attribution: refresh the per-container map on the
         // instance cadence via one amd-smi `process` scrape, joining GPU-process
         // host PIDs to container ids through `/proc/<pid>/cgroup`. On Err/empty
@@ -841,6 +1066,10 @@ pub async fn run_loop(
                 snapshot_latency(&mut telemetry.prev_ttft, &inst.container_id, cycle_at);
             (inst.tpot_ms, inst.tpot_observation) =
                 snapshot_latency(&mut telemetry.prev_tpot, &inst.container_id, cycle_at);
+            inst.gen_tps_last_request = telemetry
+                .gen_trackers
+                .get(&inst.container_id)
+                .is_some_and(GenerationObservationTracker::is_direct);
         }
         // Derive per-instance efficiency now that this tick's GPU power is known
         // and gen_tps reflects the tracker state for this cycle.
@@ -881,6 +1110,7 @@ pub async fn run_loop(
                 entry.ttft_observation = inst.ttft_observation.clone();
                 entry.tpot_ms = inst.tpot_ms;
                 entry.tpot_observation = inst.tpot_observation.clone();
+                entry.gen_tps_last_request = inst.gen_tps_last_request;
                 entry.tokens_per_watt = inst.tokens_per_watt;
                 entry.power_w = inst.power_w;
             }
@@ -907,6 +1137,7 @@ pub async fn run_loop(
         }
         warnings.extend(docker_warn.iter().cloned());
         warnings.extend(registry_warn.iter().cloned());
+        warnings.extend(lemonade_discovery_warn.iter().cloned());
         warnings.extend(scrape_warns.iter().cloned());
         let snap = Snapshot {
             timestamp: cycle_at,
@@ -1018,6 +1249,7 @@ pub(crate) fn merge_discovery_refresh(
         inst.waiting_reqs = ex.waiting_reqs;
         inst.gen_tps = ex.gen_tps;
         inst.gen_tps_observation = ex.gen_tps_observation.clone();
+        inst.gen_tps_last_request = ex.gen_tps_last_request;
         inst.tokens_per_watt = ex.tokens_per_watt;
         inst.power_w = ex.power_w;
         inst.ttft_ms = ex.ttft_ms;
@@ -1026,347 +1258,6 @@ pub(crate) fn merge_discovery_refresh(
         inst.tpot_observation = ex.tpot_observation.clone();
     }
     inst
-}
-
-/// Per-instance telemetry the loop carries between scrapes, keyed by container id.
-#[derive(Default)]
-struct TelemetryState {
-    /// Generation-throughput trackers. Constructed lazily from
-    /// `opts.instance_tick`; they survive scrape failures so the last-observed
-    /// rate is held for the validity window before clearing.
-    gen_trackers: HashMap<String, GenerationObservationTracker>,
-    /// Previous TTFT / TPOT histogram readings plus a freshness tracker per
-    /// instance, for the windowed avg-ms derivation (mirrors `gen_trackers`).
-    prev_ttft: LatencyWindows,
-    prev_tpot: LatencyWindows,
-}
-
-impl TelemetryState {
-    /// Remove all per-service telemetry state for `id`: tracker, TTFT, and
-    /// TPOT baselines.  Call on explicit removal (Docker Gone, Lemonade Gone,
-    /// managed Gone) and whenever an identity change requires a clean slate.
-    fn purge(&mut self, id: &str) {
-        self.gen_trackers.remove(id);
-        self.prev_ttft.remove(id);
-        self.prev_tpot.remove(id);
-    }
-
-    /// Invalidate the generation tracker for `id` (reset baseline without
-    /// removing the map entry) and clear the TTFT/TPOT latency windows.
-    /// Called when an endpoint changes within the same container/service id so
-    /// the new scrape address starts with a fresh rate baseline.
-    fn invalidate_on_endpoint_change(&mut self, id: &str) {
-        if let Some(t) = self.gen_trackers.get_mut(id) {
-            t.invalidate();
-        }
-        self.prev_ttft.remove(id);
-        self.prev_tpot.remove(id);
-    }
-}
-
-/// What each discovery source currently has live, so a pass can tell a new
-/// service from a known one and a known one from one that has gone.
-#[derive(Default)]
-struct DiscoveryState {
-    /// Container ids the last Docker pass saw.
-    known_instances: HashSet<String>,
-    /// Ids the last managed-service registry pass surfaced.
-    known_services: HashSet<String>,
-    /// The subset of the registry ids whose engine is NOT vLLM, excluded from
-    /// the vLLM Prometheus scrape so they aren't mis-parsed.
-    managed_non_vllm: HashSet<String>,
-    /// Ancestry roots of the managed services the registry surfaced, used to
-    /// attribute GPU processes to a service when the cgroup join cannot (a
-    /// managed service is not a container).
-    managed_roots: Vec<rocm_dash_collectors::ancestry::Root>,
-    /// The id of the currently-live Lemonade instance, if any.
-    lemonade_id: Option<String>,
-    /// How the registry reads have been going, so a condition that lasts many
-    /// passes is logged once rather than every discovery tick.
-    registry_health: RegistryHealth,
-}
-
-impl DiscoveryState {
-    /// Record what a pass that read only part of the registry found. The services
-    /// it saw join the known set, so a later complete read can retire them, and
-    /// the known ones it did not see stay; the non-vLLM marks of the services it
-    /// saw are refreshed and the others kept, so a kept non-vLLM service is still
-    /// left out of the vLLM scrape.
-    fn keep_through_partial_registry(&mut self, disc: crate::registry::ManagedDiscovery) {
-        self.managed_non_vllm.retain(|id| !disc.seen.contains(id));
-        self.managed_non_vllm.extend(disc.non_vllm);
-        // Roots of the services this pass saw are replaced; the unseen ones
-        // keep theirs, as their services stay known.
-        // A service this pass read and found stopped loses its roots too, or its
-        // PID would stay matchable for as long as an unrelated record is broken.
-        self.managed_roots
-            .retain(|r| !disc.seen.contains(&r.owner) && !disc.retired.contains(&r.owner));
-        self.managed_roots.extend(disc.roots);
-        self.known_services.extend(disc.seen);
-    }
-}
-
-/// What the managed-service registry's reads have reported so far. A failure
-/// that lasts is logged on its first pass only, the recovery once, and a set of
-/// malformed records each time it changes; the dashboard's warning badge, which
-/// is cheap and does not scroll, carries the failure for as long as it lasts.
-#[derive(Default)]
-struct RegistryHealth {
-    /// The previous pass could not read the registry.
-    failing: bool,
-    /// The malformed records the last successful pass reported, so an unchanged
-    /// set is not reported again.
-    reported_malformed: Vec<PathBuf>,
-}
-
-/// What a discovery pass should say about the registry, apart from the services
-/// it found. Kept as data so [`RegistryHealth::observe`] can be tested without a
-/// log subscriber.
-#[derive(Debug, Default, PartialEq, Eq)]
-struct RegistryChange {
-    /// The first failed pass of a streak, with the error.
-    failed: Option<String>,
-    /// The first successful pass after a streak of failures.
-    recovered: bool,
-    /// The malformed records, when the set differs from the one last reported
-    /// and is not empty.
-    malformed: Vec<PathBuf>,
-}
-
-impl RegistryHealth {
-    fn observe(
-        &mut self,
-        read: &Result<crate::registry::RegistryRead, crate::registry::RegistryReadError>,
-    ) -> RegistryChange {
-        let mut change = RegistryChange::default();
-        match read {
-            Err(e) => {
-                if !self.failing {
-                    self.failing = true;
-                    change.failed = Some(e.to_string());
-                }
-            }
-            Ok(read) => {
-                if self.failing {
-                    self.failing = false;
-                    change.recovered = true;
-                }
-                if read.malformed != self.reported_malformed {
-                    self.reported_malformed.clone_from(&read.malformed);
-                    change.malformed.clone_from(&read.malformed);
-                }
-            }
-        }
-        change
-    }
-}
-
-impl RegistryChange {
-    fn log(&self) {
-        if let Some(error) = &self.failed {
-            warn!(
-                error = %error,
-                "managed-service registry could not be read; keeping the known services until it can be"
-            );
-        }
-        if self.recovered {
-            info!("managed-service registry is readable again");
-        }
-        if !self.malformed.is_empty() {
-            warn!(
-                files = ?self.malformed,
-                "skipping managed-service records that are not valid JSON"
-            );
-        }
-    }
-}
-
-/// The header warning for a pass that could not read the registry.
-fn registry_read_warning(error: &crate::registry::RegistryReadError) -> String {
-    format!("managed registry: {error}; keeping the last known services")
-}
-
-/// Which discovery source a service came from. It only selects the log wording
-/// in [`Reconcile::announce`] and [`Reconcile::retire`]; those two steps behave
-/// the same for every source. How a pass decides what is new, known or gone
-/// differs: Docker and the registry go through `reconcile_set`, Lemonade through
-/// `reconcile_lemonade`.
-#[derive(Clone, Copy)]
-enum DiscoverySource {
-    Docker,
-    Lemonade,
-    Managed,
-}
-
-impl DiscoverySource {
-    fn log_discovered(self, svc: &DiscoveredService) {
-        match self {
-            Self::Docker => info!(
-                id = %svc.container_id,
-                name = %svc.container_name,
-                model = %svc.model_name,
-                "instance discovered"
-            ),
-            Self::Lemonade => info!(
-                id = %svc.container_id,
-                model = %svc.model_name,
-                "lemonade instance discovered"
-            ),
-            Self::Managed => info!(id = %svc.container_id, "managed service discovered"),
-        }
-    }
-
-    fn log_gone(self, id: &str) {
-        match self {
-            Self::Docker => info!(id = %id, "instance gone"),
-            Self::Lemonade => info!(id = %id, "lemonade instance gone"),
-            Self::Managed => info!(id = %id, "managed service gone"),
-        }
-    }
-}
-
-/// The loop state a discovery pass changes, and the stream it announces on.
-struct Reconcile<'a> {
-    state: &'a mut State,
-    telemetry: &'a mut TelemetryState,
-    tx: &'a broadcast::Sender<Event>,
-    persist: Option<&'a Arc<Mutex<SessionWriter>>>,
-}
-
-impl Reconcile<'_> {
-    /// Upsert a (re)discovered service. Collector-owned fields carry over from
-    /// the instance already in state unless `carry_live` is false, which is how
-    /// a changed identity starts from a clean baseline.
-    fn upsert(&mut self, svc: &DiscoveredService, carry_live: bool) {
-        let existing = self.state.instances.get(&svc.container_id).cloned();
-        let inst = merge_discovery_refresh(svc, if carry_live { existing.as_ref() } else { None });
-        self.state.apply(StateEvent::InstanceUpserted(inst));
-    }
-
-    /// Announce a newly discovered service. InstanceDiscovered is a
-    /// discovery-metadata event: it carries a clean instance, with no prior
-    /// collector-owned telemetry.
-    fn announce(&self, source: DiscoverySource, svc: &DiscoveredService) {
-        source.log_discovered(svc);
-        broadcast_and_persist(
-            self.tx,
-            self.persist,
-            Event::InstanceDiscovered(instance_from_discovered(svc)),
-        );
-    }
-
-    /// Drop a service that has gone: purge its telemetry, remove it from state
-    /// and announce it.
-    fn retire(&mut self, source: DiscoverySource, id: &str) {
-        source.log_gone(id);
-        self.telemetry.purge(id);
-        self.state
-            .apply(StateEvent::InstanceRemoved(id.to_string()));
-        broadcast_and_persist(
-            self.tx,
-            self.persist,
-            Event::InstanceGone {
-                container_id: id.to_string(),
-            },
-        );
-    }
-
-    /// Reconcile a source that reports its whole set each pass (Docker, the
-    /// managed-service registry). `known` is what the previous pass saw and
-    /// `seen` what this one saw; the caller stores `seen` as the next `known`.
-    ///
-    /// A service whose port changed under the same id has a new scrape address:
-    /// its rate baseline and latency windows are reset and no live fields carry
-    /// over. It is still the same service, so it is not announced again.
-    fn reconcile_set(
-        &mut self,
-        source: DiscoverySource,
-        svcs: &[DiscoveredService],
-        known: &HashSet<String>,
-        seen: &HashSet<String>,
-    ) {
-        self.upsert_set(source, svcs, known);
-        for gone in known.difference(seen) {
-            self.retire(source, gone);
-        }
-    }
-
-    /// The half of [`Self::reconcile_set`] that adds and refreshes: upsert every
-    /// service in `svcs` and announce the ones `known` did not have. Retires
-    /// nothing, which is what a pass that could only see part of its source needs
-    /// (see [`DiscoveryState::keep_through_partial_registry`]).
-    fn upsert_set(
-        &mut self,
-        source: DiscoverySource,
-        svcs: &[DiscoveredService],
-        known: &HashSet<String>,
-    ) {
-        for svc in svcs {
-            let same_endpoint = self
-                .state
-                .instances
-                .get(&svc.container_id)
-                .is_none_or(|ex| ex.port == svc.port);
-            if !same_endpoint {
-                self.telemetry
-                    .invalidate_on_endpoint_change(&svc.container_id);
-            }
-            self.upsert(svc, same_endpoint);
-            if !known.contains(&svc.container_id) {
-                self.announce(source, svc);
-            }
-        }
-    }
-
-    /// Reconcile the probe-based Lemonade source, which has at most one service.
-    ///
-    /// Its `container_id` encodes the host and port, so a port or host change
-    /// yields a new id. The old id is retired first (its telemetry is purged, so
-    /// a stale rate baseline, TTFT and TPOT do not bleed across; it leaves the
-    /// state and is announced gone), then the new id is announced, so the state
-    /// and every snapshot carry one Lemonade instance and the vLLM scrape never
-    /// polls the old endpoint. `None` means the endpoint did not answer, which
-    /// retires the current one.
-    fn reconcile_lemonade(
-        &mut self,
-        probed: Option<DiscoveredService>,
-        current: &mut Option<String>,
-    ) {
-        match probed {
-            Some(svc) => {
-                let is_new_id = current.as_deref() != Some(svc.container_id.as_str());
-                if is_new_id && let Some(old_id) = current.take() {
-                    self.retire(DiscoverySource::Lemonade, &old_id);
-                }
-                self.upsert(&svc, !is_new_id);
-                if is_new_id {
-                    self.announce(DiscoverySource::Lemonade, &svc);
-                    *current = Some(svc.container_id.clone());
-                }
-            }
-            None => {
-                if let Some(id) = current.take() {
-                    self.retire(DiscoverySource::Lemonade, &id);
-                }
-            }
-        }
-    }
-}
-
-/// The `(id, port)` pairs the per-instance vLLM Prometheus scrape polls: every
-/// instance with a port except the live Lemonade instance (its own collector
-/// scrapes it) and the managed services whose engine is not vLLM.
-fn vllm_scrape_targets(
-    instances: &HashMap<String, Instance>,
-    lemonade_id: Option<&str>,
-    managed_non_vllm: &HashSet<String>,
-) -> Vec<(String, u16)> {
-    instances
-        .values()
-        .filter(|i| Some(i.container_id.as_str()) != lemonade_id)
-        .filter(|i| !managed_non_vllm.contains(&i.container_id))
-        .filter_map(|i| i.port.map(|p| (i.container_id.clone(), p)))
-        .collect()
 }
 
 /// Set `vram_used_mb`/`vram_total_mb` on each instance from the per-process
@@ -1646,7 +1537,7 @@ mod tests {
         );
     }
 
-    fn at(secs: i64) -> DateTime<Utc> {
+    pub(super) fn at(secs: i64) -> DateTime<Utc> {
         Utc.timestamp_opt(secs, 0).unwrap()
     }
 
@@ -1654,7 +1545,7 @@ mod tests {
 
     const TICK: Duration = Duration::from_secs(2);
 
-    fn baseline(sum_s: f64, count: f64) -> LatencyWindow {
+    pub(super) fn baseline(sum_s: f64, count: f64) -> LatencyWindow {
         LatencyWindow {
             prev: Some((sum_s, count, at(10))),
             tracker: GenerationObservationTracker::new(TICK),
@@ -1952,843 +1843,6 @@ mod tests {
         assert_eq!(
             ticks_per(Duration::from_secs(30), Duration::from_millis(250)),
             120
-        );
-    }
-
-    // -- Identity/endpoint cleanup helper tests -----------------------------------
-
-    fn make_tracker(tick_secs: u64) -> GenerationObservationTracker {
-        GenerationObservationTracker::new(Duration::from_secs(tick_secs))
-    }
-
-    /// `TelemetryState::purge` removes the tracker entry, TTFT baseline, and
-    /// TPOT baseline for the target id and leaves other ids untouched.
-    #[test]
-    fn telemetry_state_purge_removes_all_three_maps_for_id() {
-        let mut state = TelemetryState::default();
-
-        // Populate two ids.
-        state.gen_trackers.insert("a".into(), make_tracker(2));
-        state.gen_trackers.insert("b".into(), make_tracker(2));
-        state.prev_ttft.insert("a".into(), baseline(1.0, 1.0));
-        state.prev_ttft.insert("b".into(), baseline(2.0, 2.0));
-        state.prev_tpot.insert("a".into(), baseline(3.0, 3.0));
-        state.prev_tpot.insert("b".into(), baseline(4.0, 4.0));
-
-        state.purge("a");
-
-        // "a" must be gone from all maps.
-        assert!(
-            !state.gen_trackers.contains_key("a"),
-            "tracker for a must be removed"
-        );
-        assert!(
-            !state.prev_ttft.contains_key("a"),
-            "ttft for a must be removed"
-        );
-        assert!(
-            !state.prev_tpot.contains_key("a"),
-            "tpot for a must be removed"
-        );
-        // "b" must be unaffected.
-        assert!(
-            state.gen_trackers.contains_key("b"),
-            "tracker for b must survive"
-        );
-        assert!(state.prev_ttft.contains_key("b"), "ttft for b must survive");
-        assert!(state.prev_tpot.contains_key("b"), "tpot for b must survive");
-    }
-
-    /// `TelemetryState::invalidate_on_endpoint_change` invalidates the tracker
-    /// (resets its window so subsequent snapshots return None) and removes the
-    /// latency baselines, without removing the tracker entry itself.
-    #[test]
-    fn invalidate_on_endpoint_change_resets_tracker_and_clears_latency() {
-        let mut state = TelemetryState::default();
-
-        let mut tracker = make_tracker(2);
-        // Give the tracker a reading so it has a non-None baseline.
-        tracker.observe_counter(100.0, at(10));
-        tracker.observe_counter(200.0, at(12));
-        state.gen_trackers.insert("svc".into(), tracker);
-        state.prev_ttft.insert("svc".into(), baseline(1.0, 10.0));
-        state.prev_tpot.insert("svc".into(), baseline(0.5, 8.0));
-
-        state.invalidate_on_endpoint_change("svc");
-
-        // Tracker still exists but its window is reset: snapshot returns None.
-        let (rate, _meta) = state
-            .gen_trackers
-            .get_mut("svc")
-            .expect("tracker entry must remain")
-            .snapshot(at(12));
-        assert!(rate.is_none(), "invalidated tracker must yield None rate");
-        // Latency baselines must be cleared.
-        assert!(
-            !state.prev_ttft.contains_key("svc"),
-            "ttft baseline must be cleared on endpoint change"
-        );
-        assert!(
-            !state.prev_tpot.contains_key("svc"),
-            "tpot baseline must be cleared on endpoint change"
-        );
-    }
-
-    // ── Discovery reconcile ─────────────────────────────────────────────────
-    //
-    // The Docker source cannot be driven end to end without a container
-    // daemon, and `reconcile_set` is the code both it and the managed-service
-    // registry run, so these tests exercise it directly. The registry and
-    // Lemonade sources are also driven end to end in
-    // `tests/discovery_reconcile.rs`, except the registry's retirement of a
-    // vanished service and Lemonade's change of id, which only these tests
-    // cover.
-
-    fn discovered(id: &str, port: u16) -> DiscoveredService {
-        DiscoveredService {
-            container_id: id.into(),
-            container_name: format!("name-{id}"),
-            model_name: "model".into(),
-            port: Some(port),
-            ..Default::default()
-        }
-    }
-
-    fn id_set(ids: &[&str]) -> HashSet<String> {
-        ids.iter().map(|s| (*s).to_string()).collect()
-    }
-
-    /// The reducer state, telemetry and event stream a reconcile pass works on.
-    struct Pass {
-        state: State,
-        telemetry: TelemetryState,
-        tx: broadcast::Sender<Event>,
-        rx: broadcast::Receiver<Event>,
-    }
-
-    impl Pass {
-        fn new() -> Self {
-            let (tx, rx) = broadcast::channel(64);
-            Self {
-                state: State::default(),
-                telemetry: TelemetryState::default(),
-                tx,
-                rx,
-            }
-        }
-
-        fn reconcile(&mut self) -> Reconcile<'_> {
-            Reconcile {
-                state: &mut self.state,
-                telemetry: &mut self.telemetry,
-                tx: &self.tx,
-                persist: None,
-            }
-        }
-
-        /// The announcements broadcast since the last call, as `discovered <id>`
-        /// and `gone <id>` strings.
-        fn announced(&mut self) -> Vec<String> {
-            let mut out = Vec::new();
-            while let Ok(ev) = self.rx.try_recv() {
-                match ev {
-                    Event::InstanceDiscovered(i) => {
-                        out.push(format!("discovered {}", i.container_id));
-                    }
-                    Event::InstanceGone { container_id } => {
-                        out.push(format!("gone {container_id}"));
-                    }
-                    _ => {}
-                }
-            }
-            out
-        }
-
-        /// Give `id` a live KV reading and a latency baseline, as a scrape would.
-        fn scrape(&mut self, id: &str) {
-            let mut inst = self.state.instances.get(id).cloned().expect("instance");
-            inst.kv_cache_usage_pct = Some(25.0);
-            self.state.apply(StateEvent::InstanceUpserted(inst));
-            self.telemetry
-                .prev_ttft
-                .insert(id.into(), baseline(1.0, 10.0));
-            self.telemetry
-                .prev_tpot
-                .insert(id.into(), baseline(0.5, 8.0));
-        }
-
-        fn kv(&self, id: &str) -> Option<f32> {
-            self.state
-                .instances
-                .get(id)
-                .and_then(|i| i.kv_cache_usage_pct)
-        }
-    }
-
-    #[test]
-    fn reconcile_set_announces_a_new_service_once() {
-        let mut pass = Pass::new();
-        let svcs = [discovered("a", 8000)];
-
-        pass.reconcile().reconcile_set(
-            DiscoverySource::Docker,
-            &svcs,
-            &id_set(&[]),
-            &id_set(&["a"]),
-        );
-        assert_eq!(pass.announced(), ["discovered a"]);
-        assert!(pass.state.instances.contains_key("a"));
-
-        pass.reconcile().reconcile_set(
-            DiscoverySource::Docker,
-            &svcs,
-            &id_set(&["a"]),
-            &id_set(&["a"]),
-        );
-        assert!(
-            pass.announced().is_empty(),
-            "a known service must not be announced again"
-        );
-    }
-
-    #[test]
-    fn reconcile_set_keeps_live_fields_while_the_endpoint_is_unchanged() {
-        let mut pass = Pass::new();
-        let svcs = [discovered("a", 8000)];
-        pass.reconcile().reconcile_set(
-            DiscoverySource::Docker,
-            &svcs,
-            &id_set(&[]),
-            &id_set(&["a"]),
-        );
-        pass.scrape("a");
-
-        pass.reconcile().reconcile_set(
-            DiscoverySource::Docker,
-            &svcs,
-            &id_set(&["a"]),
-            &id_set(&["a"]),
-        );
-
-        assert_eq!(pass.kv("a"), Some(25.0));
-        assert!(pass.telemetry.prev_ttft.contains_key("a"));
-        assert!(pass.telemetry.prev_tpot.contains_key("a"));
-    }
-
-    #[test]
-    fn reconcile_set_starts_clean_when_the_port_moves_under_the_same_id() {
-        let mut pass = Pass::new();
-        pass.reconcile().reconcile_set(
-            DiscoverySource::Docker,
-            &[discovered("a", 8000)],
-            &id_set(&[]),
-            &id_set(&["a"]),
-        );
-        pass.scrape("a");
-        pass.announced();
-
-        pass.reconcile().reconcile_set(
-            DiscoverySource::Docker,
-            &[discovered("a", 9000)],
-            &id_set(&["a"]),
-            &id_set(&["a"]),
-        );
-
-        assert_eq!(pass.state.instances["a"].port, Some(9000));
-        assert_eq!(pass.kv("a"), None, "the old endpoint's reading leaked");
-        assert!(!pass.telemetry.prev_ttft.contains_key("a"));
-        assert!(!pass.telemetry.prev_tpot.contains_key("a"));
-        assert!(
-            pass.announced().is_empty(),
-            "a port change is not a new or a gone service"
-        );
-    }
-
-    #[test]
-    fn reconcile_set_retires_a_vanished_service_and_keeps_the_others() {
-        let mut pass = Pass::new();
-        let svcs = [discovered("a", 8000), discovered("b", 8001)];
-        pass.reconcile().reconcile_set(
-            DiscoverySource::Managed,
-            &svcs,
-            &id_set(&[]),
-            &id_set(&["a", "b"]),
-        );
-        pass.scrape("a");
-        pass.scrape("b");
-        pass.announced();
-
-        pass.reconcile().reconcile_set(
-            DiscoverySource::Managed,
-            &svcs[..1],
-            &id_set(&["a", "b"]),
-            &id_set(&["a"]),
-        );
-
-        assert_eq!(pass.announced(), ["gone b"]);
-        assert!(!pass.state.instances.contains_key("b"));
-        assert!(!pass.telemetry.prev_ttft.contains_key("b"));
-        assert!(pass.state.instances.contains_key("a"));
-        assert!(pass.telemetry.prev_ttft.contains_key("a"));
-    }
-
-    // ── Lemonade state matrix ───────────────────────────────────────────────
-    //
-    // One Lemonade endpoint is probed per discovery pass. Its id encodes the host
-    // and port, so the states a probe can observe are: nothing ever answered; the
-    // first answer; the same endpoint again; the host or the port changed; the
-    // endpoint went quiet; it came back somewhere else; and the same answer
-    // arriving twice in one tick. Each row below checks the announcements, the
-    // instances a snapshot would carry, the telemetry kept per id, and the
-    // `(id, port)` pairs the vLLM scrape would poll, because a stale instance is
-    // visible on all four.
-
-    fn lemonade_svc(host: &str, port: u16) -> DiscoveredService {
-        DiscoveredService {
-            container_id: format!("lemonade-{host}-{port}"),
-            container_name: "lemonade".into(),
-            model_name: "model".into(),
-            port: Some(port),
-            ..Default::default()
-        }
-    }
-
-    impl Pass {
-        /// The ids a snapshot carries. The loop builds a snapshot's instances from
-        /// `state.instances`, so this is the dashboard's view of the pass.
-        fn instance_ids(&self) -> Vec<String> {
-            let mut ids: Vec<String> = self.state.instances.keys().cloned().collect();
-            ids.sort();
-            ids
-        }
-
-        /// The ids the vLLM Prometheus scrape would poll while `current` is the
-        /// live Lemonade id.
-        fn scrape_targets(&self, current: Option<&str>) -> Vec<String> {
-            let mut ids: Vec<String> =
-                vllm_scrape_targets(&self.state.instances, current, &HashSet::new())
-                    .into_iter()
-                    .map(|(id, _port)| id)
-                    .collect();
-            ids.sort();
-            ids
-        }
-
-        /// A live KV reading, latency baselines and a rate tracker for `id`.
-        fn give_live_telemetry(&mut self, id: &str) {
-            self.scrape(id);
-            self.telemetry
-                .gen_trackers
-                .insert(id.into(), make_tracker(2));
-        }
-
-        fn has_telemetry(&self, id: &str) -> bool {
-            self.telemetry.gen_trackers.contains_key(id)
-                || self.telemetry.prev_ttft.contains_key(id)
-                || self.telemetry.prev_tpot.contains_key(id)
-        }
-    }
-
-    fn ids(ids: &[&str]) -> Vec<String> {
-        ids.iter().map(|s| (*s).to_string()).collect()
-    }
-
-    /// Discover `old`, give it live telemetry, then probe `new`. Returns the pass,
-    /// the loop's current Lemonade id and what the second probe announced.
-    fn lemonade_identity_change(
-        old: &DiscoveredService,
-        new: &DiscoveredService,
-    ) -> (Pass, Option<String>, Vec<String>) {
-        let mut pass = Pass::new();
-        let mut current: Option<String> = None;
-        pass.reconcile()
-            .reconcile_lemonade(Some(old.clone()), &mut current);
-        pass.give_live_telemetry(&old.container_id);
-        pass.announced();
-
-        pass.reconcile()
-            .reconcile_lemonade(Some(new.clone()), &mut current);
-        let announced = pass.announced();
-        (pass, current, announced)
-    }
-
-    #[test]
-    fn lemonade_that_never_answers_leaves_no_trace() {
-        let mut pass = Pass::new();
-        let mut current: Option<String> = None;
-
-        pass.reconcile().reconcile_lemonade(None, &mut current);
-        pass.reconcile().reconcile_lemonade(None, &mut current);
-
-        assert!(pass.announced().is_empty());
-        assert_eq!(current, None);
-        assert!(pass.instance_ids().is_empty());
-        assert!(pass.scrape_targets(current.as_deref()).is_empty());
-    }
-
-    #[test]
-    fn lemonade_first_answer_is_announced_once_and_left_to_its_own_collector() {
-        let mut pass = Pass::new();
-        let mut current: Option<String> = None;
-
-        pass.reconcile()
-            .reconcile_lemonade(Some(lemonade_svc("127.0.0.1", 13305)), &mut current);
-
-        assert_eq!(pass.announced(), ["discovered lemonade-127.0.0.1-13305"]);
-        assert_eq!(current.as_deref(), Some("lemonade-127.0.0.1-13305"));
-        assert_eq!(pass.instance_ids(), ids(&["lemonade-127.0.0.1-13305"]));
-        assert!(
-            pass.scrape_targets(current.as_deref()).is_empty(),
-            "the live Lemonade instance is not a vLLM scrape target"
-        );
-    }
-
-    #[test]
-    fn lemonade_same_endpoint_again_keeps_its_instance_and_live_fields() {
-        let svc = lemonade_svc("127.0.0.1", 13305);
-        let id = svc.container_id.clone();
-        let mut pass = Pass::new();
-        let mut current: Option<String> = None;
-        pass.reconcile()
-            .reconcile_lemonade(Some(svc.clone()), &mut current);
-        pass.give_live_telemetry(&id);
-        pass.announced();
-
-        pass.reconcile().reconcile_lemonade(Some(svc), &mut current);
-
-        assert!(pass.announced().is_empty());
-        assert_eq!(pass.instance_ids(), ids(&[&id]));
-        assert_eq!(pass.kv(&id), Some(25.0));
-        assert!(pass.has_telemetry(&id));
-        assert!(pass.scrape_targets(current.as_deref()).is_empty());
-    }
-
-    #[test]
-    fn lemonade_host_change_retires_the_old_instance_and_announces_the_new_one() {
-        let old = lemonade_svc("127.0.0.1", 13305);
-        let new = lemonade_svc("10.0.0.7", 13305);
-        let (pass, current, announced) = lemonade_identity_change(&old, &new);
-
-        assert_eq!(current.as_deref(), Some(new.container_id.as_str()));
-        assert_eq!(
-            announced,
-            [
-                "gone lemonade-127.0.0.1-13305",
-                "discovered lemonade-10.0.0.7-13305"
-            ]
-        );
-        assert!(!pass.has_telemetry(&old.container_id));
-        assert_eq!(pass.instance_ids(), ids(&["lemonade-10.0.0.7-13305"]));
-        assert!(
-            pass.scrape_targets(current.as_deref()).is_empty(),
-            "the old endpoint must not be polled as a vLLM target"
-        );
-    }
-
-    #[test]
-    fn lemonade_port_change_retires_the_old_instance_and_announces_the_new_one() {
-        let old = lemonade_svc("127.0.0.1", 13305);
-        let new = lemonade_svc("127.0.0.1", 13306);
-        let (pass, current, announced) = lemonade_identity_change(&old, &new);
-
-        assert_eq!(current.as_deref(), Some(new.container_id.as_str()));
-        assert_eq!(
-            announced,
-            [
-                "gone lemonade-127.0.0.1-13305",
-                "discovered lemonade-127.0.0.1-13306"
-            ]
-        );
-        assert!(!pass.has_telemetry(&old.container_id));
-        assert_eq!(pass.instance_ids(), ids(&["lemonade-127.0.0.1-13306"]));
-        assert!(
-            pass.scrape_targets(current.as_deref()).is_empty(),
-            "the old endpoint must not be polled as a vLLM target"
-        );
-    }
-
-    #[test]
-    fn lemonade_endpoint_going_quiet_is_announced_gone_and_leaves_no_trace() {
-        let svc = lemonade_svc("127.0.0.1", 13305);
-        let id = svc.container_id.clone();
-        let mut pass = Pass::new();
-        let mut current: Option<String> = None;
-        pass.reconcile().reconcile_lemonade(Some(svc), &mut current);
-        pass.give_live_telemetry(&id);
-        pass.announced();
-
-        pass.reconcile().reconcile_lemonade(None, &mut current);
-
-        assert_eq!(pass.announced(), [format!("gone {id}")]);
-        assert_eq!(current, None);
-        assert!(pass.instance_ids().is_empty());
-        assert!(!pass.has_telemetry(&id));
-        assert!(pass.scrape_targets(current.as_deref()).is_empty());
-    }
-
-    #[test]
-    fn lemonade_coming_back_elsewhere_after_going_quiet_is_the_only_instance() {
-        let old = lemonade_svc("127.0.0.1", 13305);
-        let new = lemonade_svc("127.0.0.1", 13306);
-        let mut pass = Pass::new();
-        let mut current: Option<String> = None;
-        pass.reconcile()
-            .reconcile_lemonade(Some(old.clone()), &mut current);
-        pass.give_live_telemetry(&old.container_id);
-        pass.reconcile().reconcile_lemonade(None, &mut current);
-        assert_eq!(
-            pass.announced(),
-            [
-                "discovered lemonade-127.0.0.1-13305",
-                "gone lemonade-127.0.0.1-13305"
-            ]
-        );
-
-        pass.reconcile()
-            .reconcile_lemonade(Some(new.clone()), &mut current);
-
-        assert_eq!(pass.announced(), ["discovered lemonade-127.0.0.1-13306"]);
-        assert_eq!(current.as_deref(), Some(new.container_id.as_str()));
-        assert_eq!(pass.instance_ids(), ids(&[&new.container_id]));
-        assert!(!pass.has_telemetry(&old.container_id));
-        assert!(pass.scrape_targets(current.as_deref()).is_empty());
-    }
-
-    #[test]
-    fn lemonade_answer_repeated_within_one_tick_is_announced_once() {
-        let svc = lemonade_svc("127.0.0.1", 13305);
-        let mut pass = Pass::new();
-        let mut current: Option<String> = None;
-
-        pass.reconcile()
-            .reconcile_lemonade(Some(svc.clone()), &mut current);
-        pass.reconcile().reconcile_lemonade(Some(svc), &mut current);
-
-        assert_eq!(pass.announced(), ["discovered lemonade-127.0.0.1-13305"]);
-        assert_eq!(pass.instance_ids(), ids(&["lemonade-127.0.0.1-13305"]));
-        assert!(pass.scrape_targets(current.as_deref()).is_empty());
-    }
-
-    #[test]
-    fn lemonade_endpoint_moving_away_and_back_is_retired_each_time() {
-        let a = lemonade_svc("127.0.0.1", 13305);
-        let b = lemonade_svc("127.0.0.1", 13306);
-        let mut pass = Pass::new();
-        let mut current: Option<String> = None;
-        pass.reconcile()
-            .reconcile_lemonade(Some(a.clone()), &mut current);
-        pass.announced();
-
-        pass.reconcile().reconcile_lemonade(Some(b), &mut current);
-        assert_eq!(
-            pass.announced(),
-            [
-                "gone lemonade-127.0.0.1-13305",
-                "discovered lemonade-127.0.0.1-13306"
-            ]
-        );
-        pass.reconcile()
-            .reconcile_lemonade(Some(a.clone()), &mut current);
-
-        assert_eq!(
-            pass.announced(),
-            [
-                "gone lemonade-127.0.0.1-13306",
-                "discovered lemonade-127.0.0.1-13305"
-            ]
-        );
-        assert_eq!(current.as_deref(), Some(a.container_id.as_str()));
-        assert_eq!(pass.instance_ids(), ids(&[&a.container_id]));
-        assert!(pass.scrape_targets(current.as_deref()).is_empty());
-    }
-
-    #[test]
-    fn reconcile_lemonade_follows_one_endpoint_through_its_lifecycle() {
-        let mut pass = Pass::new();
-        let mut current: Option<String> = None;
-
-        pass.reconcile()
-            .reconcile_lemonade(Some(discovered("l1", 13305)), &mut current);
-        assert_eq!(pass.announced(), ["discovered l1"]);
-        assert_eq!(current.as_deref(), Some("l1"));
-
-        pass.scrape("l1");
-        pass.reconcile()
-            .reconcile_lemonade(Some(discovered("l1", 13305)), &mut current);
-        assert!(
-            pass.announced().is_empty(),
-            "same id must not be re-announced"
-        );
-        assert_eq!(pass.kv("l1"), Some(25.0), "live fields carry over");
-
-        // A new id (the host or port changed) retires the old id, telemetry
-        // included, and announces the new one.
-        pass.reconcile()
-            .reconcile_lemonade(Some(discovered("l2", 13306)), &mut current);
-        assert_eq!(pass.announced(), ["gone l1", "discovered l2"]);
-        assert_eq!(current.as_deref(), Some("l2"));
-        assert!(!pass.telemetry.prev_ttft.contains_key("l1"));
-        // The superseded instance leaves the state (and so every snapshot), not
-        // only its telemetry.
-        assert!(!pass.state.instances.contains_key("l1"));
-
-        pass.reconcile().reconcile_lemonade(None, &mut current);
-        assert_eq!(pass.announced(), ["gone l2"]);
-        assert_eq!(current, None);
-        assert!(!pass.state.instances.contains_key("l2"));
-
-        pass.reconcile().reconcile_lemonade(None, &mut current);
-        assert!(pass.announced().is_empty(), "nothing left to retire");
-    }
-
-    // Registry read health: one test per row of the state matrix (first
-    // failure, repeated failure, recovery, empty, populated, malformed new,
-    // malformed unchanged, malformed cleared).
-
-    fn registry_read(
-        malformed: &[&str],
-    ) -> Result<crate::registry::RegistryRead, crate::registry::RegistryReadError> {
-        Ok(crate::registry::RegistryRead {
-            records: Vec::new(),
-            malformed: malformed.iter().map(PathBuf::from).collect(),
-        })
-    }
-
-    fn registry_failure(
-        why: &str,
-    ) -> Result<crate::registry::RegistryRead, crate::registry::RegistryReadError> {
-        Err(crate::registry::RegistryReadError {
-            path: PathBuf::from("services"),
-            source: std::io::Error::other(why),
-            partial: crate::registry::RegistryRead::default(),
-        })
-    }
-
-    /// State matrix for what a partially read registry does to the discovery
-    /// state, one assertion group per row: a service it saw joins the known set
-    /// and its non-vLLM mark follows the record; one it did not see stays known
-    /// and keeps its mark; nothing leaves either set.
-    #[test]
-    fn partial_registry_read_adds_what_it_saw_and_forgets_nothing() {
-        let mut state = DiscoveryState {
-            known_services: id_set(&["old-vllm", "old-lemonade", "flips"]),
-            managed_non_vllm: id_set(&["old-lemonade", "flips"]),
-            ..DiscoveryState::default()
-        };
-
-        state.keep_through_partial_registry(crate::registry::ManagedDiscovery {
-            seen: id_set(&["new-lemonade", "new-vllm", "flips"]),
-            non_vllm: id_set(&["new-lemonade"]),
-            ..Default::default()
-        });
-
-        assert_eq!(
-            state.known_services,
-            id_set(&[
-                "old-vllm",
-                "old-lemonade",
-                "flips",
-                "new-lemonade",
-                "new-vllm"
-            ]),
-            "the unseen services stay known and the new ones join them"
-        );
-        assert_eq!(
-            state.managed_non_vllm,
-            id_set(&["old-lemonade", "new-lemonade"]),
-            "an unseen non-vLLM service keeps its mark, a seen one follows its record"
-        );
-    }
-
-    #[test]
-    fn partial_registry_read_refreshes_the_roots_it_saw_and_keeps_the_unseen() {
-        use rocm_dash_collectors::ancestry::Root;
-        let root = |pid, owner: &str| Root {
-            pid,
-            start_ticks: None,
-            owner: owner.into(),
-        };
-        let mut state = DiscoveryState {
-            known_services: id_set(&["seen", "unseen"]),
-            managed_roots: vec![root(10, "seen"), root(20, "unseen")],
-            ..DiscoveryState::default()
-        };
-
-        // `seen` was relaunched under a new engine pid; `unseen` was not read.
-        state.keep_through_partial_registry(crate::registry::ManagedDiscovery {
-            seen: id_set(&["seen"]),
-            roots: vec![root(11, "seen")],
-            ..Default::default()
-        });
-
-        let mut got: Vec<_> = state
-            .managed_roots
-            .iter()
-            .map(|r| (r.pid, r.owner.as_str()))
-            .collect();
-        got.sort_unstable();
-        assert_eq!(
-            got,
-            vec![(11, "seen"), (20, "unseen")],
-            "a seen service's roots are replaced, an unseen one's survive"
-        );
-    }
-
-    #[test]
-    fn partial_registry_read_drops_the_roots_of_a_service_it_saw_stop() {
-        use rocm_dash_collectors::ancestry::Root;
-        let root = |pid, owner: &str| Root {
-            pid,
-            start_ticks: None,
-            owner: owner.into(),
-        };
-        let mut state = DiscoveryState {
-            managed_roots: vec![root(10, "stopped"), root(20, "unseen")],
-            ..DiscoveryState::default()
-        };
-        // `stopped` was read this pass and is no longer running; an unrelated
-        // record failed to read, which is what makes this a partial pass.
-        state.keep_through_partial_registry(crate::registry::ManagedDiscovery {
-            retired: id_set(&["stopped"]),
-            ..Default::default()
-        });
-        let owners: Vec<_> = state
-            .managed_roots
-            .iter()
-            .map(|r| r.owner.as_str())
-            .collect();
-        assert_eq!(
-            owners,
-            vec!["unseen"],
-            "a stopped service's PID must not stay matchable"
-        );
-    }
-
-    #[test]
-    fn partial_registry_read_that_saw_nothing_keeps_every_root() {
-        use rocm_dash_collectors::ancestry::Root;
-        let mut state = DiscoveryState {
-            managed_roots: vec![Root {
-                pid: 10,
-                start_ticks: Some(5),
-                owner: "a".into(),
-            }],
-            ..DiscoveryState::default()
-        };
-        state.keep_through_partial_registry(crate::registry::ManagedDiscovery::default());
-        assert_eq!(state.managed_roots.len(), 1);
-    }
-
-    #[test]
-    fn partial_registry_read_that_saw_nothing_changes_nothing() {
-        let mut state = DiscoveryState {
-            known_services: id_set(&["a", "b"]),
-            managed_non_vllm: id_set(&["b"]),
-            ..DiscoveryState::default()
-        };
-
-        state.keep_through_partial_registry(crate::registry::ManagedDiscovery::default());
-
-        assert_eq!(state.known_services, id_set(&["a", "b"]));
-        assert_eq!(state.managed_non_vllm, id_set(&["b"]));
-    }
-
-    #[test]
-    fn registry_health_reports_the_first_failure_of_a_streak_once() {
-        let mut health = RegistryHealth::default();
-
-        let first = health.observe(&registry_failure("disk gone"));
-        assert_eq!(
-            first.failed.as_deref(),
-            Some("cannot read services: disk gone"),
-            "the first failed pass names the error"
-        );
-        assert!(!first.recovered);
-
-        for pass in 2..=5 {
-            assert_eq!(
-                health.observe(&registry_failure("disk gone")),
-                RegistryChange::default(),
-                "failed pass {pass} of the same streak must stay quiet"
-            );
-        }
-    }
-
-    #[test]
-    fn registry_health_reports_recovery_once_and_a_new_streak_again() {
-        let mut health = RegistryHealth::default();
-        health.observe(&registry_failure("one"));
-        health.observe(&registry_failure("one"));
-
-        let recovered = health.observe(&registry_read(&[]));
-        assert!(recovered.recovered);
-        assert!(recovered.failed.is_none());
-        assert_eq!(
-            health.observe(&registry_read(&[])),
-            RegistryChange::default(),
-            "only the first good pass after a streak is a recovery"
-        );
-
-        let again = health.observe(&registry_failure("two"));
-        assert_eq!(again.failed.as_deref(), Some("cannot read services: two"));
-    }
-
-    #[test]
-    fn registry_health_is_quiet_for_an_empty_or_populated_registry() {
-        let mut health = RegistryHealth::default();
-        // A healthy read, empty or not, says nothing: there is no failure to
-        // report and no failure to have recovered from.
-        for _ in 0..3 {
-            assert_eq!(
-                health.observe(&registry_read(&[])),
-                RegistryChange::default()
-            );
-        }
-    }
-
-    #[test]
-    fn registry_health_reports_a_malformed_set_when_it_changes() {
-        let mut health = RegistryHealth::default();
-
-        let first = health.observe(&registry_read(&["a.json"]));
-        assert_eq!(first.malformed, [PathBuf::from("a.json")]);
-        assert_eq!(
-            health.observe(&registry_read(&["a.json"])),
-            RegistryChange::default(),
-            "an unchanged malformed set is not reported again"
-        );
-
-        let grown = health.observe(&registry_read(&["a.json", "b.json"]));
-        assert_eq!(
-            grown.malformed,
-            [PathBuf::from("a.json"), PathBuf::from("b.json")],
-            "a newly malformed record reports the whole set"
-        );
-
-        let cleared = health.observe(&registry_read(&[]));
-        assert!(
-            cleared.malformed.is_empty(),
-            "clearing the set is not a warning"
-        );
-        let back = health.observe(&registry_read(&["a.json"]));
-        assert_eq!(
-            back.malformed,
-            [PathBuf::from("a.json")],
-            "a record that goes bad again after being fixed is reported again"
-        );
-    }
-
-    #[test]
-    fn registry_health_keeps_the_malformed_set_across_a_read_failure() {
-        let mut health = RegistryHealth::default();
-        health.observe(&registry_read(&["a.json"]));
-        health.observe(&registry_failure("blip"));
-
-        let after = health.observe(&registry_read(&["a.json"]));
-        assert!(after.recovered);
-        assert!(
-            after.malformed.is_empty(),
-            "the same corrupt record is not news just because a read failed in between"
         );
     }
 }

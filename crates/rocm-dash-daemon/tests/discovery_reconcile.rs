@@ -970,7 +970,12 @@ fn lemonade_responder(path: &str) -> String {
 #[tokio::test]
 async fn lemonade_endpoint_is_announced_scraped_and_announced_gone() {
     let server = spawn_server(lemonade_responder).await;
-    let id = format!("lemonade-127.0.0.1-{}", server.port);
+    // Each loaded model is its own row, identified by endpoint and model.
+    let id = rocm_dash_collectors::lemonade::lemonade_model_id(
+        "127.0.0.1",
+        server.port,
+        "Mock-Lemonade-1B",
+    );
     let (mut rx, _runner) = spawn_runner(lemonade_opts(server.port));
 
     let announced = next_event(&mut rx, |ev| match ev {

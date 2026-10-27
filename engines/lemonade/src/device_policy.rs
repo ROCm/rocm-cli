@@ -5,6 +5,7 @@
 use anyhow::{Result, bail};
 use rocm_engine_protocol::{DevicePolicy, EngineDeviceAvailability, GpuSelection};
 use serde_json::Value;
+use std::path::Path;
 
 pub(crate) fn normalize_device_policy(policy: Option<DevicePolicy>) -> Result<DevicePolicy> {
     match policy.unwrap_or(DevicePolicy::GpuRequired) {
@@ -141,6 +142,38 @@ pub(crate) fn reported_device(state: Option<&Value>, backend: &str) -> String {
         Some(index) => format!("{backend} gpu {index}"),
         None => format!("{backend} gpu"),
     }
+}
+
+/// A one-line notice naming the backend actually serving when it is a GPU
+/// backend other than ROCm (Vulkan), so it is never read as a ROCm serve. `None`
+/// for ROCm backends. The text is derived from the same backend name the engine
+/// records in its state (`backend_requested`), so it cannot disagree with it.
+pub(crate) fn non_rocm_backend_notice(backend: &str) -> Option<String> {
+    let backend = backend.trim();
+    (!backend.to_ascii_lowercase().starts_with("rocm")).then(|| {
+        format!(
+            "Lemonade is serving on the {backend} GPU backend, not ROCm; no CPU fallback is used."
+        )
+    })
+}
+
+/// Print the non-ROCm backend notice and append it to the serve log, because a
+/// managed serve runs with its stdout and stderr discarded and the log is the only
+/// place the user can read it. Returns the notice, or `None` for a ROCm backend.
+pub(crate) fn announce_non_rocm_backend(backend: &str, log_path: Option<&Path>) -> Option<String> {
+    use std::io::Write as _;
+    let notice = non_rocm_backend_notice(backend)?;
+    eprintln!("{notice}");
+    if let Some(log_path) = log_path
+        && let Some(mut log) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)
+            .ok()
+    {
+        let _ = writeln!(log, "{notice}");
+    }
+    Some(notice)
 }
 
 /// The first pinned GPU ordinal recorded in service state, if any.

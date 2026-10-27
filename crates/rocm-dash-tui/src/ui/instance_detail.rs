@@ -153,7 +153,10 @@ pub(crate) struct ActivityRow {
 /// `container_id` had non-zero generation throughput — i.e. was actually
 /// serving, not idle. These are per-tick samples, not discrete serving runs.
 /// The live "gen:" gauge in `render_summary` already covers the idle case, so
-/// idle ticks are skipped. Repeated Held ticks of one scrape collapse to one row. Returns up to `cap` rows, newest first.
+/// idle ticks are skipped. A Lemonade last-request rate
+/// ([`rocm_dash_core::metrics::Instance::gen_tps_last_request`]) is not serving
+/// either: it is one finished request's rate re-reported on every tick, so it is
+/// skipped like an idle tick. Repeated Held ticks of one scrape collapse to one row. Returns up to `cap` rows, newest first.
 /// Pure — exposed for tests.
 pub(crate) fn recent_activity_rows(
     history: &std::collections::VecDeque<rocm_dash_core::metrics::Snapshot>,
@@ -169,7 +172,7 @@ pub(crate) fn recent_activity_rows(
         else {
             continue;
         };
-        if !inst.gen_tps.is_some_and(|v| v.is_finite() && v > 0.0) {
+        if !inst.live_gen_tps().is_some_and(|v| v > 0.0) {
             continue;
         }
         // A Held tick repeats an earlier scrape; age it from when the
@@ -362,7 +365,10 @@ fn render_summary(
                 Style::default().fg(theme.accent),
             ),
             Span::raw("  "),
-            Span::styled("gen: ", muted),
+            Span::styled(
+                format!("{}: ", format::gen_rate_label(inst.gen_tps_last_request)),
+                muted,
+            ),
             Span::styled(
                 format::gen_tps_compact(inst.gen_tps, inst.gen_tps_observation.as_ref()),
                 fg,
@@ -600,7 +606,8 @@ fn render_footer(f: &mut Frame, area: Rect, inst: &Instance, theme: &Theme, scro
 mod tests {
     use super::*;
     use crate::ui::tabs::instances::tests::{
-        SNAP_SECS, buffer_text, mk_inst, mk_inst_obs, mk_snap, mk_state, obs, state_with_snap,
+        SNAP_SECS, buffer_text, last_req_inst, mk_inst, mk_inst_obs, mk_snap, mk_state, obs,
+        state_with_snap,
     };
     use chrono::TimeZone;
     use rocm_dash_core::metrics::{ObservationFreshness, ObservationMetadata};
@@ -1019,6 +1026,26 @@ mod tests {
     }
 
     #[test]
+    fn detail_names_a_last_request_rate() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        for (last_request, label) in [(true, "last req: 37.5 tok/s"), (false, "gen: 37.5 tok/s")] {
+            let state = state_with_snap(last_req_inst("rate-detail", last_request));
+            let mut term = Terminal::new(TestBackend::new(160, 48)).unwrap();
+            term.draw(|f| {
+                draw_detail(f, f.area(), &state, &state.theme);
+            })
+            .unwrap();
+            let out = buffer_text(&term);
+            assert!(out.contains(label), "{label:?} missing:\n{out}");
+            assert_eq!(out.contains("last req:"), last_request, "{out}");
+            // The value already carries its unit, so the label must not repeat it.
+            assert!(!out.contains("tok/s:"), "unit doubled:\n{out}");
+        }
+    }
+
+    #[test]
     fn detail_held_shows_held_freshness_label() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
@@ -1149,6 +1176,35 @@ mod tests {
             "newest activity must come first"
         );
         assert_eq!(rows[1].gen_tps, Some(10.0));
+    }
+
+    /// An idle Lemonade server keeps reporting its last request's rate. That is
+    /// data (so the panel says "idle", not "no throughput data"), but it is not
+    /// activity, and must not be listed as an unlabelled tok/s sample.
+    #[test]
+    fn a_last_request_rate_is_not_listed_as_recent_activity() {
+        let mut idle_lemonade = mk_inst("x");
+        idle_lemonade.gen_tps = Some(45.0);
+        idle_lemonade.gen_tps_last_request = true;
+        let mut history: std::collections::VecDeque<_> = std::collections::VecDeque::new();
+        for tick in 0..3 {
+            let mut snap = mk_snap(vec![idle_lemonade.clone()]);
+            snap.timestamp = Utc.timestamp_opt(1_700_000_000 + 30 * tick, 0).unwrap();
+            history.push_back(snap);
+        }
+        assert!(recent_activity_rows(&history, "id-x", RECENT_ACTIVITY_CAP).is_empty());
+        assert!(
+            has_observed_throughput(&history, "id-x"),
+            "the rate was reported, so the panel reads idle, not no data"
+        );
+        // The same readings as a live rate are activity.
+        idle_lemonade.gen_tps_last_request = false;
+        let mut live = std::collections::VecDeque::new();
+        live.push_back(mk_snap(vec![idle_lemonade]));
+        assert_eq!(
+            recent_activity_rows(&live, "id-x", RECENT_ACTIVITY_CAP).len(),
+            1
+        );
     }
 
     #[test]

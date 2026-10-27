@@ -496,13 +496,13 @@ fn run_stop_server_tool(world: &mut E2eWorld, rocmd: PathBuf) {
 
 // ── Then ───────────────────────────────────────────────────────────
 
-// `render_service_action_result` only prints the `service:`/`status:`/
-// `endpoint:` lines when `output.result` carries a nested `service` object
-// (as `restart_server` does); `stop_server`'s result is the flat
-// `service_id`/`status` shape `stop_internal_managed_service` returns, so none
-// of those lines ever print for a stop today. That mismatch is a pre-existing
-// gap in that renderer, so this assertion covers only what the command
-// actually prints; the on-disk status below is what proves the stop itself.
+// `render_service_action_result` prints the `service:` and `status:` lines for
+// `stop_server`'s flat `service_id`/`status` result as well as for the nested
+// `service` object `restart_server` returns (unit-tested by
+// `service_stop_render_prints_the_in_process_stop_report_shape`); `endpoint:`
+// still prints only for the nested shape. This step asserts the headline and the
+// two lines naming the service and its status; the on-disk status below is what
+// proves the stop itself.
 #[then("the CLI reports the service as stopped")]
 async fn reports_stopped(world: &mut E2eWorld) {
     assert_succeeded(world);
@@ -510,6 +510,15 @@ async fn reports_stopped(world: &mut E2eWorld) {
     assert!(
         combined.contains("Local server stopped"),
         "the stop command must say it stopped the server, got:\n{combined}"
+    );
+    let has_line = |wanted: String| combined.lines().any(|line| line.trim() == wanted);
+    assert!(
+        has_line(format!("service: {SERVICE_ID}")),
+        "the stop report must name the service it stopped, got:\n{combined}"
+    );
+    assert!(
+        has_line("status: stopped".to_owned()),
+        "the stop report must give the status the service ended in, got:\n{combined}"
     );
 }
 

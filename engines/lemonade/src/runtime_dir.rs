@@ -42,6 +42,22 @@ impl ParentRuntimeEnvironment {
     }
 }
 
+// Used by Linux-only fake-executable tests throughout the engine;
+// a plain `cfg(test)` leaves it unused (and dead-code denied) on other targets.
+#[cfg(all(test, target_os = "linux"))]
+impl ParentRuntimeEnvironment {
+    /// A parent environment confined to `root`: it already names a runtime
+    /// directory, so resolving it creates nothing and reads no real user dirs.
+    pub(crate) fn rooted_at(root: &Path) -> Self {
+        Self {
+            xdg_runtime_dir: Some(root.join("xdg-runtime").into_os_string()),
+            home: Some(root.join("home").into_os_string()),
+            user: Some("test".to_owned()),
+            temp_dir: root.join("tmp"),
+        }
+    }
+}
+
 /// Leaf directory the engine gets inside a fallback runtime root, so a crashing
 /// or misbehaving server cannot disturb the telemetry socket that shares the
 /// same root.
