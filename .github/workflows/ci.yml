@@ -59,6 +59,11 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # setup-rust-toolchain v2 no longer sets this; its replacement,
+  # CARGO_BUILD_WARNINGS=deny, needs cargo 1.97+ and we pin 1.96.0
+  # (rust-toolchain.toml). Once the toolchain reaches 1.97, replace this with
+  # `CARGO_BUILD_WARNINGS: deny` instead (set at workflow level so it reaches
+  # jobs that don't use setup-rust-toolchain too).
   RUSTFLAGS: -D warnings
 
 # Every job sets `timeout-minutes`. GitHub's default is 360, so a step that hangs
