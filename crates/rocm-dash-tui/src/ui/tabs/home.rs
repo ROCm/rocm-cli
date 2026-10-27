@@ -23,7 +23,7 @@ use ratatui::widgets::Paragraph;
 
 use rocm_dash_core::state::JobStatus;
 
-use crate::app::{AppState, UpdateStatus};
+use crate::app::{AppState, ConnState, UpdateStatus};
 use crate::ui::format;
 use crate::ui::gradient::GradientGauge;
 use crate::ui::panel::{self, BoxRole};
@@ -73,12 +73,16 @@ const fn node_load_label(hist_empty: bool, simulated: bool) -> &'static str {
 /// carries no GPUs (or a legitimately-zero field) is a known state, not a
 /// still-loading one, and reads "Unknown GPU" instead (see
 /// `node_throughput_title`). Uses the sticky `has_received_gpu_snapshot`
-/// rather than `latest`/`conn`: `ClientMsg::Connected` arrives before the
-/// first snapshot (so `conn` can't gate it), and `latest` is wiped on
-/// disconnect, replay end, and seek, none of which mean detection
-/// restarted. For the numeric "—" placeholders, see `gpu_data_unavailable`.
+/// rather than `latest`: `latest` is wiped on disconnect, replay end, and
+/// seek, none of which mean detection restarted. `Connected` arrives before
+/// the first snapshot, so it still reads pending, but a `Disconnected`
+/// before any snapshot is a failed connection (the reconnect loop never
+/// delivers one), not a loading window, and reads "Unknown GPU". For the
+/// numeric "—" placeholders, see `gpu_data_unavailable`.
 const fn gpu_telemetry_pending(state: &AppState) -> bool {
-    !state.has_received_gpu_snapshot && state.latest.is_none()
+    !state.has_received_gpu_snapshot
+        && state.latest.is_none()
+        && !matches!(state.conn, ConnState::Disconnected { .. })
 }
 
 /// True when there's no usable per-GPU data to show a number for: either no
@@ -900,6 +904,16 @@ mod tests {
             node_throughput_title(&s),
             "Node throughput · Detecting GPU…"
         );
+    }
+
+    #[test]
+    fn gpu_telemetry_not_pending_when_disconnected_before_any_snapshot() {
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.conn = ConnState::Disconnected {
+            reason: "connection refused".into(),
+        };
+        assert!(!gpu_telemetry_pending(&s));
+        assert_eq!(node_throughput_title(&s), "Node throughput · Unknown GPU");
     }
 
     #[test]

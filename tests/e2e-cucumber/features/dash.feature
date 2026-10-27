@@ -620,8 +620,9 @@ Feature: Interactive dashboard
   # build): the daemon's pre-flight and WSL reachability probe follow that
   # empty root, `detect_with_binary` returns `None`, and every snapshot reports
   # zero GPUs. The other half of that state machine, the transient "pending"
-  # placeholder shown before the first snapshot arrives at all, is not covered:
-  # it closes in well under a second and there's no hook to freeze the daemon
+  # placeholder shown before the first snapshot arrives at all, is not covered
+  # here (the unit test `gpu_telemetry_pending_while_connected_but_no_snapshot_yet`
+  # pins it): it closes in well under a second and there's no hook to freeze the daemon
   # mid-handshake, so asserting on it would be asserting on a race.
   @id:dash-reports-no-gpu-telemetry @requires-os:linux
   Scenario: dash-37 - The hero shows placeholders, not fake zeros, when no GPU is detected
