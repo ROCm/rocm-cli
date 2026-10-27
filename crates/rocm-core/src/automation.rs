@@ -284,6 +284,16 @@ fn append_jsonl_record<T: Serialize>(path: &Path, record: &T, context_label: &st
             // length in between.
             let mut content = read_range(path, &file, 0, tail_start)?;
             content.extend_from_slice(&line);
+            // Done with the pre-repair file's handle before replacing it,
+            // rather than leaving that to whatever happens to still have
+            // `file` open at function return. The rename already succeeds
+            // with this handle open regardless — std opens files with
+            // `FILE_SHARE_DELETE` by default on Windows, so a rename isn't
+            // blocked by it (see `write_atomic`'s doc for the case that
+            // *isn't* covered: another process holding the destination open
+            // without delete-sharing) — but this states the intent rather
+            // than leaning on that default.
+            drop(file);
             crate::write_atomic(path, &content, "jsonl")?;
         }
         TailState::ValidUnterminated(start) => {
@@ -442,6 +452,12 @@ fn parse_jsonl_records<T: DeserializeOwned>(
     path: &Path,
     context_label: &str,
 ) -> Result<Vec<(usize, T)>> {
+    // Redundant with "this is the last split segment and it's non-blank"
+    // below (splitting on `\n` makes the final segment empty exactly when
+    // `bytes` ends in one, so a non-blank final segment can only occur when
+    // it doesn't) — kept spelled out because it states directly what that
+    // arm is for, rather than leaning on the split/is_blank interaction to
+    // prove it.
     let unterminated = !bytes.is_empty() && !bytes.ends_with(b"\n");
     let line_count = bytes.split(|&byte| byte == b'\n').count();
     let mut records = Vec::new();
@@ -534,6 +550,12 @@ fn scan_recent_jsonl_records<T: DeserializeOwned>(
             records.push(parse(&line)?);
         }
     }
+    // No-op today: the loop above never pushes past `limit`, and the one
+    // production caller (`load_recent_jsonl_records`) already refuses
+    // `limit == 0` before calling in. Kept as a guard against a future
+    // direct caller that skips that guard — the tail-line push above the
+    // loop isn't itself gated by `limit`, so it would return one record for
+    // `limit == 0` without this.
     records.truncate(limit);
     records.reverse();
     Ok(records)
@@ -556,6 +578,14 @@ fn is_torn_record(line: &[u8]) -> bool {
 /// Yields the `\n`-separated segments of a file from last to first, reading
 /// it backwards in fixed-size chunks. The first segment yielded is the one
 /// after the final `\n` (empty when the file ends with one).
+///
+/// How many chunks get read depends on the file's `\n` layout, not just its
+/// length: a single line longer than `chunk` is rescanned from its own start
+/// on every subsequent chunk read until its leading `\n` is found (each read
+/// re-prepends onto the same growing `pending`), so one pathologically long
+/// line costs O(length² / chunk) rather than O(length). Fine for this
+/// module's records and the deliberately oversized test cases below; a
+/// store whose lines could grow unbounded would need a different scan.
 struct ReverseLines<'a> {
     path: &'a Path,
     file: &'a fs::File,
@@ -602,6 +632,8 @@ impl<'a> ReverseLines<'a> {
                 return Ok(Some((0, std::mem::take(&mut self.pending))));
             }
             let start = self.pos.saturating_sub(self.chunk);
+            #[cfg(test)]
+            test_hooks::before_scan_read(self.path);
             let mut bytes = read_range(self.path, self.file, start, self.pos)?;
             // A short read while `pending` is empty — nothing accumulated
             // yet, whether from an earlier call or from this one — just
@@ -617,6 +649,54 @@ impl<'a> ReverseLines<'a> {
             self.pending = bytes;
             self.pos = start;
         }
+    }
+}
+
+/// A seam for forcing an out-of-band shrink between two of `ReverseLines`'s
+/// own chunked reads, so a test can drive `load_recent_jsonl_records`'s
+/// retry-after-a-failed-scan path deterministically. Mirrors the
+/// path-keyed-callback pattern in `uv.rs`'s `test_hooks`, but each hook is
+/// one-shot and keyed by how many reads to let pass first: unlike an install
+/// download's single commit point, a scan's vulnerable read (the one where
+/// `pending` already holds bytes from an earlier read) is not the first one.
+#[cfg(test)]
+mod test_hooks {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, LazyLock, Mutex, PoisonError};
+
+    type Hook = Arc<dyn Fn() + Send + Sync>;
+
+    /// Keyed by path, value is (reads left to skip, hook to run at zero).
+    static BEFORE_SCAN_READ: LazyLock<Mutex<HashMap<PathBuf, (usize, Hook)>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    /// Run `hook` once, immediately before the `skip`-th subsequent physical
+    /// chunk read `ReverseLines` performs against `path` (`0` = the very next
+    /// read). Removed after it fires, so later reads of the same scan (or a
+    /// retried one) proceed unhooked.
+    pub(super) fn set_before_scan_read(path: &Path, skip: usize, hook: Hook) {
+        BEFORE_SCAN_READ
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(path.to_path_buf(), (skip, hook));
+    }
+
+    pub(super) fn before_scan_read(path: &Path) {
+        let mut hooks = BEFORE_SCAN_READ
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let Some((skip, hook)) = hooks.get_mut(path) else {
+            return;
+        };
+        if *skip > 0 {
+            *skip -= 1;
+            return;
+        }
+        let hook = Arc::clone(hook);
+        hooks.remove(path);
+        drop(hooks);
+        hook();
     }
 }
 
@@ -1092,6 +1172,78 @@ mod tests {
         Ok(())
     }
 
+    /// Seed each of the three stores with one clean record followed by the
+    /// same shape of torn tail a killed writer leaves: a cut-off JSON
+    /// fragment with no trailing newline.
+    fn seed_torn_tail_in_every_store(paths: &AppPaths) -> Result<()> {
+        paths.ensure()?;
+        let torn_audit = &audit_line("torn")[..20];
+        fs::write(
+            paths.audit_events_path(),
+            format!("{}\n{torn_audit}", audit_line("seed")),
+        )?;
+        let torn_event = &serde_json::to_string(&event_record("torn"))?[..20];
+        fs::write(
+            paths.automation_events_path(),
+            format!(
+                "{}\n{torn_event}",
+                serde_json::to_string(&event_record("seed"))?
+            ),
+        )?;
+        let torn_proposal = &serde_json::to_string(&proposal_record("torn"))?[..20];
+        fs::write(
+            paths.automation_proposals_path(),
+            format!(
+                "{}\n{torn_proposal}",
+                serde_json::to_string(&proposal_record("seed"))?
+            ),
+        )?;
+        Ok(())
+    }
+
+    // Regression test for the exact hazard jsonl_lock_path's own doc comment
+    // gives as its reason to exist: a torn-tail repair (the atomic-rename
+    // replace) racing a concurrent appender that already opened the
+    // pre-repair file. Neither existing concurrency test starts from a torn
+    // tail, so the Torn arm's rewrite path was never exercised concurrently
+    // until now.
+    #[test]
+    fn concurrent_appends_after_a_torn_tail_lose_no_records() -> Result<()> {
+        const WRITERS: usize = 8;
+        const APPENDS_PER_WRITER: usize = 25;
+        let (root, paths) = temp_app_paths("jsonl-torn-tail-concurrent");
+        seed_torn_tail_in_every_store(&paths)?;
+        let barrier = std::sync::Barrier::new(WRITERS);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..WRITERS)
+                .map(|writer| {
+                    let (paths, barrier) = (&paths, &barrier);
+                    scope.spawn(move || -> Result<()> {
+                        barrier.wait();
+                        for n in 0..APPENDS_PER_WRITER {
+                            append_to_every_store(paths, &format!("t{writer}-{n}"))?;
+                        }
+                        Ok(())
+                    })
+                })
+                .collect();
+            for handle in handles {
+                handle.join().expect("writer thread panicked")?;
+            }
+            Ok::<_, anyhow::Error>(())
+        })?;
+
+        let mut expected: Vec<String> = vec!["seed".to_owned()];
+        expected.extend(
+            (0..WRITERS)
+                .flat_map(|writer| (0..APPENDS_PER_WRITER).map(move |n| format!("t{writer}-{n}"))),
+        );
+        let stores = tags_in_every_store(&paths);
+        fs::remove_dir_all(root).ok();
+        assert_every_store_holds_exactly(stores?, &expected);
+        Ok(())
+    }
+
     /// Env var that turns a re-exec of this test binary into one writer of
     /// [`concurrent_appends_from_many_processes_lose_no_records`]: its value is
     /// `<data_dir>|<writer index>`.
@@ -1151,6 +1303,230 @@ mod tests {
         let stores = tags_in_every_store(&paths);
         fs::remove_dir_all(root).ok();
         assert_every_store_holds_exactly(stores?, &expected);
+        Ok(())
+    }
+
+    /// Run `body` with `RLIMIT_FSIZE`'s soft limit temporarily lowered to
+    /// `limit_bytes`, restoring the original soft limit — leaving the hard
+    /// limit untouched throughout — before returning, so a coverage build's
+    /// own `.profraw` write at process exit (after this returns, outside
+    /// `body`'s control) isn't cut short by the same rlimit. `SIGXFSZ` is
+    /// ignored for the duration, so a write that would exceed the limit
+    /// returns `Err(EFBIG)` instead of killing the process.
+    #[cfg(unix)]
+    #[allow(unsafe_code)] // libc FFI: lower/restore RLIMIT_FSIZE and ignore SIGXFSZ for the duration
+    fn with_lowered_fsize_limit(limit_bytes: u64, body: impl FnOnce() -> Result<()>) -> Result<()> {
+        let mut original = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        unsafe {
+            if libc::getrlimit(libc::RLIMIT_FSIZE, &raw mut original) != 0 {
+                bail!("getrlimit failed: {}", std::io::Error::last_os_error());
+            }
+        }
+        let lowered = libc::rlimit {
+            rlim_cur: limit_bytes as libc::rlim_t,
+            rlim_max: original.rlim_max,
+        };
+        // The signal handler and the rlimit are restored unconditionally
+        // below, regardless of whether lowering the limit here succeeded or
+        // `body` even ran — this process stays around for the rest of the
+        // (child) test process's life, so a skipped restore on an early
+        // `bail!` would leave it running with SIGXFSZ permanently ignored.
+        let previous_handler = unsafe { libc::signal(libc::SIGXFSZ, libc::SIG_IGN) };
+        let lowered_ok = unsafe { libc::setrlimit(libc::RLIMIT_FSIZE, &raw const lowered) == 0 };
+        let result = if lowered_ok {
+            body()
+        } else {
+            Err(anyhow::anyhow!(
+                "setrlimit failed: {}",
+                std::io::Error::last_os_error()
+            ))
+        };
+        let restored_ok = unsafe { libc::setrlimit(libc::RLIMIT_FSIZE, &raw const original) == 0 };
+        unsafe {
+            libc::signal(libc::SIGXFSZ, previous_handler);
+        }
+        if !restored_ok {
+            bail!(
+                "restoring rlimit failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        result
+    }
+
+    // Regression test for append_or_tolerate_a_missing_newline's glue around
+    // a real failed write — not just the pure landed_despite_the_error
+    // predicate it calls, tested below in isolation with hand-built byte
+    // slices. An RLIMIT_FSIZE one byte under the record's full length
+    // reproduces, deterministically, the exact case that glue exists for.
+    // `write_all` loops over `write(2)`: its first call lands every byte up
+    // to the limit as a successful short write; its next call, with the one
+    // remaining byte (the trailing `\n`) now past the limit, is the one that
+    // raises SIGXFSZ (ignored) and returns `Err(EFBIG)`. The append must
+    // still report `Ok`, and the store must hold exactly the record that
+    // landed — not zero (treated as a real failure), not duplicated, and
+    // genuinely missing its `\n` rather than having silently written in
+    // full (the assertion below on the file's own last byte is what tells
+    // those two apart). A first, ordinary append before the limit is
+    // installed puts this at a non-zero `start` (`TailState::Clean` with an
+    // existing record ahead of it), not only the empty-file case.
+    #[cfg(unix)]
+    #[test]
+    fn append_tolerates_a_short_write_from_an_fsize_limit() -> Result<()> {
+        const SHORT_WRITE_CHILD_ENV: &str = "ROCM_CORE_TEST_JSONL_SHORT_WRITE_CHILD";
+
+        if let Some(data_dir) = std::env::var_os(SHORT_WRITE_CHILD_ENV) {
+            let data_dir = data_dir.to_string_lossy().into_owned();
+            let paths = AppPaths {
+                config_dir: Path::new(&data_dir).join("config"),
+                data_dir: Path::new(&data_dir).to_path_buf(),
+                cache_dir: Path::new(&data_dir).join("cache"),
+            };
+            append_audit_event(&paths, &audit_record("first"))?;
+            let record = audit_record("short-write");
+            let mut line = serde_json::to_vec(&record).context("serialize audit record")?;
+            line.push(b'\n');
+            let existing_len = fs::metadata(paths.audit_events_path())
+                .context("stat seeded store")?
+                .len();
+            with_lowered_fsize_limit(existing_len + line.len() as u64 - 1, || {
+                append_audit_event(&paths, &record)
+            })?;
+            return Ok(());
+        }
+
+        let (root, paths) = temp_app_paths("jsonl-short-write");
+        paths.ensure()?;
+        let exe = std::env::current_exe().context("current test executable")?;
+        let output = std::process::Command::new(&exe)
+            .args([
+                "automation::tests::append_tolerates_a_short_write_from_an_fsize_limit",
+                "--exact",
+                "--quiet",
+                "--nocapture",
+            ])
+            .env(SHORT_WRITE_CHILD_ENV, paths.data_dir.display().to_string())
+            .output()
+            .context("spawn short-write child")?;
+        let text = fs::read_to_string(paths.audit_events_path());
+        fs::remove_dir_all(root).ok();
+        assert!(
+            output.status.success(),
+            "child process failed: {:?}\nstdout: {}\nstderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = text?;
+        assert!(
+            !text.ends_with('\n'),
+            "the short write must have genuinely landed one byte short of its own \
+             trailing newline — a file ending in `\\n` here means the rlimit never \
+             actually cut the write, and this test proved nothing: {text:?}"
+        );
+        let records: Vec<AuditEventRecord> = text
+            .lines()
+            .map(|line| {
+                serde_json::from_str(line)
+                    .unwrap_or_else(|error| panic!("not a complete record: {error}: {line:?}"))
+            })
+            .collect();
+        assert_eq!(
+            audit_messages(&records),
+            ["first", "short-write"],
+            "the write that failed but landed must not be duplicated or dropped: {text:?}"
+        );
+        Ok(())
+    }
+
+    // Sibling of the test above, for the other side of the same glue: a
+    // write that fails and lands *nothing* (the limit leaves no room even
+    // for the first byte) must surface as a genuine `Err`, not be folded
+    // into a false `Ok` the way a landed-but-incomplete write is.
+    // `landed_despite_the_error` itself already has a direct unit test for
+    // "nothing landing is not a complete record" — what has no test without
+    // this one is the `match` in `append_or_tolerate_a_missing_newline` that
+    // acts on that verdict: a mutation collapsing its `Ok(landed) if
+    // landed_despite_the_error(..) => Ok(())` / `Ok(_) => Err(..)` arms into
+    // an unconditional `Ok(())` would pass every other test in this file.
+    #[cfg(unix)]
+    #[test]
+    fn append_reports_a_real_failure_when_nothing_landed() -> Result<()> {
+        const NOTHING_LANDS_CHILD_ENV: &str = "ROCM_CORE_TEST_JSONL_NOTHING_LANDS_CHILD";
+
+        if let Some(data_dir) = std::env::var_os(NOTHING_LANDS_CHILD_ENV) {
+            let data_dir = data_dir.to_string_lossy().into_owned();
+            let paths = AppPaths {
+                config_dir: Path::new(&data_dir).join("config"),
+                data_dir: Path::new(&data_dir).to_path_buf(),
+                cache_dir: Path::new(&data_dir).join("cache"),
+            };
+            append_audit_event(&paths, &audit_record("first"))?;
+            let existing_len = fs::metadata(paths.audit_events_path())
+                .context("stat seeded store")?
+                .len();
+            // Zero slack: the write offset already sits at the limit, so
+            // `write(2)`'s very first call returns `Err(EFBIG)` having
+            // written nothing at all — not even a partial record.
+            let result = with_lowered_fsize_limit(existing_len, || {
+                append_audit_event(&paths, &audit_record("lost"))
+            });
+            // Report the child's own verdict on stdout for the parent to
+            // read, rather than via exit status: an `Err` here is the
+            // *correct* outcome for this test, and letting it propagate as
+            // `?` would make the child process itself look like a failure
+            // for the wrong reason. The message itself (not just ok/err) is
+            // what tells a genuine write failure apart from some unrelated
+            // error (e.g. a lock or `paths.ensure()` failure) that would
+            // also make `is_err()` true without this test having proven
+            // anything.
+            match result {
+                Ok(()) => println!("ok"),
+                Err(error) => println!("err: {error:#}"),
+            }
+            return Ok(());
+        }
+
+        let (root, paths) = temp_app_paths("jsonl-nothing-lands");
+        paths.ensure()?;
+        let exe = std::env::current_exe().context("current test executable")?;
+        let output = std::process::Command::new(&exe)
+            .args([
+                "automation::tests::append_reports_a_real_failure_when_nothing_landed",
+                "--exact",
+                "--quiet",
+                "--nocapture",
+            ])
+            .env(
+                NOTHING_LANDS_CHILD_ENV,
+                paths.data_dir.display().to_string(),
+            )
+            .output()
+            .context("spawn nothing-lands child")?;
+        let text = fs::read_to_string(paths.audit_events_path());
+        fs::remove_dir_all(root).ok();
+        assert!(
+            output.status.success(),
+            "child process failed: {:?}\nstderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("err: failed to append"),
+            "a write that lands nothing must be reported as a real failure from the append \
+             itself (not folded into a false success, and not some unrelated error): \
+             child stdout was {stdout:?}"
+        );
+        assert_eq!(
+            audit_messages(&[serde_json::from_str(text?.trim()).context("parse seeded record")?]),
+            ["first"],
+            "the store must be left exactly as the seed append wrote it — no partial or \
+             lost record from the write that failed with nothing landing"
+        );
         Ok(())
     }
 
@@ -1431,6 +1807,45 @@ mod tests {
         Ok(())
     }
 
+    // Nothing in this module's own writers shrinks a store, but an
+    // out-of-band edit might, and load_recent_jsonl_records is supposed to
+    // retry from the new length rather than fail. Driving that needs the
+    // shrink to land strictly between two of ReverseLines's own chunked
+    // reads (see the `test_hooks` module doc) — which in turn
+    // needs a scan that takes more than one physical read in the first
+    // place, hence the pathologically long first record here (same
+    // technique as append_leaves_a_torn_line_longer_than_one_scan_chunk_cut_cleanly
+    // below, just complete JSON rather than torn).
+    #[test]
+    fn load_recent_retries_past_a_shrink_mid_scan_and_succeeds() -> Result<()> {
+        let (root, paths) = temp_app_paths("scan-retry-after-shrink");
+        let seed = format!("{}\n", audit_line("seed"));
+        let giant = audit_line(&"x".repeat(200_000));
+        seed_audit_store(&paths, &format!("{seed}{giant}"))?;
+        let path = paths.audit_events_path();
+        let seed_len = seed.len() as u64;
+        let hook_path = path.clone();
+        test_hooks::set_before_scan_read(
+            &path,
+            1,
+            std::sync::Arc::new(move || {
+                fs::OpenOptions::new()
+                    .write(true)
+                    .open(&hook_path)
+                    .and_then(|f| f.set_len(seed_len))
+                    .expect("truncate mid-scan");
+            }),
+        );
+        let recent = load_recent_audit_events(&paths, 5);
+        fs::remove_dir_all(root).ok();
+        assert_eq!(
+            audit_messages(&recent?),
+            ["seed"],
+            "a shrink strictly between two chunked reads must be retried, not failed"
+        );
+        Ok(())
+    }
+
     #[test]
     fn reverse_lines_refuses_to_splice_across_a_mid_scan_shrink() -> Result<()> {
         let (root, _paths) = temp_app_paths("reverse-lines-shrink");
@@ -1515,6 +1930,26 @@ mod tests {
         let text = fs::read_to_string(paths.audit_events_path());
         fs::remove_dir_all(root).ok();
         assert_eq!(text?, format!("{}\n{}\n", audit_line("a"), audit_line("b")));
+        Ok(())
+    }
+
+    // A whitespace-only unterminated tail is not valid JSON either, so
+    // without `is_blank` in `inspect_tail`'s check it would be classified
+    // Torn and cut by the next append's whole-store rewrite instead of being
+    // kept and terminated in place, as TailState::ValidUnterminated's own
+    // doc comment documents it should be.
+    #[test]
+    fn append_terminates_a_blank_unterminated_last_line_without_cutting_it() -> Result<()> {
+        let (root, paths) = temp_app_paths("append-blank-unterminated");
+        seed_audit_store(&paths, &format!("{}\n ", audit_line("a")))?;
+        append_audit_event(&paths, &audit_record("b"))?;
+        let text = fs::read_to_string(paths.audit_events_path());
+        fs::remove_dir_all(root).ok();
+        assert_eq!(
+            text?,
+            format!("{}\n \n{}\n", audit_line("a"), audit_line("b")),
+            "a blank unterminated tail must be kept and terminated, not cut as torn debris"
+        );
         Ok(())
     }
 
