@@ -130,6 +130,29 @@ derived from the same value the branch is taken on — as `preapproved_install_l
 `apps/rocm/src/therock.rs` derives it from the approval source — prefer that: a message
 computed from the decision cannot disagree with it.
 
+**A new test is shown to fail when the code it covers is broken.** Before pushing, break
+the branch under test (revert the guard, swap `max` for `sum`, replace `get(i)` with
+`get(0)`) and confirm the test goes red. A test that stays green with its target removed
+is not coverage. An assertion such as `contains("0.0%")` can be satisfied by unrelated
+text on screen; assert the specific value. Fixtures hold values the real source can
+produce, for example nothing above 4 GiB from a 32-bit WMI field.
+
+**A new state flag, placeholder, or "loading" display starts from a state matrix.** Before
+writing it, list every lifecycle state it can be observed in (initial, connecting,
+connected with no data yet, connected with an empty result, disconnected before and
+after the first data, reconnect, replay end) and write the expected output for each, with
+a test per row. Every "pending" state needs an exit on every path that never delivers
+data. Fixing only the state a reviewer named invites the next round to name its sibling;
+when a finding is one instance of a class, fix the class and list the sibling cases in
+the reply.
+
+**Platform-gated code gets a test that runs on its gate.** When a `cfg(windows)` path
+cannot be driven by e2e, put its logic behind a pure helper or an injectable function
+(a script runner, a clock) so a unit test runs on the Windows CI job, including the error
+and timeout paths. A value matched across files (a version tag, a sentinel string) gets
+one shared constant and a test tying the producer to the consumer. If a path stays
+untested, say which and why in the PR text.
+
 ## 4) Live State Verification Before Any External Claim
 
 Before each stateful decision or public status update:
@@ -202,6 +225,13 @@ Keep docs and behavior claims in sync while editing:
   file outside it), and a link leaving a skill folder in `skills/`
   (published or embedded elsewhere, §7). This covers citations you add or
   edit, not converting existing bare paths in an unrelated change
+- when a statement such as "X is not supported" or "there is no Y" becomes false,
+  grep README.md, `docs/`, doc comments, status-bar and help text, and the PR body for
+  the old claim before pushing, and check every hit against the code
+- write the PR body from the final diff, not the first commit, and re-read it after
+  every review-fix commit: it lists every user-visible change (including ones on other
+  platforms), names the lane that exercises the new behavior, and states the reason when
+  there is no scenario
 
 ## 6) rocm-cli Architecture Guardrails
 
@@ -241,6 +271,19 @@ Guardrails:
 - platforms outside Windows/Linux are unsupported; do not implement, debug, or "fix" unsupported-platform behavior
   - if a test fails only on unsupported platforms (e.g., macOS), skip or mark as out of scope; do not alter logic to make it pass
   - add a comment documenting why the test is skipped (e.g., `#[cfg_attr(not(target_os = "linux"), ignore)]`)
+- subprocess and FFI code, checked before pushing:
+  - spawned children set `kill_on_drop(true)`, so a `timeout` that fires does not leak them
+  - blocking FFI runs under `spawn_blocking`, never on an async worker; a `timeout`
+    around `spawn_blocking` drops only the join handle, so the thread still leaks
+  - DLLs load by absolute path, not by bare name
+  - never pair two independently ordered lists by index; correlate by id, or degrade
+    to "unknown" when no id exists
+  - check the documented width and range of every WMI or Win32 field before trusting
+    it (`Win32_VideoController.AdapterRAM` is 32-bit)
+  - a ticker that mirrors the daemon uses the daemon's `MissedTickBehavior`, and a slow
+    source does not block the fast ones sharing its tick
+  - derived values degrade to "unknown", never to a guess, on multi-adapter and phantom
+    adapter hosts, and a test covers those cases
 
 ## 7) Local Assistant And Tool-Use Policy Consistency
 
@@ -393,6 +436,11 @@ Watch checks to completion and drive to all-green.
 
 A red check means "not ready" until resolved.
 
+After each review-fix commit, rerun locally the checks the reviewer and CI ran (the
+workspace tests including `feature_naming`, and clippy with `--all-targets`) and
+self-review against §3 to §6 before pushing. Round-trips spent on a scenario number out
+of sequence or a clippy lint cost more than running them first.
+
 ## 13) Upstream Pre-flight Checklist
 
 Run this checklist before any upstream push, PR update, issue update, or public reply:
@@ -410,6 +458,9 @@ Run this checklist before any upstream push, PR update, issue update, or public 
 11. User approval obtained for any high-blast-radius external action — *§1*
 12. Force-push's live review/approval state checked before proposing or executing one — *§1*
 13. Review comments checked for unreplied threads before resuming review-feedback work — *§11*
+14. New tests mutation-checked; state matrix written for new state or placeholders — *§3*
+15. Old claims grepped across docs and PR body; PR body matches the final diff — *§5*
+16. Subprocess/FFI checklist applied to any new process or driver call — *§6*
 
 ## 14) Related Internal Workflows
 
