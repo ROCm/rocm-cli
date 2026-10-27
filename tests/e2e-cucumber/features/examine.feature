@@ -296,6 +296,7 @@ Feature: GPU detection and system inspection
     Given a machine whose release file quotes every value in single quotes
     When the user inspects that machine in machine-readable form
     Then the inspection reports the distribution "rhel" version "9.4" named "Red Hat Enterprise Linux 9.4 (Plow)"
+    And the inspection reports the distribution family "fedora"
     And the inspection reports no trouble reading the release file
 
   @id:examine-reads-last-os-release-assignment @requires-os:linux

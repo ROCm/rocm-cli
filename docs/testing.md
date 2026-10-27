@@ -1785,7 +1785,7 @@ DKMS repo (the amdgpu driver ships in-tree instead), so the plan comes back
 covered at the unit level by
 `driver_plan_ubuntu_2604_uses_native_archive_guidance` and its two neighbors in
 [driver_install.rs](../apps/rocm/src/driver_install.rs), and at the e2e level
-by `driver-install-06` above: the hosted `E2E tests` job's `ubuntu-26.04` image
+by `driver-install-06` above: the hosted `E2E tests` job's `ubuntu-latest` image (26.04 once GitHub's migration completes)
 reaches this arm through the CLI itself, while the self-hosted GPU lane's
 24.04 host exercises the apt arm instead.
 
@@ -1977,6 +1977,19 @@ does not apply on — and exits 3.
 
 ```bash
 cargo xtask e2e -- -n '(diagnose-40)'
+```
+
+`diagnose-42` uses the same simulated-host mechanism for the driver-reinstall
+advice: an Ubuntu 24.04 `os-release` and two stale repo files planted under the
+root make `fix-7-stale-repos` fire, and the scenario checks that it names both
+repo files by their real paths and `rocm install driver --dkms --yes`, and that
+`rocm install driver --help` accepts those flags. `driver-install-08` covers the
+retired `ROCM_CLI_AMDGPU_VERSION` / `ROCM_CLI_AMDGPU_PACKAGE_RELEASE` refusal
+and checks that setting `ROCM_CLI_AMDGPU_DRIVER_VERSION`, as the refusal advises,
+clears it.
+
+```bash
+cargo xtask e2e -- -n '(diagnose-42|driver-install-08)'
 ```
 
 The other half of the same change — `fix-13-hip-sdk-missing` no longer firing

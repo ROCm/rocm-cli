@@ -8095,6 +8095,9 @@ mod tests {
             ("pop", "24.04", "ubuntu debian", true),
             ("ol", "9.7", "rhel fedora", true),
             ("ol", "9.5", "rhel fedora", false),
+            // OL's own ID_LIKE row must not inherit the `rhel` family's
+            // versions: OL 9.6 is not in the documented OL list.
+            ("ol", "9.6", "rhel fedora", false),
             ("fedora", "41", "", false),
             ("opensuse-leap", "15.7", "suse opensuse", false),
             ("linuxmint", "22", "ubuntu debian", false),
@@ -8129,6 +8132,109 @@ mod tests {
             !commands.contains("amdgpu-dkms") && !commands.contains("rocm install driver"),
             "no purge without a planned reinstall: {commands}"
         );
+    }
+
+    fn fix_commands(e: &Examination, symptom: &str, id: &str) -> String {
+        diagnose(e, symptom)
+            .matched
+            .iter()
+            .find(|d| d.id == id)
+            .unwrap_or_else(|| panic!("{id} should be diagnosed"))
+            .fix
+            .as_ref()
+            .unwrap()
+            .commands
+            .join("\n")
+    }
+
+    #[test]
+    fn fix_12_purges_the_driver_only_where_a_reinstall_is_planned() {
+        // (id, version, id_like, repo seen, purge command, expect purge)
+        let cases = [
+            (
+                "ubuntu",
+                "24.04",
+                "debian",
+                "/etc/apt/sources.list.d/amdgpu.list",
+                "sudo apt-get purge -y amdgpu-dkms",
+                true,
+            ),
+            (
+                "linuxmint",
+                "22",
+                "ubuntu debian",
+                "/etc/apt/sources.list.d/amdgpu.list",
+                "sudo apt-get purge -y amdgpu-dkms",
+                false,
+            ),
+            (
+                "rhel",
+                "9.7",
+                "fedora",
+                "/etc/yum.repos.d/amdgpu.repo",
+                "sudo dnf remove -y amdgpu-dkms",
+                true,
+            ),
+            (
+                "fedora",
+                "41",
+                "",
+                "/etc/yum.repos.d/amdgpu.repo",
+                "sudo dnf remove -y amdgpu-dkms",
+                false,
+            ),
+            (
+                "sles",
+                "15.7",
+                "suse",
+                "/etc/zypp/repos.d/amdgpu.repo",
+                "sudo zypper remove -y amdgpu-dkms",
+                true,
+            ),
+            (
+                "opensuse-leap",
+                "15.7",
+                "suse opensuse",
+                "/etc/zypp/repos.d/amdgpu.repo",
+                "sudo zypper remove -y amdgpu-dkms",
+                false,
+            ),
+        ];
+        for (id, version, like, repo, purge, expect) in cases {
+            let mut e = linux_base();
+            e.distro_id = id.to_owned();
+            e.distro_version = version.to_owned();
+            e.distro_id_like = like.to_owned();
+            e.rocm_install_method = "repo-native".to_owned();
+            e.rocm_repos_seen = vec![repo.to_owned()];
+            let commands = fix_commands(
+                &e,
+                "dpkg: error processing package amdgpu-dkms",
+                "fix-12-installer",
+            );
+            assert_eq!(
+                commands.contains(purge),
+                expect,
+                "{id} {version}: {commands}"
+            );
+        }
+    }
+
+    #[test]
+    fn supported_distro_fix_3_and_fix_7_name_the_dkms_reinstall() {
+        let mut e = linux_base();
+        e.distro_id = "ubuntu".to_owned();
+        e.distro_version = "24.04".to_owned();
+        e.rocm_version = "7.0.0".to_owned();
+        e.amdgpu_loaded = Some(false);
+        e.rocm_repos_seen = vec![
+            "/etc/apt/sources.list.d/amdgpu.list".to_owned(),
+            "/etc/apt/sources.list.d/rocm.list".to_owned(),
+        ];
+        let fix3 = fix_commands(&e, "kernel/rocm mismatch", "fix-3-rocm-kernel");
+        assert!(fix3.contains("rocm install driver --dkms --yes"), "{fix3}");
+        let fix7 = fix_commands(&e, "stale repo conflict", "fix-7-stale-repos");
+        assert!(fix7.contains("rocm install driver --dkms --yes"), "{fix7}");
     }
 
     #[test]

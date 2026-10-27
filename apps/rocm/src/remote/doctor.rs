@@ -288,10 +288,9 @@ mod tests {
 
     #[test]
     fn distro_id_like_survives_the_remote_round_trip() {
-        // `repo_pkg_family`'s ID_LIKE fallback only ever runs against a
-        // deserialized remote examination, never a freshly probed local one --
-        // so if this field didn't round-trip through JSON, the fallback would
-        // silently and permanently never fire for `rocm remote doctor`.
+        // A remote examination is only ever seen through JSON, so if this
+        // field didn't round-trip, the ID_LIKE fallback would silently never
+        // fire for `rocm remote doctor`.
         let mut value: serde_json::Value = serde_json::from_str(&examine_json()).unwrap();
         value.as_object_mut().unwrap().insert(
             "distro_id_like".to_owned(),
@@ -299,6 +298,14 @@ mod tests {
         );
         let parsed = parse_examination(&value.to_string()).expect("examined");
         assert_eq!(parsed.distro_id_like, "rhel fedora");
+    }
+
+    #[test]
+    fn a_remote_on_an_older_cli_without_distro_id_like_still_parses() {
+        let mut value: serde_json::Value = serde_json::from_str(&examine_json()).unwrap();
+        value.as_object_mut().unwrap().remove("distro_id_like");
+        let parsed = parse_examination(&value.to_string()).expect("older remote must parse");
+        assert_eq!(parsed.distro_id_like, "");
     }
 
     #[test]

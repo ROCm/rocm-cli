@@ -2023,7 +2023,9 @@ fn is_live_rocm_repo_file_name(name: &str) -> bool {
 /// pure `is_live_rocm_repo_file_name` name check in isolation. Silently empty
 /// when `dir` does not exist or is not a directory.
 fn live_rocm_repo_paths_in_dir(dir: &str) -> Vec<String> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
+    // Read through `host_path` so a simulated host root re-roots the scan, but
+    // report the logical `dir/name`, which is what a user would `mv`.
+    let Ok(entries) = std::fs::read_dir(crate::host_path(dir)) else {
         return Vec::new();
     };
     entries
@@ -2031,7 +2033,12 @@ fn live_rocm_repo_paths_in_dir(dir: &str) -> Vec<String> {
         .filter(|entry| {
             is_live_rocm_repo_file_name(&entry.file_name().to_string_lossy().to_lowercase())
         })
-        .map(|entry| entry.path().to_string_lossy().into_owned())
+        .map(|entry| {
+            Path::new(dir)
+                .join(entry.file_name())
+                .to_string_lossy()
+                .into_owned()
+        })
         .collect()
 }
 
@@ -3454,14 +3461,43 @@ mod tests {
         );
     }
 
+    /// `probe_rocm_install` must scan every family's repo directory: narrowing
+    /// its call to fewer of `REPO_SCAN_DIRS` leaves the constant and
+    /// `merge_live_repo_paths` tests green, so this drives the probe itself
+    /// against a simulated host root with a repo file in each directory.
+    #[cfg(all(feature = "e2e-test-hooks", target_os = "linux"))]
     #[test]
-    fn repo_scan_dirs_cover_every_package_family() {
-        for dir in [
-            "/etc/apt/sources.list.d",
-            "/etc/yum.repos.d",
-            "/etc/zypp/repos.d",
+    fn probe_rocm_install_scans_every_repo_family_directory() {
+        use crate::hardware_root::TEST_HOST_ROOT_ENV;
+        use crate::test_env::RestoredEnvVar;
+
+        let root = tempfile::tempdir().expect("create host root");
+        for (dir, file) in [
+            ("etc/apt/sources.list.d", "amdgpu.list"),
+            ("etc/yum.repos.d", "amdgpu.repo"),
+            ("etc/zypp/repos.d", "amdgpu.repo"),
         ] {
-            assert!(REPO_SCAN_DIRS.contains(&dir), "missing {dir}");
+            std::fs::create_dir_all(root.path().join(dir)).expect("create repo dir");
+            std::fs::write(root.path().join(dir).join(file), "x\n").expect("write repo file");
+        }
+        let mut e = Examination::default();
+        {
+            let _guard = crate::hardware_root::HOST_ROOT_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _root = RestoredEnvVar::set(TEST_HOST_ROOT_ENV, root.path());
+            probe_rocm_install(&mut e);
+        }
+        for want in [
+            "/etc/apt/sources.list.d/amdgpu.list",
+            "/etc/yum.repos.d/amdgpu.repo",
+            "/etc/zypp/repos.d/amdgpu.repo",
+        ] {
+            assert!(
+                e.rocm_repos_seen.iter().any(|p| p == want),
+                "missing {want}: {:?}",
+                e.rocm_repos_seen
+            );
         }
     }
 

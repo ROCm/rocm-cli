@@ -39,7 +39,7 @@ async fn assert_driver_plan_matches_host_release(world: &mut E2eWorld) {
     // Derived from the host's own `/etc/os-release`, not from `output` --
     // asserting against the very thing being checked would let a change that
     // breaks the arm-selection logic pass by construction. The hosted
-    // `ubuntu-26.04` E2E image reports 26.04 ("resolute"), which has no
+    // `ubuntu-latest` E2E image (26.04 once GitHub's migration completes) reports 26.04 ("resolute"), which has no
     // published repo.radeon.com/amdgpu suite yet and takes
     // `ubuntu_native_archive`; the self-hosted GPU lane reports 24.04 and
     // takes the apt arm. See the `("ubuntu", "26.04")` arm in
@@ -70,7 +70,7 @@ async fn assert_driver_plan_matches_host_release(world: &mut E2eWorld) {
         return;
     }
 
-    // The runner may already be root (the self-hosted WSL runner always is),
+    // The runner may already be root (a self-hosted runner may be),
     // in which case the plan omits the `sudo ` prefix entirely.
     let sudo = if rocm_core::openmpi::running_as_root() {
         ""
@@ -254,6 +254,50 @@ async fn ask_windows_driver_install(world: &mut E2eWorld) {
     world.cli_output = Some(stdout);
     world.cli_stderr = Some(stderr);
     world.cli_rc = Some(rc);
+}
+
+#[when("the user previews driver installation with a retired version pin variable")]
+async fn preview_driver_install_retired_variable(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm_with_env(
+        world,
+        &["install", "driver", "--dkms", "--dry-run"],
+        &[("ROCM_CLI_AMDGPU_VERSION", "7.2.4")],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the driver plan refuses the retired variable and plans no commands")]
+async fn assert_driver_plan_refuses_retired_variable(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no driver plan output");
+    assert!(
+        output.contains("policy: retired_driver_version_override"),
+        "{output}"
+    );
+    assert!(output.contains("supported: false"), "{output}");
+    assert!(output.contains("mutating: false"), "{output}");
+    assert!(
+        output.contains("ROCM_CLI_AMDGPU_DRIVER_VERSION"),
+        "{output}"
+    );
+    assert!(output.contains("execution_commands: <none>"), "{output}");
+}
+
+#[then("setting the advised variable instead clears the refusal")]
+async fn assert_advised_variable_clears_retired_refusal(world: &mut E2eWorld) {
+    // The refusal tells the user to unset the retired variable and set this
+    // one; run exactly that and hold the claim to the resulting plan.
+    let (stdout, _stderr, _rc) = crate::run_rocm_with_env(
+        world,
+        &["install", "driver", "--dkms", "--dry-run"],
+        &[("ROCM_CLI_AMDGPU_DRIVER_VERSION", "30.10")],
+    );
+    assert!(
+        !stdout.contains("policy: retired_driver_version_override")
+            && !stdout.contains("policy: invalid_driver_version_override"),
+        "{stdout}"
+    );
 }
 
 #[then("the driver plan refuses the invalid version override and plans no commands")]

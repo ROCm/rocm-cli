@@ -1007,9 +1007,12 @@ fn build_driver_install_plan_at(
     // reintroduce the shell-injection class those fields close. An invalid
     // value is treated as absent, falling through to the "unsupported" plan
     // the same way the other fields do.
+    // Lowercased, as `rocm-core`'s `dkms_driver_plan_is_supported` does, so the
+    // two copies of the support matrix agree on `ID=Ubuntu`.
     let os_id = field("ID")
         .filter(|v| is_safe_shell_token(v))
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .to_ascii_lowercase();
     // `version_id` is interpolated unsanitized both into the same
     // single-quoted `printf '...' | tee` commands as `repo_version_expr`
     // above and, on SLES, directly unquoted on the SUSEConnect command line --
@@ -1052,7 +1055,7 @@ fn build_driver_install_plan_at(
         // 22.04/24.04 are handled.
         //
         // This arm IS reachable through the CLI on a real host: the hosted
-        // `E2E tests` job's `ubuntu-26.04` image runs `driver-install-06` in
+        // `E2E tests` job's `ubuntu-latest` image (26.04 once GitHub's migration completes) runs `driver-install-06` in
         // `driver_install.feature`, which asserts whichever arm the real host
         // actually falls into, so this one has e2e coverage too, alongside
         // the unit fixture in `driver_plan_ubuntu_2604_uses_native_archive_guidance`
@@ -2224,6 +2227,10 @@ mod tests {
         );
         assert!(!plan.supported);
         assert_eq!(plan.policy, "invalid_driver_version_override");
+        assert!(
+            !plan.mutating,
+            "a refused override must not claim to mutate"
+        );
         assert!(plan.reason.contains("ROCM_CLI_AMDGPU_DRIVER_VERSION"));
         assert!(plan.commands.is_empty());
     }
@@ -2928,6 +2935,10 @@ VERSION_CODENAME=noble
 
         assert!(!plan.supported);
         assert_eq!(plan.policy, "invalid_driver_version_override");
+        assert!(
+            !plan.mutating,
+            "a refused override must not claim to mutate"
+        );
         assert!(plan.reason.contains("ROCM_CLI_AMDGPU_DRIVER_VERSION"));
         assert!(plan.commands.is_empty());
     }
@@ -2953,6 +2964,10 @@ VERSION_CODENAME=noble
 
         assert!(!plan.supported);
         assert_eq!(plan.policy, "invalid_driver_version_override");
+        assert!(
+            !plan.mutating,
+            "a refused override must not claim to mutate"
+        );
         assert!(plan.reason.contains("ROCM_CLI_AMDGPU_DRIVER_VERSION"));
         // Already proves no command can contain "pwned": a vacuous check over
         // commands would be redundant with this.
@@ -2982,6 +2997,10 @@ VERSION_CODENAME=noble
 
         assert!(!plan.supported);
         assert_eq!(plan.policy, "invalid_driver_version_override");
+        assert!(
+            !plan.mutating,
+            "a refused override must not claim to mutate"
+        );
         assert!(plan.commands.is_empty());
     }
 
@@ -3623,6 +3642,43 @@ VERSION_ID="15.7"
     }
 
     #[test]
+    fn driver_plan_id_like_derivatives_honour_the_driver_version_env() {
+        // (os-release, expected repo path). Each derivative arm of
+        // `driver_plan_via_id_like` must thread the override, not `latest`.
+        let cases = [
+            (
+                "ID=almalinux\nID_LIKE=\"rhel centos fedora\"\nVERSION_ID=\"9.6\"\n",
+                "amdgpu/30.10/el/9.6",
+            ),
+            (
+                "ID=pop\nID_LIKE=\"ubuntu debian\"\nVERSION_ID=\"24.04\"\nVERSION_CODENAME=noble\n",
+                "amdgpu/30.10/ubuntu",
+            ),
+            (
+                "ID=devuan\nID_LIKE=debian\nVERSION_ID=\"12\"\n",
+                "amdgpu/30.10/ubuntu",
+            ),
+        ];
+        for (os_release, want) in cases {
+            let mut env = ScopedTestEnv::with_amd_overrides_cleared();
+            env.set("ROCM_CLI_AMDGPU_DRIVER_VERSION", "30.10");
+            let plan = build_driver_install_plan_read(
+                &test_examine("linux", false),
+                &os_release_found(os_release),
+                true,
+                PrivilegeEscalation::Sudo,
+            );
+            let rendered = render_driver_install_plan(&plan, false, false);
+            assert!(plan.supported, "{os_release}");
+            assert!(rendered.contains(want), "{os_release}: {rendered}");
+            assert!(
+                !rendered.contains("amdgpu/latest"),
+                "{os_release}: {rendered}"
+            );
+        }
+    }
+
+    #[test]
     fn driver_plan_refuses_a_retired_version_pin_variable() {
         for retired in RETIRED_DRIVER_VERSION_VARS {
             let mut env = ScopedTestEnv::with_amd_overrides_cleared();
@@ -3649,6 +3705,7 @@ VERSION_ID="15.7"
         let hosts = [
             ("ubuntu", "22.04", "debian"),
             ("ubuntu", "24.04", "debian"),
+            ("Ubuntu", "24.04", "debian"),
             ("ubuntu", "26.04", "debian"),
             ("debian", "12", ""),
             ("debian", "13", ""),

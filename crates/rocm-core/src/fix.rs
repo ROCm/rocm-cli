@@ -321,7 +321,7 @@ const RECIPES: &[FixRecipe] = &[
     FixRecipe {
         fix_id: "fix-3-rocm-kernel",
         title: "ROCm/distro/kernel triple unsupported",
-        rationale: "ROCm is installed but your kernel/distro combination is outside the supported matrix. Match the kernel to the matrix first, then rerun `rocm install driver --dkms`.",
+        rationale: "ROCm is installed but your kernel/distro combination is outside the supported matrix. Match the kernel to the matrix first, then rerun `rocm install driver --dkms --yes` (documented distros only; Ubuntu 26.04 ships the driver in-tree, use `apt install rocm`).",
         commands: &[
             "# Cross-check the live AMD matrix before changing anything:",
             "#   https://rocm.docs.amd.com/projects/install-on-linux/en/latest/reference/system-requirements.html",
@@ -1448,8 +1448,17 @@ fn print_recipe(r: &FixRecipe) {
         println!("Note:       {n}");
     }
     if !r.verify.is_empty() {
-        println!("Verify:     {}", r.verify);
+        println!(
+            "Verify:     {}",
+            indent_continuation(r.verify, "            ")
+        );
     }
+}
+
+/// Indent every line after the first so a multi-line `verify` (fix-7 lists one
+/// command per package manager) stays under its `Verify:` / `$` label.
+fn indent_continuation(text: &str, indent: &str) -> String {
+    text.replace('\n', &format!("\n{indent}"))
 }
 
 /// What `rocm fix` says when it is handed a `rocm diagnose` ranking position
@@ -1580,7 +1589,7 @@ fn act_on(recipe: &FixRecipe, opts: &FixOptions) -> i32 {
             println!("This fix is print-only (manual change required).");
             println!("Copy the commands above, run them yourself, then verify with:");
             if !recipe.verify.is_empty() {
-                println!("  $ {}", recipe.verify);
+                println!("  $ {}", indent_continuation(recipe.verify, "    "));
             }
             exit::OK
         }
@@ -3962,5 +3971,11 @@ mod tests {
             apt_commands_without_trailing_comment, diagnose_apt_commands,
             "this recipe's apt lines must match what diagnose.rs's apt family actually emits for fix-12-installer"
         );
+    }
+
+    #[test]
+    fn indent_continuation_keeps_multi_line_verify_under_its_label() {
+        assert_eq!(indent_continuation("a\nb\nc", "  "), "a\n  b\n  c");
+        assert_eq!(indent_continuation("single", "  "), "single");
     }
 }

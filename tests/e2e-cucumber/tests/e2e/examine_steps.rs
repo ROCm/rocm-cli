@@ -1541,6 +1541,12 @@ async fn assert_reported_distribution(
     assert_eq!(inspection_str(&json, "/summary/distro"), name, "{json:#}");
 }
 
+#[then(expr = "the inspection reports the distribution family {string}")]
+async fn assert_reported_distribution_family(world: &mut E2eWorld, like: String) {
+    let json = parsed_json(world);
+    assert_eq!(inspection_str(&json, "/distro_id_like"), like, "{json:#}");
+}
+
 #[then("the inspection reports no trouble reading the release file")]
 async fn assert_os_release_read_cleanly(world: &mut E2eWorld) {
     let json = parsed_json(world);

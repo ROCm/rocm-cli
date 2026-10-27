@@ -51,7 +51,7 @@ Feature: Driver installation planning
     And no driver command is shown or run, and no installer state is written
 
   # Every bare-metal Linux lane in this repo runs Ubuntu, but not always the
-  # same release -- the hosted `E2E tests` job's `ubuntu-26.04` image reports
+  # same release -- the hosted `E2E tests` job's `ubuntu-latest` image (26.04 once GitHub's migration completes) reports
   # 26.04 ("resolute"), which `build_driver_install_plan_at` routes to the
   # `ubuntu_native_archive` arm instead of the apt one (no repo.radeon.com/
   # amdgpu suite published for "resolute" yet; see the `("ubuntu", "26.04")`
@@ -84,3 +84,14 @@ Feature: Driver installation planning
   Scenario: driver-install-07 - An invalid ROCM_CLI_AMDGPU_DRIVER_VERSION override refuses the plan
     When the user previews driver installation with an invalid version override
     Then the driver plan refuses the invalid version override and plans no commands
+
+  # The pre-repo-native pin variables are retired, not ignored: a stale export
+  # would otherwise turn into the floating `latest` without telling the user.
+  # The refusal names `ROCM_CLI_AMDGPU_DRIVER_VERSION`, so the scenario also
+  # runs that remedy and checks it clears the refusal. Bare-metal Linux only,
+  # for the same reason as driver-install-07.
+  @id:driver-install-retired-version-variable-refused @requires-os:linux @requires-bare-metal
+  Scenario: driver-install-08 - A retired version pin variable refuses the plan until the advised variable replaces it
+    When the user previews driver installation with a retired version pin variable
+    Then the driver plan refuses the retired variable and plans no commands
+    And setting the advised variable instead clears the refusal
