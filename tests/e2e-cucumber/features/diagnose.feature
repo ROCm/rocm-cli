@@ -423,10 +423,11 @@ Feature: Diagnosing failures and listing fixes
     When the user asks the CLI to apply it without saying what to act on
     Then the CLI names what it still needs and reports no change
 
-  # Nothing here sends a report -- transport does not exist yet -- so what these
-  # two prove is the part that has to be right before it does: that the machine
-  # can see exactly what would be published, and that asking produces either a
-  # report or a stated refusal and never a silent send.
+  # Nothing here sends a report: the CLI only ever offers a prefilled mail that
+  # the user sends themselves. What these two prove is the part that has to be
+  # right before anything is offered: that the machine can see exactly what
+  # would be published, and that asking produces either a report or a stated
+  # refusal and never a silent send.
   #
   # Host-independent on purpose, and the branches land on different lanes. A
   # lane with an AMD GPU on the compatibility matrix exercises the prepared
@@ -475,12 +476,18 @@ Feature: Diagnosing failures and listing fixes
   # either, so a report is prepared on some lanes and refused on others.
   # Written so whichever branch a lane reaches is a real assertion rather
   # than a skip.
+  #
+  # The last step pairs the notice with its proof. The mail leaves from the
+  # user's own account, so the CLI says it carries their address, and says the
+  # report itself names no user, host, or file path. That second half is
+  # checked against this run's own output, not taken from the wording.
   @id:diagnose-send-on-a-headless-machine-prints-instead-of-opening @requires-os:linux
   Scenario: diagnose-32 - Asking to send on a machine with no desktop prints the address and a link instead of starting a mail client
     When the user asks the CLI for a way to send a report, with no desktop available to open it on
     Then the CLI either shows the whole report or says why it will not prepare one
     And the CLI states that nothing has been sent
     And the CLI prints the address to mail and a link, and starts nothing
+    And the CLI says the mail carries the user's own address, and the report names no user, host, or file path
 
   # HIP compiles device code at run time through a library a machine can hold
   # more than one copy of. When the copy that loads belongs to a different

@@ -370,14 +370,16 @@ position.
   `fix-19-shm-too-small`). Run `rocm diagnose` inside the distribution for
   those.
 - `--report` shows exactly what this machine would contribute to a problem
-  report, and sends nothing. There is no transport yet, and there will be no
-  automatic one: a report leaves a machine only by its owner's own action.
+  report, and sends nothing. There is no automatic transport, and there will be
+  none: a report leaves a machine only by its owner's own action.
 - `--send`, which requires `--report`, additionally offers a prefilled mail
   carrying that report. It still sends nothing: the mail opens already filled
   in with the content `--report` just printed, addressed to `ROCmCLI@amd.com`,
   and it leaves the machine only when you send it yourself. Requiring
   `--report` is what guarantees the content is shown before the mail is
-  offered.
+  offered. The mail goes from your own mail account, so it carries your
+  address even though the report does not, and the CLI says so each time it
+  offers one.
 
 The `--report` content is deliberately narrow (a schema version, the matched entry, whether
 a fix was offered for it, the GPU architecture and which compatibility
