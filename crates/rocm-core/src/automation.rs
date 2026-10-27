@@ -700,6 +700,14 @@ fn load_recent_jsonl_records<T: DeserializeOwned>(
 /// [`rotate_jsonl_generations`] keeps in order with no file under two names.
 /// The handles stay open, so a dropped generation is still readable and its
 /// file identity cannot be reused meanwhile.
+///
+/// Giving up after eight retries returns an error naming `path`, but some
+/// callers (the dashboard's status view, among others) read recent records
+/// through `.unwrap_or_default()` and would present that as an empty
+/// activity list rather than surface it. Accepted: reaching the retry limit
+/// needs the file to keep moving under every one of eight consecutive opens,
+/// far more contention than a rotation once per `EVENT_LOG_ROTATE_BYTES` of
+/// appends produces, and the very next read tries again from scratch.
 fn open_jsonl_generations(path: &Path, generations: usize) -> Result<Vec<(PathBuf, Handle)>> {
     // A rotation happens once per `EVENT_LOG_ROTATE_BYTES` of appends, so
     // even one retry is rare; running out means something else is renaming
