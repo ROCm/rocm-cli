@@ -23,8 +23,8 @@ rocm-cli local assistants use structured tools, not shell commands.
 - CPU fallback is not a supported path. GPU-required ROCm commands must fail
   loudly when the ROCm GPU path is not ready.
 - The built-in local assistant is fixed to `qwen`
-  (`Qwen3-4B-Instruct-2507-GGUF`) served by Lemonade. vLLM and Lemonade are the
-  general serving engines; the assistant may inspect or manage them for model
+  (`Qwen3-4B-Instruct-2507-GGUF`) served by Lemonade. vLLM, Lemonade and AIM (a
+  Docker-based engine) are the general serving engines; the assistant may inspect or manage them for model
   serving, but it should not switch its own built-in chat engine away from
   Lemonade.
 - The assistant prompt is grounded in the host. rocm-cli detects the operating

@@ -10291,7 +10291,7 @@ fn wait_for_service_http_ready(
         engine,
         host,
         port,
-        canonical_model_id,
+        &|| canonical_model_id.to_owned(),
         endpoint_api_key,
         timeout,
         &mut |_elapsed| {},
@@ -10317,7 +10317,7 @@ fn wait_for_service_http_ready_with_progress(
     engine: &str,
     host: &str,
     port: u16,
-    canonical_model_id: &str,
+    model_name: &dyn Fn() -> String,
     endpoint_api_key: Option<&str>,
     timeout: Duration,
     on_tick: &mut dyn FnMut(Duration),
@@ -10326,6 +10326,10 @@ fn wait_for_service_http_ready_with_progress(
     let endpoint = format_http_base_url(host, port);
     let mut best = EndpointReadiness::Unreachable;
     while start.elapsed() < timeout {
+        // Re-evaluated each pass: a container engine reports the name its server
+        // answers to only after it starts, so a name fixed up front can be wrong.
+        let canonical_model_id = model_name();
+        let canonical_model_id = canonical_model_id.as_str();
         let listed = service_http_readiness_paths(engine).iter().any(|path| {
             http_get_local_service(
                 host,
@@ -15826,6 +15830,10 @@ pub(crate) mod tests {
         // PID verdict alone must not mark the service stopped or drop its key.
         let (root, paths) = test_paths("stop-aim-engine-stop-fails");
         paths.ensure().unwrap();
+        // The built-in aim engine answers `Stop` through `docker`; a dead daemon
+        // address makes that fail the same way on a host with or without docker.
+        let mut env = ScopedTestEnv::new();
+        env.set("DOCKER_HOST", "unix:///nonexistent/rocm-test-docker.sock");
         let service_id = "svc-stop-aim-engine-stop-fails";
         let mut record = stop_test_record(&paths, service_id);
         record.engine = "aim".to_owned();
@@ -15834,6 +15842,7 @@ pub(crate) mod tests {
 
         let report =
             stop_internal_managed_service_with(&paths, service_id, |_| (Vec::new(), true)).unwrap();
+        drop(env);
 
         let on_disk = raw_manifest(&paths, service_id);
         let key = endpoint_keys::endpoint_api_key(&paths, service_id);

@@ -587,7 +587,11 @@ pub(crate) fn start_managed_service(
         engine,
         host,
         port,
-        resolve.served_model_name(),
+        &|| {
+            let mut latest = record.clone();
+            let _ = latest.refresh_from_engine_state();
+            latest.served_model_name().to_owned()
+        },
         endpoint_api_key,
         Duration::from_secs(45),
         on_wait_tick,

@@ -54,6 +54,17 @@ fn split_env(env: &BTreeMap<String, String>) -> (Vec<(&str, &str)>, Vec<&str>) {
     (file_entries, forwarded)
 }
 
+/// `docker run -p` takes an IP, not a hostname, and wants IPv6 in brackets.
+fn publish_host(host: &str) -> String {
+    if host.eq_ignore_ascii_case("localhost") {
+        "127.0.0.1".to_owned()
+    } else if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_owned()
+    }
+}
+
 fn run_args(
     spec: &RunSpec<'_>,
     wsl: bool,
@@ -66,7 +77,12 @@ fn run_args(
         "--name".to_owned(),
         spec.name.to_owned(),
         "-p".to_owned(),
-        format!("{}:{}:{}", spec.host, spec.port, spec.container_port),
+        format!(
+            "{}:{}:{}",
+            publish_host(spec.host),
+            spec.port,
+            spec.container_port
+        ),
     ];
     if spec.use_gpu {
         if let Some(csv) = rocm_engine_protocol::gpu_indices_to_csv(spec.gpu_indices) {
@@ -383,6 +399,22 @@ mod tests {
             use_gpu: !gpu_indices.is_empty(),
             render_gid: Some(993),
             env,
+        }
+    }
+
+    #[test]
+    fn run_args_publishes_localhost_and_ipv6_hosts_in_a_form_docker_accepts() {
+        let env = BTreeMap::new();
+        for (host, published) in [
+            ("localhost", "127.0.0.1:8080:8000"),
+            ("::1", "[::1]:8080:8000"),
+            ("0.0.0.0", "0.0.0.0:8080:8000"),
+        ] {
+            let mut s = spec(&[], &env);
+            s.host = host;
+            let args = run_args(&s, false, None, &[]);
+            assert_eq!(args[4], "-p");
+            assert_eq!(args[5], published);
         }
     }
 
