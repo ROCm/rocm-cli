@@ -29,6 +29,17 @@ use crate::report::{Report, UNRECOGNISED};
 /// the decision was made rather than here.
 pub const DESTINATION: &str = "ROCmCLI@amd.com";
 
+/// What the user is told about the mail, beside the report it carries.
+///
+/// The report names nothing about the sender; the mail around it does, because
+/// it leaves from the user's own account. That is the one cost of
+/// [`DESTINATION`] the user pays personally, so it is said every time the mail
+/// is offered rather than left for the user to infer. The second sentence is
+/// the claim the report's own tests prove: no user, host, or file path.
+pub const SENDER_NOTICE: &str = "If you send the mail, it goes from your own mail account and \
+                                 carries your address. The report itself names no user, host, \
+                                 or file path.";
+
 /// The first word of every subject line, so a mail rule can route the whole set.
 pub const SUBJECT_TAG: &str = "[rocm-doctor]";
 

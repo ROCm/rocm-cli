@@ -2029,7 +2029,12 @@ opens over SSH, with no `DISPLAY` or `WAYLAND_DISPLAY` on Linux, or with
 `ROCM_NO_BROWSER` set to a non-empty value. A machine with no mail client
 configured reaches the same printed form, which is why the address appears on
 its own and not only inside the `mailto:` link. That is the common case on
-servers and in containers. The opt-out is the easiest to check on a desktop:
+servers and in containers. Whichever happened, the line straight under the
+report, before the link, says the mail goes from the user's own mail account
+and carries their address, while the report itself names no user, host, or file
+path. That holds on every branch, including the plain `--report` preview, which
+tells the user how to mail the report themselves. The opt-out is the easiest to
+check on a desktop:
 
 ```bash
 ROCM_NO_BROWSER=1 rocm diagnose --report --send

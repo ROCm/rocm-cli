@@ -2359,6 +2359,14 @@ async fn answer_names_nothing_identifying(world: &mut E2eWorld) {
         );
         return;
     }
+    assert_names_no_user_host_or_path(&out);
+}
+
+/// The sweep behind the claim that a report names no user, host, or file path.
+///
+/// Shared by the step that checks the report and the step that checks the
+/// sentence the CLI prints about it, so the sentence is held to the same proof.
+fn assert_names_no_user_host_or_path(out: &str) {
     let user = std::env::var("USER")
         .or_else(|_| std::env::var("USERNAME"))
         .unwrap_or_default();
@@ -2462,6 +2470,43 @@ async fn assert_send_headless_prints_address_and_link(world: &mut E2eWorld) {
                 || out.contains("\"refused\""),
             "the output is neither a genuine report nor a stated refusal, so this assertion \
              would otherwise pass without a report ever existing to check:\n{out}"
+        );
+    }
+}
+
+#[then(
+    "the CLI says the mail carries the user's own address, and the report names no user, host, or file path"
+)]
+async fn assert_sender_notice_is_given_and_true(world: &mut E2eWorld) {
+    let out = world.cli_output.clone().expect("no CLI output");
+    let notice = "it goes from your own mail account and carries your address";
+    // Same discriminator as above. A refusal offers no mail, so it has nothing
+    // to say about one.
+    if out.contains("cli_version") {
+        assert!(
+            out.contains(notice),
+            "a mail was offered without telling the user it carries their address:\n{out}"
+        );
+        assert!(
+            out.contains("The report itself names no user, host, or file path."),
+            "the notice no longer states what the report leaves out:\n{out}"
+        );
+        // The second sentence is a claim about this output. Prove it here,
+        // against the same run, rather than trusting the wording. The notice
+        // line itself is left out of the sweep: it names the words "user",
+        // "host" and "path", and a lane whose `$USER` or host name is one of
+        // them (`USER=user` is common in containers) would fail on the
+        // sentence instead of on the report.
+        let without_notice: String = out
+            .lines()
+            .filter(|line| !line.contains(notice))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_names_no_user_host_or_path(&without_notice);
+    } else {
+        assert!(
+            !out.contains(notice),
+            "a refusal offers no mail, yet the user was told about one:\n{out}"
         );
     }
 }

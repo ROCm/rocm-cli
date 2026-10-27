@@ -251,7 +251,8 @@ enum Command {
         /// same content `--report` printed, already filled in; it leaves your
         /// machine only when you send it yourself. On a machine with no
         /// desktop, or one reached over SSH, the link is printed instead of
-        /// opened.
+        /// opened. The mail goes from your own mail account, so it carries
+        /// your address; the report itself names no user, host, or file path.
         ///
         /// Requires `--report`, so the content is always shown before the
         /// mail is offered. Not combinable with `--json`, which is for
@@ -3242,8 +3243,8 @@ fn perform_delivery(
     delivery: &rocm_core::report_delivery::Delivery,
     opener: &dyn Opener,
 ) -> String {
-    use rocm_core::report_delivery::{DESTINATION, Delivery};
-    match delivery {
+    use rocm_core::report_delivery::{DESTINATION, Delivery, SENDER_NOTICE};
+    let outcome = match delivery {
         // No mail client is started here on purpose, and the reason is worth
         // the line: this is the branch for a machine held over SSH, or a
         // server with no mail client at all, where starting one would open on
@@ -3266,7 +3267,11 @@ fn perform_delivery(
                  this yourself, mail the report above to {DESTINATION}, or open:\n  {url}"
             ),
         },
-    }
+    };
+    // Every branch offers a mail the user may send, so every branch says what
+    // that mail reveals about them. First, straight under the report: after the
+    // link, which wraps over many lines, it scrolls out of sight.
+    format!("{SENDER_NOTICE}\n{outcome}")
 }
 
 /// Print the report this machine would contribute, and send nothing.
@@ -10396,6 +10401,47 @@ pub(crate) mod tests {
              {said}"
         );
         assert!(said.contains("Nothing has been sent"));
+    }
+
+    /// The dashboard's review and the CLI give the same sender notice, word for
+    /// word. The dashboard shows it above the report before Approve; the CLI
+    /// prints it under the report, before the mail link. `rocm-dash-tui`
+    /// cannot depend on `rocm-core`, so it restates the text; this crate links
+    /// both and holds them together.
+    #[test]
+    fn the_dashboard_approval_and_the_cli_give_the_same_sender_notice() {
+        assert_eq!(
+            rocm_dash_tui::ui::examine_manager::REPORT_SENDER_NOTICE,
+            rocm_core::report_delivery::SENDER_NOTICE
+        );
+    }
+
+    /// Every way a mail is offered says it carries the sender's address.
+    ///
+    /// This pins that the notice is printed on every branch. Its second
+    /// sentence, that the report names no user, host, or file path, is proven
+    /// against a real machine by the scenarios `diagnose-30`
+    /// (`@id:diagnose-report-carries-no-identifying-detail`) and `diagnose-32`
+    /// (`@id:diagnose-send-on-a-headless-machine-prints-instead-of-opening`),
+    /// which sweep the report for exactly those.
+    #[test]
+    fn every_offered_mail_says_it_carries_the_senders_address() {
+        let url = "mailto:nobody@example.invalid";
+        for (delivery, opener) in [
+            (Delivery::Show(url.to_owned()), RecordingOpener::working()),
+            (Delivery::Open(url.to_owned()), RecordingOpener::working()),
+            (Delivery::Open(url.to_owned()), RecordingOpener::broken()),
+        ] {
+            let said = perform_delivery(&delivery, &opener);
+            assert!(
+                said.starts_with(rocm_core::report_delivery::SENDER_NOTICE),
+                "the user was offered a mail without being told first that it carries their \
+                 address: {said}"
+            );
+            // Before the link, which wraps over many lines and would push a
+            // notice after it out of sight.
+            assert!(said.find(url) > said.find(rocm_core::report_delivery::SENDER_NOTICE));
+        }
     }
 
     /// A diagnosis report holding exactly one finding.
