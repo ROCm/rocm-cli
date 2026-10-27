@@ -12,12 +12,13 @@
 //! first plants an automation runtime-state marking the daemon already
 //! running under THIS test process's (live) pid, so the CLI's double-spawn
 //! guard skips the spawn. Contracts verified against the running Linux binary
-//! (EAI-8072). Scoped to the enable/disable/mode slice plus the
-//! proposal-history listing's unit formatting; the watcher/daemon trigger
-//! behaviour itself is covered separately.
+//! (EAI-8072). Scoped to the enable/disable/mode slice, the proposal-history
+//! listing's unit formatting, and the bare listing's tolerance of a torn
+//! audit-log tail; the watcher/daemon trigger behaviour itself is covered
+//! separately.
 
 use cucumber::{given, then, when};
-use rocm_core::{AutomationProposalRecord, append_automation_proposal};
+use rocm_core::{AuditEventRecord, AutomationProposalRecord, append_automation_proposal};
 
 use crate::E2eWorld;
 
@@ -108,6 +109,41 @@ async fn pending_artifact_download_proposal(world: &mut E2eWorld) {
     .expect("failed to write automation proposal fixture");
 }
 
+/// Seed the audit-event store with one clean record followed by a cut-off
+/// JSON fragment with no trailing newline — the shape a writer killed
+/// mid-append leaves, and what a lock-free reader (`render_automations_text`,
+/// reached by `rocm automations`, the `rocm_command` assistant tool shared
+/// by `rocm chat` and the TUI's slash commands, and the TUI's own
+/// automations-manager screen alike) must skip rather than fail the whole
+/// read on. See `scan_recent_jsonl_records`/`is_torn_record` in `rocm-core`
+/// (the read path this exercises — not `inspect_tail`, which is the write
+/// path's own, separate torn-tail check).
+#[given("the audit event log ends in a torn, unterminated line")]
+async fn torn_audit_tail(world: &mut E2eWorld) {
+    let paths = world.app_paths();
+    paths.ensure().expect("failed to create app dirs");
+    let clean = AuditEventRecord {
+        at_unix_ms: 1_700_000_000_000,
+        source: "e2e".to_owned(),
+        category: "concurrency".to_owned(),
+        actor: "writer".to_owned(),
+        level: "info".to_owned(),
+        action: "append".to_owned(),
+        message: "clean".to_owned(),
+        watcher_id: None,
+        service_id: None,
+    };
+    let clean_line = serde_json::to_string(&clean).expect("serialize audit record");
+    // Just the first 20 bytes of the same record: short enough that the cut
+    // falls well before the `message` field, so what it says doesn't matter.
+    let torn_fragment = &clean_line[..20];
+    std::fs::write(
+        paths.audit_events_path(),
+        format!("{clean_line}\n{torn_fragment}"),
+    )
+    .expect("failed to seed a torn audit-event tail");
+}
+
 #[given("an enabled automation watcher")]
 async fn enabled_watcher(world: &mut E2eWorld) {
     suppress_daemon_spawn(world);
@@ -165,6 +201,25 @@ async fn enable_unknown(world: &mut E2eWorld) {
 }
 
 // ── Then ───────────────────────────────────────────────────────────
+
+#[then("the CLI still lists the record before the torn tail")]
+async fn still_lists_record_before_torn_tail(world: &mut E2eWorld) {
+    // rc == 0 alone wouldn't prove much here: render_automations_text reads
+    // every store through `.unwrap_or_default()`, so even a hard read error
+    // would render as an empty section rather than a nonzero exit. The count
+    // below is the real assertion: `audit_event_plain_summary` renders every
+    // audit event's category to one of a handful of fixed strings (never the
+    // raw message), so the fixture's "concurrency" category falls through to
+    // the generic one; exactly one occurrence confirms the one clean record
+    // before the torn tail was actually read and rendered, not silently
+    // dropped along with it (zero) or duplicated (more than one).
+    let out = ok_output(world);
+    let activity_lines = out.matches("Background activity was recorded.").count();
+    assert_eq!(
+        activity_lines, 1,
+        "expected exactly the one valid record before the torn tail to be listed, got:\n{out}"
+    );
+}
 
 #[then(regex = r"^the CLI confirms the watcher is enabled in (observe|propose) mode$")]
 async fn confirm_enabled(world: &mut E2eWorld, mode: String) {
