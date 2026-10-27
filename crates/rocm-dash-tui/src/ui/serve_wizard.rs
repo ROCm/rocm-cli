@@ -555,11 +555,8 @@ fn field_line<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-
-    fn key(c: KeyCode) -> KeyEvent {
-        KeyEvent::new(c, KeyModifiers::NONE)
-    }
+    use crate::app::test_support::press as key;
+    use crossterm::event::{KeyCode, KeyEvent};
 
     fn typed(s: &str) -> Vec<KeyEvent> {
         s.chars().map(|c| key(KeyCode::Char(c))).collect()

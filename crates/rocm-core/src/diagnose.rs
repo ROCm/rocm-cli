@@ -1049,7 +1049,7 @@ fn check_6_path_missing(e: &Examination, symptom: &str) -> Diagnosis {
         // entry into the user's own PATH. The escape is the same one the real
         // write uses, so an apostrophe in `bin_dir` cannot end the PowerShell
         // string literal early in the printed copy either.
-        let escaped_bin_dir = crate::fix::ps_single_quote_escape(&bin_dir);
+        let escaped_bin_dir = crate::quoting::ps_single_quote_escape(&bin_dir);
         Fix {
             summary: format!("Add {bin_dir} to your User PATH and reopen the shell."),
             commands: vec![
@@ -2309,6 +2309,54 @@ fn check_21_msvc_redist_outdated(e: &Examination, symptom: &str) -> Diagnosis {
     finalize(ID, TITLE, score, evidence, fix)
 }
 
+/// The score for an old display driver.
+///
+/// Below [`MIN_SCORE_FOR_MATCH`] on purpose. The entry is advice to look at the
+/// driver, not a finding that anything is broken: AMD publishes no minimum
+/// driver version for the HIP SDK or for the Lemonade Vulkan backend. A WEAK
+/// row is shown by `rocm diagnose` and does not set `has_match`.
+const DISPLAY_DRIVER_OLD_SCORE: i32 = 25;
+
+/// An AMD display driver dated before the first HIP SDK for Windows.
+///
+/// Separate from [`check_14_adrenalin_too_old`] on purpose. That entry needs a
+/// HIP SDK and a failing `hipInfo` or a symptom. This one needs neither, so it
+/// also covers a machine that only runs the Vulkan backend. Only evidence is
+/// read: the driver date from the examination, never the symptom text.
+fn check_22_display_driver_old(e: &Examination, _symptom: &str) -> Diagnosis {
+    const TITLE: &str = "AMD display driver is older than the first HIP SDK for Windows";
+    let id = crate::windows_driver::DISPLAY_DRIVER_OLD_FIX_ID;
+    if e.os_family != "windows" {
+        return zero(id, TITLE);
+    }
+    let Some(info) = crate::windows_driver::WindowsDriverInfo::from_probe(
+        &e.adrenalin_version,
+        &e.adrenalin_date,
+    ) else {
+        return zero(id, TITLE);
+    };
+    let Some(evidence) = crate::windows_driver::old_driver_evidence(&info) else {
+        return zero(id, TITLE);
+    };
+    let fix = Fix {
+        summary: "Look at AMD's support page for a newer display driver for this GPU. This is advice only: no minimum driver version is established, and rocm-cli does not install drivers on Windows.".to_owned(),
+        commands: vec![
+            "# Find the current display driver for this GPU on AMD's support page:".to_owned(),
+            format!("#   {}", crate::windows_driver::AMD_SUPPORT_URL),
+            "# Restart the machine after the driver install.".to_owned(),
+        ],
+        needs_reboot: true,
+        fix_id: id.to_owned(),
+        verify: "powershell -NoProfile -Command \"Get-CimInstance Win32_VideoController | Where-Object { $_.Name -like '*AMD*' -or $_.Name -like '*Radeon*' } | Select-Object Name,DriverVersion,DriverDate\"".to_owned(),
+        notes: vec![
+            crate::windows_driver::NO_MINIMUM_EXPLANATION.to_owned(),
+            crate::windows_driver::FLOOR_NOTE.to_owned(),
+        ],
+        ..Fix::default()
+    };
+    finalize(id, TITLE, DISPLAY_DRIVER_OLD_SCORE, vec![evidence], fix)
+}
+
 // ---------------------------------------------------------------------------
 // WSL2 catalog
 //
@@ -2801,6 +2849,9 @@ const CHECKERS: &[Checker] = &[
     // Windows only: the runtime is read from the Windows System32 folder. A WSL
     // distro is examined as a distro, so it has no such runtime to read.
     (check_21_msvc_redist_outdated, &["windows"]),
+    // Windows only: the driver date comes from the Windows display adapter.
+    // WSL2 reads the host driver through its own entries.
+    (check_22_display_driver_old, &["windows"]),
 ];
 
 const WSL_ONLY: &[&str] = &["wsl"];
@@ -2966,6 +3017,16 @@ fn uncovered_platform_message(e: &Examination) -> Option<String> {
     ))
 }
 
+/// Whether a catalog entry is advice about the host rather than a candidate
+/// cause of the reported symptom.
+///
+/// Such an entry reads only evidence, never the symptom, so it fires whatever
+/// the user reported. The text report must not call it "the highest-scoring
+/// match" nor let it stand in for the upstream escalation.
+fn is_advice_only(fix_id: &str) -> bool {
+    fix_id == crate::windows_driver::DISPLAY_DRIVER_OLD_FIX_ID
+}
+
 /// Render the human-facing diagnosis view (mirrors `diagnose.py`'s text output).
 #[must_use]
 pub fn render_report_text(report: &DiagnoseReport, top: usize) -> String {
@@ -2977,14 +3038,24 @@ pub fn render_report_text(report: &DiagnoseReport, top: usize) -> String {
         out.push('\n');
         return out;
     }
-    if report.matched.is_empty() {
+    // An advice-only row says something true about the host whatever the user
+    // reported, so it is never an answer to the symptom. When it is all there is,
+    // the upstream escalation still applies: it is printed first and the advice
+    // follows. JSON is unaffected, `matched` and `has_match` stay as built.
+    let answers_symptom = report.matched.iter().any(|d| !is_advice_only(&d.id));
+    if !answers_symptom {
         let route = &report.route_when_no_match;
         out.push_str("rocm diagnose: no known misconfiguration matched.\n\n");
         out.push_str("This is the explicit 'I don't recognise this failure mode' case. Do not speculate; file the symptom + this examination output upstream:\n");
         let _ = writeln!(out, "  {:>12}: {}", route.target, route.url);
         out.push('\n');
         out.push_str("Include the JSON from `rocm examine --json` in your report.\n");
-        return out;
+        if report.matched.is_empty() {
+            return out;
+        }
+        out.push_str(
+            "\nAdvice about this host follows. It does not explain the symptom, and nothing in it is applied automatically.\n\n",
+        );
     }
     for (i, d) in report.matched.iter().take(top).enumerate() {
         let tier = if d.score >= HIGH_CONFIDENCE {
@@ -3058,7 +3129,7 @@ pub fn render_report_text(report: &DiagnoseReport, top: usize) -> String {
 
     if let Some(high) = report.matched.iter().find(|d| d.score >= HIGH_CONFIDENCE) {
         let _ = writeln!(out, "Next step: run `rocm fix {}`.", high.id);
-    } else if let Some(best) = report.matched.first() {
+    } else if let Some(best) = report.matched.iter().find(|d| !is_advice_only(&d.id)) {
         // Below the threshold the caution still stands, but it is advice about
         // confidence -- not a reason to withhold the command. Ending here was the
         // bug: the user was told to confirm more evidence and given nothing to
@@ -4625,6 +4696,17 @@ mod tests {
             .find(|d| d.id == "fix-16-vllm-oom")
             .and_then(|d| d.fix.as_ref())
             .expect("the finding must carry a plan");
+        let commands: Vec<&str> = fix.commands.iter().map(String::as_str).collect();
+        crate::fix::assert_plan_matches_the_catalog_copy(&fix.fix_id, &commands);
+    }
+
+    #[test]
+    fn the_display_driver_old_plan_matches_the_catalog_copy() {
+        // The `diagnose` copy of fix-22 and the `rocm fix` recipe are one plan.
+        let fix =
+            check_22_display_driver_old(&windows_driver_exam("30.0.13014.8", "2021-08-04"), "")
+                .fix
+                .expect("an old driver must carry a plan");
         let commands: Vec<&str> = fix.commands.iter().map(String::as_str).collect();
         crate::fix::assert_plan_matches_the_catalog_copy(&fix.fix_id, &commands);
     }
@@ -6615,7 +6697,7 @@ mod tests {
 
     #[test]
     fn diagnosis_remediation_matches_the_fix_catalog_for_shared_fix_ids() {
-        // fix-15, fix-16, fix-21 and info-20 live in two places: the `rocm fix`
+        // fix-15, fix-16, fix-21, info-20 and fix-22 live in two places: the `rocm fix`
         // catalog (crate::fix::RECIPES) and the Fix these checks embed in a
         // Diagnosis. The prose *framing* legitimately differs by surface (a
         // catalog rationale vs a diagnosis summary), but the actionable
@@ -6665,12 +6747,26 @@ mod tests {
             },
             "",
         );
-        for diag in [vllm_oom, msvc, msvc_outdated, unsupported_gpu] {
-            assert!(
-                diag.score >= MIN_SCORE_FOR_MATCH,
-                "test setup must yield a real match for {}",
-                diag.id
-            );
+        // fix-22 is advice only: it scores below the match threshold on purpose,
+        // yet a user meets both of its copies, so it is held to the same guard.
+        let display_driver_old =
+            check_22_display_driver_old(&windows_driver_exam("30.0.13014.8", "2021-08-04"), "");
+        for diag in [
+            vllm_oom,
+            msvc,
+            msvc_outdated,
+            unsupported_gpu,
+            display_driver_old,
+        ] {
+            if diag.id == crate::windows_driver::DISPLAY_DRIVER_OLD_FIX_ID {
+                assert_eq!(diag.score, DISPLAY_DRIVER_OLD_SCORE);
+            } else {
+                assert!(
+                    diag.score >= MIN_SCORE_FOR_MATCH,
+                    "test setup must yield a real match for {}",
+                    diag.id
+                );
+            }
             let fix = diag.fix.expect("a matched diagnosis must carry a Fix");
             let (verify, notes, run_commands) =
                 crate::fix::recipe_verify_notes_and_run_commands(&fix.fix_id)
@@ -6971,5 +7067,225 @@ mod tests {
         }
         assert_eq!(v["min_score_for_match"], 50);
         assert_eq!(v["high_confidence_threshold"], 75);
+    }
+
+    fn windows_driver_exam(version: &str, date: &str) -> Examination {
+        Examination {
+            os_family: "windows".to_owned(),
+            adrenalin_version: version.to_owned(),
+            adrenalin_date: date.to_owned(),
+            ..Examination::default()
+        }
+    }
+
+    fn old_driver_entry(e: &Examination) -> Option<Diagnosis> {
+        diagnose(e, "")
+            .matched
+            .into_iter()
+            .find(|d| d.id == crate::windows_driver::DISPLAY_DRIVER_OLD_FIX_ID)
+    }
+
+    #[test]
+    fn a_2021_display_driver_is_flagged_as_advice_only() {
+        let hit = old_driver_entry(&windows_driver_exam("30.0.13014.8", "2021-08-04"))
+            .expect("a 2021 driver must be flagged");
+        assert_eq!(hit.score, DISPLAY_DRIVER_OLD_SCORE);
+        assert!(
+            hit.score < MIN_SCORE_FOR_MATCH,
+            "advice must not read as an established cause"
+        );
+        assert!(hit.evidence.iter().any(|ev| ev.contains("30.0.13014.8")));
+        assert!(hit.evidence.iter().any(|ev| ev.contains("2021-08-04")));
+        assert!(hit.evidence.iter().any(|ev| ev.contains("not established")));
+        let fix = hit.fix.expect("fix");
+        assert!(!fix.commands.is_empty());
+        assert!(
+            fix.commands.iter().all(|c| c.starts_with('#')),
+            "the recipe must print no command that installs anything: {:?}",
+            fix.commands
+        );
+        assert!(fix.commands.iter().any(|c| c.contains("Restart")));
+        assert!(
+            fix.commands
+                .iter()
+                .any(|c| c.contains("amd.com/en/support"))
+        );
+    }
+
+    /// A Windows host with a healthy HIP SDK, so that the old driver is the
+    /// only entry that fires.
+    fn old_driver_only_exam() -> Examination {
+        Examination {
+            hip_sdk_path: "C:\\Program Files\\AMD\\ROCm\\6.2".to_owned(),
+            hipinfo_present: true,
+            ..windows_driver_exam("30.0.13014.8", "2021-08-04")
+        }
+    }
+
+    #[test]
+    fn an_old_driver_alone_keeps_the_upstream_escalation_in_the_text_report() {
+        // State: the old-driver row is present, nothing else is, and no
+        // established cause exists.
+        let report = diagnose(&old_driver_only_exam(), "");
+        let ids: Vec<&str> = report.matched.iter().map(|d| d.id.as_str()).collect();
+        assert_eq!(ids, [crate::windows_driver::DISPLAY_DRIVER_OLD_FIX_ID]);
+        assert!(!report.has_match);
+
+        // Text: the symptom was not recognised, so the report says where to
+        // file it, and it does not present the advice as the best match.
+        let text = render_report_text(&report, 5);
+        assert!(text.contains("no known misconfiguration matched"), "{text}");
+        assert!(text.contains(&report.route_when_no_match.url), "{text}");
+        assert!(text.contains("rocm examine --json"), "{text}");
+        assert!(text.contains("fix-22-display-driver-old"), "{text}");
+        assert!(!text.contains("highest-scoring match"), "{text}");
+        assert!(!text.contains("HIGH_CONFIDENCE"), "{text}");
+
+        // The line that introduces the advice makes a promise: nothing in it is
+        // applied automatically. The promise and the behaviour are asserted in
+        // the same test: every command the entry carries is a printed comment
+        // (`a_2021_display_driver_is_flagged_as_advice_only` pins the same for
+        // the recipe), so nothing in the advice can run anything.
+        assert!(
+            text.contains(
+                "Advice about this host follows. It does not explain the symptom, and nothing in it is applied automatically."
+            ),
+            "{text}"
+        );
+        let fix = report.matched[0]
+            .fix
+            .as_ref()
+            .expect("the advice has a fix");
+        assert!(
+            fix.commands.iter().all(|c| c.starts_with('#')),
+            "the advice must apply nothing: {:?}",
+            fix.commands
+        );
+    }
+
+    #[test]
+    fn a_real_cause_beside_an_old_driver_is_still_the_highest_scoring_match() {
+        // The advice row must not be named as the best match, and a real
+        // finding must keep that role.
+        let mut e = old_driver_only_exam();
+        e.msvc_redist_version = "14.29.30133.0".to_owned();
+        let report = diagnose(&e, "");
+        let ids: Vec<&str> = report.matched.iter().map(|d| d.id.as_str()).collect();
+        assert!(ids.contains(&crate::windows_driver::DISPLAY_DRIVER_OLD_FIX_ID));
+        assert!(ids.contains(&"fix-21-msvc-redist-outdated"));
+        let text = render_report_text(&report, 5);
+        assert!(
+            !text.contains("no known misconfiguration matched"),
+            "{text}"
+        );
+        assert!(
+            text.contains("run `rocm fix fix-21-msvc-redist-outdated`"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("run `rocm fix fix-22-display-driver-old` (the highest"),
+            "{text}"
+        );
+    }
+
+    /// The closing "Next step" block picks the first non-advice row when
+    /// nothing reaches HIGH_CONFIDENCE. A LIKELY or WEAK real cause listed
+    /// above the old-driver row must be the one named, never the advice row.
+    #[test]
+    fn a_below_high_real_cause_beside_an_old_driver_is_the_one_named_as_next_step() {
+        for (score, tier) in [(60, "LIKELY"), (30, "WEAK")] {
+            let mut report = diagnose(&old_driver_only_exam(), "");
+            assert_eq!(report.matched.len(), 1, "fixture: only the advice row");
+            report.matched.insert(
+                0,
+                Diagnosis {
+                    id: "fix-99-synthetic-real-cause".to_owned(),
+                    title: "A real cause below HIGH_CONFIDENCE".to_owned(),
+                    score,
+                    evidence: vec!["synthetic".to_owned()],
+                    fix: None,
+                },
+            );
+            assert!(score < HIGH_CONFIDENCE);
+            let text = render_report_text(&report, 5);
+            assert!(
+                text.contains(&format!("[{tier} score={score}/100]")),
+                "{text}"
+            );
+            assert!(
+                text.contains("below the HIGH_CONFIDENCE threshold"),
+                "{text}"
+            );
+            assert!(
+                text.contains(
+                    "run `rocm fix fix-99-synthetic-real-cause` (the highest-scoring match)"
+                ),
+                "{text}"
+            );
+            assert!(
+                !text.contains("run `rocm fix fix-22-display-driver-old` (the highest"),
+                "{text}"
+            );
+            // The advice row is still listed, after the real cause.
+            assert!(text.contains("#2 (fix-22-display-driver-old)"), "{text}");
+        }
+    }
+
+    #[test]
+    fn an_old_driver_leaves_the_json_report_as_it_was() {
+        let report = diagnose(&old_driver_only_exam(), "");
+        let json = serde_json::to_value(&report).expect("serialises");
+        assert_eq!(json["has_match"], false);
+        assert_eq!(json["matched"].as_array().map(Vec::len), Some(1));
+        assert_eq!(json["matched"][0]["id"], "fix-22-display-driver-old");
+        assert!(json["route_when_no_match"]["url"].is_string());
+    }
+
+    #[test]
+    fn a_current_display_driver_is_not_flagged() {
+        assert!(old_driver_entry(&windows_driver_exam("32.0.23033.1002", "2026-05-02")).is_none());
+        // Exactly the cutoff day is not older than it.
+        assert!(old_driver_entry(&windows_driver_exam("32.0.1.1", "2023-07-27")).is_none());
+    }
+
+    #[test]
+    fn a_missing_or_unreadable_display_driver_date_never_flags() {
+        for (version, date) in [
+            ("30.0.13014.8", ""),
+            ("", "2021-08-04"),
+            ("", ""),
+            ("30.0.13014.8", "garbage"),
+        ] {
+            assert!(
+                old_driver_entry(&windows_driver_exam(version, date)).is_none(),
+                "{version:?} {date:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_old_display_driver_entry_never_applies_off_windows() {
+        for family in ["linux", "other"] {
+            let mut e = windows_driver_exam("30.0.13014.8", "2021-08-04");
+            e.os_family = family.to_owned();
+            assert!(old_driver_entry(&e).is_none(), "{family}");
+        }
+        let mut wsl = wsl_base();
+        wsl.adrenalin_version = "30.0.13014.8".to_owned();
+        wsl.adrenalin_date = "2021-08-04".to_owned();
+        assert!(old_driver_entry(&wsl).is_none());
+    }
+
+    #[test]
+    fn the_old_display_driver_entry_does_not_change_fix_14() {
+        // fix-14 keeps its meaning: an old date alone must not raise it.
+        let report = diagnose(&windows_driver_exam("30.0.13014.8", "2021-08-04"), "");
+        assert!(
+            report
+                .matched
+                .iter()
+                .all(|d| d.id != "fix-14-adrenalin-too-old")
+        );
+        assert!(!report.has_match());
     }
 }

@@ -48,7 +48,6 @@ repository.
 | anyhow | 1.0.102 | MIT OR Apache-2.0 |
 | apple-native-keyring-store | 1.0.0 | MIT OR Apache-2.0 |
 | approx | 0.5.1 | Apache-2.0 |
-| arbitrary | 1.4.2 | MIT OR Apache-2.0 |
 | arrayvec | 0.7.8 | MIT OR Apache-2.0 |
 | as-any | 0.3.2 | MIT OR Apache-2.0 |
 | assert-json-diff | 2.0.2 | MIT |
@@ -123,7 +122,6 @@ repository.
 | crossbeam-deque | 0.8.7 | MIT OR Apache-2.0 |
 | crossbeam-epoch | 0.9.20 | MIT OR Apache-2.0 |
 | crossbeam-utils | 0.8.21 | MIT OR Apache-2.0 |
-| crossterm | 0.28.1 | MIT |
 | crossterm | 0.29.0 | MIT |
 | crossterm_winapi | 0.9.1 | MIT |
 | crypto-common | 0.1.7 | MIT OR Apache-2.0 |
@@ -143,7 +141,6 @@ repository.
 | der | 0.7.10 | Apache-2.0 OR MIT |
 | deranged | 0.5.8 | MIT OR Apache-2.0 |
 | derive-getters | 0.5.0 | MIT |
-| derive_arbitrary | 1.4.2 | MIT OR Apache-2.0 |
 | derive_more | 2.1.1 | MIT |
 | derive_more-impl | 2.1.1 | MIT |
 | digest | 0.10.7 | MIT OR Apache-2.0 |
@@ -262,7 +259,6 @@ repository.
 | libredox | 0.1.17 | MIT |
 | line-clipping | 0.3.7 | MIT OR Apache-2.0 |
 | linked-hash-map | 0.5.6 | MIT/Apache-2.0 |
-| linux-raw-sys | 0.4.15 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT |
 | linux-raw-sys | 0.12.1 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT |
 | litemap | 0.8.2 | Unicode-3.0 |
 | litrs | 1.0.0 | MIT OR Apache-2.0 |
@@ -392,7 +388,6 @@ repository.
 | rustc-demangle | 0.1.27 | MIT/Apache-2.0 |
 | rustc-hash | 2.1.2 | Apache-2.0 OR MIT |
 | rustc_version | 0.4.1 | MIT OR Apache-2.0 |
-| rustix | 0.38.44 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT |
 | rustix | 1.1.4 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT |
 | rustls | 0.23.41 | Apache-2.0 OR ISC OR MIT |
 | rustls-native-certs | 0.7.3 | Apache-2.0 OR ISC OR MIT |
@@ -497,6 +492,7 @@ repository.
 | toml_writer | 1.1.2+spec-1.1.0 | MIT OR Apache-2.0 |
 | tower | 0.5.3 | MIT |
 | tower-http | 0.6.11 | MIT |
+| tower-http | 0.7.0 | MIT |
 | tower-layer | 0.3.3 | MIT |
 | tower-service | 0.3.3 | MIT |
 | tracing | 0.1.44 | MIT |
@@ -512,6 +508,7 @@ repository.
 | tungstenite | 0.28.0 | MIT OR Apache-2.0 |
 | typed-builder | 0.23.2 | MIT OR Apache-2.0 |
 | typed-builder-macro | 0.23.2 | MIT OR Apache-2.0 |
+| typed-path | 0.12.3 | MIT OR Apache-2.0 |
 | typenum | 1.20.1 | MIT OR Apache-2.0 |
 | ucd-trie | 0.1.7 | MIT OR Apache-2.0 |
 | uds_windows | 1.2.1 | MIT |
@@ -615,7 +612,8 @@ repository.
 | zerotrie | 0.2.4 | Unicode-3.0 |
 | zerovec | 0.11.6 | Unicode-3.0 |
 | zerovec-derive | 0.11.3 | Unicode-3.0 |
-| zip | 2.4.2 | MIT |
+| zip | 8.6.0 | MIT |
+| zlib-rs | 0.6.7 | Zlib |
 | zmij | 1.0.21 | MIT |
 | zopfli | 0.8.3 | Apache-2.0 |
 | zvariant | 5.12.0 | MIT |

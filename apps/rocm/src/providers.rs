@@ -2257,6 +2257,232 @@ mod tests {
         Ok(())
     }
 
+    /// Serves one chat response per entry in `bodies`, in order, answering
+    /// `GET /v1/models` the same way [`spawn_local_provider_test_server`] does
+    /// so the local-provider readiness probe (which lists models before ever
+    /// posting a chat request) is satisfied without consuming a response.
+    /// Exits once every response has been served, so the returned count
+    /// proves exactly how many `/v1/chat/completions` requests landed --
+    /// which is what the ROCMAI-725 regression tests below check.
+    fn spawn_sequenced_local_provider_test_server(
+        listener: TcpListener,
+        model_id: impl Into<String>,
+        bodies: Vec<String>,
+    ) -> thread::JoinHandle<Result<usize>> {
+        let model_id = model_id.into();
+        thread::spawn(move || -> Result<usize> {
+            let mut served = 0;
+            while served < bodies.len() {
+                let (mut stream, _) = listener.accept()?;
+                stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                let request = read_http_request(&mut stream)?;
+                if request.starts_with("GET /v1/models ") {
+                    write_models_response(&mut stream, &model_id)?;
+                    continue;
+                }
+                let body = &bodies[served];
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )?;
+                served += 1;
+            }
+            Ok(served)
+        })
+    }
+
+    fn planner_chat_completion_body(content: &str) -> String {
+        serde_json::json!({
+            "choices": [{"message": {"content": content}}]
+        })
+        .to_string()
+    }
+
+    fn ready_builtin_planner_service(paths: &AppPaths, port: u16) -> Result<()> {
+        let mut qwen = ManagedServiceRecord::new(
+            paths,
+            "svc-qwen-planner",
+            "lemonade",
+            BUILTIN_ASSISTANT_MODEL_ALIAS,
+            LEMONADE_ASSISTANT_MODEL_ID,
+            "127.0.0.1",
+            port,
+            "managed",
+            123,
+            None,
+            None,
+            Some("gpu_required".to_owned()),
+        );
+        qwen.status = "ready".to_owned();
+        // Already served inference, so readiness checks read the latch instead
+        // of probing this stub for a completion.
+        qwen.inference_verified_at_unix_ms = Some(1);
+        qwen.write()
+    }
+
+    // ROCMAI-725: `build_freeform_plan_with_context` can call out to a
+    // configured cloud `planner_provider` when a request is ambiguous, and
+    // that call is not guaranteed deterministic. Both freeform call sites used
+    // to build the plan twice per invocation -- once to render it, once to
+    // derive the next action -- so the plan shown to the operator and the
+    // plan actually reported as "next"/dispatched could silently describe two
+    // different commands. These two tests prove the fix: a single build is
+    // reused for both, at both call sites.
+
+    #[test]
+    fn freeform_plan_dedup_prevents_provider_assisted_divergence() -> Result<()> {
+        // Regression for the `chat.rs` `natural_language_plan` call site,
+        // which used to call `render_freeform_plan` and the now-removed
+        // `freeform_plan_next_action_with_context` independently -- each
+        // calling `build_freeform_plan_with_context` on its own.
+        let (root, paths) = temp_app_paths("freeform-plan-dedup");
+        paths.ensure()?;
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        // Three responses: two for the "old pattern" demonstration below
+        // (which deliberately calls the planner twice, the way the pre-fix
+        // code did), one for the single-build helper the fix uses. A real
+        // cloud LLM is exactly this unreliable across calls -- nothing here
+        // is contrived beyond "the provider's two answers differ".
+        let bodies = vec![
+            planner_chat_completion_body(
+                r#"{"intent":"inspect","tool_call":{"tool":"rocm","args":["examine"]}}"#,
+            ),
+            planner_chat_completion_body(
+                r#"{"intent":"inspect","tool_call":{"tool":"rocm","args":["engines","list"]}}"#,
+            ),
+            planner_chat_completion_body(
+                r#"{"intent":"inspect","tool_call":{"tool":"rocm","args":["examine"]}}"#,
+            ),
+        ];
+        let server = spawn_sequenced_local_provider_test_server(
+            listener,
+            LEMONADE_ASSISTANT_MODEL_ID,
+            bodies,
+        );
+        ready_builtin_planner_service(&paths, port)?;
+
+        let config = RocmCliConfig {
+            planner_provider: Some("local".to_owned()),
+            ..Default::default()
+        };
+
+        // "serve" alone has no model, so confidence stays `medium` and the
+        // request is routed through the configured planner provider -- the
+        // same ambiguity trigger `freeform_execution_validation_rejects_placeholder_tool_calls`
+        // (main.rs) uses for the deterministic case.
+        //
+        // The pre-fix shape: two independent builds.
+        let shown_plan =
+            crate::freeform_planner::build_freeform_plan_with_context("serve", &paths, &config);
+        let executed_plan =
+            crate::freeform_planner::build_freeform_plan_with_context("serve", &paths, &config);
+        let shown_text =
+            crate::freeform_planner::render_structured_request_plan(&shown_plan, &paths);
+        let executed_action = crate::freeform_planner::plan_next_action(executed_plan)
+            .expect("provider-resolved plan should produce a next action");
+        let executed_tool_call =
+            crate::freeform_planner::format_structured_tool_call("rocm", &executed_action.args);
+        assert!(
+            !shown_text.contains(&executed_tool_call),
+            "two independent builds against a non-deterministic provider should \
+             diverge -- if they don't, this test's mock isn't exercising the bug \
+             it's meant to catch: shown={shown_text:?} executed={executed_tool_call:?}"
+        );
+
+        // The fix: one build, reused for both the rendered text and the next
+        // action. This is exactly what `plan_freeform_request_with_context`
+        // (what `natural_language_plan` calls today) does.
+        let (text, action) =
+            crate::freeform_planner::plan_freeform_request_with_context("serve", &paths, &config);
+        let action = action.expect("provider-resolved plan should produce a next action");
+        assert!(
+            action.provider_assisted,
+            "request should have been resolved via the configured provider"
+        );
+        let tool_call = crate::freeform_planner::format_structured_tool_call("rocm", &action.args);
+        assert!(
+            text.contains(&tool_call),
+            "the rendered plan and the next action must describe the same \
+             command: text={text:?} tool_call={tool_call:?}"
+        );
+
+        let served = server.join().expect("server thread should not panic")?;
+        fs::remove_dir_all(root).ok();
+
+        assert_eq!(
+            served, 3,
+            "exactly three provider chat calls expected: two for the old-pattern \
+             demonstration above, one for the single-build helper"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn freeform_execution_reuses_the_rendered_plan_without_rebuilding() -> Result<()> {
+        // Regression for the `main.rs` `run_freeform` call site, which used
+        // to call `execute_freeform_next_action(request, paths, config)` --
+        // rebuilding the plan from scratch via the now-removed
+        // `freeform_plan_next_action_with_context` instead of reusing the
+        // plan `run_freeform` already built and rendered.
+        let (root, paths) = temp_app_paths("freeform-execution-no-rebuild");
+        paths.ensure()?;
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        // Only one response: the server's accept loop exits and drops the
+        // listener as soon as it has served that one request, so if
+        // `prepare_freeform_execution` rebuilt the plan, that second
+        // `build_freeform_plan_with_context` call would hit a closed port and
+        // fail fast with a connection error -- surfacing as a different
+        // error than the "reviewed interactively" one asserted below, not as
+        // a hang.
+        let bodies = vec![planner_chat_completion_body(
+            r#"{"intent":"inspect","tool_call":{"tool":"rocm","args":["examine"]}}"#,
+        )];
+        let server = spawn_sequenced_local_provider_test_server(
+            listener,
+            LEMONADE_ASSISTANT_MODEL_ID,
+            bodies,
+        );
+        ready_builtin_planner_service(&paths, port)?;
+
+        let config = RocmCliConfig {
+            planner_provider: Some("local".to_owned()),
+            ..Default::default()
+        };
+
+        let plan =
+            crate::freeform_planner::build_freeform_plan_with_context("serve", &paths, &config);
+        let provider_assisted = crate::freeform_planner::plan_next_action(plan.clone())
+            .expect("provider-resolved plan should produce a next action")
+            .provider_assisted;
+        assert!(
+            provider_assisted,
+            "request should have been resolved via the configured provider"
+        );
+
+        // Provider-assisted plans still can't auto-execute (reviewed
+        // interactively only) -- that validation is unrelated to this fix and
+        // must still fire. What this proves is that reaching it took no
+        // second provider call.
+        let error = crate::prepare_freeform_execution(plan)
+            .expect_err("provider-assisted plans must still be refused for unattended execution")
+            .to_string();
+        assert!(error.contains("reviewed interactively"));
+
+        let served = server.join().expect("server thread should not panic")?;
+        fs::remove_dir_all(root).ok();
+
+        assert_eq!(
+            served, 1,
+            "prepare_freeform_execution must not rebuild the plan -- only the \
+             initial build above may call the provider"
+        );
+        Ok(())
+    }
+
     #[test]
     fn local_provider_selects_a_service_by_its_served_model_id() -> Result<()> {
         let (root, paths) = temp_app_paths("local-provider-served-id");

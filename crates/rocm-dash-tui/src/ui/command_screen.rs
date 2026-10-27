@@ -252,11 +252,8 @@ pub fn draw_command_screen(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-
-    fn key(c: KeyCode) -> KeyEvent {
-        KeyEvent::new(c, KeyModifiers::NONE)
-    }
+    use crate::app::test_support::press as key;
+    use crossterm::event::KeyCode;
 
     fn type_str(cs: &mut Option<CommandScreenState>, jobs: &mut State, s: &str) {
         for ch in s.chars() {
