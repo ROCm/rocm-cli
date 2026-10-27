@@ -224,6 +224,9 @@ jobs:
       # workflow sets this unconditionally; here it lets a scoped dispatch confirm
       # a single nightly scenario (e.g. the 27B serve) without the full nightly run.
       E2E_INCLUDE_NIGHTLY: "${{ inputs.include_nightly && '1' || '' }}"
+      # A real GPU lane: run the `@requires-real-gpu` scenarios that a simulated
+      # host cannot stand in for. See HardwareMode in src/expectation.rs.
+      E2E_HARDWARE: real
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -448,6 +451,8 @@ jobs:
       E2E_INCLUDE_NIGHTLY: "${{ inputs.include_nightly && '1' || '' }}"
       # Heavy @merge-queue serves run only in the merge queue.
       E2E_MERGE_QUEUE: "${{ github.event_name == 'merge_group' && '1' || '' }}"
+      # See the e2e-gpu lane.
+      E2E_HARDWARE: real
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -601,6 +606,8 @@ jobs:
       E2E_INCLUDE_NIGHTLY: "${{ inputs.include_nightly && '1' || '' }}"
       # Heavy @merge-queue serves run only in the merge queue.
       E2E_MERGE_QUEUE: "${{ github.event_name == 'merge_group' && '1' || '' }}"
+      # See the e2e-gpu lane.
+      E2E_HARDWARE: real
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -949,6 +956,8 @@ jobs:
       E2E_INCLUDE_NIGHTLY: "${{ inputs.include_nightly && '1' || '' }}"
       # Heavy @merge-queue serves run only in the merge queue.
       E2E_MERGE_QUEUE: "${{ github.event_name == 'merge_group' && '1' || '' }}"
+      # See the e2e-gpu lane.
+      E2E_HARDWARE: real
       # apps/rocm/build.rs falls back to GitHub's own GITHUB_HEAD_REF/
       # GITHUB_REF_NAME when this isn't set, but those never reach the WSL
       # guest's cargo build (wsl.exe doesn't share the calling process's
@@ -1145,7 +1154,7 @@ jobs:
       # static-host step did — this guest always runs as root. `sudo` itself
       # is included because `rocm install driver` emits a hard `command -v
       # sudo` precondition into its WSL plan even when the caller is already
-      # root, and the @requires-wsl driver scenarios render that plan.
+      # root, and the driver-install scenarios render that plan.
       - name: Ensure native build deps
         shell: powershell
         run: |
@@ -1183,11 +1192,12 @@ jobs:
 
       # NO librocdxg provisioning step here, deliberately. The lane used to run
       # `scripts/wsl_setup_rocdxg.sh`; installing ROCDXG is now the CLI's own
-      # job (`rocm install driver`), and the @requires-wsl driver scenarios
-      # assert on the plan it produces. A lane that pre-installed ROCDXG would
-      # hand those scenarios a host that is already in the state the command
-      # under test exists to reach. Leaving the distro bare costs no coverage
-      # today: @requires-gpu scenarios already resolve to skip here, since
+      # job (`rocm install driver`). The driver-install scenarios assert on the
+      # plan it produces for a simulated WSL machine, so they no longer read this
+      # distro; a lane that pre-installed ROCDXG would still put the real-WSL
+      # scenarios on a host already in the state that command exists to reach.
+      # Leaving the distro bare costs no coverage today: the real-GPU
+      # (`@requires-real-gpu`) scenarios already resolve to skip here, since
       # `rocm-smi` is absent too (see the GPU preflight below). If this lane
       # ever needs a real GPU, provision it through the CLI as a separate,
       # explicitly-not-under-test step rather than restoring the old script.
@@ -1195,7 +1205,7 @@ jobs:
       # GPU preflight, bounded like the native lanes — but ADVISORY here. GPU
       # access under WSL is exactly what this lane is proving out, so an absent
       # rocm-smi is a reported condition, not a job failure: the capability probe
-      # then resolves @requires-gpu scenarios to skip and the rest still runs. A
+      # then resolves the real-GPU scenarios to skip and the rest still runs. A
       # GPU that IS present but stays held fails the job, since that would
       # corrupt the serve scenarios' results — though "held" means less here
       # than on the native lanes: this body keeps only the free-memory floor and
@@ -1374,7 +1384,7 @@ jobs:
           # Forward the job-level E2E_* env vars into the guest: `wsl.exe`
           # does not share the calling process's environment unless a
           # variable is named in WSLENV.
-          $env:WSLENV = 'E2E_SERVE_TIMEOUT_SECS:E2E_TUI_TIMEOUT_SECS:E2E_INCLUDE_NIGHTLY:E2E_MERGE_QUEUE:ROCM_CLI_RELEASE_REF'
+          $env:WSLENV = 'E2E_SERVE_TIMEOUT_SECS:E2E_TUI_TIMEOUT_SECS:E2E_INCLUDE_NIGHTLY:E2E_MERGE_QUEUE:E2E_HARDWARE:ROCM_CLI_RELEASE_REF'
           & "$env:GITHUB_WORKSPACE\.github\scripts\Invoke-WslBash.ps1" -PipeFail -Script @'
           export PATH="$HOME/.cargo/bin:$PATH"
           cd /root/work/rocm-cli
@@ -1523,6 +1533,8 @@ jobs:
       E2E_INCLUDE_NIGHTLY: "${{ inputs.include_nightly && '1' || '' }}"
       # Full serve matrix at the merge-queue gate.
       E2E_MERGE_QUEUE: "${{ github.event_name == 'merge_group' && '1' || '' }}"
+      # See the e2e-gpu lane.
+      E2E_HARDWARE: real
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
