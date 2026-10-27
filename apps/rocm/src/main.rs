@@ -57,8 +57,11 @@ mod uninstall;
 // `managed_service_process_command` because `restart_internal_managed_service`
 // (also outside `dispatch()`) calls them, and
 // `ensure_public_service_has_endpoint_key` because the endpoint-key check
-// below calls it directly. `install()`'s SDK
-// path calls into `runtime_install_finalize` directly (not via `dispatch()`),
+// below calls it directly. `prepare_freeform_execution`/
+// `render_freeform_execution_header` are re-imported for the same reason:
+// `execute_freeform_next_action` (itself only called from `run_freeform`,
+// outside `dispatch()`) calls them. `install()`'s SDK path calls into
+// `runtime_install_finalize` directly (not via `dispatch()`),
 // and `apply_runtime_update`/`append_update_activate_summary` and several
 // root-level chat/examine/update helpers call into `runtimes_cmd` directly for
 // the same reason `engines_cmd`'s runtime-resolution helpers are re-imported.

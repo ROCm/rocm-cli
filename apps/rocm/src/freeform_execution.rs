@@ -25,16 +25,19 @@
 //! distinct from building the plan (see `docs/architecture.md`'s
 //! `freeform_execution.rs` entry). Follows the same mechanical-relocation,
 //! dispatch-adjacent pattern as `driver_install.rs`: large enough to own its
-//! own private type (`FreeformExecution`) rather than leaving it in `main.rs`.
+//! own `pub(crate)` type (`FreeformExecution`) rather than leaving it in `main.rs`.
 //!
 //! `FreeformExecution` stays `pub(crate)`, as it already was — both `main.rs`
 //! and this module's own tests read it. `prepare_freeform_execution` and
 //! `render_freeform_execution_header` are widened from module-private to
 //! `pub(crate)` here, since `main.rs`'s `execute_freeform_next_action` now
-//! reaches them across the module boundary; `validate_freeform_execution_action`
-//! and `apply_freeform_execution_consent` have no caller outside this module
-//! (including its own tests) and stay module-private, unchanged from before
-//! the move. `prepare_freeform_execution` takes the already-built `plan` by
+//! reaches them across the module boundary (`prepare_freeform_execution` has
+//! a second, test-only caller: `providers.rs`'s
+//! `freeform_execution_reuses_the_rendered_plan_without_rebuilding` test, the
+//! ROCMAI-725 single-build regression, via the same re-import);
+//! `validate_freeform_execution_action` and `apply_freeform_execution_consent`
+//! have no caller outside this module and stay module-private, unchanged from
+//! before the move. `prepare_freeform_execution` takes the already-built `plan` by
 //! value rather than `request`/`paths`/`config`, matching ROCMAI-725's
 //! build-once fix in `main.rs`: the caller already built the plan (and
 //! rendered it to the operator), and a second build here could call out to a

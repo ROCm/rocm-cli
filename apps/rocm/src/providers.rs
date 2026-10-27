@@ -2368,7 +2368,7 @@ mod tests {
         // "serve" alone has no model, so confidence stays `medium` and the
         // request is routed through the configured planner provider -- the
         // same ambiguity trigger `freeform_execution_validation_rejects_placeholder_tool_calls`
-        // (main.rs) uses for the deterministic case.
+        // (freeform_execution.rs) uses for the deterministic case.
         //
         // The pre-fix shape: two independent builds.
         let shown_plan =
