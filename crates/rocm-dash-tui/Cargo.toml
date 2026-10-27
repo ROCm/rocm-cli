@@ -16,11 +16,6 @@ path = "src/lib.rs"
 
 [dependencies]
 rocm-dash-core = { path = "../rocm-dash-core" }
-# Unconditional dependency, but only exercised by `client.rs`'s
-# `#[cfg(windows)]` arm: the in-process metrics ticker there reuses
-# `HostCollector`/`WinPerfCollector` instead of a socket (no rocmdashd on
-# Windows yet).
-rocm-dash-collectors = { path = "../rocm-dash-collectors" }
 rocm-deps = { path = "../rocm-deps" }
 # Unified dashboard TUI base: ratatui 0.30 + crossterm 0.28. This is the only
 # ratatui in the workspace — the `rocm` binary no longer carries a (dead) 0.29
@@ -60,6 +55,12 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 # Test-only, Unix-only: `raise(3)` lets the termination-watcher unit tests drive
 # a real SIGTERM/SIGINT through Tokio's signal registry in-process. Not a runtime
 # dependency — the production signal path goes through `tokio::signal`.
+# Only `client.rs`'s `#[cfg(windows)]` arm uses it: the in-process metrics
+# ticker there reuses `HostCollector`/`WinPerfCollector` instead of a socket
+# (no rocmdashd on Windows yet).
+[target.'cfg(windows)'.dependencies]
+rocm-dash-collectors = { path = "../rocm-dash-collectors" }
+
 [target.'cfg(unix)'.dev-dependencies]
 libc.workspace = true
 

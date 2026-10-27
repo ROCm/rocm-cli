@@ -1303,6 +1303,18 @@ async fn home_view_displayed(world: &mut E2eWorld) {
 #[then("the hero reports no GPU telemetry available")]
 async fn hero_reports_no_gpu_telemetry(world: &mut E2eWorld) {
     let tui = session(world);
+    // A client that never reached the daemon also reads "Unknown GPU" with
+    // "—" values (`Disconnected` ends the pending placeholder), so first
+    // require the connected header, which proves a snapshot channel exists.
+    // Match "rocm daemon" rather than "connected", which "disconnected"
+    // contains.
+    tui.wait_for_screen_where(
+        "the connected header",
+        |screen| screen.contains("· rocm daemon"),
+        default_timeout(),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("the dashboard never connected to its daemon: {e}"));
     // The VRAM/TEMP/POWER mini-sparks only draw in the hero's wide layout
     // (`draw_hero_band`'s `hero.width >= 8 && hero.height >= 6` gate).
     tui.use_wide_size()

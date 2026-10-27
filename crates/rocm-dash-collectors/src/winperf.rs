@@ -149,13 +149,14 @@ fn device_key(instance: &str) -> &str {
     instance.split("_phys_").next().unwrap_or(instance)
 }
 
-/// `GPU Engine` instance names end in `..._eng_N_engtype_TYPE` (e.g. `3d`,
-/// `copy`, `videodecode`); this is the engine-type suffix, distinct per
-/// engine but shared across every process using that same engine. Pairs
-/// with `device_key` in `parse_metrics` to key utilization by (device,
-/// engine) rather than by device alone.
-fn engine_type(instance: &str) -> &str {
-    instance.rsplit("_engtype_").next().unwrap_or(instance)
+/// `GPU Engine` instance names end in `..._phys_P_eng_N_engtype_TYPE`; the
+/// part after the device key (`phys_P_eng_N_engtype_TYPE`) identifies one
+/// physical engine, shared across every process using it. Pairs with
+/// `device_key` in `parse_metrics` to key utilization by (device, engine
+/// instance). Two engines of the same type (e.g. two copy engines) are
+/// distinct and must not be summed.
+fn engine_id(instance: &str) -> &str {
+    instance.split_once("_phys_").map_or(instance, |(_, e)| e)
 }
 
 /// Builds one `GpuMetrics` per distinct adapter LUID seen in the counter
@@ -184,12 +185,12 @@ fn engine_type(instance: &str) -> &str {
 /// with fixed readings — `adlx_readings()`'s real FFI chain is Windows+driver
 /// only and not unit-testable.
 fn parse_metrics(raw: &str, adlx: &[AdlxReading]) -> Vec<GpuMetrics> {
-    // Keyed by (device, engine type): `GPU Engine` instances are
-    // per-process-per-engine, so two processes both drawing on the 3D engine
-    // each contribute their own share of that engine's capacity and must be
-    // summed, matching Task Manager. Different engine types (3D vs. copy vs.
-    // video) run concurrently on separate hardware, so those are maxed
-    // together below instead of summed.
+    // Keyed by (device, engine instance): `GPU Engine` instances are
+    // per-process-per-engine, so two processes both drawing on the same
+    // engine each contribute their own share of that engine's capacity and
+    // must be summed, matching Task Manager. Distinct engines (3D vs. copy,
+    // or two copy engines) run concurrently on separate hardware, so those
+    // are maxed together below instead of summed.
     let mut engine_util: BTreeMap<(&str, &str), f32> = BTreeMap::new();
     let mut vram_mb: BTreeMap<&str, u64> = BTreeMap::new();
     // A `BTreeSet` rather than first-seen order: `powershell.exe`'s adapter
@@ -214,9 +215,7 @@ fn parse_metrics(raw: &str, adlx: &[AdlxReading]) -> Vec<GpuMetrics> {
         match kind {
             "UTIL" => {
                 let pct: f32 = value.trim().parse().unwrap_or(0.0);
-                *engine_util
-                    .entry((key, engine_type(instance)))
-                    .or_insert(0.0) += pct;
+                *engine_util.entry((key, engine_id(instance))).or_insert(0.0) += pct;
             }
             "VRAM" => {
                 let bytes: f64 = value.trim().parse().unwrap_or(0.0);
@@ -668,7 +667,7 @@ mod tests {
         // the multi-adapter branch's own clamp must still catch it, same as
         // the single-adapter branch above it.
         let two_adapters = format!(
-            "{SAMPLE}\nUTIL\tpid_9998_luid_0x00000000_0x0000cafe_phys_0_eng_2_engtype_3d\t95.0\nUTIL\tpid_9999_luid_0x00000000_0x0000cafe_phys_0_eng_3_engtype_3d\t95.0\nGPU\tOther GPU\t4293918720\t1.0"
+            "{SAMPLE}\nUTIL\tpid_9998_luid_0x00000000_0x0000cafe_phys_0_eng_2_engtype_3d\t95.0\nUTIL\tpid_9999_luid_0x00000000_0x0000cafe_phys_0_eng_2_engtype_3d\t95.0\nGPU\tOther GPU\t4293918720\t1.0"
         );
         let metrics = parse_metrics(&two_adapters, &[]);
         assert_eq!(metrics.len(), 2);
@@ -677,6 +676,14 @@ mod tests {
             .find(|g| g.vram_used_mb == 0)
             .expect("the cafe device's metrics");
         assert_eq!(gpu.gpu_utilization_pct, 100.0);
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn utilization_across_two_engines_of_the_same_type_takes_max_not_sum() {
+        let sample = "UTIL\tpid_1_luid_0x00000000_0x0002ff2a_phys_0_eng_2_engtype_copy\t60.0\nUTIL\tpid_1_luid_0x00000000_0x0002ff2a_phys_0_eng_3_engtype_copy\t60.0\nVRAM\tluid_0x00000000_0x0002ff2a_phys_0\t1048576\nGPU\tAMD Radeon 780M Graphics\t1073741824\t32.0.31041.1004";
+        let metrics = parse_metrics(sample, &[]);
+        assert_eq!(metrics[0].gpu_utilization_pct, 60.0);
     }
 
     #[test]
