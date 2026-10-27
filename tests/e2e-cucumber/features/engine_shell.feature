@@ -39,7 +39,9 @@ Feature: Engine shell
   # The interpreter step is here because the same doubled path also sets a wrong
   # VIRTUAL_ENV and puts a nonexistent bin/bin on PATH: a fix to the hint text
   # alone would otherwise flip this row while the shell still runs the wrong
-  # python. The row flips only once the user's actual problem is fixed.
+  # python. The step runs the interpreter and also checks that VIRTUAL_ENV names
+  # an environment holding bin/activate, so the row flips only once the hint, PATH
+  # and VIRTUAL_ENV are all right.
   #
   # Phrased as "the file it names is there", not as "the path is not doubled": the
   # first survives whichever way the mismatch is repaired, the second would go

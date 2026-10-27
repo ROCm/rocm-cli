@@ -73,35 +73,45 @@ fn slug_of(display_name: &str) -> String {
         .join("-")
 }
 
-/// The identifier a check block explicitly EXPOSES, if any.
+/// The identifiers a check block plausibly EXPOSES, most specific first.
 ///
 /// The contract is "enable-able from what the listing shows", so the moment the
-/// product publishes a real identifier this must pick THAT up, or a correct fix
-/// would stay xfailed forever (the row would never go stale). Two shapes are
-/// recognised, both unambiguous — neither can be mistaken for display text:
-///   - a detail line — `id: server-recover` (also `identifier:` / `slug:`)
+/// product publishes an identifier this must pick it up, or a correct fix would
+/// stay xfailed forever (the row would never go stale). These are CANDIDATES, not
+/// a verdict: the step tries each and counts the check reachable if any works, so
+/// a wrong guess here costs nothing and a missing one is the only risk.
+///   - a detail line keyed `id:` / `identifier:` / `slug:`, or any key ending in
+///     ` id` (`command id: server-recover`)
 ///   - bracketed on the header — `Server recovery [server-recover]`
+///   - a single parenthesised token beside the label — `Server recovery (server-recover)`
 ///
-/// Any other shape a fix might pick leaves the row xfailed until this learns it;
-/// that is the cost of not guessing at forms no listing prints today. Returns
-/// `None` only when the block names no identifier at all, which is today's defect.
-fn exposed_identifier(block: &[&str]) -> Option<String> {
+/// Empty only when the block names no identifier at all, which is today's defect.
+fn exposed_identifiers(block: &[&str]) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut add = |id: &str| {
+        let id = id.trim().trim_matches(|c| c == '"' || c == '`');
+        if !id.is_empty() && !id.contains(char::is_whitespace) && !found.iter().any(|f| f == id) {
+            found.push(id.to_owned());
+        }
+    };
     for line in block {
-        let line = line.trim();
-        for key in ["id", "identifier", "slug"] {
-            if let Some(rest) = line.strip_prefix(&format!("{key}:")) {
-                let id = rest.trim().trim_matches(|c| c == '"' || c == '`');
-                if !id.is_empty() {
-                    return Some(id.to_owned());
-                }
+        if let Some((key, rest)) = line.trim().split_once(':') {
+            let key = key.trim().to_ascii_lowercase();
+            if matches!(key.as_str(), "id" | "identifier" | "slug") || key.ends_with(" id") {
+                add(rest);
             }
         }
     }
-    let header = block.first()?.trim();
-    let (open, close) = (header.rfind('[')?, header.rfind(']')?);
-    let inner = header.get(open + 1..close)?.trim();
-    (open < close && !inner.is_empty() && !inner.contains(char::is_whitespace))
-        .then(|| inner.to_owned())
+    if let Some(header) = block.first().map(|h| h.trim()) {
+        for (open, close) in [('[', ']'), ('(', ')')] {
+            if let (Some(o), Some(c)) = (header.rfind(open), header.rfind(close))
+                && o < c
+            {
+                add(&header[o + 1..c]);
+            }
+        }
+    }
+    found
 }
 
 /// The checks the listing advertises, as `(displayed name, identifier to try)`.
@@ -113,7 +123,7 @@ fn exposed_identifier(block: &[&str]) -> Option<String> {
 /// under it forms one block, so an identifier the fix exposes on a detail line
 /// is seen. The identifier to invoke is the one the block explicitly exposes,
 /// falling back to the display-name slug only when it exposes none (today's bug).
-fn listed_checks(listing: &str) -> Vec<(String, String)> {
+fn listed_checks(listing: &str) -> Vec<(String, Vec<String>)> {
     let lines: Vec<&str> = listing.lines().collect();
     let is_header = |line: &str| line.starts_with("  ") && !line.starts_with("   ");
     let mut checks = Vec::new();
@@ -140,8 +150,15 @@ fn listed_checks(listing: &str) -> Vec<(String, String)> {
                 break;
             }
         }
-        let identifier = exposed_identifier(&block).unwrap_or_else(|| slug_of(name));
-        checks.push((name.to_owned(), identifier));
+        // Exposed identifiers first, then the label exactly as listed (a fix may make
+        // `enable` accept it), then its slug — today's fallback.
+        let mut candidates = exposed_identifiers(&block);
+        for fallback in [name.to_owned(), slug_of(name)] {
+            if !candidates.contains(&fallback) {
+                candidates.push(fallback);
+            }
+        }
+        checks.push((name.to_owned(), candidates));
     }
     checks
 }
@@ -370,16 +387,29 @@ async fn assert_listed_checks_enableable(world: &mut E2eWorld) {
     );
 
     let mut unreachable = Vec::new();
-    for (name, identifier) in &checks {
-        let (stdout, stderr, rc) = crate::run_rocm(world, &["automations", "enable", identifier]);
-        if rc != 0 {
-            unreachable.push(format!(
-                "{name:?} → tried {identifier:?}: rc={rc} {}",
+    for (name, candidates) in &checks {
+        let mut last = String::new();
+        let mut reached = false;
+        for candidate in candidates {
+            let (stdout, stderr, rc) =
+                crate::run_rocm(world, &["automations", "enable", candidate]);
+            if rc == 0 {
+                reached = true;
+                break;
+            }
+            last = format!(
+                "tried {candidate:?}: rc={rc} {}",
                 stderr
                     .trim()
                     .lines()
                     .next()
                     .unwrap_or_else(|| stdout.trim())
+            );
+        }
+        if !reached {
+            unreachable.push(format!(
+                "{name:?} → none of {} candidate(s) worked; last {last}",
+                candidates.len()
             ));
         }
     }

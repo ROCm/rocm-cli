@@ -195,6 +195,12 @@ reason = "`examine --json` reports has_amd_gpu:false on a WSL2 host whose own su
 # rejects anything else with rc=1. The names do not mechanically reduce to the
 # ids, so nothing the listing prints is enough to act on. Remove this row once
 # the listing exposes an identifier a user can pass back in.
+#
+# Either direction closes it, and the scenario accepts both: show the id in the
+# listing, or make `enable` accept the label exactly as listed. Note that
+# `render_automations_text`'s unit tests currently assert the listing does NOT
+# contain `command id:` or the raw ids (apps/rocm/src/main.rs), so hiding them was
+# a deliberate choice; a fix that shows the ids has to update those assertions.
 [["automations-listed-checks-can-be-enabled"]]
 when = {}
 bug = "EAI-8047"

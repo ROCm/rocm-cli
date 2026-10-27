@@ -148,16 +148,22 @@ const PLANTED_INTERPRETER_OUTPUT: &str = "planted-engine-python";
 #[then("the engine environment's interpreter is the one that runs")]
 async fn assert_engine_interpreter(world: &mut E2eWorld) {
     // Guards against the prompt shim breaking the activation it decorates, and
-    // against a wrong PATH/VIRTUAL_ENV: the shim re-runs the user's startup files,
-    // which could otherwise reorder PATH.
+    // against a wrong PATH or VIRTUAL_ENV: the shim re-runs the user's startup
+    // files, which could otherwise reorder PATH.
     //
     // This RUNS `python` and waits for the planted interpreter's own output. Do not
     // wait for the interpreter's path instead: `engine_shell` prints
     // `python: <path>` in its banner before bash starts, so a path wait is
     // satisfied by the banner whatever `command -v` would say.
+    //
+    // `</dev/null` is load-bearing. If PATH is wrong, `python` may resolve to a real
+    // interpreter, which would start a REPL as the terminal's foreground job. That
+    // REPL outlives the test's kill of `rocm`, keeps the PTY slave open, and hangs
+    // the whole e2e run in teardown instead of failing the scenario. With stdin at
+    // EOF a wrong `python` exits on its own, and the planted stub ignores stdin.
     let session = world.tui.as_mut().expect("no engine shell session");
     session
-        .send("python\n")
+        .send("python </dev/null\n")
         .unwrap_or_else(|e| panic!("failed to run the interpreter: {e}"));
     session
         .wait_for_screen(PLANTED_INTERPRETER_OUTPUT, SCREEN_TIMEOUT)
@@ -166,6 +172,22 @@ async fn assert_engine_interpreter(world: &mut E2eWorld) {
             panic!(
                 "running `python` in the engine shell did not run the engine env's interpreter \
                  (wanted it to print {PLANTED_INTERPRETER_OUTPUT:?}): {e}"
+            )
+        });
+
+    // The shell also exports VIRTUAL_ENV, which the doubled path corrupts too. The
+    // marker is computed in the shell (`$((6*7))`), so the typed command line,
+    // which is echoed to the screen, cannot satisfy the wait by itself.
+    session
+        .send("test -f \"$VIRTUAL_ENV/bin/activate\" && echo venv-ok-$((6*7))\n")
+        .unwrap_or_else(|e| panic!("failed to check VIRTUAL_ENV: {e}"));
+    session
+        .wait_for_screen("venv-ok-42", SCREEN_TIMEOUT)
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "VIRTUAL_ENV in the engine shell does not name an environment holding \
+                 bin/activate: {e}"
             )
         });
 }
