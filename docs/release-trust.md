@@ -312,10 +312,12 @@ is already trusted.
 ## Simulated Host Root
 
 rocm-cli decides what hardware it is running on by reading fixed host paths:
-`/dev/kfd`, the render nodes under `/dev/dri`, `/dev/dxg`, the KFD topology
-under `/sys/class/kfd`, the DRM cards under `/sys/class/drm`,
-`/sys/module/amdgpu` and its `version` file, `/proc/version`, `/proc/cpuinfo`,
-`/proc/meminfo`, `/proc/cmdline`, `/proc/modules`, `/proc/1/cgroup`, the
+`/dev/kfd`, the render nodes under `/dev/dri`, `/dev/dxg`, the
+`/sys/class/kfd/kfd` class device and the KFD topology under it, the DRM cards
+under `/sys/class/drm`, the amdgpu PCI driver directory
+`/sys/bus/pci/drivers/amdgpu`, `/sys/module/amdgpu` and its `version` file,
+`/proc/version`, `/proc/cpuinfo`, `/proc/meminfo`, `/proc/cmdline`,
+`/proc/modules`, `/proc/1/cgroup`, the
 container markers `/.dockerenv` and `/run/.containerenv`, the `/etc/os-release`
 (falling back to `/usr/lib/os-release` when absent, per `os-release(5)`) behind
 the distro fields and name `rocm examine` reports, the modprobe

@@ -561,7 +561,11 @@ jobs:
         # fields and the distro name, in
         # `os_release_reads_follow_the_simulated_host_root` and, for the
         # `/usr/lib/os-release` fallback, in
-        # `os_release_reads_fall_back_to_usr_lib_when_etc_is_absent`). The other routed
+        # `os_release_reads_fall_back_to_usr_lib_when_etc_is_absent`), and the
+        # driver-presence reads `/sys/class/kfd/kfd`, `/dev/kfd` and
+        # `/sys/bus/pci/drivers/amdgpu` (`kfd_present_on_host`,
+        # `amdgpu_present_on_host`, `driver_states` and the two
+        # `probe_modules_reports_*` tests). The other routed
         # reads (`/dev/dri`, `/sys/class/drm`, `/sys/module/amdgpu`, the other
         # `/proc` files, the modprobe directories, the `/usr/lib/wsl/lib` and
         # ROCDXG checks) have no planted-root unit assertion; they are covered
