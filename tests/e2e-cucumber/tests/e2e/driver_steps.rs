@@ -56,7 +56,9 @@ async fn assert_driver_plan_matches_host_release(world: &mut E2eWorld) {
         // this scenario's premise is Ubuntu specifically (every assertion
         // below hard-codes Ubuntu's apt/native-archive command text), so a
         // future non-Ubuntu bare-metal lane has no premise here rather than
-        // failing against text it was never meant to produce.
+        // failing against text it was never meant to produce. The harness has
+        // no per-step skip, so say so rather than passing silently.
+        eprintln!("driver-install-06: not an Ubuntu host, nothing asserted");
         return;
     }
 
@@ -298,6 +300,21 @@ async fn assert_advised_variable_clears_retired_refusal(world: &mut E2eWorld) {
             && !stdout.contains("policy: invalid_driver_version_override"),
         "{stdout}"
     );
+}
+
+#[then("approving the install with the retired variable still set fails and installs nothing")]
+async fn assert_approving_retired_variable_fails(world: &mut E2eWorld) {
+    // Safe on a real host: the refusal precedes any command, so `--yes` has
+    // nothing to execute and no installer state is written.
+    let (stdout, stderr, rc) = crate::run_rocm_with_env(
+        world,
+        &["install", "driver", "--dkms", "--yes"],
+        &[("ROCM_CLI_AMDGPU_VERSION", "7.2.4")],
+    );
+    assert_ne!(rc, 0, "an approved refused plan must not exit 0:\n{stdout}");
+    let all = format!("{stdout}{stderr}");
+    assert!(all.contains("nothing was installed"), "{all}");
+    assert!(!all.contains("driver install completed"), "{all}");
 }
 
 #[then("the driver plan refuses the invalid version override and plans no commands")]

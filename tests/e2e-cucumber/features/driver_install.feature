@@ -95,3 +95,4 @@ Feature: Driver installation planning
     When the user previews driver installation with a retired version pin variable
     Then the driver plan refuses the retired variable and plans no commands
     And setting the advised variable instead clears the refusal
+    And approving the install with the retired variable still set fails and installs nothing

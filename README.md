@@ -577,6 +577,10 @@ yet publish a matching DKMS repo, so `install driver` reports a non-mutating
 `supported: false` plan instead and directs you to `apt install rocm` for the
 userspace ROCm stack.
 
+Approving (`--yes`) a plan that is `supported: false` (Ubuntu 26.04, an
+undocumented distro, or a refused version override) installs nothing and exits
+non-zero, after printing the plan.
+
 On Windows, `install driver` is validate-only: it installs and changes nothing,
 with or without `--yes`, and it starts no driver command. It prints the AMD
 display driver version and date, and whether the date is older than the first

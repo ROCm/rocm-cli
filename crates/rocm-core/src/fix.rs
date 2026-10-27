@@ -557,6 +557,7 @@ const RECIPES: &[FixRecipe] = &[
                  && rocminfo >/dev/null 2>&1",
         notes: &[
             "If the purge/remove step warns it will take unrelated packages with it, stop and resolve those by hand before continuing.",
+            "The `rocm install driver --dkms --yes` line and the verify below apply only on AMD-documented distros; `rocm install driver --dkms --yes` exits non-zero where it plans nothing (Ubuntu 26.04, undocumented distros). There, verify with `rocminfo` alone, or `dpkg-query -W rocm` after `sudo apt install rocm` on Ubuntu 26.04.",
         ],
         doc_url: None,
         applies_on: PRINT_ON_LINUX,

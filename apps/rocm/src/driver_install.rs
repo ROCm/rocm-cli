@@ -46,6 +46,14 @@ const fn should_execute(plan: &DriverInstallPlan, yes: bool, dry_run: bool) -> b
     yes && !dry_run && plan.supported && plan.mutating
 }
 
+/// Whether an approved (`--yes`) run asks for a plan that installs nothing and
+/// should say so with a failing exit status. Native Windows is exempt: its
+/// plan only reports and promises to change nothing, so approving it is a
+/// successful no-op.
+fn approval_of_unsupported_plan(plan: &DriverInstallPlan, yes: bool, dry_run: bool) -> bool {
+    yes && !dry_run && !plan.supported && plan.policy != "windows_validate_only"
+}
+
 pub(crate) fn install_driver(
     paths: &AppPaths,
     dkms: bool,
@@ -60,6 +68,16 @@ pub(crate) fn install_driver(
     let plan =
         build_driver_install_plan_read(&examine, &os_release, dkms, PrivilegeEscalation::detect());
     let mut output = render_driver_install_plan(&plan, yes, dry_run);
+    if approval_of_unsupported_plan(&plan, yes, dry_run) {
+        return Err(DriverInstallError::new(
+            anyhow::anyhow!(
+                "{output}\nnothing was installed: this host has no supported driver plan ({}). {}",
+                plan.policy,
+                plan.reason
+            ),
+            false,
+        ));
+    }
     if !should_execute(&plan, yes, dry_run) {
         return Ok(DriverInstallResult {
             output,
@@ -3676,6 +3694,23 @@ VERSION_ID="15.7"
                 "{os_release}: {rendered}"
             );
         }
+    }
+
+    #[test]
+    fn approving_an_unsupported_plan_is_an_error_but_not_a_dry_run_or_windows() {
+        let mut plan = unsupported_test_plan();
+        assert!(approval_of_unsupported_plan(&plan, true, false));
+        assert!(!approval_of_unsupported_plan(&plan, false, false));
+        assert!(!approval_of_unsupported_plan(&plan, true, true));
+        plan.policy = "windows_validate_only".to_owned();
+        assert!(!approval_of_unsupported_plan(&plan, true, false));
+        plan.policy = "x".to_owned();
+        plan.supported = true;
+        assert!(!approval_of_unsupported_plan(&plan, true, false));
+    }
+
+    fn unsupported_test_plan() -> DriverInstallPlan {
+        invalid_driver_version_override_plan("x".to_owned())
     }
 
     #[test]
