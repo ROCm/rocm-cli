@@ -477,10 +477,9 @@ async fn fresh_audit_log(world: &mut E2eWorld) {
 #[then("the recent background activity still includes entries from before the rotation")]
 async fn recent_activity_spans_rotation(world: &mut E2eWorld) {
     let out = ok_output(world);
-    let activity = out
-        .split_once("recent background activity:")
-        .map(|(_, rest)| rest)
-        .unwrap_or_else(|| panic!("expected a recent background activity section:\n{out}"));
+    let Some((_, activity)) = out.split_once("recent background activity:") else {
+        panic!("expected a recent background activity section:\n{out}");
+    };
     // Five most recent: four seeded records, which now live only in the
     // rotated generation, then the permissions change.
     assert_eq!(
