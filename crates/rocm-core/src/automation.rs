@@ -388,19 +388,11 @@ fn inspect_tail(path: &Path, file: &fs::File) -> Result<TailState> {
     if len == 0 || read_range(path, file, len - 1, len)? == b"\n" {
         return Ok(TailState::Clean(len));
     }
-    let mut tail = Vec::new();
-    let mut tail_start = len;
-    while tail_start > 0 {
-        let chunk_start = tail_start.saturating_sub(JSONL_SCAN_CHUNK);
-        let chunk = read_range(path, file, chunk_start, tail_start)?;
-        if let Some(newline) = chunk.iter().rposition(|&byte| byte == b'\n') {
-            tail.splice(0..0, chunk[newline + 1..].iter().copied());
-            tail_start = chunk_start + newline as u64 + 1;
-            break;
-        }
-        tail.splice(0..0, chunk);
-        tail_start = chunk_start;
-    }
+    // The segment after the last `\n` is exactly `ReverseLines`'s first line,
+    // so reuse its backward scan rather than re-implementing it here.
+    let (tail_start, tail) = ReverseLines::new(path, file, len, JSONL_SCAN_CHUNK)
+        .next_line()?
+        .unwrap_or_default();
     if tail.is_empty() {
         return Ok(TailState::Clean(len));
     }
@@ -418,8 +410,10 @@ fn inspect_tail(path: &Path, file: &fs::File) -> Result<TailState> {
 /// rather than truncating the live file (see [`inspect_tail`] and
 /// [`TailState::Torn`]) — so a short read here means the store was edited or
 /// truncated out-of-band, a case this module does not try to recover from
-/// cleanly: the caller treats what is still there the same as any other
-/// unexpectedly-ending tail.
+/// cleanly. Most callers treat what is still there the same as any other
+/// unexpectedly-ending tail; [`ReverseLines`] is the one exception, and
+/// reports an error instead once it would have to splice such a read onto
+/// bytes it already read, rather than risk inventing a line.
 fn read_range(path: &Path, file: &fs::File, start: u64, end: u64) -> Result<Vec<u8>> {
     let mut reader = file;
     reader
@@ -526,14 +520,14 @@ fn scan_recent_jsonl_records<T: DeserializeOwned>(
     let mut records = Vec::new();
     // The first segment is whatever follows the last `\n`: empty when the
     // file ends on a line boundary, else an unterminated last line.
-    if let Some(tail) = lines.next_line()?
+    if let Some((_, tail)) = lines.next_line()?
         && !is_blank(&tail)
         && !is_torn_record(&tail)
     {
         records.push(parse(&tail)?);
     }
     while records.len() < limit {
-        let Some(line) = lines.next_line()? else {
+        let Some((_, line)) = lines.next_line()? else {
             break;
         };
         if !is_blank(&line) {
@@ -586,7 +580,11 @@ impl<'a> ReverseLines<'a> {
         }
     }
 
-    fn next_line(&mut self) -> Result<Option<Vec<u8>>> {
+    /// Yields `(start, bytes)`: `start` is the returned line's absolute file
+    /// offset, derived from `self.pos` (which tracks real, current file
+    /// offsets as actually read) rather than from a length measured earlier
+    /// by the caller — which may be stale by the time a scan reaches it.
+    fn next_line(&mut self) -> Result<Option<(u64, Vec<u8>)>> {
         if self.done {
             return Ok(None);
         }
@@ -596,19 +594,22 @@ impl<'a> ReverseLines<'a> {
             if let Some(newline) = self.pending.iter().rposition(|&byte| byte == b'\n') {
                 let line = self.pending.split_off(newline + 1);
                 self.pending.truncate(newline);
-                return Ok(Some(line));
+                let start = self.pos + newline as u64 + 1;
+                return Ok(Some((start, line)));
             }
             if self.pos == 0 {
                 self.done = true;
-                return Ok(Some(std::mem::take(&mut self.pending)));
+                return Ok(Some((0, std::mem::take(&mut self.pending))));
             }
             let start = self.pos.saturating_sub(self.chunk);
             let mut bytes = read_range(self.path, self.file, start, self.pos)?;
-            // A short first read just means the store was edited or
-            // truncated out-of-band (see `read_range`); nothing a concurrent
-            // writer does can shrink it in place. Short after that, the
-            // bytes already read no longer continue from these, so splicing
-            // them would invent a line.
+            // A short read while `pending` is empty — nothing accumulated
+            // yet, whether from an earlier call or from this one — just
+            // means the store was edited or truncated out-of-band (see
+            // `read_range`); nothing a concurrent writer does can shrink it
+            // in place. Once `pending` holds any bytes, a short read means
+            // they no longer continue from it, so splicing them would
+            // invent a line.
             if bytes.len() as u64 != self.pos - start && !self.pending.is_empty() {
                 bail!("{} shrank while it was being read", self.path.display());
             }
@@ -1278,10 +1279,27 @@ mod tests {
             for chunk in 1..=8 {
                 let mut lines = ReverseLines::new(&path, &file, file.metadata()?.len(), chunk);
                 let mut got = Vec::new();
-                while let Some(line) = lines.next_line()? {
+                let mut starts = Vec::new();
+                while let Some((start, line)) = lines.next_line()? {
+                    starts.push(start);
                     got.push(line);
                 }
                 assert_eq!(got, expected, "contents {contents:?}, chunk {chunk}");
+                // Each line's reported start plus its own length must land
+                // exactly one byte before the previous (later-in-file) line's
+                // start — the byte in between is the `\n` that separated
+                // them — except the first line yielded here (the file's
+                // *last* line, with nothing after it to separate from),
+                // which must instead land exactly on the file's own length.
+                let mut expected_next = contents.len() as u64;
+                for (&start, line) in starts.iter().zip(&got) {
+                    assert_eq!(
+                        start + line.len() as u64,
+                        expected_next,
+                        "contents {contents:?}, chunk {chunk}: wrong start for {line:?}"
+                    );
+                    expected_next = start.saturating_sub(1);
+                }
             }
         }
         fs::remove_dir_all(root).ok();
@@ -1435,6 +1453,34 @@ mod tests {
         assert!(
             next.is_err(),
             "a short read after the first must not be spliced"
+        );
+        Ok(())
+    }
+
+    // Unlike the shrink above, a shrink before any chunk has been read yet
+    // isn't guarded (there is no prior `pending` to misalign against), so it
+    // must not error — but the line it finds, and the offset it reports,
+    // still have to match where the content actually is now, not where the
+    // `len` passed to `new` (now stale) said it would be.
+    #[test]
+    fn reverse_lines_tolerates_a_shrink_before_the_first_read() -> Result<()> {
+        let (root, _paths) = temp_app_paths("reverse-lines-shrink-first-read");
+        fs::create_dir_all(&root)?;
+        let path = root.join("lines.jsonl");
+        fs::write(&path, "aaaa\nbbbb\ncccc")?;
+        let file = fs::File::open(&path)?;
+        // As if this had measured the file at its original 14 bytes, then the
+        // file shrank to 9 ("aaaa\nbbbb", no trailing "\ncccc") before this
+        // scan's first read.
+        fs::OpenOptions::new().write(true).open(&path)?.set_len(9)?;
+        let mut lines = ReverseLines::new(&path, &file, 14, 4);
+        let next = lines.next_line();
+        fs::remove_dir_all(root).ok();
+        let (start, line) = next?.expect("one line");
+        assert_eq!(line, b"bbbb", "must read what is really there now");
+        assert_eq!(
+            start, 5,
+            "offset must match the real content, not the stale length"
         );
         Ok(())
     }
