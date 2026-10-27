@@ -367,11 +367,10 @@ Feature: GPU detection and system inspection
   # With an amd-smi that prints a snapshot's worth of JSON and only then
   # stalls, that quote is the entire payload, and the note is not a terminal
   # message: `record_gpu_metrics` copies it into the automation-event and audit
-  # JSONL files every 60s, and both append helpers rewrite the whole file each
-  # time. Unbounded, the logs grew by the payload's size every minute and each
-  # write cost more than the last. So the note must name the timeout, keep
-  # enough of the child's output to be worth reading, say that it was shortened
-  # -- and stay small.
+  # JSONL files every 60s, neither ever rotated or capped. Unbounded, the logs
+  # grew by the payload's size every minute, forever. So the note must name
+  # the timeout, keep enough of the child's output to be worth reading, say
+  # that it was shortened -- and stay small.
   #
   # Asserted here rather than only as a unit test because the note's journey is
   # the point: the bound lives in `rocm-core`'s `run_with_timeout` and the

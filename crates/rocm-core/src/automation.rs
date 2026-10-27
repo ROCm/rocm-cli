@@ -12,14 +12,21 @@
 //!
 //! The `rocm` CLI and `rocmd` write these stores concurrently, so every
 //! mutation of a store holds its sibling `.lock` file (see `jsonl_lock_path`).
-//! Appending a record is one append-mode write of one line — its cost does not
-//! grow with the store — rolled back if the write fails; a proposal status
-//! update rewrites the store via `write_atomic`. Readers take no lock, and an
-//! unterminated last line that is not valid JSON — an append caught mid-write —
-//! is skipped rather than reported as corruption. The stores are not rotated
-//! or capped. `AutomationTriggerEvent` is also defined here, but this
-//! module persists none of it: it is the in-memory trigger type passed
-//! between `rocmd`'s watcher and webhook plumbing (`apps/rocmd/src/watchers.rs`,
+//! Appending a record is, in the common case, one append-mode write of one
+//! line — its cost does not grow with the store. A torn tail — crash debris,
+//! or left by a write that failed partway — is cut by the next append rather
+//! than truncated in place: that append writes the store's clean prefix plus
+//! its own new record as a single rewrite via `write_atomic`, so a lock-free
+//! reader never observes a file shrunk mid-repair. That rewrite costs O(store)
+//! rather than O(record), the same as a proposal status update, which rewrites
+//! the whole store via `write_atomic` too. Nothing in this module ever
+//! shrinks a store in place. Readers take no lock, and an unterminated last
+//! line that is not valid JSON — an append caught mid-write — is skipped
+//! rather than reported as corruption. The stores are not rotated or capped.
+//!
+//! `AutomationTriggerEvent` is also defined here, but this module persists
+//! none of it: it is the in-memory trigger type passed between `rocmd`'s
+//! watcher and webhook plumbing (`apps/rocmd/src/watchers.rs`,
 //! `apps/rocmd/src/webhook.rs`), never serialized.
 
 use anyhow::{Context, Result, bail};
@@ -219,10 +226,12 @@ pub struct AuditEventRecord {
 /// Lock file serializing every mutation of the JSONL store at `path` — a
 /// sibling named `<store file name>.lock` (e.g. `events.jsonl.lock`).
 ///
-/// Appends and the proposal-status rewrite both take it. The rewrite needs it
-/// for its read-modify-write; appends need it too, because the rewrite
-/// replaces the store by renaming a new file over it, and an append that had
-/// already opened the old file would land in the replaced copy and vanish.
+/// Appends and the proposal-status rewrite both take it. The proposal
+/// rewrite needs it for its read-modify-write; an append needs it both to
+/// serialize against other appends and because it can itself become a
+/// rewrite — a torn tail is repaired by renaming a new file over the store
+/// (see [`TailState::Torn`]) — and an append that had already opened the old
+/// file would otherwise land in the replaced copy and vanish.
 fn jsonl_lock_path(path: &Path) -> PathBuf {
     let mut name = path.file_name().unwrap_or_default().to_os_string();
     name.push(".lock");
@@ -234,15 +243,21 @@ const JSONL_SCAN_CHUNK: u64 = 64 * 1024;
 
 /// Append one JSONL `record` to `path`, creating the file if needed.
 ///
-/// Holds the store's [`jsonl_lock_path`] lock and writes the line with a
-/// single append-mode write, so the cost no longer grows with the store and
-/// a concurrent writer can never drop this record (or have its own record
-/// dropped by this one), across threads and processes alike.
+/// Holds the store's [`jsonl_lock_path`] lock. The common case — the store
+/// already ends on a line boundary — is a single append-mode write of one
+/// line, so the cost no longer grows with the store and a concurrent writer
+/// can never drop this record (or have its own record dropped by this one),
+/// across threads and processes alike.
 ///
-/// A failed write is rolled back to the pre-append length, so a full disk
-/// never leaves a torn line behind. A torn line left by a writer that was
-/// killed mid-write is cleaned up by the next append: see
-/// [`repair_unterminated_tail`].
+/// A write that fails partway leaves whatever it already wrote as a new torn
+/// tail — the same debris a killed writer leaves — rather than rolling it
+/// back: seeing `Err` here means this specific record did not land (see
+/// [`append_or_tolerate_a_missing_newline`] for the one exception, where it
+/// did land despite the error), and the debris itself is discarded by the
+/// *next* append rather than being cut first as a separate step — see
+/// [`inspect_tail`] and [`TailState::Torn`]. A reader already skips the
+/// debris in the meantime. Nothing in this function ever truncates the live
+/// file, so a lock-free reader never observes it shrink.
 fn append_jsonl_record<T: Serialize>(path: &Path, record: &T, context_label: &str) -> Result<()> {
     let mut line = serde_json::to_vec(record)
         .with_context(|| format!("failed to serialize {context_label}"))?;
@@ -255,35 +270,123 @@ fn append_jsonl_record<T: Serialize>(path: &Path, record: &T, context_label: &st
         .create(true)
         .open(path)
         .with_context(|| format!("failed to open {}", path.display()))?;
-    let (start, needs_separator) = repair_unterminated_tail(path, &file)?;
-    if needs_separator {
-        line.insert(0, b'\n');
-    }
-    if let Err(error) = (&file).write_all(&line) {
-        // Best effort: if this fails too, the torn tail is still repaired by
-        // the next append, and readers already skip it.
-        let _ = truncate_file(path, start);
-        return Err(error).with_context(|| format!("failed to append to {}", path.display()));
+    match inspect_tail(path, &file)? {
+        TailState::Torn(tail_start) => {
+            // A torn tail is debris — crash or a failed write — that must be
+            // cut before this record lands. Cutting it in place and then
+            // appending as a second step would briefly shrink the file for
+            // any lock-free reader mid-scan, and regrowing it afterward can
+            // make that scan splice bytes read at two different moments into
+            // something that parses as a record nobody wrote (the hazard
+            // `ReverseLines::next_line`'s short-read guard exists for).
+            // Replacing the whole file atomically instead means a reader
+            // only ever sees the pre-repair length or this append's, never a
+            // length in between.
+            let mut content = read_range(path, &file, 0, tail_start)?;
+            content.extend_from_slice(&line);
+            crate::write_atomic(path, &content, "jsonl")?;
+        }
+        TailState::ValidUnterminated(start) => {
+            line.insert(0, b'\n');
+            append_or_tolerate_a_missing_newline(path, &file, &line, start)?;
+        }
+        TailState::Clean(start) => {
+            append_or_tolerate_a_missing_newline(path, &file, &line, start)?;
+        }
     }
     Ok(())
 }
 
-/// Make the store at `path` end on a line boundary before an append, returning
-/// the length to roll back to if the append fails and whether the new line
-/// needs a leading `\n`.
+/// Append-mode write of `line`, starting at offset `start`.
 ///
-/// Must be called with the store's lock held, so no other writer is mid-write
-/// and an unterminated last line is either crash debris (a writer killed
-/// mid-write: not valid JSON, cut off) or a complete record whose newline was
-/// lost to a hand edit (valid JSON, kept and terminated).
-fn repair_unterminated_tail(path: &Path, file: &fs::File) -> Result<(u64, bool)> {
+/// A write can fail after landing every byte of `line` except its final
+/// `\n` (e.g. the disk fills up one byte short). That is not torn debris:
+/// it is a complete, valid record, and readers already treat a complete
+/// record missing only its trailing newline as fully stored (see
+/// `readers_keep_an_unterminated_last_line_that_parses`). Reporting that as
+/// a failure would tell a caller that retries on error to write the same
+/// record again, leaving a duplicate the store has no way to detect or
+/// remove — so this checks what actually landed before deciding.
+fn append_or_tolerate_a_missing_newline(
+    path: &Path,
+    file: &fs::File,
+    line: &[u8],
+    start: u64,
+) -> Result<()> {
+    let mut file = file;
+    let Err(error) = file.write_all(line) else {
+        return Ok(());
+    };
+    let landed = (|| -> Result<Vec<u8>> {
+        let end = file
+            .metadata()
+            .with_context(|| format!("failed to stat {}", path.display()))?
+            .len()
+            .max(start);
+        read_range(path, file, start, end)
+    })();
+    match landed {
+        Ok(landed) if landed_despite_the_error(&landed, line) => Ok(()),
+        Ok(_) => Err(error).with_context(|| format!("failed to append to {}", path.display())),
+        // The write itself is still the more informative failure (e.g. the
+        // disk is full); checking whether it landed anyway is this
+        // function's own extra step, so losing that check is a detail
+        // folded into the same report rather than the headline error.
+        Err(check_error) => Err(error).with_context(|| {
+            format!(
+                "failed to append to {} ({check_error:#} while checking whether it landed anyway)",
+                path.display()
+            )
+        }),
+    }
+}
+
+/// Whether `landed` — the bytes a failed append-mode write actually put on
+/// disk, read back from where it started — show `line` arrived intact
+/// except possibly for its own trailing `\n`. Split out from
+/// [`append_or_tolerate_a_missing_newline`] so the decision itself can be
+/// tested without inducing a real write failure.
+fn landed_despite_the_error(landed: &[u8], line: &[u8]) -> bool {
+    let without_trailing_newline = &line[..line.len().saturating_sub(1)];
+    landed.len() >= without_trailing_newline.len()
+        && landed[..without_trailing_newline.len()] == *without_trailing_newline
+}
+
+/// How [`inspect_tail`] found the store's current last line, ahead of an
+/// append. The `Clean`/`ValidUnterminated` payload is the offset this
+/// append's own bytes will start at, used by
+/// [`append_or_tolerate_a_missing_newline`] to tell a complete record that
+/// merely failed to land its own trailing newline from one that is actually
+/// missing.
+enum TailState {
+    /// Empty, or already ends on a line boundary.
+    Clean(u64),
+    /// A complete record, or a blank (whitespace-only) line, lost its
+    /// trailing `\n` — to a hand edit, or to a write that landed every byte
+    /// except that final one; the new line needs a leading `\n`.
+    ValidUnterminated(u64),
+    /// Debris — crash, or a write that failed partway through a genuinely
+    /// incomplete record — starting at this offset. Must be cut before the
+    /// next record lands, but never by truncating in place — see
+    /// [`append_jsonl_record`].
+    Torn(u64),
+}
+
+/// Classify the store's current last line ahead of an append.
+///
+/// Must be called with the store's lock held, so no other writer is
+/// mid-write and an unterminated last line is either debris (not valid JSON,
+/// cut off — a writer killed mid-write, or one whose own append failed
+/// partway) or a complete record or blank line whose newline was lost to a
+/// hand edit or a write that failed one byte short (kept and terminated).
+fn inspect_tail(path: &Path, file: &fs::File) -> Result<TailState> {
     let len = file
         .metadata()
         .with_context(|| format!("failed to stat {}", path.display()))?
         .len();
     // The common case — empty, or ending on a line boundary — costs one byte.
     if len == 0 || read_range(path, file, len - 1, len)? == b"\n" {
-        return Ok((len, false));
+        return Ok(TailState::Clean(len));
     }
     let mut tail = Vec::new();
     let mut tail_start = len;
@@ -299,21 +402,24 @@ fn repair_unterminated_tail(path: &Path, file: &fs::File) -> Result<(u64, bool)>
         tail_start = chunk_start;
     }
     if tail.is_empty() {
-        return Ok((len, false));
+        return Ok(TailState::Clean(len));
     }
     if is_blank(&tail) || !is_torn_record(&tail) {
-        return Ok((len, true));
+        return Ok(TailState::ValidUnterminated(len));
     }
-    truncate_file(path, tail_start)?;
-    Ok((tail_start, false))
+    Ok(TailState::Torn(tail_start))
 }
 
 /// Read bytes `[start, end)` of `file`.
 ///
-/// Returns fewer bytes if the file now ends before `end`: a lock-free reader
-/// can race a writer cutting a torn last line (see
-/// [`repair_unterminated_tail`]), and the bytes cut are never a complete
-/// record, so what is still there is all the caller needs.
+/// Returns fewer bytes if the file now ends before `end`. Nothing this
+/// module's own writers do can shrink a store in place — an append only ever
+/// grows it, and a torn-tail repair replaces it wholesale via `write_atomic`
+/// rather than truncating the live file (see [`inspect_tail`] and
+/// [`TailState::Torn`]) — so a short read here means the store was edited or
+/// truncated out-of-band, a case this module does not try to recover from
+/// cleanly: the caller treats what is still there the same as any other
+/// unexpectedly-ending tail.
 fn read_range(path: &Path, file: &fs::File, start: u64, end: u64) -> Result<Vec<u8>> {
     let mut reader = file;
     reader
@@ -325,17 +431,6 @@ fn read_range(path: &Path, file: &fs::File, start: u64, end: u64) -> Result<Vec<
         .read_to_end(&mut bytes)
         .with_context(|| format!("failed to read {}", path.display()))?;
     Ok(bytes)
-}
-
-/// Cut `path` back to `len` bytes. Opens its own write handle: the append
-/// handle cannot be relied on to truncate on Windows, where append-only
-/// access does not include the right to move end-of-file backwards.
-fn truncate_file(path: &Path, len: u64) -> Result<()> {
-    fs::OpenOptions::new()
-        .write(true)
-        .open(path)
-        .and_then(|file| file.set_len(len))
-        .with_context(|| format!("failed to truncate {}", path.display()))
 }
 
 /// Parse a whole JSONL store, pairing each record with its line index.
@@ -382,10 +477,12 @@ fn parse_jsonl_records<T: DeserializeOwned>(
 /// [`parse_jsonl_records`], an unterminated last line that is not valid JSON is
 /// an append caught mid-write and is skipped.
 ///
-/// The scan takes no lock, so a writer may cut a torn last line (see
-/// [`repair_unterminated_tail`]) and append again while it runs. A scan that
-/// fails while the file's length moved under it is retried from the new end,
-/// so that race never surfaces as an error.
+/// The scan takes no lock. A concurrent append only ever grows the file (see
+/// [`append_jsonl_record`]); nothing this module's own writers do shrinks it
+/// in place. The retry below is for a store edited or truncated out-of-band
+/// — by a person, not a concurrent writer — while a scan is in flight: a
+/// scan that fails while the file's length moved under it is retried from
+/// the new end, so that still never surfaces as an error.
 fn load_recent_jsonl_records<T: DeserializeOwned>(
     path: &Path,
     limit: usize,
@@ -507,9 +604,11 @@ impl<'a> ReverseLines<'a> {
             }
             let start = self.pos.saturating_sub(self.chunk);
             let mut bytes = read_range(self.path, self.file, start, self.pos)?;
-            // A short first read just means a torn tail was cut (see
-            // `read_range`). Short after that, the bytes already read no longer
-            // continue from these, so splicing them would invent a line.
+            // A short first read just means the store was edited or
+            // truncated out-of-band (see `read_range`); nothing a concurrent
+            // writer does can shrink it in place. Short after that, the
+            // bytes already read no longer continue from these, so splicing
+            // them would invent a line.
             if bytes.len() as u64 != self.pos - start && !self.pending.is_empty() {
                 bail!("{} shrank while it was being read", self.path.display());
             }
@@ -1294,8 +1393,9 @@ mod tests {
         Ok(())
     }
 
-    // A lock-free reader that read the length just before a writer cut a torn
-    // tail sees the file end early; that is not an error.
+    // A lock-free reader that measured a stale, larger length — because the
+    // store was edited out-of-band, not because a concurrent writer shrank
+    // it — sees the file end early; that is not an error.
     #[test]
     fn a_scan_that_finds_the_file_shorter_than_it_was_still_succeeds() -> Result<()> {
         let (root, paths) = temp_app_paths("scan-shrunk");
@@ -1382,6 +1482,175 @@ mod tests {
         fs::remove_dir_all(root).ok();
         assert_eq!(audit_messages(&recent?), ["a", "b"]);
         Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn append_of_a_torn_tail_replaces_rather_than_truncates_the_file_in_place() -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+
+        // The inode is the observable difference between the two ways to
+        // repair a torn tail: truncating it in place keeps rewriting the
+        // SAME file, so a lock-free reader mid-scan can see it briefly
+        // shorter than before the repair and then longer again once the new
+        // record lands — the shrink-and-regrow window a reverse scan can
+        // misread as a record nobody wrote (see `append_jsonl_record`). A
+        // rename publishes a DIFFERENT file over the name, so a reader only
+        // ever sees the pre-repair length or the post-append length, never
+        // one in between.
+        //
+        // `append_cuts_a_torn_last_line_left_by_a_killed_writer` above only
+        // checks the final bytes, which holds just as well for an in-place
+        // truncate-then-write, so it cannot tell the two apart.
+        //
+        // The `#[cfg(windows)]` function of the same name below asserts the
+        // same guarantee through `GetFileInformationByHandle`.
+        let (root, paths) = temp_app_paths("append-torn-tail-replaces");
+        let torn = &audit_line("torn")[..20];
+        seed_audit_store(&paths, &format!("{}\n{torn}", audit_line("a")))?;
+        let path = paths.audit_events_path();
+        let before = fs::metadata(&path)?.ino();
+
+        append_audit_event(&paths, &audit_record("b"))?;
+
+        let after = fs::metadata(&path)?.ino();
+        let text = fs::read_to_string(&path);
+        fs::remove_dir_all(root).ok();
+        assert_ne!(
+            before, after,
+            "repairing a torn tail kept the same inode, so it truncated the \
+             live file in place instead of replacing it"
+        );
+        assert_eq!(text?, format!("{}\n{}\n", audit_line("a"), audit_line("b")));
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn append_of_a_torn_tail_replaces_rather_than_truncates_the_file_in_place() -> Result<()> {
+        use crate::test_support::windows_file_identity;
+
+        // The Windows counterpart of the Unix test above. The file index
+        // together with the volume serial number is this platform's file
+        // identity, the way an inode is on Unix: an in-place truncate keeps
+        // that pair, while a repair-by-rename gives the live path a
+        // different one.
+        let (root, paths) = temp_app_paths("append-torn-tail-replaces");
+        let torn = &audit_line("torn")[..20];
+        seed_audit_store(&paths, &format!("{}\n{torn}", audit_line("a")))?;
+        let path = paths.audit_events_path();
+        let before = windows_file_identity(&path)?;
+
+        append_audit_event(&paths, &audit_record("b"))?;
+
+        let after = windows_file_identity(&path)?;
+        let text = fs::read_to_string(&path);
+        fs::remove_dir_all(root).ok();
+        assert_ne!(
+            before, after,
+            "repairing a torn tail kept the same file identity, so it \
+             truncated the live file in place instead of replacing it"
+        );
+        assert_eq!(text?, format!("{}\n{}\n", audit_line("a"), audit_line("b")));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn append_to_a_clean_or_unterminated_store_keeps_the_same_file() -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+
+        // The counterpart of the torn-tail-repair test above, for the other
+        // two `TailState` arms: with no torn tail to repair — the store either
+        // already ends on a line boundary, or ends in a complete record
+        // missing just its `\n` — an append must stay a plain append-mode
+        // write on the SAME file, not the atomic replace the torn-tail case
+        // takes. An inode change here would mean every append costs a
+        // full-file rewrite, which is exactly the per-append cost this
+        // store's design exists to avoid.
+        for seed in [
+            format!("{}\n", audit_line("a")), // Clean: ends on a line boundary.
+            audit_line("a"),                  // ValidUnterminated: no trailing `\n`.
+        ] {
+            let (root, paths) = temp_app_paths("append-clean-same-file");
+            seed_audit_store(&paths, &seed)?;
+            let path = paths.audit_events_path();
+            let before = fs::metadata(&path)?.ino();
+
+            append_audit_event(&paths, &audit_record("b"))?;
+
+            let after = fs::metadata(&path)?.ino();
+            let text = fs::read_to_string(&path);
+            fs::remove_dir_all(root).ok();
+            assert_eq!(
+                before, after,
+                "an append with no torn tail to repair replaced the file \
+                 instead of appending to it in place, seed {seed:?}"
+            );
+            assert_eq!(text?, format!("{}\n{}\n", audit_line("a"), audit_line("b")));
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn append_to_a_clean_or_unterminated_store_keeps_the_same_file() -> Result<()> {
+        use crate::test_support::windows_file_identity;
+
+        // The Windows counterpart of the Unix test above.
+        for seed in [
+            format!("{}\n", audit_line("a")), // Clean: ends on a line boundary.
+            audit_line("a"),                  // ValidUnterminated: no trailing `\n`.
+        ] {
+            let (root, paths) = temp_app_paths("append-clean-same-file");
+            seed_audit_store(&paths, &seed)?;
+            let path = paths.audit_events_path();
+            let before = windows_file_identity(&path)?;
+
+            append_audit_event(&paths, &audit_record("b"))?;
+
+            let after = windows_file_identity(&path)?;
+            let text = fs::read_to_string(&path);
+            fs::remove_dir_all(root).ok();
+            assert_eq!(
+                before, after,
+                "an append with no torn tail to repair replaced the file \
+                 instead of appending to it in place, seed {seed:?}"
+            );
+            assert_eq!(text?, format!("{}\n{}\n", audit_line("a"), audit_line("b")));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn landed_despite_the_error_tolerates_only_a_missing_trailing_newline() {
+        let line = b"{\"a\":1}\n";
+        assert!(
+            landed_despite_the_error(&line[..line.len() - 1], line),
+            "a write that failed one byte short of the trailing newline must \
+             still count as landed: the record is complete and valid, and a \
+             caller that reports this as a failure and retries would write \
+             it twice"
+        );
+        assert!(
+            landed_despite_the_error(line, line),
+            "the full line landing must also count, even if write_all \
+             somehow still reported an error for it"
+        );
+        assert!(
+            !landed_despite_the_error(&line[..line.len() - 2], line),
+            "missing more than just the trailing newline is genuine torn \
+             debris, not a complete record"
+        );
+        assert!(
+            !landed_despite_the_error(b"", line),
+            "nothing landing at all is not a complete record"
+        );
+        assert!(
+            !landed_despite_the_error(b"{\"a\":2}\n", line),
+            "different bytes landing at the same length must not be \
+             mistaken for this record having landed"
+        );
     }
 
     #[test]
