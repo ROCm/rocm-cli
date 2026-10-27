@@ -96,11 +96,12 @@ fn draw_efficiency_hero(f: &mut Frame, area: Rect, state: &AppState, theme: &The
     // Track aggregate held: an instance contributes if it has a finite gen_tps
     // AND its observation metadata says Held. Mirrors the finite-value filter
     // `node_efficiency` applies below, so this can't mark the aggregate held
-    // over an instance that `node_efficiency` itself excludes as NaN/Inf.
+    // over an instance that `node_efficiency` itself excludes as NaN/Inf or as
+    // a Lemonade last-request rate (`live_gen_tps`).
     // Any contributing Held → whole aggregate is held.
     let any_held = state.latest.as_ref().is_some_and(|snap| {
         snap.instances.iter().any(|i| {
-            i.gen_tps.is_some_and(f64::is_finite)
+            i.live_gen_tps().is_some()
                 && i.gen_tps_observation.as_ref().is_some_and(|m| {
                     m.freshness == rocm_dash_core::metrics::ObservationFreshness::Held
                 })
@@ -186,8 +187,10 @@ fn draw_throughput_hero(f: &mut Frame, area: Rect, state: &AppState, theme: &The
                 let mut any_held = false;
                 for inst in &snap.instances {
                     // Finite-value filter: a single NaN/Inf sample must not
-                    // poison the whole sum, mirroring `node_efficiency`.
-                    if let Some(v) = inst.gen_tps.filter(|v| v.is_finite()) {
+                    // poison the whole sum, mirroring `node_efficiency`; a
+                    // Lemonade last-request rate is not live throughput and is
+                    // left out too (see `Instance::live_gen_tps`).
+                    if let Some(v) = inst.live_gen_tps() {
                         tps += v;
                         has_tps = true;
                         if inst.gen_tps_observation.as_ref().is_some_and(|m| {
@@ -454,6 +457,55 @@ mod tests {
         ObservationMetadata {
             observed_at: "2023-11-15T12:00:00Z".parse().unwrap(),
             freshness: ObservationFreshness::Fresh,
+        }
+    }
+
+    fn last_request_instance(
+        model: &str,
+        gen_tps: f64,
+        obs: Option<ObservationMetadata>,
+    ) -> Instance {
+        Instance {
+            gen_tps_last_request: true,
+            ..instance_with_obs(model, gen_tps, obs)
+        }
+    }
+
+    /// Only the two hero panels, so the Instances table (which labels a
+    /// last-request rate and keeps its own per-row tok/W) cannot satisfy or break
+    /// an assertion about them.
+    fn render_heroes(state: &AppState) -> String {
+        let mut term = Terminal::new(TestBackend::new(160, 12)).unwrap();
+        term.draw(|f| draw_hero_band(f, f.area(), state, &state.theme))
+            .unwrap();
+        term.backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect()
+    }
+
+    /// An idle Lemonade server keeps reporting its last request's rate. The Node
+    /// efficiency and Node throughput heroes must not present it as current: the
+    /// same rate as a live instance fills them (`1.00 tok/W`, a `tok/s` figure), as a
+    /// last-request rate they stay at `—`, and held metadata on it adds no marker
+    /// or legend.
+    #[test]
+    fn observe_heroes_leave_out_a_last_request_rate() {
+        use crate::ui::format;
+        let live = connected_with_instances(vec![instance_with_obs("m", 300.0, Some(fresh_obs()))]);
+        let out = render_heroes(&live);
+        assert!(out.contains("1.00 tok/W"), "baseline: {out}");
+        assert!(out.contains(" tok/s"), "baseline: {out}");
+
+        for obs in [fresh_obs(), held_obs()] {
+            let last = connected_with_instances(vec![last_request_instance("m", 300.0, Some(obs))]);
+            let out = render_heroes(&last);
+            assert!(!out.contains("1.00 tok/W"), "{out}");
+            assert!(!out.contains(" tok/s"), "{out}");
+            assert!(!out.contains(format::HELD_LEGEND), "{out}");
+            assert!(!out.contains(format::HELD_MARKER), "{out}");
         }
     }
 

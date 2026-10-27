@@ -53,6 +53,9 @@ pub trait GpuCollector: Send + Sync {
 /// A discovered serving process or container.
 #[derive(Debug, Clone, Default)]
 pub struct DiscoveredService {
+    /// True only for discovery from a managed-service registry record.
+    /// External protocol and container discovery do not grant lifecycle control.
+    pub managed: bool,
     pub container_id: String,
     pub container_name: String,
     pub model_name: String,
@@ -136,6 +139,7 @@ pub fn merge_instance(
     vram_total_mb: u64,
 ) -> Instance {
     Instance {
+        managed: svc.managed,
         container_id: svc.container_id.clone(),
         container_name: svc.container_name.clone(),
         status: svc.status,
@@ -158,6 +162,7 @@ pub fn merge_instance(
         // Freshness provenance: unknown at merge time; set by the runner when
         // a counter-rate delta is computed.
         gen_tps_observation: None,
+        gen_tps_last_request: false,
         tokens_per_watt: None,
         // Derived at the runner by windowing the sample's cumulative histogram
         // readings (mirrors gen_tps); left None at merge time.
@@ -172,6 +177,20 @@ pub fn merge_instance(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn merge_instance_preserves_explicit_ownership() {
+        assert!(!DiscoveredService::default().managed);
+        for managed in [false, true] {
+            let svc = DiscoveredService {
+                managed,
+                container_id: "lemonade-misleading-id".into(),
+                ..Default::default()
+            };
+            let inst = merge_instance(&svc, &InstanceSample::default(), 0, 0);
+            assert_eq!(inst.managed, managed);
+        }
+    }
 
     #[test]
     fn merge_instance_propagates_quantization() {

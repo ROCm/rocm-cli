@@ -83,7 +83,11 @@ pub fn draw_table(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         held && (inst.gen_tps.is_some_and(f64::is_finite)
             || inst.tokens_per_watt.is_some_and(f64::is_finite))
     });
-    let (table_area, legend_area) = if any_held {
+    let any_last_req = instances
+        .iter()
+        .take(visible_rows)
+        .any(|inst| inst.gen_tps_last_request && inst.gen_tps.is_some_and(f64::is_finite));
+    let (table_area, legend_area) = if any_held || any_last_req {
         let split = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Min(0), Constraint::Length(1)])
@@ -166,7 +170,13 @@ pub fn draw_table(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     if let Some(legend_area) = legend_area {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                format::HELD_LEGEND,
+                match (any_held, any_last_req) {
+                    (true, true) => {
+                        format!("{}  ·  {}", format::HELD_LEGEND, format::LAST_REQ_LEGEND)
+                    }
+                    (true, false) => format::HELD_LEGEND.to_owned(),
+                    _ => format::LAST_REQ_LEGEND.to_owned(),
+                },
                 Style::default().fg(theme.muted),
             ))),
             legend_area,
@@ -205,7 +215,7 @@ fn draw_empty(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     } else {
         match &state.conn {
             ConnState::Connected { .. } => {
-                "no instances · start daemon with --enable-docker on a host with vLLM containers"
+                "no serving models discovered · open Serving to launch a managed model or check an external endpoint"
             }
             _ => "waiting for daemon…",
         }
@@ -225,6 +235,7 @@ pub(in crate::ui) mod tests {
 
     pub(in crate::ui) fn mk_inst(name: &str) -> Instance {
         Instance {
+            managed: false,
             container_id: format!("id-{name}"),
             container_name: name.to_string(),
             status: InstanceStatus::Running,
@@ -241,6 +252,7 @@ pub(in crate::ui) mod tests {
             waiting_reqs: None,
             gen_tps: None,
             gen_tps_observation: None,
+            gen_tps_last_request: false,
             tokens_per_watt: None,
             ttft_ms: None,
             tpot_ms: None,
@@ -349,6 +361,7 @@ pub(in crate::ui) mod tests {
             services_past_attempts: 0,
             managed_registry_probe: None,
             launcher_hosted: false,
+            lemonade_managed_installed: None,
             connect: "test".into(),
             conn: ConnState::Initial,
             latest: None,
@@ -871,5 +884,52 @@ pub(in crate::ui) mod tests {
             out.contains("0 ") || out.contains("0\n") || out.contains("0*"),
             "zero gen_tps must render as '0', not '—'; got:\n{out}"
         );
+    }
+
+    pub(in crate::ui) fn last_req_inst(name: &str, last_request: bool) -> Instance {
+        let mut inst = mk_inst_obs(name, Some(37.5), Some(obs(ObservationFreshness::Fresh, 0)));
+        inst.gen_tps_last_request = last_request;
+        inst
+    }
+
+    #[test]
+    fn table_labels_a_last_request_rate_and_only_then() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        for (last_request, expect_legend) in [(true, true), (false, false)] {
+            let state = state_with_snap(last_req_inst("rate", last_request));
+            let mut term = Terminal::new(TestBackend::new(160, 20)).unwrap();
+            term.draw(|f| draw_table(f, f.area(), &state, &state.theme))
+                .unwrap();
+            let out = buffer_text(&term);
+            assert!(out.contains("38"), "the value itself still shows:\n{out}");
+            assert_eq!(
+                out.contains(format::LAST_REQ_LEGEND),
+                expect_legend,
+                "last_request={last_request}:\n{out}"
+            );
+        }
+    }
+
+    /// A held rate that is also a last-request rate shows both legends, joined.
+    #[test]
+    fn table_shows_the_held_and_last_request_legends_together() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut inst = mk_inst_obs(
+            "both",
+            Some(37.5),
+            Some(obs(ObservationFreshness::Held, 30)),
+        );
+        inst.gen_tps_last_request = true;
+        let state = state_with_snap(inst);
+        let mut term = Terminal::new(TestBackend::new(200, 20)).unwrap();
+        term.draw(|f| draw_table(f, f.area(), &state, &state.theme))
+            .unwrap();
+        let out = buffer_text(&term);
+        let both = format!("{}  ·  {}", format::HELD_LEGEND, format::LAST_REQ_LEGEND);
+        assert!(out.contains(&both), "{out}");
     }
 }

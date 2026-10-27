@@ -132,6 +132,9 @@ pub struct GenerationObservationTracker {
     /// `current_value` is `None`. Set only on successful rate computation or
     /// valid direct-rate injection; never set on missing/transient data.
     last_observed_at: Option<DateTime<Utc>>,
+    /// True once a rate was injected with [`Self::observe_direct`]: the value is an
+    /// endpoint-reported rate of the most recent request, not a live counter rate.
+    direct: bool,
 }
 
 impl GenerationObservationTracker {
@@ -150,7 +153,14 @@ impl GenerationObservationTracker {
             samples: VecDeque::with_capacity(capacity.min(16)),
             current_value: None,
             last_observed_at: None,
+            direct: false,
         }
+    }
+
+    /// Whether the rate comes from an endpoint-reported last-request figure
+    /// ([`Self::observe_direct`]) rather than a cumulative counter.
+    pub const fn is_direct(&self) -> bool {
+        self.direct
     }
 
     /// The rolling rate-computation window.
@@ -231,6 +241,9 @@ impl GenerationObservationTracker {
                 if rate.is_finite() && rate >= 0.0 {
                     self.current_value = Some(rate);
                     self.last_observed_at = Some(observed_at);
+                    // The value is a counter rate now, not an endpoint-reported
+                    // last-request rate: `is_direct` holds by construction.
+                    self.direct = false;
                 }
             }
             // dt_ms == 0: identical timestamps should not reach here (guard
@@ -252,6 +265,7 @@ impl GenerationObservationTracker {
         }
         self.current_value = Some(rate);
         self.last_observed_at = Some(observed_at);
+        self.direct = true;
     }
 
     /// Return the current rate and observation metadata for the given `now`.
@@ -897,6 +911,19 @@ mod tests {
             (v2.unwrap() - 10.0).abs() < 1e-9,
             "counter rate must supersede prior direct rate"
         );
+    }
+
+    #[test]
+    fn a_counter_rate_supersedes_a_direct_rate_and_clears_the_direct_flag() {
+        let mut tracker = GenerationObservationTracker::new(Duration::from_secs(2));
+        assert!(!tracker.is_direct());
+        tracker.observe_direct(99.0, t(0));
+        assert!(tracker.is_direct());
+        // A lone counter baseline computes no rate, so the direct value stands.
+        tracker.observe_counter(0.0, t(1));
+        assert!(tracker.is_direct());
+        tracker.observe_counter(50.0, t(6));
+        assert!(!tracker.is_direct(), "the value is a counter rate now");
     }
 
     // ── counter→direct→counter interleaving (M3) ─────────────────────────────

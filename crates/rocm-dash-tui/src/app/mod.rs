@@ -240,6 +240,8 @@ pub struct AppState {
     /// that actually exits the process. See the field doc on
     /// `ResolvedArgs::launcher_hosted` and `actions::request_quit`.
     pub(crate) launcher_hosted: bool,
+    /// Managed installation inventory captured at launch; not endpoint liveness.
+    pub lemonade_managed_installed: Option<bool>,
     /// Last body area used by the most recent draw. Mouse hit-tests resolve
     /// pointer coordinates against this rect (filled by `ui::draw`).
     pub last_body_area: Option<ratatui::layout::Rect>,
@@ -407,6 +409,7 @@ impl AppState {
             services_past_attempts: 0,
             managed_registry_probe: None,
             launcher_hosted: false,
+            lemonade_managed_installed: None,
             last_body_area: None,
             last_tab_bar_area: None,
             last_header_badge: None,

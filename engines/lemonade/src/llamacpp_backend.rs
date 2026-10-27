@@ -3,17 +3,18 @@
 // SPDX-License-Identifier: MIT
 
 use anyhow::{Context, Result, bail};
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::time::Duration;
 
-use crate::direct_llama::find_binary_in;
 use crate::install::{LemonadeInstallManifest, platform_binary_name};
 use crate::process::{
-    LemonadeProcessEnvironment, apply_lemonade_process_environment, hide_child_console_window,
-    lemonade_process_environment, run_lemonade_backend_install, spawn_lemond,
-    wait_for_lemonade_cli_status,
+    LemonadeProcessEnvironment, apply_lemonade_process_environment_with_parent,
+    hide_child_console_window, lemonade_process_environment, run_lemonade_backend_install,
+    spawn_lemond, wait_for_lemonade_cli_status,
 };
+use crate::runtime_dir::ParentRuntimeEnvironment;
 use crate::state::{free_local_port, terminate_pid};
 use crate::{DEFAULT_HOST, LLAMACPP_RECIPE, ROCM_BACKEND_NAME};
 
@@ -73,7 +74,11 @@ pub(crate) fn best_llamacpp_backend_for_host(
             log_path,
             &process_env,
         )?;
-        let listing = run_lemonade_backends_list(manifest, &process_env)?;
+        let listing = run_lemonade_backends_list(
+            manifest,
+            &process_env,
+            &ParentRuntimeEnvironment::current(),
+        )?;
         let backends = parse_llamacpp_backend_statuses(&listing);
         Ok(select_best_llamacpp_backend(&backends).map(|(name, _)| name))
     })();
@@ -112,7 +117,28 @@ pub(crate) fn ensure_best_llamacpp_backend(
     process_env: &LemonadeProcessEnvironment,
     force_reinstall: bool,
 ) -> Result<String> {
-    let listing = run_lemonade_backends_list(manifest, process_env)?;
+    ensure_best_llamacpp_backend_with_parent(
+        manifest,
+        host,
+        port,
+        process_env,
+        force_reinstall,
+        &ParentRuntimeEnvironment::current(),
+    )
+}
+
+/// [`ensure_best_llamacpp_backend`] with the parent runtime environment supplied
+/// by the caller, so a serve that was given a confined parent never reads or
+/// creates anything in the host's own.
+pub(crate) fn ensure_best_llamacpp_backend_with_parent(
+    manifest: &mut LemonadeInstallManifest,
+    host: &str,
+    port: u16,
+    process_env: &LemonadeProcessEnvironment,
+    force_reinstall: bool,
+    parent: &ParentRuntimeEnvironment,
+) -> Result<String> {
+    let listing = run_lemonade_backends_list(manifest, process_env, parent)?;
     let backends = parse_llamacpp_backend_statuses(&listing);
     let Some((backend, already_installed)) = select_best_llamacpp_backend(&backends) else {
         bail!(
@@ -132,7 +158,7 @@ pub(crate) fn ensure_best_llamacpp_backend(
     } else {
         eprintln!("Installing Lemonade {LLAMACPP_RECIPE}:{backend} backend...");
         install_llamacpp_backend_with_retry(|| {
-            run_lemonade_backend_install(manifest, host, port, &backend, process_env)
+            run_lemonade_backend_install(manifest, host, port, &backend, process_env, parent)
         })?;
     }
     Ok(backend)
@@ -214,6 +240,7 @@ fn describe_llamacpp_backends(backends: &[(String, String)]) -> String {
 fn run_lemonade_backends_list(
     manifest: &LemonadeInstallManifest,
     process_env: &LemonadeProcessEnvironment,
+    parent: &ParentRuntimeEnvironment,
 ) -> Result<String> {
     let mut command = ProcessCommand::new(&manifest.lemonade);
     command
@@ -221,7 +248,7 @@ fn run_lemonade_backends_list(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    apply_lemonade_process_environment(&mut command, process_env)?;
+    apply_lemonade_process_environment_with_parent(&mut command, process_env, parent)?;
     hide_child_console_window(&mut command);
     let output = command
         .output()
@@ -241,28 +268,52 @@ fn run_lemonade_backends_list(
 /// replacing one in place, so all three names can accumulate across attempts.
 pub(crate) const ROCM_LLAMACPP_BACKEND_DIRS: [&str; 3] = ["rocm-stable", "rocm-nightly", "rocm"];
 
-/// Like [`crate::direct_llama::find_llama_server_binary`], but scoped to the single backend Lemonade
-/// actually attempted (`manifest.backend_name`, one of `LLAMACPP_BACKEND_PRIORITY`'s
-/// `"rocm"` / `"vulkan"`), rather than scanning every known backend directory in
-/// priority order. Lemonade reports the generic `"rocm"` — never the more specific
-/// `rocm-stable`/`rocm-nightly` — but may extract the actual build into either
-/// versioned directory, so `"rocm"` maps to the whole ROCm family; `"vulkan"` never
-/// does. This is what lets alignment verification reject a stale ROCm directory left
-/// by an earlier attempt when this round actually picked `vulkan` (or the reverse).
+/// The `bin/llamacpp/` directories that may hold the `llama-server` for a manifest's
+/// selected backend, or `None` when that backend cannot be served directly. Only
+/// `rocm` and `vulkan` are valid manifest backend names: installs record whatever
+/// Lemonade selects from its `rocm`/`vulkan` priority list, so the `rocm-stable` and
+/// `rocm-nightly` directory names are members of the `rocm` family, never backend
+/// names of their own. `cpu` and unknown names fail closed (no CPU fallback).
+pub(crate) fn backend_server_dirs(backend_name: &str) -> Option<&'static [&'static str]> {
+    match backend_name {
+        ROCM_BACKEND_NAME => Some(&ROCM_LLAMACPP_BACKEND_DIRS),
+        "vulkan" => Some(&["vulkan"]),
+        _ => None,
+    }
+}
+
+/// Find a GPU llama-server scoped to the backend Lemonade selected
+/// (`manifest.backend_name`, one of `LLAMACPP_BACKEND_PRIORITY`'s `"rocm"` /
+/// `"vulkan"`), rather than scanning every known backend directory. `rocm` accepts
+/// its directory family (`rocm-stable`, `rocm-nightly`, `rocm`); Vulkan never crosses
+/// over to a stale ROCm install or the reverse. This is what lets alignment
+/// verification reject a stale ROCm directory left by an earlier attempt when this
+/// round actually picked `vulkan`. CPU and unknown names fail closed. Both flat and
+/// one-level build-numbered extraction layouts are supported.
 pub(crate) fn find_llama_server_binary_for_backend(
     manifest: &LemonadeInstallManifest,
     backend_name: &str,
 ) -> Option<PathBuf> {
     let llamacpp_dir = manifest.runtime_dir.join("bin").join("llamacpp");
     let binary = platform_binary_name("llama-server");
-    let family: &[&str] = if backend_name == ROCM_BACKEND_NAME {
-        &ROCM_LLAMACPP_BACKEND_DIRS
-    } else {
-        &["vulkan"]
-    };
-    family
+    backend_server_dirs(backend_name)?
         .iter()
         .find_map(|backend| find_binary_in(&llamacpp_dir.join(backend), &binary))
+}
+
+/// Look for `binary` directly in `dir`, then one level down in each subdirectory.
+pub(crate) fn find_binary_in(dir: &Path, binary: &str) -> Option<PathBuf> {
+    let direct = dir.join(binary);
+    if direct.is_file() {
+        return Some(direct);
+    }
+    fs::read_dir(dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .map(|subdir| subdir.join(binary))
+        .find(|candidate| candidate.is_file())
 }
 
 #[cfg(test)]

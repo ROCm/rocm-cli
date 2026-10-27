@@ -54,6 +54,26 @@ pub(crate) fn spawn_lemond(
     log_path: Option<&Path>,
     process_env: &LemonadeProcessEnvironment,
 ) -> Result<LemondChild> {
+    spawn_lemond_with_parent(
+        manifest,
+        host,
+        port,
+        log_path,
+        process_env,
+        &ParentRuntimeEnvironment::current(),
+    )
+}
+
+/// `spawn_lemond` with the parent runtime environment supplied by the caller, so
+/// tests need not read or create anything under the real user dirs.
+pub(crate) fn spawn_lemond_with_parent(
+    manifest: &LemonadeInstallManifest,
+    host: &str,
+    port: u16,
+    log_path: Option<&Path>,
+    process_env: &LemonadeProcessEnvironment,
+    parent: &ParentRuntimeEnvironment,
+) -> Result<LemondChild> {
     #[cfg(windows)]
     if let Some(log_path) = log_path {
         let args = vec![
@@ -76,13 +96,13 @@ pub(crate) fn spawn_lemond(
         .arg("--port")
         .arg(port.to_string())
         .stdin(Stdio::null());
-    apply_lemonade_process_environment(&mut command, process_env)?;
+    let vars = lemonade_process_environment_vars(process_env, parent)?;
+    apply_environment_vars(&mut command, &vars);
     if let Some(log_path) = log_path {
-        if let Some(parent) = log_path.parent() {
-            fs::create_dir_all(parent)?;
+        if let Some(log_dir) = log_path.parent() {
+            fs::create_dir_all(log_dir)?;
         }
-        let log = fs::File::create(log_path)
-            .with_context(|| format!("failed to create {}", log_path.display()))?;
+        let log = open_service_log(log_path)?;
         command.stdout(Stdio::from(log.try_clone()?));
         command.stderr(Stdio::from(log));
     } else {
@@ -93,6 +113,19 @@ pub(crate) fn spawn_lemond(
         .spawn()
         .with_context(|| format!("failed to start {}", manifest.lemond.display()))
         .map(LemondChild::Child)
+}
+
+/// Start a fresh service log and open it in append mode. The child writes
+/// through this handle while this process appends its own lines (for example the
+/// non-ROCm backend notice) through another; without `O_APPEND` the child's next
+/// write would land at its own offset, on top of what was appended.
+fn open_service_log(log_path: &Path) -> Result<fs::File> {
+    fs::File::create(log_path)
+        .with_context(|| format!("failed to create {}", log_path.display()))?;
+    fs::OpenOptions::new()
+        .append(true)
+        .open(log_path)
+        .with_context(|| format!("failed to open {}", log_path.display()))
 }
 
 pub(crate) enum LemondChild {
@@ -137,6 +170,14 @@ pub(crate) struct LemondExitStatus {
 }
 
 impl LemondExitStatus {
+    #[cfg(test)]
+    pub(crate) fn for_test(success: bool, description: &str) -> Self {
+        Self {
+            success,
+            description: description.to_owned(),
+        }
+    }
+
     pub(crate) const fn success(&self) -> bool {
         self.success
     }
@@ -181,11 +222,14 @@ pub(crate) fn lemonade_process_environment() -> Result<LemonadeProcessEnvironmen
     })
 }
 
-pub(crate) fn apply_lemonade_process_environment(
+/// Apply the Lemonade process environment to `command`, with the parent runtime
+/// environment supplied by the caller so a test can confine what is read and created.
+pub(crate) fn apply_lemonade_process_environment_with_parent(
     command: &mut ProcessCommand,
     env: &LemonadeProcessEnvironment,
+    parent: &ParentRuntimeEnvironment,
 ) -> Result<()> {
-    let vars = lemonade_process_environment_vars(env, &ParentRuntimeEnvironment::current())?;
+    let vars = lemonade_process_environment_vars(env, parent)?;
     apply_environment_vars(command, &vars);
     Ok(())
 }
@@ -193,7 +237,10 @@ pub(crate) fn apply_lemonade_process_environment(
 /// Apply an already-resolved variable set. Callers that spawn repeatedly (the
 /// readiness poll) resolve once and reuse, so preparing the runtime directory
 /// does not repeat its syscalls on every attempt.
-fn apply_environment_vars(command: &mut ProcessCommand, vars: &[(&'static str, OsString)]) {
+pub(crate) fn apply_environment_vars(
+    command: &mut ProcessCommand,
+    vars: &[(&'static str, OsString)],
+) {
     for (key, value) in vars {
         command.env(key, value);
     }
@@ -245,12 +292,33 @@ pub(crate) fn wait_for_lemonade_cli_status(
     log_path: Option<&Path>,
     process_env: &LemonadeProcessEnvironment,
 ) -> Result<()> {
+    wait_for_lemonade_cli_status_with_parent(
+        manifest,
+        host,
+        port,
+        timeout,
+        log_path,
+        process_env,
+        &ParentRuntimeEnvironment::current(),
+    )
+}
+
+/// `wait_for_lemonade_cli_status` with the parent runtime environment supplied by
+/// the caller, so tests need not read or create anything under the real user dirs.
+pub(crate) fn wait_for_lemonade_cli_status_with_parent(
+    manifest: &LemonadeInstallManifest,
+    host: &str,
+    port: u16,
+    timeout: Duration,
+    log_path: Option<&Path>,
+    process_env: &LemonadeProcessEnvironment,
+    parent: &ParentRuntimeEnvironment,
+) -> Result<()> {
     let start = std::time::Instant::now();
     let mut last_status = None;
     // Resolved once: the poll runs twice a second, and resolving also prepares
     // the child's runtime directory on disk.
-    let env_vars =
-        lemonade_process_environment_vars(process_env, &ParentRuntimeEnvironment::current())?;
+    let env_vars = lemonade_process_environment_vars(process_env, parent)?;
     while start.elapsed() < timeout {
         let mut command = ProcessCommand::new(&manifest.lemonade);
         command
@@ -302,12 +370,16 @@ fn summarize_startup_log_tail(log_path: Option<&Path>, limit: usize) -> String {
     }
 }
 
+/// Install a llama.cpp backend through the `lemonade` CLI. The parent runtime
+/// environment is supplied by the caller, so a test can confine what is read and
+/// created.
 pub(crate) fn run_lemonade_backend_install(
     manifest: &LemonadeInstallManifest,
     host: &str,
     port: u16,
     backend: &str,
     process_env: &LemonadeProcessEnvironment,
+    parent: &ParentRuntimeEnvironment,
 ) -> Result<()> {
     let mut command = ProcessCommand::new(&manifest.lemonade);
     command
@@ -321,7 +393,7 @@ pub(crate) fn run_lemonade_backend_install(
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
-    apply_lemonade_process_environment(&mut command, process_env)?;
+    apply_lemonade_process_environment_with_parent(&mut command, process_env, parent)?;
     hide_child_console_window(&mut command);
     let status = command
         .status()
@@ -347,13 +419,17 @@ fn lemonade_pull_args(host: &str, port: u16, checkpoint_ref: &str) -> Vec<String
 /// so its GGUF lands in the HF hub cache. Runs non-interactively, so a `:variant` is
 /// required — a bare `owner/repo` triggers Lemonade's interactive variant menu, which
 /// cannot be answered here.
-pub(crate) fn run_lemonade_pull(
+/// The parent runtime environment is supplied by the caller (production passes
+/// `ParentRuntimeEnvironment::current()`), so tests need not read or create anything
+/// under the real user dirs.
+pub(crate) fn run_lemonade_pull_with_parent(
     manifest: &LemonadeInstallManifest,
     host: &str,
     port: u16,
     checkpoint_ref: &str,
     log_path: Option<&Path>,
     process_env: &LemonadeProcessEnvironment,
+    parent: &ParentRuntimeEnvironment,
 ) -> Result<()> {
     let mut command = ProcessCommand::new(&manifest.lemonade);
     command
@@ -370,7 +446,8 @@ pub(crate) fn run_lemonade_pull(
     } else {
         command.stdout(Stdio::inherit()).stderr(Stdio::inherit());
     }
-    apply_lemonade_process_environment(&mut command, process_env)?;
+    let vars = lemonade_process_environment_vars(process_env, parent)?;
+    apply_environment_vars(&mut command, &vars);
     hide_child_console_window(&mut command);
     let status = command
         .status()
@@ -381,8 +458,11 @@ pub(crate) fn run_lemonade_pull(
     Ok(())
 }
 
+/// Load a model through the Lemonade CLI. The parent runtime environment is supplied
+/// by the caller (production passes `ParentRuntimeEnvironment::current()`), so tests
+/// need not read or create anything under the real user dirs.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn run_lemonade_model_load(
+pub(crate) fn run_lemonade_model_load_with_parent(
     manifest: &LemonadeInstallManifest,
     host: &str,
     port: u16,
@@ -391,6 +471,7 @@ pub(crate) fn run_lemonade_model_load(
     engine_recipe: Option<&EngineRecipeHint>,
     log_path: Option<&Path>,
     process_env: &LemonadeProcessEnvironment,
+    parent: &ParentRuntimeEnvironment,
 ) -> Result<()> {
     let mut command = ProcessCommand::new(&manifest.lemonade);
     command
@@ -413,7 +494,8 @@ pub(crate) fn run_lemonade_model_load(
     } else {
         command.stdout(Stdio::inherit()).stderr(Stdio::inherit());
     }
-    apply_lemonade_process_environment(&mut command, process_env)?;
+    let vars = lemonade_process_environment_vars(process_env, parent)?;
+    apply_environment_vars(&mut command, &vars);
     hide_child_console_window(&mut command);
     let status = command
         .status()
@@ -429,7 +511,11 @@ pub(crate) fn run_lemonade_model_load(
 /// since the direct-serve path only runs GPU backends. A Lemonade-router entry carries
 /// `recipe_options`, so its `llamacpp_backend` must match — this keeps a merely
 /// registered-but-unloaded model (empty `recipe_options`) from reading as ready.
-fn models_payload_has_ready_model(value: &Value, model_ref: &str, backend: &str) -> bool {
+pub(crate) fn models_payload_has_ready_model(
+    value: &Value,
+    model_ref: &str,
+    backend: &str,
+) -> bool {
     value
         .get("data")
         .or_else(|| value.get("models"))
@@ -643,6 +729,152 @@ mod tests {
     use crate::DEFAULT_MODEL;
     use rocm_engine_protocol::DevicePolicy;
     use serde_json::json;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn serving_gpu_model_load_process_error_is_returned() {
+        let temporary = tempfile::tempdir().unwrap();
+        let dir = temporary.path();
+        let executable = dir.join("lemonade");
+        let args_path = dir.join("args.txt");
+        rocm_core::fake_executable::write_fake_executable(&executable, "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$(dirname \"$0\")/args.txt\"\nprintf 'GPU backend initialization failed\\n' >&2\nexit 23\n").unwrap();
+        let manifest = LemonadeInstallManifest {
+            env_id: "test".to_owned(),
+            version: "test".to_owned(),
+            runtime_dir: dir.join("runtime"),
+            lemond: dir.join("lemond"),
+            lemonade: executable,
+            backend_recipe: crate::LLAMACPP_RECIPE.to_owned(),
+            backend_name: "vulkan".to_owned(),
+            installed_at_unix_ms: 0,
+        };
+        let log = dir.join("load.log");
+        let parent = ParentRuntimeEnvironment::rooted_at(dir);
+        let error = run_lemonade_model_load_with_parent(
+            &manifest,
+            "127.0.0.1",
+            11435,
+            "Qwen3-0.6B-GGUF",
+            "vulkan",
+            None,
+            Some(&log),
+            &LemonadeProcessEnvironment::default(),
+            &parent,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("Lemonade model load failed"));
+        assert!(error.to_string().contains("23"));
+        assert!(
+            fs::read_to_string(log)
+                .unwrap()
+                .contains("GPU backend initialization failed")
+        );
+        let args = fs::read_to_string(args_path).unwrap();
+        assert!(args.contains("load\nQwen3-0.6B-GGUF\n--llamacpp\nvulkan\n"));
+        assert!(!args.contains("cpu"));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn fake_pull_manifest(dir: &Path, exit_code: i32) -> LemonadeInstallManifest {
+        let executable = dir.join("lemonade");
+        rocm_core::fake_executable::write_fake_executable(
+            &executable,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$(dirname \"$0\")/args.txt\"\nprintf 'pull output line\\n'\nprintf 'pull failure detail\\n' >&2\nexit {exit_code}\n"
+            ),
+        )
+        .unwrap();
+        LemonadeInstallManifest {
+            env_id: "test".to_owned(),
+            version: "test".to_owned(),
+            runtime_dir: dir.join("runtime"),
+            lemond: dir.join("lemond"),
+            lemonade: executable,
+            backend_recipe: crate::LLAMACPP_RECIPE.to_owned(),
+            backend_name: "vulkan".to_owned(),
+            installed_at_unix_ms: 0,
+        }
+    }
+
+    /// The child's handle and a second appender share one log: a line appended
+    /// after the child's first write must survive the child's next write.
+    #[test]
+    fn a_line_appended_beside_the_childs_log_handle_survives_its_next_write() {
+        use std::io::Write as _;
+        let dir = crate::test_support::scratch_dir("service-log-append");
+        let log_path = dir.join("serve.log");
+        let mut child_handle = open_service_log(&log_path).unwrap();
+        child_handle.write_all(b"child line one\n").unwrap();
+        let notice =
+            crate::device_policy::announce_non_rocm_backend("vulkan", Some(&log_path)).unwrap();
+        child_handle.write_all(b"child line two\n").unwrap();
+        // The whole file, not a substring: without append the child's second write
+        // lands on top of the start of the notice and a `contains` on its tail
+        // would still match.
+        let log = fs::read_to_string(&log_path).unwrap();
+        assert_eq!(
+            log,
+            format!("child line one\n{notice}\nchild line two\n"),
+            "{log}"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pull_runs_exact_checkpoint_argv() {
+        let temporary = tempfile::tempdir().unwrap();
+        let dir = temporary.path();
+        let manifest = fake_pull_manifest(dir, 0);
+        let log = dir.join("pull.log");
+        run_lemonade_pull_with_parent(
+            &manifest,
+            "127.0.0.1",
+            11436,
+            "owner/repo:Q4_0",
+            Some(&log),
+            &LemonadeProcessEnvironment::default(),
+            &ParentRuntimeEnvironment::rooted_at(dir),
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.join("args.txt")).unwrap(),
+            "--host\n127.0.0.1\n--port\n11436\npull\nowner/repo:Q4_0\n"
+        );
+        assert!(
+            fs::read_to_string(log)
+                .unwrap()
+                .contains("pull output line")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pull_failure_is_returned_with_checkpoint_status_and_logged_output() {
+        let temporary = tempfile::tempdir().unwrap();
+        let dir = temporary.path();
+        let manifest = fake_pull_manifest(dir, 7);
+        let log = dir.join("pull.log");
+        let error = run_lemonade_pull_with_parent(
+            &manifest,
+            "127.0.0.1",
+            11436,
+            "owner/repo:Q4_0",
+            Some(&log),
+            &LemonadeProcessEnvironment::default(),
+            &ParentRuntimeEnvironment::rooted_at(dir),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("owner/repo:Q4_0"), "{error}");
+        assert!(error.contains('7'), "{error}");
+        // The process output is streamed to the log rather than embedded in the error.
+        assert!(
+            fs::read_to_string(log)
+                .unwrap()
+                .contains("pull failure detail")
+        );
+    }
 
     #[test]
     fn models_ready_accepts_direct_serve_and_gates_router_backend() {

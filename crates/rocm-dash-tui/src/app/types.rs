@@ -143,6 +143,10 @@ pub struct ResolvedArgs {
     /// serves still warns (see dash-29). See
     /// `registry_probe::ManagedRegistryProbe`.
     pub managed_registry_probe: Option<crate::registry_probe::SharedManagedRegistryProbe>,
+    /// Launch-time managed Lemonade installation verdict from the bin's built-in
+    /// Detect method. None means unavailable/unknown, never not installed.
+    /// Separate from live external-serving telemetry and GPU system metadata.
+    pub lemonade_managed_installed: Option<bool>,
 }
 
 impl ResolvedArgs {

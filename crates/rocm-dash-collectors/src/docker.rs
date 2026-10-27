@@ -295,6 +295,7 @@ fn parse_container(inspect: &ContainerInspectResponse) -> Result<DiscoveredServi
     let port = extract_first_host_port(inspect).unwrap_or(DEFAULT_VLLM_PORT);
 
     Ok(DiscoveredService {
+        managed: false,
         container_id: id,
         container_name: name,
         model_name: model,
