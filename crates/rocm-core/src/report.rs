@@ -219,6 +219,46 @@ pub struct Report {
 /// What a report says when the catalog recognised nothing.
 pub const UNRECOGNISED: &str = "unrecognised";
 
+/// The name of each level of [`Report::group_key`], in the same order.
+///
+/// Ordered most general first, the way a rollup reads: the cause, then the
+/// hardware, then the releases around it. A reader of the rollup learns which
+/// of these separates a group by watching where the counts split.
+pub const GROUP_AXES: [&str; 5] = ["entry", "architecture", "rocm", "os", "engine"];
+
+impl Report {
+    /// The description a grouper matches on: every published field except the
+    /// ones that describe this build rather than this machine.
+    ///
+    /// Two reports describe the same problem exactly when their keys are
+    /// equal. This is the one definition of "same problem"; a counter that
+    /// built its own would drift from the field set the report builder is
+    /// tested against.
+    ///
+    /// Left out on purpose: `schema`, `architecture_matrix`, `cli_version` and
+    /// `fix_offered` describe the CLI that wrote the report, and `os_family`
+    /// is implied by `distro`. The distribution travels with its major
+    /// version, because Ubuntu 22 and RHEL 22 would otherwise be one group.
+    /// So does the engine, except where there is none to name: an absent or
+    /// unknown engine has an absent or unknown version, so the version would
+    /// only repeat the word.
+    #[must_use]
+    pub fn group_key(&self) -> [String; 5] {
+        let engine = if self.engine == NONE || self.engine == UNKNOWN {
+            self.engine.clone()
+        } else {
+            format!("{}-{}", self.engine, self.engine_version)
+        };
+        [
+            self.entry.clone(),
+            self.architecture.clone(),
+            self.rocm.clone(),
+            format!("{}-{}", self.distro, self.os_major),
+            engine,
+        ]
+    }
+}
+
 /// What a reader made of a report.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReadOutcome {
@@ -892,19 +932,74 @@ mod tests {
         }
     }
 
-    /// The description a grouper matches on: every published field except the
-    /// ones that describe this build rather than this machine.
+    /// The description a grouper matches on, joined so a test can print it.
     fn description(report: &Report) -> String {
-        format!(
-            "{}|{}|{}-{}|{}|{}-{}",
-            report.entry,
-            report.architecture,
-            report.distro,
-            report.os_major,
-            report.rocm,
-            report.engine,
-            report.engine_version,
+        report.group_key().join("|")
+    }
+
+    /// `GROUP_AXES` names the key's levels by position, so each name has to
+    /// sit where its field lands. Changing one field must move exactly the
+    /// level named for it, and changing a field the key leaves out must move
+    /// none.
+    #[test]
+    fn every_axis_name_sits_where_its_field_lands_in_the_group_key() {
+        type Change = (&'static str, fn(&mut Report));
+        let base = prepare_report(
+            &machine("gfx942", ("ubuntu", "22"), "7.1", ("pytorch", "2.5")),
+            Some("fix-6-path"),
+            false,
         )
+        .expect("a released machine reports");
+        let changes: [Change; 9] = [
+            ("entry", |r| r.entry = UNRECOGNISED.to_owned()),
+            ("architecture", |r| r.architecture = "gfx1100".to_owned()),
+            ("rocm", |r| r.rocm = "7.0".to_owned()),
+            ("os", |r| r.distro = "rhel".to_owned()),
+            ("os", |r| r.os_major = "24".to_owned()),
+            ("engine", |r| r.engine = "llama-cpp".to_owned()),
+            ("engine", |r| r.engine_version = "2.6".to_owned()),
+            ("", |r| r.cli_version = "9.9.9".to_owned()),
+            ("", |r| r.fix_offered = !r.fix_offered),
+        ];
+        for (axis, change) in changes {
+            let mut changed = base.clone();
+            change(&mut changed);
+            let moved: Vec<&str> = (0..GROUP_AXES.len())
+                .filter(|&i| changed.group_key()[i] != base.group_key()[i])
+                .map(|i| GROUP_AXES[i])
+                .collect();
+            let expected: Vec<&str> = std::iter::once(axis).filter(|a| !a.is_empty()).collect();
+            assert_eq!(
+                moved, expected,
+                "a change meant for `{axis}` moved {moved:?}"
+            );
+        }
+        let mut build = base.clone();
+        build.schema += 1;
+        build.architecture_matrix = "another matrix".to_owned();
+        build.os_family = "other".to_owned();
+        assert_eq!(
+            build.group_key(),
+            base.group_key(),
+            "build-only fields must not split groups"
+        );
+    }
+
+    #[test]
+    fn the_group_key_names_an_engine_with_its_release_and_an_absent_one_once() {
+        let with = prepare_report(
+            &machine("gfx942", ("ubuntu", "22"), "7.1", ("pytorch", "2.5")),
+            None,
+            false,
+        )
+        .expect("a released machine reports");
+        assert_eq!(with.group_key()[4], "pytorch-2.5");
+        assert_eq!(GROUP_AXES[4], "engine");
+
+        let mut without = with;
+        without.engine = NONE.to_owned();
+        without.engine_version = NONE.to_owned();
+        assert_eq!(without.group_key()[4], NONE);
     }
 
     fn describe(machine: &Examination, entry: Option<&str>) -> String {
