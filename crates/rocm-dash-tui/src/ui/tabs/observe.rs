@@ -461,6 +461,55 @@ mod tests {
         }
     }
 
+    fn last_request_instance(
+        model: &str,
+        gen_tps: f64,
+        obs: Option<ObservationMetadata>,
+    ) -> Instance {
+        Instance {
+            gen_tps_last_request: true,
+            ..instance_with_obs(model, gen_tps, obs)
+        }
+    }
+
+    /// Only the two hero panels, so the Instances table (which labels a
+    /// last-request rate and keeps its own per-row tok/W) cannot satisfy or break
+    /// an assertion about them.
+    fn render_heroes(state: &AppState) -> String {
+        let mut term = Terminal::new(TestBackend::new(160, 12)).unwrap();
+        term.draw(|f| draw_hero_band(f, f.area(), state, &state.theme))
+            .unwrap();
+        term.backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect()
+    }
+
+    /// An idle Lemonade server keeps reporting its last request's rate. The Node
+    /// efficiency and Node throughput heroes must not present it as current: the
+    /// same rate as a live instance fills them (`1.00 tok/W`, a `tok/s` figure), as a
+    /// last-request rate they stay at `—`, and held metadata on it adds no marker
+    /// or legend.
+    #[test]
+    fn observe_heroes_leave_out_a_last_request_rate() {
+        use crate::ui::format;
+        let live = connected_with_instances(vec![instance_with_obs("m", 300.0, Some(fresh_obs()))]);
+        let out = render_heroes(&live);
+        assert!(out.contains("1.00 tok/W"), "baseline: {out}");
+        assert!(out.contains(" tok/s"), "baseline: {out}");
+
+        for obs in [fresh_obs(), held_obs()] {
+            let last = connected_with_instances(vec![last_request_instance("m", 300.0, Some(obs))]);
+            let out = render_heroes(&last);
+            assert!(!out.contains("1.00 tok/W"), "{out}");
+            assert!(!out.contains(" tok/s"), "{out}");
+            assert!(!out.contains(format::HELD_LEGEND), "{out}");
+            assert!(!out.contains(format::HELD_MARKER), "{out}");
+        }
+    }
+
     // ── EAI-7960: HELD_LEGEND rendering and efficiency hero held marker ───────
 
     #[test]
