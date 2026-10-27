@@ -138,9 +138,11 @@ text on screen; assert the specific value. Fixtures hold values the real source 
 produce, for example nothing above 4 GiB from a 32-bit WMI field.
 
 **A new state flag, placeholder, or "loading" display starts from a state matrix.** Before
-writing it, list every lifecycle state it can be observed in (initial, connecting,
-connected with no data yet, connected with an empty result, disconnected before and
-after the first data, reconnect, replay end) and write the expected output for each, with
+writing it, list every lifecycle state it can be observed in (for a streaming display:
+initial, connecting, connected with no data yet, connected with an empty result,
+disconnected before and after the first data, reconnect, replay end; a one-shot
+progress placeholder has no reconnect or replay rows, so list the states it does have)
+and write the expected output for each, with
 a test per row. Every "pending" state needs an exit on every path that never delivers
 data. Fixing only the state a reviewer named invites the next round to name its sibling;
 when a finding is one instance of a class, fix the class and list the sibling cases in
@@ -274,16 +276,16 @@ Guardrails:
 - subprocess and FFI code, checked before pushing:
   - spawned children set `kill_on_drop(true)`, so a `timeout` that fires does not leak them
   - blocking FFI runs under `spawn_blocking`, never on an async worker; a `timeout`
-    around `spawn_blocking` drops only the join handle, so the thread still leaks
+    around `spawn_blocking` drops only the join handle, so the thread still leaks:
+    give the blocking call its own deadline or cancellation flag instead
   - DLLs load by absolute path, not by bare name
   - never pair two independently ordered lists by index; correlate by id, or degrade
-    to "unknown" when no id exists
+    to "unknown" when no id exists, and never to a guess on multi-adapter and phantom
+    adapter hosts (a test covers those cases)
   - check the documented width and range of every WMI or Win32 field before trusting
-    it (`Win32_VideoController.AdapterRAM` is 32-bit)
-  - a ticker that mirrors the daemon uses the daemon's `MissedTickBehavior`, and a slow
-    source does not block the fast ones sharing its tick
-  - derived values degrade to "unknown", never to a guess, on multi-adapter and phantom
-    adapter hosts, and a test covers those cases
+    it (a 32-bit field saturates at 4 GiB)
+  - choose a ticker's `MissedTickBehavior` deliberately (`rocmd` uses `Delay`, the dash
+    daemon `Skip`), and a slow source does not block the fast ones sharing its tick
 
 ## 7) Local Assistant And Tool-Use Policy Consistency
 
@@ -436,9 +438,9 @@ Watch checks to completion and drive to all-green.
 
 A red check means "not ready" until resolved.
 
-After each review-fix commit, rerun locally the checks the reviewer and CI ran (the
-workspace tests including `feature_naming`, and clippy with `--all-targets`) and
-self-review against §3 to §6 before pushing. Round-trips spent on a scenario number out
+After each review-fix commit, rerun the §8 gate locally (workspace tests
+including `feature_naming`, `cargo clippy --workspace --all-targets -- -D warnings`,
+and `python scripts/smoke_local.py`) and self-review against §3 to §6 before pushing. Round-trips spent on a scenario number out
 of sequence or a clippy lint cost more than running them first.
 
 ## 13) Upstream Pre-flight Checklist
@@ -458,7 +460,7 @@ Run this checklist before any upstream push, PR update, issue update, or public 
 11. User approval obtained for any high-blast-radius external action — *§1*
 12. Force-push's live review/approval state checked before proposing or executing one — *§1*
 13. Review comments checked for unreplied threads before resuming review-feedback work — *§11*
-14. New tests mutation-checked; state matrix written for new state or placeholders — *§3*
+14. New tests shown to fail when their target is broken; state matrix written for new state or placeholders; platform-gated logic covered by a test that runs on its gate — *§3*
 15. Old claims grepped across docs and PR body; PR body matches the final diff — *§5*
 16. Subprocess/FFI checklist applied to any new process or driver call — *§6*
 
