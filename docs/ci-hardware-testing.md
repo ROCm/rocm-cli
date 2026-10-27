@@ -6,7 +6,7 @@ SPDX-License-Identifier: MIT
 
 # CI hardware (GPU / WSL) testing
 
-The hosted CI (`ubuntu-latest`, `windows-latest`) builds and unit-tests every
+The hosted CI (`ubuntu-24.04` and `ubuntu-26.04`, `windows-latest`) builds and unit-tests every
 shipping target natively, but GitHub-hosted runners have no AMD GPU. A
 dedicated hardware layer covers that gap by running the same cucumber-rs E2E
 suite on dedicated self-hosted runners with real AMD GPUs.
@@ -61,7 +61,7 @@ separate tier flag or tag filter to maintain.
 
 | Job | Workflow | Platform | Runner labels |
 |---|---|---|---|
-| `e2e` | `ci.yml` | Mock (no GPU) | GitHub-hosted `ubuntu-latest` |
+| `e2e` | `ci.yml` | Mock (no GPU) | GitHub-hosted `ubuntu-24.04` and `ubuntu-26.04` |
 | `e2e-gpu` | `e2e-selfhosted.yml` | MI300X (AMD Instinct, bare-metal Linux) | self-hosted `[self-hosted, linux, mi300x]` |
 | `e2e-gpu-strix-ubuntu` | `e2e-selfhosted.yml` | Strix Halo (gfx1151) on Ubuntu | self-hosted `[self-hosted, linux, devlab-dispatch, strix-halo]` |
 | `e2e-gpu-strix-windows` | `e2e-selfhosted.yml` | Strix Halo (gfx1151) on Windows 11 | self-hosted `[self-hosted, windows, devlab-dispatch, strix-halo]` |
