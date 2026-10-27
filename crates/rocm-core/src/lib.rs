@@ -18,6 +18,7 @@ pub mod config;
 pub mod crypto;
 pub mod diagnose;
 pub mod disk_space;
+pub mod endpoint_key;
 pub mod examine;
 pub mod fake_executable;
 pub mod fix;
@@ -78,6 +79,7 @@ pub use disk_space::{
     estimated_extracted_size, format_bytes, insufficient_space_message, map_write_error,
     mount_for_path, on_same_mount, warn_if_low_space, with_margin,
 };
+pub use endpoint_key::{endpoint_api_key_has_forbidden_chars, generate_endpoint_api_key};
 pub use examine::{
     Examination, FrameworkProbe, WSL_PLATFORM_NOTE, gfx_is_apu_family, probe_wsl_distro_from_host,
 };
@@ -176,9 +178,7 @@ pub use runtime::{
     runtime_python_env_bin_dir, runtime_python_executable_in_env, runtime_python_executable_name,
     runtime_rocm_library_filename, shell_command_for_host, user_runtime_dir,
 };
-pub use service_identity::{
-    ServiceId, endpoint_api_key_has_forbidden_chars, generate_endpoint_api_key, generate_service_id,
-};
+pub use service_identity::{ServiceId, generate_service_id};
 pub use service_record::ManagedServiceRecord;
 pub use uv::{
     DEFAULT_UV_TIMEOUT_SECS, DependencyViolation, UV_CACHE_DIR_ENV, UV_CACHE_DIR_OVERRIDE_ENV,
