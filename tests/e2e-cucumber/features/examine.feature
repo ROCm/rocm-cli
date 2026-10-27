@@ -488,7 +488,7 @@ Feature: GPU detection and system inspection
   # and Secure Boot enabled, so the evidence lines are reachable if the flag
   # regresses.
   @id:examine-reports-amdgpu-built-into-the-kernel @requires-os:linux
-  Scenario: examine-31 - A built-in amdgpu is reported as loaded and diagnose finds no driver fault
+  Scenario: examine-33 - A built-in amdgpu is reported as loaded and diagnose finds no driver fault
     Given a machine whose kernel has amdgpu built in and lists no amdgpu module
     When the user inspects and diagnoses that machine
     Then the inspection reports amdgpu as loaded
