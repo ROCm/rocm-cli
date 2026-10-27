@@ -287,7 +287,7 @@ mod tests {
     use std::thread;
 
     use super::*;
-    use crate::load_managed_service;
+    use crate::services_text::load_managed_service;
     use crate::tests::test_paths;
 
     #[test]
