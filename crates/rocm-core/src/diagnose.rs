@@ -786,7 +786,7 @@ fn check_2_hsa_override_unneeded(e: &Examination, symptom: &str) -> Diagnosis {
                 "[Environment]::GetEnvironmentVariable('HSA_OVERRIDE_GFX_VERSION','User')".to_owned(),
                 "[Environment]::GetEnvironmentVariable('HSA_OVERRIDE_GFX_VERSION','Machine')".to_owned(),
                 "# Clear from the User scope (does NOT affect already-open shells):".to_owned(),
-                "setx HSA_OVERRIDE_GFX_VERSION \"\"".to_owned(),
+                "[Environment]::SetEnvironmentVariable('HSA_OVERRIDE_GFX_VERSION',$null,'User')".to_owned(),
                 "# Or remove via System Properties -> Environment Variables.".to_owned(),
             ],
             fix_id: "fix-2-unset-override".to_owned(),
@@ -801,7 +801,14 @@ fn check_2_hsa_override_unneeded(e: &Examination, symptom: &str) -> Diagnosis {
                 "# Also remove it from ~/.bashrc / ~/.zshrc / ~/.profile if persisted.".to_owned(),
             ],
             fix_id: "fix-2-unset-override".to_owned(),
-            verify: "env | grep HSA_OVERRIDE_GFX_VERSION || echo OK_UNSET; python -c \"import torch; print(torch.cuda.is_available())\"".to_owned(),
+            // The `rocm fix` catalog's Linux line (needs no Python, which a
+            // stock Ubuntu lacks), then the check that clearing the override
+            // did not break the GPU. The catalog lines are shared with Windows
+            // and cannot assume torch; this arm only builds for a bash host,
+            // so it can run a second command after the first. `python3`, not
+            // `python`: whatever interpreter has torch, a stock `python3`, a
+            // virtual environment and a conda environment all provide it.
+            verify: "echo \"${HSA_OVERRIDE_GFX_VERSION:-OK_UNSET}\"; python3 -c \"import torch; print(torch.cuda.is_available())\"".to_owned(),
             ..Fix::default()
         }
     };
@@ -1075,7 +1082,7 @@ fn check_6_path_missing(e: &Examination, symptom: &str) -> Diagnosis {
             ],
             fix_id: "fix-6-path".to_owned(),
             verify: format!(
-                "powershell -NoProfile -Command \"& \\\"{bin_dir}\\hipInfo.exe\\\" | Select-Object -First 5\""
+                "powershell -NoProfile -Command \"& '{escaped_bin_dir}\\hipInfo.exe' | Select-Object -First 5\""
             ),
             ..Fix::default()
         }
@@ -1087,7 +1094,12 @@ fn check_6_path_missing(e: &Examination, symptom: &str) -> Diagnosis {
                 format!("echo 'export PATH={bin_dir}:$PATH' >> ~/.bashrc   # or ~/.zshrc"),
             ],
             fix_id: "fix-6-path".to_owned(),
-            verify: "rocminfo | head -n 5 && hipcc --version".to_owned(),
+            // The `rocm fix` catalog's Linux line. `rocminfo` lives in the bin
+            // directory this fix puts on PATH, so it printing the GPU shows
+            // both that PATH is fixed and that the GPU is visible. It does
+            // not chain `hipcc --version`: a runtime-only install has no
+            // `hipcc`, and the chain would fail there with PATH fixed.
+            verify: "rocminfo | head -n 5".to_owned(),
             ..Fix::default()
         }
     };
@@ -1366,7 +1378,7 @@ fn check_9_igpu_dgpu_collision(e: &Examination, symptom: &str) -> Diagnosis {
                 "# `setx` only takes effect in NEW shells; reopen the terminal.".to_owned(),
             ],
             fix_id: "fix-9-igpu-dgpu".to_owned(),
-            verify: "powershell -NoProfile -Command \"$env:HIP_VISIBLE_DEVICES=1; python -c \\\"import torch; print(torch.cuda.device_count())\\\"\"".to_owned(),
+            verify: "powershell -NoProfile -Command \"[Environment]::SetEnvironmentVariable('HIP_VISIBLE_DEVICES','1','Process'); python -c 'import torch; print(torch.cuda.device_count())'\"".to_owned(),
             notes: vec![note],
             ..Fix::default()
         }
@@ -1832,7 +1844,7 @@ fn check_13_hip_sdk_missing(e: &Examination, symptom: &str) -> Diagnosis {
             "# After install, reopen the shell so HIP_PATH and PATH pick up the new install.".to_owned(),
         ],
         fix_id: "fix-13-hip-sdk-missing".to_owned(),
-        verify: "powershell -NoProfile -Command \"& \\\"$env:HIP_PATH\\bin\\hipInfo.exe\\\" | Select-Object -First 5\"".to_owned(),
+        verify: "powershell -NoProfile -Command \"& (Join-Path ([Environment]::GetEnvironmentVariable('HIP_PATH')) 'bin\\hipInfo.exe') | Select-Object -First 5\"".to_owned(),
         notes: vec!["If you only need PyTorch on Windows AMD and don't need the C/C++ HIP toolchain, the TheRock wheels bundle their own HIP runtime and may not require a system HIP SDK install.".to_owned()],
         ..Fix::default()
     };
@@ -1889,7 +1901,7 @@ fn check_14_adrenalin_too_old(e: &Examination, symptom: &str) -> Diagnosis {
         ],
         needs_reboot: true,
         fix_id: "fix-14-adrenalin-too-old".to_owned(),
-        verify: "powershell -NoProfile -Command \"(Get-CimInstance Win32_VideoController | Where-Object { $_.Name -like '*AMD*' -or $_.Name -like '*Radeon*' } | Select-Object -First 1).DriverVersion\"".to_owned(),
+        verify: "powershell -NoProfile -Command \"(Get-CimInstance Win32_VideoController | Where-Object Name -match 'AMD|Radeon' | Select-Object -First 1).DriverVersion\"".to_owned(),
         ..Fix::default()
     };
     finalize(
@@ -1926,7 +1938,7 @@ fn check_15_msvc_redist(e: &Examination, symptom: &str) -> Diagnosis {
             "# After the install, reopen the shell and re-run your import / hipInfo check.".to_owned(),
         ],
         fix_id: "fix-15-msvc-redist".to_owned(),
-        verify: "where vcruntime140.dll && where vcruntime140_1.dll".to_owned(),
+        verify: "powershell -NoProfile -Command \"(Get-Item ([Environment]::GetFolderPath('System') + '\\vcruntime140.dll'),([Environment]::GetFolderPath('System') + '\\vcruntime140_1.dll') -ErrorAction Stop).VersionInfo | Select-Object FileName,FileVersion\"".to_owned(),
         notes: vec!["If installing the redistributable still leaves a missing-DLL error, the failing DLL is probably amdhip64_X.dll itself; that points at fix-13-hip-sdk-missing rather than this fix. If the runtime is present but the program crashes with an access violation, see fix-21-msvc-redist-outdated.".to_owned()],
         ..Fix::default()
     };
@@ -2592,7 +2604,7 @@ fn check_21_msvc_redist_outdated(e: &Examination, symptom: &str) -> Diagnosis {
             "# Then close and restart the program (or Lemonade) so it loads the new runtime.".to_owned(),
         ],
         fix_id: ID.to_owned(),
-        verify: "powershell -NoProfile -Command \"(Get-Item $env:SystemRoot\\System32\\msvcp140.dll).VersionInfo.FileVersion\"".to_owned(),
+        verify: "powershell -NoProfile -Command \"(Get-Item ([Environment]::GetFolderPath('System') + '\\msvcp140.dll') -ErrorAction Stop).VersionInfo.FileVersion\"".to_owned(),
         notes: vec![
             "The verify command prints the runtime version. It should read 14.40 or higher.".to_owned(),
             "`rocm fix` only prints this plan. It does not run the install: the install needs the Windows administrator prompt and your consent.".to_owned(),
@@ -2641,7 +2653,7 @@ fn check_22_display_driver_old(e: &Examination, _symptom: &str) -> Diagnosis {
         ],
         needs_reboot: true,
         fix_id: id.to_owned(),
-        verify: "powershell -NoProfile -Command \"Get-CimInstance Win32_VideoController | Where-Object { $_.Name -like '*AMD*' -or $_.Name -like '*Radeon*' } | Select-Object Name,DriverVersion,DriverDate\"".to_owned(),
+        verify: "powershell -NoProfile -Command \"Get-CimInstance Win32_VideoController | Where-Object Name -match 'AMD|Radeon' | Select-Object Name,DriverVersion,DriverDate\"".to_owned(),
         notes: vec![
             crate::windows_driver::NO_MINIMUM_EXPLANATION.to_owned(),
             crate::windows_driver::FLOOR_NOTE.to_owned(),
@@ -6991,7 +7003,7 @@ mod tests {
 
     #[test]
     fn diagnosis_remediation_matches_the_fix_catalog_for_shared_fix_ids() {
-        // fix-15, fix-16, fix-21, info-20 and fix-22 live in two places: the `rocm fix`
+        // fix-13, fix-14, fix-15, fix-16, fix-21, info-20 and fix-22 live in two places: the `rocm fix`
         // catalog (crate::fix::RECIPES) and the Fix these checks embed in a
         // Diagnosis. The prose *framing* legitimately differs by surface (a
         // catalog rationale vs a diagnosis summary), but the actionable
@@ -7041,6 +7053,25 @@ mod tests {
             },
             "",
         );
+        // fix-13 and fix-14 print a Windows verify that the Windows-only tests
+        // in `fix.rs` run from the catalog copy, so this copy has to match it.
+        let hip_sdk_missing = check_13_hip_sdk_missing(
+            &Examination {
+                os_family: "windows".to_owned(),
+                ..Examination::default()
+            },
+            "ImportError: DLL load failed: amdhip64_6.dll was not found",
+        );
+        let adrenalin_old = check_14_adrenalin_too_old(
+            &Examination {
+                os_family: "windows".to_owned(),
+                hip_sdk_path: r"C:\Program Files\AMD\ROCm\6.4".to_owned(),
+                hipinfo_present: true,
+                hipinfo_status: "error".to_owned(),
+                ..Examination::default()
+            },
+            "driver too old",
+        );
         // fix-22 is advice only: it scores below the match threshold on purpose,
         // yet a user meets both of its copies, so it is held to the same guard.
         let display_driver_old =
@@ -7050,6 +7081,8 @@ mod tests {
             msvc,
             msvc_outdated,
             unsupported_gpu,
+            hip_sdk_missing,
+            adrenalin_old,
             display_driver_old,
         ] {
             if diag.id == crate::windows_driver::DISPLAY_DRIVER_OLD_FIX_ID {
@@ -7083,6 +7116,81 @@ mod tests {
                 "executable command lines diverged for {}",
                 fix.fix_id
             );
+        }
+    }
+
+    /// The Windows `Fix` for fix-9, which only `diagnose.rs` prints: its verify
+    /// differs from the catalog's because it has to run in PowerShell.
+    fn windows_igpu_fix() -> Fix {
+        check_9_igpu_dgpu_collision(&igpu_dgpu_host("windows"), "torch crashes with a segfault")
+            .fix
+            .expect("an APU beside a discrete GPU on Windows gets a fix")
+    }
+
+    /// Runs on every host. The Windows fix-9 verify sets `HIP_VISIBLE_DEVICES`
+    /// to `1` for the process, then runs one single-quoted python program, all
+    /// in one double-quoted `-Command` argument.
+    /// `the_igpu_verify_pins_the_variable_it_names` runs it, on Windows.
+    #[test]
+    fn the_windows_igpu_verify_is_one_quoted_powershell_argument() {
+        let verify = windows_igpu_fix().verify;
+        let body = verify
+            .strip_prefix("powershell -NoProfile -Command \"")
+            .and_then(|rest| rest.strip_suffix('"'))
+            .unwrap_or_else(|| panic!("not a quoted `powershell -Command` argument: {verify}"));
+        assert!(
+            !body.contains('"'),
+            "an inner quote ends the argument: {body}"
+        );
+        assert!(
+            body.starts_with("[Environment]::SetEnvironmentVariable('HIP_VISIBLE_DEVICES','1','Process'); python -c '"),
+            "{body}"
+        );
+    }
+
+    /// Runs the fix-9 Windows verify line in cmd and in Windows PowerShell with
+    /// a stand-in `torch` module first on `PYTHONPATH`. The module's
+    /// `cuda.device_count()` returns what `HIP_VISIBLE_DEVICES` holds, so the
+    /// line, unchanged, prints `1` only if it set that variable, to that value,
+    /// before python started. The variable is removed from the child's
+    /// environment first, so a value left on the host cannot satisfy it. Python
+    /// is on PATH on the Windows CI hosts. Only compiled on Windows.
+    #[cfg(windows)]
+    #[test]
+    fn the_igpu_verify_pins_the_variable_it_names() {
+        let verify = windows_igpu_fix().verify;
+        let dir = std::env::temp_dir().join(format!("rocm igpu torch {}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("the stand-in module directory is created");
+        std::fs::write(
+            dir.join("torch.py"),
+            "import os\n\nclass cuda:\n    @staticmethod\n    def device_count():\n        \
+             return os.environ.get('HIP_VISIBLE_DEVICES', 'UNSET')\n",
+        )
+        .expect("the stand-in torch is written");
+        let python_path = dir.to_string_lossy().into_owned();
+        let runs = crate::fix::run_typed_in_cmd_and_powershell(
+            &verify,
+            &[
+                ("HIP_VISIBLE_DEVICES", None),
+                ("PYTHONPATH", Some(python_path.as_str())),
+            ],
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        for run in runs {
+            let crate::fix::ShellRun {
+                shell,
+                success,
+                status,
+                stdout,
+                stderr,
+            } = run;
+            assert!(success, "{shell}: {status}\n{stdout}\n{stderr}");
+            assert!(
+                stderr.trim().is_empty(),
+                "{shell} wrote to stderr: {stderr}"
+            );
+            assert_eq!(stdout.trim(), "1", "{shell}, stderr: {stderr}");
         }
     }
 
@@ -7333,6 +7441,320 @@ mod tests {
         let fix = hit.fix.as_ref().expect("fix");
         assert!(fix.summary.contains("llama.cpp"), "{}", fix.summary);
         assert!(!hit.title.contains("HIP DLLs cannot load"), "{}", hit.title);
+    }
+
+    /// The `Fix` that each checker builds for itself is shown to users of
+    /// Windows PowerShell 5.1 as well as cmd, just like the `rocm fix` catalog.
+    /// This runs every checker that answers on Windows and applies the same
+    /// rule as the catalog test in `fix.rs` (`fails_in_windows_powershell`), so a
+    /// hand-built verify string or command that breaks one of the rule's known
+    /// constructs fails here. A construct the rule does not list passes.
+    ///
+    /// Like that test it pins the text only. Nothing here runs a command in a
+    /// shell. The Windows-only tests named on `fails_in_windows_powershell` in
+    /// `fix.rs` run the fix-2, fix-13, fix-14, fix-15, fix-21 and fix-22 lines,
+    /// and `the_igpu_verify_pins_the_variable_it_names` runs fix-9's, all on
+    /// Windows.
+    #[test]
+    fn windows_diagnosis_remediation_passes_the_powershell_text_rule() {
+        // Host state that wakes the checkers which answer from the machine and
+        // not from the symptom: an override set, a HIP SDK with no `hipInfo`,
+        // an APU beside a discrete GPU, and a runtime that is missing.
+        let e = Examination {
+            os_family: "windows".to_owned(),
+            msvc_redist_present: Some(false),
+            hip_sdk_path: r"C:\Program Files\AMD\ROCm\6.4".to_owned(),
+            hipinfo_present: false,
+            has_apu: true,
+            has_discrete_amd: true,
+            env: [
+                ("HSA_OVERRIDE_GFX_VERSION".to_owned(), "11.0.0".to_owned()),
+                ("PATH".to_owned(), r"C:\Windows".to_owned()),
+            ]
+            .into_iter()
+            .collect(),
+            ..Examination::default()
+        };
+        // Wide enough to wake the keyword-driven checkers, so the test sees
+        // the Fix they build rather than an empty answer. fix-13 only scores
+        // when the paste names HIP failing to load, hence `was not found`.
+        let symptom = "hipErrorNoBinaryForGpu HSA_STATUS_ERROR_INVALID_ISA invalid device function \
+                       HSA_OVERRIDE_GFX_VERSION vcruntime140_1.dll amdhip64_6.dll was not found \
+                       hipblas.dll driver too old";
+        let mut seen: Vec<String> = Vec::new();
+        for (check, families) in CHECKERS {
+            if !families.contains(&"windows") {
+                continue;
+            }
+            let Some(fix) = check(&e, symptom).fix else {
+                continue;
+            };
+            let printed = fix
+                .commands
+                .iter()
+                .map(String::as_str)
+                .filter(|c| !c.trim_start().starts_with('#'))
+                .chain(std::iter::once(fix.verify.as_str()));
+            for line in printed {
+                if let Some(why) = crate::fix::fails_in_windows_powershell(line) {
+                    panic!("{}: `{line}` uses {why}", fix.fix_id);
+                }
+            }
+            seen.push(fix.fix_id);
+        }
+        // Guard the test itself: it must have looked at the Windows checkers.
+        for expected in [
+            "fix-2-unset-override",
+            "fix-6-path",
+            "fix-9-igpu-dgpu",
+            "fix-13-hip-sdk-missing",
+            "fix-14-adrenalin-too-old",
+            "fix-15-msvc-redist",
+        ] {
+            assert!(
+                seen.iter().any(|id| id == expected),
+                "the sweep never saw {expected}; it saw {seen:?}"
+            );
+        }
+    }
+
+    /// fix-6's verify line lives in the `rocm fix` catalog and in the Fix that
+    /// `check_6_path_missing` builds. The shared-id guard above covers fix-13,
+    /// fix-14, fix-15 and fix-16; this one keeps fix-6's two copies from drifting.
+    ///
+    /// The Windows arm of the checker is not compared with the catalog on
+    /// purpose. It names the SDK's own `hipInfo.exe` in a PowerShell command,
+    /// which the single catalog line cannot do, so it is checked for being a
+    /// PowerShell command instead. Its text is also covered by the Windows sweep
+    /// above.
+    #[test]
+    fn the_path_fix_verify_matches_the_catalog_copy() {
+        let (verify, _, _) = crate::fix::recipe_verify_notes_and_run_commands("fix-6-path")
+            .expect("fix-6-path is in the recipe catalog");
+        // A ROCm install whose bin directory has no `rocminfo` or `hipInfo`.
+        let host = |os_family: &str| Examination {
+            os_family: os_family.to_owned(),
+            rocm_path: "/opt/rocm".to_owned(),
+            hip_sdk_path: r"C:\Program Files\AMD\ROCm\6.4".to_owned(),
+            ..Examination::default()
+        };
+        let linux = check_6_path_missing(&host("linux"), "hipcc: command not found")
+            .fix
+            .expect("check 6 builds a Fix for its own symptom");
+        // The Linux arm runs the catalog's Linux line and nothing else. The
+        // line shared with Windows (`hipcc --version`) is not chained on: a
+        // runtime-only install has no `hipcc`, and the catalog note says that
+        // line fails there even with PATH fixed.
+        let catalog_linux = crate::fix::recipe_linux_verify("fix-6-path")
+            .expect("fix-6-path has a Linux verify line in the recipe catalog");
+        assert_eq!(
+            linux.verify, catalog_linux,
+            "the verify line for fix-6-path diverged between `diagnose` and `rocm fix`"
+        );
+        assert!(
+            !linux.verify.contains("hipcc") && !linux.verify.contains(verify),
+            "the Linux verify must pass on a runtime-only install, which has no hipcc: {}",
+            linux.verify
+        );
+        let windows = check_6_path_missing(&host("windows"), "hipcc: command not found")
+            .fix
+            .expect("check 6 builds a Fix for its own symptom");
+        assert!(
+            windows
+                .verify
+                .starts_with("powershell -NoProfile -Command "),
+            "the Windows verify line must run in PowerShell: {}",
+            windows.verify
+        );
+    }
+
+    /// A folder with an apostrophe in it, such as `C:\Users\O'Neil\ROCm\bin`,
+    /// must not end a PowerShell string literal early in either printed
+    /// fix-6 line: the PATH write or the verify.
+    #[test]
+    fn the_windows_path_fix_doubles_an_apostrophe_in_the_sdk_folder() {
+        let e = Examination {
+            os_family: "windows".to_owned(),
+            hip_sdk_path: r"C:\Users\O'Neil\ROCm".to_owned(),
+            hipinfo_present: false,
+            ..Examination::default()
+        };
+        let fix = check_6_path_missing(&e, "hipInfo.exe not found")
+            .fix
+            .expect("check 6 builds a Fix for its own symptom");
+        let write = fix
+            .commands
+            .iter()
+            .find(|c| c.contains("SetEnvironmentVariable"))
+            .expect("the PATH write is printed");
+        assert!(
+            write.contains(r"'C:\Users\O''Neil\ROCm\bin;'"),
+            "the apostrophe must be doubled: {write}"
+        );
+        assert!(
+            fix.verify
+                .contains(r"& 'C:\Users\O''Neil\ROCm\bin\hipInfo.exe'"),
+            "the apostrophe must be doubled: {}",
+            fix.verify
+        );
+    }
+
+    /// fix-2's Linux verify line is in the `rocm fix` catalog (`Verify (Linux,
+    /// WSL)`) and in the Linux arm of `check_2_hsa_override_unneeded`, which
+    /// runs it and then the GPU check the catalog line cannot carry (it is
+    /// shared with Windows and cannot assume torch). Neither may need `python`:
+    /// a stock Ubuntu has `python3` only. The Windows arm names the User scope
+    /// in a PowerShell command and is covered by the Windows sweep above.
+    #[test]
+    fn the_override_fix_verify_matches_the_catalog_copy() {
+        let catalog_linux = crate::fix::recipe_linux_verify("fix-2-unset-override")
+            .expect("fix-2-unset-override has a Linux verify line in the recipe catalog");
+        let e = Examination {
+            os_family: "linux".to_owned(),
+            env: std::iter::once(("HSA_OVERRIDE_GFX_VERSION".to_owned(), "11.0.0".to_owned()))
+                .collect(),
+            ..Examination::default()
+        };
+        let linux = check_2_hsa_override_unneeded(&e, "")
+            .fix
+            .expect("check 2 builds a Fix when the override is set");
+        assert_eq!(
+            linux.verify,
+            format!(
+                "{catalog_linux}; python3 -c \"import torch; print(torch.cuda.is_available())\""
+            ),
+            "the verify line for fix-2-unset-override diverged between `diagnose` and `rocm fix`"
+        );
+        // A stock Ubuntu has `python3` and no `python`.
+        assert!(
+            !linux.verify.split_whitespace().any(|word| word == "python"),
+            "{}",
+            linux.verify
+        );
+        // Clearing the override must leave the GPU usable; the printed line is
+        // what tells the user whether it did.
+        assert!(
+            linux.verify.contains("torch.cuda.is_available()"),
+            "{}",
+            linux.verify
+        );
+    }
+
+    /// Writes each `(name, script)` as an executable in a new directory, to be
+    /// the whole `PATH` of a shell that runs a Linux verify line.
+    #[cfg(unix)]
+    fn stub_bin_dir(stubs: &[(&str, &str)]) -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("the stub directory is created");
+        for (name, script) in stubs {
+            let path = dir.path().join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).expect("a stub is written");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("a stub is made executable");
+        }
+        dir
+    }
+
+    /// Runs one printed line in `/bin/sh` whose `PATH` is only `bin` and whose
+    /// environment is only `PATH` and `env`. Returns whether it exited 0, and
+    /// its stdout and stderr.
+    #[cfg(unix)]
+    fn run_in_sh(
+        line: &str,
+        bin: &std::path::Path,
+        env: &[(&str, &str)],
+    ) -> (bool, String, String) {
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(line)
+            .env_clear()
+            .env("PATH", bin)
+            .envs(env.iter().copied())
+            .output()
+            .expect("/bin/sh runs");
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    }
+
+    /// The fix-6 line `rocm diagnose` prints on Linux, run on a runtime-only
+    /// install: `rocminfo` is on PATH once the fix has worked, and there is no
+    /// `hipcc`. The line must succeed and show the GPU. The old line, with
+    /// `&& hipcc --version` chained on, fails on the same PATH, which is what
+    /// the catalog note says about the plain verify line.
+    #[cfg(unix)]
+    #[test]
+    fn the_path_fix_verify_passes_on_a_runtime_only_linux_install() {
+        let real_head = ["/usr/bin/head", "/bin/head"]
+            .into_iter()
+            .find(|p| std::path::Path::new(p).exists())
+            .expect("head is installed");
+        let bin = stub_bin_dir(&[
+            (
+                "rocminfo",
+                "for n in 1 2 3 4 5 6 7 8; do echo \"agent $n\"; done",
+            ),
+            ("head", &format!("exec {real_head} \"$@\"")),
+        ]);
+        let fix = check_6_path_missing(
+            &Examination {
+                os_family: "linux".to_owned(),
+                rocm_path: "/opt/rocm".to_owned(),
+                ..Examination::default()
+            },
+            "rocminfo: command not found",
+        )
+        .fix
+        .expect("check 6 builds a Fix for its own symptom");
+        let (ok, stdout, stderr) = run_in_sh(&fix.verify, bin.path(), &[]);
+        assert!(ok, "{}: {stdout}\n{stderr}", fix.verify);
+        assert_eq!(
+            stdout.lines().collect::<Vec<_>>(),
+            ["agent 1", "agent 2", "agent 3", "agent 4", "agent 5"]
+        );
+        // The control: the chain this arm used to print fails on this PATH.
+        let (old_ok, _, old_err) =
+            run_in_sh("rocminfo | head -n 5 && hipcc --version", bin.path(), &[]);
+        assert!(!old_ok && old_err.contains("hipcc"), "{old_err}");
+    }
+
+    /// The fix-2 line `rocm diagnose` prints on Linux, run on a system that has
+    /// `python3` and no `python`, with the override set and with it cleared. It
+    /// must print the override's value (or OK_UNSET) and then the torch check,
+    /// and exit 0. The line this arm used to print, which called `python`,
+    /// fails on the same PATH.
+    #[cfg(unix)]
+    #[test]
+    fn the_override_fix_verify_runs_where_only_python3_exists() {
+        let bin = stub_bin_dir(&[("python3", "echo True")]);
+        let fix = check_2_hsa_override_unneeded(
+            &Examination {
+                os_family: "linux".to_owned(),
+                env: std::iter::once(("HSA_OVERRIDE_GFX_VERSION".to_owned(), "11.0.0".to_owned()))
+                    .collect(),
+                ..Examination::default()
+            },
+            "",
+        )
+        .fix
+        .expect("check 2 builds a Fix when the override is set");
+        for (env, shown) in [
+            (&[("HSA_OVERRIDE_GFX_VERSION", "11.0.0")][..], "11.0.0"),
+            (&[][..], "OK_UNSET"),
+        ] {
+            let (ok, stdout, stderr) = run_in_sh(&fix.verify, bin.path(), env);
+            assert!(ok, "{}: {stdout}\n{stderr}", fix.verify);
+            assert_eq!(
+                stdout.lines().collect::<Vec<_>>(),
+                [shown, "True"],
+                "{stderr}"
+            );
+        }
+        // The control: calling `python` on this PATH is what the reviewer saw.
+        let (old_ok, _, old_err) = run_in_sh("python -c 'print(1)'", bin.path(), &[]);
+        assert!(!old_ok && old_err.contains("python"), "{old_err}");
     }
 
     #[test]

@@ -1295,6 +1295,78 @@ install steps also require a native Windows build before any CLI invocation.
 that ordering without running an installer. Do not run these scenarios on a
 non-Windows host.
 
+Lines that `rocm fix` and `rocm diagnose` print for Windows are meant to be
+pasted into Windows PowerShell 5.1 or cmd, so they are held to a text rule: no
+`&&` or `||`, no bare `where`, no `%NAME%`, no empty-string argument, and no
+`$` or `\"` inside a double-quoted `powershell -Command "..."` body, and no
+`Get-Item` there without `-ErrorAction Stop` (a missing path is a
+non-terminating error, so the line would print it and still exit 0). The `where`
+and `-Command` matches ignore case.
+`fails_in_windows_powershell` in
+[fix.rs](../crates/rocm-core/src/fix.rs) applies it to every catalog recipe that
+applies on Windows (commands, the `Verify` line and the `Verify (Linux, WSL)`
+line) and to the `Fix` values `rocm diagnose` builds for Windows. Scenarios
+`diagnose-43`, `diagnose-44` and `diagnose-45` in
+[diagnose.feature](../tests/e2e-cucumber/features/diagnose.feature) apply it to
+what `rocm fix <id> --dry-run` prints; the plan prints before the platform
+gate, so they run on the Linux lanes too. The e2e crate cannot depend on
+rocm-core, so it carries its own copy of the rule,
+[powershell_text_rule.rs](../tests/e2e-cucumber/src/powershell_text_rule.rs).
+Both copies are tested against one table of cases,
+[powershell_text_rule_cases.txt](../tests/e2e-cucumber/fixtures/powershell_text_rule_cases.txt):
+add a case there, and a rule that gets it wrong fails on its own side.
+
+The rule reads text; it does not prove a line runs. On Windows,
+`cargo test -p rocm-core --lib` types the `Verify` lines of fix-2, fix-13, fix-14, fix-15, fix-21 and
+fix-22 into cmd and into Windows PowerShell and checks the exit code and
+output (the tests in [fix.rs](../crates/rocm-core/src/fix.rs) named
+`the_override_verify_runs_in_cmd_and_powershell`,
+`the_hip_sdk_verify_runs_the_exe_under_hip_path`,
+`the_adrenalin_verify_runs_and_its_filter_keeps_only_amd`,
+`the_msvc_verify_runs_in_cmd_and_powershell`,
+`the_outdated_msvc_verify_prints_a_version_and_fails_when_the_dll_is_missing`
+and `the_display_driver_verify_runs_in_cmd_and_powershell`; fix-15 and fix-21
+also must exit non-zero when their DLL is missing, fix-15 in
+`the_msvc_verify_exits_nonzero_when_a_dll_is_missing`), and runs the fix-9 line
+that only `rocm diagnose` prints
+(`the_igpu_verify_pins_the_variable_it_names` in
+[diagnose.rs](../crates/rocm-core/src/diagnose.rs)). These tests are compiled on
+Windows only, so the Linux lanes do not run them, and no Windows scenario covers
+the Windows lines `rocm diagnose` prints: those are held by the text rule
+(`windows_diagnosis_remediation_passes_the_powershell_text_rule`) and the tests
+above. The fix-6 PATH write is not run by any test because it changes the
+user's PATH.
+
+A catalog entry can carry a second line for Linux and WSL, printed as
+`Verify (Linux, WSL):`, when the line every OS can run cannot show what Linux
+needs. fix-6 does: `hipcc --version` for every OS, and `rocminfo | head -n 5`
+for Linux and WSL, which shows the GPU and passes on a runtime-only install
+that has no `hipcc`. `diagnose-45` asserts both lines and the note that names
+the runtime-only case. fix-2 does too: the `python` line for every OS (it is
+what cmd and PowerShell run), and `echo "${HSA_OVERRIDE_GFX_VERSION:-OK_UNSET}"`
+for Linux and WSL, which needs no Python (a stock Ubuntu has `python3` only)
+and no `||`. `diagnose-44` asserts both lines and the note.
+
+The `rocm diagnose` Linux arms print the catalog's Linux line and nothing from
+the plain line: fix-6 prints `rocminfo | head -n 5` alone (chaining `hipcc
+--version` fails on a runtime-only install), and fix-2 prints its Linux line
+followed by `python3 -c "import torch; ..."`, the check that clearing the
+override left the GPU usable. Scenarios `diagnose-46` (fix-2, run with
+`HSA_OVERRIDE_GFX_VERSION` set) and `diagnose-47` (fix-6, on a simulated host)
+in [diagnose.feature](../tests/e2e-cucumber/features/diagnose.feature) assert
+the line `rocm diagnose` prints, and that it names `python3` and no `hipcc`.
+Both are `@requires-os:linux`, so they run on every Linux lane (WSL2 included),
+GPU or not, and are skipped on Windows. The arms are also checked against the
+catalog in [diagnose.rs](../crates/rocm-core/src/diagnose.rs)
+(`the_override_fix_verify_matches_the_catalog_copy`,
+`the_path_fix_verify_matches_the_catalog_copy`). On Unix hosts,
+`the_path_fix_verify_passes_on_a_runtime_only_linux_install` and
+`the_override_fix_verify_runs_where_only_python3_exists` run the lines
+`rocm diagnose` prints in `/bin/sh` on a `PATH` of stand-in executables with no
+`hipcc` or no `python`. `the_override_linux_verify_runs_with_nothing_on_path`
+([fix.rs](../crates/rocm-core/src/fix.rs)) runs the catalog's `verify_linux`
+line for fix-2, not the `rocm diagnose` one, on an empty `PATH`.
+
 Provider audit focused test:
 
 ```bash
