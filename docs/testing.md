@@ -200,6 +200,10 @@ not checked as written:
   `service_hints.rs`, whose verb is `{action}`, and the `runtimes` retry line
   in `runtime_services.rs`, whose subcommand is `{command}`) is excluded and
   checked through the functions that build it instead
+- separate optional groups are tried one at a time, never together (they can
+  be mutually exclusive, as in `rocm dash [--demo] [--replay <file>]`), so a
+  command that fails only when flags from two of them are combined is not
+  caught
 
 When it fails, fix the advice (or the CLI). Add text to `NOT_INVOCATIONS`, with
 a reason, only when the text starts with `rocm` but is not advice to run
@@ -697,8 +701,9 @@ The running guard is tested against a ComfyUI answering on its port
 (`starting`).
 
 The e2e scenarios `comfyui-05` to `comfyui-13`
-([comfyui.feature](../tests/e2e-cucumber/features/comfyui.feature), Linux, no
-GPU) cover the same through the built binary: what is kept, replaced and left
+([comfyui.feature](../tests/e2e-cucumber/features/comfyui.feature), no GPU;
+only `comfyui-08`, `-11` and `-12` stay Linux-only, the rest also run on
+Windows) cover the same through the built binary: what is kept, replaced and left
 in place (also when the saved run state is unreadable), a failed download, the
 dry run, a reinstall refused while ComfyUI runs (which the dry run says
 first, and which is refused before anything is downloaded), `start` refusing a half-replaced folder until the command it names is
@@ -1256,6 +1261,56 @@ package-manager plans for Ubuntu, Debian, RHEL, Oracle Linux, Rocky, and SLES,
 while unsupported Linux IDs remain non-mutating instead of guessed. The
 reconcile path is also non-privileged. It refreshes passive checks and persists
 the `total`/`present`/`missing` check summary without running DKMS commands.
+
+Windows display driver checks (`fix-22-display-driver-old`) are covered by unit
+tests, because the Linux CI lane cannot simulate a Windows host:
+
+```bash
+cargo test -p rocm-core -- windows_driver:: windows_driver_fills windows_driver_version_date \
+  display_driver old_driver driver_age driver_fact driver_date driver_from_the_inventory \
+  driver_without_the_cpu second_query version_less no_date basic_display same_adapter \
+  local_host_driver_probe formats_the_driver_date_in_utc diagnosis_remediation_matches_the_fix_catalog_for_shared_fix_ids \
+  needs_reboot_true_fix_ids_match_the_known_set every_recipe_id_is_unique_and_covers_the_catalog
+cargo test -p rocm --bin rocm -- windows_install_driver should_execute_never \
+  the_fix_id_the_install_text planners_describe the_chat_entry the_production_planner provider_plans
+```
+
+The filters are plain name fragments, because the tests sit in five modules and
+share no prefix. They match the fix-22 and driver-age tests, the install-driver
+planner tests, and some neighbouring inventory tests (for example the startup
+paths that must not start the driver query). After adding or renaming one of
+these tests, check the set with the same arguments and `-- --list`.
+
+The `rocm install driver` tests assert the printed version, date, verdict and fix
+id together with the fact that the plan has no commands and stays non-mutating,
+with or without `--yes`. A `no` verdict is asserted together with the sentence
+that the date cannot judge newer GPUs such as gfx1151.
+
+Four `@requires-os:windows` scenarios run on the Windows GPU lane
+(`e2e-gpu-strix-windows`): `examine-29` in
+[examine.feature](../tests/e2e-cucumber/features/examine.feature),
+`diagnose-41` in
+[diagnose.feature](../tests/e2e-cucumber/features/diagnose.feature), and
+`driver-install-04` and `driver-install-05` in
+[driver_install.feature](../tests/e2e-cucumber/features/driver_install.feature).
+They name no driver. The inspection, diagnosis and unapproved install scenarios
+compare their output with `rocm examine --json` on the same machine:
+the version, date and `driver_age` lines match the JSON, the verdict follows the
+date, `rocm install driver` prints that the driver install changes nothing and
+writes no installer state, with or without `--yes`, and `fix-22-display-driver-old`
+appears in `rocm diagnose` only for an old driver. The old-driver branch is
+covered by these scenarios but needs a machine whose display driver is dated
+before 27 July 2023, the value of `FIRST_HIP_SDK_FOR_WINDOWS` in
+[windows_driver.rs](../crates/rocm-core/src/windows_driver.rs). Unit tests cover
+that branch.
+
+Run these scenarios only on Windows. Cucumber's `-n` and `-t` filters replace
+this harness's platform filter, so selecting a Windows scenario by name or tag
+on Linux runs it against Linux behavior instead of skipping it. The Windows
+install steps also require a native Windows build before any CLI invocation.
+[driver_host_guard.rs](../tests/e2e-cucumber/tests/driver_host_guard.rs) checks
+that ordering without running an installer. Do not run these scenarios on a
+non-Windows host.
 
 Provider audit focused test:
 

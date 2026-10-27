@@ -286,7 +286,7 @@ form works depends on the engine your GPU selects.
 | `rocm diagnose --report` | Show what this machine would contribute to a problem report, and send nothing |
 | `rocm fix [<fix-id>]` | Apply a fix reported by `rocm diagnose` |
 | `rocm install sdk` | Install TheRock ROCm wheels into a managed Python environment |
-| `rocm install driver` | Install the AMD kernel driver on Linux |
+| `rocm install driver` | Install the AMD kernel driver on Linux; on Windows, report the display driver version and age (installs nothing) |
 | `rocm serve <model>` | Start a local OpenAI-compatible model server |
 | `rocm remote serve <machine> <model>` | Serve a model on another GPU machine over your private network |
 | `rocm dash` | Open the full-screen telemetry dashboard |
@@ -316,6 +316,20 @@ for its ROCm build and compiled GPU architectures:
   answer GPU and driver questions.
 
 `--framework` only affects the JSON report, not the human-readable one.
+
+On Windows, the human-readable summary also shows the AMD display driver's
+`driver_version` and `driver_date`, and a `driver_age` line. `driver_age`
+compares the driver date with the release of the first HIP SDK for Windows
+(27 July 2023). AMD publishes no minimum driver version for the HIP SDK or for
+the Lemonade Vulkan backend, so this is a hint to look at the driver, not a
+statement that the driver is broken. The date is only a floor: it cannot judge
+newer GPUs such as gfx120X, gfx1150 and gfx1151, which may need newer drivers.
+`rocm diagnose` lists the same finding as
+`fix-22-display-driver-old` with a WEAK score. Its advice is AMD's support
+page and a restart after the install. The entry is advice about the host, not a
+cause of any reported symptom, so when nothing else matches, `rocm diagnose`
+still says where to file it upstream. rocm-cli never installs drivers on
+Windows. The Vulkan driver version is not shown.
 
 ### Diagnose and fix
 
@@ -553,6 +567,17 @@ you what it couldn't find instead.
 
 `install driver` installs the AMD kernel driver on Linux, using DKMS or a native
 package.
+
+On Windows, `install driver` is validate-only: it installs and changes nothing,
+with or without `--yes`, and it starts no driver command. It prints the AMD
+display driver version and date, and whether the date is older than the first
+HIP SDK for Windows, 27 July 2023 (`outdated: yes`, `no` or `unknown`). Next to
+`outdated: no` it repeats that the date cannot judge newer GPUs such as
+gfx120X, gfx1150 and gfx1151. For an
+old driver it also names the fix id `fix-22-display-driver-old`. Run
+`rocm diagnose` for the advice. AMD publishes no minimum driver version, so an
+old date is a hint to look at the driver, not a finding that it is broken. See
+[Examine](#examine).
 
 #### Updates
 

@@ -113,21 +113,19 @@ Feature: ComfyUI install reports progress and makes failures actionable
   # aside, a failure after the new code is in place, and a download that is
   # not a ComfyUI release. Each asserts what the CLI prints together with what
   # is actually on disk afterwards. Only three of these still need the POSIX
-  # shell: comfyui-11's GPU-check failing transition plants a `#!/bin/sh`
-  # script (its passing-again half uses the Windows-portable `fake-python`
-  # stand-in, like every other scenario here), and comfyui-08/comfyui-12 each
-  # start their stand-in running ComfyUI process through `sh -c` (see
-  # `spawn_stand_in`). comfyui-05/-06/-07/-09/-10/-13 plant the same
-  # Windows-portable `fake-python` stand-in `comfyui-01`/`-02`/`-03` use and
-  # have no shell dependency of their own, but stay `@requires-os:linux` too:
-  # their reinstall behavior has not been run on Windows yet. Ungating them
-  # is tracked separately (#697), to keep this fix scoped to #629's
-  # comfyui-01/02/03 ask.
+  # shell and stay `@requires-os:linux`: comfyui-11's GPU-check failing
+  # transition plants a `#!/bin/sh` script (its passing-again half uses the
+  # Windows-portable `fake-python` stand-in, like every other scenario here),
+  # and comfyui-08/comfyui-12 each start their stand-in running ComfyUI
+  # process through `sh -c` (see `spawn_stand_in`). comfyui-05/-06/-07/-09/-10/-13
+  # plant the same Windows-portable `fake-python` stand-in `comfyui-01`/`-02`/`-03`
+  # use and have no shell dependency of their own, so they now run on both
+  # platforms too (#697).
   #
   # rocm-cli's saved record of a ComfyUI it started is unreadable here. `stop`
   # cannot read it either, so it must not block the reinstall; the reinstall
   # says it could not tell.
-  @id:comfyui-reinstall-keeps-user-data @requires-os:linux
+  @id:comfyui-reinstall-keeps-user-data
   Scenario: comfyui-05 - Reinstalling ComfyUI replaces its code and keeps the user's own files
     Given a ComfyUI install holding the user's models, workflows, images and custom nodes
     And a newer ComfyUI release is available to download
@@ -138,7 +136,7 @@ Feature: ComfyUI install reports progress and makes failures actionable
     And the reinstall lists the code it replaced
     And the reinstall says it could not tell whether ComfyUI was running
 
-  @id:comfyui-reinstall-failed-download-changes-nothing @requires-os:linux
+  @id:comfyui-reinstall-failed-download-changes-nothing
   Scenario: comfyui-06 - A ComfyUI reinstall whose download fails leaves the existing install untouched
     Given a ComfyUI install holding the user's models, workflows, images and custom nodes
     And the ComfyUI release download fails
@@ -146,7 +144,7 @@ Feature: ComfyUI install reports progress and makes failures actionable
     Then the reinstall fails
     And the existing ComfyUI code and the user's files are untouched
 
-  @id:comfyui-reinstall-dry-run-names-kept-folders @requires-os:linux
+  @id:comfyui-reinstall-dry-run-names-kept-folders
   Scenario: comfyui-07 - A ComfyUI reinstall dry run says what it replaces and keeps
     Given a ComfyUI install holding the user's models, workflows, images and custom nodes
     When the user previews reinstalling ComfyUI
@@ -192,7 +190,7 @@ Feature: ComfyUI install reports progress and makes failures actionable
   # the CLI's own message) and proves the condition is cleared. `status` and
   # the answer to a natural-language status question both name that command
   # rather than `start` until then.
-  @id:comfyui-interrupted-reinstall-blocks-start @requires-os:linux
+  @id:comfyui-interrupted-reinstall-blocks-start
   Scenario: comfyui-09 - ComfyUI will not start a half-replaced install until the reinstall is finished
     Given a ComfyUI install holding the user's models, workflows, images and custom nodes
     And a newer ComfyUI release is available to download
@@ -213,7 +211,7 @@ Feature: ComfyUI install reports progress and makes failures actionable
   # of `source/`. The install recorded what its release shipped, so the
   # reinstall knows that entry is the user's: it renames it and says where,
   # instead of deleting it as old code.
-  @id:comfyui-reinstall-sets-aside-colliding-entry @requires-os:linux
+  @id:comfyui-reinstall-sets-aside-colliding-entry
   Scenario: comfyui-10 - Reinstalling ComfyUI renames a folder of the user's that the new release also ships
     Given a ComfyUI install holding the user's models, workflows, images and custom nodes
     And the user keeps an app folder there that the installed ComfyUI release did not ship
@@ -264,7 +262,7 @@ Feature: ComfyUI install reports progress and makes failures actionable
   # A download that unpacks but has no main.py is not installed: the reinstall
   # would otherwise remove the installed code and put nothing startable in its
   # place. It is not kept either, so the next attempt downloads again.
-  @id:comfyui-reinstall-rejects-download-without-main-py @requires-os:linux
+  @id:comfyui-reinstall-rejects-download-without-main-py
   Scenario: comfyui-13 - A ComfyUI reinstall whose download is not a ComfyUI release leaves the install untouched
     Given a ComfyUI install holding the user's models, workflows, images and custom nodes
     And the newer ComfyUI release offered for download has no main.py

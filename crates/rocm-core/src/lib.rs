@@ -46,6 +46,7 @@ mod test_env;
 #[cfg(test)]
 mod test_support;
 pub mod uv;
+pub mod windows_driver;
 pub use automation::{
     AuditEventRecord, AutomationEventRecord, AutomationProposalRecord, AutomationRuntimeState,
     AutomationTriggerEvent, BuiltinWatcherSpec, WatcherRuntimeSnapshot, append_audit_event,
