@@ -5,7 +5,7 @@
 //! Chat LLM configuration: a pure precedence resolver plus a std-only TCP liveness probe.
 //!
 //! No HTTP client here — the Rig-built `AgentClient` (Phase 3)
-//! lives in `agent.rs`. Keeping detection in the TUI crate preserves the
+//! lives in `agent/clients.rs`. Keeping detection in the TUI crate preserves the
 //! core's render/async-free boundary.
 
 use std::net::{TcpStream, ToSocketAddrs};
@@ -19,7 +19,7 @@ use std::time::Duration;
 /// POSTs to `/chat/completions` and a vLLM/Lemonade server answers `404 Not
 /// Found`. Matches the `/v1` convention of `VLLM_ENDPOINT` / `LEMONADE_ENDPOINT`
 /// (those use `localhost`; `127.0.0.1` is the unambiguous IPv4 loopback and
-/// matches the live endpoint asserted in `agent.rs`).
+/// matches the live endpoint asserted in `agent/clients.rs`).
 pub const DEFAULT_CHAT_BASE_URL: &str = "http://127.0.0.1:8000/v1";
 
 /// Fallback model name when none is configured. Many local endpoints ignore

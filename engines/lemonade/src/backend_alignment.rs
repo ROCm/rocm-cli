@@ -3,8 +3,12 @@
 // SPDX-License-Identifier: MIT
 
 use anyhow::{Context, Result, bail};
-use rocm_core::{AppPaths, RocmCliConfig, active_managed_therock_version, runtime_is_linux};
+use rocm_core::{
+    AppPaths, RocmCliConfig, active_managed_therock_version, runtime_is_linux, runtime_is_windows,
+};
 use serde_json::Value;
+#[cfg(any(target_os = "windows", test))]
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
@@ -12,11 +16,15 @@ use std::time::Duration;
 
 use crate::direct_llama::find_llama_server_binary_for_backend;
 use crate::install::{LemonadeInstallManifest, read_manifest};
+#[cfg(target_os = "windows")]
+use crate::process::lemonade_process_environment_vars;
 use crate::process::{
     LemonadeProcessEnvironment, apply_lemonade_process_environment, hide_child_console_window,
     lemonade_process_environment, run_lemonade_backend_install, spawn_lemond,
     wait_for_lemonade_cli_status,
 };
+#[cfg(target_os = "windows")]
+use crate::runtime_dir::ParentRuntimeEnvironment;
 use crate::state::{free_local_port, terminate_pid};
 use crate::{DEFAULT_HOST, LLAMACPP_RECIPE, ROCM_BACKEND_NAME};
 
@@ -77,6 +85,7 @@ pub(crate) fn prepare_llamacpp_backend_for_active_rocm(
     prepare_llamacpp_backend_for_active_rocm_impl(
         manifest,
         lemonade_backend_alignment_disabled(),
+        !runtime_is_linux() && !runtime_is_windows(),
         || active_rocm_sdk_version_for_alignment(paths),
         read_backend_versions_therock_version,
         best_llamacpp_backend_for_host,
@@ -104,7 +113,12 @@ pub(crate) fn prepare_llamacpp_backend_for_active_rocm(
 /// no coverage outside a `@nightly @requires-gpu` e2e lane. `disabled` is
 /// [`lemonade_backend_alignment_disabled`]'s resolved value, passed in for the same
 /// reason `align` (below) takes it as a parameter: a test can drive both branches
-/// without touching process environment.
+/// without touching process environment. `unsupported_platform` is likewise resolved
+/// by the caller (`!runtime_is_linux() && !runtime_is_windows()`) rather than read
+/// here, so a test can drive the OS-gate branch without depending on the real
+/// platform the suite happens to run on -- previously this gate called the
+/// `const fn` platform checks directly and had no coverage outside a
+/// `@nightly @requires-gpu` e2e lane.
 ///
 /// This function, not `align`, is the real production enforcement point for the
 /// opt-out: the single production call site passes `disabled` straight through to
@@ -117,6 +131,7 @@ pub(crate) fn prepare_llamacpp_backend_for_active_rocm(
 fn prepare_llamacpp_backend_for_active_rocm_impl(
     manifest: &mut LemonadeInstallManifest,
     disabled: bool,
+    unsupported_platform: bool,
     mut active_rocm_sdk_version: impl FnMut() -> Result<Option<String>>,
     mut pinned_version_lookup: impl FnMut(&Path) -> Option<String>,
     mut selected_backend_lookup: impl FnMut(&LemonadeInstallManifest) -> Result<Option<String>>,
@@ -145,11 +160,12 @@ fn prepare_llamacpp_backend_for_active_rocm_impl(
         fallback_install(manifest, false)?;
         return Ok(None);
     }
-    // Alignment is only ever verifiable on Linux ([`rocm_backend_resolves`] always
-    // reports unresolved elsewhere), so attempting it on Windows can only burn up to
-    // three multi-GB backend installs and a network round-trip for a guaranteed-futile
-    // outcome. Skip straight to the ordinary pinned-version install.
-    if !runtime_is_linux() {
+    // Alignment is only ever verifiable on Linux (`ldd`-based) and Windows
+    // (DLL-presence-based); [`rocm_backend_resolves`] always reports unresolved
+    // everywhere else, so attempting it there can only burn up to three multi-GB
+    // backend installs and a network round-trip for a guaranteed-futile outcome.
+    // Skip straight to the ordinary pinned-version install.
+    if unsupported_platform {
         fallback_install(manifest, false)?;
         return Ok(None);
     }
@@ -597,9 +613,109 @@ fn rocm_backend_resolves(
         )
 }
 
-/// Off Linux, `ldd`-based verification is not exercised: a version-aligned backend is
-/// never accepted without it, so this always reports unresolved.
-#[cfg(not(target_os = "linux"))]
+/// ROCm DLL shortnames the `llamacpp:rocm` backend's `ggml-hip.dll` depends on,
+/// matched by filename *prefix* rather than an exact name: TheRock's Windows HIP
+/// runtime ships a version-suffixed `amdhip64_N.dll`, which the loader resolves by
+/// import name, not by any one literal file existing.
+#[cfg(any(target_os = "windows", test))]
+const ROCM_BACKEND_REQUIRED_LIBRARY_SHORTNAMES: [&str; 4] =
+    ["amdhip64", "hipblas", "rocblas", "hsa-runtime64"];
+
+/// Whether the ROCm GPU backend beside `llama_server_binary` has its required ROCm
+/// DLLs present somewhere the real process would actually search: the backend
+/// directory itself (Windows's loader always checks the loading module's own
+/// directory first) and `process_env`'s resolved `PATH`.
+///
+/// Weaker than Linux's `ldd` check: this confirms a matching file is present, not
+/// that the OS loader can actually load and link it (an architecture mismatch or a
+/// truncated download would still pass). ponytail: good enough to stop Windows from
+/// *always* skipping alignment and paying Lemonade's full redundant-download tax
+/// (ROCm/rocm-cli#392); upgrade to a real loader probe (e.g. spawning a throwaway
+/// child that calls `LoadLibraryExW`) if false positives turn up in practice.
+#[cfg(target_os = "windows")]
+fn rocm_backend_resolves(
+    llama_server_binary: &Path,
+    process_env: &LemonadeProcessEnvironment,
+) -> bool {
+    let Ok(env_vars) =
+        lemonade_process_environment_vars(process_env, &ParentRuntimeEnvironment::current())
+    else {
+        return false;
+    };
+    rocm_backend_resolves_with_vars(llama_server_binary, &env_vars)
+}
+
+/// The DLL-search half of `rocm_backend_resolves` (Windows), split out so a test can
+/// drive it with an explicit, controlled `env_vars` set instead of the real spawned
+/// child's actual environment -- `env_vars` is only ever additive on top of the
+/// current process's real environment (never `env_clear()`'d), so a missing `"PATH"`
+/// entry here does not mean the real child sees no `PATH`; it means the child
+/// inherits this process's own, which is what `std::env::var_os("PATH")` reads.
+#[cfg(any(target_os = "windows", test))]
+fn rocm_backend_resolves_with_vars(
+    llama_server_binary: &Path,
+    env_vars: &[(&'static str, OsString)],
+) -> bool {
+    let Some(backend_dir) = llama_server_binary.parent() else {
+        return false;
+    };
+    let path = env_vars
+        .iter()
+        .find(|(key, _)| *key == "PATH")
+        .map(|(_, value)| value.clone())
+        .or_else(|| std::env::var_os("PATH"));
+    let Some(path) = path else {
+        return false;
+    };
+    let search_dirs: Vec<PathBuf> = std::iter::once(backend_dir.to_path_buf())
+        .chain(std::env::split_paths(&path))
+        .collect();
+    windows_backend_resolves(backend_dir, &search_dirs)
+}
+
+/// The actual DLL-presence verification `rocm_backend_resolves` (Windows) checks
+/// once it has a backend directory and search path: split out, and compiled
+/// under `cfg(test)` on every target (not just real Windows builds), so
+/// `cargo test` exercises this logic -- the part that was previously
+/// untested end-to-end -- on the ordinary Linux CI lane too, not only the
+/// separate self-hosted Windows job.
+#[cfg(any(target_os = "windows", test))]
+fn windows_backend_resolves(backend_dir: &Path, search_dirs: &[PathBuf]) -> bool {
+    backend_dir.join("ggml-hip.dll").is_file()
+        && ROCM_BACKEND_REQUIRED_LIBRARY_SHORTNAMES
+            .iter()
+            .all(|shortname| library_present_in(shortname, search_dirs))
+}
+
+/// Whether some file directly inside any of `search_dirs` looks like the DLL for
+/// `shortname` -- a case-insensitive filename-prefix match anchored at a version
+/// separator, so version-suffixed names (`amdhip64_7.dll`) match alongside
+/// unsuffixed ones (`hipblas.dll`), but a distinct sibling library that merely
+/// starts with the same letters (`hipblaslt.dll` vs. shortname `"hipblas"`) does
+/// not.
+#[cfg(any(target_os = "windows", test))]
+fn library_present_in(shortname: &str, search_dirs: &[PathBuf]) -> bool {
+    search_dirs.iter().any(|dir| {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return false;
+        };
+        entries.filter_map(Result::ok).any(|entry| {
+            entry.file_name().to_str().is_some_and(|name| {
+                let stem = name.to_ascii_lowercase();
+                let Some(stem) = stem.strip_suffix(".dll") else {
+                    return false;
+                };
+                stem.strip_prefix(shortname).is_some_and(|rest| {
+                    rest.is_empty() || rest.starts_with(|c: char| c == '_' || c.is_ascii_digit())
+                })
+            })
+        })
+    })
+}
+
+/// Off Linux and Windows, no verification mechanism exists: a version-aligned
+/// backend is never accepted without one, so this always reports unresolved.
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 const fn rocm_backend_resolves(
     _llama_server_binary: &Path,
     _process_env: &LemonadeProcessEnvironment,
@@ -939,21 +1055,10 @@ fn resolve_rocm_llamacpp_backend_dirs_aside(
 mod tests {
     use super::*;
     use crate::install::platform_binary_name;
+    use crate::test_support::scratch_dir;
     use anyhow::anyhow;
     use serde_json::json;
     use std::fs;
-
-    /// A fresh scratch directory under the crate's `target/`. The base is
-    /// `CARGO_MANIFEST_DIR`, a compile-time constant, so the path never derives from a
-    /// runtime environment read.
-    fn scratch_dir(tag: &str) -> PathBuf {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join(format!("lemonade-fs-test-{tag}"));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
-    }
 
     #[test]
     fn backend_install_succeeds_without_retry() {
@@ -1360,6 +1465,7 @@ mod tests {
         let result = prepare_llamacpp_backend_for_active_rocm_impl(
             &mut manifest,
             true,
+            false,
             || panic!("disabled means the active SDK version must never be probed"),
             |_path| panic!("disabled means the packaged pin must never be read"),
             |_manifest| panic!("disabled means the vulkan-fallback probe must never run"),
@@ -1379,6 +1485,39 @@ mod tests {
     }
 
     #[test]
+    fn prepare_unsupported_platform_skips_every_lookup_and_installs_unforced() {
+        // The OS gate (neither Linux nor Windows, e.g. macOS): alignment is never
+        // verifiable there, so every lookup below it must be skipped the same way the
+        // disabled path skips them. Previously this branch called the `const fn`
+        // platform checks directly and had no coverage outside a
+        // `@nightly @requires-gpu` e2e lane that never runs on such a host.
+        let mut manifest = test_manifest(PathBuf::from("unused-runtime-dir"));
+
+        let result = prepare_llamacpp_backend_for_active_rocm_impl(
+            &mut manifest,
+            false,
+            true,
+            || panic!("unsupported platform means the active SDK version must never be probed"),
+            |_path| panic!("unsupported platform means the packaged pin must never be read"),
+            |_manifest| {
+                panic!("unsupported platform means the vulkan-fallback probe must never run")
+            },
+            |_manifest, force_reinstall| {
+                assert!(
+                    !force_reinstall,
+                    "the unsupported-platform path installs whatever is already pinned, not a fresh reinstall"
+                );
+                Ok(())
+            },
+            |_manifest, _path, _target, _pinned, _disabled| {
+                panic!("unsupported platform means align must never be reached")
+            },
+        );
+
+        assert_eq!(result.unwrap(), None);
+    }
+
+    #[test]
     fn prepare_probe_error_falls_back_to_an_unforced_install_without_reaching_align() {
         // The bug this guards: a host where the vulkan-fallback probe itself errors
         // (e.g. `lemond` failing to start) must degrade to an ordinary install
@@ -1389,6 +1528,7 @@ mod tests {
 
         let result = prepare_llamacpp_backend_for_active_rocm_impl(
             &mut manifest,
+            false,
             false,
             || Ok(Some("10.0.0".to_owned())),
             |_path| Some("7.13.0".to_owned()),
@@ -1712,6 +1852,97 @@ mod tests {
             missing_one,
             &ROCM_BACKEND_REQUIRED_SONAMES
         ));
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn library_present_in_requires_prefix_match_in_some_dir() {
+        let root = scratch_dir("library-present-in");
+        let bin_dir = root.join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::write(bin_dir.join("amdhip64_7.dll"), b"x").unwrap();
+        fs::write(bin_dir.join("hipblas.dll"), b"x").unwrap();
+
+        let search_dirs = [bin_dir.clone()];
+        assert!(library_present_in("amdhip64", &search_dirs));
+        assert!(library_present_in("hipblas", &search_dirs));
+        assert!(!library_present_in("rocblas", &search_dirs));
+
+        let other_dir = root.join("other");
+        fs::create_dir_all(&other_dir).unwrap();
+        let split_dirs = [other_dir, bin_dir];
+        assert!(library_present_in("amdhip64", &split_dirs));
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn library_present_in_does_not_match_a_distinct_sibling_library() {
+        // hipBLASLt and rocBLASLt are real, distinct ROCm/TheRock libraries commonly
+        // shipped alongside hipBLAS/rocBLAS. Their presence must not satisfy a
+        // requirement for the base library when it is itself absent.
+        let root = scratch_dir("library-present-in-sibling");
+        let bin_dir = root.join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::write(bin_dir.join("hipblaslt.dll"), b"x").unwrap();
+        fs::write(bin_dir.join("rocblaslt.dll"), b"x").unwrap();
+
+        let search_dirs = [bin_dir];
+        assert!(!library_present_in("hipblas", &search_dirs));
+        assert!(!library_present_in("rocblas", &search_dirs));
+    }
+
+    #[test]
+    fn rocm_backend_resolves_requires_every_dll_present() {
+        // Pins a controlled, empty `PATH` through `env_vars` rather than letting
+        // `rocm_backend_resolves_with_vars` fall back to this process's real,
+        // inherited `PATH` -- on the self-hosted Windows runner that real `PATH`
+        // genuinely has ROCm/Lemonade DLLs on it for other engine tests, which would
+        // make the assertion below (after deleting `hipblas.dll` from `bin_dir`)
+        // depend on whatever else happens to be installed there instead of on this
+        // test's own scratch directory.
+        let root = scratch_dir("rocm-backend-resolves");
+        let bin_dir = root.join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::write(bin_dir.join("ggml-hip.dll"), b"x").unwrap();
+        for shortname in ROCM_BACKEND_REQUIRED_LIBRARY_SHORTNAMES {
+            fs::write(bin_dir.join(format!("{shortname}.dll")), b"x").unwrap();
+        }
+        let llama_server_binary = bin_dir.join("llama-server.exe");
+        let env_vars = [("PATH", OsString::new())];
+
+        assert!(rocm_backend_resolves_with_vars(
+            &llama_server_binary,
+            &env_vars
+        ));
+
+        fs::remove_file(bin_dir.join("hipblas.dll")).unwrap();
+        assert!(!rocm_backend_resolves_with_vars(
+            &llama_server_binary,
+            &env_vars
+        ));
+    }
+
+    #[test]
+    fn windows_backend_resolves_requires_every_dll_present_across_search_dirs() {
+        // Runs on every target (see windows_backend_resolves's cfg), so this --
+        // unlike rocm_backend_resolves_requires_every_dll_present above -- also
+        // exercises the DLL-presence verification on the ordinary Linux CI lane.
+        let root = scratch_dir("windows-backend-resolves");
+        let backend_dir = root.join("backend");
+        let path_dir = root.join("path-entry");
+        fs::create_dir_all(&backend_dir).unwrap();
+        fs::create_dir_all(&path_dir).unwrap();
+        fs::write(backend_dir.join("ggml-hip.dll"), b"x").unwrap();
+        fs::write(backend_dir.join("amdhip64_7.dll"), b"x").unwrap();
+        fs::write(path_dir.join("hipblas.dll"), b"x").unwrap();
+        fs::write(path_dir.join("rocblas.dll"), b"x").unwrap();
+        fs::write(path_dir.join("hsa-runtime64.dll"), b"x").unwrap();
+
+        let search_dirs = [backend_dir.clone(), path_dir.clone()];
+        assert!(windows_backend_resolves(&backend_dir, &search_dirs));
+
+        fs::remove_file(path_dir.join("hipblas.dll")).unwrap();
+        assert!(!windows_backend_resolves(&backend_dir, &search_dirs));
     }
 
     #[test]

@@ -35,17 +35,19 @@ unsupported. rocm-cli does not use a CPU fallback for this path.
 ## Lemonade backend alignment on engine install
 
 Lemonade's `resources/backend_versions.json` pins which ROCm SDK version its
-`llamacpp:rocm` backend downloads. On Linux/WSL, `rocm engines install
-lemonade` attempts to rewrite that pin to match the active ROCm SDK so the
-backend it installs is paired with the SDK actually in use, rather than
+`llamacpp:rocm` backend downloads. On Linux/WSL and Windows, `rocm engines
+install lemonade` attempts to rewrite that pin to match the active ROCm SDK so
+the backend it installs is paired with the SDK actually in use, rather than
 whatever version Lemonade shipped pinned to. The attempt is skipped outright
-on native Windows, left alone when the active SDK reports a nightly version
-rather than a plain `X.Y.Z` the alignment can match against (or no active SDK
-version can be determined at all, or Lemonade's packaged pin can't be read),
-skipped when the pin already matches the active version, and skipped on a
-host where Lemonade would select `llamacpp:vulkan` instead of `llamacpp:rocm`
-regardless (WSL2 being the documented case, and also the fallback if that
-probe itself fails), since no rewrite can make an unsupported ROCm build
+on any other OS, where no mechanism exists to verify whether a backend
+actually resolves its ROCm libraries, left alone when the active SDK reports
+a nightly version rather than a plain `X.Y.Z` the alignment can match against
+(or no active SDK version can be determined at all, or Lemonade's packaged
+pin can't be read), skipped when the pin already matches the active version,
+and skipped on a host where Lemonade would select `llamacpp:vulkan` instead of
+`llamacpp:rocm` regardless (WSL2 being the documented case, and also the
+fallback if that probe itself fails), since no rewrite can make an
+unsupported ROCm build
 resolve there.
 
 The rewrite tries two builds in order. The first keeps Lemonade's own pinned
@@ -91,12 +93,16 @@ The same output is available in the TUI with `/engine`.
 Installer policy:
 
 - `install.sh` and `install.ps1` update only the rocm-cli binary install
-  directory and its `.rocm-cli-manifest`.
+  directory (its binaries, `.rocm-cli-manifest`, and the `.rocm-cli-path-edit`
+  record of the `PATH` change they made) and that `PATH` change itself: a
+  marked block in the shell profile, or the user `PATH` on Windows.
 - External plugins under the rocm-cli data directory are not touched by
   install or upgrade.
 - `rocm uninstall` removes the data directory by default. Use
-  `rocm uninstall --keep-data` when external plugins, managed runtimes,
-  service records, or model cache entries should be preserved.
+  `rocm uninstall --keep-data --keep-config` when external plugins, managed
+  runtimes, service records, or model cache entries should be preserved. On the
+  default layout the configuration and data directories are the same
+  directory, so both flags are needed.
 
 No fallback engine is selected automatically. If an engine adapter is missing
 or cannot satisfy the requested device policy, the command must fail until the

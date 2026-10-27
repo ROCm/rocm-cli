@@ -21,7 +21,7 @@ use std::time::Duration;
 use crate::runtime::{
     managed_tools_dir, managed_uv_cache_dir, runtime_is_windows, runtime_os_name,
 };
-use crate::{AppPaths, download_file_to_path, unix_time_millis};
+use crate::{AppPaths, FileLock, download_file_to_path, unix_time_millis};
 
 /// Default network timeout, in seconds, applied to `uv` HTTP operations.
 pub const DEFAULT_UV_TIMEOUT_SECS: u64 = 600;
@@ -194,10 +194,16 @@ pub fn uv_pip_install_base(venv_python: &Path) -> Vec<String> {
 }
 
 /// Arguments for `uv pip freeze` targeting the interpreter `venv_python`.
+///
+/// `--color never`, same as its sibling [`uv_pip_check_args`]: this output is parsed too,
+/// and a `FORCE_COLOR`/`CLICOLOR_FORCE` escape prefix would break the `name==version`
+/// line parsing just as it would break the check parsing there.
 pub fn uv_pip_freeze_args(venv_python: &Path) -> Vec<String> {
     vec![
         "pip".to_owned(),
         "freeze".to_owned(),
+        "--color".to_owned(),
+        "never".to_owned(),
         "--python".to_owned(),
         venv_python.to_string_lossy().into_owned(),
     ]
@@ -395,6 +401,9 @@ fn parse_dependency_violations(stderr: &str) -> Vec<DependencyViolation> {
 
 /// Ensure a usable `uv` binary is available, downloading and caching one if needed.
 /// Returns the path to the executable.
+///
+/// A binary named by [`UV_BINARY_ENV`] is returned as-is: it is the user's, so it is
+/// never locked, downloaded over, or replaced.
 pub fn ensure_uv_binary(paths: &AppPaths) -> Result<PathBuf> {
     if let Some(path) = uv_binary_override() {
         return Ok(path);
@@ -402,40 +411,109 @@ pub fn ensure_uv_binary(paths: &AppPaths) -> Result<PathBuf> {
 
     let version = uv_version();
     let asset = uv_asset_name()?;
-    let install_dir = managed_tools_dir(&paths.data_dir)
-        .join("uv")
-        .join(slug(&version));
+    let url = uv_download_url(&version, &asset);
+    install_managed_uv(
+        paths,
+        &ManagedUvRelease {
+            version,
+            asset,
+            url,
+        },
+    )
+}
+
+/// Which `uv` release to install, resolved from the environment by
+/// [`ensure_uv_binary`] so the install itself never reads it.
+struct ManagedUvRelease {
+    version: String,
+    asset: String,
+    url: String,
+}
+
+/// Return the managed `uv` for `release`, downloading and publishing it first if no
+/// usable copy is installed.
+///
+/// Several `rocm` processes can need `uv` at once on a fresh machine (`rocm install
+/// sdk` alongside a vLLM or ComfyUI install, say). The download, extract and publish
+/// therefore run under a per-version [`FileLock`], and the installed copy is checked
+/// again once the lock is held: a process that waited behind another one's install
+/// reuses that result instead of downloading again and deleting the copy the first
+/// process has just handed to its caller. The unlocked check before it keeps the
+/// common already-installed case lock-free.
+///
+/// The lock is a leaf: nothing below acquires another lock, so it cannot take part in
+/// a lock-order inversion with the managed-launch or daemon-autostart locks.
+fn install_managed_uv(paths: &AppPaths, release: &ManagedUvRelease) -> Result<PathBuf> {
+    let uv_root = managed_tools_dir(&paths.data_dir).join("uv");
+    let version_slug = slug(&release.version);
+    let install_dir = uv_root.join(&version_slug);
     let binary_name = uv_binary_name();
 
-    if let Some(existing) = find_binary_in(&install_dir, binary_name)
-        && uv_binary_is_usable(&existing)
-    {
+    if let Some(existing) = usable_uv_in(&install_dir, binary_name) {
         return Ok(existing);
     }
 
-    let url = uv_download_url(&version, &asset);
+    let _install_lock = FileLock::acquire(uv_install_lock_path(&uv_root, &version_slug))?;
+    if let Some(existing) = usable_uv_in(&install_dir, binary_name) {
+        return Ok(existing);
+    }
+    #[cfg(test)]
+    test_hooks::before_download(&install_dir);
+
+    let ManagedUvRelease {
+        version,
+        asset,
+        url,
+    } = release;
     let archive_path = paths
         .cache_dir
         .join("tools")
         .join("uv")
-        .join(slug(&version))
-        .join(&asset);
+        .join(&version_slug)
+        .join(asset);
     eprintln!("Downloading uv ({version}) from {url}");
     download_file_to_path(
-        &url,
+        url,
         &archive_path,
         Duration::from_secs(uv_http_timeout_secs()),
     )
     .with_context(|| format!("failed to download uv from {url}"))?;
 
-    let staging = install_dir.with_extension(format!("tmp-{}", unix_time_millis()));
+    let staging = uv_staging_dir(&uv_root, &version_slug);
     let _ = std::fs::remove_dir_all(&staging);
     std::fs::create_dir_all(&staging)
         .with_context(|| format!("failed to create {}", staging.display()))?;
-    extract_archive(&archive_path, &staging)
+    let published = publish_staged_uv(&archive_path, &staging, &install_dir, binary_name);
+    if published.is_err() {
+        let _ = std::fs::remove_dir_all(&staging);
+    }
+    let binary = published?;
+
+    let manifest = ManagedUvManifest {
+        version: version.clone(),
+        asset: asset.clone(),
+        source_url: url.clone(),
+        executable: binary.clone(),
+        installed_at_unix_ms: unix_time_millis(),
+    };
+    write_uv_manifest(paths, &manifest);
+    let _ = std::fs::remove_file(&archive_path);
+
+    Ok(binary)
+}
+
+/// Extract `archive_path` into `staging`, then move it into place as `install_dir`.
+/// The caller must hold the install lock: the publish replaces whatever is there.
+fn publish_staged_uv(
+    archive_path: &Path,
+    staging: &Path,
+    install_dir: &Path,
+    binary_name: &str,
+) -> Result<PathBuf> {
+    extract_archive(archive_path, staging)
         .with_context(|| format!("failed to extract uv archive {}", archive_path.display()))?;
 
-    let staged_binary = find_binary_in(&staging, binary_name).with_context(|| {
+    let staged_binary = find_binary_in(staging, binary_name).with_context(|| {
         format!(
             "uv archive {} did not contain a `{binary_name}` executable",
             archive_path.display()
@@ -443,17 +521,17 @@ pub fn ensure_uv_binary(paths: &AppPaths) -> Result<PathBuf> {
     })?;
     make_executable(&staged_binary)?;
 
-    let _ = std::fs::remove_dir_all(&install_dir);
+    let _ = std::fs::remove_dir_all(install_dir);
     if let Some(parent) = install_dir.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    std::fs::rename(&staging, &install_dir).or_else(|_| {
-        let _ = std::fs::remove_dir_all(&install_dir);
-        std::fs::rename(&staging, &install_dir)
+    std::fs::rename(staging, install_dir).or_else(|_| {
+        let _ = std::fs::remove_dir_all(install_dir);
+        std::fs::rename(staging, install_dir)
     })?;
 
-    let binary = find_binary_in(&install_dir, binary_name).with_context(|| {
+    let binary = find_binary_in(install_dir, binary_name).with_context(|| {
         format!(
             "uv executable missing after install at {}",
             install_dir.display()
@@ -462,18 +540,73 @@ pub fn ensure_uv_binary(paths: &AppPaths) -> Result<PathBuf> {
     if !uv_binary_is_usable(&binary) {
         bail!("downloaded uv at {} is not runnable", binary.display());
     }
-
-    let manifest = ManagedUvManifest {
-        version,
-        asset,
-        source_url: url,
-        executable: binary.clone(),
-        installed_at_unix_ms: unix_time_millis(),
-    };
-    write_uv_manifest(paths, &manifest);
-    let _ = std::fs::remove_file(&archive_path);
-
     Ok(binary)
+}
+
+/// The installed `uv` in `install_dir`, if there is one and it runs.
+fn usable_uv_in(install_dir: &Path, binary_name: &str) -> Option<PathBuf> {
+    find_binary_in(install_dir, binary_name).filter(|binary| uv_binary_is_usable(binary))
+}
+
+/// The lock serializing installs of one `uv` version: `tools/uv/<version>.lock`, a
+/// sibling of the version directory rather than a file inside it, because the publish
+/// deletes and replaces that directory.
+fn uv_install_lock_path(uv_root: &Path, version_slug: &str) -> PathBuf {
+    uv_root.join(format!("{version_slug}.lock"))
+}
+
+/// A fresh staging directory beside the version directory. The name is appended to
+/// the version rather than built with `Path::with_extension`, which would read a dotted
+/// version such as `0.5.1` as having the extension `1` and drop it.
+fn uv_staging_dir(uv_root: &Path, version_slug: &str) -> PathBuf {
+    uv_root.join(format!(
+        "{version_slug}.tmp-{}-{}",
+        std::process::id(),
+        unix_time_millis()
+    ))
+}
+
+#[cfg(test)]
+mod test_hooks {
+    //! A seam for forcing interleavings in [`super::install_managed_uv`]'s tests.
+
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex, PoisonError};
+
+    type Hook = Arc<dyn Fn() + Send + Sync>;
+
+    static BEFORE_DOWNLOAD: Mutex<Vec<(PathBuf, Hook)>> = Mutex::new(Vec::new());
+
+    /// Run `hook` whenever an install into `install_dir` has committed to
+    /// downloading. Keyed by directory so concurrent tests do not see each other's.
+    #[cfg_attr(not(unix), allow(dead_code))] // its only user is a unix-only test
+    pub(super) fn set_before_download(install_dir: &Path, hook: Hook) {
+        BEFORE_DOWNLOAD
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((install_dir.to_path_buf(), hook));
+    }
+
+    #[cfg_attr(not(unix), allow(dead_code))] // its only user is a unix-only test
+    pub(super) fn clear_before_download(install_dir: &Path) {
+        BEFORE_DOWNLOAD
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|(dir, _)| dir != install_dir);
+    }
+
+    pub(super) fn before_download(install_dir: &Path) {
+        let hooks: Vec<Hook> = BEFORE_DOWNLOAD
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter(|(dir, _)| dir == install_dir)
+            .map(|(_, hook)| Arc::clone(hook))
+            .collect();
+        for hook in hooks {
+            hook();
+        }
+    }
 }
 
 fn uv_binary_override() -> Option<PathBuf> {
@@ -558,6 +691,12 @@ fn find_binary_in(dir: &Path, name: &str) -> Option<PathBuf> {
     None
 }
 
+// Off unix the body is a no-op, so Clippy's nursery `missing_const_for_fn`
+// fires there — but this is one function with `#[cfg]` blocks inside, not a
+// cfg-split pair, and the unix arm calls `set_permissions`, which is not
+// const. Making it `const` to satisfy the Windows lint would stop the unix
+// build compiling.
+#[allow(clippy::missing_const_for_fn)]
 fn make_executable(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
@@ -650,6 +789,23 @@ mod tests {
         assert_eq!(
             args,
             vec!["venv", "--python", "/py/bin/python3", "/envs/run"]
+        );
+    }
+
+    #[test]
+    fn pip_freeze_args_target_venv_python_and_disable_color() {
+        let args = uv_pip_freeze_args(Path::new("/envs/run/bin/python"));
+        assert_eq!(
+            args,
+            vec![
+                "pip",
+                "freeze",
+                "--color",
+                "never",
+                "--python",
+                "/envs/run/bin/python"
+            ],
+            "the output is parsed (name==version), so color must be off even under FORCE_COLOR"
         );
     }
 
@@ -969,5 +1125,364 @@ All installed packages are compatible
             ("2.11.0", Some("rocm7.13.0"))
         );
         assert_eq!(split_local_version("2.11.0"), ("2.11.0", None));
+    }
+
+    #[test]
+    fn staging_keeps_a_dotted_version_whole_and_is_unique_per_process() {
+        let root = Path::new("/data/tools/uv");
+        let staging = uv_staging_dir(root, "0.5.1");
+        let name = staging
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("utf-8 staging name");
+        assert_eq!(staging.parent(), Some(root));
+        assert!(
+            name.starts_with(&format!("0.5.1.tmp-{}-", std::process::id())),
+            "staging name `{name}` must keep the full version and carry the pid"
+        );
+        assert_eq!(
+            uv_install_lock_path(root, "0.5.1"),
+            root.join("0.5.1.lock"),
+            "the lock sits beside the version directory, not inside it"
+        );
+    }
+
+    /// Serves `body` to every `GET` until `stop` is set, counting the requests.
+    #[cfg(unix)]
+    fn spawn_counting_archive_server(
+        body: Vec<u8>,
+        requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> std::io::Result<(u16, std::thread::JoinHandle<()>)> {
+        use std::io::{Read, Write};
+        use std::sync::atomic::Ordering;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        listener.set_nonblocking(true)?;
+        let server = std::thread::spawn(move || {
+            while !stop.load(Ordering::SeqCst) {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                };
+                let _ = stream.set_nonblocking(false);
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    match stream.read(&mut buffer) {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => request.extend_from_slice(&buffer[..read]),
+                    }
+                }
+                requests.fetch_add(1, Ordering::SeqCst);
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(&body);
+                let _ = stream.flush();
+            }
+        });
+        Ok((port, server))
+    }
+
+    /// A `.tar.gz` holding `uv-test/uv`, a script that answers `--version`, laid out
+    /// the way a real uv release nests its binary.
+    #[cfg(unix)]
+    fn fake_uv_archive(fixture_dir: &Path) -> Result<Vec<u8>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tree = fixture_dir.join("tree");
+        let binary_dir = tree.join("uv-test");
+        std::fs::create_dir_all(&binary_dir)?;
+        let script = binary_dir.join("uv");
+        std::fs::write(&script, "#!/bin/sh\necho 'uv 0.0.0-test'\n")?;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
+        let archive = fixture_dir.join("uv-test.tar.gz");
+        let status = Command::new("tar")
+            .arg("-czf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&tree)
+            .arg("uv-test")
+            .status()?;
+        anyhow::ensure!(
+            status.success(),
+            "tar failed to build the fixture: {status}"
+        );
+        Ok(std::fs::read(&archive)?)
+    }
+
+    // Unix-only: the fake `uv` is a shell script, and Windows can only run a real
+    // executable as `uv.exe`. The lock and the re-check under test are
+    // platform-independent.
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_bootstraps_share_one_download_and_both_get_a_usable_uv() -> Result<()> {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::{Arc, Barrier, Condvar, Mutex};
+
+        let (root, paths) = crate::test_support::temp_app_paths("uv-concurrent-bootstrap");
+        let body = fake_uv_archive(&root.join("fixture"))?;
+        let requests = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (port, server) =
+            spawn_counting_archive_server(body, Arc::clone(&requests), Arc::clone(&stop))?;
+        // A dotted version, so the staging and lock names are exercised on the shape
+        // `with_extension` used to mangle.
+        let release = Arc::new(ManagedUvRelease {
+            version: "9.9.9".to_owned(),
+            asset: "uv-test.tar.gz".to_owned(),
+            url: format!("http://127.0.0.1:{port}/uv-test.tar.gz"),
+        });
+        let uv_root = managed_tools_dir(&paths.data_dir).join("uv");
+        let install_dir = uv_root.join("9.9.9");
+
+        // Rendezvous at the point an install commits to downloading: each arrival
+        // waits for the other bootstrap to get there too, up to a deadline. With the
+        // lock the second one is held outside until the first publishes, so the
+        // first waits out the deadline alone and the second then finds its result.
+        // Without the lock (or without the re-check under it) both arrive and both
+        // download — deterministically, rather than only when the scheduler
+        // happens to overlap them.
+        let arrivals = Arc::new((Mutex::new(0_usize), Condvar::new()));
+        let hook_arrivals = Arc::clone(&arrivals);
+        test_hooks::set_before_download(
+            &install_dir,
+            Arc::new(move || {
+                let (count, arrived) = &*hook_arrivals;
+                let mut count = count.lock().expect("arrivals lock");
+                *count += 1;
+                arrived.notify_all();
+                let _ = arrived
+                    .wait_timeout_while(count, Duration::from_secs(2), |count| *count < 2)
+                    .expect("arrivals wait");
+            }),
+        );
+
+        let start = Arc::new(Barrier::new(2));
+        // Collected on purpose: joining the lazy iterator would spawn and join one
+        // thread at a time, and the bootstraps would never overlap.
+        #[allow(clippy::needless_collect)]
+        let bootstraps: Vec<_> = (0..2)
+            .map(|_| {
+                let paths = paths.clone();
+                let release = Arc::clone(&release);
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    install_managed_uv(&paths, &release)
+                })
+            })
+            .collect();
+        let results: Vec<Result<PathBuf>> = bootstraps
+            .into_iter()
+            .map(|handle| handle.join().expect("bootstrap thread"))
+            .collect();
+
+        test_hooks::clear_before_download(&install_dir);
+        stop.store(true, Ordering::SeqCst);
+        server.join().expect("server thread");
+        let leftovers: Vec<String> = std::fs::read_dir(&uv_root)?
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name != "9.9.9" && name != "9.9.9.lock")
+            .collect();
+        let downloads = requests.load(Ordering::SeqCst);
+        let binaries = results
+            .into_iter()
+            .collect::<Result<Vec<_>>>()
+            .context("both concurrent bootstraps must succeed");
+        let usable: Vec<bool> = binaries
+            .iter()
+            .flatten()
+            .map(|binary| uv_binary_is_usable(binary))
+            .collect();
+        let _ = std::fs::remove_dir_all(&root);
+
+        let binaries = binaries?;
+        for binary in &binaries {
+            assert!(binary.starts_with(&install_dir), "{}", binary.display());
+        }
+        assert_eq!(usable, [true, true], "each returned uv must still run");
+        assert_eq!(binaries[0], binaries[1], "both must get the same uv");
+        assert_eq!(
+            downloads, 1,
+            "the second bootstrap must reuse the first one's install, not download again"
+        );
+        assert!(
+            leftovers.is_empty(),
+            "staging debris left behind: {leftovers:?}"
+        );
+        Ok(())
+    }
+}
+
+/// Property tests for the `uv` bootstrap archive, judged on the filesystem by
+/// `crate::archive_props`. Extraction here is the system `tar` resolved from
+/// `PATH`, so these exercise the host's `tar` (GNU tar on the Linux CI
+/// runners) through `extract_archive`.
+#[cfg(all(test, unix))]
+mod archive_properties {
+    use std::path::Path;
+
+    use super::{extract_archive, find_binary_in, make_executable, uv_binary_name};
+    use crate::archive_props::{
+        ESCAPES_ONLY, Entry, Expect, Kind, Layout, Modes, OUTSIDE_TOKEN, concretize, entries,
+        naive_sanitizing_unpack, naive_unpack, note_mode_scope, run_case, run_property,
+        run_round_trip, tar_gz_bytes,
+    };
+
+    fn property(
+        label: &str,
+        expect: Expect,
+        extract: fn(&Path, &Path) -> anyhow::Result<()>,
+    ) -> Result<(), String> {
+        note_mode_scope(label, expect.modes);
+        run_property(label, 256, entries(), Some(5), |layout, entries| {
+            run_case(
+                layout,
+                "archive.tar.gz",
+                &tar_gz_bytes(entries),
+                &[&layout.dest],
+                &layout.dest,
+                |layout, archive| extract(archive, &layout.dest),
+            )
+            .judge(expect)
+        })
+    }
+
+    #[test]
+    fn uv_archive_extraction_never_writes_outside_the_staging_dir() {
+        property("uv", ESCAPES_ONLY, extract_archive).unwrap();
+    }
+
+    /// The other direction: a well-formed archive is extracted in full, into
+    /// the staging directory it was given. An extraction that wrote somewhere
+    /// else entirely (no `-C`) escapes the oracle above; this catches it.
+    #[test]
+    fn uv_archive_extraction_extracts_a_benign_archive_into_the_staging_dir() {
+        run_round_trip("uv-benign", |layout, entries| {
+            let archive = layout.base.join("archive.tar.gz");
+            std::fs::write(&archive, tar_gz_bytes(entries))?;
+            extract_archive(&archive, &layout.dest)?;
+            Ok(layout.dest.join("top"))
+        })
+        .unwrap();
+    }
+
+    /// The system `tar` drops setuid/setgid and applies the umask only for an
+    /// unprivileged user, so this is judged only there (see `Modes`).
+    #[test]
+    fn uv_archive_extraction_leaves_no_setuid_or_world_writable_entry() {
+        property(
+            "uv-modes",
+            Expect {
+                modes: Modes::SafeUnlessRoot,
+                no_outward_links: false,
+            },
+            extract_archive,
+        )
+        .unwrap();
+    }
+
+    /// Unpack a one-off archive into the layout's staging dir and run the
+    /// lookup-and-chmod half of `ensure_uv_binary` on it.
+    fn stage_and_locate(layout: &Layout, entries: &[Entry]) -> Option<std::path::PathBuf> {
+        let archive = layout.base.join("uv.tar.gz");
+        std::fs::write(&archive, tar_gz_bytes(&concretize(entries, layout))).unwrap();
+        extract_archive(&archive, &layout.dest).unwrap();
+        let binary = find_binary_in(&layout.dest, uv_binary_name())?;
+        let _ = make_executable(&binary);
+        Some(binary)
+    }
+
+    /// Known defect: `find_binary_in` tests `is_file`/`is_dir`, which follow
+    /// symlinks, and `make_executable` then chmods whatever was found. An
+    /// archive whose `uv` entry is a symlink to a file outside the staging
+    /// directory gets that outside file chmodded to 0755 — the system `tar`
+    /// recreates the symlink as archived, so nothing upstream of the lookup
+    /// stops it.
+    #[test]
+    #[ignore = "known defect: uv binary lookup follows symlinks out of the staging dir (#522)"]
+    fn uv_binary_lookup_never_chmods_a_file_outside_staging() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let layout = Layout::new();
+        let sentinel = layout.outside.join("sentinel");
+        std::fs::set_permissions(&sentinel, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let entries = [Entry {
+            name: b"uv".to_vec(),
+            kind: Kind::Symlink(format!("{OUTSIDE_TOKEN}/sentinel").into_bytes()),
+            mode: 0o777,
+        }];
+        let found = stage_and_locate(&layout, &entries);
+        let mode = std::fs::metadata(&sentinel).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "a file outside staging was chmodded via {found:?} (now {mode:o})"
+        );
+    }
+
+    /// Known defect: the same link-following walk recurses through directory
+    /// symlinks with no depth bound and no cycle check, so two `-> .` links
+    /// make it branch at every level until the kernel's 40-hop symlink limit:
+    /// on the order of 2^40 directory reads. (A link to `/` instead walks the
+    /// whole host filesystem.) This runs the lookup on a worker thread and
+    /// fails if it has not returned in 20 s; the thread is leaked on failure.
+    #[test]
+    #[ignore = "known defect: uv binary lookup does not terminate on a symlink loop (#522)"]
+    fn uv_binary_lookup_terminates_on_a_symlink_loop() {
+        let layout = Layout::new();
+        let entries = [
+            Entry {
+                name: b"a".to_vec(),
+                kind: Kind::Symlink(b".".to_vec()),
+                mode: 0o777,
+            },
+            Entry {
+                name: b"b".to_vec(),
+                kind: Kind::Symlink(b".".to_vec()),
+                mode: 0o777,
+            },
+        ];
+        let archive = layout.base.join("uv.tar.gz");
+        std::fs::write(&archive, tar_gz_bytes(&entries)).unwrap();
+        extract_archive(&archive, &layout.dest).unwrap();
+        let staging = layout.dest;
+        let (done, wait) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done.send(find_binary_in(&staging, uv_binary_name()));
+        });
+        let result = wait.recv_timeout(std::time::Duration::from_secs(20));
+        assert!(
+            result.is_ok(),
+            "find_binary_in did not finish within 20 s on a two-link symlink loop"
+        );
+    }
+
+    /// Calibration: the same property over the same generator must catch an
+    /// extractor that joins raw names. If this starts passing, the generator
+    /// has stopped producing traversal names and every "no escape" result
+    /// above is meaningless.
+    #[test]
+    fn generator_catches_a_traversing_extractor() {
+        let error = property("naive", ESCAPES_ONLY, naive_unpack)
+            .expect_err("an extractor that honours `..` must be caught");
+        // Caught for a write outside the root (an escape, not a harness
+        // failure or a link the escape check does not judge).
+        assert!(error.contains("outside the root: "), "{error}");
+    }
+
+    /// Calibration for the two-step link shape: an extractor that sanitises
+    /// every name but follows a symlink an earlier entry planted is only
+    /// caught if the generator really emits "link, then write through it".
+    #[test]
+    fn generator_catches_a_link_following_extractor() {
+        let error = property("naive-links", ESCAPES_ONLY, naive_sanitizing_unpack)
+            .expect_err("an extractor that writes through planted links must be caught");
+        assert!(error.contains("outside the root: "), "{error}");
     }
 }

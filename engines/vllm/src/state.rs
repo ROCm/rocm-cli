@@ -17,10 +17,13 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::process::ServeHttpRequest;
+use crate::ServeHttpRequest;
 use crate::runtime::VllmRuntime;
 
 const HEALTHCHECK_TIMEOUT_MS: u64 = 700;
+/// Maximum bytes to read from the end of a log file when extracting tail lines.
+/// Prevents reading entire gigabyte-sized logs on startup timeout.
+pub(crate) const MAX_TAIL_READ: u64 = 4 * 1024 * 1024; // 4MB
 
 #[derive(Debug, Clone)]
 pub(crate) struct ServiceFiles {
@@ -97,7 +100,7 @@ pub(crate) fn logs_response(request: LogsRequest) -> Result<LogsResponse> {
     Ok(LogsResponse {
         log_path: files.log_path.display().to_string(),
         recent_lines: if files.log_path.is_file() {
-            crate::process::tail_lines(&files.log_path, limit)?
+            rocm_core::tail_lines(&files.log_path, limit, MAX_TAIL_READ)?
         } else {
             Vec::new()
         },
@@ -116,11 +119,25 @@ pub(crate) fn service_files(service_id: &str) -> Result<ServiceFiles> {
     })
 }
 
+/// Assembles the JSON payload persisted as a running service's state and
+/// writes it. Kept here, paired with the readers that reconstruct the PID,
+/// process identity, and endpoint from it ([`pid_from_state`],
+/// [`identity_from_state`], [`endpoint_url_from_state`]) and with
+/// [`write_terminal_state`] — `engines/lemonade/src/state.rs`'s
+/// `write_running_state` pairs with matching readers, though lemonade has no
+/// `pid_from_state`, and its `write_terminal_state` counterpart is
+/// `mark_json_status`. The `VllmRuntime`-derived fields come from
+/// `crate::runtime`, never from `process.rs`, so this module still never
+/// reaches back into it.
 pub(crate) fn write_running_state(
     request: &ServeHttpRequest,
     runtime: &VllmRuntime,
     pid: u32,
 ) -> Result<()> {
+    // Kernel start-time of the launcher PID, captured while it is alive. Paired
+    // with `pid`, it identifies this exact process across PID recycling so a
+    // later stop never signals a reused PID.
+    let start_ticks = rocm_core::process_start_ticks(pid);
     write_state(
         &request.state_path,
         &json!({
@@ -139,34 +156,16 @@ pub(crate) fn write_running_state(
             "runtime_executable": runtime.command,
             "server_pid": pid,
             "engine_recipe": request.engine_recipe,
-            "engine_recipe_required_flags": crate::process::engine_recipe_launch_args(request.engine_recipe.as_ref()),
-            "therock_runtime_env": therock_runtime_env_state(runtime),
+            "engine_recipe_required_flags": crate::engine_recipe_launch_args(request.engine_recipe.as_ref()),
+            "therock_runtime_env": crate::runtime::therock_runtime_env_payload(runtime),
             "started_at_unix_ms": current_unix_millis(),
-            // Kernel start-time of the launcher PID, captured while it is alive.
-            // Paired with `pid`, it identifies this exact process across PID
-            // recycling so a later stop never signals a reused PID.
-            "start_ticks": rocm_core::process_start_ticks(pid)
+            "start_ticks": start_ticks,
+            // `server_pid` is the same process, so the same token. `rocm-core`
+            // pairs `server_pid` with this key, so it must be written too —
+            // without it the server PID is adopted with no token at all.
+            "server_start_ticks": start_ticks
         }),
     )
-}
-
-fn therock_runtime_env_state(runtime: &VllmRuntime) -> Option<Value> {
-    let root = runtime.sdk_root.as_ref()?;
-    Some(json!({
-        "runtime_id": runtime.runtime_id,
-        "env_id": runtime.env_id,
-        "root": root.display().to_string(),
-        "bin": runtime.sdk_bin.as_ref().map(|path| path.display().to_string()),
-        "bin_paths": crate::process::runtime_bin_paths(runtime)
-            .into_iter()
-            .map(|path| path.display().to_string())
-            .collect::<Vec<_>>(),
-        "library_paths": crate::process::therock_library_path_entries(runtime)
-            .into_iter()
-            .map(|path| path.display().to_string())
-            .collect::<Vec<_>>(),
-        "source": runtime.source,
-    }))
 }
 
 pub(crate) fn write_terminal_state(state_path: &Path, status: &str) -> Result<()> {
@@ -187,6 +186,13 @@ pub(crate) fn read_service_state(path: &Path) -> Result<Value> {
     serde_json::from_str(&text).with_context(|| format!("failed to parse {}", path.display()))
 }
 
+/// Serializes `value` to `path` as pretty JSON, creating the parent directory
+/// if needed. The low-level primitive [`write_running_state`] and
+/// [`write_terminal_state`] both go through — it is not the only way this
+/// module's state files are written: inference-verification latches go
+/// through `rocm_core::merge_json_state_file` instead (see
+/// [`inference_verified`]), which patches the file directly rather than
+/// routing through here.
 fn write_state(path: &Path, value: &Value) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
@@ -299,10 +305,9 @@ pub(crate) fn current_unix_millis() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::process::ServeHttpRequest;
-    use crate::runtime::VllmRuntime;
-    use rocm_engine_protocol::DevicePolicy;
-    use std::io::{Read, Write};
+    use rocm_engine_protocol::{DevicePolicy, EngineRecipeHint};
+    use std::io::Read;
+    use std::io::Write;
 
     /// Answer `count` chat requests on a loopback port with the given status,
     /// reporting how many arrived.
@@ -335,11 +340,50 @@ mod tests {
         (port, handle)
     }
     fn probe_state_path(tag: &str) -> PathBuf {
+        // pid + time alone repeat when two threads of one test process ask for
+        // the same label in the same tick; the counter makes every call unique.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         std::env::temp_dir().join(format!(
-            "rocm-vllm-probe-{tag}-{}-{}.json",
+            "rocm-vllm-probe-{tag}-{}-{}-{}.json",
             std::process::id(),
-            current_unix_millis()
+            current_unix_millis(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ))
+    }
+    /// Call `make_path` from many threads at once and assert no two calls
+    /// returned the same path.
+    ///
+    /// Concurrent rather than sequential, because that is how tests call these
+    /// helpers: calls made one after another let the clock tick between them
+    /// and can pass by luck, while threads released together all read the same
+    /// millisecond, so a name keyed on pid and time alone repeats.
+    fn assert_each_call_gets_its_own_path(make_path: impl Fn() -> PathBuf + Sync) {
+        const CALLERS: usize = 16;
+        let start = std::sync::Barrier::new(CALLERS);
+        let paths: Vec<PathBuf> = std::thread::scope(|scope| {
+            let callers: Vec<_> = (0..CALLERS)
+                .map(|_| {
+                    scope.spawn(|| {
+                        start.wait();
+                        make_path()
+                    })
+                })
+                .collect();
+            callers
+                .into_iter()
+                .map(|caller| caller.join().expect("a caller panicked"))
+                .collect()
+        });
+        let distinct: std::collections::HashSet<_> = paths.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            CALLERS,
+            "two calls with one tag must not share a path"
+        );
+    }
+    #[test]
+    fn probe_state_path_gives_each_call_its_own_file_even_for_one_tag() {
+        assert_each_call_gets_its_own_path(|| probe_state_path("same-tag"));
     }
     #[test]
     fn inference_verification_latches_into_the_state_file() -> Result<()> {
@@ -436,12 +480,15 @@ mod tests {
         );
     }
     #[test]
-    fn running_state_records_managed_therock_env_for_gpu_verification() -> Result<()> {
-        let state_path = std::env::temp_dir().join(format!(
-            "rocm-vllm-state-{}-{}.json",
-            std::process::id(),
-            current_unix_millis()
-        ));
+    fn write_running_state_records_managed_therock_env_for_gpu_verification() -> Result<()> {
+        // Uses the test's own live PID rather than a fixed placeholder so that,
+        // on Linux, the `start_ticks` assertion below exercises the real
+        // `rocm_core::process_start_ticks` lookup rather than only checking
+        // the field is present. On other platforms `process_start_ticks` is a
+        // stub that always returns `None`, so there the assertion only checks
+        // `None == None`.
+        let own_pid = std::process::id();
+        let state_path = probe_state_path("therock-env");
         let request = ServeHttpRequest {
             service_id: "svc-vllm".to_owned(),
             model_ref: "facebook/opt-125m".to_owned(),
@@ -489,11 +536,18 @@ mod tests {
             rocm_sdk_version: None,
         };
 
-        write_running_state(&request, &runtime, 12345)?;
+        write_running_state(&request, &runtime, own_pid)?;
         let state = read_service_state(&state_path)?;
         fs::remove_file(&state_path).ok();
 
-        assert_eq!(state.get("server_pid").and_then(Value::as_u64), Some(12345));
+        assert_eq!(
+            state.get("server_pid").and_then(Value::as_u64),
+            Some(u64::from(own_pid))
+        );
+        assert_eq!(
+            state.get("service_id").and_then(Value::as_str),
+            Some("svc-vllm")
+        );
         assert_eq!(
             state.get("runtime_id").and_then(Value::as_str),
             Some("therock-release:gfx120X-all")
@@ -501,6 +555,20 @@ mod tests {
         assert_eq!(
             state.get("requested_runtime_id").and_then(Value::as_str),
             Some("runtime-key-gfx120x")
+        );
+        assert_eq!(
+            state.get("endpoint_url").and_then(Value::as_str),
+            Some("http://127.0.0.1:11439/v1")
+        );
+        assert_eq!(
+            state.get("env_id").and_then(Value::as_str),
+            Some("external-vllm-therock")
+        );
+        assert!(
+            state
+                .get("engine_recipe_required_flags")
+                .and_then(Value::as_array)
+                .is_some_and(Vec::is_empty)
         );
         let runtime_env = state
             .get("therock_runtime_env")
@@ -527,8 +595,104 @@ mod tests {
                 .and_then(Value::as_array)
                 .is_some_and(|paths| !paths.is_empty())
         );
-        // The identity token must be recorded so a later stop can verify it.
-        assert!(state.get("start_ticks").is_some());
+        // The identity token must be recorded so a later stop can verify it
+        // against the live process, not merely be present in the JSON — under
+        // both PID keys, since `server_pid` is the same process and is the
+        // one `rocm-core` adopts, together with `server_start_ticks`. The
+        // equality checks alone are a `None == None` trap if
+        // `process_start_ticks` ever regressed to always returning `None` on
+        // Linux, so also pin that a live PID actually has a token there.
+        #[cfg(target_os = "linux")]
+        assert!(
+            state
+                .get("server_start_ticks")
+                .and_then(Value::as_u64)
+                .is_some(),
+            "a live PID has a token on Linux"
+        );
+        assert_eq!(
+            state.get("start_ticks").and_then(Value::as_u64),
+            rocm_core::process_start_ticks(own_pid)
+        );
+        assert_eq!(
+            state.get("server_start_ticks").and_then(Value::as_u64),
+            rocm_core::process_start_ticks(own_pid)
+        );
+
+        // Round-trips through disk via `write_running_state` and
+        // `read_service_state`, then checks that the reader side
+        // (`identity_from_state`) reconstructs the PID this writer recorded —
+        // the contract the split between the two sides of this module depends
+        // on.
+        let identity = identity_from_state(&state).expect("identity");
+        assert_eq!(identity.pid, own_pid);
+        #[cfg(target_os = "linux")]
+        assert!(
+            identity.start_ticks.is_some(),
+            "a live PID has a token on Linux"
+        );
+        assert_eq!(
+            identity.start_ticks,
+            rocm_core::process_start_ticks(own_pid)
+        );
+        Ok(())
+    }
+    #[test]
+    fn write_running_state_forwards_engine_recipe_required_flags() -> Result<()> {
+        // The sibling therock-env test above always passes `engine_recipe: None`,
+        // so its `engine_recipe_required_flags` assertion (`is_some_and(Vec::is_empty)`)
+        // can't tell "the forwarding call was deleted" apart from "the forwarding
+        // call is present but handed an empty list" — both leave the key
+        // `Some([])`. This test uses a recipe with a non-empty `required_flags`
+        // so the assertion can only pass if the flags genuinely reach the state
+        // file.
+        let state_path = probe_state_path("recipe-flags");
+        let recipe = EngineRecipeHint {
+            contract_version: "1".to_owned(),
+            engine: crate::ENGINE_NAME.to_owned(),
+            required_flags: vec!["--enable-auto-tool-choice".to_owned()],
+            parser_settings: std::collections::BTreeMap::default(),
+            preferred_endpoint: None,
+            unsupported_combinations: Vec::new(),
+            notes: Vec::new(),
+        };
+        let request = ServeHttpRequest {
+            service_id: "svc-vllm-recipe".to_owned(),
+            model_ref: "facebook/opt-125m".to_owned(),
+            host: "127.0.0.1".to_owned(),
+            port: 11440,
+            device_policy: DevicePolicy::GpuRequired,
+            gpu_indices: Vec::new(),
+            runtime_id: Some("runtime-key-gfx120x".to_owned()),
+            env_id: None,
+            state_path: state_path.clone(),
+            log_path: None,
+            engine_recipe: Some(recipe),
+        };
+        let runtime = VllmRuntime {
+            runtime_id: "therock-release:gfx120X-all".to_owned(),
+            env_id: "external-vllm-therock".to_owned(),
+            command: PathBuf::from("vllm"),
+            python_executable: None,
+            version: Some("test".to_owned()),
+            source: "managed_runtime_manifest:test".to_owned(),
+            sdk_root: None,
+            sdk_bin: None,
+            sdk_bin_paths: Vec::new(),
+            sdk_library_paths: Vec::new(),
+            rocm_sdk_version: None,
+        };
+
+        write_running_state(&request, &runtime, std::process::id())?;
+        let state = read_service_state(&state_path)?;
+        fs::remove_file(&state_path).ok();
+
+        assert_eq!(
+            state
+                .get("engine_recipe_required_flags")
+                .and_then(Value::as_array),
+            Some(&vec![Value::String("--enable-auto-tool-choice".to_owned())])
+        );
         Ok(())
     }
     #[test]

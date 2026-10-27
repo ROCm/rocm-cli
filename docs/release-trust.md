@@ -47,12 +47,48 @@ python scripts/release_readiness.py \
 ```
 
 The verifier confirms each named archive has the required rocm-cli bundle
-files, confirms the `.sha256` sidecar matches the archive bytes and names the
-archive being published, and confirms a non-empty `.sig` sidecar exists when
-signatures are required. If a public key is provided with `--public-key`, it
-also verifies the detached signature with `openssl`. Release CI also enables
-`--require-rocm-asset-names`, which rejects branch-like, path-like, or
-otherwise unsupported archive names before upload.
+files, and confirms the `.sha256` sidecar matches the archive bytes and names
+the archive being published.
+
+`--require-signatures` requires signatures that *verify*, not merely exist: each
+archive must have a non-empty `.sig` sidecar, and that signature must check out
+against the release signing public key via `cargo xtask verify`. The key is
+taken from `--public-key` when given, then from the key file named by
+`ROCM_CLI_SIGNING_PUBLIC_KEY_PATH`, then from the inline
+`ROCM_CLI_SIGNING_PUBLIC_KEY_PEM` that release and nightly CI wire from the
+signing-key secret — the same path-before-PEM precedence `install.sh` applies to
+the public key, and `cargo xtask package` to the private one. If none resolves,
+the gate fails. It deliberately does
+not fall back to checking that a `.sig` file is present: a sidecar produced by
+the wrong key, truncated, or corrupted would pass such a check, and because an
+unset GitHub secret expands to the empty string, the fallback would be reached
+silently whenever the secret was removed or rotated away. The log line
+`signature verification key:` names the key the run actually used, and is
+printed as soon as the key resolves so that a run which then fails verification
+still records which trust root it used.
+
+Verification is driven by what the run asks for, not by what happens to be in
+the environment: `--require-signatures`, `--require-production-trust` or an
+explicit `--public-key` — or the environment equivalents of the first two,
+`ROCM_CLI_REQUIRE_SIGNATURE` and `ROCM_CLI_REQUIRE_PRODUCTION_TRUST`. The
+bundle-packaging steps set `ROCM_CLI_REQUIRE_SIGNATURE=1` on the step that runs
+the gate — "Package release bundle" and "Package Windows bundle" in
+[`release.yml`](../.github/workflows/release.yml), "Package nightly bundle" and
+"Package Windows bundle" in [`nightly.yml`](../.github/workflows/nightly.yml) —
+while production trust is set once at workflow level, from the
+`ROCM_CLI_REQUIRE_PRODUCTION_TRUST` repository variable in each file's top-level
+`env:` block. Note that exporting `ROCM_CLI_REQUIRE_SIGNATURE=1` for
+packaging therefore also requires a resolvable signing key, where before it
+needed only a `.sig`.
+Previously a key present in
+`ROCM_CLI_SIGNING_PUBLIC_KEY_PEM` was enough to opportunistically verify even
+without those flags; that trigger was removed when the flags began to imply
+verification, so a readiness run that asks for neither now checks neither
+signature presence nor validity. Every `release.yml` and `nightly.yml`
+invocation passes `--require-signatures`, so no workflow takes that path.
+
+Release CI also enables `--require-rocm-asset-names`, which rejects branch-like,
+path-like, or otherwise unsupported archive names before upload.
 
 Release CI also enables `--require-exact-assets`. That rejects stale
 publishable files in `dist`, including old `.tar.gz`/`.zip` archives and orphan
@@ -243,6 +279,93 @@ the override *logic* does not exist at all in a build without
 `e2e-test-hooks` — the accessor compiled in that configuration ignores the
 environment entirely and unconditionally returns the hardcoded default URL, so
 a stray environment variable can never redirect a production install.
+
+## Dashboard Test Clock File
+
+`rocm dash` checks for one test-only input that, unlike the override above, is
+**not** compiled out of release builds:
+
+```text
+<data dir>/telemetry/test-clock-offset
+```
+
+When the file exists, the embedded telemetry daemon takes its observation clock
+from the directive in it instead of wall time. That is deliberate: it lets the
+E2E suite drive the dashboard across metric-validity boundaries
+deterministically while testing the same binary that ships, rather than one
+built with a test-only feature.
+
+Nothing in rocm-cli creates this file; only the E2E harness plants it, inside
+its own isolated data root. If one is found, `rocm dash` logs a WARN naming the
+path. Its effect is not limited to displayed timestamps: the clock drives
+generation throughput, latency averages and metric freshness, and the
+timestamps written into persisted session records. To return to wall time,
+remove the file **and restart `rocm dash`** — the path is resolved once per
+launch, and deleting the file mid-run leaves the clock pinned at its last
+directive.
+
+The directive is an integer offset in seconds, `hold`, or `hold <int>`; it can
+skew telemetry but cannot select code or redirect a download. The data directory it lives in
+already holds the runtime registry and service records, so write access to it
+is already trusted.
+
+## Simulated Host Root
+
+rocm-cli decides what hardware it is running on by reading fixed host paths:
+`/dev/kfd`, the render nodes under `/dev/dri`, `/dev/dxg`, the KFD topology
+under `/sys/class/kfd`, the DRM cards under `/sys/class/drm`,
+`/sys/module/amdgpu` and its `version` file, `/proc/version`, `/proc/cpuinfo`,
+`/proc/meminfo`, `/proc/cmdline`, `/proc/modules`, `/proc/1/cgroup`, the
+container markers `/.dockerenv` and `/run/.containerenv`, the `/etc/os-release`
+(falling back to `/usr/lib/os-release` when absent, per `os-release(5)`) behind
+the distro fields and name `rocm examine` reports, the modprobe
+configuration directories `/etc/modprobe.d`, `/usr/lib/modprobe.d` and
+`/run/modprobe.d`, the WSL plumbing under `/usr/lib/wsl` (the `lib` directory and
+`lib/libdxcore.so`), and the WSL ROCDXG capability check, which looks for
+`lib/librocdxg.so` and `share/rocdxg/dids.conf` under `/opt/rocm` and under each
+discovered ROCm install. The E2E suite can point those reads at a directory it populated with a
+simulated host instead, but only in builds compiled with the `e2e-test-hooks`
+Cargo feature:
+
+```text
+ROCM_CLI_TEST_HOST_ROOT
+```
+
+Same model as the ComfyUI override above: in a build without
+`e2e-test-hooks`, `rocm_core::host_path` is the identity function and never
+reads the environment, so a release build always probes the real machine. The
+re-rooting changes only where the probes read; the CLI still names the logical
+path (`/dev/kfd`) when it reports a device. The dashboard test clock above is
+read from a state file by the same binary that ships, while this seam is
+compiled out; the difference is the one drawn there: the clock can skew
+telemetry but cannot select code or redirect a download, whereas a re-rooted
+hardware probe decides which plan runs against the real machine, so it must not
+exist in a shipped build.
+
+Some reads stay on the real machine even in a hook build:
+
+- ROCm install discovery itself. Which installs exist, and the paths and
+  versions `rocm examine` reports for them, always come from the real host: the
+  CLI prints those paths and can write them into a shell rc file. The one
+  re-rooted read under them is the ROCDXG file check above, which looks for its
+  two files under each discovered install's path inside the simulated root.
+- The `/usr/lib/wsl/lib` loader entry an engine is launched with, and programs
+  the probes execute, such as `ldconfig`.
+- Every package-manager plan, which reads the real `/etc/os-release` (with the
+  same `/usr/lib/os-release` fallback): the OpenMPI, libatomic and libnuma
+  install hints, and the driver, OpenMPI and runtime-library installs `rocm`
+  runs before serving. Their commands run against the real machine, so a
+  simulated host must not pick the distro they are built for.
+- Process liveness under `/proc/<pid>` and `/dev/shm` sizing. Both describe
+  this process's own environment, not the hardware.
+
+One check is routed but keeps the real device as a veto: the `rocm dash`
+pre-flight that decides whether to start `amd-smi`. Because it gates a real
+process, `amd-smi` runs only when both the real `/dev/kfd` and the simulated
+host's `/dev/kfd` are readable. A simulated host can hide the GPU from the
+dashboard, but cannot start `amd-smi` on a machine without one. On WSL the
+pre-flight still accepts the CLI's GPU-reachability verdict instead of a device
+node, as it always has, so the veto does not apply there.
 
 ## Remaining Owner Step
 

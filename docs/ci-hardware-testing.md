@@ -18,8 +18,38 @@ separate from the main `ci.yml`. The split is deliberate: a job queued on an
 newer run's merge-required (GitHub-hosted) checks would sit pending forever
 (observed on PR #138). Giving the self-hosted lanes their own workflow — and
 thus their own concurrency group — means an offline runner can only ever stall
-that workflow's own supersession, never `ci.yml`'s required checks. See
-`EAI-7548`.
+that workflow's own supersession, never `ci.yml`'s required checks (only
+pull-request runs are superseded there). See `EAI-7548`.
+[`workflow_contract.rs`](../xtask/src/workflow_contract.rs)'s
+`self_hosted_workflow_owns_the_gpu_lanes` test checks that `e2e-gpu`,
+`e2e-gpu-strix-ubuntu`, and `e2e-gpu-strix-windows` still appear as job keys in
+`e2e-selfhosted.yml`, while its sibling `ci_yml_schedules_no_self_hosted_job`
+asserts `ci.yml` has no `runs-on` carrying a self-hosted label, so a PR that
+moves one of these lanes back into `ci.yml` fails CI rather than merging
+unnoticed.
+
+## The three-stage validation ladder
+
+Three self-hosted GPU gates run at different points in a change's life. None
+are required-status checks (see "Blocking vs. non-blocking" below); what
+differs is when each runs and what hardware it covers.
+
+| Rung | Workflow | Trigger | Lanes | Blocks a merge/tag? |
+|---|---|---|---|---|
+| Per-PR smoke gate | `e2e-selfhosted.yml` | `push`/`pull_request`/`merge_group` (see "Triggers") | The self-hosted jobs in the Platforms table below (`e2e-gpu-strix-ubuntu` runs both its `[release, nightly]` channel legs per PR, ROCMAI-125) | No — absent from the required-status-check list |
+| Nightly coverage gate | `nightly.yml` | `schedule` (06:00 UTC daily) + `workflow_dispatch` | The same self-hosted platforms plus R9700 (`e2e-gpu-nightly-rad3`) and MI350P (`e2e-gpu-nightly-mi350p`), each run against both the `release` and `nightly` package channel (`strategy.matrix.channel: [release, nightly]`, ROCMAI-429) | No — not part of any PR or push-to-main event |
+| Release-candidate regression gate | `e2e-selfhosted.yml` | `push` to a `release/**` branch (ROCMAI-120/EAI-8761), ahead of cutting the `v*` tag `release.yml` publishes from | The same per-PR lanes | No — same non-required status as the per-PR gate; a hardware signal for whoever cuts the tag, not an automated block |
+
+R9700 and MI350P were dropped from the per-PR gate (ROCMAI-125): still
+covered, but off every PR's critical path, so they moved to the nightly-only
+rung instead of being removed outright.
+
+The release-candidate rung's `release/**` trigger merged in PR #415, so
+`e2e-selfhosted.yml` on `main` already triggers on `push: branches: [main,
+"release/**"]`. On that trigger, every self-hosted GPU job additionally pins
+`cargo xtask e2e-prewarm --release-label` to hold at `n-1`/`n-2` instead of
+always tracking the channel's latest build (ROCMAI-430; see "Triggers"
+below for the full `sdk_version: [current, n-1, n-2]` matrix mechanism).
 
 ## Platforms
 
@@ -36,8 +66,14 @@ separate tier flag or tag filter to maintain.
 | `e2e-gpu-strix-ubuntu` | `e2e-selfhosted.yml` | Strix Halo (gfx1151) on Ubuntu | self-hosted `[self-hosted, linux, devlab-dispatch, strix-halo]` |
 | `e2e-gpu-strix-windows` | `e2e-selfhosted.yml` | Strix Halo (gfx1151) on Windows 11 | self-hosted `[self-hosted, windows, devlab-dispatch, strix-halo]` |
 | `e2e-wsl` | `e2e-selfhosted.yml` | Strix Halo (gfx1151) on Ubuntu under WSL2 | self-hosted `[self-hosted, windows, devlab-dispatch, strix-halo]` |
-| `e2e-gpu-rad3` | `e2e-selfhosted.yml` | Radeon AI PRO R9700 (gfx1201) on Linux | self-hosted `[self-hosted, linux, r9700]` |
-| `e2e-gpu-mi350p` | `e2e-selfhosted.yml` | MI350P (AMD Instinct, gfx950) on Linux | self-hosted `[self-hosted, linux, mi350p]` |
+| `e2e-gpu-w7900` | `e2e-selfhosted.yml` | AMD Radeon PRO W7900 (gfx1100, 48GB) on Linux | self-hosted `[self-hosted, linux, w7900]` |
+
+`e2e-gpu-strix-ubuntu` additionally runs a `strategy.matrix.channel: [release,
+nightly]` axis — two concurrent legs on the same job, channel-suffixed
+artifact names — so the per-PR smoke gate proves the nightly channel boots on
+at least one platform without adding the axis (and its wall-clock cost) to
+every per-PR lane. This mirrors `nightly.yml`'s channel matrix from
+ROCMAI-429, applied to a single per-PR lane rather than all of them.
 
 All three Strix Halo lanes run on the AMD Ryzen DevLab Dispatch pool: a fresh
 runner is registered per job and destroyed after, opt-in only via the
@@ -53,20 +89,21 @@ against the slow DrvFs mount. The distro is deliberately left without ROCm's
 WSL driver bridge — see "What the WSL distro needs" below.
 
 This migration is scoped to the per-PR lanes in this table, plus the nightly
-WSL lane below — not every nightly lane. `nightly.yml`'s Ubuntu and Windows
-Strix lanes (`e2e-gpu-nightly-strix`, `e2e-gpu-nightly-strix-windows`) still
-pin the `native` label and run on the same static, always-on host these per-PR
-lanes moved off of — that label still means what it always did there:
-`native` disambiguates this host from any runner that might carry a bare
-`wsl` label alongside `strix-halo` (the static WSL runner this repo used
-before the WSL lanes below moved to the ephemeral pool). Whether that runner
-remains registered is not something this migration changes either way, since
-nothing here targets a `wsl`-labeled runner anymore. `nightly.yml`'s
-`e2e-wsl-nightly`, however, already moved onto the same DevLab Dispatch pool
-as the per-PR `e2e-wsl` lane above, for the same reason: WSL2 needs no
-dedicated `wsl`-labeled runner, so there is nothing pool-incompatible about
-it. Moving the two `native` nightly lanes onto the pool as well is a
-separate, not-yet-made decision.
+WSL and Windows Strix lanes below — not every nightly lane. `nightly.yml`'s
+Ubuntu Strix lane (`e2e-gpu-nightly-strix`) still pins the `native` label and
+runs on the same static, always-on host these per-PR lanes moved off of —
+that label still means what it always did there: `native` disambiguates this
+host from any runner that might carry a bare `wsl` label alongside
+`strix-halo` (the static WSL runner this repo used before the WSL lanes below
+moved to the ephemeral pool). Whether that runner remains registered is not
+something this migration changes either way, since nothing here targets a
+`wsl`-labeled runner anymore. `nightly.yml`'s `e2e-wsl-nightly` and
+`e2e-gpu-nightly-strix-windows`, however, both moved onto the same DevLab
+Dispatch pool as the per-PR `e2e-wsl`/`e2e-gpu-strix-windows` lanes above, for
+the same reason: neither needs a dedicated `native`- or `wsl`-labeled runner,
+so there is nothing pool-incompatible about either. Moving the remaining
+`native` Ubuntu nightly lane onto the pool as well is a separate, not-yet-made
+decision.
 
 Every label in a `runs-on` must narrow the pool to one kind of hardware. In
 particular the MI300X lane pins `mi300x` rather than `amd-gpu`: `amd-gpu` is
@@ -81,7 +118,7 @@ resolve to skip here, and known bugs resolve to xfail from
 `expectations.toml`. It is a required check and must stay green.
 
 The self-hosted jobs (`e2e-gpu`, `e2e-gpu-strix-ubuntu`, `e2e-gpu-strix-windows`,
-`e2e-wsl`, `e2e-gpu-rad3`, and `e2e-gpu-mi350p`) run on AMD GPU systems, so they
+`e2e-wsl`, and `e2e-gpu-w7900`) run on AMD GPU systems, so they
 exercise host/GPU detection, engine `detect`/`capabilities`, and live serving
 scenarios that the mock job cannot. GPU availability is advisory in the WSL lane, as
 described below.
@@ -140,36 +177,137 @@ not applicable, instead of failing them on a premise the host cannot meet.
 
 Each workflow has its own consolidated report job. `ci.yml`'s `e2e-report`
 covers the mock platform;
-`e2e-selfhosted.yml`'s `e2e-report` covers the GPU platforms;
-`nightly.yml`'s `e2e-report-nightly` covers the same platforms with the
-`@nightly` scenarios included. Each joins its platforms'
+`e2e-selfhosted.yml`'s `e2e-report` covers the per-PR GPU platforms;
+`nightly.yml`'s `e2e-report-nightly` covers a strict superset of those
+platforms (it also runs `e2e-gpu-rad3` and `e2e-gpu-mi350p`, demoted from
+per-PR to nightly-only per ROCMAI-125) with the `@nightly` scenarios
+included. Each joins its platforms'
 reports — including partial or failed runs — by scenario id into one HTML report
-and GitHub step summary.
+and GitHub step summary. Since ROCMAI-429 the report keys each column by
+`(platform_slug, channel)` rather than platform alone, so `nightly.yml`'s
+release/nightly channel matrix renders two columns per platform instead of
+one channel's result silently overwriting the other.
 
-The lane artifacts are named canonically (`e2e-report`, `e2e-gpu-report`,
-`e2e-gpu-rad3-report`, `e2e-gpu-mi350p-report`, `e2e-gpu-strix-ubuntu-report`,
-`e2e-gpu-strix-windows-report`, `e2e-gpu-strix-wsl-report`) in every workflow,
-because the report derives each platform's name and OS from the artifact name.
-An unrecognised name renders as a guessed platform on Linux, which would report
-a Windows lane as Linux; `xtask`'s
-`every_uploaded_e2e_artifact_has_a_name_the_report_can_label` guards against it.
+On `main`, the `publish-e2e-wiki` job in `nightly.yml` also copies the
+consolidated nightly matrix to the `E2E-Support-Matrix` page of the repository
+wiki, overwriting it each night (the page header names the run, commit and
+date). It skips cancelled runs and runs that consolidated no platforms. One-time
+setup: enable the wiki and save its first page in the GitHub web UI, because
+GitHub does not create the wiki's git repository until then and the job fails
+with that explanation until it exists.
+
+The lane artifacts are named canonically (`e2e-gpu-mi350p-report`,
+`e2e-gpu-n-1-report`, `e2e-gpu-n-2-report`, `e2e-gpu-rad3-report`,
+`e2e-gpu-report`, `e2e-gpu-strix-ubuntu-n-1-report`,
+`e2e-gpu-strix-ubuntu-n-2-report`, `e2e-gpu-strix-ubuntu-report`,
+`e2e-gpu-strix-windows-n-1-report`, `e2e-gpu-strix-windows-n-2-report`,
+`e2e-gpu-strix-windows-report`, `e2e-gpu-strix-wsl-n-1-report`,
+`e2e-gpu-strix-wsl-n-2-report`, `e2e-gpu-strix-wsl-report`,
+`e2e-gpu-w7900-n-1-report`, `e2e-gpu-w7900-n-2-report`,
+`e2e-gpu-w7900-report`, `e2e-report`) in `ci.yml` and
+`e2e-selfhosted.yml`, because the report derives each platform's name and OS
+from the artifact name. The `-n-1`/`-n-2` suffixes are the non-`current` legs
+of the per-PR `sdk_version` matrix (below, under "Triggers"); a `current`-leg
+artifact keeps its pre-matrix name unchanged. `rad3`/`mi350p` are nightly-only
+lanes (ROCMAI-125) and don't run that matrix, so they have no `-n-1`/`-n-2`
+entries. `nightly.yml`'s self-hosted lanes run a `channel:
+[release, nightly]` matrix and append the channel as the final segment before
+the `-report` affix (e.g. `e2e-gpu-strix-windows-nightly-report`); the report
+strips that segment before matching, so the platform/OS derivation is
+unaffected, and the channel itself is read from each artifact's
+`platform.json` (or, if absent, this suffix) to keep release and nightly runs
+of the same platform in separate columns. An unrecognised name renders as a
+guessed platform on Linux, which would report a Windows lane as Linux;
+`xtask`'s `every_uploaded_e2e_artifact_has_a_name_the_report_can_label` guards
+against it.
+
+## Engine is not an independently selectable axis
+
+None of the tables above vary the serve engine as a matrix dimension, because
+no workflow passes an explicit `--engine` or configures a `default_engine`,
+so hardware/OS is what drives the engine the E2E harness expects by default
+(`select_serve_engine` in [`serve_cmd.rs`](../apps/rocm/src/serve_cmd.rs)
+checks explicit/configured overrides first, then the GPU-family preference
+— but only if the model's recipe actually supports that engine — then the
+recipe's own first preferred engine, and finally the platform default).
+[`capability.rs`](../tests/e2e-cucumber/src/capability.rs)'s
+`effective_serve_engine()` predicts what `rocm serve` would pick with no
+`--engine` on a given host, re-implementing the product's
+`preferred_serve_engine_for_host_gpu_summary`:
+
+```rust
+pub fn effective_serve_engine(gfx_target: Option<&str>, os_family: &str) -> String {
+    if os_family.eq_ignore_ascii_case("windows") {
+        return "lemonade".to_owned();
+    }
+    if family_prefers_vllm(gfx_target) {
+        "vllm".to_owned()
+    } else {
+        "lemonade".to_owned()
+    }
+}
+```
+
+Any native Windows host resolves to `lemonade` (the vLLM adapter does not
+run there; WSL reports `os_family` `"linux"` and stays vLLM-eligible);
+otherwise `vllm` is only preferred for the `*-dcgpu` families and
+`gfx906`/`gfx908`/`gfx90a`. Consequences for the lanes above:
+
+- Strix Halo is `gfx1151` on every OS, so all three per-PR Strix lanes
+  (Ubuntu, Windows, WSL2) and their nightly counterparts are lemonade-only —
+  no matrix value turns a Strix lane into a vLLM lane.
+- `e2e-gpu` (MI300X) is the only per-PR lane where vLLM is the effective
+  engine.
+- Adding a vLLM lane to the default-engine lanes above means adding hardware
+  from a vLLM-eligible family, not adding an `engine:` value to a workflow
+  matrix. A scenario that needs a specific engine regardless of host pins it
+  instead with `@requires-engine:<vllm|lemonade>`, which skips where that
+  engine can't start.
 
 ## Triggers
 
 The GPU jobs (in `e2e-selfhosted.yml`) run automatically on `push`,
-`pull_request`, and `merge_group` when the workflow's own `changes` job's
-`serve` path filter is `true`. `push` fires on `main` and on any `release/**`
-branch, so pushing to a release branch runs the full self-hosted matrix ahead
-of cutting the `v*` tag that `release.yml` builds/publishes from — this is the
+`pull_request`, and `merge_group` (every GPU lane except MI300X, which is not
+required for merging and so is skipped in the merge queue rather than left
+queued on limited runner capacity after its PR has merged) when the workflow's
+own `changes` job's `serve` path filter is `true`. A new push to a pull request
+cancels that PR's older run; push, `merge_group` and manual runs each get a
+group of their own, so none is cancelled or replaced by another. The heavy
+`@merge-queue` serves therefore no longer run on MI300X, the only per-PR vLLM
+lane: they run only on the other lanes, and the only vLLM serve before a change
+lands is the per-PR canary (`serve-05`), which runs when the `serve` filter
+matches. `push` fires on `main` and on any `release/**` branch, so pushing to
+a release branch runs the full self-hosted matrix ahead of cutting the `v*` tag that `release.yml` builds/publishes from — this is the
 release-candidate regression gate; `pull_request` fires against any base
-branch. `serve` is narrower than `heavy`: it matches only
+branch.
+
+On a release-branch push, every self-hosted GPU job additionally expands into
+a `strategy.matrix.sdk_version` of `[current, n-1, n-2]` (ROCMAI-430) — three
+legs, each pinning `cargo xtask e2e-prewarm --release-label <leg>` to a
+different TheRock SDK version (`current` tracks the channel's latest;
+`n-1`/`n-2` pin the prior two released versions from
+[`xtask/src/rocm_releases.rs`](../xtask/src/rocm_releases.rs), a static table
+seeded from the official
+[release list](https://rocm.docs.amd.com/en/latest/release/versions.html)).
+Off a release-branch push the matrix resolves to `[current]` only, so an
+ordinary PR run is unaffected. Each leg uploads its own artifact (the
+`-n-1`/`-n-2` suffix above); the pre-warm's runtime-key design lets all three
+versions share one pre-warmed runtime tree rather than needing separate ones.
+`e2e-gpu-strix-ubuntu` layers this `sdk_version` axis alongside its
+pre-existing `channel` axis (ROCMAI-125) rather than replacing it, so a
+release-branch push runs all six `channel` × `sdk_version` combinations on
+that lane; `rad3`/`mi350p` are nightly-only (above) and don't run this matrix
+at all.
+
+`serve` is narrower than `heavy`: it matches only
 paths that can change serve *behaviour* or the GPU E2E harness (the engines, the
 serve code path in `apps/rocm`/`apps/rocmd`, `rocm-core`, the e2e-cucumber crate,
 plus broad-dependency safety nets), **not** a blanket `**/*.rs`. So a Rust change
 that cannot affect serving — e.g. a dashboard-only or unrelated-crate PR — skips
 the heavy GPU matrix, while compile coverage for every crate still runs on
 `ci.yml`'s always-on build/test lanes. Off `pull_request` (push/merge_group) the
-filter is forced `true`, so the full matrix always runs there. Unlike the
+filter is forced `true`, so the full matrix (minus MI300X in the merge queue)
+always runs there. Unlike the
 pre-split layout the GPU jobs do **not** gate on the hosted `build-and-test` job
 — cross-workflow `needs` is not possible, so each GPU job builds the `rocm`
 binary itself as its first real step (a broken build fails that job fast and
@@ -186,11 +324,11 @@ They can also be triggered manually via `e2e-selfhosted.yml`'s
 `workflow_dispatch`, independent of the `serve` gate, with these inputs:
 
 - `platform` (choice: `all`, `app-dev-gpu`, `strix-ubuntu`, `strix-windows`,
-  `strix-wsl`, `rad3`, `mi350p`) — which self-hosted job(s) to run. `app-dev-gpu`
+  `strix-wsl`, `w7900`) — which self-hosted job(s) to run. `app-dev-gpu`
   maps to `e2e-gpu`, `strix-ubuntu` to `e2e-gpu-strix-ubuntu`, `strix-windows` to
-  `e2e-gpu-strix-windows`, `strix-wsl` to `e2e-wsl`, `rad3` to
-  `e2e-gpu-rad3`, and `mi350p` to `e2e-gpu-mi350p`. (The mock lane has its own
-  `platform` input on `ci.yml`; it is not part of this workflow.)
+  `e2e-gpu-strix-windows`, `strix-wsl` to `e2e-wsl`, and `w7900` to
+  `e2e-gpu-w7900`. (The mock lane has its own `platform` input on `ci.yml`; it
+  is not part of this workflow.)
 - `name_filter` (string) — a scenario-name regex forwarded to the cucumber
   harness (`cargo xtask e2e -- --name <regex>`) so a dispatch can run a
   single scenario instead of the full suite. Empty runs everything applicable
@@ -210,7 +348,9 @@ gh workflow run e2e-selfhosted.yml --ref <ref> -f platform=app-dev-gpu
 Nearly every GPU serve scenario points its `data/runtimes` at one shared,
 pre-warmed managed runtime tree (`E2E_SHARED_RUNTIMES_DIR`), so a multi-GiB
 `rocm install sdk` happens once per runner instead of once per scenario. The tree
-lives on the runner's persistent workspace, survives `git clean`, and is namespaced
+lives on the runner's workspace — persistent across runs on the long-lived
+`native`-labeled hosts, rebuilt by the prewarm step below on each ephemeral
+DevLab Dispatch pool run — survives `git clean`, and is namespaced
 by source-layout generation (`e2e-prewarm-multi-arch-v2`) so a branch using a new
 package layout cannot poison the cache consumed by code that only understands the
 previous layout.
@@ -230,6 +370,11 @@ self-hosted lane calls:
 ```bash
 cargo xtask e2e-prewarm --channel release --prewarm-dir "$prewarm"
 ```
+
+(`e2e-gpu-strix-ubuntu`'s two channel-matrix legs pass `--channel ${{
+matrix.channel }}` instead, resolving to `release` or `nightly` per leg;
+every other lane is release-only and keeps the literal `--channel release`
+above.)
 
 before the suite. `rocm update` compares both the channel version and the wheel
 composition recorded in the runtime manifest (source-layout generation and exact
@@ -258,6 +403,10 @@ Pre-warm then:
 - prunes with `rocm storage remove-old-installs` after any install, update, or
   repair, so the multi-version cache stays bounded.
 
+The invocation above is what every lane in this tree runs today; see "The
+three-stage validation ladder" above for the pin status and the pending
+SDK-version-pin work (ROCMAI-430).
+
 The runtime is always installed **in place**: `install sdk` bakes absolute paths
 into the runtime manifest, so a tree that is moved after installation leaves every
 serve pointing at a path that no longer exists.
@@ -266,19 +415,35 @@ This replaced an existence-only guard that never reinstalled, which had frozen b
 MI300X runners on a 16-day-old runtime and left drift from a fresh install untested
 (`EAI-8057`). The decision logic lives in `xtask` rather than the workflows because
 the pre-warm block is duplicated across multiple jobs in two shells;
-`xtask/src/e2e_prewarm.rs` carries unit tests for each freshness verdict, and the
+[`xtask/src/e2e_prewarm.rs`](../xtask/src/e2e_prewarm.rs) carries unit tests for each freshness verdict, and the
 `runtime-update-reports-freshness` scenario pins the `rocm update` output shape those tests assume.
+
+A pre-warm invoked with `--version`/`--build-date` overrides most of the above: a
+pin opts out of following the channel index's latest entirely, so the
+update/reuse-at-latest logic above does not apply. `rocm update` always resolves
+a channel to the index's latest version and has no notion of "stay on the
+version I originally pinned," so a pinned run instead looks for an
+already-installed runtime whose key names that exact pin. It still self-heals
+that runtime's own stale composition via repair, but never follows
+`update`/`repair` toward the index's latest key, and installs a fresh
+side-by-side runtime only when no match is found. See
+[`decide()`](../xtask/src/e2e_prewarm.rs)'s doc comment for the full rationale.
 
 ## Blocking vs. non-blocking
 
 The self-hosted jobs — `e2e-gpu`, `e2e-gpu-strix-ubuntu`,
-`e2e-gpu-strix-windows`, `e2e-wsl`, `e2e-gpu-rad3`, and `e2e-gpu-mi350p` — all run with
+`e2e-gpu-strix-windows`, `e2e-wsl`, and `e2e-gpu-w7900` — all run with
 check names that are absent from branch protection's required-status-check
 list (see below), so a hardware failure never gates a PR merge no matter how
-it reports. Five of them run with `continue-on-error: false`, so a real
-regression shows red instead of always green; `e2e-gpu-mi350p` still runs with
-`continue-on-error: true`, unchanged and out of scope here. Their results also
-surface in the self-hosted consolidated report for visibility.
+it reports. Four of them run with `continue-on-error: false`, so a real
+regression shows red instead of always green; `e2e-gpu-w7900` runs with
+`continue-on-error: true` while that hardware is being proven out, and should
+be flipped to `false` once it has a track record. Their results also surface in
+the self-hosted consolidated report for visibility. A lane that ran but uploaded
+no report (it died before writing its results) fails the consolidated report
+job, naming the lane, rather than silently dropping out of the grid; on a
+`continue-on-error: true` lane that is the only red signal for such a failure.
+The nightly report job applies the same check to every nightly lane.
 
 ### Timeouts on the Strix lanes
 

@@ -276,7 +276,16 @@ fn the_documented_count_of_clause_diagnostics_is_the_real_one() {
     // same placeholders.
     let describe = arg("describe");
     let context = arg("context");
-    let emitted: usize = diagnostic_lines(&source)
+    //
+    // Counted within the functions that build the messages the doc lists. `wait_for_popup_body_where`
+    // reuses three of the same messages with its own `describe`; it is a sibling
+    // with its own doc, not a fifth message of this list.
+    let scoped = format!(
+        "{}\n{}",
+        body_of(&source, "wait_for_screen_where"),
+        body_of(&source, "drain_panic_message")
+    );
+    let emitted: usize = diagnostic_lines(&scoped)
         .map(|line| {
             line.matches(describe.as_str()).count() + line.matches(context.as_str()).count()
         })

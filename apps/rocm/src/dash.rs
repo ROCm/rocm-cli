@@ -15,12 +15,14 @@
 //! runtime built here. The TUI lives entirely in the `rocm-dash-tui` crate.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use rocm_core::{AppPaths, RocmCliConfig, builtin_model_recipes, builtin_watchers};
 use rocm_dash_daemon::runner::RunnerOptions;
 use rocm_dash_tui::app::{ActiveTab, Focus, ResolvedArgs};
+use rocm_dash_tui::registry_probe::{ManagedRegistryProbe, ManagedRegistrySnapshot};
 use rocm_dash_tui::ui::automations_manager::AutomationSummary;
 use rocm_dash_tui::ui::launcher::LauncherChoice;
 use rocm_dash_tui::ui::model_picker::ModelRecipeSummary;
@@ -66,21 +68,92 @@ pub fn runner_options(
         // amd-smi ships inside the managed runtime wheel's bin dir, not on PATH;
         // resolve the path so the GPU collector can find it.
         amd_smi_binary: Some(rocm_core::resolve_amd_smi_binary()),
-        // Production always runs the real `/dev/kfd` pre-flight; only daemon
+        // Production always runs the real GPU-device pre-flight; only daemon
         // integration tests with a fake binary skip it.
-        amd_smi_skip_kfd_preflight: false,
-        test_clock_offset_path: dash_test_clock_offset_path(),
+        amd_smi_skip_device_preflight: false,
+        // Runs once per dashboard launch here, not per refresh tick, so the
+        // extra subprocess spawn is negligible.
+        amd_smi_gpu_reachable: gpu_reachable_for_preflight(
+            rocm_core::is_wsl_host(),
+            rocm_core::has_usable_amd_gpu(),
+        ),
+        // The same `/dev/kfd` the rest of `rocm` probes, so a simulated E2E
+        // host can hide the GPU from the dashboard too. `host_path` is the
+        // identity outside an `e2e-test-hooks` build with a host root set, and
+        // the pre-flight still requires the real device either way.
+        amd_smi_host_kfd_device: rocm_core::host_path(rocm_dash_daemon::runner::KFD_DEVICE),
+        test_clock_offset_path: dash_test_clock_offset_path(paths),
     }
 }
 
-#[cfg(feature = "e2e-test-hooks")]
-fn dash_test_clock_offset_path() -> Option<std::path::PathBuf> {
-    std::env::var_os("ROCM_CLI_DASH_TEST_CLOCK_OFFSET_PATH").map(Into::into)
+/// The verdict may only substitute for the device open on WSL: `has_usable_amd_gpu()`
+/// is deliberately fail-open on an unprobeable platform (so it never blocks a
+/// launch), which is the wrong polarity for this pre-flight's hang guard — an
+/// unknown verdict must NOT skip the real `/dev/kfd` open. Restricting the
+/// substitution to WSL (where there is no device node the dash crates can
+/// probe directly, only the shared ROCDXG-plumbing probe this same function
+/// backs) keeps bare-metal behaviour byte-identical to a plain `/dev/kfd` check.
+const fn gpu_reachable_for_preflight(is_wsl_host: bool, has_usable_gpu: bool) -> bool {
+    is_wsl_host && has_usable_gpu
 }
 
-#[cfg(not(feature = "e2e-test-hooks"))]
-const fn dash_test_clock_offset_path() -> Option<std::path::PathBuf> {
-    None
+/// Path of the daemon's logical observation clock, or `None` to use wall time.
+///
+/// State-based, not compile-time-gated: the file simply does not exist on a
+/// user's machine, and nothing in `rocm` ever creates it — only the E2E harness
+/// plants one, in the isolated data root it hands this process via
+/// `ROCM_CLI_DATA_DIR`. That keeps the binary under test byte-identical to the
+/// binary that ships, the same way the Lemonade recovery scenario plants a
+/// runtime manifest that production code reads through its normal path. A
+/// `#[cfg(feature = ...)]` seam cannot make that claim: it makes the tested
+/// binary a different binary.
+///
+/// The existence check is load-bearing, not an optimisation. `RunnerOptions::
+/// test_clock_offset_path` selects wall time *only* on `None`; a `Some(path)`
+/// whose file is absent leaves the daemon on its default
+/// `TestClockDirective::FreeRunning(0)` logical clock. Returning the path
+/// unconditionally would therefore take production off `Utc::now()`.
+///
+/// Because this runs in every build, not just under the harness, a stray copy
+/// of the file in a real data dir would otherwise move the dashboard onto a
+/// logical clock with nothing to show for it. The clock is not display-only:
+/// its value is the cycle timestamp for counter and direct observation, the
+/// histogram average, the tracker snapshot and the snapshot's own timestamp, so
+/// it is the denominator of generation throughput, the window for latency
+/// averages and the basis of the Fresh/Held/expired verdict — and it is what
+/// gets written into persisted session records. Finding the file is therefore
+/// logged at WARN naming the path, so a user whose throughput numbers look
+/// wrong is pointed at the cause rather than having to guess. The warning says
+/// *restart* as well as remove, because the resolved path is captured once for
+/// the life of the run loop and a read that fails — including the file having
+/// been deleted — leaves the directive frozen at its last value, pinning the
+/// logical clock rather than restoring wall time. The warning goes to `tracing`, not
+/// stdout/stderr. It is reached through [`runner_options`], which runtime code
+/// calls only from [`maybe_spawn_embedded_daemon`]; `run_async` calls that only
+/// when [`should_spawn_daemon`] holds, i.e. for a live `rocm dash` and for an
+/// interactive `rocm chat` (including the launcher's routes into them; a
+/// non-interactive `rocm chat` renders text and never enters `run_async`), not
+/// for a focused overlay or `rocm dash --replay`/`--demo`. All of this is
+/// unix-only: on Windows [`maybe_spawn_embedded_daemon`] never calls
+/// [`runner_options`], so no entry point reaches the warning. On the paths that
+/// do reach it, the process is about to hand the terminal to the TUI, and the
+/// client log is file-only (see `logging.rs`), so a stray stdout/stderr write
+/// would corrupt the display.
+fn dash_test_clock_offset_path(paths: &AppPaths) -> Option<PathBuf> {
+    let path = paths.dash_test_clock_file();
+    if !path.is_file() {
+        return None;
+    }
+    tracing::warn!(
+        test_clock_file = %path.display(),
+        "dashboard telemetry clock is in TEST mode, not wall time: a logical \
+         clock read from this file drives displayed timestamps, the timestamps \
+         written into persisted session records, and every figure derived from \
+         them - generation throughput, latency averages and metric freshness. \
+         Only the E2E harness creates it; remove it and restart the dashboard to \
+         return to wall time (deleting it mid-run pins the logical clock instead)."
+    );
+    Some(path)
 }
 
 /// API key precedence — sourced from the environment ONLY (never TOML/CLI/source/
@@ -196,6 +269,14 @@ pub fn resolved_args(
     initial_tab: ActiveTab,
 ) -> ResolvedArgs {
     let t = &config.dashboard.tui;
+    let service_records = rocm_dash_daemon::registry::load_service_records(&paths.services_dir());
+    // One read of the managed-service registry AND one classification pass
+    // over it (`discover_managed_services`), feeding `services_past_attempts`
+    // below. `managed_registry_probe` does NOT reuse this: it needs its own
+    // fresh read on every `snapshot()` call for the life of the session (see
+    // `LiveManagedRegistryProbe`'s own doc comment), not the one-shot read
+    // taken here at launch.
+    let discovery = rocm_dash_daemon::registry::discover_managed_services(&service_records);
     ResolvedArgs {
         connect: t.connect.clone(),
         token: config.dashboard.daemon.token.clone(),
@@ -225,12 +306,111 @@ pub fn resolved_args(
         // pretraining ("ROCm is not compatible with Windows"). Compose the real
         // assistant prompt plus this host's facts here — the bin is the only
         // side with both — and hand the TUI a plain String.
-        chat_system_prompt: Some(crate::rocm_chat_tool_system_prompt_for_host(Some(paths))),
+        chat_system_prompt: Some(crate::chat::rocm_chat_tool_system_prompt_for_host(Some(
+            paths,
+        ))),
         // The real executor is injected in `run_async` for a live dash; None
         // here keeps demo/replay/mock behaving exactly as today.
         tool_executor: None,
         bench_results_dir: config.dashboard.daemon.bench_results_dir.clone(),
+        services_past_attempts: services_past_attempts(&discovery),
+        // Live registry-read seam (issue #145): re-reads `services_dir` fresh
+        // on every call rather than carrying the one-shot `discovery` above
+        // (which still backs only `services_past_attempts`, an intentional
+        // snapshot — see its own doc comment). See
+        // `ManagedRegistryProbe`/`LiveManagedRegistryProbe`.
+        managed_registry_probe: Some(Arc::new(LiveManagedRegistryProbe {
+            services_dir: paths.services_dir(),
+        })),
+        // Set by the caller for a launcher-hosted session (`run`/`run_chat`);
+        // `resolved_args` itself has no opinion, so this always starts `false`
+        // here.
+        launcher_hosted: false,
     }
+}
+
+/// Live, synchronous read of the managed-service registry — the
+/// `rocm-dash-tui`-side `ManagedRegistryProbe` seam `ResolvedArgs::managed_registry_probe`
+/// carries (issue #145's live-read fix). `rocm-dash-tui` has no dependency on
+/// `rocm-core`/`rocm-dash-daemon` (crate-layering invariants, AGENTS.md §6),
+/// so the actual disk read lives here in the bin and crosses the seam as a
+/// plain trait object, mirroring `tool_exec::RocmToolExecutor`.
+///
+/// Re-reads `services_dir` fresh on every [`snapshot`](ManagedRegistryProbe::snapshot)
+/// call: a local JSON-file read, no daemon round-trip, no network I/O — cheap
+/// enough for the quit-confirm gate to call on every render while the prompt
+/// is open, and the only source of truth at all on a host whose
+/// dashboard-embedded daemon client never connects (Windows —
+/// `rocm_dash_tui::client`'s connect path and `maybe_spawn_embedded_daemon`
+/// are unix-only, so `AppState::instances` never gets a first snapshot
+/// there).
+///
+/// **Known divergence, same shape as [`services_past_attempts`]'s:** this
+/// reads the record's raw on-disk `status`, not process liveness. A service
+/// whose engine crashed moments ago still reads `ready`/`running` here until
+/// some `rocm services` invocation reconciles the record
+/// (`refresh_managed_service_runtime_liveness`) — see [`ManagedRegistryProbe`]'s
+/// own doc comment for why a local pid check was not added to close that gap.
+#[derive(Debug, Clone)]
+struct LiveManagedRegistryProbe {
+    services_dir: PathBuf,
+}
+
+impl ManagedRegistryProbe for LiveManagedRegistryProbe {
+    fn snapshot(&self) -> ManagedRegistrySnapshot {
+        use rocm_dash_daemon::registry::{discover_managed_services, load_service_records};
+        let records = load_service_records(&self.services_dir);
+        let discovery = discover_managed_services(&records);
+        ManagedRegistrySnapshot {
+            has_live_service: discovery.svcs.iter().any(|svc| svc.status.is_serving()),
+            managed_ids: discovery.seen,
+        }
+    }
+}
+
+/// Managed-service records that are no longer running, read from the same
+/// registry `rocm services` reads. A status-only read over already-loaded
+/// records: no readiness probes, no daemon, no disk I/O of its own.
+///
+/// **Known divergence — this can read lower than `rocm services list --all`,
+/// which is the command the overlay's own note points at.** The CLI path goes
+/// through `main.rs::load_managed_services`, which per record calls
+/// `refresh_from_engine_state` and then
+/// `refresh_managed_service_runtime_liveness`, demoting a crashed server's
+/// stale `running` record to `stopped` and writing it back. `stopped` is not a
+/// scrapeable status, so the CLI counts it; the raw status here is still
+/// `running`, so this does not. The two agree again as soon as any
+/// `rocm services` invocation rewrites the record.
+///
+/// Not refreshed here, for two reasons, in this order:
+///
+/// 1. It would not actually make the surfaces agree. This is a one-shot
+///    snapshot taken in `resolved_args` before the TUI starts (see
+///    `ResolvedArgs::services_past_attempts` — "a snapshot, not a live feed"),
+///    and nothing recomputes it for the life of the session. A server that
+///    crashes a minute into the dashboard diverges again regardless of how
+///    accurate this read was at launch. Closing the gap properly needs a live
+///    feed, not a better snapshot.
+/// 2. The CLI's verdict is not reachable without network I/O.
+///    `refresh_managed_service_runtime_liveness` decides liveness from
+///    `managed_service_endpoint_readiness`, which probes the endpoint — a model
+///    listing bounded by `SERVICE_LIVENESS_CHECK_TIMEOUT`, and for a record
+///    that lists but has not latched a verification, a real inference request
+///    bounded by `INFERENCE_PROBE_TIMEOUT` (8s). Those are per record and would
+///    be paid serially on the plain synchronous thread that `resolved_args`
+///    runs on, delaying the dashboard's first paint by seconds on exactly the
+///    hosts that serve models. It also *writes* records, which launching a
+///    read-only view should not do.
+///
+/// A cheaper approximation exists — adopt the engine state file and check the
+/// recorded pids with `process_is_running`, both local — but it is deliberately
+/// not taken: it trades this undercount for an *overcount* whenever a record's
+/// pids are dead while its endpoint still answers, and duplicates the CLI's
+/// liveness classification in a second place that could drift from it. Reading
+/// low is the safer failure: the note under this count invites the user to run
+/// `rocm services list --all`, which then shows them the true figure.
+const fn services_past_attempts(discovery: &rocm_dash_daemon::registry::ManagedDiscovery) -> usize {
+    discovery.past_attempts
 }
 
 /// Build the multi-thread tokio runtime the async daemon/TUI run on. Shared by
@@ -265,7 +445,7 @@ fn demo_session_path(paths: &AppPaths) -> Result<PathBuf> {
 
 /// Create `dir` restricted to the owner (`0o700`) on Unix. `DirBuilder::mode`
 /// applies at creation so there is no umask window; a pre-existing directory is
-/// tightened best-effort afterward (matching `server.rs`/`agent.rs`).
+/// tightened best-effort afterward (matching `server.rs`/`agent/clients.rs`).
 #[cfg(unix)]
 fn create_private_dir(dir: &Path) -> Result<()> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -350,7 +530,18 @@ fn validate_replay_path(path: &Path) -> Result<()> {
 }
 
 /// Entry point for `rocm dash`. Builds a tokio runtime and runs the dashboard.
-pub fn run(replay: Option<PathBuf>, demo: bool, chat_mock: bool) -> Result<()> {
+///
+/// `launcher_hosted` is `true` only when this session was opened FROM the
+/// pre-dashboard launcher's own hub loop ([`run_launcher`]) rather than
+/// directly via `rocm dash` — see `ResolvedArgs::launcher_hosted`'s doc
+/// comment for why that changes this session's own quit behavior (issue
+/// #145's launcher double-prompt fix).
+pub fn run(
+    replay: Option<PathBuf>,
+    demo: bool,
+    chat_mock: bool,
+    launcher_hosted: bool,
+) -> Result<()> {
     // Validate a user-supplied `--replay` path up front — before building the
     // runtime or entering the alt-screen — so a missing/unreadable file fails
     // fast with a clear error and non-zero exit instead of silently taking over
@@ -386,7 +577,8 @@ pub fn run(replay: Option<PathBuf>, demo: bool, chat_mock: bool) -> Result<()> {
     // `zbus::blocking`, which builds its own runtime and `block_on`s internally;
     // doing that on a dash runtime worker thread panics with "Cannot start a
     // runtime from within a runtime". See `run_async`.
-    let args = resolved_args(&config, &paths, ActiveTab::Home);
+    let mut args = resolved_args(&config, &paths, ActiveTab::Home);
+    args.launcher_hosted = launcher_hosted;
     let rt = build_dashboard_runtime()?;
     rt.block_on(run_async(config, paths, args, replay, chat_mock))
 }
@@ -414,6 +606,19 @@ const fn launcher_route(choice: LauncherChoice) -> LauncherRoute {
         LauncherChoice::Chat => LauncherRoute::Chat,
         LauncherChoice::OpenDashboard => LauncherRoute::Dashboard,
     }
+}
+
+/// Whether a route escalates into a session the launcher itself hosts —
+/// `run`/`run_chat`'s own `q`/Esc must then exit straight back to this loop
+/// rather than open a second, redundant quit-confirm prompt (issue #145's
+/// double-prompt fix; see `ResolvedArgs::launcher_hosted`'s doc comment). Only
+/// `Chat` and `Dashboard` escalate at all — `Focused` runs in place via
+/// `run_focused`, which never touches `launcher_hosted`. Named and tested on
+/// its own rather than left as two independent `true` literals at the two
+/// call sites below, so a future route added by copying the nearest example
+/// can't silently pass the wrong one.
+const fn launcher_route_hosts_session(route: &LauncherRoute) -> bool {
+    matches!(route, LauncherRoute::Chat | LauncherRoute::Dashboard)
 }
 
 /// Entry point for bare `rocm`: the launcher as a persistent hub.
@@ -469,11 +674,23 @@ pub fn run_launcher(chat_mock: bool) -> Result<()> {
         let serving = launcher_serving_instances(&paths);
         match rocm_dash_tui::ui::launcher::run_launcher(&theme, serving)? {
             None => return Ok(()),
-            Some(choice) => match launcher_route(choice) {
-                LauncherRoute::Focused(focus) => run_focused(focus)?,
-                LauncherRoute::Chat => run_chat(chat_mock, ChatInferenceParams::default())?,
-                LauncherRoute::Dashboard => run(None, false, chat_mock)?,
-            },
+            Some(choice) => {
+                let route = launcher_route(choice);
+                // This session's own `q`/Esc must not re-ask "May still be
+                // serving — quit anyway?" (issue #145's double-prompt fix) — the
+                // launcher's own gate, re-entered at the top of this loop, is
+                // what actually governs process exit. Derived from `route`
+                // itself (`launcher_route_hosts_session`) rather than a bare
+                // `true` literal at each arm below, so the two can't drift.
+                let launcher_hosted = launcher_route_hosts_session(&route);
+                match route {
+                    LauncherRoute::Focused(focus) => run_focused(focus)?,
+                    LauncherRoute::Chat => {
+                        run_chat(chat_mock, ChatInferenceParams::default(), launcher_hosted)?;
+                    }
+                    LauncherRoute::Dashboard => run(None, false, chat_mock, launcher_hosted)?,
+                }
+            }
         }
     }
 }
@@ -520,13 +737,19 @@ pub fn run_focused(focus: Focus) -> Result<()> {
 /// Chat tab focused. Thin wrapper over the same runtime/`run_async` path as
 /// [`run`]; no replay/demo, embedded daemon as usual. `inference` carries the
 /// `--temperature`/`--top-p`/`--max-tokens` CLI flags, which override any
-/// values configured under `[dashboard.tui]`.
-pub fn run_chat(chat_mock: bool, inference: ChatInferenceParams) -> Result<()> {
+/// values configured under `[dashboard.tui]`. `launcher_hosted` is the same
+/// seam `run` takes — see its own doc comment.
+pub fn run_chat(
+    chat_mock: bool,
+    inference: ChatInferenceParams,
+    launcher_hosted: bool,
+) -> Result<()> {
     let paths = AppPaths::discover()?;
     let config = RocmCliConfig::load(&paths)?;
     // See `run`: resolve args (incl. the keyring lookup) before the runtime so the
     // secure-store `zbus::blocking` path never runs on a runtime worker thread.
     let mut args = resolved_args(&config, &paths, ActiveTab::Chat);
+    args.launcher_hosted = launcher_hosted;
     // CLI flags win over the persisted `[dashboard.tui]` chat_* values.
     if let Some(t) = inference.temperature {
         args.chat_temperature = Some(t);
@@ -617,7 +840,7 @@ pub fn run_bench(a: BenchLoadArgs) -> Result<()> {
             .into_json()
             .with_context(|| format!("parsing the {models_url} response"))?;
         rocm_dash_tui::llm::pick_first_model(&body)
-            .with_context(|| format!("no model found at {models_url} — pass --model explicitly"))?
+            .with_context(|| format!("no model found at {models_url} - pass --model explicitly"))?
     };
 
     // Resolve the output path: default to the same `<data_dir>/bench/results.csv`
@@ -637,7 +860,7 @@ pub fn run_bench(a: BenchLoadArgs) -> Result<()> {
         requests,
     };
 
-    println!("mode: raw serving throughput (synthetic prompts) — not agent-workload.");
+    println!("mode: raw serving throughput (synthetic prompts) - not agent-workload.");
     if auto_ramp {
         println!(
             "endpoint={endpoint} model={model} mode=auto-ramp isl={isl} osl={osl} requests={requests}"
@@ -692,7 +915,7 @@ pub fn run_bench(a: BenchLoadArgs) -> Result<()> {
                 .as_deref()
                 .unwrap_or("no reason recorded");
             eprintln!(
-                "warning: {}/{} requests failed in {} — first failure: {reason}",
+                "warning: {}/{} requests failed in {} - first failure: {reason}",
                 report.failed, report.attempted, row.cell
             );
         }
@@ -713,7 +936,7 @@ pub fn run_bench(a: BenchLoadArgs) -> Result<()> {
         }
     }
     println!(
-        "note: local saturation smoke-test — client-measured throughput, not an official ROCm/AMD benchmark."
+        "note: local saturation smoke-test - client-measured throughput, not an official ROCm/AMD benchmark."
     );
     println!("wrote {} row(s) to {}", reports.len(), csv_path.display());
 
@@ -727,7 +950,7 @@ pub fn run_bench(a: BenchLoadArgs) -> Result<()> {
             .find_map(|report| report.first_error.as_deref())
             .unwrap_or("no reason recorded");
         anyhow::bail!(
-            "every benchmark request failed against {endpoint} — first failure: {reason}"
+            "every benchmark request failed against {endpoint} - first failure: {reason}"
         );
     }
 
@@ -803,6 +1026,10 @@ const fn should_spawn_daemon(args: &ResolvedArgs) -> bool {
 /// listening, so `rocm dash` works without a separate `rocm daemon` terminal.
 /// Returns the task handle + socket to clean up on exit, or `None` when an
 /// existing daemon was found (we connect to it instead).
+// One function with `#[cfg]` blocks inside, not a cfg-split pair: the unix
+// body awaits, the Windows body does not. Callers `.await` this either way,
+// so dropping `async` off unix would not compile.
+#[allow(clippy::unused_async)]
 async fn maybe_spawn_embedded_daemon(
     connect: &str,
     config: &RocmCliConfig,
@@ -862,6 +1089,531 @@ mod tests {
         }
     }
 
+    /// `resolved_args` always injects a probe (issue #145's live-read fix);
+    /// read it now for the assertions below, the same way `AppState` would at
+    /// the moment it actually needs an answer.
+    fn probe_snapshot(args: &ResolvedArgs) -> ManagedRegistrySnapshot {
+        args.managed_registry_probe
+            .as_ref()
+            .expect("resolved_args always injects a live registry probe")
+            .snapshot()
+    }
+
+    /// The services overlay renders only live instances, so the count of
+    /// records that are no longer running has to be adapted by the bin like
+    /// `model_recipes` / `runtimes` / `automations` are.
+    ///
+    /// This is also the only test here that pins that the count is read off
+    /// `services_dir()` at all — its sibling
+    /// [`resolved_args_does_not_refresh_liveness_so_a_stale_running_record_is_missed`]
+    /// asserts 0 and so still passes against an empty registry. Keep both.
+    #[test]
+    fn resolved_args_counts_records_that_are_no_longer_running() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join(".rocm-work")
+            .join("tests")
+            .join("dash")
+            .join(format!(
+                "past-attempts-{}-{}",
+                std::process::id(),
+                rocm_core::unix_time_millis()
+            ));
+        let p = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+        std::fs::create_dir_all(p.services_dir()).unwrap();
+        std::fs::write(
+            p.services_dir().join("dead.json"),
+            br#"{"service_id":"svc-dead","engine":"vllm","port":8000,"status":"failed","created_at_unix_ms":1}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            p.services_dir().join("live.json"),
+            br#"{"service_id":"svc-live","engine":"vllm","port":8001,"status":"running","created_at_unix_ms":2}"#,
+        )
+        .unwrap();
+
+        let args = resolved_args(&cfg(), &p, ActiveTab::Home);
+        assert_eq!(args.services_past_attempts, 1);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Pins the divergence documented on [`services_past_attempts`]: this count
+    /// is a raw status read, so a crashed server whose record still says
+    /// `running` is NOT counted here, while `rocm services list --all` refreshes
+    /// liveness, demotes it to `stopped` and does count it.
+    ///
+    /// Witnessed rather than left implicit because the overlay's note sends the
+    /// user to that very command, so the two surfaces can disagree in front of
+    /// them. The record below is stale by construction: its status still says
+    /// `running`, and there is no process or listener behind it. That status
+    /// string is the whole of what decides the count — this path never consults
+    /// a pid and never probes the port, and the on-disk view it deserializes
+    /// into (`rocm_dash_daemon::registry::ServiceRecord`) carries no pid fields
+    /// at all. Asserting 0 is asserting that no refresh happens on this path —
+    /// if someone later adds one, this test fails and they are pointed at the
+    /// doc comment explaining the trade-off rather than silently flipping a
+    /// launch-time read into network I/O.
+    ///
+    /// Asserting 0 would also hold if the registry were never read, so this test
+    /// does not on its own show that any record reached the count;
+    /// [`resolved_args_counts_records_that_are_no_longer_running`] is what pins
+    /// that. Keep the two together.
+    #[test]
+    fn resolved_args_does_not_refresh_liveness_so_a_stale_running_record_is_missed() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join(".rocm-work")
+            .join("tests")
+            .join("dash")
+            .join(format!(
+                "past-attempts-stale-{}-{}",
+                std::process::id(),
+                rocm_core::unix_time_millis()
+            ));
+        let p = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+        std::fs::create_dir_all(p.services_dir()).unwrap();
+        // A crashed server as this path can see one: the status string was never
+        // rewritten, so it still says `running`.
+        std::fs::write(
+            p.services_dir().join("stale.json"),
+            br#"{"service_id":"svc-crashed","engine":"vllm","port":8002,"status":"running","created_at_unix_ms":3}"#,
+        )
+        .unwrap();
+
+        let args = resolved_args(&cfg(), &p, ActiveTab::Home);
+        assert_eq!(
+            args.services_past_attempts, 0,
+            "the overlay count is a raw status snapshot; refreshing it here \
+             would put per-service endpoint probes on the dashboard launch path"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Paired with `has_live_instance_trusts_a_live_registry_read_before_first_real_snapshot_lands`
+    /// (`rocm-dash-tui`, `app::mod` tests), which proves the quit-confirm gate
+    /// consults the registry read before trusting an empty `instances` map —
+    /// this is the half that proves the bin side actually reads something off
+    /// the registry rather than always returning `false`.
+    #[test]
+    fn resolved_args_reports_a_live_managed_service_at_startup() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join(".rocm-work")
+            .join("tests")
+            .join("dash")
+            .join(format!(
+                "startup-live-{}-{}",
+                std::process::id(),
+                rocm_core::unix_time_millis()
+            ));
+        let p = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+        std::fs::create_dir_all(p.services_dir()).unwrap();
+        std::fs::write(
+            p.services_dir().join("live.json"),
+            br#"{"service_id":"svc-live","engine":"vllm","port":8001,"status":"running","created_at_unix_ms":2}"#,
+        )
+        .unwrap();
+
+        let args = resolved_args(&cfg(), &p, ActiveTab::Home);
+        assert!(probe_snapshot(&args).has_live_service);
+        assert_eq!(
+            probe_snapshot(&args).managed_ids,
+            std::collections::HashSet::from(["svc-live".to_string()]),
+            "the live record's id must be reachable via `rocm services stop`"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Proves the injected probe re-reads the registry on every `snapshot()`
+    /// call rather than caching the state it saw when `resolved_args` built
+    /// it. Every other `resolved_args_*` registry test writes its record(s)
+    /// *before* calling `resolved_args` and never mutates afterward, so a
+    /// probe that cached its first read would also pass every one of them —
+    /// this is the one that would actually catch that regression.
+    #[test]
+    fn live_registry_probe_reflects_a_record_written_after_resolved_args_was_built() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join(".rocm-work")
+            .join("tests")
+            .join("dash")
+            .join(format!(
+                "reread-{}-{}",
+                std::process::id(),
+                rocm_core::unix_time_millis()
+            ));
+        let p = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+        std::fs::create_dir_all(p.services_dir()).unwrap();
+
+        // Built against an empty services dir: nothing live yet.
+        let args = resolved_args(&cfg(), &p, ActiveTab::Home);
+        assert!(!probe_snapshot(&args).has_live_service);
+
+        // Write a running record *after* `args` was built, with no call back
+        // into `resolved_args`. A cached probe would still report `false` here.
+        let record_path = p.services_dir().join("live.json");
+        std::fs::write(
+            &record_path,
+            br#"{"service_id":"svc-live","engine":"vllm","port":8001,"status":"running","created_at_unix_ms":2}"#,
+        )
+        .unwrap();
+        assert!(
+            probe_snapshot(&args).has_live_service,
+            "the probe must re-read the registry, not cache the state it saw at build time"
+        );
+
+        // Remove it again: the probe must flip back, not latch on the first
+        // `true` it ever saw.
+        std::fs::remove_file(&record_path).unwrap();
+        assert!(
+            !probe_snapshot(&args).has_live_service,
+            "the probe must reflect the current registry state, not a one-shot snapshot"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Paired with `resolved_args_reports_no_live_managed_service_when_none_are_ready_or_running`:
+    /// `managed_ids` and `has_live_service` (`ManagedRegistrySnapshot`) are two
+    /// different questions over the same live read (liveness vs. reachability), so a record
+    /// that is not live can still be a managed id — `discover_managed_services`
+    /// only drops a record for a bad status or an unbound port, not for being
+    /// `starting`/`recovering`.
+    #[test]
+    fn resolved_args_managed_ids_includes_a_starting_record() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join(".rocm-work")
+            .join("tests")
+            .join("dash")
+            .join(format!(
+                "managed-ids-starting-{}-{}",
+                std::process::id(),
+                rocm_core::unix_time_millis()
+            ));
+        let p = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+        std::fs::create_dir_all(p.services_dir()).unwrap();
+        std::fs::write(
+            p.services_dir().join("starting.json"),
+            br#"{"service_id":"svc-starting","engine":"vllm","port":8003,"status":"starting","created_at_unix_ms":4}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            p.services_dir().join("dead.json"),
+            br#"{"service_id":"svc-dead","engine":"vllm","port":8000,"status":"failed","created_at_unix_ms":1}"#,
+        )
+        .unwrap();
+
+        let args = resolved_args(&cfg(), &p, ActiveTab::Home);
+        assert!(!probe_snapshot(&args).has_live_service);
+        assert_eq!(
+            probe_snapshot(&args).managed_ids,
+            std::collections::HashSet::from(["svc-starting".to_string()]),
+            "a starting (not yet live) record is still this host's to stop; a \
+             failed one is not a scrape target and must not appear"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Isolated `ready`-only fixture: the sibling test above
+    /// (`resolved_args_reports_a_live_managed_service_at_startup`) writes only
+    /// a `running` record, so nothing there actually exercises the `"ready"`
+    /// status on its own (mapped to `InstanceStatus::Ready`, hence
+    /// `is_serving()`, by `registry.rs`'s `instance_status_for_record` —
+    /// `LiveManagedRegistryProbe::snapshot` now delegates to that via
+    /// `discover_managed_services` rather than matching the string itself) —
+    /// a mutation breaking that one status would still pass that sibling test
+    /// via the `running` record.
+    #[test]
+    fn resolved_args_reports_a_ready_managed_service_at_startup() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join(".rocm-work")
+            .join("tests")
+            .join("dash")
+            .join(format!(
+                "startup-live-ready-{}-{}",
+                std::process::id(),
+                rocm_core::unix_time_millis()
+            ));
+        let p = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+        std::fs::create_dir_all(p.services_dir()).unwrap();
+        std::fs::write(
+            p.services_dir().join("ready.json"),
+            br#"{"service_id":"svc-ready","engine":"vllm","port":8005,"status":"ready","created_at_unix_ms":7}"#,
+        )
+        .unwrap();
+
+        let args = resolved_args(&cfg(), &p, ActiveTab::Home);
+        assert!(probe_snapshot(&args).has_live_service);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A `ready`/`running` record with no bound port never becomes a live
+    /// `Instance` in the authoritative view either (`discovered_from_record`'s
+    /// own `port == 0` exclusion, `registry.rs`), so it must not count here —
+    /// otherwise this startup read would diverge from, rather than merely
+    /// precede, the real snapshot it stands in for.
+    #[test]
+    fn resolved_args_does_not_count_a_record_with_no_bound_port() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join(".rocm-work")
+            .join("tests")
+            .join("dash")
+            .join(format!(
+                "startup-live-noport-{}-{}",
+                std::process::id(),
+                rocm_core::unix_time_millis()
+            ));
+        let p = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+        std::fs::create_dir_all(p.services_dir()).unwrap();
+        std::fs::write(
+            p.services_dir().join("unbound.json"),
+            br#"{"service_id":"svc-unbound","engine":"vllm","port":0,"status":"ready","created_at_unix_ms":6}"#,
+        )
+        .unwrap();
+
+        let args = resolved_args(&cfg(), &p, ActiveTab::Home);
+        assert!(!probe_snapshot(&args).has_live_service);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `starting`/`recovering` records exist on disk but neither counts as
+    /// "actively serving" here — matching `Instance::status.is_serving()`
+    /// (`Ready`/`Running` only) rather than the broader `is_scrapeable_status`
+    /// set `managed_service_is_live` (`apps/rocm/src/main.rs`) uses.
+    #[test]
+    fn resolved_args_reports_no_live_managed_service_when_none_are_ready_or_running() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join(".rocm-work")
+            .join("tests")
+            .join("dash")
+            .join(format!(
+                "startup-live-none-{}-{}",
+                std::process::id(),
+                rocm_core::unix_time_millis()
+            ));
+        let p = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+        std::fs::create_dir_all(p.services_dir()).unwrap();
+        std::fs::write(
+            p.services_dir().join("starting.json"),
+            br#"{"service_id":"svc-starting","engine":"vllm","port":8003,"status":"starting","created_at_unix_ms":4}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            p.services_dir().join("dead.json"),
+            br#"{"service_id":"svc-dead","engine":"vllm","port":8000,"status":"failed","created_at_unix_ms":1}"#,
+        )
+        .unwrap();
+
+        let args = resolved_args(&cfg(), &p, ActiveTab::Home);
+        assert!(!probe_snapshot(&args).has_live_service);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A `running` record still carrying a recognized `startup_phase`
+    /// (`downloading`/`loading`/`warmup`) is the supervisor's own cold-start
+    /// window — it flips the record to `running` before it starts polling
+    /// `startup_phase` from the serve log (`registry.rs::instance_status_for_record`'s
+    /// own doc comment). That record is `Starting`, not serving, in the
+    /// authoritative live view, so it must not count here either — matching
+    /// `is_serving()` exactly, not just the bare status string.
+    #[test]
+    fn resolved_args_does_not_count_a_running_record_still_in_a_startup_phase() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join(".rocm-work")
+            .join("tests")
+            .join("dash")
+            .join(format!(
+                "startup-live-phase-{}-{}",
+                std::process::id(),
+                rocm_core::unix_time_millis()
+            ));
+        let p = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+        std::fs::create_dir_all(p.services_dir()).unwrap();
+        std::fs::write(
+            p.services_dir().join("loading.json"),
+            br#"{"service_id":"svc-loading","engine":"vllm","port":8004,"status":"running","startup_phase":"loading","created_at_unix_ms":5}"#,
+        )
+        .unwrap();
+
+        let args = resolved_args(&cfg(), &p, ActiveTab::Home);
+        assert!(!probe_snapshot(&args).has_live_service);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A private scratch directory under `target/`, matching the convention the
+    /// bench-parent test below already uses (no `tempfile` dev-dependency in
+    /// this crate). Named per test so parallel tests cannot collide.
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("{name}-{}", crate::test_support::unique_suffix()));
+        std::fs::remove_dir_all(&dir).ok();
+        dir
+    }
+
+    #[test]
+    fn scratch_dir_gives_each_call_its_own_root_even_for_one_label() {
+        crate::test_support::assert_each_call_gets_its_own_root(|| scratch_dir("same-label"));
+    }
+
+    /// `AppPaths` rooted at a real directory, so the clock file's presence can
+    /// actually be varied (the shared [`paths`] fixture points at `/tmp`).
+    fn paths_at(root: &Path) -> AppPaths {
+        AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        }
+    }
+
+    /// In-memory `tracing` sink.
+    #[derive(Clone, Default)]
+    struct LogCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl LogCapture {
+        fn contents(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl tracing_subscriber::fmt::MakeWriter<'_> for LogCapture {
+        type Writer = Self;
+
+        fn make_writer(&self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Run `f` under a capturing `tracing` subscriber and return what it wrote.
+    ///
+    /// `with_default` installs the subscriber for this thread only, so a
+    /// concurrently-running test in the same binary neither sees these records
+    /// nor leaks its own into them.
+    fn captured_logs(f: impl FnOnce()) -> String {
+        let capture = LogCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        capture.contents()
+    }
+
+    /// The clock seam is state-based, so it is live in every build, not only
+    /// under the harness. A stray file in a real data dir therefore moves the
+    /// dashboard off wall time — not just in the timestamps on screen but in
+    /// throughput, latency averages, freshness and the session records written
+    /// to disk. Finding one must say so, naming the file, or a user has no way
+    /// to explain the numbers they are shown.
+    #[test]
+    fn dash_test_clock_offset_path_warns_when_the_file_is_present() {
+        let root = scratch_dir("dash-clock-warn");
+        let p = paths_at(&root);
+        std::fs::create_dir_all(p.telemetry_state_dir()).unwrap();
+        let clock = p.dash_test_clock_file();
+        std::fs::write(&clock, "0").unwrap();
+
+        let mut resolved = None;
+        let logs = captured_logs(|| resolved = dash_test_clock_offset_path(&p));
+        std::fs::remove_dir_all(&root).ok();
+
+        assert_eq!(resolved, Some(clock.clone()));
+        assert!(logs.contains("WARN"), "expected a WARN record, got: {logs}");
+        assert!(
+            logs.contains(&clock.display().to_string()),
+            "the warning must name the offending file, got: {logs}"
+        );
+    }
+
+    /// The overwhelmingly common case — no file, wall time — must stay silent.
+    /// A warning on every launch would be noise, and would drain the signal out
+    /// of the one above.
+    #[test]
+    fn dash_test_clock_offset_path_is_silent_when_the_file_is_absent() {
+        let root = scratch_dir("dash-clock-silent");
+        let p = paths_at(&root);
+        std::fs::create_dir_all(p.telemetry_state_dir()).unwrap();
+
+        let mut resolved = Some(PathBuf::new());
+        let logs = captured_logs(|| resolved = dash_test_clock_offset_path(&p));
+        std::fs::remove_dir_all(&root).ok();
+
+        assert_eq!(resolved, None, "an absent file must resolve to wall time");
+        assert!(
+            logs.is_empty(),
+            "a wall-time launch must log nothing, got: {logs}"
+        );
+    }
+
     #[test]
     fn runner_options_wires_services_dir_to_registry() {
         let p = paths();
@@ -889,6 +1641,47 @@ mod tests {
             !opts.disable_vllm_metrics,
             "vLLM metrics must stay on by default even when Docker discovery is off"
         );
+    }
+
+    #[test]
+    fn runner_options_never_skips_the_device_preflight() {
+        let p = paths();
+        let opts = runner_options(&cfg(), &p, false);
+        assert!(!opts.amd_smi_skip_device_preflight);
+    }
+
+    /// Without a simulated host root the host-root view of `/dev/kfd` is the
+    /// real device, so the pre-flight is the single check it always was. A
+    /// build with `e2e-test-hooks` would honour a root set in the test
+    /// environment, so only the release configuration is pinned here.
+    #[cfg(not(feature = "e2e-test-hooks"))]
+    #[test]
+    fn runner_options_points_the_kfd_preflight_at_the_real_device() {
+        let p = paths();
+        let opts = runner_options(&cfg(), &p, false);
+        assert_eq!(
+            opts.amd_smi_host_kfd_device,
+            std::path::PathBuf::from("/dev/kfd")
+        );
+    }
+
+    /// Truth-tables the WSL gate as a pure function, independent of the test
+    /// host's actual environment: a regression back to the un-gated
+    /// `has_usable_amd_gpu()` would flip the `(false, true)` bare-metal case
+    /// to `true`, since the fail-open verdict fires on any unprobeable
+    /// platform, not just WSL.
+    ///
+    /// This pins the helper's body only. The call site's binding — that
+    /// `runner_options` passes `is_wsl_host()` itself rather than a literal —
+    /// is not pinned by any test: on an ordinary CI host with no usable GPU,
+    /// `has_usable_amd_gpu()` is already `false`, so a mutant literal `true`
+    /// there is indistinguishable from the real call from this crate's tests.
+    #[test]
+    fn gpu_reachable_for_preflight_only_substitutes_on_wsl() {
+        assert!(!gpu_reachable_for_preflight(false, true));
+        assert!(!gpu_reachable_for_preflight(false, false));
+        assert!(!gpu_reachable_for_preflight(true, false));
+        assert!(gpu_reachable_for_preflight(true, true));
     }
 
     #[test]
@@ -1000,6 +1793,24 @@ mod tests {
             launcher_route(LauncherChoice::OpenDashboard),
             LauncherRoute::Dashboard
         );
+    }
+
+    #[test]
+    fn launcher_route_hosts_session_is_true_only_for_the_two_escalations() {
+        // `launcher_hosted` must be derived from the route
+        // (`launcher_route_hosts_session`), not a bare `true`/`false` literal
+        // written by hand at each escalation arm: a literal can be flipped
+        // without any other test failing, while deriving it from the route
+        // ties the value to what actually hosts the session, so a future
+        // route added by copying the nearest example can't silently carry
+        // the wrong value.
+        assert!(launcher_route_hosts_session(&LauncherRoute::Chat));
+        assert!(launcher_route_hosts_session(&LauncherRoute::Dashboard));
+        for focus in [Focus::Setup, Focus::Serve, Focus::Examine] {
+            assert!(!launcher_route_hosts_session(&LauncherRoute::Focused(
+                focus
+            )));
+        }
     }
 
     #[test]

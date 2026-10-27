@@ -5,7 +5,7 @@
 use anyhow::{Context, Result, bail};
 use rocm_core::{AppPaths, split_local_version};
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -95,6 +95,59 @@ pub(crate) fn runtime_is_managed(runtime: &VllmRuntime) -> bool {
     runtime.source.starts_with("managed_runtime_manifest")
 }
 
+/// The ROCm SDK 10.0 release line, as it appears in both
+/// [`ROCM_DISCOVER_BUILD_VERSIONS`] and `install.rs`'s discover-build table.
+pub(crate) const ROCM_SDK_10_0: &str = "10.0.0";
+/// The ROCm SDK 10.1 release line, as it appears in both
+/// [`ROCM_DISCOVER_BUILD_VERSIONS`] and `install.rs`'s discover-build table.
+pub(crate) const ROCM_SDK_10_1: &str = "10.1.0";
+
+/// ROCm SDK versions keyed by a row in `install.rs`'s discover-build table
+/// (see [`crate::install::vllm_rocm_discover_build`] for the recipe each one
+/// resolves to: wheel indexes, version prefixes, interpreter tag). Defined
+/// here, in the lower layer, as the single source for which versions count —
+/// `install.rs`'s table literally uses these constants for its
+/// `rocm_sdk_version` fields, and [`runtime_has_discover_build`] below
+/// matches against the same two strings. This list and that table are still
+/// two separate pieces of data, kept in agreement only by
+/// `install.rs`'s `vllm_rocm_discover_build_table_matches_the_discover_version_list`
+/// test, not by construction — a new table row needs a matching entry here,
+/// and that test is what catches it if one is missed.
+pub(crate) const ROCM_DISCOVER_BUILD_VERSIONS: &[&str] = &[ROCM_SDK_10_0, ROCM_SDK_10_1];
+
+/// Whether `recorded` and `table_key` name the same ROCm `major.minor` line,
+/// ignoring patch and any dev/pre-release suffix. See
+/// [`crate::install::vllm_rocm_discover_build`] for why the line, not the
+/// exact release, is what a discover row covers. Lives here, not in
+/// `install.rs`, alongside [`ROCM_DISCOVER_BUILD_VERSIONS`] so
+/// [`runtime_has_discover_build`] can match without calling into `install`.
+pub(crate) fn rocm_sdk_series_matches(recorded: &str, table_key: &str) -> bool {
+    fn series(version: &str) -> Option<(u64, u64)> {
+        let mut parts = version.trim().split('.');
+        let major = parts.next()?.parse().ok()?;
+        let minor: String = parts
+            .next()?
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        Some((major, minor.parse().ok()?))
+    }
+    series(recorded).is_some_and(|version| Some(version) == series(table_key))
+}
+
+/// Whether `runtime`'s recorded ROCm SDK version has a live discover-build
+/// recipe. Exposed as runtime metadata, matched directly against
+/// [`ROCM_DISCOVER_BUILD_VERSIONS`], so callers outside `install` — the vLLM
+/// launch path in `process.rs`, specifically — don't need to reach into
+/// `install`'s build-selection table for a plain yes/no check.
+pub(crate) fn runtime_has_discover_build(runtime: &VllmRuntime) -> bool {
+    runtime.rocm_sdk_version.as_deref().is_some_and(|version| {
+        ROCM_DISCOVER_BUILD_VERSIONS
+            .iter()
+            .any(|key| rocm_sdk_series_matches(version, key))
+    })
+}
+
 pub(crate) fn vllm_runtime_warnings(runtime: &VllmRuntime) -> Vec<String> {
     let runtime_scope = if runtime_is_managed(runtime) {
         "rocm-cli records this vLLM command from a managed TheRock runtime; `rocm engines install vllm` can install vLLM into that runtime"
@@ -107,20 +160,23 @@ pub(crate) fn vllm_runtime_warnings(runtime: &VllmRuntime) -> Vec<String> {
     ];
     if !cfg!(windows) && !rocm_core::openmpi::detect_openmpi().present {
         warnings.push(format!(
-            "OpenMPI runtime (libmpi.so / libmpi_cxx.so / mpirun) was not found; vLLM requires it. {}, or rerun `rocm engines install vllm --yes`.",
+            "OpenMPI runtime (libmpi.so / libmpi_cxx.so / mpirun) was not found; vLLM requires it. {}.",
             rocm_core::openmpi::install_hint()
+                .or("rerun `rocm engines install vllm --yes`")
         ));
     }
     if !cfg!(windows) && !rocm_core::openmpi::libatomic_present() {
         warnings.push(format!(
-            "libatomic runtime (libatomic.so.1) was not found; vLLM's torch wheel requires it. {}, or rerun `rocm engines install vllm --yes`.",
+            "libatomic runtime (libatomic.so.1) was not found; vLLM's torch wheel requires it. {}.",
             rocm_core::openmpi::libatomic_install_hint()
+                .or("rerun `rocm engines install vllm --yes`")
         ));
     }
     if !cfg!(windows) && !rocm_core::openmpi::libnuma_present() {
         warnings.push(format!(
-            "system numactl runtime (libnuma.so.1 with libnuma_1.2) was not found; vLLM's torch wheel requires it and the ROCm SDK's bundled numa cannot satisfy it. {}, or rerun `rocm engines install vllm --yes`.",
+            "system numactl runtime (libnuma.so.1 with libnuma_1.2) was not found; vLLM's torch wheel requires it and the ROCm SDK's bundled numa cannot satisfy it. {}.",
             rocm_core::openmpi::libnuma_install_hint()
+                .or("rerun `rocm engines install vllm --yes`")
         ));
     }
     warnings
@@ -257,12 +313,21 @@ struct ManagedRuntimeCandidate {
 fn load_runtime_manifests(runtime_id: Option<&str>) -> Result<Vec<TheRockRuntimeManifest>> {
     let paths = AppPaths::discover()?;
     let registry = paths.data_dir.join("runtimes").join("registry");
+    load_runtime_manifests_in(&registry, runtime_id)
+}
+
+/// The registry manifests in `registry` matching `runtime_id`, in
+/// [`sort_manifests_newest_install_first`]'s order.
+fn load_runtime_manifests_in(
+    registry: &Path,
+    runtime_id: Option<&str>,
+) -> Result<Vec<TheRockRuntimeManifest>> {
     if !registry.is_dir() {
         return Ok(Vec::new());
     }
     let mut manifests = Vec::new();
     for entry in
-        fs::read_dir(&registry).with_context(|| format!("failed to read {}", registry.display()))?
+        fs::read_dir(registry).with_context(|| format!("failed to read {}", registry.display()))?
     {
         let path = entry?.path();
         if path.extension().and_then(|value| value.to_str()) != Some("json") {
@@ -276,13 +341,31 @@ fn load_runtime_manifests(runtime_id: Option<&str>) -> Result<Vec<TheRockRuntime
         if !runtime_matches(&manifest, runtime_id) {
             continue;
         }
-        manifests.push((manifest.installed_at_unix_ms.unwrap_or(0), manifest));
+        manifests.push((path, manifest));
     }
-    manifests.sort_by_key(|(installed_at, _)| std::cmp::Reverse(*installed_at));
+    sort_manifests_newest_install_first(&mut manifests);
     Ok(manifests
         .into_iter()
         .map(|(_, manifest)| manifest)
         .collect())
+}
+
+/// Order newest install first, breaking ties on the runtime key and then on the
+/// manifest's own file path, so the result is a function of registry contents
+/// only rather than of whatever order `read_dir` happened to return — a
+/// `--devel` install and its plain sibling land in the same millisecond. A
+/// manifest without `installed_at_unix_ms` (written before the field existed)
+/// reads as installed at 0. This matches the tiebreak the CLI's own registry
+/// order uses.
+fn sort_manifests_newest_install_first(manifests: &mut [(PathBuf, TheRockRuntimeManifest)]) {
+    manifests.sort_by(|(left_path, left), (right_path, right)| {
+        right
+            .installed_at_unix_ms
+            .unwrap_or(0)
+            .cmp(&left.installed_at_unix_ms.unwrap_or(0))
+            .then_with(|| left.runtime_key.cmp(&right.runtime_key))
+            .then_with(|| left_path.cmp(right_path))
+    });
 }
 /// The torch build the SDK installed into this runtime, as its manifest records it.
 ///
@@ -546,6 +629,227 @@ print(json.dumps({"present": spec is not None, "version": version}))
     }
 }
 
+/// Describes a resolved runtime's TheRock SDK layout for the running-state
+/// payload, or `None` when the runtime is not backed by a TheRock SDK root.
+/// Performs no filesystem writes: `therock_library_path_entries` only derives
+/// paths here, it never writes the compat shims a launch needs those paths to
+/// contain — see [`ensure_therock_compat_shims`].
+pub(crate) fn therock_runtime_env_payload(runtime: &VllmRuntime) -> Option<Value> {
+    let root = runtime.sdk_root.as_ref()?;
+    Some(json!({
+        "runtime_id": runtime.runtime_id,
+        "env_id": runtime.env_id,
+        "root": root.display().to_string(),
+        "bin": runtime.sdk_bin.as_ref().map(|path| path.display().to_string()),
+        "bin_paths": runtime_bin_paths(runtime)
+            .into_iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>(),
+        "library_paths": therock_library_path_entries(runtime)
+            .into_iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>(),
+        "source": runtime.source,
+    }))
+}
+
+pub(crate) fn runtime_bin_paths(runtime: &VllmRuntime) -> Vec<PathBuf> {
+    let mut entries = Vec::new();
+    if let Some(bin) = runtime.sdk_bin.as_ref() {
+        entries.push(bin.clone());
+    }
+    entries.extend(runtime.sdk_bin_paths.iter().cloned());
+    dedupe_paths(entries)
+}
+
+/// How [`therock_library_path_entries_inner`] decides whether the compat dir
+/// belongs on the loader path.
+enum CompatDirSignal {
+    /// `ensure_therock_compat_shims`'s answer is not passed in to this
+    /// derivation (the running-state payload path, which never calls it).
+    /// Falls back to a read-only directory listing of whatever is already on
+    /// disk: not authoritative, but the best available signal without
+    /// performing a write.
+    Unchecked,
+    /// This launch's authoritative answer from `ensure_therock_compat_shims`:
+    /// on the launch path, `Some(dir)` when a shim was needed and written,
+    /// `None` when it was not needed or could not be written — even if one is
+    /// still sitting on disk
+    /// from an earlier run.
+    Checked(Option<PathBuf>),
+}
+
+pub(crate) fn therock_library_path_entries(runtime: &VllmRuntime) -> Vec<PathBuf> {
+    therock_library_path_entries_inner(runtime, CompatDirSignal::Unchecked)
+}
+
+/// Same path derivation as [`therock_library_path_entries`], for the launch
+/// path: `compat_shim` is the `Option<PathBuf>` [`ensure_therock_compat_shims`]
+/// returned for *this launch*'s `ensure_mpi_cxx_compat` call, and is used as
+/// the authoritative answer for whether the compat dir belongs on the loader
+/// path. Unlike a directory listing, it is not fooled by a stub some earlier
+/// run left behind after the host later gained a real `libmpi_cxx` — that
+/// case resolves to `None` here, exactly as `ensure_mpi_cxx_compat` reports
+/// it for this launch.
+pub(crate) fn therock_library_path_entries_for_launch(
+    runtime: &VllmRuntime,
+    compat_shim: Option<PathBuf>,
+) -> Vec<PathBuf> {
+    therock_library_path_entries_inner(runtime, CompatDirSignal::Checked(compat_shim))
+}
+
+fn therock_library_path_entries_inner(
+    runtime: &VllmRuntime,
+    compat_dir_signal: CompatDirSignal,
+) -> Vec<PathBuf> {
+    let Some(root) = runtime.sdk_root.as_ref() else {
+        return dedupe_paths(runtime.sdk_library_paths.clone());
+    };
+    let mut entries = runtime.sdk_library_paths.clone();
+    entries.extend([
+        root.join("lib"),
+        root.join("lib64"),
+        root.join("lib").join("rocm_sysdeps").join("lib"),
+    ]);
+    if cfg!(target_os = "linux") {
+        let wsl_dxcore_lib = PathBuf::from("/usr/lib/wsl/lib");
+        if wsl_dxcore_lib.is_dir() {
+            entries.push(wsl_dxcore_lib);
+        }
+        // OpenMPI is installed outside the default loader path on some distros
+        // (notably RHEL-family under /usr/lib64/openmpi/lib); make sure vLLM can
+        // load libmpi.so at launch when it lives there.
+        entries.extend(rocm_core::openmpi::openmpi_library_dirs());
+
+        // The compat shims this directory may hold (see
+        // `ensure_therock_compat_shims`) are not ensured here — this function
+        // only derives the path, never writes. On the launch path
+        // (`Checked`), include the candidate exactly when
+        // `ensure_therock_compat_shims` says a shim is needed this launch —
+        // this is what keeps a leftover stub from an earlier run (the host
+        // has since gained a real `libmpi_cxx.so*`) from shadowing the loader
+        // path. On the running-state payload path (`Unchecked`), which never
+        // calls that function, fall back to a read-only directory listing of
+        // whatever is already there: not authoritative, but the best
+        // available signal without performing a write.
+        match compat_dir_signal {
+            CompatDirSignal::Checked(shim) => entries.extend(shim),
+            CompatDirSignal::Unchecked => {
+                if let Some(compat_dir) = runtime_compat_dir(runtime)
+                    && compat_dir_has_shims(&compat_dir)
+                {
+                    entries.push(compat_dir);
+                }
+            }
+        }
+    }
+    dedupe_paths(entries)
+}
+
+/// Whether `compat_dir` currently has any entry at all — a plain directory
+/// listing, not a check for a specific shim [`ensure_therock_compat_shims`]
+/// would recognize. This is the fallback [`therock_library_path_entries`]
+/// uses on the running-state payload path, which never calls that function
+/// and so has no authoritative answer to consult; see
+/// [`therock_library_path_entries_for_launch`] for the path that does.
+fn compat_dir_has_shims(compat_dir: &Path) -> bool {
+    compat_dir
+        .read_dir()
+        .is_ok_and(|mut entries| entries.next().is_some())
+}
+/// Materializes the runtime-owned OpenMPI compatibility shims that
+/// `therock_library_path_entries`' `compat_dir` entry depends on. Call once
+/// from the launch path, before building the environment a server is spawned
+/// with — never from running-state payload assembly, which only needs the
+/// path list `therock_library_path_entries` derives, not the shims
+/// themselves. Returns the `libmpi_cxx` compat dir when a shim is needed for
+/// *this* launch and `ensure_mpi_cxx_compat` wrote it — pass this on to
+/// [`therock_library_path_entries_for_launch`] rather than having that
+/// derivation re-check the directory itself. Returns `None` without touching
+/// the filesystem when `runtime.sdk_root` is absent, so this function stays
+/// safe to call independent of a caller's own gating.
+///
+/// `ensure_mpi_cxx_compat` is the real probe in production
+/// ([`rocm_core::openmpi::ensure_mpi_cxx_compat`]); tests inject a fixed
+/// answer here to exercise the rest of this hand-off without depending on
+/// this host's own OpenMPI/compiler state.
+pub(crate) fn ensure_therock_compat_shims(
+    runtime: &VllmRuntime,
+    ensure_mpi_cxx_compat: impl FnOnce(&Path) -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    // No-op without `sdk_root`, matching `therock_library_path_entries_inner`'s
+    // own gating.
+    runtime.sdk_root.as_ref()?;
+    let compat_dir = runtime_compat_dir(runtime)?;
+    // PyTorch's `libtorch_global_deps.so` lists `libmpi_cxx.so.40` as a
+    // NEEDED dependency, but OpenMPI 5.x removed the legacy C++ bindings, so
+    // `import torch` aborts with `libmpi_cxx.so.40: cannot open shared object
+    // file`. When no real `libmpi_cxx.so*` exists, materialize an embedded
+    // `libmpi_cxx.so.40` stub (built at compile time, see rocm-core's
+    // build.rs) into this directory. The stub only *defines* the legacy C++
+    // binding symbols torch needs; they are never called in single-node
+    // serving, so this is safe.
+    let mpi_cxx_shim = ensure_mpi_cxx_compat(&compat_dir);
+    // PyTorch's `libc10.so` NEEDS the standard `libnuma.so.1` soname with the
+    // upstream `libnuma_1.2` symbol version. TheRock bundles numa only under
+    // the renamed soname `librocm_sysdeps_numa.so.1` whose versions are
+    // rewritten to `AMDROCM_SYSDEPS_1.0_libnuma_*`, which cannot satisfy that
+    // binding. An older rocm-cli release symlinked `libnuma.so.1` to that
+    // bundled library; on the loader path it shadowed any real system libnuma
+    // and broke `import torch` with `version 'libnuma_1.2' not found`. Remove
+    // that stale shim here so the real numactl runtime (installed via the
+    // package manager) wins; `libnuma_present()`/`spawn_vllm_server` handle
+    // the install/preflight.
+    remove_stale_numa_shim(&compat_dir);
+    mpi_cxx_shim
+}
+/// Remove a stale `libnuma.so.1` compatibility symlink left by older rocm-cli
+/// versions in `compat_dir`. That shim pointed at the ROCm SDK's bundled
+/// `librocm_sysdeps_numa.so.1`, whose renamed symbol versions cannot satisfy the
+/// `libnuma_1.2` symbol PyTorch's `libc10.so` binds; leaving it on the loader
+/// path would shadow a correctly installed system libnuma. No-op when absent or
+/// when the entry is not a symlink.
+fn remove_stale_numa_shim(compat_dir: &Path) {
+    let link = compat_dir.join("libnuma.so.1");
+    if let Ok(meta) = link.symlink_metadata()
+        && meta.file_type().is_symlink()
+    {
+        let _ = fs::remove_file(&link);
+    }
+}
+/// A writable, runtime-owned directory for managed-runtime library compatibility
+/// shims (see [`therock_library_path_entries`]). Prefers the managed Python
+/// environment root (`<env>/bin/python` -> `<env>`); falls back to the SDK root
+/// when no Python launcher is recorded.
+fn runtime_compat_dir(runtime: &VllmRuntime) -> Option<PathBuf> {
+    const COMPAT_DIR_NAME: &str = "rocm-cli-lib-compat";
+    if let Some(env_root) = runtime
+        .python_executable
+        .as_ref()
+        .and_then(|python| python.parent())
+        .and_then(|bin| bin.parent())
+    {
+        return Some(env_root.join(COMPAT_DIR_NAME));
+    }
+    runtime
+        .sdk_root
+        .as_ref()
+        .map(|root| root.join(COMPAT_DIR_NAME))
+}
+
+fn dedupe_paths(entries: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut deduped = Vec::new();
+    for entry in entries {
+        if !entry.as_os_str().is_empty() && !deduped.iter().any(|seen| seen == &entry) {
+            deduped.push(entry);
+        }
+    }
+    deduped
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -687,5 +991,356 @@ mod tests {
             rocm_sdk_version_from_manifest(&TheRockRuntimeManifest::default()),
             None
         );
+    }
+    fn runtime_with_sdk_version(version: Option<&str>) -> VllmRuntime {
+        VllmRuntime {
+            runtime_id: "nightly-wheel-gfx94x-dcgpu".to_owned(),
+            env_id: "external-vllm-therock".to_owned(),
+            command: PathBuf::from("/rocm/runtimes/wheel/nightly-gfx94x/bin/vllm"),
+            python_executable: None,
+            version: None,
+            source: "managed_runtime_manifest:nightly-wheel-gfx94x-dcgpu".to_owned(),
+            sdk_root: None,
+            sdk_bin: None,
+            sdk_bin_paths: Vec::new(),
+            sdk_library_paths: Vec::new(),
+            rocm_sdk_version: version.map(ToOwned::to_owned),
+        }
+    }
+    #[test]
+    fn runtime_has_discover_build_matches_both_discover_lines() {
+        assert!(runtime_has_discover_build(&runtime_with_sdk_version(Some(
+            "10.0.0"
+        ))));
+        assert!(runtime_has_discover_build(&runtime_with_sdk_version(Some(
+            "10.1.0a20260611"
+        ))));
+    }
+    #[test]
+    fn runtime_has_discover_build_rejects_a_line_with_no_discover_row() {
+        assert!(!runtime_has_discover_build(&runtime_with_sdk_version(
+            Some("10.2.0")
+        )));
+        assert!(!runtime_has_discover_build(&runtime_with_sdk_version(
+            Some("7.2.3")
+        )));
+    }
+    #[test]
+    fn runtime_has_discover_build_rejects_no_recorded_version() {
+        assert!(!runtime_has_discover_build(&runtime_with_sdk_version(None)));
+    }
+    #[test]
+    fn therock_library_path_entries_include_sysdeps_for_hip_apps() {
+        // A fixed path is safe here: this function only derives candidate
+        // paths and never writes to disk (see `ensure_therock_compat_shims`
+        // for the step that does).
+        let root = PathBuf::from("/tmp/rocm-sdk");
+        let runtime = VllmRuntime {
+            runtime_id: "therock-release:gfx120X-all".to_owned(),
+            env_id: "external-vllm-therock".to_owned(),
+            command: PathBuf::from("vllm"),
+            python_executable: None,
+            version: None,
+            source: "managed_runtime_manifest:test".to_owned(),
+            sdk_root: Some(root.clone()),
+            sdk_bin: Some(root.join("bin")),
+            sdk_bin_paths: vec![root.join("runtime").join("bin")],
+            sdk_library_paths: vec![root.join("runtime").join("lib")],
+            rocm_sdk_version: None,
+        };
+        let entries = therock_library_path_entries(&runtime);
+        assert!(entries.contains(&root.join("runtime").join("lib")));
+        assert!(entries.contains(&root.join("lib")));
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.ends_with(Path::new("lib").join("rocm_sysdeps").join("lib")))
+        );
+    }
+
+    #[test]
+    fn compat_dir_has_shims_reflects_directory_contents() {
+        let empty = tempfile::tempdir().unwrap();
+        assert!(!compat_dir_has_shims(empty.path()));
+
+        let populated = tempfile::tempdir().unwrap();
+        fs::write(populated.path().join("libmpi_cxx.so.40"), b"stub").unwrap();
+        assert!(compat_dir_has_shims(populated.path()));
+
+        let missing = empty.path().join("never-created");
+        assert!(!compat_dir_has_shims(&missing));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn runtime_with_compat_dir(env_root: &Path) -> VllmRuntime {
+        VllmRuntime {
+            runtime_id: "therock-release:gfx120X-all".to_owned(),
+            env_id: "external-vllm-therock".to_owned(),
+            command: PathBuf::from("vllm"),
+            python_executable: Some(env_root.join("bin").join("python")),
+            version: None,
+            source: "managed_runtime_manifest:test".to_owned(),
+            sdk_root: Some(env_root.join("sdk")),
+            sdk_bin: None,
+            sdk_bin_paths: Vec::new(),
+            sdk_library_paths: Vec::new(),
+            rocm_sdk_version: None,
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn therock_library_path_entries_omits_compat_dir_with_nothing_in_it() {
+        let env = tempfile::tempdir().unwrap();
+        let runtime = runtime_with_compat_dir(env.path());
+
+        let entries = therock_library_path_entries(&runtime);
+
+        assert!(
+            !entries.contains(&env.path().join("rocm-cli-lib-compat")),
+            "an absent/empty compat dir must not shadow the loader path: {entries:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn therock_library_path_entries_includes_compat_dir_once_a_shim_exists() {
+        let env = tempfile::tempdir().unwrap();
+        let runtime = runtime_with_compat_dir(env.path());
+        let compat_dir = env.path().join("rocm-cli-lib-compat");
+        fs::create_dir_all(&compat_dir).unwrap();
+        fs::write(compat_dir.join("libmpi_cxx.so.40"), b"stub").unwrap();
+
+        let entries = therock_library_path_entries(&runtime);
+
+        assert!(
+            entries.contains(&compat_dir),
+            "a populated compat dir must be on the loader path: {entries:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn therock_library_path_entries_for_launch_ignores_a_leftover_stub_this_launch_does_not_need() {
+        // A leftover `libmpi_cxx.so.40` from an earlier run, now that the host
+        // has gained a real `libmpi_cxx` (`ensure_mpi_cxx_compat` reports
+        // `None` for this launch), must not shadow the loader path — unlike
+        // `therock_library_path_entries`'s directory-listing fallback, which
+        // cannot tell a leftover stub from one still needed.
+        let env = tempfile::tempdir().unwrap();
+        let runtime = runtime_with_compat_dir(env.path());
+        let compat_dir = env.path().join("rocm-cli-lib-compat");
+        fs::create_dir_all(&compat_dir).unwrap();
+        fs::write(compat_dir.join("libmpi_cxx.so.40"), b"stale stub").unwrap();
+
+        let entries = therock_library_path_entries_for_launch(&runtime, None);
+
+        assert!(
+            !entries.contains(&compat_dir),
+            "a stub this launch's ensure call says is not needed must not be \
+             included just because one is still on disk: {entries:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn therock_library_path_entries_for_launch_includes_the_shim_ensure_reported() {
+        let env = tempfile::tempdir().unwrap();
+        let runtime = runtime_with_compat_dir(env.path());
+        let compat_dir = env.path().join("rocm-cli-lib-compat");
+
+        let entries = therock_library_path_entries_for_launch(&runtime, Some(compat_dir.clone()));
+
+        assert!(
+            entries.contains(&compat_dir),
+            "the dir `ensure_therock_compat_shims` reports needed must be on \
+             the loader path, even before anything is listed on disk: {entries:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn ensure_therock_compat_shims_writes_nothing_without_an_sdk_root() {
+        // `python_executable` alone (no `sdk_root`) is the real shape of the
+        // `ROCM_CLI_VLLM_PYTHON`/`VLLM_PYTHON` external-python runtime that
+        // `resolve_vllm_runtime` builds. Exercises this `pub(crate)`
+        // function's own `sdk_root` guard directly, independent of whether
+        // any caller reaches it with that runtime shape.
+        //
+        // Whether a write would otherwise happen on this host (a stub
+        // embedded at compile time, and no real `libmpi_cxx.so*` already
+        // present) varies by host, so probe `ensure_mpi_cxx_compat` against a
+        // throwaway directory first: when it would do nothing anyway, this
+        // test cannot distinguish "guarded correctly" from "nothing to guard
+        // against", so skip the directory-emptiness assertion in that case —
+        // the `shim.is_none()` assertion below still holds either way.
+        let probe = tempfile::tempdir().unwrap();
+        let would_write_without_the_guard =
+            rocm_core::openmpi::ensure_mpi_cxx_compat(probe.path()).is_some();
+
+        let env = tempfile::tempdir().unwrap();
+        let runtime = VllmRuntime {
+            runtime_id: "external-vllm-python".to_owned(),
+            env_id: "external-vllm-python".to_owned(),
+            command: PathBuf::from("vllm"),
+            python_executable: Some(env.path().join("bin").join("python")),
+            version: None,
+            source: "environment python".to_owned(),
+            sdk_root: None,
+            sdk_bin: None,
+            sdk_bin_paths: Vec::new(),
+            sdk_library_paths: Vec::new(),
+            rocm_sdk_version: None,
+        };
+
+        let shim = ensure_therock_compat_shims(&runtime, rocm_core::openmpi::ensure_mpi_cxx_compat);
+
+        assert!(
+            shim.is_none(),
+            "no sdk_root means the compat dir is never on the loader path, \
+             so there is nothing to report needing a shim for"
+        );
+        if would_write_without_the_guard {
+            assert!(
+                !env.path().join("rocm-cli-lib-compat").exists(),
+                "must not write into the venv root's compat dir when sdk_root is absent"
+            );
+        }
+    }
+
+    #[test]
+    fn load_runtime_manifests_breaks_install_time_ties_on_the_runtime_key() -> Result<()> {
+        // Both pairings of file name and runtime key, so a read-order pick is wrong
+        // in one of them. A third, older manifest proves the tie only applies to
+        // manifests that actually share `installed_at_unix_ms`.
+        for (first_file_key, second_file_key) in [("aaa", "bbb"), ("bbb", "aaa")] {
+            let registry = std::env::temp_dir().join(format!(
+                "rocm-engine-vllm-runtime-tie-{first_file_key}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir_all(&registry)?;
+
+            for (file, key) in [("first", first_file_key), ("second", second_file_key)] {
+                fs::write(
+                    registry.join(format!("{file}.json")),
+                    serde_json::to_vec(&serde_json::json!({
+                        "runtime_key": key,
+                        "runtime_id": "therock-stable:gfx94X-dcgpu",
+                        "installed_at_unix_ms": 2_000_u128,
+                    }))?,
+                )?;
+            }
+            fs::write(
+                registry.join("older.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "runtime_key": "older",
+                    "runtime_id": "therock-stable:gfx94X-dcgpu",
+                    "installed_at_unix_ms": 1_000_u128,
+                }))?,
+            )?;
+
+            let manifests =
+                load_runtime_manifests_in(&registry, Some("therock-stable:gfx94X-dcgpu"));
+            let _ = fs::remove_dir_all(&registry);
+            let manifests = manifests?;
+
+            let keys: Vec<Option<String>> = manifests
+                .into_iter()
+                .map(|manifest| manifest.runtime_key)
+                .collect();
+            assert_eq!(
+                keys,
+                vec![
+                    Some("aaa".to_owned()),
+                    Some("bbb".to_owned()),
+                    Some("older".to_owned())
+                ],
+                "files first={first_file_key}, second={second_file_key}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn manifests_without_a_key_or_a_time_still_sort_deterministically() {
+        let manifest = |path: &str, fields: serde_json::Value| {
+            (
+                PathBuf::from(path),
+                serde_json::from_value::<TheRockRuntimeManifest>(fields).expect("manifest"),
+            )
+        };
+        let paths = |manifests: &[(PathBuf, TheRockRuntimeManifest)]| {
+            manifests
+                .iter()
+                .map(|(path, _)| path.display().to_string())
+                .collect::<Vec<_>>()
+        };
+
+        // Two keyless manifests in the same millisecond differ only in their
+        // path, so the path is the last tiebreak and decides in both input
+        // orders.
+        for mut manifests in [
+            vec![
+                manifest(
+                    "b.json",
+                    serde_json::json!({ "installed_at_unix_ms": 2_000 }),
+                ),
+                manifest(
+                    "a.json",
+                    serde_json::json!({ "installed_at_unix_ms": 2_000 }),
+                ),
+            ],
+            vec![
+                manifest(
+                    "a.json",
+                    serde_json::json!({ "installed_at_unix_ms": 2_000 }),
+                ),
+                manifest(
+                    "b.json",
+                    serde_json::json!({ "installed_at_unix_ms": 2_000 }),
+                ),
+            ],
+        ] {
+            sort_manifests_newest_install_first(&mut manifests);
+            assert_eq!(paths(&manifests), ["a.json", "b.json"]);
+        }
+
+        // A manifest written before `installed_at_unix_ms` existed reads as
+        // installed at 0: it ties with an explicit 0 (so the key decides) and
+        // sorts below any real install time.
+        for mut manifests in [
+            vec![
+                manifest("untimed.json", serde_json::json!({ "runtime_key": "aaa" })),
+                manifest(
+                    "zero.json",
+                    serde_json::json!({ "runtime_key": "bbb", "installed_at_unix_ms": 0 }),
+                ),
+                manifest(
+                    "timed.json",
+                    serde_json::json!({ "runtime_key": "zzz", "installed_at_unix_ms": 1 }),
+                ),
+            ],
+            vec![
+                manifest(
+                    "timed.json",
+                    serde_json::json!({ "runtime_key": "zzz", "installed_at_unix_ms": 1 }),
+                ),
+                manifest(
+                    "zero.json",
+                    serde_json::json!({ "runtime_key": "bbb", "installed_at_unix_ms": 0 }),
+                ),
+                manifest("untimed.json", serde_json::json!({ "runtime_key": "aaa" })),
+            ],
+        ] {
+            sort_manifests_newest_install_first(&mut manifests);
+            assert_eq!(
+                paths(&manifests),
+                ["timed.json", "untimed.json", "zero.json"]
+            );
+        }
     }
 }

@@ -36,16 +36,22 @@ const FEATURE_KEYS: &[(&str, &str)] = &[
     ("engine_shell.feature", "engine-shell"),
     ("examine.feature", "examine"),
     ("install_lifecycle.feature", "lifecycle"),
+    // Not `records`: a key has to say what kind of record, and this file is
+    // about the ones a managed `rocm serve` leaves behind.
+    ("local_server_records.feature", "server-records"),
     ("logs.feature", "logs"),
     ("model_serving.feature", "serve"),
     ("networking.feature", "networking"),
     ("remote.feature", "remote"),
+    ("rocm_doctor_skill.feature", "skill"),
     // Not `runtime`: `runtime_setup.feature` owns that key, and two files
     // sharing one key would collide on every index (`runtime-01` in both).
     ("runtime_lifecycle.feature", "runtime-lifecycle"),
     ("runtime_setup.feature", "runtime"),
     ("service_record_cleanup.feature", "service-cleanup"),
+    ("service_stop.feature", "service-stop"),
     ("therock_next_generation.feature", "therock-next"),
+    ("uninstall.feature", "uninstall"),
     ("update.feature", "update"),
 ];
 

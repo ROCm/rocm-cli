@@ -5,6 +5,7 @@
 use cucumber::{given, then, when};
 
 use crate::E2eWorld;
+use crate::e2e::lifecycle_steps;
 use crate::e2e::tui_driver::{TuiSession, default_timeout};
 
 /// A symptom string that scores a catalog match on every platform these
@@ -56,6 +57,43 @@ const MUTATING_FIX_ID: &str = "fix-9-igpu-dgpu";
 /// root or touching real group membership.
 const COMMAND_FAILURE_FIX_ID: &str = "fix-4-render-group";
 
+/// The Windows PATH-repair recipe at the center of ROCMAI-449. Its own e2e
+/// coverage lives here rather than being folded into [`MUTATING_FIX_ID`]'s
+/// scenario: unlike every other fix-recipe mock in this file, there is no
+/// precedent for faking the thing under test (`powershell.exe`/`setx.exe`
+/// itself), so these scenarios run the real write against the real
+/// User-scope PATH on a `@requires-os:windows` lane instead -- see
+/// `lifecycle_steps::stage_user_path_for_test` for how that stays restorable.
+const PATH_FIX_ID: &str = "fix-6-path";
+
+/// The directory stood in for a HIP SDK install root, inside the scenario's
+/// isolated root. `fix-6-path` resolves its bin dir from `$HIP_PATH` (or the
+/// newest real ROCm install if unset), so pointing `HIP_PATH` here with a real
+/// `bin` subdirectory on disk is enough to reach the PATH read/plan/write
+/// logic without a real ROCm install.
+fn path_fix_sdk_dir(world: &E2eWorld) -> std::path::PathBuf {
+    world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("fake-hip-sdk")
+}
+
+/// The bin dir `fix-6-path` would prepend to the User PATH, under
+/// [`path_fix_sdk_dir`].
+fn path_fix_bin_dir(world: &E2eWorld) -> std::path::PathBuf {
+    path_fix_sdk_dir(world).join("bin")
+}
+
+/// A real pre-existing User PATH value containing an apostrophe, the way
+/// `C:\Users\O'Brien\bin` would appear on a host with that username. Not a
+/// contrived edge case -- see `ps_single_quote_escape`'s doc comment in
+/// `crates/rocm-core/src/fix.rs` -- and chosen so [`assert_path_fix_prepended_with_apostrophe_intact`]
+/// can prove the escaped write script still parses correctly against a real
+/// `powershell.exe`, not just the unit test's simulated one.
+const PATH_FIX_EXISTING_USER_PATH: &str = r"C:\Users\O'Brien\bin;C:\Windows\System32";
+
 /// Every fix-id in the closed catalog, in the order `rocm fix` lists them.
 ///
 /// A duplicate of the catalog, on purpose: a test that derived this list from
@@ -83,9 +121,7 @@ const CATALOG_FIX_IDS: &[&str] = &[
     "fix-13-hip-sdk-missing",
     "fix-14-adrenalin-too-old",
     "fix-15-msvc-redist",
-    // Not a typo, and not a hole to fill: `fix-16` is reserved by the vLLM
-    // out-of-memory entry on its own branch. The number is a stable handle, so
-    // the two are kept distinct rather than renamed after the fact.
+    "fix-16-vllm-oom",
     "fix-17-torch-dlpack",
     "fix-wsl-1-gpu-not-exposed",
     "fix-wsl-2-dxcore-missing",
@@ -94,20 +130,72 @@ const CATALOG_FIX_IDS: &[&str] = &[
     "fix-wsl-5-distro-too-old",
     "fix-wsl-6-host-driver-too-old",
     "fix-wsl-7-wsl1",
-    // `fix-18` is the code object manager entry on its own branch, kept
-    // distinct for the same reason `fix-16` is.
+    "fix-18-comgr-conflict",
     "fix-19-shm-too-small",
+    "fix-21-msvc-redist-outdated",
+    // The catalog's one DIAGNOSE-ONLY entry, carrying an `info-` id because it
+    // has no fix to offer. It is in the catalog all the same: `rocm diagnose`
+    // prints `apply with: rocm fix info-20-gpu-no-rocm-support` for it, so
+    // `rocm fix` has to resolve that id -- by naming the problem and changing
+    // nothing. Leaving it out here would let the two published forms drift.
+    "info-20-gpu-no-rocm-support",
 ];
 
-/// The fixes the CLI carries out itself. Every other entry only prints a plan.
+/// The fixes the CLI carries out itself **on the host running the suite**.
+///
 /// Pinned exactly: a mode quietly promoted to AUTO would begin changing
 /// machines that callers had been told it only ever advised on.
-const AUTO_APPLICABLE_FIX_IDS: &[&str] = &[
-    "fix-2-unset-override",
-    "fix-4-render-group",
-    "fix-6-path",
-    "fix-9-igpu-dgpu",
-];
+///
+/// Host-dependent because the catalog is. `fix-2-unset-override` persists the
+/// change through `setx` on Windows but only reports on Linux, where its runner
+/// takes no options and never writes. `fix-9-igpu-dgpu` is on neither list: it
+/// acts only once `--device-index` names a target, and is marked NEEDS-ARG.
+/// Both used to claim AUTO everywhere, which is the defect this pins.
+fn auto_applicable_fix_ids() -> &'static [&'static str] {
+    if cfg!(windows) {
+        return &["fix-2-unset-override", "fix-6-path"];
+    }
+    // WSL is its own catalog family, not "Linux with a flag", so `cfg!` cannot
+    // answer this -- it is a property of the running host. `fix-4-render-group`
+    // is bare-metal only and `fix-2-unset-override` only reports there, which
+    // leaves one entry the CLI actually carries out.
+    if e2e_cucumber::capability::host_capability().is_wsl {
+        return &["fix-6-path"];
+    }
+    &["fix-4-render-group", "fix-6-path"]
+}
+
+/// The one catalog entry whose behaviour splits by platform: it persists the
+/// change through `setx` on Windows, while on Linux `run_unset_override_linux`
+/// takes no options and only reports where the value is set.
+const PLATFORM_SPLIT_FIX_ID: &str = "fix-2-unset-override";
+
+/// What that entry does on the host running the suite. The listing has to agree
+/// with the machine in front of it — claiming AUTO on Linux is what told users
+/// a change was coming that never came.
+const fn platform_split_marker_here() -> &'static str {
+    // Windows persists the change; Linux and WSL both run the arm that only
+    // reports, so both see PRINT-ONLY.
+    if cfg!(windows) { "AUTO" } else { "PRINT-ONLY" }
+}
+
+/// The entry the CLI will carry out, but not until it is told which device to
+/// pin. Asked plainly it prints the identifying query and stops.
+const NEEDS_ARGUMENT_FIX_ID: &str = "fix-9-igpu-dgpu";
+
+/// The argument it is waiting for. Named in the flags line, so a reader is not
+/// left to find it in the notes.
+const NEEDS_ARGUMENT_FLAG: &str = "--device-index";
+
+/// The marker in a listing row — the contents of its first `[...]` group.
+///
+/// Read rather than matched against a padded literal, so the assertions do not
+/// break when a longer marker widens the column.
+fn row_marker(line: &str) -> Option<&str> {
+    let open = line.find('[')?;
+    let close = line[open..].find(']')? + open;
+    Some(line[open + 1..close].trim())
+}
 
 /// A WSL distribution name no host will have. Deliberately not a plausible one:
 /// the scenario must fail for "this machine does not exist", never because the
@@ -142,6 +230,11 @@ const fn fix_id_for_the_other_os() -> &'static str {
         "fix-13-hip-sdk-missing" // windows-only
     }
 }
+
+/// The entry for a code object manager library belonging to a different
+/// installation than the active runtime. Advisory by design: both remedies can
+/// break a working Python environment.
+const COMGR_CONFLICT_FIX_ID: &str = "fix-18-comgr-conflict";
 
 /// Contents planted in the scenario's own shell rc file. The assertion is that
 /// this survives the run byte for byte.
@@ -192,6 +285,31 @@ async fn user_hit_unknown_failure(world: &mut E2eWorld) {
     world.model_name = Some("xyzzy totally unrelated gibberish".to_string());
 }
 
+#[given("a user whose vLLM server ran out of GPU memory")]
+async fn user_hit_vllm_oom(world: &mut E2eWorld) {
+    world.model_name = Some(
+        "vllm: torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.".to_string(),
+    );
+}
+
+/// The separator is `ESC E` (`NEL`), deliberately, not `\n` or `\r`. Both of
+/// those were already split on by the time this scenario was written; `NEL` is
+/// what a `rich`/curses progress UI emits to advance a line, and it is what the
+/// two-character allowlist did not cover. The anchor (`vllm`) and the OOM are on
+/// different rendered lines, so no part of this paste is a vLLM fault.
+#[given(
+    "a user who pasted a capture naming vLLM and another engine's OOM on separate rendered lines"
+)]
+async fn user_pasted_a_capture_with_a_foreign_oom(world: &mut E2eWorld) {
+    world.model_name = Some(
+        "Downloading shards:  10%\u{1b}Evllm serve starting up\u{1b}E\
+         Downloading shards:  90%\u{1b}E\
+         llama.cpp: torch.OutOfMemoryError: CUDA out of memory. \
+         Tried to allocate 7.21 GiB.\u{1b}E"
+            .to_string(),
+    );
+}
+
 #[given("a user who hit the vLLM engine-startup import failure")]
 async fn user_hit_engine_import_failure(world: &mut E2eWorld) {
     world.model_name = Some(ENGINE_IMPORT_SYMPTOM.to_string());
@@ -212,9 +330,24 @@ async fn user_chose_fix_needing_sudo_and_relogin(world: &mut E2eWorld) {
     world.model_name = Some(COMMAND_FAILURE_FIX_ID.to_string());
 }
 
+#[given("a user who has chosen the fix for a shadowed compilation library")]
+async fn user_chose_comgr_conflict_fix(world: &mut E2eWorld) {
+    world.model_name = Some(COMGR_CONFLICT_FIX_ID.to_string());
+}
+
 #[given("a user who names a fix the CLI does not offer")]
 async fn user_named_unknown_fix(world: &mut E2eWorld) {
     world.model_name = Some("fix-does-not-exist".to_string());
+}
+
+#[given("a fix the CLI carries out on one kind of machine and only explains on another")]
+async fn user_chose_platform_split_fix(world: &mut E2eWorld) {
+    world.model_name = Some(PLATFORM_SPLIT_FIX_ID.to_string());
+}
+
+#[given("a user who has chosen a fix that cannot run until it is told what to act on")]
+async fn user_chose_fix_needing_an_argument(world: &mut E2eWorld) {
+    world.model_name = Some(NEEDS_ARGUMENT_FIX_ID.to_string());
 }
 
 #[given("a user who has chosen a fix that would change the machine")]
@@ -239,14 +372,8 @@ async fn user_approved_fix_that_will_fail(world: &mut E2eWorld) {
     // through one of these two scripts either way, and both fail unconditionally.
     for name in ["usermod", "sudo"] {
         let script = bin_dir.join(name);
-        std::fs::write(&script, "#!/bin/sh\nexit 1\n")
+        rocm_core::fake_executable::write_fake_executable(&script, "#!/bin/sh\nexit 1\n")
             .unwrap_or_else(|e| panic!("failed to write fake {name}: {e}"));
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
-                .unwrap_or_else(|e| panic!("failed to chmod fake {name}: {e}"));
-        }
     }
     // Restricting `$PATH` to only the fakes above also makes the recipe's
     // root-detection deterministic: it shells out to `id -u`, which is not on
@@ -269,6 +396,41 @@ async fn user_named_diagnosis_position(world: &mut E2eWorld) {
     // CLI never sees it. The product behaviour under test is what happens when
     // the argument does arrive.
     world.model_name = Some("#1".to_string());
+}
+
+#[given("a Windows host with a HIP SDK install and an apostrophe already on the real User PATH")]
+async fn user_on_windows_with_hip_sdk_and_apostrophe_path(world: &mut E2eWorld) {
+    let bin_dir = path_fix_bin_dir(world);
+    std::fs::create_dir_all(&bin_dir)
+        .expect("failed to create the scenario's fake HIP SDK bin dir");
+    world
+        .command_env
+        .push(("HIP_PATH", path_fix_sdk_dir(world).into_os_string()));
+    // Captured and restored by `LifecycleState`'s `Drop` (see
+    // `stage_user_path_for_test`), the same guarantee the lifecycle Windows
+    // scenarios get for the same machine-global state.
+    lifecycle_steps::stage_user_path_for_test(world, PATH_FIX_EXISTING_USER_PATH);
+    world.model_name = Some(PATH_FIX_ID.to_string());
+}
+
+#[given("a Windows host with a HIP SDK install and no way to resolve PowerShell")]
+async fn user_on_windows_with_hip_sdk_and_no_powershell(world: &mut E2eWorld) {
+    let bin_dir = path_fix_bin_dir(world);
+    std::fs::create_dir_all(&bin_dir)
+        .expect("failed to create the scenario's fake HIP SDK bin dir");
+    world
+        .command_env
+        .push(("HIP_PATH", path_fix_sdk_dir(world).into_os_string()));
+    // An empty child PATH means the CLI's own `Command::new("powershell")`
+    // cannot resolve the binary at all -- `powershell.exe` lives under
+    // `System32\WindowsPowerShell\v1.0`, which Windows does NOT search
+    // unconditionally the way it does System32 itself, so this is a real
+    // instance of the "PowerShell missing" cause `ps_env_scope`'s doc comment
+    // names, not a faked one. Nothing here touches the real machine's
+    // User-scope PATH, so no capture/restore is needed: the read never gets
+    // far enough to risk it.
+    world.command_env.push(("PATH", std::ffi::OsString::new()));
+    world.model_name = Some(PATH_FIX_ID.to_string());
 }
 
 // ── When ───────────────────────────────────────────────────────────
@@ -308,6 +470,17 @@ async fn user_diagnoses_json(world: &mut E2eWorld) {
 async fn user_lists_fixes(world: &mut E2eWorld) {
     let (stdout, _, rc) = crate::run_rocm(world, &["fix"]);
     world.cli_output = Some(stdout);
+    world.cli_rc = Some(rc);
+}
+
+#[when("the user asks the CLI to apply it without saying what to act on")]
+async fn user_applies_fix_without_its_argument(world: &mut E2eWorld) {
+    let fix_id = world.model_name.clone().expect("no fix id set");
+    // Deliberately no `--device-index`: the branch under test is the one that
+    // reports what is still needed instead of acting.
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["fix", &fix_id]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
     world.cli_rc = Some(rc);
 }
 
@@ -472,10 +645,15 @@ async fn assert_markers_explained(world: &mut E2eWorld) {
     let output = world.cli_output.as_ref().expect("no fix list output");
     // The markers were printed with no legend, so a reader could not tell
     // whether PRINT-ONLY meant "advisory" or "not implemented yet".
-    assert!(
-        output.contains("AUTO =") && output.contains("PRINT-ONLY ="),
-        "expected the listing to explain its AUTO/PRINT-ONLY markers:\n{output}"
-    );
+    // Every marker the listing can print has to be explained, or the newer
+    // ones land in exactly the position PRINT-ONLY was in.
+    for marker in ["AUTO =", "NEEDS-ARG =", "PRINT-ONLY =", "DIAGNOSE-ONLY ="] {
+        assert!(
+            output.contains(marker),
+            "the listing prints markers it never explains; `{marker}` is missing \
+             from the legend:\n{output}"
+        );
+    }
 }
 
 #[then("the CLI always points to somewhere the problem can be reported")]
@@ -539,6 +717,149 @@ async fn assert_json_identifies_match(world: &mut E2eWorld) {
             .and_then(serde_json::Value::as_str)
             .is_some(),
         "the matched cause must name the fix that applies it:\n{output}"
+    );
+}
+
+/// Locate the `fix-16-vllm-oom` diagnosis in a parsed report's `matched` array,
+/// panicking with the raw output if it is absent. Shared by the two `Then`
+/// steps that assert on the vLLM OOM entry.
+fn find_vllm_oom<'a>(report: &'a serde_json::Value, output: &str) -> &'a serde_json::Value {
+    find_matched(report, "fix-16-vllm-oom", output)
+}
+
+/// The entry of the diagnosis's `matched` list with the given id, panicking with
+/// the raw output if it is absent.
+fn find_matched<'a>(
+    report: &'a serde_json::Value,
+    id: &str,
+    output: &str,
+) -> &'a serde_json::Value {
+    report
+        .get("matched")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|matches| {
+            matches.iter().find(|diagnosis| {
+                diagnosis.get("id").and_then(serde_json::Value::as_str) == Some(id)
+            })
+        })
+        .unwrap_or_else(|| panic!("expected {id} in diagnosis:\n{output}"))
+}
+
+#[then("no vLLM startup OOM is reported")]
+async fn assert_no_vllm_oom_reported(world: &mut E2eWorld) {
+    assert_eq!(
+        world.cli_rc,
+        Some(0),
+        "diagnose should exit 0 (it is a query)"
+    );
+    let (report, output) = parsed_diagnosis(world);
+    let matched = report
+        .get("matched")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or_else(|| panic!("report must carry a `matched` array:\n{output}"));
+    assert!(
+        !matched.iter().any(|diagnosis| {
+            diagnosis.get("id").and_then(serde_json::Value::as_str) == Some("fix-16-vllm-oom")
+        }),
+        "another engine's OOM must not be attributed to vLLM:\n{output}"
+    );
+}
+
+#[then("the diagnosis identifies the vLLM startup OOM")]
+async fn assert_diagnosis_identifies_vllm_oom(world: &mut E2eWorld) {
+    assert_eq!(world.cli_rc, Some(0), "diagnose should exit 0");
+    let (report, output) = parsed_diagnosis(world);
+    let oom = find_vllm_oom(&report, &output);
+    let high_confidence = report
+        .get("high_confidence_threshold")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or_else(|| panic!("report must publish its high_confidence_threshold:\n{output}"));
+    assert!(
+        oom.get("score")
+            .and_then(serde_json::Value::as_i64)
+            .is_some_and(|score| score >= high_confidence),
+        "the distinctive OOM signature should be high-confidence:\n{output}"
+    );
+    assert_eq!(
+        oom.pointer("/fix/auto_applicable")
+            .and_then(serde_json::Value::as_bool),
+        Some(false),
+        "the OOM remedy must remain print-only:\n{output}"
+    );
+}
+
+/// The other half of the loop: the `apply with: rocm fix <id>` the report prints
+/// has to name a command this host will actually act on.
+///
+/// `rocm diagnose` selects a checker by the platform families the checker
+/// registers; `rocm fix` then re-gates the same id on the *recipe's* list
+/// against the running OS. WSL2 is its own family on both sides, so a recipe
+/// that omits it printed the plan and then exited 3 on a platform its checker
+/// deliberately answers for. This asserts the rc, not merely the output: the
+/// wrong-OS refusal prints the recipe first, so the text alone cannot tell the
+/// two outcomes apart.
+#[then("the CLI can act on the fix the diagnosis named")]
+async fn assert_named_fix_is_runnable_here(world: &mut E2eWorld) {
+    let (report, output) = parsed_diagnosis(world);
+    let fix_id = find_vllm_oom(&report, &output)
+        .pointer("/fix/fix_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| panic!("the matched cause must name a fix id:\n{output}"))
+        .to_owned();
+    assert_fix_is_printable_here(world, &fix_id);
+}
+
+#[then("the CLI can act on the fix named for the engine-startup import failure")]
+async fn assert_import_failure_fix_is_runnable_here(world: &mut E2eWorld) {
+    let (report, output) = parsed_diagnosis(world);
+    let fix_id = find_matched(&report, ENGINE_IMPORT_FIX_ID, &output)
+        .pointer("/fix/fix_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| panic!("the matched cause must name a fix id:\n{output}"))
+        .to_owned();
+    assert_fix_is_printable_here(world, &fix_id);
+}
+
+/// Runs `rocm fix <fix_id>` and checks that it prints its advisory plan rather
+/// than refusing on this platform. Shared by the steps that follow a diagnosis
+/// to the fix it named.
+fn assert_fix_is_printable_here(world: &mut E2eWorld, fix_id: &str) {
+    let (fix_output, fix_stderr, rc) = crate::run_rocm(world, &["fix", fix_id]);
+    assert_eq!(
+        rc,
+        0,
+        "{}",
+        e2e_cucumber::cli_failure_report(&["fix", fix_id], rc, &fix_output, &fix_stderr)
+    );
+    assert!(
+        fix_output.to_lowercase().contains("print-only"),
+        "{fix_id} is advisory, so it must say it only printed a plan:\n{fix_output}"
+    );
+}
+
+#[then("the OOM remedy distinguishes a busy GPU from a model that does not fit")]
+async fn assert_oom_remedy_is_conditional(world: &mut E2eWorld) {
+    let (report, output) = parsed_diagnosis(world);
+    let fix = find_vllm_oom(&report, &output)
+        .get("fix")
+        .unwrap_or_else(|| panic!("expected fix-16-vllm-oom remediation:\n{output}"));
+    let rendered = fix.to_string();
+    assert!(
+        rendered.contains("shared/busy")
+            && rendered.contains("does not fit")
+            && rendered.contains("--gpu-memory-utilization")
+            && rendered.contains("smaller or quantized"),
+        "the remedy must retain both conditional branches:\n{output}"
+    );
+    assert!(
+        !rendered.contains("--tensor-parallel-size"),
+        "the remedy must not prescribe the non-existent multi-GPU sharding flag:\n{output}"
+    );
+    assert!(
+        !fix.get("verify")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|verify| verify.contains("--gpu-memory-utilization")),
+        "verification must not unconditionally prescribe the tenancy workaround:\n{output}"
     );
 }
 
@@ -908,15 +1229,85 @@ async fn assert_auto_set_is_exact(world: &mut E2eWorld) {
     let output = world.cli_output.as_ref().expect("no fix list output");
     let marked_auto: Vec<&str> = output
         .lines()
-        .filter(|line| line.contains("[      AUTO]"))
+        .filter(|line| row_marker(line) == Some("AUTO"))
         .filter_map(|line| CATALOG_FIX_IDS.iter().copied().find(|id| line.contains(id)))
         .collect();
     // Exact, not "at least": a mode quietly promoted to AUTO would start
     // changing machines that callers were told it only ever advised.
     assert_eq!(
-        marked_auto, AUTO_APPLICABLE_FIX_IDS,
+        marked_auto,
+        auto_applicable_fix_ids(),
         "the set of fixes the CLI applies itself has changed:\n{output}"
     );
+}
+
+#[then("that fix is shown as what it does on this machine")]
+async fn assert_platform_split_fix_is_listed_for_this_machine(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no fix list output");
+    let fix_id = world.model_name.clone().expect("no fix id set");
+    let row = output
+        .lines()
+        .find(|line| line.contains(&fix_id))
+        .unwrap_or_else(|| panic!("the listing has no row for {fix_id}:\n{output}"));
+    assert_eq!(
+        row_marker(row),
+        Some(platform_split_marker_here()),
+        "{fix_id} is listed as something other than what it does on this machine. \
+         The catalog is authoritative: if its behaviour here changed, change the \
+         catalog and this expectation together — do not loosen the assertion.\n{row}"
+    );
+}
+
+#[then("the CLI names what it still needs and reports no change")]
+async fn assert_missing_argument_is_named(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no fix output");
+    // Exit 0, not an error code: nothing went wrong and nothing was attempted.
+    // A nonzero code would read as a failed fix rather than an unanswered
+    // question.
+    assert_eq!(
+        world.cli_rc,
+        Some(0),
+        "reporting what it still needs is not a failure:\n{output}"
+    );
+    // The flags line specifically, not the output as a whole. The recipe's
+    // notes mention the argument either way, so a whole-output search passes
+    // even when the entry is marked as one the CLI applies outright -- which is
+    // exactly the defect, and an earlier version of this assertion missed it.
+    let flags = output
+        .lines()
+        .find(|line| line.starts_with("Flags:"))
+        .unwrap_or_else(|| {
+            panic!(
+                "no flags line, so nothing told the user the CLI is waiting on \
+                 `{NEEDS_ARGUMENT_FLAG}` rather than acting:\n{output}"
+            )
+        });
+    assert!(
+        flags.contains(NEEDS_ARGUMENT_FLAG),
+        "the flags line does not name `{NEEDS_ARGUMENT_FLAG}`, so the user is told \
+         only that the fix is unavailable, not what would make it available:\n{flags}"
+    );
+    // The whole defect was a report of a change that never happened, so the
+    // absence of that claim is the assertion -- but it has to name text the
+    // product can actually produce. This asserted the absence of "Applied",
+    // which appears nowhere in the CLI, so it held against every possible
+    // regression. `fix-9`'s Linux arm announces a real change by naming the
+    // file it appended to; the Windows arm by naming the value it persisted.
+    // Only text the CLI prints *after* acting. The catalog's own plan includes
+    // `setx HIP_VISIBLE_DEVICES <dGPU-index>`, which this path legitimately
+    // shows, so the placeholder command is not evidence of a change; the
+    // announcements below are printed only once a write has happened.
+    for claim in [
+        "Appended to ",
+        "setx only takes effect in NEW shells",
+        "Plan: persist HIP_VISIBLE_DEVICES",
+    ] {
+        assert!(
+            !output.contains(claim),
+            "the CLI was not told what to act on, so it must not report having acted \
+             ({claim:?}):\n{output}"
+        );
+    }
 }
 
 #[then("the CLI lists the fixes it can apply")]
@@ -1577,5 +1968,1274 @@ async fn assert_command_failure_reported_on_stderr(world: &mut E2eWorld) {
     assert!(
         !stdout.contains("group membership NOT changed"),
         "the command-failure explanation must not also be on stdout:\n{stdout}"
+    );
+}
+
+#[then("the CLI used PowerShell's SetEnvironmentVariable, not setx, to update the User PATH")]
+async fn assert_path_fix_used_set_environment_variable(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no fix output");
+    assert_eq!(
+        world.cli_rc,
+        Some(0),
+        "expected the real PATH write to succeed:\n{output}"
+    );
+    // Scoped to the write, not to the whole command output. `rocm fix <id>`
+    // prints the catalog recipe first, and `fix-6-path`'s notes name
+    // `setx PATH "%PATH%;..."` in order to warn a Windows user off it -- so a
+    // whole-output `!contains("setx ")` reports on the documentation rather
+    // than on what the CLI did, and fails on a correct run. Taking the region
+    // between the plan line and the post-write confirmation asserts both
+    // halves where they mean something: the write went through PowerShell,
+    // and nothing in the write went through `setx`. Obtaining the region at
+    // all is what pins the plan line and the confirmation wording cb9f748d
+    // introduced.
+    let write_region = e2e_cucumber::user_path_write_region(output).unwrap_or_else(|| {
+        panic!(
+            "expected the plan/write region cb9f748d introduced -- a `Plan: prepend ...` line \
+             through a `This only takes effect in NEW shells` confirmation:\n{output}"
+        )
+    });
+    assert!(
+        write_region.contains("[Environment]::SetEnvironmentVariable("),
+        "expected the PowerShell plan/write line cb9f748d introduced, not setx:\n{write_region}"
+    );
+    assert!(
+        !write_region.contains("setx "),
+        "setx must not appear in the plan or the write now that it goes through PowerShell:\n{write_region}"
+    );
+}
+
+#[then("the HIP SDK bin dir is prepended on the real User PATH, apostrophe intact")]
+async fn assert_path_fix_prepended_with_apostrophe_intact(world: &mut E2eWorld) {
+    let bin_dir = path_fix_bin_dir(world).to_string_lossy().into_owned();
+    let new_user_path = lifecycle_steps::read_user_path_for_test();
+    assert!(
+        new_user_path.starts_with(&bin_dir),
+        "expected {bin_dir} prepended (not appended) to the real User PATH: {new_user_path:?}"
+    );
+    assert!(
+        new_user_path.contains("O'Brien"),
+        "the pre-existing apostrophe-containing path entry must survive the write \
+         unmangled -- a failure here means the write script's quoting broke \
+         mid-statement against a real powershell.exe, not just the unit test's \
+         simulated one:\n{new_user_path:?}"
+    );
+}
+
+#[then("the CLI aborts the PATH fix with exit code 4 and changes nothing")]
+async fn assert_path_fix_aborts_on_unreadable_path(world: &mut E2eWorld) {
+    let output = world.cli_output.as_deref().unwrap_or("");
+    let stderr = world.cli_stderr.as_deref().unwrap_or("");
+    assert_eq!(
+        world.cli_rc,
+        Some(4),
+        "a failed PATH read must abort with exit code 4 -- the same code as a \
+         write failure -- rather than being silently treated as an empty PATH \
+         (ROCMAI-449):\n{output}\n{stderr}"
+    );
+    let combined = format!("{output}\n{stderr}");
+    assert!(
+        combined.contains("Could not read the current User PATH"),
+        "expected the abort message naming the failed read:\n{combined}"
+    );
+    assert!(
+        !combined.contains("Plan: prepend"),
+        "a failed read must abort before any write plan is printed:\n{combined}"
+    );
+}
+
+// ── `rocm diagnose --model` ────────────────────────────────────────
+
+/// The largest curated recipe. Its 905 GiB minimum is above any single machine
+/// the suite runs on, which is what makes the "will not run" half of
+/// diagnose-21 hold on every lane rather than only on the small ones.
+const OVERSIZED_MODEL_REF: &str = "glm5";
+
+/// The smallest curated recipe (2 GiB minimum). Any machine that measured
+/// dedicated GPU memory can serve it, so the "ready" half of diagnose-22 holds
+/// on every discrete-GPU lane rather than only the Instinct one. An APU lane
+/// does not qualify for that half even though `amd-smi` telemetry exists
+/// there too: it names the BIOS carve-out, not the pool the engine allocates
+/// from, so those hosts report no measured figure and land in the
+/// "could not measure" half instead, alongside hosts with no GPU at all and
+/// hosts with no telemetry whatsoever.
+const SMALLEST_MODEL_REF: &str = "qwen-smoke";
+
+/// A recipe index path that cannot exist, used to make the catalog source
+/// genuinely unreachable rather than merely empty. Under the scenario's isolated
+/// root so it is impossible for a runner to have planted one there.
+fn unreachable_index_path(world: &E2eWorld) -> std::path::PathBuf {
+    world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("no-such-recipe-index.json")
+}
+
+/// A model-weight cache the scenario owns and that starts out absent, so
+/// "nothing was fetched" is a question about a directory the runner cannot have
+/// pre-populated. The shared `HF_HOME` the harness normally sets could not
+/// answer it: it is deliberately shared across scenarios and already holds
+/// weights.
+fn scenario_weights_dir(world: &E2eWorld) -> std::path::PathBuf {
+    world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("weights-must-stay-empty")
+}
+
+/// Read the `model` section of a `rocm diagnose --model ... --json` report.
+fn model_section(world: &E2eWorld) -> serde_json::Value {
+    let output = world.cli_output.as_ref().expect("no diagnose output");
+    let report: serde_json::Value =
+        serde_json::from_str(output).expect("diagnose --json did not emit valid JSON");
+    report
+        .get("model")
+        .cloned()
+        .filter(|value| !value.is_null())
+        .unwrap_or_else(|| panic!("diagnose --model emitted no model section:\n{output}"))
+}
+
+fn model_field<'a>(model: &'a serde_json::Value, field: &str) -> &'a serde_json::Value {
+    model
+        .get(field)
+        .unwrap_or_else(|| panic!("the model section has no `{field}`: {model:#}"))
+}
+
+fn model_verdict(model: &serde_json::Value) -> &str {
+    model_field(model, "verdict")
+        .as_str()
+        .expect("verdict is not a string")
+}
+
+/// Whether this host measured its own GPU memory. Everything downstream of it
+/// differs per lane, so it is read back from the report rather than assumed.
+fn measured_gpu_gib(model: &serde_json::Value) -> Option<f64> {
+    model_field(model, "available_gpu_memory_gib").as_f64()
+}
+
+#[given("a user asking about a model no single machine could serve")]
+async fn user_asks_about_an_oversized_model(world: &mut E2eWorld) {
+    world.model_name = Some(OVERSIZED_MODEL_REF.to_string());
+    let weights = scenario_weights_dir(world);
+    world
+        .command_env
+        .push(("HF_HOME", weights.into_os_string()));
+}
+
+#[given("a user asking about the smallest curated model")]
+async fn user_asks_about_the_smallest_model(world: &mut E2eWorld) {
+    world.model_name = Some(SMALLEST_MODEL_REF.to_string());
+}
+
+#[given("a machine that cannot reach the model recipe catalog")]
+async fn machine_cannot_reach_the_catalog(world: &mut E2eWorld) {
+    // The public key path is supplied too. Without it the CLI fails earlier, on
+    // the missing key rather than the missing index, and the scenario would be
+    // asserting about a different unreachable thing than the one it names.
+    let index = unreachable_index_path(world);
+    let key = index.with_extension("pem");
+    world
+        .command_env
+        .push(("ROCM_CLI_MODEL_RECIPE_INDEX_PATH", index.into_os_string()));
+    world.command_env.push((
+        "ROCM_CLI_MODEL_RECIPE_INDEX_PUBLIC_KEY_PATH",
+        key.into_os_string(),
+    ));
+    world.model_name = Some(SMALLEST_MODEL_REF.to_string());
+}
+
+#[when("the user asks the CLI whether that model would run, in machine-readable form")]
+async fn user_asks_whether_a_model_would_run(world: &mut E2eWorld) {
+    let model = world.model_name.clone().expect("no model named");
+    let (stdout, stderr, rc) =
+        crate::run_rocm_with_scenario_env(world, &["diagnose", "--model", &model, "--json"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[when("a tool asks the CLI for its catalog in machine-readable form")]
+async fn tool_reads_catalog(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["fix", "--json"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the model is never reported as ready")]
+async fn assert_model_is_never_ready(world: &mut E2eWorld) {
+    assert_eq!(
+        world.cli_rc,
+        Some(0),
+        "diagnose should exit 0 (it is a query)"
+    );
+    let model = model_section(world);
+    assert_ne!(
+        model_verdict(&model),
+        "ready",
+        "the `{OVERSIZED_MODEL_REF}` recipe needs more memory than any single machine here has, \
+         so no lane may call it ready: {model:#}"
+    );
+}
+
+#[then("a machine that measured its GPU is told the model will not run, and what would")]
+async fn assert_measured_machine_is_blocked_with_alternatives(world: &mut E2eWorld) {
+    let model = model_section(world);
+    let Some(available) = measured_gpu_gib(&model) else {
+        return;
+    };
+    assert_eq!(
+        model_verdict(&model),
+        "blocked",
+        "this machine measured {available} GiB against a 905 GiB recipe, so the answer is a \
+         refusal and not anything softer: {model:#}"
+    );
+    let alternatives = model_field(&model, "alternatives")
+        .as_array()
+        .expect("alternatives is not an array")
+        .clone();
+    assert!(
+        !alternatives.is_empty(),
+        "a refusal with nothing offered instead leaves the user where they started: {model:#}"
+    );
+    // The point of naming an alternative is that it runs HERE. One that does not
+    // fit either is worse than silence: it costs the user a second download to
+    // find out.
+    for alternative in &alternatives {
+        let required = alternative
+            .get("required_gpu_memory_gib")
+            .and_then(serde_json::Value::as_f64);
+        assert!(
+            required.is_none_or(|required| required <= available),
+            "`{}` was offered as what would run instead, but it needs {required:?} GiB and this \
+             machine measured {available} GiB: {model:#}",
+            alternative
+                .get("model_ref")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("<unnamed>")
+        );
+    }
+}
+
+#[then(
+    "a machine that could not measure its GPU is told why, rather than that the model is incompatible"
+)]
+async fn assert_unmeasured_machine_is_told_why(world: &mut E2eWorld) {
+    let model = model_section(world);
+    if measured_gpu_gib(&model).is_some() {
+        return;
+    }
+    // Four different machines land here and none of them deserves the same
+    // answer. One has no GPU at all, which is a fact and a refusal the CLI can
+    // stand behind. Another has an engine this platform's gate rules out
+    // before memory is even considered -- the gate runs first because a model
+    // that fits in memory still will not run on an engine with no adapter
+    // here, and reporting a memory verdict instead would be true and useless.
+    // A third has a GPU whose memory it could not read at all, which is a gap
+    // in what the CLI can see and must not be dressed up as a verdict about
+    // the model. The fourth is an APU: `amd-smi` telemetry exists, but it
+    // names the BIOS carve-out rather than the pool the engine allocates
+    // from, and there is no command that makes the right pool readable today
+    // -- so that gap earns its own reason, distinct from the no-telemetry-at-
+    // all case, and no dead-end remediation. None of the four may be reported
+    // as "this model is too big for you".
+    let evidence = model_field(&model, "evidence").to_string();
+    match model_verdict(&model) {
+        "blocked" => {
+            // Two causes reach `blocked` with nothing measured: the engine
+            // platform gate, and no GPU being visible at all. They must not
+            // be told apart by sniffing the same evidence text a collapse
+            // would corrupt -- `fix.summary` is written by two independent
+            // call sites in `assess_model_for_host`, so a future bug that
+            // makes one cause's evidence drift into the other's still gets
+            // caught here instead of passing silently.
+            let fix_summary = model_field(&model, "fix")
+                .get("summary")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            match fix_summary {
+                "serve this model from a platform that has the engine" => {
+                    let engine = model_field(&model, "engine").as_str().unwrap_or_default();
+                    assert!(
+                        evidence.contains(&format!("{engine} has no adapter")),
+                        "the engine-platform refusal has to name the engine this host ruled \
+                         out, or the user cannot tell which one to avoid: {model:#}"
+                    );
+                    assert!(
+                        evidence.contains("WSL or Linux"),
+                        "the engine-platform refusal has to offer the other-platform remedy, \
+                         or the user has nothing to act on: {model:#}"
+                    );
+                }
+                "make a GPU visible to ROCm, then ask again" => {
+                    assert!(
+                        evidence.contains("no GPU is visible to ROCm"),
+                        "the GPU-visibility refusal has to name the absent GPU, or the user \
+                         reads this as a fact about the model: {model:#}"
+                    );
+                    assert!(
+                        model_field(&model, "fix")
+                            .get("commands")
+                            .and_then(serde_json::Value::as_array)
+                            .is_some_and(|commands| commands
+                                .iter()
+                                .any(|command| command.as_str() == Some("rocm diagnose"))),
+                        "a host with no GPU at all has a real next step (`rocm diagnose`); \
+                         losing it would strand the user: {model:#}"
+                    );
+                }
+                other => panic!(
+                    "a machine that measured nothing reached a blocked verdict behind a fix \
+                     summary (`{other}`) this scenario does not know how to tell apart: \
+                     {model:#}"
+                ),
+            }
+            assert!(
+                model_field(&model, "available_gpu_memory_gib").is_null(),
+                "a machine that measured nothing must not report a figure it compared against: \
+                 {model:#}"
+            );
+        }
+        "undetermined" => match model_field(&model, "undetermined_reason")
+            .as_str()
+            .unwrap_or_default()
+        {
+            "accelerator_memory_unknown" => {
+                assert!(
+                    evidence.contains("could not be read"),
+                    "the no-telemetry-at-all reason has to say the memory could not be read, or \
+                     the user reads it as a fact about the model: {model:#}"
+                );
+                assert!(
+                    !model_field(&model, "fix").is_null(),
+                    "a host with no telemetry at all has a real next step (`amd-smi metric \
+                     --json`); collapsing this into the APU case would drop it: {model:#}"
+                );
+            }
+            "unified_memory_unreadable" => {
+                assert!(
+                    evidence.contains("no dedicated VRAM"),
+                    "the APU reason has to name the missing dedicated-VRAM pool, or the user \
+                     reads it as a fact about the model: {model:#}"
+                );
+                assert!(
+                    model_field(&model, "fix").is_null(),
+                    "there is no command that makes the APU's pool readable today; offering one \
+                     would be a dead end: {model:#}"
+                );
+            }
+            other => panic!(
+                "a machine that could not measure its GPU reported an undetermined reason \
+                 `{other}` this scenario does not know about: {model:#}"
+            ),
+        },
+        other => panic!(
+            "a machine that could not measure its GPU reported `{other}`, which claims more than \
+             it knows: {model:#}"
+        ),
+    }
+}
+
+#[then("the human-readable answer names what would run instead")]
+async fn assert_human_answer_names_alternatives(world: &mut E2eWorld) {
+    let model = model_section(world);
+    if measured_gpu_gib(&model).is_none() {
+        return;
+    }
+    let expected = model_field(&model, "alternatives")
+        .as_array()
+        .and_then(|alternatives| alternatives.first().cloned())
+        .and_then(|alternative| {
+            alternative
+                .get("model_ref")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .expect("the machine-readable answer offered no alternative to look for");
+    // The same question again without `--json`: the structured answer being
+    // right is no use if the report the user actually reads does not carry it.
+    let (stdout, _, rc) = crate::run_rocm(world, &["diagnose", "--model", OVERSIZED_MODEL_REF]);
+    assert_eq!(rc, 0, "diagnose should exit 0 (it is a query)");
+    assert!(
+        stdout.contains(&expected),
+        "the human-readable report never names `{expected}` as what would run instead:\n{stdout}"
+    );
+}
+
+#[then("no model weights were fetched")]
+async fn assert_no_weights_were_fetched(world: &mut E2eWorld) {
+    // Two places a fetch would land: the model-weight cache the scenario pointed
+    // the CLI at, and rocm-cli's own artifact cache under the isolated data dir.
+    // Neither exists before the run, so their continued absence is not something
+    // the runner could have arranged in advance.
+    let weights = scenario_weights_dir(world);
+    assert!(
+        !weights.exists(),
+        "asking whether a model would run created {} -- the answer is supposed to cost no \
+         download",
+        weights.display()
+    );
+    let artifacts = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("data")
+        .join("models")
+        .join("artifacts");
+    assert!(
+        !artifacts.exists(),
+        "asking whether a model would run populated the artifact cache at {}",
+        artifacts.display()
+    );
+}
+
+#[then("a machine with enough measured GPU memory is told the model is ready")]
+async fn assert_fitting_model_is_ready(world: &mut E2eWorld) {
+    assert_eq!(
+        world.cli_rc,
+        Some(0),
+        "diagnose should exit 0 (it is a query)"
+    );
+    let model = model_section(world);
+    let Some(available) = measured_gpu_gib(&model) else {
+        return;
+    };
+    let required = model_field(&model, "required_gpu_memory_gib")
+        .as_f64()
+        .unwrap_or(0.0);
+    if available < required {
+        return;
+    }
+    // `degraded` is allowed alongside `ready`: a machine whose system RAM is
+    // below the recipe's recommendation still runs it, and calling that a
+    // failure would make the scenario a test of the runner's RAM.
+    assert!(
+        matches!(model_verdict(&model), "ready" | "degraded"),
+        "this machine measured {available} GiB against a {required} GiB recipe, so the model runs \
+         here: {model:#}"
+    );
+}
+
+#[then("the answer names the engine that would serve it")]
+async fn assert_answer_names_the_engine(world: &mut E2eWorld) {
+    let model = model_section(world);
+    // Named whatever the verdict, as long as a recipe was read: which engine
+    // would serve a model does not depend on whether it fits, and withholding it
+    // on a refusal is what would leave the user unable to check an alternative.
+    if model_field(&model, "canonical_model_id").is_null() {
+        return;
+    }
+    let engine = model_field(&model, "engine")
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        !engine.is_empty(),
+        "the answer names no engine, so the user cannot tell what `rocm serve` would start: \
+         {model:#}"
+    );
+}
+
+#[then("the CLI reports that it could not determine the answer")]
+async fn assert_catalog_failure_is_undetermined(world: &mut E2eWorld) {
+    assert_eq!(
+        world.cli_rc,
+        Some(0),
+        "diagnose should exit 0 (it is a query)"
+    );
+    let model = model_section(world);
+    assert_eq!(
+        model_verdict(&model),
+        "undetermined",
+        "a catalog that could not be read says nothing about the model, so no verdict about the \
+         model may be reported: {model:#}"
+    );
+}
+
+#[then("the reason given is the unreachable catalog, not the model")]
+async fn assert_reason_is_the_catalog(world: &mut E2eWorld) {
+    let model = model_section(world);
+    assert_eq!(
+        model_field(&model, "undetermined_reason")
+            .as_str()
+            .unwrap_or_default(),
+        "catalog_unreachable",
+        "the reason must name the source, not the model: {model:#}"
+    );
+    let index = unreachable_index_path(world);
+    let file_name = index
+        .file_name()
+        .expect("index path has no file name")
+        .to_string_lossy()
+        .into_owned();
+    let evidence = model_field(&model, "evidence").to_string();
+    assert!(
+        evidence.contains(&file_name),
+        "the evidence never names the source that could not be read ({}): {evidence}",
+        index.display()
+    );
+}
+
+#[then("nothing is claimed about whether the model fits this machine")]
+async fn assert_nothing_claimed_about_fit(world: &mut E2eWorld) {
+    let model = model_section(world);
+    // The recipe was never read, so its requirement is not known. Reporting one
+    // anyway -- even a plausible one -- is how an unreachable source turns into
+    // a confident statement about the model.
+    for field in ["required_gpu_memory_gib", "canonical_model_id"] {
+        assert!(
+            model_field(&model, field).is_null(),
+            "`{field}` was reported for a model whose recipe was never read: {model:#}"
+        );
+    }
+}
+
+/// A ref shaped like a real model name but planted nowhere in the built-in
+/// catalog. Deliberately not a nonsense string: the point of the scenario is
+/// that a well-formed ref outside the curated set is still undetermined, not
+/// that a malformed one is.
+const UNCURATED_MODEL_REF: &str = "e2e-fixtures/not-a-curated-model";
+
+#[given("a user asking about a model the curated catalog does not carry")]
+async fn user_asks_about_an_uncurated_model(world: &mut E2eWorld) {
+    world.model_name = Some(UNCURATED_MODEL_REF.to_string());
+}
+
+#[then("the reason given is that the model is not curated, not that it does not fit")]
+async fn assert_reason_is_not_curated(world: &mut E2eWorld) {
+    let model = model_section(world);
+    assert_eq!(
+        model_verdict(&model),
+        "undetermined",
+        "a model the catalog never carried is not a refusal, and must not be scored as one: \
+         {model:#}"
+    );
+    assert_eq!(
+        model_field(&model, "undetermined_reason")
+            .as_str()
+            .unwrap_or_default(),
+        "model_not_curated",
+        "the reason must name the missing metadata, or the user reads it as a fact about \
+         whether the model fits: {model:#}"
+    );
+}
+
+fn workspace_root() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("e2e-cucumber must live under <workspace>/tests")
+        .to_path_buf()
+}
+
+fn xtask_command() -> std::process::Command {
+    if let Some(binary) = std::env::var_os("ROCM_XTASK_BINARY") {
+        std::process::Command::new(binary)
+    } else {
+        let mut command = std::process::Command::new(
+            std::env::var_os("CARGO").unwrap_or_else(|| std::ffi::OsString::from("cargo")),
+        );
+        command.arg("xtask");
+        command
+    }
+}
+
+/// A ref that exists only in the synthetic catalog [`user_asks_about_a_ram_degraded_model`]
+/// signs and points the CLI at.
+const DEGRADED_MODEL_REF: &str = "e2e-fixtures/ram-degraded";
+
+/// A recipe that needs almost no GPU memory -- so it clears the fit check on
+/// any lane that measured a GPU at all -- but recommends more system RAM than
+/// any real test host has, so the RAM softening is the only thing left that
+/// can fire. Built fresh per scenario (mirrors the signed-catalog pattern in
+/// `artifact_steps.rs`) because no built-in recipe can produce this
+/// combination: every built-in recipe's RAM recommendation scales with its
+/// GPU requirement, and `detect_system_ram_gib` has no env-var override to
+/// fake the other side of the comparison.
+#[given("a user asking about a model that recommends far more system RAM than this host has")]
+async fn user_asks_about_a_ram_degraded_model(world: &mut E2eWorld) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .to_path_buf();
+    let index = root.join("degraded-recipes.json");
+    let signature = root.join("degraded-recipes.json.sig");
+    let public_key = root.join("degraded-recipe-public.pem");
+    let private_key = root.join("degraded-recipe-private.pem");
+
+    let document = serde_json::json!({
+        "schema_version": 1,
+        "source": "e2e-ram-degraded",
+        "recipes": [{
+            "canonical_model_id": DEGRADED_MODEL_REF,
+            "aliases": [],
+            "task": "chat",
+            "source": "signed_recipe_index",
+            "revision": "main",
+            "loader": "transformers",
+            "trust_remote_code": false,
+            "dtype": "float16",
+            "device_policy": "gpu_required",
+            "min_gpu_mem_gb": 1,
+            "recommended_system_ram_gb": 999_999,
+            "artifacts": [],
+            "engine_recipes": [],
+            "manual_alternatives": [],
+            "featured": false,
+            "chat_template_mode": "auto",
+            // `lemonade`, not `vllm`: this scenario carries no platform tag and
+            // runs on every lane, including native Windows, where vLLM has no
+            // adapter and would be ruled out before the RAM softening this
+            // scenario exists to exercise ever runs -- turning the expected
+            // `degraded` into `blocked` on exactly the lane that also measures
+            // a GPU. `lemonade` is not ruled out on any lane this suite runs.
+            "preferred_engines": ["lemonade"],
+            "warnings": []
+        }]
+    });
+    std::fs::write(
+        &index,
+        serde_json::to_vec_pretty(&document).expect("failed to serialize recipe fixture"),
+    )
+    .expect("failed to write recipe fixture");
+
+    let keygen = xtask_command()
+        .args(["keygen", "--private-out"])
+        .arg(&private_key)
+        .arg("--public-out")
+        .arg(&public_key)
+        .current_dir(workspace_root())
+        .status()
+        .expect("failed to run xtask keygen");
+    assert!(keygen.success(), "xtask keygen failed");
+    let sign = xtask_command()
+        .args(["sign", "--private-key"])
+        .arg(&private_key)
+        .arg("--in")
+        .arg(&index)
+        .arg("--out")
+        .arg(&signature)
+        .current_dir(workspace_root())
+        .status()
+        .expect("failed to run xtask sign");
+    assert!(sign.success(), "xtask sign failed");
+
+    world
+        .command_env
+        .push(("ROCM_CLI_MODEL_RECIPE_INDEX_PATH", index.into_os_string()));
+    world.command_env.push((
+        "ROCM_CLI_MODEL_RECIPE_INDEX_SIGNATURE_PATH",
+        signature.into_os_string(),
+    ));
+    world.command_env.push((
+        "ROCM_CLI_MODEL_RECIPE_INDEX_PUBLIC_KEY_PATH",
+        public_key.into_os_string(),
+    ));
+    world.model_name = Some(DEGRADED_MODEL_REF.to_string());
+}
+
+#[then("a machine with enough measured GPU memory to run it is told the model is degraded")]
+async fn assert_ram_short_machine_is_degraded(world: &mut E2eWorld) {
+    assert_eq!(
+        world.cli_rc,
+        Some(0),
+        "diagnose should exit 0 (it is a query)"
+    );
+    let model = model_section(world);
+    let Some(_available) = measured_gpu_gib(&model) else {
+        // No GPU measurement means this lane cannot clear the fit check at
+        // all, so it lands on the "no GPU visible" or "memory unknown" halves
+        // that the reused unmeasured-machine step already covers -- not on
+        // degraded.
+        return;
+    };
+    assert_eq!(
+        model_verdict(&model),
+        "degraded",
+        "this recipe needs 1 GiB of GPU memory (which any measuring lane clears) and recommends \
+         999999 GiB of system RAM (which no real host has), so the RAM softening is the only \
+         path left, and blocked or ready are both wrong here: {model:#}"
+    );
+}
+
+// ── `--model` with `--distro` ──────────────────────────────────────
+
+#[given("a user who asks --model together with --distro")]
+async fn user_asks_model_with_distro(world: &mut E2eWorld) {
+    world.model_name = Some(SMALLEST_MODEL_REF.to_string());
+}
+
+#[when("the user asks the CLI to diagnose with both flags")]
+async fn user_diagnoses_with_model_and_distro(world: &mut E2eWorld) {
+    let model_ref = world.model_name.clone().expect("no model ref set");
+    // No distro name given: the refusal must fire on the flag itself, before
+    // any probe that would need one to exist runs at all -- so this holds on
+    // a lane with no WSL and no `wsl.exe`, not only on a WSL host.
+    let (stdout, stderr, rc) =
+        crate::run_rocm(world, &["diagnose", "--model", &model_ref, "--distro"]);
+    world.cli_output = Some(format!("{stdout}\n{stderr}"));
+    world.cli_rc = Some(rc);
+}
+
+#[when("the user asks the CLI what a report would carry")]
+async fn user_asks_what_a_report_would_carry(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["diagnose", "--report"]);
+    world.cli_output = Some(format!("{stdout}\n{stderr}"));
+    world.cli_rc = Some(rc);
+}
+
+#[then("the CLI refuses and says --model answers for this machine, not the one --distro names")]
+async fn assert_model_with_distro_refused(world: &mut E2eWorld) {
+    let output = world.cli_output.clone().unwrap_or_default();
+    let rc = world.cli_rc.expect("no exit code recorded");
+    assert_ne!(
+        rc, 0,
+        "--model together with --distro must be refused, not answered:\n{output}"
+    );
+    assert!(
+        output.contains("--model answers for the machine running this command")
+            && output.contains("--distro points the examination at a different one"),
+        "the refusal must say --model answers for this machine and --distro names another \
+         one, not some other failure (e.g. wsl.exe missing, which would mean the refusal fired \
+         too late -- after a probe attempt rather than on the flag itself):\n{output}"
+    );
+    // The refusal must fire before any probe, so it must not also carry a
+    // probe failure (e.g. "wsl.exe was not found") -- that would mean the two
+    // flags together produced the right exit code for the wrong reason.
+    assert!(
+        !output.to_lowercase().contains("wsl.exe"),
+        "the refusal must preempt the distro probe entirely, not race it:\n{output}"
+    );
+}
+
+#[then("no model verdict is reported")]
+async fn assert_no_model_verdict_on_refusal(world: &mut E2eWorld) {
+    let output = world.cli_output.clone().unwrap_or_default();
+    let model_ref = world.model_name.clone().expect("no model ref set");
+    // Not a bare `contains("rocm diagnose --model ")`: the refusal's own
+    // remediation text names that command (with a literal `<model>`
+    // placeholder) as what to run instead, so that substring appears in a
+    // correct refusal too. A real verdict line always follows the command
+    // with the actual ref and a colon (`render_model_readiness_text`'s
+    // leading line); the placeholder never does.
+    let verdict_marker = format!("rocm diagnose --model {model_ref}:");
+    assert!(
+        !output.contains(&verdict_marker),
+        "a refused request must not also report a model verdict for the wrong machine:\n{output}"
+    );
+}
+
+#[when("the user asks the CLI what a report would carry in machine-readable form")]
+async fn user_asks_what_a_report_would_carry_json(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["diagnose", "--report", "--json"]);
+    world.cli_output = Some(format!("{stdout}\n{stderr}"));
+    world.cli_rc = Some(rc);
+}
+
+#[then("the CLI either shows the whole report or says why it will not prepare one")]
+async fn report_is_shown_or_refused(world: &mut E2eWorld) {
+    let out = world.cli_output.clone().expect("no CLI output");
+    let shown = out.contains("a report would carry");
+    let refused = out.contains("no report was prepared") || out.contains("No report was prepared");
+    assert!(
+        shown || refused,
+        "asking for a report produced neither a report nor a stated refusal, which leaves a \
+         user unable to tell what would be published:\n{out}"
+    );
+    assert_eq!(
+        world.cli_rc,
+        Some(0),
+        "a refusal is this command working, not failing, so both branches exit 0:\n{out}"
+    );
+}
+
+#[then("the CLI states that nothing has been sent")]
+async fn nothing_has_been_sent(world: &mut E2eWorld) {
+    let out = world.cli_output.clone().expect("no CLI output");
+    // Only the prepared-report branch makes the promise; a refusal prepared
+    // nothing to send, so requiring the sentence there would assert about a
+    // report that does not exist.
+    if out.contains("a report would carry") {
+        assert!(
+            out.contains("Nothing has been sent"),
+            "the report was shown without saying it stayed here, which is the one thing a user \
+             needs to know before reading it:\n{out}"
+        );
+    }
+}
+
+#[then("the answer names no user, no host, and no file path")]
+async fn answer_names_nothing_identifying(world: &mut E2eWorld) {
+    let out = world.cli_output.clone().expect("no CLI output");
+    // A refusal envelope (`{"schema","refused","explanation"}`) trivially
+    // contains none of the markers swept below, so on a lane whose hardware is
+    // not on the allowlist -- the common case, since most lanes have no AMD
+    // GPU at all -- every sweep would pass without a report ever having
+    // existed to sweep. Branch on the outcome, the same way the sibling step
+    // `nothing_has_been_sent` already does.
+    //
+    // `cli_version` is the discriminator, not `architecture`: the
+    // `ArchitectureUnreadable` refusal's own explanation text ("No AMD GPU
+    // *architecture* could be read here...") contains the word "architecture",
+    // so keying off that field name would make this same vacuous pass survive
+    // under a different guise on exactly the refusal this sandbox reaches.
+    // `cli_version` is a field `Report` carries and no refusal explanation
+    // does.
+    if out.contains("cli_version") {
+        assert!(
+            out.contains("architecture"),
+            "a genuine report is missing the architecture field it is supposed to carry:\n{out}"
+        );
+    } else {
+        assert!(
+            out.contains("no report was prepared")
+                || out.contains("No report was prepared")
+                || out.contains("\"refused\""),
+            "the output is neither a genuine report nor a stated refusal, so this assertion \
+             would otherwise pass without a report ever existing to check:\n{out}"
+        );
+        return;
+    }
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_default();
+    if !user.is_empty() && user.len() > 2 {
+        assert!(
+            !out.contains(&user),
+            "the user name reached what a report would publish:\n{out}"
+        );
+    }
+    let host = hostname_of_this_machine();
+    if !host.is_empty() && host.len() > 2 {
+        assert!(
+            !out.contains(&host),
+            "the host name reached what a report would publish:\n{out}"
+        );
+    }
+    for path_marker in ["/opt/rocm", "/home/", "C:\\", "/usr/"] {
+        assert!(
+            !out.contains(path_marker),
+            "a file path ({path_marker}) reached what a report would publish:\n{out}"
+        );
+    }
+}
+
+/// The mailbox `--send` offers to prefill, mirrored from
+/// `rocm_core::report_delivery::DESTINATION`. Kept as a literal rather than a
+/// dependency on `rocm-core`: this crate only runs the built binary, it does
+/// not link the library behind it.
+const REPORT_DESTINATION: &str = "ROCmCLI@amd.com";
+
+#[when("the user asks the CLI for a way to send a report, without asking to see the report first")]
+async fn user_asks_to_send_without_report(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["diagnose", "--send"]);
+    world.cli_output = Some(format!("{stdout}\n{stderr}"));
+    world.cli_rc = Some(rc);
+}
+
+#[then("the CLI refuses and explains that the report must be requested too")]
+async fn assert_send_without_report_refused(world: &mut E2eWorld) {
+    let out = world.cli_output.clone().expect("no CLI output");
+    assert_eq!(
+        world.cli_rc,
+        Some(2),
+        "asking for a way to send a report without asking to see it first is an argument \
+         mistake, caught before anything is examined, so it exits the way any other bad \
+         argument combination does:\n{out}"
+    );
+    assert!(
+        out.contains("--report"),
+        "the refusal does not name the flag the user needed to add first:\n{out}"
+    );
+}
+
+/// Forces the headless branch deterministically: no display of any kind, no
+/// SSH-forwarded display, and no override asking for a browser regardless.
+/// Linux-only in effect, because the CLI under test only reads these on
+/// Linux — but the scenario that uses this is the one tagged
+/// `@requires-os:linux`, not this helper, so nothing here needs to branch on
+/// host.
+#[when("the user asks the CLI for a way to send a report, with no desktop available to open it on")]
+async fn user_asks_to_send_on_a_headless_machine(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm_with_env(
+        world,
+        &["diagnose", "--report", "--send"],
+        &[
+            ("DISPLAY", ""),
+            ("WAYLAND_DISPLAY", ""),
+            ("SSH_CONNECTION", ""),
+            ("SSH_CLIENT", ""),
+            ("SSH_TTY", ""),
+            ("ROCM_NO_BROWSER", ""),
+        ],
+    );
+    world.cli_output = Some(format!("{stdout}\n{stderr}"));
+    world.cli_rc = Some(rc);
+}
+
+#[then("the CLI prints the address to mail and a link, and starts nothing")]
+async fn assert_send_headless_prints_address_and_link(world: &mut E2eWorld) {
+    let out = world.cli_output.clone().expect("no CLI output");
+    // Same discriminator as `answer_names_nothing_identifying`: a refusal
+    // envelope has no `cli_version` field, so branch on its presence rather
+    // than asserting a shape that only a genuine report has.
+    if out.contains("cli_version") {
+        assert!(
+            out.contains(REPORT_DESTINATION),
+            "a headless machine was not given the address to mail by hand:\n{out}"
+        );
+        assert!(
+            out.contains("mailto:"),
+            "a headless machine was not given a link, only the sentence around it:\n{out}"
+        );
+        assert!(
+            !out.contains("was opened"),
+            "a mail client was reported opened on a machine with no desktop to open it on:\n{out}"
+        );
+    } else {
+        assert!(
+            out.contains("no report was prepared")
+                || out.contains("No report was prepared")
+                || out.contains("\"refused\""),
+            "the output is neither a genuine report nor a stated refusal, so this assertion \
+             would otherwise pass without a report ever existing to check:\n{out}"
+        );
+    }
+}
+
+/// This machine's host name, or empty when it cannot be read.
+///
+/// Read here rather than from the CLI: the assertion is that the name never
+/// appears in a report, so taking it from the thing under test would compare
+/// the report against itself.
+fn hostname_of_this_machine() -> String {
+    std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_owned())
+        .unwrap_or_default()
+}
+
+#[then("the CLI explains that it will not make the change itself")]
+async fn assert_fix_is_advisory(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no fix output");
+    assert_eq!(
+        world.cli_rc,
+        Some(0),
+        "printing advice is not a failure:\n{output}"
+    );
+    assert!(
+        output.contains("print-only") || output.contains("will NOT run it"),
+        "the user has to be told the CLI is not going to do this for them:\n{output}"
+    );
+}
+
+#[then("the CLI offers both options without ranking them")]
+async fn assert_both_options_unranked(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no fix output");
+    // Both remedies have to be present. Offering one is a recommendation by
+    // omission, and the wrong one breaks a working environment.
+    //
+    // Keyed on the option markers rather than on words like "remove", which also
+    // occur in the surrounding prose -- an assertion that matched those would
+    // still pass with one of the two options deleted, which is exactly the
+    // regression it exists to catch.
+    for option in ["(a)", "(b)"] {
+        assert!(
+            output.contains(option),
+            "only one way out was offered; option `{option}` is missing, which makes \
+             the other a recommendation by omission:\n{output}"
+        );
+    }
+    assert!(
+        output.contains("Neither option is recommended"),
+        "the CLI has to say it is not choosing between them -- which is right \
+         depends on which stack the user means to keep:\n{output}"
+    );
+}
+
+#[when("the user asks the CLI to apply that fix in machine-readable form")]
+async fn user_applies_fix_as_json(world: &mut E2eWorld) {
+    let fix_id = world.model_name.clone().expect("no fix id set");
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["fix", &fix_id, "--json"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the catalog names every entry and what the CLI does with each")]
+async fn assert_catalog_is_complete(world: &mut E2eWorld) {
+    assert_eq!(world.cli_rc, Some(0), "reading the catalog is a query");
+    let output = world.cli_output.as_ref().expect("no catalog output");
+    let catalog: serde_json::Value = serde_json::from_str(output)
+        .unwrap_or_else(|e| panic!("the catalog is not machine-readable ({e}):\n{output}"));
+
+    // Against the same pinned list the human listing is held to, so the two
+    // forms cannot come to describe different catalogs.
+    let ids: Vec<&str> = catalog["entries"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no entries in the catalog:\n{catalog:#}"))
+        .iter()
+        .filter_map(|e| e["id"].as_str())
+        .collect();
+    assert_eq!(
+        ids, CATALOG_FIX_IDS,
+        "the published catalog and the documented one disagree"
+    );
+
+    // Per platform, not per entry: an entry can be applied on one platform and
+    // only explained on another, and a reader that could not see that would be
+    // told the wrong thing on one of them.
+    for entry in catalog["entries"].as_array().expect("entries") {
+        let platforms = entry["platforms"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{} names no platforms:\n{entry:#}", entry["id"]));
+        assert!(
+            !platforms.is_empty(),
+            "{} applies nowhere, which cannot be right:\n{entry:#}",
+            entry["id"]
+        );
+        for platform in platforms {
+            assert!(
+                platform["os"].is_string() && platform["class"].is_string(),
+                "{} does not say what it does on a platform it applies to:\n{platform:#}",
+                entry["id"]
+            );
+        }
+    }
+    assert!(
+        catalog["contract_version"].is_number(),
+        "a reader cannot tell whether it understands this catalog:\n{catalog:#}"
+    );
+}
+
+#[then("it gives the meaning of every exit code the CLI can return")]
+async fn assert_exit_codes_published(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no catalog output");
+    let catalog: serde_json::Value = serde_json::from_str(output).expect("catalog parses");
+    let codes = catalog["exit_codes"]
+        .as_object()
+        .unwrap_or_else(|| panic!("the catalog publishes no exit codes:\n{catalog:#}"));
+    // Naming them is the point: a caller that receives a 3 and cannot look it up
+    // is back to guessing, which is what the prose it replaces forced it to do.
+    for name in [
+        "ok",
+        "internal",
+        "unknown_id",
+        "not_applicable",
+        "failed",
+        "declined",
+    ] {
+        assert!(
+            codes.contains_key(name),
+            "the published exit codes are missing `{name}`:\n{catalog:#}"
+        );
+    }
+}
+
+#[then("the CLI refuses and explains that the two cannot be combined")]
+async fn assert_json_with_fix_id_refused(world: &mut E2eWorld) {
+    let stderr = world.cli_stderr.as_ref().expect("no stderr");
+    assert_ne!(
+        world.cli_rc,
+        Some(0),
+        "a request with no answer must not look like it succeeded"
+    );
+    assert!(
+        stderr.contains("--json"),
+        "the refusal has to name what was wrong with the request:\n{stderr}"
+    );
+    // Nothing may be emitted that a caller could mistake for the catalog.
+    let stdout = world.cli_output.as_ref().map_or("", String::as_str);
+    assert!(
+        serde_json::from_str::<serde_json::Value>(stdout).is_err(),
+        "a refused request still produced machine-readable output:\n{stdout}"
+    );
+}
+
+// ── A GPU ROCm has no build for ────────────────────────────────────
+
+#[given("a machine whose only GPU is one ROCm has no build for")]
+async fn machine_with_an_unsupported_gpu(world: &mut E2eWorld) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .to_owned();
+    // One GPU node in the kernel topology, reporting gfx_target_version 90012.
+    // That decodes to gfx90c -- the Vega iGPU in Renoir / Lucienne / Cezanne /
+    // Barcelo, and the one architecture the catalog says has no ROCm build.
+    // `cpu_cores_count 0` with a nonzero `simd_count` is what makes the node a
+    // GPU rather than a CPU node.
+    let node = root.join("host-root/sys/class/kfd/kfd/topology/nodes/1");
+    std::fs::create_dir_all(&node).expect("failed to create planted KFD node");
+    std::fs::write(
+        node.join("properties"),
+        "cpu_cores_count 0\nsimd_count 56\ngfx_target_version 90012\n",
+    )
+    .expect("failed to write planted KFD node properties");
+    world
+        .command_env
+        .push(("ROCM_CLI_TEST_HOST_ROOT", root.join("host-root").into()));
+    // An `lspci` that lists an empty bus, ahead of any real one, so the PCI
+    // probe succeeds on every runner without describing the runner's cards --
+    // a second, supported GPU would make the whole-machine claim false and the
+    // cause would correctly not fire.
+    let bin = root.join("unsupported-gpu-bin");
+    std::fs::create_dir_all(&bin).expect("failed to create the fake PATH dir");
+    rocm_core::fake_executable::write_fake_executable(&bin.join("lspci"), "#!/bin/sh\nexit 0\n")
+        .expect("failed to write the fake lspci");
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .expect("PATH entries cannot hold a separator");
+    world.command_env.push(("PATH", path));
+}
+
+#[when("the user asks the CLI to diagnose that machine's state")]
+async fn user_diagnoses_planted_machine(world: &mut E2eWorld) {
+    // No `--symptom`: the finding is about the hardware, and the user on this
+    // host has no error to paste -- Vulkan inference works. `--top 20` so the
+    // assertions below read the whole ranking rather than the default five.
+    // Where the cause ranks is a separate question from whether it is reported
+    // at all, and the runner's own state can add causes above it.
+    let (stdout, stderr, rc) =
+        crate::run_rocm_with_scenario_env(world, &["diagnose", "--top", "20"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+/// The reported cause block for `info-20-gpu-no-rocm-support`: the `#N (id)`
+/// header line and everything under it up to the blank line that ends it.
+fn unsupported_gpu_cause(output: &str) -> Vec<&str> {
+    output
+        .lines()
+        .skip_while(|line| !line.contains("(info-20-gpu-no-rocm-support)"))
+        .take_while(|line| !line.trim().is_empty())
+        .collect()
+}
+
+#[then("the diagnosis names the architecture and says Vulkan still works")]
+async fn assert_unsupported_gpu_named(world: &mut E2eWorld) {
+    assert_eq!(world.cli_rc, Some(0), "`rocm diagnose` always exits 0");
+    let output = world.cli_output.as_ref().expect("no diagnose output");
+    let cause = unsupported_gpu_cause(output);
+    assert!(
+        !cause.is_empty(),
+        "the planted gfx90c host must be told why ROCm will not work on it:\n{output}"
+    );
+    let text = cause.join("\n");
+    assert!(
+        text.contains("gfx90c"),
+        "naming the architecture is the acceptance criterion; a bare \"unsupported\" \
+         leaves the user unable to check it:\n{text}"
+    );
+    assert!(
+        text.contains("Vulkan"),
+        "and the usable path has to be named, or the report reads as \"this machine \
+         cannot do inference\":\n{text}"
+    );
+}
+
+#[then("that cause offers no fix to apply, and says so")]
+async fn assert_unsupported_gpu_has_no_fix(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no diagnose output");
+    let text = unsupported_gpu_cause(output).join("\n");
+    assert!(
+        text.contains("no reliable fix"),
+        "the flags line has to say there is nothing to apply, or `apply with:` below it \
+         reads as a repair:\n{text}"
+    );
+    // The `apply with:` line is still printed, and still works: the id is a
+    // DIAGNOSE-ONLY catalog entry, so `rocm fix` answers for it by naming the
+    // problem and changing nothing. Dropping the line for this one id would
+    // have made README and `--help` false for it.
+    assert!(
+        text.contains("apply with: rocm fix info-20-gpu-no-rocm-support"),
+        "every cause carries the command that acts on it, this one included:\n{text}"
+    );
+    // Run against the SAME simulated host the diagnosis was made on, not the
+    // runner's own machine. `run_rocm_with_scenario_env` in the When step
+    // consumes `world.command_env` by design, so the host root is re-applied
+    // here explicitly rather than by reaching into a drained field.
+    //
+    // This is not cosmetic. `rocm fix` gates on `fix::current_os`, which
+    // resolves WSL by probing `/dev/dxg` and `/proc/version` *through* the host
+    // root. On a WSL2 runner -- which `@requires-os:linux` selects, because WSL2
+    // reports an `os_family` of `linux` -- the unrooted command is read as os
+    // `wsl`, which this entry deliberately does not apply on, and it exits 3 for
+    // a reason that has nothing to do with the behaviour under test.
+    let host_root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("host-root");
+    let (fix_stdout, _, rc) = crate::run_rocm_with_env(
+        world,
+        &["fix", "info-20-gpu-no-rocm-support", "--yes"],
+        &[(
+            "ROCM_CLI_TEST_HOST_ROOT",
+            host_root.to_string_lossy().as_ref(),
+        )],
+    );
+    assert_eq!(
+        rc, 0,
+        "the id the report told the user to run must be one `rocm fix` accepts:\n{fix_stdout}"
+    );
+    // Exit 0 alone is also what a PRINT-ONLY routing produces, and that one
+    // hands the user commands to run. What the report promised is that there is
+    // nothing to apply, so the promise is what gets asserted -- AGENTS.md §3.
+    assert!(
+        fix_stdout.contains("no reliable fix, so this command changes nothing"),
+        "a DIAGNOSE-ONLY id has to say it changed nothing; exit 0 on its own would \
+         equally describe a print-only fix handing over steps to carry out:\n{fix_stdout}"
+    );
+    assert!(
+        !fix_stdout.contains("Copy the commands above"),
+        "and it must not route through the print-only path, which asks for steps to be \
+         run that this entry does not have:\n{fix_stdout}"
+    );
+}
+
+#[then("no cause tells this user to install the HIP SDK")]
+async fn assert_no_hip_sdk_advice(world: &mut E2eWorld) {
+    // DELIBERATELY WEAKER THAN ITS NAME SUGGESTS, and a reader should know
+    // which half of the change it covers.
+    //
+    // `check_13_hip_sdk_missing` opens with `if e.os_family != "windows" {
+    // return zero(..) }`, which predates this change. On a Linux lane that
+    // early return alone makes this assertion hold, so it would still pass with
+    // `check_20` deleted. What it is worth is the general form: a guard that
+    // nothing *else* ever starts proposing an SDK install on a Vulkan-only
+    // host, and that the Windows gate above is not removed without a
+    // replacement. It is not proof of the Windows regression.
+    //
+    // That regression has no end-to-end coverage, and cannot have any today.
+    // The host-simulation seam (`rocm_core::hardware_root`, via
+    // `ROCM_CLI_TEST_HOST_ROOT`) re-roots Linux sysfs/procfs/device paths only;
+    // the Windows GPU probe shells out to `Win32_VideoController` and has no
+    // seam, so a Windows-shaped gfx90c host cannot be planted at all. The
+    // Windows lane that runs per PR is restricted to `@lifecycle` scenarios by
+    // `E2E_ONLY_LIFECYCLE=1`, and the self-hosted Windows lanes run on real
+    // Strix Halo (gfx1151, supported), where `check_20` correctly stays silent.
+    // The stated substitute is the unit test
+    // `fix_13_does_not_fire_on_a_lemonade_vulkan_host_with_no_hip_evidence` in
+    // `rocm-core::diagnose`, which drives the whole `diagnose()` pipeline on
+    // the ticket's exact Windows/gfx90c host shape.
+    let output = world.cli_output.as_ref().expect("no diagnose output");
+    assert!(
+        !output.contains("fix-13-hip-sdk-missing"),
+        "a host whose only engine is Vulkan has nothing to gain from a HIP SDK:\n{output}"
     );
 }

@@ -8,13 +8,14 @@
 //! either mutates reducer state directly (nav / overlays), raises a one-shot
 //! executor edge (`slash_tool` / `plan_request` / `provider_switch`) for the
 //! event loop to drain off-thread, or pushes a usage/error turn. Stays I/O-free.
-//! Split out of `app/mod.rs` to keep the core reducer focused; the slash-command
-//! payload types it raises (`SlashOutcome`, `SlashToolRequest`, `ProviderSwitch`)
-//! stay in `mod.rs` alongside the `AppState` fields that carry them.
+//! Split out of `app/mod.rs` to keep the core reducer focused. Of the
+//! slash-command payload types it raises, `SlashOutcome` and
+//! `SlashToolRequest` live in `types.rs`; `ProviderSwitch` stays in
+//! `mod.rs`, alongside the `AppState` fields that carry them.
 
 use super::{
     ActiveTab, AppState, ChatProvider, ChatTurn, Modal, ProviderSwitch, SlashOutcome,
-    SlashToolRequest,
+    SlashToolRequest, request_quit,
 };
 
 impl AppState {
@@ -48,7 +49,10 @@ impl AppState {
             "gpu" => self.active_tab = ActiveTab::Observe,
             "help" | "?" => self.modal = Modal::Help,
             "clear" => self.chat.clear(),
-            "quit" | "exit" => self.should_quit = true,
+            // Shares `KeyAction::Quit`'s own gate (issue #145): a model still
+            // being served gets the same confirm prompt the `q` key opens,
+            // instead of a second, independently-decided quit path.
+            "quit" | "exit" => self.should_quit = request_quit(self),
             // --- Group B: read-only overlays (mirror the keybind handlers) ---
             "doctor" => {
                 self.close_overlays();

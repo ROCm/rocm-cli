@@ -51,7 +51,7 @@ pub(crate) fn examine_remote(
 fn parse_examination(json: &str) -> Result<Examination> {
     serde_json::from_str::<Examination>(json.trim()).context(
         "could not understand the remote machine's system state. The remote CLI is \
-         probably a different version than this one — update whichever is older.",
+         probably a different version than this one - update whichever is older.",
     )
 }
 
@@ -338,6 +338,11 @@ mod tests {
                 url: "https://example.invalid/issues".to_owned(),
             },
             out_of_scope: None,
+            // These fixtures exercise the remote renderer, which prints the
+            // environment half of a report. A model verdict rides on top of
+            // that half rather than replacing it, so there is nothing for these
+            // to say about one.
+            model: None,
         }
     }
 

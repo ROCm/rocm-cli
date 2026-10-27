@@ -4,8 +4,9 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use rocm_core::{
-    AppPaths, DependencyViolation, check_dependencies, ensure_uv_binary, split_local_version,
-    uv_command_env, uv_pip_install_base, violation_subject, violations_requiring,
+    AppPaths, DependencyViolation, check_dependencies, command_failure_detail, ensure_uv_binary,
+    split_local_version, uv_command_env, uv_pip_freeze_args, uv_pip_install_base,
+    violation_subject, violations_requiring,
 };
 use rocm_engine_protocol::{InstallRequest, InstallResponse};
 use std::path::{Path, PathBuf};
@@ -13,9 +14,9 @@ use std::process::Command as ProcessCommand;
 
 use crate::ENGINE_NAME;
 use crate::runtime::{
-    VllmRuntime, assessed_python_for_repair, describe_skipped_managed_runtimes,
-    recorded_sdk_torch_build, resolve_managed_runtime_python, resolve_vllm_runtime,
-    runtime_is_managed, vllm_runtime_warnings,
+    ROCM_SDK_10_0, ROCM_SDK_10_1, VllmRuntime, assessed_python_for_repair,
+    describe_skipped_managed_runtimes, recorded_sdk_torch_build, resolve_managed_runtime_python,
+    resolve_vllm_runtime, rocm_sdk_series_matches, runtime_is_managed, vllm_runtime_warnings,
 };
 use crate::state::runtime_lock_hash;
 
@@ -43,58 +44,169 @@ const VLLM_ROCM_BUILD_TABLE: &[VllmRocmBuild] = &[VllmRocmBuild {
 /// what lets [`vllm_rocm_build_from_index_url`] recover the build a custom
 /// index serves and keep the requirement pinned to it.
 const VLLM_ROCM_INDEX_PREFIX: &str = "https://wheels.vllm.ai/rocm";
+/// How a [`VllmRocmDiscoverBuild`] row constrains the release discovery may
+/// resolve for one package.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiscoverVersion {
+    /// `{pkg}=={series}.*`: the newest release in the series.
+    Series(&'static str),
+    /// `{pkg}=={release}`: exactly this release. Under PEP 440 a specifier
+    /// without a local version still matches any `+rocm…` local version of
+    /// it, but not a longer release such as `{release}.2`. Needed where AMD
+    /// publishes rebuilds as extra release segments (torchaudio
+    /// `2.11.0`/`2.11.0.2`/`2.11.0.3`, each paired with a different torch), so
+    /// a series match would pick the rebuild for the wrong torch.
+    Exact(&'static str),
+}
+impl DiscoverVersion {
+    /// The requirement handed to `uv` for `pkg`.
+    fn requirement(self, pkg: &str) -> String {
+        match self {
+            Self::Series(series) => format!("{pkg}=={series}.*"),
+            Self::Exact(release) => format!("{pkg}=={release}"),
+        }
+    }
+}
 /// A ROCm SDK version whose vLLM/flash-attn/amd-aiter wheels aren't published
 /// under a fixed filename (AMD rotates the dev-tag suffix constantly), so the
 /// exact wheel must be discovered from the index at install time instead of
 /// pinned in [`VLLM_ROCM_BUILD_TABLE`].
 pub(crate) struct VllmRocmDiscoverBuild {
     rocm_sdk_version: &'static str,
+    /// PEP 425 interpreter tag this row's wheels are published for. AMD builds
+    /// ROCm 10.x `vllm`, `flash-attn` and `amd-aiter` for exactly one CPython
+    /// version, so a venv on any other interpreter resolves nothing at all.
+    python_tag: &'static str,
+    /// Index publishing this row's rotating-dev-tag vLLM/flash-attn/amd-aiter
+    /// wheels. Per-row because ROCm 10.1 frameworks are staged on a different
+    /// host than 10.0's.
+    vllm_index_url: &'static str,
+    /// Index publishing this row's torch build.
+    torch_index_url: &'static str,
     vllm_version_prefix: &'static str,
     flash_attn_version_prefix: &'static str,
     amd_aiter_version_prefix: &'static str,
-    torch_requirement: &'static str,
-    tensorizer_requirement: &'static str,
+    torch_version_prefix: &'static str,
+    /// torchvision's version prefix is always the ROCm "Next" torch minor
+    /// plus 15 (torch 2.12 pairs with torchvision 0.27); torchaudio has no
+    /// such rule and is hardcoded per row to whatever AMD has actually
+    /// published for it. Both are discovered fresh alongside torch rather
+    /// than trusted from a pre-install snapshot, so the triplet installed
+    /// here is always coherent with the torch version this row actually pins
+    /// (see `install_vllm_rocm10_discover`).
+    torchvision_version_prefix: &'static str,
+    /// [`DiscoverVersion::Exact`] wherever the row's index publishes more than
+    /// one rebuild of a torchaudio series, which `whl-next` does (`2.11.0`,
+    /// `2.11.0.2`, `2.11.0.3`, each paired with a different torch): a series
+    /// match takes the newest, i.e. the rebuild for some *other* row's torch.
+    /// [`DiscoverVersion::Series`] is only safe on an index that serves one
+    /// build per series.
+    ///
+    /// An [`DiscoverVersion::Exact`] torchaudio is also the hardware-verified
+    /// build for the row's ROCm line, and `rocm install sdk` pins it too, via
+    /// [`verified_torchaudio_release`]: set one only for a build confirmed to
+    /// load against the row's torch on real hardware, never as a guess.
+    torchaudio_version: DiscoverVersion,
 }
 
-const VLLM_ROCM_DISCOVER_BUILD_TABLE: &[VllmRocmDiscoverBuild] = &[VllmRocmDiscoverBuild {
-    rocm_sdk_version: "10.0.0",
-    vllm_version_prefix: "0.27",
-    flash_attn_version_prefix: "2.8",
-    amd_aiter_version_prefix: "0.1",
-    torch_requirement: "torch==2.12.0+rocm10.0.0",
-    tensorizer_requirement: "tensorizer==2.12.1",
-}];
-/// Index that publishes the rotating-dev-tag vLLM/flash-attn/amd-aiter
-/// wheels for [`VLLM_ROCM_DISCOVER_BUILD_TABLE`] rows.
-const VLLM_ROCM_DISCOVER_INDEX_URL: &str = "https://rocm.frameworks.amd.com/whl-multi-arch/vllm/";
-/// Index that publishes the pinned torch build for
-/// [`VLLM_ROCM_DISCOVER_BUILD_TABLE`] rows.
-const VLLM_ROCM_DISCOVER_TORCH_INDEX_URL: &str = "https://stable.repo.amd.com/rocm/whl-next/";
+const VLLM_ROCM_DISCOVER_BUILD_TABLE: &[VllmRocmDiscoverBuild] = &[
+    VllmRocmDiscoverBuild {
+        rocm_sdk_version: ROCM_SDK_10_0,
+        python_tag: "cp314",
+        vllm_index_url: "https://rocm.frameworks.amd.com/whl-multi-arch/vllm/",
+        torch_index_url: "https://stable.repo.amd.com/rocm/whl-next/",
+        vllm_version_prefix: "0.27",
+        flash_attn_version_prefix: "2.8",
+        amd_aiter_version_prefix: "0.1",
+        torch_version_prefix: "2.12",
+        torchvision_version_prefix: "0.27",
+        // Still a series match, unlike the 10.1 row below, and unverified
+        // against `whl-next` now that both rows read from it: that index is
+        // flat across ROCm lines, so a series match here can resolve a
+        // `+rocm10.1.0` wheel, which `ensure_rocm_local_version_matches`
+        // rejects. Left as-is rather than pinned blind -- which torchaudio
+        // rebuild pairs with 10.0's torch 2.12 needs a live 10.0 box to
+        // establish, and this row has no coverage on the self-hosted lanes.
+        // `rocm install sdk` reads this field too: see `torchaudio_version`.
+        torchaudio_version: DiscoverVersion::Series("2.11"),
+    },
+    VllmRocmDiscoverBuild {
+        rocm_sdk_version: ROCM_SDK_10_1,
+        python_tag: "cp314",
+        vllm_index_url: "https://rocm.frameworks-prereleases.amd.com/whl-multi-arch-staging/vllm/",
+        // Torch stack from `whl-next`, not staging: it is the index
+        // `rocm install sdk` resolves the 10.1 SDK's own `+rocm10.1.0` torch
+        // stack from, so vLLM realigns onto the same builds rather than
+        // staging's `rc` ones.
+        torch_index_url: "https://stable.repo.amd.com/rocm/whl-next/",
+        vllm_version_prefix: "0.29",
+        flash_attn_version_prefix: "2.8",
+        amd_aiter_version_prefix: "0.1",
+        // 2.13, not 2.12: AMD's own `rocm/vllm:rocm10.1.0_..._vllm-0.29.0`
+        // image (whose Dockerfile build args pin `TORCH_VERSION=2.13.0`,
+        // `TORCHVISION_VERSION=0.28.0`) builds this exact vllm release
+        // against torch 2.13, not 2.12. `vllm` 0.29's own `_rocm_C.abi3.so`
+        // needs a `c10::NotImplementedError` constructor symbol torch
+        // 2.12.0+rocm10.1.0 does not export; 2.13 is published on this same
+        // `whl-next` index and matches what vllm was actually built against.
+        torch_version_prefix: "2.13",
+        torchvision_version_prefix: "0.28",
+        // Exact, not `2.11.*`: `whl-next` publishes three `+rocm10.1.0`
+        // torchaudio builds, `2.11.0`, `2.11.0.2` and `2.11.0.3`. `2.11.0` is
+        // a CPU-only rebuild (no `libamdhip64`/`libc10_hip`/`libtorch_hip`
+        // in its `.so`s) that predates torch's stable-ABI split and does not
+        // reference the `torch_exception_get_what` / `torch_new_stable_ivalue`
+        // symbols torch 2.13 exports. `2.11.0.2` and `2.11.0.3` are both HIP
+        // builds against that same stable ABI (confirmed on a live Strix Halo
+        // box: torch 2.13.0+rocm10.1.0 exports both symbols as `T`, and
+        // torchaudio 2.11.0.2 imports them as `U`); a series match would
+        // resolve the newest, `2.11.0.3`, so pin the lower of the two
+        // confirmed-working builds instead. `rocm install sdk` pins this same
+        // build for the 10.1 line: see `torchaudio_version`.
+        torchaudio_version: DiscoverVersion::Exact("2.11.0.2"),
+    },
+];
 /// Looks up the discovery build recipe for a ROCm SDK version, if any.
 ///
-/// Matched on major version only: unlike [`VLLM_ROCM_BUILD_TABLE`], where a
-/// row pins one exact release's wheel filename, a discover row is a live
-/// resolver recipe AMD's index applies uniformly across an entire ROCm major
-/// line. AMD's preview wheels are tagged with the real target release
-/// (`whl-multi-arch/torch/` carries `+rocm7.13.0`, `+rocm7.14.0`, and
-/// `+rocm7.14.1` as genuinely distinct, coexisting builds), so once ROCm
-/// 10.x's target moves past `10.0.0` the same rotation will happen here; a
-/// row keyed to an exact string would then silently stop matching. `10.0.0`
-/// and `10.1.0` should both discover through the same `"10.0.0"` row. This
-/// intentionally differs from `apps/rocm/src/therock.rs`'s SDK layout
-/// selection, which avoids major-only gating for unrelated reasons (on-disk
-/// layout, not wheel availability).
+/// Matched on `major.minor`, ignoring patch and any dev/pre-release suffix. A
+/// discover row is a live resolver recipe rather than one pinned filename, so
+/// it does span a release line, but only a `major.minor` one: 10.0 and 10.1
+/// publish genuinely different wheels (vLLM `0.27` from
+/// `rocm.frameworks.amd.com` versus `0.29` from the staging host), so a
+/// major-only row would serve one SDK's wheels to the other. Patch is still
+/// ignored, because AMD does rotate the patch and dev tag within a line
+/// (`whl-multi-arch/torch/` carries `+rocm7.13.0`, `+rocm7.14.0` and
+/// `+rocm7.14.1` as coexisting builds) and a row keyed to an exact string
+/// would silently stop matching. An unknown line matches nothing and fails
+/// closed in [`resolve_vllm_install_target`] rather than falling back to a
+/// stale static pin.
 pub(crate) fn vllm_rocm_discover_build(
     rocm_sdk_version: &str,
 ) -> Option<&'static VllmRocmDiscoverBuild> {
     VLLM_ROCM_DISCOVER_BUILD_TABLE
         .iter()
-        .find(|build| rocm_sdk_major_matches(rocm_sdk_version, build.rocm_sdk_version))
+        .find(|build| rocm_sdk_series_matches(rocm_sdk_version, build.rocm_sdk_version))
+}
+/// The torchaudio release confirmed on hardware for `rocm_sdk_version`'s ROCm
+/// `major.minor` line: the row's [`DiscoverVersion::Exact`] torchaudio, if it
+/// has one. `None` for a line with no row, or whose row still matches a series,
+/// because nothing has verified which build of that series works.
+///
+/// Read by `rocm install sdk` as well as by this crate's discovery, so the SDK
+/// and its vLLM install pin the same torchaudio from this one table.
+pub(crate) fn verified_torchaudio_release(rocm_sdk_version: &str) -> Option<&'static str> {
+    match vllm_rocm_discover_build(rocm_sdk_version)?.torchaudio_version {
+        DiscoverVersion::Exact(release) => Some(release),
+        DiscoverVersion::Series(_) => None,
+    }
 }
 /// Whether `recorded` (a runtime manifest's live `rocm_sdk.__version__` probe)
 /// and `table_key` (a literal key in [`VLLM_ROCM_DISCOVER_BUILD_TABLE`]) share
 /// a ROCm SDK major version, ignoring minor, patch, and any dev/pre-release
-/// suffix. See [`vllm_rocm_discover_build`] for why major alone is enough here.
+/// suffix. Major-only on purpose: it is broader than the `major.minor` row
+/// lookup [`vllm_rocm_discover_build`] uses, so a 10.x line with no discover
+/// row fails closed here instead of falling through to the default static
+/// pin.
 fn rocm_sdk_major_matches(recorded: &str, table_key: &str) -> bool {
     fn major(version: &str) -> Option<u64> {
         version.trim().split('.').next()?.parse().ok()
@@ -505,15 +617,7 @@ fn install_vllm_with_uv(
             if output.status.success() {
                 return Ok(Vec::new());
             }
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-            let detail = if !stderr.is_empty() {
-                stderr
-            } else if !stdout.is_empty() {
-                stdout
-            } else {
-                "no output".to_owned()
-            };
+            let detail = command_failure_detail(&output);
             bail!(
                 "`uv pip install {} --extra-index-url {}` failed for {}: {}",
                 requirement,
@@ -524,15 +628,16 @@ fn install_vllm_with_uv(
         }
     }
 }
-/// Resolves the exact requirement `uv` would install for
-/// `{pkg}=={version_prefix}.*` from `index_url`, without installing anything.
+/// Resolves the exact requirement `uv` would install for `pkg` constrained
+/// by `version` (see [`DiscoverVersion::requirement`]) from `index_url`,
+/// without installing anything.
 ///
 /// `uv` has no `pip download` command (and never has — it's a declined
 /// upstream feature request, astral-sh/uv#3163), so this uses `uv pip
 /// install --dry-run` instead: it runs the real resolver against `python`'s
 /// platform/interpreter tags and reports the version it would install on a
 /// ` + {pkg}==<version>` line, which is parsed back out by
-/// [`dry_run_resolved_pin`]. A prefix with no compatible build published
+/// [`dry_run_resolved_pin`]. A version with no compatible build published
 /// surfaces as a resolver failure (never fall back to unpinned PyPI).
 ///
 /// `--reinstall` is always passed here (independent of the caller's own
@@ -546,9 +651,9 @@ fn discover_pinned_requirement(
     python: &Path,
     index_url: &str,
     pkg: &str,
-    version_prefix: &str,
+    version: DiscoverVersion,
 ) -> Result<String> {
-    let requirement_prefix = format!("{pkg}=={version_prefix}.*");
+    let requirement = version.requirement(pkg);
     let output = ProcessCommand::new(uv)
         .args([
             "pip",
@@ -561,7 +666,7 @@ fn discover_pinned_requirement(
         .arg(index_url)
         .args(["--prerelease", "allow", "--python"])
         .arg(python)
-        .arg(&requirement_prefix)
+        .arg(&requirement)
         .envs(uv_command_env(paths))
         .output()
         .with_context(|| format!("failed to launch uv pip install --dry-run for {pkg}"))?;
@@ -572,15 +677,8 @@ fn discover_pinned_requirement(
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     if !output.status.success() {
-        let stderr_trimmed = stderr.trim();
-        let detail = if !stderr_trimmed.is_empty() {
-            stderr_trimmed.to_owned()
-        } else if !stdout.trim().is_empty() {
-            stdout.trim().to_owned()
-        } else {
-            "no output".to_owned()
-        };
-        bail!("`uv pip install --dry-run {requirement_prefix}` from {index_url} failed: {detail}");
+        let detail = command_failure_detail(&output);
+        bail!("`uv pip install --dry-run {requirement}` from {index_url} failed: {detail}");
     }
     dry_run_resolved_pin(&stderr, pkg)
         .or_else(|| dry_run_resolved_pin(&stdout, pkg))
@@ -591,7 +689,7 @@ fn discover_pinned_requirement(
                 stderr.trim()
             };
             anyhow!(
-                "`uv pip install --dry-run {requirement_prefix}` from {index_url} did not report a \
+                "`uv pip install --dry-run {requirement}` from {index_url} did not report a \
                  resolved version for {pkg}: {reported}"
             )
         })
@@ -606,30 +704,268 @@ fn dry_run_resolved_pin(stdout: &str, pkg: &str) -> Option<String> {
         (!version.is_empty()).then(|| format!("{pkg}=={version}"))
     })
 }
-/// Builds the `uv pip install` argv for a ROCm 10.x discovery install: the
-/// resolved `pins` plus `--prerelease allow` and both discovery indexes.
-fn vllm_rocm10_discover_install_args(
+/// Builds the `uv pip install` argv for pinned torch alone, scoped to only
+/// `torch_index_url`.
+///
+/// Mixing `vllm_index_url` into the same call (as a prior version of this
+/// code did) makes `uv` probe torch's package name under the wrong index
+/// too; AMD's CloudFront/S3-backed discovery hosts answer a nonexistent
+/// sub-path with a fatal 403 rather than a fall-through-safe 404, which
+/// aborts the whole resolution before `uv` ever reaches the index that
+/// actually has torch.
+///
+/// Uses `--index-url`, not `--extra-index-url`: the latter is kept
+/// pip-compatible by `uv`, meaning it is checked *after* the implicit
+/// default PyPI index, not before it. This call installs a single exact
+/// pin with `--no-deps`, so there is nothing legitimate for PyPI to supply;
+/// leaving it reachable only risks `uv` silently satisfying the pin from a
+/// same-numbered public PyPI release instead of AMD's build.
+///
+/// `--no-deps` matters just as much here as it does in
+/// [`discover_pinned_requirement`]: this torch wheel's own metadata pins an
+/// exact `rocm[libraries]==<version>` dependency, naming the ROCm release
+/// its ROCm libs were built against. That release is managed separately by
+/// `rocm install sdk`, which can legitimately be a different version track
+/// (e.g. a nightly build) than this discovery row's pin, so the `rocm`
+/// project is never published under this index at that exact version;
+/// resolving it here fails the whole install instead of leaving the
+/// already-installed SDK alone.
+fn vllm_rocm10_discover_torch_install_args(
+    python: &Path,
+    reinstall: bool,
+    build: &VllmRocmDiscoverBuild,
+    torch_pin: &str,
+) -> Vec<String> {
+    let mut args = uv_pip_install_base(python);
+    if reinstall {
+        args.push("--reinstall-package".to_owned());
+        args.push("torch".to_owned());
+    }
+    args.push(torch_pin.to_owned());
+    args.push("--no-deps".to_owned());
+    args.push("--prerelease".to_owned());
+    args.push("allow".to_owned());
+    args.push("--index-url".to_owned());
+    args.push(build.torch_index_url.to_owned());
+    args
+}
+/// Builds the `uv pip install` argv that realigns torch, torchvision and
+/// torchaudio back to `pins` after the full-dependency install, all
+/// `--no-deps` and scoped to `torch_index_url`.
+///
+/// `pins` is always the torch/torchvision/torchaudio trio discovered fresh
+/// from this row's `torch_index_url`, so they are guaranteed coherent with
+/// each other even when they weren't with whatever the SDK install resolved
+/// first. A single call realigns the whole stack together rather than one
+/// `uv` invocation per package.
+///
+/// Uses `--index-url`, for the same reason
+/// [`vllm_rocm10_discover_torch_install_args`] does: torch's pin always
+/// carries a `+rocmX.Y` local version with no PyPI equivalent, but
+/// torchvision/torchaudio do not, so `--extra-index-url`'s lower-than-default
+/// priority would let a same-numbered public PyPI wheel silently win over
+/// AMD's build here, reproducing the exact ABI mismatch this realign step
+/// exists to prevent.
+fn vllm_rocm10_discover_realign_install_args(
+    python: &Path,
+    build: &VllmRocmDiscoverBuild,
+    pins: &[String],
+) -> Vec<String> {
+    let mut args = uv_pip_install_base(python);
+    for pin in pins {
+        if let Some((name, _)) = pin.split_once("==") {
+            args.push("--reinstall-package".to_owned());
+            args.push(name.to_owned());
+        }
+    }
+    args.extend(pins.iter().cloned());
+    args.push("--no-deps".to_owned());
+    args.push("--prerelease".to_owned());
+    args.push("allow".to_owned());
+    args.push("--index-url".to_owned());
+    args.push(build.torch_index_url.to_owned());
+    args
+}
+/// Builds the `uv pip install` argv for pinned vllm/flash-attn/amd-aiter,
+/// scoped to only `vllm_index_url`. tensorizer is not pinned here: vllm's own
+/// wheel metadata already declares an exact tensorizer dependency, and a
+/// second, independently chosen pin for the same package risks conflicting
+/// with it.
+///
+/// See [`vllm_rocm10_discover_torch_install_args`] for why torch is never
+/// mixed into this same call. This call resolves full dependencies (unlike
+/// torch's `--no-deps` call), which can pull in an unconstrained `torch` from
+/// PyPI and silently undo the exact pin just installed; callers must re-run
+/// [`vllm_rocm10_discover_torch_install_args`] afterwards to realign it.
+///
+/// `vllm_index_url` is supplied via `--config-file`, not `--extra-index-url`,
+/// here: `uv` does not merge a CLI `--extra-index-url` with a config-file
+/// `[[index]]` entry for the same URL, so a CLI copy would keep 403ing fatally
+/// even with the config file's `ignore-error-codes` also active.
+fn vllm_rocm10_discover_remaining_install_args(
     python: &Path,
     reinstall: bool,
     pins: &[String],
 ) -> Vec<String> {
     let mut args = uv_pip_install_base(python);
     if reinstall {
-        args.push("--reinstall".to_owned());
+        for pin in pins {
+            if let Some((name, _)) = pin.split_once("==") {
+                args.push("--reinstall-package".to_owned());
+                args.push(name.to_owned());
+            }
+        }
     }
     args.extend(pins.iter().cloned());
     args.push("--prerelease".to_owned());
     args.push("allow".to_owned());
-    args.push("--extra-index-url".to_owned());
-    args.push(VLLM_ROCM_DISCOVER_INDEX_URL.to_owned());
-    args.push("--extra-index-url".to_owned());
-    args.push(VLLM_ROCM_DISCOVER_TORCH_INDEX_URL.to_owned());
     args
+}
+/// Writes a scratch `uv.toml` that keeps `uv` searching other indexes when
+/// `vllm_index_url` 403s on a package it doesn't host, instead of aborting
+/// resolution outright.
+///
+/// `uv`'s default index-strategy treats a 403 from any configured index as
+/// fatal, not as "not found here, try the next index" — the docs note this is
+/// normally only special-cased for the pytorch index. AMD's staging index is a
+/// CDN-backed static index with the same 403-for-missing-package behavior, so
+/// vllm's own plain-PyPI transitive dependencies (e.g. `lm-format-enforcer`)
+/// need the same `ignore-error-codes` treatment here. There is no CLI flag or
+/// env var for it, only this config file.
+fn write_vllm_index_uv_config(paths: &AppPaths, build: &VllmRocmDiscoverBuild) -> Result<PathBuf> {
+    std::fs::create_dir_all(&paths.cache_dir)
+        .with_context(|| format!("failed to create {}", paths.cache_dir.display()))?;
+    let path = paths.cache_dir.join("vllm-rocm10-uv.toml");
+    let contents = format!(
+        "[[index]]\nurl = \"{}\"\nignore-error-codes = [403]\n",
+        build.vllm_index_url
+    );
+    std::fs::write(&path, contents)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(path)
+}
+/// Runs a `uv pip install` invocation, surfacing a failure with the full
+/// command and `uv`'s own output.
+fn run_uv_pip_install(uv: &Path, paths: &AppPaths, python: &Path, args: Vec<String>) -> Result<()> {
+    let output = ProcessCommand::new(uv)
+        .args(&args)
+        .envs(uv_command_env(paths))
+        .output()
+        .context("failed to launch uv pip install for vLLM (ROCm 10.x discovery)")?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let detail = command_failure_detail(&output);
+    bail!(
+        "`uv pip install {}` failed for {}: {}",
+        args.join(" "),
+        python.display(),
+        detail
+    )
+}
+/// Rejects a discovered pin whose `+rocm<version>` local version names a
+/// different ROCm line than the SDK being installed for.
+///
+/// Discovery constrains the *release* (`vllm==0.29.*`) but cannot constrain the
+/// local version, because PEP 440 has no local-version wildcard. Both discovery
+/// indexes serve more than one ROCm line at once (staging carries 10.0 and 10.1
+/// vLLM side by side), so without this a mis-stocked or re-pointed index could
+/// resolve a 10.0 wheel onto a 10.1 SDK and only fail at import time.
+/// `flash-attn` and `amd-aiter` publish no rocm local version at all, so a pin
+/// without one passes.
+fn ensure_rocm_local_version_matches(pin: &str, rocm_sdk_version: &str) -> Result<()> {
+    let Some((_, version)) = pin.split_once("==") else {
+        return Ok(());
+    };
+    let Some(local) = split_local_version(version).1 else {
+        return Ok(());
+    };
+    let Some(local_rocm) = local.strip_prefix("rocm") else {
+        return Ok(());
+    };
+    if rocm_sdk_series_matches(local_rocm, rocm_sdk_version) {
+        return Ok(());
+    }
+    bail!(
+        "discovered `{pin}` for ROCm SDK {rocm_sdk_version}, but its `+{local}` build targets a \
+         different ROCm release; the index for this ROCm line is serving another SDK's wheels"
+    )
+}
+/// The PEP 425 interpreter tag of `python`, e.g. `cp314`.
+fn python_interpreter_tag(python: &Path) -> Result<String> {
+    let output = ProcessCommand::new(python)
+        .args([
+            "-c",
+            "import sys; print(f'cp{sys.version_info[0]}{sys.version_info[1]}')",
+        ])
+        .output()
+        .with_context(|| format!("failed to launch {} to read its version", python.display()))?;
+    if !output.status.success() {
+        bail!(
+            "{} could not report its version: {}",
+            python.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+/// Fails before discovery when `python` is not the interpreter this row's
+/// wheels are built for.
+///
+/// Checked up front rather than left to `uv`: every package in the row is
+/// published for one tag only, so a mismatched interpreter surfaces as three
+/// separate "no compatible version found" resolver dumps that name the
+/// requirement but never the interpreter, which is the thing to fix.
+fn ensure_discover_python_tag(python: &Path, build: &VllmRocmDiscoverBuild) -> Result<()> {
+    let tag = python_interpreter_tag(python)?;
+    if tag == build.python_tag {
+        return Ok(());
+    }
+    bail!(
+        "vLLM for ROCm {} is published for {} only, but {} is {}.\n\
+         Re-create this runtime's Python environment on {}, for example by re-running \
+         `rocm install sdk --version {}` so ROCm CLI provisions a matching interpreter.",
+        build.rocm_sdk_version,
+        build.python_tag,
+        python.display(),
+        tag,
+        build.python_tag,
+        build.rocm_sdk_version
+    )
+}
+/// Lists every package `uv pip freeze` reports as installed in `python`'s
+/// environment, as bare names (no version).
+fn installed_package_names(uv: &Path, paths: &AppPaths, python: &Path) -> Result<Vec<String>> {
+    let output = ProcessCommand::new(uv)
+        .args(uv_pip_freeze_args(python))
+        .envs(uv_command_env(paths))
+        .output()
+        .context("failed to launch `uv pip freeze` to find installed packages")?;
+    if !output.status.success() {
+        bail!(
+            "`uv pip freeze` failed for {}: {}",
+            python.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.split_once("==").map(|(name, _)| name.to_owned()))
+        .collect())
+}
+/// Whether `name` is one of AMD's per-GPU-architecture device-kernel plugin
+/// packages for `base_pkg` (e.g. `amd-torch-device-gfx1151` or
+/// `amd-torchvision-device-gfx115x` for `base_pkg` `torch`/`torchvision`).
+/// Each is versioned in lockstep with its own `base_pkg`, not with torch.
+fn is_amd_device_package_for(name: &str, base_pkg: &str) -> bool {
+    name.to_ascii_lowercase()
+        .replace('_', "-")
+        .starts_with(&format!("amd-{base_pkg}-device-gfx"))
 }
 /// Discovers and installs the current vLLM/flash-attn/amd-aiter wheels for a
 /// [`VllmRocmDiscoverBuild`] row, pinning each to the exact version `uv pip
 /// install --dry-run` resolved so the real install can never silently drift
-/// to a different (or non-ROCm) build. Returns the five pins actually installed.
+/// to a different (or non-ROCm) build. Returns the pins actually installed.
 fn install_vllm_rocm10_discover(
     uv: &Path,
     paths: &AppPaths,
@@ -637,63 +973,121 @@ fn install_vllm_rocm10_discover(
     reinstall: bool,
     build: &VllmRocmDiscoverBuild,
 ) -> Result<Vec<String>> {
+    ensure_discover_python_tag(python, build)?;
+    let torch = discover_pinned_requirement(
+        uv,
+        paths,
+        python,
+        build.torch_index_url,
+        "torch",
+        DiscoverVersion::Series(build.torch_version_prefix),
+    )?;
+    // Discovered fresh from the same index and row as torch, rather than
+    // snapshotted from whatever the SDK install resolved earlier: that
+    // snapshot can pair with a *different* torch version than the one this
+    // row pins (the SDK's own install is unpinned and may have picked the
+    // newest torch/torchvision/torchaudio available, independently of each
+    // other), producing an ABI-incompatible triplet at realign time.
+    let torchvision = discover_pinned_requirement(
+        uv,
+        paths,
+        python,
+        build.torch_index_url,
+        "torchvision",
+        DiscoverVersion::Series(build.torchvision_version_prefix),
+    )?;
+    let torchaudio = discover_pinned_requirement(
+        uv,
+        paths,
+        python,
+        build.torch_index_url,
+        "torchaudio",
+        build.torchaudio_version,
+    )?;
     let vllm = discover_pinned_requirement(
         uv,
         paths,
         python,
-        VLLM_ROCM_DISCOVER_INDEX_URL,
+        build.vllm_index_url,
         "vllm",
-        build.vllm_version_prefix,
+        DiscoverVersion::Series(build.vllm_version_prefix),
     )?;
     let flash_attn = discover_pinned_requirement(
         uv,
         paths,
         python,
-        VLLM_ROCM_DISCOVER_INDEX_URL,
+        build.vllm_index_url,
         "flash-attn",
-        build.flash_attn_version_prefix,
+        DiscoverVersion::Series(build.flash_attn_version_prefix),
     )?;
     let amd_aiter = discover_pinned_requirement(
         uv,
         paths,
         python,
-        VLLM_ROCM_DISCOVER_INDEX_URL,
+        build.vllm_index_url,
         "amd-aiter",
-        build.amd_aiter_version_prefix,
+        DiscoverVersion::Series(build.amd_aiter_version_prefix),
     )?;
 
-    let pins = vec![
-        build.torch_requirement.to_owned(),
-        vllm,
-        flash_attn,
-        amd_aiter,
-        build.tensorizer_requirement.to_owned(),
-    ];
-
-    let args = vllm_rocm10_discover_install_args(python, reinstall, &pins);
-    let output = ProcessCommand::new(uv)
-        .args(args)
-        .envs(uv_command_env(paths))
-        .output()
-        .context("failed to launch uv pip install for vLLM (ROCm 10.x discovery)")?;
-    if output.status.success() {
-        return Ok(pins);
+    let pins = vec![torch, torchvision, torchaudio, vllm, flash_attn, amd_aiter];
+    for pin in &pins {
+        ensure_rocm_local_version_matches(pin, build.rocm_sdk_version)?;
     }
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    let detail = if !stderr.is_empty() {
-        stderr
-    } else if !stdout.is_empty() {
-        stdout
-    } else {
-        "no output".to_owned()
-    };
-    bail!(
-        "`uv pip install {}` failed for {}: {}",
-        pins.join(" "),
-        python.display(),
-        detail
-    )
+
+    // Two separate `uv pip install` calls, each scoped to exactly one index:
+    // see `vllm_rocm10_discover_torch_install_args` for why combining both
+    // indexes into one call is unsafe.
+    let torch_args = vllm_rocm10_discover_torch_install_args(python, reinstall, build, &pins[0]);
+    run_uv_pip_install(uv, paths, python, torch_args)?;
+
+    let mut remaining_args =
+        vllm_rocm10_discover_remaining_install_args(python, reinstall, &pins[3..]);
+    let config_file = write_vllm_index_uv_config(paths, build)?;
+    remaining_args.push("--config-file".to_owned());
+    remaining_args.push(config_file.display().to_string());
+    run_uv_pip_install(uv, paths, python, remaining_args)?;
+
+    // The full-dependency resolve above can replace torch (and, pulling it in
+    // transitively, torchvision/torchaudio) with unconstrained PyPI builds;
+    // force the whole stack back to the coherent trio discovered above. This
+    // must run unconditionally, before the device-plugin discovery below: a
+    // `uv pip freeze` failure there must not skip restoring the trio too.
+    let trio_realign_args = vllm_rocm10_discover_realign_install_args(python, build, &pins[..3]);
+    run_uv_pip_install(uv, paths, python, trio_realign_args)?;
+
+    // The full-dependency resolve can also pull in an AMD device-kernel
+    // plugin for any of the three (`amd-torch-device-gfx*`,
+    // `amd-torchvision-device-gfx*`, ...) pinned to whatever the index's
+    // newest release is, unconstrained by -- and so routinely ahead of --
+    // the base package version just realigned above; the mismatch doesn't
+    // fail here, it fails at serve time as a HIP "Cannot find Symbol" crash.
+    // Realign any such installed device package to the exact version of its
+    // own base package: a device package always shares its base package's
+    // version number, not any other package's.
+    let installed = installed_package_names(uv, paths, python)?;
+    let mut device_pins: Vec<String> = Vec::new();
+    for pin in &pins[..3] {
+        // Fail closed rather than emit a `name==` with an empty release: every
+        // other surprise on this install path bails too.
+        let (base_pkg, release) = pin.split_once("==").with_context(|| {
+            format!("discovered pin `{pin}` is not a `name==version` requirement")
+        })?;
+        device_pins.extend(
+            installed
+                .iter()
+                .filter(|name| is_amd_device_package_for(name, base_pkg))
+                .map(|name| format!("{name}=={release}")),
+        );
+    }
+    if !device_pins.is_empty() {
+        let device_realign_args =
+            vllm_rocm10_discover_realign_install_args(python, build, &device_pins);
+        run_uv_pip_install(uv, paths, python, device_realign_args)?;
+    }
+
+    let mut pins = pins;
+    pins.extend(device_pins);
+    Ok(pins)
 }
 /// Wheel index and exact requirement for one `uv pip install vllm`.
 ///
@@ -827,8 +1221,38 @@ fn vllm_rocm_build_from_index_url(index_url: &str) -> Option<(String, String)> {
 mod tests {
     use super::*;
     use crate::runtime::{
-        RocmSdkRuntimeProbe, TheRockRuntimeManifest, sdk_torch_build_from_manifest,
+        ROCM_DISCOVER_BUILD_VERSIONS, RocmSdkRuntimeProbe, TheRockRuntimeManifest,
+        sdk_torch_build_from_manifest,
     };
+
+    #[test]
+    fn vllm_rocm_discover_build_table_matches_the_discover_version_list() {
+        // `ROCM_DISCOVER_BUILD_VERSIONS` (runtime.rs) and
+        // `VLLM_ROCM_DISCOVER_BUILD_TABLE` (here) are two separate pieces of data that
+        // must name the same ROCm SDK versions — the list drives launch-time env setup
+        // (`apply_therock_env`), the table drives install routing, and a row present in
+        // only one of them means a runtime gets installed one way and launched another.
+        // See the doc comment on `ROCM_DISCOVER_BUILD_VERSIONS` for why nothing but this
+        // test enforces the agreement.
+        for build in VLLM_ROCM_DISCOVER_BUILD_TABLE {
+            assert!(
+                ROCM_DISCOVER_BUILD_VERSIONS.contains(&build.rocm_sdk_version),
+                "{} is a VLLM_ROCM_DISCOVER_BUILD_TABLE row but missing from \
+                 ROCM_DISCOVER_BUILD_VERSIONS; launch-time env setup would silently skip it",
+                build.rocm_sdk_version
+            );
+        }
+        for version in ROCM_DISCOVER_BUILD_VERSIONS {
+            assert!(
+                VLLM_ROCM_DISCOVER_BUILD_TABLE
+                    .iter()
+                    .any(|build| build.rocm_sdk_version == *version),
+                "{version} is in ROCM_DISCOVER_BUILD_VERSIONS but has no \
+                 VLLM_ROCM_DISCOVER_BUILD_TABLE row; install routing has nothing to install \
+                 for a runtime launch-time env setup now treats as a discover build"
+            );
+        }
+    }
 
     fn install_target(
         index: Option<&str>,
@@ -1369,9 +1793,9 @@ mod tests {
         assert!(vllm_rocm_discover_build("10.0.0").is_some());
         // AMD tags preview wheels with the real target release (verified via
         // whl-multi-arch/torch/'s coexisting +rocm7.13.0/7.14.0/7.14.1
-        // builds), so ROCm 10.x's tag will move past 10.0.0 the same way;
-        // the discovery recipe must keep firing across the whole major line,
-        // not just the exact version it happened to be added for.
+        // builds), so a pre-release suffix on a known major.minor must still
+        // match its row (here the dedicated 10.1.0 one), not just an exact
+        // version string.
         assert!(vllm_rocm_discover_build("10.1.0a20260822").is_some());
         assert!(vllm_rocm_discover_build("999.0.0").is_none());
     }
@@ -1420,27 +1844,528 @@ mod tests {
         assert_eq!(vllm_install_route(None, None), VllmInstallRoute::Static);
     }
     #[test]
-    fn vllm_rocm10_discover_install_args_includes_pins_and_both_indexes() {
+    fn vllm_rocm10_discover_torch_install_args_use_only_the_torch_index() {
+        let python = PathBuf::from("/opt/venv/bin/python");
+        let build = vllm_rocm_discover_build("10.0.0").expect("10.0.0 has a discover row");
+        let torch_pin = "torch==2.12.0+rocm10.0.0";
+
+        let args = vllm_rocm10_discover_torch_install_args(&python, false, build, torch_pin);
+        assert!(!args.contains(&"--reinstall".to_owned()));
+        assert!(!args.contains(&"--reinstall-package".to_owned()));
+        assert!(args.contains(&torch_pin.to_owned()));
+        assert!(args.contains(&"--no-deps".to_owned()));
+        assert!(args.contains(&"--prerelease".to_owned()));
+        assert!(args.contains(&"allow".to_owned()));
+        assert!(args.contains(&build.torch_index_url.to_owned()));
+        assert!(
+            args.contains(&"--index-url".to_owned()),
+            "{args:?} must use --index-url, not --extra-index-url, or a same-numbered public \
+             PyPI wheel can silently outrank AMD's build"
+        );
+        assert!(!args.contains(&"--extra-index-url".to_owned()));
+        assert!(
+            !args.contains(&build.vllm_index_url.to_owned()),
+            "{args:?} must never reference vllm_index_url, or `uv` may probe torch under it \
+             and hit a fatal 403 from a nonexistent sub-path"
+        );
+
+        let args = vllm_rocm10_discover_torch_install_args(&python, true, build, torch_pin);
+        assert!(args.contains(&"--reinstall-package".to_owned()));
+        assert!(args.contains(&"torch".to_owned()));
+        assert!(!args.contains(&"--reinstall".to_owned()));
+    }
+    #[test]
+    fn vllm_rocm10_discover_remaining_install_args_use_only_the_vllm_index() {
         let pins = vec![
-            "torch==2.12.0+rocm10.0.0".to_owned(),
             "vllm==0.27.1.dev5+rocm10.0.0".to_owned(),
             "flash-attn==2.8.3".to_owned(),
             "amd-aiter==0.1.4".to_owned(),
             "tensorizer==2.12.1".to_owned(),
         ];
         let python = PathBuf::from("/opt/venv/bin/python");
+        let build = vllm_rocm_discover_build("10.0.0").expect("10.0.0 has a discover row");
 
-        let args = vllm_rocm10_discover_install_args(&python, false, &pins);
-        assert!(!args.contains(&"--reinstall".to_owned()));
+        let args = vllm_rocm10_discover_remaining_install_args(&python, false, &pins);
+        assert!(!args.contains(&"--reinstall-package".to_owned()));
         for pin in &pins {
             assert!(args.contains(pin), "{args:?} should contain {pin}");
         }
         assert!(args.contains(&"--prerelease".to_owned()));
         assert!(args.contains(&"allow".to_owned()));
-        assert!(args.contains(&VLLM_ROCM_DISCOVER_INDEX_URL.to_owned()));
-        assert!(args.contains(&VLLM_ROCM_DISCOVER_TORCH_INDEX_URL.to_owned()));
+        assert!(
+            !args.contains(&build.vllm_index_url.to_owned()),
+            "{args:?} must supply vllm_index_url via --config-file, not --extra-index-url, or \
+             `uv` 403s fatally on a package the index doesn't host despite ignore-error-codes"
+        );
+        assert!(
+            !args.contains(&build.torch_index_url.to_owned()),
+            "{args:?} must never reference torch_index_url, or `uv` may probe flash-attn/\
+             amd-aiter under it and hit a fatal 403 from a nonexistent sub-path"
+        );
 
-        let args = vllm_rocm10_discover_install_args(&python, true, &pins);
-        assert!(args.contains(&"--reinstall".to_owned()));
+        let args = vllm_rocm10_discover_remaining_install_args(&python, true, &pins);
+        for pin in &pins {
+            let name = pin.split_once("==").unwrap().0;
+            assert!(args.contains(&"--reinstall-package".to_owned()));
+            assert!(
+                args.contains(&name.to_owned()),
+                "{args:?} should reinstall {name}"
+            );
+        }
+        assert!(!args.contains(&"--reinstall".to_owned()));
+    }
+    #[test]
+    fn write_vllm_index_uv_config_writes_an_ignore_error_codes_entry() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let paths = AppPaths {
+            config_dir: root.path().join("config"),
+            data_dir: root.path().join("data"),
+            cache_dir: root.path().join("cache"),
+        };
+        let build = vllm_rocm_discover_build("10.0.0").expect("10.0.0 has a discover row");
+
+        let config_file = write_vllm_index_uv_config(&paths, build)?;
+        let contents = std::fs::read_to_string(&config_file)?;
+        assert!(contents.contains(build.vllm_index_url), "{contents}");
+        assert!(
+            contents.contains("ignore-error-codes = [403]"),
+            "{contents}"
+        );
+        Ok(())
+    }
+    /// The prefix boundary (`-device-gfx`, not a bare `starts_with` of
+    /// `amd-{base_pkg}`) must stop `torch`'s match from also catching
+    /// `torchvision`'s device package: `amd-torchvision-...` does start with
+    /// `amd-torch`, just not with `amd-torch-device-gfx`.
+    #[test]
+    fn is_amd_device_package_for_does_not_cross_match_prefixed_base_packages() {
+        assert!(is_amd_device_package_for(
+            "amd-torch-device-gfx1151",
+            "torch"
+        ));
+        assert!(!is_amd_device_package_for(
+            "amd-torchvision-device-gfx1151",
+            "torch"
+        ));
+        assert!(is_amd_device_package_for(
+            "amd-torchvision-device-gfx1151",
+            "torchvision"
+        ));
+        // Real `uv pip freeze` output is PEP 503 canonical (hyphenated), but
+        // the check normalizes underscores too.
+        assert!(is_amd_device_package_for(
+            "amd_torch_device_gfx1151",
+            "torch"
+        ));
+    }
+    /// A series renders with the `.*` that lets `uv` take the newest release
+    /// in it; an exact release renders bare, so it cannot.
+    #[test]
+    fn discover_version_renders_series_and_exact_requirements() {
+        assert_eq!(
+            DiscoverVersion::Series("2.11").requirement("torchaudio"),
+            "torchaudio==2.11.*"
+        );
+        // No trailing `.*`: that would also admit the `2.11.0.2`/`2.11.0.3`
+        // rebuilds an exact pin exists to exclude.
+        assert_eq!(
+            DiscoverVersion::Exact("2.11.0").requirement("torchaudio"),
+            "torchaudio==2.11.0"
+        );
+    }
+    /// The 10.1 row must reach the staging host for vLLM, which is only
+    /// published there, but takes its torch stack from `whl-next` just like
+    /// 10.0, the same index `rocm install sdk` resolves its own
+    /// `+rocm10.1.0` torch stack from (though the SDK's resolve and this
+    /// row's discovery are independent: this row pins its own version
+    /// prefixes rather than matching whatever the SDK happened to install).
+    /// Its torchaudio is pinned exactly: a `2.11.*` match resolves the
+    /// newest rebuild, `2.11.0.3`; `2.11.0.2` is the lower of the two builds
+    /// confirmed (on a live Strix Halo box) to load against torch 2.13
+    /// (therock-next-09). 10.0 keeps the production frameworks index for
+    /// vLLM. The live half of this is therock-next-09.
+    #[test]
+    fn discover_rows_select_their_own_indexes() {
+        let ten_zero = vllm_rocm_discover_build("10.0.0").expect("10.0.0 has a discover row");
+        assert_eq!(
+            ten_zero.vllm_index_url,
+            "https://rocm.frameworks.amd.com/whl-multi-arch/vllm/"
+        );
+        assert_eq!(
+            ten_zero.torch_index_url,
+            "https://stable.repo.amd.com/rocm/whl-next/"
+        );
+        assert_eq!(ten_zero.vllm_version_prefix, "0.27");
+
+        // A real probe carries a patch and dev suffix the table key never does.
+        let ten_one = vllm_rocm_discover_build("10.1.0a20260928").expect("10.1 has a discover row");
+        assert_eq!(
+            ten_one.vllm_index_url,
+            "https://rocm.frameworks-prereleases.amd.com/whl-multi-arch-staging/vllm/"
+        );
+        assert_eq!(
+            ten_one.torch_index_url,
+            "https://stable.repo.amd.com/rocm/whl-next/"
+        );
+        assert_eq!(ten_one.vllm_version_prefix, "0.29");
+        // 2.13/0.28, not 2.12/0.27: the pair AMD's own
+        // `rocm/vllm:...vllm-0.29.0` image builds this vllm release against.
+        assert_eq!(ten_one.torch_version_prefix, "2.13");
+        assert_eq!(ten_one.torchvision_version_prefix, "0.28");
+        // `whl-next` carries `2.11.0`, `2.11.0.2` and `2.11.0.3` for
+        // `+rocm10.1.0`; `2.11.0` is CPU-only, and a series match would
+        // resolve the newest, `2.11.0.3`, not the confirmed-working
+        // `2.11.0.2`, so this must stay exact and never a series.
+        assert_eq!(
+            ten_one.torchaudio_version,
+            DiscoverVersion::Exact("2.11.0.2")
+        );
+
+        // An unpublished line must not borrow another line's wheels.
+        assert!(vllm_rocm_discover_build("10.2.0").is_none());
+        assert!(vllm_rocm_discover_build("7.2.3").is_none());
+    }
+    /// Only an exact torchaudio pin counts as verified: the 10.1 row's
+    /// `2.11.0.2` is, the 10.0 row's `2.11` series is not, and a line with no
+    /// row has nothing to offer. `rocm install sdk` reads this same answer.
+    #[test]
+    fn verified_torchaudio_release_is_only_an_exact_row_pin() {
+        assert_eq!(verified_torchaudio_release("10.1.0"), Some("2.11.0.2"));
+        assert_eq!(
+            verified_torchaudio_release("10.1.0a20260928"),
+            Some("2.11.0.2")
+        );
+        assert_eq!(verified_torchaudio_release("10.0.0"), None);
+        assert_eq!(verified_torchaudio_release("10.2.0"), None);
+        assert_eq!(verified_torchaudio_release("7.2.3"), None);
+    }
+    /// An unknown 10.x line fails closed rather than silently resolving the
+    /// static table's 7.2.3 pin, which is the whole point of keeping
+    /// [`rocm_sdk_major_matches`] alongside the narrower row lookup.
+    #[test]
+    fn unknown_rocm10_line_still_fails_closed() {
+        let err = install_target(None, Some("10.2.0")).expect_err("10.2.0 has no vLLM build");
+        let rendered = format!("{err:#}");
+        assert!(
+            !rendered.contains("7.2.3"),
+            "should not fall back to the static pin: {rendered}"
+        );
+    }
+    #[test]
+    fn rocm_local_version_guard_rejects_another_lines_wheel() {
+        // No local version at all (flash-attn, amd-aiter) is fine.
+        assert!(ensure_rocm_local_version_matches("flash-attn==2.8.3", "10.1.0").is_ok());
+        // Same line, different patch and rc suffix, is fine.
+        assert!(ensure_rocm_local_version_matches("torch==2.12.0+rocm10.1.0rc3", "10.1.0").is_ok());
+        // A 10.0 wheel resolved for a 10.1 SDK is not.
+        let err = ensure_rocm_local_version_matches(
+            "vllm==0.27.1.dev5+rocm10.0.0.gf46a9dfe2.d20260826",
+            "10.1.0",
+        )
+        .expect_err("a 10.0 wheel must not install onto a 10.1 SDK");
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("10.1.0"), "{rendered}");
+        assert!(rendered.contains("rocm10.0.0"), "{rendered}");
+    }
+    /// Pins `install_vllm_rocm10_discover`'s own call sequencing, not just its
+    /// arg-builder helpers in isolation: the remaining-deps install must use
+    /// `--config-file` (never `--extra-index-url`, which cannot tolerate the
+    /// 403 `lm-format-enforcer` needs), and a torch realign call must follow
+    /// it so that install's full-dependency resolve cannot leave an
+    /// unconstrained torch in place. Runs offline against fake `uv`/`python`
+    /// shims, same pattern as `crates/rocm-core/src/examine.rs`.
+    #[test]
+    #[cfg(unix)]
+    fn install_vllm_rocm10_discover_realigns_torch_after_the_config_file_install() -> Result<()> {
+        use rocm_core::fake_executable::write_fake_executable;
+
+        let root = tempfile::tempdir()?;
+        let paths = AppPaths {
+            config_dir: root.path().join("config"),
+            data_dir: root.path().join("data"),
+            cache_dir: root.path().join("cache"),
+        };
+        let log = root.path().join("uv-calls.log");
+
+        let python = root.path().join("python");
+        write_fake_executable(&python, "#!/bin/sh\necho cp314\n")?;
+
+        // Answers every `--dry-run` discovery call with a resolved pin for
+        // whatever package the requirement names, and otherwise just records
+        // the call (the real installs) for the assertions below.
+        let uv = root.path().join("uv");
+        write_fake_executable(
+            &uv,
+            format!(
+                r#"#!/bin/sh
+echo "$@" >> "{log}"
+last=""
+for a in "$@"; do last="$a"; done
+case "$*" in
+  *--dry-run*)
+    pkg=${{last%%==*}}
+    echo " + ${{pkg}}==9.9.9" >&2
+    ;;
+  *"pip freeze"*)
+    true
+    ;;
+esac
+exit 0
+"#,
+                log = log.display()
+            ),
+        )?;
+
+        let build = vllm_rocm_discover_build("10.1.0").expect("10.1.0 has a discover row");
+        let pins = install_vllm_rocm10_discover(&uv, &paths, &python, true, build)?;
+        assert_eq!(pins.len(), 6);
+
+        let calls: Vec<Vec<String>> = std::fs::read_to_string(&log)?
+            .lines()
+            .map(|line| line.split_whitespace().map(ToOwned::to_owned).collect())
+            .collect();
+        let discovered: Vec<&String> = calls
+            .iter()
+            .filter(|args| args.contains(&"--dry-run".to_owned()))
+            .filter_map(|args| args.last())
+            .collect();
+        assert_eq!(
+            discovered,
+            [
+                "torch==2.13.*",
+                "torchvision==0.28.*",
+                "torchaudio==2.11.0.2",
+                "vllm==0.29.*",
+                "flash-attn==2.8.*",
+                "amd-aiter==0.1.*",
+            ],
+            "discovery must ask uv for exactly torchaudio 2.11.0.2 on 10.1: {calls:?}"
+        );
+        let real_installs: Vec<&Vec<String>> = calls
+            .iter()
+            .filter(|args| !args.contains(&"--dry-run".to_owned()))
+            .filter(|args| args.get(1).map(String::as_str) != Some("freeze"))
+            .collect();
+        assert_eq!(
+            real_installs.len(),
+            3,
+            "expected torch install, remaining-deps install, stack realign: {calls:?}"
+        );
+
+        let torch_install = real_installs[0];
+        assert!(torch_install.contains(&"--index-url".to_owned()));
+        assert!(!torch_install.contains(&"--extra-index-url".to_owned()));
+        assert!(!torch_install.contains(&"--config-file".to_owned()));
+
+        let remaining_install = real_installs[1];
+        assert!(
+            remaining_install.contains(&"--config-file".to_owned()),
+            "the remaining-deps install must use --config-file, not --extra-index-url, \
+             for the 403-tolerant index: {remaining_install:?}"
+        );
+        assert!(!remaining_install.contains(&"--extra-index-url".to_owned()));
+
+        let stack_realign = real_installs[2];
+        assert!(
+            stack_realign.contains(&"--reinstall-package".to_owned())
+                && stack_realign.contains(&"torch".to_owned()),
+            "the full-dependency install can silently replace torch with an unconstrained \
+             PyPI build; a forced reinstall must follow it: {stack_realign:?}"
+        );
+        assert!(
+            stack_realign.contains(&"torchvision==9.9.9".to_owned())
+                && stack_realign.contains(&"torchaudio==9.9.9".to_owned()),
+            "torchvision/torchaudio must be discovered fresh and restored alongside torch, \
+             or the full-dependency resolve can leave an ABI-incompatible build in place: \
+             {stack_realign:?}"
+        );
+        assert!(stack_realign.contains(&"--index-url".to_owned()));
+        assert!(!stack_realign.contains(&"--extra-index-url".to_owned()));
+        assert!(!stack_realign.contains(&"--config-file".to_owned()));
+
+        Ok(())
+    }
+    /// The full-dependency install can leave an AMD torch device-kernel
+    /// plugin pinned to whatever the index's newest release is, ahead of the
+    /// torch version realigned alongside it -- a mismatch that doesn't fail
+    /// install, only serving. Whichever such package `uv pip freeze` reports
+    /// installed must be realigned to torch's exact release too.
+    #[test]
+    #[cfg(unix)]
+    fn install_vllm_rocm10_discover_realigns_stale_device_packages_per_base_package() -> Result<()>
+    {
+        use rocm_core::fake_executable::write_fake_executable;
+
+        let root = tempfile::tempdir()?;
+        let paths = AppPaths {
+            config_dir: root.path().join("config"),
+            data_dir: root.path().join("data"),
+            cache_dir: root.path().join("cache"),
+        };
+        let log = root.path().join("uv-calls.log");
+
+        let python = root.path().join("python");
+        write_fake_executable(&python, "#!/bin/sh\necho cp314\n")?;
+
+        let uv = root.path().join("uv");
+        write_fake_executable(
+            &uv,
+            format!(
+                r#"#!/bin/sh
+echo "$@" >> "{log}"
+last=""
+for a in "$@"; do last="$a"; done
+case "$*" in
+  *--dry-run*)
+    pkg=${{last%%==*}}
+    case "$pkg" in
+      torchvision) echo " + ${{pkg}}==8.8.8" >&2 ;;
+      *) echo " + ${{pkg}}==9.9.9" >&2 ;;
+    esac
+    ;;
+  *"pip freeze"*)
+    echo "amd_torch_device_gfx1151==2.14.0+rocm10.1.0"
+    echo "amd_torchvision_device_gfx1151==1.1.1+rocm10.1.0"
+    ;;
+esac
+exit 0
+"#,
+                log = log.display()
+            ),
+        )?;
+
+        let build = vllm_rocm_discover_build("10.1.0").expect("10.1.0 has a discover row");
+        let pins = install_vllm_rocm10_discover(&uv, &paths, &python, true, build)?;
+        assert!(
+            pins.contains(&"amd_torch_device_gfx1151==9.9.9".to_owned()),
+            "the stale torch device package must be realigned to torch's own resolved release: {pins:?}"
+        );
+        assert!(
+            pins.contains(&"amd_torchvision_device_gfx1151==8.8.8".to_owned()),
+            "the stale torchvision device package must be realigned to torchvision's own \
+             resolved release, not torch's: {pins:?}"
+        );
+        // Guards the prefix-boundary check in `is_amd_device_package_for`: a
+        // weakened boundary (e.g. matching on a bare `starts_with` of
+        // `amd-torch`, which `amd-torchvision-device-gfx1151` also satisfies)
+        // would add a second, wrongly-cross-matched pin alongside the
+        // correct one above, invisible to a `.contains()`-only check.
+        assert!(
+            !pins.contains(&"amd_torchvision_device_gfx1151==9.9.9".to_owned()),
+            "torchvision's device package must not be cross-matched under torch's base \
+             package and pinned to torch's release: {pins:?}"
+        );
+        assert_eq!(
+            pins.len(),
+            8,
+            "expected the 6 discovered pins plus exactly one device pin per base package: {pins:?}"
+        );
+
+        let calls: Vec<Vec<String>> = std::fs::read_to_string(&log)?
+            .lines()
+            .map(|line| line.split_whitespace().map(ToOwned::to_owned).collect())
+            .collect();
+        let stack_realign = calls
+            .iter()
+            .rfind(|args| {
+                !args.contains(&"--dry-run".to_owned())
+                    && args.get(1).map(String::as_str) != Some("freeze")
+            })
+            .expect("a stack realign call must have run");
+        assert!(
+            stack_realign.contains(&"--reinstall-package".to_owned())
+                && stack_realign.contains(&"amd_torch_device_gfx1151".to_owned())
+                && stack_realign.contains(&"amd_torch_device_gfx1151==9.9.9".to_owned()),
+            "the realign call must reinstall the stale torch device package pinned to torch's \
+             resolved release: {stack_realign:?}"
+        );
+        assert!(
+            stack_realign.contains(&"amd_torchvision_device_gfx1151".to_owned())
+                && stack_realign.contains(&"amd_torchvision_device_gfx1151==8.8.8".to_owned()),
+            "the realign call must reinstall the stale torchvision device package pinned to \
+             torchvision's resolved release: {stack_realign:?}"
+        );
+
+        Ok(())
+    }
+    /// Pins the ordering fix directly: the trio realign (torch/torchvision/
+    /// torchaudio `--no-deps`) must run before `uv pip freeze` is even
+    /// invoked, so a freeze failure aborts only the device-plugin lookup that
+    /// follows it, never the realign itself. Reverting the ordering (freeze
+    /// before realign) would leave only 2 real installs here instead of 3.
+    #[test]
+    #[cfg(unix)]
+    fn install_vllm_rocm10_discover_realigns_the_trio_even_if_pip_freeze_fails() -> Result<()> {
+        use rocm_core::fake_executable::write_fake_executable;
+
+        let root = tempfile::tempdir()?;
+        let paths = AppPaths {
+            config_dir: root.path().join("config"),
+            data_dir: root.path().join("data"),
+            cache_dir: root.path().join("cache"),
+        };
+        let log = root.path().join("uv-calls.log");
+
+        let python = root.path().join("python");
+        write_fake_executable(&python, "#!/bin/sh\necho cp314\n")?;
+
+        let uv = root.path().join("uv");
+        write_fake_executable(
+            &uv,
+            format!(
+                r#"#!/bin/sh
+echo "$@" >> "{log}"
+last=""
+for a in "$@"; do last="$a"; done
+case "$*" in
+  *--dry-run*)
+    pkg=${{last%%==*}}
+    echo " + ${{pkg}}==9.9.9" >&2
+    ;;
+  *"pip freeze"*)
+    echo "simulated uv pip freeze failure" >&2
+    exit 1
+    ;;
+esac
+exit 0
+"#,
+                log = log.display()
+            ),
+        )?;
+
+        let build = vllm_rocm_discover_build("10.1.0").expect("10.1.0 has a discover row");
+        let err = install_vllm_rocm10_discover(&uv, &paths, &python, true, build)
+            .expect_err("a pip freeze failure must surface, not silently succeed");
+        assert!(
+            format!("{err:#}").contains("pip freeze"),
+            "error should name the step that failed: {err:#}"
+        );
+
+        let calls: Vec<Vec<String>> = std::fs::read_to_string(&log)?
+            .lines()
+            .map(|line| line.split_whitespace().map(ToOwned::to_owned).collect())
+            .collect();
+        let real_installs: Vec<&Vec<String>> = calls
+            .iter()
+            .filter(|args| !args.contains(&"--dry-run".to_owned()))
+            .filter(|args| args.get(1).map(String::as_str) != Some("freeze"))
+            .collect();
+        assert_eq!(
+            real_installs.len(),
+            3,
+            "torch install, remaining-deps install, and the trio realign must all run before \
+             `uv pip freeze` is even invoked, so its failure cannot skip the realign: {calls:?}"
+        );
+        let stack_realign = real_installs[2];
+        assert!(
+            stack_realign.contains(&"--no-deps".to_owned())
+                && stack_realign.contains(&"--reinstall-package".to_owned())
+                && stack_realign.contains(&"torch".to_owned())
+                && stack_realign.contains(&"torchvision==9.9.9".to_owned())
+                && stack_realign.contains(&"torchaudio==9.9.9".to_owned()),
+            "the trio realign must have already run before the freeze failure: {stack_realign:?}"
+        );
+
+        Ok(())
     }
 }

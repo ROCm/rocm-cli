@@ -29,7 +29,7 @@ use rocm_dash_core::state::{SideEffect, State, StateEvent};
 use crate::ui::approval::{
     ApprovalChoice, ApprovalRequest, ApprovalVerdict, approval_key, draw_approval,
 };
-use crate::ui::exec::{exe_label, resolve_exe};
+use crate::ui::exec::{display_args, exe_label, resolve_exe};
 use crate::ui::folder_browser::{FolderBrowser, FolderOutcome, draw_folder_browser};
 use crate::ui::job_console::{ConsoleOutcome, on_console_key};
 use crate::ui::model_picker::{ModelPicker, ModelRecipeSummary, PickerOutcome, draw_model_picker};
@@ -346,7 +346,7 @@ fn request_launch(w: &mut ServeWizardState) {
     match w.build_args() {
         Ok(args) => {
             let cmd = resolve_exe();
-            let cmdline = format!("{} {}", exe_label(&cmd), args.join(" "));
+            let cmdline = format!("{} {}", exe_label(&cmd), display_args(&args));
             let request = ApprovalRequest::new(
                 format!("serve “{}”", w.model.trim()),
                 vec![

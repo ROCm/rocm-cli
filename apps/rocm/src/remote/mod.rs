@@ -452,7 +452,7 @@ fn serve_with_transport(
             return Err(error.context(format!(
                 "a model may now be running on {} port {} with nothing tracking it.\n\
                      Check with: ssh {} -- {remote_cli} services list\n\
-                     Its API key was kept at {} — it is the only copy.",
+                     Its API key was kept at {} - it is the only copy.",
                 request.target,
                 request.remote_port,
                 request.target,
@@ -544,9 +544,9 @@ fn unwind_partial_serve(
     }
 
     if let Some(service_id) = service_id {
-        match transport.exec(&format!(
-            "{remote_cli} services stop {} --yes",
-            shell_quote(service_id)
+        match transport.exec(&crate::service_hints::remote_service_stop_hint(
+            remote_cli,
+            &shell_quote(service_id),
         )) {
             Ok(outcome) if outcome.success => {}
             Ok(outcome) => leftovers.push(format!(
@@ -571,11 +571,23 @@ fn unwind_partial_serve(
         session::clear_key(paths, session_id);
     } else {
         leftovers.push(format!(
-            "its API key was kept at {} — it is the only copy",
+            "its API key was kept at {} - it is the only copy",
             session::key_path(paths, session_id).display()
         ));
     }
     leftovers
+}
+
+/// One item per line, bulleted. Shared rather than reimplemented per call
+/// site, so a third copy never has to decide independently whether to match
+/// this formatting. Private: the only other caller is `remote::install`, a
+/// child module, which sees a plain-private item without any added visibility.
+fn bullets(items: &[String]) -> String {
+    items
+        .iter()
+        .map(|item| format!("  - {item}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Attach what could not be cleaned up to the error that caused it.
@@ -586,11 +598,7 @@ fn describe_leftovers(error: anyhow::Error, target: &str, leftovers: &[String]) 
     error.context(format!(
         "{target} was left with things this command could not undo:\n{}\n\
          Check it with: ssh {target} -- rocm services list",
-        leftovers
-            .iter()
-            .map(|leftover| format!("  - {leftover}"))
-            .collect::<Vec<_>>()
-            .join("\n")
+        bullets(leftovers)
     ))
 }
 
@@ -729,7 +737,8 @@ fn discover_started_service(
              A running server cannot be given a key it did not start with, so publishing this \
              endpoint would expose it on the tailnet while printing a key it would reject.\n\
              Stop it and run this again: ssh into the machine and run \
-             `{remote_cli} services stop {service_id}`."
+             `{}`.",
+            crate::service_hints::remote_service_stop_hint(remote_cli, &service_id)
         );
     }
     Ok(service_id)
@@ -967,14 +976,14 @@ fn render_status(
                 Known(publish::PublishState::Published) => "yes".to_owned(),
                 Known(publish::PublishState::Absent) => "no".to_owned(),
                 Known(publish::PublishState::Foreign { forwards_to }) =>
-                    format!("no — that port now forwards to {forwards_to}"),
+                    format!("no - that port now forwards to {forwards_to}"),
                 // Not "no": Funnel is classified before anything is asked about
                 // our own forward and short-circuits, so this state says
                 // nothing either way about whether the endpoint is published.
                 // Leading with "no" answered a question it had not looked at,
                 // and buried the one thing here that needs acting on.
                 Known(publish::PublishState::FunnelAllowed) => format!(
-                    "exposed — Tailscale Funnel is allowed on that port, which puts it on the \
+                    "exposed - Tailscale Funnel is allowed on that port, which puts it on the \
                      public internet; run `tailscale funnel --tcp={} off` on the remote, then \
                      check again",
                     record.tailnet_port
@@ -985,12 +994,12 @@ fn render_status(
                 // stay distinct because the next step differs — fix the reply,
                 // fix the remote's tailscale, or fix the connection.
                 Known(publish::PublishState::Unreadable) =>
-                    "unknown — the machine's reply could not be read".to_owned(),
+                    "unknown - the machine's reply could not be read".to_owned(),
                 // Reached, and it told us why. Printing its own words beats
                 // "could not be asked", which describes a different failure and
                 // sends the user to check the network instead of the remote.
-                Failed(why) => format!("unknown — the machine answered: {why}"),
-                Unreachable(why) => format!("unknown — the machine could not be asked: {why}"),
+                Failed(why) => format!("unknown - the machine answered: {why}"),
+                Unreachable(why) => format!("unknown - the machine could not be asked: {why}"),
             }
         );
 
@@ -1094,10 +1103,9 @@ fn stop_with_transport(
     // live publish is a refused connection, but a live model behind a forgotten
     // publish is an open GPU endpoint nobody is tracking.
     let withdrawn = publish::withdraw(transport, record.tailnet_port, record.remote_port);
-    let stopped = transport.exec(&format!(
-        "{} services stop {} --yes",
-        record.remote_cli,
-        shell_quote(&record.remote_service_id)
+    let stopped = transport.exec(&crate::service_hints::remote_service_stop_hint(
+        &record.remote_cli,
+        &shell_quote(&record.remote_service_id),
     ));
     let stop_failure = describe_stop_failure(&stopped);
     let model_stopped = stop_failure.is_none();
@@ -1217,7 +1225,7 @@ fn render_stopped(
         if !withdrawn {
             let _ = writeln!(
                 output,
-                "  endpoint still reachable on the tailnet — clear it with:\n    \
+                "  endpoint still reachable on the tailnet - clear it with:\n    \
                  ssh {} -- tailscale serve --tcp={} off",
                 record.target, record.tailnet_port
             );
@@ -1225,7 +1233,7 @@ fn render_stopped(
         if !model_stopped {
             let _ = writeln!(
                 output,
-                "  model may still hold the GPU — check with:\n    \
+                "  model may still hold the GPU - check with:\n    \
                  ssh {} -- {} services list",
                 record.target, record.remote_cli
             );
@@ -1286,9 +1294,8 @@ mod tests {
     /// endpoint key.
     fn temp_paths(tag: &str) -> (std::path::PathBuf, AppPaths) {
         let root = std::env::temp_dir().join(format!(
-            "rocm-remote-unwind-{tag}-{}-{}",
-            std::process::id(),
-            rocm_core::unix_time_millis()
+            "rocm-remote-unwind-{tag}-{}",
+            crate::test_support::unique_suffix()
         ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
@@ -1300,6 +1307,11 @@ mod tests {
                 cache_dir: root.join("cache"),
             },
         )
+    }
+
+    #[test]
+    fn temp_paths_gives_each_call_its_own_root_even_for_one_label() {
+        crate::test_support::assert_each_call_gets_its_own_root(|| temp_paths("same-label").0);
     }
 
     fn sample_record() -> RemoteSessionRecord {
@@ -1541,9 +1553,24 @@ mod tests {
             error.contains("already serving on port 11434"),
             "the refusal must say what it found: {error}"
         );
+        // The printed hint must be the exact, directly-runnable command:
+        // `main.rs`'s `service_actions_require_yes_and_render_sandbox_result`
+        // proves this exact form (`rocm services stop <id> --yes`) is the one
+        // the approval gate itself recommends on the local side, and this
+        // message tells the user to run the same CLI's own `services stop` on
+        // the remote. That running this form actually clears *this* refusal —
+        // a service the remote reused instead of starting fresh — is proven on
+        // the remote's own CLI by
+        // `@id:remote-serve-refuses-reusing-already-serving-session`
+        // (`tests/e2e-cucumber/features/remote.feature`, remote-15), which
+        // reproduces this exact condition over the container, runs the printed
+        // hint there, and asserts the service is actually gone — not by
+        // `stop_managed_services` in `tests/e2e-cucumber/tests/e2e.rs`, which
+        // runs this same invocation as best-effort teardown and never asserts
+        // success.
         assert!(
-            error.contains("services stop already-there"),
-            "the refusal must name the way out: {error}"
+            error.contains("services stop already-there --yes"),
+            "the refusal must name the way out, directly runnable with --yes: {error}"
         );
     }
 
@@ -2045,9 +2072,10 @@ mod tests {
         assert!(
             transport.calls().iter().any(|call| matches!(
                 call,
-                TransportCall::Exec { command, .. } if command.contains("services stop svc-1")
+                TransportCall::Exec { command, .. } if command.contains("services stop svc-1 --yes")
             )),
-            "the started model should have been stopped: {:?}",
+            "the started model should have been stopped with the same directly-runnable form \
+             the hint prints, --yes included: {:?}",
             transport.calls()
         );
         let _ = std::fs::remove_dir_all(root);
