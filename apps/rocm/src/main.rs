@@ -46,6 +46,7 @@ mod test_support;
 mod therock;
 mod uninstall;
 mod uninstall_plan;
+mod update_cmd;
 
 // Per-command handlers mechanically relocated into modules — fns, plus the
 // types (e.g. `ServeArgs`, driver-plan types) that moved with their cluster.
@@ -64,11 +65,16 @@ mod uninstall_plan;
 // `render_freeform_execution_header` are re-imported for the same reason:
 // `execute_freeform_next_action` (itself only called from `run_freeform`,
 // outside `dispatch()`) calls them. `install()`'s SDK path calls into
-// `runtime_install_finalize` directly (not via `dispatch()`),
-// and `apply_runtime_update`/`append_update_activate_summary` and several
-// root-level chat/examine/update helpers call into `runtimes_cmd` directly for
-// the same reason `engines_cmd`'s runtime-resolution helpers are re-imported.
-use crate::automations::automations;
+// `runtime_install_finalize` directly (not via `dispatch()`), and several
+// root-level chat/examine helpers call into `runtimes_cmd` directly for the
+// same reason `engines_cmd`'s runtime-resolution helpers are re-imported;
+// `current_runtime_manifest`/`select_runtime_manifest` stay re-imported here
+// for `single_ready_runtime_key`/`resolve_runtime_selector_to_exact_key`
+// below, also outside `dispatch()`. `update_cmd.rs`'s
+// `apply_runtime_update`/`append_update_activate_summary` call into
+// `runtimes_cmd` directly too, via their own imports rather than this
+// re-export.
+use crate::automations::{automations, render_daemon_text};
 use crate::driver_install::{install_driver, reconcile_driver_install};
 use crate::engine_ipc::{
     builtin_engine_available, builtin_engine_serve_http_args, engine_request,
@@ -94,10 +100,10 @@ use crate::runtime_install_finalize::{
     print_sdk_install_success,
 };
 use crate::runtimes_cmd::{
-    RuntimeActivationResult, activate_runtime, active_runtime_marker_path,
-    current_runtime_manifest, default_runtime_id_matches, recover_setup_runtime_registration,
-    runtime_keys_text, runtime_usability_status, runtimes, select_runtime_manifest,
-    setup_runtime_paths, toolchain_state_text, validate_runtime_manifest_for_activation,
+    active_runtime_marker_path, current_runtime_manifest, default_runtime_id_matches,
+    recover_setup_runtime_registration, runtime_keys_text, runtime_usability_status, runtimes,
+    select_runtime_manifest, setup_runtime_paths, toolchain_state_text,
+    validate_runtime_manifest_for_activation,
 };
 use crate::serve_cmd::{ServeArgs, select_serve_engine, serve};
 use crate::service_launch::ensure_public_service_has_endpoint_key;
@@ -108,6 +114,7 @@ use crate::service_launch::{
 };
 use crate::uninstall::uninstall;
 use crate::uninstall_plan::UninstallOptions;
+use crate::update_cmd::{apply_runtime_update, render_update_text, update_should_preview_or_apply};
 
 use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
@@ -116,19 +123,18 @@ use rocm_core::model_readiness::{
     AcceleratorMemory, HostEngineChoice, HostFacts, ModelCatalogSource, ModelReadiness,
 };
 use rocm_core::{
-    AppPaths, AuditEventRecord, AutomationEventRecord, AutomationProposalRecord,
-    AutomationRuntimeState, CodexBridgeEngine, CodexBridgeGpuSnapshot, CodexBridgeSnapshot,
-    DEFAULT_LOCAL_HOST, EndpointReadiness, ExamineSummary, ManagedServiceRecord, ModelRecipeRecord,
-    ModelRecipeRegistry, ModelRecipeRegistrySource, PERMISSIONS_MODE_ASK,
-    PERMISSIONS_MODE_FULL_ACCESS, RocmCliConfig, TELEMETRY_MODE_LOCAL, TELEMETRY_MODE_OFF,
-    WatcherMode, append_audit_event, builtin_model_recipes, builtin_watchers, connect_tcp_stream,
+    AppPaths, AuditEventRecord, AutomationRuntimeState, CodexBridgeEngine, CodexBridgeGpuSnapshot,
+    CodexBridgeSnapshot, DEFAULT_LOCAL_HOST, EndpointReadiness, ExamineSummary,
+    ManagedServiceRecord, ModelRecipeRecord, ModelRecipeRegistry, ModelRecipeRegistrySource,
+    PERMISSIONS_MODE_ASK, PERMISSIONS_MODE_FULL_ACCESS, RocmCliConfig, TELEMETRY_MODE_LOCAL,
+    TELEMETRY_MODE_OFF, WatcherMode, append_audit_event, builtin_model_recipes, connect_tcp_stream,
     daemon_binary_path, default_engine_for_platform, detect_host_gfx_target,
     detect_host_gpu_summary, engine_plugin_dirs, format_host_port, format_http_base_url,
-    interactive_terminal, load_model_recipe_registry, load_recent_audit_events,
-    load_recent_automation_events, load_recent_automation_proposals, managed_pip_cache_dir,
-    model_artifact_cache_status, model_catalog_platforms, model_recipe_featured,
-    model_recipe_target_platform_label, normalize_therock_family, platform_matches_gfx_family,
-    process_is_running, read_http_response_bounded, uv_cache_source, write_all_tcp_stream,
+    interactive_terminal, load_model_recipe_registry, load_recent_automation_events,
+    managed_pip_cache_dir, model_artifact_cache_status, model_catalog_platforms,
+    model_recipe_featured, model_recipe_target_platform_label, normalize_therock_family,
+    platform_matches_gfx_family, process_is_running, read_http_response_bounded, uv_cache_source,
+    write_all_tcp_stream,
 };
 use rocm_engine_protocol::{
     DEFAULT_LOG_TAIL_LINES, DetectRequest, DetectResponse, DevicePolicy,
@@ -7473,197 +7479,6 @@ fn read_tail_lines(path: &Path, limit: usize, label: &str) -> Result<Vec<String>
     Ok(lines.into_iter().collect())
 }
 
-pub(crate) fn render_update_text(paths: &AppPaths) -> Result<String> {
-    let mut output = therock::render_update_report(paths)?;
-    append_update_surfaces(&mut output);
-    Ok(output)
-}
-
-fn append_update_surfaces(output: &mut String) {
-    let _ = writeln!(output, "  update_surfaces:");
-    let _ = writeln!(
-        output,
-        "    cli: installed={} status=not_configured reason=repository-owned CLI update feed is not published yet",
-        env!("CARGO_PKG_VERSION")
-    );
-    let engine_ids = engine_inventory()
-        .iter()
-        .map(|(engine, _)| *engine)
-        .collect::<Vec<_>>()
-        .join(",");
-    let _ = writeln!(
-        output,
-        "    engines: status=package_managed packaged=[{engine_ids}] reason=first-party engine binaries update with the rocm-cli package; data-dir plugins are user-managed"
-    );
-    match load_model_recipe_registry() {
-        Ok(registry) => match registry.source {
-            ModelRecipeRegistrySource::BuiltIn => {
-                let _ = writeln!(
-                    output,
-                    "    model_recipes: status=built_in count={} reason=external signed recipe index is not configured",
-                    registry.recipes.len()
-                );
-            }
-            ModelRecipeRegistrySource::SignedIndex {
-                index_path,
-                signature_path,
-                public_key_path,
-            } => {
-                let _ = writeln!(
-                    output,
-                    "    model_recipes: status=signed_index count={} index={} signature={} public_key={} reason=loaded signed recipe index; recipe update feed is not live in this build",
-                    registry.recipes.len(),
-                    index_path.display(),
-                    signature_path.display(),
-                    public_key_path.display()
-                );
-            }
-        },
-        Err(error) => {
-            let _ = writeln!(
-                output,
-                "    model_recipes: status=error reason={}",
-                sanitize_log_value(&error.to_string())
-            );
-        }
-    }
-    let runtime_status = if output.contains("  managed runtimes: none") {
-        "none_configured"
-    } else {
-        "checked_above"
-    };
-    let _ = writeln!(
-        output,
-        "    runtimes: status={runtime_status} reason=TheRock runtime update checks above are the only live update checks in this build"
-    );
-    let _ = writeln!(
-        output,
-        "  note: `rocm update --apply` applies runtime updates only; CLI, engine, and recipe update feeds require published metadata before they can mutate state"
-    );
-}
-
-/// Whether `rocm update` should route into the runtime update path
-/// (`apply_runtime_update`) instead of the read-only status report.
-///
-/// `--dry-run` alone must take this path too, since `apply_runtime_update`
-/// only mutates anything when `dry_run` is false — a plain status report
-/// would silently ignore `--dry-run` and never show what `--apply` would do.
-const fn update_should_preview_or_apply(apply: bool, dry_run: bool) -> bool {
-    apply || dry_run
-}
-
-fn apply_runtime_update(
-    paths: &AppPaths,
-    config: &mut RocmCliConfig,
-    runtime_selector: Option<&str>,
-    activate: bool,
-    dry_run: bool,
-) -> Result<String> {
-    let manifests = therock::load_runtime_manifests(paths)?;
-    let source = select_runtime_update_source(&manifests, config, runtime_selector)?;
-    let plan = therock::runtime_update_plan(paths, source, &manifests, None)?;
-    let mut output = String::new();
-    let _ = writeln!(output, "runtime update");
-    let _ = writeln!(output, "  source_runtime_key: {}", source.runtime_key);
-    let _ = writeln!(output, "  source_runtime_id: {}", source.runtime_id);
-    let _ = writeln!(output, "  channel: {}", source.channel);
-    let _ = writeln!(output, "  format: {}", source.format);
-    let _ = writeln!(output, "  family: {}", source.family);
-    let _ = writeln!(
-        output,
-        "  installed_version: {}",
-        therock::runtime_version_display(&source.version)
-    );
-    let _ = writeln!(
-        output,
-        "  latest_version: {}",
-        therock::runtime_version_display(&plan.latest_version)
-    );
-    let _ = writeln!(output, "  status: {}", plan.status);
-    let _ = writeln!(output, "  target_runtime_key: {}", plan.target_runtime_key);
-    let _ = writeln!(output, "  activate_after_install: {activate}");
-    if !plan.update_available {
-        let _ = writeln!(output, "  result: no newer runtime found");
-        return Ok(output);
-    }
-
-    if dry_run {
-        let _ = writeln!(output, "  mode: dry-run");
-        let install_plan = therock::install_sdk_for_update(
-            paths,
-            &source.channel,
-            &source.format,
-            &source.family,
-            plan.device_target.as_deref(),
-            plan.source_layout_generation.as_deref(),
-            source.includes_devel(),
-            true,
-            activate,
-        )?;
-        let _ = writeln!(output, "  install_plan:");
-        for line in install_plan.output.lines() {
-            let _ = writeln!(output, "    {line}");
-        }
-        return Ok(output);
-    }
-
-    // `activate` rather than a bare `true`: the update path is preapproved either
-    // way (its approval comes from the runtime the user selected, not from a
-    // flag, and `rocm update` has no terminal contract), but the approval line it
-    // prints must not promise an activation that only `--activate` performs
-    // below.
-    let install_output = therock::install_sdk_for_update(
-        paths,
-        &source.channel,
-        &source.format,
-        &source.family,
-        plan.device_target.as_deref(),
-        plan.source_layout_generation.as_deref(),
-        // Reinstall what the user originally chose rather than silently
-        // adding or dropping the compiler toolchain on update.
-        source.includes_devel(),
-        false,
-        activate,
-    )?;
-    let manifests_after = therock::load_runtime_manifests(paths)?;
-    // By exact key, never by version: a same-version repair installs a sibling
-    // that shares the source's channel, format, family AND version, so a
-    // version match would just as happily return the stale runtime this update
-    // was meant to replace, and then activate it.
-    let installed = select_installed_update_runtime(&manifests_after, &plan.target_runtime_key)
-        .with_context(|| {
-            format!(
-                "runtime install completed but no manifest was written for the planned runtime key `{}`",
-                plan.target_runtime_key
-            )
-        })?;
-    let _ = writeln!(output, "  installed_runtime_key: {}", installed.runtime_key);
-    let _ = writeln!(
-        output,
-        "  installed_runtime_root: {}",
-        installed.install_root.display()
-    );
-    if activate {
-        // No `config.save` after this: `activate_runtime` already persisted the
-        // same struct and nothing mutates it in between, so a second write can
-        // only fail after an activation that fully succeeded — sending the user
-        // to re-run a command that already worked.
-        let activation = activate_runtime(paths, config, &installed.runtime_key)?;
-        append_update_activate_summary(&mut output, &activation);
-    } else {
-        let _ = writeln!(
-            output,
-            "  next step: rocm runtimes activate {}",
-            installed.runtime_key
-        );
-    }
-    let _ = writeln!(output, "  install_output:");
-    for line in install_output.output.lines() {
-        let _ = writeln!(output, "    {line}");
-    }
-    Ok(output)
-}
-
 /// Shown after any activation (direct `runtimes activate`, `update --apply
 /// --activate`, or an `install sdk` that switches the active runtime) that
 /// recorded a previous runtime, so every path that reaches this state gives
@@ -7672,422 +7487,6 @@ fn apply_runtime_update(
 /// call sites.
 const ROLLBACK_RECOVERY_HINT: &str = "  next step: if this causes problems, run `rocm runtimes rollback` \
 (no history - undoes only this one activation)";
-
-/// Appends the `--activate` branch of the `update --apply` summary. The
-/// rollback hint is only shown when a previous runtime was actually recorded —
-/// `rocm runtimes rollback` hard-errors otherwise (no prior runtime to return
-/// to), so hinting it unconditionally would point users at a command that
-/// immediately fails on their very first activation.
-fn append_update_activate_summary(output: &mut String, activation: &RuntimeActivationResult) {
-    let _ = writeln!(
-        output,
-        "  activated_runtime_key: {}",
-        activation.runtime_key
-    );
-    let _ = writeln!(
-        output,
-        "  previous_runtime_key: {}",
-        activation
-            .previous_runtime_key
-            .as_deref()
-            .unwrap_or("<unset>")
-    );
-    let _ = write!(
-        output,
-        "{}",
-        runtime_services::render_runtime_service_reconciliation(
-            &activation.services,
-            &activation.runtime_key
-        )
-    );
-    if activation.previous_runtime_key.is_some() {
-        let _ = writeln!(output, "{ROLLBACK_RECOVERY_HINT}");
-    }
-}
-
-fn select_runtime_update_source<'a>(
-    manifests: &'a [therock::InstalledRuntimeManifest],
-    config: &RocmCliConfig,
-    runtime_selector: Option<&str>,
-) -> Result<&'a therock::InstalledRuntimeManifest> {
-    if let Some(selector) = runtime_selector {
-        return select_runtime_manifest(manifests, selector);
-    }
-    if let Some(active) = current_runtime_manifest(config, manifests) {
-        return Ok(active);
-    }
-    match manifests {
-        [] => bail!(
-            "no managed runtimes are registered; run `rocm install sdk --channel release --format wheel` first"
-        ),
-        [only] => Ok(only),
-        _ => bail!(
-            "multiple runtimes are registered and no active runtime is configured; pass `--runtime <runtime-key>`"
-        ),
-    }
-}
-
-fn select_installed_update_runtime<'a>(
-    manifests: &'a [therock::InstalledRuntimeManifest],
-    target_runtime_key: &str,
-) -> Option<&'a therock::InstalledRuntimeManifest> {
-    manifests
-        .iter()
-        .find(|manifest| manifest.runtime_key == target_runtime_key)
-}
-
-pub(crate) fn render_automations_text(paths: &AppPaths, config: &RocmCliConfig) -> Result<String> {
-    let runtime_state = AutomationRuntimeState::load(paths).unwrap_or(None);
-    let recent_events = load_recent_automation_events(paths, 5).unwrap_or_default();
-    let recent_proposals = load_recent_automation_proposals(paths, 5).unwrap_or_default();
-    let recent_audit_events = load_recent_audit_events(paths, 5).unwrap_or_default();
-    let mut output = String::new();
-    let _ = writeln!(output, "automation checks");
-    let _ = writeln!(output, "  config: {}", paths.config_path().display());
-    let _ = writeln!(
-        output,
-        "  background checks: {}",
-        if config.automation_daemon_enabled() {
-            "on"
-        } else {
-            "off"
-        }
-    );
-    if let Some(state) = runtime_state.as_ref() {
-        let _ = writeln!(
-            output,
-            "  background service: {}",
-            if state.running { "running" } else { "stopped" }
-        );
-        let _ = writeln!(
-            output,
-            "  local event intake: {}",
-            state
-                .local_webhook_endpoint
-                .as_deref()
-                .unwrap_or("disabled")
-        );
-    } else {
-        let _ = writeln!(output, "  background service: not running");
-        let _ = writeln!(output, "  local event intake: disabled");
-    }
-    for watcher in builtin_watchers() {
-        let runtime_snapshot = runtime_state.as_ref().and_then(|state| {
-            state
-                .active_watchers
-                .iter()
-                .find(|item| item.id == watcher.id)
-        });
-        let _ = writeln!(
-            output,
-            "  {} ({})",
-            watcher_plain_name(watcher.id),
-            if config.watcher_enabled(watcher) {
-                "on"
-            } else {
-                "off"
-            }
-        );
-        let _ = writeln!(
-            output,
-            "    setting: {}",
-            watcher_mode_plain_label(config.effective_watcher_mode(watcher))
-        );
-        let _ = writeln!(
-            output,
-            "    listens for: {}",
-            watcher_plain_trigger(watcher.id)
-        );
-        let _ = writeln!(output, "    does: {}", watcher_plain_action(watcher.id));
-        if let Some(note) = watcher_policy_note(watcher.id) {
-            let _ = writeln!(output, "    policy: {note}");
-        }
-        if let Some(snapshot) = runtime_snapshot {
-            let _ = writeln!(output, "    last check: {}", watcher_last_check(snapshot));
-        }
-    }
-    if !recent_events.is_empty() {
-        let _ = writeln!(output, "  recent automation activity:");
-        for event in recent_events {
-            let _ = writeln!(output, "    {}", automation_event_plain_summary(&event));
-            if let Some(service_id) = event.service_id.as_deref() {
-                let _ = writeln!(output, "      server: {service_id}");
-            }
-        }
-    }
-    if !recent_proposals.is_empty() {
-        let _ = writeln!(output, "  recent review requests:");
-        for proposal in recent_proposals {
-            let _ = writeln!(
-                output,
-                "    {} [{}] {}",
-                proposal.proposal_id,
-                proposal_status_label(&proposal.status),
-                proposal_plain_summary(&proposal)
-            );
-            let _ = writeln!(output, "      why: {}", proposal_plain_reason(&proposal));
-            if let Some(service_id) = proposal.service_id.as_deref() {
-                let _ = writeln!(output, "      server: {service_id}");
-            }
-            if let Some(artifact_ref) = proposal
-                .arguments
-                .get("artifact_ref")
-                .and_then(serde_json::Value::as_str)
-            {
-                let _ = writeln!(output, "      model file: {artifact_ref}");
-            }
-            if proposal_bool_argument(&proposal, "allow_artifact_download") {
-                let limit = proposal
-                    .arguments
-                    .get("artifact_max_bytes")
-                    .and_then(serde_json::Value::as_u64)
-                    .map_or_else(|| "not set".to_owned(), format_bytes);
-                let _ = writeln!(output, "      download: approved up to {limit}");
-            } else if proposal_kind(&proposal) == ProposalKind::PrefetchArtifact {
-                let _ = writeln!(output, "      download: not approved yet");
-            }
-            if proposal_kind(&proposal) == ProposalKind::DriverPlan {
-                let _ = writeln!(
-                    output,
-                    "      effect: show a driver plan only; no driver install"
-                );
-            }
-            if proposal.status == "pending" {
-                let _ = writeln!(
-                    output,
-                    "      controls: /automations approve {} | /automations reject {}",
-                    proposal.proposal_id, proposal.proposal_id
-                );
-            }
-        }
-    }
-    if !recent_audit_events.is_empty() {
-        let _ = writeln!(output, "  recent background activity:");
-        for event in recent_audit_events {
-            let _ = writeln!(output, "    {}", audit_event_plain_summary(&event));
-            if let Some(service_id) = event.service_id.as_deref() {
-                let _ = writeln!(output, "      server: {service_id}");
-            }
-        }
-    }
-    Ok(output)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProposalKind {
-    RestartServer,
-    StopServer,
-    CheckUpdates,
-    PrefetchArtifact,
-    DriverPlan,
-    Other,
-}
-
-fn proposal_kind(proposal: &AutomationProposalRecord) -> ProposalKind {
-    match proposal
-        .tool
-        .as_deref()
-        .or_else(|| fallback_tool_for_automation_action(&proposal.action))
-    {
-        Some("restart_server") => ProposalKind::RestartServer,
-        Some("stop_server") => ProposalKind::StopServer,
-        Some("check_updates") => ProposalKind::CheckUpdates,
-        Some("prefetch_artifact") => ProposalKind::PrefetchArtifact,
-        Some("driver_plan") => ProposalKind::DriverPlan,
-        _ => ProposalKind::Other,
-    }
-}
-
-fn fallback_tool_for_automation_action(action: &str) -> Option<&'static str> {
-    match action {
-        "queue_restart_proposal" => Some("restart_server"),
-        "queue_stop_server_proposal" => Some("stop_server"),
-        "queue_update_proposal" => Some("check_updates"),
-        "queue_prefetch_proposal" => Some("prefetch_artifact"),
-        "prepare_driver_plan" => Some("driver_plan"),
-        _ => None,
-    }
-}
-
-fn proposal_plain_summary(proposal: &AutomationProposalRecord) -> &'static str {
-    match proposal_kind(proposal) {
-        ProposalKind::RestartServer => "Restart a model server",
-        ProposalKind::StopServer => "Stop a model server",
-        ProposalKind::CheckUpdates => "Check for ROCm updates",
-        ProposalKind::PrefetchArtifact => "Prepare a model file",
-        ProposalKind::DriverPlan => "Show a driver plan",
-        ProposalKind::Other => "Review an automation request",
-    }
-}
-
-fn proposal_plain_reason(proposal: &AutomationProposalRecord) -> &'static str {
-    match proposal_kind(proposal) {
-        ProposalKind::RestartServer => "A managed server looks stopped or unhealthy.",
-        ProposalKind::StopServer => "GPU pressure is high and serving should be reviewed.",
-        ProposalKind::CheckUpdates => "A scheduled update check is due.",
-        ProposalKind::PrefetchArtifact => "rocm-cli was asked to prepare this model file.",
-        ProposalKind::DriverPlan => "A driver update signal was received.",
-        ProposalKind::Other => "An enabled automation asked for review.",
-    }
-}
-
-fn proposal_status_label(status: &str) -> &'static str {
-    match status {
-        "pending" => "waiting for review",
-        "approved" => "approved",
-        "completed" => "done",
-        "rejected" => "rejected",
-        "failed" => "failed",
-        _ => "status unknown",
-    }
-}
-
-fn proposal_bool_argument(proposal: &AutomationProposalRecord, key: &str) -> bool {
-    proposal
-        .arguments
-        .get(key)
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-}
-
-fn automation_event_plain_summary(event: &AutomationEventRecord) -> &'static str {
-    match event.watcher_id.as_str() {
-        "therock-update" => "ROCm update check recorded.",
-        "server-recover" => "Server recovery check recorded.",
-        "gpu-metrics" => "GPU status check recorded.",
-        "gpu-thermal-protect" => "GPU pressure check recorded.",
-        "cache-warm" => "Model file preparation request recorded.",
-        "driver-upgrade" => "Driver update review recorded.",
-        _ => "Automation activity recorded.",
-    }
-}
-
-fn audit_event_plain_summary(event: &AuditEventRecord) -> &'static str {
-    match event.category.as_str() {
-        "automation" => "Automation activity was recorded.",
-        "proposal" => "A review request changed status.",
-        "provider" => "Provider request completed.",
-        "service" => "Managed server activity was recorded.",
-        "install" => "Install activity was recorded.",
-        "update" => "Update activity was recorded.",
-        "runtime" => "ROCm runtime activity was recorded.",
-        "engine" => "Engine activity was recorded.",
-        _ => "Background activity was recorded.",
-    }
-}
-
-const fn watcher_mode_plain_label(mode: WatcherMode) -> &'static str {
-    match mode {
-        WatcherMode::Observe => "record only",
-        WatcherMode::Propose => "ask before taking action",
-        WatcherMode::Contained => "ask before changes; keep actions limited",
-    }
-}
-
-fn watcher_last_check(snapshot: &rocm_core::WatcherRuntimeSnapshot) -> &'static str {
-    let Some(event) = snapshot.last_event.as_deref() else {
-        return "not yet";
-    };
-    match event {
-        "remind_update_check" => "ROCm update check recorded",
-        "queue_update_proposal" => "ROCm update review requested",
-        "collect_failure_snapshot" => "server health check recorded",
-        "restart_managed_service" | "queue_restart_proposal" => "server restart review requested",
-        "record_gpu_metrics" => "GPU status check recorded",
-        "queue_stop_server_proposal" => "GPU pressure review requested",
-        "queue_prefetch_proposal" => "model file review requested",
-        "prepare_driver_plan" => "driver plan review requested",
-        _ => "activity recorded",
-    }
-}
-
-fn watcher_plain_name(watcher_id: &str) -> &'static str {
-    match watcher_id {
-        "therock-update" => "ROCm update checks",
-        "server-recover" => "Server recovery",
-        "gpu-metrics" => "GPU status checks",
-        "gpu-thermal-protect" => "GPU pressure protection",
-        "cache-warm" => "Model file preparation",
-        "driver-upgrade" => "Driver update review",
-        _ => "Automation check",
-    }
-}
-
-fn watcher_plain_trigger(watcher_id: &str) -> &'static str {
-    match watcher_id {
-        "therock-update" => "a scheduled check",
-        "server-recover" => "a server that stops or becomes unhealthy",
-        "gpu-metrics" => "local GPU status updates",
-        "gpu-thermal-protect" => "high GPU temperature or memory pressure",
-        "cache-warm" => "a request to prepare a model file",
-        "driver-upgrade" => "a driver update signal",
-        _ => "local automation activity",
-    }
-}
-
-fn watcher_plain_action(watcher_id: &str) -> &'static str {
-    match watcher_id {
-        "therock-update" => "checks for ROCm updates without installing them",
-        "server-recover" => "asks before restarting a managed server",
-        "gpu-metrics" => "records local GPU status only",
-        "gpu-thermal-protect" => "asks before stopping a managed server",
-        "cache-warm" => "asks before preparing or downloading a model file",
-        "driver-upgrade" => "shows a driver plan only",
-        _ => "records the event",
-    }
-}
-
-fn watcher_policy_note(watcher_id: &str) -> Option<&'static str> {
-    match watcher_id {
-        "gpu-metrics" => Some(
-            "read-only telemetry; propose/contained modes record events only and do not create review requests or mutate services",
-        ),
-        "gpu-thermal-protect" => Some(
-            "GPU pressure protection is review-gated; propose/contained modes queue a stop review only and never stop servers automatically",
-        ),
-        "cache-warm" => Some(
-            "artifact prefetch stays review-gated; contained mode creates a review request instead of downloading without reviewed source policy",
-        ),
-        "driver-upgrade" => Some(
-            "local driver update signals stay review-gated; review requests run a read-only driver plan and never install drivers automatically",
-        ),
-        _ => None,
-    }
-}
-
-pub(crate) fn render_daemon_text(paths: &AppPaths, config: &RocmCliConfig) -> String {
-    let runtime_state = AutomationRuntimeState::load(paths).unwrap_or(None);
-    let mut output = String::new();
-    let _ = writeln!(output, "Background helper");
-    let _ = writeln!(output);
-    let _ = writeln!(
-        output,
-        "Status: {}",
-        match runtime_state {
-            Some(ref state) if state.running => "running",
-            _ => "not running",
-        }
-    );
-    let _ = writeln!(output, "Startup: on demand");
-    let _ = writeln!(
-        output,
-        "Why it runs: automation checks and local model servers use it when needed."
-    );
-    let _ = writeln!(
-        output,
-        "Automation checks: {}",
-        if config.automation_daemon_enabled() {
-            "on"
-        } else {
-            "off"
-        }
-    );
-    let _ = writeln!(output, "Saved state: kept on this computer");
-    let _ = writeln!(output);
-    let _ = writeln!(output, "Choose Automations to review background checks.");
-    let _ = writeln!(output, "Choose Local servers to see local model servers.");
-    output
-}
 
 pub(crate) const fn engine_inventory() -> &'static [(&'static str, &'static str)] {
     &[
@@ -10758,23 +10157,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn render_update_text_reports_all_update_surfaces() -> Result<()> {
-        let (root, paths) = test_paths("update-surfaces");
-
-        let rendered = render_update_text(&paths)?;
-        fs::remove_dir_all(root).ok();
-
-        assert!(rendered.contains("update_surfaces:"));
-        assert!(rendered.contains("cli: installed="));
-        assert!(rendered.contains("status=not_configured"));
-        assert!(rendered.contains("engines: status=package_managed"));
-        assert!(rendered.contains("model_recipes: status="));
-        assert!(rendered.contains("runtimes: status=none_configured"));
-        assert!(rendered.contains("`rocm update --apply` applies runtime updates only"));
-        Ok(())
-    }
-
-    #[test]
     fn render_logs_text_preserves_directory_summary() {
         let (_root, paths) = test_paths("logs-summary");
         let rendered = render_logs_text(&paths);
@@ -12535,25 +11917,6 @@ pub(crate) mod tests {
         );
     }
 
-    // This only pins the free predicate's truth table. The actual dispatch
-    // wiring — that `rocm update --dry-run` really does reach the preview
-    // path without requiring --apply — is covered by e2e scenario
-    // `update-dry-run-reaches-preview-path-without-apply`
-    // (tests/e2e-cucumber/features/update.feature).
-    #[test]
-    fn update_should_preview_or_apply_includes_dry_run() {
-        assert!(
-            !update_should_preview_or_apply(false, false),
-            "plain `rocm update` should stay on the read-only status report"
-        );
-        assert!(
-            update_should_preview_or_apply(false, true),
-            "the predicate must say dry-run alone should preview"
-        );
-        assert!(update_should_preview_or_apply(true, false));
-        assert!(update_should_preview_or_apply(true, true));
-    }
-
     #[test]
     fn remote_is_structured_not_freeform() {
         // `rocm remote …` reads like a plain-English request, so without an
@@ -14080,7 +13443,7 @@ pub(crate) mod tests {
             result.err()
         );
 
-        let actions: Vec<String> = load_recent_audit_events(&paths, 10)?
+        let actions: Vec<String> = rocm_core::load_recent_audit_events(&paths, 10)?
             .into_iter()
             .map(|event| event.action)
             .collect();
@@ -14243,195 +13606,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn render_automations_text_marks_gpu_metrics_read_only() -> Result<()> {
-        let (root, paths) = test_paths("automation-status-policy");
-        let mut config = RocmCliConfig::default();
-        let watcher = config.watcher_config_mut("gpu-metrics");
-        watcher.enabled = true;
-        watcher.mode = Some(WatcherMode::Contained);
-        config.automations.daemon_enabled = true;
-
-        let rendered = render_automations_text(&paths, &config)?;
-        let _ = fs::remove_dir_all(root);
-
-        assert!(rendered.contains("GPU status checks (on)"));
-        assert!(rendered.contains("setting: ask before changes; keep actions limited"));
-        assert!(rendered.contains("listens for: local GPU status updates"));
-        assert!(rendered.contains("does: records local GPU status only"));
-        assert!(rendered.contains("policy: read-only telemetry"));
-        assert!(rendered.contains("do not create review requests or mutate services"));
-        assert!(!rendered.contains("command id:"));
-        assert!(!rendered.contains("mode:"));
-        assert!(!rendered.contains("gpu-metrics"));
-        Ok(())
-    }
-
-    #[test]
-    fn render_automations_text_marks_gpu_thermal_protect_review_gated() -> Result<()> {
-        let (root, paths) = test_paths("automation-gpu-thermal-policy");
-        let mut config = RocmCliConfig::default();
-        let watcher = config.watcher_config_mut("gpu-thermal-protect");
-        watcher.enabled = true;
-        watcher.mode = Some(WatcherMode::Contained);
-        config.automations.daemon_enabled = true;
-
-        let rendered = render_automations_text(&paths, &config)?;
-        let _ = fs::remove_dir_all(root);
-
-        assert!(rendered.contains("GPU pressure protection (on)"));
-        assert!(rendered.contains("setting: ask before changes; keep actions limited"));
-        assert!(rendered.contains("listens for: high GPU temperature or memory pressure"));
-        assert!(rendered.contains("does: asks before stopping a managed server"));
-        assert!(rendered.contains("policy: GPU pressure protection is review-gated"));
-        assert!(rendered.contains("never stop servers automatically"));
-        assert!(!rendered.contains("command id:"));
-        assert!(!rendered.contains("mode:"));
-        assert!(!rendered.contains("gpu-thermal-protect"));
-        Ok(())
-    }
-
-    #[test]
-    fn render_automations_text_surfaces_local_webhook_endpoint() -> Result<()> {
-        let (root, paths) = test_paths("automation-local-webhook");
-        AutomationRuntimeState {
-            running: true,
-            automations_enabled: true,
-            daemon_pid: 123,
-            started_at_unix_ms: 1,
-            last_tick_unix_ms: 2,
-            local_webhook_endpoint: Some("http://127.0.0.1:19191/automation-events".to_owned()),
-            active_watchers: vec![rocm_core::WatcherRuntimeSnapshot {
-                id: "gpu-metrics".to_owned(),
-                enabled: true,
-                mode: WatcherMode::Observe,
-                summary: "record metrics".to_owned(),
-                last_event: Some("record_gpu_metrics".to_owned()),
-                last_event_unix_ms: Some(2),
-            }],
-        }
-        .write(&paths)?;
-
-        let rendered = render_automations_text(&paths, &RocmCliConfig::default())?;
-        let _ = fs::remove_dir_all(root);
-
-        assert!(rendered.contains("background service: running"));
-        assert!(rendered.contains("local event intake: http://127.0.0.1:19191/automation-events"));
-        assert!(rendered.contains("last check: GPU status check recorded"));
-        assert!(!rendered.contains("pid=123"));
-        assert!(!rendered.contains("last_tick_unix_ms"));
-        assert!(!rendered.contains("local_webhook_endpoint"));
-        assert!(!rendered.contains("record_gpu_metrics"));
-        assert!(!rendered.contains("gpu-metrics"));
-        Ok(())
-    }
-
-    #[test]
-    fn render_automations_text_uses_plain_proposal_history() -> Result<()> {
-        let (root, paths) = test_paths("automation-plain-proposal-history");
-        rocm_core::append_automation_proposal(
-            &paths,
-            &AutomationProposalRecord {
-                at_unix_ms: 42,
-                proposal_id: "proposal-plain".to_owned(),
-                watcher_id: "server-recover".to_owned(),
-                action: "queue_restart_proposal".to_owned(),
-                title: "queue restart proposal".to_owned(),
-                message: "backend-authored recovery message".to_owned(),
-                status: "pending".to_owned(),
-                service_id: Some("svc-plain".to_owned()),
-                tool: Some("restart_server".to_owned()),
-                arguments: serde_json::json!({ "service_id": "svc-plain" }),
-                reviewed_at_unix_ms: None,
-            },
-        )?;
-        rocm_core::append_automation_proposal(
-            &paths,
-            &AutomationProposalRecord {
-                at_unix_ms: 43,
-                proposal_id: "proposal-file".to_owned(),
-                watcher_id: "cache-warm".to_owned(),
-                action: "queue_prefetch_proposal".to_owned(),
-                title: "queue prefetch proposal".to_owned(),
-                message: "cache warm requested internal artifact prefetch".to_owned(),
-                status: "pending".to_owned(),
-                service_id: None,
-                tool: Some("prefetch_artifact".to_owned()),
-                arguments: serde_json::json!({
-                    "artifact_ref": "tiny/model#gguf",
-                    "allow_artifact_download": true,
-                    // One byte under 1 MiB: `{:.1}` rounds it up to a full
-                    // 1024 KiB, so the approved cap must read as "1.0 MiB",
-                    // not "1024.0 KiB". It must also read as `MiB`, not `MB`
-                    // — this is base-1024 math, not base-1000 (issue #190).
-                    "artifact_max_bytes": 1_048_575
-                }),
-                reviewed_at_unix_ms: None,
-            },
-        )?;
-        rocm_core::append_automation_event(
-            &paths,
-            &rocm_core::AutomationEventRecord {
-                at_unix_ms: 44,
-                watcher_id: "gpu-metrics".to_owned(),
-                level: "info".to_owned(),
-                action: "record_gpu_metrics".to_owned(),
-                message: "raw amd-smi telemetry event".to_owned(),
-                service_id: None,
-            },
-        )?;
-        rocm_core::append_audit_event(
-            &paths,
-            &AuditEventRecord {
-                at_unix_ms: 45,
-                source: "test".to_owned(),
-                category: "proposal".to_owned(),
-                actor: "watcher:server-recover".to_owned(),
-                level: "info".to_owned(),
-                action: "proposal_approved".to_owned(),
-                message: "approved proposal-plain with backend detail".to_owned(),
-                watcher_id: Some("server-recover".to_owned()),
-                service_id: Some("svc-plain".to_owned()),
-            },
-        )?;
-
-        let rendered = render_automations_text(&paths, &RocmCliConfig::default())?;
-        let _ = fs::remove_dir_all(root);
-
-        assert!(rendered.contains("recent automation activity:"));
-        assert!(rendered.contains("GPU status check recorded."));
-        assert!(rendered.contains("recent review requests:"));
-        assert!(rendered.contains("proposal-plain [waiting for review] Restart a model server"));
-        assert!(rendered.contains("why: A managed server looks stopped or unhealthy."));
-        assert!(rendered.contains("server: svc-plain"));
-        assert!(rendered.contains("proposal-file [waiting for review] Prepare a model file"));
-        assert!(rendered.contains("model file: tiny/model#gguf"));
-        assert!(rendered.contains("download: approved up to 1.0 MiB"));
-        assert!(rendered.contains(
-            "controls: /automations approve proposal-plain | /automations reject proposal-plain"
-        ));
-        assert!(rendered.contains("recent background activity:"));
-        assert!(rendered.contains("A review request changed status."));
-        assert!(!rendered.contains("queue_restart_proposal"));
-        assert!(!rendered.contains("restart_server"));
-        assert!(!rendered.contains("queue restart proposal"));
-        assert!(!rendered.contains("backend-authored recovery message"));
-        assert!(!rendered.contains("record_gpu_metrics"));
-        assert!(!rendered.contains("raw amd-smi telemetry event"));
-        assert!(!rendered.contains("proposal_approved"));
-        assert!(!rendered.contains("approved proposal-plain with backend detail"));
-        assert!(!rendered.contains("created_unix_ms"));
-        assert!(!rendered.contains("last_tick_unix_ms"));
-        assert!(!rendered.contains("local_webhook_endpoint"));
-        assert!(!rendered.contains("command id:"));
-        assert!(!rendered.contains("mode:"));
-        assert!(!rendered.contains("1048576 bytes"));
-        assert!(!rendered.contains("recent events:"));
-        assert!(!rendered.contains("recent audit:"));
-        assert!(!rendered.contains("tool:"));
-        Ok(())
-    }
-
-    #[test]
     fn linux_only_engine_runtime_status_is_explicit_on_native_windows() {
         let detect = DetectResponse {
             installed: false,
@@ -14489,7 +13663,7 @@ pub(crate) mod tests {
             None,
         );
 
-        let events = load_recent_audit_events(&paths, 1)?;
+        let events = rocm_core::load_recent_audit_events(&paths, 1)?;
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].source, "rocm");
         assert_eq!(events[0].actor, "cli");
@@ -15156,131 +14330,6 @@ pub(crate) mod tests {
             "there is no override to report when the two agree:\n{output}"
         );
         let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn runtime_update_source_uses_active_runtime_and_requires_selector_when_ambiguous() -> Result<()>
-    {
-        let (root, paths) = test_paths("runtime-update-source");
-        let first = write_test_pip_runtime(
-            &paths,
-            "release-pip-gfx110x-all",
-            "therock-release:gfx110X-all",
-            "7.13.0a20260416",
-            1,
-        )?;
-        let second = write_test_pip_runtime(
-            &paths,
-            "release-pip-gfx120x-all",
-            "therock-release:gfx120X-all",
-            "7.13.0a20260416",
-            2,
-        )?;
-        let manifests = therock::load_runtime_manifests(&paths)?;
-        let active_config = RocmCliConfig {
-            default_runtime_id: Some(second.runtime_id.clone()),
-            active_runtime_key: Some(second.runtime_key.clone()),
-            ..RocmCliConfig::default()
-        };
-
-        let selected = select_runtime_update_source(&manifests, &active_config, None)?;
-        assert_eq!(selected.runtime_key, second.runtime_key);
-
-        let explicit = select_runtime_update_source(
-            &manifests,
-            &RocmCliConfig::default(),
-            Some(&first.runtime_key),
-        )?;
-        assert_eq!(explicit.runtime_key, first.runtime_key);
-
-        let error = select_runtime_update_source(&manifests, &RocmCliConfig::default(), None)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("multiple runtimes"));
-        assert!(error.contains("--runtime <runtime-key>"));
-        let _ = fs::remove_dir_all(root);
-        Ok(())
-    }
-
-    #[test]
-    fn installed_update_runtime_is_selected_by_exact_target_key() {
-        // Everything a version match would have keyed on is identical here:
-        // same channel, format, family and version. Only the composition-keyed
-        // runtime key tells the freshly installed repair apart from the stale
-        // runtime it was installed to replace.
-        let stale = test_runtime_manifest_for_update(
-            "release-wheel-multi-arch-7-14-0",
-            "therock-release:gfx120X-all",
-            "gfx120X-all",
-            "7.14.0",
-        );
-        let wrong_family = test_runtime_manifest_for_update(
-            "release-wheel-multi-arch-7-14-0-ffffffffffffffff",
-            "therock-release:gfx110X-all",
-            "gfx110X-all",
-            "7.14.0",
-        );
-        let repaired = test_runtime_manifest_for_update(
-            "release-wheel-multi-arch-7-14-0-0123456789abcdef",
-            "therock-release:gfx120X-all",
-            "gfx120X-all",
-            "7.14.0",
-        );
-        let manifests = vec![stale, wrong_family, repaired.clone()];
-
-        let selected = select_installed_update_runtime(&manifests, &repaired.runtime_key)
-            .expect("the side-by-side repair must be selected by its exact key");
-        assert_eq!(selected.runtime_key, repaired.runtime_key);
-
-        assert!(
-            select_installed_update_runtime(&manifests, "release-wheel-multi-arch-7-15-0")
-                .is_none(),
-            "an install that wrote no manifest for the planned key must not resolve to a sibling"
-        );
-    }
-
-    #[test]
-    fn update_activate_summary_hints_rollback_only_when_a_previous_runtime_exists() {
-        let with_previous = RuntimeActivationResult {
-            runtime_id: "therock-release:gfx942".to_owned(),
-            runtime_key: "release-wheel-gfx942".to_owned(),
-            previous_runtime_key: Some("release-wheel-gfx942-old".to_owned()),
-            reactivated: false,
-            // No live services: this test is about the rollback hint, and an
-            // empty reconciliation is what an update on a machine with nothing
-            // serving produces.
-            services: runtime_services::RuntimeServiceReconciliation::default(),
-        };
-        let mut rendered = String::new();
-        append_update_activate_summary(&mut rendered, &with_previous);
-        assert!(
-            rendered.contains("services_on_previous_runtime: 0"),
-            "the update summary reports service state the same way `runtimes \
-             activate` does, including when there is none:\n{rendered}"
-        );
-        assert!(
-            rendered.contains("next step: if this causes problems, run `rocm runtimes rollback`"),
-            "a previous runtime is recorded, so rollback is a valid recovery path:\n{rendered}"
-        );
-        assert!(
-            rendered.contains("undoes only this one activation"),
-            "the hint should state the single-step limit up front, not just in --help:\n{rendered}"
-        );
-
-        let without_previous = RuntimeActivationResult {
-            runtime_id: "therock-release:gfx942".to_owned(),
-            runtime_key: "release-wheel-gfx942".to_owned(),
-            previous_runtime_key: None,
-            reactivated: false,
-            services: runtime_services::RuntimeServiceReconciliation::default(),
-        };
-        let mut rendered = String::new();
-        append_update_activate_summary(&mut rendered, &without_previous);
-        assert!(
-            !rendered.contains("rocm runtimes rollback"),
-            "no previous runtime is recorded, so `rocm runtimes rollback` would hard-error; \
-             must not hint at a command that immediately fails:\n{rendered}"
-        );
     }
 
     pub(crate) fn test_runtime_manifest_for_update(
