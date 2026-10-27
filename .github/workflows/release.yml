@@ -14,6 +14,13 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # REQUIRED, not dormant: every readiness step below runs --require-signatures,
+  # which now means signatures must actually verify, so this is the public key
+  # the release is verified against. Removing or blanking the secret fails every
+  # release run — GitHub expands an unset secret to the empty string, which the
+  # gate treats as "no key" and rejects. It is the public half only; the private
+  # signing key stays step-scoped.
+  ROCM_CLI_SIGNING_PUBLIC_KEY_PEM: ${{ secrets.ROCM_CLI_SIGNING_PUBLIC_KEY_PEM }}
   # Production trust gate — dormant until the owner sets the repository variable
   # ROCM_CLI_REQUIRE_PRODUCTION_TRUST (e.g. "1") and provides the trust inputs
   # below. While the variable is unset/falsy, release_readiness.py skips
@@ -22,7 +29,6 @@ env:
   # enabling the gate, the recipe-index inputs also require a step that
   # materializes the hosted index + its .sig into the workspace.
   ROCM_CLI_REQUIRE_PRODUCTION_TRUST: ${{ vars.ROCM_CLI_REQUIRE_PRODUCTION_TRUST }}
-  ROCM_CLI_SIGNING_PUBLIC_KEY_PEM: ${{ secrets.ROCM_CLI_SIGNING_PUBLIC_KEY_PEM }}
   ROCM_CLI_METADATA_PUBLIC_KEY_PEM: ${{ secrets.ROCM_CLI_METADATA_PUBLIC_KEY_PEM }}
   ROCM_CLI_MODEL_RECIPE_INDEX_PATH: ${{ vars.ROCM_CLI_MODEL_RECIPE_INDEX_PATH }}
   ROCM_CLI_MODEL_RECIPE_INDEX_PUBLIC_KEY_PATH: ${{ vars.ROCM_CLI_MODEL_RECIPE_INDEX_PUBLIC_KEY_PATH }}
@@ -100,10 +106,20 @@ jobs:
 
           # Build as the runner user so cached Cargo/rustup files are owned by
           # the runner (the host-side cache save step must be able to read them).
+          #
+          # ROCM_CLI_RELEASE_REF is forwarded explicitly: this container sees
+          # none of GitHub's own GITHUB_REF_* env, which `apps/rocm/build.rs`
+          # would otherwise fall back to (and which isn't set at all for a
+          # workflow_dispatch release, since the tag is an input, not a ref).
+          # The "Determine version" step above already resolved the one true
+          # release version; every version-reporting surface must embed that
+          # same value, not re-derive it from ambient context this container
+          # doesn't have.
           docker run --rm \
             -u "$(id -u):$(id -g)" \
             -e CARGO_HOME=/host-cargo \
             -e RUSTUP_HOME=/host-cargo/rustup \
+            -e ROCM_CLI_RELEASE_REF="${{ steps.version.outputs.value }}" \
             -v "$HOME/.cargo":/host-cargo \
             -v "$PWD":/work \
             -w /work \
@@ -144,15 +160,12 @@ jobs:
             --asset "${DIST}.tar.gz" \
             --asset rocm-cli-linux-amd64.tar.gz
 
-      - name: Create release
+      - name: Create or update release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           VERSION="${{ steps.version.outputs.value }}"
-          gh release create "${VERSION}" \
-            --draft \
-            --title "rocm-cli ${VERSION}" \
-            --notes "$(cat <<EOF
+          NOTES="$(cat <<EOF
           Install the latest stable release on Linux x86_64:
 
           \`\`\`bash
@@ -171,7 +184,24 @@ jobs:
           curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | sh -s -- ${VERSION}
           \`\`\`
           EOF
-          )" \
+          )"
+          if gh release view "${VERSION}" >/dev/null 2>&1; then
+            EXISTING_BODY="$(gh release view "${VERSION}" --json body -q .body)"
+            if [[ "${EXISTING_BODY}" != *"Install the latest stable release on Linux x86_64"* ]]; then
+              if [ -n "${EXISTING_BODY}" ]; then
+                COMBINED_NOTES="${EXISTING_BODY}"$'\n\n'"${NOTES}"
+                gh release edit "${VERSION}" --notes "${COMBINED_NOTES}"
+              else
+                gh release edit "${VERSION}" --notes "${NOTES}"
+              fi
+            fi
+            gh release upload "${VERSION}" dist/*.tar.gz dist/*.tar.gz.sha256 dist/*.sig --clobber
+            exit 0
+          fi
+          gh release create "${VERSION}" \
+            --draft \
+            --title "rocm-cli ${VERSION}" \
+            --notes "${NOTES}" \
             dist/*.tar.gz dist/*.tar.gz.sha256 dist/*.sig
 
   windows-release:
@@ -189,6 +219,12 @@ jobs:
 
       - name: Build release binaries
         shell: pwsh
+        # See the Linux job's "Build release binaries" step: the release ref
+        # must come from the resolved `release` job output, not ambient
+        # GITHUB_REF_* context (unset for a workflow_dispatch release, since
+        # the tag is an input there, not a ref) or local git state.
+        env:
+          ROCM_CLI_RELEASE_REF: ${{ needs.release.outputs.version }}
         run: cargo build --release -p rocm -p rocmd -p xtask
 
       - name: Package Windows bundle

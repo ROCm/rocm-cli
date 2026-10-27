@@ -1,0 +1,2021 @@
+// Copyright © Advanced Micro Devices, Inc., or its affiliates.
+//
+// SPDX-License-Identifier: MIT
+
+//! Prepare the shared managed runtime the GPU E2E lanes serve against.
+//!
+//! Nearly every GPU serve scenario points its `data/runtimes` at ONE shared,
+//! pre-warmed runtime tree (see `E2E_SHARED_RUNTIMES_DIR` and
+//! `E2eWorld::use_shared_runtimes`) so a multi-GiB `install sdk` happens once per
+//! runner instead of once per scenario. The lanes used to guard that install on
+//! directory existence alone:
+//!
+//! ```text
+//! if [ ! -d "$E2E_SHARED_RUNTIMES_DIR/registry" ]; then ... rocm install sdk ...; fi
+//! ```
+//!
+//! which never reinstalls. The tree persists on the runner's PVC, so after the
+//! first run ever the pre-warm was a permanent no-op and every lane kept serving
+//! against whatever runtime happened to be installed that day — 16 days stale on
+//! both MI300X runners when this was measured (EAI-8057). Drift between the
+//! shared tree and what a fresh install produces was therefore untested, and
+//! widened silently.
+//!
+//! This keeps the cache and invalidates it when either the channel index
+//! publishes something newer or the package composition the CLI now requires
+//! differs from the one the installed runtime records, reusing the primitives
+//! the CLI already ships rather than reimplementing resolution in workflow
+//! shell:
+//!
+//! * `rocm update` reports, per installed runtime, `status=up_to_date |
+//!   update_available | repair_available | ahead_of_index` by comparing both the
+//!   channel version and the recorded wheel composition, plus `target=<key>`:
+//!   the runtime key an apply from that line would produce.
+//! * `rocm update --apply --runtime <key> --activate` installs the newer or
+//!   composition-corrected runtime SIDE BY SIDE and makes it the default.
+//!   Side-by-side matters: `install sdk` bakes ABSOLUTE paths into the runtime
+//!   manifest, so a runtime must be created in its final location and never
+//!   moved afterwards.
+//! * `rocm runtimes activate <key>` points the tree at the runtime a reuse
+//!   actually meant, which after a repair is not the manifest the report line
+//!   belongs to.
+//! * `rocm storage remove-old-installs --keep N` bounds the resulting multi-version
+//!   cache with a per-channel/format/family retention policy.
+//!
+//! Living in xtask rather than the workflows is deliberate: the pre-warm block is
+//! duplicated across multiple jobs in two shells (bash on the Linux lanes,
+//! PowerShell on Strix Windows), so the decision logic would otherwise drift across
+//! copies and be untestable. Same reasoning as `e2e.rs` — the recipe belongs in
+//! one cross-platform place instead of a shell wrapper.
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use anyhow::{Context, Result, bail};
+
+use crate::paths::{binary_name, release_binary_dir, workspace_root};
+
+/// What the pre-warm should do with the shared tree, given the current
+/// `rocm update` report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Decision {
+    /// No managed runtime for this channel yet — do the cold `install sdk`.
+    Install,
+    /// The channel index has a newer version than the installed one; install it
+    /// alongside and activate it.
+    Update { runtime_key: String },
+    /// The version is current, but its recorded package composition is stale or
+    /// absent. Install a composition-keyed replacement alongside it.
+    Repair { runtime_key: String },
+    /// The tree is current, or its freshness could not be established. Serve
+    /// against what is already there.
+    ///
+    /// `activate` names the runtime that reuse means, when the report identified
+    /// one. A tree that has already been repaired holds BOTH the superseded
+    /// legacy runtime and its replacement, and only the replacement can run this
+    /// host's kernels — so reuse has to say which, or the lane serves whichever
+    /// one the active pointer happens to hold.
+    Reuse {
+        reason: String,
+        activate: Option<String>,
+    },
+}
+
+/// Decide from a `rocm update` report what the pre-warm should do for `channel`.
+///
+/// Pure so every branch is unit-testable without a GPU, a network, or an install.
+///
+/// The bias is deliberately conservative: anything this cannot read as "a newer
+/// version exists for our channel" resolves to [`Decision::Reuse`]. A GPU lane
+/// must not be turned red, nor a multi-GiB download triggered, because the
+/// package index was briefly unreachable — `rocm update` reports that per runtime
+/// as `status=error`, and an offline runner would otherwise reinstall on every run.
+///
+/// `pin` is the exact `--version`/`--build-date` the caller pre-warmed with, if
+/// any. `rocm update` always resolves a channel to the index's LATEST version —
+/// it has no notion of "stay on the version I originally pinned" — so `status`
+/// alone cannot drive this decision once a pin is in play: an n-1/n-2 pin is
+/// permanently `update_available` against a `release` index that has moved on,
+/// and following that status would silently replace the pin with latest. A
+/// pinned run instead looks for an already-installed runtime whose key names
+/// that exact pin: it still self-heals that runtime's own stale composition via
+/// repair, but never follows `update`/`repair` toward the index's latest key,
+/// and installs a fresh side-by-side runtime only when no match is found.
+#[must_use]
+pub fn decide(update_report: &str, channel: &str, pin: Option<&str>) -> Decision {
+    // The empty-registry wording from `render_update_report`. Checked before the
+    // per-runtime scan because there are no `runtime` lines at all in that case.
+    if update_report.contains("managed runtimes: none") {
+        return Decision::Install;
+    }
+
+    let runtimes: Vec<RuntimeLine> = update_report
+        .lines()
+        .filter_map(RuntimeLine::parse)
+        .collect();
+
+    let channel_runtimes = runtimes
+        .iter()
+        .filter(|line| line.channel.as_deref() == Some(channel))
+        .collect::<Vec<_>>();
+
+    // A pin overrides every status-driven branch below: those all chase the
+    // index's latest, which is the one thing a pin explicitly opts out of.
+    // Checked before the unattributed-error gate too, so a pin still gets
+    // consulted when this channel has no runtimes of its own yet — otherwise
+    // an unrelated channel's `status=error` line would shadow it and this run
+    // would silently serve whatever else is already active in the tree. For
+    // the same reason, a degraded `status=error` line (no `channel=`, see the
+    // gate below) still counts as a candidate when its own key names this
+    // channel, so a transient index blip on the pinned runtime's own probe
+    // doesn't shadow it either.
+    //
+    // Matched against each line's OWN `runtime_key`, never `target_runtime_key`
+    // (`serving_runtime_key()`): `target=` always names the channel's
+    // freshly-resolved LATEST key (`render_update_report` derives it from
+    // `runtime_update_plan`'s `version_selector: None` resolution), so for any
+    // pin other than the current latest, matching against it would never find
+    // the already-installed pinned runtime and would reinstall on every run.
+    if let Some(pin) = pin {
+        let channel_prefix = format!("{channel}-");
+        return match runtimes
+            .iter()
+            .filter(|line| {
+                line.channel.as_deref() == Some(channel)
+                    || (line.channel.is_none() && line.runtime_key.starts_with(&channel_prefix))
+            })
+            .find(|line| key_matches_pin(&line.runtime_key, pin))
+        {
+            // A pin never follows `target=` (the channel's latest), but a
+            // `repair_available` line for the pin's OWN key still means its
+            // on-disk composition is stale for the SAME version — the same
+            // gap the unpinned `repair_available` branch below closes.
+            // Falling through to plain `Reuse` here would serve a
+            // composition-drifted install of the pinned version forever, with
+            // no self-heal path. `update_available` is NOT included: it means
+            // a newer version exists in the index, which a pin deliberately
+            // opts out of chasing.
+            Some(pinned) if pinned.status.as_deref() == Some("repair_available") => {
+                Decision::Repair {
+                    runtime_key: pinned.runtime_key.clone(),
+                }
+            }
+            Some(pinned) => Decision::Reuse {
+                reason: format!("runtime already matches the pinned version {pin}"),
+                // Only an `up_to_date` line's `target=` names a
+                // composition-migrated replacement for the SAME version.
+                activate: Some(if pinned.status.as_deref() == Some("up_to_date") {
+                    pinned.serving_runtime_key().to_owned()
+                } else {
+                    pinned.runtime_key.clone()
+                }),
+            },
+            // A miss means a fresh side-by-side `install sdk --version/--build-date`,
+            // not an update.
+            None => Decision::Install,
+        };
+    }
+
+    // A degraded `status=error` line omits `channel=` because resolution failed
+    // before the renderer had a plan. It proves a runtime exists but cannot be
+    // attributed safely, so the conservative choice is reuse, not a fresh
+    // multi-GiB install. A later healthy probe will identify the channel.
+    // In a mixed-channel tree the error may belong to another channel, but the
+    // report has discarded that identity. Reuse remains the safe floor until a
+    // healthy probe can distinguish "missing channel" from "unknown freshness".
+    if channel_runtimes.is_empty() {
+        if runtimes
+            .iter()
+            .any(|line| line.channel.is_none() && line.status.as_deref() == Some("error"))
+        {
+            return Decision::Reuse {
+                reason: "could not establish runtime freshness; leaving the shared tree untouched"
+                    .to_owned(),
+                activate: None,
+            };
+        }
+
+        // Nothing installed for THIS channel. The tree may still hold another
+        // channel's runtime, so install this one.
+        return Decision::Install;
+    }
+
+    // A current composition already in the tree satisfies the lane even while an
+    // obsolete same-channel entry survives until the retention pass removes it.
+    // Checked FIRST for exactly that reason: the legacy entry is the one that
+    // would otherwise be repaired, again, on every single run.
+    if let Some(current) = channel_runtimes
+        .iter()
+        .find(|line| line.status.as_deref() == Some("up_to_date"))
+    {
+        return Decision::Reuse {
+            reason: "runtime is up to date with the channel index".to_owned(),
+            // Its own key when it is the current runtime; its replacement's key
+            // when it is the superseded manifest that the repair left behind.
+            activate: Some(current.serving_runtime_key().to_owned()),
+        };
+    }
+
+    // `ahead_of_index` means the installed runtime is NEWER than anything the
+    // index offers (a hand-placed or pinned build). The index cannot reproduce
+    // it, so neither an update nor a repair could do anything but roll it back.
+    // Serve it as it stands.
+    if let Some(pinned) = channel_runtimes
+        .iter()
+        .find(|line| line.status.as_deref() == Some("ahead_of_index"))
+    {
+        return Decision::Reuse {
+            reason: "installed runtime is ahead of the channel index".to_owned(),
+            activate: Some(pinned.runtime_key.clone()),
+        };
+    }
+
+    if let Some(stale) = channel_runtimes
+        .iter()
+        .find(|line| line.status.as_deref() == Some("update_available"))
+    {
+        return Decision::Update {
+            runtime_key: stale.runtime_key.clone(),
+        };
+    }
+
+    if let Some(stale) = channel_runtimes
+        .iter()
+        .find(|line| line.status.as_deref() == Some("repair_available"))
+    {
+        return Decision::Repair {
+            runtime_key: stale.runtime_key.clone(),
+        };
+    }
+
+    // Only `status=error` (or a shape this does not recognise) remains. Naming a
+    // runtime to activate here would be a guess about a tree whose state could
+    // not be read at all.
+    Decision::Reuse {
+        reason: "could not establish runtime freshness; leaving the shared tree untouched"
+            .to_owned(),
+        activate: None,
+    }
+}
+
+/// A managed runtime in the shared tree that records an install root somewhere
+/// else, so serving against it cannot work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoisonedRuntime {
+    pub runtime_key: String,
+    pub format: String,
+    pub install_root: String,
+}
+
+/// Managed runtimes in the pre-warm tree whose recorded install root is not in
+/// that tree.
+///
+/// Pure so every branch is unit-testable without a GPU, a network, or an install
+/// — same contract as [`decide`].
+///
+/// A scenario reaches the shared tree through a symlink at its own
+/// `data/runtimes` (`E2eWorld::use_shared_runtimes`). `install sdk` run that way
+/// writes the *link's* path — a per-scenario temp dir — into the manifest that
+/// lands in the SHARED registry, and into the venv's console-script shebangs. Once
+/// the scenario's temp dir is gone the shared runtime records a path that no
+/// longer exists, and every later run that resolves it fails.
+///
+/// The signal is deliberately "install root is outside the tree" and NOT
+/// `status=unusable`. Unusable has many causes — a missing `rocm_sdk` probe block
+/// alone reports it — and this function's caller DELETES what it returns. Keying
+/// a multi-GiB delete off a status that a future tightening of
+/// `validate_runtime_manifest_for_activation` could start emitting for healthy
+/// runtimes is not a trade worth making. An out-of-tree install root, for a
+/// runtime this tree is supposed to own, has exactly one cause.
+///
+/// `mode=read-only` is exempt: `runtimes import` / `runtimes adopt` record an
+/// external folder on purpose, and that is what read-only means.
+#[must_use]
+pub fn assess(runtimes_list_report: &str, runtimes_dir: &Path) -> Vec<PoisonedRuntime> {
+    // The recorded root of a poisoned runtime does not exist, so it cannot be
+    // canonicalized. Compare textually instead, against both the path as given and
+    // its resolved form, so a caller that passes a path through a symlinked parent
+    // still matches the roots the CLI wrote.
+    let mut roots = vec![runtimes_dir.to_path_buf()];
+    if let Ok(resolved) = runtimes_dir.canonicalize()
+        && resolved != *runtimes_dir
+    {
+        roots.push(resolved);
+    }
+
+    let lines: Vec<&str> = runtimes_list_report.lines().collect();
+    let mut poisoned = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        let Some(entry) = RuntimeEntry::parse(line) else {
+            continue;
+        };
+        if entry.read_only {
+            continue;
+        }
+        // `install_root:` is written immediately under its entry by
+        // `render_runtimes_text`. Without it there is nothing to judge, and
+        // guessing a path we are about to delete is not acceptable.
+        let Some(install_root) = lines
+            .get(index + 1)
+            .and_then(|next| next.trim().strip_prefix("install_root: "))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        if roots
+            .iter()
+            .any(|root| Path::new(install_root).starts_with(root))
+        {
+            continue;
+        }
+        poisoned.push(PoisonedRuntime {
+            runtime_key: entry.runtime_key,
+            format: entry.format,
+            install_root: install_root.to_owned(),
+        });
+    }
+    poisoned
+}
+
+/// One `  {marker} <key> runtime_id=… format=… mode=… status=…` line from
+/// `rocm runtimes list`.
+///
+/// `status=` is last and its value carries spaces and parentheses
+/// (`unusable (install root is missing: /x)`), so it is not read here — every
+/// field this needs appears before it and is space-free.
+struct RuntimeEntry {
+    runtime_key: String,
+    format: String,
+    read_only: bool,
+}
+
+impl RuntimeEntry {
+    fn parse(line: &str) -> Option<Self> {
+        let mut fields = line.split_whitespace();
+        let first = fields.next()?;
+        // The active/rollback markers are separate tokens; anything else is the key.
+        let runtime_key = if matches!(first, "*" | "-") {
+            fields.next()?
+        } else {
+            first
+        };
+        let mut format = None;
+        let mut mode = None;
+        let mut is_entry = false;
+        for field in fields {
+            match field.split_once('=') {
+                Some(("runtime_id", _)) => is_entry = true,
+                Some(("format", value)) => format = Some(value.to_owned()),
+                Some(("mode", value)) => mode = Some(value.to_owned()),
+                _ => {}
+            }
+        }
+        // `runtime_id=` and `mode=` together separate a real entry from the
+        // header lines, which use `active_runtime_id:` / `registry:` shapes.
+        if !is_entry {
+            return None;
+        }
+        Some(Self {
+            runtime_key: runtime_key.to_owned(),
+            format: format?,
+            read_only: mode.as_deref() == Some("read-only"),
+        })
+    }
+}
+
+/// The active-runtime selector the config still records after the runtime it
+/// names has gone, if the report says so.
+///
+/// This is the OTHER way the shared tree goes stale, and it is the one that kills
+/// the lane outright. [`assess`] finds a runtime the registry has but the tree
+/// does not; this finds a pointer the config has but the registry does not. The
+/// two are independent: removing a runtime through
+/// `rocm runtimes uninstall` clears the config pointers with it, so a dangling
+/// pointer means something removed the tree WITHOUT the CLI — a hand cleanup on
+/// the runner, or a scenario that deleted a folder it had symlinked in.
+///
+/// `rocm engines install` resolves the runtime to build against as
+/// `--runtime` → `config.active_runtime_key` → `config.default_runtime_id`, so a
+/// dangling pointer in either field fails that resolution before anything else
+/// runs:
+///
+/// ```text
+/// pre-warm: ensuring the vllm engine is installed
+/// Error: runtime selector `release-wheel-gfx94x-dcgpu-7-14-0` from engine install
+///        runtime selection is not an exact usable runtime: installed runtime not found
+/// ```
+///
+/// Nine seconds in, before a single scenario, and the message names neither the
+/// pre-warm nor the tree it is about. Detecting it is free because
+/// `render_runtimes_text` already reports it, and reporting it is all the CLI
+/// does — there is no verb that clears a pointer, so the repair has to be
+/// activating something that exists.
+///
+/// Only `config.json` is read this way. `engines.<name>.last_installed_runtime_id`
+/// can dangle too, but nothing resolves through it — it is displayed, not
+/// followed — so healing it would be motion without a failure behind it.
+#[must_use]
+pub fn dangling_active_runtime(runtimes_list_report: &str) -> Option<&str> {
+    runtimes_list_report.lines().find_map(|line| {
+        let rest = line
+            .trim()
+            .strip_prefix("active_status: missing manifest for ")?;
+        // Whichever field held the dead name — the key when one was activated, the
+        // id when only a default was ever set. Both are selectors the engine
+        // install would resolve, and both fail it the same way.
+        let (_, selector) = rest.split_once('=')?;
+        let selector = selector.trim();
+        (!selector.is_empty()).then_some(selector)
+    })
+}
+
+/// The already-installed runtime (from `rocm runtimes list`, which carries no
+/// `channel=` field at all) whose key names `pin` within `channel`.
+///
+/// Mirrors `decide()`'s pin branch, which scopes its own search to
+/// `channel_runtimes` (or a same-channel unattributed error line) before ever
+/// calling `key_matches_pin` — `key_matches_pin` alone only checks whether the
+/// pin's token/digit-run appears in a key, with no notion of channel, so an
+/// unscoped search here could match a `release` pin against an installed
+/// `nightly` runtime that happens to share the pin's version/build-date
+/// digits, silently serving the wrong channel's SDK. Since this listing has no
+/// channel field to key off at all, the guard is the same `{channel}-` prefix
+/// `decide()` falls back to for its own degraded, channel-less lines.
+///
+/// Read-only (adopted/imported) entries are excluded for the same reason
+/// `activation_candidates` excludes them: a matching entry here becomes
+/// `Decision::Reuse{activate: Some(key)}`, which `run()` turns straight into
+/// `rocm runtimes activate <key>` — quietly making someone's externally-owned
+/// install the shared tree's default for every later GPU scenario, the exact
+/// outcome `activation_candidates`'s own filter exists to prevent.
+fn find_pinned_runtime_entry(listing: &str, channel: &str, pin: &str) -> Option<RuntimeEntry> {
+    let channel_prefix = format!("{channel}-");
+    listing
+        .lines()
+        .filter_map(RuntimeEntry::parse)
+        .filter(|entry| !entry.read_only && entry.runtime_key.starts_with(&channel_prefix))
+        .find(|entry| key_matches_pin(&entry.runtime_key, pin))
+}
+
+/// Managed runtimes the tree could be pointed at instead, in report order.
+///
+/// Read-only entries are excluded on purpose. `runtimes adopt` records a folder
+/// the pre-warm does not own, and quietly making somebody's external ROCm install
+/// the default for every GPU scenario on the runner is a larger decision than
+/// repairing a pointer. If the tree holds nothing else, the caller leaves the
+/// pointer dangling and the install path replaces it.
+#[must_use]
+pub fn activation_candidates(runtimes_list_report: &str) -> Vec<String> {
+    runtimes_list_report
+        .lines()
+        .filter_map(RuntimeEntry::parse)
+        .filter(|entry| !entry.read_only)
+        .map(|entry| entry.runtime_key)
+        .collect()
+}
+
+/// One `  runtime <key> format=… channel=… … status=… target=…` line from
+/// `rocm update`.
+///
+/// Both shapes that renderer emits are handled: the full report line, and the
+/// degraded `runtime <key> format=… status=error message=…` line. `message=` is
+/// free text that may contain spaces, but it is last and only
+/// `channel`/`status`/`target` are read, so a whitespace split is sufficient —
+/// trailing words of the message simply carry no `=` and are ignored.
+struct RuntimeLine {
+    runtime_key: String,
+    channel: Option<String>,
+    status: Option<String>,
+    /// The runtime key an apply from this line would produce. On a superseded
+    /// legacy manifest this names its already-installed replacement, which is
+    /// the sibling the lane must actually serve against.
+    target_runtime_key: Option<String>,
+}
+
+impl RuntimeLine {
+    fn parse(line: &str) -> Option<Self> {
+        let rest = line.trim().strip_prefix("runtime ")?;
+        let mut fields = rest.split_whitespace();
+        let runtime_key = fields.next()?.to_owned();
+        let mut channel = None;
+        let mut status = None;
+        let mut target_runtime_key = None;
+        for field in fields {
+            match field.split_once('=') {
+                Some(("channel", value)) => channel = Some(value.to_owned()),
+                Some(("status", value)) => status = Some(value.to_owned()),
+                Some(("target", value)) => target_runtime_key = Some(value.to_owned()),
+                _ => {}
+            }
+        }
+        Some(Self {
+            runtime_key,
+            channel,
+            status,
+            target_runtime_key,
+        })
+    }
+
+    /// The runtime this line says the lane should be serving against.
+    fn serving_runtime_key(&self) -> &str {
+        self.target_runtime_key
+            .as_deref()
+            .unwrap_or(&self.runtime_key)
+    }
+}
+
+/// Normalizes a `--version`/`--build-date` pin the same way `slugify` in
+/// `apps/rocm/src/therock.rs` normalizes every runtime key: lowercase
+/// alphanumerics kept as-is, every other byte (not just `.`) collapsed to
+/// `-`. A pin carrying a `+`-style local-version suffix (e.g.
+/// `7.13.0+rocm7.13`, the shape `decode_simple_index_version` decodes for
+/// the `rocm` package) must be normalized identically to the key it's being
+/// compared against, or the `+` survives in the pin but not in the key and
+/// the two never match.
+fn slugify_like_runtime_key(pin: &str) -> String {
+    pin.chars()
+        .map(|ch| match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' => ch.to_ascii_lowercase(),
+            _ => '-',
+        })
+        .collect()
+}
+
+/// Whether `runtime_key` names the exact pin the caller asked for.
+///
+/// Runtime keys are slugified (`runtime_key`/`wheel_runtime_key` in
+/// `apps/rocm/src/therock.rs` both dash-join their fields), so a dotted
+/// `--version` like `7.11.0` shows up as `7-11-0` inside the key. A
+/// `--build-date` instead recovers as an eight-digit `YYYYMMDD` run (e.g.
+/// `20260605`) via `runtime_version_build_date`, with no dashes at all, so it
+/// needs its own digits-only comparison rather than the dash-normalized one —
+/// and the caller may have spelled it `MMDDYYYY` (`normalize_requested_build_date`
+/// accepts that too), which digit-stripping alone can't reorder.
+///
+/// Stripping punctuation from an arbitrary `--version` can also yield a short
+/// digit run that isn't a build date at all (`7.13.0` -> `7130`), and that run
+/// can collide with a fragment of some *other* runtime's hex fingerprint
+/// suffix. So the digits-only comparison only ever fires for an exact 8-digit
+/// run (the one shape a recovered build date has) and only matches a run in
+/// the key that isn't itself a piece of a longer digit sequence.
+///
+/// A pin that is *already* bare digits (e.g. `--build-date 20260605`) skips
+/// the plain substring check below entirely and goes straight through that
+/// same guarded comparison — otherwise it would match unguarded against any
+/// fingerprint that happens to contain the same digits. The substring check
+/// itself is delimiter-bounded for the same reason: an unanchored `contains`
+/// would let a short pin (`7.1` -> `7-1`) match as a sub-span of a longer
+/// version (`7-13-0`), or a bare `7` match almost any key.
+fn key_matches_pin(runtime_key: &str, pin: &str) -> bool {
+    let pin_is_all_digits = !pin.is_empty() && pin.bytes().all(|b| b.is_ascii_digit());
+    if !pin_is_all_digits
+        && (key_contains_delimited_token(runtime_key, pin)
+            || key_contains_delimited_token(runtime_key, &slugify_like_runtime_key(pin)))
+    {
+        return true;
+    }
+    let digits_only: String = pin.chars().filter(char::is_ascii_digit).collect();
+    if digits_only.len() != 8 {
+        return false;
+    }
+    // Runtime keys only ever carry the YYYYMMDD order; reorder an MMDDYYYY
+    // pin before comparing (same digit-position heuristic as
+    // `normalize_requested_build_date` in `apps/rocm/src/therock.rs`).
+    let yyyymmdd = if digits_only.starts_with("20") {
+        digits_only
+    } else if digits_only[4..].starts_with("20") {
+        format!(
+            "{}{}{}",
+            &digits_only[4..8],
+            &digits_only[0..2],
+            &digits_only[2..4]
+        )
+    } else {
+        return false;
+    };
+    key_contains_delimited_digit_run(runtime_key, &yyyymmdd)
+}
+
+/// Whether `key` contains `run` (a fixed-length digit string) as a maximal
+/// digit run — not immediately preceded by another digit, so it can't be a
+/// sub-span of some longer digit sequence, and not immediately followed by
+/// another digit *or letter*, so it can't be glued to a longer alphanumeric
+/// run such as a hex fingerprint suffix (which uses `0`-`9` and `a`-`f`
+/// both — a digit-only check on that side would wave a fingerprint-embedded
+/// match through). The leading side stays digit-only because a real build
+/// date is always preceded by the version string's own `a`/`b`/`rc` marker
+/// (e.g. `0a20260605`), which must not itself count as a delimiter break.
+fn key_contains_delimited_digit_run(key: &str, run: &str) -> bool {
+    let bytes = key.as_bytes();
+    key.match_indices(run).any(|(start, _)| {
+        let before_is_digit = start > 0 && bytes[start - 1].is_ascii_digit();
+        let end = start + run.len();
+        let after_is_alnum = end < bytes.len() && bytes[end].is_ascii_alphanumeric();
+        !before_is_digit && !after_is_alnum
+    })
+}
+
+/// Whether `key` contains `token` as a delimiter-bounded span: not
+/// immediately preceded or followed by another alphanumeric character, so a
+/// short pin can't match as a sub-span of a longer dash-joined segment (pin
+/// `7.1` -> `7-1` must not match inside version segment `7-13-0`) or a bare
+/// digit/letter pin can't match inside an unrelated hex fingerprint.
+fn key_contains_delimited_token(key: &str, token: &str) -> bool {
+    if token.is_empty() {
+        return false;
+    }
+    let bytes = key.as_bytes();
+    key.match_indices(token).any(|(start, _)| {
+        let before_is_alnum = start > 0 && bytes[start - 1].is_ascii_alphanumeric();
+        let end = start + token.len();
+        let after_is_alnum = end < bytes.len() && bytes[end].is_ascii_alphanumeric();
+        !before_is_alnum && !after_is_alnum
+    })
+}
+
+/// Bring the shared pre-warm tree at `prewarm_dir` to the runtime state the
+/// `channel` requires, keeping `keep` recent installs per channel/format/family.
+///
+/// `version`/`build_date` pin the SDK to an exact TheRock package instead of
+/// the channel's latest; the CLI's own `--version`/`--build-date` flags are
+/// mutually exclusive (enforced by clap at the `xtask` command layer), so at
+/// most one of these is ever `Some`.
+pub fn run(
+    channel: &str,
+    keep: usize,
+    prewarm_dir: &Path,
+    version: Option<&str>,
+    build_date: Option<&str>,
+) -> Result<()> {
+    let pin = version.or(build_date);
+    let rocm = resolve_rocm_binary()?;
+    for sub in ["config", "data", "cache"] {
+        let dir = prewarm_dir.join(sub);
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("failed to create pre-warm directory {}", dir.display()))?;
+    }
+
+    // Before asking whether the tree is FRESH, make sure what is in it is
+    // actually usable from this tree. `rocm update` compares versions against the
+    // index; it cannot see that a runtime records a folder somewhere else.
+    // Repairing first means `decide` reads a registry with nothing dead in it.
+    repair_poisoned_runtimes(&rocm, prewarm_dir)?;
+
+    // And point the tree at something that exists before anything resolves the
+    // active runtime. Must run after the repair above, which can itself remove
+    // the runtime the pointer names.
+    repair_dangling_active_runtime(&rocm, prewarm_dir)?;
+
+    let decision = match probe(&rocm, prewarm_dir) {
+        Ok(report) => decide(&report, channel, pin),
+        Err(error) => {
+            // `rocm update` itself failed (not a per-runtime index error). Fall
+            // back to the guard the lanes used before this existed: install only
+            // when the registry is genuinely absent, otherwise serve against what
+            // is there. Preserves the old floor rather than failing the lane.
+            let registry = prewarm_dir.join("data").join("runtimes").join("registry");
+            if !registry.is_dir() {
+                println!("pre-warm: `rocm update` failed ({error:#}); no registry yet, installing");
+                Decision::Install
+            } else if let Some(pin) = pin {
+                // The blind "reuse whatever is already there" floor below is
+                // exactly the "n-1 lane gets n latest" bug this module exists to
+                // fix, reached through a different path: a pin asking for an
+                // OLDER version must not silently serve a newer one just because
+                // `rocm update` (not `rocm runtimes list`, a different command)
+                // had a transient failure. Check the registry directly instead.
+                match list_runtimes(&rocm, prewarm_dir) {
+                    Ok(listing) => {
+                        if let Some(entry) = find_pinned_runtime_entry(&listing, channel, pin) {
+                            println!(
+                                "pre-warm: `rocm update` failed ({error:#}); pinned runtime {} is already installed, reusing it",
+                                entry.runtime_key
+                            );
+                            Decision::Reuse {
+                                reason: "update probe failed; pinned runtime already installed"
+                                    .to_owned(),
+                                activate: Some(entry.runtime_key),
+                            }
+                        } else {
+                            println!(
+                                "pre-warm: `rocm update` failed ({error:#}); pinned version {pin} not found in the tree, installing"
+                            );
+                            Decision::Install
+                        }
+                    }
+                    Err(list_error) => {
+                        println!(
+                            "pre-warm: `rocm update` failed ({error:#}) and could not list runtimes ({list_error:#}); reusing the existing tree"
+                        );
+                        Decision::Reuse {
+                            reason: "update probe failed".to_owned(),
+                            activate: None,
+                        }
+                    }
+                }
+            } else {
+                println!("pre-warm: `rocm update` failed ({error:#}); reusing the existing tree");
+                Decision::Reuse {
+                    reason: "update probe failed".to_owned(),
+                    activate: None,
+                }
+            }
+        }
+    };
+
+    match &decision {
+        Decision::Install => {
+            println!(
+                "pre-warm: installing the {channel} SDK into {}",
+                prewarm_dir.display()
+            );
+            // `--yes` rather than `--approve-replacing-active-default`, and the
+            // second consent is why: pre-warm is provisioning, so it wants the
+            // required system packages installed too, and the runners it runs on
+            // have passwordless sudo for exactly that — no prompt is raised, and
+            // a package that cannot be installed warns and continues.
+            //
+            // The narrow flag would cover the first consent on its own: the gate
+            // keys on the tree's active default runtime, not on the channel
+            // `decide()` inspected, so a shared tree pre-warmed for `release` and
+            // then for `nightly` arrives here with a release runtime already
+            // active and no terminal to confirm on. It would just leave the
+            // packages behind.
+            let mut command = rocm_command(&rocm, prewarm_dir);
+            command.args(["install", "sdk", "--channel", channel, "--yes"]);
+            if let Some(version) = version {
+                command.args(["--version", version]);
+            } else if let Some(build_date) = build_date {
+                command.args(["--build-date", build_date]);
+            }
+            command.status_ok("rocm install sdk")?;
+        }
+        Decision::Update { runtime_key } => {
+            println!(
+                "pre-warm: {runtime_key} is behind the {channel} index; installing the newer runtime alongside it"
+            );
+            rocm_command(&rocm, prewarm_dir)
+                .args(["update", "--apply", "--runtime", runtime_key, "--activate"])
+                .status_ok("rocm update --apply")?;
+        }
+        Decision::Repair { runtime_key } => {
+            println!(
+                "pre-warm: {runtime_key} has a stale package composition; installing its replacement alongside it"
+            );
+            rocm_command(&rocm, prewarm_dir)
+                .args(["update", "--apply", "--runtime", runtime_key, "--activate"])
+                .status_ok("rocm update --apply")?;
+        }
+        Decision::Reuse { reason, activate } => {
+            println!("pre-warm: reusing the shared {channel} runtime ({reason})");
+            // Reuse is not "leave the pointer alone". Once a repair has run, the
+            // tree holds the superseded runtime AND its replacement, and only
+            // the replacement can run this host's kernels — so name the one this
+            // reuse actually meant. `runtimes activate` is idempotent, so the
+            // ordinary warm case just reasserts what is already active. Before
+            // the engine check below, because that installs into whichever
+            // runtime is active.
+            if let Some(runtime_key) = activate {
+                println!("pre-warm: activating {runtime_key}");
+                rocm_command(&rocm, prewarm_dir)
+                    .args(["runtimes", "activate", runtime_key])
+                    .status_ok("rocm runtimes activate")?;
+            }
+        }
+    }
+
+    // Unconditional, and deliberately BEFORE the reuse early return below. The
+    // runtime and the serving engine are installed separately: `install sdk`
+    // lays down the ROCm runtime, `engines install` builds the engine venv
+    // against it. `decide` only ever reasons about the runtime, so a tree whose
+    // runtime is current but whose engine was never installed — or was left
+    // behind with an older runtime — resolves to `Reuse`, which used to return
+    // here having done nothing. The shared tree then served every GPU scenario a
+    // runtime with no engine, which is the one thing those lanes exist to
+    // exercise. Re-checking a warm tree is cheap: without `--reinstall`,
+    // `engines install` on a ready engine installs nothing.
+    ensure_default_engine(&rocm, prewarm_dir)?;
+
+    if !runtime_changed(&decision) {
+        return Ok(());
+    }
+
+    // An install/update/repair that exits 0 without leaving a registry behind is the
+    // confusing case the lanes used to call out by hand: every scenario then falls
+    // back to installing its own runtime and the job quietly blows its time cap.
+    // Say so loudly, but do not fail — the suite can still run.
+    let registry = prewarm_dir.join("data").join("runtimes").join("registry");
+    if !registry.is_dir() {
+        println!(
+            "::warning::pre-warm produced no runtimes registry at {}; scenarios will install their own",
+            registry.display()
+        );
+    }
+
+    // Only reached after an install, update, or repair added a tree. Housekeeping:
+    // a failure here wastes disk but leaves a correct runtime in place, so it must
+    // not fail the lane.
+    let pruned = rocm_command(&rocm, prewarm_dir)
+        .args([
+            "storage",
+            "remove-old-installs",
+            "--keep",
+            &keep.to_string(),
+            "--yes",
+        ])
+        .status_ok("rocm storage remove-old-installs");
+    if let Err(error) = pruned {
+        println!("pre-warm: pruning old installs failed ({error:#}); continuing");
+    }
+    Ok(())
+}
+
+/// Whether `decision` put a new runtime in the tree, and so whether the registry
+/// check and the retention prune at the end of [`run`] have anything to do.
+///
+/// Read AFTER the engine check, never inside the decision's own match arm: the
+/// engine is installed separately from the runtime, so every decision — reuse
+/// most of all, since it is the one a warm runner takes every time — has to
+/// reach that check before this can end the pre-warm early.
+const fn runtime_changed(decision: &Decision) -> bool {
+    !matches!(decision, Decision::Reuse { .. })
+}
+
+/// Install the engine the active runtime would serve on, so the shared tree has
+/// one before a scenario asks it to serve.
+///
+/// Which engine that is comes from the CLI rather than from a constant here:
+/// `rocm engines list` marks the engine `serve` picks for the detected GPU with
+/// `* ` (vLLM on Instinct, Lemonade on Strix), and the pre-warm must agree with
+/// `serve` on every runner without this file learning the hardware map.
+///
+/// Fatal on failure, like [`repair_poisoned_runtimes`] and unlike the freshness
+/// path: reusing a stale-but-working runtime keeps a lane meaningful, whereas
+/// serving with no engine fails every GPU scenario later and for reasons that
+/// name none of this.
+fn ensure_default_engine(rocm: &Path, prewarm_dir: &Path) -> Result<()> {
+    let output = rocm_command(rocm, prewarm_dir)
+        .args(["engines", "list"])
+        .output()
+        .context("failed to run `rocm engines list`")?;
+    if !output.status.success() {
+        bail!("`rocm engines list` exited with {}", output.status);
+    }
+    let inventory = String::from_utf8_lossy(&output.stdout);
+    let engine = default_engine_from_inventory(&inventory)
+        .context("`rocm engines list` did not identify a default engine")?;
+    println!("pre-warm: ensuring the {engine} engine is installed");
+    rocm_command(rocm, prewarm_dir)
+        .args(["engines", "install", engine, "--yes"])
+        .status_ok("rocm engines install")
+}
+
+/// The engine `rocm engines list` marks as the default for this host, if any.
+///
+/// The inventory renders one line per engine as `{marker} {name:10} {note}` with
+/// the marker in column 0, then indents that engine's detail lines (`    adapter:
+/// …`, `    runtime: …`) beneath it. Matching `* ` at the start of the line
+/// unindented is therefore what separates the default engine's own line from
+/// everything else the report prints.
+fn default_engine_from_inventory(inventory: &str) -> Option<&str> {
+    inventory
+        .lines()
+        .find_map(|line| line.strip_prefix("* ")?.split_whitespace().next())
+}
+
+/// Drop any managed runtime in the shared tree that records an install root
+/// outside it, so the pre-warm reinstalls instead of serving a dead one.
+///
+/// Deleting the folder is not belt-and-braces, it is the repair. A poisoned venv
+/// keeps a working `bin/python` — that is a symlink to the base interpreter, which
+/// is still there — so `ensure_uv_venv` REUSES it, and an already-satisfied
+/// package is audited rather than reinstalled, leaving every console-script
+/// shebang still pointing at the folder that went away. Measured with uv 0.9.30:
+/// re-running the install over a poisoned venv reports success and repairs
+/// nothing; only removing the folder first does.
+///
+/// Failure to repair is fatal, unlike the rest of this module. Everywhere else a
+/// conservative fallback keeps the lane green; here the alternative is serving
+/// against a runtime already known to be broken, which fails later, elsewhere, and
+/// for reasons that name none of this.
+fn repair_poisoned_runtimes(rocm: &Path, prewarm_dir: &Path) -> Result<()> {
+    let runtimes_dir = prewarm_dir.join("data").join("runtimes");
+    if !runtimes_dir.is_dir() {
+        return Ok(());
+    }
+
+    let listing = match list_runtimes(rocm, prewarm_dir) {
+        Ok(listing) => listing,
+        Err(error) => {
+            // Same floor as everywhere else in this module: an unreadable report
+            // must not delete anything, and must not redden the lane.
+            println!(
+                "pre-warm: could not list runtimes ({error:#}); leaving the shared tree untouched"
+            );
+            return Ok(());
+        }
+    };
+
+    for runtime in assess(&listing, &runtimes_dir) {
+        println!(
+            "::warning::pre-warm: removing the shared runtime {} — it records an install root \
+             outside this tree ({}), which a scenario that installed through its own \
+             `data/runtimes` symlink would have written. A reinstall follows. See rocm-cli#315.",
+            runtime.runtime_key, runtime.install_root
+        );
+
+        // Drops the registry entry, the active marker, and the config pointers.
+        // Tolerates the recorded folder being absent, which it is.
+        rocm_command(rocm, prewarm_dir)
+            .args(["runtimes", "uninstall", &runtime.runtime_key, "--yes"])
+            .status_ok("rocm runtimes uninstall")?;
+
+        // The physical tree the CLI could not reach: it removed what the manifest
+        // POINTED at, and the files are where the manifest should have said.
+        let planted = runtimes_dir
+            .join(&runtime.format)
+            .join(&runtime.runtime_key);
+        if !planted.starts_with(&runtimes_dir) {
+            bail!(
+                "refusing to remove {}: outside the pre-warm tree at {}",
+                planted.display(),
+                runtimes_dir.display()
+            );
+        }
+        if planted.is_dir() {
+            std::fs::remove_dir_all(&planted).with_context(|| {
+                format!(
+                    "failed to remove the poisoned runtime folder {}",
+                    planted.display()
+                )
+            })?;
+            println!("pre-warm: removed {}", planted.display());
+        }
+    }
+    Ok(())
+}
+
+/// Re-point the shared tree's active runtime when it names one that is gone, so
+/// the engine install resolves instead of dying nine seconds into the lane.
+///
+/// See [`dangling_active_runtime`] for how the pointer goes stale and why this is
+/// worth healing here. The repair is `rocm runtimes activate`: the CLI has no verb
+/// that clears a pointer, so the only way out is to name something that exists.
+/// Candidates are tried in report order and the first that takes it wins — which
+/// may be an older runtime than the tree would ideally serve, and that is fine.
+/// `decide` runs next, and the `Update` arm re-activates the newest as part of
+/// updating to it.
+///
+/// Doing nothing is correct when the tree holds no managed runtime at all: the
+/// install path activates whatever it installs, and it runs before
+/// `ensure_default_engine` — which is the only thing that would have tripped over
+/// the pointer. The case that has to be handled here is the one that self-healing
+/// misses: a pointer dangling while OTHER runtimes are sitting right there, where
+/// `decide` says `Reuse`, nothing installs, and nothing re-activates.
+fn repair_dangling_active_runtime(rocm: &Path, prewarm_dir: &Path) -> Result<()> {
+    if !prewarm_dir.join("data").join("runtimes").is_dir() {
+        return Ok(());
+    }
+
+    // Deliberately a second listing rather than one shared with the repair above:
+    // that repair uninstalls, which rewrites exactly the pointers read here.
+    let listing = match list_runtimes(rocm, prewarm_dir) {
+        Ok(listing) => listing,
+        Err(error) => {
+            println!(
+                "pre-warm: could not list runtimes ({error:#}); leaving the active runtime as it is"
+            );
+            return Ok(());
+        }
+    };
+
+    let Some(dangling) = dangling_active_runtime(&listing) else {
+        return Ok(());
+    };
+
+    let candidates = activation_candidates(&listing);
+    if candidates.is_empty() {
+        println!(
+            "pre-warm: the active runtime {dangling} is gone and nothing is installed to take \
+             its place; the install below will set it"
+        );
+        return Ok(());
+    }
+
+    println!(
+        "::warning::pre-warm: the shared tree still points at the runtime {dangling}, which is \
+         no longer installed — something removed it without going through \
+         `rocm runtimes uninstall`. Engine installs resolve through that pointer, so re-pointing \
+         it at an installed runtime. See rocm-cli#314."
+    );
+
+    for candidate in &candidates {
+        let activated = rocm_command(rocm, prewarm_dir)
+            .args(["runtimes", "activate", candidate])
+            .status()
+            .with_context(|| format!("failed to run `rocm runtimes activate {candidate}`"))?;
+        if activated.success() {
+            println!("pre-warm: active runtime is now {candidate}");
+            return Ok(());
+        }
+        // An installed runtime can still be refused — `activate` validates the
+        // manifest. Try the next one rather than taking the whole lane down for
+        // one bad entry.
+        println!("pre-warm: could not activate {candidate}; trying the next runtime");
+    }
+
+    bail!(
+        "the shared pre-warm tree points at the runtime `{dangling}`, which is not installed, and \
+         none of its {} installed runtime(s) could be activated in its place",
+        candidates.len()
+    )
+}
+
+/// Ask the CLI what it has registered. Read-only.
+fn list_runtimes(rocm: &Path, prewarm_dir: &Path) -> Result<String> {
+    let output = rocm_command(rocm, prewarm_dir)
+        .args(["runtimes", "list"])
+        .output()
+        .context("failed to run `rocm runtimes list`")?;
+    if !output.status.success() {
+        bail!(
+            "`rocm runtimes list` exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Ask the CLI whether the installed runtimes are current. Check-only: plain
+/// `rocm update` without `--apply` never mutates state.
+fn probe(rocm: &Path, prewarm_dir: &Path) -> Result<String> {
+    let output = rocm_command(rocm, prewarm_dir)
+        .arg("update")
+        .output()
+        .context("failed to run `rocm update`")?;
+    if !output.status.success() {
+        bail!(
+            "`rocm update` exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// A `rocm` invocation scoped to the pre-warm tree.
+///
+/// The three `ROCM_CLI_*` directories are what make this a SHARED tree rather
+/// than the caller's own; `HF_HOME` / `UV_CACHE_DIR` are inherited from the job
+/// environment, which the lanes already export.
+fn rocm_command(rocm: &Path, prewarm_dir: &Path) -> Command {
+    let mut cmd = Command::new(rocm);
+    cmd.env("ROCM_CLI_CONFIG_DIR", prewarm_dir.join("config"))
+        .env("ROCM_CLI_DATA_DIR", prewarm_dir.join("data"))
+        .env("ROCM_CLI_CACHE_DIR", prewarm_dir.join("cache"));
+    cmd
+}
+
+/// Run a command for its exit status, turning a non-zero exit into an error that
+/// names the command.
+trait StatusOk {
+    fn status_ok(&mut self, what: &str) -> Result<()>;
+}
+
+impl StatusOk for Command {
+    fn status_ok(&mut self, what: &str) -> Result<()> {
+        let status = self
+            .status()
+            .with_context(|| format!("failed to run `{what}`"))?;
+        if !status.success() {
+            bail!("`{what}` exited with {status}");
+        }
+        Ok(())
+    }
+}
+
+/// The `rocm` binary to drive: `ROCM_CLI_BINARY` when the caller already built
+/// one (as every CI lane does, so the pre-warm and the suite share a build),
+/// otherwise the release binary in the active target directory.
+fn resolve_rocm_binary() -> Result<PathBuf> {
+    if let Some(path) = std::env::var_os("ROCM_CLI_BINARY") {
+        // Absolutize as `e2e.rs` does: the Strix Windows lane sets a RELATIVE
+        // `target\release\rocm.exe` when `CARGO_TARGET_DIR` is unset, which would
+        // only resolve while the cwd happens to be the workspace root.
+        let path = PathBuf::from(path);
+        return if path.is_absolute() {
+            Ok(path)
+        } else {
+            Ok(std::env::current_dir()
+                .context("failed to read the current directory")?
+                .join(path))
+        };
+    }
+    let root = workspace_root()?;
+    let candidate = release_binary_dir(&root, None).join(binary_name("rocm"));
+    if !candidate.is_file() {
+        bail!(
+            "no rocm binary at {}; run `cargo build --release -p rocm` or set ROCM_CLI_BINARY",
+            candidate.display()
+        );
+    }
+    Ok(candidate)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A real `rocm update` report on a machine with no managed runtime, captured
+    /// verbatim from the built binary rather than written by hand — the parser has
+    /// to survive the whole document, not an idealized excerpt of it.
+    ///
+    /// Note the `update_surfaces` block: `runtimes: status=none_configured` is one
+    /// character away from a real `runtime <key> … status=…` entry, and carries a
+    /// `status=` field of its own. See `update_surfaces_block_is_not_a_runtime_entry`.
+    const EMPTY: &str = "\
+update
+  policy: bounded startup check, cached metadata, prompt before mutating state.
+  managed runtimes: none
+  next step: run `rocm install sdk --channel release --dry-run` to resolve a TheRock runtime
+  update_surfaces:
+    cli: installed=0.1.0 status=not_configured reason=repository-owned CLI update feed is not published yet
+    engines: status=package_managed packaged=[lemonade,vllm] reason=first-party engine binaries update with the rocm-cli package; data-dir plugins are user-managed
+    model_recipes: status=built_in count=13 reason=external signed recipe index is not configured
+    runtimes: status=none_configured reason=TheRock runtime update checks above are the only live update checks in this build
+  note: `rocm update --apply` applies runtime updates only; CLI, engine, and recipe update feeds require published metadata before they can mutate state
+";
+
+    fn report(status: &str, channel: &str) -> String {
+        report_with_target(
+            status,
+            channel,
+            &format!("{channel}-wheel-gfx94x-dcgpu-7-13-0"),
+        )
+    }
+
+    /// A report line whose `target=` names a runtime other than its own key —
+    /// what a superseded legacy manifest renders once its replacement exists.
+    fn report_with_target(status: &str, channel: &str, target: &str) -> String {
+        format!(
+            "update\n  policy: bounded startup check, cached metadata, prompt before mutating state.\n  \
+runtime {channel}-wheel-gfx94x-dcgpu-7-13-0 format=wheel channel={channel} \
+family=gfx94X-dcgpu installed=7.13.0 latest=7.15.0 status={status} target={target}\n    \
+install_root: /w/e2e-prewarm/data/runtimes/wheel/{channel}-wheel-gfx94x-dcgpu-7-13-0\n    \
+source: index\n"
+        )
+    }
+
+    /// A real `rocm runtimes list` on a tree holding all three shapes that matter,
+    /// captured verbatim from the built binary rather than written by hand: one
+    /// poisoned managed runtime (an install root under a per-scenario temp dir that
+    /// is gone), one healthy managed runtime inside the tree, and one read-only
+    /// runtime adopted from outside it.
+    ///
+    /// Note that ALL THREE report `status=unusable` here. That is the whole reason
+    /// [`assess`] keys off the install root instead: the healthy one is unusable
+    /// only for want of a `rocm_sdk` probe block, and treating that as poison would
+    /// delete a multi-GiB runtime that a reinstall would have kept.
+    const MIXED: &str = "\
+registered ROCm runtimes
+  active_runtime_id: <unset>
+  active_runtime_key: <unset>
+  previous_runtime_key: <unset>
+  registry: /w/e2e-prewarm/data/runtimes/registry
+  marker: /w/e2e-prewarm/data/runtimes/active.json
+  installed:
+    legend: * = active, - = rollback target
+
+    adopted-external-env runtime_id=external-adopted version=7.14.0 format=wheel family=gfx94X-dcgpu mode=read-only status=unusable (pip runtime manifest is missing rocm_sdk probe data)
+      install_root: /opt/external-rocm
+    release-wheel-gfx94x-dcgpu-7-15-0 runtime_id=therock-release-gfx94x-dcgpu version=7.15.0 format=wheel family=gfx94X-dcgpu mode=managed status=unusable (pip runtime manifest is missing rocm_sdk probe data)
+      install_root: /w/e2e-prewarm/data/runtimes/wheel/release-wheel-gfx94x-dcgpu-7-15-0
+    release-wheel-gfx94x-dcgpu-7-13-0 runtime_id=therock-release-gfx94x-dcgpu version=7.13.0 format=wheel family=gfx94X-dcgpu mode=managed status=unusable (install root is missing: /tmp/rocm-e2e-7MidR2/data/runtimes/wheel/release-wheel-gfx94x-dcgpu-7-13-0)
+      install_root: /tmp/rocm-e2e-7MidR2/data/runtimes/wheel/release-wheel-gfx94x-dcgpu-7-13-0
+";
+
+    /// A real `rocm runtimes list` on an empty tree, captured from the binary.
+    const NO_RUNTIMES: &str = "\
+registered ROCm runtimes
+  active_runtime_id: <unset>
+  active_runtime_key: <unset>
+  previous_runtime_key: <unset>
+  registry: /w/e2e-prewarm/data/runtimes/registry
+  marker: /w/e2e-prewarm/data/runtimes/active.json
+  installed: none
+  next step: rocm install sdk --channel release --format wheel
+";
+
+    /// A real `rocm runtimes list` on the tree that killed the lane: the config
+    /// still names the 7.14.0 runtime that was removed out of band, while two
+    /// runtimes it could be pointed at sit right there.
+    ///
+    /// Note there is no `*` marker on any entry — the renderer only marks the
+    /// active one by matching `active_runtime_key` against a manifest, and that is
+    /// exactly the match that fails here. The `active_status:` line is the only
+    /// thing in the document that says so.
+    const DANGLING_ACTIVE: &str = "\
+registered ROCm runtimes
+  active_runtime_id: therock-release:gfx94X-dcgpu
+  active_runtime_key: release-wheel-gfx94x-dcgpu-7-14-0
+  previous_runtime_key: release-wheel-gfx94x-dcgpu-7-13-0
+  registry: /w/e2e-prewarm/data/runtimes/registry
+  marker: /w/e2e-prewarm/data/runtimes/active.json
+  active_status: missing manifest for active_runtime_key=release-wheel-gfx94x-dcgpu-7-14-0
+  installed:
+    legend: * = active, - = rollback target
+
+    adopted-external-env runtime_id=external-adopted version=7.14.0 format=wheel family=gfx94X-dcgpu mode=read-only status=usable
+      install_root: /opt/external-rocm
+    release-wheel-gfx94x-dcgpu-7-13-0 runtime_id=therock-release-gfx94x-dcgpu version=7.13.0 format=wheel family=gfx94X-dcgpu mode=managed status=usable
+      install_root: /w/e2e-prewarm/data/runtimes/wheel/release-wheel-gfx94x-dcgpu-7-13-0
+";
+
+    fn prewarm_runtimes_dir() -> &'static Path {
+        Path::new("/w/e2e-prewarm/data/runtimes")
+    }
+
+    #[test]
+    fn a_runtime_recording_a_scenario_temp_dir_is_poisoned() {
+        assert_eq!(
+            assess(MIXED, prewarm_runtimes_dir()),
+            vec![PoisonedRuntime {
+                runtime_key: "release-wheel-gfx94x-dcgpu-7-13-0".to_owned(),
+                format: "wheel".to_owned(),
+                install_root:
+                    "/tmp/rocm-e2e-7MidR2/data/runtimes/wheel/release-wheel-gfx94x-dcgpu-7-13-0"
+                        .to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn an_unusable_runtime_inside_the_tree_is_left_alone() {
+        // The healthy-but-unusable entry in MIXED. Deleting it would throw away a
+        // multi-GiB install over a validation detail a reinstall would have fixed.
+        let poisoned = assess(MIXED, prewarm_runtimes_dir());
+        assert!(
+            !poisoned
+                .iter()
+                .any(|runtime| runtime.runtime_key.ends_with("7-15-0")),
+            "an in-tree runtime must never be removed for being unusable: {poisoned:?}"
+        );
+    }
+
+    #[test]
+    fn a_read_only_runtime_adopted_from_outside_is_left_alone() {
+        // `runtimes adopt` records an external folder on purpose. Removing it would
+        // delete a runtime the tree never owned.
+        let poisoned = assess(MIXED, prewarm_runtimes_dir());
+        assert!(
+            !poisoned
+                .iter()
+                .any(|runtime| runtime.runtime_key == "adopted-external-env"),
+            "a read-only adopted runtime must be exempt: {poisoned:?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_tree_has_nothing_to_repair() {
+        assert!(assess(NO_RUNTIMES, prewarm_runtimes_dir()).is_empty());
+    }
+
+    #[test]
+    fn an_active_runtime_that_is_gone_is_reported_by_name() {
+        assert_eq!(
+            dangling_active_runtime(DANGLING_ACTIVE),
+            Some("release-wheel-gfx94x-dcgpu-7-14-0")
+        );
+    }
+
+    #[test]
+    fn a_default_runtime_id_that_is_gone_dangles_the_same_way() {
+        // The other field the engine install resolves through, reported by the
+        // renderer under the same key when no runtime_key was ever activated.
+        let text = "registered ROCm runtimes\n  active_runtime_id: therock-release:gfx94X-dcgpu\n  \
+active_runtime_key: <unset>\n  \
+active_status: missing manifest for active_runtime_id=therock-release:gfx94X-dcgpu\n";
+        assert_eq!(
+            dangling_active_runtime(text),
+            Some("therock-release:gfx94X-dcgpu")
+        );
+    }
+
+    #[test]
+    fn a_tree_whose_active_runtime_is_installed_is_left_alone() {
+        // No active_status line at all is the healthy shape — MIXED has a dead
+        // runtime in it, but nothing points AT the dead one.
+        assert_eq!(dangling_active_runtime(MIXED), None);
+        assert_eq!(dangling_active_runtime(NO_RUNTIMES), None);
+        assert_eq!(dangling_active_runtime(""), None);
+    }
+
+    #[test]
+    fn an_ambiguous_runtime_id_is_not_a_dangling_pointer() {
+        // Same `active_status:` prefix, entirely different condition: the runtimes
+        // are all there, one runtime_id just names several of them. Activating
+        // something would be a guess, and the engine install resolves it fine.
+        let text = "registered ROCm runtimes\n  \
+active_status: ambiguous runtime_id=therock-release:gfx94X-dcgpu; activate one runtime_key: a, b\n";
+        assert_eq!(dangling_active_runtime(text), None);
+    }
+
+    #[test]
+    fn only_managed_runtimes_are_offered_as_replacements() {
+        // The read-only adopted entry is installed and usable, and still excluded:
+        // making somebody's external ROCm the default for every GPU scenario is a
+        // bigger decision than repairing a pointer.
+        assert_eq!(
+            activation_candidates(DANGLING_ACTIVE),
+            vec!["release-wheel-gfx94x-dcgpu-7-13-0".to_owned()]
+        );
+    }
+
+    #[test]
+    fn a_tree_with_nothing_installed_offers_no_replacement() {
+        // The caller leaves the pointer dangling here rather than failing: the
+        // install that follows activates whatever it installs.
+        assert!(activation_candidates(NO_RUNTIMES).is_empty());
+        assert!(activation_candidates("").is_empty());
+    }
+
+    /// A `rocm runtimes list` on a tree holding both a `release` and a `nightly`
+    /// runtime, the latter installed at the version the test below pins —
+    /// the shape that would wrongly satisfy an unscoped pin search for
+    /// `release`.
+    const MULTI_CHANNEL: &str = "\
+registered ROCm runtimes
+  active_runtime_id: therock-release:gfx94X-dcgpu
+  active_runtime_key: release-wheel-gfx94x-dcgpu-7-13-0
+  previous_runtime_key: <unset>
+  registry: /w/e2e-prewarm/data/runtimes/registry
+  marker: /w/e2e-prewarm/data/runtimes/active.json
+  installed:
+    legend: * = active, - = rollback target
+
+    * release-wheel-gfx94x-dcgpu-7-13-0 runtime_id=therock-release-gfx94x-dcgpu version=7.13.0 format=wheel family=gfx94X-dcgpu mode=managed status=usable
+      install_root: /w/e2e-prewarm/data/runtimes/wheel/release-wheel-gfx94x-dcgpu-7-13-0
+    nightly-wheel-gfx94x-dcgpu-7-14-0 runtime_id=therock-nightly-gfx94x-dcgpu version=7.14.0 format=wheel family=gfx94X-dcgpu mode=managed status=usable
+      install_root: /w/e2e-prewarm/data/runtimes/wheel/nightly-wheel-gfx94x-dcgpu-7-14-0
+";
+
+    #[test]
+    fn pinned_runtime_entry_is_found_within_its_own_channel() {
+        assert_eq!(
+            find_pinned_runtime_entry(MULTI_CHANNEL, "release", "7.13.0").map(|e| e.runtime_key),
+            Some("release-wheel-gfx94x-dcgpu-7-13-0".to_owned())
+        );
+    }
+
+    #[test]
+    fn pinned_runtime_entry_does_not_match_another_channels_installed_runtime() {
+        // 7.14.0 is only installed under `nightly`, not the requested
+        // `release`. `rocm runtimes list` carries no `channel=` field at all
+        // (unlike `rocm update`'s report), so the `{channel}-` prefix guard is
+        // the only thing standing between this and silently serving the wrong
+        // channel's SDK for a pin that happens to share another channel's
+        // installed version.
+        assert!(find_pinned_runtime_entry(MULTI_CHANNEL, "release", "7.14.0").is_none());
+        assert_eq!(
+            find_pinned_runtime_entry(MULTI_CHANNEL, "nightly", "7.14.0").map(|e| e.runtime_key),
+            Some("nightly-wheel-gfx94x-dcgpu-7-14-0".to_owned()),
+            "sanity: the matching channel's own entry must still be found"
+        );
+    }
+
+    #[test]
+    fn pinned_runtime_entry_is_none_when_the_tree_is_empty() {
+        assert!(find_pinned_runtime_entry(NO_RUNTIMES, "release", "7.13.0").is_none());
+        assert!(find_pinned_runtime_entry("", "release", "7.13.0").is_none());
+    }
+
+    #[test]
+    fn pinned_runtime_entry_does_not_match_a_read_only_adopted_runtime() {
+        // A `release`-channel pin whose only on-disk match is an adopted,
+        // read-only entry must miss, not "find" it — the caller turns a hit
+        // into `rocm runtimes activate <key>`, which would silently make
+        // somebody's externally-owned install the shared tree's default.
+        let text = "\
+registered ROCm runtimes
+  active_runtime_id: <unset>
+  active_runtime_key: <unset>
+  previous_runtime_key: <unset>
+  registry: /w/e2e-prewarm/data/runtimes/registry
+  marker: /w/e2e-prewarm/data/runtimes/active.json
+  installed:
+    legend: * = active, - = rollback target
+
+    release-wheel-gfx94x-dcgpu-7-13-0 runtime_id=external-adopted version=7.13.0 format=wheel family=gfx94X-dcgpu mode=read-only status=usable
+      install_root: /opt/external-rocm
+";
+        assert!(find_pinned_runtime_entry(text, "release", "7.13.0").is_none());
+    }
+
+    #[test]
+    fn a_report_that_cannot_be_read_removes_nothing() {
+        // The conservative floor: never delete on a shape this does not recognise.
+        assert!(assess("", prewarm_runtimes_dir()).is_empty());
+        assert!(assess("totally unexpected output\n", prewarm_runtimes_dir()).is_empty());
+    }
+
+    #[test]
+    fn an_entry_without_its_install_root_line_removes_nothing() {
+        // Guessing the folder to delete from the key alone is not acceptable.
+        let text = "  installed:\n    k runtime_id=r version=1 format=wheel family=f \
+mode=managed status=ready\n";
+        assert!(assess(text, prewarm_runtimes_dir()).is_empty());
+    }
+
+    #[test]
+    fn the_active_and_rollback_markers_do_not_hide_an_entry() {
+        // `render_runtimes_text` prefixes the active runtime with `*` and the
+        // rollback target with `-`; a poisoned runtime is usually the active one.
+        for marker in ["*", "-"] {
+            let text = format!(
+                "  installed:\n  {marker} k runtime_id=r version=1 format=wheel family=f \
+mode=managed status=ready\n      install_root: /tmp/rocm-e2e-XXXX/data/runtimes/wheel/k\n"
+            );
+            let poisoned = assess(&text, prewarm_runtimes_dir());
+            assert_eq!(poisoned.len(), 1, "marker {marker} hid the entry");
+            assert_eq!(poisoned[0].runtime_key, "k");
+        }
+    }
+
+    #[test]
+    fn header_lines_are_not_read_as_entries() {
+        // `active_runtime_id:` is one character away from the `runtime_id=` field
+        // that identifies a real entry.
+        assert!(RuntimeEntry::parse("  active_runtime_id: <unset>").is_none());
+        assert!(RuntimeEntry::parse("  registry: /w/e2e-prewarm/data/runtimes/registry").is_none());
+        assert!(RuntimeEntry::parse("  installed: none").is_none());
+        assert!(RuntimeEntry::parse("      install_root: /tmp/x").is_none());
+    }
+
+    #[test]
+    fn a_tarball_runtime_reports_its_own_format() {
+        // The folder to remove is `<runtimes>/<format>/<key>`, so the format has to
+        // survive parsing — removing the wheel path for a tarball runtime would
+        // silently repair nothing.
+        let text = "  installed:\n    k runtime_id=r version=1 format=tarball family=f \
+mode=managed status=ready\n      install_root: /tmp/rocm-e2e-XXXX/data/runtimes/tarball/k\n";
+        let poisoned = assess(text, prewarm_runtimes_dir());
+        assert_eq!(poisoned.len(), 1);
+        assert_eq!(poisoned[0].format, "tarball");
+    }
+
+    /// A real `rocm engines list` on an Instinct host, captured verbatim: the
+    /// default engine's line carries the `* ` marker in column 0, and its own
+    /// detail lines are indented beneath it.
+    const ENGINES_READY: &str = "\
+Local model engines
+  Built-in engines are included with rocm-cli. External plugins are optional.
+  ROCm GPU execution is required.
+  Plugin folders:
+    1. /w/e2e-prewarm/data/engines/plugins (primary)
+  lemonade   default embedded Lemonade server with ROCm llama.cpp backend
+    adapter: built-in
+    runtime: not found
+* vllm       Linux/WSL ROCm GPU serving engine through external vLLM
+    adapter: built-in
+    runtime: /w/e2e-prewarm/data/runtimes/wheel/release-wheel-gfx94x-dcgpu-7-15-0
+  protocol: 0.1.0
+";
+
+    #[test]
+    fn the_marked_engine_is_the_one_pre_warmed() {
+        // Which engine to install comes from the CLI's own host detection, not
+        // from a hardware map duplicated here.
+        assert_eq!(default_engine_from_inventory(ENGINES_READY), Some("vllm"));
+    }
+
+    #[test]
+    fn an_indented_detail_line_is_not_read_as_the_default() {
+        // Every engine's detail lines are indented under it, and a note may well
+        // start with a bullet. Only the marker in column 0 names the default.
+        let inventory = "\
+Local model engines
+* lemonade   default embedded Lemonade server with ROCm llama.cpp backend
+    adapter: built-in
+    * not a marker
+";
+        assert_eq!(default_engine_from_inventory(inventory), Some("lemonade"));
+    }
+
+    #[test]
+    fn an_inventory_without_a_default_engine_names_none() {
+        // `ensure_default_engine` turns this into an error rather than guessing an
+        // engine: installing the wrong one costs a multi-GiB build and still
+        // leaves the lane with nothing to serve on.
+        assert_eq!(default_engine_from_inventory(""), None);
+        assert_eq!(
+            default_engine_from_inventory("Local model engines\n  lemonade   embedded\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn reusing_the_shared_runtime_still_reaches_the_engine_check() {
+        // The regression this guards: `Reuse` — the decision EVERY warm runner
+        // takes, run after run — used to end `run` with a `return` inside its own
+        // match arm, before anything looked at the engine. The early return is now
+        // this predicate, read only AFTER `ensure_default_engine`, so reuse cannot
+        // skip the engine. Reuse must still install and update NOTHING, which is
+        // what keeps it cheap enough to re-check the engine on every run.
+        assert!(!runtime_changed(&Decision::Reuse {
+            reason: "up to date".to_owned(),
+            activate: None,
+        }));
+        assert!(runtime_changed(&Decision::Install));
+        assert!(runtime_changed(&Decision::Update {
+            runtime_key: "release-wheel-gfx94x-dcgpu-7-13-0".to_owned()
+        }));
+        assert!(runtime_changed(&Decision::Repair {
+            runtime_key: "release-wheel-gfx94x-dcgpu-7-13-0".to_owned()
+        }));
+    }
+
+    #[test]
+    fn no_managed_runtime_installs() {
+        assert_eq!(decide(EMPTY, "release", None), Decision::Install);
+    }
+
+    #[test]
+    fn newer_version_in_the_index_updates_that_runtime() {
+        assert_eq!(
+            decide(&report("update_available", "release"), "release", None),
+            Decision::Update {
+                runtime_key: "release-wheel-gfx94x-dcgpu-7-13-0".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn same_version_runtime_with_a_stale_composition_is_repaired() {
+        assert_eq!(
+            decide(&report("repair_available", "release"), "release", None),
+            Decision::Repair {
+                runtime_key: "release-wheel-gfx94x-dcgpu-7-13-0".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn an_installed_replacement_stops_the_repair_repeating() {
+        // The retention pass has not yet dropped the legacy manifest, so the
+        // report still carries its `repair_available` line beside the current
+        // one. Repairing again would reinstall a runtime already in the tree,
+        // every run, forever.
+        let text = format!(
+            "{}{}",
+            report("repair_available", "release"),
+            report("up_to_date", "release")
+        );
+
+        let Decision::Reuse { reason, .. } = decide(&text, "release", None) else {
+            panic!("an installed current composition must prevent repeated repair");
+        };
+        assert!(reason.contains("up to date"), "{reason}");
+    }
+
+    #[test]
+    fn current_runtime_is_reused_and_activated() {
+        let Decision::Reuse { reason, activate } =
+            decide(&report("up_to_date", "release"), "release", None)
+        else {
+            panic!("an up-to-date runtime must be reused, not reinstalled");
+        };
+        assert!(reason.contains("up to date"), "{reason}");
+        assert_eq!(
+            activate.as_deref(),
+            Some("release-wheel-gfx94x-dcgpu-7-13-0"),
+            "reuse must name the runtime it means, or the lane serves whatever the pointer holds"
+        );
+    }
+
+    #[test]
+    fn distinct_version_pins_yield_distinct_runtime_keys() {
+        let text = "update\n  \
+runtime release-wheel-gfx94x-dcgpu-7-13-0 format=wheel channel=release status=up_to_date\n  \
+runtime release-wheel-gfx94x-dcgpu-7-11-0 format=wheel channel=release status=up_to_date\n";
+
+        let Decision::Reuse { activate, .. } = decide(text, "release", Some("7.13.0")) else {
+            panic!("a runtime already matching the pin must be reused");
+        };
+        assert_eq!(
+            activate.as_deref(),
+            Some("release-wheel-gfx94x-dcgpu-7-13-0")
+        );
+
+        let Decision::Reuse { activate, .. } = decide(text, "release", Some("7.11.0")) else {
+            panic!("a runtime already matching the other pin must be reused");
+        };
+        assert_eq!(
+            activate.as_deref(),
+            Some("release-wheel-gfx94x-dcgpu-7-11-0")
+        );
+
+        assert_ne!(
+            decide(text, "release", Some("7.13.0")),
+            decide(text, "release", Some("7.11.0")),
+            "two distinct pins against the same tree must resolve to distinct runtime keys"
+        );
+    }
+
+    #[test]
+    fn pin_matches_its_own_key_even_when_target_names_the_channel_latest() {
+        // `target=` always names the channel's freshly-resolved latest, never the
+        // pin. Matching against `serving_runtime_key()` (which prefers `target=`)
+        // would never find a pin other than that latest, reinstalling every run.
+        let text = report_with_target(
+            "update_available",
+            "release",
+            "release-wheel-gfx94x-dcgpu-7-15-0",
+        );
+        let Decision::Reuse { activate, .. } = decide(&text, "release", Some("7.13.0")) else {
+            panic!("the pinned runtime's own key must be reused, not shadowed by target=");
+        };
+        assert_eq!(
+            activate.as_deref(),
+            Some("release-wheel-gfx94x-dcgpu-7-13-0")
+        );
+    }
+
+    #[test]
+    fn pin_matches_an_unattributed_error_line_for_its_own_runtime() {
+        // A degraded `status=error` line (no `channel=`) for the pinned runtime's
+        // own probe must still be found, or a transient index outage reinstalls
+        // the exact runtime the pin already has on disk.
+        let text = "update\n  runtime release-wheel-gfx94x-dcgpu-7-13-0 format=wheel \
+status=error message=failed to reach the index\n";
+        let Decision::Reuse { activate, .. } = decide(text, "release", Some("7.13.0")) else {
+            panic!("an unattributed error on the pinned runtime's own line must reuse it");
+        };
+        assert_eq!(
+            activate.as_deref(),
+            Some("release-wheel-gfx94x-dcgpu-7-13-0")
+        );
+    }
+
+    #[test]
+    fn pin_does_not_match_another_channels_unattributed_error_line() {
+        // The broadened pin search must still respect the channel prefix guard —
+        // an unrelated channel's degraded error line must not satisfy this pin.
+        let text = "update\n  runtime nightly-wheel-gfx94x-dcgpu-7-13-0 format=wheel \
+status=error message=failed to reach the index\n";
+        assert_eq!(decide(text, "release", Some("7.11.0")), Decision::Install);
+    }
+
+    #[test]
+    fn build_date_pin_matches_the_digits_only_key() {
+        // A build date reaches the runtime key as an 8-digit run with no
+        // dashes (runtime_version_build_date's scan format), while the flag
+        // is documented and passed as YYYY-MM-DD — the two must still match.
+        let text = "update\n  \
+runtime release-wheel-multi-arch-7-13-0a20260605 format=wheel channel=release status=up_to_date\n";
+
+        let Decision::Reuse { activate, .. } = decide(text, "release", Some("2026-06-05")) else {
+            panic!("a runtime already matching the dashed build-date pin must be reused");
+        };
+        assert_eq!(
+            activate.as_deref(),
+            Some("release-wheel-multi-arch-7-13-0a20260605")
+        );
+    }
+
+    #[test]
+    fn bare_digit_build_date_pin_does_not_match_an_unrelated_digit_run() {
+        // A bare (undashed) build-date pin used to skip the digit-run guard
+        // entirely via the plain substring fast path, so it could match
+        // inside an unrelated, longer digit sequence.
+        assert!(!key_matches_pin(
+            "release-wheel-multi-arch-7-9-0-120260605abcde",
+            "20260605"
+        ));
+    }
+
+    #[test]
+    fn build_date_pin_does_not_match_a_hex_fingerprint_fragment() {
+        // The digit run is bounded by 'a' before (the version's own alpha
+        // marker, expected) but by hex letters 'd'/'e' after — a digit-only
+        // boundary check on the trailing side let this through.
+        assert!(!key_matches_pin(
+            "release-wheel-multi-arch-7-9-0-aa20260605ddeeff",
+            "2026-06-05"
+        ));
+    }
+
+    #[test]
+    fn version_pin_digits_do_not_match_an_unrelated_fingerprint_fragment() {
+        // digits_only("7.13.0") is "7130", which appears verbatim inside this
+        // other runtime's 16-hex fingerprint suffix. It must not match: this
+        // key belongs to version 7.9.0, not 7.13.0.
+        assert!(!key_matches_pin(
+            "release-wheel-multi-arch-7-9-0-aa7130bbccddeeff",
+            "7.13.0"
+        ));
+    }
+
+    #[test]
+    fn build_date_pin_matches_regardless_of_mmddyyyy_or_yyyymmdd_spelling() {
+        let key = "nightly-wheel-multi-arch-7-13-0a20260605-0123456789abcdef";
+        assert!(key_matches_pin(key, "2026-06-05"));
+        assert!(key_matches_pin(key, "06-05-2026"));
+    }
+
+    #[test]
+    fn short_version_pin_does_not_match_as_a_sub_span_of_a_longer_version() {
+        // "7.1" -> "7-1" used to match unanchored inside "7-13-0" because the
+        // plain substring check had no delimiter guard at all.
+        assert!(!key_matches_pin(
+            "release-wheel-multi-arch-7-13-0-0123456789abcdef",
+            "7.1"
+        ));
+    }
+
+    #[test]
+    fn bare_major_version_pin_does_not_match_inside_a_fingerprint() {
+        // A single-digit pin used to match "essentially everything" via the
+        // same unanchored substring check.
+        assert!(!key_matches_pin(
+            "release-wheel-multi-arch-9-0-0-aa7130bbccddeeff",
+            "7"
+        ));
+    }
+
+    #[test]
+    fn version_pin_with_local_version_suffix_matches_its_slugified_key() {
+        // A pin carrying a `+`-style local-version suffix (the shape
+        // `decode_simple_index_version` decodes for the "rocm" package, e.g.
+        // `7.13.0+rocm7.13`) used to only have its `.` normalized to `-`
+        // before comparison, leaving the `+` in place -- but `slugify`
+        // (which built this runtime key) maps *every* non-alphanumeric byte
+        // to `-`, so the un-normalized `+` never matched and the pin fell
+        // through to Install on every run despite already being satisfied.
+        assert!(key_matches_pin(
+            "release-wheel-gfx94x-dcgpu-7-13-0-rocm7-13",
+            "7.13.0+rocm7.13"
+        ));
+    }
+
+    #[test]
+    fn short_all_digit_pin_does_not_match_a_delimited_span_of_that_value() {
+        // "911" is bare digits, so it must be forced through the 8-digit
+        // build-date path (and fail there) rather than the plain
+        // delimiter-bounded substring fast path, which would otherwise find
+        // it as a clean "-911-" span and wrongly match.
+        assert!(!key_matches_pin(
+            "release-wheel-multi-arch-911-0123456789abcdef",
+            "911"
+        ));
+    }
+
+    #[test]
+    fn pin_does_not_match_a_same_version_runtime_in_a_different_channel() {
+        // Same version as the pin, but tagged with an explicit, different
+        // channel. The earlier unattributed-error-line test used a key whose
+        // version already differed from the pin, so it passed even with the
+        // channel-prefix guard deleted; this one isolates the guard itself.
+        let text = "update\n  runtime nightly-wheel-gfx94x-dcgpu-7-13-0 format=wheel \
+channel=nightly status=up_to_date\n";
+        assert_eq!(decide(text, "release", Some("7.13.0")), Decision::Install);
+    }
+
+    #[test]
+    fn pinned_runtime_with_a_stale_composition_is_repaired_not_reused() {
+        // A `repair_available` line for the pin's OWN key still means its
+        // on-disk composition is stale for the same version -- the same gap
+        // the unpinned `repair_available` branch closes. Falling through to
+        // plain `Reuse` here would serve a composition-drifted install of
+        // the pinned version forever, with no self-heal path.
+        assert_eq!(
+            decide(
+                &report("repair_available", "release"),
+                "release",
+                Some("7.13.0")
+            ),
+            Decision::Repair {
+                runtime_key: "release-wheel-gfx94x-dcgpu-7-13-0".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn pinned_runtime_with_a_newer_index_version_is_still_reused_not_repaired() {
+        // `update_available` on the pin's own key means a newer version
+        // exists in the index -- exactly what a pin deliberately opts out of
+        // chasing. Only `repair_available` (same version, stale
+        // composition) should trigger a repair.
+        let Decision::Reuse { activate, .. } = decide(
+            &report("update_available", "release"),
+            "release",
+            Some("7.13.0"),
+        ) else {
+            panic!("an update-available status on the pin's own key must not force a repair");
+        };
+        assert_eq!(
+            activate.as_deref(),
+            Some("release-wheel-gfx94x-dcgpu-7-13-0")
+        );
+    }
+
+    #[test]
+    fn unpinned_prewarm_key_is_unchanged() {
+        assert_eq!(
+            decide(&report("up_to_date", "release"), "release", None),
+            Decision::Reuse {
+                reason: "runtime is up to date with the channel index".to_owned(),
+                activate: Some("release-wheel-gfx94x-dcgpu-7-13-0".to_owned()),
+            }
+        );
+    }
+
+    #[test]
+    fn reuse_after_a_repair_activates_the_replacement_not_the_superseded_runtime() {
+        // The line belongs to the superseded legacy manifest: its own key is the
+        // old one, and `target=` names the composition-keyed replacement the
+        // repair already installed. Activating the line's own key here would
+        // serve the runtime whose device payload cannot run this host's kernels.
+        let Decision::Reuse { activate, .. } = decide(
+            &report_with_target(
+                "up_to_date",
+                "release",
+                "release-wheel-multi-arch-7-13-0-0123456789abcdef",
+            ),
+            "release",
+            None,
+        ) else {
+            panic!("a migrated tree must be reused");
+        };
+        assert_eq!(
+            activate.as_deref(),
+            Some("release-wheel-multi-arch-7-13-0-0123456789abcdef")
+        );
+    }
+
+    #[test]
+    fn pin_matching_a_superseded_line_activates_the_replacement_not_the_legacy_key() {
+        // Same migrated-tree shape as the unpinned case above, but reached via
+        // the pin branch: the pin matches the line's own (legacy) key, so the
+        // activated key must still come from `serving_runtime_key()`.
+        let Decision::Reuse { activate, .. } = decide(
+            &report_with_target(
+                "up_to_date",
+                "release",
+                "release-wheel-multi-arch-7-13-0-0123456789abcdef",
+            ),
+            "release",
+            Some("7.13.0"),
+        ) else {
+            panic!("a pin matching a migrated tree must be reused");
+        };
+        assert_eq!(
+            activate.as_deref(),
+            Some("release-wheel-multi-arch-7-13-0-0123456789abcdef")
+        );
+    }
+
+    #[test]
+    fn runtime_ahead_of_the_index_is_not_downgraded() {
+        // A pinned or hand-placed build newer than the index must be left alone —
+        // "updating" it would move the lane backwards. It is also the one case
+        // where `target=` must be ignored: the index cannot reproduce this build,
+        // so the key an apply would produce names a runtime that is not there.
+        let Decision::Reuse { reason, activate } = decide(
+            &report_with_target(
+                "ahead_of_index",
+                "release",
+                "release-wheel-multi-arch-7-15-0-deadbeefdeadbeef",
+            ),
+            "release",
+            None,
+        ) else {
+            panic!("a runtime ahead of the index must be reused");
+        };
+        assert!(reason.contains("ahead of"), "{reason}");
+        assert_eq!(
+            activate.as_deref(),
+            Some("release-wheel-gfx94x-dcgpu-7-13-0")
+        );
+    }
+
+    #[test]
+    fn index_error_reuses_rather_than_reinstalling() {
+        // The renderer omits `channel=` when resolving the index fails. That is
+        // unknown freshness, not proof that this channel has no runtime, so the
+        // conservative pre-warm decision must reuse rather than download again.
+        let text = "update\n  runtime release-wheel-gfx94x-dcgpu-7-13-0 format=wheel \
+status=error message=failed to reach https://repo.amd.com/rocm/whl after 3 tries\n";
+        let Decision::Reuse { reason, .. } = decide(text, "release", None) else {
+            panic!("an unattributable index error must reuse the existing tree");
+        };
+        assert!(reason.contains("could not establish"), "{reason}");
+    }
+
+    #[test]
+    fn unattributed_error_wins_over_a_known_other_channel() {
+        let text = format!(
+            "{}  runtime release-wheel-gfx94x-dcgpu-7-13-0 format=wheel \
+status=error message=failed to reach the index\n",
+            report("up_to_date", "nightly")
+        );
+        assert!(matches!(
+            decide(&text, "release", None),
+            Decision::Reuse { .. }
+        ));
+    }
+
+    #[test]
+    fn index_error_on_an_attributable_line_is_reused() {
+        let text = "update\n  runtime release-wheel-gfx94x-dcgpu-7-13-0 format=wheel \
+channel=release status=error message=failed to reach the index\n";
+        let Decision::Reuse { reason, .. } = decide(text, "release", None) else {
+            panic!("an unreadable freshness status must reuse the existing tree");
+        };
+        assert!(reason.contains("could not establish"), "{reason}");
+    }
+
+    #[test]
+    fn another_channels_runtime_does_not_satisfy_this_channel() {
+        // A per-channel pre-warm still shares one tree layout, and EAI-8056 adds a
+        // nightly lane: a release runtime must never be mistaken for a nightly one.
+        assert_eq!(
+            decide(&report("up_to_date", "release"), "nightly", None),
+            Decision::Install
+        );
+    }
+
+    #[test]
+    fn the_stale_runtime_for_this_channel_is_the_one_updated() {
+        // Mixed tree: only the line matching our channel may be selected.
+        let text = format!(
+            "{}{}",
+            report("up_to_date", "release"),
+            report("update_available", "nightly")
+        );
+        assert_eq!(
+            decide(&text, "nightly", None),
+            Decision::Update {
+                runtime_key: "nightly-wheel-gfx94x-dcgpu-7-13-0".to_owned()
+            }
+        );
+        // …and the release lane reading the same tree still sees a cache hit.
+        assert!(matches!(
+            decide(&text, "release", None),
+            Decision::Reuse { .. }
+        ));
+    }
+
+    #[test]
+    fn unparseable_report_reuses() {
+        let Decision::Reuse { reason, .. } = decide(
+            "update\n  runtime weird-key format=wheel channel=release\n",
+            "release",
+            None,
+        ) else {
+            panic!("a report with no status must reuse");
+        };
+        assert!(reason.contains("could not establish"), "{reason}");
+    }
+
+    #[test]
+    fn message_text_containing_spaces_does_not_break_field_parsing() {
+        let line = "  runtime k format=wheel channel=release status=error \
+message=connect timed out after 30 s";
+        let parsed = RuntimeLine::parse(line).expect("line parses");
+        assert_eq!(parsed.runtime_key, "k");
+        assert_eq!(parsed.channel.as_deref(), Some("release"));
+        assert_eq!(parsed.status.as_deref(), Some("error"));
+        // A degraded line has no plan, so it names no target. Falling back to
+        // the line's own key keeps the reuse path from activating nothing.
+        assert_eq!(parsed.target_runtime_key, None);
+        assert_eq!(parsed.serving_runtime_key(), "k");
+    }
+
+    #[test]
+    fn non_runtime_lines_are_ignored() {
+        assert!(RuntimeLine::parse("  policy: bounded startup check").is_none());
+        assert!(RuntimeLine::parse("    install_root: /tmp/x").is_none());
+    }
+
+    #[test]
+    fn update_surfaces_block_is_not_a_runtime_entry() {
+        // `runtimes: status=none_configured` differs from a real entry only by the
+        // `s` where the prefix expects a space, and it does carry a `status=`
+        // field. Reading it as a runtime would make an empty tree look like an
+        // unrecognised-status one and resolve to Reuse — the pre-warm would then
+        // never do the very first install.
+        assert!(
+            RuntimeLine::parse(
+                "    runtimes: status=none_configured reason=TheRock runtime update checks \
+                 above are the only live update checks in this build"
+            )
+            .is_none(),
+            "the update_surfaces summary must not parse as an installed runtime"
+        );
+        assert!(RuntimeLine::parse("    cli: installed=0.1.0 status=not_configured").is_none());
+        // …and end to end, the real empty report still resolves to a cold install.
+        assert_eq!(decide(EMPTY, "release", None), Decision::Install);
+    }
+}

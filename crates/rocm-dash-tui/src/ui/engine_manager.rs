@@ -26,7 +26,7 @@ use rocm_dash_core::state::{SideEffect, State, StateEvent};
 use crate::ui::approval::{
     ApprovalChoice, ApprovalRequest, ApprovalVerdict, approval_key, draw_approval,
 };
-use crate::ui::exec::{exe_label, resolve_exe};
+use crate::ui::exec::{display_args, exe_label, resolve_exe};
 use crate::ui::job_console::{ConsoleOutcome, on_console_key};
 use crate::ui::panel::{self, BoxRole};
 use crate::ui::theme::Theme;
@@ -147,8 +147,10 @@ pub fn on_key(
     // 3) List navigation + action requests.
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => *engines = None,
-        KeyCode::Up | KeyCode::Char('k') => em.selected = em.selected.saturating_sub(1),
-        KeyCode::Down | KeyCode::Char('j') => {
+        KeyCode::Up | KeyCode::Char('k') | KeyCode::Left => {
+            em.selected = em.selected.saturating_sub(1);
+        }
+        KeyCode::Down | KeyCode::Char('j') | KeyCode::Right => {
             em.selected = (em.selected + 1).min(ENGINE_CATALOG.len() - 1);
         }
         KeyCode::Char('u') => request_op(em, EngineAction::Use),
@@ -174,7 +176,7 @@ fn request_op(em: &mut EngineManagerState, action: EngineAction) {
     let request = ApprovalRequest::new(
         format!("{} engine “{}”", action.verb(), name),
         vec![
-            format!("{} {}", exe_label(&cmd), args.join(" ")),
+            format!("{} {}", exe_label(&cmd), display_args(&args)),
             String::new(),
             explain.to_string(),
         ],
@@ -285,7 +287,7 @@ pub fn draw_engine_manager(
 
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "↑↓ select · u use · i install · r reinstall · Esc close",
+            "↑↓←→ select · u use · i install · r reinstall · Esc close",
             Style::default().fg(theme.muted),
         ))),
         body[2],
@@ -335,6 +337,20 @@ mod tests {
         assert_eq!(em.as_ref().unwrap().selected, ENGINE_CATALOG.len() - 1);
         for _ in 0..ENGINE_CATALOG.len() + 3 {
             on_key(&mut em, &mut jobs, key(KeyCode::Up));
+        }
+        assert_eq!(em.as_ref().unwrap().selected, 0);
+    }
+
+    #[test]
+    fn left_right_alias_up_down() {
+        let mut em = Some(EngineManagerState::default());
+        let mut jobs = State::default();
+        for _ in 0..ENGINE_CATALOG.len() + 3 {
+            on_key(&mut em, &mut jobs, key(KeyCode::Right));
+        }
+        assert_eq!(em.as_ref().unwrap().selected, ENGINE_CATALOG.len() - 1);
+        for _ in 0..ENGINE_CATALOG.len() + 3 {
+            on_key(&mut em, &mut jobs, key(KeyCode::Left));
         }
         assert_eq!(em.as_ref().unwrap().selected, 0);
     }

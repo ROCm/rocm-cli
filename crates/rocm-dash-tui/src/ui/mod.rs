@@ -42,7 +42,9 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 
-use crate::app::{ActiveTab, AppState, ConnState, FooterChip, KeyAction, Modal};
+use crate::app::{
+    ActiveTab, AppState, ChatConsent, ConnState, FooterChip, KeyAction, Modal, PaneFocus,
+};
 use crate::ui::theme::Theme;
 
 pub fn draw(f: &mut Frame, state: &mut AppState) {
@@ -128,7 +130,8 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
         // detail (the selectable list on that surface).
         Modal::Detail => {
             if state.active_tab == ActiveTab::Observe {
-                tabs::instances::draw_detail(f, body, state, &theme);
+                let max_scroll = tabs::instances::draw_detail(f, body, state, &theme);
+                state.instance_detail_max_scroll = max_scroll;
             }
         }
         Modal::ThemePicker => {
@@ -151,7 +154,7 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
     if state.has_open_overlay() {
         modal::grey_overlay(f);
     }
-    let manager_rect = modal::centered_rect(82, 80, 130, 34, body);
+    let manager_rect = manager_rect(body);
     draw_active_manager(f, manager_rect, state, &theme);
 
     // Approval modal (Phase 4): drawn LAST so it sits on top of every overlay
@@ -161,6 +164,236 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
         modal::grey_overlay(f);
         approval::draw_approval(f, body, &pa.req, pa.choice, &theme);
     }
+
+    // Quit-confirm prompt (issue #145): a quit attempted while a model is
+    // still serving. Same reuse of the approval seam, same "drawn last, owns
+    // the screen" rule — the two are never open at the same time, so render
+    // order between them never matters: `open_approval` refuses outright
+    // while `quit_confirm` is open, and `open_quit_confirm` closes any open
+    // approval the same way it closes every other overlay (see their doc
+    // comments on `AppState`, not a doc comment on `quit_confirm` itself).
+    if let Some(choice) = state.quit_confirm {
+        modal::grey_overlay(f);
+        // `true`: the dashboard's own `s` key (`quit_confirm_open_services_key`
+        // in `event_loop`) can act on the hint this renders.
+        approval::draw_approval(f, body, &quit_confirm_request(state, true), choice, &theme);
+    }
+}
+
+/// Build the quit-confirm prompt's request (title + body) once, so the
+/// dashboard's own render arm above and the pre-dashboard launcher's
+/// (`ui::launcher::draw`) call the same construction instead of each
+/// hand-copying the title string — the same launcher/dashboard drift
+/// `quit_confirm_body`, `resolve_quit_confirm_key`, and `is_running` are each
+/// also shared to avoid.
+///
+/// The title is derived from the same decision as the body
+/// (`nothing_is_currently_being_served_with`) rather than hardcoded, so the two
+/// can't contradict each other the way they used to when a model stopped
+/// (or was never confirmed live) while the prompt sat open: "May still be
+/// serving" above a body that says "Nothing is being served anymore."
+/// underneath it.
+///
+/// `offer_stop_action` gates the trailing "press s" hint (issue #145): `true`
+/// from the dashboard's own render arm, which can actually act on `s`
+/// (`AppState::quit_confirm_open_services_key`); `false` from the
+/// pre-dashboard launcher, which shares this prompt's text but has no live
+/// Services overlay to jump to, so advertising a key it can't honor would be
+/// exactly the kind of printed claim AGENTS.md §3 rules out.
+pub(crate) fn quit_confirm_request(
+    state: &AppState,
+    offer_stop_action: bool,
+) -> approval::ApprovalRequest {
+    // One snapshot for the whole decision: the title, the body, and the
+    // stop-hint below all read it instead of each doing their own
+    // `live_registry_snapshot()` call, so a registry write mid-render can no
+    // longer make them disagree the way "May still be serving" over a body
+    // that says "Nothing is being served anymore." used to be possible (the doc comment
+    // on `nothing_is_currently_being_served_with` below is only true because
+    // of this single read).
+    let snapshot = state.live_registry_snapshot();
+    let title = if nothing_is_currently_being_served_with(state, &snapshot) {
+        "Nothing to confirm — quit?"
+    } else {
+        "May still be serving — quit anyway?"
+    };
+    let mut body = quit_confirm_body_with(state, &snapshot);
+    if offer_stop_action && state.has_stoppable_managed_instance_with(&snapshot) {
+        body.push(String::new());
+        body.push("Press s to open Services and stop it.".to_string());
+    }
+    approval::ApprovalRequest::new(title, body)
+}
+
+/// Whether the authoritative view — a real snapshot if one has landed,
+/// otherwise a live registry read — says nothing is currently serving.
+/// Shared by `quit_confirm_request` (title) and `quit_confirm_body_with` (its
+/// own early-return branch) so the two can't independently decide this and
+/// drift apart. Expressed directly via `AppState::has_live_instance_with` —
+/// the exact same question, already answered there, against the caller's own
+/// already-fetched `snapshot` rather than a fresh read — not re-deriving the
+/// same `instances`/registry-fallback OR by hand a second time (the
+/// `simulated` short-circuit that function also applies is a no-op here in
+/// practice: the prompt can only be open at all once `has_live_instance` was
+/// already `true` when it was opened, and `simulated` never changes
+/// mid-session).
+fn nothing_is_currently_being_served_with(
+    state: &AppState,
+    snapshot: &crate::registry_probe::ManagedRegistrySnapshot,
+) -> bool {
+    !state.has_live_instance_with(snapshot)
+}
+
+/// Fetch-once convenience wrapper over
+/// [`quit_confirm_body_with`] for a caller that only needs the body in
+/// isolation (every unit test below) — `quit_confirm_request` calls the
+/// `_with` form directly so it shares one snapshot across the title, body,
+/// and stop-hint instead of each fetching its own.
+#[cfg(test)]
+fn quit_confirm_body(state: &AppState) -> Vec<String> {
+    let snapshot = state.live_registry_snapshot();
+    quit_confirm_body_with(state, &snapshot)
+}
+
+/// Body text for the quit-confirm prompt: name the models still serving
+/// (mirroring the Serving tab's "Running now" listing in
+/// `tabs::pane::live_lines`'s `OpenServices` arm, as plain lines instead of
+/// styled spans), and how to stop each one that this host's own registry
+/// manages (a live read, passed in as `snapshot` so the caller controls how
+/// many times the registry is actually read — see `quit_confirm_request`) —
+/// not a blanket command, since a Docker- or Lemonade-discovered instance
+/// from an external daemon cannot be stopped that way.
+///
+/// The trailer is hedged ("may still be running") rather than asserted
+/// present-tense ("keeps running"), for every caller — not only the
+/// pre-dashboard launcher. `state.instances` (the dashboard's own render arm)
+/// looks daemon-verified but isn't: `rocm-dash-daemon`'s registry discovery
+/// (`runner.rs`) promotes a record from `Starting` to `Ready` on a successful
+/// scrape, but a *failed* scrape only logs and leaves the prior status in
+/// place, and nothing on the `rocm dash` path calls the CLI's own liveness
+/// reconcile (`refresh_managed_service_runtime_liveness`, wired only into
+/// `load_managed_services`) — so a service that crashed since its last
+/// successful scrape still reads `is_serving() == true` here, the same gap
+/// the launcher's raw on-disk read already has. Both are now the identical
+/// hedge instead of two different claims over equally-unverified data.
+///
+/// Iterates `state.instances.values()` more than once (via the `running`
+/// closure below, and again inside `nothing_is_currently_being_served_with`)
+/// rather than collecting into a `Vec` first: nothing here needs random
+/// access, and a `HashMap`'s `values()` is cheap to re-create — this still
+/// allocates a fresh `Vec<String>` for the returned body every render while
+/// the prompt is open (an unavoidable allocation, not one this avoids); the
+/// point of the double iteration is only to skip building an intermediate
+/// `Vec<&Instance>` neither closure needs.
+fn quit_confirm_body_with(
+    state: &AppState,
+    snapshot: &crate::registry_probe::ManagedRegistrySnapshot,
+) -> Vec<String> {
+    let running = || state.instances.values().filter(|i| i.status.is_serving());
+    let total = running().count();
+    let managed_ids = &snapshot.managed_ids;
+    if nothing_is_currently_being_served_with(state, snapshot) {
+        // A real snapshot is authoritative here (or there was never a
+        // startup fallback to begin with) and it says nothing is serving.
+        // Can change between opening the prompt and this render (e.g. the
+        // model exits on its own while the prompt is up) — not dead code.
+        // The "it keeps running" trailer below would be a direct, printed
+        // lie in this state (reachable whether or not the startup fallback
+        // was ever active), so return before appending it rather than
+        // widening the gate below.
+        return vec!["Nothing is being served anymore.".to_string()];
+    }
+    let mut body = Vec::new();
+    if total == 0 {
+        // `total == 0` here only because `nothing_is_currently_being_served_with`
+        // returned `false` above: either the startup-race fallback (issue
+        // #145) is active — the daemon's first snapshot hasn't landed yet —
+        // or the connection never will succeed at all (Windows: the
+        // dashboard-embedded daemon client's connect path is unix-only, so
+        // `instances` stays empty for the whole session). `instances` can't
+        // name anything in either case, but the live registry read
+        // (`managed_ids`) needs no daemon snapshot — it is this host's own
+        // `rocm serve` registry, read straight off disk — so it can still
+        // list each id this host can actually stop and the real command for
+        // it; only the pretty model *name* `instances` would otherwise
+        // supply is unavailable here. So this stays honest about not knowing
+        // whether the listed ids are *still* serving, instead of claiming to
+        // know either way — the trailer below is hedged to match, rather
+        // than asserting present-tense that it does keep running.
+        //
+        // `managed_ids` is never empty here: `nothing_is_currently_being_served_with`
+        // already returned `false` above, and with `total == 0` that can only be
+        // because `snapshot.has_live_service` is `true` — every `ManagedRegistryProbe`
+        // in this tree (`LiveManagedRegistryProbe::snapshot`, `apps/rocm::dash`) derives
+        // both fields from the same `discover_managed_services` pass
+        // (`crates/rocm-dash-daemon/src/registry.rs`), which inserts an id into `seen`
+        // (-> `managed_ids`) for every record it also counts into `svcs` (->
+        // `has_live_service`), so a probe can never report "live" with no id to name.
+        // Asserted rather than branched on: a probe that someday broke that pairing
+        // should fail loudly here instead of silently falling through with no ids
+        // to list, leaving the "stop it first" guidance below with nothing to name.
+        debug_assert!(
+            !managed_ids.is_empty(),
+            "a live registry snapshot reported serving with no managed id to name"
+        );
+        let mut ids: Vec<&String> = managed_ids.iter().collect();
+        ids.sort();
+        for id in ids.iter().take(5) {
+            body.push(format!("• {id} — stop it first:"));
+            body.push(format!("  rocm services stop {id} --yes"));
+        }
+        if let Some(line) = format::overflow_line(managed_ids.len(), 5) {
+            body.push(line);
+        }
+    } else {
+        // Sorted by `container_id` — the same key `services_manager::service_rows`
+        // sorts by — rather than left in whichever order this `HashMap`'s
+        // `values()` happened to yield, so the listing is at least stable
+        // across renders. `s` does not focus "the Nth instance named here":
+        // `quit_confirm_open_services_key` always focuses the FIRST managed,
+        // still-serving row in `service_rows`' own order, which can include
+        // an unmanaged (Docker/Lemonade) entry this listing also shows ahead
+        // of it — so the row `s` focuses need not be the Nth line printed
+        // below.
+        let mut sorted: Vec<_> = running().collect();
+        sorted.sort_by(|a, b| a.container_id.cmp(&b.container_id));
+        for i in sorted.into_iter().take(5) {
+            // The stop command is only ever printed next to a service this
+            // host's own registry can actually reach: `instances` can also
+            // hold a Docker- or Lemonade-discovered entry from an external
+            // daemon, which `rocm services stop` cannot touch — printing it
+            // unconditionally would be remediation advice the user cannot
+            // follow for that instance (AGENTS.md §3).
+            if managed_ids.contains(&i.container_id) {
+                // The command sits on its own line rather than trailing the
+                // model name on one long line: at the popup's narrowest width
+                // (the launcher's copy, @id:dash-launcher-quit-confirm-when-serving
+                // on an 80-column terminal) a combined line word-wraps the
+                // command itself across two rows, which the e2e assertion
+                // matches against the full flattened screen — a wrap there
+                // lands the command's second half next to unrelated menu text
+                // from outside the popup instead of the first half. Splitting
+                // keeps the SHORT, fixture-sized id used in that scenario
+                // (`e2e-mock`) from wrapping; it does not stop a real id
+                // (`generate_service_id`, `rocm_core::generate_service_id`,
+                // produces roughly 23-47 characters depending on engine and
+                // model slug) from wrapping on its own line at a narrow
+                // width. A real user never has to
+                // reassemble a remediation command broken across the model
+                // name's line, at least.
+                body.push(format!("• {} — stop it first:", i.model_name));
+                body.push(format!("  rocm services stop {} --yes", i.container_id));
+            } else {
+                body.push(format!("• {}", i.model_name));
+            }
+        }
+        if let Some(line) = format::overflow_line(total, 5) {
+            body.push(line);
+        }
+    }
+    body.push(String::new());
+    body.push("It may still be running in the background after you quit.".to_string());
+    body
 }
 
 /// Render a *focused-host* frame: theme background plus exactly ONE overlay.
@@ -168,10 +401,30 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
 /// A single hint line sits below it — no header, tab shell, dock, or footer
 /// legend. Used by the bare-`rocm` launcher's in-place flows (Set up / Serve /
 /// Diagnose), where the full dashboard chrome would be misleading. The overlay
-/// is drawn through the same [`draw_active_manager`] path the dashboard uses (so
-/// the approval / job-console layering is identical). Falls back to a centered
-/// "closing…" note when no overlay is open — defensive; the event loop breaks at
-/// that point and hands control back to the launcher.
+/// (and any job console nested inside it) is drawn through the same
+/// [`draw_active_manager`] path [`draw`] uses, and the same dimmed-backdrop
+/// wash is applied behind it. It is NOT identical to [`draw`] in two ways:
+/// there is no approval layer here (a focused-host session has no chat, so no
+/// tool call can ever be pending), and the "Esc back to menu" hint below is
+/// rendered with a foreground-only `Style` (no `bg`) — `ratatui::Style::patch`
+/// leaves an unset field untouched rather than clearing it, so the hint
+/// inherits the wash's background from the cells underneath it rather than
+/// reverting to plain theme bg, exactly like `draw`'s footer. Falls back to a
+/// centered "closing…" note when no overlay is open — defensive; the event
+/// loop breaks at that point and hands control back to the launcher.
+///
+/// Also renders the quit-confirm prompt (issue #145) when open, same as
+/// `draw`'s own arm — dead last, "owns the screen" the same way. No focused
+/// path actually opens it today (`actions::request_quit`'s own doc comment:
+/// unreachable in practice), but a future one that does needs two things
+/// together, not this arm alone: `open_quit_confirm` closes every manager
+/// overlay, which would otherwise make `AppState::focused_should_exit` fire
+/// on the very next loop iteration and exit silently before this ever drew —
+/// so that gate also exempts a pending quit-confirm (see its own doc
+/// comment). Drawing the prompt here is what makes that exemption show
+/// something instead of merely not exiting.
+/// `offer_stop_action: false` — same reasoning as the launcher's own copy:
+/// a focused host has no live Services overlay of its own to jump to.
 pub fn draw_focused(f: &mut Frame, state: &mut AppState) {
     let theme = state.theme;
     state.scrollbars.borrow_mut().clear();
@@ -187,7 +440,12 @@ pub fn draw_focused(f: &mut Frame, state: &mut AppState) {
     let footer_area = outer[1];
 
     if state.has_open_overlay() {
-        let manager_rect = modal::centered_rect(82, 80, 130, 34, body);
+        // Dim the periphery behind the modal, matching `draw()`'s treatment so
+        // the overlay reads as the foreground here too (previously this path
+        // skipped the wash entirely, leaving the area outside the manager card
+        // at plain theme background instead of dimmed).
+        modal::grey_overlay(f);
+        let manager_rect = manager_rect(body);
         draw_active_manager(f, manager_rect, state, &theme);
     } else {
         f.render_widget(
@@ -209,6 +467,17 @@ pub fn draw_focused(f: &mut Frame, state: &mut AppState) {
         ))),
         footer_area,
     );
+
+    if let Some(choice) = state.quit_confirm {
+        modal::grey_overlay(f);
+        approval::draw_approval(f, body, &quit_confirm_request(state, false), choice, &theme);
+    }
+}
+
+/// Where an operational manager overlay is drawn inside the dashboard `body`.
+/// One place, so the draw paths and the tests that check what fits agree.
+pub(crate) fn manager_rect(body: Rect) -> Rect {
+    modal::centered_rect(82, 80, 130, 34, body)
 }
 
 /// Draw whichever operational manager is open into `rect`. The managers are
@@ -242,7 +511,15 @@ fn draw_active_manager(f: &mut Frame, rect: Rect, state: &AppState, theme: &Them
         return;
     }
     if let Some(sm) = &state.services {
-        services_manager::draw_services_manager(f, rect, sm, &state.instances, &state.jobs, theme);
+        services_manager::draw_services_manager(
+            f,
+            rect,
+            sm,
+            &state.instances,
+            &state.jobs,
+            state.services_past_attempts,
+            theme,
+        );
     } else if let Some(w) = &state.serve_wizard {
         serve_wizard::draw_serve_wizard(f, rect, w, &state.jobs, &state.model_recipes, theme);
     } else if let Some(em) = &state.engine_manager {
@@ -413,33 +690,139 @@ fn draw_footer(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) -> Ve
     } else {
         KeyAction::OpenDetail
     };
+    // Single source of truth for "does a global hotkey reach its normal
+    // `handle_key` arm right now, or does something else own the keyboard
+    // first?" — mirrors, in order, `event_loop`'s own dispatch: a manager
+    // overlay or pending approval owns every key before `handle_key` is ever
+    // called (`overlay_or_approval`); a plain `Modal::*` fully returns from
+    // its own arm before reaching the global match (`modal_open`); and
+    // focused chat text entry absorbs every key except PageUp/PageDown
+    // (`chat_typing`, see `handle_key`'s `chat.focused` branch). Any footer
+    // chip whose click dispatches a *global* hotkey action must gate on this,
+    // or the click can do something the key it displays never could.
+    let overlay_or_approval = state.overlay_or_approval();
+    let modal_open = state.modal != Modal::None;
+    let chat_typing = state.active_tab == ActiveTab::Chat && state.chat_focused;
+    let hotkeys_owned_elsewhere = overlay_or_approval || modal_open || chat_typing;
     let mut segs: Vec<Seg> = vec![
-        Seg::Key("Tab", Some(KeyAction::SwitchTab(state.active_tab.next()))),
+        // A real Tab keypress reaches `SwitchTab` only in that same idle
+        // state: every modal arm (including `Options`, which remaps Tab to
+        // `OptionsTab`) returns before the global match, a manager overlay
+        // owns keys entirely, and focused chat text entry consumes Tab as
+        // `Nothing` rather than falling through.
+        Seg::Key(
+            "Tab",
+            (!hotkeys_owned_elsewhere).then_some(KeyAction::SwitchTab(state.active_tab.next())),
+        ),
         Seg::Sep(" next  "),
         Seg::Key("1–5", None),
         Seg::Sep(" jump  "),
     ];
-    // On a domain tab with a manager open inline, the pane keys route to the
-    // manager — advertise the back-out instead of the (now wrong) select/open.
-    if is_action_tab && state.has_open_overlay() {
+    // Exactly one Esc chip is shown at all times, and it must match what Esc
+    // actually does — the real routing priority (highest first) is: the
+    // quit-confirm prompt (issue #145) or a pending chat approval owns every
+    // key; then an open manager overlay backs itself out; then a `Modal::*`
+    // overlay closes; then a focused/gating Chat tab absorbs Esc; only once
+    // none of those apply does Esc fall through to the uniform "menu"
+    // fallback (item #35). Mirror that order here so the chip never
+    // advertises `menu` while the Esc *key* would actually do something else.
+    // A click on the chip itself can no longer disagree with this label for
+    // quit-confirm/approval: `resolve_mouse`'s `blocks_body_absolutely()`
+    // guard swallows a footer-chip click there before `footer_chip_hit` ever
+    // resolves one (issue #145) — this label logic still has to track the
+    // manager-overlay case, where a chip click does dispatch.
+    if state.blocks_body_absolutely() {
+        segs.push(Seg::Key("Esc", None));
+        segs.push(Seg::Sep(" cancel  "));
+    } else if state.has_open_overlay() && state.active_overlay_at_root() {
         segs.push(Seg::Key("Esc", None));
         segs.push(Seg::Sep(" back out  "));
-    } else if matches!(
-        state.active_tab,
-        ActiveTab::Observe | ActiveTab::Rocm | ActiveTab::Serving
-    ) {
-        segs.push(Seg::Key("j/k", Some(KeyAction::Move(1))));
-        segs.push(Seg::Sep(" select  "));
-        segs.push(Seg::Key("Enter", Some(enter_action)));
-        segs.push(Seg::Sep(if is_action_tab {
-            " open  "
+    } else if state.has_open_overlay()
+        && let Some(id) = state.active_job_id()
+    {
+        let closes = crate::ui::job_console::console_esc_closes(state.jobs.job(id));
+        // A manager's job console is showing a job — `closes` mirrors
+        // `on_console_key`'s own terminality check (`console_esc_closes`) so
+        // the label can't drift from what Esc actually does, matched once
+        // here instead of as two separate (and negated) lookups.
+        segs.push(Seg::Key("Esc", None));
+        if closes {
+            // Still running — Esc fully closes the overlay (the job keeps
+            // running in the background), matching the console's own footer
+            // hint ("Esc close (keeps running)"), not the generic sub-popup
+            // "cancel" below.
+            segs.push(Seg::Sep(" close  "));
         } else {
-            " detail  "
+            // Finished (or vanished) — `on_console_key` only dismisses the
+            // console back to the screen body (the overlay itself stays
+            // open); nothing is left to cancel, matching the console's own
+            // reworded footer hint ("Enter/Esc dismiss", see
+            // `job_console::draw`). This must not fall through to the
+            // generic sub-popup "cancel" arm below, which would otherwise
+            // contradict that hint.
+            segs.push(Seg::Sep(" dismiss  "));
+        }
+    } else if state.has_open_overlay() {
+        // A manager is open but not at its root layer (sub-popup, picker, or
+        // approval) — Esc is handled by that layer's own event-loop arm, not
+        // by `should_pane_back_out`/`OpenMenu`. `None` keeps the chip
+        // non-clickable so it can't dispatch the wrong action.
+        segs.push(Seg::Key("Esc", None));
+        segs.push(Seg::Sep(" cancel  "));
+    } else if state.modal != Modal::None {
+        segs.push(Seg::Key("Esc", Some(KeyAction::CloseModal)));
+        segs.push(Seg::Sep(" close  "));
+    } else if state.active_tab == ActiveTab::Chat
+        && state.chat_detect_offer.is_some()
+        && state.chat_consent != ChatConsent::Accepted
+    {
+        segs.push(Seg::Key("Esc", Some(KeyAction::ChatDetectDismiss)));
+        segs.push(Seg::Sep(" dismiss  "));
+    } else if state.active_tab == ActiveTab::Chat && state.chat_focused {
+        segs.push(Seg::Key("Esc", Some(KeyAction::ChatBlur)));
+        segs.push(Seg::Sep(" unfocus  "));
+    } else {
+        // Dispatch `PaneEscape`, not a hardcoded `OpenMenu` — `apply_action`
+        // resolves `PaneEscape` against `pane_focus` exactly as a real
+        // keypress does (Details → Actions on Rocm/Serving, else the menu),
+        // so the chip can't promise "menu" when the key would actually just
+        // step the pane back out.
+        let steps_out_of_detail = is_action_tab && state.pane_focus == PaneFocus::Detail;
+        segs.push(Seg::Key("Esc", Some(KeyAction::PaneEscape)));
+        segs.push(Seg::Sep(if steps_out_of_detail {
+            " back  "
+        } else {
+            " menu  "
         }));
+        if matches!(
+            state.active_tab,
+            ActiveTab::Observe | ActiveTab::Rocm | ActiveTab::Serving
+        ) {
+            segs.push(Seg::Key("j/k", Some(KeyAction::Move(1))));
+            segs.push(Seg::Sep(" select  "));
+            segs.push(Seg::Key("Enter", Some(enter_action)));
+            segs.push(Seg::Sep(if is_action_tab {
+                " open  "
+            } else {
+                " detail  "
+            }));
+        }
     }
     // Guided-action letter hotkeys — Observe only (telemetry quick-jumps). On
     // ROCm/Serving the Actions list is the single path, so no letter chips.
-    if state.active_tab == ActiveTab::Observe {
+    //
+    // Gated on `overlay_or_approval || modal_open`, not just the former: a
+    // real w/e/d/u/i/l/s/b keypress can't reach these `Open*` actions while a
+    // manager overlay owns the event loop, a chat approval is pending, *or* a
+    // plain `Modal::*` is open (every modal arm in `handle_key` fully returns
+    // before this letter-hotkey match, none of them match these letters), but
+    // a footer-chip click bypasses all three. Each `Open*` handler starts
+    // with `close_overlays()`, which would silently discard whatever overlay,
+    // approval, or modal was open — the same class of bug the t/?/q gating
+    // below exists to prevent. (`chat_typing` doesn't apply: this whole block
+    // is already tab-gated to Observe, and `chat_typing` can only be true on
+    // the Chat tab.)
+    if state.active_tab == ActiveTab::Observe && !overlay_or_approval && !modal_open {
         segs.push(Seg::Key("w", Some(KeyAction::OpenServeWizard)));
         segs.push(Seg::Sep(" serve  "));
         segs.push(Seg::Key("e", Some(KeyAction::OpenEngineManager)));
@@ -457,18 +840,64 @@ fn draw_footer(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) -> Ve
         segs.push(Seg::Key("b", Some(KeyAction::OpenBenchRun)));
         segs.push(Seg::Sep(" bench  "));
     }
-    if state.replay.is_some() {
+    // Same reachability argument as the Tab chip above: a real Space/+/-
+    // keypress only reaches `ReplayTogglePause`/`ReplaySpeedUp` when nothing
+    // else — overlay, approval, modal, or focused chat text entry — owns the
+    // key first.
+    if state.replay.is_some() && !hotkeys_owned_elsewhere {
         segs.push(Seg::Key("Space", Some(KeyAction::ReplayTogglePause)));
         segs.push(Seg::Sep(" pause  "));
         segs.push(Seg::Key("+/-", Some(KeyAction::ReplaySpeedUp)));
         segs.push(Seg::Sep(" speed  "));
     }
-    segs.push(Seg::Key("t", Some(KeyAction::OpenThemePicker)));
-    segs.push(Seg::Sep(" theme  "));
-    segs.push(Seg::Key("?", Some(KeyAction::ToggleHelp)));
-    segs.push(Seg::Sep(" help  "));
-    segs.push(Seg::Key("q", Some(KeyAction::Quit)));
-    segs.push(Seg::Sep(" quit"));
+    // While a manager overlay is open it owns every key (the event loop routes
+    // each keypress to its `on_key`, never falling through to `apply_action`),
+    // so a real `t`/`?`/`q` press can't reach
+    // `OpenThemePicker`/`ToggleHelp`/`KeyAction::Quit` there — it cancels the
+    // approval, closes the job console, or backs the manager out instead, but
+    // it never opens the theme picker, toggles help, or tears down the app the
+    // way those actions do. The same is true while an approval is pending:
+    // `has_open_overlay()` deliberately excludes `approval` (it's a separate
+    // gating layer), so `approval_pending()` has to be checked here too, or
+    // these chips would stay clickable and let a mouse click silently discard
+    // a pending approval that a real keypress never could.
+    //
+    // `t`/`?` additionally need `state.modal` itself checked: `OpenThemePicker`/
+    // `ToggleHelp` both call `close_overlays()` then unconditionally overwrite
+    // `state.modal`, silently replacing whatever plain `Modal::*` is already
+    // open (Detail/Menu/Palette/Options/GlobalHelp) — but `handle_key` routes
+    // `t`/`?` differently (or not at all) inside every one of those modals'
+    // own arms, so a real keypress never reaches those actions there either.
+    // And both need `chat_typing` checked: focused chat text entry consumes
+    // any `Char` key (including `t`/`?`) as ordinary input, never as a global
+    // hotkey — `hotkeys_owned_elsewhere` covers all three conditions.
+    // `q`'s label ("close" vs "quit") only depends on `overlay_or_approval` —
+    // that's the one condition under which a real `q` still does something
+    // (the overlay's own `on_key` backs it out), so `chat_typing` alone must
+    // not relabel it "close" with no overlay to close. But `q`'s
+    // *clickability* also has to account for `chat_typing`: while typing, a
+    // real `q` types the letter rather than reaching `Quit`, so the chip must
+    // go non-clickable there too even though it keeps the "quit" label.
+    // `modal_open` doesn't affect `q` either way: every modal arm already
+    // maps a real `q` to `Quit` (see `handle_key`).
+    if hotkeys_owned_elsewhere {
+        segs.push(Seg::Key("t", None));
+        segs.push(Seg::Sep(" theme  "));
+        segs.push(Seg::Key("?", None));
+        segs.push(Seg::Sep(" help  "));
+    } else {
+        segs.push(Seg::Key("t", Some(KeyAction::OpenThemePicker)));
+        segs.push(Seg::Sep(" theme  "));
+        segs.push(Seg::Key("?", Some(KeyAction::ToggleHelp)));
+        segs.push(Seg::Sep(" help  "));
+    }
+    if overlay_or_approval {
+        segs.push(Seg::Key("q", None));
+        segs.push(Seg::Sep(" close"));
+    } else {
+        segs.push(Seg::Key("q", (!chat_typing).then_some(KeyAction::Quit)));
+        segs.push(Seg::Sep(" quit"));
+    }
 
     // Lay out left-to-right, rendering each segment in its own cell span so the
     // recorded chip geometry matches the painted columns exactly.
@@ -527,6 +956,9 @@ fn draw_footer(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) -> Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Shared with `app`'s own test module rather than each carrying its own
+    // byte-identical copy — see its doc comment.
+    use crate::app::test_support::with_registry_probe;
 
     #[test]
     fn wide_triptych_aligns_tabs_with_center_not_far_left() {
@@ -551,5 +983,1348 @@ mod tests {
     #[test]
     fn narrow_body_has_no_triptych() {
         assert!(wide_triptych(Rect::new(0, 0, 100, 40)).is_none());
+    }
+
+    #[test]
+    fn footer_shows_esc_menu_chip_when_no_overlay_open() {
+        use crate::ui::theme::Theme;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let theme = Theme::from_name("default-dark");
+        let state = AppState::new("t".into(), "default-dark".into());
+        let backend = TestBackend::new(90, 1);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut chips = Vec::new();
+        term.draw(|f| chips = draw_footer(f, f.area(), &state, &theme))
+            .unwrap();
+
+        // The chip dispatches `PaneEscape`, matching what a real Esc keypress
+        // resolves to via `handle_key`'s catch-all — not a hardcoded
+        // `OpenMenu` that would diverge from `apply_action`'s `pane_focus`
+        // handling on Rocm/Serving.
+        let _ = chips
+            .iter()
+            .find(|c| c.action == KeyAction::PaneEscape)
+            .expect("a fallback Esc chip stepping the pane back out must always be present");
+    }
+
+    #[test]
+    fn footer_esc_chip_dispatches_pane_escape_when_detail_focused() {
+        // Regression: on Rocm/Serving with `pane_focus == Detail`, the real
+        // Esc key steps Details → Actions first (`PaneEscape` in
+        // `apply_action`); it does not open the menu. The chip must dispatch
+        // the same `PaneEscape` action (not `OpenMenu`) so a click matches
+        // the keypress, and its label must say so.
+        use crate::ui::theme::Theme;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let theme = Theme::from_name("default-dark");
+        let mut state = AppState::new("t".into(), "default-dark".into());
+        state.active_tab = ActiveTab::Rocm;
+        state.pane_focus = PaneFocus::Detail;
+
+        let backend = TestBackend::new(90, 1);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut chips = Vec::new();
+        term.draw(|f| chips = draw_footer(f, f.area(), &state, &theme))
+            .unwrap();
+
+        assert!(
+            chips.iter().any(|c| c.action == KeyAction::PaneEscape),
+            "Esc chip must dispatch PaneEscape, matching the real key, while Detail is focused"
+        );
+        assert!(
+            !chips.iter().any(|c| c.action == KeyAction::OpenMenu),
+            "no chip may claim OpenMenu while Esc would actually step Detail back to Actions"
+        );
+        let row: String = (0..90)
+            .map(|x| term.backend().buffer().cell((x, 0)).unwrap().symbol())
+            .collect();
+        assert!(
+            row.contains("back"),
+            "chip label should say the Esc key steps back out of Detail: {row:?}"
+        );
+    }
+
+    #[test]
+    fn footer_esc_chip_is_not_clickable_menu_when_overlay_has_a_sub_popup_open() {
+        // Regression: with a manager open but not at its root layer (here, a
+        // folder browser sub-popup), `has_open_overlay()` is true but
+        // `active_overlay_at_root()` is false. The chip must not fall through
+        // to the generic `OpenMenu` arm — that key is actually consumed by the
+        // manager's own event-loop arm, which cancels the sub-layer, not the
+        // menu. Any chip shown here must be non-clickable (`action == None`)
+        // and labeled "cancel" (this sub-popup has no "close means job keeps
+        // running" nuance, unlike a job console — see the "close" test below).
+        use crate::ui::theme::Theme;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let theme = Theme::from_name("default-dark");
+        let mut state = AppState::new("t".into(), "default-dark".into());
+        state.serve_wizard = Some(crate::ui::serve_wizard::ServeWizardState {
+            browser: Some(crate::ui::folder_browser::FolderBrowser::new(
+                "t",
+                std::env::temp_dir(),
+            )),
+            ..Default::default()
+        });
+        assert!(state.has_open_overlay());
+        assert!(!state.active_overlay_at_root());
+
+        let backend = TestBackend::new(90, 1);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut chips = Vec::new();
+        term.draw(|f| chips = draw_footer(f, f.area(), &state, &theme))
+            .unwrap();
+
+        for chip in &chips {
+            assert_ne!(
+                chip.action,
+                KeyAction::OpenMenu,
+                "no chip may dispatch OpenMenu while a sub-popup owns Esc"
+            );
+        }
+        let row: String = (0..90)
+            .map(|x| term.backend().buffer().cell((x, 0)).unwrap().symbol())
+            .collect();
+        assert!(
+            row.contains("Esc  cancel"),
+            "sub-popup Esc chip should say cancel: {row:?}"
+        );
+        // Note: "close" legitimately appears elsewhere in this row (the `q`
+        // chip always says "close" while any overlay is open, root or not —
+        // see `footer_q_t_help_chips_are_not_clickable_when_a_manager_overlay_is_open`),
+        // so the Esc chip's own label must be checked specifically rather
+        // than scanning the whole row for the substring.
+        assert!(
+            !row.contains("Esc  close"),
+            "sub-popup Esc chip should not say close: {row:?}"
+        );
+    }
+
+    #[test]
+    fn quit_confirm_body_prints_the_stop_command_during_the_startup_fallback_when_the_registry_names_an_id()
+     {
+        // On a host whose dashboard-embedded daemon client never connects at
+        // all (Windows — `has_received_snapshot` never flips for the whole
+        // session), `instances` never fills, so without this the quit prompt
+        // could only ever print the generic "a model was serving" sentence —
+        // no model name (expected: `instances` is the only source for that),
+        // but also no stop command and no id, even though the live registry
+        // read already has one. The registry read needs no daemon snapshot,
+        // so the stop command should be available here regardless.
+        //
+        // This only pins the printed string (AGENTS.md §3) — it does not run
+        // the command. `dash-28`
+        // (`@id:dash-quit-prompt-stop-command-actually-works`) is the test
+        // that proves a real `rocm services stop <id> --yes` actually clears
+        // the condition.
+        let mut state = AppState::new("t".into(), "default-dark".into());
+        with_registry_probe(&mut state, true, &["svc-managed"]);
+        assert!(state.instances.is_empty());
+        assert!(!state.has_received_snapshot);
+
+        let body = quit_confirm_body(&state);
+        assert!(
+            body.iter()
+                .any(|line| line.contains("rocm services stop svc-managed --yes")),
+            "must print the real stop command from the live registry read even with no \
+             daemon snapshot: {body:?}"
+        );
+        // Checked by requiring the hedge phrase itself, not by requiring the
+        // absence of the retired present-tense one: production never prints
+        // that exact retired string once hedged, so the negative alone can't
+        // fail.
+        assert!(
+            body.iter()
+                .any(|line| line.contains("may still be running")),
+            "must still hedge — the registry read can't confirm current liveness, only that \
+             the record hasn't been reconciled as stopped: {body:?}"
+        );
+    }
+
+    #[test]
+    fn quit_confirm_body_says_nothing_is_being_served_once_a_snapshot_confirms_it() {
+        // Once a real (even empty) snapshot has landed, the startup fallback
+        // is retired (`AppState::has_live_instance`'s own doc comment) and
+        // the plain "nothing anymore" line is accurate again. Same class of
+        // self-contradiction as the sibling test above, reached via a
+        // different trigger: a model that was serving stops on its own while
+        // the prompt sits open awaiting a keypress (the event loop drains
+        // daemon snapshots on its own `select!` arm independent of the
+        // pending prompt) — the body must not print "It keeps running in the
+        // background" right after "Nothing is being served anymore."
+        //
+        // The registry is seeded to still (falsely, or just not yet reaped)
+        // report a live, stoppable managed id, to prove that a leftover
+        // registry entry alone can't make the body claim anything is
+        // running once a real empty snapshot has landed — the snapshot's
+        // early return in `quit_confirm_body` fires before the registry is
+        // ever consulted, so a "stop it first" assertion here would be
+        // vacuously true regardless of what's seeded (see the sibling tests
+        // for actual stop-line coverage: `quit_confirm_body_names_the_real_stop_command_for_a_managed_instance`
+        // and `quit_confirm_body_omits_the_stop_command_for_an_unmanaged_instance`).
+        let mut state = AppState::new("t".into(), "default-dark".into());
+        with_registry_probe(&mut state, true, &["svc-managed"]);
+        state.has_received_snapshot = true;
+
+        let body = quit_confirm_body(&state);
+        assert!(
+            body.iter()
+                .any(|line| line.contains("Nothing is being served"))
+        );
+        // The early return in `quit_confirm_body_with` skips the trailer
+        // entirely, so no hedge should leak through either — not just the
+        // retired present-tense phrase, which production never prints once
+        // hedged and so can't tell a leaked trailer from no trailer at all.
+        assert!(
+            !body
+                .iter()
+                .any(|line| line.contains("may still be running")),
+            "must not print any continued-running trailer once a snapshot confirms nothing is \
+             serving: {body:?}"
+        );
+    }
+
+    #[test]
+    fn quit_confirm_request_title_matches_the_body_when_nothing_is_being_served() {
+        // The title used to be hardcoded to "Still serving" even in the exact
+        // states `quit_confirm_body` itself renders as "Nothing is being
+        // served anymore." — a visible contradiction between the two halves
+        // of the same prompt. Covers both triggers for that state (plain
+        // "nothing ever was", and the snapshot-confirms-it-stopped case) so a
+        // fix for only one can't quietly leave the other still titled wrong.
+        let plain = AppState::new("t".into(), "default-dark".into());
+        let req = quit_confirm_request(&plain, true);
+        assert_eq!(
+            req.title, "Nothing to confirm — quit?",
+            "title must not claim serving when nothing is"
+        );
+        assert!(
+            req.body
+                .iter()
+                .any(|l| l.contains("Nothing is being served"))
+        );
+
+        let mut snapshot_confirmed = AppState::new("t".into(), "default-dark".into());
+        with_registry_probe(&mut snapshot_confirmed, true, &[]);
+        snapshot_confirmed.has_received_snapshot = true;
+        let req = quit_confirm_request(&snapshot_confirmed, true);
+        assert_eq!(
+            req.title, "Nothing to confirm — quit?",
+            "title must not claim serving once a snapshot confirms it stopped"
+        );
+    }
+
+    #[test]
+    fn quit_confirm_request_title_and_trailer_are_hedged_once_a_real_snapshot_has_landed() {
+        // `state.instances` looks daemon-verified once a real snapshot has
+        // landed, but isn't — a failed scrape in
+        // `rocm-dash-daemon`'s `runner.rs` only logs and leaves the prior
+        // status in place, with nothing on this path calling the CLI's own
+        // liveness reconcile (`refresh_managed_service_runtime_liveness`,
+        // wired only into `load_managed_services`). A crashed-but-still-
+        // `ready` record therefore still reads `is_serving() == true` here,
+        // so both the title and the trailer must stay hedged for the
+        // dashboard's own render arm — not just for the pre-dashboard
+        // launcher, which already got this hedge before this round.
+        use rocm_dash_core::metrics::{Instance, InstanceStatus};
+        let mut state = AppState::new("t".into(), "default-dark".into());
+        state.instances.insert(
+            "svc-managed".to_string(),
+            Instance {
+                container_id: "svc-managed".to_string(),
+                status: InstanceStatus::Running,
+                ..Default::default()
+            },
+        );
+        state.has_received_snapshot = true;
+        with_registry_probe(&mut state, true, &["svc-managed"]);
+
+        let dashboard = quit_confirm_request(&state, true);
+        assert_eq!(
+            dashboard.title, "May still be serving — quit anyway?",
+            "the dashboard's own title must hedge the same way the launcher's does: {:?}",
+            dashboard.title
+        );
+        // Checked by requiring the hedge phrase itself: production never
+        // prints the retired present-tense wording once hedged, so a bare
+        // `!contains` against it can't fail.
+        assert!(
+            dashboard
+                .body
+                .iter()
+                .any(|line| line.contains("may still be running")),
+            "must not assert present-tense liveness the daemon never actually verified — the \
+             trailer must hedge the same way the launcher's copy does: {:?}",
+            dashboard.body
+        );
+
+        // The launcher's copy (`offer_stop_action: false`) must match: same
+        // title, same hedge, derived from the exact same shared function.
+        let launcher = quit_confirm_request(&state, false);
+        assert_eq!(launcher.title, dashboard.title);
+    }
+
+    #[test]
+    fn quit_confirm_request_offers_the_stop_hint_only_for_the_dashboard_with_something_stoppable() {
+        use rocm_dash_core::metrics::{Instance, InstanceStatus};
+        let mut state = AppState::new("t".into(), "default-dark".into());
+        state.instances.insert(
+            "svc-managed".to_string(),
+            Instance {
+                container_id: "svc-managed".to_string(),
+                status: InstanceStatus::Running,
+                ..Default::default()
+            },
+        );
+        with_registry_probe(&mut state, true, &["svc-managed"]);
+
+        let dashboard = quit_confirm_request(&state, true);
+        assert!(
+            dashboard
+                .body
+                .iter()
+                .any(|l| l.contains("Press s to open Services")),
+            "the dashboard copy must offer the hint it can act on: {:?}",
+            dashboard.body
+        );
+
+        let launcher = quit_confirm_request(&state, false);
+        assert!(
+            !launcher.body.iter().any(|l| l.contains("Press s")),
+            "the launcher copy must not advertise a key it cannot honor: {:?}",
+            launcher.body
+        );
+
+        // No managed instance serving (only an unmanaged/external one): the
+        // dashboard copy must not offer the hint either, since `s` would have
+        // nothing to focus.
+        let mut unmanaged_only = AppState::new("t".into(), "default-dark".into());
+        unmanaged_only.instances.insert(
+            "docker-abc".to_string(),
+            Instance {
+                container_id: "docker-abc".to_string(),
+                status: InstanceStatus::Running,
+                ..Default::default()
+            },
+        );
+        let dashboard_unmanaged = quit_confirm_request(&unmanaged_only, true);
+        assert!(
+            !dashboard_unmanaged
+                .body
+                .iter()
+                .any(|l| l.contains("Press s")),
+            "must not offer to stop something `s` can't reach: {:?}",
+            dashboard_unmanaged.body
+        );
+    }
+
+    #[test]
+    fn quit_confirm_open_services_key_focuses_the_stoppable_managed_row() {
+        use crossterm::event::KeyCode;
+        use rocm_dash_core::metrics::{Instance, InstanceStatus};
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        // Sorts before "svc-managed" by id (`service_rows` sorts by id), so a
+        // naive "just pick row 0" would wrongly focus this unmanaged one.
+        s.instances.insert(
+            "docker-abc".to_string(),
+            Instance {
+                container_id: "docker-abc".to_string(),
+                status: InstanceStatus::Running,
+                ..Default::default()
+            },
+        );
+        s.instances.insert(
+            "svc-managed".to_string(),
+            Instance {
+                container_id: "svc-managed".to_string(),
+                status: InstanceStatus::Running,
+                ..Default::default()
+            },
+        );
+        with_registry_probe(&mut s, true, &["svc-managed"]);
+        s.open_quit_confirm();
+
+        assert!(s.quit_confirm_open_services_key(KeyCode::Char('s')));
+        assert!(
+            s.quit_confirm.is_none(),
+            "the quit-confirm prompt must close once `s` is handled"
+        );
+        let services = s
+            .services
+            .as_ref()
+            .expect("`s` must open the Services overlay");
+        let rows = crate::ui::services_manager::service_rows(&s.instances);
+        assert_eq!(
+            rows[services.selected].id, "svc-managed",
+            "must focus the stoppable managed row, not whichever sorts first: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn quit_confirm_open_services_key_is_a_no_op_without_a_stoppable_managed_instance() {
+        use crossterm::event::KeyCode;
+        use rocm_dash_core::metrics::{Instance, InstanceStatus};
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.instances.insert(
+            "docker-abc".to_string(),
+            Instance {
+                container_id: "docker-abc".to_string(),
+                status: InstanceStatus::Running,
+                ..Default::default()
+            },
+        );
+        s.open_quit_confirm();
+
+        assert!(!s.quit_confirm_open_services_key(KeyCode::Char('s')));
+        assert!(
+            s.quit_confirm.is_some(),
+            "nothing to stop: the prompt must stay open for its normal y/n/Esc handling"
+        );
+        assert!(s.services.is_none());
+    }
+
+    #[test]
+    fn quit_confirm_open_services_key_ignores_other_keys_and_a_closed_prompt() {
+        use crossterm::event::KeyCode;
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        assert!(
+            !s.quit_confirm_open_services_key(KeyCode::Char('s')),
+            "must not fire while the prompt isn't open"
+        );
+
+        s.open_quit_confirm();
+        assert!(
+            !s.quit_confirm_open_services_key(KeyCode::Char('y')),
+            "must not fire for any key other than `s`"
+        );
+        assert!(s.quit_confirm.is_some());
+    }
+
+    #[test]
+    fn quit_confirm_body_names_the_real_stop_command_for_a_managed_instance() {
+        // The prompt's remediation must name the id `rocm services stop`
+        // actually needs, not a literal `<id>` placeholder, and must only
+        // offer it for a service this host's own registry manages.
+        //
+        // This only pins the printed string (AGENTS.md §3) — a string match
+        // cannot show the command "works". `dash-28`
+        // (`@id:dash-quit-prompt-stop-command-actually-works`) is the test
+        // that runs it for real and proves it does.
+        use rocm_dash_core::metrics::{Instance, InstanceStatus};
+        let mut state = AppState::new("t".into(), "default-dark".into());
+        state.instances.insert(
+            "svc-managed".to_string(),
+            Instance {
+                container_id: "svc-managed".to_string(),
+                model_name: "Qwen2.5-7B".to_string(),
+                status: InstanceStatus::Running,
+                ..Default::default()
+            },
+        );
+        with_registry_probe(&mut state, true, &["svc-managed"]);
+
+        let body = quit_confirm_body(&state);
+        assert!(
+            body.iter()
+                .any(|line| line == "• Qwen2.5-7B — stop it first:"),
+            "expected the managed-instance bullet to name the serving model: {body:?}"
+        );
+        assert!(
+            body.iter()
+                .any(|line| line.contains("rocm services stop svc-managed --yes")),
+            "expected a fillable stop command naming the real id: {body:?}"
+        );
+    }
+
+    #[test]
+    fn quit_confirm_body_omits_the_stop_command_for_an_unmanaged_instance() {
+        // `instances` can hold a Docker- or Lemonade-discovered entry from an
+        // external daemon when connected to one; `rocm services stop` cannot
+        // reach those, so the prompt must not suggest it can.
+        use rocm_dash_core::metrics::{Instance, InstanceStatus};
+        let mut state = AppState::new("t".into(), "default-dark".into());
+        state.instances.insert(
+            "docker-abc123".to_string(),
+            Instance {
+                container_id: "docker-abc123".to_string(),
+                model_name: "external-model".to_string(),
+                status: InstanceStatus::Running,
+                ..Default::default()
+            },
+        );
+        assert!(state.live_registry_snapshot().managed_ids.is_empty());
+
+        let body = quit_confirm_body(&state);
+        assert!(
+            body.iter().any(|line| line.contains("external-model")),
+            "the model must still be named: {body:?}"
+        );
+        assert!(
+            !body.iter().any(|line| line.contains("rocm services stop")),
+            "must not offer a stop command this host cannot honor: {body:?}"
+        );
+    }
+
+    #[test]
+    fn draw_renders_the_press_s_hint_for_a_stoppable_managed_instance() {
+        // Regression guard: `quit_confirm_request_offers_the_stop_hint_only_for_the_dashboard_with_something_stoppable`
+        // already pins the request-building logic, but nothing rendered the
+        // actual frame through the top-level `draw` entry point a real user
+        // sees — a wiring break between `draw`'s `offer_stop_action: true` arm
+        // (`ui/mod.rs`'s own render match on `state.quit_confirm`) and the
+        // request builder could pass that test while never reaching the
+        // screen.
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use rocm_dash_core::metrics::{Instance, InstanceStatus};
+
+        let mut state = AppState::new("t".into(), "default-dark".into());
+        state.instances.insert(
+            "svc-managed".to_string(),
+            Instance {
+                container_id: "svc-managed".to_string(),
+                status: InstanceStatus::Running,
+                ..Default::default()
+            },
+        );
+        with_registry_probe(&mut state, true, &["svc-managed"]);
+        state.open_quit_confirm();
+
+        let mut term = Terminal::new(TestBackend::new(160, 48)).unwrap();
+        term.draw(|f| draw(f, &mut state)).unwrap();
+        let painted: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            painted.contains("Press s to open Services"),
+            "the dashboard's rendered quit-confirm prompt must offer the \
+             stop hint for a stoppable managed instance: {painted:?}"
+        );
+    }
+
+    #[test]
+    fn quit_confirm_body_caps_the_listing_at_five_with_an_overflow_line() {
+        use rocm_dash_core::metrics::{Instance, InstanceStatus};
+        let mut state = AppState::new("t".into(), "default-dark".into());
+        for n in 0..6 {
+            state.instances.insert(
+                format!("svc-{n}"),
+                Instance {
+                    container_id: format!("svc-{n}"),
+                    model_name: format!("model-{n}"),
+                    status: InstanceStatus::Running,
+                    ..Default::default()
+                },
+            );
+        }
+
+        let body = quit_confirm_body(&state);
+        let bullets = body.iter().filter(|line| line.starts_with('•')).count();
+        assert_eq!(bullets, 5, "the listing must cap at 5 bullets: {body:?}");
+        assert!(
+            body.iter().any(|line| line.contains("…and 1 more")),
+            "the sixth instance must be summarized by the overflow line: {body:?}"
+        );
+    }
+
+    #[test]
+    fn quit_confirm_body_lists_services_sorted_by_container_id() {
+        // The body sorts by `container_id` — the same key
+        // `services_manager::service_rows` sorts by — so the listing is
+        // stable rather than left in whichever order a `HashMap`'s
+        // `values()` happens to yield. This does not mean `s`
+        // (`AppState::quit_confirm_open_services_key`) focuses the Nth
+        // bullet printed here: it always focuses the FIRST managed,
+        // still-serving row in `service_rows`' own order, which can include
+        // an unmanaged entry this listing also shows.
+        // `quit_confirm_body_caps_the_listing_at_five_with_an_overflow_line`
+        // inserts ids (`svc-0`..`svc-5`) that already sort the same way
+        // whether by id or insertion order, so it can't catch a regression
+        // here — these ids are deliberately inserted out of sorted order.
+        //
+        // Eight ids, not three: with only 3 ids a `HashMap`'s random
+        // iteration order matches the sorted order by chance often enough to
+        // make this test flaky at catching its own regression — commenting
+        // out the `sort_by` this asserts and re-running 9 times passed 4 and
+        // failed 5. With 8 ids there are 8! = 40320 orderings, so a random
+        // iteration order matching the fully-sorted one by chance is
+        // negligible; a missing/wrong sort now fails reliably.
+        use rocm_dash_core::metrics::{Instance, InstanceStatus};
+        let mut state = AppState::new("t".into(), "default-dark".into());
+        let ids = [
+            "svc-golf",
+            "svc-charlie",
+            "svc-hotel",
+            "svc-alpha",
+            "svc-foxtrot",
+            "svc-delta",
+            "svc-bravo",
+            "svc-echo",
+        ];
+        for id in ids {
+            state.instances.insert(
+                id.to_string(),
+                Instance {
+                    container_id: id.to_string(),
+                    model_name: format!("model-{id}"),
+                    status: InstanceStatus::Running,
+                    ..Default::default()
+                },
+            );
+        }
+
+        let body = quit_confirm_body(&state);
+        let bullets: Vec<&str> = body
+            .iter()
+            .filter(|line| line.starts_with('•'))
+            .map(std::string::String::as_str)
+            .collect();
+        assert_eq!(
+            bullets,
+            vec![
+                "• model-svc-alpha",
+                "• model-svc-bravo",
+                "• model-svc-charlie",
+                "• model-svc-delta",
+                "• model-svc-echo",
+            ],
+            "bullets must be sorted by container_id, not insertion/HashMap order \
+             (capped at 5, so this also exercises the sort ahead of the cap): {body:?}"
+        );
+    }
+
+    #[test]
+    fn quit_confirm_popup_with_realistic_ids_does_not_panic_at_a_narrow_width() {
+        // `generate_service_id` (`rocm_core::generate_service_id`) produces
+        // `<engine>-<model-slug>-<unix-millis>` ids, roughly 23-47 characters,
+        // not the short `e2e-mock`/`svc-managed` fixtures used elsewhere in
+        // this file — a doc comment on the stop-command split used to claim
+        // the split "keeps the command short enough to never need to wrap",
+        // which is false for a real id at a narrow popup width. This doesn't
+        // assert a specific layout (ratatui wraps however it wraps; asserting
+        // exact column breaks here would just pin that behavior without
+        // proving anything about it, and the clipping this can produce at 3+
+        // services is a known, separately-tracked non-blocking gap, not what
+        // this test is for) — it pins that several realistic-length,
+        // realistic-*format* managed ids at the popup's narrowest supported
+        // width render without panicking and still contain every id's text
+        // somewhere in the frame.
+        //
+        // The fixture's `model_name` deliberately does NOT embed the id
+        // (unlike an earlier version of this test): with a model name like
+        // "model-<id>", `painted.contains(id)` could pass off that line
+        // alone even if the "stop it first" bullet and its
+        // `rocm services stop <id> --yes` line — the only other place the raw
+        // id appears — were dropped entirely. With a plain name instead, the
+        // id can only appear via the stop-command line, so this is no longer
+        // vacuous.
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use rocm_dash_core::metrics::{Instance, InstanceStatus};
+
+        let realistic_ids = [
+            "vllm-llama-3-1-8b-instruct-1760345671001",
+            "lemonade-qwen2-5-7b-instruct-1760345672002",
+            "vllm-mixtral-8x7b-instruct-1760345673003",
+        ];
+        let model_names = ["Model A", "Model B", "Model C"];
+        let mut state = AppState::new("t".into(), "default-dark".into());
+        for (id, name) in realistic_ids.into_iter().zip(model_names) {
+            state.instances.insert(
+                id.to_string(),
+                Instance {
+                    container_id: id.to_string(),
+                    model_name: name.to_string(),
+                    status: InstanceStatus::Running,
+                    ..Default::default()
+                },
+            );
+        }
+        with_registry_probe(&mut state, true, &realistic_ids);
+        state.open_quit_confirm();
+
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| draw(f, &mut state)).unwrap();
+        let painted: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            painted.contains("rocm services stop"),
+            "at least one stop command must render: {painted:?}"
+        );
+        for id in realistic_ids {
+            assert!(
+                painted.contains(id),
+                "realistic id {id:?} must still appear somewhere in the \
+                 rendered frame even if its line wraps — not vacuously \
+                 satisfied by a model name that happens to embed it: {painted:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn footer_esc_chip_is_noninteractive_while_quit_confirm_is_pending() {
+        // Issue #145 regression: the Esc-chip label chain checked
+        // `approval_pending()` but not `quit_confirm_pending()`, so with
+        // nothing else open it fell to the generic `PaneEscape` arm — making
+        // the chip genuinely clickable (and mislabeled "menu") while the
+        // quit-confirm prompt was still open on top of it.
+        use crate::ui::theme::Theme;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let theme = Theme::from_name("default-dark");
+        let mut state = AppState::new("t".into(), "default-dark".into());
+        state.open_quit_confirm();
+        assert!(!state.has_open_overlay());
+        assert_eq!(state.modal, Modal::None);
+
+        let backend = TestBackend::new(90, 1);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut chips = Vec::new();
+        term.draw(|f| chips = draw_footer(f, f.area(), &state, &theme))
+            .unwrap();
+
+        for chip in &chips {
+            assert_ne!(
+                chip.action,
+                KeyAction::PaneEscape,
+                "no chip may dispatch PaneEscape while quit-confirm owns Esc"
+            );
+        }
+        let row: String = (0..90)
+            .map(|x| term.backend().buffer().cell((x, 0)).unwrap().symbol())
+            .collect();
+        assert!(
+            row.contains("Esc  cancel"),
+            "quit-confirm Esc chip should say cancel: {row:?}"
+        );
+        assert!(
+            !row.contains("Esc  menu"),
+            "quit-confirm Esc chip must not advertise menu: {row:?}"
+        );
+    }
+
+    #[test]
+    fn footer_esc_chip_labels_close_when_job_console_is_open() {
+        // A manager's job console is showing a still-running job — Esc fully
+        // closes the overlay there (matching the console's own "Esc close
+        // (keeps running)" footer hint), so the dashboard footer chip must say
+        // "close", not the generic sub-popup "cancel".
+        use crate::ui::theme::Theme;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use rocm_dash_core::state::StateEvent;
+
+        let theme = Theme::from_name("default-dark");
+        let mut state = AppState::new("t".into(), "default-dark".into());
+        state.jobs.apply(StateEvent::StartJob {
+            id: "job".into(),
+            cmd: "echo".into(),
+            args: vec!["hi".into()],
+        });
+        state.serve_wizard = Some(crate::ui::serve_wizard::ServeWizardState {
+            active_job: Some("job".into()),
+            ..Default::default()
+        });
+        assert!(state.has_open_overlay());
+        assert!(!state.active_overlay_at_root());
+        assert!(state.active_job_id().is_some());
+
+        let backend = TestBackend::new(90, 1);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| {
+            let _ = draw_footer(f, f.area(), &state, &theme);
+        })
+        .unwrap();
+
+        let row: String = (0..90)
+            .map(|x| term.backend().buffer().cell((x, 0)).unwrap().symbol())
+            .collect();
+        // The `q` chip always says "close" while any overlay is open, root or
+        // not, so an unscoped substring check here would pass even if the Esc
+        // chip's own label were wrong — check the Esc chip specifically.
+        assert!(
+            row.contains("Esc  close"),
+            "job console Esc chip should say close: {row:?}"
+        );
+        assert!(
+            !row.contains("Esc  cancel"),
+            "job console Esc chip should not say cancel: {row:?}"
+        );
+    }
+
+    #[test]
+    fn footer_esc_chip_labels_dismiss_when_job_console_shows_a_finished_job() {
+        // Once the job console's job has finished, Esc only dismisses the
+        // console back to the screen body (the overlay itself stays open) —
+        // `on_console_key` never returns `Closed` for a terminal job. The
+        // footer chip must not claim "close" here, and must not fall through
+        // to the generic sub-popup "cancel" label either — that would
+        // contradict the console's own reworded footer hint ("Enter/Esc
+        // dismiss", see `job_console::draw`). It gets a dedicated "dismiss"
+        // label instead.
+        use crate::ui::theme::Theme;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use rocm_dash_core::state::StateEvent;
+
+        let theme = Theme::from_name("default-dark");
+        let mut state = AppState::new("t".into(), "default-dark".into());
+        state.jobs.apply(StateEvent::StartJob {
+            id: "job".into(),
+            cmd: "echo".into(),
+            args: vec!["hi".into()],
+        });
+        state.jobs.apply(StateEvent::JobDone {
+            id: "job".into(),
+            code: 0,
+        });
+        state.serve_wizard = Some(crate::ui::serve_wizard::ServeWizardState {
+            active_job: Some("job".into()),
+            ..Default::default()
+        });
+        assert!(state.has_open_overlay());
+        assert!(!state.active_overlay_at_root());
+        assert!(state.active_job_id().is_some());
+
+        let backend = TestBackend::new(90, 1);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| {
+            let _ = draw_footer(f, f.area(), &state, &theme);
+        })
+        .unwrap();
+
+        let row: String = (0..90)
+            .map(|x| term.backend().buffer().cell((x, 0)).unwrap().symbol())
+            .collect();
+        assert!(
+            row.contains("Esc  dismiss"),
+            "finished-job console Esc chip should say dismiss: {row:?}"
+        );
+        // Note: "close" legitimately appears elsewhere in this row (the `q`
+        // chip always says "close" while any overlay is open — see
+        // `footer_q_t_help_chips_are_not_clickable_when_a_manager_overlay_is_open`),
+        // so the Esc chip's own label must be checked specifically rather
+        // than scanning the whole row for the substring.
+        assert!(
+            !row.contains("Esc  close"),
+            "finished-job console Esc chip should not say close: {row:?}"
+        );
+        assert!(
+            !row.contains("Esc  cancel"),
+            "finished-job console Esc chip should not say cancel: {row:?}"
+        );
+    }
+
+    #[test]
+    fn footer_q_t_help_chips_are_not_clickable_when_a_manager_overlay_is_open() {
+        // Regression: while any manager overlay is open it owns every key
+        // (the event loop routes each keypress to the manager's own `on_key`,
+        // never falling through to `apply_action`), so a real `q`/`t`/`?`
+        // press can never reach `KeyAction::Quit`/`OpenThemePicker`/
+        // `ToggleHelp` there — it only cancels/closes the overlay. A click on
+        // any of these footer chips must not diverge from that: it must not
+        // tear down the app (killing a still-running job via `kill_on_drop`)
+        // or swap the theme / pop the help overlay on top of the manager when
+        // the key itself never would.
+        use crate::ui::services_manager::ServicesManagerState;
+        use crate::ui::theme::Theme;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let theme = Theme::from_name("default-dark");
+        let mut state = AppState::new("t".into(), "default-dark".into());
+        state.services = Some(ServicesManagerState::default());
+        assert!(state.has_open_overlay());
+
+        let backend = TestBackend::new(90, 1);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut chips = Vec::new();
+        term.draw(|f| chips = draw_footer(f, f.area(), &state, &theme))
+            .unwrap();
+
+        for chip in &chips {
+            assert_ne!(
+                chip.action,
+                KeyAction::Quit,
+                "no chip may dispatch Quit while a manager overlay owns `q`"
+            );
+            assert_ne!(
+                chip.action,
+                KeyAction::OpenThemePicker,
+                "no chip may dispatch OpenThemePicker while a manager overlay owns `t`"
+            );
+            assert_ne!(
+                chip.action,
+                KeyAction::ToggleHelp,
+                "no chip may dispatch ToggleHelp while a manager overlay owns `?`"
+            );
+        }
+        let row: String = (0..90)
+            .map(|x| term.backend().buffer().cell((x, 0)).unwrap().symbol())
+            .collect();
+        assert!(
+            row.contains("close"),
+            "q chip should say close while an overlay is open: {row:?}"
+        );
+        assert!(
+            !row.contains("quit"),
+            "q chip should not say quit while an overlay is open: {row:?}"
+        );
+    }
+
+    #[test]
+    fn footer_q_t_help_chips_are_not_clickable_when_an_approval_is_pending() {
+        // Regression: `has_open_overlay()` deliberately excludes `approval`
+        // (it's a separate gating layer with its own routing — see its doc
+        // comment), so a pending approval alone must still gate these chips.
+        // Keyboard input has a dedicated `state.approval.is_some()` arm ahead
+        // of general key dispatch that routes every key to `approval_key`;
+        // a footer-chip click bypasses that dispatch entirely and would
+        // otherwise silently discard the pending approval (or, for `q`, tear
+        // the app down without ever recording a verdict).
+        use crate::app::PendingApproval;
+        use crate::ui::approval::{ApprovalChoice, ApprovalRequest};
+        use crate::ui::theme::Theme;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let theme = Theme::from_name("default-dark");
+        let mut state = AppState::new("t".into(), "default-dark".into());
+        state.approval = Some(PendingApproval {
+            req: ApprovalRequest::new("run it", vec!["echo hi".into()]),
+            choice: ApprovalChoice::default(),
+            name: "tool".into(),
+            arguments: serde_json::Value::Null,
+        });
+        assert!(!state.has_open_overlay());
+
+        let backend = TestBackend::new(90, 1);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut chips = Vec::new();
+        term.draw(|f| chips = draw_footer(f, f.area(), &state, &theme))
+            .unwrap();
+
+        for chip in &chips {
+            assert_ne!(
+                chip.action,
+                KeyAction::Quit,
+                "no chip may dispatch Quit while an approval is pending"
+            );
+            assert_ne!(
+                chip.action,
+                KeyAction::OpenThemePicker,
+                "no chip may dispatch OpenThemePicker while an approval is pending"
+            );
+            assert_ne!(
+                chip.action,
+                KeyAction::ToggleHelp,
+                "no chip may dispatch ToggleHelp while an approval is pending"
+            );
+        }
+    }
+
+    #[test]
+    fn observe_guided_action_chips_are_hidden_while_an_overlay_or_approval_owns_input() {
+        // Regression: the w/e/d/u/i/l/s/b Observe-tab hotkey chips are the one
+        // footer group that used to be pushed unconditionally, unlike every
+        // other chip this file gates. A real w/e/d/u/i/l/s/b keypress can
+        // never reach an `Open*` action while a manager overlay or a pending
+        // approval owns the event loop (same reachability argument as the
+        // q/t/? chips above) — but every `Open*` handler starts with
+        // `close_overlays()`, which would silently discard whatever was open
+        // (including an approval, with no verdict ever recorded) if a click
+        // on one of these chips reached it anyway.
+        use crate::app::PendingApproval;
+        use crate::ui::approval::{ApprovalChoice, ApprovalRequest};
+        use crate::ui::services_manager::ServicesManagerState;
+        use crate::ui::theme::Theme;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let theme = Theme::from_name("default-dark");
+        let open_actions = [
+            KeyAction::OpenServeWizard,
+            KeyAction::OpenEngineManager,
+            KeyAction::OpenExamine,
+            KeyAction::OpenUpdate,
+            KeyAction::OpenInstall,
+            KeyAction::OpenLogs,
+            KeyAction::OpenServices,
+            KeyAction::OpenBenchRun,
+        ];
+        let assert_no_open_chip = |state: &AppState, why: &str| {
+            let backend = TestBackend::new(160, 1);
+            let mut term = Terminal::new(backend).unwrap();
+            let mut chips = Vec::new();
+            term.draw(|f| chips = draw_footer(f, f.area(), state, &theme))
+                .unwrap();
+            for chip in &chips {
+                assert!(
+                    !open_actions.contains(&chip.action),
+                    "no chip may dispatch {:?} {why}",
+                    chip.action
+                );
+            }
+        };
+
+        let mut overlay_state = AppState::new("t".into(), "default-dark".into());
+        overlay_state.active_tab = ActiveTab::Observe;
+        overlay_state.services = Some(ServicesManagerState::default());
+        assert!(overlay_state.has_open_overlay());
+        assert_no_open_chip(&overlay_state, "while a manager overlay is open");
+
+        let mut approval_state = AppState::new("t".into(), "default-dark".into());
+        approval_state.active_tab = ActiveTab::Observe;
+        approval_state.approval = Some(PendingApproval {
+            req: ApprovalRequest::new("run it", vec!["echo hi".into()]),
+            choice: ApprovalChoice::default(),
+            name: "tool".into(),
+            arguments: serde_json::Value::Null,
+        });
+        assert!(!approval_state.has_open_overlay());
+        assert_no_open_chip(&approval_state, "while an approval is pending");
+
+        let mut idle_state = AppState::new("t".into(), "default-dark".into());
+        idle_state.active_tab = ActiveTab::Observe;
+        let backend = TestBackend::new(160, 1);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut chips = Vec::new();
+        term.draw(|f| chips = draw_footer(f, f.area(), &idle_state, &theme))
+            .unwrap();
+        for action in open_actions {
+            assert!(
+                chips.iter().any(|c| c.action == action),
+                "{action:?} chip must still be clickable on an idle Observe tab"
+            );
+        }
+    }
+
+    #[test]
+    fn footer_t_help_chips_are_not_clickable_while_a_plain_modal_is_open() {
+        // Regression: `OpenThemePicker`/`ToggleHelp` both call `close_overlays()`
+        // then unconditionally overwrite `state.modal` (`open_theme_picker`,
+        // and `ToggleHelp`'s handler) — but neither `has_open_overlay()` nor
+        // `approval_pending()` is true while a plain `Modal::*` (e.g. Detail)
+        // is open, so before this fix these chips stayed clickable and a click
+        // would silently replace the open modal with ThemePicker/Help, which a
+        // real keypress there can't do (`handle_key`'s `Modal::Detail` arm maps
+        // `?` to `CloseModal` and doesn't match `t` at all).
+        use crate::ui::theme::Theme;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let theme = Theme::from_name("default-dark");
+        let mut state = AppState::new("t".into(), "default-dark".into());
+        state.modal = Modal::Detail;
+        assert!(!state.has_open_overlay() && !state.approval_pending());
+
+        let backend = TestBackend::new(90, 1);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut chips = Vec::new();
+        term.draw(|f| chips = draw_footer(f, f.area(), &state, &theme))
+            .unwrap();
+
+        for chip in &chips {
+            assert_ne!(
+                chip.action,
+                KeyAction::OpenThemePicker,
+                "no chip may dispatch OpenThemePicker while a plain modal is open"
+            );
+            assert_ne!(
+                chip.action,
+                KeyAction::ToggleHelp,
+                "no chip may dispatch ToggleHelp while a plain modal is open"
+            );
+            assert!(
+                !matches!(chip.action, KeyAction::SwitchTab(_)),
+                "no chip may dispatch SwitchTab while a plain modal is open \
+                 (Modal::Detail doesn't remap Tab at all, so a real Tab \
+                 keypress there is swallowed as Nothing)"
+            );
+        }
+        // `q` is unaffected: every modal arm already maps a real `q` to `Quit`
+        // (see `handle_key`), so the chip must stay clickable and correctly
+        // labeled, not silently fall back to the overlay's "close" label.
+        assert!(
+            chips.iter().any(|c| c.action == KeyAction::Quit),
+            "q chip must still dispatch Quit while only a plain modal is open"
+        );
+    }
+
+    #[test]
+    fn observe_guided_action_chips_are_hidden_while_a_plain_modal_is_open() {
+        // Regression: `observe_guided_action_chips_are_hidden_while_an_overlay_or_approval_owns_input`
+        // only covered the manager-overlay and pending-approval cases, missing
+        // a plain `Modal::*` (e.g. `Detail`) — every modal arm in `handle_key`
+        // fully returns before the w/e/d/u/i/l/s/b match, so a real keypress
+        // never reaches an `Open*` action there either, but before this fix
+        // the chips stayed clickable and their `Open*` handler's
+        // `close_overlays()` would silently discard the open modal.
+        use crate::ui::theme::Theme;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let theme = Theme::from_name("default-dark");
+        let open_actions = [
+            KeyAction::OpenServeWizard,
+            KeyAction::OpenEngineManager,
+            KeyAction::OpenExamine,
+            KeyAction::OpenUpdate,
+            KeyAction::OpenInstall,
+            KeyAction::OpenLogs,
+            KeyAction::OpenServices,
+            KeyAction::OpenBenchRun,
+        ];
+
+        let mut state = AppState::new("t".into(), "default-dark".into());
+        state.active_tab = ActiveTab::Observe;
+        state.modal = Modal::Detail;
+        assert!(!state.has_open_overlay() && !state.approval_pending());
+
+        let backend = TestBackend::new(160, 1);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut chips = Vec::new();
+        term.draw(|f| chips = draw_footer(f, f.area(), &state, &theme))
+            .unwrap();
+        for chip in &chips {
+            assert!(
+                !open_actions.contains(&chip.action),
+                "no chip may dispatch {:?} while a plain modal is open",
+                chip.action
+            );
+        }
+    }
+
+    #[test]
+    fn footer_global_hotkey_chips_are_not_clickable_while_chat_is_focused() {
+        // Regression: focused chat text entry consumes every `Char` key
+        // (including `t`/`?`/`q`, and — via the catch-all `_ => Nothing` arm —
+        // `Tab`) as ordinary input, never as a global hotkey (see
+        // `handle_key`'s `chat.focused` branch). Before this fix, `Tab`/`t`/`?`
+        // stayed clickable while composing a chat message, and clicking them
+        // would switch tabs or open the theme picker / help overlay out from
+        // under the user mid-sentence — something no keystroke there could do.
+        use crate::ui::theme::Theme;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let theme = Theme::from_name("default-dark");
+        let mut state = AppState::new("t".into(), "default-dark".into());
+        state.active_tab = ActiveTab::Chat;
+        state.chat_consent = ChatConsent::Accepted;
+        state.chat_focused = true;
+
+        let backend = TestBackend::new(90, 1);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut chips = Vec::new();
+        term.draw(|f| chips = draw_footer(f, f.area(), &state, &theme))
+            .unwrap();
+
+        for chip in &chips {
+            assert!(
+                !matches!(
+                    chip.action,
+                    KeyAction::SwitchTab(_)
+                        | KeyAction::OpenThemePicker
+                        | KeyAction::ToggleHelp
+                        | KeyAction::Quit
+                ),
+                "no chip may dispatch {:?} while chat is focused",
+                chip.action
+            );
+        }
+        // `q`'s label stays "quit" here (unlike the overlay/approval case,
+        // there is no overlay to "close" while merely typing) even though the
+        // chip itself is non-clickable.
+        let row: String = (0..90)
+            .map(|x| term.backend().buffer().cell((x, 0)).unwrap().symbol())
+            .collect();
+        assert!(
+            row.contains("quit"),
+            "q chip should still say quit while chat is focused: {row:?}"
+        );
+        assert!(
+            !row.contains("close"),
+            "q chip should not say close while chat is focused (no overlay to close): {row:?}"
+        );
+    }
+
+    #[test]
+    fn footer_replay_chips_are_not_clickable_while_an_overlay_or_modal_owns_input() {
+        // Same reachability argument as the Tab/t/?/q chips: a real
+        // Space/+/- keypress only reaches `ReplayTogglePause`/`ReplaySpeedUp`
+        // when nothing else owns the key first.
+        use crate::app::ReplayState;
+        use crate::replay::ReplayController;
+        use crate::ui::services_manager::ServicesManagerState;
+        use crate::ui::theme::Theme;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let theme = Theme::from_name("default-dark");
+        let replay_actions = [KeyAction::ReplayTogglePause, KeyAction::ReplaySpeedUp];
+        let assert_no_replay_chip = |state: &AppState, why: &str| {
+            let backend = TestBackend::new(90, 1);
+            let mut term = Terminal::new(backend).unwrap();
+            let mut chips = Vec::new();
+            term.draw(|f| chips = draw_footer(f, f.area(), state, &theme))
+                .unwrap();
+            for chip in &chips {
+                assert!(
+                    !replay_actions.contains(&chip.action),
+                    "no chip may dispatch {:?} {why}",
+                    chip.action
+                );
+            }
+        };
+
+        let mut overlay_state = AppState::new("t".into(), "default-dark".into());
+        overlay_state.replay = Some(ReplayState::new(ReplayController::for_test()));
+        overlay_state.services = Some(ServicesManagerState::default());
+        assert!(overlay_state.has_open_overlay());
+        assert_no_replay_chip(&overlay_state, "while a manager overlay is open");
+
+        let mut modal_state = AppState::new("t".into(), "default-dark".into());
+        modal_state.replay = Some(ReplayState::new(ReplayController::for_test()));
+        modal_state.modal = Modal::Detail;
+        assert_no_replay_chip(&modal_state, "while a plain modal is open");
+
+        let mut idle_state = AppState::new("t".into(), "default-dark".into());
+        idle_state.replay = Some(ReplayState::new(ReplayController::for_test()));
+        let backend = TestBackend::new(90, 1);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut chips = Vec::new();
+        term.draw(|f| chips = draw_footer(f, f.area(), &idle_state, &theme))
+            .unwrap();
+        for action in replay_actions {
+            assert!(
+                chips.iter().any(|c| c.action == action),
+                "{action:?} chip must still be clickable while idle and replaying"
+            );
+        }
+    }
+
+    /// The wash `grey_overlay` paints behind an open overlay (see
+    /// `modal::grey_overlay`'s own `grey_overlay_dims_every_cell` test for the
+    /// exact color); these tests only check that `draw`/`draw_focused` actually
+    /// invoke it at their three call sites, not the wash's own correctness.
+    const OVERLAY_WASH: ratatui::style::Color = ratatui::style::Color::Rgb(0x1c, 0x1e, 0x22);
+
+    #[test]
+    fn draw_dims_periphery_with_grey_overlay_behind_manager_overlay() {
+        // Covers `draw`'s manager-overlay `grey_overlay(f)` call (the
+        // `has_open_overlay()` branch, not the approval one).
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut state = AppState::new("t".into(), "default-dark".into());
+        state.services = Some(crate::ui::services_manager::ServicesManagerState::default());
+        assert!(state.has_open_overlay());
+
+        let mut term = Terminal::new(TestBackend::new(160, 48)).unwrap();
+        term.draw(|f| draw(f, &mut state)).unwrap();
+        let corner = term.backend().buffer().cell((0, 0)).unwrap();
+        assert_eq!(
+            corner.style().bg,
+            Some(OVERLAY_WASH),
+            "corner cell must carry grey_overlay's wash bg while a manager overlay is open"
+        );
+    }
+
+    #[test]
+    fn draw_dims_periphery_with_grey_overlay_behind_approval_modal() {
+        // Covers `draw`'s approval-modal `grey_overlay(f)` call, distinct from
+        // the manager-overlay one above (`state.approval` is `Some` with no
+        // manager open).
+        use crate::app::PendingApproval;
+        use crate::ui::approval::{ApprovalChoice, ApprovalRequest};
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut state = AppState::new("t".into(), "default-dark".into());
+        state.approval = Some(PendingApproval {
+            req: ApprovalRequest::new("run it", vec!["echo hi".into()]),
+            choice: ApprovalChoice::default(),
+            name: "tool".into(),
+            arguments: serde_json::Value::Null,
+        });
+        assert!(!state.has_open_overlay());
+
+        let mut term = Terminal::new(TestBackend::new(160, 48)).unwrap();
+        term.draw(|f| draw(f, &mut state)).unwrap();
+        let corner = term.backend().buffer().cell((0, 0)).unwrap();
+        assert_eq!(
+            corner.style().bg,
+            Some(OVERLAY_WASH),
+            "corner cell must carry grey_overlay's wash bg while the approval modal is open"
+        );
+    }
+
+    #[test]
+    fn draw_focused_dims_periphery_with_grey_overlay_behind_manager_overlay() {
+        // Covers `draw_focused`'s own `grey_overlay(f)` call — a separate
+        // renderer from `draw`, previously skipping the wash entirely for the
+        // bare-launcher focused-host path.
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut state = AppState::new("t".into(), "default-dark".into());
+        state.services = Some(crate::ui::services_manager::ServicesManagerState::default());
+        assert!(state.has_open_overlay());
+
+        let mut term = Terminal::new(TestBackend::new(160, 48)).unwrap();
+        term.draw(|f| draw_focused(f, &mut state)).unwrap();
+        let corner = term.backend().buffer().cell((0, 0)).unwrap();
+        assert_eq!(
+            corner.style().bg,
+            Some(OVERLAY_WASH),
+            "corner cell must carry grey_overlay's wash bg in the focused-host renderer too"
+        );
+    }
+
+    #[test]
+    fn draw_focused_renders_the_quit_confirm_prompt_when_open() {
+        // No focused path opens `quit_confirm` today (`actions::request_quit`'s
+        // own doc comment), but `draw_focused` must still render it if one
+        // ever does — otherwise a future focused path would open an
+        // invisible, key-eating prompt instead of a visible one. Paired with
+        // `focused_should_exit_stays_shut_while_quit_confirm_is_pending`
+        // (`app::event_loop` tests), which covers the exit-gate half of the
+        // same guarantee. Mirrors `launcher_renders_the_quit_confirm_prompt_when_open`
+        // in `ui::launcher`, the same regression for that renderer.
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut state = AppState::new("t".into(), "default-dark".into());
+        state.open_quit_confirm();
+
+        let mut term = Terminal::new(TestBackend::new(160, 48)).unwrap();
+        term.draw(|f| draw_focused(f, &mut state)).unwrap();
+        let painted: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            painted.contains("quit"),
+            "the focused-host renderer must render the quit-confirm prompt: {painted:?}"
+        );
     }
 }

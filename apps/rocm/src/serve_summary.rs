@@ -18,12 +18,8 @@
 //! exact, approximated, or `n/a`).
 
 use std::fmt::Write as _;
-use std::io::{IsTerminal, Write};
 use std::time::{Duration, Instant};
 
-use crossterm::QueueableCommand;
-use crossterm::cursor::MoveToColumn;
-use crossterm::terminal::{Clear, ClearType};
 use rocm_core::AppPaths;
 
 use crate::providers::{self, ChatMessage, ChatRequest, ProviderStreamEvent};
@@ -33,8 +29,6 @@ use crate::providers::{self, ChatMessage, ChatRequest, ProviderStreamEvent};
 const SMOKE_PROMPT: &str = "Reply with a short one-sentence greeting.";
 /// Cap the smoke-test generation so a slow or verbose model cannot stall startup.
 const SMOKE_MAX_TOKENS: u32 = 32;
-/// Braille spinner frames (matching the dashboard's visual language).
-const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// Best-effort metrics measured against a freshly-started server. Every field is
 /// optional: any probe failure leaves it `None` and the summary renders `n/a`.
@@ -138,7 +132,10 @@ pub(crate) fn render_summary(summary: &DeploymentSummary) -> String {
             ("time to first token", format_ttft(summary.metrics.ttft)),
             ("throughput (approx)", format_tps(summary.metrics.gen_tps)),
             ("service", summary.service_id.clone()),
-            ("stop", format!("rocm services stop {}", summary.service_id)),
+            (
+                "stop",
+                crate::service_hints::service_stop_hint(&summary.service_id),
+            ),
             (
                 "logs",
                 format!("rocm logs --service {}", summary.service_id),
@@ -162,7 +159,7 @@ pub(crate) fn render_summary(summary: &DeploymentSummary) -> String {
         let _ = writeln!(out, "  api key: {api_key}");
         let _ = writeln!(
             out,
-            "  note: this key is shown only now — clients must send `Authorization: Bearer <key>`"
+            "  note: this key is shown only now - clients must send `Authorization: Bearer <key>`"
         );
     }
     if !ready && !summary.already_running {
@@ -178,7 +175,7 @@ pub(crate) fn render_summary(summary: &DeploymentSummary) -> String {
         };
         let _ = writeln!(
             out,
-            "  note: {explanation} — check `rocm logs --service {}` or `rocm services list`",
+            "  note: {explanation} - check `rocm logs --service {}` or `rocm services list`",
             summary.service_id
         );
     }
@@ -200,6 +197,8 @@ pub(crate) fn run_smoke_test(paths: &AppPaths, api_model: &str) -> SmokeMetrics 
             content: SMOKE_PROMPT.to_owned(),
         }],
         max_tokens: Some(SMOKE_MAX_TOKENS),
+        temperature: None,
+        top_p: None,
         rocm_tools: false,
     };
 
@@ -254,63 +253,6 @@ fn compute_metrics(
     SmokeMetrics { ttft, gen_tps }
 }
 
-/// A carriage-return status indicator written to stderr. Disabled (a no-op) when
-/// stderr is not a TTY, so piped/redirected output never receives control
-/// characters. Keeps stdout clean for the summary table.
-pub(crate) struct Spinner {
-    enabled: bool,
-    idx: usize,
-    label: String,
-    active: bool,
-}
-
-impl Spinner {
-    pub(crate) fn new(label: impl Into<String>) -> Self {
-        Self {
-            enabled: std::io::stderr().is_terminal(),
-            idx: 0,
-            label: label.into(),
-            active: false,
-        }
-    }
-
-    /// Change the message shown next to the spinner (e.g. "Running smoke test…").
-    pub(crate) fn set_label(&mut self, label: impl Into<String>) {
-        self.label = label.into();
-        self.render_current();
-    }
-
-    /// Advance to the next animation frame and repaint.
-    pub(crate) fn tick(&mut self) {
-        self.idx = self.idx.wrapping_add(1);
-        self.render_current();
-    }
-
-    fn render_current(&mut self) {
-        if !self.enabled {
-            return;
-        }
-        let frame = SPINNER_FRAMES[self.idx % SPINNER_FRAMES.len()];
-        let mut err = std::io::stderr();
-        let _ = err.queue(MoveToColumn(0));
-        let _ = err.queue(Clear(ClearType::CurrentLine));
-        let _ = write!(err, "{frame} {}", self.label);
-        let _ = err.flush();
-        self.active = true;
-    }
-
-    /// Erase the spinner line so the summary table starts on a clean line.
-    pub(crate) fn clear(&mut self) {
-        if self.enabled && self.active {
-            let mut err = std::io::stderr();
-            let _ = err.queue(MoveToColumn(0));
-            let _ = err.queue(Clear(ClearType::CurrentLine));
-            let _ = err.flush();
-            self.active = false;
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,7 +298,16 @@ mod tests {
         assert!(rendered.contains("Qwen/Qwen2.5-7B-Instruct"));
         assert!(rendered.contains("180 ms"));
         assert!(rendered.contains("42.1 tok/s"));
-        assert!(rendered.contains("rocm services stop vllm-qwen-1720000000"));
+        // The printed hint must be the exact, directly-runnable command: `main.rs`'s
+        // `service_actions_require_yes_and_render_sandbox_result` proves this exact
+        // form (`rocm services stop <id> --yes`) is the one the approval gate itself
+        // recommends. That running this form actually stops the service is proven
+        // by `@id:service-stop-yes-stops-a-running-service`
+        // (`tests/e2e-cucumber/features/service_stop.feature`), which plants a
+        // running record and asserts it is left `stopped` — not by
+        // `stop_managed_services` in `tests/e2e-cucumber/tests/e2e.rs`, which runs
+        // this same invocation as best-effort teardown and never asserts success.
+        assert!(rendered.contains("rocm services stop vllm-qwen-1720000000 --yes"));
     }
 
     #[test]

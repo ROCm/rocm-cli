@@ -29,6 +29,17 @@ on:
         options: [all, mock]
         # No tier input: the harness resolves pass/xfail/skip per scenario, so a
         # platform runs one job covering everything applicable to it.
+      # Opt a dispatch into building the same downloadable Linux + Windows PR
+      # bundles a pull_request push produces (see pr-linux-binaries and the PR
+      # bundle steps on windows-build-and-test), without needing an open PR.
+      # On the Windows job this also runs the full 45min build/test/lifecycle
+      # suite, not just the packaging steps -- `heavy` is forced true on any
+      # dispatch, so every heavy-gated step in that job runs, same as it would
+      # on a PR push.
+      build_binaries:
+        description: "Also build downloadable PR-style binaries (Linux + Windows)"
+        type: boolean
+        default: false
 
 concurrency:
   # Manual dispatches get a UNIQUE group (run_id) so a stuck run never holds the
@@ -49,6 +60,14 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
+# Every job sets `timeout-minutes`. GitHub's default is 360, so a step that hangs
+# rather than fails — an `apt-get` against an unresponsive mirror, a network call
+# with no timeout — holds a runner for six hours and, in the merge queue, stalls
+# every queued PR behind it with no signal that anything is wrong. The values here
+# are deliberately loose (roughly 4x the observed p100, which is under 3 min for
+# most jobs and ~13 min for the Windows build) so they never fire on a merely slow
+# run; they exist to convert a silent multi-hour stall into a prompt, legible
+# failure. Raise a value if a job legitimately grows into it.
 jobs:
   # Decide which file categories a change touches so unaffected jobs can skip
   # their expensive work. Filtering runs ONLY on pull_request; on push and in the
@@ -59,6 +78,7 @@ jobs:
   # `.github/workflows/**`, so any change to CI itself triggers a full run.
   changes:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     # paths-filter reads the PR's changed-file list from the API on
     # pull_request events; that needs pull-requests:read on top of the
     # workflow-wide contents:read (job-level permissions replace the default
@@ -73,13 +93,15 @@ jobs:
       heavy: ${{ steps.filter.outputs.heavy || steps.all.outputs.forced }}
       lint: ${{ steps.filter.outputs.lint || steps.all.outputs.forced }}
       tpn: ${{ steps.filter.outputs.tpn || steps.all.outputs.forced }}
+      docs: ${{ steps.filter.outputs.docs || steps.all.outputs.forced }}
+      skills: ${{ steps.filter.outputs.skills || steps.all.outputs.forced }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Filter changed paths (pull requests only)
         id: filter
         if: github.event_name == 'pull_request'
-        uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4.0.2
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         with:
           filters: |
             # Rust-only checks (fmt, clippy, coverage).
@@ -88,11 +110,42 @@ jobs:
               - '**/Cargo.toml'
               - 'Cargo.lock'
               - 'rust-toolchain*'
-              # clippy runs `cargo xtask manifest --check` against this file.
+              # clippy runs `cargo xtask manifest --check` against this file;
+              # pinned_tool_versions_match_across_docs_and_workflows (xtask)
+              # also reads its cargo-about pin.
               - 'MANIFEST.md'
+              # The committed per-crate coverage floors. Listed so that lowering
+              # a floor re-runs the gate that floor controls, instead of being
+              # the one edit the coverage job never sees.
+              - 'coverage-floors.toml'
               # rocm-deps compiles the pins into constants, so a pin change is a
               # source change even though no *.rs file moved.
               - 'runtime-deps.toml'
+              # pinned_tool_versions_match_across_docs_and_workflows (xtask) reads
+              # this file's hawkeye/cargo-about pins. This entry only gates
+              # whether the rust-flagged jobs run at all; `cargo xtask affected`
+              # treats Markdown as ignorable by default and would otherwise skip
+              # the `Test (nextest)` step for a pin-only edit here (the coverage
+              # job isn't affected-narrowed, so it alone would still catch a
+              # drift, but invisibly). CONTRIBUTING.md is listed in
+              # `forces_full_workspace` (xtask/src/affected.rs) for the same
+              # reason MANIFEST.md already is, so nextest runs too.
+              - 'CONTRIBUTING.md'
+              # hardware_testing_docs_cover_all_self_hosted_platforms (xtask)
+              # reads this file and the one below it; same
+              # `Selection::Empty`/invisible-coverage gap as CONTRIBUTING.md
+              # above, so both are in `forces_full_workspace` too and need the
+              # same rust-filter entry. tests/e2e-cucumber/README.md also
+              # matches `heavy` below, so the Windows lane's full workspace
+              # run backstops this entry on its own; it's listed here anyway
+              # so the Linux `test` job (which is `rust`-gated, not
+              # `heavy`-gated) doesn't silently skip the test that reads it.
+              - 'docs/ci-hardware-testing.md'
+              - 'tests/e2e-cucumber/README.md'
+              # license_headers_hook_has_no_file_type_filter (xtask) reads this
+              # file's license-headers hook config; an edit here that reopens the
+              # file-type-filter gap must still run that test on the PR.
+              - '.pre-commit-config.yaml'
               - '.github/workflows/**'
             # build-and-test runs cargo AND the python/shell smoke steps plus the
             # install-lifecycle E2E (`cargo xtask package` + the real installer),
@@ -112,6 +165,14 @@ jobs:
               - '**/*.ps1'
               - '**/*.feature'
               - 'tests/e2e-cucumber/**'
+              # The containerised control-channel lane; its Dockerfile matches
+              # none of the extension globs above.
+              - 'tests/remote-ssh/**'
+              # skills/rocm-doctor/reference.md is an e2e FIXTURE: the
+              # rocm_doctor_skill.feature scenarios parse its catalog table and
+              # compare it to `rocm fix`. A skill-only edit must therefore run
+              # the E2E job, which gates on `heavy`.
+              - 'skills/**'
               - 'install*'
               # Pinned-key consistency compares docs/keys/* against the installers,
               # so a canonical-key-only change must trigger the heavy job that runs
@@ -139,6 +200,25 @@ jobs:
               - 'ruff.toml'
               - 'PSScriptAnalyzerSettings.psd1'
               - '.github/workflows/**'
+            # Sphinx docs site: the doc sources themselves, plus README.md,
+            # CONTRIBUTING.md, docs/vllm.md and docs/wsl.md, which pages
+            # single-source via MyST `{include}` directives, plus the build
+            # config/toolchain pins.
+            docs:
+              - 'docs/rocm-docs/**'
+              - 'README.md'
+              - 'CONTRIBUTING.md'
+              - 'docs/vllm.md'
+              - 'docs/wsl.md'
+              - '.readthedocs.yaml'
+              - '.github/workflows/**'
+
+            # Published Agent Skills, graded by skillscope. The dataset and the
+            # skill's prose are one unit — a prompt can stop matching because the
+            # description changed — so any edit under skills/ re-runs the check.
+            skills:
+              - 'skills/**'
+              - '.github/workflows/**'
 
       - name: Force full run off pull requests
         id: all
@@ -153,9 +233,10 @@ jobs:
   xfail-hint:
     name: Stale xfail hint (advisory)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     if: github.event_name == 'pull_request'
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Need the PR range to read its commit messages.
           fetch-depth: 0
@@ -176,6 +257,53 @@ jobs:
 
   build-and-test:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # sccache caches each rustc invocation (keyed by source + deps + flags) in an
+    # Azure blob container, so unchanged workspace crates are restored instead of
+    # recompiled across runs. It layers on top of setup-rust-toolchain's rust-cache,
+    # which restores the registry and dependency target/ but deliberately does not
+    # cache workspace crates — the bulk of the build time here. rust-cache also sets
+    # CARGO_INCREMENTAL=0 (which sccache requires) for these steps.
+    #
+    # The backend is Azure rather than the GitHub Actions cache because the GHA
+    # cache is capped at 10 GB per repository and this repo already sits at that
+    # ceiling: rust-cache's per-job lanes (two OSes, several jobs) fill it, so
+    # GitHub continuously evicts least-recently-used entries. sccache adds
+    # thousands of small per-artifact entries on top of that, which under a full
+    # cache are evicted before the next run reads them — leaving the cold-cache
+    # penalty (a populating run compiles everything twice over) without the warm
+    # benefit. An external store has no such cap, so entries survive between runs
+    # — but nothing evicts them either: SCCACHE_CACHE_SIZE bounds only sccache's
+    # local disk cache, never a cloud backend. Retention is therefore the
+    # container's responsibility and has to come from a blob lifecycle rule
+    # (expire entries untouched for N days), not from anything in this workflow.
+    #
+    # Only trusted events populate the cache. Every branch a contributor can push
+    # receives the credential on its pull_request run, and a shared cache that
+    # such a run may write to is a code-execution path into a later main build:
+    # keys are derived from the compiler, source and flags, so anyone holding the
+    # credential can compute the key a trusted build will look up and store an
+    # arbitrary artifact under it. Limiting writes to push and merge_group leaves
+    # only main and the merge queue able to populate, while pull requests keep the
+    # full read-side speedup — which is where the measured gain comes from anyway.
+    # READ_ONLY also short-circuits the write half of sccache's startup store
+    # check, so the probe below behaves identically on pull requests.
+    #
+    # RUSTC_WRAPPER is set unconditionally rather than only when the backend is
+    # reachable: rust-cache hashes every environment variable starting with
+    # "RUST" into its cache key, so a wrapper that comes and goes would change
+    # that key and force a full cold dependency rebuild on the run after any
+    # backend hiccup. Keeping it constant makes the probe below turn the *remote*
+    # backend off (leaving sccache on its local disk cache, which always starts)
+    # instead of the wrapper itself.
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_AZURE_CONNECTION_STRING: ${{ secrets.CACHE_AZURE_CONNECTION_STRING }}
+      SCCACHE_AZURE_BLOB_CONTAINER: cache
+      # Namespaced so the Linux and Windows lanes cannot collide, and so the
+      # container stays legible if it is ever shared with another consumer.
+      SCCACHE_AZURE_KEY_PREFIX: rocm-cli/build-and-test
+      SCCACHE_AZURE_RW_MODE: ${{ (github.event_name == 'push' || github.event_name == 'merge_group') && 'READ_WRITE' || 'READ_ONLY' }}
     # Don't spend per-OS build/test cycles unless the cheap lint gate is green.
     needs: [changes, clippy, prek]
     # A manual E2E dispatch skips this heavy job for a fast loop; the E2E jobs
@@ -187,6 +315,75 @@ jobs:
       - name: Install native build deps
         if: needs.changes.outputs.heavy == 'true'
         run: sudo apt-get update && sudo apt-get install -y pkg-config libcap-dev
+
+      # Installs the sccache binary. Both this and the probe below run BEFORE
+      # setup-rust-toolchain, because its rust-cache step runs `cargo metadata`,
+      # which honours RUSTC_WRAPPER — the wrapper must be resolvable by then.
+      # `version` is pinned: the action defaults to whatever the latest sccache
+      # release happens to be, which would let the compiler wrapper float.
+      #
+      # continue-on-error, because RUSTC_WRAPPER is set for the whole job: if the
+      # download fails (a release blip, a checksum mismatch) the probe below
+      # notices the missing binary and clears the wrapper, rather than the job
+      # dying on an unavailable cache.
+      - name: Set up sccache
+        if: needs.changes.outputs.heavy == 'true'
+        continue-on-error: true
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.17.0
+
+      # Keep the remote backend only if it actually answers.
+      #
+      # sccache verifies the store when its server starts: it reads a probe
+      # object and, for anything other than "not found" or a rate limit, aborts
+      # with a non-zero exit. That aborted startup surfaces as a failure of the
+      # first cargo invocation, so a missing, expired, or rotated credential
+      # would take down every compile-heavy required check at once — turning a
+      # caching problem into a merge-blocking outage.
+      #
+      # Starting the server here converts that into a soft failure. On any
+      # problem the Azure variables are blanked for later steps, which leaves
+      # sccache running against its local disk cache: still a valid wrapper (so
+      # the rust-cache key stays put) that always starts, just without cross-run
+      # reuse. Pull requests from forks get empty secrets and take the same path,
+      # since sccache treats an empty value as unset.
+      #
+      # Bumping the pinned sccache version above means re-verifying the four
+      # degradation paths this handles (no binary, absent credential, invalid
+      # credential, unreachable backend). Validating the store at server startup
+      # is v0.17.0 behaviour, not a documented contract: a release that validated
+      # lazily instead would turn this step into a silent no-op and move the
+      # hard failure back onto the first cargo step, across three required checks.
+      - name: Probe sccache cache backend
+        id: sccache_probe
+        if: needs.changes.outputs.heavy == 'true'
+        run: |
+          disable() {
+            echo "SCCACHE_AZURE_CONNECTION_STRING=" >> "$GITHUB_ENV"
+            echo "SCCACHE_AZURE_BLOB_CONTAINER=" >> "$GITHUB_ENV"
+          }
+          if ! command -v sccache >/dev/null; then
+            echo "::warning::sccache is not installed; compiling without it."
+            echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
+            # Nothing will read the credential now; don't leave it in the job env.
+            disable
+            exit 0
+          fi
+          # sccache is the compiler wrapper from here on, remote backend or not,
+          # so there are statistics worth reporting either way.
+          echo "active=true" >> "$GITHUB_OUTPUT"
+          if [ -z "${SCCACHE_AZURE_CONNECTION_STRING}" ]; then
+            echo "::notice::No cache credential available (expected on forks); compiling without a shared cache."
+            disable
+            exit 0
+          fi
+          if ! sccache --start-server; then
+            echo "::warning::sccache could not reach the cache backend; compiling without a shared cache."
+            # Leave no half-started server behind for the cargo steps to find.
+            sccache --stop-server || true
+            disable
+          fi
 
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         if: needs.changes.outputs.heavy == 'true'
@@ -200,6 +397,18 @@ jobs:
         if: needs.changes.outputs.heavy == 'true'
         run: cargo build --workspace
 
+      # Surface the cache hit rate for the workspace compile so the effect is
+      # visible in the logs — including on the local-only path, where a fork PR
+      # still compiles through sccache and its hit rate is the only cache signal
+      # that run produces. Skipped only when the probe found no sccache to ask.
+      #
+      # The action registers a post-job show_stats step of its own, but that runs
+      # once at the end, after `cargo xtask` steps have added their own compiles;
+      # this one reports the workspace build alone. Keep both.
+      - name: sccache stats
+        if: needs.changes.outputs.heavy == 'true' && steps.sccache_probe.outputs.active == 'true'
+        run: sccache --show-stats
+
       - name: Local no-fallback smoke
         if: needs.changes.outputs.heavy == 'true'
         run: python scripts/smoke_local.py --skip-build
@@ -210,11 +419,26 @@ jobs:
           python scripts/comfyui_therock_gpu_test.py --self-test
           python scripts/local_assistant_therock_gpu_test.py --self-test
           python scripts/vllm_therock_gpu_test.py --self-test
-          python scripts/wsl_preflight.py --self-test
 
       - name: Portable WSL build deps self-test
         if: needs.changes.outputs.heavy == 'true'
         run: bash scripts/setup-wsl-portable-build-deps.sh --self-test
+
+      # Runs here, on the GitHub-hosted lane, rather than on the GPU runners the
+      # reclaim protects: the matching rules are what regress, and they are
+      # provable against decoy processes with no GPU present.
+      - name: GPU reclaim self-test
+        if: needs.changes.outputs.heavy == 'true'
+        # Twice, because one of the rules is conditional on the environment.
+        # The scenario root follows TMPDIR, and the self-test can only assert
+        # the redirected form when the shell running it actually has one — a
+        # hosted runner does not, so a single plain run reports that arm as
+        # "not exercised" and the nightly Strix lane's redirect would be the
+        # first place a break showed up. The second run supplies the redirect.
+        run: |
+          bash scripts/reclaim-gpu.sh --self-test
+          mkdir -p "${RUNNER_TEMP}/redirected-tmp"
+          TMPDIR="${RUNNER_TEMP}/redirected-tmp" bash scripts/reclaim-gpu.sh --self-test
 
       - name: Release readiness self-test
         if: needs.changes.outputs.heavy == 'true'
@@ -246,9 +470,18 @@ jobs:
   # (windows-build-and-test) also runs the whole workspace on every change, so it
   # backstops any crate a graph-based selection could miss (e.g. an integration
   # test that drives another crate only at runtime).
+  #
+  # This job is deliberately left off sccache, unlike the other compile-heavy
+  # jobs. On pull requests it compiles a crate subset, and a subset resolves Cargo
+  # features differently than the whole workspace — that changes the rustc command
+  # line, and so the cache key, for much of what it builds, which would therefore
+  # neither hit the build-and-test entries nor be reusable by them. It has its own
+  # rust-cache lane (`cache-key` above) for the same reason. Revisit if this job
+  # becomes a bottleneck.
   test:
     name: Test (affected crates)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     # Same lint gate as the OS build jobs: don't spend a test cycle until the
     # cheap checks are green.
     needs: [changes, clippy, prek]
@@ -277,7 +510,7 @@ jobs:
 
       - name: Install cargo-nextest
         if: needs.changes.outputs.rust == 'true'
-        uses: taiki-e/install-action@a6b2e2dcd845ddd7f509ce4f3ed3d922b80cc5d9 # v2.84.0
+        uses: taiki-e/install-action@fcf5432d9f50d67e37ee6e29bdb7a224ff67b4a7 # v2.86.8
         with:
           tool: nextest
 
@@ -305,47 +538,215 @@ jobs:
         # entries. The values are crate names from our own tool, not user input.
         run: cargo nextest run ${{ steps.sel.outputs.sel }}
 
+      - name: Test rocm-core with e2e-test-hooks
+        # The simulated-host-root tests (`hardware_root.rs`, and the planted-root
+        # probe tests in `examine.rs`) only exist with this feature, which no
+        # other unit-test, nextest or clippy invocation enables. Without this
+        # step they are not even compiled in CI, so a probe reverted to a raw
+        # path would pass everything automated. Runs only when rocm-core is in
+        # the affected selection (or the whole workspace is), since nothing
+        # outside the crate can change these results.
+        #
+        # This is a sample, not full coverage of the routed reads. The probe
+        # tests assert only the KFD topology (GPU node count and gfx target),
+        # `/dev/kfd` via `stat_device`, `/proc/version` and `/dev/dxg` via
+        # `is_wsl_host`, `/run/.containerenv` and `/proc/1/cgroup` via
+        # `probe_container`, and both `/etc/os-release` reads (the distro
+        # fields and the distro name, in
+        # `os_release_reads_follow_the_simulated_host_root` and, for the
+        # `/usr/lib/os-release` fallback, in
+        # `os_release_reads_fall_back_to_usr_lib_when_etc_is_absent`). The other routed
+        # reads (`/dev/dri`, `/sys/class/drm`, `/sys/module/amdgpu`, the other
+        # `/proc` files, the modprobe directories, the `/usr/lib/wsl/lib` and
+        # ROCDXG checks) have no planted-root unit assertion; they are covered
+        # end to end only by the follow-up's simulated-machine scenarios.
+        #
+        # nextest, like the step above, so each test is its own process: the
+        # planted-root test sets the root for the whole process while it runs,
+        # and under a threaded `cargo test` any other test probing the host in
+        # that window would read the simulated machine.
+        if: >-
+          needs.changes.outputs.rust == 'true'
+          && (steps.sel.outputs.sel == '--workspace'
+              || contains(format('{0} ', steps.sel.outputs.sel), '-p rocm-core '))
+        run: cargo nextest run --locked -p rocm-core --lib --features e2e-test-hooks
+
   windows-build-and-test:
     runs-on: windows-latest
+    timeout-minutes: 45
     env:
       CARGO_INCREMENTAL: "0"
+      # Cache each rustc invocation across runs; the full-workspace build is the
+      # dominant cost on this runner and rust-cache does not cache workspace
+      # crates. CARGO_INCREMENTAL=0 above is required for (and assumed by) sccache.
+      # See build-and-test for why the backend is Azure rather than the GitHub
+      # Actions cache, why the probe below disables the backend rather than the
+      # wrapper, why only push and merge_group may write, and why the container
+      # needs a lifecycle rule of its own.
+      RUSTC_WRAPPER: sccache
+      SCCACHE_AZURE_CONNECTION_STRING: ${{ secrets.CACHE_AZURE_CONNECTION_STRING }}
+      SCCACHE_AZURE_BLOB_CONTAINER: cache
+      SCCACHE_AZURE_KEY_PREFIX: rocm-cli/windows-build-and-test
+      SCCACHE_AZURE_RW_MODE: ${{ (github.event_name == 'push' || github.event_name == 'merge_group') && 'READ_WRITE' || 'READ_ONLY' }}
     # Don't spend per-OS build/test cycles unless the cheap lint gate is green.
     needs: [changes, clippy, prek]
-    # A manual E2E dispatch only exercises the E2E jobs; skip the rest.
-    if: github.event_name != 'workflow_dispatch'
+    # A manual E2E dispatch only exercises the E2E jobs; skip the rest — unless
+    # the dispatch explicitly asked for PR-style binaries, which this job's
+    # build step produces. `clippy`/`prek` are themselves always skipped on
+    # workflow_dispatch (their own `if:`), and a job whose `needs` were SKIPPED
+    # (not just failed) is skipped by default too — so without `!cancelled()`
+    # plus the explicit skipped-or-success checks below, `build_binaries: true`
+    # could never actually run this job. The success requirement is still
+    # enforced on every other trigger, where clippy/prek always run for real.
+    # `!cancelled()` rather than `always()`: this job (like pr-linux-binaries
+    # below) still needs to be cancelled when a new commit supersedes the run,
+    # per this workflow's `concurrency: cancel-in-progress: true`.
+    if: >-
+      !cancelled()
+      && needs.changes.result == 'success'
+      && (needs.clippy.result == 'success' || needs.clippy.result == 'skipped')
+      && (needs.prek.result == 'success' || needs.prek.result == 'skipped')
+      && (github.event_name != 'workflow_dispatch' || github.event.inputs.build_binaries == 'true')
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Installs sccache. Runs BEFORE setup-rust-toolchain, whose rust-cache step
+      # runs `cargo metadata` and honours RUSTC_WRAPPER. `version` is pinned so
+      # the compiler wrapper does not float with the latest sccache release.
+      # continue-on-error for the same reason as build-and-test: a failed install
+      # is handled by the probe, not by failing the job.
+      - name: Set up sccache
+        if: needs.changes.outputs.heavy == 'true'
+        continue-on-error: true
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.17.0
+
+      # Keep the remote backend only if it answers — see the equivalent step in
+      # build-and-test for why this is a probe, and why failure clears the Azure
+      # variables rather than the wrapper.
+      - name: Probe sccache cache backend
+        id: sccache_probe
+        if: needs.changes.outputs.heavy == 'true'
+        shell: pwsh
+        run: |
+          # This script decides whether to use the cache; a non-zero status from
+          # the commands it runs is an answer, not a job failure. Pin the native
+          # error preference off so a future runner default cannot turn a failed
+          # probe into a failed step.
+          $PSNativeCommandUseErrorActionPreference = $false
+          # Every Out-File below passes -Encoding utf8 explicitly. PowerShell 7
+          # (`shell: pwsh`) already defaults to UTF-8, but Windows PowerShell 5.1
+          # defaults to UTF-16LE, which the runner cannot parse — so an edit that
+          # switched this step to `shell: powershell` would silently corrupt the
+          # environment file rather than fail visibly.
+          function Disable-Backend {
+            "SCCACHE_AZURE_CONNECTION_STRING=" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            "SCCACHE_AZURE_BLOB_CONTAINER=" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          }
+          if (-not (Get-Command sccache -ErrorAction SilentlyContinue)) {
+            Write-Output "::warning::sccache is not installed; compiling without it."
+            "RUSTC_WRAPPER=" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            # Nothing will read the credential now; don't leave it in the job env.
+            Disable-Backend
+            exit 0
+          }
+          # sccache is the compiler wrapper from here on, remote backend or not,
+          # so there are statistics worth reporting either way.
+          "active=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          if (-not $env:SCCACHE_AZURE_CONNECTION_STRING) {
+            Write-Output "::notice::No cache credential available (expected on forks); compiling without a shared cache."
+            Disable-Backend
+            exit 0
+          }
+          sccache --start-server
+          if ($LASTEXITCODE -ne 0) {
+            Write-Output "::warning::sccache could not reach the cache backend; compiling without a shared cache."
+            # Leave no half-started server behind for the cargo steps to find.
+            sccache --stop-server *> $null
+            Disable-Backend
+          }
+          exit 0
 
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         if: needs.changes.outputs.heavy == 'true'
         with:
           cache-on-failure: true
 
+      # The `clippy` job runs on Linux only, so it compiles the `cfg(unix)` side
+      # of every platform conditional and never sees the `cfg(windows)` side.
+      # Windows-gated code was therefore outside the warnings-as-errors gate
+      # entirely — not merely under-linted — so a lint could land there and no
+      # check in the set could fail. This mirrors the two invocations the Linux
+      # `clippy` job runs; the second is separate because the `e2e` target sets
+      # `test = false`, so `--all-targets` does not build it.
+      #
+      # Runs before the build so a lint failure costs seconds rather than the
+      # full build/test/package cycle, matching why this job `needs: clippy`.
+      #
+      # One cargo command per step, here and in Build below: `shell: pwsh` does
+      # not stop on a failing native command, and the step's result is only the
+      # LAST command's exit code — so a second command that passes would turn a
+      # failing first one green.
+      - name: Clippy (Windows targets)
+        if: needs.changes.outputs.heavy == 'true'
+        shell: pwsh
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: Clippy (Windows, e2e harness + steps)
+        if: needs.changes.outputs.heavy == 'true'
+        shell: pwsh
+        run: cargo clippy --locked -p e2e-cucumber --test e2e -- -D warnings
+
       - name: Build
         if: needs.changes.outputs.heavy == 'true'
         shell: pwsh
-        run: |
-          cargo build --workspace --all-targets
-          cargo build --release -p rocm -p rocmd -p rocm-engine-lemonade -p rocm-engine-vllm -p xtask
+        run: cargo build --workspace --all-targets
+
+      - name: Build (release)
+        if: needs.changes.outputs.heavy == 'true'
+        shell: pwsh
+        run: cargo build --release -p rocm -p rocmd -p rocm-engine-lemonade -p rocm-engine-vllm -p xtask
 
       - name: Test
         if: needs.changes.outputs.heavy == 'true'
         shell: pwsh
         run: cargo test --workspace --all-targets
 
+      # Surface the cache hit rate for the workspace build/test so the effect is
+      # visible in the logs, on the local-only path too — see build-and-test for
+      # why this is gated on sccache being present rather than on the remote
+      # backend being up, and why the action's own post-job stats step does not
+      # make this one redundant.
+      - name: sccache stats
+        if: needs.changes.outputs.heavy == 'true' && steps.sccache_probe.outputs.active == 'true'
+        shell: pwsh
+        run: sccache --show-stats
+
       - name: Local no-fallback smoke
         if: needs.changes.outputs.heavy == 'true'
         shell: pwsh
         run: python .\scripts\smoke_local.py --skip-build
 
-      - name: Acceptance harness self-tests
+      # One command per step: pwsh carries on past a failing native command and
+      # the step reports only the last command's exit code, so a multi-line
+      # block would let an early self-test fail unseen. Enforced for every pwsh
+      # step by `no_pwsh_step_lets_a_failing_native_command_pass_unseen` in
+      # xtask/src/workflow_contract.rs.
+      - name: Acceptance harness self-test (ComfyUI)
         if: needs.changes.outputs.heavy == 'true'
         shell: pwsh
-        run: |
-          python .\scripts\comfyui_therock_gpu_test.py --self-test
-          python .\scripts\local_assistant_therock_gpu_test.py --self-test
-          python .\scripts\vllm_therock_gpu_test.py --self-test
-          python .\scripts\wsl_preflight.py --self-test
+        run: python .\scripts\comfyui_therock_gpu_test.py --self-test
+
+      - name: Acceptance harness self-test (local assistant)
+        if: needs.changes.outputs.heavy == 'true'
+        shell: pwsh
+        run: python .\scripts\local_assistant_therock_gpu_test.py --self-test
+
+      - name: Acceptance harness self-test (vLLM)
+        if: needs.changes.outputs.heavy == 'true'
+        shell: pwsh
+        run: python .\scripts\vllm_therock_gpu_test.py --self-test
 
       - name: Release readiness self-test
         if: needs.changes.outputs.heavy == 'true'
@@ -365,22 +766,212 @@ jobs:
 
       - name: Acceptance install lifecycle
         if: needs.changes.outputs.heavy == 'true'
+        shell: pwsh
         # Windows install lifecycle (packaging + native-crypto verify + user-PATH
         # + loopback HTTP + isolated smoke + uninstall) as opt-in @lifecycle E2E.
+        #
+        # Hand the suite the binaries the Build step already produced. Without
+        # this `cargo xtask e2e` builds `rocm`/`rocmd` for itself, and because it
+        # adds `--features rocm/e2e-test-hooks` the feature resolution differs
+        # from the Build step's — so cargo recompiles the whole release graph
+        # rather than reusing it. That second release build cost 3-4 minutes on
+        # every run, on the job that alone determines when CI goes green.
+        #
+        # Deliberately NOT built with `rocm/e2e-test-hooks`, unlike the prebuilt
+        # lanes in e2e-selfhosted.yml / nightly.yml. Those run the full suite,
+        # whose scripted failure seams are compiled out without the feature.
+        # `E2E_ONLY_LIFECYCLE` restricts this lane to @lifecycle scenarios, none
+        # of which touch a seam — and this lane packages and installs the binary
+        # through the real installer, so it should ship exactly what a release
+        # ships rather than a build carrying test hooks.
         env:
           E2E_INCLUDE_LIFECYCLE: "1"
           E2E_ONLY_LIFECYCLE: "1"
-        run: cargo xtask e2e
+        run: |
+          # Derive from CARGO_TARGET_DIR when it is set, falling back to the
+          # default target dir, so a future job-level CARGO_TARGET_DIR cannot
+          # leave this lane pointing at a stale path. The expression is
+          # byte-identical to the prebuilt lanes in nightly.yml and
+          # e2e-selfhosted.yml — which keeps the shared pin string meaningful —
+          # though those steps run under `shell: powershell` rather than pwsh.
+          $targetDir = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { "target" }
+          $env:ROCM_CLI_BINARY = "$targetDir\release\rocm.exe"
+          $env:ROCM_CLI_ROCMD_BINARY = "$targetDir\release\rocmd.exe"
+          # Fail here, naming the missing binary, rather than letting a scenario
+          # die on a "failed to run" deep in the suite.
+          foreach ($bin in $env:ROCM_CLI_BINARY, $env:ROCM_CLI_ROCMD_BINARY) {
+            if (-not (Test-Path -LiteralPath $bin)) {
+              throw "expected the Build step to have produced $bin"
+            }
+          }
+          cargo xtask e2e
+
+      # Downloadable PR-testing bundle, reusing the release binaries built
+      # above rather than building Windows twice. Skipped on push-to-main /
+      # merge_group (nightly already covers main) and on an ordinary dispatch
+      # (build_binaries left at its false default).
+      - name: Package PR bundle
+        if: >-
+          needs.changes.outputs.heavy == 'true' &&
+          (github.event_name == 'pull_request' || github.event.inputs.build_binaries == 'true')
+        shell: pwsh
+        run: cargo xtask package rocm-cli-pr-windows-amd64
+
+      - name: Add install instructions to job summary
+        if: >-
+          needs.changes.outputs.heavy == 'true' &&
+          (github.event_name == 'pull_request' || github.event.inputs.build_binaries == 'true')
+        shell: pwsh
+        run: |
+          @'
+          ## Try this PR's build (Windows x86_64)
+
+          Download `rocm-cli-pr-windows-amd64` from this run's **Artifacts**
+          section below, then:
+
+          ```powershell
+          Expand-Archive rocm-cli-pr-windows-amd64.zip -DestinationPath pr-artifact   # GitHub's wrapper zip
+          Expand-Archive pr-artifact\rocm-cli-pr-windows-amd64.zip -DestinationPath rocm-cli-pr
+          $dest = "$env:LOCALAPPDATA\rocm-cli\bin"
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          Copy-Item rocm-cli-pr\rocm-cli-pr-windows-amd64\bin\rocm.exe,rocm-cli-pr\rocm-cli-pr-windows-amd64\bin\rocmd.exe $dest
+          $env:Path = "$dest;$env:Path"
+          rocm --version
+          ```
+
+          Unsigned build for manual testing only — not for production use.
+          '@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      - name: Upload PR bundle
+        if: >-
+          needs.changes.outputs.heavy == 'true' &&
+          (github.event_name == 'pull_request' || github.event.inputs.build_binaries == 'true')
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rocm-cli-pr-windows-amd64
+          path: |
+            dist/rocm-cli-pr-windows-amd64.zip
+            dist/rocm-cli-pr-windows-amd64.zip.sha256
+          retention-days: 7
+          if-no-files-found: error
+
+  # Downloadable Linux PR-testing bundle. No job in THIS file builds a release
+  # binary in the release manylinux2014 container (build-and-test only does a
+  # debug, non-containerized build; release.yml and nightly.yml both already
+  # do the containerized build, just not for a PR), so this is a standalone
+  # job rather than an extension. Mirrors release.yml's Linux build minus
+  # versioning/signing/release-upload — these are unsigned, disposable,
+  # per-run artifacts for manual testing, not a publication.
+  pr-linux-binaries:
+    name: Build Linux PR binaries
+    runs-on: ubuntu-latest
+    # 30min: a cold containerised release build (image pull, yum install,
+    # rustup install, then `cargo build --release` for 3 crates) plus none of
+    # its steps below are individually bounded -- see the convention comment
+    # at the top of this block.
+    timeout-minutes: 30
+    needs: [changes, clippy, prek]
+    # `clippy`/`prek` are themselves always skipped on workflow_dispatch (their
+    # own `if:`), and a job whose `needs` were SKIPPED (not just failed) is
+    # skipped by default too — so without `!cancelled()` plus the explicit
+    # skipped-or-success checks below, `build_binaries: true` could never
+    # actually run this job. The success requirement is still enforced on
+    # every other trigger, where clippy/prek always run for real. `!cancelled()`
+    # rather than `always()`: this job still needs to be cancelled when a new
+    # commit supersedes the run, per this workflow's `concurrency:
+    # cancel-in-progress: true` (see windows-build-and-test above).
+    if: >-
+      !cancelled()
+      && needs.changes.result == 'success'
+      && (needs.clippy.result == 'success' || needs.clippy.result == 'skipped')
+      && (needs.prek.result == 'success' || needs.prek.result == 'skipped')
+      && (github.event_name == 'pull_request' || github.event.inputs.build_binaries == 'true')
+      && needs.changes.outputs.heavy == 'true'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+
+      - name: Cache Cargo home and build artifacts
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/index
+            ~/.cargo/registry/src
+            ~/.cargo/rustup
+            target
+          key: Linux-manylinux-pr-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            Linux-manylinux-pr-
+
+      - name: Build release binaries
+        run: |
+          mkdir -p "$HOME/.cargo"
+          docker run --rm -v "$PWD":/work -w /work quay.io/pypa/manylinux2014_x86_64 /bin/bash -lc '
+            set -euo pipefail
+            yum install -y pkgconfig libcap-devel
+          '
+          docker run --rm \
+            -u "$(id -u):$(id -g)" \
+            -e CARGO_HOME=/host-cargo -e RUSTUP_HOME=/host-cargo/rustup \
+            -v "$HOME/.cargo":/host-cargo -v "$PWD":/work -w /work \
+            quay.io/pypa/manylinux2014_x86_64 \
+            /bin/bash -lc '
+              set -euo pipefail
+              if [ ! -f /host-cargo/bin/cargo ]; then
+                curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none --no-modify-path
+              fi
+              export PATH="/host-cargo/bin:$PATH"
+              cargo build --release -p rocm -p rocmd -p xtask
+            '
+
+      - name: Package PR bundle
+        run: |
+          chmod +x install.sh
+          cargo xtask package rocm-cli-pr-linux-amd64
+
+      - name: Add install instructions to job summary
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          ## Try this PR's build (Linux x86_64)
+
+          Download `rocm-cli-pr-linux-amd64` from this run's **Artifacts**
+          section below, then:
+
+          ```sh
+          unzip rocm-cli-pr-linux-amd64.zip   # GitHub wraps the artifact in a zip
+          tar -xzf rocm-cli-pr-linux-amd64.tar.gz
+          dest="$HOME/rocm-cli-pr/bin"
+          install -Dm0755 rocm-cli-pr-linux-amd64/bin/rocm rocm-cli-pr-linux-amd64/bin/rocmd -t "$dest"
+          export PATH="$dest:$PATH"
+          rocm --version
+          ```
+
+          Unsigned build for manual testing only — not for production use.
+          EOF
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rocm-cli-pr-linux-amd64
+          path: |
+            dist/rocm-cli-pr-linux-amd64.tar.gz
+            dist/rocm-cli-pr-linux-amd64.tar.gz.sha256
+          retention-days: 7
+          if-no-files-found: error
 
   prek:
     # The fast lint gate: every toolchain-light lint/hygiene check, run from the
     # single source of truth in .pre-commit-config.yaml — hygiene + Python (ruff)
     # + Shell (shellcheck) + cargo fmt (rustfmt only, no compile).
     # `--no-group local-tools` skips the hooks that need a full Rust compile,
-    # hawkeye, or PowerShell — those have their own jobs (clippy, build-and-test,
-    # license-headers, powershell-lint).
+    # hawkeye, lychee, PowerShell, or commit-history/signing access — those have
+    # their own jobs (clippy, build-and-test, license-headers, docs-links,
+    # powershell-lint, commit-signatures).
     name: prek (lint / hygiene)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     # Always-on: prek is the cheapest gate (no compile) and its hygiene hooks run
     # on every file type, so it is relevant to any change — including docs-only
     # PRs that match no `changes` category. Like license-headers and
@@ -402,18 +993,135 @@ jobs:
       # it, so a tampered release can't be installed. This commit is past the
       # v2.0.4 tag because it is the one that added prek 0.4.5 to that map — pin
       # an earlier commit and the action would not know 0.4.5 and skip the check.
-      - uses: j178/prek-action@5337cb91e0fa35a7ff31b9ca345126d8bbbcdf16 # prek 0.4.5 checksums
+      - uses: j178/prek-action@4e14d07f9231acabce116ccfca13b13dd9755ece # prek 0.4.5 checksums
         with:
           prek-version: 0.4.5
           extra-args: --all-files --no-group local-tools
 
+  remote-ssh:
+    # `rocm remote` drives ssh, scp, and the remote's service/serve tooling. Its
+    # unit tests use a scripted stand-in, which proves the control flow but
+    # assumes the real tools behave a certain way. This job checks that
+    # assumption against a real OpenSSH server in a container: argument
+    # handling, exit-code propagation, stdin delivery of a credential, file
+    # copy, batch-mode refusal, the shape Tailscale Funnel takes in the serve
+    # config (including that the fake refuses the ports the real daemon
+    # refuses), and — the one that matters most — that withdrawing a published
+    # endpoint actually removes it. A publish is configuration rather than a
+    # process, so it survives reboots, and a withdrawal that silently does
+    # nothing leaves a GPU endpoint exposed with nothing tracking it.
+    #
+    # No GPU, no ROCm, no tailnet: the remote's `rocm` and `tailscale` are
+    # stand-ins that answer in the shapes the real tools do.
+    name: remote control channel (containerised)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Gated like every other heavy job here: a fast lint failure should
+    # short-circuit before this spends 30 minutes on a container and a cold
+    # cargo build, and a manual dispatch should stay a fast loop.
+    needs: [changes, clippy, prek]
+    if: github.event_name != 'workflow_dispatch' && needs.changes.outputs.heavy == 'true'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Docker and the OpenSSH client are both present on ubuntu-latest; jq is
+      # the only extra, and only for asserting on JSON contracts.
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Check the control-channel contracts
+        run: tests/remote-ssh/run.sh
+
+      # The pinned toolchain, and the rust-cache that comes with it, as every
+      # other cargo job in this workflow uses. Without it this lane builds the
+      # whole workspace cold against a different compiler from the rest of CI,
+      # inside a 30-minute timeout.
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+
+      # The same container, driven by the real binary this time: discover a
+      # target, probe it, serve, publish, reconcile status, re-publish after an
+      # out-of-band withdrawal, tear down, and refuse to publish over a
+      # Funnel-exposed port. Catches the orchestration mistakes a scripted
+      # stand-in cannot — an argument the CLI builds wrongly, a session record
+      # it fails to clean up.
+      - name: Build the CLI for the end-to-end run
+        run: cargo build -p rocm
+
+      - name: Drive rocm remote end to end
+        run: tests/remote-ssh/run-e2e.sh
+
   clippy:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # sccache caches each rustc invocation across runs (see build-and-test for the
+    # choice of backend and the probe). clippy compiles the whole workspace with
+    # --all-targets, so it benefits too. rust-cache sets CARGO_INCREMENTAL=0
+    # (required by sccache) for these steps.
+    #
+    # This job shares build-and-test's key prefix: both compile the same crates
+    # for the same Linux target, so what one caches the other can read. The
+    # overlap is narrower than it looks — clippy builds dependencies without
+    # `--emit=link`, which gives most of them a different cache key than the
+    # build job's, and workspace crates go through clippy-driver, whose hash
+    # differs from rustc's. Crates that must be fully linked for both (proc
+    # macros, and anything a build script needs) do hit. Sharing cannot poison
+    # either job: the compiler binary is part of every key.
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_AZURE_CONNECTION_STRING: ${{ secrets.CACHE_AZURE_CONNECTION_STRING }}
+      SCCACHE_AZURE_BLOB_CONTAINER: cache
+      SCCACHE_AZURE_KEY_PREFIX: rocm-cli/build-and-test
+      SCCACHE_AZURE_RW_MODE: ${{ (github.event_name == 'push' || github.event_name == 'merge_group') && 'READ_WRITE' || 'READ_ONLY' }}
     needs: changes
     # A manual E2E dispatch only exercises the E2E jobs; skip the rest.
     if: github.event_name != 'workflow_dispatch'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Installs sccache. Runs BEFORE setup-rust-toolchain, whose rust-cache step
+      # runs `cargo metadata` and honours RUSTC_WRAPPER. `version` is pinned so
+      # the compiler wrapper does not float with the latest sccache release.
+      # continue-on-error for the same reason as build-and-test: a failed install
+      # is handled by the probe, not by failing the job.
+      - name: Set up sccache
+        if: needs.changes.outputs.rust == 'true'
+        continue-on-error: true
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.17.0
+
+      # Keep the remote backend only if it answers — see the equivalent step in
+      # build-and-test for why this is a probe, and why failure clears the Azure
+      # variables rather than the wrapper.
+      - name: Probe sccache cache backend
+        id: sccache_probe
+        if: needs.changes.outputs.rust == 'true'
+        run: |
+          disable() {
+            echo "SCCACHE_AZURE_CONNECTION_STRING=" >> "$GITHUB_ENV"
+            echo "SCCACHE_AZURE_BLOB_CONTAINER=" >> "$GITHUB_ENV"
+          }
+          if ! command -v sccache >/dev/null; then
+            echo "::warning::sccache is not installed; compiling without it."
+            echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
+            # Nothing will read the credential now; don't leave it in the job env.
+            disable
+            exit 0
+          fi
+          # sccache is the compiler wrapper from here on, remote backend or not,
+          # so there are statistics worth reporting either way.
+          echo "active=true" >> "$GITHUB_OUTPUT"
+          if [ -z "${SCCACHE_AZURE_CONNECTION_STRING}" ]; then
+            echo "::notice::No cache credential available (expected on forks); compiling without a shared cache."
+            disable
+            exit 0
+          fi
+          if ! sccache --start-server; then
+            echo "::warning::sccache could not reach the cache backend; compiling without a shared cache."
+            # Leave no half-started server behind for the cargo steps to find.
+            sccache --stop-server || true
+            disable
+          fi
 
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         if: needs.changes.outputs.rust == 'true'
@@ -434,9 +1142,27 @@ jobs:
         if: needs.changes.outputs.rust == 'true'
         run: cargo xtask manifest --check
 
+      - name: First-party crate dependency edges are within the allowlist
+        if: needs.changes.outputs.rust == 'true'
+        run: cargo xtask check-crate-edges
+
+      - name: Published Doctor catalog is current
+        if: needs.changes.outputs.rust == 'true'
+        run: cargo xtask catalog --check
+
+      # Surface the cache hit rate for the clippy compile so the effect is visible
+      # in the logs, on the local-only path too — see build-and-test for why this
+      # is gated on sccache being present rather than on the remote backend being
+      # up, and why the action's own post-job stats step does not make this one
+      # redundant.
+      - name: sccache stats
+        if: needs.changes.outputs.rust == 'true' && steps.sccache_probe.outputs.active == 'true'
+        run: sccache --show-stats
+
   third-party-notices:
     name: Third-party notices current
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     needs: changes
     # A manual E2E dispatch only exercises the E2E jobs; skip the rest.
     if: github.event_name != 'workflow_dispatch'
@@ -469,8 +1195,17 @@ jobs:
         run: cargo xtask tpn --check
 
   coverage:
+    # The name is stale — this gate covers every workspace crate, not just the
+    # rocm-dash ones — but it is a required status check on `main`, and GitHub
+    # matches required checks by job name. Renaming it here without updating
+    # branch protection in the same moment would leave every subsequent pull
+    # request waiting on a check that can no longer report. Rename and update
+    # protection together, as their own change.
     name: Coverage (rocm-dash crates, ratcheted)
     runs-on: ubuntu-latest
+    # Raised from 20: the gate now instruments the whole workspace rather than
+    # four crates, so the build it waits on is several times larger.
+    timeout-minutes: 45
     needs: changes
     # A manual E2E dispatch only exercises the E2E jobs; skip the rest.
     if: github.event_name != 'workflow_dispatch'
@@ -488,7 +1223,7 @@ jobs:
 
       - name: Install cargo-llvm-cov
         if: needs.changes.outputs.rust == 'true'
-        uses: taiki-e/install-action@a6b2e2dcd845ddd7f509ce4f3ed3d922b80cc5d9 # v2.84.0
+        uses: taiki-e/install-action@fcf5432d9f50d67e37ee6e29bdb7a224ff67b4a7 # v2.86.8
         with:
           tool: cargo-llvm-cov
 
@@ -504,19 +1239,17 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-cov-
 
-      # Ratcheted, fail-on-regression floor scoped to the transplanted rocm-dash
-      # crates (the clean anchor) — deliberately NOT the whole workspace, so the
-      # gate does not over-claim coverage of the large untyped rocm-cli core
-      # Baseline measured 2026-06-11: 73.7% lines across the four
-      # crates. Floor set just below measured; ratchet upward as the larger TUI
-      # tab files (bench/overview/modal) gain tests.
-      - name: Coverage gate (rocm-dash crates, >= 70% lines)
+      # Per-crate floors over every workspace crate, pinned in
+      # `coverage-floors.toml` and enforced by the xtask. The crate list lives
+      # in the xtask rather than here so a new workspace member cannot land
+      # outside the gate by nobody remembering to edit this file — the check
+      # fails on a crate with no floor.
+      #
+      # See `xtask/src/coverage.rs` for why the floors are per crate, and what
+      # this metric does and does not measure.
+      - name: Coverage floors (every crate)
         if: needs.changes.outputs.rust == 'true'
-        run: |
-          cargo llvm-cov --no-cfg-coverage \
-            -p rocm-dash-core -p rocm-dash-collectors \
-            -p rocm-dash-daemon -p rocm-dash-tui \
-            --fail-under-lines 70
+        run: cargo xtask coverage
 
   powershell-lint:
     # Runs the prek `powershell-script-analyzer` hook's logic (cargo xtask
@@ -526,6 +1259,7 @@ jobs:
     # rather than behind that slow job.
     name: Lint (PowerShell)
     runs-on: windows-latest
+    timeout-minutes: 20
     needs: changes
     # A manual E2E dispatch only exercises the E2E jobs; skip the rest.
     if: github.event_name != 'workflow_dispatch'
@@ -556,9 +1290,92 @@ jobs:
         if: needs.changes.outputs.lint == 'true'
         run: cargo xtask powershell-lint --shell powershell
 
+  # Grades the published Agent Skills under skills/ with AMD's skillscope
+  # harness. Only the `structural` command runs: it needs no agent, no API key
+  # and no network beyond the install, so a red run is never wrong for a
+  # reason of its own. It is advisory today, not blocking: `Skill checks
+  # (skillscope)` (this job's `name:`, not the `skill-evals` job id) is not a
+  # required status check in branch protection, so a failing run does not
+  # stop a merge. An admin must add that exact context to make it blocking.
+  # It checks the frontmatter an agent runtime
+  # parses (a `name` that disagrees with the folder makes the skill unloadable),
+  # the dataset's coverage bar, and every internal markdown reference — a link
+  # into a renamed file is not cosmetic here, because the agent follows it,
+  # finds nothing, and improvises.
+  #
+  # `routing` and `behavioral` are deliberately NOT run: both need an
+  # authenticated `claude` CLI and an ANTHROPIC_API_KEY, and this repo has no
+  # such secret. Turning them on is a caller change to skillscope's
+  # `skill-evals.yml` reusable workflow once one exists — they are the half of
+  # the question that asks whether the skill actually fires, so this job is not
+  # a substitute for them.
+  #
+  # skills/rocm-cli-assistant/ is deliberately out of scope. Despite its path it
+  # is not a published skill: apps/rocm/src/main.rs embeds it verbatim into the
+  # chat assistant's system prompt with include_str!, so giving it the YAML
+  # frontmatter this check requires would inject that frontmatter into a live
+  # prompt.
+  skill-evals:
+    name: Skill checks (skillscope)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: changes
+    # A manual E2E dispatch only exercises the E2E jobs; skip the rest.
+    if: github.event_name != 'workflow_dispatch' && needs.changes.outputs.skills == 'true'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The `skillscope` step below names skills/rocm-doctor explicitly, so a
+      # third skills/<name>/ folder added later would pass this job green
+      # while never being graded -- the same silent-non-grading failure this
+      # job exists to catch, just one level deeper. Fail loudly instead: any
+      # directory under skills/ that isn't graded above or excluded by design
+      # (rocm-cli-assistant -- see AGENTS.md #7) forces a deliberate edit here.
+      - name: Guard against an ungraded skills/ directory
+        run: |
+          set -euo pipefail
+          # Without nullglob, a skills/ with no subdirectories leaves the
+          # pattern unexpanded and the loop runs once on the literal
+          # `skills/*/`, reporting `skills/* is neither graded ...` -- a
+          # made-up skill name, from a tree that has no ungraded skill in it.
+          # With it the loop simply does not run, which is the right answer for
+          # "nothing to grade".
+          shopt -s nullglob
+          known="rocm-doctor rocm-cli-assistant"
+          for dir in skills/*/; do
+            name="${dir%/}"
+            name="${name#skills/}"
+            case " $known " in
+              *" $name "*) ;;
+              *)
+                echo "::error::skills/$name is neither graded by skill-evals nor excluded by design ($known). Add it to the skillscope step's 'skills:' input, or add it to this guard's exclusion list with the reason, before merging." >&2
+                exit 1
+                ;;
+            esac
+          done
+
+      # The action is only a launcher: it sets up Python and uv, resolves which
+      # build of the harness to run, and execs it. It imports nothing from
+      # skillscope, so pinning it to a release SHA cannot break on a payload
+      # version it predates. What the pin does NOT cover: the composite's own
+      # steps (setup-python, setup-uv, setup-node) are on their own moving
+      # tags, and the harness itself is resolved at runtime via
+      # `uvx --from git+.../skillscope@<ref>` with no lockfile. Unlike this
+      # repo's usual SHA pin (AGENTS.md #6), this one does not reach the code
+      # that actually runs. install-claude stays off; structural needs no
+      # agent.
+      - name: Check skill structure, dataset, and references
+        uses: amd/skillscope@6dde8e8a34ad5456d3c2ff3418bc81c2cd9d5d69 # v0.1.0
+        with:
+          command: structural
+          skills: skills/rocm-doctor
+          args: --skill-files skill-card.md --skill-sections Description,Owner,License
+          install-claude: "false"
+
   license-headers:
     name: License header check (hawkeye)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     env:
       # Install a pinned prebuilt hawkeye binary instead of pulling the
       # korandoru/hawkeye Docker image on every run, and verify it against a
@@ -568,8 +1385,8 @@ jobs:
       # check — pinning the hash here makes that fail instead. To upgrade, bump
       # the version and replace the hash with the new release's published
       # .sha256 (confirm the bytes first).
-      HAWKEYE_VERSION: v6.5.1
-      HAWKEYE_SHA256: d6eb0505a45a15244f4f789158aafe5e3f1a7dc86c9dc1d7651f3cb1e1b321e0
+      HAWKEYE_VERSION: v7.0.0
+      HAWKEYE_SHA256: 2617b43ec6f871511f7b381e3d34544d6aa47c2468541ca67102d69ff7d0f541
       HAWKEYE_INSTALL_DIR: ${{ github.workspace }}/.hawkeye-bin
     # A manual E2E dispatch only exercises the E2E jobs; skip the rest.
     if: github.event_name != 'workflow_dispatch'
@@ -588,7 +1405,7 @@ jobs:
         run: |
           tarball="hawkeye-x86_64-unknown-linux-gnu.tar.xz"
           curl --proto '=https' --tlsv1.2 -LsSf \
-            "https://github.com/korandoru/hawkeye/releases/download/${HAWKEYE_VERSION}/${tarball}" \
+            "https://github.com/fast/hawkeye/releases/download/${HAWKEYE_VERSION}/${tarball}" \
             -o "${tarball}"
           echo "${HAWKEYE_SHA256}  ${tarball}" | sha256sum -c -
           mkdir -p "${HAWKEYE_INSTALL_DIR}"
@@ -599,9 +1416,63 @@ jobs:
         run: |
           "${HAWKEYE_INSTALL_DIR}/hawkeye" check
 
+  docs-links:
+    name: Markdown links resolve (lychee)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Deliberately NOT gated by the `changes` path filter: a markdown link can
+    # go stale when the file or heading it points at moves, without the
+    # markdown file itself changing. Run unconditionally instead.
+    #
+    # A manual E2E dispatch only exercises the E2E jobs; skip the rest.
+    if: github.event_name != 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Check markdown links
+        uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
+        with:
+          args: --config lychee.toml './**/*.md'
+          fail: true
+          # Explicit, so an action bump can't silently drift from the version
+          # CONTRIBUTING.md pins for the local `lychee` prek hook — bump both.
+          lycheeVersion: v0.24.2
+
+  docs-build:
+    name: Sphinx docs build (-W)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [changes]
+    # A manual E2E dispatch only exercises the E2E jobs; skip the rest. Off a
+    # dispatch, `needs.changes` never ran, so short-circuit on event_name first.
+    if: github.event_name != 'workflow_dispatch' && needs.changes.outputs.docs == 'true'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Cache pip packages
+        id: cache-pip
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-docs-pip-${{ hashFiles('docs/rocm-docs/sphinx/requirements.txt') }}
+
+      - name: Install Sphinx toolchain
+        run: |
+          python3 -m venv .docs-venv
+          .docs-venv/bin/pip install -q -r docs/rocm-docs/sphinx/requirements.txt
+
+      # Same source Sphinx points at (docs/rocm-docs/conf.py) and the same
+      # -W (warnings-as-errors) mode read-the-docs builds with, so a broken
+      # MyST include, dead xref, or toctree gap fails CI instead of surfacing
+      # as a silent RTD build failure after merge.
+      - name: Build docs (warnings as errors)
+        run: |
+          .docs-venv/bin/sphinx-build -b html docs/rocm-docs /tmp/rocm-cli-docs -W
+
   commit-signatures:
     name: Commit signatures + sign-off
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     # Runs on pull requests and in the merge queue. Both define a base that
     # bounds the commit range. Handling `merge_group` matters once this is a
     # *required* check: the queue fires `merge_group` (not `pull_request`), so a
@@ -706,6 +1577,14 @@ jobs:
 
       - name: Run E2E tests
         if: steps.gate.outputs.run == 'true'
+        # E2E_INCLUDE_DOCKER turns on the `rocm remote` scenarios that need a
+        # second machine, stood up as a container. This is the only lane that
+        # opts in: GitHub-hosted runners can build the fixture image, while the
+        # self-hosted GPU runners have a daemon but no route to the package
+        # mirror it installs from, so they skip rather than fail on an image
+        # they could never build.
+        env:
+          E2E_INCLUDE_DOCKER: "1"
         run: cargo xtask e2e
 
       - name: Upload E2E report
