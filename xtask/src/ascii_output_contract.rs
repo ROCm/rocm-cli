@@ -243,8 +243,9 @@ mod tests {
     ///
     /// A whole-tree walk rather than a list of source directories, so a crate
     /// added under a new top-level directory is covered without anyone
-    /// remembering to extend this. `target*/` (`target-container/` is the
-    /// container gate's build dir) and dot-directories are skipped:
+    /// remembering to extend this. `target/`, `target-*/` (alternate cargo
+    /// target dirs, e.g. a `CARGO_TARGET_DIR=target-foo` build) and dot-directories
+    /// are skipped:
     /// the latter include the `.claude/worktrees` checkouts of other
     /// branches, and scanning those would make the verdict depend on state
     /// outside the commit under test.
@@ -270,7 +271,7 @@ mod tests {
                 let skip = path
                     .file_name()
                     .and_then(|name| name.to_str())
-                    .is_none_or(|name| name.starts_with("target") || name.starts_with('.'));
+                    .is_none_or(|name| name == "target" || name.starts_with("target-") || name.starts_with('.'));
                 if skip {
                     continue;
                 }

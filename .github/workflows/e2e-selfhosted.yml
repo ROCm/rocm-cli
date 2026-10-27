@@ -1532,7 +1532,7 @@ jobs:
         || (github.event_name == 'workflow_dispatch'
           && (inputs.platform == 'all' || inputs.platform == 'w7900'))
       )
-    # Non-blocking while this hardware is proven out, as the MI350P lane is.
+    # continue-on-error while this hardware is proven out.
     # Flip to `false` once it has a track record — that is what the older lanes
     # run with, so a real regression on this silicon shows red instead of
     # always green.

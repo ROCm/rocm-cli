@@ -740,7 +740,7 @@ impl TuiSession {
         // "waiting until {describe}", so a lone `"Ready"` would land as
         // `waiting until "Ready"`.
         let wanted = format!("the screen shows {marker:?}");
-        self.wait_for_screen_where(&wanted, |screen| screen.contains(marker), timeout)
+        self.wait_loop(&wanted, |screen| screen.contains(marker), timeout, true)
             .await
     }
 
@@ -809,8 +809,22 @@ impl TuiSession {
     pub async fn wait_for_screen_where(
         &mut self,
         describe: &str,
+        is_ready: impl FnMut(&str) -> bool,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        self.wait_loop(describe, is_ready, timeout, false).await
+    }
+
+    /// The shared loop. `drain_on_exit` is set only by the positive form
+    /// ([`wait_for_screen`](Self::wait_for_screen)), where a marker that
+    /// appeared as the child exited did genuinely appear; an absence or
+    /// cleared-cell wait must never be satisfied by a dead process's last frame.
+    async fn wait_loop(
+        &mut self,
+        describe: &str,
         mut is_ready: impl FnMut(&str) -> bool,
         timeout: Duration,
+        drain_on_exit: bool,
     ) -> Result<(), String> {
         let deadline = Instant::now() + timeout;
         loop {
@@ -823,9 +837,10 @@ impl TuiSession {
             if let Ok(Some(status)) = self.child.try_wait() {
                 self.finished = true;
                 self.record_once(i32::try_from(status.exit_code()).unwrap_or(-1));
-                if self
-                    .drain_final_frame_where(Some(describe), &mut is_ready)
-                    .await?
+                if drain_on_exit
+                    && self
+                        .drain_final_frame_where(Some(describe), &mut is_ready)
+                        .await?
                 {
                     return Ok(());
                 }

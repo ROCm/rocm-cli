@@ -638,7 +638,7 @@ Feature: Diagnosing failures and listing fixes
   # first tells the user what will put the machine right, while the second is the
   # command they are told to run. They must not leave the user with two different
   # definitions of what proves the remedy worked.
-  @id:diagnose-and-fix-agree-on-how-to-verify @requires-os:linux
+  @id:diagnose-and-fix-agree-on-how-to-verify @requires-os:linux @requires-bare-metal
   Scenario: diagnose-42 - Diagnosing a problem and previewing its fix agree on how to verify it
     Given a user who hit a device-permission failure
     When the user compares the diagnosis with the matching fix preview

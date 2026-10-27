@@ -639,7 +639,7 @@ async fn user_inspects_for_scripting_first(world: &mut E2eWorld) {
     // second, so the comparison step can hold the two to each other.
     let (json, _, rc) = crate::run_rocm(world, &["examine", "--json"]);
     let (human, _, _) = crate::run_rocm(world, &["examine"]);
-    world.cli_stderr = Some(human);
+    world.cli_other_output = Some(human);
     world.cli_output = Some(json);
     world.cli_rc = Some(rc);
 }
@@ -842,7 +842,7 @@ async fn assert_json_states_what_human_does(world: &mut E2eWorld) {
 async fn assert_json_names_setup_runtime_folder(world: &mut E2eWorld) {
     let planted = planted_setup_runtime_root(world).display().to_string();
     let human = world
-        .cli_stderr
+        .cli_other_output
         .as_ref()
         .expect("the human report was not captured");
     let value = parsed_json(world);
@@ -2096,7 +2096,10 @@ fn age_expected_from_date(record: &serde_json::Value) -> &'static str {
 )]
 async fn assert_examine_reports_driver_version_and_date(world: &mut E2eWorld) {
     let json = parsed_json(world);
-    let text = world.cli_stderr.as_ref().expect("no readable inspection");
+    let text = world
+        .cli_other_output
+        .as_ref()
+        .expect("no readable inspection");
     let record = windows_driver_record(&json).unwrap_or_else(|| {
         panic!("the machine-readable form carries no Windows driver record:\n{json:#}")
     });
@@ -2124,7 +2127,10 @@ async fn assert_examine_reports_driver_version_and_date(world: &mut E2eWorld) {
 #[then("the inspection calls the driver old only when its date is before 27 July 2023")]
 async fn assert_examine_driver_age_follows_the_date(world: &mut E2eWorld) {
     let json = parsed_json(world);
-    let text = world.cli_stderr.as_ref().expect("no readable inspection");
+    let text = world
+        .cli_other_output
+        .as_ref()
+        .expect("no readable inspection");
     let record = windows_driver_record(&json)
         .unwrap_or_else(|| panic!("no Windows driver record in the machine-readable form"));
     let expected = age_expected_from_date(record);

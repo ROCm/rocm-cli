@@ -108,7 +108,7 @@ Feature: Chat and endpoint detection
     Then the CLI prints the assistant's reply
     And the model receives the piped prompt with its whitespace intact
 
-  # Expected to FAIL. Scenario 7 names the model and works; this one leaves the
+  # Expected to FAIL. Scenario 8 names the model and works; this one leaves the
   # choice to the CLI and is told nothing is running — on the very machine whose
   # services list shows a ready local server. Asking to chat locally should use
   # the local server that is there, whichever model the user chose to serve.

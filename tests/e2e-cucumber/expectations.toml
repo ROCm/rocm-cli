@@ -176,8 +176,8 @@ flaky = true
 # --- EAI-8020: `diagnose` and `fix` each carry their own copy of the
 # render-group remedy, and the verification step has drifted between them
 # (`diagnose` adds `ls -l /dev/kfd`). Both strings are constants, so this holds
-# wherever the catalog runs at all; `@requires-os:linux` on the scenario keeps it
-# off Windows, where the recipe does not apply. Remove when the two are one. ---
+# wherever the catalog runs on bare metal; `@requires-os:linux` and
+# `@requires-bare-metal` keep it off Windows and WSL2, where the recipe does not apply. Remove when the two are one. ---
 [["diagnose-and-fix-agree-on-how-to-verify"]]
 when = {}
 bug = "EAI-8020"

@@ -14,7 +14,6 @@
 //! update-07 and update-08 do plant managed runtimes, and serve the TheRock
 //! catalog they resolve against from a loopback server, so they stay off the
 //! network too.
-//! binary (EAI-8072). Mock lane.
 //!
 //! The flag-handling steps below are argument handling only: nothing there
 //! contacts a package index or changes the machine either, so they run on every

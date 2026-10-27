@@ -282,7 +282,7 @@ fn the_documented_count_of_clause_diagnostics_is_the_real_one() {
     // with its own doc, not a fifth message of this list.
     let scoped = format!(
         "{}\n{}",
-        body_of(&source, "wait_for_screen_where"),
+        body_of(&source, "wait_loop"),
         body_of(&source, "drain_panic_message")
     );
     let emitted: usize = diagnostic_lines(&scoped)
@@ -301,7 +301,7 @@ fn the_documented_count_of_clause_diagnostics_is_the_real_one() {
 /// The body of `fn <name>`: from its signature to the brace that closes it.
 ///
 /// The marker convention is not unique to one function — `wait_until_gone`
-/// quotes its own bare marker in messages of its own — so a count of `{marker:?}`
+/// formats its own bare marker into its `describe` label — so a count of `{marker:?}`
 /// across the file measures every function that happens to name its parameter
 /// `marker`, not the one whose doc states the number.
 fn body_of<'a>(source: &'a str, name: &str) -> String {
