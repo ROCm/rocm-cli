@@ -1432,6 +1432,27 @@ async fn os_release_with_a_command(world: &mut E2eWorld) {
 const RUNS_A_COMMAND_ON_LINE_3: &str =
     "ID=ubuntu\nVERSION_ID=\"24.04\"\nexport ID=debian\nPRETTY_NAME=\"Ubuntu 24.04 LTS\"\n";
 
+/// Writes each `(name, script)` as an executable in the isolated root's
+/// `fake-bin` and puts that directory first on the scenario's `PATH`.
+fn put_fake_executables_on_path(world: &mut E2eWorld, executables: &[(&str, &str)]) {
+    let bin = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("fake-bin");
+    std::fs::create_dir_all(&bin).expect("failed to create the fake PATH dir");
+    for (name, script) in executables {
+        rocm_core::fake_executable::write_fake_executable(&bin.join(name), script)
+            .unwrap_or_else(|e| panic!("failed to write the fake {name}: {e}"));
+    }
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .expect("PATH entries cannot hold a separator");
+    world.command_env.push(("PATH", path));
+}
+
 /// One GPU node in the kernel topology: a gfx1101 with no PCI address, so it
 /// matches no `lspci` entry and is listed from the topology alone. Plus an
 /// `lspci` that lists an empty bus, ahead of any real one, so the PCI probe
@@ -1453,15 +1474,7 @@ fn plant_gpu_fixtures(world: &mut E2eWorld) {
         "cpu_cores_count 0\nsimd_count 120\ngfx_target_version 110001\n",
     )
     .expect("failed to write planted KFD node properties");
-    let bin = root.join("fake-bin");
-    std::fs::create_dir_all(&bin).expect("failed to create the fake PATH dir");
-    rocm_core::fake_executable::write_fake_executable(&bin.join("lspci"), "#!/bin/sh\nexit 0\n")
-        .expect("failed to write the fake lspci");
-    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
-        &std::env::var_os("PATH").unwrap_or_default(),
-    )))
-    .expect("PATH entries cannot hold a separator");
-    world.command_env.push(("PATH", path));
+    put_fake_executables_on_path(world, &[("lspci", "#!/bin/sh\nexit 0\n")]);
 }
 
 #[given("a GPU machine whose release file runs a command on line 3")]
@@ -1505,18 +1518,13 @@ fn plant_machine_without_amdkfd_module(world: &mut E2eWorld, with_kfd: bool) {
     if with_kfd {
         std::fs::write(host.join("dev/kfd"), "").expect("failed to plant /dev/kfd");
     }
-    let bin = root.join("fake-bin");
-    std::fs::create_dir_all(&bin).expect("failed to create the fake PATH dir");
-    rocm_core::fake_executable::write_fake_executable(
-        &bin.join("lsmod"),
-        "#!/bin/sh\nprintf 'Module Size Used by\\namdgpu 1 0\\ndrm 1 1 amdgpu\\n'\n",
-    )
-    .expect("failed to write the fake lsmod");
-    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
-        &std::env::var_os("PATH").unwrap_or_default(),
-    )))
-    .expect("PATH entries cannot hold a separator");
-    world.command_env.push(("PATH", path));
+    put_fake_executables_on_path(
+        world,
+        &[(
+            "lsmod",
+            "#!/bin/sh\nprintf 'Module Size Used by\\namdgpu 1 0\\ndrm 1 1 amdgpu\\n'\n",
+        )],
+    );
     world
         .command_env
         .push(("ROCM_CLI_TEST_HOST_ROOT", host.into_os_string()));
@@ -1545,15 +1553,7 @@ async fn machine_with_kfd_and_no_module_list(world: &mut E2eWorld) {
     let host = root.join("host-root");
     std::fs::create_dir_all(host.join("dev")).expect("failed to create planted /dev");
     std::fs::write(host.join("dev/kfd"), "").expect("failed to plant /dev/kfd");
-    let bin = root.join("fake-bin");
-    std::fs::create_dir_all(&bin).expect("failed to create the fake PATH dir");
-    rocm_core::fake_executable::write_fake_executable(&bin.join("lsmod"), "#!/bin/sh\nexit 1\n")
-        .expect("failed to write the fake lsmod");
-    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
-        &std::env::var_os("PATH").unwrap_or_default(),
-    )))
-    .expect("PATH entries cannot hold a separator");
-    world.command_env.push(("PATH", path));
+    put_fake_executables_on_path(world, &[("lsmod", "#!/bin/sh\nexit 1\n")]);
     world
         .command_env
         .push(("ROCM_CLI_TEST_HOST_ROOT", host.into_os_string()));
@@ -1590,23 +1590,16 @@ async fn machine_with_built_in_amdgpu(world: &mut E2eWorld) {
     let rocm = root.join("rocm");
     std::fs::create_dir_all(rocm.join(".info")).expect("failed to plant a ROCm install");
     std::fs::write(rocm.join(".info/version"), "6.4.1\n").expect("failed to plant its version");
-    let bin = root.join("fake-bin");
-    std::fs::create_dir_all(&bin).expect("failed to create the fake PATH dir");
-    rocm_core::fake_executable::write_fake_executable(
-        &bin.join("lsmod"),
-        "#!/bin/sh\nprintf 'Module Size Used by\\ndrm 1 0\\n'\n",
-    )
-    .expect("failed to write the fake lsmod");
-    rocm_core::fake_executable::write_fake_executable(
-        &bin.join("mokutil"),
-        "#!/bin/sh\necho 'SecureBoot enabled'\n",
-    )
-    .expect("failed to write the fake mokutil");
-    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
-        &std::env::var_os("PATH").unwrap_or_default(),
-    )))
-    .expect("PATH entries cannot hold a separator");
-    world.command_env.push(("PATH", path));
+    put_fake_executables_on_path(
+        world,
+        &[
+            (
+                "lsmod",
+                "#!/bin/sh\nprintf 'Module Size Used by\\ndrm 1 0\\n'\n",
+            ),
+            ("mokutil", "#!/bin/sh\necho 'SecureBoot enabled'\n"),
+        ],
+    );
     world.command_env.push(("ROCM_PATH", rocm.into_os_string()));
     world
         .command_env
