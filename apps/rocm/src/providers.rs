@@ -328,7 +328,7 @@ impl ProviderAdapter for LocalProvider<'_> {
         on_event: &mut dyn FnMut(ProviderStreamEvent) -> Result<()>,
     ) -> Result<ChatStreamSummary> {
         let service = select_local_chat_service(self.paths, request.model.as_deref())?;
-        let model = service.canonical_model_id.clone();
+        let model = service.served_model_name().to_owned();
         let body = openai_local_stream_chat_request_body(service.served_model_name(), request);
         let endpoint_api_key =
             crate::endpoint_keys::endpoint_api_key(self.paths, &service.service_id);

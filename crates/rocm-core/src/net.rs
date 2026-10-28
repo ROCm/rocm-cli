@@ -962,16 +962,32 @@ fn model_ref_tokens(value: &str) -> Vec<String> {
 }
 
 pub fn connect_tcp_stream(host: &str, port: u16, timeout: Duration) -> Result<TcpStream> {
-    let addr = (host, port)
+    let addrs: Vec<_> = (host, port)
         .to_socket_addrs()
         .with_context(|| format!("failed to resolve {host}:{port}"))?
-        .next()
-        .with_context(|| format!("no socket addresses resolved for {host}:{port}"))?;
+        .collect();
+    if addrs.is_empty() {
+        bail!("no socket addresses resolved for {host}:{port}");
+    }
     // Bound the connect as well as the reads: a probe against an engine that is
     // pinned solid must fail within the caller's timeout, not sit in the OS
-    // default SYN retry window.
-    let stream = TcpStream::connect_timeout(&addr, timeout)
-        .with_context(|| format!("failed to connect to {host}:{port}"))?;
+    // default SYN retry window. Try every resolved address so `localhost`
+    // resolving to `::1` first still reaches an IPv4-only listener.
+    let mut last_err = None;
+    let mut connected = None;
+    for addr in &addrs {
+        match TcpStream::connect_timeout(addr, timeout) {
+            Ok(s) => {
+                connected = Some(s);
+                break;
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+    let Some(stream) = connected else {
+        let e = last_err.expect("addrs non-empty");
+        return Err(anyhow::Error::new(e).context(format!("failed to connect to {host}:{port}")));
+    };
     stream.set_read_timeout(Some(timeout)).ok();
     stream.set_write_timeout(Some(timeout)).ok();
     Ok(stream)
@@ -1070,6 +1086,14 @@ fn http_response_is_complete(response: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connect_tcp_stream_reaches_ipv4_listener_via_localhost() {
+        // `localhost` may resolve to ::1 first; every address must be tried.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        connect_tcp_stream("localhost", port, Duration::from_secs(2)).unwrap();
+    }
 
     use crate::test_support::{probe_test_record, workspace_test_artifact_dir};
     use std::io::{Read, Write};
