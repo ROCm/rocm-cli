@@ -431,7 +431,16 @@ fn audit_records(path: &std::path::Path) -> Vec<AuditEventRecord> {
     std::fs::read_to_string(path)
         .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()))
         .lines()
-        .map(|line| serde_json::from_str(line).expect("audit line parses"))
+        .enumerate()
+        .map(|(index, line)| {
+            serde_json::from_str(line).unwrap_or_else(|error| {
+                panic!(
+                    "{}:{}: audit line failed to parse: {error}\n{line}",
+                    path.display(),
+                    index + 1
+                )
+            })
+        })
         .collect()
 }
 
