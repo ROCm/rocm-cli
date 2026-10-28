@@ -3937,10 +3937,17 @@ fi
             .expect("windows-build-and-test must have an Acceptance install lifecycle step");
         let step = step_block(&lines, at);
 
-        assert!(
-            step.contains("E2E_ALSO_RUN_IDS"),
-            "the Windows lifecycle lane must additionally select the hermetic \
-             comfyui scenarios so they get required-CI Windows coverage (#689):\n{step}"
+        // `flattened_values` strips comments before matching the key, so a
+        // mention of `E2E_ALSO_RUN_IDS` in the explanatory comment above the
+        // `env:` block (there to say why these ids are selected here) cannot
+        // satisfy this on its own — only the real `env:` entry can.
+        let also_run_ids = flattened_values(&step, "E2E_ALSO_RUN_IDS");
+        assert_eq!(
+            also_run_ids.len(),
+            1,
+            "the Windows lifecycle lane must set env.E2E_ALSO_RUN_IDS exactly \
+             once to additionally select the hermetic comfyui scenarios, so \
+             they get required-CI Windows coverage (#689):\n{step}"
         );
         for id in [
             "comfyui-uv-install-failure-names-log",
@@ -3948,8 +3955,8 @@ fi
             "comfyui-ambiguous-runtime-actionable",
         ] {
             assert!(
-                step.contains(id),
-                "the Windows lifecycle lane must select {id} via E2E_ALSO_RUN_IDS:\n{step}"
+                also_run_ids[0].contains(id),
+                "the Windows lifecycle lane must select {id} via env.E2E_ALSO_RUN_IDS:\n{step}"
             );
         }
     }
