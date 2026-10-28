@@ -37,6 +37,7 @@ use rocm_engine_protocol::{
 
 use crate::DevicePolicyArg;
 use crate::endpoint_keys;
+use crate::engine_ipc::engine_request;
 use crate::engines_cmd::{engine_manages_own_runtime, ensure_self_managed_engine_ready};
 use crate::serve_summary;
 use crate::service_launch::{
@@ -45,8 +46,8 @@ use crate::service_launch::{
     run_attached_service, start_managed_service, validate_bind_host,
 };
 use crate::{
-    cli_progress, collect_serve_notes, detect_gpu_count, device_policy_name, engine_request,
-    gpu_vram_usage, parse_device_policy, parse_gpu_selection, resolve_engine_selection,
+    cli_progress, collect_serve_notes, detect_gpu_count, device_policy_name, gpu_vram_usage,
+    parse_device_policy, parse_gpu_selection, resolve_engine_selection,
     select_gpu_indices_under_launch_lock, serve_gpu_low_memory_warning,
     validate_engine_selection_runtime, validate_pinned_gpu_index,
 };

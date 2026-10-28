@@ -23,6 +23,7 @@ use rocm_core::{
 };
 use rocm_engine_protocol::{EngineMethod, InstallRequest, InstallResponse};
 
+use crate::engine_ipc::engine_request_with_env_root;
 use crate::engines_cmd::{
     engine_manages_own_runtime, env_root_for_engine_install, runtime_key_for_python,
     runtime_manifest_for_selector,
@@ -31,10 +32,7 @@ use crate::runtimes_cmd::{
     activate_runtime, newest_installed_runtime_manifest, recover_setup_runtime_registration,
 };
 use crate::therock;
-use crate::{
-    ROLLBACK_RECOVERY_HINT, engine_request_with_env_root, record_cli_audit_event, runtime_services,
-    sanitize_log_value,
-};
+use crate::{ROLLBACK_RECOVERY_HINT, record_cli_audit_event, runtime_services, sanitize_log_value};
 
 #[derive(Debug, Clone)]
 pub(crate) struct SdkInstallFinalization {

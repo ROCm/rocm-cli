@@ -1534,6 +1534,26 @@ The harness applies the matching OS requirement itself; do not select these
 with cucumber's `--tags`/`-n` flags, because those bypass the suite's custom
 expectation and applicability resolver.
 
+The required `windows-build-and-test` lane additionally folds in the hermetic
+`comfyui-01`/`comfyui-02`/`comfyui-03` scenarios (not themselves `@lifecycle`)
+via `E2E_ALSO_RUN_IDS`, a comma-separated list of `@id`s:
+
+```powershell
+$env:E2E_INCLUDE_LIFECYCLE = "1"
+$env:E2E_ONLY_LIFECYCLE = "1"
+$env:E2E_ALSO_RUN_IDS = "comfyui-uv-install-failure-names-log,comfyui-uv-install-progress-streamed,comfyui-ambiguous-runtime-actionable"
+cargo xtask e2e
+```
+
+These three were made hermetic and Windows-portable without being tagged
+`@lifecycle` — they're ComfyUI install scenarios, not release packaging/
+install/uninstall ones, and tagging them `@lifecycle` would drop them out of
+the full-suite runs in `nightly.yml` and `e2e-selfhosted.yml`, neither of
+which sets `E2E_INCLUDE_LIFECYCLE`. `E2E_ALSO_RUN_IDS` selects them into this
+lane instead, so this is the one required lane that guarantees Windows
+coverage for them; the self-hosted Windows lane that otherwise runs them is
+optional.
+
 Heavy CI runs the matching set per platform. The scenarios reject untrusted
 signers, bad checksums, bad detached signatures, and missing required signature
 sidecars before activation; cover generated private-key PEM packaging and
