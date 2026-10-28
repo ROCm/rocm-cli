@@ -1058,7 +1058,7 @@ fn build_driver_install_plan_at(
     let id_like = field("ID_LIKE").unwrap_or_default();
 
     match (os_id.as_str(), version_id.as_str()) {
-        ("ubuntu", "22.04" | "24.04") => apt_driver_plan(
+        ("ubuntu", "22.04" | "24.04" | "26.04") => apt_driver_plan(
             os_id,
             version_id,
             codename,
@@ -1067,51 +1067,6 @@ fn build_driver_install_plan_at(
             true,
             escalation,
         ),
-        // TODO: AMD had not published a repo.radeon.com/amdgpu "resolute"
-        // suite as of 2026-08; re-check
-        // https://repo.radeon.com/amdgpu/latest/ubuntu/dists/ and switch this
-        // to apt_driver_plan(..., true) once it exists, the same way
-        // 22.04/24.04 are handled.
-        //
-        // This arm IS reachable through the CLI on a real host: the hosted
-        // `E2E tests` job's `ubuntu-latest` image (26.04 once GitHub's migration completes) runs `driver-install-06` in
-        // `driver_install.feature`, which asserts whichever arm the real host
-        // actually falls into, so this one has e2e coverage too, alongside
-        // the unit fixture in `driver_plan_ubuntu_2604_uses_native_archive_guidance`
-        // and its two neighbors below.
-        ("ubuntu", "26.04") => {
-            let sudo = escalation.prefix();
-            DriverInstallPlan {
-                supported: false,
-                mutating: false,
-                policy: "ubuntu_native_archive".to_owned(),
-                os_id,
-                version_id,
-                // codename_for_version already resolves this to "resolute" when
-                // VERSION_CODENAME/UBUNTU_CODENAME are absent, so this is never
-                // empty here -- no fallback needed.
-                codename,
-                repo_version_expr,
-                reason: format!(
-                    "Ubuntu 26.04 LTS ships ROCm natively via the standard archive and \
-                    includes the amdgpu kernel driver in-tree; AMD's repo.radeon.com/amdgpu \
-                    tree does not yet publish a 'resolute' suite, so no third-party DKMS repo \
-                    commands are planned. Run `{sudo}apt install rocm` for the userspace ROCm \
-                    stack instead."
-                ),
-                preflight_checks: Vec::new(),
-                commands: Vec::new(),
-                // `checks` renders as `post_reboot_checks:` and, like every other
-                // arm, holds passive verification targets only -- the mutating
-                // install command above belongs in `reason`, not here.
-                checks: vec!["rocm examine".to_owned(), "rocminfo".to_owned()],
-                // The amdgpu kernel driver ships in-tree with the kernel itself,
-                // not with this guidance's `apt install rocm` -- that command
-                // installs the userspace ROCm stack only, so nothing changes on
-                // the kernel side and no reboot is needed for it to take effect.
-                reboot_required: false,
-            }
-        }
         ("debian", "12" | "13") => {
             let repo_codename = if version_id == "13" { "noble" } else { "jammy" };
             let mut plan = apt_driver_plan(
@@ -1260,7 +1215,7 @@ fn driver_plan_via_id_like(
     // `ubuntu/<codename>` repo, so the plan is identical to the Ubuntu base.
     // Derivatives with their own version scheme (e.g. Linux Mint's "22") do not
     // match here and remain unsupported rather than guessing a codename.
-    if mentions("ubuntu") && matches!(version_id, "22.04" | "24.04") {
+    if mentions("ubuntu") && matches!(version_id, "22.04" | "24.04" | "26.04") {
         let codename = if codename.is_empty() {
             codename_for_version("ubuntu", version_id)
                 .unwrap_or_default()
@@ -1353,6 +1308,15 @@ fn apt_driver_plan(
     let sudo = escalation.prefix();
     let mut commands = Vec::new();
     if dkms {
+        // AMD's page says to remove an AMDGPU driver from a previous
+        // installation first. Removal is destructive, so the plan only
+        // detects and warns; the user decides.
+        commands.push(driver_command(
+            DriverCommandPhase::Prepare,
+            &format!(
+                "if dpkg-query -W -f='${{Status}}' amdgpu-dkms 2>/dev/null | grep -q 'install ok installed'; then echo 'warning: amdgpu-dkms from a previous installation is installed and was not removed. AMD advises removing it first: stop and run `{sudo}apt-get autoremove -y amdgpu-dkms`, then re-run this install.'; fi"
+            ),
+        ));
         commands.extend([
             driver_command(
                 DriverCommandPhase::Prepare,
@@ -1427,6 +1391,10 @@ fn apt_driver_plan(
         preflight_checks: if dkms {
             let mut checks = driver_root_preflight_checks(escalation);
             checks.push("`apt-get` package manager is available".to_owned());
+            checks.push(
+                "no previous `amdgpu-dkms` install (the first command warns if one is found; nothing is removed automatically)"
+                    .to_owned(),
+            );
             checks
         } else {
             Vec::new()
@@ -2843,7 +2811,7 @@ VERSION_CODENAME=noble
     }
 
     #[test]
-    fn driver_plan_ubuntu_2604_uses_native_archive_guidance() {
+    fn driver_plan_ubuntu_2604_plans_the_dkms_flow_with_the_resolute_suite() {
         let _env = ScopedTestEnv::with_amd_overrides_cleared();
         let os_release = r#"
 ID=ubuntu
@@ -2858,33 +2826,17 @@ VERSION_CODENAME=resolute
         );
         let rendered = render_driver_install_plan(&plan, false, false);
 
-        assert!(!plan.supported);
-        assert!(!plan.mutating);
-        assert_eq!(plan.policy, "ubuntu_native_archive");
+        assert!(plan.supported);
+        assert!(plan.mutating);
+        assert_eq!(plan.policy, "linux_official_amd_dkms_wrapper");
         assert_eq!(plan.codename, "resolute");
-        assert!(rendered.contains("approval: not required"));
-        assert!(rendered.contains("execution_commands: <none>"));
-        assert!(rendered.contains("sudo apt install rocm"));
-        assert!(!rendered.contains("amdgpu-dkms"));
-        assert!(plan.commands.is_empty());
-        // The kernel driver ships in-tree on 26.04, so this arm must not
-        // claim a reboot is needed for `apt install rocm` (userspace only).
-        assert!(!plan.reboot_required);
-        // `checks` renders as `post_reboot_checks:` and must hold verification
-        // targets only -- the mutating install guidance belongs in `reason`.
-        assert!(
-            !plan
-                .checks
-                .iter()
-                .any(|check| check.contains("apt install"))
-        );
+        assert!(rendered.contains("https://repo.radeon.com/amdgpu/latest/ubuntu resolute main"));
+        assert!(rendered.contains("Execute: sudo apt-get install -y amdgpu-dkms"));
+        assert!(plan.reboot_required);
     }
 
     #[test]
-    fn driver_plan_ubuntu_2604_root_guidance_drops_sudo() {
-        // Companion to the Sudo case above: this arm derives its guidance from
-        // `escalation` rather than hardcoding `sudo`, so a root host must see
-        // the same command with no `sudo` prefix.
+    fn driver_plan_ubuntu_2604_root_drops_sudo() {
         let _env = ScopedTestEnv::with_amd_overrides_cleared();
         let os_release = r#"
 ID=ubuntu
@@ -2899,18 +2851,15 @@ VERSION_CODENAME=resolute
         );
         let rendered = render_driver_install_plan(&plan, false, false);
 
-        assert!(rendered.contains("apt install rocm"));
-        assert!(!plan.reason.contains("sudo"));
-        assert!(!plan.checks.iter().any(|check| check.contains("sudo")));
+        assert!(rendered.contains("Execute: apt-get install -y amdgpu-dkms"));
+        assert!(plan.commands.iter().all(|c| !c.command.contains("sudo")));
     }
 
     #[test]
     fn driver_plan_ubuntu_2604_falls_back_to_resolute_codename() {
         let _env = ScopedTestEnv::with_amd_overrides_cleared();
         // No VERSION_CODENAME/UBUNTU_CODENAME in os-release: codename_for_version
-        // must supply "resolute" on its own, and the policy must still be the
-        // native-archive one -- pinning both closes the gap where deleting the
-        // whole ("ubuntu", "26.04") arm would still leave this test green.
+        // must supply "resolute" on its own.
         let os_release = r#"
 ID=ubuntu
 VERSION_ID="26.04"
@@ -2923,7 +2872,80 @@ VERSION_ID="26.04"
         );
 
         assert_eq!(plan.codename, "resolute");
-        assert_eq!(plan.policy, "ubuntu_native_archive");
+        assert!(plan.supported);
+        assert_eq!(plan.policy, "linux_official_amd_dkms_wrapper");
+    }
+
+    #[test]
+    fn driver_plan_apt_warns_about_a_previous_amdgpu_dkms_without_removing_it() {
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
+        let os_release = r#"
+ID=ubuntu
+VERSION_ID="24.04"
+VERSION_CODENAME=noble
+"#;
+        let plan = build_driver_install_plan_read(
+            &test_examine("linux", false),
+            &os_release_found(os_release),
+            true,
+            PrivilegeEscalation::Sudo,
+        );
+        let first = &plan
+            .commands
+            .first()
+            .expect("apt plan has commands")
+            .command;
+
+        // Detection runs before anything else, and only echoes: removal stays
+        // the user's call. Behavior is proven end to end by running the
+        // command against a stubbed dpkg-query in
+        // `previous_driver_warning_fires_only_when_amdgpu_dkms_is_installed`.
+        assert!(first.contains("dpkg-query"));
+        assert!(first.contains("sudo apt-get autoremove -y amdgpu-dkms"));
+        assert!(
+            !plan
+                .commands
+                .iter()
+                .skip(1)
+                .any(|c| c.command.contains("autoremove"))
+        );
+        assert!(
+            plan.preflight_checks
+                .iter()
+                .any(|check| check.contains("previous `amdgpu-dkms`"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn previous_driver_warning_fires_only_when_amdgpu_dkms_is_installed() {
+        use std::os::unix::fs::PermissionsExt;
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
+        let os_release = "ID=ubuntu\nVERSION_ID=\"24.04\"\nVERSION_CODENAME=noble\n";
+        let plan = build_driver_install_plan_read(
+            &test_examine("linux", false),
+            &os_release_found(os_release),
+            true,
+            PrivilegeEscalation::AlreadyRoot,
+        );
+        let command = &plan.commands[0].command;
+        let root = std::env::temp_dir().join(format!("rocm-prevdrv-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let run = |status: &str| {
+            let stub = root.join("dpkg-query");
+            fs::write(&stub, format!("#!/bin/sh\nprintf '%s' '{status}'\n")).unwrap();
+            fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+            let out = ProcessCommand::new("sh")
+                .args(["-c", command])
+                .env("PATH", format!("{}:/usr/bin:/bin", root.display()))
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        assert!(run("install ok installed").contains("warning: amdgpu-dkms"));
+        assert!(run("").is_empty());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[cfg(unix)]
