@@ -11,6 +11,13 @@ Feature: ComfyUI install reports progress and makes failures actionable
   # The runtime, its rocm_sdk probe, the Python interpreter and `uv` itself are
   # all planted so the scenario is hermetic: no GPU, no network, no real
   # package resolution.
+  #
+  # This scenario and comfyui-02/-03 below are hermetic and Windows-portable
+  # (no `@requires-os:linux`), but nothing in required CI ran them on Windows
+  # until the required `windows-build-and-test` lane started selecting their
+  # ids explicitly via `E2E_ALSO_RUN_IDS` (see `docs/testing.md`'s "Install
+  # lifecycle" section) — before that, Windows coverage depended entirely on
+  # the optional, self-hosted `e2e-selfhosted.yml` lane.
   @id:comfyui-uv-install-failure-names-log
   Scenario: comfyui-01 - A failed dependency install names the log it wrote
     Given a ready ROCm runtime with a ComfyUI checkout pending dependencies

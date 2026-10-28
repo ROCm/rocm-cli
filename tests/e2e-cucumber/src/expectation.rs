@@ -625,6 +625,34 @@ pub fn resolve(
     Expectation::ExpectPass
 }
 
+/// Whether a scenario runs in an `E2E_ONLY_LIFECYCLE=1` lane.
+///
+/// True for a scenario that is itself `@lifecycle`, or whose `@id` is one of
+/// `extra_ids` — scenarios a caller has explicitly opted into this lane
+/// without tagging them `@lifecycle` (which would also pull them out of
+/// `nightly.yml` and `e2e-selfhosted.yml`, neither of which restricts to the
+/// lifecycle set).
+pub fn lifecycle_lane_includes(decl: &ScenarioDecl, extra_ids: &[String]) -> bool {
+    decl.lifecycle
+        || decl
+            .id
+            .as_deref()
+            .is_some_and(|id| extra_ids.iter().any(|e| e == id))
+}
+
+/// `extra_ids` entries that match no scenario's `@id` in `known_ids`.
+///
+/// `lifecycle_lane_includes` folds an unmatched id in silently — a renamed or
+/// typo'd `@id:` tag would otherwise drop a scenario out of the lane with CI
+/// staying green. The caller should treat a non-empty result as fatal.
+pub fn unmatched_also_run_ids<'a>(extra_ids: &'a [String], known_ids: &[String]) -> Vec<&'a str> {
+    extra_ids
+        .iter()
+        .filter(|id| !known_ids.contains(*id))
+        .map(String::as_str)
+        .collect()
+}
+
 /// Tiny glob: `*` matches any run of chars. Used only for `therock_family`.
 fn glob_match(pattern: &str, text: &str) -> bool {
     let pattern = pattern.to_ascii_lowercase();
@@ -945,6 +973,63 @@ serve_timeout_secs = 90
             ),
             Expectation::Skip { .. }
         ));
+    }
+
+    #[test]
+    fn lifecycle_lane_includes_lifecycle_scenarios_regardless_of_extra_ids() {
+        let d = decl(&["id:lifecycle-linux-install", "lifecycle"]);
+        assert!(lifecycle_lane_includes(&d, &[]));
+        assert!(lifecycle_lane_includes(&d, &["some-other-id".to_owned()]));
+    }
+
+    #[test]
+    fn lifecycle_lane_includes_a_non_lifecycle_scenario_named_in_extra_ids() {
+        let d = decl(&["id:comfyui-uv-install-failure-names-log"]);
+        assert!(!d.lifecycle);
+        assert!(lifecycle_lane_includes(
+            &d,
+            &["comfyui-uv-install-failure-names-log".to_owned()]
+        ));
+    }
+
+    #[test]
+    fn lifecycle_lane_excludes_a_non_lifecycle_scenario_not_named_in_extra_ids() {
+        let d = decl(&["id:comfyui-uv-install-failure-names-log"]);
+        assert!(!lifecycle_lane_includes(&d, &["some-other-id".to_owned()]));
+        assert!(!lifecycle_lane_includes(&d, &[]));
+    }
+
+    #[test]
+    fn lifecycle_lane_excludes_a_scenario_with_no_id_even_with_extra_ids_set() {
+        let d = decl(&[]);
+        assert!(d.id.is_none());
+        assert!(!lifecycle_lane_includes(
+            &d,
+            &["comfyui-uv-install-failure-names-log".to_owned()]
+        ));
+    }
+
+    #[test]
+    fn unmatched_also_run_ids_is_empty_when_every_extra_id_matches_a_known_id() {
+        let known = vec!["comfyui-01".to_owned(), "comfyui-02".to_owned()];
+        let extra = vec!["comfyui-01".to_owned()];
+        assert!(unmatched_also_run_ids(&extra, &known).is_empty());
+    }
+
+    #[test]
+    fn unmatched_also_run_ids_names_an_extra_id_no_scenario_carries() {
+        let known = vec!["comfyui-01".to_owned()];
+        let extra = vec!["comfyui-01".to_owned(), "comfyui-02-renamed".to_owned()];
+        assert_eq!(
+            unmatched_also_run_ids(&extra, &known),
+            vec!["comfyui-02-renamed"]
+        );
+    }
+
+    #[test]
+    fn unmatched_also_run_ids_is_empty_when_extra_ids_is_empty() {
+        let known = vec!["comfyui-01".to_owned()];
+        assert!(unmatched_also_run_ids(&[], &known).is_empty());
     }
 
     #[test]
