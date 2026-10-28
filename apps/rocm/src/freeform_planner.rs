@@ -29,9 +29,10 @@
 //! guaranteed deterministic across calls) can never describe one command to
 //! the caller that renders it and a different one to the caller that executes
 //! it. Everything downstream of "is this request freeform at all"
-//! (`parse_freeform_invocation`/`should_treat_as_freeform`) and "is this action
-//! safe to execute" (`validate_freeform_execution_action`) stays in `main.rs` —
-//! this module only builds and renders the plan.
+//! (`parse_freeform_invocation`/`should_treat_as_freeform`, which stay in
+//! `main.rs`) and "is this action safe to execute" (`validate_freeform_execution_action`,
+//! which moved to `freeform_execution.rs` in a later follow-up, ROCMAI-726) is
+//! out of scope here — this module only builds and renders the plan.
 
 use anyhow::{Context, Result, bail};
 use clap::Parser as _;

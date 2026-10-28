@@ -2359,6 +2359,14 @@ async fn answer_names_nothing_identifying(world: &mut E2eWorld) {
         );
         return;
     }
+    assert_names_no_user_host_or_path(&out);
+}
+
+/// The sweep behind the claim that a report names no user, host, or file path.
+///
+/// Shared by the step that checks the report and the step that checks the
+/// sentence the CLI prints about it, so the sentence is held to the same proof.
+fn assert_names_no_user_host_or_path(out: &str) {
     let user = std::env::var("USER")
         .or_else(|_| std::env::var("USERNAME"))
         .unwrap_or_default();
@@ -2462,6 +2470,43 @@ async fn assert_send_headless_prints_address_and_link(world: &mut E2eWorld) {
                 || out.contains("\"refused\""),
             "the output is neither a genuine report nor a stated refusal, so this assertion \
              would otherwise pass without a report ever existing to check:\n{out}"
+        );
+    }
+}
+
+#[then(
+    "the CLI says the mail carries the user's own address, and the report names no user, host, or file path"
+)]
+async fn assert_sender_notice_is_given_and_true(world: &mut E2eWorld) {
+    let out = world.cli_output.clone().expect("no CLI output");
+    let notice = "it goes from your own mail account and carries your address";
+    // Same discriminator as above. A refusal offers no mail, so it has nothing
+    // to say about one.
+    if out.contains("cli_version") {
+        assert!(
+            out.contains(notice),
+            "a mail was offered without telling the user it carries their address:\n{out}"
+        );
+        assert!(
+            out.contains("The report itself names no user, host, or file path."),
+            "the notice no longer states what the report leaves out:\n{out}"
+        );
+        // The second sentence is a claim about this output. Prove it here,
+        // against the same run, rather than trusting the wording. The notice
+        // line itself is left out of the sweep: it names the words "user",
+        // "host" and "path", and a lane whose `$USER` or host name is one of
+        // them (`USER=user` is common in containers) would fail on the
+        // sentence instead of on the report.
+        let without_notice: String = out
+            .lines()
+            .filter(|line| !line.contains(notice))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_names_no_user_host_or_path(&without_notice);
+    } else {
+        assert!(
+            !out.contains(notice),
+            "a refusal offers no mail, yet the user was told about one:\n{out}"
         );
     }
 }
@@ -2669,6 +2714,90 @@ async fn user_diagnoses_planted_machine(world: &mut E2eWorld) {
     world.cli_output = Some(stdout);
     world.cli_stderr = Some(stderr);
     world.cli_rc = Some(rc);
+}
+
+// ── Stale repo advice on a simulated Ubuntu host ───────────────────
+
+#[given("an Ubuntu 24.04 machine with two stale ROCm repo files")]
+async fn ubuntu_with_stale_repos(world: &mut E2eWorld) {
+    let host = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("host-root");
+    std::fs::create_dir_all(host.join("etc/apt/sources.list.d"))
+        .expect("failed to create planted apt directory");
+    std::fs::write(
+        host.join("etc/os-release"),
+        "ID=ubuntu\nVERSION_ID=\"24.04\"\nVERSION_CODENAME=noble\nPRETTY_NAME=\"Ubuntu 24.04 LTS\"\n",
+    )
+    .expect("failed to write planted os-release");
+    for name in ["amdgpu.list", "rocm.list"] {
+        std::fs::write(
+            host.join("etc/apt/sources.list.d").join(name),
+            "# planted\n",
+        )
+        .expect("failed to plant a repo file");
+    }
+    world
+        .command_env
+        .push(("ROCM_CLI_TEST_HOST_ROOT", host.into_os_string()));
+}
+
+#[when("the user diagnoses that machine with a stale repo symptom")]
+async fn user_diagnoses_stale_repo_symptom(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(
+        world,
+        &[
+            "diagnose",
+            "--symptom",
+            "stale repo conflict",
+            "--top",
+            "20",
+        ],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the stale repo cause names both planted repo files and the driver reinstall command")]
+async fn assert_stale_repo_advice(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no diagnose output");
+    let cause: Vec<&str> = output
+        .lines()
+        .skip_while(|line| !line.contains("(fix-7-stale-repos)"))
+        .take_while(|line| !line.trim().is_empty())
+        .collect();
+    let text = cause.join("\n");
+    assert!(
+        !text.is_empty(),
+        "no stale repo cause was reported:\n{output}"
+    );
+    // The logical paths a user would move, not the scenario's temp host root.
+    for file in ["amdgpu.list", "rocm.list"] {
+        assert!(
+            text.contains(&format!("/etc/apt/sources.list.d/{file}")),
+            "{file} must be named by its real path:\n{text}"
+        );
+    }
+    assert!(
+        text.contains("rocm install driver --dkms --yes"),
+        "Ubuntu 24.04 has a driver plan, so the advice must name it:\n{text}"
+    );
+}
+
+#[then("the advised driver reinstall command accepts the flags it is advised with")]
+async fn assert_advised_driver_command_exists(world: &mut E2eWorld) {
+    let (stdout, _stderr, rc) = crate::run_rocm(world, &["install", "driver", "--help"]);
+    assert_eq!(rc, 0, "`rocm install driver --help` must exist:\n{stdout}");
+    for flag in ["--dkms", "--yes"] {
+        assert!(
+            stdout.contains(flag),
+            "{flag} is advised but not accepted:\n{stdout}"
+        );
+    }
 }
 
 // ── Windows display driver advice ──────────────────────────────────

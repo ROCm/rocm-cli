@@ -28,18 +28,21 @@ use crate::freeform_planner::{
     format_structured_tool_call, infer_engine_from_request, plan_freeform_request_with_context,
     serve_args_request_cpu_device,
 };
+use crate::managed_service_status::{
+    friendly_engine_label, load_managed_services, managed_service_is_live,
+};
 use crate::runtimes_cmd::render_runtimes_text;
 use crate::service_launch::is_loopback_host;
+use crate::uninstall_plan::render_uninstall_dry_run;
 use crate::{
     ChatInferenceParams, apply_app_path_env, build_codex_bridge_gpu_snapshot,
     build_codex_bridge_snapshot, builtin_codex_bridge_engine_inventory, cli_version_string,
-    friendly_engine_label, load_managed_services, managed_service_is_live, read_tail_lines,
-    record_cli_audit_event, render_automations_text, render_config_text, render_daemon_text,
-    render_engine_inventory_text_with_paths, render_examine_text, render_examine_text_with_paths,
-    render_logs_browser_text, render_logs_text,
+    read_tail_lines, record_cli_audit_event, render_automations_text, render_config_text,
+    render_daemon_text, render_engine_inventory_text_with_paths, render_examine_text,
+    render_examine_text_with_paths, render_logs_browser_text, render_logs_text,
     render_model_registry_verbose_text_with_context_and_host, render_service_logs_text,
-    render_services_text, render_setup_status_text, render_uninstall_dry_run, render_update_text,
-    service_model_names_match, therock_install_version_selector, validate_service_id,
+    render_services_text, render_setup_status_text, render_update_text, service_model_names_match,
+    therock_install_version_selector, validate_service_id,
 };
 use crate::{chat_host_facts, comfyui, providers, therock};
 use anyhow::{Context, Result, bail};

@@ -35,6 +35,7 @@ publish = false
 anyhow = "1.0"
 async-stream = "0.3"
 axum = "0.8"
+base64 = "0.22"
 clap = { version = "4.6", features = ["derive", "string", "suggestions"] }
 clap_complete = "4.6"
 crossterm = { version = "0.29", features = ["libc", "use-dev-tty"] }

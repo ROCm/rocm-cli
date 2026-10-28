@@ -30,10 +30,8 @@ use crate::runtimes_cmd::{
     ActiveRuntimeMarker, InstallRootDecision, active_runtime_marker_path,
     should_remove_runtime_install_root,
 };
-use crate::{
-    StorageCommand, UninstallPlan, UninstallPlanEntry, confirm_uninstall, format_bytes,
-    remove_path, therock,
-};
+use crate::uninstall_plan::{UninstallPlan, UninstallPlanEntry, confirm_uninstall, remove_path};
+use crate::{StorageCommand, format_bytes, therock};
 
 /// Recent installs kept per retention bucket by default (see
 /// [`retention_group`]): the one in use plus one rollback target. This is the

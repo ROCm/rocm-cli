@@ -207,13 +207,22 @@ Current workspace members:
 - shared crates: `crates/rocm-core`, `crates/rocm-engine-protocol`
 - engine crates: `engines/lemonade`, `engines/vllm`, `engines/aim`
 
-Shared UI components — reuse rather than hand-rolling new ones:
-`apps/rocm/src/cli_progress.rs`'s `Spinner` for a caller-driven indicator that
-only advances when the caller's own loop ticks it (e.g. `serve`'s
-HTTP-polling wait loop); that same file's `AnimatedSpinner` for progress that
-must keep animating between caller updates, which can go quiet for long
-stretches (e.g. a download or the ComfyUI/SDK extraction spinner); and
-`crates/rocm-dash-tui/src/ui/approval.rs` for approval-state prompts.
+Shared UI components — reuse rather than hand-rolling new ones. The CLI (`apps/rocm`) and the dash-TUI (`crates/rocm-dash-tui`) each have their own set; they are not interchangeable (see the naming-collision warning below).
+
+CLI, in [`apps/rocm/src/cli_progress.rs`](apps/rocm/src/cli_progress.rs):
+
+- **`Spinner`** — a caller-driven indicator that only advances when the caller's own loop ticks it (e.g. `serve`'s HTTP-polling wait loop)
+- **`AnimatedSpinner`** — progress that must keep animating between caller updates and can go quiet for long stretches (e.g. a download, or the ComfyUI/SDK extraction spinner)
+
+dash-TUI, in `crates/rocm-dash-tui/src/ui/`:
+
+- **[`approval.rs`](crates/rocm-dash-tui/src/ui/approval.rs)** — approval-state prompts
+- **[`job_console.rs`](crates/rocm-dash-tui/src/ui/job_console.rs)**'s `draw_job_console`/`on_console_key` — the shared "a job is running" surface (streamed output, status header, Ctrl+C cancels/`q` always closes/Esc-Enter dismiss a finished job); every operational manager already routes through this instead of building its own console
+- **[`spinner.rs`](crates/rocm-dash-tui/src/ui/spinner.rs)**'s `spinner_frame`/`parse_progress_pct` — the braille animation and percentage parsing `job_console.rs` renders with
+- **[`panel.rs`](crates/rocm-dash-tui/src/ui/panel.rs)**'s `bento`/`popup` — bordered, titled panels; prefer these over an inline `Block::default()`
+- **[`theme.rs`](crates/rocm-dash-tui/src/ui/theme.rs)**'s `job_status_color` — the pattern to follow for any status enum's color (Running/Error/Pending/etc.); route through (or extend) a shared status→color mapping rather than a bespoke inline match per screen
+
+**Two different components are both informally "the spinner"; they are not interchangeable.** The CLI's [`cli_progress.rs`](apps/rocm/src/cli_progress.rs) `Spinner`/`AnimatedSpinner` above is TTY/stderr-gated for a plain terminal and lives in `apps/rocm`. The dash-TUI's [`spinner.rs`](crates/rocm-dash-tui/src/ui/spinner.rs) above is a pure frame/percentage helper rendered through `job_console.rs` inside a ratatui frame loop, and lives in `crates/rocm-dash-tui`. A dash-TUI screen needs the latter.
 
 Guardrails:
 

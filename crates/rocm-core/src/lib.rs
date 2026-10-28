@@ -38,6 +38,7 @@ pub mod process;
 pub mod quoting;
 pub mod report;
 pub mod report_delivery;
+pub mod report_rollup;
 pub mod rocm_install;
 pub mod runtime;
 pub mod service_identity;
@@ -157,10 +158,11 @@ pub use process::{
 };
 pub use quoting::{posix_shell_quote, powershell_quote};
 pub use report::{
-    APPROVED_ARCHITECTURES, APPROVED_ARCHITECTURES_SOURCE, REPORT_SCHEMA_VERSION, ReadOutcome,
-    Refusal as ReportRefusal, Report, is_rocm_supported, prepare_report, read_report,
+    APPROVED_ARCHITECTURES, APPROVED_ARCHITECTURES_SOURCE, GROUP_AXES, REPORT_SCHEMA_VERSION,
+    ReadOutcome, Refusal as ReportRefusal, Report, is_rocm_supported, prepare_report, read_report,
     refusal_envelope,
 };
+pub use report_rollup::{Group as ReportGroup, Rollup as ReportRollup};
 pub use rocm_install::{LegacyRocmSummary, detect_legacy_rocm_sdk, detect_legacy_rocm_summary};
 use rocm_install::{RocmInstall, discover_rocm_installs, rocm_install_version};
 use runtime::env_path_override;

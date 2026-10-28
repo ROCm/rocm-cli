@@ -254,6 +254,23 @@ fallback paired an architecture line with the wrong GPU. On that machine
 `rocm diagnose` must **not** report `info-20-gpu-no-rocm-support` at all — the
 discrete card does have ROCm support, so the whole-machine claim is false.
 
+## 2b. Bare-Metal Driver Install
+
+On a real apt/dnf/zypper Linux host:
+
+```bash
+rocm install driver --dry-run
+```
+
+Expected result: the plan names the floating `latest` amdgpu release unless
+`ROCM_CLI_AMDGPU_DRIVER_VERSION` is set, in which case it names that version
+instead. A malformed override (e.g. containing a space or `'`) is refused with
+a reason naming `ROCM_CLI_AMDGPU_DRIVER_VERSION`, not silently ignored.
+
+On an Ubuntu 26.04 host, expect `supported: false` instead: `repo.radeon.com`
+has no DKMS repo for it yet (the amdgpu driver ships in-tree), so the plan
+directs you to `apt install rocm` rather than naming any DKMS commands.
+
 ## 3. Lemonade GPU Verification
 
 Lemonade is the default local assistant/server engine. Serve a small assistant
@@ -633,8 +650,11 @@ Expected result:
   CLI's own explanation, says no report was prepared, and the footer has no
   `s review & send`. Pressing `s` then does nothing.
 - `s` does not send. It opens a review dialog titled `Report this diagnosis`
-  that shows the full report, and `Deny` is the selected button. Check that
-  nothing else happened: no mail client opened and no job started.
+  that shows the full report, and `Deny` is the selected button. Its second
+  line, above the report, says the mail goes from your own mail account and
+  carries your address, so that is on screen before you approve, without
+  scrolling. Check that nothing else happened: no mail client opened and no job
+  started.
 - In the dialog, PgUp and PgDn scroll one page, Home and End jump to the top and
   the bottom. A muted `More to read` line with the row position appears only
   while the report is longer than the dialog. Up and Down do not scroll.
@@ -645,7 +665,10 @@ Expected result:
   your mail client, or on a machine with no mail client prints the address and
   the link. The mail is not sent until you send it from the mail client. The
   send examines the machine again, so the mail can differ slightly from the
-  preview if the machine changed in between.
+  preview if the machine changed in between. In the console, the line straight
+  under the report says the mail goes from your own mail account and carries
+  your address, and that the report itself names no user, host, or file path.
+  Check that the report above it bears that out.
 
 On an 80x24 terminal, repeat the steps up to the dialog: the card shows the
 outcome (report ready or refusal) without scrolling.
