@@ -194,13 +194,12 @@ pub(crate) fn read_service_state(path: &Path) -> Result<Value> {
 /// [`inference_verified`]), which patches the file directly rather than
 /// routing through here.
 fn write_state(path: &Path, value: &Value) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-    fs::write(
+    // `rocmd` and `rocm uninstall` read this file while a launch rewrites it;
+    // the atomic publish means they never see a torn document. It creates the
+    // parent directory itself.
+    rocm_core::write_file_atomically(
         path,
-        serde_json::to_vec_pretty(value).context("failed to serialize vLLM state")?,
+        &serde_json::to_vec_pretty(value).context("failed to serialize vLLM state")?,
     )
     .with_context(|| format!("failed to write {}", path.display()))
 }

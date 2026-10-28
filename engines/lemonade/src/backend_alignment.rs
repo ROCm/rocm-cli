@@ -2036,8 +2036,8 @@ mod tests {
 
     #[test]
     fn a_failed_put_back_says_so_and_leaves_the_restored_pins_in_place() {
-        // The backup points at a directory that does not exist, so writing the
-        // previous bytes back fails.
+        // The backup's parent is a regular file, so writing the previous bytes
+        // back fails whether or not the writer creates missing directories.
         let flow = restore_flow(
             vec![
                 Err(anyhow!("connection reset")),
@@ -2046,8 +2046,9 @@ mod tests {
             |pin_file, dir| {
                 let previous = fs::read(pin_file).unwrap();
                 fs::write(pin_file, "PACKAGED").unwrap();
+                fs::write(dir.join("not-a-dir"), "file").unwrap();
                 Ok(Some(PinFileBackup::new(
-                    dir.join("no-such-dir").join("backend_versions.json"),
+                    dir.join("not-a-dir").join("backend_versions.json"),
                     Some(previous),
                 )))
             },

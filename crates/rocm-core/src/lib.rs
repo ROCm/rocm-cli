@@ -3,8 +3,9 @@
 // SPDX-License-Identifier: MIT
 
 use anyhow::{Context, Result, bail};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -132,15 +133,16 @@ pub use model_catalog::{
 };
 pub use net::{
     Backoff, DEFAULT_LOCAL_HOST, DEFAULT_LOCAL_PORT, DOWNLOAD_MAX_ATTEMPTS, DownloadOutcome,
-    DownloadRequest, EndpointReadiness, EndpointReadinessOutcome, HttpResponseParts,
-    INFERENCE_PROBE_ATTEMPTED_STATE_KEY, INFERENCE_PROBE_RETRY_INTERVAL, INFERENCE_PROBE_TIMEOUT,
-    INFERENCE_VERIFIED_STATE_KEY, connect_tcp_stream, download_file_streaming,
-    download_file_streaming_with_progress, download_file_to_path,
+    DownloadRequest, EndpointIdentity, EndpointReadiness, EndpointReadinessOutcome,
+    HttpResponseParts, INFERENCE_PROBE_ATTEMPTED_STATE_KEY, INFERENCE_PROBE_RETRY_INTERVAL,
+    INFERENCE_PROBE_TIMEOUT, INFERENCE_VERIFIED_STATE_KEY, connect_tcp_stream,
+    download_file_streaming, download_file_streaming_with_progress, download_file_to_path,
     download_file_to_path_with_progress, engine_state_inference_verified, format_host_for_url,
     format_host_port, format_http_base_url, http_get_text, http_get_text_with_auth,
-    http_post_json_with_auth, managed_service_endpoint_model_ready,
-    managed_service_endpoint_readiness, merge_json_state_file, openai_chat_completion_probe,
-    openai_chat_completion_status, openai_models_endpoint_has_model, parse_http_endpoint,
+    http_get_with_auth, http_post_json_with_auth, managed_service_endpoint_identity,
+    managed_service_endpoint_model_ready, managed_service_endpoint_readiness,
+    merge_json_state_file, openai_chat_completion_probe, openai_chat_completion_status,
+    openai_models_endpoint_has_model, openai_models_endpoint_identity, parse_http_endpoint,
     read_http_response_bounded, write_all_tcp_stream,
 };
 pub use paths::{AppPaths, engine_plugin_dirs};
@@ -337,61 +339,188 @@ pub fn unix_time_millis() -> u128 {
         .as_millis()
 }
 
-/// Replace `path`'s content with `bytes`, atomically.
+/// How many temp names to try before giving up on staging an atomic write.
+const ATOMIC_WRITE_TEMP_ATTEMPTS: u32 = 128;
+
+/// A unique temp path next to `path`, preserving the full file name so a
+/// multi-extension artifact keeps its extensions (`sdk.tar.gz` becomes
+/// `sdk.tar.gz.tmp-<id>`, where `with_extension` would drop `.gz`).
+fn temp_sibling_path(path: &Path, suffix: &OsStr) -> Result<PathBuf> {
+    let parent = path.parent().context("file path has no parent directory")?;
+    let mut file_name = path
+        .file_name()
+        .context("file path has no file name")?
+        .to_os_string();
+    file_name.push(".tmp-");
+    file_name.push(suffix);
+    Ok(parent.join(file_name))
+}
+
+/// Move a staged temp file onto `path`, replacing whatever is there.
 ///
-/// Writes a sibling temp file and renames it over the destination: an
-/// interrupted write (full disk, crash, killed process) can never leave a
-/// truncated file in place, and a reader sees
-/// either the old content or the new content. The destination is NOT removed
-/// first: `fs::rename` replaces an existing file on both supported platforms
-/// (it is `MoveFileEx` with `MOVEFILE_REPLACE_EXISTING` on Windows), and
-/// removing it would open a window with no file at all, which a concurrent
-/// reader could see as "file doesn't exist" instead of the old or new
-/// content. The temp file is removed if the write or the rename fails.
+/// The single implementation of the publish step for the whole workspace. It
+/// lives here rather than in each caller because the Windows half is not
+/// something to re-derive: a plain `rename` over an existing file is not
+/// reliable while another process holds the destination open (an antivirus or
+/// indexer scanning a file this CLI just wrote is enough), so an existing
+/// destination goes through `ReplaceFileW`. Callers that got this wrong would
+/// fail in the direction that matters — `ManagedServiceRecord::write` is on the
+/// uninstall stop path, where a failed publish is reported as a service that
+/// could not be stopped and aborts the whole uninstall.
+#[cfg(not(windows))]
+pub fn publish_temp_file(tmp: &Path, path: &Path) -> std::io::Result<()> {
+    fs::rename(tmp, path)
+}
+
+/// Move a staged temp file onto `path`, replacing whatever is there.
 ///
-/// `tmp_ext` names the temp file's extension (e.g. `"json"`, `"jsonl"`).
-/// Both halves of the generated suffix matter: the timestamp keeps
-/// successive writes to the same path apart, and the pid keeps two
-/// processes writing in the same millisecond from clobbering each other's
-/// temp file and losing one of the two updates.
+/// See the non-Windows twin for why this is centralized.
+#[cfg(windows)]
+pub fn publish_temp_file(tmp: &Path, path: &Path) -> std::io::Result<()> {
+    if path.try_exists()? {
+        return replace_file_windows(path, tmp);
+    }
+
+    match fs::rename(tmp, path) {
+        Ok(()) => Ok(()),
+        Err(rename_error) => {
+            // The destination can appear between the check and the rename.
+            if path.try_exists()? {
+                replace_file_windows(path, tmp)
+            } else {
+                Err(rename_error)
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)] // Win32 FFI
+fn replace_file_windows(path: &Path, replacement: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
+
+    let path_wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let replacement_wide: Vec<u16> = replacement
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+
+    // SAFETY: both path buffers are valid, NUL-terminated UTF-16 strings and
+    // remain alive for the duration of the synchronous Windows API call. The
+    // optional backup, exclude, and reserved pointers are intentionally null.
+    let replaced = unsafe {
+        ReplaceFileW(
+            path_wide.as_ptr(),
+            replacement_wide.as_ptr(),
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    if replaced == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// Write `bytes` to `path` so a concurrent reader sees either the old contents
+/// or the new ones, never a half-written file.
 ///
-/// Not guaranteed:
-/// - Serializing writers: this takes no lock, so two read-modify-write
-///   cycles that overlap still lose one update (last rename wins). A caller
-///   whose new content depends on the old must hold a lock across the whole
-///   cycle, as the JSONL proposal store does (`automation::jsonl_lock_path`).
-///   Two callers in the *same process* within the same millisecond are a
-///   sharper case of this, not just a milder one: they generate the exact
-///   same temp path below, so concurrent `fs::write`s truncating that one
-///   path can publish mixed bytes, and the losing rename then fails outright
-///   (its source file already gone) rather than merely losing an update —
-///   this is the same-process collision
-///   `automation::tests::concurrent_appends_from_many_threads_lose_no_records`'s
-///   own comment describes ("two threads of one process even shared a
-///   temp-file name") — fixed for its own callers by the per-store lock
-///   `automation.rs` takes before ever calling into this function.
-/// - Durability: the bytes are not fsynced before the rename, so a power
-///   loss can still surface the new name with unflushed contents.
-/// - Replacing a destination another process holds open without delete
-///   sharing: on Windows the rename then fails with a sharing violation,
-///   this returns that error, and the old destination stays in place.
-pub fn write_atomic(path: &Path, bytes: &[u8], tmp_ext: &str) -> Result<()> {
-    let tmp_path = path.with_extension(format!(
-        "{tmp_ext}.tmp-{}-{}",
-        unix_time_millis(),
-        std::process::id()
-    ));
-    fs::write(&tmp_path, bytes)
-        .with_context(|| format!("failed to write {}", tmp_path.display()))
+/// Staged under a unique sibling name reserved with `create_new` — so two
+/// writers cannot pick the same scratch file — and published with
+/// [`publish_temp_file`]. A failed publish takes the scratch file with it.
+///
+/// Four limits worth knowing before reaching for this:
+///
+/// * **Atomic, not durable.** The staged bytes are `sync_all`ed before the
+///   publish, so a crash cannot leave a half-written or zero-length file. The
+///   containing *directory* is never fsynced, so the rename itself can still be
+///   lost by a power failure — the guarantee is that readers only ever see one
+///   complete version, not that the newest one survives a crash. That flush is
+///   held by construction, not by test: deleting it leaves every test green,
+///   because reproducing what it prevents needs a real crash between the write
+///   and the rename. Do not read a green suite as evidence it is still there.
+/// * **Permissions are not carried over.** This replaces the target inode with
+///   a freshly created file, so an existing file's mode does not survive (a
+///   difference from the `fs::write` it usually replaces), and the new file gets
+///   whatever the umask allows. The containing directory does not make up for
+///   it: `AppPaths::ensure` creates it with plain `create_dir_all` and no mode of
+///   its own. A caller with something sensitive to write must set the mode
+///   explicitly here; it cannot lean on the directory. `RocmCliConfig::save` is
+///   such a caller today (it persists the dashboard token) and does not yet.
+/// * **No lock.** Two read-modify-write cycles that overlap still lose one
+///   update (last rename wins), so a caller whose new content depends on the old
+///   must hold a lock across the whole cycle, as the JSONL stores in
+///   `automation` do.
+/// * **A symlink at `path` is replaced, not written through.** The publish is a
+///   rename onto `path` itself, so a symlink there is what gets replaced — where
+///   `fs::write` would have followed it and overwritten the target. That is the
+///   safer direction for state files (it cannot be aimed somewhere else by
+///   planting a link) but it is a behaviour change, so a caller that means to
+///   write through a link must resolve it first.
+pub fn write_file_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
+    let temp_id = format!("{}-{}", std::process::id(), unix_time_millis());
+    write_file_atomically_with_temp_id(path, bytes, &temp_id)
+}
+
+/// [`write_file_atomically`] with the scratch-file id supplied, so a test can
+/// plant files under the names the attempts will try and drive the
+/// already-exists retry and the exhausted-attempts failure deterministically.
+fn write_file_atomically_with_temp_id(path: &Path, bytes: &[u8], temp_id: &str) -> Result<()> {
+    let parent = path.parent().context("file path has no parent directory")?;
+    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+
+    let mut reserved = None;
+    for attempt in 0..ATOMIC_WRITE_TEMP_ATTEMPTS {
+        let tmp = temp_sibling_path(path, &OsString::from(format!("{temp_id}-{attempt}")))?;
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+        {
+            Ok(file) => {
+                reserved = Some((tmp, file));
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to create {}", tmp.display()));
+            }
+        }
+    }
+    let Some((tmp, mut file)) = reserved else {
+        bail!(
+            "failed to reserve a temporary file next to {} after {ATOMIC_WRITE_TEMP_ATTEMPTS} \
+             attempts",
+            path.display()
+        );
+    };
+
+    if let Err(error) = file.write_all(bytes) {
+        drop(file);
+        let _ = fs::remove_file(&tmp);
+        return Err(disk_space::map_write_error(error, &tmp));
+    }
+    // Flush before publishing. Without this the rename can reach the disk while
+    // the bytes have not, leaving a zero-length file after a crash — which for a
+    // service record is not a lost update but an unparseable manifest, and the
+    // uninstall gate refuses to remove anything while one of those exists.
+    if let Err(error) = file.sync_all() {
+        drop(file);
+        let _ = fs::remove_file(&tmp);
+        return Err(disk_space::map_write_error(error, &tmp));
+    }
+    drop(file);
+
+    publish_temp_file(&tmp, path)
         .inspect_err(|_| {
-            let _ = fs::remove_file(&tmp_path);
-        })?;
-    fs::rename(&tmp_path, path)
-        .with_context(|| format!("failed to replace {}", path.display()))
-        .inspect_err(|_| {
-            let _ = fs::remove_file(&tmp_path);
-        })?;
-    Ok(())
+            let _ = fs::remove_file(&tmp);
+        })
+        .with_context(|| format!("failed to publish {}", path.display()))
 }
 
 #[cfg(test)]
@@ -400,6 +529,385 @@ mod tests {
 
     use std::fs;
     use std::path::Path;
+
+    /// A private root for one test, removed on the way out.
+    fn atomic_write_root(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "rocm-core-atomic-write-{name}-{}-{}",
+            std::process::id(),
+            unix_time_millis()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("failed to create the test root");
+        root
+    }
+
+    /// The scratch files `write_file_atomically` stages under, if any survived.
+    ///
+    /// `temp_sibling_path` names them `<file>.tmp-<pid>-<millis>-<attempt>`, so
+    /// a leftover is visible as a sibling containing `.tmp-`.
+    fn leftover_scratch_files(dir: &Path) -> Vec<String> {
+        fs::read_dir(dir)
+            .expect("failed to read the test root")
+            .filter_map(|entry| {
+                let name = entry.ok()?.file_name().to_string_lossy().into_owned();
+                name.contains(".tmp-").then_some(name)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_taken_scratch_name_is_skipped_and_the_write_still_lands() {
+        // Another writer already holds attempt 0's name: the write must move on to
+        // the next attempt rather than fail or clobber the file it does not own.
+        let root = atomic_write_root("scratch-name-taken");
+        let target = root.join("record.json");
+        let taken = root.join("record.json.tmp-fixed-0");
+        fs::write(&taken, b"someone else's scratch").expect("plant the taken name");
+
+        write_file_atomically_with_temp_id(&target, b"mine", "fixed").expect("write");
+
+        assert_eq!(fs::read(&target).expect("read"), b"mine");
+        assert_eq!(
+            fs::read(&taken).expect("read"),
+            b"someone else's scratch",
+            "a scratch file that is not ours is left untouched"
+        );
+        assert_eq!(
+            leftover_scratch_files(&root),
+            vec!["record.json.tmp-fixed-0".to_owned()],
+            "our own scratch file is gone once published"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn every_scratch_name_taken_is_an_error_not_a_clobber() {
+        let root = atomic_write_root("scratch-names-exhausted");
+        let target = root.join("record.json");
+        fs::write(&target, b"original").expect("seed the target");
+        for attempt in 0..ATOMIC_WRITE_TEMP_ATTEMPTS {
+            fs::write(root.join(format!("record.json.tmp-fixed-{attempt}")), b"x")
+                .expect("plant a taken name");
+        }
+
+        let error = write_file_atomically_with_temp_id(&target, b"new", "fixed")
+            .expect_err("no scratch name is free");
+
+        assert!(
+            format!("{error:#}").contains("failed to reserve a temporary file"),
+            "{error:#}"
+        );
+        assert_eq!(
+            fs::read(&target).expect("read"),
+            b"original",
+            "a failed reservation leaves the target as it was"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Linux/unix: relies on a rename replacing the directory entry while an
+    /// already-open descriptor keeps reading the previous inode. Windows
+    /// publishes through `ReplaceFileW` and does not offer the same observation.
+    #[cfg(unix)]
+    #[test]
+    fn a_service_record_write_never_shows_a_reader_a_truncated_manifest() {
+        // `ManagedServiceRecord::write` runs on the uninstall stop path, where a
+        // torn manifest is not a lost update but an unparseable record that makes
+        // the gate refuse to remove anything.
+        //
+        // Asserting "the bytes landed" would not pin that: a plain `fs::write`
+        // also leaves correct final bytes and creates no scratch file, so such a
+        // test passes either way. The property only the atomic path has is what a
+        // *concurrent reader* sees — `fs::write` truncates the existing inode in
+        // place, so a reader holding it open watches the record disappear and
+        // come back, while the publish swaps in a new inode and leaves the old
+        // one whole. Hold the manifest open across a rewrite and require the old
+        // view to still be a complete, parseable record.
+        use std::io::{Read, Seek, SeekFrom};
+
+        let root = atomic_write_root("service-record-reader-safety");
+        let paths = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+        paths.ensure().expect("create the app directories");
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-reader-safety",
+            "vllm",
+            "amd/model",
+            "amd/model",
+            "127.0.0.1",
+            8000,
+            "managed",
+            0,
+            None,
+            None,
+            None,
+        );
+        record.status = "ready".to_owned();
+        record.write().expect("seed the manifest");
+
+        // A reader that opened the manifest before the rewrite began.
+        let mut reader = fs::File::open(&record.manifest_path).expect("open the manifest");
+
+        record.status = "stopped".to_owned();
+        record.write().expect("rewrite the manifest");
+
+        reader.seek(SeekFrom::Start(0)).expect("rewind");
+        let mut seen = Vec::new();
+        reader
+            .read_to_end(&mut seen)
+            .expect("read the open manifest");
+        let parsed: ManagedServiceRecord = serde_json::from_slice(&seen)
+            .expect("a reader holding the manifest open must never see a truncated document");
+        assert_eq!(
+            parsed.status, "ready",
+            "the open descriptor must still see the pre-write record, not a rewritten inode"
+        );
+
+        // And the published file is the new one.
+        let published: ManagedServiceRecord =
+            serde_json::from_slice(&fs::read(&record.manifest_path).expect("read back"))
+                .expect("the published manifest must parse");
+        assert_eq!(published.status, "stopped", "the rewrite must have landed");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_runtime_state_write_never_shows_a_reader_a_truncated_file() {
+        // The uninstall gate reads this file to decide whether a daemon is live; a
+        // torn write makes it unparseable and aborts the run. Same property as
+        // the service record: a reader holding the old inode must keep seeing a
+        // whole document across a rewrite.
+        use std::io::{Read, Seek, SeekFrom};
+
+        let root = atomic_write_root("runtime-state-reader-safety");
+        let paths = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+        paths.ensure().expect("create the app directories");
+        let mut state = AutomationRuntimeState {
+            running: true,
+            automations_enabled: true,
+            daemon_pid: 1,
+            daemon_start_ticks: None,
+            started_at_unix_ms: 1,
+            last_tick_unix_ms: 1,
+            local_webhook_endpoint: None,
+            active_watchers: Vec::new(),
+        };
+        state.write(&paths).expect("seed the state file");
+        let mut reader =
+            fs::File::open(paths.automation_state_path()).expect("open the state file");
+
+        state.running = false;
+        state.write(&paths).expect("rewrite the state file");
+
+        reader.seek(SeekFrom::Start(0)).expect("rewind");
+        let mut seen = Vec::new();
+        reader.read_to_end(&mut seen).expect("read the open file");
+        let parsed: AutomationRuntimeState = serde_json::from_slice(&seen)
+            .expect("a reader holding the file open must never see a truncated document");
+        assert!(
+            parsed.running,
+            "the open descriptor must see the pre-write state"
+        );
+        let published = AutomationRuntimeState::load(&paths)
+            .expect("load")
+            .expect("present");
+        assert!(!published.running, "the rewrite must have landed");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_service_record_write_leaves_no_scratch_sibling() {
+        // This pins scratch-file hygiene, NOT atomic publishing: a plain
+        // `fs::write` creates no scratch file at all and would pass too. The
+        // atomicity property is pinned next door, by
+        // `a_service_record_write_never_shows_a_reader_a_truncated_manifest`,
+        // which fails against an in-place write.
+        //
+        // It still earns its place, but for a smaller reason than uninstall:
+        // scratch siblings are named `<record>.json.tmp-<pid>-<millis>-<attempt>`,
+        // whose extension is `tmp-…`, and both `unreadable_service_manifests`
+        // and the record loader filter on `extension == "json"` — so a leaked
+        // one is skipped, not mistaken for a corrupt record, and cannot abort
+        // uninstall. What this guards is directory hygiene: a publish that
+        // aborts between staging and rename leaves litter that accumulates
+        // silently, one file per failed write, in a directory an operator reads
+        // by hand.
+        let root = atomic_write_root("service-record-publish");
+        let paths = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+        paths.ensure().expect("create the app directories");
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-atomic-publish",
+            "vllm",
+            "amd/model",
+            "amd/model",
+            "127.0.0.1",
+            8000,
+            "managed",
+            0,
+            None,
+            None,
+            None,
+        );
+        record.write().expect("first publish");
+        record.status = "stopped".to_owned();
+        record
+            .write()
+            .expect("republish over the existing manifest");
+
+        let services_dir = paths.services_dir();
+        let stray = fs::read_dir(&services_dir)
+            .expect("read the services directory")
+            .filter_map(|entry| {
+                let name = entry.ok()?.file_name().to_string_lossy().into_owned();
+                name.contains(".tmp-").then_some(name)
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            stray.is_empty(),
+            "publishing a record must leave no scratch manifest: {stray:?}"
+        );
+        let written = fs::read(&record.manifest_path).expect("read the manifest back");
+        let parsed: ManagedServiceRecord =
+            serde_json::from_slice(&written).expect("the published manifest must always parse");
+        assert_eq!(parsed.status, "stopped", "the republish must have landed");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn write_file_atomically_replaces_contents_and_leaves_no_scratch_file() {
+        // The publish must land the new bytes and take its staging file with it;
+        // a leaked scratch sibling in `services_dir` would be a file the uninstall
+        // gate has to reason about.
+        let root = atomic_write_root("replaces");
+        let target = root.join("record.json");
+        fs::write(&target, b"old contents").expect("seed the file");
+
+        write_file_atomically(&target, b"new contents").expect("the write must succeed");
+
+        assert_eq!(
+            fs::read(&target).expect("read back"),
+            b"new contents",
+            "the published file must hold the new bytes"
+        );
+        assert!(
+            leftover_scratch_files(&root).is_empty(),
+            "a successful publish must leave no scratch file: {:?}",
+            leftover_scratch_files(&root)
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Unix: needs a real symlink.
+    #[cfg(unix)]
+    #[test]
+    fn write_file_atomically_replaces_a_symlink_instead_of_writing_through_it() {
+        // Documented behaviour, and a change from the `fs::write` this replaced:
+        // that followed a symlink and overwrote whatever it pointed at, while
+        // the publish here renames onto the path itself. Security-relevant in
+        // the safe direction — planting a link next to a state file can no
+        // longer redirect the write somewhere else — but a change, so it is
+        // pinned rather than left as prose.
+        let root = atomic_write_root("symlink-target");
+        let elsewhere = root.join("elsewhere");
+        fs::write(&elsewhere, b"must not be touched").expect("seed the link target");
+        let target = root.join("state.json");
+        std::os::unix::fs::symlink(&elsewhere, &target).expect("plant a symlink at the target");
+
+        write_file_atomically(&target, b"published").expect("the write must succeed");
+
+        assert_eq!(
+            fs::read(&elsewhere).expect("read the link target"),
+            b"must not be touched",
+            "the write must not follow the symlink to its target"
+        );
+        assert_eq!(
+            fs::read(&target).expect("read the published file"),
+            b"published",
+            "the published bytes must land at the path itself"
+        );
+        assert!(
+            !fs::symlink_metadata(&target)
+                .expect("stat the published path")
+                .file_type()
+                .is_symlink(),
+            "the symlink must have been replaced by a regular file"
+        );
+        assert!(
+            leftover_scratch_files(&root).is_empty(),
+            "no scratch file may survive a successful publish"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn write_file_atomically_creates_the_parent_directory() {
+        // `ManagedServiceRecord::write` targets a services dir that may not exist
+        // yet on a first write.
+        let root = atomic_write_root("creates-parent");
+        let target = root.join("nested").join("deeper").join("record.json");
+
+        write_file_atomically(&target, b"contents").expect("the write must succeed");
+
+        assert_eq!(fs::read(&target).expect("read back"), b"contents");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn write_file_atomically_cleans_up_when_publishing_fails() {
+        // A failed publish must not strand its staging file. The destination is a
+        // non-empty directory, which no platform will let a file replace, so the
+        // failure happens at the publish step with the scratch file already
+        // written — exactly the path that has to clean up after itself.
+        let root = atomic_write_root("publish-fails");
+        let target = root.join("record.json");
+        fs::create_dir_all(&target).expect("seed a directory where the file goes");
+        fs::write(target.join("occupant"), b"x").expect("make it non-empty");
+
+        let error = write_file_atomically(&target, b"contents")
+            .expect_err("replacing a non-empty directory must fail");
+
+        assert!(
+            leftover_scratch_files(&root).is_empty(),
+            "a failed publish must remove its scratch file, got {:?} ({error:#})",
+            leftover_scratch_files(&root)
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn write_file_atomically_refuses_a_path_with_no_parent_or_an_unusable_parent() {
+        let error = write_file_atomically(Path::new("/"), b"x")
+            .expect_err("a root path has no directory to stage in");
+        assert!(format!("{error:#}").contains("no parent"), "{error:#}");
+
+        // A regular file where the parent directory should be: the directory
+        // cannot be created, and nothing may be left behind.
+        let root = atomic_write_root("parent-is-a-file");
+        let blocker = root.join("blocker");
+        fs::write(&blocker, b"x").expect("seed the blocking file");
+        let error = write_file_atomically(&blocker.join("record.json"), b"x")
+            .expect_err("a file cannot be a parent directory");
+        assert!(
+            format!("{error:#}").contains("failed to create"),
+            "{error:#}"
+        );
+        assert!(leftover_scratch_files(&root).is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn resolve_amd_smi_binary_prefers_home_rocm_venv_path() -> Result<()> {
@@ -536,13 +1044,13 @@ mod tests {
     }
 
     #[test]
-    fn write_atomic_writes_bytes_and_leaves_no_temp_file() -> Result<()> {
+    fn write_file_atomically_writes_bytes_and_leaves_no_temp_file() -> Result<()> {
         let temp_root =
             std::env::temp_dir().join(format!("rocm-cli-write-atomic-ok-{}", unix_time_millis()));
         fs::create_dir_all(&temp_root)?;
         let path = temp_root.join("store.jsonl");
 
-        write_atomic(&path, b"hello\n", "jsonl")?;
+        write_file_atomically(&path, b"hello\n")?;
 
         let written = fs::read(&path)?;
         let leftovers: Vec<_> = fs::read_dir(&temp_root)?
@@ -561,17 +1069,17 @@ mod tests {
     }
 
     #[test]
-    fn write_atomic_rename_failure_leaves_destination_and_dir_untouched() -> Result<()> {
+    fn write_file_atomically_rename_failure_leaves_destination_and_dir_untouched() -> Result<()> {
         let temp_root =
             std::env::temp_dir().join(format!("rocm-cli-write-atomic-fail-{}", unix_time_millis()));
         fs::create_dir_all(&temp_root)?;
         let path = temp_root.join("store.jsonl");
         // A file can't be renamed over an existing directory, so making the
-        // destination a directory forces `write_atomic`'s rename step to fail
+        // destination a directory forces `write_file_atomically`'s rename step to fail
         // after the temp file has already been written.
         fs::create_dir_all(&path)?;
 
-        let result = write_atomic(&path, b"hello\n", "jsonl");
+        let result = write_file_atomically(&path, b"hello\n");
         let destination_is_still_a_dir = path.is_dir();
         let leftovers: Vec<_> = fs::read_dir(&temp_root)?
             .filter_map(Result::ok)

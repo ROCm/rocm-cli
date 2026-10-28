@@ -362,7 +362,7 @@ fn restore_packaged_backend_versions_with(
         // Missing (or not JSON): there is nothing of the user's to keep.
         None => packaged,
     };
-    rocm_core::write_atomic(&target, &restored, "pins")
+    rocm_core::write_file_atomically(&target, &restored)
         .with_context(|| format!("failed to restore {}", target.display()))?;
     Ok(Some(PinFileBackup {
         target,
@@ -414,7 +414,7 @@ fn set_or_remove_pin(
 
 /// What `resources/backend_versions.json` held before
 /// [`restore_packaged_backend_versions`] rewrote it. Written back through
-/// `rocm_core::write_atomic`, like the restore itself.
+/// `rocm_core::write_file_atomically`, like the restore itself.
 ///
 /// A restore is attempted after any failed install, including a transient
 /// network or disk error, so a restore whose retry fails too must not leave a
@@ -437,7 +437,7 @@ impl PinFileBackup {
     /// Writes the previous bytes back, or removes the file if there were none.
     pub(crate) fn put_back(self) -> Result<()> {
         match self.previous {
-            Some(bytes) => rocm_core::write_atomic(&self.target, &bytes, "pins")
+            Some(bytes) => rocm_core::write_file_atomically(&self.target, &bytes)
                 .with_context(|| format!("failed to put back {}", self.target.display())),
             None => match fs::remove_file(&self.target) {
                 Err(err) if err.kind() != std::io::ErrorKind::NotFound => {

@@ -171,3 +171,20 @@ mod tests {
         assert_eq!(suffixes.len(), 64, "two calls must never share a suffix");
     }
 }
+
+/// A [`std::process::Command`] for a coreutils binary, by absolute path.
+///
+/// Some tests narrow `PATH` for the whole process while they run, and a test that
+/// spawns a bare name such as `sleep` at that moment fails with `ENOENT`. The
+/// stand-in processes the uninstall tests spawn have no reason to depend on
+/// `PATH`, so they take the standard location instead of racing it.
+#[cfg(unix)]
+pub(crate) fn bare_command(name: &str) -> std::process::Command {
+    for dir in ["/usr/bin", "/bin"] {
+        let candidate = std::path::Path::new(dir).join(name);
+        if candidate.is_file() {
+            return std::process::Command::new(candidate);
+        }
+    }
+    std::process::Command::new(name)
+}

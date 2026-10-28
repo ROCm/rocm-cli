@@ -203,10 +203,10 @@ pub(crate) fn read_service_state(path: &Path) -> Result<Value> {
 }
 
 fn write_state(path: &Path, value: &Value) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(path, serde_json::to_vec_pretty(value)?)
+    // `rocmd` and `rocm uninstall` read this file while a launch rewrites it;
+    // the atomic publish means they never see a torn document. It creates the
+    // parent directory itself.
+    rocm_core::write_file_atomically(path, &serde_json::to_vec_pretty(value)?)
         .with_context(|| format!("failed to write {}", path.display()))
 }
 

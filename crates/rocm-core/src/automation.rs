@@ -16,10 +16,10 @@
 //! line — its cost does not grow with the store. A torn tail — crash debris,
 //! or left by a write that failed partway — is cut by the next append rather
 //! than truncated in place: that append writes the store's clean prefix plus
-//! its own new record as a single rewrite via `write_atomic`, so a lock-free
+//! its own new record as a single rewrite via `write_file_atomically`, so a lock-free
 //! reader never observes a file shrunk mid-repair. That rewrite costs O(store)
 //! rather than O(record), the same as a proposal status update, which rewrites
-//! the whole store via `write_atomic` too. Nothing in this module ever
+//! the whole store via `write_file_atomically` too. Nothing in this module ever
 //! shrinks a store in place. Readers take no lock, and an unterminated last
 //! line that is not valid JSON — an append caught mid-write — is skipped
 //! rather than reported as corruption. The stores are not rotated or capped.
@@ -42,6 +42,7 @@ use crate::FileLock;
 use crate::WatcherMode;
 use crate::require_nonempty;
 use crate::unix_time_millis;
+use crate::write_file_atomically;
 
 #[derive(Debug, Clone, Copy)]
 pub struct BuiltinWatcherSpec {
@@ -122,6 +123,28 @@ pub struct AutomationRuntimeState {
     pub running: bool,
     pub automations_enabled: bool,
     pub daemon_pid: u32,
+    /// The daemon's kernel start-time, captured at spawn, so `daemon_pid` can be
+    /// checked for PID recycling before anything signals it.
+    ///
+    /// `daemon_pid` alone is not safe to kill: this file survives a crash,
+    /// OOM-kill or reboot with `running` still true, after which the OS can
+    /// reissue that PID to an unrelated process. Pairing the PID with its
+    /// start-time makes a recycled PID detectable ([`identity_state`]).
+    ///
+    /// `None` on two very different occasions, which callers must not conflate:
+    /// a state file written before this field existed, and a platform where
+    /// [`process_start_ticks`] can never return anything.
+    ///
+    /// Conflating them is a live hazard, because [`identity_state`] maps a `None`
+    /// recorded value to [`IdentityState::Matches`] — the legacy best-effort arm
+    /// — so **no recycling check happens at all** and a caller that signals on
+    /// that verdict is killing on a bare pid. Both supported platforms (Linux
+    /// `/proc`, Windows `GetProcessTimes`) can record a start-time, so there an
+    /// absent value means the record predates the field or its writer never
+    /// stamped it, and the pid is unverifiable. Only an unsupported platform
+    /// (neither source, i.e. macOS) can never produce one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_start_ticks: Option<u64>,
     pub started_at_unix_ms: u128,
     pub last_tick_unix_ms: u128,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -143,15 +166,21 @@ impl AutomationRuntimeState {
         Ok(Some(state))
     }
 
+    /// Publish the runtime state atomically.
+    ///
+    /// Written on every daemon tick, and read by `rocm uninstall` to decide
+    /// whether a background helper is still up. A plain `fs::write` leaves a
+    /// truncated file if the daemon dies mid-write, and uninstall has to treat an
+    /// unreadable state file as "cannot confirm the helper is stopped" — so a
+    /// crash at the wrong moment would block uninstall until the operator
+    /// repaired the file by hand.
     pub fn write(&self, paths: &AppPaths) -> Result<()> {
         paths.ensure()?;
         let path = paths.automation_state_path();
-        fs::write(
-            &path,
-            serde_json::to_vec_pretty(self)
-                .context("failed to serialize automation runtime state")?,
-        )
-        .with_context(|| format!("failed to write {}", path.display()))?;
+        let bytes = serde_json::to_vec_pretty(self)
+            .context("failed to serialize automation runtime state")?;
+        write_file_atomically(&path, &bytes)
+            .with_context(|| format!("failed to write {}", path.display()))?;
         Ok(())
     }
 
@@ -298,12 +327,12 @@ fn append_jsonl_record<T: Serialize>(path: &Path, record: &T, context_label: &st
             // `file` open at function return. The rename already succeeds
             // with this handle open regardless — std opens files with
             // `FILE_SHARE_DELETE` by default on Windows, so a rename isn't
-            // blocked by it (see `write_atomic`'s doc for the case that
+            // blocked by it (see `write_file_atomically`'s doc for the case that
             // *isn't* covered: another process holding the destination open
             // without delete-sharing) — but this states the intent rather
             // than leaning on that default.
             drop(file);
-            crate::write_atomic(path, &content, "jsonl")?;
+            crate::write_file_atomically(path, &content)?;
         }
         TailState::ValidUnterminated(start) => {
             line.insert(0, b'\n');
@@ -430,7 +459,7 @@ fn inspect_tail(path: &Path, file: &fs::File) -> Result<TailState> {
 ///
 /// Returns fewer bytes if the file now ends before `end`. Nothing this
 /// module's own writers do can shrink a store in place — an append only ever
-/// grows it, and a torn-tail repair replaces it wholesale via `write_atomic`
+/// grows it, and a torn-tail repair replaces it wholesale via `write_file_atomically`
 /// rather than truncating the live file (see [`inspect_tail`] and
 /// [`TailState::Torn`]) — so a short read here means the store was edited or
 /// truncated out-of-band, a case this module does not try to recover from
@@ -833,7 +862,7 @@ fn write_automation_proposals(
         );
         text.push('\n');
     }
-    crate::write_atomic(&path, text.as_bytes(), "jsonl")
+    crate::write_file_atomically(&path, text.as_bytes())
 }
 
 fn normalize_proposal_identity(proposal: &mut AutomationProposalRecord, index: usize) {
