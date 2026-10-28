@@ -370,14 +370,16 @@ position.
   `fix-19-shm-too-small`). Run `rocm diagnose` inside the distribution for
   those.
 - `--report` shows exactly what this machine would contribute to a problem
-  report, and sends nothing. There is no transport yet, and there will be no
-  automatic one: a report leaves a machine only by its owner's own action.
+  report, and sends nothing. There is no automatic transport, and there will be
+  none: a report leaves a machine only by its owner's own action.
 - `--send`, which requires `--report`, additionally offers a prefilled mail
   carrying that report. It still sends nothing: the mail opens already filled
   in with the content `--report` just printed, addressed to `ROCmCLI@amd.com`,
   and it leaves the machine only when you send it yourself. Requiring
   `--report` is what guarantees the content is shown before the mail is
-  offered.
+  offered. The mail goes from your own mail account, so it carries your
+  address even though the report does not, and the CLI says so each time it
+  offers one.
 
 The `--report` content is deliberately narrow (a schema version, the matched entry, whether
 a fix was offered for it, the GPU architecture and which compatibility
@@ -566,7 +568,20 @@ you what it couldn't find instead.
 #### Driver installation
 
 `install driver` installs the AMD kernel driver on Linux, using DKMS or a native
-package.
+package. On bare metal it defaults to the floating `latest` amdgpu release;
+set `ROCM_CLI_AMDGPU_DRIVER_VERSION` to pin a specific one. This replaces the
+older `ROCM_CLI_AMDGPU_VERSION`/`ROCM_CLI_AMDGPU_PACKAGE_RELEASE` pair, which
+pinned a fixed default and are no longer read; the plan is refused while either is still set,
+so an old pin is never silently turned into `latest`.
+
+On Ubuntu 26.04, the amdgpu driver ships in-tree and `repo.radeon.com` does not
+yet publish a matching DKMS repo, so `install driver` reports a non-mutating
+`supported: false` plan instead and directs you to `apt install rocm` for the
+userspace ROCm stack.
+
+Approving (`--yes`) a plan that is `supported: false` (Ubuntu 26.04, an
+undocumented distro, or a refused version override) installs nothing and exits
+non-zero, after printing the plan.
 
 On Windows, `install driver` is validate-only: it installs and changes nothing,
 with or without `--yes`, and it starts no driver command. It prints the AMD

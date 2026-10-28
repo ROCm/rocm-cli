@@ -119,9 +119,9 @@ Feature: GPU detection and system inspection
     Then the inspection reports Linux as the operating system
     And the inspection reports that the host is WSL
 
-  # The dry-run plan used to print the raw `${ROCM_CLI_AMDGPU_VERSION:-...}` shell
-  # placeholder on its `repo_version:` line instead of the effective version, so
-  # the preview a user reviews before approving disagreed with what the install
+  # The dry-run plan used to print the raw `${ROCM_CLI_AMDGPU_VERSION:-7.2.4}`
+  # shell placeholder on its `repo_version:` line instead of the effective version,
+  # so the preview a user reviews before approving disagreed with what the install
   # would actually pull. The plan is rendered on every Linux host regardless of
   # GPU (the driver is not yet installed when you preview it), so the mock lane
   # pins this without hardware.
@@ -296,6 +296,7 @@ Feature: GPU detection and system inspection
     Given a machine whose release file quotes every value in single quotes
     When the user inspects that machine in machine-readable form
     Then the inspection reports the distribution "rhel" version "9.4" named "Red Hat Enterprise Linux 9.4 (Plow)"
+    And the inspection reports the distribution family "fedora"
     And the inspection reports no trouble reading the release file
 
   @id:examine-reads-last-os-release-assignment @requires-os:linux
@@ -444,6 +445,27 @@ Feature: GPU detection and system inspection
     Then the inspection reports the display driver's version and date as the machine-readable form does
     And the inspection calls the driver old only when its date is before 27 July 2023
 
+  # `rocm_install_method` used to report "amdgpu-install"/"tarball-or-other";
+  # renamed to "repo-native"/"runfile-or-tarball" alongside the switch away
+  # from the amdgpu-install wrapper. It also feeds fix-12's applicability
+  # score (not which remediation commands it renders -- that comes from the
+  # package family and distro, not this field), so a silent revert of the
+  # rename would misfire there without any test catching it -- this pins the
+  # JSON contract directly rather than only
+  # asserting the human-readable form (examine-06), which never named it. A
+  # whitelist rather than one pinned value keeps this hermetic: which method
+  # actually fires depends on this host's real ROCm repo markers (some
+  # developer machines and self-hosted GPU runners have them, a clean mock
+  # lane does not), not just on the install this scenario plants. No GPU
+  # needed: the install is planted by the harness (`plant_unmanaged_rocm`),
+  # same as examine-06. Linux/WSL only, like examine-12: `probe_rocm_install`
+  # only runs there, so `rocm_install_method` is empty on Windows.
+  @id:examine-reports-a-current-install-method-name @requires-os:linux
+  Scenario: examine-30 - System inspection reports a current install-method name, not the retired amdgpu-install naming
+    Given a machine with a ROCm install that was not set up by the CLI
+    When the user inspects the system in machine-readable form
+    Then the inspection reports a current install-method name
+
   # The help's own worked examples are the first thing a new user copies, so a
   # model named there has to be one this CLI can actually serve. The check
   # accepts either form the README documents — a name the model listing knows,
@@ -454,7 +476,7 @@ Feature: GPU detection and system inspection
   # real catalog alias), so this ships as a guard rather than an expected
   # failure.
   @id:examine-help-serve-example-names-a-resolvable-model
-  Scenario: examine-30 - Every model the help offers as an example is one the CLI can resolve
+  Scenario: examine-31 - Every model the help offers as an example is one the CLI can resolve
     When the user reads the serve examples the help offers
     Then every model named there is one the CLI can resolve
 
@@ -466,6 +488,6 @@ Feature: GPU detection and system inspection
   # Since fixed on main (the same EAI-8011 change now describes bare `rocm` as
   # the launcher), so this ships as a guard rather than an expected failure.
   @id:examine-help-describes-the-default-command
-  Scenario: examine-31 - The help tells the two ways of opening a screen apart
+  Scenario: examine-32 - The help tells the two ways of opening a screen apart
     When the user asks for help
     Then running the CLI with no subcommand is not described as the dashboard command

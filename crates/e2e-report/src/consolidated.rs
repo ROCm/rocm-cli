@@ -1007,34 +1007,37 @@ fn report_sort_key(r: &PlatformReport) -> (&str, &str, bool, Option<&str>) {
     )
 }
 
-/// The per-platform `PlatformReport` set, bundled with the `(label,
-/// json_path)` inputs they were parsed from.
+/// Everything the consolidated report renders, built once from one set of
+/// `(label, json_path)` inputs.
 ///
-/// Returned by [`load_platform_reports`] so [`generate_consolidated`] and
-/// [`consolidated_summary_markdown`] always render `reports` and `inputs`
-/// from the same platform set — the two can no longer be independently
-/// filtered, reordered, or re-paired into a self-contradicting report the way
-/// two loose parameters could (ROCMAI-484 / ROCm/rocm-cli#640). Opaque:
-/// nothing outside this crate needs to read `reports` or `inputs`
-/// individually, only hand the bundle to the two render functions.
+/// Holds the per-platform `PlatformReport`s, the reconciled expectation
+/// `Grid`, and the scenario-reference map. Returned by
+/// [`load_platform_reports`] so [`generate_consolidated`] and
+/// [`consolidated_summary_markdown`] draw every part they render from the
+/// same platform set — the parts can no longer be independently filtered,
+/// reordered, or re-paired into a self-contradicting report the way loose
+/// parameters could (ROCMAI-484 / ROCm/rocm-cli#640). Opaque: nothing outside
+/// this crate needs to read the parts individually, only hand the bundle to
+/// the two render functions.
 pub struct PlatformReports {
     reports: Vec<PlatformReport>,
-    inputs: Vec<(String, PathBuf)>,
+    grid: Grid,
+    scenarios: ScenarioReference,
 }
 
-/// Build the per-platform `PlatformReport` set once, bundled with the
-/// `inputs` that produced it.
+/// Build everything both outputs render, once per run.
 ///
-/// Parses every platform's `report.json`/`platform.json`/`commands.jsonl`,
-/// sorted by platform/OS, then known-bugs flag, then channel. Shared by
-/// [`generate_consolidated`] and [`consolidated_summary_markdown`],
-/// so a caller producing both outputs from the same `inputs` in one process
-/// (e.g. `xtask`'s `e2e_report::run`) runs `PlatformReport::load` — and so
-/// reads each platform's `commands.jsonl` — once instead of once per output.
-/// The expectation grid and scenario reference sections parse the bundled
-/// `inputs` independently of `reports` on every call; see
-/// [`generate_consolidated`] and [`consolidated_summary_markdown`] for what
-/// each output still parses `inputs` for.
+/// Parses every platform's `report.json`/`platform.json`/`commands.jsonl`
+/// into `PlatformReport`s, sorted by platform/OS, then known-bugs flag, then
+/// channel, and builds the expectation `Grid` and scenario-reference map
+/// alongside them. Shared by [`generate_consolidated`] and
+/// [`consolidated_summary_markdown`], so a caller producing both outputs
+/// from the same `inputs` in one process (e.g. `xtask`'s `e2e_report::run`)
+/// builds each part once, not once per output or per report section. Each
+/// part still reads the files it needs itself — `PlatformReport::load`,
+/// `Grid::build` and `scenario_reference` each parse `report.json`, and the
+/// first two `platform.json` — so a file is read more than once here, but no
+/// longer again for every section that renders from it.
 pub fn load_platform_reports(inputs: &[(String, PathBuf)]) -> PlatformReports {
     let mut reports: Vec<PlatformReport> = inputs
         .iter()
@@ -1045,7 +1048,10 @@ pub fn load_platform_reports(inputs: &[(String, PathBuf)]) -> PlatformReports {
     reports.sort_by(|a, b| report_sort_key(a).cmp(&report_sort_key(b)));
     PlatformReports {
         reports,
-        inputs: inputs.to_vec(),
+        // From `inputs`, not the sorted `reports`: `Grid::build` lays columns
+        // out in input order, and sorting first would change that.
+        grid: Grid::build(inputs),
+        scenarios: scenario_reference(inputs),
     }
 }
 
@@ -1080,21 +1086,19 @@ fn excluded_platform_label(artifact: &str) -> String {
 
 /// Build one consolidated HTML report from a [`PlatformReports`] bundle.
 ///
-/// The bundle's `inputs` are `(label, json_path)` pairs; the label identifies
-/// the platform/tier (e.g. "GPU Strix Windows (known bugs)"). New platforms
-/// need no code change — the caller just passes more inputs to
-/// [`load_platform_reports`].
+/// The bundle is built from `(label, json_path)` pairs passed to
+/// [`load_platform_reports`]; the label identifies the platform/tier (e.g.
+/// "GPU Strix Windows (known bugs)"). New platforms need no code change — the
+/// caller just passes more inputs there.
 ///
-/// `bundle.inputs` is still needed here for the expectation grid, which is
-/// keyed differently and re-parses `report.json` and `platform.json` from
-/// `inputs`, independently of `bundle.reports`.
+/// Reads no input from disk; everything it renders comes from the bundle
+/// (see [`load_platform_reports`]).
 pub fn generate_consolidated(
     bundle: &PlatformReports,
     html_out: &Path,
     meta: &RunMeta,
 ) -> std::io::Result<()> {
     let reports = &bundle.reports;
-    let inputs = &bundle.inputs;
     let now = now_utc();
     let all_ok = reports.iter().all(PlatformReport::ok);
     let overall = if reports.is_empty() {
@@ -1131,7 +1135,7 @@ pub fn generate_consolidated(
             (matrix_table(reports))
             (legend())
 
-            (expectation_grid_html(inputs))
+            (expectation_grid_html(&bundle.grid))
 
             h2 { "Per-platform Details" }
             div.details {
@@ -1150,15 +1154,12 @@ pub fn generate_consolidated(
 /// GitHub-flavoured markdown table, for piping into `$GITHUB_STEP_SUMMARY`.
 /// Same bundle as [`generate_consolidated`].
 ///
-/// `bundle.inputs` is still needed here for the expectation grid and scenario
-/// reference sections, which are keyed differently and each build their own
-/// expectation grid from `inputs`, independently re-parsing `report.json` and
-/// `platform.json`, independently of `bundle.reports`.
+/// Reads nothing from disk; everything it renders comes from the bundle
+/// (see [`load_platform_reports`]).
 pub fn consolidated_summary_markdown(bundle: &PlatformReports) -> String {
     use std::fmt::Write as _;
 
     let reports = &bundle.reports;
-    let inputs = &bundle.inputs;
     let mut out = String::from("## E2E consolidated report\n\n");
     if reports.is_empty() {
         out.push_str("_No per-platform report.json files were found to consolidate._\n");
@@ -1264,22 +1265,21 @@ pub fn consolidated_summary_markdown(bundle: &PlatformReports) -> String {
         }
     }
 
-    // id → (scenario name, Gherkin steps), built once from report.json across all
-    // inputs. Used both for the grid's Scenario column (name + id link) and the
-    // Scenario reference section at the very end.
-    let scenarios = scenario_reference(inputs);
-
     // The per-(scenario × platform) expectation grid, when platform.json
     // sidecars are present (the new expectation system). Placed before the
     // command-coverage table; it supersedes the coarse platform×tier matrix for
-    // "where should each test pass / not matter / not run".
-    out.push_str(&expectation_grid_markdown(inputs, &scenarios));
+    // "where should each test pass / not matter / not run". The scenario
+    // map supplies names for the grid's Scenario column (name + id link).
+    out.push_str(&expectation_grid_markdown(&bundle.grid, &bundle.scenarios));
 
     out.push_str(&command_coverage_markdown(reports));
 
     // Scenario reference LAST (after command coverage): each id's actual Gherkin
     // scenario, anchored so the grid's id links resolve here.
-    out.push_str(&scenario_reference_markdown(inputs, &scenarios));
+    out.push_str(&scenario_reference_markdown(
+        &bundle.grid,
+        &bundle.scenarios,
+    ));
 
     out
 }
@@ -1289,8 +1289,7 @@ pub fn consolidated_summary_markdown(bundle: &PlatformReports) -> String {
 /// column/row AND no excluded platform to caption (see
 /// [`Grid::nothing_to_report`]); a report where every platform lacks a usable
 /// `platform.json` still renders a heading and caption naming them.
-fn expectation_grid_html(inputs: &[(String, PathBuf)]) -> Markup {
-    let grid = Grid::build(inputs);
+fn expectation_grid_html(grid: &Grid) -> Markup {
     // Not `grid.is_empty()`: a report where every platform lacks a
     // `platform.json` has no columns/groups either, but still has an
     // `excluded_note` worth showing — otherwise that case regresses to a
@@ -1390,13 +1389,9 @@ fn expectation_grid_html(inputs: &[(String, PathBuf)]) -> Markup {
 /// AND no excluded platform to caption (see [`Grid::nothing_to_report`]); a
 /// report where every platform lacks a usable `platform.json` still renders a
 /// heading and caption naming them.
-fn expectation_grid_markdown(
-    inputs: &[(String, PathBuf)],
-    scenarios: &std::collections::BTreeMap<String, (String, Vec<String>)>,
-) -> String {
+fn expectation_grid_markdown(grid: &Grid, scenarios: &ScenarioReference) -> String {
     use std::fmt::Write as _;
 
-    let grid = Grid::build(inputs);
     // Not `grid.is_empty()`: see the matching comment in `expectation_grid_html`
     // — a report where every platform lacks a `platform.json` still has an
     // `excluded_note` worth showing, even with no columns/groups to table.
@@ -1505,15 +1500,11 @@ fn expectation_grid_markdown(
 /// Gherkin scenario (name + steps), anchored by the id (`##### <id>` → GitHub
 /// anchor `#<id>`) so the grid's id links resolve. Grouped by feature and ordered
 /// like the grid. Empty when no expectation grid exists.
-fn scenario_reference_markdown(
-    inputs: &[(String, PathBuf)],
-    scenarios: &std::collections::BTreeMap<String, (String, Vec<String>)>,
-) -> String {
+fn scenario_reference_markdown(grid: &Grid, scenarios: &ScenarioReference) -> String {
     use std::fmt::Write as _;
 
     // Only emit when there is a grid to reference (platform.json sidecars present),
     // matching where the id links are generated.
-    let grid = Grid::build(inputs);
     if grid.is_empty() {
         return String::new();
     }
@@ -1558,13 +1549,14 @@ fn scenario_reference_markdown(
     out
 }
 
+/// Scenario `@id` → (human name, Gherkin steps); see [`scenario_reference`].
+type ScenarioReference = BTreeMap<String, (String, Vec<String>)>;
+
 /// Build a map of scenario `@id` → (human name, Gherkin steps) by scanning every
 /// input's `report.json`. Used for the grid's Scenario reference section. A
 /// scenario appears on the first input that ran it; later duplicates are ignored
 /// (the name/steps are identical across platforms).
-fn scenario_reference(
-    inputs: &[(String, PathBuf)],
-) -> std::collections::BTreeMap<String, (String, Vec<String>)> {
+fn scenario_reference(inputs: &[(String, PathBuf)]) -> ScenarioReference {
     let mut map = std::collections::BTreeMap::new();
     for (_label, json_path) in inputs {
         for f in parse_features(json_path) {
@@ -1903,9 +1895,10 @@ mod tests {
         // `inputs` as two loose parameters): passing `&[]` instead of `inputs`
         // to the `expectation_grid_html(inputs)` call inside passed every
         // existing test at the time, because the fixtures used elsewhere had
-        // no platform.json, so the grid was empty either way. Give this one a
-        // platform.json via write_platform and assert the grid heading
-        // actually renders.
+        // no platform.json, so the grid was empty either way. The same slip
+        // now would be building the bundle's grid from `&[]` in
+        // `load_platform_reports`. Give this one a platform.json via
+        // write_platform and assert the grid heading actually renders.
         let report = feature_json(&[(&["id:serve-a"], &["passed"])]);
         let platform = r#"{
             "platform_slug": "mock",
@@ -1925,6 +1918,100 @@ mod tests {
             html.contains("Expectation grid (scenario × platform)"),
             "grid heading missing from output:\n{html}"
         );
+    }
+
+    #[test]
+    fn rendering_uses_the_bundle_not_the_artifacts_on_disk() {
+        // The render functions must work from what `load_platform_reports`
+        // built, never re-parse the inputs. Delete the artifacts after
+        // loading: anything re-read from disk now comes back empty, so a
+        // renderer that still re-parses loses the grid rows, the grid cell,
+        // or the scenario reference's names and steps.
+        //
+        // `serve-b` declares no `scenario` name in platform.json, so its grid
+        // row and reference entry take their name ("s1") from the scenario
+        // map — the one path where the grid reads that map.
+        let report = feature_json(&[
+            (&["id:serve-a"], &["passed"]),
+            (&["id:serve-b"], &["passed"]),
+        ]);
+        let platform = r#"{
+            "platform_slug": "mock",
+            "capability": {"effective_serve_engine": "none"},
+            "expectations": [
+                {"id":"serve-a","feature":"Serving","scenario":"serve-01 - first","expected":"pass"},
+                {"id":"serve-b","feature":"Serving","expected":"pass"}
+            ]
+        }"#;
+        let (dir, path) = write_platform(&report, platform);
+        let inputs = vec![("e2e-report".to_string(), path)];
+        let bundle = load_platform_reports(&inputs);
+        dir.close().expect("remove artifacts");
+
+        let md = consolidated_summary_markdown(&bundle);
+        for want in [
+            "serve-01 - first<br>[`serve-a`](#serve-a) | ✅ |",
+            "s1<br>[`serve-b`](#serve-b) | ✅ |",
+            "##### serve-a\n\n_serve-01 - first_\n\n- Given x\n",
+            "##### serve-b\n\n_s1_\n\n- Given x\n",
+        ] {
+            assert!(md.contains(want), "markdown lost {want:?}:\n{md}");
+        }
+        assert!(
+            !md.contains("no usable platform.json"),
+            "markdown re-read the deleted platform.json:\n{md}"
+        );
+
+        let out = tempfile::NamedTempFile::new().expect("temp");
+        generate_consolidated(&bundle, out.path(), &RunMeta::default()).expect("generate");
+        let html = std::fs::read_to_string(out.path()).expect("read");
+        // `class="num "` (trailing space, empty status class) is the grid's
+        // pass cell; the summary matrix's numeric cells are plain `class="num"`.
+        assert!(
+            html.contains(r#"<h3 class="feature-heading">Serving</h3>"#)
+                && html.contains(r#"<code>serve-b</code></td><td class="num ">✅</td>"#)
+                && !html.contains("no usable platform.json"),
+            "html grid lost its rows or cells, or re-read the deleted platform.json:\n{html}"
+        );
+    }
+
+    #[test]
+    fn load_platform_reports_keeps_grid_columns_in_input_order() {
+        // `load_platform_reports` sorts `reports`, but builds the grid from
+        // `inputs`, preserving the column order `Grid::build` already had —
+        // whether the grid should instead follow the summary matrix's order is
+        // a separate question this does not settle. Feed inputs in the reverse
+        // of report sort order so building the grid from the sorted reports
+        // would show up here as an unintended change.
+        let platform = |slug: &str| {
+            format!(
+                r#"{{"platform_slug":"{slug}","expectations":[
+                    {{"id":"serve-a","feature":"Serving","scenario":"serve-01 - first","expected":"pass"}}
+                ]}}"#
+            )
+        };
+        let report = feature_json(&[(&["id:serve-a"], &["passed"])]);
+        let (_mock_dir, mock) = write_platform(&report, &platform("mock"));
+        let (_gpu_dir, gpu) = write_platform(&report, &platform("mi300x"));
+        let inputs = vec![
+            ("e2e-report".to_string(), mock),
+            ("e2e-gpu-report".to_string(), gpu),
+        ];
+
+        let bundle = load_platform_reports(&inputs);
+        let report_order: Vec<_> = bundle
+            .reports
+            .iter()
+            .map(|r| r.desc.platform.as_str())
+            .collect();
+        assert_eq!(report_order, ["MI300X", "Mock"]);
+        let column_order: Vec<_> = bundle
+            .grid
+            .columns
+            .iter()
+            .map(|c| c.slug.as_str())
+            .collect();
+        assert_eq!(column_order, ["mock", "mi300x"]);
     }
 
     #[test]
@@ -3011,7 +3098,7 @@ mod tests {
             );
         }
 
-        let html = expectation_grid_html(&inputs).into_string();
+        let html = expectation_grid_html(&Grid::build(&inputs)).into_string();
         for glyph in ["✅XPASS (flaky)", "⚠️n/a-ran", "⚠️no-result"] {
             assert!(
                 html.contains(glyph),
@@ -3087,7 +3174,7 @@ mod tests {
         let (_d, path) = write_platform(&report, platform);
         let inputs = vec![("mi300x".to_string(), path)];
 
-        let html = expectation_grid_html(&inputs).into_string();
+        let html = expectation_grid_html(&Grid::build(&inputs)).into_string();
         for glyph in ["⚠️XPASS", "⚠️n/a-ran", "⚠️no-result", "❌FAIL"] {
             let needle = format!("class=\"status-fail\">{glyph}</span>");
             assert!(
@@ -3366,7 +3453,7 @@ mod tests {
             "there is no column to table, so no table header must render:\n{md}"
         );
 
-        let html = expectation_grid_html(&inputs).into_string();
+        let html = expectation_grid_html(&Grid::build(&inputs)).into_string();
         assert!(
             html.contains(
                 "have no usable platform.json and are not shown in this grid: Mock Linux"
@@ -3438,7 +3525,7 @@ mod tests {
             "markdown must caption the excluded platform by name:\n{md}"
         );
 
-        let html = expectation_grid_html(&inputs).into_string();
+        let html = expectation_grid_html(&Grid::build(&inputs)).into_string();
         assert!(
             html.contains(
                 "platform(s) have no usable platform.json and are not shown in this grid: \

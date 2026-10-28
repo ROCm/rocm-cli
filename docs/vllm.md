@@ -109,6 +109,28 @@ cannot silently install the wrong line's wheel onto this SDK. If AMD's index
 has no compatible build for a package, the resolver fails and the install
 fails instead of falling back to an unpinned or CPU install.
 
+`flash-attn` and `amd-aiter` are the exception to the per-package series match
+above. The vLLM wheel declares the exact builds of both that it was built
+against, and the index keeps publishing newer ones it does not accept (for
+example `amd-aiter 0.1.24.post1` beside a vLLM that depends on a `0.1.22` dev
+build), so pinning each package's newest release can name a combination the
+vLLM wheel itself rules out. After the vLLM pin is discovered, the install
+resolves that exact vLLM with `uv pip install --dry-run` and takes the
+`flash-attn` and `amd-aiter` versions the resolver reports, but only when the
+vLLM index serves that exact version on its own (a dependency vLLM leaves
+unpinned can resolve to a PyPI build instead, and is never used as the pin).
+Otherwise the series match above decides, as before.
+
+The resolve probe and the confirmation only improve on the series match, so
+neither can make an install fail that would have worked without them. If the
+probe fails, or the vLLM index does not confirm a build the probe named,
+`flash-attn` and `amd-aiter` fall back to the series match, and the reason is
+reported in the install warnings. The confirmation is tried twice, so one
+transient network error is not enough to fall back. If the install then fails
+with those fallback pins, the same reasons are appended to the error after the
+install's own failure, because the series match is the combination this step
+exists to avoid.
+
 The final install of vllm, flash-attn, and amd-aiter also resolves vLLM's own
 plain-PyPI transitive dependencies (for example, `lm-format-enforcer`), which
 AMD's index doesn't host. A generated `uv.toml` sets `ignore-error-codes = [403]`

@@ -411,7 +411,7 @@ pub(crate) struct SlashToolRequest {
 
 /// The structured next action from a natural-language plan (Phase 7).
 ///
-/// Plain data mirrored from the bin's `freeform_plan_next_action_with_context`
+/// Plain data mirrored from the bin's `plan_freeform_request_with_context`
 /// so the reducer can decide whether to hand a complete mutating action to the
 /// approval modal. A placeholder action (`has_placeholders`) stays plan-only.
 /// `pub` (not `pub(crate)`) because it is a payload of the `pub`
