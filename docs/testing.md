@@ -1762,6 +1762,35 @@ rocm --bin rocm wsl_rocdxg`). Running it end to end needs a WSL2 host with
 `/dev/dxg` and dxcore present, since the plan refuses before installing
 otherwise.
 
+## Bare-metal driver install
+
+On Linux bare metal, `rocm install driver` defaults to the floating `latest`
+amdgpu release; `ROCM_CLI_AMDGPU_DRIVER_VERSION` overrides it (replacing the
+retired `ROCM_CLI_AMDGPU_VERSION`/`ROCM_CLI_AMDGPU_PACKAGE_RELEASE` pair, which the plan refuses while either is still set). An
+override that isn't a plain version token is refused rather than silently
+falling back, since it is interpolated into privileged shell commands:
+
+```bash
+cargo test -p rocm --bin rocm driver_install
+```
+
+`driver-install-06` in
+[driver_install.feature](../tests/e2e-cucumber/features/driver_install.feature)
+asserts whichever plan a real bare-metal Linux host actually produces: the apt
+repo file and signing key on a release with a published
+repo.radeon.com/amdgpu suite, or the native-archive refusal below on one
+without.
+
+On Ubuntu 26.04, `repo.radeon.com` does not yet publish a matching `resolute`
+DKMS repo (the amdgpu driver ships in-tree instead), so the plan comes back
+`supported: false` and directs the user to `apt install rocm`. This arm is
+covered at the unit level by
+`driver_plan_ubuntu_2604_uses_native_archive_guidance` and its two neighbors in
+[driver_install.rs](../apps/rocm/src/driver_install.rs), and at the e2e level
+by `driver-install-06` above: the hosted `E2E tests` job's `ubuntu-latest` image (26.04 once GitHub's migration completes)
+reaches this arm through the CLI itself, while the self-hosted GPU lane's
+24.04 host exercises the apt arm instead.
+
 ## /etc/os-release
 
 Every Rust reader of `/etc/os-release` parses it with
@@ -1950,6 +1979,19 @@ does not apply on — and exits 3.
 
 ```bash
 cargo xtask e2e -- -n '(diagnose-40)'
+```
+
+`diagnose-42` uses the same simulated-host mechanism for the driver-reinstall
+advice: an Ubuntu 24.04 `os-release` and two stale repo files planted under the
+root make `fix-7-stale-repos` fire, and the scenario checks that it names both
+repo files by their real paths and `rocm install driver --dkms --yes`, and that
+`rocm install driver --help` accepts those flags. `driver-install-08` covers the
+retired `ROCM_CLI_AMDGPU_VERSION` / `ROCM_CLI_AMDGPU_PACKAGE_RELEASE` refusal
+and checks that setting `ROCM_CLI_AMDGPU_DRIVER_VERSION`, as the refusal advises,
+clears it.
+
+```bash
+cargo xtask e2e -- -n '(diagnose-42|driver-install-08)'
 ```
 
 The other half of the same change — `fix-13-hip-sdk-missing` no longer firing

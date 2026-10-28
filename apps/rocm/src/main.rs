@@ -10039,12 +10039,13 @@ pub(crate) mod tests {
             }
         }
 
-        /// Clear the two AMD driver-install override vars for the duration of the
-        /// test, so a value exported in the developer's or runner's shell cannot
-        /// leak into a plan and make its resolved `repo_version`/package release
-        /// disagree with the assertion.
+        /// Clear the AMD driver-version override for the duration of the test, so
+        /// a value exported in the developer's or runner's shell cannot leak into
+        /// a plan and make its resolved `repo_version_expr` disagree with the
+        /// assertion.
         pub(crate) fn with_amd_overrides_cleared() -> Self {
             let mut env = Self::new();
+            env.clear("ROCM_CLI_AMDGPU_DRIVER_VERSION");
             env.clear("ROCM_CLI_AMDGPU_VERSION");
             env.clear("ROCM_CLI_AMDGPU_PACKAGE_RELEASE");
             env

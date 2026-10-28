@@ -2716,6 +2716,90 @@ async fn user_diagnoses_planted_machine(world: &mut E2eWorld) {
     world.cli_rc = Some(rc);
 }
 
+// ── Stale repo advice on a simulated Ubuntu host ───────────────────
+
+#[given("an Ubuntu 24.04 machine with two stale ROCm repo files")]
+async fn ubuntu_with_stale_repos(world: &mut E2eWorld) {
+    let host = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("host-root");
+    std::fs::create_dir_all(host.join("etc/apt/sources.list.d"))
+        .expect("failed to create planted apt directory");
+    std::fs::write(
+        host.join("etc/os-release"),
+        "ID=ubuntu\nVERSION_ID=\"24.04\"\nVERSION_CODENAME=noble\nPRETTY_NAME=\"Ubuntu 24.04 LTS\"\n",
+    )
+    .expect("failed to write planted os-release");
+    for name in ["amdgpu.list", "rocm.list"] {
+        std::fs::write(
+            host.join("etc/apt/sources.list.d").join(name),
+            "# planted\n",
+        )
+        .expect("failed to plant a repo file");
+    }
+    world
+        .command_env
+        .push(("ROCM_CLI_TEST_HOST_ROOT", host.into_os_string()));
+}
+
+#[when("the user diagnoses that machine with a stale repo symptom")]
+async fn user_diagnoses_stale_repo_symptom(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(
+        world,
+        &[
+            "diagnose",
+            "--symptom",
+            "stale repo conflict",
+            "--top",
+            "20",
+        ],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the stale repo cause names both planted repo files and the driver reinstall command")]
+async fn assert_stale_repo_advice(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no diagnose output");
+    let cause: Vec<&str> = output
+        .lines()
+        .skip_while(|line| !line.contains("(fix-7-stale-repos)"))
+        .take_while(|line| !line.trim().is_empty())
+        .collect();
+    let text = cause.join("\n");
+    assert!(
+        !text.is_empty(),
+        "no stale repo cause was reported:\n{output}"
+    );
+    // The logical paths a user would move, not the scenario's temp host root.
+    for file in ["amdgpu.list", "rocm.list"] {
+        assert!(
+            text.contains(&format!("/etc/apt/sources.list.d/{file}")),
+            "{file} must be named by its real path:\n{text}"
+        );
+    }
+    assert!(
+        text.contains("rocm install driver --dkms --yes"),
+        "Ubuntu 24.04 has a driver plan, so the advice must name it:\n{text}"
+    );
+}
+
+#[then("the advised driver reinstall command accepts the flags it is advised with")]
+async fn assert_advised_driver_command_exists(world: &mut E2eWorld) {
+    let (stdout, _stderr, rc) = crate::run_rocm(world, &["install", "driver", "--help"]);
+    assert_eq!(rc, 0, "`rocm install driver --help` must exist:\n{stdout}");
+    for flag in ["--dkms", "--yes"] {
+        assert!(
+            stdout.contains(flag),
+            "{flag} is advised but not accepted:\n{stdout}"
+        );
+    }
+}
+
 // ── Windows display driver advice ──────────────────────────────────
 
 #[when("the user diagnoses this machine in machine-readable form, with no symptom")]

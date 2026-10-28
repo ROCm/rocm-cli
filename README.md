@@ -568,7 +568,20 @@ you what it couldn't find instead.
 #### Driver installation
 
 `install driver` installs the AMD kernel driver on Linux, using DKMS or a native
-package.
+package. On bare metal it defaults to the floating `latest` amdgpu release;
+set `ROCM_CLI_AMDGPU_DRIVER_VERSION` to pin a specific one. This replaces the
+older `ROCM_CLI_AMDGPU_VERSION`/`ROCM_CLI_AMDGPU_PACKAGE_RELEASE` pair, which
+pinned a fixed default and are no longer read; the plan is refused while either is still set,
+so an old pin is never silently turned into `latest`.
+
+On Ubuntu 26.04, the amdgpu driver ships in-tree and `repo.radeon.com` does not
+yet publish a matching DKMS repo, so `install driver` reports a non-mutating
+`supported: false` plan instead and directs you to `apt install rocm` for the
+userspace ROCm stack.
+
+Approving (`--yes`) a plan that is `supported: false` (Ubuntu 26.04, an
+undocumented distro, or a refused version override) installs nothing and exits
+non-zero, after printing the plan.
 
 On Windows, `install driver` is validate-only: it installs and changes nothing,
 with or without `--yes`, and it starts no driver command. It prints the AMD

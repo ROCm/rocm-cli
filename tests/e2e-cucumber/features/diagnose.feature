@@ -640,3 +640,16 @@ Feature: Diagnosing failures and listing fixes
     Given a machine with an AMD GPU
     When the user diagnoses this machine in machine-readable form, with no symptom
     Then the diagnosis offers the old display driver advice only when the inspection reports an old driver
+
+  # The remediation text names a command and the files to move aside, so it is
+  # checked against a simulated Ubuntu 24.04 machine (os-release and two stale
+  # repo files planted under the host root, as in diagnose-40) rather than the
+  # runner's own distro: the advice depends on the distro and the runner's is
+  # not fixed. The named command is then held to existing and accepting the
+  # flags it is advised with; its behaviour is covered by driver-install-06.
+  @id:diagnose-stale-repos-advice-names-the-driver-reinstall @requires-os:linux
+  Scenario: diagnose-42 - Stale repo advice on Ubuntu 24.04 names the planted repo files and a driver reinstall that exists
+    Given an Ubuntu 24.04 machine with two stale ROCm repo files
+    When the user diagnoses that machine with a stale repo symptom
+    Then the stale repo cause names both planted repo files and the driver reinstall command
+    And the advised driver reinstall command accepts the flags it is advised with
