@@ -69,7 +69,6 @@ pub use config::{
     PermissionsConfig, ProviderUserConfig, RocmCliConfig, SetupConfig, TELEMETRY_MODE_LOCAL,
     TELEMETRY_MODE_OFF, TelemetryConfig, WatcherMode, WatcherUserConfig,
 };
-pub use confirm::{is_affirmative_answer, read_yes_no};
 pub use crypto::{
     generate_rsa_signing_keypair, sign_rsa_pkcs1_sha256_signature,
     verify_rsa_pkcs1_sha256_signature,

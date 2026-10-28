@@ -364,7 +364,9 @@ fn env_path(name: &str) -> Option<PathBuf> {
 }
 
 pub(crate) fn confirm_uninstall() -> Result<bool> {
-    rocm_core::read_yes_no("Proceed with uninstall? [y/N]: ")
+    rocm_core::confirm::print_prompt(&mut io::stdout(), "Proceed with uninstall? [y/N]: ")
+        .context("failed to flush uninstall prompt")?;
+    rocm_core::confirm::read_answer(&mut io::stdin().lock())
         .context("failed to read uninstall confirmation")
 }
 

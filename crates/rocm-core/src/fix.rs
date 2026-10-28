@@ -1627,7 +1627,8 @@ fn confirm(prompt: &str, assume_yes: bool) -> bool {
         }
         return verdict;
     }
-    let confirmed = crate::confirm::read_yes_no(&format!("{prompt} [y/N]: ")).unwrap_or(false);
+    let _ = crate::confirm::print_prompt(&mut std::io::stdout(), &format!("{prompt} [y/N]: "));
+    let confirmed = crate::confirm::read_answer(&mut std::io::stdin().lock()).unwrap_or(false);
     if !confirmed {
         fail!("Not confirmed; refusing to apply.");
     }

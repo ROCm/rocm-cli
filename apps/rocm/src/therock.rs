@@ -2894,7 +2894,10 @@ fn confirm_overwrite_existing_sdk(
 }
 
 fn prompt_yes_no(prompt: &str) -> Result<bool> {
-    rocm_core::read_yes_no(prompt).context("failed to read confirmation response")
+    rocm_core::confirm::print_prompt(&mut std::io::stdout(), prompt)
+        .context("failed to flush confirmation prompt")?;
+    rocm_core::confirm::read_answer(&mut std::io::stdin().lock())
+        .context("failed to read confirmation response")
 }
 
 #[allow(clippy::too_many_arguments)]
