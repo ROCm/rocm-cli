@@ -633,7 +633,11 @@ pub fn resolve(
 /// `nightly.yml` and `e2e-selfhosted.yml`, neither of which restricts to the
 /// lifecycle set).
 pub fn lifecycle_lane_includes(decl: &ScenarioDecl, extra_ids: &[String]) -> bool {
-    decl.lifecycle || decl.id.as_deref().is_some_and(|id| extra_ids.iter().any(|e| e == id))
+    decl.lifecycle
+        || decl
+            .id
+            .as_deref()
+            .is_some_and(|id| extra_ids.iter().any(|e| e == id))
 }
 
 /// Tiny glob: `*` matches any run of chars. Used only for `therock_family`.
@@ -962,10 +966,7 @@ serve_timeout_secs = 90
     fn lifecycle_lane_includes_lifecycle_scenarios_regardless_of_extra_ids() {
         let d = decl(&["id:lifecycle-linux-install", "lifecycle"]);
         assert!(lifecycle_lane_includes(&d, &[]));
-        assert!(lifecycle_lane_includes(
-            &d,
-            &["some-other-id".to_owned()]
-        ));
+        assert!(lifecycle_lane_includes(&d, &["some-other-id".to_owned()]));
     }
 
     #[test]
@@ -981,10 +982,7 @@ serve_timeout_secs = 90
     #[test]
     fn lifecycle_lane_excludes_a_non_lifecycle_scenario_not_named_in_extra_ids() {
         let d = decl(&["id:comfyui-uv-install-failure-names-log"]);
-        assert!(!lifecycle_lane_includes(
-            &d,
-            &["some-other-id".to_owned()]
-        ));
+        assert!(!lifecycle_lane_includes(&d, &["some-other-id".to_owned()]));
         assert!(!lifecycle_lane_includes(&d, &[]));
     }
 
