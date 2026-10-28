@@ -750,6 +750,15 @@ rocm engines shell <engine>   [--runtime-id KEY | --env-id ID] [--shell PATH]
 
 Supported engines: `lemonade`, `vllm`.
 
+`rocm engines install lemonade` also keeps Lemonade's llama.cpp backend paired
+with the ROCm SDK in use, and rewrites the two pins it owns
+(`therock.version` and `llamacpp.rocm-stable` in `resources/backend_versions.json`)
+to do so. If installing an already-pinned backend fails, it restores those two
+pins from the cached Lemonade archive (it does not download), prints a warning,
+and installs once more; see
+[Lemonade backend alignment](https://github.com/ROCm/rocm-cli/blob/main/docs/engine-plugins.md#lemonade-backend-alignment-on-engine-install) for the details and for
+`ROCM_CLI_DISABLE_LEMONADE_BACKEND_ALIGNMENT`, which turns both off.
+
 `--yes` approves required system-package installs, such as OpenMPI for vLLM,
 without asking.
 

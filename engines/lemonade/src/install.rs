@@ -240,6 +240,215 @@ pub(crate) fn write_manifest(paths: &AppPaths, manifest: &LemonadeInstallManifes
     Ok(())
 }
 
+/// Put `resources/backend_versions.json` back to what the cached embeddable
+/// archive ships. Returns `None` when the file already held the packaged
+/// values, and otherwise a [`PinFileBackup`] that puts the previous bytes back.
+///
+/// That file is the one piece of the extracted tree rocm-cli itself edits (ROCm
+/// backend alignment pins a ROCm version and a llama.cpp build into it), and
+/// the edit outlives the process: the runtime tree is shared and is only
+/// re-extracted on a version change or `--reinstall`. A pin kept from an
+/// earlier successful alignment can therefore name assets that have since
+/// been withdrawn, and nothing but this restore (or a full `--reinstall`)
+/// clears it. Only that one file is rewritten, so backends already installed
+/// in the tree, and any server running from it, are left alone.
+///
+/// This runs only after an install has already failed, so it never downloads:
+/// the archive is read from the cache `prepare_embeddable_with` filled earlier
+/// in the same install, and its digest is verified before any byte of it is
+/// trusted. When the cached archive is gone or does not verify, this fails and
+/// the caller reports the original install error.
+///
+/// The pin file is read only after the archive work is done, immediately
+/// before the rewrite, so a pin another process wrote in the meantime is
+/// neither overwritten blindly nor missing from the backup.
+pub(crate) fn restore_packaged_backend_versions(
+    manifest: &LemonadeInstallManifest,
+    resource: &str,
+) -> Result<Option<PinFileBackup>> {
+    restore_packaged_backend_versions_with(manifest, resource, embeddable_archive_sha256(), || {})
+}
+
+/// [`restore_packaged_backend_versions`] with the archive digest injectable.
+/// `after_archive` runs once the archive work is done and before the pin file
+/// is read; tests use it to stand in for a writer that gets in between.
+fn restore_packaged_backend_versions_with(
+    manifest: &LemonadeInstallManifest,
+    resource: &str,
+    expected_sha256: &str,
+    after_archive: impl FnOnce(),
+) -> Result<Option<PinFileBackup>> {
+    let root = manifest
+        .runtime_dir
+        .parent()
+        .context("Lemonade runtime directory has no parent to hold its archive cache")?;
+    let archive = root
+        .join("downloads")
+        .join(embeddable_archive_name(&manifest.version));
+    let target = manifest.runtime_dir.join(resource);
+
+    // Checked first so that a missing cache creates nothing at all.
+    if !archive.is_file() {
+        bail!(
+            "the embeddable archive is not cached at {}; not downloading it while recovering from a failed install",
+            archive.display()
+        );
+    }
+    // The download step can only fail: a cached archive that does not verify is
+    // dropped by `ensure_cached_archive` and is not replaced from the network.
+    let guard = ensure_cached_archive("", &archive, expected_sha256, |_, _| {
+        bail!(
+            "the cached embeddable archive {} does not match its digest; not downloading it while recovering from a failed install",
+            archive.display()
+        )
+    })?;
+    let extract_root = root
+        .join("extract")
+        .join(format!("{}-packaged-pins", current_unix_millis()));
+    fs::create_dir_all(&extract_root)?;
+    let packaged = (|| -> Result<Vec<u8>> {
+        extract_archive(&archive, &extract_root)?;
+        let embeddable_root = find_embeddable_root(&extract_root)?;
+        let packaged_path = embeddable_root.join(resource);
+        fs::read(&packaged_path).with_context(|| format!("embeddable archive has no {resource}"))
+    })();
+    fs::remove_dir_all(&extract_root).ok();
+    drop(guard);
+    let packaged = packaged?;
+    after_archive();
+
+    // Read only now, after the archive work above, and used for both the
+    // computation and the backup: a pin file written by another process
+    // while the archive was being verified and extracted is what gets
+    // restored over and backed up, not a stale earlier read.
+    // Only "no such file" means there was nothing to keep. Any other failure
+    // (a sharing violation from a concurrent writer, a permission error) says
+    // nothing about what the file holds, and treating it as absent would make
+    // the backup delete a real pin file if the retry fails. Like the other
+    // cache-only skips above, it fails the restore, so nothing is rewritten and
+    // the caller reports the original install error.
+    let current = match fs::read(&target) {
+        Ok(bytes) => Some(bytes),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "could not read {} to back it up; leaving it as it is",
+                    target.display()
+                )
+            });
+        }
+    };
+
+    // Only the two pins backend alignment writes are restored, so an edit to any
+    // other entry of the file survives and a file that already holds the packaged
+    // values for those two is not drift. Compared as JSON, not bytes: an edit
+    // re-serializes the file, so the same values can sit in different bytes.
+    let packaged_value: serde_json::Value = serde_json::from_slice(&packaged)
+        .with_context(|| format!("{resource} in the embeddable archive is not valid JSON"))?;
+    let restored = match current
+        .as_deref()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())
+    {
+        Some(mut value) => {
+            if alignment_pins(&value) == alignment_pins(&packaged_value) {
+                return Ok(None);
+            }
+            for (section, key) in ALIGNMENT_PIN_KEYS {
+                set_or_remove_pin(&mut value, section, key, &packaged_value);
+            }
+            serde_json::to_vec_pretty(&value)?
+        }
+        // Missing (or not JSON): there is nothing of the user's to keep.
+        None => packaged,
+    };
+    rocm_core::write_atomic(&target, &restored, "pins")
+        .with_context(|| format!("failed to restore {}", target.display()))?;
+    Ok(Some(PinFileBackup {
+        target,
+        previous: current,
+    }))
+}
+
+/// The two entries of `resources/backend_versions.json` that backend alignment
+/// writes: the ROCm version a backend is built for and the llama.cpp build tag.
+const ALIGNMENT_PIN_KEYS: [(&str, &str); 2] = [("therock", "version"), ("llamacpp", "rocm-stable")];
+
+fn alignment_pins(value: &serde_json::Value) -> [Option<&serde_json::Value>; 2] {
+    ALIGNMENT_PIN_KEYS.map(|(section, key)| value.get(section).and_then(|s| s.get(key)))
+}
+
+/// Gives `section.key` of `value` the value it has in `packaged`, or removes it
+/// when `packaged` has none, leaving every other entry as it was.
+fn set_or_remove_pin(
+    value: &mut serde_json::Value,
+    section: &str,
+    key: &str,
+    packaged: &serde_json::Value,
+) {
+    let packaged_pin = packaged.get(section).and_then(|s| s.get(key));
+    match packaged_pin {
+        Some(pin) => {
+            if !value.is_object() {
+                *value = serde_json::json!({});
+            }
+            if let Some(object) = value.as_object_mut() {
+                let section_value = object
+                    .entry(section.to_owned())
+                    .or_insert_with(|| serde_json::json!({}));
+                if !section_value.is_object() {
+                    *section_value = serde_json::json!({});
+                }
+                if let Some(section_object) = section_value.as_object_mut() {
+                    section_object.insert(key.to_owned(), pin.clone());
+                }
+            }
+        }
+        None => {
+            if let Some(section_object) = value.get_mut(section).and_then(|s| s.as_object_mut()) {
+                section_object.remove(key);
+            }
+        }
+    }
+}
+
+/// What `resources/backend_versions.json` held before
+/// [`restore_packaged_backend_versions`] rewrote it. Written back through
+/// `rocm_core::write_atomic`, like the restore itself.
+///
+/// A restore is attempted after any failed install, including a transient
+/// network or disk error, so a restore whose retry fails too must not leave a
+/// pin that was fine discarded.
+#[derive(Debug)]
+pub(crate) struct PinFileBackup {
+    target: PathBuf,
+    /// `None` when the file did not exist, so putting it back removes it.
+    previous: Option<Vec<u8>>,
+}
+
+impl PinFileBackup {
+    /// For tests that stand in for the restore step; the real restore builds
+    /// the struct itself.
+    #[cfg(test)]
+    pub(crate) const fn new(target: PathBuf, previous: Option<Vec<u8>>) -> Self {
+        Self { target, previous }
+    }
+
+    /// Writes the previous bytes back, or removes the file if there were none.
+    pub(crate) fn put_back(self) -> Result<()> {
+        match self.previous {
+            Some(bytes) => rocm_core::write_atomic(&self.target, &bytes, "pins")
+                .with_context(|| format!("failed to put back {}", self.target.display())),
+            None => match fs::remove_file(&self.target) {
+                Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
+                    Err(err).with_context(|| format!("failed to remove {}", self.target.display()))
+                }
+                _ => Ok(()),
+            },
+        }
+    }
+}
+
 fn lemond_path_in(runtime_dir: &Path) -> PathBuf {
     runtime_dir.join(platform_binary_name("lemond"))
 }
@@ -1644,6 +1853,435 @@ mod tests {
             Some(version),
             "prepare_embeddable extracted the archive but never recorded the version"
         );
+    }
+
+    /// Writes an embeddable archive in the host's format holding the two
+    /// binaries and a packaged `resources/backend_versions.json`.
+    fn write_embeddable_with_pins(archive: &Path, pins: &str) {
+        let files = [
+            (platform_binary_name("lemond"), b"lemond".to_vec()),
+            (platform_binary_name("lemonade"), b"lemonade".to_vec()),
+            (
+                "resources/backend_versions.json".to_owned(),
+                pins.as_bytes().to_vec(),
+            ),
+        ];
+        let file = fs::File::create(archive).unwrap();
+        if runtime_is_windows() {
+            let mut writer = zip::ZipWriter::new(file);
+            let options = zip::write::SimpleFileOptions::default();
+            for (name, body) in &files {
+                writer
+                    .start_file(format!("embeddable/{name}"), options)
+                    .unwrap();
+                writer.write_all(body).unwrap();
+            }
+            writer.finish().unwrap();
+        } else {
+            let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::fast());
+            let mut builder = tar::Builder::new(encoder);
+            for (name, body) in &files {
+                let mut header = tar::Header::new_ustar();
+                header.set_size(body.len() as u64);
+                header.set_mode(0o755);
+                header.set_entry_type(tar::EntryType::Regular);
+                header.set_path(format!("embeddable/{name}")).unwrap();
+                header.set_cksum();
+                builder.append(&header, body.as_slice()).unwrap();
+            }
+            builder.into_inner().unwrap().finish().unwrap();
+        }
+    }
+
+    #[test]
+    fn restore_packaged_backend_versions_replaces_only_a_pin_file_that_drifted() {
+        let dir = scratch_dir("restore-packaged-pins");
+        let root = dir.join("lemonade");
+        let runtime_dir = runtime_dir_in(&root);
+        fs::create_dir_all(runtime_dir.join("resources")).unwrap();
+        let pins = runtime_dir.join("resources/backend_versions.json");
+        let backend = runtime_dir.join("backends").join("rocm");
+        fs::create_dir_all(&backend).unwrap();
+        fs::write(backend.join("llama-server"), b"installed backend").unwrap();
+
+        let packaged = r#"{"therock":{"version":"7.13.0"},"llamacpp":{"rocm-stable":"b9752"}}"#;
+        let source = dir.join("source-archive");
+        write_embeddable_with_pins(&source, packaged);
+        let sha256 = format!("{:x}", Sha256::digest(fs::read(&source).unwrap()));
+        let manifest = LemonadeInstallManifest {
+            env_id: "test".to_owned(),
+            version: "11.5.1".to_owned(),
+            runtime_dir: runtime_dir.clone(),
+            lemond: lemond_path_in(&runtime_dir),
+            lemonade: lemonade_path_in(&runtime_dir),
+            backend_recipe: LLAMACPP_RECIPE.to_owned(),
+            backend_name: ROCM_BACKEND_NAME.to_owned(),
+            installed_at_unix_ms: 0,
+        };
+        cache_archive(&root, &source);
+        let restore = |manifest: &LemonadeInstallManifest| {
+            restore_packaged_backend_versions_with(
+                manifest,
+                "resources/backend_versions.json",
+                &sha256,
+                || {},
+            )
+        };
+
+        // The state an earlier alignment left behind: the active ROCm version
+        // and a newer llama.cpp build pinned in place of the packaged ones.
+        fs::write(
+            &pins,
+            r#"{"therock":{"version":"7.14.1"},"llamacpp":{"rocm-stable":"b11783"}}"#,
+        )
+        .unwrap();
+        let backup = restore(&manifest)
+            .unwrap()
+            .expect("a drifted pin file must be restored");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&fs::read_to_string(&pins).unwrap()).unwrap(),
+            serde_json::from_str::<serde_json::Value>(packaged).unwrap()
+        );
+        assert_no_pin_temp_files(&runtime_dir.join("resources"));
+        assert_eq!(
+            fs::read(backend.join("llama-server")).unwrap(),
+            b"installed backend",
+            "restoring the pins must not touch backends already installed in the tree"
+        );
+        assert!(
+            fs::read_dir(root.join("extract")).unwrap().next().is_none(),
+            "the scratch extraction must be cleaned up"
+        );
+
+        // Re-serialized but equal content is not drift: nothing to restore.
+        fs::write(
+            &pins,
+            serde_json::to_vec_pretty(
+                &serde_json::from_str::<serde_json::Value>(packaged).unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(restore(&manifest).unwrap().is_none());
+
+        // The backup puts the drifted bytes back exactly, so a restore whose
+        // retry fails does not discard the pin that was there.
+        backup.put_back().unwrap();
+        assert_eq!(
+            fs::read_to_string(&pins).unwrap(),
+            r#"{"therock":{"version":"7.14.1"},"llamacpp":{"rocm-stable":"b11783"}}"#
+        );
+        assert_no_pin_temp_files(&runtime_dir.join("resources"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Puts `source` where `prepare_embeddable_with` leaves the verified
+    /// archive of the `11.5.1` test manifests: `<root>/downloads/<name>`.
+    fn cache_archive(root: &Path, source: &Path) {
+        let downloads = root.join("downloads");
+        fs::create_dir_all(&downloads).unwrap();
+        fs::copy(source, downloads.join(embeddable_archive_name("11.5.1"))).unwrap();
+    }
+
+    fn assert_no_pin_temp_files(dir: &Path) {
+        let leftovers: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".tmp-"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "the atomic write must not leave a temp file behind: {leftovers:?}"
+        );
+    }
+
+    /// Runs the restore against a fake embeddable archive that ships
+    /// `{"therock":{"version":"7.13.0"},"llamacpp":{"rocm-stable":"b9752"}}`,
+    /// with `current` as the pin file already on disk. Returns what the restore
+    /// returned and the pin file's content afterwards.
+    fn restore_over(tag: &str, current: &str) -> (Option<PinFileBackup>, String) {
+        restore_over_packaged(
+            tag,
+            r#"{"therock":{"version":"7.13.0"},"llamacpp":{"rocm-stable":"b9752"}}"#,
+            current,
+        )
+    }
+
+    /// [`restore_over`] with the pin file the archive ships given too.
+    fn restore_over_packaged(
+        tag: &str,
+        packaged: &str,
+        current: &str,
+    ) -> (Option<PinFileBackup>, String) {
+        let dir = scratch_dir(tag);
+        let root = dir.join("lemonade");
+        let runtime_dir = runtime_dir_in(&root);
+        fs::create_dir_all(runtime_dir.join("resources")).unwrap();
+        let pins = runtime_dir.join("resources/backend_versions.json");
+        fs::write(&pins, current).unwrap();
+        let source = dir.join("source-archive");
+        write_embeddable_with_pins(&source, packaged);
+        let sha256 = format!("{:x}", Sha256::digest(fs::read(&source).unwrap()));
+        let manifest = LemonadeInstallManifest {
+            env_id: "test".to_owned(),
+            version: "11.5.1".to_owned(),
+            runtime_dir: runtime_dir.clone(),
+            lemond: lemond_path_in(&runtime_dir),
+            lemonade: lemonade_path_in(&runtime_dir),
+            backend_recipe: LLAMACPP_RECIPE.to_owned(),
+            backend_name: ROCM_BACKEND_NAME.to_owned(),
+            installed_at_unix_ms: 0,
+        };
+        cache_archive(&root, &source);
+        let backup = restore_packaged_backend_versions_with(
+            &manifest,
+            "resources/backend_versions.json",
+            &sha256,
+            || {},
+        )
+        .unwrap();
+        let after = fs::read_to_string(&pins).unwrap();
+        // The backup, if any, still has to be able to put the file back.
+        if let Some(backup) = &backup {
+            assert!(backup.previous.is_some());
+        }
+        (backup, after)
+    }
+
+    #[test]
+    fn restore_keeps_entries_a_user_edited_and_only_resets_the_alignment_pins() {
+        let current = r#"{"therock":{"version":"7.14.1"},"llamacpp":{"rocm-stable":"b11783","vulkan":"b1111"},"custom":{"x":1}}"#;
+        let (backup, after) = restore_over("restore-keeps-user-edits", current);
+
+        let value: serde_json::Value = serde_json::from_str(&after).unwrap();
+        assert_eq!(value["therock"]["version"], "7.13.0");
+        assert_eq!(value["llamacpp"]["rocm-stable"], "b9752");
+        assert_eq!(value["llamacpp"]["vulkan"], "b1111", "{after}");
+        assert_eq!(value["custom"]["x"], 1, "{after}");
+        assert!(backup.is_some());
+    }
+
+    #[test]
+    fn restore_is_a_no_op_when_only_other_entries_differ_from_the_packaged_file() {
+        let current = r#"{"therock":{"version":"7.13.0"},"llamacpp":{"rocm-stable":"b9752","vulkan":"b1111"}}"#;
+        let (backup, after) = restore_over("restore-noop-other-keys", current);
+
+        assert!(backup.is_none(), "the alignment pins already match");
+        assert_eq!(after, current, "the file must not be rewritten");
+    }
+
+    #[test]
+    fn restore_removes_a_pin_the_packaged_file_does_not_have() {
+        // A packaged file without `llamacpp.rocm-stable` must not leave the
+        // kept alignment pin behind; the user's other entries still survive.
+        let packaged = r#"{"therock":{"version":"7.13.0"},"llamacpp":{"vulkan":"b9747"}}"#;
+        let current = r#"{"therock":{"version":"7.13.0"},"llamacpp":{"rocm-stable":"b11783","vulkan":"b1111"}}"#;
+        let (backup, after) = restore_over_packaged("restore-removes-pin", packaged, current);
+
+        assert!(backup.is_some(), "the kept rocm-stable pin is drift");
+        let value: serde_json::Value = serde_json::from_str(&after).unwrap();
+        assert!(value["llamacpp"].get("rocm-stable").is_none(), "{after}");
+        assert_eq!(value["llamacpp"]["vulkan"], "b1111", "{after}");
+        assert_eq!(value["therock"]["version"], "7.13.0");
+    }
+
+    #[test]
+    fn restore_happens_when_only_the_rocm_stable_pin_drifted() {
+        let current = r#"{"therock":{"version":"7.13.0"},"llamacpp":{"rocm-stable":"b11783"}}"#;
+        let (backup, after) = restore_over("restore-only-rocm-stable", current);
+
+        assert!(backup.is_some(), "a drifted llama.cpp tag alone is drift");
+        let value: serde_json::Value = serde_json::from_str(&after).unwrap();
+        assert_eq!(value["llamacpp"]["rocm-stable"], "b9752");
+        assert_eq!(value["therock"]["version"], "7.13.0");
+    }
+
+    #[test]
+    fn restore_replaces_a_pin_file_that_is_not_json_with_the_packaged_one() {
+        let (backup, after) = restore_over("restore-not-json", "{ not json");
+
+        assert!(backup.is_some());
+        let value: serde_json::Value = serde_json::from_str(&after).unwrap();
+        assert_eq!(value["therock"]["version"], "7.13.0");
+    }
+
+    /// A runtime tree whose pin file holds a stale kept pin, and the manifest
+    /// for it. The archive cache is left empty.
+    fn stale_pin_tree(tag: &str) -> (PathBuf, PathBuf, PathBuf, LemonadeInstallManifest) {
+        let dir = scratch_dir(tag);
+        let root = dir.join("lemonade");
+        let runtime_dir = runtime_dir_in(&root);
+        fs::create_dir_all(runtime_dir.join("resources")).unwrap();
+        let pins = runtime_dir.join("resources/backend_versions.json");
+        fs::write(
+            &pins,
+            r#"{"therock":{"version":"7.14.1"},"llamacpp":{"rocm-stable":"b11783"}}"#,
+        )
+        .unwrap();
+        let manifest = LemonadeInstallManifest {
+            env_id: "test".to_owned(),
+            version: "11.5.1".to_owned(),
+            runtime_dir: runtime_dir.clone(),
+            lemond: lemond_path_in(&runtime_dir),
+            lemonade: lemonade_path_in(&runtime_dir),
+            backend_recipe: LLAMACPP_RECIPE.to_owned(),
+            backend_name: ROCM_BACKEND_NAME.to_owned(),
+            installed_at_unix_ms: 0,
+        };
+        (dir, root, pins, manifest)
+    }
+
+    #[test]
+    fn restore_without_a_cached_archive_downloads_nothing_and_leaves_the_pins() {
+        // The restore runs after an install already failed (often because the
+        // network is down), so it must not start a download of its own.
+        let (dir, root, pins, manifest) = stale_pin_tree("restore-no-cache");
+        let before = fs::read(&pins).unwrap();
+
+        let error = restore_packaged_backend_versions_with(
+            &manifest,
+            "resources/backend_versions.json",
+            "0000",
+            || {},
+        )
+        .unwrap_err();
+
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("is not cached") && error.contains("not downloading"),
+            "{error}"
+        );
+        assert_eq!(
+            fs::read(&pins).unwrap(),
+            before,
+            "the pin file is untouched"
+        );
+        assert!(
+            !root.join("downloads").exists() && !root.join("extract").exists(),
+            "a missing cache must not create a download or scratch directory"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn restore_does_not_replace_a_cached_archive_that_fails_its_digest() {
+        let (dir, root, pins, manifest) = stale_pin_tree("restore-bad-cache");
+        let before = fs::read(&pins).unwrap();
+        let source = dir.join("source-archive");
+        write_embeddable_with_pins(
+            &source,
+            r#"{"therock":{"version":"7.13.0"},"llamacpp":{"rocm-stable":"b9752"}}"#,
+        );
+        cache_archive(&root, &source);
+
+        let error = restore_packaged_backend_versions_with(
+            &manifest,
+            "resources/backend_versions.json",
+            "not-the-digest-of-the-cached-archive",
+            || {},
+        )
+        .unwrap_err();
+
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("does not match its digest") && error.contains("not downloading"),
+            "{error}"
+        );
+        assert_eq!(
+            fs::read(&pins).unwrap(),
+            before,
+            "the pin file is untouched"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn restore_reads_the_pin_file_after_the_archive_work_not_before() {
+        let (dir, root, pins, manifest) = stale_pin_tree("restore-reads-late");
+        let source = dir.join("source-archive");
+        write_embeddable_with_pins(
+            &source,
+            r#"{"therock":{"version":"7.13.0"},"llamacpp":{"rocm-stable":"b9752"}}"#,
+        );
+        let sha256 = format!("{:x}", Sha256::digest(fs::read(&source).unwrap()));
+        cache_archive(&root, &source);
+        // Another process writes the pin file after this one started but
+        // before it has finished with the archive.
+        let concurrent = r#"{"therock":{"version":"7.14.2"},"llamacpp":{"rocm-stable":"b12000"},"custom":{"x":1}}"#;
+
+        let backup = restore_packaged_backend_versions_with(
+            &manifest,
+            "resources/backend_versions.json",
+            &sha256,
+            || fs::write(&pins, concurrent).unwrap(),
+        )
+        .unwrap()
+        .expect("the concurrent pins differ from the packaged ones");
+
+        assert_eq!(
+            backup.previous.as_deref(),
+            Some(concurrent.as_bytes()),
+            "the backup holds what was on disk when the restore wrote, not an earlier read"
+        );
+        let value: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&pins).unwrap()).unwrap();
+        assert_eq!(value["therock"]["version"], "7.13.0");
+        assert_eq!(
+            value["custom"]["x"], 1,
+            "the concurrent writer's other entries survive"
+        );
+        backup.put_back().unwrap();
+        assert_eq!(fs::read_to_string(&pins).unwrap(), concurrent);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn restore_does_not_treat_an_unreadable_pin_file_as_absent() {
+        // A directory where the file should be is unreadable on every platform
+        // (and, like a sharing violation, is not `NotFound`). The restore must
+        // fail without producing a backup that would delete the path later.
+        let (dir, root, pins, manifest) = stale_pin_tree("restore-unreadable");
+        fs::remove_file(&pins).unwrap();
+        fs::create_dir(&pins).unwrap();
+        fs::write(pins.join("keep"), b"kept").unwrap();
+        let source = dir.join("source-archive");
+        write_embeddable_with_pins(
+            &source,
+            r#"{"therock":{"version":"7.13.0"},"llamacpp":{"rocm-stable":"b9752"}}"#,
+        );
+        let sha256 = format!("{:x}", Sha256::digest(fs::read(&source).unwrap()));
+        cache_archive(&root, &source);
+
+        let error = restore_packaged_backend_versions_with(
+            &manifest,
+            "resources/backend_versions.json",
+            &sha256,
+            || {},
+        )
+        .unwrap_err();
+
+        let error = format!("{error:#}");
+        assert!(error.contains("could not read"), "{error}");
+        assert!(
+            pins.is_dir() && pins.join("keep").is_file(),
+            "the unreadable path is left exactly as it was"
+        );
+        assert_no_pin_temp_files(pins.parent().unwrap());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_backup_of_a_missing_pin_file_removes_the_file_again() {
+        let dir = scratch_dir("pin-backup-missing");
+        let pins = dir.join("backend_versions.json");
+        fs::write(&pins, b"restored").unwrap();
+
+        PinFileBackup::new(pins.clone(), None).put_back().unwrap();
+        assert!(!pins.exists());
+        // Already gone is not an error.
+        PinFileBackup::new(pins, None).put_back().unwrap();
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
