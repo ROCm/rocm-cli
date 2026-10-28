@@ -40,8 +40,6 @@ pub(crate) const DEFAULT_MODEL_REPO_DIR: &str = "models--unsloth--Qwen3-4B-Instr
 pub(crate) const DEFAULT_MODEL_GGUF: &str = "Qwen3-4B-Instruct-2507-Q4_K_M.gguf";
 pub(crate) const LLAMACPP_RECIPE: &str = "llamacpp";
 pub(crate) const ROCM_BACKEND_NAME: &str = "rocm";
-#[cfg(feature = "e2e-test-hooks")]
-const BACKEND_INSTALL_FAILURE_TEST_ENV: &str = "ROCM_E2E_LEMONADE_BACKEND_INSTALL_FAILURE";
 const DEFAULT_LOG_TAIL_LINES: usize = 200;
 /// How long a stop waits for the server to actually exit after each signal
 /// before reporting a timeout (or, under `force`, escalating to `SIGKILL`).
@@ -350,16 +348,6 @@ fn detect_response() -> DetectResponse {
 fn install_response(request: InstallRequest) -> Result<InstallResponse> {
     let paths = AppPaths::discover()?;
     paths.ensure()?;
-    // Debug builds expose a deterministic failure seam for the black-box CLI
-    // scenario that pins retry count and terminal recovery guidance. Keep it at
-    // the backend phase: the real defect happens after the embeddable is ready,
-    // and exercising it must not download or alter a runtime on the test host.
-    #[cfg(feature = "e2e-test-hooks")]
-    if std::env::var_os(BACKEND_INSTALL_FAILURE_TEST_ENV).is_some() {
-        crate::backend_alignment::install_llamacpp_backend_with_retry(|| {
-            bail!("scripted Lemonade backend install failure")
-        })?;
-    }
     eprintln!(
         "Preparing Lemonade embeddable {}...",
         rocm_deps::LEMONADE_VERSION

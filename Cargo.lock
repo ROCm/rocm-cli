@@ -1239,6 +1239,7 @@ dependencies = [
  "rand 0.9.4",
  "reqwest 0.13.4",
  "rocm-core",
+ "rocm-deps",
  "serde",
  "serde_json",
  "tempfile",

@@ -590,6 +590,109 @@ impl E2eWorld {
         self.legacy_rocm_path = Some(rocm);
     }
 
+    /// Plant a Lemonade runtime whose llama.cpp backend install always fails, on
+    /// a simulated host with one AMD GPU, so
+    /// `@id:serve-lemonade-preparation-recovery` can pin the retry count and the
+    /// terminal recovery guidance without a real GPU or a multi-gigabyte
+    /// runtime download.
+    ///
+    /// This replaces two `#[cfg(feature = "e2e-test-hooks")]` branches: one in
+    /// the Lemonade engine that failed the install on an environment variable,
+    /// and one in `rocm serve` that waived its no-GPU pre-flight for the same
+    /// variable. The failure now happens at the boundary a broken install fails
+    /// at -- a non-zero `lemonade backends install` -- and the pre-flight runs
+    /// unchanged against a host that has a GPU.
+    ///
+    /// **The runtime.** Black-box, like [`Self::register_mock_service`]: the
+    /// manifest is plain JSON matching the engine's on-disk schema, not a typed
+    /// import. `resolve_runtime` accepts it because it checks only that the
+    /// manifest parses and that `lemond` is a file; no checksum, version or
+    /// signature is on this path, so nothing here weakens a check the product
+    /// performs. `env_id` is the one field that cannot be a sentinel: `serve`
+    /// skips its own install only when `Detect` reports the id
+    /// `managed_engine_runtime_id` builds for the pinned version, and a
+    /// placeholder makes it quietly run the real install instead. So it is
+    /// derived from `rocm_deps` rather than copied.
+    ///
+    /// It goes under the scenario's own `data/engines/lemonade`, because this
+    /// scenario does not call [`Self::use_shared_runtimes`]: with an empty
+    /// runtimes registry the CLI resolves no env root, so `lemonade_root` is the
+    /// isolated engine dir.
+    ///
+    /// **The GPU.** One KFD GPU node under a simulated host root
+    /// (`ROCM_CLI_TEST_HOST_ROOT`), which is what `rocm serve`'s pre-flight
+    /// counts. The root holds nothing else, so a GPU runner's real devices do
+    /// not take part either. The host root is honoured only by the
+    /// `e2e-test-hooks` build and re-roots Linux paths only, which is why the
+    /// scenario is `@requires-os:linux`. The serve must therefore run through
+    /// `run_rocm_with_scenario_env`.
+    pub fn plant_failing_lemonade_runtime(&mut self) {
+        let root = self
+            .isolated_root
+            .as_ref()
+            .expect("no isolated root")
+            .path()
+            .to_owned();
+        let engine = root.join("data").join("engines").join("lemonade");
+        let runtime_dir = engine.join("runtime");
+        // `serve` writes running state and a startup log beside the manifest,
+        // and does not create these itself outside the install path.
+        for dir in [
+            &runtime_dir,
+            &engine.join("manifests"),
+            &engine.join("state"),
+            &engine.join("logs"),
+        ] {
+            std::fs::create_dir_all(dir)
+                .unwrap_or_else(|e| panic!("failed to create {}: {e}", dir.display()));
+        }
+
+        // One fixture under both names; it takes its role from argv[0].
+        let lemond = runtime_dir.join(e2e_cucumber::fixture_binary::fixture_target_name("lemond"));
+        let lemonade = runtime_dir.join(e2e_cucumber::fixture_binary::fixture_target_name(
+            "lemonade",
+        ));
+        install_fixture_binary("fake-lemonade", &lemond);
+        install_fixture_binary("fake-lemonade", &lemonade);
+
+        let manifest = serde_json::json!({
+            "env_id": format!("lemonade-embeddable-{}", rocm_deps::LEMONADE_VERSION),
+            "version": rocm_deps::LEMONADE_VERSION,
+            "runtime_dir": runtime_dir,
+            "lemond": lemond,
+            "lemonade": lemonade,
+            "backend_recipe": "llamacpp",
+            "backend_name": "rocm",
+            "installed_at_unix_ms": 0,
+        });
+        let path = engine.join("manifests").join("runtime.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&manifest).expect("manifest json"),
+        )
+        .unwrap_or_else(|e| panic!("failed to write {}: {e}", path.display()));
+
+        let host_root = root.join("host-root");
+        let node = host_root.join("sys/class/kfd/kfd/topology/nodes/1");
+        std::fs::create_dir_all(&node).expect("failed to create planted KFD node");
+        std::fs::write(
+            node.join("properties"),
+            "cpu_cores_count 0\nsimd_count 120\ngfx_target_version 110001\n",
+        )
+        .expect("failed to write planted KFD node properties");
+        self.command_env
+            .push(("ROCM_CLI_TEST_HOST_ROOT", host_root.into_os_string()));
+
+        // The engine prepares a runtime directory for `lemond` under
+        // `XDG_RUNTIME_DIR`, falling back to the real `$HOME`. Give it one inside
+        // the scenario, so the fake server writes nothing outside the isolated
+        // tree and a runner whose `$HOME` is not writable still gets this far.
+        let runtime = root.join("runtime");
+        std::fs::create_dir_all(&runtime).expect("failed to create isolated runtime dir");
+        self.command_env
+            .push(("XDG_RUNTIME_DIR", runtime.into_os_string()));
+    }
+
     /// Register the running mock server with the CLI by writing a managed-service
     /// record into the isolated services directory (`<data>/services/`), exactly
     /// as `rocm serve --managed` would. This lets `rocm services list` and the

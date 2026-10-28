@@ -184,12 +184,17 @@ Feature: Model serving
     Then serving is refused before any engine starts
     And the user is told the two selectors cannot be combined
 
-  # The failure is injected at Lemonade's backend-install boundary in debug/test
-  # builds, after the CLI has selected Lemonade but before any runtime download or
-  # machine mutation. That makes the user-visible retry and final recovery command
-  # deterministic on the blocking no-GPU lane rather than relying on a real 3 GiB
-  # transfer to fail at just the right moment.
-  @id:serve-lemonade-preparation-recovery @requires-no-gpu
+  # The harness plants a Lemonade runtime whose `lemonade backends install`
+  # always exits non-zero, so the failure happens at a real boundary -- a
+  # non-zero child process -- after the CLI has selected Lemonade but before any
+  # runtime download or machine mutation, and the retry and recovery command are
+  # deterministic without a real multi-gigabyte transfer failing at the right
+  # moment. `rocm serve` refuses before preparation on a host with no usable GPU,
+  # so the harness also plants one under a simulated host root, which re-roots
+  # Linux paths only; hence Linux. Windows is excluded for a second reason too:
+  # there `rocm serve` does not notice a managed engine dying at startup (#467),
+  # so the failure would not reach the user at all.
+  @id:serve-lemonade-preparation-recovery @requires-os:linux
   Scenario: serve-18 - Repeated Lemonade preparation failure gives the user a recovery path
     Given Lemonade preparation cannot complete
     When the user serves a model with Lemonade
