@@ -24,8 +24,10 @@ mod deletion_properties;
 mod driver_install;
 mod endpoint_keys;
 mod engines_cmd;
+mod freeform_execution;
 mod freeform_planner;
 mod logging;
+mod managed_service_status;
 mod provider_keys;
 mod providers;
 mod remote;
@@ -42,6 +44,7 @@ mod storage;
 mod test_support;
 mod therock;
 mod uninstall;
+mod uninstall_plan;
 
 // Per-command handlers mechanically relocated into modules — fns, plus the
 // types (e.g. `ServeArgs`, driver-plan types) that moved with their cluster.
@@ -56,8 +59,11 @@ mod uninstall;
 // `managed_service_process_command` because `restart_internal_managed_service`
 // (also outside `dispatch()`) calls them, and
 // `ensure_public_service_has_endpoint_key` because the endpoint-key check
-// below calls it directly. `install()`'s SDK
-// path calls into `runtime_install_finalize` directly (not via `dispatch()`),
+// below calls it directly. `prepare_freeform_execution`/
+// `render_freeform_execution_header` are re-imported for the same reason:
+// `execute_freeform_next_action` (itself only called from `run_freeform`,
+// outside `dispatch()`) calls them. `install()`'s SDK path calls into
+// `runtime_install_finalize` directly (not via `dispatch()`),
 // and `apply_runtime_update`/`append_update_activate_summary` and several
 // root-level chat/examine/update helpers call into `runtimes_cmd` directly for
 // the same reason `engines_cmd`'s runtime-resolution helpers are re-imported.
@@ -65,6 +71,12 @@ use crate::automations::automations;
 use crate::driver_install::{install_driver, reconcile_driver_install};
 use crate::engines_cmd::{
     engine_manages_own_runtime, engines, env_root_for_service, runtime_manifest_for_selector,
+};
+use crate::freeform_execution::{prepare_freeform_execution, render_freeform_execution_header};
+use crate::managed_service_status::{
+    load_managed_services, local_server_sidebar_status, managed_service_is_live,
+    managed_service_sidebar_counts, recorded_service_pids,
+    refresh_managed_service_runtime_liveness,
 };
 use crate::runtime_install_finalize::{
     SdkInstallConsents, ensure_libatomic_for_torch, ensure_libnuma_for_torch,
@@ -85,6 +97,7 @@ use crate::service_launch::{
     managed_service_process_command,
 };
 use crate::uninstall::uninstall;
+use crate::uninstall_plan::UninstallOptions;
 
 use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
@@ -95,18 +108,18 @@ use rocm_core::model_readiness::{
 use rocm_core::{
     AppPaths, AuditEventRecord, AutomationEventRecord, AutomationProposalRecord,
     AutomationRuntimeState, CodexBridgeEngine, CodexBridgeGpuSnapshot, CodexBridgeSnapshot,
-    DEFAULT_LOCAL_HOST, EndpointReadiness, EndpointReadinessOutcome, ExamineSummary,
-    ManagedServiceRecord, ModelRecipeRecord, ModelRecipeRegistry, ModelRecipeRegistrySource,
-    PERMISSIONS_MODE_ASK, PERMISSIONS_MODE_FULL_ACCESS, RocmCliConfig, TELEMETRY_MODE_LOCAL,
-    TELEMETRY_MODE_OFF, WatcherMode, append_audit_event, builtin_model_recipes, builtin_watchers,
-    connect_tcp_stream, daemon_binary_path, default_engine_for_platform, detect_host_gfx_target,
+    DEFAULT_LOCAL_HOST, EndpointReadiness, ExamineSummary, ManagedServiceRecord, ModelRecipeRecord,
+    ModelRecipeRegistry, ModelRecipeRegistrySource, PERMISSIONS_MODE_ASK,
+    PERMISSIONS_MODE_FULL_ACCESS, RocmCliConfig, TELEMETRY_MODE_LOCAL, TELEMETRY_MODE_OFF,
+    WatcherMode, append_audit_event, builtin_model_recipes, builtin_watchers, connect_tcp_stream,
+    daemon_binary_path, default_engine_for_platform, detect_host_gfx_target,
     detect_host_gpu_summary, engine_binary_path, engine_plugin_dirs, format_host_port,
     format_http_base_url, interactive_terminal, load_model_recipe_registry,
     load_recent_audit_events, load_recent_automation_events, load_recent_automation_proposals,
-    managed_pip_cache_dir, managed_service_endpoint_readiness, model_artifact_cache_status,
-    model_catalog_platforms, model_recipe_featured, model_recipe_target_platform_label,
-    normalize_therock_family, platform_matches_gfx_family, process_is_running,
-    read_http_response_bounded, uv_cache_source, write_all_tcp_stream,
+    managed_pip_cache_dir, model_artifact_cache_status, model_catalog_platforms,
+    model_recipe_featured, model_recipe_target_platform_label, normalize_therock_family,
+    platform_matches_gfx_family, process_is_running, read_http_response_bounded, uv_cache_source,
+    write_all_tcp_stream,
 };
 use rocm_engine_protocol::{
     DEFAULT_LOG_TAIL_LINES, DetectRequest, DetectResponse, DevicePolicy,
@@ -246,7 +259,8 @@ enum Command {
         /// same content `--report` printed, already filled in; it leaves your
         /// machine only when you send it yourself. On a machine with no
         /// desktop, or one reached over SSH, the link is printed instead of
-        /// opened.
+        /// opened. The mail goes from your own mail account, so it carries
+        /// your address; the report itself names no user, host, or file path.
         ///
         /// Requires `--report`, so the content is always shown before the
         /// mail is offered. Not combinable with `--json`, which is for
@@ -1762,7 +1776,7 @@ fn run_freeform(request: String, approve: bool) -> Result<()> {
         freeform_planner::render_structured_request_plan(&plan, &paths)
     );
     if approve {
-        execute_freeform_next_action(&request, &paths, &config)?;
+        execute_freeform_next_action(plan)?;
     }
     Ok(())
 }
@@ -1906,165 +1920,21 @@ fn should_treat_as_freeform(invocation: &FreeformInvocation) -> bool {
     treat_as_natural_language(&invocation.request_args)
 }
 
-fn execute_freeform_next_action(
-    request: &str,
-    paths: &AppPaths,
-    config: &RocmCliConfig,
-) -> Result<()> {
-    let execution = prepare_freeform_execution(request, paths, config)?;
+/// Takes the `StructuredRequestPlan` the caller already built (and already
+/// rendered to the operator) and dispatches its next action — never rebuilds
+/// it. A second, independent build here could call out to a configured cloud
+/// `planner_provider` a second time; since that call is not guaranteed
+/// deterministic, the plan the operator saw and the plan actually dispatched
+/// could silently diverge. Reusing the one `plan` the caller already has
+/// closes that gap.
+fn execute_freeform_next_action(plan: freeform_planner::StructuredRequestPlan) -> Result<()> {
+    let execution = prepare_freeform_execution(plan)?;
     print!("{}", render_freeform_execution_header(&execution));
 
     let mut argv = vec!["rocm".to_owned()];
     argv.extend(execution.action.args);
     let cli = Cli::try_parse_from(argv)?;
     dispatch(cli)
-}
-
-/// The argv `execute_freeform_next_action` is about to dispatch, plus whether
-/// [`apply_freeform_execution_consent`] added a flag to it.
-///
-/// The flag is tracked rather than re-detected from `action.args` because the
-/// execution header uses it to tell the operator *why* its `tool_call:` differs
-/// from the one in the request plan above. Looking for the flag in the final
-/// argv would report "added here" for a plan that already carried it.
-pub(crate) struct FreeformExecution {
-    pub action: freeform_planner::FreeformPlanAction,
-    pub consent_added: bool,
-}
-
-/// Everything `execute_freeform_next_action` decides before it hands the argv to
-/// clap: plan, refuse what must not run unattended, and grant the consent the
-/// outer `--yes` already carries.
-///
-/// Split out so the consent injection is reachable from a test without
-/// dispatching a real install — the header render and the `dispatch` call are
-/// all that is left above it.
-fn prepare_freeform_execution(
-    request: &str,
-    paths: &AppPaths,
-    config: &RocmCliConfig,
-) -> Result<FreeformExecution> {
-    let mut action =
-        freeform_planner::freeform_plan_next_action_with_context(request, paths, config)
-            .context("natural-language plan did not produce a structured tool call")?;
-    validate_freeform_execution_action(&action)?;
-    let consent_added = apply_freeform_execution_consent(&mut action.args);
-    Ok(FreeformExecution {
-        action,
-        consent_added,
-    })
-}
-
-/// Grant the generated tool call the consent the operator already gave on the
-/// outer command line.
-///
-/// Only ever reached from `run_freeform` with `approve` set, i.e. from
-/// `rocm --yes <natural-language request>`. The planner builds a bare
-/// `install sdk ...` argv and `execute_freeform_next_action` re-parses and
-/// dispatches it **in process**, so `install()` would otherwise run with
-/// `yes = false, approve_replacing_active_default = false` no matter what the
-/// outer invocation said. That made this surface print `approval: granted by
-/// --yes` and then, with an active default runtime, refuse with "re-run with
-/// `--approve-replacing-active-default`" — a flag this surface offers no way to
-/// pass — or prompt on a terminal it had just said it did not need to ask.
-///
-/// Not `--yes`, for the same reason every other internal caller picks the narrow
-/// flag: `--yes` on `install sdk` carries a second, unrelated consent for
-/// system-package installs that run `sudo`, and the outer `--yes` here means
-/// "execute the plan you were just shown", not "install system packages".
-///
-/// Injected before the execution header renders, so the printed `tool_call:` is
-/// the argv that actually runs, and skipped under `--dry-run`, which returns
-/// before the gate and needs no consent — matching the dry-run-aware arms in
-/// `chat_rocm_command_action_from_args`, `rocmd` and dash-tui. The plan
-/// rendering path is deliberately untouched: `rocm <request>` without `--yes`
-/// prints a command for a human to review, and it must not hand them a
-/// pre-approved one.
-///
-/// That leaves `rocm --yes <request>` printing two `tool_call:` lines that
-/// differ — `run_freeform` renders the plan section before calling
-/// `execute_freeform_next_action`, and the flag is injected between them — and
-/// that is also deliberate. The two sections report different things: "request
-/// plan" is what the planner derived from the request, and "execution" is the
-/// argv handed to clap, so the added consent showing up only under the
-/// `execution` header is how this surface discloses that it granted it. Nothing
-/// is being solicited in between; under `--yes` the operator already approved
-/// on the outer command line, and under no `--yes` the execution section is
-/// never reached, so neither line is an approval prompt whose subject could
-/// drift from what runs. Injecting into the plan render instead would have to
-/// reach `render_structured_request_plan`, which the no-`--yes` review path
-/// shares, and would print a pre-approved command to a human being asked to
-/// review it — the case the paragraph above rules out.
-///
-/// So the difference stays deliberate but stops being unexplained: this returns
-/// whether it actually added the flag, and the execution section says so in
-/// words. A doc comment reaches the next reader of this file; the operator
-/// looking at two `tool_call:` lines that disagree is the one who needs it.
-///
-/// Returns `true` only when the flag was not already present, so the disclosure
-/// is about a flag this function added and not one the argv arrived with.
-fn apply_freeform_execution_consent(args: &mut Vec<String>) -> bool {
-    let is_install_sdk = args.first().is_some_and(|arg| arg == "install")
-        && args.get(1).is_some_and(|arg| arg == "sdk");
-    if !is_install_sdk || args.iter().any(|arg| arg == "--dry-run") {
-        return false;
-    }
-    let already_present = args
-        .iter()
-        .any(|arg| arg == "--approve-replacing-active-default");
-    chat::ensure_flag(args, "--approve-replacing-active-default");
-    !already_present
-}
-
-fn validate_freeform_execution_action(action: &freeform_planner::FreeformPlanAction) -> Result<()> {
-    if action.has_placeholders {
-        bail!(
-            "cannot execute natural-language plan because the next tool call still contains placeholder values: {}",
-            freeform_planner::format_structured_tool_call("rocm", &action.args)
-        );
-    }
-    if action.provider_assisted {
-        bail!(
-            "provider-assisted plans must be reviewed interactively; run the displayed structured rocm command directly after reviewing it"
-        );
-    }
-    Ok(())
-}
-
-fn render_freeform_execution_header(execution: &FreeformExecution) -> String {
-    let action = &execution.action;
-    let mut output = String::new();
-    let _ = writeln!(output);
-    let _ = writeln!(output, "execution");
-    let _ = writeln!(
-        output,
-        "  approval: {}",
-        if action.approval_required {
-            "granted by --yes"
-        } else {
-            "not required; executing because --yes was supplied"
-        }
-    );
-    let _ = writeln!(
-        output,
-        "  tool_call: {}",
-        freeform_planner::format_structured_tool_call("rocm", &action.args)
-    );
-    // Printed only when the two `tool_call:` lines actually disagree, and
-    // immediately under the one that runs. Without it the operator sees a
-    // consent flag on the executed command that the request plan above never
-    // showed, with nothing on screen saying where it came from — the natural
-    // reading being that something was approved behind their back rather than
-    // that their own `--yes` was carried through.
-    if execution.consent_added {
-        let _ = writeln!(
-            output,
-            "  note: --approve-replacing-active-default was added here from your --yes, so this \
-             tool_call differs from the one under `request plan` above; nothing was approved \
-             between them."
-        );
-    }
-    output
 }
 
 fn render_freeform_read_only_answer(
@@ -3238,8 +3108,8 @@ fn perform_delivery(
     delivery: &rocm_core::report_delivery::Delivery,
     opener: &dyn Opener,
 ) -> String {
-    use rocm_core::report_delivery::{DESTINATION, Delivery};
-    match delivery {
+    use rocm_core::report_delivery::{DESTINATION, Delivery, SENDER_NOTICE};
+    let outcome = match delivery {
         // No mail client is started here on purpose, and the reason is worth
         // the line: this is the branch for a machine held over SSH, or a
         // server with no mail client at all, where starting one would open on
@@ -3262,7 +3132,11 @@ fn perform_delivery(
                  this yourself, mail the report above to {DESTINATION}, or open:\n  {url}"
             ),
         },
-    }
+    };
+    // Every branch offers a mail the user may send, so every branch says what
+    // that mail reveals about them. First, straight under the report: after the
+    // link, which wraps over many lines, it scrolls out of sight.
+    format!("{SENDER_NOTICE}\n{outcome}")
 }
 
 /// Print the report this machine would contribute, and send nothing.
@@ -8236,699 +8110,6 @@ pub(crate) fn render_daemon_text(paths: &AppPaths, config: &RocmCliConfig) -> St
     output
 }
 
-fn friendly_engine_label(engine: &str) -> &str {
-    match engine {
-        "lemonade" => "Lemonade",
-        "vllm" => "vLLM",
-        other => other,
-    }
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ManagedServiceSidebarCounts {
-    pub(crate) ready: usize,
-    pub(crate) starting: usize,
-    pub(crate) past_attempts: usize,
-}
-
-pub(crate) fn managed_service_sidebar_counts(
-    records: &[ManagedServiceRecord],
-) -> ManagedServiceSidebarCounts {
-    let mut counts = ManagedServiceSidebarCounts::default();
-    for record in records {
-        match record.status.as_str() {
-            "ready" | "running" => counts.ready += 1,
-            "starting" | "recovering" => counts.starting += 1,
-            _ => counts.past_attempts += 1,
-        }
-    }
-    counts
-}
-
-pub(crate) fn managed_service_is_live(record: &ManagedServiceRecord) -> bool {
-    record.is_live()
-}
-
-/// Idempotency guard for managed launches: returns an already-live managed
-/// service for this engine+model, if any, from an already-refreshed live set.
-/// The caller compares its effective launch recipe before deciding whether reuse
-/// is safe.
-///
-/// Keyed on `(engine, canonical_model_id)` — NOT `service_id`. `generate_service_id`
-/// embeds `unix_time_millis()`, so every launch mints a unique id; matching on it
-/// would never catch a duplicate. [`live_managed_services`] refreshes liveness, so
-/// stale manifests (dead PIDs) demote to "stopped" and are skipped, letting a
-/// genuine relaunch proceed. Records are sorted newest-first, so `find` returns
-/// the newest live match. Prevents a second `serve --managed` for the same
-/// engine+model from spawning a duplicate process once the TUI job-bridge guard
-/// has cleared.
-///
-/// Takes the snapshot rather than the paths so the allocation transaction loads
-/// it once and uses it for both this check and the port reservations: duplicate
-/// detection and candidate selection can never observe different states.
-pub(crate) fn existing_live_managed_service_in<'a>(
-    live: &'a [ManagedServiceRecord],
-    engine: &str,
-    canonical_model_id: &str,
-) -> Option<&'a ManagedServiceRecord> {
-    live.iter()
-        .find(|record| record.engine == engine && record.canonical_model_id == canonical_model_id)
-}
-
-const SERVICE_LIVENESS_CHECK_TIMEOUT: Duration = Duration::from_millis(750);
-
-/// The real process ids a record tracks.
-///
-/// The launcher pid is always recorded; `engine_pid` is adopted once the engine
-/// state file reports one. A `0` pid is a placeholder, never a real process.
-fn recorded_service_pids(record: &ManagedServiceRecord) -> Vec<u32> {
-    [record.engine_pid, Some(record.supervisor_pid)]
-        .into_iter()
-        .flatten()
-        .filter(|pid| *pid != 0)
-        .collect()
-}
-
-/// Complete a stop that was requested but could not confirm termination, once
-/// the processes are actually observed gone: drop the endpoint key and clear the
-/// marker. Returns whether the record changed.
-///
-/// This is deliberately keyed on `stop_requested_unix_ms` rather than on "the
-/// tracked pids are dead". A *crashed* service also has dead pids, but its
-/// operator never asked for it to go away and will want it back: dropping the
-/// key there would make `rocm services restart` and daemon recovery refuse it
-/// permanently — fail-closed guards have no way to re-mint a key. The cost of
-/// this choice is that a crashed public service's 0600 key file outlives the
-/// process until the service is stopped or successfully restarted.
-///
-/// Called before the liveness gate in
-/// [`refresh_managed_service_runtime_liveness`], so a record that reached
-/// "stopped" by another route still gets its deferred cleanup rather than
-/// stranding the key.
-fn settle_pending_stop_key_cleanup(paths: &AppPaths, record: &mut ManagedServiceRecord) -> bool {
-    if record.stop_requested_unix_ms.is_none() {
-        return false;
-    }
-    if recorded_service_pids(record)
-        .iter()
-        .any(|pid| process_is_running(*pid))
-    {
-        return false;
-    }
-    endpoint_keys::clear_endpoint_api_key(paths, &record.service_id);
-    record.stop_requested_unix_ms = None;
-    true
-}
-
-fn refresh_managed_service_runtime_liveness(
-    paths: &AppPaths,
-    record: &mut ManagedServiceRecord,
-) -> bool {
-    let settled_pending_stop = settle_pending_stop_key_cleanup(paths, record);
-    if !managed_service_is_live(record) {
-        return settled_pending_stop;
-    }
-
-    // Probe with the service's key so a protected public service is not mistaken
-    // for dead (an anonymous /v1/models would 401).
-    let endpoint_api_key = endpoint_keys::endpoint_api_key(paths, &record.service_id);
-    let outcome = if matches!(record.status.as_str(), "ready" | "running") {
-        managed_service_endpoint_readiness(
-            record,
-            endpoint_api_key.as_deref(),
-            SERVICE_LIVENESS_CHECK_TIMEOUT,
-            rocm_core::INFERENCE_PROBE_TIMEOUT,
-        )
-    } else {
-        EndpointReadinessOutcome {
-            readiness: EndpointReadiness::Unreachable,
-            record_changed: false,
-        }
-    };
-    let readiness = outcome.readiness;
-    if readiness == EndpointReadiness::Serving {
-        // Mirror `providers.rs::ready_local_services()`: a live, probe-passing
-        // service should be persisted as "ready", not left stuck at "running".
-        if record.status == "running" {
-            record.status = "ready".to_owned();
-            return true;
-        }
-        // A newly latched verification is itself worth persisting, so the next
-        // check reads it instead of sending another inference request.
-        return settled_pending_stop || outcome.record_changed;
-    }
-    if readiness == EndpointReadiness::Listing {
-        // The server is up and advertising the model; the weights are simply not
-        // usable yet. Leave the status alone rather than demoting to "starting" —
-        // `rocmd` restarts a service that sits in "starting" past its stale
-        // window, which for a slow-loading model would restart it mid-load and
-        // begin the wait all over again. Still report a change when the probe
-        // bookkeeping moved, so the retry throttle is persisted and the next
-        // process does not spend another full probe timeout.
-        return settled_pending_stop || outcome.record_changed;
-    }
-
-    let tracked_pids = recorded_service_pids(record);
-    let has_tracked_pid = !tracked_pids.is_empty();
-    let has_live_pid = tracked_pids.iter().any(|pid| process_is_running(*pid));
-    if has_tracked_pid && !has_live_pid {
-        // Reconcile the status only. The endpoint key is *not* dropped here:
-        // dead pids alone do not distinguish a stopped service from a crashed
-        // one, and a crashed public service needs its key to be restartable.
-        // `settle_pending_stop_key_cleanup` above owns that cleanup, gated on a
-        // stop having actually been requested.
-        if record.status != "stopped" {
-            record.status = "stopped".to_owned();
-            return true;
-        }
-        return settled_pending_stop;
-    }
-
-    if matches!(record.status.as_str(), "ready" | "running") {
-        let new_status = if has_live_pid { "starting" } else { "stopped" };
-        if record.status != new_status {
-            record.status = new_status.to_owned();
-            return true;
-        }
-    }
-
-    settled_pending_stop
-}
-
-/// One-line header for the local-servers views.
-///
-/// Records that are neither ready nor starting used to be invisible here, so a
-/// host with three failed servers and nothing live read "none ready" - true of
-/// the live set, misleading about what is on disk. They now get their own
-/// clause. The ready/starting wording is unchanged, so a header with no past
-/// attempts reads exactly as before; one with past attempts gains a third
-/// clause ("1 ready, 1 starting, 1 not running").
-fn local_server_sidebar_status(counts: &ManagedServiceSidebarCounts) -> String {
-    let mut parts = Vec::new();
-    if counts.ready > 0 {
-        parts.push(format!("{} ready", counts.ready));
-    }
-    if counts.starting > 0 {
-        parts.push(format!("{} starting", counts.starting));
-    }
-    if counts.past_attempts > 0 {
-        parts.push(format!("{} not running", counts.past_attempts));
-    }
-    if parts.is_empty() {
-        "none ready".to_owned()
-    } else {
-        parts.join(", ")
-    }
-}
-
-pub(crate) fn load_managed_services(paths: &AppPaths) -> Result<Vec<ManagedServiceRecord>> {
-    let services_dir = paths.services_dir();
-    if !services_dir.is_dir() {
-        return Ok(Vec::new());
-    }
-
-    let mut records = Vec::new();
-    for entry in fs::read_dir(&services_dir)
-        .with_context(|| format!("failed to read {}", services_dir.display()))?
-    {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().and_then(|value| value.to_str()) != Some("json") {
-            continue;
-        }
-        let bytes =
-            fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
-        if let Ok(mut record) = serde_json::from_slice::<ManagedServiceRecord>(&bytes) {
-            record.normalize_paths_for_host();
-            let refreshed_from_engine = record.refresh_from_engine_state().unwrap_or(false);
-            let refreshed_liveness = refresh_managed_service_runtime_liveness(paths, &mut record);
-            if refreshed_from_engine || refreshed_liveness {
-                let _ = record.write();
-            }
-            records.push(record);
-        }
-    }
-
-    records.sort_by_key(|record| std::cmp::Reverse(record.created_at_unix_ms));
-    Ok(records)
-}
-
-#[derive(Debug, Clone, Default)]
-struct UninstallOptions {
-    yes: bool,
-    dry_run: bool,
-    keep_binaries: bool,
-    keep_config: bool,
-    keep_data: bool,
-    keep_cache: bool,
-    force_dev_binaries: bool,
-}
-
-#[derive(Debug, Clone)]
-struct UninstallPlanEntry {
-    kind: &'static str,
-    path: PathBuf,
-}
-
-#[derive(Debug, Clone, Default)]
-struct UninstallPlan {
-    actions: Vec<UninstallPlanEntry>,
-    skipped: Vec<String>,
-    warnings: Vec<String>,
-    /// Installer PATH changes `rocm uninstall` undoes.
-    path_edits: Vec<uninstall::PathEdit>,
-    /// The installer's record of its PATH change, removed once that change is
-    /// undone.
-    path_record: Option<PathBuf>,
-    /// The running executable, on Windows, which is deleted as the command exits.
-    self_delete: Option<PathBuf>,
-}
-
-fn build_uninstall_plan(paths: &AppPaths, options: &UninstallOptions) -> Result<UninstallPlan> {
-    let mut plan = UninstallPlan::default();
-
-    plan_installed_binaries(
-        &mut plan,
-        options,
-        || daemon_binary_path().context("failed to discover current rocm executable"),
-        rocm_core::runtime_home_dir().as_deref(),
-    )?;
-
-    for (keep, kind, path) in [
-        (options.keep_config, "config", paths.config_dir.clone()),
-        (options.keep_data, "data", paths.data_dir.clone()),
-        (options.keep_cache, "cache", paths.cache_dir.clone()),
-    ] {
-        if keep {
-            plan.skipped
-                .push(format!("{kind} removal disabled by command line flag"));
-            continue;
-        }
-        // Planned under the spelling `remove_path` acts on, so the review names
-        // the entry that is actually removed, and `dir/` and `dir` dedup to one
-        // line. Existence is the entry's own, not its target's: a dangling link
-        // is listed and then really removed, instead of reported as absent.
-        // A failed check is not an absence either: it fails the plan, so the
-        // uninstall stops before removing anything instead of leaving a folder
-        // that may still be on disk out of the review.
-        match existing_entry(&path)
-            .with_context(|| format!("failed to check the {kind} folder {}", path.display()))?
-        {
-            Some((entry, _)) => plan.actions.push(UninstallPlanEntry { kind, path: entry }),
-            None => plan
-                .skipped
-                .push(format!("{kind} path not present: {}", path.display())),
-        }
-    }
-
-    for note in shared_cache_notes(paths) {
-        plan.warnings.push(note);
-    }
-
-    let managed_services = load_managed_services(paths).unwrap_or_default();
-    if !managed_services.is_empty() {
-        plan.warnings.push(format!(
-            "{} managed service record(s) exist under {}; background processes are not stopped automatically in this pass",
-            managed_services.len(),
-            paths.services_dir().display()
-        ));
-    }
-
-    // Remote sessions are worse than local ones to drop silently. The model runs
-    // on someone else's machine and its endpoint is published there, so removing
-    // the record here does not stop either — it only destroys the last thing that
-    // knew they existed. Name them and the command that tears them down properly.
-    //
-    // A read that fails is reported, not defaulted away. `load_all` already warns
-    // past an individual unreadable record and keeps going, so an `Err` here is a
-    // directory-level I/O failure, and a missing directory is `Ok`. Taking the
-    // default would state "there are none" on the one path where we do not know —
-    // and this plan goes on to delete the data directory those records live in,
-    // so the warning that something is still published elsewhere would be lost at
-    // exactly the moment it was the last copy.
-    let remote_sessions = match remote::session::load_all(paths) {
-        Ok(sessions) => sessions,
-        Err(error) => {
-            plan.warnings.push(format!(
-                "could not read the remote session records under {}: {error:#}\n\
-                 This pass cannot tell whether models are still running on other machines with \
-                 their endpoints published. Check with `rocm remote status` before continuing.",
-                paths.remote_sessions_dir().display()
-            ));
-            Vec::new()
-        }
-    };
-    if !remote_sessions.is_empty() {
-        plan.warnings.push(format!(
-            "{} remote session record(s) exist under {}; their models keep running on the \
-             remote machines and their endpoints stay published. Removing these records only \
-             loses track of them - run `rocm remote stop <session>` for each first: {}",
-            remote_sessions.len(),
-            paths.remote_sessions_dir().display(),
-            remote_sessions
-                .iter()
-                .map(|session| session.session_id.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
-    }
-
-    plan.actions
-        .sort_by(|left, right| left.path.cmp(&right.path));
-    plan.actions.dedup_by(|left, right| left.path == right.path);
-    Ok(plan)
-}
-
-/// Plan removing the installed binaries beside the running one, which
-/// `current_exe` names, and undoing the installer's PATH change for their
-/// folder. `--keep-binaries` keeps both, and so does a cargo build's folder.
-fn plan_installed_binaries(
-    plan: &mut UninstallPlan,
-    options: &UninstallOptions,
-    current_exe: impl FnOnce() -> Result<PathBuf>,
-    home: Option<&Path>,
-) -> Result<()> {
-    if options.keep_binaries {
-        // The PATH change only serves the binaries, so it stays with them.
-        plan.skipped.push(
-            "binary removal disabled by --keep-binaries, so any PATH change the installer made \
-             stays too"
-                .to_owned(),
-        );
-        return Ok(());
-    }
-    let current_exe = current_exe()?;
-    if is_dev_binary_layout(&current_exe) && !options.force_dev_binaries {
-        plan.skipped.push(format!(
-            "binary removal skipped because {} looks like a cargo target build; pass --force-dev-binaries to remove sibling debug/release binaries",
-            current_exe.display()
-        ));
-        return Ok(());
-    }
-    let binaries = collect_installed_binary_candidates(&current_exe)?;
-    for path in &binaries {
-        // Windows will not unlink a running image; it is deleted as the
-        // command exits instead.
-        if is_running_executable(path, &current_exe, cfg!(windows)) {
-            plan.self_delete = Some(path.clone());
-            continue;
-        }
-        // The PATH record goes only once its change is undone; see
-        // `uninstall::plan_path_edits`.
-        if path.file_name().and_then(|name| name.to_str()) == Some(uninstall::PATH_EDIT_RECORD) {
-            continue;
-        }
-        plan.actions.push(UninstallPlanEntry {
-            kind: "binary",
-            path: path.clone(),
-        });
-    }
-    if let Some(bin_dir) = current_exe.parent() {
-        uninstall::plan_path_edits(plan, bin_dir, &binaries, home);
-    }
-    Ok(())
-}
-
-/// Whether `path`, an entry of the running executable's folder, is the running
-/// executable itself, which only Windows has to treat specially. Windows names
-/// are case-insensitive, and the running image may report its own name in
-/// another case, or in its 8.3 short form (`ROCM.EXE`), than the folder listing
-/// does; missing it would plan an ordinary removal that Windows refuses.
-fn is_running_executable(path: &Path, current_exe: &Path, windows: bool) -> bool {
-    if !windows {
-        return false;
-    }
-    path == current_exe
-        || (path.parent() == current_exe.parent()
-            && path
-                .file_name()
-                .zip(current_exe.file_name())
-                .is_some_and(|(name, exe)| {
-                    name.to_string_lossy()
-                        .eq_ignore_ascii_case(&exe.to_string_lossy())
-                }))
-}
-
-pub(crate) fn render_uninstall_dry_run(paths: &AppPaths) -> Result<String> {
-    let options = UninstallOptions {
-        dry_run: true,
-        ..UninstallOptions::default()
-    };
-    let plan = build_uninstall_plan(paths, &options)?;
-    Ok(render_uninstall_plan(&plan, &options))
-}
-
-fn render_uninstall_plan(plan: &UninstallPlan, options: &UninstallOptions) -> String {
-    let mut output = String::new();
-    let _ = writeln!(output, "Uninstall review");
-    let _ = writeln!(output);
-    let removals = uninstall::removal_count(plan);
-    if uninstall::plan_is_empty(plan) {
-        let _ = writeln!(output, "Nothing managed by rocm-cli would be removed.");
-    } else if removals > 0 {
-        let _ = writeln!(output, "{removals} item(s) would be removed:");
-        for entry in &plan.actions {
-            let _ = writeln!(output, "  - {}: {}", entry.kind, entry.path.display());
-        }
-    }
-    uninstall::render_extra_plan(&mut output, plan);
-    if !plan.warnings.is_empty() {
-        let _ = writeln!(output);
-        let _ = writeln!(output, "Please review:");
-    }
-    for warning in &plan.warnings {
-        let _ = writeln!(output, "  - {warning}");
-    }
-    if !plan.skipped.is_empty() {
-        let _ = writeln!(output);
-        let _ = writeln!(output, "Left alone:");
-    }
-    for skipped in &plan.skipped {
-        let _ = writeln!(output, "  - {skipped}");
-    }
-    if options.dry_run {
-        let _ = writeln!(output);
-        let _ = writeln!(output, "Choose Review uninstall to approve removal.");
-    }
-    output
-}
-
-/// Caches that ROCm CLI causes to be filled but does not own, so uninstall
-/// leaves them in place.
-///
-/// These are usually the largest things on disk after an install, so a plan
-/// that stays silent about them reads as a clean slate it does not deliver.
-/// Only paths that exist and sit outside everything already being removed are
-/// reported, so the notes stay truthful as caches move under the data
-/// directory.
-fn shared_cache_notes(paths: &AppPaths) -> Vec<String> {
-    let removed_roots = [
-        paths.config_dir.clone(),
-        paths.data_dir.clone(),
-        paths.cache_dir.clone(),
-    ];
-    shared_cache_notes_for(&removed_roots, &shared_cache_candidates())
-}
-
-/// The pure part of [`shared_cache_notes`], so the filtering is testable without
-/// depending on the caller's real environment.
-fn shared_cache_notes_for(
-    removed_roots: &[PathBuf],
-    candidates: &[(PathBuf, &'static str)],
-) -> Vec<String> {
-    candidates
-        .iter()
-        .filter(|(path, _)| path.exists())
-        .filter(|(path, _)| !removed_roots.iter().any(|root| path.starts_with(root)))
-        .map(|(path, description)| format!("{description} not removed: {}", path.display()))
-        .collect()
-}
-
-/// The shared caches worth reporting, with why each is left alone.
-fn shared_cache_candidates() -> Vec<(PathBuf, &'static str)> {
-    let mut candidates = Vec::new();
-
-    // `uv` writes to `UV_CACHE_DIR` when set, otherwise its own default. Read it
-    // rather than assuming a location, so this stays correct wherever the cache
-    // has been pointed.
-    let uv_cache = env_path("UV_CACHE_DIR")
-        .or_else(|| rocm_core::runtime_home_dir().map(|home| home.join(".cache").join("uv")));
-    if let Some(path) = uv_cache {
-        candidates.push((
-            path,
-            "the uv package cache is shared with other uv projects on this computer and is",
-        ));
-    }
-
-    let hf_cache = env_path("HF_HOME")
-        .map(|home| home.join("hub"))
-        .or_else(|| env_path("HUGGINGFACE_HUB_CACHE"))
-        .or_else(|| {
-            rocm_core::runtime_home_dir()
-                .map(|home| home.join(".cache").join("huggingface").join("hub"))
-        });
-    if let Some(path) = hf_cache {
-        candidates.push((
-            path,
-            "downloaded model files are slow to fetch again and may include your own, so they are",
-        ));
-    }
-
-    candidates
-}
-
-fn env_path(name: &str) -> Option<PathBuf> {
-    std::env::var_os(name)
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-}
-
-fn confirm_uninstall() -> Result<bool> {
-    print!("Proceed with uninstall? [y/N]: ");
-    io::stdout()
-        .flush()
-        .context("failed to flush uninstall prompt")?;
-    let mut response = String::new();
-    io::stdin()
-        .read_line(&mut response)
-        .context("failed to read uninstall confirmation")?;
-    let normalized = response.trim().to_ascii_lowercase();
-    Ok(matches!(normalized.as_str(), "y" | "yes"))
-}
-
-fn collect_installed_binary_candidates(current_exe: &Path) -> Result<Vec<PathBuf>> {
-    let binary_dir = current_exe
-        .parent()
-        .context("current executable has no parent directory")?;
-    let mut binaries = Vec::new();
-    for entry in fs::read_dir(binary_dir)
-        .with_context(|| format!("failed to read {}", binary_dir.display()))?
-    {
-        let entry = entry?;
-        let path = entry.path();
-        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
-            continue;
-        };
-        if !path.is_file() {
-            continue;
-        }
-        if is_rocm_install_entry_name(name) {
-            binaries.push(path);
-        }
-    }
-    binaries.sort();
-    Ok(binaries)
-}
-
-fn is_rocm_install_entry_name(name: &str) -> bool {
-    if name == ".rocm-cli-manifest" || name == uninstall::PATH_EDIT_RECORD {
-        return true;
-    }
-    let normalized = name.strip_suffix(".exe").unwrap_or(name);
-    normalized == "rocm"
-        || normalized == "rocmd"
-        || normalized == "rocm-codex"
-        || normalized.starts_with("rocm-engine-")
-}
-
-fn is_dev_binary_layout(path: &Path) -> bool {
-    let Some(parent) = path.parent() else {
-        return false;
-    };
-    let Some(parent_name) = parent.file_name().and_then(|value| value.to_str()) else {
-        return false;
-    };
-    if parent_name != "debug" && parent_name != "release" {
-        return false;
-    }
-    parent
-        .parent()
-        .and_then(|value| value.file_name())
-        .and_then(|value| value.to_str())
-        == Some("target")
-}
-
-/// `path` respelled so it names the final entry itself.
-///
-/// A trailing separator (`link/`) or a trailing `.` (`link/.`) makes the kernel
-/// resolve a final symlink, so `symlink_metadata` reports the link's *target*
-/// directory and a recursive delete walks into it. Rebuilding the path from its
-/// components drops exactly those spellings (plus repeated separators and
-/// interior `.`), none of which otherwise change which entry is named. `..` is
-/// kept: dropping it lexically would change the meaning through a link.
-fn entry_path(path: &Path) -> PathBuf {
-    path.components().collect()
-}
-
-/// Does `path`'s text end in a separator or a final `.` (`x/`, `x/.`)? The
-/// kernel only lets such a spelling name a directory, so `notes.txt/` names
-/// nothing even though `notes.txt` exists.
-fn spelled_as_directory(path: &Path) -> bool {
-    let text = path.as_os_str().as_encoded_bytes();
-    let is_separator = |byte: u8| std::path::is_separator(char::from(byte));
-    match text {
-        [.., last] if is_separator(*last) => true,
-        [.., before, b'.'] => is_separator(*before),
-        _ => false,
-    }
-}
-
-/// The entry `path` names, as [`entry_path`] spells it, with its own
-/// (link-not-followed) metadata — or `None` when nothing is there.
-///
-/// A spelling that can only name a directory (see [`spelled_as_directory`])
-/// names nothing when the entry is a regular file, so that counts as absent
-/// rather than letting the respelling turn `notes.txt/` into `notes.txt`. A
-/// symlink is still the entry: it is what [`remove_path`] unlinks.
-fn existing_entry(path: &Path) -> io::Result<Option<(PathBuf, fs::Metadata)>> {
-    let entry = entry_path(path);
-    // Not `path.exists()`: that follows links, so a dangling link would read as
-    // already gone, be skipped, and still be reported as removed by the caller.
-    // "Not a directory" means a folder on the way is really a file (as in
-    // `notes.txt/../x`), so the path names nothing, the same as "not found".
-    // Any other failure is a real error, not an absence.
-    let metadata = match fs::symlink_metadata(&entry) {
-        Ok(metadata) => metadata,
-        Err(error)
-            if matches!(
-                error.kind(),
-                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
-            ) =>
-        {
-            return Ok(None);
-        }
-        Err(error) => return Err(error),
-    };
-    if spelled_as_directory(path) && !metadata.is_dir() && !metadata.file_type().is_symlink() {
-        return Ok(None);
-    }
-    Ok(Some((entry, metadata)))
-}
-
-/// Remove the entry `path` names: a file or symlink is unlinked (never
-/// followed, however `path` is spelled), a real directory is removed
-/// recursively, and an entry that is already gone is a no-op.
-///
-/// Normalizing here rather than only at plan time covers every caller —
-/// `rocm uninstall` and `rocm storage remove-downloads` — whatever spelling
-/// their plan carries.
-fn remove_path(path: &Path) -> Result<()> {
-    let Some((path, metadata)) =
-        existing_entry(path).with_context(|| format!("failed to stat {}", path.display()))?
-    else {
-        return Ok(());
-    };
-    let path = path.as_path();
-    if metadata.file_type().is_symlink() || metadata.is_file() {
-        fs::remove_file(path).with_context(|| format!("failed to remove {}", path.display()))?;
-    } else if metadata.is_dir() {
-        fs::remove_dir_all(path).with_context(|| format!("failed to remove {}", path.display()))?;
-    } else {
-        bail!("unsupported filesystem entry for {}", path.display());
-    }
-    Ok(())
-}
-
 pub(crate) const fn engine_inventory() -> &'static [(&'static str, &'static str)] {
     &[
         (
@@ -10713,6 +9894,47 @@ pub(crate) mod tests {
         assert!(said.contains("Nothing has been sent"));
     }
 
+    /// The dashboard's review and the CLI give the same sender notice, word for
+    /// word. The dashboard shows it above the report before Approve; the CLI
+    /// prints it under the report, before the mail link. `rocm-dash-tui`
+    /// cannot depend on `rocm-core`, so it restates the text; this crate links
+    /// both and holds them together.
+    #[test]
+    fn the_dashboard_approval_and_the_cli_give_the_same_sender_notice() {
+        assert_eq!(
+            rocm_dash_tui::ui::examine_manager::REPORT_SENDER_NOTICE,
+            rocm_core::report_delivery::SENDER_NOTICE
+        );
+    }
+
+    /// Every way a mail is offered says it carries the sender's address.
+    ///
+    /// This pins that the notice is printed on every branch. Its second
+    /// sentence, that the report names no user, host, or file path, is proven
+    /// against a real machine by the scenarios `diagnose-30`
+    /// (`@id:diagnose-report-carries-no-identifying-detail`) and `diagnose-32`
+    /// (`@id:diagnose-send-on-a-headless-machine-prints-instead-of-opening`),
+    /// which sweep the report for exactly those.
+    #[test]
+    fn every_offered_mail_says_it_carries_the_senders_address() {
+        let url = "mailto:nobody@example.invalid";
+        for (delivery, opener) in [
+            (Delivery::Show(url.to_owned()), RecordingOpener::working()),
+            (Delivery::Open(url.to_owned()), RecordingOpener::working()),
+            (Delivery::Open(url.to_owned()), RecordingOpener::broken()),
+        ] {
+            let said = perform_delivery(&delivery, &opener);
+            assert!(
+                said.starts_with(rocm_core::report_delivery::SENDER_NOTICE),
+                "the user was offered a mail without being told first that it carries their \
+                 address: {said}"
+            );
+            // Before the link, which wraps over many lines and would push a
+            // notice after it out of sight.
+            assert!(said.find(url) > said.find(rocm_core::report_delivery::SENDER_NOTICE));
+        }
+    }
+
     /// A diagnosis report holding exactly one finding.
     ///
     /// `has_match` is passed independently of the score on purpose: the point
@@ -10874,64 +10096,6 @@ pub(crate) mod tests {
         assert_eq!(super::exit_code_for(result), ExitCode::from(2));
     }
 
-    /// A cache that has moved inside a directory uninstall already removes must
-    /// not be reported as "not removed" — the note would be false.
-    #[test]
-    fn shared_cache_notes_skip_paths_already_being_removed() {
-        let root = std::env::temp_dir().join(format!("rocm-shared-cache-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let data = root.join("data");
-        let inside = data.join("uv-cache");
-        std::fs::create_dir_all(&inside).unwrap();
-
-        let notes = super::shared_cache_notes_for(
-            &[root.join("config"), data, root.join("cache")],
-            &[(inside, "the uv package cache")],
-        );
-
-        assert!(
-            notes.is_empty(),
-            "a cache inside a removed directory must not be reported: {notes:?}"
-        );
-
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// A cache that exists outside everything being removed is reported, with
-    /// its path, so the plan does not imply a clean slate it will not deliver.
-    #[test]
-    fn shared_cache_notes_report_paths_left_behind() {
-        let root = std::env::temp_dir().join(format!("rocm-shared-out-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let outside = root.join("elsewhere").join("uv");
-        std::fs::create_dir_all(&outside).unwrap();
-
-        let notes = super::shared_cache_notes_for(
-            &[root.join("data")],
-            &[(outside.clone(), "the uv package cache")],
-        );
-
-        assert_eq!(notes.len(), 1, "{notes:?}");
-        assert!(notes[0].contains("not removed"), "{notes:?}");
-        assert!(
-            notes[0].contains(&outside.display().to_string()),
-            "{notes:?}"
-        );
-
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// A cache that does not exist is not worth mentioning.
-    #[test]
-    fn shared_cache_notes_ignore_missing_paths() {
-        let missing = std::env::temp_dir().join("rocm-definitely-not-here-12345");
-        let notes = super::shared_cache_notes_for(
-            &[std::env::temp_dir()],
-            &[(missing, "the uv package cache")],
-        );
-        assert!(notes.is_empty(), "{notes:?}");
-    }
-
     use super::*;
     use serde_json::json;
 
@@ -10965,12 +10129,13 @@ pub(crate) mod tests {
             }
         }
 
-        /// Clear the two AMD driver-install override vars for the duration of the
-        /// test, so a value exported in the developer's or runner's shell cannot
-        /// leak into a plan and make its resolved `repo_version`/package release
-        /// disagree with the assertion.
+        /// Clear the AMD driver-version override for the duration of the test, so
+        /// a value exported in the developer's or runner's shell cannot leak into
+        /// a plan and make its resolved `repo_version_expr` disagree with the
+        /// assertion.
         pub(crate) fn with_amd_overrides_cleared() -> Self {
             let mut env = Self::new();
+            env.clear("ROCM_CLI_AMDGPU_DRIVER_VERSION");
             env.clear("ROCM_CLI_AMDGPU_VERSION");
             env.clear("ROCM_CLI_AMDGPU_PACKAGE_RELEASE");
             env
@@ -12552,214 +11717,6 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    #[test]
-    fn a_loading_service_keeps_its_status_instead_of_being_demoted() -> Result<()> {
-        use std::io::{Read, Write};
-        use std::net::TcpListener;
-
-        // A model that is listed but cannot serve yet is coming up normally. It
-        // must not be demoted to "starting": `rocmd` restarts a service that sits
-        // in "starting" past its stale window, which would kill a slow-loading
-        // model mid-load and start the wait over.
-        let listener = TcpListener::bind(("127.0.0.1", 0))?;
-        let port = listener.local_addr()?.port();
-        // Keeps listing the model for as long as the test asks, so a second
-        // readiness check reaches the probe throttle rather than an unanswered
-        // socket. Counts the inference requests that actually got sent.
-        let probes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let server_probes = std::sync::Arc::clone(&probes);
-        let server = thread::spawn(move || {
-            while let Ok((mut stream, _)) = listener.accept() {
-                stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
-                let mut buffer = [0_u8; 1024];
-                let Ok(read) = stream.read(&mut buffer) else {
-                    continue;
-                };
-                let request = String::from_utf8_lossy(&buffer[..read]).into_owned();
-                if request.starts_with("POST /v1/chat/completions ") {
-                    server_probes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    let body = r#"{"error":"loading model"}"#;
-                    let _ = write!(
-                        stream,
-                        "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        body.len(),
-                        body
-                    );
-                } else {
-                    let body = r#"{"data":[{"id":"Qwen3-0.6B-GGUF"}]}"#;
-                    let _ = write!(
-                        stream,
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        body.len(),
-                        body
-                    );
-                }
-            }
-        });
-
-        let (root, paths) = test_paths("liveness-loading-service");
-        paths.ensure()?;
-        let mut record = ManagedServiceRecord::new(
-            &paths,
-            "svc-loading",
-            "vllm",
-            "Qwen3-0.6B-GGUF",
-            "Qwen3-0.6B-GGUF",
-            "127.0.0.1",
-            port,
-            "managed",
-            std::process::id(),
-            None,
-            None,
-            None,
-        );
-        record.status = "running".to_owned();
-        record.write()?;
-
-        let changed = refresh_managed_service_runtime_liveness(&paths, &mut record);
-
-        assert_eq!(
-            record.status, "running",
-            "a loading service keeps its status rather than being demoted"
-        );
-        assert!(
-            record.inference_verified_at_unix_ms.is_none(),
-            "nothing is latched until inference actually answers"
-        );
-        assert!(
-            changed && record.inference_probe_attempted_at_unix_ms.is_some(),
-            "the probe attempt is recorded and reported so the caller persists \
-             the retry throttle"
-        );
-
-        // Second pass, inside the retry interval: the throttle holds, so the
-        // model is not asked to generate again just because someone re-listed.
-        let changed_again = refresh_managed_service_runtime_liveness(&paths, &mut record);
-        assert!(!changed_again, "a throttled check changes nothing");
-        assert_eq!(record.status, "running");
-        assert_eq!(
-            probes.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "a warming service must not be re-probed by every poll"
-        );
-
-        drop(server);
-        fs::remove_dir_all(root).ok();
-        Ok(())
-    }
-
-    #[test]
-    fn load_managed_services_promotes_running_to_ready_once_probe_passes() -> Result<()> {
-        use std::io::{Read, Write};
-        use std::net::TcpListener;
-
-        let listener = TcpListener::bind(("127.0.0.1", 0))?;
-        let port = listener.local_addr()?.port();
-        // Three requests hit this mock. `load_managed_services` lists the model
-        // and then confirms inference, which promotes the record and latches the
-        // verification; the `load_managed_service` re-read below (which proves the
-        // promotion was persisted, not just returned in-memory) reads that latch
-        // and so only re-lists.
-        let server = thread::spawn(move || -> Result<Vec<String>> {
-            let mut requests = Vec::new();
-            for _ in 0..3 {
-                let (mut stream, _) = listener.accept()?;
-                stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
-                let mut request_bytes = Vec::new();
-                let mut buffer = [0_u8; 1024];
-                loop {
-                    let read = stream.read(&mut buffer)?;
-                    if read == 0 {
-                        break;
-                    }
-                    request_bytes.extend_from_slice(&buffer[..read]);
-                    if String::from_utf8_lossy(&request_bytes).contains("\r\n\r\n") {
-                        break;
-                    }
-                }
-                let request = String::from_utf8_lossy(&request_bytes).into_owned();
-                let body = if request.starts_with("POST /v1/chat/completions ") {
-                    r#"{"choices":[{"message":{"content":"ok"}}]}"#
-                } else {
-                    r#"{"data":[{"id":"Qwen3-0.6B-GGUF"}]}"#
-                };
-                write!(
-                    stream,
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                )?;
-                requests.push(request);
-            }
-            Ok(requests)
-        });
-
-        let (root, paths) = test_paths("load-managed-services-promote-ready");
-        paths.ensure()?;
-        let mut record = ManagedServiceRecord::new(
-            &paths,
-            "svc-qwen-promote",
-            "vllm",
-            "Qwen3-0.6B-GGUF",
-            "Qwen3-0.6B-GGUF",
-            "127.0.0.1",
-            port,
-            "managed",
-            std::process::id(),
-            None,
-            None,
-            None,
-        );
-        // A supervisor that has already observed the engine come up reports
-        // "running"; only the HTTP model-ready probe should promote it further.
-        record.status = "running".to_owned();
-        record.write()?;
-
-        let records = load_managed_services(&paths)?;
-        let promoted = records
-            .iter()
-            .find(|found| found.service_id == "svc-qwen-promote")
-            .expect("service should be present");
-        assert_eq!(promoted.status, "ready");
-
-        // Re-read the manifest file directly (bypassing any code path that
-        // could itself re-run the promotion) to prove the transition was
-        // actually written to disk, not just returned in the in-memory
-        // `Vec<ManagedServiceRecord>` above. `load_managed_service` below
-        // also calls `refresh_managed_service_runtime_liveness` on every
-        // read, so asserting only on its return value would pass even if
-        // `load_managed_services` never persisted anything.
-        let on_disk_bytes = fs::read(&record.manifest_path)?;
-        let on_disk = serde_json::from_slice::<ManagedServiceRecord>(&on_disk_bytes)?;
-        assert_eq!(on_disk.status, "ready");
-
-        // The promotion must have been persisted to disk, not just returned
-        // in-memory, since chat's `pick_managed_chat_endpoint` re-reads it.
-        let reloaded = load_managed_service(&paths, "svc-qwen-promote")?;
-        assert_eq!(reloaded.status, "ready");
-        assert!(
-            reloaded.inference_verified_at_unix_ms.is_some(),
-            "the inference verification is persisted with the promotion"
-        );
-
-        let requests = server.join().expect("server thread should not panic")?;
-        let lines: Vec<&str> = requests
-            .iter()
-            .filter_map(|request| request.lines().next())
-            .collect();
-        assert_eq!(
-            lines,
-            vec![
-                "GET /v1/models HTTP/1.1",
-                "POST /v1/chat/completions HTTP/1.1",
-                "GET /v1/models HTTP/1.1",
-            ],
-            "promotion confirms inference once; the re-read reads the latch"
-        );
-        fs::remove_dir_all(root).ok();
-        Ok(())
-    }
-
     pub(crate) fn test_app_paths() -> AppPaths {
         AppPaths {
             config_dir: PathBuf::from("C:/Users/test/.rocm"),
@@ -12788,12 +11745,6 @@ pub(crate) mod tests {
             vars.last().map(|(key, value)| (*key, value.as_path())),
             Some(("ROCM_CLI_ENGINE_ENVS_ROOT", engine_root.as_path()))
         );
-    }
-
-    #[test]
-    fn uninstall_binary_matcher_includes_packaged_codex_binary() {
-        assert!(is_rocm_install_entry_name("rocm-codex"));
-        assert!(is_rocm_install_entry_name("rocm-codex.exe"));
     }
 
     #[test]
@@ -12858,185 +11809,6 @@ pub(crate) mod tests {
 
         assert!(!should_treat_as_freeform(&help));
         assert!(!should_treat_as_freeform(&bad_flag));
-    }
-
-    #[test]
-    fn freeform_execution_validation_rejects_placeholder_tool_calls() {
-        let action =
-            freeform_planner::freeform_plan_next_action("serve", &RocmCliConfig::default())
-                .expect("serve request should have next action");
-
-        let error = validate_freeform_execution_action(&action)
-            .unwrap_err()
-            .to_string();
-
-        assert!(action.has_placeholders);
-        assert!(error.contains("placeholder values"));
-        assert!(error.contains("rocm serve <model>"));
-    }
-
-    #[test]
-    fn freeform_execution_validation_accepts_fully_structured_tool_call() -> Result<()> {
-        let action = freeform_planner::freeform_plan_next_action(
-            "serve qwen3.5 with vllm",
-            &RocmCliConfig::default(),
-        )
-        .expect("serve request should have next action");
-
-        validate_freeform_execution_action(&action)?;
-        assert_eq!(
-            freeform_planner::format_structured_tool_call("rocm", &action.args),
-            "rocm serve Qwen/Qwen3.5-4B --engine vllm --device gpu_required --managed"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn freeform_execution_grants_the_narrow_consent_the_outer_yes_already_gave() {
-        // `rocm --yes <request>` dispatches the generated argv **in process**, so
-        // nothing carries the outer `--yes` into `install()` unless this does.
-        // Without it the surface prints `approval: granted by --yes` and then
-        // either refuses non-interactively, asking for a flag it offers no way to
-        // pass, or prompts on a terminal it just said it would not need to ask.
-        let request =
-            "install the latest TheRock nightly for this GPU into D:\\ROCm\\therock_venvs";
-        let config = RocmCliConfig::default();
-
-        let planned = freeform_planner::freeform_plan_next_action(request, &config)
-            .expect("install request should have next action");
-        assert!(
-            !planned
-                .args
-                .iter()
-                .any(|arg| arg.starts_with("--yes") || arg.starts_with("--approve-")),
-            "the plan itself must stay unapproved so `rocm <request>` shows a \
-             reviewable command: {:?}",
-            planned.args
-        );
-
-        // Through the real pre-dispatch path, not the injector in isolation:
-        // `execute_freeform_next_action` is this plus the header render and
-        // `dispatch`, so dropping the injection from the pipeline fails here.
-        let execution = prepare_freeform_execution(request, &test_app_paths(), &config)
-            .expect("install request should prepare for execution");
-        let action = &execution.action;
-
-        assert_eq!(
-            freeform_planner::format_structured_tool_call("rocm", &action.args),
-            "rocm install sdk --channel nightly --format wheel --prefix \
-             D:\\ROCm\\therock_venvs --approve-replacing-active-default"
-        );
-        // The narrow flag, never `--yes`: this surface has no terminal promise to
-        // make about a sudo password prompt for system packages.
-        assert!(!action.args.iter().any(|arg| arg == "--yes"));
-        // The header renders after injection, so the printed tool call is the
-        // argv that actually runs.
-        let rendered = render_freeform_execution_header(&execution);
-        assert!(rendered.contains("--approve-replacing-active-default"));
-        // And the operator is told why this `tool_call:` carries a consent flag
-        // the `request plan` section above it did not show. The plan assertion at
-        // the top of this test is what makes the two lines differ here, so the
-        // disclosure and the difference are pinned by the same test.
-        assert!(
-            execution.consent_added,
-            "the plan arrived unapproved, so the injector must report adding the flag"
-        );
-        assert!(
-            rendered.contains("was added here from your --yes"),
-            "the execution section must explain the differing tool_call: {rendered}"
-        );
-        // Re-parsing must reach `install()` with the consent actually set.
-        let mut argv = vec!["rocm".to_owned()];
-        argv.extend(execution.action.args);
-        let cli = Cli::try_parse_from(argv).expect("generated argv should parse");
-        match cli.command {
-            Some(Command::Install {
-                target:
-                    InstallTarget::Sdk {
-                        yes,
-                        approve_replacing_active_default,
-                        ..
-                    },
-            }) => {
-                assert!(approve_replacing_active_default);
-                assert!(!yes);
-            }
-            other => panic!("expected `install sdk`, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn freeform_execution_consent_is_scoped_to_mutating_sdk_installs() {
-        // Dry runs return before the consent gate, and the sibling dry-run-aware
-        // arms in chat, rocmd and dash-tui all withhold the flag there.
-        let mut dry_run = vec![
-            "install".to_owned(),
-            "sdk".to_owned(),
-            "--dry-run".to_owned(),
-        ];
-        assert!(!apply_freeform_execution_consent(&mut dry_run));
-        assert_eq!(
-            dry_run,
-            vec![
-                "install".to_owned(),
-                "sdk".to_owned(),
-                "--dry-run".to_owned()
-            ]
-        );
-
-        // Nothing else the planner can emit takes this flag; injecting it would
-        // not even parse.
-        for mut args in [
-            vec!["install".to_owned(), "driver".to_owned()],
-            vec!["serve".to_owned(), "qwen".to_owned()],
-            vec!["comfyui".to_owned(), "install".to_owned()],
-        ] {
-            let before = args.clone();
-            assert!(!apply_freeform_execution_consent(&mut args));
-            assert_eq!(args, before);
-        }
-
-        // Idempotent: a plan that already carries the flag is not given it twice,
-        // and reports that it added nothing — the execution section must not
-        // claim to have added a flag the argv arrived with.
-        let mut already = vec![
-            "install".to_owned(),
-            "sdk".to_owned(),
-            "--approve-replacing-active-default".to_owned(),
-        ];
-        assert!(!apply_freeform_execution_consent(&mut already));
-        assert_eq!(
-            already
-                .iter()
-                .filter(|arg| *arg == "--approve-replacing-active-default")
-                .count(),
-            1
-        );
-    }
-
-    #[test]
-    fn freeform_execution_header_surfaces_explicit_approval_and_tool_call() {
-        let action = freeform_planner::freeform_plan_next_action(
-            "serve qwen3.5 with vllm",
-            &RocmCliConfig::default(),
-        )
-        .expect("serve request should have next action");
-        let rendered = render_freeform_execution_header(&FreeformExecution {
-            action,
-            consent_added: false,
-        });
-
-        assert!(rendered.contains("execution"));
-        assert!(rendered.contains("approval: granted by --yes"));
-        assert!(rendered.contains(
-            "tool_call: rocm serve Qwen/Qwen3.5-4B --engine vllm --device gpu_required --managed"
-        ));
-        // Nothing was injected on this path, so the two `tool_call:` lines agree
-        // and the disclosure would be noise that contradicts the plan above.
-        assert!(
-            !rendered.contains("was added here"),
-            "the note must be scoped to an argv this surface actually changed: {rendered}"
-        );
     }
 
     #[test]
@@ -13206,32 +11978,6 @@ pub(crate) mod tests {
         let reloaded = RocmCliConfig::load(&paths).expect("reload config");
         assert_eq!(reloaded.permissions.mode_label(), PERMISSIONS_MODE_ASK);
         let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn freeform_execution_validation_rejects_provider_assisted_plans() -> Result<()> {
-        let content = r#"{
-            "intent": "serve",
-            "tool_call": {
-                "tool": "rocm",
-                "args": ["serve", "sshleifer/tiny-gpt2", "--engine", "vllm", "--managed"]
-            }
-        }"#;
-        let plan = freeform_planner::provider_planner_response_to_plan(
-            "start a local model",
-            "local",
-            content,
-        )?;
-        let action =
-            freeform_planner::plan_next_action(plan).expect("provider plan should have an action");
-
-        let error = validate_freeform_execution_action(&action)
-            .unwrap_err()
-            .to_string();
-
-        assert!(action.provider_assisted);
-        assert!(error.contains("reviewed interactively"));
-        Ok(())
     }
 
     #[test]
@@ -14787,70 +13533,6 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    /// `rocm uninstall`'s review warns that a remote session keeps running on
-    /// someone else's machine, and names the command that stops it properly.
-    ///
-    /// Nothing exercised that warning before: no test planted a remote session
-    /// record, so the whole sentence -- including the ASCII punctuation this
-    /// change put in it (ROCMAI-543) -- shipped uncovered. The remediation is
-    /// asserted alongside the encoding because a warning that stops naming
-    /// `rocm remote stop` leaves the user with no way to act on it.
-    #[test]
-    fn uninstall_warns_about_remote_sessions_in_ascii_and_names_the_stop_command() -> Result<()> {
-        let (root, paths) = test_paths("uninstall-remote-session-warning");
-        paths.ensure()?;
-        let session = crate::remote::session::RemoteSessionRecord {
-            session_id: crate::remote::session::RemoteSessionRecord::id_for("dev-box", 8000),
-            target: "dev-box".to_owned(),
-            peer_host: "dev-box".to_owned(),
-            ssh_port: None,
-            model: "qwen".to_owned(),
-            remote_service_id: "svc-remote".to_owned(),
-            remote_cli: "rocm".to_owned(),
-            remote_port: 8000,
-            tailnet_port: 8000,
-            base_url: "http://dev-box:8000/v1".to_owned(),
-            created_at_unix_ms: 1,
-        };
-        session.write(&paths)?;
-
-        // `keep_binaries` so the plan never reaches outside the sandbox: the
-        // binary paths are the host's real ones and have nothing to do with
-        // this warning.
-        let options = UninstallOptions {
-            dry_run: true,
-            keep_binaries: true,
-            ..UninstallOptions::default()
-        };
-        let plan = build_uninstall_plan(&paths, &options);
-        let _ = fs::remove_dir_all(&root);
-        let plan = plan?;
-
-        let warning = plan
-            .warnings
-            .iter()
-            .find(|warning| warning.contains("remote session record(s)"))
-            .unwrap_or_else(|| {
-                panic!("a planted remote session must be warned about: {plan:#?}");
-            });
-        assert!(
-            warning.contains(&session.session_id),
-            "the warning must name the session it found: {warning}"
-        );
-        assert!(
-            warning.contains("rocm remote stop <session>"),
-            "the warning must name the command that stops the remote model: {warning}"
-        );
-        // ROCMAI-543: printed verbatim by `render_uninstall_plan`, so non-ASCII
-        // punctuation here renders as mojibake like "ΓÇö" on a Windows console
-        // using the OEM code page.
-        assert!(
-            warning.is_ascii(),
-            "the remote-session warning must be ASCII-only (ROCMAI-543): {warning}"
-        );
-        Ok(())
-    }
-
     /// A file `prune` cannot delete must be *reported*, not swallowed and not
     /// propagated: the plan, the per-record progress and the audit event all
     /// have to survive it, because a destructive command that loses its own
@@ -15527,112 +14209,6 @@ pub(crate) mod tests {
             after.status, "stopped",
             "a refused restart must not stop the service"
         );
-        let _ = fs::remove_dir_all(root);
-    }
-
-    /// A public record with a dead pid and a stored endpoint key, for the
-    /// liveness-refresh cases below. The port is one nothing listens on, so the
-    /// refresh's endpoint probe fails and it falls through to the pid check.
-    fn dead_public_service_with_key(
-        paths: &AppPaths,
-        service_id: &str,
-        port: u16,
-    ) -> ManagedServiceRecord {
-        paths.ensure().unwrap();
-        let mut record = ManagedServiceRecord::new(
-            paths,
-            service_id,
-            "vllm",
-            "model-ref",
-            "canonical/model",
-            "0.0.0.0",
-            port,
-            "managed",
-            // A pid far above any plausible live process, as in
-            // `dead_managed_service_allows_relaunch`.
-            999_999_999,
-            None,
-            None,
-            None,
-        );
-        record.status = "running".to_owned();
-        record.write().unwrap();
-        endpoint_keys::store_endpoint_api_key(paths, service_id, "secret-key").unwrap();
-        record
-    }
-
-    #[test]
-    fn crashed_public_service_keeps_its_endpoint_key() {
-        // A crash (OOM kill, host reboot, panic) leaves the record at "running"
-        // with dead pids and no stop marker. Dropping the key here would make
-        // the fail-closed respawn guards refuse every later `rocm services
-        // restart` and every daemon recovery attempt — permanently, because
-        // nothing can re-mint the key. The refresh happens on every read
-        // (`rocm services list`), so this must survive it.
-        let (root, paths) = test_paths("liveness-crash-keeps-key");
-        let service_id = "svc-crashed-public";
-        let mut record = dead_public_service_with_key(&paths, service_id, 11982);
-
-        let changed = refresh_managed_service_runtime_liveness(&paths, &mut record);
-
-        assert!(changed, "a dead service must be demoted to stopped");
-        assert_eq!(record.status, "stopped");
-        assert_eq!(
-            endpoint_keys::endpoint_api_key(&paths, service_id).as_deref(),
-            Some("secret-key"),
-            "a crashed public service must stay restartable"
-        );
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn unconfirmed_stop_clears_the_endpoint_key_once_the_processes_are_gone() {
-        // The other half: a stop that could not confirm termination leaves the
-        // key in place (the engine may still be alive and enforcing it) and
-        // records the intent. Once the processes are observed gone, the deferred
-        // cleanup runs, so no plaintext secret is stranded for a service the
-        // operator did ask to stop.
-        let (root, paths) = test_paths("liveness-pending-stop-clears-key");
-        let service_id = "svc-pending-stop";
-        let mut record = dead_public_service_with_key(&paths, service_id, 11983);
-        record.stop_requested_unix_ms = Some(1);
-
-        let changed = refresh_managed_service_runtime_liveness(&paths, &mut record);
-
-        assert!(changed);
-        assert_eq!(record.status, "stopped");
-        assert_eq!(
-            endpoint_keys::endpoint_api_key(&paths, service_id),
-            None,
-            "a requested stop must still drop the key"
-        );
-        assert_eq!(
-            record.stop_requested_unix_ms, None,
-            "the marker is consumed, so the cleanup does not run again"
-        );
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn pending_stop_cleanup_runs_even_once_the_record_reads_stopped() {
-        // Proves the cleanup sits *before* the `managed_service_is_live` gate:
-        // a record that reached "stopped" by another route (an engine state
-        // refresh, a concurrent writer) would otherwise early-return and strand
-        // the key of a service the operator stopped.
-        let (root, paths) = test_paths("liveness-pending-stop-when-stopped");
-        let service_id = "svc-pending-stop-stopped";
-        let mut record = dead_public_service_with_key(&paths, service_id, 11984);
-        record.status = "stopped".to_owned();
-        record.stop_requested_unix_ms = Some(1);
-
-        let changed = refresh_managed_service_runtime_liveness(&paths, &mut record);
-
-        assert!(
-            changed,
-            "consuming the marker is a record change worth writing"
-        );
-        assert_eq!(endpoint_keys::endpoint_api_key(&paths, service_id), None);
-        assert_eq!(record.stop_requested_unix_ms, None);
         let _ = fs::remove_dir_all(root);
     }
 

@@ -21,13 +21,18 @@
 //!   deterministic plan is validated — it can never bypass the GPU-required or
 //!   local-bind-only rules the deterministic path enforces.
 //!
-//! [`render_freeform_plan`]/[`render_structured_request_plan`] render a plan for
-//! the no-`--yes` review path; [`freeform_plan_next_action_with_context`]
-//! reduces a plan to the single next [`FreeformPlanAction`] the dispatch flow
-//! executes. Everything downstream of "is this request freeform at all"
-//! (`parse_freeform_invocation`/`should_treat_as_freeform`) and "is this action
-//! safe to execute" (`validate_freeform_execution_action`) stays in `main.rs` —
-//! this module only builds and renders the plan.
+//! [`render_structured_request_plan`] renders a plan for the no-`--yes` review
+//! path; [`plan_next_action`] reduces a plan to the single next
+//! [`FreeformPlanAction`] the dispatch flow executes.
+//! [`plan_freeform_request_with_context`] builds a plan exactly once and
+//! derives both from that same value, so a provider-assisted plan (not
+//! guaranteed deterministic across calls) can never describe one command to
+//! the caller that renders it and a different one to the caller that executes
+//! it. Everything downstream of "is this request freeform at all"
+//! (`parse_freeform_invocation`/`should_treat_as_freeform`, which stay in
+//! `main.rs`) and "is this action safe to execute" (`validate_freeform_execution_action`,
+//! which moved to `freeform_execution.rs` in a later follow-up, ROCMAI-726) is
+//! out of scope here — this module only builds and renders the plan.
 
 use anyhow::{Context, Result, bail};
 use clap::Parser as _;
@@ -41,6 +46,11 @@ use std::fmt::Write as _;
 use crate::service_launch::is_loopback_host;
 use crate::{Cli, chat, providers};
 
+/// Builds the freeform plan once and renders it. Kept for the render-only test
+/// below; production code calls [`plan_freeform_request_with_context`]
+/// instead, which derives both the rendered text and the next action from a
+/// single build so the two can never diverge.
+#[cfg(test)]
 pub(crate) fn render_freeform_plan(
     request: &str,
     paths: &AppPaths,
@@ -69,13 +79,33 @@ pub(crate) fn freeform_plan_next_action(
     plan_next_action(plan)
 }
 
-pub(crate) fn freeform_plan_next_action_with_context(
+/// Builds the freeform plan exactly once, returning both the rendered plan
+/// text and the next action derived from that same plan.
+///
+/// Used by `chat.rs`'s `natural_language_plan` MCP tool, which used to call
+/// `render_freeform_plan` and (the now-removed)
+/// `freeform_plan_next_action_with_context` independently — each building its
+/// own `StructuredRequestPlan`. When the request is ambiguous and a cloud
+/// `planner_provider` is configured, building the plan calls out to that
+/// provider, and the call is not guaranteed deterministic: two independent
+/// builds could return two different plans, so the text shown to the user and
+/// the action reported as "next" could describe different commands. Building
+/// once and deriving both from the same `plan` value makes that impossible.
+///
+/// `main.rs`'s `run_freeform` has the same shape of fix but doesn't call this:
+/// it already needs the built `plan` by itself (to decide whether a read-only
+/// answer short-circuits rendering), so it builds once via
+/// [`build_freeform_plan_with_context`] directly and passes that same `plan`
+/// through to `execute_freeform_next_action`.
+pub(crate) fn plan_freeform_request_with_context(
     request: &str,
     paths: &AppPaths,
     config: &RocmCliConfig,
-) -> Option<FreeformPlanAction> {
+) -> (String, Option<FreeformPlanAction>) {
     let plan = build_freeform_plan_with_context(request, paths, config);
-    plan_next_action(plan)
+    let text = render_structured_request_plan(&plan, paths);
+    let action = plan_next_action(plan);
+    (text, action)
 }
 
 pub(crate) fn plan_next_action(plan: StructuredRequestPlan) -> Option<FreeformPlanAction> {
@@ -103,6 +133,40 @@ pub(crate) struct StructuredRequestPlan {
     parsed: Vec<(String, String)>,
     pub(crate) actions: Vec<PlannedToolCall>,
     notes: Vec<String>,
+}
+
+impl StructuredRequestPlan {
+    /// Builds a plan from the deterministic (non-provider-assisted) parser
+    /// path in [`build_freeform_plan_with_recipes`], hardcoding the
+    /// `planner`/`provider_assisted` fields every one of its 13 call sites
+    /// repeated verbatim.
+    ///
+    /// This must NOT be used by [`provider_planner_response_to_plan`]: that
+    /// path sets `provider_assisted: true` and a dynamic
+    /// `planner` string naming the provider, which this constructor's
+    /// hardcoded values would make awkward (or silently wrong) to keep
+    /// correct. That 14th call site keeps constructing the struct directly.
+    fn deterministic(
+        request: &str,
+        intent: PlannerIntent,
+        confidence: &'static str,
+        approval: &'static str,
+        parsed: Vec<(String, String)>,
+        actions: Vec<PlannedToolCall>,
+        notes: Vec<String>,
+    ) -> Self {
+        Self {
+            request: request.to_owned(),
+            planner: "hybrid-parser-v1".to_owned(),
+            provider_assisted: false,
+            intent,
+            confidence,
+            approval,
+            parsed,
+            actions,
+            notes,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,14 +204,26 @@ pub(crate) struct PlannedToolCall {
 }
 
 impl PlannedToolCall {
-    const fn read_only(title: &'static str, args: Vec<String>, reason: &'static str) -> Self {
+    /// Shared constructor behind [`Self::read_only`] and
+    /// [`Self::approval_required`], which differ only in the `approval`
+    /// literal they pass through.
+    const fn with_approval(
+        title: &'static str,
+        args: Vec<String>,
+        approval: &'static str,
+        reason: &'static str,
+    ) -> Self {
         Self {
             title,
             tool: "rocm",
             args,
-            approval: "not required",
+            approval,
             reason,
         }
+    }
+
+    const fn read_only(title: &'static str, args: Vec<String>, reason: &'static str) -> Self {
+        Self::with_approval(title, args, "not required", reason)
     }
 
     const fn approval_required(
@@ -155,13 +231,7 @@ impl PlannedToolCall {
         args: Vec<String>,
         reason: &'static str,
     ) -> Self {
-        Self {
-            title,
-            tool: "rocm",
-            args,
-            approval: "required",
-            reason,
-        }
+        Self::with_approval(title, args, "required", reason)
     }
 }
 
@@ -219,14 +289,12 @@ pub(crate) fn plan_driver_request(
             vec!["Driver changes are always explicit and never silent.".to_owned()],
         )
     };
-    StructuredRequestPlan {
-        request: trimmed.to_owned(),
-        planner: "hybrid-parser-v1".to_owned(),
-        provider_assisted: false,
-        intent: PlannerIntent::InstallDriver,
-        confidence: "high",
+    StructuredRequestPlan::deterministic(
+        trimmed,
+        PlannerIntent::InstallDriver,
+        "high",
         approval,
-        parsed: vec![(
+        vec![(
             "driver_flow".to_owned(),
             if lower.contains("dkms") {
                 "dkms"
@@ -235,7 +303,7 @@ pub(crate) fn plan_driver_request(
             }
             .to_owned(),
         )],
-        actions: vec![
+        vec![
             PlannedToolCall::read_only(
                 "Inspect host/driver state",
                 vec!["examine".to_owned()],
@@ -244,7 +312,7 @@ pub(crate) fn plan_driver_request(
             install_action,
         ],
         notes,
-    }
+    )
 }
 
 /// `host_default_engine` is the engine this GPU serves on, resolved by the
@@ -312,38 +380,25 @@ fn build_freeform_plan_on(
                 .map(|recipe| recipe.device_policy.as_str())
         });
         if device_policy.is_some_and(device_policy_is_cpu_mode) {
-            let mut parsed = vec![
-                ("model".to_owned(), model.to_owned()),
-                ("engine".to_owned(), engine.to_owned()),
-                ("device_policy".to_owned(), "cpu_not_supported".to_owned()),
-                ("mode".to_owned(), "managed".to_owned()),
-            ];
-            if model == "<model>" {
-                parsed.push(("missing".to_owned(), "model".to_owned()));
-            }
-            if let Some(requested_model) = requested_model
-                && requested_model != model
-            {
-                parsed.push(("model_alias".to_owned(), requested_model.to_owned()));
-            }
-            if let Some(recipe) = resolved_recipe.as_ref() {
-                parsed.push(("recipe_source".to_owned(), recipe.source.clone()));
-                parsed.push(("recipe_dtype".to_owned(), recipe.dtype.clone()));
-            }
-            return StructuredRequestPlan {
-                request: trimmed.to_owned(),
-                planner: "hybrid-parser-v1".to_owned(),
-                provider_assisted: false,
-                intent: PlannerIntent::Serve,
-                confidence: if model == "<model>" { "medium" } else { "high" },
-                approval: "not available; ROCm CLI requires ROCm GPU execution",
+            let (parsed, confidence) = serve_plan_parsed_fields_and_confidence(
+                model,
+                engine,
+                "cpu_not_supported",
+                requested_model,
+                resolved_recipe.as_ref(),
+            );
+            return StructuredRequestPlan::deterministic(
+                trimmed,
+                PlannerIntent::Serve,
+                confidence,
+                "not available; ROCm CLI requires ROCm GPU execution",
                 parsed,
-                actions: Vec::new(),
-                notes: vec![
+                Vec::new(),
+                vec![
                     "CPU mode is not offered by rocm-cli.".to_owned(),
                     "Use a ROCm-capable AMD GPU and request GPU execution.".to_owned(),
                 ],
-            };
+            );
         }
         let device_policy = device_policy.map(planned_device_policy_without_fallback);
         let mut args = vec![
@@ -357,27 +412,13 @@ fn build_freeform_plan_on(
             args.push(device_policy.to_owned());
         }
         args.push("--managed".to_owned());
-        let mut parsed = vec![
-            ("model".to_owned(), model.to_owned()),
-            ("engine".to_owned(), engine.to_owned()),
-            (
-                "device_policy".to_owned(),
-                device_policy.unwrap_or("gpu_required").to_owned(),
-            ),
-            ("mode".to_owned(), "managed".to_owned()),
-        ];
-        if model == "<model>" {
-            parsed.push(("missing".to_owned(), "model".to_owned()));
-        }
-        if let Some(requested_model) = requested_model
-            && requested_model != model
-        {
-            parsed.push(("model_alias".to_owned(), requested_model.to_owned()));
-        }
-        if let Some(recipe) = resolved_recipe.as_ref() {
-            parsed.push(("recipe_source".to_owned(), recipe.source.clone()));
-            parsed.push(("recipe_dtype".to_owned(), recipe.dtype.clone()));
-        }
+        let (parsed, confidence) = serve_plan_parsed_fields_and_confidence(
+            model,
+            engine,
+            device_policy.unwrap_or("gpu_required"),
+            requested_model,
+            resolved_recipe.as_ref(),
+        );
         let mut notes = vec![
             "Final execution must come from the structured tool call shown above.".to_owned(),
             "GPU-preferred recipe policies are treated as GPU required; no CPU fallback is implied."
@@ -386,15 +427,13 @@ fn build_freeform_plan_on(
         if let Some(recipe) = resolved_recipe.as_ref() {
             notes.extend(recipe.warnings.iter().cloned());
         }
-        return StructuredRequestPlan {
-            request: trimmed.to_owned(),
-            planner: "hybrid-parser-v1".to_owned(),
-            provider_assisted: false,
-            intent: PlannerIntent::Serve,
-            confidence: if model == "<model>" { "medium" } else { "high" },
-            approval: "required before launch; plan rendering is read-only",
+        return StructuredRequestPlan::deterministic(
+            trimmed,
+            PlannerIntent::Serve,
+            confidence,
+            "required before launch; plan rendering is read-only",
             parsed,
-            actions: vec![
+            vec![
                 PlannedToolCall::read_only(
                     "Inspect host/runtime state",
                     vec!["examine".to_owned()],
@@ -412,7 +451,7 @@ fn build_freeform_plan_on(
                 ),
             ],
             notes,
-        };
+        );
     }
 
     if lower.contains("driver") {
@@ -421,71 +460,63 @@ fn build_freeform_plan_on(
 
     if planner_mentions_comfyui(&lower) {
         if chat::any_substring(&lower, &["log", "logs"]) {
-            return StructuredRequestPlan {
-                request: trimmed.to_owned(),
-                planner: "hybrid-parser-v1".to_owned(),
-                provider_assisted: false,
-                intent: PlannerIntent::Inspect,
-                confidence: "high",
-                approval: "not required for inspection",
-                parsed: vec![("app".to_owned(), "ComfyUI".to_owned())],
-                actions: vec![PlannedToolCall::read_only(
+            return StructuredRequestPlan::deterministic(
+                trimmed,
+                PlannerIntent::Inspect,
+                "high",
+                "not required for inspection",
+                vec![("app".to_owned(), "ComfyUI".to_owned())],
+                vec![PlannedToolCall::read_only(
                     "Read ComfyUI logs",
                     vec!["comfyui".to_owned(), "logs".to_owned()],
                     "read-only app log check",
                 )],
-                notes: Vec::new(),
-            };
+                Vec::new(),
+            );
         }
         if chat::any_substring(&lower, &["start", "run", "launch", "open"]) {
-            return StructuredRequestPlan {
-                request: trimmed.to_owned(),
-                planner: "hybrid-parser-v1".to_owned(),
-                provider_assisted: false,
-                intent: PlannerIntent::Serve,
-                confidence: "high",
-                approval: "required before launch",
-                parsed: vec![("app".to_owned(), "ComfyUI".to_owned())],
-                actions: vec![PlannedToolCall::approval_required(
+            return StructuredRequestPlan::deterministic(
+                trimmed,
+                PlannerIntent::Serve,
+                "high",
+                "required before launch",
+                vec![("app".to_owned(), "ComfyUI".to_owned())],
+                vec![PlannedToolCall::approval_required(
                     "Start ComfyUI",
                     vec!["comfyui".to_owned(), "start".to_owned()],
                     "starts a local ComfyUI process",
                 )],
-                notes: Vec::new(),
-            };
+                Vec::new(),
+            );
         }
         if planner_requests_comfyui_install(&lower) {
-            return StructuredRequestPlan {
-                request: trimmed.to_owned(),
-                planner: "hybrid-parser-v1".to_owned(),
-                provider_assisted: false,
-                intent: PlannerIntent::InstallSdk,
-                confidence: "high",
-                approval: "required before installing ComfyUI",
-                parsed: vec![("app".to_owned(), "ComfyUI".to_owned())],
-                actions: vec![PlannedToolCall::approval_required(
+            return StructuredRequestPlan::deterministic(
+                trimmed,
+                PlannerIntent::InstallSdk,
+                "high",
+                "required before installing ComfyUI",
+                vec![("app".to_owned(), "ComfyUI".to_owned())],
+                vec![PlannedToolCall::approval_required(
                     "Install ComfyUI",
                     vec!["comfyui".to_owned(), "install".to_owned()],
                     "installs ComfyUI into ROCm CLI's managed app folder",
                 )],
-                notes: vec!["ComfyUI uses the active ROCm CLI managed TheRock runtime.".to_owned()],
-            };
+                vec!["ComfyUI uses the active ROCm CLI managed TheRock runtime.".to_owned()],
+            );
         }
-        return StructuredRequestPlan {
-            request: trimmed.to_owned(),
-            planner: "hybrid-parser-v1".to_owned(),
-            provider_assisted: false,
-            intent: PlannerIntent::Inspect,
-            confidence: "high",
-            approval: "not required for inspection",
-            parsed: vec![("app".to_owned(), "ComfyUI".to_owned())],
-            actions: vec![PlannedToolCall::read_only(
+        return StructuredRequestPlan::deterministic(
+            trimmed,
+            PlannerIntent::Inspect,
+            "high",
+            "not required for inspection",
+            vec![("app".to_owned(), "ComfyUI".to_owned())],
+            vec![PlannedToolCall::read_only(
                 "Check ComfyUI",
                 vec!["comfyui".to_owned(), "status".to_owned()],
                 "read-only app status check",
             )],
-            notes: Vec::new(),
-        };
+            Vec::new(),
+        );
     }
 
     if planner_is_install_sdk_request(&lower) {
@@ -503,20 +534,18 @@ fn build_freeform_plan_on(
             if let Some(build_date) = build_date.as_deref() {
                 parsed.push(("build_date".to_owned(), build_date.to_owned()));
             }
-            return StructuredRequestPlan {
-                request: trimmed.to_owned(),
-                planner: "hybrid-parser-v1".to_owned(),
-                provider_assisted: false,
-                intent: PlannerIntent::Ask,
-                confidence: "medium",
-                approval: "not applicable until an install folder is chosen",
+            return StructuredRequestPlan::deterministic(
+                trimmed,
+                PlannerIntent::Ask,
+                "medium",
+                "not applicable until an install folder is chosen",
                 parsed,
-                actions: Vec::new(),
-                notes: vec![
+                Vec::new(),
+                vec![
                     "Choose a ROCm/TheRock install folder before approving an install.".to_owned(),
                     "Say something like: install TheRock into D:\\ROCm\\therock_venvs.".to_owned(),
                 ],
-            };
+            );
         };
         let mut args = vec![
             "install".to_owned(),
@@ -540,15 +569,13 @@ fn build_freeform_plan_on(
         if let Some(build_date) = build_date.as_deref() {
             parsed.push(("build_date".to_owned(), build_date.to_owned()));
         }
-        return StructuredRequestPlan {
-            request: trimmed.to_owned(),
-            planner: "hybrid-parser-v1".to_owned(),
-            provider_assisted: false,
-            intent: PlannerIntent::InstallSdk,
-            confidence: "high",
-            approval: "required before installing or switching runtimes",
+        return StructuredRequestPlan::deterministic(
+            trimmed,
+            PlannerIntent::InstallSdk,
+            "high",
+            "required before installing or switching runtimes",
             parsed,
-            actions: vec![
+            vec![
                 PlannedToolCall::read_only(
                     "Inspect current runtime",
                     vec!["examine".to_owned()],
@@ -560,8 +587,8 @@ fn build_freeform_plan_on(
                     "changes managed runtime state",
                 ),
             ],
-            notes: vec!["TheRock pip venv install is the default managed runtime path.".to_owned()],
-        };
+            vec!["TheRock pip venv install is the default managed runtime path.".to_owned()],
+        );
     }
 
     if lower.contains("update") {
@@ -571,22 +598,20 @@ fn build_freeform_plan_on(
         } else {
             vec!["update".to_owned()]
         };
-        return StructuredRequestPlan {
-            request: trimmed.to_owned(),
-            planner: "hybrid-parser-v1".to_owned(),
-            provider_assisted: false,
-            intent: PlannerIntent::Update,
-            confidence: "high",
-            approval: if apply {
+        return StructuredRequestPlan::deterministic(
+            trimmed,
+            PlannerIntent::Update,
+            "high",
+            if apply {
                 "required before applying updates"
             } else {
                 "not required for update inspection"
             },
-            parsed: vec![(
+            vec![(
                 "mode".to_owned(),
                 if apply { "apply" } else { "check" }.to_owned(),
             )],
-            actions: vec![if apply {
+            vec![if apply {
                 PlannedToolCall::approval_required(
                     "Apply update",
                     args,
@@ -595,20 +620,18 @@ fn build_freeform_plan_on(
             } else {
                 PlannedToolCall::read_only("Check updates", args, "read-only update inspection")
             }],
-            notes: vec!["Update checks compare against the selected runtime channel.".to_owned()],
-        };
+            vec!["Update checks compare against the selected runtime channel.".to_owned()],
+        );
     }
 
     if lower.contains("uninstall") || lower.contains("remove rocm") {
-        return StructuredRequestPlan {
-            request: trimmed.to_owned(),
-            planner: "hybrid-parser-v1".to_owned(),
-            provider_assisted: false,
-            intent: PlannerIntent::Uninstall,
-            confidence: "high",
-            approval: "required before deleting installed files",
-            parsed: Vec::new(),
-            actions: vec![
+        return StructuredRequestPlan::deterministic(
+            trimmed,
+            PlannerIntent::Uninstall,
+            "high",
+            "required before deleting installed files",
+            Vec::new(),
+            vec![
                 PlannedToolCall::read_only(
                     "Preview uninstall",
                     vec!["uninstall".to_owned(), "--dry-run".to_owned()],
@@ -620,45 +643,76 @@ fn build_freeform_plan_on(
                     "deletes installed files and state",
                 ),
             ],
-            notes: Vec::new(),
-        };
+            Vec::new(),
+        );
     }
 
     if planner_is_inspect_request(&lower) {
-        return StructuredRequestPlan {
-            request: trimmed.to_owned(),
-            planner: "hybrid-parser-v1".to_owned(),
-            provider_assisted: false,
-            intent: PlannerIntent::Inspect,
-            confidence: "high",
-            approval: "not required for inspection",
-            parsed: vec![("engine".to_owned(), default_engine.to_owned())],
-            actions: vec![PlannedToolCall::read_only(
+        return StructuredRequestPlan::deterministic(
+            trimmed,
+            PlannerIntent::Inspect,
+            "high",
+            "not required for inspection",
+            vec![("engine".to_owned(), default_engine.to_owned())],
+            vec![PlannedToolCall::read_only(
                 "Inspect local ROCm state",
                 vec!["examine".to_owned()],
                 "read-only inspection",
             )],
-            notes: vec![
+            vec![
                 "Use /chat <prompt> in the TUI for provider-backed answers.".to_owned(),
                 "Use /plan with an explicit install, update, serve, or uninstall request for action planning.".to_owned(),
             ],
-        };
+        );
     }
 
-    StructuredRequestPlan {
-        request: trimmed.to_owned(),
-        planner: "hybrid-parser-v1".to_owned(),
-        provider_assisted: false,
-        intent: PlannerIntent::Ask,
-        confidence: "low",
-        approval: "not applicable",
-        parsed: Vec::new(),
-        actions: Vec::new(),
-        notes: vec![
+    StructuredRequestPlan::deterministic(
+        trimmed,
+        PlannerIntent::Ask,
+        "low",
+        "not applicable",
+        Vec::new(),
+        Vec::new(),
+        vec![
             "No ROCm action matched this request.".to_owned(),
             "Run `rocm --help` to see available commands, or rephrase to include an action such as install, update, serve, uninstall, check, or inspect.".to_owned(),
         ],
+    )
+}
+
+/// Builds the `parsed` vector and the confidence level shared by the two
+/// serve-plan return branches in [`build_freeform_plan_with_recipes`] (the
+/// CPU-mode early return and the normal managed-serve return): both record
+/// the same model/engine/mode fields and compute confidence identically,
+/// differing only in the `device_policy` value recorded and whether
+/// `actions` follow (the caller's concern, not this helper's).
+fn serve_plan_parsed_fields_and_confidence(
+    model: &str,
+    engine: &str,
+    device_policy_value: &str,
+    requested_model: Option<&str>,
+    resolved_recipe: Option<&ModelRecipeRecord>,
+) -> (Vec<(String, String)>, &'static str) {
+    let mut parsed = vec![
+        ("model".to_owned(), model.to_owned()),
+        ("engine".to_owned(), engine.to_owned()),
+        ("device_policy".to_owned(), device_policy_value.to_owned()),
+        ("mode".to_owned(), "managed".to_owned()),
+    ];
+    if model == "<model>" {
+        parsed.push(("missing".to_owned(), "model".to_owned()));
     }
+    if let Some(requested_model) = requested_model
+        && requested_model != model
+    {
+        parsed.push(("model_alias".to_owned(), requested_model.to_owned()));
+    }
+    if let Some(recipe) = resolved_recipe {
+        parsed.push(("recipe_source".to_owned(), recipe.source.clone()));
+        parsed.push(("recipe_dtype".to_owned(), recipe.dtype.clone()));
+    }
+    let confidence = if model == "<model>" { "medium" } else { "high" };
+    (parsed, confidence)
 }
 
 fn planned_device_policy_without_fallback(policy: &str) -> &str {
@@ -1212,6 +1266,9 @@ pub(crate) fn format_structured_tool_call(tool: &str, args: &[String]) -> String
     parts.join(" ")
 }
 
+/// Quotes `value` for rendered plan text and LLM prompt text only -- never
+/// executed directly. Deliberately kept separate from `rocm_core::quoting`
+/// (ROCMAI-727); see that module's doc comment for why.
 fn quote_tool_arg(value: &str) -> String {
     if value.is_empty() || value.chars().any(char::is_whitespace) {
         format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))

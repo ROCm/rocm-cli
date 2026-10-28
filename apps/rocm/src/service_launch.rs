@@ -48,12 +48,14 @@ use rocm_engine_protocol::{DevicePolicy, EngineRecipeHint, ResolveModelResponse}
 use crate::apply_app_path_env;
 use crate::endpoint_keys;
 use crate::engines_cmd::env_root_for_service;
+use crate::managed_service_status::{
+    existing_live_managed_service_in, load_managed_services, managed_service_is_live,
+};
 use crate::read_optional_tail_lines;
 use crate::serve_port;
 use crate::service_hints;
 use crate::{
     SandboxToolArg, builtin_engine_serve_http_args, device_policy_name,
-    existing_live_managed_service_in, load_managed_services, managed_service_is_live,
     managed_service_launcher_path, record_cli_audit_event, render_service_action_result,
     run_internal_sandbox_tool, status_for_readiness, wait_for_service_http_ready_with_progress,
 };

@@ -423,10 +423,11 @@ Feature: Diagnosing failures and listing fixes
     When the user asks the CLI to apply it without saying what to act on
     Then the CLI names what it still needs and reports no change
 
-  # Nothing here sends a report -- transport does not exist yet -- so what these
-  # two prove is the part that has to be right before it does: that the machine
-  # can see exactly what would be published, and that asking produces either a
-  # report or a stated refusal and never a silent send.
+  # Nothing here sends a report: the CLI only ever offers a prefilled mail that
+  # the user sends themselves. What these two prove is the part that has to be
+  # right before anything is offered: that the machine can see exactly what
+  # would be published, and that asking produces either a report or a stated
+  # refusal and never a silent send.
   #
   # Host-independent on purpose, and the branches land on different lanes. A
   # lane with an AMD GPU on the compatibility matrix exercises the prepared
@@ -475,12 +476,18 @@ Feature: Diagnosing failures and listing fixes
   # either, so a report is prepared on some lanes and refused on others.
   # Written so whichever branch a lane reaches is a real assertion rather
   # than a skip.
+  #
+  # The last step pairs the notice with its proof. The mail leaves from the
+  # user's own account, so the CLI says it carries their address, and says the
+  # report itself names no user, host, or file path. That second half is
+  # checked against this run's own output, not taken from the wording.
   @id:diagnose-send-on-a-headless-machine-prints-instead-of-opening @requires-os:linux
   Scenario: diagnose-32 - Asking to send on a machine with no desktop prints the address and a link instead of starting a mail client
     When the user asks the CLI for a way to send a report, with no desktop available to open it on
     Then the CLI either shows the whole report or says why it will not prepare one
     And the CLI states that nothing has been sent
     And the CLI prints the address to mail and a link, and starts nothing
+    And the CLI says the mail carries the user's own address, and the report names no user, host, or file path
 
   # HIP compiles device code at run time through a library a machine can hold
   # more than one copy of. When the copy that loads belongs to a different
@@ -563,7 +570,7 @@ Feature: Diagnosing failures and listing fixes
     Then no vLLM startup OOM is reported
 
   # Round 2 of ROCMAI-449 (`fix-6-path`): the escaped-write fix
-  # (`ps_single_quote_escape` in crates/rocm-core/src/fix.rs) is unit-tested
+  # (`ps_single_quote_escape` in crates/rocm-core/src/quoting.rs) is unit-tested
   # against the exact script string that gets built, but only a real Windows
   # host with a real `powershell.exe` can prove the escaped script still
   # parses and the value it carries survives the round trip. This also covers
@@ -633,3 +640,16 @@ Feature: Diagnosing failures and listing fixes
     Given a machine with an AMD GPU
     When the user diagnoses this machine in machine-readable form, with no symptom
     Then the diagnosis offers the old display driver advice only when the inspection reports an old driver
+
+  # The remediation text names a command and the files to move aside, so it is
+  # checked against a simulated Ubuntu 24.04 machine (os-release and two stale
+  # repo files planted under the host root, as in diagnose-40) rather than the
+  # runner's own distro: the advice depends on the distro and the runner's is
+  # not fixed. The named command is then held to existing and accepting the
+  # flags it is advised with; its behaviour is covered by driver-install-06.
+  @id:diagnose-stale-repos-advice-names-the-driver-reinstall @requires-os:linux
+  Scenario: diagnose-42 - Stale repo advice on Ubuntu 24.04 names the planted repo files and a driver reinstall that exists
+    Given an Ubuntu 24.04 machine with two stale ROCm repo files
+    When the user diagnoses that machine with a stale repo symptom
+    Then the stale repo cause names both planted repo files and the driver reinstall command
+    And the advised driver reinstall command accepts the flags it is advised with

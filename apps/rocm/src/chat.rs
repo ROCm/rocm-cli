@@ -25,25 +25,27 @@
 //! above.
 
 use crate::freeform_planner::{
-    format_structured_tool_call, freeform_plan_next_action_with_context, render_freeform_plan,
-    serve_args_request_cpu_device,
+    format_structured_tool_call, plan_freeform_request_with_context, serve_args_request_cpu_device,
 };
-use crate::runtime_install_finalize::empty_as_unknown;
+use crate::managed_service_status::{
+    friendly_engine_label, load_managed_services, managed_service_is_live,
+};
 use crate::runtimes_cmd::render_runtimes_text;
 use crate::service_launch::is_loopback_host;
+use crate::uninstall_plan::render_uninstall_dry_run;
 use crate::{
     ChatInferenceParams, apply_app_path_env, build_codex_bridge_gpu_snapshot,
     build_codex_bridge_snapshot, builtin_codex_bridge_engine_inventory, cli_version_string,
-    friendly_engine_label, load_managed_services, managed_service_is_live, read_tail_lines,
-    record_cli_audit_event, render_automations_text, render_config_text, render_daemon_text,
-    render_engine_inventory_text_with_paths, render_examine_text, render_examine_text_with_paths,
-    render_logs_browser_text, render_logs_text,
+    read_tail_lines, record_cli_audit_event, render_automations_text, render_config_text,
+    render_daemon_text, render_engine_inventory_text_with_paths, render_examine_text,
+    render_examine_text_with_paths, render_logs_browser_text, render_logs_text,
     render_model_registry_verbose_text_with_context_and_host, render_service_logs_text,
-    render_services_text, render_setup_status_text, render_uninstall_dry_run, render_update_text,
-    service_model_names_match, therock_install_version_selector, validate_service_id,
+    render_services_text, render_setup_status_text, render_update_text, service_model_names_match,
+    therock_install_version_selector, validate_service_id,
 };
 use crate::{chat_host_facts, comfyui, providers, therock};
 use anyhow::{Context, Result, bail};
+use rocm_core::placeholder::empty_as_unknown;
 use rocm_core::{
     AppPaths, AutomationRuntimeState, DEFAULT_LOCAL_HOST, ExamineSummary, ManagedServiceRecord,
     RocmCliConfig, builtin_watcher, daemon_binary_path, load_recent_automation_events,
@@ -3440,16 +3442,20 @@ pub(crate) fn run_internal_mcp_call(
             let request = json_string(&arguments, "request")
                 .context("natural_language_plan requires `request`")?;
             let config = RocmCliConfig::load(paths).unwrap_or_default();
-            let text = render_freeform_plan(&request, paths, &config);
-            let action =
-                freeform_plan_next_action_with_context(&request, paths, &config).map(|action| {
-                    serde_json::json!({
-                        "args": action.args,
-                        "approval_required": action.approval_required,
-                        "has_placeholders": action.has_placeholders,
-                        "provider_assisted": action.provider_assisted,
-                    })
-                });
+            // Built exactly once: the text shown to the operator and the
+            // `action` reported as what would run next both come from the
+            // same `StructuredRequestPlan`, so a provider-assisted plan (not
+            // guaranteed deterministic across calls) cannot describe one
+            // command in `text` and a different one in `action`.
+            let (text, action) = plan_freeform_request_with_context(&request, paths, &config);
+            let action = action.map(|action| {
+                serde_json::json!({
+                    "args": action.args,
+                    "approval_required": action.approval_required,
+                    "has_placeholders": action.has_placeholders,
+                    "provider_assisted": action.provider_assisted,
+                })
+            });
             Ok(internal_mcp_tool_success(
                 "Planned the ROCm request.".to_owned(),
                 serde_json::json!({

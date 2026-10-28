@@ -286,6 +286,7 @@ pub(crate) fn install_response(request: InstallRequest) -> Result<InstallRespons
         None => (None, RepairAssessment::default(), None),
     };
     let mut discover_pins: Vec<String> = Vec::new();
+    let mut discover_notes: Vec<String> = Vec::new();
     let runtime = if let Some(runtime) = already_installed {
         runtime
     } else {
@@ -310,11 +311,13 @@ pub(crate) fn install_response(request: InstallRequest) -> Result<InstallRespons
                 },
             )?,
         };
-        discover_pins = install_vllm_with_uv(
+        let outcome = install_vllm_with_uv(
             &managed.python_executable,
             request.reinstall,
             managed.rocm_sdk_version.as_deref(),
         )?;
+        discover_pins = outcome.pins;
+        discover_notes = outcome.notes;
         resolve_vllm_runtime(Some(&managed.runtime_id)).with_context(|| {
             format!(
                 "vLLM install completed in {}, but runtime `{}` still could not be resolved",
@@ -353,6 +356,7 @@ pub(crate) fn install_response(request: InstallRequest) -> Result<InstallRespons
             .notes
             .into_iter()
             .chain(vllm_runtime_warnings(&runtime))
+            .chain(discover_notes)
             .chain((!discover_pins.is_empty()).then(|| {
                 format!(
                     "vLLM ROCm 10.x discovery pinned: {}",
@@ -565,13 +569,21 @@ fn unverified_repair(reason: &str) -> RepairAssessment {
         )],
     }
 }
-/// Installs vLLM into `python`, returning any resolved pins worth surfacing
-/// to the caller as install warnings (empty for the static-pin route).
+/// What a vLLM install route resolved: the pins worth surfacing as an install
+/// warning, and a note for each place the route fell back to a weaker choice
+/// than the one it prefers. Both are empty for the static-pin route.
+#[derive(Debug, Default)]
+struct VllmInstallOutcome {
+    pins: Vec<String>,
+    notes: Vec<String>,
+}
+/// Installs vLLM into `python`, returning the pins and fallback notes worth
+/// surfacing to the caller as install warnings.
 fn install_vllm_with_uv(
     python: &Path,
     reinstall: bool,
     rocm_sdk_version: Option<&str>,
-) -> Result<Vec<String>> {
+) -> Result<VllmInstallOutcome> {
     let index_override = std::env::var("ROCM_CLI_VLLM_ROCM_INDEX_URL").ok();
     let index_override = index_override
         .as_deref()
@@ -615,7 +627,7 @@ fn install_vllm_with_uv(
                 .output()
                 .context("failed to launch uv pip install for vLLM")?;
             if output.status.success() {
-                return Ok(Vec::new());
+                return Ok(VllmInstallOutcome::default());
             }
             let detail = command_failure_detail(&output);
             bail!(
@@ -653,7 +665,20 @@ fn discover_pinned_requirement(
     pkg: &str,
     version: DiscoverVersion,
 ) -> Result<String> {
-    let requirement = version.requirement(pkg);
+    discover_pinned_requirement_for(uv, paths, python, index_url, pkg, &version.requirement(pkg))
+}
+
+/// [`discover_pinned_requirement`] for a requirement already spelled out, so a
+/// version learned at run time (not only a [`DiscoverVersion`] baked into a
+/// build row) can be confirmed against `index_url` the same way.
+fn discover_pinned_requirement_for(
+    uv: &Path,
+    paths: &AppPaths,
+    python: &Path,
+    index_url: &str,
+    pkg: &str,
+    requirement: &str,
+) -> Result<String> {
     let output = ProcessCommand::new(uv)
         .args([
             "pip",
@@ -666,7 +691,7 @@ fn discover_pinned_requirement(
         .arg(index_url)
         .args(["--prerelease", "allow", "--python"])
         .arg(python)
-        .arg(&requirement)
+        .arg(requirement)
         .envs(uv_command_env(paths))
         .output()
         .with_context(|| format!("failed to launch uv pip install --dry-run for {pkg}"))?;
@@ -694,6 +719,113 @@ fn discover_pinned_requirement(
             )
         })
 }
+/// Runs the dependency-resolving `uv pip install --dry-run` for the discovered
+/// vLLM pin and returns uv's report, without installing anything.
+///
+/// vLLM's wheel declares exact versions of the sibling wheels it was built
+/// against (`amd-aiter==<dev build>`), and the index keeps publishing newer
+/// siblings that those vLLM builds do not accept. Picking each package's newest
+/// release independently, as the series match does, can therefore name a
+/// combination the vLLM wheel itself rules out; the resolver's own answer for
+/// vLLM is the source of truth for what pairs with it. The resolution uses the
+/// same default index and the same 403-tolerant config file as the real install
+/// that follows, but not the same flags (`--reinstall` for the whole set, and no
+/// torch pins), so it is a close approximation of that install, not a guarantee
+/// about it. Only the companion lines of its output are consumed.
+fn resolve_vllm_dependencies(
+    uv: &Path,
+    paths: &AppPaths,
+    python: &Path,
+    vllm_pin: &str,
+    config_file: &Path,
+) -> Result<String> {
+    let mut args = uv_pip_install_base(python);
+    args.extend(
+        [
+            "--dry-run",
+            "--reinstall",
+            "--prerelease",
+            "allow",
+            "--config-file",
+        ]
+        .map(str::to_owned),
+    );
+    args.push(config_file.display().to_string());
+    args.push(vllm_pin.to_owned());
+    let output = ProcessCommand::new(uv)
+        .args(&args)
+        .envs(uv_command_env(paths))
+        .output()
+        .context("failed to launch uv pip install --dry-run to resolve vLLM's dependencies")?;
+    if !output.status.success() {
+        bail!(
+            "`uv {}` failed: {}",
+            args.join(" "),
+            command_failure_detail(&output)
+        );
+    }
+    Ok(format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    ))
+}
+
+/// The pin for a package that ships alongside vLLM (`flash-attn`,
+/// `amd-aiter`): the version vLLM's own dependencies resolve to when the vLLM
+/// index serves that exact build, otherwise the newest release of `series`.
+///
+/// The resolver's answer is only taken after the vLLM index is asked for that
+/// exact version on its own (`--index-url`, no PyPI): an unpinned dependency
+/// can resolve to a public PyPI release, which is the non-ROCm build this
+/// whole route exists to avoid, and such an answer falls through to the series
+/// match as before.
+///
+/// `vllm_resolution` is `None` when the resolve probe itself failed. A
+/// resolved pin the vLLM index does not confirm is not fatal either, but the
+/// reason comes back with the pin: a transient uv or network failure looks the
+/// same as "the index does not serve it", and both end in the series pin. The
+/// confirm call is tried twice, because on ROCm 10.1 the series pin is the pair
+/// that cannot be installed together, so a single transient failure should not
+/// be enough to land on it.
+fn discover_vllm_companion_pin(
+    uv: &Path,
+    paths: &AppPaths,
+    python: &Path,
+    build: &VllmRocmDiscoverBuild,
+    vllm_resolution: Option<&str>,
+    pkg: &str,
+    series: DiscoverVersion,
+) -> Result<(String, Option<String>)> {
+    let mut fallback_note = None;
+    if let Some(requirement) =
+        vllm_resolution.and_then(|resolved| dry_run_resolved_pin(resolved, pkg))
+    {
+        let confirm = || {
+            discover_pinned_requirement_for(
+                uv,
+                paths,
+                python,
+                build.vllm_index_url,
+                pkg,
+                &requirement,
+            )
+        };
+        match confirm().or_else(|_| confirm()) {
+            Ok(pin) => return Ok((pin, None)),
+            Err(err) => {
+                fallback_note = Some(format!(
+                    "vLLM's dependencies resolve {pkg} to `{requirement}`, but the vLLM index \
+                     did not confirm that build ({err:#}); using the newest {pkg} of its series \
+                     instead"
+                ));
+            }
+        }
+    }
+    let pin = discover_pinned_requirement(uv, paths, python, build.vllm_index_url, pkg, series)?;
+    Ok((pin, fallback_note))
+}
+
 /// Parses the ` + {pkg}==<version>` line `uv pip install --dry-run` prints
 /// for each package it would install, returning it as a `{pkg}==<version>`
 /// requirement.
@@ -965,14 +1097,15 @@ fn is_amd_device_package_for(name: &str, base_pkg: &str) -> bool {
 /// Discovers and installs the current vLLM/flash-attn/amd-aiter wheels for a
 /// [`VllmRocmDiscoverBuild`] row, pinning each to the exact version `uv pip
 /// install --dry-run` resolved so the real install can never silently drift
-/// to a different (or non-ROCm) build. Returns the pins actually installed.
+/// to a different (or non-ROCm) build. Returns the pins actually installed,
+/// and a note for each companion pin that fell back to the series match.
 fn install_vllm_rocm10_discover(
     uv: &Path,
     paths: &AppPaths,
     python: &Path,
     reinstall: bool,
     build: &VllmRocmDiscoverBuild,
-) -> Result<Vec<String>> {
+) -> Result<VllmInstallOutcome> {
     ensure_discover_python_tag(python, build)?;
     let torch = discover_pinned_requirement(
         uv,
@@ -1012,22 +1145,43 @@ fn install_vllm_rocm10_discover(
         "vllm",
         DiscoverVersion::Series(build.vllm_version_prefix),
     )?;
-    let flash_attn = discover_pinned_requirement(
+    let config_file = write_vllm_index_uv_config(paths, build)?;
+    // The probe only improves on the series match, so a probe that fails does
+    // not fail the install: the real install below is the authority, and it
+    // reports its own error. The reason is kept, because the series match is
+    // exactly the choice this probe exists to improve on.
+    let mut notes: Vec<String> = Vec::new();
+    let vllm_resolution = match resolve_vllm_dependencies(uv, paths, python, &vllm, &config_file) {
+        Ok(resolution) => Some(resolution),
+        Err(err) => {
+            notes.push(format!(
+                "could not resolve the dependencies of {vllm} ({err:#}); flash-attn and \
+                 amd-aiter use the newest release of their series, which may not be the \
+                 build this vLLM was made against"
+            ));
+            None
+        }
+    };
+    let (flash_attn, flash_attn_note) = discover_vllm_companion_pin(
         uv,
         paths,
         python,
-        build.vllm_index_url,
+        build,
+        vllm_resolution.as_deref(),
         "flash-attn",
         DiscoverVersion::Series(build.flash_attn_version_prefix),
     )?;
-    let amd_aiter = discover_pinned_requirement(
+    let (amd_aiter, amd_aiter_note) = discover_vllm_companion_pin(
         uv,
         paths,
         python,
-        build.vllm_index_url,
+        build,
+        vllm_resolution.as_deref(),
         "amd-aiter",
         DiscoverVersion::Series(build.amd_aiter_version_prefix),
     )?;
+    notes.extend(flash_attn_note);
+    notes.extend(amd_aiter_note);
 
     let pins = vec![torch, torchvision, torchaudio, vllm, flash_attn, amd_aiter];
     for pin in &pins {
@@ -1042,10 +1196,22 @@ fn install_vllm_rocm10_discover(
 
     let mut remaining_args =
         vllm_rocm10_discover_remaining_install_args(python, reinstall, &pins[3..]);
-    let config_file = write_vllm_index_uv_config(paths, build)?;
     remaining_args.push("--config-file".to_owned());
     remaining_args.push(config_file.display().to_string());
-    run_uv_pip_install(uv, paths, python, remaining_args)?;
+    if let Err(err) = run_uv_pip_install(uv, paths, python, remaining_args) {
+        // A note kept only for the success path would be lost exactly when the
+        // fallback pins are what failed.
+        return Err(if notes.is_empty() {
+            err
+        } else {
+            // The cause first, so plain `{}` display leads with the uv failure
+            // and not with a note about how the pins were chosen.
+            anyhow!(
+                "{err:#}\n\nThe fallback pins were used because: {}",
+                notes.join(" ")
+            )
+        });
+    }
 
     // The full-dependency resolve above can replace torch (and, pulling it in
     // transitively, torchvision/torchaudio) with unconstrained PyPI builds;
@@ -1087,7 +1253,7 @@ fn install_vllm_rocm10_discover(
 
     let mut pins = pins;
     pins.extend(device_pins);
-    Ok(pins)
+    Ok(VllmInstallOutcome { pins, notes })
 }
 /// Wheel index and exact requirement for one `uv pip install vllm`.
 ///
@@ -1914,6 +2080,354 @@ mod tests {
         }
         assert!(!args.contains(&"--reinstall".to_owned()));
     }
+    /// A stand-in `uv` that answers the two kinds of dry-run the discovery makes the
+    /// way AMD's staging index did when ROCm 10.1's vLLM stopped installing: the
+    /// index serves a newer `amd-aiter` (0.1.24.post1) than the one the newest
+    /// vLLM 0.29 wheel declares (a 0.1.22 dev build), and the `--no-deps`
+    /// single-index query serves only builds that index really holds.
+    #[cfg(unix)]
+    fn fake_uv_for_staging_index(dir: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let script = r#"#!/bin/sh
+for last; do :; done
+case "$*" in
+  *--no-deps*)
+    case "$last" in
+      amd-aiter==0.1.22.post2.dev0+gb4d9154d1.d20261002) echo " + $last" >&2 ;;
+      amd-aiter==0.1.\*) echo " + amd-aiter==0.1.24.post1" >&2 ;;
+      flash-attn==2.8.3|flash-attn==2.8.\*) echo " + flash-attn==2.8.3" >&2 ;;
+      *) echo "error: no version of ${last} on this index" >&2; exit 1 ;;
+    esac ;;
+  *) exit 64 ;;
+esac
+"#;
+        let path = dir.join("uv");
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn companion_pins_follow_what_the_discovered_vllm_depends_on() -> Result<()> {
+        // The ROCm 10.1 failure: installing `amd-aiter==0.1.24.post1` (the newest
+        // release in the series) beside a vLLM wheel that depends on the 0.1.22 dev
+        // build made `uv` report the pair unsatisfiable, so the reinstall failed.
+        let root = tempfile::tempdir()?;
+        let paths = AppPaths {
+            config_dir: root.path().join("config"),
+            data_dir: root.path().join("data"),
+            cache_dir: root.path().join("cache"),
+        };
+        let uv = fake_uv_for_staging_index(root.path());
+        let python = root.path().join("python");
+        let build = vllm_rocm_discover_build("10.1.0").expect("10.1.0 has a discover row");
+        let resolution = "Resolved 232 packages in 5.33s\n + amd-aiter==0.1.22.post2.dev0+gb4d9154d1.d20261002\n + flash-attn==2.8.3\n + torch==2.14.1\n";
+
+        let (amd_aiter, note) = discover_vllm_companion_pin(
+            &uv,
+            &paths,
+            &python,
+            build,
+            Some(resolution),
+            "amd-aiter",
+            DiscoverVersion::Series(build.amd_aiter_version_prefix),
+        )?;
+        assert_eq!(
+            amd_aiter,
+            "amd-aiter==0.1.22.post2.dev0+gb4d9154d1.d20261002"
+        );
+        assert_eq!(note, None, "a confirmed pin needs no fallback note");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn companion_pin_the_vllm_index_does_not_serve_falls_back_to_the_series() -> Result<()> {
+        // A dependency vLLM leaves unpinned can resolve to a public PyPI release.
+        // The vLLM index does not hold it, so it must not become the pin (that is
+        // the non-ROCm build the discovery route exists to avoid): the series
+        // match decides, as it did before vLLM's own resolution was consulted.
+        let root = tempfile::tempdir()?;
+        let paths = AppPaths {
+            config_dir: root.path().join("config"),
+            data_dir: root.path().join("data"),
+            cache_dir: root.path().join("cache"),
+        };
+        let uv = fake_uv_for_staging_index(root.path());
+        let python = root.path().join("python");
+        let build = vllm_rocm_discover_build("10.1.0").expect("10.1.0 has a discover row");
+
+        let (flash_attn, note) = discover_vllm_companion_pin(
+            &uv,
+            &paths,
+            &python,
+            build,
+            Some("Resolved 232 packages\n + flash-attn==9.9.9\n"),
+            "flash-attn",
+            DiscoverVersion::Series(build.flash_attn_version_prefix),
+        )?;
+        assert_eq!(flash_attn, "flash-attn==2.8.3");
+        // The fallback is not silent: the resolved build and the index's answer
+        // are both in the note.
+        let note = note.expect("an unconfirmed pin must leave a note");
+        assert!(
+            note.contains("flash-attn==9.9.9") && note.contains("did not confirm"),
+            "{note}"
+        );
+
+        // And a vLLM that depends on neither sibling leaves the series in charge.
+        let (amd_aiter, note) = discover_vllm_companion_pin(
+            &uv,
+            &paths,
+            &python,
+            build,
+            Some("Resolved 3 packages\n + vllm==0.29.1\n"),
+            "amd-aiter",
+            DiscoverVersion::Series(build.amd_aiter_version_prefix),
+        )?;
+        assert_eq!(amd_aiter, "amd-aiter==0.1.24.post1");
+        assert_eq!(note, None, "nothing was resolved, so nothing was dropped");
+
+        // A probe that failed leaves no resolution at all: the series decides.
+        let (amd_aiter, note) = discover_vllm_companion_pin(
+            &uv,
+            &paths,
+            &python,
+            build,
+            None,
+            "amd-aiter",
+            DiscoverVersion::Series(build.amd_aiter_version_prefix),
+        )?;
+        assert_eq!(amd_aiter, "amd-aiter==0.1.24.post1");
+        assert_eq!(note, None, "the probe failure is reported by the caller");
+        Ok(())
+    }
+
+    /// Runs `install_vllm_rocm10_discover` against a fake `uv` that answers the
+    /// probe, the exact-version confirm and the real installs, and returns what
+    /// it returned together with every `uv` argv it saw.
+    ///
+    /// Unlike the helper-level tests above this drives the real resolve output
+    /// through the whole discovery sequence.
+    #[cfg(unix)]
+    fn run_discover_with_fake_uv(
+        probe_ok: bool,
+        confirm_ok: bool,
+        install_ok: bool,
+    ) -> Result<(Result<VllmInstallOutcome>, Vec<String>)> {
+        use rocm_core::fake_executable::write_fake_executable;
+        let root = tempfile::tempdir()?;
+        let paths = AppPaths {
+            config_dir: root.path().join("config"),
+            data_dir: root.path().join("data"),
+            cache_dir: root.path().join("cache"),
+        };
+        let python = root.path().join("python");
+        write_fake_executable(&python, "#!/bin/sh\necho cp314\n")?;
+        let log = root.path().join("uv.log");
+        let uv = root.path().join("uv");
+        let probe = if probe_ok {
+            r#"echo "Resolved 232 packages" >&2
+    echo " + amd-aiter==0.1.22.post2.dev0+gb4d9154d1.d20261002" >&2
+    echo " + flash-attn==2.8.3" >&2
+    echo " + vllm==9.9.9" >&2"#
+        } else {
+            r#"echo "error: No solution found when resolving dependencies" >&2
+    exit 2"#
+        };
+        let confirm = if confirm_ok {
+            r#"echo " + ${last}" >&2"#
+        } else {
+            r#"echo "error: connection reset" >&2
+        exit 1"#
+        };
+        let install = if install_ok {
+            "exit 0"
+        } else {
+            "echo 'error: unsatisfiable' >&2; exit 1"
+        };
+        write_fake_executable(
+            &uv,
+            format!(
+                r#"#!/bin/sh
+echo "$@" >> "{log}"
+last=""
+for a in "$@"; do last="$a"; done
+case "$*" in
+  *--dry-run*--config-file*)
+    {probe}
+    ;;
+  *--dry-run*)
+    pkg=${{last%%==*}}
+    case "$last" in
+      *'*'*) echo " + ${{pkg}}==9.9.9" >&2 ;;
+      amd-aiter==*|flash-attn==*)
+        {confirm}
+        ;;
+      *) echo " + ${{last}}" >&2 ;;
+    esac
+    ;;
+  *--config-file*)
+    {install}
+    ;;
+  *"pip freeze"*)
+    true
+    ;;
+esac
+exit 0
+"#,
+                log = log.display()
+            ),
+        )?;
+        let build = vllm_rocm_discover_build("10.1.0").expect("10.1.0 has a discover row");
+        let outcome = install_vllm_rocm10_discover(&uv, &paths, &python, true, build);
+        let calls = std::fs::read_to_string(&log)?
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        Ok((outcome, calls))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_installs_the_companions_the_discovered_vllm_depends_on() -> Result<()> {
+        // The real resolve output flows through the whole sequence: the probe
+        // names the 0.1.22 dev build, the index confirms it, and that build (not
+        // the series' newest) is what the real install pins.
+        let (outcome, calls) = run_discover_with_fake_uv(true, true, true)?;
+        let outcome = outcome?;
+        assert!(
+            outcome
+                .pins
+                .contains(&"amd-aiter==0.1.22.post2.dev0+gb4d9154d1.d20261002".to_owned()),
+            "{:?}",
+            outcome.pins
+        );
+        assert!(outcome.pins.contains(&"flash-attn==2.8.3".to_owned()));
+        assert!(outcome.notes.is_empty(), "{:?}", outcome.notes);
+        let real_install = calls
+            .iter()
+            .find(|call| call.contains("--reinstall-package vllm"))
+            .expect("the real vllm install ran");
+        assert!(
+            real_install.contains("amd-aiter==0.1.22.post2.dev0+gb4d9154d1.d20261002"),
+            "{real_install}"
+        );
+        assert!(!real_install.contains("amd-aiter==9.9.9"), "{real_install}");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_transient_confirm_failure_is_retried_once_before_falling_back() -> Result<()> {
+        use rocm_core::fake_executable::write_fake_executable;
+        let root = tempfile::tempdir()?;
+        let paths = AppPaths {
+            config_dir: root.path().join("config"),
+            data_dir: root.path().join("data"),
+            cache_dir: root.path().join("cache"),
+        };
+        let python = root.path().join("python");
+        let marker = root.path().join("first-call-seen");
+        let uv = root.path().join("uv");
+        // The exact-build confirm fails the first time it is asked and succeeds
+        // the second, like a dropped connection.
+        write_fake_executable(
+            &uv,
+            format!(
+                r#"#!/bin/sh
+for last; do :; done
+if [ -e "{marker}" ]; then
+  echo " + $last" >&2
+else
+  touch "{marker}"
+  echo "error: connection reset" >&2
+  exit 1
+fi
+"#,
+                marker = marker.display()
+            ),
+        )?;
+        let build = vllm_rocm_discover_build("10.1.0").expect("10.1.0 has a discover row");
+        let resolution =
+            "Resolved 3 packages\n + amd-aiter==0.1.22.post2.dev0+gb4d9154d1.d20261002\n";
+
+        let (pin, note) = discover_vllm_companion_pin(
+            &uv,
+            &paths,
+            &python,
+            build,
+            Some(resolution),
+            "amd-aiter",
+            DiscoverVersion::Series(build.amd_aiter_version_prefix),
+        )?;
+        assert_eq!(pin, "amd-aiter==0.1.22.post2.dev0+gb4d9154d1.d20261002");
+        assert_eq!(note, None, "a retry that succeeds needs no note");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_resolve_probe_falls_back_to_the_series_and_says_why() -> Result<()> {
+        // The probe only improves on the series match; it must not make an
+        // install that worked before fail. The reason is reported, not dropped.
+        let (outcome, _) = run_discover_with_fake_uv(false, true, true)?;
+        let outcome = outcome?;
+        assert!(outcome.pins.contains(&"amd-aiter==9.9.9".to_owned()));
+        assert!(outcome.pins.contains(&"flash-attn==9.9.9".to_owned()));
+        assert_eq!(outcome.notes.len(), 1, "{:?}", outcome.notes);
+        assert!(
+            outcome.notes[0].contains("could not resolve the dependencies")
+                && outcome.notes[0].contains("No solution found"),
+            "{:?}",
+            outcome.notes
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unconfirmed_companion_pin_is_reported_and_follows_a_failed_install() -> Result<()> {
+        // A transient index failure on the confirm call ends in the series pin,
+        // which is the pair that can be unsatisfiable. Both the success path
+        // and the failure path must carry the reason.
+        let (outcome, _) = run_discover_with_fake_uv(true, false, true)?;
+        let outcome = outcome?;
+        assert_eq!(outcome.notes.len(), 2, "{:?}", outcome.notes);
+        assert!(
+            outcome
+                .notes
+                .iter()
+                .all(|note| note.contains("connection reset")),
+            "{:?}",
+            outcome.notes
+        );
+
+        let (outcome, _) = run_discover_with_fake_uv(true, false, false)?;
+        let err = outcome.expect_err("the real install was made to fail");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("unsatisfiable") && rendered.contains("connection reset"),
+            "the failure must name both the install error and the dropped pin: {rendered}"
+        );
+        // Plain display is what a user sees: the uv failure comes first and the
+        // note about the fallback follows it.
+        let plain = err.to_string();
+        let cause_at = plain.find("unsatisfiable").expect("the cause is shown");
+        let note_at = plain.find("connection reset").expect("the note is shown");
+        assert!(cause_at < note_at, "the cause must lead: {plain}");
+
+        // With nothing dropped, the install error is left as it was.
+        let (outcome, _) = run_discover_with_fake_uv(true, true, false)?;
+        let rendered = format!(
+            "{:#}",
+            outcome.expect_err("the real install was made to fail")
+        );
+        assert!(!rendered.contains("did not confirm"), "{rendered}");
+        Ok(())
+    }
+
     #[test]
     fn write_vllm_index_uv_config_writes_an_ignore_error_codes_entry() -> Result<()> {
         let root = tempfile::tempdir()?;
@@ -2117,7 +2631,7 @@ exit 0
         )?;
 
         let build = vllm_rocm_discover_build("10.1.0").expect("10.1.0 has a discover row");
-        let pins = install_vllm_rocm10_discover(&uv, &paths, &python, true, build)?;
+        let pins = install_vllm_rocm10_discover(&uv, &paths, &python, true, build)?.pins;
         assert_eq!(pins.len(), 6);
 
         let calls: Vec<Vec<String>> = std::fs::read_to_string(&log)?
@@ -2136,6 +2650,11 @@ exit 0
                 "torchvision==0.28.*",
                 "torchaudio==2.11.0.2",
                 "vllm==0.29.*",
+                // The resolve probe for the vLLM just discovered, which is
+                // where flash-attn and amd-aiter get their pins when the vLLM
+                // index serves that exact version. The fake uv answers it with
+                // no dependencies, so the series pins below still apply.
+                "vllm==9.9.9",
                 "flash-attn==2.8.*",
                 "amd-aiter==0.1.*",
             ],
@@ -2235,7 +2754,7 @@ exit 0
         )?;
 
         let build = vllm_rocm_discover_build("10.1.0").expect("10.1.0 has a discover row");
-        let pins = install_vllm_rocm10_discover(&uv, &paths, &python, true, build)?;
+        let pins = install_vllm_rocm10_discover(&uv, &paths, &python, true, build)?.pins;
         assert!(
             pins.contains(&"amd_torch_device_gfx1151==9.9.9".to_owned()),
             "the stale torch device package must be realigned to torch's own resolved release: {pins:?}"

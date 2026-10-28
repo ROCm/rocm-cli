@@ -61,6 +61,18 @@ const REPORT_REFUSED: &str = "No report was prepared for this machine.";
 /// different number fails closed: the preview is called unreadable and no send is
 /// offered, until this constant is raised with the CLI's.
 const KNOWN_REPORT_SCHEMA: u64 = 1;
+/// What the send approval tells the user about the mail before they approve.
+///
+/// The same words the CLI prints under the report, before the mail link, as
+/// `rocm_core::report_delivery::SENDER_NOTICE`. This crate must not depend on
+/// `rocm-core`, so the text is restated here, and a test in `apps/rocm`, which
+/// depends on both, asserts the two are identical. Said in the dialog as well
+/// because the CLI's line only appears once the send has run, after the approve
+/// it should inform.
+pub const REPORT_SENDER_NOTICE: &str = "If you send the mail, it goes from your own mail account \
+                                        and carries your address. The report itself names no \
+                                        user, host, or file path.";
+
 /// Rows a PgUp or PgDn moves the approval body.
 const APPROVAL_PAGE: u16 = 5;
 
@@ -245,10 +257,14 @@ fn stage_send(d: &mut ExamineManagerState) {
     let ReportStage::Prepared(lines) = &d.report else {
         return;
     };
+    // The notice sits in the opening lines, above the report. The body scrolls
+    // and Approve does not, so anything below the report can be approved past
+    // without ever being on screen.
     let mut body = vec![
         "This is what a report would carry now. The send examines this machine again, \
          so the mail can differ if the machine changed."
             .to_owned(),
+        REPORT_SENDER_NOTICE.to_owned(),
         String::new(),
     ];
     body.extend(lines.iter().cloned());
@@ -458,11 +474,8 @@ pub fn draw_examine_manager(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-
-    fn key(c: KeyCode) -> KeyEvent {
-        KeyEvent::new(c, KeyModifiers::NONE)
-    }
+    use crate::app::test_support::press as key;
+    use crossterm::event::KeyCode;
 
     #[test]
     fn enter_runs_examine_read_only_no_approval() {
@@ -655,6 +668,21 @@ mod tests {
         let body = pending.request.body.join("\n");
         assert!(body.contains("\"architecture\": \"gfx942\""), "{body}");
         assert!(body.contains("Nothing is sent until"), "{body}");
+        // Said before the approve, which is the decision it informs. Its truth
+        // is proven against the CLI's output by `diagnose-32`
+        // (`@id:diagnose-send-on-a-headless-machine-prints-instead-of-opening`).
+        assert!(body.contains(REPORT_SENDER_NOTICE), "{body}");
+        // Above the report, so it is on screen with Approve before any scroll.
+        let notice_row = pending
+            .request
+            .body
+            .iter()
+            .position(|l| l == REPORT_SENDER_NOTICE);
+        let report_row = pending.request.body.iter().position(|l| l.starts_with('{'));
+        assert!(
+            notice_row < report_row,
+            "the notice must come before the report it would otherwise scroll below: {body}"
+        );
         // The send runs the examine again, so the body must not call the preview final.
         assert!(body.contains("examines this machine again"), "{body}");
         assert_eq!(

@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: MIT
 
 use anyhow::{Context, Result, bail};
-use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -14,10 +13,12 @@ mod archive_props;
 pub mod automation;
 pub mod binary_paths;
 pub mod browser;
+pub mod codex_bridge;
 pub mod config;
 pub mod crypto;
 pub mod diagnose;
 pub mod disk_space;
+pub mod endpoint_key;
 pub mod examine;
 pub mod fake_executable;
 pub mod fix;
@@ -31,12 +32,16 @@ pub mod net;
 pub mod openmpi;
 pub mod os_release;
 pub mod paths;
+pub mod placeholder;
 pub mod proc_lifecycle;
 pub mod process;
+pub mod quoting;
 pub mod report;
 pub mod report_delivery;
+pub mod report_rollup;
 pub mod rocm_install;
 pub mod runtime;
+pub mod service_identity;
 pub mod service_record;
 pub mod terminal;
 pub mod user_path;
@@ -56,6 +61,7 @@ pub use automation::{
     update_automation_proposal_status,
 };
 pub use binary_paths::{daemon_binary_path, engine_binary_path, sibling_binary_path};
+pub use codex_bridge::{CodexBridgeEngine, CodexBridgeGpuSnapshot, CodexBridgeSnapshot};
 pub use config::{
     AutomationsConfig, DashboardConfig, DashboardDaemonConfig, DashboardTuiConfig,
     EngineUserConfig, ManagedToolConfig, PERMISSIONS_MODE_ASK, PERMISSIONS_MODE_FULL_ACCESS,
@@ -77,6 +83,7 @@ pub use disk_space::{
     estimated_extracted_size, format_bytes, insufficient_space_message, map_write_error,
     mount_for_path, on_same_mount, warn_if_low_space, with_margin,
 };
+pub use endpoint_key::{endpoint_api_key_has_forbidden_chars, generate_endpoint_api_key};
 pub use examine::{
     Examination, FrameworkProbe, WSL_PLATFORM_NOTE, gfx_is_apu_family, probe_wsl_distro_from_host,
 };
@@ -152,11 +159,13 @@ pub use process::{
     spawn_detached_no_inherit, spawn_hidden_console_no_inherit, spawn_hidden_console_with_log,
     wait_for_process_exit,
 };
+pub use quoting::{posix_shell_quote, powershell_quote};
 pub use report::{
-    APPROVED_ARCHITECTURES, APPROVED_ARCHITECTURES_SOURCE, REPORT_SCHEMA_VERSION, ReadOutcome,
-    Refusal as ReportRefusal, Report, is_rocm_supported, prepare_report, read_report,
+    APPROVED_ARCHITECTURES, APPROVED_ARCHITECTURES_SOURCE, GROUP_AXES, REPORT_SCHEMA_VERSION,
+    ReadOutcome, Refusal as ReportRefusal, Report, is_rocm_supported, prepare_report, read_report,
     refusal_envelope,
 };
+pub use report_rollup::{Group as ReportGroup, Rollup as ReportRollup};
 pub use rocm_install::{LegacyRocmSummary, detect_legacy_rocm_sdk, detect_legacy_rocm_summary};
 use rocm_install::{RocmInstall, discover_rocm_installs, rocm_install_version};
 use runtime::env_path_override;
@@ -178,6 +187,7 @@ pub use runtime::{
     runtime_python_env_bin_dir, runtime_python_executable_in_env, runtime_python_executable_name,
     runtime_rocm_library_filename, shell_command_for_host, user_runtime_dir,
 };
+pub use service_identity::{ServiceId, generate_service_id};
 pub use service_record::ManagedServiceRecord;
 pub use uv::{
     DEFAULT_UV_TIMEOUT_SECS, DependencyViolation, UV_CACHE_DIR_ENV, UV_CACHE_DIR_OVERRIDE_ENV,
@@ -228,83 +238,6 @@ pub fn command_failure_detail(output: &std::process::Output) -> String {
         return stdout;
     }
     "no output".to_owned()
-}
-
-/// Number of random alphanumeric characters in a generated endpoint API key.
-/// 48 chars from a 62-symbol alphabet is ~285 bits of entropy — far beyond what
-/// a bearer token guarding a network endpoint needs, with no padding characters
-/// that would complicate copy/paste into client configs or shell env vars.
-const ENDPOINT_API_KEY_LEN: usize = 48;
-
-/// Generate a fresh, cryptographically-random API key for a public endpoint.
-///
-/// The value is URL-safe alphanumeric (`[A-Za-z0-9]`) so it can be dropped
-/// verbatim into an `Authorization: Bearer` header, a client config file, or an
-/// environment variable without escaping.
-///
-/// Drawn from `rand::rng()`, a CSPRNG seeded from the operating system;
-/// deliberately *not* derived from `generate_service_id` (a timestamp-based,
-/// guessable identifier — unsuitable as a secret).
-pub fn generate_endpoint_api_key() -> String {
-    use rand::Rng;
-    use rand::distr::Alphanumeric;
-
-    rand::rng()
-        .sample_iter(&Alphanumeric)
-        .take(ENDPOINT_API_KEY_LEN)
-        .map(char::from)
-        .collect()
-}
-
-/// Return `true` if `key` contains a character that must never appear in an API
-/// key used verbatim in an `Authorization: Bearer` header.
-///
-/// The CLI and engine adapters build those header lines by raw string
-/// interpolation (`Authorization: Bearer {key}\r\n`), so an embedded CR or LF in
-/// the key would inject additional header lines (HTTP header injection). A
-/// control character has no legitimate place in a bearer token, so we reject the
-/// whole class rather than only CR/LF. Callers apply this at input validation
-/// (rejecting a supplied key) and defensively when reading the key file.
-pub fn endpoint_api_key_has_forbidden_chars(key: &str) -> bool {
-    key.chars().any(char::is_control)
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CodexBridgeSnapshot {
-    pub protocol: String,
-    pub generated_at_unix_ms: u128,
-    pub examine: ExamineSummary,
-    pub gpu: CodexBridgeGpuSnapshot,
-    pub config: RocmCliConfig,
-    #[serde(default)]
-    pub automation_runtime: Option<AutomationRuntimeState>,
-    #[serde(default)]
-    pub recent_automation_events: Vec<AutomationEventRecord>,
-    #[serde(default)]
-    pub engines: Vec<CodexBridgeEngine>,
-    #[serde(default)]
-    pub services: Vec<ManagedServiceRecord>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CodexBridgeGpuSnapshot {
-    pub amd_smi_available: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub static_snapshot: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub monitor_snapshot: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub note: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CodexBridgeEngine {
-    pub id: String,
-    pub summary: String,
-    pub default_for_platform: bool,
-    pub installed_binary: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub binary_path: Option<String>,
 }
 
 pub fn resolve_amd_smi_binary() -> OsString {
@@ -390,82 +323,6 @@ fn resolve_amd_smi_binary_in_home(home_dir: Option<&Path>) -> OsString {
     "amd-smi".into()
 }
 
-/// A validated managed-service identifier that is safe to use as a single
-/// filesystem path component.
-///
-/// Every managed-service path (e.g. the endpoint-key sidecar) is built as
-/// `services_dir().join(format!("{service_id}..."))`. A `ServiceId` can only be
-/// constructed through [`ServiceId::new`], which rejects path separators, `..`
-/// traversal, and control characters — so a value of this type can never make a
-/// join escape its intended directory. Prefer threading a `ServiceId` (or
-/// validating with it) over passing raw `&str` ids into path builders.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ServiceId(String);
-
-impl ServiceId {
-    /// Validate an untrusted string as a service id.
-    ///
-    /// Rejects empty/whitespace-only input, path separators (`/` and `\`), `..`
-    /// traversal sequences, and control characters. Ids produced by
-    /// [`generate_service_id`] are always accepted.
-    ///
-    /// # Errors
-    /// Returns an error describing the first rule the input violates.
-    pub fn new(value: &str) -> Result<Self> {
-        if value.trim().is_empty() {
-            bail!("service id must not be empty");
-        }
-        if value.contains('/') || value.contains('\\') {
-            bail!("service id must not contain path separators");
-        }
-        if value.contains("..") {
-            bail!("service id must not contain `..`");
-        }
-        if value.chars().any(char::is_control) {
-            bail!("service id must not contain control characters");
-        }
-        Ok(Self(value.to_owned()))
-    }
-
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl std::convert::TryFrom<&str> for ServiceId {
-    type Error = anyhow::Error;
-    fn try_from(value: &str) -> Result<Self> {
-        Self::new(value)
-    }
-}
-
-impl std::fmt::Display for ServiceId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl AsRef<str> for ServiceId {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-pub fn generate_service_id(engine: &str, model_ref: &str) -> String {
-    let model_slug = sanitize_component(model_ref)
-        .trim_matches('-')
-        .chars()
-        .take(24)
-        .collect::<String>();
-    format!(
-        "{}-{}-{}",
-        sanitize_component(engine),
-        model_slug,
-        unix_time_millis()
-    )
-}
-
 pub fn sanitize_component(value: &str) -> String {
     value
         .chars()
@@ -530,74 +387,6 @@ mod tests {
 
     use std::fs;
     use std::path::Path;
-
-    #[test]
-    fn service_id_accepts_generated_and_plain_ids() {
-        // A freshly generated id must always validate.
-        let generated = generate_service_id("vllm", "Qwen/Qwen3.5");
-        assert!(ServiceId::new(&generated).is_ok());
-        // Plain alphanumeric-with-dashes ids validate and round-trip verbatim.
-        let id = ServiceId::new("svc-vllm-qwen-1730000000000").expect("valid id");
-        assert_eq!(id.as_str(), "svc-vllm-qwen-1730000000000");
-        assert_eq!(id.to_string(), "svc-vllm-qwen-1730000000000");
-    }
-
-    #[test]
-    fn service_id_rejects_traversal_and_separators() {
-        // Anything that could make `services_dir().join(id)` escape the directory
-        // (or otherwise not resolve to a single child component) is rejected.
-        for bad in [
-            "",
-            "   ",
-            "../../etc/passwd",
-            "..",
-            "a/b",
-            "a\\b",
-            "/abs",
-            "svc\r\ninject",
-            "svc\0nul",
-        ] {
-            assert!(
-                ServiceId::new(bad).is_err(),
-                "expected {bad:?} to be rejected"
-            );
-        }
-    }
-
-    #[test]
-    fn generate_endpoint_api_key_is_random_and_alphanumeric() {
-        let key = generate_endpoint_api_key();
-        assert_eq!(key.len(), ENDPOINT_API_KEY_LEN);
-        assert!(
-            key.chars().all(|c| c.is_ascii_alphanumeric()),
-            "key must be URL-safe alphanumeric, got {key:?}"
-        );
-        // Two draws must differ — a constant key would be catastrophic for auth.
-        assert_ne!(generate_endpoint_api_key(), generate_endpoint_api_key());
-        // A freshly generated key must itself pass the header-safety predicate.
-        assert!(!endpoint_api_key_has_forbidden_chars(
-            &generate_endpoint_api_key()
-        ));
-    }
-
-    #[test]
-    fn endpoint_api_key_has_forbidden_chars_flags_control_chars() {
-        // Control characters (notably CR/LF) enable header injection when the key
-        // is interpolated into a raw `Authorization: Bearer` line.
-        for bad in ["key\r\ninject", "key\nother", "tab\there", "nul\0byte"] {
-            assert!(
-                endpoint_api_key_has_forbidden_chars(bad),
-                "should reject {bad:?}"
-            );
-        }
-        // Ordinary printable keys are accepted.
-        for good in ["my-key", "AbC123._~-", "sk-proj-abcDEF0123456789"] {
-            assert!(
-                !endpoint_api_key_has_forbidden_chars(good),
-                "should accept {good:?}"
-            );
-        }
-    }
 
     #[test]
     fn resolve_amd_smi_binary_prefers_home_rocm_venv_path() -> Result<()> {

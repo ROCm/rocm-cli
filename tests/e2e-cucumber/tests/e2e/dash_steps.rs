@@ -2570,6 +2570,89 @@ async fn dashboard_offers_send_only_if_the_cli_prepared_one(world: &mut E2eWorld
     }
 }
 
+/// Title of the send approval the `s` key opens.
+const SEND_REVIEW_TITLE: &str = "Report this diagnosis";
+
+/// The part of the dashboard's sender notice this suite matches on, mirrored
+/// from `REPORT_SENDER_NOTICE` in `crates/rocm-dash-tui/src/ui/examine_manager.rs`
+/// (this crate runs the built binary and links neither).
+const SENDER_NOTICE_FRAGMENT: &str = "it goes from your own mail account and carries your address";
+
+/// The screen as one line of prose: dialog borders dropped and whitespace
+/// collapsed, so a sentence the dialog wrapped over two rows still matches.
+fn screen_as_prose(screen: &str) -> String {
+    screen
+        .replace(['│', '┃', '║'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[when("the user asks to review the report for sending")]
+async fn ask_to_review_for_sending(world: &mut E2eWorld) {
+    // `s` only opens the review. Nothing is sent before an approve, and this
+    // scenario never approves.
+    session(world)
+        .send("s")
+        .unwrap_or_else(|e| panic!("failed to ask to review the report for sending: {e}"));
+}
+
+#[then("the review says the mail carries the user's own address before showing the report")]
+async fn review_states_the_sender_notice_first(world: &mut E2eWorld) {
+    let refused = world
+        .dash_report_refused
+        .expect("the preview step records whether the CLI refused");
+    let tui = session(world);
+    if refused {
+        // Nothing to send, so no review may open. Give a stray dialog the
+        // time it would take to draw before looking.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let screen = tui.screen_text();
+        assert!(
+            !screen.contains(SEND_REVIEW_TITLE),
+            "a refusal opened a send review:\n{screen}"
+        );
+        return;
+    }
+    tui.wait_for_screen(SEND_REVIEW_TITLE, default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the send review did not open: {e}"));
+    let screen = tui.screen_text();
+    let prose = screen_as_prose(&screen);
+    let notice = prose.find(SENDER_NOTICE_FRAGMENT);
+    let report = prose.find("\"schema\"");
+    assert!(
+        notice.is_some(),
+        "the send review does not say the mail carries the user's address:\n{screen}"
+    );
+    // On the first screen of the review, above the report: the body scrolls
+    // and Approve does not, so a notice below the report could be approved
+    // past without ever being seen. The report's first key, `"schema"`, is on
+    // that first screen too; requiring it keeps the order check from passing
+    // only because the report was missing.
+    assert!(
+        report.is_some(),
+        "the review's first screen does not show the report it asks about:\n{screen}"
+    );
+    assert!(
+        notice < report,
+        "the notice must come before the report in the review:\n{screen}"
+    );
+}
+
+#[when("the user declines the send")]
+async fn decline_the_send(world: &mut E2eWorld) {
+    if world.dash_report_refused == Some(true) {
+        return;
+    }
+    let tui = session(world);
+    tui.send("n")
+        .unwrap_or_else(|e| panic!("failed to decline the send: {e}"));
+    tui.wait_until_gone(SEND_REVIEW_TITLE, default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the send review is still open after declining: {e}"));
+}
+
 #[when("the user closes the Diagnose screen")]
 async fn close_diagnose_screen(world: &mut E2eWorld) {
     // An open overlay eats the quit key, so a scenario that opened one closes it
