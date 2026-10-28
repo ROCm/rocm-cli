@@ -341,3 +341,41 @@ Feature: Model serving
   Scenario: serve-25 - The recommended model list prints ASCII-only text
     When the user lists recommended models
     Then the model list output contains only ASCII characters
+
+  # AIM serve + inference canary (ROCMAI-554). This scenario deliberately still
+  # serves via the raw AIM Docker image reference rather than the catalog
+  # recipe added in ROCMAI-555 — it's a hardware-verified canary pinned to one
+  # exact image/profile, not a catalog-discovery test. `@requires-engine:aim`
+  # skips here when Docker is unreachable OR the gfx family isn't one aim is
+  # verified on (see `HostCapability::engine_available`'s "aim" arm — Radeon
+  # gfx110X/120X and Strix Halo gfx1151, not Instinct); a Strix Halo
+  # self-hosted runner with Docker is where this actually runs.
+  # `@serve-timeout:1200`
+  # widens both the harness's readiness poll and the CLI's own
+  # ROCM_CLI_AIM_READY_TIMEOUT_SECS (see isolate_cmd) — a cold-start HF weight
+  # download for this 9B model legitimately exceeds the engine's default
+  # 5-minute readiness cap.
+  @id:serve-aim-inference @requires-gpu @requires-engine:aim @serve-timeout:1200
+  Scenario: serve-26 - A model served on AIM responds to inference requests
+    Given a managed runtime is active
+    And a model is being served on aim
+    When the user sends a chat completion request
+    Then the response contains a model reply
+    And the response identifies the correct model
+
+  # Lifecycle parity for AIM (ROCMAI-554). AIM's engine integration is new
+  # enough that nothing had yet proven a container-backed service can be
+  # stopped and relaunched like any other managed engine's — this reuses the
+  # same stop path the serve-retry logic and scenario teardown already rely
+  # on (`stop_managed_services`, via the `stop_aim_service` step), and the
+  # same serve+inference fixture `serve-26` uses, rather than adding a new
+  # stop/restart mechanism just for AIM.
+  @id:serve-aim-lifecycle-parity @requires-gpu @requires-engine:aim @serve-timeout:1200
+  Scenario: serve-27 - A stopped AIM service can be restarted and serves inference again
+    Given a managed runtime is active
+    And a model is being served on aim
+    When the user stops the AIM service
+    And the user serves that same model on aim again
+    And the user sends a chat completion request
+    Then the response contains a model reply
+    And the response identifies the correct model

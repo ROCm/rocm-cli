@@ -283,7 +283,7 @@ impl ProviderAdapter for LocalProvider<'_> {
         let builtin_ready = services.iter().any(local_service_is_builtin_assistant);
         let mut models = services
             .into_iter()
-            .map(|record| record.canonical_model_id)
+            .map(|record| record.served_model_name().to_owned())
             .collect::<Vec<_>>();
         models.sort();
         models.dedup();
@@ -303,13 +303,7 @@ impl ProviderAdapter for LocalProvider<'_> {
 
     fn chat(&self, request: &ChatRequest) -> Result<ChatResponse> {
         let service = select_local_chat_service(self.paths, request.model.as_deref())?;
-        let body = openai_local_chat_request_body(
-            request
-                .model
-                .as_deref()
-                .unwrap_or(&service.canonical_model_id),
-            request,
-        );
+        let body = openai_local_chat_request_body(service.served_model_name(), request);
         let endpoint_api_key =
             crate::endpoint_keys::endpoint_api_key(self.paths, &service.service_id);
         let response = post_json_to_local_endpoint(
@@ -334,14 +328,8 @@ impl ProviderAdapter for LocalProvider<'_> {
         on_event: &mut dyn FnMut(ProviderStreamEvent) -> Result<()>,
     ) -> Result<ChatStreamSummary> {
         let service = select_local_chat_service(self.paths, request.model.as_deref())?;
-        let model = service.canonical_model_id.clone();
-        let body = openai_local_stream_chat_request_body(
-            request
-                .model
-                .as_deref()
-                .unwrap_or(&service.canonical_model_id),
-            request,
-        );
+        let model = service.served_model_name().to_owned();
+        let body = openai_local_stream_chat_request_body(service.served_model_name(), request);
         let endpoint_api_key =
             crate::endpoint_keys::endpoint_api_key(self.paths, &service.service_id);
         stream_json_from_local_endpoint(
@@ -476,6 +464,10 @@ fn select_local_chat_service(
         services.retain(|service| {
             service.canonical_model_id.eq_ignore_ascii_case(model)
                 || service.model_ref.eq_ignore_ascii_case(model)
+                || service
+                    .served_model_id
+                    .as_deref()
+                    .is_some_and(|served| served.eq_ignore_ascii_case(model))
         });
         return services
             .into_iter()
@@ -2476,6 +2468,38 @@ mod tests {
             "prepare_freeform_execution must not rebuild the plan -- only the \
              initial build above may call the provider"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn local_provider_selects_a_service_by_its_served_model_id() -> Result<()> {
+        let (root, paths) = temp_app_paths("local-provider-served-id");
+        paths.ensure()?;
+        let server = spawn_models_only_server("Org/Served")?;
+        let mut aim = ManagedServiceRecord::new(
+            &paths,
+            "svc-aim",
+            "aim",
+            "aim-qwen3.5-9b",
+            "docker.io/org/aim-image:1",
+            "127.0.0.1",
+            server.port(),
+            "managed",
+            123,
+            None,
+            None,
+            None,
+        );
+        aim.status = "ready".to_owned();
+        aim.served_model_id = Some("Org/Served".to_owned());
+        aim.write()?;
+        let selected = select_local_chat_service(&paths, Some("org/served"))?;
+        let status = provider_status(&paths, "local")?;
+        fs::remove_dir_all(root).ok();
+        assert_eq!(selected.service_id, "svc-aim");
+        // Chat sends `served_model_name()`, so `status` must list that name too.
+        assert_eq!(status.models, vec!["Org/Served".to_owned()]);
+        assert_eq!(selected.served_model_name(), "Org/Served");
         Ok(())
     }
 

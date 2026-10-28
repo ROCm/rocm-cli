@@ -209,7 +209,7 @@ Current workspace members:
 
 - apps: `apps/rocm`, `apps/rocmd`
 - shared crates: `crates/rocm-core`, `crates/rocm-engine-protocol`
-- engine crates: `engines/lemonade`, `engines/vllm`
+- engine crates: `engines/lemonade`, `engines/vllm`, `engines/aim`
 
 Shared UI components — reuse rather than hand-rolling new ones. The CLI (`apps/rocm`) and the dash-TUI (`crates/rocm-dash-tui`) each have their own set; they are not interchangeable (see the naming-collision warning below).
 

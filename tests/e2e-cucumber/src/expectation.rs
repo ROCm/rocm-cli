@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 
 use serde::Deserialize;
 
-use crate::capability::HostCapability;
+use crate::capability::{HostCapability, docker_available};
 
 /// Tag prefixes in their normalized bare form. cucumber-rs currently supplies
 /// scenario tags with a leading `@`; [`ScenarioDecl::from_tags`] accepts either
@@ -59,24 +59,6 @@ pub enum Expectation {
     },
     /// Not applicable on this host (e.g. required engine can't start); skipped.
     Skip { reason: String },
-}
-
-/// Whether a container runtime is usable here.
-///
-/// Probed rather than assumed: a developer machine may have the client without
-/// a running daemon.
-///
-/// Necessary but not sufficient — see the `requires_docker` gate, which also
-/// wants an explicit opt-in. A daemon answering does not mean the fixture image
-/// can be built: a self-hosted runner behind a restricted network has both a
-/// working daemon and no route to the package mirror the image installs from.
-fn docker_available() -> bool {
-    std::process::Command::new("docker")
-        .arg("info")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
 }
 
 /// Facts extracted from a scenario's tags.

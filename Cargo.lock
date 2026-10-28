@@ -3672,6 +3672,7 @@ dependencies = [
  "rocm-dash-daemon",
  "rocm-dash-tui",
  "rocm-deps",
+ "rocm-engine-aim",
  "rocm-engine-lemonade",
  "rocm-engine-protocol",
  "rocm-engine-vllm",
@@ -3806,6 +3807,20 @@ name = "rocm-deps"
 version = "0.1.0"
 dependencies = [
  "toml",
+]
+
+[[package]]
+name = "rocm-engine-aim"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "rocm-core",
+ "rocm-engine-protocol",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "ureq",
 ]
 
 [[package]]

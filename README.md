@@ -748,7 +748,7 @@ rocm engines install <engine> [--runtime-id KEY] [--python-version X.Y] [--reins
 rocm engines shell <engine>   [--runtime-id KEY | --env-id ID] [--shell PATH]
 ```
 
-Supported engines: `lemonade`, `vllm`.
+Supported engines: `lemonade`, `vllm`, `aim`.
 
 `rocm engines install lemonade` also keeps Lemonade's llama.cpp backend paired
 with the ROCm SDK in use, and rewrites the two pins it owns
@@ -805,7 +805,7 @@ GPU memory, and preferred engines.
 Start a local OpenAI-compatible model server:
 
 ```
-rocm serve <model> [--engine lemonade|vllm]
+rocm serve <model> [--engine lemonade|vllm|aim]
                    [--device gpu_required|gpu_preferred]
                    [--gpu auto|<index>]
                    [--runtime-id KEY | --env-id ID]
@@ -815,7 +815,20 @@ rocm serve <model> [--engine lemonade|vllm]
                    [--allow-public-bind] [--require-api-key] [--api-key KEY]
                    [--temperature TEMP] [--top-p PROB] [--max-tokens N]
                    [--gpu-memory-utilization FRACTION] [--tool-call-parser NAME]
+                   [--engine-env KEY=VALUE]...
 ```
+
+`--engine aim` runs the model in a Docker container instead of a host
+process; it requires a reachable Docker daemon and is Linux/WSL2 only.
+`--engine-env` passes an extra environment variable through to the engine's
+own process/container (repeatable); currently only `aim` consumes these (e.g.
+`AIM_PROFILE_ID`). `KEY=VALUE` values are visible in the detached child's
+argv and in `rocm services list --json`, so do not put secrets there; pass a
+bare `KEY` (e.g. `--engine-env HF_TOKEN`) to forward the value from your
+current environment without storing it. A service restarted by the daemon
+after a crash inherits the daemon's environment, not yours, so a forwarded
+secret must also be set there. `ROCM_CLI_AIM_READY_TIMEOUT_SECS` raises the
+5-minute readiness wait for a cold-start model download.
 
 `--gpu-memory-utilization` (a fraction above 0.0 and up to 1.0 of each GPU's
 total VRAM) and `--tool-call-parser` (for example `hermes`, `llama3_json`, or
