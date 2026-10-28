@@ -2283,6 +2283,7 @@ maintainer tooling, not part of `rocm`, and it sends and files nothing:
 cargo xtask report-rollup <export-dir>
 cargo xtask report-rollup <export-dir> --json
 cargo xtask report-rollup <export-dir> --verbose
+cargo xtask report-rollup <export-dir> --weeks 12 --rise-factor 2 --min-reports 3
 ```
 
 The report address is a group, so every member receives each report, and any
@@ -2309,6 +2310,57 @@ problem" is `Report::group_key` in
 [report.rs](../crates/rocm-core/src/report.rs), and the counting is in
 [report_rollup.rs](../crates/rocm-core/src/report_rollup.rs).
 
+After the tree comes the weekly trend: the reports per week for each catalog
+entry, over the newest `--weeks` weeks (8 by default), each week named by the
+Monday it starts on. The header names the first and last of those Mondays in
+full, so the year of a column is never in doubt. A problem with nothing in the
+weeks shown has no row, though it is still in the tree. A count says how many
+reports describe a problem, and the trend says whether that number is steady or
+new, which call for different responses. A report goes in the week its mail was
+sent. A report whose mail has no usable `Date` (missing, unreadable, before
+2026-10-05, the day the code that writes reports first landed, or more than a
+day in the future) is counted and is in no week, and the output says how many.
+A raw `.json` body has no mail around it, so it is always undated.
+
+The `Date` is what the sender's mail client claims, and the table's span and
+every baseline are taken from those dates. A date inside the plausible range is
+taken as given, so one sender can choose a week inside it: a single report dated
+months early widens the table and can bring a baseline into reach that the real
+reports do not support. That is acceptable while the trend is read by a person.
+It is the reason a rise is not acted on automatically yet. `Received` would be
+more trustworthy, and it identifies the sender, which is why it is not read. A
+forwarded report carries the forwarder's `Date`, not the original's.
+
+A rise is a week in which a known problem's count is at least `--rise-factor`
+times (3 by default) the average of the `--baseline-weeks` (4) weeks before it,
+with at least `--min-reports` (5) reports. Each rise names the entry, the week,
+the count against the average, and the ROCm releases that week's reports came
+from, which is how a rise is tied to a release. It is a line of output and
+nothing more: nothing is sent to anyone or filed. The defaults are the
+proposal's own example, "triple in the week after a ROCm release", and they are
+flags because there is no data yet to set them from. A rise is judged over every
+week of the export, so a printed rise can name a week older than the table
+shows. `--rise-factor` must be at least 2, and `--baseline-weeks` and `--weeks` at least 1; the
+defaults are read from the library, so the command and the code cannot disagree
+about them. When a rise you expected is missing, these are the rules that can
+hide it:
+
+- `unrecognised` is in the table and is never flagged. It mixes every cause the
+  catalog does not know, so a rise in it does not describe one problem.
+- A problem with no reports in its baseline is new, not risen.
+- The whole baseline must lie inside the weeks the export covers, and the
+  export's first week is never part of one. An export that begins mid-week holds
+  only the end of that week, which would understate a baseline and make the next
+  week look like a rise. So the weeks at the start of an export are never rises,
+  and the bound is global: one early report of any problem makes baselines
+  available to every problem.
+- An export covering fewer than `--baseline-weeks` plus two weeks cannot be
+  judged at all. The output then says "not evaluated" and how many weeks it
+  needs, instead of "none found", and `--json` carries `rises_evaluated: false`.
+- A quiet week inside the baseline counts as zero.
+- The first and the latest week of the export may be partial. The latest is
+  partial when the export was taken mid-week, so a rise in it is a lower bound.
+
 Every input lands in exactly one bucket, and each bucket is printed:
 
 - A report read and grouped. Those with no recognised cause are counted apart,
@@ -2334,9 +2386,13 @@ Every count is of reports, not of people. A report carries no machine
 identifier, so one person who sends the same report five times counts as five.
 
 The mail around a report identifies its sender, and the report does not. The
-reader keeps only the subject, the content headers and a digest of the
-`Message-ID`, and it reads only the JSON value in the body, so nothing from a
-report's mail headers or signature reaches any output.
+reader keeps only the subject, the content headers, a digest of the
+`Message-ID` and the week of the `Date`, and it reads only the JSON value in the
+body, so nothing from a report's mail headers or signature reaches any output,
+except the week derived from the `Date`. That week is what the trend shows. The
+`Date` is converted to UTC and reduced to its week while it is read. The time of
+day, the zone and the day never leave that step, so the trend cannot place a
+sender in time more finely than a week.
 
 The other inputs are the maintainer's own, and the outputs differ in how much of
 them they carry. `--json` carries counts and the group values, and a group value
