@@ -41,6 +41,7 @@ pub mod quoting;
 pub mod report;
 pub mod report_delivery;
 pub mod report_rollup;
+pub mod report_trend;
 pub mod rocm_install;
 pub mod runtime;
 pub mod service_identity;
@@ -167,6 +168,9 @@ pub use report::{
     refusal_envelope,
 };
 pub use report_rollup::{Group as ReportGroup, Rollup as ReportRollup};
+pub use report_trend::{
+    RiseRule as ReportRiseRule, TrendView as ReportTrendView, Week as ReportWeek,
+};
 pub use rocm_install::{LegacyRocmSummary, detect_legacy_rocm_sdk, detect_legacy_rocm_summary};
 use rocm_install::{RocmInstall, discover_rocm_installs, rocm_install_version};
 use runtime::env_path_override;
