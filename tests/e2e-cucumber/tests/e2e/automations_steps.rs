@@ -63,17 +63,51 @@ pub(crate) fn suppress_daemon_spawn(world: &E2eWorld) {
 /// and defer instead of spawning a duplicate daemon. Written in the same
 /// `"<pid> <ms>"` shape the CLI's `write_autostart_claim` uses.
 fn plant_inflight_autostart_claim(world: &E2eWorld) {
+    let path = autostart_claim_path(world);
+    std::fs::create_dir_all(path.parent().expect("claim path has a parent"))
+        .expect("failed to create automations dir");
+    write_harness_autostart_claim(&path);
+}
+
+/// Where the CLI reads its autostart claim inside the scenario's isolated root.
+fn autostart_claim_path(world: &E2eWorld) -> std::path::PathBuf {
     let root = world.isolated_root.as_ref().expect("no isolated root");
-    let dir = root.path().join("data").join("automations");
-    std::fs::create_dir_all(&dir).expect("failed to create automations dir");
+    root.path()
+        .join("data")
+        .join("automations")
+        .join("autostart.claim")
+}
+
+/// Write a claim for this harness process, stamped now.
+fn write_harness_autostart_claim(path: &std::path::Path) {
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_millis());
-    std::fs::write(
-        dir.join("autostart.claim"),
-        format!("{} {now_ms}", std::process::id()),
-    )
-    .expect("failed to write autostart claim");
+    std::fs::write(path, format!("{} {now_ms}", std::process::id()))
+        .expect("failed to write autostart claim");
+}
+
+/// Re-stamp a claim `plant_inflight_autostart_claim` planted, right before the
+/// CLI runs. The CLI honours a claim for only 30 seconds
+/// (`AUTOSTART_CLAIM_TTL_MS` in `apps/rocm/src/service_launch.rs`). The mock
+/// lane runs up to 64 scenarios at once, and every step blocks a runtime
+/// worker while its `rocm` child runs, so this scenario's When can start more
+/// than 30 seconds after its Given. The CLI then rightly reads the claim as
+/// stale and spawns, and the scenario fails without any defect in the CLI.
+/// Only a claim holding this process's pid is touched: that is the one the
+/// Given wrote, never one the CLI wrote for a daemon it spawned.
+fn refresh_harness_autostart_claim(world: &E2eWorld) {
+    let path = autostart_claim_path(world);
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let ours = text
+        .split_whitespace()
+        .next()
+        .is_some_and(|pid| pid == std::process::id().to_string());
+    if ours {
+        write_harness_autostart_claim(&path);
+    }
 }
 
 #[given("a daemon spawn is already in flight")]
@@ -155,6 +189,7 @@ async fn enabled_watcher(world: &mut E2eWorld) {
 
 #[when("the user enables an automation watcher in observe mode")]
 async fn enable_observe(world: &mut E2eWorld) {
+    refresh_harness_autostart_claim(world);
     let (stdout, stderr, rc) = crate::run_rocm(
         world,
         &["automations", "enable", WATCHER, "--mode", "observe"],
