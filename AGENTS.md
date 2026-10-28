@@ -37,7 +37,10 @@ This workflow adds OSS safety and verification guardrails on top of normal dev f
   - opening/closing/merging PRs
   - public comments/review replies
   - changes to shared or public state
-- Before proposing or executing a force-push, check the PR's live review/approval state (`gh pr view {pr} --repo OWNER/REPO --json reviews,reviewDecision`), not just the user's go-ahead for the push itself — check both fields, since `reviewDecision` alone can read `REVIEW_REQUIRED` even while a reviewer already holds a standing `APPROVED` or `CHANGES_REQUESTED` review. If either field shows a current reviewer opinion, flag it when asking the user for that force-push approval. Whether the push itself dismisses an existing review depends on this repo's branch-protection or ruleset settings, not on which commit the review targeted — don't try to compute that yourself, and flag it anyway when unsure.
+- Before proposing or executing a force-push, check the PR's live review/approval state — not just the user's go-ahead for the push itself:
+  - query `gh pr view {pr} --repo OWNER/REPO --json reviews,reviewDecision` and check both fields, since `reviewDecision` alone can read `REVIEW_REQUIRED` even while a reviewer already holds a standing `APPROVED` or `CHANGES_REQUESTED` review
+  - if either field shows a current reviewer opinion, flag it when asking the user for that force-push approval
+  - whether the push itself dismisses an existing review depends on this repo's branch-protection or ruleset settings, not on which commit the review targeted — don't try to compute that yourself, and flag it anyway when unsure
 
 ## 2) Company Identity Required, Internal Content Forbidden
 
@@ -396,6 +399,8 @@ Run this checklist before any upstream push, PR update, issue update, or public 
 9. Scope remains one logical change at correct layer — *§11*
 10. CI watched to completion and driven to green — *§12*
 11. User approval obtained for any high-blast-radius external action — *§1*
+12. Force-push's live review/approval state checked before proposing or executing one — *§1*
+13. Review comments checked for unreplied threads before resuming review-feedback work — *§11*
 
 ## 14) Related Internal Workflows
 
