@@ -428,7 +428,6 @@ const KEYWORDS_DPKG_BROKEN: KeywordTable = &[
         25,
         "apt mentions dpkg failure",
     ),
-    ("--accept-eula", 40, "user mentions --accept-eula"),
 ];
 
 const KEYWORDS_PAGE_FAULT: KeywordTable = &[
@@ -839,18 +838,31 @@ fn check_3_rocm_kernel_unsupported(e: &Examination, symptom: &str) -> Diagnosis 
     if score <= 0 {
         return zero("fix-3-rocm-kernel", "ROCm/distro/kernel triple unsupported");
     }
+    let mut commands = vec![
+        format!("# Current: kernel={kernel} distro={distro} {distro_v} rocm={rocm_version}"),
+        "# Compare to the live AMD matrix:".to_owned(),
+        "#   https://rocm.docs.amd.com/projects/install-on-linux/en/latest/reference/system-requirements.html".to_owned(),
+    ];
+    if ubuntu_driver_is_native_archive(e) {
+        commands.push("# Note on Ubuntu 26.04: the amdgpu driver ships in-tree there, so `rocm install driver --dkms` plans nothing; run `apt install rocm` (with sudo if not root) instead.".to_owned());
+    } else if dkms_driver_plan_is_supported(e) {
+        commands.push("# If your kernel is above the supported range, install the HWE".to_owned());
+        commands.push(
+            "# kernel that matches ROCm, then rerun `rocm install driver --dkms --yes`.".to_owned(),
+        );
+    } else {
+        commands.push(format!(
+            "# `rocm install driver --dkms` plans nothing on {distro} {distro_v}: it isn't one of the AMD-documented distros/versions above, so rerunning it won't fix this."
+        ));
+    }
     let fix = Fix {
         summary: "Cross-check your kernel/distro against the live AMD compatibility matrix before reinstalling.".to_owned(),
-        commands: vec![
-            format!("# Current: kernel={kernel} distro={distro} {distro_v} rocm={rocm_version}"),
-            "# Compare to the live AMD matrix:".to_owned(),
-            "#   https://rocm.docs.amd.com/projects/install-on-linux/en/latest/reference/system-requirements.html".to_owned(),
-            "# If your kernel is above the supported range, install the HWE".to_owned(),
-            "# kernel that matches ROCm, or rerun amdgpu-install with --no-dkms.".to_owned(),
-        ],
+        commands,
         fix_id: "fix-3-rocm-kernel".to_owned(),
         needs_reboot: true,
-        verify: "lsmod | grep amdgpu && rocminfo | head -n 20".to_owned(),
+        // Check rocminfo's own exit code: piping through `head` would report
+        // the pipeline's last stage and mask a missing/failing `rocminfo`.
+        verify: "lsmod | grep amdgpu && rocminfo >/dev/null 2>&1".to_owned(),
         ..Fix::default()
     };
     finalize(
@@ -1049,7 +1061,7 @@ fn check_6_path_missing(e: &Examination, symptom: &str) -> Diagnosis {
         // entry into the user's own PATH. The escape is the same one the real
         // write uses, so an apostrophe in `bin_dir` cannot end the PowerShell
         // string literal early in the printed copy either.
-        let escaped_bin_dir = crate::fix::ps_single_quote_escape(&bin_dir);
+        let escaped_bin_dir = crate::quoting::ps_single_quote_escape(&bin_dir);
         Fix {
             summary: format!("Add {bin_dir} to your User PATH and reopen the shell."),
             commands: vec![
@@ -1088,6 +1100,25 @@ fn check_6_path_missing(e: &Examination, symptom: &str) -> Diagnosis {
     )
 }
 
+/// The package manager's own "re-resolve the repo metadata" command for
+/// `family`, without a `sudo` prefix. Shared by `check_7_stale_repos` and
+/// `check_12_repo_native_broken` so a future per-family tweak (e.g. adding
+/// `--non-interactive` to one of these) only has one copy to update instead
+/// of drifting across the two checks.
+fn refresh_command_for_family(family: &str) -> Option<&'static str> {
+    match family {
+        "apt" => Some("apt update"),
+        // `dnf clean all` only deletes the local cache and always exits 0; it
+        // can't fail even when a repo file is malformed or unreachable, which
+        // is exactly what `verify` needs to catch. `dnf makecache` re-fetches
+        // and parses the metadata, so it fails loudly in that case, matching
+        // `apt update` and `zypper refresh` below.
+        "dnf" => Some("dnf makecache"),
+        "zypper" => Some("zypper refresh"),
+        _ => None,
+    }
+}
+
 fn check_7_stale_repos(e: &Examination, symptom: &str) -> Diagnosis {
     let mut score = 0;
     let mut evidence = Vec::new();
@@ -1106,30 +1137,81 @@ fn check_7_stale_repos(e: &Examination, symptom: &str) -> Diagnosis {
     if score <= 0 {
         return zero("fix-7-stale-repos", "Stale ROCm repos");
     }
-    let mut commands =
-        vec!["ls /etc/apt/sources.list.d/ | grep -iE 'rocm|amdgpu|radeon' || true".to_owned()];
+    let family = repo_pkg_family(e);
+    let mut commands = Vec::new();
+    match family {
+        "apt" => commands
+            .push("ls /etc/apt/sources.list.d/ | grep -iE 'rocm|amdgpu|radeon' || true".to_owned()),
+        "dnf" => {
+            commands
+                .push("ls /etc/yum.repos.d/ | grep -iE 'rocm|amdgpu|radeon' || true".to_owned());
+        }
+        "zypper" => commands
+            .push("ls /etc/zypp/repos.d/ | grep -iE 'rocm|amdgpu|radeon' || true".to_owned()),
+        _ => {}
+    }
     for r in repos {
         commands.push(format!(
             "# sudo mv {r} {r}.bak     # quarantine, do not delete yet"
         ));
     }
-    commands.push("sudo apt update".to_owned());
-    commands.push("# If apt now resolves, reinstall via the correct method only:".to_owned());
+    if let Some(cmd) = refresh_command_for_family(family) {
+        commands.push(format!("sudo {cmd}"));
+    }
     commands.push(
-        "#   amdgpu-install --usecase=rocm,hip --no-dkms   # if you want amdgpu-install".to_owned(),
+        "# If the package manager now resolves, reinstall the driver only (review the plan, then approve):"
+            .to_owned(),
     );
-    commands.push("#   or use the distro packages exclusively".to_owned());
+    if ubuntu_driver_is_native_archive(e) {
+        commands.push("#   sudo apt install rocm   # Ubuntu 26.04 ships the amdgpu driver in-tree, so there is no DKMS driver to reinstall".to_owned());
+    } else if dkms_driver_plan_is_supported(e) {
+        commands.push("#   rocm install driver --dkms   # review the plan".to_owned());
+        commands
+            .push("#   rocm install driver --dkms --yes   # reinstalls the driver only".to_owned());
+    } else {
+        commands.push(format!(
+            "#   `rocm install driver --dkms` plans nothing on {} {}: it isn't one of the AMD-documented distros/versions; see https://rocm.docs.amd.com/projects/install-on-linux/en/latest/reference/system-requirements.html",
+            e.distro_id, e.distro_version
+        ));
+    }
+    let verify = match refresh_command_for_family(family) {
+        // `set -o pipefail` so the exit status reflects `{cmd}` itself, not
+        // `tail` (which exits 0 regardless) -- otherwise a copy-pasted
+        // failure of this command silently reads as success.
+        Some(cmd) => format!("bash -c 'set -o pipefail; sudo {cmd} 2>&1 | tail -n 20'"),
+        // No package manager to refresh on this host, so the only real
+        // post-condition the suggested (commented-out) `mv ... .bak`
+        // commands above leave behind is that the flagged repo files are
+        // gone from their original paths -- unlike
+        // `rocm examine --json | grep -q '"rocm_install_method"'`, which is
+        // present in every `examine --json` output regardless of host state
+        // and so can never fail. When no repo files were actually flagged
+        // (the symptom text alone triggered this fix), there is nothing to
+        // assert about a `mv` command that never ran, so fall back to a
+        // real, still-falsifiable check: no ROCm/AMDGPU repo file exists
+        // under any of the three families' repo directories.
+        None if repos.is_empty() => {
+            "! ls /etc/apt/sources.list.d/ /etc/yum.repos.d/ /etc/zypp/repos.d/ 2>/dev/null \
+             | grep -iE 'rocm|amdgpu|radeon'"
+                .to_owned()
+        }
+        None => repos
+            .iter()
+            .map(|r| format!("! test -e '{r}'"))
+            .collect::<Vec<_>>()
+            .join(" && "),
+    };
     let fix = Fix {
-        summary: "Quarantine duplicate ROCm/AMDGPU repo files and resolve apt before re-running any installer.".to_owned(),
+        summary: "Quarantine duplicate ROCm/AMDGPU repo files and resolve the package manager before re-running any installer.".to_owned(),
         commands,
         needs_sudo: true,
         fix_id: "fix-7-stale-repos".to_owned(),
-        verify: "sudo apt update 2>&1 | tail -n 20".to_owned(),
+        verify,
         ..Fix::default()
     };
     finalize(
         "fix-7-stale-repos",
-        "Stale or conflicting APT/DNF repos from prior installer runs",
+        "Stale or conflicting APT/DNF/zypper repos from prior installer runs",
         score,
         evidence,
         fix,
@@ -1420,43 +1502,255 @@ fn check_11_iommu_hang(e: &Examination, symptom: &str) -> Diagnosis {
     )
 }
 
-fn check_12_amdgpu_install_broken(e: &Examination, symptom: &str) -> Diagnosis {
+/// Best-effort package-manager family for this host: prefer the family
+/// implied by the repo dir the marker files live under, since that's the
+/// config these commands act on, and fall back to the same `ID_LIKE`-aware
+/// resolver `openmpi` uses only when no repo file was found -- restricted to
+/// apt/dnf/zypper, the only families this check has remediation for: a
+/// pacman host (which `openmpi`'s resolver can return, for its own,
+/// unrelated library installers) falls back to `"unknown"`, rather than the
+/// remediation commands mismatching a real "pacman" answer.
+fn repo_pkg_family(e: &Examination) -> &'static str {
+    if e.rocm_repos_seen.iter().any(|r| r.contains("/etc/apt/")) {
+        return "apt";
+    }
+    if e.rocm_repos_seen
+        .iter()
+        .any(|r| r.contains("/etc/yum.repos.d/"))
+    {
+        return "dnf";
+    }
+    if e.rocm_repos_seen.iter().any(|r| r.contains("/etc/zypp/")) {
+        return "zypper";
+    }
+    // The two `match family` sites below only implement apt/dnf/zypper
+    // remediation (this check has no pacman-based repo-native ROCm install to
+    // recover, unlike `openmpi`'s library installers); their `_` arms already
+    // treat any unhandled string, including a literal `"pacman"`, as "no
+    // package-manager-specific command" -- so collapsing pacman to
+    // `"unknown"` here doesn't change that match's behavior. It's kept so the
+    // family string this function returns always matches what its callers
+    // actually handle, rather than leaking a fourth value they merely happen
+    // to no-op on today.
+    crate::openmpi::resolve_package_manager(
+        &e.distro_id.to_ascii_lowercase(),
+        &e.distro_id_like.to_ascii_lowercase(),
+    )
+    .filter(|pm| {
+        matches!(
+            pm,
+            crate::openmpi::PackageManager::Apt
+                | crate::openmpi::PackageManager::Dnf
+                | crate::openmpi::PackageManager::Zypper
+        )
+    })
+    .map_or("unknown", crate::openmpi::PackageManager::as_str)
+}
+
+/// Whether `rocm_install_method` indicates a package-manager-driven install,
+/// covering both the marker-file-based `"repo-native"` value and the
+/// dpkg/rpm-query fallback's `"apt"`/`"dnf"` (see `probe_rocm_install` in
+/// `examine.rs`): a host without one of `REPO_NATIVE_INSTALL_MARKERS` present
+/// but whose package manager confirms `rocm-hip-runtime` is installed is
+/// still repo-native-managed, just detected a different way.
+///
+/// `"amdgpu-install"` is kept as a legacy alias of `"repo-native"`: an older
+/// `rocm remote doctor` client can still send the retired value for a while
+/// after this rename, and dropping it here would silently lose fix-12
+/// evidence for that machine rather than just serving a stale label.
+fn is_repo_native_installed(method: &str) -> bool {
+    matches!(method, "repo-native" | "amdgpu-install" | "apt" | "dnf")
+}
+
+/// Whether `rocm install driver --dkms` has nothing to reinstall on this
+/// host. Ubuntu 26.04 ships the amdgpu kernel driver in-tree and
+/// `build_driver_install_plan_at` in `apps/rocm/src/driver_install.rs` plans no
+/// DKMS repo install there (see the `("ubuntu", "26.04")` arm); `rocm-core`
+/// can't call that plan builder directly (`apps/rocm` depends on
+/// `rocm-core`, not the reverse), so this mirrors just that one condition.
+/// WSL hosts never reach `check_3`/`check_7`/`check_12` at all -- see
+/// `CHECKERS`'s `&["linux"]` tag on each.
+fn ubuntu_driver_is_native_archive(e: &Examination) -> bool {
+    e.distro_id.eq_ignore_ascii_case("ubuntu") && e.distro_version == "26.04"
+}
+
+/// Whether `rocm install driver --dkms` plans any commands for this host.
+///
+/// Mirrors the full `(os_id, version_id)` / `ID_LIKE`-derivative
+/// matrix in `apps/rocm/src/driver_install.rs::build_driver_install_plan_at`
+/// (`rocm-core` can't call that plan builder directly -- see
+/// `ubuntu_driver_is_native_archive` above for why). Ubuntu 26.04 is
+/// deliberately excluded here even though its plan is also "no DKMS repo
+/// commands": that host has its own guidance (native archive, `apt install
+/// rocm`), handled separately via `ubuntu_driver_is_native_archive`, not the
+/// "no plan was guessed for this distro at all" case this function reports.
+pub fn dkms_driver_plan_is_supported(e: &Examination) -> bool {
+    let os_id = e.distro_id.to_ascii_lowercase();
+    let version_id = e.distro_version.as_str();
+    match (os_id.as_str(), version_id) {
+        ("ubuntu", "22.04" | "24.04") => true,
+        ("debian", "12" | "13") => true,
+        ("rhel", "10.1" | "10.0" | "9.7" | "9.6" | "9.4" | "8.10") => true,
+        ("ol", "10.1" | "9.7" | "8.10") => true,
+        ("rocky", "9.4" | "9.6" | "9.7") => true,
+        ("sles" | "sle", "15.7") => true,
+        _ => {
+            let likes: Vec<String> = e
+                .distro_id_like
+                .split_whitespace()
+                .map(str::to_ascii_lowercase)
+                .collect();
+            let mentions = |family: &str| likes.iter().any(|like| like == family);
+            (mentions("ubuntu") && matches!(version_id, "22.04" | "24.04"))
+                || (mentions("debian") && matches!(version_id, "12" | "13"))
+                || (mentions("rhel")
+                    && !matches!(os_id.as_str(), "ol" | "oracle")
+                    && matches!(version_id, "10.1" | "10.0" | "9.7" | "9.6" | "9.4" | "8.10"))
+        }
+    }
+}
+
+fn check_12_repo_native_broken(e: &Examination, symptom: &str) -> Diagnosis {
     let mut score = 0;
     let mut evidence = Vec::new();
     let method = &e.rocm_install_method;
-    if method == "amdgpu-install" {
-        evidence.push("ROCm was installed via amdgpu-install".to_owned());
+    if is_repo_native_installed(method) {
+        evidence.push("ROCm was installed via the repo-native package-manager flow".to_owned());
     }
     let (kw_score, kw_ev) = keyword_score(symptom, KEYWORDS_DPKG_BROKEN);
     score += kw_score;
     evidence.extend(kw_ev);
-    if method == "amdgpu-install" && kw_score > 0 {
+    if is_repo_native_installed(method) && kw_score > 0 {
         score += 20;
     }
 
     if score <= 0 {
-        return zero("fix-12-installer", "amdgpu-install broken state");
+        return zero("fix-12-installer", "repo-native install broken state");
     }
+    let family = repo_pkg_family(e);
+    // Purging `amdgpu-dkms` is only the first half of purge-then-reinstall:
+    // where rocm-cli plans no reinstall (undocumented distro) it would strip
+    // the driver with nothing to put back, so that step is withheld there.
+    let reinstall_planned = ubuntu_driver_is_native_archive(e) || dkms_driver_plan_is_supported(e);
+    let mut commands = vec!["# Clear the half-configured package/DKMS state first.".to_owned()];
+    match family {
+        "apt" => {
+            commands.push("sudo dpkg --configure -a".to_owned());
+            commands.push("sudo apt-get install -f".to_owned());
+            if reinstall_planned {
+                commands.push("sudo apt-get purge -y amdgpu-dkms".to_owned());
+            }
+        }
+        "dnf" if reinstall_planned => commands.push("sudo dnf remove -y amdgpu-dkms".to_owned()),
+        "zypper" if reinstall_planned => {
+            commands.push("sudo zypper remove -y amdgpu-dkms".to_owned());
+        }
+        _ => {}
+    }
+    commands.push(
+        "# Quarantine (do not delete) the repo files, then let the package manager".to_owned(),
+    );
+    commands.push("# forget the broken state before reinstalling.".to_owned());
+    if e.rocm_repos_seen.is_empty() {
+        // No repo file was actually seen on this host, so show an example
+        // matching the detected package family rather than always the apt
+        // path -- a dnf/zypper host has no `/etc/apt/` at all.
+        let example = match family {
+            "dnf" => "/etc/yum.repos.d/amdgpu.repo",
+            "zypper" => "/etc/zypp/repos.d/amdgpu.repo",
+            _ => "/etc/apt/sources.list.d/amdgpu.list",
+        };
+        commands.push(format!(
+            "# sudo mv {example} {example}.bak     # or the equivalent for your package manager"
+        ));
+    } else {
+        for r in &e.rocm_repos_seen {
+            commands.push(format!(
+                "# sudo mv {r} {r}.bak     # quarantine, do not delete yet"
+            ));
+        }
+    }
+    if let Some(cmd) = refresh_command_for_family(family) {
+        commands.push(format!("sudo {cmd}"));
+    }
+    let summary = if ubuntu_driver_is_native_archive(e) {
+        commands
+            .push("# Ubuntu 26.04 ships the amdgpu kernel driver in-tree; there is no".to_owned());
+        commands.push(
+            "# repo-native DKMS driver to reinstall here. Reinstall the userspace stack:"
+                .to_owned(),
+        );
+        commands.push("sudo apt install rocm".to_owned());
+        "Clear the half-configured package state, quarantine the repo-native install's repo files, THEN reinstall the userspace stack via `sudo apt install rocm` (Ubuntu 26.04 ships the amdgpu kernel driver in-tree, so there is no DKMS driver to reinstall).".to_owned()
+    } else if dkms_driver_plan_is_supported(e) {
+        commands.push("# Reinstall via rocm-cli's repo-native flow:".to_owned());
+        commands.push("rocm install driver --dkms --yes".to_owned());
+        "Clear the half-configured package/DKMS state, quarantine the repo-native install's repo files, THEN reinstall via `rocm install driver --dkms --yes`.".to_owned()
+    } else {
+        commands.push(
+            "# rocm-cli has no automated DKMS driver plan for this distro; reinstall the"
+                .to_owned(),
+        );
+        commands.push("# driver manually per AMD's install docs:".to_owned());
+        commands.push("#   https://rocm.docs.amd.com/projects/install-on-linux/en/latest/reference/system-requirements.html".to_owned());
+        format!(
+            "Clear the half-configured package/DKMS state and quarantine the repo-native install's repo files; rocm-cli has no automated DKMS driver plan for {} {}, so reinstall the driver manually per AMD's docs.",
+            e.distro_id, e.distro_version
+        )
+    };
+
+    // Query the package manager's own records, not `rocm examine`'s
+    // self-reported `rocm_install_method` marker: that marker is set from
+    // repo-marker-file presence before dpkg/rpm is consulted (see
+    // `probe_rocm_install`), so a repo file left behind by a failed
+    // `install --dkms` keeps the marker true even though the package
+    // never actually installed.
+    //
+    // Must check the *targeted* package's installed status, not just that
+    // some `rocm`/`amdgpu` name appears anywhere: a bare `grep -qE
+    // 'rocm|amdgpu'` also matches unrelated stock packages (e.g.
+    // `libdrm-amdgpu1`), and matches a healthy `rocm-*` package sitting
+    // next to the broken `amdgpu-dkms` this fix targets. So query
+    // `amdgpu-dkms` specifically, via dpkg's full `Status` field
+    // (`install ok installed`, not a `^ii` substring) or `rpm -q`. Also
+    // confirm DKMS itself reports the module built, and check
+    // `rocminfo`'s own exit code directly -- piping through `head` would
+    // report the pipeline's last stage, masking a missing/failing
+    // `rocminfo`.
+    //
+    // Ubuntu 26.04 has no `amdgpu-dkms`/DKMS module to query (see
+    // `ubuntu_driver_is_native_archive` above): check the `rocm` package
+    // dpkg reinstalled instead.
+    let verify = if ubuntu_driver_is_native_archive(e) {
+        "dpkg-query -W -f='${Status}' rocm 2>/dev/null | grep -q 'install ok installed' \
+         && rocminfo >/dev/null 2>&1"
+            .to_owned()
+    } else if dkms_driver_plan_is_supported(e) {
+        "(dpkg-query -W -f='${Status}' amdgpu-dkms 2>/dev/null | grep -q 'install ok installed' \
+         || rpm -q amdgpu-dkms >/dev/null 2>&1) \
+         && dkms status amdgpu 2>/dev/null | grep -q installed \
+         && rocminfo >/dev/null 2>&1"
+            .to_owned()
+    } else {
+        // No AMD-documented package/DKMS name to check on an undocumented
+        // distro -- the manual reinstall above is on the user, not rocm-cli,
+        // so the only thing this fix itself can still assert is that the
+        // GPU stack actually works afterward.
+        "rocminfo >/dev/null 2>&1".to_owned()
+    };
     let fix = Fix {
-        summary: "Run amdgpu-install's documented uninstall sequence to clear the half-configured state, THEN reinstall without the flag that broke it.".to_owned(),
-        commands: vec![
-            "sudo amdgpu-install --uninstall".to_owned(),
-            "sudo apt autoremove --purge -y".to_owned(),
-            "sudo apt update".to_owned(),
-            "# Reinstall. Drop --accept-eula if you used it previously; the".to_owned(),
-            "# newer installer rejects it and leaves a half-configured repo.".to_owned(),
-            "sudo amdgpu-install --usecase=rocm,hip".to_owned(),
-        ],
+        summary,
+        commands,
         needs_sudo: true,
         needs_reboot: true,
         fix_id: "fix-12-installer".to_owned(),
-        verify: "dpkg -l | grep -E 'rocm|amdgpu' | head -n 20 && rocminfo | head -n 5".to_owned(),
-        notes: vec!["If `apt autoremove` warns it will remove unrelated packages, stop and resolve those by hand before continuing.".to_owned()],
+        verify,
+        notes: vec!["If the purge/remove step warns it will take unrelated packages with it, stop and resolve those by hand before continuing.".to_owned()],
         ..Fix::default()
     };
     finalize(
         "fix-12-installer",
-        "amdgpu-install left a broken state (repo regression / partial DKMS)",
+        "Repo-native install left a broken state (repo regression / partial DKMS)",
         score,
         evidence,
         fix,
@@ -2309,6 +2603,54 @@ fn check_21_msvc_redist_outdated(e: &Examination, symptom: &str) -> Diagnosis {
     finalize(ID, TITLE, score, evidence, fix)
 }
 
+/// The score for an old display driver.
+///
+/// Below [`MIN_SCORE_FOR_MATCH`] on purpose. The entry is advice to look at the
+/// driver, not a finding that anything is broken: AMD publishes no minimum
+/// driver version for the HIP SDK or for the Lemonade Vulkan backend. A WEAK
+/// row is shown by `rocm diagnose` and does not set `has_match`.
+const DISPLAY_DRIVER_OLD_SCORE: i32 = 25;
+
+/// An AMD display driver dated before the first HIP SDK for Windows.
+///
+/// Separate from [`check_14_adrenalin_too_old`] on purpose. That entry needs a
+/// HIP SDK and a failing `hipInfo` or a symptom. This one needs neither, so it
+/// also covers a machine that only runs the Vulkan backend. Only evidence is
+/// read: the driver date from the examination, never the symptom text.
+fn check_22_display_driver_old(e: &Examination, _symptom: &str) -> Diagnosis {
+    const TITLE: &str = "AMD display driver is older than the first HIP SDK for Windows";
+    let id = crate::windows_driver::DISPLAY_DRIVER_OLD_FIX_ID;
+    if e.os_family != "windows" {
+        return zero(id, TITLE);
+    }
+    let Some(info) = crate::windows_driver::WindowsDriverInfo::from_probe(
+        &e.adrenalin_version,
+        &e.adrenalin_date,
+    ) else {
+        return zero(id, TITLE);
+    };
+    let Some(evidence) = crate::windows_driver::old_driver_evidence(&info) else {
+        return zero(id, TITLE);
+    };
+    let fix = Fix {
+        summary: "Look at AMD's support page for a newer display driver for this GPU. This is advice only: no minimum driver version is established, and rocm-cli does not install drivers on Windows.".to_owned(),
+        commands: vec![
+            "# Find the current display driver for this GPU on AMD's support page:".to_owned(),
+            format!("#   {}", crate::windows_driver::AMD_SUPPORT_URL),
+            "# Restart the machine after the driver install.".to_owned(),
+        ],
+        needs_reboot: true,
+        fix_id: id.to_owned(),
+        verify: "powershell -NoProfile -Command \"Get-CimInstance Win32_VideoController | Where-Object { $_.Name -like '*AMD*' -or $_.Name -like '*Radeon*' } | Select-Object Name,DriverVersion,DriverDate\"".to_owned(),
+        notes: vec![
+            crate::windows_driver::NO_MINIMUM_EXPLANATION.to_owned(),
+            crate::windows_driver::FLOOR_NOTE.to_owned(),
+        ],
+        ..Fix::default()
+    };
+    finalize(id, TITLE, DISPLAY_DRIVER_OLD_SCORE, vec![evidence], fix)
+}
+
 // ---------------------------------------------------------------------------
 // WSL2 catalog
 //
@@ -2765,7 +3107,7 @@ const CHECKERS: &[Checker] = &[
     (check_9_igpu_dgpu_collision, &["linux", "windows"]),
     (check_10_container_devices, &["linux"]),
     (check_11_iommu_hang, &["linux"]),
-    (check_12_amdgpu_install_broken, &["linux"]),
+    (check_12_repo_native_broken, &["linux"]),
     (check_13_hip_sdk_missing, &["windows"]),
     (check_14_adrenalin_too_old, &["windows"]),
     (check_15_msvc_redist, &["windows"]),
@@ -2801,6 +3143,9 @@ const CHECKERS: &[Checker] = &[
     // Windows only: the runtime is read from the Windows System32 folder. A WSL
     // distro is examined as a distro, so it has no such runtime to read.
     (check_21_msvc_redist_outdated, &["windows"]),
+    // Windows only: the driver date comes from the Windows display adapter.
+    // WSL2 reads the host driver through its own entries.
+    (check_22_display_driver_old, &["windows"]),
 ];
 
 const WSL_ONLY: &[&str] = &["wsl"];
@@ -2966,6 +3311,16 @@ fn uncovered_platform_message(e: &Examination) -> Option<String> {
     ))
 }
 
+/// Whether a catalog entry is advice about the host rather than a candidate
+/// cause of the reported symptom.
+///
+/// Such an entry reads only evidence, never the symptom, so it fires whatever
+/// the user reported. The text report must not call it "the highest-scoring
+/// match" nor let it stand in for the upstream escalation.
+fn is_advice_only(fix_id: &str) -> bool {
+    fix_id == crate::windows_driver::DISPLAY_DRIVER_OLD_FIX_ID
+}
+
 /// Render the human-facing diagnosis view (mirrors `diagnose.py`'s text output).
 #[must_use]
 pub fn render_report_text(report: &DiagnoseReport, top: usize) -> String {
@@ -2977,14 +3332,24 @@ pub fn render_report_text(report: &DiagnoseReport, top: usize) -> String {
         out.push('\n');
         return out;
     }
-    if report.matched.is_empty() {
+    // An advice-only row says something true about the host whatever the user
+    // reported, so it is never an answer to the symptom. When it is all there is,
+    // the upstream escalation still applies: it is printed first and the advice
+    // follows. JSON is unaffected, `matched` and `has_match` stay as built.
+    let answers_symptom = report.matched.iter().any(|d| !is_advice_only(&d.id));
+    if !answers_symptom {
         let route = &report.route_when_no_match;
         out.push_str("rocm diagnose: no known misconfiguration matched.\n\n");
         out.push_str("This is the explicit 'I don't recognise this failure mode' case. Do not speculate; file the symptom + this examination output upstream:\n");
         let _ = writeln!(out, "  {:>12}: {}", route.target, route.url);
         out.push('\n');
         out.push_str("Include the JSON from `rocm examine --json` in your report.\n");
-        return out;
+        if report.matched.is_empty() {
+            return out;
+        }
+        out.push_str(
+            "\nAdvice about this host follows. It does not explain the symptom, and nothing in it is applied automatically.\n\n",
+        );
     }
     for (i, d) in report.matched.iter().take(top).enumerate() {
         let tier = if d.score >= HIGH_CONFIDENCE {
@@ -3058,7 +3423,7 @@ pub fn render_report_text(report: &DiagnoseReport, top: usize) -> String {
 
     if let Some(high) = report.matched.iter().find(|d| d.score >= HIGH_CONFIDENCE) {
         let _ = writeln!(out, "Next step: run `rocm fix {}`.", high.id);
-    } else if let Some(best) = report.matched.first() {
+    } else if let Some(best) = report.matched.iter().find(|d| !is_advice_only(&d.id)) {
         // Below the threshold the caution still stands, but it is advice about
         // confidence -- not a reason to withhold the command. Ending here was the
         // bug: the user was told to confirm more evidence and given nothing to
@@ -4625,6 +4990,17 @@ mod tests {
             .find(|d| d.id == "fix-16-vllm-oom")
             .and_then(|d| d.fix.as_ref())
             .expect("the finding must carry a plan");
+        let commands: Vec<&str> = fix.commands.iter().map(String::as_str).collect();
+        crate::fix::assert_plan_matches_the_catalog_copy(&fix.fix_id, &commands);
+    }
+
+    #[test]
+    fn the_display_driver_old_plan_matches_the_catalog_copy() {
+        // The `diagnose` copy of fix-22 and the `rocm fix` recipe are one plan.
+        let fix =
+            check_22_display_driver_old(&windows_driver_exam("30.0.13014.8", "2021-08-04"), "")
+                .fix
+                .expect("an old driver must carry a plan");
         let commands: Vec<&str> = fix.commands.iter().map(String::as_str).collect();
         crate::fix::assert_plan_matches_the_catalog_copy(&fix.fix_id, &commands);
     }
@@ -6615,7 +6991,7 @@ mod tests {
 
     #[test]
     fn diagnosis_remediation_matches_the_fix_catalog_for_shared_fix_ids() {
-        // fix-15, fix-16, fix-21 and info-20 live in two places: the `rocm fix`
+        // fix-15, fix-16, fix-21, info-20 and fix-22 live in two places: the `rocm fix`
         // catalog (crate::fix::RECIPES) and the Fix these checks embed in a
         // Diagnosis. The prose *framing* legitimately differs by surface (a
         // catalog rationale vs a diagnosis summary), but the actionable
@@ -6665,12 +7041,26 @@ mod tests {
             },
             "",
         );
-        for diag in [vllm_oom, msvc, msvc_outdated, unsupported_gpu] {
-            assert!(
-                diag.score >= MIN_SCORE_FOR_MATCH,
-                "test setup must yield a real match for {}",
-                diag.id
-            );
+        // fix-22 is advice only: it scores below the match threshold on purpose,
+        // yet a user meets both of its copies, so it is held to the same guard.
+        let display_driver_old =
+            check_22_display_driver_old(&windows_driver_exam("30.0.13014.8", "2021-08-04"), "");
+        for diag in [
+            vllm_oom,
+            msvc,
+            msvc_outdated,
+            unsupported_gpu,
+            display_driver_old,
+        ] {
+            if diag.id == crate::windows_driver::DISPLAY_DRIVER_OLD_FIX_ID {
+                assert_eq!(diag.score, DISPLAY_DRIVER_OLD_SCORE);
+            } else {
+                assert!(
+                    diag.score >= MIN_SCORE_FOR_MATCH,
+                    "test setup must yield a real match for {}",
+                    diag.id
+                );
+            }
             let fix = diag.fix.expect("a matched diagnosis must carry a Fix");
             let (verify, notes, run_commands) =
                 crate::fix::recipe_verify_notes_and_run_commands(&fix.fix_id)
@@ -6971,5 +7361,1112 @@ mod tests {
         }
         assert_eq!(v["min_score_for_match"], 50);
         assert_eq!(v["high_confidence_threshold"], 75);
+    }
+
+    #[test]
+    fn repo_pkg_family_prefers_seen_repos_over_distro_id() {
+        let mut e = linux_base();
+        e.distro_id = "sles".to_owned();
+        e.rocm_repos_seen = vec!["/etc/apt/sources.list.d/amdgpu.list".to_owned()];
+        assert_eq!(repo_pkg_family(&e), "apt");
+    }
+
+    #[test]
+    fn repo_pkg_family_detects_dnf_and_zypper_from_seen_repos() {
+        let mut e = linux_base();
+        e.rocm_repos_seen = vec!["/etc/yum.repos.d/amdgpu.repo".to_owned()];
+        assert_eq!(repo_pkg_family(&e), "dnf");
+
+        e.rocm_repos_seen = vec!["/etc/zypp/repos.d/amdgpu.repo".to_owned()];
+        assert_eq!(repo_pkg_family(&e), "zypper");
+    }
+
+    #[test]
+    fn repo_pkg_family_falls_back_to_distro_id_when_no_repo_seen() {
+        let mut e = linux_base();
+        e.distro_id = "sles".to_owned();
+        assert_eq!(repo_pkg_family(&e), "zypper");
+
+        e.distro_id = "rocky".to_owned();
+        assert_eq!(repo_pkg_family(&e), "dnf");
+
+        e.distro_id = "ubuntu".to_owned();
+        assert_eq!(repo_pkg_family(&e), "apt");
+    }
+
+    #[test]
+    fn repo_pkg_family_fallback_is_id_like_aware() {
+        // Amazon Linux has no ROCm repo file in this scenario and isn't in
+        // the old hardcoded list; it must not default to "apt".
+        let mut e = linux_base();
+        e.distro_id = "amzn".to_owned();
+        assert_eq!(repo_pkg_family(&e), "dnf");
+
+        // A RHEL rebuild with an unrecognized ID must still resolve via
+        // ID_LIKE, same as openmpi's resolver.
+        let mut e = linux_base();
+        e.distro_id = "some-rhel-rebuild".to_owned();
+        e.distro_id_like = "rhel fedora".to_owned();
+        assert_eq!(repo_pkg_family(&e), "dnf");
+    }
+
+    #[test]
+    fn repo_pkg_family_degrades_to_unknown_on_pacman_hosts() {
+        // openmpi's resolver can answer "pacman" (it has its own, unrelated
+        // library installers for Arch et al.), but this check has no pacman
+        // remediation -- it must not surface "pacman" verbatim, nor coerce to
+        // "apt" (which would make check_12 print apt/dpkg commands on an Arch
+        // host); both `match family` arms in check_12 treat "unknown" as "no
+        // package-manager-specific command".
+        let mut e = linux_base();
+        e.distro_id = "arch".to_owned();
+        assert_eq!(repo_pkg_family(&e), "unknown");
+    }
+
+    #[test]
+    fn kernel_unsupported_on_ubuntu_26_04_names_the_native_archive_path() {
+        let mut e = linux_base();
+        e.distro_id = "ubuntu".to_owned();
+        e.distro_version = "26.04".to_owned();
+        e.rocm_version = "7.0.0".to_owned();
+        e.amdgpu_loaded = Some(false);
+        let report = diagnose(&e, "kernel/rocm mismatch");
+        let hit = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-3-rocm-kernel")
+            .expect("unsupported kernel triple should be diagnosed");
+        let commands = hit.fix.as_ref().unwrap().commands.join("\n");
+        assert!(
+            commands.contains("Note on Ubuntu 26.04") && commands.contains("apt install rocm"),
+            "Ubuntu 26.04 must be told to use the native archive path, not a DKMS rerun: {commands}"
+        );
+        assert!(
+            !commands.contains("rerun `rocm install driver --dkms --yes`"),
+            "Ubuntu 26.04 must not be told to rerun a command that plans nothing there: {commands}"
+        );
+    }
+
+    #[test]
+    fn kernel_unsupported_on_an_undocumented_distro_does_not_suggest_a_dkms_rerun() {
+        let mut e = linux_base();
+        e.distro_id = "fedora".to_owned();
+        e.distro_version = "40".to_owned();
+        e.rocm_version = "7.0.0".to_owned();
+        e.amdgpu_loaded = Some(false);
+        let report = diagnose(&e, "kernel/rocm mismatch");
+        let hit = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-3-rocm-kernel")
+            .expect("unsupported kernel triple should be diagnosed");
+        let commands = hit.fix.as_ref().unwrap().commands.join("\n");
+        assert!(
+            commands.contains("plans nothing on fedora 40"),
+            "an undocumented distro must be told the dkms command plans nothing, not rerun it: {commands}"
+        );
+        assert!(
+            !commands.contains("rerun `rocm install driver --dkms --yes`"),
+            "an undocumented distro must not be told to rerun a command that plans nothing: {commands}"
+        );
+    }
+
+    #[test]
+    fn stale_repos_on_ubuntu_26_04_suggests_apt_install_rocm_not_a_dkms_reinstall() {
+        let mut e = linux_base();
+        e.distro_id = "ubuntu".to_owned();
+        e.distro_version = "26.04".to_owned();
+        e.rocm_repos_seen = vec![
+            "/etc/apt/sources.list.d/amdgpu.list".to_owned(),
+            "/etc/apt/sources.list.d/rocm.list".to_owned(),
+        ];
+        let report = diagnose(&e, "stale repo conflict");
+        let hit = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-7-stale-repos")
+            .expect("duplicate repo files should be diagnosed");
+        let commands = hit.fix.as_ref().unwrap().commands.join("\n");
+        assert!(
+            commands.contains("sudo apt install rocm")
+                && commands.contains("Ubuntu 26.04 ships the amdgpu driver in-tree"),
+            "Ubuntu 26.04 must be pointed at the native archive reinstall, not DKMS: {commands}"
+        );
+        assert!(
+            !commands.contains("rocm install driver --dkms --yes"),
+            "Ubuntu 26.04 must not be offered a DKMS reinstall that plans nothing there: {commands}"
+        );
+    }
+
+    #[test]
+    fn stale_repos_on_an_undocumented_dnf_distro_does_not_suggest_a_dkms_reinstall() {
+        let mut e = linux_base();
+        e.distro_id = "fedora".to_owned();
+        e.distro_version = "40".to_owned();
+        e.rocm_repos_seen = vec![
+            "/etc/yum.repos.d/amdgpu.repo".to_owned(),
+            "/etc/yum.repos.d/rocm.repo".to_owned(),
+        ];
+        let report = diagnose(&e, "stale repo conflict");
+        let hit = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-7-stale-repos")
+            .expect("duplicate repo files should be diagnosed");
+        let commands = hit.fix.as_ref().unwrap().commands.join("\n");
+        assert!(
+            commands.contains("plans nothing on fedora 40"),
+            "an undocumented dnf distro must be told the dkms command plans nothing: {commands}"
+        );
+        assert!(
+            !commands.contains("rocm install driver --dkms --yes")
+                && !commands.contains("rocm install driver --dkms   # review the plan"),
+            "an undocumented distro must not be offered a DKMS reinstall that plans nothing: {commands}"
+        );
+    }
+
+    #[test]
+    fn repo_native_broken_on_ubuntu_26_04_reinstalls_the_userspace_stack_not_dkms() {
+        let mut e = linux_base();
+        e.distro_id = "ubuntu".to_owned();
+        e.distro_version = "26.04".to_owned();
+        e.rocm_install_method = "repo-native".to_owned();
+        e.rocm_repos_seen = vec!["/etc/apt/sources.list.d/amdgpu.list".to_owned()];
+        let report = diagnose(
+            &e,
+            "dpkg: error processing package amdgpu-dkms (half-configured)",
+        );
+        let hit = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-12-installer")
+            .expect("repo-native broken state should be diagnosed");
+        let fix = hit.fix.as_ref().unwrap();
+        let commands = fix.commands.join("\n");
+        assert!(
+            commands.contains("sudo apt install rocm"),
+            "Ubuntu 26.04 must reinstall the userspace stack, not a DKMS driver: {commands}"
+        );
+        assert!(
+            !commands.contains("rocm install driver --dkms --yes"),
+            "Ubuntu 26.04 must not be offered a DKMS reinstall that plans nothing there: {commands}"
+        );
+        assert!(
+            fix.verify.contains("dpkg-query -W -f='${Status}' rocm")
+                && !fix.verify.contains("amdgpu-dkms"),
+            "Ubuntu 26.04's verify must check the `rocm` package, not a nonexistent DKMS module: {}",
+            fix.verify
+        );
+    }
+
+    #[test]
+    fn repo_native_broken_on_an_undocumented_distro_tells_the_user_to_reinstall_manually() {
+        let mut e = linux_base();
+        e.distro_id = "fedora".to_owned();
+        e.distro_version = "40".to_owned();
+        e.rocm_install_method = "repo-native".to_owned();
+        e.rocm_repos_seen = vec!["/etc/yum.repos.d/amdgpu.repo".to_owned()];
+        let report = diagnose(
+            &e,
+            "dpkg: error processing package amdgpu-dkms (half-configured)",
+        );
+        let hit = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-12-installer")
+            .expect("repo-native broken state should be diagnosed");
+        let fix = hit.fix.as_ref().unwrap();
+        let commands = fix.commands.join("\n");
+        assert!(
+            commands.contains("no automated DKMS driver plan for this distro")
+                && commands.contains("system-requirements.html"),
+            "an undocumented distro must be sent to AMD's manual install docs: {commands}"
+        );
+        assert!(
+            !commands.contains("rocm install driver --dkms --yes"),
+            "an undocumented distro must not be offered a DKMS reinstall that plans nothing: {commands}"
+        );
+        assert_eq!(
+            fix.verify, "rocminfo >/dev/null 2>&1",
+            "with no AMD-documented package/DKMS name to check, verify must fall back to \
+             confirming the GPU stack works, not assert an unknowable package state: {}",
+            fix.verify
+        );
+    }
+
+    #[test]
+    fn stale_repos_on_a_sles_host_gets_zypper_commands_not_apt() {
+        // A SLES host whose repo files now live under /etc/zypp/repos.d/ (the
+        // new zypp scan this diff adds) must not be told to run apt/dpkg
+        // commands: `check_7` must branch on `repo_pkg_family` the same way
+        // `check_12` already does.
+        let mut e = linux_base();
+        e.distro_id = "sles".to_owned();
+        e.rocm_repos_seen = vec![
+            "/etc/zypp/repos.d/amdgpu.repo".to_owned(),
+            "/etc/zypp/repos.d/rocm.repo".to_owned(),
+        ];
+        let report = diagnose(&e, "stale repo conflict");
+        let hit = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-7-stale-repos")
+            .expect("duplicate repo files should be diagnosed");
+        let fix = hit.fix.as_ref().unwrap();
+        let commands = fix.commands.join("\n");
+        assert!(
+            commands.contains("/etc/zypp/repos.d/") && commands.contains("sudo zypper refresh"),
+            "a SLES host must get zypper remediation: {commands}"
+        );
+        assert!(
+            !commands.contains("apt") && !commands.contains("dpkg"),
+            "a SLES host must not be told to run apt/dpkg commands: {commands}"
+        );
+        assert!(
+            fix.verify.contains("sudo zypper refresh"),
+            "a SLES host's verify step must also use zypper, not apt: {}",
+            fix.verify
+        );
+    }
+
+    #[test]
+    fn stale_repos_on_a_dnf_host_gets_dnf_commands_not_apt() {
+        // Same drift guard as the SLES/zypper test above, for the dnf family.
+        let mut e = linux_base();
+        e.distro_id = "rocky".to_owned();
+        e.rocm_repos_seen = vec![
+            "/etc/yum.repos.d/amdgpu.repo".to_owned(),
+            "/etc/yum.repos.d/rocm.repo".to_owned(),
+        ];
+        let report = diagnose(&e, "stale repo conflict");
+        let hit = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-7-stale-repos")
+            .expect("duplicate repo files should be diagnosed");
+        let fix = hit.fix.as_ref().unwrap();
+        let commands = fix.commands.join("\n");
+        assert!(
+            commands.contains("/etc/yum.repos.d/") && commands.contains("sudo dnf makecache"),
+            "a dnf host must get dnf remediation: {commands}"
+        );
+        assert!(
+            !commands.contains("apt") && !commands.contains("dpkg") && !commands.contains("zypper"),
+            "a dnf host must not be told to run apt/dpkg/zypper commands: {commands}"
+        );
+        assert!(
+            fix.verify.contains("sudo dnf makecache"),
+            "a dnf host's verify step must also use dnf, not apt: {}",
+            fix.verify
+        );
+    }
+
+    #[test]
+    fn stale_repos_emits_no_package_manager_commands_on_pacman_hosts() {
+        let mut e = linux_base();
+        e.distro_id = "arch".to_owned();
+        e.rocm_repos_seen = vec!["/some/rocm.repo".to_owned(), "/some/amdgpu.repo".to_owned()];
+        let report = diagnose(&e, "stale repo conflict");
+        let hit = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-7-stale-repos")
+            .expect("duplicate repo files should be diagnosed");
+        let fix = hit.fix.as_ref().unwrap();
+        let commands: Vec<&str> = fix
+            .commands
+            .iter()
+            .map(String::as_str)
+            .filter(|c| !c.trim_start().starts_with('#'))
+            .collect();
+        assert!(
+            commands.iter().all(|c| !c.contains("apt")
+                && !c.contains("dpkg")
+                && !c.contains("dnf")
+                && !c.contains("zypper")),
+            "must not print a foreign package manager's commands on an unresolved/pacman host: {commands:?}"
+        );
+        assert!(
+            !fix.verify.contains("apt")
+                && !fix.verify.contains("dnf")
+                && !fix.verify.contains("zypper"),
+            "verify step must not assume a foreign package manager on a pacman host: {}",
+            fix.verify
+        );
+        // Not just "no foreign package manager" -- the verify must be a real,
+        // falsifiable post-condition. `rocm examine --json | grep -q
+        // '"rocm_install_method"'` is present in every `examine --json` output
+        // regardless of host state, so it would pass this assertion too while
+        // never actually being able to fail. Pin it to the one thing the
+        // suggested (commented) `mv {r} {r}.bak` commands actually change: the
+        // flagged repo files no longer existing at their original paths.
+        for r in &e.rocm_repos_seen {
+            assert!(
+                fix.verify.contains(r),
+                "verify must check each flagged repo file is gone, not a tautology: {}",
+                fix.verify
+            );
+        }
+    }
+
+    #[test]
+    fn stale_repos_verify_is_not_empty_when_symptom_alone_triggers_on_an_unresolved_host() {
+        // Same unresolved/pacman family as the test above, but this time no
+        // repo files were ever recorded -- only the symptom text scores the
+        // fix. `repos.iter().join(" && ")` over an empty `repos` produces an
+        // empty string, which would make `verify` a blank, always-passing
+        // check instead of the real repo-marker check below.
+        let mut e = linux_base();
+        e.distro_id = "arch".to_owned();
+        let report = diagnose(&e, "404 against repo.radeon.com");
+        let hit = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-7-stale-repos")
+            .expect("symptom-only match should still diagnose fix-7");
+        let fix = hit.fix.as_ref().unwrap();
+        assert!(
+            !fix.verify.trim().is_empty(),
+            "verify must not be blank when no repo files were flagged"
+        );
+        assert!(
+            fix.verify.contains("rocm|amdgpu|radeon"),
+            "verify must fall back to a real, falsifiable repo-marker check: {}",
+            fix.verify
+        );
+    }
+
+    #[test]
+    fn repo_native_broken_emits_no_package_manager_commands_on_pacman_hosts() {
+        let mut e = linux_base();
+        e.distro_id = "arch".to_owned();
+        e.rocm_install_method = "repo-native".to_owned();
+        let report = diagnose(
+            &e,
+            "dpkg: error processing package amdgpu-dkms (half-configured)",
+        );
+        let hit = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-12-installer")
+            .expect("repo-native broken state should be diagnosed");
+        // Only real (non-comment) commands are package-manager-specific here;
+        // the commented-out quarantine example always names the apt path as a
+        // generic illustration ("or the yum/zypp equivalent"), unrelated to
+        // `family` and out of scope for this check.
+        let commands: Vec<&str> = hit
+            .fix
+            .as_ref()
+            .unwrap()
+            .commands
+            .iter()
+            .map(String::as_str)
+            .filter(|c| !c.trim_start().starts_with('#'))
+            .collect();
+        assert!(
+            commands.iter().all(|c| !c.contains("apt")
+                && !c.contains("dpkg")
+                && !c.contains("dnf")
+                && !c.contains("zypper")),
+            "must not print a foreign package manager's commands on an unresolved/pacman host: {commands:?}"
+        );
+    }
+
+    #[test]
+    fn is_repo_native_installed_still_accepts_the_retired_amdgpu_install_value() {
+        // An older `rocm remote doctor` client can report the pre-rename
+        // value for a while after this PR; it must still count as
+        // repo-native-managed, not silently fall through to "not a
+        // package-manager install" and lose fix-12 evidence.
+        assert!(is_repo_native_installed("amdgpu-install"));
+        assert!(is_repo_native_installed("repo-native"));
+        assert!(!is_repo_native_installed("runfile-or-tarball"));
+        assert!(!is_repo_native_installed(""));
+    }
+
+    #[test]
+    fn repo_native_broken_verify_requires_dpkg_status_not_just_name_presence() {
+        // `method == "apt"` here is the exact pre-fix state `is_repo_native_installed`
+        // treats as already repo-native-installed (see its doc comment): the dpkg/rpm
+        // query fallback found an amdgpu/rocm package by name, with no distinction
+        // between a healthy install and a half-configured one. If `verify` only
+        // re-ran that same bare name grep, it would already be true here, before any
+        // of this fix's remediation commands run.
+        let mut e = linux_base();
+        e.distro_id = "ubuntu".to_owned();
+        e.distro_version = "22.04".to_owned();
+        e.rocm_install_method = "apt".to_owned();
+        let report = diagnose(
+            &e,
+            "dpkg: error processing package amdgpu-dkms (half-configured)",
+        );
+        let hit = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-12-installer")
+            .expect("repo-native broken state should be diagnosed");
+        let verify = &hit.fix.as_ref().unwrap().verify;
+        assert!(
+            verify.contains("grep -q 'install ok installed'"),
+            "verify must check dpkg's full installed-status field, not just that the \
+             package name appears anywhere -- a bare name grep also matches unrelated \
+             stock packages (e.g. libdrm-amdgpu1) and a healthy rocm-* package sitting \
+             next to the broken amdgpu-dkms this fix targets: {verify}"
+        );
+        assert!(
+            verify.contains("dpkg-query -W -f='${Status}' amdgpu-dkms"),
+            "verify must query dpkg's status for amdgpu-dkms by name, not merely contain \
+             the right-shaped status-field query against some other package -- pinning \
+             the package name closes the gap where the targeted name could be swapped \
+             for an unrelated one and this test would still pass: {verify}"
+        );
+        assert!(
+            verify.contains("dkms status amdgpu"),
+            "verify must also confirm dkms reports the module actually built: {verify}"
+        );
+        assert!(
+            !verify.contains("| head"),
+            "verify must not pipe rocminfo through head, which would report head's exit \
+             code instead of rocminfo's: {verify}"
+        );
+    }
+
+    #[test]
+    fn repo_native_broken_fires_and_clears_state_before_reinstall() {
+        let mut e = linux_base();
+        e.distro_id = "ubuntu".to_owned();
+        e.distro_version = "22.04".to_owned();
+        e.rocm_install_method = "repo-native".to_owned();
+        e.rocm_repos_seen = vec!["/etc/apt/sources.list.d/amdgpu.list".to_owned()];
+        let report = diagnose(
+            &e,
+            "dpkg: error processing package amdgpu-dkms (half-configured)",
+        );
+        let hit = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-12-installer")
+            .expect("repo-native broken state should be diagnosed");
+        let fix = hit.fix.as_ref().unwrap();
+        let commands = fix.commands.join("\n");
+        assert!(
+            commands.contains("dpkg --configure -a"),
+            "must clear the half-configured dpkg state before reinstalling: {commands}"
+        );
+        assert!(
+            commands.contains("purge -y amdgpu-dkms"),
+            "must purge the broken driver package: {commands}"
+        );
+        assert!(
+            commands.contains("# sudo mv /etc/apt/sources.list.d/amdgpu.list"),
+            "repo quarantine command must be commented out, not ready-to-run: {commands}"
+        );
+        assert!(
+            commands.contains("rocm install driver --dkms --yes"),
+            "reinstall command must actually install (bare 'rocm install driver' is a non-mutating preflight no-op): {commands}"
+        );
+        assert!(
+            fix.verify.contains("dpkg") && fix.verify.contains("rpm"),
+            "verify must query real dpkg/rpm package state, not the self-reported \
+             rocm_install_method marker (set from repo-file presence before the \
+             package actually installs): {}",
+            fix.verify
+        );
+        assert!(
+            hit.evidence
+                .iter()
+                .any(|l| l.contains("installed via the repo-native package-manager flow")),
+            "positive control: the repo-native evidence line must appear when the method really is repo-native: {:?}",
+            hit.evidence
+        );
+    }
+
+    #[test]
+    fn repo_native_broken_on_a_dnf_host_gets_dnf_commands_not_apt() {
+        let mut e = linux_base();
+        e.distro_id = "rocky".to_owned();
+        e.distro_version = "9.6".to_owned();
+        e.rocm_install_method = "repo-native".to_owned();
+        e.rocm_repos_seen = vec!["/etc/yum.repos.d/amdgpu.repo".to_owned()];
+        let report = diagnose(
+            &e,
+            "dpkg: error processing package amdgpu-dkms (half-configured)",
+        );
+        let hit = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-12-installer")
+            .expect("repo-native broken state should be diagnosed");
+        let commands = hit.fix.as_ref().unwrap().commands.join("\n");
+        assert!(
+            commands.contains("sudo dnf remove -y amdgpu-dkms")
+                && commands.contains("sudo dnf makecache"),
+            "a dnf host must get dnf remediation: {commands}"
+        );
+        assert!(
+            !commands.contains("apt") && !commands.contains("dpkg") && !commands.contains("zypper"),
+            "a dnf host must not be told to run apt/dpkg/zypper commands: {commands}"
+        );
+    }
+
+    #[test]
+    fn repo_native_broken_on_a_zypper_host_gets_zypper_commands_not_apt() {
+        let mut e = linux_base();
+        e.distro_id = "sles".to_owned();
+        e.distro_version = "15.7".to_owned();
+        e.rocm_install_method = "repo-native".to_owned();
+        e.rocm_repos_seen = vec!["/etc/zypp/repos.d/amdgpu.repo".to_owned()];
+        let report = diagnose(
+            &e,
+            "dpkg: error processing package amdgpu-dkms (half-configured)",
+        );
+        let hit = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-12-installer")
+            .expect("repo-native broken state should be diagnosed");
+        let commands = hit.fix.as_ref().unwrap().commands.join("\n");
+        assert!(
+            commands.contains("sudo zypper remove -y amdgpu-dkms")
+                && commands.contains("sudo zypper refresh"),
+            "a zypper host must get zypper remediation: {commands}"
+        );
+        assert!(
+            !commands.contains("apt") && !commands.contains("dpkg") && !commands.contains("dnf"),
+            "a zypper host must not be told to run apt/dpkg/dnf commands: {commands}"
+        );
+    }
+
+    #[test]
+    fn repo_native_broken_quarantine_example_matches_the_family_when_no_repo_was_seen() {
+        // With no repo file recorded (`rocm_repos_seen` empty), the quarantine
+        // line falls back to an example path -- it must match the host's own
+        // package family, not always show the apt path on a dnf/zypper host
+        // that has no `/etc/apt/` at all.
+        let mut e = linux_base();
+        e.distro_id = "sles".to_owned();
+        e.rocm_install_method = "repo-native".to_owned();
+        e.rocm_repos_seen = Vec::new();
+        let report = diagnose(
+            &e,
+            "dpkg: error processing package amdgpu-dkms (half-configured)",
+        );
+        let hit = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-12-installer")
+            .expect("repo-native broken state should be diagnosed");
+        let commands = hit.fix.as_ref().unwrap().commands.join("\n");
+        assert!(
+            commands.contains("/etc/zypp/repos.d/amdgpu.repo"),
+            "a zypper host's fallback quarantine example must show a zypp path: {commands}"
+        );
+        assert!(
+            !commands.contains("/etc/apt/"),
+            "a zypper host must not show an apt path as its quarantine example: {commands}"
+        );
+    }
+
+    #[test]
+    fn repo_native_broken_does_not_claim_repo_native_evidence_for_other_install_methods() {
+        // Regression test: an empty symptom would short-circuit keyword_score to
+        // 0 before the install-method gate is ever reached, making this pass
+        // vacuously regardless of whether the gate works. Pass a real dpkg
+        // symptom instead, matching the positive-control test above, so fix-12
+        // still fires (kw_score alone clears MIN_SCORE_FOR_MATCH) but must not
+        // claim repo-native evidence for a non-repo-native install.
+        let mut e = linux_base();
+        e.rocm_install_method = "runfile-or-tarball".to_owned();
+        let report = diagnose(
+            &e,
+            "dpkg: error processing package amdgpu-dkms (half-configured)",
+        );
+        let hit = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-12-installer")
+            .expect("dpkg keyword evidence alone should still surface fix-12");
+        assert!(
+            !hit.evidence
+                .iter()
+                .any(|l| l.contains("installed via the repo-native package-manager flow")),
+            "must not claim repo-native evidence for a non-repo-native install: {:?}",
+            hit.evidence
+        );
+    }
+
+    #[test]
+    fn repo_native_broken_claims_repo_native_evidence_for_dpkg_rpm_fallback_methods() {
+        // probe_rocm_install (examine.rs) falls back to the literal "apt"/"dnf"
+        // when dpkg/rpm confirms the package is installed but no marker file
+        // was found. Those hosts are still repo-native-managed, so the evidence
+        // line must fire for them too, not just the marker-file-detected
+        // literal "repo-native" case covered above. The +20 score bonus that
+        // fires alongside it is asserted separately, in
+        // `repo_native_broken_score_bonus_actually_raises_confidence`.
+        for method in ["apt", "dnf"] {
+            let mut e = linux_base();
+            e.rocm_install_method = method.to_owned();
+            let report = diagnose(
+                &e,
+                "dpkg: error processing package amdgpu-dkms (half-configured)",
+            );
+            let hit = report
+                .matched
+                .iter()
+                .find(|d| d.id == "fix-12-installer")
+                .expect("dpkg keyword evidence alone should still surface fix-12");
+            assert!(
+                hit.evidence
+                    .iter()
+                    .any(|l| l.contains("installed via the repo-native package-manager flow")),
+                "method {method:?} is a repo-native fallback and must claim repo-native evidence: {:?}",
+                hit.evidence
+            );
+        }
+    }
+
+    #[test]
+    fn repo_native_broken_score_bonus_actually_raises_confidence() {
+        // The two tests above only assert the evidence *line*, which fires
+        // from the same `is_repo_native_installed(method)` check that gates
+        // the `+20` bonus a few lines later -- so they'd stay green even if
+        // the bonus itself were deleted. Diagnose the same dpkg symptom on a
+        // repo-native host and a runfile-or-tarball host and assert the
+        // former's score is exactly 20 higher.
+        let symptom = "dpkg: error processing package amdgpu-dkms (half-configured)";
+        let score_for = |method: &str| {
+            let mut e = linux_base();
+            e.rocm_install_method = method.to_owned();
+            diagnose(&e, symptom)
+                .matched
+                .iter()
+                .find(|d| d.id == "fix-12-installer")
+                .expect("dpkg keyword evidence alone should still surface fix-12")
+                .score
+        };
+        assert_eq!(
+            score_for("apt"),
+            score_for("runfile-or-tarball") + 20,
+            "the +20 repo-native score bonus must actually raise the computed score, \
+             not just the evidence text"
+        );
+    }
+
+    #[test]
+    fn repo_native_broken_fires_on_dpkg_symptom_regardless_of_install_method() {
+        // The keyword score alone (half-configured + generic dpkg error = 75)
+        // clears MIN_SCORE_FOR_MATCH without the +20 repo-native bonus, so
+        // fix-12 still fires even when rocm_install_method isn't
+        // "repo-native" -- the method only adds confidence, it doesn't gate
+        // whether the check fires at all. See the sibling test above for the
+        // repo-native-evidence-line assertion this used to also make.
+        let mut e = linux_base();
+        e.rocm_install_method = "runfile-or-tarball".to_owned();
+        let report = diagnose(
+            &e,
+            "dpkg: error processing package amdgpu-dkms (half-configured)",
+        );
+        assert!(
+            report.matched.iter().any(|d| d.id == "fix-12-installer"),
+            "dpkg keyword evidence alone should still surface fix-12"
+        );
+    }
+
+    #[test]
+    fn dkms_driver_plan_support_matrix_covers_every_arm() {
+        // (distro_id, distro_version, distro_id_like, supported). Kept in step
+        // with `build_driver_install_plan_at` by
+        // `driver_plan_support_matches_rocm_core_diagnose` in
+        // `apps/rocm/src/driver_install.rs`.
+        let table = [
+            ("ubuntu", "22.04", "debian", true),
+            ("ubuntu", "24.04", "debian", true),
+            ("ubuntu", "26.04", "debian", false),
+            ("debian", "12", "", true),
+            ("debian", "13", "", true),
+            ("rhel", "9.7", "fedora", true),
+            ("rhel", "10.0", "fedora", true),
+            ("ol", "9.7", "fedora", true),
+            ("rocky", "9.6", "rhel centos fedora", true),
+            ("sles", "15.7", "suse", true),
+            ("sle", "15.7", "suse", true),
+            ("almalinux", "9.6", "rhel centos fedora", true),
+            ("pop", "24.04", "ubuntu debian", true),
+            ("ol", "9.7", "rhel fedora", true),
+            ("ol", "9.5", "rhel fedora", false),
+            // OL's own ID_LIKE row must not inherit the `rhel` family's
+            // versions: OL 9.6 is not in the documented OL list.
+            ("ol", "9.6", "rhel fedora", false),
+            ("fedora", "41", "", false),
+            ("opensuse-leap", "15.7", "suse opensuse", false),
+            ("linuxmint", "22", "ubuntu debian", false),
+        ];
+        for (id, version, like, expected) in table {
+            let mut e = linux_base();
+            e.distro_id = id.to_owned();
+            e.distro_version = version.to_owned();
+            e.distro_id_like = like.to_owned();
+            assert_eq!(
+                dkms_driver_plan_is_supported(&e),
+                expected,
+                "{id} {version} (ID_LIKE={like})"
+            );
+        }
+    }
+
+    #[test]
+    fn repo_native_broken_on_an_undocumented_distro_does_not_purge_the_driver() {
+        let mut e = linux_base();
+        e.distro_id = "fedora".to_owned();
+        e.distro_version = "41".to_owned();
+        e.rocm_install_method = "repo-native".to_owned();
+        let report = diagnose(&e, "dpkg: error processing package amdgpu-dkms");
+        let hit = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-12-installer")
+            .expect("repo-native broken state should be diagnosed");
+        let commands = hit.fix.as_ref().unwrap().commands.join("\n");
+        assert!(
+            !commands.contains("amdgpu-dkms") && !commands.contains("rocm install driver"),
+            "no purge without a planned reinstall: {commands}"
+        );
+    }
+
+    fn fix_commands(e: &Examination, symptom: &str, id: &str) -> String {
+        diagnose(e, symptom)
+            .matched
+            .iter()
+            .find(|d| d.id == id)
+            .unwrap_or_else(|| panic!("{id} should be diagnosed"))
+            .fix
+            .as_ref()
+            .unwrap()
+            .commands
+            .join("\n")
+    }
+
+    #[test]
+    fn fix_12_purges_the_driver_only_where_a_reinstall_is_planned() {
+        // (id, version, id_like, repo seen, purge command, expect purge)
+        let cases = [
+            (
+                "ubuntu",
+                "24.04",
+                "debian",
+                "/etc/apt/sources.list.d/amdgpu.list",
+                "sudo apt-get purge -y amdgpu-dkms",
+                true,
+            ),
+            (
+                "linuxmint",
+                "22",
+                "ubuntu debian",
+                "/etc/apt/sources.list.d/amdgpu.list",
+                "sudo apt-get purge -y amdgpu-dkms",
+                false,
+            ),
+            (
+                "rhel",
+                "9.7",
+                "fedora",
+                "/etc/yum.repos.d/amdgpu.repo",
+                "sudo dnf remove -y amdgpu-dkms",
+                true,
+            ),
+            (
+                "fedora",
+                "41",
+                "",
+                "/etc/yum.repos.d/amdgpu.repo",
+                "sudo dnf remove -y amdgpu-dkms",
+                false,
+            ),
+            (
+                "sles",
+                "15.7",
+                "suse",
+                "/etc/zypp/repos.d/amdgpu.repo",
+                "sudo zypper remove -y amdgpu-dkms",
+                true,
+            ),
+            (
+                "opensuse-leap",
+                "15.7",
+                "suse opensuse",
+                "/etc/zypp/repos.d/amdgpu.repo",
+                "sudo zypper remove -y amdgpu-dkms",
+                false,
+            ),
+        ];
+        for (id, version, like, repo, purge, expect) in cases {
+            let mut e = linux_base();
+            e.distro_id = id.to_owned();
+            e.distro_version = version.to_owned();
+            e.distro_id_like = like.to_owned();
+            e.rocm_install_method = "repo-native".to_owned();
+            e.rocm_repos_seen = vec![repo.to_owned()];
+            let commands = fix_commands(
+                &e,
+                "dpkg: error processing package amdgpu-dkms",
+                "fix-12-installer",
+            );
+            assert_eq!(
+                commands.contains(purge),
+                expect,
+                "{id} {version}: {commands}"
+            );
+        }
+    }
+
+    #[test]
+    fn supported_distro_fix_3_and_fix_7_name_the_dkms_reinstall() {
+        let mut e = linux_base();
+        e.distro_id = "ubuntu".to_owned();
+        e.distro_version = "24.04".to_owned();
+        e.rocm_version = "7.0.0".to_owned();
+        e.amdgpu_loaded = Some(false);
+        e.rocm_repos_seen = vec![
+            "/etc/apt/sources.list.d/amdgpu.list".to_owned(),
+            "/etc/apt/sources.list.d/rocm.list".to_owned(),
+        ];
+        let fix3 = fix_commands(&e, "kernel/rocm mismatch", "fix-3-rocm-kernel");
+        assert!(fix3.contains("rocm install driver --dkms --yes"), "{fix3}");
+        let fix7 = fix_commands(&e, "stale repo conflict", "fix-7-stale-repos");
+        assert!(fix7.contains("rocm install driver --dkms --yes"), "{fix7}");
+    }
+
+    #[test]
+    fn kernel_unsupported_does_not_offer_the_sdk_install_or_a_maskable_verify() {
+        let mut e = linux_base();
+        e.distro_id = "ubuntu".to_owned();
+        e.distro_version = "24.04".to_owned();
+        e.rocm_version = "7.0.0".to_owned();
+        e.amdgpu_loaded = Some(false);
+        let report = diagnose(&e, "kernel/rocm mismatch");
+        let fix = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-3-rocm-kernel")
+            .and_then(|d| d.fix.as_ref())
+            .expect("unsupported kernel triple should be diagnosed");
+        assert!(!fix.commands.join("\n").contains("rocm install sdk"));
+        assert!(!fix.verify.contains("| head"), "{}", fix.verify);
+    }
+
+    fn windows_driver_exam(version: &str, date: &str) -> Examination {
+        Examination {
+            os_family: "windows".to_owned(),
+            adrenalin_version: version.to_owned(),
+            adrenalin_date: date.to_owned(),
+            ..Examination::default()
+        }
+    }
+
+    fn old_driver_entry(e: &Examination) -> Option<Diagnosis> {
+        diagnose(e, "")
+            .matched
+            .into_iter()
+            .find(|d| d.id == crate::windows_driver::DISPLAY_DRIVER_OLD_FIX_ID)
+    }
+
+    #[test]
+    fn a_2021_display_driver_is_flagged_as_advice_only() {
+        let hit = old_driver_entry(&windows_driver_exam("30.0.13014.8", "2021-08-04"))
+            .expect("a 2021 driver must be flagged");
+        assert_eq!(hit.score, DISPLAY_DRIVER_OLD_SCORE);
+        assert!(
+            hit.score < MIN_SCORE_FOR_MATCH,
+            "advice must not read as an established cause"
+        );
+        assert!(hit.evidence.iter().any(|ev| ev.contains("30.0.13014.8")));
+        assert!(hit.evidence.iter().any(|ev| ev.contains("2021-08-04")));
+        assert!(hit.evidence.iter().any(|ev| ev.contains("not established")));
+        let fix = hit.fix.expect("fix");
+        assert!(!fix.commands.is_empty());
+        assert!(
+            fix.commands.iter().all(|c| c.starts_with('#')),
+            "the recipe must print no command that installs anything: {:?}",
+            fix.commands
+        );
+        assert!(fix.commands.iter().any(|c| c.contains("Restart")));
+        assert!(
+            fix.commands
+                .iter()
+                .any(|c| c.contains("amd.com/en/support"))
+        );
+    }
+
+    fn old_driver_only_exam() -> Examination {
+        Examination {
+            hip_sdk_path: "C:\\Program Files\\AMD\\ROCm\\6.2".to_owned(),
+            hipinfo_present: true,
+            ..windows_driver_exam("30.0.13014.8", "2021-08-04")
+        }
+    }
+
+    #[test]
+    fn an_old_driver_alone_keeps_the_upstream_escalation_in_the_text_report() {
+        // State: the old-driver row is present, nothing else is, and no
+        // established cause exists.
+        let report = diagnose(&old_driver_only_exam(), "");
+        let ids: Vec<&str> = report.matched.iter().map(|d| d.id.as_str()).collect();
+        assert_eq!(ids, [crate::windows_driver::DISPLAY_DRIVER_OLD_FIX_ID]);
+        assert!(!report.has_match);
+
+        // Text: the symptom was not recognised, so the report says where to
+        // file it, and it does not present the advice as the best match.
+        let text = render_report_text(&report, 5);
+        assert!(text.contains("no known misconfiguration matched"), "{text}");
+        assert!(text.contains(&report.route_when_no_match.url), "{text}");
+        assert!(text.contains("rocm examine --json"), "{text}");
+        assert!(text.contains("fix-22-display-driver-old"), "{text}");
+        assert!(!text.contains("highest-scoring match"), "{text}");
+        assert!(!text.contains("HIGH_CONFIDENCE"), "{text}");
+
+        // The line that introduces the advice makes a promise: nothing in it is
+        // applied automatically. The promise and the behaviour are asserted in
+        // the same test: every command the entry carries is a printed comment
+        // (`a_2021_display_driver_is_flagged_as_advice_only` pins the same for
+        // the recipe), so nothing in the advice can run anything.
+        assert!(
+            text.contains(
+                "Advice about this host follows. It does not explain the symptom, and nothing in it is applied automatically."
+            ),
+            "{text}"
+        );
+        let fix = report.matched[0]
+            .fix
+            .as_ref()
+            .expect("the advice has a fix");
+        assert!(
+            fix.commands.iter().all(|c| c.starts_with('#')),
+            "the advice must apply nothing: {:?}",
+            fix.commands
+        );
+    }
+
+    #[test]
+    fn a_real_cause_beside_an_old_driver_is_still_the_highest_scoring_match() {
+        // The advice row must not be named as the best match, and a real
+        // finding must keep that role.
+        let mut e = old_driver_only_exam();
+        e.msvc_redist_version = "14.29.30133.0".to_owned();
+        let report = diagnose(&e, "");
+        let ids: Vec<&str> = report.matched.iter().map(|d| d.id.as_str()).collect();
+        assert!(ids.contains(&crate::windows_driver::DISPLAY_DRIVER_OLD_FIX_ID));
+        assert!(ids.contains(&"fix-21-msvc-redist-outdated"));
+        let text = render_report_text(&report, 5);
+        assert!(
+            !text.contains("no known misconfiguration matched"),
+            "{text}"
+        );
+        assert!(
+            text.contains("run `rocm fix fix-21-msvc-redist-outdated`"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("run `rocm fix fix-22-display-driver-old` (the highest"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_below_high_real_cause_beside_an_old_driver_is_the_one_named_as_next_step() {
+        for (score, tier) in [(60, "LIKELY"), (30, "WEAK")] {
+            let mut report = diagnose(&old_driver_only_exam(), "");
+            assert_eq!(report.matched.len(), 1, "fixture: only the advice row");
+            report.matched.insert(
+                0,
+                Diagnosis {
+                    id: "fix-99-synthetic-real-cause".to_owned(),
+                    title: "A real cause below HIGH_CONFIDENCE".to_owned(),
+                    score,
+                    evidence: vec!["synthetic".to_owned()],
+                    fix: None,
+                },
+            );
+            assert!(score < HIGH_CONFIDENCE);
+            let text = render_report_text(&report, 5);
+            assert!(
+                text.contains(&format!("[{tier} score={score}/100]")),
+                "{text}"
+            );
+            assert!(
+                text.contains("below the HIGH_CONFIDENCE threshold"),
+                "{text}"
+            );
+            assert!(
+                text.contains(
+                    "run `rocm fix fix-99-synthetic-real-cause` (the highest-scoring match)"
+                ),
+                "{text}"
+            );
+            assert!(
+                !text.contains("run `rocm fix fix-22-display-driver-old` (the highest"),
+                "{text}"
+            );
+            // The advice row is still listed, after the real cause.
+            assert!(text.contains("#2 (fix-22-display-driver-old)"), "{text}");
+        }
+    }
+
+    #[test]
+    fn an_old_driver_leaves_the_json_report_as_it_was() {
+        let report = diagnose(&old_driver_only_exam(), "");
+        let json = serde_json::to_value(&report).expect("serialises");
+        assert_eq!(json["has_match"], false);
+        assert_eq!(json["matched"].as_array().map(Vec::len), Some(1));
+        assert_eq!(json["matched"][0]["id"], "fix-22-display-driver-old");
+        assert!(json["route_when_no_match"]["url"].is_string());
+    }
+
+    #[test]
+    fn a_current_display_driver_is_not_flagged() {
+        assert!(old_driver_entry(&windows_driver_exam("32.0.23033.1002", "2026-05-02")).is_none());
+        // Exactly the cutoff day is not older than it.
+        assert!(old_driver_entry(&windows_driver_exam("32.0.1.1", "2023-07-27")).is_none());
+    }
+
+    #[test]
+    fn a_missing_or_unreadable_display_driver_date_never_flags() {
+        for (version, date) in [
+            ("30.0.13014.8", ""),
+            ("", "2021-08-04"),
+            ("", ""),
+            ("30.0.13014.8", "garbage"),
+        ] {
+            assert!(
+                old_driver_entry(&windows_driver_exam(version, date)).is_none(),
+                "{version:?} {date:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_old_display_driver_entry_never_applies_off_windows() {
+        for family in ["linux", "other"] {
+            let mut e = windows_driver_exam("30.0.13014.8", "2021-08-04");
+            e.os_family = family.to_owned();
+            assert!(old_driver_entry(&e).is_none(), "{family}");
+        }
+        let mut wsl = wsl_base();
+        wsl.adrenalin_version = "30.0.13014.8".to_owned();
+        wsl.adrenalin_date = "2021-08-04".to_owned();
+        assert!(old_driver_entry(&wsl).is_none());
+    }
+
+    #[test]
+    fn the_old_display_driver_entry_does_not_change_fix_14() {
+        // fix-14 keeps its meaning: an old date alone must not raise it.
+        let report = diagnose(&windows_driver_exam("30.0.13014.8", "2021-08-04"), "");
+        assert!(
+            report
+                .matched
+                .iter()
+                .all(|d| d.id != "fix-14-adrenalin-too-old")
+        );
+        assert!(!report.has_match());
     }
 }

@@ -288,7 +288,7 @@ form works depends on the engine your GPU selects.
 | `rocm diagnose --report` | Show what this machine would contribute to a problem report, and send nothing |
 | `rocm fix [<fix-id>]` | Apply a fix reported by `rocm diagnose` |
 | `rocm install sdk` | Install TheRock ROCm wheels into a managed Python environment |
-| `rocm install driver` | Install the AMD kernel driver on Linux |
+| `rocm install driver` | Install the AMD kernel driver on Linux; on Windows, report the display driver version and age (installs nothing) |
 | `rocm serve <model>` | Start a local OpenAI-compatible model server |
 | `rocm remote serve <machine> <model>` | Serve a model on another GPU machine over your private network |
 | `rocm dash` | Open the full-screen telemetry dashboard |
@@ -318,6 +318,20 @@ for its ROCm build and compiled GPU architectures:
   answer GPU and driver questions.
 
 `--framework` only affects the JSON report, not the human-readable one.
+
+On Windows, the human-readable summary also shows the AMD display driver's
+`driver_version` and `driver_date`, and a `driver_age` line. `driver_age`
+compares the driver date with the release of the first HIP SDK for Windows
+(27 July 2023). AMD publishes no minimum driver version for the HIP SDK or for
+the Lemonade Vulkan backend, so this is a hint to look at the driver, not a
+statement that the driver is broken. The date is only a floor: it cannot judge
+newer GPUs such as gfx120X, gfx1150 and gfx1151, which may need newer drivers.
+`rocm diagnose` lists the same finding as
+`fix-22-display-driver-old` with a WEAK score. Its advice is AMD's support
+page and a restart after the install. The entry is advice about the host, not a
+cause of any reported symptom, so when nothing else matches, `rocm diagnose`
+still says where to file it upstream. rocm-cli never installs drivers on
+Windows. The Vulkan driver version is not shown.
 
 ### Diagnose and fix
 
@@ -358,14 +372,16 @@ position.
   `fix-19-shm-too-small`). Run `rocm diagnose` inside the distribution for
   those.
 - `--report` shows exactly what this machine would contribute to a problem
-  report, and sends nothing. There is no transport yet, and there will be no
-  automatic one: a report leaves a machine only by its owner's own action.
+  report, and sends nothing. There is no automatic transport, and there will be
+  none: a report leaves a machine only by its owner's own action.
 - `--send`, which requires `--report`, additionally offers a prefilled mail
   carrying that report. It still sends nothing: the mail opens already filled
   in with the content `--report` just printed, addressed to `ROCmCLI@amd.com`,
   and it leaves the machine only when you send it yourself. Requiring
   `--report` is what guarantees the content is shown before the mail is
-  offered.
+  offered. The mail goes from your own mail account, so it carries your
+  address even though the report does not, and the CLI says so each time it
+  offers one.
 
 The `--report` content is deliberately narrow (a schema version, the matched entry, whether
 a fix was offered for it, the GPU architecture and which compatibility
@@ -554,7 +570,31 @@ you what it couldn't find instead.
 #### Driver installation
 
 `install driver` installs the AMD kernel driver on Linux, using DKMS or a native
-package.
+package. On bare metal it defaults to the floating `latest` amdgpu release;
+set `ROCM_CLI_AMDGPU_DRIVER_VERSION` to pin a specific one. This replaces the
+older `ROCM_CLI_AMDGPU_VERSION`/`ROCM_CLI_AMDGPU_PACKAGE_RELEASE` pair, which
+pinned a fixed default and are no longer read; the plan is refused while either is still set,
+so an old pin is never silently turned into `latest`.
+
+On Ubuntu 26.04, the amdgpu driver ships in-tree and `repo.radeon.com` does not
+yet publish a matching DKMS repo, so `install driver` reports a non-mutating
+`supported: false` plan instead and directs you to `apt install rocm` for the
+userspace ROCm stack.
+
+Approving (`--yes`) a plan that is `supported: false` (Ubuntu 26.04, an
+undocumented distro, or a refused version override) installs nothing and exits
+non-zero, after printing the plan.
+
+On Windows, `install driver` is validate-only: it installs and changes nothing,
+with or without `--yes`, and it starts no driver command. It prints the AMD
+display driver version and date, and whether the date is older than the first
+HIP SDK for Windows, 27 July 2023 (`outdated: yes`, `no` or `unknown`). Next to
+`outdated: no` it repeats that the date cannot judge newer GPUs such as
+gfx120X, gfx1150 and gfx1151. For an
+old driver it also names the fix id `fix-22-display-driver-old`. Run
+`rocm diagnose` for the advice. AMD publishes no minimum driver version, so an
+old date is a hint to look at the driver, not a finding that it is broken. See
+[Examine](#examine).
 
 #### Updates
 

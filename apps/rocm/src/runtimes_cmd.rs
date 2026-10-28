@@ -35,9 +35,9 @@ use rocm_core::{
 use serde::{Deserialize, Serialize};
 
 use crate::therock;
+use crate::uninstall_plan::confirm_uninstall;
 use crate::{
-    ROLLBACK_RECOVERY_HINT, RuntimesCommand, cli_report, confirm_uninstall, record_cli_audit_event,
-    runtime_services,
+    ROLLBACK_RECOVERY_HINT, RuntimesCommand, cli_report, record_cli_audit_event, runtime_services,
 };
 
 /// Refuse `--restart-services` without `--yes`, naming the command the user

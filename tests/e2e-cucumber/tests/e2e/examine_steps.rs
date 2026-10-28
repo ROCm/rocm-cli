@@ -201,11 +201,16 @@ async fn assert_driver_plan_repo_version_resolved(world: &mut E2eWorld) {
         !repo_version.contains("${"),
         "repo_version still shows an unresolved shell placeholder: {repo_version:?}\n{output}"
     );
+    // The default, unoverridden value is the literal "latest" (ROCM_CLI_AMDGPU_DRIVER_VERSION
+    // is unset on a normal test host) -- not a numeric ROCm version -- so only
+    // non-empty and metacharacter-safe are asserted here, matching the same
+    // filter build_driver_install_plan_at applies before this value ever reaches
+    // a single-quoted shell command.
+    assert!(!repo_version.is_empty(), "repo_version is empty:\n{output}");
     assert!(
         repo_version
             .chars()
-            .next()
-            .is_some_and(|first| first.is_ascii_digit()),
+            .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c)),
         "repo_version is not a concrete version string: {repo_version:?}\n{output}"
     );
 }
@@ -430,6 +435,34 @@ fn parsed_json(world: &E2eWorld) -> serde_json::Value {
     let output = world.cli_output.as_ref().expect("no command was run");
     serde_json::from_str(output)
         .unwrap_or_else(|e| panic!("`examine --json` did not emit valid JSON ({e}):\n{output}"))
+}
+
+#[then("the inspection reports a current install-method name")]
+async fn assert_install_method_is_current(world: &mut E2eWorld) {
+    let json = parsed_json(world);
+    let method = json
+        .get("rocm_install_method")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    // `probe_rocm_install` used to name these "amdgpu-install" and
+    // "tarball-or-other"; a whitelist (rather than pinning one value) is what
+    // keeps this hermetic across hosts -- which branch actually fires here
+    // depends on this machine's real /etc/apt (etc.) ROCm repo markers, not
+    // just on the CLI-managed install this scenario plants, so a host that
+    // happens to have a real ROCm repo configured (this includes some
+    // developer machines and self-hosted GPU runners, not just a clean mock
+    // lane) legitimately resolves to "repo-native" instead of
+    // "runfile-or-tarball". Either current name passing and either retired
+    // name failing is exactly the coverage a revert of the rename needs.
+    // "zypper" is excluded: `probe_rocm_install` reports SUSE via its `rpm -q`
+    // branch, so it always yields "dnf", never "zypper". "none" is excluded
+    // too: this scenario plants an install, so "none" would mean the planted
+    // install went undetected, which is the regression this scenario exists
+    // to catch, not a value it should tolerate.
+    assert!(
+        matches!(method, "apt" | "dnf" | "repo-native" | "runfile-or-tarball"),
+        "expected a current rocm_install_method name, got {method:?}: {json}"
+    );
 }
 
 #[when("the user inspects the system both for reading and for scripting")]
@@ -1508,6 +1541,12 @@ async fn assert_reported_distribution(
     assert_eq!(inspection_str(&json, "/summary/distro"), name, "{json:#}");
 }
 
+#[then(expr = "the inspection reports the distribution family {string}")]
+async fn assert_reported_distribution_family(world: &mut E2eWorld, like: String) {
+    let json = parsed_json(world);
+    assert_eq!(inspection_str(&json, "/distro_id_like"), like, "{json:#}");
+}
+
 #[then("the inspection reports no trouble reading the release file")]
 async fn assert_os_release_read_cleanly(world: &mut E2eWorld) {
     let json = parsed_json(world);
@@ -1935,5 +1974,91 @@ async fn assert_partial_snapshot_note_names_the_monitor_timeout(world: &mut E2eW
         length <= MAX_NOTE_CHARS,
         "this note travels to the same automation and audit logs as examine-25's, so it needs \
          the same bound, but amd-smi's {STUB_GPU_COUNT}-GPU payload produced {length} characters"
+    );
+}
+
+// ── Windows display driver ─────────────────────────────────────────
+
+/// The first day not counted as older: the release of the first HIP SDK for
+/// Windows, `FIRST_HIP_SDK_FOR_WINDOWS` in `rocm_core::windows_driver`.
+///
+/// Repeated here on purpose. The step judges the CLI's verdict against the day
+/// the documentation names, so a verdict computed from a drifted constant would
+/// not agree with it. Dates are `yyyy-MM-dd`, which order as text.
+const FIRST_HIP_SDK_FOR_WINDOWS_DAY: &str = "2023-07-27";
+
+/// The driver record the machine-readable form carries, if it carries one.
+pub(crate) fn windows_driver_record(json: &serde_json::Value) -> Option<&serde_json::Value> {
+    json.pointer("/summary/driver/windows")
+}
+
+/// What the machine-readable form says about the driver's age, worked out from
+/// its date and not from the verdict it carries, so the verdict can be held
+/// against it.
+fn age_expected_from_date(record: &serde_json::Value) -> &'static str {
+    match record.get("date").and_then(serde_json::Value::as_str) {
+        None => "unknown",
+        Some(date) if date < FIRST_HIP_SDK_FOR_WINDOWS_DAY => "predates_first_hip_sdk",
+        Some(_) => "not_older",
+    }
+}
+
+#[then(
+    "the inspection reports the display driver's version and date as the machine-readable form does"
+)]
+async fn assert_examine_reports_driver_version_and_date(world: &mut E2eWorld) {
+    let json = parsed_json(world);
+    let text = world.cli_stderr.as_ref().expect("no readable inspection");
+    let record = windows_driver_record(&json).unwrap_or_else(|| {
+        panic!("the machine-readable form carries no Windows driver record:\n{json:#}")
+    });
+    let version = record
+        .get("version")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    assert!(!version.is_empty(), "{record:#}");
+    assert_eq!(field_value(text, "driver_version"), Some(version), "{text}");
+    // A version with no date would map to "unknown", and the age steps of this
+    // scenario, `diagnose-41` and `driver-install-04` would all stay green on
+    // it. The probe reads the date from the same device record as the
+    // version, so on the lane it must be there.
+    let date = record
+        .get("date")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        date.len() == 10 && date.as_bytes()[4] == b'-' && date.as_bytes()[7] == b'-',
+        "a driver version was read but no yyyy-MM-dd date came with it: {record:#}"
+    );
+    assert_eq!(field_value(text, "driver_date"), Some(date), "{text}");
+}
+
+#[then("the inspection calls the driver old only when its date is before 27 July 2023")]
+async fn assert_examine_driver_age_follows_the_date(world: &mut E2eWorld) {
+    let json = parsed_json(world);
+    let text = world.cli_stderr.as_ref().expect("no readable inspection");
+    let record = windows_driver_record(&json)
+        .unwrap_or_else(|| panic!("no Windows driver record in the machine-readable form"));
+    let expected = age_expected_from_date(record);
+    assert_eq!(
+        record.get("age").and_then(serde_json::Value::as_str),
+        Some(expected),
+        "the machine-readable verdict does not follow the driver date:\n{record:#}"
+    );
+    let age = field_value(text, "driver_age").unwrap_or_else(|| panic!("no driver_age:\n{text}"));
+    let expected_start = match expected {
+        "predates_first_hip_sdk" => "older than the first HIP SDK for Windows",
+        "not_older" => "not older than the first HIP SDK for Windows",
+        _ => "unknown",
+    };
+    assert!(
+        age.starts_with(expected_start),
+        "driver_age should start with {expected_start:?} for {record:#}, got: {age}"
+    );
+    // Whatever the verdict, the text says the minimum is not established. It
+    // must never present the date as a compatibility requirement.
+    assert!(
+        expected == "unknown" || age.contains("not established"),
+        "{age}"
     );
 }

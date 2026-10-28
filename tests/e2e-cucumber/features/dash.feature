@@ -646,11 +646,14 @@ Feature: Interactive dashboard
   # cramped 80x24 case is covered by the unit test in
   # `crates/rocm-dash-tui/src/ui/examine_manager.rs`.
   #
-  # The scenario never presses `s` and never approves a send, so no mail client
-  # is ever opened from a test. The approve and decline paths, and the promise
-  # that no send starts before an approve, are asserted where the key sequence
-  # can be driven directly: the unit tests in
-  # `crates/rocm-dash-tui/src/ui/examine_manager.rs`.
+  # The scenario opens the send review with `s` and then declines it. It never
+  # approves, so no mail client is ever opened from a test. What the review must
+  # say before anyone can approve is checked here: the mail goes from the user's
+  # own account and carries their address, stated above the report so it is on
+  # screen with Approve. On a lane where the CLI refused, `s` opens nothing, and
+  # that is checked instead. The approve path, and the promise that no send
+  # starts before an approve, are asserted where the key sequence can be driven
+  # directly: the unit tests in `crates/rocm-dash-tui/src/ui/examine_manager.rs`.
   @id:dash-doctor-report-is-reviewed-before-sending @requires-os:linux
   Scenario: dash-38 - A user reviews a Doctor report in the dashboard before anything is sent
     When the user opens the dashboard with demo data
@@ -660,6 +663,9 @@ Feature: Interactive dashboard
     Then the report is displayed for review
     When the user leaves the report review
     Then the dashboard offers to send a report only if the CLI prepared one
-    When the user closes the Diagnose screen
+    When the user asks to review the report for sending
+    Then the review says the mail carries the user's own address before showing the report
+    When the user declines the send
+    And the user closes the Diagnose screen
     And the user quits the dashboard
     Then the dashboard exits successfully
