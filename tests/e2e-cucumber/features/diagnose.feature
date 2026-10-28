@@ -654,12 +654,86 @@ Feature: Diagnosing failures and listing fixes
     Then the stale repo cause names both planted repo files and the driver reinstall command
     And the advised driver reinstall command accepts the flags it is advised with
 
+  # The verify line of the MSVC runtime fix is shown to users of Windows
+  # PowerShell 5.1 and of cmd. `&&` and `||` are syntax errors in the first, a
+  # bare `where` is `Where-Object` there, it does not expand `%NAME%`, and in a
+  # `powershell -Command "..."` body it takes neither `\"` as an escaped quote
+  # nor `$_` (the outer shell expands it).
+  # Deliberately not OS-gated: the plan is printed before the fix's platform
+  # gate, so the text is the same on every lane, and the scenario asserts the
+  # printed lines and not the exit code. It does not run the line. The test
+  # `the_msvc_verify_runs_in_cmd_and_powershell` in
+  # crates/rocm-core/src/fix.rs does that, and only on Windows.
+  @id:diagnose-msvc-verify-line-text-is-powershell-safe
+  Scenario: diagnose-43 - The lines printed for the MSVC runtime fix avoid the constructs known to break in Windows PowerShell, and the verify line is a PowerShell command
+    Given a user who has chosen the fix for the missing MSVC runtime
+    When the user previews that fix without applying it
+    Then the printed commands and verify line avoid the constructs known to break in Windows PowerShell
+    And the printed verify command is a PowerShell command that selects FileVersion
+
+  # The same check for the two other fixes whose lines are shown on Windows
+  # and were written for one shell: the override fix's verify line used
+  # `env | grep ... ||`, and the PATH fix's verify line used `rocminfo | head
+  # && ...`. The override fix's Linux line is `echo "${HSA_OVERRIDE_GFX_VERSION:-OK_UNSET}"`:
+  # it has no `||`, which the rule refuses on a line a Windows user sees, and it
+  # needs no `python`, which a stock Ubuntu lacks. The override fix also used to print `setx HSA_OVERRIDE_GFX_VERSION ""`,
+  # and Windows PowerShell 5.1 drops the empty argument, so setx failed with
+  # "Invalid syntax" and cleared nothing; the step refuses an empty-string
+  # argument too. Text only, like diagnose-43. `the_override_verify_runs_in_cmd_and_powershell`
+  # in crates/rocm-core/src/fix.rs runs the override verify line, on Windows.
+  # These three scenarios see what `rocm fix <id> --dry-run` prints from the
+  # catalog. The `Fix` values `rocm diagnose` builds for Windows are held to the
+  # same text rule by `windows_diagnosis_remediation_passes_the_powershell_text_rule`
+  # in crates/rocm-core/src/diagnose.rs, and a printed line the rule passes is
+  # still not proven to run: the Windows-only tests named above do that.
+  @id:diagnose-override-fix-lines-are-powershell-safe
+  Scenario: diagnose-44 - The lines printed for the GPU override fix avoid the constructs known to break in Windows PowerShell
+    Given a user who has chosen the fix for the GPU override
+    When the user previews that fix without applying it
+    Then the printed commands and verify line avoid the constructs known to break in Windows PowerShell
+    And the printed Linux verify line reads the override without needing Python
+    And the printed notes say a stock Linux install has python3 and not python
+
+  @id:diagnose-path-fix-lines-are-powershell-safe
+  Scenario: diagnose-45 - The lines printed for the PATH fix avoid the constructs known to break in Windows PowerShell
+    Given a user who has chosen the fix for ROCm missing from PATH
+    When the user previews that fix without applying it
+    Then the printed commands and verify line avoid the constructs known to break in Windows PowerShell
+    And the printed Linux verify line shows the GPU without needing a compiler
+    And the printed notes say a runtime-only Linux install has no hipcc
+
+  # The three scenarios above see `rocm fix <id> --dry-run`, which prints the
+  # catalog's lines. `rocm diagnose` builds its own `Fix` values and prints the
+  # verify line from them, so the line a user reads after a diagnosis is checked
+  # here, on Linux, where it can be told apart from the catalog's by running
+  # the binary. The exact line is asserted, and that it names `python3`: a stock
+  # Ubuntu has no `python`. Text only: the line is run by
+  # `the_override_fix_verify_runs_where_only_python3_exists` in
+  # crates/rocm-core/src/diagnose.rs, on Unix hosts. The Windows arms of these
+  # printed lines are held by `windows_diagnosis_remediation_passes_the_powershell_text_rule`
+  # (text) and the Windows-only `*_verify_runs_*` tests in
+  # crates/rocm-core/src/fix.rs (run); there is no Windows scenario for them.
+  @id:diagnose-override-verify-line-names-python3 @requires-os:linux
+  Scenario: diagnose-46 - The verify line printed for the GPU override cause reads the override and uses python3
+    Given a Linux machine whose shell has a GPU override set
+    When the user diagnoses that machine with a page fault symptom
+    Then the override cause prints a verify line that reads the override and checks torch with python3
+
+  # The fix-6 Linux arm used to chain `hipcc --version` after `rocminfo`, which
+  # fails on a runtime-only install even with PATH fixed. The host is simulated
+  # as in diagnose-40 and the symptom is what raises the cause.
+  @id:diagnose-path-verify-line-is-rocminfo-alone @requires-os:linux
+  Scenario: diagnose-47 - The verify line printed for the PATH cause is rocminfo alone, with no hipcc
+    Given a simulated Linux machine with ROCm missing from PATH
+    When the user diagnoses that machine with a rocminfo not found symptom
+    Then the PATH cause prints a verify line that shows the GPU with rocminfo alone
+
   # Expected to FAIL. `diagnose` and `fix` are two views of the same remedy: the
   # first tells the user what will put the machine right, while the second is the
   # command they are told to run. They must not leave the user with two different
   # definitions of what proves the remedy worked.
   @id:diagnose-and-fix-agree-on-how-to-verify @requires-os:linux @requires-bare-metal
-  Scenario: diagnose-43 - Diagnosing a problem and previewing its fix agree on how to verify it
+  Scenario: diagnose-48 - Diagnosing a problem and previewing its fix agree on how to verify it
     Given a user who hit a device-permission failure
     When the user compares the diagnosis with the matching fix preview
     Then both give the same way to verify that the fix worked
@@ -671,17 +745,17 @@ Feature: Diagnosing failures and listing fixes
   # (the lookup failure now falls back to the conventional group), so this ships
   # as a guard rather than an expected failure.
   @id:diagnose-commands-name-a-real-group @requires-gpu @requires-bare-metal @requires-os:linux
-  Scenario: diagnose-44 - Every group named in a diagnosis is one the machine recognises
+  Scenario: diagnose-49 - Every group named in a diagnosis is one the machine recognises
     Given the GPU device belongs to a group the machine cannot name
     When the user asks the CLI to diagnose a device-permission failure
     Then every group named in the remedy exists on the machine
 
   # Expected to FAIL on a bare-metal GPU host whose device group is not the
   # hard-coded default. The diagnosis promises one command and its matching fix
-  # previews another. This is distinct from scenario diagnose-43:
+  # previews another. This is distinct from scenario diagnose-48:
   # even after the verify text agrees, the actual change must agree too.
   @id:diagnose-and-fix-agree-on-the-remedy-command @requires-gpu @requires-bare-metal @requires-os:linux
-  Scenario: diagnose-45 - Diagnosing a problem and previewing its fix agree on the remedy command
+  Scenario: diagnose-50 - Diagnosing a problem and previewing its fix agree on the remedy command
     Given the GPU device belongs to a recognised non-default group
     When the user compares the diagnosis with the matching fix preview
     Then both give the same command for applying the remedy
@@ -691,7 +765,7 @@ Feature: Diagnosing failures and listing fixes
   # not the outcome. A diagnosis should credit the observable access the user
   # has instead of recommending a permission repair for a usable device.
   @id:diagnose-credits-a-usable-device @requires-gpu @requires-bare-metal @requires-os:linux
-  Scenario: diagnose-46 - A usable GPU device is not diagnosed as a permission failure
+  Scenario: diagnose-51 - A usable GPU device is not diagnosed as a permission failure
     Given the user can already read and write the GPU device
     When the user asks the CLI to diagnose the machine
     Then adding the user to a device group is not offered as a cause

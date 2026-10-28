@@ -337,9 +337,11 @@ pub fn unix_time_millis() -> u128 {
         .as_millis()
 }
 
-/// Replace `path`'s content by writing a sibling temp file and renaming it
-/// over the destination: an interrupted write (full disk, crash, killed
-/// process) can never leave a truncated file in place, and a reader sees
+/// Replace `path`'s content with `bytes`, atomically.
+///
+/// Writes a sibling temp file and renames it over the destination: an
+/// interrupted write (full disk, crash, killed process) can never leave a
+/// truncated file in place, and a reader sees
 /// either the old content or the new content. The destination is NOT removed
 /// first: `fs::rename` replaces an existing file on both supported platforms
 /// (it is `MoveFileEx` with `MOVEFILE_REPLACE_EXISTING` on Windows), and
@@ -354,12 +356,26 @@ pub fn unix_time_millis() -> u128 {
 /// temp file and losing one of the two updates.
 ///
 /// Not guaranteed:
+/// - Serializing writers: this takes no lock, so two read-modify-write
+///   cycles that overlap still lose one update (last rename wins). A caller
+///   whose new content depends on the old must hold a lock across the whole
+///   cycle, as the JSONL proposal store does (`automation::jsonl_lock_path`).
+///   Two callers in the *same process* within the same millisecond are a
+///   sharper case of this, not just a milder one: they generate the exact
+///   same temp path below, so concurrent `fs::write`s truncating that one
+///   path can publish mixed bytes, and the losing rename then fails outright
+///   (its source file already gone) rather than merely losing an update —
+///   this is the same-process collision
+///   `automation::tests::concurrent_appends_from_many_threads_lose_no_records`'s
+///   own comment describes ("two threads of one process even shared a
+///   temp-file name") — fixed for its own callers by the per-store lock
+///   `automation.rs` takes before ever calling into this function.
 /// - Durability: the bytes are not fsynced before the rename, so a power
 ///   loss can still surface the new name with unflushed contents.
 /// - Replacing a destination another process holds open without delete
 ///   sharing: on Windows the rename then fails with a sharing violation,
 ///   this returns that error, and the old destination stays in place.
-pub(crate) fn write_atomic(path: &Path, bytes: &[u8], tmp_ext: &str) -> Result<()> {
+pub fn write_atomic(path: &Path, bytes: &[u8], tmp_ext: &str) -> Result<()> {
     let tmp_path = path.with_extension(format!(
         "{tmp_ext}.tmp-{}-{}",
         unix_time_millis(),

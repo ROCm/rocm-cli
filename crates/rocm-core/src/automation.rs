@@ -8,21 +8,37 @@
 //! the running daemon's live snapshot (`AutomationRuntimeState`), the
 //! logically append-only JSONL stores for watcher action events
 //! (`AutomationEventRecord`), audit log entries, and review proposals, and
-//! the accessors used to read them back. Every write to the JSONL stores —
-//! an appended record or a full rewrite on proposal status update — goes
-//! through `write_atomic`, so a crash or full disk mid-write never leaves a
-//! truncated store. `AutomationTriggerEvent` is also defined here, but this
-//! module persists none of it: it is the in-memory trigger type passed
-//! between `rocmd`'s watcher and webhook plumbing (`apps/rocmd/src/watchers.rs`,
+//! the accessors used to read them back.
+//!
+//! The `rocm` CLI and `rocmd` write these stores concurrently, so every
+//! mutation of a store holds its sibling `.lock` file (see `jsonl_lock_path`).
+//! Appending a record is, in the common case, one append-mode write of one
+//! line — its cost does not grow with the store. A torn tail — crash debris,
+//! or left by a write that failed partway — is cut by the next append rather
+//! than truncated in place: that append writes the store's clean prefix plus
+//! its own new record as a single rewrite via `write_atomic`, so a lock-free
+//! reader never observes a file shrunk mid-repair. That rewrite costs O(store)
+//! rather than O(record), the same as a proposal status update, which rewrites
+//! the whole store via `write_atomic` too. Nothing in this module ever
+//! shrinks a store in place. Readers take no lock, and an unterminated last
+//! line that is not valid JSON — an append caught mid-write — is skipped
+//! rather than reported as corruption. The stores are not rotated or capped.
+//!
+//! `AutomationTriggerEvent` is also defined here, but this module persists
+//! none of it: it is the in-memory trigger type passed between `rocmd`'s
+//! watcher and webhook plumbing (`apps/rocmd/src/watchers.rs`,
 //! `apps/rocmd/src/webhook.rs`), never serialized.
 
 use anyhow::{Context, Result, bail};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::Path;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::AppPaths;
+use crate::FileLock;
 use crate::WatcherMode;
 use crate::require_nonempty;
 use crate::unix_time_millis;
@@ -207,48 +223,495 @@ pub struct AuditEventRecord {
     pub service_id: Option<String>,
 }
 
-/// Append one JSONL `record` to `path`: read the existing content (if any),
-/// append the serialized record plus a newline, and replace the file via
-/// `write_atomic`.
-fn append_jsonl_record<T: Serialize>(path: &Path, record: &T, context_label: &str) -> Result<()> {
-    let mut line = serde_json::to_string(record)
-        .with_context(|| format!("failed to serialize {context_label}"))?;
-    line.push('\n');
-    let mut existing = if path.is_file() {
-        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?
-    } else {
-        String::new()
-    };
-    existing.push_str(&line);
-    crate::write_atomic(path, existing.as_bytes(), "jsonl")
+/// Lock file serializing every mutation of the JSONL store at `path` — a
+/// sibling named `<store file name>.lock` (e.g. `events.jsonl.lock`).
+///
+/// Appends and the proposal-status rewrite both take it. The proposal
+/// rewrite needs it for its read-modify-write; an append needs it both to
+/// serialize against other appends and because it can itself become a
+/// rewrite — a torn tail is repaired by renaming a new file over the store
+/// (see [`TailState::Torn`]) — and an append that had already opened the old
+/// file would otherwise land in the replaced copy and vanish.
+fn jsonl_lock_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".lock");
+    path.with_file_name(name)
 }
 
-/// Read every JSONL record from `path` and keep only the most recent `limit`
-/// (in on-disk order). Returns an empty vec when `path` doesn't exist yet or
-/// `limit` is `0`.
-fn load_recent_jsonl_records<T: serde::de::DeserializeOwned>(
+/// How many bytes the backward scans below read per step.
+const JSONL_SCAN_CHUNK: u64 = 64 * 1024;
+
+/// Append one JSONL `record` to `path`, creating the file if needed.
+///
+/// Holds the store's [`jsonl_lock_path`] lock. The common case — the store
+/// already ends on a line boundary — is a single append-mode write of one
+/// line, so the cost no longer grows with the store and a concurrent writer
+/// can never drop this record (or have its own record dropped by this one),
+/// across threads and processes alike.
+///
+/// A write that fails partway leaves whatever it already wrote as a new torn
+/// tail — the same debris a killed writer leaves — rather than rolling it
+/// back, and the debris itself is discarded by the *next* append rather than
+/// being cut first as a separate step — see [`inspect_tail`] and
+/// [`TailState::Torn`]. A reader already skips the debris in the meantime.
+/// Nothing in this function ever truncates the live file, so a lock-free
+/// reader never observes it shrink.
+///
+/// [`append_or_tolerate_a_missing_newline`] checks whether a failed write
+/// landed anyway before reporting it, so a write that fails but still lands
+/// a complete record is reported as `Ok`, not `Err`. Seeing `Err` here
+/// usually does mean the record did not land — with one case where that's
+/// not knowable rather than false: if the write itself fails *and* the
+/// follow-up check of what actually landed also fails (a second I/O fault
+/// on the same unhealthy disk, say), the original write failure is reported
+/// without knowing whether the record landed anyway. A caller that retries
+/// on `Err` in that specific, low-likelihood case could write a duplicate
+/// the store has no way to detect or remove.
+fn append_jsonl_record<T: Serialize>(path: &Path, record: &T, context_label: &str) -> Result<()> {
+    let mut line = serde_json::to_vec(record)
+        .with_context(|| format!("failed to serialize {context_label}"))?;
+    line.push(b'\n');
+
+    let _lock = FileLock::acquire(jsonl_lock_path(path))?;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .append(true)
+        .create(true)
+        .open(path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    match inspect_tail(path, &file)? {
+        TailState::Torn(tail_start) => {
+            // A torn tail is debris — crash or a failed write — that must be
+            // cut before this record lands. Cutting it in place and then
+            // appending as a second step would briefly shrink the file for
+            // any lock-free reader mid-scan, and regrowing it afterward can
+            // make that scan splice bytes read at two different moments into
+            // something that parses as a record nobody wrote (the hazard
+            // `ReverseLines::next_line`'s short-read guard exists for).
+            // Replacing the whole file atomically instead means a reader
+            // only ever sees the pre-repair length or this append's, never a
+            // length in between.
+            let mut content = read_range(path, &file, 0, tail_start)?;
+            content.extend_from_slice(&line);
+            // Done with the pre-repair file's handle before replacing it,
+            // rather than leaving that to whatever happens to still have
+            // `file` open at function return. The rename already succeeds
+            // with this handle open regardless — std opens files with
+            // `FILE_SHARE_DELETE` by default on Windows, so a rename isn't
+            // blocked by it (see `write_atomic`'s doc for the case that
+            // *isn't* covered: another process holding the destination open
+            // without delete-sharing) — but this states the intent rather
+            // than leaning on that default.
+            drop(file);
+            crate::write_atomic(path, &content, "jsonl")?;
+        }
+        TailState::ValidUnterminated(start) => {
+            line.insert(0, b'\n');
+            append_or_tolerate_a_missing_newline(path, &file, &line, start)?;
+        }
+        TailState::Clean(start) => {
+            append_or_tolerate_a_missing_newline(path, &file, &line, start)?;
+        }
+    }
+    Ok(())
+}
+
+/// Append-mode write of `line`, starting at offset `start`.
+///
+/// A write can fail after landing every byte of `line` except its final
+/// `\n` (e.g. the disk fills up one byte short). That is not torn debris:
+/// it is a complete, valid record, and readers already treat a complete
+/// record missing only its trailing newline as fully stored (see
+/// `readers_keep_an_unterminated_last_line_that_parses`). Reporting that as
+/// a failure would tell a caller that retries on error to write the same
+/// record again, leaving a duplicate the store has no way to detect or
+/// remove — so this checks what actually landed before deciding.
+///
+/// That check can itself fail (stat or read-back hits its own I/O error),
+/// in which case this reports the original write failure without knowing
+/// whether the record landed anyway — the one case where `Err` here does
+/// not guarantee the record is absent (see [`append_jsonl_record`]'s doc).
+fn append_or_tolerate_a_missing_newline(
+    path: &Path,
+    file: &fs::File,
+    line: &[u8],
+    start: u64,
+) -> Result<()> {
+    let mut file = file;
+    let Err(error) = file.write_all(line) else {
+        return Ok(());
+    };
+    let landed = (|| -> Result<Vec<u8>> {
+        let end = file
+            .metadata()
+            .with_context(|| format!("failed to stat {}", path.display()))?
+            .len()
+            .max(start);
+        read_range(path, file, start, end)
+    })();
+    match landed {
+        Ok(landed) if landed_despite_the_error(&landed, line) => Ok(()),
+        Ok(_) => Err(error).with_context(|| format!("failed to append to {}", path.display())),
+        // The write itself is still the more informative failure (e.g. the
+        // disk is full); checking whether it landed anyway is this
+        // function's own extra step, so losing that check is a detail
+        // folded into the same report rather than the headline error.
+        Err(check_error) => Err(error).with_context(|| {
+            format!(
+                "failed to append to {} ({check_error:#} while checking whether it landed anyway)",
+                path.display()
+            )
+        }),
+    }
+}
+
+/// Whether `landed` — the bytes a failed append-mode write actually put on
+/// disk, read back from where it started — show `line` arrived intact
+/// except possibly for its own trailing `\n`. Split out from
+/// [`append_or_tolerate_a_missing_newline`] so the decision itself can be
+/// tested without inducing a real write failure.
+fn landed_despite_the_error(landed: &[u8], line: &[u8]) -> bool {
+    let without_trailing_newline = &line[..line.len().saturating_sub(1)];
+    landed.len() >= without_trailing_newline.len()
+        && landed[..without_trailing_newline.len()] == *without_trailing_newline
+}
+
+/// How [`inspect_tail`] found the store's current last line, ahead of an
+/// append. The `Clean`/`ValidUnterminated` payload is the offset this
+/// append's own bytes will start at, used by
+/// [`append_or_tolerate_a_missing_newline`] to tell a complete record that
+/// merely failed to land its own trailing newline from one that is actually
+/// missing.
+enum TailState {
+    /// Empty, or already ends on a line boundary.
+    Clean(u64),
+    /// A complete record, or a blank (whitespace-only) line, lost its
+    /// trailing `\n` — to a hand edit, or to a write that landed every byte
+    /// except that final one; the new line needs a leading `\n`.
+    ValidUnterminated(u64),
+    /// Debris — crash, or a write that failed partway through a genuinely
+    /// incomplete record — starting at this offset. Must be cut before the
+    /// next record lands, but never by truncating in place — see
+    /// [`append_jsonl_record`].
+    Torn(u64),
+}
+
+/// Classify the store's current last line ahead of an append.
+///
+/// Must be called with the store's lock held, so no other writer is
+/// mid-write and an unterminated last line is either debris (not valid JSON,
+/// cut off — a writer killed mid-write, or one whose own append failed
+/// partway) or a complete record or blank line whose newline was lost to a
+/// hand edit or a write that failed one byte short (kept and terminated).
+fn inspect_tail(path: &Path, file: &fs::File) -> Result<TailState> {
+    let len = file
+        .metadata()
+        .with_context(|| format!("failed to stat {}", path.display()))?
+        .len();
+    // The common case — empty, or ending on a line boundary — costs one byte.
+    if len == 0 || read_range(path, file, len - 1, len)? == b"\n" {
+        return Ok(TailState::Clean(len));
+    }
+    // The segment after the last `\n` is exactly `ReverseLines`'s first line,
+    // so reuse its backward scan rather than re-implementing it here.
+    let (tail_start, tail) = ReverseLines::new(path, file, len, JSONL_SCAN_CHUNK)
+        .next_line()?
+        .unwrap_or_default();
+    if tail.is_empty() {
+        return Ok(TailState::Clean(len));
+    }
+    if is_blank(&tail) || !is_torn_record(&tail) {
+        return Ok(TailState::ValidUnterminated(len));
+    }
+    Ok(TailState::Torn(tail_start))
+}
+
+/// Read bytes `[start, end)` of `file`.
+///
+/// Returns fewer bytes if the file now ends before `end`. Nothing this
+/// module's own writers do can shrink a store in place — an append only ever
+/// grows it, and a torn-tail repair replaces it wholesale via `write_atomic`
+/// rather than truncating the live file (see [`inspect_tail`] and
+/// [`TailState::Torn`]) — so a short read here means the store was edited or
+/// truncated out-of-band, a case this module does not try to recover from
+/// cleanly. Most callers treat what is still there the same as any other
+/// unexpectedly-ending tail; [`ReverseLines`] is the one exception, and
+/// reports an error instead once it would have to splice such a read onto
+/// bytes it already read, rather than risk inventing a line.
+fn read_range(path: &Path, file: &fs::File, start: u64, end: u64) -> Result<Vec<u8>> {
+    let mut reader = file;
+    reader
+        .seek(SeekFrom::Start(start))
+        .with_context(|| format!("failed to seek in {}", path.display()))?;
+    let mut bytes = Vec::new();
+    reader
+        .take(end - start)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    Ok(bytes)
+}
+
+/// Parse a whole JSONL store, pairing each record with its line index.
+///
+/// Readers take no lock, so one may catch an append mid-write: a last line
+/// with no terminating `\n` that is not valid JSON is that in-flight (or
+/// crash-torn) record, and is skipped rather than failing the whole read. Any
+/// other unparseable line is still an error.
+///
+/// Works on bytes, not a `String`: a record cut mid-write can end inside a
+/// multi-byte UTF-8 character, which would fail a whole-file UTF-8 decode
+/// before the skip could apply.
+fn parse_jsonl_records<T: DeserializeOwned>(
+    bytes: &[u8],
+    path: &Path,
+    context_label: &str,
+) -> Result<Vec<(usize, T)>> {
+    // Redundant with "this is the last split segment and it's non-blank"
+    // below (splitting on `\n` makes the final segment empty exactly when
+    // `bytes` ends in one, so a non-blank final segment can only occur when
+    // it doesn't) — kept spelled out because it states directly what that
+    // arm is for, rather than leaning on the split/is_blank interaction to
+    // prove it.
+    let unterminated = !bytes.is_empty() && !bytes.ends_with(b"\n");
+    let line_count = bytes.split(|&byte| byte == b'\n').count();
+    let mut records = Vec::new();
+    for (index, line) in bytes.split(|&byte| byte == b'\n').enumerate() {
+        if is_blank(line) {
+            continue;
+        }
+        match serde_json::from_slice::<T>(line) {
+            Ok(record) => records.push((index, record)),
+            Err(_) if unterminated && index + 1 == line_count && is_torn_record(line) => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to parse {context_label} in {}", path.display())
+                });
+            }
+        }
+    }
+    Ok(records)
+}
+
+/// Read the most recent `limit` JSONL records from `path`, in on-disk order.
+/// Returns an empty vec when `path` doesn't exist yet or `limit` is `0`.
+///
+/// Scans backwards from the end of the file and stops once it has `limit`
+/// records, so the cost tracks `limit`, not the size of the store; a corrupt
+/// line older than those records is therefore not reported. As in
+/// [`parse_jsonl_records`], an unterminated last line that is not valid JSON is
+/// an append caught mid-write and is skipped.
+///
+/// The scan takes no lock. A concurrent append only ever grows the file (see
+/// [`append_jsonl_record`]); nothing this module's own writers do shrinks it
+/// in place. The retry below is for a store edited or truncated out-of-band
+/// — by a person, not a concurrent writer — while a scan is in flight: a
+/// scan that fails while the file's length moved under it is retried from
+/// the new end, so that still never surfaces as an error.
+fn load_recent_jsonl_records<T: DeserializeOwned>(
     path: &Path,
     limit: usize,
     context_label: &str,
 ) -> Result<Vec<T>> {
+    const ATTEMPTS: usize = 3;
     if !path.is_file() || limit == 0 {
         return Ok(Vec::new());
     }
-    let text =
-        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
-    let mut records = Vec::new();
-    for line in text.lines() {
-        if line.trim().is_empty() {
-            continue;
+    let file =
+        fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let file_len = || {
+        file.metadata()
+            .map(|metadata| metadata.len())
+            .with_context(|| format!("failed to stat {}", path.display()))
+    };
+    let mut attempt = 1;
+    loop {
+        let len = file_len()?;
+        match scan_recent_jsonl_records(path, &file, len, limit, context_label) {
+            Err(_) if attempt < ATTEMPTS && file_len()? != len => attempt += 1,
+            outcome => return outcome,
         }
-        let record = serde_json::from_str::<T>(line)
-            .with_context(|| format!("failed to parse {context_label} in {}", path.display()))?;
-        records.push(record);
     }
-    if records.len() > limit {
-        records.drain(0..records.len() - limit);
+}
+
+/// One backward scan of [`load_recent_jsonl_records`], over the first `len`
+/// bytes of `file`.
+fn scan_recent_jsonl_records<T: DeserializeOwned>(
+    path: &Path,
+    file: &fs::File,
+    len: u64,
+    limit: usize,
+    context_label: &str,
+) -> Result<Vec<T>> {
+    let mut lines = ReverseLines::new(path, file, len, JSONL_SCAN_CHUNK);
+    let parse = |line: &[u8]| {
+        serde_json::from_slice::<T>(line)
+            .with_context(|| format!("failed to parse {context_label} in {}", path.display()))
+    };
+    let mut records = Vec::new();
+    // The first segment is whatever follows the last `\n`: empty when the
+    // file ends on a line boundary, else an unterminated last line.
+    if let Some((_, tail)) = lines.next_line()?
+        && !is_blank(&tail)
+        && !is_torn_record(&tail)
+    {
+        records.push(parse(&tail)?);
     }
+    while records.len() < limit {
+        let Some((_, line)) = lines.next_line()? else {
+            break;
+        };
+        if !is_blank(&line) {
+            records.push(parse(&line)?);
+        }
+    }
+    // No-op today: the loop above never pushes past `limit`, and the one
+    // production caller (`load_recent_jsonl_records`) already refuses
+    // `limit == 0` before calling in. Kept as a guard against a future
+    // direct caller that skips that guard — the tail-line push above the
+    // loop isn't itself gated by `limit`, so it would return one record for
+    // `limit == 0` without this.
+    records.truncate(limit);
+    records.reverse();
     Ok(records)
+}
+
+fn is_blank(line: &[u8]) -> bool {
+    line.iter().all(u8::is_ascii_whitespace)
+}
+
+/// Whether an unterminated last line is a record cut off mid-write, as
+/// opposed to a complete one that merely lost its `\n` (e.g. to a hand edit).
+///
+/// The test is "not valid JSON", not "not a valid record": a cut-off JSON
+/// object never parses, while complete JSON of the wrong shape is real data —
+/// readers report it as before, and writers keep it rather than cut it.
+fn is_torn_record(line: &[u8]) -> bool {
+    serde_json::from_slice::<serde::de::IgnoredAny>(line).is_err()
+}
+
+/// Yields the `\n`-separated segments of a file from last to first, reading
+/// it backwards in fixed-size chunks. The first segment yielded is the one
+/// after the final `\n` (empty when the file ends with one).
+///
+/// How many chunks get read depends on the file's `\n` layout, not just its
+/// length: a single line longer than `chunk` is rescanned from its own start
+/// on every subsequent chunk read until its leading `\n` is found (each read
+/// re-prepends onto the same growing `pending`), so one pathologically long
+/// line costs O(length² / chunk) rather than O(length). Fine for this
+/// module's records and the deliberately oversized test cases below; a
+/// store whose lines could grow unbounded would need a different scan.
+struct ReverseLines<'a> {
+    path: &'a Path,
+    file: &'a fs::File,
+    chunk: u64,
+    /// File offset of `pending[0]`; everything before it is still unread.
+    pos: u64,
+    /// Bytes read but not yet yielded, i.e. file bytes `[pos, pos + len)`.
+    pending: Vec<u8>,
+    done: bool,
+}
+
+impl<'a> ReverseLines<'a> {
+    /// Read the first `len` bytes of `file` backwards, `chunk` bytes a step.
+    const fn new(path: &'a Path, file: &'a fs::File, len: u64, chunk: u64) -> Self {
+        Self {
+            path,
+            file,
+            chunk: if chunk == 0 { 1 } else { chunk },
+            pos: len,
+            pending: Vec::new(),
+            done: false,
+        }
+    }
+
+    /// Yields `(start, bytes)`: `start` is the returned line's absolute file
+    /// offset, derived from `self.pos` (which tracks real, current file
+    /// offsets as actually read) rather than from a length measured earlier
+    /// by the caller — which may be stale by the time a scan reaches it.
+    fn next_line(&mut self) -> Result<Option<(u64, Vec<u8>)>> {
+        if self.done {
+            return Ok(None);
+        }
+        loop {
+            // Scans from the end, so it stops at the nearest `\n`: a line is
+            // rescanned only when it is longer than one chunk.
+            if let Some(newline) = self.pending.iter().rposition(|&byte| byte == b'\n') {
+                let line = self.pending.split_off(newline + 1);
+                self.pending.truncate(newline);
+                let start = self.pos + newline as u64 + 1;
+                return Ok(Some((start, line)));
+            }
+            if self.pos == 0 {
+                self.done = true;
+                return Ok(Some((0, std::mem::take(&mut self.pending))));
+            }
+            let start = self.pos.saturating_sub(self.chunk);
+            #[cfg(test)]
+            test_hooks::before_scan_read(self.path);
+            let mut bytes = read_range(self.path, self.file, start, self.pos)?;
+            // A short read while `pending` is empty — nothing accumulated
+            // yet, whether from an earlier call or from this one — just
+            // means the store was edited or truncated out-of-band (see
+            // `read_range`); nothing a concurrent writer does can shrink it
+            // in place. Once `pending` holds any bytes, a short read means
+            // they no longer continue from it, so splicing them would
+            // invent a line.
+            if bytes.len() as u64 != self.pos - start && !self.pending.is_empty() {
+                bail!("{} shrank while it was being read", self.path.display());
+            }
+            bytes.append(&mut self.pending);
+            self.pending = bytes;
+            self.pos = start;
+        }
+    }
+}
+
+/// A seam for forcing an out-of-band shrink between two of `ReverseLines`'s
+/// own chunked reads, so a test can drive `load_recent_jsonl_records`'s
+/// retry-after-a-failed-scan path deterministically. Mirrors the
+/// path-keyed-callback pattern in `uv.rs`'s `test_hooks`, but each hook is
+/// one-shot and keyed by how many reads to let pass first: unlike an install
+/// download's single commit point, a scan's vulnerable read (the one where
+/// `pending` already holds bytes from an earlier read) is not the first one.
+#[cfg(test)]
+mod test_hooks {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, LazyLock, Mutex, PoisonError};
+
+    type Hook = Arc<dyn Fn() + Send + Sync>;
+
+    /// Keyed by path, value is (reads left to skip, hook to run at zero).
+    static BEFORE_SCAN_READ: LazyLock<Mutex<HashMap<PathBuf, (usize, Hook)>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    /// Run `hook` once, immediately before the `skip`-th subsequent physical
+    /// chunk read `ReverseLines` performs against `path` (`0` = the very next
+    /// read). Removed after it fires, so later reads of the same scan (or a
+    /// retried one) proceed unhooked.
+    pub(super) fn set_before_scan_read(path: &Path, skip: usize, hook: Hook) {
+        BEFORE_SCAN_READ
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(path.to_path_buf(), (skip, hook));
+    }
+
+    pub(super) fn before_scan_read(path: &Path) {
+        let mut hooks = BEFORE_SCAN_READ
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let Some((skip, hook)) = hooks.get_mut(path) else {
+            return;
+        };
+        if *skip > 0 {
+            *skip -= 1;
+            return;
+        }
+        let hook = Arc::clone(hook);
+        hooks.remove(path);
+        drop(hooks);
+        hook();
+    }
 }
 
 pub fn append_automation_event(paths: &AppPaths, event: &AutomationEventRecord) -> Result<()> {
@@ -286,19 +749,16 @@ pub fn load_automation_proposals(paths: &AppPaths) -> Result<Vec<AutomationPropo
     if !path.is_file() {
         return Ok(Vec::new());
     }
-    let text =
-        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
-    let mut proposals = Vec::new();
-    for (index, line) in text.lines().enumerate() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let mut proposal = serde_json::from_str::<AutomationProposalRecord>(line)
-            .with_context(|| format!("failed to parse proposal record in {}", path.display()))?;
-        normalize_proposal_identity(&mut proposal, index);
-        proposals.push(proposal);
-    }
-    Ok(proposals)
+    let bytes = fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    Ok(
+        parse_jsonl_records::<AutomationProposalRecord>(&bytes, &path, "proposal record")?
+            .into_iter()
+            .map(|(index, mut proposal)| {
+                normalize_proposal_identity(&mut proposal, index);
+                proposal
+            })
+            .collect(),
+    )
 }
 
 pub fn load_recent_automation_proposals(
@@ -324,6 +784,11 @@ pub fn find_automation_proposal(
         .with_context(|| format!("automation proposal `{proposal_id}` not found"))
 }
 
+/// Set one proposal's `status` by rewriting the proposals store.
+///
+/// The whole read-modify-write runs under the store's [`jsonl_lock_path`]
+/// lock, so a proposal appended (or another status set) meanwhile is neither
+/// dropped nor overwritten.
 pub fn update_automation_proposal_status(
     paths: &AppPaths,
     proposal_id: &str,
@@ -331,6 +796,8 @@ pub fn update_automation_proposal_status(
 ) -> Result<AutomationProposalRecord> {
     require_nonempty(proposal_id, "proposal_id")?;
     require_nonempty(status, "status")?;
+    paths.ensure()?;
+    let _lock = FileLock::acquire(jsonl_lock_path(&paths.automation_proposals_path()))?;
     let mut proposals = load_automation_proposals(paths)?;
     let Some(proposal) = proposals
         .iter_mut()
@@ -351,11 +818,12 @@ pub fn load_recent_audit_events(paths: &AppPaths, limit: usize) -> Result<Vec<Au
     load_recent_jsonl_records(&paths.audit_events_path(), limit, "audit event")
 }
 
+/// Replace the proposals store with `proposals`. The caller must hold the
+/// store's [`jsonl_lock_path`] lock.
 fn write_automation_proposals(
     paths: &AppPaths,
     proposals: &[AutomationProposalRecord],
 ) -> Result<()> {
-    paths.ensure()?;
     let path = paths.automation_proposals_path();
     let mut text = String::new();
     for proposal in proposals {
@@ -591,5 +1059,1153 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].action, "proposal_rejected");
         Ok(())
+    }
+
+    fn audit_record(tag: &str) -> AuditEventRecord {
+        AuditEventRecord {
+            at_unix_ms: 1,
+            source: "test".to_owned(),
+            category: "concurrency".to_owned(),
+            actor: "writer".to_owned(),
+            level: "info".to_owned(),
+            action: "append".to_owned(),
+            message: tag.to_owned(),
+            watcher_id: None,
+            service_id: None,
+        }
+    }
+
+    fn event_record(tag: &str) -> AutomationEventRecord {
+        AutomationEventRecord {
+            at_unix_ms: 1,
+            watcher_id: "gpu-metrics".to_owned(),
+            level: "info".to_owned(),
+            action: "record_gpu_metrics".to_owned(),
+            message: tag.to_owned(),
+            service_id: None,
+        }
+    }
+
+    fn proposal_record(tag: &str) -> AutomationProposalRecord {
+        AutomationProposalRecord {
+            at_unix_ms: 1,
+            proposal_id: tag.to_owned(),
+            watcher_id: "cache-warm".to_owned(),
+            action: "queue_prefetch_proposal".to_owned(),
+            title: "Prefetch".to_owned(),
+            message: tag.to_owned(),
+            status: "pending".to_owned(),
+            service_id: None,
+            tool: None,
+            arguments: serde_json::json!({}),
+            reviewed_at_unix_ms: None,
+        }
+    }
+
+    /// Append one record tagged `tag` to each of the three JSONL stores.
+    fn append_to_every_store(paths: &AppPaths, tag: &str) -> Result<()> {
+        append_audit_event(paths, &audit_record(tag))?;
+        append_automation_event(paths, &event_record(tag))?;
+        append_automation_proposal(paths, &proposal_record(tag))
+    }
+
+    /// The tags in each store, in on-disk order, read straight from the files
+    /// so a lost record cannot hide behind any loader's filtering.
+    fn tags_in_every_store(paths: &AppPaths) -> Result<[Vec<String>; 3]> {
+        let audit = fs::read_to_string(paths.audit_events_path())?
+            .lines()
+            .map(|line| serde_json::from_str::<AuditEventRecord>(line).map(|r| r.message))
+            .collect::<Result<Vec<_>, _>>()?;
+        let events = fs::read_to_string(paths.automation_events_path())?
+            .lines()
+            .map(|line| serde_json::from_str::<AutomationEventRecord>(line).map(|r| r.message))
+            .collect::<Result<Vec<_>, _>>()?;
+        let proposals = fs::read_to_string(paths.automation_proposals_path())?
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<AutomationProposalRecord>(line).map(|r| r.proposal_id)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok([audit, events, proposals])
+    }
+
+    fn assert_every_store_holds_exactly(stores: [Vec<String>; 3], expected: &[String]) {
+        let mut expected = expected.to_vec();
+        expected.sort();
+        for (store, mut tags) in ["audit", "events", "proposals"].into_iter().zip(stores) {
+            tags.sort();
+            assert_eq!(
+                tags.len(),
+                expected.len(),
+                "{store} store lost or duplicated records under concurrent writers"
+            );
+            assert_eq!(
+                tags, expected,
+                "{store} store holds the wrong set of records"
+            );
+        }
+    }
+
+    /// Run `writers` threads, each appending `appends_per_writer` tagged
+    /// records (`t<writer>-<n>`) to all three stores concurrently (a
+    /// `Barrier` lines them up so the appends actually overlap rather than
+    /// running one at a time), then return what each store actually holds
+    /// afterward. Shared by the two tests immediately below, which differ
+    /// only in what (if anything) was in the stores before this runs and in
+    /// what tags they expect alongside `t<writer>-<n>`.
+    fn run_concurrent_thread_appends(
+        paths: &AppPaths,
+        writers: usize,
+        appends_per_writer: usize,
+    ) -> Result<[Vec<String>; 3]> {
+        let barrier = std::sync::Barrier::new(writers);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..writers)
+                .map(|writer| {
+                    let (paths, barrier) = (paths, &barrier);
+                    scope.spawn(move || -> Result<()> {
+                        barrier.wait();
+                        for n in 0..appends_per_writer {
+                            append_to_every_store(paths, &format!("t{writer}-{n}"))?;
+                        }
+                        Ok(())
+                    })
+                })
+                .collect();
+            for handle in handles {
+                handle.join().expect("writer thread panicked")?;
+            }
+            Ok::<_, anyhow::Error>(())
+        })?;
+        tags_in_every_store(paths)
+    }
+
+    // Regression test for concurrent writers silently dropping each other's
+    // records: every append used to read the whole store, add one line in
+    // memory, and rename a rewritten copy over the original, so two writers
+    // that overlapped kept only the last rename (and two threads of one
+    // process even shared a temp-file name).
+    #[test]
+    fn concurrent_appends_from_many_threads_lose_no_records() -> Result<()> {
+        const WRITERS: usize = 8;
+        const APPENDS_PER_WRITER: usize = 25;
+        let (root, paths) = temp_app_paths("jsonl-concurrent-threads");
+        paths.ensure()?;
+        let stores = run_concurrent_thread_appends(&paths, WRITERS, APPENDS_PER_WRITER);
+
+        let expected: Vec<String> = (0..WRITERS)
+            .flat_map(|writer| (0..APPENDS_PER_WRITER).map(move |n| format!("t{writer}-{n}")))
+            .collect();
+        fs::remove_dir_all(root).ok();
+        assert_every_store_holds_exactly(stores?, &expected);
+        Ok(())
+    }
+
+    /// Seed each of the three stores with one clean record followed by the
+    /// same shape of torn tail a killed writer leaves: a cut-off JSON
+    /// fragment with no trailing newline.
+    fn seed_torn_tail_in_every_store(paths: &AppPaths) -> Result<()> {
+        paths.ensure()?;
+        let torn_audit = &audit_line("torn")[..20];
+        fs::write(
+            paths.audit_events_path(),
+            format!("{}\n{torn_audit}", audit_line("seed")),
+        )?;
+        let torn_event = &serde_json::to_string(&event_record("torn"))?[..20];
+        fs::write(
+            paths.automation_events_path(),
+            format!(
+                "{}\n{torn_event}",
+                serde_json::to_string(&event_record("seed"))?
+            ),
+        )?;
+        let torn_proposal = &serde_json::to_string(&proposal_record("torn"))?[..20];
+        fs::write(
+            paths.automation_proposals_path(),
+            format!(
+                "{}\n{torn_proposal}",
+                serde_json::to_string(&proposal_record("seed"))?
+            ),
+        )?;
+        Ok(())
+    }
+
+    // Regression test for the exact hazard jsonl_lock_path's own doc comment
+    // gives as its reason to exist: a torn-tail repair (the atomic-rename
+    // replace) racing a concurrent appender that already opened the
+    // pre-repair file. Neither existing concurrency test starts from a torn
+    // tail, so the Torn arm's rewrite path was never exercised concurrently
+    // until now.
+    #[test]
+    fn concurrent_appends_after_a_torn_tail_lose_no_records() -> Result<()> {
+        const WRITERS: usize = 8;
+        const APPENDS_PER_WRITER: usize = 25;
+        let (root, paths) = temp_app_paths("jsonl-torn-tail-concurrent");
+        seed_torn_tail_in_every_store(&paths)?;
+        let stores = run_concurrent_thread_appends(&paths, WRITERS, APPENDS_PER_WRITER);
+
+        let mut expected: Vec<String> = vec!["seed".to_owned()];
+        expected.extend(
+            (0..WRITERS)
+                .flat_map(|writer| (0..APPENDS_PER_WRITER).map(move |n| format!("t{writer}-{n}"))),
+        );
+        fs::remove_dir_all(root).ok();
+        assert_every_store_holds_exactly(stores?, &expected);
+        Ok(())
+    }
+
+    /// Env var that turns a re-exec of this test binary into one writer of
+    /// [`concurrent_appends_from_many_processes_lose_no_records`]: its value is
+    /// `<data_dir>|<writer index>`.
+    const CHILD_WRITER_ENV: &str = "ROCM_CORE_TEST_JSONL_CHILD_WRITER";
+    const PROCESS_APPENDS_PER_WRITER: usize = 20;
+
+    // Same regression as the thread test, across processes — the shape the
+    // stores actually see (the `rocm` CLI and `rocmd` both write the audit
+    // store, and both touch the proposals store).
+    #[test]
+    fn concurrent_appends_from_many_processes_lose_no_records() -> Result<()> {
+        const WRITERS: usize = 6;
+        if let Some(spec) = std::env::var_os(CHILD_WRITER_ENV) {
+            let spec = spec.to_string_lossy().into_owned();
+            let (data_dir, writer) = spec.split_once('|').context("malformed writer spec")?;
+            let paths = AppPaths {
+                config_dir: Path::new(data_dir).join("config"),
+                data_dir: Path::new(data_dir).to_path_buf(),
+                cache_dir: Path::new(data_dir).join("cache"),
+            };
+            for n in 0..PROCESS_APPENDS_PER_WRITER {
+                append_to_every_store(&paths, &format!("p{writer}-{n}"))?;
+            }
+            return Ok(());
+        }
+
+        let (root, paths) = temp_app_paths("jsonl-concurrent-processes");
+        paths.ensure()?;
+        let exe = std::env::current_exe().context("current test executable")?;
+        let children = (0..WRITERS)
+            .map(|writer| {
+                std::process::Command::new(&exe)
+                    .args([
+                        "automation::tests::concurrent_appends_from_many_processes_lose_no_records",
+                        "--exact",
+                        "--quiet",
+                    ])
+                    .env(
+                        CHILD_WRITER_ENV,
+                        format!("{}|{writer}", paths.data_dir.display()),
+                    )
+                    .stdout(std::process::Stdio::null())
+                    .spawn()
+                    .context("spawn writer process")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for mut child in children {
+            let status = child.wait()?;
+            assert!(status.success(), "writer process failed: {status:?}");
+        }
+
+        let expected: Vec<String> = (0..WRITERS)
+            .flat_map(|writer| {
+                (0..PROCESS_APPENDS_PER_WRITER).map(move |n| format!("p{writer}-{n}"))
+            })
+            .collect();
+        let stores = tags_in_every_store(&paths);
+        fs::remove_dir_all(root).ok();
+        assert_every_store_holds_exactly(stores?, &expected);
+        Ok(())
+    }
+
+    /// Run `body` with `RLIMIT_FSIZE`'s soft limit temporarily lowered to
+    /// `limit_bytes`, restoring the original soft limit — leaving the hard
+    /// limit untouched throughout — before returning, so a coverage build's
+    /// own `.profraw` write at process exit (after this returns, outside
+    /// `body`'s control) isn't cut short by the same rlimit. `SIGXFSZ` is
+    /// ignored for the duration, so a write that would exceed the limit
+    /// returns `Err(EFBIG)` instead of killing the process.
+    #[cfg(unix)]
+    #[allow(unsafe_code)] // libc FFI: lower/restore RLIMIT_FSIZE and ignore SIGXFSZ for the duration
+    fn with_lowered_fsize_limit(limit_bytes: u64, body: impl FnOnce() -> Result<()>) -> Result<()> {
+        let mut original = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        unsafe {
+            if libc::getrlimit(libc::RLIMIT_FSIZE, &raw mut original) != 0 {
+                bail!("getrlimit failed: {}", std::io::Error::last_os_error());
+            }
+        }
+        let lowered = libc::rlimit {
+            rlim_cur: limit_bytes as libc::rlim_t,
+            rlim_max: original.rlim_max,
+        };
+        // The signal handler and the rlimit are restored unconditionally
+        // below, regardless of whether lowering the limit here succeeded or
+        // `body` even ran — this process stays around for the rest of the
+        // (child) test process's life, so a skipped restore on an early
+        // `bail!` would leave it running with SIGXFSZ permanently ignored.
+        let previous_handler = unsafe { libc::signal(libc::SIGXFSZ, libc::SIG_IGN) };
+        let lowered_ok = unsafe { libc::setrlimit(libc::RLIMIT_FSIZE, &raw const lowered) == 0 };
+        let result = if lowered_ok {
+            body()
+        } else {
+            Err(anyhow::anyhow!(
+                "setrlimit failed: {}",
+                std::io::Error::last_os_error()
+            ))
+        };
+        let restored_ok = unsafe { libc::setrlimit(libc::RLIMIT_FSIZE, &raw const original) == 0 };
+        unsafe {
+            libc::signal(libc::SIGXFSZ, previous_handler);
+        }
+        if !restored_ok {
+            bail!(
+                "restoring rlimit failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        result
+    }
+
+    // Regression test for append_or_tolerate_a_missing_newline's glue around
+    // a real failed write — not just the pure landed_despite_the_error
+    // predicate it calls, tested below in isolation with hand-built byte
+    // slices. An RLIMIT_FSIZE one byte under the record's full length
+    // reproduces, deterministically, the exact case that glue exists for.
+    // `write_all` loops over `write(2)`: its first call lands every byte up
+    // to the limit as a successful short write; its next call, with the one
+    // remaining byte (the trailing `\n`) now past the limit, is the one that
+    // raises SIGXFSZ (ignored) and returns `Err(EFBIG)`. The append must
+    // still report `Ok`, and the store must hold exactly the record that
+    // landed — not zero (treated as a real failure), not duplicated, and
+    // genuinely missing its `\n` rather than having silently written in
+    // full (the assertion below on the file's own last byte is what tells
+    // those two apart). A first, ordinary append before the limit is
+    // installed puts this at a non-zero `start` (`TailState::Clean` with an
+    // existing record ahead of it), not only the empty-file case.
+    #[cfg(unix)]
+    #[test]
+    fn append_tolerates_a_short_write_from_an_fsize_limit() -> Result<()> {
+        const SHORT_WRITE_CHILD_ENV: &str = "ROCM_CORE_TEST_JSONL_SHORT_WRITE_CHILD";
+
+        if let Some(data_dir) = std::env::var_os(SHORT_WRITE_CHILD_ENV) {
+            let data_dir = data_dir.to_string_lossy().into_owned();
+            let paths = AppPaths {
+                config_dir: Path::new(&data_dir).join("config"),
+                data_dir: Path::new(&data_dir).to_path_buf(),
+                cache_dir: Path::new(&data_dir).join("cache"),
+            };
+            append_audit_event(&paths, &audit_record("first"))?;
+            let record = audit_record("short-write");
+            let mut line = serde_json::to_vec(&record).context("serialize audit record")?;
+            line.push(b'\n');
+            let existing_len = fs::metadata(paths.audit_events_path())
+                .context("stat seeded store")?
+                .len();
+            with_lowered_fsize_limit(existing_len + line.len() as u64 - 1, || {
+                append_audit_event(&paths, &record)
+            })?;
+            return Ok(());
+        }
+
+        let (root, paths) = temp_app_paths("jsonl-short-write");
+        paths.ensure()?;
+        let exe = std::env::current_exe().context("current test executable")?;
+        let output = std::process::Command::new(&exe)
+            .args([
+                "automation::tests::append_tolerates_a_short_write_from_an_fsize_limit",
+                "--exact",
+                "--quiet",
+                "--nocapture",
+            ])
+            .env(SHORT_WRITE_CHILD_ENV, paths.data_dir.display().to_string())
+            .output()
+            .context("spawn short-write child")?;
+        let text = fs::read_to_string(paths.audit_events_path());
+        fs::remove_dir_all(root).ok();
+        assert!(
+            output.status.success(),
+            "child process failed: {:?}\nstdout: {}\nstderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = text?;
+        assert!(
+            !text.ends_with('\n'),
+            "the short write must have genuinely landed one byte short of its own \
+             trailing newline — a file ending in `\\n` here means the rlimit never \
+             actually cut the write, and this test proved nothing: {text:?}"
+        );
+        let records: Vec<AuditEventRecord> = text
+            .lines()
+            .map(|line| {
+                serde_json::from_str(line)
+                    .unwrap_or_else(|error| panic!("not a complete record: {error}: {line:?}"))
+            })
+            .collect();
+        assert_eq!(
+            audit_messages(&records),
+            ["first", "short-write"],
+            "the write that failed but landed must not be duplicated or dropped: {text:?}"
+        );
+        Ok(())
+    }
+
+    // Sibling of the test above, for the other side of the same glue: a
+    // write that fails and lands *nothing* (the limit leaves no room even
+    // for the first byte) must surface as a genuine `Err`, not be folded
+    // into a false `Ok` the way a landed-but-incomplete write is.
+    // `landed_despite_the_error` itself already has a direct unit test for
+    // "nothing landing is not a complete record" — what has no test without
+    // this one is the `match` in `append_or_tolerate_a_missing_newline` that
+    // acts on that verdict: a mutation collapsing its `Ok(landed) if
+    // landed_despite_the_error(..) => Ok(())` / `Ok(_) => Err(..)` arms into
+    // an unconditional `Ok(())` would pass every other test in this file.
+    #[cfg(unix)]
+    #[test]
+    fn append_reports_a_real_failure_when_nothing_landed() -> Result<()> {
+        const NOTHING_LANDS_CHILD_ENV: &str = "ROCM_CORE_TEST_JSONL_NOTHING_LANDS_CHILD";
+
+        if let Some(data_dir) = std::env::var_os(NOTHING_LANDS_CHILD_ENV) {
+            let data_dir = data_dir.to_string_lossy().into_owned();
+            let paths = AppPaths {
+                config_dir: Path::new(&data_dir).join("config"),
+                data_dir: Path::new(&data_dir).to_path_buf(),
+                cache_dir: Path::new(&data_dir).join("cache"),
+            };
+            append_audit_event(&paths, &audit_record("first"))?;
+            let existing_len = fs::metadata(paths.audit_events_path())
+                .context("stat seeded store")?
+                .len();
+            // Zero slack: the write offset already sits at the limit, so
+            // `write(2)`'s very first call returns `Err(EFBIG)` having
+            // written nothing at all — not even a partial record.
+            let result = with_lowered_fsize_limit(existing_len, || {
+                append_audit_event(&paths, &audit_record("lost"))
+            });
+            // Report the child's own verdict on stdout for the parent to
+            // read, rather than via exit status: an `Err` here is the
+            // *correct* outcome for this test, and letting it propagate as
+            // `?` would make the child process itself look like a failure
+            // for the wrong reason. The message itself (not just ok/err) is
+            // what tells a genuine write failure apart from some unrelated
+            // error (e.g. a lock or `paths.ensure()` failure) that would
+            // also make `is_err()` true without this test having proven
+            // anything.
+            match result {
+                Ok(()) => println!("ok"),
+                Err(error) => println!("err: {error:#}"),
+            }
+            return Ok(());
+        }
+
+        let (root, paths) = temp_app_paths("jsonl-nothing-lands");
+        paths.ensure()?;
+        let exe = std::env::current_exe().context("current test executable")?;
+        let output = std::process::Command::new(&exe)
+            .args([
+                "automation::tests::append_reports_a_real_failure_when_nothing_landed",
+                "--exact",
+                "--quiet",
+                "--nocapture",
+            ])
+            .env(
+                NOTHING_LANDS_CHILD_ENV,
+                paths.data_dir.display().to_string(),
+            )
+            .output()
+            .context("spawn nothing-lands child")?;
+        let text = fs::read_to_string(paths.audit_events_path());
+        fs::remove_dir_all(root).ok();
+        assert!(
+            output.status.success(),
+            "child process failed: {:?}\nstderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("err: failed to append"),
+            "a write that lands nothing must be reported as a real failure from the append \
+             itself (not folded into a false success, and not some unrelated error): \
+             child stdout was {stdout:?}"
+        );
+        assert_eq!(
+            audit_messages(&[serde_json::from_str(text?.trim()).context("parse seeded record")?]),
+            ["first"],
+            "the store must be left exactly as the seed append wrote it — no partial or \
+             lost record from the write that failed with nothing landing"
+        );
+        Ok(())
+    }
+
+    // A proposal-status update rewrites the whole proposals store, so it must
+    // neither drop proposals appended while it runs nor be undone by them.
+    #[test]
+    fn proposal_status_updates_racing_appends_lose_neither() -> Result<()> {
+        const APPENDS: usize = 100;
+        const UPDATES: usize = 50;
+        let (root, paths) = temp_app_paths("proposal-status-race");
+        append_automation_proposal(&paths, &proposal_record("reviewed"))?;
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let appender = scope.spawn(|| -> Result<()> {
+                barrier.wait();
+                for n in 0..APPENDS {
+                    append_automation_proposal(&paths, &proposal_record(&format!("new-{n}")))?;
+                }
+                Ok(())
+            });
+            let reviewer = scope.spawn(|| -> Result<()> {
+                barrier.wait();
+                for n in 0..UPDATES {
+                    let status = if n % 2 == 0 { "approved" } else { "rejected" };
+                    update_automation_proposal_status(&paths, "reviewed", status)?;
+                }
+                Ok(())
+            });
+            appender.join().expect("appender panicked")?;
+            reviewer.join().expect("reviewer panicked")?;
+            Ok::<_, anyhow::Error>(())
+        })?;
+
+        let proposals = load_automation_proposals(&paths)?;
+        fs::remove_dir_all(root).ok();
+        let mut ids: Vec<&str> = proposals.iter().map(|p| p.proposal_id.as_str()).collect();
+        ids.sort_unstable();
+        let mut expected: Vec<String> = (0..APPENDS).map(|n| format!("new-{n}")).collect();
+        expected.push("reviewed".to_owned());
+        expected.sort();
+        assert_eq!(
+            ids, expected,
+            "a status rewrite dropped an appended proposal"
+        );
+        let reviewed = proposals
+            .iter()
+            .find(|p| p.proposal_id == "reviewed")
+            .expect("reviewed proposal present");
+        // UPDATES is even, so the last update (n = UPDATES - 1) is odd: rejected.
+        assert_eq!(
+            reviewed.status, "rejected",
+            "the last status update was lost"
+        );
+        Ok(())
+    }
+
+    // Smoke test, not a race-pinning one: these stores stay well under one
+    // scan chunk, so on Linux a small append is essentially never actually
+    // observed half-written here, and this can mostly only fail via a
+    // propagated read/write error or the final count assertion — not by
+    // actually exercising the torn-line skip under real contention. That
+    // skip is pinned deterministically instead by
+    // `readers_skip_an_unterminated_last_line_that_does_not_parse`. What
+    // this test is still worth keeping for: a reader that started failing
+    // outright under concurrent load (rather than just reading stale data,
+    // which this can't detect either) would still show up here.
+    #[test]
+    fn concurrent_reads_and_appends_never_error() -> Result<()> {
+        const APPENDS: usize = 200;
+        let (root, paths) = temp_app_paths("jsonl-read-race");
+        paths.ensure()?;
+        let done = std::sync::atomic::AtomicBool::new(false);
+        let outcome = std::thread::scope(|scope| {
+            let reader = scope.spawn(|| -> Result<usize> {
+                let mut reads = 0;
+                while !done.load(std::sync::atomic::Ordering::Acquire) {
+                    load_recent_audit_events(&paths, 5)?;
+                    load_recent_automation_events(&paths, 5)?;
+                    load_automation_proposals(&paths)?;
+                    reads += 1;
+                }
+                Ok(reads)
+            });
+            let written =
+                (0..APPENDS).try_for_each(|n| append_to_every_store(&paths, &format!("r{n}")));
+            done.store(true, std::sync::atomic::Ordering::Release);
+            let reads = reader.join().expect("reader panicked");
+            written.and(reads)
+        });
+        let loaded = load_recent_audit_events(&paths, APPENDS);
+        fs::remove_dir_all(root).ok();
+        outcome?;
+        assert_eq!(loaded?.len(), APPENDS);
+        Ok(())
+    }
+
+    /// Write `contents` as the audit store, creating its directory.
+    fn seed_audit_store(paths: &AppPaths, contents: &str) -> Result<()> {
+        paths.ensure()?;
+        fs::write(paths.audit_events_path(), contents)?;
+        Ok(())
+    }
+
+    fn audit_line(tag: &str) -> String {
+        serde_json::to_string(&audit_record(tag)).expect("serialize audit record")
+    }
+
+    fn audit_messages(records: &[AuditEventRecord]) -> Vec<&str> {
+        records.iter().map(|r| r.message.as_str()).collect()
+    }
+
+    #[test]
+    fn reverse_lines_matches_a_forward_split_at_every_chunk_size() -> Result<()> {
+        let (root, _paths) = temp_app_paths("reverse-lines");
+        fs::create_dir_all(&root)?;
+        let path = root.join("lines.jsonl");
+        for contents in [
+            "",
+            "\n",
+            "a",
+            "a\n",
+            "a\nbb\n",
+            "a\nbb\nccc",
+            "\n\nx\n\n",
+            "long-line-crossing-chunks\nshort\n",
+        ] {
+            fs::write(&path, contents)?;
+            let file = fs::File::open(&path)?;
+            let mut expected: Vec<&[u8]> = contents.as_bytes().split(|&b| b == b'\n').collect();
+            expected.reverse();
+            for chunk in 1..=8 {
+                let mut lines = ReverseLines::new(&path, &file, file.metadata()?.len(), chunk);
+                let mut got = Vec::new();
+                let mut starts = Vec::new();
+                while let Some((start, line)) = lines.next_line()? {
+                    starts.push(start);
+                    got.push(line);
+                }
+                assert_eq!(got, expected, "contents {contents:?}, chunk {chunk}");
+                // Each line's reported start plus its own length must land
+                // exactly one byte before the previous (later-in-file) line's
+                // start — the byte in between is the `\n` that separated
+                // them — except the first line yielded here (the file's
+                // *last* line, with nothing after it to separate from),
+                // which must instead land exactly on the file's own length.
+                let mut expected_next = contents.len() as u64;
+                for (&start, line) in starts.iter().zip(&got) {
+                    assert_eq!(
+                        start + line.len() as u64,
+                        expected_next,
+                        "contents {contents:?}, chunk {chunk}: wrong start for {line:?}"
+                    );
+                    expected_next = start.saturating_sub(1);
+                }
+            }
+        }
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn load_recent_stops_before_corrupt_lines_older_than_the_window() -> Result<()> {
+        let (root, paths) = temp_app_paths("recent-window");
+        seed_audit_store(
+            &paths,
+            &format!(
+                "not json\n{}\n\n{}\n{}\n",
+                audit_line("a"),
+                audit_line("b"),
+                audit_line("c")
+            ),
+        )?;
+        let recent = load_recent_audit_events(&paths, 3);
+        let too_far = load_recent_audit_events(&paths, 4);
+        fs::remove_dir_all(root).ok();
+        assert_eq!(audit_messages(&recent?), ["a", "b", "c"]);
+        // Reaching the corrupt line is still an error, as before.
+        assert!(
+            too_far.is_err(),
+            "a corrupt line inside the window must fail"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn readers_skip_an_unterminated_last_line_that_does_not_parse() -> Result<()> {
+        let (root, paths) = temp_app_paths("unterminated-torn");
+        let torn = &audit_line("torn")[..20];
+        seed_audit_store(&paths, &format!("{}\n{torn}", audit_line("a")))?;
+        let torn_proposal = &serde_json::to_string(&proposal_record("torn"))?[..20];
+        fs::write(
+            paths.automation_proposals_path(),
+            format!(
+                "{}\n{torn_proposal}",
+                serde_json::to_string(&proposal_record("a"))?
+            ),
+        )?;
+        let audit = load_recent_audit_events(&paths, 5);
+        let proposals = load_automation_proposals(&paths);
+        fs::remove_dir_all(root).ok();
+        assert_eq!(audit_messages(&audit?), ["a"]);
+        let ids: Vec<String> = proposals?.into_iter().map(|p| p.proposal_id).collect();
+        assert_eq!(ids, ["a"]);
+        Ok(())
+    }
+
+    // `serde_json` writes non-ASCII text as raw UTF-8, so a record cut
+    // mid-write can end inside a character; that must not fail a whole-file
+    // UTF-8 decode and block every proposal read, approve and reject.
+    #[test]
+    fn proposal_reads_skip_a_torn_line_cut_inside_a_utf8_character() -> Result<()> {
+        let (root, paths) = temp_app_paths("unterminated-utf8");
+        paths.ensure()?;
+        let mut torn = proposal_record("torn");
+        torn.message = "ü".repeat(8);
+        let torn = serde_json::to_vec(&torn)?;
+        let cut = torn
+            .iter()
+            .position(|&byte| byte == 0xC3)
+            .expect("message is raw UTF-8")
+            + 1;
+        let mut contents = serde_json::to_vec(&proposal_record("a"))?;
+        contents.push(b'\n');
+        contents.extend_from_slice(&torn[..cut]);
+        fs::write(paths.automation_proposals_path(), contents)?;
+        let proposals = load_automation_proposals(&paths);
+        let updated = update_automation_proposal_status(&paths, "a", "approved");
+        fs::remove_dir_all(root).ok();
+        let ids: Vec<String> = proposals?.into_iter().map(|p| p.proposal_id).collect();
+        assert_eq!(ids, ["a"]);
+        assert_eq!(updated?.status, "approved");
+        Ok(())
+    }
+
+    // Complete JSON that is not a valid record is real data, not an append
+    // caught mid-write: reads still report it, and a status rewrite must fail
+    // rather than silently drop it from disk.
+    #[test]
+    fn an_unterminated_last_line_of_the_wrong_shape_is_reported_not_dropped() -> Result<()> {
+        let (root, paths) = temp_app_paths("unterminated-wrong-shape");
+        paths.ensure()?;
+        let contents = format!(
+            "{}\n{{\"unexpected\":true}}",
+            serde_json::to_string(&proposal_record("a"))?
+        );
+        fs::write(paths.automation_proposals_path(), &contents)?;
+        seed_audit_store(
+            &paths,
+            &format!("{}\n{{\"unexpected\":true}}", audit_line("a")),
+        )?;
+        let proposals = load_automation_proposals(&paths);
+        let updated = update_automation_proposal_status(&paths, "a", "approved");
+        let on_disk = fs::read_to_string(paths.automation_proposals_path());
+        let audit = load_recent_audit_events(&paths, 5);
+        fs::remove_dir_all(root).ok();
+        assert!(proposals.is_err(), "a wrong-shape record must be reported");
+        assert!(
+            updated.is_err(),
+            "the rewrite must refuse, not drop the line"
+        );
+        assert_eq!(on_disk?, contents);
+        assert!(audit.is_err(), "a wrong-shape record must be reported");
+        Ok(())
+    }
+
+    // Mirrors the test above, but for the position half of
+    // parse_jsonl_records's guard rather than its shape half: a line that
+    // is not valid JSON (so `is_torn_record` is true for it, same as a
+    // genuine torn tail) but is NOT the store's last line must still be
+    // reported as an error, not silently skipped. Without the
+    // `index + 1 == line_count` half of that guard, this line would be
+    // indistinguishable from torn debris and silently dropped by
+    // update_automation_proposal_status's whole-file rewrite.
+    #[test]
+    fn a_corrupt_line_before_the_last_is_reported_not_dropped() -> Result<()> {
+        let (root, paths) = temp_app_paths("corrupt-line-not-last");
+        paths.ensure()?;
+        let corrupt = &serde_json::to_string(&proposal_record("corrupt"))?[..10];
+        // No trailing `\n` after "b": the buffer as a whole must be
+        // unterminated too, so the corrupt line is excluded from the
+        // tolerance window by the position check specifically
+        // (`index + 1 == line_count`) and not merely because the whole
+        // buffer happens to already be terminated.
+        let contents = format!(
+            "{}\n{corrupt}\n{}",
+            serde_json::to_string(&proposal_record("a"))?,
+            serde_json::to_string(&proposal_record("b"))?
+        );
+        fs::write(paths.automation_proposals_path(), &contents)?;
+        let proposals = load_automation_proposals(&paths);
+        let updated = update_automation_proposal_status(&paths, "a", "approved");
+        let on_disk = fs::read_to_string(paths.automation_proposals_path());
+        fs::remove_dir_all(root).ok();
+        assert!(
+            proposals.is_err(),
+            "a corrupt line that isn't the store's last line must be reported, not silently skipped"
+        );
+        assert!(
+            updated.is_err(),
+            "the rewrite must refuse, not drop the line"
+        );
+        assert_eq!(
+            on_disk?, contents,
+            "a refused rewrite must leave the file untouched"
+        );
+        Ok(())
+    }
+
+    // A lock-free reader that measured a stale, larger length — because the
+    // store was edited out-of-band, not because a concurrent writer shrank
+    // it — sees the file end early; that is not an error.
+    #[test]
+    fn a_scan_that_finds_the_file_shorter_than_it_was_still_succeeds() -> Result<()> {
+        let (root, paths) = temp_app_paths("scan-shrunk");
+        seed_audit_store(
+            &paths,
+            &format!("{}\n{}\n", audit_line("a"), audit_line("b")),
+        )?;
+        let path = paths.audit_events_path();
+        let file = fs::File::open(&path)?;
+        let stale_len = file.metadata()?.len() + 40;
+        let recent =
+            scan_recent_jsonl_records::<AuditEventRecord>(&path, &file, stale_len, 5, "audit");
+        fs::remove_dir_all(root).ok();
+        assert_eq!(audit_messages(&recent?), ["a", "b"]);
+        Ok(())
+    }
+
+    // Nothing in this module's own writers shrinks a store, but an
+    // out-of-band edit might, and load_recent_jsonl_records is supposed to
+    // retry from the new length rather than fail. Driving that needs the
+    // shrink to land strictly between two of ReverseLines's own chunked
+    // reads (see the `test_hooks` module doc) — which in turn
+    // needs a scan that takes more than one physical read in the first
+    // place, hence the pathologically long first record here (same
+    // technique as append_leaves_a_torn_line_longer_than_one_scan_chunk_cut_cleanly
+    // below, just complete JSON rather than torn).
+    #[test]
+    fn load_recent_retries_past_a_shrink_mid_scan_and_succeeds() -> Result<()> {
+        let (root, paths) = temp_app_paths("scan-retry-after-shrink");
+        let seed = format!("{}\n", audit_line("seed"));
+        let giant = audit_line(&"x".repeat(200_000));
+        seed_audit_store(&paths, &format!("{seed}{giant}"))?;
+        let path = paths.audit_events_path();
+        let seed_len = seed.len() as u64;
+        let hook_path = path.clone();
+        test_hooks::set_before_scan_read(
+            &path,
+            1,
+            std::sync::Arc::new(move || {
+                fs::OpenOptions::new()
+                    .write(true)
+                    .open(&hook_path)
+                    .and_then(|f| f.set_len(seed_len))
+                    .expect("truncate mid-scan");
+            }),
+        );
+        let recent = load_recent_audit_events(&paths, 5);
+        fs::remove_dir_all(root).ok();
+        assert_eq!(
+            audit_messages(&recent?),
+            ["seed"],
+            "a shrink strictly between two chunked reads must be retried, not failed"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reverse_lines_refuses_to_splice_across_a_mid_scan_shrink() -> Result<()> {
+        let (root, _paths) = temp_app_paths("reverse-lines-shrink");
+        fs::create_dir_all(&root)?;
+        let path = root.join("lines.jsonl");
+        fs::write(&path, "aaaa\nbbbb\ncccc")?;
+        let file = fs::File::open(&path)?;
+        let mut lines = ReverseLines::new(&path, &file, 14, 4);
+        // As if the first step had read the last chunk, "cccc" (no `\n` yet),
+        // and the file then shrank below the next chunk's end.
+        lines.pending = b"cccc".to_vec();
+        lines.pos = 10;
+        let shrunk = fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .and_then(|f| f.set_len(7));
+        let next = lines.next_line();
+        fs::remove_dir_all(root).ok();
+        shrunk?;
+        assert!(
+            next.is_err(),
+            "a short read after the first must not be spliced"
+        );
+        Ok(())
+    }
+
+    // Unlike the shrink above, a shrink before any chunk has been read yet
+    // isn't guarded (there is no prior `pending` to misalign against), so it
+    // must not error — but the line it finds, and the offset it reports,
+    // still have to match where the content actually is now, not where the
+    // `len` passed to `new` (now stale) said it would be.
+    #[test]
+    fn reverse_lines_tolerates_a_shrink_before_the_first_read() -> Result<()> {
+        let (root, _paths) = temp_app_paths("reverse-lines-shrink-first-read");
+        fs::create_dir_all(&root)?;
+        let path = root.join("lines.jsonl");
+        fs::write(&path, "aaaa\nbbbb\ncccc")?;
+        let file = fs::File::open(&path)?;
+        // As if this had measured the file at its original 14 bytes, then the
+        // file shrank to 9 ("aaaa\nbbbb", no trailing "\ncccc") before this
+        // scan's first read.
+        fs::OpenOptions::new().write(true).open(&path)?.set_len(9)?;
+        let mut lines = ReverseLines::new(&path, &file, 14, 4);
+        let next = lines.next_line();
+        fs::remove_dir_all(root).ok();
+        let (start, line) = next?.expect("one line");
+        assert_eq!(line, b"bbbb", "must read what is really there now");
+        assert_eq!(
+            start, 5,
+            "offset must match the real content, not the stale length"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn readers_keep_an_unterminated_last_line_that_parses() -> Result<()> {
+        let (root, paths) = temp_app_paths("unterminated-complete");
+        seed_audit_store(&paths, &format!("{}\n{}", audit_line("a"), audit_line("b")))?;
+        let audit = load_recent_audit_events(&paths, 5);
+        fs::remove_dir_all(root).ok();
+        assert_eq!(audit_messages(&audit?), ["a", "b"]);
+        Ok(())
+    }
+
+    #[test]
+    fn append_cuts_a_torn_last_line_left_by_a_killed_writer() -> Result<()> {
+        let (root, paths) = temp_app_paths("append-torn-tail");
+        let torn = &audit_line("torn")[..20];
+        seed_audit_store(&paths, &format!("{}\n{torn}", audit_line("a")))?;
+        append_audit_event(&paths, &audit_record("b"))?;
+        let text = fs::read_to_string(paths.audit_events_path());
+        fs::remove_dir_all(root).ok();
+        assert_eq!(text?, format!("{}\n{}\n", audit_line("a"), audit_line("b")));
+        Ok(())
+    }
+
+    #[test]
+    fn append_terminates_a_complete_unterminated_last_line() -> Result<()> {
+        let (root, paths) = temp_app_paths("append-unterminated");
+        seed_audit_store(&paths, &audit_line("a"))?;
+        append_audit_event(&paths, &audit_record("b"))?;
+        let text = fs::read_to_string(paths.audit_events_path());
+        fs::remove_dir_all(root).ok();
+        assert_eq!(text?, format!("{}\n{}\n", audit_line("a"), audit_line("b")));
+        Ok(())
+    }
+
+    // A whitespace-only unterminated tail is not valid JSON either, so
+    // without `is_blank` in `inspect_tail`'s check it would be classified
+    // Torn and cut by the next append's whole-store rewrite instead of being
+    // kept and terminated in place, as TailState::ValidUnterminated's own
+    // doc comment documents it should be.
+    #[test]
+    fn append_terminates_a_blank_unterminated_last_line_without_cutting_it() -> Result<()> {
+        let (root, paths) = temp_app_paths("append-blank-unterminated");
+        seed_audit_store(&paths, &format!("{}\n ", audit_line("a")))?;
+        append_audit_event(&paths, &audit_record("b"))?;
+        let text = fs::read_to_string(paths.audit_events_path());
+        fs::remove_dir_all(root).ok();
+        assert_eq!(
+            text?,
+            format!("{}\n \n{}\n", audit_line("a"), audit_line("b")),
+            "a blank unterminated tail must be kept and terminated, not cut as torn debris"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn append_leaves_a_torn_line_longer_than_one_scan_chunk_cut_cleanly() -> Result<()> {
+        let (root, paths) = temp_app_paths("append-long-torn-tail");
+        let long_torn = format!("{{\"message\":\"{}", "x".repeat(3 * 64 * 1024));
+        seed_audit_store(&paths, &format!("{}\n{long_torn}", audit_line("a")))?;
+        append_audit_event(&paths, &audit_record("b"))?;
+        let recent = load_recent_audit_events(&paths, 5);
+        fs::remove_dir_all(root).ok();
+        assert_eq!(audit_messages(&recent?), ["a", "b"]);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn append_of_a_torn_tail_replaces_rather_than_truncates_the_file_in_place() -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+
+        // The inode is the observable difference between the two ways to
+        // repair a torn tail: truncating it in place keeps rewriting the
+        // SAME file, so a lock-free reader mid-scan can see it briefly
+        // shorter than before the repair and then longer again once the new
+        // record lands — the shrink-and-regrow window a reverse scan can
+        // misread as a record nobody wrote (see `append_jsonl_record`). A
+        // rename publishes a DIFFERENT file over the name, so a reader only
+        // ever sees the pre-repair length or the post-append length, never
+        // one in between.
+        //
+        // `append_cuts_a_torn_last_line_left_by_a_killed_writer` above only
+        // checks the final bytes, which holds just as well for an in-place
+        // truncate-then-write, so it cannot tell the two apart.
+        //
+        // The `#[cfg(windows)]` function of the same name below asserts the
+        // same guarantee through `GetFileInformationByHandle`.
+        let (root, paths) = temp_app_paths("append-torn-tail-replaces");
+        let torn = &audit_line("torn")[..20];
+        seed_audit_store(&paths, &format!("{}\n{torn}", audit_line("a")))?;
+        let path = paths.audit_events_path();
+        let before = fs::metadata(&path)?.ino();
+
+        append_audit_event(&paths, &audit_record("b"))?;
+
+        let after = fs::metadata(&path)?.ino();
+        let text = fs::read_to_string(&path);
+        fs::remove_dir_all(root).ok();
+        assert_ne!(
+            before, after,
+            "repairing a torn tail kept the same inode, so it truncated the \
+             live file in place instead of replacing it"
+        );
+        assert_eq!(text?, format!("{}\n{}\n", audit_line("a"), audit_line("b")));
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn append_of_a_torn_tail_replaces_rather_than_truncates_the_file_in_place() -> Result<()> {
+        use crate::test_support::windows_file_identity;
+
+        // The Windows counterpart of the Unix test above. The file index
+        // together with the volume serial number is this platform's file
+        // identity, the way an inode is on Unix: an in-place truncate keeps
+        // that pair, while a repair-by-rename gives the live path a
+        // different one.
+        let (root, paths) = temp_app_paths("append-torn-tail-replaces");
+        let torn = &audit_line("torn")[..20];
+        seed_audit_store(&paths, &format!("{}\n{torn}", audit_line("a")))?;
+        let path = paths.audit_events_path();
+        let before = windows_file_identity(&path)?;
+
+        append_audit_event(&paths, &audit_record("b"))?;
+
+        let after = windows_file_identity(&path)?;
+        let text = fs::read_to_string(&path);
+        fs::remove_dir_all(root).ok();
+        assert_ne!(
+            before, after,
+            "repairing a torn tail kept the same file identity, so it \
+             truncated the live file in place instead of replacing it"
+        );
+        assert_eq!(text?, format!("{}\n{}\n", audit_line("a"), audit_line("b")));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn append_to_a_clean_or_unterminated_store_keeps_the_same_file() -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+
+        // The counterpart of the torn-tail-repair test above, for the other
+        // two `TailState` arms: with no torn tail to repair — the store either
+        // already ends on a line boundary, or ends in a complete record
+        // missing just its `\n` — an append must stay a plain append-mode
+        // write on the SAME file, not the atomic replace the torn-tail case
+        // takes. An inode change here would mean every append costs a
+        // full-file rewrite, which is exactly the per-append cost this
+        // store's design exists to avoid.
+        for seed in [
+            format!("{}\n", audit_line("a")), // Clean: ends on a line boundary.
+            audit_line("a"),                  // ValidUnterminated: no trailing `\n`.
+        ] {
+            let (root, paths) = temp_app_paths("append-clean-same-file");
+            seed_audit_store(&paths, &seed)?;
+            let path = paths.audit_events_path();
+            let before = fs::metadata(&path)?.ino();
+
+            append_audit_event(&paths, &audit_record("b"))?;
+
+            let after = fs::metadata(&path)?.ino();
+            let text = fs::read_to_string(&path);
+            fs::remove_dir_all(root).ok();
+            assert_eq!(
+                before, after,
+                "an append with no torn tail to repair replaced the file \
+                 instead of appending to it in place, seed {seed:?}"
+            );
+            assert_eq!(text?, format!("{}\n{}\n", audit_line("a"), audit_line("b")));
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn append_to_a_clean_or_unterminated_store_keeps_the_same_file() -> Result<()> {
+        use crate::test_support::windows_file_identity;
+
+        // The Windows counterpart of the Unix test above.
+        for seed in [
+            format!("{}\n", audit_line("a")), // Clean: ends on a line boundary.
+            audit_line("a"),                  // ValidUnterminated: no trailing `\n`.
+        ] {
+            let (root, paths) = temp_app_paths("append-clean-same-file");
+            seed_audit_store(&paths, &seed)?;
+            let path = paths.audit_events_path();
+            let before = windows_file_identity(&path)?;
+
+            append_audit_event(&paths, &audit_record("b"))?;
+
+            let after = windows_file_identity(&path)?;
+            let text = fs::read_to_string(&path);
+            fs::remove_dir_all(root).ok();
+            assert_eq!(
+                before, after,
+                "an append with no torn tail to repair replaced the file \
+                 instead of appending to it in place, seed {seed:?}"
+            );
+            assert_eq!(text?, format!("{}\n{}\n", audit_line("a"), audit_line("b")));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn landed_despite_the_error_tolerates_only_a_missing_trailing_newline() {
+        let line = b"{\"a\":1}\n";
+        assert!(
+            landed_despite_the_error(&line[..line.len() - 1], line),
+            "a write that failed one byte short of the trailing newline must \
+             still count as landed: the record is complete and valid, and a \
+             caller that reports this as a failure and retries would write \
+             it twice"
+        );
+        assert!(
+            landed_despite_the_error(line, line),
+            "the full line landing must also count, even if write_all \
+             somehow still reported an error for it"
+        );
+        assert!(
+            !landed_despite_the_error(&line[..line.len() - 2], line),
+            "missing more than just the trailing newline is genuine torn \
+             debris, not a complete record"
+        );
+        assert!(
+            !landed_despite_the_error(b"", line),
+            "nothing landing at all is not a complete record"
+        );
+        assert!(
+            !landed_despite_the_error(b"{\"a\":2}\n", line),
+            "different bytes landing at the same length must not be \
+             mistaken for this record having landed"
+        );
+    }
+
+    #[test]
+    fn the_store_lock_is_a_sibling_of_the_store() {
+        let paths = AppPaths {
+            config_dir: PathBuf::from("c"),
+            data_dir: PathBuf::from("d"),
+            cache_dir: PathBuf::from("k"),
+        };
+        assert_eq!(
+            jsonl_lock_path(&paths.audit_events_path()),
+            paths.audit_dir().join("events.jsonl.lock")
+        );
+        assert_eq!(
+            jsonl_lock_path(&paths.automation_proposals_path()),
+            paths.automations_dir().join("proposals.jsonl.lock")
+        );
     }
 }

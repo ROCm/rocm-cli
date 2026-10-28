@@ -790,9 +790,22 @@ jobs:
         # of which touch a seam — and this lane packages and installs the binary
         # through the real installer, so it should ship exactly what a release
         # ships rather than a build carrying test hooks.
+        #
+        # `E2E_ALSO_RUN_IDS` folds the comfyui-01/02/03 scenarios into this
+        # otherwise-lifecycle-only selection (#689). PR #637 made them hermetic
+        # (no GPU, no network, no `e2e-test-hooks` dependency — their `uv`/Python
+        # subprocesses are planted fixture binaries) and Windows-portable, but
+        # this required lane was the only place that guarantee could actually be
+        # enforced: the self-hosted Windows lane that otherwise runs them
+        # (e2e-selfhosted.yml) is optional and not a required check. They are not
+        # tagged `@lifecycle` themselves — they are not release packaging/
+        # install/uninstall scenarios, and tagging them so would drop them out of
+        # nightly.yml's and e2e-selfhosted.yml's full-suite runs, neither of
+        # which sets `E2E_INCLUDE_LIFECYCLE`.
         env:
           E2E_INCLUDE_LIFECYCLE: "1"
           E2E_ONLY_LIFECYCLE: "1"
+          E2E_ALSO_RUN_IDS: "comfyui-uv-install-failure-names-log,comfyui-uv-install-progress-streamed,comfyui-ambiguous-runtime-actionable"
         run: |
           # Derive from CARGO_TARGET_DIR when it is set, falling back to the
           # default target dir, so a future job-level CARGO_TARGET_DIR cannot

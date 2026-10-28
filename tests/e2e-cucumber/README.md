@@ -158,7 +158,7 @@ Scenarios carry stable-id and capability tags:
 | `@requires-no-gpu` | Premise is a host with no usable AMD GPU (e.g. a refusal that only happens without one). The inverse of `@requires-gpu`; resolves to **skip** on a GPU host. |
 | `@merge-queue` | Too expensive for per-PR CI (a real serve). Skipped unless `E2E_MERGE_QUEUE` is set, which the self-hosted lanes in [`e2e-selfhosted.yml`](../../.github/workflows/e2e-selfhosted.yml) do on a `merge_group` event. Those lanes are non-blocking (that file's header says why), so such a scenario is telemetry rather than a gate. |
 | `@nightly` | Expensive scenario skipped by default; included when `E2E_INCLUDE_NIGHTLY=1`. |
-| `@lifecycle` | Expensive, OS-mutating release-lifecycle scenario (packaging + real installer + install/uninstall). Skipped by default; included when `E2E_INCLUDE_LIFECYCLE=1`. `E2E_ONLY_LIFECYCLE=1` selects only this set without bypassing expectation resolution. |
+| `@lifecycle` | Expensive, OS-mutating release-lifecycle scenario (packaging + real installer + install/uninstall). Skipped by default; included when `E2E_INCLUDE_LIFECYCLE=1`. `E2E_ONLY_LIFECYCLE=1` selects only this set without bypassing expectation resolution. A caller can additionally fold specific non-`@lifecycle` scenarios into that restricted set via `E2E_ALSO_RUN_IDS` (comma-separated `@id`s), without tagging them `@lifecycle` — which would also pull them out of the full-suite lanes that don't set `E2E_INCLUDE_LIFECYCLE`. `ci.yml`'s Windows lane uses this to fold in the hermetic comfyui-01/02/03 scenarios. |
 
 Known bugs are **not** tagged in the `.feature` files — they live in
 `expectations.toml`, keyed by `@id`, each with a `when = { ... }` condition (e.g.

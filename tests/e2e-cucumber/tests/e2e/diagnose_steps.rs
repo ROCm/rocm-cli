@@ -321,6 +321,163 @@ async fn user_chose_engine_import_fix(world: &mut E2eWorld) {
     world.model_name = Some(ENGINE_IMPORT_FIX_ID.to_string());
 }
 
+#[given("a user who has chosen the fix for the missing MSVC runtime")]
+async fn user_chose_msvc_runtime_fix(world: &mut E2eWorld) {
+    world.model_name = Some("fix-15-msvc-redist".to_string());
+}
+
+#[given("a user who has chosen the fix for the GPU override")]
+async fn user_chose_override_fix(world: &mut E2eWorld) {
+    world.model_name = Some("fix-2-unset-override".to_string());
+}
+
+#[given("a user who has chosen the fix for ROCm missing from PATH")]
+async fn user_chose_path_fix(world: &mut E2eWorld) {
+    world.model_name = Some("fix-6-path".to_string());
+}
+
+#[then(
+    "the printed commands and verify line avoid the constructs known to break in Windows PowerShell"
+)]
+async fn assert_printed_lines_avoid_powershell_hostile_syntax(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no fix preview output");
+    let mut lines: Vec<&str> = output
+        .lines()
+        .filter_map(|line| line.strip_prefix("  $ "))
+        .filter(|c| !c.trim_start().starts_with('#'))
+        .collect();
+    // Every verify line is shown on Windows, the Linux one included (labelled).
+    lines.extend(printed_verify_lines(output));
+    // The rule lives in this crate because it does not depend on rocm-core. The
+    // table in `fixtures/powershell_text_rule_cases.txt` holds it and the
+    // rocm-core rule to the same answers.
+    for line in lines {
+        if let Some(why) = e2e_cucumber::powershell_text_rule::refusal(line) {
+            panic!("`{line}` uses {why}");
+        }
+    }
+}
+
+#[then("the printed verify command is a PowerShell command that selects FileVersion")]
+async fn assert_verify_is_powershell_selecting_version(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no fix preview output");
+    let verify = printed_verify_line(output);
+    // Text only. `the_msvc_verify_runs_in_cmd_and_powershell` (rocm-core,
+    // Windows only) runs the line.
+    assert!(
+        verify.starts_with("powershell -NoProfile -Command ") && verify.contains("FileVersion"),
+        "expected a PowerShell command that prints FileVersion: {verify}"
+    );
+}
+
+#[then("the printed Linux verify line shows the GPU without needing a compiler")]
+async fn assert_linux_verify_shows_the_gpu(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no fix preview output");
+    let linux = output
+        .lines()
+        .find_map(|line| line.strip_prefix("Verify (Linux, WSL):"))
+        .unwrap_or_else(|| panic!("the preview printed no Linux verify line:\n{output}"))
+        .trim();
+    // `rocminfo` lists the GPU agents. `hipcc` is the compiler a runtime-only
+    // Linux install does not have, so a line that runs it fails there even
+    // with PATH fixed. Text only: the line is not run here, because a Linux
+    // lane without ROCm has no `rocminfo`.
+    assert!(
+        linux.starts_with("rocminfo") && !linux.contains("hipcc"),
+        "the Linux verify line must show the GPU and not need hipcc: {linux}"
+    );
+    // The line every OS can run stays free of anything only Linux has.
+    let shared = printed_verify_line(output);
+    assert!(
+        !shared.contains("rocminfo"),
+        "the Windows verify line must not need rocminfo: {shared}"
+    );
+}
+
+#[then("the printed Linux verify line reads the override without needing Python")]
+async fn assert_linux_verify_reads_the_override_without_python(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no fix preview output");
+    let linux = output
+        .lines()
+        .find_map(|line| line.strip_prefix("Verify (Linux, WSL):"))
+        .unwrap_or_else(|| panic!("the preview printed no Linux verify line:\n{output}"))
+        .trim();
+    // A stock Ubuntu has `python3` and no `python`, so a line that runs either
+    // fails there after a correct fix. Text only: the line is run, with an
+    // empty PATH, by `the_override_linux_verify_runs_with_nothing_on_path` in
+    // rocm-core (Unix hosts).
+    assert!(
+        linux.contains("HSA_OVERRIDE_GFX_VERSION") && !linux.contains("python"),
+        "the Linux verify line must read the override without Python: {linux}"
+    );
+    // The line every OS can run is the one that needs `python`.
+    let shared = printed_verify_line(output);
+    assert!(
+        shared.starts_with("python -c "),
+        "the plain verify line is the python one: {shared}"
+    );
+}
+
+#[then("the printed notes say a stock Linux install has python3 and not python")]
+async fn assert_notes_name_the_python3_case(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no fix preview output");
+    // The claim is about the two verify lines printed above: the plain one runs
+    // `python` and fails on a stock Ubuntu, the Linux one does not. The
+    // assertion in `assert_linux_verify_reads_the_override_without_python` is
+    // what makes the note's statement about the Linux line true.
+    assert!(
+        output
+            .lines()
+            .any(|line| line.strip_prefix("Note:").is_some_and(|note| {
+                note.contains("python3")
+                    && note.contains("`python`")
+                    && note.contains("Verify (Linux, WSL)")
+            })),
+        "no note names the python3 case:\n{output}"
+    );
+}
+
+#[then("the printed notes say a runtime-only Linux install has no hipcc")]
+async fn assert_notes_name_the_runtime_only_case(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no fix preview output");
+    // The claim is about the two verify lines printed above: the one that runs
+    // `hipcc` fails on a runtime-only install, the Linux one does not. The
+    // assertion in `assert_linux_verify_shows_the_gpu` is what makes the note's
+    // statement about the Linux line true.
+    assert!(
+        output
+            .lines()
+            .any(|line| line.strip_prefix("Note:").is_some_and(|note| {
+                note.contains("runtime-only")
+                    && note.contains("hipcc")
+                    && note.contains("Verify (Linux, WSL)")
+            })),
+        "no note names the runtime-only case:\n{output}"
+    );
+}
+
+/// Every `Verify` line the preview printed: the plain one and the Linux one.
+fn printed_verify_lines(output: &str) -> Vec<&str> {
+    output
+        .lines()
+        .filter_map(|line| {
+            line.strip_prefix("Verify:")
+                .or_else(|| line.strip_prefix("Verify (Linux, WSL):"))
+        })
+        .map(str::trim)
+        .collect()
+}
+
+fn printed_verify_line(output: &str) -> &str {
+    output
+        .lines()
+        .find_map(|line| line.strip_prefix("Verify:"))
+        .map_or_else(
+            || panic!("the preview printed no Verify: line:\n{output}"),
+            str::trim,
+        )
+}
+
 #[given("a user who has chosen a known fix")]
 async fn user_chose_known_fix(world: &mut E2eWorld) {
     world.model_name = Some(PREVIEW_FIX_ID.to_string());
@@ -3243,6 +3400,144 @@ async fn assert_advised_driver_command_exists(world: &mut E2eWorld) {
             "{flag} is advised but not accepted:\n{stdout}"
         );
     }
+}
+
+// ── The verify line `rocm diagnose` prints on Linux ────────────────
+
+/// The reported cause block for `fix_id`: the `#N (id)` header line and
+/// everything under it up to the blank line that ends it.
+fn cause_block<'a>(output: &'a str, fix_id: &str) -> Vec<&'a str> {
+    let marker = format!("({fix_id})");
+    output
+        .lines()
+        .skip_while(|line| !line.contains(&marker))
+        .take_while(|line| !line.trim().is_empty())
+        .collect()
+}
+
+/// The text after `verify after fix:` in the cause block for `fix_id`.
+fn diagnose_verify_line(output: &str, fix_id: &str) -> String {
+    let block = cause_block(output, fix_id);
+    assert!(
+        !block.is_empty(),
+        "no `{fix_id}` cause was reported:
+{output}"
+    );
+    block
+        .iter()
+        .find_map(|line| line.trim().strip_prefix("verify after fix:"))
+        .unwrap_or_else(|| {
+            panic!(
+                "`{fix_id}` printed no verify line:
+{}",
+                block.join(
+                    "
+"
+                )
+            )
+        })
+        .trim()
+        .to_owned()
+}
+
+#[given("a Linux machine whose shell has a GPU override set")]
+async fn linux_machine_with_a_gpu_override(world: &mut E2eWorld) {
+    // `rocm diagnose` reads the override from the environment it examines,
+    // which is the CLI child's, so setting it there is the whole setup.
+    world
+        .command_env
+        .push(("HSA_OVERRIDE_GFX_VERSION", "11.0.0".into()));
+}
+
+#[when("the user diagnoses that machine with a page fault symptom")]
+async fn user_diagnoses_page_fault_symptom(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(
+        world,
+        &["diagnose", "--symptom", "page fault", "--top", "20"],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then(
+    "the override cause prints a verify line that reads the override and checks torch with python3"
+)]
+async fn assert_diagnose_override_verify_uses_python3(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no diagnose output");
+    let verify = diagnose_verify_line(output, "fix-2-unset-override");
+    // A stock Ubuntu has `python3` and no `python`, so a printed line that runs
+    // `python` fails there after a correct fix. Text only: the line is run by
+    // `the_override_fix_verify_runs_where_only_python3_exists` in rocm-core
+    // (Unix hosts), and this machine may have no torch.
+    assert_eq!(
+        verify,
+        "echo \"${HSA_OVERRIDE_GFX_VERSION:-OK_UNSET}\"; python3 -c \"import torch; print(torch.cuda.is_available())\"",
+        "the printed verify line changed"
+    );
+    assert!(
+        !verify.split_whitespace().any(|word| word == "python"),
+        "the verify line must not run bare `python`: {verify}"
+    );
+}
+
+#[given("a simulated Linux machine with ROCm missing from PATH")]
+async fn simulated_linux_machine_without_rocm_on_path(world: &mut E2eWorld) {
+    // Planted host root, as in diagnose-40/42, so the runner's own ROCm state
+    // is not what is described. The symptom below is what makes the cause fire.
+    let host = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("host-root");
+    std::fs::create_dir_all(host.join("etc")).expect("failed to create planted etc");
+    std::fs::write(
+        host.join("etc/os-release"),
+        "ID=ubuntu
+VERSION_ID=\"24.04\"
+VERSION_CODENAME=noble
+PRETTY_NAME=\"Ubuntu 24.04 LTS\"
+",
+    )
+    .expect("failed to write planted os-release");
+    world
+        .command_env
+        .push(("ROCM_CLI_TEST_HOST_ROOT", host.into_os_string()));
+}
+
+#[when("the user diagnoses that machine with a rocminfo not found symptom")]
+async fn user_diagnoses_rocminfo_not_found(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(
+        world,
+        &[
+            "diagnose",
+            "--symptom",
+            "rocminfo: command not found",
+            "--top",
+            "20",
+        ],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the PATH cause prints a verify line that shows the GPU with rocminfo alone")]
+async fn assert_diagnose_path_verify_is_rocminfo_alone(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no diagnose output");
+    let verify = diagnose_verify_line(output, "fix-6-path");
+    // `hipcc` is the compiler a runtime-only install does not have, so a line
+    // that chains it fails there with PATH fixed. Text only: running `rocminfo`
+    // needs ROCm on the lane.
+    assert_eq!(
+        verify, "rocminfo | head -n 5",
+        "the printed verify line changed"
+    );
+    assert!(
+        !verify.contains("hipcc"),
+        "the verify line must not need hipcc: {verify}"
+    );
 }
 
 // ── Windows display driver advice ──────────────────────────────────
