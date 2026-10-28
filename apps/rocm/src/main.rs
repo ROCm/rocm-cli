@@ -141,10 +141,12 @@ use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command as ProcessCommand;
 use std::process::ExitCode;
 #[cfg(all(test, not(windows)))]
 use std::process::ExitStatus;
-use std::process::{Command as ProcessCommand, Stdio};
+#[cfg(not(windows))]
+use std::process::Stdio;
 #[cfg(test)]
 use std::sync::Mutex;
 use std::thread;

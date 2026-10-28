@@ -61,7 +61,9 @@
 //! and `#[cfg(not(target_os = "linux"))]` — both moved intact, cfg-gates
 //! unchanged, no platform behavior change.
 
+#[cfg(any(target_os = "linux", test))]
 use std::fs;
+#[cfg(any(target_os = "linux", test))]
 use std::path::Path;
 use std::process::{Command as ProcessCommand, Stdio};
 
