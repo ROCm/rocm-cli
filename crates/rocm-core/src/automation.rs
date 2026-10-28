@@ -1146,25 +1146,26 @@ mod tests {
         }
     }
 
-    // Regression test for concurrent writers silently dropping each other's
-    // records: every append used to read the whole store, add one line in
-    // memory, and rename a rewritten copy over the original, so two writers
-    // that overlapped kept only the last rename (and two threads of one
-    // process even shared a temp-file name).
-    #[test]
-    fn concurrent_appends_from_many_threads_lose_no_records() -> Result<()> {
-        const WRITERS: usize = 8;
-        const APPENDS_PER_WRITER: usize = 25;
-        let (root, paths) = temp_app_paths("jsonl-concurrent-threads");
-        paths.ensure()?;
-        let barrier = std::sync::Barrier::new(WRITERS);
+    /// Run `writers` threads, each appending `appends_per_writer` tagged
+    /// records (`t<writer>-<n>`) to all three stores concurrently (a
+    /// `Barrier` lines them up so the appends actually overlap rather than
+    /// running one at a time), then return what each store actually holds
+    /// afterward. Shared by the two tests immediately below, which differ
+    /// only in what (if anything) was in the stores before this runs and in
+    /// what tags they expect alongside `t<writer>-<n>`.
+    fn run_concurrent_thread_appends(
+        paths: &AppPaths,
+        writers: usize,
+        appends_per_writer: usize,
+    ) -> Result<[Vec<String>; 3]> {
+        let barrier = std::sync::Barrier::new(writers);
         std::thread::scope(|scope| {
-            let handles: Vec<_> = (0..WRITERS)
+            let handles: Vec<_> = (0..writers)
                 .map(|writer| {
-                    let (paths, barrier) = (&paths, &barrier);
+                    let (paths, barrier) = (paths, &barrier);
                     scope.spawn(move || -> Result<()> {
                         barrier.wait();
-                        for n in 0..APPENDS_PER_WRITER {
+                        for n in 0..appends_per_writer {
                             append_to_every_store(paths, &format!("t{writer}-{n}"))?;
                         }
                         Ok(())
@@ -1176,11 +1177,25 @@ mod tests {
             }
             Ok::<_, anyhow::Error>(())
         })?;
+        tags_in_every_store(paths)
+    }
+
+    // Regression test for concurrent writers silently dropping each other's
+    // records: every append used to read the whole store, add one line in
+    // memory, and rename a rewritten copy over the original, so two writers
+    // that overlapped kept only the last rename (and two threads of one
+    // process even shared a temp-file name).
+    #[test]
+    fn concurrent_appends_from_many_threads_lose_no_records() -> Result<()> {
+        const WRITERS: usize = 8;
+        const APPENDS_PER_WRITER: usize = 25;
+        let (root, paths) = temp_app_paths("jsonl-concurrent-threads");
+        paths.ensure()?;
+        let stores = run_concurrent_thread_appends(&paths, WRITERS, APPENDS_PER_WRITER);
 
         let expected: Vec<String> = (0..WRITERS)
             .flat_map(|writer| (0..APPENDS_PER_WRITER).map(move |n| format!("t{writer}-{n}")))
             .collect();
-        let stores = tags_in_every_store(&paths);
         fs::remove_dir_all(root).ok();
         assert_every_store_holds_exactly(stores?, &expected);
         Ok(())
@@ -1227,32 +1242,13 @@ mod tests {
         const APPENDS_PER_WRITER: usize = 25;
         let (root, paths) = temp_app_paths("jsonl-torn-tail-concurrent");
         seed_torn_tail_in_every_store(&paths)?;
-        let barrier = std::sync::Barrier::new(WRITERS);
-        std::thread::scope(|scope| {
-            let handles: Vec<_> = (0..WRITERS)
-                .map(|writer| {
-                    let (paths, barrier) = (&paths, &barrier);
-                    scope.spawn(move || -> Result<()> {
-                        barrier.wait();
-                        for n in 0..APPENDS_PER_WRITER {
-                            append_to_every_store(paths, &format!("t{writer}-{n}"))?;
-                        }
-                        Ok(())
-                    })
-                })
-                .collect();
-            for handle in handles {
-                handle.join().expect("writer thread panicked")?;
-            }
-            Ok::<_, anyhow::Error>(())
-        })?;
+        let stores = run_concurrent_thread_appends(&paths, WRITERS, APPENDS_PER_WRITER);
 
         let mut expected: Vec<String> = vec!["seed".to_owned()];
         expected.extend(
             (0..WRITERS)
                 .flat_map(|writer| (0..APPENDS_PER_WRITER).map(move |n| format!("t{writer}-{n}"))),
         );
-        let stores = tags_in_every_store(&paths);
         fs::remove_dir_all(root).ok();
         assert_every_store_holds_exactly(stores?, &expected);
         Ok(())
