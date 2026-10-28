@@ -81,6 +81,9 @@ pub fn open_running(jobs: &mut State) -> (ExamineManagerState, Vec<SideEffect>) 
     (d, fx)
 }
 
+/// The `rocm` argv (after the binary) this screen runs.
+pub(crate) const EXAMINE_ARGS: &[&str] = &["examine"];
+
 /// Spawn `rocm examine` (read-only). A stable id replaces any prior console.
 fn run_examine(d: &mut ExamineManagerState, jobs: &mut State) -> Vec<SideEffect> {
     let cmd = resolve_exe();
@@ -88,7 +91,7 @@ fn run_examine(d: &mut ExamineManagerState, jobs: &mut State) -> Vec<SideEffect>
     let fx = jobs.apply(StateEvent::StartJob {
         id: id.clone(),
         cmd,
-        args: vec!["examine".to_string()],
+        args: EXAMINE_ARGS.iter().map(|arg| (*arg).to_string()).collect(),
     });
     // Examine uses a single stable id, so a no-op (a prior run still going)
     // means re-attach to that same console — intentional, unlike the
