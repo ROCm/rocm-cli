@@ -2673,7 +2673,11 @@ mod tests {
 
         append_automation_event(&paths, &event_record("new"))?;
         let rotated = jsonl_generation_path(&paths.automation_events_path(), 1).exists();
-        let recent = load_recent_automation_events(&paths, 1);
+        // `limit: 2` so the read must actually cross into the rotated `.1` to
+        // satisfy it — `limit: 1` would be answered by the live file alone and
+        // never exercise `load_recent_automation_events`'s own
+        // `EVENT_LOG_ROTATED_GENERATIONS` wiring, only the append side's.
+        let recent = load_recent_automation_events(&paths, 2);
         fs::remove_dir_all(root).ok();
 
         assert!(
@@ -2685,7 +2689,7 @@ mod tests {
                 .into_iter()
                 .map(|event| event.message)
                 .collect::<Vec<_>>(),
-            ["new"]
+            ["filler", "new"]
         );
         Ok(())
     }
@@ -2699,7 +2703,10 @@ mod tests {
 
         append_audit_event(&paths, &audit_record("new"))?;
         let rotated = jsonl_generation_path(&paths.audit_events_path(), 1).exists();
-        let recent = load_recent_audit_events(&paths, 1);
+        // `limit: 2`, for the same reason as the events-store twin above: the
+        // read must actually cross into `.1` to exercise
+        // `load_recent_audit_events`'s own generations wiring.
+        let recent = load_recent_audit_events(&paths, 2);
         fs::remove_dir_all(root).ok();
 
         assert!(
@@ -2711,7 +2718,7 @@ mod tests {
                 .into_iter()
                 .map(|event| event.message)
                 .collect::<Vec<_>>(),
-            ["new"]
+            ["filler", "new"]
         );
         Ok(())
     }
