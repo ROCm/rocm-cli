@@ -6454,8 +6454,11 @@ fn ensure_managed_python(
 /// resolver somewhere else without touching the process environment. Tests need
 /// that: `cargo test` runs every test as a thread in one process, so a test that
 /// overwrote `PATH` to steer this resolver also hid every other PATH-resolved
-/// binary from unrelated tests running at the same moment.
-#[derive(Clone)]
+/// binary from unrelated tests running at the same moment. In test builds, a
+/// test can also install one as a thread-local override (see
+/// [`OverridePythonResolverEnv`]) instead of constructing one to pass directly
+/// to [`resolve_python_launcher_in`].
+#[cfg_attr(test, derive(Clone))]
 struct PythonResolverEnv {
     /// `ROCM_CLI_PYTHON`: an explicit interpreter that wins over any search.
     python_override: Option<String>,
@@ -6490,7 +6493,9 @@ thread_local! {
 
 /// RAII guard installing a fixed [`PythonResolverEnv`] for [`resolve_python_launcher`]
 /// on the calling thread only, restoring the prior override on drop (so nested
-/// use composes correctly, mirroring [`SuppressProgressOutput`]).
+/// use composes correctly, mirroring [`SuppressProgressOutput`] — see the
+/// `nested_python_resolver_env_override_restores_the_outer_one_on_drop` test
+/// for the property this claims).
 #[cfg(test)]
 struct OverridePythonResolverEnv {
     previous: Option<PythonResolverEnv>,
@@ -7785,6 +7790,12 @@ mod tests {
         // see issue #650, where mutating process-wide `PATH` to steer this
         // test raced any sibling test thread that spawned a PATH-resolved
         // binary (e.g. bare-name `tar`) during the window.
+        //
+        // The lock below is no longer for `PATH`: it's still needed because
+        // this test mutates the real `ROCM_CLI_DISABLE_MANAGED_PYTHON_BOOTSTRAP`
+        // process env var below, and every process-env-mutating test in this
+        // file takes this lock, even where (as here) nothing else currently
+        // reads that specific variable.
         let _env_guard = PROCESS_ENV_TEST_LOCK.lock().unwrap();
         let (root, paths) = test_paths("render-update-json-installs-guard");
 
@@ -10509,6 +10520,54 @@ mod tests {
 
         fs::remove_dir_all(root).ok();
         Ok(())
+    }
+
+    #[test]
+    fn nested_python_resolver_env_override_restores_the_outer_one_on_drop() {
+        // Mirrors `suppress_progress_output_contract`'s bookkeeping check for
+        // `SuppressProgressOutput`: proves the same restore-previous
+        // composition for `OverridePythonResolverEnv`, which its doc comment
+        // claims but nothing else here exercises. Thread-local, so this
+        // doesn't race with other tests' threads.
+        assert!(python_resolver_env_override().is_none());
+        {
+            let _outer = OverridePythonResolverEnv::new(PythonResolverEnv {
+                python_override: Some("outer".to_owned()),
+                search_dirs: vec![],
+            });
+            assert_eq!(
+                python_resolver_env_override()
+                    .unwrap()
+                    .python_override
+                    .as_deref(),
+                Some("outer")
+            );
+            {
+                let _inner = OverridePythonResolverEnv::new(PythonResolverEnv {
+                    python_override: Some("inner".to_owned()),
+                    search_dirs: vec![],
+                });
+                assert_eq!(
+                    python_resolver_env_override()
+                        .unwrap()
+                        .python_override
+                        .as_deref(),
+                    Some("inner")
+                );
+            }
+            assert_eq!(
+                python_resolver_env_override()
+                    .unwrap()
+                    .python_override
+                    .as_deref(),
+                Some("outer"),
+                "dropping the inner override must restore the outer one, not clear it"
+            );
+        }
+        assert!(
+            python_resolver_env_override().is_none(),
+            "dropping the outer override must restore the pre-override state"
+        );
     }
 
     #[cfg(unix)]
