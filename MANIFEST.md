@@ -395,7 +395,7 @@ repository.
 | rustc-hash | 2.1.2 | Apache-2.0 OR MIT |
 | rustc_version | 0.4.1 | MIT OR Apache-2.0 |
 | rustix | 1.1.4 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT |
-| rustls | 0.23.41 | Apache-2.0 OR ISC OR MIT |
+| rustls | 0.23.43 | Apache-2.0 OR ISC OR MIT |
 | rustls-native-certs | 0.7.3 | Apache-2.0 OR ISC OR MIT |
 | rustls-native-certs | 0.8.4 | Apache-2.0 OR ISC OR MIT |
 | rustls-pemfile | 2.2.0 | Apache-2.0 OR ISC OR MIT |

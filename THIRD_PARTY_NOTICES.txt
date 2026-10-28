@@ -6046,7 +6046,7 @@ The following component(s) are licensed under Apache License 2.0:
   - rustls-native-certs 0.7.3 <https://github.com/rustls/rustls-native-certs>
   - rustls-native-certs 0.8.4 <https://github.com/rustls/rustls-native-certs>
   - rustls-pemfile 2.2.0 <https://github.com/rustls/pemfile>
-  - rustls 0.23.41 <https://github.com/rustls/rustls>
+  - rustls 0.23.43 <https://github.com/rustls/rustls>
   - scopeguard 1.2.0 <https://github.com/bluss/scopeguard>
   - secret-service 5.1.0 <https://github.com/hwchen/secret-service-rs.git>
   - security-framework-sys 2.17.0 <https://github.com/kornelski/rust-security-framework>
