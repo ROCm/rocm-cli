@@ -640,6 +640,19 @@ pub fn lifecycle_lane_includes(decl: &ScenarioDecl, extra_ids: &[String]) -> boo
             .is_some_and(|id| extra_ids.iter().any(|e| e == id))
 }
 
+/// `extra_ids` entries that match no scenario's `@id` in `known_ids`.
+///
+/// `lifecycle_lane_includes` folds an unmatched id in silently — a renamed or
+/// typo'd `@id:` tag would otherwise drop a scenario out of the lane with CI
+/// staying green. The caller should treat a non-empty result as fatal.
+pub fn unmatched_also_run_ids<'a>(extra_ids: &'a [String], known_ids: &[String]) -> Vec<&'a str> {
+    extra_ids
+        .iter()
+        .filter(|id| !known_ids.contains(*id))
+        .map(String::as_str)
+        .collect()
+}
+
 /// Tiny glob: `*` matches any run of chars. Used only for `therock_family`.
 fn glob_match(pattern: &str, text: &str) -> bool {
     let pattern = pattern.to_ascii_lowercase();
@@ -994,6 +1007,29 @@ serve_timeout_secs = 90
             &d,
             &["comfyui-uv-install-failure-names-log".to_owned()]
         ));
+    }
+
+    #[test]
+    fn unmatched_also_run_ids_is_empty_when_every_extra_id_matches_a_known_id() {
+        let known = vec!["comfyui-01".to_owned(), "comfyui-02".to_owned()];
+        let extra = vec!["comfyui-01".to_owned()];
+        assert!(unmatched_also_run_ids(&extra, &known).is_empty());
+    }
+
+    #[test]
+    fn unmatched_also_run_ids_names_an_extra_id_no_scenario_carries() {
+        let known = vec!["comfyui-01".to_owned()];
+        let extra = vec!["comfyui-01".to_owned(), "comfyui-02-renamed".to_owned()];
+        assert_eq!(
+            unmatched_also_run_ids(&extra, &known),
+            vec!["comfyui-02-renamed"]
+        );
+    }
+
+    #[test]
+    fn unmatched_also_run_ids_is_empty_when_extra_ids_is_empty() {
+        let known = vec!["comfyui-01".to_owned()];
+        assert!(unmatched_also_run_ids(&[], &known).is_empty());
     }
 
     #[test]

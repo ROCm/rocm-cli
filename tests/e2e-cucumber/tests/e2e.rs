@@ -1171,7 +1171,9 @@ async fn main() {
 
     use cucumber::writer::{self, Stats as _};
     use e2e_cucumber::capability::host_capability;
-    use e2e_cucumber::expectation::{Expectation, ScenarioDecl, lifecycle_lane_includes, resolve};
+    use e2e_cucumber::expectation::{
+        Expectation, ScenarioDecl, lifecycle_lane_includes, resolve, unmatched_also_run_ids,
+    };
     use e2e_cucumber::monotonic_clock::MonotonicClockWriter;
 
     let dir = results_dir();
@@ -1328,6 +1330,10 @@ async fn main() {
         // host — e.g. a required engine can't start) are filtered out and never
         // run; their resolution is still recorded so platform.json can show N/A.
         .filter_run(concat!(env!("CARGO_MANIFEST_DIR"), "/features/"), {
+            // Cloned so the outer `also_run_ids` survives this `move` closure —
+            // it is checked against every recorded scenario id after the run,
+            // to catch a listed id that matched nothing.
+            let also_run_ids = also_run_ids.clone();
             move |feature, _rule, scenario| {
                 let decl = ScenarioDecl::from_tags(&scenario.tags);
                 let expectation = resolve(
@@ -1391,6 +1397,17 @@ async fn main() {
     let actual = e2e_cucumber::report::scenario_results_by_id(&dir.join("report.json"))
         .expect("failed to read scenario results");
     let resolutions = resolutions.lock().expect("resolutions poisoned");
+
+    // Every scenario's id was recorded above regardless of whether it ran, so
+    // an `E2E_ALSO_RUN_IDS` entry missing from `resolutions` means no scenario
+    // in the suite carries that `@id` — a rename or typo that would otherwise
+    // silently drop the scenario from this lane while CI stayed green.
+    let known_ids: Vec<String> = resolutions.keys().cloned().collect();
+    let unmatched = unmatched_also_run_ids(&also_run_ids, &known_ids);
+    assert!(
+        unmatched.is_empty(),
+        "E2E_ALSO_RUN_IDS listed id(s) that no scenario carries (rename or typo?): {unmatched:?}"
+    );
 
     // Collect component versions (OS/ROCm/vLLM/lemonade) for the report heading.
     // OS is always collected (every platform, incl. mock); ROCm/vLLM/lemonade come
