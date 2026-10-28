@@ -111,13 +111,11 @@ async fn pending_artifact_download_proposal(world: &mut E2eWorld) {
 
 /// Seed the audit-event store with one clean record followed by a cut-off
 /// JSON fragment with no trailing newline — the shape a writer killed
-/// mid-append leaves, and what a lock-free reader (`render_automations_text`,
-/// reached by `rocm automations`, the `rocm_command` assistant tool shared
-/// by `rocm chat` and the TUI's slash commands, and the TUI's own
-/// automations-manager screen alike) must skip rather than fail the whole
-/// read on. See `scan_recent_jsonl_records`/`is_torn_record` in `rocm-core`
-/// (the read path this exercises — not `inspect_tail`, which is the write
-/// path's own, separate torn-tail check).
+/// mid-append leaves. See the scenario's own comment in `automations.feature`
+/// for why this matters and who reads this store; see
+/// `scan_recent_jsonl_records`/`is_torn_record` in `rocm-core` for the read
+/// path this exercises (not `inspect_tail`, which is the write path's own,
+/// separate torn-tail check).
 #[given("the audit event log ends in a torn, unterminated line")]
 async fn torn_audit_tail(world: &mut E2eWorld) {
     let paths = world.app_paths();
@@ -204,15 +202,13 @@ async fn enable_unknown(world: &mut E2eWorld) {
 
 #[then("the CLI still lists the record before the torn tail")]
 async fn still_lists_record_before_torn_tail(world: &mut E2eWorld) {
-    // rc == 0 alone wouldn't prove much here: render_automations_text reads
-    // every store through `.unwrap_or_default()`, so even a hard read error
-    // would render as an empty section rather than a nonzero exit. The count
-    // below is the real assertion: `audit_event_plain_summary` renders every
-    // audit event's category to one of a handful of fixed strings (never the
-    // raw message), so the fixture's "concurrency" category falls through to
-    // the generic one; exactly one occurrence confirms the one clean record
-    // before the torn tail was actually read and rendered, not silently
-    // dropped along with it (zero) or duplicated (more than one).
+    // The count, not rc == 0, is the real assertion here (see
+    // `automations.feature` for why). `audit_event_plain_summary` renders
+    // every audit event's category to one of a handful of fixed strings
+    // (never the raw message), so the fixture's "concurrency" category falls
+    // through to the generic one; exactly one occurrence confirms the one
+    // clean record before the torn tail was actually read and rendered, not
+    // silently dropped along with it (zero) or duplicated (more than one).
     let out = ok_output(world);
     let activity_lines = out.matches("Background activity was recorded.").count();
     assert_eq!(

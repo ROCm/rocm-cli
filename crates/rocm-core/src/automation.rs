@@ -251,13 +251,22 @@ const JSONL_SCAN_CHUNK: u64 = 64 * 1024;
 ///
 /// A write that fails partway leaves whatever it already wrote as a new torn
 /// tail — the same debris a killed writer leaves — rather than rolling it
-/// back: seeing `Err` here means this specific record did not land (see
-/// [`append_or_tolerate_a_missing_newline`] for the one exception, where it
-/// did land despite the error), and the debris itself is discarded by the
-/// *next* append rather than being cut first as a separate step — see
-/// [`inspect_tail`] and [`TailState::Torn`]. A reader already skips the
-/// debris in the meantime. Nothing in this function ever truncates the live
-/// file, so a lock-free reader never observes it shrink.
+/// back, and the debris itself is discarded by the *next* append rather than
+/// being cut first as a separate step — see [`inspect_tail`] and
+/// [`TailState::Torn`]. A reader already skips the debris in the meantime.
+/// Nothing in this function ever truncates the live file, so a lock-free
+/// reader never observes it shrink.
+///
+/// [`append_or_tolerate_a_missing_newline`] checks whether a failed write
+/// landed anyway before reporting it, so a write that fails but still lands
+/// a complete record is reported as `Ok`, not `Err`. Seeing `Err` here
+/// usually does mean the record did not land — with one case where that's
+/// not knowable rather than false: if the write itself fails *and* the
+/// follow-up check of what actually landed also fails (a second I/O fault
+/// on the same unhealthy disk, say), the original write failure is reported
+/// without knowing whether the record landed anyway. A caller that retries
+/// on `Err` in that specific, low-likelihood case could write a duplicate
+/// the store has no way to detect or remove.
 fn append_jsonl_record<T: Serialize>(path: &Path, record: &T, context_label: &str) -> Result<()> {
     let mut line = serde_json::to_vec(record)
         .with_context(|| format!("failed to serialize {context_label}"))?;
@@ -317,6 +326,11 @@ fn append_jsonl_record<T: Serialize>(path: &Path, record: &T, context_label: &st
 /// a failure would tell a caller that retries on error to write the same
 /// record again, leaving a duplicate the store has no way to detect or
 /// remove — so this checks what actually landed before deciding.
+///
+/// That check can itself fail (stat or read-back hits its own I/O error),
+/// in which case this reports the original write failure without knowing
+/// whether the record landed anyway — the one case where `Err` here does
+/// not guarantee the record is absent (see [`append_jsonl_record`]'s doc).
 fn append_or_tolerate_a_missing_newline(
     path: &Path,
     file: &fs::File,
@@ -1583,13 +1597,18 @@ mod tests {
         Ok(())
     }
 
-    // Readers take no lock, so they can catch an append mid-write; that must
-    // never surface as a parse error from `rocm status` or the dashboard.
-    // This is a smoke test: on Linux a small append is rarely seen half-done,
-    // so the skip itself is pinned deterministically by
-    // `readers_skip_an_unterminated_last_line_that_does_not_parse`.
+    // Smoke test, not a race-pinning one: these stores stay well under one
+    // scan chunk, so on Linux a small append is essentially never actually
+    // observed half-written here, and this can mostly only fail via a
+    // propagated read/write error or the final count assertion — not by
+    // actually exercising the torn-line skip under real contention. That
+    // skip is pinned deterministically instead by
+    // `readers_skip_an_unterminated_last_line_that_does_not_parse`. What
+    // this test is still worth keeping for: a reader that started failing
+    // outright under concurrent load (rather than just reading stale data,
+    // which this can't detect either) would still show up here.
     #[test]
-    fn reads_racing_appends_never_fail() -> Result<()> {
+    fn concurrent_reads_and_appends_never_error() -> Result<()> {
         const APPENDS: usize = 200;
         let (root, paths) = temp_app_paths("jsonl-read-race");
         paths.ensure()?;
@@ -1784,6 +1803,49 @@ mod tests {
         );
         assert_eq!(on_disk?, contents);
         assert!(audit.is_err(), "a wrong-shape record must be reported");
+        Ok(())
+    }
+
+    // Mirrors the test above, but for the position half of
+    // parse_jsonl_records's guard rather than its shape half: a line that
+    // is not valid JSON (so `is_torn_record` is true for it, same as a
+    // genuine torn tail) but is NOT the store's last line must still be
+    // reported as an error, not silently skipped. Without the
+    // `index + 1 == line_count` half of that guard, this line would be
+    // indistinguishable from torn debris and silently dropped by
+    // update_automation_proposal_status's whole-file rewrite.
+    #[test]
+    fn a_corrupt_line_before_the_last_is_reported_not_dropped() -> Result<()> {
+        let (root, paths) = temp_app_paths("corrupt-line-not-last");
+        paths.ensure()?;
+        let corrupt = &serde_json::to_string(&proposal_record("corrupt"))?[..10];
+        // No trailing `\n` after "b": the buffer as a whole must be
+        // unterminated too, so the corrupt line is excluded from the
+        // tolerance window by the position check specifically
+        // (`index + 1 == line_count`) and not merely because the whole
+        // buffer happens to already be terminated.
+        let contents = format!(
+            "{}\n{corrupt}\n{}",
+            serde_json::to_string(&proposal_record("a"))?,
+            serde_json::to_string(&proposal_record("b"))?
+        );
+        fs::write(paths.automation_proposals_path(), &contents)?;
+        let proposals = load_automation_proposals(&paths);
+        let updated = update_automation_proposal_status(&paths, "a", "approved");
+        let on_disk = fs::read_to_string(paths.automation_proposals_path());
+        fs::remove_dir_all(root).ok();
+        assert!(
+            proposals.is_err(),
+            "a corrupt line that isn't the store's last line must be reported, not silently skipped"
+        );
+        assert!(
+            updated.is_err(),
+            "the rewrite must refuse, not drop the line"
+        );
+        assert_eq!(
+            on_disk?, contents,
+            "a refused rewrite must leave the file untouched"
+        );
         Ok(())
     }
 

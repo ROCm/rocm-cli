@@ -4564,16 +4564,20 @@ fn apply_service_prune_plan(
 /// run — the same kind of disagreement the paragraph above declines to ship.
 ///
 /// **No nested acquire.** `FileLock::acquire` blocks with no `try_` variant, so
-/// a second acquire on a path already held by this process would hang forever.
-/// Nothing under either phase acquires this path: the only other
-/// `FileLock::acquire` calls in the tree are `ensure_background_helper_running_quiet`,
-/// the managed-uv bootstrap in `rocm_core::uv`, and the per-store locks
-/// `rocm_core`'s automation module takes around each audit, event and proposal
-/// write — each on a different lock file — and none is reachable from here:
-/// `rocm services prune` records its audit event only after this returns and
-/// the lock is released. In the other
-/// direction `serve` holds this lock but never runs prune, in-process or as a
-/// subprocess.
+/// a second acquire on this same lock path while this process already holds
+/// it would hang forever. Nothing reachable from either phase re-acquires
+/// `managed_launch_lock_path`: the only other production call site on this
+/// same path is `select_gpu_indices_under_launch_lock`, which is only ever
+/// reached from `serve`, and `serve` never runs prune in-process or as a
+/// subprocess (test code acquires this path directly too, but that is test
+/// setup, not something reachable from this function's own call graph).
+///
+/// Separately, prune does cross a *different* lock — recording its audit
+/// event takes that store's own `jsonl_lock_path` — but that call
+/// (`record_cli_audit_event` in the `services` dispatch) happens only after
+/// *this* function has already returned and `_launch_lock` has dropped, so
+/// the two locks are never held at once and their acquisition order cannot
+/// matter.
 fn prune_managed_service_records(
     paths: &AppPaths,
     hours: u64,
