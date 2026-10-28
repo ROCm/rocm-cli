@@ -5516,6 +5516,13 @@ mod tests {
         // node's target is outside the APU list. `lspci` naming an APU is a
         // statement about the part, so the membership pass must not turn it into
         // "discrete" -- it only fills the target in.
+        //
+        // This is a guard-regression test, not a feature-presence one: with the
+        // whole reclassification removed, `is_apu` stays `Some(true)` here too,
+        // because the pre-change code never touched it in this branch. It fails
+        // only when the guard itself is weakened (e.g. to `if true`). Revert
+        // coverage for the fix is carried by
+        // `a_kernel_target_classifies_an_unnamed_apu` above.
         let mut e = Examination {
             gpus: vec![Gpu {
                 name: "Strix Halo [Radeon Graphics / Radeon 8050S Graphics / Radeon 8060S \

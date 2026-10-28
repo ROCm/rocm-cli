@@ -727,6 +727,12 @@ fn gfx_target_from_amd_pci_device_id(device_id: &str) -> Option<&'static str> {
         // [Radeon Graphics / Radeon 8050S Graphics / Radeon 8060S Graphics]",
         // but older packaged copies predate that entry, which is why this table
         // answers without reading one.
+        //
+        // Only the Windows/PNP path reads this row today
+        // (`gfx_target_from_pnp_device_id`); the Linux `lspci` reader that would
+        // consume it is the other half of #507 and does not exist yet. The Linux
+        // e2e scenarios for #449 exercise the kernel-target reclassification in
+        // `apply_kernel_gpu_membership`, not this row.
         "1586" => Some("gfx1151"),
         // Navi 48: Radeon RX 9070 / 9070 XT / 9070 GRE.
         "7550" => Some("gfx1201"),
