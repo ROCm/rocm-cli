@@ -1303,6 +1303,13 @@ async fn home_view_displayed(world: &mut E2eWorld) {
 #[then("the hero reports no GPU telemetry available")]
 async fn hero_reports_no_gpu_telemetry(world: &mut E2eWorld) {
     let tui = session(world);
+    // The VRAM/TEMP/POWER mini-sparks only draw in the hero's wide layout
+    // (`draw_hero_band`'s `hero.width >= 8 && hero.height >= 6` gate).
+    tui.use_wide_size()
+        .unwrap_or_else(|e| panic!("failed to enlarge the dashboard: {e}"));
+
+    // Runs after the resize: the header line carries the socket path and is
+    // cut off before "rocm daemon" at the default 80-column pty.
     // A client that never reached the daemon also reads "Unknown GPU" with
     // "—" values (`Disconnected` ends the pending placeholder), so first
     // require the connected header, which proves a snapshot channel exists.
@@ -1315,10 +1322,6 @@ async fn hero_reports_no_gpu_telemetry(world: &mut E2eWorld) {
     )
     .await
     .unwrap_or_else(|e| panic!("the dashboard never connected to its daemon: {e}"));
-    // The VRAM/TEMP/POWER mini-sparks only draw in the hero's wide layout
-    // (`draw_hero_band`'s `hero.width >= 8 && hero.height >= 6` gate).
-    tui.use_wide_size()
-        .unwrap_or_else(|e| panic!("failed to enlarge the dashboard: {e}"));
 
     // `use_wide_size` only resizes the pty; the TUI redraws asynchronously
     // once it processes the resulting SIGWINCH. Wait for that redraw by
