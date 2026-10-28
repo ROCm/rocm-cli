@@ -41,7 +41,7 @@
 
 use std::fmt::Write as _;
 use std::fs;
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -364,16 +364,8 @@ fn env_path(name: &str) -> Option<PathBuf> {
 }
 
 pub(crate) fn confirm_uninstall() -> Result<bool> {
-    print!("Proceed with uninstall? [y/N]: ");
-    io::stdout()
-        .flush()
-        .context("failed to flush uninstall prompt")?;
-    let mut response = String::new();
-    io::stdin()
-        .read_line(&mut response)
-        .context("failed to read uninstall confirmation")?;
-    let normalized = response.trim().to_ascii_lowercase();
-    Ok(matches!(normalized.as_str(), "y" | "yes"))
+    rocm_core::read_yes_no("Proceed with uninstall? [y/N]: ")
+        .context("failed to read uninstall confirmation")
 }
 
 fn collect_installed_binary_candidates(current_exe: &Path) -> Result<Vec<PathBuf>> {

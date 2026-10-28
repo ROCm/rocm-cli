@@ -1627,19 +1627,11 @@ fn confirm(prompt: &str, assume_yes: bool) -> bool {
         }
         return verdict;
     }
-    print!("{prompt} [y/N]: ");
-    let _ = std::io::stdout().flush();
-    let mut line = String::new();
-    let confirmed = std::io::stdin().read_line(&mut line).is_ok() && is_affirmative_answer(&line);
+    let confirmed = crate::confirm::read_yes_no(&format!("{prompt} [y/N]: ")).unwrap_or(false);
     if !confirmed {
         fail!("Not confirmed; refusing to apply.");
     }
     confirmed
-}
-
-/// Parse a user's typed response to a `[y/N]` prompt.
-fn is_affirmative_answer(line: &str) -> bool {
-    matches!(line.trim().to_lowercase().as_str(), "y" | "yes")
 }
 
 fn home_dir() -> Option<PathBuf> {
@@ -2265,26 +2257,6 @@ mod tests {
     // subject IS the `$ROCM_PATH` read — takes this lock. Anything provable
     // through the seam should not be reaching for the lock.
     static PROCESS_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    #[test]
-    fn is_affirmative_answer_accepts_only_y_and_yes() {
-        for accepted in ["y", "Y", "yes", "YES", "Yes", "  y  ", "  yes\n"] {
-            assert!(
-                is_affirmative_answer(accepted),
-                "expected {accepted:?} to be treated as a yes"
-            );
-        }
-    }
-
-    #[test]
-    fn is_affirmative_answer_rejects_everything_else() {
-        for declined in ["n", "no", "", "\n", "yep", "ye"] {
-            assert!(
-                !is_affirmative_answer(declined),
-                "expected {declined:?} to be treated as a decline"
-            );
-        }
-    }
 
     /// Whether a recipe applies on the platform the test is running on.
     ///

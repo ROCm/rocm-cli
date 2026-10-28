@@ -209,10 +209,11 @@ Current workspace members:
 
 Shared UI components — reuse rather than hand-rolling new ones. The CLI (`apps/rocm`) and the dash-TUI (`crates/rocm-dash-tui`) each have their own set; they are not interchangeable (see the naming-collision warning below).
 
-CLI, in [`apps/rocm/src/cli_progress.rs`](apps/rocm/src/cli_progress.rs):
+CLI:
 
-- **`Spinner`** — a caller-driven indicator that only advances when the caller's own loop ticks it (e.g. `serve`'s HTTP-polling wait loop)
-- **`AnimatedSpinner`** — progress that must keep animating between caller updates and can go quiet for long stretches (e.g. a download, or the ComfyUI/SDK extraction spinner)
+- [`cli_progress.rs`](apps/rocm/src/cli_progress.rs)'s **`Spinner`** — a caller-driven indicator that only advances when the caller's own loop ticks it (e.g. `serve`'s HTTP-polling wait loop)
+- [`cli_progress.rs`](apps/rocm/src/cli_progress.rs)'s **`AnimatedSpinner`** — progress that must keep animating between caller updates and can go quiet for long stretches (e.g. a download, or the ComfyUI/SDK extraction spinner)
+- [`confirm.rs`](crates/rocm-core/src/confirm.rs)'s **`read_yes_no`** — the shared `[y/N]` confirmation prompt (print the prompt, read a line, parse yes/no); `fix.rs` layers its own `--yes`/non-interactive short-circuit and refusal wording on top of this instead of re-deriving the prompt itself
 
 dash-TUI, in `crates/rocm-dash-tui/src/ui/`:
 
