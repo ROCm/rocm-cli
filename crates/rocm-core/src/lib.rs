@@ -354,6 +354,20 @@ pub fn unix_time_millis() -> u128 {
 /// temp file and losing one of the two updates.
 ///
 /// Not guaranteed:
+/// - Serializing writers: this takes no lock, so two read-modify-write
+///   cycles that overlap still lose one update (last rename wins). A caller
+///   whose new content depends on the old must hold a lock across the whole
+///   cycle, as the JSONL proposal store does (`automation::jsonl_lock_path`).
+///   Two callers in the *same process* within the same millisecond are a
+///   sharper case of this, not just a milder one: they generate the exact
+///   same temp path below, so concurrent `fs::write`s truncating that one
+///   path can publish mixed bytes, and the losing rename then fails outright
+///   (its source file already gone) rather than merely losing an update —
+///   this is the same-process collision
+///   `automation::tests::concurrent_appends_from_many_threads_lose_no_records`'s
+///   own comment describes ("two threads of one process even shared a
+///   temp-file name") — fixed for its own callers by the per-store lock
+///   `automation.rs` takes before ever calling into this function.
 /// - Durability: the bytes are not fsynced before the rename, so a power
 ///   loss can still surface the new name with unflushed contents.
 /// - Replacing a destination another process holds open without delete
