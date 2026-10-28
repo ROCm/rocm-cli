@@ -226,12 +226,12 @@ pub(crate) struct PlatformReport {
     /// or one that doesn't parse). Kept in full — not just the `tally`/`versions`
     /// derived from it — so [`Grid::build`] can read `platform_slug`,
     /// `capability` and every `expectations` entry without a second parse of
-    /// the same file (ROCMAI-731).
+    /// the same file.
     manifest: Option<PlatformManifest>,
     /// Scenario `@id` → whether it passed, from this platform's already-parsed
     /// `features`. Kept (not just folded into `tally`) so [`Grid::build`] can
     /// reconcile `manifest.expectations` against it directly, instead of
-    /// rebuilding the identical map from `features` a second time (ROCMAI-731).
+    /// rebuilding the identical map from `features` a second time.
     actual: std::collections::HashMap<String, bool>,
 }
 
@@ -548,7 +548,7 @@ struct FeatureGroup {
 /// The reconciled grid: scenario rows grouped by feature × platform columns.
 /// Built from each already-loaded [`PlatformReport`]'s stored `platform.json`
 /// manifest (expected) joined with its already-parsed `report.json` features
-/// (actual) by stable `@id` — no file is read again to build this (ROCMAI-731).
+/// (actual) by stable `@id` — no file is read again to build this.
 /// Reports with no manifest (pre-expectation artifacts) are skipped here — they
 /// still appear in the legacy platform×tier matrix.
 struct Grid {
@@ -613,7 +613,7 @@ impl Grid {
                 continue;
             };
             // Actual results by id — already computed once by `PlatformReport::load`
-            // from the same `features`; reused here rather than rebuilt (ROCMAI-731).
+            // from the same `features`; reused here rather than rebuilt.
             let actual = &report.actual;
 
             // Merge into an existing column with the same (slug, channel) —
@@ -634,7 +634,7 @@ impl Grid {
                     // `PlatformReport::desc`, the same derivation every other
                     // section of the report uses for its platform label (issue
                     // #702), computed once by `PlatformReport::load` rather than
-                    // re-parsed here (ROCMAI-731). Both fields, not just
+                    // re-parsed here. Both fields, not just
                     // `platform`: see `GridColumn::os`'s doc for why OS has to be
                     // part of the label here specifically.
                     columns.push(GridColumn {
@@ -830,8 +830,7 @@ fn id_features(reports: &[PlatformReport]) -> BTreeMap<String, String> {
 /// feature list. (Internal sibling of the public
 /// [`crate::parse::scenario_results_by_id`], returning a map.) Takes `&[Feature]`
 /// rather than a path so a caller that already holds a parsed `report.json`
-/// (every caller, via `PlatformReport`'s own `features`) never re-reads it
-/// (ROCMAI-731).
+/// (every caller, via `PlatformReport`'s own `features`) never re-reads it.
 fn id_pass_map(features: &[Feature]) -> std::collections::HashMap<String, bool> {
     features
         .iter()
@@ -918,8 +917,8 @@ impl PlatformReport {
             .any(|el| el.tags.iter().any(|t| t.name == EXPECTED_FAILURE_TAG));
         let desc = parse_descriptor(&artifact);
         let commands = parse_commands(json_path);
-        // Parsed exactly once here (ROCMAI-731): `tally` and `versions` are both
-        // derived from this same `manifest`, and the manifest itself is kept on
+        // Parsed exactly once here: `tally` and `versions` are both derived
+        // from this same `manifest`, and the manifest itself is kept on
         // `Self` so `Grid::build` can read it too without a second parse.
         let manifest = parse_platform_manifest(json_path);
         let actual = id_pass_map(&features);
@@ -1054,7 +1053,7 @@ pub struct PlatformReports {
 /// Parse every `(label, json_path)` input into a [`PlatformReport`], in input
 /// order. The one place `report.json`/`platform.json`/`commands.jsonl` are
 /// read from disk — [`Grid::build`] and [`scenario_reference`] consume the
-/// resulting `PlatformReport`s instead of re-reading (ROCMAI-731).
+/// resulting `PlatformReport`s instead of re-reading.
 fn load_reports(inputs: &[(String, PathBuf)]) -> Vec<PlatformReport> {
     inputs
         .iter()
@@ -1073,9 +1072,9 @@ fn load_reports(inputs: &[(String, PathBuf)]) -> Vec<PlatformReport> {
 /// builds each part once, not once per output or per report section. Each
 /// input's files are parsed exactly once, by `PlatformReport::load`
 /// (`load_reports`) — `Grid::build` and `scenario_reference` consume that
-/// already-parsed data and never re-read a file (ROCMAI-731).
+/// already-parsed data and never re-read a file.
 pub fn load_platform_reports(inputs: &[(String, PathBuf)]) -> PlatformReports {
-    let reports = load_reports(inputs);
+    let mut reports = load_reports(inputs);
     // From `reports` in their as-loaded (input) order, BEFORE the sort below:
     // `Grid::build` lays columns out in that order, and sorting first would
     // change that.
@@ -1083,7 +1082,6 @@ pub fn load_platform_reports(inputs: &[(String, PathBuf)]) -> PlatformReports {
     let scenarios = scenario_reference(&reports);
     // Group each platform's rows together and order tiers expect-pass → known
     // bugs, instead of the alphabetical mash of the old single-label sort.
-    let mut reports = reports;
     reports.sort_by(|a, b| report_sort_key(a).cmp(&report_sort_key(b)));
     PlatformReports {
         reports,
@@ -1103,7 +1101,7 @@ fn platform_cell(r: &PlatformReport) -> String {
 /// Full label (platform AND OS) for a platform excluded from the expectation
 /// grid because its artifact has no usable `platform.json` (see
 /// [`Grid::excluded`]). Takes the already-computed `PlatformReport::desc`
-/// rather than re-deriving one from the raw artifact name (ROCMAI-731).
+/// rather than re-deriving one from the raw artifact name.
 /// Deliberately mirrors [`PlatformReport::load`]'s `label` field and
 /// [`GridColumn::label`] (same shape, no `versions.channel` to prefer since
 /// there is no manifest, so this falls back to the artifact-name channel
@@ -2013,7 +2011,7 @@ mod tests {
 
     #[test]
     fn grid_and_scenario_reference_do_not_re_read_the_input_files() {
-        // ROCMAI-731: `Grid::build` and `scenario_reference` must work from an
+        // `Grid::build` and `scenario_reference` must work from an
         // already-loaded `PlatformReport`, never re-open its `report.json`/
         // `platform.json`. Build the report via `PlatformReport::load`, then
         // delete the backing directory — if either function still opened a
@@ -2042,6 +2040,11 @@ mod tests {
             grid.excluded
         );
         assert_eq!(grid.groups.len(), 1);
+        assert_eq!(
+            grid.columns[0].outcomes.get("serve-a"),
+            Some(&CellOutcome::Pass),
+            "row cell outcome lost after the backing files were deleted"
+        );
 
         let scenarios = scenario_reference(&reports);
         // `scenario_reference` names scenarios from `report.json` (`feature_json`
