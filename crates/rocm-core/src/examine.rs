@@ -1888,15 +1888,26 @@ fn driver_states(modules: Option<&[&str]>) -> (Option<bool>, Option<bool>) {
     )
 }
 
-fn probe_modules(e: &mut Examination) {
+/// The kernel's module list, one module per line with its name first: `lsmod`
+/// without its header, else `/proc/modules`. `None` when neither can be read.
+fn read_module_list() -> Option<String> {
     let (rc, out, _) = run("lsmod", &[], SHORT);
-    let module_text = if rc == 0 {
+    if rc == 0 {
         Some(out.lines().skip(1).collect::<Vec<_>>().join("\n"))
     } else {
         let txt = read_host_text("/proc/modules");
         if txt.is_empty() { None } else { Some(txt) }
-    };
-    let modules: Option<Vec<&str>> = module_text.as_deref().map(|text| {
+    }
+}
+
+fn probe_modules(e: &mut Examination) {
+    probe_modules_from(e, read_module_list().as_deref());
+}
+
+/// `probe_modules` given the module list, so a test can hand one in instead
+/// of reading the machine's own.
+fn probe_modules_from(e: &mut Examination, module_text: Option<&str>) {
+    let modules: Option<Vec<&str>> = module_text.map(|text| {
         text.lines()
             .filter_map(|line| line.split_whitespace().next())
             .collect()
@@ -6571,14 +6582,17 @@ mod tests {
         assert!(planted, "/sys/bus/pci/drivers/amdgpu counts");
     }
 
-    /// The wiring, not just the helpers: `probe_modules` must consult the host
-    /// root. The `amdgpu` module line cannot be planted away on a machine that
-    /// has one, so this asserts `amdgpu_loaded` only positively: with
-    /// `/sys/bus/pci/drivers/amdgpu` planted it is `Some(true)` whatever the
-    /// module list says. It assumes, like the kfd test below, a runner whose
-    /// kernel lists no `amdkfd` module (none since 4.20); then the driver
-    /// directory alone must not make `amdkfd_loaded` true. `driver_states`
-    /// is tested for the same case without that assumption.
+    /// The wiring, not just the helpers: `probe_modules_from` must consult the
+    /// host root. The module list it is handed names neither driver, so
+    /// `amdgpu_loaded` can only come from the planted
+    /// `/sys/bus/pci/drivers/amdgpu`, and that directory must not make
+    /// `amdkfd_loaded` true.
+    /// A module list, as `read_module_list` returns it, naming neither
+    /// `amdgpu` nor `amdkfd`.
+    #[cfg(all(feature = "e2e-test-hooks", target_os = "linux"))]
+    const NO_AMD_MODULES: &str = "snd_hda_intel 61440 3 - Live 0x0000000000000000\n\
+                                  nvme 61440 2 - Live 0x0000000000000000";
+
     #[cfg(all(feature = "e2e-test-hooks", target_os = "linux"))]
     #[test]
     fn probe_modules_reports_amdgpu_when_it_is_on_the_host() {
@@ -6599,14 +6613,14 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let _root = RestoredEnvVar::set(TEST_HOST_ROOT_ENV, &root);
             let mut e = Examination::default();
-            probe_modules(&mut e);
+            probe_modules_from(&mut e, Some(NO_AMD_MODULES));
             (e.amdgpu_loaded, e.amdkfd_loaded)
         };
         std::fs::remove_dir_all(&root).ok();
         assert_eq!(amdgpu_loaded, Some(true));
-        assert_ne!(
+        assert_eq!(
             amdkfd_loaded,
-            Some(true),
+            Some(false),
             "the amdgpu PCI driver does not imply kfd"
         );
     }
@@ -6751,8 +6765,8 @@ mod tests {
         );
     }
 
-    /// The wiring, not just the helpers: `probe_modules` must consult the host
-    /// root. On every machine this runs on, no `amdkfd` module line exists, so
+    /// The wiring, not just the helpers: `probe_modules_from` must consult the
+    /// host root. The module list it is handed names neither driver, so
     /// `Some(true)` can only come from the planted `/dev/kfd`, which answers
     /// `amdgpu_loaded` too.
     #[cfg(all(feature = "e2e-test-hooks", target_os = "linux"))]
@@ -6776,7 +6790,7 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let _root = RestoredEnvVar::set(TEST_HOST_ROOT_ENV, &root);
             let mut e = Examination::default();
-            probe_modules(&mut e);
+            probe_modules_from(&mut e, Some(NO_AMD_MODULES));
             (e.amdgpu_loaded, e.amdkfd_loaded)
         };
         std::fs::remove_dir_all(&root).ok();
