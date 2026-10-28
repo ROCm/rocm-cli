@@ -1152,12 +1152,29 @@ jobs:
       # is included because `rocm install driver` emits a hard `command -v
       # sudo` precondition into its WSL plan even when the caller is already
       # root, and the @requires-wsl driver scenarios render that plan.
+      #
+      # `apt-get update` is retried: every job starts a fresh guest against the
+      # public Ubuntu archive, and while a mirror is mid-sync it serves index
+      # files that disagree with its Release file ("File has unexpected size
+      # ... Mirror sync in progress?"). apt-get then exits non-zero and the
+      # whole lane fails before building anything. The sync settles within
+      # minutes, so a few spaced attempts ride it out.
       - name: Ensure native build deps
         shell: powershell
         run: |
           # See .github/scripts/Invoke-WslBash.ps1.
           & "$env:GITHUB_WORKSPACE\.github\scripts\Invoke-WslBash.ps1" -PipeFail -Script @'
-          apt-get update
+          for attempt in 1 2 3 4; do
+            if apt-get update; then
+              break
+            fi
+            if [ "$attempt" -eq 4 ]; then
+              echo "apt-get update failed after $attempt attempts" >&2
+              exit 1
+            fi
+            echo "apt-get update failed (attempt $attempt); retrying in 60s"
+            sleep 60
+          done
           apt-get install -y --no-install-recommends \
             pkg-config build-essential libcap-dev git ca-certificates curl sudo
           '@
