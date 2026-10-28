@@ -37,7 +37,7 @@ This workflow adds OSS safety and verification guardrails on top of normal dev f
   - opening/closing/merging PRs
   - public comments/review replies
   - changes to shared or public state
-- Before proposing or executing a force-push, check the PR's live review/approval state (`gh pr view --json reviews,reviewDecision`), not just the user's go-ahead for the push itself — flag it if existing approvals would be invalidated
+- Before proposing or executing a force-push, check the PR's live review/approval state (`gh pr view --json reviews,reviewDecision`), not just the user's go-ahead for the push itself — flag it in the approval request if existing approvals would be invalidated.
 
 ## 2) Company Identity Required, Internal Content Forbidden
 
