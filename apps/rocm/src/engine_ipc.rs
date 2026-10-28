@@ -324,6 +324,7 @@ fn builtin_engine_request(
             envelope.clone(),
         )),
         "vllm" => Some(rocm_engine_vllm::builtin_handle_envelope(envelope.clone())),
+        "aim" => Some(rocm_engine_aim::builtin_handle_envelope(envelope.clone())),
         _ => None,
     }
 }
@@ -342,7 +343,7 @@ pub(crate) fn run_builtin_engine_stdio(engine: &str) -> Result<()> {
 }
 
 pub(crate) fn builtin_engine_available(engine: &str) -> bool {
-    matches!(engine, "lemonade" | "vllm")
+    matches!(engine, "lemonade" | "vllm" | "aim")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -376,6 +377,19 @@ pub(crate) fn run_builtin_engine_serve_http(
             engine_recipe,
         ),
         "vllm" => rocm_engine_vllm::builtin_serve_http(
+            service_id,
+            model_ref,
+            host,
+            port,
+            parsed_policy,
+            gpu_indices,
+            runtime_id,
+            env_id,
+            state_path,
+            log_path,
+            engine_recipe,
+        ),
+        "aim" => rocm_engine_aim::builtin_serve_http(
             service_id,
             model_ref,
             host,

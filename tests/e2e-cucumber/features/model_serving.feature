@@ -342,6 +342,44 @@ Feature: Model serving
     When the user lists recommended models
     Then the model list output contains only ASCII characters
 
+  # AIM serve + inference canary (ROCMAI-554). This scenario deliberately still
+  # serves via the raw AIM Docker image reference rather than the catalog
+  # recipe added in ROCMAI-555 — it's a hardware-verified canary pinned to one
+  # exact image/profile, not a catalog-discovery test. `@requires-engine:aim`
+  # skips here when Docker is unreachable OR the gfx family isn't one aim is
+  # verified on (see `HostCapability::engine_available`'s "aim" arm — Radeon
+  # gfx110X/120X and Strix Halo gfx1151, not Instinct); a Strix Halo
+  # self-hosted runner with Docker is where this actually runs.
+  # `@serve-timeout:1200`
+  # widens both the harness's readiness poll and the CLI's own
+  # ROCM_CLI_AIM_READY_TIMEOUT_SECS (see isolate_cmd) — a cold-start HF weight
+  # download for this 9B model legitimately exceeds the engine's default
+  # 5-minute readiness cap.
+  @id:serve-aim-inference @requires-gpu @requires-engine:aim @serve-timeout:1200
+  Scenario: serve-26 - A model served on AIM responds to inference requests
+    Given a managed runtime is active
+    And a model is being served on aim
+    When the user sends a chat completion request
+    Then the response contains a model reply
+    And the response identifies the correct model
+
+  # Lifecycle parity for AIM (ROCMAI-554). AIM's engine integration is new
+  # enough that nothing had yet proven a container-backed service can be
+  # stopped and relaunched like any other managed engine's — this reuses the
+  # same stop path the serve-retry logic and scenario teardown already rely
+  # on (`stop_managed_services`, via the `stop_aim_service` step), and the
+  # same serve+inference fixture `serve-26` uses, rather than adding a new
+  # stop/restart mechanism just for AIM.
+  @id:serve-aim-lifecycle-parity @requires-gpu @requires-engine:aim @serve-timeout:1200
+  Scenario: serve-27 - A stopped AIM service can be restarted and serves inference again
+    Given a managed runtime is active
+    And a model is being served on aim
+    When the user stops the AIM service
+    And the user serves that same model on aim again
+    And the user sends a chat completion request
+    Then the response contains a model reply
+    And the response identifies the correct model
+
   # `serve` advertises a set of device policies, and the list the user is offered
   # has to be the list the command accepts. Runs on the no-GPU lane, where a
   # refusal that names the policy itself is cleanly distinguishable from the
@@ -351,7 +389,7 @@ Feature: Model serving
   # advertised list and the accepted list are one list), so this ships as a
   # guard rather than an expected failure.
   @id:serve-rejects-no-advertised-device-policy @requires-no-gpu
-  Scenario: serve-26 - Every device policy the serve command offers is one it accepts
+  Scenario: serve-28 - Every device policy the serve command offers is one it accepts
     When the user serves a model under each device policy the command offers
     Then no policy is refused for being that policy
 
@@ -369,7 +407,7 @@ Feature: Model serving
   # little headroom left on main alone, so three more real serves follow
   # serve-06/07/08 onto the merge-queue path where the budget for them lives.
   @id:serve-services-stop-reports-what-it-stopped @requires-gpu @merge-queue
-  Scenario: serve-27 - Stopping a running server reports that it stopped it
+  Scenario: serve-29 - Stopping a running server reports that it stopped it
     Given a managed runtime is active
     And a model is being served on GPU
     When the user stops the server that is running
@@ -381,7 +419,7 @@ Feature: Model serving
   # touches the installed program: the removal is scoped to this scenario's own
   # directories and keeps the binaries.
   @id:serve-uninstall-stops-what-it-manages @requires-os:linux
-  Scenario: serve-28 - Removing the CLI's managed files stops the servers it manages
+  Scenario: serve-30 - Removing the CLI's managed files stops the servers it manages
     Given a local server this machine manages is running
     When the user removes the CLI's managed files
     Then the removal is reported as complete
@@ -394,7 +432,7 @@ Feature: Model serving
   # this scenario also guards them.
   # @merge-queue for the serve-cost reason on `@id:serve-services-stop-reports-what-it-stopped`.
   @id:serve-auto-gpu-selection-names-a-device @requires-gpu @merge-queue
-  Scenario: serve-29 - Letting the CLI choose the GPU names the device it chose
+  Scenario: serve-31 - Letting the CLI choose the GPU names the device it chose
     Given a managed runtime is active
     And a machine with an AMD GPU
     When the user serves a model letting the CLI choose the GPU
@@ -406,7 +444,7 @@ Feature: Model serving
   # or say the usual one is busy — but silently reusing it is not.
   # @merge-queue for the serve-cost reason on `@id:serve-services-stop-reports-what-it-stopped`.
   @id:serve-second-server-gets-a-free-port @requires-gpu @merge-queue
-  Scenario: serve-30 - A second server does not take an address already in use
+  Scenario: serve-32 - A second server does not take an address already in use
     Given a managed runtime is active
     And the address a new server would use is already taken
     When the user serves a model without choosing an address

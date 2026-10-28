@@ -408,7 +408,7 @@ async fn assert_host_default_engine_reported(world: &mut E2eWorld) {
 #[then("all supported engines are listed")]
 async fn assert_all_engines_listed(world: &mut E2eWorld) {
     let output = world.cli_output.as_ref().expect("no command was run");
-    for engine in ["lemonade", "vllm"] {
+    for engine in ["lemonade", "vllm", "aim"] {
         assert!(
             output.contains(engine),
             "engine '{engine}' not found in:\n{output}"

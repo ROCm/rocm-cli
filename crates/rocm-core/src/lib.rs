@@ -185,7 +185,7 @@ pub use runtime::{
     runtime_rocm_library_filename, shell_command_for_host, user_runtime_dir,
 };
 pub use service_identity::{ServiceId, generate_service_id};
-pub use service_record::ManagedServiceRecord;
+pub use service_record::{ManagedServiceRecord, engine_stop_decides_confirmation};
 pub use uv::{
     DEFAULT_UV_TIMEOUT_SECS, DependencyViolation, UV_CACHE_DIR_ENV, UV_CACHE_DIR_OVERRIDE_ENV,
     UvCacheSource, ViolationSubject, check_dependencies, ensure_uv_binary, split_local_version,

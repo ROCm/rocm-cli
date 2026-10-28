@@ -189,6 +189,10 @@ const fn rocmd_engine_inventory() -> &'static [(&'static str, &'static str)] {
             "vllm",
             "Linux/WSL ROCm GPU serving engine through external vLLM",
         ),
+        (
+            "aim",
+            "AMD Enterprise AI pre-built Docker serving containers",
+        ),
     ]
 }
 

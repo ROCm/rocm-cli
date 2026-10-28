@@ -652,6 +652,7 @@ mod tests {
             engine: crate::ENGINE_NAME.to_owned(),
             required_flags: vec!["--enable-auto-tool-choice".to_owned()],
             parser_settings: std::collections::BTreeMap::default(),
+            extra_env: std::collections::BTreeMap::default(),
             preferred_endpoint: None,
             unsupported_combinations: Vec::new(),
             notes: Vec::new(),

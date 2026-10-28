@@ -1204,10 +1204,17 @@ fn contains_planner_word(text: &str, expected: &str) -> bool {
         .any(|word| word == expected)
 }
 
-fn infer_engine_from_request(lower: &str) -> Option<&'static str> {
-    ["lemonade", "vllm"]
+pub(crate) fn infer_engine_from_request(lower: &str) -> Option<&'static str> {
+    // Word-boundary match, not substring: "aim" as a bare `.contains` also
+    // matches "aiming"/"claim"/"maintain", silently steering an unrelated
+    // chat request onto the Docker-backed AIM engine.
+    let words: std::collections::HashSet<&str> = lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect();
+    ["lemonade", "vllm", "aim"]
         .into_iter()
-        .find(|engine| lower.contains(*engine))
+        .find(|engine| words.contains(engine))
 }
 
 fn infer_model_from_request(request: &str) -> Option<&str> {
@@ -1279,6 +1286,26 @@ fn quote_tool_arg(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::infer_engine_from_request;
+
+    /// "aim" must match as its own word, not as a substring of an unrelated
+    /// word like "aiming"/"claim"/"maintain" in a free-text chat request.
+    #[test]
+    fn infer_engine_from_request_does_not_match_aim_as_a_substring() {
+        assert_eq!(
+            infer_engine_from_request("serve a small model, aiming for low latency"),
+            None
+        );
+        assert_eq!(
+            infer_engine_from_request("please explain how to maintain a claim"),
+            None
+        );
+        assert_eq!(
+            infer_engine_from_request("serve qwen3.5-9b with aim"),
+            Some("aim")
+        );
+    }
+
     use super::*;
     use crate::tests::test_paths;
 

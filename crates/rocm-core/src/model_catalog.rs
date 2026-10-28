@@ -69,6 +69,11 @@ pub struct ModelRecipeEngineRecord {
     pub required_flags: Vec<String>,
     #[serde(default)]
     pub parser_settings: BTreeMap<String, String>,
+    /// Environment variables this engine recipe requires at launch (for example
+    /// AIM's `AIM_PROFILE_ID`), carried into the launched [`EngineRecipeHint`]'s
+    /// `extra_env` alongside any `--engine-env` CLI overrides.
+    #[serde(default)]
+    pub extra_env: BTreeMap<String, String>,
     #[serde(default)]
     pub preferred_endpoint: Option<ModelRecipeEndpointRecord>,
     #[serde(default)]
@@ -80,6 +85,13 @@ pub struct ModelRecipeEngineRecord {
     /// id for Lemonade versus a Hugging Face repo id for vLLM).
     #[serde(default)]
     pub model_id_override: Option<String>,
+    /// Pins the container image this engine serves the model from to a specific
+    /// digest (`sha256:` plus 64 hex characters), rather than a floating tag.
+    /// Enforced by appending `@{digest}` to the resolved model ref in
+    /// `serve_model_ref_for_engine`. Only valid on a container engine's record
+    /// (currently `aim`); catalog validation rejects it elsewhere.
+    #[serde(default)]
+    pub image_digest: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
@@ -641,6 +653,12 @@ fn recipe_artifact_url_host(uri: &str) -> Option<String> {
     (!host.is_empty()).then_some(host)
 }
 
+fn is_sha256_digest(value: &str) -> bool {
+    value
+        .strip_prefix("sha256:")
+        .is_some_and(|hex| hex.len() == 64 && hex.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
 fn validate_model_recipe_engine_record(
     engine_recipe: &ModelRecipeEngineRecord,
     canonical_model_id: &str,
@@ -652,6 +670,10 @@ fn validate_model_recipe_engine_record(
     for (key, value) in &engine_recipe.parser_settings {
         require_nonempty(key, "engine parser setting key")?;
         require_nonempty(value, "engine parser setting value")?;
+    }
+    for (key, value) in &engine_recipe.extra_env {
+        require_nonempty(key, "engine extra_env key")?;
+        require_nonempty(value, "engine extra_env value")?;
     }
     if let Some(endpoint) = engine_recipe.preferred_endpoint.as_ref() {
         require_nonempty(&endpoint.endpoint_mode, "engine preferred endpoint mode")?;
@@ -670,12 +692,31 @@ fn validate_model_recipe_engine_record(
     if let Some(model_id_override) = engine_recipe.model_id_override.as_deref() {
         require_nonempty(model_id_override, "engine model id override")?;
     }
+    if let Some(digest) = engine_recipe.image_digest.as_deref() {
+        // The digest is appended to the image reference by the serve path, which
+        // only means something for an engine that pulls an image.
+        if !engine_recipe.engine.eq_ignore_ascii_case("aim") {
+            bail!(
+                "engine recipe for `{}` on `{canonical_model_id}` sets image_digest, which only \
+                 applies to container engines (aim)",
+                engine_recipe.engine
+            );
+        }
+        if !is_sha256_digest(digest) {
+            bail!(
+                "engine recipe image_digest `{digest}` on `{canonical_model_id}` must be \
+                 `sha256:` followed by 64 hex characters"
+            );
+        }
+    }
     if engine_recipe.required_flags.is_empty()
         && engine_recipe.parser_settings.is_empty()
         && engine_recipe.preferred_endpoint.is_none()
         && engine_recipe.unsupported_combinations.is_empty()
         && engine_recipe.notes.is_empty()
         && engine_recipe.model_id_override.is_none()
+        && engine_recipe.image_digest.is_none()
+        && engine_recipe.extra_env.is_empty()
     {
         bail!(
             "engine recipe for `{}` on `{canonical_model_id}` must not be empty",
@@ -837,7 +878,7 @@ mod tests {
         let strix = resolve_builtin_model_recipe("qwen").expect("qwen assistant");
         assert_eq!(
             model_recipe_target_platform_label(&strix, &platforms),
-            "AMD Ryzen AI - Strix Halo (Lemonade / llama.cpp)"
+            "AMD Ryzen AI - Strix Halo (Lemonade / llama.cpp / AIM)"
         );
         let mi300x = resolve_builtin_model_recipe("qwen3.6-27b").expect("qwen3.6-27b");
         assert_eq!(
@@ -922,6 +963,47 @@ mod tests {
     }
 
     #[test]
+    fn model_recipe_index_validates_image_digest_shape_and_engine() {
+        let build = |engine: &str, digest: &str| {
+            let mut recipe = sample_recipe_with_artifact("Qwen/Test-1B", &["test-qwen"]);
+            recipe.engine_recipes.push(ModelRecipeEngineRecord {
+                engine: engine.to_owned(),
+                required_flags: vec!["--flag".to_owned()],
+                parser_settings: BTreeMap::new(),
+                extra_env: BTreeMap::new(),
+                preferred_endpoint: None,
+                unsupported_combinations: Vec::new(),
+                notes: Vec::new(),
+                model_id_override: None,
+                image_digest: Some(digest.to_owned()),
+            });
+            ModelRecipeIndexDocument {
+                schema_version: 1,
+                source: Some("fixture".to_owned()),
+                generated_at_unix_ms: Some(123),
+                platforms: Vec::new(),
+                recipes: vec![recipe],
+            }
+        };
+        let good = format!("sha256:{}", "a".repeat(64));
+        build("aim", &good)
+            .validate()
+            .expect("a valid aim digest passes");
+        assert!(
+            build("aim", "sha256:abcd1234").validate().is_err(),
+            "a truncated digest must be rejected"
+        );
+        assert!(
+            build("aim", &"a".repeat(64)).validate().is_err(),
+            "a digest without the sha256: prefix must be rejected"
+        );
+        assert!(
+            build("vllm", &good).validate().is_err(),
+            "image_digest only applies to container engines"
+        );
+    }
+
+    #[test]
     fn model_recipe_index_validates_artifact_metadata() -> Result<()> {
         let mut recipe = sample_recipe_with_artifact("Qwen/Test-1B", &["test-qwen"]);
         recipe.artifacts[0].uri =
@@ -935,6 +1017,7 @@ mod tests {
             engine: "vllm".to_owned(),
             required_flags: vec!["--enable-auto-tool-choice".to_owned()],
             parser_settings: BTreeMap::from([("reasoning_parser".to_owned(), "qwen3".to_owned())]),
+            extra_env: BTreeMap::new(),
             preferred_endpoint: Some(ModelRecipeEndpointRecord {
                 endpoint_mode: "openai".to_owned(),
                 settings: BTreeMap::from([("streaming".to_owned(), "true".to_owned())]),
@@ -945,6 +1028,7 @@ mod tests {
             }],
             notes: vec!["metadata only; adapter protocol does not consume this yet".to_owned()],
             model_id_override: None,
+            image_digest: None,
         });
         let index = ModelRecipeIndexDocument {
             schema_version: 1,

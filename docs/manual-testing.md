@@ -841,3 +841,54 @@ Expected result:
   `PATH change left in place` and names it, and the `PATH` change stays.
 - With `rocm uninstall --keep-binaries`, the review says the `PATH` change
   stays too, and it does.
+
+## 9. AIM (Docker) Engine Verification
+
+Linux/WSL2 only, and requires a reachable Docker daemon (`docker info` must
+succeed).
+
+```bash
+rocm serve aim-qwen3.5-9b --engine aim --managed
+rocm services list --all          # note the service id, e.g. aim-<model>-<millis>
+rocm services stop <service-id> --yes
+docker ps -a --filter name=rocm-aim-
+rocm services restart <service-id> --yes
+```
+
+A cold start downloads the model weights inside the container, which can exceed
+the engine's default 5-minute readiness wait. Raise it with
+`ROCM_CLI_AIM_READY_TIMEOUT_SECS=<seconds>` (a positive integer) in the
+environment of `rocm serve`. Stopping or failing a start removes the container
+and its downloaded weights, so a retry downloads them again.
+
+`aim-qwen3.5-9b` is the catalog entry (`rocm model --verbose`). It supplies the
+pinned image and `AIM_PROFILE_ID`; to serve a raw image reference instead, pass
+the profile yourself:
+
+```bash
+rocm serve amdenterpriseai/aim-radeon-qwen-qwen3-5-9b:0.12.0-preview --engine aim \
+  --managed --engine-env AIM_PROFILE_ID=vllm-w7900-bf16-tp1-latency
+```
+
+`--engine-env KEY=VALUE` is stored with the service record, so use it for
+non-secret values only. For a secret such as a gated model's `HF_TOKEN`, export
+it and pass the bare name (`export HF_TOKEN=...`, then `--engine-env HF_TOKEN`):
+it is forwarded from your environment and never stored. `--engine-env` is
+ignored by the other engines (the command prints a note saying so).
+
+Expected result:
+
+- The command pulls/starts an AIM Docker container (first run takes longer
+  while the image is pulled) and the model is reachable on the printed port
+  once the service shows `ready`. The model name to send is the one printed as
+  the API model, which is the name the container serves, not the image
+  reference.
+- `rocm services list --all` shows the service's engine as `aim`, and the
+  service stays `ready` while the container runs.
+- Stopping the service stops and removes the container; `docker ps -a` no
+  longer lists it, and `rocm services restart` brings the same service id back
+  up.
+- Killing the container directly (`docker kill rocm-aim-<service-id>`) makes the
+  service read `failed` rather than `stopped`, so rocmd's recovery restarts it.
+- On native Windows, the same command fails explicitly instead of falling
+  back to another engine.

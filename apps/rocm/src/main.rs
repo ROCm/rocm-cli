@@ -148,7 +148,7 @@ use std::time::{Duration, SystemTime};
 /// User-selectable serving engines, in the order shown in `--help` and shell
 /// completions. Used as the clap `value_parser` for every user-facing `--engine`
 /// argument so the possible values stay in sync across the CLI surface.
-const SUPPORTED_ENGINES: [&str; 2] = ["lemonade", "vllm"];
+const SUPPORTED_ENGINES: [&str; 3] = ["lemonade", "vllm", "aim"];
 
 #[derive(Parser, Debug)]
 #[command(
@@ -587,6 +587,14 @@ rocm serve qwen --verbose --device gpu_required")]
         /// authenticated too.
         #[arg(long)]
         api_key: Option<String>,
+        /// Extra environment variable for the engine's container (repeatable).
+        /// Engine-specific; currently only `--engine aim` reads these (e.g.
+        /// `AIM_PROFILE_ID=...`) and other engines ignore it. `KEY=VALUE` is
+        /// recorded with the service, so for a secret such as `HF_TOKEN` pass a
+        /// bare `KEY` instead: it is forwarded from your environment and never
+        /// stored.
+        #[arg(long = "engine-env", value_name = "KEY[=VALUE]")]
+        engine_env: Vec<String>,
     },
     /// [preview] Install, start, stop, or inspect ComfyUI.
     #[command(alias = "comfy")]
@@ -2395,6 +2403,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             top_p,
             max_tokens,
             api_key,
+            engine_env,
         }) => serve(ServeArgs {
             model,
             engine,
@@ -2416,6 +2425,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             top_p,
             max_tokens,
             api_key,
+            engine_env,
         }),
         Some(Command::Comfyui { command }) => comfyui(command),
         Some(Command::Services { command }) => services(command),
@@ -2648,6 +2658,10 @@ const fn builtin_engine_inventory() -> &'static [(&'static str, &'static str)] {
         (
             "vllm",
             "Linux/WSL ROCm GPU serving engine through external vLLM",
+        ),
+        (
+            "aim",
+            "AMD Enterprise AI pre-built Docker serving containers",
         ),
     ]
 }
@@ -3052,26 +3066,55 @@ fn assess_model_for_host(
     rocm_core::model_readiness::assess_model_readiness(model_ref, catalog, host, &engine_for)
 }
 
-/// Whether the platform gate rules this engine out on this host.
+/// Why the platform gate rules an engine out on this host, if it does.
 ///
-/// One place, so the `/model` adapter-availability note and the readiness
-/// verdict cannot answer differently about the same host and engine.
-const fn engine_ruled_out_by_platform(engine: &str) -> bool {
-    rocm_core::runtime_is_windows() && engine.eq_ignore_ascii_case("vllm")
+/// Returned by [`engine_ruled_out_by_platform`], the one place that decides
+/// *why*, so the `/model` adapter-availability note and the readiness verdict
+/// -- which only decide how to word it -- cannot disagree about the same host
+/// and engine.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PlatformRuleOut {
+    Allowed,
+    NativeWindowsVllm,
+    /// AIM's Docker GPU passthrough exists only for Linux and WSL2.
+    NativeWindowsAim,
+    AimDockerUnavailable,
 }
 
-/// The `unsupported_here` message for an engine, given whether the platform
-/// gate already ruled it out.
+/// Whether, and why, the platform gate rules this engine out on this host.
+fn engine_ruled_out_by_platform(engine: &str) -> PlatformRuleOut {
+    if rocm_core::runtime_is_windows() && engine.eq_ignore_ascii_case("vllm") {
+        PlatformRuleOut::NativeWindowsVllm
+    } else if rocm_core::runtime_is_windows() && engine.eq_ignore_ascii_case("aim") {
+        PlatformRuleOut::NativeWindowsAim
+    } else if engine.eq_ignore_ascii_case("aim")
+        && !rocm_engine_aim::builtin_docker_daemon_reachable()
+    {
+        PlatformRuleOut::AimDockerUnavailable
+    } else {
+        PlatformRuleOut::Allowed
+    }
+}
+
+/// The `unsupported_here` message for an engine, given why the platform gate
+/// already ruled it out.
 ///
 /// Split out from the `engine_for` closure in [`assess_model_for_host`] so it
 /// can be unit-tested on both branches directly, instead of only indirectly
-/// through whichever platform the test happens to run on. `ruled_out` is a
-/// plain `bool` rather than re-deriving it from `engine` here, so a test can
+/// through whichever platform the test happens to run on. `ruled_out` is
+/// passed in rather than re-derived from `engine` here, so a test can
 /// exercise the "ruled out" branch on Linux CI and the "allowed" branch on a
 /// Windows runner without either one being unreachable.
-fn unsupported_here_for(engine: &str, ruled_out: bool) -> Option<String> {
-    ruled_out
-        .then(|| format!("{engine} has no adapter on native Windows; serve it from WSL or Linux"))
+fn unsupported_here_for(engine: &str, ruled_out: PlatformRuleOut) -> Option<String> {
+    match ruled_out {
+        PlatformRuleOut::Allowed => None,
+        PlatformRuleOut::AimDockerUnavailable => Some(format!(
+            "{engine} needs a reachable Docker daemon to serve; start Docker or choose a different engine"
+        )),
+        PlatformRuleOut::NativeWindowsVllm | PlatformRuleOut::NativeWindowsAim => Some(format!(
+            "{engine} has no adapter on native Windows; serve it from WSL or Linux"
+        )),
+    }
 }
 
 /// The catalog entry a report should name, and whether a fix was offered for it.
@@ -5950,13 +5993,18 @@ fn append_model_engine_support_lines(
 }
 
 #[allow(dead_code)]
-const fn model_registry_adapter_availability_note(engine: &str) -> Option<&'static str> {
-    if engine_ruled_out_by_platform(engine) {
-        Some(
+fn model_registry_adapter_availability_note(engine: &str) -> Option<&'static str> {
+    match engine_ruled_out_by_platform(engine) {
+        PlatformRuleOut::Allowed => None,
+        PlatformRuleOut::AimDockerUnavailable => Some(
+            "runtime_status=unsupported_docker_unavailable reason=Docker daemon not reachable; start Docker or choose a different engine; run /engine for adapter details",
+        ),
+        PlatformRuleOut::NativeWindowsVllm => Some(
             "runtime_status=unsupported_native_windows reason=native Windows skipped; use WSL/Linux vLLM ROCm; gpu_execution_required=true; run /engine for adapter details",
-        )
-    } else {
-        None
+        ),
+        PlatformRuleOut::NativeWindowsAim => Some(
+            "runtime_status=unsupported_native_windows reason=native Windows skipped; AIM GPU serving is Linux/WSL2 only; run /engine for adapter details",
+        ),
     }
 }
 
@@ -6932,7 +6980,12 @@ fn stop_internal_managed_service_confirmed_with(
     // unverifiable PID), leave the status so the standard liveness refresh
     // reconciles it to "stopped" once the process actually dies — rather than
     // asserting a stop that did not happen.
-    let all_stopped = terminated_all && stopping.names_same_processes(&record);
+    // A container engine is stopped by its engine `Stop`, not by the PID of the
+    // supervisor that follows it, so a failed `Stop` leaves the stop unconfirmed.
+    let engine_stop_confirms =
+        !rocm_core::engine_stop_decides_confirmation(&stopping.engine) || engine_stop.is_ok();
+    let all_stopped =
+        terminated_all && stopping.names_same_processes(&record) && engine_stop_confirms;
     if all_stopped {
         record.status = "stopped".to_owned();
         record.stop_requested_unix_ms = None;
@@ -7206,7 +7259,7 @@ fn restart_internal_managed_service_with(
         &started.engine,
         &started.host,
         started.port,
-        &started.canonical_model_id,
+        started.served_model_name(),
         endpoint_api_key.as_deref(),
         Duration::from_secs(45),
     );
@@ -8038,6 +8091,10 @@ pub(crate) const fn engine_inventory() -> &'static [(&'static str, &'static str)
         (
             "vllm",
             "Linux/WSL ROCm GPU serving engine through external vLLM",
+        ),
+        (
+            "aim",
+            "AMD Enterprise AI pre-built Docker serving containers",
         ),
     ]
 }
@@ -9043,7 +9100,7 @@ fn wait_for_service_http_ready(
         engine,
         host,
         port,
-        canonical_model_id,
+        &|| canonical_model_id.to_owned(),
         endpoint_api_key,
         timeout,
         &mut |_elapsed| {},
@@ -9069,7 +9126,7 @@ fn wait_for_service_http_ready_with_progress(
     engine: &str,
     host: &str,
     port: u16,
-    canonical_model_id: &str,
+    model_name: &dyn Fn() -> String,
     endpoint_api_key: Option<&str>,
     timeout: Duration,
     on_tick: &mut dyn FnMut(Duration),
@@ -9078,6 +9135,10 @@ fn wait_for_service_http_ready_with_progress(
     let endpoint = format_http_base_url(host, port);
     let mut best = EndpointReadiness::Unreachable;
     while start.elapsed() < timeout {
+        // Re-evaluated each pass: a container engine reports the name its server
+        // answers to only after it starts, so a name fixed up front can be wrong.
+        let canonical_model_id = model_name();
+        let canonical_model_id = canonical_model_id.as_str();
         let listed = service_http_readiness_paths(engine).iter().any(|path| {
             http_get_local_service(
                 host,
@@ -13823,6 +13884,37 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn stop_of_a_container_engine_is_unconfirmed_when_the_engine_stop_fails() {
+        // For `aim` the recorded PID is only the supervisor; killing it says
+        // nothing about the container. With no aim engine to answer `Stop`, the
+        // PID verdict alone must not mark the service stopped or drop its key.
+        let (root, paths) = test_paths("stop-aim-engine-stop-fails");
+        paths.ensure().unwrap();
+        // The built-in aim engine answers `Stop` through `docker`; a dead daemon
+        // address makes that fail the same way on a host with or without docker.
+        let mut env = ScopedTestEnv::new();
+        env.set("DOCKER_HOST", "unix:///nonexistent/rocm-test-docker.sock");
+        let service_id = "svc-stop-aim-engine-stop-fails";
+        let mut record = stop_test_record(&paths, service_id);
+        record.engine = "aim".to_owned();
+        record.write().unwrap();
+        endpoint_keys::store_endpoint_api_key(&paths, service_id, "key-123").unwrap();
+
+        let report =
+            stop_internal_managed_service_with(&paths, service_id, |_| (Vec::new(), true)).unwrap();
+        drop(env);
+
+        let on_disk = raw_manifest(&paths, service_id);
+        let key = endpoint_keys::endpoint_api_key(&paths, service_id);
+        let _ = fs::remove_dir_all(root);
+        assert!(report["engine_stop"]["error"].is_string(), "{report}");
+        // Unconfirmed: the marker is re-stamped and the key kept for the liveness
+        // refresh to settle, rather than cleared as for a confirmed stop.
+        assert!(on_disk.stop_requested_unix_ms.is_some());
+        assert_eq!(key.as_deref(), Some("key-123"), "the key is kept");
+    }
+
+    #[test]
     fn stop_final_write_keeps_what_others_wrote_while_it_ran() {
         // The stop's last write applies its own fields to the record as it is
         // now, not to the copy it loaded before the engine stop and the wait.
@@ -16025,7 +16117,7 @@ pub(crate) mod tests {
         assert!(rendered.contains("Recommended models - run one with `rocm serve <model>`"));
         // Featured current models are grouped under their hardware target, each
         // with the quant that fits a single GPU.
-        assert!(rendered.contains("AMD Ryzen AI - Strix Halo (Lemonade / llama.cpp)"));
+        assert!(rendered.contains("AMD Ryzen AI - Strix Halo (Lemonade / llama.cpp / AIM)"));
         assert!(rendered.contains("AMD Instinct - MI300X, MI350X, MI355X (vLLM)"));
         // Strix Halo GGUF entries carry the servable owner/repo:variant ref.
         assert!(rendered.contains("unsloth/Qwen3.6-35B-A3B-GGUF:Q4_K_M"));
@@ -16165,6 +16257,8 @@ pub(crate) mod tests {
             }],
             notes: vec!["metadata only; not applied to launches yet".to_owned()],
             model_id_override: None,
+            image_digest: None,
+            extra_env: BTreeMap::new(),
         }];
         let mut output = String::new();
 
@@ -17329,8 +17423,8 @@ pub(crate) mod tests {
     /// points at WSL/Linux -- the actual escape hatch, not a guess.
     #[test]
     fn unsupported_here_for_names_the_engine_when_ruled_out() {
-        let message =
-            unsupported_here_for("vllm", true).expect("a ruled-out engine gets a message");
+        let message = unsupported_here_for("vllm", PlatformRuleOut::NativeWindowsVllm)
+            .expect("a ruled-out engine gets a message");
         assert!(
             message.contains("vllm"),
             "the message has to name the engine it is talking about: {message:?}"
@@ -17341,13 +17435,118 @@ pub(crate) mod tests {
         );
     }
 
+    /// AIM's Docker GPU passthrough only exists on Linux/WSL2, so native
+    /// Windows must be ruled out (the Docker-reachability gate alone would pass
+    /// on Docker Desktop and launch on CPU).
+    #[test]
+    fn unsupported_here_for_names_wsl_for_aim_on_native_windows() {
+        let message = unsupported_here_for("aim", PlatformRuleOut::NativeWindowsAim)
+            .expect("a ruled-out engine gets a message");
+        assert!(
+            message.contains("aim") && message.contains("WSL"),
+            "{message:?}"
+        );
+    }
+
     /// When the platform gate allows an engine, there is nothing to report --
     /// asserted directly against the pure helper, not by relying on whichever
     /// OS this test happens to run on.
     #[test]
     fn unsupported_here_for_is_none_when_allowed() {
-        assert_eq!(unsupported_here_for("vllm", false), None);
-        assert_eq!(unsupported_here_for("llamacpp", false), None);
+        assert_eq!(unsupported_here_for("vllm", PlatformRuleOut::Allowed), None);
+        assert_eq!(
+            unsupported_here_for("llamacpp", PlatformRuleOut::Allowed),
+            None
+        );
+    }
+
+    /// `aim` is ruled out for a different reason than `vllm` on Windows
+    /// (Docker, not the OS), so the message has to say Docker, not WSL.
+    ///
+    /// Pins the wording only; that the gate actually fires on an unreachable
+    /// daemon is proven by
+    /// `engine_ruled_out_by_platform_gates_aim_on_docker_reachability`.
+    #[test]
+    fn unsupported_here_for_names_docker_for_aim() {
+        let message = unsupported_here_for("aim", PlatformRuleOut::AimDockerUnavailable)
+            .expect("a ruled-out engine gets a message");
+        assert!(
+            message.to_lowercase().contains("docker"),
+            "the message has to name the actual reason, Docker: {message:?}"
+        );
+    }
+
+    /// Child half of [`engine_ruled_out_by_platform_gates_aim_on_docker_reachability`].
+    ///
+    /// Runs in its own process so the hostile `PATH` (a fake `docker` that
+    /// always fails) can be set with `Command::env` -- mutating `PATH`
+    /// in-process would need `unsafe`, which the workspace denies.
+    #[test]
+    fn docker_unreachable_subprocess_helper() {
+        if std::env::var_os("ROCM_AIM_DOCKER_UNREACHABLE_TEST_DIR").is_none() {
+            return;
+        }
+        assert_eq!(
+            engine_ruled_out_by_platform("aim"),
+            PlatformRuleOut::AimDockerUnavailable,
+            "docker is unreachable, so the platform gate must rule aim out"
+        );
+        let message =
+            unsupported_here_for("aim", engine_ruled_out_by_platform("aim")).expect("ruled out");
+        assert!(
+            message.to_lowercase().contains("docker"),
+            "the gate and its message must agree: {message:?}"
+        );
+    }
+
+    /// Fix for the review finding that `unsupported_here_for_names_docker_for_aim`
+    /// only pinned the message's wording, never the real
+    /// `engine_ruled_out_by_platform("aim")` gate it is paired with in
+    /// `assess_model_for_host`. This drives the gate itself against a `docker`
+    /// that always fails, rather than hand-feeding it `ruled_out: true`.
+    #[cfg(unix)]
+    #[test]
+    fn engine_ruled_out_by_platform_gates_aim_on_docker_reachability() {
+        let dir = std::env::temp_dir().join(format!(
+            "rocm-aim-docker-unreachable-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let fake_bin = dir.join("bin");
+        std::fs::create_dir_all(&fake_bin).unwrap();
+        rocm_core::fake_executable::write_fake_executable(
+            &fake_bin.join("docker"),
+            "#!/bin/sh\nexit 1\n",
+        )
+        .unwrap();
+
+        let mut entries = vec![fake_bin];
+        entries.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::docker_unreachable_subprocess_helper",
+                "--nocapture",
+            ])
+            .env(
+                "ROCM_AIM_DOCKER_UNREACHABLE_TEST_DIR",
+                std::path::PathBuf::from("1"),
+            )
+            .env("PATH", std::env::join_paths(entries).unwrap())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "helper subprocess failed");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Regression test for the engine-consistency bug: `assess_model_on_this_host`
