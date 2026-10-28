@@ -1171,7 +1171,7 @@ async fn main() {
 
     use cucumber::writer::{self, Stats as _};
     use e2e_cucumber::capability::host_capability;
-    use e2e_cucumber::expectation::{Expectation, ScenarioDecl, resolve};
+    use e2e_cucumber::expectation::{Expectation, ScenarioDecl, lifecycle_lane_includes, resolve};
     use e2e_cucumber::monotonic_clock::MonotonicClockWriter;
 
     let dir = results_dir();
@@ -1210,6 +1210,19 @@ async fn main() {
     // either its CLI filter OR this closure, so CLI selection would bypass OS,
     // nightly/lifecycle, ID, and expectation resolution entirely.
     let only_lifecycle = std::env::var_os("E2E_ONLY_LIFECYCLE").is_some_and(|v| v == "1");
+    // A `E2E_ONLY_LIFECYCLE` lane can fold in specific non-`@lifecycle`
+    // scenarios by `@id` (comma-separated) instead of running the full suite —
+    // e.g. the Windows lane adding the hermetic comfyui scenarios so they get
+    // required-CI coverage there without being tagged `@lifecycle`, which would
+    // also pull them out of `nightly.yml` and `e2e-selfhosted.yml` (neither sets
+    // `E2E_INCLUDE_LIFECYCLE`, so a `@lifecycle` tag would drop them from both).
+    let also_run_ids: Vec<String> = std::env::var("E2E_ALSO_RUN_IDS")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect();
     // Heavy `@merge-queue` serves run only in the merge queue (a cheaper
     // per-engine canary covers them on the PR fast path); set by
     // e2e-selfhosted.yml on the `merge_group` event.
@@ -1328,7 +1341,7 @@ async fn main() {
                         merge_queue: include_merge_queue,
                     },
                 );
-                let run = (!only_lifecycle || decl.lifecycle)
+                let run = (!only_lifecycle || lifecycle_lane_includes(&decl, &also_run_ids))
                     && !matches!(expectation, Expectation::Skip { .. });
                 if let Some(id) = &decl.id {
                     let engine = decl.effective_engine(cap).to_owned();

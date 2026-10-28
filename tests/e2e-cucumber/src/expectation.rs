@@ -625,6 +625,17 @@ pub fn resolve(
     Expectation::ExpectPass
 }
 
+/// Whether a scenario runs in an `E2E_ONLY_LIFECYCLE=1` lane.
+///
+/// True for a scenario that is itself `@lifecycle`, or whose `@id` is one of
+/// `extra_ids` — scenarios a caller has explicitly opted into this lane
+/// without tagging them `@lifecycle` (which would also pull them out of
+/// `nightly.yml` and `e2e-selfhosted.yml`, neither of which restricts to the
+/// lifecycle set).
+pub fn lifecycle_lane_includes(decl: &ScenarioDecl, extra_ids: &[String]) -> bool {
+    decl.lifecycle || decl.id.as_deref().is_some_and(|id| extra_ids.iter().any(|e| e == id))
+}
+
 /// Tiny glob: `*` matches any run of chars. Used only for `therock_family`.
 fn glob_match(pattern: &str, text: &str) -> bool {
     let pattern = pattern.to_ascii_lowercase();
@@ -944,6 +955,46 @@ serve_timeout_secs = 90
                 }
             ),
             Expectation::Skip { .. }
+        ));
+    }
+
+    #[test]
+    fn lifecycle_lane_includes_lifecycle_scenarios_regardless_of_extra_ids() {
+        let d = decl(&["id:lifecycle-linux-install", "lifecycle"]);
+        assert!(lifecycle_lane_includes(&d, &[]));
+        assert!(lifecycle_lane_includes(
+            &d,
+            &["some-other-id".to_owned()]
+        ));
+    }
+
+    #[test]
+    fn lifecycle_lane_includes_a_non_lifecycle_scenario_named_in_extra_ids() {
+        let d = decl(&["id:comfyui-uv-install-failure-names-log"]);
+        assert!(!d.lifecycle);
+        assert!(lifecycle_lane_includes(
+            &d,
+            &["comfyui-uv-install-failure-names-log".to_owned()]
+        ));
+    }
+
+    #[test]
+    fn lifecycle_lane_excludes_a_non_lifecycle_scenario_not_named_in_extra_ids() {
+        let d = decl(&["id:comfyui-uv-install-failure-names-log"]);
+        assert!(!lifecycle_lane_includes(
+            &d,
+            &["some-other-id".to_owned()]
+        ));
+        assert!(!lifecycle_lane_includes(&d, &[]));
+    }
+
+    #[test]
+    fn lifecycle_lane_excludes_a_scenario_with_no_id_even_with_extra_ids_set() {
+        let d = decl(&[]);
+        assert!(d.id.is_none());
+        assert!(!lifecycle_lane_includes(
+            &d,
+            &["comfyui-uv-install-failure-names-log".to_owned()]
         ));
     }
 
