@@ -113,3 +113,17 @@ Feature: Automation watchers
     And only the most recently reviewed proposals are kept
     When the user looks up the older pending proposal
     Then the CLI shows it still pending
+
+  # automations-07 only exercises a single rollover: a live file at the cap
+  # gets a `.1`. The shift-and-drop-oldest chain beyond that — `.1` to `.2`,
+  # `.2` to `.3`, `.3` to `.4`, and the previous `.4` dropped — is otherwise
+  # pinned only by unit tests in `automation.rs`. This seeds a full chain of
+  # four already-rotated generations plus a live file at the cap, forces one
+  # more rotation, and checks the whole chain shifted down by one and the
+  # oldest generation's content is gone, not just that `.1` exists.
+  @id:automations-rotation-chain-shifts-and-drops-oldest
+  Scenario: automations-09 - A further rotation shifts the whole chain and drops the oldest generation
+    Given an audit log already holding a full chain of four rotated generations
+    When the user selects a permissions mode
+    Then each rotated generation holds what the previous one held
+    And the oldest previous generation is gone

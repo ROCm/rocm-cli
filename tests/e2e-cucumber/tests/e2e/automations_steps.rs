@@ -21,7 +21,8 @@
 use cucumber::{given, then, when};
 use rocm_core::{
     AuditEventRecord, AutomationProposalRecord, EVENT_LOG_ROTATE_BYTES,
-    REVIEWED_PROPOSALS_RETAINED, append_automation_proposal, load_automation_proposals,
+    EVENT_LOG_ROTATED_GENERATIONS, REVIEWED_PROPOSALS_RETAINED, append_automation_proposal,
+    load_automation_proposals,
 };
 
 use crate::E2eWorld;
@@ -216,6 +217,69 @@ async fn audit_log_at_cap(world: &mut E2eWorld) {
         line.repeat(usize::try_from(lines).expect("line count fits usize")),
     )
     .expect("failed to seed the audit log");
+}
+
+/// Action tag for the already-rotated `generation`-th file seeded by
+/// `audit_log_with_full_rotation_chain`, so after one more rotation each
+/// generation's new content can be traced back to which generation it came
+/// from.
+fn seeded_generation_action(generation: usize) -> String {
+    format!("e2e_seeded_gen{generation}")
+}
+
+/// Action tag for the live file seeded by `audit_log_with_full_rotation_chain`,
+/// distinct from every `seeded_generation_action` tag.
+const SEEDED_LIVE_BEFORE_CHAIN_ROTATION: &str = "e2e_seeded_live_before_chain_rotation";
+
+#[given("an audit log already holding a full chain of four rotated generations")]
+async fn audit_log_with_full_rotation_chain(world: &mut E2eWorld) {
+    let paths = world.app_paths();
+    std::fs::create_dir_all(paths.audit_dir()).expect("failed to create audit dir");
+    let live = paths.audit_events_path();
+
+    // An already-rotated generation is never resized by a further rotation —
+    // only shifted or renamed over — so these only need to exist and be
+    // distinguishable, not reach the cap themselves.
+    for generation in 1..=EVENT_LOG_ROTATED_GENERATIONS {
+        let record = AuditEventRecord {
+            at_unix_ms: 1_700_000_000_000,
+            source: "rocm".to_owned(),
+            category: "install".to_owned(),
+            actor: "cli".to_owned(),
+            level: "info".to_owned(),
+            action: seeded_generation_action(generation),
+            message: format!("generation {generation}"),
+            watcher_id: None,
+            service_id: None,
+        };
+        let line = serde_json::to_string(&record).expect("serialize audit record") + "\n";
+        std::fs::write(
+            live.with_file_name(format!("events.jsonl.{generation}")),
+            line,
+        )
+        .unwrap_or_else(|error| panic!("failed to seed generation {generation}: {error}"));
+    }
+
+    // The live file itself must be at the cap, or the change made afterwards
+    // would not rotate anything at all.
+    let live_record = AuditEventRecord {
+        at_unix_ms: 1_700_000_000_000,
+        source: "rocm".to_owned(),
+        category: "install".to_owned(),
+        actor: "cli".to_owned(),
+        level: "info".to_owned(),
+        action: SEEDED_LIVE_BEFORE_CHAIN_ROTATION.to_owned(),
+        message: "x".repeat(1024),
+        watcher_id: None,
+        service_id: None,
+    };
+    let live_line = serde_json::to_string(&live_record).expect("serialize audit record") + "\n";
+    let lines = EVENT_LOG_ROTATE_BYTES.div_ceil(live_line.len() as u64);
+    std::fs::write(
+        &live,
+        live_line.repeat(usize::try_from(lines).expect("line count fits usize")),
+    )
+    .expect("failed to seed the live audit log");
 }
 
 const OLD_PENDING_PROPOSAL: &str = "e2e-pending-old";
@@ -503,6 +567,54 @@ async fn recent_activity_spans_rotation(world: &mut E2eWorld) {
         1,
         "expected the permissions change from the fresh log:\n{out}"
     );
+}
+
+#[then("each rotated generation holds what the previous one held")]
+async fn chain_shifted_by_one(world: &mut E2eWorld) {
+    ok_output(world);
+    let live = world.app_paths().audit_events_path();
+    assert!(
+        audit_records(&live.with_file_name("events.jsonl.1"))
+            .iter()
+            .all(|record| record.action == SEEDED_LIVE_BEFORE_CHAIN_ROTATION),
+        "expected .1 to hold only what was the live file before this rotation"
+    );
+    for generation in 2..=EVENT_LOG_ROTATED_GENERATIONS {
+        let actions: Vec<String> =
+            audit_records(&live.with_file_name(format!("events.jsonl.{generation}")))
+                .into_iter()
+                .map(|record| record.action)
+                .collect();
+        assert_eq!(
+            actions,
+            [seeded_generation_action(generation - 1)],
+            "expected .{generation} to hold what .{} held before this rotation",
+            generation - 1
+        );
+    }
+}
+
+#[then("the oldest previous generation is gone")]
+async fn oldest_generation_dropped(world: &mut E2eWorld) {
+    let live = world.app_paths().audit_events_path();
+    assert!(
+        !live
+            .with_file_name(format!(
+                "events.jsonl.{}",
+                EVENT_LOG_ROTATED_GENERATIONS + 1
+            ))
+            .exists(),
+        "rotation must never keep more than {EVENT_LOG_ROTATED_GENERATIONS} generations"
+    );
+    let dropped_action = seeded_generation_action(EVENT_LOG_ROTATED_GENERATIONS);
+    for generation in 1..=EVENT_LOG_ROTATED_GENERATIONS {
+        assert!(
+            !audit_records(&live.with_file_name(format!("events.jsonl.{generation}")))
+                .iter()
+                .any(|record| record.action == dropped_action),
+            "the oldest generation's content ({dropped_action}) must not survive in .{generation}"
+        );
+    }
 }
 
 #[then("the CLI confirms the approval")]
