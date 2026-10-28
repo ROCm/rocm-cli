@@ -37,7 +37,7 @@ This workflow adds OSS safety and verification guardrails on top of normal dev f
   - opening/closing/merging PRs
   - public comments/review replies
   - changes to shared or public state
-- Before proposing or executing a force-push, check the PR's live review/approval state (`gh pr view --json reviews,reviewDecision`), not just the user's go-ahead for the push itself — flag it in the approval request if existing approvals would be invalidated.
+- Before proposing or executing a force-push, check the PR's live review/approval state (`gh pr view {pr} --repo OWNER/REPO --json reviews,reviewDecision`), not just the user's go-ahead for the push itself — check both fields, since `reviewDecision` alone can read `REVIEW_REQUIRED` even while a reviewer already holds a standing `APPROVED` or `CHANGES_REQUESTED` review. If either field shows a current reviewer opinion, flag it when asking the user for that force-push approval. Whether the push itself dismisses an existing review depends on this repo's branch-protection or ruleset settings, not on which commit the review targeted — don't try to compute that yourself, and flag it anyway when unsure.
 
 ## 2) Company Identity Required, Internal Content Forbidden
 
@@ -358,7 +358,7 @@ If a vendored upstream tree is introduced in the future, apply the following rul
 - avoid AI-generated boilerplate footers
 - do not resolve reviewer threads you did not author; reply with fix commit context
 - if reviewed code must be updated, explain what changed since review
-- before starting a new review pass on a PR, check for unresolved feedback from prior rounds first (same `in_reply_to_id` cross-reference technique below)
+- before resuming review-feedback work on a PR you authored, first check for review comments with no reply yet (same `in_reply_to_id` cross-reference technique below)
 - automated reviewers (e.g. Copilot) can post new findings on a commit that itself fixed earlier findings; after pushing a fix and replying to the original threads, re-fetch PR comments once more before treating the review round as closed
 - to check whether a review comment already has a reply, do not call `gh api repos/OWNER/REPO/pulls/comments/$id/replies` (GET); it 404s. Fetch the full list (`gh api repos/OWNER/REPO/pulls/{pr}/comments --paginate`) and cross-reference each comment's `in_reply_to_id` against other comments' `id`s
 
