@@ -1547,16 +1547,39 @@ fn restart_managed_service_with(
     // one the caller saw: a `rocm services restart` of this service can finish
     // while recovery waits for the lock, and writing the stale copy over it
     // would orphan the restarted engine or start a second supervisor.
-    if let Ok(current) = load_service_record(paths, &record.service_id)
-        && (current.status != record.status
-            || current.supervisor_pid != record.supervisor_pid
-            || current.supervisor_start_ticks != record.supervisor_start_ticks
-            || current.engine_pid != record.engine_pid)
-    {
-        anyhow::bail!(
-            "cannot recover managed service {}: its record changed while recovery was waiting              for the launch lock",
-            record.service_id
-        );
+    match load_service_record(paths, &record.service_id) {
+        Ok(current) => {
+            // Only a stop newer than the caller's copy counts: restarting a
+            // record that already carried one deliberately supersedes it.
+            if stop_requested(&current)
+                && current.stop_requested_unix_ms != record.stop_requested_unix_ms
+            {
+                anyhow::bail!(
+                    "cannot recover managed service {}: a stop was requested while recovery was \
+                     waiting for the launch lock",
+                    record.service_id
+                );
+            }
+            if current.status != record.status
+                || current.supervisor_pid != record.supervisor_pid
+                || current.supervisor_start_ticks != record.supervisor_start_ticks
+                || current.engine_pid != record.engine_pid
+            {
+                anyhow::bail!(
+                    "cannot recover managed service {}: its record changed while recovery was \
+                     waiting for the launch lock",
+                    record.service_id
+                );
+            }
+        }
+        Err(_) if !paths.service_manifest_path(&record.service_id).exists() => {
+            anyhow::bail!(
+                "cannot recover managed service {}: it was removed while recovery was waiting \
+                 for the launch lock",
+                record.service_id
+            );
+        }
+        Err(error) => return Err(error.context("failed to re-read the service record")),
     }
 
     // On the canonical loopback host, prove the recorded port is genuinely free
@@ -3616,7 +3639,7 @@ mod tests {
         paths.ensure()?;
         fs::create_dir_all(paths.services_dir())?;
 
-        let port = 21_778_u16;
+        let port = free_loopback_port();
         let mut stopped_sibling = ManagedServiceRecord::new(
             &paths,
             "lemonade-stopped-sibling",
@@ -4444,6 +4467,92 @@ mod tests {
         let persisted = persisted?;
         assert_eq!(persisted.status, "starting");
         assert_eq!(persisted.supervisor_pid, 4_242_424);
+        Ok(())
+    }
+
+    /// A stop requested while recovery waited for the lock must not be cleared.
+    #[test]
+    fn recovery_refuses_when_a_stop_was_requested_while_waiting_for_the_lock() -> Result<()> {
+        let (root, paths) = temp_app_paths("recovery-stop-requested");
+        paths.ensure()?;
+        fs::create_dir_all(paths.services_dir())?;
+
+        let service_id = "svc-recovery-stop-requested";
+        let mut record = identity_probe_record(&paths, service_id, free_loopback_port());
+        record.status = "failed".to_owned();
+        record.write()?;
+        let mut stale = record.clone();
+
+        record.stop_requested_unix_ms = Some(unix_time_millis());
+        record.write()?;
+
+        let never = |_command: &mut ProcessCommand| -> std::io::Result<std::process::Child> {
+            panic!("recovery must not spawn for a service being stopped")
+        };
+        let outcome = restart_managed_service_with(&paths, &mut stale, Some(&never));
+        let persisted = load_service_record(&paths, service_id);
+        fs::remove_dir_all(root).ok();
+
+        let message = format!(
+            "{:#}",
+            outcome.expect_err("a pending stop refuses recovery")
+        );
+        assert!(message.contains("stop was requested"), "{message}");
+        assert!(stop_requested(&persisted?));
+        Ok(())
+    }
+
+    /// A manifest deleted while recovery waited must not be resurrected.
+    #[test]
+    fn recovery_refuses_when_the_record_was_removed_while_waiting_for_the_lock() -> Result<()> {
+        let (root, paths) = temp_app_paths("recovery-removed-record");
+        paths.ensure()?;
+        fs::create_dir_all(paths.services_dir())?;
+
+        let service_id = "svc-recovery-removed-record";
+        let mut record = identity_probe_record(&paths, service_id, free_loopback_port());
+        record.status = "failed".to_owned();
+        record.write()?;
+        let mut stale = record;
+        fs::remove_file(paths.service_manifest_path(service_id))?;
+
+        let never = |_command: &mut ProcessCommand| -> std::io::Result<std::process::Child> {
+            panic!("recovery must not spawn for a removed service")
+        };
+        let outcome = restart_managed_service_with(&paths, &mut stale, Some(&never));
+        let resurrected = paths.service_manifest_path(service_id).exists();
+        fs::remove_dir_all(root).ok();
+
+        let message = format!(
+            "{:#}",
+            outcome.expect_err("a removed record refuses recovery")
+        );
+        assert!(message.contains("was removed"), "{message}");
+        assert!(!resurrected, "recovery must not rewrite a deleted manifest");
+        Ok(())
+    }
+
+    /// A candidate still inside its restart backoff must not starve the ones
+    /// after it.
+    #[test]
+    fn find_recoverable_service_skips_a_candidate_inside_its_backoff() -> Result<()> {
+        let (root, paths) = temp_app_paths("recoverable-backoff-skip");
+        paths.ensure()?;
+        fs::create_dir_all(paths.services_dir())?;
+
+        let mut a = identity_probe_record(&paths, "svc-backoff-a", free_loopback_port());
+        a.status = "failed".to_owned();
+        a.last_restart_unix_ms = Some(unix_time_millis());
+        a.write()?;
+        let mut b = identity_probe_record(&paths, "svc-backoff-b", free_loopback_port());
+        b.status = "failed".to_owned();
+        b.write()?;
+
+        let found = find_recoverable_service(&paths);
+        fs::remove_dir_all(root).ok();
+
+        let (record, _reason) = found?.expect("service B is recoverable");
+        assert_eq!(record.service_id, "svc-backoff-b");
         Ok(())
     }
 

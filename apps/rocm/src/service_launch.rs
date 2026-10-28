@@ -1197,7 +1197,7 @@ pub(crate) fn run_attached_service(
         resolve.engine_recipe.as_ref(),
         require_api_key,
     )
-    // Mirrors `run_attached_service`'s cleanup: a pre-spawn
+    // Mirrors `start_managed_service`'s cleanup: a pre-spawn
     // failure (port reserved/in use, range exhausted, other bind error) returns
     // before any service record exists, so nothing else clears the key just
     // stored for this attempt.
