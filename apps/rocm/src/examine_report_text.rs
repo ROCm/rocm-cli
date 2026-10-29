@@ -802,10 +802,17 @@ fn append_model_engine_recipe_settings_lines(output: &mut String, recipe: &Model
         if !engine_recipe.supported_gfx_families.is_empty() {
             let _ = writeln!(
                 output,
-                "      engine_recipe {} supported_gfx_families=[{}] profile_ids=[{}]",
+                "      engine_recipe {} supported_gfx_families=[{}] profile_ids=[{}] min_gpu_counts=[{}]",
                 engine_recipe.engine,
                 engine_recipe.supported_gfx_families.join(","),
-                format_string_map_or_none(&engine_recipe.profile_ids)
+                format_string_map_or_none(&engine_recipe.profile_ids),
+                format_string_map_or_none(
+                    &engine_recipe
+                        .min_gpu_counts
+                        .iter()
+                        .map(|(family, count)| (family.clone(), count.to_string()))
+                        .collect()
+                )
             );
         }
         let _ = writeln!(
@@ -2041,6 +2048,7 @@ mod tests {
             profile_ids: BTreeMap::new(),
             requires_hf_token: false,
             supported_boards: Vec::new(),
+            min_gpu_counts: BTreeMap::new(),
             extra_env: BTreeMap::new(),
         }];
         let mut output = String::new();

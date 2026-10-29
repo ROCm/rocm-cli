@@ -621,6 +621,7 @@
           "model_id_override": "amdenterpriseai/aim-coherelabs-command-a-reasoning-08-2025:0.11.1",
           "image_digest": "sha256:6da329641e3ea98e945f43b1df17b7efb3ba0a284dfb123297ace72d4084b4d3",
           "supported_gfx_families": ["gfx90a", "gfx94X-dcgpu", "gfx950-dcgpu"],
+          "min_gpu_counts": {"gfx90a": 8, "gfx94X-dcgpu": 2},
           "requires_hf_token": true,
           "generated_at_unix_ms": 1793272421113,
           "extra_env": {}
@@ -665,6 +666,7 @@
           "model_id_override": "amdenterpriseai/aim-deepseek-ai-deepseek-r1-0528:0.11.1",
           "image_digest": "sha256:348f6ee92b07bf150b01c7b37adb8365336ffc98a2a6f747ed73754cd41f61bc",
           "supported_gfx_families": ["gfx94X-dcgpu", "gfx950-dcgpu"],
+          "min_gpu_counts": {"gfx94X-dcgpu": 8, "gfx950-dcgpu": 8},
           "generated_at_unix_ms": 1793272421113,
           "extra_env": {}
         }
@@ -708,6 +710,7 @@
           "model_id_override": "amdenterpriseai/aim-deepseek-ai-deepseek-r1:0.11.1",
           "image_digest": "sha256:4bbea192e4c3fd11865652119c584e9bad27b07634d5d56da2ca1bcf1c74473d",
           "supported_gfx_families": ["gfx94X-dcgpu", "gfx950-dcgpu"],
+          "min_gpu_counts": {"gfx94X-dcgpu": 8, "gfx950-dcgpu": 8},
           "generated_at_unix_ms": 1793272421113,
           "extra_env": {}
         }
@@ -751,6 +754,7 @@
           "model_id_override": "amdenterpriseai/aim-deepseek-ai-deepseek-v3-1-terminus:0.11.1",
           "image_digest": "sha256:5f0335322a88bd4a8abe0865227287f419b906b47d9913cf8de7a35df80142f4",
           "supported_gfx_families": ["gfx94X-dcgpu", "gfx950-dcgpu"],
+          "min_gpu_counts": {"gfx94X-dcgpu": 8, "gfx950-dcgpu": 8},
           "generated_at_unix_ms": 1793272421113,
           "extra_env": {}
         }
@@ -794,6 +798,7 @@
           "model_id_override": "amdenterpriseai/aim-deepseek-ai-deepseek-v3-1:0.11.1",
           "image_digest": "sha256:9fc6f3c6e5b165352ed0873d60bc1acfc1aeaebc048da4630d3166e0b498fb33",
           "supported_gfx_families": ["gfx94X-dcgpu", "gfx950-dcgpu"],
+          "min_gpu_counts": {"gfx94X-dcgpu": 8, "gfx950-dcgpu": 8},
           "generated_at_unix_ms": 1793272421113,
           "extra_env": {}
         }
@@ -836,6 +841,7 @@
           "model_id_override": "amdenterpriseai/aim-deepseek-ai-deepseek-v4-flash-0731:2026.11.0",
           "image_digest": "sha256:bb4e2c8b9ecfcfac886d7c5ebf2629c62ded2debac804d8bf2c11483f7ac6d8c",
           "supported_gfx_families": ["gfx94X-dcgpu", "gfx950-dcgpu"],
+          "min_gpu_counts": {"gfx94X-dcgpu": 2, "gfx950-dcgpu": 2},
           "generated_at_unix_ms": 1793272421113,
           "extra_env": {}
         }
@@ -1015,6 +1021,7 @@
           "model_id_override": "amdenterpriseai/aim-meta-llama-llama-3-1-405b-instruct:0.11.1",
           "image_digest": "sha256:bfe038184d0f0d8a415ee057f4fe64b984dbb743874d0907448be9ceed432743",
           "supported_gfx_families": ["gfx94X-dcgpu", "gfx950-dcgpu"],
+          "min_gpu_counts": {"gfx94X-dcgpu": 4},
           "requires_hf_token": true,
           "generated_at_unix_ms": 1793272421113,
           "extra_env": {}
@@ -1196,6 +1203,7 @@
           "model_id_override": "amdenterpriseai/aim-minimaxai-minimax-m2-5:0.12.0",
           "image_digest": "sha256:0a20a6dd756dc3ebc9cc0ada23f95e8edf49fbe33354652702f6d878380323ed",
           "supported_gfx_families": ["gfx94X-dcgpu", "gfx950-dcgpu"],
+          "min_gpu_counts": {"gfx94X-dcgpu": 2},
           "generated_at_unix_ms": 1793272421113,
           "extra_env": {}
         }
@@ -1238,6 +1246,7 @@
           "model_id_override": "amdenterpriseai/aim-minimaxai-minimax-m3:2026.9.0",
           "image_digest": "sha256:2b7221c5fa3592afefb0e904d10b063126ebe76f71ca7a5b8cd2c2a8a26c10c9",
           "supported_gfx_families": ["gfx94X-dcgpu", "gfx950-dcgpu"],
+          "min_gpu_counts": {"gfx94X-dcgpu": 4, "gfx950-dcgpu": 4},
           "generated_at_unix_ms": 1793272421113,
           "extra_env": {}
         }
@@ -1367,6 +1376,7 @@
           "model_id_override": "amdenterpriseai/aim-mistralai-mistral-large-3-675b-instruct-2512:0.10.0",
           "image_digest": "sha256:6119b9c717b44ff4bec3183318623738d2d95a99ecd85e0fe5bdca98bf24dbdd",
           "supported_gfx_families": ["gfx94X-dcgpu", "gfx950-dcgpu"],
+          "min_gpu_counts": {"gfx94X-dcgpu": 8, "gfx950-dcgpu": 8},
           "generated_at_unix_ms": 1793272421113,
           "extra_env": {}
         }
@@ -1496,6 +1506,7 @@
           "model_id_override": "amdenterpriseai/aim-mistralai-mixtral-8x22b-instruct-v0-1:0.11.1",
           "image_digest": "sha256:bcbe47ea00037f1d3b203a47c95bcfaa2dc76b5739a94bfdf0d681be1385c8a7",
           "supported_gfx_families": ["gfx94X-dcgpu", "gfx950-dcgpu"],
+          "min_gpu_counts": {"gfx94X-dcgpu": 4, "gfx950-dcgpu": 4},
           "generated_at_unix_ms": 1793272421113,
           "extra_env": {}
         }
@@ -1582,6 +1593,7 @@
           "model_id_override": "amdenterpriseai/aim-openai-gpt-oss-120b:0.11.1",
           "image_digest": "sha256:a3052d6230d7a414837903c31be0122f6615819448598e9caea973c084dc3ea7",
           "supported_gfx_families": ["gfx90a", "gfx94X-dcgpu", "gfx950-dcgpu"],
+          "min_gpu_counts": {"gfx90a": 2},
           "generated_at_unix_ms": 1793272421113,
           "extra_env": {}
         }
@@ -1668,6 +1680,7 @@
           "model_id_override": "amdenterpriseai/aim-qwen-qwen3-235b-a22b:0.11.1",
           "image_digest": "sha256:427d25b93cce97b499f9c1e9268b33eea25a8da8a0f7ef7904f4cdeef5f52f5a",
           "supported_gfx_families": ["gfx94X-dcgpu", "gfx950-dcgpu"],
+          "min_gpu_counts": {"gfx94X-dcgpu": 2},
           "generated_at_unix_ms": 1793272421113,
           "extra_env": {}
         }
@@ -1797,6 +1810,7 @@
           "model_id_override": "amdenterpriseai/aim-qwen-qwen3-vl-235b-a22b-instruct:0.11.1",
           "image_digest": "sha256:4353ab9fb67d30b54d4c724429c0401490b42aa96045a050faea7b46a9e2d3d6",
           "supported_gfx_families": ["gfx94X-dcgpu", "gfx950-dcgpu"],
+          "min_gpu_counts": {"gfx94X-dcgpu": 2},
           "generated_at_unix_ms": 1793272421113,
           "extra_env": {}
         }
@@ -1840,6 +1854,7 @@
           "model_id_override": "amdenterpriseai/aim-qwen-qwen3-vl-235b-a22b-thinking:0.11.1",
           "image_digest": "sha256:c10ee1a4189708e101802b4b0b3d292dfc4802ad08c6da70a0f56ae2094eeccb",
           "supported_gfx_families": ["gfx94X-dcgpu", "gfx950-dcgpu"],
+          "min_gpu_counts": {"gfx94X-dcgpu": 2},
           "generated_at_unix_ms": 1793272421113,
           "extra_env": {}
         }
@@ -1931,6 +1946,7 @@
           "model_id_override": "amdenterpriseai/aim-radeon-qwen-qwen3-6-35b-a3b:2026.11.0",
           "image_digest": "sha256:4df926af5c9e792675577cf881fb12b4964b6dac18f6d3f7c1e2cf460834eee2",
           "supported_gfx_families": ["gfx110X-all", "gfx120X-all"],
+          "min_gpu_counts": {"gfx110X-all": 4, "gfx120X-all": 4},
           "supported_boards": ["W7900", "R9700"],
           "profile_ids": {"gfx110X-all": "vllm-w7900-bf16-tp4-latency", "gfx120X-all": "vllm-r9700-bf16-tp4-latency"},
           "generated_at_unix_ms": 1793272421113,
@@ -2022,6 +2038,7 @@
           "model_id_override": "amdenterpriseai/aim-radeon-zai-org-glm-4-7-flash:0.12.0-preview",
           "image_digest": "sha256:b94130be1f12eaab28bdce274a63b3c10a24b8e292dc91f4c563b7a42246c1ab",
           "supported_gfx_families": ["gfx110X-all", "gfx120X-all"],
+          "min_gpu_counts": {"gfx110X-all": 2, "gfx120X-all": 4},
           "supported_boards": ["W7900", "R9700"],
           "profile_ids": {"gfx110X-all": "vllm-w7900-bf16-tp2-latency", "gfx120X-all": "vllm-r9700-bf16-tp4-latency"},
           "generated_at_unix_ms": 1793272421113,
@@ -2067,6 +2084,7 @@
           "model_id_override": "amdenterpriseai/aim-zai-org-glm-4-7:0.12.0",
           "image_digest": "sha256:6555005fe59ad9334ce292ca3df4b619106656a731e7319114c2b3a43a1b1219",
           "supported_gfx_families": ["gfx94X-dcgpu", "gfx950-dcgpu"],
+          "min_gpu_counts": {"gfx94X-dcgpu": 2},
           "generated_at_unix_ms": 1793272421113,
           "extra_env": {}
         }
@@ -2109,6 +2127,7 @@
           "model_id_override": "amdenterpriseai/aim-zai-org-glm-5-2:2026.9.0",
           "image_digest": "sha256:1a0ad5bda56eb0784085583068d56e1cfc03f4b28875fe968d9477b30b9f5f5b",
           "supported_gfx_families": ["gfx94X-dcgpu"],
+          "min_gpu_counts": {"gfx94X-dcgpu": 8},
           "generated_at_unix_ms": 1793272421113,
           "extra_env": {}
         }

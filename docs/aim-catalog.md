@@ -68,3 +68,9 @@ not need a rocm-cli maintainer.
    parameter count is not published (DeepSeek-V4-Flash, MiniMax-M3, GLM-5.2) are
    left unset rather than guessed. Replace an estimate with a measured figure
    when one is available.
+10. Set `min_gpu_counts` for any family whose smallest profile uses more than one
+    GPU (the smallest tensor-parallel size in that family's profiles; leave the
+    family out when a single-GPU profile exists). `rocm serve` refuses such an
+    image up front when `--gpu` pins one device or too few GPUs are usable.
+    `rocm serve` does not yet select several GPUs, so these images cannot be
+    started on a host where it would pick one; that is tracked as ROCMAI-751.

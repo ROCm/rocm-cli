@@ -120,6 +120,12 @@ pub struct ModelRecipeEngineRecord {
     /// on `aim`, and only checked when `profile_ids` pins a profile.
     #[serde(default)]
     pub supported_boards: Vec<String>,
+    /// Minimum number of GPUs the image needs per gfx family (the smallest
+    /// tensor-parallel size across that family's profiles). A family left out
+    /// needs one. Keys must be listed in `supported_gfx_families`. `rocm serve`
+    /// refuses to start with fewer usable GPUs. Only valid on `aim`.
+    #[serde(default)]
+    pub min_gpu_counts: BTreeMap<String, u32>,
 }
 
 /// Outcome of matching an engine recipe against the detected GPU family.
@@ -819,7 +825,16 @@ fn validate_model_recipe_engine_record(
             );
         }
     }
+    for (family, count) in &engine_recipe.min_gpu_counts {
+        if !engine_recipe.supported_gfx_families.contains(family) || *count < 2 {
+            bail!(
+                "engine recipe min_gpu_counts for `{family}` on `{canonical_model_id}` must be \
+                 a listed supported_gfx_families entry with a count of at least 2"
+            );
+        }
+    }
     if (!engine_recipe.supported_gfx_families.is_empty()
+        || !engine_recipe.min_gpu_counts.is_empty()
         || !engine_recipe.profile_ids.is_empty()
         || engine_recipe.requires_hf_token
         || !engine_recipe.supported_boards.is_empty())
@@ -1224,6 +1239,10 @@ mod tests {
         bad.profile_ids
             .insert("gfx120X-all".to_owned(), "q".to_owned());
         assert!(validate_model_recipe_engine_record(&bad, "m").is_err());
+        let mut bad_count = bad.clone();
+        bad_count.profile_ids.clear();
+        bad_count.min_gpu_counts.insert("gfx110X-all".to_owned(), 1);
+        assert!(validate_model_recipe_engine_record(&bad_count, "m").is_err());
         let mut wrong_engine = aim;
         wrong_engine.engine = "vllm".to_owned();
         assert!(validate_model_recipe_engine_record(&wrong_engine, "m").is_err());
@@ -1271,6 +1290,7 @@ mod tests {
                 profile_ids: BTreeMap::new(),
                 requires_hf_token: false,
                 supported_boards: Vec::new(),
+                min_gpu_counts: BTreeMap::new(),
             });
             ModelRecipeIndexDocument {
                 schema_version: 1,
@@ -1329,6 +1349,7 @@ mod tests {
             profile_ids: BTreeMap::new(),
             requires_hf_token: false,
             supported_boards: Vec::new(),
+            min_gpu_counts: BTreeMap::new(),
         });
         let index = ModelRecipeIndexDocument {
             schema_version: 1,

@@ -265,6 +265,57 @@ fn ensure_aim_hf_token(
     )
 }
 
+/// GPUs an AIM image needs on `family`, when more than one (see
+/// `min_gpu_counts`). `None` when it needs one, or the family is unknown.
+fn aim_min_gpu_count(
+    engine: &str,
+    recipe: Option<&ModelRecipeRecord>,
+    family: Option<&str>,
+) -> Option<u32> {
+    let family = family?;
+    aim_engine_record(engine, recipe)?
+        .min_gpu_counts
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(family))
+        .map(|(_, count)| *count)
+}
+
+/// Refuses an AIM image that needs `needed` GPUs when `--gpu` pins one device,
+/// fewer usable GPUs exist, or serve selected fewer devices than it needs,
+/// before anything is pulled: the container would start with too few devices and
+/// fail inside the image. `usable` is `None` when the count could not be probed,
+/// and `selected` is `None` before GPU selection or when none was made (the
+/// container then sees every GPU); neither is enforced then.
+fn ensure_aim_gpu_count(
+    model: &str,
+    needed: u32,
+    pinned_single_gpu: bool,
+    usable: Option<usize>,
+    selected: Option<usize>,
+) -> Result<()> {
+    let needed_usize = needed as usize;
+    if pinned_single_gpu {
+        bail!(
+            "`{model}` needs {needed} GPUs on this hardware, but `--gpu <index>` pins one device; \
+             drop `--gpu` (`rocm serve` does not support multi-GPU serving yet, so this model \
+             cannot be started here)"
+        );
+    }
+    if let Some(usable) = usable.filter(|usable| *usable < needed_usize) {
+        bail!(
+            "`{model}` needs {needed} GPUs on this hardware, but only {usable} usable {} found",
+            if usable == 1 { "GPU was" } else { "GPUs were" }
+        );
+    }
+    if selected.is_some_and(|selected| selected > 0 && selected < needed_usize) {
+        bail!(
+            "`{model}` needs {needed} GPUs on this hardware, but `rocm serve` selects a single \
+             GPU and does not support multi-GPU serving yet, so this model cannot be started here"
+        );
+    }
+    Ok(())
+}
+
 /// Note shown when the pinned AIM profile targets boards other than the detected
 /// GPU (a gfx family can cover cards the profile was not built for).
 fn aim_board_note(
@@ -773,16 +824,24 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
         .as_ref()
         .filter(|recipe| model_recipe_supports_engine(recipe, &selected_engine))
         .and_then(|recipe| protocol_engine_recipe_hint(recipe, &selected_engine));
+    let aim_host_family = aim_engine_record(&selected_engine, shared_recipe.as_ref())
+        .filter(|record| !record.supported_gfx_families.is_empty())
+        .and_then(|_| {
+            detect_host_gfx_target()
+                .as_deref()
+                .and_then(normalize_therock_family)
+        });
     let recipe_hint = engine_recipe_with_aim_gfx_profile(
         &selected_engine,
         shared_recipe.as_ref(),
         recipe_hint,
-        || {
-            detect_host_gfx_target()
-                .as_deref()
-                .and_then(normalize_therock_family)
-        },
+        || aim_host_family.clone(),
     )?;
+    let aim_min_gpus = aim_min_gpu_count(
+        &selected_engine,
+        shared_recipe.as_ref(),
+        aim_host_family.as_deref(),
+    );
     // vLLM rejects the TUI chat tab's tool-bearing requests with HTTP 400 unless it
     // is launched with `--enable-auto-tool-choice`/`--tool-call-parser`. The parser
     // is model-specific and vLLM does not auto-detect it, so it is never guessed: it
@@ -935,6 +994,15 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     } else {
         None
     };
+    if let (Some(needed), false) = (aim_min_gpus, cpu_only) {
+        ensure_aim_gpu_count(
+            &model,
+            needed,
+            matches!(gpu_selection, GpuSelection::Index(_)),
+            visible_gpu_indices.as_ref().map(Vec::len),
+            None,
+        )?;
+    }
     let resolved_selection = resolve_engine_selection(
         &config,
         &selected_engine,
@@ -984,6 +1052,9 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
         visible_gpu_indices.as_deref(),
         gpu_vram.as_deref(),
     )?;
+    if let (Some(needed), false) = (aim_min_gpus, cpu_only) {
+        ensure_aim_gpu_count(&model, needed, false, None, Some(gpu_indices.len()))?;
+    }
     let service_id = generate_service_id(&selected_engine, &resolve.canonical_model_id);
 
     // Attached foreground streaming is the debugging path, selected by `--verbose`
@@ -1459,6 +1530,52 @@ mod tests {
     }
 
     #[test]
+    fn multi_gpu_aim_image_is_refused_before_launch() {
+        let id = "deepseek-ai/DeepSeek-R1";
+        let r1 = resolve_builtin_model_recipe(id).expect("multi-gpu aim entry");
+        assert_eq!(
+            aim_min_gpu_count("aim", Some(&r1), Some("gfx94X-dcgpu")),
+            Some(8)
+        );
+        assert_eq!(aim_min_gpu_count("aim", Some(&r1), Some("gfx1151")), None);
+        assert_eq!(aim_min_gpu_count("aim", Some(&r1), None), None);
+        assert_eq!(
+            aim_min_gpu_count("vllm", Some(&r1), Some("gfx94X-dcgpu")),
+            None
+        );
+        // A single-GPU image has no requirement.
+        let small = resolve_builtin_model_recipe("Qwen/Qwen3-32B").expect("single-gpu entry");
+        assert_eq!(
+            aim_min_gpu_count("aim", Some(&small), Some("gfx94X-dcgpu")),
+            None
+        );
+        // Radeon needs differ per family.
+        let flash = resolve_builtin_model_recipe("zai-org/GLM-4.7-Flash").expect("flash entry");
+        assert_eq!(
+            aim_min_gpu_count("aim", Some(&flash), Some("gfx110X-all")),
+            Some(2)
+        );
+        assert_eq!(
+            aim_min_gpu_count("aim", Some(&flash), Some("gfx120X-all")),
+            Some(4)
+        );
+
+        let err = |pinned, usable, selected| {
+            ensure_aim_gpu_count(id, 8, pinned, usable, selected)
+                .unwrap_err()
+                .to_string()
+        };
+        assert!(err(true, Some(8), None).contains("`--gpu <index>` pins one device"));
+        assert!(err(false, Some(2), None).contains("only 2 usable GPUs were found"));
+        assert!(err(false, Some(1), None).contains("only 1 usable GPU was found"));
+        assert!(err(false, Some(8), Some(1)).contains("does not support multi-GPU serving yet"));
+        // Unknown counts, or no selection made (container sees every GPU), pass.
+        assert!(ensure_aim_gpu_count(id, 8, false, None, None).is_ok());
+        assert!(ensure_aim_gpu_count(id, 8, false, Some(8), Some(0)).is_ok());
+        assert!(ensure_aim_gpu_count(id, 8, false, Some(8), Some(8)).is_ok());
+    }
+
+    #[test]
     fn aim_board_note_only_fires_for_a_pinned_profile_on_another_board() {
         let radeon = resolve_builtin_model_recipe("aim-qwen3.5-9b").expect("radeon aim entry");
         assert!(aim_board_note("aim", Some(&radeon), Some("AMD Radeon PRO W7900")).is_none());
@@ -1572,6 +1689,7 @@ mod tests {
                 profile_ids: BTreeMap::new(),
                 requires_hf_token: false,
                 supported_boards: Vec::new(),
+                min_gpu_counts: BTreeMap::new(),
                 extra_env: BTreeMap::new(),
             },
             rocm_core::ModelRecipeEngineRecord {
@@ -1588,6 +1706,7 @@ mod tests {
                 profile_ids: BTreeMap::new(),
                 requires_hf_token: false,
                 supported_boards: Vec::new(),
+                min_gpu_counts: BTreeMap::new(),
                 extra_env: BTreeMap::new(),
             },
         ];
