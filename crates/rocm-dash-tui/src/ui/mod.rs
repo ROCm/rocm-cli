@@ -1009,8 +1009,10 @@ mod tests {
             version: ConnState::in_process_version("1.2.3"),
         };
         let mut term = Terminal::new(TestBackend::new(120, 3)).unwrap();
-        term.draw(|f| draw_header(f, f.area(), &state, &theme))
-            .unwrap();
+        term.draw(|f| {
+            draw_header(f, f.area(), &state, &theme);
+        })
+        .unwrap();
         let grid: String = (0..3)
             .flat_map(|y| (0..120).map(move |x| (x, y)))
             .map(|p| {
