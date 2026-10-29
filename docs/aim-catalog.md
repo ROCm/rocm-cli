@@ -46,3 +46,13 @@ not need a rocm-cli maintainer.
 6. Check each image's model page in the AIM catalog for the line "requires a
    Hugging Face authentication". For those, add the `HF_TOKEN` note to the
    entry's `notes` (the pattern used by the existing gated entries).
+7. Record which GPUs the image has profiles for. From the model page's profile
+   table, set `supported_gfx_families` on the entry (MI250X `gfx90a`; MI300X and
+   MI325X `gfx94X-dcgpu`; MI350X and MI355X `gfx950-dcgpu`; W7900 `gfx110X-all`;
+   R9700 `gfx120X-all`). `rocm serve` refuses a GPU outside that list, and
+   `rocm model` groups the recipe under the platform covering those families.
+   Instinct images auto-select a profile, so leave `AIM_PROFILE_ID` alone. Radeon
+   images do not select reliably: add `profile_ids` mapping each family to a
+   profile (the lowest-GPU-count optimized latency profile, noting in `notes` if
+   it needs more than one GPU). An explicit `--engine-env AIM_PROFILE_ID=...`
+   still wins.

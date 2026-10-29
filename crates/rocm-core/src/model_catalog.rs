@@ -97,6 +97,56 @@ pub struct ModelRecipeEngineRecord {
     /// [`MODEL_RECIPE_STALE_AFTER_MS`], since the pinned image may be gone.
     #[serde(default)]
     pub generated_at_unix_ms: Option<u128>,
+    /// TheRock gfx families (for example `gfx94X-dcgpu`) this engine recipe has a
+    /// profile for. Empty means unrestricted. Serving on a detected GPU outside
+    /// this list is refused, and it ties the recipe to the platforms covering
+    /// these families in `rocm model`. Only valid on `aim`.
+    #[serde(default)]
+    pub supported_gfx_families: Vec<String>,
+    /// AIM profile id (`AIM_PROFILE_ID`) to pin per gfx family, for images whose
+    /// profile auto-selection is unreliable (Radeon). Keys must be listed in
+    /// `supported_gfx_families`. An explicit `--engine-env AIM_PROFILE_ID=...`
+    /// wins over this. Only valid on `aim`.
+    #[serde(default)]
+    pub profile_ids: BTreeMap<String, String>,
+}
+
+/// Outcome of matching an engine recipe against the detected GPU family.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum GfxSupport<'a> {
+    /// No restriction, or no GPU family known to check against.
+    Unrestricted,
+    /// Supported; carries the profile id pinned for this family, if any.
+    Supported(Option<&'a str>),
+    /// The recipe lists families and this one is not among them.
+    Unsupported,
+}
+
+/// Checks `engine_recipe` against `gfx_family` (a normalized TheRock family).
+pub fn engine_recipe_gfx_support<'a>(
+    engine_recipe: &'a ModelRecipeEngineRecord,
+    gfx_family: Option<&str>,
+) -> GfxSupport<'a> {
+    if engine_recipe.supported_gfx_families.is_empty() {
+        return GfxSupport::Unrestricted;
+    }
+    let Some(family) = gfx_family else {
+        return GfxSupport::Unrestricted;
+    };
+    if !engine_recipe
+        .supported_gfx_families
+        .iter()
+        .any(|f| f.eq_ignore_ascii_case(family))
+    {
+        return GfxSupport::Unsupported;
+    }
+    GfxSupport::Supported(
+        engine_recipe
+            .profile_ids
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(family))
+            .map(|(_, id)| id.as_str()),
+    )
 }
 
 /// How long an engine recipe's `generated_at_unix_ms` stays trusted (180 days).
@@ -734,6 +784,39 @@ fn validate_model_recipe_engine_record(
             );
         }
     }
+    let known = crate::known_therock_families();
+    for family in &engine_recipe.supported_gfx_families {
+        if !known.contains(&family.as_str()) {
+            bail!(
+                "engine recipe for `{}` on `{canonical_model_id}` lists unknown gfx family `{family}`",
+                engine_recipe.engine
+            );
+        }
+    }
+    for (family, profile) in &engine_recipe.profile_ids {
+        require_nonempty(profile, "engine profile id")?;
+        if !engine_recipe.supported_gfx_families.contains(family) {
+            bail!(
+                "engine recipe profile_ids for `{family}` on `{canonical_model_id}` must also \
+                 be listed in supported_gfx_families"
+            );
+        }
+        if engine_recipe.extra_env.contains_key("AIM_PROFILE_ID") {
+            bail!(
+                "engine recipe on `{canonical_model_id}` sets both profile_ids and \
+                 extra_env AIM_PROFILE_ID"
+            );
+        }
+    }
+    if (!engine_recipe.supported_gfx_families.is_empty() || !engine_recipe.profile_ids.is_empty())
+        && !engine_recipe.engine.eq_ignore_ascii_case("aim")
+    {
+        bail!(
+            "engine recipe for `{}` on `{canonical_model_id}` sets supported_gfx_families or \
+             profile_ids, which only apply to aim",
+            engine_recipe.engine
+        );
+    }
     if engine_recipe.required_flags.is_empty()
         && engine_recipe.parser_settings.is_empty()
         && engine_recipe.preferred_endpoint.is_none()
@@ -742,6 +825,7 @@ fn validate_model_recipe_engine_record(
         && engine_recipe.model_id_override.is_none()
         && engine_recipe.image_digest.is_none()
         && engine_recipe.extra_env.is_empty()
+        && engine_recipe.supported_gfx_families.is_empty()
     {
         bail!(
             "engine recipe for `{}` on `{canonical_model_id}` must not be empty",
@@ -789,15 +873,47 @@ pub fn model_recipe_target_platform_label(
     recipe: &ModelRecipeRecord,
     platforms: &[ModelCatalogPlatform],
 ) -> String {
-    let engine = recipe
-        .preferred_engines
-        .first()
-        .map(|e| e.trim().to_ascii_lowercase())
-        .unwrap_or_default();
     platforms
         .iter()
-        .find(|p| p.engines.iter().any(|e| e.eq_ignore_ascii_case(&engine)))
-        .map_or_else(|| engine.clone(), |p| p.label.clone())
+        .find(|p| model_recipe_targets_platform(recipe, p))
+        .map_or_else(
+            || {
+                recipe
+                    .preferred_engines
+                    .first()
+                    .map(|e| e.trim().to_ascii_lowercase())
+                    .unwrap_or_default()
+            },
+            |p| p.label.clone(),
+        )
+}
+
+/// Whether `recipe` belongs under `platform`: its first preferred engine runs
+/// there and, when that engine's recipe restricts gfx families, the platform
+/// covers at least one of them.
+pub fn model_recipe_targets_platform(
+    recipe: &ModelRecipeRecord,
+    platform: &ModelCatalogPlatform,
+) -> bool {
+    let Some(engine) = recipe.preferred_engines.first() else {
+        return false;
+    };
+    if !platform
+        .engines
+        .iter()
+        .any(|e| e.eq_ignore_ascii_case(engine))
+    {
+        return false;
+    }
+    let families = recipe
+        .engine_recipes
+        .iter()
+        .find(|r| r.engine.eq_ignore_ascii_case(engine))
+        .map_or(&[][..], |r| r.supported_gfx_families.as_slice());
+    families.is_empty()
+        || families
+            .iter()
+            .any(|family| platform_matches_gfx_family(platform, family))
 }
 
 /// Whether the given normalized TheRock family matches a platform's gfx targets.
@@ -903,7 +1019,7 @@ mod tests {
         let strix = resolve_builtin_model_recipe("qwen").expect("qwen assistant");
         assert_eq!(
             model_recipe_target_platform_label(&strix, &platforms),
-            "AMD Ryzen AI - Strix Halo (Lemonade / llama.cpp / AIM)"
+            "AMD Ryzen AI - Strix Halo (Lemonade / llama.cpp)"
         );
         let mi300x = resolve_builtin_model_recipe("qwen3.6-27b").expect("qwen3.6-27b");
         assert_eq!(
@@ -1029,6 +1145,63 @@ mod tests {
     }
 
     #[test]
+    fn aim_recipes_are_matched_to_the_platforms_their_profiles_support() {
+        let registry = builtin_model_recipe_registry();
+        let platforms = model_catalog_platforms(&registry);
+        let label = |id: &str| {
+            model_recipe_target_platform_label(
+                &resolve_builtin_model_recipe(id).expect("recipe"),
+                &platforms,
+            )
+        };
+        assert!(label("Qwen/Qwen3.5-9B").starts_with("AMD Radeon"));
+        assert!(label("Qwen/Qwen3-32B").starts_with("AMD Instinct"));
+        let strix = platforms
+            .iter()
+            .find(|p| p.label.contains("Strix Halo"))
+            .expect("strix halo platform");
+        assert!(!strix.engines.iter().any(|e| e == "aim"));
+        for recipe in &registry.recipes {
+            for aim in recipe.engine_recipes.iter().filter(|e| e.engine == "aim") {
+                assert!(
+                    !aim.supported_gfx_families.is_empty(),
+                    "{} aim entry must say which GPUs its profiles cover",
+                    recipe.canonical_model_id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gfx_support_pins_profiles_and_rejects_other_families() {
+        let aim = ModelRecipeEngineRecord {
+            engine: "aim".to_owned(),
+            supported_gfx_families: vec!["gfx110X-all".to_owned()],
+            profile_ids: BTreeMap::from([("gfx110X-all".to_owned(), "p".to_owned())]),
+            ..Default::default()
+        };
+        assert_eq!(
+            engine_recipe_gfx_support(&aim, Some("gfx110X-all")),
+            GfxSupport::Supported(Some("p"))
+        );
+        assert_eq!(
+            engine_recipe_gfx_support(&aim, Some("gfx1151")),
+            GfxSupport::Unsupported
+        );
+        assert_eq!(
+            engine_recipe_gfx_support(&aim, None),
+            GfxSupport::Unrestricted
+        );
+        let mut bad = aim.clone();
+        bad.profile_ids
+            .insert("gfx120X-all".to_owned(), "q".to_owned());
+        assert!(validate_model_recipe_engine_record(&bad, "m").is_err());
+        let mut wrong_engine = aim;
+        wrong_engine.engine = "vllm".to_owned();
+        assert!(validate_model_recipe_engine_record(&wrong_engine, "m").is_err());
+    }
+
+    #[test]
     fn builtin_aim_recipe_carries_a_verification_timestamp() {
         let recipe = resolve_builtin_model_recipe("Qwen/Qwen3.5-9B").expect("aim recipe");
         let aim = recipe
@@ -1066,6 +1239,8 @@ mod tests {
                 model_id_override: None,
                 image_digest: Some(digest.to_owned()),
                 generated_at_unix_ms: None,
+                supported_gfx_families: Vec::new(),
+                profile_ids: BTreeMap::new(),
             });
             ModelRecipeIndexDocument {
                 schema_version: 1,
@@ -1120,6 +1295,8 @@ mod tests {
             model_id_override: None,
             image_digest: None,
             generated_at_unix_ms: None,
+            supported_gfx_families: Vec::new(),
+            profile_ids: BTreeMap::new(),
         });
         let index = ModelRecipeIndexDocument {
             schema_version: 1,
