@@ -198,14 +198,11 @@ pub(crate) fn apply_action(state: &mut AppState, action: KeyAction) -> bool {
         }
         // Reached from the `!` arm of `handle_key`, which only runs when no overlay,
         // prompt or modal owns the keyboard, and from a click on the badge, gated
-        // on `global_hotkeys_reachable`. So there is nothing open to close first;
-        // an opener that skipped that gate would hide the popup under an approval.
+        // on `global_hotkeys_reachable`. The check is repeated here so an opener
+        // that skipped that gate cannot hide the popup under an approval, in
+        // debug and release alike.
         KeyAction::OpenWarnings => {
-            debug_assert!(
-                !state.overlay_or_approval(),
-                "OpenWarnings must not be dispatched over an overlay or a pending approval"
-            );
-            if state.warning_count() > 0 {
+            if state.global_hotkeys_reachable() && state.warning_count() > 0 {
                 state.modal = Modal::Warnings;
             }
         }
@@ -1662,6 +1659,28 @@ mod tests {
         with_warnings(&mut s, 0);
         apply_action(&mut s, KeyAction::OpenWarnings);
         assert_eq!(s.modal, Modal::None, "snapshot without warnings");
+    }
+
+    #[test]
+    fn opening_warnings_is_refused_while_something_else_owns_the_keyboard() {
+        let mut s = st();
+        with_warnings(&mut s, 1);
+        s.modal = Modal::Help;
+        apply_action(&mut s, KeyAction::OpenWarnings);
+        assert_eq!(s.modal, Modal::Help, "a modal stays put");
+
+        let mut s = st();
+        with_warnings(&mut s, 1);
+        s.quit_confirm = Some(crate::ui::approval::ApprovalChoice::default());
+        apply_action(&mut s, KeyAction::OpenWarnings);
+        assert_eq!(s.modal, Modal::None, "nothing opens over a pending prompt");
+
+        let mut s = st();
+        with_warnings(&mut s, 1);
+        s.active_tab = ActiveTab::Chat;
+        s.chat_focused = true;
+        apply_action(&mut s, KeyAction::OpenWarnings);
+        assert_eq!(s.modal, Modal::None, "focused chat input owns the keyboard");
     }
 
     #[test]

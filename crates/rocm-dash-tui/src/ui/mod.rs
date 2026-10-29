@@ -725,10 +725,10 @@ fn draw_footer(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) -> Ve
     // `AppState::global_hotkeys_reachable` (the header warning badge gates on it
     // too); its terms are split out here because the footer needs subsets of
     // them separately (`q`'s label and clickability). It mirrors, in order,
-    // `event_loop`'s own dispatch: a manager
-    // overlay or pending approval owns every key before `handle_key` is ever
-    // called (`overlay_or_approval`); a plain `Modal::*` fully returns from
-    // its own arm before reaching the global match (`modal_open`); and
+    // `event_loop`'s own dispatch: a manager overlay or pending approval owns
+    // every key before `handle_key` is ever called (`overlay_or_approval`); a
+    // plain `Modal::*` fully returns from its own arm before reaching the
+    // global match (`modal_open`); and
     // focused chat text entry absorbs every key except PageUp/PageDown
     // (`chat_typing`, see `handle_key`'s `chat.focused` branch). Any footer
     // chip whose click dispatches a *global* hotkey action must gate on this,
