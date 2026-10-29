@@ -254,6 +254,23 @@ fallback paired an architecture line with the wrong GPU. On that machine
 `rocm diagnose` must **not** report `info-20-gpu-no-rocm-support` at all — the
 discrete card does have ROCm support, so the whole-machine claim is false.
 
+## 2b. Bare-Metal Driver Install
+
+On a real apt/dnf/zypper Linux host:
+
+```bash
+rocm install driver --dry-run
+```
+
+Expected result: the plan names the floating `latest` amdgpu release unless
+`ROCM_CLI_AMDGPU_DRIVER_VERSION` is set, in which case it names that version
+instead. A malformed override (e.g. containing a space or `'`) is refused with
+a reason naming `ROCM_CLI_AMDGPU_DRIVER_VERSION`, not silently ignored.
+
+On an Ubuntu 26.04 host, expect `supported: false` instead: `repo.radeon.com`
+has no DKMS repo for it yet (the amdgpu driver ships in-tree), so the plan
+directs you to `apt install rocm` rather than naming any DKMS commands.
+
 ## 3. Lemonade GPU Verification
 
 Lemonade is the default local assistant/server engine. Serve a small assistant
@@ -276,6 +293,23 @@ in `MSVCP140.dll`), the Visual C++ runtime on the machine is probably older than
 fix-21-msvc-redist-outdated` prints the update plan and changes nothing. After
 the update, restart Lemonade and repeat the serve command above.
 
+To check the recovery from a stale Lemonade backend pin (Windows or Linux with
+a managed Lemonade runtime already installed and an active managed ROCm SDK):
+the recovery only runs when the pinned `therock.version` equals the active
+SDK's version; with no active SDK, or a different version, the install takes
+other paths and simply fails or realigns. Edit
+`resources/backend_versions.json` in the Lemonade runtime tree so that
+`therock.version` is the active SDK's version and `llamacpp.rocm-stable` is a
+build tag Lemonade does not ship, add an unrelated key, remove the installed
+ROCm backend directory under `bin/llamacpp/`, and run
+`rocm engines install lemonade`. Expected result:
+
+- A warning says the pinned llama.cpp backend could not be installed and that the
+  pins Lemonade ships were restored; the command exits 0 and installs the
+  packaged backend.
+- `therock.version` and `llamacpp.rocm-stable` in `backend_versions.json` hold the
+  packaged values again, and the unrelated key is still there.
+
 While the log stream is attached, verify detach and stop behave differently:
 
 - Press `Ctrl+D`. The stream ends and the shell prompt returns, printing a
@@ -284,6 +318,42 @@ While the log stream is attached, verify detach and stop behave differently:
   request. Stop it afterward with `rocm services stop <service-id> --yes`.
 - Re-run the serve command and press `Ctrl+C` instead. The server shuts down and
   `rocm services` no longer lists it as running.
+
+### Windows display driver check
+
+On a Windows machine with an AMD GPU, check what the CLI says about the display
+driver:
+
+```powershell
+rocm examine
+rocm diagnose
+rocm install driver
+Get-CimInstance Win32_VideoController | Select-Object Name,DriverVersion,DriverDate
+```
+
+Expected result:
+
+- `rocm examine` prints `driver_version` and `driver_date`. Both match the
+  `DriverVersion` and `DriverDate` that the last command prints.
+- With a driver dated before 27 July 2023 (`FIRST_HIP_SDK_FOR_WINDOWS` in
+  [windows_driver.rs](../crates/rocm-core/src/windows_driver.rs)), `driver_age` says it is older than the
+  first HIP SDK for Windows and that the minimum driver version is not
+  established. `rocm diagnose` lists `fix-22-display-driver-old` with a WEAK
+  score, and its advice is AMD's support page and a restart after the install.
+  The date is only a floor: it cannot judge newer GPUs such as gfx120X,
+  gfx1150 and gfx1151, which may need newer drivers.
+- With a newer driver, `driver_age` says it is not older, and `rocm diagnose`
+  does not list `fix-22-display-driver-old`.
+- `rocm install driver` prints the same version and date, an `outdated:` verdict,
+  and the fix id when the driver is old. Next to `outdated: no` it says the date
+  cannot judge newer GPUs such as gfx120X, gfx1150 and gfx1151. It installs nothing and prints no
+  execution commands.
+
+Automated end-to-end scenarios (`examine-29`, `diagnose-41`, `driver-install-04`
+and `driver-install-05`) cover the lines, the verdict and the "installs nothing"
+promise on the Windows GPU lane with whatever driver that machine has. Only the
+old-driver branch needs this manual check: it needs a machine whose display
+driver is dated before 27 July 2023. The logic is also covered by unit tests.
 
 ## 4. Local Server Records
 
@@ -597,8 +667,11 @@ Expected result:
   CLI's own explanation, says no report was prepared, and the footer has no
   `s review & send`. Pressing `s` then does nothing.
 - `s` does not send. It opens a review dialog titled `Report this diagnosis`
-  that shows the full report, and `Deny` is the selected button. Check that
-  nothing else happened: no mail client opened and no job started.
+  that shows the full report, and `Deny` is the selected button. Its second
+  line, above the report, says the mail goes from your own mail account and
+  carries your address, so that is on screen before you approve, without
+  scrolling. Check that nothing else happened: no mail client opened and no job
+  started.
 - In the dialog, PgUp and PgDn scroll one page, Home and End jump to the top and
   the bottom. A muted `More to read` line with the row position appears only
   while the report is longer than the dialog. Up and Down do not scroll.
@@ -609,7 +682,10 @@ Expected result:
   your mail client, or on a machine with no mail client prints the address and
   the link. The mail is not sent until you send it from the mail client. The
   send examines the machine again, so the mail can differ slightly from the
-  preview if the machine changed in between.
+  preview if the machine changed in between. In the console, the line straight
+  under the report says the mail goes from your own mail account and carries
+  your address, and that the report itself names no user, host, or file path.
+  Check that the report above it bears that out.
 
 On an 80x24 terminal, repeat the steps up to the dialog: the card shows the
 outcome (report ready or refusal) without scrolling.
@@ -765,3 +841,54 @@ Expected result:
   `PATH change left in place` and names it, and the `PATH` change stays.
 - With `rocm uninstall --keep-binaries`, the review says the `PATH` change
   stays too, and it does.
+
+## 9. AIM (Docker) Engine Verification
+
+Linux/WSL2 only, and requires a reachable Docker daemon (`docker info` must
+succeed).
+
+```bash
+rocm serve aim-qwen3.5-9b --engine aim --managed
+rocm services list --all          # note the service id, e.g. aim-<model>-<millis>
+rocm services stop <service-id> --yes
+docker ps -a --filter name=rocm-aim-
+rocm services restart <service-id> --yes
+```
+
+A cold start downloads the model weights inside the container, which can exceed
+the engine's default 5-minute readiness wait. Raise it with
+`ROCM_CLI_AIM_READY_TIMEOUT_SECS=<seconds>` (a positive integer) in the
+environment of `rocm serve`. Stopping or failing a start removes the container
+and its downloaded weights, so a retry downloads them again.
+
+`aim-qwen3.5-9b` is the catalog entry (`rocm model --verbose`). It supplies the
+pinned image and `AIM_PROFILE_ID`; to serve a raw image reference instead, pass
+the profile yourself:
+
+```bash
+rocm serve amdenterpriseai/aim-radeon-qwen-qwen3-5-9b:0.12.0-preview --engine aim \
+  --managed --engine-env AIM_PROFILE_ID=vllm-w7900-bf16-tp1-latency
+```
+
+`--engine-env KEY=VALUE` is stored with the service record, so use it for
+non-secret values only. For a secret such as a gated model's `HF_TOKEN`, export
+it and pass the bare name (`export HF_TOKEN=...`, then `--engine-env HF_TOKEN`):
+it is forwarded from your environment and never stored. `--engine-env` is
+ignored by the other engines (the command prints a note saying so).
+
+Expected result:
+
+- The command pulls/starts an AIM Docker container (first run takes longer
+  while the image is pulled) and the model is reachable on the printed port
+  once the service shows `ready`. The model name to send is the one printed as
+  the API model, which is the name the container serves, not the image
+  reference.
+- `rocm services list --all` shows the service's engine as `aim`, and the
+  service stays `ready` while the container runs.
+- Stopping the service stops and removes the container; `docker ps -a` no
+  longer lists it, and `rocm services restart` brings the same service id back
+  up.
+- Killing the container directly (`docker kill rocm-aim-<service-id>`) makes the
+  service read `failed` rather than `stopped`, so rocmd's recovery restarts it.
+- On native Windows, the same command fails explicitly instead of falling
+  back to another engine.

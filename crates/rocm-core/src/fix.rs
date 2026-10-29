@@ -15,6 +15,7 @@
 //! place.
 
 use crate::examine::{run, which};
+use crate::quoting::ps_single_quote_escape;
 #[cfg(test)]
 use crate::rocm_install::{
     RocmLayout, discover_rocm_installs_in_layout, discover_rocm_installs_on_host_in,
@@ -235,6 +236,14 @@ struct FixRecipe {
     needs_reboot: bool,
     needs_relogin: bool,
     verify: &'static str,
+    /// A second verify line for Linux and WSL, printed as `Verify (Linux, WSL):`
+    /// after `verify`. `None` when `verify` runs the same on every OS the
+    /// recipe applies on. `verify` is shown to Windows users, so it cannot
+    /// name a tool that only exists on Linux (and cannot chain with `&&`);
+    /// this field carries the Linux check without that limit. It is still
+    /// printed on Windows, labelled, as the `# Linux:` command lines are, so
+    /// the text rule for Windows lines applies to it too.
+    verify_linux: Option<&'static str>,
     notes: &'static [&'static str],
     /// Where to read more about this failure. `None` for most entries today --
     /// an empty answer beats a guessed one, which would send a user somewhere
@@ -287,6 +296,7 @@ const RECIPES: &[FixRecipe] = &[
         needs_reboot: false,
         needs_relogin: false,
         verify: "python -c \"import torch; print(torch.cuda.is_available(), torch.cuda.get_arch_list())\"",
+        verify_linux: None,
         notes: &[
             "TheRock per-gfx wheels are the recommended fallback when the official pytorch index does not yet cover your gfx (and the only first-party option on Windows AMD).",
             "HSA_OVERRIDE_GFX_VERSION is NOT the right fix here -- it papers over the mismatch and risks page faults at runtime.",
@@ -305,15 +315,27 @@ const RECIPES: &[FixRecipe] = &[
             "# Linux:",
             "unset HSA_OVERRIDE_GFX_VERSION",
             "# Then remove the line from ~/.bashrc / ~/.zshrc / ~/.profile.",
-            "# Windows:",
-            "setx HSA_OVERRIDE_GFX_VERSION \"\"",
+            "# Windows (PowerShell):",
+            "[Environment]::SetEnvironmentVariable('HSA_OVERRIDE_GFX_VERSION',$null,'User')",
             "# Or remove via System Properties -> Environment Variables.",
+            "# This only affects NEW shells; close and reopen this terminal before running the verify command.",
         ],
         needs_sudo: false,
         needs_reboot: false,
         needs_relogin: false,
-        verify: "env | grep HSA_OVERRIDE_GFX_VERSION || echo OK_UNSET",
-        notes: &[],
+        // One line for cmd and Windows PowerShell (bash runs it too): it
+        // prints the override's value, or OK_UNSET. It needs `python`, which
+        // a Windows Python install and a virtual environment provide but a
+        // stock Ubuntu does not (that has `python3` only), so Linux and WSL get
+        // their own line below.
+        verify: "python -c \"import os; print(os.environ.get('HSA_OVERRIDE_GFX_VERSION') or 'OK_UNSET')\"",
+        // The same answer from the shell's own variable, with no Python and
+        // no external command, so it runs on a bare system. It has no `||`:
+        // this line is printed on Windows too, where the text rule refuses it.
+        verify_linux: Some("echo \"${HSA_OVERRIDE_GFX_VERSION:-OK_UNSET}\""),
+        notes: &[
+            "Linux, WSL: run the `Verify (Linux, WSL)` line. It reads the shell's own variable and needs no Python. The plain `Verify` line runs `python`, which a Windows Python install and a virtual environment provide, but a stock Ubuntu install has only `python3`, so the plain line fails there with `command not found` even after the override is cleared.",
+        ],
         doc_url: None,
         applies_on: PRINT_ON_LINUX_AND_WSL_AUTO_ON_WINDOWS,
         runner: Some(run_unset_override),
@@ -321,7 +343,7 @@ const RECIPES: &[FixRecipe] = &[
     FixRecipe {
         fix_id: "fix-3-rocm-kernel",
         title: "ROCm/distro/kernel triple unsupported",
-        rationale: "ROCm is installed but your kernel/distro combination is outside the supported matrix. Match the kernel to the matrix before reinstalling, or rerun with --no-dkms and accept the risk.",
+        rationale: "ROCm is installed but your kernel/distro combination is outside the supported matrix. Match the kernel to the matrix first, then rerun `rocm install driver --dkms --yes` (documented distros only; Ubuntu 26.04 ships the driver in-tree, use `apt install rocm`).",
         commands: &[
             "# Cross-check the live AMD matrix before changing anything:",
             "#   https://rocm.docs.amd.com/projects/install-on-linux/en/latest/reference/system-requirements.html",
@@ -330,7 +352,8 @@ const RECIPES: &[FixRecipe] = &[
         needs_sudo: false,
         needs_reboot: true,
         needs_relogin: false,
-        verify: "lsmod | grep amdgpu && rocminfo | head -n 5",
+        verify: "lsmod | grep amdgpu && rocminfo >/dev/null 2>&1",
+        verify_linux: None,
         notes: &[],
         doc_url: Some(
             "https://rocm.docs.amd.com/projects/install-on-linux/en/latest/reference/system-requirements.html",
@@ -347,6 +370,7 @@ const RECIPES: &[FixRecipe] = &[
         needs_reboot: false,
         needs_relogin: true,
         verify: "groups | tr ' ' '\\n' | grep -E '^(render|video)$' && rocminfo | head -n 5",
+        verify_linux: None,
         notes: &[],
         doc_url: None,
         applies_on: AUTO_ON_LINUX,
@@ -367,6 +391,7 @@ const RECIPES: &[FixRecipe] = &[
         needs_reboot: true,
         needs_relogin: false,
         verify: "lsmod | grep amdgpu && rocminfo | head -n 5",
+        verify_linux: None,
         notes: &[
             "If Secure Boot is enabled and amdgpu still won't load, the DKMS module isn't signed. Either sign it with mokutil or disable Secure Boot in firmware.",
         ],
@@ -387,7 +412,12 @@ const RECIPES: &[FixRecipe] = &[
         needs_sudo: false,
         needs_reboot: false,
         needs_relogin: false,
-        verify: "rocminfo | head -n 5 && hipcc --version",
+        // The line every OS can run, Windows included: `hipcc` ships with the
+        // HIP SDK there. Linux gets its own line below.
+        verify: "hipcc --version",
+        // `rocminfo` prints the GPU agents and needs no compiler, so it also
+        // passes on a runtime-only Linux install, which has no `hipcc`.
+        verify_linux: Some("rocminfo | head -n 5"),
         // The Windows command above is the manual-paste twin of what
         // `path_export_windows` actually runs -- same scope, same prepend
         // ordering -- so a user who pastes it and a user who lets `rocm fix`
@@ -395,7 +425,8 @@ const RECIPES: &[FixRecipe] = &[
         // the `setx` one-liner a Windows user would otherwise reach for.
         notes: &[
             "Windows: the PowerShell line reads and rewrites the User scope only, and puts the SDK's bin dir first -- the same write `rocm fix fix-6-path` performs. Do not substitute `setx PATH \"%PATH%;...\"`: setx silently truncates the value at 1024 characters while still exiting 0, and %PATH% expands to the combined user+system PATH, so that form would copy every system entry into your User PATH.",
-            "Windows: a PATH change only takes effect in NEW shells -- close this terminal and reopen it before re-running hipInfo.",
+            "Windows: a PATH change only takes effect in NEW shells -- close this terminal and reopen it before running the verify command.",
+            "Linux, WSL: run the `Verify (Linux, WSL)` line. `rocminfo` prints the GPU and needs no compiler, so it passes on a runtime-only install. The plain `Verify` line runs `hipcc --version`, which exists on Windows (HIP SDK) and on a Linux install that has the compiler, and fails on a runtime-only Linux install even when PATH is fixed, because that install has no `hipcc`.",
         ],
         doc_url: None,
         applies_on: AUTO_ON_LINUX_WINDOWS_AND_WSL,
@@ -406,15 +437,25 @@ const RECIPES: &[FixRecipe] = &[
         title: "Quarantine duplicate AMD repos",
         rationale: "More than one ROCm/AMDGPU repo file exists. The package manager is mixing versions; quarantine the extras before reinstalling.",
         commands: &[
-            "ls /etc/apt/sources.list.d/ | grep -iE 'rocm|amdgpu|radeon'",
+            "# Run only the line matching your package manager:",
+            "ls /etc/apt/sources.list.d/ | grep -iE 'rocm|amdgpu|radeon' || true   # Debian/Ubuntu",
+            "ls /etc/yum.repos.d/ | grep -iE 'rocm|amdgpu|radeon' || true          # RHEL/Fedora/Rocky/Alma/Oracle",
+            "ls /etc/zypp/repos.d/ | grep -iE 'rocm|amdgpu|radeon' || true         # SLES/openSUSE",
             "# For each duplicate file:",
-            "sudo mv /etc/apt/sources.list.d/<file>.list /etc/apt/sources.list.d/<file>.list.bak",
-            "sudo apt update",
+            "sudo mv /etc/apt/sources.list.d/<file>.list /etc/apt/sources.list.d/<file>.list.bak   # or the yum/zypp equivalent",
+            "# Run only the line matching your package manager:",
+            "sudo apt update      # Debian/Ubuntu",
+            "sudo dnf makecache   # RHEL/Fedora/Rocky/Alma/Oracle",
+            "sudo zypper refresh  # SLES/openSUSE",
         ],
         needs_sudo: true,
         needs_reboot: false,
         needs_relogin: false,
-        verify: "sudo apt update 2>&1 | tail -n 20",
+        verify: "# Run only the line matching your package manager:\n\
+                 bash -c 'set -o pipefail; sudo apt update 2>&1 | tail -n 20'      # Debian/Ubuntu\n\
+                 bash -c 'set -o pipefail; sudo dnf makecache 2>&1 | tail -n 20'   # RHEL/Fedora/Rocky/Alma/Oracle\n\
+                 bash -c 'set -o pipefail; sudo zypper refresh 2>&1 | tail -n 20'  # SLES/openSUSE",
+        verify_linux: None,
         notes: &[],
         doc_url: None,
         applies_on: PRINT_ON_LINUX,
@@ -437,6 +478,7 @@ const RECIPES: &[FixRecipe] = &[
         needs_reboot: false,
         needs_relogin: false,
         verify: "python -c \"import torch; print(torch.__version__, torch.version.hip, torch.cuda.is_available())\"",
+        verify_linux: None,
         notes: &[],
         doc_url: Some(
             "https://rocm.docs.amd.com/projects/install-on-linux/en/latest/reference/system-requirements.html",
@@ -460,6 +502,7 @@ const RECIPES: &[FixRecipe] = &[
         needs_reboot: false,
         needs_relogin: false,
         verify: "python -c \"import torch; print(torch.cuda.device_count(), torch.cuda.get_device_name(0))\"",
+        verify_linux: None,
         notes: &[
             "Pass --device-index N to persist the env var; without it, this fix only prints the rocminfo / hipInfo query so you can identify N.",
         ],
@@ -484,6 +527,7 @@ const RECIPES: &[FixRecipe] = &[
         needs_reboot: false,
         needs_relogin: false,
         verify: "rocminfo | head -n 5",
+        verify_linux: None,
         notes: &[
             "Rootless podman additionally needs `--userns=keep-id` and a host user that is in the render group; podman maps it through.",
         ],
@@ -506,6 +550,7 @@ const RECIPES: &[FixRecipe] = &[
         needs_reboot: true,
         needs_relogin: false,
         verify: "cat /proc/cmdline | grep -o 'iommu=\\w*'",
+        verify_linux: None,
         notes: &[],
         doc_url: None,
         applies_on: PRINT_ON_LINUX,
@@ -513,20 +558,43 @@ const RECIPES: &[FixRecipe] = &[
     },
     FixRecipe {
         fix_id: "fix-12-installer",
-        title: "Reset amdgpu-install state and reinstall",
-        rationale: "amdgpu-install left a half-configured DKMS / repo state. Run the documented uninstall, clean up, and reinstall without the flag that broke things (commonly --accept-eula on newer installers).",
+        title: "Reset repo-native install state and reinstall",
+        rationale: "The repo-native package-manager install left a half-configured DKMS / repo state. Clear the broken package state, quarantine the ROCm/AMDGPU repo files found on this host, let the package manager forget the broken state, then reinstall via rocm-cli's own repo-native flow.",
         commands: &[
-            "sudo amdgpu-install --uninstall",
-            "sudo apt autoremove --purge -y",
-            "sudo apt update",
-            "sudo amdgpu-install --usecase=rocm,hip",
+            "# Applies only where `rocm install driver --dkms` plans a reinstall (AMD-documented",
+            "# distros). On Ubuntu 26.04 the driver is in-tree: skip the purge/remove, the DKMS",
+            "# reinstall and the DKMS verify, and run `sudo apt install rocm` instead. On any other",
+            "# distro it plans nothing: skip the purge/remove and reinstall per AMD's install docs.",
+            "# Run only the block matching your package manager. On Debian/Ubuntu, run all",
+            "# three lines even if an earlier one reports an error -- the purge must not",
+            "# be skipped just because the half-configured state made `install -f` fail:",
+            "sudo dpkg --configure -a      # Debian/Ubuntu",
+            "sudo apt-get install -f       # Debian/Ubuntu",
+            "sudo apt-get purge -y amdgpu-dkms   # Debian/Ubuntu",
+            "sudo dnf remove -y amdgpu-dkms                                                             # RHEL/Fedora/Rocky/Alma/Oracle",
+            "sudo zypper remove -y amdgpu-dkms                                                          # SLES/openSUSE",
+            "# sudo mv /etc/apt/sources.list.d/amdgpu.list /etc/apt/sources.list.d/amdgpu.list.bak       # or the yum/zypp equivalent; quarantine, do not delete yet",
+            "# Run only the line matching your package manager:",
+            "sudo apt update      # Debian/Ubuntu",
+            "sudo dnf makecache   # RHEL/Fedora/Rocky/Alma/Oracle",
+            "sudo zypper refresh  # SLES/openSUSE",
+            "rocm install driver --dkms --yes",
         ],
         needs_sudo: true,
         needs_reboot: true,
         needs_relogin: false,
-        verify: "dpkg -l | grep -E 'rocm|amdgpu' | head -n 20 && rocminfo | head -n 5",
+        // See the matching comment on this fix's `verify` in diagnose.rs:
+        // must query the targeted amdgpu-dkms package's installed status
+        // (not a bare rocm/amdgpu name grep), confirm dkms reports the
+        // module built, and check rocminfo's own exit code directly.
+        verify: "(dpkg-query -W -f='${Status}' amdgpu-dkms 2>/dev/null | grep -q 'install ok installed' \
+                 || rpm -q amdgpu-dkms >/dev/null 2>&1) \
+                 && dkms status amdgpu 2>/dev/null | grep -q installed \
+                 && rocminfo >/dev/null 2>&1",
+        verify_linux: None,
         notes: &[
-            "If `apt autoremove --purge` warns it will remove unrelated packages, stop and resolve those by hand before continuing.",
+            "If the purge/remove step warns it will take unrelated packages with it, stop and resolve those by hand before continuing.",
+            "The `rocm install driver --dkms --yes` line and the verify below apply only on AMD-documented distros; `rocm install driver --dkms --yes` exits non-zero where it plans nothing (Ubuntu 26.04, undocumented distros). There, verify with `rocminfo` alone, or `dpkg-query -W rocm` after `sudo apt install rocm` on Ubuntu 26.04.",
         ],
         doc_url: None,
         applies_on: PRINT_ON_LINUX,
@@ -544,7 +612,8 @@ const RECIPES: &[FixRecipe] = &[
         needs_sudo: false,
         needs_reboot: false,
         needs_relogin: false,
-        verify: "powershell -NoProfile -Command \"& \\\"$env:HIP_PATH\\bin\\hipInfo.exe\\\" | Select-Object -First 5\"",
+        verify: "powershell -NoProfile -Command \"& (Join-Path ([Environment]::GetEnvironmentVariable('HIP_PATH')) 'bin\\hipInfo.exe') | Select-Object -First 5\"",
+        verify_linux: None,
         notes: &[
             "If you only need PyTorch on Windows AMD and don't need the C/C++ HIP toolchain, the TheRock wheels bundle their own HIP runtime and may not require a system HIP SDK install.",
         ],
@@ -566,7 +635,8 @@ const RECIPES: &[FixRecipe] = &[
         needs_sudo: false,
         needs_reboot: true,
         needs_relogin: false,
-        verify: "powershell -NoProfile -Command \"(Get-CimInstance Win32_VideoController | Where-Object { $_.Name -like '*AMD*' -or $_.Name -like '*Radeon*' } | Select-Object -First 1).DriverVersion\"",
+        verify: "powershell -NoProfile -Command \"(Get-CimInstance Win32_VideoController | Where-Object Name -match 'AMD|Radeon' | Select-Object -First 1).DriverVersion\"",
+        verify_linux: None,
         notes: &[],
         doc_url: Some(
             "https://rocm.docs.amd.com/projects/install-on-windows/en/latest/install/install.html",
@@ -586,7 +656,8 @@ const RECIPES: &[FixRecipe] = &[
         needs_sudo: false,
         needs_reboot: false,
         needs_relogin: false,
-        verify: "where vcruntime140.dll && where vcruntime140_1.dll",
+        verify: "powershell -NoProfile -Command \"(Get-Item ([Environment]::GetFolderPath('System') + '\\vcruntime140.dll'),([Environment]::GetFolderPath('System') + '\\vcruntime140_1.dll') -ErrorAction Stop).VersionInfo | Select-Object FileName,FileVersion\"",
+        verify_linux: None,
         notes: &[
             "If installing the redistributable still leaves a missing-DLL error, the failing DLL is probably amdhip64_X.dll itself; that points at fix-13-hip-sdk-missing rather than this fix. If the runtime is present but the program crashes with an access violation, see fix-21-msvc-redist-outdated.",
         ],
@@ -610,6 +681,7 @@ const RECIPES: &[FixRecipe] = &[
         needs_reboot: false,
         needs_relogin: false,
         verify: "rocm serve <model> <case-appropriate options above>   # re-run and watch for a clean startup",
+        verify_linux: None,
         notes: &[
             "Only lower --gpu-memory-utilization when the GPU is shared or already busy; on a GPU dedicated to this server it cannot create the room a too-large model needs.",
             "This entry is keyword-matched from the error text: `rocm diagnose` cannot see per-GPU VRAM or tenancy, so pass the failure with --symptom (or arrive from the `rocm serve` failure note).",
@@ -662,6 +734,7 @@ const RECIPES: &[FixRecipe] = &[
         needs_reboot: false,
         needs_relogin: false,
         verify: "rocm serve <model> --engine vllm   # then `rocm services list --all` and `rocm services logs <service-id>` to confirm the import no longer aborts",
+        verify_linux: None,
         notes: &[
             "Running vLLM on ROCm is not by itself a reason to apply this. torch-c-dlpack-ext arrives as a transitive dependency of tilelang, which vLLM pins, and it only misbehaves on the torch versions it ships prebuilts for.",
             "The usual way a runtime lands in the failing range is `rocm install sdk` being re-run after the engine was installed, which overwrites the engine's pinned torch. Reinstalling the engine puts the pin back.",
@@ -691,6 +764,7 @@ const RECIPES: &[FixRecipe] = &[
         needs_reboot: false,
         needs_relogin: false,
         verify: "ls -l /dev/dxg",
+        verify_linux: None,
         notes: &[
             "A container running on WSL2 reports itself as WSL but sees /dev/dxg only when it was started with the device. Check that before touching the Windows driver.",
         ],
@@ -714,6 +788,7 @@ const RECIPES: &[FixRecipe] = &[
         needs_reboot: false,
         needs_relogin: false,
         verify: "ls -l /usr/lib/wsl/lib/libdxcore.so && ldconfig -p | grep libdxcore",
+        verify_linux: None,
         notes: &["apt cannot repair /usr/lib/wsl: it is a mount supplied by WSL, not a package."],
         doc_url: None,
         applies_on: PRINT_ON_WSL,
@@ -732,6 +807,7 @@ const RECIPES: &[FixRecipe] = &[
         needs_reboot: false,
         needs_relogin: false,
         verify: "ldconfig -p | grep librocdxg",
+        verify_linux: None,
         notes: &[
             "Print-only on purpose: this downloads a .deb from a release page and installs it with sudo. `rocm install driver` prints the plan first so the URL and the package are reviewable before anything runs.",
             "The download is checked against a digest pinned for that ROCDXG release. To install a release rocm-cli has no digest for, set ROCM_CLI_ROCDXG_SHA256 to the one published with it.",
@@ -749,6 +825,7 @@ const RECIPES: &[FixRecipe] = &[
         needs_reboot: false,
         needs_relogin: false,
         verify: "ldconfig -p | grep librocdxg",
+        verify_linux: None,
         notes: &[
             "If ldconfig alone does not do it, the library landed outside the linker's search path: add that directory under /etc/ld.so.conf.d/ and re-run.",
         ],
@@ -768,6 +845,7 @@ const RECIPES: &[FixRecipe] = &[
         needs_reboot: false,
         needs_relogin: false,
         verify: "f=/etc/os-release; [ -e \"$f\" ] || f=/usr/lib/os-release; grep VERSION_ID \"$f\" 2>/dev/null | head -1",
+        verify_linux: None,
         notes: &[
             "Distros install side by side, so the current one can stay until the new one is set up.",
         ],
@@ -787,6 +865,7 @@ const RECIPES: &[FixRecipe] = &[
         needs_reboot: false,
         needs_relogin: false,
         verify: "rocminfo | head -n 20",
+        verify_linux: None,
         notes: &[
             "Nothing inside the distro can carry this out, which is why it prints rather than runs.",
             "The ROCm release and the Adrenalin release are paired; check the WSL install guide for the version that matches your ROCm.",
@@ -808,6 +887,7 @@ const RECIPES: &[FixRecipe] = &[
         needs_reboot: false,
         needs_relogin: false,
         verify: "uname -r",
+        verify_linux: None,
         notes: &[
             "Converting rewrites the distro's filesystem and can take a long time on a large install. Back up anything you cannot lose first.",
         ],
@@ -838,6 +918,7 @@ const RECIPES: &[FixRecipe] = &[
         needs_reboot: false,
         needs_relogin: false,
         verify: "python -c \"import torch; torch.zeros(1, device='cuda')\"",
+        verify_linux: None,
         notes: &[
             COMGR_CONFLICT_NEITHER_OPTION_RECOMMENDED,
             "This describes the environment outside the CLI's managed runtimes. `rocm serve` puts a managed runtime's libraries first on purpose, so inside one the wheel copy wins by design and that is correct.",
@@ -870,6 +951,7 @@ const RECIPES: &[FixRecipe] = &[
         needs_reboot: false,
         needs_relogin: false,
         verify: "df -h /dev/shm",
+        verify_linux: None,
         notes: &[
             "A running container cannot have its allowance changed. It has to be started again with the larger value.",
             "This is reported below 1 GiB. Silence is not proof of enough: a container given 2 GiB clears that bar and can still be too small for a large model.",
@@ -901,13 +983,39 @@ const RECIPES: &[FixRecipe] = &[
         needs_sudo: false,
         needs_reboot: false,
         needs_relogin: false,
-        verify: "powershell -NoProfile -Command \"(Get-Item $env:SystemRoot\\System32\\msvcp140.dll).VersionInfo.FileVersion\"",
+        verify: "powershell -NoProfile -Command \"(Get-Item ([Environment]::GetFolderPath('System') + '\\msvcp140.dll') -ErrorAction Stop).VersionInfo.FileVersion\"",
+        verify_linux: None,
         notes: &[
             "The verify command prints the runtime version. It should read 14.40 or higher.",
             "`rocm fix` only prints this plan. It does not run the install: the install needs the Windows administrator prompt and your consent.",
             "14.40 is the first runtime that matches the toolset where the standard library changed. A newer program can still ask for a newer runtime, so install the latest one.",
         ],
         doc_url: Some("https://aka.ms/vs/17/release/vc_redist.x64.exe"),
+        applies_on: PRINT_ON_WINDOWS,
+        runner: None,
+    },
+    FixRecipe {
+        fix_id: crate::windows_driver::DISPLAY_DRIVER_OLD_FIX_ID,
+        title: "Look for a newer AMD display driver (advice only)",
+        rationale: "The AMD display driver on this Windows machine is dated before the first HIP SDK for Windows (27 July 2023). AMD publishes no minimum driver version for the HIP SDK or for the Lemonade Vulkan backend, so the minimum is not established and this is advice, not a finding that anything is broken. rocm-cli never installs drivers on Windows.",
+        commands: &[
+            "# Find the current display driver for this GPU on AMD's support page:",
+            // A literal because a `static` slice cannot format a constant in. The
+            // URL must equal `windows_driver::AMD_SUPPORT_URL`; the display-driver
+            // test below pins it, and the diagnose copy builds the line from the constant.
+            "#   https://www.amd.com/en/support",
+            "# Restart the machine after the driver install.",
+        ],
+        needs_sudo: false,
+        needs_reboot: true,
+        needs_relogin: false,
+        verify: "powershell -NoProfile -Command \"Get-CimInstance Win32_VideoController | Where-Object Name -match 'AMD|Radeon' | Select-Object Name,DriverVersion,DriverDate\"",
+        verify_linux: None,
+        notes: &[
+            crate::windows_driver::NO_MINIMUM_EXPLANATION,
+            crate::windows_driver::FLOOR_NOTE,
+        ],
+        doc_url: Some(crate::windows_driver::AMD_SUPPORT_URL),
         applies_on: PRINT_ON_WINDOWS,
         runner: None,
     },
@@ -927,6 +1035,7 @@ const RECIPES: &[FixRecipe] = &[
         needs_reboot: false,
         needs_relogin: false,
         verify: "",
+        verify_linux: None,
         notes: &[
             "HSA_OVERRIDE_GFX_VERSION is NOT a workaround here: it makes the runtime load kernels built for another architecture, which faults at runtime rather than adding support.",
             // Not "`rocm serve` already picks a Vulkan engine on this host":
@@ -1108,6 +1217,268 @@ pub(crate) fn recipe_verify_notes_and_run_commands(
             .collect::<Vec<_>>();
         (recipe.verify, recipe.notes, run_commands)
     })
+}
+
+/// Test-only: the Linux and WSL verify line of a recipe, when it has one.
+#[cfg(test)]
+pub(crate) fn recipe_linux_verify(fix_id: &str) -> Option<&'static str> {
+    find_recipe(fix_id).and_then(|recipe| recipe.verify_linux)
+}
+
+/// What one Windows shell did with a line typed into it.
+#[cfg(all(test, windows))]
+pub(crate) struct ShellRun {
+    pub shell: &'static str,
+    pub success: bool,
+    pub status: String,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+/// Runs `text` the way a user would type it into Windows PowerShell 5.1.
+///
+/// The text goes on stdin (`-Command -`), which parses it as typed. Passing it
+/// as an argument of an outer `-Command` is not the same thing: PowerShell
+/// joins its arguments after removing their quotes, so the inner command text
+/// would be cut at the first space and the pipe would run in the outer shell.
+///
+/// `env` sets (`Some`) or removes (`None`) variables for the child only.
+///
+/// `PSModulePath` is removed first, so Windows PowerShell 5.1 starts with its own
+/// default module path. A test run from a PowerShell 7 session inherits that
+/// session's path, which lists the PowerShell 7 modules first. 5.1 then picks
+/// the PSReadLine built for 7, cannot load it, and writes "Cannot load PSReadline
+/// module" to stderr, which the tests below treat as a failure of the line.
+#[cfg(all(test, windows))]
+pub(crate) fn run_typed_in_powershell(text: &str, env: &[(&str, Option<&str>)]) -> ShellRun {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let mut command = Command::new("powershell");
+    command.args(["-NoProfile", "-Command", "-"]);
+    command.env_remove("PSModulePath");
+    for (name, value) in env {
+        match value {
+            Some(v) => command.env(name, v),
+            None => command.env_remove(name),
+        };
+    }
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().expect("powershell starts");
+    let mut stdin = child.stdin.take().expect("stdin is piped");
+    writeln!(stdin, "{text}").expect("the line is written");
+    drop(stdin);
+    shell_run(
+        "powershell",
+        child.wait_with_output().expect("powershell finishes"),
+    )
+}
+
+/// Runs `line` the way a user would type it into cmd (`cmd /C`, with the line
+/// passed unquoted and unescaped). `env` is as for [`run_typed_in_powershell`].
+#[cfg(all(test, windows))]
+pub(crate) fn run_typed_in_cmd(line: &str, env: &[(&str, Option<&str>)]) -> ShellRun {
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+    let mut command = Command::new("cmd");
+    command.arg("/C").raw_arg(line);
+    command.env_remove("PSModulePath");
+    for (name, value) in env {
+        match value {
+            Some(v) => command.env(name, v),
+            None => command.env_remove(name),
+        };
+    }
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let out = command
+        .spawn()
+        .expect("cmd starts")
+        .wait_with_output()
+        .expect("cmd finishes");
+    shell_run("cmd", out)
+}
+
+/// Runs one printed line in cmd and in Windows PowerShell, in that order.
+#[cfg(all(test, windows))]
+pub(crate) fn run_typed_in_cmd_and_powershell(
+    line: &str,
+    env: &[(&str, Option<&str>)],
+) -> Vec<ShellRun> {
+    vec![
+        run_typed_in_cmd(line, env),
+        run_typed_in_powershell(line, env),
+    ]
+}
+
+#[cfg(all(test, windows))]
+fn shell_run(shell: &'static str, out: std::process::Output) -> ShellRun {
+    ShellRun {
+        shell,
+        success: out.status.success(),
+        status: format!("{:?}", out.status),
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+    }
+}
+
+/// Where a `powershell ... -Command "..."` argument starts in `lowered` (the
+/// line, lowercased): the byte offset of the flag, the quote that opens the
+/// argument, and the text after that quote.
+///
+/// PowerShell accepts any prefix of `-Command` down to `-c`, so `-c` and
+/// `-comm` are found as well.
+#[cfg(test)]
+fn command_argument(lowered: &str) -> Option<(usize, char, &str)> {
+    lowered.match_indices('-').find_map(|(at, _)| {
+        let head = &lowered[..at];
+        // Only a PowerShell line: `python -c "..."` has the same flag.
+        if head.chars().next_back().is_some_and(|c| !c.is_whitespace())
+            || !(head.contains("powershell") || head.contains("pwsh"))
+        {
+            return None;
+        }
+        let rest = &lowered[at..];
+        let flag = rest.split_whitespace().next()?;
+        if flag.len() < 2 || !"-command".starts_with(flag) {
+            return None;
+        }
+        let after = rest[flag.len()..].trim_start();
+        let quote = after.chars().next().filter(|c| matches!(c, '"' | '\''))?;
+        Some((at, quote, &after[1..]))
+    })
+}
+
+/// Test-only rule for what a printed command must not contain when it is shown
+/// to a user of Windows PowerShell 5.1 as well as cmd:
+///
+/// - `&&` and `||`, which are syntax errors in Windows PowerShell 5.1;
+/// - a bare `where`, which starts a command and is the `Where-Object` alias in
+///   PowerShell, not `where.exe`. A command starts after `|`, `;`, `(`, `{` and
+///   a lone `&` (cmd's unconditional separator), at the start of a
+///   `-Command "..."` body, and after `cmd /c`, so `echo x & where foo` is
+///   caught. The `&` of a call operator (`& 'path\exe'`) is split the same way
+///   and stays legal, because the word after it is not `where`;
+/// - a `%NAME%` reference, which PowerShell passes on as literal text. For
+///   `setx PATH "%PATH%;..."` that writes `%PATH%` into the user's Path;
+/// - a `-Command` (or `-c`, or any longer prefix of it) argument in single
+///   quotes. cmd does not treat `'` as a quote, so it splits the argument at
+///   its spaces;
+/// - inside the double-quoted body of a `powershell ... -Command "..."` line, a
+///   backslash-escaped quote (`\"`) or any `$`. PowerShell does not take `\` as
+///   an escape, so typed into PowerShell the `\"` ends the string early; and
+///   an outer PowerShell expands `$_`, `$env:NAME` and the like before the inner
+///   one starts, so they would be empty or hold the outer value, and a value
+///   with a space in it would split the inner command. Use single quotes inside
+///   the body, `[Environment]::GetEnvironmentVariable('NAME')` for a variable,
+///   `[Environment]::GetFolderPath('System')` for the system directory, and a
+///   cmdlet that needs no `$_`. There is no exemption. The `-Command` match
+///   ignores case;
+/// - outside such a body, an empty-string argument (`""` or `''`). Windows
+///   PowerShell 5.1 drops it when it calls a native program, so
+///   `setx NAME ""` reaches setx as `setx NAME`, which fails with "Invalid
+///   syntax" and clears nothing. Use a .NET call such as
+///   `[Environment]::SetEnvironmentVariable('NAME',$null,'User')`;
+/// - inside a `-Command` body, a `Get-Item` that does not carry
+///   `-ErrorAction Stop`. `Get-Item` reports a missing path as a
+///   non-terminating error and PowerShell exits 0 after one, so a verify that
+///   checks a file this way would pass with the file missing. Other cmdlets
+///   that behave this way are not listed.
+///
+/// It is a text rule over those known-bad constructs. It is not a parser: it
+/// does not prove a line is valid or that it runs, and a construct it does not
+/// list passes. On Windows, the verify lines of fix-2, fix-13, fix-14, fix-15,
+/// fix-21 and fix-22 are run by `the_override_verify_runs_in_cmd_and_powershell`,
+/// `the_hip_sdk_verify_runs_the_exe_under_hip_path`,
+/// `the_adrenalin_verify_runs_and_its_filter_keeps_only_amd`,
+/// `the_msvc_verify_runs_in_cmd_and_powershell` (fix-15 again in
+/// `the_msvc_verify_exits_nonzero_when_a_dll_is_missing`),
+/// `the_outdated_msvc_verify_prints_a_version_and_fails_when_the_dll_is_missing`
+/// and `the_display_driver_verify_runs_in_cmd_and_powershell`; fix-9's Windows
+/// line, which only `diagnose.rs` prints, by
+/// `the_igpu_verify_pins_the_variable_it_names`.
+/// Some lines `diagnose.rs` prints are PowerShell-only by design, and are
+/// checked as such where they are built.
+///
+/// Shared by the checks on the `RECIPES` catalog here and on the `Fix` values
+/// that `diagnose.rs` builds. A copy of this rule lives in the e2e crate
+/// (`powershell_text_rule::refusal`), which cannot depend on rocm-core;
+/// `the_powershell_text_rule_agrees_with_the_shared_case_table` and the test
+/// next to that copy both read `tests/e2e-cucumber/fixtures/powershell_text_rule_cases.txt`,
+/// so a case one rule gets wrong fails on that side.
+#[cfg(test)]
+pub(crate) fn fails_in_windows_powershell(line: &str) -> Option<&'static str> {
+    if line.contains("&&") || line.contains("||") {
+        return Some("`&&` or `||`, a syntax error in Windows PowerShell 5.1");
+    }
+    // `-Command` is not case-sensitive, and neither is this match.
+    let lowered = line.to_ascii_lowercase();
+    let command = command_argument(&lowered);
+    // An opening brace is written as an escape on purpose: the advised-commands
+    // scanner skips a cfg(test) item by counting braces, and a lone one throws it off.
+    let starts_bare_where = |text: &str| {
+        text.split(['|', ';', '&', '(', '\u{7b}']).any(|part| {
+            let mut words = part.split_whitespace().map(|w| w.trim_matches('"'));
+            let mut first = words.next();
+            if first == Some("cmd") {
+                first = words.find(|w| !w.starts_with('/'));
+            }
+            first == Some("where")
+        })
+    };
+    if starts_bare_where(&lowered)
+        || command.is_some_and(|(_, _, body)| starts_bare_where(body.trim_start()))
+    {
+        return Some("a bare `where`, which is `Where-Object` in PowerShell");
+    }
+    // The text outside a `-Command "..."` body, which is typed at the outer
+    // shell and so is where an argument can be dropped.
+    let outer = command.map_or(lowered.as_str(), |(at, _, _)| &lowered[..at]);
+    if outer
+        .split_whitespace()
+        .any(|word| word == "\"\"" || word == "''")
+    {
+        return Some(
+            "an empty-string argument (`\"\"` or `''`), which Windows PowerShell 5.1 drops when it calls a native program",
+        );
+    }
+    if let Some((_, quote, body)) = command {
+        if quote == '\'' {
+            return Some(
+                "a single-quoted `-Command` argument, which cmd does not take as one argument",
+            );
+        }
+        if body.contains("\\\"") {
+            return Some(
+                "a backslash-escaped quote inside a `powershell -Command \"...\"` body, which ends the string early when typed into PowerShell",
+            );
+        }
+        if body.contains('$') {
+            return Some(
+                "a `$` inside a `powershell -Command \"...\"` body (`$_`, `$env:NAME`), which an outer PowerShell expands before the inner one starts",
+            );
+        }
+        if body.contains("get-item") && !body.contains("-erroraction stop") {
+            return Some(
+                "a `Get-Item` without `-ErrorAction Stop`: a missing path is a non-terminating error, so the line prints it and still exits 0",
+            );
+        }
+    }
+    // The text between a `%` and the next one. The last piece has no closing
+    // `%`, so it is never a name.
+    let pieces: Vec<&str> = line.split('%').collect();
+    let names_a_cmd_variable = pieces
+        .get(1..pieces.len().saturating_sub(1))
+        .unwrap_or_default()
+        .iter()
+        .any(|name| {
+            !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        });
+    names_a_cmd_variable.then_some("a `%NAME%` reference, which PowerShell does not expand")
 }
 
 /// Test-only view of the platform families a recipe is runnable on.
@@ -1393,9 +1764,51 @@ fn print_recipe(r: &FixRecipe) {
     for n in r.notes {
         println!("Note:       {n}");
     }
-    if !r.verify.is_empty() {
-        println!("Verify:     {}", r.verify);
+    for line in verify_lines(r) {
+        println!("{line}");
     }
+}
+
+/// The `Verify` lines of the plan `print_recipe` prints, in print order: the
+/// line every OS can run, then the Linux and WSL line when the recipe has one.
+/// Split out so the labels are testable, as `format_flags` is. A multi-line
+/// line keeps its continuation under the label.
+fn verify_lines(r: &FixRecipe) -> Vec<String> {
+    let mut lines = Vec::new();
+    if !r.verify.is_empty() {
+        lines.push(format!(
+            "Verify:     {}",
+            indent_continuation(r.verify, "            ")
+        ));
+    }
+    if let Some(linux) = r.verify_linux {
+        lines.push(format!(
+            "Verify (Linux, WSL): {}",
+            indent_continuation(linux, "            ")
+        ));
+    }
+    lines
+}
+
+/// The commands a print-only plan tells the user to run to verify, as printed.
+fn verify_steps(r: &FixRecipe) -> Vec<String> {
+    let mut steps = Vec::new();
+    if !r.verify.is_empty() {
+        steps.push(format!("  $ {}", indent_continuation(r.verify, "    ")));
+    }
+    if let Some(linux) = r.verify_linux {
+        steps.push(format!(
+            "  $ {}   # Linux, WSL",
+            indent_continuation(linux, "    ")
+        ));
+    }
+    steps
+}
+
+/// Indent every line after the first so a multi-line `verify` (fix-7 lists one
+/// command per package manager) stays under its `Verify:` / `$` label.
+fn indent_continuation(text: &str, indent: &str) -> String {
+    text.replace('\n', &format!("\n{indent}"))
 }
 
 /// What `rocm fix` says when it is handed a `rocm diagnose` ranking position
@@ -1525,8 +1938,8 @@ fn act_on(recipe: &FixRecipe, opts: &FixOptions) -> i32 {
         Plan::PrintSteps => {
             println!("This fix is print-only (manual change required).");
             println!("Copy the commands above, run them yourself, then verify with:");
-            if !recipe.verify.is_empty() {
-                println!("  $ {}", recipe.verify);
+            for step in verify_steps(recipe) {
+                println!("{step}");
             }
             exit::OK
         }
@@ -1562,19 +1975,12 @@ fn confirm(prompt: &str, assume_yes: bool) -> bool {
         }
         return verdict;
     }
-    print!("{prompt} [y/N]: ");
-    let _ = std::io::stdout().flush();
-    let mut line = String::new();
-    let confirmed = std::io::stdin().read_line(&mut line).is_ok() && is_affirmative_answer(&line);
+    let _ = crate::confirm::print_prompt(&mut std::io::stdout(), &format!("{prompt} [y/N]: "));
+    let confirmed = crate::confirm::read_answer(&mut std::io::stdin().lock()).unwrap_or(false);
     if !confirmed {
         fail!("Not confirmed; refusing to apply.");
     }
     confirmed
-}
-
-/// Parse a user's typed response to a `[y/N]` prompt.
-fn is_affirmative_answer(line: &str) -> bool {
-    matches!(line.trim().to_lowercase().as_str(), "y" | "yes")
 }
 
 fn home_dir() -> Option<PathBuf> {
@@ -1798,11 +2204,21 @@ fn report_and_clear_override_windows(
     let mut declined = false;
     if !user_val.is_empty() {
         println!("\nClear from the User scope (no admin needed):");
-        println!("  Will run: setx HSA_OVERRIDE_GFX_VERSION \"\"");
+        // What the CLI runs, not a line to paste: the process is started
+        // directly with these arguments, empty one included. Windows PowerShell
+        // 5.1 drops an empty argument, so pasting the line would not clear
+        // anything; the plan above carries the line to paste. The text is built
+        // from the argument list that is run, so the two cannot differ.
+        let setx_args = ["HSA_OVERRIDE_GFX_VERSION", ""];
+        let shown: Vec<String> = setx_args.iter().map(|a| format!("\"{a}\"")).collect();
+        println!(
+            "  The CLI runs (arguments, not a line to paste): setx {}",
+            shown.join(" ")
+        );
         if opts.dry_run {
             println!("  (dry-run; not executed)");
         } else if consent("Clear HSA_OVERRIDE_GFX_VERSION from User scope?") {
-            let (rc, out, err) = run("setx", &["HSA_OVERRIDE_GFX_VERSION", ""], RUN_TIMEOUT);
+            let (rc, out, err) = run("setx", &setx_args, RUN_TIMEOUT);
             relay_output(&out, &err);
             if rc != 0 {
                 fail!("setx exited {rc}; User scope NOT changed.");
@@ -1933,31 +2349,6 @@ fn windows_path_prepend(bin_dir: &str, user_path: &str) -> String {
     } else {
         format!("{bin_dir};{user_path}")
     }
-}
-
-/// Escapes a value for embedding inside a PowerShell single-quoted string
-/// literal. PowerShell single-quoted strings are literal, and the
-/// language's own convention for including a literal `'` in one is to
-/// double it (`''`) -- an unescaped `'` instead ends the literal early, so
-/// whatever follows on the line is parsed as separate PowerShell tokens.
-///
-/// This matters here because the value embedded into
-/// `path_export_windows`'s write script (`new_path`, built by
-/// [`windows_path_prepend`] from `bin_dir` and the real existing User PATH
-/// read back from the host) is filesystem/environment-origin data, not a
-/// literal this code controls. A path containing an apostrophe --
-/// `C:\Users\O'Brien\bin` on the real PATH, or an install root with one in
-/// `bin_dir` -- is an ordinary Windows path, not a contrived edge case, and
-/// without this escape it would split the generated `-Command` script
-/// mid-statement.
-///
-/// `pub(crate)` because the same escape has to apply to the copy of this
-/// command `crate::diagnose` *prints* for the user to paste: the two are one
-/// plan on two surfaces, and a path the write survives but the printed
-/// version breaks on would be the same ROCMAI-449 bug moved from the write to
-/// the documentation.
-pub(crate) fn ps_single_quote_escape(value: &str) -> String {
-    value.replace('\'', "''")
 }
 
 /// Does the read/plan/write work for [`run_path_export_windows`], with the
@@ -2226,26 +2617,6 @@ mod tests {
     // through the seam should not be reaching for the lock.
     static PROCESS_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    #[test]
-    fn is_affirmative_answer_accepts_only_y_and_yes() {
-        for accepted in ["y", "Y", "yes", "YES", "Yes", "  y  ", "  yes\n"] {
-            assert!(
-                is_affirmative_answer(accepted),
-                "expected {accepted:?} to be treated as a yes"
-            );
-        }
-    }
-
-    #[test]
-    fn is_affirmative_answer_rejects_everything_else() {
-        for declined in ["n", "no", "", "\n", "yep", "ye"] {
-            assert!(
-                !is_affirmative_answer(declined),
-                "expected {declined:?} to be treated as a decline"
-            );
-        }
-    }
-
     /// Whether a recipe applies on the platform the test is running on.
     ///
     /// Gating on `runtime_is_linux()` stopped being the same question once WSL
@@ -2458,6 +2829,7 @@ mod tests {
             needs_reboot: false,
             needs_relogin: false,
             verify: "",
+            verify_linux: None,
             notes: &[],
             doc_url: None,
             applies_on: Box::leak(Box::new([on(current_os(), class)])),
@@ -2609,11 +2981,12 @@ mod tests {
         let count = ids.len();
         ids.dedup();
         assert_eq!(ids.len(), count, "duplicate fix-id in RECIPES");
-        // 21 bare-metal/Windows entries (fix-16-vllm-oom, fix-17-torch-dlpack,
+        // 22 bare-metal/Windows entries (fix-16-vllm-oom, fix-17-torch-dlpack,
         // fix-18-comgr-conflict, fix-19-shm-too-small,
-        // fix-21-msvc-redist-outdated and the informational
-        // info-20-gpu-no-rocm-support among them) plus the 7 WSL ones.
-        assert_eq!(count, 28, "expected 28 catalog entries");
+        // fix-21-msvc-redist-outdated, fix-22-display-driver-old and the
+        // informational info-20-gpu-no-rocm-support among them) plus the 7 WSL
+        // ones.
+        assert_eq!(count, 29, "expected 29 catalog entries");
     }
 
     /// `rocm fix fix-21-msvc-redist-outdated` prints the plan and runs nothing.
@@ -2750,6 +3123,670 @@ mod tests {
                 r.fix_id
             );
         }
+    }
+
+    /// The commands and the verify line of a recipe that applies on Windows
+    /// are shown to users of Windows PowerShell and of cmd, so none may use
+    /// what `fails_in_windows_powershell` lists. The set of recipes is derived
+    /// from `applies_on`, so a new Windows recipe is covered without editing
+    /// this test.
+    ///
+    /// This pins the text only. The Windows-only tests named on
+    /// `fails_in_windows_powershell` run the verify lines of fix-2, fix-13,
+    /// fix-14, fix-15, fix-21 and fix-22 in a shell; the other catalog lines
+    /// are not run. The same
+    /// rule is applied to the `Fix` values that `diagnose.rs` builds, in
+    /// `windows_diagnosis_remediation_passes_the_powershell_text_rule`.
+    #[test]
+    fn windows_recipes_pass_the_powershell_text_rule() {
+        let windows: Vec<&FixRecipe> = RECIPES
+            .iter()
+            .filter(|r| r.platform("windows").is_some())
+            .collect();
+        assert!(
+            windows.iter().any(|r| r.fix_id == "fix-15-msvc-redist"),
+            "the derivation found no Windows recipes: {windows:?}",
+            windows = windows.iter().map(|r| r.fix_id).collect::<Vec<_>>()
+        );
+        for r in windows {
+            let printed = r
+                .commands
+                .iter()
+                .copied()
+                .filter(|c| !c.trim_start().starts_with('#'))
+                .chain(std::iter::once(r.verify))
+                .chain(r.verify_linux);
+            for line in printed {
+                if let Some(why) = fails_in_windows_powershell(line) {
+                    panic!("{}: `{line}` uses {why}", r.fix_id);
+                }
+            }
+        }
+    }
+
+    /// fix-6's plan carries one verify line that runs on Windows and one for
+    /// Linux and WSL that shows the GPU. The plain line is what Windows runs, so
+    /// it cannot need `rocminfo`; the Linux line must not need `hipcc`, which a
+    /// runtime-only install lacks. The note says exactly that, so the two
+    /// claims in it are asserted against the lines it names.
+    #[test]
+    fn the_path_fix_verifies_the_gpu_on_linux_without_needing_hipcc() {
+        let recipe = find_recipe("fix-6-path").expect("fix-6 is in the catalog");
+        let linux = recipe.verify_linux.expect("fix-6 has a Linux verify line");
+        assert!(
+            linux.starts_with("rocminfo") && !linux.contains("hipcc"),
+            "the Linux line must show the GPU and not need hipcc: {linux}"
+        );
+        assert!(
+            !recipe.verify.contains("rocminfo"),
+            "the plain line is shown to Windows users, where rocminfo does not exist: {}",
+            recipe.verify
+        );
+        assert_eq!(
+            verify_lines(recipe),
+            [
+                "Verify:     hipcc --version",
+                "Verify (Linux, WSL): rocminfo | head -n 5"
+            ]
+        );
+        let note = recipe
+            .notes
+            .iter()
+            .find(|n| n.contains("runtime-only"))
+            .expect("a note names the runtime-only install");
+        assert!(
+            note.contains("hipcc") && note.contains("Verify (Linux, WSL)"),
+            "{note}"
+        );
+    }
+
+    /// fix-2's plan carries the line every OS can run (`python`, as cmd and
+    /// PowerShell run it) and a Linux and WSL line that does not need Python,
+    /// because a stock Ubuntu has `python3` only. The note names both lines, so
+    /// the claims in it are asserted against what is printed: the Linux line
+    /// really needs no `python` and no external command, and it reports the
+    /// same answer as the plain line (the override's value, or OK_UNSET).
+    // The `${...}` in the expected line is shell text, not a format argument.
+    #[allow(clippy::literal_string_with_formatting_args)]
+    #[test]
+    fn the_override_fix_has_a_linux_verify_line_that_needs_no_python() {
+        let recipe = find_recipe("fix-2-unset-override").expect("fix-2 is in the catalog");
+        let linux = recipe.verify_linux.expect("fix-2 has a Linux verify line");
+        assert_eq!(
+            verify_lines(recipe),
+            [
+                format!("Verify:     {}", recipe.verify),
+                "Verify (Linux, WSL): echo \"${HSA_OVERRIDE_GFX_VERSION:-OK_UNSET}\"".to_owned()
+            ]
+        );
+        assert!(
+            recipe.verify.starts_with("python -c "),
+            "the plain line is the one that runs in cmd and PowerShell: {}",
+            recipe.verify
+        );
+        assert!(!linux.contains("python"), "{linux}");
+        let note = recipe
+            .notes
+            .iter()
+            .find(|n| n.contains("python3"))
+            .expect("a note names the stock-Ubuntu python3 case");
+        assert!(
+            note.contains("Verify (Linux, WSL)") && note.contains("`python`"),
+            "{note}"
+        );
+    }
+
+    /// The fix-2 Linux line, run in `/bin/sh` with a `PATH` that holds nothing
+    /// (no `python`, no `env`, no `grep`): it must still report the override's
+    /// value, or OK_UNSET once it is cleared, and exit 0. The plain `python`
+    /// line fails on this PATH.
+    #[cfg(unix)]
+    #[test]
+    fn the_override_linux_verify_runs_with_nothing_on_path() {
+        let linux = find_recipe("fix-2-unset-override")
+            .and_then(|r| r.verify_linux)
+            .expect("fix-2 has a Linux verify line");
+        let empty = tempfile::tempdir().expect("an empty PATH directory is created");
+        let run = |line: &str, value: Option<&str>| {
+            let mut command = std::process::Command::new("/bin/sh");
+            command
+                .arg("-c")
+                .arg(line)
+                .env_clear()
+                .env("PATH", empty.path());
+            if let Some(value) = value {
+                command.env("HSA_OVERRIDE_GFX_VERSION", value);
+            }
+            let out = command.output().expect("/bin/sh runs");
+            (
+                out.status.success(),
+                String::from_utf8_lossy(&out.stdout).trim().to_owned(),
+            )
+        };
+        assert_eq!(run(linux, Some("11.0.0")), (true, "11.0.0".to_owned()));
+        assert_eq!(run(linux, None), (true, "OK_UNSET".to_owned()));
+        let plain = find_recipe("fix-2-unset-override").unwrap().verify;
+        assert!(!run(plain, None).0, "the plain line needs python on PATH");
+    }
+
+    /// A Linux verify line is only worth having on a recipe that applies on
+    /// Linux or WSL; on any other it could never be run.
+    #[test]
+    fn a_linux_verify_line_belongs_to_a_recipe_that_applies_on_linux_or_wsl() {
+        let with_one: Vec<&FixRecipe> = RECIPES
+            .iter()
+            .filter(|r| r.verify_linux.is_some())
+            .collect();
+        assert!(
+            !with_one.is_empty(),
+            "no recipe carries a Linux verify line"
+        );
+        for r in with_one {
+            assert!(
+                r.platform("linux").is_some() || r.platform("wsl").is_some(),
+                "{} has a Linux verify line but does not apply on Linux or WSL",
+                r.fix_id
+            );
+        }
+    }
+
+    #[test]
+    fn a_print_only_plan_labels_its_linux_verify_step() {
+        let mut recipe = unfixable_recipe(FixClass::PrintOnly);
+        recipe.verify = "hipcc --version";
+        assert_eq!(verify_steps(&recipe), ["  $ hipcc --version"]);
+        recipe.verify_linux = Some("rocminfo | head -n 5");
+        assert_eq!(
+            verify_steps(&recipe),
+            [
+                "  $ hipcc --version",
+                "  $ rocminfo | head -n 5   # Linux, WSL"
+            ]
+        );
+        recipe.verify = "";
+        recipe.verify_linux = None;
+        assert!(verify_steps(&recipe).is_empty() && verify_lines(&recipe).is_empty());
+    }
+
+    /// The fix-15 verify line, taken apart. This is a structural check on the
+    /// text, so it runs on every host: a misspelled cmdlet or environment
+    /// variable fails here even where no Windows shell is available. It does not
+    /// replace running the line. `the_msvc_verify_runs_in_cmd_and_powershell`
+    /// does that, and only on Windows.
+    #[test]
+    fn the_msvc_verify_is_a_wellformed_powershell_command() {
+        let verify = find_recipe("fix-15-msvc-redist")
+            .expect("fix-15 is in the catalog")
+            .verify;
+        // Starts with `powershell` so cmd runs it too. The body is one
+        // double-quoted argument with no `$`, so an outer PowerShell has
+        // nothing to expand, whatever the system directory's path holds.
+        let body = verify
+            .strip_prefix("powershell -NoProfile -Command \"")
+            .and_then(|rest| rest.strip_suffix('"'))
+            .unwrap_or_else(|| panic!("not a quoted `powershell -Command` argument: {verify}"));
+        assert!(
+            !body.contains('"'),
+            "an inner quote would end the argument: {body}"
+        );
+        // Every command word is a real cmdlet, and the Windows directory is
+        // read inside the body by .NET rather than from a variable.
+        let cmdlets: Vec<&str> = body
+            .split('|')
+            .map(|stage| {
+                stage
+                    .trim()
+                    .trim_start_matches('(')
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+            })
+            .collect();
+        assert_eq!(cmdlets, ["Get-Item", "Select-Object"], "{body}");
+        assert!(
+            !body.contains('$'),
+            "an outer PowerShell would expand it: {body}"
+        );
+        assert_eq!(
+            body.matches("[Environment]::GetFolderPath('System')")
+                .count(),
+            2,
+            "{body}"
+        );
+        for dll in ["vcruntime140.dll", "vcruntime140_1.dll"] {
+            assert!(body.contains(dll), "{dll} is not checked: {body}");
+        }
+        assert!(
+            body.contains(".VersionInfo") && body.ends_with("Select-Object FileName,FileVersion"),
+            "{body}"
+        );
+    }
+
+    /// Runs the fix-15 verify line the way a user would: typed into cmd, and
+    /// typed into Windows PowerShell. Both must exit 0 and print each DLL on its own
+    /// row with a dotted version. The runtime is installed on the Windows CI hosts, so a
+    /// failure here means the line is broken.
+    ///
+    /// The PowerShell leg feeds the line on stdin (`-Command -`), which parses
+    /// it as typed text. Passing it as an argument of an outer `-Command` is
+    /// not the same thing: PowerShell joins its arguments after removing their
+    /// quotes, so the inner command text would be cut at the first space and
+    /// the pipe would run in the outer shell.
+    ///
+    /// Only compiled on Windows. Linux and macOS lanes do not run it, which is
+    /// why `the_msvc_verify_is_a_wellformed_powershell_command` also checks the
+    /// text on every host.
+    #[cfg(windows)]
+    #[test]
+    fn the_msvc_verify_runs_in_cmd_and_powershell() {
+        let verify = find_recipe("fix-15-msvc-redist")
+            .expect("fix-15 is in the catalog")
+            .verify;
+        for run in run_typed_in_cmd_and_powershell(verify, &[]) {
+            let ShellRun {
+                shell,
+                success,
+                status,
+                stdout: text,
+                stderr: err,
+            } = run;
+            assert!(success, "{shell}: {status}\n{text}\n{err}");
+            assert!(err.trim().is_empty(), "{shell} wrote to stderr: {err}");
+            // `Select-Object FileName,FileVersion` prints a table with one row
+            // per DLL: the path, then the version, on one line. Check each DLL
+            // on its own row, so a pairing that lost or crossed a version (a
+            // row with a name and no version, or both names on one row) fails.
+            // `vcruntime140.dll` is not a substring of `vcruntime140_1.dll`,
+            // so each name picks out exactly one row. This proves each listed
+            // DLL has a dotted version beside it; it cannot prove the version
+            // is the right one for that file. A path wrapped onto a second
+            // line would fail here, and then the test is wrong, not the line.
+            let is_version = |w: &str| {
+                let parts: Vec<&str> = w.split('.').collect();
+                parts.len() >= 3
+                    && parts
+                        .iter()
+                        .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+            };
+            for dll in ["vcruntime140.dll", "vcruntime140_1.dll"] {
+                let rows: Vec<&str> = text.lines().filter(|l| l.contains(dll)).collect();
+                assert_eq!(
+                    rows.len(),
+                    1,
+                    "{shell}: expected one row for {dll}:\n{text}"
+                );
+                let row = rows[0];
+                assert!(
+                    row.split_whitespace().any(is_version),
+                    "{shell}: the {dll} row has no dotted version:\n{text}"
+                );
+                let other = if dll == "vcruntime140.dll" {
+                    "vcruntime140_1.dll"
+                } else {
+                    "vcruntime140.dll"
+                };
+                assert!(
+                    !row.contains(other),
+                    "{shell}: {dll} and {other} share a row:\n{text}"
+                );
+            }
+        }
+    }
+
+    /// A DLL that is missing must fail the fix-15 verify. `Get-Item` reports a
+    /// missing path as a non-terminating error, and PowerShell exits 0 after one,
+    /// so without `-ErrorAction Stop` the line printed an error for the missing
+    /// DLL and still exited 0. The line is run with the name of the second DLL
+    /// changed to one that does not exist; the system directory cannot be
+    /// redirected to one without it, because PowerShell does not start under a
+    /// `SystemRoot` that is not the real one. Only compiled on Windows.
+    #[cfg(windows)]
+    #[test]
+    fn the_msvc_verify_exits_nonzero_when_a_dll_is_missing() {
+        let verify = find_recipe("fix-15-msvc-redist")
+            .expect("fix-15 is in the catalog")
+            .verify;
+        let broken = verify.replace("vcruntime140_1.dll", "vcruntime140_absent.dll");
+        assert_ne!(
+            broken, verify,
+            "the recipe no longer names vcruntime140_1.dll"
+        );
+        for run in run_typed_in_cmd_and_powershell(&broken, &[]) {
+            let ShellRun {
+                shell,
+                success,
+                stdout,
+                stderr,
+                ..
+            } = run;
+            assert!(
+                !success,
+                "{shell} exited 0 with a DLL missing:\n{stdout}\n{stderr}"
+            );
+            assert!(
+                stderr.contains("vcruntime140_absent.dll"),
+                "{shell} did not name the missing DLL on stderr:\n{stderr}"
+            );
+        }
+    }
+
+    /// fix-21's verify line, run typed into cmd and into Windows PowerShell:
+    /// it prints the dotted version of `msvcp140.dll`. With the DLL's name
+    /// changed to one that does not exist, both shells must exit non-zero and
+    /// name the file: `Get-Item` reports a missing path as a non-terminating
+    /// error, so without `-ErrorAction Stop` the line exits 0 with no output
+    /// (the case `the_msvc_verify_exits_nonzero_when_a_dll_is_missing` covers
+    /// for fix-15). `diagnose.rs` holds its copy of the line equal to this one.
+    /// Only compiled on Windows.
+    #[cfg(windows)]
+    #[test]
+    fn the_outdated_msvc_verify_prints_a_version_and_fails_when_the_dll_is_missing() {
+        let verify = find_recipe("fix-21-msvc-redist-outdated")
+            .expect("fix-21 is in the catalog")
+            .verify;
+        for run in run_typed_in_cmd_and_powershell(verify, &[]) {
+            let ShellRun {
+                shell,
+                success,
+                status,
+                stdout,
+                stderr,
+            } = run;
+            assert!(success, "{shell}: {status}\n{stdout}\n{stderr}");
+            assert!(
+                stderr.trim().is_empty(),
+                "{shell} wrote to stderr: {stderr}"
+            );
+            let version = stdout.trim();
+            let parts: Vec<&str> = version.split('.').collect();
+            assert!(
+                parts.len() >= 3
+                    && parts
+                        .iter()
+                        .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())),
+                "{shell}: not a dotted version: {stdout}"
+            );
+        }
+        let broken = verify.replace("msvcp140.dll", "msvcp140_absent.dll");
+        assert_ne!(broken, verify, "the recipe no longer names msvcp140.dll");
+        for run in run_typed_in_cmd_and_powershell(&broken, &[]) {
+            let ShellRun {
+                shell,
+                success,
+                stdout,
+                stderr,
+                ..
+            } = run;
+            assert!(
+                !success,
+                "{shell} exited 0 with the DLL missing:\n{stdout}\n{stderr}"
+            );
+            assert!(
+                stderr.contains("msvcp140_absent.dll"),
+                "{shell} did not name the missing DLL on stderr:\n{stderr}"
+            );
+        }
+    }
+
+    /// Runs the fix-2 verify line typed into cmd and into Windows PowerShell,
+    /// once with the override unset and once with it set. Python is on PATH on
+    /// the Windows CI hosts. Only compiled on Windows; the line's shape is
+    /// checked on every host by `the_override_verify_is_one_line_for_every_shell`.
+    #[cfg(windows)]
+    #[test]
+    fn the_override_verify_runs_in_cmd_and_powershell() {
+        let verify = find_recipe("fix-2-unset-override").unwrap().verify;
+        for (value, expected) in [(None, "OK_UNSET"), (Some("11.0.0"), "11.0.0")] {
+            for run in
+                run_typed_in_cmd_and_powershell(verify, &[("HSA_OVERRIDE_GFX_VERSION", value)])
+            {
+                let ShellRun {
+                    shell,
+                    success,
+                    status,
+                    stdout: text,
+                    stderr: err,
+                } = run;
+                assert!(success, "{shell}: {status}\n{text}\n{err}");
+                assert_eq!(text.trim(), expected, "{shell}, stderr: {err}");
+            }
+        }
+    }
+
+    /// The text of fix-13's verify, taken apart. Runs on every host. It reads
+    /// `HIP_PATH`, joins `bin\hipInfo.exe` onto it as a single-quoted string,
+    /// and keeps the first lines; `the_hip_sdk_verify_runs_the_exe_under_hip_path`
+    /// runs it, on Windows.
+    #[test]
+    fn the_hip_sdk_verify_reads_hip_path_and_runs_hipinfo() {
+        let verify = find_recipe("fix-13-hip-sdk-missing").unwrap().verify;
+        let body = verify
+            .strip_prefix("powershell -NoProfile -Command \"")
+            .and_then(|rest| rest.strip_suffix('"'))
+            .unwrap_or_else(|| panic!("not a quoted `powershell -Command` argument: {verify}"));
+        assert!(
+            !body.contains('"'),
+            "an inner quote ends the argument: {body}"
+        );
+        assert!(
+            body.starts_with("& (Join-Path ([Environment]::GetEnvironmentVariable('HIP_PATH')) 'bin\\hipInfo.exe')")
+                && body.ends_with("| Select-Object -First 5"),
+            "{body}"
+        );
+    }
+
+    /// The Where-Object stage of fix-14's verify, as written in the recipe.
+    /// The Windows test and the shape test both take the filter from here, so
+    /// neither keeps a copy of it.
+    fn adrenalin_filter(verify: &str) -> &str {
+        verify
+            .split(" | ")
+            .find(|stage| stage.starts_with("Where-Object"))
+            .unwrap_or_else(|| panic!("fix-14's verify has no Where-Object stage: {verify}"))
+    }
+
+    /// Runs on every host: the filter that picks the AMD adapter is the one
+    /// the Windows test exercises, so it has to be found and be the AMD match.
+    #[test]
+    fn the_adrenalin_verify_filters_on_amd_or_radeon() {
+        let verify = find_recipe("fix-14-adrenalin-too-old").unwrap().verify;
+        assert_eq!(
+            adrenalin_filter(verify),
+            "Where-Object Name -match 'AMD|Radeon'"
+        );
+    }
+
+    /// Runs the fix-13 verify line in cmd and in Windows PowerShell against a
+    /// throwaway SDK directory whose name contains a space: the single-quoted
+    /// Join-Path form exists to survive one. `whoami.exe` stands in for
+    /// `hipInfo.exe`; nothing else is reachable through `HIP_PATH`, so output
+    /// means the line ran the file it built from `HIP_PATH`. With `HIP_PATH`
+    /// pointing at a directory that has no `hipInfo.exe`, the line must fail
+    /// and say so, which shows the variable is the one it reads. Only compiled
+    /// on Windows.
+    #[cfg(windows)]
+    #[test]
+    fn the_hip_sdk_verify_runs_the_exe_under_hip_path() {
+        let verify = find_recipe("fix-13-hip-sdk-missing").unwrap().verify;
+        let root = std::env::temp_dir().join(format!("rocm hip sdk {}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("bin")).expect("the SDK directory is created");
+        let system_root = std::env::var("SystemRoot").expect("SystemRoot is set on Windows");
+        std::fs::copy(
+            std::path::Path::new(&system_root).join("System32\\whoami.exe"),
+            root.join("bin").join("hipInfo.exe"),
+        )
+        .expect("a stand-in hipInfo.exe is copied");
+        let empty = root.join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        let hip_path = root.to_string_lossy().into_owned();
+        let empty_path = empty.to_string_lossy().into_owned();
+
+        let present =
+            run_typed_in_cmd_and_powershell(verify, &[("HIP_PATH", Some(hip_path.as_str()))]);
+        let missing =
+            run_typed_in_cmd_and_powershell(verify, &[("HIP_PATH", Some(empty_path.as_str()))]);
+        let _ = std::fs::remove_dir_all(&root);
+
+        for run in present {
+            let ShellRun {
+                shell,
+                success,
+                status,
+                stdout,
+                stderr,
+            } = run;
+            assert!(success, "{shell}: {status}\n{stdout}\n{stderr}");
+            assert!(
+                stderr.trim().is_empty(),
+                "{shell} wrote to stderr: {stderr}"
+            );
+            assert!(
+                !stdout.trim().is_empty(),
+                "{shell} printed nothing from the stand-in hipInfo.exe"
+            );
+        }
+        for run in missing {
+            let ShellRun {
+                shell,
+                success,
+                stdout,
+                stderr,
+                ..
+            } = run;
+            assert!(
+                !(success && stderr.trim().is_empty()) && stdout.trim().is_empty(),
+                "{shell} ran something with no hipInfo.exe under HIP_PATH:\n{stdout}\n{stderr}"
+            );
+        }
+    }
+
+    /// Runs the fix-22 verify line typed into cmd and into Windows PowerShell:
+    /// both must parse it and exit 0 with nothing on stderr. The line used a
+    /// `{ $_.Name ... }` filter, and `$_` inside the double-quoted `-Command`
+    /// body is expanded by an outer PowerShell to nothing, so it failed with
+    /// "The term '.Name' is not recognized" on every host. Only compiled on
+    /// Windows.
+    #[cfg(windows)]
+    #[test]
+    fn the_display_driver_verify_runs_in_cmd_and_powershell() {
+        let verify = find_recipe("fix-22-display-driver-old").unwrap().verify;
+        for run in run_typed_in_cmd_and_powershell(verify, &[]) {
+            let ShellRun {
+                shell,
+                success,
+                status,
+                stdout,
+                stderr,
+            } = run;
+            assert!(success, "{shell}: {status}\n{stdout}\n{stderr}");
+            assert!(
+                stderr.trim().is_empty(),
+                "{shell} wrote to stderr: {stderr}"
+            );
+        }
+    }
+
+    /// Runs the fix-14 verify line in cmd and in Windows PowerShell: both must
+    /// parse it and exit 0 with nothing on stderr. Its output is empty on a
+    /// host with no AMD adapter, so that alone would pass for a filter that
+    /// matches nothing. The filter text is therefore taken from the recipe and
+    /// run over made-up adapters; only the AMD ones may come out. Only compiled
+    /// on Windows.
+    #[cfg(windows)]
+    #[test]
+    fn the_adrenalin_verify_runs_and_its_filter_keeps_only_amd() {
+        let verify = find_recipe("fix-14-adrenalin-too-old").unwrap().verify;
+        for run in run_typed_in_cmd_and_powershell(verify, &[]) {
+            let ShellRun {
+                shell,
+                success,
+                status,
+                stdout,
+                stderr,
+            } = run;
+            assert!(success, "{shell}: {status}\n{stdout}\n{stderr}");
+            assert!(
+                stderr.trim().is_empty(),
+                "{shell} wrote to stderr: {stderr}"
+            );
+        }
+        let filter = adrenalin_filter(verify);
+        let synthetic = format!(
+            "@([pscustomobject]@{{Name='AMD Radeon X'}},[pscustomobject]@{{Name='Other'}},\
+             [pscustomobject]@{{Name='Intel UHD'}},[pscustomobject]@{{Name='Radeon Pro W'}}) \
+             | {filter} | ForEach-Object {{ $_.Name }}"
+        );
+        let run = run_typed_in_powershell(&synthetic, &[]);
+        assert!(
+            run.success,
+            "{}\n{}\n{}",
+            run.status, run.stdout, run.stderr
+        );
+        let names: Vec<&str> = run.stdout.lines().map(str::trim).collect();
+        assert_eq!(names, ["AMD Radeon X", "Radeon Pro W"], "{}", run.stderr);
+    }
+
+    /// The cases the rule is held to live in one file that the e2e crate's copy
+    /// of the rule reads too, so the two cannot disagree on a listed line.
+    const RULE_CASES: &str =
+        include_str!("../../../tests/e2e-cucumber/fixtures/powershell_text_rule_cases.txt");
+
+    #[test]
+    fn the_powershell_text_rule_agrees_with_the_shared_case_table() {
+        let mut flagged = 0;
+        let mut passed = 0;
+        for (number, raw) in RULE_CASES.lines().enumerate() {
+            let raw = raw.trim_end();
+            if raw.is_empty() || raw.starts_with('#') {
+                continue;
+            }
+            if let Some(line) = raw.strip_prefix("flag ") {
+                assert!(
+                    fails_in_windows_powershell(line).is_some(),
+                    "line {}: `{line}`",
+                    number + 1
+                );
+                flagged += 1;
+            } else if let Some(line) = raw.strip_prefix("pass ") {
+                assert_eq!(
+                    fails_in_windows_powershell(line),
+                    None,
+                    "line {}: `{line}`",
+                    number + 1
+                );
+                passed += 1;
+            } else {
+                panic!("line {}: neither `flag` nor `pass`: {raw}", number + 1);
+            }
+        }
+        // The table was read, not skipped.
+        assert!(
+            flagged >= 20 && passed >= 15,
+            "{flagged} flag, {passed} pass"
+        );
+        // The catalog's own fix-2 line is one of the lines it must let through.
+        let fix_2 = find_recipe("fix-2-unset-override").unwrap().verify;
+        assert_eq!(fails_in_windows_powershell(fix_2), None, "{fix_2}");
+    }
+
+    /// The fix-2 verify line is shown on Linux, WSL and Windows, so it must be
+    /// one command that bash, cmd and PowerShell all run the same way: a
+    /// `python -c` whose program is one double-quoted argument with no inner
+    /// double quote and no `$`, so no shell expands anything in it.
+    #[test]
+    fn the_override_verify_is_one_line_for_every_shell() {
+        let verify = find_recipe("fix-2-unset-override").unwrap().verify;
+        let program = verify
+            .strip_prefix("python -c \"")
+            .and_then(|rest| rest.strip_suffix('"'))
+            .unwrap_or_else(|| panic!("not a quoted `python -c` argument: {verify}"));
+        assert!(!program.contains(['"', '$', '`', '%']), "{program}");
+        assert!(
+            program.contains("os.environ.get('HSA_OVERRIDE_GFX_VERSION')")
+                && program.contains("'OK_UNSET'"),
+            "{program}"
+        );
     }
 
     #[test]
@@ -3119,9 +4156,39 @@ mod tests {
     }
 
     #[test]
+    fn the_old_display_driver_recipe_is_print_only_advice_on_windows() {
+        let recipe = RECIPES
+            .iter()
+            .find(|r| r.fix_id == crate::windows_driver::DISPLAY_DRIVER_OLD_FIX_ID)
+            .expect("the recipe is registered");
+        // rocm-cli never installs drivers on Windows: every printed line is a
+        // comment, and the only platform is Windows, print-only.
+        assert!(recipe.commands.iter().all(|c| c.starts_with('#')));
+        assert!(recipe.commands.iter().any(|c| c.contains("Restart")));
+        assert!(recipe.runner.is_none());
+        assert_eq!(recipe.applies_on.len(), 1);
+        assert_eq!(recipe.applies_on[0].os, "windows");
+        assert_eq!(recipe.applies_on[0].class, FixClass::PrintOnly);
+        assert!(recipe.rationale.contains("not established"));
+        // The rationale spells the cutoff out in prose; it must name the same
+        // day as the constant the comparison uses.
+        let cutoff = crate::windows_driver::FIRST_HIP_SDK_FOR_WINDOWS;
+        assert_eq!(
+            (cutoff.year, cutoff.month, cutoff.day),
+            (2023, 7, 27),
+            "the cutoff moved: update the \"27 July 2023\" prose in this recipe, README.md,              skills/rocm-doctor/reference.md, docs/testing.md and docs/manual-testing.md"
+        );
+        assert!(recipe.rationale.contains("27 July 2023"));
+        // The literal URL in the commands is the shared constant.
+        let url_line = format!("#   {}", crate::windows_driver::AMD_SUPPORT_URL);
+        assert!(recipe.commands.contains(&url_line.as_str()));
+        assert_eq!(recipe.doc_url, Some(crate::windows_driver::AMD_SUPPORT_URL));
+    }
+
+    #[test]
     fn needs_reboot_true_fix_ids_match_the_known_set() {
         // assert_needs_reboot_matches_the_catalog only ever runs for
-        // fix-5-amdgpu-load, so the other 23 fix-ids' hardcoded needs_reboot
+        // fix-5-amdgpu-load, so every other fix-id's hardcoded needs_reboot
         // literals in diagnose.rs have no guard against drifting from the
         // catalog. This doesn't reach into diagnose.rs, but it does catch an
         // accidental catalog edit and pins the expected set by name so a
@@ -3133,6 +4200,7 @@ mod tests {
             "fix-11-iommu",
             "fix-12-installer",
             "fix-14-adrenalin-too-old",
+            "fix-22-display-driver-old",
         ]
         .into_iter()
         .collect();
@@ -3378,19 +4446,6 @@ mod tests {
             new_path.starts_with(bin_dir),
             "a prepend must start with bin_dir, not end with it: got {new_path:?}"
         );
-    }
-
-    /// `ps_single_quote_escape` must double every embedded `'`, per
-    /// PowerShell's own single-quoted-string escaping convention.
-    #[test]
-    fn ps_single_quote_escape_doubles_every_embedded_quote() {
-        assert_eq!(ps_single_quote_escape("plain"), "plain");
-        assert_eq!(ps_single_quote_escape("O'Brien"), "O''Brien");
-        assert_eq!(
-            ps_single_quote_escape("'leading and trailing'"),
-            "''leading and trailing''"
-        );
-        assert_eq!(ps_single_quote_escape("a'b'c"), "a''b''c");
     }
 
     /// Round 2 of ROCMAI-449: an apostrophe anywhere in the real User PATH
@@ -3644,5 +4699,243 @@ mod tests {
             "the catalog knows which argument fix-9-igpu-dgpu waits for, so the flags line \
              has to say it: {named:?}"
         );
+    }
+
+    #[test]
+    fn fix_7_apt_commands_match_the_diagnose_copy_verbatim() {
+        // Same drift guard as fix_12_apt_commands_match_the_diagnose_copy_verbatim:
+        // diagnose.rs builds its own per-family command list for fix-7 rather than
+        // reusing this recipe, so drive diagnose() itself instead of comparing
+        // against a hardcoded literal that can't detect diagnose.rs drifting.
+        let e = crate::examine::Examination {
+            os_family: "linux".to_owned(),
+            distro_id: "ubuntu".to_owned(),
+            rocm_repos_seen: vec![
+                "/etc/apt/sources.list.d/rocm.list".to_owned(),
+                "/etc/apt/sources.list.d/amdgpu.list".to_owned(),
+            ],
+            ..crate::examine::Examination::default()
+        };
+        let report = crate::diagnose::diagnose(&e, "stale repo conflict");
+        let hit = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-7-stale-repos")
+            .expect("duplicate repo files should be diagnosed");
+        let diagnose_apt_list_cmd = hit
+            .fix
+            .as_ref()
+            .unwrap()
+            .commands
+            .first()
+            .expect("fix-7 always lists the repo dir first on a recognized family")
+            .as_str();
+
+        let recipe = RECIPES
+            .iter()
+            .find(|r| r.fix_id == "fix-7-stale-repos")
+            .expect("fix-7-stale-repos recipe must exist");
+        let recipe_apt_list_cmd = recipe
+            .commands
+            .iter()
+            .find(|c| c.trim_end().ends_with("# Debian/Ubuntu") && c.contains("ls /etc/apt"))
+            .map(|c| c.split('#').next().unwrap().trim_end())
+            .expect("recipe must have a commented apt list line");
+        assert_eq!(
+            recipe_apt_list_cmd, diagnose_apt_list_cmd,
+            "this recipe's apt list command must match what diagnose.rs's apt family actually emits for fix-7-stale-repos"
+        );
+
+        // `verify` must also track diagnose.rs's per-family text, not just
+        // `commands`: diagnose.rs varies `verify` by family too, so compare
+        // each family's line against what diagnose() actually emits for it.
+        // The dnf/zypper `ls` lines get the same treatment as apt above --
+        // only asserting the apt one left those two families' list commands
+        // able to drift from the recipe undetected.
+        for (family_repo_dir, marker) in [
+            ("/etc/apt/sources.list.d/", "# Debian/Ubuntu"),
+            ("/etc/yum.repos.d/", "# RHEL/Fedora/Rocky/Alma/Oracle"),
+            ("/etc/zypp/repos.d/", "# SLES/openSUSE"),
+        ] {
+            let e = crate::examine::Examination {
+                os_family: "linux".to_owned(),
+                distro_id: "ubuntu".to_owned(),
+                rocm_repos_seen: vec![
+                    format!("{family_repo_dir}rocm.repo"),
+                    format!("{family_repo_dir}amdgpu.repo"),
+                ],
+                ..crate::examine::Examination::default()
+            };
+            let report = crate::diagnose::diagnose(&e, "stale repo conflict");
+            let hit = report
+                .matched
+                .iter()
+                .find(|d| d.id == "fix-7-stale-repos")
+                .expect("duplicate repo files should be diagnosed");
+            let fix = hit.fix.as_ref().unwrap();
+            let diagnose_list_cmd = fix
+                .commands
+                .first()
+                .expect("fix-7 always lists the repo dir first on a recognized family")
+                .as_str();
+            let diagnose_verify = fix.verify.as_str();
+
+            let recipe_list_cmd = recipe
+                .commands
+                .iter()
+                .find(|c| c.trim_end().ends_with(marker) && c.contains("ls /"))
+                .map_or_else(
+                    || panic!("recipe must have a commented list line for {marker}"),
+                    |c| c.split('#').next().unwrap().trim_end(),
+                );
+            assert_eq!(
+                recipe_list_cmd, diagnose_list_cmd,
+                "this recipe's {marker} list command must match what diagnose.rs emits for fix-7-stale-repos"
+            );
+
+            let recipe_verify_line = recipe
+                .verify
+                .lines()
+                .find(|l| l.trim_end().ends_with(marker))
+                .map_or_else(
+                    || panic!("recipe verify must have a line for {marker}"),
+                    |l| l.split('#').next().unwrap().trim(),
+                );
+            assert_eq!(
+                recipe_verify_line, diagnose_verify,
+                "this recipe's {marker} verify line must match what diagnose.rs emits for fix-7-stale-repos"
+            );
+        }
+    }
+
+    #[test]
+    fn fix_12_recipe_clears_state_before_reinstall_and_keeps_mv_commented() {
+        let recipe = RECIPES
+            .iter()
+            .find(|r| r.fix_id == "fix-12-installer")
+            .expect("fix-12-installer recipe must exist");
+        let commands = recipe.commands.join("\n");
+        assert!(
+            commands.contains("dpkg --configure -a"),
+            "must clear the half-configured dpkg state before reinstalling: {commands}"
+        );
+        assert!(
+            commands.contains("purge -y amdgpu-dkms"),
+            "must purge the broken driver package: {commands}"
+        );
+        assert!(
+            commands.contains("# sudo mv /etc/apt/sources.list.d/amdgpu.list"),
+            "repo quarantine command must be commented out, not ready-to-run: {commands}"
+        );
+        assert!(
+            commands.contains("rocm install driver --dkms --yes"),
+            "reinstall command must actually install (bare 'rocm install driver' is a non-mutating preflight no-op): {commands}"
+        );
+        assert!(
+            recipe.verify.contains("dpkg") && recipe.verify.contains("rpm"),
+            "verify must query real dpkg/rpm package state, not the self-reported \
+             rocm_install_method marker (that marker is set from repo-file presence \
+             before the package actually installs): {}",
+            recipe.verify
+        );
+        assert!(
+            !recipe
+                .commands
+                .iter()
+                .any(|c| c.contains("configure -a &&") || c.contains("install -f &&")),
+            "the apt block must not chain configure/install -f into the purge with `&&`: \
+             a failure there must not skip the purge: {commands}"
+        );
+    }
+
+    #[test]
+    fn fix_3_verify_matches_the_diagnose_copy_verbatim() {
+        // No drift guard previously existed between this recipe and
+        // diagnose.rs's `check_3_rocm_kernel_unsupported` for fix-3 (unlike
+        // fix-7/fix-12's `commands`, fix-3's `commands` legitimately differ --
+        // diagnose.rs injects the host's live kernel/distro/rocm values into a
+        // comment this host-unaware recipe can't know -- but `verify` has no
+        // such excuse to diverge).
+        let e = crate::examine::Examination {
+            os_family: "linux".to_owned(),
+            rocm_version: "6.4.1".to_owned(),
+            amdgpu_loaded: Some(false),
+            ..crate::examine::Examination::default()
+        };
+        let report = crate::diagnose::diagnose(&e, "");
+        let hit = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-3-rocm-kernel")
+            .expect("rocm installed with amdgpu not loaded should be diagnosed");
+        let diagnose_verify = hit.fix.as_ref().unwrap().verify.as_str();
+
+        let recipe = RECIPES
+            .iter()
+            .find(|r| r.fix_id == "fix-3-rocm-kernel")
+            .expect("fix-3-rocm-kernel recipe must exist");
+        assert_eq!(
+            recipe.verify, diagnose_verify,
+            "this recipe's verify step must match what diagnose.rs emits for fix-3-rocm-kernel"
+        );
+    }
+
+    #[test]
+    fn fix_12_apt_commands_match_the_diagnose_copy_verbatim() {
+        // `crate::diagnose` builds its own apt command list for fix-12 rather
+        // than reusing this recipe (it branches per detected package-manager
+        // family, which this catalog entry cannot do -- it prints guidance for
+        // every family at once). Drive `diagnose()` itself so a drift between
+        // the two copies actually fails this test, rather than comparing
+        // against a hardcoded literal that can't detect diagnose.rs changing
+        // out from under it.
+        let e = crate::examine::Examination {
+            os_family: "linux".to_owned(),
+            distro_id: "ubuntu".to_owned(),
+            distro_version: "24.04".to_owned(),
+            rocm_install_method: "repo-native".to_owned(),
+            ..crate::examine::Examination::default()
+        };
+        let report = crate::diagnose::diagnose(
+            &e,
+            "dpkg: error processing package amdgpu-dkms (half-configured)",
+        );
+        let hit = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-12-installer")
+            .expect("repo-native broken state should be diagnosed");
+        let diagnose_apt_commands: Vec<&str> = hit
+            .fix
+            .as_ref()
+            .unwrap()
+            .commands
+            .iter()
+            .map(String::as_str)
+            .filter(|c| !c.trim_start().starts_with('#'))
+            .take(3)
+            .collect();
+
+        let recipe = RECIPES
+            .iter()
+            .find(|r| r.fix_id == "fix-12-installer")
+            .expect("fix-12-installer recipe must exist");
+        let apt_commands_without_trailing_comment: Vec<&str> = recipe
+            .commands
+            .iter()
+            .filter(|c| c.trim_end().ends_with("# Debian/Ubuntu"))
+            .map(|c| c.split('#').next().unwrap().trim_end())
+            .take(3)
+            .collect();
+        assert_eq!(
+            apt_commands_without_trailing_comment, diagnose_apt_commands,
+            "this recipe's apt lines must match what diagnose.rs's apt family actually emits for fix-12-installer"
+        );
+    }
+
+    #[test]
+    fn indent_continuation_keeps_multi_line_verify_under_its_label() {
+        assert_eq!(indent_continuation("a\nb\nc", "  "), "a\n  b\n  c");
+        assert_eq!(indent_continuation("single", "  "), "single");
     }
 }

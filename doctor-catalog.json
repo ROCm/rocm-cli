@@ -187,7 +187,7 @@
     },
     {
       "id": "fix-12-installer",
-      "title": "Reset amdgpu-install state and reinstall",
+      "title": "Reset repo-native install state and reinstall",
       "platforms": [
         {
           "os": "linux",
@@ -412,6 +412,20 @@
       "needs_reboot": false,
       "needs_relogin": false,
       "doc_url": "https://aka.ms/vs/17/release/vc_redist.x64.exe"
+    },
+    {
+      "id": "fix-22-display-driver-old",
+      "title": "Look for a newer AMD display driver (advice only)",
+      "platforms": [
+        {
+          "os": "windows",
+          "class": "print-only"
+        }
+      ],
+      "needs_sudo": false,
+      "needs_reboot": true,
+      "needs_relogin": false,
+      "doc_url": "https://www.amd.com/en/support"
     },
     {
       "id": "info-20-gpu-no-rocm-support",

@@ -37,6 +37,10 @@ This workflow adds OSS safety and verification guardrails on top of normal dev f
   - opening/closing/merging PRs
   - public comments/review replies
   - changes to shared or public state
+- Before proposing or executing a force-push, check the PR's live review/approval state — not just the user's go-ahead for the push itself:
+  - query `gh pr view {pr} --repo OWNER/REPO --json reviews,reviewDecision` and check both fields, since `reviewDecision` alone can read `REVIEW_REQUIRED` even while a reviewer already holds a standing `APPROVED` or `CHANGES_REQUESTED` review
+  - if either field shows a current reviewer opinion, flag it when asking the user for that force-push approval
+  - whether the push itself dismisses an existing review depends on this repo's branch-protection or ruleset settings, not on which commit the review targeted — don't try to compute that yourself, and flag it anyway when unsure
 
 ## 2) Company Identity Required, Internal Content Forbidden
 
@@ -205,15 +209,28 @@ Current workspace members:
 
 - apps: `apps/rocm`, `apps/rocmd`
 - shared crates: `crates/rocm-core`, `crates/rocm-engine-protocol`
-- engine crates: `engines/lemonade`, `engines/vllm`
+- engine crates: `engines/lemonade`, `engines/vllm`, `engines/aim`
 
-Shared UI components — reuse rather than hand-rolling new ones:
-`apps/rocm/src/cli_progress.rs`'s `Spinner` for a caller-driven indicator that
-only advances when the caller's own loop ticks it (e.g. `serve`'s
-HTTP-polling wait loop); that same file's `AnimatedSpinner` for progress that
-must keep animating between caller updates, which can go quiet for long
-stretches (e.g. a download or the ComfyUI/SDK extraction spinner); and
-`crates/rocm-dash-tui/src/ui/approval.rs` for approval-state prompts.
+Shared UI components — reuse rather than hand-rolling new ones. The CLI (`apps/rocm`) and the dash-TUI (`crates/rocm-dash-tui`) each have their own set; they are not interchangeable (see the naming-collision warning below). A few primitives live in `crates/rocm-core` instead, since they're shared by the CLI and by `rocm-core`'s own [`fix.rs`](crates/rocm-core/src/fix.rs).
+
+Shared (`crates/rocm-core`):
+
+- [`confirm.rs`](crates/rocm-core/src/confirm.rs)'s **`print_prompt`**/**`read_answer`** — the shared `[y/N]` confirmation prompt: `print_prompt` writes and flushes a prompt (callers include their own trailing `[y/N]: `), `read_answer` reads a line and parses it as yes/no. Two fallible calls rather than one, so a caller can choose whether a failed write is fatal: [`fix.rs`](crates/rocm-core/src/fix.rs)'s `confirm()` attempts the read anyway, while [`uninstall_plan.rs`](apps/rocm/src/uninstall_plan.rs)'s `confirm_uninstall` and [`therock.rs`](apps/rocm/src/therock.rs)'s `prompt_yes_no` treat it as fatal. [`uninstall.rs`](apps/rocm/src/uninstall.rs), [`storage.rs`](apps/rocm/src/storage.rs) and [`runtimes_cmd.rs`](apps/rocm/src/runtimes_cmd.rs) reach the prompt only through `confirm_uninstall`, each checking `--yes`/an interactive terminal itself before calling in; `fix.rs`'s `confirm()` additionally layers its own non-interactive short-circuit and refusal wording on top
+
+CLI:
+
+- [`cli_progress.rs`](apps/rocm/src/cli_progress.rs)'s **`Spinner`** — a caller-driven indicator that only advances when the caller's own loop ticks it (e.g. `serve`'s HTTP-polling wait loop)
+- [`cli_progress.rs`](apps/rocm/src/cli_progress.rs)'s **`AnimatedSpinner`** — progress that must keep animating between caller updates and can go quiet for long stretches (e.g. a download, or the ComfyUI/SDK extraction spinner)
+
+dash-TUI, in `crates/rocm-dash-tui/src/ui/`:
+
+- **[`approval.rs`](crates/rocm-dash-tui/src/ui/approval.rs)** — approval-state prompts
+- **[`job_console.rs`](crates/rocm-dash-tui/src/ui/job_console.rs)**'s `draw_job_console`/`on_console_key` — the shared "a job is running" surface (streamed output, status header, Ctrl+C cancels/`q` always closes/Esc-Enter dismiss a finished job); every operational manager already routes through this instead of building its own console
+- **[`spinner.rs`](crates/rocm-dash-tui/src/ui/spinner.rs)**'s `spinner_frame`/`parse_progress_pct` — the braille animation and percentage parsing `job_console.rs` renders with
+- **[`panel.rs`](crates/rocm-dash-tui/src/ui/panel.rs)**'s `bento`/`popup` — bordered, titled panels; prefer these over an inline `Block::default()`
+- **[`theme.rs`](crates/rocm-dash-tui/src/ui/theme.rs)**'s `job_status_color` — the pattern to follow for any status enum's color (Running/Error/Pending/etc.); route through (or extend) a shared status→color mapping rather than a bespoke inline match per screen
+
+**Two different components are both informally "the spinner"; they are not interchangeable.** The CLI's [`cli_progress.rs`](apps/rocm/src/cli_progress.rs) `Spinner`/`AnimatedSpinner` above is TTY/stderr-gated for a plain terminal and lives in `apps/rocm`. The dash-TUI's [`spinner.rs`](crates/rocm-dash-tui/src/ui/spinner.rs) above is a pure frame/percentage helper rendered through `job_console.rs` inside a ratatui frame loop, and lives in `crates/rocm-dash-tui`. A dash-TUI screen needs the latter.
 
 Guardrails:
 
@@ -357,6 +374,7 @@ If a vendored upstream tree is introduced in the future, apply the following rul
 - avoid AI-generated boilerplate footers
 - do not resolve reviewer threads you did not author; reply with fix commit context
 - if reviewed code must be updated, explain what changed since review
+- before resuming review-feedback work on a PR you authored, first check for review comments with no reply yet (same `in_reply_to_id` cross-reference technique below)
 - automated reviewers (e.g. Copilot) can post new findings on a commit that itself fixed earlier findings; after pushing a fix and replying to the original threads, re-fetch PR comments once more before treating the review round as closed
 - to check whether a review comment already has a reply, do not call `gh api repos/OWNER/REPO/pulls/comments/$id/replies` (GET); it 404s. Fetch the full list (`gh api repos/OWNER/REPO/pulls/{pr}/comments --paginate`) and cross-reference each comment's `in_reply_to_id` against other comments' `id`s
 
@@ -394,6 +412,8 @@ Run this checklist before any upstream push, PR update, issue update, or public 
 9. Scope remains one logical change at correct layer — *§11*
 10. CI watched to completion and driven to green — *§12*
 11. User approval obtained for any high-blast-radius external action — *§1*
+12. Force-push's live review/approval state checked before proposing or executing one — *§1*
+13. Review comments checked for unreplied threads before resuming review-feedback work — *§11*
 
 ## 14) Related Internal Workflows
 

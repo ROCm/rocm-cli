@@ -2393,6 +2393,9 @@ fn wheel_composition_device_target(composition: Option<&WheelRuntimeComposition>
     })
 }
 
+/// Quotes `value` for the dry-run preview line only -- it is never fed to a
+/// real subprocess. Deliberately kept separate from `rocm_core::quoting`
+/// (ROCMAI-727); see that module's doc comment for why.
 fn quote_display_arg(value: &str) -> String {
     if value.is_empty()
         || value
@@ -2891,16 +2894,10 @@ fn confirm_overwrite_existing_sdk(
 }
 
 fn prompt_yes_no(prompt: &str) -> Result<bool> {
-    print!("{prompt}");
-    std::io::stdout()
-        .flush()
-        .context("failed to flush confirmation prompt")?;
-    let mut response = String::new();
-    std::io::stdin()
-        .read_line(&mut response)
-        .context("failed to read confirmation response")?;
-    let normalized = response.trim().to_ascii_lowercase();
-    Ok(matches!(normalized.as_str(), "y" | "yes"))
+    rocm_core::confirm::print_prompt(&mut std::io::stdout(), prompt)
+        .context("failed to write confirmation prompt")?;
+    rocm_core::confirm::read_answer(&mut std::io::stdin().lock())
+        .context("failed to read confirmation response")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7259,7 +7256,11 @@ mod tests {
     // they run. Because env is shared across all test threads, any test that spawns a
     // bare-name binary (e.g. `tar`) via `PATH` lookup must also hold this lock, or it
     // can fail with ENOENT while another test has temporarily narrowed `PATH`.
-    static PROCESS_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    //
+    // `pub(super)` rather than private: `archive_properties` below is a sibling
+    // module (not a descendant of `tests`), and its property tests extract through
+    // `extract_tarball_and_discard_archive`, which spawns the same bare-name `tar`.
+    pub(super) static PROCESS_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn family_for_test(family: &str, raw_arch: Option<&str>) -> FamilyResolution {
         FamilyResolution {
@@ -9260,8 +9261,20 @@ mod tests {
         Ok(())
     }
 
+    /// Takes the lock that serializes tests which replace process-wide
+    /// environment variables. The program is started by name, so it is found
+    /// through `PATH`, and another test replaces `PATH` for the duration of its
+    /// body; a spawn that lands in that window fails with "program not found"
+    /// and the test that wanted a sleeping child panics.
+    fn lock_process_env_for_spawn() -> std::sync::MutexGuard<'static, ()> {
+        PROCESS_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     #[cfg(not(windows))]
     fn spawn_test_sleep(seconds: u64) -> std::process::Child {
+        let _env = lock_process_env_for_spawn();
         Command::new("sleep")
             .arg(seconds.to_string())
             .stdin(Stdio::null())
@@ -9277,6 +9290,7 @@ mod tests {
     // wrong reason. `Start-Sleep` has no such requirement.
     #[cfg(windows)]
     fn spawn_test_sleep(seconds: u64) -> std::process::Child {
+        let _env = lock_process_env_for_spawn();
         Command::new("powershell")
             .args([
                 "-NoProfile",
@@ -9288,6 +9302,36 @@ mod tests {
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawn Start-Sleep")
+    }
+
+    /// The sleeping child is found through `PATH`, so starting it while another
+    /// test has replaced `PATH` must wait for that test rather than fail. This
+    /// holds the environment lock with `PATH` emptied, starts the child from
+    /// another thread, and only then puts `PATH` back: without the lock in
+    /// `spawn_test_sleep` the spawn runs at once and panics.
+    #[test]
+    #[allow(unsafe_code)] // std::env::set_var is unsafe in edition 2024
+    fn spawning_the_test_sleep_waits_while_another_test_has_replaced_path() {
+        let holder = PROCESS_ENV_TEST_LOCK.lock().unwrap();
+        let old_path = std::env::var_os("PATH");
+        unsafe {
+            std::env::set_var("PATH", "");
+        }
+        let spawner = std::thread::spawn(|| spawn_test_sleep(30));
+        std::thread::sleep(Duration::from_millis(300));
+        unsafe {
+            match old_path {
+                Some(value) => std::env::set_var("PATH", value),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+        drop(holder);
+
+        let mut child = spawner
+            .join()
+            .expect("the spawn must wait for the lock instead of failing while PATH is replaced");
+        child.kill().ok();
+        child.wait().ok();
     }
 
     /// A budget-constrained caller (the startup update check) must get its
@@ -12379,6 +12423,7 @@ exit 1
 #[cfg(all(test, unix))]
 mod archive_properties {
     use super::extract_tarball_and_discard_archive;
+    use super::tests::PROCESS_ENV_TEST_LOCK;
     use crate::archive_props::{
         Expect, Modes, entries, note_mode_scope, run_case, run_property, run_round_trip,
         tar_gz_bytes,
@@ -12389,6 +12434,13 @@ mod archive_properties {
     /// judged when this runs as root (see `Modes`).
     #[test]
     fn sdk_tarball_unpack_never_writes_outside_the_install_root() {
+        // Every generated case below extracts through `extract_tarball_and_
+        // discard_archive`, which spawns bare-name `tar` via `PATH`; hold the
+        // lock for the whole property run so a concurrent test that narrows
+        // `PATH` cannot make any case fail to launch.
+        let _guard = PROCESS_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let expect = Expect {
             modes: Modes::SafeUnlessRoot,
             no_outward_links: false,
@@ -12415,6 +12467,10 @@ mod archive_properties {
     /// entirely escapes the oracle above; this catches it.
     #[test]
     fn sdk_tarball_unpack_extracts_a_benign_tarball_into_the_install_root() {
+        // Same bare-name `tar` spawn as above; same reason to hold the lock.
+        let _guard = PROCESS_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         run_round_trip("therock-benign", |layout, entries| {
             let archive = layout.base.join("sdk.tar.gz");
             std::fs::write(&archive, tar_gz_bytes(entries))?;

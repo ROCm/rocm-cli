@@ -24,24 +24,31 @@
 //! module; none of the module's types need to be, bar the one exception
 //! above.
 
-use crate::runtime_install_finalize::empty_as_unknown;
+use crate::automations::{render_automations_text, render_daemon_text};
+use crate::freeform_planner::{
+    format_structured_tool_call, infer_engine_from_request, plan_freeform_request_with_context,
+    serve_args_request_cpu_device,
+};
+use crate::managed_service_status::{
+    friendly_engine_label, load_managed_services, managed_service_is_live,
+};
 use crate::runtimes_cmd::render_runtimes_text;
 use crate::service_launch::is_loopback_host;
+use crate::uninstall_plan::render_uninstall_dry_run;
+use crate::update_cmd::render_update_text;
 use crate::{
     ChatInferenceParams, apply_app_path_env, build_codex_bridge_gpu_snapshot,
     build_codex_bridge_snapshot, builtin_codex_bridge_engine_inventory, cli_version_string,
-    format_structured_tool_call, freeform_plan_next_action_with_context, friendly_engine_label,
-    load_managed_services, managed_service_is_live, read_tail_lines, record_cli_audit_event,
-    render_automations_text, render_config_text, render_daemon_text,
+    read_tail_lines, record_cli_audit_event, render_config_text,
     render_engine_inventory_text_with_paths, render_examine_text, render_examine_text_with_paths,
-    render_freeform_plan, render_logs_browser_text, render_logs_text,
+    render_logs_browser_text, render_logs_text,
     render_model_registry_verbose_text_with_context_and_host, render_service_logs_text,
-    render_services_text, render_setup_status_text, render_uninstall_dry_run, render_update_text,
-    serve_args_request_cpu_device, service_model_names_match, therock_install_version_selector,
-    validate_service_id,
+    render_services_text, render_setup_status_text, service_model_names_match,
+    therock_install_version_selector, validate_service_id,
 };
 use crate::{chat_host_facts, comfyui, providers, therock};
 use anyhow::{Context, Result, bail};
+use rocm_core::placeholder::empty_as_unknown;
 use rocm_core::{
     AppPaths, AutomationRuntimeState, DEFAULT_LOCAL_HOST, ExamineSummary, ManagedServiceRecord,
     RocmCliConfig, builtin_watcher, daemon_binary_path, load_recent_automation_events,
@@ -56,7 +63,7 @@ use std::process::Command as ProcessCommand;
 use std::time::Duration;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
-enum ChatRocmCommandAction {
+pub(crate) enum ChatRocmCommandAction {
     ReadOnly(Vec<String>),
     Approval {
         args: Vec<String>,
@@ -322,7 +329,7 @@ fn parse_bracketed_csv(line: &str, start: &str, end: &str) -> Vec<String> {
 fn is_engine_status_line(line: &str) -> bool {
     matches!(
         line.split_once(':').map(|(engine, _)| engine),
-        Some("lemonade" | "vllm")
+        Some("lemonade" | "vllm" | "aim")
     )
 }
 
@@ -433,7 +440,7 @@ fn parse_deterministic_engine_rows(tool_text: &str) -> Vec<DeterministicEngineRo
 }
 
 fn engine_name_from_inventory_line(line: &str) -> Option<&'static str> {
-    ["lemonade", "vllm"].into_iter().find(|engine| {
+    ["lemonade", "vllm", "aim"].into_iter().find(|engine| {
         line == *engine
             || line
                 .strip_prefix(*engine)
@@ -1413,17 +1420,16 @@ fn fallback_config_tool_call_for_prompt(normalized: &str) -> Option<providers::C
         });
     }
     if any_substring(normalized, &["default engine", "set engine", "use engine"]) {
-        for engine in ["lemonade", "vllm"] {
-            if normalized.contains(engine) {
-                return Some(providers::ChatToolCall {
-                    id: Some("fallback-config-default-engine".to_owned()),
-                    name: "rocm_command".to_owned(),
-                    arguments: serde_json::json!({
-                        "args": ["config", "set-default-engine", engine],
-                        "reason": "Change ROCm CLI's default engine after the user approves it."
-                    }),
-                });
-            }
+        // Word-boundary inference: a bare `contains("aim")` matched "aiming".
+        if let Some(engine) = infer_engine_from_request(normalized) {
+            return Some(providers::ChatToolCall {
+                id: Some("fallback-config-default-engine".to_owned()),
+                name: "rocm_command".to_owned(),
+                arguments: serde_json::json!({
+                    "args": ["config", "set-default-engine", engine],
+                    "reason": "Change ROCm CLI's default engine after the user approves it."
+                }),
+            });
         }
     }
     if normalized.contains("telemetry") {
@@ -1797,7 +1803,7 @@ fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
 /// to, and a WSL user was told "on native Windows, vLLM is skipped" while vLLM
 /// was in fact their supported path. Anything host-dependent now comes from
 /// [`chat_host_facts::HostFacts`], which knows which machine it is describing.
-const ROCM_CHAT_TOOL_SYSTEM_PROMPT: &str = "You are ROCm CLI's local assistant. Speak in simple English for non-technical users. Use the provided ROCm tools when you need to inspect this machine, preview setup, read service logs, check updates, inspect automations, install or start ROCm-managed apps, or request ROCm/TheRock, config, engine, app, and local model server changes. For simple greetings or thanks like hello, hi, hey, ok, or thank you, reply normally; do not inspect ROCm, do not call tools, and do not launch or propose a model server. Tool-use rules: inspect first with read-only tools; call rocm_command only with argv-style args and no shell text; use natural_language_plan for ROCm requests that do not fit another read-only tool; ask for a mutating tool call only after explaining why it is needed; summarize tool results after they are returned. Read-only tools may run immediately. Tools that install, launch, stop, delete, or change state require user approval; request rocm_command and explain why. For 'is X running?', 'what is running?', status, or port questions, inspect before answering and do not start, stop, install, or serve anything. For ComfyUI or port 8188 use [\"comfyui\",\"status\"] or port_status. For vLLM, Lemonade, qwen, or local model servers use [\"services\",\"list\",\"--all\"] for running state and [\"engines\",\"list\"] for installed/available engine state. Treat ready/running as running, starting/recovering as starting, failed/stopped as not running, and no matching record as unknown or not managed by ROCm CLI. Interpret Examine carefully: active_runtime_status=ready means ROCm CLI has an active managed TheRock/ROCm runtime; legacy_rocm_status=not_detected only means no global system ROCm install was found. If active_runtime_status=ready, tell the user ROCm/TheRock is installed and active for ROCm CLI. For 'is TheRock installed', 'is ROCm installed', or 'which GPU is on this machine', use examine or gpu_snapshot before answering. For 'how do I setup TheRock' or install/setup requests, guide the user to choose an install folder first; do not answer with only a status check. For 'which LLMs can this machine support', use rocm_command args [\"model\"] or natural_language_plan before answering. For TheRock installs, always let the user choose the install folder. If the user names a folder or prefix, preserve that exact folder with [\"--prefix\",\"PATH\"]; you may call path_exists first to check whether that user-provided folder or its parent exists. If the user asks you to install TheRock/ROCm but has not named a folder, ask for the folder or let the guided setup folder picker collect it; do not invent a hidden default folder and do not request an install command without --prefix. Use rocm_command args [\"install\",\"sdk\",\"--channel\",\"release\",\"--format\",\"wheel\",\"--prefix\",\"PATH\"] only when the user asks you to install it and a folder is known; for a requested build date add [\"--build-date\",\"YYYY-MM-DD\"] and for a requested exact version add [\"--version\",\"VERSION\"]. For config changes, inspect with [\"config\",\"show\"] first when useful, then request config subcommands such as [\"config\",\"set-default-engine\",\"lemonade\"], [\"config\",\"set-default-runtime\",\"RUNTIME_KEY\"], or [\"config\",\"set-telemetry\",\"local\"] only after explaining why. For ComfyUI, use rocm_command with args like [\"comfyui\",\"status\"], [\"comfyui\",\"logs\"], [\"comfyui\",\"install\"], [\"comfyui\",\"start\"], or [\"comfyui\",\"stop\"]. First-time setup is the same thing as bootstrap in ROCm CLI; it is a deterministic ROCm setup flow, not a separate model chat. The built-in local assistant is fixed to qwen, which maps to Qwen3-4B-Instruct-2507-GGUF served by Lemonade with gpu_required. vLLM and Lemonade are the general serving engines; inspect or manage them when the user asks about general model serving, but do not switch the built-in assistant away from Lemonade. Use qwen-smoke only for a quick server smoke test. For vLLM management, inspect engines first and use [\"engines\",\"install\",\"vllm\"] or [\"serve\",\"MODEL\",\"--engine\",\"vllm\",\"--device\",\"gpu_required\",\"--managed\"] only where the host supports it. Do not invent shell commands and do not request CPU fallback.";
+const ROCM_CHAT_TOOL_SYSTEM_PROMPT: &str = "You are ROCm CLI's local assistant. Speak in simple English for non-technical users. Use the provided ROCm tools when you need to inspect this machine, preview setup, read service logs, check updates, inspect automations, install or start ROCm-managed apps, or request ROCm/TheRock, config, engine, app, and local model server changes. For simple greetings or thanks like hello, hi, hey, ok, or thank you, reply normally; do not inspect ROCm, do not call tools, and do not launch or propose a model server. Tool-use rules: inspect first with read-only tools; call rocm_command only with argv-style args and no shell text; use natural_language_plan for ROCm requests that do not fit another read-only tool; ask for a mutating tool call only after explaining why it is needed; summarize tool results after they are returned. Read-only tools may run immediately. Tools that install, launch, stop, delete, or change state require user approval; request rocm_command and explain why. For 'is X running?', 'what is running?', status, or port questions, inspect before answering and do not start, stop, install, or serve anything. For ComfyUI or port 8188 use [\"comfyui\",\"status\"] or port_status. For vLLM, Lemonade, AIM, qwen, or local model servers use [\"services\",\"list\",\"--all\"] for running state and [\"engines\",\"list\"] for installed/available engine state. Treat ready/running as running, starting/recovering as starting, failed/stopped as not running, and no matching record as unknown or not managed by ROCm CLI. Interpret Examine carefully: active_runtime_status=ready means ROCm CLI has an active managed TheRock/ROCm runtime; legacy_rocm_status=not_detected only means no global system ROCm install was found. If active_runtime_status=ready, tell the user ROCm/TheRock is installed and active for ROCm CLI. For 'is TheRock installed', 'is ROCm installed', or 'which GPU is on this machine', use examine or gpu_snapshot before answering. For 'how do I setup TheRock' or install/setup requests, guide the user to choose an install folder first; do not answer with only a status check. For 'which LLMs can this machine support', use rocm_command args [\"model\"] or natural_language_plan before answering. For TheRock installs, always let the user choose the install folder. If the user names a folder or prefix, preserve that exact folder with [\"--prefix\",\"PATH\"]; you may call path_exists first to check whether that user-provided folder or its parent exists. If the user asks you to install TheRock/ROCm but has not named a folder, ask for the folder or let the guided setup folder picker collect it; do not invent a hidden default folder and do not request an install command without --prefix. Use rocm_command args [\"install\",\"sdk\",\"--channel\",\"release\",\"--format\",\"wheel\",\"--prefix\",\"PATH\"] only when the user asks you to install it and a folder is known; for a requested build date add [\"--build-date\",\"YYYY-MM-DD\"] and for a requested exact version add [\"--version\",\"VERSION\"]. For config changes, inspect with [\"config\",\"show\"] first when useful, then request config subcommands such as [\"config\",\"set-default-engine\",\"lemonade\"], [\"config\",\"set-default-runtime\",\"RUNTIME_KEY\"], or [\"config\",\"set-telemetry\",\"local\"] only after explaining why. For ComfyUI, use rocm_command with args like [\"comfyui\",\"status\"], [\"comfyui\",\"logs\"], [\"comfyui\",\"install\"], [\"comfyui\",\"start\"], or [\"comfyui\",\"stop\"]. First-time setup is the same thing as bootstrap in ROCm CLI; it is a deterministic ROCm setup flow, not a separate model chat. The built-in local assistant is fixed to qwen, which maps to Qwen3-4B-Instruct-2507-GGUF served by Lemonade with gpu_required. vLLM, Lemonade, and AIM (Docker-based) are the general serving engines; inspect or manage them when the user asks about general model serving, but do not switch the built-in assistant away from Lemonade. Use qwen-smoke only for a quick server smoke test. For vLLM management, inspect engines first and use [\"engines\",\"install\",\"vllm\"] or [\"serve\",\"MODEL\",\"--engine\",\"vllm\",\"--device\",\"gpu_required\",\"--managed\"] only where the host supports it. Do not invent shell commands and do not request CPU fallback.";
 const ROCM_CHAT_TOOL_SKILL: &str = include_str!("../../../skills/rocm-cli-assistant/SKILL.md");
 
 fn rocm_chat_tool_system_prompt() -> String {
@@ -2428,7 +2434,34 @@ fn render_services_tool_result_text(records: &[ManagedServiceRecord]) -> String 
     output
 }
 
-fn chat_rocm_command_action_from_args(mut args: Vec<String>) -> Result<ChatRocmCommandAction> {
+/// The chat action for `rocm install driver`. Where the command only reports
+/// (`only_reports`, the same decision the command itself makes) it is a
+/// read-only call with no `--yes`; elsewhere it needs approval and carries
+/// `--yes`.
+///
+/// A model-supplied `--yes` is stripped in both forms, bare and `--yes=...`,
+/// as the `install sdk` arm does: the approval path appends its own bare
+/// `--yes`, so a stray attached form would otherwise ride along and clap would
+/// refuse the whole command, and the read-only path has no consent to grant.
+pub(crate) fn chat_install_driver_action(
+    mut args: Vec<String>,
+    only_reports: bool,
+) -> ChatRocmCommandAction {
+    args.retain(|arg| arg != "--yes" && !arg.starts_with("--yes="));
+    if only_reports {
+        return ChatRocmCommandAction::ReadOnly(args);
+    }
+    ensure_flag(&mut args, "--yes");
+    ChatRocmCommandAction::Approval {
+        args,
+        pending_title: "Install driver".to_owned(),
+        command_title: "Install".to_owned(),
+    }
+}
+
+pub(crate) fn chat_rocm_command_action_from_args(
+    mut args: Vec<String>,
+) -> Result<ChatRocmCommandAction> {
     canonicalize_chat_rocm_command(&mut args)?;
     validate_chat_rocm_command_safety(&args)?;
     let first = args.first().map(|value| value.to_ascii_lowercase());
@@ -2509,14 +2542,10 @@ fn chat_rocm_command_action_from_args(mut args: Vec<String>) -> Result<ChatRocmC
                 command_title: "Install".to_owned(),
             })
         }
-        Some("install") if second.as_deref() == Some("driver") => {
-            ensure_flag(&mut args, "--yes");
-            Ok(ChatRocmCommandAction::Approval {
-                args,
-                pending_title: "Install driver".to_owned(),
-                command_title: "Install".to_owned(),
-            })
-        }
+        Some("install") if second.as_deref() == Some("driver") => Ok(chat_install_driver_action(
+            args,
+            crate::driver_install::host_install_driver_only_reports(),
+        )),
         Some("update") if args.iter().any(|arg| arg == "--apply") => {
             ensure_flag(&mut args, "--yes");
             Ok(ChatRocmCommandAction::Approval {
@@ -3401,16 +3430,20 @@ pub(crate) fn run_internal_mcp_call(
             let request = json_string(&arguments, "request")
                 .context("natural_language_plan requires `request`")?;
             let config = RocmCliConfig::load(paths).unwrap_or_default();
-            let text = render_freeform_plan(&request, paths, &config);
-            let action =
-                freeform_plan_next_action_with_context(&request, paths, &config).map(|action| {
-                    serde_json::json!({
-                        "args": action.args,
-                        "approval_required": action.approval_required,
-                        "has_placeholders": action.has_placeholders,
-                        "provider_assisted": action.provider_assisted,
-                    })
-                });
+            // Built exactly once: the text shown to the operator and the
+            // `action` reported as what would run next both come from the
+            // same `StructuredRequestPlan`, so a provider-assisted plan (not
+            // guaranteed deterministic across calls) cannot describe one
+            // command in `text` and a different one in `action`.
+            let (text, action) = plan_freeform_request_with_context(&request, paths, &config);
+            let action = action.map(|action| {
+                serde_json::json!({
+                    "args": action.args,
+                    "approval_required": action.approval_required,
+                    "has_placeholders": action.has_placeholders,
+                    "provider_assisted": action.provider_assisted,
+                })
+            });
             Ok(internal_mcp_tool_success(
                 "Planned the ROCm request.".to_owned(),
                 serde_json::json!({
@@ -3754,6 +3787,25 @@ fn run_rocm_read_only_in_process(paths: &AppPaths, args: &[String]) -> Result<St
                 && subcommand.eq_ignore_ascii_case("status") =>
         {
             render_setup_status_text(paths, &config)
+        }
+        // `install driver` is a read-only call where the command only reports
+        // (`chat_install_driver_action`). It runs as a dry run that never
+        // executes anything, so a call that reaches it elsewhere cannot change
+        // the host either. `--dry-run` is accepted because it is what this arm
+        // already does; `--reconcile` is not, since it rewrites the saved driver
+        // install state and the command refuses to combine it with the other
+        // flags.
+        [command, subcommand, rest @ ..]
+            if command.eq_ignore_ascii_case("install")
+                && subcommand.eq_ignore_ascii_case("driver")
+                && rest.iter().all(|arg| {
+                    arg.eq_ignore_ascii_case("--dkms") || arg.eq_ignore_ascii_case("--dry-run")
+                }) =>
+        {
+            let dkms = rest.iter().any(|arg| arg.eq_ignore_ascii_case("--dkms"));
+            crate::driver_install::install_driver(paths, dkms, false, true)
+                .map(|result| result.output)
+                .map_err(|error| error.source)
         }
         _ => bail!(
             "unsupported in-process read-only rocm command: {}",
@@ -5098,7 +5150,7 @@ endpoint: 127.0.0.1:8001
         // Stated only where it is true: present on Windows, absent elsewhere.
         let grounded = rocm_chat_tool_system_prompt_for_host(None);
         assert_eq!(
-            grounded.contains("vLLM is skipped on native Windows"),
+            grounded.contains("vLLM and AIM are skipped on native Windows"),
             cfg!(windows),
             "the vLLM caveat must track the host:\n{grounded}"
         );
@@ -5472,6 +5524,32 @@ model recipes
             .expect("approval should be built");
         assert_eq!(approval.pending_title, "Change settings");
         assert_eq!(approval.command_title, "Config");
+    }
+
+    #[test]
+    fn default_engine_fallback_matches_aim_only_as_a_word() {
+        let proposed = |prompt: &str| {
+            fallback_config_tool_call_for_prompt(prompt).map(|call| {
+                call.arguments["args"][2]
+                    .as_str()
+                    .expect("engine arg")
+                    .to_owned()
+            })
+        };
+        assert_eq!(
+            proposed("change the default engine to aim").as_deref(),
+            Some("aim")
+        );
+        assert_eq!(
+            proposed("change the default engine to vllm, aiming for low latency").as_deref(),
+            Some("vllm")
+        );
+        assert_eq!(
+            proposed(
+                "change the default engine so I can maintain my claim, aiming for low latency"
+            ),
+            None
+        );
     }
 
     #[test]
@@ -6104,6 +6182,104 @@ model recipes
                 .and_then(serde_json::Value::as_bool),
             Some(true)
         );
+    }
+
+    /// On Windows `rocm install driver` only reports, and chat plans it as a
+    /// read-only call. That call must run in process: before this arm existed it
+    /// failed with "unsupported in-process read-only rocm command". It is a dry
+    /// run, so it never executes anything on any platform.
+    #[test]
+    fn install_driver_read_only_call_runs_in_process() {
+        let (_root, paths) = test_paths("install-driver-in-process");
+        let args = vec!["install".to_owned(), "driver".to_owned()];
+        let text = run_rocm_read_only_in_process(&paths, &args)
+            .expect("the read-only install driver call should run in process");
+        assert!(text.contains("approval:"), "{text}");
+        assert!(!text.contains("driver install completed"), "{text}");
+        assert!(
+            run_rocm_read_only_in_process(
+                &paths,
+                &[
+                    "install".to_owned(),
+                    "driver".to_owned(),
+                    "--yes".to_owned()
+                ]
+            )
+            .is_err(),
+            "a flag the read-only path does not know is still refused"
+        );
+    }
+
+    /// `--dry-run` is what the in-process arm already does, so it is accepted
+    /// and the call reports a dry run. `--reconcile` writes driver install state
+    /// and stays refused, as does any flag the arm does not know.
+    #[test]
+    fn install_driver_read_only_call_accepts_dry_run_and_refuses_reconcile() {
+        let (_root, paths) = test_paths("install-driver-in-process-dry-run");
+        let run = |extra: &[&str]| {
+            let mut args = vec!["install".to_owned(), "driver".to_owned()];
+            args.extend(extra.iter().map(|arg| (*arg).to_owned()));
+            run_rocm_read_only_in_process(&paths, &args)
+        };
+        for extra in [&["--dry-run"][..], &["--dkms", "--dry-run"], &["--DRY-RUN"]] {
+            let text = run(extra).unwrap_or_else(|error| panic!("{extra:?} must run: {error}"));
+            assert!(text.contains("dry_run: true"), "{extra:?}: {text}");
+            assert!(
+                !text.contains("driver install completed"),
+                "{extra:?}: {text}"
+            );
+        }
+        for extra in [&["--reconcile"][..], &["--dry-run", "--reconcile"]] {
+            assert!(run(extra).is_err(), "{extra:?} must stay refused");
+        }
+        // Refusing `--reconcile` changed nothing on disk: the state file is
+        // written only by a reconcile or an executed install.
+        assert!(
+            !crate::driver_install::driver_install_state_path(&paths).exists(),
+            "a refused call must not create driver install state"
+        );
+    }
+
+    /// The `install driver` chat action strips `--yes` in the attached form too,
+    /// like the `install sdk` arm: read-only where the command only reports, and
+    /// a single bare `--yes` where it installs.
+    #[test]
+    fn chat_install_driver_strips_a_model_supplied_yes_in_both_forms() {
+        for supplied in ["--yes", "--yes=true", "--yes=1", "--yes=false"] {
+            let argv = |extra: &str| -> Vec<String> {
+                ["install", "driver", "--dry-run", extra]
+                    .iter()
+                    .map(|arg| (*arg).to_owned())
+                    .collect()
+            };
+            let ChatRocmCommandAction::ReadOnly(args) =
+                chat_install_driver_action(argv(supplied), true)
+            else {
+                panic!("a report-only platform must stay read-only");
+            };
+            assert_eq!(args, ["install", "driver", "--dry-run"], "{supplied}");
+
+            let ChatRocmCommandAction::Approval { args, .. } =
+                chat_install_driver_action(argv(supplied), false)
+            else {
+                panic!("an installing platform must ask approval");
+            };
+            assert_eq!(
+                args,
+                ["install", "driver", "--dry-run", "--yes"],
+                "{supplied}"
+            );
+        }
+        let ChatRocmCommandAction::ReadOnly(args) = chat_install_driver_action(
+            ["install", "driver", "--yes-not-a-flag"]
+                .iter()
+                .map(|arg| (*arg).to_owned())
+                .collect(),
+            true,
+        ) else {
+            panic!("read-only expected");
+        };
+        assert!(args.iter().any(|arg| arg == "--yes-not-a-flag"), "{args:?}");
     }
 
     #[test]

@@ -33,6 +33,13 @@ path = "src/bin/fake-uv.rs"
 name = "fake-python"
 path = "src/bin/fake-python.rs"
 
+# Stand-in for `docker` that always fails, planted by the model-catalog
+# scenario proving the AIM engine's Docker-unavailable gate deterministically
+# (see `src/bin/fake-docker.rs`).
+[[bin]]
+name = "fake-docker"
+path = "src/bin/fake-docker.rs"
+
 [dependencies]
 axum.workspace = true
 cucumber = { version = "0.23", features = ["output-json", "output-junit"] }
@@ -61,7 +68,7 @@ toml = "1.1"
 # `src/loopback_http.rs`), so the E2E suite does not hand-roll HTTP framing,
 # socket-mode handling, or path-traversal defence. 0.6 is the version reqwest
 # already pulls in, so this adds no second copy to the tree.
-tower-http = { version = "0.6", features = ["fs"] }
+tower-http = { version = "0.7", features = ["fs"] }
 url = "2"
 vt100 = "0.16"
 

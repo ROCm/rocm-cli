@@ -222,6 +222,17 @@ pub(crate) struct PlatformReport {
     /// Component versions (OS/ROCm/vLLM/lemonade) from `platform.json`, for the
     /// summary-matrix Platform/OS cells. Default (all `None`) for older artifacts.
     versions: PlatformVersions,
+    /// The parsed `platform.json` itself (`None` for pre-expectation artifacts,
+    /// or one that doesn't parse). Kept in full — not just the `tally`/`versions`
+    /// derived from it — so [`Grid::build`] can read `platform_slug`,
+    /// `capability` and every `expectations` entry without a second parse of
+    /// the same file.
+    manifest: Option<PlatformManifest>,
+    /// Scenario `@id` → whether it passed, from this platform's already-parsed
+    /// `features`. Kept (not just folded into `tally`) so [`Grid::build`] can
+    /// reconcile `manifest.expectations` against it directly, instead of
+    /// rebuilding the identical map from `features` a second time.
+    actual: std::collections::HashMap<String, bool>,
 }
 
 /// One recorded `rocm` invocation from a platform's `commands.jsonl` sidecar.
@@ -535,18 +546,19 @@ struct FeatureGroup {
 }
 
 /// The reconciled grid: scenario rows grouped by feature × platform columns.
-/// Built from each input's `platform.json` (expected) joined with its
-/// `report.json` (actual) by stable `@id`. Inputs without a `platform.json`
-/// (pre-expectation artifacts) are skipped here — they still appear in the legacy
-/// platform×tier matrix.
+/// Built from each already-loaded [`PlatformReport`]'s stored `platform.json`
+/// manifest (expected) joined with its already-parsed `report.json` features
+/// (actual) by stable `@id` — no file is read again to build this.
+/// Reports with no manifest (pre-expectation artifacts) are skipped here — they
+/// still appear in the legacy platform×tier matrix.
 struct Grid {
     /// Feature groups, alphabetical by feature name; rows within a group ordered
     /// by their `<key>-<NN>` index (i.e. feature-file order).
     groups: Vec<FeatureGroup>,
     columns: Vec<GridColumn>,
     /// Canonical labels (see [`excluded_platform_label`]) of platforms skipped
-    /// from `columns` because [`parse_platform_manifest`] returned `None` for
-    /// them — no `platform.json` file, or one present but not valid JSON for
+    /// from `columns` because their `PlatformReport::manifest` is `None` — no
+    /// `platform.json` file, or one present but not valid JSON for
     /// the expected shape. Distinct from a platform whose `platform.json`
     /// parses fine but merely has no `expectations`, which still gets a
     /// (empty) column. Sorted, deduplicated. Surfaced as a caption near the
@@ -585,23 +597,24 @@ fn feature_of(exp: &ManifestExpectation, from_reports: Option<&str>) -> String {
 }
 
 impl Grid {
-    fn build(inputs: &[(String, PathBuf)]) -> Self {
+    fn build(reports: &[PlatformReport]) -> Self {
         // Feature names for ids that ran somewhere, as a fallback for artifacts
         // whose platform.json predates the `feature` field.
-        let features_from_reports = id_features(inputs);
+        let features_from_reports = id_features(reports);
         // id → (feature, scenario name), merged across inputs. A later input can
         // fill in identity an earlier (older) artifact lacked.
         let mut identity: BTreeMap<String, (String, String)> = BTreeMap::new();
         let mut columns: Vec<GridColumn> = Vec::new();
         let mut excluded: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
-        for (label, json_path) in inputs {
-            let Some(manifest) = parse_platform_manifest(json_path) else {
-                excluded.insert(excluded_platform_label(label));
+        for report in reports {
+            let Some(manifest) = report.manifest.as_ref() else {
+                excluded.insert(excluded_platform_label(&report.desc));
                 continue;
             };
-            // Actual results by id from this platform's report.json.
-            let actual = id_pass_map(json_path);
+            // Actual results by id — already computed once by `PlatformReport::load`
+            // from the same `features`; reused here rather than rebuilt.
+            let actual = &report.actual;
 
             // Merge into an existing column with the same (slug, channel) —
             // channel is part of column identity so a nightly and a release run
@@ -617,16 +630,17 @@ impl Grid {
                         && c.versions.channel == manifest.versions.channel
                 })
                 .unwrap_or_else(|| {
-                    // Canonical label, not the raw slug — derived the same way
-                    // every other section of the report derives its platform
-                    // label (issue #702). Both fields, not just `platform`:
-                    // see `GridColumn::os`'s doc for why OS has to be part of
-                    // the label here specifically.
-                    let desc = parse_descriptor(label);
+                    // Canonical label, not the raw slug — reused from
+                    // `PlatformReport::desc`, the same derivation every other
+                    // section of the report uses for its platform label (issue
+                    // #702), computed once by `PlatformReport::load` rather than
+                    // re-parsed here. Both fields, not just
+                    // `platform`: see `GridColumn::os`'s doc for why OS has to be
+                    // part of the label here specifically.
                     columns.push(GridColumn {
                         slug: manifest.platform_slug.clone(),
-                        platform: desc.platform,
-                        os: desc.os,
+                        platform: report.desc.platform.clone(),
+                        os: report.desc.os.clone(),
                         engine: manifest
                             .capability
                             .as_ref()
@@ -796,12 +810,12 @@ impl Grid {
 }
 
 /// Map each scenario `@id` → the name of the feature that ran it, from every
-/// input's `report.json`. The fallback used when a `platform.json` predates the
-/// `feature` field.
-fn id_features(inputs: &[(String, PathBuf)]) -> BTreeMap<String, String> {
+/// report's already-parsed features. The fallback used when a `platform.json`
+/// predates the `feature` field.
+fn id_features(reports: &[PlatformReport]) -> BTreeMap<String, String> {
     let mut map = BTreeMap::new();
-    for (_label, json_path) in inputs {
-        for f in parse_features(json_path) {
+    for report in reports {
+        for f in &report.features {
             for el in &f.elements {
                 if let Some(id) = scenario_id(el) {
                     map.entry(id).or_insert_with(|| f.name.clone());
@@ -812,11 +826,12 @@ fn id_features(inputs: &[(String, PathBuf)]) -> BTreeMap<String, String> {
     map
 }
 
-/// Map each scenario's stable `@id` → whether it passed, from a `report.json`.
-/// (Internal sibling of the public [`crate::parse::scenario_results_by_id`],
-/// returning a map.)
-fn id_pass_map(json_path: &Path) -> std::collections::HashMap<String, bool> {
-    let features = parse_features(json_path);
+/// Map each scenario's stable `@id` → whether it passed, from an already-parsed
+/// feature list. (Internal sibling of the public
+/// [`crate::parse::scenario_results_by_id`], returning a map.) Takes `&[Feature]`
+/// rather than a path so a caller that already holds a parsed `report.json`
+/// (every caller, via `PlatformReport`'s own `features`) never re-reads it.
+fn id_pass_map(features: &[Feature]) -> std::collections::HashMap<String, bool> {
     features
         .iter()
         .flat_map(|f| &f.elements)
@@ -851,12 +866,14 @@ impl ReconciledTally {
     }
 }
 
-/// Reconcile one platform's `platform.json` expectations against its
-/// `report.json` results. `None` when the artifact predates the expectation
-/// system (no `platform.json`) — callers fall back to the legacy junit status.
-fn reconciled_tally(json_path: &Path) -> Option<ReconciledTally> {
-    let manifest = parse_platform_manifest(json_path)?;
-    let actual = id_pass_map(json_path);
+/// Reconcile one platform's `platform.json` expectations against its already
+/// reconciled `report.json` results (`actual`). Callers without a manifest (an
+/// artifact predating the expectation system) skip calling this and fall back
+/// to the legacy junit status instead.
+fn reconciled_tally(
+    manifest: &PlatformManifest,
+    actual: &std::collections::HashMap<String, bool>,
+) -> ReconciledTally {
     let mut t = ReconciledTally::default();
     for exp in &manifest.expectations {
         match CellOutcome::reconcile(&exp.expected, exp.flaky, actual.get(&exp.id).copied()) {
@@ -876,7 +893,7 @@ fn reconciled_tally(json_path: &Path) -> Option<ReconciledTally> {
             CellOutcome::Missing => {}
         }
     }
-    Some(t)
+    t
 }
 
 /// The channel that governs a platform's rendering: the manifest's
@@ -900,9 +917,15 @@ impl PlatformReport {
             .any(|el| el.tags.iter().any(|t| t.name == EXPECTED_FAILURE_TAG));
         let desc = parse_descriptor(&artifact);
         let commands = parse_commands(json_path);
-        let tally = reconciled_tally(json_path);
-        let versions = parse_platform_manifest(json_path)
-            .map(|m| m.versions)
+        // Parsed exactly once here: `tally` and `versions` are both derived
+        // from this same `manifest`, and the manifest itself is kept on
+        // `Self` so `Grid::build` can read it too without a second parse.
+        let manifest = parse_platform_manifest(json_path);
+        let actual = id_pass_map(&features);
+        let tally = manifest.as_ref().map(|m| reconciled_tally(m, &actual));
+        let versions = manifest
+            .as_ref()
+            .map(|m| m.versions.clone())
             .unwrap_or_default();
         let effective_channel = resolve_channel(&versions, &desc);
         let label =
@@ -917,6 +940,8 @@ impl PlatformReport {
             commands,
             tally,
             versions,
+            manifest,
+            actual,
         }
     }
 
@@ -1007,45 +1032,61 @@ fn report_sort_key(r: &PlatformReport) -> (&str, &str, bool, Option<&str>) {
     )
 }
 
-/// The per-platform `PlatformReport` set, bundled with the `(label,
-/// json_path)` inputs they were parsed from.
+/// Everything the consolidated report renders, built once from one set of
+/// `(label, json_path)` inputs.
 ///
-/// Returned by [`load_platform_reports`] so [`generate_consolidated`] and
-/// [`consolidated_summary_markdown`] always render `reports` and `inputs`
-/// from the same platform set — the two can no longer be independently
-/// filtered, reordered, or re-paired into a self-contradicting report the way
-/// two loose parameters could (ROCMAI-484 / ROCm/rocm-cli#640). Opaque:
-/// nothing outside this crate needs to read `reports` or `inputs`
-/// individually, only hand the bundle to the two render functions.
+/// Holds the per-platform `PlatformReport`s, the reconciled expectation
+/// `Grid`, and the scenario-reference map. Returned by
+/// [`load_platform_reports`] so [`generate_consolidated`] and
+/// [`consolidated_summary_markdown`] draw every part they render from the
+/// same platform set — the parts can no longer be independently filtered,
+/// reordered, or re-paired into a self-contradicting report the way loose
+/// parameters could (ROCMAI-484 / ROCm/rocm-cli#640). Opaque: nothing outside
+/// this crate needs to read the parts individually, only hand the bundle to
+/// the two render functions.
 pub struct PlatformReports {
     reports: Vec<PlatformReport>,
-    inputs: Vec<(String, PathBuf)>,
+    grid: Grid,
+    scenarios: ScenarioReference,
 }
 
-/// Build the per-platform `PlatformReport` set once, bundled with the
-/// `inputs` that produced it.
-///
-/// Parses every platform's `report.json`/`platform.json`/`commands.jsonl`,
-/// sorted by platform/OS, then known-bugs flag, then channel. Shared by
-/// [`generate_consolidated`] and [`consolidated_summary_markdown`],
-/// so a caller producing both outputs from the same `inputs` in one process
-/// (e.g. `xtask`'s `e2e_report::run`) runs `PlatformReport::load` — and so
-/// reads each platform's `commands.jsonl` — once instead of once per output.
-/// The expectation grid and scenario reference sections parse the bundled
-/// `inputs` independently of `reports` on every call; see
-/// [`generate_consolidated`] and [`consolidated_summary_markdown`] for what
-/// each output still parses `inputs` for.
-pub fn load_platform_reports(inputs: &[(String, PathBuf)]) -> PlatformReports {
-    let mut reports: Vec<PlatformReport> = inputs
+/// Parse every `(label, json_path)` input into a [`PlatformReport`], in input
+/// order. The one place `report.json`/`platform.json`/`commands.jsonl` are
+/// read from disk — [`Grid::build`] and [`scenario_reference`] consume the
+/// resulting `PlatformReport`s instead of re-reading.
+fn load_reports(inputs: &[(String, PathBuf)]) -> Vec<PlatformReport> {
+    inputs
         .iter()
         .map(|(label, path)| PlatformReport::load(label.clone(), path))
-        .collect();
+        .collect()
+}
+
+/// Build everything both outputs render, once per run.
+///
+/// Parses every platform's `report.json`/`platform.json`/`commands.jsonl`
+/// into `PlatformReport`s (via [`load_reports`]), sorted by platform/OS, then
+/// known-bugs flag, then channel, and builds the expectation `Grid` and
+/// scenario-reference map alongside them. Shared by [`generate_consolidated`]
+/// and [`consolidated_summary_markdown`], so a caller producing both outputs
+/// from the same `inputs` in one process (e.g. `xtask`'s `e2e_report::run`)
+/// builds each part once, not once per output or per report section. Each
+/// input's files are parsed exactly once, by `PlatformReport::load`
+/// (`load_reports`) — `Grid::build` and `scenario_reference` consume that
+/// already-parsed data and never re-read a file.
+pub fn load_platform_reports(inputs: &[(String, PathBuf)]) -> PlatformReports {
+    let mut reports = load_reports(inputs);
+    // From `reports` in their as-loaded (input) order, BEFORE the sort below:
+    // `Grid::build` lays columns out in that order, and sorting first would
+    // change that.
+    let grid = Grid::build(&reports);
+    let scenarios = scenario_reference(&reports);
     // Group each platform's rows together and order tiers expect-pass → known
     // bugs, instead of the alphabetical mash of the old single-label sort.
     reports.sort_by(|a, b| report_sort_key(a).cmp(&report_sort_key(b)));
     PlatformReports {
         reports,
-        inputs: inputs.to_vec(),
+        grid,
+        scenarios,
     }
 }
 
@@ -1059,19 +1100,19 @@ fn platform_cell(r: &PlatformReport) -> String {
 
 /// Full label (platform AND OS) for a platform excluded from the expectation
 /// grid because its artifact has no usable `platform.json` (see
-/// [`Grid::excluded`]). Deliberately mirrors [`PlatformReport::load`]'s
-/// `label` field and [`GridColumn::label`] (same shape, no `versions.channel`
-/// to prefer since there is no manifest, so this falls back to the
-/// artifact-name channel directly) rather than the OS-less [`platform_cell`]:
-/// two real lanes of the same silicon family (e.g. "Strix Halo" Ubuntu vs.
-/// Windows, see `parse_descriptor`) must stay distinguishable here, or an
-/// excluded Windows lane would read as the identical string to an included
-/// Ubuntu column of the same platform — an outright contradiction in the
-/// rendered report — and two such excluded lanes would silently collapse into
-/// one `BTreeSet` entry, undercounting how many artifacts are actually
-/// missing.
-fn excluded_platform_label(artifact: &str) -> String {
-    let desc = parse_descriptor(artifact);
+/// [`Grid::excluded`]). Takes the already-computed `PlatformReport::desc`
+/// rather than re-deriving one from the raw artifact name.
+/// Deliberately mirrors [`PlatformReport::load`]'s `label` field and
+/// [`GridColumn::label`] (same shape, no `versions.channel` to prefer since
+/// there is no manifest, so this falls back to the artifact-name channel
+/// directly) rather than the OS-less [`platform_cell`]: two real lanes of the
+/// same silicon family (e.g. "Strix Halo" Ubuntu vs. Windows, see
+/// `parse_descriptor`) must stay distinguishable here, or an excluded Windows
+/// lane would read as the identical string to an included Ubuntu column of
+/// the same platform — an outright contradiction in the rendered report — and
+/// two such excluded lanes would silently collapse into one `BTreeSet` entry,
+/// undercounting how many artifacts are actually missing.
+fn excluded_platform_label(desc: &Descriptor) -> String {
     with_channel_suffix(
         &format!("{} {}", desc.platform, desc.os),
         desc.channel_from_name,
@@ -1080,21 +1121,19 @@ fn excluded_platform_label(artifact: &str) -> String {
 
 /// Build one consolidated HTML report from a [`PlatformReports`] bundle.
 ///
-/// The bundle's `inputs` are `(label, json_path)` pairs; the label identifies
-/// the platform/tier (e.g. "GPU Strix Windows (known bugs)"). New platforms
-/// need no code change — the caller just passes more inputs to
-/// [`load_platform_reports`].
+/// The bundle is built from `(label, json_path)` pairs passed to
+/// [`load_platform_reports`]; the label identifies the platform/tier (e.g.
+/// "GPU Strix Windows (known bugs)"). New platforms need no code change — the
+/// caller just passes more inputs there.
 ///
-/// `bundle.inputs` is still needed here for the expectation grid, which is
-/// keyed differently and re-parses `report.json` and `platform.json` from
-/// `inputs`, independently of `bundle.reports`.
+/// Reads no input from disk; everything it renders comes from the bundle
+/// (see [`load_platform_reports`]).
 pub fn generate_consolidated(
     bundle: &PlatformReports,
     html_out: &Path,
     meta: &RunMeta,
 ) -> std::io::Result<()> {
     let reports = &bundle.reports;
-    let inputs = &bundle.inputs;
     let now = now_utc();
     let all_ok = reports.iter().all(PlatformReport::ok);
     let overall = if reports.is_empty() {
@@ -1131,7 +1170,7 @@ pub fn generate_consolidated(
             (matrix_table(reports))
             (legend())
 
-            (expectation_grid_html(inputs))
+            (expectation_grid_html(&bundle.grid))
 
             h2 { "Per-platform Details" }
             div.details {
@@ -1150,15 +1189,12 @@ pub fn generate_consolidated(
 /// GitHub-flavoured markdown table, for piping into `$GITHUB_STEP_SUMMARY`.
 /// Same bundle as [`generate_consolidated`].
 ///
-/// `bundle.inputs` is still needed here for the expectation grid and scenario
-/// reference sections, which are keyed differently and each build their own
-/// expectation grid from `inputs`, independently re-parsing `report.json` and
-/// `platform.json`, independently of `bundle.reports`.
+/// Reads nothing from disk; everything it renders comes from the bundle
+/// (see [`load_platform_reports`]).
 pub fn consolidated_summary_markdown(bundle: &PlatformReports) -> String {
     use std::fmt::Write as _;
 
     let reports = &bundle.reports;
-    let inputs = &bundle.inputs;
     let mut out = String::from("## E2E consolidated report\n\n");
     if reports.is_empty() {
         out.push_str("_No per-platform report.json files were found to consolidate._\n");
@@ -1264,22 +1300,21 @@ pub fn consolidated_summary_markdown(bundle: &PlatformReports) -> String {
         }
     }
 
-    // id → (scenario name, Gherkin steps), built once from report.json across all
-    // inputs. Used both for the grid's Scenario column (name + id link) and the
-    // Scenario reference section at the very end.
-    let scenarios = scenario_reference(inputs);
-
     // The per-(scenario × platform) expectation grid, when platform.json
     // sidecars are present (the new expectation system). Placed before the
     // command-coverage table; it supersedes the coarse platform×tier matrix for
-    // "where should each test pass / not matter / not run".
-    out.push_str(&expectation_grid_markdown(inputs, &scenarios));
+    // "where should each test pass / not matter / not run". The scenario
+    // map supplies names for the grid's Scenario column (name + id link).
+    out.push_str(&expectation_grid_markdown(&bundle.grid, &bundle.scenarios));
 
     out.push_str(&command_coverage_markdown(reports));
 
     // Scenario reference LAST (after command coverage): each id's actual Gherkin
     // scenario, anchored so the grid's id links resolve here.
-    out.push_str(&scenario_reference_markdown(inputs, &scenarios));
+    out.push_str(&scenario_reference_markdown(
+        &bundle.grid,
+        &bundle.scenarios,
+    ));
 
     out
 }
@@ -1289,8 +1324,7 @@ pub fn consolidated_summary_markdown(bundle: &PlatformReports) -> String {
 /// column/row AND no excluded platform to caption (see
 /// [`Grid::nothing_to_report`]); a report where every platform lacks a usable
 /// `platform.json` still renders a heading and caption naming them.
-fn expectation_grid_html(inputs: &[(String, PathBuf)]) -> Markup {
-    let grid = Grid::build(inputs);
+fn expectation_grid_html(grid: &Grid) -> Markup {
     // Not `grid.is_empty()`: a report where every platform lacks a
     // `platform.json` has no columns/groups either, but still has an
     // `excluded_note` worth showing — otherwise that case regresses to a
@@ -1390,13 +1424,9 @@ fn expectation_grid_html(inputs: &[(String, PathBuf)]) -> Markup {
 /// AND no excluded platform to caption (see [`Grid::nothing_to_report`]); a
 /// report where every platform lacks a usable `platform.json` still renders a
 /// heading and caption naming them.
-fn expectation_grid_markdown(
-    inputs: &[(String, PathBuf)],
-    scenarios: &std::collections::BTreeMap<String, (String, Vec<String>)>,
-) -> String {
+fn expectation_grid_markdown(grid: &Grid, scenarios: &ScenarioReference) -> String {
     use std::fmt::Write as _;
 
-    let grid = Grid::build(inputs);
     // Not `grid.is_empty()`: see the matching comment in `expectation_grid_html`
     // — a report where every platform lacks a `platform.json` still has an
     // `excluded_note` worth showing, even with no columns/groups to table.
@@ -1505,15 +1535,11 @@ fn expectation_grid_markdown(
 /// Gherkin scenario (name + steps), anchored by the id (`##### <id>` → GitHub
 /// anchor `#<id>`) so the grid's id links resolve. Grouped by feature and ordered
 /// like the grid. Empty when no expectation grid exists.
-fn scenario_reference_markdown(
-    inputs: &[(String, PathBuf)],
-    scenarios: &std::collections::BTreeMap<String, (String, Vec<String>)>,
-) -> String {
+fn scenario_reference_markdown(grid: &Grid, scenarios: &ScenarioReference) -> String {
     use std::fmt::Write as _;
 
     // Only emit when there is a grid to reference (platform.json sidecars present),
     // matching where the id links are generated.
-    let grid = Grid::build(inputs);
     if grid.is_empty() {
         return String::new();
     }
@@ -1558,18 +1584,19 @@ fn scenario_reference_markdown(
     out
 }
 
+/// Scenario `@id` → (human name, Gherkin steps); see [`scenario_reference`].
+type ScenarioReference = BTreeMap<String, (String, Vec<String>)>;
+
 /// Build a map of scenario `@id` → (human name, Gherkin steps) by scanning every
-/// input's `report.json`. Used for the grid's Scenario reference section. A
-/// scenario appears on the first input that ran it; later duplicates are ignored
-/// (the name/steps are identical across platforms).
-fn scenario_reference(
-    inputs: &[(String, PathBuf)],
-) -> std::collections::BTreeMap<String, (String, Vec<String>)> {
+/// report's already-parsed features. Used for the grid's Scenario reference
+/// section. A scenario appears on the first input that ran it; later duplicates
+/// are ignored (the name/steps are identical across platforms).
+fn scenario_reference(reports: &[PlatformReport]) -> ScenarioReference {
     let mut map = std::collections::BTreeMap::new();
-    for (_label, json_path) in inputs {
-        for f in parse_features(json_path) {
-            for el in f.elements {
-                let Some(id) = scenario_id(&el) else { continue };
+    for report in reports {
+        for f in &report.features {
+            for el in &f.elements {
+                let Some(id) = scenario_id(el) else { continue };
                 if map.contains_key(&id) {
                     continue;
                 }
@@ -1902,9 +1929,10 @@ mod tests {
         // `inputs` as two loose parameters): passing `&[]` instead of `inputs`
         // to the `expectation_grid_html(inputs)` call inside passed every
         // existing test at the time, because the fixtures used elsewhere had
-        // no platform.json, so the grid was empty either way. Give this one a
-        // platform.json via write_platform and assert the grid heading
-        // actually renders.
+        // no platform.json, so the grid was empty either way. The same slip
+        // now would be building the bundle's grid from `&[]` in
+        // `load_platform_reports`. Give this one a platform.json via
+        // write_platform and assert the grid heading actually renders.
         let report = feature_json(&[(&["id:serve-a"], &["passed"])]);
         let platform = r#"{
             "platform_slug": "mock",
@@ -1924,6 +1952,147 @@ mod tests {
             html.contains("Expectation grid (scenario × platform)"),
             "grid heading missing from output:\n{html}"
         );
+    }
+
+    #[test]
+    fn rendering_uses_the_bundle_not_the_artifacts_on_disk() {
+        // The render functions must work from what `load_platform_reports`
+        // built, never re-parse the inputs. Delete the artifacts after
+        // loading: anything re-read from disk now comes back empty, so a
+        // renderer that still re-parses loses the grid rows, the grid cell,
+        // or the scenario reference's names and steps.
+        //
+        // `serve-b` declares no `scenario` name in platform.json, so its grid
+        // row and reference entry take their name ("s1") from the scenario
+        // map — the one path where the grid reads that map.
+        let report = feature_json(&[
+            (&["id:serve-a"], &["passed"]),
+            (&["id:serve-b"], &["passed"]),
+        ]);
+        let platform = r#"{
+            "platform_slug": "mock",
+            "capability": {"effective_serve_engine": "none"},
+            "expectations": [
+                {"id":"serve-a","feature":"Serving","scenario":"serve-01 - first","expected":"pass"},
+                {"id":"serve-b","feature":"Serving","expected":"pass"}
+            ]
+        }"#;
+        let (dir, path) = write_platform(&report, platform);
+        let inputs = vec![("e2e-report".to_string(), path)];
+        let bundle = load_platform_reports(&inputs);
+        dir.close().expect("remove artifacts");
+
+        let md = consolidated_summary_markdown(&bundle);
+        for want in [
+            "serve-01 - first<br>[`serve-a`](#serve-a) | ✅ |",
+            "s1<br>[`serve-b`](#serve-b) | ✅ |",
+            "##### serve-a\n\n_serve-01 - first_\n\n- Given x\n",
+            "##### serve-b\n\n_s1_\n\n- Given x\n",
+        ] {
+            assert!(md.contains(want), "markdown lost {want:?}:\n{md}");
+        }
+        assert!(
+            !md.contains("no usable platform.json"),
+            "markdown re-read the deleted platform.json:\n{md}"
+        );
+
+        let out = tempfile::NamedTempFile::new().expect("temp");
+        generate_consolidated(&bundle, out.path(), &RunMeta::default()).expect("generate");
+        let html = std::fs::read_to_string(out.path()).expect("read");
+        // `class="num "` (trailing space, empty status class) is the grid's
+        // pass cell; the summary matrix's numeric cells are plain `class="num"`.
+        assert!(
+            html.contains(r#"<h3 class="feature-heading">Serving</h3>"#)
+                && html.contains(r#"<code>serve-b</code></td><td class="num ">✅</td>"#)
+                && !html.contains("no usable platform.json"),
+            "html grid lost its rows or cells, or re-read the deleted platform.json:\n{html}"
+        );
+    }
+
+    #[test]
+    fn grid_and_scenario_reference_do_not_re_read_the_input_files() {
+        // `Grid::build` and `scenario_reference` must work from an
+        // already-loaded `PlatformReport`, never re-open its `report.json`/
+        // `platform.json`. Build the report via `PlatformReport::load`, then
+        // delete the backing directory — if either function still opened a
+        // file, this would come back empty/excluded instead of populated.
+        let report = feature_json(&[(&["id:serve-a"], &["passed"])]);
+        let platform = r#"{
+            "platform_slug": "mock",
+            "expectations": [
+                {"id":"serve-a","feature":"Serving","scenario":"serve-01 - first","expected":"pass"}
+            ]
+        }"#;
+        let (dir, path) = write_platform(&report, platform);
+        let loaded = PlatformReport::load("e2e-report".to_string(), &path);
+        dir.close().expect("remove artifacts");
+
+        let reports = vec![loaded];
+        let grid = Grid::build(&reports);
+        assert_eq!(
+            grid.columns.len(),
+            1,
+            "grid lost its column after the backing files were deleted"
+        );
+        assert!(
+            grid.excluded.is_empty(),
+            "platform wrongly excluded after deletion: {:?}",
+            grid.excluded
+        );
+        assert_eq!(grid.groups.len(), 1);
+        assert_eq!(
+            grid.columns[0].outcomes.get("serve-a"),
+            Some(&CellOutcome::Pass),
+            "row cell outcome lost after the backing files were deleted"
+        );
+
+        let scenarios = scenario_reference(&reports);
+        // `scenario_reference` names scenarios from `report.json` (`feature_json`
+        // names its only scenario "s0"), not from `platform.json`'s `scenario`
+        // field — that's `Grid`'s row identity, a separate map.
+        let (name, steps) = scenarios.get("serve-a").expect("scenario still present");
+        assert_eq!(name, "s0");
+        assert!(!steps.is_empty());
+    }
+
+    #[test]
+    fn load_platform_reports_keeps_grid_columns_in_input_order() {
+        // `load_platform_reports` builds the grid from `reports` in their
+        // as-loaded (input) order, BEFORE sorting `reports` for display,
+        // preserving the column order `Grid::build` already had — whether the
+        // grid should instead follow the summary matrix's order is a separate
+        // question this does not settle. Feed inputs in the reverse of report
+        // sort order so building the grid from the sorted reports would show
+        // up here as an unintended change.
+        let platform = |slug: &str| {
+            format!(
+                r#"{{"platform_slug":"{slug}","expectations":[
+                    {{"id":"serve-a","feature":"Serving","scenario":"serve-01 - first","expected":"pass"}}
+                ]}}"#
+            )
+        };
+        let report = feature_json(&[(&["id:serve-a"], &["passed"])]);
+        let (_mock_dir, mock) = write_platform(&report, &platform("mock"));
+        let (_gpu_dir, gpu) = write_platform(&report, &platform("mi300x"));
+        let inputs = vec![
+            ("e2e-report".to_string(), mock),
+            ("e2e-gpu-report".to_string(), gpu),
+        ];
+
+        let bundle = load_platform_reports(&inputs);
+        let report_order: Vec<_> = bundle
+            .reports
+            .iter()
+            .map(|r| r.desc.platform.as_str())
+            .collect();
+        assert_eq!(report_order, ["MI300X", "Mock"]);
+        let column_order: Vec<_> = bundle
+            .grid
+            .columns
+            .iter()
+            .map(|c| c.slug.as_str())
+            .collect();
+        assert_eq!(column_order, ["mock", "mi300x"]);
     }
 
     #[test]
@@ -2019,6 +2188,8 @@ mod tests {
                 channel: manifest_channel.map(str::to_string),
                 ..Default::default()
             },
+            manifest: None,
+            actual: std::collections::HashMap::new(),
         }
     }
 
@@ -2264,7 +2435,7 @@ mod tests {
 
     /// The order the grid renders rows in, flattened across feature groups.
     fn grid_order(inputs: &[(String, PathBuf)]) -> Vec<(String, String)> {
-        Grid::build(inputs)
+        Grid::build(&load_reports(inputs))
             .groups
             .iter()
             .flat_map(|g| g.rows.iter().map(|r| (g.feature.clone(), r.id.clone())))
@@ -2469,7 +2640,7 @@ mod tests {
             ("mi300x-nightly".to_string(), nightly_path),
         ];
 
-        let grid = Grid::build(&inputs);
+        let grid = Grid::build(&load_reports(&inputs));
         assert_eq!(
             grid.columns.len(),
             2,
@@ -2524,7 +2695,7 @@ mod tests {
             ("e2e-gpu-strix-wsl-report".to_string(), wsl_path),
         ];
 
-        let grid = Grid::build(&inputs);
+        let grid = Grid::build(&load_reports(&inputs));
         assert_eq!(
             grid.columns.len(),
             3,
@@ -2761,7 +2932,7 @@ mod tests {
             ("mi300x-nightly".to_string(), nightly_path),
         ];
 
-        let grid = Grid::build(&inputs);
+        let grid = Grid::build(&load_reports(&inputs));
         let nightly_col = grid
             .columns
             .iter()
@@ -2804,7 +2975,7 @@ mod tests {
             ("mi300x-release-b".to_string(), second_path),
         ];
 
-        let grid = Grid::build(&inputs);
+        let grid = Grid::build(&load_reports(&inputs));
         assert_eq!(
             grid.columns.len(),
             1,
@@ -2838,7 +3009,7 @@ mod tests {
         let (_d, path) = write_platform(&report, platform);
         let inputs = vec![("mock".to_string(), path)];
 
-        let grid = Grid::build(&inputs);
+        let grid = Grid::build(&load_reports(&inputs));
         assert_eq!(grid.columns.len(), 1);
         assert_eq!(grid.columns[0].label(), "Mock Linux");
     }
@@ -3010,7 +3181,7 @@ mod tests {
             );
         }
 
-        let html = expectation_grid_html(&inputs).into_string();
+        let html = expectation_grid_html(&Grid::build(&load_reports(&inputs))).into_string();
         for glyph in ["✅XPASS (flaky)", "⚠️n/a-ran", "⚠️no-result"] {
             assert!(
                 html.contains(glyph),
@@ -3086,7 +3257,7 @@ mod tests {
         let (_d, path) = write_platform(&report, platform);
         let inputs = vec![("mi300x".to_string(), path)];
 
-        let html = expectation_grid_html(&inputs).into_string();
+        let html = expectation_grid_html(&Grid::build(&load_reports(&inputs))).into_string();
         for glyph in ["⚠️XPASS", "⚠️n/a-ran", "⚠️no-result", "❌FAIL"] {
             let needle = format!("class=\"status-fail\">{glyph}</span>");
             assert!(
@@ -3365,7 +3536,7 @@ mod tests {
             "there is no column to table, so no table header must render:\n{md}"
         );
 
-        let html = expectation_grid_html(&inputs).into_string();
+        let html = expectation_grid_html(&Grid::build(&load_reports(&inputs))).into_string();
         assert!(
             html.contains(
                 "have no usable platform.json and are not shown in this grid: Mock Linux"
@@ -3404,7 +3575,7 @@ mod tests {
             ),
         ];
 
-        let grid = Grid::build(&inputs);
+        let grid = Grid::build(&load_reports(&inputs));
         assert_eq!(
             grid.columns.len(),
             1,
@@ -3437,7 +3608,7 @@ mod tests {
             "markdown must caption the excluded platform by name:\n{md}"
         );
 
-        let html = expectation_grid_html(&inputs).into_string();
+        let html = expectation_grid_html(&Grid::build(&load_reports(&inputs))).into_string();
         assert!(
             html.contains(
                 "platform(s) have no usable platform.json and are not shown in this grid: \
@@ -3475,7 +3646,7 @@ mod tests {
             ),
         ];
 
-        let grid = Grid::build(&inputs);
+        let grid = Grid::build(&load_reports(&inputs));
         assert_eq!(
             grid.columns.len(),
             1,

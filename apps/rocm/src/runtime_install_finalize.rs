@@ -23,6 +23,7 @@ use rocm_core::{
 };
 use rocm_engine_protocol::{EngineMethod, InstallRequest, InstallResponse};
 
+use crate::engine_ipc::engine_request_with_env_root;
 use crate::engines_cmd::{
     engine_manages_own_runtime, env_root_for_engine_install, runtime_key_for_python,
     runtime_manifest_for_selector,
@@ -31,10 +32,7 @@ use crate::runtimes_cmd::{
     activate_runtime, newest_installed_runtime_manifest, recover_setup_runtime_registration,
 };
 use crate::therock;
-use crate::{
-    ROLLBACK_RECOVERY_HINT, engine_request_with_env_root, record_cli_audit_event, runtime_services,
-    sanitize_log_value,
-};
+use crate::{ROLLBACK_RECOVERY_HINT, record_cli_audit_event, runtime_services, sanitize_log_value};
 
 #[derive(Debug, Clone)]
 pub(crate) struct SdkInstallFinalization {
@@ -144,17 +142,12 @@ const fn system_package_install_action(
     }
 }
 
-pub(crate) const fn empty_as_unknown(value: &str) -> &str {
-    if value.is_empty() { "<unknown>" } else { value }
-}
-
 /// The real host's `/etc/os-release`, falling back to `/usr/lib/os-release`
 /// when the former is absent (per `os-release(5)`).
 ///
 /// Deliberately not routed through `rocm_core::host_path`: every caller builds
-/// a package-manager plan (`apt`, `dnf`, `amdgpu-install`) that then runs
-/// against the real machine, so a simulated host root must not choose its
-/// distro. The descriptive distro name `examine` reports comes from
+/// a package-manager plan (`apt`, `dnf`, `zypper`) that then runs against the
+/// real machine, so a simulated host root must not choose its distro. The descriptive distro name `examine` reports comes from
 /// `ExamineSummary::gather`'s `distro` field, which does follow a simulated
 /// root.
 pub(crate) fn real_os_release() -> rocm_core::hardware_root::OsRelease {
@@ -1538,7 +1531,8 @@ enum HostGpu {
 }
 
 fn detect_host_gpu() -> HostGpu {
-    match ExamineSummary::gather() {
+    // Reads only the GPU target, so it skips the driver version and date query.
+    match ExamineSummary::gather_without_driver_facts() {
         Ok(summary) if summary.detected_gfx_target.is_some() => HostGpu::Detected,
         Ok(_) => HostGpu::Absent,
         Err(error) => HostGpu::NotVerified(format!("{error:#}")),

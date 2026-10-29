@@ -610,8 +610,8 @@ proptest! {
         }
         config.default_runtime_id = Some(anchor.runtime_id.clone());
 
-        let left = crate::select_runtime_update_source(&manifests, &config, None);
-        let right = crate::select_runtime_update_source(&reordered, &config, None);
+        let left = crate::update_cmd::select_runtime_update_source(&manifests, &config, None);
+        let right = crate::update_cmd::select_runtime_update_source(&reordered, &config, None);
         match (left, right) {
             (Ok(left), Ok(right)) => prop_assert_eq!(
                 &left.runtime_key,

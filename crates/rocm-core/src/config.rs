@@ -1143,45 +1143,11 @@ last_installed_runtime_id = "therock-release"
         Ok(())
     }
 
-    /// The volume serial number paired with the 64-bit file index: this
-    /// platform's file identity, the way an inode is on Unix.
-    ///
-    /// Read through `GetFileInformationByHandle` rather than
-    /// `std::os::windows::fs::MetadataExt`, whose `volume_serial_number` and
-    /// `file_index` accessors are unstable behind the `windows_by_handle`
-    /// feature gate and so cannot be called on the pinned stable toolchain.
-    #[cfg(windows)]
-    #[allow(unsafe_code)] // Win32 FFI
-    fn windows_file_identity(path: &Path) -> Result<(u32, u64)> {
-        use anyhow::bail;
-        use std::os::windows::io::AsRawHandle;
-        use windows_sys::Win32::Foundation::HANDLE;
-        use windows_sys::Win32::Storage::FileSystem::{
-            BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
-        };
-
-        let file =
-            fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-        // All-POD `repr(C)` record, fully overwritten by the call below on
-        // success and never read on failure.
-        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
-        let handle = file.as_raw_handle() as HANDLE;
-        if unsafe { GetFileInformationByHandle(handle, &raw mut info) } == 0 {
-            bail!(
-                "failed to read the file identity of {}: {}",
-                path.display(),
-                std::io::Error::last_os_error()
-            );
-        }
-        Ok((
-            info.dwVolumeSerialNumber,
-            (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
-        ))
-    }
-
     #[cfg(windows)]
     #[test]
     fn saving_the_config_replaces_the_file_rather_than_rewriting_it_in_place() -> Result<()> {
+        use crate::test_support::windows_file_identity;
+
         // The Windows counterpart of the Unix test above. The file index
         // together with the volume serial number is this platform's file
         // identity, the way an inode is on Unix: a `fs::write` over the live
