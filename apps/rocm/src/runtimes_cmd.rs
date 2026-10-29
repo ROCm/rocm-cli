@@ -13,8 +13,8 @@
 //! way `EnginesCommand` stayed behind when `engines()` moved to
 //! `engines_cmd.rs` in Phase 6a. `RuntimeActivationResult` and
 //! `ActiveRuntimeMarker` stay `pub(crate)`: the former is read by
-//! `append_update_activate_summary` in `main.rs`'s `apply_runtime_update`
-//! flow, the latter by `storage.rs`. `select_runtime_manifest`,
+//! `append_update_activate_summary` in `update_cmd.rs`'s
+//! `apply_runtime_update` flow, the latter by `storage.rs`. `select_runtime_manifest`,
 //! `validate_runtime_manifest_for_activation`, `normalize_path_for_compare`,
 //! `recover_setup_runtime_registration`, `active_runtime_marker_path`,
 //! `should_remove_runtime_install_root`, and `runtime_usability_status` are
