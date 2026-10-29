@@ -219,7 +219,8 @@ pub struct AppState {
     /// Same for the tab bar, used for click-to-switch-tab.
     pub last_tab_bar_area: Option<ratatui::layout::Rect>,
     /// Header `⚠ N` badge from the most recent draw (`None` when no warning is
-    /// shown). Left-clicking it dispatches the same `KeyAction` as `!`.
+    /// shown). Left-clicking it opens the warnings popup, as `!` does, under the
+    /// same gating.
     pub last_header_badge: Option<ratatui::layout::Rect>,
     /// Clickable footer-legend chips from the most recent draw. Left-clicking a
     /// chip dispatches the same `KeyAction` as pressing that key.
@@ -1563,6 +1564,53 @@ mod tests {
     use super::*;
     use ratatui::layout::Rect;
     use tokio::sync::mpsc;
+
+    #[test]
+    fn global_hotkeys_are_unreachable_while_a_modal_overlay_or_prompt_owns_the_keyboard() {
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        assert!(s.global_hotkeys_reachable(), "idle dashboard");
+        s.modal = Modal::Help;
+        assert!(!s.global_hotkeys_reachable(), "a plain modal returns first");
+        s.modal = Modal::None;
+        s.services = Some(crate::ui::services_manager::ServicesManagerState::default());
+        assert!(
+            !s.global_hotkeys_reachable(),
+            "a manager overlay owns every key"
+        );
+        s.services = None;
+        s.open_quit_confirm();
+        assert!(
+            !s.global_hotkeys_reachable(),
+            "the quit prompt owns every key"
+        );
+    }
+
+    #[test]
+    fn typing_in_chat_owns_the_keyboard_only_on_the_chat_tab_and_only_while_focused() {
+        // `handle_key` hands every character to the chat input only once chat
+        // is accepted and the input is focused.
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.chat_consent = ChatConsent::Accepted;
+        s.active_tab = ActiveTab::Chat;
+        s.chat_focused = false;
+        assert!(s.global_hotkeys_reachable(), "chat tab, input not focused");
+        s.chat_focused = true;
+        assert!(!s.global_hotkeys_reachable(), "focused chat input");
+        // `chat_focused` is not cleared when the user switches tab, so a stale
+        // `true` on another tab must not be read as "typing".
+        for tab in [
+            ActiveTab::Home,
+            ActiveTab::Rocm,
+            ActiveTab::Serving,
+            ActiveTab::Observe,
+        ] {
+            s.active_tab = tab;
+            assert!(
+                s.global_hotkeys_reachable(),
+                "{tab:?} with a stale chat focus"
+            );
+        }
+    }
 
     use crate::client::ClientMsg;
 

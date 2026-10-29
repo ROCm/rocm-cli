@@ -720,9 +720,12 @@ fn draw_footer(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) -> Ve
     } else {
         KeyAction::OpenDetail
     };
-    // Single source of truth for "does a global hotkey reach its normal
-    // `handle_key` arm right now, or does something else own the keyboard
-    // first?" — mirrors, in order, `event_loop`'s own dispatch: a manager
+    // "Does a global hotkey reach its normal `handle_key` arm right now, or
+    // does something else own the keyboard first?" is answered by
+    // `AppState::global_hotkeys_reachable` (the header warning badge gates on it
+    // too); its terms are split out here because the footer needs subsets of
+    // them separately (`q`'s label and clickability). It mirrors, in order,
+    // `event_loop`'s own dispatch: a manager
     // overlay or pending approval owns every key before `handle_key` is ever
     // called (`overlay_or_approval`); a plain `Modal::*` fully returns from
     // its own arm before reaching the global match (`modal_open`); and
@@ -1901,8 +1904,9 @@ mod tests {
         let mut s = state_with_warnings(&["only one"]);
         let rows = draw_frame(&mut s, 140, 40);
         let badge = s.last_header_badge.expect("a warning is shown, so a badge");
-        let under = text_in(&rows, badge);
-        assert!(under.contains('⚠') && under.contains("1 (!)"), "{under:?}");
+        // Exactly the drawn badge, padding included: a region one column off
+        // would still contain the glyph and the count.
+        assert_eq!(text_in(&rows, badge), " ⚠ 1 (!) ");
     }
 
     #[test]
@@ -1921,6 +1925,33 @@ mod tests {
         let under = text_in(&rows, badge);
         assert!(under.contains('⚠'), "{under:?}");
         assert!(!under.contains("(!)"), "`!` does nothing here: {under:?}");
+    }
+
+    #[test]
+    fn header_badge_drops_the_key_hint_while_an_overlay_or_approval_owns_the_keyboard() {
+        use crate::ui::services_manager::ServicesManagerState;
+        let mut overlay = state_with_warnings(&["only one"]);
+        overlay.services = Some(ServicesManagerState::default());
+        let mut approval = state_with_warnings(&["only one"]);
+        approval.open_approval(crate::tool_exec::ApprovalIntent {
+            title: "run a command".into(),
+            body: vec!["echo hi".into()],
+            name: "shell".into(),
+            arguments: serde_json::Value::Null,
+        });
+        for (what, mut s) in [
+            ("a manager overlay", overlay),
+            ("a pending approval", approval),
+        ] {
+            let rows = draw_frame(&mut s, 140, 40);
+            let badge = s.last_header_badge.expect("the badge is still counted");
+            let under = text_in(&rows, badge);
+            assert!(under.contains('⚠'), "{what}: {under:?}");
+            assert!(
+                !under.contains("(!)"),
+                "{what}: `!` does nothing here: {under:?}"
+            );
+        }
     }
 
     #[test]

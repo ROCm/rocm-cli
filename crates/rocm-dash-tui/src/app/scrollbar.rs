@@ -124,14 +124,15 @@ pub(crate) fn resolve_mouse(me: MouseEvent, state: &AppState) -> KeyAction {
         {
             return KeyAction::SwitchTab(tab);
         }
-        // Header warning badge: a click acts exactly like `!`, and is gated the
-        // same way, so it cannot close an overlay or discard a pending approval
-        // that the key itself could never reach.
+        // Header warning badge: a click opens the warnings, as `!` does, and is
+        // gated on `global_hotkeys_reachable` like the key. A pending approval or
+        // quit prompt was already swallowed above; this gate is what keeps the
+        // click out of an open modal, a manager overlay and focused chat input.
         if let Some(badge) = state.last_header_badge
             && state.global_hotkeys_reachable()
             && badge.contains((me.column, me.row).into())
         {
-            return KeyAction::ToggleWarnings;
+            return KeyAction::OpenWarnings;
         }
         // Footer legend: a click on a key chip acts exactly like the key press.
         if let Some(chip) = footer_chip_hit(&state.last_footer_chips, me.column, me.row) {
@@ -456,26 +457,20 @@ mod tests {
     fn clicking_the_header_badge_acts_like_the_bang_key() {
         let mut s = st();
         s.last_header_badge = Some(Rect::new(20, 1, 9, 1));
-        assert_eq!(
-            resolve_mouse(click_at(20, 1), &s),
-            KeyAction::ToggleWarnings
-        );
-        assert_eq!(
-            resolve_mouse(click_at(28, 1), &s),
-            KeyAction::ToggleWarnings
-        );
+        assert_eq!(resolve_mouse(click_at(20, 1), &s), KeyAction::OpenWarnings);
+        assert_eq!(resolve_mouse(click_at(28, 1), &s), KeyAction::OpenWarnings);
         // Just outside the badge on either side, and on the row below it.
         for (x, y) in [(19, 1), (29, 1), (22, 2)] {
             assert_ne!(
                 resolve_mouse(click_at(x, y), &s),
-                KeyAction::ToggleWarnings,
+                KeyAction::OpenWarnings,
                 "({x}, {y})"
             );
         }
         s.last_header_badge = None;
         assert_ne!(
             resolve_mouse(click_at(22, 1), &s),
-            KeyAction::ToggleWarnings,
+            KeyAction::OpenWarnings,
             "no badge drawn, nothing to click"
         );
     }
@@ -487,14 +482,16 @@ mod tests {
         own(&mut s);
         assert_ne!(
             resolve_mouse(click_at(22, 1), &s),
-            KeyAction::ToggleWarnings,
+            KeyAction::OpenWarnings,
             "badge click must not fire while {what} owns the screen"
         );
     }
 
-    // Opening the popup runs `close_overlays()`, which would silently discard
-    // whatever owns the screen — a pending approval most of all — so the click
-    // must be refused wherever the `!` key itself would not fire.
+    // The click must be refused wherever the `!` key itself would not fire, or
+    // the popup would open underneath whatever owns the screen. A pending
+    // approval and the quit prompt are already swallowed earlier in
+    // `resolve_mouse`, so those two tests do not exercise the badge gate; the
+    // plain-modal, manager-overlay and chat-input cases are what it exists for.
     #[test]
     fn the_header_badge_is_not_clickable_while_a_plain_modal_is_open() {
         assert_badge_click_blocked_while("a plain modal", |s| s.modal = Modal::Help);

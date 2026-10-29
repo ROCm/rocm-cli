@@ -248,11 +248,7 @@ async fn warning_text_is_displayed(world: &mut E2eWorld) {
 #[then("the warning text is no longer displayed")]
 async fn warning_text_is_gone(world: &mut E2eWorld) {
     session(world)
-        .wait_for_screen_where(
-            "the warning text is gone",
-            |screen| !screen.contains(RECORDED_WARNING),
-            default_timeout(),
-        )
+        .wait_until_gone(RECORDED_WARNING, default_timeout())
         .await
         .unwrap_or_else(|e| panic!("the warnings popup did not close: {e}"));
 }

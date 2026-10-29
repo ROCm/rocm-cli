@@ -650,10 +650,12 @@ Feature: Interactive dashboard
   # them, and while a GPU is reported the text is drawn nowhere else in the
   # dashboard. A recording supplies one warning next to a working GPU so the
   # scenario needs no daemon and no particular host hardware; the user reads
-  # the text from the badge with `!`. The key gating (the popup never opens over
-  # an approval or another overlay) and the click on the badge are asserted by
-  # the unit tests in `crates/rocm-dash-tui/src/app/` and `ui/mod.rs`, where
-  # a mouse event can be sent directly.
+  # the text from the badge with `!`. The click on the badge, and its refusal
+  # over an open modal, a manager overlay or focused chat input, are asserted by
+  # the unit tests in `crates/rocm-dash-tui/src/app/` and `ui/mod.rs`, where a
+  # mouse event can be sent directly. The key needs no such gate: it is only
+  # reached when nothing else owns the keyboard, which is the event loop's
+  # existing arm order and is not re-tested here.
   @id:dash-warning-badge-opens-the-warning @requires-os:linux
   Scenario: dash-38 - A user reads the warning behind the header badge
     When the user opens the dashboard replaying a recording that reports a warning
