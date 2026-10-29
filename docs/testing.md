@@ -1433,8 +1433,8 @@ rotation policy; two further tests go through the public
 `append_automation_event`/`append_audit_event` and
 `load_recent_automation_events`/`load_recent_audit_events` wrappers instead,
 at the real size cap, so the wiring between them and the rotation policy
-itself stays covered. The user-visible side is `automations-06` and
-`automations-07` in
+itself stays covered. The user-visible side is `automations-07` through
+`automations-09` in
 [automations.feature](../tests/e2e-cucumber/features/automations.feature).
 
 Natural-language plan handoff tests:
