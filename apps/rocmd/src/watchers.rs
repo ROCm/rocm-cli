@@ -857,8 +857,8 @@ fn pending_stop_proposal_exists(paths: &AppPaths, service_id: &str) -> Result<bo
 /// Reads the whole proposals store rather than a recent window: a pending
 /// proposal is never dropped, so it can be arbitrarily old, and a window that
 /// missed it would let the watcher queue a duplicate once the original aged
-/// out of that window. Compaction
-/// bounds the reviewed proposals to a fixed count; pending ones are kept.
+/// out of that window. Compaction bounds the reviewed proposals to a fixed
+/// count; pending ones are kept.
 fn pending_restart_proposal_exists(paths: &AppPaths, service_id: &str) -> Result<bool> {
     Ok(rocm_core::load_automation_proposals(paths)?
         .into_iter()

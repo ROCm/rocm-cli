@@ -35,9 +35,9 @@
 //! rewrite compacts it, dropping all but the newest
 //! [`REVIEWED_PROPOSALS_RETAINED`] reviewed proposals.
 //!
-//! `AutomationTriggerEvent` is also defined here, but this
-//! module persists none of it: it is the in-memory trigger type passed
-//! between `rocmd`'s watcher and webhook plumbing (`apps/rocmd/src/watchers.rs`,
+//! `AutomationTriggerEvent` is also defined here, but this module persists
+//! none of it: it is the in-memory trigger type passed between `rocmd`'s
+//! watcher and webhook plumbing (`apps/rocmd/src/watchers.rs`,
 //! `apps/rocmd/src/webhook.rs`), never serialized.
 
 use anyhow::{Context, Result, bail};
@@ -2836,6 +2836,64 @@ mod tests {
         assert_eq!(live?, format!("{}\n{}\n", audit_line("a"), audit_line("b")));
         assert_eq!(first?, audit_line("old") + "\n");
         assert_eq!(recent?, ["old", "a", "b"]);
+        Ok(())
+    }
+
+    // `rotation_failure_warning` is unit-tested on its own; this pins that
+    // `append_jsonl_record` actually prints it, once for a store that keeps
+    // failing to rotate. Run in a child process to read its stderr, which the
+    // test harness would otherwise swallow.
+    #[test]
+    fn a_failed_rotation_prints_its_warning_once_to_stderr() -> Result<()> {
+        const WARNING_CHILD_ENV: &str = "ROCM_CORE_TEST_ROTATION_WARNING_CHILD";
+
+        if let Some(path) = std::env::var_os(WARNING_CHILD_ENV) {
+            let rotation = JsonlRotation {
+                max_bytes: 1,
+                generations: 2,
+            };
+            append_rotating(Path::new(&path), "b", rotation)?;
+            append_rotating(Path::new(&path), "c", rotation)?;
+            return Ok(());
+        }
+
+        let (root, paths) = temp_app_paths("rotation-warning");
+        paths.ensure()?;
+        let path = paths.audit_events_path();
+        fs::write(&path, audit_line("a") + "\n")?;
+        fs::write(jsonl_generation_path(&path, 1), audit_line("old") + "\n")?;
+        // `.1` cannot be renamed over a non-empty directory.
+        let blocker = jsonl_generation_path(&path, 2);
+        fs::create_dir_all(&blocker)?;
+        fs::write(blocker.join("keep"), "x")?;
+        let exe = std::env::current_exe().context("current test executable")?;
+        let output = std::process::Command::new(&exe)
+            .args([
+                "automation::tests::a_failed_rotation_prints_its_warning_once_to_stderr",
+                "--exact",
+                "--quiet",
+                "--nocapture",
+            ])
+            .env(WARNING_CHILD_ENV, &path)
+            .output()
+            .context("spawn rotation-warning child")?;
+        fs::remove_dir_all(root).ok();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "child process failed: {:?}\nstdout: {}\nstderr: {stderr}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+        );
+        assert_eq!(
+            stderr.matches("warning: failed to rotate").count(),
+            1,
+            "two appends to a store stuck at its cap must print one warning: {stderr}"
+        );
+        assert!(
+            stderr.contains("events.jsonl"),
+            "the warning names the store: {stderr}"
+        );
         Ok(())
     }
 

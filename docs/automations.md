@@ -86,6 +86,17 @@ the exact `/automations approve <id>` and `/automations reject <id>` controls.
 Raw backend action and restricted-tool names are kept out of this overview so
 the user-facing history stays readable.
 
+In `propose` mode, while a restart request for a managed server is still
+awaiting review, `server-recover` does not queue another one for that server.
+It records a
+`restart_proposal_already_pending` event instead, so a server that stays
+unhealthy shows one pending request rather than a new one on every recovery
+check. If the review requests cannot be read (for example the file is
+corrupt), `server-recover` records a `restart_proposal_check_failed` error
+event and queues no restart for that server until they can be read again: it
+cannot tell whether one is already pending, and the failure is reported rather
+than raised so the `rocmd` daemon keeps running.
+
 For `cache-warm`, the webhook accepts exactly `cache.warm` and can only request
 a reviewed prefetch request for an artifact ref already present in the model
 recipe registry:
