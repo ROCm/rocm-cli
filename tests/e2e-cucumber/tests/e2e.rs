@@ -731,7 +731,7 @@ fn stop_managed_services(root: &std::path::Path) -> String {
             Ok(out) => format!(
                 "{service_id}: STOP FAILED (rc={}) {}",
                 out.status.code().unwrap_or(-1),
-                last_line(&String::from_utf8_lossy(&out.stderr))
+                stop_failure_summary(&String::from_utf8_lossy(&out.stderr))
             ),
             Err(error) => format!("{service_id}: STOP NOT RUN ({error})"),
         });
@@ -740,6 +740,17 @@ fn stop_managed_services(root: &std::path::Path) -> String {
         return format!("no services recorded in {}", services_dir.display());
     }
     outcomes.join("; ")
+}
+
+/// One line summing up a failed `rocm services stop`: its `Error:` line, which
+/// is the report's header (`Local server stop not confirmed`) for an
+/// unconfirmed stop, rather than the report's last detail line; otherwise the
+/// last non-blank line.
+fn stop_failure_summary(stderr: &str) -> String {
+    stderr
+        .lines()
+        .find(|line| line.starts_with("Error:"))
+        .map_or_else(|| last_line(stderr), last_line)
 }
 
 /// The last non-blank line of `text`, clipped, for a one-line failure summary.

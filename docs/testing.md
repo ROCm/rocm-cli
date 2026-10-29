@@ -974,9 +974,10 @@ otherwise the CLI would lock itself out of a service that is still running and
 still enforcing the key — and the deferred cleanup lands on the liveness refresh
 that later observes the process dead. `service-stop-01`
 (`features/service_stop.feature`) covers `services stop` succeeding against a
-running record on the mock lane and the record being persisted as stopped;
-there is still no e2e coverage of the key being dropped or `services restart`,
-which remain unit-tested only. Reusing a running service for a
+running record on the mock lane and the record being persisted as stopped, and
+`service-stop-02` covers the key being dropped once the daemon's `stop_server`
+confirms a stop. There is still no e2e coverage of `services restart`, which
+remains unit-tested only. Reusing a running service for a
 `--require-api-key` request it never had is refused rather than silently
 upgraded — `serve-24` (`features/model_serving.feature`, Lemonade GPU lane,
 Linux-only since the Windows managed Lemonade spawn can't enforce the key)
@@ -1160,7 +1161,39 @@ bubblewrap isolation must still execute only this internal tool API and record
 a sandbox audit event. `stop_server` — the sandbox tool and the MCP tool alike —
 reports a stop only once every recorded process is confirmed gone: otherwise
 the sandbox tool reports `status: stop_unconfirmed`, the MCP tool answers with
-`isError: true`, and the manifest keeps its PIDs and endpoint key. The stop
+`isError: true`, and the manifest keeps its PIDs and any endpoint key. `rocm
+services stop --yes` takes the same verdict from its own stop: it prints `Local
+server stop not confirmed` on stderr instead of `Local server stopped`, and
+exits non-zero. Its lines follow each recorded PID's outcome (`pid_outcomes`,
+as in `rocmd`): a `timed_out` process, or one under it, did not exit; an
+`unverified` one is not signaled and gets an OS command to check on it. Like
+`rocmd`'s MCP answer it names no command to run the stop again, because
+`terminate_verified` reports a dead recorded process as `already_gone` without
+looking at the tree under it, so a second stop could confirm while a process
+under it still runs. When the stop answers unconfirmed, the attached `rocm serve`
+Ctrl-C stop prints the same report on stderr, signals nothing further, exits
+with an error and records an `error` audit event; when the stop itself fails,
+it notes the stop's error on stderr, signals the child the session launched
+directly, exits 0, and records whether that signal worked, adding a second
+stderr `note:` when it did not (`cargo test -p rocm --bin rocm services_stop_` and
+`cargo test -p rocm --bin rocm attached_ctrl_c_`).
+
+No scenario drives the attached Ctrl-C stop end to end. Attaching needs a real
+`rocm serve` launch — an engine and a runtime the mock lane does not have,
+which is why the chat scenarios there plant a record behind a mock server
+instead — and the GPU lanes, which can launch one, cannot be run from here to
+prove such a scenario. `attached_ctrl_c_` covers everything after the stop
+answers: the stream each report goes to, the exit, the signal and the audit
+event.
+
+In `rocm sandbox-run stop_server`'s answer the authoritative fields are
+`output.status` (`stopped` or `stop_unconfirmed`) and `output.result.stopped`.
+`output.result.status` is the server record's own status, which can already
+read `stopped` (the liveness refresh reconciles a record whose PID it sees
+gone) beside `stopped: false`. `rocmd sandbox-tool stop_server` answers with the
+same top-level `status` and `result.stopped`, and carries the record under
+`result.service`. Both commands exit 0 with `stop_unconfirmed`, leaving the
+verdict to the JSON; `rocm services stop` exits 1. The stop
 records the request in the manifest before it signals anything, and applies its
 result to the manifest as it is once the stop ends, so a write made meanwhile is
 kept — and a restart that recorded new processes meanwhile makes the stop
@@ -1172,6 +1205,18 @@ process and checks the confirmed report against the process, the record and
 the endpoint key file. Run it with
 `ROCM_CLI_BINARY=target/debug/rocm ROCM_CLI_ROCMD_BINARY=target/debug/rocmd
 cargo test -p e2e-cucumber --test e2e -- -n "service-stop-02"`.
+`service-stop-03`, `-04` and `-05` (Linux, mock lane) cover `rocm services
+stop`'s unconfirmed half through the `e2e-test-hooks` seam
+`ROCM_E2E_STOP_OUTCOME` (`timed_out` or `unverified`), which makes the verified
+stop report that outcome for the recorded process without signalling it: each
+checks the report on stderr, exit 1, the kept PID and stop request, and that no
+stop command is named. -03 and -04 plant an endpoint key and check that the
+`kept:` line names it and the key file is still there; -05 plants none and
+checks that the line omits it and no key file exists. Because the seam
+replaces `terminate_verified`, they say nothing about what is signalled. They need
+a hooks build, as `cargo xtask e2e` makes: `cargo build -p rocm -p rocmd
+--features rocm/e2e-test-hooks`, then the command above with `-n
+"service-stop"`.
 
 Manual restricted-tool smoke:
 
