@@ -7,9 +7,11 @@
 //! summary.
 //!
 //! Mechanically relocated from `main.rs` with no behavior change — the
-//! `dispatch()` call site stays `automations(command)` (re-imported via
-//! `use crate::automations::automations;`). As of Phase 6f (ROCMAI-210, see
-//! `docs/architecture.md`) this module also owns the rendering/classification
+//! `dispatch()` call site stays `automations(command)`, re-imported with
+//! `render_daemon_text` via
+//! `use crate::automations::{automations, render_daemon_text};`. As of
+//! Phase 6f (ROCMAI-210, see `docs/architecture.md`) this module also owns the
+//! rendering/classification
 //! helpers behind `render_automations_text` (the `rocm automations` status
 //! report: watcher status/policy lines, recent automation activity, and
 //! plain-language proposal/audit summaries) and `render_daemon_text` (the
@@ -26,8 +28,7 @@
 //! `watcher_plain_trigger`, `watcher_plain_action`, `watcher_policy_note`),
 //! and `render_daemon_text`. `render_automations_text` and
 //! `render_daemon_text` are `pub(crate)`: `main.rs`'s `dispatch()` calls
-//! `render_daemon_text` directly (re-imported via
-//! `use crate::automations::render_daemon_text;`), and `chat.rs`'s
+//! `render_daemon_text` directly (via the re-import above), and `chat.rs`'s
 //! deterministic tool summaries call both. Everything else here has no
 //! caller outside this module (including `watcher_policy_note`, now that the
 //! `automations()` handler above reaches it locally rather than through a
