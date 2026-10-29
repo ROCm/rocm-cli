@@ -530,7 +530,10 @@ rocm model --verbose"
     /// server runs as a managed background service and prints a deployment summary
     /// (status, endpoint, model, and smoke-test metrics); use --verbose to stream engine
     /// logs in this terminal instead. When streaming, press Ctrl-D to detach and leave the
-    /// server running, or Ctrl-C to stop it. Inspect or stop servers later with
+    /// server running, or Ctrl-C to stop it. If that stop answers that it could not confirm
+    /// the server exited, it says so on stderr and exits with an error; if the stop itself
+    /// fails, it says why on stderr, signals the server process directly and exits 0,
+    /// noting on stderr if that signal fails too. Inspect or stop servers later with
     /// `rocm services`.
     ///
     /// Under --device gpu_required (the default) this command refuses on a host with no
@@ -1172,6 +1175,14 @@ enum ServicesCommand {
         service_id: String,
     },
     /// Stop a local model server.
+    ///
+    /// Reports the server stopped only once every process it recorded is
+    /// confirmed gone. Otherwise it reports on stderr that the stop was not
+    /// confirmed and exits with an error, keeping the record, which still names
+    /// the processes, and any endpoint key, which the server may still be
+    /// enforcing. It names each process that did not exit, and for one it could
+    /// not verify it signals nothing and names an operating-system command to
+    /// check on it. It does not suggest running the stop again.
     Stop {
         /// Service id from `rocm services list`.
         service_id: String,

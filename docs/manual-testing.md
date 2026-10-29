@@ -317,8 +317,11 @@ While the log stream is attached, verify detach and stop behave differently:
   "detached - server still running" note with the service id. Confirm the server
   is still up: `rocm services` lists it and the endpoint still answers a chat
   request. Stop it afterward with `rocm services stop <service-id> --yes`.
-- Re-run the serve command and press `Ctrl+C` instead. The server shuts down and
-  `rocm services` no longer lists it as running.
+- Re-run the serve command and press `Ctrl+C` instead. The server shuts down,
+  the command prints `Local server stopped` and exits 0, and `rocm services` no
+  longer lists it as running. (A stop that cannot confirm the process exited
+  prints `Local server stop not confirmed` on stderr and exits non-zero
+  instead.)
 
 ### Windows display driver check
 
@@ -391,6 +394,13 @@ Expected result:
 rocm services stop <service-id> --yes
 rocm services restart <service-id> --yes
 ```
+
+`stop` prints `Local server stopped` only once every recorded process is
+confirmed gone; otherwise it prints `Local server stop not confirmed` on stderr,
+keeps the record and any endpoint key, and exits non-zero. It names each
+process that, or a process under it, did not exit, and for one it could not
+verify, an operating-system command to check on it. It never prints a `retry:`
+line.
 
 `restart` starts the server again only once its stop has confirmed every
 recorded process gone; otherwise it reports that and starts nothing.
