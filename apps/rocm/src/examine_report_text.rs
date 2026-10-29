@@ -698,6 +698,14 @@ pub(crate) fn render_model_registry_verbose_text_with_context_and_host(
         for warning in &recipe.warnings {
             let _ = writeln!(output, "      warning: {warning}");
         }
+        for engine_recipe in &recipe.engine_recipes {
+            if let Some(warning) = rocm_core::model_recipe_staleness_warning(
+                engine_recipe,
+                rocm_core::unix_time_millis(),
+            ) {
+                let _ = writeln!(output, "      warning: {warning}");
+            }
+        }
     }
     append_model_recipe_registry_source(&mut output, &registry);
     output
@@ -2026,6 +2034,7 @@ mod tests {
             notes: vec!["metadata only; not applied to launches yet".to_owned()],
             model_id_override: None,
             image_digest: None,
+            generated_at_unix_ms: None,
             extra_env: BTreeMap::new(),
         }];
         let mut output = String::new();

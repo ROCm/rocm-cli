@@ -1281,6 +1281,7 @@ mod tests {
                 notes: vec!["adapter hint".to_owned()],
                 model_id_override: None,
                 image_digest: None,
+                generated_at_unix_ms: None,
                 extra_env: BTreeMap::new(),
             },
             rocm_core::ModelRecipeEngineRecord {
@@ -1292,6 +1293,7 @@ mod tests {
                 notes: Vec::new(),
                 model_id_override: None,
                 image_digest: None,
+                generated_at_unix_ms: None,
                 extra_env: BTreeMap::new(),
             },
         ];

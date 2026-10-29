@@ -92,6 +92,31 @@ pub struct ModelRecipeEngineRecord {
     /// (currently `aim`); catalog validation rejects it elsewhere.
     #[serde(default)]
     pub image_digest: Option<String>,
+    /// When a maintainer last checked this entry against the upstream image
+    /// registry (unix ms). `rocm model` warns once it is older than
+    /// [`MODEL_RECIPE_STALE_AFTER_MS`], since the pinned image may be gone.
+    #[serde(default)]
+    pub generated_at_unix_ms: Option<u128>,
+}
+
+/// How long an engine recipe's `generated_at_unix_ms` stays trusted (180 days).
+pub const MODEL_RECIPE_STALE_AFTER_MS: u128 = 180 * 24 * 60 * 60 * 1000;
+
+/// Returns a warning when `engine_recipe` was last verified more than
+/// [`MODEL_RECIPE_STALE_AFTER_MS`] before `now_ms`. Entries without a
+/// timestamp are never flagged.
+pub fn model_recipe_staleness_warning(
+    engine_recipe: &ModelRecipeEngineRecord,
+    now_ms: u128,
+) -> Option<String> {
+    let age_ms = now_ms.checked_sub(engine_recipe.generated_at_unix_ms?)?;
+    (age_ms > MODEL_RECIPE_STALE_AFTER_MS).then(|| {
+        format!(
+            "{} entry was last verified {} days ago; the pinned image may no longer exist (see docs/aim-catalog.md to refresh)",
+            engine_recipe.engine,
+            age_ms / (24 * 60 * 60 * 1000)
+        )
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
@@ -951,6 +976,38 @@ mod tests {
     }
 
     #[test]
+    fn staleness_warning_fires_only_past_the_threshold() {
+        let mut aim = ModelRecipeEngineRecord {
+            engine: "aim".to_owned(),
+            ..Default::default()
+        };
+        let now = 10 * MODEL_RECIPE_STALE_AFTER_MS;
+        assert_eq!(model_recipe_staleness_warning(&aim, now), None);
+        aim.generated_at_unix_ms = Some(now - MODEL_RECIPE_STALE_AFTER_MS);
+        assert_eq!(model_recipe_staleness_warning(&aim, now), None);
+        aim.generated_at_unix_ms = Some(now - MODEL_RECIPE_STALE_AFTER_MS - 1);
+        assert!(
+            model_recipe_staleness_warning(&aim, now)
+                .expect("stale entry warns")
+                .contains("180 days ago")
+        );
+        // A timestamp in the future (clock skew) is not stale.
+        aim.generated_at_unix_ms = Some(now + 1);
+        assert_eq!(model_recipe_staleness_warning(&aim, now), None);
+    }
+
+    #[test]
+    fn builtin_aim_recipe_carries_a_verification_timestamp() {
+        let recipe = resolve_builtin_model_recipe("aim-qwen3.5-9b").expect("aim recipe");
+        let aim = recipe
+            .engine_recipes
+            .iter()
+            .find(|e| e.engine == "aim")
+            .expect("aim engine");
+        assert!(aim.generated_at_unix_ms.is_some());
+    }
+
+    #[test]
     fn builtin_recipe_records_remote_code_policy() {
         let glm = resolve_builtin_model_recipe("glm-5").expect("glm alias should resolve");
         assert!(glm.trust_remote_code);
@@ -976,6 +1033,7 @@ mod tests {
                 notes: Vec::new(),
                 model_id_override: None,
                 image_digest: Some(digest.to_owned()),
+                generated_at_unix_ms: None,
             });
             ModelRecipeIndexDocument {
                 schema_version: 1,
@@ -1029,6 +1087,7 @@ mod tests {
             notes: vec!["metadata only; adapter protocol does not consume this yet".to_owned()],
             model_id_override: None,
             image_digest: None,
+            generated_at_unix_ms: None,
         });
         let index = ModelRecipeIndexDocument {
             schema_version: 1,
