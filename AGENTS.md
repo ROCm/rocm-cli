@@ -204,10 +204,10 @@ Keep docs and behavior claims in sync while editing:
   docs/manual-testing.md in the same change — do not leave user-facing docs
   for a follow-up
 - the same behavior claim (e.g. "does X automatically") often repeats across
-  README.md, --help doc comments, printed CLI output, and docs/*.md; each
-  drifts independently, so grep for the claim's wording across all of them,
-  not just the surface you're editing, and check each against the actual
-  code path
+  README.md, --help doc comments, printed CLI output, status-bar text, docs/*.md,
+  and the PR body; each drifts independently, so grep for the claim's wording
+  across all of them, not just the surface you're editing, and check each
+  against the actual code path
 - cite a specific repo file in markdown as a link relative to the citing
   file — `[fix.rs](../crates/rocm-core/src/fix.rs)` from `docs/` — not as a
   bare backtick path: the `docs-links` CI job and the `lychee` prek hook
@@ -228,8 +228,7 @@ Keep docs and behavior claims in sync while editing:
   (published or embedded elsewhere, §7). This covers citations you add or
   edit, not converting existing bare paths in an unrelated change
 - when a statement such as "X is not supported" or "there is no Y" becomes false,
-  grep README.md, `docs/`, doc comments, status-bar and help text, and the PR body for
-  the old claim before pushing, and check every hit against the code
+  grep the same surfaces for the old claim before pushing
 - write the PR body from the final diff, not the first commit, and re-read it after
   every review-fix commit: it lists every user-visible change (including ones on other
   platforms), names the lane that exercises the new behavior, and states the reason when
@@ -274,18 +273,23 @@ Guardrails:
   - if a test fails only on unsupported platforms (e.g., macOS), skip or mark as out of scope; do not alter logic to make it pass
   - add a comment documenting why the test is skipped (e.g., `#[cfg_attr(not(target_os = "linux"), ignore)]`)
 - subprocess and FFI code, checked before pushing:
-  - spawned children set `kill_on_drop(true)`, so a `timeout` that fires does not leak them
+  - a `tokio::process` child awaited under a `timeout` sets `kill_on_drop(true)`, so a
+    timeout that fires does not leak it; children deliberately detached to outlive the
+    CLI (`detach_background_command`) are exempt
   - blocking FFI runs under `spawn_blocking`, never on an async worker; a `timeout`
     around `spawn_blocking` drops only the join handle, so the thread still leaks:
     give the blocking call its own deadline or cancellation flag instead
   - DLLs load by absolute path, not by bare name
-  - never pair two independently ordered lists by index; correlate by id, or degrade
-    to "unknown" when no id exists, and never to a guess on multi-adapter and phantom
-    adapter hosts (a test covers those cases)
+  - do not pair two independently ordered lists by index when they share an id;
+    correlate by id. Where no id exists, positional pairing is allowed only as the last
+    resort after every stronger identifier (device id, name) has been tried, as
+    `fill_unidentified_gpus_from_hipinfo` in [examine.rs](crates/rocm-core/src/examine.rs) does;
+    otherwise degrade to "unknown", never to a guess on multi-adapter hosts
   - check the documented width and range of every WMI or Win32 field before trusting
     it (a 32-bit field saturates at 4 GiB)
   - choose a ticker's `MissedTickBehavior` deliberately (`rocmd` uses `Delay`, the dash
-    daemon `Skip`), and a slow source does not block the fast ones sharing its tick
+    daemon `Skip`), and do not let a slow source block the fast ones sharing its tick
+    (the dash daemon's tick polls its sources serially and does not do this yet)
 
 ## 7) Local Assistant And Tool-Use Policy Consistency
 
@@ -438,9 +442,7 @@ Watch checks to completion and drive to all-green.
 
 A red check means "not ready" until resolved.
 
-After each review-fix commit, rerun the §8 gate locally (workspace tests
-including `feature_naming`, `cargo clippy --workspace --all-targets -- -D warnings`,
-and `python scripts/smoke_local.py`) and self-review against §3 to §6 before pushing. Round-trips spent on a scenario number out
+After each review-fix commit, rerun the §8 gate locally and self-review against §3 to §6 before pushing. Round-trips spent on a scenario number out
 of sequence or a clippy lint cost more than running them first.
 
 ## 13) Upstream Pre-flight Checklist
