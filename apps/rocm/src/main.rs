@@ -75,8 +75,8 @@ mod update_cmd;
 // stay re-imported here for the same reason. `select_runtime_manifest` is no
 // longer needed here: `single_ready_runtime_key`/
 // `resolve_runtime_selector_to_exact_key` moved out to
-// `engine_runtime_select.rs` in ROCMAI-215 (Phase 6f), reaching it via their
-// own `use crate::runtimes_cmd::select_runtime_manifest;` instead.
+// `engine_runtime_select.rs` in ROCMAI-215 (Phase 6f), reaching it via that
+// module's own grouped `use crate::runtimes_cmd::{...}` import instead.
 // `update_cmd.rs`'s `apply_runtime_update`/`append_update_activate_summary`
 // call into `runtimes_cmd` directly too, via their own imports rather than
 // this re-export.
