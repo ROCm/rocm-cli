@@ -128,16 +128,18 @@ At the time of writing:
 
 ## Changing what is graded
 
-This repository is the source of truth for the skill, so a change to how it is graded
-is ours to propose, as a pull request to `amd/skills`:
+This repository owns the skill and its dataset, and a change to either is made here. It
+does not own the workflows in `amd/skills` that grade them, which belong to that
+repository's maintainers. So each of these is a request to them, or a pull request they
+review and may decline:
 
 - **Routing.** Add `rocm-doctor` to `routing_room` in `evals.yml`. That workflow lists
   the room by hand because adding a name moves every other skill's routing number, so
-  the pull request should say that plainly.
-- **A spread.** Dispatch the `evals` workflow several times at one commit with
+  the request should say that plainly.
+- **A spread.** Run the `evals` workflow several times at one commit with
   `mode: behavioral` and `skills: rocm-doctor`, changing nothing between runs, and
   record the observed spread of the case rate and of the routing accuracy beside the
-  figures.
+  figures. Dispatching it takes permission on that repository.
 - **A kept series.** Have the report uploaded as an artifact, or collected from the
   run, so two runs from different dates can be compared without reconstructing them.
 
