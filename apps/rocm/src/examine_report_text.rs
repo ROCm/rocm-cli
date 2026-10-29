@@ -559,14 +559,7 @@ pub(crate) fn render_model_registry_text_with_context_and_host(
     for platform in &platforms {
         let mut group = visible
             .iter()
-            .filter(|recipe| {
-                recipe.preferred_engines.first().is_some_and(|engine| {
-                    platform
-                        .engines
-                        .iter()
-                        .any(|e| e.eq_ignore_ascii_case(engine))
-                })
-            })
+            .filter(|recipe| rocm_core::model_recipe_targets_platform(recipe, platform))
             .peekable();
         if group.peek().is_none() {
             continue;
@@ -806,6 +799,15 @@ fn append_model_engine_recipe_settings_lines(output: &mut String, recipe: &Model
                 .join("; ")
         };
         let notes = format_list_or_none(&engine_recipe.notes);
+        if !engine_recipe.supported_gfx_families.is_empty() {
+            let _ = writeln!(
+                output,
+                "      engine_recipe {} supported_gfx_families=[{}] profile_ids=[{}]",
+                engine_recipe.engine,
+                engine_recipe.supported_gfx_families.join(","),
+                format_string_map_or_none(&engine_recipe.profile_ids)
+            );
+        }
         let _ = writeln!(
             output,
             "      engine_recipe {} required_flags=[{}] parser_settings=[{}] preferred_endpoint={} unsupported_combinations=[{}] notes=[{}]",
@@ -1893,7 +1895,7 @@ mod tests {
         assert!(rendered.contains("Recommended models - run one with `rocm serve <model>`"));
         // Featured current models are grouped under their hardware target, each
         // with the quant that fits a single GPU.
-        assert!(rendered.contains("AMD Ryzen AI - Strix Halo (Lemonade / llama.cpp / AIM)"));
+        assert!(rendered.contains("AMD Ryzen AI - Strix Halo (Lemonade / llama.cpp)"));
         assert!(rendered.contains("AMD Instinct - MI300X, MI350X, MI355X (vLLM / AIM)"));
         // Strix Halo GGUF entries carry the servable owner/repo:variant ref.
         assert!(rendered.contains("unsloth/Qwen3.6-35B-A3B-GGUF:Q4_K_M"));
@@ -2035,6 +2037,8 @@ mod tests {
             model_id_override: None,
             image_digest: None,
             generated_at_unix_ms: None,
+            supported_gfx_families: Vec::new(),
+            profile_ids: BTreeMap::new(),
             extra_env: BTreeMap::new(),
         }];
         let mut output = String::new();

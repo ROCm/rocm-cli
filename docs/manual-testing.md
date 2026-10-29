@@ -862,8 +862,10 @@ the engine's default 5-minute readiness wait. Raise it with
 environment of `rocm serve`. Stopping or failing a start removes the container
 and its downloaded weights, so a retry downloads them again.
 
-`aim-qwen3.5-9b` is the catalog entry (`rocm model --verbose`). It supplies the
-pinned image and `AIM_PROFILE_ID`; to serve a raw image reference instead, pass
+`aim-qwen3.5-9b` (canonical id `Qwen/Qwen3.5-9B`) is the catalog entry
+(`rocm model --verbose`). It supplies the pinned image and, for the detected GPU
+family, `AIM_PROFILE_ID`; on a GPU the image has no profile for (for example
+Strix Halo or an Instinct card) `rocm serve` refuses with the supported families. To serve a raw image reference instead, pass
 the profile yourself:
 
 ```bash

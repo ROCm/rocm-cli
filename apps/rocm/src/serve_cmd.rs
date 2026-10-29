@@ -32,8 +32,9 @@ use std::fmt::Write as _;
 
 use anyhow::{Result, bail};
 use rocm_core::{
-    AppPaths, ModelRecipeRecord, RocmCliConfig, default_engine_for_platform,
-    detect_host_gpu_summary, generate_service_id, preferred_serve_engine_for_host_gpu_summary,
+    AppPaths, GfxSupport, ModelRecipeRecord, RocmCliConfig, default_engine_for_platform,
+    detect_host_gfx_target, detect_host_gpu_summary, engine_recipe_gfx_support,
+    generate_service_id, normalize_therock_family, preferred_serve_engine_for_host_gpu_summary,
     resolve_model_recipe,
 };
 use rocm_engine_protocol::{
@@ -178,6 +179,50 @@ fn render_serve_engine_recipe_lines(engine_recipe: &EngineRecipeHint) -> String 
         );
     }
     output
+}
+
+/// For AIM, refuses a GPU the catalog has no profile for and pins the catalog's
+/// `AIM_PROFILE_ID` for the detected GPU family. `host_family` is a normalized
+/// TheRock family, `None` when it could not be detected (nothing is enforced
+/// then). Runs before `--engine-env`, so an explicit override still wins.
+fn engine_recipe_with_aim_gfx_profile(
+    engine: &str,
+    recipe: Option<&ModelRecipeRecord>,
+    hint: Option<EngineRecipeHint>,
+    host_family: impl FnOnce() -> Option<String>,
+) -> Result<Option<EngineRecipeHint>> {
+    let Some(aim) = recipe
+        .filter(|_| engine.eq_ignore_ascii_case("aim"))
+        .and_then(|recipe| {
+            recipe
+                .engine_recipes
+                .iter()
+                .find(|record| record.engine.eq_ignore_ascii_case("aim"))
+                .map(|record| (recipe, record))
+        })
+        .filter(|(_, record)| !record.supported_gfx_families.is_empty())
+    else {
+        return Ok(hint);
+    };
+    let (recipe, record) = aim;
+    let family = host_family();
+    match engine_recipe_gfx_support(record, family.as_deref()) {
+        GfxSupport::Unrestricted => Ok(hint),
+        GfxSupport::Unsupported => bail!(
+            "the AIM image for `{}` has no profile for this GPU ({}); it supports: {}",
+            recipe.canonical_model_id,
+            family.as_deref().unwrap_or("unknown"),
+            record.supported_gfx_families.join(", ")
+        ),
+        GfxSupport::Supported(profile) => Ok(match (hint, profile) {
+            (Some(mut hint), Some(profile)) => {
+                hint.extra_env
+                    .insert("AIM_PROFILE_ID".to_owned(), profile.to_owned());
+                Some(hint)
+            }
+            (hint, _) => hint,
+        }),
+    }
 }
 
 fn protocol_engine_recipe_hint(
@@ -655,6 +700,16 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
         .as_ref()
         .filter(|recipe| model_recipe_supports_engine(recipe, &selected_engine))
         .and_then(|recipe| protocol_engine_recipe_hint(recipe, &selected_engine));
+    let recipe_hint = engine_recipe_with_aim_gfx_profile(
+        &selected_engine,
+        shared_recipe.as_ref(),
+        recipe_hint,
+        || {
+            detect_host_gfx_target()
+                .as_deref()
+                .and_then(normalize_therock_family)
+        },
+    )?;
     // vLLM rejects the TUI chat tab's tool-bearing requests with HTTP 400 unless it
     // is launched with `--enable-auto-tool-choice`/`--tool-call-parser`. The parser
     // is model-specific and vLLM does not auto-detect it, so it is never guessed: it
@@ -1172,17 +1227,32 @@ mod tests {
     }
 
     #[test]
-    fn catalog_extra_env_reaches_the_aim_hint_and_engine_env_overrides_it() {
+    fn catalog_profile_pin_reaches_the_aim_hint_and_engine_env_overrides_it() {
         let recipe = resolve_builtin_model_recipe("aim-qwen3.5-9b").expect("aim catalog entry");
-        let hint = protocol_engine_recipe_hint(&recipe, "aim").expect("aim hint");
+        let hint = protocol_engine_recipe_hint(&recipe, "aim");
+        let pinned = |family: &'static str| {
+            engine_recipe_with_aim_gfx_profile("aim", Some(&recipe), hint.clone(), || {
+                Some(family.to_owned())
+            })
+            .unwrap()
+            .unwrap()
+        };
+        let w7900 = pinned("gfx110X-all");
         assert_eq!(
-            hint.extra_env.get("AIM_PROFILE_ID").map(String::as_str),
+            w7900.extra_env.get("AIM_PROFILE_ID").map(String::as_str),
             Some("vllm-w7900-bf16-tp1-latency")
+        );
+        assert_eq!(
+            pinned("gfx120X-all")
+                .extra_env
+                .get("AIM_PROFILE_ID")
+                .map(String::as_str),
+            Some("vllm-r9700-bf16-tp1-latency")
         );
 
         let overridden = engine_recipe_with_extra_env(
             "aim",
-            Some(hint),
+            Some(w7900),
             &[
                 "AIM_PROFILE_ID=vllm-other".to_owned(),
                 "HF_TOKEN".to_owned(),
@@ -1199,6 +1269,64 @@ mod tests {
             "`--engine-env` must beat the catalog's value"
         );
         assert_eq!(overridden.extra_env.get("HF_TOKEN"), Some(&String::new()));
+    }
+
+    #[test]
+    fn aim_serve_refuses_a_gpu_the_image_has_no_profile_for() {
+        let radeon = resolve_builtin_model_recipe("aim-qwen3.5-9b").expect("radeon aim entry");
+        let hint = protocol_engine_recipe_hint(&radeon, "aim");
+        let err = engine_recipe_with_aim_gfx_profile("aim", Some(&radeon), hint, || {
+            Some("gfx94X-dcgpu".to_owned())
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("no profile for this GPU (gfx94X-dcgpu)"),
+            "{err}"
+        );
+        assert!(err.contains("gfx110X-all, gfx120X-all"), "{err}");
+
+        // Strix Halo has no AIM profile either.
+        let hint = protocol_engine_recipe_hint(&radeon, "aim");
+        assert!(
+            engine_recipe_with_aim_gfx_profile("aim", Some(&radeon), hint, || Some(
+                "gfx1151".to_owned()
+            ))
+            .is_err()
+        );
+
+        // Instinct images serve on Instinct without pinning a profile (AIM
+        // auto-selects), and are refused on a Radeon.
+        let instinct = resolve_builtin_model_recipe("Qwen/Qwen3-32B").expect("instinct aim entry");
+        let hint = protocol_engine_recipe_hint(&instinct, "aim");
+        let served =
+            engine_recipe_with_aim_gfx_profile("aim", Some(&instinct), hint.clone(), || {
+                Some("gfx94X-dcgpu".to_owned())
+            })
+            .unwrap()
+            .unwrap();
+        assert!(!served.extra_env.contains_key("AIM_PROFILE_ID"));
+        assert!(
+            engine_recipe_with_aim_gfx_profile("aim", Some(&instinct), hint, || Some(
+                "gfx110X-all".to_owned()
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn aim_gfx_check_is_skipped_when_the_gpu_is_unknown_or_the_engine_is_not_aim() {
+        let radeon = resolve_builtin_model_recipe("aim-qwen3.5-9b").expect("radeon aim entry");
+        let hint = protocol_engine_recipe_hint(&radeon, "aim");
+        let unchanged =
+            engine_recipe_with_aim_gfx_profile("aim", Some(&radeon), hint.clone(), || None)
+                .unwrap();
+        assert_eq!(unchanged, hint);
+        let vllm = engine_recipe_with_aim_gfx_profile("vllm", Some(&radeon), None, || {
+            panic!("host GPU must not be probed for other engines")
+        })
+        .unwrap();
+        assert!(vllm.is_none());
     }
 
     #[test]
@@ -1282,6 +1410,8 @@ mod tests {
                 model_id_override: None,
                 image_digest: None,
                 generated_at_unix_ms: None,
+                supported_gfx_families: Vec::new(),
+                profile_ids: BTreeMap::new(),
                 extra_env: BTreeMap::new(),
             },
             rocm_core::ModelRecipeEngineRecord {
@@ -1294,6 +1424,8 @@ mod tests {
                 model_id_override: None,
                 image_digest: None,
                 generated_at_unix_ms: None,
+                supported_gfx_families: Vec::new(),
+                profile_ids: BTreeMap::new(),
                 extra_env: BTreeMap::new(),
             },
         ];
