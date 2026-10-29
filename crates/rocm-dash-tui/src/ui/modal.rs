@@ -264,10 +264,11 @@ fn warning_lines<'a>(warning: &'a str, theme: &Theme) -> Vec<Line<'a>> {
     out
 }
 
-/// Render the Warnings modal: the warnings the daemon currently reports, the
-/// text behind the header `⚠ N` badge. A multi-line one longer than
-/// [`WARNING_MAX_LINES`] + 1 lines is cut to [`WARNING_MAX_LINES`] lines of text
-/// with a count of the rest.
+/// Render the Warnings modal: the text behind the header `⚠ N` badge.
+///
+/// It lists the warnings the daemon currently reports. A multi-line one longer
+/// than [`WARNING_MAX_LINES`] + 1 lines is cut to [`WARNING_MAX_LINES`] lines of
+/// text with a count of the rest.
 ///
 /// Content-sized like [`draw_help`] — the warnings are few and short-lived, so
 /// the popup is sized to them rather than growing a scroll position of its own.
