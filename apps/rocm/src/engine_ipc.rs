@@ -48,9 +48,11 @@
 //! module and stay private. Shared helpers this module calls back into at the
 //! crate root — `apply_app_path_env`, `app_path_env_vars`,
 //! `with_sigpipe_ignored`, `optional_arg`, `engine_recipe_json_arg`,
-//! `device_policy_name`, `missing_packaged_engine_reason`,
-//! `parse_device_policy` — stay in `main.rs` and are reached unqualified via
-//! `use crate::{...}`, same as for other mechanically relocated modules.
+//! `device_policy_name`, `missing_packaged_engine_reason` — stay in
+//! `main.rs` and are reached unqualified via `use crate::{...}`, same as for
+//! other mechanically relocated modules. `parse_device_policy` moved out of
+//! `main.rs` into `gpu_policy.rs` in ROCMAI-214 (Phase 6f); it is reached via
+//! `use crate::gpu_policy::parse_device_policy;` instead.
 
 use std::ffi::OsString;
 use std::io::{self, BufRead, Read, Write};
@@ -68,9 +70,10 @@ use rocm_engine_protocol::{
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+use crate::gpu_policy::parse_device_policy;
 use crate::{
     app_path_env_vars, apply_app_path_env, device_policy_name, engine_recipe_json_arg,
-    missing_packaged_engine_reason, optional_arg, parse_device_policy, with_sigpipe_ignored,
+    missing_packaged_engine_reason, optional_arg, with_sigpipe_ignored,
 };
 
 static BUILTIN_ENGINE_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
