@@ -997,6 +997,38 @@ mod tests {
     }
 
     #[test]
+    fn gated_aim_models_say_to_pass_hf_token() {
+        // Gated per the AIM catalog's model pages ("requires a Hugging Face
+        // authentication"); `--engine-env HF_TOKEN` forwarding is covered in
+        // engines/aim (run_args_never_puts_env_values_on_the_command_line).
+        for id in [
+            "meta-llama/Llama-3.2-3B-Instruct",
+            "meta-llama/Llama-3.3-70B-Instruct",
+            "google/gemma-3-27b-it",
+        ] {
+            let recipe = resolve_builtin_model_recipe(id).expect("gated aim recipe");
+            let aim = recipe
+                .engine_recipes
+                .iter()
+                .find(|e| e.engine == "aim")
+                .expect("aim engine");
+            assert!(
+                aim.notes
+                    .iter()
+                    .any(|n| n.contains("--engine-env HF_TOKEN")),
+                "{id}"
+            );
+        }
+        let open = resolve_builtin_model_recipe("Qwen/Qwen3-32B").expect("ungated aim recipe");
+        assert!(
+            !open.engine_recipes[0]
+                .notes
+                .iter()
+                .any(|n| n.contains("HF_TOKEN"))
+        );
+    }
+
+    #[test]
     fn builtin_aim_recipe_carries_a_verification_timestamp() {
         let recipe = resolve_builtin_model_recipe("Qwen/Qwen3.5-9B").expect("aim recipe");
         let aim = recipe
