@@ -218,11 +218,15 @@ pub fn draw_help(f: &mut Frame, area: Rect, tab: ActiveTab, theme: &Theme) {
     f.render_widget(p, inner);
 }
 
-/// Most lines one multi-line warning shows. A failed amd-smi call embeds its raw
-/// stderr, which can run to dozens of lines; uncapped it would push every
-/// warning listed after it off a popup that does not scroll. A warning only
-/// slightly over the cap is shown whole, since "1 more line" costs the row it
-/// saves.
+/// Lines of text a multi-line warning is cut to once it is longer than this plus
+/// one. A failed amd-smi call embeds its raw stderr, which can run to dozens of
+/// lines; uncapped it would push every warning listed after it off a popup that
+/// does not scroll. A warning only one line over the cap is shown whole, since
+/// "1 more line" costs the row it saves.
+///
+/// The cap counts lines of the warning's text, not the rows they wrap to, so one
+/// very long line can still take several rows. A popup that runs out of room
+/// says so with its truncation marker (see [`draw_warnings`]).
 const WARNING_MAX_LINES: usize = 4;
 
 /// One warning as popup lines: a bullet on the first line, an indent on the
@@ -261,8 +265,9 @@ fn warning_lines<'a>(warning: &'a str, theme: &Theme) -> Vec<Line<'a>> {
 }
 
 /// Render the Warnings modal: the warnings the daemon currently reports, the
-/// text behind the header `⚠ N` badge. A multi-line one is cut to
-/// [`WARNING_MAX_LINES`] lines with a count of the rest.
+/// text behind the header `⚠ N` badge. A multi-line one longer than
+/// [`WARNING_MAX_LINES`] + 1 lines is cut to [`WARNING_MAX_LINES`] lines of text
+/// with a count of the rest.
 ///
 /// Content-sized like [`draw_help`] — the warnings are few and short-lived, so
 /// the popup is sized to them rather than growing a scroll position of its own.
@@ -1428,6 +1433,36 @@ mod ported_chrome_tests {
             2,
             "one bullet per warning:\n{}",
             painted.join("\n")
+        );
+    }
+
+    // Warning text is often raw amd-smi stderr. Nothing in this crate strips it:
+    // ratatui drops every grapheme holding a control character when it writes the
+    // buffer, so an escape sequence cannot reach the terminal. This pins that.
+    #[test]
+    fn warnings_modal_paints_no_control_character_from_a_warning() {
+        let theme = Theme::from_name("default-dark");
+        let warnings = vec![
+            "\x1b[31mred\x1b[0m\x07 bell\ttab\rreturn\x1b]0;title\x07\ndel\x7f after".to_string(),
+        ];
+        let area = Rect::new(0, 0, 80, 20);
+        let backend = TestBackend::new(80, 20);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| super::draw_warnings(f, area, &warnings, &theme))
+            .unwrap();
+        let buf = term.backend().buffer();
+        let painted: String = (0..20)
+            .flat_map(|y| (0..80).map(move |x| (x, y)))
+            .map(|pos| buf[pos].symbol().to_string())
+            .collect();
+        assert!(
+            !painted.chars().any(char::is_control),
+            "a control character reached the buffer: {painted:?}"
+        );
+        assert!(painted.contains("red"), "{painted:?}");
+        assert!(
+            painted.contains("after"),
+            "the second line must survive: {painted:?}"
         );
     }
 
