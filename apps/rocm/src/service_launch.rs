@@ -47,6 +47,7 @@ use rocm_engine_protocol::{DevicePolicy, EngineRecipeHint, ResolveModelResponse}
 #[cfg(not(windows))]
 use crate::apply_app_path_env;
 use crate::endpoint_keys;
+use crate::engine_ipc::builtin_engine_serve_http_args;
 use crate::engines_cmd::env_root_for_service;
 use crate::managed_service_status::{
     existing_live_managed_service_in, load_managed_services, managed_service_is_live,
@@ -55,9 +56,9 @@ use crate::read_optional_tail_lines;
 use crate::serve_port;
 use crate::service_hints;
 use crate::{
-    SandboxToolArg, builtin_engine_serve_http_args, device_policy_name,
-    managed_service_launcher_path, record_cli_audit_event, render_service_action_result,
-    run_internal_sandbox_tool, status_for_readiness, wait_for_service_http_ready_with_progress,
+    SandboxToolArg, device_policy_name, managed_service_launcher_path, record_cli_audit_event,
+    render_service_action_result, run_internal_sandbox_tool, status_for_readiness,
+    wait_for_service_http_ready_with_progress,
 };
 #[cfg(windows)]
 use crate::{app_path_env_var_refs, app_path_env_var_values};
@@ -590,6 +591,7 @@ fn spawn_managed_engine_child(
         Some(device_policy_name(device_policy).to_owned()),
     );
     record.gpu_indices = gpu_indices.to_vec();
+    record.served_model_id = resolve.served_model_id.clone();
     record.engine_recipe_json = requested_recipe_json;
     // The flag the user actually passed, carried through rather than re-derived.
     //
@@ -889,7 +891,11 @@ pub(crate) fn start_managed_service(
         engine,
         host,
         port,
-        &resolve.canonical_model_id,
+        &|| {
+            let mut latest = record.clone();
+            let _ = latest.refresh_from_engine_state();
+            latest.served_model_name().to_owned()
+        },
         endpoint_api_key,
         Duration::from_secs(45),
         on_wait_tick,
@@ -1522,6 +1528,7 @@ mod tests {
 
         let resolve = ResolveModelResponse {
             canonical_model_id: "qwen-canonical".to_owned(),
+            served_model_id: None,
             task: "chat".to_owned(),
             source: "hf".to_owned(),
             revision: "main".to_owned(),
@@ -1607,6 +1614,7 @@ mod tests {
 
         let resolve = ResolveModelResponse {
             canonical_model_id: "qwen-canonical".to_owned(),
+            served_model_id: None,
             task: "chat".to_owned(),
             source: "hf".to_owned(),
             revision: "main".to_owned(),
@@ -1696,6 +1704,7 @@ mod tests {
 
         let resolve = ResolveModelResponse {
             canonical_model_id: "qwen-canonical".to_owned(),
+            served_model_id: None,
             task: "chat".to_owned(),
             source: "hf".to_owned(),
             revision: "main".to_owned(),
@@ -1789,6 +1798,7 @@ mod tests {
 
         let resolve = ResolveModelResponse {
             canonical_model_id: "qwen-canonical".to_owned(),
+            served_model_id: None,
             task: "chat".to_owned(),
             source: "hf".to_owned(),
             revision: "main".to_owned(),
@@ -1903,6 +1913,7 @@ mod tests {
 
             let resolve = ResolveModelResponse {
                 canonical_model_id: "qwen-canonical".to_owned(),
+                served_model_id: None,
                 task: "chat".to_owned(),
                 source: "hf".to_owned(),
                 revision: "main".to_owned(),
@@ -2018,6 +2029,7 @@ mod tests {
 
         let resolve = ResolveModelResponse {
             canonical_model_id: "qwen-canonical".to_owned(),
+            served_model_id: None,
             task: "chat".to_owned(),
             source: "hf".to_owned(),
             revision: "main".to_owned(),
@@ -2103,6 +2115,7 @@ mod tests {
 
         let resolve = ResolveModelResponse {
             canonical_model_id: "qwen-canonical".to_owned(),
+            served_model_id: None,
             task: "chat".to_owned(),
             source: "hf".to_owned(),
             revision: "main".to_owned(),
@@ -2163,6 +2176,7 @@ mod tests {
     fn start_and_attached_launches_hold_the_launch_lock_until_the_spawn() -> Result<()> {
         let resolve = ResolveModelResponse {
             canonical_model_id: "qwen-canonical".to_owned(),
+            served_model_id: None,
             task: "chat".to_owned(),
             source: "hf".to_owned(),
             revision: "main".to_owned(),
@@ -2871,7 +2885,7 @@ mod tests {
 
         // Go through the real stop path (`rocm services stop <id> --yes`'s own
         // implementation) rather than writing `status = "stopped"` to disk
-        // directly, so this test actually proves the advice serve-27 pins: that
+        // directly, so this test actually proves the advice serve-29 pins: that
         // running the stop command frees the port. The termination closure is
         // the same seam production injects a real signal through; here it just
         // confirms every recorded process gone without touching the test
@@ -3066,12 +3080,19 @@ mod tests {
 
         barrier.wait();
         let started = Instant::now();
-        let (gpu_indices, launch_lock) =
-            crate::select_gpu_indices_under_launch_lock(&paths, true, None, || None, None, None)?;
+        let (gpu_indices, launch_lock) = crate::gpu_policy::select_gpu_indices_under_launch_lock(
+            &paths,
+            true,
+            None,
+            || None,
+            None,
+            None,
+        )?;
         let waited = started.elapsed();
 
         let resolve = ResolveModelResponse {
             canonical_model_id: "held-canonical".to_owned(),
+            served_model_id: None,
             task: "chat".to_owned(),
             source: "hf".to_owned(),
             revision: "main".to_owned(),
@@ -3259,6 +3280,7 @@ mod tests {
 
         let resolve = ResolveModelResponse {
             canonical_model_id: "qwen-canonical".to_owned(),
+            served_model_id: None,
             task: "chat".to_owned(),
             source: "hf".to_owned(),
             revision: "main".to_owned(),

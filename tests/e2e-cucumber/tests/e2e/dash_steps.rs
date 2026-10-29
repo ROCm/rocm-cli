@@ -2578,15 +2578,9 @@ const SEND_REVIEW_TITLE: &str = "Report this diagnosis";
 /// (this crate runs the built binary and links neither).
 const SENDER_NOTICE_FRAGMENT: &str = "it goes from your own mail account and carries your address";
 
-/// The screen as one line of prose: dialog borders dropped and whitespace
-/// collapsed, so a sentence the dialog wrapped over two rows still matches.
-fn screen_as_prose(screen: &str) -> String {
-    screen
-        .replace(['│', '┃', '║'], " ")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-}
+/// The send review's title as the shared approval popup stamps it, which is
+/// what `TuiSession::wait_for_popup_body_where` finds the popup by.
+const SEND_REVIEW_TITLE_BAR: &str = "Review: Report this diagnosis";
 
 #[when("the user asks to review the report for sending")]
 async fn ask_to_review_for_sending(world: &mut E2eWorld) {
@@ -2614,16 +2608,39 @@ async fn review_states_the_sender_notice_first(world: &mut E2eWorld) {
         );
         return;
     }
-    tui.wait_for_screen(SEND_REVIEW_TITLE, default_timeout())
-        .await
-        .unwrap_or_else(|e| panic!("the send review did not open: {e}"));
+    // Read the popup's own body, not the whole screen. The review is drawn
+    // over the Diagnose screen and the Observe panels, which share its rows,
+    // so the whole screen joined into one line puts their text (a panel's
+    // "MODEL" heading, say) into the middle of any sentence the review
+    // wrapped. `wait_for_popup_body_where` slices each row to the popup's own
+    // columns and undoes the wrap. It waits for the report's first key so the
+    // body is read once the review has drawn the report.
+    //
+    // Both sides are then compared with all whitespace removed. A wrap that
+    // ends flush with the popup's right border cannot be told apart from a
+    // word split mid-word, so the rejoined body can read "carriesyour" there
+    // (see `popup_body_text`). Without whitespace the fragment still occurs
+    // only in the notice.
+    let mut body = String::new();
+    tui.wait_for_popup_body_where(
+        "the send review shows the report",
+        SEND_REVIEW_TITLE_BAR,
+        |text| {
+            text.clone_into(&mut body);
+            text.contains("\"schema\"")
+        },
+        default_timeout(),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("the send review did not open with the report: {e}"));
     let screen = tui.screen_text();
-    let prose = screen_as_prose(&screen);
-    let notice = prose.find(SENDER_NOTICE_FRAGMENT);
-    let report = prose.find("\"schema\"");
+    let unspaced = |text: &str| text.split_whitespace().collect::<String>();
+    let compact = unspaced(&body);
+    let notice = compact.find(&unspaced(SENDER_NOTICE_FRAGMENT));
+    let report = compact.find("\"schema\"");
     assert!(
         notice.is_some(),
-        "the send review does not say the mail carries the user's address:\n{screen}"
+        "the send review does not say the mail carries the user's address:\n{body}\n{screen}"
     );
     // On the first screen of the review, above the report: the body scrolls
     // and Approve does not, so a notice below the report could be approved

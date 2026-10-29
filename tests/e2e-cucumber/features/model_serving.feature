@@ -342,12 +342,50 @@ Feature: Model serving
     When the user lists recommended models
     Then the model list output contains only ASCII characters
 
+  # AIM serve + inference canary (ROCMAI-554). This scenario deliberately still
+  # serves via the raw AIM Docker image reference rather than the catalog
+  # recipe added in ROCMAI-555 — it's a hardware-verified canary pinned to one
+  # exact image/profile, not a catalog-discovery test. `@requires-engine:aim`
+  # skips here when Docker is unreachable OR the gfx family isn't one aim is
+  # verified on (see `HostCapability::engine_available`'s "aim" arm — Radeon
+  # gfx110X/120X and Strix Halo gfx1151, not Instinct); a Strix Halo
+  # self-hosted runner with Docker is where this actually runs.
+  # `@serve-timeout:1200`
+  # widens both the harness's readiness poll and the CLI's own
+  # ROCM_CLI_AIM_READY_TIMEOUT_SECS (see isolate_cmd) — a cold-start HF weight
+  # download for this 9B model legitimately exceeds the engine's default
+  # 5-minute readiness cap.
+  @id:serve-aim-inference @requires-gpu @requires-engine:aim @serve-timeout:1200
+  Scenario: serve-26 - A model served on AIM responds to inference requests
+    Given a managed runtime is active
+    And a model is being served on aim
+    When the user sends a chat completion request
+    Then the response contains a model reply
+    And the response identifies the correct model
+
+  # Lifecycle parity for AIM (ROCMAI-554). AIM's engine integration is new
+  # enough that nothing had yet proven a container-backed service can be
+  # stopped and relaunched like any other managed engine's — this reuses the
+  # same stop path the serve-retry logic and scenario teardown already rely
+  # on (`stop_managed_services`, via the `stop_aim_service` step), and the
+  # same serve+inference fixture `serve-26` uses, rather than adding a new
+  # stop/restart mechanism just for AIM.
+  @id:serve-aim-lifecycle-parity @requires-gpu @requires-engine:aim @serve-timeout:1200
+  Scenario: serve-27 - A stopped AIM service can be restarted and serves inference again
+    Given a managed runtime is active
+    And a model is being served on aim
+    When the user stops the AIM service
+    And the user serves that same model on aim again
+    And the user sends a chat completion request
+    Then the response contains a model reply
+    And the response identifies the correct model
+
   # Parse-time refusal (serve-port rewrite): an out-of-range `--port` (0 here;
   # 65536 and non-numeric values share the same parser and message) is rejected
   # before any engine or GPU work, so it needs no GPU and gates every PR
   # (ungated), like its sibling serve-14.
   @id:serve-invalid-port-rejected
-  Scenario: serve-26 - Serving with an out-of-range port is refused with a clear reason
+  Scenario: serve-28 - Serving with an out-of-range port is refused with a clear reason
     When the user serves a model with an out-of-range port
     Then serving is refused before any engine starts
     And the user is told the port must be between 1 and 65535
@@ -364,7 +402,7 @@ Feature: Model serving
   # apps/rocm/src/service_launch.rs, per AGENTS.md section 3.
   # Runs in the merge queue, like its automatic-port sibling serve-auto-port-skips-occupied.
   @id:serve-explicit-port-reserved @requires-gpu @merge-queue
-  Scenario: serve-27 - Serving on a port another managed service already holds is refused
+  Scenario: serve-29 - Serving on a port another managed service already holds is refused
     Given a managed runtime is active
     And another managed service already reserves the default serve port
     When the user serves a model explicitly on the reserved port
@@ -372,17 +410,17 @@ Feature: Model serving
     And the user is told to stop the service holding that port
 
   # Collision-safe explicit ports, untracked-process case (serve-port rewrite,
-  # sibling of serve-27). No managed-service record exists here, so
+  # sibling of serve-29). No managed-service record exists here, so
   # `resolve_serve_port` never reaches the "reserved by managed service" branch
   # and instead gets a plain OS-level `AddrInUse` back from the bind probe,
   # routing to `explicit_bind_error`'s "already in use by another process"
-  # message. Needs the same `@requires-gpu` as serve-27 for the same reason:
+  # message. Needs the same `@requires-gpu` as serve-29 for the same reason:
   # `resolve_serve_port` only runs once `spawn_managed_engine_child` has a
   # completed model/GPU resolution in hand (GPU indices are selected earlier in
   # `serve_cmd.rs`, under the launch lock, before any port is ever probed), and
   # `serve` has no CPU fallback that gets there.
   @id:serve-explicit-port-in-use-by-untracked-process @requires-gpu @merge-queue
-  Scenario: serve-28 - Serving on a port an untracked process already holds is refused
+  Scenario: serve-30 - Serving on a port an untracked process already holds is refused
     Given a managed runtime is active
     And the default serve port is occupied
     When the user serves a model explicitly on the occupied port
@@ -394,7 +432,7 @@ Feature: Model serving
   # endpoint must advance to the next candidate rather than failing late in the
   # engine. Runs in the merge queue because it launches a real model server.
   @id:serve-auto-port-skips-occupied @requires-gpu @merge-queue
-  Scenario: serve-29 - Automatic serving skips an occupied default port
+  Scenario: serve-31 - Automatic serving skips an occupied default port
     Given a managed runtime is active
     And the default serve port is occupied
     When the user serves a model with automatic port selection

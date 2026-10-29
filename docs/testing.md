@@ -830,6 +830,8 @@ cargo test -p rocm --bin rocm update_report_policy
 cargo test -p rocm-engine-lemonade stdio_protocol_routes_all_methods_without_side_effects
 cargo test -p rocm-engine-vllm stdio_protocol_routes_all_methods_without_side_effects
 cargo test -p rocm-engine-vllm
+cargo test -p rocm-engine-aim
+cargo test -p rocm --bin rocm extra_env
 cargo test -p rocmd event_collector
 cargo test -p rocmd event_dispatcher
 ```
@@ -1076,6 +1078,26 @@ and Lemonade on non-Windows are all fully supported. Teaching the Windows
 detached-spawn primitive to carry a value-typed override (so Windows Lemonade can
 serve public with auth) is tracked as a separate follow-up.
 
+Lemonade backend pin restore focused tests (the restore after a kept alignment
+pin stops installing; `docs/engine-plugins.md`, section "Lemonade backend
+alignment on engine install"):
+
+```bash
+cargo test -p rocm-engine-lemonade restore
+cargo test -p rocm-engine-lemonade equal_pin
+cargo test -p rocm-engine-lemonade failed_retry
+```
+
+They assert each warning together with the real state it describes: the pin
+file, the ROCm backend directories (including a partial build the first attempt
+left), and that a missing or mismatched cached archive triggers no download.
+No Gherkin scenario covers the restore: it needs a runtime tree that already
+holds a stale pin and a live backend download, which only a gated hardware lane
+has. The Windows Strix Halo e2e lane's prewarm step (`rocm engines install
+lemonade` against the shared tree) reaches the restore only on a runner whose
+shared tree still holds a stale pin; on a healthy runner the install succeeds and
+the restore never runs, so a green lane does not show that it works.
+
 Engine recipe adapter contract focused tests:
 
 ```bash
@@ -1311,6 +1333,78 @@ install steps also require a native Windows build before any CLI invocation.
 [driver_host_guard.rs](../tests/e2e-cucumber/tests/driver_host_guard.rs) checks
 that ordering without running an installer. Do not run these scenarios on a
 non-Windows host.
+
+Lines that `rocm fix` and `rocm diagnose` print for Windows are meant to be
+pasted into Windows PowerShell 5.1 or cmd, so they are held to a text rule: no
+`&&` or `||`, no bare `where`, no `%NAME%`, no empty-string argument, and no
+`$` or `\"` inside a double-quoted `powershell -Command "..."` body, and no
+`Get-Item` there without `-ErrorAction Stop` (a missing path is a
+non-terminating error, so the line would print it and still exit 0). The `where`
+and `-Command` matches ignore case.
+`fails_in_windows_powershell` in
+[fix.rs](../crates/rocm-core/src/fix.rs) applies it to every catalog recipe that
+applies on Windows (commands, the `Verify` line and the `Verify (Linux, WSL)`
+line) and to the `Fix` values `rocm diagnose` builds for Windows. Scenarios
+`diagnose-43`, `diagnose-44` and `diagnose-45` in
+[diagnose.feature](../tests/e2e-cucumber/features/diagnose.feature) apply it to
+what `rocm fix <id> --dry-run` prints; the plan prints before the platform
+gate, so they run on the Linux lanes too. The e2e crate cannot depend on
+rocm-core, so it carries its own copy of the rule,
+[powershell_text_rule.rs](../tests/e2e-cucumber/src/powershell_text_rule.rs).
+Both copies are tested against one table of cases,
+[powershell_text_rule_cases.txt](../tests/e2e-cucumber/fixtures/powershell_text_rule_cases.txt):
+add a case there, and a rule that gets it wrong fails on its own side.
+
+The rule reads text; it does not prove a line runs. On Windows,
+`cargo test -p rocm-core --lib` types the `Verify` lines of fix-2, fix-13, fix-14, fix-15, fix-21 and
+fix-22 into cmd and into Windows PowerShell and checks the exit code and
+output (the tests in [fix.rs](../crates/rocm-core/src/fix.rs) named
+`the_override_verify_runs_in_cmd_and_powershell`,
+`the_hip_sdk_verify_runs_the_exe_under_hip_path`,
+`the_adrenalin_verify_runs_and_its_filter_keeps_only_amd`,
+`the_msvc_verify_runs_in_cmd_and_powershell`,
+`the_outdated_msvc_verify_prints_a_version_and_fails_when_the_dll_is_missing`
+and `the_display_driver_verify_runs_in_cmd_and_powershell`; fix-15 and fix-21
+also must exit non-zero when their DLL is missing, fix-15 in
+`the_msvc_verify_exits_nonzero_when_a_dll_is_missing`), and runs the fix-9 line
+that only `rocm diagnose` prints
+(`the_igpu_verify_pins_the_variable_it_names` in
+[diagnose.rs](../crates/rocm-core/src/diagnose.rs)). These tests are compiled on
+Windows only, so the Linux lanes do not run them, and no Windows scenario covers
+the Windows lines `rocm diagnose` prints: those are held by the text rule
+(`windows_diagnosis_remediation_passes_the_powershell_text_rule`) and the tests
+above. The fix-6 PATH write is not run by any test because it changes the
+user's PATH.
+
+A catalog entry can carry a second line for Linux and WSL, printed as
+`Verify (Linux, WSL):`, when the line every OS can run cannot show what Linux
+needs. fix-6 does: `hipcc --version` for every OS, and `rocminfo | head -n 5`
+for Linux and WSL, which shows the GPU and passes on a runtime-only install
+that has no `hipcc`. `diagnose-45` asserts both lines and the note that names
+the runtime-only case. fix-2 does too: the `python` line for every OS (it is
+what cmd and PowerShell run), and `echo "${HSA_OVERRIDE_GFX_VERSION:-OK_UNSET}"`
+for Linux and WSL, which needs no Python (a stock Ubuntu has `python3` only)
+and no `||`. `diagnose-44` asserts both lines and the note.
+
+The `rocm diagnose` Linux arms print the catalog's Linux line and nothing from
+the plain line: fix-6 prints `rocminfo | head -n 5` alone (chaining `hipcc
+--version` fails on a runtime-only install), and fix-2 prints its Linux line
+followed by `python3 -c "import torch; ..."`, the check that clearing the
+override left the GPU usable. Scenarios `diagnose-46` (fix-2, run with
+`HSA_OVERRIDE_GFX_VERSION` set) and `diagnose-47` (fix-6, on a simulated host)
+in [diagnose.feature](../tests/e2e-cucumber/features/diagnose.feature) assert
+the line `rocm diagnose` prints, and that it names `python3` and no `hipcc`.
+Both are `@requires-os:linux`, so they run on every Linux lane (WSL2 included),
+GPU or not, and are skipped on Windows. The arms are also checked against the
+catalog in [diagnose.rs](../crates/rocm-core/src/diagnose.rs)
+(`the_override_fix_verify_matches_the_catalog_copy`,
+`the_path_fix_verify_matches_the_catalog_copy`). On Unix hosts,
+`the_path_fix_verify_passes_on_a_runtime_only_linux_install` and
+`the_override_fix_verify_runs_where_only_python3_exists` run the lines
+`rocm diagnose` prints in `/bin/sh` on a `PATH` of stand-in executables with no
+`hipcc` or no `python`. `the_override_linux_verify_runs_with_nothing_on_path`
+([fix.rs](../crates/rocm-core/src/fix.rs)) runs the catalog's `verify_linux`
+line for fix-2, not the `rocm diagnose` one, on an empty `PATH`.
 
 Provider audit focused test:
 
@@ -1548,6 +1642,26 @@ E2E_INCLUDE_LIFECYCLE=1 E2E_ONLY_LIFECYCLE=1 cargo xtask e2e
 The harness applies the matching OS requirement itself; do not select these
 with cucumber's `--tags`/`-n` flags, because those bypass the suite's custom
 expectation and applicability resolver.
+
+The required `windows-build-and-test` lane additionally folds in the hermetic
+`comfyui-01`/`comfyui-02`/`comfyui-03` scenarios (not themselves `@lifecycle`)
+via `E2E_ALSO_RUN_IDS`, a comma-separated list of `@id`s:
+
+```powershell
+$env:E2E_INCLUDE_LIFECYCLE = "1"
+$env:E2E_ONLY_LIFECYCLE = "1"
+$env:E2E_ALSO_RUN_IDS = "comfyui-uv-install-failure-names-log,comfyui-uv-install-progress-streamed,comfyui-ambiguous-runtime-actionable"
+cargo xtask e2e
+```
+
+These three were made hermetic and Windows-portable without being tagged
+`@lifecycle` — they're ComfyUI install scenarios, not release packaging/
+install/uninstall ones, and tagging them `@lifecycle` would drop them out of
+the full-suite runs in `nightly.yml` and `e2e-selfhosted.yml`, neither of
+which sets `E2E_INCLUDE_LIFECYCLE`. `E2E_ALSO_RUN_IDS` selects them into this
+lane instead, so this is the one required lane that guarantees Windows
+coverage for them; the self-hosted Windows lane that otherwise runs them is
+optional.
 
 Heavy CI runs the matching set per platform. The scenarios reject untrusted
 signers, bad checksums, bad detached signatures, and missing required signature
@@ -1793,20 +1907,12 @@ cargo test -p rocm --bin rocm driver_install
 
 `driver-install-06` in
 [driver_install.feature](../tests/e2e-cucumber/features/driver_install.feature)
-asserts whichever plan a real bare-metal Linux host actually produces: the apt
-repo file and signing key on a release with a published
-repo.radeon.com/amdgpu suite, or the native-archive refusal below on one
-without.
-
-On Ubuntu 26.04, `repo.radeon.com` does not yet publish a matching `resolute`
-DKMS repo (the amdgpu driver ships in-tree instead), so the plan comes back
-`supported: false` and directs the user to `apt install rocm`. This arm is
-covered at the unit level by
-`driver_plan_ubuntu_2604_uses_native_archive_guidance` and its two neighbors in
-[driver_install.rs](../apps/rocm/src/driver_install.rs), and at the e2e level
-by `driver-install-06` above: the hosted `E2E tests` job's `ubuntu-latest` image (26.04 once GitHub's migration completes)
-reaches this arm through the CLI itself, while the self-hosted GPU lane's
-24.04 host exercises the apt arm instead.
+asserts the plan a real bare-metal Linux host actually produces: the apt
+repo file and signing key with the host's own suite (`noble` on 24.04,
+`resolute` on 26.04), and the previous-driver warning. The warning command is
+also run against a stubbed `dpkg-query` by
+`previous_driver_warning_fires_only_when_amdgpu_dkms_is_installed` in
+[driver_install.rs](../apps/rocm/src/driver_install.rs).
 
 ## /etc/os-release
 

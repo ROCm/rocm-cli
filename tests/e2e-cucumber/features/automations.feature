@@ -4,10 +4,11 @@ Feature: Automation watchers
   # automation watcher in the CLI config and prints a confirmation; bare `rocm
   # automations` lists the most recent review requests (any status — only the
   # per-entry approve/reject controls are gated on "pending"). This feature
-  # pins the enable/disable/mode-confirmation slice plus the proposal-history
-  # listing's unit formatting; the watcher/daemon trigger behaviour itself is
-  # covered elsewhere. Config-only (no GPU, no network), so it runs on the
-  # mock lane every PR.
+  # pins the enable/disable/mode-confirmation slice, the proposal-history
+  # listing's unit formatting, and the bare listing's tolerance of a torn
+  # audit-log tail; the watcher/daemon trigger behaviour itself is covered
+  # elsewhere. Config-only (no GPU, no network), so it runs on the mock lane
+  # every PR.
 
   @id:automations-enable-confirms-mode
   Scenario: automations-01 - Enabling a watcher confirms its mode
@@ -54,3 +55,31 @@ Feature: Automation watchers
     Given a pending artifact-download proposal approved for a size just under 1 MiB
     When the user lists automations
     Then the CLI reports the approved size in binary units
+
+  # Readers of the audit/events/proposals stores take no lock, so one can
+  # catch a write mid-append; the cut-off last line that leaves is skipped
+  # instead of failing the whole read.
+  # `render_automations_text` already swallows any read error from these
+  # stores via `.unwrap_or_default()`, so `rocm automations` never exits
+  # non-zero either way — what this scenario actually pins is that the clean
+  # record ahead of the torn one still shows up, rather than the torn line's
+  # read error wiping out the whole audit section the way it would without
+  # this skip.
+  # `render_automations_text` is the production reader of the audit store
+  # specifically (the one this scenario seeds). The two places a person
+  # reads its raw text directly are the `rocm automations` CLI subcommand
+  # itself, and the TUI's automations-manager screen, which shells out to
+  # `rocm automations list` as a subprocess — so that's where the audit
+  # store's tolerance is directly user-observable. It's also reachable
+  # through other paths that don't show the raw text the same way —
+  # `rocm chat`'s and the TUI's slash-command `rocm_command` tool in-process
+  # (the model sees it, or the TUI shrinks it to field counts first), and
+  # rocmd's own MCP `rocm_command` tool via a further `rocm automations list`
+  # subprocess — this isn't meant as an exhaustive map of every caller, just
+  # context for why the CLI subcommand is the right level to pin this at.
+  @id:automations-tolerates-torn-audit-tail
+  Scenario: automations-06 - Listing automations tolerates a torn audit-log tail
+    Given a fresh CLI configuration
+    And the audit event log ends in a torn, unterminated line
+    When the user lists automations
+    Then the CLI still lists the record before the torn tail

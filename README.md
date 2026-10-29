@@ -574,12 +574,15 @@ older `ROCM_CLI_AMDGPU_VERSION`/`ROCM_CLI_AMDGPU_PACKAGE_RELEASE` pair, which
 pinned a fixed default and are no longer read; the plan is refused while either is still set,
 so an old pin is never silently turned into `latest`.
 
-On Ubuntu 26.04, the amdgpu driver ships in-tree and `repo.radeon.com` does not
-yet publish a matching DKMS repo, so `install driver` reports a non-mutating
-`supported: false` plan instead and directs you to `apt install rocm` for the
-userspace ROCm stack.
+On Ubuntu, the plan uses the `repo.radeon.com/amdgpu` suite matching the
+release (`jammy` 22.04, `noble` 24.04, `resolute` 26.04). If `amdgpu-dkms` from
+a previous installation is already present, the plan's first command prints a
+warning naming the removal command (`apt-get autoremove -y amdgpu-dkms`); it
+never removes the old driver itself, and the install continues after the
+warning. This applies to every apt-based distro the DKMS flow covers (Ubuntu
+and Debian 12/13).
 
-Approving (`--yes`) a plan that is `supported: false` (Ubuntu 26.04, an
+Approving (`--yes`) a plan that is `supported: false` (an
 undocumented distro, or a refused version override) installs nothing and exits
 non-zero, after printing the plan.
 
@@ -748,7 +751,16 @@ rocm engines install <engine> [--runtime-id KEY] [--python-version X.Y] [--reins
 rocm engines shell <engine>   [--runtime-id KEY | --env-id ID] [--shell PATH]
 ```
 
-Supported engines: `lemonade`, `vllm`.
+Supported engines: `lemonade`, `vllm`, `aim`.
+
+`rocm engines install lemonade` also keeps Lemonade's llama.cpp backend paired
+with the ROCm SDK in use, and rewrites the two pins it owns
+(`therock.version` and `llamacpp.rocm-stable` in `resources/backend_versions.json`)
+to do so. If installing an already-pinned backend fails, it restores those two
+pins from the cached Lemonade archive (it does not download), prints a warning,
+and installs once more; see
+[Lemonade backend alignment](https://github.com/ROCm/rocm-cli/blob/main/docs/engine-plugins.md#lemonade-backend-alignment-on-engine-install) for the details and for
+`ROCM_CLI_DISABLE_LEMONADE_BACKEND_ALIGNMENT`, which turns both off.
 
 `--yes` approves required system-package installs, such as OpenMPI for vLLM,
 without asking.
@@ -796,7 +808,7 @@ GPU memory, and preferred engines.
 Start a local OpenAI-compatible model server:
 
 ```
-rocm serve <model> [--engine lemonade|vllm]
+rocm serve <model> [--engine lemonade|vllm|aim]
                    [--device gpu_required|gpu_preferred]
                    [--gpu auto|<index>]
                    [--runtime-id KEY | --env-id ID]
@@ -806,7 +818,20 @@ rocm serve <model> [--engine lemonade|vllm]
                    [--allow-public-bind] [--require-api-key] [--api-key KEY]
                    [--temperature TEMP] [--top-p PROB] [--max-tokens N]
                    [--gpu-memory-utilization FRACTION] [--tool-call-parser NAME]
+                   [--engine-env KEY=VALUE]...
 ```
+
+`--engine aim` runs the model in a Docker container instead of a host
+process; it requires a reachable Docker daemon and is Linux/WSL2 only.
+`--engine-env` passes an extra environment variable through to the engine's
+own process/container (repeatable); currently only `aim` consumes these (e.g.
+`AIM_PROFILE_ID`). `KEY=VALUE` values are visible in the detached child's
+argv and in `rocm services list --json`, so do not put secrets there; pass a
+bare `KEY` (e.g. `--engine-env HF_TOKEN`) to forward the value from your
+current environment without storing it. A service restarted by the daemon
+after a crash inherits the daemon's environment, not yours, so a forwarded
+secret must also be set there. `ROCM_CLI_AIM_READY_TIMEOUT_SECS` raises the
+5-minute readiness wait for a cold-start model download.
 
 `--port` is optional on the default loopback host (`127.0.0.1`): omit it and
 `rocm serve` picks the first free port in `11435`-`11535`, checking both

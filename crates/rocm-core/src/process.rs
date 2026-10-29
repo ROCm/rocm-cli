@@ -6,8 +6,9 @@
 //!
 //! Hidden-console/detached spawn and exit-wait on Windows, process/process-tree
 //! termination on both platforms, and the exclusive `FileLock` used to
-//! serialize the daemon autostart path, the managed-launch GPU claim, and
-//! `uv` installs across processes.
+//! serialize check-then-act sequences over shared on-disk state across
+//! processes — e.g. the daemon autostart path, the managed-launch GPU claim,
+//! a `uv` install, and each JSONL store's append/rewrite.
 //!
 //! [`run_with_timeout`] is the bulk of the file: run a command to completion
 //! with both streams captured and a real time bound. A thread per pipe drains
@@ -389,9 +390,11 @@ pub fn process_is_running(pid: u32) -> bool {
 /// Wraps the standard-library file lock (`std::fs::File::lock`), so the exclusion
 /// holds between *separate `rocm` processes*, not just threads: each caller opens
 /// the same lock-file path and only one can hold the lock at a time. It exists to
-/// serialize check-then-act sequences over shared on-disk state — the daemon
-/// autostart decision and the managed-serve GPU select-then-claim — so two
-/// concurrent invocations cannot both pass the same TOCTOU check.
+/// serialize check-then-act sequences over shared on-disk state — e.g. the
+/// daemon autostart decision, the managed-serve GPU select-then-claim, a
+/// `uv` install, and each JSONL store's append-or-repair and read-modify-write
+/// (see `jsonl_lock_path` in `automation.rs`) — so two concurrent invocations
+/// cannot both pass the same check, or interleave a write with another's.
 ///
 /// The lock is released when the guard is dropped, and by the OS if the process
 /// exits while holding it (so a crashed holder never wedges the next caller).
@@ -839,10 +842,9 @@ const DRAIN_GRACE: Duration = Duration::from_millis(200);
 /// The bound matters because the message does not stop at a terminal. `rocmd`
 /// renders the whole error chain into the bridge snapshot's `note`, and the
 /// GPU-metrics watcher copies that note into the automation-event and audit
-/// JSONL files once a minute — files whose append helpers rewrite the whole
-/// file each time. Unbounded, a child that prints a megabyte and then stalls
-/// past its timeout grows both logs by that much per minute, and every
-/// subsequent append costs more than the last.
+/// JSONL files once a minute — stores that are never rotated or capped.
+/// Unbounded, a child that prints a megabyte and then stalls past its
+/// timeout grows both logs by that much per minute, forever.
 ///
 /// Sized to still hold a real stderr backtrace: the point is to stop a
 /// payload-sized quote, not to shorten diagnostics.
@@ -2269,9 +2271,9 @@ mod tests {
             //
             // Unbounded, this message travels: `rocmd` renders the error chain
             // into the bridge snapshot's `note`, and the GPU-metrics watcher
-            // writes that note into two JSONL logs every 60s, rewriting each
-            // file whole. A real amd-smi on a multi-GPU host prints well past
-            // this fixture's size.
+            // writes that note into two JSONL logs every 60s, neither ever
+            // rotated or capped. A real amd-smi on a multi-GPU host prints
+            // well past this fixture's size.
             let mut command = Command::new(shell);
             command.args([
                 "-c",

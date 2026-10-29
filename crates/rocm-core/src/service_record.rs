@@ -31,6 +31,12 @@ pub struct ManagedServiceRecord {
     pub engine: String,
     pub model_ref: String,
     pub canonical_model_id: String,
+    /// The name the running server lists in `/v1/models`, when it differs from
+    /// `canonical_model_id` (a container engine's `canonical_model_id` is the
+    /// image to pull). Adopted from the engine state file; see
+    /// [`Self::served_model_name`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub served_model_id: Option<String>,
     pub host: String,
     pub port: u16,
     pub endpoint_url: String,
@@ -106,6 +112,18 @@ pub struct ManagedServiceRecord {
     pub created_at_unix_ms: u128,
 }
 
+/// Whether the engine `Stop` verdict decides that a stop is confirmed.
+///
+/// True for engines whose service is a container rather than a recorded
+/// process: the engine `Stop` is the only thing that stops one, so its verdict,
+/// not the PID signalling, decides. For a PID-supervised
+/// engine the PIDs are authoritative and the engine `Stop` is reported only.
+/// Shared by `rocm` and `rocmd` so the two stop paths cannot disagree.
+#[must_use]
+pub fn engine_stop_decides_confirmation(engine: &str) -> bool {
+    engine == "aim"
+}
+
 impl ManagedServiceRecord {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -134,6 +152,7 @@ impl ManagedServiceRecord {
             engine,
             model_ref: model_ref.into(),
             canonical_model_id: canonical_model_id.into(),
+            served_model_id: None,
             host,
             port,
             mode: mode.into(),
@@ -161,6 +180,21 @@ impl ManagedServiceRecord {
             engine_state_path,
             created_at_unix_ms: unix_time_millis(),
         }
+    }
+
+    /// The model name to look for in the endpoint's `/v1/models` and to send in
+    /// requests: the served name when the engine reported one, else the
+    /// canonical id, else the model ref.
+    #[must_use]
+    pub fn served_model_name(&self) -> &str {
+        [
+            self.served_model_id.as_deref().unwrap_or_default(),
+            self.canonical_model_id.as_str(),
+            self.model_ref.as_str(),
+        ]
+        .into_iter()
+        .find(|name| !name.trim().is_empty())
+        .unwrap_or_default()
     }
 
     /// Drop the per-run state that a restart invalidates, and count the restart.
@@ -276,6 +310,13 @@ impl ManagedServiceRecord {
             .filter(|value| !value.trim().is_empty())
         {
             self.env_id = Some(env_id.to_owned());
+        }
+        if let Some(served) = state
+            .get("served_model_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        {
+            self.served_model_id = Some(served.to_owned());
         }
         // Adopt the engine server PID together with ITS OWN start-time token so
         // a later stop verifies the server process, not the launcher. The ticks
@@ -430,6 +471,29 @@ mod tests {
         record.refresh_from_engine_state().expect("refresh");
         let _ = fs::remove_dir_all(dir);
         record
+    }
+
+    /// A container engine serves under a different name than the image it pulls;
+    /// the record adopts that name from the engine state, and every readiness
+    /// probe asks for it rather than for the image reference.
+    #[test]
+    fn engine_refresh_adopts_the_served_model_name_for_readiness_probes() {
+        let mut record = probe_test_record(11438);
+        record.canonical_model_id = "org/aim-image:1".to_owned();
+        assert_eq!(record.served_model_name(), "org/aim-image:1");
+
+        let record = refresh_from_state(
+            "served-name",
+            &serde_json::json!({ "status": "running", "served_model_id": "Org/Served-Model" }),
+        );
+        assert_eq!(record.served_model_id.as_deref(), Some("Org/Served-Model"));
+        assert_eq!(record.served_model_name(), "Org/Served-Model");
+
+        let record = refresh_from_state(
+            "blank-served-name",
+            &serde_json::json!({ "status": "running", "served_model_id": "  " }),
+        );
+        assert_eq!(record.served_model_id, None);
     }
 
     /// vLLM records one process as both `pid` and `server_pid` with only

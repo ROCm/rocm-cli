@@ -12,12 +12,13 @@
 //! first plants an automation runtime-state marking the daemon already
 //! running under THIS test process's (live) pid, so the CLI's double-spawn
 //! guard skips the spawn. Contracts verified against the running Linux binary
-//! (EAI-8072). Scoped to the enable/disable/mode slice plus the
-//! proposal-history listing's unit formatting; the watcher/daemon trigger
-//! behaviour itself is covered separately.
+//! (EAI-8072). Scoped to the enable/disable/mode slice, the proposal-history
+//! listing's unit formatting, and the bare listing's tolerance of a torn
+//! audit-log tail; the watcher/daemon trigger behaviour itself is covered
+//! separately.
 
 use cucumber::{given, then, when};
-use rocm_core::{AutomationProposalRecord, append_automation_proposal};
+use rocm_core::{AuditEventRecord, AutomationProposalRecord, append_automation_proposal};
 
 use crate::E2eWorld;
 
@@ -62,17 +63,51 @@ pub(crate) fn suppress_daemon_spawn(world: &E2eWorld) {
 /// and defer instead of spawning a duplicate daemon. Written in the same
 /// `"<pid> <ms>"` shape the CLI's `write_autostart_claim` uses.
 fn plant_inflight_autostart_claim(world: &E2eWorld) {
+    let path = autostart_claim_path(world);
+    std::fs::create_dir_all(path.parent().expect("claim path has a parent"))
+        .expect("failed to create automations dir");
+    write_harness_autostart_claim(&path);
+}
+
+/// Where the CLI reads its autostart claim inside the scenario's isolated root.
+fn autostart_claim_path(world: &E2eWorld) -> std::path::PathBuf {
     let root = world.isolated_root.as_ref().expect("no isolated root");
-    let dir = root.path().join("data").join("automations");
-    std::fs::create_dir_all(&dir).expect("failed to create automations dir");
+    root.path()
+        .join("data")
+        .join("automations")
+        .join("autostart.claim")
+}
+
+/// Write a claim for this harness process, stamped now.
+fn write_harness_autostart_claim(path: &std::path::Path) {
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_millis());
-    std::fs::write(
-        dir.join("autostart.claim"),
-        format!("{} {now_ms}", std::process::id()),
-    )
-    .expect("failed to write autostart claim");
+    std::fs::write(path, format!("{} {now_ms}", std::process::id()))
+        .expect("failed to write autostart claim");
+}
+
+/// Re-stamp a claim `plant_inflight_autostart_claim` planted, right before the
+/// CLI runs. The CLI honours a claim for only 30 seconds
+/// (`AUTOSTART_CLAIM_TTL_MS` in `apps/rocm/src/service_launch.rs`). The mock
+/// lane runs up to 64 scenarios at once, and every step blocks a runtime
+/// worker while its `rocm` child runs, so this scenario's When can start more
+/// than 30 seconds after its Given. The CLI then rightly reads the claim as
+/// stale and spawns, and the scenario fails without any defect in the CLI.
+/// Only a claim holding this process's pid is touched: that is the one the
+/// Given wrote, never one the CLI wrote for a daemon it spawned.
+fn refresh_harness_autostart_claim(world: &E2eWorld) {
+    let path = autostart_claim_path(world);
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let ours = text
+        .split_whitespace()
+        .next()
+        .is_some_and(|pid| pid == std::process::id().to_string());
+    if ours {
+        write_harness_autostart_claim(&path);
+    }
 }
 
 #[given("a daemon spawn is already in flight")]
@@ -108,6 +143,39 @@ async fn pending_artifact_download_proposal(world: &mut E2eWorld) {
     .expect("failed to write automation proposal fixture");
 }
 
+/// Seed the audit-event store with one clean record followed by a cut-off
+/// JSON fragment with no trailing newline — the shape a writer killed
+/// mid-append leaves. See the scenario's own comment in `automations.feature`
+/// for why this matters and who reads this store; see
+/// `scan_recent_jsonl_records`/`is_torn_record` in `rocm-core` for the read
+/// path this exercises (not `inspect_tail`, which is the write path's own,
+/// separate torn-tail check).
+#[given("the audit event log ends in a torn, unterminated line")]
+async fn torn_audit_tail(world: &mut E2eWorld) {
+    let paths = world.app_paths();
+    paths.ensure().expect("failed to create app dirs");
+    let clean = AuditEventRecord {
+        at_unix_ms: 1_700_000_000_000,
+        source: "e2e".to_owned(),
+        category: "concurrency".to_owned(),
+        actor: "writer".to_owned(),
+        level: "info".to_owned(),
+        action: "append".to_owned(),
+        message: "clean".to_owned(),
+        watcher_id: None,
+        service_id: None,
+    };
+    let clean_line = serde_json::to_string(&clean).expect("serialize audit record");
+    // Just the first 20 bytes of the same record: short enough that the cut
+    // falls well before the `message` field, so what it says doesn't matter.
+    let torn_fragment = &clean_line[..20];
+    std::fs::write(
+        paths.audit_events_path(),
+        format!("{clean_line}\n{torn_fragment}"),
+    )
+    .expect("failed to seed a torn audit-event tail");
+}
+
 #[given("an enabled automation watcher")]
 async fn enabled_watcher(world: &mut E2eWorld) {
     suppress_daemon_spawn(world);
@@ -121,6 +189,7 @@ async fn enabled_watcher(world: &mut E2eWorld) {
 
 #[when("the user enables an automation watcher in observe mode")]
 async fn enable_observe(world: &mut E2eWorld) {
+    refresh_harness_autostart_claim(world);
     let (stdout, stderr, rc) = crate::run_rocm(
         world,
         &["automations", "enable", WATCHER, "--mode", "observe"],
@@ -165,6 +234,23 @@ async fn enable_unknown(world: &mut E2eWorld) {
 }
 
 // ── Then ───────────────────────────────────────────────────────────
+
+#[then("the CLI still lists the record before the torn tail")]
+async fn still_lists_record_before_torn_tail(world: &mut E2eWorld) {
+    // The count, not rc == 0, is the real assertion here (see
+    // `automations.feature` for why). `audit_event_plain_summary` renders
+    // every audit event's category to one of a handful of fixed strings
+    // (never the raw message), so the fixture's "concurrency" category falls
+    // through to the generic one; exactly one occurrence confirms the one
+    // clean record before the torn tail was actually read and rendered, not
+    // silently dropped along with it (zero) or duplicated (more than one).
+    let out = ok_output(world);
+    let activity_lines = out.matches("Background activity was recorded.").count();
+    assert_eq!(
+        activity_lines, 1,
+        "expected exactly the one valid record before the torn tail to be listed, got:\n{out}"
+    );
+}
 
 #[then(regex = r"^the CLI confirms the watcher is enabled in (observe|propose) mode$")]
 async fn confirm_enabled(world: &mut E2eWorld, mode: String) {

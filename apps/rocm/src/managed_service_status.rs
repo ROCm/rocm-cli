@@ -44,6 +44,7 @@ pub(crate) fn friendly_engine_label(engine: &str) -> &str {
     match engine {
         "lemonade" => "Lemonade",
         "vllm" => "vLLM",
+        "aim" => "AIM",
         other => other,
     }
 }

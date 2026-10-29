@@ -16,6 +16,7 @@ pub mod monotonic_clock;
 pub mod paced_download;
 pub mod panic_capture;
 pub mod polled_deadline;
+pub mod powershell_text_rule;
 pub mod quit_and_wait;
 pub mod reader_failure;
 pub mod send_until;
@@ -181,7 +182,8 @@ mod tests {
         "Flags:      rocm fix can run it\n",
         "Note:       Windows: the PowerShell line reads and rewrites the User scope only. Do not substitute `setx PATH \"%PATH%;...\"`: setx silently truncates the value at 1024 characters.\n",
         "Note:       Windows: a PATH change only takes effect in NEW shells.\n",
-        "Verify:     rocminfo | head -n 5 && hipcc --version\n",
+        "Verify:     hipcc --version\n",
+        "Verify (Linux, WSL): rocminfo | head -n 5\n",
         "\n",
     );
 

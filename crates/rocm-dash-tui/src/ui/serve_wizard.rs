@@ -48,7 +48,7 @@ use crate::ui::theme::Theme;
 /// Automatic emits no `--engine` and lets the CLI resolve one; the rest mirror
 /// `apps/rocm` `engine_inventory()`. Kept TUI-local (a stable, small list) so
 /// this layer needs no `rocm-core` dep.
-pub const ENGINES: &[&str] = &["automatic", "lemonade", "vllm"];
+pub const ENGINES: &[&str] = &["automatic", "lemonade", "vllm", "aim"];
 
 /// Index into [`ENGINES`] that means "let the CLI decide".
 pub const ENGINE_AUTO: usize = 0;
@@ -1420,6 +1420,8 @@ mod tests {
         assert_eq!(ENGINES[wiz.as_ref().unwrap().engine_idx], "lemonade");
         feed(&mut wiz, &mut jobs, &[KeyCode::Right]);
         assert_eq!(ENGINES[wiz.as_ref().unwrap().engine_idx], "vllm");
+        feed(&mut wiz, &mut jobs, &[KeyCode::Right]);
+        assert_eq!(ENGINES[wiz.as_ref().unwrap().engine_idx], "aim");
         feed(&mut wiz, &mut jobs, &[KeyCode::Right]);
         assert_eq!(wiz.as_ref().unwrap().engine_idx, ENGINE_AUTO, "wraps");
     }

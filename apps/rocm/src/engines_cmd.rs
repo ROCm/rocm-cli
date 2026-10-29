@@ -38,6 +38,7 @@ use rocm_engine_protocol::{
 use serde::Deserialize;
 
 use crate::EnginesCommand;
+use crate::engine_ipc::{engine_request, engine_request_with_env_root};
 use crate::runtime_install_finalize::{
     ensure_libatomic_for_torch, ensure_libnuma_for_torch, ensure_openmpi_for_vllm,
     settle_engine_install,
@@ -48,9 +49,9 @@ use crate::runtimes_cmd::{
 };
 use crate::therock;
 use crate::{
-    apply_app_path_env, engine_request, engine_request_with_env_root, record_cli_audit_event,
-    render_engine_inventory_text_with_paths, resolve_engine_selection,
-    resolve_runtime_selector_to_exact_key, validate_engine_selection_runtime,
+    apply_app_path_env, record_cli_audit_event, render_engine_inventory_text_with_paths,
+    resolve_engine_selection, resolve_runtime_selector_to_exact_key,
+    validate_engine_selection_runtime,
 };
 
 pub(crate) fn render_engine_inventory_text() -> String {
@@ -178,7 +179,7 @@ fn resolve_engine_install_runtime_id(
 }
 
 pub(crate) fn engine_manages_own_runtime(engine: &str) -> bool {
-    engine == "lemonade"
+    engine == "lemonade" || engine == "aim"
 }
 
 fn env_root_for_runtime(
@@ -201,15 +202,24 @@ pub(crate) fn env_root_for_engine_install(
     runtime_id: &str,
 ) -> Result<Option<PathBuf>> {
     if engine_manages_own_runtime(engine) {
-        return env_root_for_self_managed_engine(paths, config);
+        return env_root_for_self_managed_engine(paths, config, engine);
     }
     env_root_for_runtime(paths, engine, runtime_id)
 }
 
+/// Only `lemonade` installs into a therock-managed Python runtime; `aim` runs
+/// entirely in Docker and has no env root to match against. Answering `None`
+/// for it here (rather than returning whatever unrelated runtime happens to
+/// be active) keeps `detect_runtime_matches_env_root` from failing aim's
+/// Detect response for a reason that has nothing to do with aim.
 fn env_root_for_self_managed_engine(
     paths: &AppPaths,
     config: &RocmCliConfig,
+    engine: &str,
 ) -> Result<Option<PathBuf>> {
+    if engine != "lemonade" {
+        return Ok(None);
+    }
     recover_setup_runtime_registration(paths, config)?;
     let manifests = therock::load_runtime_manifests(paths)?;
     for selector in [
@@ -334,7 +344,7 @@ pub(crate) fn ensure_self_managed_engine_ready(
         return Ok(());
     }
     let runtime_id = managed_engine_runtime_id(engine);
-    let env_root = env_root_for_self_managed_engine(paths, config)?;
+    let env_root = env_root_for_self_managed_engine(paths, config, engine)?;
     let detect = engine_request::<_, DetectResponse>(
         Some(paths),
         engine,
