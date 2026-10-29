@@ -38,8 +38,9 @@
 //!
 //! The cluster's regression tests live in this module's own `mod tests`,
 //! reaching shared fixtures (`test_paths`, `test_runtime_manifest_for_update`)
-//! through `crate::tests::` the same way other mechanically relocated
-//! modules do.
+//! through `crate::tests::` and `write_test_pip_runtime` through
+//! `crate::test_support::`, the same way other mechanically relocated modules
+//! do.
 
 use std::fmt::Write as _;
 

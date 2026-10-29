@@ -591,7 +591,7 @@ mod tests {
         )?;
         rocm_core::append_automation_event(
             &paths,
-            &rocm_core::AutomationEventRecord {
+            &AutomationEventRecord {
                 at_unix_ms: 44,
                 watcher_id: "gpu-metrics".to_owned(),
                 level: "info".to_owned(),
