@@ -998,7 +998,7 @@ mod tests {
 
     #[test]
     fn builtin_aim_recipe_carries_a_verification_timestamp() {
-        let recipe = resolve_builtin_model_recipe("aim-qwen3.5-9b").expect("aim recipe");
+        let recipe = resolve_builtin_model_recipe("Qwen/Qwen3.5-9B").expect("aim recipe");
         let aim = recipe
             .engine_recipes
             .iter()
