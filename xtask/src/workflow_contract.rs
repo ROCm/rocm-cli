@@ -707,6 +707,292 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
         ));
     }
 
+    /// `step` without its full-line comments, so prose that quotes a command
+    /// cannot stand in for the command.
+    fn without_comments(step: &str) -> String {
+        step.lines()
+            .filter(|line| !line.trim_start().starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Whether `line` runs `cargo build` with `--release` or `-r`, in any flag
+    /// order and quoted or not. A command wrapped over several lines is not seen.
+    fn is_release_cargo_build(line: &str) -> bool {
+        let tokens: Vec<&str> = line
+            .split_whitespace()
+            .map(|token| token.trim_matches(|c| c == '\'' || c == '"'))
+            .collect();
+        tokens.windows(2).any(|pair| pair == ["cargo", "build"])
+            && tokens
+                .iter()
+                .any(|token| matches!(*token, "--release" | "-r"))
+    }
+
+    /// Every step in `text` that builds shipped release binaries: a release
+    /// `cargo build` that is not the `e2e-test-hooks` harness build.
+    /// Named and unnamed (`- run:`) steps both count.
+    fn shipped_release_build_steps(text: &str) -> Vec<String> {
+        let lines: Vec<&str> = text.lines().collect();
+        lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| {
+                let item = line.trim_start();
+                item.starts_with("- name:") || item.starts_with("- run:")
+            })
+            .map(|(i, _)| step_block(&lines, i))
+            .filter(|step| {
+                let code = without_comments(step);
+                code.lines().any(is_release_cargo_build) && !code.contains("e2e-test-hooks")
+            })
+            .collect()
+    }
+
+    /// The `docker run` flag tokens before the image name (the first token
+    /// naming `manylinux`) of the invocation that runs the release build,
+    /// comments excluded.
+    fn container_build_flags(step: &str) -> Option<Vec<String>> {
+        let code = without_comments(step);
+        let invocation = code
+            .split("docker run")
+            .skip(1)
+            .find(|part| part.lines().any(is_release_cargo_build))?;
+        Some(
+            invocation
+                .split_whitespace()
+                .take_while(|token| !token.contains("manylinux"))
+                .map(str::to_owned)
+                .collect(),
+        )
+    }
+
+    /// Where each shipped release build in a workflow gets `AWS_LC_SYS_USE_SYSTEM`
+    /// from, as one message per way it can fail to be `0`.
+    ///
+    /// `aws-lc-sys` 0.46+ links an AWS-LC it detects on the build host
+    /// (`OPENSSL_DIR` or pkg-config) unless the variable is `0`, so a shipped
+    /// binary could depend on whatever that host provides. GitHub resolves the
+    /// value step, then job, then workflow, so each build step is judged on its
+    /// own against that order. A manylinux container inherits none of them: a
+    /// dropped `-e AWS_LC_SYS_USE_SYSTEM` reverts that build to host detection
+    /// with no other symptom.
+    fn aws_lc_opt_out_violations(workflow: &str, text: &str, expected_steps: usize) -> Vec<String> {
+        const VAR: &str = "AWS_LC_SYS_USE_SYSTEM";
+        let entry = |line: &str| {
+            line.trim()
+                .strip_prefix("AWS_LC_SYS_USE_SYSTEM:")
+                .map(|value| strip_quotes(strip_comment(value).trim()))
+        };
+        let workflow_value = text
+            .lines()
+            .filter(|line| indent_of(line) == 2)
+            .find_map(entry);
+        let jobs = top_level_block(text, "jobs");
+        let job_ids: Vec<&str> = jobs
+            .lines()
+            .filter(|line| indent_of(line) == 2 && !line.trim_start().starts_with('#'))
+            .filter_map(|line| line.trim().strip_suffix(':'))
+            .collect();
+
+        let mut violations = Vec::new();
+        let mut shipped_steps = 0;
+        for job in job_ids {
+            let block = job_block(text, job);
+            // Entries of a job-level `env:` sit at indent 6; a step's own keys
+            // are two columns deeper, so they cannot match here.
+            let job_value = block
+                .lines()
+                .filter(|line| indent_of(line) == 6)
+                .find_map(entry);
+            for step in shipped_release_build_steps(block) {
+                shipped_steps += 1;
+                let value = step_env(&step)
+                    .get(VAR)
+                    .cloned()
+                    .or_else(|| job_value.clone())
+                    .or_else(|| workflow_value.clone());
+                if value.as_deref() != Some("0") {
+                    violations.push(format!(
+                        "{workflow}: a shipped release build resolves `{VAR}` to {value:?} from \
+                         its step, job and workflow env, not \"0\":\n{step}"
+                    ));
+                }
+                let Some(flags) = container_build_flags(&step) else {
+                    continue;
+                };
+                let forwarded = flags.windows(2).any(|pair| {
+                    matches!(pair[0].as_str(), "-e" | "--env")
+                        && (pair[1] == VAR || pair[1] == format!("{VAR}=0"))
+                });
+                if !forwarded {
+                    violations.push(format!(
+                        "{workflow}: the manylinux container build does not forward `{VAR}` \
+                         (`-e {VAR}`), so it builds against whatever AWS-LC the host \
+                         provides:\n{step}"
+                    ));
+                }
+            }
+        }
+        if shipped_steps != expected_steps {
+            violations.push(format!(
+                "{workflow}: expected {expected_steps} shipped release build steps, found \
+                 {shipped_steps}. A step is counted when a line runs `cargo build` with \
+                 `--release` or `-r`; if a build was added or removed, update the count and \
+                 make sure it pins `{VAR}`, and if one was reshaped so it is no longer \
+                 recognised, teach `is_release_cargo_build` its spelling instead"
+            ));
+        }
+        violations
+    }
+
+    #[test]
+    fn shipped_release_builds_pin_the_vendored_aws_lc_opt_out() {
+        // The Linux and the Windows bundle build of each workflow.
+        for (workflow, expected_steps) in [("release.yml", 2), ("nightly.yml", 2), ("ci.yml", 2)] {
+            let violations =
+                aws_lc_opt_out_violations(workflow, &read_workflow(workflow), expected_steps);
+            assert!(violations.is_empty(), "{}", violations.join("\n\n"));
+        }
+    }
+
+    #[test]
+    fn aws_lc_opt_out_check_resolves_every_env_layer_and_spelling() {
+        const OFF: &str = "AWS_LC_SYS_USE_SYSTEM: \"0\"";
+        const ON: &str = "AWS_LC_SYS_USE_SYSTEM: \"1\"";
+        let workflow = |workflow_env: &str, job_env: &str, steps: &str| {
+            let job_env = if job_env.is_empty() {
+                String::new()
+            } else {
+                format!("    env:\n      {job_env}\n")
+            };
+            format!(
+                "env:\n  {workflow_env}\njobs:\n  build:\n    runs-on: ubuntu-latest\n{job_env}    steps:\n{steps}"
+            )
+        };
+        let native = |step_env: &str| {
+            let env = if step_env.is_empty() {
+                String::new()
+            } else {
+                format!("        env:\n          {step_env}\n")
+            };
+            format!("      - name: Build\n{env}        run: cargo build --release -p rocm\n")
+        };
+        let container = |flag: &str| {
+            r"      - name: Build
+        run: |
+          docker run --rm \
+            FLAG \
+            quay.io/pypa/manylinux2014_x86_64 \
+            /bin/bash -lc 'cargo build --release -p rocm'
+"
+            .replace("FLAG", flag)
+        };
+        let check =
+            |text: &str, expected: usize| aws_lc_opt_out_violations("t.yml", text, expected);
+
+        assert!(check(&workflow(OFF, "", &native("")), 1).is_empty());
+        assert!(
+            check(&workflow(OFF, ON, &native("")), 1).len() == 1,
+            "job env overrides the workflow's"
+        );
+        assert!(
+            check(&workflow(OFF, ON, &native(OFF)), 1).is_empty(),
+            "step env overrides the job's"
+        );
+        assert!(
+            check(&workflow(OFF, "", &native(ON)), 1).len() == 1,
+            "step env overrides the workflow's"
+        );
+        assert!(
+            check(&workflow("", "", &native("")), 1).len() == 1,
+            "an unset variable is not 0"
+        );
+
+        for flag in [
+            "-e AWS_LC_SYS_USE_SYSTEM",
+            "--env AWS_LC_SYS_USE_SYSTEM",
+            "-e AWS_LC_SYS_USE_SYSTEM=0",
+        ] {
+            assert!(
+                check(&workflow(OFF, "", &container(flag)), 1).is_empty(),
+                "{flag}"
+            );
+        }
+        for flag in [
+            "-e CARGO_HOME=/c",
+            "-e AWS_LC_SYS_USE_SYSTEM=1",
+            "# -e AWS_LC_SYS_USE_SYSTEM",
+        ] {
+            assert!(
+                check(&workflow(OFF, "", &container(flag)), 1).len() == 1,
+                "{flag}"
+            );
+        }
+
+        let unnamed = "      - run: cargo build --release -p rocm\n";
+        assert!(check(&workflow(OFF, "", unnamed), 1).is_empty());
+        assert_eq!(
+            check(&workflow(OFF, "", unnamed), 0).len(),
+            1,
+            "unnamed steps are counted"
+        );
+        assert_eq!(
+            check(&workflow("", "", unnamed), 1).len(),
+            1,
+            "unnamed steps are checked"
+        );
+        let harness = "      - name: Harness\n        run: cargo build --release -p rocm --features rocm/e2e-test-hooks\n";
+        assert!(
+            check(&workflow("", "", harness), 0).is_empty(),
+            "the e2e harness build is not shipped"
+        );
+        for spelling in [
+            "cargo build --locked --release -p rocm",
+            "cargo build -p rocm -r",
+        ] {
+            let step = format!("      - run: {spelling}\n");
+            assert_eq!(check(&workflow("", "", &step), 1).len(), 1, "{spelling}");
+            assert!(check(&workflow(OFF, "", &step), 1).is_empty(), "{spelling}");
+        }
+        assert!(
+            check(&workflow("", "", "      - run: cargo build -p rocm\n"), 0).is_empty(),
+            "a debug build is not shipped"
+        );
+        let quoting_the_harness = "      - name: Build\n        # unlike the e2e-test-hooks build\n        run: cargo build --release -p rocm\n";
+        assert_eq!(
+            check(&workflow("", "", quoting_the_harness), 1).len(),
+            1,
+            "a comment cannot exempt a shipped build"
+        );
+
+        assert_eq!(
+            check(&workflow(OFF, "", &native("")), 2).len(),
+            1,
+            "a missing shipped build is reported"
+        );
+        let commented = "AWS_LC_SYS_USE_SYSTEM: \"0\"  # vendored";
+        assert!(
+            check(&workflow(commented, "", &native("")), 1).is_empty(),
+            "workflow value with a trailing comment"
+        );
+        assert!(
+            check(&workflow("", commented, &native("")), 1).is_empty(),
+            "job value with a trailing comment"
+        );
+        let after_image = "      - name: Build\n        run: |\n          docker run --rm quay.io/pypa/manylinux2014_x86_64 \\\n            -e AWS_LC_SYS_USE_SYSTEM \\\n            /bin/bash -lc 'cargo build --release -p rocm'\n";
+        assert_eq!(
+            check(&workflow(OFF, "", after_image), 1).len(),
+            1,
+            "a flag after the image is not a docker flag"
+        );
+        let comment_key = workflow(OFF, "", &native("")).replace("jobs:\n", "jobs:\n  # note:\n");
+        assert!(
+            check(&comment_key, 1).is_empty(),
+            "a comment ending in a colon is not a job"
+        );
+    }
+
     #[test]
     fn every_ci_job_declares_a_timeout() {
         let ci = read_workflow("ci.yml");
