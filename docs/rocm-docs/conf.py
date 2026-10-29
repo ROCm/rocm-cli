@@ -82,6 +82,17 @@ exclude_patterns = []
 # -- Sphinx setup ----------------------------------------------------------
 
 
+ROCM_CORE_SDK_URL = "https://rocm.docs.amd.com/en/latest/"
+
+
+def _point_core_sdk_link_to_latest(app, pagename, templatename, context, doctree):
+    # On docs-X.Y.Z branches rocm-docs-core resolves every sister project to
+    # that same version, but the ROCm Core SDK has no docs-0.2.1 build.
+    context["projects"] = {**context["projects"], "rocm": ROCM_CORE_SDK_URL}
+
+
 def setup(app):
     """Sphinx setup"""
+    # Priority 900 runs after rocm_docs sets context["projects"] (default 500).
+    app.connect("html-page-context", _point_core_sdk_link_to_latest, priority=900)
     return {"parallel_read_safe": True, "parallel_write_safe": True}
