@@ -225,6 +225,79 @@ fn engine_recipe_with_aim_gfx_profile(
     }
 }
 
+fn aim_engine_record<'a>(
+    engine: &str,
+    recipe: Option<&'a ModelRecipeRecord>,
+) -> Option<&'a rocm_core::ModelRecipeEngineRecord> {
+    recipe
+        .filter(|_| engine.eq_ignore_ascii_case("aim"))?
+        .engine_recipes
+        .iter()
+        .find(|record| record.engine.eq_ignore_ascii_case("aim"))
+}
+
+/// Refuses to launch a gated AIM image before the container is pulled when no
+/// Hugging Face token will reach it: `--engine-env HF_TOKEN=<value>`, or the bare
+/// `--engine-env HF_TOKEN` with `HF_TOKEN` exported (the form that is never
+/// stored). Runs after `--engine-env` is applied to the hint.
+fn ensure_aim_hf_token(
+    engine: &str,
+    recipe: Option<&ModelRecipeRecord>,
+    hint: Option<&EngineRecipeHint>,
+    env: impl Fn(&str) -> Option<String>,
+) -> Result<()> {
+    if !aim_engine_record(engine, recipe).is_some_and(|record| record.requires_hf_token) {
+        return Ok(());
+    }
+    let supplied = hint
+        .and_then(|hint| hint.extra_env.get("HF_TOKEN"))
+        .is_some_and(|value| {
+            !value.trim().is_empty() || env("HF_TOKEN").is_some_and(|v| !v.trim().is_empty())
+        });
+    if supplied {
+        return Ok(());
+    }
+    let model = recipe.map_or("<model>", |r| r.canonical_model_id.as_str());
+    bail!(
+        "`{model}` is a gated model and needs a Hugging Face token. Export it and pass the \
+         bare name so it is forwarded and never stored: `export HF_TOKEN=<token>`, then \
+         `rocm serve {model} --engine aim --engine-env HF_TOKEN`"
+    )
+}
+
+/// Note shown when the pinned AIM profile targets boards other than the detected
+/// GPU (a gfx family can cover cards the profile was not built for).
+fn aim_board_note(
+    engine: &str,
+    recipe: Option<&ModelRecipeRecord>,
+    gpu_name: Option<&str>,
+) -> Option<String> {
+    let record = aim_engine_record(engine, recipe)?;
+    let name = gpu_name?;
+    if record.profile_ids.is_empty() || record.supported_boards.is_empty() {
+        return None;
+    }
+    let squash = |value: &str| {
+        value
+            .chars()
+            .filter(char::is_ascii_alphanumeric)
+            .collect::<String>()
+            .to_ascii_lowercase()
+    };
+    let name_key = squash(name);
+    if record
+        .supported_boards
+        .iter()
+        .any(|board| name_key.contains(&squash(board)))
+    {
+        return None;
+    }
+    Some(format!(
+        "the pinned AIM profile targets {}; `{name}` is not one of them, so it may not run well. Override with `--engine-env AIM_PROFILE_ID=<id>`",
+        record.supported_boards.join(" / ")
+    ))
+}
+
 fn protocol_engine_recipe_hint(
     recipe: &ModelRecipeRecord,
     engine: &str,
@@ -750,7 +823,31 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
         generation_defaults,
     )?;
     let engine_recipe = engine_recipe_with_extra_env(&selected_engine, engine_recipe, &engine_env)?;
-    let engine_env_note = engine_env_ignored_note(&selected_engine, &engine_env);
+    ensure_aim_hf_token(
+        &selected_engine,
+        shared_recipe.as_ref(),
+        engine_recipe.as_ref(),
+        |key| std::env::var(key).ok(),
+    )?;
+    let aim_gpu_name = aim_engine_record(&selected_engine, shared_recipe.as_ref())
+        .filter(|record| !record.profile_ids.is_empty())
+        .and_then(|_| {
+            host_gpu_summary
+                .clone()
+                .unwrap_or_else(|| detect_host_gpu_summary(Some(&paths)))
+                .name
+        });
+    let engine_env_notes: Vec<String> = [
+        engine_env_ignored_note(&selected_engine, &engine_env),
+        aim_board_note(
+            &selected_engine,
+            shared_recipe.as_ref(),
+            aim_gpu_name.as_deref(),
+        ),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
     let tool_call_note = if tool_call_parser.is_some() && !engine_serves_vllm {
         Some(format!(
             "note: --tool-call-parser applies only to vLLM; ignored for engine '{selected_engine}'"
@@ -966,7 +1063,7 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
         if let Some(note) = &gpu_memory_utilization_note {
             println!("  note: {note}");
         }
-        if let Some(note) = &engine_env_note {
+        for note in &engine_env_notes {
             println!("  note: {note}");
         }
     }
@@ -1048,9 +1145,7 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
                 host_gpu_summary.as_ref(),
                 engine_serves_vllm,
             );
-            if let Some(note) = &engine_env_note {
-                notes.push(note.clone());
-            }
+            notes.extend(engine_env_notes.iter().cloned());
             let summary = serve_summary::DeploymentSummary {
                 engine: selected_engine.clone(),
                 requested_model: model,
@@ -1315,6 +1410,69 @@ mod tests {
     }
 
     #[test]
+    fn gated_aim_model_needs_an_hf_token_before_launch() {
+        let gated = resolve_builtin_model_recipe("meta-llama/Llama-3.2-3B-Instruct")
+            .expect("gated aim entry");
+        let hint = |engine_env: &[&str]| {
+            engine_recipe_with_extra_env(
+                "aim",
+                protocol_engine_recipe_hint(&gated, "aim"),
+                &engine_env
+                    .iter()
+                    .map(|s| (*s).to_owned())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap()
+        };
+        let no_env = |_: &str| None;
+        let exported = |_: &str| Some("hf_x".to_owned());
+
+        // Without the flag, or with the bare flag but nothing exported, refuse and
+        // name the command that clears it.
+        for env in [&no_env as &dyn Fn(&str) -> Option<String>, &exported] {
+            let err = ensure_aim_hf_token("aim", Some(&gated), hint(&[]).as_ref(), env)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("--engine-env HF_TOKEN"), "{err}");
+        }
+        assert!(
+            ensure_aim_hf_token("aim", Some(&gated), hint(&["HF_TOKEN"]).as_ref(), no_env).is_err()
+        );
+        // The advised form (bare flag with the variable exported) or an explicit
+        // value clears it, and other engines are never checked.
+        assert!(
+            ensure_aim_hf_token("aim", Some(&gated), hint(&["HF_TOKEN"]).as_ref(), exported)
+                .is_ok()
+        );
+        assert!(
+            ensure_aim_hf_token(
+                "aim",
+                Some(&gated),
+                hint(&["HF_TOKEN=hf_y"]).as_ref(),
+                no_env
+            )
+            .is_ok()
+        );
+        assert!(ensure_aim_hf_token("vllm", Some(&gated), None, no_env).is_ok());
+        let open = resolve_builtin_model_recipe("Qwen/Qwen3-32B").expect("ungated aim entry");
+        assert!(ensure_aim_hf_token("aim", Some(&open), None, no_env).is_ok());
+    }
+
+    #[test]
+    fn aim_board_note_only_fires_for_a_pinned_profile_on_another_board() {
+        let radeon = resolve_builtin_model_recipe("aim-qwen3.5-9b").expect("radeon aim entry");
+        assert!(aim_board_note("aim", Some(&radeon), Some("AMD Radeon PRO W7900")).is_none());
+        assert!(aim_board_note("aim", Some(&radeon), Some("AMD Radeon AI PRO R9700")).is_none());
+        let note = aim_board_note("aim", Some(&radeon), Some("AMD Radeon RX 7900 XTX"))
+            .expect("other board warns");
+        assert!(note.contains("W7900 / R9700") && note.contains("--engine-env AIM_PROFILE_ID"));
+        assert!(aim_board_note("aim", Some(&radeon), None).is_none());
+        // Instinct images pin no profile, so there is nothing to mismatch.
+        let instinct = resolve_builtin_model_recipe("Qwen/Qwen3-32B").expect("instinct entry");
+        assert!(aim_board_note("aim", Some(&instinct), Some("anything")).is_none());
+    }
+
+    #[test]
     fn aim_gfx_check_is_skipped_when_the_gpu_is_unknown_or_the_engine_is_not_aim() {
         let radeon = resolve_builtin_model_recipe("aim-qwen3.5-9b").expect("radeon aim entry");
         let hint = protocol_engine_recipe_hint(&radeon, "aim");
@@ -1412,6 +1570,8 @@ mod tests {
                 generated_at_unix_ms: None,
                 supported_gfx_families: Vec::new(),
                 profile_ids: BTreeMap::new(),
+                requires_hf_token: false,
+                supported_boards: Vec::new(),
                 extra_env: BTreeMap::new(),
             },
             rocm_core::ModelRecipeEngineRecord {
@@ -1426,6 +1586,8 @@ mod tests {
                 generated_at_unix_ms: None,
                 supported_gfx_families: Vec::new(),
                 profile_ids: BTreeMap::new(),
+                requires_hf_token: false,
+                supported_boards: Vec::new(),
                 extra_env: BTreeMap::new(),
             },
         ];

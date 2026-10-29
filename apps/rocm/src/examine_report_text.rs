@@ -2039,6 +2039,8 @@ mod tests {
             generated_at_unix_ms: None,
             supported_gfx_families: Vec::new(),
             profile_ids: BTreeMap::new(),
+            requires_hf_token: false,
+            supported_boards: Vec::new(),
             extra_env: BTreeMap::new(),
         }];
         let mut output = String::new();

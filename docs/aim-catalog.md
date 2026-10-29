@@ -44,8 +44,10 @@ not need a rocm-cli maintainer.
    supports their tasks.
 5. Open a PR; `cargo test -p rocm-core model_recipe` validates the catalog.
 6. Check each image's model page in the AIM catalog for the line "requires a
-   Hugging Face authentication". For those, add the `HF_TOKEN` note to the
-   entry's `notes` (the pattern used by the existing gated entries).
+   Hugging Face authentication". For those, set `requires_hf_token: true` and
+   add the `HF_TOKEN` note to the entry's `notes` (the pattern used by the
+   existing gated entries). `rocm serve` then refuses to start the image until
+   `HF_TOKEN` is passed with `--engine-env`.
 7. Record which GPUs the image has profiles for. From the model page's profile
    table, set `supported_gfx_families` on the entry (MI250X `gfx90a`; MI300X and
    MI325X `gfx94X-dcgpu`; MI350X and MI355X `gfx950-dcgpu`; W7900 `gfx110X-all`;
@@ -56,3 +58,13 @@ not need a rocm-cli maintainer.
    profile (the lowest-GPU-count optimized latency profile, noting in `notes` if
    it needs more than one GPU). An explicit `--engine-env AIM_PROFILE_ID=...`
    still wins.
+8. On Radeon entries, set `supported_boards` to the board names in the profile
+   table (for example `W7900`, `R9700`). `rocm serve` warns, without refusing,
+   when the detected GPU name matches none of them, because a gfx family can
+   cover boards the pinned profile was not built for.
+9. Set `min_gpu_mem_gb`. The AIM docs publish GPU counts but no VRAM, so the
+   values in the catalog are estimates: total parameters times 1 byte (2 when
+   the image has no fp8 profile) plus 20% headroom, rounded up. Entries whose
+   parameter count is not published (DeepSeek-V4-Flash, MiniMax-M3, GLM-5.2) are
+   left unset rather than guessed. Replace an estimate with a measured figure
+   when one is available.

@@ -876,7 +876,9 @@ rocm serve amdenterpriseai/aim-radeon-qwen-qwen3-5-9b:0.12.0-preview --engine ai
 `--engine-env KEY=VALUE` is stored with the service record, so use it for
 non-secret values only. For a secret such as a gated model's `HF_TOKEN`, export
 it and pass the bare name (`export HF_TOKEN=...`, then `--engine-env HF_TOKEN`):
-it is forwarded from your environment and never stored. `--engine-env` is
+it is forwarded from your environment and never stored. A gated model
+(`rocm model --verbose` shows `requires_hf_token` in its notes) is refused before
+anything is pulled if no token was passed. `--engine-env` is
 ignored by the other engines (the command prints a note saying so).
 
 Expected result:
