@@ -645,3 +645,23 @@ Feature: Interactive dashboard
     And the user closes the Diagnose screen
     And the user quits the dashboard
     Then the dashboard exits successfully
+
+  # #286: the header's warning badge counted warnings but gave no way to read
+  # them, and while a GPU is reported the text is drawn nowhere else in the
+  # dashboard. A recording supplies one warning next to a working GPU so the
+  # scenario needs no daemon and no particular host hardware; the user reads
+  # the text from the badge with `!`. The key gating (the popup never opens over
+  # an approval or another overlay) and the click on the badge are asserted by
+  # the unit tests in `crates/rocm-dash-tui/src/app/` and `ui/mod.rs`, where
+  # a mouse event can be sent directly.
+  @id:dash-warning-badge-opens-the-warning @requires-os:linux
+  Scenario: dash-38 - A user reads the warning behind the header badge
+    When the user opens the dashboard replaying a recording that reports a warning
+    Then the header shows that one warning is reported
+    When the user opens the warnings
+    Then the warning text is displayed
+    And the backdrop behind the popup is dimmed
+    When the user presses Escape
+    Then the warning text is no longer displayed
+    When the user quits the dashboard
+    Then the dashboard exits successfully

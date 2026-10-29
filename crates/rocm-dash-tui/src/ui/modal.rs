@@ -142,6 +142,7 @@ pub fn draw_help(f: &mut Frame, area: Rect, tab: ActiveTab, theme: &Theme) {
         key_line("Tab / Shift-Tab", "next / previous tab", theme),
         key_line("1 .. 5", "jump to tab", theme),
         key_line("t", "open theme picker", theme),
+        key_line("!", "show warnings (header ⚠ badge)", theme),
         key_line("Space", "pause / resume (replay only)", theme),
         key_line("+ / -", "speed up / slow down (replay only)", theme),
         key_line("[ / ]", "jump ±10s (replay only)", theme),
@@ -214,6 +215,50 @@ pub fn draw_help(f: &mut Frame, area: Rect, tab: ActiveTab, theme: &Theme) {
     let popup = centered_rect(70, 100, 80, needed, area);
     let inner = draw_popup_frame(f, popup, &help_title("Help", needed, popup), theme);
 
+    f.render_widget(p, inner);
+}
+
+/// Render the Warnings modal: every warning the daemon currently reports, the
+/// full text behind the header `⚠ N` badge.
+///
+/// Content-sized like [`draw_help`] — the warnings are few and short-lived, so
+/// the popup is sized to them and marks its title when the terminal is too
+/// short, rather than growing a scroll position of its own.
+pub fn draw_warnings(f: &mut Frame, area: Rect, warnings: &[String], theme: &Theme) {
+    grey_overlay(f);
+    let mut lines: Vec<Line> = if warnings.is_empty() {
+        // The daemon can clear its warnings while the popup is open.
+        vec![Line::from(Span::styled(
+            "No active warnings.",
+            Style::default().fg(theme.muted),
+        ))]
+    } else {
+        warnings
+            .iter()
+            .map(|w| {
+                Line::from(vec![
+                    Span::styled("• ", Style::default().fg(theme.warn)),
+                    Span::styled(w.as_str(), Style::default().fg(theme.fg)),
+                ])
+            })
+            .collect()
+    };
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        "Esc / Enter / ! close",
+        Style::default().fg(theme.muted),
+    )));
+
+    let p = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let width = centered_width(70, 80, area);
+    let needed = popup_height_for(p.line_count(width.saturating_sub(2)));
+    let popup = centered_rect(70, 100, 80, needed, area);
+    let title = if warnings.is_empty() {
+        "Warnings".to_string()
+    } else {
+        format!("Warnings ({})", warnings.len())
+    };
+    let inner = draw_popup_frame(f, popup, &help_title(&title, needed, popup), theme);
     f.render_widget(p, inner);
 }
 
@@ -700,6 +745,7 @@ pub fn draw_global_help(f: &mut Frame, area: Rect, theme: &Theme) {
                 (":", "command palette"),
                 ("? ", "this help"),
                 ("t", "theme picker"),
+                ("!", "show warnings"),
             ],
         ),
     ];
@@ -1164,6 +1210,64 @@ mod ported_chrome_tests {
         }
     }
 
+    #[test]
+    fn warnings_modal_lists_every_warning_with_a_count() {
+        let theme = Theme::from_name("default-dark");
+        let warnings = vec![
+            "amd-smi unavailable (alpha)".to_string(),
+            "vram attribution: beta".to_string(),
+            "vllm scrape: gamma".to_string(),
+        ];
+        let area = Rect::new(0, 0, 80, 30);
+        let painted = rows(80, 30, |f| {
+            super::draw_warnings(f, area, &warnings, &theme);
+        })
+        .join("\n");
+        for w in &warnings {
+            assert!(painted.contains(w.as_str()), "missing {w:?}:\n{painted}");
+        }
+        assert!(painted.contains("Warnings (3)"), "{painted}");
+    }
+
+    #[test]
+    fn warnings_modal_does_not_clip_a_long_warning_on_a_narrow_terminal() {
+        let theme = Theme::from_name("default-dark");
+        let warnings = vec![
+            "amd-smi is missing, unresolvable, or failed to run, even though a GPU was \
+             detected by other means - it may not be supported on this platform yet"
+                .to_string(),
+        ];
+        let area = Rect::new(0, 0, 40, 30);
+        let painted = rows(40, 30, |f| {
+            super::draw_warnings(f, area, &warnings, &theme);
+        })
+        .join("\n");
+        assert!(
+            painted.contains("platform yet"),
+            "the tail of the warning must survive wrapping:\n{painted}"
+        );
+    }
+
+    #[test]
+    fn warnings_modal_says_so_when_the_warnings_have_cleared() {
+        let theme = Theme::from_name("default-dark");
+        let area = Rect::new(0, 0, 80, 30);
+        let painted = rows(80, 30, |f| super::draw_warnings(f, area, &[], &theme)).join("\n");
+        assert!(painted.contains("No active warnings."), "{painted}");
+    }
+
+    #[test]
+    fn warnings_modal_marks_its_title_when_the_terminal_is_too_short() {
+        let theme = Theme::from_name("default-dark");
+        let warnings: Vec<String> = (0..12).map(|i| format!("warning number {i}")).collect();
+        let area = Rect::new(0, 0, 80, 8);
+        let painted = rows(80, 8, |f| {
+            super::draw_warnings(f, area, &warnings, &theme);
+        })
+        .join("\n");
+        assert!(painted.contains("truncated"), "{painted}");
+    }
+
     /// When the content genuinely cannot fit, the modal takes **every** row of
     /// the area rather than a fixed share of it, so the most hints the terminal
     /// can hold are shown. This is what `pct_y = 100` buys over the old 70%.
@@ -1190,10 +1294,10 @@ mod ported_chrome_tests {
             painted.join("\n")
         );
         // Eight inner rows, so eight wrapped hint rows: `q`, the two the Ctrl-C
-        // hint wraps to, `?`, Tab, `1 .. 5`, `t`, Space. A 70% share would stop
+        // hint wraps to, `?`, Tab, `1 .. 5`, `t`, `!`. A 70% share would stop
         // five rows in, at `next / previous tab`.
         assert!(
-            painted[8].contains("pause / resume"),
+            painted[8].contains("show warnings"),
             "a full-height modal must paint every row it has:\n{}",
             painted.join("\n")
         );

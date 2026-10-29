@@ -218,6 +218,9 @@ pub struct AppState {
     pub last_body_area: Option<ratatui::layout::Rect>,
     /// Same for the tab bar, used for click-to-switch-tab.
     pub last_tab_bar_area: Option<ratatui::layout::Rect>,
+    /// Header `⚠ N` badge from the most recent draw (`None` when no warning is
+    /// shown). Left-clicking it dispatches the same `KeyAction` as `!`.
+    pub last_header_badge: Option<ratatui::layout::Rect>,
     /// Clickable footer-legend chips from the most recent draw. Left-clicking a
     /// chip dispatches the same `KeyAction` as pressing that key.
     pub last_footer_chips: Vec<FooterChip>,
@@ -377,6 +380,7 @@ impl AppState {
             launcher_hosted: false,
             last_body_area: None,
             last_tab_bar_area: None,
+            last_header_badge: None,
             last_footer_chips: Vec::new(),
             jobs: rocm_dash_core::state::State::default(),
             services: None,
@@ -876,6 +880,23 @@ impl AppState {
     /// comments.
     pub(crate) const fn overlay_or_approval(&self) -> bool {
         self.has_open_overlay() || self.blocks_body_absolutely()
+    }
+
+    /// Whether a global hotkey reaches its normal `handle_key` arm right now,
+    /// or something else owns the keyboard first: a manager overlay or pending
+    /// approval/quit-confirm owns every key, a plain `Modal::*` returns from
+    /// its own arm, and focused chat text entry consumes every `Char`. Anything
+    /// that dispatches a global hotkey action from a click (footer chips, the
+    /// header warning badge) must gate on this, or the click can do what the
+    /// key it stands for never could.
+    pub(crate) const fn global_hotkeys_reachable(&self) -> bool {
+        let chat_typing = matches!(self.active_tab, ActiveTab::Chat) && self.chat_focused;
+        !(self.overlay_or_approval() || !matches!(self.modal, Modal::None) || chat_typing)
+    }
+
+    /// Number of warnings in the latest snapshot — what the header badge shows.
+    pub(crate) fn warning_count(&self) -> usize {
+        self.latest.as_ref().map_or(0, |s| s.warnings.len())
     }
 
     /// Focused-host exit gate: `true` when a `focus` is active AND its single

@@ -70,7 +70,7 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
     let body = outer[1];
     let footer_area = outer[2];
 
-    draw_header(f, outer[0], state, &theme);
+    state.last_header_badge = draw_header(f, outer[0], state, &theme);
 
     // The body is framed by the outlined folder-tab panel (the live chrome). On
     // a wide screen the panel wraps only the CENTER column so the tabs read as
@@ -141,6 +141,10 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
         Modal::Palette => modal::draw_palette(f, body, state.palette_sel, &theme),
         Modal::Options => modal::draw_options(f, body, state, &theme),
         Modal::GlobalHelp => modal::draw_global_help(f, body, &theme),
+        Modal::Warnings => {
+            let warnings = state.latest.as_ref().map_or(&[][..], |s| &s.warnings[..]);
+            modal::draw_warnings(f, body, warnings, &theme);
+        }
     }
 
     // Operational managers render as a centered MODAL on every tab. The
@@ -576,7 +580,9 @@ const fn wide_triptych(body: Rect) -> Option<(Rect, Rect, Rect)> {
     Some((left, center_outer, right))
 }
 
-fn draw_header(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+/// Draw the header and return where the `⚠ N` warning badge landed (clipped to
+/// the header, `None` when no badge is shown) so a click on it can be resolved.
+fn draw_header(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) -> Option<Rect> {
     // In demo/replay the data is not live, so never present the session as
     // "connected" to a real daemon — the Connected case shows a simulated label
     // instead, and the SIMULATED DATA chip below makes the state unmistakable.
@@ -614,23 +620,41 @@ fn draw_header(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         ));
         spans.push(Span::raw("  "));
     }
+    let warning_count = state.warning_count();
+    // (column offset within the header, width) of the badge, once placed.
+    let mut badge: Option<(u16, u16)> = None;
+    // Placed right after the brand, ahead of the connection target and status:
+    // the header is one unwrapped row, and on an 80-column terminal those two
+    // already fill it, which would clip a trailing badge out of sight (and out of
+    // reach of a click) when it is the part that asks the user to do something.
+    if warning_count > 0 {
+        let offset: usize = spans.iter().map(Span::width).sum();
+        // Advertise the key only where it works; the click is gated the same way.
+        let hint = if state.global_hotkeys_reachable() {
+            " (!)"
+        } else {
+            ""
+        };
+        let badge_span = Span::styled(
+            format!(" ⚠ {warning_count}{hint} "),
+            Style::default()
+                .bg(theme.warn)
+                .fg(theme.surface_2)
+                .add_modifier(Modifier::BOLD),
+        );
+        badge = Some((
+            u16::try_from(offset).unwrap_or(u16::MAX),
+            u16::try_from(badge_span.width()).unwrap_or(u16::MAX),
+        ));
+        spans.push(badge_span);
+        spans.push(Span::raw("   "));
+    }
     spans.push(Span::styled(
         format!("→ {}", state.connect),
         Style::default().fg(theme.muted),
     ));
     spans.push(Span::raw("   "));
     spans.push(Span::styled(status_text, Style::default().fg(status_color)));
-    let warning_count = state.latest.as_ref().map_or(0, |s| s.warnings.len());
-    if warning_count > 0 {
-        spans.push(Span::raw("   "));
-        spans.push(Span::styled(
-            format!(" ⚠ {warning_count} "),
-            Style::default()
-                .bg(theme.warn)
-                .fg(theme.surface_2)
-                .add_modifier(Modifier::BOLD),
-        ));
-    }
     if let Some(r) = state.replay.as_ref() {
         spans.push(Span::raw("   "));
         let (icon, fg) = if r.paused {
@@ -670,6 +694,12 @@ fn draw_header(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     ));
     let inner = panel::bento(f, area, None, panel::BoxRole::Neutral, false, theme);
     f.render_widget(Paragraph::new(vec![Line::from(spans)]), inner);
+    // The paragraph is not wrapped, so whatever runs past `inner` is cut off; the
+    // clickable region must be cut the same way.
+    badge.and_then(|(offset, width)| {
+        let width = width.min(inner.width.saturating_sub(offset));
+        (inner.height > 0 && width > 0).then(|| Rect::new(inner.x + offset, inner.y, width, 1))
+    })
 }
 
 /// One footer-legend segment: a key chip (optionally clickable) or plain text.
@@ -703,7 +733,7 @@ fn draw_footer(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) -> Ve
     let overlay_or_approval = state.overlay_or_approval();
     let modal_open = state.modal != Modal::None;
     let chat_typing = state.active_tab == ActiveTab::Chat && state.chat_focused;
-    let hotkeys_owned_elsewhere = overlay_or_approval || modal_open || chat_typing;
+    let hotkeys_owned_elsewhere = !state.global_hotkeys_reachable();
     let mut segs: Vec<Seg> = vec![
         // A real Tab keypress reaches `SwitchTab` only in that same idle
         // state: every modal arm (including `Options`, which remaps Tab to
@@ -1828,6 +1858,123 @@ mod tests {
             !row.contains("Esc  cancel"),
             "finished-job console Esc chip should not say cancel: {row:?}"
         );
+    }
+
+    /// A state whose latest snapshot has a working GPU and these warnings — the
+    /// case where the warning text was shown nowhere at all.
+    fn state_with_warnings(warnings: &[&str]) -> AppState {
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.latest = Some(rocm_dash_core::metrics::Snapshot {
+            gpus: vec![rocm_dash_core::metrics::GpuMetrics {
+                device_id: "gpu-0".into(),
+                vram_total_mb: 1024,
+                ..Default::default()
+            }],
+            warnings: warnings.iter().map(|w| (*w).to_string()).collect(),
+            ..Default::default()
+        });
+        s
+    }
+
+    /// Draw a whole frame and return its rows as text.
+    fn draw_frame(state: &mut AppState, w: u16, h: u16) -> Vec<String> {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| draw(f, state)).unwrap();
+        let buf = term.backend().buffer();
+        (0..h)
+            .map(|y| (0..w).map(|x| buf.cell((x, y)).unwrap().symbol()).collect())
+            .collect()
+    }
+
+    fn text_in(rows: &[String], r: Rect) -> String {
+        rows[usize::from(r.y)]
+            .chars()
+            .skip(usize::from(r.x))
+            .take(usize::from(r.width))
+            .collect()
+    }
+
+    #[test]
+    fn header_badge_region_covers_the_drawn_badge_and_advertises_the_key() {
+        let mut s = state_with_warnings(&["only one"]);
+        let rows = draw_frame(&mut s, 140, 40);
+        let badge = s.last_header_badge.expect("a warning is shown, so a badge");
+        let under = text_in(&rows, badge);
+        assert!(under.contains('⚠') && under.contains("1 (!)"), "{under:?}");
+    }
+
+    #[test]
+    fn header_has_no_badge_region_without_warnings() {
+        let mut s = state_with_warnings(&[]);
+        draw_frame(&mut s, 140, 40);
+        assert_eq!(s.last_header_badge, None);
+    }
+
+    #[test]
+    fn header_badge_drops_the_key_hint_while_another_modal_owns_the_keyboard() {
+        let mut s = state_with_warnings(&["only one"]);
+        s.modal = Modal::Help;
+        let rows = draw_frame(&mut s, 140, 40);
+        let badge = s.last_header_badge.expect("the badge is still counted");
+        let under = text_in(&rows, badge);
+        assert!(under.contains('⚠'), "{under:?}");
+        assert!(!under.contains("(!)"), "`!` does nothing here: {under:?}");
+    }
+
+    #[test]
+    fn header_badge_is_visible_on_an_80_column_terminal_with_a_long_connection_line() {
+        // The connection target and status already fill an 80-column header; a
+        // badge drawn after them was cut off, so the count (and its click) could
+        // not be seen on the smallest terminal the dashboard supports.
+        let mut s = state_with_warnings(&["only one"]);
+        s.connect = "replay:a-recording-with-a-fairly-long-name.ndjson".into();
+        s.conn = ConnState::Connected {
+            host: "a-host-with-a-long-name".into(),
+            version: "0.1.0".into(),
+        };
+        let rows = draw_frame(&mut s, 80, 24);
+        let badge = s.last_header_badge.expect("badge must fit at 80 columns");
+        assert!(text_in(&rows, badge).contains('⚠'), "{:?}", rows[1]);
+    }
+
+    #[test]
+    fn header_badge_region_is_clipped_to_a_header_narrower_than_the_badge() {
+        use crate::ui::theme::Theme;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let s = state_with_warnings(&["only one"]);
+        let theme = Theme::from_name("default-dark");
+        let badge_at = |w: u16| {
+            let mut term = Terminal::new(TestBackend::new(w, 3)).unwrap();
+            let mut badge = None;
+            term.draw(|f| badge = draw_header(f, f.area(), &s, &theme))
+                .unwrap();
+            badge
+        };
+        let full = badge_at(120).expect("room for the whole badge").width;
+        let mut clipped = false;
+        for w in 1..=40u16 {
+            if let Some(r) = badge_at(w) {
+                assert!(r.x + r.width <= w, "width {w}: {r:?} runs off the screen");
+                clipped |= r.width < full;
+            }
+        }
+        assert!(
+            clipped,
+            "no width cut the badge short, so clipping is untested"
+        );
+    }
+
+    #[test]
+    fn warnings_popup_shows_the_warning_text_while_a_gpu_is_reported() {
+        let mut s = state_with_warnings(&["vram attribution: first", "vllm scrape: second"]);
+        s.modal = Modal::Warnings;
+        let frame = draw_frame(&mut s, 120, 40).join("\n");
+        assert!(frame.contains("vram attribution: first"), "{frame}");
+        assert!(frame.contains("vllm scrape: second"), "{frame}");
+        assert!(frame.contains("Warnings (2)"), "{frame}");
     }
 
     #[test]

@@ -124,6 +124,15 @@ pub(crate) fn resolve_mouse(me: MouseEvent, state: &AppState) -> KeyAction {
         {
             return KeyAction::SwitchTab(tab);
         }
+        // Header warning badge: a click acts exactly like `!`, and is gated the
+        // same way, so it cannot close an overlay or discard a pending approval
+        // that the key itself could never reach.
+        if let Some(badge) = state.last_header_badge
+            && state.global_hotkeys_reachable()
+            && badge.contains((me.column, me.row).into())
+        {
+            return KeyAction::ToggleWarnings;
+        }
         // Footer legend: a click on a key chip acts exactly like the key press.
         if let Some(chip) = footer_chip_hit(&state.last_footer_chips, me.column, me.row) {
             return chip;
@@ -432,6 +441,95 @@ mod tests {
         // Manager open → the body click is swallowed (no click-through).
         s.install_manager = Some(crate::ui::install_manager::InstallManagerState::default());
         assert_eq!(resolve_mouse(click, &s), KeyAction::Nothing);
+    }
+
+    fn click_at(column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn clicking_the_header_badge_acts_like_the_bang_key() {
+        let mut s = st();
+        s.last_header_badge = Some(Rect::new(20, 1, 9, 1));
+        assert_eq!(
+            resolve_mouse(click_at(20, 1), &s),
+            KeyAction::ToggleWarnings
+        );
+        assert_eq!(
+            resolve_mouse(click_at(28, 1), &s),
+            KeyAction::ToggleWarnings
+        );
+        // Just outside the badge on either side, and on the row below it.
+        for (x, y) in [(19, 1), (29, 1), (22, 2)] {
+            assert_ne!(
+                resolve_mouse(click_at(x, y), &s),
+                KeyAction::ToggleWarnings,
+                "({x}, {y})"
+            );
+        }
+        s.last_header_badge = None;
+        assert_ne!(
+            resolve_mouse(click_at(22, 1), &s),
+            KeyAction::ToggleWarnings,
+            "no badge drawn, nothing to click"
+        );
+    }
+
+    /// Own the screen with `own`, then click the header badge.
+    fn assert_badge_click_blocked_while(what: &str, own: impl FnOnce(&mut AppState)) {
+        let mut s = st();
+        s.last_header_badge = Some(Rect::new(20, 1, 9, 1));
+        own(&mut s);
+        assert_ne!(
+            resolve_mouse(click_at(22, 1), &s),
+            KeyAction::ToggleWarnings,
+            "badge click must not fire while {what} owns the screen"
+        );
+    }
+
+    // Opening the popup runs `close_overlays()`, which would silently discard
+    // whatever owns the screen — a pending approval most of all — so the click
+    // must be refused wherever the `!` key itself would not fire.
+    #[test]
+    fn the_header_badge_is_not_clickable_while_a_plain_modal_is_open() {
+        assert_badge_click_blocked_while("a plain modal", |s| s.modal = Modal::Help);
+    }
+
+    #[test]
+    fn the_header_badge_is_not_clickable_while_a_manager_overlay_is_open() {
+        assert_badge_click_blocked_while("a manager overlay", |s| {
+            s.services = Some(crate::ui::services_manager::ServicesManagerState::default());
+        });
+    }
+
+    #[test]
+    fn the_header_badge_is_not_clickable_while_an_approval_is_pending() {
+        assert_badge_click_blocked_while("a pending approval", |s| {
+            s.open_approval(crate::tool_exec::ApprovalIntent {
+                title: "run a command".into(),
+                body: vec!["echo hi".into()],
+                name: "shell".into(),
+                arguments: serde_json::Value::Null,
+            });
+        });
+    }
+
+    #[test]
+    fn the_header_badge_is_not_clickable_while_quit_is_being_confirmed() {
+        assert_badge_click_blocked_while("the quit-confirm prompt", AppState::open_quit_confirm);
+    }
+
+    #[test]
+    fn the_header_badge_is_not_clickable_while_typing_in_chat() {
+        assert_badge_click_blocked_while("focused chat text entry", |s| {
+            s.active_tab = ActiveTab::Chat;
+            s.chat_focused = true;
+        });
     }
 
     #[test]

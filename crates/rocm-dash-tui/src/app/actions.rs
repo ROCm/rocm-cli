@@ -196,6 +196,14 @@ pub(crate) fn apply_action(state: &mut AppState, action: KeyAction) -> bool {
                 Modal::Help
             };
         }
+        KeyAction::ToggleWarnings => {
+            if state.modal == Modal::Warnings {
+                state.modal = Modal::None;
+            } else if state.warning_count() > 0 {
+                state.close_overlays();
+                state.modal = Modal::Warnings;
+            }
+        }
         KeyAction::CloseModal => state.modal = Modal::None,
         // The operational overlays are mutually exclusive: opening any one first
         // closes the rest (see `close_overlays`), so no open path — key, mouse,
@@ -393,6 +401,9 @@ pub enum KeyAction {
     SelectLast,
     OpenDetail,
     ToggleHelp,
+    /// Open the warnings popup (the full text behind the header `⚠ N` badge),
+    /// or close it. A no-op while the daemon reports no warnings.
+    ToggleWarnings,
     CloseModal,
     OpenThemePicker,
     ApplyThemePick,
@@ -605,6 +616,14 @@ pub(crate) fn handle_key(
             _ => KeyAction::Nothing,
         };
     }
+    // Warnings popup: absorbs everything except quit / close, like Help.
+    if *modal == Modal::Warnings {
+        return match k.code {
+            KeyCode::Char('q') => KeyAction::Quit,
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('!') => KeyAction::CloseModal,
+            _ => KeyAction::Nothing,
+        };
+    }
     // Global help overlay (opened from the Esc menu): close, same as the
     // contextual Help above.
     if *modal == Modal::GlobalHelp {
@@ -658,6 +677,7 @@ pub(crate) fn handle_key(
         KeyCode::Esc => KeyAction::OpenMenu,
         KeyCode::Char(':') => KeyAction::OpenPalette,
         KeyCode::Char('?') => KeyAction::ToggleHelp,
+        KeyCode::Char('!') => KeyAction::ToggleWarnings,
         KeyCode::Char('t') => KeyAction::OpenThemePicker,
         KeyCode::BackTab => KeyAction::SwitchTab(current.prev()),
         KeyCode::Tab => {
@@ -1566,6 +1586,76 @@ mod tests {
             handle_mouse(scroll_down, &Modal::None, ActiveTab::Rocm),
             KeyAction::Nothing
         );
+    }
+
+    fn with_warnings(s: &mut AppState, n: usize) {
+        s.latest = Some(rocm_dash_core::metrics::Snapshot {
+            warnings: (0..n).map(|i| format!("warning {i}")).collect(),
+            ..Default::default()
+        });
+    }
+
+    #[test]
+    fn bang_opens_the_warnings_popup_from_every_tab() {
+        for tab in [
+            ActiveTab::Home,
+            ActiveTab::Rocm,
+            ActiveTab::Serving,
+            ActiveTab::Observe,
+            ActiveTab::Chat,
+        ] {
+            assert_eq!(
+                hk(KeyCode::Char('!'), tab),
+                KeyAction::ToggleWarnings,
+                "{tab:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn warnings_popup_closes_on_esc_enter_and_bang_and_absorbs_other_keys() {
+        let key = |c| {
+            handle_key(
+                press(c),
+                ActiveTab::Home,
+                &Modal::Warnings,
+                ChatKeyCtx::default(),
+            )
+        };
+        for c in [KeyCode::Esc, KeyCode::Enter, KeyCode::Char('!')] {
+            assert_eq!(key(c), KeyAction::CloseModal, "{c:?}");
+        }
+        assert_eq!(key(KeyCode::Char('q')), KeyAction::Quit);
+        // Like Help: nothing underneath may react while the popup is open.
+        for c in [
+            KeyCode::Char('t'),
+            KeyCode::Char('?'),
+            KeyCode::Char('1'),
+            KeyCode::Tab,
+            KeyCode::Down,
+        ] {
+            assert_eq!(key(c), KeyAction::Nothing, "{c:?}");
+        }
+    }
+
+    #[test]
+    fn toggle_warnings_opens_then_closes_the_popup() {
+        let mut s = st();
+        with_warnings(&mut s, 2);
+        apply_action(&mut s, KeyAction::ToggleWarnings);
+        assert_eq!(s.modal, Modal::Warnings);
+        apply_action(&mut s, KeyAction::ToggleWarnings);
+        assert_eq!(s.modal, Modal::None);
+    }
+
+    #[test]
+    fn toggle_warnings_opens_nothing_when_there_are_no_warnings() {
+        let mut s = st();
+        apply_action(&mut s, KeyAction::ToggleWarnings);
+        assert_eq!(s.modal, Modal::None, "no snapshot yet");
+        with_warnings(&mut s, 0);
+        apply_action(&mut s, KeyAction::ToggleWarnings);
+        assert_eq!(s.modal, Modal::None, "snapshot without warnings");
     }
 
     #[test]
