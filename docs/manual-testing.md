@@ -267,9 +267,10 @@ Expected result: the plan names the floating `latest` amdgpu release unless
 instead. A malformed override (e.g. containing a space or `'`) is refused with
 a reason naming `ROCM_CLI_AMDGPU_DRIVER_VERSION`, not silently ignored.
 
-On an Ubuntu 26.04 host, expect `supported: false` instead: `repo.radeon.com`
-has no DKMS repo for it yet (the amdgpu driver ships in-tree), so the plan
-directs you to `apt install rocm` rather than naming any DKMS commands.
+On Ubuntu 22.04, 24.04 and 26.04 the apt source line names the matching suite
+(`jammy`, `noble`, `resolute`). If `amdgpu-dkms` is already installed, the
+first prepare command prints a "from a previous installation" warning; confirm
+nothing is removed (`dpkg -s amdgpu-dkms` still reports installed afterwards).
 
 ## 3. Lemonade GPU Verification
 

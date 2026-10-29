@@ -39,6 +39,10 @@ use serde::Deserialize;
 
 use crate::EnginesCommand;
 use crate::engine_ipc::{engine_request, engine_request_with_env_root};
+use crate::engine_runtime_select::{
+    apply_app_path_env, resolve_engine_selection, resolve_runtime_selector_to_exact_key,
+    validate_engine_selection_runtime,
+};
 use crate::runtime_install_finalize::{
     ensure_libatomic_for_torch, ensure_libnuma_for_torch, ensure_openmpi_for_vllm,
     settle_engine_install,
@@ -48,11 +52,7 @@ use crate::runtimes_cmd::{
     validate_runtime_manifest_for_activation,
 };
 use crate::therock;
-use crate::{
-    apply_app_path_env, record_cli_audit_event, render_engine_inventory_text_with_paths,
-    resolve_engine_selection, resolve_runtime_selector_to_exact_key,
-    validate_engine_selection_runtime,
-};
+use crate::{record_cli_audit_event, render_engine_inventory_text_with_paths};
 
 pub(crate) fn render_engine_inventory_text() -> String {
     let paths = AppPaths::discover().ok();

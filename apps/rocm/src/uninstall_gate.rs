@@ -17,10 +17,10 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::chat::loopback_tcp_port_is_reachable;
+use crate::services_text::{MANAGED_STOP_GRACE, stop_internal_managed_service_confirmed};
 use crate::{
-    MANAGED_STOP_GRACE, endpoint_keys, host_port_resolves, load_managed_services,
-    managed_service_is_live, managed_service_record_is_in_use,
-    stop_internal_managed_service_confirmed,
+    endpoint_keys, host_port_resolves, load_managed_services, managed_service_is_live,
+    managed_service_record_is_in_use,
 };
 
 /// A managed service uninstall could not confirm stopped, and why.

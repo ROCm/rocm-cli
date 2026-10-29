@@ -854,6 +854,23 @@ fn pending_stop_proposal_exists(paths: &AppPaths, service_id: &str) -> Result<bo
         }))
 }
 
+/// Reads the whole proposals store rather than a recent window: a pending
+/// proposal is never dropped, so it can be arbitrarily old, and a window that
+/// missed it would let the watcher queue a duplicate once the original aged
+/// out of that window. Compaction bounds the reviewed proposals to a fixed
+/// count; pending ones are kept.
+fn pending_restart_proposal_exists(paths: &AppPaths, service_id: &str) -> Result<bool> {
+    Ok(rocm_core::load_automation_proposals(paths)?
+        .into_iter()
+        .any(|proposal| {
+            proposal.status == "pending"
+                && proposal.watcher_id == "server-recover"
+                && proposal.service_id.as_deref() == Some(service_id)
+                && (proposal.action == "queue_restart_proposal"
+                    || proposal.tool.as_deref() == Some("restart_server"))
+        }))
+}
+
 fn handle_cache_warm_event(
     paths: &AppPaths,
     mode: WatcherMode,
@@ -1225,6 +1242,43 @@ fn handle_server_recover_event_with_record(
             Some(record.service_id.clone()),
         ),
         WatcherPolicyAction::QueueProposal => {
+            // An unreadable proposals store is reported and skipped, never
+            // propagated: the daemon loop exits on an error out of
+            // `evaluate_watchers`, so a store that stays corrupt would take it
+            // down on every recovery tick.
+            match pending_restart_proposal_exists(paths, &record.service_id) {
+                Ok(true) => {
+                    return crate::persistence::record_event(
+                        paths,
+                        state,
+                        "server-recover",
+                        "info",
+                        "restart_proposal_already_pending",
+                        &format!(
+                            "managed service {} needs recovery ({recovery_reason_display}); a restart request awaiting review is already queued",
+                            record.service_id,
+                        ),
+                        Some(record.service_id.clone()),
+                    );
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    return crate::persistence::record_event(
+                        paths,
+                        state,
+                        "server-recover",
+                        "error",
+                        "restart_proposal_check_failed",
+                        &format!(
+                            "managed service {} needs recovery ({recovery_reason_display}); \
+                             not queueing a restart request because the proposals store could \
+                             not be checked for one already pending: {error:#}",
+                            record.service_id,
+                        ),
+                        Some(record.service_id.clone()),
+                    );
+                }
+            }
             let message = format!(
                 "managed service {} needs recovery ({recovery_reason_display}); queueing restart proposal",
                 record.service_id,
@@ -2232,6 +2286,277 @@ mod tests {
                 .iter()
                 .any(|event| event.action == "stop_proposal_already_pending")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn server_recover_does_not_duplicate_pending_restart_proposals() -> Result<()> {
+        let (root, paths) = temp_app_paths("server-recover-dedupe");
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-unhealthy",
+            "vllm",
+            "tiny",
+            "Tiny/Test",
+            "127.0.0.1",
+            11436,
+            "managed",
+            123,
+            None,
+            None,
+            None,
+        );
+        record.status = "unreachable".to_owned();
+        record.write()?;
+        let mut state = test_runtime_state(vec![test_watcher_snapshot(
+            "server-recover",
+            WatcherMode::Propose,
+            None,
+        )]);
+        let event = AutomationTriggerEvent {
+            at_unix_ms: 1,
+            kind: "service.manifest_recoverable".to_owned(),
+            source: "managed_service".to_owned(),
+            watcher_hint: Some("server-recover".to_owned()),
+            service_id: Some(record.service_id.clone()),
+            reason: Some("manifest_status_failed".to_owned()),
+            payload: json!({}),
+        };
+
+        handle_server_recover_event_with_record(
+            &paths,
+            WatcherMode::Propose,
+            &mut state,
+            &event,
+            &mut record,
+        )?;
+        handle_server_recover_event_with_record(
+            &paths,
+            WatcherMode::Propose,
+            &mut state,
+            &event,
+            &mut record,
+        )?;
+        let events = rocm_core::load_recent_automation_events(&paths, 2)?;
+        let proposals = rocm_core::load_recent_automation_proposals(&paths, 10)?;
+        fs::remove_dir_all(root).ok();
+
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(proposals[0].tool.as_deref(), Some("restart_server"));
+        // The wording describes a proposal still awaiting review; the single
+        // pending proposal asserted here is what makes that true.
+        assert_eq!(proposals[0].status, "pending");
+        assert!(events.iter().any(|event| {
+            event.action == "restart_proposal_already_pending"
+                && event.message.contains("a restart request awaiting review")
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn server_recover_dedupe_sees_a_pending_restart_older_than_the_recent_window() -> Result<()> {
+        let (root, paths) = temp_app_paths("server-recover-dedupe-old");
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-unhealthy",
+            "vllm",
+            "tiny",
+            "Tiny/Test",
+            "127.0.0.1",
+            11436,
+            "managed",
+            123,
+            None,
+            None,
+            None,
+        );
+        record.status = "unreachable".to_owned();
+        record.write()?;
+        let mut state = test_runtime_state(vec![test_watcher_snapshot(
+            "server-recover",
+            WatcherMode::Propose,
+            None,
+        )]);
+        let event = AutomationTriggerEvent {
+            at_unix_ms: 1,
+            kind: "service.manifest_recoverable".to_owned(),
+            source: "managed_service".to_owned(),
+            watcher_hint: Some("server-recover".to_owned()),
+            service_id: Some(record.service_id.clone()),
+            reason: Some("manifest_status_failed".to_owned()),
+            payload: json!({}),
+        };
+
+        handle_server_recover_event_with_record(
+            &paths,
+            WatcherMode::Propose,
+            &mut state,
+            &event,
+            &mut record,
+        )?;
+        // Enough newer proposals from other watchers that the restart proposal
+        // is no longer among the 100 most recent.
+        for index in 0..101 {
+            queue_proposal_with_arguments(
+                &paths,
+                "gpu-thermal-protect",
+                "queue_stop_server_proposal",
+                "Stop another server",
+                "unrelated proposal",
+                Some(format!("svc-other-{index}")),
+                json!({}),
+            )?;
+        }
+        handle_server_recover_event_with_record(
+            &paths,
+            WatcherMode::Propose,
+            &mut state,
+            &event,
+            &mut record,
+        )?;
+        let restarts = rocm_core::load_automation_proposals(&paths)?
+            .into_iter()
+            .filter(|proposal| proposal.tool.as_deref() == Some("restart_server"))
+            .count();
+        fs::remove_dir_all(root).ok();
+
+        assert_eq!(restarts, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn server_recover_dedupe_ignores_proposals_that_do_not_block_a_restart() -> Result<()> {
+        let (root, paths) = temp_app_paths("server-recover-dedupe-filters");
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-unhealthy",
+            "vllm",
+            "tiny",
+            "Tiny/Test",
+            "127.0.0.1",
+            11436,
+            "managed",
+            123,
+            None,
+            None,
+            None,
+        );
+        record.status = "unreachable".to_owned();
+        record.write()?;
+        // Each of these matches the restart check on all but one field, so
+        // none of them may suppress a new restart for `svc-unhealthy`.
+        for (watcher_id, service_id, status) in [
+            ("server-recover", "svc-unhealthy", "approved"),
+            ("server-recover", "svc-other", "pending"),
+            ("another-watcher", "svc-unhealthy", "pending"),
+        ] {
+            append_automation_proposal(
+                &paths,
+                &AutomationProposalRecord {
+                    at_unix_ms: unix_time_millis(),
+                    proposal_id: String::new(),
+                    watcher_id: watcher_id.to_owned(),
+                    action: "queue_restart_proposal".to_owned(),
+                    title: "Restart".to_owned(),
+                    message: "unrelated".to_owned(),
+                    status: status.to_owned(),
+                    service_id: Some(service_id.to_owned()),
+                    tool: Some("restart_server".to_owned()),
+                    arguments: json!({}),
+                    reviewed_at_unix_ms: None,
+                },
+            )?;
+        }
+        let mut state = test_runtime_state(vec![test_watcher_snapshot(
+            "server-recover",
+            WatcherMode::Propose,
+            None,
+        )]);
+        let event = AutomationTriggerEvent {
+            at_unix_ms: 1,
+            kind: "service.manifest_recoverable".to_owned(),
+            source: "managed_service".to_owned(),
+            watcher_hint: Some("server-recover".to_owned()),
+            service_id: Some(record.service_id.clone()),
+            reason: Some("manifest_status_failed".to_owned()),
+            payload: json!({}),
+        };
+
+        handle_server_recover_event_with_record(
+            &paths,
+            WatcherMode::Propose,
+            &mut state,
+            &event,
+            &mut record,
+        )?;
+        let queued = rocm_core::load_automation_proposals(&paths)?
+            .into_iter()
+            .filter(|proposal| {
+                proposal.watcher_id == "server-recover"
+                    && proposal.status == "pending"
+                    && proposal.service_id.as_deref() == Some("svc-unhealthy")
+            })
+            .count();
+        fs::remove_dir_all(root).ok();
+
+        assert_eq!(queued, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn server_recover_reports_an_unreadable_proposals_store_instead_of_failing() -> Result<()> {
+        let (root, paths) = temp_app_paths("server-recover-corrupt-store");
+        paths.ensure()?;
+        fs::write(paths.automation_proposals_path(), "not a proposal\n")?;
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-unhealthy",
+            "vllm",
+            "tiny",
+            "Tiny/Test",
+            "127.0.0.1",
+            11436,
+            "managed",
+            123,
+            None,
+            None,
+            None,
+        );
+        record.status = "unreachable".to_owned();
+        record.write()?;
+        let mut state = test_runtime_state(vec![test_watcher_snapshot(
+            "server-recover",
+            WatcherMode::Propose,
+            None,
+        )]);
+        let event = AutomationTriggerEvent {
+            at_unix_ms: 1,
+            kind: "service.manifest_recoverable".to_owned(),
+            source: "managed_service".to_owned(),
+            watcher_hint: Some("server-recover".to_owned()),
+            service_id: Some(record.service_id.clone()),
+            reason: Some("manifest_status_failed".to_owned()),
+            payload: json!({}),
+        };
+
+        let outcome = handle_server_recover_event_with_record(
+            &paths,
+            WatcherMode::Propose,
+            &mut state,
+            &event,
+            &mut record,
+        );
+        let events = rocm_core::load_recent_automation_events(&paths, 1)?;
+        let stored = fs::read_to_string(paths.automation_proposals_path())?;
+        fs::remove_dir_all(root).ok();
+
+        // An error out of a watcher ends the daemon loop, so a corrupt store
+        // must surface as an event and a skipped tick, not as `Err`.
+        outcome?;
+        assert_eq!(stored, "not a proposal\n", "nothing may be queued");
+        assert!(events.iter().any(|event| {
+            event.level == "error" && event.action == "restart_proposal_check_failed"
+        }));
         Ok(())
     }
 

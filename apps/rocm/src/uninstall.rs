@@ -2109,7 +2109,7 @@ mod stop_gate_tests {
     // near-identical comments, is exactly what made it easy to believe both
     // process-based tests were bounded when only one of them actually was.
     #[cfg(target_os = "linux")]
-    use crate::tests::assert_stopped_within_grace;
+    use crate::services_text::tests::assert_stopped_within_grace;
 
     /// Gated to Linux because it spawns a real stand-in process and relies on the
     /// zombie-state detection in `terminate_verified`, which is implemented only there.
