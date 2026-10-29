@@ -109,6 +109,17 @@ pub struct ModelRecipeEngineRecord {
     /// wins over this. Only valid on `aim`.
     #[serde(default)]
     pub profile_ids: BTreeMap<String, String>,
+    /// The image needs a Hugging Face token (a gated model). `rocm serve` refuses
+    /// to start it until `HF_TOKEN` is passed with `--engine-env`. Only valid on
+    /// `aim`.
+    #[serde(default)]
+    pub requires_hf_token: bool,
+    /// Board names (for example `W7900`) the image's pinned profiles were built
+    /// for. `rocm serve` warns when the detected GPU name matches none of them,
+    /// since a gfx family can cover boards the profile does not suit. Only valid
+    /// on `aim`, and only checked when `profile_ids` pins a profile.
+    #[serde(default)]
+    pub supported_boards: Vec<String>,
 }
 
 /// Outcome of matching an engine recipe against the detected GPU family.
@@ -808,12 +819,15 @@ fn validate_model_recipe_engine_record(
             );
         }
     }
-    if (!engine_recipe.supported_gfx_families.is_empty() || !engine_recipe.profile_ids.is_empty())
+    if (!engine_recipe.supported_gfx_families.is_empty()
+        || !engine_recipe.profile_ids.is_empty()
+        || engine_recipe.requires_hf_token
+        || !engine_recipe.supported_boards.is_empty())
         && !engine_recipe.engine.eq_ignore_ascii_case("aim")
     {
         bail!(
-            "engine recipe for `{}` on `{canonical_model_id}` sets supported_gfx_families or \
-             profile_ids, which only apply to aim",
+            "engine recipe for `{}` on `{canonical_model_id}` sets supported_gfx_families, \
+             profile_ids, requires_hf_token or supported_boards, which only apply to aim",
             engine_recipe.engine
         );
     }
@@ -1128,12 +1142,26 @@ mod tests {
                 .iter()
                 .find(|e| e.engine == "aim")
                 .expect("aim engine");
+            assert!(aim.requires_hf_token, "{id}");
             assert!(
                 aim.notes
                     .iter()
                     .any(|n| n.contains("--engine-env HF_TOKEN")),
                 "{id}"
             );
+        }
+        // The flag and the note never drift apart across the whole catalog.
+        for recipe in builtin_model_recipes() {
+            for aim in recipe.engine_recipes.iter().filter(|e| e.engine == "aim") {
+                assert_eq!(
+                    aim.requires_hf_token,
+                    aim.notes
+                        .iter()
+                        .any(|n| n.contains("--engine-env HF_TOKEN")),
+                    "{}",
+                    recipe.canonical_model_id
+                );
+            }
         }
         let open = resolve_builtin_model_recipe("Qwen/Qwen3-32B").expect("ungated aim recipe");
         assert!(
@@ -1241,6 +1269,8 @@ mod tests {
                 generated_at_unix_ms: None,
                 supported_gfx_families: Vec::new(),
                 profile_ids: BTreeMap::new(),
+                requires_hf_token: false,
+                supported_boards: Vec::new(),
             });
             ModelRecipeIndexDocument {
                 schema_version: 1,
@@ -1297,6 +1327,8 @@ mod tests {
             generated_at_unix_ms: None,
             supported_gfx_families: Vec::new(),
             profile_ids: BTreeMap::new(),
+            requires_hf_token: false,
+            supported_boards: Vec::new(),
         });
         let index = ModelRecipeIndexDocument {
             schema_version: 1,
