@@ -35,6 +35,10 @@ vendors this skill and pays for the runs:
 So a figure exists for a given version of the skill when a bump pull request for it has
 been graded, and not otherwise.
 
+Running `routing` and `behavioral` from this repository's own `skill-evals` job as well,
+with the credential `amd/skills` uses, is planned as a separate change. Until it lands,
+this page describes what runs today.
+
 Everything in the rest of this page about what runs there was checked on 2026-10-29.
 It is `amd/skills`' workflow and it can change; the files to re-read are
 `.github/workflows/evals.yml`, `.github/workflows/federate-skills.yml` and
