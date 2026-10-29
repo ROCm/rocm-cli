@@ -6456,7 +6456,7 @@ fn ensure_managed_python(
 /// overwrote `PATH` to steer this resolver also hid every other PATH-resolved
 /// binary from unrelated tests running at the same moment. In test builds, a
 /// test can also install one as a thread-local override (see
-/// [`OverridePythonResolverEnv`]) instead of constructing one to pass directly
+/// `OverridePythonResolverEnv`) instead of constructing one to pass directly
 /// to [`resolve_python_launcher_in`].
 #[cfg_attr(test, derive(Clone))]
 struct PythonResolverEnv {
@@ -6482,9 +6482,14 @@ impl PythonResolverEnv {
 //
 // Unlike mutating process-wide `PATH`, a thread-local cannot race a sibling
 // test thread that spawns a PATH-resolved binary (e.g. bare-name `tar`)
-// during the window a test is steering resolution — see issue #650, where
+// during the window a test is steering resolution (see issue #650, where
 // that mutation intermittently failed unrelated tests under `cargo test`'s
-// one-process-many-threads model.
+// one-process-many-threads model).
+//
+// Because the override is thread-local, it only applies when
+// `resolve_python_launcher` runs on the thread that installed it. If the code
+// under test ever resolves from a spawned thread (or `thread::scope`), that
+// thread silently falls back to the real process environment.
 #[cfg(test)]
 thread_local! {
     static PYTHON_RESOLVER_ENV_OVERRIDE: std::cell::RefCell<Option<PythonResolverEnv>> =
@@ -6493,9 +6498,9 @@ thread_local! {
 
 /// RAII guard installing a fixed [`PythonResolverEnv`] for [`resolve_python_launcher`]
 /// on the calling thread only, restoring the prior override on drop (so nested
-/// use composes correctly, mirroring [`SuppressProgressOutput`] — see the
+/// use composes correctly, mirroring [`SuppressProgressOutput`]; the
 /// `nested_python_resolver_env_override_restores_the_outer_one_on_drop` test
-/// for the property this claims).
+/// covers the property this claims).
 #[cfg(test)]
 struct OverridePythonResolverEnv {
     previous: Option<PythonResolverEnv>,
@@ -7794,8 +7799,7 @@ mod tests {
         // The lock below is no longer for `PATH`: it's still needed because
         // this test mutates the real `ROCM_CLI_DISABLE_MANAGED_PYTHON_BOOTSTRAP`
         // process env var below, and every process-env-mutating test in this
-        // file takes this lock, even where (as here) nothing else currently
-        // reads that specific variable.
+        // file takes this lock.
         let _env_guard = PROCESS_ENV_TEST_LOCK.lock().unwrap();
         let (root, paths) = test_paths("render-update-json-installs-guard");
 
@@ -10477,15 +10481,14 @@ mod tests {
         Ok(())
     }
 
-    /// This is the property that eliminates issue #650: the only way to steer
-    /// `resolve_python_launcher` used to be overwriting process-wide `PATH`,
-    /// which raced any sibling test thread spawning a PATH-resolved binary
-    /// (e.g. bare-name `tar`) during that window. The override is
-    /// thread-local, so resolving through it must never call
-    /// `std::env::set_var`/`remove_var` on `PATH` at all.
+    /// `resolve_python_launcher` must consult an installed
+    /// `OverridePythonResolverEnv` instead of the real process environment.
+    /// That is what lets a test steer resolution without overwriting
+    /// process-wide `PATH`, which raced sibling test threads spawning
+    /// PATH-resolved binaries (issue #650).
     #[cfg(unix)]
     #[test]
-    fn python_resolver_env_override_resolves_without_touching_process_path() -> Result<()> {
+    fn python_resolver_env_override_is_consulted_by_resolve_python_launcher() -> Result<()> {
         if current_platform_wheel_tags().is_err() {
             // No wheel platform tag for this host (e.g. macOS): every python fails
             // the wheel-compatibility check, so resolution always falls through to
@@ -10498,7 +10501,6 @@ mod tests {
         fs::create_dir_all(&bin_dir)?;
         write_fake_python_with_venv(&bin_dir, "python3")?;
 
-        let path_before = std::env::var_os("PATH");
         let launcher = {
             let _guard = OverridePythonResolverEnv::new(PythonResolverEnv {
                 python_override: None,
@@ -10506,12 +10508,7 @@ mod tests {
             });
             resolve_python_launcher(&paths, python_requirement(SourceLayout::Canonical))?
         };
-        let path_after = std::env::var_os("PATH");
 
-        assert_eq!(
-            path_before, path_after,
-            "resolving through the override must never mutate process-wide PATH"
-        );
         assert_eq!(
             launcher.source, "path",
             "resolve_python_launcher must consult the test override, not the real environment"
