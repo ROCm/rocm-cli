@@ -286,6 +286,7 @@ repository.
 | nanoid | 0.4.0 | MIT |
 | nix | 0.28.0 | MIT |
 | nix | 0.29.0 | MIT |
+| nix | 0.31.3 | MIT |
 | nom | 7.1.3 | MIT |
 | nom | 8.0.0 | MIT |
 | nom_locate | 5.0.0 | MIT |
@@ -620,7 +621,7 @@ repository.
 | zerotrie | 0.2.4 | Unicode-3.0 |
 | zerovec | 0.11.6 | Unicode-3.0 |
 | zerovec-derive | 0.11.3 | Unicode-3.0 |
-| zip | 8.6.0 | MIT |
+| zip | 9.0.5 | MIT |
 | zlib-rs | 0.6.7 | Zlib |
 | zmij | 1.0.21 | MIT |
 | zopfli | 0.8.3 | Apache-2.0 |
