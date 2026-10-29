@@ -1431,6 +1431,30 @@ The plain proposal history test verifies that `/automations` and
 server/artifact details, and approve/reject controls instead of raw backend
 action or restricted-tool names.
 
+Automation history stores (events, audit, proposals):
+
+```bash
+cargo test -p rocm-core automation::tests
+```
+
+These cover the three JSONL stores in
+[automation.rs](../crates/rocm-core/src/automation.rs): concurrent writers
+across threads and processes losing no records, size-based rotation of the
+event and audit logs under the same lock (no record lost or duplicated while
+writers rotate, recent reads spanning the rollover, a failed rotation still
+keeping the record and printing its one-shot warning to stderr, lock-free
+readers never reading a file twice or skipping a generation), and proposal
+compaction keeping every pending proposal, the
+newest reviewed ones, and legacy proposal ids. Most of those drive
+`append_jsonl_record`/`load_recent_jsonl_records` directly with a custom
+rotation policy; two further tests go through the public
+`append_automation_event`/`append_audit_event` and
+`load_recent_automation_events`/`load_recent_audit_events` wrappers instead,
+at the real size cap, so the wiring between them and the rotation policy
+itself stays covered. The user-visible side is `automations-07` through
+`automations-09` in
+[automations.feature](../tests/e2e-cucumber/features/automations.feature).
+
 Natural-language plan handoff tests:
 
 ```bash

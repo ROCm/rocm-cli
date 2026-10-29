@@ -646,8 +646,30 @@ Feature: Interactive dashboard
     And the user quits the dashboard
     Then the dashboard exits successfully
 
+  # #286: the header's warning badge counted warnings but gave no way to read
+  # them, and while a GPU is reported the text is drawn nowhere else in the
+  # dashboard. A recording supplies one warning next to a working GPU so the
+  # scenario needs no daemon and no particular host hardware; the user reads
+  # the text from the badge with `!`. The click on the badge, and its refusal
+  # over an open modal, a manager overlay or focused chat input, are asserted by
+  # the unit tests in `crates/rocm-dash-tui/src/app/` and `ui/mod.rs`, where a
+  # mouse event can be sent directly. The key needs no such gate: it is only
+  # reached when nothing else owns the keyboard, which is the event loop's
+  # existing arm order and is not re-tested here.
+  @id:dash-warning-badge-opens-the-warning @requires-os:linux
+  Scenario: dash-38 - A user reads the warning behind the header badge
+    When the user opens the dashboard replaying a recording that reports a warning
+    Then the header shows that one warning is reported
+    When the user opens the warnings
+    Then the warning text is displayed
+    And the backdrop behind the popup is dimmed
+    When the user presses Escape
+    Then the warning text is no longer displayed
+    When the user quits the dashboard
+    Then the dashboard exits successfully
+
   @id:dash-serve-wizard-opens-collapsed @requires-os:linux
-  Scenario: dash-38 - Opening the serve wizard shows only the model, Advanced settings, and Launch
+  Scenario: dash-39 - Opening the serve wizard shows only the model, Advanced settings, and Launch
     When the user opens the dashboard with demo data
     And the user opens the Observe view
     And the user opens the serve wizard
@@ -658,7 +680,7 @@ Feature: Interactive dashboard
     Then the dashboard exits successfully
 
   @id:dash-serve-wizard-escape-cancels-edit-without-closing @requires-os:linux
-  Scenario: dash-39 - Escape cancels an in-progress host edit without closing the serve wizard
+  Scenario: dash-40 - Escape cancels an in-progress host edit without closing the serve wizard
     When the user opens the dashboard with demo data
     And the user opens the Observe view
     And the user opens the serve wizard
@@ -673,7 +695,7 @@ Feature: Interactive dashboard
     Then the dashboard exits successfully
 
   @id:dash-serve-wizard-automatic-form-stages-bare-serve @requires-os:linux
-  Scenario: dash-40 - An automatic serve form stages a bare serve command with an automatic port
+  Scenario: dash-41 - An automatic serve form stages a bare serve command with an automatic port
     When the user opens the dashboard with demo data
     And the user opens the Observe view
     And the user opens the serve wizard
@@ -688,7 +710,7 @@ Feature: Interactive dashboard
     Then the dashboard exits successfully
 
   @id:dash-serve-wizard-refuses-custom-host-with-automatic-port @requires-os:linux
-  Scenario: dash-41 - A custom host with an automatic port is refused in the form
+  Scenario: dash-42 - A custom host with an automatic port is refused in the form
     When the user opens the dashboard with demo data
     And the user opens the Observe view
     And the user opens the serve wizard

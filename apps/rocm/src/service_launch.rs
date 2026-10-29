@@ -44,24 +44,24 @@ use rocm_core::{AppPaths, AutomationRuntimeState, EndpointReadiness, ManagedServ
 use rocm_core::{format_http_base_url, process_is_running};
 use rocm_engine_protocol::{DevicePolicy, EngineRecipeHint, ResolveModelResponse};
 
-#[cfg(not(windows))]
-use crate::apply_app_path_env;
 use crate::endpoint_keys;
 use crate::engine_ipc::builtin_engine_serve_http_args;
+#[cfg(not(windows))]
+use crate::engine_runtime_select::apply_app_path_env;
+#[cfg(windows)]
+use crate::engine_runtime_select::{app_path_env_var_refs, app_path_env_var_values};
+use crate::engine_runtime_select::{
+    managed_service_launcher_path, wait_for_service_http_ready_with_progress,
+};
 use crate::engines_cmd::env_root_for_service;
 use crate::managed_service_status::{
     existing_live_managed_service_in, load_managed_services, managed_service_is_live,
 };
-use crate::read_optional_tail_lines;
 use crate::serve_port;
 use crate::service_hints;
-use crate::{
-    SandboxToolArg, device_policy_name, managed_service_launcher_path, record_cli_audit_event,
-    render_service_action_result, run_internal_sandbox_tool, status_for_readiness,
-    wait_for_service_http_ready_with_progress,
-};
-#[cfg(windows)]
-use crate::{app_path_env_var_refs, app_path_env_var_values};
+use crate::services_text::read_optional_tail_lines;
+use crate::services_text::{render_service_action_result, run_internal_sandbox_tool};
+use crate::{SandboxToolArg, device_policy_name, record_cli_audit_event, status_for_readiness};
 
 pub(crate) fn validate_bind_host(host: &str, allow_public_bind: bool) -> Result<()> {
     if !is_loopback_host(host) && !allow_public_bind {
@@ -2890,7 +2890,9 @@ mod tests {
         // the same seam production injects a real signal through; here it just
         // confirms every recorded process gone without touching the test
         // process itself.
-        crate::stop_internal_managed_service_with(&paths, "lemonade-a-1", |_| (Vec::new(), true))?;
+        crate::services_text::stop_internal_managed_service_with(&paths, "lemonade-a-1", |_| {
+            (Vec::new(), true)
+        })?;
 
         let decision = resolve_managed_port_in_transaction(
             &paths,
