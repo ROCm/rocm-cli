@@ -14,8 +14,8 @@
       "gfx_families": ["gfx110X-all", "gfx120X-all"]
     },
     {
-      "label": "AMD Instinct - MI300X, MI350X, MI355X (vLLM)",
-      "engines": ["vllm"],
+      "label": "AMD Instinct - MI300X, MI350X, MI355X (vLLM / AIM)",
+      "engines": ["vllm", "aim"],
       "gfx_families": ["gfx906", "gfx908", "gfx90a", "gfx94X-dcgpu", "gfx950-dcgpu"]
     }
   ],
