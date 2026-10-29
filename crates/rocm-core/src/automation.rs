@@ -44,9 +44,11 @@ use anyhow::{Context, Result, bail};
 use same_file::Handle;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::AppPaths;
@@ -408,8 +410,10 @@ fn append_jsonl_record<T: Serialize>(
             // ours is held across the rename and the reopen below gets the
             // new file.
             drop(file);
-            if let Err(error) = rotate_jsonl_generations(path, rotation.generations) {
-                warn_once_rotation_failed(path, &error);
+            if let Err(error) = rotate_jsonl_generations(path, rotation.generations)
+                && let Some(warning) = rotation_failure_warning(path, &error)
+            {
+                eprintln!("{warning}");
             }
             file = open_jsonl_for_append(path)?;
         }
@@ -451,15 +455,19 @@ fn append_jsonl_record<T: Serialize>(
     Ok(())
 }
 
-/// Warn once per process that rotating `path` failed, so a rename that keeps
-/// failing (e.g. another program holds the live file open without delete
-/// sharing on Windows) is observable without a line on every single append
-/// while the store stays stuck over its cap.
-fn warn_once_rotation_failed(path: &Path, error: &anyhow::Error) {
-    static WARNED: std::sync::Once = std::sync::Once::new();
-    WARNED.call_once(|| {
-        eprintln!("warning: failed to rotate {}: {error:#}", path.display());
-    });
+/// The warning to print that rotating `path` failed, or `None` after the first
+/// one for that store in this process, so a rename that keeps failing (e.g.
+/// another program holds the live file open without delete sharing on
+/// Windows) is observable without a line on every single append while the
+/// store stays stuck over its cap. Keyed by path so one store's failure does
+/// not silence another's.
+fn rotation_failure_warning(path: &Path, error: &anyhow::Error) -> Option<String> {
+    static WARNED: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
+    WARNED
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(path.to_path_buf())
+        .then(|| format!("warning: failed to rotate {}: {error:#}", path.display()))
 }
 
 /// Append-mode write of `line`, starting at offset `start`.
@@ -1233,6 +1241,25 @@ pub fn load_recent_automation_events(
 mod tests {
     use super::*;
     use crate::test_support::temp_app_paths;
+
+    #[test]
+    fn a_rotation_failure_is_reported_once_per_store() {
+        // Shaped like the real stores, which share a file name and differ
+        // only by directory: keying on the file name alone must not pass.
+        let events = Path::new("rotation-warning-test/automations/events.jsonl");
+        let audit = Path::new("rotation-warning-test/audit/events.jsonl");
+        let error = anyhow::anyhow!("rename blocked");
+
+        let first = rotation_failure_warning(events, &error)
+            .expect("the first failure for a store is reported");
+        assert!(first.contains("rotation-warning-test/automations/events.jsonl"));
+        assert!(first.contains("rename blocked"));
+        assert_eq!(rotation_failure_warning(events, &error), None);
+        let other = rotation_failure_warning(audit, &error)
+            .expect("one store's failure must not silence another store's warning");
+        assert!(other.contains("rotation-warning-test/audit/events.jsonl"));
+        assert_eq!(rotation_failure_warning(audit, &error), None);
+    }
 
     #[test]
     fn builtin_watchers_include_read_only_gpu_metrics() {
