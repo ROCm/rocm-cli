@@ -196,6 +196,16 @@ pub(crate) fn apply_action(state: &mut AppState, action: KeyAction) -> bool {
                 Modal::Help
             };
         }
+        // Reached from the `!` arm of `handle_key`, which only runs when no overlay,
+        // prompt or modal owns the keyboard, and from a click on the badge, gated
+        // on `global_hotkeys_reachable`. The check is repeated here so an opener
+        // that skipped that gate cannot hide the popup under an approval, in
+        // debug and release alike.
+        KeyAction::OpenWarnings => {
+            if state.global_hotkeys_reachable() && state.warning_count() > 0 {
+                state.modal = Modal::Warnings;
+            }
+        }
         KeyAction::CloseModal => state.modal = Modal::None,
         // The operational overlays are mutually exclusive: opening any one first
         // closes the rest (see `close_overlays`), so no open path — key, mouse,
@@ -393,6 +403,9 @@ pub enum KeyAction {
     SelectLast,
     OpenDetail,
     ToggleHelp,
+    /// Open the warnings popup (the text behind the header `⚠ N` badge). A no-op
+    /// while the daemon reports no warnings. Closing it is `CloseModal`.
+    OpenWarnings,
     CloseModal,
     OpenThemePicker,
     ApplyThemePick,
@@ -605,6 +618,14 @@ pub(crate) fn handle_key(
             _ => KeyAction::Nothing,
         };
     }
+    // Warnings popup: absorbs everything except quit / close, like Help.
+    if *modal == Modal::Warnings {
+        return match k.code {
+            KeyCode::Char('q') => KeyAction::Quit,
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('!') => KeyAction::CloseModal,
+            _ => KeyAction::Nothing,
+        };
+    }
     // Global help overlay (opened from the Esc menu): close, same as the
     // contextual Help above.
     if *modal == Modal::GlobalHelp {
@@ -658,6 +679,7 @@ pub(crate) fn handle_key(
         KeyCode::Esc => KeyAction::OpenMenu,
         KeyCode::Char(':') => KeyAction::OpenPalette,
         KeyCode::Char('?') => KeyAction::ToggleHelp,
+        KeyCode::Char('!') => KeyAction::OpenWarnings,
         KeyCode::Char('t') => KeyAction::OpenThemePicker,
         KeyCode::BackTab => KeyAction::SwitchTab(current.prev()),
         KeyCode::Tab => {
@@ -886,7 +908,7 @@ mod tests {
     fn quit_key_while_a_modal_is_open_closes_it_instead_of_stranding_the_user() {
         // Regression: `q` reaches the shared `KeyAction::Quit` arm from
         // inside every per-modal match (ThemePicker, Detail, Help,
-        // GlobalHelp, Menu, Palette, Options — see those arms above), not
+        // GlobalHelp, Warnings, Menu, Palette, Options — see those arms above), not
         // just the Esc-menu's "Quit" row. `open_quit_confirm` used to close
         // overlays but never `modal`, so declining left the user stuck back
         // inside whatever modal was open when they pressed `q`.
@@ -896,6 +918,7 @@ mod tests {
             Modal::Detail,
             Modal::Help,
             Modal::GlobalHelp,
+            Modal::Warnings,
             Modal::Palette,
             Modal::Options,
         ] {
@@ -1566,6 +1589,98 @@ mod tests {
             handle_mouse(scroll_down, &Modal::None, ActiveTab::Rocm),
             KeyAction::Nothing
         );
+    }
+
+    fn with_warnings(s: &mut AppState, n: usize) {
+        s.latest = Some(rocm_dash_core::metrics::Snapshot {
+            warnings: (0..n).map(|i| format!("warning {i}")).collect(),
+            ..Default::default()
+        });
+    }
+
+    #[test]
+    fn bang_opens_the_warnings_popup_from_every_tab() {
+        for tab in [
+            ActiveTab::Home,
+            ActiveTab::Rocm,
+            ActiveTab::Serving,
+            ActiveTab::Observe,
+            ActiveTab::Chat,
+        ] {
+            assert_eq!(
+                hk(KeyCode::Char('!'), tab),
+                KeyAction::OpenWarnings,
+                "{tab:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn warnings_popup_closes_on_esc_enter_and_bang_and_absorbs_other_keys() {
+        let key = |c| {
+            handle_key(
+                press(c),
+                ActiveTab::Home,
+                &Modal::Warnings,
+                ChatKeyCtx::default(),
+            )
+        };
+        for c in [KeyCode::Esc, KeyCode::Enter, KeyCode::Char('!')] {
+            assert_eq!(key(c), KeyAction::CloseModal, "{c:?}");
+        }
+        assert_eq!(key(KeyCode::Char('q')), KeyAction::Quit);
+        // Like Help: nothing underneath may react while the popup is open.
+        for c in [
+            KeyCode::Char('t'),
+            KeyCode::Char('?'),
+            KeyCode::Char('1'),
+            KeyCode::Tab,
+            KeyCode::Down,
+        ] {
+            assert_eq!(key(c), KeyAction::Nothing, "{c:?}");
+        }
+    }
+
+    #[test]
+    fn opening_warnings_shows_the_popup_and_close_modal_dismisses_it() {
+        let mut s = st();
+        with_warnings(&mut s, 2);
+        apply_action(&mut s, KeyAction::OpenWarnings);
+        assert_eq!(s.modal, Modal::Warnings);
+        apply_action(&mut s, KeyAction::CloseModal);
+        assert_eq!(s.modal, Modal::None);
+    }
+
+    #[test]
+    fn opening_warnings_opens_nothing_when_there_are_no_warnings() {
+        let mut s = st();
+        apply_action(&mut s, KeyAction::OpenWarnings);
+        assert_eq!(s.modal, Modal::None, "no snapshot yet");
+        with_warnings(&mut s, 0);
+        apply_action(&mut s, KeyAction::OpenWarnings);
+        assert_eq!(s.modal, Modal::None, "snapshot without warnings");
+    }
+
+    #[test]
+    fn opening_warnings_is_refused_while_something_else_owns_the_keyboard() {
+        let mut s = st();
+        with_warnings(&mut s, 1);
+        s.modal = Modal::Help;
+        apply_action(&mut s, KeyAction::OpenWarnings);
+        assert_eq!(s.modal, Modal::Help, "a modal stays put");
+
+        let mut s = st();
+        with_warnings(&mut s, 1);
+        s.quit_confirm = Some(crate::ui::approval::ApprovalChoice::default());
+        apply_action(&mut s, KeyAction::OpenWarnings);
+        assert_eq!(s.modal, Modal::None, "nothing opens over a pending prompt");
+
+        let mut s = st();
+        with_warnings(&mut s, 1);
+        s.active_tab = ActiveTab::Chat;
+        s.chat_focused = true;
+        apply_action(&mut s, KeyAction::OpenWarnings);
+        assert_eq!(s.modal, Modal::None, "focused chat input owns the keyboard");
     }
 
     #[test]
