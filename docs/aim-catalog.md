@@ -43,3 +43,6 @@ not need a rocm-cli maintainer.
    to CPU, as are non-chat images (speech, video, bio) until the serve path
    supports their tasks.
 5. Open a PR; `cargo test -p rocm-core model_recipe` validates the catalog.
+6. Check each image's model page in the AIM catalog for the line "requires a
+   Hugging Face authentication". For those, add the `HF_TOKEN` note to the
+   entry's `notes` (the pattern used by the existing gated entries).

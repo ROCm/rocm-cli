@@ -338,6 +338,7 @@
           "preferred_endpoint": null,
           "unsupported_combinations": [],
           "notes": [
+            "gated model: export HF_TOKEN (a Hugging Face token with access to the model) and pass --engine-env HF_TOKEN; it is forwarded from your environment and never stored",
             "requires a reachable Docker daemon; the image is pulled on first serve",
             "datacenter-class image; check the AIM catalog for the GPU memory it needs"
           ],
@@ -609,6 +610,7 @@
           "preferred_endpoint": null,
           "unsupported_combinations": [],
           "notes": [
+            "gated model: export HF_TOKEN (a Hugging Face token with access to the model) and pass --engine-env HF_TOKEN; it is forwarded from your environment and never stored",
             "requires a reachable Docker daemon; the image is pulled on first serve",
             "datacenter-class image; check the AIM catalog for the GPU memory it needs"
           ],
@@ -855,6 +857,7 @@
           "preferred_endpoint": null,
           "unsupported_combinations": [],
           "notes": [
+            "gated model: export HF_TOKEN (a Hugging Face token with access to the model) and pass --engine-env HF_TOKEN; it is forwarded from your environment and never stored",
             "requires a reachable Docker daemon; the image is pulled on first serve",
             "datacenter-class image; check the AIM catalog for the GPU memory it needs"
           ],
@@ -896,6 +899,7 @@
           "preferred_endpoint": null,
           "unsupported_combinations": [],
           "notes": [
+            "gated model: export HF_TOKEN (a Hugging Face token with access to the model) and pass --engine-env HF_TOKEN; it is forwarded from your environment and never stored",
             "requires a reachable Docker daemon; the image is pulled on first serve",
             "datacenter-class image; check the AIM catalog for the GPU memory it needs"
           ],
@@ -937,6 +941,7 @@
           "preferred_endpoint": null,
           "unsupported_combinations": [],
           "notes": [
+            "gated model: export HF_TOKEN (a Hugging Face token with access to the model) and pass --engine-env HF_TOKEN; it is forwarded from your environment and never stored",
             "requires a reachable Docker daemon; the image is pulled on first serve",
             "datacenter-class image; check the AIM catalog for the GPU memory it needs"
           ],
@@ -978,6 +983,7 @@
           "preferred_endpoint": null,
           "unsupported_combinations": [],
           "notes": [
+            "gated model: export HF_TOKEN (a Hugging Face token with access to the model) and pass --engine-env HF_TOKEN; it is forwarded from your environment and never stored",
             "requires a reachable Docker daemon; the image is pulled on first serve",
             "datacenter-class image; check the AIM catalog for the GPU memory it needs"
           ],
@@ -1019,6 +1025,7 @@
           "preferred_endpoint": null,
           "unsupported_combinations": [],
           "notes": [
+            "gated model: export HF_TOKEN (a Hugging Face token with access to the model) and pass --engine-env HF_TOKEN; it is forwarded from your environment and never stored",
             "requires a reachable Docker daemon; the image is pulled on first serve",
             "Radeon-targeted image; if profile auto-selection fails, set AIM_PROFILE_ID with --engine-env"
           ],
@@ -1060,6 +1067,7 @@
           "preferred_endpoint": null,
           "unsupported_combinations": [],
           "notes": [
+            "gated model: export HF_TOKEN (a Hugging Face token with access to the model) and pass --engine-env HF_TOKEN; it is forwarded from your environment and never stored",
             "requires a reachable Docker daemon; the image is pulled on first serve",
             "datacenter-class image; check the AIM catalog for the GPU memory it needs"
           ],
@@ -1101,6 +1109,7 @@
           "preferred_endpoint": null,
           "unsupported_combinations": [],
           "notes": [
+            "gated model: export HF_TOKEN (a Hugging Face token with access to the model) and pass --engine-env HF_TOKEN; it is forwarded from your environment and never stored",
             "requires a reachable Docker daemon; the image is pulled on first serve",
             "datacenter-class image; check the AIM catalog for the GPU memory it needs"
           ],
@@ -1798,6 +1807,7 @@
           "preferred_endpoint": null,
           "unsupported_combinations": [],
           "notes": [
+            "gated model: export HF_TOKEN (a Hugging Face token with access to the model) and pass --engine-env HF_TOKEN; it is forwarded from your environment and never stored",
             "requires a reachable Docker daemon; the image is pulled on first serve",
             "Radeon-targeted image; if profile auto-selection fails, set AIM_PROFILE_ID with --engine-env"
           ],
