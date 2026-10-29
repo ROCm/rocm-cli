@@ -16,6 +16,7 @@ pub mod binary_paths;
 pub mod browser;
 pub mod codex_bridge;
 pub mod config;
+pub mod confirm;
 pub mod crypto;
 pub mod diagnose;
 pub mod disk_space;
