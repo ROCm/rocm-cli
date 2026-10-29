@@ -1890,20 +1890,12 @@ cargo test -p rocm --bin rocm driver_install
 
 `driver-install-06` in
 [driver_install.feature](../tests/e2e-cucumber/features/driver_install.feature)
-asserts whichever plan a real bare-metal Linux host actually produces: the apt
-repo file and signing key on a release with a published
-repo.radeon.com/amdgpu suite, or the native-archive refusal below on one
-without.
-
-On Ubuntu 26.04, `repo.radeon.com` does not yet publish a matching `resolute`
-DKMS repo (the amdgpu driver ships in-tree instead), so the plan comes back
-`supported: false` and directs the user to `apt install rocm`. This arm is
-covered at the unit level by
-`driver_plan_ubuntu_2604_uses_native_archive_guidance` and its two neighbors in
-[driver_install.rs](../apps/rocm/src/driver_install.rs), and at the e2e level
-by `driver-install-06` above: the hosted `E2E tests` job's `ubuntu-latest` image (26.04 once GitHub's migration completes)
-reaches this arm through the CLI itself, while the self-hosted GPU lane's
-24.04 host exercises the apt arm instead.
+asserts the plan a real bare-metal Linux host actually produces: the apt
+repo file and signing key with the host's own suite (`noble` on 24.04,
+`resolute` on 26.04), and the previous-driver warning. The warning command is
+also run against a stubbed `dpkg-query` by
+`previous_driver_warning_fires_only_when_amdgpu_dkms_is_installed` in
+[driver_install.rs](../apps/rocm/src/driver_install.rs).
 
 ## /etc/os-release
 
