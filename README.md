@@ -578,7 +578,9 @@ On Ubuntu, the plan uses the `repo.radeon.com/amdgpu` suite matching the
 release (`jammy` 22.04, `noble` 24.04, `resolute` 26.04). If `amdgpu-dkms` from
 a previous installation is already present, the plan's first command prints a
 warning naming the removal command (`apt-get autoremove -y amdgpu-dkms`); it
-never removes the old driver itself.
+never removes the old driver itself, and the install continues after the
+warning. This applies to every apt-based distro the DKMS flow covers (Ubuntu
+and Debian 12/13).
 
 Approving (`--yes`) a plan that is `supported: false` (an
 undocumented distro, or a refused version override) installs nothing and exits

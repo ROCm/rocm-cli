@@ -1314,7 +1314,7 @@ fn apt_driver_plan(
         commands.push(driver_command(
             DriverCommandPhase::Prepare,
             &format!(
-                "if dpkg-query -W -f='${{Status}}' amdgpu-dkms 2>/dev/null | grep -q 'install ok installed'; then echo 'warning: amdgpu-dkms from a previous installation is installed and was not removed. AMD advises removing it first: stop and run `{sudo}apt-get autoremove -y amdgpu-dkms`, then re-run this install.'; fi"
+                "if dpkg-query -W -f='${{Status}}' amdgpu-dkms 2>/dev/null | grep -q 'install ok installed'; then echo 'warning: amdgpu-dkms from a previous installation is installed and was not removed. AMD advises removing it first (`{sudo}apt-get autoremove -y amdgpu-dkms`); continuing anyway. If the install fails, remove it and re-run.'; fi"
             ),
         ));
         commands.extend([
@@ -1383,7 +1383,7 @@ fn apt_driver_plan(
         codename,
         repo_version_expr,
         reason: if dkms {
-            "Plan uses AMD's package-manager DKMS flow and requires explicit approval before execution."
+            "Plan uses AMD's package-manager DKMS flow and requires explicit approval before execution. If amdgpu-dkms from a previous installation is present, the first command only warns; the install continues and nothing is removed automatically."
         } else {
             "DKMS was not requested; this is a non-mutating preflight plan."
         }
@@ -1391,10 +1391,6 @@ fn apt_driver_plan(
         preflight_checks: if dkms {
             let mut checks = driver_root_preflight_checks(escalation);
             checks.push("`apt-get` package manager is available".to_owned());
-            checks.push(
-                "no previous `amdgpu-dkms` install (the first command warns if one is found; nothing is removed automatically)"
-                    .to_owned(),
-            );
             checks
         } else {
             Vec::new()
@@ -2909,10 +2905,13 @@ VERSION_CODENAME=noble
                 .skip(1)
                 .any(|c| c.command.contains("autoremove"))
         );
+        assert!(plan.reason.contains("only warns"));
+        assert!(first.contains("continuing anyway"));
         assert!(
-            plan.preflight_checks
+            !plan
+                .preflight_checks
                 .iter()
-                .any(|check| check.contains("previous `amdgpu-dkms`"))
+                .any(|check| check.contains("amdgpu-dkms"))
         );
     }
 
@@ -2929,8 +2928,8 @@ VERSION_CODENAME=noble
             PrivilegeEscalation::AlreadyRoot,
         );
         let command = &plan.commands[0].command;
-        let root = std::env::temp_dir().join(format!("rocm-prevdrv-{}", std::process::id()));
-        fs::create_dir_all(&root).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
         let run = |status: &str| {
             let stub = root.join("dpkg-query");
             fs::write(&stub, format!("#!/bin/sh\nprintf '%s' '{status}'\n")).unwrap();
@@ -2945,7 +2944,6 @@ VERSION_CODENAME=noble
         };
         assert!(run("install ok installed").contains("warning: amdgpu-dkms"));
         assert!(run("").is_empty());
-        let _ = fs::remove_dir_all(root);
     }
 
     #[cfg(unix)]
