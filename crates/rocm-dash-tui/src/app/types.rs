@@ -480,6 +480,8 @@ pub enum Modal {
     Options,
     /// Global 2-column keyboard reference (distinct from the contextual `?`).
     GlobalHelp,
+    /// The daemon's current warnings in full — what the header `⚠ N` badge counts.
+    Warnings,
 }
 
 /// Reduction of a completed `rocm update --json` check, for the Home tab's

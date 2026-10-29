@@ -223,6 +223,10 @@ pub struct AppState {
     pub last_body_area: Option<ratatui::layout::Rect>,
     /// Same for the tab bar, used for click-to-switch-tab.
     pub last_tab_bar_area: Option<ratatui::layout::Rect>,
+    /// Header `⚠ N` badge from the most recent draw (`None` when no warning is
+    /// shown). Left-clicking it opens the warnings popup, as `!` does, under the
+    /// same gating.
+    pub last_header_badge: Option<ratatui::layout::Rect>,
     /// Clickable footer-legend chips from the most recent draw. Left-clicking a
     /// chip dispatches the same `KeyAction` as pressing that key.
     pub last_footer_chips: Vec<FooterChip>,
@@ -383,6 +387,7 @@ impl AppState {
             launcher_hosted: false,
             last_body_area: None,
             last_tab_bar_area: None,
+            last_header_badge: None,
             last_footer_chips: Vec::new(),
             jobs: rocm_dash_core::state::State::default(),
             services: None,
@@ -884,6 +889,23 @@ impl AppState {
     /// comments.
     pub(crate) const fn overlay_or_approval(&self) -> bool {
         self.has_open_overlay() || self.blocks_body_absolutely()
+    }
+
+    /// Whether a global hotkey reaches its normal `handle_key` arm right now,
+    /// or something else owns the keyboard first: a manager overlay or pending
+    /// approval/quit-confirm owns every key, a plain `Modal::*` returns from
+    /// its own arm, and focused chat text entry consumes every `Char`. Anything
+    /// that dispatches a global hotkey action from a click (footer chips, the
+    /// header warning badge) must gate on this, or the click can do what the
+    /// key it stands for never could.
+    pub(crate) const fn global_hotkeys_reachable(&self) -> bool {
+        let chat_typing = matches!(self.active_tab, ActiveTab::Chat) && self.chat_focused;
+        !(self.overlay_or_approval() || !matches!(self.modal, Modal::None) || chat_typing)
+    }
+
+    /// Number of warnings in the latest snapshot — what the header badge shows.
+    pub(crate) fn warning_count(&self) -> usize {
+        self.latest.as_ref().map_or(0, |s| s.warnings.len())
     }
 
     /// Focused-host exit gate: `true` when a `focus` is active AND its single
@@ -1572,6 +1594,53 @@ mod tests {
     use super::*;
     use ratatui::layout::Rect;
     use tokio::sync::mpsc;
+
+    #[test]
+    fn global_hotkeys_are_unreachable_while_a_modal_overlay_or_prompt_owns_the_keyboard() {
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        assert!(s.global_hotkeys_reachable(), "idle dashboard");
+        s.modal = Modal::Help;
+        assert!(!s.global_hotkeys_reachable(), "a plain modal returns first");
+        s.modal = Modal::None;
+        s.services = Some(crate::ui::services_manager::ServicesManagerState::default());
+        assert!(
+            !s.global_hotkeys_reachable(),
+            "a manager overlay owns every key"
+        );
+        s.services = None;
+        s.open_quit_confirm();
+        assert!(
+            !s.global_hotkeys_reachable(),
+            "the quit prompt owns every key"
+        );
+    }
+
+    #[test]
+    fn typing_in_chat_owns_the_keyboard_only_on_the_chat_tab_and_only_while_focused() {
+        // `handle_key` hands every character to the chat input only once chat
+        // is accepted and the input is focused.
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.chat_consent = ChatConsent::Accepted;
+        s.active_tab = ActiveTab::Chat;
+        s.chat_focused = false;
+        assert!(s.global_hotkeys_reachable(), "chat tab, input not focused");
+        s.chat_focused = true;
+        assert!(!s.global_hotkeys_reachable(), "focused chat input");
+        // `chat_focused` is not cleared when the user switches tab, so a stale
+        // `true` on another tab must not be read as "typing".
+        for tab in [
+            ActiveTab::Home,
+            ActiveTab::Rocm,
+            ActiveTab::Serving,
+            ActiveTab::Observe,
+        ] {
+            s.active_tab = tab;
+            assert!(
+                s.global_hotkeys_reachable(),
+                "{tab:?} with a stale chat focus"
+            );
+        }
+    }
 
     use crate::client::ClientMsg;
 

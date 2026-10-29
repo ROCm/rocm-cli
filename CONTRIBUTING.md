@@ -79,7 +79,7 @@ cargo install lychee@0.24.2 --locked   # pinned to match the CI docs-links job (
 | `crates/rocm-core` | Core library |
 | `crates/rocm-dash-*` | Dashboard terminal user interface (TUI) libraries |
 | `crates/rocm-engine-protocol` | Engine IPC protocol |
-| `engines/` | Inference engine adapters (lemonade, vllm) |
+| `engines/` | Inference engine adapters (lemonade, vllm, aim) |
 
 ### Module organization
 

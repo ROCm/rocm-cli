@@ -6046,7 +6046,7 @@ The following component(s) are licensed under Apache License 2.0:
   - rustls-native-certs 0.7.3 <https://github.com/rustls/rustls-native-certs>
   - rustls-native-certs 0.8.4 <https://github.com/rustls/rustls-native-certs>
   - rustls-pemfile 2.2.0 <https://github.com/rustls/pemfile>
-  - rustls 0.23.41 <https://github.com/rustls/rustls>
+  - rustls 0.23.46 <https://github.com/rustls/rustls>
   - scopeguard 1.2.0 <https://github.com/bluss/scopeguard>
   - secret-service 5.1.0 <https://github.com/hwchen/secret-service-rs.git>
   - security-framework-sys 2.17.0 <https://github.com/kornelski/rust-security-framework>
@@ -8353,7 +8353,7 @@ The following component(s) are licensed under Apache License 2.0:
   - android_system_properties 0.1.5 <https://github.com/nical/android_system_properties>
   - anyhow 1.0.104 <https://github.com/dtolnay/anyhow>
   - async-trait 0.1.92 <https://github.com/dtolnay/async-trait>
-  - aws-lc-sys 0.41.0 <https://github.com/aws/aws-lc-rs>
+  - aws-lc-sys 0.46.0 <https://github.com/aws/aws-lc-rs>
   - bollard-stubs 1.53.1-rc.29.3.1
   - cucumber-codegen 0.23.0 <https://github.com/cucumber-rs/cucumber>
   - directories 6.0.0 <https://github.com/soc/directories-rs>
@@ -8850,7 +8850,7 @@ BSD 3-Clause "New" or "Revised" License
 ================================================================================
 
 The following component(s) are licensed under BSD 3-Clause "New" or "Revised" License:
-  - aws-lc-sys 0.41.0 <https://github.com/aws/aws-lc-rs>
+  - aws-lc-sys 0.46.0 <https://github.com/aws/aws-lc-rs>
 
 Copyright (c) <year> <owner>. 
 
@@ -9172,7 +9172,7 @@ ISC License
 ================================================================================
 
 The following component(s) are licensed under ISC License:
-  - rustls-webpki 0.103.13 <https://github.com/rustls/webpki>
+  - rustls-webpki 0.103.16 <https://github.com/rustls/webpki>
 
 Except as otherwise noted, this project is licensed under the following
 (ISC-style) terms:
@@ -9200,8 +9200,8 @@ ISC License
 ================================================================================
 
 The following component(s) are licensed under ISC License:
-  - aws-lc-rs 1.17.0 <https://github.com/aws/aws-lc-rs>
-  - aws-lc-sys 0.41.0 <https://github.com/aws/aws-lc-rs>
+  - aws-lc-rs 1.18.2 <https://github.com/aws/aws-lc-rs>
+  - aws-lc-sys 0.46.0 <https://github.com/aws/aws-lc-rs>
 
 ISC License:
 
@@ -11230,7 +11230,7 @@ MIT License
 ================================================================================
 
 The following component(s) are licensed under MIT License:
-  - aws-lc-sys 0.41.0 <https://github.com/aws/aws-lc-rs>
+  - aws-lc-sys 0.46.0 <https://github.com/aws/aws-lc-rs>
 
 The MIT License (MIT)
 

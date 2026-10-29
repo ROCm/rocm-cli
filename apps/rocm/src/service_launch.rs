@@ -46,18 +46,21 @@ use rocm_core::{format_http_base_url, process_is_running};
 use rocm_engine_protocol::{DevicePolicy, EngineRecipeHint, ResolveModelResponse};
 
 use crate::endpoint_keys;
+use crate::engine_ipc::builtin_engine_serve_http_args;
+#[cfg(not(windows))]
+use crate::engine_runtime_select::apply_app_path_env;
+#[cfg(windows)]
+use crate::engine_runtime_select::{app_path_env_var_refs, app_path_env_var_values};
+use crate::engine_runtime_select::{
+    managed_service_launcher_path, wait_for_service_http_ready_with_progress,
+};
 use crate::engines_cmd::env_root_for_service;
 use crate::managed_service_status::existing_live_managed_service;
 use crate::service_hints;
-use crate::{
-    SandboxToolArg, builtin_engine_serve_http_args, device_policy_name,
-    managed_service_launcher_path, record_cli_audit_event, render_service_action_result,
-    run_internal_sandbox_tool, status_for_readiness, wait_for_service_http_ready_with_progress,
-};
-#[cfg(windows)]
-use crate::{app_path_env_var_refs, app_path_env_var_values};
 #[cfg(not(windows))]
-use crate::{apply_app_path_env, read_optional_tail_lines};
+use crate::services_text::read_optional_tail_lines;
+use crate::services_text::{render_service_action_result, run_internal_sandbox_tool};
+use crate::{SandboxToolArg, device_policy_name, record_cli_audit_event, status_for_readiness};
 
 pub(crate) fn validate_bind_host(host: &str, allow_public_bind: bool) -> Result<()> {
     if !is_loopback_host(host) && !allow_public_bind {
@@ -414,6 +417,7 @@ fn spawn_managed_engine_child(
         Some(device_policy_name(device_policy).to_owned()),
     );
     record.gpu_indices = gpu_indices.to_vec();
+    record.served_model_id = resolve.served_model_id.clone();
     record.engine_recipe_json = requested_recipe_json;
     // The flag the user actually passed, carried through rather than re-derived.
     //
@@ -586,7 +590,11 @@ pub(crate) fn start_managed_service(
         engine,
         host,
         port,
-        &resolve.canonical_model_id,
+        &|| {
+            let mut latest = record.clone();
+            let _ = latest.refresh_from_engine_state();
+            latest.served_model_name().to_owned()
+        },
         endpoint_api_key,
         Duration::from_secs(45),
         on_wait_tick,
@@ -1217,6 +1225,7 @@ mod tests {
 
         let resolve = ResolveModelResponse {
             canonical_model_id: "qwen-canonical".to_owned(),
+            served_model_id: None,
             task: "chat".to_owned(),
             source: "hf".to_owned(),
             revision: "main".to_owned(),
@@ -1306,6 +1315,7 @@ mod tests {
 
         let resolve = ResolveModelResponse {
             canonical_model_id: "qwen-canonical".to_owned(),
+            served_model_id: None,
             task: "chat".to_owned(),
             source: "hf".to_owned(),
             revision: "main".to_owned(),
@@ -1390,6 +1400,7 @@ mod tests {
 
         let resolve = ResolveModelResponse {
             canonical_model_id: "qwen-canonical".to_owned(),
+            served_model_id: None,
             task: "chat".to_owned(),
             source: "hf".to_owned(),
             revision: "main".to_owned(),

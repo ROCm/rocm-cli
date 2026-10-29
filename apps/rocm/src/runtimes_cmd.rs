@@ -13,8 +13,8 @@
 //! way `EnginesCommand` stayed behind when `engines()` moved to
 //! `engines_cmd.rs` in Phase 6a. `RuntimeActivationResult` and
 //! `ActiveRuntimeMarker` stay `pub(crate)`: the former is read by
-//! `append_update_activate_summary` in `main.rs`'s `apply_runtime_update`
-//! flow, the latter by `storage.rs`. `select_runtime_manifest`,
+//! `append_update_activate_summary` in `update_cmd.rs`'s
+//! `apply_runtime_update` flow, the latter by `storage.rs`. `select_runtime_manifest`,
 //! `validate_runtime_manifest_for_activation`, `normalize_path_for_compare`,
 //! `recover_setup_runtime_registration`, `active_runtime_marker_path`,
 //! `should_remove_runtime_install_root`, and `runtime_usability_status` are
@@ -1820,6 +1820,8 @@ fn write_active_runtime_marker(paths: &AppPaths, marker: ActiveRuntimeMarker) ->
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::append_examine_runtime_state;
+    use crate::engine_runtime_select::resolve_runtime_selector_to_exact_key;
     use crate::runtime_install_finalize::{
         finalize_successful_sdk_install, render_sdk_install_success,
     };
@@ -1827,7 +1829,6 @@ pub(crate) mod tests {
     use crate::tests::{
         NEW_RUNTIME_KEY, OLD_RUNTIME_KEY, plant_service_record_on_runtime, test_paths,
     };
-    use crate::{append_examine_runtime_state, resolve_runtime_selector_to_exact_key};
 
     #[test]
     fn runtime_selector_recovers_setup_runtime_registry_from_local_manifest() -> Result<()> {

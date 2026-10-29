@@ -33,6 +33,13 @@ path = "src/bin/fake-uv.rs"
 name = "fake-python"
 path = "src/bin/fake-python.rs"
 
+# Stand-in for `docker` that always fails, planted by the model-catalog
+# scenario proving the AIM engine's Docker-unavailable gate deterministically
+# (see `src/bin/fake-docker.rs`).
+[[bin]]
+name = "fake-docker"
+path = "src/bin/fake-docker.rs"
+
 [dependencies]
 axum.workspace = true
 cucumber = { version = "0.23", features = ["output-json", "output-junit"] }

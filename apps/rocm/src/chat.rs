@@ -24,24 +24,29 @@
 //! module; none of the module's types need to be, bar the one exception
 //! above.
 
+use crate::automations::{render_automations_text, render_daemon_text};
+use crate::engine_runtime_select::{apply_app_path_env, service_model_names_match};
 use crate::freeform_planner::{
-    format_structured_tool_call, plan_freeform_request_with_context, serve_args_request_cpu_device,
+    format_structured_tool_call, infer_engine_from_request, plan_freeform_request_with_context,
+    serve_args_request_cpu_device,
 };
 use crate::managed_service_status::{
     friendly_engine_label, load_managed_services, managed_service_is_live,
 };
 use crate::runtimes_cmd::render_runtimes_text;
 use crate::service_launch::is_loopback_host;
+use crate::services_text::{
+    read_tail_lines, render_logs_browser_text, render_logs_text, render_service_logs_text,
+    render_services_text, validate_service_id,
+};
 use crate::uninstall_plan::render_uninstall_dry_run;
+use crate::update_cmd::render_update_text;
 use crate::{
-    ChatInferenceParams, apply_app_path_env, build_codex_bridge_gpu_snapshot,
-    build_codex_bridge_snapshot, builtin_codex_bridge_engine_inventory, cli_version_string,
-    read_tail_lines, record_cli_audit_event, render_automations_text, render_config_text,
-    render_daemon_text, render_engine_inventory_text_with_paths, render_examine_text,
-    render_examine_text_with_paths, render_logs_browser_text, render_logs_text,
-    render_model_registry_verbose_text_with_context_and_host, render_service_logs_text,
-    render_services_text, render_setup_status_text, render_update_text, service_model_names_match,
-    therock_install_version_selector, validate_service_id,
+    ChatInferenceParams, build_codex_bridge_gpu_snapshot, build_codex_bridge_snapshot,
+    builtin_codex_bridge_engine_inventory, cli_version_string, record_cli_audit_event,
+    render_config_text, render_engine_inventory_text_with_paths, render_examine_text,
+    render_examine_text_with_paths, render_model_registry_verbose_text_with_context_and_host,
+    render_setup_status_text, therock_install_version_selector,
 };
 use crate::{chat_host_facts, comfyui, providers, therock};
 use anyhow::{Context, Result, bail};
@@ -326,7 +331,7 @@ fn parse_bracketed_csv(line: &str, start: &str, end: &str) -> Vec<String> {
 fn is_engine_status_line(line: &str) -> bool {
     matches!(
         line.split_once(':').map(|(engine, _)| engine),
-        Some("lemonade" | "vllm")
+        Some("lemonade" | "vllm" | "aim")
     )
 }
 
@@ -437,7 +442,7 @@ fn parse_deterministic_engine_rows(tool_text: &str) -> Vec<DeterministicEngineRo
 }
 
 fn engine_name_from_inventory_line(line: &str) -> Option<&'static str> {
-    ["lemonade", "vllm"].into_iter().find(|engine| {
+    ["lemonade", "vllm", "aim"].into_iter().find(|engine| {
         line == *engine
             || line
                 .strip_prefix(*engine)
@@ -1417,17 +1422,16 @@ fn fallback_config_tool_call_for_prompt(normalized: &str) -> Option<providers::C
         });
     }
     if any_substring(normalized, &["default engine", "set engine", "use engine"]) {
-        for engine in ["lemonade", "vllm"] {
-            if normalized.contains(engine) {
-                return Some(providers::ChatToolCall {
-                    id: Some("fallback-config-default-engine".to_owned()),
-                    name: "rocm_command".to_owned(),
-                    arguments: serde_json::json!({
-                        "args": ["config", "set-default-engine", engine],
-                        "reason": "Change ROCm CLI's default engine after the user approves it."
-                    }),
-                });
-            }
+        // Word-boundary inference: a bare `contains("aim")` matched "aiming".
+        if let Some(engine) = infer_engine_from_request(normalized) {
+            return Some(providers::ChatToolCall {
+                id: Some("fallback-config-default-engine".to_owned()),
+                name: "rocm_command".to_owned(),
+                arguments: serde_json::json!({
+                    "args": ["config", "set-default-engine", engine],
+                    "reason": "Change ROCm CLI's default engine after the user approves it."
+                }),
+            });
         }
     }
     if normalized.contains("telemetry") {
@@ -1801,7 +1805,7 @@ fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
 /// to, and a WSL user was told "on native Windows, vLLM is skipped" while vLLM
 /// was in fact their supported path. Anything host-dependent now comes from
 /// [`chat_host_facts::HostFacts`], which knows which machine it is describing.
-const ROCM_CHAT_TOOL_SYSTEM_PROMPT: &str = "You are ROCm CLI's local assistant. Speak in simple English for non-technical users. Use the provided ROCm tools when you need to inspect this machine, preview setup, read service logs, check updates, inspect automations, install or start ROCm-managed apps, or request ROCm/TheRock, config, engine, app, and local model server changes. For simple greetings or thanks like hello, hi, hey, ok, or thank you, reply normally; do not inspect ROCm, do not call tools, and do not launch or propose a model server. Tool-use rules: inspect first with read-only tools; call rocm_command only with argv-style args and no shell text; use natural_language_plan for ROCm requests that do not fit another read-only tool; ask for a mutating tool call only after explaining why it is needed; summarize tool results after they are returned. Read-only tools may run immediately. Tools that install, launch, stop, delete, or change state require user approval; request rocm_command and explain why. For 'is X running?', 'what is running?', status, or port questions, inspect before answering and do not start, stop, install, or serve anything. For ComfyUI or port 8188 use [\"comfyui\",\"status\"] or port_status. For vLLM, Lemonade, qwen, or local model servers use [\"services\",\"list\",\"--all\"] for running state and [\"engines\",\"list\"] for installed/available engine state. Treat ready/running as running, starting/recovering as starting, failed/stopped as not running, and no matching record as unknown or not managed by ROCm CLI. Interpret Examine carefully: active_runtime_status=ready means ROCm CLI has an active managed TheRock/ROCm runtime; legacy_rocm_status=not_detected only means no global system ROCm install was found. If active_runtime_status=ready, tell the user ROCm/TheRock is installed and active for ROCm CLI. For 'is TheRock installed', 'is ROCm installed', or 'which GPU is on this machine', use examine or gpu_snapshot before answering. For 'how do I setup TheRock' or install/setup requests, guide the user to choose an install folder first; do not answer with only a status check. For 'which LLMs can this machine support', use rocm_command args [\"model\"] or natural_language_plan before answering. For TheRock installs, always let the user choose the install folder. If the user names a folder or prefix, preserve that exact folder with [\"--prefix\",\"PATH\"]; you may call path_exists first to check whether that user-provided folder or its parent exists. If the user asks you to install TheRock/ROCm but has not named a folder, ask for the folder or let the guided setup folder picker collect it; do not invent a hidden default folder and do not request an install command without --prefix. Use rocm_command args [\"install\",\"sdk\",\"--channel\",\"release\",\"--format\",\"wheel\",\"--prefix\",\"PATH\"] only when the user asks you to install it and a folder is known; for a requested build date add [\"--build-date\",\"YYYY-MM-DD\"] and for a requested exact version add [\"--version\",\"VERSION\"]. For config changes, inspect with [\"config\",\"show\"] first when useful, then request config subcommands such as [\"config\",\"set-default-engine\",\"lemonade\"], [\"config\",\"set-default-runtime\",\"RUNTIME_KEY\"], or [\"config\",\"set-telemetry\",\"local\"] only after explaining why. For ComfyUI, use rocm_command with args like [\"comfyui\",\"status\"], [\"comfyui\",\"logs\"], [\"comfyui\",\"install\"], [\"comfyui\",\"start\"], or [\"comfyui\",\"stop\"]. First-time setup is the same thing as bootstrap in ROCm CLI; it is a deterministic ROCm setup flow, not a separate model chat. The built-in local assistant is fixed to qwen, which maps to Qwen3-4B-Instruct-2507-GGUF served by Lemonade with gpu_required. vLLM and Lemonade are the general serving engines; inspect or manage them when the user asks about general model serving, but do not switch the built-in assistant away from Lemonade. Use qwen-smoke only for a quick server smoke test. For vLLM management, inspect engines first and use [\"engines\",\"install\",\"vllm\"] or [\"serve\",\"MODEL\",\"--engine\",\"vllm\",\"--device\",\"gpu_required\",\"--managed\"] only where the host supports it. Do not invent shell commands and do not request CPU fallback.";
+const ROCM_CHAT_TOOL_SYSTEM_PROMPT: &str = "You are ROCm CLI's local assistant. Speak in simple English for non-technical users. Use the provided ROCm tools when you need to inspect this machine, preview setup, read service logs, check updates, inspect automations, install or start ROCm-managed apps, or request ROCm/TheRock, config, engine, app, and local model server changes. For simple greetings or thanks like hello, hi, hey, ok, or thank you, reply normally; do not inspect ROCm, do not call tools, and do not launch or propose a model server. Tool-use rules: inspect first with read-only tools; call rocm_command only with argv-style args and no shell text; use natural_language_plan for ROCm requests that do not fit another read-only tool; ask for a mutating tool call only after explaining why it is needed; summarize tool results after they are returned. Read-only tools may run immediately. Tools that install, launch, stop, delete, or change state require user approval; request rocm_command and explain why. For 'is X running?', 'what is running?', status, or port questions, inspect before answering and do not start, stop, install, or serve anything. For ComfyUI or port 8188 use [\"comfyui\",\"status\"] or port_status. For vLLM, Lemonade, AIM, qwen, or local model servers use [\"services\",\"list\",\"--all\"] for running state and [\"engines\",\"list\"] for installed/available engine state. Treat ready/running as running, starting/recovering as starting, failed/stopped as not running, and no matching record as unknown or not managed by ROCm CLI. Interpret Examine carefully: active_runtime_status=ready means ROCm CLI has an active managed TheRock/ROCm runtime; legacy_rocm_status=not_detected only means no global system ROCm install was found. If active_runtime_status=ready, tell the user ROCm/TheRock is installed and active for ROCm CLI. For 'is TheRock installed', 'is ROCm installed', or 'which GPU is on this machine', use examine or gpu_snapshot before answering. For 'how do I setup TheRock' or install/setup requests, guide the user to choose an install folder first; do not answer with only a status check. For 'which LLMs can this machine support', use rocm_command args [\"model\"] or natural_language_plan before answering. For TheRock installs, always let the user choose the install folder. If the user names a folder or prefix, preserve that exact folder with [\"--prefix\",\"PATH\"]; you may call path_exists first to check whether that user-provided folder or its parent exists. If the user asks you to install TheRock/ROCm but has not named a folder, ask for the folder or let the guided setup folder picker collect it; do not invent a hidden default folder and do not request an install command without --prefix. Use rocm_command args [\"install\",\"sdk\",\"--channel\",\"release\",\"--format\",\"wheel\",\"--prefix\",\"PATH\"] only when the user asks you to install it and a folder is known; for a requested build date add [\"--build-date\",\"YYYY-MM-DD\"] and for a requested exact version add [\"--version\",\"VERSION\"]. For config changes, inspect with [\"config\",\"show\"] first when useful, then request config subcommands such as [\"config\",\"set-default-engine\",\"lemonade\"], [\"config\",\"set-default-runtime\",\"RUNTIME_KEY\"], or [\"config\",\"set-telemetry\",\"local\"] only after explaining why. For ComfyUI, use rocm_command with args like [\"comfyui\",\"status\"], [\"comfyui\",\"logs\"], [\"comfyui\",\"install\"], [\"comfyui\",\"start\"], or [\"comfyui\",\"stop\"]. First-time setup is the same thing as bootstrap in ROCm CLI; it is a deterministic ROCm setup flow, not a separate model chat. The built-in local assistant is fixed to qwen, which maps to Qwen3-4B-Instruct-2507-GGUF served by Lemonade with gpu_required. vLLM, Lemonade, and AIM (Docker-based) are the general serving engines; inspect or manage them when the user asks about general model serving, but do not switch the built-in assistant away from Lemonade. Use qwen-smoke only for a quick server smoke test. For vLLM management, inspect engines first and use [\"engines\",\"install\",\"vllm\"] or [\"serve\",\"MODEL\",\"--engine\",\"vllm\",\"--device\",\"gpu_required\",\"--managed\"] only where the host supports it. Do not invent shell commands and do not request CPU fallback.";
 const ROCM_CHAT_TOOL_SKILL: &str = include_str!("../../../skills/rocm-cli-assistant/SKILL.md");
 
 fn rocm_chat_tool_system_prompt() -> String {
@@ -5148,7 +5152,7 @@ endpoint: 127.0.0.1:8001
         // Stated only where it is true: present on Windows, absent elsewhere.
         let grounded = rocm_chat_tool_system_prompt_for_host(None);
         assert_eq!(
-            grounded.contains("vLLM is skipped on native Windows"),
+            grounded.contains("vLLM and AIM are skipped on native Windows"),
             cfg!(windows),
             "the vLLM caveat must track the host:\n{grounded}"
         );
@@ -5522,6 +5526,32 @@ model recipes
             .expect("approval should be built");
         assert_eq!(approval.pending_title, "Change settings");
         assert_eq!(approval.command_title, "Config");
+    }
+
+    #[test]
+    fn default_engine_fallback_matches_aim_only_as_a_word() {
+        let proposed = |prompt: &str| {
+            fallback_config_tool_call_for_prompt(prompt).map(|call| {
+                call.arguments["args"][2]
+                    .as_str()
+                    .expect("engine arg")
+                    .to_owned()
+            })
+        };
+        assert_eq!(
+            proposed("change the default engine to aim").as_deref(),
+            Some("aim")
+        );
+        assert_eq!(
+            proposed("change the default engine to vllm, aiming for low latency").as_deref(),
+            Some("vllm")
+        );
+        assert_eq!(
+            proposed(
+                "change the default engine so I can maintain my claim, aiming for low latency"
+            ),
+            None
+        );
     }
 
     #[test]

@@ -174,6 +174,85 @@ async fn open_dashboard_demo(world: &mut E2eWorld) {
     world.tui = Some(session);
 }
 
+/// The one warning `dash-38`'s recording reports. Short and ASCII so it stays on
+/// one screen row inside the popup and is found by a plain substring match.
+const RECORDED_WARNING: &str = "amd-smi unavailable (GPU device inaccessible)";
+
+#[when("the user opens the dashboard replaying a recording that reports a warning")]
+async fn open_dashboard_replaying_warning(world: &mut E2eWorld) {
+    // A snapshot with a working GPU *and* a warning: the combination where the
+    // warning text used to be drawn nowhere in the dashboard. The dashboard
+    // forgets its latest snapshot the moment a replay ends, and replay caps the
+    // wait between entries at two seconds, so a single line would be gone before
+    // the scenario looked at it. Sixty entries two seconds apart keep the
+    // recording playing for two minutes, far longer than the scenario runs.
+    let snapshot = |ts_us: u64| {
+        format!(
+            concat!(
+                r#"{{"ts_us":{ts_us},"event":{{"kind":"snapshot","#,
+                r#""timestamp":"2023-11-15T00:00:00Z","#,
+                r#""host":{{"cpu_overall_pct":0.0,"cpu_per_core_pct":[],"memory_used_mb":0,"#,
+                r#""memory_total_mb":0,"swap_used_mb":0,"swap_total_mb":0,"#,
+                r#""disk_read_bps":0,"disk_write_bps":0,"net_rx_bps":0,"net_tx_bps":0}},"#,
+                r#""gpus":[{{"device_id":"0","vram_used_mb":0,"vram_total_mb":1024,"#,
+                r#""gpu_utilization_pct":0.0,"temperature_c":0.0,"power_w":0.0,"clock_mhz":null}}],"#,
+                r#""gpu_system_info":null,"instances":[],"warnings":["{warning}"]}}}}"#,
+            ),
+            ts_us = ts_us,
+            warning = RECORDED_WARNING
+        )
+    };
+    let recording_text: String = (0..60u64)
+        .map(|i| snapshot(1_700_000_000_000_000 + i * 2_000_000) + "\n")
+        .collect();
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .to_path_buf();
+    let recording = root.join("warning-recording.ndjson");
+    std::fs::write(&recording, recording_text)
+        .unwrap_or_else(|e| panic!("failed to write {}: {e}", recording.display()));
+    let path = recording.to_string_lossy().to_string();
+    let session = TuiSession::spawn(world, &["dash", "--replay", &path])
+        .unwrap_or_else(|e| panic!("failed to open the dashboard replaying a recording: {e}"));
+    world.tui = Some(session);
+}
+
+#[then("the header shows that one warning is reported")]
+async fn header_shows_one_warning(world: &mut E2eWorld) {
+    session(world)
+        .wait_for_screen("⚠ 1", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the header warning badge did not appear: {e}"));
+}
+
+#[when("the user opens the warnings")]
+async fn open_warnings(world: &mut E2eWorld) {
+    // `!` toggles the popup, so it is not safe to resend; the previous step
+    // already waited for a frame that shows the badge, so the event loop is up.
+    session(world)
+        .send("!")
+        .unwrap_or_else(|e| panic!("failed to open the warnings: {e}"));
+}
+
+#[then("the warning text is displayed")]
+async fn warning_text_is_displayed(world: &mut E2eWorld) {
+    session(world)
+        .wait_for_screen(RECORDED_WARNING, default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the warning text was not shown: {e}"));
+}
+
+#[then("the warning text is no longer displayed")]
+async fn warning_text_is_gone(world: &mut E2eWorld) {
+    session(world)
+        .wait_until_gone(RECORDED_WARNING, default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the warnings popup did not close: {e}"));
+}
+
 /// The name of a child directory `dash-25` plants under the scenario's cwd;
 /// `existing_folder_browser_shows_scenario_folder` asserts the browser lists
 /// it by this fixed, short label rather than its full path — the browser's
@@ -2501,15 +2580,9 @@ const SEND_REVIEW_TITLE: &str = "Report this diagnosis";
 /// (this crate runs the built binary and links neither).
 const SENDER_NOTICE_FRAGMENT: &str = "it goes from your own mail account and carries your address";
 
-/// The screen as one line of prose: dialog borders dropped and whitespace
-/// collapsed, so a sentence the dialog wrapped over two rows still matches.
-fn screen_as_prose(screen: &str) -> String {
-    screen
-        .replace(['│', '┃', '║'], " ")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-}
+/// The send review's title as the shared approval popup stamps it, which is
+/// what `TuiSession::wait_for_popup_body_where` finds the popup by.
+const SEND_REVIEW_TITLE_BAR: &str = "Review: Report this diagnosis";
 
 #[when("the user asks to review the report for sending")]
 async fn ask_to_review_for_sending(world: &mut E2eWorld) {
@@ -2537,16 +2610,39 @@ async fn review_states_the_sender_notice_first(world: &mut E2eWorld) {
         );
         return;
     }
-    tui.wait_for_screen(SEND_REVIEW_TITLE, default_timeout())
-        .await
-        .unwrap_or_else(|e| panic!("the send review did not open: {e}"));
+    // Read the popup's own body, not the whole screen. The review is drawn
+    // over the Diagnose screen and the Observe panels, which share its rows,
+    // so the whole screen joined into one line puts their text (a panel's
+    // "MODEL" heading, say) into the middle of any sentence the review
+    // wrapped. `wait_for_popup_body_where` slices each row to the popup's own
+    // columns and undoes the wrap. It waits for the report's first key so the
+    // body is read once the review has drawn the report.
+    //
+    // Both sides are then compared with all whitespace removed. A wrap that
+    // ends flush with the popup's right border cannot be told apart from a
+    // word split mid-word, so the rejoined body can read "carriesyour" there
+    // (see `popup_body_text`). Without whitespace the fragment still occurs
+    // only in the notice.
+    let mut body = String::new();
+    tui.wait_for_popup_body_where(
+        "the send review shows the report",
+        SEND_REVIEW_TITLE_BAR,
+        |text| {
+            text.clone_into(&mut body);
+            text.contains("\"schema\"")
+        },
+        default_timeout(),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("the send review did not open with the report: {e}"));
     let screen = tui.screen_text();
-    let prose = screen_as_prose(&screen);
-    let notice = prose.find(SENDER_NOTICE_FRAGMENT);
-    let report = prose.find("\"schema\"");
+    let unspaced = |text: &str| text.split_whitespace().collect::<String>();
+    let compact = unspaced(&body);
+    let notice = compact.find(&unspaced(SENDER_NOTICE_FRAGMENT));
+    let report = compact.find("\"schema\"");
     assert!(
         notice.is_some(),
-        "the send review does not say the mail carries the user's address:\n{screen}"
+        "the send review does not say the mail carries the user's address:\n{body}\n{screen}"
     );
     // On the first screen of the review, above the report: the body scrolls
     // and Approve does not, so a notice below the report could be approved

@@ -44,6 +44,7 @@ pub(crate) fn friendly_engine_label(engine: &str) -> &str {
     match engine {
         "lemonade" => "Lemonade",
         "vllm" => "vLLM",
+        "aim" => "AIM",
         other => other,
     }
 }
@@ -286,7 +287,7 @@ mod tests {
     use std::thread;
 
     use super::*;
-    use crate::load_managed_service;
+    use crate::services_text::load_managed_service;
     use crate::tests::test_paths;
 
     #[test]
