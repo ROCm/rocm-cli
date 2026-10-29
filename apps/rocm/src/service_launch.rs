@@ -47,18 +47,22 @@ use rocm_engine_protocol::{DevicePolicy, EngineRecipeHint, ResolveModelResponse}
 
 use crate::endpoint_keys;
 use crate::engine_ipc::builtin_engine_serve_http_args;
+#[cfg(not(windows))]
+use crate::engine_runtime_select::apply_app_path_env;
+#[cfg(windows)]
+use crate::engine_runtime_select::{app_path_env_var_refs, app_path_env_var_values};
+use crate::engine_runtime_select::{
+    managed_service_launcher_path, wait_for_service_http_ready_with_progress,
+};
 use crate::engines_cmd::env_root_for_service;
 use crate::managed_service_status::existing_live_managed_service;
+#[cfg(not(windows))]
+use crate::read_optional_tail_lines;
 use crate::service_hints;
 use crate::{
-    SandboxToolArg, device_policy_name, managed_service_launcher_path, record_cli_audit_event,
-    render_service_action_result, run_internal_sandbox_tool, status_for_readiness,
-    wait_for_service_http_ready_with_progress,
+    SandboxToolArg, device_policy_name, record_cli_audit_event, render_service_action_result,
+    run_internal_sandbox_tool, status_for_readiness,
 };
-#[cfg(windows)]
-use crate::{app_path_env_var_refs, app_path_env_var_values};
-#[cfg(not(windows))]
-use crate::{apply_app_path_env, read_optional_tail_lines};
 
 pub(crate) fn validate_bind_host(host: &str, allow_public_bind: bool) -> Result<()> {
     if !is_loopback_host(host) && !allow_public_bind {

@@ -1820,6 +1820,8 @@ fn write_active_runtime_marker(paths: &AppPaths, marker: ActiveRuntimeMarker) ->
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::append_examine_runtime_state;
+    use crate::engine_runtime_select::resolve_runtime_selector_to_exact_key;
     use crate::runtime_install_finalize::{
         finalize_successful_sdk_install, render_sdk_install_success,
     };
@@ -1827,7 +1829,6 @@ pub(crate) mod tests {
     use crate::tests::{
         NEW_RUNTIME_KEY, OLD_RUNTIME_KEY, plant_service_record_on_runtime, test_paths,
     };
-    use crate::{append_examine_runtime_state, resolve_runtime_selector_to_exact_key};
 
     #[test]
     fn runtime_selector_recovers_setup_runtime_registry_from_local_manifest() -> Result<()> {
