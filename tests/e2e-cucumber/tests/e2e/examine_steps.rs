@@ -1618,7 +1618,7 @@ async fn kernel_only_apu_machine(world: &mut E2eWorld) {
 /// that matches nothing here -- and the branch under test is the one taken when
 /// no PCI entry matched at all.
 ///
-/// The `rocminfo` stub is load-bearing for the same reason as in examine-29: a
+/// The `rocminfo` stub is load-bearing for the same reason as in examine-31: a
 /// runner with ROCm installed resolves the APU through its own probe first and
 /// would mask the verdict this scenario is about.
 fn plant_kernel_only_apu_fixtures(world: &mut E2eWorld) {

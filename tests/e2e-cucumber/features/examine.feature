@@ -492,10 +492,10 @@ Feature: GPU detection and system inspection
   # PCI scan sees nothing at all (no `lspci`, or one that enumerates an empty
   # bus). That branch decides `is_apu` from the node's target alone, and before
   # this change it left the verdict unset -- so a gfx1151 host with no PCI tools
-  # still reported `has_apu: false`. examine-30 always has a PCI match and never
+  # still reported `has_apu: false`. examine-31 always has a PCI match and never
   # reaches the branch, so nothing covered it.
   @id:examine-classifies-a-kernel-only-apu @requires-os:linux
-  Scenario: examine-31 - An APU the PCI scan never sees is still classified as an APU
+  Scenario: examine-32 - An APU the PCI scan never sees is still classified as an APU
     Given a machine whose kernel exposes an APU the PCI scan cannot see
     When the user inspects that machine in machine-readable form
     Then the inspection classifies the kernel-only GPU as an APU
