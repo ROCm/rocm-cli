@@ -635,6 +635,7 @@ mod tests {
                 gpu_utilization_pct: 62.0,
                 temperature_c: 51.0,
                 power_w: 420.0,
+                power_limit_w: None,
                 clock_mhz: Some(2100.0),
             }],
             gpu_system_info: Some(GpuSystemInfo {

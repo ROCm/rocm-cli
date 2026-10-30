@@ -42,6 +42,12 @@ pub struct GpuMetrics {
     pub gpu_utilization_pct: f32,
     pub temperature_c: f32,
     pub power_w: f32,
+    /// The board's power cap (W), when the platform reports one. Warning
+    /// thresholds are derived from it; `None` means unknown (never `0`), and
+    /// consumers must not substitute another part's limit. Serde-default so
+    /// older recordings load.
+    #[serde(default)]
+    pub power_limit_w: Option<f32>,
     pub clock_mhz: Option<f32>,
 }
 
@@ -205,15 +211,30 @@ pub struct Instance {
     /// occupies. `None` when throughput or GPU power telemetry is unavailable.
     #[serde(default)]
     pub tokens_per_watt: Option<f64>,
+    /// Board power (W) attributed to this instance: each GPU's power split among
+    /// the instances sharing it (see `efficiency::attribute_power_w`). `None`
+    /// when no occupied GPU reports power. Serde-default for replay back-compat.
+    #[serde(default)]
+    pub power_w: Option<f64>,
     /// Live average time-to-first-token (ms), windowed from the vLLM TTFT
     /// histogram. `None` until two scrapes (or absent for non-vLLM engines);
     /// Observe shows `—`. Serde-default for NDJSON replay back-compat.
     #[serde(default)]
     pub ttft_ms: Option<f64>,
+    /// Freshness provenance for [`Instance::ttft_ms`]. A value with no new
+    /// requests in the latest scrape window is `Held` until the observation
+    /// validity window lapses, then cleared. `None` when unknown (legacy
+    /// snapshots). Omitted from JSON when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttft_observation: Option<ObservationMetadata>,
     /// Live average time-per-output-token (ms), windowed from the vLLM TPOT
     /// histogram. `None` until two scrapes (or absent); Observe shows `—`.
     #[serde(default)]
     pub tpot_ms: Option<f64>,
+    /// Freshness provenance for [`Instance::tpot_ms`]; same semantics as
+    /// [`Instance::ttft_observation`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tpot_observation: Option<ObservationMetadata>,
     pub launch_args: Vec<String>,
     pub env_vars: std::collections::BTreeMap<String, String>,
     pub log_file: Option<String>,
@@ -256,6 +277,29 @@ mod tests {
         let back: Instance = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back.ttft_ms, Some(180.5));
         assert_eq!(back.tpot_ms, Some(22.0));
+    }
+
+    #[test]
+    fn instance_latency_observation_is_omitted_when_unknown_and_round_trips() {
+        // Legacy payloads carry no freshness: it stays `None`, never `Fresh`,
+        // and is not written back out.
+        let json = serde_json::to_string(&Instance::default()).expect("serialize");
+        assert!(!json.contains("ttft_observation") && !json.contains("tpot_observation"));
+        let inst = Instance {
+            ttft_ms: Some(100.0),
+            ttft_observation: Some(ObservationMetadata {
+                observed_at: Utc::now(),
+                freshness: ObservationFreshness::Held,
+            }),
+            ..Default::default()
+        };
+        let back: Instance =
+            serde_json::from_str(&serde_json::to_string(&inst).expect("serialize")).expect("parse");
+        assert_eq!(
+            back.ttft_observation.map(|m| m.freshness),
+            Some(ObservationFreshness::Held)
+        );
+        assert!(back.tpot_observation.is_none());
     }
 
     #[test]

@@ -123,6 +123,13 @@ impl AmdSmiCollector {
         Ok(parse_metrics(&v))
     }
 
+    /// Per-GPU power caps (W) from `amd-smi static --json`, keyed by the same
+    /// `gpu-N` id [`metrics`] uses. GPUs with no readable cap are omitted.
+    pub async fn power_limits(&self) -> io::Result<std::collections::HashMap<String, f32>> {
+        let v = self.run_json(&["static", "--json"]).await?;
+        Ok(parse_power_limits(&v))
+    }
+
     /// Per-process GPU VRAM usage from `amd-smi process --json`.
     ///
     /// Inherent async (mirrors [`metrics`]); the runner uses this directly
@@ -239,7 +246,44 @@ pub fn parse_metrics(v: &Value) -> Vec<GpuMetrics> {
                 temperature_c,
                 power_w: val_f32(nested(g, &["power", "socket_power", "value"])).unwrap_or(0.0),
                 clock_mhz: val_f32(nested(g, &["clock", "gfx_0", "clk", "value"])),
+                // Filled by the runner from `power_limits`; not in `metric`.
+                power_limit_w: None,
             }
+        })
+        .collect()
+}
+
+/// Candidate keys under a GPU's `limit` object for its power cap, in priority
+/// order: the cap currently in force, then the maximum the part allows.
+const POWER_LIMIT_KEYS: [&str; 2] = ["socket_power", "max_power"];
+
+/// Parse `amd-smi static --json` into per-GPU power caps (W), keyed `gpu-N`.
+///
+/// Assumed schema (not verified against every amd-smi release): top level
+/// `{ "gpu_data": [ <gpu>, ... ] }` or a bare array; each `<gpu>` has
+/// `{ "gpu": N, "limit": { "socket_power" | "max_power": <watts> } }` where the
+/// value is a raw number or a `{ "value": W, "unit": "W" }` wrapper. A missing,
+/// non-numeric, non-finite or non-positive cap (`N/A`, `0`) is omitted, so an
+/// unrecognised schema yields an empty map and callers treat the cap as
+/// unknown rather than guessing one.
+pub fn parse_power_limits(v: &Value) -> std::collections::HashMap<String, f32> {
+    let entries: Vec<&Value> = if let Some(arr) = v.get("gpu_data").and_then(|x| x.as_array()) {
+        arr.iter().collect()
+    } else if let Some(arr) = v.as_array() {
+        arr.iter().collect()
+    } else {
+        return std::collections::HashMap::new();
+    };
+    entries
+        .into_iter()
+        .filter_map(|g| {
+            let id = g.get("gpu").and_then(serde_json::Value::as_u64)?;
+            let limit = g.get("limit")?;
+            let watts = POWER_LIMIT_KEYS.iter().find_map(|k| {
+                let raw = limit.get(*k)?;
+                val_f32(Some(raw)).or_else(|| val_f32(raw.get("value")))
+            })?;
+            (watts.is_finite() && watts > 0.0).then(|| (format!("gpu-{id}"), watts))
         })
         .collect()
 }
@@ -483,6 +527,27 @@ mod tests {
             !preflight_passes(false, false, &real_missing, &host_missing),
             "neither readable: amd-smi does not run"
         );
+    }
+
+    #[test]
+    fn power_limits_prefer_current_cap_and_skip_unreadable() {
+        let v: Value = serde_json::from_str(
+            r#"{ "gpu_data": [
+              { "gpu": 0, "limit": { "socket_power": { "value": 600, "unit": "W" },
+                                      "max_power":    { "value": 750, "unit": "W" } } },
+              { "gpu": 1, "limit": { "max_power": 750 } },
+              { "gpu": 2, "limit": { "socket_power": "N/A" } },
+              { "gpu": 3, "limit": { "max_power": { "value": 0, "unit": "W" } } },
+              { "gpu": 4 }
+            ] }"#,
+        )
+        .unwrap();
+        let m = parse_power_limits(&v);
+        assert_eq!(m.get("gpu-0"), Some(&600.0), "current cap wins over max");
+        assert_eq!(m.get("gpu-1"), Some(&750.0), "raw number falls back to max");
+        assert_eq!(m.len(), 2, "N/A, zero and absent caps are unknown: {m:?}");
+        // Unrecognised shapes are an empty map, not a panic.
+        assert!(parse_power_limits(&Value::Null).is_empty());
     }
 
     const SAMPLE_METRIC: &str = r#"{

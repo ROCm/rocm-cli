@@ -649,6 +649,154 @@ async fn gen_tps_held_for_validity_window_after_single_failure() {
     );
 }
 
+// ── TTFT freshness (ROCMAI-62) ──────────────────────────────────────────────
+
+/// Extract the `contract-svc` instance's TTFT and its freshness.
+/// Outer `None` = instance absent.
+#[allow(clippy::type_complexity)]
+fn svc_ttft(
+    snap: &rocm_dash_core::metrics::Snapshot,
+) -> Option<(
+    Option<f64>,
+    Option<rocm_dash_core::metrics::ObservationFreshness>,
+)> {
+    snap.instances
+        .iter()
+        .find(|i| i.container_id == SVC_ID)
+        .map(|i| (i.ttft_ms, i.ttft_observation.as_ref().map(|m| m.freshness)))
+}
+
+/// Contract: once new requests stop arriving, the last windowed TTFT is held
+/// (`Held`) for the observation validity window and then cleared. It is never
+/// replaced by the histogram's lifetime average, which the mock's constant
+/// `Frozen` body would otherwise report as a steady 50 ms indefinitely.
+///
+/// Exercises the real runner loop: scrape, per-instance tracker, snapshot.
+#[tokio::test]
+async fn ttft_is_held_then_cleared_when_requests_stop() {
+    use rocm_dash_core::metrics::ObservationFreshness::{Fresh, Held};
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let services_dir = tmp.path().join("services");
+
+    let mode = Arc::new(Mutex::new(MockMode::Growing));
+    let ticks = Arc::new(AtomicU64::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let failure_count = Arc::new(AtomicU64::new(0));
+    let port = spawn_mock_server(
+        Arc::clone(&mode),
+        Arc::clone(&ticks),
+        Arc::clone(&failure_count),
+        Arc::clone(&stop),
+    )
+    .await;
+
+    write_service_record(&services_dir, port);
+    let (tx, mut rx) = broadcast::channel::<Event>(64);
+    let _runner = spawn_runner(tx, fast_opts(services_dir)).await;
+
+    // Step 1: traffic is flowing, so TTFT is a live (Fresh) windowed value.
+    let live = wait_for_snapshot(&mut rx, |snap| {
+        svc_ttft(snap).and_then(|(v, f)| (f == Some(Fresh)).then_some(v).flatten())
+    })
+    .await
+    .unwrap_or_else(|e| panic!("fresh TTFT never established: {e}"));
+    assert!(live > 0.0, "windowed TTFT should be positive, got {live}");
+
+    // Step 2: the engine goes idle: histograms stop advancing.
+    drain_snapshots(&mut rx);
+    *mode
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = MockMode::Frozen(1000);
+
+    // Step 3: the value is held, marked as such, rather than dropped or
+    // silently presented as live.
+    let held = wait_for_snapshot(&mut rx, |snap| {
+        svc_ttft(snap).and_then(|(v, f)| (f == Some(Held)).then_some(v).flatten())
+    })
+    .await
+    .unwrap_or_else(|e| panic!("TTFT was never reported as Held once idle: {e}"));
+    assert!(held > 0.0);
+
+    // Step 4: after the validity window it clears, and stays clear. The
+    // pre-fix behaviour would keep reporting the 50 ms lifetime average here.
+    let cleared = wait_for_snapshot(&mut rx, |snap| {
+        svc_ttft(snap).and_then(|(v, _)| v.is_none().then_some(()))
+    })
+    .await;
+    stop.store(true, Ordering::Relaxed);
+    assert!(
+        cleared.is_ok(),
+        "idle TTFT was never cleared: stale latency persisted past the validity          window ({:?})",
+        observation_validity_window()
+    );
+}
+
+// ── GPU power limit and shared-GPU attribution (ROCMAI-62) ──────────────────
+
+/// Contract: with `amd-smi` reporting one 400 W GPU capped at 750 W and two
+/// managed services launched on that GPU, the broadcast snapshot carries the
+/// cap on the GPU and splits the board power between the two instances
+/// instead of crediting each with all of it. Drives the real runner with a
+/// fake `amd-smi`; amd-smi itself is not needed on the host.
+#[cfg(unix)]
+#[tokio::test]
+async fn shared_gpu_power_is_split_and_limit_is_reported() {
+    use rocm_core::fake_executable::write_fake_executable;
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let services_dir = tmp.path().join("services");
+    std::fs::create_dir_all(&services_dir).unwrap();
+    for id in ["shared-a", "shared-b"] {
+        // Unscraped ports: this scenario is about power, not Prometheus.
+        let json = format!(
+            r#"{{"service_id":"{id}","engine":"vllm","model_ref":"M/{id}","canonical_model_id":"M/{id}","host":"127.0.0.1","port":9,"status":"ready","gpu_indices":[0],"created_at_unix_ms":0}}"#
+        );
+        std::fs::write(services_dir.join(format!("{id}.json")), json).unwrap();
+    }
+
+    let fake = tmp.path().join("amd-smi-fake");
+    write_fake_executable(
+        &fake,
+        r#"#!/bin/sh
+case "$1" in
+  metric) echo '{"gpu_data":[{"gpu":0,"mem_usage":{"used_vram":{"value":1000},"total_vram":{"value":8000}},"usage":{"gfx_activity":{"value":50}},"temperature":{"hotspot":{"value":60}},"power":{"socket_power":{"value":400.0,"unit":"W"}}}]}' ;;
+  static) echo '{"gpu_data":[{"gpu":0,"limit":{"max_power":{"value":750,"unit":"W"}}}]}' ;;
+  process) echo '{"gpu_data":[]}' ;;
+  *) echo '{}' ;;
+esac
+"#,
+    )
+    .unwrap();
+
+    let (tx, mut rx) = broadcast::channel::<Event>(64);
+    let opts = RunnerOptions {
+        amd_smi_binary: Some(fake.into_os_string()),
+        amd_smi_skip_device_preflight: true,
+        ..fast_opts(services_dir)
+    };
+    let _runner = spawn_runner(tx, opts).await;
+
+    let (limit, a, b) = wait_for_snapshot(&mut rx, |snap| {
+        let gpu = snap.gpus.first()?;
+        let power = |id: &str| {
+            snap.instances
+                .iter()
+                .find(|i| i.container_id == id)
+                .and_then(|i| i.power_w)
+        };
+        Some((gpu.power_limit_w?, power("shared-a")?, power("shared-b")?))
+    })
+    .await
+    .unwrap_or_else(|e| panic!("limit and attributed power never appeared: {e}"));
+
+    assert!((limit - 750.0).abs() < f32::EPSILON, "limit was {limit}");
+    // No per-process VRAM was reported, so the board is split equally and the
+    // two shares add back up to what the GPU actually draws.
+    assert!((a - 200.0).abs() < 1e-6, "shared-a got {a} W");
+    assert!((b - 200.0).abs() < 1e-6, "shared-b got {b} W");
+}
+
 // ── Scenario 5: Omitted counter → None (not zero, not panic) ───────────────
 
 /// Contract: when the `/metrics` endpoint returns HTTP 200 but the body omits

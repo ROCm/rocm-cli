@@ -262,6 +262,25 @@ pub fn gen_tps_cell(tps: Option<f64>, obs: Option<&ObservationMetadata>) -> Stri
     }
 }
 
+/// Latency (TTFT/TPOT) for narrow table cells.
+///
+/// - `None` / non-finite → `"—"`
+/// - `Some(v)`, Held → `"{v:.0}ms*"`
+/// - `Some(v)`, Fresh or unknown metadata → `"{v:.0}ms"`
+pub fn latency_cell(ms: Option<f64>, obs: Option<&ObservationMetadata>) -> String {
+    match ms.filter(|v| v.is_finite()) {
+        None => "—".to_string(),
+        Some(v) => {
+            let base = format!("{v:.0}ms");
+            if obs.is_some_and(|m| m.freshness == ObservationFreshness::Held) {
+                format!("{base}{HELD_MARKER}")
+            } else {
+                base
+            }
+        }
+    }
+}
+
 /// Full-unit gen_tps for cards, pane rows, and services views.
 /// Mirrors [`tps_opt`] format and appends [`HELD_MARKER`] when metadata is Held.
 ///
@@ -610,6 +629,16 @@ mod tests {
             observed_at: DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
             freshness: ObservationFreshness::Fresh,
         }
+    }
+
+    #[test]
+    fn latency_cell_marks_held_and_never_prints_non_finite() {
+        assert_eq!(latency_cell(None, None), "—");
+        assert_eq!(latency_cell(Some(f64::NAN), Some(&held_obs())), "—");
+        assert_eq!(latency_cell(Some(150.4), Some(&held_obs())), "150ms*");
+        assert_eq!(latency_cell(Some(150.4), Some(&fresh_obs())), "150ms");
+        // Unknown freshness (legacy snapshot) is never shown as held.
+        assert_eq!(latency_cell(Some(150.4), None), "150ms");
     }
 
     fn held_obs() -> ObservationMetadata {

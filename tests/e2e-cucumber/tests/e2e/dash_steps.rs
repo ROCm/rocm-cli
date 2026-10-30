@@ -23,27 +23,6 @@ const MANAGED_MODEL_PROMPT: &str = "hello from the terminal";
 /// it proves both that the overlay opened and - as an absence - that it closed.
 const SERVICES_OVERLAY_TITLE: &str = "Services — managed inference servers";
 
-/// The Observe instances table's TTFT cell while the scripted mock is serving:
-/// its histogram pins time-to-first-token at exactly 50 ms
-/// (`ttft_sum_s = ticks × 0.050` over `ttft_count = ticks`), and the cell is
-/// rendered `"{v:.0}ms"`. A *failed* scrape clears `ttft_ms`/`tpot_ms`
-/// (`runner.rs`), so this cell changing is the screen's own proof that the
-/// frame on display was assembled after the failure — the only frame the
-/// held-throughput assertion is about.
-const SCRIPTED_TTFT_CELL: &str = "50ms";
-
-/// Zero-based index of the TTFT cell within an Observe instances row, counting
-/// from the model id: `MODEL TOK/S TOK/W TTFT TPOT POWER QUEUE KV%`
-/// (`instances.rs`).
-///
-/// The cell is read by position on the scripted instance's own row rather than
-/// matched as a substring of the whole screen. A bare substring cannot tell a
-/// cleared cell from a surviving one: any future ms-suffixed value that merely
-/// *contains* the scripted one (`150ms`, `250ms`), or a second row whose TTFT
-/// is also 50 ms, would keep the marker on screen and time this step out for a
-/// reason that has nothing to do with the scrape it synchronises on.
-const TTFT_COLUMN: usize = 3;
-
 /// Borrow the scenario's active TUI session, or fail clearly if none was opened.
 const fn session(world: &mut E2eWorld) -> &mut TuiSession {
     world
@@ -2207,19 +2186,27 @@ fn write_dash_clock(path: &std::path::Path, directive: &str) {
     std::fs::rename(&tmp, path).expect("failed to publish the dashboard test clock");
 }
 
-/// The TTFT cell `model`'s row is currently rendering, or `None` while that row
-/// is not on screen at all.
+/// The count on the header's `⚠ N` warnings badge, or 0 while no badge is drawn.
 ///
-/// Cells are whitespace-separated and a model id carries no spaces, so counting
-/// fields from the id yields one field per column — including the `—`
-/// placeholder a cleared cell renders, which keeps the columns aligned.
-fn scripted_ttft_cell<'a>(screen: &'a str, model: &str) -> Option<&'a str> {
+/// The badge counts the daemon's current warnings, and a failed `/metrics`
+/// scrape adds a `vllm scrape: N failed` warning to the snapshot it publishes.
+/// A TTFT or throughput cell cannot serve as proof that a failure reached the
+/// screen: those values are deliberately *held* through a failed scrape (and,
+/// with the clock held, stay marked fresh), so the badge growing is the
+/// visible evidence that a frame assembled after the failure is on display.
+fn warning_badge_count(screen: &str) -> usize {
     screen
-        .lines()
-        .find(|line| line.contains(model))?
-        .split_whitespace()
-        .skip_while(|field| *field != model)
-        .nth(TTFT_COLUMN)
+        .split('⚠')
+        .nth(1)
+        .map(|after| {
+            after
+                .trim_start()
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+        })
+        .and_then(|digits| digits.parse().ok())
+        .unwrap_or(0)
 }
 
 /// The Observe tab's node-throughput hero shows the "tok/s" unit whenever
@@ -2263,12 +2250,17 @@ async fn dashboard_observation_time_is_held(world: &mut E2eWorld) {
 
 /// Switch the scripted mock to Failure mode and wait for the failure to reach
 /// the screen: first the mock's own counter proves the daemon was served a 503,
-/// then the cleared TTFT cell proves the frame on display is one the daemon
-/// assembled after that scrape. Both waits are synchronizations on observed
-/// events, not fixed sleeps, and — the clock being held — neither can consume
-/// the validity window they precede.
+/// then the header warnings badge growing proves the frame on display is one
+/// the daemon assembled after that scrape. Both waits are synchronizations on
+/// observed events, not fixed sleeps, and — the clock being held — neither can
+/// consume the validity window they precede.
 #[when("the metrics endpoint fails transiently")]
 async fn metrics_endpoint_fails(world: &mut E2eWorld) {
+    // Read the badge before the failure is injected: the count that matters is
+    // the one this failure adds, and other warnings (e.g. no amd-smi on a
+    // GPU-less runner) are already present and constant.
+    let before = warning_badge_count(&session(world).screen_text());
+
     let mock = world.mock.as_ref().expect("no mock server running");
     mock.set_metrics_mode(MetricsMode::Failure);
 
@@ -2288,16 +2280,10 @@ async fn metrics_endpoint_fails(world: &mut E2eWorld) {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    let model = world
-        .model_name
-        .clone()
-        .expect("the scripted-metrics Given records the model this row belongs to");
     session(world)
         .wait_for_screen_where(
-            &format!("the scripted instance's TTFT cell leaves {SCRIPTED_TTFT_CELL:?}"),
-            |screen| {
-                scripted_ttft_cell(screen, &model).is_some_and(|cell| cell != SCRIPTED_TTFT_CELL)
-            },
+            &format!("the header warnings badge grows past {before}"),
+            |screen| warning_badge_count(screen) > before,
             default_timeout(),
         )
         .await
