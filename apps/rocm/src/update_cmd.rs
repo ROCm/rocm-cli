@@ -65,7 +65,7 @@ fn append_update_surfaces(output: &mut String) {
     let _ = writeln!(
         output,
         "    cli: installed={} status=not_configured reason=repository-owned CLI update feed is not published yet",
-        env!("CARGO_PKG_VERSION")
+        crate::cli_version_number()
     );
     let engine_ids = engine_inventory()
         .iter()
@@ -327,7 +327,16 @@ mod tests {
         fs::remove_dir_all(root).ok();
 
         assert!(rendered.contains("update_surfaces:"));
-        assert!(rendered.contains("cli: installed="));
+        // One token, taken from the same string `rocm version` prints. Which
+        // leading version a tag, `main`, or an unknown ref produces is
+        // `version_surfaces_share_one_build_script_string` in `main.rs`.
+        let installed = crate::cli_version_number();
+        assert!(!installed.contains(' '), "{installed}");
+        assert!(crate::cli_version_string().starts_with(&installed));
+        assert!(
+            rendered.contains(&format!("cli: installed={installed} status=not_configured")),
+            "{rendered}"
+        );
         assert!(rendered.contains("status=not_configured"));
         assert!(rendered.contains("engines: status=package_managed"));
         assert!(rendered.contains("model_recipes: status="));

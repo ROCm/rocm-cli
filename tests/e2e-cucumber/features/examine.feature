@@ -1,5 +1,8 @@
 Feature: GPU detection and system inspection
 
+  # A release tag `vX.Y.Z` is reported as `X.Y.Z (vX.Y.Z, <hash>)`. Any other
+  # resolved ref, including `main`, is reported as `0.0.0-dev` rather than the
+  # unpublished workspace package version. The step checks that shape.
   @id:examine-version
   Scenario: examine-01 - The CLI reports its version
     When the user asks for the version through every CLI surface
