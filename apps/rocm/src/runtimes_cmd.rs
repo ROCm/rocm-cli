@@ -20,8 +20,11 @@
 //! `should_remove_runtime_install_root`, and `runtime_usability_status` are
 //! also `pub(crate)` and read from `engines_cmd.rs`, `storage.rs`, and
 //! `comfyui.rs`. The SDK-install-finalization/torch-alignment/dependency bundle
-//! this cluster calls into (`finish_sdk_install` and friends) lives in the
-//! sibling `runtime_install_finalize.rs`, reached via `crate::`.
+//! (`finish_sdk_install` and friends) lives in the sibling
+//! `runtime_install_finalize.rs`, which calls into this module (for
+//! `activate_runtime`, `newest_installed_runtime_manifest` and
+//! `recover_setup_runtime_registration`); this module reaches back into it
+//! only from its own test module.
 
 use std::fmt::Write as _;
 use std::fs;

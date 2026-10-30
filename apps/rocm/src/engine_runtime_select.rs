@@ -35,11 +35,11 @@
 //! instead of moving: `const fn status_for_readiness` sits between
 //! `wait_for_service_http_ready_with_progress` and
 //! `service_http_readiness_paths`, but it already had callers outside this
-//! cluster — `services_text.rs`'s own `restart_internal_managed_service_with`
-//! and `service_launch.rs`, which reaches it unqualified via `use
-//! crate::status_for_readiness;` — so it stays a shared crate-root
-//! function, reached from here (and from the retained tests below) the same
-//! way, via `use crate::status_for_readiness;`.
+//! cluster — `services_text.rs`'s `record_restart_readiness` (which
+//! `restart_internal_managed_service_with` calls) and `service_launch.rs`,
+//! which reaches it unqualified via `use crate::{...};` — so it stays a shared
+//! crate-root function. Within this module only the retained tests below call
+//! it, via `use crate::status_for_readiness;`.
 //!
 //! `EngineSelection` is not named in isolation anywhere in `main.rs`'s
 //! dispatch/call-site re-import contract, but it is this cluster's own type —
