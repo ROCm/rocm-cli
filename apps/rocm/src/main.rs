@@ -4631,9 +4631,9 @@ fn apply_service_prune_plan(
 /// **No nested acquire.** `FileLock::acquire` blocks with no `try_` variant, so
 /// a second acquire on this same lock path while this process already holds
 /// it would hang forever. Nothing reachable from either phase re-acquires
-/// `managed_launch_lock_path`: the only other production call site on this
-/// same path is `select_gpu_indices_under_launch_lock`, which is only ever
-/// reached from `serve`, and `serve` never runs prune in-process or as a
+/// `managed_launch_lock_path`: the other production acquirers of this
+/// same path are `select_gpu_indices_under_launch_lock` (reached only from
+/// `serve`) and `rocm services restart`, and neither runs prune in-process or as a
 /// subprocess (test code acquires this path directly too, but that is test
 /// setup, not something reachable from this function's own call graph).
 ///

@@ -333,11 +333,13 @@ Expected result:
 - `rocm services` shows the launched service bound to the port it picked, and
   the deployment summary's endpoint matches it.
 
-With that service still running, try to launch a second one pinned to the
-same port:
+With that service still running, try to launch a service for a different
+model pinned to the same port. (The same model and engine would be reported as
+already running instead, since an equivalent live service is reused before any
+port check.)
 
 ```powershell
-rocm serve qwen --engine lemonade --device gpu_required --managed --port <the-port-above>
+rocm serve <a-different-model> --engine lemonade --device gpu_required --managed --port <the-port-above>
 ```
 
 Expected result:

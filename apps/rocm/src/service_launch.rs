@@ -213,7 +213,7 @@ pub(crate) fn ensure_public_service_has_endpoint_key(
             "managed service is bound to the public host `{host}` but has no endpoint API key, \
              so restarting it would reopen it without authentication. The key is dropped when a \
              service stops and cannot be recovered. Launch it again with \
-             `rocm serve --host {host} --allow-public-bind` (add `--api-key <key>`, or set \
+             `rocm serve --host {host} --port <port> --allow-public-bind` (add `--api-key <key>`, or set \
              ROCM_SERVE_API_KEY, to choose the key instead of generating one)."
         );
     }
@@ -337,9 +337,9 @@ enum ManagedPortDecision {
 /// service the OS preflight still guards its port (the engine holds it), and
 /// refusing to serve because the services directory could not be listed would
 /// be a worse failure than launching. That guard does not cover a `starting`
-/// record: its port is released back to the OS at the end of
-/// [`spawn_managed_engine_child`] (see `lease.release()`) before the new
-/// engine child has actually bound it, so a concurrent launch that hits this
+/// record: its port is released back to the OS in
+/// `launch_managed_engine_child_locked` (see `lease.release()`), right before the
+/// spawn, and stays unbound until the new engine child has actually bound it, so a concurrent launch that hits this
 /// read failure in that narrow window can probe the same port successfully.
 /// Accepted as a known gap — narrower than the general services-dir read
 /// failure case, and only reachable by a second, near-simultaneous I/O
@@ -2878,8 +2878,13 @@ mod tests {
             serve_port::PortRequest::Explicit(11_435),
             &mut always_free,
         );
+        // The refusal names the service AND the command that frees the port;
+        // the stop below is that command's own implementation, and the grant
+        // after it is the outcome, so advice and result are pinned together.
+        let stop_hint = service_hints::service_stop_hint("lemonade-a-1");
         assert!(
-            matches!(still_reserved, Err(ref error) if error.to_string().contains("already reserved by managed service lemonade-a-1")),
+            matches!(still_reserved, Err(ref error) if error.to_string().contains("already reserved by managed service lemonade-a-1")
+                && error.to_string().contains(&stop_hint)),
             "unexpected result while still running: {still_reserved:?}"
         );
 
@@ -3051,16 +3056,14 @@ mod tests {
     }
 
     #[test]
-    fn select_gpu_indices_under_launch_lock_blocks_for_the_full_hold_and_then_sees_the_holders_write()
-    -> Result<()> {
-        // The standing gap this closes: nothing exercised the real lock-acquisition
-        // function production callers use (`select_gpu_indices_under_launch_lock`)
-        // against a lock another thread actually holds, so a refactor that dropped
-        // the lock early (or stopped threading it through) would not fail any test.
-        // A real end-to-end spawn test is avoided here per the fix-forward plan:
-        // `spawn_managed_engine_child` is still exercised for real, but only via its
-        // `AlreadyLive` short-circuit (a pre-seeded duplicate record), so no child
-        // process is ever launched.
+    fn select_gpu_indices_under_launch_lock_blocks_until_the_holder_releases() -> Result<()> {
+        // Exercises the real lock-acquisition function production callers use
+        // (`select_gpu_indices_under_launch_lock`) against a lock another thread
+        // actually holds, so a refactor that dropped the lock early would fail
+        // here. `spawn_managed_engine_child` is then run for real, but only via
+        // its `AlreadyLive` short-circuit (a pre-seeded duplicate record), so no
+        // child process is ever launched. The holder writes nothing: this does
+        // not show a write made under the lock being observed.
         use std::sync::{Arc, Barrier};
         use std::time::Instant;
 

@@ -2756,6 +2756,16 @@ pub(crate) fn validate_chat_rocm_command_safety(args: &[String]) -> Result<()> {
         {
             bail!("local assistant cannot request non-local host `{host}`");
         }
+        // The same rule `rocm serve` applies, so an approval card is never offered
+        // for a command the CLI then refuses.
+        let port = chat_cli_arg_value(args, "--port")
+            .map(crate::serve_port::parse_serve_port)
+            .transpose()
+            .map_err(anyhow::Error::msg)?;
+        crate::serve_port::validate_port_request(
+            chat_cli_arg_value(args, "--host").unwrap_or(rocm_core::DEFAULT_LOCAL_HOST),
+            crate::serve_port::PortRequest::from_flag(port),
+        )?;
         if chat_cli_has_flag(args, "--foreground") || !chat_cli_has_flag(args, "--managed") {
             bail!("local assistant must request managed serving with --managed");
         }
@@ -6069,6 +6079,26 @@ model recipes
             .unwrap_err()
             .to_string();
         assert!(error.contains("public network binding"));
+
+        let no_port_on_custom_host = providers::ChatToolCall {
+            id: None,
+            name: "rocm_command".to_owned(),
+            arguments: serde_json::json!({
+                "args": ["serve", "qwen", "--host", "localhost", "--managed"]
+            }),
+        };
+        let error = validate_chat_tool_call(&no_port_on_custom_host)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("explicit `--port"), "{error}");
+        validate_chat_tool_call(&providers::ChatToolCall {
+            id: None,
+            name: "rocm_command".to_owned(),
+            arguments: serde_json::json!({
+                "args": ["serve", "qwen", "--host", "localhost", "--port", "8000", "--managed"]
+            }),
+        })
+        .expect("an explicit port on a loopback host is allowed");
 
         let foreground = providers::ChatToolCall {
             id: None,

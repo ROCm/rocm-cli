@@ -1858,7 +1858,7 @@ mod tests {
 
     // This only pins the shared constant into the approval body; the CLI's own
     // plan output proves the phrase actually appears before the resolved
-    // endpoint, in `serve-auto-port-skips-occupied` (serve-29).
+    // endpoint, in `serve-auto-port-skips-occupied` (serve-31).
     #[test]
     fn approval_shows_exact_argv_and_the_automatic_port_phrase() {
         let mut w = ServeWizardState {
@@ -2175,6 +2175,16 @@ mod tests {
             "read-only device text: {out:?}"
         );
         assert!(!out.contains("Review:"), "no second modal");
+    }
+
+    #[test]
+    fn engine_only_override_summarises_as_customized() {
+        let w = ServeWizardState {
+            engine_idx: ENGINE_AUTO + 1,
+            ..Default::default()
+        };
+        assert!(w.is_customized());
+        assert_eq!(w.advanced_summary(), "Customized");
     }
 
     #[test]

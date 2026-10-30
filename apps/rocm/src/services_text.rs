@@ -997,6 +997,16 @@ fn restart_internal_managed_service_with(
 /// Replaces the child `spawn()` of a restart (non-Windows only; Windows spawns
 /// through `rocm_core::spawn_detached_no_inherit`). Test-only seam, so a test
 /// can observe the leased port at the exact instant production would spawn.
+/// How long a restart waits for the new child to serve.
+#[allow(clippy::missing_const_for_fn)] // not const under `cfg(test)`, where a test shortens it
+fn restart_readiness_timeout() -> Duration {
+    #[cfg(test)]
+    if let Some(timeout) = tests::READINESS_TIMEOUT_OVERRIDE.with(std::cell::Cell::get) {
+        return timeout;
+    }
+    Duration::from_secs(45)
+}
+
 type RestartSpawnOverride<'a> =
     dyn Fn(&mut std::process::Command) -> io::Result<std::process::Child> + 'a;
 
@@ -1179,7 +1189,7 @@ fn restart_internal_managed_service_inner(
         started.port,
         started.served_model_name(),
         endpoint_api_key.as_deref(),
-        Duration::from_secs(45),
+        restart_readiness_timeout(),
     );
     record_restart_readiness(paths, &started, readiness)
 }
@@ -2798,6 +2808,121 @@ mod tests {
         assert!(
             rendered.contains("spawn intercepted by test"),
             "a stopped or failed sibling on the same port must not block the restart: {rendered}"
+        );
+        Ok(())
+    }
+
+    thread_local! {
+        /// Lets a test that lets a restart reach its readiness wait shorten it.
+        pub(super) static READINESS_TIMEOUT_OVERRIDE: std::cell::Cell<Option<Duration>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    /// The restart holds the launch lock until its record names the new child.
+    /// A waiter blocked on the lock since the spawn must therefore read a record
+    /// that already carries the child's pid the moment it gets in; releasing
+    /// the lock right after the spawn lets it read the stale record instead.
+    #[cfg(not(windows))]
+    #[test]
+    fn restart_holds_the_launch_lock_until_the_record_names_the_new_child() -> Result<()> {
+        let (root, paths) = test_paths("restart-lock-until-published");
+        paths.ensure()?;
+        let service_id = "svc-restart-lock-until-published";
+        let record = stop_test_record(&paths, service_id);
+        record.write()?;
+
+        READINESS_TIMEOUT_OVERRIDE.with(|cell| cell.set(Some(Duration::ZERO)));
+        let (observed_tx, observed_rx) = std::sync::mpsc::channel();
+        let lock_path = paths.managed_launch_lock_path();
+        let manifest_path = paths.service_manifest_path(service_id);
+        let spawn: &RestartSpawnOverride<'_> = &|command| {
+            let child = std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .map_err(|error| io::Error::other(format!("{error} ({command:?})")))?;
+            let (lock_path, manifest_path, tx) = (
+                lock_path.clone(),
+                manifest_path.clone(),
+                observed_tx.clone(),
+            );
+            thread::spawn(move || {
+                // Blocks until the restart drops the lock.
+                let _lock = rocm_core::FileLock::acquire(&lock_path).expect("acquire");
+                let record: ManagedServiceRecord =
+                    serde_json::from_slice(&fs::read(manifest_path).expect("read")).expect("parse");
+                let _ = tx.send(record.supervisor_pid);
+            });
+            Ok(child)
+        };
+        let result = restart_internal_managed_service_inner(
+            &paths,
+            service_id,
+            None,
+            |_| (Vec::new(), true),
+            Some(spawn),
+        );
+        READINESS_TIMEOUT_OVERRIDE.with(|cell| cell.set(None));
+        let started = result?;
+        let observed = observed_rx.recv_timeout(Duration::from_secs(10));
+        // Reap the stand-in engine.
+        let _ = std::process::Command::new("kill")
+            .arg(started.supervisor_pid.to_string())
+            .status();
+        let _ = fs::remove_dir_all(root);
+
+        assert_eq!(
+            observed.expect("the waiter must get the lock after the restart"),
+            started.supervisor_pid,
+            "the lock was released before the record named the restarted child"
+        );
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn restart_is_not_blocked_by_a_live_record_on_another_port() -> Result<()> {
+        // `blocks_port` compares ports. A live service elsewhere must not trip
+        // the "claimed that port" refusal: if it ignored the port, every
+        // restart would be refused while any other service ran.
+        let (root, paths) = test_paths("restart-live-other-port");
+        paths.ensure()?;
+        let service_id = "svc-restart-live-other-port";
+        let record = stop_test_record(&paths, service_id);
+        let host = record.host.clone();
+        let port = record.port;
+        record.write()?;
+
+        let mut other = ManagedServiceRecord::new(
+            &paths,
+            "svc-live-other-port",
+            "lemonade",
+            "other-model",
+            "other-model-canonical",
+            &host,
+            port.wrapping_add(1),
+            "managed",
+            0,
+            None,
+            None,
+            None,
+        );
+        other.status = "starting".to_owned();
+        other.write()?;
+
+        let spawn: &RestartSpawnOverride<'_> =
+            &|_command| Err(io::Error::other("spawn intercepted by test"));
+        let result = restart_internal_managed_service_inner(
+            &paths,
+            service_id,
+            None,
+            |_| (Vec::new(), true),
+            Some(spawn),
+        );
+        let _ = fs::remove_dir_all(root);
+        let rendered = format!("{:#}", result.expect_err("the intercepted spawn must fail"));
+        assert!(
+            rendered.contains("spawn intercepted by test"),
+            "a live service on another port must not block the restart: {rendered}"
         );
         Ok(())
     }

@@ -14,7 +14,7 @@
 //! registry (`load_managed_services`, `refresh_managed_service_runtime_liveness`,
 //! `recorded_service_pids`, `settle_pending_stop_key_cleanup`), the idempotency
 //! guard that finds an already-live service for a given engine+model
-//! (`existing_live_managed_service`), the "is this record live" classifier
+//! (`existing_live_managed_service_in`), the "is this record live" classifier
 //! (`managed_service_is_live`), and the dashboard sidebar's ready/starting/past-
 //! attempts counts and one-line status text
 //! (`ManagedServiceSidebarCounts`/`managed_service_sidebar_counts`/

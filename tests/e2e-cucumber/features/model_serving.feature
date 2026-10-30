@@ -323,6 +323,28 @@ Feature: Model serving
     Then the CLI refuses and names the exact command to stop the existing service
     And running that command actually stops the service
 
+  # An explicit --port is a demand: when an equivalent service (same engine and
+  # model) is already live on a different port, serve refuses instead of
+  # reporting success on the old port. Same planted record and lane as serve-24.
+  @id:serve-explicit-port-refused-for-live-equivalent @requires-gpu @requires-engine:lemonade @requires-os:linux
+  Scenario: serve-32 - An explicit port that differs from a running equivalent service is refused
+    Given a managed runtime is active
+    And an unauthenticated Lemonade service is already running for that model
+    When the user serves that same model again on an explicit port other than the running one
+    Then the CLI refuses and names the port the running service uses
+    And the CLI names the exact command to stop the existing service
+
+  # `rocm services restart` takes the launch lock and refuses a port another
+  # live managed service now holds, before it spawns anything. No GPU: the
+  # refusal comes from the on-disk records.
+  @id:services-restart-refused-when-port-claimed @requires-os:linux
+  Scenario: serve-33 - Restarting a service whose port another service holds is refused
+    Given a managed runtime is active
+    And another managed service already reserves the default serve port
+    And a stopped managed service is recorded on the default serve port
+    When the user restarts the stopped service
+    Then the restart is refused naming the service that holds the port
+
   # ROCMAI-543: a Windows console on the OEM code page (437) renders a UTF-8 em
   # dash, and other non-ASCII punctuation, as mojibake (e.g. "ΓÇö") instead of
   # transliterating it. `rocm model` is the flagship instance of that bug class;

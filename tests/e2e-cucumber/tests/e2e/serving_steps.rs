@@ -419,7 +419,7 @@ async fn occupy_default_serve_port(world: &mut E2eWorld) {
 /// behind the record, the endpoint probe would then come back `Unreachable`
 /// and the record gets demoted to `"stopped"` *before* the explicit-port
 /// collision check ever sees it (`refresh_managed_service_runtime_liveness`
-/// in `apps/rocm/src/main.rs`). Backing the record with a `MockServer` on
+/// in `apps/rocm/src/managed_service_status.rs`). Backing the record with a `MockServer` on
 /// `SERVE_PORT` makes `/v1/models` list `other-model`, so the probe reports
 /// `Listing`/`Serving` and the record is left `"ready"` instead — the
 /// scenario needs the collision detected, so the port has to be reserved for
@@ -430,6 +430,7 @@ async fn occupy_default_serve_port(world: &mut E2eWorld) {
 /// doc comment for the same hazard).
 #[given("another managed service already reserves the default serve port")]
 async fn reserve_default_serve_port(world: &mut E2eWorld) {
+    ensure_serve_port_free().await;
     let root = world.isolated_root.as_ref().expect("no isolated root");
     let services = root.path().join("data").join("services");
     let mock = MockServer::start_on_port("other-model", SERVE_PORT).await;
@@ -1928,6 +1929,118 @@ async fn user_serves_requiring_api_key(world: &mut E2eWorld) {
     world.cli_output = Some(stdout);
     world.cli_stderr = Some(stderr);
     world.cli_rc = Some(rc);
+}
+
+#[when("the user serves that same model again on an explicit port other than the running one")]
+async fn user_serves_other_explicit_port(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(
+        world,
+        &[
+            "serve",
+            REUSE_REFUSAL_MODEL,
+            "--engine",
+            REUSE_REFUSAL_ENGINE,
+            "--managed",
+            "--port",
+            "11500",
+        ],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the CLI refuses and names the port the running service uses")]
+async fn assert_refused_naming_running_port(world: &mut E2eWorld) {
+    let rc = world.cli_rc.expect("no serve rc recorded");
+    let output = serve_output(world);
+    assert!(
+        rc != 0,
+        "an explicit port the running service does not use must be refused:\n{output}"
+    );
+    assert!(
+        output.contains(REUSE_REFUSAL_SERVICE_ID)
+            && output.contains("on port 9")
+            && output.contains("port 11500 would not be used"),
+        "the refusal must name the running service and both ports:\n{output}"
+    );
+}
+
+#[then("the CLI names the exact command to stop the existing service")]
+async fn assert_names_stop_command(world: &mut E2eWorld) {
+    let output = serve_output(world);
+    assert!(
+        output.contains(&format!(
+            "rocm services stop {REUSE_REFUSAL_SERVICE_ID} --yes"
+        )),
+        "the refusal must name the way out, directly runnable with --yes: {output}"
+    );
+}
+
+/// A second record, `e2e-stopped`, on the default serve port: the service the
+/// restart scenario tries to bring back. Cloned from the `e2e-mock` record
+/// `reserve_default_serve_port` planted, so its shape is the one the CLI reads.
+#[given("a stopped managed service is recorded on the default serve port")]
+async fn plant_stopped_service_on_default_port(world: &mut E2eWorld) {
+    let services = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("data")
+        .join("services");
+    let mut record: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(services.join("e2e-mock.json")).expect("read e2e-mock record"),
+    )
+    .expect("parse e2e-mock record");
+    record["service_id"] = "e2e-stopped".into();
+    record["status"] = "stopped".into();
+    record["manifest_path"] = services.join("e2e-stopped.json").to_string_lossy().into();
+    record["log_path"] = services.join("e2e-stopped.log").to_string_lossy().into();
+    record["engine_state_path"] = services
+        .join("e2e-stopped.state.json")
+        .to_string_lossy()
+        .into();
+    std::fs::write(
+        services.join("e2e-stopped.json"),
+        serde_json::to_vec_pretty(&record).expect("serialize record"),
+    )
+    .expect("write stopped record");
+}
+
+#[when("the user restarts the stopped service")]
+async fn user_restarts_stopped_service(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) =
+        crate::run_rocm(world, &["services", "restart", "e2e-stopped", "--yes"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the restart is refused naming the service that holds the port")]
+async fn assert_restart_refused_naming_holder(world: &mut E2eWorld) {
+    let rc = world.cli_rc.expect("no restart rc recorded");
+    let output = serve_output(world);
+    assert!(
+        rc != 0,
+        "the restart must be refused, but exited 0:\n{output}"
+    );
+    assert!(
+        output.contains("e2e-mock") && output.contains("recorded on that port"),
+        "the refusal must name the service holding the port:\n{output}"
+    );
+    // Nothing was spawned: the stopped record is still stopped.
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path();
+    let record: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(root.join("data").join("services").join("e2e-stopped.json"))
+            .expect("read stopped record"),
+    )
+    .expect("parse stopped record");
+    assert_eq!(record["status"], "stopped", "{record}");
 }
 
 #[then("the CLI refuses and names the exact command to stop the existing service")]

@@ -452,6 +452,22 @@ mod tests {
         assert!(record.last_restart_unix_ms.is_some());
     }
 
+    #[test]
+    fn blocks_port_needs_a_live_record_on_that_exact_port() {
+        let mut record = probe_test_record(11435);
+        record.status = "running".to_owned();
+        assert!(record.blocks_port(11435));
+        assert!(
+            !record.blocks_port(11436),
+            "a different port is not blocked"
+        );
+        record.status = "stopped".to_owned();
+        assert!(
+            !record.blocks_port(11435),
+            "a stopped record blocks nothing"
+        );
+    }
+
     /// Writes `state` as the record's engine state file and runs the refresh.
     fn refresh_from_state(name: &str, state: &serde_json::Value) -> ManagedServiceRecord {
         let dir = std::env::temp_dir().join(format!(

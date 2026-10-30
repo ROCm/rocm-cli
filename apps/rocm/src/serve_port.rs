@@ -151,9 +151,9 @@ pub(crate) fn resolve_serve_port(
         // or failure stays engine-owned. Automatic is refused here as well as in
         // `serve()`, because this is the shared choke point every caller reaches
         // — and it is refused by returning an error, never by panicking.
+        validate_port_request(host, request)?;
         let Some(port) = request.explicit() else {
-            validate_port_request(host, request)?;
-            unreachable!("custom-host automatic requests are rejected above");
+            bail!("automatic port selection is not available on host {host}");
         };
         return Ok(LoopbackPortLease::engine_owned(port));
     }
@@ -492,13 +492,30 @@ mod tests {
 
     #[test]
     fn automatic_exhaustion_reports_the_exact_scanned_range() {
-        let mut probe = |_port: u16| -> io::Result<LoopbackPortLease> {
+        let probe = |_port: u16| -> io::Result<LoopbackPortLease> {
             Err(io::Error::new(io::ErrorKind::AddrInUse, "occupied"))
         };
-        let error = resolve_serve_port(DEFAULT_LOCAL_HOST, PortRequest::Auto, &[], &mut probe)
+        let mut probes = 0usize;
+        let mut counting = |port: u16| {
+            probes += 1;
+            probe(port)
+        };
+        let error = resolve_serve_port(DEFAULT_LOCAL_HOST, PortRequest::Auto, &[], &mut counting)
             .expect_err("an exhausted range must fail");
         let message = format!("{error:#}");
         assert!(message.contains("11435-11535"), "{message}");
+        assert_eq!(probes, 101, "every port in the inclusive window is probed");
+    }
+
+    #[test]
+    fn automatic_reaches_the_last_port_of_the_window() {
+        let occupied = (AUTO_PORT_FIRST..AUTO_PORT_LAST)
+            .map(|port| (port, io::ErrorKind::AddrInUse))
+            .collect();
+        let mut probe = scripted(occupied);
+        let lease = resolve_serve_port(DEFAULT_LOCAL_HOST, PortRequest::Auto, &[], &mut probe)
+            .expect("the final port of the window is still tried");
+        assert_eq!(lease.port(), AUTO_PORT_LAST);
     }
 
     #[test]

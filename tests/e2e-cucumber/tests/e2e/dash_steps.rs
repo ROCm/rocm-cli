@@ -709,6 +709,25 @@ async fn serve_wizard_asks_to_approve_automatic(world: &mut E2eWorld, command: S
     );
 }
 
+#[then("the serve wizard approval closes and the wizard stays open")]
+async fn serve_wizard_approval_closes_wizard_stays(world: &mut E2eWorld) {
+    // Waiting for the approval to clear between two Escapes keeps them from
+    // coalescing into one in the same PTY read, and shows the first one closed
+    // only the approval.
+    let tui = session(world);
+    tui.wait_until_gone(
+        "Port: automatic; endpoint shown after launch",
+        default_timeout(),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("the serve approval did not close: {e}"));
+    let screen = tui.screen_text();
+    assert!(
+        screen.contains("Serve a model"),
+        "Escape on the approval closed the whole wizard:\n{screen}"
+    );
+}
+
 #[then(expr = "the serve wizard refuses to launch and says {string}")]
 async fn serve_wizard_refuses_to_launch(world: &mut E2eWorld, message: String) {
     let tui = session(world);

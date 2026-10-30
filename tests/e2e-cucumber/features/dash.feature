@@ -704,7 +704,8 @@ Feature: Interactive dashboard
     And the user presses Enter in the serve wizard
     Then the serve wizard asks to approve "serve demo-model" with an automatic port
     When the user presses Escape
-    And the user presses Escape
+    Then the serve wizard approval closes and the wizard stays open
+    When the user presses Escape
     Then the serve wizard is closed
     When the user quits the dashboard
     Then the dashboard exits successfully
@@ -724,6 +725,26 @@ Feature: Interactive dashboard
     And the user presses Down 3 times in the serve wizard
     And the user presses Enter in the serve wizard
     Then the serve wizard refuses to launch and says "set Port to Custom"
+    When the user presses Escape
+    Then the serve wizard is closed
+    When the user quits the dashboard
+    Then the dashboard exits successfully
+
+  @id:dash-serve-wizard-refuses-public-host @requires-os:linux
+  Scenario: dash-43 - A public host is refused in the form with the CLI pointer
+    When the user opens the dashboard with demo data
+    And the user opens the Observe view
+    And the user opens the serve wizard
+    And the user types "demo-model" into the serve wizard
+    And the user presses Down 1 times in the serve wizard
+    And the user presses Enter in the serve wizard
+    And the user presses Down 3 times in the serve wizard
+    And the user presses Enter in the serve wizard
+    And the user types "0.0.0.0" into the serve wizard
+    And the user presses Enter in the serve wizard
+    And the user presses Down 3 times in the serve wizard
+    And the user presses Enter in the serve wizard
+    Then the serve wizard refuses to launch and says "Dash serves on loopback only"
     When the user presses Escape
     Then the serve wizard is closed
     When the user quits the dashboard

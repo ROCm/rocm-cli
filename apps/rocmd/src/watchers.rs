@@ -1568,10 +1568,24 @@ fn restart_managed_service_with(
     record: &mut ManagedServiceRecord,
     spawn_override: Option<&SpawnOverride<'_>>,
 ) -> Result<()> {
-    let _launch_lock = rocm_core::FileLock::acquire_bounded(
-        paths.managed_launch_lock_path(),
+    restart_managed_service_bounded(
+        paths,
+        record,
+        spawn_override,
         rocm_core::MANAGED_LAUNCH_LOCK_TIMEOUT,
-    )?;
+    )
+}
+
+/// [`restart_managed_service_with`] with the launch-lock wait injectable, so a
+/// test can prove the wait is bounded without waiting out the real bound.
+fn restart_managed_service_bounded(
+    paths: &AppPaths,
+    record: &mut ManagedServiceRecord,
+    spawn_override: Option<&SpawnOverride<'_>>,
+    lock_timeout: Duration,
+) -> Result<()> {
+    let _launch_lock =
+        rocm_core::FileLock::acquire_bounded(paths.managed_launch_lock_path(), lock_timeout)?;
 
     // Re-check against the disk, now that the lock excludes a concurrent
     // `rocm serve` publish: the caller's `record` was read before this lock was
@@ -4481,7 +4495,15 @@ mod tests {
             .expect("spawn sleeper child");
         let child_pid = child.id();
 
+        let started = std::time::Instant::now();
         terminate_recovery_supervisor(&mut child);
+        // The sleeper sleeps for two minutes by itself: only a kill returns
+        // well before that, so waiting it out must not pass.
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "terminate_recovery_supervisor took {:?}: the child was waited out, not killed",
+            started.elapsed()
+        );
 
         // The helper reaps, so the pid must be gone rather than a zombie.
         assert!(
@@ -4857,6 +4879,36 @@ mod tests {
         Ok(())
     }
 
+    /// Recovery waits a bounded time for the launch lock, then gives up instead
+    /// of queuing behind an interactive launch.
+    #[test]
+    fn recovery_gives_up_when_the_launch_lock_stays_held_past_its_bound() -> Result<()> {
+        let (root, paths) = temp_app_paths("recovery-lock-bound");
+        paths.ensure()?;
+        let mut record = identity_probe_record(&paths, "svc-lock-bound", free_loopback_port());
+        record.status = "failed".to_owned();
+        record.write()?;
+
+        let guard = rocm_core::FileLock::acquire(paths.managed_launch_lock_path())?;
+        let holder = thread::spawn(move || {
+            thread::sleep(Duration::from_secs(3));
+            drop(guard);
+        });
+        let started = std::time::Instant::now();
+        let outcome =
+            restart_managed_service_bounded(&paths, &mut record, None, Duration::from_millis(100));
+        let waited = started.elapsed();
+        holder.join().expect("holder thread");
+        fs::remove_dir_all(root).ok();
+
+        assert!(outcome.is_err(), "a held lock must defer recovery");
+        assert!(
+            waited < Duration::from_secs(2),
+            "recovery waited {waited:?} for a lock held for 3s: the wait is not bounded"
+        );
+        Ok(())
+    }
+
     /// A candidate still inside its restart backoff must not starve the ones
     /// after it.
     #[test]
@@ -4865,12 +4917,17 @@ mod tests {
         paths.ensure()?;
         fs::create_dir_all(paths.services_dir())?;
 
+        let b_created = unix_time_millis() - 10_000;
         let mut a = identity_probe_record(&paths, "svc-backoff-a", free_loopback_port());
         a.status = "failed".to_owned();
         a.last_restart_unix_ms = Some(unix_time_millis());
+        // Records load newest first: A must come first, or the skip is not what
+        // gets B returned.
+        a.created_at_unix_ms = b_created + 1_000;
         a.write()?;
         let mut b = identity_probe_record(&paths, "svc-backoff-b", free_loopback_port());
         b.status = "failed".to_owned();
+        b.created_at_unix_ms = b_created;
         b.write()?;
 
         let found = find_recoverable_service(&paths);
@@ -4881,9 +4938,10 @@ mod tests {
         Ok(())
     }
 
-    /// The `try_wait` failure path rolls back against the snapshot taken after
-    /// the supervisor was recorded; the pre-record snapshot would mismatch the
-    /// on-disk pid and leave `recovering` behind.
+    /// The rollback restores the prior record when handed the snapshot taken
+    /// after the supervisor was recorded, which is the one the `try_wait`
+    /// failure arm passes. That arm cannot be driven from here, so this covers
+    /// the rollback's guard, not the choice of snapshot at that call site.
     #[test]
     fn rollback_against_the_recorded_snapshot_restores_the_prior_record() -> Result<()> {
         let (root, paths) = temp_app_paths("rollback-recorded-snapshot");
