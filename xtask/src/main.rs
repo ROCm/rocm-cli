@@ -88,7 +88,9 @@ pub(crate) enum Command {
     /// Assert the release/metadata public keys pinned in the installers and
     /// `apps/rocm/src/therock/fetch.rs` match the canonical published keys under
     /// `docs/keys/`, and that any configured CI signing key matches the pinned
-    /// current release key. A no-op while no canonical keys are published.
+    /// current release key. Each slot must be assigned exactly once (install.sh
+    /// must also mark it `readonly`), and a slot whose canonical key is not
+    /// published yet must be empty.
     VerifyPinnedKeys,
     /// Print the workspace crates affected by a git range (changed crates plus
     /// their transitive dependents) as `cargo` package-selection flags, so CI
