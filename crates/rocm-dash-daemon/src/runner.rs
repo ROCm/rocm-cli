@@ -25,7 +25,9 @@ use rocm_dash_collectors::host::HostCollector;
 use rocm_dash_collectors::lemonade::LemonadeCollector;
 use rocm_dash_collectors::parallel::parallel_scrape;
 use rocm_dash_collectors::vllm_prom::VllmPrometheusCollector;
-use rocm_dash_core::metrics::{GpuMetrics, GpuSystemInfo, Instance, InstanceStatus, Snapshot};
+use rocm_dash_core::metrics::{
+    GpuMetrics, GpuSystemInfo, Instance, InstanceStatus, ObservationMetadata, Snapshot,
+};
 use rocm_dash_core::observation::GenerationObservationTracker;
 use rocm_dash_core::protocol::Event;
 use rocm_dash_core::state::{State, StateEvent};
@@ -359,10 +361,10 @@ pub async fn run_loop(
     // Constructed lazily from opts.instance_tick; survives scrape failures so
     // the last-observed rate is held for the validity window before clearing.
     let mut gen_trackers: HashMap<String, GenerationObservationTracker> = HashMap::new();
-    // Previous TTFT / TPOT histogram readings (sum_s, count, at) per instance,
-    // for the windowed avg-ms derivation (mirrors `prev_gen_tokens`).
-    let mut prev_ttft: HashMap<String, (f64, f64, DateTime<Utc>)> = HashMap::new();
-    let mut prev_tpot: HashMap<String, (f64, f64, DateTime<Utc>)> = HashMap::new();
+    // Previous TTFT / TPOT histogram readings plus a freshness tracker per
+    // instance, for the windowed avg-ms derivation (mirrors `gen_trackers`).
+    let mut prev_ttft: LatencyWindows = HashMap::new();
+    let mut prev_tpot: LatencyWindows = HashMap::new();
     // Per-container VRAM (MB) from the last amd-smi `process` scrape. Refreshed
     // on the instance cadence and reused every tick so the attributed value is
     // stable between scrapes (mirrors how GPU power drives tokens_per_watt).
@@ -775,17 +777,21 @@ pub async fn run_loop(
                         // assembly below (tracker.snapshot per cycle_at).
                         //
                         // Windowed avg latency (ms) from the cumulative TTFT/TPOT
-                        // histograms; cumulative-average fallback on first scrape.
-                        let ttft_ms = avg_ms_from_histogram(
+                        // histograms. Only a window with new requests produces a
+                        // value; the tracker holds it, then expires it, in the
+                        // snapshot assembly below.
+                        observe_latency(
                             &mut prev_ttft,
                             &id,
+                            opts.instance_tick,
                             sample.ttft_sum_s,
                             sample.ttft_count,
                             cycle_at,
                         );
-                        let tpot_ms = avg_ms_from_histogram(
+                        observe_latency(
                             &mut prev_tpot,
                             &id,
+                            opts.instance_tick,
                             sample.tpot_sum_s,
                             sample.tpot_count,
                             cycle_at,
@@ -794,8 +800,6 @@ pub async fn run_loop(
                             inst.kv_cache_usage_pct = sample.kv_cache_usage_pct;
                             inst.running_reqs = sample.running_reqs;
                             inst.waiting_reqs = sample.waiting_reqs;
-                            inst.ttft_ms = ttft_ms;
-                            inst.tpot_ms = tpot_ms;
                             // Docker-discovered instances have no
                             // `ManagedServiceRecord` to promote their status, so
                             // they start life as `Starting`. A successful vLLM
@@ -818,18 +822,11 @@ pub async fn run_loop(
                         // window (clamp(3×instance_tick, 6s, 30s)) and only clears
                         // it after expiry — satisfying the "held" contract.
                         //
-                        // Clear TTFT/TPOT baselines so recovery re-baselines from
-                        // the next successful scrape (latency clearing semantics
-                        // are unchanged; freshness generalization is out of scope).
-                        prev_ttft.remove(&id);
-                        prev_tpot.remove(&id);
-                        if let Some(mut inst) = runner.state.instances.get(&id).cloned()
-                            && (inst.ttft_ms.is_some() || inst.tpot_ms.is_some())
-                        {
-                            inst.ttft_ms = None;
-                            inst.tpot_ms = None;
-                            runner.state.apply(StateEvent::InstanceUpserted(inst));
-                        }
+                        // Drop the TTFT/TPOT baselines so recovery re-baselines
+                        // from the next successful scrape; the trackers keep the
+                        // last windowed value Held until its validity lapses.
+                        rebaseline_latency(&mut prev_ttft, &id);
+                        rebaseline_latency(&mut prev_tpot, &id);
                     }
                 }
             }
@@ -921,6 +918,10 @@ pub async fn run_loop(
                 .map_or((None, None), |t| t.snapshot(cycle_at));
             inst.gen_tps = gen_tps;
             inst.gen_tps_observation = meta;
+            (inst.ttft_ms, inst.ttft_observation) =
+                snapshot_latency(&mut prev_ttft, &inst.container_id, cycle_at);
+            (inst.tpot_ms, inst.tpot_observation) =
+                snapshot_latency(&mut prev_tpot, &inst.container_id, cycle_at);
         }
         // Derive per-instance efficiency now that this tick's GPU power is known
         // and gen_tps reflects the tracker state for this cycle.
@@ -952,6 +953,10 @@ pub async fn run_loop(
             if let Some(entry) = runner.state.instances.get_mut(&inst.container_id) {
                 entry.gen_tps = inst.gen_tps;
                 entry.gen_tps_observation = inst.gen_tps_observation.clone();
+                entry.ttft_ms = inst.ttft_ms;
+                entry.ttft_observation = inst.ttft_observation.clone();
+                entry.tpot_ms = inst.tpot_ms;
+                entry.tpot_observation = inst.tpot_observation.clone();
                 entry.tokens_per_watt = inst.tokens_per_watt;
             }
         }
@@ -1023,8 +1028,8 @@ pub async fn run_loop(
 pub(crate) fn purge_telemetry_state(
     id: &str,
     gen_trackers: &mut HashMap<String, GenerationObservationTracker>,
-    prev_ttft: &mut HashMap<String, (f64, f64, DateTime<Utc>)>,
-    prev_tpot: &mut HashMap<String, (f64, f64, DateTime<Utc>)>,
+    prev_ttft: &mut LatencyWindows,
+    prev_tpot: &mut LatencyWindows,
 ) {
     gen_trackers.remove(id);
     prev_ttft.remove(id);
@@ -1038,8 +1043,8 @@ pub(crate) fn purge_telemetry_state(
 pub(crate) fn invalidate_on_endpoint_change(
     id: &str,
     gen_trackers: &mut HashMap<String, GenerationObservationTracker>,
-    prev_ttft: &mut HashMap<String, (f64, f64, DateTime<Utc>)>,
-    prev_tpot: &mut HashMap<String, (f64, f64, DateTime<Utc>)>,
+    prev_ttft: &mut LatencyWindows,
+    prev_tpot: &mut LatencyWindows,
 ) {
     if let Some(t) = gen_trackers.get_mut(id) {
         t.invalidate();
@@ -1086,7 +1091,9 @@ pub(crate) fn merge_discovery_refresh(
         inst.gen_tps_observation = ex.gen_tps_observation.clone();
         inst.tokens_per_watt = ex.tokens_per_watt;
         inst.ttft_ms = ex.ttft_ms;
+        inst.ttft_observation = ex.ttft_observation.clone();
         inst.tpot_ms = ex.tpot_ms;
+        inst.tpot_observation = ex.tpot_observation.clone();
     }
     inst
 }
@@ -1137,44 +1144,76 @@ fn ticks_per(period: Duration, tick: Duration) -> u64 {
     n.max(1) as u64
 }
 
-/// Upper bound on the scrape interval accepted by `avg_ms_from_histogram`.
+/// Upper bound on the scrape interval accepted by [`observe_latency`].
 /// Applies to TTFT/TPOT latency histograms only; generation-counter staleness
 /// is managed by `GenerationObservationTracker` (see `rocm-dash-core`).
-/// A gap longer than this makes the windowed delta stale (outage or forward
-/// wall-clock jump / NTP / VM resume), so the histogram falls back to the
-/// cumulative average for that sample.
+/// A gap longer than this (outage, forward wall-clock jump / NTP / VM resume)
+/// makes the windowed delta meaningless, so that sample yields no value and
+/// only re-baselines.
 const MAX_RATE_INTERVAL_S: f64 = 60.0;
 
-/// Average latency (ms) from a cumulative histogram's `_sum` (seconds) and
-/// `_count` series, windowed over successive scrapes: `(Δsum / Δcount) × 1000`.
-/// Updates the per-instance baseline in `prev`. On the FIRST reading (or after a
-/// counter reset / stale interval / no new requests) it falls back to the
-/// cumulative average `sum/count × 1000`, so a single scrape already yields a
-/// value. Returns `None` when the histogram is absent (`sum`/`count` `None`) or
-/// `count == 0` — Observe then shows `—` (never a fabricated number).
-fn avg_ms_from_histogram(
-    prev: &mut HashMap<String, (f64, f64, DateTime<Utc>)>,
+/// Per-instance latency state for one histogram: the previous cumulative
+/// reading and the tracker that holds and then expires the derived average.
+pub(crate) struct LatencyWindow {
+    /// Previous `(sum_s, count, at)` reading; `None` until baselined.
+    prev: Option<(f64, f64, DateTime<Utc>)>,
+    /// Holds the last windowed average for the observation validity window.
+    tracker: GenerationObservationTracker,
+}
+
+pub(crate) type LatencyWindows = HashMap<String, LatencyWindow>;
+
+/// Feed one scrape of a cumulative latency histogram (`_sum` in seconds,
+/// `_count`) into `id`'s window. A value is recorded only when the window saw
+/// new requests: `(Δsum / Δcount) × 1000` ms. The first reading, a counter
+/// reset, a stale interval, or a window with no new requests only moves the
+/// baseline; the lifetime average is never reported, so an idle server's old
+/// latency ages out instead of persisting. An absent histogram (`None`) leaves
+/// the window untouched.
+fn observe_latency(
+    windows: &mut LatencyWindows,
     id: &str,
+    instance_tick: Duration,
     sum_s: Option<f64>,
     count: Option<f64>,
     now: DateTime<Utc>,
-) -> Option<f64> {
-    let (sum_s, count) = (sum_s?, count?);
-    let last = prev.insert(id.to_string(), (sum_s, count, now));
-    if let Some((psum, pcount, pat)) = last {
+) {
+    let (Some(sum_s), Some(count)) = (sum_s, count) else {
+        return;
+    };
+    let w = windows
+        .entry(id.to_string())
+        .or_insert_with(|| LatencyWindow {
+            prev: None,
+            tracker: GenerationObservationTracker::new(instance_tick),
+        });
+    if let Some((psum, pcount, pat)) = w.prev.replace((sum_s, count, now)) {
         let dcount = count - pcount;
         let dsum = sum_s - psum;
         let dt = (now - pat).num_milliseconds() as f64 / 1000.0;
         if dcount > 0.0 && dsum >= 0.0 && dt > 0.0 && dt <= MAX_RATE_INTERVAL_S {
-            return Some(dsum / dcount * 1000.0);
+            w.tracker.observe_direct(dsum / dcount * 1000.0, now);
         }
     }
-    // Cumulative-average fallback: first scrape, no new requests, or a reset.
-    if count > 0.0 {
-        Some(sum_s / count * 1000.0)
-    } else {
-        None
+}
+
+/// Forget the previous reading after a failed scrape so recovery re-baselines,
+/// while the tracker keeps the last value held until it expires.
+fn rebaseline_latency(windows: &mut LatencyWindows, id: &str) {
+    if let Some(w) = windows.get_mut(id) {
+        w.prev = None;
     }
+}
+
+/// Current held/fresh/expired latency for `id` at `now`.
+fn snapshot_latency(
+    windows: &mut LatencyWindows,
+    id: &str,
+    now: DateTime<Utc>,
+) -> (Option<f64>, Option<ObservationMetadata>) {
+    windows
+        .get_mut(id)
+        .map_or((None, None), |w| w.tracker.snapshot(now))
 }
 
 #[cfg(test)]
@@ -1340,36 +1379,95 @@ mod tests {
         Utc.timestamp_opt(secs, 0).unwrap()
     }
 
+    use rocm_dash_core::metrics::ObservationFreshness;
+
+    const TICK: Duration = Duration::from_secs(2);
+
+    fn baseline(sum_s: f64, count: f64) -> LatencyWindow {
+        LatencyWindow {
+            prev: Some((sum_s, count, at(10))),
+            tracker: GenerationObservationTracker::new(TICK),
+        }
+    }
+
+    fn snap_at(
+        w: &mut LatencyWindows,
+        id: &str,
+        secs: i64,
+    ) -> (Option<f64>, Option<ObservationFreshness>) {
+        let (v, m) = snapshot_latency(w, id, at(secs));
+        (v, m.map(|m| m.freshness))
+    }
+
     #[test]
-    fn avg_ms_first_scrape_uses_cumulative_then_windows() {
-        let mut prev = HashMap::new();
-        // First scrape: cumulative average = 2.0s / 4 × 1000 = 500 ms.
+    fn latency_first_scrape_reports_nothing_then_windows() {
+        let mut w = LatencyWindows::new();
+        // First scrape only baselines: the lifetime average is not reported.
+        observe_latency(&mut w, "a", TICK, Some(2.0), Some(4.0), at(10));
+        assert_eq!(snap_at(&mut w, "a", 10), (None, None));
+        // Second scrape: Δsum=1.0s over Δcount=10 → 100 ms, fresh.
+        observe_latency(&mut w, "a", TICK, Some(3.0), Some(14.0), at(12));
         assert_eq!(
-            avg_ms_from_histogram(&mut prev, "a", Some(2.0), Some(4.0), at(10)),
-            Some(500.0)
+            snap_at(&mut w, "a", 12),
+            (Some(100.0), Some(ObservationFreshness::Fresh))
         );
-        // Second scrape: Δsum=1.0s over Δcount=10 → 100 ms (windowed).
+    }
+
+    #[test]
+    fn latency_is_held_without_new_requests_then_expires() {
+        let mut w = LatencyWindows::new();
+        observe_latency(&mut w, "a", TICK, Some(2.0), Some(4.0), at(10));
+        observe_latency(&mut w, "a", TICK, Some(3.0), Some(14.0), at(12));
+        // Idle scrapes: counters unchanged → no new value, previous is held.
+        observe_latency(&mut w, "a", TICK, Some(3.0), Some(14.0), at(14));
         assert_eq!(
-            avg_ms_from_histogram(&mut prev, "a", Some(3.0), Some(14.0), at(12)),
-            Some(100.0)
+            snap_at(&mut w, "a", 14),
+            (Some(100.0), Some(ObservationFreshness::Held))
         );
-        // Absent histogram → None (Observe shows `—`).
+        // Validity for a 2 s tick is the 6 s floor: still held at +6 s...
         assert_eq!(
-            avg_ms_from_histogram(&mut prev, "b", None, None, at(12)),
-            None
+            snap_at(&mut w, "a", 18),
+            (Some(100.0), Some(ObservationFreshness::Held))
         );
-        // count == 0 (no requests yet) → None, never a divide-by-zero number.
+        // ...and gone just past it. The stale lifetime average never returns.
+        observe_latency(&mut w, "a", TICK, Some(3.0), Some(14.0), at(19));
+        assert_eq!(snap_at(&mut w, "a", 19), (None, None));
+    }
+
+    #[test]
+    fn latency_absent_empty_reset_and_stale_interval_report_nothing() {
+        let mut w = LatencyWindows::new();
+        // Absent histogram / zero count never fabricate a number.
+        observe_latency(&mut w, "b", TICK, None, None, at(12));
+        assert_eq!(snap_at(&mut w, "b", 12), (None, None));
+        observe_latency(&mut w, "c", TICK, Some(0.0), Some(0.0), at(12));
+        observe_latency(&mut w, "c", TICK, Some(0.0), Some(0.0), at(14));
+        assert_eq!(snap_at(&mut w, "c", 14), (None, None));
+        // A counter reset (sum drops) only re-baselines.
+        observe_latency(&mut w, "d", TICK, Some(10.0), Some(100.0), at(10));
+        observe_latency(&mut w, "d", TICK, Some(0.2), Some(2.0), at(12));
+        assert_eq!(snap_at(&mut w, "d", 12), (None, None));
+        // A gap beyond MAX_RATE_INTERVAL_S is not a usable window.
+        observe_latency(&mut w, "e", TICK, Some(1.0), Some(10.0), at(0));
+        observe_latency(&mut w, "e", TICK, Some(2.0), Some(20.0), at(100));
+        assert_eq!(snap_at(&mut w, "e", 100), (None, None));
+    }
+
+    #[test]
+    fn failed_scrape_rebaselines_but_keeps_value_held() {
+        let mut w = LatencyWindows::new();
+        observe_latency(&mut w, "a", TICK, Some(2.0), Some(4.0), at(10));
+        observe_latency(&mut w, "a", TICK, Some(3.0), Some(14.0), at(12));
+        rebaseline_latency(&mut w, "a");
         assert_eq!(
-            avg_ms_from_histogram(&mut prev, "c", Some(0.0), Some(0.0), at(12)),
-            None
+            snap_at(&mut w, "a", 14),
+            (Some(100.0), Some(ObservationFreshness::Held))
         );
-        // A counter reset (sum drops) re-bases to the cumulative average.
-        let mut p2 = HashMap::new();
-        avg_ms_from_histogram(&mut p2, "d", Some(10.0), Some(100.0), at(10));
+        // Recovery re-baselines: the first post-failure scrape yields nothing new.
+        observe_latency(&mut w, "a", TICK, Some(9.0), Some(50.0), at(15));
         assert_eq!(
-            avg_ms_from_histogram(&mut p2, "d", Some(0.2), Some(2.0), at(12)),
-            Some(100.0),
-            "reset falls back to cumulative 0.2/2×1000"
+            snap_at(&mut w, "a", 15),
+            (Some(100.0), Some(ObservationFreshness::Held))
         );
     }
 
@@ -1497,16 +1595,16 @@ mod tests {
     #[test]
     fn purge_telemetry_state_removes_all_three_maps_for_id() {
         let mut trackers: HashMap<String, GenerationObservationTracker> = HashMap::new();
-        let mut ttft: HashMap<String, (f64, f64, DateTime<Utc>)> = HashMap::new();
-        let mut tpot: HashMap<String, (f64, f64, DateTime<Utc>)> = HashMap::new();
+        let mut ttft: LatencyWindows = HashMap::new();
+        let mut tpot: LatencyWindows = HashMap::new();
 
         // Populate two ids.
         trackers.insert("a".into(), make_tracker(2));
         trackers.insert("b".into(), make_tracker(2));
-        ttft.insert("a".into(), (1.0, 1.0, at(10)));
-        ttft.insert("b".into(), (2.0, 2.0, at(10)));
-        tpot.insert("a".into(), (3.0, 3.0, at(10)));
-        tpot.insert("b".into(), (4.0, 4.0, at(10)));
+        ttft.insert("a".into(), baseline(1.0, 1.0));
+        ttft.insert("b".into(), baseline(2.0, 2.0));
+        tpot.insert("a".into(), baseline(3.0, 3.0));
+        tpot.insert("b".into(), baseline(4.0, 4.0));
 
         purge_telemetry_state("a", &mut trackers, &mut ttft, &mut tpot);
 
@@ -1526,16 +1624,16 @@ mod tests {
     #[test]
     fn invalidate_on_endpoint_change_resets_tracker_and_clears_latency() {
         let mut trackers: HashMap<String, GenerationObservationTracker> = HashMap::new();
-        let mut ttft: HashMap<String, (f64, f64, DateTime<Utc>)> = HashMap::new();
-        let mut tpot: HashMap<String, (f64, f64, DateTime<Utc>)> = HashMap::new();
+        let mut ttft: LatencyWindows = HashMap::new();
+        let mut tpot: LatencyWindows = HashMap::new();
 
         let mut tracker = make_tracker(2);
         // Give the tracker a reading so it has a non-None baseline.
         tracker.observe_counter(100.0, at(10));
         tracker.observe_counter(200.0, at(12));
         trackers.insert("svc".into(), tracker);
-        ttft.insert("svc".into(), (1.0, 10.0, at(10)));
-        tpot.insert("svc".into(), (0.5, 8.0, at(10)));
+        ttft.insert("svc".into(), baseline(1.0, 10.0));
+        tpot.insert("svc".into(), baseline(0.5, 8.0));
 
         invalidate_on_endpoint_change("svc", &mut trackers, &mut ttft, &mut tpot);
 

@@ -12,7 +12,9 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Paragraph, Row, Table, Wrap};
 
-use rocm_dash_core::metrics::{Instance, InstanceStatus, ObservationFreshness};
+use rocm_dash_core::metrics::{
+    Instance, InstanceStatus, ObservationFreshness, ObservationMetadata,
+};
 
 use crate::app::{AppState, ConnState, KeyAction, ScrollTarget};
 use crate::ui::format;
@@ -112,8 +114,15 @@ pub fn draw_table(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             .gen_tps_observation
             .as_ref()
             .is_some_and(|m| m.freshness == ObservationFreshness::Held);
-        held && (inst.gen_tps.is_some_and(f64::is_finite)
-            || inst.tokens_per_watt.is_some_and(f64::is_finite))
+        let is_held = |m: &Option<ObservationMetadata>| {
+            m.as_ref()
+                .is_some_and(|m| m.freshness == ObservationFreshness::Held)
+        };
+        (held
+            && (inst.gen_tps.is_some_and(f64::is_finite)
+                || inst.tokens_per_watt.is_some_and(f64::is_finite)))
+            || (is_held(&inst.ttft_observation) && inst.ttft_ms.is_some_and(f64::is_finite))
+            || (is_held(&inst.tpot_observation) && inst.tpot_ms.is_some_and(f64::is_finite))
     });
     let (table_area, legend_area) = if any_held {
         let split = Layout::default()
@@ -140,14 +149,8 @@ pub fn draw_table(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         let tps = format::gen_tps_cell(inst.gen_tps, inst.gen_tps_observation.as_ref());
         let tpw =
             format::tokens_per_watt_cell(inst.tokens_per_watt, inst.gen_tps_observation.as_ref());
-        let ttft = inst
-            .ttft_ms
-            .filter(|v| v.is_finite())
-            .map_or_else(|| dash.to_string(), |v| format!("{v:.0}ms"));
-        let tpot = inst
-            .tpot_ms
-            .filter(|v| v.is_finite())
-            .map_or_else(|| dash.to_string(), |v| format!("{v:.0}ms"));
+        let ttft = format::latency_cell(inst.ttft_ms, inst.ttft_observation.as_ref());
+        let tpot = format::latency_cell(inst.tpot_ms, inst.tpot_observation.as_ref());
         let power = rocm_dash_core::efficiency::instance_power_w(&inst.gpu_ids, gpus)
             .map_or_else(|| dash.to_string(), |w| format!("{w:.0}W"));
         let queue = match (inst.running_reqs, inst.waiting_reqs) {
@@ -992,7 +995,9 @@ mod tests {
             gen_tps_observation: None,
             tokens_per_watt: None,
             ttft_ms: None,
+            ttft_observation: None,
             tpot_ms: None,
+            tpot_observation: None,
             launch_args: vec![],
             env_vars: BTreeMap::new(),
             log_file: None,
@@ -2007,6 +2012,35 @@ mod tests {
         assert!(
             out.contains(format::HELD_LEGEND),
             "HELD_LEGEND must appear when a shown gen_tps is held; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn table_held_ttft_shows_marker_and_legend_even_with_fresh_gen_tps() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut inst = mk_inst_obs(
+            "idle",
+            Some(456.0),
+            Some(obs(ObservationFreshness::Fresh, 5)),
+        );
+        inst.ttft_ms = Some(150.0);
+        inst.ttft_observation = Some(obs(ObservationFreshness::Held, 30));
+        let state = state_with_snap(inst);
+        let mut term = Terminal::new(TestBackend::new(160, 20)).unwrap();
+        term.draw(|f| draw_table(f, f.area(), &state, &state.theme))
+            .unwrap();
+        let out = buffer_text(&term);
+        assert!(
+            out.contains("150ms*"),
+            "held TTFT must be marked; got:
+{out}"
+        );
+        assert!(
+            out.contains(format::HELD_LEGEND),
+            "legend must explain a held TTFT marker; got:
+{out}"
         );
     }
 

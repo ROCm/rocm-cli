@@ -162,7 +162,9 @@ pub fn merge_instance(
         // Derived at the runner by windowing the sample's cumulative histogram
         // readings (mirrors gen_tps); left None at merge time.
         ttft_ms: None,
+        ttft_observation: None,
         tpot_ms: None,
+        tpot_observation: None,
         launch_args: svc.launch_args.clone(),
         env_vars: svc.env_vars.clone(),
         log_file: svc.log_file.clone(),
