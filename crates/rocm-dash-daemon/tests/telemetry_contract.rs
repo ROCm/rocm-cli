@@ -649,6 +649,89 @@ async fn gen_tps_held_for_validity_window_after_single_failure() {
     );
 }
 
+// ── TTFT freshness (ROCMAI-62) ──────────────────────────────────────────────
+
+/// Extract the `contract-svc` instance's TTFT and its freshness.
+/// Outer `None` = instance absent.
+#[allow(clippy::type_complexity)]
+fn svc_ttft(
+    snap: &rocm_dash_core::metrics::Snapshot,
+) -> Option<(
+    Option<f64>,
+    Option<rocm_dash_core::metrics::ObservationFreshness>,
+)> {
+    snap.instances
+        .iter()
+        .find(|i| i.container_id == SVC_ID)
+        .map(|i| (i.ttft_ms, i.ttft_observation.as_ref().map(|m| m.freshness)))
+}
+
+/// Contract: once new requests stop arriving, the last windowed TTFT is held
+/// (`Held`) for the observation validity window and then cleared. It is never
+/// replaced by the histogram's lifetime average, which the mock's constant
+/// `Frozen` body would otherwise report as a steady 50 ms indefinitely.
+///
+/// Exercises the real runner loop: scrape, per-instance tracker, snapshot.
+#[tokio::test]
+async fn ttft_is_held_then_cleared_when_requests_stop() {
+    use rocm_dash_core::metrics::ObservationFreshness::{Fresh, Held};
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let services_dir = tmp.path().join("services");
+
+    let mode = Arc::new(Mutex::new(MockMode::Growing));
+    let ticks = Arc::new(AtomicU64::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let failure_count = Arc::new(AtomicU64::new(0));
+    let port = spawn_mock_server(
+        Arc::clone(&mode),
+        Arc::clone(&ticks),
+        Arc::clone(&failure_count),
+        Arc::clone(&stop),
+    )
+    .await;
+
+    write_service_record(&services_dir, port);
+    let (tx, mut rx) = broadcast::channel::<Event>(64);
+    let _runner = spawn_runner(tx, fast_opts(services_dir)).await;
+
+    // Step 1: traffic is flowing, so TTFT is a live (Fresh) windowed value.
+    let live = wait_for_snapshot(&mut rx, |snap| {
+        svc_ttft(snap).and_then(|(v, f)| (f == Some(Fresh)).then_some(v).flatten())
+    })
+    .await
+    .unwrap_or_else(|e| panic!("fresh TTFT never established: {e}"));
+    assert!(live > 0.0, "windowed TTFT should be positive, got {live}");
+
+    // Step 2: the engine goes idle: histograms stop advancing.
+    drain_snapshots(&mut rx);
+    *mode
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = MockMode::Frozen(1000);
+
+    // Step 3: the value is held, marked as such, rather than dropped or
+    // silently presented as live.
+    let held = wait_for_snapshot(&mut rx, |snap| {
+        svc_ttft(snap).and_then(|(v, f)| (f == Some(Held)).then_some(v).flatten())
+    })
+    .await
+    .unwrap_or_else(|e| panic!("TTFT was never reported as Held once idle: {e}"));
+    assert!(held > 0.0);
+
+    // Step 4: after the validity window it clears, and stays clear. The
+    // pre-fix behaviour would keep reporting the 50 ms lifetime average here.
+    let cleared = wait_for_snapshot(&mut rx, |snap| {
+        svc_ttft(snap).and_then(|(v, _)| v.is_none().then_some(()))
+    })
+    .await;
+    stop.store(true, Ordering::Relaxed);
+    assert!(
+        cleared.is_ok(),
+        "idle TTFT was never cleared: stale latency persisted past the validity          window ({:?})",
+        observation_validity_window()
+    );
+}
+
 // ── Scenario 5: Omitted counter → None (not zero, not panic) ───────────────
 
 /// Contract: when the `/metrics` endpoint returns HTTP 200 but the body omits
