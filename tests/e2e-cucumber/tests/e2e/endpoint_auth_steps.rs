@@ -1,0 +1,223 @@
+// Copyright © Advanced Micro Devices, Inc., or its affiliates.
+//
+// SPDX-License-Identifier: MIT
+
+//! Steps for the public-bind endpoint authentication contract (EAI-7409).
+//!
+//! `rocm serve --host 0.0.0.0 --allow-public-bind` issues an endpoint API key,
+//! prints it exactly once, and hands the serving engine a key file to enforce.
+//! These steps drive a real managed serve and then talk to the endpoint directly
+//! over HTTP with and without credentials, because the ENGINE is what enforces the
+//! key — the CLI only issues it. That is also why these steps are GPU-lane only:
+//! there is no plan-only serve mode that would surface enforcement without a real
+//! engine and model. Contracts read from the CLI's own output (EAI-8072).
+
+use std::time::{Duration, Instant};
+
+use cucumber::{then, when};
+
+use crate::E2eWorld;
+use e2e_cucumber::serve_log::service_log_tail;
+
+use crate::e2e::serving_steps::{
+    SERVE_BASE_URL, ensure_serve_port_free, host_serve_target, serve_timeout_for,
+};
+
+/// A public bind listens on all interfaces, so the test still reaches the shared
+/// serve port over loopback.
+fn endpoint_url() -> &'static str {
+    SERVE_BASE_URL.as_str()
+}
+
+/// Pull the issued endpoint key out of the launch output. `serve` prints it as
+/// `  api key: <key>` exactly once, alongside the note and curl example.
+fn issued_api_key(output: &str) -> Option<String> {
+    output
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("api key:"))
+        .map(|key| key.trim().to_owned())
+        .filter(|key| !key.is_empty())
+}
+
+/// GET `<endpoint>/models`, optionally presenting a bearer token. `None` means the
+/// request never reached a listener (connection refused / timed out), which is
+/// distinct from "answered with a status" — the readiness wait tolerates that while
+/// the engine is still binding, but an assertion must not.
+async fn try_models_status(bearer: Option<&str>) -> Option<reqwest::StatusCode> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .expect("failed to build HTTP client");
+    let mut request = client.get(format!("{}/models", endpoint_url()));
+    if let Some(token) = bearer {
+        request = request.bearer_auth(token);
+    }
+    request.send().await.ok().map(|response| response.status())
+}
+
+/// As [`try_models_status`], but a transport failure is fatal. Used by the
+/// assertions, which only run once the endpoint has already answered — so at that
+/// point a refused connection is a genuine failure, not a startup race.
+async fn get_models_status(bearer: Option<&str>) -> reqwest::StatusCode {
+    try_models_status(bearer).await.unwrap_or_else(|| {
+        panic!(
+            "GET {}/models did not reach the served endpoint",
+            endpoint_url()
+        )
+    })
+}
+
+/// Wait until the authenticated endpoint answers, so the assertions run against a
+/// loaded model rather than a still-starting one. Polls WITH the key, because an
+/// unauthenticated probe is exactly what the endpoint is meant to reject.
+///
+/// A managed serve returns as soon as the supervisor is up, so for the first while
+/// the engine has not bound the port yet and the connection is simply refused.
+/// That is expected here and must be retried — panicking on the first refusal is
+/// what made this scenario fail before it ever reached its assertions.
+///
+/// On timeout the panic carries the engine's own log tail and the last thing the
+/// endpoint did, because "did not answer in Ns" alone cannot distinguish the three
+/// failures that look identical from outside: the engine never started, it started
+/// but is still loading weights, or it is up and REJECTING the key we were issued
+/// (which would be a real defect in the contract under test, not a slow start).
+async fn wait_for_authenticated_endpoint(key: &str, timeout_secs: u64, serve_stdout: &str) {
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    loop {
+        let last_seen = match try_models_status(Some(key)).await {
+            Some(status) if status.is_success() => return,
+            // A bound engine rejecting the key it was issued is a contract defect,
+            // not a slow start, so report it now instead of at the deadline.
+            Some(reqwest::StatusCode::UNAUTHORIZED) => panic!(
+                "public endpoint {} rejected the issued key with 401\n--- SERVE STDOUT ---\n{serve_stdout}\n--- SERVICE LOG (tail) ---\n{}",
+                endpoint_url(),
+                service_log_tail(serve_stdout)
+            ),
+            Some(status) => format!("endpoint answered {status} to the issued key"),
+            None => "connection refused / timed out".to_owned(),
+        };
+        let endpoint = endpoint_url();
+        assert!(
+            Instant::now() < deadline,
+            "public endpoint {endpoint} did not answer an authenticated request within \
+             {timeout_secs}s\nlast observed: {last_seen}\n--- SERVE STDOUT ---\n{serve_stdout}\
+             \n--- SERVICE LOG (tail) ---\n{}",
+            service_log_tail(serve_stdout)
+        );
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+}
+
+// ── When ───────────────────────────────────────────────────────────
+
+#[when("the user serves a model on a public interface with public binding allowed")]
+async fn serve_public_bind(world: &mut E2eWorld) {
+    let (model, engine, _) = host_serve_target();
+    ensure_serve_port_free().await;
+    // No `--api-key`: the CLI must GENERATE one, which is the behaviour under test.
+    let stdout = crate::run_rocm_ok(
+        world,
+        &[
+            "serve",
+            model,
+            "--engine",
+            engine,
+            "--managed",
+            "--host",
+            "0.0.0.0",
+            "--allow-public-bind",
+        ],
+    );
+    let key = issued_api_key(&stdout)
+        .unwrap_or_else(|| panic!("serve did not print an endpoint api key:\n{stdout}"));
+    wait_for_authenticated_endpoint(&key, serve_timeout_for(world), &stdout).await;
+    world.endpoint = Some(endpoint_url().to_owned());
+    world.endpoint_api_key = Some(key);
+    world.model_name = Some(model.to_owned());
+    world.cli_output = Some(stdout);
+}
+
+// ── Then ───────────────────────────────────────────────────────────
+
+#[then("the CLI shows the endpoint key once and how to send it")]
+async fn shows_key_once(world: &mut E2eWorld) {
+    let output = world.cli_output.as_deref().expect("no serve output");
+    let key = world
+        .endpoint_api_key
+        .as_deref()
+        .expect("no endpoint api key captured");
+    // Exactly one dedicated `api key:` line — this is the launch output's single
+    // disclosure of the secret, matching the "shown only now" promise beneath it.
+    // The key also appears inside the adjacent `example: curl -H "Authorization:
+    // Bearer <key>"` usage line, which is deliberate guidance rather than a second
+    // disclosure, so count only the dedicated line rather than occurrences of the
+    // key itself.
+    let shown = output
+        .lines()
+        .filter(|line| line.trim().starts_with("api key:"))
+        .count();
+    assert_eq!(
+        shown, 1,
+        "expected exactly one dedicated `api key:` line, got {shown}:\n{output}"
+    );
+    // The key may appear only on the `api key:` line and in the curl example; any
+    // other line carrying it means it leaked elsewhere in the launch output.
+    let leaked: Vec<&str> = output
+        .lines()
+        .filter(|line| line.contains(key))
+        .filter(|line| {
+            let line = line.trim();
+            !line.starts_with("api key:") && !line.starts_with("example:")
+        })
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "the key leaked onto lines other than the api key line and curl example: {leaked:?}"
+    );
+    assert!(
+        output.contains("shown only now"),
+        "expected the show-once note, got:\n{output}"
+    );
+    assert!(
+        output.contains("Authorization: Bearer"),
+        "expected the CLI to say how to send the key, got:\n{output}"
+    );
+    assert!(
+        key.len() >= 16,
+        "expected a strong generated key, got one of {} chars",
+        key.len()
+    );
+}
+
+#[then("a request without the key is refused as unauthorized")]
+async fn unauthenticated_refused(_world: &mut E2eWorld) {
+    let status = get_models_status(None).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::UNAUTHORIZED,
+        "an unauthenticated request to a public endpoint must be refused, got {status}"
+    );
+}
+
+#[then("a request with the wrong key is refused as unauthorized")]
+async fn wrong_key_refused(_world: &mut E2eWorld) {
+    let status = get_models_status(Some("not-the-issued-key")).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::UNAUTHORIZED,
+        "a request with the wrong key must be refused, got {status}"
+    );
+}
+
+#[then("a request carrying the issued key is accepted")]
+async fn issued_key_accepted(world: &mut E2eWorld) {
+    let key = world
+        .endpoint_api_key
+        .clone()
+        .expect("no endpoint api key captured");
+    let status = get_models_status(Some(&key)).await;
+    assert!(
+        status.is_success(),
+        "the issued key must be accepted, got {status}"
+    );
+}
