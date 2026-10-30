@@ -233,6 +233,9 @@ pub(crate) enum Command {
     },
     /// Print the rocm-cli version, release tag or branch, and commit hash,
     /// plus the ROCm SDK and GPU driver this machine would use.
+    ///
+    /// A release tag `vX.Y.Z` is shown as `X.Y.Z (vX.Y.Z, <hash>)`. A build
+    /// from `main` is shown as `0.0.0-dev (main, <hash>)`.
     Version,
     /// Generate a shell completion script for the given shell.
     Completions {
@@ -1483,6 +1486,35 @@ mod tests {
     #[test]
     fn cli_command_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    /// `-V`/`--version` and `rocm version` both print `ROCM_CLI_VERSION`, the
+    /// one string `format_cli_version` in `build.rs` embeds. Tag, `main`, and
+    /// unknown shapes are the `format_cli_version_*` tests there.
+    #[test]
+    fn version_surfaces_share_one_build_script_string() {
+        let full = crate::cli_version_string();
+        let number = crate::cli_version_number();
+        let reference = env!("ROCM_CLI_VERSION_REF");
+        let hash = env!("ROCM_CLI_GIT_HASH");
+        assert_eq!(full, env!("ROCM_CLI_VERSION"));
+        assert_eq!(
+            cli_command().get_version(),
+            Some(full.as_str()),
+            "-V/--version must print the same string as `rocm version`"
+        );
+        assert_eq!(full, format!("{number} ({reference}, {hash})"));
+        // A resolved ref whose text is not `v` plus the leading version is not
+        // a release tag. `main`, a feature branch, and a name such as `vllm`
+        // all land here, and none of them may report the workspace package
+        // version.
+        if reference != "unknown" && reference.strip_prefix('v') != Some(number.as_str()) {
+            assert_eq!(number, "0.0.0-dev", "{full}");
+            assert_ne!(number, env!("CARGO_PKG_VERSION"));
+        }
+        if reference == "unknown" {
+            assert_eq!(number, env!("CARGO_PKG_VERSION"));
+        }
     }
 
     /// EAI-7362: the top-level `rocm --help` command list must be alphabetical,

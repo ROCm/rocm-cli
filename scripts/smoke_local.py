@@ -96,10 +96,22 @@ def assert_version_string(text: str, label: str) -> None:
     match = re.fullmatch(r"rocm-cli (\S+) \((\S+), ([0-9a-f]+)\)", text.strip())
     if match is None:
         fail(f"{label} did not match 'rocm-cli <version> (<ref>, <hash>)':\n{text}")
-    ref = match.group(2)
+    version, ref = match.group(1), match.group(2)
     if ref == "unknown":
         fail(
             f"{label} has an unresolved ref ('unknown'), expected a real tag/branch:\n{text}"
+        )
+    # Same contract as format_cli_version in apps/rocm/build.rs: a tag vX.Y.Z
+    # is reported with that one leading v removed; every other resolved ref,
+    # including main, is 0.0.0-dev rather than the workspace package version.
+    if ref.startswith("v") and ref[1:] == version:
+        if not version[:1].isdigit():
+            fail(f"{label} release version does not start with a digit:\n{text}")
+    elif version != "0.0.0-dev":
+        fail(
+            f"{label} reported {version!r} for ref {ref!r}; "
+            "a non-release build must report 0.0.0-dev:\n"
+            f"{text}"
         )
 
 
