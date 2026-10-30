@@ -1207,18 +1207,31 @@ async fn then_get_started_block(world: &mut E2eWorld) {
 #[then("the installer next-step hint names the installed rocm binary")]
 async fn then_hint_names_binary(world: &mut E2eWorld) {
     // ROCM_CLI_UPDATE_SHELL_PATH=0 and the install dir is not on the caller's
-    // PATH, so bare `rocm` would not work: the hint and the examples must name
-    // the binary by path.
+    // PATH, so bare `rocm` would not work: the hint and every example must
+    // name the binary by path. PowerShell invokes a quoted path with `&`.
     let st = state(world);
-    let rocm = format!("{}/rocm", st.install_dir.display());
-    let out = &st.last_output;
-    for needle in [
-        format!("Run: {rocm} examine"),
-        format!("{rocm} install sdk"),
-    ] {
+    let rocm = installed_binary(&st.install_dir, "rocm")
+        .display()
+        .to_string();
+    let cmd = if cfg!(windows) {
+        format!("& \"{rocm}\"")
+    } else {
+        rocm
+    };
+    let lines: Vec<&str> = st.last_output.lines().map(str::trim).collect();
+    let hint = format!("Run: {cmd} examine");
+    assert_eq!(
+        lines.iter().rev().find(|l| !l.is_empty()),
+        Some(&hint.as_str()),
+        "installer's last line is not the next-step hint:\n{}",
+        st.last_output
+    );
+    for example in ["install sdk", "serve qwen"] {
+        let want = format!("{cmd} {example}");
         assert!(
-            out.contains(&needle),
-            "installer output is missing {needle:?}:\n{out}"
+            lines.iter().any(|l| l.starts_with(&want)),
+            "no get-started example starts with {want:?}:\n{}",
+            st.last_output
         );
     }
 }

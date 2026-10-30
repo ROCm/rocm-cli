@@ -372,6 +372,8 @@ Feature: Release install lifecycle
     And the installer next-step hint names the installed rocm binary
     And the installer output has no ANSI escapes
 
+  # Regression guard only: piped output already disables color before NO_COLOR
+  # is consulted, so this does not exercise the NO_COLOR check itself.
   @id:lifecycle-linux-install-output-no-color-env @lifecycle @requires-os:linux
   Scenario: lifecycle-29 - Linux - NO_COLOR keeps the installer output free of ANSI escapes
     Given a freshly built release tree
@@ -394,10 +396,12 @@ Feature: Release install lifecycle
     And the installer output has no ANSI escapes
 
   @id:lifecycle-windows-install-output-banner @lifecycle @requires-os:windows
-  Scenario: lifecycle-31 - Windows - a piped install prints the get-started block and no ANSI escapes
+  Scenario: lifecycle-31 - Windows - a piped install prints the get-started block with a hint that names the installed binary, and no ANSI escapes
     Given a freshly built release tree
     And a generated signing keypair
     When the release is packaged and signed with the private key file
     And the signed bundle is installed with the public key file
     Then the installer prints the get-started block
+    And the installer output has no banner art
+    And the installer next-step hint names the installed rocm binary
     And the installer output has no ANSI escapes

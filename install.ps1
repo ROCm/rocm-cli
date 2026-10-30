@@ -65,17 +65,18 @@ function Write-CompletionBanner {
  ##F==##T##|   ##|##|     ##|L##FJ##|    ##|     ##|     ##|
  ##|  ##|L######FJL######T##| L=J ##|    L######T#######T##|
  L=J  L=J L=====J  L=====JL=J     L=J     L=====JL======JL=J
-
-        Local AI on AMD GPUs ~ one binary, zero setup
 '@
     $glyphs = @{
         '#' = [char]0x2588; '=' = [char]0x2550; '|' = [char]0x2551
         'T' = [char]0x2557; 'F' = [char]0x2554; 'L' = [char]0x255A
-        'J' = [char]0x255D; '~' = [char]0x2014
+        'J' = [char]0x255D
     }
     $art = -join ($art.ToCharArray() | ForEach-Object {
         if ($glyphs.ContainsKey([string] $_)) { $glyphs[[string] $_] } else { $_ }
     })
+    # The caption stays outside the substitution: `@{}` keys are
+    # case-insensitive, so the placeholders would also rewrite its letters.
+    $art += "`n`n        Local AI on AMD GPUs $([char] 0x2014) one binary, zero setup"
     # Only the glyphs need UTF-8, and only a real console needs the switch:
     # redirected output keeps whatever encoding its consumer already expects.
     # Restored afterwards because under `irm | iex` this is the user's session.
@@ -814,18 +815,18 @@ try {
     if ($updateUserPath) {
         Add-InstallDirToUserPath $InstallDir
     } elseif (-not (Test-PathInList $env:Path $InstallDir)) {
-        Write-Host "note: $InstallDir is not on PATH"
-        Write-Host "  add it to the user PATH or run:"
-        Write-Host "  `$env:Path = `"$InstallDir;`$env:Path`""
+        Write-Detail "note: $InstallDir is not on PATH"
+        Write-Detail "add it to the user PATH or run:"
+        Write-Detail "`$env:Path = `"$InstallDir;`$env:Path`""
     }
 
     if (Test-PathInList $env:Path $InstallDir) {
-        $nextHint = "Run: rocm examine"
+        $cmd = "rocm"
     } else {
         $rocmExe = Join-Path $InstallDir "rocm.exe"
-        $nextHint = "Run: & `"$rocmExe`" examine"
+        $cmd = "& `"$rocmExe`""
     }
-    Write-CompletionBanner $nextHint
+    Write-CompletionBanner $cmd "Run: $cmd examine"
 } finally {
     if (Test-Path -LiteralPath $tempRoot) {
         Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
