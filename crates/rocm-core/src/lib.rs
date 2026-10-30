@@ -14,6 +14,7 @@ pub mod automation;
 pub mod binary_paths;
 pub mod browser;
 pub mod codex_bridge;
+pub mod command_capture;
 pub mod config;
 pub mod confirm;
 pub mod crypto;
@@ -64,6 +65,7 @@ pub use automation::{
 };
 pub use binary_paths::{daemon_binary_path, engine_binary_path, sibling_binary_path};
 pub use codex_bridge::{CodexBridgeEngine, CodexBridgeGpuSnapshot, CodexBridgeSnapshot};
+pub use command_capture::{CommandCapture, command_capture_text, run_rocm_capture_with_env};
 pub use config::{
     AutomationsConfig, DashboardConfig, DashboardDaemonConfig, DashboardTuiConfig,
     EngineUserConfig, ManagedToolConfig, PERMISSIONS_MODE_ASK, PERMISSIONS_MODE_FULL_ACCESS,

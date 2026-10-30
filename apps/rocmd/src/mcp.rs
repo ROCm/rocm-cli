@@ -2,14 +2,14 @@
 //
 // SPDX-License-Identifier: MIT
 
-use crate::common::{self, CommandCapture};
+use crate::common;
 use crate::persistence;
 use anyhow::{Context, Result, bail};
 #[cfg(test)]
 use rocm_core::unix_time_millis;
 use rocm_core::{
-    AppPaths, AutomationRuntimeState, DEFAULT_LOCAL_HOST, ExamineSummary, RocmCliConfig,
-    load_recent_automation_events,
+    AppPaths, AutomationRuntimeState, CommandCapture, DEFAULT_LOCAL_HOST, ExamineSummary,
+    RocmCliConfig, command_capture_text, load_recent_automation_events,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -841,20 +841,6 @@ fn tool_result_from_command(prefix: &str, output: CommandCapture, is_error: bool
         },
         "isError": is_error || output.exit_status != 0,
     })
-}
-
-fn command_capture_text(output: &CommandCapture) -> String {
-    if output.stderr.trim().is_empty() {
-        output.stdout.trim().to_owned()
-    } else if output.stdout.trim().is_empty() {
-        format!("stderr:\n{}", output.stderr.trim())
-    } else {
-        format!(
-            "stdout:\n{}\n\nstderr:\n{}",
-            output.stdout.trim(),
-            output.stderr.trim()
-        )
-    }
 }
 
 fn read_tail_lines(path: &std::path::Path, limit: usize) -> Result<String> {

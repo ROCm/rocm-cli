@@ -3143,7 +3143,7 @@ mod tests {
             &event,
             |_paths| {
                 Ok(crate::sandbox::sandbox_driver_plan_value(
-                    crate::common::CommandCapture {
+                    rocm_core::CommandCapture {
                         argv: vec![
                             "rocm".to_owned(),
                             "install".to_owned(),
@@ -3598,7 +3598,7 @@ mod tests {
             &event,
             |_paths| {
                 Ok(crate::sandbox::sandbox_check_updates_value(
-                    crate::common::CommandCapture {
+                    rocm_core::CommandCapture {
                         argv: vec!["rocm".to_owned(), "update".to_owned()],
                         exit_status: 0,
                         stdout: "update\n  managed runtimes: none\n".to_owned(),
@@ -3663,7 +3663,7 @@ mod tests {
             &mut state,
             &event,
             |_paths| {
-                Ok(crate::sandbox::sandbox_check_updates_value(crate::common::CommandCapture {
+                Ok(crate::sandbox::sandbox_check_updates_value(rocm_core::CommandCapture {
                     argv: vec!["rocm".to_owned(), "update".to_owned()],
                     exit_status: 0,
                     stdout: "update\n  runtime release-pip-gfx120x-all status=update_available installed=7.13.0 latest=7.14.0\n".to_owned(),

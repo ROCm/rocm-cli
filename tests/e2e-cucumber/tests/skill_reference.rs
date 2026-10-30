@@ -110,8 +110,9 @@ fn catalog_not_print_only_count(md: &str) -> usize {
 /// Two free-standing counts restate the table in prose rather than in cells a
 /// parser already checks: `reference.md`'s "(N failure modes)" heading, and
 /// `SKILL.md`'s "the other M are print-only" line. `rocm_doctor_skill.feature`
-/// says plainly that these are not parsed and can go stale even while the
-/// table itself stays correct -- which is exactly what happened here (the
+/// does not parse them, so they can go stale even while the table itself
+/// stays correct, and says that this file checks both counts instead. That is
+/// exactly what happened here (the
 /// catalog grew by one row and both numbers were left behind). This does not
 /// reopen that scope decision; it only adds a floor cheap enough that the next
 /// drift fails a `cargo test` instead of waiting for someone to count rows by
@@ -153,30 +154,22 @@ fn free_standing_catalog_counts_match_the_table() {
     let skill_md = std::fs::read_to_string(skill_md_path())
         .unwrap_or_else(|e| panic!("failed to read {}: {e}", skill_md_path().display()));
     // "The other N" and "are **print-only**" sit on adjacent source lines that
-    // wrap a single sentence, so join the whole doc on whitespace first rather
-    // than matching one line -- a line-scoped search would find the
-    // print-only line without the number on it and fail to parse.
-    let flattened = skill_md.split_whitespace().collect::<Vec<_>>().join(" ");
-    let after_the_other = flattened.split("The other ").nth(1).unwrap_or_else(|| {
-        panic!(
-            "no 'The other N ... print-only' phrase found in {}",
-            skill_md_path().display()
-        )
-    });
-    assert!(
-        after_the_other.starts_with(|c: char| c.is_ascii_digit())
-            && after_the_other.contains("print-only"),
-        "'The other N' in {} is not followed by a number and 'print-only' as expected: {:?}",
-        skill_md_path().display(),
-        after_the_other.chars().take(60).collect::<String>()
-    );
-    let print_only_count: usize = after_the_other
-        .split_whitespace()
-        .next()
-        .and_then(|n| n.parse().ok())
+    // wrap a single sentence; `number_after_phrase` joins the doc on whitespace
+    // first, so a line-scoped search cannot miss the number.
+    let (print_only_count, rest) = e2e_cucumber::number_after_phrase(&skill_md, "The other ")
         .unwrap_or_else(|| {
-            panic!("could not parse the print-only count out of {after_the_other:?}")
+            panic!(
+                "no 'The other N ... print-only' phrase with a number found in {}",
+                skill_md_path().display()
+            )
         });
+    assert!(
+        rest.contains("print-only"),
+        "'The other {print_only_count}' in {} is not followed by 'print-only' as expected: {:?}",
+        skill_md_path().display(),
+        rest.chars().take(60).collect::<String>()
+    );
+    let print_only_count = usize::try_from(print_only_count).expect("print-only count fits usize");
     assert_eq!(
         print_only_count,
         total - not_print_only,

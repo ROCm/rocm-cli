@@ -904,6 +904,8 @@ fn extract_tar_gz(archive: &Path, destination: &Path) -> Result<()> {
 
 /// Extracts a zip archive in-process.
 fn extract_zip(archive: &Path, destination: &Path) -> Result<()> {
+    const S_IFMT: u32 = 0o170_000;
+    const S_IFLNK: u32 = 0o120_000;
     let file =
         fs::File::open(archive).with_context(|| format!("failed to open {}", archive.display()))?;
     let mut zip = zip::ZipArchive::new(std::io::BufReader::new(file))
@@ -915,9 +917,14 @@ fn extract_zip(archive: &Path, destination: &Path) -> Result<()> {
         // `enclosed_name` returns None for absolute or `..`-bearing names; the
         // raw name is still used for diagnostics and for the trailing-slash
         // directory convention.
-        let raw = entry.name().to_owned();
-        // See the link policy on `extract_archive`.
-        if entry.is_symlink() {
+        let raw = entry
+            .name()
+            .with_context(|| format!("failed to decode the name of entry {index}"))?
+            .into_owned();
+        // See the link policy on `extract_archive`. `zip` 9 ignores the high
+        // attribute bits of an entry written by a DOS host, so `is_symlink`
+        // misses a link recorded there; check the bits directly.
+        if entry.is_symlink() || (entry.external_attributes() >> 16) & S_IFMT == S_IFLNK {
             bail!("archive contains symlink at {raw}");
         }
         let name = entry
@@ -2497,7 +2504,7 @@ mod tests {
         // If the zip writer refused to emit the traversal name there is nothing
         // hostile to assert on; the tar cases cover the shared validator.
         let mut zip = zip::ZipArchive::new(fs::File::open(&archive).unwrap()).unwrap();
-        let hostile = zip.by_index(0).unwrap().name().to_owned();
+        let hostile = zip.by_index(0).unwrap().name().unwrap().into_owned();
         if hostile == "../escaped.txt" {
             let error = format!("{:#}", extract_archive(&archive, &destination).unwrap_err());
             assert!(error.contains("escapes the extraction root"), "{error}");
@@ -2555,7 +2562,7 @@ mod tests {
     }
 
     /// Zip counterpart to `extract_archive_rejects_symlink_entry`: the zip path
-    /// has its own link check, keyed on the entry's unix mode.
+    /// has its own link check, keyed on the entry's mode and attribute bits.
     #[test]
     fn extract_archive_rejects_zip_symlink_entry() {
         let dir = scratch_dir("zip-symlink");
@@ -2576,6 +2583,34 @@ mod tests {
 
         let error = format!("{:#}", extract_archive(&archive, &destination).unwrap_err());
         assert!(error.contains("symlink"), "{error}");
+        assert!(!destination.join("escape-link").exists());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `zip` 9 ignores the high attribute bits of an entry written by a DOS
+    /// host, so an archive can mark a link there while `is_symlink` reports
+    /// false. The extractor must still refuse it.
+    #[test]
+    fn extract_archive_rejects_zip_symlink_entry_from_dos_host() {
+        let dir = scratch_dir("zip-symlink-dos");
+        let archive = dir.join("hostile.zip");
+        let destination = dir.join("extract");
+        fs::create_dir_all(&destination).unwrap();
+
+        let file = fs::File::create(&archive).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .system(zip::System::Dos)
+            .external_attributes(0o120_777 << 16);
+        writer.start_file("escape-link", options).unwrap();
+        std::io::Write::write_all(&mut writer, b"/etc/passwd").unwrap();
+        writer.finish().unwrap();
+
+        let error = format!("{:#}", extract_archive(&archive, &destination).unwrap_err());
+        assert!(
+            error.contains("archive contains symlink at escape-link"),
+            "{error}"
+        );
         assert!(!destination.join("escape-link").exists());
         fs::remove_dir_all(&dir).ok();
     }
@@ -2704,7 +2739,7 @@ mod archive_properties {
             let (mut has_traversal, mut has_symlink) = (false, false);
             for index in 0..stored.len() {
                 let entry = stored.by_index_raw(index).unwrap();
-                let name = entry.name();
+                let name = entry.name().unwrap();
                 has_traversal |=
                     name.starts_with('/') || name.split(['/', '\\']).any(|part| part == "..");
                 has_symlink |= entry.is_symlink();
