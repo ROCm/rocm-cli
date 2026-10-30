@@ -934,6 +934,23 @@ cargo test -p rocm --bin rocm serve_engine_selection
 These tests verify that explicit/configured engines still win and shared model
 recipes only choose a preferred engine when no user/default engine is set.
 
+Interactive `rocm serve` (a terminal, without `--verbose` or `--foreground`)
+keeps a status line through download, load, and health until the server can
+serve or that wait fails. A download that is still moving is not cut off at
+45 seconds, and a failure names `rocm logs --service <service-id>` and
+`rocm services stop <service-id> --yes` instead of printing
+`Deployment summary (not ready yet)`. Piped output keeps the 45-second status
+budget. The status line is a TTY spinner, and the harness does not allocate a
+PTY, so this is not a default-lane Gherkin scenario (a live engine would also
+be `@requires-gpu`). `decide_serve_startup` and `wait_for_serve_startup` in
+[serve_progress.rs](../apps/rocm/src/serve_progress.rs) are the state matrix,
+covered by:
+
+```bash
+cargo test -p rocm --bin rocm serve_progress
+cargo test -p rocmd recovery_leaves_a_live_startup_alone
+```
+
 Public-endpoint authentication focused tests:
 
 ```bash
