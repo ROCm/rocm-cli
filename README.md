@@ -120,10 +120,12 @@ rocm version
 ```
 
 The output shows the ROCm CLI version with its release tag or branch and commit
-hash, the ROCm SDK that ROCm CLI would use on this computer, and the GPU driver
-version. A successful install prints the CLI version line. The SDK and driver
-lines read `not detected` when none is found, which is expected on a computer
-where you haven't installed ROCm or a driver yet.
+hash (a release build leads with its release version, such as
+`0.2.1 (v0.2.1, 1cde824)`; a build from `main` leads with `0.0.0-dev`), the ROCm
+SDK that ROCm CLI would use on this computer, and the GPU driver version. A
+successful install prints the CLI version line. The SDK and driver lines read
+`not detected` when none is found, which is expected on a computer where you
+haven't installed ROCm or a driver yet.
 
 If the shell reports `rocm: command not found`, confirm that the install
 directory is on your `PATH`. That is `~/.local/bin` on Linux,
@@ -292,7 +294,7 @@ form works depends on the engine your GPU selects.
 | `rocm dash` | Open the full-screen telemetry dashboard |
 | `rocm bench load --endpoint <url>` | Load-test a local OpenAI-compatible endpoint |
 | `rocm setup status` | Show first-time setup state |
-| `rocm version` | Print the ROCm CLI version, release tag or branch, and commit hash, plus the ROCm SDK and GPU driver in use |
+| `rocm version` | Print the ROCm CLI version, release tag or branch, and commit hash (a release `vX.Y.Z` reports `X.Y.Z`; a branch, including `main`, reports `0.0.0-dev`), plus the ROCm SDK and GPU driver in use |
 | `rocm completions <shell>` | Print a shell completion script (bash, zsh, fish, elvish, powershell) |
 
 ## Commands
@@ -392,6 +394,8 @@ The ROCm release and the inference engine's release are each cut
 back to a release, so a build number that would narrow toward one machine
 never appears there; the CLI's own version is the exception, since it names
 the tool that wrote the report instead of something read off the machine.
+That value is the same string `rocm version` prints (`X.Y.Z (vX.Y.Z, <hash>)`
+for a release tag, `0.0.0-dev (<ref>, <hash>)` for any other resolved ref).
 The distribution is checked against a list of known names instead of
 being repeated from the machine.
 

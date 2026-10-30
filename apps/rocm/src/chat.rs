@@ -6115,7 +6115,15 @@ model recipes
                 .and_then(serde_json::Value::as_str),
             Some("rocm")
         );
-        assert!(mcp_tool_result_text(&result).contains(env!("CARGO_PKG_VERSION")));
+        // The MCP summary prefixes the command output. The version line is
+        // the same string `rocm version` prints. Its tag / `main` / unknown
+        // shapes are `format_cli_version_reports_a_release_tag_without_its_leading_v`,
+        // `format_cli_version_reports_main_as_a_dev_build`, and
+        // `format_cli_version_falls_back_to_the_package_version_only_when_the_ref_is_unknown`
+        // in `build.rs` (run via `tests/build_metadata.rs`).
+        let text = mcp_tool_result_text(&result);
+        let version_line = format!("rocm-cli {}", cli_version_string());
+        assert!(text.lines().any(|line| line == version_line), "{text}");
     }
 
     #[test]
