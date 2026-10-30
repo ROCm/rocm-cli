@@ -862,12 +862,18 @@ different settings. If you previously started a service with `--temperature`
 flags, or with different ones, stop the existing service first (`rocm
 services stop <service-id> --yes`) or match the original flags.
 
-By default the server runs in the background under ROCm CLI's supervision and
-prints a deployment summary: a progress indicator while it starts, then a table
-with the status, the full inference endpoint, the API-qualified model name, and a
-quick smoke test (time to first token and approximate tokens per second). Control
-returns to your shell with the server still running; manage it later with `rocm
-services` (below).
+By default the server runs in the background under ROCm CLI's supervision.
+While it starts, the status line follows the engine: a download, a weight
+load, or the latest log line, until the server is ready or that wait fails
+(the engine exits, a download stops advancing, or the startup deadline
+passes). When the server is ready it prints a deployment summary: a table
+with the status, the full inference endpoint, the API-qualified model name,
+and a quick smoke test (time to first token and approximate tokens per
+second). A model that is still loading is not reported as a finished "not
+ready" summary. If the wait fails and the server is still running, the
+message names `rocm logs --service <service-id>` and
+`rocm services stop <service-id> --yes`. Control returns to your shell with
+the server still running; manage it later with `rocm services` (below).
 
 `--verbose` (or `--foreground`) instead attaches to the server in the current
 terminal and streams every engine log line. Use it to debug a startup problem.

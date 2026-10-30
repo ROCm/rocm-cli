@@ -51,6 +51,7 @@ use crate::gpu_policy::{
     detect_gpu_count, gpu_vram_usage, parse_device_policy, parse_gpu_selection,
     select_gpu_indices_under_launch_lock, serve_gpu_low_memory_warning, validate_pinned_gpu_index,
 };
+use crate::serve_progress::{self, ServeStartupView};
 use crate::serve_summary;
 use crate::service_launch::{
     drop_orphaned_endpoint_key_on_already_running, ensure_background_helper_running_quiet,
@@ -927,9 +928,19 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     }
 
     if background {
-        let mut spinner =
-            cli_progress::Spinner::new(format!("Starting {model} on {selected_engine}…"));
+        let mut shown = serve_progress::starting_label(&model, &selected_engine);
+        let mut spinner = cli_progress::Spinner::new(shown.clone());
         spinner.tick();
+        // Interactive summary follows download / load / health until ready or
+        // a bounded failure. Piped output keeps the historical 45-second
+        // status budget so a serve that never answers does not block CI.
+        let policy = if summary_mode {
+            serve_progress::ServeStartupPolicy::interactive()
+        } else {
+            serve_progress::ServeStartupPolicy::status_budget(
+                serve_progress::PIPED_SERVE_STATUS_BUDGET,
+            )
+        };
         let report = start_managed_service(
             &selected_engine,
             &service_id,
@@ -945,8 +956,29 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
             endpoint_auth.as_deref(),
             launch_lock,
             require_api_key,
-            &mut |_elapsed| spinner.tick(),
-        )?;
+            &policy,
+            &mut |view: &ServeStartupView| {
+                if view.label == shown {
+                    spinner.tick();
+                } else {
+                    shown.clone_from(&view.label);
+                    spinner.set_label(view.label.clone());
+                }
+            },
+        );
+        let report = match report {
+            Ok(report) => report,
+            Err(error) => {
+                spinner.clear();
+                // The process is already recorded. Start supervision before
+                // returning the startup failure so a server that is still
+                // running is not left with no daemon.
+                if let Err(helper) = ensure_background_helper_running_quiet(summary_mode) {
+                    return Err(error.context(helper));
+                }
+                return Err(error);
+            }
+        };
         ensure_background_helper_running_quiet(summary_mode)?;
 
         // An equivalent service was already running, so nothing was spawned and the

@@ -5,7 +5,8 @@
 //! Engine-agnostic deployment summary for `rocm serve`.
 //!
 //! By default `rocm serve <model>` no longer streams raw engine logs. Instead it
-//! shows an animated status indicator while the server starts, runs a small
+//! shows a status line that follows the engine (a download, a load, or the
+//! latest log line) while the server starts, runs a small
 //! inference smoke test, and then prints a compact summary table: deployment
 //! status, the full inference endpoint (with port), the API-qualified model name,
 //! and the measured time-to-first-token / throughput.
@@ -93,10 +94,11 @@ pub(crate) fn format_tps(tps: Option<f64>) -> String {
 /// Render the deployment summary table as plain text (returned rather than
 /// printed so it is unit-testable and identical across engines).
 pub(crate) fn render_summary(summary: &DeploymentSummary) -> String {
-    // The server answered its health check within the startup window. A launch
-    // that timed out lands here with `status == "starting"`; the heading and a
-    // note must make that visibly different from a healthy deployment so the
-    // summary is never mistaken for success.
+    // A ready server answered an inference request. Any other status on a fresh
+    // launch gets a distinct heading so it cannot be read as success.
+    // Interactive `rocm serve` does not render this heading for a startup that
+    // is still loading: that wait ends in `ServeStartupStop::user_message`
+    // (`listing_at_the_deadline_stops_without_a_not_ready_summary`).
     let ready = summary.status == "ready";
     let heading = if summary.already_running {
         "Deployment summary (already running)"
@@ -138,7 +140,7 @@ pub(crate) fn render_summary(summary: &DeploymentSummary) -> String {
             ),
             (
                 "logs",
-                format!("rocm logs --service {}", summary.service_id),
+                crate::service_hints::service_logs_hint(&summary.service_id),
             ),
         ],
     ]

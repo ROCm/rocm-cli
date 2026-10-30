@@ -49,13 +49,12 @@ use crate::endpoint_keys;
 use crate::engine_ipc::builtin_engine_serve_http_args;
 #[cfg(not(windows))]
 use crate::engine_runtime_select::apply_app_path_env;
+use crate::engine_runtime_select::managed_service_launcher_path;
 #[cfg(windows)]
 use crate::engine_runtime_select::{app_path_env_var_refs, app_path_env_var_values};
-use crate::engine_runtime_select::{
-    managed_service_launcher_path, wait_for_service_http_ready_with_progress,
-};
 use crate::engines_cmd::env_root_for_service;
 use crate::managed_service_status::existing_live_managed_service;
+use crate::serve_progress::{self, ServeStartupPolicy, ServeStartupView};
 use crate::service_hints;
 #[cfg(not(windows))]
 use crate::services_text::read_optional_tail_lines;
@@ -556,7 +555,8 @@ pub(crate) fn start_managed_service(
     endpoint_api_key: Option<&str>,
     launch_lock: rocm_core::FileLock,
     require_api_key: bool,
-    on_wait_tick: &mut dyn FnMut(Duration),
+    policy: &ServeStartupPolicy,
+    on_view: &mut dyn FnMut(&ServeStartupView),
 ) -> Result<ManagedLaunchReport> {
     let paths = AppPaths::discover()?;
     let (mut record, child_pid) = match spawn_managed_engine_child(
@@ -586,22 +586,40 @@ pub(crate) fn start_managed_service(
     #[cfg(windows)]
     thread::sleep(Duration::from_millis(200));
 
-    let readiness = wait_for_service_http_ready_with_progress(
-        engine,
-        host,
-        port,
-        &|| {
+    let waited = {
+        let mut observe = || {
             let mut latest = record.clone();
             let _ = latest.refresh_from_engine_state();
-            latest.served_model_name().to_owned()
-        },
-        endpoint_api_key,
-        Duration::from_secs(45),
-        on_wait_tick,
-    );
-    let launch_status = status_for_readiness(readiness);
+            let model_name = latest.served_model_name().to_owned();
+            let signals = serve_progress::ServeStartupSignals {
+                engine_failed: latest.status == "failed",
+                process_alive: process_is_running(latest.supervisor_pid)
+                    || latest.engine_pid.is_some_and(process_is_running),
+                log_line: serve_progress::latest_meaningful_log_line(&latest.log_path),
+            };
+            (model_name, signals)
+        };
+        serve_progress::wait_for_serve_startup(
+            engine,
+            requested_model,
+            host,
+            port,
+            endpoint_api_key,
+            policy,
+            &mut observe,
+            on_view,
+        )
+    };
+    let (readiness, startup_stop) = match waited {
+        Ok(readiness) => (readiness, None),
+        Err(stop) => (stop.readiness, Some(stop)),
+    };
+    let launch_status = match &startup_stop {
+        Some(stop) => serve_progress::recorded_status_after_stop(stop),
+        None => status_for_readiness(readiness),
+    };
     record.status = launch_status.to_owned();
-    if readiness == EndpointReadiness::Serving {
+    if readiness == EndpointReadiness::Serving && startup_stop.is_none() {
         // Latch the verification the wait just performed, so the readiness checks
         // behind `services list` and chat read it instead of re-probing.
         record.inference_verified_at_unix_ms = Some(rocm_core::unix_time_millis() as u64);
@@ -619,6 +637,9 @@ pub(crate) fn start_managed_service(
         ),
         Some(service_id),
     );
+    if let Some(stop) = startup_stop {
+        bail!("{}", stop.user_message(requested_model, engine, service_id));
+    }
     Ok(ManagedLaunchReport {
         service_id: service_id.to_owned(),
         endpoint_url,
