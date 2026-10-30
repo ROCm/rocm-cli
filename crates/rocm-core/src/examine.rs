@@ -1737,10 +1737,18 @@ fn apply_kernel_gpu_membership(e: &mut Examination, nodes: &[crate::KfdGpuNode])
                 gfx_target: node.gfx_target.clone(),
                 pci_id: node.pci_id.clone(),
                 is_amd: true,
-                // Left unset rather than guessed, for the same reason
-                // `probe_gpus_sysfs_fallback` leaves it unset: KFD gives the
-                // target, not the packaging.
-                is_apu: None,
+                // The target is enough to answer the family question, and every
+                // gfx115x part is an APU. Packaging (which SKU, which VRAM
+                // carve-out) still needs a name; `has_apu` only needs the
+                // family, so leaving this unset hid kernel-visible APUs on
+                // hosts without `lspci`.
+                //
+                // An empty target is unknown, not discrete. KFD leaves it empty
+                // when its `gfx_target_version` does not decode, and answering
+                // `Some(false)` there would stamp a confident "discrete" verdict
+                // from a failed lookup -- the same mistake this change fixes for
+                // the PCI name, one layer down.
+                is_apu: (!node.gfx_target.is_empty()).then(|| gfx_is_apu_family(&node.gfx_target)),
             });
             continue;
         };
@@ -1753,6 +1761,18 @@ fn apply_kernel_gpu_membership(e: &mut Examination, nodes: &[crate::KfdGpuNode])
         // there is nothing to compare it against.
         if gpu.gfx_target.is_empty() {
             gpu.gfx_target = node.gfx_target.clone();
+            // `lspci` did not resolve a target from the name, so the `is_apu`
+            // carried over from the PCI scan was a failed name lookup, not a
+            // verdict about the part. KFD's target is the first real evidence,
+            // and `gfx_is_apu_family` answers for the family -- on gfx1151 the
+            // old path reported an APU with `has_apu: false`.
+            //
+            // Only when the node actually names one: an empty target is unknown,
+            // and a verdict the name already resolved (`Some(true)`) is never
+            // downgraded by it.
+            if gpu.is_apu != Some(true) && !gpu.gfx_target.is_empty() {
+                gpu.is_apu = Some(gfx_is_apu_family(&gpu.gfx_target));
+            }
         }
         gpus.push(gpu);
     }
@@ -5398,6 +5418,143 @@ mod tests {
     }
 
     #[test]
+    fn a_kernel_target_classifies_an_unnamed_apu() {
+        // Strix Halo: `pci.ids` does not know 1002:1586, so lspci prints
+        // "... [AMD/ATI] Device", `classify_amd_marketing_name` resolves no
+        // target, and the PCI scan stamped `is_apu: false` from that failed
+        // lookup. KFD still names the part. Before this, `examine` reported
+        // `gfx_target: gfx1151` next to `has_apu: false`.
+        let mut e = Examination {
+            gpus: vec![Gpu {
+                name: "Advanced Micro Devices, Inc. [AMD/ATI] Device".to_owned(),
+                gfx_target: String::new(),
+                pci_id: "0000:c5:00.0".to_owned(),
+                is_amd: true,
+                is_apu: Some(false),
+            }],
+            ..Examination::default()
+        };
+        apply_kernel_gpu_membership(
+            &mut e,
+            &[crate::KfdGpuNode {
+                pci_id: "0000:c5:00.0".to_owned(),
+                gfx_target: "gfx1151".to_owned(),
+            }],
+        );
+
+        assert_eq!(e.gpus[0].gfx_target, "gfx1151");
+        assert_eq!(
+            e.gpus[0].is_apu,
+            Some(true),
+            "the kernel target is the first real evidence when the name resolved none"
+        );
+    }
+
+    #[test]
+    fn a_kernel_only_apu_node_is_classified_from_its_target() {
+        // The same host without `lspci`: the membership pass is the only probe
+        // that sees the GPU, so it must not leave the verdict unset.
+        let mut e = Examination::default();
+        apply_kernel_gpu_membership(
+            &mut e,
+            &[crate::KfdGpuNode {
+                pci_id: "0000:c5:00.0".to_owned(),
+                gfx_target: "gfx1151".to_owned(),
+            }],
+        );
+
+        assert_eq!(e.gpus.len(), 1);
+        assert_eq!(e.gpus[0].is_apu, Some(true));
+        // ... while a discrete target still lands on the other side.
+        let mut d = Examination::default();
+        apply_kernel_gpu_membership(
+            &mut d,
+            &[crate::KfdGpuNode {
+                pci_id: "0000:03:00.0".to_owned(),
+                gfx_target: "gfx1100".to_owned(),
+            }],
+        );
+        assert_eq!(d.gpus[0].is_apu, Some(false));
+    }
+
+    #[test]
+    fn an_unparseable_kernel_target_leaves_the_family_unknown() {
+        // KFD leaves `gfx_target` empty when its `gfx_target_version` does not
+        // decode, and `gfx_is_apu_family("")` answers `false`. Reading that as a
+        // verdict would call an unidentifiable APU a discrete card on exactly the
+        // host shape `examine` exists for: no `lspci`, no ROCm installed.
+        let mut e = Examination::default();
+        apply_kernel_gpu_membership(
+            &mut e,
+            &[crate::KfdGpuNode {
+                pci_id: "0000:c5:00.0".to_owned(),
+                gfx_target: String::new(),
+            }],
+        );
+
+        assert_eq!(
+            e.gpus.len(),
+            1,
+            "the card is usable and must still be listed"
+        );
+        assert_eq!(
+            e.gpus[0].is_apu, None,
+            "an undecoded target is unknown, not a discrete verdict"
+        );
+        summarise_gpu_categories(&mut e);
+        assert!(!e.has_apu);
+        assert!(
+            !e.has_discrete_amd,
+            "nothing established that this is a discrete card: {:#?}",
+            e.gpus
+        );
+    }
+
+    #[test]
+    fn a_resolved_apu_verdict_is_not_downgraded_by_a_kernel_target() {
+        // The name already answered the family question (`Some(true)`), and the
+        // node's target is outside the APU list. `lspci` naming an APU is a
+        // statement about the part, so the membership pass must not turn it into
+        // "discrete" -- it only fills the target in.
+        //
+        // This is a guard-regression test, not a feature-presence one: with the
+        // whole reclassification removed, `is_apu` stays `Some(true)` here too,
+        // because the pre-change code never touched it in this branch. It fails
+        // only when the guard itself is weakened (e.g. to `if true`). Revert
+        // coverage for the fix is carried by
+        // `a_kernel_target_classifies_an_unnamed_apu` above.
+        let mut e = Examination {
+            gpus: vec![Gpu {
+                name: "Strix Halo [Radeon Graphics / Radeon 8050S Graphics / Radeon 8060S \
+                       Graphics]"
+                    .to_owned(),
+                gfx_target: String::new(),
+                pci_id: "0000:c5:00.0".to_owned(),
+                is_amd: true,
+                is_apu: Some(true),
+            }],
+            ..Examination::default()
+        };
+        apply_kernel_gpu_membership(
+            &mut e,
+            &[crate::KfdGpuNode {
+                pci_id: "0000:c5:00.0".to_owned(),
+                gfx_target: "gfx1200".to_owned(),
+            }],
+        );
+
+        assert_eq!(
+            e.gpus[0].gfx_target, "gfx1200",
+            "the empty field is still filled in"
+        );
+        assert_eq!(
+            e.gpus[0].is_apu,
+            Some(true),
+            "a resolved APU verdict is never downgraded by the kernel target"
+        );
+    }
+
+    #[test]
     fn each_kernel_node_labels_its_own_card_and_leaves_other_vendors_alone() {
         // An APU + a discrete card. Reading the target per node is what makes
         // this safe: a single host-wide answer would stamp the APU's gfx1103
@@ -6146,6 +6303,11 @@ mod tests {
             // RDNA3 / RDNA3.5 iGPUs: Phoenix and Strix.
             ("PCI\\VEN_1002&DEV_15BF&SUBSYS_55555555", "gfx1103", true),
             ("PCI\\VEN_1002&DEV_1114&SUBSYS_66666666", "gfx1152", true),
+            // Strix Halo. Upstream `pci.ids` names it "Strix Halo [Radeon
+            // Graphics / Radeon 8050S Graphics / Radeon 8060S Graphics]"; older
+            // packaged copies predate that entry, which is why the id table has
+            // to know the target on its own.
+            ("PCI\\VEN_1002&DEV_1586&SUBSYS_00001028", "gfx1151", true),
             // Discrete cards through the same door, so a blanket `true` fails
             // here too: Navi 21 / 22 / 23 / 24 and Navi 48.
             ("PCI\\VEN_1002&DEV_73A0&SUBSYS_77777777", "gfx1030", false),
