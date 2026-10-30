@@ -862,6 +862,42 @@ anything is removed:
 cargo xtask e2e -- -n "uninstall-"
 ```
 
+## Removing Old Installs
+
+`rocm storage remove-old-installs` picks which install folders to delete from a
+set the user never listed, so its retention policy has property tests as well as
+examples:
+
+```bash
+cargo test -p rocm --bin rocm storage::properties
+cargo test -p rocm --bin rocm storage::tests::applying_a_whole_plan_never_removes_the_install_in_use
+cargo test -p rocm --bin rocm version_proptests
+```
+
+`storage::properties` runs each property at 2048 cases. All but one check the
+pure policy: that the install in use, the rollback target, anything the
+active-runtime marker names, and anything ROCm CLI does not own are never
+selected, even at `--keep 0`; that each group keeps exactly its `--keep` most
+recent installs that nothing else holds and removes the rest, so raising
+`--keep` never removes more; that every install is either kept or removed, once;
+and that each kept install is reported with the first reason that applies. The
+remaining one passes each selected key through the real runtime resolver and
+checks that it resolves back to that same install, not to a case twin of it. The
+tests work out the expected groups and holds themselves, from the `--keep` help
+and the matching rules the policy implements, rather than by calling the
+policy's helpers. Keys, channels, formats and families come from small alphabets, some of
+them weighted, so keys differing only in letter case, shared runtime ids, tied
+install times and retention groups with more candidates than `--keep` are
+generated; `generator_reach_report`, a fixed 20,000-sample measurement rather
+than a property, prints how often (run it with `-- --nocapture`) and fails if
+the generator stops reaching them.
+
+`applying_a_whole_plan_never_removes_the_install_in_use` runs 256 cases through
+real registry files, install folders and the real removal call. The
+`version_proptests` command runs that whole module; among its version-ordering
+properties are the retention ones for order independence and recency over
+version.
+
 ## Provider-Assisted Planning
 
 The deterministic planner remains the default. Optional LLM/provider ambiguity

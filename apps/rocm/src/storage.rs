@@ -1012,6 +1012,9 @@ pub(crate) fn storage(command: Option<StorageCommand>) -> Result<()> {
 }
 
 #[cfg(test)]
+mod properties;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1832,6 +1835,90 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
         Ok(())
     }
+
+    /// What survived one generated prune: the key of the install that was in
+    /// use, and whether its folder is still there.
+    struct AppliedPlan {
+        in_use_key: String,
+        folder_survives: bool,
+    }
+
+    fn apply_generated_plan(
+        families: &[&str],
+        active_index: usize,
+        keep: usize,
+    ) -> Result<AppliedPlan> {
+        let (root, paths) = test_paths("apply-plan-property");
+        let mut installed = Vec::new();
+        for (index, family) in families.iter().enumerate() {
+            let record = manifest(
+                &format!("release-wheel-{family}-7-{index}-0"),
+                family,
+                &format!("7.{index}.0"),
+                index as u128,
+            );
+            installed.push(install_fixture(&paths, record, 512)?);
+        }
+        let active = &installed[active_index % installed.len()];
+        let mut config = RocmCliConfig {
+            active_runtime_key: Some(active.runtime_key.clone()),
+            // What `activate_runtime` writes alongside it on a real machine.
+            default_runtime_id: Some(active.runtime_id.clone()),
+            ..RocmCliConfig::default()
+        };
+
+        let plan = build_prune_plan(&paths, &config, keep)?;
+        for entry in &plan.remove {
+            crate::runtimes_cmd::uninstall_runtime(&paths, &mut config, &entry.runtime_key)?;
+        }
+
+        let applied = AppliedPlan {
+            in_use_key: active.runtime_key.clone(),
+            folder_survives: active.install_root.is_dir(),
+        };
+        let _ = std::fs::remove_dir_all(root);
+        Ok(applied)
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig {
+            // Each case writes and deletes a tree, so this matches the other
+            // filesystem-backed property suites rather than the pure-policy
+            // budget.
+            cases: 256,
+            ..proptest::prelude::ProptestConfig::default()
+        })]
+
+        /// The same safety invariant as the pure-policy properties, but
+        /// driven through real registry files, real install folders and the
+        /// real removal call — so it also fails if that removal deletes the
+        /// install in use when the plan did not name it. Every install here is
+        /// owned and every key is distinct, so neither the on-disk ownership
+        /// guards nor case-twin key lookups are what it tests.
+        ///
+        /// Keys are lowercase here, as every key ROCm CLI generates is; two
+        /// keys differing only in case are covered by
+        /// `prune_removes_the_install_it_named_and_not_a_case_twin_of_it`.
+        #[test]
+        fn applying_a_whole_plan_never_removes_the_install_in_use(
+            families in proptest::collection::vec(
+                proptest::sample::select(&["gfx110x-all", "gfx120x-all"][..]), 1..5),
+            active_index in 0_usize..5,
+            keep in 0_usize..3,
+        ) {
+            let applied = apply_generated_plan(&families, active_index, keep)
+                .map_err(|error| {
+                    proptest::test_runner::TestCaseError::fail(error.to_string())
+                })?;
+
+            proptest::prop_assert!(
+                applied.folder_survives,
+                "the runtime in use ({}) was removed with --keep {keep}",
+                applied.in_use_key,
+            );
+        }
+    }
+
     /// `--yes` is required when there is nobody to answer the prompt. This is
     /// the gate standing between a scripted invocation and a multi-gigabyte
     /// deletion, so it is worth a test of its own.
