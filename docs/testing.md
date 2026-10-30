@@ -1650,6 +1650,23 @@ The harness applies the matching OS requirement itself; do not select these
 with cucumber's `--tags`/`-n` flags, because those bypass the suite's custom
 expectation and applicability resolver.
 
+Fish profile setup in `install.sh` is covered on its own by
+[`tests/install-sh/run.sh`](../tests/install-sh/run.sh). That script signs a
+local bundle, points the installer at a temporary home, and checks that a
+bash, zsh, or ksh login shell still updates its own profile and, when `fish`
+is on `PATH` or `~/.config/fish` exists, also writes the fish `PATH` block,
+fish completions, and the uninstall record. A bash home with no fish
+install keeps no fish config. It needs no network or GPU. The Linux
+`build-and-test` job runs it:
+
+```bash
+sh tests/install-sh/run.sh
+```
+
+The same path with the packaged binary, including `rocm uninstall` putting the
+fish config back, is `@id:lifecycle-linux-fish-configured-from-bash` in the
+lifecycle set above.
+
 The required `windows-build-and-test` lane additionally folds in the hermetic
 `comfyui-01`/`comfyui-02`/`comfyui-03` scenarios (not themselves `@lifecycle`)
 via `E2E_ALSO_RUN_IDS`, a comma-separated list of `@id`s:

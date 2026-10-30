@@ -60,6 +60,12 @@ pub struct LifecycleState {
     /// A shell profile the installer is pointed at through
     /// `ROCM_CLI_SHELL_PROFILE`; `None` means the default `~/.bashrc`.
     custom_profile: Option<PathBuf>,
+    /// The login shell (`$SHELL`) the installer is run under; `None` leaves the
+    /// runner's own.
+    login_shell: Option<String>,
+    /// The fish config seeded before install, which uninstall must restore
+    /// exactly.
+    fish_config_before_install: Option<String>,
 }
 
 /// The Windows user `Path` exactly as the registry holds it: its value with
@@ -534,6 +540,8 @@ async fn given_release_tree(world: &mut E2eWorld) {
         smoke_cache: None,
         profile_before_install: None,
         custom_profile: None,
+        login_shell: None,
+        fish_config_before_install: None,
     });
 }
 
@@ -588,6 +596,37 @@ async fn given_profile_user_settings(world: &mut E2eWorld) {
     let contents = "# the user's own settings\nexport ROCM_E2E_USER_SETTING=1\n".to_owned();
     std::fs::write(&profile, &contents).expect("failed to seed the shell profile");
     state_mut(world).profile_before_install = Some(contents);
+}
+
+/// The fish config the installer writes its PATH block to in this scenario.
+fn fish_config(st: &LifecycleState) -> PathBuf {
+    st.home_dir.join(".config").join("fish").join("config.fish")
+}
+
+/// The completion file the installer writes for fish in this scenario.
+fn fish_completions(st: &LifecycleState) -> PathBuf {
+    st.home_dir
+        .join(".config")
+        .join("fish")
+        .join("completions")
+        .join("rocm.fish")
+}
+
+#[given("fish is set up with its own settings")]
+async fn given_fish_configured(world: &mut E2eWorld) {
+    // A config directory is enough for the installer to treat fish as installed,
+    // so the scenario does not depend on the runner having the fish binary.
+    let config = fish_config(state(world));
+    std::fs::create_dir_all(config.parent().expect("fish config has a folder"))
+        .expect("failed to create the fish config folder");
+    let contents = "# the user's own fish settings\nset -gx ROCM_E2E_USER_SETTING 1\n".to_owned();
+    std::fs::write(&config, &contents).expect("failed to seed the fish config");
+    state_mut(world).fish_config_before_install = Some(contents);
+}
+
+#[given("the login shell is bash")]
+async fn given_login_shell_bash(world: &mut E2eWorld) {
+    state_mut(world).login_shell = Some("/bin/bash".to_owned());
 }
 
 #[given("a signed bundle installed updating the user PATH")]
@@ -779,6 +818,9 @@ async fn install_with_key_file_shell_profile(world: &mut E2eWorld) {
         st.public_key.to_string_lossy().into_owned(),
     )];
     let mut shell_on = vec![("ROCM_CLI_UPDATE_SHELL_PATH", "1".to_string())];
+    if let Some(shell) = &st.login_shell {
+        shell_on.push(("SHELL", shell.clone()));
+    }
     if let Some(profile) = &st.custom_profile {
         shell_on.push((
             "ROCM_CLI_SHELL_PROFILE",
@@ -1454,6 +1496,70 @@ async fn then_profile_restored(world: &mut E2eWorld) {
     assert!(
         out.contains("removed the rocm-cli PATH lines from"),
         "uninstall did not report removing the PATH lines:\n{out}"
+    );
+}
+
+#[then("the fish config adds the install directory to PATH once")]
+async fn then_fish_config_has_path(world: &mut E2eWorld) {
+    let st = state(world);
+    let config = fish_config(st);
+    let contents = std::fs::read_to_string(&config).expect("fish config not found");
+    let count = contents.matches("# >>> rocm-cli path >>>").count();
+    assert_eq!(
+        count,
+        1,
+        "expected exactly one rocm-cli PATH marker in {}, found {count}:\n{contents}",
+        config.display()
+    );
+    assert!(
+        contents.contains("set -gx PATH"),
+        "the fish config did not get fish syntax:\n{contents}"
+    );
+    assert!(
+        contents.contains("# the user's own fish settings"),
+        "the installer dropped the user's own fish settings:\n{contents}"
+    );
+    // The bash profile the login shell asked for keeps POSIX syntax, not fish's.
+    let bashrc = std::fs::read_to_string(shell_profile(st)).expect("bash profile not found");
+    assert!(
+        bashrc.contains("export PATH=") && !bashrc.contains("set -gx PATH"),
+        "the bash profile did not keep POSIX syntax:\n{bashrc}"
+    );
+    let out = &st.last_output;
+    assert!(
+        out.contains(&config.display().to_string()),
+        "installer did not report the fish profile:\n{out}"
+    );
+}
+
+#[then("the fish completions for the installed rocm are in place")]
+async fn then_fish_completions_installed(world: &mut E2eWorld) {
+    let st = state(world);
+    let path = fish_completions(st);
+    let contents = std::fs::read_to_string(&path).expect("fish completions not found");
+    assert!(
+        contents.contains("complete -c rocm"),
+        "{} is not a rocm completion script:\n{contents}",
+        path.display()
+    );
+    let out = &st.last_output;
+    assert!(
+        out.contains("fish completions installed:") && out.contains(&path.display().to_string()),
+        "installer did not report the fish completions:\n{out}"
+    );
+}
+
+#[then("the fish config is back to the user's own settings")]
+async fn then_fish_config_restored(world: &mut E2eWorld) {
+    let st = state(world);
+    let before = st
+        .fish_config_before_install
+        .as_deref()
+        .expect("the fish config was not seeded");
+    let contents = std::fs::read_to_string(fish_config(st)).unwrap_or_default();
+    assert_eq!(
+        contents, before,
+        "uninstall did not restore the fish config to its pre-install contents"
     );
 }
 
