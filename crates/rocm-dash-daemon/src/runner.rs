@@ -408,6 +408,10 @@ pub async fn run_loop(
 
     let mut tick_count: u64 = 0;
     let mut last_sysinfo_refresh: u64 = 0;
+    // Static per-GPU power caps (`amd-smi static`), refreshed on the sysinfo
+    // cadence and stamped onto each tick's metrics. `None` until first fetched.
+    let mut power_limits: HashMap<String, f32> = HashMap::new();
+    let mut last_power_limit_refresh: Option<u64> = None;
     // Discovery/scrape warnings are produced on their own (slower) cadences, so
     // holding them only for the tick that produced them makes the header ⚠ badge
     // blink on and off. Keep the last result until that cadence runs again.
@@ -467,7 +471,17 @@ pub async fn run_loop(
         }
 
         let mut warnings = Vec::new();
-        let gpus = if let Some(g) = &gpu {
+        if let Some(g) = &gpu
+            && last_power_limit_refresh
+                .is_none_or(|at| tick_count.saturating_sub(at) >= sysinfo_refresh_ticks)
+        {
+            // A failed fetch keeps the previous caps; retry next interval.
+            if let Ok(limits) = g.power_limits().await {
+                power_limits = limits;
+            }
+            last_power_limit_refresh = Some(tick_count);
+        }
+        let mut gpus = if let Some(g) = &gpu {
             match g.metrics().await {
                 Ok(v) => v,
                 Err(e) => {
@@ -506,6 +520,10 @@ pub async fn run_loop(
             // until the first detection result lands.
             Vec::new()
         };
+
+        for g in &mut gpus {
+            g.power_limit_w = power_limits.get(&g.device_id).copied();
+        }
 
         if gpu.is_some()
             && tick_count.saturating_sub(last_sysinfo_refresh) >= sysinfo_refresh_ticks

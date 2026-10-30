@@ -409,7 +409,7 @@ pub fn gpu_compact_line(
         ),
         Span::styled(
             format!("{:>4.0} W", g.power_w),
-            power_style(g.power_w, theme),
+            power_style(g.power_w, g.power_limit_w, theme),
         ),
     ];
     let base_w: usize = spans.iter().map(|s| s.content.chars().count()).sum();
@@ -689,6 +689,7 @@ mod tests {
             gpu_utilization_pct: util,
             temperature_c: temp,
             power_w: power,
+            power_limit_w: None,
             clock_mhz: Some(1850.0),
         }
     }
@@ -738,7 +739,8 @@ mod tests {
     fn gpu_compact_line_colors_and_truncates() {
         let theme = Theme::default_dark();
         // hot + high power → err color on both temp and power spans
-        let hot = mk_gpu("gpu-2", 95.0, 88.0, 740.0);
+        let mut hot = mk_gpu("gpu-2", 95.0, 88.0, 740.0);
+        hot.power_limit_w = Some(750.0);
         let line = gpu_compact_line(&hot, &theme, 120, true);
         let temp_span = line
             .spans
@@ -748,6 +750,15 @@ mod tests {
         let pow_span = line.spans.iter().find(|s| s.content.contains('W')).unwrap();
         assert_eq!(temp_span.style.fg, Some(theme.err));
         assert_eq!(pow_span.style.fg, Some(theme.err));
+        // same draw but no known power limit → power is not judged (plain fg)
+        hot.power_limit_w = None;
+        let unjudged = gpu_compact_line(&hot, &theme, 120, true);
+        let pow = unjudged
+            .spans
+            .iter()
+            .find(|s| s.content.contains('W'))
+            .unwrap();
+        assert_eq!(pow.style.fg, Some(theme.fg));
         // wide → vram segment included
         assert!(line.spans.iter().any(|s| s.content.contains("GiB")));
         // narrow → vram segment dropped (truncation by omission)

@@ -15,15 +15,13 @@ pub const TEMP_WARN_C: f32 = 60.0;
 /// Temperature critical threshold (°C). At or above → err color.
 pub const TEMP_CRIT_C: f32 = 80.0;
 
-/// Board-power warning threshold (W). At or above → warn color.
+/// Fraction of a GPU's power limit at or above which power is colored warn.
 ///
-/// Fixed semantic thresholds make heatmap/gauge colors mean "near the limit"
-/// rather than "near the largest value seen this session". Tuned for
-/// MI355X-class parts (TDP ~750 W); the demo generator peaks ~740 W at 100%
-/// util. No per-GPU TDP exists in the data model, so these are constants.
-pub const POWER_WARN_W: f32 = 525.0;
-/// Board-power critical threshold (W). At or above → err color. ~TDP-adjacent.
-pub const POWER_CRIT_W: f32 = 700.0;
+/// Thresholds are relative to the device's own cap so the colors mean
+/// "near this part's limit" on any GPU, not "near an MI355X's".
+pub const POWER_WARN_FRAC: f32 = 0.70;
+/// Fraction of the power limit at or above which board power is colored err.
+pub const POWER_CRIT_FRAC: f32 = 0.93;
 
 /// Truncate `s` to at most `n` characters (not bytes).
 pub fn trunc(s: &str, n: usize) -> String {
@@ -46,15 +44,19 @@ pub fn temperature_style(c: f32, theme: &Theme) -> Style {
     Style::default().fg(color)
 }
 
-/// Color a board-power value against the fixed [`POWER_WARN_W`] /
-/// [`POWER_CRIT_W`] thresholds, mirroring [`temperature_style`].
-pub fn power_style(w: f32, theme: &Theme) -> Style {
-    let color = if w >= POWER_CRIT_W {
-        theme.err
-    } else if w >= POWER_WARN_W {
-        theme.warn
-    } else {
-        theme.ok
+/// Color a board-power value against the GPU's own power limit
+/// ([`POWER_WARN_FRAC`] / [`POWER_CRIT_FRAC`] of it), mirroring
+/// [`temperature_style`].
+///
+/// With no known limit (or a non-positive one) there is nothing to compare
+/// against, so the value is drawn in the plain foreground color rather than
+/// judged against another part's TDP.
+pub fn power_style(w: f32, limit_w: Option<f32>, theme: &Theme) -> Style {
+    let color = match limit_w.filter(|l| l.is_finite() && *l > 0.0) {
+        None => theme.fg,
+        Some(limit) if w >= limit * POWER_CRIT_FRAC => theme.err,
+        Some(limit) if w >= limit * POWER_WARN_FRAC => theme.warn,
+        Some(_) => theme.ok,
     };
     Style::default().fg(color)
 }
@@ -182,14 +184,31 @@ mod tests {
     }
 
     #[test]
-    fn power_style_uses_fixed_thresholds() {
+    fn power_style_is_relative_to_the_gpu_limit() {
         let theme = Theme::default_dark();
-        assert_eq!(power_style(720.0, &theme).fg, Some(theme.err));
-        assert_eq!(power_style(600.0, &theme).fg, Some(theme.warn));
-        assert_eq!(power_style(300.0, &theme).fg, Some(theme.ok));
-        // boundaries are inclusive at the threshold
-        assert_eq!(power_style(POWER_CRIT_W, &theme).fg, Some(theme.err));
-        assert_eq!(power_style(POWER_WARN_W, &theme).fg, Some(theme.warn));
+        // Same wattage, different parts: 600 W is critical on a 600 W card but
+        // comfortably fine on a 1000 W one.
+        assert_eq!(power_style(600.0, Some(600.0), &theme).fg, Some(theme.err));
+        assert_eq!(power_style(600.0, Some(1000.0), &theme).fg, Some(theme.ok));
+        assert_eq!(power_style(500.0, Some(600.0), &theme).fg, Some(theme.warn));
+        assert_eq!(power_style(300.0, Some(600.0), &theme).fg, Some(theme.ok));
+        // Boundaries are inclusive.
+        assert_eq!(
+            power_style(1000.0 * POWER_CRIT_FRAC, Some(1000.0), &theme).fg,
+            Some(theme.err)
+        );
+        assert_eq!(
+            power_style(1000.0 * POWER_WARN_FRAC, Some(1000.0), &theme).fg,
+            Some(theme.warn)
+        );
+    }
+
+    #[test]
+    fn power_style_without_a_limit_is_neutral_not_judged() {
+        let theme = Theme::default_dark();
+        for limit in [None, Some(0.0), Some(f32::NAN), Some(-5.0)] {
+            assert_eq!(power_style(720.0, limit, &theme).fg, Some(theme.fg));
+        }
     }
 
     #[test]

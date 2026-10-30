@@ -539,6 +539,8 @@ fn build_gpu(idx: usize, t_s: f64, seed: &mut u64) -> GpuMetrics {
         gpu_utilization_pct: util,
         temperature_c: temp,
         power_w: power,
+        // MI355X-class board power cap.
+        power_limit_w: Some(750.0),
         clock_mhz: Some((jitter(seed) - 0.5).mul_add(80.0, 1850.0)),
     }
 }

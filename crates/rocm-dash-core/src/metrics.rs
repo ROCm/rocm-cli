@@ -42,6 +42,12 @@ pub struct GpuMetrics {
     pub gpu_utilization_pct: f32,
     pub temperature_c: f32,
     pub power_w: f32,
+    /// The board's power cap (W), when the platform reports one. Warning
+    /// thresholds are derived from it; `None` means unknown (never `0`), and
+    /// consumers must not substitute another part's limit. Serde-default so
+    /// older recordings load.
+    #[serde(default)]
+    pub power_limit_w: Option<f32>,
     pub clock_mhz: Option<f32>,
 }
 
