@@ -127,3 +127,16 @@ Feature: Automation watchers
     When the user selects a permissions mode
     Then each rotated generation holds what the previous one held
     And the oldest previous generation is gone
+
+  # The scenarios above enable a watcher by an id the test already knows. This one pins
+  # the complementary contract: the listing is the only place a user learns which
+  # background checks exist, so whatever it shows has to be enough to act on.
+  # Deriving each check's identifier from the listing the way a reader would IS
+  # the contract under test — the identifiers are deliberately not written into
+  # the scenario or the steps, because hard-coding them would pass against a
+  # listing that exposes nothing. No fixtures, no GPU, no network.
+  @id:automations-listed-checks-can-be-enabled
+  Scenario: automations-10 - Every background check that is listed can be turned on
+    Given a machine with no background checks turned on
+    When the user lists the background checks
+    Then every listed check can be turned on from what the listing shows

@@ -17,6 +17,13 @@
 //! audit-log tail, and the size cap on the audit log and compaction of the
 //! proposal history (ROCMAI-729); the watcher/daemon trigger behaviour itself
 //! is covered separately.
+//!
+//! Two slices live here. The enable/disable/mode steps act on a watcher id the
+//! test already knows. The listing steps (scenario 10) assert the complementary
+//! discoverability contract: everything the listing shows a user must also be
+//! able to act on, so they derive each check's identifier FROM the listing rather
+//! than knowing it in advance — hard-coding the real ids would keep passing
+//! against a listing that publishes none of them, which is the defect pinned.
 
 use cucumber::{given, then, when};
 use rocm_core::{
@@ -57,6 +64,112 @@ pub(crate) fn suppress_daemon_spawn(world: &E2eWorld) {
     )
     .expect("failed to write automation runtime state");
 }
+
+/// Slugify a display name: lowercase, words joined by dashes.
+///
+/// This is the guess a user is forced into when the listing exposes no real
+/// identifier — the current-bug fallback, not the contract. It deliberately does
+/// NOT recover the true ids ("Server recovery" → `server-recovery`, not the real
+/// `server-recover`), which is exactly why the listing has to publish them.
+fn slug_of(display_name: &str) -> String {
+    display_name
+        .split_whitespace()
+        .map(str::to_lowercase)
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+/// The identifiers a check block plausibly EXPOSES, most specific first.
+///
+/// The contract is "enable-able from what the listing shows", so the moment the
+/// product publishes an identifier this must pick it up, or a correct fix would
+/// stay xfailed forever (the row would never go stale). These are CANDIDATES, not
+/// a verdict: the step tries each and counts the check reachable if any works, so
+/// a wrong guess here costs nothing and a missing one is the only risk.
+///   - a detail line keyed `id:` / `identifier:` / `slug:`, or any key ending in
+///     ` id` (`command id: server-recover`)
+///   - bracketed on the header — `Server recovery [server-recover]`
+///   - a single parenthesised token beside the label — `Server recovery (server-recover)`
+///
+/// Empty only when the block names no identifier at all, which is today's defect.
+fn exposed_identifiers(block: &[&str]) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut add = |id: &str| {
+        let id = id.trim().trim_matches(|c| c == '"' || c == '`');
+        if !id.is_empty() && !id.contains(char::is_whitespace) && !found.iter().any(|f| f == id) {
+            found.push(id.to_owned());
+        }
+    };
+    for line in block {
+        if let Some((key, rest)) = line.trim().split_once(':') {
+            let key = key.trim().to_ascii_lowercase();
+            if matches!(key.as_str(), "id" | "identifier" | "slug") || key.ends_with(" id") {
+                add(rest);
+            }
+        }
+    }
+    if let Some(header) = block.first().map(|h| h.trim()) {
+        for (open, close) in [('[', ']'), ('(', ')')] {
+            if let (Some(o), Some(c)) = (header.rfind(open), header.rfind(close))
+                && o < c
+            {
+                add(&header[o + 1..c]);
+            }
+        }
+    }
+    found
+}
+
+/// The checks the listing advertises, as `(displayed name, identifier to try)`.
+///
+/// A check is a two-space-indented header line carrying a parenthesised on/off
+/// state — `  Server recovery (off)`. Its own detail lines (`setting:`, `does:`,
+/// and potentially an `id:`) are indented further; the report's other sections
+/// list events rather than checks. Each header plus the deeper-indented lines
+/// under it forms one block, so an identifier the fix exposes on a detail line
+/// is seen. The identifier to invoke is the one the block explicitly exposes,
+/// falling back to the display-name slug only when it exposes none (today's bug).
+fn listed_checks(listing: &str) -> Vec<(String, Vec<String>)> {
+    let lines: Vec<&str> = listing.lines().collect();
+    let is_header = |line: &str| line.starts_with("  ") && !line.starts_with("   ");
+    let mut checks = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        if !is_header(line) {
+            continue;
+        }
+        let Some(name) = line
+            .trim()
+            .strip_suffix("(on)")
+            .or_else(|| line.trim().strip_suffix("(off)"))
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        else {
+            continue;
+        };
+        // The block is this header plus every following more-indented line, up
+        // to the next header or a less-indented line.
+        let mut block = vec![name];
+        for detail in &lines[i + 1..] {
+            if detail.starts_with("    ") {
+                block.push(detail);
+            } else {
+                break;
+            }
+        }
+        // Exposed identifiers first, then the label exactly as listed (a fix may make
+        // `enable` accept it), then its slug — today's fallback.
+        let mut candidates = exposed_identifiers(&block);
+        for fallback in [name.to_owned(), slug_of(name)] {
+            if !candidates.contains(&fallback) {
+                candidates.push(fallback);
+            }
+        }
+        checks.push((name.to_owned(), candidates));
+    }
+    checks
+}
+
+// ── Given ──────────────────────────────────────────────────────────
 
 /// Plant an autostart *claim* — the harness's own (live) pid and a fresh spawn
 /// time — WITHOUT planting the daemon runtime-state. Unlike `suppress_daemon_spawn`
@@ -324,6 +437,17 @@ async fn pending_before_review_history(world: &mut E2eWorld) {
     }
 }
 
+#[given("a machine with no background checks turned on")]
+async fn no_background_checks(world: &mut E2eWorld) {
+    // The scenario's isolated config starts empty, so every check is already off
+    // and nothing needs planting for the precondition itself. What DOES need
+    // planting is the running-daemon marker, for the same reason the sibling
+    // scenarios plant it: `automations enable` would otherwise launch a detached
+    // `rocm daemon` that outlives the scenario and accumulates on a persistent
+    // runner.
+    suppress_daemon_spawn(world);
+}
+
 // ── When ───────────────────────────────────────────────────────────
 
 #[when("the user enables an automation watcher in observe mode")]
@@ -397,6 +521,16 @@ async fn approve_newest_pending(world: &mut E2eWorld) {
 #[when("the user looks up the older pending proposal")]
 async fn show_old_pending(world: &mut E2eWorld) {
     proposal_action(world, OLD_PENDING_PROPOSAL, "show");
+}
+
+#[when("the user lists the background checks")]
+async fn user_lists_checks(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["automations", "list"]);
+    assert_eq!(
+        rc, 0,
+        "listing the background checks failed (rc={rc}):\n{stdout}\n{stderr}"
+    );
+    world.cli_output = Some(stdout);
 }
 
 // ── Then ───────────────────────────────────────────────────────────
@@ -658,6 +792,56 @@ async fn shows_still_pending(world: &mut E2eWorld) {
     assert!(
         out.contains(&format!("Proposal {OLD_PENDING_PROPOSAL} (pending)")),
         "expected the older pending proposal to still be found, got:\n{out}"
+    );
+}
+
+#[then("every listed check can be turned on from what the listing shows")]
+async fn assert_listed_checks_enableable(world: &mut E2eWorld) {
+    let listing = world
+        .cli_output
+        .clone()
+        .expect("the background checks were never listed");
+    let checks = listed_checks(&listing);
+    // Guard the guard: a listing this step failed to parse would otherwise
+    // "prove" the contract by checking nothing at all.
+    assert!(
+        !checks.is_empty(),
+        "no background checks were found in the listing:\n{listing}"
+    );
+
+    let mut unreachable = Vec::new();
+    for (name, candidates) in &checks {
+        let mut last = String::new();
+        let mut reached = false;
+        for candidate in candidates {
+            let (stdout, stderr, rc) =
+                crate::run_rocm(world, &["automations", "enable", candidate]);
+            if rc == 0 {
+                reached = true;
+                break;
+            }
+            last = format!(
+                "tried {candidate:?}: rc={rc} {}",
+                stderr
+                    .trim()
+                    .lines()
+                    .next()
+                    .unwrap_or_else(|| stdout.trim())
+            );
+        }
+        if !reached {
+            unreachable.push(format!(
+                "{name:?} → none of {} candidate(s) worked; last {last}",
+                candidates.len()
+            ));
+        }
+    }
+    assert!(
+        unreachable.is_empty(),
+        "the listing names {} background check(s) that cannot be turned on from what it \
+         shows:\n  {}\nfull listing:\n{listing}",
+        unreachable.len(),
+        unreachable.join("\n  "),
     );
 }
 

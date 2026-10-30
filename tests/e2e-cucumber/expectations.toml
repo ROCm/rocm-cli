@@ -180,3 +180,49 @@ flaky = true
 when = { is_wsl = true, therock_family = "gfx*" }
 bug = "EAI-7998"
 reason = "`examine --json` reports has_amd_gpu:false on a WSL2 host whose own summary names a gfx target."
+
+# -- README-walkthrough defects (EAI-8047, EAI-8049) --
+# Defects found walking the CLI on an MI300X host, each pinned by a
+# scenario asserting the CORRECT behaviour. Both are in code paths with no
+# hardware, engine or network dependency, and both were re-confirmed in a plain
+# Linux container — so each row is scoped `when = {}` and is expected to go stale
+# (XPASS) on every lane the day its bug is fixed. Neither is `flaky`: each
+# reproduced deterministically.
+
+# --- EAI-8047: listed automation checks cannot be turned on from the listing ---
+# `automations list` shows each check by display name only ("Server recovery"),
+# while `automations enable` accepts the internal id ("server-recover") and
+# rejects anything else with rc=1. The names do not mechanically reduce to the
+# ids, so nothing the listing prints is enough to act on. Remove this row once
+# the listing exposes an identifier a user can pass back in.
+#
+# Either direction closes it, and the scenario accepts both: show the id in the
+# listing, or make `enable` accept the label exactly as listed. Note that
+# `render_automations_text`'s unit tests currently assert the listing does NOT
+# contain `command id:` or the raw ids (apps/rocm/src/main.rs), so hiding them was
+# a deliberate choice; a fix that shows the ids has to update those assertions.
+[["automations-listed-checks-can-be-enabled"]]
+when = {}
+bug = "EAI-8047"
+reason = "`automations list` publishes no usable identifier, so the checks it lists cannot be enabled from what it shows."
+
+# --- EAI-8049: the engine shell's activation hint names a path that is not there ---
+# `engines shell` builds the hint by appending the interpreter directory to the
+# resolved env_path. Users reach it through the auto-install branch of
+# `resolve_engine_env`, which uses the install response's env_path live, and the
+# vLLM install reports that as the directory CONTAINING the command
+# (`command.parent()`, engines/vllm/src/install.rs). The hint therefore doubles
+# the segment and points at a file nobody can source. Container-measured: with a bin-shaped env_path the hint named
+# `<env>/bin/bin/activate` (absent) while a root-shaped one named
+# `<env>/bin/activate` (present).
+#
+# The scenario plants a bin-shaped manifest as a stand-in for that response: no
+# install writes such a manifest to disk, it is only the cheapest way to hand the
+# shell the value the vLLM install reports. A fix in engines/vllm that reports the
+# environment root therefore closes EAI-8049 but does NOT flip this row, since the
+# planted manifest is unchanged; delete the row and rewrite or delete the
+# scenario together with that fix. Only a fix to the hint composition flips it. ---
+[["engine-shell-activation-hint-is-usable"]]
+when = {}
+bug = "EAI-8049"
+reason = "`engines shell` prints an activation hint whose path does not exist, because the env_path it is given (as reported by the vLLM install response) already includes the interpreter directory."
