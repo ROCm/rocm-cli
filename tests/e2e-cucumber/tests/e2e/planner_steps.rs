@@ -101,7 +101,7 @@ async fn start_planning_assistant(world: &mut E2eWorld, script: Vec<Value>) {
     );
 }
 
-fn mock(world: &E2eWorld) -> &MockServer {
+const fn mock(world: &E2eWorld) -> &MockServer {
     world.mock.as_ref().expect("no planning assistant running")
 }
 
