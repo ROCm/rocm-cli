@@ -1484,7 +1484,7 @@ async fn assert_new_server_avoids_taken_address(world: &mut E2eWorld) {
     let output = serve_output(world);
     // The `port:` line read here is the one `serve` prints in its "serve plan"
     // block — the `println!` under `serve plan` in `serve` itself
-    // (`apps/rocm/src/main.rs`) — which is what this scenario ran.
+    // (`apps/rocm/src/serve_cmd.rs`) — which is what this scenario ran.
     //
     // Named because grepping the product for `port: {port}` finds a decoy first:
     // `run_chat_port_status_tool` writes an identical line for a different

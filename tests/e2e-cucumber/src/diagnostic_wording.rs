@@ -179,9 +179,23 @@ fn code_text(source: &str) -> String {
         .join("\n")
 }
 
-fn assert_both_sides(source: &str, documented: &[Documented], owner: &str) {
+/// `code_owners` names the functions that build the messages. The templates are
+/// searched in their bodies only: `wait_for_popup_body_where` repeats three of
+/// them verbatim, so a file-wide search stays green when the real one is reworded.
+fn assert_both_sides(
+    source: &str,
+    documented: &[Documented],
+    owner: &str,
+    code_owners: &[&str],
+) {
     let docs = doc_block_of(source, owner);
-    let code = code_text(source);
+    let code = code_text(
+        &code_owners
+            .iter()
+            .map(|name| body_of(source, name))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
     for Documented {
         templates,
         documented_as,
@@ -246,6 +260,7 @@ fn every_clause_diagnostic_is_both_emitted_and_documented() {
         &read(DRIVER),
         &clause_diagnostics(),
         "wait_for_screen_where",
+        &["wait_loop", "drain_panic_message"],
     );
 }
 
@@ -256,6 +271,7 @@ fn every_marker_diagnostic_is_both_emitted_and_documented() {
         &read(DRIVER),
         &marker_diagnostics(),
         "terminal_state_after_wait",
+        &["terminal_state_after_wait"],
     );
 }
 

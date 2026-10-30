@@ -732,7 +732,8 @@ impl TuiSession {
     /// This only gates on the action you're waiting *for* if `marker` is
     /// genuinely absent before it — the marker is tested before the first
     /// sleep, so a call whose marker is already on screen returns
-    /// immediately and proves nothing about what happens afterward. A step
+    /// immediately (while the child is alive and the reader has not panicked)
+    /// and proves nothing about what happens afterward. A step
     /// that re-waits on a marker a prior step already waited for is a silent
     /// no-op, not a barrier.
     pub async fn wait_for_screen(&mut self, marker: &str, timeout: Duration) -> Result<(), String> {
@@ -785,8 +786,8 @@ impl TuiSession {
     ///
     /// `src/diagnostic_wording.rs` pins this list against the templates below.
     ///
-    /// Unlike `wait_for_screen`, the liveness checks run *before* the predicate,
-    /// and deliberately so. The order is only observable on a poll where one of
+    /// The liveness checks run *before* the predicate, in this form and in
+    /// `wait_for_screen` alike, and deliberately so. The order is only observable on a poll where one of
     /// them fires — the child has exited, or the reader thread has panicked —
     /// and there that check returns before the predicate is ever consulted, so
     /// the only outcome the ordering can change is a would-be success into a
@@ -800,12 +801,12 @@ impl TuiSession {
     /// The cost falls on predicates that require something to be *present*
     /// (a cell that must still be rendered, only with a different value): if
     /// such a condition first holds in the frame the child left behind, this
-    /// reports the exit instead. The positive form can afford the opposite
-    /// order — and drains the final frame after `try_wait`, via
-    /// [`drain_final_frame`](Self::drain_final_frame) — because a marker
-    /// that appeared as the child exited did genuinely appear. Here that
-    /// recovery is given up on purpose: a diagnosed exit is worth more than a
-    /// condition that only ever held in a dying process's last frame.
+    /// reports the exit instead. Only the positive form
+    /// ([`wait_for_screen`](Self::wait_for_screen)) drains the final frame after
+    /// `try_wait` — a marker that appeared as the child exited did genuinely
+    /// appear. Here that recovery is given up on purpose: a diagnosed exit is
+    /// worth more than a condition that only ever held in a dying process's
+    /// last frame.
     pub async fn wait_for_screen_where(
         &mut self,
         describe: &str,

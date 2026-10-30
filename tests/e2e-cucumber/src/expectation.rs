@@ -1989,29 +1989,41 @@ flaky = true
     /// that nothing measures. Nothing at runtime notices — resolution is keyed
     /// FROM the scenario TO this file, never the other way — so the orphan is
     /// caught here instead.
+    /// The `@id:` tags declared on tag lines. Tag lines only, the way
+    /// `scenarios_of` in tests/feature_naming.rs reads them: this set decides
+    /// whether a row is an orphan, so an `@id:` written inside a `#` comment
+    /// must not vouch for a row that measures nothing.
+    fn tag_ids(text: &str) -> std::collections::BTreeSet<String> {
+        let mut ids = std::collections::BTreeSet::new();
+        for line in text.lines() {
+            let line = line.trim();
+            if !line.starts_with('@') {
+                continue;
+            }
+            for tag in line.split_whitespace() {
+                if let Some(id) = tag.strip_prefix("@id:") {
+                    ids.insert(id.to_owned());
+                }
+            }
+        }
+        ids
+    }
+
+    #[test]
+    fn a_commented_out_id_does_not_declare_a_scenario() {
+        let text = "  # @id:ghost\n  @requires-os:linux @id:real\n  Scenario: x\n";
+        let ids = tag_ids(text);
+        assert!(ids.contains("real"), "{ids:?}");
+        assert!(!ids.contains("ghost"), "{ids:?}");
+    }
+
     #[test]
     fn every_expectation_row_names_a_scenario_that_exists() {
         let mut scenario_ids = std::collections::BTreeSet::new();
         for path in feature_files() {
             let text = std::fs::read_to_string(&path)
                 .unwrap_or_else(|e| panic!("could not read {}: {e}", path.display()));
-            // Read tags off TAG LINES only, the way `scenarios_of` in
-            // tests/feature_naming.rs does. Scanning the whole file would also
-            // pick up an `@id:` written inside a `#` comment — and since this
-            // set is what decides whether a row is an orphan, a commented-out
-            // id would vouch for a row that measures nothing, which is the one
-            // thing this test exists to catch.
-            for line in text.lines() {
-                let line = line.trim();
-                if !line.starts_with('@') {
-                    continue;
-                }
-                for tag in line.split_whitespace() {
-                    if let Some(id) = tag.strip_prefix("@id:") {
-                        scenario_ids.insert(id.to_owned());
-                    }
-                }
-            }
+            scenario_ids.extend(tag_ids(&text));
         }
         assert!(
             !scenario_ids.is_empty(),
@@ -2441,15 +2453,7 @@ flaky = true
         assert_eq!(xfail.bug.as_deref(), Some("EAI-1"));
         assert_eq!(xfail.reason.as_deref(), Some("r"));
         assert!(xfail.flaky);
-        assert_eq!(
-            xfail.expected,
-            Expectation::ExpectXfail {
-                bug: "EAI-1".into(),
-                reason: "r".into(),
-                flaky: true,
-            }
-            .label()
-        );
+        assert_eq!(xfail.expected, "xfail");
         assert_eq!(xfail.id, "x");
         assert_eq!(xfail.feature, "f");
         assert_eq!(xfail.scenario, "s");
@@ -2466,11 +2470,13 @@ flaky = true
                 reason: "no gpu".into(),
             },
         );
+        assert_eq!(skipped.expected, "skip");
         assert_eq!(skipped.bug, None);
         assert_eq!(skipped.reason.as_deref(), Some("no gpu"));
         assert!(!skipped.flaky);
 
         let passing = ResolvedScenario::new("x", "f", "s", "vllm", &Expectation::ExpectPass);
+        assert_eq!(passing.expected, "pass");
         assert_eq!(passing.bug, None);
         assert_eq!(passing.reason, None);
         assert!(!passing.flaky);

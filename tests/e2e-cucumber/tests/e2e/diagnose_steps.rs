@@ -1654,7 +1654,8 @@ async fn assert_interactive_decline_reported(world: &mut E2eWorld) {
 /// does — which is exactly why the two can drift apart.
 const DEVICE_PERMISSION_FIX_ID: &str = "fix-4-render-group";
 
-/// A symptom that makes the device-permission cause score on any host, so the
+/// A symptom that makes the device-permission cause score on any bare-metal
+/// Linux host (the check is not registered on WSL or Windows), so the
 /// comparison never depends on what happens to be wrong with the runner.
 const DEVICE_PERMISSION_SYMPTOM: &str = "unable to open /dev/kfd";
 
