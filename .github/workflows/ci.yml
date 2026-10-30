@@ -564,7 +564,7 @@ jobs:
         # `os_release_reads_fall_back_to_usr_lib_when_etc_is_absent`), and the
         # driver-presence reads `/sys/class/kfd/kfd`, `/dev/kfd` and
         # `/sys/bus/pci/drivers/amdgpu` (`kfd_present_on_host`,
-        # `amdgpu_present_on_host`, `driver_states` and the two
+        # `amdgpu_present_on_host`, `driver_states` and the three
         # `probe_modules_reports_*` tests). The other routed
         # reads (`/dev/dri`, `/sys/class/drm`, `/sys/module/amdgpu`, the other
         # `/proc` files, the modprobe directories, the `/usr/lib/wsl/lib` and
