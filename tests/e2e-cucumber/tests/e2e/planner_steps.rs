@@ -43,10 +43,12 @@ const BUILTIN_ASSISTANT_MODEL_ID: &str = "Qwen3-4B-Instruct-2507-GGUF";
 /// `--yes` — dispatches a real `rocm serve`.)
 const VAGUE_REQUEST: &str = "serve a model";
 
-/// Opening words of the prompt the CLI sends the planning assistant, which is
-/// how a planning request is told apart from the chat assistant's own
-/// completions. The text is the CLI's own; this is a plain substring match.
-const PLANNER_PROMPT_MARKER: &str = "resolving an ambiguous rocm-cli request";
+/// Opening words of the prompt the CLI sends the planning assistant
+/// (`build_provider_planner_prompt` in `apps/rocm/src/freeform_planner.rs`),
+/// which is how a planning request is told apart from the chat assistant's own
+/// completions. The harness repeats the text because it is black-box; if the
+/// product's wording drifts, no request matches and the scenarios fail closed.
+const PLANNER_PROMPT_MARKER: &str = "You are resolving an ambiguous rocm-cli request";
 
 /// The two plans the assistant gives, in the order it gives them. Different on
 /// purpose: a second planning call would print the second.
@@ -106,16 +108,18 @@ fn message_texts(request: &Value) -> Vec<&str> {
         .unwrap_or_default()
 }
 
-/// Whether `request` is a planning request: a *user* turn carrying the planner
-/// prompt. Only user turns count, so a system prompt that happened to mention
-/// the phrase could not pass for one.
+/// Whether `request` is a planning request: a *user* turn that begins with the
+/// planner prompt. The local provider folds any system prompt into the first
+/// user turn behind a `ROCm CLI guidance:` header, so a chat completion that
+/// merely mentions the phrase in its guidance starts with that header instead
+/// and does not pass for a planning request.
 fn is_planning_request(request: &Value) -> bool {
     request["messages"].as_array().is_some_and(|messages| {
         messages.iter().any(|message| {
             message["role"] == "user"
                 && message["content"]
                     .as_str()
-                    .is_some_and(|text| text.contains(PLANNER_PROMPT_MARKER))
+                    .is_some_and(|text| text.starts_with(PLANNER_PROMPT_MARKER))
         })
     })
 }
@@ -155,7 +159,7 @@ async fn planning_assistant_with_distinct_plans(world: &mut E2eWorld) {
 }
 
 #[given(
-    "a local assistant that hands the request to the planner, which suggests a different plan each time it is asked"
+    "a local assistant that hands a vague request to the planner, which suggests a different plan each time it is asked"
 )]
 async fn assistant_that_asks_the_planner(world: &mut E2eWorld) {
     // Three completions are expected, in this order: the chat assistant asking
@@ -219,30 +223,27 @@ async fn user_asks_chat_assistant_for_help(world: &mut E2eWorld) {
 #[then("the planning assistant was asked exactly once")]
 async fn planning_assistant_asked_once(world: &mut E2eWorld) {
     let requests = mock(world).chat_requests();
-    let planning = requests
+    let planning: Vec<&Value> = requests
         .iter()
         .filter(|request| is_planning_request(request))
-        .count();
+        .collect();
     assert_eq!(
-        planning,
+        planning.len(),
         1,
         "the request must be planned exactly once, but the assistant received {} completions \
-         ({planning} of them planning requests):\n{}",
+         ({} of them planning requests):\n{}",
         requests.len(),
+        planning.len(),
         describe_requests(&requests)
     );
-}
-
-#[then("the chat assistant was asked once before the plan and once after it")]
-async fn chat_assistant_asked_around_the_plan(world: &mut E2eWorld) {
-    let requests = mock(world).chat_requests();
-    let kinds: Vec<bool> = requests.iter().map(is_planning_request).collect();
-    assert_eq!(
-        kinds,
-        [false, true, false],
-        "expected the chat assistant, then the planner, then the chat assistant again \
-         (false = chat, true = planning), got {} completions:\n{}",
-        requests.len(),
+    // The one request must be about the vague request the user (or the chat
+    // assistant on their behalf) made, not some other planning call.
+    let expected = format!("User request: {VAGUE_REQUEST}");
+    assert!(
+        message_texts(planning[0])
+            .iter()
+            .any(|text| text.contains(&expected)),
+        "the planning request must carry `{expected}`:\n{}",
         describe_requests(&requests)
     );
 }

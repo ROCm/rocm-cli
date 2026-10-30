@@ -869,8 +869,14 @@ resolution is only used after a user configures a planner provider:
 
 ```bash
 rocm config set-planner-provider local
-rocm "start a local model"
+rocm "serve a model"
 ```
+
+Only a request the deterministic planner cannot settle reaches the provider:
+`serve a model` names no model, so its plan is a placeholder and the provider is
+asked, while `start a local model` resolves to the validated default model at
+high confidence and never consults the provider (so, under `--yes`, it runs the
+`rocm serve` it plans).
 
 For OpenAI or Anthropic, prompt sending must also be enabled and a key must be
 available through the OS secure store or session environment:

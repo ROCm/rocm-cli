@@ -364,7 +364,8 @@ struct ServerState {
     /// `/v1` prefix would pass while 404ing against a real engine. Recording the
     /// path lets a scenario assert the versioned route was the one used.
     chat_paths: Arc<Mutex<Vec<String>>>,
-    /// Every `/v1/chat/completions` request body, in arrival order. Unlike
+    /// Every chat completion request body (on either chat route), in arrival
+    /// order. Unlike
     /// `last_chat_request` this keeps the whole history, so a scenario can count
     /// how many completions the CLI asked for and read each prompt — the only
     /// way to prove a request was planned once rather than twice, when the two
@@ -565,7 +566,8 @@ impl MockServer {
     }
 
     /// Like [`Self::start`], but chat completions are answered from `script`
-    /// instead of the fixed stub: the Nth `/v1/chat/completions` request gets
+    /// instead of the fixed stub: the Nth chat completion request, on either the
+    /// `/v1/chat/completions` or the unversioned `/chat/completions` route, gets
     /// `script[N]` as its complete response body (build entries with
     /// [`chat_text_reply`] / [`chat_tool_call_reply`]).
     ///
@@ -706,8 +708,10 @@ impl MockServer {
     /// first, and the local-endpoint detection probe (`Say ok.`, `max_tokens: 2`)
     /// is itself a chat request that lands before the user has typed anything.
     /// A scenario with no intervening screen wait therefore sees the probe and
-    /// reports the real turn as missing. Only `last_chat_request` is retained,
-    /// so this narrows to the newest body rather than searching a history.
+    /// reports the real turn as missing. Each poll tests only the newest body
+    /// ([`Self::last_chat_request`]), not the full history that
+    /// [`Self::chat_requests`] keeps, so a matching request that a later one
+    /// has already replaced is not found.
     pub async fn wait_for_chat_request_where(
         &self,
         timeout: Duration,
@@ -1200,10 +1204,18 @@ mod chat_script_tests {
     async fn without_a_script_every_request_gets_the_same_stub_and_is_recorded() {
         let mock = MockServer::start("m").await;
 
-        let (_, first) = post_chat(&mock, "a").await;
-        let (_, second) = post_chat(&mock, "b").await;
+        // The stub text the unscripted server must keep answering with: the demo
+        // override when one is set, the fixed default otherwise.
+        let expected = std::env::var("ROCM_MOCK_CHAT_REPLY")
+            .unwrap_or_else(|_| "This is a mock response for testing.".to_string());
 
-        assert_eq!(reply_text(&first), reply_text(&second));
+        let (first_status, first) = post_chat(&mock, "a").await;
+        let (second_status, second) = post_chat(&mock, "b").await;
+
+        assert_eq!(first_status, 200);
+        assert_eq!(second_status, 200);
+        assert_eq!(reply_text(&first), expected);
+        assert_eq!(reply_text(&second), expected);
         assert_eq!(mock.chat_requests().len(), 2);
     }
 

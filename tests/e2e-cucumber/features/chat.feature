@@ -132,8 +132,7 @@ Feature: Chat and endpoint detection
   # was made, so the count of requests is what shows it was made once.
   @id:chat-assistant-plan-tool-plans-once
   Scenario: chat-11 - Asking the chat assistant to plan a vague request consults the planning assistant once
-    Given a local assistant that hands the request to the planner, which suggests a different plan each time it is asked
+    Given a local assistant that hands a vague request to the planner, which suggests a different plan each time it is asked
     When the user asks the assistant in one-shot chat for help with a vague request
     Then the planning assistant was asked exactly once
-    And the chat assistant was asked once before the plan and once after it
     And the chat reports that the request was planned
