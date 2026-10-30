@@ -554,7 +554,6 @@ fn build_sysinfo() -> GpuSystemInfo {
         memory_partition_mode: MemoryPartitionMode::Nps1,
         compute_partition_mode: ComputePartitionMode::Spx,
         vram_per_logical_gpu_mb: VRAM_TOTAL_MB,
-        lemond_version: None,
         llama_server_build: None,
         ccr_version: None,
         llamacpp_backend: None,
@@ -610,6 +609,7 @@ fn build_instances(t_s: f64, seed: &mut u64) -> Vec<Instance> {
             };
 
             Instance {
+                managed: false,
                 container_id: c.container_id.into(),
                 container_name: c.container_name.into(),
                 status: InstanceStatus::Running,
@@ -626,6 +626,7 @@ fn build_instances(t_s: f64, seed: &mut u64) -> Vec<Instance> {
                 waiting_reqs: Some(waiting),
                 gen_tps: Some(gen_tps),
                 gen_tps_observation: None,
+                gen_tps_last_request: false,
                 tokens_per_watt: None,
                 ttft_ms,
                 tpot_ms,

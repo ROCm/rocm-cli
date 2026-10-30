@@ -333,11 +333,19 @@ Feature: Runtime configuration
   # environment and has no llama.cpp backend to align; `@nightly` for the same
   # reason as the vLLM torch-alignment scenarios above -- a real managed SDK
   # and a real backend download, not something to repeat on every PR.
+  #
+  # The advice `rocm serve` prints for a missing llama-server is `rocm engines
+  # install lemonade --reinstall`. The Givens install Lemonade and delete the
+  # selected backend's llama-server, so the last Then can only pass if the
+  # reinstall put it back.
   @id:runtime-lemonade-backend-alignment-reported @requires-gpu @requires-os:windows @requires-engine:lemonade @nightly
   Scenario: runtime-16 - Reinstalling Lemonade reports whether its ROCm backend was aligned
     Given a managed runtime is active
+    And the lemonade engine is installed
+    And the selected Lemonade backend's llama-server binary has been deleted
     When the user reinstalls the lemonade engine
     Then the CLI reports that Lemonade's ROCm backend was aligned to the active SDK
+    And the selected Lemonade backend's llama-server binary is installed
 
   # `ROCM_CLI_DISABLE_LEMONADE_BACKEND_ALIGNMENT` is the exit for a hand-edited
   # `backend_versions.json` -- the alignment runs on every Lemonade install, so

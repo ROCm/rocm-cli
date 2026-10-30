@@ -87,14 +87,24 @@ pub struct ServiceRow {
     pub gen_tps: Option<f64>,
     /// Freshness metadata for `gen_tps`; `None` for legacy snapshots.
     pub gen_tps_observation: Option<ObservationMetadata>,
+    /// `gen_tps` is only the endpoint's most recent request, not a live rate.
+    pub gen_tps_last_request: bool,
 }
 
-/// Build the sorted service list from the daemon-surfaced instances.
+/// The one ownership predicate for lifecycle surfaces: only registry-owned
+/// instances are listed and counted, because those are what the controls act on.
+#[must_use]
+pub const fn is_listed_service(i: &Instance) -> bool {
+    i.managed
+}
+
+/// Build the sorted lifecycle list from registry-owned instances only.
 pub fn service_rows<S: ::std::hash::BuildHasher>(
     instances: &HashMap<String, Instance, S>,
 ) -> Vec<ServiceRow> {
     let mut rows: Vec<ServiceRow> = instances
         .values()
+        .filter(|i| is_listed_service(i))
         .map(|i| ServiceRow {
             id: i.container_id.clone(),
             model: i.model_name.clone(),
@@ -104,6 +114,7 @@ pub fn service_rows<S: ::std::hash::BuildHasher>(
             status: i.status.label().to_owned(),
             gen_tps: i.gen_tps,
             gen_tps_observation: i.gen_tps_observation.clone(),
+            gen_tps_last_request: i.gen_tps_last_request,
         })
         .collect();
     rows.sort_by(|a, b| a.id.cmp(&b.id));
@@ -125,6 +136,20 @@ pub fn on_key<S: ::std::hash::BuildHasher>(
     let Some(sm) = services.as_mut() else {
         return Vec::new();
     };
+
+    // Discovery may remove the target or replace it with an external row while
+    // the modal is open. Revalidate ownership before handling any verdict.
+    // The key is not consumed: it falls through and is handled as a normal key.
+    if sm
+        .approval
+        .as_ref()
+        .is_some_and(|pending| !rows.iter().any(|row| row.id == pending.service_id))
+    {
+        sm.approval = None;
+    }
+
+    // Keep navigation aligned with the refreshed managed-only list.
+    sm.selected = sm.selected.min(rows.len().saturating_sub(1));
 
     // 1) Approval modal has focus.
     if let Some(pending) = sm.approval.as_mut() {
@@ -352,7 +377,8 @@ pub fn draw_services_manager<S: ::std::hash::BuildHasher>(
                     Span::styled(format!("{:<10}", r.status), Style::default().fg(theme.ok)),
                     Span::styled(
                         format!(
-                            "gen {}",
+                            "{} {}",
+                            format::gen_rate_label(r.gen_tps_last_request),
                             format::gen_tps_compact(r.gen_tps, r.gen_tps_observation.as_ref())
                         ),
                         Style::default().fg(theme.fg),
@@ -407,7 +433,9 @@ pub fn draw_services_manager<S: ::std::hash::BuildHasher>(
     }
 
     // Approval modal sits on top of the list.
-    if let Some(pending) = &sm.approval {
+    if let Some(pending) = &sm.approval
+        && rows.iter().any(|row| row.id == pending.service_id)
+    {
         draw_approval(f, area, &pending.request, pending.choice, theme);
     }
 }
@@ -430,6 +458,7 @@ mod tests {
 
     fn inst(id: &str, model: &str, tps: Option<f64>) -> Instance {
         Instance {
+            managed: true,
             container_id: id.into(),
             container_name: id.into(),
             model_name: model.into(),
@@ -445,6 +474,197 @@ mod tests {
         m.insert("a".into(), inst("svc-a", "llama3", Some(42.0)));
         m.insert("b".into(), inst("svc-b", "qwen", None));
         m
+    }
+
+    #[test]
+    fn external_only_lifecycle_keys_do_not_offer_approval_or_spawn_jobs() {
+        let mut external = inst("svc-external", "external-model", Some(12.0));
+        external.managed = false;
+        let insts = HashMap::from([(external.container_id.clone(), external)]);
+        for action in ['s', 'r'] {
+            let mut services = Some(ServicesManagerState::default());
+            let mut jobs = State::default();
+            for pressed in [action, 'y'] {
+                let fx = on_key(
+                    &mut services,
+                    &mut jobs,
+                    &insts,
+                    key(KeyCode::Char(pressed)),
+                );
+                assert!(fx.is_empty(), "external service must never emit effects");
+                let sm = services.as_ref().unwrap();
+                assert!(sm.approval.is_none(), "external service is read-only");
+                assert!(sm.active_job.is_none());
+                assert!(jobs.jobs.is_empty());
+            }
+            let out = render(services.as_ref().unwrap(), &jobs, &insts);
+            assert!(out.contains("No managed services."), "{out}");
+            assert!(!out.contains("external-model"), "{out}");
+        }
+    }
+
+    #[test]
+    fn rows_use_positive_ownership_not_id_or_engine_markers() {
+        let mut insts = instances();
+        let mut external = inst("svc-looks-managed", "external", None);
+        external.managed = false;
+        insts.insert("external".into(), external);
+        let mut managed = inst("lemonade-owned", "managed", None);
+        managed.container_name = "lemonade".into();
+        insts.insert("managed".into(), managed);
+        let rows = service_rows(&insts);
+        assert_eq!(
+            rows.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["lemonade-owned", "svc-a", "svc-b"]
+        );
+        let out = render(&ServicesManagerState::default(), &State::default(), &insts);
+        assert!(out.contains("lemonade-owned"), "{out}");
+        assert!(!out.contains("svc-looks-managed"), "{out}");
+    }
+
+    #[test]
+    fn removed_or_unmanaged_target_invalidates_pending_approval() {
+        for action in ['s', 'r'] {
+            for replace_with_external in [false, true] {
+                let mut services = Some(ServicesManagerState::default());
+                let mut jobs = State::default();
+                let mut telemetry = State::default();
+                let managed = inst("svc-a", "managed", None);
+                telemetry.apply(StateEvent::InstanceUpserted(managed.clone()));
+                on_key(
+                    &mut services,
+                    &mut jobs,
+                    &telemetry.instances,
+                    key(KeyCode::Char(action)),
+                );
+                assert!(services.as_ref().unwrap().approval.is_some());
+                telemetry.apply(StateEvent::InstanceRemoved("svc-a".into()));
+                if replace_with_external {
+                    let mut external = managed;
+                    external.managed = false;
+                    telemetry.apply(StateEvent::InstanceUpserted(external));
+                }
+                let out = render(services.as_ref().unwrap(), &jobs, &telemetry.instances);
+                assert!(out.contains("No managed services."), "{out}");
+                assert!(
+                    !out.contains("Review:"),
+                    "stale approval must not render: {out}"
+                );
+                let fx = on_key(
+                    &mut services,
+                    &mut jobs,
+                    &telemetry.instances,
+                    key(KeyCode::Char('y')),
+                );
+                assert!(fx.is_empty(), "stale approval must not emit effects");
+                assert!(services.as_ref().unwrap().approval.is_none());
+                assert!(services.as_ref().unwrap().active_job.is_none());
+                assert!(jobs.jobs.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn stale_approval_does_not_swallow_the_next_key() {
+        // `j` after the stale approval is dropped moves the selection.
+        let mut insts = instances();
+        let mut services = Some(ServicesManagerState::default());
+        let mut jobs = State::default();
+        on_key(&mut services, &mut jobs, &insts, key(KeyCode::Char('s')));
+        assert_eq!(
+            services
+                .as_ref()
+                .unwrap()
+                .approval
+                .as_ref()
+                .unwrap()
+                .service_id,
+            "svc-a"
+        );
+        // The target disappears while the modal is open.
+        insts.remove("a");
+        insts.insert("c".into(), inst("svc-c", "other", None));
+        insts.insert("d".into(), inst("svc-d", "other", None));
+        let fx = on_key(&mut services, &mut jobs, &insts, key(KeyCode::Char('j')));
+        assert!(fx.is_empty());
+        let sm = services.as_ref().unwrap();
+        assert!(sm.approval.is_none());
+        assert_eq!(sm.selected, 1, "j must be handled as navigation");
+
+        // `s` after a stale approval stages a fresh approval for the selection.
+        let mut services = Some(ServicesManagerState::default());
+        let mut insts = instances();
+        on_key(&mut services, &mut jobs, &insts, key(KeyCode::Char('s')));
+        insts.remove("a");
+        let fx = on_key(&mut services, &mut jobs, &insts, key(KeyCode::Char('s')));
+        assert!(fx.is_empty());
+        let pending = services.as_ref().unwrap().approval.as_ref().unwrap();
+        assert_eq!(pending.service_id, "svc-b");
+        // `y` still approves only the fresh target, never the stale one.
+        let fx = on_key(&mut services, &mut jobs, &insts, key(KeyCode::Char('y')));
+        assert!(!fx.is_empty());
+        assert_eq!(jobs.jobs.len(), 1);
+        assert!(
+            jobs.jobs.contains_key("svc-stop-svc-b"),
+            "{:?}",
+            jobs.jobs.keys()
+        );
+    }
+
+    #[test]
+    fn stale_approval_then_y_cannot_spawn_a_job() {
+        let mut insts = instances();
+        let mut services = Some(ServicesManagerState::default());
+        let mut jobs = State::default();
+        on_key(&mut services, &mut jobs, &insts, key(KeyCode::Char('s')));
+        insts.clear();
+        let fx = on_key(&mut services, &mut jobs, &insts, key(KeyCode::Char('y')));
+        assert!(fx.is_empty());
+        assert!(jobs.jobs.is_empty());
+        assert!(services.as_ref().unwrap().approval.is_none());
+    }
+
+    #[test]
+    fn selection_is_clamped_when_managed_rows_shrink() {
+        let mut insts = instances();
+        let mut services = Some(ServicesManagerState::default());
+        let mut jobs = State::default();
+        on_key(&mut services, &mut jobs, &insts, key(KeyCode::Char('j')));
+        assert_eq!(services.as_ref().unwrap().selected, 1);
+        // Only one managed row remains; the old selection is out of range.
+        insts.remove("b");
+        on_key(&mut services, &mut jobs, &insts, key(KeyCode::Char('s')));
+        let sm = services.as_ref().unwrap();
+        assert_eq!(sm.selected, 0);
+        let pending = sm.approval.as_ref().expect("a valid target is staged");
+        assert_eq!(pending.service_id, "svc-a");
+    }
+
+    #[test]
+    fn restart_requires_approval_then_spawns_job() {
+        let mut services = Some(ServicesManagerState::default());
+        let mut jobs = State::default();
+        let insts = instances();
+        let fx = on_key(&mut services, &mut jobs, &insts, key(KeyCode::Char('r')));
+        assert!(fx.is_empty());
+        assert!(jobs.jobs.is_empty());
+        let sm = services.as_ref().unwrap();
+        assert_eq!(
+            sm.approval.as_ref().unwrap().action,
+            LifecycleAction::Restart
+        );
+        let out = render(sm, &jobs, &insts);
+        assert!(out.contains("restart service"), "{out}");
+        let fx = on_key(&mut services, &mut jobs, &insts, key(KeyCode::Char('y')));
+        assert_eq!(fx.len(), 1);
+        assert!(matches!(&fx[0], SideEffect::SpawnJob { args, .. }
+            if args == &["services", "restart", "svc-a", "--yes"]));
+        assert!(services.as_ref().unwrap().approval.is_none());
+        assert_eq!(
+            services.as_ref().unwrap().active_job.as_deref(),
+            Some("svc-restart-svc-a")
+        );
+        assert_eq!(jobs.jobs.len(), 1);
     }
 
     #[test]
@@ -579,12 +799,28 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_labels_a_last_request_rate() {
+        let mut insts = HashMap::new();
+        for (id, last_request) in [("live", false), ("idle", true)] {
+            let mut i = inst(id, &format!("model-{id}"), Some(42.0));
+            i.gen_tps_last_request = last_request;
+            insts.insert(id.into(), i);
+        }
+        let rows = service_rows(&insts);
+        assert!(rows[0].gen_tps_last_request && !rows[1].gen_tps_last_request);
+        let out = render(&ServicesManagerState::default(), &State::default(), &insts);
+        assert!(out.contains("last req 42"), "{out}");
+        assert!(out.contains("gen 42"), "{out}");
+    }
+
+    #[test]
     fn snapshot_shows_held_legend_when_a_row_is_held() {
         use rocm_dash_core::metrics::{InstanceStatus, ObservationFreshness, ObservationMetadata};
         let mut insts = HashMap::new();
         insts.insert(
             "held".into(),
             Instance {
+                managed: true,
                 container_id: "held".into(),
                 container_name: "svc-held".into(),
                 model_name: "llama3".into(),
@@ -640,6 +876,7 @@ mod tests {
             m.insert(
                 id.clone(),
                 Instance {
+                    managed: true,
                     container_id: id.clone(),
                     container_name: id,
                     model_name: "llama3".into(),

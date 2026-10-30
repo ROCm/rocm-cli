@@ -64,6 +64,38 @@ pub(crate) fn reported_device(state: Option<&Value>, backend: &str) -> String {
     }
 }
 
+/// A one-line notice naming the backend actually serving when it is a GPU
+/// backend other than ROCm (Vulkan), so it is never read as a ROCm serve. `None`
+/// for ROCm backends. The text is derived from the same backend name the engine
+/// records in its state (`backend_requested`), so it cannot disagree with it.
+pub(crate) fn non_rocm_backend_notice(backend: &str) -> Option<String> {
+    let backend = backend.trim();
+    (!backend.to_ascii_lowercase().starts_with("rocm")).then(|| {
+        format!(
+            "Lemonade is serving on the {backend} GPU backend, not ROCm; no CPU fallback is used."
+        )
+    })
+}
+
+/// Print the non-ROCm backend notice and append it to the serve log, because a
+/// managed serve runs with its stdout and stderr discarded and the log is the only
+/// place the user can read it. Returns the notice, or `None` for a ROCm backend.
+pub(crate) fn announce_non_rocm_backend(backend: &str, log_path: Option<&Path>) -> Option<String> {
+    use std::io::Write as _;
+    let notice = non_rocm_backend_notice(backend)?;
+    eprintln!("{notice}");
+    if let Some(log_path) = log_path
+        && let Some(mut log) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)
+            .ok()
+    {
+        let _ = writeln!(log, "{notice}");
+    }
+    Some(notice)
+}
+
 /// The first pinned GPU ordinal recorded in service state, if any.
 fn first_gpu_index_from_state(state: &Value) -> Option<u32> {
     state
@@ -140,6 +172,24 @@ pub(crate) fn write_running_state(
     server_pid: Option<u32>,
     status: &str,
 ) -> Result<()> {
+    write_running_state_for_model(
+        request,
+        runtime,
+        pid,
+        server_pid,
+        status,
+        &request.model_ref,
+    )
+}
+
+pub(crate) fn write_running_state_for_model(
+    request: &ServeHttpRequest,
+    runtime: &LemonadeRuntime,
+    pid: u32,
+    server_pid: Option<u32>,
+    status: &str,
+    served_model_ref: &str,
+) -> Result<()> {
     write_state(
         &request.state_path,
         &json!({
@@ -149,7 +199,7 @@ pub(crate) fn write_running_state(
             "pid": pid,
             "server_pid": server_pid,
             "model_ref": request.model_ref,
-            "canonical_model_id": request.model_ref,
+            "canonical_model_id": served_model_ref,
             "host": request.host,
             "port": request.port,
             "endpoint_url": endpoint_url(&request.host, request.port),

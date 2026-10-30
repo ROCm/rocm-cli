@@ -37,6 +37,43 @@ use tracing::{info, trace, warn};
 /// Refresh GPU system info (versions, partition modes) every N seconds.
 const SYSINFO_REFRESH_SECS: u64 = 30;
 
+/// Row identity and accepted model names for singleton Lemonade attribution.
+#[derive(Clone)]
+struct LemonadeRow {
+    id: String,
+    model_names: Vec<String>,
+}
+
+#[derive(Clone)]
+struct LemonadeEndpoint {
+    host: String,
+    port: u16,
+    collector: LemonadeCollector,
+    rows: Vec<LemonadeRow>,
+    /// The endpoint is the external probe (not a registry-managed target). This
+    /// decides how strictly health is read: an external server that starts to
+    /// require credentials is a failure to report, a managed target that does not
+    /// serve the Lemonade protocol is not. It is a property of the endpoint, not
+    /// of the tick.
+    external: bool,
+    /// This tick is a discovery tick: rows are rebuilt from health. External
+    /// endpoints also appear on scrape-only ticks, with this `false`.
+    discover_external: bool,
+}
+
+impl LemonadeEndpoint {
+    fn warning(&self, phase: &str, error: &impl std::fmt::Display) -> String {
+        let mut ids: Vec<&str> = self.rows.iter().map(|row| row.id.as_str()).collect();
+        ids.sort_unstable();
+        format!(
+            "lemonade {phase} {}:{} [{}]: {error}",
+            self.host,
+            self.port,
+            ids.join(", ")
+        )
+    }
+}
+
 /// Options for `run_loop`. Mirrors daemon CLI flags + config.
 #[derive(Debug, Clone)]
 pub struct RunnerOptions {
@@ -56,9 +93,10 @@ pub struct RunnerOptions {
     pub disable_vllm_metrics: bool,
     /// Hostname to scrape; `127.0.0.1` for the typical co-located daemon.
     pub vllm_metrics_host: String,
-    /// Opt-in probe-based Lemonade discovery: when enabled, probe a local
-    /// Lemonade endpoint each discovery tick and surface it as an Instance.
-    /// Off by default so hosts with no Lemonade server never poll a dead port.
+    /// Probe-based Lemonade discovery: when enabled, probe a local Lemonade
+    /// endpoint each discovery tick and surface its healthy loaded models.
+    /// `rocm dash` passes the dashboard config value, which defaults to on;
+    /// only `RunnerOptions::default()` is off, for standalone use and tests.
     pub enable_lemonade: bool,
     /// Lemonade endpoint host + port (defaults `127.0.0.1:13305`).
     pub lemonade_host: String,
@@ -70,7 +108,7 @@ pub struct RunnerOptions {
     /// When set, the daemon reads `ManagedServiceRecord`s each discovery tick and
     /// surfaces live ones as scrape targets (port from the registry), so a model
     /// served via `rocm serve` appears in the dashboard with live `gen_tps`
-    /// without Docker discovery. Off by default.
+    /// without Docker discovery. `None` by default; `rocm dash` sets it.
     pub services_dir: Option<PathBuf>,
     /// Path or command name for the `amd-smi` binary. The managed ROCm SDK
     /// ships it inside the runtime wheel's bin directory rather than on `PATH`,
@@ -313,8 +351,9 @@ pub async fn run_loop(
         None
     };
 
-    // Opt-in Lemonade discovery (probe-based; off unless a Lemonade endpoint is
-    // configured). Distinct from Docker/vLLM discovery — a local server, not a
+    // Probe-based Lemonade discovery, gated on `opts.enable_lemonade` (the
+    // dashboard config default is on; `RunnerOptions::default()` is off).
+    // Distinct from Docker/vLLM discovery — a local server, not a
     // container — so it is tracked separately from `known_instances`.
     let lemonade = if opts.enable_lemonade {
         info!(
@@ -330,8 +369,11 @@ pub async fn run_loop(
     } else {
         None
     };
-    // The id of the currently-live Lemonade instance, if any.
-    let mut lemonade_id: Option<String> = None;
+    // Persistent endpoint collectors share their reqwest connection pools across cycles.
+    let mut managed_lemonade_collectors: HashMap<(String, u16), LemonadeCollector> = HashMap::new();
+    // Model identities of externally discovered Lemonade rows.
+    let mut lemonade_ids: HashSet<String> = HashSet::new();
+    let mut managed_lemonade: Vec<crate::registry::ManagedLemonadeTarget> = Vec::new();
 
     let mut bench = opts.bench_csv.as_ref().map(|p| {
         info!(path = %p.display(), "tailing benchmark CSV");
@@ -411,6 +453,7 @@ pub async fn run_loop(
     // blink on and off. Keep the last result until that cadence runs again.
     let mut docker_warn: Option<String> = None;
     let mut scrape_warns: Vec<String> = Vec::new();
+    let mut lemonade_discovery_warn: Option<String> = None;
 
     loop {
         ticker.tick().await;
@@ -589,75 +632,6 @@ pub async fn run_loop(
             }
         }
 
-        // Lemonade discovery — probe the endpoint on the discovery cadence; add a
-        // Lemonade Instance when reachable, emit Gone when it disappears, and stay
-        // a clean no-op (no warning/panic) when no endpoint is configured.
-        //
-        // The Lemonade `container_id` encodes the host and port
-        // (`<host>:<port>`), so a port or host change produces a new id string
-        // and is treated as a full identity change (old gone, new discovered).
-        if let Some(l) = lemonade.as_ref()
-            && (tick_count == 1 || tick_count.is_multiple_of(discovery_ticks))
-        {
-            match l.discover().await {
-                Some(svc) => {
-                    let is_new_id = lemonade_id.as_deref() != Some(svc.container_id.as_str());
-                    if is_new_id {
-                        // New identity: purge all telemetry state for the old id so
-                        // stale rate baseline, TTFT, and TPOT do not bleed across.
-                        if let Some(old_id) = lemonade_id.as_deref() {
-                            purge_telemetry_state(
-                                old_id,
-                                &mut gen_trackers,
-                                &mut prev_ttft,
-                                &mut prev_tpot,
-                            );
-                        }
-                    }
-                    let existing = runner.state.instances.get(&svc.container_id).cloned();
-                    let inst = merge_discovery_refresh(
-                        &svc,
-                        if is_new_id { None } else { existing.as_ref() },
-                    );
-                    runner
-                        .state
-                        .apply(StateEvent::InstanceUpserted(inst.clone()));
-                    if is_new_id {
-                        info!(
-                            id = %svc.container_id,
-                            model = %svc.model_name,
-                            "lemonade instance discovered"
-                        );
-                        // InstanceDiscovered is a discovery-metadata event; broadcast
-                        // a clean instance (no prior collector-owned telemetry).
-                        broadcast_and_persist(
-                            &tx,
-                            persist.as_ref(),
-                            Event::InstanceDiscovered(instance_from_discovered(&svc)),
-                        );
-                        lemonade_id = Some(svc.container_id.clone());
-                    }
-                }
-                None => {
-                    if let Some(id) = lemonade_id.take() {
-                        info!(id = %id, "lemonade instance gone");
-                        purge_telemetry_state(
-                            &id,
-                            &mut gen_trackers,
-                            &mut prev_ttft,
-                            &mut prev_tpot,
-                        );
-                        runner.state.apply(StateEvent::InstanceRemoved(id.clone()));
-                        broadcast_and_persist(
-                            &tx,
-                            persist.as_ref(),
-                            Event::InstanceGone { container_id: id },
-                        );
-                    }
-                }
-            }
-        }
-
         // Managed-service registry discovery — read the rocm-cli
         // `serve` records and surface live ones as scrape targets. The port is
         // the registry's authority; non-vLLM engines are tracked so the vLLM
@@ -669,13 +643,27 @@ pub async fn run_loop(
             let records = crate::registry::load_service_records(services_dir);
             let disc = crate::registry::discover_managed_services(&records);
             managed_non_vllm = disc.non_vllm;
+            let previous_lemonade = std::mem::replace(&mut managed_lemonade, disc.lemonade);
             for svc in disc.svcs {
                 let id = svc.container_id.clone();
                 let is_new = !known_services.contains(&id);
                 let existing = runner.state.instances.get(&id).cloned();
-                // Endpoint change → new logical service; reset rate baseline and
-                // latency windows so the new port starts fresh.
-                let same_endpoint = existing.as_ref().is_none_or(|ex| ex.port == svc.port);
+                // Endpoint/model change → new logical service; reset telemetry.
+                let same_endpoint = existing.as_ref().is_none_or(|ex| ex.port == svc.port)
+                    && previous_lemonade
+                        .iter()
+                        .find(|target| target.service_id == id)
+                        .is_none_or(|old| {
+                            managed_lemonade
+                                .iter()
+                                .find(|target| target.service_id == id)
+                                .is_some_and(|new| {
+                                    crate::registry::endpoints_match(
+                                        &old.host, old.port, &new.host, new.port,
+                                    ) && old.model_ref == new.model_ref
+                                        && old.canonical_model_id == new.canonical_model_id
+                                })
+                        });
                 if !same_endpoint {
                     invalidate_on_endpoint_change(
                         &id,
@@ -726,9 +714,256 @@ pub async fn run_loop(
             scrape_warns.clear();
         }
 
-        // Per-instance vLLM metric scrape, parallel, on its own cadence. The
-        // Lemonade instance (if any) is scraped via its own collector below, so
-        // exclude it from the vLLM Prometheus targets. Managed non-vLLM services
+        // Independent endpoints run concurrently, but health always precedes
+        // stats within each endpoint. Last-request stats have no model identity:
+        // only a singleton loaded set matching exactly one row can own the rate.
+        let discovery_now = tick_count == 1 || tick_count.is_multiple_of(discovery_ticks);
+        let scrape_now = tick_count.is_multiple_of(instance_ticks);
+        if discovery_now || scrape_now {
+            let managed_endpoint = managed_lemonade.iter().any(|target| {
+                crate::registry::endpoints_match(
+                    &target.host,
+                    target.port,
+                    &opts.lemonade_host,
+                    opts.lemonade_port,
+                )
+            });
+            let mut endpoints = Vec::new();
+            if let Some(collector) = lemonade.as_ref() {
+                if managed_endpoint && discovery_now {
+                    // Registry binding wins even if its configured model differs
+                    // from health. Never attach external controls to that binding.
+                    for gone in &lemonade_ids {
+                        purge_telemetry_state(
+                            gone,
+                            &mut gen_trackers,
+                            &mut prev_ttft,
+                            &mut prev_tpot,
+                        );
+                        runner
+                            .state
+                            .apply(StateEvent::InstanceRemoved(gone.clone()));
+                        broadcast_and_persist(
+                            &tx,
+                            persist.as_ref(),
+                            Event::InstanceGone {
+                                container_id: gone.clone(),
+                            },
+                        );
+                    }
+                    lemonade_ids.clear();
+                    lemonade_discovery_warn = None;
+                } else if !managed_endpoint && (discovery_now || !lemonade_ids.is_empty()) {
+                    endpoints.push(LemonadeEndpoint {
+                        host: opts.lemonade_host.clone(),
+                        port: opts.lemonade_port,
+                        collector: collector.clone(),
+                        rows: lemonade_ids
+                            .iter()
+                            .filter_map(|id| {
+                                runner.state.instances.get(id).map(|inst| LemonadeRow {
+                                    id: id.clone(),
+                                    model_names: vec![inst.model_name.clone()],
+                                })
+                            })
+                            .collect(),
+                        external: true,
+                        discover_external: discovery_now,
+                    });
+                }
+            }
+            let mut groups: HashMap<(String, u16), Vec<LemonadeRow>> = HashMap::new();
+            for target in &managed_lemonade {
+                // Use the registry's endpoint equivalence without rewriting the
+                // selected request host or conflating IPv4 and IPv6 listeners.
+                // Prefer the cached representative so reorder keeps its client.
+                // A cached collector dials a fixed address, so it is reused
+                // only when it would dial the same host as this target.
+                let endpoint = groups
+                    .keys()
+                    .find(|(host, port)| {
+                        crate::registry::endpoints_match(host, *port, &target.host, target.port)
+                    })
+                    .or_else(|| {
+                        managed_lemonade_collectors.keys().find(|(host, port)| {
+                            crate::registry::endpoints_match(host, *port, &target.host, target.port)
+                                && crate::registry::cached_collector_reusable(host, &target.host)
+                        })
+                    })
+                    .cloned()
+                    .unwrap_or_else(|| (target.host.clone(), target.port));
+                groups.entry(endpoint).or_default().push(LemonadeRow {
+                    id: target.service_id.clone(),
+                    model_names: vec![target.model_ref.clone(), target.canonical_model_id.clone()],
+                });
+            }
+            managed_lemonade_collectors.retain(|endpoint, _| groups.contains_key(endpoint));
+            if scrape_now {
+                for ((host, port), rows) in groups {
+                    let collector = managed_lemonade_collectors
+                        .entry((host.clone(), port))
+                        .or_insert_with(|| {
+                            LemonadeCollector::new(
+                                crate::registry::scrape_host(&host),
+                                port,
+                                Duration::from_millis(1500),
+                            )
+                        })
+                        .clone();
+                    endpoints.push(LemonadeEndpoint {
+                        host,
+                        port,
+                        collector,
+                        rows,
+                        external: false,
+                        discover_external: false,
+                    });
+                }
+            }
+            let results = parallel_scrape(endpoints, move |endpoint| async move {
+                // A managed row can be a server without the Lemonade protocol
+                // (a direct llama-server). It stays listed with throughput
+                // unavailable and no standing warning; real failures still warn.
+                let health = if endpoint.external {
+                    endpoint.collector.fetch_health().await?
+                } else if let Some(health) = endpoint.collector.fetch_health_if_router().await? {
+                    health
+                } else {
+                    return Ok((None, endpoint.rows.clone(), None, None));
+                };
+                let discovered = endpoint.discover_external.then(|| {
+                    rocm_dash_collectors::lemonade::services_from_health(
+                        &endpoint.host,
+                        endpoint.port,
+                        &health,
+                    )
+                });
+                let rows = discovered.as_ref().map_or_else(
+                    || endpoint.rows.clone(),
+                    |services| {
+                        services
+                            .iter()
+                            .map(|service| LemonadeRow {
+                                id: service.container_id.clone(),
+                                model_names: vec![service.model_name.clone()],
+                            })
+                            .collect()
+                    },
+                );
+                let attribution = health.stats_model();
+                let mut matching = rows.iter().filter(|row| {
+                    attribution
+                        .as_ref()
+                        .is_some_and(|model| row.model_names.iter().any(|name| name == model))
+                });
+                let attributed_id = matching
+                    .next()
+                    .filter(|_| matching.next().is_none())
+                    .map(|row| row.id.clone());
+                let stats = if scrape_now && attributed_id.is_some() {
+                    Some(endpoint.collector.fetch_stats().await)
+                } else {
+                    None
+                };
+                Ok::<_, rocm_dash_core::traits::CollectorError>((
+                    discovered,
+                    rows,
+                    attributed_id,
+                    stats,
+                ))
+            })
+            .await;
+            for (endpoint, result) in results {
+                let (discovered, rows, attributed_id, stats) = match result {
+                    Ok(result) => {
+                        if endpoint.discover_external {
+                            lemonade_discovery_warn = None;
+                        }
+                        result
+                    }
+                    Err(error) => {
+                        // A failed external discovery still removes rows immediately,
+                        // but reports why they disappeared. A never-seen endpoint
+                        // with nothing listening stays quiet; one that answers with
+                        // an HTTP or body error warns even on first contact.
+                        // Managed failures retain only the existing hold.
+                        if endpoint.discover_external {
+                            let absent = endpoint.rows.is_empty()
+                                && rocm_dash_collectors::lemonade::is_connect_error(&error);
+                            lemonade_discovery_warn =
+                                (!absent).then(|| endpoint.warning("health", &error));
+                            (Some(Vec::new()), Vec::new(), None, None)
+                        } else {
+                            scrape_warns.push(endpoint.warning("health", &error));
+                            continue;
+                        }
+                    }
+                };
+                if let Some(services) = discovered {
+                    let seen: HashSet<String> = services
+                        .iter()
+                        .map(|service| service.container_id.clone())
+                        .collect();
+                    for service in &services {
+                        let existing = runner.state.instances.get(&service.container_id);
+                        let instance = merge_discovery_refresh(service, existing);
+                        runner.state.apply(StateEvent::InstanceUpserted(instance));
+                        if !lemonade_ids.contains(&service.container_id) {
+                            broadcast_and_persist(
+                                &tx,
+                                persist.as_ref(),
+                                Event::InstanceDiscovered(instance_from_discovered(service)),
+                            );
+                        }
+                    }
+                    for gone in lemonade_ids.difference(&seen) {
+                        purge_telemetry_state(
+                            gone,
+                            &mut gen_trackers,
+                            &mut prev_ttft,
+                            &mut prev_tpot,
+                        );
+                        runner
+                            .state
+                            .apply(StateEvent::InstanceRemoved(gone.clone()));
+                        broadcast_and_persist(
+                            &tx,
+                            persist.as_ref(),
+                            Event::InstanceGone {
+                                container_id: gone.clone(),
+                            },
+                        );
+                    }
+                    lemonade_ids = seen;
+                }
+                // Healthy contradictory/ambiguous evidence invalidates prior
+                // attribution immediately, even off the stats cadence.
+                for row in &rows {
+                    if Some(&row.id) != attributed_id.as_ref() {
+                        gen_trackers.remove(&row.id);
+                    }
+                }
+                if let Some(stats) = stats {
+                    match stats {
+                        Ok(sample) => {
+                            if let Some(rate) = sample.gen_tps {
+                                gen_trackers
+                                    .entry(attributed_id.expect("stats require attribution"))
+                                    .or_insert_with(|| {
+                                        GenerationObservationTracker::new(opts.instance_tick)
+                                    })
+                                    .observe_direct(rate, cycle_at);
+                            }
+                        }
+                        Err(error) => scrape_warns.push(endpoint.warning("stats", &error)),
+                    }
+                }
+            }
+        }
+
+        // Per-instance vLLM metric scrape, parallel, on its own cadence.
+        // Lemonade rows are scraped via their endpoint collectors above, so
+        // exclude them from the vLLM Prometheus targets. Managed non-vLLM services
         // are excluded too (their engine uses a different parser).
         if let Some(prom) = vllm.as_ref()
             && !runner.state.instances.is_empty()
@@ -738,7 +973,7 @@ pub async fn run_loop(
                 .state
                 .instances
                 .values()
-                .filter(|i| Some(i.container_id.as_str()) != lemonade_id.as_deref())
+                .filter(|i| !lemonade_ids.contains(&i.container_id))
                 .filter(|i| !managed_non_vllm.contains(&i.container_id))
                 .filter_map(|i| i.port.map(|p| (i.container_id.clone(), p)))
                 .collect();
@@ -841,51 +1076,6 @@ pub async fn run_loop(
             }
         }
 
-        // Lemonade per-instance scrape — reports an instantaneous rate directly
-        // (`gen_tps`), so no counter-differencing. A scrape failure leaves the
-        // last-known fields and warns; it never panics.
-        if let (Some(l), Some(id)) = (lemonade.as_ref(), lemonade_id.clone())
-            && tick_count.is_multiple_of(instance_ticks)
-        {
-            match l.fetch_stats().await {
-                Ok(sample) => {
-                    // EAI-7960: drive the tracker with a direct rate reading when
-                    // the sample carries one. A missing direct rate (None) does not
-                    // erase or refresh the tracker; the held value stays valid until
-                    // the validity window expires.
-                    if let Some(rate) = sample.gen_tps {
-                        gen_trackers
-                            .entry(id.clone())
-                            .or_insert_with(|| {
-                                GenerationObservationTracker::new(opts.instance_tick)
-                            })
-                            .observe_direct(rate, cycle_at);
-                    }
-                    if let Some(mut inst) = runner.state.instances.get(&id).cloned() {
-                        // gen_tps is written in the snapshot assembly below;
-                        // set the KV/request fields immediately so they are
-                        // present in state for subsequent snapshots.
-                        inst.kv_cache_usage_pct = sample.kv_cache_usage_pct;
-                        inst.running_reqs = sample.running_reqs;
-                        inst.waiting_reqs = sample.waiting_reqs;
-                        // See the vLLM scrape-success handler: a successful stats
-                        // fetch proves the instance is serving; promote out of Starting.
-                        if matches!(inst.status, InstanceStatus::Starting { .. }) {
-                            inst.status = InstanceStatus::Ready;
-                        }
-                        runner.state.apply(StateEvent::InstanceUpserted(inst));
-                    }
-                }
-                Err(e) => {
-                    trace!(id = %id, error = %e, "lemonade scrape failed");
-                    scrape_warns.push(format!("lemonade scrape: {e}"));
-                    // EAI-7960: retain tracker during validity window on failure.
-                    // gen_tps is assembled from the tracker snapshot below;
-                    // no explicit clearing needed here.
-                }
-            }
-        }
-
         // Per-process VRAM attribution: refresh the per-container map on the
         // instance cadence via one amd-smi `process` scrape, joining GPU-process
         // host PIDs to container ids through `/proc/<pid>/cgroup`. On Err/empty
@@ -921,6 +1111,9 @@ pub async fn run_loop(
                 .map_or((None, None), |t| t.snapshot(cycle_at));
             inst.gen_tps = gen_tps;
             inst.gen_tps_observation = meta;
+            inst.gen_tps_last_request = gen_trackers
+                .get(&inst.container_id)
+                .is_some_and(GenerationObservationTracker::is_direct);
         }
         // Derive per-instance efficiency now that this tick's GPU power is known
         // and gen_tps reflects the tracker state for this cycle.
@@ -952,6 +1145,7 @@ pub async fn run_loop(
             if let Some(entry) = runner.state.instances.get_mut(&inst.container_id) {
                 entry.gen_tps = inst.gen_tps;
                 entry.gen_tps_observation = inst.gen_tps_observation.clone();
+                entry.gen_tps_last_request = inst.gen_tps_last_request;
                 entry.tokens_per_watt = inst.tokens_per_watt;
             }
         }
@@ -977,6 +1171,7 @@ pub async fn run_loop(
             }
         }
         warnings.extend(docker_warn.iter().cloned());
+        warnings.extend(lemonade_discovery_warn.iter().cloned());
         warnings.extend(scrape_warns.iter().cloned());
         let snap = Snapshot {
             timestamp: cycle_at,
@@ -1084,6 +1279,7 @@ pub(crate) fn merge_discovery_refresh(
         inst.waiting_reqs = ex.waiting_reqs;
         inst.gen_tps = ex.gen_tps;
         inst.gen_tps_observation = ex.gen_tps_observation.clone();
+        inst.gen_tps_last_request = ex.gen_tps_last_request;
         inst.tokens_per_watt = ex.tokens_per_watt;
         inst.ttft_ms = ex.ttft_ms;
         inst.tpot_ms = ex.tpot_ms;

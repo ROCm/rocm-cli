@@ -21,6 +21,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
+use rocm_dash_core::metrics::Instance;
 use rocm_dash_core::state::JobStatus;
 
 use crate::app::{AppState, UpdateStatus};
@@ -283,14 +284,16 @@ fn draw_hero_left(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     // (and, for `any_tpw_held`, count as held without ever being displayed) —
     // filtered out the same way `tokens_per_watt` is guarded per-instance
     // elsewhere in this tab.
+    // `live_tokens_per_watt` leaves out an efficiency derived from a Lemonade
+    // last-request rate, for the same reason as the T/S hero.
     let tpw: f64 = state
         .instances
         .values()
-        .filter_map(|i| i.tokens_per_watt)
+        .filter_map(Instance::live_tokens_per_watt)
         .filter(|v| v.is_finite())
         .sum();
     let any_tpw_held = state.instances.values().any(|i| {
-        i.tokens_per_watt.is_some_and(f64::is_finite)
+        i.live_tokens_per_watt().is_some_and(f64::is_finite)
             && i.gen_tps_observation
                 .as_ref()
                 .is_some_and(|m| m.freshness == rocm_dash_core::metrics::ObservationFreshness::Held)
@@ -404,15 +407,16 @@ fn draw_hero_right(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     // A single NaN/Infinity instance would otherwise poison the whole sum
     // (rendering "NaN"/"inf" in the hero) and could mark the aggregate held
     // without ever contributing a displayed value — guarded the same way
-    // `gen_tps_cell` guards a single instance's value.
+    // `gen_tps_cell` guards a single instance's value. A Lemonade last-request
+    // rate is not live throughput (it stays put while the server is idle), so
+    // `live_gen_tps` leaves it out of this node total and out of the held check.
     let tps: f64 = state
         .instances
         .values()
-        .filter_map(|i| i.gen_tps)
-        .filter(|v| v.is_finite())
+        .filter_map(Instance::live_gen_tps)
         .sum();
     let any_tps_held = state.instances.values().any(|i| {
-        i.gen_tps.is_some_and(f64::is_finite)
+        i.live_gen_tps().is_some()
             && i.gen_tps_observation
                 .as_ref()
                 .is_some_and(|m| m.freshness == rocm_dash_core::metrics::ObservationFreshness::Held)
@@ -753,6 +757,41 @@ mod tests {
             out.contains(format::HELD_LEGEND),
             "HELD_LEGEND must appear when instance data is held; got:\n{out}"
         );
+    }
+
+    /// The text of the screen row holding `needle`, for a `cols`-wide render.
+    fn row_with(out: &str, cols: usize, needle: &str) -> String {
+        let at = out
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle:?} not rendered:\n{out}"));
+        let chars: Vec<char> = out.chars().collect();
+        let row = out[..at].chars().count() / cols;
+        chars[row * cols..(row + 1) * cols].iter().collect()
+    }
+
+    /// An idle Lemonade server keeps its last request's rate. The same numbers on
+    /// a live instance fill the T/S and tokens/watt heroes; as a last-request rate
+    /// they must not, and held metadata on it adds no marker or legend.
+    #[test]
+    fn home_heroes_leave_out_a_last_request_rate() {
+        let live = render(
+            &state_with_instance(instance_with_obs(300.0, Some(fresh_obs()))),
+            160,
+            30,
+        );
+        assert!(row_with(&live, 160, "T/S").contains("300"), "{live}");
+        assert!(live.contains("1.0 tokens / watt"), "{live}");
+
+        for obs in [fresh_obs(), held_obs()] {
+            let mut inst = instance_with_obs(300.0, Some(obs));
+            inst.gen_tps_last_request = true;
+            let out = render(&state_with_instance(inst), 160, 30);
+            let tps_row = row_with(&out, 160, "T/S");
+            assert!(!tps_row.contains("300"), "{tps_row}");
+            assert!(out.contains("tokens / watt —"), "{out}");
+            assert!(!out.contains("1.0 tokens / watt"), "{out}");
+            assert!(!out.contains(format::HELD_LEGEND), "{out}");
+        }
     }
 
     #[test]

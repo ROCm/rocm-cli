@@ -93,6 +93,10 @@ pub fn instances_on_gpu<'a>(device_id: &str, instances: &'a [Instance]) -> Vec<&
 
 /// Node-level energy efficiency: total generation throughput divided by total board power, in tokens per watt.
 ///
+/// Only live throughput counts: a Lemonade last-request rate (see
+/// [`Instance::live_gen_tps`]) stays unchanged while the server is idle, so it is
+/// left out rather than shown as current efficiency.
+///
 /// `None` when there is no traffic
 /// (`sum gen_tps == 0`) or no power telemetry (`sum power_w == 0`), or when the
 /// result is non-finite.
@@ -102,8 +106,7 @@ pub fn node_efficiency(snap: &Snapshot) -> Option<f64> {
     let tps: f64 = snap
         .instances
         .iter()
-        .filter_map(|i| i.gen_tps)
-        .filter(|v| v.is_finite())
+        .filter_map(Instance::live_gen_tps)
         .sum();
     let power: f64 = snap.gpus.iter().map(|g| f64::from(g.power_w)).sum();
     if tps > 0.0 && power > 0.0 {
@@ -230,6 +233,26 @@ mod tests {
         let xs = vec![inst("vllm-a", &["0"], Some(10.0))];
         assert!(instances_on_gpu("gpu-7", &xs).is_empty());
         assert!(instances_on_gpu("gpu-7", &[]).is_empty());
+    }
+
+    #[test]
+    fn node_efficiency_leaves_out_a_last_request_rate() {
+        let mut idle = inst("lemonade", &["0"], Some(500.0));
+        idle.gen_tps_last_request = true;
+        let snap = Snapshot {
+            gpus: vec![gpu("gpu-0", 100.0)],
+            instances: vec![idle.clone(), inst("vllm", &["0"], Some(30.0))],
+            ..Default::default()
+        };
+        // Only the live 30 tok/s counts: (30) / 100 W, not (530) / 100 W.
+        assert_eq!(node_efficiency(&snap), Some(0.3));
+        // An idle Lemonade server alone is no traffic at all.
+        let only_idle = Snapshot {
+            gpus: vec![gpu("gpu-0", 100.0)],
+            instances: vec![idle],
+            ..Default::default()
+        };
+        assert_eq!(node_efficiency(&only_idle), None);
     }
 
     #[test]

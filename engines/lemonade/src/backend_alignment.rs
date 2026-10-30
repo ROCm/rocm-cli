@@ -19,11 +19,10 @@ use crate::install::{LemonadeInstallManifest, PinFileBackup, read_manifest};
 #[cfg(target_os = "windows")]
 use crate::process::lemonade_process_environment_vars;
 use crate::process::{
-    LemonadeProcessEnvironment, apply_lemonade_process_environment, hide_child_console_window,
-    lemonade_process_environment, run_lemonade_backend_install, spawn_lemond,
-    wait_for_lemonade_cli_status,
+    LemonadeProcessEnvironment, apply_lemonade_process_environment_with_parent,
+    hide_child_console_window, lemonade_process_environment, run_lemonade_backend_install,
+    spawn_lemond, wait_for_lemonade_cli_status,
 };
-#[cfg(target_os = "windows")]
 use crate::runtime_dir::ParentRuntimeEnvironment;
 use crate::state::{free_local_port, terminate_pid};
 use crate::{DEFAULT_HOST, LLAMACPP_RECIPE, ROCM_BACKEND_NAME};
@@ -726,7 +725,13 @@ fn rocm_backend_resolves(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    if apply_lemonade_process_environment(&mut command, process_env).is_err() {
+    if apply_lemonade_process_environment_with_parent(
+        &mut command,
+        process_env,
+        &ParentRuntimeEnvironment::current(),
+    )
+    .is_err()
+    {
         return false;
     }
     let Ok(output) = command.output() else {
@@ -921,7 +926,11 @@ fn best_llamacpp_backend_for_host(manifest: &LemonadeInstallManifest) -> Result<
             log_path,
             &process_env,
         )?;
-        let listing = run_lemonade_backends_list(manifest, &process_env)?;
+        let listing = run_lemonade_backends_list(
+            manifest,
+            &process_env,
+            &ParentRuntimeEnvironment::current(),
+        )?;
         let backends = parse_llamacpp_backend_statuses(&listing);
         Ok(select_best_llamacpp_backend(&backends).map(|(name, _)| name))
     })();
@@ -960,7 +969,28 @@ pub(crate) fn ensure_best_llamacpp_backend(
     process_env: &LemonadeProcessEnvironment,
     force_reinstall: bool,
 ) -> Result<String> {
-    let listing = run_lemonade_backends_list(manifest, process_env)?;
+    ensure_best_llamacpp_backend_with_parent(
+        manifest,
+        host,
+        port,
+        process_env,
+        force_reinstall,
+        &ParentRuntimeEnvironment::current(),
+    )
+}
+
+/// [`ensure_best_llamacpp_backend`] with the parent runtime environment supplied
+/// by the caller, so a serve that was given a confined parent never reads or
+/// creates anything in the host's own.
+pub(crate) fn ensure_best_llamacpp_backend_with_parent(
+    manifest: &mut LemonadeInstallManifest,
+    host: &str,
+    port: u16,
+    process_env: &LemonadeProcessEnvironment,
+    force_reinstall: bool,
+    parent: &ParentRuntimeEnvironment,
+) -> Result<String> {
+    let listing = run_lemonade_backends_list(manifest, process_env, parent)?;
     let backends = parse_llamacpp_backend_statuses(&listing);
     let Some((backend, already_installed)) = select_best_llamacpp_backend(&backends) else {
         bail!(
@@ -980,7 +1010,7 @@ pub(crate) fn ensure_best_llamacpp_backend(
     } else {
         eprintln!("Installing Lemonade {LLAMACPP_RECIPE}:{backend} backend...");
         install_llamacpp_backend_with_retry(|| {
-            run_lemonade_backend_install(manifest, host, port, &backend, process_env)
+            run_lemonade_backend_install(manifest, host, port, &backend, process_env, parent)
         })?;
     }
     Ok(backend)
@@ -1062,6 +1092,7 @@ fn describe_llamacpp_backends(backends: &[(String, String)]) -> String {
 fn run_lemonade_backends_list(
     manifest: &LemonadeInstallManifest,
     process_env: &LemonadeProcessEnvironment,
+    parent: &ParentRuntimeEnvironment,
 ) -> Result<String> {
     let mut command = ProcessCommand::new(&manifest.lemonade);
     command
@@ -1069,7 +1100,7 @@ fn run_lemonade_backends_list(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    apply_lemonade_process_environment(&mut command, process_env)?;
+    apply_lemonade_process_environment_with_parent(&mut command, process_env, parent)?;
     hide_child_console_window(&mut command);
     let output = command
         .output()

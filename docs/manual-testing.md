@@ -283,8 +283,9 @@ rocm serve qwen --engine lemonade --device gpu_required --foreground --port 1143
 
 Expected result:
 
-- The engine uses ROCm GPU execution.
-- The run does not fall back to CPU or Vulkan.
+- The engine uses its selected supported GPU backend, ROCm or Vulkan.
+- The run does not fall back to CPU, and does not select a stale ROCm binary
+  when the installed runtime selects Vulkan.
 - If the GPU cannot be used, the command fails with a clear error.
 - The OpenAI-compatible endpoint answers a simple chat request.
 
@@ -355,6 +356,104 @@ and `driver-install-05`) cover the lines, the verdict and the "installs nothing"
 promise on the Windows GPU lane with whatever driver that machine has. Only the
 old-driver branch needs this manual check: it needs a machine whose display
 driver is dated before 27 July 2023. The logic is also covered by unit tests.
+
+### Named models and dashboard discovery
+
+On Linux or WSL, repeat the serving and inference check with a non-default
+registered model and with its explicit checkpoint:
+
+```bash
+rocm serve qwen-smoke --engine lemonade --managed --port 11435
+# Stop the test-owned service before reusing its port.
+rocm services stop <service-id> --yes
+rocm serve unsloth/Qwen3-0.6B-GGUF:Q4_0 --engine lemonade --managed --port 11435
+```
+
+`rocm serve` returns to the shell once the server is ready. Background is the
+default, and `--managed` is accepted as an explicit synonym. Only `--foreground`
+or `--verbose` attach to the log stream. Use `rocm services` to find the service id.
+
+For each run, confirm that the endpoint answers inference for the requested
+model and that `rocm dash` shows the managed model. A startup announcement alone
+is not proof of a working endpoint. Stop only the services created by this check.
+Simple single-GGUF catalog entries can use direct serving on Linux; registered
+entries needing extra files or model-specific options stay with the router, as
+does a registered checkpoint that is not a plain `owner/repo:variant`, such as
+one whose variant is `*`.
+Explicit checkpoints require the selected GPU backend and must not fall back to
+another backend or CPU when it is missing.
+
+For the complex registered-model check, stop your previous test service and run:
+
+```bash
+rocm serve Qwen3.5-0.8B-GGUF --engine lemonade --managed --port 11435
+```
+
+This catalog entry needs both its GGUF checkpoint and projector file. Confirm
+that inference identifies the requested model and the engine state records
+`load_response.method` as `lemonade-cli`, not a packaged direct-server launch.
+Stop that service with `rocm services stop <service-id> --yes` and confirm its
+endpoint closes. The automated equivalent is the nightly GPU scenario
+`serve-lemonade-complex-registered-inference` in
+[model_serving.feature](../tests/e2e-cucumber/features/model_serving.feature).
+
+For a simple registered name on Linux, such as `Qwen3-0.6B-GGUF`, the engine
+state records `load_response.method` as `lemonade-packaged-llama-server` and a
+non-CPU `backend_requested`. The automated equivalent is
+`serve-lemonade-simple-registered-direct-route` in the same feature file.
+
+For external discovery on Linux or WSL, use a separately running Lemonade server
+with a loaded model. The embedded dashboard daemon probes `127.0.0.1:13305` by
+default. For a non-default endpoint, set these fields in the CLI's `config.json`
+(`~/.rocm/config.json`, or `config.json` in the directory named by
+`ROCM_CLI_CONFIG_DIR`), preserving other configuration:
+
+```json
+{
+  "dashboard": {
+    "daemon": {
+      "enable_lemonade": true,
+      "lemonade_host": "127.0.0.1",
+      "lemonade_port": 13305
+    }
+  }
+}
+```
+
+Confirm the following through the dashboard and the external server:
+
+- Each loaded model appears, without creating a managed service record.
+- With multiple loaded models, throughput is unavailable because endpoint-level
+  last-request statistics cannot be attributed safely. A managed direct
+  `llama-server` also shows unavailable throughput when it has no Lemonade stats API.
+- A managed Lemonade server that answers its health route with 401 or 403 (API
+  key required) stays listed with its registry status, no throughput, and no
+  repeating health warning. External discovery still warns on such a response.
+- A shown rate is the most recent completed request's rate and does not decay
+  while the server is idle. The Instances table shows the legend `Lemonade tok/s =
+  last req tok/s (not live)` and the instance detail reads `last req tok/s:`
+  instead of `gen:`; a managed Lemonade row in the Services overlay and its quick
+  preview reads `last req <rate>` instead of `gen <rate>`. A vLLM row shows neither. With only an idle Lemonade server
+  loaded, the Home and Observe tok/s and tok/W heroes show no throughput instead
+  of repeating that rate.
+- The engine pane distinguishes managed installation from external availability,
+  even when GPU telemetry is unavailable. It reads the managed-runtime status once,
+  when the dashboard starts. After you install Lemonade from the Engines overlay,
+  restart the dashboard to see the new status. When the status cannot be read, the
+  pane says "unknown, run `rocm engines list`", and that command prints each
+  engine's detect result.
+- Unloading a model removes it from the running-model list; reloading restores it.
+  A healthy but unloaded server does not claim a running model.
+- In Observe, open Services with `s`. External models are not managed-service
+  targets. With only external models, the list reports no managed services;
+  pressing `s` or `r` stages no approval and starts no job. Close the list with
+  Escape and confirm the external endpoint is still reachable.
+- Closing the dashboard also leaves the external server reachable.
+- Setting `enable_lemonade` to `false` disables external discovery on the next
+  embedded-daemon launch; managed service records remain visible.
+
+Native Windows has no live dashboard telemetry. These dashboard checks apply to
+Linux and WSL, not the native Windows CLI.
 
 ## 4. Local Server Records
 
@@ -613,7 +712,9 @@ Expected result:
 - From the dashboard (not the launcher), the prompt also offers `s`: pressing
   it closes the prompt and opens the Services overlay, pre-focused on the
   serving model, so you can stop it there through the overlay's own
-  approval+job flow. The launcher's copy of the prompt does not show this
+  approval+job flow. The offer appears once the dashboard lists the service as
+  managed; for a service started a moment earlier it is absent and the printed
+  stop command is the way to stop it. The launcher's copy of the prompt does not show this
   hint or respond to `s` — it has no live Services overlay to jump to — and
   neither does the dashboard on Windows, for the same reason the model's name
   is missing there.

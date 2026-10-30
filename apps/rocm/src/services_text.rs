@@ -538,11 +538,21 @@ fn render_service_logs_text_with_options(
 pub(crate) fn render_service_action_result(tool: &str, value: &serde_json::Value) -> String {
     let output = value.get("output").unwrap_or(value);
     let action = service_action_past_tense(tool);
-    let service = output.get("service").or_else(|| {
-        output
-            .get("result")
-            .and_then(|result| result.get("service"))
-    });
+    // Restart nests the record under `service`; the in-process stop report
+    // ([`stop_internal_managed_service`]) is itself the record's summary, with
+    // `service_id` and `status` directly on `result`.
+    let service = output
+        .get("service")
+        .or_else(|| {
+            output
+                .get("result")
+                .and_then(|result| result.get("service"))
+        })
+        .or_else(|| {
+            output
+                .get("result")
+                .filter(|result| result.get("service_id").is_some())
+        });
     let mut text = String::new();
     let _ = writeln!(text, "Local server {action}");
     if let Some(service) = service {

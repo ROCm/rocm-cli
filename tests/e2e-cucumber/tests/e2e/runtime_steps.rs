@@ -534,6 +534,114 @@ async fn assert_lemonade_backend_alignment_reported(world: &mut E2eWorld) {
     );
 }
 
+/// The Lemonade install `rocm serve` consults before it serves a GGUF directly:
+/// the selected backend and where its `llama-server` lives.
+struct SelectedLemonadeBackend {
+    manifest: serde_json::Value,
+    backend: String,
+    runtime_dir: std::path::PathBuf,
+}
+
+impl SelectedLemonadeBackend {
+    /// Read the manifest the install wrote: the runtime directory and backend are
+    /// what the engine's own lookup (`<runtime_dir>/bin/llamacpp/<backend>/`) uses.
+    fn read(world: &E2eWorld) -> Self {
+        let root = world
+            .isolated_root
+            .as_ref()
+            .expect("scenario has no isolated state root")
+            .path();
+        let manifest_path = root.join("data/engines/lemonade/manifests/runtime.json");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap_or_else(|error| {
+                panic!("failed to read {}: {error}", manifest_path.display())
+            }))
+            .unwrap_or_else(|error| panic!("failed to parse {}: {error}", manifest_path.display()));
+        let field = |name: &str| {
+            manifest[name]
+                .as_str()
+                .unwrap_or_else(|| panic!("no `{name}` in {}: {manifest}", manifest_path.display()))
+                .to_owned()
+        };
+        let (recipe, backend, runtime_dir) = (
+            field("backend_recipe"),
+            field("backend_name"),
+            std::path::PathBuf::from(field("runtime_dir")),
+        );
+        assert_eq!(
+            recipe, "llamacpp",
+            "the selected recipe is not llama.cpp, so direct serving has no llama-server to find: {manifest}"
+        );
+        Self {
+            manifest,
+            backend,
+            runtime_dir,
+        }
+    }
+
+    /// The selected backend's `llama-server`, or the directories searched.
+    fn server(&self) -> Result<std::path::PathBuf, String> {
+        let lookup =
+            e2e_cucumber::lemonade_backend::find_llama_server(&self.runtime_dir, &self.backend)
+                .unwrap_or_else(|reason| panic!("{reason}: {}", self.manifest));
+        lookup.found.ok_or_else(|| {
+            format!(
+                "no llama-server exists for the selected backend `{}` under {}. Searched (flat, or one build-numbered level down):{}",
+                self.backend,
+                self.runtime_dir.display(),
+                lookup
+                    .searched
+                    .iter()
+                    .fold(String::new(), |mut listing, dir| {
+                        use std::fmt::Write as _;
+                        let _ = write!(listing, "\n  {}", dir.display());
+                        listing
+                    })
+            )
+        })
+    }
+}
+
+/// A precondition for the reinstall advice: `rocm serve` tells a user whose
+/// selected backend has no `llama-server` to run
+/// `rocm engines install lemonade --reinstall`. That advice only holds if the
+/// command brings the file back, so the scenario first installs Lemonade (the
+/// plain install, so the later `--reinstall` is what has to repair it).
+#[given("the lemonade engine is installed")]
+async fn setup_lemonade_engine_installed(world: &mut E2eWorld) {
+    crate::run_rocm_ok(world, &["engines", "install", "lemonade"]);
+}
+
+/// Damage the install the way the advice is for: delete the selected backend's
+/// `llama-server`. Asserts it was there first and is gone after, so the Then that
+/// follows a reinstall can only pass if the reinstall restored it.
+#[given("the selected Lemonade backend's llama-server binary has been deleted")]
+async fn delete_lemonade_backend_server(world: &mut E2eWorld) {
+    let selected = SelectedLemonadeBackend::read(world);
+    let binary = selected
+        .server()
+        .unwrap_or_else(|reason| panic!("nothing to delete after the install: {reason}"));
+    std::fs::remove_file(&binary)
+        .unwrap_or_else(|error| panic!("failed to delete {}: {error}", binary.display()));
+    assert!(
+        selected.server().is_err(),
+        "a llama-server still exists for `{}` after deleting {}",
+        selected.backend,
+        binary.display()
+    );
+}
+
+/// Checks the file the direct serve route looks for exists. In runtime-16 it runs
+/// after the file was deleted, so it is the reinstall that put it back; the
+/// lookup is [`e2e_cucumber::lemonade_backend::find_llama_server`].
+#[then("the selected Lemonade backend's llama-server binary is installed")]
+async fn assert_lemonade_backend_server_installed(world: &mut E2eWorld) {
+    let selected = SelectedLemonadeBackend::read(world);
+    if let Err(searched) = selected.server() {
+        panic!("after the reinstall, {searched}");
+    }
+}
+
 /// The CLI names the variable whenever it is set, so a user can tell it was
 /// read -- this alone does not prove alignment was actually skipped.
 ///
