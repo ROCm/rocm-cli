@@ -1240,9 +1240,8 @@ pub fn load_recent_automation_events(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{
-        assert_write_spares_foreign_temp_files, retired_temp_path, temp_app_paths,
-    };
+    use crate::foreign_temp_probe::assert_write_spares_foreign_temp_files;
+    use crate::test_support::{retired_temp_path, temp_app_paths};
 
     #[test]
     fn a_rotation_failure_is_reported_once_per_store() {
