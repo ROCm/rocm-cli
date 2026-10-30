@@ -156,8 +156,9 @@ Expected result:
   `--approve-replacing-active-default` as the flag to add.
 - With `--approve-replacing-active-default`, the install proceeds without
   asking and prints a line crediting that flag by name — not `--yes`.
-- `rocm install sdk ... --dry-run` never prompts or refuses, whatever the
-  active default is: the preview stops before the gate.
+- `rocm install sdk ... --dry-run` never prompts about the active default: the
+  preview stops before that gate. A release install with no exact GPU arch
+  still refuses, including `--dry-run`.
 - rocm-cli creates or reuses a rocm-cli managed Python venv.
 - pip installs pinned `rocm`, `torch`, and `torchvision` requirements with
   exactly one `device-<detected-gfx-target>` extra (`rocm` also requests
@@ -167,8 +168,10 @@ Expected result:
   hardware-verified build for the ROCm line (the vLLM ROCm 10.x row's exact
   torchaudio pin, when that row has one) or the newest published one, which it
   marks as not hardware-verified (a real install also logs that as a `Note:`).
-  On a host with no detectable AMD GPU the preview reports `device_target: undetermined` and a real install refuses
-  rather than pulling every published device payload.
+  On a host with no detectable AMD GPU, an unpinned release install refuses
+  before a plan and asks for an exact `--family`. A nightly preview, or a pin
+  of a ROCm 7 release, reports `device_target: undetermined`, and a real
+  install of those refuses rather than pulling every published device payload.
 - rocm-cli chooses the newest exact ROCm build suffix common to the SDK package
   and the PyTorch stack for the current Python/platform wheel tags, then pins
   all four packages in one pip transaction.

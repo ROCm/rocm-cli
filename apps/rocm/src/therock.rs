@@ -54,9 +54,9 @@ const THEROCK_SOURCE_LAYOUT_GENERATION: &str = "multi-arch-v2";
 /// so a later update reads back the layout that produced the runtime instead of
 /// guessing it from the version.
 const THEROCK_NEXT_LAYOUT_GENERATION: &str = "next-v1";
-/// The first ROCm major version published only in the next layout. A pin at or
-/// past it is the one request the canonical stream provably cannot serve, and
-/// therefore the only thing that selects [`SourceLayout::Next`].
+/// The first ROCm major version published only in the next layout. A stable pin
+/// at or past it selects [`SourceLayout::Next`], and so does an unpinned
+/// release-channel install, which resolves the newest stable version there.
 const THEROCK_NEXT_MIN_MAJOR: u32 = 10;
 const DEFAULT_MANAGED_PYTHON_VERSION: &str = "3.12";
 /// Interpreter `uv` provisions for a [`SourceLayout::Next`] install. See
@@ -87,10 +87,13 @@ enum TheRockChannel {
 /// Which published hosting layout a resolution reads from.
 ///
 /// Orthogonal to [`TheRockChannel`]. `Canonical` is the release/nightly stream
-/// the CLI has always installed and remains the answer for every request that
-/// does not explicitly ask for something else. `Next` is ROCm 10's separately
-/// hosted layout — an extension, never a fallback: nothing degrades into it and
-/// nothing degrades out of it, so a canonical install resolves exactly the URLs,
+/// the CLI has always installed. It remains the answer for nightly auto-select,
+/// for any pin that is not a stable ROCm >= [`THEROCK_NEXT_MIN_MAJOR`] version,
+/// and for an update of a runtime that was installed from it. `Next` is ROCm
+/// 10's separately hosted layout. An unpinned release-channel install reads it
+/// for the newest stable version, and so does an explicit stable pin at
+/// ROCm >= [`THEROCK_NEXT_MIN_MAJOR`]. It is never a fallback: a request that
+/// cannot use it refuses, and a canonical install still resolves the URLs,
 /// device target, and package specs it resolved before the layout existed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SourceLayout {
@@ -292,35 +295,57 @@ fn next_layout_requested(selector: &RuntimeVersionSelector) -> bool {
     })
 }
 
+/// Whether this request reads [`SourceLayout::Next`] before arch and channel
+/// checks. An explicit stable pin at ROCm >= [`THEROCK_NEXT_MIN_MAJOR`] does,
+/// and so does an unpinned release-channel install. Nightly auto-select, a
+/// build date, an unparseable pin, a prerelease, and any stable pin below that
+/// major stay on the canonical stream.
+fn selects_next_layout(
+    channel: TheRockChannel,
+    version_selector: Option<&RuntimeVersionSelector>,
+) -> bool {
+    if version_selector.is_some_and(next_layout_requested) {
+        return true;
+    }
+    version_selector.is_none() && matches!(channel, TheRockChannel::Release)
+}
+
 /// The layout an install must read from, and the refusal when it cannot.
 ///
-/// Only an explicit pin at ROCm >= [`THEROCK_NEXT_MIN_MAJOR`] selects `Next`,
-/// because that is the one request the canonical stream provably cannot serve.
-/// No selector, a build date, an unparseable pin, or an older pin all stay
-/// canonical, so nothing that resolves today starts resolving somewhere else.
-/// A pin that does reach `Next` still needs an exact arch, because that layout
-/// picks its device payload by exact arch and a grouped family names none.
+/// [`selects_next_layout`] decides the route. A pin that names a stable
+/// ROCm >= [`THEROCK_NEXT_MIN_MAJOR`] version on a channel other than release
+/// is refused: that layout has no nightly stream. Every route onto `Next`
+/// needs an exact arch, because that layout picks its device payload by exact
+/// arch and a grouped family names none. A missing arch stops here. It does
+/// not fall back to the canonical stream.
 fn select_source_layout(
     channel: TheRockChannel,
     family_resolution: &FamilyResolution,
     version_selector: Option<&RuntimeVersionSelector>,
 ) -> Result<SourceLayout> {
-    let Some(selector) = version_selector.filter(|selector| next_layout_requested(selector)) else {
+    if !selects_next_layout(channel, version_selector) {
         return Ok(SourceLayout::Canonical);
-    };
-    let RuntimeVersionSelector::Version(version) = selector else {
-        return Ok(SourceLayout::Canonical);
-    };
-    let major = parse_version(version).map_or(THEROCK_NEXT_MIN_MAJOR, |parsed| parsed.major);
-    if !matches!(channel, TheRockChannel::Release) {
+    }
+    let pinned = version_selector.and_then(|selector| match selector {
+        RuntimeVersionSelector::Version(version) => Some(version.as_str()),
+        RuntimeVersionSelector::BuildDate(_) => None,
+    });
+    let major = pinned
+        .and_then(parse_version)
+        .map_or(THEROCK_NEXT_MIN_MAJOR, |parsed| parsed.major);
+    if let Some(version) = pinned.filter(|_| !matches!(channel, TheRockChannel::Release)) {
         bail!(
             "ROCm {major} and newer is published only on the release channel; re-run `rocm install sdk --channel release --version {version}`"
         );
     }
     if family_resolution.raw_arch.is_none() {
+        let example = match pinned {
+            Some(version) => format!("`rocm install sdk --version {version} --family gfx1200`"),
+            None => "`rocm install sdk --family gfx1200`".to_owned(),
+        };
         bail!(
             "installing ROCm {major} requires an exact GPU arch, but the resolved target family `{}` names a group of them.\n\
-             ROCm {major} selects its device payload by exact arch, so re-run with the one this host has, for example `rocm install sdk --version {version} --family gfx1200`.\n\n{}",
+             ROCm {major} selects its device payload by exact arch, so re-run with the one this host has, for example {example}.\n\n{}",
             family_resolution.family,
             detect_host_gpu_diagnostics()
         );
@@ -1114,9 +1139,11 @@ pub(crate) fn install_sdk(
         ),
         "tarball" => {
             // A tarball catalog lists whole archives, not a resolvable package
-            // graph, so there is nothing to pin a version against — except the
-            // ROCm 10 catalog, which is reachable *only* by naming a version,
-            // because nothing else distinguishes it from the canonical one.
+            // graph, so there is nothing to pin a version against on the
+            // canonical stream. The next catalog is reachable without a pin on
+            // the release channel (it installs the newest stable there) and by
+            // naming a stable ROCm >= THEROCK_NEXT_MIN_MAJOR version; any other
+            // selector still has to use `--format wheel`.
             if let Some(selector) = version_selector.as_ref()
                 && !next_layout_requested(selector)
             {
@@ -1824,33 +1851,38 @@ fn install_wheel_runtime(
     // does internally.
     let recovered_family_override = family_override
         .map(|family| family_override_or_recovered_arch(family, device_target_override));
-    // Fail fast on a request `resolve_pip_runtime` could only ever reject (wrong
-    // channel, or a grouped family with no exact arch) before paying for Python
-    // provisioning below, which can mean a real download for a layout this host
-    // or channel can never actually use.
-    select_source_layout(
-        channel,
-        &resolve_family(paths, recovered_family_override.as_deref())?,
-        version_selector,
-    )?;
+    // Fail fast on a fresh request `resolve_pip_runtime` could only ever reject
+    // (wrong channel, or a grouped family with no exact arch) before paying for
+    // Python provisioning below, which can mean a real download for a layout
+    // this host or channel can never actually use. An update already recorded
+    // its layout; re-deciding from the absent selector would treat a canonical
+    // runtime's refresh as an unpinned release install.
+    if layout_override.is_none() {
+        select_source_layout(
+            channel,
+            &resolve_family(paths, recovered_family_override.as_deref())?,
+            version_selector,
+        )?;
+    }
     // The interpreter has to be picked before `resolve_pip_runtime`, which
     // selects wheels using that interpreter's own tags. `requested_source_layout`
-    // only answers from the *request*: an explicit stable ROCm 10+ pin already
-    // routes to `Next` and gets `cp314` that way, but a plain auto-select or a
-    // nightly build-date/prerelease pin always reports `Canonical`, even once
-    // the canonical/nightly feed's own "latest" has rotated past that major on
-    // its own, with no `Next` routing involved. `canonical_auto_select_needs_next_python`
+    // answers from the *request*: an unpinned release install and an explicit
+    // stable ROCm 10+ pin both route to `Next` and get `cp314` that way. A
+    // nightly build-date/prerelease pin still reports `Canonical`, even once
+    // the nightly feed's own "latest" has rotated past that major on its own,
+    // with no `Next` routing involved. `canonical_auto_select_needs_next_python`
     // peeks the channel's own `rocm` listing to catch that case.
-    let python_requirement = match requested_source_layout(layout_override, version_selector) {
-        SourceLayout::Next => python_requirement(SourceLayout::Next),
-        SourceLayout::Canonical => {
-            if canonical_auto_select_needs_next_python(paths, channel, version_selector)? {
-                python_requirement(SourceLayout::Next)
-            } else {
-                python_requirement(SourceLayout::Canonical)
+    let python_requirement =
+        match requested_source_layout(layout_override, channel, version_selector) {
+            SourceLayout::Next => python_requirement(SourceLayout::Next),
+            SourceLayout::Canonical => {
+                if canonical_auto_select_needs_next_python(paths, channel, version_selector)? {
+                    python_requirement(SourceLayout::Next)
+                } else {
+                    python_requirement(SourceLayout::Canonical)
+                }
             }
-        }
-    };
+        };
     progress_line(format!(
         "Checking Python for the ROCm install; if needed, ROCm CLI will prepare Python {}.",
         managed_python_version(python_requirement)
@@ -3134,10 +3166,10 @@ fn resolve_pip_runtime_with_timeout(
     })?;
     let published_device_targets = parse_aggregate_device_targets(&root_html);
     // The canonical stream validates against what this host reports, exactly as
-    // before. The next layout is reachable only through an explicit pin that
-    // already carried a validated exact arch, and that arch — not a second probe
-    // of whatever card happens to be plugged in — is what the pin asked to
-    // install for.
+    // before. The next layout is reached only after `select_source_layout` has
+    // already validated an exact arch on the family resolution, and that arch —
+    // not a second probe of whatever card happens to be plugged in — is what the
+    // install asked for.
     let detected_target = match layout {
         SourceLayout::Canonical => detect_host_gfx_target(),
         SourceLayout::Next => family_resolution.raw_arch.clone(),
@@ -3423,7 +3455,10 @@ fn tarball_family_token(layout: SourceLayout, family: &str) -> &str {
 /// all, and whose mtime is *later* than the archive they shadow, so an unfiltered
 /// "newest wins" would pick the wrong file. Requiring a parseable stable version
 /// excludes them without inventing a second grammar for the canonical catalogs,
-/// which publish no such siblings and have never been held to one.
+/// which publish no such siblings and have never been held to one. Among the
+/// stables that remain, the release channel orders by version, so a republished
+/// older archive cannot outrank a newer stable version. Nightly keeps upload
+/// time as the first key.
 fn select_tarball_candidate(
     files: &[TarballIndexFile],
     channel: TheRockChannel,
@@ -3454,11 +3489,20 @@ fn select_tarball_candidate(
         })
         .collect::<Vec<_>>();
     candidates.sort_by(|left, right| {
-        left.0
-            .mtime
-            .partial_cmp(&right.0.mtime)
-            .unwrap_or(Ordering::Equal)
-            .then_with(|| compare_version_strings(&left.1, &right.1))
+        if matches!(channel, TheRockChannel::Release) {
+            compare_version_strings(&left.1, &right.1).then_with(|| {
+                left.0
+                    .mtime
+                    .partial_cmp(&right.0.mtime)
+                    .unwrap_or(Ordering::Equal)
+            })
+        } else {
+            left.0
+                .mtime
+                .partial_cmp(&right.0.mtime)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| compare_version_strings(&left.1, &right.1))
+        }
     });
     candidates.pop()
 }
@@ -6253,11 +6297,11 @@ struct PythonRequirement {
 /// Keyed on the layout rather than on a resolved ROCm version because the
 /// interpreter has to be chosen *before* resolution: `resolve_pip_runtime` picks
 /// wheels using the interpreter's own tags, so the resolved version is not
-/// available yet. The layout is an honest stand-in only when it was decided
-/// from an explicit stable pin (`next_layout_requested`); a fresh install with
-/// no pin, or a nightly build-date/prerelease pin, needs
-/// [`canonical_auto_select_needs_next_python`] to check whether the channel's
-/// own "latest" has rotated past [`THEROCK_NEXT_MIN_MAJOR`] on its own.
+/// available yet. The layout is decided by [`requested_source_layout`] (an
+/// unpinned release install or an explicit stable ROCm >= 10 pin). A nightly
+/// build-date/prerelease pin that stays on `Canonical` still needs
+/// [`canonical_auto_select_needs_next_python`] when that feed's own "latest"
+/// has rotated past [`THEROCK_NEXT_MIN_MAJOR`] on its own.
 const fn python_requirement(layout: SourceLayout) -> PythonRequirement {
     match layout {
         SourceLayout::Next => PythonRequirement {
@@ -6273,32 +6317,35 @@ const fn python_requirement(layout: SourceLayout) -> PythonRequirement {
 
 /// The layout an install or update will read from, as far as is knowable before
 /// an interpreter has been chosen. An update passes its manifest's recorded
-/// layout; a fresh install passes its request and lets the pin decide.
+/// layout; a fresh install passes its channel and selector and lets
+/// [`selects_next_layout`] decide.
 fn requested_source_layout(
     layout_override: Option<SourceLayout>,
+    channel: TheRockChannel,
     version_selector: Option<&RuntimeVersionSelector>,
 ) -> SourceLayout {
     match layout_override {
         Some(layout) => layout,
-        None if version_selector.is_some_and(next_layout_requested) => SourceLayout::Next,
+        None if selects_next_layout(channel, version_selector) => SourceLayout::Next,
         None => SourceLayout::Canonical,
     }
 }
 
-/// Whether a `Canonical`-layout install (auto-select, or a nightly
+/// Whether a `Canonical`-layout install (nightly auto-select, or a nightly
 /// build-date/prerelease pin) will actually resolve a ROCm build at major >=
 /// [`THEROCK_NEXT_MIN_MAJOR`], regardless of [`VersionStage`].
 ///
-/// `requested_source_layout` only answers from the shape of the request: an
-/// explicit *stable* pin at ROCm >= `THEROCK_NEXT_MIN_MAJOR` routes to `Next`
-/// and gets `cp314` that way, but the canonical/nightly feed can resolve a
-/// ROCm >= `THEROCK_NEXT_MIN_MAJOR` build (stable or prerelease) on its own,
-/// with no `Next` routing involved — and the `cp314` requirement is a property
-/// of the build itself, not of which index served it. Fetching the channel's
-/// own interpreter-agnostic `rocm` listing ahead of interpreter selection is
-/// the only way to know; `resolve_pip_runtime` re-fetches the same URL for the
-/// real resolution afterwards and shares this call's cache entry, so this
-/// costs no extra network round trip.
+/// `requested_source_layout` answers from the shape of the request: an
+/// unpinned release install and an explicit *stable* pin at ROCm >=
+/// `THEROCK_NEXT_MIN_MAJOR` both route to `Next` and get `cp314` that way, but
+/// the nightly feed can resolve a ROCm >= `THEROCK_NEXT_MIN_MAJOR` build
+/// (stable or prerelease) on its own, with no `Next` routing involved — and
+/// the `cp314` requirement is a property of the build itself, not of which
+/// index served it. Fetching the channel's own interpreter-agnostic `rocm`
+/// listing ahead of interpreter selection is the only way to know;
+/// `resolve_pip_runtime` re-fetches the same URL for the real resolution
+/// afterwards and shares this call's cache entry, so this costs no extra
+/// network round trip.
 fn canonical_auto_select_needs_next_python(
     paths: &AppPaths,
     channel: TheRockChannel,
@@ -6738,7 +6785,8 @@ fn validate_tarball_file_name(name: &str) -> Result<()> {
 /// Total order over published version strings — the total order used for
 /// sorting candidates in this module's "which build does the user get?"
 /// decisions. It is not always the first key: [`select_tarball_candidate`]
-/// orders by upload time first and uses this only to break ties.
+/// orders a nightly catalog by upload time first and uses this only to break
+/// ties. The release channel orders by this comparison first.
 ///
 /// Ordering is PEP 440's, because these strings come from a Python simple
 /// index: within one release `7.0.0.dev1` < `7.0.0a1` < `7.0.0b1` <
@@ -7330,22 +7378,16 @@ mod tests {
         }
     }
 
-    /// Everything a user can ask for today must keep resolving the canonical
-    /// stream. The next layout is an extension, so no existing request may start
-    /// answering from somewhere else.
+    /// A build date, an older stable pin, and a string that is not a version
+    /// stay on the canonical stream. An unpinned nightly install does too.
     #[test]
-    fn only_a_rocm_10_pin_leaves_the_canonical_layout() {
+    fn selectors_that_are_not_stable_rocm_10_stay_canonical() {
         let exact = family_for_test("gfx120X-all", Some("gfx1200"));
         let build_date = RuntimeVersionSelector::build_date("2026-06-05").unwrap();
-        let older_pin = RuntimeVersionSelector::version("7.14.0").unwrap();
+        let older_pin = RuntimeVersionSelector::version("7.14.1").unwrap();
         let unparseable = RuntimeVersionSelector::version("main").unwrap();
 
-        for selector in [
-            None,
-            Some(&build_date),
-            Some(&older_pin),
-            Some(&unparseable),
-        ] {
+        for selector in [Some(&build_date), Some(&older_pin), Some(&unparseable)] {
             assert_eq!(
                 select_source_layout(TheRockChannel::Release, &exact, selector).unwrap(),
                 SourceLayout::Canonical,
@@ -7353,10 +7395,56 @@ mod tests {
             );
         }
 
-        let pin = RuntimeVersionSelector::version("10.0.0").unwrap();
+        assert_eq!(
+            select_source_layout(TheRockChannel::Nightly, &exact, None).unwrap(),
+            SourceLayout::Canonical,
+            "an unpinned nightly install stays on the nightly canonical stream"
+        );
+
+        let pin = RuntimeVersionSelector::version("10.1.0").unwrap();
         assert_eq!(
             select_source_layout(TheRockChannel::Release, &exact, Some(&pin)).unwrap(),
             SourceLayout::Next
+        );
+    }
+
+    /// Reverting the unpinned release route to `Canonical` fails this test.
+    /// The arch is exact (`gfx1151`), so the only way the result is `Canonical`
+    /// is the default route itself.
+    #[test]
+    fn unpinned_release_selects_the_next_layout() {
+        let exact = family_for_test("gfx115X-all", Some("gfx1151"));
+
+        assert_eq!(
+            select_source_layout(TheRockChannel::Release, &exact, None).unwrap(),
+            SourceLayout::Next
+        );
+        assert_eq!(
+            requested_source_layout(None, TheRockChannel::Release, None),
+            SourceLayout::Next
+        );
+        assert_eq!(
+            python_requirement(requested_source_layout(None, TheRockChannel::Release, None))
+                .version,
+            "3.14"
+        );
+    }
+
+    /// A grouped family on an unpinned release install stops. It does not fall
+    /// back to the canonical stream, which would install without an exact arch.
+    #[test]
+    fn unpinned_release_without_an_exact_arch_refuses_instead_of_falling_back() {
+        let grouped = family_for_test("gfx120X-all", None);
+
+        let error = select_source_layout(TheRockChannel::Release, &grouped, None)
+            .expect_err("a grouped family cannot select a device payload")
+            .to_string();
+
+        assert!(error.contains("requires an exact GPU arch"), "{error}");
+        assert!(error.contains("--family gfx1200"), "{error}");
+        assert!(
+            !error.contains("--version"),
+            "an unpinned refusal must not invent a version pin: {error}"
         );
     }
 
@@ -10226,31 +10314,126 @@ mod tests {
     }
 
     /// The requirement is read before `resolve_pip_runtime` runs, so it has to
-    /// be derivable from the request alone. Only an explicit stable ROCm >= 10
-    /// pin reaches the next layout; a build-date pin, an older pin, or no
-    /// selector at all must stay canonical so nothing that installs today
-    /// starts demanding a different interpreter.
+    /// be derivable from the request alone. An unpinned release install and an
+    /// explicit stable ROCm >= 10 pin reach the next layout. Nightly
+    /// auto-select, a build-date pin, and an older pin stay canonical.
     #[test]
     fn requested_source_layout_reads_the_request_not_the_resolution() {
         let next_pin = RuntimeVersionSelector::Version("10.1.0".to_owned());
         assert_eq!(
-            requested_source_layout(None, Some(&next_pin)),
+            requested_source_layout(None, TheRockChannel::Release, Some(&next_pin)),
             SourceLayout::Next
         );
-
-        let old_pin = RuntimeVersionSelector::Version("7.2.3".to_owned());
         assert_eq!(
-            requested_source_layout(None, Some(&old_pin)),
+            python_requirement(requested_source_layout(
+                None,
+                TheRockChannel::Release,
+                Some(&next_pin)
+            ))
+            .version,
+            "3.14"
+        );
+
+        let old_pin = RuntimeVersionSelector::Version("7.14.1".to_owned());
+        assert_eq!(
+            requested_source_layout(None, TheRockChannel::Release, Some(&old_pin)),
             SourceLayout::Canonical
         );
-        assert_eq!(requested_source_layout(None, None), SourceLayout::Canonical);
-
-        // An update supplies its manifest's layout, which wins over the (absent)
-        // selector so the runtime keeps the interpreter its stream needs.
         assert_eq!(
-            requested_source_layout(Some(SourceLayout::Next), None),
+            python_requirement(requested_source_layout(
+                None,
+                TheRockChannel::Release,
+                Some(&old_pin)
+            ))
+            .version,
+            "3.12"
+        );
+        // A two-component selector does not parse as stable >= 10.
+        let line_pin = RuntimeVersionSelector::Version("10.1".to_owned());
+        assert_eq!(
+            requested_source_layout(None, TheRockChannel::Release, Some(&line_pin)),
+            SourceLayout::Canonical
+        );
+
+        assert_eq!(
+            requested_source_layout(None, TheRockChannel::Release, None),
             SourceLayout::Next
         );
+        assert_eq!(
+            requested_source_layout(None, TheRockChannel::Nightly, None),
+            SourceLayout::Canonical
+        );
+        assert_eq!(
+            python_requirement(requested_source_layout(None, TheRockChannel::Nightly, None))
+                .version,
+            "3.12"
+        );
+
+        // An update supplies its manifest's layout, which wins over the absent
+        // selector so a canonical runtime is not moved onto the next layout.
+        // `multi-arch-v2` is the generation those manifests record.
+        let recorded_canonical = SourceLayout::from_generation(Some("multi-arch-v2")).unwrap();
+        assert_eq!(recorded_canonical, SourceLayout::Canonical);
+        assert_eq!(
+            requested_source_layout(Some(recorded_canonical), TheRockChannel::Release, None),
+            SourceLayout::Canonical,
+            "updating a multi-arch-v2 runtime must stay on the canonical stream"
+        );
+        assert_eq!(
+            requested_source_layout(Some(SourceLayout::Next), TheRockChannel::Release, None),
+            SourceLayout::Next
+        );
+    }
+
+    /// Release auto-select takes the highest stable version. A prerelease
+    /// newer than that stable, and an older stable, both lose.
+    #[test]
+    fn release_auto_select_picks_the_newest_stable_not_a_newer_prerelease() {
+        let versions = vec![
+            "10.0.0".to_owned(),
+            "10.2.0rc1".to_owned(),
+            "10.1.0".to_owned(),
+            "10.1.1a20261030".to_owned(),
+        ];
+
+        assert_eq!(
+            select_rocm_version(TheRockChannel::Release, &versions, None).as_deref(),
+            Some("10.1.0")
+        );
+    }
+
+    /// Same rule on the tarball catalog: a later mtime on an older stable, or
+    /// on a prerelease, does not beat the newest stable version.
+    #[test]
+    fn unpinned_next_tarball_picks_the_newest_stable_not_a_later_prerelease() {
+        let platform = platform_tarball_token();
+        let prefix = format!("therock-dist-{platform}-gfx120X-all-");
+        let files = vec![
+            TarballIndexFile {
+                name: format!("{prefix}10.0.0.tar.gz"),
+                mtime: 30.0,
+            },
+            TarballIndexFile {
+                name: format!("{prefix}10.1.0.tar.gz"),
+                mtime: 10.0,
+            },
+            TarballIndexFile {
+                name: format!("{prefix}10.2.0rc1.tar.gz"),
+                mtime: 40.0,
+            },
+        ];
+
+        let (file, version) = select_tarball_candidate(
+            &files,
+            TheRockChannel::Release,
+            SourceLayout::Next,
+            "gfx120X-all",
+            None,
+        )
+        .expect("the newest stable archive must be selectable");
+
+        assert_eq!(version, "10.1.0");
+        assert!(file.name.ends_with("10.1.0.tar.gz"), "{}", file.name);
     }
 
     /// A tag mismatch and a broken venv are different failures with different

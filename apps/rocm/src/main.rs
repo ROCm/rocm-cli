@@ -769,10 +769,16 @@ enum BenchCommand {
 #[derive(Subcommand, Debug)]
 enum InstallTarget {
     /// Install TheRock ROCm wheels into a Python folder managed by ROCm CLI.
+    ///
+    /// With no `--version` on the release channel, this installs the newest
+    /// stable ROCm 10 release and needs an exact GPU arch (`--family gfx1200`).
+    /// `--channel nightly` with no version stays on the nightly index.
+    /// `--version 7.14.1` installs that release from the earlier index.
     #[command(after_help = "EXAMPLES:\n  \
 rocm install sdk\n  \
+rocm install sdk --family gfx1200 --dry-run\n  \
+rocm install sdk --version 7.14.1 --family gfx110X-all --dry-run\n  \
 rocm install sdk --channel nightly --build-date 2025-01-15\n  \
-rocm install sdk --family gfx110X-all --dry-run\n  \
 rocm install sdk --devel")]
     Sdk {
         /// Package channel to install, such as release or nightly.
@@ -792,7 +798,10 @@ rocm install sdk --devel")]
         build_date: Option<String>,
         /// TheRock GPU package family to install, such as gfx110X-all.
         ///
-        /// A GPU target ROCm publishes no build for is refused rather than
+        /// ROCm 10, including `rocm install sdk` with no `--version` on the
+        /// release channel, rejects a family label and asks for an exact arch
+        /// such as `--family gfx1200`. A GPU target ROCm publishes no build
+        /// for is refused rather than
         /// mapped to a near neighbour: `--family gfx90c` - the Vega iGPU in
         /// Renoir, Lucienne, Cezanne and Barcelo APUs - fails and installs
         /// nothing, instead of substituting another family. A plain `rocm

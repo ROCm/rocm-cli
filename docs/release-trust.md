@@ -253,8 +253,9 @@ ROCM_CLI_THEROCK_NEXT_TARBALL_BASE
 ```
 
 The last two address the ROCm 10 ("next") source layout, which is a layout
-rather than a channel: it has no nightly counterpart and is never resolved
-unless an install explicitly pins a ROCm version of 10 or newer.
+rather than a channel: it has no nightly counterpart. An unpinned release
+install resolves it, and so does an explicit pin of a stable ROCm version of
+10 or newer. `--channel nightly` with no version stays on the nightly index.
 
 None of these take effect unless `ROCM_CLI_THEROCK_ALLOW_BASE_OVERRIDE` is also
 set to a non-empty value. Without that gate, a stray override left in a

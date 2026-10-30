@@ -252,11 +252,13 @@ This downloads TheRock ROCm wheels and a matching PyTorch stack into a managed
 environment. Running `rocm install sdk` creates a managed runtime alongside any
 legacy install.
 
-ROCm CLI supports ROCm 7.14, 10.0, and 10.1. Without `--version`,
-`rocm install sdk` currently installs ROCm 7.14. To install ROCm 10.0 or 10.1,
-add `--version`. If ROCm CLI can't tell which exact GPU arch this computer has,
-or you want a different one, also add `--family` with the raw `gfx` code from
-`rocm examine`. For example: `--version 10.1.0 --family gfx1200`.
+ROCm CLI supports ROCm 7.14 and the ROCm 10 line. Without `--version`,
+`rocm install sdk` on the release channel installs the newest stable ROCm 10
+release. That release needs an exact GPU arch. If ROCm CLI can't tell which
+arch this computer has, or you want a different one, add `--family` with the
+raw `gfx` code from `rocm examine`. For example: `--family gfx1200`.
+To install ROCm 7.14.1 instead, pass `--version 7.14.1`. `--channel nightly`
+with no version stays on the nightly stream.
 
 Running `rocm install sdk` when a managed runtime is already the active default
 asks first, because the new install takes over as the active default; see
@@ -451,9 +453,10 @@ rocm update         [--apply] [--runtime KEY] [--activate] [--dry-run]
 ```
 
 `install sdk` downloads TheRock ROCm wheels into a Python environment managed
-by ROCm CLI. ROCm CLI supports ROCm 7.14, 10.0, and 10.1. Without `--version`,
-it currently installs ROCm 7.14. To install 10.0 or 10.1, follow the steps under
-ROCm 10 and newer, below.
+by ROCm CLI. On the release channel, with no `--version`, it installs the
+newest stable ROCm 10 release. Pass `--version 7.14.1` to install that older
+release instead. `--channel nightly` with no version stays on the nightly
+stream. ROCm 10 needs an exact GPU arch; see ROCm 10 and newer, below.
 
 To remove ROCm CLI and what it manages, see
 [Logs and cleanup](#logs-and-cleanup).
@@ -527,14 +530,16 @@ active default runtime, not about what a named prefix loses.
 
 #### ROCm 10 and newer
 
-ROCm 10 and newer ship from a different source layout. You opt in by pinning the
-version with `--version`. These versions select their device payload by exact
-GPU arch, so when ROCm CLI can't resolve one for this computer (it detects only
-a family of GPUs, or none), or you want to target a different GPU, also pass
-`--family` with the raw `gfx` code instead of a family label:
+ROCm 10 and newer ship from a different source layout than ROCm 7. On the
+release channel, `rocm install sdk` with no `--version` installs the newest
+stable release from that layout and prepares Python 3.14 for it. These
+versions select their device payload by exact GPU arch, so when ROCm CLI can't
+resolve one for this computer (it detects only a family of GPUs, or none), or
+you want to target a different GPU, also pass `--family` with the raw `gfx`
+code instead of a family label:
 
 ```
-rocm install sdk --version 10.1.0 --family gfx1200 --dry-run
+rocm install sdk --family gfx1200 --dry-run
 ```
 
 A family label such as `--family gfx120X-all` is rejected for those versions
@@ -561,10 +566,14 @@ dependency metadata alongside the pinned torchaudio. Before it creates or
 changes a managed runtime, it validates that every selected framework package
 carries the same ROCm build identifier.
 
-Nothing about this happens on its own. Without a `--version` of 10 or newer,
-`install sdk` resolves the same release and nightly sources as before. It doesn't
-quietly retry against the ROCm 10 sources when a lookup finds nothing; it tells
-you what it couldn't find instead.
+An older release stays on the earlier source. `rocm install sdk --version 7.14.1`
+installs 7.14.1 from that source and uses Python 3.12. `--channel nightly` with
+no version stays on the nightly stream. Pinning a ROCm 10 version still works,
+for example `rocm install sdk --version 10.1.0 --family gfx1200`. Updating a
+runtime keeps the source layout that installed it, so `rocm update` does not
+move a ROCm 7 runtime onto ROCm 10. The install does not quietly retry the
+other source when a lookup finds nothing; it tells you what it couldn't find
+instead.
 
 #### Driver installation
 

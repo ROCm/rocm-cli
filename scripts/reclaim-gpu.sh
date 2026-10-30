@@ -710,7 +710,7 @@ self_test() {
   TERM_GRACE_SECS=2
 
   # The real shape: lemonade's engine binary inside the shared pre-warm runtime.
-  prewarm_decoy="${tmp}/e2e-prewarm-multi-arch-v2/data/runtimes/wheel/release-wheel-multi-arch-7-14-1-deadbeef/engines/lemonade/runtime/bin/llamacpp/rocm-stable/llama-b9752/llama-server"
+  prewarm_decoy="${tmp}/e2e-prewarm-next-v1/data/runtimes/wheel/release-wheel-multi-arch-7-14-1-deadbeef/engines/lemonade/runtime/bin/llamacpp/rocm-stable/llama-b9752/llama-server"
   # A manual-testing serve on a shared runner: an engine, but no E2E root.
   workload_decoy="${tmp}/workload/manual-serve/llama-server"
   # An E2E root with NO engine marker — the suite's own test binary under
@@ -720,7 +720,7 @@ self_test() {
   # Same shape as the pre-warm decoy but ignores SIGTERM, so the escalation this
   # script adds is reached. Without it, TERM alone ends every decoy and both the
   # SIGKILL block and the `kill -TERM` call can be removed with the test green.
-  stubborn_decoy="${tmp}/e2e-prewarm-multi-arch-v2/data/runtimes/wheel/release-wheel-multi-arch-7-14-1-deadbeef/engines/lemonade/runtime/bin/llamacpp/rocm-stable/llama-b9753/llama-server"
+  stubborn_decoy="${tmp}/e2e-prewarm-next-v1/data/runtimes/wheel/release-wheel-multi-arch-7-14-1-deadbeef/engines/lemonade/runtime/bin/llamacpp/rocm-stable/llama-b9753/llama-server"
   # Matches the rule in full — an E2E root AND an engine marker — but lies
   # OUTSIDE the scope. It is the only fixture the SELFTEST_SCOPE filter can be
   # observed doing anything to, and therefore the only reason check 7 can fail.
@@ -729,7 +729,7 @@ self_test() {
   # two bytes the pid<TAB>cmdline<NEWLINE> record format is built out of. Without
   # a fixture whose command line contains them, the format is only ever exercised
   # on strings that cannot break it.
-  delimiter_decoy="${tmp}/e2e-prewarm-multi-arch-v2/data/runtimes/wheel/release-wheel-multi-arch-7-14-1-deadbeef/engines/lemonade/runtime/bin/llamacpp/rocm-stable/llama-b9754/llama-server"
+  delimiter_decoy="${tmp}/e2e-prewarm-next-v1/data/runtimes/wheel/release-wheel-multi-arch-7-14-1-deadbeef/engines/lemonade/runtime/bin/llamacpp/rocm-stable/llama-b9754/llama-server"
 
   # Each pid is registered with the EXIT trap the moment it exists, for the same
   # reason the scratch-dir traps above are widened one statement at a time:
@@ -1293,7 +1293,7 @@ self_test() {
   #     that survived a reclaim, and a check driven from a pre-reclaim pid
   #     would pass against an assert_clear that merely replayed check 10's
   #     selection instead of taking its own.
-  late_decoy="${tmp}/e2e-prewarm-multi-arch-v2/data/runtimes/wheel/release-wheel-multi-arch-7-14-1-deadbeef/engines/lemonade/runtime/bin/llamacpp/rocm-stable/llama-b9755/llama-server"
+  late_decoy="${tmp}/e2e-prewarm-next-v1/data/runtimes/wheel/release-wheel-multi-arch-7-14-1-deadbeef/engines/lemonade/runtime/bin/llamacpp/rocm-stable/llama-b9755/llama-server"
   late_pid="$(spawn_decoy "${late_decoy}")"
   selftest_track_decoy "${late_pid}"
   decoy_pids+=("${late_pid}")
