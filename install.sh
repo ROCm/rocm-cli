@@ -321,6 +321,64 @@ record_path_edit() {
   printf '%s\n' "$1" >> "${record}"
 }
 
+fish_config_path() {
+  printf '%s\n' "${HOME}/.config/fish/config.fish"
+}
+
+# Whether fish is set up on this machine, whatever the login shell is: the
+# binary is on PATH, or the user already has a fish config directory. A bash
+# login shell is common even for people who run fish interactively.
+fish_is_installed() {
+  command -v fish >/dev/null 2>&1 && return 0
+  [ -d "${HOME}/.config/fish" ] && return 0
+  return 1
+}
+
+# Append the fish PATH block to ~/.config/fish/config.fish and record it so
+# `rocm uninstall` can take it out again. The caller skips this when that file
+# is the profile the login-shell step just wrote.
+configure_fish_path() {
+  fish_profile="$(fish_config_path)"
+  fish_expr="$1"
+  fish_result="$(append_path_snippet "${fish_profile}" fish "${fish_expr}")" || true
+  if profile_has_own_block "${fish_profile}" "${fish_expr}"; then
+    record_path_edit "profile ${fish_profile}"
+    record_path_edit "path-expr ${fish_expr}"
+  fi
+  case "${fish_result}" in
+    updated:*)
+      echo "fish shell profile updated:"
+      echo "  profile: ${fish_result#updated:}"
+      ;;
+    unchanged:*)
+      echo "fish shell profile already configured:"
+      echo "  profile: ${fish_result#unchanged:}"
+      ;;
+    *)
+      echo "note: ${INSTALL_DIR} is not saved in your fish config"
+      ;;
+  esac
+}
+
+# Install fish completions from the binary that was just placed, so they match
+# it. Best effort: a binary that cannot print them leaves the install intact.
+install_fish_completions() {
+  completions_dir="${HOME}/.config/fish/completions"
+  completions_path="${completions_dir}/rocm.fish"
+  completions_tmp="${tmp_dir}/rocm.fish"
+  if "${INSTALL_DIR}/rocm" completions fish > "${completions_tmp}" \
+    && [ -s "${completions_tmp}" ] \
+    && mkdir -p "${completions_dir}" \
+    && install -m 0644 "${completions_tmp}" "${completions_path}"; then
+    echo "fish completions installed:"
+    echo "  ${completions_path}"
+  else
+    echo "note: could not install fish completions"
+    echo "  run: mkdir -p ${completions_dir}"
+    echo "  run: rocm completions fish > ${completions_path}"
+  fi
+}
+
 ensure_installer_process_path() {
   case ":${PATH}:" in
     *:"${INSTALL_DIR}":*)
@@ -563,6 +621,15 @@ case ":${PATH}:" in
           echo "  rocm is installed here: ${INSTALL_DIR}/rocm"
           ;;
       esac
+      # Fish gets its own snippet when it is installed, including when the
+      # login shell is bash, zsh, or ksh. Skip the second write when that
+      # login shell already targeted config.fish.
+      if fish_is_installed; then
+        if [ "${profile_path}" != "$(fish_config_path)" ]; then
+          configure_fish_path "${path_expr}"
+        fi
+        install_fish_completions
+      fi
     else
       echo "shell profile update skipped"
       echo "  rocm is installed here: ${INSTALL_DIR}/rocm"
