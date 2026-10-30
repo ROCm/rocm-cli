@@ -1063,6 +1063,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_only_rocm_command_reports_approval_without_executing() {
+        // `rocm_command` is registered as a read-only tool, so it has no
+        // approval channel: when the executor classifies the argv as mutating,
+        // the tool must hand the model an error and run nothing.
+        let approved = Arc::new(Mutex::new(Vec::<String>::new()));
+        let exec: SharedRocmToolExecutor = Arc::new(RecordingMutatingExec {
+            approved: approved.clone(),
+        });
+        let tool = RocmCommandRocmTool {
+            executor: Some(exec),
+            fired: Arc::new(Mutex::new(Vec::new())),
+        };
+        let out = tool
+            .call(json!({ "args": ["serve", "qwen", "--managed"] }))
+            .await
+            .expect("tool call ok");
+        assert!(
+            out.get("error")
+                .and_then(Value::as_str)
+                .is_some_and(|e| e.contains("requires approval")),
+            "an approval request must reach the model as an error, got {out}"
+        );
+        assert!(
+            approved.lock().unwrap().is_empty(),
+            "a read-only tool must never execute a mutating command"
+        );
+    }
+
+    #[tokio::test]
     async fn mutating_tool_none_executor_is_graceful() {
         let tool = LaunchServerRocmTool {
             executor: None,
