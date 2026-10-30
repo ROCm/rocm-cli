@@ -780,6 +780,8 @@ impl TuiSession {
     /// `timed out … waiting until {describe}`, `before {describe}.`, and `…
     /// draining the final frame, waiting until {describe}`. The last is
     /// assembled from two fragments in two functions, and both carry the clause.
+    /// It is reached only through [`wait_for_screen`](Self::wait_for_screen),
+    /// the one form that drains on exit; this form reaches the other three.
     /// So it must fit all four ("the screen shows X", "generation throughput
     /// leaves the screen"), not be a bare noun; it carries whatever quoting the
     /// caller puts in it, since none is added here.

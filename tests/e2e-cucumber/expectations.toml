@@ -167,11 +167,14 @@ flaky = true
 
 # ── Contracts found by walking the public README end to end ─────────────────
 #
-# The rows below were all filed from one pass through README.md against a
-# nightly build on an MI300X pod (EAI-8024 tracks the set). Each scenario asserts
-# the behaviour the README leads a reader to expect, and each row here says the
-# product does not do that yet — so the day one is fixed its row goes stale and
-# deletes itself.
+# The rows below came out of one walkthrough of the README against a nightly build
+# on an MI300X pod (EAI-8024 tracks the set). Most scenarios assert behaviour the
+# walkthrough leads a reader to expect; a few are contracts the walkthrough implies
+# rather than states (diagnose and fix agreeing, a usable device not being
+# diagnosed as a permission failure, a second server avoiding a taken address), and
+# one is a proposal the README does not make (uninstall stopping what it manages,
+# below). Each row says the product does not do that yet — so the day one is fixed
+# its row goes stale and deletes itself.
 
 # --- EAI-8020: `diagnose` and `fix` each carry their own copy of the
 # render-group remedy, and the verification step has drifted between them
@@ -222,11 +225,14 @@ flaky = true
 # would be a stale XPASS on both lanes and would fail them. The ticket keeps the
 # pod observation; what distinguishes that host is still unknown.
 
-# --- EAI-8014: `uninstall` removes the managed files and reports completion
-# without stopping the servers it manages — and takes the service records with
-# it, so the supported way to stop them goes too. It warns that it does not stop
-# them, which is the behaviour being disputed, not a defence of it. No hardware
-# needed. Remove when uninstall stops what it manages first. ---
+# --- EAI-8014: a PROPOSED contract, not a README one. The README documents that
+# `uninstall` warns it does not stop managed background processes; this row pins
+# the stronger behaviour the ticket asks for — `uninstall` removes the managed
+# files and reports completion without stopping the servers it manages, and takes
+# the service records with it, so the supported way to stop them goes too. The
+# warning is documented behaviour, so this stays a row only until the product and
+# README change together. No hardware needed. Remove when uninstall stops what it
+# manages first, or when the contract is dropped. ---
 [["serve-uninstall-stops-what-it-manages"]]
 when = {}
 bug = "EAI-8014"

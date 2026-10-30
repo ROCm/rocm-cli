@@ -412,10 +412,14 @@ Feature: Model serving
     And a model is being served on GPU
     When the user stops the server that is running
     Then the CLI reports that it stopped a process
+    And the stopped server no longer answers
 
-  # Expected to FAIL. Removing the CLI's managed files reports completion while
-  # the server it was managing is left running — and with the records gone, the
-  # supported way to stop it has been removed along with them. Nothing here
+  # Expected to FAIL. A PROPOSED contract, not one the README promises: the
+  # README says `uninstall` warns that it does not stop managed background
+  # processes. This scenario asserts the stronger behaviour — that removing the
+  # CLI's managed files reports completion while the server it was managing is
+  # left running, and with the records gone, the supported way to stop it has
+  # been removed along with them. Nothing here
   # touches the installed program: the removal is scoped to this scenario's own
   # directories and keeps the binaries.
   @id:serve-uninstall-stops-what-it-manages @requires-os:linux

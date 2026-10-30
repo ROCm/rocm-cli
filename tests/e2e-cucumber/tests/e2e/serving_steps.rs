@@ -1373,6 +1373,26 @@ async fn assert_owned_server_stopped(world: &mut E2eWorld) {
     );
 }
 
+#[then("the stopped server no longer answers")]
+async fn assert_stopped_server_stops_answering(world: &mut E2eWorld) {
+    let endpoint = world.endpoint.as_ref().expect("no endpoint configured");
+    let url = format!("{endpoint}/models");
+    // A signalled server can take a moment to release its port, so the answer is
+    // given a bounded window to stop. A server that is still listening at the end
+    // of it was not stopped, whatever the CLI reported.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if reqwest::get(&url).await.is_err() {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the CLI reported the stop, but {url} still answers a minute later"
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
 #[then("the CLI reports that it stopped a process")]
 async fn assert_stop_count_reported(world: &mut E2eWorld) {
     let output = world.cli_output.as_ref().expect("no stop output");

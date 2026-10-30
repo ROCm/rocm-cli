@@ -182,12 +182,7 @@ fn code_text(source: &str) -> String {
 /// `code_owners` names the functions that build the messages. The templates are
 /// searched in their bodies only: `wait_for_popup_body_where` repeats three of
 /// them verbatim, so a file-wide search stays green when the real one is reworded.
-fn assert_both_sides(
-    source: &str,
-    documented: &[Documented],
-    owner: &str,
-    code_owners: &[&str],
-) {
+fn assert_both_sides(source: &str, documented: &[Documented], owner: &str, code_owners: &[&str]) {
     let docs = doc_block_of(source, owner);
     let code = code_text(
         &code_owners

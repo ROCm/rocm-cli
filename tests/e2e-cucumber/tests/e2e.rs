@@ -1562,14 +1562,11 @@ async fn main() {
     // deliberately excluded: uv's cache is content-addressed and uv does its
     // own locking. A lane that races becomes serialized-and-slower instead.
     //
-    // The mock lane's 64 is deliberately left as main has it. Bounding it to the
-    // core count was tried on this branch and reverted: dash-08/dash-09 measure a
-    // validity window whose elapsed time advances with DAEMON CYCLES (the logical
-    // clock added in #380), so a less-loaded lane burns that window faster and
-    // clears the held value before the assertion looks. Both scenarios pass on
-    // main at 64-way and failed here at 2..=6 — a suite-wide scheduling knob
-    // changing two unrelated scenarios' verdicts is reason enough for a
-    // contract-pinning change not to touch it.
+    // The mock lane stays at 64: dash-08/dash-09 measure a validity window whose
+    // elapsed time advances with DAEMON CYCLES (the logical clock added in #380),
+    // so a less-loaded lane burns that window faster and clears the held value
+    // before the assertion looks. Both pass at 64-way and fail at 2..=6, so a
+    // tighter cap here would change two unrelated scenarios' verdicts.
     let max_concurrent =
         if cap.has_amd_gpu || shared_cache_dir().is_some() || shared_runtimes_dir().is_some() {
             1
