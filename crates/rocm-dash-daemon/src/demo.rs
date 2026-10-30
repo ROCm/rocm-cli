@@ -627,6 +627,7 @@ fn build_instances(t_s: f64, seed: &mut u64) -> Vec<Instance> {
                 gen_tps: Some(gen_tps),
                 gen_tps_observation: None,
                 tokens_per_watt: None,
+                power_w: None,
                 ttft_ms,
                 ttft_observation: None,
                 tpot_ms,
@@ -645,9 +646,14 @@ fn build_snapshot(t_s: f64, base_secs: i64, seed: &mut u64) -> Snapshot {
     let mut instances = build_instances(t_s, seed);
     // Mirror the runner: derive tokens_per_watt once both throughput and GPU
     // power are in hand, exercising the same id-normalizing join.
-    for inst in &mut instances {
-        inst.tokens_per_watt =
-            rocm_dash_core::efficiency::tokens_per_watt(inst.gen_tps, &inst.gpu_ids, &gpus);
+    let attributed = rocm_dash_core::efficiency::attribute_power_w(
+        &instances,
+        &gpus,
+        &std::collections::HashMap::new(),
+    );
+    for (inst, power_w) in instances.iter_mut().zip(attributed) {
+        inst.power_w = power_w;
+        inst.tokens_per_watt = rocm_dash_core::efficiency::tokens_per_watt(inst.gen_tps, power_w);
     }
     Snapshot {
         timestamp,

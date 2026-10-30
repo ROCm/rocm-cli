@@ -205,6 +205,11 @@ pub struct Instance {
     /// occupies. `None` when throughput or GPU power telemetry is unavailable.
     #[serde(default)]
     pub tokens_per_watt: Option<f64>,
+    /// Board power (W) attributed to this instance: each GPU's power split among
+    /// the instances sharing it (see `efficiency::attribute_power_w`). `None`
+    /// when no occupied GPU reports power. Serde-default for replay back-compat.
+    #[serde(default)]
+    pub power_w: Option<f64>,
     /// Live average time-to-first-token (ms), windowed from the vLLM TTFT
     /// histogram. `None` until two scrapes (or absent for non-vLLM engines);
     /// Observe shows `—`. Serde-default for NDJSON replay back-compat.

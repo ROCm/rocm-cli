@@ -67,8 +67,6 @@ pub fn draw_table(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     }
     let instances = sorted_instances(&state.instances);
     let sel = clamp_sel(state.instance_sel, instances.len());
-    let gpus: &[rocm_dash_core::metrics::GpuMetrics] =
-        state.latest.as_ref().map_or(&[], |s| s.gpus.as_slice());
 
     let inner = panel::bento(
         f,
@@ -151,7 +149,9 @@ pub fn draw_table(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             format::tokens_per_watt_cell(inst.tokens_per_watt, inst.gen_tps_observation.as_ref());
         let ttft = format::latency_cell(inst.ttft_ms, inst.ttft_observation.as_ref());
         let tpot = format::latency_cell(inst.tpot_ms, inst.tpot_observation.as_ref());
-        let power = rocm_dash_core::efficiency::instance_power_w(&inst.gpu_ids, gpus)
+        let power = inst
+            .power_w
+            .filter(|w| w.is_finite())
             .map_or_else(|| dash.to_string(), |w| format!("{w:.0}W"));
         let queue = match (inst.running_reqs, inst.waiting_reqs) {
             (None, None) => dash.to_string(),
@@ -994,6 +994,7 @@ mod tests {
             gen_tps: None,
             gen_tps_observation: None,
             tokens_per_watt: None,
+            power_w: None,
             ttft_ms: None,
             ttft_observation: None,
             tpot_ms: None,
@@ -2040,6 +2041,39 @@ mod tests {
         assert!(
             out.contains(format::HELD_LEGEND),
             "legend must explain a held TTFT marker; got:
+{out}"
+        );
+    }
+
+    #[test]
+    fn table_power_shows_attributed_share_not_board_power() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        // The GPU board may report far more than this instance's share; the
+        // POWER column must show the attributed figure carried on the instance.
+        let mut inst = mk_inst_obs("shared", Some(10.0), None);
+        inst.power_w = Some(123.0);
+        let mut state = state_with_snap(inst);
+        if let Some(snap) = state.latest.as_mut() {
+            snap.gpus = vec![rocm_dash_core::metrics::GpuMetrics {
+                device_id: "gpu-0".into(),
+                power_w: 999.0,
+                ..Default::default()
+            }];
+        }
+        let mut term = Terminal::new(TestBackend::new(160, 20)).unwrap();
+        term.draw(|f| draw_table(f, f.area(), &state, &state.theme))
+            .unwrap();
+        let out = buffer_text(&term);
+        assert!(
+            out.contains("123W"),
+            "attributed power missing; got:
+{out}"
+        );
+        assert!(
+            !out.contains("999W"),
+            "board power leaked into row; got:
 {out}"
         );
     }

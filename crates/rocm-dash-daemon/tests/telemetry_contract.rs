@@ -732,6 +732,67 @@ async fn ttft_is_held_then_cleared_when_requests_stop() {
     );
 }
 
+// ── GPU power limit and shared-GPU attribution (ROCMAI-62) ──────────────────
+
+/// Contract: with `amd-smi` reporting one 400 W GPU and two managed services
+/// launched on that GPU, the broadcast snapshot splits the board power between
+/// the two instances instead of crediting each with all of it. Drives the real runner with a
+/// fake `amd-smi`; amd-smi itself is not needed on the host.
+#[cfg(unix)]
+#[tokio::test]
+async fn shared_gpu_power_is_split_and_limit_is_reported() {
+    use rocm_core::fake_executable::write_fake_executable;
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let services_dir = tmp.path().join("services");
+    std::fs::create_dir_all(&services_dir).unwrap();
+    for id in ["shared-a", "shared-b"] {
+        // Unscraped ports: this scenario is about power, not Prometheus.
+        let json = format!(
+            r#"{{"service_id":"{id}","engine":"vllm","model_ref":"M/{id}","canonical_model_id":"M/{id}","host":"127.0.0.1","port":9,"status":"ready","gpu_indices":[0],"created_at_unix_ms":0}}"#
+        );
+        std::fs::write(services_dir.join(format!("{id}.json")), json).unwrap();
+    }
+
+    let fake = tmp.path().join("amd-smi-fake");
+    write_fake_executable(
+        &fake,
+        r#"#!/bin/sh
+case "$1" in
+  metric) echo '{"gpu_data":[{"gpu":0,"mem_usage":{"used_vram":{"value":1000},"total_vram":{"value":8000}},"usage":{"gfx_activity":{"value":50}},"temperature":{"hotspot":{"value":60}},"power":{"socket_power":{"value":400.0,"unit":"W"}}}]}' ;;
+  process) echo '{"gpu_data":[]}' ;;
+  *) echo '{}' ;;
+esac
+"#,
+    )
+    .unwrap();
+
+    let (tx, mut rx) = broadcast::channel::<Event>(64);
+    let opts = RunnerOptions {
+        amd_smi_binary: Some(fake.into_os_string()),
+        amd_smi_skip_device_preflight: true,
+        ..fast_opts(services_dir)
+    };
+    let _runner = spawn_runner(tx, opts).await;
+
+    let (a, b) = wait_for_snapshot(&mut rx, |snap| {
+        let power = |id: &str| {
+            snap.instances
+                .iter()
+                .find(|i| i.container_id == id)
+                .and_then(|i| i.power_w)
+        };
+        Some((power("shared-a")?, power("shared-b")?))
+    })
+    .await
+    .unwrap_or_else(|e| panic!("attributed power never appeared: {e}"));
+
+    // No per-process VRAM was reported, so the board is split equally and the
+    // two shares add back up to what the GPU actually draws.
+    assert!((a - 200.0).abs() < 1e-6, "shared-a got {a} W");
+    assert!((b - 200.0).abs() < 1e-6, "shared-b got {b} W");
+}
+
 // ── Scenario 5: Omitted counter → None (not zero, not panic) ───────────────
 
 /// Contract: when the `/metrics` endpoint returns HTTP 200 but the body omits

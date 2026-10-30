@@ -929,9 +929,14 @@ pub async fn run_loop(
         // don't line up with any amd-smi device_id — the silent-None failure
         // mode on real hardware, surfaced via the header ⚠ badge.
         let mut id_join_misses = 0usize;
-        for inst in &mut instances {
+        // Split each GPU's power among the instances sharing it, so two
+        // instances on one board don't both claim all of it.
+        let attributed =
+            rocm_dash_core::efficiency::attribute_power_w(&instances, &gpus, &per_container_used);
+        for (inst, power_w) in instances.iter_mut().zip(attributed) {
+            inst.power_w = power_w;
             inst.tokens_per_watt =
-                rocm_dash_core::efficiency::tokens_per_watt(inst.gen_tps, &inst.gpu_ids, &gpus);
+                rocm_dash_core::efficiency::tokens_per_watt(inst.gen_tps, power_w);
             if inst.gen_tps.is_some()
                 && !inst.gpu_ids.is_empty()
                 && !gpus.is_empty()
@@ -958,6 +963,7 @@ pub async fn run_loop(
                 entry.tpot_ms = inst.tpot_ms;
                 entry.tpot_observation = inst.tpot_observation.clone();
                 entry.tokens_per_watt = inst.tokens_per_watt;
+                entry.power_w = inst.power_w;
             }
         }
         // Attribute per-instance VRAM (per-process where the cgroup join hit,
@@ -1090,6 +1096,7 @@ pub(crate) fn merge_discovery_refresh(
         inst.gen_tps = ex.gen_tps;
         inst.gen_tps_observation = ex.gen_tps_observation.clone();
         inst.tokens_per_watt = ex.tokens_per_watt;
+        inst.power_w = ex.power_w;
         inst.ttft_ms = ex.ttft_ms;
         inst.ttft_observation = ex.ttft_observation.clone();
         inst.tpot_ms = ex.tpot_ms;

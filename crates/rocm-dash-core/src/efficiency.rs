@@ -7,7 +7,10 @@
 //! This is the join that turns vLLM throughput + amd-smi power into a
 //! per-instance capacity number. See `../wiki/concepts/metric-registry.md`.
 
-use crate::metrics::GpuMetrics;
+use std::collections::HashMap;
+use std::hash::BuildHasher;
+
+use crate::metrics::{GpuMetrics, Instance};
 
 /// Normalize a GPU identifier to a bare index for joining.
 ///
@@ -34,44 +37,82 @@ pub fn gpu_ids_overlap(gpu_ids: &[String], gpus: &[GpuMetrics]) -> bool {
     gpus.iter().any(|g| device_in(&g.device_id, gpu_ids))
 }
 
-/// Summed board power (W) of the GPUs one instance occupies.
+/// Board power (W) attributed to each instance, index-aligned with `instances`.
 ///
-/// Uses the same id-normalizing join as [`tokens_per_watt`]. `None` when no
-/// matched GPU reports power (id join found nothing / amd-smi unavailable) so
-/// the Observe table shows `—` rather than a fabricated `0 W`.
+/// A GPU's power is split among the instances that occupy it, so the instance
+/// figures never add up to more than the board reports. Two instances sharing
+/// one GPU each get a share, not the whole board.
+///
+/// The split is proportional to each occupant's VRAM from
+/// `per_container_vram_mb` (the per-process `amd-smi` attribution). A
+/// multi-GPU instance's VRAM is spread evenly over its GPUs. If any occupant of
+/// a GPU has no per-container reading the split on that GPU is equal, rather
+/// than guessing a skew from partial data. A sole occupant gets the whole GPU.
+///
+/// Power on a GPU no instance occupies (idle, or a process outside the managed
+/// set) is attributed to nobody; it still counts toward node power. An entry is
+/// `None` when none of its GPUs matched a GPU reporting power (id join found
+/// nothing, power telemetry unavailable), so the UI shows `—` instead of a
+/// fabricated `0 W`.
 #[must_use]
-pub fn instance_power_w(gpu_ids: &[String], gpus: &[GpuMetrics]) -> Option<f64> {
-    let total: f64 = gpus
-        .iter()
-        .filter(|g| device_in(&g.device_id, gpu_ids))
-        .map(|g| f64::from(g.power_w))
-        .sum();
-    (total > 0.0).then_some(total)
+pub fn attribute_power_w<S: BuildHasher>(
+    instances: &[Instance],
+    gpus: &[GpuMetrics],
+    per_container_vram_mb: &HashMap<String, u64, S>,
+) -> Vec<Option<f64>> {
+    let mut watts = vec![0.0_f64; instances.len()];
+    let mut matched = vec![false; instances.len()];
+    for gpu in gpus {
+        let power = f64::from(gpu.power_w);
+        if !power.is_finite() || power <= 0.0 {
+            continue;
+        }
+        let occupants: Vec<usize> = instances
+            .iter()
+            .enumerate()
+            .filter(|(_, i)| device_in(&gpu.device_id, &i.gpu_ids))
+            .map(|(k, _)| k)
+            .collect();
+        if occupants.is_empty() {
+            continue;
+        }
+        let weights: Option<Vec<f64>> = occupants
+            .iter()
+            .map(|&k| {
+                let inst = &instances[k];
+                per_container_vram_mb
+                    .get(&inst.container_id)
+                    .filter(|&&mb| mb > 0)
+                    .map(|&mb| mb as f64 / inst.gpu_ids.len().max(1) as f64)
+            })
+            .collect();
+        let weight_sum = weights.as_ref().map(|w| w.iter().sum::<f64>());
+        for (pos, &k) in occupants.iter().enumerate() {
+            let share = match (&weights, weight_sum) {
+                (Some(w), Some(sum)) if sum > 0.0 => w[pos] / sum,
+                _ => 1.0 / occupants.len() as f64,
+            };
+            watts[k] = power.mul_add(share, watts[k]);
+            matched[k] = true;
+        }
+    }
+    watts
+        .into_iter()
+        .zip(matched)
+        .map(|(w, m)| m.then_some(w))
+        .collect()
 }
 
 /// Tokens-per-watt for one serving instance: generation throughput (tok/s)
-/// divided by the summed power (W) of the GPUs it occupies.
+/// divided by the power (W) attributed to it by [`attribute_power_w`].
 ///
-/// Returns `None` when throughput is unknown (`gen_tps` is `None`) or the
-/// matched GPUs report no power (e.g. amd-smi unavailable, or the id join
-/// found nothing) — never a divide-by-zero or a negative number. A zero
-/// throughput with live GPUs is a real `Some(0.0)`, not `None`.
-pub fn tokens_per_watt(
-    gen_tps: Option<f64>,
-    gpu_ids: &[String],
-    gpus: &[GpuMetrics],
-) -> Option<f64> {
-    let tps = gen_tps?;
-    let total_w: f64 = gpus
-        .iter()
-        .filter(|g| device_in(&g.device_id, gpu_ids))
-        .map(|g| f64::from(g.power_w))
-        .sum();
-    if total_w > 0.0 {
-        Some(tps / total_w)
-    } else {
-        None
-    }
+/// Returns `None` when throughput or attributed power is unknown, or power is
+/// not positive — never a divide-by-zero or a negative number. A zero
+/// throughput with live power is a real `Some(0.0)`, not `None`.
+#[must_use]
+pub fn tokens_per_watt(gen_tps: Option<f64>, power_w: Option<f64>) -> Option<f64> {
+    let (tps, power) = (gen_tps?, power_w?);
+    (power > 0.0).then(|| tps / power)
 }
 
 #[cfg(test)]
@@ -94,60 +135,112 @@ mod tests {
         assert_eq!(normalize_gpu_id("3"), "3");
     }
 
-    #[test]
-    fn joins_bare_index_to_prefixed_device_id() {
-        // The crux: instance "0" must match amd-smi "gpu-0".
-        let gpus = [gpu("gpu-0", 250.0)];
-        let r = tokens_per_watt(Some(500.0), &["0".into()], &gpus);
-        assert_eq!(r, Some(2.0));
+    fn inst(id: &str, gpu_ids: &[&str]) -> Instance {
+        Instance {
+            container_id: id.into(),
+            gpu_ids: gpu_ids.iter().map(|s| (*s).to_string()).collect(),
+            ..Instance::default()
+        }
+    }
+
+    fn vram(entries: &[(&str, u64)]) -> HashMap<String, u64> {
+        entries
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), *v))
+            .collect()
     }
 
     #[test]
-    fn sums_power_across_tensor_parallel_gpus() {
+    fn sole_occupant_gets_whole_board_via_bare_index_join() {
+        // The crux: instance "0" must match amd-smi "gpu-0".
+        let p = attribute_power_w(&[inst("a", &["0"])], &[gpu("gpu-0", 250.0)], &vram(&[]));
+        assert_eq!(p, vec![Some(250.0)]);
+    }
+
+    #[test]
+    fn tensor_parallel_instance_sums_its_gpus_and_ignores_others() {
         let gpus = [
             gpu("gpu-0", 200.0),
             gpu("gpu-1", 300.0),
             gpu("gpu-2", 999.0),
         ];
-        // Instance occupies gpus 0 and 1 → 500 W; gpu-2 excluded.
-        let r = tokens_per_watt(Some(1000.0), &["0".into(), "1".into()], &gpus);
-        assert_eq!(r, Some(2.0));
+        let p = attribute_power_w(&[inst("a", &["0", "1"])], &gpus, &vram(&[]));
+        assert_eq!(p, vec![Some(500.0)]);
     }
 
     #[test]
-    fn none_throughput_yields_none() {
-        let gpus = [gpu("gpu-0", 250.0)];
-        assert_eq!(tokens_per_watt(None, &["0".into()], &gpus), None);
+    fn shared_gpu_splits_by_vram_and_conserves_board_power() {
+        let gpus = [gpu("gpu-0", 400.0)];
+        let insts = [inst("a", &["0"]), inst("b", &["0"])];
+        let p = attribute_power_w(&insts, &gpus, &vram(&[("a", 30_000), ("b", 10_000)]));
+        assert_eq!(p, vec![Some(300.0), Some(100.0)]);
+        let total: f64 = p.iter().flatten().sum();
+        assert!((total - 400.0).abs() < 1e-9, "must not exceed board power");
     }
 
     #[test]
-    fn zero_total_power_yields_none() {
-        let gpus = [gpu("gpu-0", 0.0)];
-        assert_eq!(tokens_per_watt(Some(500.0), &["0".into()], &gpus), None);
+    fn shared_gpu_splits_equally_without_complete_vram() {
+        let gpus = [gpu("gpu-0", 400.0)];
+        let insts = [inst("a", &["0"]), inst("b", &["0"])];
+        // No readings, or one occupant missing: equal split, no guessed skew.
+        for v in [
+            vram(&[]),
+            vram(&[("a", 30_000)]),
+            vram(&[("a", 30_000), ("b", 0)]),
+        ] {
+            assert_eq!(
+                attribute_power_w(&insts, &gpus, &v),
+                vec![Some(200.0), Some(200.0)]
+            );
+        }
     }
 
     #[test]
-    fn unmatched_ids_yield_none() {
-        let gpus = [gpu("gpu-5", 250.0)];
-        assert_eq!(tokens_per_watt(Some(500.0), &["0".into()], &gpus), None);
+    fn multi_gpu_instance_vram_is_spread_across_its_gpus() {
+        // `a` spans gpu 0+1 (40 GB total -> 20 GB each); `b` is alone on gpu 1
+        // with 20 GB. gpu-0 is all `a`; gpu-1 is split 50/50.
+        let gpus = [gpu("gpu-0", 100.0), gpu("gpu-1", 100.0)];
+        let insts = [inst("a", &["0", "1"]), inst("b", &["1"])];
+        let p = attribute_power_w(&insts, &gpus, &vram(&[("a", 40_000), ("b", 20_000)]));
+        assert_eq!(p, vec![Some(150.0), Some(50.0)]);
     }
 
     #[test]
-    fn empty_gpu_ids_yield_none() {
-        let gpus = [gpu("gpu-0", 250.0)];
-        assert_eq!(tokens_per_watt(Some(500.0), &[], &gpus), None);
+    fn unoccupied_gpu_power_is_attributed_to_nobody() {
+        let gpus = [gpu("gpu-0", 100.0), gpu("gpu-1", 500.0)];
+        let p = attribute_power_w(&[inst("a", &["0"])], &gpus, &vram(&[]));
+        assert_eq!(p, vec![Some(100.0)]);
     }
 
     #[test]
-    fn no_gpu_telemetry_yields_none() {
-        assert_eq!(tokens_per_watt(Some(500.0), &["0".into()], &[]), None);
+    fn unmatched_empty_or_unpowered_yield_none() {
+        let v = vram(&[]);
+        let a0 = [inst("a", &["0"])];
+        assert_eq!(
+            attribute_power_w(&a0, &[gpu("gpu-5", 250.0)], &v),
+            vec![None]
+        );
+        assert_eq!(
+            attribute_power_w(&[inst("a", &[])], &[gpu("gpu-0", 250.0)], &v),
+            vec![None]
+        );
+        assert_eq!(attribute_power_w(&a0, &[], &v), vec![None]);
+        // Zero / NaN power means "no telemetry" (e.g. Windows without ADLX).
+        assert_eq!(attribute_power_w(&a0, &[gpu("gpu-0", 0.0)], &v), vec![None]);
+        assert_eq!(
+            attribute_power_w(&a0, &[gpu("gpu-0", f32::NAN)], &v),
+            vec![None]
+        );
     }
 
     #[test]
-    fn zero_throughput_with_live_gpus_is_some_zero() {
-        // Idle instance, GPUs powered: 0 tok/W is a real reading, not "-".
-        let gpus = [gpu("gpu-0", 250.0)];
-        assert_eq!(tokens_per_watt(Some(0.0), &["0".into()], &gpus), Some(0.0));
+    fn tokens_per_watt_divides_and_guards() {
+        assert_eq!(tokens_per_watt(Some(500.0), Some(250.0)), Some(2.0));
+        assert_eq!(tokens_per_watt(None, Some(250.0)), None);
+        assert_eq!(tokens_per_watt(Some(500.0), None), None);
+        assert_eq!(tokens_per_watt(Some(500.0), Some(0.0)), None);
+        // Idle instance, powered GPU: 0 tok/W is a real reading, not "-".
+        assert_eq!(tokens_per_watt(Some(0.0), Some(250.0)), Some(0.0));
     }
 
     #[test]
@@ -157,31 +250,5 @@ mod tests {
         assert!(!gpu_ids_overlap(&["5".into()], &gpus));
         assert!(!gpu_ids_overlap(&[], &gpus));
         assert!(!gpu_ids_overlap(&["0".into()], &[]));
-    }
-
-    #[test]
-    fn instance_power_sums_matching_gpus() {
-        let gpus = [
-            gpu("gpu-0", 200.0),
-            gpu("gpu-1", 300.0),
-            gpu("gpu-2", 999.0),
-        ];
-        // Instance occupies gpus 0 and 1 → 500 W; gpu-2 is excluded.
-        assert_eq!(
-            instance_power_w(&["0".into(), "1".into()], &gpus),
-            Some(500.0)
-        );
-    }
-
-    #[test]
-    fn instance_power_no_match_yields_none() {
-        let gpus = [gpu("gpu-5", 250.0)];
-        assert_eq!(instance_power_w(&["0".into()], &gpus), None);
-    }
-
-    #[test]
-    fn instance_power_empty_ids_yields_none() {
-        let gpus = [gpu("gpu-0", 250.0)];
-        assert_eq!(instance_power_w(&[], &gpus), None);
     }
 }
