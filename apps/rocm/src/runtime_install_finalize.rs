@@ -6,8 +6,10 @@
 //! install, torch alignment, engine-dependency checks, and device checks.
 //!
 //! Mechanically relocated from `main.rs` with no behavior change. Called from
-//! `main.rs`'s `install()` (the SDK-install path) and from the sibling
-//! `runtimes_cmd.rs` (runtime activation). `SdkInstallConsents` stays
+//! `main.rs`'s `install()` (the SDK-install path) and from `engines_cmd.rs`
+//! (engine install). It calls into the sibling `runtimes_cmd.rs` for runtime
+//! activation; `runtimes_cmd.rs` reaches back only from its own test module.
+//! `SdkInstallConsents` stays
 //! `pub(crate)` and is read from `install()`; several torch/dependency/device
 //! helpers (`ensure_openmpi_for_vllm`, `ensure_libatomic_for_torch`,
 //! `ensure_libnuma_for_torch`, `settle_engine_install`) are also `pub(crate)`

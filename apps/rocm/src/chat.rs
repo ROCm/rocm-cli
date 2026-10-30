@@ -6,13 +6,13 @@
 //! (`ChatRocmCommandAction`, `DeterministicModelRecipe`,
 //! `DeterministicServiceRow`, `DeterministicEngineRow`, and others — all
 //! module-private except `ChatToolApprovalRequest`, reached by
-//! `dash_seam.rs` as `chat_tool_approval_request`'s return type), its
+//! `dash_seam.rs` as `chat_tool_approval_request`'s return type, and
+//! `ChatRocmCommandAction`, read by `driver_install.rs`'s test module), its
 //! tool-call validation/approval/execution logic (`validate_chat_tool_call`
 //! and the `validate_chat_*_tool_call` family), deterministic tool-output
 //! summarization, and the MCP tool-bridge entry points
-//! (`run_internal_mcp_call` and its helpers). Every call site in `main.rs`,
-//! `dash.rs`, `dash_seam.rs`, `comfyui.rs`, and `runtime_install_finalize.rs`
-//! goes through the `chat::` module boundary.
+//! (`run_internal_mcp_call` and its helpers). Callers in other modules,
+//! production and test-only, reach it through the `chat::` module boundary.
 //!
 //! Full domain extraction, mirroring `providers.rs`. Phase 6d (ROCMAI-88) of
 //! the `main.rs` modularization (see `docs/architecture.md`), split across
@@ -21,8 +21,8 @@
 //! bodies, and the cluster's regression tests moved out of `main.rs`'s
 //! shared `mod tests` block), plus the third PR's own visibility audit —
 //! every function still `pub(crate)` has a confirmed caller outside this
-//! module; none of the module's types need to be, bar the one exception
-//! above.
+//! module, production or test-only; none of the module's types need to be,
+//! bar the two exceptions above.
 
 use crate::automations::{render_automations_text, render_daemon_text};
 use crate::engine_runtime_select::{app_path_env_vars, service_model_names_match};
