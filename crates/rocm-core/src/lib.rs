@@ -10,6 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(all(test, unix))]
 mod archive_props;
+pub mod atomic_write;
 pub mod automation;
 pub mod binary_paths;
 pub mod browser;
