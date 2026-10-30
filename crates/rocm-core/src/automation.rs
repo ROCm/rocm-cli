@@ -16,11 +16,12 @@
 //! line — its cost does not grow with the store. A torn tail — crash debris,
 //! or left by a write that failed partway — is cut by the next append rather
 //! than truncated in place: that append writes the store's clean prefix plus
-//! its own new record as a single rewrite via `write_atomic`, so a lock-free
-//! reader never observes a file shrunk mid-repair. That rewrite costs O(store)
-//! rather than O(record), the same as a proposal status update, which rewrites
-//! the whole store via `write_atomic` too. Nothing in this module ever
-//! shrinks a store in place. Readers take no lock, and an unterminated last
+//! its own new record as a single rewrite via
+//! [`crate::atomic_write::write_file_atomically`], so a lock-free reader never
+//! observes a file shrunk mid-repair. That rewrite costs O(store) rather than
+//! O(record), the same as a proposal status update, which rewrites the whole
+//! store the same way. Nothing in this module ever shrinks a store in place.
+//! Readers take no lock, and an unterminated last
 //! line that is not valid JSON — an append caught mid-write — is skipped
 //! rather than reported as corruption.
 //!
@@ -28,7 +29,7 @@
 //! (see [`EVENT_LOG_ROTATE_BYTES`]): the append that finds the live file at
 //! the cap renames it whole to `<store>.1` first, under the same lock —
 //! before any torn tail in it would otherwise be repaired, so an at-cap store
-//! is never paid for with a `write_atomic` rewrite only to be rotated away
+//! is never paid for with an atomic rewrite only to be rotated away
 //! immediately after — and the recent-record readers span the rotated
 //! generations. The proposals store is never rotated, because a pending
 //! proposal must stay findable by id until it is reviewed; instead the status
@@ -434,15 +435,14 @@ fn append_jsonl_record<T: Serialize>(
             content.extend_from_slice(&line);
             // Done with the pre-repair file's handle before replacing it,
             // rather than leaving that to whatever happens to still have
-            // `file` open at function return. The rename already succeeds
+            // `file` open at function return. The replace already succeeds
             // with this handle open regardless — std opens files with
-            // `FILE_SHARE_DELETE` by default on Windows, so a rename isn't
-            // blocked by it (see `write_atomic`'s doc for the case that
-            // *isn't* covered: another process holding the destination open
-            // without delete-sharing) — but this states the intent rather
-            // than leaning on that default.
+            // `FILE_SHARE_DELETE` by default on Windows, so it isn't blocked
+            // by it (see the `atomic_write` module doc for how the publish
+            // treats a destination another process holds open) — but this
+            // states the intent rather than leaning on that default.
             drop(file);
-            crate::write_atomic(path, &content, "jsonl")?;
+            crate::atomic_write::write_file_atomically(path, &content)?;
         }
         TailState::ValidUnterminated(start) => {
             line.insert(0, b'\n');
@@ -584,7 +584,7 @@ fn inspect_tail(path: &Path, file: &fs::File) -> Result<TailState> {
 ///
 /// Returns fewer bytes if the file now ends before `end`. Nothing this
 /// module's own writers do can shrink a store in place — an append only ever
-/// grows it, and a torn-tail repair replaces it wholesale via `write_atomic`
+/// grows it, and a torn-tail repair replaces it wholesale via the atomic writer
 /// rather than truncating the live file (see [`inspect_tail`] and
 /// [`TailState::Torn`]) — so a short read here means the store was edited or
 /// truncated out-of-band, a case this module does not try to recover from
@@ -1191,7 +1191,7 @@ fn write_automation_proposals(
         );
         text.push('\n');
     }
-    crate::write_atomic(&path, text.as_bytes(), "jsonl")
+    crate::atomic_write::write_file_atomically(&path, text.as_bytes())
 }
 
 fn normalize_proposal_identity(proposal: &mut AutomationProposalRecord, index: usize) {
@@ -1240,7 +1240,9 @@ pub fn load_recent_automation_events(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::temp_app_paths;
+    use crate::test_support::{
+        assert_write_spares_foreign_temp_files, retired_temp_path, temp_app_paths,
+    };
 
     #[test]
     fn a_rotation_failure_is_reported_once_per_store() {
@@ -1400,6 +1402,62 @@ mod tests {
         assert_eq!(updated.status, "rejected");
         assert_eq!(loaded.status, "rejected");
         assert!(loaded.reviewed_at_unix_ms.is_some());
+        Ok(())
+    }
+
+    /// A status update never writes through a file another writer already
+    /// staged next to the proposals store. The occupied names are the ones the
+    /// retired clock-and-pid temp naming would have picked, so a rewrite that
+    /// still used one would truncate a foreign file and rename it into place.
+    /// `proposal_status_update_rewrites_record` would pass for either writer;
+    /// the foreign files are what tell them apart.
+    #[test]
+    fn proposal_status_update_never_reuses_another_writers_temp_file() -> Result<()> {
+        let (root, paths) = temp_app_paths("proposal-status-foreign-temp");
+        append_automation_proposal(&paths, &proposal_record("proposal-1"))?;
+        let store = paths.automation_proposals_path();
+
+        assert_write_spares_foreign_temp_files(
+            |millis| retired_temp_path(&store, millis),
+            || update_automation_proposal_status(&paths, "proposal-1", "rejected").map(|_| ()),
+        )?;
+
+        let loaded = find_automation_proposal(&paths, "proposal-1")?;
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(loaded.status, "rejected");
+        Ok(())
+    }
+
+    /// The torn-tail repair, the other place a store is replaced wholesale,
+    /// spares foreign staged files for the same reason. Each attempt seeds the
+    /// torn tail again, since a repair only happens once.
+    #[test]
+    fn torn_tail_repair_never_reuses_another_writers_temp_file() -> Result<()> {
+        let (root, paths) = temp_app_paths("torn-tail-foreign-temp");
+        // Creates the store directory the foreign files go in.
+        seed_torn_tail_in_every_store(&paths)?;
+        let store = paths.automation_events_path();
+
+        assert_write_spares_foreign_temp_files(
+            |millis| retired_temp_path(&store, millis),
+            || {
+                seed_torn_tail_in_every_store(&paths)?;
+                append_automation_event(&paths, &event_record("after-repair"))
+            },
+        )?;
+
+        // Only the events store was appended to; the other two still hold the
+        // torn tails the seeding left in them.
+        let tags = fs::read_to_string(&store)?
+            .lines()
+            .map(|line| serde_json::from_str::<AutomationEventRecord>(line).map(|r| r.message))
+            .collect::<Result<Vec<_>, _>>()?;
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(
+            tags,
+            vec!["seed".to_owned(), "after-repair".to_owned()],
+            "the repair must keep the clean prefix, drop the torn tail and add the new record"
+        );
         Ok(())
     }
 

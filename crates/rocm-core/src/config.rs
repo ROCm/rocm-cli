@@ -542,9 +542,11 @@ impl RocmCliConfig {
             .with_context(|| format!("failed to parse {}", path.display()))
     }
 
-    /// Persist the config by replacing it via the shared `write_atomic`
-    /// helper (write a sibling temp file, then rename it over `config.json`;
-    /// see that helper's own doc for the write/rename/cleanup guarantees).
+    /// Persist the config by replacing it via the shared
+    /// [`write_file_atomically`](crate::atomic_write::write_file_atomically)
+    /// helper (write a uniquely named sibling temp file, then publish it over
+    /// `config.json`; see that helper's module doc for the
+    /// write/publish/cleanup guarantees).
     ///
     /// The destination is never removed first, because `load` reads a
     /// missing `config.json` as "no config" and answers with defaults — a
@@ -556,7 +558,7 @@ impl RocmCliConfig {
             .with_context(|| format!("failed to create {}", paths.config_dir.display()))?;
         let bytes =
             serde_json::to_vec_pretty(self).context("failed to serialize rocm-cli config")?;
-        crate::write_atomic(&path, &bytes, "json")
+        crate::atomic_write::write_file_atomically(&path, &bytes)
             .with_context(|| format!("failed to save rocm-cli config to {}", path.display()))
     }
 
@@ -689,7 +691,9 @@ impl RocmCliConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::temp_app_paths;
+    use crate::test_support::{
+        assert_write_spares_foreign_temp_files, retired_temp_path, temp_app_paths,
+    };
 
     // The socket-path precedence is mirrored in `rocm-dash-core`; these tests
     // mirror the ones there so a divergence in either crate is caught.
@@ -1038,7 +1042,7 @@ last_installed_runtime_id = "therock-release"
     /// The `inspect_err` cleanup on the rename, which the happy-path test above
     /// cannot reach: it only ever asserts that a SUCCESSFUL save leaves nothing
     /// behind, so deleting the cleanup would go unnoticed until a user with a
-    /// failing disk accumulated one `config.json.tmp-<ts>-<pid>` per attempt.
+    /// failing disk accumulated one `config.json.tmp-<pid>-<ts>-<attempt>` per attempt.
     ///
     /// A directory at the destination is what makes the rename fail on both
     /// supported platforms without needing permissions a root CI lane ignores —
@@ -1097,6 +1101,35 @@ last_installed_runtime_id = "therock-release"
             leftovers.is_empty(),
             "a completed save must leave no temp file in the config folder: {leftovers:?}"
         );
+        Ok(())
+    }
+
+    /// A save never writes through a file another writer already staged next
+    /// to `config.json`. The names occupied are the ones the retired
+    /// clock-and-pid temp naming would have picked, so a save that still wrote
+    /// to one would truncate a foreign file and rename it into place, taking
+    /// the other writer's bytes with it. The save-and-load assertions below
+    /// would pass for either writer; the foreign files are what tell them apart.
+    #[test]
+    fn saving_the_config_never_reuses_another_writers_temp_file() -> Result<()> {
+        let (root, paths) = temp_app_paths("config-save-foreign-temp");
+        fs::create_dir_all(&paths.config_dir)?;
+        let config_path = paths.config_path();
+        let mut config = RocmCliConfig {
+            default_engine: Some("vllm".to_owned()),
+            ..RocmCliConfig::default()
+        };
+        config.save(&paths)?;
+        config.default_engine = Some("lemonade".to_owned());
+
+        assert_write_spares_foreign_temp_files(
+            |millis| retired_temp_path(&config_path, millis),
+            || config.save(&paths),
+        )?;
+
+        let loaded = RocmCliConfig::load(&paths)?;
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(loaded.default_engine.as_deref(), Some("lemonade"));
         Ok(())
     }
 
