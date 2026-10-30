@@ -1672,7 +1672,10 @@ optional.
 
 Heavy CI runs the matching set per platform. The scenarios reject untrusted
 signers, bad checksums, bad detached signatures, and missing required signature
-sidecars before activation; cover generated private-key PEM packaging and
+sidecars before activation; assert the installer's get-started block (banner art
+only on a UTF-8 terminal), `!!` failure marker, and absence of ANSI escapes in
+piped or `NO_COLOR` output (the colored TTY branch is not driven by any
+scenario); cover generated private-key PEM packaging and
 generated public-key PEM installer verification; verify first-install PATH setup
 (Windows persists the install folder to the user PATH and restores it afterward;
 Linux writes the shell profile); reinstall stale-manifest purge and config
