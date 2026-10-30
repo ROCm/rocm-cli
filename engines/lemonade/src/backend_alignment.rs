@@ -2036,8 +2036,9 @@ mod tests {
 
     #[test]
     fn a_failed_put_back_says_so_and_leaves_the_restored_pins_in_place() {
-        // The backup points at a directory that does not exist, so writing the
-        // previous bytes back fails.
+        // The backup points at a non-empty directory, which a file cannot be
+        // published over, so writing the previous bytes back fails. (A missing
+        // parent directory would not do: the shared atomic writer creates it.)
         let flow = restore_flow(
             vec![
                 Err(anyhow!("connection reset")),
@@ -2046,10 +2047,9 @@ mod tests {
             |pin_file, dir| {
                 let previous = fs::read(pin_file).unwrap();
                 fs::write(pin_file, "PACKAGED").unwrap();
-                Ok(Some(PinFileBackup::new(
-                    dir.join("no-such-dir").join("backend_versions.json"),
-                    Some(previous),
-                )))
+                let occupied = dir.join("occupied").join("backend_versions.json");
+                fs::create_dir_all(occupied.join("nested")).unwrap();
+                Ok(Some(PinFileBackup::new(occupied, Some(previous))))
             },
         );
 
