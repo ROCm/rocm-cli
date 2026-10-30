@@ -894,7 +894,7 @@ execute provider-assisted plans automatically.
 A request is planned exactly once, so the plan shown to the user is the plan
 the provider gave: building a plan can call the provider, whose answers are not
 guaranteed to be the same twice, and a second call could describe a different
-command than the first. Two E2E scenarios in
+command than the first. Three E2E scenarios in
 [chat.feature](../tests/e2e-cucumber/features/chat.feature) hold this through the
 real binary, against a mock chat provider that answers from a script (a
 different plan on each call, via `MockServer::start_with_chat_script` in
@@ -908,17 +908,25 @@ different plan on each call, via `MockServer::start_with_chat_script` in
   provider-assisted plans.
 - `chat-11` (`chat-assistant-plan-tool-plans-once`): the chat assistant's
   `natural_language_plan` tool asks the planning provider exactly once.
+- `chat-12` (`chat-plan-tool-text-matches-action`): the same tool called
+  directly through the hidden `rocm mcp-call` entry point asks the provider
+  exactly once, and the JSON it returns agrees with itself: the rendered plan
+  text (`structuredContent.text`) and the action it reports as what would run
+  next (`structuredContent.action`) are both the provider's first answer, with
+  the action marked `provider_assisted`.
 
 ```bash
 cargo xtask e2e -- -n "chat-10"
 cargo xtask e2e -- -n "chat-11"
+cargo xtask e2e -- -n "chat-12"
 ```
 
-Both run on the mock lane and need no GPU. They do not show that the plan
-shown is also the action that would run: `--yes` refuses a provider-assisted
-plan before dispatching it and the chat tool reports only a fixed confirmation,
-so neither surface ever runs the plan's command. That half is covered by the
-unit tests below.
+All three run on the mock lane and need no GPU. The plan shown and the action
+that would run can be compared only where both are reported, which is the
+`natural_language_plan` tool (`chat-12`). The `--yes` surface refuses a
+provider-assisted plan before dispatching it, so it never runs the plan's
+command and shows only the plan text; for that surface the reuse of the
+rendered plan is covered by the unit tests below.
 
 Focused coverage:
 

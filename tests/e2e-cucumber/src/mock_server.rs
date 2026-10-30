@@ -365,11 +365,11 @@ struct ServerState {
     /// path lets a scenario assert the versioned route was the one used.
     chat_paths: Arc<Mutex<Vec<String>>>,
     /// Every chat completion request body (on either chat route), in arrival
-    /// order. Unlike
-    /// `last_chat_request` this keeps the whole history, so a scenario can count
-    /// how many completions the CLI asked for and read each prompt — the only
-    /// way to prove a request was planned once rather than twice, when the two
-    /// calls would otherwise leave nothing but the final body behind.
+    /// order. Unlike `last_chat_request` this keeps the whole history, so a
+    /// scenario can count how many completions the CLI asked for and read each
+    /// prompt — the only way to prove a request was planned once rather than
+    /// twice, when the two calls would otherwise leave nothing but the final
+    /// body behind.
     completion_requests: Arc<Mutex<Vec<Value>>>,
     /// `Some` only when started via [`MockServer::start_with_chat_script`]; the
     /// replies to hand out, in request order. `None` keeps the fixed stub reply.
@@ -573,7 +573,7 @@ impl MockServer {
     ///
     /// For scenarios whose claim is about the *sequence* of completions a
     /// command makes — "asked exactly once", "the plan shown is the one the
-    /// provider gave" — and which therefore need each call to answer
+    /// planning assistant gave" — and which therefore need each call to answer
     /// differently, so a repeated call is visible in the output rather than
     /// returning the same bytes. A request past the end of the script is answered
     /// with HTTP 500 (and still recorded), so asking more often than scripted
@@ -1222,27 +1222,32 @@ mod chat_script_tests {
     #[test]
     fn the_inference_latch_is_written_only_when_asked_for() {
         let dir = tempfile::tempdir().expect("failed to create temp dir");
+        // Read back through the product's own record type, not the literal key
+        // the writer uses: the CLI skips its readiness probe only when this
+        // field deserializes to `Some`, so a key the product does not read
+        // would leave the latch silently unset while a JSON-level check on the
+        // writer's own key still passed.
         let latch = |options: ServiceRecordOptions| {
             write_service_record_with(dir.path(), "m", 1, options);
-            let record: Value = serde_json::from_slice(
+            let record: rocm_core::ManagedServiceRecord = serde_json::from_slice(
                 &std::fs::read(dir.path().join("e2e-mock.json")).expect("record not written"),
             )
-            .expect("record not JSON");
-            record["inference_verified_at_unix_ms"].clone()
+            .expect("record is not a ManagedServiceRecord");
+            record.inference_verified_at_unix_ms
         };
 
         assert_eq!(
             latch(ServiceRecordOptions::default()),
-            Value::Null,
+            None,
             "the default record must stay unlatched so existing scenarios keep probing"
         );
-        assert_eq!(
+        assert!(
             latch(ServiceRecordOptions {
                 inference_verified: true,
                 ..ServiceRecordOptions::default()
-            }),
-            json!(1),
-            "an inference-verified record must carry a non-null latch"
+            })
+            .is_some(),
+            "an inference-verified record must carry a latch the CLI reads"
         );
     }
 }

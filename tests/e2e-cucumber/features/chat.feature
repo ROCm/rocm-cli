@@ -115,8 +115,9 @@ Feature: Chat and endpoint detection
   # shown must be its answer. The assistant here answers differently each time
   # it is asked, which is what makes a second ask visible. `--yes` never runs a
   # plan the assistant produced, so what this scenario can show about "acted on"
-  # is that the request is refused with nothing executed; that the plan shown is
-  # also the action taken is covered by the unit tests
+  # is that the request is refused with nothing executed; the comparison of the
+  # plan shown with the action reported is chat-12, and the `--yes` path's own
+  # reuse of the rendered plan is covered by the unit tests
   # `freeform_plan_dedup_prevents_provider_assisted_divergence` and
   # `freeform_execution_reuses_the_rendered_plan_without_rebuilding`.
   @id:chat-freeform-yes-plans-once
@@ -124,7 +125,7 @@ Feature: Chat and endpoint detection
     Given a local planning assistant that suggests a different plan each time it is asked
     When the user approves a vague natural-language request with --yes
     Then the planning assistant was asked exactly once
-    And the plan shown is the one the assistant gave
+    And the plan shown is the one the planning assistant gave
     And the request is refused rather than run without review
 
   # The same guarantee through the other path that plans a request: the chat
@@ -132,7 +133,20 @@ Feature: Chat and endpoint detection
   # was made, so the count of requests is what shows it was made once.
   @id:chat-assistant-plan-tool-plans-once
   Scenario: chat-11 - Asking the chat assistant to plan a vague request consults the planning assistant once
-    Given a local assistant that hands a vague request to the planner, which suggests a different plan each time it is asked
-    When the user asks the assistant in one-shot chat for help with a vague request
+    Given a local chat assistant that hands a vague request to the planning assistant, which suggests a different plan each time it is asked
+    When the user asks the chat assistant in one-shot chat for help with a vague request
     Then the planning assistant was asked exactly once
     And the chat reports that the request was planned
+
+  # The plan a tool-using client is shown and the action it is told would run
+  # next both come out of the same reply, so they can be compared: planning the
+  # request twice would let the text describe one answer and the action carry
+  # the other. Both must be the planning assistant's first answer, and the
+  # action must say it came from the assistant.
+  @id:chat-plan-tool-text-matches-action
+  Scenario: chat-12 - A client asking for a vague request to be planned gets the same plan as text and as action
+    Given a local planning assistant that suggests a different plan each time it is asked
+    When a tool-using client asks the CLI to plan a vague request
+    Then the planning assistant was asked exactly once
+    And the plan text returned is the one the planning assistant gave
+    And the action returned is the one the planning assistant gave

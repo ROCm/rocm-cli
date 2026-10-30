@@ -3,20 +3,25 @@
 // SPDX-License-Identifier: MIT
 
 //! Steps for the planning-assistant scenarios in `chat.feature`: a request the
-//! CLI cannot plan on its own is handed to a configured local assistant, and
-//! must be handed over exactly once, with the plan the assistant gave being the
-//! plan the user is shown.
+//! CLI cannot plan on its own is handed to a configured local planning
+//! assistant, and must be handed over exactly once, with the plan the planning
+//! assistant gave being the plan the user is shown.
 //!
 //! The mock answers from a script (`MockServer::start_with_chat_script`), one
 //! reply per completion request, so each call gets a *different* answer. A
 //! request planned twice therefore shows up twice — in the request count and in
 //! which plan is printed — rather than hiding behind two identical replies.
 //!
-//! What this cannot show black-box: that the plan shown is also the action that
-//! would run. `--yes` refuses a provider-assisted plan before dispatching it,
-//! and the chat tool only returns a fixed confirmation string, so neither
-//! surface ever executes or reports the plan's command. That half of the
-//! guarantee stays covered by the unit tests in `apps/rocm/src/providers.rs`
+//! The plan the user is shown and the action that would run come from one plan
+//! build, and that agreement is only observable where both are reported. The
+//! `natural_language_plan` tool reports both (`text` and `action`), through the
+//! hidden `rocm mcp-call` entry point, which runs the same
+//! `run_internal_mcp_call` handler the chat assistant's tool call reaches
+//! in-process, so chat-12 reads them side by side. The `--yes` surface (chat-10)
+//! cannot: it refuses a provider-assisted plan in `prepare_freeform_execution`
+//! before dispatching anything, so it never runs the plan's command and only
+//! the plan text is visible there. For that surface the "shown is what runs" half stays with the
+//! unit tests in `apps/rocm/src/providers.rs`
 //! (`freeform_plan_dedup_prevents_provider_assisted_divergence` and
 //! `freeform_execution_reuses_the_rendered_plan_without_rebuilding`).
 
@@ -52,8 +57,13 @@ const PLANNER_PROMPT_MARKER: &str = "You are resolving an ambiguous rocm-cli req
 
 /// The two plans the assistant gives, in the order it gives them. Different on
 /// purpose: a second planning call would print the second.
-const FIRST_PLAN_COMMAND: &str = "rocm examine";
-const SECOND_PLAN_COMMAND: &str = "rocm engines list";
+const FIRST_PLAN_ARGS: &[&str] = &["examine"];
+const SECOND_PLAN_ARGS: &[&str] = &["engines", "list"];
+
+/// The command line a plan's `args` render as in the plan text.
+fn plan_command(args: &[&str]) -> String {
+    format!("rocm {}", args.join(" "))
+}
 
 fn plan_reply(args: &[&str]) -> Value {
     let plan = json!({
@@ -64,11 +74,11 @@ fn plan_reply(args: &[&str]) -> Value {
 }
 
 fn examine_plan_reply() -> Value {
-    plan_reply(&["examine"])
+    plan_reply(FIRST_PLAN_ARGS)
 }
 
 fn engines_list_plan_reply() -> Value {
-    plan_reply(&["engines", "list"])
+    plan_reply(SECOND_PLAN_ARGS)
 }
 
 /// Start the scripted mock, plant it as the ready built-in assistant, and make
@@ -159,12 +169,14 @@ async fn planning_assistant_with_distinct_plans(world: &mut E2eWorld) {
 }
 
 #[given(
-    "a local assistant that hands a vague request to the planner, which suggests a different plan each time it is asked"
+    "a local chat assistant that hands a vague request to the planning assistant, which suggests a different plan each time it is asked"
 )]
-async fn assistant_that_asks_the_planner(world: &mut E2eWorld) {
+async fn chat_assistant_that_asks_the_planning_assistant(world: &mut E2eWorld) {
     // Three completions are expected, in this order: the chat assistant asking
-    // for the request to be planned, the planner answering, and the chat
-    // assistant's closing answer. A fourth would be a second planning call.
+    // for the request to be planned, the planning assistant answering, and the
+    // chat assistant's closing answer. A second planning call would arrive third
+    // and take the closing reply, which leaves the chat's own closing completion
+    // as an unscripted fourth: it gets HTTP 500, so asking twice fails loudly.
     let ask_for_a_plan = e2e_cucumber::mock_server::chat_tool_call_reply(
         BUILTIN_ASSISTANT_MODEL_ID,
         "natural_language_plan",
@@ -195,7 +207,26 @@ async fn user_approves_vague_request(world: &mut E2eWorld) {
     world.cli_rc = Some(rc);
 }
 
-#[when("the user asks the assistant in one-shot chat for help with a vague request")]
+#[when("a tool-using client asks the CLI to plan a vague request")]
+async fn client_asks_for_a_plan(world: &mut E2eWorld) {
+    // The planning tool is read-only, so no `--allow-mutation`. The exit code is
+    // checked by the `Then` steps that parse the reply, after the request count.
+    let arguments = json!({ "request": VAGUE_REQUEST }).to_string();
+    let (stdout, stderr, rc) = crate::run_rocm(
+        world,
+        &[
+            "mcp-call",
+            "natural_language_plan",
+            "--arguments-json",
+            &arguments,
+        ],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[when("the user asks the chat assistant in one-shot chat for help with a vague request")]
 async fn user_asks_chat_assistant_for_help(world: &mut E2eWorld) {
     // The wording avoids every phrase the CLI answers without consulting the
     // assistant (anything naming `serve`, for one), so the assistant is asked.
@@ -231,10 +262,12 @@ async fn planning_assistant_asked_once(world: &mut E2eWorld) {
         planning.len(),
         1,
         "the request must be planned exactly once, but the assistant received {} completions \
-         ({} of them planning requests):\n{}",
+         ({} of them planning requests):\n{}\nthe command exited with {:?}; stderr:\n{}",
         requests.len(),
         planning.len(),
-        describe_requests(&requests)
+        describe_requests(&requests),
+        world.cli_rc,
+        world.cli_stderr.as_deref().unwrap_or_default()
     );
     // The one request must be about the vague request the user (or the chat
     // assistant on their behalf) made, not some other planning call.
@@ -248,29 +281,85 @@ async fn planning_assistant_asked_once(world: &mut E2eWorld) {
     );
 }
 
-#[then("the plan shown is the one the assistant gave")]
-async fn plan_shown_is_the_assistants(world: &mut E2eWorld) {
-    let out = cli_output(world);
-    // Both halves matter: the planner line proves the plan came from the
-    // assistant at all (the deterministic plan prints `hybrid-parser-v1` alone),
-    // and the whole `next_tool_call` line proves *which* of the assistant's
-    // answers it is. A substring match would also pass on the deterministic
-    // plan, which proposes `rocm serve <model>`, and on the second plan, which
-    // is a different command.
+/// Assert that `text` is the rendering of the planning assistant's *first*
+/// answer. Both halves matter: the planner line proves the plan came from the
+/// assistant at all (the deterministic plan prints `hybrid-parser-v1` alone),
+/// and the whole `next_tool_call` line proves *which* of the assistant's answers
+/// it is. A substring match would also pass on the deterministic plan, which
+/// proposes `rocm serve <model>`, and on the second plan, which is a different
+/// command.
+fn assert_plan_text_is_the_first_answer(text: &str) {
     assert!(
-        out.contains("planner: hybrid-parser-v1 + provider:local"),
-        "the plan was not produced with the planning assistant:\n{out}"
+        text.contains("planner: hybrid-parser-v1 + provider:local"),
+        "the plan was not produced with the planning assistant:\n{text}"
     );
-    let next: Vec<&str> = out
+    let next: Vec<&str> = text
         .lines()
         .map(str::trim)
         .filter(|line| line.starts_with("next_tool_call:"))
         .collect();
+    let first = plan_command(FIRST_PLAN_ARGS);
+    let second = plan_command(SECOND_PLAN_ARGS);
     assert_eq!(
         next,
-        [format!("next_tool_call: {FIRST_PLAN_COMMAND}")],
-        "the plan shown must be the assistant's first answer (`{FIRST_PLAN_COMMAND}`, not the \
-         `{SECOND_PLAN_COMMAND}` a second planning call would give):\n{out}"
+        [format!("next_tool_call: {first}")],
+        "the plan shown must be the assistant's first answer (`{first}`, not the \
+         `{second}` a second planning call would give):\n{text}"
+    );
+}
+
+#[then("the plan shown is the one the planning assistant gave")]
+async fn plan_shown_is_the_assistants(world: &mut E2eWorld) {
+    assert_plan_text_is_the_first_answer(cli_output(world));
+}
+
+/// The `structuredContent` of the planning tool's reply, parsed from the JSON
+/// `rocm mcp-call` prints. Asserts the call succeeded first, so a failure reads
+/// as the CLI's own error rather than a JSON parse error.
+fn plan_tool_structured_content(world: &E2eWorld) -> Value {
+    let out = cli_output(world);
+    let stderr = world.cli_stderr.as_deref().unwrap_or_default();
+    let rc = world.cli_rc.expect("no command was run");
+    assert!(rc == 0, "rocm mcp-call failed (rc={rc}):\n{out}\n{stderr}");
+    let reply: Value = serde_json::from_str(out.trim())
+        .unwrap_or_else(|error| panic!("rocm mcp-call did not print JSON ({error}):\n{out}"));
+    assert_eq!(
+        reply["isError"],
+        json!(false),
+        "the planning tool reported an error:\n{out}"
+    );
+    reply["structuredContent"].clone()
+}
+
+#[then("the plan text returned is the one the planning assistant gave")]
+async fn plan_text_returned_is_the_assistants(world: &mut E2eWorld) {
+    let content = plan_tool_structured_content(world);
+    let text = content["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the reply carries no plan text:\n{content}"));
+    assert_plan_text_is_the_first_answer(text);
+}
+
+#[then("the action returned is the one the planning assistant gave")]
+async fn action_returned_is_the_assistants(world: &mut E2eWorld) {
+    let content = plan_tool_structured_content(world);
+    let action = &content["action"];
+    // The action is what the caller is told would run next. It must be the same
+    // answer the text above displays, not the one a second planning call would
+    // have produced, and it must say it came from the assistant (which is what
+    // makes `--yes` refuse it).
+    let first = plan_command(FIRST_PLAN_ARGS);
+    let second = plan_command(SECOND_PLAN_ARGS);
+    assert_eq!(
+        action["args"],
+        json!(FIRST_PLAN_ARGS),
+        "the action must be the assistant's first answer (`{first}`), not the \
+         `{second}` a second planning call would give:\n{content}"
+    );
+    assert_eq!(
+        action["provider_assisted"],
+        json!(true),
+        "the action must be marked as provider-assisted:\n{content}"
     );
 }
 
