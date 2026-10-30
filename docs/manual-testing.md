@@ -1240,8 +1240,9 @@ Expected result:
 
 - The dry run lists the binaries (on Windows, `rocm.exe` is marked as deleted
   as the command exits) and, under
-  `PATH changes from the installer that would be undone:`, the shell profile
-  (Linux) or the user `PATH` entry (Windows). It removes nothing, and at a
+  `PATH changes from the installer that would be undone:`, each shell profile
+  the installer wrote (Linux, including `~/.config/fish/config.fish` when fish
+  was installed) or the user `PATH` entry (Windows). It removes nothing, and at a
   terminal ends with `Nothing was removed. To remove these items, run it again
   without --dry-run.` Running the same command again without `--dry-run` asks
   `[y/N]` and, on yes, removes what was listed (scenario `uninstall-07`). With

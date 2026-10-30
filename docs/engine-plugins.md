@@ -143,7 +143,10 @@ Installer policy:
 - `install.sh` and `install.ps1` update only the rocm-cli binary install
   directory (its binaries, `.rocm-cli-manifest`, and the `.rocm-cli-path-edit`
   record of the `PATH` change they made) and that `PATH` change itself: a
-  marked block in the shell profile, or the user `PATH` on Windows.
+  marked block in the login shell's profile, plus `~/.config/fish/config.fish`
+  when fish is installed, or the user `PATH` on Windows. When fish is
+  installed, `install.sh` also writes the fish completion script to
+  `~/.config/fish/completions/rocm.fish`.
 - External plugins under the rocm-cli data directory are not touched by
   install or upgrade.
 - `rocm uninstall` removes the data directory by default. Use
