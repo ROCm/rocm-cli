@@ -466,7 +466,7 @@ impl ActivationSnapshot {
                     .context("active runtime marker path has no parent directory")?;
                 fs::create_dir_all(parent)
                     .with_context(|| format!("failed to create {}", parent.display()))?;
-                therock::write_file_atomically(&path, &bytes)
+                rocm_core::atomic_write::write_file_atomically(&path, &bytes)
                     .with_context(|| format!("failed to restore {}", path.display()))?;
             }
             // Only a regular file is removed: whatever else may sit at that
@@ -1793,12 +1793,18 @@ pub(crate) fn active_runtime_marker_path(paths: &AppPaths) -> PathBuf {
     paths.data_dir.join("runtimes").join("active.json")
 }
 
+/// Replace the active-runtime marker in one step.
+///
+/// Two `rocm` processes can activate a runtime against the same data
+/// directory at once (two terminals, a script), so the write goes through the
+/// shared atomic writer: each writer stages into its own exclusively created
+/// temp file, and the marker is replaced rather than removed first, so a
+/// reader always finds a complete marker. On Windows the replace goes through
+/// `ReplaceFileW`, and two replacements in flight at once there are not
+/// tested. It does not order the two activations: the last one to publish
+/// wins, as before.
 fn write_active_runtime_marker(paths: &AppPaths, marker: ActiveRuntimeMarker) -> Result<()> {
     let path = active_runtime_marker_path(paths);
-    fs::create_dir_all(
-        path.parent()
-            .context("active runtime marker path has no parent directory")?,
-    )?;
     // The shared helper rather than a local temp-file-and-rename: it is the same
     // write the failed-activation restore uses, and it is strictly stronger than
     // a bare `fs::rename`, which on Windows is `MoveFileExW` and fails with a
@@ -1808,13 +1814,12 @@ fn write_active_runtime_marker(paths: &AppPaths, marker: ActiveRuntimeMarker) ->
     // window with no marker at all, which runtime resolution and the storage
     // retention holds both read as "nothing is active" — and a failed publish
     // takes its temp file with it, so a retried activation cannot strand one in
-    // the folder `rocm runtimes` reads.
-    therock::write_file_atomically(
-        &path,
-        &serde_json::to_vec_pretty(&marker).context("failed to serialize active runtime marker")?,
-    )
-    .with_context(|| format!("failed to write {}", path.display()))?;
-    Ok(())
+    // the folder `rocm runtimes` reads. It also creates the `runtimes` folder
+    // when it is missing.
+    let bytes =
+        serde_json::to_vec_pretty(&marker).context("failed to serialize active runtime marker")?;
+    rocm_core::atomic_write::write_file_atomically(&path, &bytes)
+        .with_context(|| format!("failed to write active runtime marker {}", path.display()))
 }
 
 #[cfg(test)]
@@ -2105,6 +2110,239 @@ pub(crate) mod tests {
         assert!(examine.contains("active_runtime_version: 7.14.0a20260601 (build 2026-06-01)"));
 
         let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    fn test_active_runtime_marker(paths: &AppPaths, runtime_key: &str) -> ActiveRuntimeMarker {
+        ActiveRuntimeMarker {
+            runtime_id: "therock-release:gfx120X-all".to_owned(),
+            runtime_key: runtime_key.to_owned(),
+            manifest_path: runtime_manifest_path(paths, runtime_key),
+            install_root: paths.data_dir.join("runtimes").join(runtime_key),
+            previous_runtime_id: None,
+            previous_runtime_key: None,
+            activated_at_unix_ms: rocm_core::unix_time_millis(),
+        }
+    }
+
+    fn leftover_marker_temp_files(paths: &AppPaths) -> Result<Vec<String>> {
+        let dir = active_runtime_marker_path(paths)
+            .parent()
+            .context("marker has a parent")?
+            .to_path_buf();
+        let mut leftovers = Vec::new();
+        for entry in fs::read_dir(dir)? {
+            let name = entry?.file_name().to_string_lossy().into_owned();
+            if name.starts_with("active.json.tmp-") {
+                leftovers.push(name);
+            }
+        }
+        Ok(leftovers)
+    }
+
+    /// The marker is staged through `rocm_core::atomic_write`, the writer this
+    /// change makes `rocm` and `rocmd` share (rocmd's own copy is gone), so it
+    /// never writes through a temp file another writer reserved. #605 reported
+    /// the marker staged at `active.json.tmp-<millis>` with a truncating write,
+    /// where a writer that drew another activation's millisecond wrote into
+    /// *that* writer's temp file and moved it into place; #424 fixed that on
+    /// its own, and this test keeps the marker from going back to it.
+    ///
+    /// Pre-creating a file at every name that scheme could pick while this
+    /// test runs stands in for the other writer deterministically: the write
+    /// has to succeed without touching any of them. This guards against a
+    /// return to that millis-only scheme specifically. The shared writer's own
+    /// names (`{name}.tmp-{pid}-{millis}-{attempt}`) cannot match these by
+    /// construction, so collision safety under the current scheme is covered
+    /// by `concurrent_active_runtime_marker_writes_keep_a_complete_marker_published`
+    /// and by `rocm_core::atomic_write`'s own concurrency tests.
+    ///
+    /// The pre-created names only cover the milliseconds they were made for, so
+    /// a write that lands after them proves nothing. The window starts at 2 s
+    /// and, when a slow or scanned filesystem lets the write miss it, is
+    /// retried at four times what the pre-creation and write took (up to
+    /// 16 s). Where creating the names is itself slower than one per
+    /// millisecond no window can cover the write, and where every try misses,
+    /// the test says it is inconclusive on stderr and passes rather than
+    /// failing code that is correct.
+    #[test]
+    fn active_runtime_marker_write_never_reuses_another_writers_temp_file() -> Result<()> {
+        const FOREIGN: &[u8] = b"another writer's staged marker";
+        const ATTEMPTS: usize = 3;
+        const MAX_WINDOW_MS: u128 = 16_000;
+        let (root, paths) = test_paths("marker-temp-collision");
+        write_active_runtime_marker(&paths, test_active_runtime_marker(&paths, "previous"))?;
+        let marker_path = active_runtime_marker_path(&paths);
+
+        let mut window_ms: u128 = 2_000;
+        for attempt in 1..=ATTEMPTS {
+            let start = rocm_core::unix_time_millis();
+            let foreign: Vec<PathBuf> = (start..start + window_ms)
+                .map(|millis| marker_path.with_extension(format!("json.tmp-{millis}")))
+                .collect();
+            for path in &foreign {
+                fs::write(path, FOREIGN)?;
+            }
+            let setup_ms = rocm_core::unix_time_millis() - start;
+
+            write_active_runtime_marker(&paths, test_active_runtime_marker(&paths, "next"))?;
+            let finished = rocm_core::unix_time_millis();
+
+            for path in &foreign {
+                assert_eq!(
+                    fs::read(path).ok().as_deref(),
+                    Some(FOREIGN),
+                    "{} belongs to another writer but was written through or moved",
+                    path.display()
+                );
+            }
+            for path in &foreign {
+                fs::remove_file(path)?;
+            }
+            if finished < start + window_ms {
+                let published: ActiveRuntimeMarker =
+                    serde_json::from_slice(&fs::read(&marker_path)?)?;
+                assert_eq!(published.runtime_key, "next");
+                assert_eq!(leftover_marker_temp_files(&paths)?, Vec::<String>::new());
+                let _ = fs::remove_dir_all(root);
+                return Ok(());
+            }
+            // Missed: the names ran out before the write ran. One name covers
+            // one millisecond, so when creating them is slower than one per
+            // millisecond no window can be wide enough; otherwise size the
+            // next one from what this pre-creation and write took.
+            let next_ms = 4 * (finished - start);
+            if setup_ms * 2 >= window_ms || next_ms > MAX_WINDOW_MS {
+                eprintln!(
+                    "inconclusive: pre-creating {window_ms} names took {setup_ms} ms and the \
+                     write finished after them; this filesystem is too slow for the test \
+                     to say anything, so it is skipped"
+                );
+                let _ = fs::remove_dir_all(root);
+                return Ok(());
+            }
+            window_ms = window_ms.max(next_ms);
+            eprintln!(
+                "attempt {attempt}/{ATTEMPTS}: the write finished after the pre-created \
+                 names ran out; retrying with a {window_ms} ms window"
+            );
+        }
+        eprintln!(
+            "inconclusive: on every attempt the write ran after the window of pre-created \
+             names, so this host is too slow for this test to say anything"
+        );
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// Two activations writing the marker at once must both succeed, and a
+    /// reader must find a complete marker throughout. #605 reported a writer
+    /// that removed `active.json` before renaming the replacement in, and two
+    /// writers in the same millisecond sharing one temp file, so one failed
+    /// with "failed to move active runtime marker" and the other could publish
+    /// the shorter payload followed by the longer one's tail. #424 fixed that;
+    /// this change routes the marker through `rocm_core::atomic_write`, the
+    /// writer `rocm` and `rocmd` now share, and this test pins that the marker
+    /// keeps the property through it.
+    ///
+    /// The bug is a race, so against the old code this fails with high
+    /// probability per round rather than deterministically; against the
+    /// current writer nothing in it is timing-dependent. Unix only: the
+    /// property under test is that `rename` replaces in one step. The Windows
+    /// publish path goes through `ReplaceFileW` instead, whose behaviour with
+    /// two replacements of one file in flight this test has not been run
+    /// against.
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_active_runtime_marker_writes_keep_a_complete_marker_published() -> Result<()> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Barrier};
+
+        const ROUNDS: usize = 200;
+        let (root, paths) = test_paths("marker-concurrent");
+        write_active_runtime_marker(&paths, test_active_runtime_marker(&paths, "initial"))?;
+        let marker_path = active_runtime_marker_path(&paths);
+
+        let done = Arc::new(AtomicBool::new(false));
+        let reader = {
+            let done = Arc::clone(&done);
+            let marker_path = marker_path.clone();
+            std::thread::spawn(move || {
+                let mut problems = Vec::new();
+                while !done.load(Ordering::Acquire) {
+                    match fs::read(&marker_path) {
+                        Ok(bytes) => {
+                            if let Err(error) =
+                                serde_json::from_slice::<ActiveRuntimeMarker>(&bytes)
+                            {
+                                problems.push(format!("unparsable marker: {error}"));
+                            }
+                        }
+                        Err(error) => problems.push(format!("marker unreadable: {error}")),
+                    }
+                }
+                problems
+            })
+        };
+
+        let barrier = Arc::new(Barrier::new(2));
+        let writers: Vec<_> = [
+            "short",
+            "a-runtime-key-long-enough-to-leave-a-tail-behind-a-shorter-payload",
+        ]
+        .into_iter()
+        .map(|runtime_key| {
+            let barrier = Arc::clone(&barrier);
+            let paths = paths.clone();
+            std::thread::spawn(move || {
+                let mut errors = Vec::new();
+                for _ in 0..ROUNDS {
+                    barrier.wait();
+                    if let Err(error) = write_active_runtime_marker(
+                        &paths,
+                        test_active_runtime_marker(&paths, runtime_key),
+                    ) {
+                        errors.push(format!("{error:#}"));
+                    }
+                }
+                errors
+            })
+        })
+        .collect();
+
+        let mut writer_errors = Vec::new();
+        for writer in writers {
+            writer_errors.extend(writer.join().expect("writer thread panicked"));
+        }
+        done.store(true, Ordering::Release);
+        let reader_problems = reader.join().expect("reader thread panicked");
+
+        let published: ActiveRuntimeMarker = serde_json::from_slice(&fs::read(&marker_path)?)?;
+        let leftovers = leftover_marker_temp_files(&paths)?;
+        let _ = fs::remove_dir_all(root);
+
+        assert!(
+            writer_errors.is_empty(),
+            "{} of {} marker writes failed; first: {:?}",
+            writer_errors.len(),
+            2 * ROUNDS,
+            writer_errors.first()
+        );
+        assert!(
+            reader_problems.is_empty(),
+            "a reader found no complete marker {} times; first: {:?}",
+            reader_problems.len(),
+            reader_problems.first()
+        );
+        assert!(
+            [
+                "short",
+                "a-runtime-key-long-enough-to-leave-a-tail-behind-a-shorter-payload"
+            ]
+            .contains(&published.runtime_key.as_str()),
+            "unexpected marker: {published:?}"
+        );
+        assert_eq!(leftovers, Vec::<String>::new());
         Ok(())
     }
 
