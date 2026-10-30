@@ -1710,6 +1710,29 @@ async fn instance_details_displayed(world: &mut E2eWorld) {
         .unwrap_or_else(|e| panic!("instance details did not appear: {e}"));
 }
 
+#[then("the instance detail lists recent throughput samples")]
+async fn detail_lists_recent_throughput_samples(world: &mut E2eWorld) {
+    // A populated row is "<N>s ago" then a numeric tok/s cell. The panel title
+    // and the idle placeholder both contain "recent throughput", and the
+    // summary's freshness line ("held · 1s ago") contains " ago", so neither
+    // substring alone distinguishes rows from the placeholders.
+    session(world)
+        .wait_for_screen_where(
+            "the detail modal's recent throughput panel lists an 'Ns ago <tok/s>' row",
+            |screen| {
+                screen.lines().any(|line| {
+                    line.split_once("s ago").is_some_and(|(head, tail)| {
+                        head.ends_with(|c: char| c.is_ascii_digit())
+                            && tail.trim_start().starts_with(|c: char| c.is_ascii_digit())
+                    })
+                })
+            },
+            default_timeout(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("recent throughput samples never appeared: {e}"));
+}
+
 #[then("the instance detail footer shows the scroll hint")]
 async fn detail_footer_shows_scroll_hint(world: &mut E2eWorld) {
     session(world)
