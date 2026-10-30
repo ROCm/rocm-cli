@@ -42,6 +42,12 @@ pub struct GpuMetrics {
     pub gpu_utilization_pct: f32,
     pub temperature_c: f32,
     pub power_w: f32,
+    /// The board's power cap (W), when the platform reports one. Warning
+    /// thresholds are derived from it; `None` means unknown (never `0`), and
+    /// consumers must not substitute another part's limit. Serde-default so
+    /// older recordings load.
+    #[serde(default)]
+    pub power_limit_w: Option<f32>,
     pub clock_mhz: Option<f32>,
 }
 
@@ -215,8 +221,9 @@ pub struct Instance {
     /// Omitted from JSON when `None` to preserve wire back-compat.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gen_tps_observation: Option<ObservationMetadata>,
-    /// Efficiency: `gen_tps` ÷ summed power (W) of the GPUs this instance
-    /// occupies. `None` when throughput or GPU power telemetry is unavailable.
+    /// Efficiency: `gen_tps` ÷ the power (W) attributed to this instance
+    /// ([`Instance::power_w`]). `None` when throughput or GPU power telemetry
+    /// is unavailable.
     #[serde(default)]
     pub tokens_per_watt: Option<f64>,
     /// Board power (W) attributed to this instance: each GPU's power split among
@@ -225,8 +232,8 @@ pub struct Instance {
     #[serde(default)]
     pub power_w: Option<f64>,
     /// Live average time-to-first-token (ms), windowed from the vLLM TTFT
-    /// histogram. `None` until two scrapes (or absent for non-vLLM engines);
-    /// Observe shows `—`. Serde-default for NDJSON replay back-compat.
+    /// histogram. `None` until a window sees new requests (or absent for
+    /// non-vLLM engines); Observe shows `—`. Serde-default for NDJSON replay back-compat.
     #[serde(default)]
     pub ttft_ms: Option<f64>,
     /// Freshness provenance for [`Instance::ttft_ms`]. A value with no new
@@ -236,7 +243,8 @@ pub struct Instance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttft_observation: Option<ObservationMetadata>,
     /// Live average time-per-output-token (ms), windowed from the vLLM TPOT
-    /// histogram. `None` until two scrapes (or absent); Observe shows `—`.
+    /// histogram. `None` until a window sees new requests (or absent);
+    /// Observe shows `—`.
     #[serde(default)]
     pub tpot_ms: Option<f64>,
     /// Freshness provenance for [`Instance::tpot_ms`]; same semantics as
@@ -270,6 +278,20 @@ mod tests {
         assert_eq!(inst.ttft_ms, None);
         assert_eq!(inst.tpot_ms, None);
         assert_eq!(inst.kv_cache_usage_pct, Some(42.0));
+    }
+
+    #[test]
+    fn gpu_metrics_deserializes_without_power_limit() {
+        // Replay back-compat: recordings made before `power_limit_w` existed
+        // must load with the limit unknown, never 0.
+        let legacy = r#"{
+            "device_id": "gpu-0", "vram_used_mb": 1, "vram_total_mb": 2,
+            "gpu_utilization_pct": 3.0, "temperature_c": 4.0, "power_w": 5.0,
+            "clock_mhz": null
+        }"#;
+        let g: GpuMetrics = serde_json::from_str(legacy).expect("legacy GPU must parse");
+        assert_eq!(g.power_limit_w, None);
+        assert!((g.power_w - 5.0).abs() < f32::EPSILON);
     }
 
     #[test]

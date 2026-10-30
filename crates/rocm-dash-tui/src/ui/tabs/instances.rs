@@ -158,8 +158,10 @@ pub fn draw_table(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         // Wide enough for "{v:.2} tok/W*" (tokens_per_watt_cell's longest
         // rendering) so the held marker never gets clipped mid-unit.
         Constraint::Length(12),
-        Constraint::Length(7),
-        Constraint::Length(7),
+        // Wide enough for a held 5-digit latency ("10000ms*") so the marker is
+        // never the part that gets clipped.
+        Constraint::Length(8),
+        Constraint::Length(8),
         Constraint::Length(7),
         Constraint::Length(7),
         Constraint::Length(5),
@@ -757,6 +759,35 @@ pub(in crate::ui) mod tests {
             !out.contains("999W"),
             "board power leaked into row; got:
 {out}"
+        );
+    }
+
+    #[test]
+    fn table_held_tpot_shows_marker_and_legend_and_five_digit_latency_is_not_clipped() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut inst = mk_inst_obs(
+            "idle",
+            Some(456.0),
+            Some(obs(ObservationFreshness::Fresh, 5)),
+        );
+        // TPOT alone is held, and long enough that a 7-wide column would clip
+        // the trailing marker.
+        inst.tpot_ms = Some(12345.0);
+        inst.tpot_observation = Some(obs(ObservationFreshness::Held, 30));
+        let state = state_with_snap(inst);
+        let mut term = Terminal::new(TestBackend::new(160, 20)).unwrap();
+        term.draw(|f| draw_table(f, f.area(), &state, &state.theme))
+            .unwrap();
+        let out = buffer_text(&term);
+        assert!(
+            out.contains("12345ms*"),
+            "held TPOT marker missing or clipped; got:\n{out}"
+        );
+        assert!(
+            out.contains(format::HELD_LEGEND),
+            "legend must explain a held TPOT marker; got:\n{out}"
         );
     }
 

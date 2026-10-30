@@ -24,6 +24,7 @@ fn gpu_json(g: &GpuMetrics) -> Value {
         "gpu_utilization_pct": g.gpu_utilization_pct,
         "temperature_c": g.temperature_c,
         "power_w": g.power_w,
+        "power_limit_w": g.power_limit_w,
         "vram_used_mb": g.vram_used_mb,
         "vram_total_mb": g.vram_total_mb,
     })
@@ -61,7 +62,14 @@ fn freshness_label(obs: Option<&ObservationMetadata>) -> Value {
 /// Fields added by EAI-7960:
 /// - `gen_tps`: live generation throughput from the Instance (same as daemon)
 /// - `tokens_per_watt`: daemon-provided efficiency (never recomputed here)
-/// - `freshness`: `"fresh"` | `"held"` | `null` (null for legacy/unknown)
+/// - `attributed_power_w`: this instance's share of its GPUs' board power
+///   (split among instances sharing a GPU). Not the same as `gpu_status`'s
+///   `power_w`, which is the whole board.
+/// - `ttft_ms` / `tpot_ms` with `ttft_freshness` / `tpot_freshness`
+///   (`"fresh"` | `"held"` | `null`): a held latency is the last value from a
+///   window that saw requests, not a live reading
+/// - `freshness`: `"fresh"` | `"held"` | `null` (null for legacy/unknown),
+///   for `gen_tps`
 /// - `observed_at`: ISO-8601 UTC string when present, `null` when absent
 pub fn list_instances_json(snap: &StateSnapshot) -> Value {
     let arr: Vec<Value> = snap
@@ -90,7 +98,7 @@ pub fn list_instances_json(snap: &StateSnapshot) -> Value {
                 "waiting_reqs": i.waiting_reqs,
                 "gen_tps": i.gen_tps,
                 "tokens_per_watt": i.tokens_per_watt,
-                "power_w": i.power_w,
+                "attributed_power_w": i.power_w,
                 "ttft_ms": i.ttft_ms,
                 "ttft_freshness": freshness_label(i.ttft_observation.as_ref()),
                 "tpot_ms": i.tpot_ms,
@@ -282,7 +290,32 @@ mod tests {
         // No metadata is unknown, never reported as fresh.
         assert_eq!(i["tpot_ms"], 22.0);
         assert!(i["tpot_freshness"].is_null());
-        assert_eq!(i["power_w"], 123.0);
+        assert_eq!(i["attributed_power_w"], 123.0);
+    }
+
+    #[test]
+    fn gpu_status_json_reports_the_power_limit_or_null() {
+        use rocm_dash_core::metrics::Snapshot;
+        let mut snap = fixture_snapshot();
+        let mut g = GpuMetrics {
+            device_id: "gpu-0".into(),
+            power_w: 700.0,
+            power_limit_w: Some(750.0),
+            ..GpuMetrics::default()
+        };
+        snap.latest = Some(Snapshot {
+            gpus: vec![g.clone()],
+            ..Snapshot::default()
+        });
+        let v = gpu_status_json(&snap, None);
+        assert_eq!(v["gpus"][0]["power_limit_w"], 750.0);
+        // Unknown stays null: never 0, never another part's limit.
+        g.power_limit_w = None;
+        snap.latest = Some(Snapshot {
+            gpus: vec![g],
+            ..Snapshot::default()
+        });
+        assert!(gpu_status_json(&snap, None)["gpus"][0]["power_limit_w"].is_null());
     }
 
     #[test]

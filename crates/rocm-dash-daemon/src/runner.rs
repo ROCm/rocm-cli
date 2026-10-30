@@ -408,6 +408,11 @@ pub async fn run_loop(
 
     let mut tick_count: u64 = 0;
     let mut last_sysinfo_refresh: u64 = 0;
+    // Static per-GPU power caps (`amd-smi static`), refreshed on the sysinfo
+    // cadence and stamped onto each tick's metrics. `None` until first fetched.
+    let mut power_limits: HashMap<String, f32> = HashMap::new();
+    let mut last_power_limit_refresh: Option<u64> = None;
+    let mut warned_no_power_limits = false;
     // Discovery/scrape warnings are produced on their own (slower) cadences, so
     // holding them only for the tick that produced them makes the header ⚠ badge
     // blink on and off. Keep the last result until that cadence runs again.
@@ -467,8 +472,42 @@ pub async fn run_loop(
         }
 
         let mut warnings = Vec::new();
-        let gpus = if let Some(g) = &gpu {
-            match g.metrics().await {
+        // Power caps are static, so they refresh on the sysinfo cadence. Fetch
+        // them alongside this tick's metrics instead of ahead of it, so the
+        // refresh tick pays one amd-smi round trip, not two in a row.
+        let refresh_limits = gpu.is_some()
+            && last_power_limit_refresh
+                .is_none_or(|at| tick_count.saturating_sub(at) >= sysinfo_refresh_ticks);
+        let mut gpus = if let Some(g) = &gpu {
+            let (limits, metrics) = tokio::join!(
+                async {
+                    if refresh_limits {
+                        Some(g.power_limits().await)
+                    } else {
+                        None
+                    }
+                },
+                g.metrics()
+            );
+            if let Some(res) = limits {
+                match res {
+                    // An empty map (a schema the parser no longer matches) must
+                    // not wipe caps we already hold, and is worth saying once.
+                    Ok(l) if l.is_empty() => {
+                        if power_limits.is_empty() && !warned_no_power_limits {
+                            warn!(
+                                "amd-smi static reported no readable power cap; power stays uncolored"
+                            );
+                            warned_no_power_limits = true;
+                        }
+                    }
+                    Ok(l) => power_limits = l,
+                    // A failed fetch keeps the previous caps; retry next interval.
+                    Err(_) => {}
+                }
+                last_power_limit_refresh = Some(tick_count);
+            }
+            match metrics {
                 Ok(v) => v,
                 Err(e) => {
                     warnings.push(format!("amd-smi metric: {e}"));
@@ -506,6 +545,10 @@ pub async fn run_loop(
             // until the first detection result lands.
             Vec::new()
         };
+
+        for g in &mut gpus {
+            g.power_limit_w = power_limits.get(&g.device_id).copied();
+        }
 
         if gpu.is_some()
             && tick_count.saturating_sub(last_sysinfo_refresh) >= sysinfo_refresh_ticks
@@ -972,14 +1015,7 @@ pub async fn run_loop(
         // Warn only when a real process scrape happened but an instance with
         // live GPUs still fell back to device-summed (cgroup join missed).
         if procs_nonempty {
-            let vram_fallbacks = instances
-                .iter()
-                .filter(|i| {
-                    !i.gpu_ids.is_empty()
-                        && rocm_dash_core::efficiency::gpu_ids_overlap(&i.gpu_ids, &gpus)
-                        && !per_container_used.contains_key(&i.container_id)
-                })
-                .count();
+            let vram_fallbacks = count_vram_join_misses(&instances, &gpus, &per_container_used);
             if vram_fallbacks > 0 {
                 scrape_warns.push(format!(
                     "vram attribution: {vram_fallbacks} instance(s) fell back to device-summed \
@@ -1026,6 +1062,29 @@ pub async fn run_loop(
             }
         }
     }
+}
+
+/// Instances that *could* have joined the per-process VRAM map but did not.
+///
+/// The map is keyed by docker/containerd ids read from `/proc/<pid>/cgroup`,
+/// so only an instance whose id has that shape can ever hit it. A managed
+/// `rocm serve` service (named by its service id) falls back to device-summed
+/// VRAM by design, and counting it would raise a false "check /proc access"
+/// warning on every healthy managed instance.
+fn count_vram_join_misses<S: std::hash::BuildHasher>(
+    instances: &[Instance],
+    gpus: &[GpuMetrics],
+    per_container_used: &HashMap<String, u64, S>,
+) -> usize {
+    instances
+        .iter()
+        .filter(|i| {
+            rocm_dash_collectors::cgroup::is_container_id(&i.container_id)
+                && !i.gpu_ids.is_empty()
+                && rocm_dash_core::efficiency::gpu_ids_overlap(&i.gpu_ids, gpus)
+                && !per_container_used.contains_key(&i.container_id)
+        })
+        .count()
 }
 
 /// Remove all per-service telemetry state for `id`: tracker, TTFT, and TPOT
@@ -1404,6 +1463,31 @@ mod tests {
     ) -> (Option<f64>, Option<ObservationFreshness>) {
         let (v, m) = snapshot_latency(w, id, at(secs));
         (v, m.map(|m| m.freshness))
+    }
+
+    fn inst_on(id: &str, gpu: &str) -> Instance {
+        Instance {
+            container_id: id.into(),
+            gpu_ids: vec![gpu.into()],
+            ..Instance::default()
+        }
+    }
+
+    #[test]
+    fn managed_instances_never_count_as_vram_join_misses() {
+        let docker_id = "ab".repeat(32);
+        let gpus = [gpu("gpu-0", 1000, 8000)];
+        let insts = [
+            inst_on("vllm-qwen-qwen2-5-0-5b-instru-1793361705247", "0"),
+            inst_on(&docker_id, "0"),
+        ];
+        // A docker instance with no /proc match is a real miss; the managed
+        // service, which could never match, is not.
+        let empty: HashMap<String, u64> = HashMap::new();
+        assert_eq!(count_vram_join_misses(&insts, &gpus, &empty), 1);
+        // Once the docker instance joins, nothing is missed.
+        let joined: HashMap<String, u64> = [(docker_id, 512)].into();
+        assert_eq!(count_vram_join_misses(&insts, &gpus, &joined), 0);
     }
 
     #[test]

@@ -734,9 +734,10 @@ async fn ttft_is_held_then_cleared_when_requests_stop() {
 
 // ── GPU power limit and shared-GPU attribution (ROCMAI-62) ──────────────────
 
-/// Contract: with `amd-smi` reporting one 400 W GPU and two managed services
-/// launched on that GPU, the broadcast snapshot splits the board power between
-/// the two instances instead of crediting each with all of it. Drives the real runner with a
+/// Contract: with `amd-smi` reporting one 400 W GPU capped at 750 W and two
+/// managed services launched on that GPU, the broadcast snapshot carries the
+/// cap on the GPU and splits the board power between the two instances
+/// instead of crediting each with all of it. Drives the real runner with a
 /// fake `amd-smi`; amd-smi itself is not needed on the host.
 #[cfg(unix)]
 #[tokio::test]
@@ -760,7 +761,8 @@ async fn shared_gpu_power_is_split_and_limit_is_reported() {
         r#"#!/bin/sh
 case "$1" in
   metric) echo '{"gpu_data":[{"gpu":0,"mem_usage":{"used_vram":{"value":1000},"total_vram":{"value":8000}},"usage":{"gfx_activity":{"value":50}},"temperature":{"hotspot":{"value":60}},"power":{"socket_power":{"value":400.0,"unit":"W"}}}]}' ;;
-  process) echo '{"gpu_data":[]}' ;;
+  static) echo '{"gpu_data":[{"gpu":0,"limit":{"max_power":{"value":750,"unit":"W"}}}]}' ;;
+  process) echo '{"gpu_data":[{"gpu":0,"process_list":[{"process_info":{"pid":1,"memory_usage":{"vram_mem":{"value":100,"unit":"MB"}}}}]}]}' ;;
   *) echo '{}' ;;
 esac
 "#,
@@ -775,22 +777,38 @@ esac
     };
     let _runner = spawn_runner(tx, opts).await;
 
-    let (a, b) = wait_for_snapshot(&mut rx, |snap| {
+    let (limit, a, b, warnings) = wait_for_snapshot(&mut rx, |snap| {
+        let gpu = snap.gpus.first()?;
         let power = |id: &str| {
             snap.instances
                 .iter()
                 .find(|i| i.container_id == id)
                 .and_then(|i| i.power_w)
         };
-        Some((power("shared-a")?, power("shared-b")?))
+        Some((
+            gpu.power_limit_w?,
+            power("shared-a")?,
+            power("shared-b")?,
+            snap.warnings.clone(),
+        ))
     })
     .await
-    .unwrap_or_else(|e| panic!("attributed power never appeared: {e}"));
+    .unwrap_or_else(|e| panic!("limit and attributed power never appeared: {e}"));
 
-    // No per-process VRAM was reported, so the board is split equally and the
-    // two shares add back up to what the GPU actually draws.
+    assert!((limit - 750.0).abs() < f32::EPSILON, "limit was {limit}");
+    // Neither service joins the per-container VRAM map (managed services can
+    // not), so the board is split equally and the two shares add back up to
+    // what the GPU actually draws.
     assert!((a - 200.0).abs() < 1e-6, "shared-a got {a} W");
     assert!((b - 200.0).abs() < 1e-6, "shared-b got {b} W");
+    // amd-smi lists a GPU process, so the VRAM scrape is "real", but that
+    // process is in no container the cgroup join can name. Managed services
+    // can never join that map by design, so this must not read as a /proc
+    // problem.
+    assert!(
+        !warnings.iter().any(|w| w.starts_with("vram attribution")),
+        "false vram-attribution warning for healthy managed services: {warnings:?}"
+    );
 }
 
 // ── Scenario 5: Omitted counter → None (not zero, not panic) ───────────────

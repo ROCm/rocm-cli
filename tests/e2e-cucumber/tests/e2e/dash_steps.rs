@@ -2499,8 +2499,8 @@ async fn metrics_endpoint_fails(world: &mut E2eWorld) {
 
 /// EAI-7960 principal regression assertion.
 ///
-/// The frame under assertion is provably post-failure (the TTFT cell it used to
-/// show is gone) and the logical clock is held, so the only way "tok/s" can be
+/// The frame under assertion is provably post-failure (the header warnings
+/// badge has grown past its pre-failure count) and the logical clock is held, so the only way "tok/s" can be
 /// missing here is the regression itself: the daemon clearing a held rate on a
 /// failed scrape instead of keeping it for the validity window.
 #[then("generation throughput remains visible within the validity window")]

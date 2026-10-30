@@ -112,7 +112,11 @@ impl Tool for ListInstancesTool {
         ToolDefinition {
             name: Self::NAME.to_string(),
             description: "List discovered serving instances: name, model, status, \
-                          KV-cache usage %, and running/waiting request counts."
+                          KV-cache usage %, running/waiting request counts, \
+                          generation tok/s, TTFT/TPOT (each with a fresh/held \
+                          flag; held means the last value, not a live reading), \
+                          and attributed_power_w (this instance's share of its \
+                          GPUs' power, not whole-board power)."
                 .to_string(),
             parameters: json!({ "type": "object", "properties": {} }),
         }
@@ -166,7 +170,8 @@ impl Tool for TokensPerWattTool {
         ToolDefinition {
             name: Self::NAME.to_string(),
             description: "Per-instance efficiency: generation tokens/sec divided by \
-                          the summed power (W) of the GPUs each instance occupies."
+                          the instance's attributed share of its GPUs' power (W). \
+                          GPUs shared by several instances are split between them."
                 .to_string(),
             parameters: json!({ "type": "object", "properties": {} }),
         }
