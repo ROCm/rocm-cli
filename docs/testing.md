@@ -885,11 +885,43 @@ Provider-assisted output is reduced to a validated `rocm` tool call. It is
 shown for review in the TUI, but non-interactive `rocm --yes ...` does not
 execute provider-assisted plans automatically.
 
+A request is planned exactly once, so the plan shown to the user is the plan
+the provider gave: building a plan can call the provider, whose answers are not
+guaranteed to be the same twice, and a second call could describe a different
+command than the first. Two E2E scenarios in
+[chat.feature](../tests/e2e-cucumber/features/chat.feature) hold this through the
+real binary, against a mock chat provider that answers from a script (a
+different plan on each call, via `MockServer::start_with_chat_script` in
+[mock_server.rs](../tests/e2e-cucumber/src/mock_server.rs); steps in
+[planner_steps.rs](../tests/e2e-cucumber/tests/e2e/planner_steps.rs)):
+
+- `chat-10` (`chat-freeform-yes-plans-once`): `rocm --yes "serve a model"`
+  asks the planning provider exactly once, prints the provider's plan, and is
+  refused (non-zero exit, no `execution` section) rather than running it. This
+  is also the scenario for the claim above that `--yes` does not execute
+  provider-assisted plans.
+- `chat-11` (`chat-assistant-plan-tool-plans-once`): the chat assistant's
+  `natural_language_plan` tool asks the planning provider exactly once.
+
+```bash
+cargo xtask e2e -- -n "chat-10"
+cargo xtask e2e -- -n "chat-11"
+```
+
+Both run on the mock lane and need no GPU. They do not show that the plan
+shown is also the action that would run: `--yes` refuses a provider-assisted
+plan before dispatching it and the chat tool reports only a fixed confirmation,
+so neither surface ever runs the plan's command. That half is covered by the
+unit tests below.
+
 Focused coverage:
 
 ```bash
 cargo test -p rocm --bin rocm provider_planner
 cargo test -p rocm --bin rocm freeform_execution_validation_rejects_provider_assisted_plans
+cargo test -p rocm --bin rocm freeform_plan_dedup_prevents_provider_assisted_divergence
+cargo test -p rocm --bin rocm freeform_execution_reuses_the_rendered_plan_without_rebuilding
+cargo test -p e2e-cucumber --lib chat_script_tests
 ```
 
 Log browser smoke:

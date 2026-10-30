@@ -107,3 +107,33 @@ Feature: Chat and endpoint detection
     When the user pipes a one-shot chat prompt through the CLI
     Then the CLI prints the assistant's reply
     And the model receives the piped prompt with its whitespace intact
+
+  # A request the CLI cannot plan on its own is handed to the configured local
+  # planning assistant, whose answers are not the same twice. Asking twice would
+  # let the plan the user reads and the plan that gets acted on come from two
+  # different answers, so the assistant must be asked exactly once and the plan
+  # shown must be its answer. The assistant here answers differently each time
+  # it is asked, which is what makes a second ask visible. `--yes` never runs a
+  # plan the assistant produced, so what this scenario can show about "acted on"
+  # is that the request is refused with nothing executed; that the plan shown is
+  # also the action taken is covered by the unit tests
+  # `freeform_plan_dedup_prevents_provider_assisted_divergence` and
+  # `freeform_execution_reuses_the_rendered_plan_without_rebuilding`.
+  @id:chat-freeform-yes-plans-once
+  Scenario: chat-10 - A vague request approved with --yes consults the planning assistant once
+    Given a local planning assistant that suggests a different plan each time it is asked
+    When the user approves a vague natural-language request with --yes
+    Then the planning assistant was asked exactly once
+    And the plan shown is the one the assistant gave
+    And the request is refused rather than run without review
+
+  # The same guarantee through the other path that plans a request: the chat
+  # assistant asking for it to be planned. The chat only reports that the plan
+  # was made, so the count of requests is what shows it was made once.
+  @id:chat-assistant-plan-tool-plans-once
+  Scenario: chat-11 - Asking the chat assistant to plan a vague request consults the planning assistant once
+    Given a local assistant that hands the request to the planner, which suggests a different plan each time it is asked
+    When the user asks the assistant in one-shot chat for help with a vague request
+    Then the planning assistant was asked exactly once
+    And the chat assistant was asked once before the plan and once after it
+    And the chat reports that the request was planned
