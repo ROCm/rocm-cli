@@ -176,7 +176,7 @@ fn chat_tool_call_display_label(call: &providers::ChatToolCall) -> String {
     }
 }
 
-fn loopback_tcp_port_is_reachable(host: &str, port: u16) -> bool {
+pub(crate) fn loopback_tcp_port_is_reachable(host: &str, port: u16) -> bool {
     let Ok(addresses) = (host, port).to_socket_addrs() else {
         return false;
     };

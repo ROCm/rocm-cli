@@ -360,14 +360,10 @@ fn terminate_recorded_pid(identity: &rocm_core::ProcessIdentity) -> rocm_core::T
     // it through an `__engine-serve-http` process. A root-only kill would leave
     // the engine running and still holding the device.
     //
-    // Identity verification does not apply on Windows. `process_start_ticks`
-    // has no `/proc` to read there and returns `None`, so no recorded identity
-    // can be refuted and the gate below only ever turns away a PID that is not
-    // running at all. A recorded PID that has been recycled by an unrelated
-    // process still passes it, and `taskkill /T /F` then takes that process and
-    // its whole subtree: the stale-PID hazard is unchanged on Windows, exactly
-    // as it was before this gate existed. Closing it needs `rocm_core` to read a
-    // Windows process creation time.
+    // Identity verification applies on Windows too: `process_start_ticks` reads
+    // the process creation time there, so a recycled PID is refuted before
+    // `taskkill /T /F` can take an unrelated process and its subtree. Only a
+    // record with no recorded start time has nothing to be refuted against.
     #[cfg(windows)]
     if matches!(
         rocm_core::identity_state(identity),
@@ -935,6 +931,9 @@ fn build_runtime_state(
         running: automations_enabled,
         automations_enabled,
         daemon_pid: std::process::id(),
+        // Captured while this process is alive so a later `rocm uninstall` can
+        // tell this daemon from an unrelated process that inherited the PID.
+        daemon_start_ticks: rocm_core::ProcessIdentity::capture(std::process::id()).start_ticks,
         started_at_unix_ms: now,
         last_tick_unix_ms: now,
         local_webhook_endpoint: None,
@@ -1062,6 +1061,23 @@ fn wait_for_service_ready(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn a_fresh_runtime_state_records_this_daemons_start_time() {
+        // `rocm uninstall` refuses to signal a daemon pid it cannot prove is
+        // rocmd, and the proof is this field: `None` here would make every
+        // record look pre-upgrade and abort every uninstall that finds a daemon.
+        let state = build_runtime_state(&RocmCliConfig::default(), true);
+        assert_eq!(state.daemon_pid, std::process::id());
+        let recorded = state
+            .daemon_start_ticks
+            .expect("a live daemon must record its own start-time");
+        assert_eq!(
+            Some(recorded),
+            rocm_core::process_start_ticks(std::process::id())
+        );
+    }
     use crate::test_support::identity_probe_record;
     use crate::test_support::{
         UNCONFIRMED_STOP_PID, seed_keyed_service, temp_app_paths, unique_test_root,

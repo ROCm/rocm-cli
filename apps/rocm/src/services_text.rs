@@ -38,8 +38,9 @@
 //! rather than staying behind, since neither has a caller outside this
 //! cluster: the `LogBrowserEntry` struct (used only by
 //! `collect_log_browser_entries`/`filter_log_browser_entries`) and the
-//! `MANAGED_STOP_GRACE` constant (used only by
-//! `stop_internal_managed_service_confirmed_with`). Both stay private.
+//! `MANAGED_STOP_GRACE` constant (used by
+//! `stop_internal_managed_service_confirmed_with` and the uninstall gate).
+//! `LogBrowserEntry` stays private; the constant is `pub(crate)`.
 //!
 //! `dispatch()` calls directly into this module at several points —
 //! `render_internal_status_text`, `run_internal_sandbox_tool`,
@@ -682,7 +683,7 @@ pub(crate) fn run_internal_sandbox_tool(
 
 /// How long a managed stop waits for each recorded process to actually exit
 /// after `SIGTERM` before escalating to `SIGKILL` and then reporting a timeout.
-const MANAGED_STOP_GRACE: Duration = Duration::from_secs(10);
+pub(crate) const MANAGED_STOP_GRACE: Duration = Duration::from_secs(10);
 
 /// Terminate the processes recorded for a managed service, verifying each PID's
 /// identity first so a recycled PID never causes an unrelated process tree to be
@@ -695,24 +696,8 @@ const MANAGED_STOP_GRACE: Duration = Duration::from_secs(10);
 /// known token. Returns the PIDs actually signalled and whether every recorded
 /// process is confirmed no longer running.
 fn terminate_recorded_service_pids(record: &ManagedServiceRecord) -> (Vec<u32>, bool) {
-    // Build the (pid, own-token) work list, de-duplicating on PID and preferring
-    // an entry that carries a verifiable start-time.
-    let mut entries: Vec<(u32, Option<u64>)> = Vec::new();
-    for (pid, ticks) in [
-        (Some(record.supervisor_pid), record.supervisor_start_ticks),
-        (record.engine_pid, record.engine_start_ticks),
-    ] {
-        let Some(pid) = pid.filter(|pid| *pid != 0 && *pid != std::process::id()) else {
-            continue;
-        };
-        if let Some(existing) = entries.iter_mut().find(|(seen, _)| *seen == pid) {
-            if existing.1.is_none() {
-                existing.1 = ticks;
-            }
-        } else {
-            entries.push((pid, ticks));
-        }
-    }
+    // The same (pid, own-token) list the uninstall gate pre-checks.
+    let entries = crate::uninstall_gate::recorded_pid_identities(record);
 
     let mut signaled_pids = Vec::new();
     let mut all_stopped = true;
@@ -749,6 +734,17 @@ fn stop_internal_managed_service(paths: &AppPaths, service_id: &str) -> Result<s
     stop_internal_managed_service_with(paths, service_id, terminate_recorded_service_pids)
 }
 
+/// [`stop_internal_managed_service`], also returning whether the stop is
+/// confirmed. Uninstall decides on this flag, not on the report's `status`: a
+/// record that already read `stopped` keeps that status through a stop that
+/// confirmed nothing.
+pub(crate) fn stop_internal_managed_service_confirmed(
+    paths: &AppPaths,
+    service_id: &str,
+) -> Result<(serde_json::Value, bool)> {
+    stop_internal_managed_service_confirmed_with(paths, service_id, terminate_recorded_service_pids)
+}
+
 /// [`stop_internal_managed_service`], with the termination of the recorded
 /// processes supplied by the caller. Production passes
 /// [`terminate_recorded_service_pids`]; a test passes a stand-in that observes
@@ -768,7 +764,7 @@ fn stop_internal_managed_service_with(
 /// them. The report's `status` cannot carry that on its own — a record that
 /// already read `stopped` keeps that status through a stop that confirmed
 /// nothing.
-fn stop_internal_managed_service_confirmed_with(
+pub(crate) fn stop_internal_managed_service_confirmed_with(
     paths: &AppPaths,
     service_id: &str,
     terminate: impl FnOnce(&ManagedServiceRecord) -> (Vec<u32>, bool),
@@ -1305,7 +1301,7 @@ pub(crate) fn read_tail_lines(path: &Path, limit: usize, label: &str) -> Result<
     Ok(lines.into_iter().collect())
 }
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::cell::RefCell;
 
     use super::*;
@@ -2719,20 +2715,66 @@ mod tests {
         Ok(())
     }
 
+    /// Assert `child` exits within a bounded grace, and reap it either way.
+    ///
+    /// NOT `wait()`. These tests spawn a stand-in that exits on its own after a
+    /// minute, so an unbounded `wait()` blocks until that happens and then finds
+    /// the process gone — passing whether or not anything killed it. The only
+    /// symptom of a total regression would be the suite taking a minute. Polling
+    /// against a deadline asserts it died *now*, which is the actual claim.
+    ///
+    /// The grace exceeds the stop path's own per-process wait but stays far
+    /// below the stand-in's lifetime, or this goes back to measuring nothing.
+    ///
+    /// Shared with `crate::uninstall`'s tests rather than duplicated there: two
+    /// near-identical copies of this, with near-identical comments, is what made
+    /// it easy to believe both process-based tests were bounded when only one
+    /// of them was.
     #[cfg(unix)]
-    fn managed_record_for_pid(
+    pub(crate) const STOP_ASSERTION_GRACE: Duration = Duration::from_secs(30);
+
+    #[cfg(unix)]
+    pub(crate) fn assert_stopped_within_grace(child: &mut std::process::Child, message: &str) {
+        let deadline = std::time::Instant::now() + STOP_ASSERTION_GRACE;
+        let exited = loop {
+            match child.try_wait().expect("poll the stand-in") {
+                Some(_) => break true,
+                None if std::time::Instant::now() >= deadline => break false,
+                None => thread::sleep(Duration::from_millis(50)),
+            }
+        };
+        if !exited {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        assert!(exited, "{message}");
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn managed_record_for_pid(
         paths: &AppPaths,
+        pid: u32,
+        start_ticks: Option<u64>,
+    ) -> ManagedServiceRecord {
+        managed_record_named(paths, "svc-managed-stop", pid, start_ticks)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn managed_record_named(
+        paths: &AppPaths,
+        service_id: &str,
         pid: u32,
         start_ticks: Option<u64>,
     ) -> ManagedServiceRecord {
         let mut record = ManagedServiceRecord::new(
             paths,
-            "svc-managed-stop",
+            service_id,
             "vllm",
             "m",
             "m",
             "127.0.0.1",
-            9,
+            // Port 0 is never served, so the gate's probe cannot meet a listener.
+            0,
             "managed",
             pid,
             None,
@@ -2750,7 +2792,7 @@ mod tests {
     fn managed_stop_refuses_recycled_pid() {
         // A live process whose recorded identity does not match: this is exactly
         // what a recycled PID looks like. The stop must NOT signal it.
-        let mut child = std::process::Command::new("sleep")
+        let mut child = crate::test_support::bare_command("sleep")
             .arg("60")
             .spawn()
             .expect("spawn child");
@@ -2778,11 +2820,11 @@ mod tests {
     fn managed_stop_verifies_distinct_supervisor_and_engine_pids() {
         // The launcher and the engine server are different processes; each PID
         // must be verified with its OWN start-time token and terminated.
-        let sup = std::process::Command::new("sleep")
+        let sup = crate::test_support::bare_command("sleep")
             .arg("60")
             .spawn()
             .expect("spawn supervisor");
-        let eng = std::process::Command::new("sleep")
+        let eng = crate::test_support::bare_command("sleep")
             .arg("60")
             .spawn()
             .expect("spawn engine");
@@ -2812,7 +2854,7 @@ mod tests {
     #[test]
     fn managed_stop_terminates_verified_pid() {
         // Correct identity: the recorded process is really ours, so it is stopped.
-        let child = std::process::Command::new("sleep")
+        let child = crate::test_support::bare_command("sleep")
             .arg("60")
             .spawn()
             .expect("spawn child");
@@ -2825,10 +2867,10 @@ mod tests {
 
         assert_eq!(signaled, vec![pid]);
         assert!(all_stopped);
-        // Reap our own child (a detached managed process would be reaped by init)
-        // so the liveness check does not observe a not-yet-reaped zombie.
+        // Bounded, and our own child, so this pins that the terminate killed it
+        // rather than that it outlived the test.
         let mut child = child;
-        let _ = child.wait();
+        assert_stopped_within_grace(&mut child, "the verified process must be terminated");
         assert!(
             !rocm_core::process_is_running(pid),
             "the verified process must be terminated"

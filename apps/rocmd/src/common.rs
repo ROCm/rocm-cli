@@ -318,15 +318,19 @@ pub(crate) fn ensure_public_service_has_endpoint_key(
         bail!(
             "refusing to recover a service that was launched with an endpoint API key but no \
              longer has one: it would come back up without authentication, and something \
-             outside this machine may still be publishing its port. Relaunch it with \
-             `rocm serve --require-api-key` to issue a new key."
+             outside this machine may still be publishing its port. Relaunch it with `{}` {} to \
+             issue a new key.",
+            rocm_engine_protocol::relaunch_command(host, true),
+            rocm_engine_protocol::RELAUNCH_KEY_CHOICE
         );
     }
     if rocm_engine_protocol::is_public_bind_host(host) && !key_present {
         bail!(
             "refusing to respawn a service bound to the public host `{host}` without an endpoint \
-             API key: it would come back up without authentication. Relaunch it with \
-             `rocm serve --host {host} --allow-public-bind` to issue a new key."
+             API key: it would come back up without authentication. Relaunch it with `{}` {} to \
+             issue a new key.",
+            rocm_engine_protocol::relaunch_command(host, false),
+            rocm_engine_protocol::RELAUNCH_KEY_CHOICE
         );
     }
     Ok(())
@@ -443,9 +447,15 @@ mod tests {
         for host in ["127.0.0.1", "localhost", "::1"] {
             let error = ensure_public_service_has_endpoint_key(host, false, true)
                 .expect_err("a service launched with a key must not be recovered without one");
+            let rendered = format!("{error:#}");
+            assert!(rendered.contains("without authentication"), "{rendered}");
             assert!(
-                format!("{error:#}").contains("without authentication"),
-                "{error:#}"
+                rendered.contains(&format!("rocm serve <model> --host {host} --port <port>")),
+                "the relaunch command must be one that can be run: {rendered}"
+            );
+            assert!(
+                rendered.contains("--require-api-key"),
+                "a service launched with a key must be told to relaunch with one: {rendered}"
             );
         }
         // With the key still present, recovery proceeds.
@@ -460,9 +470,18 @@ mod tests {
         // the key gone the child would listen on that public host anonymously,
         // so the spawn must be refused instead.
         let error = ensure_public_service_has_endpoint_key("0.0.0.0", false, false).unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("without authentication"), "{rendered}");
+        // The command it names must be the public-bind one: `--allow-public-bind`
+        // and no `--require-api-key`, which this branch never asked for.
         assert!(
-            error.to_string().contains("without authentication"),
-            "{error:#}"
+            rendered
+                .contains("rocm serve <model> --host 0.0.0.0 --port <port> --allow-public-bind`"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(rocm_engine_protocol::RELAUNCH_KEY_CHOICE),
+            "{rendered}"
         );
 
         ensure_public_service_has_endpoint_key("0.0.0.0", true, false).unwrap();

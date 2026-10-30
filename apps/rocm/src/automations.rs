@@ -518,6 +518,7 @@ mod tests {
             running: true,
             automations_enabled: true,
             daemon_pid: 123,
+            daemon_start_ticks: None,
             started_at_unix_ms: 1,
             last_tick_unix_ms: 2,
             local_webhook_endpoint: Some("http://127.0.0.1:19191/automation-events".to_owned()),
