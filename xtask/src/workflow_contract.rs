@@ -1761,15 +1761,16 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
         step
     }
 
-    /// The lines of a step's `run: |` block, still indented.
+    /// The lines of a step's block-scalar `run:` (`run: |`, `|-`, `>`, `>-`,
+    /// …), still indented and, for a folded `>` block, not yet folded: see
+    /// [`run_script`] for the script the shell is handed.
     ///
     /// Trailing blank lines are dropped: they are the separator `step_block`
     /// lets through, not part of the script, and keeping them would make two
     /// identical scripts compare unequal over the spacing between steps.
     fn run_block(step: &str) -> Option<Vec<&str>> {
         let lines: Vec<&str> = step.lines().collect();
-        let run_at = lines.iter().position(|l| l.trim() == "run: |")?;
-        let run_indent = indent_of(lines[run_at]);
+        let (run_at, run_indent, _) = run_block_header(&lines)?;
         let mut body: Vec<&str> = lines[run_at + 1..]
             .iter()
             .take_while(|l| l.trim().is_empty() || indent_of(l) > run_indent)
@@ -1779,6 +1780,74 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
             body.pop();
         }
         Some(body)
+    }
+
+    /// Where a step's block-scalar `run:` opens: the index of its `run:` line
+    /// in `lines`, the column of the `run` key, and whether the block is
+    /// folded (`>`) rather than literal (`|`). The key may be the step's
+    /// first (`- run: |`), two columns in from the dash.
+    ///
+    /// Any block-scalar header counts — `|` or `>`, with or without a
+    /// chomping (`-`/`+`) or indentation (digit) indicator, and with or
+    /// without a trailing comment — since every one of them hands the step a
+    /// multi-line script.
+    fn run_block_header(lines: &[&str]) -> Option<(usize, usize, bool)> {
+        lines.iter().enumerate().find_map(|(at, line)| {
+            let code = strip_comment(line).trim();
+            let (key, key_column) = match code.strip_prefix("- ") {
+                Some(rest) => (rest.trim_start(), indent_of(line) + 2),
+                None => (code, indent_of(line)),
+            };
+            let indicator = key.strip_prefix("run:")?.trim();
+            let folded = match indicator.chars().next()? {
+                '|' => false,
+                '>' => true,
+                _ => return None,
+            };
+            indicator[1..]
+                .chars()
+                .all(|c| c == '-' || c == '+' || c.is_ascii_digit())
+                .then_some((at, key_column, folded))
+        })
+    }
+
+    /// The script a step's block-scalar `run:` hands its shell, one entry per
+    /// line: [`run_block`]'s lines, folded the way YAML folds a `>` block.
+    ///
+    /// In a folded block a line break between two lines at the block's own
+    /// indent becomes a space, so two such lines are ONE line of script; a
+    /// blank line ends the line, and a more-indented line keeps the breaks
+    /// around it. A literal `|` block is the script as written.
+    fn run_script(step: &str) -> Option<Vec<String>> {
+        let lines: Vec<&str> = step.lines().collect();
+        let (_, _, folded) = run_block_header(&lines)?;
+        let body = run_block(step)?;
+        if !folded {
+            return Some(body.iter().map(|line| (*line).to_owned()).collect());
+        }
+        let indent = body
+            .iter()
+            .find(|line| !line.trim().is_empty())
+            .map_or(0, |line| indent_of(line));
+        let mut script: Vec<String> = Vec::new();
+        let mut folds_onto_last = false;
+        for line in body {
+            if line.trim().is_empty() {
+                script.push(String::new());
+                folds_onto_last = false;
+                continue;
+            }
+            let at_block_indent = indent_of(line) == indent;
+            match script.last_mut() {
+                Some(last) if at_block_indent && folds_onto_last => {
+                    last.push(' ');
+                    last.push_str(line.trim_start());
+                }
+                _ => script.push(line.to_owned()),
+            }
+            folds_onto_last = at_block_indent;
+        }
+        Some(script)
     }
 
     /// The non-comment lines of a step's `run: |` block, joined.
@@ -5357,20 +5426,34 @@ permissions:
 
     /// Every `shell: pwsh` step in `text` as `(name, step block)`.
     ///
-    /// The step is found from its `shell: pwsh` line by walking up to the
-    /// nearest `- ` item shallower than it, so the key order inside the step
-    /// does not matter.
+    /// The step is found from its `shell: pwsh` line: that line itself when
+    /// `shell:` is the step's first key (`- shell: pwsh`), and otherwise by
+    /// walking up to the nearest `- ` item shallower than it, so the key order
+    /// inside the step does not matter.
     fn pwsh_steps(text: &str) -> Vec<(String, String)> {
         let lines: Vec<&str> = text.lines().collect();
         let mut steps = Vec::new();
         for (at, line) in lines.iter().enumerate() {
-            if strip_comment(line).trim() != "shell: pwsh" {
+            let code = strip_comment(line).trim();
+            let (key, is_item) = match code.strip_prefix("- ") {
+                Some(rest) => (rest.trim_start(), true),
+                None => (code, false),
+            };
+            if key
+                .strip_prefix("shell:")
+                .is_none_or(|shell| strip_quotes(shell.trim()) != "pwsh")
+            {
                 continue;
             }
             let shell_indent = indent_of(line);
-            let Some(start) = (0..at).rev().find(|&i| {
-                indent_of(lines[i]) < shell_indent && lines[i].trim_start().starts_with("- ")
-            }) else {
+            let start = if is_item {
+                Some(at)
+            } else {
+                (0..at).rev().find(|&i| {
+                    indent_of(lines[i]) < shell_indent && lines[i].trim_start().starts_with("- ")
+                })
+            };
+            let Some(start) = start else {
                 continue;
             };
             let step = step_block(&lines, start);
@@ -5380,9 +5463,14 @@ permissions:
     }
 
     /// PowerShell words that open a statement but are not a program to run.
-    const PWSH_KEYWORDS: [&str; 15] = [
+    ///
+    /// Every entry is a keyword to pwsh's own tokenizer
+    /// (`TokenTraits::HasTrait(kind, TokenFlags::Keyword)`), so none can name
+    /// a program at the start of a statement.
+    const PWSH_KEYWORDS: [&str; 22] = [
         "if", "elseif", "else", "foreach", "for", "while", "do", "switch", "function", "try",
-        "catch", "finally", "throw", "exit", "return",
+        "catch", "finally", "throw", "exit", "return", "break", "continue", "begin", "process",
+        "end", "param", "trap",
     ];
 
     /// Whether a trimmed, comment-free pwsh statement runs an external
@@ -5514,29 +5602,188 @@ permissions:
     }
 
     /// The native-command statements in a pwsh body whose exit status
-    /// nothing reads: not the body's last statement, and not followed by a
-    /// statement that inspects `$LASTEXITCODE`.
+    /// nothing reads (see [`exit_status_is_read`]).
     fn unchecked_native_commands(body: &[&str]) -> Vec<String> {
         let statements = pwsh_statements(body);
         statements
             .iter()
             .enumerate()
             .filter(|(i, line)| {
-                is_native_command_line(line)
-                    && statements
-                        .get(i + 1)
-                        .is_some_and(|next| !next.contains("$LASTEXITCODE"))
+                is_native_command_line(line) && !exit_status_is_read(&statements[i + 1..])
             })
             .map(|(_, line)| line.clone())
             .collect()
     }
 
-    /// [`unchecked_native_commands`] over a pwsh step's script: its `run: |`
-    /// block, or its one-line `run:` value, which can chain statements with
-    /// `;` just the same.
+    /// Whether a native command's exit status is still in `$LASTEXITCODE`
+    /// when something reads it, given the statements that follow it.
+    ///
+    /// The statements are walked in order:
+    ///
+    /// - one that assigns `$LASTEXITCODE` overwrites the status: unread;
+    /// - one that otherwise mentions `$LASTEXITCODE` reads it: read;
+    /// - one that [leaves it alone](leaves_last_exit_code_alone) is passed
+    ///   over;
+    /// - anything else might run another program, or leave the script, before
+    ///   the status is read: unread.
+    ///
+    /// Running off the end is a read: GitHub's pwsh wrapper appends
+    /// `if ((Test-Path -LiteralPath variable:\LASTEXITCODE)) { exit $LASTEXITCODE }`,
+    /// so the step itself exits with the status.
+    fn exit_status_is_read(after: &[String]) -> bool {
+        for statement in after {
+            if assigns_last_exit_code(statement) {
+                return false;
+            }
+            if reads_last_exit_code(statement) {
+                return true;
+            }
+            if !leaves_last_exit_code_alone(statement) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Whether a pwsh statement assigns `$LASTEXITCODE` (`= 0`, `+= 1`, with
+    /// or without a `global:`/`script:`/`local:` scope), so the status it
+    /// held is gone.
+    fn assigns_last_exit_code(statement: &str) -> bool {
+        let lower = statement.trim().to_ascii_lowercase();
+        let Some(variable) = lower.strip_prefix('$') else {
+            return false;
+        };
+        let variable = ["global:", "script:", "local:"]
+            .iter()
+            .find_map(|scope| variable.strip_prefix(scope))
+            .unwrap_or(variable);
+        variable.strip_prefix("lastexitcode").is_some_and(|rest| {
+            let rest = rest.trim_start();
+            ["=", "+=", "-=", "*=", "/=", "%=", "??="]
+                .iter()
+                .any(|operator| rest.starts_with(operator))
+        })
+    }
+
+    /// Cmdlets that only write output, a stream or a file: none of them runs
+    /// a program or sets `$LASTEXITCODE`.
+    const PWSH_INERT_CMDLETS: [&str; 11] = [
+        "Write-Output",
+        "Write-Host",
+        "Write-Information",
+        "Write-Verbose",
+        "Write-Debug",
+        "Write-Warning",
+        "Out-File",
+        "Out-Null",
+        "Out-Host",
+        "Add-Content",
+        "Set-Content",
+    ];
+
+    /// Whether a pwsh statement can neither run a program nor touch
+    /// `$LASTEXITCODE`, so a native command's status survives it.
+    ///
+    /// Deliberately narrow, and erring towards "might": outside single
+    /// quotes, which are literal, the statement has no `(` (a subexpression
+    /// `$(…)` or a `(…)` argument runs a command, even inside double quotes),
+    /// no `{` (a script block), no `&` (the call operator, `&&`) and no
+    /// expanding `@"` here-string. What is left is a pipeline whose first
+    /// element is a value — a variable, a string or a number — or an
+    /// assignment of one, or one of [`PWSH_INERT_CMDLETS`], and whose every
+    /// later element is one of those cmdlets. Anything else, a keyword
+    /// (`exit`, a loop's closing `}`) or a function call included, is not.
+    fn leaves_last_exit_code_alone(statement: &str) -> bool {
+        let code = without_single_quoted_text(statement);
+        if code.contains(['(', '{', '&']) || code.contains("@\"") {
+            return false;
+        }
+        code.split('|').enumerate().all(|(at, element)| {
+            let element = element.trim();
+            let first = element.split_whitespace().next().unwrap_or_default();
+            PWSH_INERT_CMDLETS
+                .iter()
+                .any(|cmdlet| cmdlet.eq_ignore_ascii_case(first))
+                || (at == 0 && is_value_or_assignment(element))
+        })
+    }
+
+    /// Whether a pipeline element is a plain value (`$x`, `"text"`, `'text'`,
+    /// `42`, a literal here-string) or `$name = …` of one, with a target other
+    /// than `$LASTEXITCODE`. A `+=`-style operator counts as `=`.
+    fn is_value_or_assignment(element: &str) -> bool {
+        let value = match element.split_once('=') {
+            Some((target, value)) if element.starts_with('$') => {
+                let target = target
+                    .trim_end()
+                    .trim_end_matches(['+', '-', '*', '/', '%', '?'])
+                    .trim_end();
+                let name = target.trim_start_matches('$');
+                if name.is_empty()
+                    || !name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+                    || assigns_last_exit_code(element)
+                {
+                    return false;
+                }
+                // `$a = $b = cargo …` chains: the value must pass in turn.
+                return is_value_or_assignment(value.trim());
+            }
+            _ => element,
+        };
+        value.starts_with(['$', '"', '\''])
+            || value.starts_with("@'")
+            || value.starts_with(|c: char| c.is_ascii_digit())
+    }
+
+    /// `statement` with the text inside its single-quoted strings removed:
+    /// that text is literal, so nothing in it can run. Double-quoted strings
+    /// are kept whole, since `$(…)` inside one does run, and a `'` inside one
+    /// is just a character.
+    fn without_single_quoted_text(statement: &str) -> String {
+        let mut kept = String::new();
+        let mut quote: Option<char> = None;
+        let mut chars = statement.chars();
+        while let Some(c) = chars.next() {
+            match (quote, c) {
+                (Some('\''), '\'') | (Some('"'), '"') => {
+                    quote = None;
+                    kept.push(c);
+                }
+                (Some('\''), _) => {}
+                (_, '`') => {
+                    kept.push(c);
+                    if let Some(escaped) = chars.next() {
+                        kept.push(escaped);
+                    }
+                }
+                (None, '\'' | '"') => {
+                    quote = Some(c);
+                    kept.push(c);
+                }
+                _ => kept.push(c),
+            }
+        }
+        kept
+    }
+
+    /// Whether a pwsh statement mentions `$LASTEXITCODE`. PowerShell variable
+    /// names are case-insensitive, so `$LastExitCode` and `$lastexitcode` are
+    /// the same variable and count just the same.
+    fn reads_last_exit_code(statement: &str) -> bool {
+        statement.to_ascii_lowercase().contains("$lastexitcode")
+    }
+
+    /// [`unchecked_native_commands`] over a pwsh step's script: its
+    /// block-scalar `run:` (`|`, `|-`, `>`, `>-`, …, folded as YAML folds it),
+    /// or its one-line `run:` value, which can chain statements with `;` just
+    /// the same.
     fn unchecked_native_commands_in_step(step: &str) -> Vec<String> {
-        match run_block(step) {
-            Some(body) => unchecked_native_commands(&body),
+        match run_script(step) {
+            Some(script) => {
+                unchecked_native_commands(&script.iter().map(String::as_str).collect::<Vec<_>>())
+            }
             None => unchecked_native_commands(&[step_key(step, "run").as_str()]),
         }
     }
@@ -5576,9 +5823,10 @@ permissions:
     /// python b.py --self-test   # exits 0
     /// ```
     ///
-    /// the step is green. Every native command that is not the body's last
-    /// statement must therefore have its `$LASTEXITCODE` read on the next
-    /// line, or be split into its own step (#633), or be allow-listed above
+    /// the step is green. Every native command must therefore have its
+    /// `$LASTEXITCODE` read before anything that could run another program or
+    /// reset it (see [`exit_status_is_read`]; the end of the body counts as a
+    /// read), or be split into its own step (#633), or be allow-listed above
     /// with the reason its failure still surfaces.
     #[test]
     fn no_pwsh_step_lets_a_failing_native_command_pass_unseen() {
@@ -5624,7 +5872,8 @@ permissions:
             "these `shell: pwsh` steps run a native command whose failure the step \
              would not report, because pwsh carries on and the step takes only the last \
              command's exit code — split each into its own step, or check \
-             `$LASTEXITCODE` right after it:\n  {}",
+             `$LASTEXITCODE` before anything that could run another program or \
+             reset it:\n  {}",
             offenders.join("\n  ")
         );
         // An allow-list entry that no longer matches anything exempts nothing
@@ -5771,6 +6020,218 @@ permissions:
             unchecked_native_commands(&mismatched).is_empty(),
             "{:?}",
             pwsh_statements(&mismatched)
+        );
+    }
+
+    /// PowerShell variable names are case-insensitive: a check spelled
+    /// `$LastExitCode` reads the same variable as `$LASTEXITCODE`.
+    #[test]
+    fn unchecked_native_commands_reads_last_exit_code_in_any_case() {
+        for check in [
+            "if ($LastExitCode -ne 0) { exit $LastExitCode }",
+            "if ($lastexitcode -ne 0) { exit 1 }",
+        ] {
+            let body = ["cargo build", check, "cargo xtask e2e"];
+            assert!(
+                unchecked_native_commands(&body).is_empty(),
+                "{check:?} reads the status: {:?}",
+                unchecked_native_commands(&body)
+            );
+        }
+    }
+
+    /// A statement that opens with a PowerShell keyword runs no program, so
+    /// it is not a native command left unchecked before `cargo xtask e2e`.
+    #[test]
+    fn a_statement_opening_with_a_pwsh_keyword_is_not_a_native_command() {
+        for statement in [
+            "break",
+            "continue",
+            "begin {",
+            "process {",
+            "end {",
+            "param([string] $Target)",
+            "trap { Write-Output 'trapped' }",
+        ] {
+            assert!(
+                !is_native_command_line(statement),
+                "{statement:?} reads as a native command"
+            );
+            assert!(
+                unchecked_native_commands(&[statement, "cargo xtask e2e"]).is_empty(),
+                "{statement:?}"
+            );
+        }
+    }
+
+    /// Every block-scalar form of `run:` hands a pwsh step a script, so every
+    /// form is checked. Read only as `run: |`, a `run: |-`, `run: >` or
+    /// `run: >-` step fell through to the one-line reading, whose value is the
+    /// bare indicator, and so escaped the contract whatever its script did.
+    #[test]
+    fn unchecked_native_commands_reads_every_block_scalar_run_form() {
+        // Literal forms: each line is a line of script.
+        for header in ["run: |", "run: |-", "run: |+", "run: |2", "run: |-  # note"] {
+            let step = format!(
+                "      - name: Self-tests\n        shell: pwsh\n        {header}\n          \
+                 python a.py --self-test\n          python b.py --self-test\n"
+            );
+            assert_eq!(
+                unchecked_native_commands_in_step(&step),
+                ["python a.py --self-test"],
+                "{header}"
+            );
+        }
+        // Folded forms: a blank line separates two lines of script.
+        for header in ["run: >", "run: >-", "run: >+"] {
+            let step = format!(
+                "      - name: Self-tests\n        shell: pwsh\n        {header}\n          \
+                 python a.py --self-test\n\n          python b.py --self-test\n"
+            );
+            assert_eq!(
+                unchecked_native_commands_in_step(&step),
+                ["python a.py --self-test"],
+                "{header}"
+            );
+        }
+    }
+
+    /// A folded `run: >` block is read as YAML folds it: lines at the block's
+    /// indent join with a space into one line of script, a blank line starts
+    /// a new one, and a more-indented line keeps its own line. Taken line by
+    /// line instead, the first two lines below would read as two commands and
+    /// the first as unchecked, where pwsh is handed one `cargo` command.
+    #[test]
+    fn a_folded_run_block_is_read_as_yaml_folds_it() {
+        let step = "      - shell: pwsh\n        name: Build\n        run: >-\n          \
+                    cargo build\n          --locked\n\n          if ($LASTEXITCODE) {\n            \
+                    exit 1\n          }\n";
+        assert_eq!(
+            run_script(step).expect("the step has a block-scalar run"),
+            [
+                "          cargo build --locked",
+                "",
+                "          if ($LASTEXITCODE) {",
+                "            exit 1",
+                "          }",
+            ]
+        );
+        assert!(unchecked_native_commands_in_step(step).is_empty());
+    }
+
+    /// `shell:` and `run:` can each be a step's first key, on its `- ` line;
+    /// the step is pwsh, and its script checked, just the same. Matched only
+    /// as sibling keys, `- shell: pwsh` was never found as a pwsh step and
+    /// `- run: |` read as no script at all.
+    #[test]
+    fn a_pwsh_step_is_checked_whichever_key_comes_first() {
+        let script = "            python a.py --self-test\n            \
+                      python b.py --self-test\n";
+        for step in [
+            format!("      - shell: pwsh\n        name: Self-tests\n        run: |\n{script}"),
+            format!("      - shell: 'pwsh'\n        name: Self-tests\n        run: |\n{script}"),
+            format!("      - run: |\n{script}        shell: pwsh\n        name: Self-tests\n"),
+        ] {
+            let text = format!("jobs:\n  win:\n    runs-on: windows-latest\n    steps:\n{step}");
+            let found: Vec<(String, Vec<String>)> = pwsh_steps(&text)
+                .into_iter()
+                .map(|(name, step)| (name, unchecked_native_commands_in_step(&step)))
+                .collect();
+            assert_eq!(
+                found,
+                [(
+                    "Self-tests".to_owned(),
+                    vec!["python a.py --self-test".to_owned()]
+                )],
+                "{step}"
+            );
+        }
+    }
+
+    /// A `$LASTEXITCODE` check need not be the very next statement: what
+    /// sits between may only be statements that can neither run a program
+    /// nor touch `$LASTEXITCODE`. Each case below was run through pwsh after
+    /// a native command exiting 3, under GitHub's wrapper: in every accepted
+    /// case the check still saw 3.
+    #[test]
+    fn a_later_last_exit_code_check_counts_when_nothing_between_can_reset_it() {
+        let check = "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }";
+        for between in [
+            &["Write-Output 'built'"][..],
+            &["Write-Host \"built $target\""],
+            &["$artifact = 'dist/rocm.zip'"],
+            &["$env:RESULT = $artifact", "$count += 1"],
+            &["\"k=v\" | Out-File -FilePath $env:GITHUB_OUTPUT -Append"],
+            &[
+                "@'",
+                "## Summary (cargo build; git status)",
+                "'@ | Add-Content $env:GITHUB_STEP_SUMMARY",
+            ],
+            &["Write-Output 'one'", "$x = 'two'", "Write-Host $x"],
+            &["Write-Output 'done (all targets) & {more}'"],
+        ] {
+            let body: Vec<&str> = std::iter::once("cargo build")
+                .chain(between.iter().copied())
+                .chain([check, "cargo xtask e2e"])
+                .collect();
+            assert!(
+                unchecked_native_commands(&body).is_empty(),
+                "{between:?} leaves the status for the check: {:?}",
+                unchecked_native_commands(&body)
+            );
+        }
+        // The end of the body is a read too: GitHub's wrapper exits with
+        // `$LASTEXITCODE`, which a trailing cmdlet leaves alone.
+        assert!(unchecked_native_commands(&["cargo build", "Write-Output 'done'"]).is_empty());
+    }
+
+    /// The other side of the rule: a statement that can run a program, leave
+    /// the script, or set `$LASTEXITCODE` between a native command and the
+    /// check leaves that command unchecked. Run through pwsh after a native
+    /// command exiting 3 (`.\scripts\collect.ps1` standing for a script
+    /// that ends `exit 0`), each of these lost the 3 before the check —
+    /// another status took its place, or the step left first — except the
+    /// two marked: one this check cannot tell from a statement that does,
+    /// and a loop's closing brace, which is not a statement on its own.
+    #[test]
+    fn a_later_last_exit_code_check_does_not_count_past_a_statement_that_can_reset_it() {
+        let check = "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }";
+        for between in [
+            &["git rev-parse HEAD"][..],
+            &["Write-Output (git rev-parse HEAD)"],
+            &["Write-Output \"sha: $(git rev-parse HEAD)\""],
+            &["Write-Output \"it's $(git rev-parse HEAD)\""],
+            &["& .\\scripts\\collect.ps1"],
+            &["$LASTEXITCODE = 0"],
+            &["$global:LastExitCode = 0"],
+            &["$sha = git rev-parse HEAD"],
+            &["$a = $b = git rev-parse HEAD"],
+            &["Write-Output 'x' | git hash-object --stdin"],
+            // Conservative: runs git only if Write-Output fails.
+            &["Write-Output 'x' || git rev-parse HEAD"],
+            &["@\"", "$(git rev-parse HEAD)", "\"@ | Out-File summary.md"],
+            &["Invoke-Expression 'git rev-parse HEAD'"],
+            &["Write-Output 'x' && git rev-parse HEAD"],
+            // A hashtable value is a statement, and runs.
+            &["Write-Output @{ sha = git rev-parse HEAD }"],
+            &["Write-Output @\"", "$(git rev-parse HEAD)", "\"@"],
+            &["exit 0"],
+            // A loop's closing brace: the check reads the last pass only.
+            &["}"],
+            &["Write-Output 'fine'", "git rev-parse HEAD"],
+        ] {
+            let body: Vec<&str> = std::iter::once("cargo build")
+                .chain(between.iter().copied())
+                .chain([check, "cargo xtask e2e"])
+                .collect();
+            assert!(
+                unchecked_native_commands(&body).contains(&"cargo build".to_owned()),
+                "{between:?} can reset the status, yet `cargo build` reads as checked"
+            );
+        }
+        assert_eq!(
+            unchecked_native_commands(&["cargo build", "exit 0"]),
+            ["cargo build"]
         );
     }
 }
