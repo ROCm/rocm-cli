@@ -875,7 +875,11 @@ can:
 
 - Press **Ctrl-D** to detach. The log stream stops, your shell comes back, and
   the server keeps running. Manage it afterward with `rocm services`.
-- Press **Ctrl-C** to stop the server instead.
+- Press **Ctrl-C** to stop the server instead. If the stop answers that it
+  could not confirm the server's process exited, the command prints the same
+  report as `rocm services stop` on stderr and exits with an error. If the stop
+  itself fails, the command says why on stderr, signals the server process
+  directly and exits 0; if that signal fails too, it says so on stderr.
 
 `--managed` is the explicit form of the default background behavior.
 `--no-smoke-test` skips the post-startup inference probe.
@@ -916,6 +920,16 @@ rocm services restart <service-id> --yes
 rocm services remove <service-id> --yes
 rocm services prune [--older-than-hours <n> | --any-age] [--dry-run] [--yes]
 ```
+
+`stop` reports a server stopped only once every recorded process is confirmed
+gone. If it cannot confirm that, it prints `Local server stop not confirmed` on
+stderr and exits with an error. It keeps the record, which still names the
+processes, and any endpoint key, which the server may still be enforcing. It
+names each process that, or a process under it, did not exit after it was
+signaled; for a process it could not verify as the server's, it signals nothing
+and names an operating-system command to check on it. It does not suggest
+running the stop again: when only a process under the recorded one survived, a
+second stop can report the server stopped while that process still runs.
 
 `restart` starts a server again only once its stop has confirmed that every
 recorded process is gone; if the stop cannot confirm that, it says so, starts

@@ -142,14 +142,15 @@ pub(crate) fn stop_managed_service_via(
         record.stop_requested_unix_ms = None;
         // Recorded PIDs go stale the instant their processes exit, and a stale
         // PID is exactly what the identity check exists to catch — so do not
-        // leave one behind for the next stop to find. Only safe here: an
-        // unconfirmed survivor is still the service's, and a later stop has to
-        // be able to reach it.
+        // leave one behind for the next stop to find.
         record.supervisor_pid = 0;
         record.supervisor_start_ticks = None;
         record.engine_pid = None;
         record.engine_start_ticks = None;
     } else {
+        // The recorded PIDs stay: an unconfirmed survivor is still the
+        // service's, and the record is what names it.
+        //
         // The marker that tells a service the operator stopped from one that
         // merely crashed. While it is set the daemon will not recover the
         // service (`stop_requested`), so an unconfirmed stop is not undone.
@@ -157,9 +158,9 @@ pub(crate) fn stop_managed_service_via(
         // It is also what the deferred key cleanup keys on — but that cleanup
         // lives in the `rocm` binary (`settle_pending_stop_key_cleanup`, run by
         // its liveness refresh), not here. A caller that only ever drives
-        // `rocmd` finishes the job by repeating the stop: once the processes
-        // are gone the repeat confirms, clears the marker and drops the key.
-        // Until then, both stay on disk.
+        // `rocmd` keeps both the marker and the key on disk until a later stop
+        // confirms; that confirmation is only as good as the check above it,
+        // which cannot see a survivor under a dead recorded root.
         record.stop_requested_unix_ms = Some(requested_at);
     }
     record.write()?;

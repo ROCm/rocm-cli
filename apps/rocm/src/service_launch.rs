@@ -59,7 +59,9 @@ use crate::managed_service_status::existing_live_managed_service;
 use crate::service_hints;
 #[cfg(not(windows))]
 use crate::services_text::read_optional_tail_lines;
-use crate::services_text::{render_service_action_result, run_internal_sandbox_tool};
+use crate::services_text::{
+    render_service_action_result, run_internal_sandbox_tool, service_stop_unconfirmed,
+};
 use crate::{SandboxToolArg, device_policy_name, record_cli_audit_event, status_for_readiness};
 
 pub(crate) fn validate_bind_host(host: &str, allow_public_bind: bool) -> Result<()> {
@@ -976,29 +978,21 @@ pub(crate) fn run_attached_service(
         }
         AttachOutcome::Stop => {
             println!("stopping server...");
-            match run_internal_sandbox_tool(
+            let stop = run_internal_sandbox_tool(
                 &paths,
                 SandboxToolArg::StopServer,
                 Some(service_id.clone()),
                 true,
-            ) {
-                Ok(result) => print!("{}", render_service_action_result("stop_server", &result)),
-                Err(error) => {
-                    // Best-effort direct signal so Ctrl-C never leaves the model
-                    // orphaned when the sandbox stop path fails.
-                    let _ = rocm_core::terminate_process_tree(child_pid);
-                    println!("  note: {error}");
-                }
-            }
-            record_cli_audit_event(
-                &paths,
-                "service",
-                "serve_stop",
-                "info",
-                format!("stopped attached serve service_id={service_id}"),
-                Some(&service_id),
             );
-            Ok(())
+            finish_attached_stop(
+                &paths,
+                &service_id,
+                child_pid,
+                stop,
+                rocm_core::terminate_process_tree,
+                &mut io::stdout().lock(),
+                &mut io::stderr().lock(),
+            )
         }
         AttachOutcome::ServerExited => {
             println!("server process exited");
@@ -1156,6 +1150,91 @@ fn stream_attached_logs_no_tty(log_path: &Path, child_pid: u32) -> Result<Attach
     }
 }
 
+/// Finish the attached `rocm serve` Ctrl-C stop once the managed stop has
+/// answered: what is printed where, what is signalled, what is audited, and
+/// how the command exits. Everything but the stop itself and the real
+/// signal is here, so a test can drive it.
+///
+/// - Confirmed: the report goes to `out` and the command succeeds.
+/// - Unconfirmed: the same report `rocm services stop` gives, check lines
+///   included, becomes the error, so it reaches stderr and the command exits
+///   non-zero. Nothing is signalled on the stop's behalf: the stop has already
+///   done what it safely could.
+/// - The stop itself failed: `signal_child` gets the child this session
+///   launched, so Ctrl-C never leaves the model orphaned when the stop path
+///   breaks. The stop's error, and the signal's if that fails too, are noted on
+///   `err`, and the audit event records whether the signal worked. The command
+///   still exits 0, as it always has here.
+fn finish_attached_stop(
+    paths: &AppPaths,
+    service_id: &str,
+    child_pid: u32,
+    stop: Result<serde_json::Value>,
+    signal_child: impl FnOnce(u32) -> Result<()>,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> Result<()> {
+    match stop {
+        Ok(result) if service_stop_unconfirmed(&result) => {
+            record_cli_audit_event(
+                paths,
+                "service",
+                "serve_stop",
+                "error",
+                format!("stop of attached serve not confirmed service_id={service_id}"),
+                Some(service_id),
+            );
+            bail!(
+                "{}",
+                render_service_action_result("stop_server", &result).trim_end()
+            )
+        }
+        Ok(result) => {
+            write!(
+                out,
+                "{}",
+                render_service_action_result("stop_server", &result)
+            )?;
+            record_cli_audit_event(
+                paths,
+                "service",
+                "serve_stop",
+                "info",
+                format!("stopped attached serve service_id={service_id}"),
+                Some(service_id),
+            );
+            Ok(())
+        }
+        Err(error) => {
+            let signal = signal_child(child_pid);
+            writeln!(err, "  note: {error:#}")?;
+            if let Err(signal_error) = &signal {
+                writeln!(
+                    err,
+                    "  note: signaling this session's server process {child_pid} directly also failed: {signal_error:#}"
+                )?;
+            }
+            let message = match &signal {
+                Ok(()) => format!(
+                    "stop failed; signaled attached serve child {child_pid} service_id={service_id}"
+                ),
+                Err(signal_error) => format!(
+                    "stop failed; signaling attached serve child {child_pid} also failed: {signal_error:#} service_id={service_id}"
+                ),
+            };
+            record_cli_audit_event(
+                paths,
+                "service",
+                "serve_stop",
+                if signal.is_ok() { "warn" } else { "error" },
+                message,
+                Some(service_id),
+            );
+            Ok(())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1172,6 +1251,179 @@ mod tests {
             "{error:#}"
         );
         validate_bind_host("0.0.0.0", true).unwrap();
+    }
+
+    /// A `stop_server` answer whose one recorded process ended with `outcome`.
+    fn stop_answer(confirmed: bool, outcome: &str) -> serde_json::Value {
+        crate::services_text::internal_stop_server_value(serde_json::json!({
+            "service_id": "svc-attached",
+            "status": "ready",
+            "signaled_pids": if outcome == "unverified" { vec![] } else { vec![4242] },
+            "pid_outcomes": [{ "pid": 4242, "role": "supervisor_and_engine", "outcome": outcome }],
+            // An attached serve on a public bind stores a key; an unconfirmed
+            // stop keeps it.
+            "endpoint_key_kept": !confirmed,
+            "stopped": confirmed,
+        }))
+    }
+
+    /// Run [`finish_attached_stop`] for `stop`, returning its result, what it
+    /// wrote to stdout, the PID it signalled (if any) and the audit event.
+    fn finish(
+        name: &str,
+        stop: Result<serde_json::Value>,
+    ) -> (Result<()>, String, Option<u32>, serde_json::Value) {
+        finish_signalling(name, stop, Ok(()))
+    }
+
+    /// [`finish`], with the direct signal answering `signal_result`.
+    fn finish_signalling(
+        name: &str,
+        stop: Result<serde_json::Value>,
+        signal_result: Result<()>,
+    ) -> (Result<()>, String, Option<u32>, serde_json::Value) {
+        let (result, out, _err, signalled, audit) = finish_capturing(name, stop, signal_result);
+        (result, out, signalled, audit)
+    }
+
+    /// [`finish_signalling`], also returning what was written to stderr.
+    fn finish_capturing(
+        name: &str,
+        stop: Result<serde_json::Value>,
+        signal_result: Result<()>,
+    ) -> (Result<()>, String, String, Option<u32>, serde_json::Value) {
+        let (root, paths) = test_paths(name);
+        paths.ensure().unwrap();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let mut signalled = None;
+        let result = finish_attached_stop(
+            &paths,
+            "svc-attached",
+            777,
+            stop,
+            |pid| {
+                signalled = Some(pid);
+                signal_result
+            },
+            &mut out,
+            &mut err,
+        );
+        let audit_text = fs::read_to_string(paths.audit_events_path()).expect("audit log");
+        let audit = serde_json::from_str(audit_text.lines().last().expect("an audit event"))
+            .expect("audit json");
+        let _ = fs::remove_dir_all(root);
+        (
+            result,
+            String::from_utf8(out).unwrap(),
+            String::from_utf8(err).unwrap(),
+            signalled,
+            audit,
+        )
+    }
+
+    #[test]
+    fn attached_ctrl_c_reports_a_confirmed_stop_on_stdout() {
+        let (result, out, signalled, audit) =
+            finish("attached-confirmed", Ok(stop_answer(true, "graceful")));
+        result.expect("a confirmed stop succeeds");
+        assert!(out.contains("Local server stopped"), "{out}");
+        assert_eq!(signalled, None);
+        assert_eq!(audit["level"], "info", "{audit}");
+        assert_eq!(
+            audit["message"],
+            "stopped attached serve service_id=svc-attached"
+        );
+    }
+
+    #[test]
+    fn attached_ctrl_c_fails_an_unconfirmed_stop_like_services_stop_and_signals_nothing() {
+        // The same report `rocm services stop` gives, as the error (stderr,
+        // non-zero exit), naming no retry; nothing is signalled on the stop's
+        // behalf and nothing reaches stdout.
+        let answer = stop_answer(false, "timed_out");
+        let (result, out, signalled, audit) = finish("attached-timed-out", Ok(answer.clone()));
+        let error = format!("{:#}", result.expect_err("an unconfirmed stop fails"));
+        assert_eq!(
+            error,
+            render_service_action_result("stop_server", &answer).trim_end(),
+            "the report is `rocm services stop`'s own"
+        );
+        assert!(
+            error.contains(
+                "process 4242 (supervisor_and_engine) or a process under it did not exit"
+            ),
+            "{error}"
+        );
+        assert!(
+            error.lines().any(|line| line
+                == "  kept: the server record, which still names its processes, and its endpoint key, which the server may still be enforcing"),
+            "{error}"
+        );
+        crate::services_text::tests::assert_no_retry_line(&error);
+        assert!(out.is_empty(), "nothing on stdout: {out}");
+        assert_eq!(signalled, None, "an unconfirmed stop signals nothing more");
+        assert_eq!(audit["level"], "error", "{audit}");
+        assert_eq!(
+            audit["message"],
+            "stop of attached serve not confirmed service_id=svc-attached"
+        );
+    }
+
+    #[test]
+    fn attached_ctrl_c_names_a_check_for_an_unverified_process() {
+        let (result, out, signalled, audit) =
+            finish("attached-unverified", Ok(stop_answer(false, "unverified")));
+        let error = format!("{:#}", result.expect_err("an unverified stop fails"));
+        assert!(error.contains("not signaled: process 4242"), "{error}");
+        assert!(error.contains("check: `ps -p 4242 -o pid,args`"), "{error}");
+        crate::services_text::tests::assert_no_retry_line(&error);
+        assert!(out.is_empty(), "{out}");
+        assert_eq!(signalled, None);
+        assert_eq!(audit["level"], "error", "{audit}");
+    }
+
+    #[test]
+    fn attached_ctrl_c_signals_its_own_child_when_the_stop_itself_fails() {
+        let (result, out, err, signalled, audit) = finish_capturing(
+            "attached-stop-error",
+            Err(anyhow::anyhow!("managed service `svc-attached` not found")
+                .context("failed to stop svc-attached")),
+            Ok(()),
+        );
+        result.expect("a failed stop falls back and still exits cleanly, as before");
+        assert_eq!(signalled, Some(777));
+        assert_eq!(
+            err, "  note: failed to stop svc-attached: managed service `svc-attached` not found\n",
+            "the stop's error goes to stderr, and a signal that worked adds nothing"
+        );
+        assert!(out.is_empty(), "nothing on stdout: {out}");
+        assert_eq!(audit["level"], "warn", "{audit}");
+        assert_eq!(
+            audit["message"],
+            "stop failed; signaled attached serve child 777 service_id=svc-attached"
+        );
+
+        // The direct signal failing too is printed on stderr and recorded, with
+        // its error.
+        let (result, _, err, signalled, audit) = finish_capturing(
+            "attached-stop-error-signal-fails",
+            Err(anyhow::anyhow!("managed service `svc-attached` not found")),
+            Err(anyhow::anyhow!("no such process")),
+        );
+        result.expect("still exits 0, as on main");
+        assert_eq!(
+            err,
+            "  note: managed service `svc-attached` not found\n  \
+             note: signaling this session's server process 777 directly also failed: no such process\n",
+            "both notes go to stderr"
+        );
+        assert_eq!(signalled, Some(777));
+        assert_eq!(audit["level"], "error", "{audit}");
+        assert_eq!(
+            audit["message"],
+            "stop failed; signaling attached serve child 777 also failed: no such process service_id=svc-attached"
+        );
     }
 
     #[test]

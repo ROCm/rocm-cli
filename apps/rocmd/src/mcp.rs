@@ -798,12 +798,12 @@ fn mcp_stop_server_reply(service_id: &str, stopped: Value) -> Value {
         tool_success(format!("Stopped managed service `{service_id}`."), stopped)
     } else {
         // Not a success: a recorded process may still be running and holding
-        // the device. `stop_managed_service` keeps the record's PIDs and the
+        // the device. `stop_managed_service` keeps the record's PIDs and any
         // endpoint key for exactly that case, and `pid_outcomes` in the
         // structured result names the PID that could not be confirmed.
         tool_error(
             format!(
-                "Could not confirm that managed service `{service_id}` stopped; a recorded process may still be running. Its recorded PIDs and any endpoint key were kept so a later stop can still reach it; see `pid_outcomes`."
+                "Could not confirm that managed service `{service_id}` stopped; a recorded process may still be running. Its record, which names the processes it last recorded, and any endpoint key, which the server may still be enforcing, were kept; see `pid_outcomes`."
             ),
             stopped,
         )

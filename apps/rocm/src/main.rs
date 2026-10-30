@@ -123,7 +123,7 @@ use crate::serve_cmd::{ServeArgs, select_serve_engine, serve};
 use crate::services_text::{
     load_managed_service, render_internal_status_text, render_logs_browser_text, render_logs_text,
     render_service_action_result, render_service_logs_text, render_services_json,
-    render_services_text, run_internal_sandbox_tool, validate_service_id,
+    render_services_text, run_internal_sandbox_tool, service_stop_unconfirmed, validate_service_id,
 };
 use crate::uninstall::uninstall;
 use crate::uninstall_plan::UninstallOptions;
@@ -503,7 +503,10 @@ rocm model --verbose"
     /// server runs as a managed background service and prints a deployment summary
     /// (status, endpoint, model, and smoke-test metrics); use --verbose to stream engine
     /// logs in this terminal instead. When streaming, press Ctrl-D to detach and leave the
-    /// server running, or Ctrl-C to stop it. Inspect or stop servers later with
+    /// server running, or Ctrl-C to stop it. If that stop answers that it could not confirm
+    /// the server exited, it says so on stderr and exits with an error; if the stop itself
+    /// fails, it says why on stderr, signals the server process directly and exits 0,
+    /// noting on stderr if that signal fails too. Inspect or stop servers later with
     /// `rocm services`.
     #[command(after_help = "EXAMPLES:\n  \
 rocm serve qwen\n  \
@@ -1099,6 +1102,14 @@ enum ServicesCommand {
         service_id: String,
     },
     /// Stop a local model server.
+    ///
+    /// Reports the server stopped only once every process it recorded is
+    /// confirmed gone. Otherwise it reports on stderr that the stop was not
+    /// confirmed and exits with an error, keeping the record, which still names
+    /// the processes, and any endpoint key, which the server may still be
+    /// enforcing. It names each process that did not exit, and for one it could
+    /// not verify it signals nothing and names an operating-system command to
+    /// check on it. It does not suggest running the stop again.
     Stop {
         /// Service id from `rocm services list`.
         service_id: String,
@@ -3920,7 +3931,36 @@ fn run_approved_service_action(
     }
     let sandbox_tool = sandbox_tool_arg_from_service_tool(tool)?;
     let result = run_internal_sandbox_tool(paths, sandbox_tool, Some(service_id.to_owned()), true)?;
-    print!("{}", render_service_action_result(tool, &result));
+    print!(
+        "{}",
+        finish_service_action(paths, tool, service_id, &result)?
+    );
+    Ok(())
+}
+
+/// The text a completed `rocm services <action> --yes` prints, with its audit
+/// event. A stop that could not confirm every recorded process gone is an
+/// error, not a success with a caveat: the same verdict `rocmd`'s MCP
+/// `stop_server` reports as `isError`, and a script chaining on the exit status
+/// must not move on as if the service were down.
+pub(crate) fn finish_service_action(
+    paths: &AppPaths,
+    tool: &str,
+    service_id: &str,
+    result: &serde_json::Value,
+) -> Result<String> {
+    let rendered = render_service_action_result(tool, result);
+    if tool == "stop_server" && service_stop_unconfirmed(result) {
+        record_cli_audit_event(
+            paths,
+            "service",
+            tool,
+            "error",
+            format!("stop of managed service {service_id} not confirmed"),
+            Some(service_id),
+        );
+        bail!("{}", rendered.trim_end());
+    }
     record_cli_audit_event(
         paths,
         "service",
@@ -3932,7 +3972,7 @@ fn run_approved_service_action(
         ),
         Some(service_id),
     );
-    Ok(())
+    Ok(rendered)
 }
 
 fn sandbox_tool_arg_from_service_tool(tool: &str) -> Result<SandboxToolArg> {
