@@ -1096,6 +1096,41 @@ async fn user_serves_negative_temperature(world: &mut E2eWorld) {
 
 /// Serve with every GPU hidden from the CLI and engine via an empty
 /// `HIP_VISIBLE_DEVICES`, so a GPU host presents as having no usable device.
+/// A gated AIM catalog entry (`requires_hf_token`). The token check runs before
+/// GPU detection and Docker, so no engine or GPU is needed to reach it.
+const GATED_AIM_MODEL: &str = "meta-llama/Llama-3.1-8B-Instruct";
+
+#[when("the user serves a gated AIM model without passing a Hugging Face token")]
+async fn user_serves_gated_aim_without_token(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) =
+        crate::run_rocm(world, &["serve", GATED_AIM_MODEL, "--engine", "aim"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[when("the user serves a gated AIM model with an exported Hugging Face token and no visible GPU")]
+async fn user_serves_gated_aim_with_token(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm_with_env(
+        world,
+        &[
+            "serve",
+            GATED_AIM_MODEL,
+            "--engine",
+            "aim",
+            "--engine-env",
+            "HF_TOKEN",
+        ],
+        &[
+            ("HF_TOKEN", "hf_e2e_placeholder"),
+            ("HIP_VISIBLE_DEVICES", ""),
+        ],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
 #[when("the user serves a model with every GPU masked from view")]
 async fn user_serves_with_masked_gpus(world: &mut E2eWorld) {
     let (model, engine, _) = host_serve_target();
@@ -1693,6 +1728,36 @@ async fn assert_no_engine_preparation(world: &mut E2eWorld) {
         !output.contains("Preparing "),
         "a live managed service for an unrelated model must not drag engine \
          preparation ahead of the no-usable-GPU refusal:\n{output}"
+#[then("the CLI explains that the model needs a Hugging Face token")]
+async fn assert_hf_token_message(world: &mut E2eWorld) {
+    let output = serve_output(world);
+    assert!(
+        output.contains("needs a Hugging Face token") && output.contains("--engine-env HF_TOKEN"),
+        "expected the gated-model refusal naming the remedy, got:\n{output}"
+    );
+}
+
+#[then("no service was started")]
+async fn assert_no_service_started(world: &mut E2eWorld) {
+    let services_dir = world
+        .isolated_root
+        .as_ref()
+        .expect("scenario has no isolated root")
+        .path()
+        .join("data")
+        .join("services");
+    let records = std::fs::read_dir(&services_dir)
+        .map(|entries| entries.count())
+        .unwrap_or(0);
+    assert_eq!(records, 0, "a refused serve left service records behind");
+}
+
+#[then("the refusal is not about the Hugging Face token")]
+async fn assert_refusal_is_not_hf_token(world: &mut E2eWorld) {
+    let output = serve_output(world);
+    assert!(
+        !output.contains("needs a Hugging Face token"),
+        "the exported token was not accepted:\n{output}"
     );
 }
 

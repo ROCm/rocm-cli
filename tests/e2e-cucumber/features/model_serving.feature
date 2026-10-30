@@ -519,3 +519,27 @@ Feature: Model serving
     Then serving is refused before any engine starts
     And the user is told no AMD GPU was detected
     And the user is not told to relaunch the server with different options
+
+  # ROCMAI-556: a gated AIM image is refused before anything is pulled when no
+  # Hugging Face token was passed. The check runs ahead of GPU detection and
+  # Docker, so it needs neither and gates every PR (ungated). The refusal names
+  # the remedy and leaves no service record behind; serve-34 proves the named
+  # remedy clears the condition. The gfx-family, board-mismatch and multi-GPU
+  # refusals depend on the detected GPU family, so they are unit-tested in
+  # `apps/rocm/src/serve_cmd.rs` rather than covered here.
+  @id:serve-gated-aim-refused-without-hf-token
+  Scenario: serve-33 - A gated AIM image is refused without a Hugging Face token
+    When the user serves a gated AIM model without passing a Hugging Face token
+    Then serving is refused before any engine starts
+    And the CLI explains that the model needs a Hugging Face token
+    And no service was started
+
+  # The remedy printed by serve-33 (`export HF_TOKEN`, then `--engine-env
+  # HF_TOKEN`) must actually clear that refusal. Every GPU is masked, so the
+  # serve then stops at the GPU pre-flight, still before anything is pulled; the
+  # refusal is no longer about the token.
+  @id:serve-gated-aim-token-remedy-clears-refusal
+  Scenario: serve-34 - Passing the exported Hugging Face token clears the gated AIM refusal
+    When the user serves a gated AIM model with an exported Hugging Face token and no visible GPU
+    Then serving is refused before any engine starts
+    And the refusal is not about the Hugging Face token
