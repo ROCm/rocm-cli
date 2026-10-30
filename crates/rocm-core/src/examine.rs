@@ -3476,6 +3476,11 @@ mod tests {
             .expect("write quarantined repo");
         std::fs::write(dir.path().join("unrelated.list"), "deb ...\n").expect("write unrelated");
 
+        // The scan reads through `host_path`; hold the lock so another test's
+        // host root cannot re-root it.
+        let _guard = crate::hardware_root::HOST_ROOT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut seen = live_rocm_repo_paths_in_dir(&dir.path().to_string_lossy());
         seen.sort();
 
@@ -3513,6 +3518,11 @@ mod tests {
             yum_dir.path().to_string_lossy().into_owned(),
             zypp_dir.path().to_string_lossy().into_owned(),
         ];
+        // The scan reads through `host_path`; hold the lock so another test's
+        // host root cannot re-root it.
+        let _guard = crate::hardware_root::HOST_ROOT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir_refs: Vec<&str> = dirs.iter().map(String::as_str).collect();
         merge_live_repo_paths(&mut e, &dir_refs);
 
