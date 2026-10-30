@@ -70,7 +70,8 @@ pub(super) enum VersionStage {
 /// Total order over published version strings — the total order used for
 /// sorting candidates in the `therock` module's "which build does the user get?"
 /// decisions. It is not always the first key: [`super::select_tarball_candidate`]
-/// orders by upload time first and uses this only to break ties.
+/// orders a nightly catalog by upload time first and uses this only to break
+/// ties. The release channel orders by this comparison first.
 ///
 /// Ordering is PEP 440's, because these strings come from a Python simple
 /// index: within one release `7.0.0.dev1` < `7.0.0a1` < `7.0.0b1` <

@@ -438,7 +438,7 @@ jobs:
           # The shared dir IS the pre-warm's own data/runtimes; NEVER move it — a
           # post-install mv invalidates the absolute paths install sdk bakes into
           # the runtime manifest and every serve fails instantly (run 29320025393).
-          prewarm="$RUNNER_WORKSPACE/e2e-prewarm-multi-arch-v2"
+          prewarm="$RUNNER_WORKSPACE/e2e-prewarm-next-v1"
           export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
 
           # Build both binaries once; reuse them for pre-warm + suite.
@@ -529,7 +529,7 @@ jobs:
           # (see e2e-selfhosted.yml e2e-gpu).
           runner_root="$(dirname "$(dirname "$RUNNER_WORKSPACE")")"
           export E2E_SHARED_UV_CACHE_DIR="$runner_root/uv-cache"
-          prewarm="$RUNNER_WORKSPACE/e2e-prewarm-multi-arch-v2"
+          prewarm="$RUNNER_WORKSPACE/e2e-prewarm-next-v1"
           export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
 
           # See the e2e-gpu lane in e2e-selfhosted.yml for why the
@@ -605,7 +605,7 @@ jobs:
           # (see e2e-selfhosted.yml e2e-gpu).
           runner_root="$(dirname "$(dirname "$RUNNER_WORKSPACE")")"
           export E2E_SHARED_UV_CACHE_DIR="$runner_root/uv-cache"
-          prewarm="$RUNNER_WORKSPACE/e2e-prewarm-multi-arch-v2"
+          prewarm="$RUNNER_WORKSPACE/e2e-prewarm-next-v1"
           export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
 
           # See the e2e-gpu lane in e2e-selfhosted.yml for why the
@@ -687,7 +687,7 @@ jobs:
           # (see e2e-selfhosted.yml e2e-gpu).
           runner_root="$(dirname "$(dirname "$RUNNER_WORKSPACE")")"
           export E2E_SHARED_UV_CACHE_DIR="$runner_root/uv-cache"
-          prewarm="$RUNNER_WORKSPACE/e2e-prewarm-multi-arch-v2"
+          prewarm="$RUNNER_WORKSPACE/e2e-prewarm-next-v1"
           export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
 
           # See the e2e-gpu lane in e2e-selfhosted.yml for why the
@@ -774,7 +774,7 @@ jobs:
         run: |
           export CARGO_TARGET_DIR="$RUNNER_WORKSPACE/e2e-target"
           export E2E_SHARED_CACHE_DIR="$RUNNER_WORKSPACE/e2e-shared"
-          prewarm="$RUNNER_WORKSPACE/e2e-prewarm-multi-arch-v2"
+          prewarm="$RUNNER_WORKSPACE/e2e-prewarm-next-v1"
           export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
 
           # See the e2e-gpu lane in e2e-selfhosted.yml for why the
@@ -1021,7 +1021,7 @@ jobs:
           # absolute paths. On the ephemeral DevLab Dispatch pool this host is
           # destroyed after the job, so the paths only need to stay valid for
           # this run's scenarios, not across runs.
-          $prewarm = "$env:RUNNER_WORKSPACE\e2e-prewarm-multi-arch-v2"
+          $prewarm = "$env:RUNNER_WORKSPACE\e2e-prewarm-next-v1"
           $env:E2E_SHARED_RUNTIMES_DIR = "$prewarm\data\runtimes"
 
           # See e2e-gpu-strix-windows in e2e-selfhosted.yml: the harness's own
@@ -1459,7 +1459,7 @@ jobs:
           # correctness, not speed: `install sdk` bakes ABSOLUTE paths into the
           # runtime manifest, so installing into a per-scenario temp dir leaves
           # every later serve pointing at a deleted install root.
-          prewarm="/root/work/e2e-prewarm-multi-arch-v2"
+          prewarm="/root/work/e2e-prewarm-next-v1"
           export E2E_SHARED_RUNTIMES_DIR="$prewarm/data/runtimes"
 
           # See the e2e-gpu lane in e2e-selfhosted.yml for why the

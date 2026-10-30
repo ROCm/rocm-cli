@@ -8,9 +8,9 @@
 //! ("next") layout from one loopback server, under `current/` and `next/`
 //! prefixes, and point the gated `ROCM_CLI_THEROCK_*_BASE` overrides at them.
 //! Serving both — rather than only the one a scenario expects to be used — is
-//! what makes "the canonical stream is still canonical" and "the next stream is
-//! only reached when explicitly pinned" assertable: a dispatch regression
-//! resolves the *other* fixture instead of failing to resolve anything.
+//! what makes "the canonical stream is still canonical" and "an unpinned release
+//! install reaches the next stream" assertable: a dispatch regression resolves
+//! the *other* fixture instead of failing to resolve anything.
 //!
 //! Scenario 06 sets an override without the trust opt-in and resolves the live
 //! default index, proving the child CLI ignores the untrusted value end to end.
@@ -269,7 +269,7 @@ fn serve_pip_fixtures(world: &mut E2eWorld) {
 /// — but torchaudio requires neither, so nothing in its metadata ties it to a
 /// build. `torchaudio` lists the torchaudio builds the index publishes, each
 /// with its wheel tag.
-fn serve_two_next_builds(world: &mut E2eWorld, torchaudio: &[(&str, &str)]) {
+fn write_two_next_builds(world: &E2eWorld, torchaudio: &[(&str, &str)]) {
     let served = root(world).join("therock-pip-fixtures").join("next");
     write_fixture(&served.join("index.html"), &aggregate_root_html());
     let builds = [
@@ -298,6 +298,47 @@ fn serve_two_next_builds(world: &mut E2eWorld, torchaudio: &[(&str, &str)]) {
     write_wheel_index_builds(&served.join("torch"), "torch", &torch);
     write_wheel_index_builds(&served.join("torchvision"), "torchvision", &torchvision);
     write_wheel_index_builds(&served.join("torchaudio"), "torchaudio", &torchaudio);
+}
+
+fn serve_two_next_builds(world: &mut E2eWorld, torchaudio: &[(&str, &str)]) {
+    write_two_next_builds(world, torchaudio);
+    serve_pip_fixtures(world);
+}
+
+const NEWER_PRERELEASE_ROCM_VERSION: &str = "10.2.0rc1";
+const CANONICAL_STABLE_ROCM_VERSION: &str = "7.14.1";
+
+/// Canonical 7.14.1 beside a next index that publishes 10.0.0, 10.1.0, and a
+/// prerelease newer than both. An unpinned release preview that falls back to
+/// the canonical index, or that takes the prerelease, is visible in the plan.
+#[given(
+    "a canonical release pip index and a ROCm 10 index publishing 10.0.0, 10.1.0, and a newer prerelease"
+)]
+async fn pip_indexes_for_unpinned_newest_stable(world: &mut E2eWorld) {
+    let served = root(world).join("therock-pip-fixtures");
+    write_pip_index(
+        &served.join("current"),
+        [
+            ("rocm", CANONICAL_STABLE_ROCM_VERSION),
+            ("torch", "2.11.0+rocm7.14.1"),
+            ("torchvision", "0.26.0+rocm7.14.1"),
+            ("torchaudio", "2.11.0+rocm7.14.1"),
+        ],
+    );
+    write_two_next_builds(
+        world,
+        &[
+            (NEXT_TORCHAUDIO_VERSION, ANY_WHEEL_TAG),
+            (NEWER_NEXT_TORCHAUDIO_VERIFIED_VERSION, ANY_WHEEL_TAG),
+        ],
+    );
+    let rocm_index = served.join("next").join("rocm").join("index.html");
+    let mut html = std::fs::read_to_string(&rocm_index).expect("rocm index was just written");
+    let prerelease = format!("rocm-{NEWER_PRERELEASE_ROCM_VERSION}-{ANY_WHEEL_TAG}.whl");
+    html.push_str(&format!(
+        "<a href=\"{prerelease}\" data-dist-info-metadata=\"true\">{prerelease}</a>\n"
+    ));
+    std::fs::write(&rocm_index, html).expect("failed to add the prerelease link");
     serve_pip_fixtures(world);
 }
 
@@ -602,19 +643,24 @@ async fn paced_tarball_fixture(world: &mut E2eWorld) {
         .as_ref()
         .expect("paced download server was just started")
         .base_url();
+    let catalog = format!("{base}/tarball/current/");
     world.command_env.push((
         "ROCM_CLI_THEROCK_RELEASE_TARBALL_BASE",
-        format!("{base}/tarball/current/").into(),
+        catalog.clone().into(),
     ));
+    // An unpinned release tarball reads the next catalog. Point that override
+    // at the same paced files so the download under test is still this fixture.
+    world
+        .command_env
+        .push(("ROCM_CLI_THEROCK_NEXT_TARBALL_BASE", catalog.into()));
 }
 
 #[when("the user installs the tarball SDK for family gfx120X-all under a real terminal")]
 async fn install_tarball_sdk_under_pty(world: &mut E2eWorld) {
-    // No `--version`: tarball installs only accept an explicit version pin for
-    // a stable ROCm 10+ selector (see `resolve_tarball_artifact_with_timeout`'s
-    // rejection message), so an unpinned request is what reaches the canonical
-    // release catalog here — which the given-step populated with exactly one
-    // candidate, `CURRENT_TARBALL`.
+    // No `--version`: an unpinned release tarball reads the next catalog. The
+    // given-step points that catalog at the paced fixture, which publishes
+    // exactly one stable archive, `CURRENT_TARBALL`. `--family gfx1200` is an
+    // exact arch; a group label is refused on this route.
     //
     // This scenario is testing the download spinner, not the post-install
     // torch-runtime-dependency setup — but a real SDK install completing
@@ -636,7 +682,7 @@ async fn install_tarball_sdk_under_pty(world: &mut E2eWorld) {
             "--format",
             "tarball",
             "--family",
-            GROUP_FAMILY,
+            RAW_ARCH,
             "--yes",
         ],
     )
@@ -776,6 +822,44 @@ async fn preview_unpinned_wheel_install(world: &mut E2eWorld) {
             "wheel",
             "--family",
             RAW_ARCH,
+            "--dry-run",
+        ],
+    );
+}
+
+#[when("the user previews a wheel SDK install for family gfx120X-all with no version pin")]
+async fn preview_unpinned_wheel_install_with_group_family(world: &mut E2eWorld) {
+    preview(
+        world,
+        &[
+            "install",
+            "sdk",
+            "--channel",
+            "release",
+            "--format",
+            "wheel",
+            "--family",
+            GROUP_FAMILY,
+            "--dry-run",
+        ],
+    );
+}
+
+#[when("the user previews a wheel SDK install for arch gfx1200 pinned to ROCm 7.10.0")]
+async fn preview_older_pinned_wheel_install(world: &mut E2eWorld) {
+    preview_ok(
+        world,
+        &[
+            "install",
+            "sdk",
+            "--channel",
+            "release",
+            "--format",
+            "wheel",
+            "--family",
+            RAW_ARCH,
+            "--version",
+            CURRENT_ROCM_VERSION,
             "--dry-run",
         ],
     );
@@ -1010,13 +1094,53 @@ async fn preview_never_mentions_next_index(world: &mut E2eWorld) {
     let next = next_pip_base(world);
     assert!(
         !stdout(world).contains(&next),
-        "an unpinned release install reached the ROCm 10 index {next}:\n{}",
+        "this install reached the ROCm 10 index {next}:\n{}",
         stdout(world)
     );
     assert!(
         !stdout(world).contains("next-v1"),
-        "an unpinned release install selected the next source layout:\n{}",
+        "this install selected the next source layout:\n{}",
         stdout(world)
+    );
+}
+
+#[then("the preview selects ROCm 10.1.0 from the ROCm 10 pip index")]
+async fn preview_selects_newest_stable_next(world: &mut E2eWorld) {
+    let base = next_pip_base(world);
+    assert_contains(world, &format!("canonical_source: {base}"), "next source");
+    assert_contains(world, &format!("index_url: {base}"), "resolved index");
+    assert_contains(
+        world,
+        &format!("selected_rocm_version: {NEWER_NEXT_ROCM_VERSION}"),
+        "selected version",
+    );
+    assert_contains(
+        world,
+        &format!("latest_compatible_version: {NEWER_NEXT_ROCM_VERSION}"),
+        "compatible version",
+    );
+    assert_contains(world, "python_wheel_tag: cp314", "next interpreter");
+}
+
+#[then("the preview does not select the canonical release or the newer prerelease")]
+async fn preview_skips_canonical_and_prerelease(world: &mut E2eWorld) {
+    let output = stdout(world);
+    let current = current_pip_base(world);
+    assert!(
+        !output.contains(&current),
+        "an unpinned release install reached the canonical index {current}:\n{output}"
+    );
+    assert!(
+        !output.contains(CANONICAL_STABLE_ROCM_VERSION),
+        "an unpinned release install selected canonical {CANONICAL_STABLE_ROCM_VERSION}:\n{output}"
+    );
+    assert!(
+        !output.contains(NEWER_PRERELEASE_ROCM_VERSION),
+        "an unpinned release install selected the prerelease:\n{output}"
+    );
+    assert!(
+        !output.contains(NEXT_ROCM_VERSION),
+        "an unpinned release install selected the older stable {NEXT_ROCM_VERSION}:\n{output}"
     );
 }
 
