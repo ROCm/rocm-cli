@@ -80,8 +80,10 @@ impl WinPerfCollector {
         // driver I/O — running it directly here would stall a tokio worker
         // thread, same hazard run_script() avoids by using an async Command.
         // Timed out the same way: a wedged driver call must not freeze every
-        // other metric this tick forever, and either failure mode is
-        // surfaced as a warning rather than silently degrading to defaults.
+        // other metric this tick forever. A panic or timeout surfaces as a
+        // warning; a driver that is absent or fails to initialise inside
+        // adlx_readings() degrades to no readings with no warning, since
+        // "no AMD driver" is an expected state indistinguishable from it.
         let (adlx, adlx_warning) =
             match timeout(ADLX_TIMEOUT, task::spawn_blocking(adlx_readings)).await {
                 Ok(Ok(readings)) => (readings, None),
@@ -128,6 +130,7 @@ impl WinPerfCollector {
 /// than reporting its true size. A value this close to that ceiling is far
 /// more likely a truncated sentinel than an improbably-exact ~4GiB card, so
 /// treat it as unknown (0) rather than report a number that's probably wrong.
+/// Set ~295MB below the true 2^32 boundary so near-cap values are caught too.
 const WMI_ADAPTER_RAM_CAP_THRESHOLD: u64 = 4_000_000_000;
 
 const fn wmi_vram_total_mb(ram_bytes: u64) -> u64 {
@@ -146,7 +149,9 @@ const fn wmi_vram_total_mb(ram_bytes: u64) -> u64 {
 /// process using the GPU looks like a distinct phantom device.
 fn device_key(instance: &str) -> &str {
     let instance = instance.find("luid_").map_or(instance, |i| &instance[i..]);
-    instance.split("_phys_").next().unwrap_or(instance)
+    instance
+        .split_once("_phys_")
+        .map_or(instance, |(head, _)| head)
 }
 
 /// `GPU Engine` instance names end in `..._phys_P_eng_N_engtype_TYPE`; the
@@ -587,8 +592,8 @@ mod tests {
     #[test]
     #[allow(clippy::float_cmp)]
     fn single_adapter_prefers_adlx_vram_over_wmi_truncated_value() {
-        // WMI's AdapterRAM here (4293918720, just under the 4GiB cap
-        // threshold) is the classic 32-bit-field truncation case; ADLX's own
+        // WMI's AdapterRAM here (4293918720, just under 2^32 and
+        // above the coded cap threshold) is the classic 32-bit-field truncation case; ADLX's own
         // query reports the real 8GiB so parse_metrics should prefer it.
         let sample = "UTIL\tluid_0x00000000_0x0000b3a4_phys_0_eng_0_engtype_3d\t1.0\nVRAM\tluid_0x00000000_0x0000b3a4_phys_0\t1048576\nGPU\tDiscrete GPU\t4293918720\t1.0";
         let adlx = [AdlxReading {

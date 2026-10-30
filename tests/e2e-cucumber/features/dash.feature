@@ -681,7 +681,7 @@ Feature: Interactive dashboard
   # reached when nothing else owns the keyboard, which is the event loop's
   # existing arm order and is not re-tested here.
   @id:dash-warning-badge-opens-the-warning @requires-os:linux
-  Scenario: dash-38 - A user reads the warning behind the header badge
+  Scenario: dash-39 - A user reads the warning behind the header badge
     When the user opens the dashboard replaying a recording that reports a warning
     Then the header shows that one warning is reported
     When the user opens the warnings

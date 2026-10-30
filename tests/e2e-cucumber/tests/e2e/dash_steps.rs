@@ -174,7 +174,7 @@ async fn open_dashboard_demo(world: &mut E2eWorld) {
     world.tui = Some(session);
 }
 
-/// The one warning `dash-38`'s recording reports. Short and ASCII so it stays on
+/// The one warning `dash-39`'s recording reports. Short and ASCII so it stays on
 /// one screen row inside the popup and is found by a plain substring match.
 const RECORDED_WARNING: &str = "amd-smi unavailable (GPU device inaccessible)";
 

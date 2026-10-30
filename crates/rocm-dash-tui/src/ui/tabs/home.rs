@@ -35,8 +35,11 @@ use crate::ui::theme::Theme;
 /// correlate a multi-adapter host to specific VRAM sizes) — must read as
 /// `0.0`, not `used / 1 * 100`.
 fn vram_used_pct(snap: &rocm_dash_core::metrics::Snapshot) -> f64 {
-    let used: u64 = snap.gpus.iter().map(|g| g.vram_used_mb).sum();
-    let total: u64 = snap.gpus.iter().map(|g| g.vram_total_mb).sum();
+    // Only GPUs with a known total count, on both sides of the ratio: an
+    // unknown-total GPU's used VRAM must not inflate the others' percentage.
+    let known = || snap.gpus.iter().filter(|g| g.vram_total_mb > 0);
+    let used: u64 = known().map(|g| g.vram_used_mb).sum();
+    let total: u64 = known().map(|g| g.vram_total_mb).sum();
     if total > 0 {
         used as f64 / total as f64 * 100.0
     } else {
@@ -959,6 +962,26 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(vram_used_pct(&snap), 0.0);
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn vram_used_pct_ignores_gpus_with_unknown_total() {
+        let gpu = |used, total| GpuMetrics {
+            device_id: "GPU".into(),
+            vram_used_mb: used,
+            vram_total_mb: total,
+            gpu_utilization_pct: 0.0,
+            temperature_c: 0.0,
+            power_w: 0.0,
+            clock_mhz: None,
+        };
+        let snap = Snapshot {
+            host: SystemMetrics::default(),
+            gpus: vec![gpu(96000, 192_000), gpu(8000, 0)],
+            ..Default::default()
+        };
+        assert_eq!(vram_used_pct(&snap), 50.0);
     }
 
     #[test]
