@@ -272,19 +272,14 @@ pub(crate) enum Command {
     /// Reads `.eml` files (one message each) and raw `.json` report bodies,
     /// and prints how many reports describe each problem, at every level of
     /// the group key, with refused and unreadable reports counted apart.
-    /// Sends and files nothing. Counts are reports, not people.
-    ReportRollup {
-        /// `.eml` or `.json` files, or directories holding them (read one
-        /// level deep).
-        #[arg(required = true)]
-        paths: Vec<PathBuf>,
-        /// Print the rollup as JSON.
-        #[arg(long)]
-        json: bool,
-        /// Also list each message skipped as not a report, by file and subject.
-        #[arg(long)]
-        verbose: bool,
-    },
+    ///
+    /// Also prints the weekly trend, by the week each mail was sent in (only
+    /// the week is kept from its `Date`), and names any week in which a known
+    /// problem rose sharply against its recent average. The first and the
+    /// latest week of the export may be partial: the first is never part of a
+    /// baseline, and a rise in the latest is a lower bound. Sends and files
+    /// nothing. Counts are reports, not people.
+    ReportRollup(report_rollup::Args),
     /// Lint PowerShell scripts with PSScriptAnalyzer (parse errors are reported
     /// too, so this also covers syntax).
     PowershellLint {
@@ -374,11 +369,7 @@ fn run() -> Result<()> {
             artifacts_dir,
             html_out,
         } => e2e_report::run(&artifacts_dir, &html_out)?,
-        Command::ReportRollup {
-            paths,
-            json,
-            verbose,
-        } => report_rollup::run(&paths, json, verbose)?,
+        Command::ReportRollup(args) => report_rollup::run(&args)?,
         Command::PowershellLint { shell, files } => powershell::run(shell, files)?,
     }
     Ok(())

@@ -3708,6 +3708,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "cc",
+ "chrono",
  "directories",
  "flate2",
  "libc",
@@ -6074,6 +6075,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64",
+ "chrono",
  "clap",
  "e2e-report",
  "flate2",

@@ -53,6 +53,9 @@ proptest = { version = "1", default-features = false, features = ["std"] }
 flate2 = "1"
 tar = "0.4"
 tempfile = "3"
+# `report_trend` writes its own civil calendar so the shipped crate needs no date
+# library; a test checks it against this for every day from 2000 to 2100.
+chrono.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }

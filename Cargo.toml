@@ -36,6 +36,9 @@ anyhow = "1.0"
 async-stream = "0.3"
 axum = "0.8"
 base64 = "0.22"
+# Read mail dates (xtask) and check a hand-written calendar against a library
+# (rocm-core tests). The dashboard crates keep their own entries, with `serde`.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 clap = { version = "4.6", features = ["derive", "string", "suggestions"] }
 clap_complete = "4.6"
 crossterm = { version = "0.29", features = ["libc", "use-dev-tty"] }
