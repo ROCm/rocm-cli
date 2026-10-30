@@ -364,6 +364,16 @@ struct ServerState {
     /// `/v1` prefix would pass while 404ing against a real engine. Recording the
     /// path lets a scenario assert the versioned route was the one used.
     chat_paths: Arc<Mutex<Vec<String>>>,
+    /// Every chat completion request body (on either chat route), in arrival
+    /// order. Unlike `last_chat_request` this keeps the whole history, so a
+    /// scenario can count how many completions the CLI asked for and read each
+    /// prompt — the only way to prove a request was planned once rather than
+    /// twice, when the two calls would otherwise leave nothing but the final
+    /// body behind.
+    completion_requests: Arc<Mutex<Vec<Value>>>,
+    /// `Some` only when started via [`MockServer::start_with_chat_script`]; the
+    /// replies to hand out, in request order. `None` keeps the fixed stub reply.
+    chat_script: Option<Arc<Vec<Value>>>,
 }
 
 /// Deterministic, monotonically-advancing state behind the mock `/metrics`
@@ -440,6 +450,8 @@ pub struct MockServer {
     last_chat_request: Arc<Mutex<Option<Value>>>,
     /// Shared with the running server's `ServerState`; see the field doc there.
     chat_paths: Arc<Mutex<Vec<String>>>,
+    /// Shared with the running server's `ServerState`; see the field doc there.
+    completion_requests: Arc<Mutex<Vec<Value>>>,
     /// `Some` only when started with [`MockServer::start_with_scripted_metrics`].
     scripted: Option<Arc<ScriptedMetrics>>,
 }
@@ -467,6 +479,7 @@ impl MockServer {
     pub async fn start_with_scripted_metrics(model_name: &str) -> Self {
         let last_chat_request = Arc::new(Mutex::new(None));
         let chat_paths = Arc::new(Mutex::new(Vec::new()));
+        let completion_requests = Arc::new(Mutex::new(Vec::new()));
         let scripted = Arc::new(ScriptedMetrics::new());
         let state = ServerState {
             model_name: model_name.to_string(),
@@ -474,6 +487,8 @@ impl MockServer {
             scripted_metrics: Some(Arc::clone(&scripted)),
             last_chat_request: Arc::clone(&last_chat_request),
             chat_paths: Arc::clone(&chat_paths),
+            completion_requests: Arc::clone(&completion_requests),
+            chat_script: None,
         };
         let app = Router::new()
             .route("/v1/models", get(handle_models))
@@ -487,6 +502,7 @@ impl MockServer {
             last_chat_request,
             scripted: Some(scripted),
             chat_paths,
+            completion_requests,
         }
     }
 
@@ -519,12 +535,15 @@ impl MockServer {
     async fn spawn(model_name: &str, with_metrics: bool) -> Self {
         let last_chat_request = Arc::new(Mutex::new(None));
         let chat_paths = Arc::new(Mutex::new(Vec::new()));
+        let completion_requests = Arc::new(Mutex::new(Vec::new()));
         let state = ServerState {
             model_name: model_name.to_string(),
             metrics: with_metrics.then(|| Arc::new(MetricsCounter::new())),
             scripted_metrics: None,
             last_chat_request: Arc::clone(&last_chat_request),
             chat_paths: Arc::clone(&chat_paths),
+            completion_requests: Arc::clone(&completion_requests),
+            chat_script: None,
         };
 
         let mut app = Router::new()
@@ -542,6 +561,49 @@ impl MockServer {
             scripted: None,
             last_chat_request,
             chat_paths,
+            completion_requests,
+        }
+    }
+
+    /// Like [`Self::start`], but chat completions are answered from `script`
+    /// instead of the fixed stub: the Nth chat completion request, on either the
+    /// `/v1/chat/completions` or the unversioned `/chat/completions` route, gets
+    /// `script[N]` as its complete response body (build entries with
+    /// [`chat_text_reply`] / [`chat_tool_call_reply`]).
+    ///
+    /// For scenarios whose claim is about the *sequence* of completions a
+    /// command makes — "asked exactly once", "the plan shown is the one the
+    /// planning assistant gave" — and which therefore need each call to answer
+    /// differently, so a repeated call is visible in the output rather than
+    /// returning the same bytes. A request past the end of the script is answered
+    /// with HTTP 500 (and still recorded), so asking more often than scripted
+    /// fails loudly instead of recycling an earlier reply. `GET /v1/models` does
+    /// not consume an entry.
+    pub async fn start_with_chat_script(model_name: &str, script: Vec<Value>) -> Self {
+        let last_chat_request = Arc::new(Mutex::new(None));
+        let chat_paths = Arc::new(Mutex::new(Vec::new()));
+        let completion_requests = Arc::new(Mutex::new(Vec::new()));
+        let state = ServerState {
+            model_name: model_name.to_string(),
+            metrics: None,
+            scripted_metrics: None,
+            last_chat_request: Arc::clone(&last_chat_request),
+            chat_paths: Arc::clone(&chat_paths),
+            completion_requests: Arc::clone(&completion_requests),
+            chat_script: Some(Arc::new(script)),
+        };
+        let app = Router::new()
+            .route("/v1/models", get(handle_models))
+            .route("/models", get(handle_models))
+            .route("/v1/chat/completions", post(handle_chat))
+            .route("/chat/completions", post(handle_chat))
+            .with_state(state);
+        Self {
+            server: http_server::spawn(app).await,
+            last_chat_request,
+            chat_paths,
+            completion_requests,
+            scripted: None,
         }
     }
 
@@ -554,6 +616,19 @@ impl MockServer {
     #[must_use]
     pub fn chat_paths(&self) -> Vec<String> {
         self.chat_paths
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Every chat completion request body received so far, oldest first.
+    ///
+    /// Includes requests answered with an error, so a count taken after a
+    /// command finishes is the number of completions it asked for. Recovers a
+    /// poisoned lock for the same reason [`Self::last_chat_request`] does.
+    #[must_use]
+    pub fn chat_requests(&self) -> Vec<Value> {
+        self.completion_requests
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
@@ -579,6 +654,7 @@ impl MockServer {
             server: http_server::spawn(app).await,
             last_chat_request: Arc::new(Mutex::new(None)),
             chat_paths: Arc::new(Mutex::new(Vec::new())),
+            completion_requests: Arc::new(Mutex::new(Vec::new())),
             scripted: None,
         }
     }
@@ -632,8 +708,10 @@ impl MockServer {
     /// first, and the local-endpoint detection probe (`Say ok.`, `max_tokens: 2`)
     /// is itself a chat request that lands before the user has typed anything.
     /// A scenario with no intervening screen wait therefore sees the probe and
-    /// reports the real turn as missing. Only `last_chat_request` is retained,
-    /// so this narrows to the newest body rather than searching a history.
+    /// reports the real turn as missing. Each poll tests only the newest body
+    /// ([`Self::last_chat_request`]), not the full history that
+    /// [`Self::chat_requests`] keeps, so a matching request that a later one
+    /// has already replaced is not found.
     pub async fn wait_for_chat_request_where(
         &self,
         timeout: Duration,
@@ -704,6 +782,15 @@ pub struct ServiceRecordOptions {
     /// refused before anything is stopped, which makes a failed restart
     /// observable without an engine.
     pub host: Option<&'static str>,
+    /// Whether the record already carries the "inference was verified" latch
+    /// (`inference_verified_at_unix_ms`) a real launch writes once a completion
+    /// first succeeds. `false` (the default) keeps the historical record with
+    /// no latch, so the CLI's readiness check sends its own `Say ok.` completion
+    /// probe to the service. Set it when the mock's chat replies are scripted
+    /// ([`MockServer::start_with_chat_script`]): with the latch the CLI skips
+    /// that probe, so the first scripted reply goes to the request the scenario
+    /// is about instead of being consumed by readiness.
+    pub inference_verified: bool,
 }
 
 impl Default for ServiceRecordOptions {
@@ -716,6 +803,7 @@ impl Default for ServiceRecordOptions {
             supervisor_start_ticks: None,
             runtime_id: None,
             host: None,
+            inference_verified: false,
         }
     }
 }
@@ -767,6 +855,7 @@ pub fn write_service_record_with(
         "supervisor_start_ticks": options.supervisor_start_ticks,
         "engine_pid": options.engine_pid,
         "runtime_id": options.runtime_id,
+        "inference_verified_at_unix_ms": options.inference_verified.then_some(1_u64),
         "env_id": null,
         "device_policy": null,
         "gpu_indices": [],
@@ -812,11 +901,74 @@ async fn handle_scripted_metrics(State(state): State<ServerState>) -> (StatusCod
     }
 }
 
+/// A complete `chat.completion` response body whose assistant message is plain
+/// text. The shape [`MockServer`] answers with by default, and what a
+/// [`MockServer::start_with_chat_script`] entry usually is.
+#[must_use]
+pub fn chat_text_reply(model: &str, content: &str) -> Value {
+    json!({
+        "id": "mock-completion-1",
+        "object": "chat.completion",
+        "created": 1_700_000_000_u64,
+        "model": model,
+        "system_fingerprint": null,
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": content
+            },
+            "finish_reason": "stop"
+        }],
+        "usage": {
+            "prompt_tokens": 10,
+            "completion_tokens": 8,
+            "total_tokens": 18
+        }
+    })
+}
+
+/// A `chat.completion` response body in which the assistant calls tool `name`.
+///
+/// An OpenAI-style `tool_calls` entry with `arguments` serialized as a JSON
+/// string, and no text content.
+#[must_use]
+pub fn chat_tool_call_reply(model: &str, name: &str, arguments: &Value) -> Value {
+    json!({
+        "id": "mock-completion-1",
+        "object": "chat.completion",
+        "created": 1_700_000_000_u64,
+        "model": model,
+        "system_fingerprint": null,
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": arguments.to_string()
+                    }
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }],
+        "usage": {
+            "prompt_tokens": 10,
+            "completion_tokens": 8,
+            "total_tokens": 18
+        }
+    })
+}
+
 async fn handle_chat(
     State(state): State<ServerState>,
     uri: axum::http::Uri,
     Json(body): Json<Value>,
-) -> Json<Value> {
+) -> (StatusCode, Json<Value>) {
     // Record which of the two chat routes the client actually used, so a
     // scenario can distinguish the versioned path from the unversioned one.
     state
@@ -837,7 +989,38 @@ async fn handle_chat(
     *state
         .last_chat_request
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(body);
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(body.clone());
+
+    // The history doubles as the script cursor: the index this request takes is
+    // the number of requests recorded before it, read under the same lock that
+    // appends it, so two concurrent requests can never be handed one entry.
+    let index = {
+        let mut history = state
+            .completion_requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        history.push(body);
+        history.len() - 1
+    };
+
+    if let Some(script) = &state.chat_script {
+        return script.get(index).map_or_else(
+            || {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({
+                        "error": format!(
+                            "mock chat script exhausted: request {} arrived but only {} \
+                             replies were scripted",
+                            index + 1,
+                            script.len()
+                        )
+                    })),
+                )
+            },
+            |reply| (StatusCode::OK, Json(reply.clone())),
+        );
+    }
 
     // Tests assert on the request contract, not the reply text, so the default
     // is a fixed stub. Demos (`rocm-demo-env`) set `ROCM_MOCK_CHAT_REPLY` to a
@@ -845,24 +1028,226 @@ async fn handle_chat(
     let content = std::env::var("ROCM_MOCK_CHAT_REPLY")
         .unwrap_or_else(|_| "This is a mock response for testing.".to_string());
 
-    Json(json!({
-        "id": "mock-completion-1",
-        "object": "chat.completion",
-        "created": 1_700_000_000_u64,
-        "model": model,
-        "system_fingerprint": null,
-        "choices": [{
-            "index": 0,
-            "message": {
-                "role": "assistant",
-                "content": content
-            },
-            "finish_reason": "stop"
-        }],
-        "usage": {
-            "prompt_tokens": 10,
-            "completion_tokens": 8,
-            "total_tokens": 18
+    (StatusCode::OK, Json(chat_text_reply(&model, &content)))
+}
+
+/// Tests for the scripted chat replies and the request history: the harness
+/// pieces the planner scenarios stand on, so a script that skipped, repeated or
+/// recycled an entry — or a history that lost a request — would make a
+/// "asked exactly once" assertion meaningless without failing anything itself.
+#[cfg(test)]
+mod chat_script_tests {
+    use super::{
+        MockServer, ServiceRecordOptions, chat_text_reply, chat_tool_call_reply,
+        write_service_record_with,
+    };
+    use serde_json::{Value, json};
+    use std::time::Duration;
+
+    fn client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .expect("failed to build HTTP client")
+    }
+
+    /// POST one chat completion whose single user message is `prompt`; returns
+    /// the HTTP status and the parsed body.
+    async fn post_chat(mock: &MockServer, prompt: &str) -> (u16, Value) {
+        let response = client()
+            .post(format!("{}/chat/completions", mock.base_url()))
+            .json(&json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": prompt}]
+            }))
+            .send()
+            .await
+            .expect("chat request failed");
+        let status = response.status().as_u16();
+        (status, response.json().await.expect("non-JSON chat reply"))
+    }
+
+    fn reply_text(body: &Value) -> &str {
+        body["choices"][0]["message"]["content"]
+            .as_str()
+            .expect("reply carried no text")
+    }
+
+    fn user_prompt(request: &Value) -> &str {
+        request["messages"][0]["content"]
+            .as_str()
+            .expect("request carried no user prompt")
+    }
+
+    #[tokio::test]
+    async fn scripted_replies_come_back_in_request_order() {
+        let mock = MockServer::start_with_chat_script(
+            "m",
+            vec![
+                chat_text_reply("m", "first"),
+                chat_text_reply("m", "second"),
+                chat_text_reply("m", "third"),
+            ],
+        )
+        .await;
+
+        for (prompt, expected) in [("a", "first"), ("b", "second"), ("c", "third")] {
+            let (status, body) = post_chat(&mock, prompt).await;
+            assert_eq!(status, 200, "scripted request must succeed");
+            assert_eq!(
+                reply_text(&body),
+                expected,
+                "request `{prompt}` must get the reply scripted for its position"
+            );
         }
-    }))
+    }
+
+    #[tokio::test]
+    async fn every_request_is_recorded_in_order_and_last_request_still_tracks() {
+        let mock = MockServer::start_with_chat_script(
+            "m",
+            vec![chat_text_reply("m", "one"), chat_text_reply("m", "two")],
+        )
+        .await;
+
+        post_chat(&mock, "alpha").await;
+        post_chat(&mock, "beta").await;
+
+        let requests = mock.chat_requests();
+        assert_eq!(requests.len(), 2, "both requests must be kept");
+        assert_eq!(user_prompt(&requests[0]), "alpha");
+        assert_eq!(user_prompt(&requests[1]), "beta");
+        let last = mock.last_chat_request().expect("no last request recorded");
+        assert_eq!(
+            user_prompt(&last),
+            "beta",
+            "`last_chat_request` must keep returning the newest body"
+        );
+    }
+
+    #[tokio::test]
+    async fn listing_models_does_not_consume_a_script_entry() {
+        let mock =
+            MockServer::start_with_chat_script("m", vec![chat_text_reply("m", "only")]).await;
+
+        for _ in 0..3 {
+            let listing = client()
+                .get(format!("{}/models", mock.base_url()))
+                .send()
+                .await
+                .expect("models request failed");
+            assert_eq!(listing.status().as_u16(), 200);
+        }
+        assert!(
+            mock.chat_requests().is_empty(),
+            "a model listing is not a chat completion and must not be recorded as one"
+        );
+
+        let (status, body) = post_chat(&mock, "x").await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            reply_text(&body),
+            "only",
+            "the first completion must still get the first scripted reply"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_past_the_end_of_the_script_fails_and_is_still_recorded() {
+        let mock =
+            MockServer::start_with_chat_script("m", vec![chat_text_reply("m", "only")]).await;
+
+        let (status, _) = post_chat(&mock, "one").await;
+        assert_eq!(status, 200);
+        let (status, body) = post_chat(&mock, "two").await;
+        assert_eq!(status, 500, "an unscripted request must not get a reply");
+        assert!(
+            body["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("exhausted")),
+            "the failure must say the script ran out, got {body}"
+        );
+        let (status, _) = post_chat(&mock, "three").await;
+        assert_eq!(status, 500, "the script must not wrap around");
+
+        let requests = mock.chat_requests();
+        assert_eq!(
+            requests.len(),
+            3,
+            "requests past the end must still be counted, so over-asking is visible"
+        );
+        assert_eq!(user_prompt(&requests[2]), "three");
+    }
+
+    #[tokio::test]
+    async fn a_tool_call_reply_carries_the_call_in_the_openai_shape() {
+        let mock = MockServer::start_with_chat_script(
+            "m",
+            vec![chat_tool_call_reply(
+                "m",
+                "natural_language_plan",
+                &json!({"request": "serve a model"}),
+            )],
+        )
+        .await;
+
+        let (_, body) = post_chat(&mock, "x").await;
+        let call = &body["choices"][0]["message"]["tool_calls"][0]["function"];
+        assert_eq!(call["name"], "natural_language_plan");
+        let arguments: Value =
+            serde_json::from_str(call["arguments"].as_str().expect("arguments not a string"))
+                .expect("arguments not JSON");
+        assert_eq!(arguments["request"], "serve a model");
+    }
+
+    #[tokio::test]
+    async fn without_a_script_every_request_gets_the_same_stub_and_is_recorded() {
+        let mock = MockServer::start("m").await;
+
+        // The stub text the unscripted server must keep answering with: the demo
+        // override when one is set, the fixed default otherwise.
+        let expected = std::env::var("ROCM_MOCK_CHAT_REPLY")
+            .unwrap_or_else(|_| "This is a mock response for testing.".to_string());
+
+        let (first_status, first) = post_chat(&mock, "a").await;
+        let (second_status, second) = post_chat(&mock, "b").await;
+
+        assert_eq!(first_status, 200);
+        assert_eq!(second_status, 200);
+        assert_eq!(reply_text(&first), expected);
+        assert_eq!(reply_text(&second), expected);
+        assert_eq!(mock.chat_requests().len(), 2);
+    }
+
+    #[test]
+    fn the_inference_latch_is_written_only_when_asked_for() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        // Read back through the product's own record type, not the literal key
+        // the writer uses: the CLI skips its readiness probe only when this
+        // field deserializes to `Some`, so a key the product does not read
+        // would leave the latch silently unset while a JSON-level check on the
+        // writer's own key still passed.
+        let latch = |options: ServiceRecordOptions| {
+            write_service_record_with(dir.path(), "m", 1, options);
+            let record: rocm_core::ManagedServiceRecord = serde_json::from_slice(
+                &std::fs::read(dir.path().join("e2e-mock.json")).expect("record not written"),
+            )
+            .expect("record is not a ManagedServiceRecord");
+            record.inference_verified_at_unix_ms
+        };
+
+        assert_eq!(
+            latch(ServiceRecordOptions::default()),
+            None,
+            "the default record must stay unlatched so existing scenarios keep probing"
+        );
+        assert!(
+            latch(ServiceRecordOptions {
+                inference_verified: true,
+                ..ServiceRecordOptions::default()
+            })
+            .is_some(),
+            "an inference-verified record must carry a latch the CLI reads"
+        );
+    }
 }

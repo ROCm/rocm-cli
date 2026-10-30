@@ -43,6 +43,7 @@ tests/e2e-cucumber/
 │   └── e2e/                      # step functions — one file per feature area
 │       ├── chat_steps.rs
 │       ├── examine_steps.rs
+│       ├── planner_steps.rs      # planning-assistant scenarios (scripted chat mock)
 │       ├── runtime_steps.rs
 │       ├── serving_steps.rs
 │       └── skill_steps.rs
@@ -51,7 +52,7 @@ tests/e2e-cucumber/
     ├── lib.rs
     ├── capability.rs             # host capability probe (OS / GPU / effective engine)
     ├── expectation.rs            # tag parsing + pass/xfail/skip resolution
-    └── mock_server.rs            # axum mock OpenAI server
+    └── mock_server.rs            # axum mock OpenAI server (fixed stub, or a scripted reply per chat request)
 ```
 
 ## Running tests
@@ -252,9 +253,10 @@ The `.feature` file is both the spec and the test input — cucumber reads it at
 
 ## Design principles
 
-- **Black-box only.** Step functions interact with `rocm` and explicitly configured `rocmd` through their CLIs and HTTP endpoints. No imports from the rocm-cli codebase. Where a scenario needs the CLI to know about a running server, it plants a managed-service record as plain JSON matching the on-disk schema (see `register_mock_service`) — the same file `rocm serve --managed` would write — rather than importing the record type.
+- **Black-box only.** Step functions interact with `rocm` and explicitly configured `rocmd` through their CLIs and HTTP endpoints. No imports from the rocm-cli codebase. Where a scenario needs the CLI to know about a running server, it plants a managed-service record as plain JSON matching the on-disk schema (see `register_mock_service`) — the same file `rocm serve --managed` would write — rather than importing the record type. (A harness *unit* test may read a planted record back through `rocm_core::ManagedServiceRecord`, to tie the writer's field names to the ones the CLI reads; steps do not.)
 - **Isolated state.** Each scenario uses isolated config, data, and cache directories. Tests never touch `~/.rocm`.
 - **Behavioral language.** Feature files describe what users care about, not implementation details. How steps are implemented (mock vs real, which port, which API) stays in the step functions.
+- **A scenario about a sequence of chat completions scripts them.** `MockServer::chat_requests` records every chat completion request body even with the fixed stub reply, so a scenario can count completions and read each prompt. A script makes a double ask visible in what the user sees as well: `MockServer::start_with_chat_script` hands out one distinct reply per chat completion request (on either the `/v1/chat/completions` or the unversioned `/chat/completions` route), so the plan that gets printed or returned shows which call produced it, and a request past the end of the script gets HTTP 500 (and is still recorded), so asking more often than scripted fails loudly instead of recycling a reply. Plant the service with `ServiceRecordOptions { inference_verified: true, .. }` so the CLI's own readiness probe does not consume the first scripted reply. `planner_steps.rs` is the worked example.
 - **OS-assigned ports.** The mock server binds to `127.0.0.1:0` to avoid port conflicts between tests.
 - **A message is asserted with the state it describes.** A `Then` step matching printed output ("no existing SDK was found", "becomes the active default runtime", "stop them with `rocm services stop <id> --yes`") asserts the resulting state in the same scenario — the file that was or was not written, the runtime that is or is not active, the advice's named command actually clearing the condition. Matching the text alone certifies the wording, not the truth of it, which is how a scenario passes over a CLI that is wrong about what it did. See AGENTS.md §3.
 

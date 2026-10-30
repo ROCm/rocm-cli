@@ -869,8 +869,14 @@ resolution is only used after a user configures a planner provider:
 
 ```bash
 rocm config set-planner-provider local
-rocm "start a local model"
+rocm "serve a model"
 ```
+
+Only a request the deterministic planner cannot settle reaches the provider:
+`serve a model` names no model, so its plan is a placeholder and the provider is
+asked, while `start a local model` resolves to the validated default model at
+high confidence and never consults the provider (so, under `--yes`, it runs the
+`rocm serve` it plans).
 
 For OpenAI or Anthropic, prompt sending must also be enabled and a key must be
 available through the OS secure store or session environment:
@@ -885,11 +891,51 @@ Provider-assisted output is reduced to a validated `rocm` tool call. It is
 shown for review in the TUI, but non-interactive `rocm --yes ...` does not
 execute provider-assisted plans automatically.
 
+A request is planned exactly once, so the plan shown to the user is the plan
+the provider gave: building a plan can call the provider, whose answers are not
+guaranteed to be the same twice, and a second call could describe a different
+command than the first. Three E2E scenarios in
+[chat.feature](../tests/e2e-cucumber/features/chat.feature) hold this through the
+real binary, against a mock chat provider that answers from a script (a
+different plan on each call, via `MockServer::start_with_chat_script` in
+[mock_server.rs](../tests/e2e-cucumber/src/mock_server.rs); steps in
+[planner_steps.rs](../tests/e2e-cucumber/tests/e2e/planner_steps.rs)):
+
+- `chat-10` (`chat-freeform-yes-plans-once`): `rocm --yes "serve a model"`
+  asks the planning provider exactly once, prints the provider's plan, and is
+  refused (non-zero exit, no `execution` section) rather than running it. This
+  is also the scenario for the claim above that `--yes` does not execute
+  provider-assisted plans.
+- `chat-11` (`chat-assistant-plan-tool-plans-once`): the chat assistant's
+  `natural_language_plan` tool asks the planning provider exactly once.
+- `chat-12` (`chat-plan-tool-text-matches-action`): the same tool called
+  directly through the hidden `rocm mcp-call` entry point asks the provider
+  exactly once, and the JSON it returns agrees with itself: the rendered plan
+  text (`structuredContent.text`) and the action it reports as what would run
+  next (`structuredContent.action`) are both the provider's first answer, with
+  the action marked `provider_assisted`.
+
+```bash
+cargo xtask e2e -- -n "chat-10"
+cargo xtask e2e -- -n "chat-11"
+cargo xtask e2e -- -n "chat-12"
+```
+
+All three run on the mock lane and need no GPU. The plan shown and the action
+that would run can be compared only where both are reported, which is the
+`natural_language_plan` tool (`chat-12`). The `--yes` surface refuses a
+provider-assisted plan before dispatching it, so it never runs the plan's
+command and shows only the plan text; for that surface the reuse of the
+rendered plan is covered by the unit tests below.
+
 Focused coverage:
 
 ```bash
 cargo test -p rocm --bin rocm provider_planner
 cargo test -p rocm --bin rocm freeform_execution_validation_rejects_provider_assisted_plans
+cargo test -p rocm --bin rocm freeform_plan_dedup_prevents_provider_assisted_divergence
+cargo test -p rocm --bin rocm freeform_execution_reuses_the_rendered_plan_without_rebuilding
+cargo test -p e2e-cucumber --lib chat_script_tests
 ```
 
 Log browser smoke:

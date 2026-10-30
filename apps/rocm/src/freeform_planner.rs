@@ -1795,8 +1795,9 @@ mod tests {
             "notes": ["resolved the missing model to a tiny test model"]
         }"#;
 
-        let plan = provider_planner_response_to_plan("start a local model", "local", content)?;
+        let plan = provider_planner_response_to_plan("serve a model", "local", content)?;
 
+        assert_eq!(plan.request, "serve a model");
         assert!(plan.provider_assisted);
         assert!(plan.planner.contains("provider:local"));
         assert_eq!(plan.intent, PlannerIntent::Serve);
