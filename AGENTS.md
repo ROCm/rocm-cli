@@ -324,7 +324,9 @@ on two counts, and both change how you edit it:
   tracks `main` here. When this folder changes on `main`, that workflow opens a
   "Bump `rocm-doctor`" pull request in `amd/skills`, and the change reaches
   `amd/skills` only when that pull request is merged. So edit it here, and never edit
-  the `amd/skills` copy directly — the next bump overwrites it.
+  the `amd/skills` copy directly — the next bump overwrites it. Those bump pull requests are also
+  where the skill is graded; [docs/skill-quality.md](docs/skill-quality.md) says
+  what runs there.
 - **`reference.md` is an e2e fixture.** `tests/e2e-cucumber/features/rocm_doctor_skill.feature`
   parses its closed-catalog table and compares it to what `rocm fix` reports.
   The failure catalog itself is authoritative in `crates/rocm-core/src/fix.rs`
@@ -368,9 +370,11 @@ Two checks gate it, and they cover different things:
   describes the binary, as above.
 
 Neither grades whether the skill actually *fires*. That is skillscope's
-`routing` and `behavioral`, which need an authenticated `claude` CLI and an
-`ANTHROPIC_API_KEY` this repo does not have. The dataset is written and checked
-so those can be switched on without further work.
+`routing` and `behavioral`, which make paid model calls and need a credential
+this repo does not hold, so they do not run here. `amd/skills` grades the skill
+instead. What runs there today, what the figures mean and what they cannot tell
+you is in [docs/skill-quality.md](docs/skill-quality.md), which is the one place
+that is kept current.
 
 `skills/rocm-cli-assistant/` is **not** in scope for skillscope: it is embedded
 verbatim into the chat system prompt with `include_str!`, so the YAML
