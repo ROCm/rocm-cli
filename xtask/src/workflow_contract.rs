@@ -4205,6 +4205,21 @@ fi
         );
     }
 
+    /// `install.sh` fish setup is exercised by a hermetic shell script ahead of
+    /// the lifecycle E2E. The Linux build job must run that script: it fails
+    /// when a bash, zsh, or ksh login shell skips fish, and when a bash home
+    /// with no fish install grows a fish config.
+    #[test]
+    fn ci_linux_build_and_test_runs_the_install_sh_fish_checks() {
+        let ci = read_workflow("ci.yml");
+        let linux = job_block(&ci, "build-and-test");
+        assert!(
+            linux.contains("tests/install-sh/run.sh"),
+            "build-and-test must run tests/install-sh/run.sh so a bash login \
+             shell that skips fish fails in required CI"
+        );
+    }
+
     /// The hermetic comfyui-01/02/03 scenarios (no GPU, no network, no
     /// `e2e-test-hooks` dependency, Windows-portable since #637) must stay
     /// explicitly selected into this otherwise-`@lifecycle`-only Windows lane

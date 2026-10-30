@@ -454,6 +454,13 @@ jobs:
         if: needs.changes.outputs.heavy == 'true'
         run: cargo xtask verify-pinned-keys
 
+      # Hermetic: a signed local bundle and a stub `rocm`, no network and no
+      # GPU. Runs before the lifecycle E2E so a fish-profile regression fails
+      # here instead of only inside a full release install.
+      - name: Installer fish profile checks
+        if: needs.changes.outputs.heavy == 'true'
+        run: sh tests/install-sh/run.sh
+
       - name: Acceptance install lifecycle
         if: needs.changes.outputs.heavy == 'true'
         # The install lifecycle (package + real installer + install/uninstall) now

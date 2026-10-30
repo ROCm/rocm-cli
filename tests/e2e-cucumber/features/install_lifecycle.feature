@@ -354,3 +354,19 @@ Feature: Release install lifecycle
     Then the installed rocm and rocmd binaries are gone
     And the shell profile is back to the user's own settings
     And the record of the installer's PATH change is gone
+
+  @id:lifecycle-linux-fish-configured-from-bash @lifecycle @requires-os:linux
+  Scenario: lifecycle-28 - Linux - a bash login shell on a machine with fish also gets fish's PATH and completions, and uninstall undoes the PATH change
+    Given a freshly built release tree
+    And a generated signing keypair
+    And the login shell is bash
+    And fish is set up with its own settings
+    And a signed bundle installed with the shell profile updated
+    Then the fish config adds the install directory to PATH once
+    And the fish completions for the installed rocm are in place
+    When the signed bundle is reinstalled with the shell profile updated
+    Then the fish config adds the install directory to PATH once
+    When the user uninstalls from the installed binary
+    Then the installed rocm and rocmd binaries are gone
+    And the fish config is back to the user's own settings
+    And the record of the installer's PATH change is gone
