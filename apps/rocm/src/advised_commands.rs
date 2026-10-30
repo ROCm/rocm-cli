@@ -1146,7 +1146,7 @@ const NOT_INVOCATIONS: &[(&str, &str, &str)] = &[
         "error message naming the command, not advice",
     ),
     (
-        "apps/rocm/src/main.rs",
+        "apps/rocm/src/examine_report_text.rs",
         "rocm interactive shell",
         "heading of the non-interactive launcher report",
     ),
@@ -1191,7 +1191,7 @@ const NOT_INVOCATIONS: &[(&str, &str, &str)] = &[
         "fallback label for an unrenderable chat tool call",
     ),
     (
-        "apps/rocm/src/main.rs",
+        "apps/rocm/src/gpu_policy.rs",
         "rocm serve requires ROCm GPU execution; CPU mode is not a fallback path in rocm-cli",
         "error message naming the command, not advice",
     ),

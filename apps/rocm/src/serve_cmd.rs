@@ -11,8 +11,15 @@
 //! `Cli` is not referenced from this file; `DevicePolicyArg` (part of the clap arg tree)
 //! is, via `use crate::DevicePolicyArg`.
 //!
-//! `collect_serve_notes` and `validate_pinned_gpu_index` stay in `main.rs`
-//! (no entanglement; a later pass can relocate them). The
+//! `collect_serve_notes` stays in `main.rs` (no entanglement; a later pass
+//! can relocate it). `detect_gpu_count`, `gpu_vram_usage`,
+//! `parse_device_policy`, `parse_gpu_selection`,
+//! `select_gpu_indices_under_launch_lock`, `serve_gpu_low_memory_warning`,
+//! and `validate_pinned_gpu_index` moved out of `main.rs` into
+//! `gpu_policy.rs` in ROCMAI-214 (Phase 6f); `resolve_engine_selection` and
+//! `validate_engine_selection_runtime` moved out of `main.rs` into
+//! `engine_runtime_select.rs` in ROCMAI-215 (Phase 6f); this file's `use`
+//! list below points to both now instead of at the crate root. The
 //! managed-service-spawning tail this file calls into — `start_managed_service`,
 //! `run_attached_service`, `resolve_endpoint_auth`,
 //! `ensure_public_bind_engine_supported`,
@@ -38,19 +45,19 @@ use rocm_engine_protocol::{
 use crate::DevicePolicyArg;
 use crate::endpoint_keys;
 use crate::engine_ipc::engine_request;
+use crate::engine_runtime_select::{resolve_engine_selection, validate_engine_selection_runtime};
 use crate::engines_cmd::{engine_manages_own_runtime, ensure_self_managed_engine_ready};
+use crate::gpu_policy::{
+    detect_gpu_count, gpu_vram_usage, parse_device_policy, parse_gpu_selection,
+    select_gpu_indices_under_launch_lock, serve_gpu_low_memory_warning, validate_pinned_gpu_index,
+};
 use crate::serve_summary;
 use crate::service_launch::{
     drop_orphaned_endpoint_key_on_already_running, ensure_background_helper_running_quiet,
     ensure_public_bind_engine_supported, print_managed_launch_plain, resolve_endpoint_auth,
     run_attached_service, start_managed_service, validate_bind_host,
 };
-use crate::{
-    cli_progress, collect_serve_notes, detect_gpu_count, device_policy_name, gpu_vram_usage,
-    parse_device_policy, parse_gpu_selection, resolve_engine_selection,
-    select_gpu_indices_under_launch_lock, serve_gpu_low_memory_warning,
-    validate_engine_selection_runtime, validate_pinned_gpu_index,
-};
+use crate::{cli_progress, collect_serve_notes, device_policy_name};
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) struct ServeEngineSelection {

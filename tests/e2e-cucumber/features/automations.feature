@@ -5,8 +5,9 @@ Feature: Automation watchers
   # automations` lists the most recent review requests (any status — only the
   # per-entry approve/reject controls are gated on "pending"). This feature
   # pins the enable/disable/mode-confirmation slice, the proposal-history
-  # listing's unit formatting, and the bare listing's tolerance of a torn
-  # audit-log tail; the watcher/daemon trigger behaviour itself is covered
+  # listing's unit formatting, the bare listing's tolerance of a torn
+  # audit-log tail, and how the audit log and proposal history are kept
+  # bounded; the watcher/daemon trigger behaviour itself is covered
   # elsewhere. Config-only (no GPU, no network), so it runs on the mock lane
   # every PR.
 
@@ -83,3 +84,46 @@ Feature: Automation watchers
     And the audit event log ends in a torn, unterminated line
     When the user lists automations
     Then the CLI still lists the record before the torn tail
+
+  # The automation event log and the audit log are size-capped (ROCMAI-729):
+  # the write that finds the live log at its cap first renames it aside to
+  # `events.jsonl.1`, keeping a fixed number of such generations. This seeds the
+  # audit log at the cap, makes one change the CLI audits, and checks both the
+  # files and that the automations listing still shows activity from before the
+  # rollover, which it can only read from the rotated generation.
+  @id:automations-audit-log-rotates-at-cap
+  Scenario: automations-07 - A full audit log is set aside and its recent history stays visible
+    Given an audit log that has reached its size cap
+    When the user selects a permissions mode
+    Then the full audit log is kept aside as its first rotated generation
+    And the permissions change starts a fresh audit log
+    When the user lists automations
+    Then the recent background activity still includes entries from before the rotation
+
+  # The proposal history is compacted, not rotated (ROCMAI-729): a pending
+  # proposal must stay findable by id until it is reviewed, so reviewing one
+  # rewrites the history keeping every pending proposal but only the most
+  # recently reviewed ones. Approves through `rocm mcp-call proposal_action`, the
+  # hidden entry point the dashboard and chat review controls use.
+  @id:automations-review-compaction-keeps-pending
+  Scenario: automations-08 - Approving a proposal trims old review history but keeps older pending proposals
+    Given a pending proposal queued before a long history of reviewed proposals
+    When the user approves the newest pending proposal
+    Then the CLI confirms the approval
+    And only the most recently reviewed proposals are kept
+    When the user looks up the older pending proposal
+    Then the CLI shows it still pending
+
+  # automations-07 only exercises a single rollover: a live file at the cap
+  # gets a `.1`. The shift-and-drop-oldest chain beyond that — `.1` to `.2`,
+  # `.2` to `.3`, `.3` to `.4`, and the previous `.4` dropped — is otherwise
+  # pinned only by unit tests in `automation.rs`. This seeds a full chain of
+  # four already-rotated generations plus a live file at the cap, forces one
+  # more rotation, and checks the whole chain shifted down by one and the
+  # oldest generation's content is gone, not just that `.1` exists.
+  @id:automations-rotation-chain-shifts-and-drops-oldest
+  Scenario: automations-09 - A further rotation shifts the whole chain and drops the oldest generation
+    Given an audit log already holding a full chain of four rotated generations
+    When the user selects a permissions mode
+    Then each rotated generation holds what the previous one held
+    And the oldest previous generation is gone
