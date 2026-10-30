@@ -354,3 +354,50 @@ Feature: Release install lifecycle
     Then the installed rocm and rocmd binaries are gone
     And the shell profile is back to the user's own settings
     And the record of the installer's PATH change is gone
+
+  # ── Installer output: banner, hint, markers, color gating ───────────────
+  # The harness captures the installer through pipes, so these prove the piped
+  # (no-color) contract. The colored TTY branch is not driven here: the PTY
+  # driver exposes the emulated screen, which has already resolved escape
+  # sequences, so it cannot assert on raw ANSI bytes.
+
+  @id:lifecycle-linux-install-output-banner-and-hint @lifecycle @requires-os:linux
+  Scenario: lifecycle-28 - Linux - a piped install prints the get-started block without the art, and a hint that names the installed binary, with no ANSI escapes
+    Given a freshly built release tree
+    And a generated signing keypair
+    When the release is packaged and signed with the private key file
+    And the signed bundle is installed with the public key file
+    Then the installer prints the get-started block
+    And the installer output has no banner art
+    And the installer next-step hint names the installed rocm binary
+    And the installer output has no ANSI escapes
+
+  @id:lifecycle-linux-install-output-no-color-env @lifecycle @requires-os:linux
+  Scenario: lifecycle-29 - Linux - NO_COLOR keeps the installer output free of ANSI escapes
+    Given a freshly built release tree
+    And a generated signing keypair
+    When the release is packaged and signed with the private key file
+    And the signed bundle is installed with the public key file and NO_COLOR set
+    Then the installer prints the get-started block
+    And the installer output has no banner art
+    And the installer output has no ANSI escapes
+
+  @id:lifecycle-linux-install-failure-marker @lifecycle @requires-os:linux
+  Scenario: lifecycle-30 - Linux - an installer failure is marked with the !! prefix and carries no ANSI escapes when piped
+    Given a freshly built release tree
+    And a generated signing keypair
+    When the release is packaged and signed with the private key file
+    And the bundle checksum sidecar is corrupted
+    And the signed bundle is installed with the public key file
+    Then the install fails reporting checksum verification failed
+    And the installer failure line is marked with the !! prefix
+    And the installer output has no ANSI escapes
+
+  @id:lifecycle-windows-install-output-banner @lifecycle @requires-os:windows
+  Scenario: lifecycle-31 - Windows - a piped install prints the get-started block and no ANSI escapes
+    Given a freshly built release tree
+    And a generated signing keypair
+    When the release is packaged and signed with the private key file
+    And the signed bundle is installed with the public key file
+    Then the installer prints the get-started block
+    And the installer output has no ANSI escapes

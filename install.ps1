@@ -21,6 +21,98 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# [Console]::IsOutputRedirected is checked alongside NO_COLOR so piped or
+# logged output carries no color. It is also a conservative guard for hosts
+# with no real console (WinRM, scheduled tasks), where Write-Host
+# -ForegroundColor may fail; not reproduced here. Note that "redirected" is
+# not the same thing as "no console attached".
+$script:NoColor = (-not [string]::IsNullOrEmpty($env:NO_COLOR)) -or [Console]::IsOutputRedirected
+
+function Write-Step {
+    param([string] $Message)
+    if ($script:NoColor) {
+        Write-Host "==> $Message"
+    } else {
+        Write-Host "==> " -ForegroundColor Cyan -NoNewline
+        Write-Host $Message
+    }
+}
+
+function Write-Detail {
+    param([string] $Message)
+    Write-Host "  $Message"
+}
+
+function Write-Ok {
+    param([string] $Message)
+    if ($script:NoColor) {
+        Write-Host ":: $Message"
+    } else {
+        Write-Host ":: " -ForegroundColor Green -NoNewline
+        Write-Host $Message
+    }
+}
+
+function Write-CompletionBanner {
+    param([string] $Cmd, [string] $NextHint)
+    # Kept ASCII-only so the file needs no BOM (a BOM breaks `irm | iex` on
+    # Windows PowerShell 5.1): the art is drawn with placeholder letters and
+    # expanded to box-drawing characters here.
+    $art = @'
+ ######T  ######T  ######T###T   ###T     ######T##T     ##T
+ ##F==##T##F===##T##F====J####T ####|    ##F====J##|     ##|
+ ######FJ##|   ##|##|     ##F####F##|    ##|     ##|     ##|
+ ##F==##T##|   ##|##|     ##|L##FJ##|    ##|     ##|     ##|
+ ##|  ##|L######FJL######T##| L=J ##|    L######T#######T##|
+ L=J  L=J L=====J  L=====JL=J     L=J     L=====JL======JL=J
+
+        Local AI on AMD GPUs ~ one binary, zero setup
+'@
+    $glyphs = @{
+        '#' = [char]0x2588; '=' = [char]0x2550; '|' = [char]0x2551
+        'T' = [char]0x2557; 'F' = [char]0x2554; 'L' = [char]0x255A
+        'J' = [char]0x255D; '~' = [char]0x2014
+    }
+    $art = -join ($art.ToCharArray() | ForEach-Object {
+        if ($glyphs.ContainsKey([string] $_)) { $glyphs[[string] $_] } else { $_ }
+    })
+    # Only the glyphs need UTF-8, and only a real console needs the switch:
+    # redirected output keeps whatever encoding its consumer already expects.
+    # Restored afterwards because under `irm | iex` this is the user's session.
+    $prevEncoding = $null
+    if (-not [Console]::IsOutputRedirected) {
+        try {
+            $prevEncoding = [Console]::OutputEncoding
+            [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+        } catch {
+            Write-Verbose "Could not set console output encoding to UTF-8: $_"
+            $prevEncoding = $null
+        }
+    }
+    try {
+        # Art only for an interactive console; redirected output gets the
+        # plain "Get started" block.
+        if (-not [Console]::IsOutputRedirected) {
+            if ($script:NoColor) {
+                Write-Host $art
+            } else {
+                Write-Host $art -ForegroundColor Cyan
+            }
+            Write-Host ""
+        }
+        Write-Host "Get started:"
+        Write-Host ("  {0,-20} # {1}" -f "$Cmd install sdk", "set up a managed ROCm runtime")
+        Write-Host ("  {0,-20} # {1}" -f "$Cmd serve qwen", "serve a small built-in assistant model")
+        Write-Host ("  {0,-20} # {1}" -f "$Cmd", "open the launcher")
+        Write-Host ""
+        Write-Host $NextHint
+    } finally {
+        if ($null -ne $prevEncoding) {
+            [Console]::OutputEncoding = $prevEncoding
+        }
+    }
+}
+
 function Fail {
     param([string] $Message)
     Write-Error "rocm-cli installer: $Message"
@@ -409,7 +501,7 @@ function Write-MinimalConfigIfMissing {
     $configDir = Get-RocmConfigDir
     $configPath = Join-Path $configDir "config.json"
     if (Test-Path -LiteralPath $configPath -PathType Leaf) {
-        Write-Host "config: existing $configPath"
+        Write-Detail "config: existing $configPath"
         return
     }
 
@@ -435,7 +527,7 @@ function Write-MinimalConfigIfMissing {
 '@
     $utf8NoBom = New-Object System.Text.UTF8Encoding $false
     [System.IO.File]::WriteAllText($configPath, $json + [Environment]::NewLine, $utf8NoBom)
-    Write-Host "config: created $configPath"
+    Write-Detail "config: created $configPath"
 }
 
 function Expand-RocmArchive {
@@ -543,20 +635,20 @@ function Add-InstallDirToUserPath {
     }
 
     if ($userPathAlreadyConfigured) {
-        Write-Host "user PATH already configured:"
-        Write-Host "  path: $Path"
+        Write-Detail "user PATH already configured:"
+        Write-Detail "path: $Path"
     } else {
-        Write-Host "user PATH updated:"
-        Write-Host "  added: $Path"
-        Write-Host "  new PowerShell windows can run: rocm"
+        Write-Ok "user PATH updated:"
+        Write-Detail "added: $Path"
+        Write-Detail "new PowerShell windows can run: rocm"
     }
 
     if ($processPathAlreadyConfigured) {
-        Write-Host "installer PATH already configured:"
-        Write-Host "  path: $Path"
+        Write-Detail "installer PATH already configured:"
+        Write-Detail "path: $Path"
     } else {
-        Write-Host "installer PATH updated:"
-        Write-Host "  this PowerShell process can run: rocm"
+        Write-Ok "installer PATH updated:"
+        Write-Detail "this PowerShell process can run: rocm"
     }
 }
 
@@ -643,11 +735,11 @@ try {
     New-Item -ItemType Directory -Force -Path $tempRoot, $extractDir | Out-Null
     $signingPublicKeys = @(Resolve-SigningPublicKey $SigningPublicKeyPath $SigningPublicKeyPem $tempRoot)
 
-    Write-Host "rocm-cli installer"
-    Write-Host "  repo: $Repo"
-    Write-Host "  channel: $Channel"
-    Write-Host "  install_dir: $InstallDir"
-    Write-Host "  download: $archiveUrl"
+    Write-Step "rocm-cli installer"
+    Write-Detail "repo: $Repo"
+    Write-Detail "channel: $Channel"
+    Write-Detail "install_dir: $InstallDir"
+    Write-Detail "download: $archiveUrl"
 
     Save-File $archiveUrl $archivePath
     Save-File $shaUrl $shaPath
@@ -664,7 +756,7 @@ try {
         }
         Save-File $sigUrl $sigPath "required signature sidecar is missing or unavailable"
         Confirm-ArchiveSignature $archivePath $sigPath $signingPublicKeys
-        Write-Host "signature verified"
+        Write-Ok "signature verified"
     }
 
     Expand-RocmArchive $archivePath $extractDir
@@ -683,7 +775,7 @@ try {
     Write-MinimalConfigIfMissing
 
     if (Test-Path -LiteralPath $manifestPath -PathType Leaf) {
-        Write-Host "removing previous rocm-cli install"
+        Write-Step "removing previous rocm-cli install"
         foreach ($installedPath in Get-Content -LiteralPath $manifestPath) {
             if ([string]::IsNullOrWhiteSpace($installedPath)) {
                 continue
@@ -709,9 +801,9 @@ try {
     $utf8NoBom = New-Object System.Text.UTF8Encoding $false
     [System.IO.File]::WriteAllLines($manifestPath, [string[]] $manifestEntries, $utf8NoBom)
 
-    Write-Host "installed:"
+    Write-Step "installed:"
     foreach ($entry in $manifestEntries) {
-        Write-Host "  $entry"
+        Write-Detail $entry
     }
 
     $updateUserPath = -not $NoPathUpdate
@@ -727,13 +819,13 @@ try {
         Write-Host "  `$env:Path = `"$InstallDir;`$env:Path`""
     }
 
-    Write-Host "run:"
     if (Test-PathInList $env:Path $InstallDir) {
-        Write-Host "  rocm examine"
+        $nextHint = "Run: rocm examine"
     } else {
         $rocmExe = Join-Path $InstallDir "rocm.exe"
-        Write-Host "  & `"$rocmExe`" examine"
+        $nextHint = "Run: & `"$rocmExe`" examine"
     }
+    Write-CompletionBanner $nextHint
 } finally {
     if (Test-Path -LiteralPath $tempRoot) {
         Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
