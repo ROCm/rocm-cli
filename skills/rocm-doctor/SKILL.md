@@ -1,20 +1,19 @@
 ---
 name: rocm-doctor
 description: >-
-  Diagnoses why ROCm, the HIP SDK, PyTorch, or llama.cpp is broken on an AMD GPU
-  on Linux, Windows, or WSL2, then applies a low-risk fix with consent or hands
+  Diagnoses why ROCm, the HIP SDK, PyTorch, llama.cpp, or vLLM is broken on an AMD
+  GPU on Linux, Windows, or WSL2, then applies a low-risk fix with consent or hands
   back the exact next step. Also routes Lemonade, LM Studio, and Ollama problems to the
   right upstream channel. Use when the user reports that ROCm or HIP "isn't
   working", torch.cuda.is_available() is False, rocminfo / hipInfo can't see the
-  GPU, or hits hipErrorNoBinaryForGpu, HSA_STATUS_ERROR_INVALID_ISA, "invalid
+  GPU, a vLLM startup OutOfMemoryError or libtorch_cuda.so ImportError, or hits
+  hipErrorNoBinaryForGpu, HSA_STATUS_ERROR_INVALID_ISA, "invalid
   device function", "no kernel image is available", cannot open /dev/kfd,
   permission denied on /dev/kfd, "ROCk module is NOT loaded", a missing
   libamdhip64.so / amdhip64_6.dll / hipblas.dll / vcruntime140_1.dll, an
   HSA_OVERRIDE_GFX_VERSION page fault, an iGPU+dGPU crash, a container that can't
   see the GPU, or a repo-native package-manager install (formerly `amdgpu-install`) / DKMS
-  failure. Backed by the `rocm` CLI
-  (`rocm examine` / `rocm diagnose` / `rocm fix`); this skill is a thin driver
-  over those commands, not a re-implementation.
+  failure. Backed by the `rocm` CLI (`rocm examine` / `diagnose` / `fix`).
 ---
 
 # ROCm Doctor
@@ -257,6 +256,26 @@ never name one of these apps. Use the list below.
 - Anything else with no catalog match → ROCm core:
   https://github.com/ROCm/ROCm/issues (this is what `route_when_no_match`
   returns by default).
+
+## vLLM startup failures
+
+Two vLLM engine failures are in the catalog. Both are **print-only**: `rocm fix`
+prints the plan and the user runs it.
+
+- **Out of memory at startup** (`fix-16-vllm-oom`, Linux and WSL2). The match is
+  keyword-based and needs `vllm` or `gpu-memory-utilization` in the symptom, so
+  pass the exact error line together with the line that names vLLM. A bare
+  `torch.OutOfMemoryError` with no vLLM anchor does not match. Relay both cases
+  the CLI returns: lowering the reservation helps only on a shared or busy GPU,
+  and a model that does not fit needs a smaller or quantized model.
+- **Import error at engine start** (`fix-17-torch-dlpack`, Linux and WSL2). Pass
+  the exact error line, for example one naming `libtorch_cuda.so`. The fix is an
+  engine reinstall that the CLI prints. It is not a group membership change, so
+  do not suggest `render` or `video` group edits for it. Native Windows gets no
+  match, which is correct because the vLLM engine does not run there, so route
+  that user upstream.
+
+`rocm diagnose --model <ref>` answers whether a model fits before a download.
 
 ## Out of scope
 
