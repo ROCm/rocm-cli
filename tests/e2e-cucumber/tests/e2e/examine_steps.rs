@@ -1432,6 +1432,27 @@ async fn os_release_with_a_command(world: &mut E2eWorld) {
 const RUNS_A_COMMAND_ON_LINE_3: &str =
     "ID=ubuntu\nVERSION_ID=\"24.04\"\nexport ID=debian\nPRETTY_NAME=\"Ubuntu 24.04 LTS\"\n";
 
+/// Writes each `(name, script)` as an executable in the isolated root's
+/// `fake-bin` and puts that directory first on the scenario's `PATH`.
+fn put_fake_executables_on_path(world: &mut E2eWorld, executables: &[(&str, &str)]) {
+    let bin = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("fake-bin");
+    std::fs::create_dir_all(&bin).expect("failed to create the fake PATH dir");
+    for (name, script) in executables {
+        rocm_core::fake_executable::write_fake_executable(&bin.join(name), script)
+            .unwrap_or_else(|e| panic!("failed to write the fake {name}: {e}"));
+    }
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .expect("PATH entries cannot hold a separator");
+    world.command_env.push(("PATH", path));
+}
+
 /// One GPU node in the kernel topology: a gfx1101 with no PCI address, so it
 /// matches no `lspci` entry and is listed from the topology alone. Plus an
 /// `lspci` that lists an empty bus, ahead of any real one, so the PCI probe
@@ -1453,15 +1474,7 @@ fn plant_gpu_fixtures(world: &mut E2eWorld) {
         "cpu_cores_count 0\nsimd_count 120\ngfx_target_version 110001\n",
     )
     .expect("failed to write planted KFD node properties");
-    let bin = root.join("fake-bin");
-    std::fs::create_dir_all(&bin).expect("failed to create the fake PATH dir");
-    rocm_core::fake_executable::write_fake_executable(&bin.join("lspci"), "#!/bin/sh\nexit 0\n")
-        .expect("failed to write the fake lspci");
-    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
-        &std::env::var_os("PATH").unwrap_or_default(),
-    )))
-    .expect("PATH entries cannot hold a separator");
-    world.command_env.push(("PATH", path));
+    put_fake_executables_on_path(world, &[("lspci", "#!/bin/sh\nexit 0\n")]);
 }
 
 #[given("a GPU machine whose release file runs a command on line 3")]
@@ -1488,6 +1501,161 @@ async fn gpu_machine_with_unreadable_release_file(world: &mut E2eWorld) {
         .command_env
         .push(("ROCM_CLI_TEST_HOST_ROOT", root.into_os_string()));
     plant_gpu_fixtures(world);
+}
+
+/// A simulated host root, plus a `lsmod` on `PATH` that lists `amdgpu` and no
+/// `amdkfd`, so the module list never answers for kfd. `with_kfd` plants the
+/// `/dev/kfd` node.
+fn plant_machine_without_amdkfd_module(world: &mut E2eWorld, with_kfd: bool) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .to_owned();
+    let host = root.join("host-root");
+    std::fs::create_dir_all(host.join("dev")).expect("failed to create planted /dev");
+    if with_kfd {
+        std::fs::write(host.join("dev/kfd"), "").expect("failed to plant /dev/kfd");
+    }
+    put_fake_executables_on_path(
+        world,
+        &[(
+            "lsmod",
+            "#!/bin/sh\nprintf 'Module Size Used by\\namdgpu 1 0\\ndrm 1 1 amdgpu\\n'\n",
+        )],
+    );
+    world
+        .command_env
+        .push(("ROCM_CLI_TEST_HOST_ROOT", host.into_os_string()));
+}
+
+#[given("a machine whose kernel exposes kfd but lists no amdkfd module")]
+async fn machine_with_built_in_kfd(world: &mut E2eWorld) {
+    plant_machine_without_amdkfd_module(world, true);
+}
+
+#[given("a machine whose kernel has no kfd and lists no amdkfd module")]
+async fn machine_without_kfd(world: &mut E2eWorld) {
+    plant_machine_without_amdkfd_module(world, false);
+}
+
+/// A simulated host root with `/dev/kfd`, no `/proc/modules`, and a `lsmod`
+/// on `PATH` that fails: no module list can be read at all.
+#[given("a machine whose kernel exposes kfd but whose module list cannot be read")]
+async fn machine_with_kfd_and_no_module_list(world: &mut E2eWorld) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .to_owned();
+    let host = root.join("host-root");
+    std::fs::create_dir_all(host.join("dev")).expect("failed to create planted /dev");
+    std::fs::write(host.join("dev/kfd"), "").expect("failed to plant /dev/kfd");
+    put_fake_executables_on_path(world, &[("lsmod", "#!/bin/sh\nexit 1\n")]);
+    world
+        .command_env
+        .push(("ROCM_CLI_TEST_HOST_ROOT", host.into_os_string()));
+}
+
+#[then("the inspection reports kfd as loaded")]
+async fn assert_kfd_loaded(world: &mut E2eWorld) {
+    let json = parsed_json(world);
+    assert_eq!(json["amdkfd_loaded"], serde_json::json!(true), "{json:#}");
+}
+
+#[then("the inspection reports kfd as not loaded")]
+async fn assert_kfd_not_loaded(world: &mut E2eWorld) {
+    let json = parsed_json(world);
+    assert_eq!(json["amdkfd_loaded"], serde_json::json!(false), "{json:#}");
+}
+
+/// A simulated host root with `/sys/bus/pci/drivers/amdgpu` and a `lsmod` that lists
+/// neither `amdgpu` nor `amdkfd`: amdgpu built into the kernel. A ROCm install
+/// (`ROCM_PATH`) and a `mokutil` reporting Secure Boot enabled are planted too,
+/// so the three `rocm diagnose` evidence lines that read `amdgpu_loaded` have
+/// everything else they need to fire.
+#[given("a machine whose kernel has amdgpu built in and lists no amdgpu module")]
+async fn machine_with_built_in_amdgpu(world: &mut E2eWorld) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .to_owned();
+    let host = root.join("host-root");
+    std::fs::create_dir_all(host.join("sys/bus/pci/drivers/amdgpu"))
+        .expect("failed to plant /sys/bus/pci/drivers/amdgpu");
+    let rocm = root.join("rocm");
+    std::fs::create_dir_all(rocm.join(".info")).expect("failed to plant a ROCm install");
+    std::fs::write(rocm.join(".info/version"), "6.4.1\n").expect("failed to plant its version");
+    put_fake_executables_on_path(
+        world,
+        &[
+            (
+                "lsmod",
+                "#!/bin/sh\nprintf 'Module Size Used by\\ndrm 1 0\\n'\n",
+            ),
+            ("mokutil", "#!/bin/sh\necho 'SecureBoot enabled'\n"),
+        ],
+    );
+    world.command_env.push(("ROCM_PATH", rocm.into_os_string()));
+    world
+        .command_env
+        .push(("ROCM_CLI_TEST_HOST_ROOT", host.into_os_string()));
+}
+
+/// Both commands read the same planted machine, so the scenario environment is
+/// restored between them: `run_rocm_with_scenario_env` consumes it.
+#[when("the user inspects and diagnoses that machine")]
+async fn user_inspects_and_diagnoses_planted_machine(world: &mut E2eWorld) {
+    let env = world.command_env.clone();
+    let (stdout, stderr, rc) =
+        crate::run_rocm_with_scenario_env(world, &["examine", "--framework", "skip", "--json"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+    world.command_env = env;
+    let (diagnosis, _, diagnose_rc) =
+        crate::run_rocm_with_scenario_env(world, &["diagnose", "--json"]);
+    assert_eq!(diagnose_rc, 0, "diagnose is a query and exits 0");
+    world.cli_outputs = Some(vec![diagnosis]);
+}
+
+#[then("the inspection reports amdgpu as loaded")]
+async fn assert_amdgpu_loaded(world: &mut E2eWorld) {
+    let json = parsed_json(world);
+    assert_eq!(json["amdgpu_loaded"], serde_json::json!(true), "{json:#}");
+}
+
+#[then("the diagnosis cites no missing amdgpu module, DKMS failure or Secure Boot evidence")]
+async fn assert_no_amdgpu_fault_evidence(world: &mut E2eWorld) {
+    let diagnosis = &world.cli_outputs.as_ref().expect("no diagnosis was run")[0];
+    let report: serde_json::Value = serde_json::from_str(diagnosis)
+        .unwrap_or_else(|e| panic!("diagnose --json is not JSON ({e}):\n{diagnosis}"));
+    let evidence: Vec<&str> = report["matched"]
+        .as_array()
+        .unwrap_or_else(|| panic!("diagnose --json has no matched array:\n{report:#}"))
+        .iter()
+        .flat_map(|m| m["evidence"].as_array().into_iter().flatten())
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    // One phrase per evidence line that `amdgpu_loaded == Some(false)` produces in
+    // diagnose.rs, each copied verbatim from that check so it keeps guarding it.
+    let amdgpu_missing_evidence = [
+        // check_3_rocm_kernel_unsupported
+        "the amdgpu kernel module is not loaded",
+        // check_5_amdgpu_blacklisted
+        "amdgpu module is not loaded",
+        "Secure Boot is enabled and amdgpu didn't load",
+    ];
+    for line in evidence {
+        assert!(
+            !amdgpu_missing_evidence.iter().any(|p| line.contains(p)),
+            "amdgpu was reported missing though the amdgpu PCI driver is registered: {line}"
+        );
+    }
 }
 
 #[when("the user inspects that machine in machine-readable form")]
