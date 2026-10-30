@@ -1380,7 +1380,7 @@ async fn assert_stopped_server_stops_answering(world: &mut E2eWorld) {
     // A signalled server can take a moment to release its port, so the answer is
     // given a bounded window to stop. A server that is still listening at the end
     // of it was not stopped, whatever the CLI reported.
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_mins(1);
     loop {
         if reqwest::get(&url).await.is_err() {
             return;
