@@ -310,6 +310,20 @@ fn collect_process_tree(root: u32) -> Vec<u32> {
         }
     }
 
+    walk_process_tree(root, &children)
+}
+
+/// Walk `root` plus its transitive descendants over an already-built
+/// parent→children table.
+///
+/// `root` comes first, every other PID comes after its parent, and no PID is
+/// listed twice, so a cycle in the table ends the walk instead of looping it.
+///
+/// Split out of [`collect_process_tree`] so the traversal — the part that
+/// decides which PIDs get signalled — can be exercised against a synthetic
+/// table (cycles, self-parents, shared parents) without touching `/proc`.
+#[cfg(not(windows))]
+fn walk_process_tree(root: u32, children: &std::collections::HashMap<u32, Vec<u32>>) -> Vec<u32> {
     let mut order = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let mut stack = vec![root];
@@ -1014,6 +1028,12 @@ fn assemble_output(
 
     Ok(output)
 }
+
+/// Property tests for [`walk_process_tree`]; a child module so it can reach
+/// the walk while it stays private.
+#[cfg(all(test, not(windows)))]
+#[path = "process_tree_properties.rs"]
+mod tree_properties;
 
 #[cfg(test)]
 mod tests {
