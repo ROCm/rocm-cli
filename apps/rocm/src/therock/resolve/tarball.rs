@@ -18,8 +18,10 @@ use super::super::fetch::download_text_cached;
 use super::super::platform_tarball_token;
 use super::super::source::{
     RuntimeVersionSelector, SourceLayout, TheRockChannel, resolve_source, select_source_layout,
+    selector_is_release_line,
 };
 use super::super::version::{compare_version_strings, is_stable_runtime_version};
+use super::wheel::next_layout_unsatisfied_hint;
 use anyhow::{Context, Result, bail};
 use rocm_core::AppPaths;
 use serde::Deserialize;
@@ -102,15 +104,12 @@ pub(in crate::therock) fn resolve_tarball_artifact_with_timeout(
         version_selector,
     )
     .with_context(|| {
-        format!(
-            "canonical TheRock {} tarball stream is incomplete for the resolved GPU family\n\n{}",
-            channel.as_str(),
-            family_resolution_hint(
-                &family_resolution.source,
-                &family_resolution.family,
-                channel,
-                "tarball",
-            )
+        tarball_resolution_failure_context(
+            channel,
+            layout,
+            &family_resolution.source,
+            &family_resolution.family,
+            version_selector,
         )
     })?;
     Ok(TarballArtifact {
@@ -182,14 +181,48 @@ fn select_tarball_candidate(
             Some((file.clone(), version))
         })
         .collect::<Vec<_>>();
+    // An unpinned catalog pick is "newest upload". A major.minor line pin is
+    // "newest stable release in that line", even when an older patch was
+    // uploaded later. Exact pins match one archive, so the order does not
+    // change which file they select.
+    let prefer_newest_line_release = version_selector.is_some_and(selector_is_release_line);
     candidates.sort_by(|left, right| {
-        left.0
+        let by_mtime = left
+            .0
             .mtime
             .partial_cmp(&right.0.mtime)
-            .unwrap_or(Ordering::Equal)
-            .then_with(|| compare_version_strings(&left.1, &right.1))
+            .unwrap_or(Ordering::Equal);
+        let by_version = compare_version_strings(&left.1, &right.1);
+        if prefer_newest_line_release {
+            by_version.then(by_mtime)
+        } else {
+            by_mtime.then(by_version)
+        }
     });
     candidates.pop()
+}
+
+fn tarball_resolution_failure_context(
+    channel: TheRockChannel,
+    layout: SourceLayout,
+    family_source: &str,
+    family: &str,
+    version_selector: Option<&RuntimeVersionSelector>,
+) -> String {
+    let (stream, hint) = match layout {
+        SourceLayout::Next => (
+            "next-layout",
+            next_layout_unsatisfied_hint(version_selector),
+        ),
+        SourceLayout::Canonical => (
+            "canonical",
+            family_resolution_hint(family_source, family, channel, "tarball"),
+        ),
+    };
+    format!(
+        "{stream} TheRock {} tarball stream is incomplete for the resolved GPU family\n\n{hint}",
+        channel.as_str()
+    )
 }
 
 fn parse_tarball_index_html(html: &str) -> Result<Vec<TarballIndexFile>> {
@@ -435,6 +468,58 @@ mod tests {
             )
             .map(|(_, version)| version),
             Some("10.1.0a20260822".to_owned())
+        );
+    }
+
+    #[test]
+    fn release_line_pin_prefers_the_newest_stable_tarball_in_the_line() {
+        let platform = platform_tarball_token();
+        let files = vec![
+            TarballIndexFile {
+                name: format!("therock-dist-{platform}-gfx120X-all-10.1.0.tar.gz"),
+                mtime: 5.0,
+            },
+            TarballIndexFile {
+                name: format!("therock-dist-{platform}-gfx120X-all-10.1.2.tar.gz"),
+                mtime: 1.0,
+            },
+            TarballIndexFile {
+                name: format!("therock-dist-{platform}-gfx120X-all-10.1.0a20260822.tar.gz"),
+                mtime: 9.0,
+            },
+            TarballIndexFile {
+                name: format!("therock-dist-{platform}-gfx120X-all-10.0.0.tar.gz"),
+                mtime: 8.0,
+            },
+            TarballIndexFile {
+                name: format!("therock-dist-{platform}-gfx120X-all-tests-10.1.3.tar.gz"),
+                mtime: 9.0,
+            },
+        ];
+        let line = RuntimeVersionSelector::version("10.1").unwrap();
+        assert_eq!(
+            select_tarball_candidate(
+                &files,
+                TheRockChannel::Release,
+                SourceLayout::Next,
+                "gfx120X-all",
+                Some(&line),
+            )
+            .map(|(_, version)| version),
+            Some("10.1.2".to_owned())
+        );
+
+        let exact = RuntimeVersionSelector::version("10.1.0").unwrap();
+        assert_eq!(
+            select_tarball_candidate(
+                &files,
+                TheRockChannel::Release,
+                SourceLayout::Next,
+                "gfx120X-all",
+                Some(&exact),
+            )
+            .map(|(_, version)| version),
+            Some("10.1.0".to_owned())
         );
     }
 }

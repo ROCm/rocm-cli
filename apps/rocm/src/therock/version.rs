@@ -70,7 +70,10 @@ pub(super) enum VersionStage {
 /// Total order over published version strings — the total order used for
 /// sorting candidates in the `therock` module's "which build does the user get?"
 /// decisions. It is not always the first key: `select_tarball_candidate` (in
-/// `resolve/tarball.rs`) orders by upload time first and uses this only to break ties.
+/// `resolve/tarball.rs`) orders an unpinned catalog by upload time first and
+/// uses this only to break ties. A `major.minor` line pin orders by this key
+/// first, so the newest stable release in the line wins even when an older
+/// patch was uploaded later.
 ///
 /// Ordering is PEP 440's, because these strings come from a Python simple
 /// index: within one release `7.0.0.dev1` < `7.0.0a1` < `7.0.0b1` <
@@ -246,6 +249,47 @@ pub(super) fn parse_version_for_ordering(value: &str) -> Option<VersionOrderKey>
         stage,
         stage_number,
     })
+}
+
+/// Whether a requested version string selects the published `version`.
+///
+/// A stable two-component pin (`10.1`) selects every stable release in that
+/// major.minor line. Callers that want one of them take the newest. A
+/// three-component pin, including a prerelease suffix, stays an exact string
+/// match: `10.1.0` does not select `10.1.1`, and `10.1.0a20260822` is not the
+/// `10.1` line.
+pub(super) fn version_request_matches(requested: &str, published: &str) -> bool {
+    if let Some((major, minor)) = stable_release_line_pin(requested) {
+        return published_in_stable_line(published, major, minor);
+    }
+    published == requested
+}
+
+/// A stable `major.minor` pin: two numeric components and nothing after them.
+///
+/// `10.1` names the 10.1 line. `10.1.0` is an exact pin. `10.1.0a20260822` is
+/// a prerelease, so it is not this shape and a line pin's parser cannot
+/// retarget it onto the next layout.
+pub(super) fn stable_release_line_pin(value: &str) -> Option<(u32, u32)> {
+    let (major, rest) = split_u32_prefix(value)?;
+    let rest = rest.strip_prefix('.')?;
+    let (minor, rest) = split_u32_prefix(rest)?;
+    rest.is_empty().then_some((major, minor))
+}
+
+fn split_u32_prefix(value: &str) -> Option<(u32, &str)> {
+    let (number, rest) = split_leading_number(value)?;
+    Some((u32::try_from(number).ok()?, rest))
+}
+
+/// Whether `published` is a stable release of the `major.minor` line.
+fn published_in_stable_line(published: &str, major: u32, minor: u32) -> bool {
+    if let Some(parsed) = parse_version(published) {
+        return parsed.stage == VersionStage::Stable
+            && parsed.major == major
+            && parsed.minor == minor;
+    }
+    stable_release_line_pin(published) == Some((major, minor))
 }
 
 /// Split a leading run of ASCII digits off `value`, returning it and the rest.
