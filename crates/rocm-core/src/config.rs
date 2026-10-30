@@ -691,9 +691,8 @@ impl RocmCliConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{
-        assert_write_spares_foreign_temp_files, retired_temp_path, temp_app_paths,
-    };
+    use crate::foreign_temp_probe::assert_write_spares_foreign_temp_files;
+    use crate::test_support::{retired_temp_path, temp_app_paths};
 
     // The socket-path precedence is mirrored in `rocm-dash-core`; these tests
     // mirror the ones there so a divergence in either crate is caught.

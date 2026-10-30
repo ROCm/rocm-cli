@@ -48,6 +48,8 @@ pub mod service_record;
 pub mod terminal;
 pub mod user_path;
 
+#[cfg(any(test, feature = "test-support"))]
+pub mod foreign_temp_probe;
 #[cfg(test)]
 mod test_env;
 #[cfg(test)]

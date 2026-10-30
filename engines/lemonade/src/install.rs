@@ -1161,9 +1161,8 @@ fn copy_tree_entries(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{
-        assert_write_spares_foreign_temp_files, retired_pin_temp_path, scratch_dir,
-    };
+    use crate::test_support::{retired_pin_temp_path, scratch_dir};
+    use rocm_core::foreign_temp_probe::assert_write_spares_foreign_temp_files;
     use std::io::Write;
     use std::process::{Command as ProcessCommand, Stdio};
     use std::time::Duration;

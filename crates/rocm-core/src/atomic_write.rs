@@ -2,7 +2,8 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Atomic file replacement, shared by `rocm` and `rocmd`.
+//! Atomic file replacement, shared by the `rocm` and `rocmd` apps, `rocm-core`'s
+//! own config, automation and service-record writers, and the Lemonade engine.
 //!
 //! [`write_file_atomically`] stages the bytes in a fresh sibling temp file and
 //! then publishes it over the destination in one step, so a reader sees either

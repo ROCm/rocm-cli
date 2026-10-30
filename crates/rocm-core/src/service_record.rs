@@ -396,10 +396,8 @@ impl ManagedServiceRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{
-        assert_write_spares_foreign_temp_files, probe_test_record, retired_temp_path,
-        temp_app_paths,
-    };
+    use crate::foreign_temp_probe::assert_write_spares_foreign_temp_files;
+    use crate::test_support::{probe_test_record, retired_temp_path, temp_app_paths};
 
     #[test]
     fn restarting_drops_the_previous_runs_inference_verification() {

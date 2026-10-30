@@ -38,5 +38,6 @@ ureq = { version = "2.12", features = ["json", "native-certs"] }
 zip = { version = "8.6", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
+rocm-core = { path = "../../crates/rocm-core", features = ["test-support"] }
 # Archive-extraction property tests; see `crates/rocm-core/src/archive_props.rs`.
 proptest = { version = "1", default-features = false, features = ["std"] }
