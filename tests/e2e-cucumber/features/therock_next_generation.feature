@@ -251,3 +251,25 @@ Feature: TheRock "next" ROCm 10 install layout
     When the user installs a wheel SDK for arch gfx1200 pinned to ROCm 10.0.0 without confirming
     Then the install is refused without replacing the active default runtime
     And the install log notes that its torchaudio is the newest build for ROCm 10.0.0 and not hardware-verified
+
+  # `--version 10.1` is the 10.1 line, not a failed parse of `10.1.0` and not
+  # an exact pin. The fixture publishes 10.0.0 and 10.1.0; the line pin must
+  # take 10.1.0 from the next index and must not stay on the canonical 7.x index.
+  @id:therock-next-15-two-component-line-pin
+  Scenario: therock-next-15 - A ROCm 10.1 line pin installs the newest stable build in that line
+    Given a ROCm 10 pip index fixture that also publishes a newer ROCm 10 build
+    When the user previews a wheel SDK install for arch gfx1200 pinned to ROCm 10.1
+    Then the preview resolves the ROCm 10 pip index for ROCm 10.1.0
+    And the preview reports the next source layout generation
+    And the preview installs the hardware-verified torchaudio for ROCm 10.1.0, not the newer rebuild
+
+  # The same pin against a next index that only publishes 10.0.0 cannot be
+  # satisfied. The refusal must name the next layout, a full version, and an
+  # exact arch. It must not offer `--channel nightly`: that channel refuses
+  # ROCm 10 and the suggestion cannot succeed.
+  @id:therock-next-16-unsatisfied-line-pin-skips-nightly
+  Scenario: therock-next-16 - An unsatisfied ROCm 10.1 line pin does not suggest the nightly channel
+    Given a canonical release pip index fixture and a ROCm 10 pip index fixture
+    When the user tries to preview a wheel SDK install for arch gfx1200 pinned to ROCm 10.1
+    Then the install fails
+    And the failure names the ROCm 10 next layout and a full version, without suggesting nightly

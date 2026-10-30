@@ -784,7 +784,11 @@ rocm install sdk --devel")]
         /// Full folder path where the ROCm Python environment should be created.
         #[arg(long)]
         prefix: Option<std::path::PathBuf>,
-        /// Exact TheRock package version to install.
+        /// TheRock package version to install.
+        ///
+        /// `major.minor.patch` is exact, including a prerelease suffix.
+        /// `major.minor` (for example `10.1`) selects the newest stable
+        /// release in that line.
         #[arg(long, conflicts_with = "build_date")]
         version: Option<String>,
         /// Pick the TheRock package built on this date.
