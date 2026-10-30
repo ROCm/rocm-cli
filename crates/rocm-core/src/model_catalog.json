@@ -584,7 +584,8 @@
       "manual_alternatives": [],
       "chat_template_mode": "auto",
       "preferred_engines": [
-        "aim"
+        "aim",
+        "vllm"
       ],
       "warnings": [
         "Radeon-targeted AIM image (W7900 / R9700 profiles only); requires Docker"
@@ -630,7 +631,8 @@
       "manual_alternatives": [],
       "chat_template_mode": "auto",
       "preferred_engines": [
-        "aim"
+        "aim",
+        "vllm"
       ],
       "warnings": [
         "AIM image from the AMD Enterprise AI catalog; requires Docker"
@@ -674,7 +676,8 @@
       "manual_alternatives": [],
       "chat_template_mode": "auto",
       "preferred_engines": [
-        "aim"
+        "aim",
+        "vllm"
       ],
       "warnings": [
         "AIM image from the AMD Enterprise AI catalog; requires Docker"
@@ -718,7 +721,8 @@
       "manual_alternatives": [],
       "chat_template_mode": "auto",
       "preferred_engines": [
-        "aim"
+        "aim",
+        "vllm"
       ],
       "warnings": [
         "AIM image from the AMD Enterprise AI catalog; requires Docker"
@@ -762,7 +766,8 @@
       "manual_alternatives": [],
       "chat_template_mode": "auto",
       "preferred_engines": [
-        "aim"
+        "aim",
+        "vllm"
       ],
       "warnings": [
         "AIM image from the AMD Enterprise AI catalog; requires Docker"
@@ -806,7 +811,8 @@
       "manual_alternatives": [],
       "chat_template_mode": "auto",
       "preferred_engines": [
-        "aim"
+        "aim",
+        "vllm"
       ],
       "warnings": [
         "AIM image from the AMD Enterprise AI catalog; requires Docker"
@@ -849,7 +855,8 @@
       "manual_alternatives": [],
       "chat_template_mode": "auto",
       "preferred_engines": [
-        "aim"
+        "aim",
+        "vllm"
       ],
       "warnings": [
         "AIM image from the AMD Enterprise AI catalog; requires Docker"
@@ -894,7 +901,8 @@
       "manual_alternatives": [],
       "chat_template_mode": "auto",
       "preferred_engines": [
-        "aim"
+        "aim",
+        "vllm"
       ],
       "warnings": [
         "AIM image from the AMD Enterprise AI catalog; requires Docker"
@@ -939,7 +947,8 @@
       "manual_alternatives": [],
       "chat_template_mode": "auto",
       "preferred_engines": [
-        "aim"
+        "aim",
+        "vllm"
       ],
       "warnings": [
         "AIM image from the AMD Enterprise AI catalog; requires Docker"
@@ -984,7 +993,8 @@
       "manual_alternatives": [],
       "chat_template_mode": "auto",
       "preferred_engines": [
-        "aim"
+        "aim",
+        "vllm"
       ],
       "warnings": [
         "AIM image from the AMD Enterprise AI catalog; requires Docker"
@@ -1030,7 +1040,8 @@
       "manual_alternatives": [],
       "chat_template_mode": "auto",
       "preferred_engines": [
-        "aim"
+        "aim",
+        "vllm"
       ],
       "warnings": [
         "AIM image from the AMD Enterprise AI catalog; requires Docker"
@@ -1077,7 +1088,8 @@
       "manual_alternatives": [],
       "chat_template_mode": "auto",
       "preferred_engines": [
-        "aim"
+        "aim",
+        "vllm"
       ],
       "warnings": [
         "AIM image from the AMD Enterprise AI catalog; requires Docker"
@@ -1122,7 +1134,8 @@
       "manual_alternatives": [],
       "chat_template_mode": "auto",
       "preferred_engines": [
-        "aim"
+        "aim",
+        "vllm"
       ],
       "warnings": [
         "AIM image from the AMD Enterprise AI catalog; requires Docker"
@@ -1167,7 +1180,8 @@
       "manual_alternatives": [],
       "chat_template_mode": "auto",
       "preferred_engines": [
-        "aim"
+        "aim",
+        "vllm"
       ],
       "warnings": [
         "AIM image from the AMD Enterprise AI catalog; requires Docker"
@@ -1211,7 +1225,8 @@
       "manual_alternatives": [],
       "chat_template_mode": "auto",
       "preferred_engines": [
-        "aim"
+        "aim",
+        "vllm"
       ],
       "warnings": [
         "AIM image from the AMD Enterprise AI catalog; requires Docker"
@@ -1254,7 +1269,8 @@
       "manual_alternatives": [],
       "chat_template_mode": "auto",
       "preferred_engines": [
-        "aim"
+        "aim",
+        "vllm"
       ],
       "warnings": [
         "AIM image from the AMD Enterprise AI catalog; requires Docker"
@@ -1297,7 +1313,8 @@
       "manual_alternatives": [],
       "chat_template_mode": "auto",
       "preferred_engines": [
-        "aim"
+        "aim",
+        "vllm"
       ],
       "warnings": [
         "AIM image from the AMD Enterprise AI catalog; requires Docker"
@@ -1340,7 +1357,8 @@
       "manual_alternatives": [],
       "chat_template_mode": "auto",
       "preferred_engines": [
-        "aim"
+        "aim",
+        "vllm"
       ],
       "warnings": [
         "AIM image from the AMD Enterprise AI catalog; requires Docker"
@@ -1384,7 +1402,8 @@
       "manual_alternatives": [],
       "chat_template_mode": "auto",
       "preferred_engines": [
-        "aim"
+        "aim",
+        "vllm"
       ],
       "warnings": [
         "AIM image from the AMD Enterprise AI catalog; requires Docker"
@@ -1427,7 +1446,8 @@
       "manual_alternatives": [],
       "chat_template_mode": "auto",
       "preferred_engines": [
-        "aim"
+        "aim",
+        "vllm"
       ],
       "warnings": [
         "AIM image from the AMD Enterprise AI catalog; requires Docker"
@@ -1470,7 +1490,8 @@
       "manual_alternatives": [],
       "chat_template_mode": "auto",
       "preferred_engines": [
-        "aim"
+        "aim",
+        "vllm"
       ],
       "warnings": [
         "AIM image from the AMD Enterprise AI catalog; requires Docker"
@@ -1514,7 +1535,8 @@
       "manual_alternatives": [],
       "chat_template_mode": "auto",
       "preferred_engines": [
-        "aim"
+        "aim",
+        "vllm"
       ],
       "warnings": [
         "AIM image from the AMD Enterprise AI catalog; requires Docker"
@@ -1557,7 +1579,8 @@
       "manual_alternatives": [],
       "chat_template_mode": "auto",
       "preferred_engines": [
-        "aim"
+        "aim",
+        "vllm"
       ],
       "warnings": [
         "AIM image from the AMD Enterprise AI catalog; requires Docker"
@@ -1575,7 +1598,6 @@
       "trust_remote_code": false,
       "dtype": "auto",
       "device_policy": "gpu_required",
-      "min_gpu_mem_gb": 281,
       "quantization": "none; served as-is by the AIM image's bundled vLLM",
       "artifact_hint": "AMD Enterprise AI (AIM) pre-built Docker image; pulled and run by the aim engine, not by Hugging Face resolution",
       "artifacts": [],
@@ -1601,7 +1623,8 @@
       "manual_alternatives": [],
       "chat_template_mode": "auto",
       "preferred_engines": [
-        "aim"
+        "aim",
+        "vllm"
       ],
       "warnings": [
         "AIM image from the AMD Enterprise AI catalog; requires Docker"
@@ -1619,7 +1642,6 @@
       "trust_remote_code": false,
       "dtype": "auto",
       "device_policy": "gpu_required",
-      "min_gpu_mem_gb": 51,
       "quantization": "none; served as-is by the AIM image's bundled vLLM",
       "artifact_hint": "AMD Enterprise AI (AIM) pre-built Docker image; pulled and run by the aim engine, not by Hugging Face resolution",
       "artifacts": [],
@@ -1644,7 +1666,8 @@
       "manual_alternatives": [],
       "chat_template_mode": "auto",
       "preferred_engines": [
-        "aim"
+        "aim",
+        "vllm"
       ],
       "warnings": [
         "AIM image from the AMD Enterprise AI catalog; requires Docker"
@@ -1688,7 +1711,8 @@
       "manual_alternatives": [],
       "chat_template_mode": "auto",
       "preferred_engines": [
-        "aim"
+        "aim",
+        "vllm"
       ],
       "warnings": [
         "AIM image from the AMD Enterprise AI catalog; requires Docker"
@@ -1731,7 +1755,8 @@
       "manual_alternatives": [],
       "chat_template_mode": "auto",
       "preferred_engines": [
-        "aim"
+        "aim",
+        "vllm"
       ],
       "warnings": [
         "AIM image from the AMD Enterprise AI catalog; requires Docker"
@@ -1774,7 +1799,8 @@
       "manual_alternatives": [],
       "chat_template_mode": "auto",
       "preferred_engines": [
-        "aim"
+        "aim",
+        "vllm"
       ],
       "warnings": [
         "AIM image from the AMD Enterprise AI catalog; requires Docker"
@@ -1818,7 +1844,8 @@
       "manual_alternatives": [],
       "chat_template_mode": "auto",
       "preferred_engines": [
-        "aim"
+        "aim",
+        "vllm"
       ],
       "warnings": [
         "AIM image from the AMD Enterprise AI catalog; requires Docker"
@@ -1862,7 +1889,8 @@
       "manual_alternatives": [],
       "chat_template_mode": "auto",
       "preferred_engines": [
-        "aim"
+        "aim",
+        "vllm"
       ],
       "warnings": [
         "AIM image from the AMD Enterprise AI catalog; requires Docker"
@@ -1909,7 +1937,8 @@
       "manual_alternatives": [],
       "chat_template_mode": "auto",
       "preferred_engines": [
-        "aim"
+        "aim",
+        "vllm"
       ],
       "warnings": [
         "AIM image from the AMD Enterprise AI catalog; requires Docker"
@@ -1956,7 +1985,8 @@
       "manual_alternatives": [],
       "chat_template_mode": "auto",
       "preferred_engines": [
-        "aim"
+        "aim",
+        "vllm"
       ],
       "warnings": [
         "AIM image from the AMD Enterprise AI catalog; requires Docker"
@@ -2001,7 +2031,8 @@
       "manual_alternatives": [],
       "chat_template_mode": "auto",
       "preferred_engines": [
-        "aim"
+        "aim",
+        "vllm"
       ],
       "warnings": [
         "AIM image from the AMD Enterprise AI catalog; requires Docker"
@@ -2048,7 +2079,8 @@
       "manual_alternatives": [],
       "chat_template_mode": "auto",
       "preferred_engines": [
-        "aim"
+        "aim",
+        "vllm"
       ],
       "warnings": [
         "AIM image from the AMD Enterprise AI catalog; requires Docker"
@@ -2066,7 +2098,7 @@
       "trust_remote_code": false,
       "dtype": "auto",
       "device_policy": "gpu_required",
-      "min_gpu_mem_gb": 426,
+      "min_gpu_mem_gb": 384,
       "quantization": "none; served as-is by the AIM image's bundled vLLM",
       "artifact_hint": "AMD Enterprise AI (AIM) pre-built Docker image; pulled and run by the aim engine, not by Hugging Face resolution",
       "artifacts": [],
@@ -2092,7 +2124,8 @@
       "manual_alternatives": [],
       "chat_template_mode": "auto",
       "preferred_engines": [
-        "aim"
+        "aim",
+        "vllm"
       ],
       "warnings": [
         "AIM image from the AMD Enterprise AI catalog; requires Docker"
@@ -2135,7 +2168,8 @@
       "manual_alternatives": [],
       "chat_template_mode": "auto",
       "preferred_engines": [
-        "aim"
+        "aim",
+        "vllm"
       ],
       "warnings": [
         "AIM image from the AMD Enterprise AI catalog; requires Docker"

@@ -179,7 +179,7 @@ pub fn model_recipe_staleness_warning(
     let age_ms = now_ms.checked_sub(engine_recipe.generated_at_unix_ms?)?;
     (age_ms > MODEL_RECIPE_STALE_AFTER_MS).then(|| {
         format!(
-            "{} entry was last verified {} days ago; the pinned image may no longer exist (see docs/aim-catalog.md to refresh)",
+            "{} entry was last verified {} days ago; the pinned image may no longer exist; update rocm-cli for a refreshed catalog",
             engine_recipe.engine,
             age_ms / (24 * 60 * 60 * 1000)
         )
@@ -842,7 +842,8 @@ fn validate_model_recipe_engine_record(
     {
         bail!(
             "engine recipe for `{}` on `{canonical_model_id}` sets supported_gfx_families, \
-             profile_ids, requires_hf_token or supported_boards, which only apply to aim",
+             profile_ids, min_gpu_counts, requires_hf_token or supported_boards, which only \
+             apply to aim",
             engine_recipe.engine
         );
     }
@@ -855,6 +856,11 @@ fn validate_model_recipe_engine_record(
         && engine_recipe.image_digest.is_none()
         && engine_recipe.extra_env.is_empty()
         && engine_recipe.supported_gfx_families.is_empty()
+        && engine_recipe.generated_at_unix_ms.is_none()
+        && engine_recipe.profile_ids.is_empty()
+        && !engine_recipe.requires_hf_token
+        && engine_recipe.supported_boards.is_empty()
+        && engine_recipe.min_gpu_counts.is_empty()
     {
         bail!(
             "engine recipe for `{}` on `{canonical_model_id}` must not be empty",
