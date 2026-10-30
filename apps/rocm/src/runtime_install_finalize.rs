@@ -6,8 +6,8 @@
 //! install, torch alignment, engine-dependency checks, and device checks.
 //!
 //! Mechanically relocated from `main.rs` with no behavior change. Called from
-//! `main.rs`'s `install()` (the SDK-install path) and from `engines_cmd.rs`
-//! (engine install). It calls into the sibling `runtimes_cmd.rs` for runtime
+//! `main.rs`'s `install()` (the SDK-install path), from `engines_cmd.rs`
+//! (engine install) and, for `real_os_release`, from `driver_install.rs`. It calls into the sibling `runtimes_cmd.rs` for runtime
 //! activation; `runtimes_cmd.rs` reaches back only from its own test module.
 //! `SdkInstallConsents` stays
 //! `pub(crate)` and is read from `install()`; several torch/dependency/device
