@@ -14,6 +14,10 @@
 //! update-07 and update-08 do plant managed runtimes, and serve the TheRock
 //! catalog they resolve against from a loopback server, so they stay off the
 //! network too.
+//!
+//! The flag-handling steps below are argument handling only: nothing there
+//! contacts a package index or changes the machine either, so they run on every
+//! lane too.
 
 use cucumber::{given, then, when};
 use e2e_cucumber::loopback_http::LoopbackServer;

@@ -95,15 +95,27 @@ async fn assert_prompt_marked(world: &mut E2eWorld) {
     let marker = format!("(rocm:{ENGINE})");
     // The marker must be on the rendered prompt line, which is what the user
     // actually sees — not merely somewhere in the informational block above it.
-    // That block names the marker too ("your prompt is now prefixed
-    // (rocm:vllm)") and is printed before bash starts, so waiting for the bare
-    // marker returns before any prompt exists; wait for the prompt line itself.
-    // `$` for a normal user's prompt, `#` for root's -- this suite runs as root
-    // on the WSL2 hardware lane, so both are genuine prompt lines.
+    //
+    // Waited for as ONE condition rather than two. Waiting for the marker alone
+    // and then reading the screen once is satisfied by the banner above the
+    // prompt ("your prompt is now prefixed (rocm:vllm)"), which the CLI prints
+    // before bash has painted anything — so the single read that follows lands
+    // in the gap between the two whenever the machine is busy, and reports a
+    // shell that simply had not reached its prompt yet as one whose prompt is
+    // unmarked. Waiting on the real condition removes the gap without weakening
+    // it: a shell that never marks its prompt still fails, at the timeout.
+    //
+    // Through `wait_for_screen_where` rather than a local poll loop, so a shell
+    // that dies or a pty reader that panics is reported as THAT, instead of
+    // running out the full timeout and blaming the prompt marker for a failure
+    // that happened earlier and elsewhere.
     session
         .wait_for_screen_where(
-            "the marker is on a prompt line",
+            &format!("{marker} appears on a prompt line"),
             |screen| {
+                // `$` for a normal user's prompt, `#` for root's -- the suite
+                // runs as root on the WSL2 hardware lane, so both are genuine
+                // prompt lines.
                 screen
                     .lines()
                     .filter(|line| line.contains(&marker))
@@ -112,7 +124,7 @@ async fn assert_prompt_marked(world: &mut E2eWorld) {
             SCREEN_TIMEOUT,
         )
         .await
-        .unwrap_or_else(|e| panic!("the marker never reached a prompt line: {e}"));
+        .unwrap_or_else(|e| panic!("the engine shell's prompt was never marked: {e}"));
 }
 
 #[then("the engine environment's interpreter is the one that runs")]

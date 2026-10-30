@@ -4,6 +4,8 @@
 
 pub mod capability;
 pub mod chat_request;
+#[cfg(test)]
+mod diagnostic_wording;
 pub mod expectation;
 pub mod fixture_binary;
 pub mod harness_diagnostics;
