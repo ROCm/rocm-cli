@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail};
 use rocm_core::{
     AppPaths, AutomationProposalRecord, AutomationRuntimeState, AutomationTriggerEvent,
     CodexBridgeGpuSnapshot, ManagedServiceRecord, RocmCliConfig, WatcherMode,
-    WatcherRuntimeSnapshot, append_automation_proposal, builtin_watchers,
+    WatcherRuntimeSnapshot, append_automation_proposal, builtin_watchers, process_is_running,
     resolve_model_recipe_artifact, unix_time_millis,
 };
 use serde_json::Value;
@@ -1421,6 +1421,12 @@ pub(crate) fn find_recoverable_service(
                 &record.engine,
                 &record.service_id,
             ) else {
+                // A live process that has not opened its port is still the
+                // interactive serve wait's job. Restarting it here kills a
+                // download the CLI is reporting. A dead pid is not spared.
+                if record.status == "running" && live_startup_still_in_progress(&record, now) {
+                    continue;
+                }
                 if let Some(reason) = endpoint_service_recovery_reason(&record) {
                     return Ok(Some((record, reason)));
                 }
@@ -1433,6 +1439,9 @@ pub(crate) fn find_recoverable_service(
                 )));
             }
             if let Some(reason) = endpoint_service_recovery_reason(&record) {
+                if record.status == "running" && live_startup_still_in_progress(&record, now) {
+                    continue;
+                }
                 return Ok(Some((record, reason)));
             }
         }
@@ -1452,6 +1461,26 @@ pub(crate) fn find_recoverable_service(
 /// stop apart from a crash; a confirmed stop, and any fresh launch, clear it.
 pub(crate) const fn stop_requested(record: &ManagedServiceRecord) -> bool {
     record.stop_requested_unix_ms.is_some()
+}
+
+/// A recorded process is alive and the service is younger than
+/// [`rocm_core::SERVE_STARTUP_DEADLINE`].
+///
+/// That is the window interactive `rocm serve` spends following a download
+/// or load before the port accepts connections. Endpoint-unreachable
+/// recovery during it restarts the process out from under that wait.
+fn live_startup_still_in_progress(record: &ManagedServiceRecord, now_unix_ms: u128) -> bool {
+    let started_at = record
+        .last_restart_unix_ms
+        .unwrap_or(record.created_at_unix_ms);
+    let age_ms = now_unix_ms.saturating_sub(started_at);
+    if age_ms >= rocm_core::SERVE_STARTUP_DEADLINE.as_millis() {
+        return false;
+    }
+    [Some(record.supervisor_pid), record.engine_pid]
+        .into_iter()
+        .flatten()
+        .any(|pid| pid != 0 && process_is_running(pid))
 }
 
 fn endpoint_service_recovery_reason(record: &ManagedServiceRecord) -> Option<String> {
@@ -3180,6 +3209,75 @@ mod tests {
         fs::remove_dir_all(root).ok();
         assert_eq!(found.0.service_id, "svc-starting");
         assert_eq!(found.1, "manifest_status_starting_stale");
+        Ok(())
+    }
+
+    /// A live process that has not opened its port yet is the interactive
+    /// `rocm serve` wait, not a crash. Endpoint recovery must leave it alone
+    /// until [`rocm_core::SERVE_STARTUP_DEADLINE`]. A dead pid at the same age
+    /// is still recovered: the guard is the live process, not the clock alone.
+    #[test]
+    fn recovery_leaves_a_live_startup_alone_and_still_restarts_a_dead_one() -> Result<()> {
+        let (root, paths) = temp_app_paths("recover-live-startup");
+        paths.ensure()?;
+
+        let mut live = ManagedServiceRecord::new(
+            &paths,
+            "svc-live-startup",
+            "vllm",
+            "qwen",
+            "Qwen/Qwen3.5",
+            "127.0.0.1",
+            11461,
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            None,
+        );
+        live.status = "running".to_owned();
+        let now = unix_time_millis();
+        let deadline_ms = rocm_core::SERVE_STARTUP_DEADLINE.as_millis();
+        // Two seconds inside the bound, so the check below cannot cross it.
+        // A shorter window than the shared deadline would recover this.
+        live.created_at_unix_ms = now.saturating_sub(deadline_ms.saturating_sub(2_000));
+        live.write()?;
+
+        let found_inside = find_recoverable_service(&paths)?;
+
+        live.supervisor_pid = u32::MAX;
+        live.engine_pid = None;
+        live.write()?;
+        let found_dead = find_recoverable_service(&paths)?;
+
+        live.supervisor_pid = std::process::id();
+        // Age equal to the deadline is no longer the interactive wait.
+        // A longer window than the shared deadline would spare this.
+        live.created_at_unix_ms = now.saturating_sub(deadline_ms);
+        live.write()?;
+        let found_at_deadline = find_recoverable_service(&paths)?;
+        fs::remove_dir_all(root).ok();
+
+        assert!(
+            found_inside.is_none(),
+            "a live process inside the startup deadline must not be restarted: {found_inside:?}"
+        );
+        assert_eq!(
+            found_dead.map(|(record, reason)| (record.service_id, reason)),
+            Some((
+                "svc-live-startup".to_owned(),
+                "endpoint_status_unreachable".to_owned()
+            )),
+            "a dead pid is not a startup still in progress"
+        );
+        assert_eq!(
+            found_at_deadline.map(|(record, reason)| (record.service_id, reason)),
+            Some((
+                "svc-live-startup".to_owned(),
+                "endpoint_status_unreachable".to_owned()
+            )),
+            "at the startup deadline a live process with a closed port is recoverable"
+        );
         Ok(())
     }
 

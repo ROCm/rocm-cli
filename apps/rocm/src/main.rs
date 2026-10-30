@@ -39,6 +39,7 @@ mod runtime_install_finalize;
 mod runtime_services;
 mod runtimes_cmd;
 mod serve_cmd;
+mod serve_progress;
 mod serve_summary;
 mod service_hints;
 mod service_launch;
@@ -500,8 +501,12 @@ rocm model --verbose"
     /// Start a local OpenAI-compatible model server.
     ///
     /// Picks an engine and ROCm runtime automatically unless overridden. By default the
-    /// server runs as a managed background service and prints a deployment summary
-    /// (status, endpoint, model, and smoke-test metrics); use --verbose to stream engine
+    /// server runs as a managed background service. While it starts, the status line
+    /// follows what the engine is doing (download, load, or the latest log line) until
+    /// the server is ready or that wait fails. A ready server then prints a deployment
+    /// summary (status, endpoint, model, and smoke-test metrics). A wait that fails
+    /// while the server is still running names `rocm logs` and `rocm services stop`
+    /// instead of a finished "not ready" summary. Use --verbose to stream engine
     /// logs in this terminal instead. When streaming, press Ctrl-D to detach and leave the
     /// server running, or Ctrl-C to stop it. Inspect or stop servers later with
     /// `rocm services`.

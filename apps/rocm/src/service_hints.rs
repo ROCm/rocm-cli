@@ -24,6 +24,15 @@ pub(crate) fn service_stop_hint(service_id: &str) -> String {
     service_action_hint("stop", service_id)
 }
 
+/// The directly-runnable `rocm logs --service <id>` hint.
+///
+/// `rocm logs --service` prints `services_text::render_service_logs_text` for
+/// that service. Shared so a startup failure and the deployment summary cannot
+/// name two different log commands.
+pub(crate) fn service_logs_hint(service_id: &str) -> String {
+    format!("rocm logs --service {service_id}")
+}
+
 /// The directly-runnable `<remote_cli> services stop <id> --yes` hint for a
 /// service on a remote machine, where `remote_cli` is that machine's own
 /// `rocm` binary name (not necessarily `"rocm"` — it is whatever the remote

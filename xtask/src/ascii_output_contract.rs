@@ -188,8 +188,13 @@ mod tests {
             SPINNER_LABEL,
         ),
         (
-            "apps/rocm/src/serve_cmd.rs",
-            "Starting {model} on {selected_engine}…",
+            "apps/rocm/src/serve_progress.rs",
+            "Starting {model} on {engine}…",
+            SPINNER_LABEL,
+        ),
+        (
+            "apps/rocm/src/serve_progress.rs",
+            "Waiting for {model} to serve…",
             SPINNER_LABEL,
         ),
         (
