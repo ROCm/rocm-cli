@@ -254,9 +254,12 @@ legacy install.
 
 ROCm CLI supports ROCm 7.14, 10.0, and 10.1. Without `--version`,
 `rocm install sdk` currently installs ROCm 7.14. To install ROCm 10.0 or 10.1,
-add `--version`. If ROCm CLI can't tell which exact GPU arch this computer has,
-or you want a different one, also add `--family` with the raw `gfx` code from
-`rocm examine`. For example: `--version 10.1.0 --family gfx1200`.
+add `--version`. A `major.minor` pin such as `--version 10.1` selects the
+newest stable release in that line (for example `10.1.0`). A
+`major.minor.patch` pin such as `--version 10.1.0` stays exact. If ROCm CLI
+can't tell which exact GPU arch this computer has, or you want a different
+one, also add `--family` with the raw `gfx` code from `rocm examine`. For
+example: `--version 10.1.0 --family gfx1200`.
 
 Running `rocm install sdk` when a managed runtime is already the active default
 asks first, because the new install takes over as the active default; see
@@ -439,7 +442,7 @@ hardware, not something an install or a setting can put right.
 
 ```
 rocm install sdk    [--channel release|nightly] [--format wheel|tarball]
-                    [--version x.y.z | --build-date YYYY-MM-DD]
+                    [--version x.y[.z] | --build-date YYYY-MM-DD]
                     [--family gfx110X-all] [--prefix PATH] [--devel] [--dry-run]
                     [--approve-replacing-active-default] [--yes]
 
@@ -527,9 +530,11 @@ active default runtime, not about what a named prefix loses.
 #### ROCm 10 and newer
 
 ROCm 10 and newer ship from a different source layout. You opt in by pinning the
-version with `--version`. These versions select their device payload by exact
-GPU arch, so when ROCm CLI can't resolve one for this computer (it detects only
-a family of GPUs, or none), or you want to target a different GPU, also pass
+version with `--version`. A two-component pin (`--version 10.1`) is the 10.1
+line and installs the newest stable release in it; `--version 10.1.0` installs
+that exact release. These versions select their device payload by exact GPU
+arch, so when ROCm CLI can't resolve one for this computer (it detects only a
+family of GPUs, or none), or you want to target a different GPU, also pass
 `--family` with the raw `gfx` code instead of a family label:
 
 ```
