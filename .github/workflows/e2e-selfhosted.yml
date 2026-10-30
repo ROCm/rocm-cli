@@ -564,8 +564,8 @@ jobs:
           path: tests/e2e-cucumber/results/
 
   # First real Windows GPU coverage: the Strix Halo Windows 11 runner. The
-  # existing windows-build-and-test uses GitHub-hosted windows-latest, which has
-  # no GPU. Non-blocking so it never gates the PR.
+  # existing windows-debug/windows-release jobs use GitHub-hosted windows-latest,
+  # which has no GPU. Non-blocking so it never gates the PR.
   e2e-gpu-strix-windows:
     name: E2E tests (Strix Halo, Windows, ${{ matrix.sdk_version }})
     # 45min: see e2e-gpu — one collapsed job runs all serves + per-scenario

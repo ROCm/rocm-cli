@@ -31,10 +31,10 @@ on:
         # platform runs one job covering everything applicable to it.
       # Opt a dispatch into building the same downloadable Linux + Windows PR
       # bundles a pull_request push produces (see pr-linux-binaries and the PR
-      # bundle steps on windows-build-and-test), without needing an open PR.
-      # On the Windows job this also runs the full 45min build/test/lifecycle
+      # bundle steps on windows-release), without needing an open PR.
+      # On the Windows jobs this also runs the full build/test/lifecycle
       # suite, not just the packaging steps -- `heavy` is forced true on any
-      # dispatch, so every heavy-gated step in that job runs, same as it would
+      # dispatch, so every heavy-gated step in those jobs runs, same as it would
       # on a PR push.
       build_binaries:
         description: "Also build downloadable PR-style binaries (Linux + Windows)"
@@ -101,6 +101,11 @@ jobs:
       tpn: ${{ steps.filter.outputs.tpn || steps.all.outputs.forced }}
       docs: ${{ steps.filter.outputs.docs || steps.all.outputs.forced }}
       skills: ${{ steps.filter.outputs.skills || steps.all.outputs.forced }}
+      # Whether the Windows jobs run at all: every event except a manual dispatch
+      # that did not ask for PR-style binaries. Both Windows work jobs gate on this
+      # and the `windows-build-and-test` aggregator derives its expected skip from
+      # it, so "skipped on purpose" has one spelling and cannot drift between them.
+      windows: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.build_binaries == 'true' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -310,7 +315,7 @@ jobs:
       # container stays legible if it is ever shared with another consumer.
       SCCACHE_AZURE_KEY_PREFIX: rocm-cli/build-and-test
       SCCACHE_AZURE_RW_MODE: ${{ (github.event_name == 'push' || github.event_name == 'merge_group') && 'READ_WRITE' || 'READ_ONLY' }}
-    # Don't spend per-OS build/test cycles unless the cheap lint gate is green.
+    # Don't spend a Linux build/test cycle until the cheap lint gate is green.
     needs: [changes, clippy, prek]
     # A manual E2E dispatch skips this heavy job for a fast loop; the E2E jobs
     # tolerate a skipped build-and-test in their own `if:` guards.
@@ -473,7 +478,7 @@ jobs:
   # in the merge queue the selection is forced to `--workspace`, so post-merge
   # `main` and every queued PR run the full suite — a required check is never
   # starved and the queue cannot stall. The full Windows suite
-  # (windows-build-and-test) also runs the whole workspace on every change, so it
+  # (the windows-debug job) also runs the whole workspace on every change, so it
   # backstops any crate a graph-based selection could miss (e.g. an integration
   # test that drives another crate only at runtime).
   #
@@ -488,8 +493,9 @@ jobs:
     name: Test (affected crates)
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    # Same lint gate as the OS build jobs: don't spend a test cycle until the
-    # cheap checks are green.
+    # Same lint gate as the Linux build job: don't spend a test cycle until the
+    # cheap checks are green. (The Windows jobs deliberately do not wait; see
+    # windows-debug.)
     needs: [changes, clippy, prek]
     # A manual E2E dispatch only exercises the E2E jobs; skip the rest.
     if: github.event_name != 'workflow_dispatch'
@@ -577,7 +583,23 @@ jobs:
               || contains(format('{0} ', steps.sel.outputs.sel), '-p rocm-core '))
         run: cargo nextest run --locked -p rocm-core --lib --features e2e-test-hooks
 
-  windows-build-and-test:
+  # The Windows lane is two parallel jobs (`windows-debug`, `windows-release`)
+  # joined by `windows-build-and-test` below. One serial job was the longest pole
+  # of the whole run (it alone decided when CI went green); the debug side
+  # (clippy, build, test, smoke) and the release side (release build, install
+  # lifecycle, PR bundle) share no outputs, so they run side by side.
+  #
+  # Neither job waits for `clippy` or `prek`. Those stay required checks in their
+  # own right, so a lint failure still blocks the merge. What this trades is about
+  # two and a half minutes of wall clock on every run, paid for with Windows runner
+  # time on pushes that turn out lint-red (the Linux jobs still wait). Windows runs
+  # its own clippy as its first compile step, so a clippy failure surfaces within
+  # minutes there; a `prek` failure (rustfmt, ruff, shellcheck, hygiene hooks) does
+  # not. A manual dispatch only exercises the E2E jobs, so both Windows jobs skip it
+  # — unless the dispatch asked for PR-style binaries, in which case both run, as on
+  # a pull request.
+  windows-debug:
+    name: Windows build and test (debug)
     runs-on: windows-latest
     timeout-minutes: 45
     env:
@@ -594,25 +616,13 @@ jobs:
       SCCACHE_AZURE_BLOB_CONTAINER: cache
       SCCACHE_AZURE_KEY_PREFIX: rocm-cli/windows-build-and-test
       SCCACHE_AZURE_RW_MODE: ${{ (github.event_name == 'push' || github.event_name == 'merge_group') && 'READ_WRITE' || 'READ_ONLY' }}
-    # Don't spend per-OS build/test cycles unless the cheap lint gate is green.
-    needs: [changes, clippy, prek]
-    # A manual E2E dispatch only exercises the E2E jobs; skip the rest — unless
-    # the dispatch explicitly asked for PR-style binaries, which this job's
-    # build step produces. `clippy`/`prek` are themselves always skipped on
-    # workflow_dispatch (their own `if:`), and a job whose `needs` were SKIPPED
-    # (not just failed) is skipped by default too — so without `!cancelled()`
-    # plus the explicit skipped-or-success checks below, `build_binaries: true`
-    # could never actually run this job. The success requirement is still
-    # enforced on every other trigger, where clippy/prek always run for real.
-    # `!cancelled()` rather than `always()`: this job (like pr-linux-binaries
-    # below) still needs to be cancelled when a new commit supersedes the run,
-    # per this workflow's `concurrency: cancel-in-progress: true`.
-    if: >-
-      !cancelled()
-      && needs.changes.result == 'success'
-      && (needs.clippy.result == 'success' || needs.clippy.result == 'skipped')
-      && (needs.prek.result == 'success' || needs.prek.result == 'skipped')
-      && (github.event_name != 'workflow_dispatch' || github.event.inputs.build_binaries == 'true')
+    # `needs: changes` and nothing else, deliberately: `clippy` and `prek` skip
+    # themselves on a manual dispatch, so waiting on them would skip this job there
+    # even when binaries were requested. The implicit success() on this `if:` also
+    # skips the job when `changes` did not succeed, and the aggregator below turns
+    # that skip into a failure.
+    needs: changes
+    if: needs.changes.outputs.windows == 'true'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -688,7 +698,7 @@ jobs:
       # `test = false`, so `--all-targets` does not build it.
       #
       # Runs before the build so a lint failure costs seconds rather than the
-      # full build/test/package cycle, matching why this job `needs: clippy`.
+      # full build and test cycle.
       #
       # One cargo command per step, here and in Build below: `shell: pwsh` does
       # not stop on a failing native command, and the step's result is only the
@@ -708,15 +718,6 @@ jobs:
         if: needs.changes.outputs.heavy == 'true'
         shell: pwsh
         run: cargo build --workspace --all-targets
-
-      - name: Build (release)
-        if: needs.changes.outputs.heavy == 'true'
-        shell: pwsh
-        # These binaries are packaged as the downloadable PR bundle; see the
-        # Linux bundle build for why aws-lc-sys must build its vendored copy.
-        env:
-          AWS_LC_SYS_USE_SYSTEM: "0"
-        run: cargo build --release -p rocm -p rocmd -p rocm-engine-lemonade -p rocm-engine-vllm -p xtask
 
       - name: Test
         if: needs.changes.outputs.heavy == 'true'
@@ -758,6 +759,126 @@ jobs:
         shell: pwsh
         run: python .\scripts\vllm_therock_gpu_test.py --self-test
 
+  # Release side of the Windows lane. It builds the optimised binaries, and the
+  # install lifecycle and the PR bundle consume them. The release-readiness
+  # self-test, the installer syntax check and the pinned-key check need no binaries;
+  # they sit here only to keep the two jobs about the same length. See
+  # `windows-debug` for why the lane is split. The sccache key prefix below is
+  # deliberately the same as that job's (and the pre-split job's), which keeps the
+  # entries written before the split valid for both. Debug and release builds pass
+  # different rustc flags, so the two jobs mostly do not reuse each other's entries.
+  # Its env and setup steps are kept identical to `windows-debug`'s by
+  # `ci_windows_jobs_share_one_cache_and_toolchain_setup`.
+  windows-release:
+    name: Windows release build and lifecycle
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: "0"
+      # Cache each rustc invocation across runs; the full-workspace build is the
+      # dominant cost on this runner and rust-cache does not cache workspace
+      # crates. CARGO_INCREMENTAL=0 above is required for (and assumed by) sccache.
+      # See build-and-test for why the backend is Azure rather than the GitHub
+      # Actions cache, why the probe below disables the backend rather than the
+      # wrapper, why only push and merge_group may write, and why the container
+      # needs a lifecycle rule of its own.
+      RUSTC_WRAPPER: sccache
+      SCCACHE_AZURE_CONNECTION_STRING: ${{ secrets.CACHE_AZURE_CONNECTION_STRING }}
+      SCCACHE_AZURE_BLOB_CONTAINER: cache
+      SCCACHE_AZURE_KEY_PREFIX: rocm-cli/windows-build-and-test
+      SCCACHE_AZURE_RW_MODE: ${{ (github.event_name == 'push' || github.event_name == 'merge_group') && 'READ_WRITE' || 'READ_ONLY' }}
+    # `needs: changes` and nothing else, deliberately: `clippy` and `prek` skip
+    # themselves on a manual dispatch, so waiting on them would skip this job there
+    # even when binaries were requested. The implicit success() on this `if:` also
+    # skips the job when `changes` did not succeed, and the aggregator below turns
+    # that skip into a failure.
+    needs: changes
+    if: needs.changes.outputs.windows == 'true'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Installs sccache. Runs BEFORE setup-rust-toolchain, whose rust-cache step
+      # runs `cargo metadata` and honours RUSTC_WRAPPER. `version` is pinned so
+      # the compiler wrapper does not float with the latest sccache release.
+      # continue-on-error for the same reason as build-and-test: a failed install
+      # is handled by the probe, not by failing the job.
+      - name: Set up sccache
+        if: needs.changes.outputs.heavy == 'true'
+        continue-on-error: true
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.17.0
+
+      # Keep the remote backend only if it answers — see the equivalent step in
+      # build-and-test for why this is a probe, and why failure clears the Azure
+      # variables rather than the wrapper.
+      - name: Probe sccache cache backend
+        id: sccache_probe
+        if: needs.changes.outputs.heavy == 'true'
+        shell: pwsh
+        run: |
+          # This script decides whether to use the cache; a non-zero status from
+          # the commands it runs is an answer, not a job failure. Pin the native
+          # error preference off so a future runner default cannot turn a failed
+          # probe into a failed step.
+          $PSNativeCommandUseErrorActionPreference = $false
+          # Every Out-File below passes -Encoding utf8 explicitly. PowerShell 7
+          # (`shell: pwsh`) already defaults to UTF-8, but Windows PowerShell 5.1
+          # defaults to UTF-16LE, which the runner cannot parse — so an edit that
+          # switched this step to `shell: powershell` would silently corrupt the
+          # environment file rather than fail visibly.
+          function Disable-Backend {
+            "SCCACHE_AZURE_CONNECTION_STRING=" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            "SCCACHE_AZURE_BLOB_CONTAINER=" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          }
+          if (-not (Get-Command sccache -ErrorAction SilentlyContinue)) {
+            Write-Output "::warning::sccache is not installed; compiling without it."
+            "RUSTC_WRAPPER=" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            # Nothing will read the credential now; don't leave it in the job env.
+            Disable-Backend
+            exit 0
+          }
+          # sccache is the compiler wrapper from here on, remote backend or not,
+          # so there are statistics worth reporting either way.
+          "active=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          if (-not $env:SCCACHE_AZURE_CONNECTION_STRING) {
+            Write-Output "::notice::No cache credential available (expected on forks); compiling without a shared cache."
+            Disable-Backend
+            exit 0
+          }
+          sccache --start-server
+          if ($LASTEXITCODE -ne 0) {
+            Write-Output "::warning::sccache could not reach the cache backend; compiling without a shared cache."
+            # Leave no half-started server behind for the cargo steps to find.
+            sccache --stop-server *> $null
+            Disable-Backend
+          }
+          exit 0
+
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        if: needs.changes.outputs.heavy == 'true'
+        with:
+          cache-on-failure: true
+
+      - name: Build (release)
+        if: needs.changes.outputs.heavy == 'true'
+        shell: pwsh
+        # These binaries are packaged as the downloadable PR bundle; see the
+        # Linux bundle build for why aws-lc-sys must build its vendored copy.
+        env:
+          AWS_LC_SYS_USE_SYSTEM: "0"
+        run: cargo build --release -p rocm -p rocmd -p rocm-engine-lemonade -p rocm-engine-vllm -p xtask
+
+      # Surface the cache hit rate for the release build so the effect is
+      # visible in the logs, on the local-only path too — see build-and-test for
+      # why this is gated on sccache being present rather than on the remote
+      # backend being up, and why the action's own post-job stats step does not
+      # make this one redundant.
+      - name: sccache stats
+        if: needs.changes.outputs.heavy == 'true' && steps.sccache_probe.outputs.active == 'true'
+        shell: pwsh
+        run: sccache --show-stats
+
       - name: Release readiness self-test
         if: needs.changes.outputs.heavy == 'true'
         shell: pwsh
@@ -785,7 +906,7 @@ jobs:
         # adds `--features rocm/e2e-test-hooks` the feature resolution differs
         # from the Build step's — so cargo recompiles the whole release graph
         # rather than reusing it. That second release build cost 3-4 minutes on
-        # every run, on the job that alone determines when CI goes green.
+        # every run, on a lane that determines when CI goes green.
         #
         # Deliberately NOT built with `rocm/e2e-test-hooks`, unlike the prebuilt
         # lanes in e2e-selfhosted.yml / nightly.yml. Those run the full suite,
@@ -877,6 +998,47 @@ jobs:
             dist/rocm-cli-pr-windows-amd64.zip.sha256
           retention-days: 7
           if-no-files-found: error
+
+  # The required check. Its name is the one branch protection already matches, so
+  # splitting the lane did not need a ruleset change — and a split that left only
+  # the two work jobs would have made a failing lifecycle or build stop blocking
+  # merges unless an admin also added their names.
+  #
+  # `!cancelled()` rather than `always()`: a run superseded by a new commit is
+  # still cancelled, per this workflow's `concurrency: cancel-in-progress: true`.
+  # A job that is itself cancelled (runner loss) while the run is live is caught by
+  # the exact-match check below: every result must be precisely what is expected, so
+  # `failure`, `cancelled`, and an unexpected `skipped` all fail this job. A skipped
+  # required check reads as passing, so skipping this one is never the failure path.
+  windows-build-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [changes, windows-debug, windows-release]
+    if: ${{ !cancelled() }}
+    steps:
+      - name: Require every Windows job to have passed
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          DEBUG_RESULT: ${{ needs.windows-debug.result }}
+          RELEASE_RESULT: ${{ needs.windows-release.result }}
+          # The only run where the two jobs are meant to be skipped: a manual
+          # dispatch that did not ask for PR-style binaries. Derived from the very
+          # output the two jobs gate on, so the two cannot disagree.
+          EXPECT_SKIPPED: ${{ needs.changes.outputs.windows != 'true' }}
+        run: |
+          want=success
+          if [ "$EXPECT_SKIPPED" = "true" ]; then want=skipped; fi
+          status=0
+          check() {
+            if [ "$2" != "$3" ]; then
+              echo "::error::$1 finished as '$2', expected '$3'"
+              status=1
+            fi
+          }
+          check changes "$CHANGES_RESULT" success
+          check windows-debug "$DEBUG_RESULT" "$want"
+          check windows-release "$RELEASE_RESULT" "$want"
+          exit "$status"
 
   # Downloadable Linux PR-testing bundle. No job in THIS file builds a release
   # binary in the release manylinux2014 container (build-and-test only does a
@@ -1284,8 +1446,8 @@ jobs:
     # Runs the prek `powershell-script-analyzer` hook's logic (cargo xtask
     # powershell-lint) under BOTH PowerShell editions. windows-latest is the only
     # runner with Windows PowerShell 5.1 (`powershell`); it also ships PowerShell
-    # 7 (`pwsh`). Kept separate from windows-build-and-test so it runs in parallel
-    # rather than behind that slow job.
+    # 7 (`pwsh`). Kept separate from the Windows build jobs so it runs in parallel
+    # rather than behind them.
     name: Lint (PowerShell)
     runs-on: windows-latest
     timeout-minutes: 20
