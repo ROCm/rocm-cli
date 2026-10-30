@@ -24,6 +24,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
+name = "adlx"
+version = "0.0.0-alpha.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fae45a2d1c9dcfb7fc8bb3069dc821d38218b36d6e1d2ebbd7d80a4751c3aef6"
+dependencies = [
+ "anyhow",
+ "libloading",
+]
+
+[[package]]
 name = "aes"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2297,6 +2307,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
+name = "libloading"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
+
+[[package]]
 name = "libm"
 version = "0.2.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3731,6 +3751,7 @@ dependencies = [
 name = "rocm-dash-collectors"
 version = "0.1.0"
 dependencies = [
+ "adlx",
  "bollard",
  "chrono",
  "csv",
@@ -3744,6 +3765,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+ "windows-sys 0.61.2",
  "wiremock",
 ]
 
@@ -3798,6 +3820,7 @@ dependencies = [
  "ratatui",
  "reqwest 0.13.4",
  "rig-core",
+ "rocm-dash-collectors",
  "rocm-dash-core",
  "rocm-deps",
  "serde",

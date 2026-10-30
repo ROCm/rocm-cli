@@ -609,6 +609,30 @@ Feature: Interactive dashboard
     And the user quits the dashboard
     Then the dashboard exits successfully
 
+  # Exercises the hero's "no GPU telemetry" rendering (see
+  # `gpu_data_unavailable`/`node_throughput_title` in
+  # `crates/rocm-dash-tui/src/ui/tabs/home.rs`) with a *real* embedded daemon,
+  # not `--demo` (whose fixture always has 8 GPUs and can never reach this
+  # state). The runner's own hardware must not decide the outcome (a WSL host
+  # with a usable GPU skips the `/dev/kfd` pre-flight, and any host whose user
+  # can read `/dev/kfd` passes it), so the scenario runs on a simulated GPU-less
+  # host (`ROCM_CLI_TEST_HOST_ROOT`, honoured only by the `e2e-test-hooks`
+  # build): the daemon's pre-flight and WSL reachability probe follow that
+  # empty root, `detect_with_binary` returns `None`, and every snapshot reports
+  # zero GPUs. The other half of that state machine, the transient "pending"
+  # placeholder shown before the first snapshot arrives at all, is not covered
+  # here (the unit test `gpu_telemetry_pending_while_connected_but_no_snapshot_yet`
+  # pins it): it closes in well under a second and there's no hook to freeze the daemon
+  # mid-handshake, so asserting on it would be asserting on a race.
+  @id:dash-reports-no-gpu-telemetry @requires-os:linux
+  Scenario: dash-37 - The hero shows placeholders, not fake zeros, when no GPU is detected
+    Given a machine with no GPU
+    When the user opens the dashboard
+    Then the dashboard home view is displayed
+    And the hero reports no GPU telemetry available
+    When the user quits the dashboard
+    Then the dashboard exits successfully
+
   # The Diagnose screen offers the same Doctor report the CLI prepares, and the
   # review comes first. Whether a report can be prepared is a property of the
   # machine, not of the dashboard: hardware that is not on AMD's published list,
@@ -631,7 +655,7 @@ Feature: Interactive dashboard
   # starts before an approve, are asserted where the key sequence can be driven
   # directly: the unit tests in `crates/rocm-dash-tui/src/ui/examine_manager.rs`.
   @id:dash-doctor-report-is-reviewed-before-sending @requires-os:linux
-  Scenario: dash-37 - A user reviews a Doctor report in the dashboard before anything is sent
+  Scenario: dash-38 - A user reviews a Doctor report in the dashboard before anything is sent
     When the user opens the dashboard with demo data
     And the user opens the Observe view
     And the user opens the Diagnose screen
@@ -657,7 +681,7 @@ Feature: Interactive dashboard
   # reached when nothing else owns the keyboard, which is the event loop's
   # existing arm order and is not re-tested here.
   @id:dash-warning-badge-opens-the-warning @requires-os:linux
-  Scenario: dash-38 - A user reads the warning behind the header badge
+  Scenario: dash-39 - A user reads the warning behind the header badge
     When the user opens the dashboard replaying a recording that reports a warning
     Then the header shows that one warning is reported
     When the user opens the warnings

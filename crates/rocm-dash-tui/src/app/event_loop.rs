@@ -1041,6 +1041,7 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
                         state.latest = None;
                     }
                     Some(ClientMsg::Event(ev)) => state.apply_event(*ev),
+                    Some(ClientMsg::HostGpuSnapshot(snap)) => state.push_host_gpu_snapshot(*snap),
                     Some(ClientMsg::ReplaySeek) => state.reset_for_seek(),
                     Some(ClientMsg::ReplayPosition { elapsed_s, total_s }) => {
                         if let Some(r) = state.replay.as_mut() {

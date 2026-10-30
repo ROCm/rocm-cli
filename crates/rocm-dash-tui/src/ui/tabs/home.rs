@@ -23,12 +23,29 @@ use ratatui::widgets::Paragraph;
 
 use rocm_dash_core::state::JobStatus;
 
-use crate::app::{AppState, UpdateStatus};
+use crate::app::{AppState, ConnState, UpdateStatus};
 use crate::ui::format;
 use crate::ui::gradient::GradientGauge;
 use crate::ui::panel::{self, BoxRole};
 use crate::ui::sparkline::BrailleSparkline;
 use crate::ui::theme::Theme;
+
+/// Summed VRAM used / summed VRAM total across all GPUs, as a percentage.
+/// `total == 0` is a legitimate state (e.g. the Windows collector can't
+/// correlate a multi-adapter host to specific VRAM sizes) — must read as
+/// `0.0`, not `used / 1 * 100`.
+fn vram_used_pct(snap: &rocm_dash_core::metrics::Snapshot) -> f64 {
+    // Only GPUs with a known total count, on both sides of the ratio: an
+    // unknown-total GPU's used VRAM must not inflate the others' percentage.
+    let known = || snap.gpus.iter().filter(|g| g.vram_total_mb > 0);
+    let used: u64 = known().map(|g| g.vram_used_mb).sum();
+    let total: u64 = known().map(|g| g.vram_total_mb).sum();
+    if total > 0 {
+        used as f64 / total as f64 * 100.0
+    } else {
+        0.0
+    }
+}
 
 /// History series helper: map each snapshot to a 0..=100 magnitude via `pick`.
 fn history<F: Fn(&rocm_dash_core::metrics::Snapshot) -> f64>(
@@ -52,6 +69,31 @@ const fn node_load_label(hist_empty: bool, simulated: bool) -> &'static str {
     } else {
         "live"
     }
+}
+
+/// True until the first snapshot has arrived at all. Drives only the hero
+/// title's "Detecting GPU…" placeholder — a snapshot that arrived but
+/// carries no GPUs (or a legitimately-zero field) is a known state, not a
+/// still-loading one, and reads "Unknown GPU" instead (see
+/// `node_throughput_title`). Uses the sticky `has_received_gpu_snapshot`
+/// rather than `latest`: `latest` is wiped on disconnect, replay end, and
+/// seek, none of which mean detection restarted. `Connected` arrives before
+/// the first snapshot, so it still reads pending, but a `Disconnected`
+/// before any snapshot is a failed connection (the reconnect loop never
+/// delivers one), not a loading window, and reads "Unknown GPU". For the
+/// numeric "—" placeholders, see `gpu_data_unavailable`.
+const fn gpu_telemetry_pending(state: &AppState) -> bool {
+    !state.has_received_gpu_snapshot
+        && state.latest.is_none()
+        && !matches!(state.conn, ConnState::Disconnected { .. })
+}
+
+/// True when there's no usable per-GPU data to show a number for: either no
+/// snapshot has arrived yet, or one arrived but carries no GPUs at all.
+/// Drives the headline util/vram/temp/power "—" placeholders — distinct
+/// from `gpu_telemetry_pending`, which only gates the hero title.
+fn gpu_data_unavailable(state: &AppState) -> bool {
+    state.latest.as_ref().is_none_or(|s| s.gpus.is_empty())
 }
 
 /// Peak GPU utilization across the GPUs in a snapshot (the headline metric).
@@ -108,9 +150,14 @@ fn mini_spark(
 }
 
 /// Hero card title in the mock's form: `Node throughput · N × MODEL · ROCm V`.
-/// Falls back to `Unknown GPU` when no GPU model is detected, and drops the
-/// count/ROCm segments that aren't known rather than inventing them.
+/// Falls back to `Detecting GPU…` while no telemetry has arrived at all yet
+/// (see `gpu_telemetry_pending`), or to `Unknown GPU` when telemetry arrived
+/// but didn't carry a model name — and drops the count/ROCm segments that
+/// aren't known rather than inventing them.
 fn node_throughput_title(state: &AppState) -> String {
+    if gpu_telemetry_pending(state) {
+        return "Node throughput · Detecting GPU…".to_string();
+    }
     let info = state
         .latest
         .as_ref()
@@ -261,7 +308,11 @@ fn draw_hero_left(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         lh[0],
     );
     let util = state.latest.as_ref().map_or(0.0, snap_util);
-    let util_label = format::pct(util as f32);
+    let util_label = if gpu_data_unavailable(state) {
+        "—".to_string()
+    } else {
+        format::pct(util as f32)
+    };
     let g = GradientGauge::new(util / 100.0)
         .stops(theme.ok, theme.warn, theme.err)
         .track_bg(theme.surface_2)
@@ -348,11 +399,9 @@ fn draw_hero_right(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         rh[0],
     );
     let latest = state.latest.as_ref();
-    let vram = latest.map_or(0.0, |s| {
-        let used: u64 = s.gpus.iter().map(|g| g.vram_used_mb).sum();
-        let total: u64 = s.gpus.iter().map(|g| g.vram_total_mb).sum::<u64>().max(1);
-        used as f64 / total as f64 * 100.0
-    });
+    let unavailable = gpu_data_unavailable(state);
+    let vram = latest.map_or(0.0, vram_used_pct);
+    let vram_total: u64 = latest.map_or(0, |s| s.gpus.iter().map(|g| g.vram_total_mb).sum());
     let temp = latest.map_or(0.0, |s| {
         s.gpus
             .iter()
@@ -362,16 +411,35 @@ fn draw_hero_right(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let power: f64 = latest.map_or(0.0, |s| {
         s.gpus.iter().map(|g| f64::from(g.power_w)).sum::<f64>()
     });
+    // While there's no GPU telemetry at all, show "—" rather than 0%/0°C/0W
+    // — those look like real (broken) readings rather than a loading/unknown
+    // state. The same applies per-metric once data has arrived but a given
+    // metric reads exactly zero: a multi-adapter Windows host can't
+    // correlate VRAM totals per-device (`vram_total_mb == 0`, see
+    // `vram_used_pct`), and temp/power read 0.0 with no ADLX reading — a
+    // real GPU is never actually at 0°C/0W, so an exact zero there means
+    // "not measured", not "measured as zero".
+    let vram_label = if unavailable || vram_total == 0 {
+        "—".to_string()
+    } else {
+        format::pct(vram as f32)
+    };
+    let temp_label = if unavailable || temp == 0.0 {
+        "—".to_string()
+    } else {
+        format::celsius(temp as f32)
+    };
+    let power_label = if unavailable || power == 0.0 {
+        "—".to_string()
+    } else {
+        format::watts(power as f32)
+    };
     mini_spark(
         f,
         rh[1],
         "VRAM ",
-        &format::pct(vram as f32),
-        &history(state, |s| {
-            let used: u64 = s.gpus.iter().map(|g| g.vram_used_mb).sum();
-            let total: u64 = s.gpus.iter().map(|g| g.vram_total_mb).sum::<u64>().max(1);
-            used as f64 / total as f64 * 100.0
-        }),
+        &vram_label,
+        &history(state, vram_used_pct),
         false,
         theme,
     );
@@ -379,7 +447,7 @@ fn draw_hero_right(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         f,
         rh[2],
         "TEMP ",
-        &format::celsius(temp as f32),
+        &temp_label,
         &history(state, |s| {
             s.gpus
                 .iter()
@@ -393,7 +461,7 @@ fn draw_hero_right(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         f,
         rh[3],
         "POWER",
-        &format::watts(power as f32),
+        &power_label,
         // Power can exceed 100; scale to a nominal 1kW ceiling for the trace.
         &history(state, |s| {
             s.gpus.iter().map(|g| f64::from(g.power_w)).sum::<f64>() / 10.0
@@ -675,10 +743,245 @@ mod tests {
         assert!(t.starts_with("Node throughput · "), "prefix: {t}");
         assert!(t.contains("Instinct MI355X"), "model: {t}");
         assert!(t.contains("ROCm 6.2"), "rocm version: {t}");
-        // No telemetry → Unknown GPU, no fabricated count/version.
+        // No telemetry at all yet → "detecting", not a bogus "Unknown GPU".
         let empty = AppState::new("t".into(), "default-dark".into());
         let t2 = node_throughput_title(&empty);
-        assert_eq!(t2, "Node throughput · Unknown GPU");
+        assert_eq!(t2, "Node throughput · Detecting GPU…");
+    }
+
+    #[test]
+    fn node_throughput_title_unknown_gpu_only_when_telemetry_present_but_unnamed() {
+        // Telemetry arrived (a GPU is present) but carried no model name —
+        // distinct from "nothing has arrived yet" and must still read
+        // "Unknown GPU", not the pending/detecting placeholder.
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.latest = Some(Snapshot {
+            host: SystemMetrics::default(),
+            gpus: vec![GpuMetrics {
+                device_id: "GPU0".into(),
+                vram_used_mb: 0,
+                vram_total_mb: 0,
+                gpu_utilization_pct: 0.0,
+                temperature_c: 0.0,
+                power_w: 0.0,
+                clock_mhz: None,
+            }],
+            gpu_system_info: None,
+            ..Default::default()
+        });
+        assert_eq!(node_throughput_title(&s), "Node throughput · Unknown GPU");
+    }
+
+    #[test]
+    fn gpu_telemetry_pending_only_tracks_whether_anything_arrived() {
+        // Nothing has arrived yet → pending (drives the hero title).
+        let empty = AppState::new("t".into(), "default-dark".into());
+        assert!(gpu_telemetry_pending(&empty));
+        // A snapshot with no GPUs at all is a known state, not "still
+        // loading" — the title falls back to "Unknown GPU", not "Detecting".
+        let mut no_gpus = AppState::new("t".into(), "default-dark".into());
+        no_gpus.latest = Some(Snapshot::default());
+        assert!(!gpu_telemetry_pending(&no_gpus));
+        assert!(!gpu_telemetry_pending(&state_with_gpu()));
+    }
+
+    #[test]
+    fn gpu_data_unavailable_distinguishes_no_data_from_legitimate_zero() {
+        // Nothing has arrived yet → unavailable.
+        let empty = AppState::new("t".into(), "default-dark".into());
+        assert!(gpu_data_unavailable(&empty));
+        // A snapshot with no GPUs at all → still unavailable (no number to show).
+        let mut no_gpus = AppState::new("t".into(), "default-dark".into());
+        no_gpus.latest = Some(Snapshot::default());
+        assert!(gpu_data_unavailable(&no_gpus));
+        // A real GPU present (even with legitimately-zero fields) → available.
+        assert!(!gpu_data_unavailable(&state_with_gpu()));
+    }
+
+    #[test]
+    fn hero_shows_dash_placeholders_not_fake_zeros_when_metrics_are_unmeasured() {
+        // A real GPU is present (so the title isn't "Detecting GPU…"), but
+        // vram_total/temp/power all read exactly zero — e.g. a Windows
+        // multi-adapter host that can't correlate per-device VRAM totals,
+        // or no ADLX reading for temp/power. Each must show "—", not a
+        // fake-looking "0%"/"0°C"/"0W".
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.active_tab = ActiveTab::Home;
+        s.latest = Some(Snapshot {
+            host: SystemMetrics::default(),
+            gpus: vec![GpuMetrics {
+                device_id: "GPU0".into(),
+                vram_used_mb: 0,
+                vram_total_mb: 0,
+                gpu_utilization_pct: 12.0,
+                temperature_c: 0.0,
+                power_w: 0.0,
+                clock_mhz: None,
+            }],
+            gpu_system_info: Some(GpuSystemInfo {
+                gpu_model: "Some GPU".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let out = render(&s, 160, 30);
+        // The buffer is row-major with no row separators, so bound each
+        // check to the segment between consecutive labels — otherwise an
+        // unrelated "0%"-shaped substring earlier in the row (e.g. the
+        // "12.0%" utilization gauge) would false-positive the negative
+        // assertions below.
+        let vram_segment = out
+            .split("VRAM")
+            .nth(1)
+            .and_then(|s| s.split("TEMP").next());
+        let temp_segment = out
+            .split("TEMP")
+            .nth(1)
+            .and_then(|s| s.split("POWER").next());
+        let power_segment = out
+            .split("POWER")
+            .nth(1)
+            .and_then(|s| s.split("T/S").next());
+        let vram_segment = vram_segment.unwrap_or_else(|| panic!("vram row missing: {out:?}"));
+        let temp_segment = temp_segment.unwrap_or_else(|| panic!("temp row missing: {out:?}"));
+        let power_segment = power_segment.unwrap_or_else(|| panic!("power row missing: {out:?}"));
+        assert!(
+            vram_segment.contains('—'),
+            "vram should read —: {vram_segment:?}"
+        );
+        assert!(
+            !vram_segment.contains('%'),
+            "vram should not show a fake 0%: {vram_segment:?}"
+        );
+        assert!(
+            temp_segment.contains('—'),
+            "temp should read —: {temp_segment:?}"
+        );
+        assert!(
+            !temp_segment.contains('°'),
+            "temp should not show a fake 0°C: {temp_segment:?}"
+        );
+        assert!(
+            power_segment.contains('—'),
+            "power should read —: {power_segment:?}"
+        );
+        assert!(
+            !power_segment.contains('W'),
+            "power should not show a fake 0W: {power_segment:?}"
+        );
+    }
+
+    #[test]
+    fn gpu_utilization_gauge_shows_dash_not_a_fake_zero_percent_when_no_gpus_are_reported() {
+        // A snapshot arrived but carries no GPUs at all (`gpu_data_unavailable`
+        // true) — the gauge label must read "—", not a fake "0.0%"
+        // (draw_hero_left's `gpu_data_unavailable` branch).
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.active_tab = ActiveTab::Home;
+        s.latest = Some(Snapshot::default());
+        let out = render(&s, 160, 30);
+        let segment = out
+            .split("GPU UTILIZATION")
+            .nth(1)
+            .and_then(|s| s.split("tokens / watt").next())
+            .unwrap_or_else(|| panic!("gpu utilization row missing: {out:?}"));
+        assert!(
+            segment.contains('—'),
+            "gpu utilization should read —, not a fake 0.0%: {segment:?}"
+        );
+        assert!(
+            !segment.contains("0.0%"),
+            "gpu utilization should not show a fake 0.0%: {segment:?}"
+        );
+    }
+
+    #[test]
+    fn gpu_telemetry_pending_while_connected_but_no_snapshot_yet() {
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.conn = ConnState::Connected {
+            host: "x".into(),
+            version: "1".into(),
+        };
+        assert!(gpu_telemetry_pending(&s));
+        assert_eq!(
+            node_throughput_title(&s),
+            "Node throughput · Detecting GPU…"
+        );
+    }
+
+    #[test]
+    fn gpu_telemetry_not_pending_when_disconnected_before_any_snapshot() {
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.conn = ConnState::Disconnected {
+            reason: "connection refused".into(),
+        };
+        assert!(!gpu_telemetry_pending(&s));
+        assert_eq!(node_throughput_title(&s), "Node throughput · Unknown GPU");
+    }
+
+    #[test]
+    fn gpu_telemetry_pending_does_not_resume_after_a_disconnect_or_replay_end() {
+        // Once connected, losing the connection (end of `--replay`, a daemon
+        // drop, ClientMsg::Disconnected) wipes `latest` but must not look
+        // like detection restarted — the title should stay on "Unknown GPU",
+        // never flip back to "Detecting GPU…".
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.conn = ConnState::Connected {
+            host: "x".into(),
+            version: "1".into(),
+        };
+        s.latest = Some(Snapshot::default());
+        s.conn = ConnState::Disconnected {
+            reason: "end of recording".into(),
+        };
+        s.push_host_gpu_snapshot(Snapshot::default());
+        s.latest = None;
+        assert!(!gpu_telemetry_pending(&s));
+        s.conn = ConnState::Connecting;
+        assert!(!gpu_telemetry_pending(&s), "reconnect must not revert");
+        assert_eq!(node_throughput_title(&s), "Node throughput · Unknown GPU");
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn vram_used_pct_is_zero_not_garbage_when_total_is_unknown() {
+        // vram_total_mb == 0 is a legitimate state (e.g. the Windows
+        // collector can't correlate a multi-adapter host to specific VRAM
+        // sizes) — must read as 0.0, not `used / 1 * 100` (would be 80800.0).
+        let snap = Snapshot {
+            host: SystemMetrics::default(),
+            gpus: vec![GpuMetrics {
+                device_id: "GPU0".into(),
+                vram_used_mb: 808,
+                vram_total_mb: 0,
+                gpu_utilization_pct: 0.5,
+                temperature_c: 0.0,
+                power_w: 0.0,
+                clock_mhz: None,
+            }],
+            ..Default::default()
+        };
+        assert_eq!(vram_used_pct(&snap), 0.0);
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn vram_used_pct_ignores_gpus_with_unknown_total() {
+        let gpu = |used, total| GpuMetrics {
+            device_id: "GPU".into(),
+            vram_used_mb: used,
+            vram_total_mb: total,
+            gpu_utilization_pct: 0.0,
+            temperature_c: 0.0,
+            power_w: 0.0,
+            clock_mhz: None,
+        };
+        let snap = Snapshot {
+            host: SystemMetrics::default(),
+            gpus: vec![gpu(96000, 192_000), gpu(8000, 0)],
+            ..Default::default()
+        };
+        assert_eq!(vram_used_pct(&snap), 50.0);
     }
 
     #[test]

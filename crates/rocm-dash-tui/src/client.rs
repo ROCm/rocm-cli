@@ -6,13 +6,16 @@
 //! forwards everything (including connect/disconnect transitions) to the app loop
 //! via an mpsc channel.
 
-// On Windows the connection is a #[cfg(unix)] stub, so the unix-socket imports
-// below are only used on unix; silence the resulting unused-import noise there.
+// On Windows there's no `rocmdashd` unix socket to connect to, so the
+// `#[cfg(windows)]` arm builds snapshots in-process instead (see
+// `connect_and_run`); the unix-socket imports below are only used on unix,
+// so silence the resulting unused-import noise there.
 #![cfg_attr(windows, allow(unused_imports))]
 
 use std::path::PathBuf;
 
 use anyhow::{Context, anyhow};
+use rocm_dash_core::metrics::Snapshot;
 use rocm_dash_core::protocol::{Command, Event, PROTOCOL_VERSION};
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::sync::mpsc::UnboundedSender;
@@ -33,6 +36,15 @@ pub enum ClientMsg {
         reason: String,
     },
     Event(Box<Event>),
+    /// Windows in-process synthetic tick (`#[cfg(windows)] connect_and_run`):
+    /// host/GPU metrics sourced from local collectors, not a real daemon.
+    /// Deliberately NOT `Event(Snapshot)` — that path treats `instances` as
+    /// authoritative truth and latches `has_received_snapshot` forever, but
+    /// this snapshot's `instances` is always an empty stand-in (Windows has
+    /// no instance registry daemon yet), so routing it through there would
+    /// permanently blind the issue #145 quit-confirm prompt to models
+    /// actually being served. See `AppState::push_host_gpu_snapshot`.
+    HostGpuSnapshot(Box<Snapshot>),
     /// Replay-only: the scrubber jumped backward. The TUI must wipe any
     /// state derived from past events before the burst-emitted events for
     /// the new playhead position arrive.
@@ -178,12 +190,65 @@ async fn connect_and_run(connect: &str, tx: UnboundedSender<ClientMsg>) -> anyho
     Ok(())
 }
 
+/// Windows has no rocmdashd socket yet, so this builds `Snapshot`s in-process
+/// instead of connecting anywhere: `HostCollector` (already cross-platform)
+/// for CPU/memory, `WinPerfCollector` (OS perf counters, no AMD tool needed)
+/// for GPU. Sends `Connected` like the unix arm, but then a stream of
+/// `ClientMsg::HostGpuSnapshot` rather than `Event::Snapshot` — deliberately
+/// not routed through `Event::Snapshot`, to avoid disturbing the "quit while
+/// serving" confirmation prompt (see `AppState::push_host_gpu_snapshot`).
 #[cfg(windows)]
-// Mirrors the signature of the `cfg(unix)` arm, which callers `.await`;
-// dropping `async` here would not compile on Windows.
-#[allow(clippy::unused_async)]
-async fn connect_and_run(connect: &str, _tx: UnboundedSender<ClientMsg>) -> anyhow::Result<()> {
-    Err(anyhow!(
-        "rocm-dash TUI requires Unix domain sockets; not supported on Windows yet (connect={connect})"
-    ))
+async fn connect_and_run(connect: &str, tx: UnboundedSender<ClientMsg>) -> anyhow::Result<()> {
+    use rocm_dash_collectors::host::HostCollector;
+    use rocm_dash_collectors::winperf::WinPerfCollector;
+    use rocm_dash_core::metrics::GpuSystemInfo;
+
+    info!(
+        connect,
+        "windows: collecting metrics in-process (no daemon socket)"
+    );
+    let _ = tx.send(ClientMsg::Connected {
+        host: "localhost".into(),
+        daemon_version: crate::app::ConnState::in_process_version(env!("CARGO_PKG_VERSION")),
+    });
+
+    let mut host = HostCollector::new();
+    let gpu = WinPerfCollector::new();
+    // Mirrors the daemon's `gpu_tick` cadence (rocm_dash_daemon::runner::RunnerOptions::default()).
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
+    // A slow powershell/ADLX tick (see `WinPerfCollector::snapshot`) must not
+    // queue up a burst of catch-up ticks once it returns; matches
+    // `rocm-dash-daemon/src/runner.rs`'s existing explicit choice.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        ticker.tick().await;
+        let host_metrics = host.tick();
+        let (gpus, gpu_system_info, warnings) = match gpu.snapshot().await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(error = %e, "windows GPU perf-counter query failed");
+                (
+                    Vec::new(),
+                    GpuSystemInfo::default(),
+                    vec![format!("windows GPU perf-counter query failed: {e}")],
+                )
+            }
+        };
+        let snapshot = Snapshot {
+            timestamp: chrono::Utc::now(),
+            host: host_metrics,
+            gpus,
+            gpu_system_info: Some(gpu_system_info),
+            instances: Vec::new(),
+            warnings,
+        };
+        if tx
+            .send(ClientMsg::HostGpuSnapshot(Box::new(snapshot)))
+            .is_err()
+        {
+            break;
+        }
+    }
+    Ok(())
 }

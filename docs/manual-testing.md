@@ -602,14 +602,14 @@ Expected result:
 - A prompt appears naming the serving model and warning that it may
   still be running in the background after you quit, with the real
   `rocm services stop <service-id> --yes` command (the actual id, not a
-  placeholder) to stop it first. From the dashboard (not the launcher) on a
-  host where its own daemon client never connects (Windows, for the whole
-  session), the prompt still shows that same stop command and the service
-  id, but not the model's name — the dashboard's own live view is where the
-  name comes from, and it never fills there. The launcher's own copy of the
-  prompt always names the model, Windows included — it reads the
-  managed-service registry directly rather than through the dashboard's
-  daemon connection.
+  placeholder) to stop it first. From the dashboard (not the launcher) on
+  Windows, where the dashboard streams live GPU/CPU/memory but never gets a
+  serving-instance snapshot (no `rocmdashd` unix socket there), the prompt
+  still shows that same stop command and the service id, but not the
+  model's name — the dashboard's own live view is where the name comes
+  from, and it never fills there. The launcher's own copy of the prompt
+  always names the model, Windows included — it reads the managed-service
+  registry directly rather than through the dashboard's daemon connection.
 - From the dashboard (not the launcher), the prompt also offers `s`: pressing
   it closes the prompt and opens the Services overlay, pre-focused on the
   serving model, so you can stop it there through the overlay's own

@@ -594,6 +594,9 @@ fn draw_header(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) -> Op
         ConnState::Connected { .. } if state.simulated => {
             ("simulated — not live".to_string(), theme.warn)
         }
+        c @ ConnState::Connected { host, .. } if c.is_in_process() => {
+            (format!("live · {host} · local collectors"), theme.ok)
+        }
         ConnState::Connected { host, version } => (
             format!("connected · {host} · rocm daemon {version}"),
             theme.ok,
@@ -994,6 +997,38 @@ mod tests {
     use crate::app::test_support::with_registry_probe;
 
     #[test]
+    fn header_does_not_claim_a_daemon_for_the_in_process_collector() {
+        use crate::ui::theme::Theme;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let theme = Theme::from_name("default-dark");
+        let mut state = AppState::new("t".into(), "default-dark".into());
+        state.conn = ConnState::Connected {
+            host: "localhost".into(),
+            version: ConnState::in_process_version("1.2.3"),
+        };
+        let mut term = Terminal::new(TestBackend::new(120, 3)).unwrap();
+        term.draw(|f| {
+            draw_header(f, f.area(), &state, &theme);
+        })
+        .unwrap();
+        let grid: String = (0..3)
+            .flat_map(|y| (0..120).map(move |x| (x, y)))
+            .map(|p| {
+                term.backend()
+                    .buffer()
+                    .cell(p)
+                    .unwrap()
+                    .symbol()
+                    .to_string()
+            })
+            .collect();
+        assert!(grid.contains("local collectors"), "got: {grid}");
+        assert!(!grid.contains("rocm daemon"), "got: {grid}");
+    }
+
+    #[test]
     fn wide_triptych_aligns_tabs_with_center_not_far_left() {
         // A wide body: tabs (over center_outer) must start to the RIGHT of the
         // GPU wall, left-aligned with the center column — not at the far left.
@@ -1141,9 +1176,11 @@ mod tests {
     #[test]
     fn quit_confirm_body_prints_the_stop_command_during_the_startup_fallback_when_the_registry_names_an_id()
      {
-        // On a host whose dashboard-embedded daemon client never connects at
-        // all (Windows — `has_received_snapshot` never flips for the whole
-        // session), `instances` never fills, so without this the quit prompt
+        // On a host whose daemon client never sends an instance snapshot
+        // (Windows — it connects and streams live GPU/CPU/memory every tick,
+        // but has no `rocmdashd` socket to source an instance list from, so
+        // `has_received_snapshot` never flips for the whole session),
+        // `instances` never fills, so without this the quit prompt
         // could only ever print the generic "a model was serving" sentence —
         // no model name (expected: `instances` is the only source for that),
         // but also no stop command and no id, even though the live registry
