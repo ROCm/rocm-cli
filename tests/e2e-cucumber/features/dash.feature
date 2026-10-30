@@ -667,3 +667,85 @@ Feature: Interactive dashboard
     Then the warning text is no longer displayed
     When the user quits the dashboard
     Then the dashboard exits successfully
+
+  @id:dash-serve-wizard-opens-collapsed @requires-os:linux
+  Scenario: dash-39 - Opening the serve wizard shows only the model, Advanced settings, and Launch
+    When the user opens the dashboard with demo data
+    And the user opens the Observe view
+    And the user opens the serve wizard
+    Then the serve wizard shows only the model, Advanced settings, and Launch
+    When the user presses Escape
+    Then the serve wizard is closed
+    When the user quits the dashboard
+    Then the dashboard exits successfully
+
+  @id:dash-serve-wizard-escape-cancels-edit-without-closing @requires-os:linux
+  Scenario: dash-40 - Escape cancels an in-progress host edit without closing the serve wizard
+    When the user opens the dashboard with demo data
+    And the user opens the Observe view
+    And the user opens the serve wizard
+    And the user expands the serve wizard's Advanced settings
+    And the user starts editing the serve wizard's Host field
+    And the user types "nope" into the serve wizard
+    And the user presses Escape
+    Then the serve wizard is still open with the host unchanged
+    When the user presses Escape
+    Then the serve wizard is closed
+    When the user quits the dashboard
+    Then the dashboard exits successfully
+
+  @id:dash-serve-wizard-automatic-form-stages-bare-serve @requires-os:linux
+  Scenario: dash-41 - An automatic serve form stages a bare serve command with an automatic port
+    When the user opens the dashboard with demo data
+    And the user opens the Observe view
+    And the user opens the serve wizard
+    And the user types "demo-model" into the serve wizard
+    And the user presses Down 2 times in the serve wizard
+    And the user presses Enter in the serve wizard
+    Then the serve wizard asks to approve "serve demo-model" with an automatic port
+    When the user presses Escape
+    Then the serve wizard approval closes and the wizard stays open
+    When the user presses Escape
+    Then the serve wizard is closed
+    When the user quits the dashboard
+    Then the dashboard exits successfully
+
+  @id:dash-serve-wizard-refuses-custom-host-with-automatic-port @requires-os:linux
+  Scenario: dash-42 - A custom host with an automatic port is refused in the form
+    When the user opens the dashboard with demo data
+    And the user opens the Observe view
+    And the user opens the serve wizard
+    And the user types "demo-model" into the serve wizard
+    And the user presses Down 1 times in the serve wizard
+    And the user presses Enter in the serve wizard
+    And the user presses Down 3 times in the serve wizard
+    And the user presses Enter in the serve wizard
+    And the user types "localhost" into the serve wizard
+    And the user presses Enter in the serve wizard
+    And the user presses Down 3 times in the serve wizard
+    And the user presses Enter in the serve wizard
+    Then the serve wizard refuses to launch and says "set Port to Custom"
+    When the user presses Escape
+    Then the serve wizard is closed
+    When the user quits the dashboard
+    Then the dashboard exits successfully
+
+  @id:dash-serve-wizard-refuses-public-host @requires-os:linux
+  Scenario: dash-43 - A public host is refused in the form with the CLI pointer
+    When the user opens the dashboard with demo data
+    And the user opens the Observe view
+    And the user opens the serve wizard
+    And the user types "demo-model" into the serve wizard
+    And the user presses Down 1 times in the serve wizard
+    And the user presses Enter in the serve wizard
+    And the user presses Down 3 times in the serve wizard
+    And the user presses Enter in the serve wizard
+    And the user types "0.0.0.0" into the serve wizard
+    And the user presses Enter in the serve wizard
+    And the user presses Down 3 times in the serve wizard
+    And the user presses Enter in the serve wizard
+    Then the serve wizard refuses to launch and says "Dash serves on loopback only"
+    When the user presses Escape
+    Then the serve wizard is closed
+    When the user quits the dashboard
+    Then the dashboard exits successfully

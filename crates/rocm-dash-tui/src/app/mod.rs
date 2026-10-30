@@ -937,7 +937,8 @@ impl AppState {
     /// (and is ignored while a job runs) before it can eject the manager.
     pub(crate) fn active_overlay_at_root(&self) -> bool {
         self.serve_wizard.as_ref().is_none_or(|w| {
-            w.browser.is_none()
+            w.editor.is_none()
+                && w.browser.is_none()
                 && w.picker.is_none()
                 && w.approval.is_none()
                 && w.active_job.is_none()
@@ -1130,7 +1131,7 @@ impl AppState {
         self.chat_detect_dispatch = true;
         if self.chat_consent == ChatConsent::Accepted {
             self.chat.push(ChatTurn::agent(
-                "Detecting a local engine (Lemonade :13305 / vLLM :8000 / rocm serve :11435)…"
+                "Detecting a local engine (Lemonade :13305 / vLLM :8000 / a rocm serve service)…"
                     .to_string(),
             ));
         }
@@ -1160,7 +1161,7 @@ impl AppState {
             self.chat_detect_offer = Some(cfg);
         } else {
             self.chat_detect_offer = None;
-            let msg = "no local engine found (Lemonade :13305 / vLLM :8000 / rocm serve :11435)";
+            let msg = "no local engine found (Lemonade :13305 / vLLM :8000 / a rocm serve service)";
             if accepted {
                 self.chat.push(ChatTurn::agent(msg.to_string()));
             } else {
@@ -1864,6 +1865,56 @@ mod tests {
         );
     }
 
+    #[test]
+    fn serve_wizard_editor_handles_escape_before_overlay_back_out() {
+        let mut state = AppState::new("t".into(), "default-dark".into());
+        state.active_tab = ActiveTab::Serving;
+        let mut wizard = crate::ui::serve_wizard::ServeWizardState {
+            model: "typed-model".into(),
+            ..Default::default()
+        };
+        wizard.editor = Some(crate::ui::serve_wizard::InlineEditor {
+            field: crate::ui::serve_wizard::Field::Host,
+            value: "localhost".into(),
+            cursor: 9,
+            selected: false,
+        });
+        state.serve_wizard = Some(wizard);
+
+        assert!(
+            !state.should_pane_back_out(crossterm::event::KeyCode::Esc),
+            "Esc must reach the inline editor instead of closing the wizard"
+        );
+
+        // Drive Esc through the real dispatch (mirrors event_loop.rs's
+        // `state.serve_wizard.is_some()` arm) instead of only checking the
+        // routing predicate above, so a removed `editor_key` Esc arm turns
+        // this test red.
+        let key = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+        );
+        let _ = crate::ui::serve_wizard::on_key(
+            &mut state.serve_wizard,
+            &mut state.jobs,
+            &state.model_recipes,
+            key,
+        );
+
+        let wizard = state
+            .serve_wizard
+            .as_ref()
+            .expect("Esc must not close the wizard");
+        assert!(
+            wizard.editor.is_none(),
+            "Esc must discard the inline editor"
+        );
+        assert_eq!(
+            wizard.model, "typed-model",
+            "the in-progress form remains available to the editor handler"
+        );
+    }
+
     /// `active_overlay_at_root`'s per-manager clauses are a hand-maintained
     /// enumeration of each manager's nested sub-view fields (documented on
     /// `OnboardingState`, which lists every struct this covers). Nothing stops
@@ -1895,10 +1946,12 @@ mod tests {
             field: _,
             model: _,
             engine_idx: _,
-            device_idx: _,
             host: _,
+            port_mode: _,
             port: _,
             managed: _,
+            advanced_expanded: _,
+            editor: _,
             browser,
             picker,
             approval,

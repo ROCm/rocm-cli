@@ -323,6 +323,28 @@ Feature: Model serving
     Then the CLI refuses and names the exact command to stop the existing service
     And running that command actually stops the service
 
+  # An explicit --port is a demand: when an equivalent service (same engine and
+  # model) is already live on a different port, serve refuses instead of
+  # reporting success on the old port. Same planted record and lane as serve-24.
+  @id:serve-explicit-port-refused-for-live-equivalent @requires-gpu @requires-engine:lemonade @requires-os:linux
+  Scenario: serve-32 - An explicit port that differs from a running equivalent service is refused
+    Given a managed runtime is active
+    And an unauthenticated Lemonade service is already running for that model
+    When the user serves that same model again on an explicit port other than the running one
+    Then the CLI refuses and names the port the running service uses
+    And the CLI names the exact command to stop the existing service
+
+  # `rocm services restart` takes the launch lock and refuses a port another
+  # live managed service now holds, before it spawns anything. No GPU: the
+  # refusal comes from the on-disk records.
+  @id:services-restart-refused-when-port-claimed @requires-os:linux
+  Scenario: serve-33 - Restarting a service whose port another service holds is refused
+    Given a managed runtime is active
+    And another managed service already reserves the default serve port
+    And a stopped managed service is recorded on the default serve port
+    When the user restarts the stopped service
+    Then the restart is refused naming the service that holds the port
+
   # ROCMAI-543: a Windows console on the OEM code page (437) renders a UTF-8 em
   # dash, and other non-ASCII punctuation, as mojibake (e.g. "ΓÇö") instead of
   # transliterating it. `rocm model` is the flagship instance of that bug class;
@@ -379,3 +401,61 @@ Feature: Model serving
     And the user sends a chat completion request
     Then the response contains a model reply
     And the response identifies the correct model
+
+  # Parse-time refusal (serve-port rewrite): an out-of-range `--port` (0 here;
+  # 65536 and non-numeric values share the same parser and message) is rejected
+  # before any engine or GPU work, so it needs no GPU and gates every PR
+  # (ungated), like its sibling serve-14.
+  @id:serve-invalid-port-rejected
+  Scenario: serve-28 - Serving with an out-of-range port is refused with a clear reason
+    When the user serves a model with an out-of-range port
+    Then serving is refused before any engine starts
+    And the user is told the port must be between 1 and 65535
+
+  # Collision-safe explicit ports (serve-port rewrite). An explicit `--port`
+  # equal to one a live managed service already holds must be refused before any
+  # bind is attempted, naming the service so the user can stop it or pick
+  # another port. Reaching this check needs a real GPU: `resolve_serve_port`
+  # only runs once `spawn_managed_engine_child` has a completed model/engine
+  # resolution in hand, and `serve` has no CPU fallback that gets there. The
+  # "stop the service holding that port" advice is checked here by its wording
+  # only; the advice is actually proven by
+  # `stopping_the_reserving_record_frees_its_explicit_port_for_reuse` in
+  # apps/rocm/src/service_launch.rs, per AGENTS.md section 3.
+  # Runs in the merge queue, like its automatic-port sibling serve-auto-port-skips-occupied.
+  @id:serve-explicit-port-reserved @requires-gpu @merge-queue
+  Scenario: serve-29 - Serving on a port another managed service already holds is refused
+    Given a managed runtime is active
+    And another managed service already reserves the default serve port
+    When the user serves a model explicitly on the reserved port
+    Then serving is refused before any engine starts
+    And the user is told to stop the service holding that port
+
+  # Collision-safe explicit ports, untracked-process case (serve-port rewrite,
+  # sibling of serve-29). No managed-service record exists here, so
+  # `resolve_serve_port` never reaches the "reserved by managed service" branch
+  # and instead gets a plain OS-level `AddrInUse` back from the bind probe,
+  # routing to `explicit_bind_error`'s "already in use by another process"
+  # message. Needs the same `@requires-gpu` as serve-29 for the same reason:
+  # `resolve_serve_port` only runs once `spawn_managed_engine_child` has a
+  # completed model/GPU resolution in hand (GPU indices are selected earlier in
+  # `serve_cmd.rs`, under the launch lock, before any port is ever probed), and
+  # `serve` has no CPU fallback that gets there.
+  @id:serve-explicit-port-in-use-by-untracked-process @requires-gpu @merge-queue
+  Scenario: serve-30 - Serving on a port an untracked process already holds is refused
+    Given a managed runtime is active
+    And the default serve port is occupied
+    When the user serves a model explicitly on the occupied port
+    Then serving is refused before any engine starts
+    And the user is told the port is already in use by another process
+
+  # Real CLI coverage for automatic port allocation. A loopback listener holds
+  # the legacy default while one real managed GPU serve starts; the reported
+  # endpoint must advance to the next candidate rather than failing late in the
+  # engine. Runs in the merge queue because it launches a real model server.
+  @id:serve-auto-port-skips-occupied @requires-gpu @merge-queue
+  Scenario: serve-31 - Automatic serving skips an occupied default port
+    Given a managed runtime is active
+    And the default serve port is occupied
+    When the user serves a model with automatic port selection
+    Then the service uses the next automatic port

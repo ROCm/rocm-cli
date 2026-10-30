@@ -65,6 +65,9 @@ pub struct E2eWorld {
     /// so the port keeps answering, as a started ComfyUI's does, for the rest
     /// of the scenario.
     pub comfyui_port_listener: Option<std::net::TcpListener>,
+    /// Listener that deliberately occupies the default serve port while a real
+    /// `rocm serve` invocation proves automatic allocation advances past it.
+    pub automatic_port_guard: Option<std::net::TcpListener>,
     /// Cache-marker destination discovered from `rocmd`'s own JSON report.
     pub artifact_marker_path: Option<PathBuf>,
     pub endpoint: Option<String>,
@@ -299,6 +302,7 @@ impl Default for E2eWorld {
             artifact_server: None,
             paced_download_server: None,
             comfyui_port_listener: None,
+            automatic_port_guard: None,
             artifact_marker_path: None,
             endpoint: None,
             model_name: None,

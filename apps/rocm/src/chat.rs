@@ -2220,6 +2220,20 @@ fn validate_chat_launch_server_tool_call(call: &providers::ChatToolCall) -> Resu
     if !is_loopback_host(&host) {
         bail!("local assistant cannot request non-local host `{host}`");
     }
+    // A malformed `port` must be rejected here, not silently dropped by the
+    // argv builder and left to fall through to automatic port selection.
+    let port = rocm_core::launch_port_argument(object.get("port"))
+        .map_err(|reason| anyhow::anyhow!("ROCm tool `launch_server` argument `port` {reason}"))?;
+    // `rocm serve` proves a port is free only on the exact default host; every
+    // other spelling (including the loopback aliases `localhost`/`::1` this
+    // check still accepts) needs an explicit port or the CLI call refuses
+    // later with a less actionable error. See `is_canonical_loopback_host`.
+    if port.is_none() && !rocm_core::is_canonical_loopback_host(&host) {
+        bail!(
+            "local assistant must supply an explicit `port` for host `{host}`; automatic port \
+             selection is only supported on the default host {DEFAULT_LOCAL_HOST}"
+        );
+    }
     if object
         .get("device")
         .and_then(serde_json::Value::as_str)
@@ -2719,6 +2733,16 @@ pub(crate) fn validate_chat_rocm_command_safety(args: &[String]) -> Result<()> {
         {
             bail!("local assistant cannot request non-local host `{host}`");
         }
+        // The same rule `rocm serve` applies, so an approval card is never offered
+        // for a command the CLI then refuses.
+        let port = chat_cli_arg_value(args, "--port")
+            .map(crate::serve_port::parse_serve_port)
+            .transpose()
+            .map_err(anyhow::Error::msg)?;
+        crate::serve_port::validate_port_request(
+            chat_cli_arg_value(args, "--host").unwrap_or(rocm_core::DEFAULT_LOCAL_HOST),
+            crate::serve_port::PortRequest::from_flag(port),
+        )?;
         if chat_cli_has_flag(args, "--foreground") || !chat_cli_has_flag(args, "--managed") {
             bail!("local assistant must request managed serving with --managed");
         }
@@ -5983,6 +6007,26 @@ model recipes
             .to_string();
         assert!(error.contains("public network binding"));
 
+        let no_port_on_custom_host = providers::ChatToolCall {
+            id: None,
+            name: "rocm_command".to_owned(),
+            arguments: serde_json::json!({
+                "args": ["serve", "qwen", "--host", "localhost", "--managed"]
+            }),
+        };
+        let error = validate_chat_tool_call(&no_port_on_custom_host)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("explicit `--port"), "{error}");
+        validate_chat_tool_call(&providers::ChatToolCall {
+            id: None,
+            name: "rocm_command".to_owned(),
+            arguments: serde_json::json!({
+                "args": ["serve", "qwen", "--host", "localhost", "--port", "8000", "--managed"]
+            }),
+        })
+        .expect("an explicit port on a loopback host is allowed");
+
         let foreground = providers::ChatToolCall {
             id: None,
             name: "rocm_command".to_owned(),
@@ -6317,6 +6361,92 @@ model recipes
         };
         let error = validate_chat_tool_call(&host).unwrap_err().to_string();
         assert!(error.contains("non-local host"));
+    }
+
+    #[test]
+    fn chat_tool_call_requires_an_explicit_port_for_non_canonical_loopback_hosts() {
+        let no_port = providers::ChatToolCall {
+            id: None,
+            name: "launch_server".to_owned(),
+            arguments: serde_json::json!({
+                "model": "tiny.gguf",
+                "engine": "vllm",
+                "host": "localhost"
+            }),
+        };
+        let error = validate_chat_tool_call(&no_port).unwrap_err().to_string();
+        assert!(
+            error.contains("explicit `port`"),
+            "unexpected error: {error}"
+        );
+
+        let with_port = providers::ChatToolCall {
+            id: None,
+            name: "launch_server".to_owned(),
+            arguments: serde_json::json!({
+                "model": "tiny.gguf",
+                "engine": "vllm",
+                "host": "localhost",
+                "port": 11999
+            }),
+        };
+        validate_chat_tool_call(&with_port).expect("explicit port on localhost is allowed");
+
+        let canonical_no_port = providers::ChatToolCall {
+            id: None,
+            name: "launch_server".to_owned(),
+            arguments: serde_json::json!({
+                "model": "tiny.gguf",
+                "engine": "vllm",
+                "host": "127.0.0.1"
+            }),
+        };
+        validate_chat_tool_call(&canonical_no_port)
+            .expect("automatic port selection still works on the canonical loopback host");
+    }
+
+    #[test]
+    fn chat_tool_call_rejects_a_malformed_port_instead_of_letting_it_fall_through() {
+        // A non-integer `port` must not be treated as "no port supplied" here:
+        // the argv builder (`object.get("port").and_then(as_u64)`) would drop
+        // it just as silently, so without this check a malformed port on a
+        // non-canonical host would sail past validation only to fall through
+        // to automatic port selection the host doesn't support.
+        let string_port = providers::ChatToolCall {
+            id: None,
+            name: "launch_server".to_owned(),
+            arguments: serde_json::json!({
+                "model": "tiny.gguf",
+                "engine": "vllm",
+                "host": "localhost",
+                "port": "11999"
+            }),
+        };
+        let error = validate_chat_tool_call(&string_port)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("must be an integer"),
+            "unexpected error: {error}"
+        );
+
+        let out_of_range_port = providers::ChatToolCall {
+            id: None,
+            name: "launch_server".to_owned(),
+            arguments: serde_json::json!({
+                "model": "tiny.gguf",
+                "engine": "vllm",
+                "host": "127.0.0.1",
+                "port": 70000
+            }),
+        };
+        let error = validate_chat_tool_call(&out_of_range_port)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("between 1 and 65535"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

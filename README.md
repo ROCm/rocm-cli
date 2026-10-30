@@ -834,6 +834,22 @@ after a crash inherits the daemon's environment, not yours, so a forwarded
 secret must also be set there. `ROCM_CLI_AIM_READY_TIMEOUT_SECS` raises the
 5-minute readiness wait for a cold-start model download.
 
+`--port` is optional on the default loopback host (`127.0.0.1`): omit it and
+`rocm serve` picks the first free port in `11435`-`11535`, checking both
+rocm-cli's own records and the OS. The non-interactive plan output (piped
+output, or the Dash approval card) shows `Port: automatic; endpoint shown
+after launch` while the launch is in flight and prints the concrete endpoint
+once the port is actually leased; the interactive deployment summary table
+only ever shows the final resolved endpoint. Pass `--port` explicitly to pin
+one; on `127.0.0.1`, an explicit loopback port already reserved by another
+managed service is rejected up front, naming that service and how to free it
+(`rocm services stop <service-id> --yes`). A port held by an untracked process
+is rejected too, but without naming the holder. `--host` to anything other
+than the default
+loopback address (`localhost`, `::1`, `0.0.0.0`, or any other address)
+requires an explicit `--port`: automatic selection only probes `127.0.0.1` and
+cannot promise a free port anywhere else.
+
 `--gpu-memory-utilization` (a fraction above 0.0 and up to 1.0 of each GPU's
 total VRAM) and `--tool-call-parser` (for example `hermes`, `llama3_json`, or
 `mistral`, which also turns on automatic tool choice) apply to vLLM only. Lower
@@ -861,6 +877,10 @@ different settings. If you previously started a service with `--temperature`
 (or another sampling flag) and now run `rocm serve` for the same model without
 flags, or with different ones, stop the existing service first (`rocm
 services stop <service-id> --yes`) or match the original flags.
+
+Likewise, an explicit `--port` that differs from the port the running service
+is already on is refused rather than silently ignored; omit `--port` to reuse
+the running service, or stop it first to serve on the new port.
 
 By default the server runs in the background under ROCm CLI's supervision and
 prints a deployment summary: a progress indicator while it starts, then a table

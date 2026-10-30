@@ -445,7 +445,8 @@ pub(crate) fn rocm_mcp_tools() -> Vec<Value> {
                     "port": {
                         "type": "integer",
                         "minimum": 1,
-                        "maximum": 65535
+                        "maximum": 65535,
+                        "description": "Required unless host is exactly 127.0.0.1 (localhost/::1 still need one)."
                     },
                     "allow_public_bind": {
                         "type": "boolean"
@@ -1079,6 +1080,20 @@ fn build_launch_server_args(arguments: &serde_json::Map<String, Value>) -> Resul
             "launch_server host `{host}` is not loopback; require `allow_public_bind=true` before binding a non-local interface"
         );
     }
+    // A malformed `port` must be rejected here, not silently dropped by the
+    // argv builder and left to fall through to automatic port selection.
+    let port = rocm_core::launch_port_argument(arguments.get("port"))
+        .map_err(|reason| anyhow::anyhow!("launch_server argument `port` {reason}"))?;
+    // `rocm serve` proves a port is free only on the exact default host; every
+    // other spelling (including the loopback aliases `localhost`/`::1` the
+    // check above still accepts) needs an explicit port or the CLI call
+    // refuses later with a less actionable error. See `is_canonical_loopback_host`.
+    if port.is_none() && !rocm_core::is_canonical_loopback_host(host) {
+        bail!(
+            "launch_server host `{host}` needs an explicit `port`; automatic port selection is \
+             only supported on the default host {DEFAULT_LOCAL_HOST}"
+        );
+    }
 
     let mut argv = vec!["serve".to_owned(), model.to_owned(), "--managed".to_owned()];
     if let Some(engine) = arguments.get("engine").and_then(Value::as_str) {
@@ -1102,7 +1117,7 @@ fn build_launch_server_args(arguments: &serde_json::Map<String, Value>) -> Resul
     if allow_public_bind {
         argv.push("--allow-public-bind".to_owned());
     }
-    if let Some(port) = arguments.get("port").and_then(Value::as_u64) {
+    if let Some(port) = port {
         argv.push("--port".to_owned());
         argv.push(port.to_string());
     }
@@ -1407,9 +1422,62 @@ mod tests {
             ("model".to_owned(), Value::String("tiny-gpt2".to_owned())),
             ("host".to_owned(), Value::String("0.0.0.0".to_owned())),
             ("allow_public_bind".to_owned(), Value::Bool(true)),
+            ("port".to_owned(), Value::Number(11999.into())),
         ]);
         let args = build_launch_server_args(&arguments)?;
         assert!(args.contains(&"--allow-public-bind".to_owned()));
+        Ok(())
+    }
+
+    #[test]
+    fn launch_server_requires_an_explicit_port_for_non_canonical_loopback_hosts() {
+        let arguments = serde_json::Map::from_iter([
+            ("model".to_owned(), Value::String("tiny-gpt2".to_owned())),
+            ("host".to_owned(), Value::String("localhost".to_owned())),
+        ]);
+        let error = build_launch_server_args(&arguments).unwrap_err();
+        assert!(error.to_string().contains("explicit `port`"), "{error:#}");
+    }
+
+    #[test]
+    fn launch_server_rejects_a_malformed_port_instead_of_choosing_one_automatically() {
+        // Each value would be dropped by a lenient argv builder and leave the
+        // launch to automatic port selection on a host that cannot do it.
+        for (port, expected) in [
+            (Value::String("8000".to_owned()), "must be an integer"),
+            (Value::Number(0.into()), "between 1 and 65535"),
+            (Value::Number(65536.into()), "between 1 and 65535"),
+        ] {
+            let arguments = serde_json::Map::from_iter([
+                ("model".to_owned(), Value::String("tiny-gpt2".to_owned())),
+                ("host".to_owned(), Value::String("localhost".to_owned())),
+                ("port".to_owned(), port.clone()),
+            ]);
+            let error = build_launch_server_args(&arguments).unwrap_err();
+            assert!(error.to_string().contains(expected), "{port}: {error:#}");
+        }
+    }
+
+    #[test]
+    fn launch_server_treats_a_null_port_as_automatic() -> Result<()> {
+        let arguments = serde_json::Map::from_iter([
+            ("model".to_owned(), Value::String("tiny-gpt2".to_owned())),
+            ("port".to_owned(), Value::Null),
+        ]);
+        let args = build_launch_server_args(&arguments)?;
+        assert!(!args.contains(&"--port".to_owned()), "{args:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn launch_server_allows_localhost_with_an_explicit_port() -> Result<()> {
+        let arguments = serde_json::Map::from_iter([
+            ("model".to_owned(), Value::String("tiny-gpt2".to_owned())),
+            ("host".to_owned(), Value::String("localhost".to_owned())),
+            ("port".to_owned(), Value::Number(11999.into())),
+        ]);
+        let args = build_launch_server_args(&arguments)?;
+        assert!(args.contains(&"11999".to_owned()));
         Ok(())
     }
 

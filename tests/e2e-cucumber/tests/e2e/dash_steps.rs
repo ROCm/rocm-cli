@@ -582,6 +582,173 @@ async fn choose_serving(world: &mut E2eWorld) {
         .unwrap_or_else(|e| panic!("failed to open Serving: {e}"));
 }
 
+#[when("the user opens the serve wizard")]
+async fn open_serve_wizard(world: &mut E2eWorld) {
+    // `w` opens the serve wizard, but only from the Observe tab (`actions.rs`),
+    // so the preceding `the user opens the Observe view` step is load-bearing
+    // — it also proves the event loop is reading input, the same way
+    // `open_services_overlay` relies on it for `s`.
+    let tui = session(world);
+    tui.send("w")
+        .unwrap_or_else(|e| panic!("failed to open the serve wizard: {e}"));
+    tui.wait_for_screen("Serve a model", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("serve wizard did not open: {e}"));
+}
+
+#[then("the serve wizard shows only the model, Advanced settings, and Launch")]
+async fn serve_wizard_shows_only_basic_fields(world: &mut E2eWorld) {
+    let tui = session(world);
+    tui.wait_for_screen("[ Launch ]", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("serve wizard did not finish drawing: {e}"));
+    let screen = tui.screen_text();
+    assert!(
+        screen.contains("Model   ")
+            && screen.contains("Advanced settings ▸ Automatic")
+            && screen.contains("[ Launch ]"),
+        "serve wizard is missing one of its collapsed-view fields:\n{screen}"
+    );
+    assert!(
+        !screen.contains("Engine  ")
+            && !screen.contains("Device  ")
+            && !screen.contains("Host    ")
+            && !screen.contains("Port    ")
+            && !screen.contains("Mode    "),
+        "serve wizard shows an advanced field while collapsed:\n{screen}"
+    );
+}
+
+// `Field::Model` is at index 0 of the collapsed `BASIC_FIELDS`, so one Down
+// reaches `Field::Advanced`. Arrow keys are sent as their raw VT100 escape
+// sequences, same as a real terminal would report them; the wizard's `on_key`
+// only matches literal `KeyCode::Up`/`Down`, not vim-style `j`/`k`, so those
+// would be typed straight into the focused field instead of moving focus.
+#[when("the user expands the serve wizard's Advanced settings")]
+async fn expand_serve_wizard_advanced(world: &mut E2eWorld) {
+    let tui = session(world);
+    tui.send("\x1b[B")
+        .unwrap_or_else(|e| panic!("failed to move to Advanced settings: {e}"));
+    tui.send("\r")
+        .unwrap_or_else(|e| panic!("failed to expand Advanced settings: {e}"));
+    tui.wait_for_screen("Advanced settings ▾", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("Advanced settings did not expand: {e}"));
+}
+
+// With Advanced expanded, focus is still on `Field::Advanced` (index 1 of the
+// full `FIELDS` order); three more Downs walk Engine → Device → Host.
+#[when("the user starts editing the serve wizard's Host field")]
+async fn start_editing_serve_wizard_host(world: &mut E2eWorld) {
+    let tui = session(world);
+    for _ in 0..3 {
+        tui.send("\x1b[B")
+            .unwrap_or_else(|e| panic!("failed to move toward the Host field: {e}"));
+    }
+    tui.send("\r")
+        .unwrap_or_else(|e| panic!("failed to start editing the Host field: {e}"));
+    tui.wait_for_screen("editing host", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("Host field editor did not open: {e}"));
+}
+
+#[when(expr = "the user types {string} into the serve wizard")]
+async fn type_into_serve_wizard(world: &mut E2eWorld, text: String) {
+    session(world)
+        .send(&text)
+        .unwrap_or_else(|e| panic!("failed to type {text:?} into the serve wizard: {e}"));
+}
+
+#[then("the serve wizard is still open with the host unchanged")]
+async fn serve_wizard_still_open_host_unchanged(world: &mut E2eWorld) {
+    let tui = session(world);
+    tui.wait_until_gone("editing host", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("Host edit was not cancelled by Escape: {e}"));
+    let screen = tui.screen_text();
+    assert!(
+        screen.contains("Serve a model")
+            && screen.contains("[127.0.0.1]")
+            && !screen.contains("editing host"),
+        "Escape did not cleanly cancel the Host edit:\n{screen}"
+    );
+}
+
+#[when(expr = "the user presses Down {int} times in the serve wizard")]
+async fn press_down_in_serve_wizard(world: &mut E2eWorld, times: u32) {
+    for _ in 0..times {
+        session(world)
+            .send("\x1b[B")
+            .unwrap_or_else(|e| panic!("failed to move down in the serve wizard: {e}"));
+    }
+}
+
+#[when("the user presses Enter in the serve wizard")]
+async fn press_enter_in_serve_wizard(world: &mut E2eWorld) {
+    session(world)
+        .send("\r")
+        .unwrap_or_else(|e| panic!("failed to press Enter in the serve wizard: {e}"));
+}
+
+// The approval card is what the user is asked to approve, so the staged
+// command line is asserted there: an automatic form stages a bare
+// `serve <model>`, with no engine or port flag the CLI should be choosing.
+#[then(expr = "the serve wizard asks to approve {string} with an automatic port")]
+async fn serve_wizard_asks_to_approve_automatic(world: &mut E2eWorld, command: String) {
+    let tui = session(world);
+    tui.wait_for_screen(
+        "Port: automatic; endpoint shown after launch",
+        default_timeout(),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("the serve wizard did not stage an approval: {e}"));
+    let screen = tui.screen_text();
+    assert!(
+        screen.contains(&command) && !screen.contains("--engine") && !screen.contains("--port"),
+        "expected a bare `{command}` with no engine or port flag:\n{screen}"
+    );
+}
+
+#[then("the serve wizard approval closes and the wizard stays open")]
+async fn serve_wizard_approval_closes_wizard_stays(world: &mut E2eWorld) {
+    // Waiting for the approval to clear between two Escapes keeps them from
+    // coalescing into one in the same PTY read, and shows the first one closed
+    // only the approval.
+    let tui = session(world);
+    tui.wait_until_gone(
+        "Port: automatic; endpoint shown after launch",
+        default_timeout(),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("the serve approval did not close: {e}"));
+    let screen = tui.screen_text();
+    assert!(
+        screen.contains("Serve a model"),
+        "Escape on the approval closed the whole wizard:\n{screen}"
+    );
+}
+
+#[then(expr = "the serve wizard refuses to launch and says {string}")]
+async fn serve_wizard_refuses_to_launch(world: &mut E2eWorld, message: String) {
+    let tui = session(world);
+    tui.wait_for_screen(&message, default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the serve wizard did not refuse the launch: {e}"));
+    let screen = tui.screen_text();
+    assert!(
+        screen.contains("Serve a model") && !screen.contains("Port: automatic;"),
+        "a refused launch must leave the form open and stage nothing:\n{screen}"
+    );
+}
+
+#[then("the serve wizard is closed")]
+async fn serve_wizard_closed(world: &mut E2eWorld) {
+    session(world)
+        .wait_until_gone("Serve a model", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the serve wizard is still open after Escape: {e}"));
+}
+
 #[when("the user opens onboarding setup")]
 async fn open_onboarding_setup(world: &mut E2eWorld) {
     // `n` opens the onboarding wizard from the Observe tab

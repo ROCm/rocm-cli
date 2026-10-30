@@ -39,6 +39,7 @@ mod runtime_install_finalize;
 mod runtime_services;
 mod runtimes_cmd;
 mod serve_cmd;
+mod serve_port;
 mod serve_summary;
 mod service_hints;
 mod service_launch;
@@ -531,9 +532,16 @@ rocm serve qwen --verbose --device gpu_required")]
         /// Host address to bind.
         #[arg(long, default_value = DEFAULT_LOCAL_HOST)]
         host: String,
-        /// TCP port to bind.
-        #[arg(long, default_value_t = rocm_core::DEFAULT_LOCAL_PORT)]
-        port: u16,
+        /// TCP port to bind. Omit it to choose an available port automatically,
+        /// starting at 11435, on the default 127.0.0.1 host. Any other --host
+        /// requires an explicit --port: proactive collision detection is claimed
+        /// only for local 127.0.0.1 serving.
+        // `allow_hyphen_values` so a negative value such as `-1` reaches
+        // `parse_serve_port` and gets the domain error naming the valid range,
+        // instead of clap rejecting it as an unknown flag. Mirrors the same
+        // choice made for `--gpu-memory-utilization` below.
+        #[arg(long, value_parser = serve_port::parse_serve_port, allow_hyphen_values = true)]
+        port: Option<u16>,
         /// Attach to the server in this terminal and stream its logs (Ctrl-D to
         /// detach and leave it running, Ctrl-C to stop). Same as --verbose.
         #[arg(long, conflicts_with = "managed")]
@@ -4565,8 +4573,11 @@ fn apply_service_prune_plan(
 /// window — [`select_gpu_indices_under_launch_lock`] acquires it, hands the
 /// guard back to its caller, and `start_managed_service`/`run_attached_service`
 /// only drop it once the record is persisted (see that function's own comment,
-/// which this one must not drift from). The gap was simply that prune never
-/// acquired it: the helper above was the single acquirer in the tree. Taking it
+/// which this one must not drift from). `restart_internal_managed_service_with`
+/// acquires the same lock around its own respawn, for the same reason. The gap
+/// was simply that prune never acquired it, while those two already did
+/// (`rocmd`'s recovery path takes the same file lock too, bounded, from its own
+/// process — see `restart_managed_service`'s doc comment). Taking it
 /// here closes the window deterministically, for any number of records, which no
 /// age floor can — the window is not short and is not bounded, because
 /// `spawn_managed_engine_child`'s idempotency guard runs `load_managed_services`
@@ -4624,9 +4635,9 @@ fn apply_service_prune_plan(
 /// **No nested acquire.** `FileLock::acquire` blocks with no `try_` variant, so
 /// a second acquire on this same lock path while this process already holds
 /// it would hang forever. Nothing reachable from either phase re-acquires
-/// `managed_launch_lock_path`: the only other production call site on this
-/// same path is `select_gpu_indices_under_launch_lock`, which is only ever
-/// reached from `serve`, and `serve` never runs prune in-process or as a
+/// `managed_launch_lock_path`: the other production acquirers of this
+/// same path are `select_gpu_indices_under_launch_lock` (reached only from
+/// `serve`) and `rocm services restart`, and neither runs prune in-process or as a
 /// subprocess (test code acquires this path directly too, but that is test
 /// setup, not something reachable from this function's own call graph).
 ///
@@ -5932,6 +5943,21 @@ pub(crate) mod tests {
             .collect()
     }
 
+    fn serve_arg_help(arg_id: &str) -> String {
+        let mut cli = Cli::command();
+        let serve = cli
+            .find_subcommand_mut("serve")
+            .expect("serve subcommand exists");
+        let arg = serve
+            .get_arguments()
+            .find(|arg| arg.get_id().as_str() == arg_id)
+            .unwrap_or_else(|| panic!("serve has no `{arg_id}` argument"));
+        arg.get_long_help()
+            .map(ToString::to_string)
+            .or_else(|| arg.get_help().map(ToString::to_string))
+            .unwrap_or_default()
+    }
+
     // Both `--engine` and `--device` restrict their input to a fixed set via a
     // clap `value_parser`/`ValueEnum`, so invalid input is rejected as a usage
     // error (exit code 2) with the accepted choices listed. Values are advertised
@@ -6112,6 +6138,77 @@ pub(crate) mod tests {
             }
             other => panic!("expected Serve, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn serve_without_port_flag_requests_automatic_selection() {
+        let cli = parse_serve(&[]).expect("bare serve parses");
+        match cli.command {
+            Some(Command::Serve { port, host, .. }) => {
+                assert_eq!(port, None, "omitted --port must stay unresolved");
+                assert_eq!(host, DEFAULT_LOCAL_HOST);
+                assert!(serve_port::PortRequest::from_flag(port).is_auto());
+            }
+            other => panic!("expected Serve, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serve_with_explicit_port_keeps_it_concrete() {
+        let cli = parse_serve(&["--port", "8000"]).expect("explicit port parses");
+        match cli.command {
+            Some(Command::Serve { port, .. }) => {
+                assert_eq!(port, Some(8000));
+                assert_eq!(
+                    serve_port::PortRequest::from_flag(port),
+                    serve_port::PortRequest::Explicit(8000)
+                );
+            }
+            other => panic!("expected Serve, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serve_rejects_a_zero_or_out_of_range_port() {
+        for bad in ["0", "65536", "-1", "auto"] {
+            let error = parse_serve(&["--port", bad]).expect_err("must be rejected");
+            assert!(
+                error.to_string().contains("between 1 and 65535"),
+                "unexpected error for --port {bad}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn hidden_engine_serve_command_keeps_a_concrete_default_port() {
+        // Only the user-facing verb gained automatic selection; the direct engine
+        // entry point still requires (and defaults to) a concrete port.
+        let cli = Cli::try_parse_from([
+            "rocm",
+            "__engine-serve-http",
+            "lemonade",
+            "svc-1",
+            "qwen",
+            "--state-path",
+            "state.json",
+        ])
+        .expect("hidden engine command parses");
+        match cli.command {
+            Some(Command::EngineServeHttp { port, host, .. }) => {
+                assert_eq!(port, rocm_core::DEFAULT_LOCAL_PORT);
+                assert_eq!(host, DEFAULT_LOCAL_HOST);
+            }
+            other => panic!("expected EngineServeHttp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serve_port_help_documents_omission_and_the_custom_host_rule() {
+        let help = serve_arg_help("port");
+        assert!(help.contains("11435"), "{help}");
+        assert!(help.contains("automatically"), "{help}");
+        assert!(help.contains("127.0.0.1"), "{help}");
+        assert!(help.contains("explicit --port"), "{help}");
     }
 
     #[test]
