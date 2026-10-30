@@ -6582,17 +6582,57 @@ mod tests {
         assert!(planted, "/sys/bus/pci/drivers/amdgpu counts");
     }
 
-    /// The wiring, not just the helpers: `probe_modules_from` must consult the
-    /// host root. The module list it is handed names neither driver, so
-    /// `amdgpu_loaded` can only come from the planted
-    /// `/sys/bus/pci/drivers/amdgpu`, and that directory must not make
-    /// `amdkfd_loaded` true.
     /// A module list, as `read_module_list` returns it, naming neither
     /// `amdgpu` nor `amdkfd`.
     #[cfg(all(feature = "e2e-test-hooks", target_os = "linux"))]
     const NO_AMD_MODULES: &str = "snd_hda_intel 61440 3 - Live 0x0000000000000000\n\
                                   nvme 61440 2 - Live 0x0000000000000000";
 
+    /// The module list alone, against an empty host root: on a machine where
+    /// the drivers really are modules, each field must come from its own name
+    /// in the list. Both named answers both fields; `amdgpu` alone answers
+    /// only `amdgpu_loaded`, and `amdkfd` alone only `amdkfd_loaded`, so a
+    /// misspelt or swapped name in `driver_states` fails here.
+    #[cfg(all(feature = "e2e-test-hooks", target_os = "linux"))]
+    #[test]
+    fn probe_modules_reports_each_driver_its_module_list_names() {
+        use crate::hardware_root::TEST_HOST_ROOT_ENV;
+        use crate::test_env::RestoredEnvVar;
+
+        let root = tempfile::tempdir().expect("create host root");
+        let probe = |module_text: &str| {
+            let mut e = Examination::default();
+            probe_modules_from(&mut e, Some(module_text));
+            (e.amdgpu_loaded, e.amdkfd_loaded)
+        };
+        let (both, amdgpu_only, amdkfd_only) = {
+            let _guard = crate::hardware_root::HOST_ROOT_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _root = RestoredEnvVar::set(TEST_HOST_ROOT_ENV, root.path());
+            (
+                probe(
+                    "amdgpu 19378176 12 - Live 0x0000000000000000\n\
+                     amdkfd 380928 1 amdgpu, Live 0x0000000000000000\n\
+                     nvme 61440 2 - Live 0x0000000000000000",
+                ),
+                probe(
+                    "snd_hda_intel 61440 3 - Live 0x0000000000000000\n\
+                     amdgpu 19378176 12 - Live 0x0000000000000000",
+                ),
+                probe("amdkfd 380928 0 - Live 0x0000000000000000"),
+            )
+        };
+        assert_eq!(both, (Some(true), Some(true)), "both drivers listed");
+        assert_eq!(amdgpu_only, (Some(true), Some(false)), "only amdgpu listed");
+        assert_eq!(amdkfd_only, (Some(false), Some(true)), "only amdkfd listed");
+    }
+
+    /// The wiring, not just the helpers: `probe_modules_from` must consult the
+    /// host root. The module list it is handed names neither driver, so
+    /// `amdgpu_loaded` can only come from the planted
+    /// `/sys/bus/pci/drivers/amdgpu`, and that directory must not make
+    /// `amdkfd_loaded` true.
     #[cfg(all(feature = "e2e-test-hooks", target_os = "linux"))]
     #[test]
     fn probe_modules_reports_amdgpu_when_it_is_on_the_host() {
