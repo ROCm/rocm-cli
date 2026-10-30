@@ -1038,7 +1038,8 @@ last_installed_runtime_id = "therock-release"
         Ok(())
     }
 
-    /// The `inspect_err` cleanup on the rename, which the happy-path test above
+    /// The temp-file cleanup when the publish step fails (in
+    /// `atomic_write::publish_staged_file_with`), which the happy-path test above
     /// cannot reach: it only ever asserts that a SUCCESSFUL save leaves nothing
     /// behind, so deleting the cleanup would go unnoticed until a user with a
     /// failing disk accumulated one `config.json.tmp-<pid>-<ts>-<attempt>` per attempt.

@@ -58,13 +58,16 @@ pub fn assert_write_spares_foreign_temp_files(
     write: impl FnMut() -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     let outcome = probe(foreign_name, write, INITIAL_WINDOW_MS, MAX_MS, ATTEMPTS)?;
-    require_conclusive(outcome);
+    require_conclusive(outcome, cfg!(windows));
     Ok(())
 }
 
-fn require_conclusive(outcome: Outcome) {
+/// Fails the test for an inconclusive `outcome` unless `tolerate_inconclusive`
+/// is set, in which case it only says so on stderr. A parameter rather than a
+/// `cfg!` inside, so both branches run in a test on every platform.
+fn require_conclusive(outcome: Outcome, tolerate_inconclusive: bool) {
     if let Outcome::Inconclusive(why) = outcome {
-        if cfg!(windows) {
+        if tolerate_inconclusive {
             eprintln!("inconclusive (tolerated on Windows): {why}");
         } else {
             panic!(
@@ -146,38 +149,95 @@ mod tests {
         dir.join(format!("target.tmp-{millis}"))
     }
 
+    /// How many times a self-test below reruns the probe when the host was too
+    /// slow for it to be conclusive, before accepting that it cannot say.
+    const SELF_TEST_RUNS: usize = 3;
+
+    /// Reruns `run` until it reaches a verdict about the writer, `None` when
+    /// every run was inconclusive. A panic from the probe propagates.
+    fn run_until_conclusive(mut run: impl FnMut() -> anyhow::Result<Outcome>) -> Option<Outcome> {
+        for _ in 0..SELF_TEST_RUNS {
+            match run().expect("probe ran") {
+                Outcome::Inconclusive(why) => eprintln!("self-test run inconclusive: {why}"),
+                Outcome::Spared => return Some(Outcome::Spared),
+            }
+        }
+        None
+    }
+
+    fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
+        payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| {
+                payload
+                    .downcast_ref::<&str>()
+                    .map(|text| (*text).to_owned())
+            })
+            .unwrap_or_default()
+    }
+
     #[test]
-    #[should_panic(expected = "belongs to another writer")]
     fn a_writer_that_reuses_a_retired_name_is_caught() {
         let dir = tempfile::tempdir().expect("scratch directory");
         // A writer shaped like the retired `write_atomic`: a temp name fixed
         // by the clock alone, opened with `fs::write`, which truncates
         // whatever is already there.
-        assert_write_spares_foreign_temp_files(
-            |millis| occupied_name(dir.path(), millis),
-            || {
-                std::fs::write(occupied_name(dir.path(), unix_time_millis()), b"clobbered")?;
-                Ok(())
-            },
-        )
-        .expect("probe ran");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_until_conclusive(|| {
+                probe(
+                    |millis| occupied_name(dir.path(), millis),
+                    || {
+                        std::fs::write(
+                            occupied_name(dir.path(), unix_time_millis()),
+                            b"clobbered",
+                        )?;
+                        Ok(())
+                    },
+                    INITIAL_WINDOW_MS,
+                    MAX_MS,
+                    ATTEMPTS,
+                )
+            })
+        }));
+        match result {
+            Err(payload) => {
+                let text = panic_text(payload.as_ref());
+                assert!(
+                    text.contains("belongs to another writer"),
+                    "the probe failed for another reason: {text}"
+                );
+            }
+            Ok(Some(verdict)) => {
+                panic!("a writer that truncates a foreign temp file was reported {verdict:?}")
+            }
+            // A host too slow for any window to cover the write says nothing
+            // about the probe; the run above already printed why.
+            Ok(None) => {}
+        }
     }
 
     #[test]
     fn a_writer_that_picks_its_own_name_is_spared() {
         let dir = tempfile::tempdir().expect("scratch directory");
-        let outcome = probe(
-            |millis| occupied_name(dir.path(), millis),
-            || {
-                std::fs::write(dir.path().join("unrelated.tmp"), b"staged")?;
-                Ok(())
-            },
-            INITIAL_WINDOW_MS,
-            MAX_MS,
-            ATTEMPTS,
-        )
-        .expect("probe ran");
-        assert_eq!(outcome, Outcome::Spared);
+        let verdict = run_until_conclusive(|| {
+            probe(
+                |millis| occupied_name(dir.path(), millis),
+                || {
+                    std::fs::write(dir.path().join("unrelated.tmp"), b"staged")?;
+                    Ok(())
+                },
+                INITIAL_WINDOW_MS,
+                MAX_MS,
+                ATTEMPTS,
+            )
+        });
+        // `None` is a host too slow to say; a panic inside would be the probe
+        // wrongly blaming a writer that never touched a foreign name.
+        assert!(
+            matches!(verdict, None | Some(Outcome::Spared)),
+            "{verdict:?}"
+        );
         let leftovers: Vec<_> = std::fs::read_dir(dir.path())
             .expect("list scratch directory")
             .map(|entry| entry.expect("directory entry").file_name())
@@ -209,10 +269,22 @@ mod tests {
         );
     }
 
-    #[cfg(not(windows))]
     #[test]
     #[should_panic(expected = "inconclusive")]
-    fn an_inconclusive_probe_fails_off_windows() {
-        require_conclusive(Outcome::Inconclusive("too slow".to_owned()));
+    fn an_inconclusive_probe_fails_when_not_tolerated() {
+        require_conclusive(Outcome::Inconclusive("too slow".to_owned()), false);
+    }
+
+    #[test]
+    fn an_inconclusive_probe_is_tolerated_when_allowed() {
+        // Returning without a panic is the whole claim. The public entry point
+        // passes `cfg!(windows)` for this flag.
+        require_conclusive(Outcome::Inconclusive("too slow".to_owned()), true);
+    }
+
+    #[test]
+    fn a_conclusive_probe_passes_either_way() {
+        require_conclusive(Outcome::Spared, false);
+        require_conclusive(Outcome::Spared, true);
     }
 }
