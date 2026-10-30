@@ -29,8 +29,8 @@
 //! runtime activation; `service_launch.rs` is the only caller of the
 //! `existing_live_managed_service` duplicate-launch guard it runs before
 //! spawning a new managed service. Shared types/config (`ManagedServiceRecord`,
-//! `AppPaths`) and the `endpoint_keys` module stay reachable through `crate::`/`rocm_core::`, as
-//! for other mechanically relocated modules.
+//! `AppPaths`) and the `endpoint_keys` module stay reachable through
+//! `crate::`/`rocm_core::`, as for other mechanically relocated modules.
 
 use std::fs;
 use std::time::Duration;
