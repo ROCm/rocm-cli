@@ -1414,6 +1414,30 @@ The plain proposal history test verifies that `/automations` and
 server/artifact details, and approve/reject controls instead of raw backend
 action or restricted-tool names.
 
+Automation history stores (events, audit, proposals):
+
+```bash
+cargo test -p rocm-core automation::tests
+```
+
+These cover the three JSONL stores in
+[automation.rs](../crates/rocm-core/src/automation.rs): concurrent writers
+across threads and processes losing no records, size-based rotation of the
+event and audit logs under the same lock (no record lost or duplicated while
+writers rotate, recent reads spanning the rollover, a failed rotation still
+keeping the record and printing its one-shot warning to stderr, lock-free
+readers never reading a file twice or skipping a generation), and proposal
+compaction keeping every pending proposal, the
+newest reviewed ones, and legacy proposal ids. Most of those drive
+`append_jsonl_record`/`load_recent_jsonl_records` directly with a custom
+rotation policy; two further tests go through the public
+`append_automation_event`/`append_audit_event` and
+`load_recent_automation_events`/`load_recent_audit_events` wrappers instead,
+at the real size cap, so the wiring between them and the rotation policy
+itself stays covered. The user-visible side is `automations-07` through
+`automations-09` in
+[automations.feature](../tests/e2e-cucumber/features/automations.feature).
+
 Natural-language plan handoff tests:
 
 ```bash
@@ -1890,20 +1914,12 @@ cargo test -p rocm --bin rocm driver_install
 
 `driver-install-06` in
 [driver_install.feature](../tests/e2e-cucumber/features/driver_install.feature)
-asserts whichever plan a real bare-metal Linux host actually produces: the apt
-repo file and signing key on a release with a published
-repo.radeon.com/amdgpu suite, or the native-archive refusal below on one
-without.
-
-On Ubuntu 26.04, `repo.radeon.com` does not yet publish a matching `resolute`
-DKMS repo (the amdgpu driver ships in-tree instead), so the plan comes back
-`supported: false` and directs the user to `apt install rocm`. This arm is
-covered at the unit level by
-`driver_plan_ubuntu_2604_uses_native_archive_guidance` and its two neighbors in
-[driver_install.rs](../apps/rocm/src/driver_install.rs), and at the e2e level
-by `driver-install-06` above: the hosted `E2E tests` job's `ubuntu-latest` image (26.04 once GitHub's migration completes)
-reaches this arm through the CLI itself, while the self-hosted GPU lane's
-24.04 host exercises the apt arm instead.
+asserts the plan a real bare-metal Linux host actually produces: the apt
+repo file and signing key with the host's own suite (`noble` on 24.04,
+`resolute` on 26.04), and the previous-driver warning. The warning command is
+also run against a stubbed `dpkg-query` by
+`previous_driver_warning_fires_only_when_amdgpu_dkms_is_installed` in
+[driver_install.rs](../apps/rocm/src/driver_install.rs).
 
 ## /etc/os-release
 

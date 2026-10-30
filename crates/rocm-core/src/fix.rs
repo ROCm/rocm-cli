@@ -343,7 +343,7 @@ const RECIPES: &[FixRecipe] = &[
     FixRecipe {
         fix_id: "fix-3-rocm-kernel",
         title: "ROCm/distro/kernel triple unsupported",
-        rationale: "ROCm is installed but your kernel/distro combination is outside the supported matrix. Match the kernel to the matrix first, then rerun `rocm install driver --dkms --yes` (documented distros only; Ubuntu 26.04 ships the driver in-tree, use `apt install rocm`).",
+        rationale: "ROCm is installed but your kernel/distro combination is outside the supported matrix. Match the kernel to the matrix first, then rerun `rocm install driver --dkms --yes` (documented distros only, which includes Ubuntu 26.04).",
         commands: &[
             "# Cross-check the live AMD matrix before changing anything:",
             "#   https://rocm.docs.amd.com/projects/install-on-linux/en/latest/reference/system-requirements.html",
@@ -562,9 +562,8 @@ const RECIPES: &[FixRecipe] = &[
         rationale: "The repo-native package-manager install left a half-configured DKMS / repo state. Clear the broken package state, quarantine the ROCm/AMDGPU repo files found on this host, let the package manager forget the broken state, then reinstall via rocm-cli's own repo-native flow.",
         commands: &[
             "# Applies only where `rocm install driver --dkms` plans a reinstall (AMD-documented",
-            "# distros). On Ubuntu 26.04 the driver is in-tree: skip the purge/remove, the DKMS",
-            "# reinstall and the DKMS verify, and run `sudo apt install rocm` instead. On any other",
-            "# distro it plans nothing: skip the purge/remove and reinstall per AMD's install docs.",
+            "# distros, Ubuntu 26.04 included). On any other distro it plans nothing: skip the",
+            "# purge/remove and reinstall per AMD's install docs.",
             "# Run only the block matching your package manager. On Debian/Ubuntu, run all",
             "# three lines even if an earlier one reports an error -- the purge must not",
             "# be skipped just because the half-configured state made `install -f` fail:",
@@ -594,7 +593,7 @@ const RECIPES: &[FixRecipe] = &[
         verify_linux: None,
         notes: &[
             "If the purge/remove step warns it will take unrelated packages with it, stop and resolve those by hand before continuing.",
-            "The `rocm install driver --dkms --yes` line and the verify below apply only on AMD-documented distros; `rocm install driver --dkms --yes` exits non-zero where it plans nothing (Ubuntu 26.04, undocumented distros). There, verify with `rocminfo` alone, or `dpkg-query -W rocm` after `sudo apt install rocm` on Ubuntu 26.04.",
+            "The `rocm install driver --dkms --yes` line and the verify below apply only on AMD-documented distros; `rocm install driver --dkms --yes` exits non-zero where it plans nothing (undocumented distros). There, verify with `rocminfo` alone.",
         ],
         doc_url: None,
         applies_on: PRINT_ON_LINUX,
@@ -2616,6 +2615,24 @@ mod tests {
     // subject IS the `$ROCM_PATH` read — takes this lock. Anything provable
     // through the seam should not be reaching for the lock.
     static PROCESS_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    // Ubuntu 26.04 gets the DKMS driver plan (`dkms_driver_plan_is_supported`),
+    // so no recipe may still describe it as in-tree or unplanned.
+    #[test]
+    fn recipes_do_not_describe_ubuntu_26_04_as_unplanned() {
+        for r in RECIPES {
+            let text = std::iter::once(r.rationale)
+                .chain(r.commands.iter().copied())
+                .chain(r.notes.iter().copied())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                !text.contains("in-tree") && !text.contains("apt install rocm"),
+                "{} still describes Ubuntu 26.04 as in-tree",
+                r.fix_id
+            );
+        }
+    }
 
     /// Whether a recipe applies on the platform the test is running on.
     ///

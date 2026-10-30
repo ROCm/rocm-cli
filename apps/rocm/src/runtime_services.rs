@@ -25,10 +25,8 @@ use anyhow::{Result, bail};
 use rocm_core::{AppPaths, ManagedServiceRecord};
 
 use crate::managed_service_status::{load_managed_services, managed_service_is_live};
-use crate::{
-    engine_manages_own_runtime, load_managed_service, restart_internal_managed_service,
-    runtime_manifest_for_selector, therock,
-};
+use crate::services_text::{load_managed_service, restart_internal_managed_service};
+use crate::{engine_manages_own_runtime, runtime_manifest_for_selector, therock};
 
 /// Where one live local server stands relative to the runtime being activated.
 #[derive(Debug, Clone, PartialEq, Eq)]
