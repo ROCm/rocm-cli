@@ -36,10 +36,10 @@ So a figure exists for a given version of the skill when a bump pull request for
 been graded, and not otherwise.
 
 Running `routing` and `behavioral` from this repository's own `skill-evals` job as well,
-with the credential `amd/skills` uses, is planned as a separate change. Until it lands,
-this page describes what runs today.
+with the credential `amd/skills` uses, is not done yet. This page describes what runs
+today.
 
-Everything in the rest of this page about what runs there was checked on 2026-10-29.
+Everything in the rest of this page about what runs there was checked on 2026-10-30.
 It is `amd/skills`' workflow and it can change; the files to re-read are
 `.github/workflows/evals.yml`, `.github/workflows/federate-skills.yml` and
 `.github/federation.json` in that repository.
@@ -103,12 +103,10 @@ A figure is only comparable with another when the same things were graded:
 | The harness | The ref on the `uses: amd/skillscope/...` line in `amd/skills`' `evals.yml`. Some routing cases ship inside the harness package, so changing the harness changes the denominator. |
 | The model and effort | The summary line (`on opus (effort high)`). CI forces the model, and the effort is `high`. |
 
-## Reading a run
-
-Open the bump pull request for the version of the skill you care about, then its
-`evals` run. The behavioral jobs for `rocm-doctor` each print a summary of the form
-`N/N cases passed (M/M individual expectations)` and a list of any unmet expectations.
-Compare two runs only when the three pins above match.
+To read a run, open the bump pull request for the version of the skill you care about,
+then its `evals` run. The behavioral jobs for `rocm-doctor` each print a summary of the
+form `N/N cases passed (M/M individual expectations)` and a list of any unmet
+expectations. Compare two runs only when the three pins above match.
 
 ## What is not available yet
 

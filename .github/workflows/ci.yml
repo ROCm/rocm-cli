@@ -1333,10 +1333,10 @@ jobs:
   # finds nothing, and improvises.
   #
   # `routing` and `behavioral` are deliberately NOT run here: they make paid
-  # model calls and need a credential this repo does not hold. They run in
-  # amd/skills on every federation bump of this skill — they are the half of
-  # the question that asks whether the skill actually fires, so this job is not
-  # a substitute for them. See docs/skill-quality.md.
+  # model calls and need a credential this repo does not hold. amd/skills
+  # grades this skill instead (docs/skill-quality.md says what that covers).
+  # They are the half of the question that asks whether the skill actually
+  # fires, so this job is not a substitute for them.
   #
   # skills/rocm-cli-assistant/ is deliberately out of scope. Despite its path it
   # is not a published skill: apps/rocm/src/main.rs embeds it verbatim into the
