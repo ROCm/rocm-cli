@@ -159,6 +159,7 @@ pub fn merge_instance(
         // a counter-rate delta is computed.
         gen_tps_observation: None,
         tokens_per_watt: None,
+        power_w: None,
         // Derived at the runner by windowing the sample's cumulative histogram
         // readings (mirrors gen_tps); left None at merge time.
         ttft_ms: None,
