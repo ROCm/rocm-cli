@@ -3,26 +3,46 @@ Feature: TheRock "next" ROCm 10 install layout
   # ROCm 10 ships from a different source layout than the canonical multi-arch
   # release/nightly streams: a separate pip index and a separate tarball catalog
   # whose listing mixes non-release `-tests-` siblings in with the real dist
-  # archive. The next layout is an explicit extension, never a default: it is
-  # reachable only by pinning a ROCm version whose major is 10 or newer AND
-  # naming an exact raw GFX arch, and the canonical streams keep resolving
-  # exactly as they do today when neither is asked for.
+  # archive. An unpinned release install reads that layout and takes the newest
+  # stable version there. It still needs an exact raw GFX arch. Nightly
+  # auto-select, and any pin that is not a stable ROCm 10 version, stay on the
+  # canonical streams.
   #
   # Scenarios 01-05 point source overrides at loopback fixtures through the
   # explicit trust gate. Scenario 06 proves the same overrides are inert when
   # the trust gate is absent; scenario 07 supplies the live GPU evidence.
 
-  # The regression this pins: a "next-first" dispatch that probes the ROCm 10
-  # sources before the canonical ones. An unpinned release install must never
-  # look at the next layout at all, so the next fixture is served and asserted
-  # untouched rather than left unconfigured.
-  @id:therock-next-01-unpinned-release-stays-canonical
-  Scenario: therock-next-01 - An unpinned release install stays on the canonical multi-arch source
-    Given a canonical release pip index fixture and a ROCm 10 pip index fixture
+  # An unpinned release install resolves the newest stable version on the next
+  # layout. The fixture publishes 10.0.0, 10.1.0, and a newer prerelease on the
+  # next index, and 7.14.1 on the canonical index. Falling back to canonical, or
+  # taking the prerelease, fails the assertions below.
+  @id:therock-next-01-unpinned-release-selects-newest-stable
+  Scenario: therock-next-01 - An unpinned release install selects the newest stable ROCm 10 release
+    Given a canonical release pip index and a ROCm 10 index publishing 10.0.0, 10.1.0, and a newer prerelease
     When the user previews a wheel SDK install for arch gfx1200 with no version pin
+    Then the preview selects ROCm 10.1.0 from the ROCm 10 pip index
+    And the preview reports the next source layout generation
+    And the preview does not select the canonical release or the newer prerelease
+
+  # A stable pin below ROCm 10 stays on the canonical fixture. The version is
+  # the one that fixture publishes (7.10.0); 7.14.1 is the same decision and is
+  # covered by `requested_source_layout_reads_the_request_not_the_resolution`.
+  @id:therock-next-16-older-pin-stays-canonical
+  Scenario: therock-next-16 - A ROCm 7 pin stays on the canonical multi-arch source
+    Given a canonical release pip index fixture and a ROCm 10 pip index fixture
+    When the user previews a wheel SDK install for arch gfx1200 pinned to ROCm 7.10.0
     Then the preview resolves the canonical release pip index
     And the preview reports the canonical multi-arch source layout generation
     And the preview never mentions the ROCm 10 pip index
+
+  # No silent fallback when the family is a group label. Reverting the default
+  # route to the canonical stream would make this preview succeed.
+  @id:therock-next-15-unpinned-release-group-family-refused
+  Scenario: therock-next-15 - An unpinned release wheel install refuses a group family label
+    Given a canonical release pip index fixture and a ROCm 10 pip index fixture
+    When the user previews a wheel SDK install for family gfx120X-all with no version pin
+    Then the install fails
+    And the failure asks for an exact GPU arch and names --family gfx1200
 
   # `--version 10.0.0` plus a raw arch is the whole opt-in. The device payload is
   # requested as an exact `device-gfx1200` extra on rocm, torch and torchvision;
@@ -148,7 +168,8 @@ Feature: TheRock "next" ROCm 10 install layout
   #
   # The serve+inference tail matters because `serve-vllm-inference`
   # (model_serving.feature) does not cover this route: its runtime comes from
-  # a plain unpinned `rocm install sdk`, never the ROCm 10 preview source. A
+  # a plain unpinned `rocm install sdk`, which now uses this same ROCm 10
+  # index, but that scenario does not assert the vLLM discovery pins. A
   # discovered wheel that installs cleanly but can't actually load or answer a
   # request (bad torch realignment, cp314 ABI mismatch, a `uv.toml` fallback
   # pulling an incompatible transitive dep) would pass every assertion above

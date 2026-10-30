@@ -451,9 +451,10 @@ rocm install sdk --channel release --format wheel --approve-replacing-active-def
 rocm install sdk --channel release --format wheel < /dev/null   # expect the refusal
 ```
 
-The preview path is unaffected: `--dry-run` returns before the gate is
-consulted, so `rocm install sdk --channel release --format wheel --dry-run`
-never prompts and never refuses, whatever the active default is.
+The preview path is unaffected by the active-default gate: `--dry-run` returns
+before that gate is consulted, so it never prompts about replacing the active
+default. A release install that has no exact GPU arch still refuses, including
+`--dry-run`, and names `--family` with an exact `gfx` code.
 
 Then it verifies:
 
@@ -468,11 +469,16 @@ Then it verifies:
   extra (`rocm` also requests `libraries`), plus pinned `torchaudio`, and that
   the toolchain is not planned for unless asked (pass the script `--devel` to
   check the opt-in path instead, which adds `devel` to the `rocm` extras)
-- on a host with no detectable AMD GPU the preview reports `device_target:
-  undetermined` and renders the device extra as a placeholder; a real install
-  refuses rather than falling back to every published device payload
-- package selection uses the newest exact ROCm build suffix common to the SDK
-  package and the PyTorch stack for the current Python/platform wheel tags
+- on a host with no detectable AMD GPU, an unpinned release install refuses
+  before a plan, including `--dry-run`, and asks for `--family` with an exact
+  `gfx` code. It does not fall back to the ROCm 7 index. A nightly preview, or
+  a pin of a ROCm 7 release, still reports `device_target: undetermined` and
+  renders the device extra as a placeholder; a real install of those refuses
+  rather than falling back to every published device payload
+- package selection on an unpinned release install takes the newest stable
+  ROCm version published on the ROCm 10 index (a newer prerelease does not
+  win), then pins `rocm`, `torch`, `torchvision`, and `torchaudio` for that
+  version
 - `python -m rocm_sdk version`
 - `python -m rocm_sdk targets`
 - runtime-only TheRock wheel discovery through

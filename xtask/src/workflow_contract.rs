@@ -4111,8 +4111,8 @@ fi
         for workflow_name in ["e2e-selfhosted.yml", "nightly.yml"] {
             let workflow = read_workflow(workflow_name);
             assert!(
-                workflow.contains("e2e-prewarm-multi-arch-v2"),
-                "{workflow_name} must isolate the canonical multi-arch runtime tree"
+                workflow.contains("e2e-prewarm-next-v1"),
+                "{workflow_name} must isolate the ROCm 10 runtime tree from the previous layout"
             );
             assert!(
                 !workflow.lines().any(|line| {
