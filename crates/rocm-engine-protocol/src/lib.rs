@@ -82,6 +82,8 @@ pub fn relaunch_command(host: &str, require_api_key: bool) -> String {
 ///
 /// The template stays the single source of the flag set; this substitutes its
 /// model and port placeholders and appends the engine, so the advice runs as printed.
+/// The port goes in first: it is digits and cannot collide, whereas the model is
+/// arbitrary text that must never be rescanned for a placeholder.
 #[must_use]
 pub fn relaunch_command_for(
     model: &str,
@@ -91,8 +93,8 @@ pub fn relaunch_command_for(
     require_api_key: bool,
 ) -> String {
     let mut command = relaunch_command(host, require_api_key)
-        .replacen("<model>", &shell_word(model), 1)
-        .replacen("<port>", &port.to_string(), 1);
+        .replacen("<port>", &port.to_string(), 1)
+        .replacen("<model>", &shell_word(model), 1);
     if !engine.is_empty() {
         command.push_str(" --engine ");
         command.push_str(&shell_word(engine));
@@ -931,6 +933,19 @@ mod tests {
             "rocm serve '/models/my model.gguf' --host 127.0.0.1 --port 8000"
         );
         assert!(!relaunch_command_for("m", "vllm", "127.0.0.1", 1, false).contains('<'));
+    }
+
+    #[test]
+    fn a_model_named_like_the_port_placeholder_does_not_steal_the_port() {
+        let command = relaunch_command_for("/models/<port>.gguf", "", "127.0.0.1", 8123, false);
+        assert!(
+            command.contains("--port 8123"),
+            "the real port placeholder must be the one filled: {command}"
+        );
+        assert!(
+            command.contains("/models/<port>.gguf"),
+            "the model text must survive untouched: {command}"
+        );
     }
 
     #[test]
