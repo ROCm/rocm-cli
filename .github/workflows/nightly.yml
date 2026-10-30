@@ -16,6 +16,11 @@ env:
   # `CARGO_BUILD_WARNINGS: deny` instead (set at workflow level so it reaches
   # jobs that don't use setup-rust-toolchain too).
   RUSTFLAGS: -D warnings
+  # aws-lc-sys 0.46 and later auto-detect an AWS-LC already installed on the
+  # build host and link it when found. Nightly binaries must not depend on
+  # what the runner or build container happens to have, so always build the
+  # vendored copy.
+  AWS_LC_SYS_USE_SYSTEM: "0"
   # REQUIRED, not dormant: every readiness step below runs --require-signatures,
   # which now means signatures must actually verify, so this is the public key
   # the nightly is verified against. Removing or blanking the secret fails every
@@ -122,6 +127,7 @@ jobs:
             -e CARGO_HOME=/host-cargo \
             -e RUSTUP_HOME=/host-cargo/rustup \
             -e ROCM_CLI_RELEASE_REF="${{ github.ref_name }}" \
+            -e AWS_LC_SYS_USE_SYSTEM \
             -v "$HOME/.cargo":/host-cargo \
             -v "$PWD":/work \
             -w /work \

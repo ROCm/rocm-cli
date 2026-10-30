@@ -4,14 +4,15 @@
 
 use crate::ARTIFACT_PREFETCH_TIMEOUT;
 use crate::cli::{SandboxToolArg, SandboxToolPolicy};
-use crate::common::{self, CommandCapture};
+use crate::common;
 use crate::persistence::load_managed_services;
 use crate::service::{sandbox_stop_server_value, stop_managed_service};
 use crate::watchers::restart_managed_service;
 use anyhow::{Context, Result, bail};
 use rocm_core::{
-    AppPaths, AuditEventRecord, ExamineSummary, ModelRecipeArtifactRecord, append_audit_event,
-    model_artifact_cache_status, resolve_model_recipe_artifact, unix_time_millis,
+    AppPaths, AuditEventRecord, CommandCapture, ExamineSummary, ModelRecipeArtifactRecord,
+    append_audit_event, model_artifact_cache_status, resolve_model_recipe_artifact,
+    unix_time_millis,
 };
 use serde_json::Value;
 use serde_json::json;
