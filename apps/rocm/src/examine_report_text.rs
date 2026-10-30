@@ -5,7 +5,7 @@
 //! Examine/model-catalog/engine-inventory rendering: the `rocm examine`
 //! report (both its JSON-adjacent text path and its plain-language human
 //! report), the `rocm engines`/`examine` engine-inventory listing, and the
-//! `rocm models`/`examine` model-catalog rendering (built-in recipe
+//! `rocm model` (alias `models`) model-catalog rendering (built-in recipe
 //! listing, verbose per-recipe diagnostics, artifact/source-policy
 //! metadata, host-RAM/GPU fit, manual-alternative recommendations, and
 //! per-engine support/adapter-availability notes).
@@ -58,19 +58,21 @@
 //! module-split sufficiency"). They are left exactly where they are,
 //! untouched by this change.
 //!
-//! `dispatch()` calls directly into this module at three points — the
-//! `models`/`examine --verbose` branches' calls to
-//! `render_model_registry_verbose_text_with_context_and_host` and
-//! `render_model_registry_text_with_context_and_host`, and the human-readable
-//! `Command::Examine` arm's call to `examine_human_report` — all three
-//! re-imported via `use crate::examine_report_text::{...};`; `main.rs`'s own
+//! `dispatch()` calls directly into this module at two points — the
+//! `Command::Model` arm's calls to
+//! `render_model_registry_verbose_text_with_context_and_host` (with
+//! `--verbose`) and `render_model_registry_text_with_context_and_host` — and
+//! `main.rs`'s `examine()`, which the `Command::Examine` arm calls, calls
+//! `examine_human_report`; all re-imported via
+//! `use crate::examine_report_text::{...};`. `main.rs`'s own
 //! `launch_default` calls `render_launch_summary` directly, also re-imported
 //! there. `render_examine_text`, `render_examine_text_with_paths`, and
 //! `render_model_registry_verbose_text_with_context_and_host` are also
 //! `pub(crate)`, read from [`chat.rs`](../apps/rocm/src/chat.rs)'s
 //! deterministic tool-output summaries; `render_engine_inventory_text_with_paths`
 //! is also read from `chat.rs` and from
-//! [`engines_cmd.rs`](../apps/rocm/src/engines_cmd.rs)'s `engines()`;
+//! [`engines_cmd.rs`](../apps/rocm/src/engines_cmd.rs)'s
+//! `render_engine_inventory_text`;
 //! `append_examine_runtime_state` is also `pub(crate)`, read only from
 //! [`runtimes_cmd.rs`](../apps/rocm/src/runtimes_cmd.rs)'s own test module —
 //! `main.rs`'s re-import of it is itself `#[cfg(test)]`, since it would
@@ -83,9 +85,9 @@
 //!
 //! This cluster reaches three items that stayed behind in `main.rs` because
 //! they already had callers outside it: `engine_inventory()` (the built-in
-//! engine list, also read from `main.rs`'s own serve-engine resolution),
-//! `engine_ruled_out_by_platform` (also read from `main.rs`'s engine-serve
-//! dispatch arm; the private `PlatformRuleOut` enum it returns, which
+//! engine list, also read from `update_cmd.rs`),
+//! `engine_ruled_out_by_platform` (also read from `main.rs`'s
+//! `assess_model_for_host`; the private `PlatformRuleOut` enum it returns, which
 //! `model_registry_adapter_availability_note` matches on, is reached the same
 //! way), and `missing_packaged_engine_reason` (already noted in
 //! [`engine_ipc.rs`](../apps/rocm/src/engine_ipc.rs)'s doc comment as having
