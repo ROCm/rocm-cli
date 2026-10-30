@@ -4,8 +4,8 @@
   "generated_at_unix_ms": null,
   "platforms": [
     {
-      "label": "AMD Ryzen AI - Strix Halo (Lemonade / llama.cpp / AIM)",
-      "engines": ["lemonade", "llama.cpp", "llamacpp", "aim"],
+      "label": "AMD Ryzen AI - Strix Halo (Lemonade / llama.cpp)",
+      "engines": ["lemonade", "llama.cpp", "llamacpp"],
       "gfx_families": ["gfx1151"]
     },
     {
@@ -14,8 +14,8 @@
       "gfx_families": ["gfx110X-all", "gfx120X-all"]
     },
     {
-      "label": "AMD Instinct - MI300X, MI350X, MI355X (vLLM)",
-      "engines": ["vllm"],
+      "label": "AMD Instinct - MI300X, MI350X, MI355X (vLLM / AIM)",
+      "engines": ["vllm", "aim"],
       "gfx_families": ["gfx906", "gfx908", "gfx90a", "gfx94X-dcgpu", "gfx950-dcgpu"]
     }
   ],
@@ -330,6 +330,24 @@
           "unsupported_combinations": [],
           "notes": [],
           "model_id_override": null
+        },
+        {
+          "engine": "aim",
+          "required_flags": [],
+          "parser_settings": {},
+          "preferred_endpoint": null,
+          "unsupported_combinations": [],
+          "notes": [
+            "gated model: export HF_TOKEN (a Hugging Face token with access to the model) and pass --engine-env HF_TOKEN; it is forwarded from your environment and never stored",
+            "requires a reachable Docker daemon; the image is pulled on first serve",
+            "Instinct-class image; AIM auto-selects the profile, see the AIM catalog for the GPU memory and GPU count it needs"
+          ],
+          "model_id_override": "amdenterpriseai/aim-meta-llama-llama-3-2-3b-instruct:0.11.1",
+          "image_digest": "sha256:12e146a90d3ad26bafc102ac0217f5d49b3107c9e7abc476d16ad3f1ae7de4ae",
+          "supported_gfx_families": ["gfx94X-dcgpu", "gfx950-dcgpu"],
+          "requires_hf_token": true,
+          "generated_at_unix_ms": 1793272421113,
+          "extra_env": {}
         }
       ],
       "manual_alternatives": [
@@ -429,7 +447,24 @@
       "quantization": "BF16, ~62 GiB (1x MI300X)",
       "artifact_hint": "Hugging Face model id; vLLM ROCm serving validates artifacts during serve",
       "artifacts": [],
-      "engine_recipes": [],
+      "engine_recipes": [
+        {
+          "engine": "aim",
+          "required_flags": [],
+          "parser_settings": {},
+          "preferred_endpoint": null,
+          "unsupported_combinations": [],
+          "notes": [
+            "requires a reachable Docker daemon; the image is pulled on first serve",
+            "Instinct-class image; AIM auto-selects the profile, see the AIM catalog for the GPU memory and GPU count it needs"
+          ],
+          "model_id_override": "amdenterpriseai/aim-google-gemma-4-31b-it:0.13.0-preview",
+          "image_digest": "sha256:ec2c6940ebd7088f112d09c4c6f554e4d3efaa88b61c89be9f1ecd347beaef9a",
+          "supported_gfx_families": ["gfx94X-dcgpu", "gfx950-dcgpu"],
+          "generated_at_unix_ms": 1793272421113,
+          "extra_env": {}
+        }
+      ],
       "manual_alternatives": [
         "qwen3-32b-fp8"
       ],
@@ -510,8 +545,9 @@
       ]
     },
     {
-      "canonical_model_id": "aim-qwen3.5-9b",
+      "canonical_model_id": "Qwen/Qwen3.5-9B",
       "aliases": [
+        "aim-qwen3.5-9b",
         "amdenterpriseai/aim-radeon-qwen-qwen3-5-9b"
       ],
       "task": "chat",
@@ -534,23 +570,1609 @@
           "preferred_endpoint": null,
           "unsupported_combinations": [],
           "notes": [
-            "pins AIM_PROFILE_ID=vllm-w7900-bf16-tp1-latency via extra_env; Radeon profile auto-selection isn't reliable yet, override with --engine-env if needed",
+            "pins AIM_PROFILE_ID per GPU family from profile_ids because Radeon profile auto-selection isn't reliable yet; override with --engine-env AIM_PROFILE_ID=<id> if needed",
             "requires a reachable Docker daemon; the image is pulled on first serve"
           ],
           "model_id_override": "amdenterpriseai/aim-radeon-qwen-qwen3-5-9b:0.12.0-preview",
           "image_digest": "sha256:ee1201261f358be881318de5930ce9505d17309486f747a83147d7d042fc95ce",
-          "extra_env": {
-            "AIM_PROFILE_ID": "vllm-w7900-bf16-tp1-latency"
-          }
+          "supported_gfx_families": ["gfx110X-all", "gfx120X-all"],
+          "supported_boards": ["W7900", "R9700"],
+          "profile_ids": {"gfx110X-all": "vllm-w7900-bf16-tp1-latency", "gfx120X-all": "vllm-r9700-bf16-tp1-latency"},
+          "generated_at_unix_ms": 1793203564000
         }
       ],
       "manual_alternatives": [],
       "chat_template_mode": "auto",
       "preferred_engines": [
-        "aim"
+        "aim",
+        "vllm"
       ],
       "warnings": [
-        "Radeon-targeted AIM image; requires Docker and an explicit AIM_PROFILE_ID"
+        "Radeon-targeted AIM image (W7900 / R9700 profiles only); requires Docker"
+      ]
+    },
+    {
+      "canonical_model_id": "CohereLabs/command-a-reasoning-08-2025",
+      "aliases": [
+        "amdenterpriseai/aim-coherelabs-command-a-reasoning-08-2025"
+      ],
+      "task": "chat",
+      "source": "recipe_index",
+      "revision": "main",
+      "loader": "aim",
+      "trust_remote_code": false,
+      "dtype": "auto",
+      "device_policy": "gpu_required",
+      "min_gpu_mem_gb": 267,
+      "quantization": "none; served as-is by the AIM image's bundled vLLM",
+      "artifact_hint": "AMD Enterprise AI (AIM) pre-built Docker image; pulled and run by the aim engine, not by Hugging Face resolution",
+      "artifacts": [],
+      "engine_recipes": [
+        {
+          "engine": "aim",
+          "required_flags": [],
+          "parser_settings": {},
+          "preferred_endpoint": null,
+          "unsupported_combinations": [],
+          "notes": [
+            "gated model: export HF_TOKEN (a Hugging Face token with access to the model) and pass --engine-env HF_TOKEN; it is forwarded from your environment and never stored",
+            "requires a reachable Docker daemon; the image is pulled on first serve",
+            "Instinct-class image; AIM auto-selects the profile, see the AIM catalog for the GPU memory and GPU count it needs"
+          ],
+          "model_id_override": "amdenterpriseai/aim-coherelabs-command-a-reasoning-08-2025:0.11.1",
+          "image_digest": "sha256:6da329641e3ea98e945f43b1df17b7efb3ba0a284dfb123297ace72d4084b4d3",
+          "supported_gfx_families": ["gfx90a", "gfx94X-dcgpu", "gfx950-dcgpu"],
+          "min_gpu_counts": {"gfx90a": 8, "gfx94X-dcgpu": 2},
+          "requires_hf_token": true,
+          "generated_at_unix_ms": 1793272421113,
+          "extra_env": {}
+        }
+      ],
+      "manual_alternatives": [],
+      "chat_template_mode": "auto",
+      "preferred_engines": [
+        "aim",
+        "vllm"
+      ],
+      "warnings": [
+        "AIM image from the AMD Enterprise AI catalog; requires Docker"
+      ]
+    },
+    {
+      "canonical_model_id": "deepseek-ai/DeepSeek-R1-0528",
+      "aliases": [
+        "amdenterpriseai/aim-deepseek-ai-deepseek-r1-0528"
+      ],
+      "task": "chat",
+      "source": "recipe_index",
+      "revision": "main",
+      "loader": "aim",
+      "trust_remote_code": false,
+      "dtype": "auto",
+      "device_policy": "gpu_required",
+      "min_gpu_mem_gb": 806,
+      "quantization": "none; served as-is by the AIM image's bundled vLLM",
+      "artifact_hint": "AMD Enterprise AI (AIM) pre-built Docker image; pulled and run by the aim engine, not by Hugging Face resolution",
+      "artifacts": [],
+      "engine_recipes": [
+        {
+          "engine": "aim",
+          "required_flags": [],
+          "parser_settings": {},
+          "preferred_endpoint": null,
+          "unsupported_combinations": [],
+          "notes": [
+            "requires a reachable Docker daemon; the image is pulled on first serve",
+            "Instinct-class image; AIM auto-selects the profile, see the AIM catalog for the GPU memory and GPU count it needs"
+          ],
+          "model_id_override": "amdenterpriseai/aim-deepseek-ai-deepseek-r1-0528:0.11.1",
+          "image_digest": "sha256:348f6ee92b07bf150b01c7b37adb8365336ffc98a2a6f747ed73754cd41f61bc",
+          "supported_gfx_families": ["gfx94X-dcgpu", "gfx950-dcgpu"],
+          "min_gpu_counts": {"gfx94X-dcgpu": 8, "gfx950-dcgpu": 8},
+          "generated_at_unix_ms": 1793272421113,
+          "extra_env": {}
+        }
+      ],
+      "manual_alternatives": [],
+      "chat_template_mode": "auto",
+      "preferred_engines": [
+        "aim",
+        "vllm"
+      ],
+      "warnings": [
+        "AIM image from the AMD Enterprise AI catalog; requires Docker"
+      ]
+    },
+    {
+      "canonical_model_id": "deepseek-ai/DeepSeek-R1",
+      "aliases": [
+        "amdenterpriseai/aim-deepseek-ai-deepseek-r1"
+      ],
+      "task": "chat",
+      "source": "recipe_index",
+      "revision": "main",
+      "loader": "aim",
+      "trust_remote_code": false,
+      "dtype": "auto",
+      "device_policy": "gpu_required",
+      "min_gpu_mem_gb": 806,
+      "quantization": "none; served as-is by the AIM image's bundled vLLM",
+      "artifact_hint": "AMD Enterprise AI (AIM) pre-built Docker image; pulled and run by the aim engine, not by Hugging Face resolution",
+      "artifacts": [],
+      "engine_recipes": [
+        {
+          "engine": "aim",
+          "required_flags": [],
+          "parser_settings": {},
+          "preferred_endpoint": null,
+          "unsupported_combinations": [],
+          "notes": [
+            "requires a reachable Docker daemon; the image is pulled on first serve",
+            "Instinct-class image; AIM auto-selects the profile, see the AIM catalog for the GPU memory and GPU count it needs"
+          ],
+          "model_id_override": "amdenterpriseai/aim-deepseek-ai-deepseek-r1:0.11.1",
+          "image_digest": "sha256:4bbea192e4c3fd11865652119c584e9bad27b07634d5d56da2ca1bcf1c74473d",
+          "supported_gfx_families": ["gfx94X-dcgpu", "gfx950-dcgpu"],
+          "min_gpu_counts": {"gfx94X-dcgpu": 8, "gfx950-dcgpu": 8},
+          "generated_at_unix_ms": 1793272421113,
+          "extra_env": {}
+        }
+      ],
+      "manual_alternatives": [],
+      "chat_template_mode": "auto",
+      "preferred_engines": [
+        "aim",
+        "vllm"
+      ],
+      "warnings": [
+        "AIM image from the AMD Enterprise AI catalog; requires Docker"
+      ]
+    },
+    {
+      "canonical_model_id": "deepseek-ai/DeepSeek-V3.1-Terminus",
+      "aliases": [
+        "amdenterpriseai/aim-deepseek-ai-deepseek-v3-1-terminus"
+      ],
+      "task": "chat",
+      "source": "recipe_index",
+      "revision": "main",
+      "loader": "aim",
+      "trust_remote_code": false,
+      "dtype": "auto",
+      "device_policy": "gpu_required",
+      "min_gpu_mem_gb": 806,
+      "quantization": "none; served as-is by the AIM image's bundled vLLM",
+      "artifact_hint": "AMD Enterprise AI (AIM) pre-built Docker image; pulled and run by the aim engine, not by Hugging Face resolution",
+      "artifacts": [],
+      "engine_recipes": [
+        {
+          "engine": "aim",
+          "required_flags": [],
+          "parser_settings": {},
+          "preferred_endpoint": null,
+          "unsupported_combinations": [],
+          "notes": [
+            "requires a reachable Docker daemon; the image is pulled on first serve",
+            "Instinct-class image; AIM auto-selects the profile, see the AIM catalog for the GPU memory and GPU count it needs"
+          ],
+          "model_id_override": "amdenterpriseai/aim-deepseek-ai-deepseek-v3-1-terminus:0.11.1",
+          "image_digest": "sha256:5f0335322a88bd4a8abe0865227287f419b906b47d9913cf8de7a35df80142f4",
+          "supported_gfx_families": ["gfx94X-dcgpu", "gfx950-dcgpu"],
+          "min_gpu_counts": {"gfx94X-dcgpu": 8, "gfx950-dcgpu": 8},
+          "generated_at_unix_ms": 1793272421113,
+          "extra_env": {}
+        }
+      ],
+      "manual_alternatives": [],
+      "chat_template_mode": "auto",
+      "preferred_engines": [
+        "aim",
+        "vllm"
+      ],
+      "warnings": [
+        "AIM image from the AMD Enterprise AI catalog; requires Docker"
+      ]
+    },
+    {
+      "canonical_model_id": "deepseek-ai/DeepSeek-V3.1",
+      "aliases": [
+        "amdenterpriseai/aim-deepseek-ai-deepseek-v3-1"
+      ],
+      "task": "chat",
+      "source": "recipe_index",
+      "revision": "main",
+      "loader": "aim",
+      "trust_remote_code": false,
+      "dtype": "auto",
+      "device_policy": "gpu_required",
+      "min_gpu_mem_gb": 806,
+      "quantization": "none; served as-is by the AIM image's bundled vLLM",
+      "artifact_hint": "AMD Enterprise AI (AIM) pre-built Docker image; pulled and run by the aim engine, not by Hugging Face resolution",
+      "artifacts": [],
+      "engine_recipes": [
+        {
+          "engine": "aim",
+          "required_flags": [],
+          "parser_settings": {},
+          "preferred_endpoint": null,
+          "unsupported_combinations": [],
+          "notes": [
+            "requires a reachable Docker daemon; the image is pulled on first serve",
+            "Instinct-class image; AIM auto-selects the profile, see the AIM catalog for the GPU memory and GPU count it needs"
+          ],
+          "model_id_override": "amdenterpriseai/aim-deepseek-ai-deepseek-v3-1:0.11.1",
+          "image_digest": "sha256:9fc6f3c6e5b165352ed0873d60bc1acfc1aeaebc048da4630d3166e0b498fb33",
+          "supported_gfx_families": ["gfx94X-dcgpu", "gfx950-dcgpu"],
+          "min_gpu_counts": {"gfx94X-dcgpu": 8, "gfx950-dcgpu": 8},
+          "generated_at_unix_ms": 1793272421113,
+          "extra_env": {}
+        }
+      ],
+      "manual_alternatives": [],
+      "chat_template_mode": "auto",
+      "preferred_engines": [
+        "aim",
+        "vllm"
+      ],
+      "warnings": [
+        "AIM image from the AMD Enterprise AI catalog; requires Docker"
+      ]
+    },
+    {
+      "canonical_model_id": "deepseek-ai/DeepSeek-V4-Flash-0731",
+      "aliases": [
+        "amdenterpriseai/aim-deepseek-ai-deepseek-v4-flash-0731"
+      ],
+      "task": "chat",
+      "source": "recipe_index",
+      "revision": "main",
+      "loader": "aim",
+      "trust_remote_code": false,
+      "dtype": "auto",
+      "device_policy": "gpu_required",
+      "quantization": "none; served as-is by the AIM image's bundled vLLM",
+      "artifact_hint": "AMD Enterprise AI (AIM) pre-built Docker image; pulled and run by the aim engine, not by Hugging Face resolution",
+      "artifacts": [],
+      "engine_recipes": [
+        {
+          "engine": "aim",
+          "required_flags": [],
+          "parser_settings": {},
+          "preferred_endpoint": null,
+          "unsupported_combinations": [],
+          "notes": [
+            "requires a reachable Docker daemon; the image is pulled on first serve",
+            "Instinct-class image; AIM auto-selects the profile, see the AIM catalog for the GPU memory and GPU count it needs"
+          ],
+          "model_id_override": "amdenterpriseai/aim-deepseek-ai-deepseek-v4-flash-0731:2026.11.0",
+          "image_digest": "sha256:bb4e2c8b9ecfcfac886d7c5ebf2629c62ded2debac804d8bf2c11483f7ac6d8c",
+          "supported_gfx_families": ["gfx94X-dcgpu", "gfx950-dcgpu"],
+          "min_gpu_counts": {"gfx94X-dcgpu": 2, "gfx950-dcgpu": 2},
+          "generated_at_unix_ms": 1793272421113,
+          "extra_env": {}
+        }
+      ],
+      "manual_alternatives": [],
+      "chat_template_mode": "auto",
+      "preferred_engines": [
+        "aim",
+        "vllm"
+      ],
+      "warnings": [
+        "AIM image from the AMD Enterprise AI catalog; requires Docker"
+      ]
+    },
+    {
+      "canonical_model_id": "google/gemma-3-1b-it",
+      "aliases": [
+        "amdenterpriseai/aim-google-gemma-3-1b-it"
+      ],
+      "task": "chat",
+      "source": "recipe_index",
+      "revision": "main",
+      "loader": "aim",
+      "trust_remote_code": false,
+      "dtype": "auto",
+      "device_policy": "gpu_required",
+      "min_gpu_mem_gb": 3,
+      "quantization": "none; served as-is by the AIM image's bundled vLLM",
+      "artifact_hint": "AMD Enterprise AI (AIM) pre-built Docker image; pulled and run by the aim engine, not by Hugging Face resolution",
+      "artifacts": [],
+      "engine_recipes": [
+        {
+          "engine": "aim",
+          "required_flags": [],
+          "parser_settings": {},
+          "preferred_endpoint": null,
+          "unsupported_combinations": [],
+          "notes": [
+            "gated model: export HF_TOKEN (a Hugging Face token with access to the model) and pass --engine-env HF_TOKEN; it is forwarded from your environment and never stored",
+            "requires a reachable Docker daemon; the image is pulled on first serve",
+            "Instinct-class image; AIM auto-selects the profile, see the AIM catalog for the GPU memory and GPU count it needs"
+          ],
+          "model_id_override": "amdenterpriseai/aim-google-gemma-3-1b-it:0.12.0",
+          "image_digest": "sha256:fb49e69fe72ca40efaef97173d1532e09982a141900905015d41267ced1654cf",
+          "supported_gfx_families": ["gfx94X-dcgpu", "gfx950-dcgpu"],
+          "requires_hf_token": true,
+          "generated_at_unix_ms": 1793272421113,
+          "extra_env": {}
+        }
+      ],
+      "manual_alternatives": [],
+      "chat_template_mode": "auto",
+      "preferred_engines": [
+        "aim",
+        "vllm"
+      ],
+      "warnings": [
+        "AIM image from the AMD Enterprise AI catalog; requires Docker"
+      ]
+    },
+    {
+      "canonical_model_id": "google/gemma-3-27b-it",
+      "aliases": [
+        "amdenterpriseai/aim-google-gemma-3-27b-it"
+      ],
+      "task": "chat",
+      "source": "recipe_index",
+      "revision": "main",
+      "loader": "aim",
+      "trust_remote_code": false,
+      "dtype": "auto",
+      "device_policy": "gpu_required",
+      "min_gpu_mem_gb": 65,
+      "quantization": "none; served as-is by the AIM image's bundled vLLM",
+      "artifact_hint": "AMD Enterprise AI (AIM) pre-built Docker image; pulled and run by the aim engine, not by Hugging Face resolution",
+      "artifacts": [],
+      "engine_recipes": [
+        {
+          "engine": "aim",
+          "required_flags": [],
+          "parser_settings": {},
+          "preferred_endpoint": null,
+          "unsupported_combinations": [],
+          "notes": [
+            "gated model: export HF_TOKEN (a Hugging Face token with access to the model) and pass --engine-env HF_TOKEN; it is forwarded from your environment and never stored",
+            "requires a reachable Docker daemon; the image is pulled on first serve",
+            "Instinct-class image; AIM auto-selects the profile, see the AIM catalog for the GPU memory and GPU count it needs"
+          ],
+          "model_id_override": "amdenterpriseai/aim-google-gemma-3-27b-it:0.13.0",
+          "image_digest": "sha256:2340abdb1c7cf34a84c5398607b57e1a7cf73b7099ba3fdbde8fbb810e849e33",
+          "supported_gfx_families": ["gfx94X-dcgpu", "gfx950-dcgpu"],
+          "requires_hf_token": true,
+          "generated_at_unix_ms": 1793272421113,
+          "extra_env": {}
+        }
+      ],
+      "manual_alternatives": [],
+      "chat_template_mode": "auto",
+      "preferred_engines": [
+        "aim",
+        "vllm"
+      ],
+      "warnings": [
+        "AIM image from the AMD Enterprise AI catalog; requires Docker"
+      ]
+    },
+    {
+      "canonical_model_id": "google/medgemma-27b-it",
+      "aliases": [
+        "amdenterpriseai/aim-google-medgemma-27b-it"
+      ],
+      "task": "chat",
+      "source": "recipe_index",
+      "revision": "main",
+      "loader": "aim",
+      "trust_remote_code": false,
+      "dtype": "auto",
+      "device_policy": "gpu_required",
+      "min_gpu_mem_gb": 65,
+      "quantization": "none; served as-is by the AIM image's bundled vLLM",
+      "artifact_hint": "AMD Enterprise AI (AIM) pre-built Docker image; pulled and run by the aim engine, not by Hugging Face resolution",
+      "artifacts": [],
+      "engine_recipes": [
+        {
+          "engine": "aim",
+          "required_flags": [],
+          "parser_settings": {},
+          "preferred_endpoint": null,
+          "unsupported_combinations": [],
+          "notes": [
+            "gated model: export HF_TOKEN (a Hugging Face token with access to the model) and pass --engine-env HF_TOKEN; it is forwarded from your environment and never stored",
+            "requires a reachable Docker daemon; the image is pulled on first serve",
+            "Instinct-class image; AIM auto-selects the profile, see the AIM catalog for the GPU memory and GPU count it needs"
+          ],
+          "model_id_override": "amdenterpriseai/aim-google-medgemma-27b-it:0.13.0",
+          "image_digest": "sha256:a89823487230a8cea1f9d49f881e64f20375ee793739c223ab2c09f7bc30a088",
+          "supported_gfx_families": ["gfx94X-dcgpu", "gfx950-dcgpu"],
+          "requires_hf_token": true,
+          "generated_at_unix_ms": 1793272421113,
+          "extra_env": {}
+        }
+      ],
+      "manual_alternatives": [],
+      "chat_template_mode": "auto",
+      "preferred_engines": [
+        "aim",
+        "vllm"
+      ],
+      "warnings": [
+        "AIM image from the AMD Enterprise AI catalog; requires Docker"
+      ]
+    },
+    {
+      "canonical_model_id": "meta-llama/Llama-3.1-405B-Instruct",
+      "aliases": [
+        "amdenterpriseai/aim-meta-llama-llama-3-1-405b-instruct"
+      ],
+      "task": "chat",
+      "source": "recipe_index",
+      "revision": "main",
+      "loader": "aim",
+      "trust_remote_code": false,
+      "dtype": "auto",
+      "device_policy": "gpu_required",
+      "min_gpu_mem_gb": 486,
+      "quantization": "none; served as-is by the AIM image's bundled vLLM",
+      "artifact_hint": "AMD Enterprise AI (AIM) pre-built Docker image; pulled and run by the aim engine, not by Hugging Face resolution",
+      "artifacts": [],
+      "engine_recipes": [
+        {
+          "engine": "aim",
+          "required_flags": [],
+          "parser_settings": {},
+          "preferred_endpoint": null,
+          "unsupported_combinations": [],
+          "notes": [
+            "gated model: export HF_TOKEN (a Hugging Face token with access to the model) and pass --engine-env HF_TOKEN; it is forwarded from your environment and never stored",
+            "requires a reachable Docker daemon; the image is pulled on first serve",
+            "Instinct-class image; AIM auto-selects the profile, see the AIM catalog for the GPU memory and GPU count it needs"
+          ],
+          "model_id_override": "amdenterpriseai/aim-meta-llama-llama-3-1-405b-instruct:0.11.1",
+          "image_digest": "sha256:bfe038184d0f0d8a415ee057f4fe64b984dbb743874d0907448be9ceed432743",
+          "supported_gfx_families": ["gfx94X-dcgpu", "gfx950-dcgpu"],
+          "min_gpu_counts": {"gfx94X-dcgpu": 4},
+          "requires_hf_token": true,
+          "generated_at_unix_ms": 1793272421113,
+          "extra_env": {}
+        }
+      ],
+      "manual_alternatives": [],
+      "chat_template_mode": "auto",
+      "preferred_engines": [
+        "aim",
+        "vllm"
+      ],
+      "warnings": [
+        "AIM image from the AMD Enterprise AI catalog; requires Docker"
+      ]
+    },
+    {
+      "canonical_model_id": "meta-llama/Llama-3.1-8B-Instruct",
+      "aliases": [
+        "amdenterpriseai/aim-radeon-meta-llama-llama-3-1-8b-instruct"
+      ],
+      "task": "chat",
+      "source": "recipe_index",
+      "revision": "main",
+      "loader": "aim",
+      "trust_remote_code": false,
+      "dtype": "auto",
+      "device_policy": "gpu_required",
+      "min_gpu_mem_gb": 20,
+      "quantization": "none; served as-is by the AIM image's bundled vLLM",
+      "artifact_hint": "AMD Enterprise AI (AIM) pre-built Docker image; pulled and run by the aim engine, not by Hugging Face resolution",
+      "artifacts": [],
+      "engine_recipes": [
+        {
+          "engine": "aim",
+          "required_flags": [],
+          "parser_settings": {},
+          "preferred_endpoint": null,
+          "unsupported_combinations": [],
+          "notes": [
+            "gated model: export HF_TOKEN (a Hugging Face token with access to the model) and pass --engine-env HF_TOKEN; it is forwarded from your environment and never stored",
+            "requires a reachable Docker daemon; the image is pulled on first serve",
+            "Radeon-targeted image; the AIM profile is pinned per GPU family from profile_ids, override with --engine-env AIM_PROFILE_ID=<id>"
+          ],
+          "model_id_override": "amdenterpriseai/aim-radeon-meta-llama-llama-3-1-8b-instruct:2026.11.0",
+          "image_digest": "sha256:a300b53f5f919a59d0cdc4bc177a6db5ef1660719cb50c128be6f8ec4a7c79d5",
+          "supported_gfx_families": ["gfx110X-all", "gfx120X-all"],
+          "supported_boards": ["W7900", "R9700"],
+          "requires_hf_token": true,
+          "profile_ids": {"gfx110X-all": "vllm-w7900-bf16-tp1-latency", "gfx120X-all": "vllm-r9700-bf16-tp1-latency"},
+          "generated_at_unix_ms": 1793272421113,
+          "extra_env": {}
+        }
+      ],
+      "manual_alternatives": [],
+      "chat_template_mode": "auto",
+      "preferred_engines": [
+        "aim",
+        "vllm"
+      ],
+      "warnings": [
+        "AIM image from the AMD Enterprise AI catalog; requires Docker"
+      ]
+    },
+    {
+      "canonical_model_id": "meta-llama/Llama-3.2-1B-Instruct",
+      "aliases": [
+        "amdenterpriseai/aim-meta-llama-llama-3-2-1b-instruct"
+      ],
+      "task": "chat",
+      "source": "recipe_index",
+      "revision": "main",
+      "loader": "aim",
+      "trust_remote_code": false,
+      "dtype": "auto",
+      "device_policy": "gpu_required",
+      "min_gpu_mem_gb": 3,
+      "quantization": "none; served as-is by the AIM image's bundled vLLM",
+      "artifact_hint": "AMD Enterprise AI (AIM) pre-built Docker image; pulled and run by the aim engine, not by Hugging Face resolution",
+      "artifacts": [],
+      "engine_recipes": [
+        {
+          "engine": "aim",
+          "required_flags": [],
+          "parser_settings": {},
+          "preferred_endpoint": null,
+          "unsupported_combinations": [],
+          "notes": [
+            "gated model: export HF_TOKEN (a Hugging Face token with access to the model) and pass --engine-env HF_TOKEN; it is forwarded from your environment and never stored",
+            "requires a reachable Docker daemon; the image is pulled on first serve",
+            "Instinct-class image; AIM auto-selects the profile, see the AIM catalog for the GPU memory and GPU count it needs"
+          ],
+          "model_id_override": "amdenterpriseai/aim-meta-llama-llama-3-2-1b-instruct:0.11.1",
+          "image_digest": "sha256:92e87333a235d5af0494d3148a5dea537da041de671b8b9a9db05bfbd2bfb164",
+          "supported_gfx_families": ["gfx94X-dcgpu", "gfx950-dcgpu"],
+          "requires_hf_token": true,
+          "generated_at_unix_ms": 1793272421113,
+          "extra_env": {}
+        }
+      ],
+      "manual_alternatives": [],
+      "chat_template_mode": "auto",
+      "preferred_engines": [
+        "aim",
+        "vllm"
+      ],
+      "warnings": [
+        "AIM image from the AMD Enterprise AI catalog; requires Docker"
+      ]
+    },
+    {
+      "canonical_model_id": "meta-llama/Llama-3.3-70B-Instruct",
+      "aliases": [
+        "amdenterpriseai/aim-meta-llama-llama-3-3-70b-instruct"
+      ],
+      "task": "chat",
+      "source": "recipe_index",
+      "revision": "main",
+      "loader": "aim",
+      "trust_remote_code": false,
+      "dtype": "auto",
+      "device_policy": "gpu_required",
+      "min_gpu_mem_gb": 85,
+      "quantization": "none; served as-is by the AIM image's bundled vLLM",
+      "artifact_hint": "AMD Enterprise AI (AIM) pre-built Docker image; pulled and run by the aim engine, not by Hugging Face resolution",
+      "artifacts": [],
+      "engine_recipes": [
+        {
+          "engine": "aim",
+          "required_flags": [],
+          "parser_settings": {},
+          "preferred_endpoint": null,
+          "unsupported_combinations": [],
+          "notes": [
+            "gated model: export HF_TOKEN (a Hugging Face token with access to the model) and pass --engine-env HF_TOKEN; it is forwarded from your environment and never stored",
+            "requires a reachable Docker daemon; the image is pulled on first serve",
+            "Instinct-class image; AIM auto-selects the profile, see the AIM catalog for the GPU memory and GPU count it needs"
+          ],
+          "model_id_override": "amdenterpriseai/aim-meta-llama-llama-3-3-70b-instruct:0.11.1",
+          "image_digest": "sha256:c8d1bb99119241592d5749e7e707224154a7acae081558d5a30caefc75c32338",
+          "supported_gfx_families": ["gfx94X-dcgpu", "gfx950-dcgpu"],
+          "requires_hf_token": true,
+          "generated_at_unix_ms": 1793272421113,
+          "extra_env": {}
+        }
+      ],
+      "manual_alternatives": [],
+      "chat_template_mode": "auto",
+      "preferred_engines": [
+        "aim",
+        "vllm"
+      ],
+      "warnings": [
+        "AIM image from the AMD Enterprise AI catalog; requires Docker"
+      ]
+    },
+    {
+      "canonical_model_id": "MiniMaxAI/MiniMax-M2.5",
+      "aliases": [
+        "amdenterpriseai/aim-minimaxai-minimax-m2-5"
+      ],
+      "task": "chat",
+      "source": "recipe_index",
+      "revision": "main",
+      "loader": "aim",
+      "trust_remote_code": false,
+      "dtype": "auto",
+      "device_policy": "gpu_required",
+      "min_gpu_mem_gb": 276,
+      "quantization": "none; served as-is by the AIM image's bundled vLLM",
+      "artifact_hint": "AMD Enterprise AI (AIM) pre-built Docker image; pulled and run by the aim engine, not by Hugging Face resolution",
+      "artifacts": [],
+      "engine_recipes": [
+        {
+          "engine": "aim",
+          "required_flags": [],
+          "parser_settings": {},
+          "preferred_endpoint": null,
+          "unsupported_combinations": [],
+          "notes": [
+            "requires a reachable Docker daemon; the image is pulled on first serve",
+            "Instinct-class image; AIM auto-selects the profile, see the AIM catalog for the GPU memory and GPU count it needs"
+          ],
+          "model_id_override": "amdenterpriseai/aim-minimaxai-minimax-m2-5:0.12.0",
+          "image_digest": "sha256:0a20a6dd756dc3ebc9cc0ada23f95e8edf49fbe33354652702f6d878380323ed",
+          "supported_gfx_families": ["gfx94X-dcgpu", "gfx950-dcgpu"],
+          "min_gpu_counts": {"gfx94X-dcgpu": 2},
+          "generated_at_unix_ms": 1793272421113,
+          "extra_env": {}
+        }
+      ],
+      "manual_alternatives": [],
+      "chat_template_mode": "auto",
+      "preferred_engines": [
+        "aim",
+        "vllm"
+      ],
+      "warnings": [
+        "AIM image from the AMD Enterprise AI catalog; requires Docker"
+      ]
+    },
+    {
+      "canonical_model_id": "MiniMaxAI/MiniMax-M3",
+      "aliases": [
+        "amdenterpriseai/aim-minimaxai-minimax-m3"
+      ],
+      "task": "chat",
+      "source": "recipe_index",
+      "revision": "main",
+      "loader": "aim",
+      "trust_remote_code": false,
+      "dtype": "auto",
+      "device_policy": "gpu_required",
+      "quantization": "none; served as-is by the AIM image's bundled vLLM",
+      "artifact_hint": "AMD Enterprise AI (AIM) pre-built Docker image; pulled and run by the aim engine, not by Hugging Face resolution",
+      "artifacts": [],
+      "engine_recipes": [
+        {
+          "engine": "aim",
+          "required_flags": [],
+          "parser_settings": {},
+          "preferred_endpoint": null,
+          "unsupported_combinations": [],
+          "notes": [
+            "requires a reachable Docker daemon; the image is pulled on first serve",
+            "Instinct-class image; AIM auto-selects the profile, see the AIM catalog for the GPU memory and GPU count it needs"
+          ],
+          "model_id_override": "amdenterpriseai/aim-minimaxai-minimax-m3:2026.9.0",
+          "image_digest": "sha256:2b7221c5fa3592afefb0e904d10b063126ebe76f71ca7a5b8cd2c2a8a26c10c9",
+          "supported_gfx_families": ["gfx94X-dcgpu", "gfx950-dcgpu"],
+          "min_gpu_counts": {"gfx94X-dcgpu": 4, "gfx950-dcgpu": 4},
+          "generated_at_unix_ms": 1793272421113,
+          "extra_env": {}
+        }
+      ],
+      "manual_alternatives": [],
+      "chat_template_mode": "auto",
+      "preferred_engines": [
+        "aim",
+        "vllm"
+      ],
+      "warnings": [
+        "AIM image from the AMD Enterprise AI catalog; requires Docker"
+      ]
+    },
+    {
+      "canonical_model_id": "mistralai/Ministral-3-14B-Instruct-2512",
+      "aliases": [
+        "amdenterpriseai/aim-mistralai-ministral-3-14b-instruct-2512"
+      ],
+      "task": "chat",
+      "source": "recipe_index",
+      "revision": "main",
+      "loader": "aim",
+      "trust_remote_code": false,
+      "dtype": "auto",
+      "device_policy": "gpu_required",
+      "min_gpu_mem_gb": 17,
+      "quantization": "none; served as-is by the AIM image's bundled vLLM",
+      "artifact_hint": "AMD Enterprise AI (AIM) pre-built Docker image; pulled and run by the aim engine, not by Hugging Face resolution",
+      "artifacts": [],
+      "engine_recipes": [
+        {
+          "engine": "aim",
+          "required_flags": [],
+          "parser_settings": {},
+          "preferred_endpoint": null,
+          "unsupported_combinations": [],
+          "notes": [
+            "requires a reachable Docker daemon; the image is pulled on first serve",
+            "Instinct-class image; AIM auto-selects the profile, see the AIM catalog for the GPU memory and GPU count it needs"
+          ],
+          "model_id_override": "amdenterpriseai/aim-mistralai-ministral-3-14b-instruct-2512:0.11.1",
+          "image_digest": "sha256:8fa94cb5351554ca32c15543b48d74b79ef214a29f8066501c841d38798f6504",
+          "supported_gfx_families": ["gfx94X-dcgpu", "gfx950-dcgpu"],
+          "generated_at_unix_ms": 1793272421113,
+          "extra_env": {}
+        }
+      ],
+      "manual_alternatives": [],
+      "chat_template_mode": "auto",
+      "preferred_engines": [
+        "aim",
+        "vllm"
+      ],
+      "warnings": [
+        "AIM image from the AMD Enterprise AI catalog; requires Docker"
+      ]
+    },
+    {
+      "canonical_model_id": "mistralai/Ministral-3-14B-Reasoning-2512",
+      "aliases": [
+        "amdenterpriseai/aim-mistralai-ministral-3-14b-reasoning-2512"
+      ],
+      "task": "chat",
+      "source": "recipe_index",
+      "revision": "main",
+      "loader": "aim",
+      "trust_remote_code": false,
+      "dtype": "auto",
+      "device_policy": "gpu_required",
+      "min_gpu_mem_gb": 17,
+      "quantization": "none; served as-is by the AIM image's bundled vLLM",
+      "artifact_hint": "AMD Enterprise AI (AIM) pre-built Docker image; pulled and run by the aim engine, not by Hugging Face resolution",
+      "artifacts": [],
+      "engine_recipes": [
+        {
+          "engine": "aim",
+          "required_flags": [],
+          "parser_settings": {},
+          "preferred_endpoint": null,
+          "unsupported_combinations": [],
+          "notes": [
+            "requires a reachable Docker daemon; the image is pulled on first serve",
+            "Instinct-class image; AIM auto-selects the profile, see the AIM catalog for the GPU memory and GPU count it needs"
+          ],
+          "model_id_override": "amdenterpriseai/aim-mistralai-ministral-3-14b-reasoning-2512:0.11.1",
+          "image_digest": "sha256:50cb5fc4f2a2a6973f63adcf0f8621d091dd825f67f3808cb6d743ded9d2a00a",
+          "supported_gfx_families": ["gfx94X-dcgpu", "gfx950-dcgpu"],
+          "generated_at_unix_ms": 1793272421113,
+          "extra_env": {}
+        }
+      ],
+      "manual_alternatives": [],
+      "chat_template_mode": "auto",
+      "preferred_engines": [
+        "aim",
+        "vllm"
+      ],
+      "warnings": [
+        "AIM image from the AMD Enterprise AI catalog; requires Docker"
+      ]
+    },
+    {
+      "canonical_model_id": "mistralai/Mistral-Large-3-675B-Instruct-2512",
+      "aliases": [
+        "amdenterpriseai/aim-mistralai-mistral-large-3-675b-instruct-2512"
+      ],
+      "task": "chat",
+      "source": "recipe_index",
+      "revision": "main",
+      "loader": "aim",
+      "trust_remote_code": false,
+      "dtype": "auto",
+      "device_policy": "gpu_required",
+      "min_gpu_mem_gb": 810,
+      "quantization": "none; served as-is by the AIM image's bundled vLLM",
+      "artifact_hint": "AMD Enterprise AI (AIM) pre-built Docker image; pulled and run by the aim engine, not by Hugging Face resolution",
+      "artifacts": [],
+      "engine_recipes": [
+        {
+          "engine": "aim",
+          "required_flags": [],
+          "parser_settings": {},
+          "preferred_endpoint": null,
+          "unsupported_combinations": [],
+          "notes": [
+            "requires a reachable Docker daemon; the image is pulled on first serve",
+            "Instinct-class image; AIM auto-selects the profile, see the AIM catalog for the GPU memory and GPU count it needs"
+          ],
+          "model_id_override": "amdenterpriseai/aim-mistralai-mistral-large-3-675b-instruct-2512:0.10.0",
+          "image_digest": "sha256:6119b9c717b44ff4bec3183318623738d2d95a99ecd85e0fe5bdca98bf24dbdd",
+          "supported_gfx_families": ["gfx94X-dcgpu", "gfx950-dcgpu"],
+          "min_gpu_counts": {"gfx94X-dcgpu": 8, "gfx950-dcgpu": 8},
+          "generated_at_unix_ms": 1793272421113,
+          "extra_env": {}
+        }
+      ],
+      "manual_alternatives": [],
+      "chat_template_mode": "auto",
+      "preferred_engines": [
+        "aim",
+        "vllm"
+      ],
+      "warnings": [
+        "AIM image from the AMD Enterprise AI catalog; requires Docker"
+      ]
+    },
+    {
+      "canonical_model_id": "mistralai/Mistral-Small-24B-Instruct-2501",
+      "aliases": [
+        "amdenterpriseai/aim-mistralai-mistral-small-24b-instruct-2501"
+      ],
+      "task": "chat",
+      "source": "recipe_index",
+      "revision": "main",
+      "loader": "aim",
+      "trust_remote_code": false,
+      "dtype": "auto",
+      "device_policy": "gpu_required",
+      "min_gpu_mem_gb": 58,
+      "quantization": "none; served as-is by the AIM image's bundled vLLM",
+      "artifact_hint": "AMD Enterprise AI (AIM) pre-built Docker image; pulled and run by the aim engine, not by Hugging Face resolution",
+      "artifacts": [],
+      "engine_recipes": [
+        {
+          "engine": "aim",
+          "required_flags": [],
+          "parser_settings": {},
+          "preferred_endpoint": null,
+          "unsupported_combinations": [],
+          "notes": [
+            "requires a reachable Docker daemon; the image is pulled on first serve",
+            "Instinct-class image; AIM auto-selects the profile, see the AIM catalog for the GPU memory and GPU count it needs"
+          ],
+          "model_id_override": "amdenterpriseai/aim-mistralai-mistral-small-24b-instruct-2501:0.13.0",
+          "image_digest": "sha256:976a1e5a9880756058dad68dd3f543d76f01f1955a436f1bf5b03832704e2b20",
+          "supported_gfx_families": ["gfx94X-dcgpu", "gfx950-dcgpu"],
+          "generated_at_unix_ms": 1793272421113,
+          "extra_env": {}
+        }
+      ],
+      "manual_alternatives": [],
+      "chat_template_mode": "auto",
+      "preferred_engines": [
+        "aim",
+        "vllm"
+      ],
+      "warnings": [
+        "AIM image from the AMD Enterprise AI catalog; requires Docker"
+      ]
+    },
+    {
+      "canonical_model_id": "mistralai/Mistral-Small-3.2-24B-Instruct-2506",
+      "aliases": [
+        "amdenterpriseai/aim-mistralai-mistral-small-3-2-24b-instruct-2506"
+      ],
+      "task": "chat",
+      "source": "recipe_index",
+      "revision": "main",
+      "loader": "aim",
+      "trust_remote_code": false,
+      "dtype": "auto",
+      "device_policy": "gpu_required",
+      "min_gpu_mem_gb": 58,
+      "quantization": "none; served as-is by the AIM image's bundled vLLM",
+      "artifact_hint": "AMD Enterprise AI (AIM) pre-built Docker image; pulled and run by the aim engine, not by Hugging Face resolution",
+      "artifacts": [],
+      "engine_recipes": [
+        {
+          "engine": "aim",
+          "required_flags": [],
+          "parser_settings": {},
+          "preferred_endpoint": null,
+          "unsupported_combinations": [],
+          "notes": [
+            "requires a reachable Docker daemon; the image is pulled on first serve",
+            "Instinct-class image; AIM auto-selects the profile, see the AIM catalog for the GPU memory and GPU count it needs"
+          ],
+          "model_id_override": "amdenterpriseai/aim-mistralai-mistral-small-3-2-24b-instruct-2506:0.11.1",
+          "image_digest": "sha256:7883d07cc867795a307073855a716b0c7e623e7f1327a6c347a338f95760f719",
+          "supported_gfx_families": ["gfx94X-dcgpu", "gfx950-dcgpu"],
+          "generated_at_unix_ms": 1793272421113,
+          "extra_env": {}
+        }
+      ],
+      "manual_alternatives": [],
+      "chat_template_mode": "auto",
+      "preferred_engines": [
+        "aim",
+        "vllm"
+      ],
+      "warnings": [
+        "AIM image from the AMD Enterprise AI catalog; requires Docker"
+      ]
+    },
+    {
+      "canonical_model_id": "mistralai/Mixtral-8x22B-Instruct-v0.1",
+      "aliases": [
+        "amdenterpriseai/aim-mistralai-mixtral-8x22b-instruct-v0-1"
+      ],
+      "task": "chat",
+      "source": "recipe_index",
+      "revision": "main",
+      "loader": "aim",
+      "trust_remote_code": false,
+      "dtype": "auto",
+      "device_policy": "gpu_required",
+      "min_gpu_mem_gb": 339,
+      "quantization": "none; served as-is by the AIM image's bundled vLLM",
+      "artifact_hint": "AMD Enterprise AI (AIM) pre-built Docker image; pulled and run by the aim engine, not by Hugging Face resolution",
+      "artifacts": [],
+      "engine_recipes": [
+        {
+          "engine": "aim",
+          "required_flags": [],
+          "parser_settings": {},
+          "preferred_endpoint": null,
+          "unsupported_combinations": [],
+          "notes": [
+            "requires a reachable Docker daemon; the image is pulled on first serve",
+            "Instinct-class image; AIM auto-selects the profile, see the AIM catalog for the GPU memory and GPU count it needs"
+          ],
+          "model_id_override": "amdenterpriseai/aim-mistralai-mixtral-8x22b-instruct-v0-1:0.11.1",
+          "image_digest": "sha256:bcbe47ea00037f1d3b203a47c95bcfaa2dc76b5739a94bfdf0d681be1385c8a7",
+          "supported_gfx_families": ["gfx94X-dcgpu", "gfx950-dcgpu"],
+          "min_gpu_counts": {"gfx94X-dcgpu": 4, "gfx950-dcgpu": 4},
+          "generated_at_unix_ms": 1793272421113,
+          "extra_env": {}
+        }
+      ],
+      "manual_alternatives": [],
+      "chat_template_mode": "auto",
+      "preferred_engines": [
+        "aim",
+        "vllm"
+      ],
+      "warnings": [
+        "AIM image from the AMD Enterprise AI catalog; requires Docker"
+      ]
+    },
+    {
+      "canonical_model_id": "mistralai/Mixtral-8x7B-Instruct-v0.1",
+      "aliases": [
+        "amdenterpriseai/aim-mistralai-mixtral-8x7b-instruct-v0-1"
+      ],
+      "task": "chat",
+      "source": "recipe_index",
+      "revision": "main",
+      "loader": "aim",
+      "trust_remote_code": false,
+      "dtype": "auto",
+      "device_policy": "gpu_required",
+      "min_gpu_mem_gb": 113,
+      "quantization": "none; served as-is by the AIM image's bundled vLLM",
+      "artifact_hint": "AMD Enterprise AI (AIM) pre-built Docker image; pulled and run by the aim engine, not by Hugging Face resolution",
+      "artifacts": [],
+      "engine_recipes": [
+        {
+          "engine": "aim",
+          "required_flags": [],
+          "parser_settings": {},
+          "preferred_endpoint": null,
+          "unsupported_combinations": [],
+          "notes": [
+            "requires a reachable Docker daemon; the image is pulled on first serve",
+            "Instinct-class image; AIM auto-selects the profile, see the AIM catalog for the GPU memory and GPU count it needs"
+          ],
+          "model_id_override": "amdenterpriseai/aim-mistralai-mixtral-8x7b-instruct-v0-1:0.11.1",
+          "image_digest": "sha256:9f2abb10dc3a21169d7cd0e6f96294df3683dd42ea49f1d5230e62722f4ae738",
+          "supported_gfx_families": ["gfx94X-dcgpu", "gfx950-dcgpu"],
+          "generated_at_unix_ms": 1793272421113,
+          "extra_env": {}
+        }
+      ],
+      "manual_alternatives": [],
+      "chat_template_mode": "auto",
+      "preferred_engines": [
+        "aim",
+        "vllm"
+      ],
+      "warnings": [
+        "AIM image from the AMD Enterprise AI catalog; requires Docker"
+      ]
+    },
+    {
+      "canonical_model_id": "openai/gpt-oss-120b",
+      "aliases": [
+        "amdenterpriseai/aim-openai-gpt-oss-120b"
+      ],
+      "task": "chat",
+      "source": "recipe_index",
+      "revision": "main",
+      "loader": "aim",
+      "trust_remote_code": false,
+      "dtype": "auto",
+      "device_policy": "gpu_required",
+      "quantization": "none; served as-is by the AIM image's bundled vLLM",
+      "artifact_hint": "AMD Enterprise AI (AIM) pre-built Docker image; pulled and run by the aim engine, not by Hugging Face resolution",
+      "artifacts": [],
+      "engine_recipes": [
+        {
+          "engine": "aim",
+          "required_flags": [],
+          "parser_settings": {},
+          "preferred_endpoint": null,
+          "unsupported_combinations": [],
+          "notes": [
+            "requires a reachable Docker daemon; the image is pulled on first serve",
+            "Instinct-class image; AIM auto-selects the profile, see the AIM catalog for the GPU memory and GPU count it needs"
+          ],
+          "model_id_override": "amdenterpriseai/aim-openai-gpt-oss-120b:0.11.1",
+          "image_digest": "sha256:a3052d6230d7a414837903c31be0122f6615819448598e9caea973c084dc3ea7",
+          "supported_gfx_families": ["gfx90a", "gfx94X-dcgpu", "gfx950-dcgpu"],
+          "min_gpu_counts": {"gfx90a": 2},
+          "generated_at_unix_ms": 1793272421113,
+          "extra_env": {}
+        }
+      ],
+      "manual_alternatives": [],
+      "chat_template_mode": "auto",
+      "preferred_engines": [
+        "aim",
+        "vllm"
+      ],
+      "warnings": [
+        "AIM image from the AMD Enterprise AI catalog; requires Docker"
+      ]
+    },
+    {
+      "canonical_model_id": "openai/gpt-oss-20b",
+      "aliases": [
+        "amdenterpriseai/aim-openai-gpt-oss-20b"
+      ],
+      "task": "chat",
+      "source": "recipe_index",
+      "revision": "main",
+      "loader": "aim",
+      "trust_remote_code": false,
+      "dtype": "auto",
+      "device_policy": "gpu_required",
+      "quantization": "none; served as-is by the AIM image's bundled vLLM",
+      "artifact_hint": "AMD Enterprise AI (AIM) pre-built Docker image; pulled and run by the aim engine, not by Hugging Face resolution",
+      "artifacts": [],
+      "engine_recipes": [
+        {
+          "engine": "aim",
+          "required_flags": [],
+          "parser_settings": {},
+          "preferred_endpoint": null,
+          "unsupported_combinations": [],
+          "notes": [
+            "requires a reachable Docker daemon; the image is pulled on first serve",
+            "Instinct-class image; AIM auto-selects the profile, see the AIM catalog for the GPU memory and GPU count it needs"
+          ],
+          "model_id_override": "amdenterpriseai/aim-openai-gpt-oss-20b:0.11.1",
+          "image_digest": "sha256:67cee29f3f9036eb3918190c76bc4442dd48254657e680d0256a5018c2164274",
+          "supported_gfx_families": ["gfx90a", "gfx94X-dcgpu", "gfx950-dcgpu"],
+          "generated_at_unix_ms": 1793272421113,
+          "extra_env": {}
+        }
+      ],
+      "manual_alternatives": [],
+      "chat_template_mode": "auto",
+      "preferred_engines": [
+        "aim",
+        "vllm"
+      ],
+      "warnings": [
+        "AIM image from the AMD Enterprise AI catalog; requires Docker"
+      ]
+    },
+    {
+      "canonical_model_id": "Qwen/Qwen3-235B-A22B",
+      "aliases": [
+        "amdenterpriseai/aim-qwen-qwen3-235b-a22b"
+      ],
+      "task": "chat",
+      "source": "recipe_index",
+      "revision": "main",
+      "loader": "aim",
+      "trust_remote_code": false,
+      "dtype": "auto",
+      "device_policy": "gpu_required",
+      "min_gpu_mem_gb": 282,
+      "quantization": "none; served as-is by the AIM image's bundled vLLM",
+      "artifact_hint": "AMD Enterprise AI (AIM) pre-built Docker image; pulled and run by the aim engine, not by Hugging Face resolution",
+      "artifacts": [],
+      "engine_recipes": [
+        {
+          "engine": "aim",
+          "required_flags": [],
+          "parser_settings": {},
+          "preferred_endpoint": null,
+          "unsupported_combinations": [],
+          "notes": [
+            "requires a reachable Docker daemon; the image is pulled on first serve",
+            "Instinct-class image; AIM auto-selects the profile, see the AIM catalog for the GPU memory and GPU count it needs"
+          ],
+          "model_id_override": "amdenterpriseai/aim-qwen-qwen3-235b-a22b:0.11.1",
+          "image_digest": "sha256:427d25b93cce97b499f9c1e9268b33eea25a8da8a0f7ef7904f4cdeef5f52f5a",
+          "supported_gfx_families": ["gfx94X-dcgpu", "gfx950-dcgpu"],
+          "min_gpu_counts": {"gfx94X-dcgpu": 2},
+          "generated_at_unix_ms": 1793272421113,
+          "extra_env": {}
+        }
+      ],
+      "manual_alternatives": [],
+      "chat_template_mode": "auto",
+      "preferred_engines": [
+        "aim",
+        "vllm"
+      ],
+      "warnings": [
+        "AIM image from the AMD Enterprise AI catalog; requires Docker"
+      ]
+    },
+    {
+      "canonical_model_id": "Qwen/Qwen3-32B",
+      "aliases": [
+        "amdenterpriseai/aim-qwen-qwen3-32b"
+      ],
+      "task": "chat",
+      "source": "recipe_index",
+      "revision": "main",
+      "loader": "aim",
+      "trust_remote_code": false,
+      "dtype": "auto",
+      "device_policy": "gpu_required",
+      "min_gpu_mem_gb": 40,
+      "quantization": "none; served as-is by the AIM image's bundled vLLM",
+      "artifact_hint": "AMD Enterprise AI (AIM) pre-built Docker image; pulled and run by the aim engine, not by Hugging Face resolution",
+      "artifacts": [],
+      "engine_recipes": [
+        {
+          "engine": "aim",
+          "required_flags": [],
+          "parser_settings": {},
+          "preferred_endpoint": null,
+          "unsupported_combinations": [],
+          "notes": [
+            "requires a reachable Docker daemon; the image is pulled on first serve",
+            "Instinct-class image; AIM auto-selects the profile, see the AIM catalog for the GPU memory and GPU count it needs"
+          ],
+          "model_id_override": "amdenterpriseai/aim-qwen-qwen3-32b:0.13.0",
+          "image_digest": "sha256:3e8d47db7c88ca1b7bb210b7bfd5a66f0439e3b768f200ab4aa51fb058d2871c",
+          "supported_gfx_families": ["gfx94X-dcgpu", "gfx950-dcgpu"],
+          "generated_at_unix_ms": 1793272421113,
+          "extra_env": {}
+        }
+      ],
+      "manual_alternatives": [],
+      "chat_template_mode": "auto",
+      "preferred_engines": [
+        "aim",
+        "vllm"
+      ],
+      "warnings": [
+        "AIM image from the AMD Enterprise AI catalog; requires Docker"
+      ]
+    },
+    {
+      "canonical_model_id": "Qwen/Qwen3-Coder-Next",
+      "aliases": [
+        "amdenterpriseai/aim-qwen-qwen3-coder-next"
+      ],
+      "task": "chat",
+      "source": "recipe_index",
+      "revision": "main",
+      "loader": "aim",
+      "trust_remote_code": false,
+      "dtype": "auto",
+      "device_policy": "gpu_required",
+      "min_gpu_mem_gb": 96,
+      "quantization": "none; served as-is by the AIM image's bundled vLLM",
+      "artifact_hint": "AMD Enterprise AI (AIM) pre-built Docker image; pulled and run by the aim engine, not by Hugging Face resolution",
+      "artifacts": [],
+      "engine_recipes": [
+        {
+          "engine": "aim",
+          "required_flags": [],
+          "parser_settings": {},
+          "preferred_endpoint": null,
+          "unsupported_combinations": [],
+          "notes": [
+            "requires a reachable Docker daemon; the image is pulled on first serve",
+            "Instinct-class image; AIM auto-selects the profile, see the AIM catalog for the GPU memory and GPU count it needs"
+          ],
+          "model_id_override": "amdenterpriseai/aim-qwen-qwen3-coder-next:0.11.1",
+          "image_digest": "sha256:0874c97e547a59df1893813e3f011c7e5bc1d035b68e99361f4175c0e15010c0",
+          "supported_gfx_families": ["gfx94X-dcgpu", "gfx950-dcgpu"],
+          "generated_at_unix_ms": 1793272421113,
+          "extra_env": {}
+        }
+      ],
+      "manual_alternatives": [],
+      "chat_template_mode": "auto",
+      "preferred_engines": [
+        "aim",
+        "vllm"
+      ],
+      "warnings": [
+        "AIM image from the AMD Enterprise AI catalog; requires Docker"
+      ]
+    },
+    {
+      "canonical_model_id": "Qwen/Qwen3-VL-235B-A22B-Instruct",
+      "aliases": [
+        "amdenterpriseai/aim-qwen-qwen3-vl-235b-a22b-instruct"
+      ],
+      "task": "chat",
+      "source": "recipe_index",
+      "revision": "main",
+      "loader": "aim",
+      "trust_remote_code": false,
+      "dtype": "auto",
+      "device_policy": "gpu_required",
+      "min_gpu_mem_gb": 282,
+      "quantization": "none; served as-is by the AIM image's bundled vLLM",
+      "artifact_hint": "AMD Enterprise AI (AIM) pre-built Docker image; pulled and run by the aim engine, not by Hugging Face resolution",
+      "artifacts": [],
+      "engine_recipes": [
+        {
+          "engine": "aim",
+          "required_flags": [],
+          "parser_settings": {},
+          "preferred_endpoint": null,
+          "unsupported_combinations": [],
+          "notes": [
+            "requires a reachable Docker daemon; the image is pulled on first serve",
+            "Instinct-class image; AIM auto-selects the profile, see the AIM catalog for the GPU memory and GPU count it needs"
+          ],
+          "model_id_override": "amdenterpriseai/aim-qwen-qwen3-vl-235b-a22b-instruct:0.11.1",
+          "image_digest": "sha256:4353ab9fb67d30b54d4c724429c0401490b42aa96045a050faea7b46a9e2d3d6",
+          "supported_gfx_families": ["gfx94X-dcgpu", "gfx950-dcgpu"],
+          "min_gpu_counts": {"gfx94X-dcgpu": 2},
+          "generated_at_unix_ms": 1793272421113,
+          "extra_env": {}
+        }
+      ],
+      "manual_alternatives": [],
+      "chat_template_mode": "auto",
+      "preferred_engines": [
+        "aim",
+        "vllm"
+      ],
+      "warnings": [
+        "AIM image from the AMD Enterprise AI catalog; requires Docker"
+      ]
+    },
+    {
+      "canonical_model_id": "Qwen/Qwen3-VL-235B-A22B-Thinking",
+      "aliases": [
+        "amdenterpriseai/aim-qwen-qwen3-vl-235b-a22b-thinking"
+      ],
+      "task": "chat",
+      "source": "recipe_index",
+      "revision": "main",
+      "loader": "aim",
+      "trust_remote_code": false,
+      "dtype": "auto",
+      "device_policy": "gpu_required",
+      "min_gpu_mem_gb": 282,
+      "quantization": "none; served as-is by the AIM image's bundled vLLM",
+      "artifact_hint": "AMD Enterprise AI (AIM) pre-built Docker image; pulled and run by the aim engine, not by Hugging Face resolution",
+      "artifacts": [],
+      "engine_recipes": [
+        {
+          "engine": "aim",
+          "required_flags": [],
+          "parser_settings": {},
+          "preferred_endpoint": null,
+          "unsupported_combinations": [],
+          "notes": [
+            "requires a reachable Docker daemon; the image is pulled on first serve",
+            "Instinct-class image; AIM auto-selects the profile, see the AIM catalog for the GPU memory and GPU count it needs"
+          ],
+          "model_id_override": "amdenterpriseai/aim-qwen-qwen3-vl-235b-a22b-thinking:0.11.1",
+          "image_digest": "sha256:c10ee1a4189708e101802b4b0b3d292dfc4802ad08c6da70a0f56ae2094eeccb",
+          "supported_gfx_families": ["gfx94X-dcgpu", "gfx950-dcgpu"],
+          "min_gpu_counts": {"gfx94X-dcgpu": 2},
+          "generated_at_unix_ms": 1793272421113,
+          "extra_env": {}
+        }
+      ],
+      "manual_alternatives": [],
+      "chat_template_mode": "auto",
+      "preferred_engines": [
+        "aim",
+        "vllm"
+      ],
+      "warnings": [
+        "AIM image from the AMD Enterprise AI catalog; requires Docker"
+      ]
+    },
+    {
+      "canonical_model_id": "google/gemma-3n-E4B-it",
+      "aliases": [
+        "amdenterpriseai/aim-radeon-google-gemma-3n-e4b-it"
+      ],
+      "task": "chat",
+      "source": "recipe_index",
+      "revision": "main",
+      "loader": "aim",
+      "trust_remote_code": false,
+      "dtype": "auto",
+      "device_policy": "gpu_required",
+      "min_gpu_mem_gb": 20,
+      "quantization": "none; served as-is by the AIM image's bundled vLLM",
+      "artifact_hint": "AMD Enterprise AI (AIM) pre-built Docker image; pulled and run by the aim engine, not by Hugging Face resolution",
+      "artifacts": [],
+      "engine_recipes": [
+        {
+          "engine": "aim",
+          "required_flags": [],
+          "parser_settings": {},
+          "preferred_endpoint": null,
+          "unsupported_combinations": [],
+          "notes": [
+            "gated model: export HF_TOKEN (a Hugging Face token with access to the model) and pass --engine-env HF_TOKEN; it is forwarded from your environment and never stored",
+            "requires a reachable Docker daemon; the image is pulled on first serve",
+            "Radeon-targeted image; the AIM profile is pinned per GPU family from profile_ids, override with --engine-env AIM_PROFILE_ID=<id>"
+          ],
+          "model_id_override": "amdenterpriseai/aim-radeon-google-gemma-3n-e4b-it:0.12.0-preview",
+          "image_digest": "sha256:f5dd9116c6714a8e51e6bdbf94f5a2a8b06db62fc95994e6b331f92931416697",
+          "supported_gfx_families": ["gfx110X-all", "gfx120X-all"],
+          "supported_boards": ["W7900", "R9700"],
+          "requires_hf_token": true,
+          "profile_ids": {"gfx110X-all": "vllm-w7900-bf16-tp1-latency", "gfx120X-all": "vllm-r9700-bf16-tp1-latency"},
+          "generated_at_unix_ms": 1793272421113,
+          "extra_env": {}
+        }
+      ],
+      "manual_alternatives": [],
+      "chat_template_mode": "auto",
+      "preferred_engines": [
+        "aim",
+        "vllm"
+      ],
+      "warnings": [
+        "AIM image from the AMD Enterprise AI catalog; requires Docker"
+      ]
+    },
+    {
+      "canonical_model_id": "Qwen/Qwen3.6-35B-A3B",
+      "aliases": [
+        "amdenterpriseai/aim-radeon-qwen-qwen3-6-35b-a3b"
+      ],
+      "task": "chat",
+      "source": "recipe_index",
+      "revision": "main",
+      "loader": "aim",
+      "trust_remote_code": false,
+      "dtype": "auto",
+      "device_policy": "gpu_required",
+      "min_gpu_mem_gb": 84,
+      "quantization": "none; served as-is by the AIM image's bundled vLLM",
+      "artifact_hint": "AMD Enterprise AI (AIM) pre-built Docker image; pulled and run by the aim engine, not by Hugging Face resolution",
+      "artifacts": [],
+      "engine_recipes": [
+        {
+          "engine": "aim",
+          "required_flags": [],
+          "parser_settings": {},
+          "preferred_endpoint": null,
+          "unsupported_combinations": [],
+          "notes": [
+            "the pinned profiles use tensor parallelism and need 4 GPUs on gfx110X-all / 4 GPUs on gfx120X-all",
+            "requires a reachable Docker daemon; the image is pulled on first serve",
+            "Radeon-targeted image; the AIM profile is pinned per GPU family from profile_ids, override with --engine-env AIM_PROFILE_ID=<id>"
+          ],
+          "model_id_override": "amdenterpriseai/aim-radeon-qwen-qwen3-6-35b-a3b:2026.11.0",
+          "image_digest": "sha256:4df926af5c9e792675577cf881fb12b4964b6dac18f6d3f7c1e2cf460834eee2",
+          "supported_gfx_families": ["gfx110X-all", "gfx120X-all"],
+          "min_gpu_counts": {"gfx110X-all": 4, "gfx120X-all": 4},
+          "supported_boards": ["W7900", "R9700"],
+          "profile_ids": {"gfx110X-all": "vllm-w7900-bf16-tp4-latency", "gfx120X-all": "vllm-r9700-bf16-tp4-latency"},
+          "generated_at_unix_ms": 1793272421113,
+          "extra_env": {}
+        }
+      ],
+      "manual_alternatives": [],
+      "chat_template_mode": "auto",
+      "preferred_engines": [
+        "aim",
+        "vllm"
+      ],
+      "warnings": [
+        "AIM image from the AMD Enterprise AI catalog; requires Docker"
+      ]
+    },
+    {
+      "canonical_model_id": "Qwen/Qwen3-VL-8B-Instruct",
+      "aliases": [
+        "amdenterpriseai/aim-radeon-qwen-qwen3-vl-8b-instruct"
+      ],
+      "task": "chat",
+      "source": "recipe_index",
+      "revision": "main",
+      "loader": "aim",
+      "trust_remote_code": false,
+      "dtype": "auto",
+      "device_policy": "gpu_required",
+      "min_gpu_mem_gb": 22,
+      "quantization": "none; served as-is by the AIM image's bundled vLLM",
+      "artifact_hint": "AMD Enterprise AI (AIM) pre-built Docker image; pulled and run by the aim engine, not by Hugging Face resolution",
+      "artifacts": [],
+      "engine_recipes": [
+        {
+          "engine": "aim",
+          "required_flags": [],
+          "parser_settings": {},
+          "preferred_endpoint": null,
+          "unsupported_combinations": [],
+          "notes": [
+            "requires a reachable Docker daemon; the image is pulled on first serve",
+            "Radeon-targeted image; the AIM profile is pinned per GPU family from profile_ids, override with --engine-env AIM_PROFILE_ID=<id>"
+          ],
+          "model_id_override": "amdenterpriseai/aim-radeon-qwen-qwen3-vl-8b-instruct:2026.11.0",
+          "image_digest": "sha256:89775113626743d77023e15b595d4218c1e46e89e932b3f3ee5c0350914add55",
+          "supported_gfx_families": ["gfx110X-all", "gfx120X-all"],
+          "supported_boards": ["W7900", "R9700"],
+          "profile_ids": {"gfx110X-all": "vllm-w7900-bf16-tp1-latency", "gfx120X-all": "vllm-r9700-bf16-tp1-latency"},
+          "generated_at_unix_ms": 1793272421113,
+          "extra_env": {}
+        }
+      ],
+      "manual_alternatives": [],
+      "chat_template_mode": "auto",
+      "preferred_engines": [
+        "aim",
+        "vllm"
+      ],
+      "warnings": [
+        "AIM image from the AMD Enterprise AI catalog; requires Docker"
+      ]
+    },
+    {
+      "canonical_model_id": "zai-org/GLM-4.7-Flash",
+      "aliases": [
+        "amdenterpriseai/aim-radeon-zai-org-glm-4-7-flash"
+      ],
+      "task": "chat",
+      "source": "recipe_index",
+      "revision": "main",
+      "loader": "aim",
+      "trust_remote_code": false,
+      "dtype": "auto",
+      "device_policy": "gpu_required",
+      "min_gpu_mem_gb": 72,
+      "quantization": "none; served as-is by the AIM image's bundled vLLM",
+      "artifact_hint": "AMD Enterprise AI (AIM) pre-built Docker image; pulled and run by the aim engine, not by Hugging Face resolution",
+      "artifacts": [],
+      "engine_recipes": [
+        {
+          "engine": "aim",
+          "required_flags": [],
+          "parser_settings": {},
+          "preferred_endpoint": null,
+          "unsupported_combinations": [],
+          "notes": [
+            "the pinned profiles use tensor parallelism and need 2 GPUs on gfx110X-all / 4 GPUs on gfx120X-all",
+            "requires a reachable Docker daemon; the image is pulled on first serve",
+            "Radeon-targeted image; the AIM profile is pinned per GPU family from profile_ids, override with --engine-env AIM_PROFILE_ID=<id>"
+          ],
+          "model_id_override": "amdenterpriseai/aim-radeon-zai-org-glm-4-7-flash:0.12.0-preview",
+          "image_digest": "sha256:b94130be1f12eaab28bdce274a63b3c10a24b8e292dc91f4c563b7a42246c1ab",
+          "supported_gfx_families": ["gfx110X-all", "gfx120X-all"],
+          "min_gpu_counts": {"gfx110X-all": 2, "gfx120X-all": 4},
+          "supported_boards": ["W7900", "R9700"],
+          "profile_ids": {"gfx110X-all": "vllm-w7900-bf16-tp2-latency", "gfx120X-all": "vllm-r9700-bf16-tp4-latency"},
+          "generated_at_unix_ms": 1793272421113,
+          "extra_env": {}
+        }
+      ],
+      "manual_alternatives": [],
+      "chat_template_mode": "auto",
+      "preferred_engines": [
+        "aim",
+        "vllm"
+      ],
+      "warnings": [
+        "AIM image from the AMD Enterprise AI catalog; requires Docker"
+      ]
+    },
+    {
+      "canonical_model_id": "zai-org/GLM-4.7",
+      "aliases": [
+        "amdenterpriseai/aim-zai-org-glm-4-7"
+      ],
+      "task": "chat",
+      "source": "recipe_index",
+      "revision": "main",
+      "loader": "aim",
+      "trust_remote_code": false,
+      "dtype": "auto",
+      "device_policy": "gpu_required",
+      "min_gpu_mem_gb": 384,
+      "quantization": "none; served as-is by the AIM image's bundled vLLM",
+      "artifact_hint": "AMD Enterprise AI (AIM) pre-built Docker image; pulled and run by the aim engine, not by Hugging Face resolution",
+      "artifacts": [],
+      "engine_recipes": [
+        {
+          "engine": "aim",
+          "required_flags": [],
+          "parser_settings": {},
+          "preferred_endpoint": null,
+          "unsupported_combinations": [],
+          "notes": [
+            "requires a reachable Docker daemon; the image is pulled on first serve",
+            "Instinct-class image; AIM auto-selects the profile, see the AIM catalog for the GPU memory and GPU count it needs"
+          ],
+          "model_id_override": "amdenterpriseai/aim-zai-org-glm-4-7:0.12.0",
+          "image_digest": "sha256:6555005fe59ad9334ce292ca3df4b619106656a731e7319114c2b3a43a1b1219",
+          "supported_gfx_families": ["gfx94X-dcgpu", "gfx950-dcgpu"],
+          "min_gpu_counts": {"gfx94X-dcgpu": 2},
+          "generated_at_unix_ms": 1793272421113,
+          "extra_env": {}
+        }
+      ],
+      "manual_alternatives": [],
+      "chat_template_mode": "auto",
+      "preferred_engines": [
+        "aim",
+        "vllm"
+      ],
+      "warnings": [
+        "AIM image from the AMD Enterprise AI catalog; requires Docker"
+      ]
+    },
+    {
+      "canonical_model_id": "zai-org/GLM-5.2",
+      "aliases": [
+        "amdenterpriseai/aim-zai-org-glm-5-2"
+      ],
+      "task": "chat",
+      "source": "recipe_index",
+      "revision": "main",
+      "loader": "aim",
+      "trust_remote_code": false,
+      "dtype": "auto",
+      "device_policy": "gpu_required",
+      "quantization": "none; served as-is by the AIM image's bundled vLLM",
+      "artifact_hint": "AMD Enterprise AI (AIM) pre-built Docker image; pulled and run by the aim engine, not by Hugging Face resolution",
+      "artifacts": [],
+      "engine_recipes": [
+        {
+          "engine": "aim",
+          "required_flags": [],
+          "parser_settings": {},
+          "preferred_endpoint": null,
+          "unsupported_combinations": [],
+          "notes": [
+            "requires a reachable Docker daemon; the image is pulled on first serve",
+            "Instinct-class image; AIM auto-selects the profile, see the AIM catalog for the GPU memory and GPU count it needs"
+          ],
+          "model_id_override": "amdenterpriseai/aim-zai-org-glm-5-2:2026.9.0",
+          "image_digest": "sha256:1a0ad5bda56eb0784085583068d56e1cfc03f4b28875fe968d9477b30b9f5f5b",
+          "supported_gfx_families": ["gfx94X-dcgpu"],
+          "min_gpu_counts": {"gfx94X-dcgpu": 8},
+          "generated_at_unix_ms": 1793272421113,
+          "extra_env": {}
+        }
+      ],
+      "manual_alternatives": [],
+      "chat_template_mode": "auto",
+      "preferred_engines": [
+        "aim",
+        "vllm"
+      ],
+      "warnings": [
+        "AIM image from the AMD Enterprise AI catalog; requires Docker"
       ]
     }
   ]

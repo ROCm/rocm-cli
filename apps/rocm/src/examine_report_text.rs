@@ -561,14 +561,7 @@ pub(crate) fn render_model_registry_text_with_context_and_host(
     for platform in &platforms {
         let mut group = visible
             .iter()
-            .filter(|recipe| {
-                recipe.preferred_engines.first().is_some_and(|engine| {
-                    platform
-                        .engines
-                        .iter()
-                        .any(|e| e.eq_ignore_ascii_case(engine))
-                })
-            })
+            .filter(|recipe| rocm_core::model_recipe_targets_platform(recipe, platform))
             .peekable();
         if group.peek().is_none() {
             continue;
@@ -700,9 +693,22 @@ pub(crate) fn render_model_registry_verbose_text_with_context_and_host(
         for warning in &recipe.warnings {
             let _ = writeln!(output, "      warning: {warning}");
         }
+        append_model_recipe_staleness_lines(&mut output, recipe, rocm_core::unix_time_millis());
     }
     append_model_recipe_registry_source(&mut output, &registry);
     output
+}
+
+fn append_model_recipe_staleness_lines(
+    output: &mut String,
+    recipe: &ModelRecipeRecord,
+    now_ms: u128,
+) {
+    for engine_recipe in &recipe.engine_recipes {
+        if let Some(warning) = rocm_core::model_recipe_staleness_warning(engine_recipe, now_ms) {
+            let _ = writeln!(output, "      warning: {warning}");
+        }
+    }
 }
 
 /// The `rocm model` header. For the default built-in list it just names the
@@ -800,6 +806,22 @@ fn append_model_engine_recipe_settings_lines(output: &mut String, recipe: &Model
                 .join("; ")
         };
         let notes = format_list_or_none(&engine_recipe.notes);
+        if !engine_recipe.supported_gfx_families.is_empty() {
+            let _ = writeln!(
+                output,
+                "      engine_recipe {} supported_gfx_families=[{}] profile_ids=[{}] min_gpu_counts=[{}]",
+                engine_recipe.engine,
+                engine_recipe.supported_gfx_families.join(","),
+                format_string_map_or_none(&engine_recipe.profile_ids),
+                format_string_map_or_none(
+                    &engine_recipe
+                        .min_gpu_counts
+                        .iter()
+                        .map(|(family, count)| (family.clone(), count.to_string()))
+                        .collect()
+                )
+            );
+        }
         let _ = writeln!(
             output,
             "      engine_recipe {} required_flags=[{}] parser_settings=[{}] preferred_endpoint={} unsupported_combinations=[{}] notes=[{}]",
@@ -1887,8 +1909,8 @@ mod tests {
         assert!(rendered.contains("Recommended models - run one with `rocm serve <model>`"));
         // Featured current models are grouped under their hardware target, each
         // with the quant that fits a single GPU.
-        assert!(rendered.contains("AMD Ryzen AI - Strix Halo (Lemonade / llama.cpp / AIM)"));
-        assert!(rendered.contains("AMD Instinct - MI300X, MI350X, MI355X (vLLM)"));
+        assert!(rendered.contains("AMD Ryzen AI - Strix Halo (Lemonade / llama.cpp)"));
+        assert!(rendered.contains("AMD Instinct - MI300X, MI350X, MI355X (vLLM / AIM)"));
         // Strix Halo GGUF entries carry the servable owner/repo:variant ref.
         assert!(rendered.contains("unsloth/Qwen3.6-35B-A3B-GGUF:Q4_K_M"));
         assert!(rendered.contains("Q4_K_M GGUF"));
@@ -1980,7 +2002,7 @@ mod tests {
         assert!(rendered.contains("source: built-in recipe registry"));
         // Verbose keeps every recipe (including hidden ones) and annotates each
         // with its curated catalog placement.
-        assert!(rendered.contains("catalog: AMD Instinct - MI300X, MI350X, MI355X (vLLM)"));
+        assert!(rendered.contains("catalog: AMD Instinct - MI300X, MI350X, MI355X (vLLM / AIM)"));
         assert!(rendered.contains("catalog: hidden (resolvable via rocm serve"));
         assert!(rendered.contains("sshleifer/tiny-gpt2"));
         // ROCMAI-543: `rocm model --verbose` output must stick to ASCII too, not
@@ -2028,6 +2050,12 @@ mod tests {
             notes: vec!["metadata only; not applied to launches yet".to_owned()],
             model_id_override: None,
             image_digest: None,
+            generated_at_unix_ms: None,
+            supported_gfx_families: Vec::new(),
+            profile_ids: BTreeMap::new(),
+            requires_hf_token: false,
+            supported_boards: Vec::new(),
+            min_gpu_counts: BTreeMap::new(),
             extra_env: BTreeMap::new(),
         }];
         let mut output = String::new();
@@ -2088,6 +2116,24 @@ mod tests {
         ));
         assert!(rendered.contains("llama-3.2-3b-instruct (8 GiB min GPU)"));
         assert!(rendered.contains("tiny-gpt2 (2 GiB min GPU)"));
+    }
+
+    #[test]
+    fn model_recipe_staleness_lines_warn_only_for_stale_engine_recipes() {
+        let recipe = rocm_core::resolve_builtin_model_recipe("Qwen/Qwen3-32B").expect("aim entry");
+        let verified = recipe.engine_recipes[0]
+            .generated_at_unix_ms
+            .expect("aim entries record when they were verified");
+        let stale_ms = rocm_core::MODEL_RECIPE_STALE_AFTER_MS;
+        let mut fresh = String::new();
+        append_model_recipe_staleness_lines(&mut fresh, &recipe, verified + stale_ms);
+        assert!(fresh.is_empty(), "{fresh}");
+        let mut stale = String::new();
+        append_model_recipe_staleness_lines(&mut stale, &recipe, verified + stale_ms + 1);
+        assert!(
+            stale.contains("warning: aim entry was last verified 180 days ago"),
+            "{stale}"
+        );
     }
 
     #[test]
