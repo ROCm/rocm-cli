@@ -803,8 +803,8 @@ rocm model [--verbose]
 the hardware they target. Pass `--verbose` to list every recipe, including ones
 hidden from the default list, with details such as aliases, data type, minimum
 GPU memory, and preferred engines. AIM entries are hand-maintained and record
-when they were last verified; `rocm model` warns when one is over 180 days old
-(see [docs/aim-catalog.md](docs/aim-catalog.md)).
+when they were last verified; `rocm model --verbose` warns when one is over 180
+days old (see `docs/aim-catalog.md`).
 
 ### Model serving
 

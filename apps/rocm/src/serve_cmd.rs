@@ -280,40 +280,14 @@ fn aim_min_gpu_count(
         .map(|(_, count)| *count)
 }
 
-/// Refuses an AIM image that needs `needed` GPUs when `--gpu` pins one device,
-/// fewer usable GPUs exist, or serve selected fewer devices than it needs,
-/// before anything is pulled: the container would start with too few devices and
-/// fail inside the image. `usable` is `None` when the count could not be probed,
-/// and `selected` is `None` before GPU selection or when none was made (the
-/// container then sees every GPU); neither is enforced then.
-fn ensure_aim_gpu_count(
-    model: &str,
-    needed: u32,
-    pinned_single_gpu: bool,
-    usable: Option<usize>,
-    selected: Option<usize>,
-) -> Result<()> {
-    let needed_usize = needed as usize;
-    if pinned_single_gpu {
-        bail!(
-            "`{model}` needs {needed} GPUs on this hardware, but `--gpu <index>` pins one device; \
-             drop `--gpu` (`rocm serve` does not support multi-GPU serving yet, so this model \
-             cannot be started here)"
-        );
-    }
-    if let Some(usable) = usable.filter(|usable| *usable < needed_usize) {
-        bail!(
-            "`{model}` needs {needed} GPUs on this hardware, but only {usable} usable {} found",
-            if usable == 1 { "GPU was" } else { "GPUs were" }
-        );
-    }
-    if selected.is_some_and(|selected| selected > 0 && selected < needed_usize) {
-        bail!(
-            "`{model}` needs {needed} GPUs on this hardware, but `rocm serve` selects a single \
-             GPU and does not support multi-GPU serving yet, so this model cannot be started here"
-        );
-    }
-    Ok(())
+/// Refuses an AIM image that needs `needed` GPUs before anything is pulled:
+/// `rocm serve` selects a single GPU, so the container would start with too few
+/// devices and fail inside the image.
+fn ensure_aim_multi_gpu_supported(model: &str, needed: u32) -> Result<()> {
+    bail!(
+        "`{model}` needs {needed} GPUs on this hardware, but `rocm serve` does not support \
+         multi-GPU serving yet, so this model cannot be started here"
+    )
 }
 
 /// Note shown when the pinned AIM profile targets boards other than the detected
@@ -824,8 +798,12 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
         .as_ref()
         .filter(|recipe| model_recipe_supports_engine(recipe, &selected_engine))
         .and_then(|recipe| protocol_engine_recipe_hint(recipe, &selected_engine));
+    let device_policy = parse_device_policy(device.as_ref().map(|policy| policy.as_policy_str()))?;
+    let cpu_only = matches!(device_policy, DevicePolicy::CpuOnly);
+    // The AIM GPU checks are about the GPU the container would use, so they do
+    // not apply to `--device cpu_only`.
     let aim_host_family = aim_engine_record(&selected_engine, shared_recipe.as_ref())
-        .filter(|record| !record.supported_gfx_families.is_empty())
+        .filter(|record| !record.supported_gfx_families.is_empty() && !cpu_only)
         .and_then(|_| {
             detect_host_gfx_target()
                 .as_deref()
@@ -842,6 +820,9 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
         shared_recipe.as_ref(),
         aim_host_family.as_deref(),
     );
+    if let Some(needed) = aim_min_gpus {
+        ensure_aim_multi_gpu_supported(&model, needed)?;
+    }
     // vLLM rejects the TUI chat tab's tool-bearing requests with HTTP 400 unless it
     // is launched with `--enable-auto-tool-choice`/`--tool-call-parser`. The parser
     // is model-specific and vLLM does not auto-detect it, so it is never guessed: it
@@ -918,12 +899,10 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     } else {
         None
     };
-    let device_policy = parse_device_policy(device.as_ref().map(|policy| policy.as_policy_str()))?;
     let gpu_selection = parse_gpu_selection(gpu.as_deref())?;
     // CPU-only serving never pins a GPU, so skip GPU resolution entirely and
     // surface the explicit `--gpu` as ignored rather than printing a device the
     // server will not use.
-    let cpu_only = matches!(device_policy, DevicePolicy::CpuOnly);
     // AMD GPU ordinals still usable after the active visibility mask
     // (`HIP_VISIBLE_DEVICES`, then `ROCR_VISIBLE_DEVICES`) is applied, in HIP
     // ordinal space — the space `--gpu` is validated and exported through. A
@@ -994,15 +973,6 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     } else {
         None
     };
-    if let (Some(needed), false) = (aim_min_gpus, cpu_only) {
-        ensure_aim_gpu_count(
-            &model,
-            needed,
-            matches!(gpu_selection, GpuSelection::Index(_)),
-            visible_gpu_indices.as_ref().map(Vec::len),
-            None,
-        )?;
-    }
     let resolved_selection = resolve_engine_selection(
         &config,
         &selected_engine,
@@ -1052,9 +1022,6 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
         visible_gpu_indices.as_deref(),
         gpu_vram.as_deref(),
     )?;
-    if let (Some(needed), false) = (aim_min_gpus, cpu_only) {
-        ensure_aim_gpu_count(&model, needed, false, None, Some(gpu_indices.len()))?;
-    }
     let service_id = generate_service_id(&selected_engine, &resolve.canonical_model_id);
 
     // Attached foreground streaming is the debugging path, selected by `--verbose`
@@ -1334,6 +1301,34 @@ mod tests {
     }
 
     #[test]
+    fn aim_catalogued_hf_ids_still_select_vllm_on_instinct_and_aim_elsewhere() {
+        // These ids had no recipe before the AIM catalog; cataloguing them must not
+        // move an Instinct host off vLLM, or refuse ids AIM has no Instinct profile for.
+        let instinct = rocm_core::HostGpuSummary {
+            therock_family: Some("gfx94X-dcgpu".to_owned()),
+            ..rocm_core::HostGpuSummary::default()
+        };
+        let radeon = rocm_core::HostGpuSummary {
+            therock_family: Some("gfx1151".to_owned()),
+            ..rocm_core::HostGpuSummary::default()
+        };
+        for id in [
+            "meta-llama/Llama-3.1-8B-Instruct",
+            "openai/gpt-oss-20b",
+            "Qwen/Qwen3-32B",
+        ] {
+            let recipe = resolve_builtin_model_recipe(id).expect("aim-catalogued recipe");
+            assert!(model_recipe_supports_engine(&recipe, "aim"));
+            let on_instinct = select_serve_engine(None, None, Some(&recipe), Some(&instinct));
+            let on_radeon = select_serve_engine(None, None, Some(&recipe), Some(&radeon));
+            if !cfg!(windows) {
+                assert_eq!(on_instinct.engine, "vllm", "{id}");
+            }
+            assert_eq!(on_radeon.engine, "aim", "{id}");
+        }
+    }
+
+    #[test]
     fn serve_qwen_uses_vllm_with_hf_repo_on_vllm_preferred_gpu() {
         // The qwen alias serves the GGUF via Lemonade by default, but on a vLLM-preferred
         // GPU it must serve the non-GGUF Hugging Face repo through vLLM.
@@ -1560,19 +1555,10 @@ mod tests {
             Some(4)
         );
 
-        let err = |pinned, usable, selected| {
-            ensure_aim_gpu_count(id, 8, pinned, usable, selected)
-                .unwrap_err()
-                .to_string()
-        };
-        assert!(err(true, Some(8), None).contains("`--gpu <index>` pins one device"));
-        assert!(err(false, Some(2), None).contains("only 2 usable GPUs were found"));
-        assert!(err(false, Some(1), None).contains("only 1 usable GPU was found"));
-        assert!(err(false, Some(8), Some(1)).contains("does not support multi-GPU serving yet"));
-        // Unknown counts, or no selection made (container sees every GPU), pass.
-        assert!(ensure_aim_gpu_count(id, 8, false, None, None).is_ok());
-        assert!(ensure_aim_gpu_count(id, 8, false, Some(8), Some(0)).is_ok());
-        assert!(ensure_aim_gpu_count(id, 8, false, Some(8), Some(8)).is_ok());
+        let err = ensure_aim_multi_gpu_supported(id, 8)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("needs 8 GPUs") && err.contains("does not support multi-GPU"));
     }
 
     #[test]

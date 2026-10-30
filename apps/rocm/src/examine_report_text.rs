@@ -691,17 +691,22 @@ pub(crate) fn render_model_registry_verbose_text_with_context_and_host(
         for warning in &recipe.warnings {
             let _ = writeln!(output, "      warning: {warning}");
         }
-        for engine_recipe in &recipe.engine_recipes {
-            if let Some(warning) = rocm_core::model_recipe_staleness_warning(
-                engine_recipe,
-                rocm_core::unix_time_millis(),
-            ) {
-                let _ = writeln!(output, "      warning: {warning}");
-            }
-        }
+        append_model_recipe_staleness_lines(&mut output, recipe, rocm_core::unix_time_millis());
     }
     append_model_recipe_registry_source(&mut output, &registry);
     output
+}
+
+fn append_model_recipe_staleness_lines(
+    output: &mut String,
+    recipe: &ModelRecipeRecord,
+    now_ms: u128,
+) {
+    for engine_recipe in &recipe.engine_recipes {
+        if let Some(warning) = rocm_core::model_recipe_staleness_warning(engine_recipe, now_ms) {
+            let _ = writeln!(output, "      warning: {warning}");
+        }
+    }
 }
 
 /// The `rocm model` header. For the default built-in list it just names the
@@ -2109,6 +2114,24 @@ mod tests {
         ));
         assert!(rendered.contains("llama-3.2-3b-instruct (8 GiB min GPU)"));
         assert!(rendered.contains("tiny-gpt2 (2 GiB min GPU)"));
+    }
+
+    #[test]
+    fn model_recipe_staleness_lines_warn_only_for_stale_engine_recipes() {
+        let recipe = rocm_core::resolve_builtin_model_recipe("Qwen/Qwen3-32B").expect("aim entry");
+        let verified = recipe.engine_recipes[0]
+            .generated_at_unix_ms
+            .expect("aim entries record when they were verified");
+        let stale_ms = rocm_core::MODEL_RECIPE_STALE_AFTER_MS;
+        let mut fresh = String::new();
+        append_model_recipe_staleness_lines(&mut fresh, &recipe, verified + stale_ms);
+        assert!(fresh.is_empty(), "{fresh}");
+        let mut stale = String::new();
+        append_model_recipe_staleness_lines(&mut stale, &recipe, verified + stale_ms + 1);
+        assert!(
+            stale.contains("warning: aim entry was last verified 180 days ago"),
+            "{stale}"
+        );
     }
 
     #[test]
