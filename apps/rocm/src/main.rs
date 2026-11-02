@@ -880,12 +880,13 @@ rocm engines install vllm --reinstall")]
         /// Reinstall even if the engine already exists.
         #[arg(long)]
         reinstall: bool,
-        /// Approve required system-package installs (such as OpenMPI for
-        /// vLLM), including a sudo password prompt. This command never asks
+        /// Approve the system-package installs vLLM needs (OpenMPI, libatomic,
+        /// libnuma), including a sudo password prompt. This command never asks
         /// for confirmation. Without --yes, a Linux host with root or
         /// passwordless sudo installs a missing package anyway, and one that
         /// would need a password prints the commands to run while the install
-        /// continues. With --yes, a failed package install is an error.
+        /// continues. With --yes, a failed OpenMPI install is an error; a
+        /// failed libatomic or libnuma install only warns.
         #[arg(long)]
         yes: bool,
     },
@@ -5733,7 +5734,11 @@ pub(crate) mod tests {
             (&["storage", "remove-downloads"], REFUSES),
             (&["fix"], REFUSES),
             (&["install", "driver"], NEVER_ASKS),
-            (&["engines", "install"], NEVER_ASKS),
+            (
+                &["engines", "install"],
+                // Only OpenMPI's failure is an error; libatomic/libnuma warn.
+                &["never asks for confirmation", "only warns"],
+            ),
             (&["runtimes", "activate"], NEVER_PROMPTS),
             (&["runtimes", "rollback"], NEVER_PROMPTS),
         ];

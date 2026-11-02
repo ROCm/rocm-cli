@@ -430,11 +430,12 @@ rocm engines install vllm --runtime-id <runtime_key_a> --yes
 rocm engines install vllm --runtime-id <runtime_key_b> --yes
 ```
 
-`--yes` approves required system-package installs such as OpenMPI, which can
-call `sudo`. `engines install` never asks for confirmation: without `--yes`, a
-Linux host with root or passwordless `sudo` installs a missing package anyway,
-and one that would need a password prints the commands to run while the install
-continues. With `--yes`, a failed package install is an error. If the
+`--yes` approves the system-package installs vLLM needs (OpenMPI, libatomic and
+libnuma), which can call `sudo`. `engines install` never asks for confirmation:
+without `--yes`, a Linux host with root or passwordless `sudo` installs a
+missing package anyway, and one that would need a password prints the commands
+to run while the install continues. With `--yes`, a failed OpenMPI install is an
+error; a failed libatomic or libnuma install only warns. If the
 `install sdk` report above already printed an `engine auto-install` block for
 vLLM, that runtime has it; `--reinstall` is the flag that forces a reinstall
 when the engine already exists.

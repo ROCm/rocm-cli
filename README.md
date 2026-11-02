@@ -777,12 +777,12 @@ and installs once more; see
 [Lemonade backend alignment](https://github.com/ROCm/rocm-cli/blob/main/docs/engine-plugins.md#lemonade-backend-alignment-on-engine-install) for the details and for
 `ROCM_CLI_DISABLE_LEMONADE_BACKEND_ALIGNMENT`, which turns both off.
 
-`--yes` approves required system-package installs, such as OpenMPI for vLLM,
-including a `sudo` password prompt. `engines install` never asks for
+`--yes` approves the system-package installs vLLM needs (OpenMPI, libatomic and
+libnuma), including a `sudo` password prompt. `engines install` never asks for
 confirmation. Without `--yes`, a Linux host with root or passwordless `sudo`
 installs a missing package anyway, and one that would need a password prints the
-commands to run while the install continues. With `--yes`, a failed package
-install is an error.
+commands to run while the install continues. With `--yes`, a failed OpenMPI
+install is an error; a failed libatomic or libnuma install only warns.
 
 ### Will a model run here?
 
