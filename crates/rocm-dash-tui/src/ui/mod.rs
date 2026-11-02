@@ -37,6 +37,7 @@ pub mod sparkline;
 pub mod spinner;
 pub mod tabs;
 pub mod theme;
+mod theme_picker;
 pub mod update_manager;
 pub mod widgets;
 
@@ -141,7 +142,13 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
             }
         }
         Modal::ThemePicker => {
-            modal::draw_theme_picker(f, body, state.theme_picker_sel, &state.theme_name, &theme);
+            theme_picker::draw_theme_picker(
+                f,
+                body,
+                state.theme_picker_sel,
+                &state.theme_name,
+                &theme,
+            );
         }
         Modal::Menu => modal::draw_menu(f, body, state.menu_sel, &theme),
         Modal::Palette => modal::draw_palette(f, body, state.palette_sel, &theme),
