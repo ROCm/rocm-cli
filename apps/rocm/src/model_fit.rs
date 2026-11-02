@@ -21,10 +21,10 @@
 //! `PlatformRuleOut` and `engine_ruled_out_by_platform`, does not have to
 //! depend on a command module. Its own dependencies are `serve_cmd.rs` and
 //! `gpu_policy.rs`; neither depends on this module. `assess_model_on_this_host`
-//! (called from `diagnose()` in `main.rs`), `PlatformRuleOut` and
-//! `engine_ruled_out_by_platform` are `pub(crate)` and re-imported in `main.rs`,
-//! so those callers keep reaching them as `crate::<name>`; every other item has
-//! no caller outside this module and stays private.
+//! (called from `diagnose()` in `diagnose_cmd.rs`), `PlatformRuleOut` and
+//! `engine_ruled_out_by_platform` are `pub(crate)`; `main.rs` re-imports the
+//! last two so `examine_report_text.rs` keeps reaching them as `crate::<name>`.
+//! Every other item has no caller outside this module and stays private.
 //!
 //! The cluster's regression tests live in this module's own `mod tests`.
 //! `engine_ruled_out_by_platform_gates_aim_on_docker_reachability` re-runs the
