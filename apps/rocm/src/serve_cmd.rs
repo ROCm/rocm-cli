@@ -249,7 +249,7 @@ fn aim_engine_record<'a>(
 /// Refuses to launch a gated AIM image before the container is pulled when no
 /// Hugging Face token will reach it: `--engine-env HF_TOKEN=<value>`, or the bare
 /// `--engine-env HF_TOKEN` with `HF_TOKEN` exported (the form that is never
-/// stored). Runs after `--engine-env` is applied to the hint.
+/// stored). `hint` carries the `--engine-env` entries.
 fn ensure_aim_hf_token(
     engine: &str,
     recipe: Option<&ModelRecipeRecord>,
@@ -873,6 +873,17 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
         .and_then(|recipe| protocol_engine_recipe_hint(recipe, &selected_engine));
     let device_policy = parse_device_policy(device.as_ref().map(|policy| policy.as_policy_str()))?;
     let cpu_only = matches!(device_policy, DevicePolicy::CpuOnly);
+    // The token needs nothing from the GPU, so it is checked first: a gated model
+    // is refused for its missing token on any host, not only on one whose GPU the
+    // image supports. Only `--engine-env` can supply it, so a hint built from
+    // that alone is enough; the real hint below still gets the same env applied
+    // after the catalog's profile pin, which is what lets the flag override it.
+    ensure_aim_hf_token(
+        &selected_engine,
+        shared_recipe.as_ref(),
+        engine_recipe_with_extra_env(&selected_engine, None, &engine_env)?.as_ref(),
+        |key| std::env::var(key).ok(),
+    )?;
     // The AIM GPU checks are about the GPU the container would use, so they do
     // not apply to `--device cpu_only`.
     let aim_host_family = aim_engine_record(&selected_engine, shared_recipe.as_ref())
@@ -936,12 +947,6 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
         generation_defaults,
     )?;
     let engine_recipe = engine_recipe_with_extra_env(&selected_engine, engine_recipe, &engine_env)?;
-    ensure_aim_hf_token(
-        &selected_engine,
-        shared_recipe.as_ref(),
-        engine_recipe.as_ref(),
-        |key| std::env::var(key).ok(),
-    )?;
     let aim_gpu_name = aim_engine_record(&selected_engine, shared_recipe.as_ref())
         .filter(|record| !record.profile_ids.is_empty())
         .and_then(|_| {
