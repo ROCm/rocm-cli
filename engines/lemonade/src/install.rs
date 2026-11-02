@@ -240,6 +240,23 @@ pub(crate) fn write_manifest(paths: &AppPaths, manifest: &LemonadeInstallManifes
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct LemonadeRuntime {
+    pub(crate) manifest: LemonadeInstallManifest,
+}
+
+pub(crate) fn resolve_runtime() -> Result<LemonadeRuntime> {
+    let paths = AppPaths::discover()?;
+    let manifest = read_manifest(&paths)?;
+    if !manifest.lemond.is_file() {
+        bail!(
+            "Lemonade runtime is missing {}; run `rocm engines install lemonade`",
+            manifest.lemond.display()
+        );
+    }
+    Ok(LemonadeRuntime { manifest })
+}
+
 /// Put `resources/backend_versions.json` back to what the cached embeddable
 /// archive ships. Returns `None` when the file already held the packaged
 /// values, and otherwise a [`PinFileBackup`] that puts the previous bytes back.

@@ -310,7 +310,7 @@ fn capabilities() -> EngineCapabilities {
 }
 
 fn detect_response() -> DetectResponse {
-    let runtime = crate::backend_alignment::resolve_runtime().ok();
+    let runtime = crate::install::resolve_runtime().ok();
     let mut notes = Vec::new();
     if let Some(runtime) = runtime.as_ref() {
         notes.push(format!(
@@ -441,7 +441,7 @@ fn launch_service(mut request: LaunchRequest) -> Result<LaunchResponse> {
         request.device_policy.clone(),
     )?);
     request.engine_recipe = crate::state::accepted_engine_recipe(request.engine_recipe)?;
-    let runtime = crate::backend_alignment::resolve_runtime()?;
+    let runtime = crate::install::resolve_runtime()?;
     let paths = AppPaths::discover()?;
     paths.ensure()?;
     std::fs::create_dir_all(paths.engine_logs_dir(ENGINE_NAME))?;
@@ -506,7 +506,7 @@ fn serve_http(mut request: ServeHttpRequest) -> Result<()> {
     // assumed device 0), and an explicit `--gpu` index is rejected when it is not
     // actually present. This runs before any server process is spawned.
     request.gpu_indices = crate::state::resolve_serve_gpu_indices(&request.gpu_indices)?;
-    let mut runtime = crate::backend_alignment::resolve_runtime()?;
+    let mut runtime = crate::install::resolve_runtime()?;
     let mut process_env = crate::process::lemonade_process_environment()?;
     process_env.gpu_indices = request.gpu_indices.clone();
     let log_path = request.log_path.as_deref();

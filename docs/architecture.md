@@ -227,7 +227,7 @@ These modules are private `mod` declarations — [`lib.rs`](../crates/e2e-report
 
 - [`backend_alignment.rs`](../engines/lemonade/src/backend_alignment.rs) — ROCm-SDK-to-llama.cpp-backend Tier 1/Tier 2/revert alignment and backend discovery/install/selection.
 - [`direct_llama.rs`](../engines/lemonade/src/direct_llama.rs) — Hugging Face checkpoint/GGUF resolution and the direct-llama-server serve path.
-- [`install.rs`](../engines/lemonade/src/install.rs) — embeddable-runtime archive download/verify/extract, cache locking, and manifest persistence.
+- [`install.rs`](../engines/lemonade/src/install.rs) — embeddable-runtime archive download/verify/extract, cache locking, and manifest persistence, plus the `LemonadeRuntime` handle and `resolve_runtime`, which wrap the persisted manifest (a leaf here, so `state.rs`, `process.rs` and `direct_llama.rs` reach it without importing `backend_alignment.rs`).
 - [`process.rs`](../engines/lemonade/src/process.rs) — `lemond`/llama-server spawn, env/path setup, and readiness/health polling.
 - [`runtime_dir.rs`](../engines/lemonade/src/runtime_dir.rs) — `XDG_RUNTIME_DIR` tier1/2/3 hardening for the spawned child.
 - [`state.rs`](../engines/lemonade/src/state.rs) — service state file I/O, device-policy/GPU-selection parsing, and port/endpoint helpers.

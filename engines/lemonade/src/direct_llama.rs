@@ -8,8 +8,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::backend_alignment::{LemonadeRuntime, ROCM_LLAMACPP_BACKEND_DIRS};
-use crate::install::{LemonadeInstallManifest, platform_binary_name};
+use crate::backend_alignment::ROCM_LLAMACPP_BACKEND_DIRS;
+use crate::install::{LemonadeInstallManifest, LemonadeRuntime, platform_binary_name};
 use crate::process::{
     LemonadeProcessEnvironment, run_lemonade_model_load, run_lemonade_pull,
     serve_direct_llama_server, spawn_lemond, wait_for_lemonade_cli_status,

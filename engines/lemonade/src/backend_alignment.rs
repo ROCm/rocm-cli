@@ -15,7 +15,7 @@ use std::process::{Command as ProcessCommand, Stdio};
 use std::time::Duration;
 
 use crate::direct_llama::find_llama_server_binary_for_backend;
-use crate::install::{LemonadeInstallManifest, PinFileBackup, read_manifest};
+use crate::install::{LemonadeInstallManifest, PinFileBackup};
 #[cfg(target_os = "windows")]
 use crate::process::lemonade_process_environment_vars;
 use crate::process::{
@@ -41,11 +41,6 @@ const BACKEND_VERSIONS_RESOURCE: &str = "resources/backend_versions.json";
 /// `DIRECT_LLAMA_SERVER_BACKENDS`). When only CPU is usable, selection returns
 /// `None` and the caller fails with actionable guidance.
 const LLAMACPP_BACKEND_PRIORITY: [&str; 2] = ["rocm", "vulkan"];
-
-#[derive(Debug, Clone)]
-pub(crate) struct LemonadeRuntime {
-    pub(crate) manifest: LemonadeInstallManifest,
-}
 
 /// The variable that opts a machine out of rocm-cli aligning Lemonade's
 /// `llamacpp:rocm` backend to the active ROCm SDK.
@@ -1082,18 +1077,6 @@ fn run_lemonade_backends_list(
         );
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-}
-
-pub(crate) fn resolve_runtime() -> Result<LemonadeRuntime> {
-    let paths = AppPaths::discover()?;
-    let manifest = read_manifest(&paths)?;
-    if !manifest.lemond.is_file() {
-        bail!(
-            "Lemonade runtime is missing {}; run `rocm engines install lemonade`",
-            manifest.lemond.display()
-        );
-    }
-    Ok(LemonadeRuntime { manifest })
 }
 
 /// The ROCm-family llama.cpp backend directory names under `bin/llamacpp/`. Lemonade's

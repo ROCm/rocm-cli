@@ -16,9 +16,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::time::Duration;
 
-use crate::backend_alignment::LemonadeRuntime;
 use crate::direct_llama::{direct_llama_model_path, llama_server_backend_label};
-use crate::install::LemonadeInstallManifest;
+use crate::install::{LemonadeInstallManifest, LemonadeRuntime};
 use crate::runtime_dir::{ParentRuntimeEnvironment, child_runtime_dir_var};
 use crate::state::{
     MAX_TAIL_READ, mark_json_status, merge_json_state, parse_http_endpoint,

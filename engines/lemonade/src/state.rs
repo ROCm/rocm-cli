@@ -17,8 +17,7 @@ use std::path::{Path, PathBuf};
 #[cfg(not(windows))]
 use std::process::{Command as ProcessCommand, Stdio};
 
-use crate::backend_alignment::LemonadeRuntime;
-use crate::install::LemonadeInstallManifest;
+use crate::install::{LemonadeInstallManifest, LemonadeRuntime};
 use crate::{DEFAULT_HOST, DEFAULT_MODEL, ENGINE_NAME, ServeHttpRequest, current_unix_millis};
 
 /// Maximum bytes to read from the end of a log file when extracting tail lines.
