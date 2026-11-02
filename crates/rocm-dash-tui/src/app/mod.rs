@@ -18,8 +18,9 @@
 //! `handle_key`, `apply_action`), `app/scrollbar.rs` (mouse hit-testing),
 //! `app/event_loop.rs` (the tick loop), `app/terminal.rs` (terminal restore,
 //! shutdown latch, signal watcher), `app/focus.rs` (focused-host policy),
-//! `app/update_check.rs` (the Updates-tile check) and `app/summary.rs`. `crate::app::*` paths for the public surface moved out
-//! are unchanged via the re-exports below.
+//! `app/update_check.rs` (the Updates-tile check) and `app/summary.rs`.
+//! `crate::app::*` paths for the public surface moved out are unchanged via
+//! the re-exports below.
 
 use std::collections::{HashMap, VecDeque};
 
