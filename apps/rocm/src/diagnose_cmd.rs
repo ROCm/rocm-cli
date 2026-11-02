@@ -29,16 +29,16 @@ use rocm_core::browser::Opener;
 use rocm_core::{AppPaths, RocmCliConfig};
 use serde::Serialize;
 
-use crate::FixExitCode;
 use crate::cli_report::{JsonOrText, print_json_or_text};
 use crate::model_fit::assess_model_on_this_host;
+use crate::{FixExitCode, ModelQuery, report_ignores_model_note};
 
 pub(crate) fn diagnose(
     symptom: Option<String>,
     top: usize,
     json: bool,
     distro: Option<String>,
-    model: Option<String>,
+    model: Option<ModelQuery>,
     report_requested: bool,
     send: bool,
 ) -> Result<()> {
@@ -95,8 +95,18 @@ pub(crate) fn diagnose(
         .as_ref()
         .is_some_and(|wsl| !wsl.locally_probed);
     let mut report = rocm_core::run_diagnose(&examination, &symptom.unwrap_or_default());
-    if let Some(model_ref) = &model {
-        report.model = Some(assess_model_on_this_host(model_ref, &examination));
+    // A prepared report carries no model verdict, and a GGUF estimate may read
+    // the model's header from the network -- which `--report` promises it never
+    // does -- so under `--report` the model is not assessed at all.
+    if report_requested && let Some(query) = &model {
+        eprintln!("{}", report_ignores_model_note(query));
+    }
+    if let Some(query) = model.as_ref().filter(|_| !report_requested) {
+        report.model = Some(assess_model_on_this_host(
+            &query.model_ref,
+            &examination,
+            &query.context,
+        ));
     }
     if report_requested {
         return show_prepared_report(&examination, &report, json, send);
@@ -570,6 +580,7 @@ mod tests {
             route: None,
             undetermined_reason: None,
             warnings: Vec::new(),
+            estimate: None,
         };
         let readiness_text = rocm_core::model_readiness::render_model_readiness_text(&readiness);
         report.model = Some(readiness);

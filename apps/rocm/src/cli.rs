@@ -111,21 +111,66 @@ pub(crate) enum Command {
         /// Also answer whether a model would run on this machine, before
         /// downloading it.
         ///
-        /// Takes a curated model name or alias (see `rocm model`). Nothing is
-        /// fetched: the answer comes from the recipe and this host's GPU. A
-        /// model the catalog does not carry is reported as undetermined rather
-        /// than blocked - `rocm serve` still accepts it, this just cannot say
-        /// in advance whether it fits.
+        /// Takes a curated model name or alias (see `rocm model`), or a GGUF
+        /// model: a local `.gguf` path, or `owner/repo:QUANT` on Hugging Face.
+        /// No weights are downloaded. A curated model is answered from its
+        /// recipe and this host's GPU. A GGUF outside the catalog is estimated
+        /// from its file header (for a remote file: one repository listing, a
+        /// `HEAD` request for a file the listing does not size, then a few MB by
+        /// range request; no token is sent, so a gated or private repository
+        /// cannot be read): weights plus KV cache at `--context-size` plus a
+        /// compute buffer and a runtime reserve, against the dedicated VRAM of
+        /// the GPU with the most of it, labelled ESTIMATED rather than READY or
+        /// BLOCKED. If `HIP_VISIBLE_DEVICES`, `ROCR_VISIBLE_DEVICES` or
+        /// `CUDA_VISIBLE_DEVICES` is set on a host whose GPUs differ in memory,
+        /// the report says that how the mask maps onto amd-smi's numbering is
+        /// unverified, so the figure may be for another card. Any other model
+        /// the catalog does not carry is reported as undetermined rather than
+        /// blocked - `rocm serve` still
+        /// accepts it, this just cannot say in advance whether it fits.
         ///
         /// A flag rather than a positional: `diagnose` takes no positional
         /// today, and one added now would be ambiguous against `--symptom`.
         #[arg(long, value_name = "MODEL")]
         model: Option<String>,
+        /// Context size, in tokens, to estimate a GGUF model for (1 to
+        /// 16777216; default 4096).
+        ///
+        /// The largest context that fits (never more than the context the model
+        /// was trained for) is reported as well, but only when this machine's
+        /// GPU memory could be read; without a reading, the memory the model
+        /// needs is shown and nothing is compared, so no largest context is
+        /// given. The comparison is against the total dedicated VRAM of the GPU
+        /// with the most of it that ROCm can see, as for a curated model, not
+        /// what other processes have left free. Applies to a GGUF outside the
+        /// catalog (a curated model's memory minimum is fixed, and says so);
+        /// `rocm serve` has no context-size option yet, so this answers the
+        /// question without changing what serve does.
+        #[arg(
+            long,
+            value_name = "TOKENS",
+            requires = "model",
+            value_parser = clap::value_parser!(u64).range(1..=rocm_core::gguf_fit::MAX_CONTEXT_SIZE)
+        )]
+        context_size: Option<u64>,
+        /// KV cache element type to estimate for (default f16).
+        ///
+        /// A quantized cache is smaller. In llama.cpp a quantized V cache needs
+        /// flash attention (q8_0 and q4_0 here quantize both K and V), and the
+        /// estimate assumes flash attention is on. Applies to a GGUF outside the
+        /// catalog.
+        #[arg(long, value_enum, value_name = "TYPE", requires = "model")]
+        kv_cache_type: Option<KvCacheTypeArg>,
         /// Show the report this machine would contribute, and send nothing.
         ///
         /// Nothing leaves the machine: this prints the exact content so it can
         /// be read before any of it is shared. Hardware that is not on AMD's
         /// published compatibility matrix produces no report at all.
+        ///
+        /// `--model` is not consulted with `--report`: a report carries no model
+        /// verdict, so nothing is looked up for it and nothing is fetched. A
+        /// note on stderr says that `--model` (and `--context-size` and
+        /// `--kv-cache-type`, if given) were ignored.
         ///
         /// Not combinable with `--distro`: a report describes this machine, and
         /// a WSL distribution reached remotely is not fully examined (see
@@ -1271,6 +1316,30 @@ pub(crate) enum FrameworkArg {
     Skip,
 }
 
+/// KV cache element type for `rocm diagnose --model`'s GGUF estimate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum KvCacheTypeArg {
+    /// 16-bit floats (llama.cpp's default).
+    #[value(name = "f16")]
+    F16,
+    /// 8-bit quantized: about half the size of f16.
+    #[value(name = "q8_0")]
+    Q8_0,
+    /// 4-bit quantized: about a quarter the size of f16.
+    #[value(name = "q4_0")]
+    Q4_0,
+}
+
+impl From<KvCacheTypeArg> for rocm_core::gguf_fit::KvCacheType {
+    fn from(arg: KvCacheTypeArg) -> Self {
+        match arg {
+            KvCacheTypeArg::F16 => Self::F16,
+            KvCacheTypeArg::Q8_0 => Self::Q8_0,
+            KvCacheTypeArg::Q4_0 => Self::Q4_0,
+        }
+    }
+}
+
 impl From<FrameworkArg> for rocm_core::FrameworkProbe {
     fn from(value: FrameworkArg) -> Self {
         match value {
@@ -1889,6 +1958,103 @@ mod tests {
                     ),
             }) => (restart_services, yes),
             other => panic!("expected runtimes activate or rollback, got {other:?}"),
+        }
+    }
+
+    fn parse_diagnose(args: &[&str]) -> Result<Cli, clap::Error> {
+        let mut argv = vec!["rocm", "diagnose"];
+        argv.extend_from_slice(args);
+        Cli::try_parse_from(argv)
+    }
+
+    // The context options describe the model being asked about, so without
+    // `--model` they would be accepted and silently do nothing.
+    #[test]
+    fn diagnose_context_options_are_refused_without_a_model() {
+        for args in [
+            &["--context-size", "8192"][..],
+            &["--kv-cache-type", "q8_0"][..],
+        ] {
+            let error = parse_diagnose(args).expect_err("an option with nothing to apply to");
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::MissingRequiredArgument,
+                "{args:?}"
+            );
+            assert!(error.to_string().contains("--model"), "{args:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn diagnose_context_options_reach_the_request_and_bad_values_are_refused() {
+        let cli = parse_diagnose(&[
+            "--model",
+            "o/r:Q4_K_M",
+            "--context-size",
+            "32768",
+            "--kv-cache-type",
+            "q4_0",
+        ])
+        .expect("a model with both options parses");
+        match cli.command {
+            Some(Command::Diagnose {
+                context_size,
+                kv_cache_type,
+                ..
+            }) => {
+                assert_eq!(context_size, Some(32768));
+                assert_eq!(
+                    kv_cache_type.map(rocm_core::gguf_fit::KvCacheType::from),
+                    Some(rocm_core::gguf_fit::KvCacheType::Q4_0)
+                );
+            }
+            other => panic!("expected diagnose, got {other:?}"),
+        }
+        for bad in [
+            &["--context-size", "0"][..],
+            &["--context-size", "-1"][..],
+            &["--context-size", "lots"][..],
+            &["--context-size", "18446744073709551615"][..],
+            &["--context-size", "16777217"][..],
+            &["--kv-cache-type", "q5_0"][..],
+        ] {
+            let mut args = vec!["--model", "o/r:Q4_K_M"];
+            args.extend_from_slice(bad);
+            assert!(parse_diagnose(&args).is_err(), "{bad:?} must not parse");
+        }
+    }
+
+    // The largest context size the flag takes is the one the estimate is made for,
+    // not a number of its own: a figure past it would print an absurd memory
+    // need, so clap refuses it before anything is estimated.
+    #[test]
+    fn the_largest_context_size_accepted_is_the_largest_the_estimate_makes() {
+        let largest = rocm_core::gguf_fit::MAX_CONTEXT_SIZE.to_string();
+        let cli = parse_diagnose(&["--model", "o/r:Q4_K_M", "--context-size", &largest])
+            .expect("the cap itself parses");
+        match cli.command {
+            Some(Command::Diagnose { context_size, .. }) => {
+                assert_eq!(context_size, Some(rocm_core::gguf_fit::MAX_CONTEXT_SIZE));
+            }
+            other => panic!("expected diagnose, got {other:?}"),
+        }
+        let over = (rocm_core::gguf_fit::MAX_CONTEXT_SIZE + 1).to_string();
+        assert!(parse_diagnose(&["--model", "o/r:Q4_K_M", "--context-size", &over]).is_err());
+    }
+
+    // Every spelling the flag takes maps to the type the estimate uses, so a
+    // mismatch between the two enums cannot silently estimate another cache.
+    #[test]
+    fn every_kv_cache_flag_value_names_the_matching_estimate_type() {
+        use clap::ValueEnum;
+        for arg in KvCacheTypeArg::value_variants() {
+            let name = arg
+                .to_possible_value()
+                .expect("named")
+                .get_name()
+                .to_owned();
+            let kind = rocm_core::gguf_fit::KvCacheType::from(*arg);
+            assert_eq!(kind.name(), name);
         }
     }
 

@@ -8,10 +8,14 @@
 //! after a failure. This answers the question that comes before both, from data
 //! the CLI already has: a curated [`ModelRecipeRecord`] (dtype, quantization,
 //! minimum GPU memory, device policy, preferred engines, declared alternatives)
-//! composed with what the host can offer. **It fetches nothing** — no weights,
-//! no metadata probe, no network call of any kind — which is the whole point:
-//! today a user learns a model will not run by starting a download and waiting
-//! for it to fail.
+//! composed with what the host can offer. **It never fetches weights** — which
+//! is the whole point: a user should not learn a model will not run by starting
+//! a download and waiting for it to fail. The curated path reads nothing beyond
+//! what the caller hands over. A GGUF reference *outside* the catalog is the one
+//! exception, and a small one: [`attach_context_estimate`] reads the file's
+//! header (for a remote file: one repository listing, then a few megabytes by
+//! range request) and sizes the
+//! model from it. See [`crate::gguf_fit`].
 //!
 //! Three distinctions carry the design, and collapsing any of them produces a
 //! confident wrong answer:
@@ -27,14 +31,22 @@
 //!   today. Conflating the two hands an APU user a remediation that can never
 //!   work. See [`AcceleratorMemory::UnifiedMemoryUnreadable`].
 //!
-//! Curated recipes only. Answering for an arbitrary hub model needs a metadata
-//! probe and a table mapping quantization schemes to available kernels, neither
-//! of which has a source of truth here; such a model is reported
-//! [`UndeterminedReason::ModelNotCurated`], never blocked.
+//! A model outside the catalog has no recipe, so it is reported
+//! [`UndeterminedReason::ModelNotCurated`], never blocked. When it is a GGUF the
+//! header allows an *estimate* (weights, KV cache at a context size, compute
+//! buffer) against dedicated VRAM, carried in [`ModelReadiness::estimate`] under
+//! its own label rather than as a verdict: an estimate from a header is not a
+//! recipe's tested minimum.
 
 use crate::ModelRecipeRecord;
 use crate::ModelRecipeRegistry;
 use crate::diagnose::{Fix, Route, upstream_route};
+use crate::gguf::parse_gguf_header;
+use crate::gguf_fit::{
+    CannotEstimateReason, ContextEstimate, ESTIMATE_CAVEAT, EstimateOutcome, FitRequest,
+    KvCacheType, SERVE_OPTIONS_NOTE, estimate_fit, evidence_lines, tokens,
+};
+use crate::gguf_source::{GgufRef, GgufSource, parse_gguf_ref};
 use serde::{Deserialize, Serialize};
 
 /// How many fallback alternatives to offer when a recipe declares none that fit.
@@ -113,7 +125,7 @@ pub enum AcceleratorMemory {
 
 impl AcceleratorMemory {
     /// The figure to compare a recipe minimum against, when there is one.
-    const fn measured_gib(self) -> Option<f64> {
+    pub(crate) const fn measured_gib(self) -> Option<f64> {
         match self {
             Self::Dedicated(gib) => Some(gib),
             Self::None | Self::Unknown | Self::UnifiedMemoryUnreadable => None,
@@ -196,6 +208,14 @@ pub struct ModelReadiness {
     /// Informational — every curated recipe carries at least one — so they do
     /// not move the verdict. Degradation is decided from measurements.
     pub warnings: Vec<String>,
+    /// A memory estimate from a GGUF file's header, for a model outside the
+    /// catalog. Absent for curated models and for references that are not GGUF.
+    ///
+    /// Deliberately not a [`ModelVerdict`]: `verdict` stays `undetermined`, and
+    /// this carries its own outcome, so no reader mistakes an estimate for a
+    /// recipe's tested minimum.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimate: Option<ContextEstimate>,
 }
 
 impl ModelReadiness {
@@ -222,6 +242,7 @@ impl ModelReadiness {
             route: None,
             undetermined_reason: Some(reason),
             warnings: Vec::new(),
+            estimate: None,
         }
     }
 }
@@ -303,7 +324,7 @@ fn requires_gpu(recipe: &ModelRecipeRecord) -> bool {
 /// values come from `u32` catalog fields, so they are always exact integers
 /// and never reach this branch; flooring only ever shades a measured figure
 /// down, never a minimum.
-fn format_gib(value: f64) -> String {
+pub(crate) fn format_gib(value: f64) -> String {
     if value.fract().abs() < f64::EPSILON {
         format!("{value:.0} GiB")
     } else {
@@ -392,8 +413,9 @@ fn assess(
             UndeterminedReason::ModelNotCurated,
             vec![
                 format!("`{model_ref}` is not in the curated recipe catalog"),
-                "`rocm diagnose --model` answers for curated recipes only: judging an arbitrary \
-                 model needs metadata this CLI does not fetch"
+                "there is no recipe for it, so no tested GPU memory minimum to compare; a GGUF \
+                 reference (a local .gguf path, or `owner/repo:QUANT` on Hugging Face) is \
+                 estimated from its file header instead"
                     .to_owned(),
             ],
         );
@@ -408,8 +430,8 @@ fn assess(
             commands: vec!["rocm model".to_owned()],
             verify: format!("rocm serve {model_ref}"),
             notes: vec![
-                "`rocm serve` accepts models outside this catalog; it just cannot say in advance \
-                 whether they will fit"
+                "`rocm serve` accepts models outside this catalog; for one that is not a GGUF \
+                 reference this cannot say in advance whether it will fit"
                     .to_owned(),
             ],
             ..Fix::default()
@@ -448,6 +470,7 @@ fn assess(
         route: None,
         undetermined_reason: None,
         warnings: recipe.warnings.clone(),
+        estimate: None,
     };
 
     // Ordered by what pre-empts what. The engine gate comes first because a
@@ -675,6 +698,192 @@ fn alternatives_for(
         .collect()
 }
 
+/// The context size an estimate is made for when none was asked for.
+pub const DEFAULT_CONTEXT_SIZE: u64 = 4096;
+
+/// What the user asked of a context-size estimate.
+///
+/// Each field is `None` when the flag was not passed, which is not the same as
+/// passing the default: it decides whether a curated model, which has no
+/// context estimate, should say so.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ContextRequest {
+    pub context_size: Option<u64>,
+    pub kv_cache_type: Option<KvCacheType>,
+}
+
+/// Size a GGUF model outside the catalog from its file header.
+///
+/// Acts only on an answer of [`UndeterminedReason::ModelNotCurated`] whose
+/// reference names a GGUF; every other answer is left exactly as it was. The
+/// verdict stays `Undetermined`: what is added is [`ModelReadiness::estimate`]
+/// and the evidence that goes with it. `source` is the only thing that reads a
+/// file or the network, and it reads the header, never the weights.
+pub fn attach_context_estimate(
+    readiness: &mut ModelReadiness,
+    request: &ContextRequest,
+    host: &HostFacts,
+    source: &dyn GgufSource,
+) {
+    let asked = request.context_size.is_some() || request.kv_cache_type.is_some();
+    if readiness.canonical_model_id.is_some() {
+        if asked {
+            readiness.evidence.push(
+                "a context size and KV cache type do not apply to a curated recipe, whose GPU memory \
+                 minimum is fixed; estimates for them cover GGUF models outside the catalog"
+                    .to_owned(),
+            );
+        }
+        return;
+    }
+    if readiness.undetermined_reason == Some(UndeterminedReason::CatalogUnreachable) {
+        // Whether the reference names a curated model is exactly what could not be
+        // found out, so there is no telling which answer it is owed: say that the
+        // flags were not applied rather than dropping them without a word.
+        if asked {
+            readiness.evidence.push(
+                "the context size and KV cache type were not applied: the recipe catalog could \
+                 not be read, so it is not known whether this is a curated model or a GGUF \
+                 outside the catalog"
+                    .to_owned(),
+            );
+        }
+        return;
+    }
+    if readiness.undetermined_reason != Some(UndeterminedReason::ModelNotCurated) {
+        return;
+    }
+    let Some(reference) = parse_gguf_ref(&readiness.model_ref) else {
+        if asked {
+            readiness.evidence.push(
+                "a context size and KV cache type are estimated for GGUF models only: a local \
+                 .gguf path, or `owner/repo:QUANT` on Hugging Face"
+                    .to_owned(),
+            );
+        }
+        return;
+    };
+    // `owner/repo` with no quantization names a repository, not a file, and a
+    // repository is not read (every file in it is a different model). Without a
+    // context flag the answer is the plain "not in the catalog" it always was,
+    // reached without touching the network; with one, the user is told what
+    // would make it answerable.
+    if matches!(reference, GgufRef::Hub { variant: None, .. }) {
+        if asked {
+            readiness.evidence.push(format!(
+                "`{}` names a repository, not a model file: add `:QUANT` (for example \
+                 `:Q4_K_M`) to estimate one of its GGUF files",
+                readiness.model_ref
+            ));
+        }
+        return;
+    }
+    let fit_request = FitRequest {
+        context_size: request.context_size.unwrap_or(DEFAULT_CONTEXT_SIZE),
+        context_size_defaulted: request.context_size.is_none(),
+        kv_cache_type: request.kv_cache_type.unwrap_or(KvCacheType::F16),
+    };
+    let estimate = match source.open(&reference).and_then(|mut opened| {
+        let header =
+            parse_gguf_header(&mut opened.reader).map_err(|error| anyhow::anyhow!("{error}"))?;
+        Ok((header, opened.size, opened.description))
+    }) {
+        Ok((header, size, description)) => estimate_fit(
+            &header,
+            size,
+            &description,
+            &fit_request,
+            host.accelerator_memory,
+            host.system_ram_gib,
+        ),
+        Err(error) => ContextEstimate::unreadable(&readiness.model_ref, &fit_request, &error),
+    };
+    readiness.evidence.extend(evidence_lines(&estimate));
+    // The route sends a user to the upstream tracker because the catalog lacks
+    // the model. A GGUF was looked at directly, so that is no longer the
+    // question -- and for a path that does not exist or a hub that did not
+    // answer, the tracker is the wrong place to take it.
+    readiness.route = None;
+    if estimate.total_gib.is_some() {
+        // The header was read and sized, so the "serve it directly and read the
+        // engine's refusal" plan and the report-it route answered a question
+        // that no longer applies -- whether or not this host could be compared
+        // against. They stay when the header could not be read: then nothing
+        // was learnt and they are still the honest next step.
+        readiness.fix = None;
+        if estimate.outcome == EstimateOutcome::Fits {
+            readiness.alternatives.clear();
+        }
+    }
+    if estimate.total_gib.is_some() {
+        readiness.warnings.push(ESTIMATE_CAVEAT.to_owned());
+    } else if estimate.cannot_estimate_reason == Some(CannotEstimateReason::HeaderUnreadable)
+        && matches!(reference, GgufRef::Local(_))
+    {
+        // A path that could not be read is a path to check. "Serve it directly and
+        // read the engine's refusal" is advice for a model nobody has looked at,
+        // and `rocm serve <path>` on a file that is not there only repeats this.
+        readiness.fix = Some(Fix {
+            summary: "check the path, and that the file is a GGUF model, then ask again".to_owned(),
+            verify: format!("rocm diagnose --model {}", readiness.model_ref),
+            ..Fix::default()
+        });
+    } else if let Some(fix) = &mut readiness.fix {
+        // The plan was written for a model that is not a GGUF reference, and its
+        // note says so. This one is, and the estimate above says why it could not
+        // be sized, so the note says that instead of contradicting it.
+        fix.notes = vec![
+            "`rocm serve` accepts models outside this catalog; the estimate above could not size \
+             this GGUF, so this cannot say in advance whether it will fit"
+                .to_owned(),
+        ];
+        // `rocm serve` takes `owner/repo:QUANT`, whose label has no `/`; the
+        // `owner/repo:dir/file.gguf` form selects an exact file for this estimate
+        // only, and serve would not read it as a checkpoint. Naming it in a
+        // `rocm serve` command would hand the user a line that fails.
+        if matches!(&reference, GgufRef::Hub { variant: Some(variant), .. } if variant.contains('/'))
+        {
+            fix.verify = format!("rocm diagnose --model {}", readiness.model_ref);
+            fix.notes.push(
+                "`rocm serve` does not accept an exact file name after the colon; it takes \
+                 `owner/repo:QUANT`"
+                    .to_owned(),
+            );
+        }
+    }
+    if estimate.outcome == EstimateOutcome::DoesNotFit && !estimate.suggestions.is_empty() {
+        readiness.warnings.push(SERVE_OPTIONS_NOTE.to_owned());
+    }
+    readiness.estimate = Some(estimate);
+}
+
+/// What an estimate says when a device-visibility variable is set on a host
+/// whose GPUs differ in memory.
+pub const MASK_UNVERIFIED_NOTE: &str = "a device-visibility variable (HIP_VISIBLE_DEVICES, \
+     ROCR_VISIBLE_DEVICES or CUDA_VISIBLE_DEVICES) is set and this host's GPUs do not all \
+     have the same memory; how the mask's numbering maps onto amd-smi's has not been verified \
+     on such a host, so the memory compared with may be that of a different card (or the host \
+     may be mistaken for an integrated GPU)";
+
+/// Add [`MASK_UNVERIFIED_NOTE`] to a compared estimate when `mask_set` and the
+/// GPUs' totals (`gpu_totals_mb`, one per amd-smi row) are not all equal.
+///
+/// Which row a mask selects is not something this binary has verified on a
+/// multi-GPU machine, so the visible rows are not guessed at: if any two cards
+/// differ, whichever one the mask picked might not be the one compared. An
+/// estimate that compared nothing has no figure to doubt and is left alone.
+pub fn note_unverified_mask(readiness: &mut ModelReadiness, mask_set: bool, gpu_totals_mb: &[u64]) {
+    let differ = gpu_totals_mb.windows(2).any(|pair| pair[0] != pair[1]);
+    if !(mask_set && differ) {
+        return;
+    }
+    if let Some(estimate) = readiness.estimate.as_mut()
+        && estimate.available_gib.is_some()
+    {
+        estimate.notes.push(MASK_UNVERIFIED_NOTE.to_owned());
+    }
+}
+
 /// The word this verdict is reported under.
 const fn verdict_label(verdict: ModelVerdict) -> &'static str {
     match verdict {
@@ -682,6 +891,23 @@ const fn verdict_label(verdict: ModelVerdict) -> &'static str {
         ModelVerdict::Degraded => "DEGRADED",
         ModelVerdict::Blocked => "BLOCKED",
         ModelVerdict::Undetermined => "UNDETERMINED",
+    }
+}
+
+/// The word the report opens with. An estimate that compared its figures with
+/// the GPU is labelled as one, never as a verdict; every other answer -- an
+/// estimate that could not compare included -- keeps the verdict's own word.
+fn header_label(readiness: &ModelReadiness) -> String {
+    match &readiness.estimate {
+        Some(estimate) if estimate.outcome == EstimateOutcome::Fits => format!(
+            "ESTIMATED: fits at {} (not a tested minimum)",
+            tokens(estimate.context_size)
+        ),
+        Some(estimate) if estimate.outcome == EstimateOutcome::DoesNotFit => format!(
+            "ESTIMATED: does not fit at {} (not a tested minimum)",
+            tokens(estimate.context_size)
+        ),
+        _ => verdict_label(readiness.verdict).to_owned(),
     }
 }
 
@@ -700,13 +926,21 @@ pub fn render_model_readiness_text(readiness: &ModelReadiness) -> String {
         out,
         "rocm diagnose --model {}: {}",
         readiness.model_ref,
-        verdict_label(readiness.verdict)
+        header_label(readiness)
     );
     if let Some(canonical) = &readiness.canonical_model_id {
         let _ = writeln!(out, "   recipe: {canonical}");
     }
     for line in &readiness.evidence {
         let _ = writeln!(out, "   - {line}");
+    }
+    if let Some(estimate) = &readiness.estimate
+        && !estimate.suggestions.is_empty()
+    {
+        let _ = writeln!(out, "   what would make it fit:");
+        for suggestion in &estimate.suggestions {
+            let _ = writeln!(out, "     - {}", suggestion.text);
+        }
     }
     if !readiness.alternatives.is_empty() {
         let _ = writeln!(out, "   what would run here instead:");
@@ -738,9 +972,20 @@ pub fn render_model_readiness_text(readiness: &ModelReadiness) -> String {
         let _ = writeln!(out, "   report it: {:>12}: {}", route.target, route.url);
     }
     // The recipe's own warnings come last and carry no verdict weight. Putting
-    // them above the plan would read as reasons for it.
+    // them above the plan would read as reasons for it. The estimate's notes
+    // are about the figures, not a recipe, and are labelled as such.
+    if let Some(estimate) = &readiness.estimate {
+        for note in &estimate.notes {
+            let _ = writeln!(out, "   note: {note}");
+        }
+    }
     for warning in &readiness.warnings {
-        let _ = writeln!(out, "   recipe note: {warning}");
+        let label = if readiness.estimate.is_some() {
+            "note"
+        } else {
+            "recipe note"
+        };
+        let _ = writeln!(out, "   {label}: {warning}");
     }
     out
 }
@@ -1214,5 +1459,658 @@ mod tests {
     #[test]
     fn format_gib_renders_a_whole_number_with_no_decimal() {
         assert_eq!(format_gib(8.0), "8 GiB");
+    }
+
+    // ----- GGUF estimate (models outside the catalog) -----------------------
+
+    use crate::gguf::test_builder::llama_like;
+    use crate::gguf_fit::SuggestionKind;
+    use crate::gguf_source::{GgufRef, OpenedGguf};
+    use std::io::Cursor;
+    use std::sync::Mutex;
+
+    /// Serves one in-memory GGUF for every reference and records what it was
+    /// asked to open, so a test can show the source was (or was not) reached.
+    struct FakeSource {
+        file: Option<Vec<u8>>,
+        /// The size the source reports for the file: the header plus the
+        /// weights it pretends to carry, so no test allocates a real model.
+        size: u64,
+        opened: Mutex<Vec<GgufRef>>,
+    }
+
+    impl FakeSource {
+        fn with(file: Vec<u8>) -> Self {
+            Self {
+                size: file.len() as u64,
+                file: Some(file),
+                opened: Mutex::new(Vec::new()),
+            }
+        }
+
+        /// A llama-shaped file whose weights are `weights_mib` MiB: 8192
+        /// tokens of f16 cache is exactly 1 GiB for it.
+        fn weights(weights_mib: u64) -> Self {
+            let header = llama_like(10).file(0);
+            Self {
+                size: header.len() as u64 + weights_mib * 1024 * 1024,
+                file: Some(header),
+                opened: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn failing() -> Self {
+            Self {
+                file: None,
+                size: 0,
+                opened: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.opened.lock().unwrap().len()
+        }
+    }
+
+    impl GgufSource for FakeSource {
+        fn open(&self, reference: &GgufRef) -> anyhow::Result<OpenedGguf> {
+            self.opened.lock().unwrap().push(reference.clone());
+            let Some(file) = &self.file else {
+                anyhow::bail!("the hub could not be reached");
+            };
+            Ok(OpenedGguf {
+                size: self.size,
+                reader: Box::new(Cursor::new(file.clone())),
+                description: "fake.gguf".to_owned(),
+            })
+        }
+    }
+
+    fn not_curated(model_ref: &str) -> ModelReadiness {
+        let registry = builtin_model_recipe_registry();
+        assess_model_readiness(
+            model_ref,
+            &ModelCatalogSource::Available(&registry),
+            &host_with(24.0, 64.0),
+            &engine_choice,
+        )
+    }
+
+    fn asked(context: u64) -> ContextRequest {
+        ContextRequest {
+            context_size: Some(context),
+            kv_cache_type: None,
+        }
+    }
+
+    #[test]
+    fn a_gguf_outside_the_catalog_gets_an_estimate_and_stays_undetermined() {
+        let mut readiness = not_curated("some-lab/never-curated-7b:Q4_K_M");
+        // The catalog-miss answer offers curated models that would run here; an
+        // estimate that says the model fits has no use for them.
+        assert!(
+            !readiness.alternatives.is_empty(),
+            "the catalog-miss answer carries curated alternatives to clear"
+        );
+        let source = FakeSource::weights(2048);
+        attach_context_estimate(
+            &mut readiness,
+            &asked(8192),
+            &host_with(24.0, 64.0),
+            &source,
+        );
+        let estimate = readiness.estimate.as_ref().expect("no estimate attached");
+        assert_eq!(estimate.outcome, EstimateOutcome::Fits);
+        assert!(
+            readiness.alternatives.is_empty(),
+            "ESTIMATED: fits offered alternatives: {:?}",
+            readiness.alternatives
+        );
+        assert!(!render_model_readiness_text(&readiness).contains("what would run here instead"),);
+        assert_eq!(estimate.context_size, 8192);
+        // The closed-set verdict is not widened: an estimate is not a recipe.
+        assert_eq!(readiness.verdict, ModelVerdict::Undetermined);
+        assert_eq!(
+            readiness.undetermined_reason,
+            Some(UndeterminedReason::ModelNotCurated)
+        );
+        assert!(
+            readiness.canonical_model_id.is_none() && readiness.required_gpu_memory_gib.is_none()
+        );
+        assert!(readiness.fix.is_none() && readiness.route.is_none());
+        assert_eq!(source.calls(), 1);
+        let text = render_model_readiness_text(&readiness);
+        assert!(
+            text.starts_with("rocm diagnose --model some-lab/never-curated-7b:Q4_K_M: ESTIMATED: fits at 8192 tokens"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("READY") && !text.contains("BLOCKED"),
+            "{text}"
+        );
+        assert!(text.contains("note: these are estimates"), "{text}");
+    }
+
+    #[test]
+    fn a_gguf_that_does_not_fit_says_what_would_make_it_fit() {
+        let mut readiness = not_curated("some-lab/never-curated-7b:Q4_K_M");
+        // 2 GiB of weights, 1 GiB of cache at 8192, ~1.4 GiB for the compute
+        // buffer and runtime: 4.4 GiB against 4, with room for ~5000 tokens.
+        let host = host_with(4.0, 64.0);
+        attach_context_estimate(
+            &mut readiness,
+            &asked(8192),
+            &host,
+            &FakeSource::weights(2048),
+        );
+        let estimate = readiness.estimate.as_ref().unwrap();
+        assert_eq!(estimate.outcome, EstimateOutcome::DoesNotFit);
+        // A model that does not fit keeps the curated models that would run here:
+        // they answer the question the user is left with.
+        assert!(
+            !readiness.alternatives.is_empty(),
+            "ESTIMATED: does not fit dropped the alternatives"
+        );
+        let kinds: Vec<_> = estimate.suggestions.iter().map(|s| s.kind).collect();
+        assert!(kinds.contains(&SuggestionKind::SmallerContext), "{kinds:?}");
+        assert!(kinds.contains(&SuggestionKind::KvCacheType), "{kinds:?}");
+        let text = render_model_readiness_text(&readiness);
+        assert!(
+            text.contains("ESTIMATED: does not fit at 8192 tokens"),
+            "{text}"
+        );
+        assert!(text.contains("what would make it fit:"), "{text}");
+        // Nothing printed as a command: `rocm serve` takes none of these options,
+        // and a runnable-looking line for them would be false.
+        assert!(!text.contains("     $ "), "{text}");
+        assert!(!text.contains("rocm serve some-lab"), "{text}");
+        assert!(!text.contains("rocm serve --"), "{text}");
+        assert!(
+            text.contains("`rocm serve` does not take a context size"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_bare_repository_is_answered_as_before_and_read_nowhere() {
+        // `owner/repo` with no quantization names a repository, not a file. With
+        // no context flag the answer is exactly the plain "not in the catalog"
+        // one, reached without touching the network or the disk.
+        let plain = not_curated("some-lab/never-curated-7b");
+        let mut readiness = plain.clone();
+        let source = FakeSource::weights(64);
+        attach_context_estimate(
+            &mut readiness,
+            &ContextRequest::default(),
+            &host_with(24.0, 64.0),
+            &source,
+        );
+        assert_eq!(readiness, plain);
+        assert_eq!(source.calls(), 0);
+        assert!(readiness.estimate.is_none() && readiness.route.is_some());
+        // With a flag, the user is told what would make it answerable -- still
+        // without reading anything.
+        attach_context_estimate(
+            &mut readiness,
+            &asked(8192),
+            &host_with(24.0, 64.0),
+            &source,
+        );
+        assert_eq!(source.calls(), 0);
+        assert!(readiness.estimate.is_none());
+        let text = render_model_readiness_text(&readiness);
+        assert!(
+            text.contains("names a repository, not a model file: add `:QUANT`"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_gguf_that_cannot_be_read_is_not_sent_to_the_upstream_tracker() {
+        // A typo'd path: the tracker cannot help with it. The plan to serve the
+        // model directly stays, because nothing was learnt about the model.
+        let mut readiness = not_curated("models/nosuch.gguf");
+        assert!(
+            readiness.route.is_some(),
+            "the catalog-miss route is the default"
+        );
+        attach_context_estimate(
+            &mut readiness,
+            &ContextRequest::default(),
+            &host_with(24.0, 64.0),
+            &FakeSource::failing(),
+        );
+        let estimate = readiness.estimate.as_ref().unwrap();
+        assert_eq!(
+            estimate.cannot_estimate_reason,
+            Some(CannotEstimateReason::HeaderUnreadable)
+        );
+        assert!(readiness.route.is_none());
+        // A typo'd local path is a path to check, not a model to "serve directly".
+        let fix = readiness.fix.as_ref().expect("a plan is still given");
+        assert!(fix.summary.contains("check the path"), "{}", fix.summary);
+        assert!(fix.commands.is_empty());
+        assert_eq!(fix.verify, "rocm diagnose --model models/nosuch.gguf");
+        let text = render_model_readiness_text(&readiness);
+        assert!(!text.contains("report it:"), "{text}");
+        assert!(
+            !text.contains("serve this model directly") && !text.contains("rocm serve"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_hub_file_that_cannot_be_read_keeps_the_serve_it_directly_plan() {
+        // Nothing was learnt about the model, and `rocm serve owner/repo:QUANT` is
+        // a real way to find out.
+        let mut readiness = not_curated("some-lab/never-curated-7b:Q4_K_M");
+        attach_context_estimate(
+            &mut readiness,
+            &ContextRequest::default(),
+            &host_with(24.0, 64.0),
+            &FakeSource::failing(),
+        );
+        let fix = readiness.fix.as_ref().unwrap();
+        assert!(
+            fix.summary.contains("serve this model directly"),
+            "{}",
+            fix.summary
+        );
+    }
+
+    fn compared_estimate() -> ModelReadiness {
+        let mut readiness = not_curated("some-lab/never-curated-7b:Q4_K_M");
+        attach_context_estimate(
+            &mut readiness,
+            &asked(8192),
+            &host_with(24.0, 64.0),
+            &FakeSource::weights(2048),
+        );
+        assert!(readiness.estimate.as_ref().unwrap().available_gib.is_some());
+        readiness
+    }
+
+    #[test]
+    fn a_mask_on_a_host_whose_gpus_differ_is_said_to_be_unverified() {
+        let notes = |readiness: &ModelReadiness| readiness.estimate.as_ref().unwrap().notes.clone();
+        // Mask set, cards of two sizes: the figure may be for the other card.
+        let mut readiness = compared_estimate();
+        note_unverified_mask(&mut readiness, true, &[24_576, 8192]);
+        assert!(
+            notes(&readiness).iter().any(|n| n == MASK_UNVERIFIED_NOTE),
+            "{:?}",
+            notes(&readiness)
+        );
+        let text = render_model_readiness_text(&readiness);
+        assert!(text.contains("has not been verified"), "{text}");
+        // Whichever order the rows come in.
+        let mut readiness = compared_estimate();
+        note_unverified_mask(&mut readiness, true, &[8192, 24_576]);
+        assert!(notes(&readiness).iter().any(|n| n == MASK_UNVERIFIED_NOTE));
+        // No mask: nothing to doubt. Same cards: whichever is picked, the figure is the same.
+        for (mask_set, totals) in [
+            (false, vec![24_576_u64, 8192]),
+            (true, vec![24_576, 24_576]),
+            (true, vec![24_576]),
+            (true, vec![]),
+        ] {
+            let mut readiness = compared_estimate();
+            note_unverified_mask(&mut readiness, mask_set, &totals);
+            assert!(
+                !notes(&readiness).iter().any(|n| n == MASK_UNVERIFIED_NOTE),
+                "{mask_set} {totals:?}"
+            );
+        }
+        // An estimate that compared nothing has no figure to doubt.
+        let mut unmeasured = not_curated("some-lab/never-curated-7b:Q4_K_M");
+        attach_context_estimate(
+            &mut unmeasured,
+            &asked(8192),
+            &HostFacts {
+                accelerator_memory: AcceleratorMemory::Unknown,
+                system_ram_gib: Some(64.0),
+            },
+            &FakeSource::weights(2048),
+        );
+        note_unverified_mask(&mut unmeasured, true, &[24_576, 8192]);
+        assert!(
+            !notes(&unmeasured).iter().any(|n| n == MASK_UNVERIFIED_NOTE),
+            "{:?}",
+            notes(&unmeasured)
+        );
+    }
+
+    /// `owner/repo:dir/file.gguf` selects an exact file for the estimate; `rocm
+    /// serve` reads only `owner/repo:QUANT`, so a verify line naming it would fail.
+    #[test]
+    fn the_verify_command_is_one_rocm_serve_accepts() {
+        let verify = |model_ref: &str| {
+            let mut readiness = not_curated(model_ref);
+            attach_context_estimate(
+                &mut readiness,
+                &ContextRequest::default(),
+                &host_with(24.0, 64.0),
+                &FakeSource::failing(),
+            );
+            readiness
+                .fix
+                .expect("the plan stays for an unreadable file")
+                .verify
+        };
+        assert_eq!(
+            verify("some-lab/never-curated-7b:Q4_K_M"),
+            "rocm serve some-lab/never-curated-7b:Q4_K_M"
+        );
+        assert_eq!(
+            verify("some-lab/never-curated-7b:sub/model-Q4_K_M.gguf"),
+            "rocm diagnose --model some-lab/never-curated-7b:sub/model-Q4_K_M.gguf"
+        );
+    }
+
+    #[test]
+    fn the_default_context_is_labelled_as_a_default() {
+        let mut readiness = not_curated("some-lab/never-curated-7b:Q4_K_M");
+        attach_context_estimate(
+            &mut readiness,
+            &ContextRequest::default(),
+            &host_with(24.0, 64.0),
+            &FakeSource::weights(64),
+        );
+        let estimate = readiness.estimate.as_ref().unwrap();
+        assert_eq!(estimate.context_size, DEFAULT_CONTEXT_SIZE);
+        assert!(estimate.context_size_defaulted);
+        assert_eq!(estimate.kv_cache_type, KvCacheType::F16);
+        let text = render_model_readiness_text(&readiness);
+        assert!(
+            text.contains("(the default; pass --context-size to change it)"),
+            "{text}"
+        );
+    }
+
+    /// The three states of host memory, for a model that would otherwise fit:
+    /// none produces a comparison, each says its own reason, and the figures
+    /// the file allows are still shown.
+    #[test]
+    fn host_memory_that_cannot_be_compared_never_yields_a_fits_or_blocked_answer() {
+        for (memory, reason) in [
+            (AcceleratorMemory::None, CannotEstimateReason::NoGpu),
+            (
+                AcceleratorMemory::Unknown,
+                CannotEstimateReason::AcceleratorMemoryUnknown,
+            ),
+            (
+                AcceleratorMemory::UnifiedMemoryUnreadable,
+                CannotEstimateReason::UnifiedMemoryUnreadable,
+            ),
+        ] {
+            let mut readiness = not_curated("some-lab/never-curated-7b:Q4_K_M");
+            let host = HostFacts {
+                accelerator_memory: memory,
+                system_ram_gib: Some(64.0),
+            };
+            attach_context_estimate(
+                &mut readiness,
+                &asked(4096),
+                &host,
+                &FakeSource::weights(64),
+            );
+            let estimate = readiness.estimate.as_ref().unwrap();
+            assert_eq!(
+                estimate.outcome,
+                EstimateOutcome::CannotEstimate,
+                "{memory:?}"
+            );
+            assert_eq!(estimate.cannot_estimate_reason, Some(reason), "{memory:?}");
+            assert!(
+                estimate.total_gib.is_some(),
+                "{memory:?}: the need was not shown"
+            );
+            assert_eq!(readiness.verdict, ModelVerdict::Undetermined);
+            // Sized, so the "serve it directly" plan no longer applies.
+            assert!(
+                readiness.fix.is_none() && readiness.route.is_none(),
+                "{memory:?}"
+            );
+            let text = render_model_readiness_text(&readiness);
+            assert!(text.contains(": UNDETERMINED"), "{memory:?}: {text}");
+            assert!(!text.contains("ESTIMATED:"), "{memory:?}: {text}");
+            assert!(text.contains("KV cache (f16)"), "{memory:?}: {text}");
+        }
+    }
+
+    #[test]
+    fn an_unreachable_or_unreadable_file_is_a_gap_in_the_estimate_not_a_verdict_on_the_model() {
+        let mut readiness = not_curated("some-lab/never-curated-7b:Q4_K_M");
+        attach_context_estimate(
+            &mut readiness,
+            &asked(4096),
+            &host_with(24.0, 64.0),
+            &FakeSource::failing(),
+        );
+        let estimate = readiness.estimate.as_ref().unwrap();
+        assert_eq!(
+            estimate.cannot_estimate_reason,
+            Some(CannotEstimateReason::HeaderUnreadable)
+        );
+        assert!(
+            estimate
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("could not be reached")
+        );
+        assert_eq!(estimate.total_gib, None);
+        // The original "serve it directly" plan survives: nothing replaced it.
+        assert!(readiness.fix.is_some());
+
+        let mut readiness = not_curated("some-lab/never-curated-7b:Q4_K_M");
+        attach_context_estimate(
+            &mut readiness,
+            &asked(4096),
+            &host_with(24.0, 64.0),
+            &FakeSource::with(b"not a gguf file at all".to_vec()),
+        );
+        let estimate = readiness.estimate.as_ref().unwrap();
+        assert_eq!(
+            estimate.cannot_estimate_reason,
+            Some(CannotEstimateReason::HeaderUnreadable)
+        );
+        assert!(
+            estimate
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("not a GGUF file")
+        );
+    }
+
+    /// The plan's note was written for a model that is not a GGUF reference. For
+    /// one that is, and whose header could not be sized, it must not say so.
+    #[test]
+    fn the_plan_note_never_claims_a_gguf_is_not_one() {
+        let note_of = |source: &FakeSource| {
+            let mut readiness = not_curated("some-lab/never-curated-7b:Q4_K_M");
+            attach_context_estimate(&mut readiness, &asked(4096), &host_with(24.0, 64.0), source);
+            let text = render_model_readiness_text(&readiness);
+            assert!(!text.contains("not a GGUF reference"), "{text}");
+            readiness.fix.expect("the plan stays").notes.join("\n")
+        };
+        // Unreadable, and read but not sizeable (a shard of a split model).
+        let unreadable = note_of(&FakeSource::failing());
+        assert!(
+            unreadable.contains("could not size this GGUF"),
+            "{unreadable}"
+        );
+        let shard = note_of(&FakeSource::with(
+            llama_like(10).u32("split.count", 3).file(64),
+        ));
+        assert!(shard.contains("could not size this GGUF"), "{shard}");
+        // Sized: there is no plan left to carry a note.
+        let mut sized = not_curated("some-lab/never-curated-7b:Q4_K_M");
+        attach_context_estimate(
+            &mut sized,
+            &asked(4096),
+            &host_with(24.0, 64.0),
+            &FakeSource::weights(64),
+        );
+        assert!(sized.fix.is_none());
+        // Without a context flag nothing is read and the original note stands:
+        // that reference is not asked about as a GGUF at all.
+        let mut plain = not_curated("lab/plain-name");
+        attach_context_estimate(
+            &mut plain,
+            &ContextRequest::default(),
+            &host_with(24.0, 64.0),
+            &FakeSource::failing(),
+        );
+        assert!(plain.estimate.is_none());
+        assert!(
+            plain
+                .fix
+                .unwrap()
+                .notes
+                .join("\n")
+                .contains("for one that is not a GGUF reference")
+        );
+    }
+
+    #[test]
+    fn flags_are_never_dropped_in_silence_when_the_catalog_could_not_be_read() {
+        let unreachable = || {
+            assess_model_readiness(
+                "/models/local.gguf",
+                &ModelCatalogSource::Unreachable {
+                    detail: "no index".to_owned(),
+                },
+                &host_with(24.0, 64.0),
+                &engine_choice,
+            )
+        };
+        let source = FakeSource::weights(64);
+        let mut readiness = unreachable();
+        let before = readiness.evidence.clone();
+        attach_context_estimate(
+            &mut readiness,
+            &asked(4096),
+            &host_with(24.0, 64.0),
+            &source,
+        );
+        assert!(readiness.estimate.is_none());
+        assert_eq!(source.calls(), 0, "which answer it is owed is not known");
+        assert_eq!(readiness.evidence.len(), before.len() + 1);
+        assert!(
+            readiness
+                .evidence
+                .last()
+                .unwrap()
+                .contains("were not applied"),
+            "{:?}",
+            readiness.evidence
+        );
+        assert_eq!(
+            readiness.undetermined_reason,
+            Some(UndeterminedReason::CatalogUnreachable)
+        );
+        // No flag, no line: the answer is exactly what it was.
+        let mut readiness = unreachable();
+        let before = readiness.clone();
+        attach_context_estimate(
+            &mut readiness,
+            &ContextRequest::default(),
+            &host_with(24.0, 64.0),
+            &source,
+        );
+        assert_eq!(readiness, before);
+    }
+
+    #[test]
+    fn a_one_token_context_reads_as_one_token() {
+        let mut readiness = not_curated("some-lab/never-curated-7b:Q4_K_M");
+        attach_context_estimate(
+            &mut readiness,
+            &asked(1),
+            &host_with(24.0, 64.0),
+            &FakeSource::weights(64),
+        );
+        let text = render_model_readiness_text(&readiness);
+        assert!(text.contains(": ESTIMATED: fits at 1 token (not"), "{text}");
+        assert!(!text.contains("1 tokens"), "{text}");
+    }
+
+    #[test]
+    fn only_a_model_outside_the_catalog_that_names_a_gguf_reaches_the_source() {
+        let source = FakeSource::weights(64);
+        let host = host_with(24.0, 64.0);
+        // A curated model: no network, no estimate; and an explicit context
+        // flag is answered with why it does not apply, not silently ignored.
+        let mut curated = not_curated(SMALL_MODEL_REF);
+        attach_context_estimate(&mut curated, &asked(8192), &host, &source);
+        assert!(curated.estimate.is_none());
+        assert!(
+            curated
+                .evidence
+                .iter()
+                .any(|line| line.contains("do not apply to a curated recipe")),
+            "{:?}",
+            curated.evidence
+        );
+        let mut curated = not_curated(SMALL_MODEL_REF);
+        let before = curated.evidence.clone();
+        attach_context_estimate(&mut curated, &ContextRequest::default(), &host, &source);
+        assert_eq!(
+            curated.evidence, before,
+            "an unasked curated answer must not change"
+        );
+        // A name that is not a GGUF reference.
+        let mut other = not_curated("never-curated");
+        let before = other.evidence.len();
+        attach_context_estimate(&mut other, &ContextRequest::default(), &host, &source);
+        assert!(other.estimate.is_none() && other.evidence.len() == before);
+        attach_context_estimate(&mut other, &asked(4096), &host, &source);
+        assert!(other.estimate.is_none());
+        assert!(
+            other
+                .evidence
+                .iter()
+                .any(|line| line.contains("GGUF models only"))
+        );
+        // A reference of the right shape, but the catalog could not be read:
+        // the answer is about the catalog, and an estimate would contradict it.
+        let mut unreachable = assess_model_readiness(
+            "some-lab/never-curated-7b:Q4_K_M",
+            &ModelCatalogSource::Unreachable {
+                detail: "gone".to_owned(),
+            },
+            &host,
+            &engine_choice,
+        );
+        attach_context_estimate(&mut unreachable, &asked(4096), &host, &source);
+        assert!(unreachable.estimate.is_none());
+        assert_eq!(
+            source.calls(),
+            0,
+            "the source was reached for a model that did not qualify"
+        );
+    }
+
+    #[test]
+    fn an_answer_without_an_estimate_serializes_exactly_as_it_did_before() {
+        let readiness = not_curated("some-lab/never-curated-7b");
+        let json = serde_json::to_value(&readiness).unwrap();
+        assert!(json.get("estimate").is_none(), "{json}");
+        // And a JSON answer from before the field existed still reads.
+        let round_trip: ModelReadiness = serde_json::from_value(json).unwrap();
+        assert_eq!(round_trip, readiness);
+        let mut with = not_curated("some-lab/never-curated-7b:Q4_K_M");
+        attach_context_estimate(
+            &mut with,
+            &asked(4096),
+            &host_with(24.0, 64.0),
+            &FakeSource::weights(64),
+        );
+        let json = serde_json::to_value(&with).unwrap();
+        assert_eq!(json["estimate"]["outcome"], "fits");
+        assert_eq!(json["estimate"]["kv_cache_type"], "f16");
+        assert_eq!(json["verdict"], "undetermined");
     }
 }

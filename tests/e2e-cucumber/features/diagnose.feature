@@ -304,7 +304,8 @@ Feature: Diagnosing failures and listing fixes
     And the preview states that the CLI can run it automatically
   # `--model` answers the question that comes before the other two: given this
   # machine and that model, will it run. The point is that it answers in seconds
-  # and fetches nothing, so the user is not told by a download that failed.
+  # and downloads no weights (a curated model fetches nothing at all), so the user
+  # is not told by a download that failed.
   #
   # Host-agnostic in the same way diagnose-10 is, and for the same reason. The
   # verdict depends on what this machine can measure of its own GPU, which
@@ -748,3 +749,47 @@ Feature: Diagnosing failures and listing fixes
     Given a machine with an AMD GPU
     When the user diagnoses this machine in machine-readable form, with no symptom
     Then the diagnosis lists the HIP SDK cause only when the inspection finds something that needs it
+
+  # A GGUF outside the catalog has no recipe, so there is no tested minimum to
+  # compare. Its header still says how many layers it has, how many KV heads and
+  # how wide, and the file's size is the weights: enough to estimate memory at a
+  # chosen context size without downloading anything. The answer must stay
+  # visibly an estimate -- a different outcome from the closed verdict, and a
+  # different word -- because a figure derived from metadata and allowances
+  # calibrated on one GPU is not a model that was loaded. The file is a few kilobytes of header and a
+  # tiny weight region, so the scenario is deterministic on every lane; the
+  # comparison with GPU memory is host-specific and asserted per half, as
+  # diagnose-21 and diagnose-22 do.
+  @id:diagnose-model-gguf-is-estimated-from-its-header-not-judged
+  Scenario: diagnose-49 - A GGUF outside the catalog is sized from its header and reported as an estimate, not a verdict
+    Given a user asking about a small GGUF file on this machine
+    When the user asks the CLI whether that file would run at 2048 tokens with a q8_0 KV cache, in machine-readable form
+    Then the answer is an estimate under its own outcome, and the verdict stays undetermined
+    And the estimate sizes the file's weights and its KV cache at that context
+    And a machine that measured its GPU is told whether the estimate fits, and one that could not is told why
+    And no model weights were fetched
+
+  # The human-readable half of diagnose-49: the label is what a reader sees
+  # first, and READY or BLOCKED over a figure derived from metadata would claim
+  # a certainty the estimate does not have.
+  @id:diagnose-model-gguf-estimate-is-labelled-in-the-text-report
+  Scenario: diagnose-50 - The text report labels a GGUF estimate as an estimate and never calls the file ready or blocked
+    Given a user asking about a small GGUF file on this machine
+    When the user asks the CLI whether that file would run at 2048 tokens with a q8_0 KV cache, in human-readable form
+    Then the report is labelled an estimate, or undetermined with the figures, and is never ready or blocked
+    And no model weights were fetched
+
+  # `--report` promises that nothing leaves the machine. A GGUF reference such as
+  # owner/repo:Q4_K_M is read from Hugging Face, which would put the model's name
+  # on the wire, so a prepared report must not assess the model at all. The
+  # second half proves the endpoint is wired in: without `--report` the same
+  # question does reach it, and the note about ignoring the model is not shown.
+  @id:diagnose-report-never-reaches-the-hub-for-a-model
+  Scenario: diagnose-51 - A prepared problem report never asks the hub about a model
+    Given a Hugging Face endpoint that records every request made to it
+    When the user asks the CLI to prepare a problem report that names a model on that endpoint
+    Then no request reached the endpoint
+    And the CLI says the model was ignored rather than assessed
+    When the user asks the CLI the same model question without preparing a report
+    Then the endpoint was asked about the model
+    And the CLI does not say the model was ignored

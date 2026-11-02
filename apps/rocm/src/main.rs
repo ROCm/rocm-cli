@@ -182,6 +182,7 @@ use crate::update_cmd::update;
 
 use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, FromArgMatches, Parser};
+use rocm_core::model_readiness::ContextRequest;
 use rocm_core::{
     AppPaths, EndpointReadiness, RocmCliConfig, interactive_terminal, uv_cache_source,
 };
@@ -296,6 +297,32 @@ fn clap_exit_code(err: clap::Error) -> anyhow::Error {
     let code = err.exit_code();
     let _ = err.print();
     ClapExitCode(code).into()
+}
+
+/// What `rocm diagnose --model` was asked about.
+struct ModelQuery {
+    model_ref: String,
+    context: ContextRequest,
+}
+
+/// What `--report` says to stderr when it was given a model question: the report
+/// is about this machine, so the model flags did nothing, and nothing about the
+/// model was fetched. A flag that is accepted and silently has no effect reads as
+/// an answer that was never asked for.
+fn report_ignores_model_note(query: &ModelQuery) -> String {
+    let mut ignored = vec!["--model"];
+    if query.context.context_size.is_some() {
+        ignored.push("--context-size");
+    }
+    if query.context.kv_cache_type.is_some() {
+        ignored.push("--kv-cache-type");
+    }
+    let verb = if ignored.len() == 1 { "was" } else { "were" };
+    format!(
+        "note: --report describes this machine, not a model, so {} {verb} ignored and nothing \
+         about the model was fetched",
+        ignored.join(", ")
+    )
 }
 
 fn main() -> ExitCode {
@@ -685,9 +712,20 @@ fn dispatch(cli: Cli) -> Result<()> {
             json,
             distro,
             model,
+            context_size,
+            kv_cache_type,
             report,
             send,
-        }) => diagnose(symptom, top, json, distro, model, report, send),
+        }) => {
+            let model = model.map(|model_ref| ModelQuery {
+                model_ref,
+                context: ContextRequest {
+                    context_size,
+                    kv_cache_type: kv_cache_type.map(Into::into),
+                },
+            });
+            diagnose(symptom, top, json, distro, model, report, send)
+        }
         // Keep this error chained rather than discarding it into a fresh
         // `anyhow!(...)` (e.g. via a `.map_err` that restringifies it) -- see
         // `FixExitCode`'s doc comment for why that would silently break its

@@ -284,7 +284,7 @@ form works depends on the engine your GPU selects.
 | `rocm` | Open the launcher menu (setup, serve, diagnose, chat, dashboard) |
 | `rocm examine` | Check GPU, ROCm install, engines, and managed folders |
 | `rocm diagnose` | Match this machine against known ROCm, PyTorch, and llama.cpp failure modes |
-| `rocm diagnose --model <model>` | Say whether a model will run here, before downloading it |
+| `rocm diagnose --model <model>` | Say whether a model will run here, before downloading it; for a GGUF, estimate the largest context that fits |
 | `rocm diagnose --report` | Show what this machine would contribute to a problem report, and send nothing |
 | `rocm fix [<fix-id>]` | Apply a fix reported by `rocm diagnose` |
 | `rocm install sdk` | Install TheRock ROCm wheels into a managed Python environment |
@@ -337,7 +337,7 @@ Windows. The Vulkan driver version is not shown.
 
 ```
 rocm diagnose [--symptom TEXT] [--top N] [--json] [--distro [NAME] | --report [--send]]
-rocm diagnose --model <model> [--json]
+rocm diagnose --model <model> [--context-size N] [--kv-cache-type f16|q8_0|q4_0] [--json]
 rocm fix [<fix-id>] [--yes] [--dry-run] [--device-index N] [--json]
 ```
 
@@ -373,7 +373,9 @@ position.
   those.
 - `--report` shows exactly what this machine would contribute to a problem
   report, and sends nothing. There is no automatic transport, and there will be
-  none: a report leaves a machine only by its owner's own action.
+  none: a report leaves a machine only by its owner's own action. A `--model`
+  given with it is not assessed (a report carries no model verdict), so a GGUF
+  reference is not looked up on Hugging Face for it.
 - `--send`, which requires `--report`, additionally offers a prefilled mail
   carrying that report. It still sends nothing: the mail opens already filled
   in with the content `--report` just printed, addressed to `ROCmCLI@amd.com`,
@@ -794,14 +796,14 @@ Windows these installs are skipped.
 Ask before downloading anything:
 
 ```
-rocm diagnose --model <model> [--json]
+rocm diagnose --model <model> [--context-size N] [--kv-cache-type f16|q8_0|q4_0] [--json]
 ```
 
-Answers in seconds, from the curated recipe and this machine's GPU. It
-fetches no weights and makes no network call. The verdict is `ready`,
-`degraded`, `blocked`, or `undetermined`. A `ready` answer also names the
-engine `rocm serve` would use; a `blocked` one names curated models that would
-run here instead.
+Answers from the curated recipe and this machine's GPU, in seconds. It
+downloads no weights. For a curated model it makes no network call. The
+verdict is `ready`, `degraded`, `blocked`, or `undetermined`. A `ready` answer
+also names the engine `rocm serve` would use; a `blocked` one names curated
+models that would run here instead.
 
 `undetermined` is a real answer, not a failure. You get it when any of these is
 true:
@@ -814,7 +816,89 @@ true:
 
 None of these says anything about whether the model fits, so none of them is
 reported as though it did. `rocm serve` still accepts a model outside the
-catalog, but `diagnose` cannot tell you in advance how it will go.
+catalog, but for anything other than a GGUF, `diagnose` cannot tell you in
+advance how it will go.
+
+#### A GGUF model outside the catalog
+
+Pass a local `.gguf` path, or `owner/repo:QUANT` for a file on Hugging Face
+(for example `owner/repo:Q4_K_M`, or an exact file name ending in `.gguf`, with
+its directory when the file is in one and another file shares its name:
+`owner/repo:dir/model-Q4_K_M.gguf`; a bare name means the file at the top of the
+repository when there is one). A file that exists on this machine is read
+as that file even when its name looks like `owner/repo:QUANT`. A bare
+`owner/repo`, with no quantization, names a repository rather than a file and
+is answered like any other model outside the catalog: undetermined, with
+nothing read.
+Instead of a recipe's minimum, `diagnose` reads the file's header, which holds
+the layer count, the KV head count and head width, and the tensor shapes. For
+a remote file that is one listing request for the repository (up to 16 MiB, to
+find the file and its size), a `HEAD` request for a file the listing does not
+size, then a few megabytes fetched by HTTP range request (set
+`HF_ENDPOINT` to use a mirror); the weights are never downloaded. A remote read
+has two minutes in all, so on a slow link it can take that long to fail. No
+token is sent, so a gated or private repository cannot be read.
+It then estimates weights, plus the KV cache at `--context-size` (default 4096)
+and `--kv-cache-type` (default `f16`), plus a compute buffer and a runtime
+reserve, against this GPU's dedicated VRAM:
+
+```
+rocm diagnose --model owner/repo:Q4_K_M --context-size 32768 --kv-cache-type q8_0
+```
+
+The answer is labelled `ESTIMATED: fits at N tokens` or `ESTIMATED: does not
+fit at N tokens`, never `ready` or `blocked`: in `--json` the `verdict` stays
+`undetermined` and the figures are under `model.estimate`. It reports the
+largest context that fits with that KV cache type. When the file does not fit
+at the size you asked for, it lists what would make it fit: a smaller context,
+a q8_0 or q4_0 KV cache (llama.cpp needs flash attention for a quantized V
+cache, and the estimate assumes it is on), a smaller quantization, or keeping
+some layers on the CPU. Those are llama.cpp options (`--ctx-size`, `--cache-type-k`/`-v`,
+`--n-gpu-layers`): **`rocm serve` does not take a context size, KV cache type
+or GPU layer count yet**, so none of them is printed as a `rocm serve` command.
+
+The KV cache is exact for a plain full-attention model, and the weights are the
+file's own size from its tensor offsets, less the input embedding, which
+llama.cpp keeps in host memory. Only the compute buffer and the runtime reserve
+are allowances, calibrated against sixteen real loads of two dense models on one
+MI300X (gfx942) with llama.cpp b9752 and ROCm 7.2, flash attention on. In
+fifteen of those loads the estimated total was above what the GPU's used memory
+grew by, by 0.05% to 2.9% with an f16 KV cache and up to 4.5% with a quantized
+one; in the sixteenth, a load made with the card almost full, it was 5.5% above,
+because the process overhead measured there was only about 0.4 GiB against
+1.05-1.28 GiB in the others, which is unexplained. So across all sixteen the
+estimate was 0.05% to 5.5% above what was used, never below. That is the same
+loads the allowances were fitted to, on two dense models and one build, so it
+says how well they fit, not that the estimate is an upper bound elsewhere.
+A model with sliding-window, state-space or mixture-of-experts layers was not
+measured: its KV cache is sized as if every layer attended over the whole
+context (which can overstate it), a state-space model's recurrent state is not
+counted (which can understate it), and the output says which applies. Another
+GPU, engine build or batch size can miss by more, so leave headroom. The figures
+are compared with the total dedicated VRAM of the GPU with the most of it that
+ROCm can see, the same figure a curated model's minimum is compared with, not
+with what other processes have left free. When a device-visibility variable
+(`HIP_VISIBLE_DEVICES`, `ROCR_VISIBLE_DEVICES`, `CUDA_VISIBLE_DEVICES`) is set on
+a host whose GPUs differ in memory, the report says that the mapping between the
+mask and `amd-smi`'s numbering has not been verified on such a host, so the
+figure may be for a different card; that mapping has not been checked on a
+multi-GPU machine. Where memory cannot be read, the memory the model needs is
+shown and nothing is compared. The memory figures are whole MiB, each rounded
+up, and the verdict is decided on their sum, so what is printed always adds up.
+The largest context is also capped at the context length the model was trained
+for. `--context-size` takes 1 to 16777216 tokens. Passing `--context-size` or
+`--kv-cache-type` for a curated model changes nothing, because a recipe's memory
+minimum is fixed; the report says so. Under `--report` the model is not assessed
+at all, so nothing is fetched for it, and `--context-size` and `--kv-cache-type`
+are ignored along with `--model`; a note on stderr names the flags that were
+ignored.
+
+On an integrated GPU (APU), where the CLI can't read the memory
+pool the engine uses, and on a host with no GPU or an unreadable one, the
+answer stays `undetermined` but still shows what the file needs. Layouts the
+formula does not describe (a file that is one shard of a split model, latent
+attention, a model with no attention layers) are reported as such rather than
+estimated.
 
 ### Curated models
 

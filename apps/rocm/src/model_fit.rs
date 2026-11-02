@@ -36,8 +36,10 @@
 //! `model_fit::tests::docker_unreachable_subprocess_helper`; that path moved
 //! with the helper.
 
+use rocm_core::gguf_source::{GgufSource, LiveGgufSource};
 use rocm_core::model_readiness::{
-    AcceleratorMemory, HostEngineChoice, HostFacts, ModelCatalogSource, ModelReadiness,
+    AcceleratorMemory, ContextRequest, HostEngineChoice, HostFacts, ModelCatalogSource,
+    ModelReadiness, attach_context_estimate, note_unverified_mask,
 };
 use rocm_core::{
     AppPaths, ModelRecipeRecord, RocmCliConfig, detect_host_gpu_summary, load_model_recipe_registry,
@@ -56,9 +58,16 @@ use crate::serve_cmd::select_serve_engine;
 pub(crate) fn assess_model_on_this_host(
     model_ref: &str,
     examination: &rocm_core::Examination,
+    context: &ContextRequest,
 ) -> ModelReadiness {
     let paths = AppPaths::discover().ok();
-    assess_model_with_host_paths(model_ref, examination, paths.as_ref())
+    assess_model_with_host_paths(
+        model_ref,
+        examination,
+        paths.as_ref(),
+        context,
+        &LiveGgufSource::new(),
+    )
 }
 
 /// Testable core of [`assess_model_on_this_host`].
@@ -77,16 +86,25 @@ fn assess_model_with_host_paths(
     model_ref: &str,
     examination: &rocm_core::Examination,
     paths: Option<&AppPaths>,
+    context: &ContextRequest,
+    gguf_source: &dyn GgufSource,
 ) -> ModelReadiness {
     let host_gpu_summary = detect_host_gpu_summary(paths);
+    // Read once: the memory classification and the mask caveat below both need
+    // the rows, and each read is an `amd-smi` subprocess.
+    let vram = gpu_vram_usage();
     let host = HostFacts {
-        accelerator_memory: host_accelerator_memory(&host_gpu_summary, examination),
+        accelerator_memory: host_accelerator_memory(
+            &host_gpu_summary,
+            examination,
+            vram.as_deref(),
+        ),
         system_ram_gib: rocm_core::detect_system_ram_gib(),
     };
     let configured_engine = paths
         .and_then(|paths| RocmCliConfig::load(paths).ok())
         .and_then(|config| config.default_engine);
-    match load_model_recipe_registry() {
+    let mut readiness = match load_model_recipe_registry() {
         Ok(registry) => assess_model_for_host(
             model_ref,
             &ModelCatalogSource::Available(&registry),
@@ -103,7 +121,45 @@ fn assess_model_with_host_paths(
             configured_engine.as_deref(),
             Some(&host_gpu_summary),
         ),
-    }
+    };
+    // The one step that can touch a file or the network, and only for a GGUF
+    // reference the catalog does not carry; it reads the header, not the weights.
+    attach_context_estimate(&mut readiness, context, &host, gguf_source);
+    // Which card a device-visibility mask selects, in `amd-smi`'s numbering, has
+    // not been verified on a multi-GPU machine, so an estimate that compared
+    // memory says so when it could have compared the wrong card.
+    note_mask_for_rows(
+        &mut readiness,
+        vram.as_deref(),
+        device_visibility_mask_is_set(),
+    );
+    readiness
+}
+
+/// [`note_unverified_mask`] over the rows `amd-smi` reported.
+fn note_mask_for_rows(
+    readiness: &mut ModelReadiness,
+    vram: Option<&[GpuVramUsage]>,
+    mask_set: bool,
+) {
+    let totals: Vec<u64> = vram
+        .iter()
+        .flat_map(|rows| rows.iter())
+        .map(|usage| usage.total_mb)
+        .collect();
+    note_unverified_mask(readiness, mask_set, &totals);
+}
+
+/// Whether any of the variables that hide GPUs from the runtime is set, even to
+/// nothing (which hides every one).
+fn device_visibility_mask_is_set() -> bool {
+    [
+        "HIP_VISIBLE_DEVICES",
+        "ROCR_VISIBLE_DEVICES",
+        "CUDA_VISIBLE_DEVICES",
+    ]
+    .iter()
+    .any(|name| std::env::var_os(name).is_some())
 }
 
 /// The memory pool an engine on this host would allocate a model from.
@@ -147,9 +203,10 @@ fn examination_reports_amd_gpu(examination: &rocm_core::Examination) -> bool {
 fn host_accelerator_memory(
     host_gpu_summary: &rocm_core::HostGpuSummary,
     examination: &rocm_core::Examination,
+    vram: Option<&[GpuVramUsage]>,
 ) -> AcceleratorMemory {
     classify_accelerator_memory(
-        gpu_vram_usage().as_deref(),
+        vram,
         host_gpu_summary.gfx_target.as_deref(),
         examination_reports_amd_gpu(examination),
         rocm_core::usable_amd_gpu_indices().as_deref(),
@@ -190,8 +247,11 @@ fn classify_accelerator_memory(
             .iter()
             .filter(|usage| usable_indices.is_none_or(|indices| indices.contains(&usage.index)))
             .map(|usage| usage.total_mb as f64 / 1024.0)
-            .fold(0.0_f64, f64::max);
-        return AcceleratorMemory::Dedicated(max_gib);
+            .reduce(f64::max);
+        // A mask that leaves no card is "no GPU is visible", the same answer
+        // `has_usable_amd_gpu` gives -- not a card with 0 GiB, which a verdict
+        // would then print as a measured figure ("this host offers 0 GiB").
+        return max_gib.map_or(AcceleratorMemory::None, AcceleratorMemory::Dedicated);
     }
     // This is an APU: the carve-out `amd-smi` reports above is the wrong pool,
     // per `vram_capacity_is_meaningful`'s own doc. The right pool is the GTT
@@ -310,6 +370,7 @@ fn unsupported_here_for(engine: &str, ruled_out: PlatformRuleOut) -> Option<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{ModelQuery, report_ignores_model_note};
 
     /// Hosts whose engine choice differs, so the assertion below is exercised on
     /// more than one branch of `select_serve_engine`.
@@ -571,8 +632,13 @@ mod tests {
         let summary = detect_host_gpu_summary(Some(&paths));
         let expected = select_serve_engine(None, Some("vllm"), Some(recipe), Some(&summary));
 
-        let readiness =
-            assess_model_with_host_paths(&recipe.canonical_model_id, &examination, Some(&paths));
+        let readiness = assess_model_with_host_paths(
+            &recipe.canonical_model_id,
+            &examination,
+            Some(&paths),
+            &ContextRequest::default(),
+            &LiveGgufSource::new(),
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
 
@@ -584,6 +650,98 @@ mod tests {
              read the same discovered AppPaths",
             readiness.engine
         );
+    }
+
+    /// A readiness whose estimate compared memory, built without a network or a file.
+    fn readiness_with_a_compared_estimate() -> ModelReadiness {
+        let mut readiness = assess_model_for_host(
+            "some-lab/never-curated-7b:Q4_K_M",
+            &ModelCatalogSource::Unreachable {
+                detail: "not needed here".to_owned(),
+            },
+            &HostFacts {
+                accelerator_memory: AcceleratorMemory::Dedicated(24.0),
+                system_ram_gib: None,
+            },
+            None,
+            None,
+        );
+        let mut estimate = rocm_core::gguf_fit::ContextEstimate::unreadable(
+            "x.gguf",
+            &rocm_core::gguf_fit::FitRequest {
+                context_size: 4096,
+                context_size_defaulted: true,
+                kv_cache_type: rocm_core::gguf_fit::KvCacheType::F16,
+            },
+            &anyhow::anyhow!("not read"),
+        );
+        estimate.available_gib = Some(24.0);
+        readiness.estimate = Some(estimate);
+        readiness
+    }
+
+    fn gpu_row(index: u32, total_gib: u64) -> GpuVramUsage {
+        GpuVramUsage {
+            index,
+            used_mb: 0,
+            total_mb: total_gib * 1024,
+        }
+    }
+
+    /// `--report` ignores the model flags it was given, and says which, so a flag
+    /// that did nothing is not taken for one that was answered.
+    #[test]
+    fn the_report_note_names_exactly_the_model_flags_that_were_ignored() {
+        let note = |context_size: Option<u64>, kv: Option<rocm_core::gguf_fit::KvCacheType>| {
+            report_ignores_model_note(&ModelQuery {
+                model_ref: "o/r:Q4_K_M".to_owned(),
+                context: ContextRequest {
+                    context_size,
+                    kv_cache_type: kv,
+                },
+            })
+        };
+        let alone = note(None, None);
+        assert!(alone.contains("--model was ignored"), "{alone}");
+        assert!(!alone.contains("--context-size"), "{alone}");
+        assert!(!alone.contains("--kv-cache-type"), "{alone}");
+        let both = note(Some(4096), Some(rocm_core::gguf_fit::KvCacheType::Q8_0));
+        assert!(
+            both.contains("--model, --context-size, --kv-cache-type were ignored"),
+            "{both}"
+        );
+        let size_only = note(Some(4096), None);
+        assert!(
+            size_only.contains("--model, --context-size were ignored")
+                && !size_only.contains("--kv-cache-type"),
+            "{size_only}"
+        );
+        assert!(
+            both.contains("nothing about the model was fetched"),
+            "{both}"
+        );
+    }
+
+    /// The glue between `amd-smi`'s rows and the caveat: cards of two sizes and a
+    /// mask say it, and every other host does not.
+    #[test]
+    fn the_unverified_mask_note_reaches_an_estimate_when_the_gpus_differ() {
+        let noted = |rows: Option<&[GpuVramUsage]>, mask_set: bool| {
+            let mut readiness = readiness_with_a_compared_estimate();
+            note_mask_for_rows(&mut readiness, rows, mask_set);
+            readiness
+                .estimate
+                .unwrap()
+                .notes
+                .iter()
+                .any(|note| note.contains("has not been verified"))
+        };
+        let mixed = [gpu_row(0, 24), gpu_row(1, 8)];
+        let same = [gpu_row(0, 24), gpu_row(1, 24)];
+        assert!(noted(Some(&mixed), true));
+        assert!(!noted(Some(&mixed), false), "no mask, nothing to doubt");
+        assert!(!noted(Some(&same), true), "the same card either way");
+        assert!(!noted(None, true), "no rows, no figure compared");
     }
 
     /// A single dedicated GPU reports its measured total, unmodified.
@@ -716,6 +874,44 @@ mod tests {
             result,
             AcceleratorMemory::Dedicated(8.0),
             "a masked-out GPU's VRAM must not count toward the verdict: {result:?}"
+        );
+    }
+
+    /// A mask that hides every card is "no GPU is visible", not a card with no
+    /// memory: the fold over the visible rows used to start from 0.0 and report
+    /// `Dedicated(0.0)`, which a verdict printed as a measured "0 MiB".
+    #[test]
+    fn classify_accelerator_memory_reports_none_when_the_mask_leaves_no_gpu() {
+        let vram = [
+            GpuVramUsage {
+                index: 0,
+                used_mb: 0,
+                total_mb: 24 * 1024,
+            },
+            GpuVramUsage {
+                index: 1,
+                used_mb: 0,
+                total_mb: 8 * 1024,
+            },
+        ];
+        // `HIP_VISIBLE_DEVICES=""`: no usable device at all.
+        assert_eq!(
+            classify_accelerator_memory(Some(&vram), Some("gfx942"), true, Some(&[])),
+            AcceleratorMemory::None
+        );
+        // A mask naming only a device `amd-smi` has no row for.
+        assert_eq!(
+            classify_accelerator_memory(Some(&vram), Some("gfx942"), true, Some(&[5])),
+            AcceleratorMemory::None
+        );
+        // Unchanged: no mask, and a mask that leaves a card.
+        assert_eq!(
+            classify_accelerator_memory(Some(&vram), Some("gfx942"), true, None),
+            AcceleratorMemory::Dedicated(24.0)
+        );
+        assert_eq!(
+            classify_accelerator_memory(Some(&vram), Some("gfx942"), true, Some(&[1])),
+            AcceleratorMemory::Dedicated(8.0)
         );
     }
 

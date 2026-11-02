@@ -16,7 +16,7 @@ tooling.
 - It's a general system inspector, so it **always exits 0**. The verdict is the
   `status` field: `ok` · `no-amd-gpu` · `wsl` · `unsupported-os` · `degraded`.
 
-### `rocm diagnose [--symptom "<text>"] [--top N] [--json] [--distro [NAME]] [--model REF]`
+### `rocm diagnose [--symptom "<text>"] [--top N] [--json] [--distro [NAME]] [--model REF [--context-size N] [--kv-cache-type f16|q8_0|q4_0]]`
 
 Match the host + symptom against the closed catalog. **Always exits 0**; read
 the result from `--json`:
@@ -49,13 +49,40 @@ the result from `--json`:
 - `route_when_no_match` — `{ target, url }` upstream tracker to use when `has_match` is false.
 - `model` — set only when `--model <ref>` was passed; otherwise not set. Answers
   "will this curated model run here" from the recipe catalog and this host's
-  GPU/RAM, without downloading anything: `{ verdict, evidence[], engine,
+  GPU/RAM, without downloading the weights: `{ verdict, evidence[], engine,
   required_gpu_memory_gib, available_gpu_memory_gib, alternatives[],
   undetermined_reason, fix }`. `verdict` is one of `ready`, `degraded`,
   `blocked`, `undetermined` — treat `undetermined` as "the CLI could not find
   out", never as evidence the model is incompatible. `--model` is refused
   together with `--distro`: the verdict is about the machine running the
   command, not the one `--distro` names.
+  For a GGUF outside the catalog (a local `.gguf` path, or `owner/repo:QUANT`)
+  the verdict stays `undetermined` and an `estimate` object is added, sized from
+  the file's header (the weights are never downloaded). Its fields, by group:
+  where it came from (`source`, `architecture`, `layers`); the outcome
+  (`outcome` is `fits`, `does_not_fit` or `cannot_estimate`, and with
+  `cannot_estimate` the `cannot_estimate_reason` and `detail` say why; the
+  figures are still given when the reason is about the host (`no_gpu`,
+  `accelerator_memory_unknown`, `unified_memory_unreadable`: what the model would
+  need, with nothing to compare it to) and are null when it is about the file
+  (`header_unreadable`, `split_file`, `latent_attention`, `no_attention_layers`,
+  `missing_metadata`)); what was asked for (`context_size`, `context_size_defaulted`,
+  `kv_cache_type`); the memory figures (`weights_gib`, `kv_cache_gib`,
+  `compute_buffer_gib`, `runtime_reserve_gib`, `total_gib`, the same in bytes as
+  `weights_bytes`, `kv_cache_bytes`, `compute_buffer_bytes`,
+  `runtime_reserve_bytes` and `total_bytes`, and `kv_cache_bytes_per_token`, the
+  cache's cost of one token); the comparison (`available_gib` is the total
+  dedicated VRAM of the GPU with the most of it that ROCm can see, not what is
+  free; `max_context` is the largest context that fits, capped at
+  `training_context`, and is null when GPU memory was not measured and also when
+  not even one 256-token step fits); and what the figures leave out
+  (`conservative_ceiling` says the ceiling is known to be conservative,
+  `suggestions[]` what would make it fit, `notes[]` the caveats).
+  It is an estimate, not a tested minimum: report it as one. With `--report`
+  the model is not assessed at all and nothing is fetched; a note on stderr names
+  the model flags that were ignored.
+  `suggestions[]` name llama.cpp options; `rocm serve` does not take a context
+  size yet, so do not propose a `rocm serve` command for them.
 
 ### `rocm fix [<id>] [--yes] [--dry-run] [--device-index N] [--json]`
 
