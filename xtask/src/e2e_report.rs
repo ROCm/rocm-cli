@@ -44,10 +44,8 @@ pub fn run(artifacts_dir: &Path, html_out: &Path) -> Result<()> {
         event: std::env::var("GITHUB_EVENT_NAME").ok(),
     };
 
-    // Builds the shared `PlatformReports` bundle once for both outputs below
-    // (ROCMAI-484); see `generate_consolidated`'s and
-    // `consolidated_summary_markdown`'s docs for what each output still uses
-    // `inputs` for independently of the parsed reports.
+    // Builds the shared `PlatformReports` bundle once for both outputs below;
+    // they render from it without re-reading the artifacts.
     let bundle = e2e_report::load_platform_reports(&inputs);
 
     e2e_report::generate_consolidated(&bundle, html_out, &meta)

@@ -246,14 +246,11 @@ pub fn draw_job_console(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::test_support::press as k;
     use rocm_dash_core::state::{State, StateEvent};
 
     fn theme() -> Theme {
         Theme::from_name("default")
-    }
-
-    fn k(code: crossterm::event::KeyCode) -> crossterm::event::KeyEvent {
-        crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE)
     }
 
     #[test]

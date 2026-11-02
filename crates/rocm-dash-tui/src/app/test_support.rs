@@ -3,15 +3,18 @@
 // SPDX-License-Identifier: MIT
 
 //! Test-only helpers shared across `app`'s submodule test suites, and
-//! (`with_registry_probe`) `crate::ui`'s own test module too — the module
-//! itself and that one fn are `pub(crate)` rather than `pub(super)` for
+//! (`press`, `with_registry_probe`) `crate::ui`'s test modules too — the
+//! module itself and those fns are `pub(crate)` rather than `pub(super)` for
 //! exactly that cross-module reach.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::AppState;
 
-pub(super) fn press(code: KeyCode) -> KeyEvent {
+/// A plain (no-modifier) key press. `crate::ui`'s screen test modules import
+/// this — aliased to their local call-site name — rather than each carrying
+/// its own byte-identical copy.
+pub(crate) fn press(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
 }
 
