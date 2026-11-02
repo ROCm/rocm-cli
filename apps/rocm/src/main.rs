@@ -146,7 +146,7 @@ use crate::services_text::{
 use crate::setup_cmd::{render_setup_status_text, setup};
 use crate::uninstall::uninstall;
 use crate::uninstall_plan::UninstallOptions;
-use crate::update_cmd::{apply_runtime_update, render_update_text, update_should_preview_or_apply};
+use crate::update_cmd::update;
 
 use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
@@ -2124,119 +2124,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             yes: _,
             json,
             timeout_secs,
-        }) => {
-            let paths = AppPaths::discover()?;
-            if !apply && !dry_run && (runtime.is_some() || activate) {
-                bail!(
-                    "--runtime and --activate require --apply or --dry-run; \
-                     run `rocm update --dry-run` to preview or add --apply to update"
-                );
-            }
-            if update_should_preview_or_apply(apply, dry_run) {
-                let mut config = RocmCliConfig::load(&paths)?;
-                match apply_runtime_update(
-                    &paths,
-                    &mut config,
-                    runtime.as_deref(),
-                    activate,
-                    dry_run,
-                ) {
-                    Ok(text) => {
-                        print!("{text}");
-                        record_cli_audit_event(
-                            &paths,
-                            "runtime",
-                            if dry_run {
-                                "runtime_update_dry_run"
-                            } else {
-                                "runtime_update_apply"
-                            },
-                            "info",
-                            format!(
-                                "runtime update completed runtime={} activate={} dry_run={}",
-                                runtime.as_deref().unwrap_or("<selected>"),
-                                activate,
-                                dry_run
-                            ),
-                            None,
-                        );
-                    }
-                    Err(error) => {
-                        record_cli_audit_event(
-                            &paths,
-                            "runtime",
-                            if dry_run {
-                                "runtime_update_dry_run"
-                            } else {
-                                "runtime_update_apply"
-                            },
-                            "error",
-                            format!(
-                                "runtime update failed runtime={} activate={} dry_run={}: {error}",
-                                runtime.as_deref().unwrap_or("<selected>"),
-                                activate,
-                                dry_run
-                            ),
-                            None,
-                        );
-                        return Err(error);
-                    }
-                }
-                return Ok(());
-            }
-            if json {
-                match therock::render_update_json(&paths, timeout_secs) {
-                    Ok(document) => {
-                        println!("{}", serde_json::to_string(&document)?);
-                        record_cli_audit_event(
-                            &paths,
-                            "update",
-                            "update_check",
-                            "info",
-                            "rendered update report (json)",
-                            None,
-                        );
-                    }
-                    Err(error) => {
-                        record_cli_audit_event(
-                            &paths,
-                            "update",
-                            "update_check",
-                            "error",
-                            format!("update report failed: {error}"),
-                            None,
-                        );
-                        return Err(error);
-                    }
-                }
-                return Ok(());
-            }
-            match render_update_text(&paths) {
-                Ok(text) => {
-                    print!("{text}");
-                    record_cli_audit_event(
-                        &paths,
-                        "update",
-                        "update_check",
-                        "info",
-                        "rendered update report",
-                        None,
-                    );
-                }
-                Err(error) => {
-                    record_cli_audit_event(
-                        &paths,
-                        "update",
-                        "update_check",
-                        "error",
-                        format!("update report failed: {error}"),
-                        None,
-                    );
-                    return Err(error);
-                }
-            }
-            Ok(())
-        }
+        }) => update(apply, runtime, activate, dry_run, json, timeout_secs),
         Some(Command::Runtimes { command }) => runtimes(command),
         Some(Command::Storage { command }) => storage::storage(command),
         Some(Command::Engines { command }) => engines(command),
