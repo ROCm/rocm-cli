@@ -6,8 +6,8 @@ use anyhow::{Context, Result, bail};
 use rocm_core::{
     AppPaths, AutomationRuntimeState, CodexBridgeEngine, CodexBridgeGpuSnapshot,
     CodexBridgeSnapshot, CommandCapture, ExamineSummary, RocmCliConfig,
-    default_engine_for_platform, format_host_port, load_recent_automation_events,
-    resolve_amd_smi_binary, unix_time_millis,
+    default_engine_for_platform, load_recent_automation_events, resolve_amd_smi_binary,
+    unix_time_millis,
 };
 #[cfg(test)]
 use rocm_engine_protocol::EnginePluginDescriptor;
@@ -19,11 +19,9 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::io::Write;
-use std::net::{SocketAddr, TcpStream};
 #[cfg(test)]
 use std::path::PathBuf;
 use std::process::{Command as ProcessCommand, Stdio};
-use std::thread;
 use std::time::Duration;
 
 const AMD_SMI_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -56,7 +54,7 @@ pub(crate) fn update_check_message(status: &str) -> &'static str {
     }
 }
 
-pub(crate) fn gather_gpu_snapshot() -> CodexBridgeGpuSnapshot {
+fn gather_gpu_snapshot() -> CodexBridgeGpuSnapshot {
     let static_snapshot = match capture_amd_smi_json(&["static", "-a", "-g", "all", "--json"]) {
         Ok(value) => Some(value),
         Err(error) => {
@@ -210,11 +208,6 @@ where
         .into_iter()
         .find(|plugin: &EnginePluginDescriptor| plugin.id == engine)
         .map(|plugin| plugin.executable_path))
-}
-
-pub(crate) fn run_rocm_capture(args: &[&str]) -> Result<CommandCapture> {
-    let paths = AppPaths::discover()?;
-    run_rocm_capture_for_paths(&paths, args, Duration::from_mins(2))
 }
 
 /// Run `rocm` on `paths`' config/data/cache roots, via the shared
@@ -408,22 +401,6 @@ where
         .data
         .context("engine response did not include data")?;
     serde_json::from_value(data).context("failed to deserialize engine response data")
-}
-
-pub(crate) fn wait_for_port(host: &str, port: u16, timeout: Duration) -> bool {
-    let address: SocketAddr = match format_host_port(host, port).parse() {
-        Ok(value) => value,
-        Err(_) => return false,
-    };
-
-    let start = std::time::Instant::now();
-    while start.elapsed() < timeout {
-        if TcpStream::connect_timeout(&address, Duration::from_millis(200)).is_ok() {
-            return true;
-        }
-        thread::sleep(Duration::from_millis(200));
-    }
-    false
 }
 
 pub(crate) fn payload_string(payload: &Value, key: &str) -> Option<String> {

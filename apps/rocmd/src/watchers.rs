@@ -9,11 +9,13 @@ use anyhow::{Context, Result, bail};
 use rocm_core::{
     AppPaths, AutomationProposalRecord, AutomationRuntimeState, AutomationTriggerEvent,
     CodexBridgeGpuSnapshot, ManagedServiceRecord, RocmCliConfig, WatcherMode,
-    WatcherRuntimeSnapshot, append_automation_proposal, builtin_watchers,
+    WatcherRuntimeSnapshot, append_automation_proposal, builtin_watchers, format_host_port,
     resolve_model_recipe_artifact, unix_time_millis,
 };
 use serde_json::Value;
 use serde_json::json;
+use std::net::{SocketAddr, TcpStream};
+use std::thread;
 use std::time::Duration;
 
 const SERVER_RECOVER_BACKOFF_MS: u128 = 30_000;
@@ -1446,8 +1448,24 @@ pub(crate) const fn stop_requested(record: &ManagedServiceRecord) -> bool {
 }
 
 fn endpoint_service_recovery_reason(record: &ManagedServiceRecord) -> Option<String> {
-    (!crate::common::wait_for_port(&record.host, record.port, ENDPOINT_HEALTH_TIMEOUT))
+    (!wait_for_port(&record.host, record.port, ENDPOINT_HEALTH_TIMEOUT))
         .then(|| "endpoint_status_unreachable".to_owned())
+}
+
+fn wait_for_port(host: &str, port: u16, timeout: Duration) -> bool {
+    let address: SocketAddr = match format_host_port(host, port).parse() {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+
+    let start = std::time::Instant::now();
+    while start.elapsed() < timeout {
+        if TcpStream::connect_timeout(&address, Duration::from_millis(200)).is_ok() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+    false
 }
 
 fn manifest_service_recovery_reason(
