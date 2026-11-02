@@ -4443,7 +4443,7 @@ mod tests {
         // two installations and fire on the most common install we ship. (A
         // fixture nesting `_rocm_sdk_core` under the root, the shape the
         // installer never produces, would pass by construction without
-        // proving that -- this one matches `apps/rocm/src/therock.rs`'s
+        // proving that -- this one matches `apps/rocm/src/therock/probe.rs`'s
         // `ROCM_SDK_PROBE_SCRIPT` instead.)
         let mut e = linux_base();
         let root = "/data/runtimes/therock/_rocm_sdk_devel";
