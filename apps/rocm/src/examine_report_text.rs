@@ -98,14 +98,14 @@
 //! The cluster's regression tests live in this module's own `mod tests`,
 //! reaching the shared `test_paths` fixture through `crate::tests::` and
 //! `write_test_pip_runtime` through `crate::test_support::`, the same way
-//! other mechanically relocated modules do. Four tests interleaved among
+//! other mechanically relocated modules do. Two tests interleaved among
 //! this cluster's tests in `main.rs`'s old shared `mod tests` stayed behind
 //! because their primary subject is unrelated: `missing_packaged_engine_reason`'s
-//! own test (`missing_packaged_engine_reason_has_no_deferred_first_party_engines`),
-//! two CLI-lifecycle-audit-log tests
-//! (`record_cli_audit_event_writes_cli_lifecycle_record`,
-//! `cli_lifecycle_log_sanitizes_components_and_newlines`), and the
-//! whole-command-tree ASCII-help walk (`every_help_text_in_the_command_tree_is_ascii`).
+//! own test (`missing_packaged_engine_reason_has_no_deferred_first_party_engines`)
+//! and the whole-command-tree ASCII-help walk
+//! (`every_help_text_in_the_command_tree_is_ascii`). Two further such tests, for
+//! the CLI audit/lifecycle log, stayed there when this module was split out and
+//! have since moved to `cli_audit.rs`.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;

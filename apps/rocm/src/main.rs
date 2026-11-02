@@ -13,6 +13,7 @@ mod automations;
 mod bootstrap;
 mod chat;
 mod chat_host_facts;
+mod cli_audit;
 mod cli_progress;
 mod cli_report;
 mod comfyui;
@@ -84,7 +85,11 @@ mod update_cmd;
 // their only caller outside `dispatch()`, `restart_internal_managed_service`
 // (and the endpoint-key check inside it), moved out to `services_text.rs` in
 // ROCMAI-209 (Phase 6f), reaching them via its own imports instead.
+// `record_cli_audit_event`, `cli_lifecycle_log_path` and `sanitize_log_value`
+// (from `cli_audit.rs`) are re-imported so other modules keep reaching them as
+// `crate::<name>`; `main.rs` itself calls `record_cli_audit_event`.
 use crate::automations::{automations, render_daemon_text};
+use crate::cli_audit::{cli_lifecycle_log_path, record_cli_audit_event, sanitize_log_value};
 use crate::driver_install::{install_driver, reconcile_driver_install};
 use crate::engine_ipc::{run_builtin_engine_serve_http, run_builtin_engine_stdio};
 use crate::engine_runtime_select::{daemon_run_argv, parse_engine_recipe_json_arg};
@@ -137,11 +142,11 @@ use rocm_core::model_readiness::{
     AcceleratorMemory, HostEngineChoice, HostFacts, ModelCatalogSource, ModelReadiness,
 };
 use rocm_core::{
-    AppPaths, AuditEventRecord, AutomationRuntimeState, CodexBridgeEngine, CodexBridgeGpuSnapshot,
+    AppPaths, AutomationRuntimeState, CodexBridgeEngine, CodexBridgeGpuSnapshot,
     CodexBridgeSnapshot, DEFAULT_LOCAL_HOST, EndpointReadiness, ExamineSummary,
     ManagedServiceRecord, ModelRecipeRecord, PERMISSIONS_MODE_ASK, PERMISSIONS_MODE_FULL_ACCESS,
-    RocmCliConfig, TELEMETRY_MODE_LOCAL, TELEMETRY_MODE_OFF, WatcherMode, append_audit_event,
-    daemon_binary_path, default_engine_for_platform, detect_host_gpu_summary, interactive_terminal,
+    RocmCliConfig, TELEMETRY_MODE_LOCAL, TELEMETRY_MODE_OFF, WatcherMode, daemon_binary_path,
+    default_engine_for_platform, detect_host_gpu_summary, interactive_terminal,
     load_model_recipe_registry, load_recent_automation_events, process_is_running, uv_cache_source,
 };
 use rocm_engine_protocol::{DEFAULT_LOG_TAIL_LINES, DevicePolicy, GpuSelection};
@@ -3341,111 +3346,6 @@ fn fix(
         return Err(FixExitCode(code).into());
     }
     Ok(())
-}
-
-pub(crate) fn record_cli_audit_event(
-    paths: &AppPaths,
-    category: &str,
-    action: &str,
-    level: &str,
-    message: impl Into<String>,
-    service_id: Option<&str>,
-) {
-    let event = AuditEventRecord {
-        at_unix_ms: rocm_core::unix_time_millis(),
-        source: "rocm".to_owned(),
-        category: category.to_owned(),
-        actor: "cli".to_owned(),
-        level: level.to_owned(),
-        action: action.to_owned(),
-        message: message.into(),
-        watcher_id: None,
-        service_id: service_id.map(str::to_owned),
-    };
-    if let Err(error) = append_audit_event(paths, &event) {
-        eprintln!("warning: failed to write audit event: {error}");
-    }
-    if let Err(error) = append_cli_lifecycle_logs(paths, &event) {
-        eprintln!("warning: failed to write CLI lifecycle log: {error}");
-    }
-}
-
-fn append_cli_lifecycle_logs(paths: &AppPaths, event: &AuditEventRecord) -> Result<()> {
-    paths.ensure()?;
-    let line = render_cli_lifecycle_log_line(event);
-    append_text_log_line(&cli_lifecycle_log_path(paths), &line)?;
-    append_text_log_line(
-        &cli_action_log_path(paths, &event.category, &event.action),
-        &line,
-    )?;
-    Ok(())
-}
-
-fn render_cli_lifecycle_log_line(event: &AuditEventRecord) -> String {
-    format!(
-        "{} level={} category={} action={} service_id={} message={}\n",
-        event.at_unix_ms,
-        sanitize_log_value(&event.level),
-        sanitize_log_value(&event.category),
-        sanitize_log_value(&event.action),
-        event.service_id.as_deref().unwrap_or("<none>"),
-        sanitize_log_value(&event.message)
-    )
-}
-
-fn append_text_log_line(path: &Path, line: &str) -> Result<()> {
-    let parent = path.parent().context("log path has no parent directory")?;
-    fs::create_dir_all(parent)?;
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .with_context(|| format!("failed to open {}", path.display()))?;
-    file.write_all(line.as_bytes())
-        .with_context(|| format!("failed to write {}", path.display()))?;
-    Ok(())
-}
-
-fn cli_lifecycle_log_path(paths: &AppPaths) -> PathBuf {
-    paths.data_dir.join("logs").join("cli-lifecycle.log")
-}
-
-fn cli_action_log_path(paths: &AppPaths, category: &str, action: &str) -> PathBuf {
-    paths.data_dir.join("logs").join("cli").join(format!(
-        "{}-{}.log",
-        sanitize_log_component(category),
-        sanitize_log_component(action)
-    ))
-}
-
-fn sanitize_log_component(value: &str) -> String {
-    let component = value
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
-                ch.to_ascii_lowercase()
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>()
-        .trim_matches('-')
-        .to_owned();
-    if component.is_empty() {
-        "unknown".to_owned()
-    } else {
-        component
-    }
-}
-
-fn sanitize_log_value(value: &str) -> String {
-    value
-        .chars()
-        .map(|ch| match ch {
-            '\r' | '\n' | '\t' => ' ',
-            _ => ch,
-        })
-        .collect::<String>()
 }
 
 fn therock_install_version_selector(
@@ -8573,66 +8473,6 @@ pub(crate) mod tests {
     fn missing_packaged_engine_reason_has_no_deferred_first_party_engines() {
         assert!(missing_packaged_engine_reason("lemonade").is_none());
         assert!(missing_packaged_engine_reason("vllm").is_none());
-    }
-
-    #[test]
-    fn record_cli_audit_event_writes_cli_lifecycle_record() -> Result<()> {
-        let (root, paths) = test_paths("cli-audit");
-
-        record_cli_audit_event(
-            &paths,
-            "runtime",
-            "runtime_activate",
-            "info",
-            "activated test runtime",
-            None,
-        );
-
-        let events = rocm_core::load_recent_audit_events(&paths, 1)?;
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].source, "rocm");
-        assert_eq!(events[0].actor, "cli");
-        assert_eq!(events[0].category, "runtime");
-        assert_eq!(events[0].action, "runtime_activate");
-        assert_eq!(events[0].message, "activated test runtime");
-        let lifecycle_log = fs::read_to_string(cli_lifecycle_log_path(&paths))?;
-        assert!(lifecycle_log.contains("category=runtime"));
-        assert!(lifecycle_log.contains("action=runtime_activate"));
-        assert!(lifecycle_log.contains("message=activated test runtime"));
-        let action_log =
-            fs::read_to_string(cli_action_log_path(&paths, "runtime", "runtime_activate"))?;
-        assert_eq!(lifecycle_log, action_log);
-
-        let _ = fs::remove_dir_all(root);
-        Ok(())
-    }
-
-    #[test]
-    fn cli_lifecycle_log_sanitizes_components_and_newlines() -> Result<()> {
-        let (root, paths) = test_paths("cli-lifecycle-sanitize");
-        let event = AuditEventRecord {
-            at_unix_ms: 42,
-            source: "rocm".to_owned(),
-            category: "Run Time".to_owned(),
-            actor: "cli".to_owned(),
-            level: "info".to_owned(),
-            action: "install/sdk".to_owned(),
-            message: "line one\nline two".to_owned(),
-            watcher_id: None,
-            service_id: Some("svc-1".to_owned()),
-        };
-
-        append_cli_lifecycle_logs(&paths, &event)?;
-
-        let line = fs::read_to_string(cli_lifecycle_log_path(&paths))?;
-        assert!(line.contains("service_id=svc-1"));
-        assert!(line.contains("message=line one line two"));
-        assert!(
-            cli_action_log_path(&paths, "Run Time", "install/sdk")
-                .ends_with("run-time-install-sdk.log")
-        );
-        let _ = fs::remove_dir_all(root);
-        Ok(())
     }
 
     /// ROCMAI-543: the clap doc comments are the largest single surface of
