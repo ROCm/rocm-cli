@@ -4248,21 +4248,32 @@ fi
     }
 
     /// Every job in `ci.yml` as `(id, block)`, in file order. Unlike [`job_block`]
-    /// it tolerates a trailing comment on the id line.
+    /// it tolerates a trailing comment on the id line. The comment block and
+    /// blank lines between two jobs describe the job that follows, so they are
+    /// dropped rather than left on the end of the job before it.
     fn ci_jobs(ci: &str) -> Vec<(String, String)> {
         let mut jobs: Vec<(String, String)> = Vec::new();
+        let mut between = String::new();
         for line in top_level_block(ci, "jobs").lines() {
+            let job_level_comment = indent_of(line) == 2 && line.trim_start().starts_with('#');
+            if line.trim().is_empty() || job_level_comment {
+                between.push_str(line);
+                between.push('\n');
+                continue;
+            }
             if indent_of(line) == 2
-                && !line.trim_start().starts_with('#')
                 && let Some(id) = strip_comment(line).trim().strip_suffix(':')
             {
+                between.clear();
                 jobs.push((id.to_owned(), String::new()));
                 continue;
             }
             if let Some((_, block)) = jobs.last_mut() {
+                block.push_str(&between);
                 block.push_str(line);
                 block.push('\n');
             }
+            between.clear();
         }
         jobs
     }
@@ -4272,6 +4283,39 @@ fi
             .into_iter()
             .find_map(|(job, block)| (job == id).then_some(block))
             .unwrap_or_else(|| panic!("ci.yml defines job `{id}`"))
+    }
+
+    /// A comment above a job describes the job that follows, not the one before
+    /// it, so it is left out of the previous job's block (as [`job_block`] does)
+    /// instead of being read as that job's own content. Comments nested inside a
+    /// job stay, including one that is the last line of its block.
+    #[test]
+    fn ci_jobs_drops_the_comment_between_jobs_instead_of_keeping_it_on_the_job_before() {
+        let ci = "name: x\n\
+                  jobs:\n\
+                  \x20 first:\n\
+                  \x20   runs-on: ubuntu-latest\n\
+                  \x20   steps:\n\
+                  \x20     - run: a\n\
+                  \n\
+                  \x20     # inside first\n\
+                  \x20     - run: b\n\
+                  \n\
+                  \x20     # last of first\n\
+                  \n\
+                  \x20 # About second: mentions always() and continue-on-error.\n\
+                  \x20 #\n\
+                  \x20 second: # trailing\n\
+                  \x20   runs-on: windows-latest\n";
+        let jobs = ci_jobs(ci);
+        let ids: Vec<&str> = jobs.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, ["first", "second"]);
+        assert_eq!(
+            jobs[0].1,
+            "    runs-on: ubuntu-latest\n    steps:\n      - run: a\n\n      # inside first\n      - run: b\n\n      # last of first\n",
+            "first keeps its own comments and blank line and nothing from second"
+        );
+        assert_eq!(jobs[1].1, "    runs-on: windows-latest\n");
     }
 
     /// Jobs that are NOT part of the Windows build-and-test lane even though they
