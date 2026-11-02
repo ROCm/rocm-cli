@@ -21,6 +21,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 mod backend_alignment;
 mod direct_llama;
 mod install;
+mod llamacpp_backend;
 mod process;
 mod runtime_dir;
 mod state;
@@ -356,7 +357,7 @@ fn install_response(request: InstallRequest) -> Result<InstallResponse> {
     // and exercising it must not download or alter a runtime on the test host.
     #[cfg(feature = "e2e-test-hooks")]
     if std::env::var_os(BACKEND_INSTALL_FAILURE_TEST_ENV).is_some() {
-        crate::backend_alignment::install_llamacpp_backend_with_retry(|| {
+        crate::llamacpp_backend::install_llamacpp_backend_with_retry(|| {
             bail!("scripted Lemonade backend install failure")
         })?;
     }
@@ -566,7 +567,7 @@ fn serve_http(mut request: ServeHttpRequest) -> Result<()> {
         &process_env,
     )
     .context("Lemonade server did not become ready")?;
-    let backend = crate::backend_alignment::ensure_best_llamacpp_backend(
+    let backend = crate::llamacpp_backend::ensure_best_llamacpp_backend(
         &mut runtime.manifest,
         &request.host,
         request.port,

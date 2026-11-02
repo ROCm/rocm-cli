@@ -11,7 +11,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::time::Duration;
 
-use crate::backend_alignment::ROCM_LLAMACPP_BACKEND_DIRS;
 use crate::install::{LemonadeInstallManifest, LemonadeRuntime, platform_binary_name};
 use crate::process::{
     LemonadeProcessEnvironment, apply_lemonade_process_environment, hide_child_console_window,
@@ -490,32 +489,8 @@ pub(crate) fn find_llama_server_binary(manifest: &LemonadeInstallManifest) -> Op
         .find_map(|backend| find_binary_in(&llamacpp_dir.join(backend), &binary))
 }
 
-/// Like [`find_llama_server_binary`], but scoped to the single backend Lemonade
-/// actually attempted (`manifest.backend_name`, one of `LLAMACPP_BACKEND_PRIORITY`'s
-/// `"rocm"` / `"vulkan"`), rather than scanning every known backend directory in
-/// priority order. Lemonade reports the generic `"rocm"` — never the more specific
-/// `rocm-stable`/`rocm-nightly` — but may extract the actual build into either
-/// versioned directory, so `"rocm"` maps to the whole ROCm family; `"vulkan"` never
-/// does. This is what lets alignment verification reject a stale ROCm directory left
-/// by an earlier attempt when this round actually picked `vulkan` (or the reverse).
-pub(crate) fn find_llama_server_binary_for_backend(
-    manifest: &LemonadeInstallManifest,
-    backend_name: &str,
-) -> Option<PathBuf> {
-    let llamacpp_dir = manifest.runtime_dir.join("bin").join("llamacpp");
-    let binary = platform_binary_name("llama-server");
-    let family: &[&str] = if backend_name == ROCM_BACKEND_NAME {
-        &ROCM_LLAMACPP_BACKEND_DIRS
-    } else {
-        &["vulkan"]
-    };
-    family
-        .iter()
-        .find_map(|backend| find_binary_in(&llamacpp_dir.join(backend), &binary))
-}
-
 /// Look for `binary` directly in `dir`, then one level down in each subdirectory.
-fn find_binary_in(dir: &Path, binary: &str) -> Option<PathBuf> {
+pub(crate) fn find_binary_in(dir: &Path, binary: &str) -> Option<PathBuf> {
     let direct = dir.join(binary);
     if direct.is_file() {
         return Some(direct);
@@ -928,62 +903,6 @@ mod tests {
             backend_name: ROCM_BACKEND_NAME.to_owned(),
             installed_at_unix_ms: 0,
         }
-    }
-
-    #[test]
-    fn find_llama_server_binary_for_backend_scopes_to_rocm_family() {
-        let dir = scratch_dir("find-server-scoped-rocm");
-        let runtime_dir = dir.join("runtime");
-        let llamacpp = runtime_dir.join("bin").join("llamacpp");
-        let server = platform_binary_name("llama-server");
-        // A stale vulkan install from an earlier attempt must never satisfy a "rocm"
-        // scoped lookup.
-        let vulkan_dir = llamacpp.join("vulkan");
-        fs::create_dir_all(&vulkan_dir).unwrap();
-        fs::write(vulkan_dir.join(&server), b"x").unwrap();
-        let manifest = test_manifest(runtime_dir);
-        assert_eq!(
-            find_llama_server_binary_for_backend(&manifest, ROCM_BACKEND_NAME),
-            None
-        );
-
-        // Any directory in the ROCm family satisfies it, matching the unscoped scan's
-        // priority order.
-        let nightly_dir = llamacpp.join("rocm-nightly");
-        fs::create_dir_all(&nightly_dir).unwrap();
-        fs::write(nightly_dir.join(&server), b"x").unwrap();
-        assert_eq!(
-            find_llama_server_binary_for_backend(&manifest, ROCM_BACKEND_NAME),
-            Some(nightly_dir.join(&server))
-        );
-        fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn find_llama_server_binary_for_backend_scopes_to_vulkan_only() {
-        let dir = scratch_dir("find-server-scoped-vulkan");
-        let runtime_dir = dir.join("runtime");
-        let llamacpp = runtime_dir.join("bin").join("llamacpp");
-        let server = platform_binary_name("llama-server");
-        // A stale rocm-stable install from an earlier attempt must never satisfy a
-        // "vulkan" scoped lookup, even though it would win the unscoped priority scan.
-        let rocm_dir = llamacpp.join("rocm-stable");
-        fs::create_dir_all(&rocm_dir).unwrap();
-        fs::write(rocm_dir.join(&server), b"x").unwrap();
-        let manifest = test_manifest(runtime_dir);
-        assert_eq!(
-            find_llama_server_binary_for_backend(&manifest, "vulkan"),
-            None
-        );
-
-        let vulkan_dir = llamacpp.join("vulkan");
-        fs::create_dir_all(&vulkan_dir).unwrap();
-        fs::write(vulkan_dir.join(&server), b"x").unwrap();
-        assert_eq!(
-            find_llama_server_binary_for_backend(&manifest, "vulkan"),
-            Some(vulkan_dir.join(&server))
-        );
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

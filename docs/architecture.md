@@ -225,9 +225,10 @@ These modules are private `mod` declarations — [`lib.rs`](../crates/e2e-report
 
 `engines/lemonade` follows the same pattern:
 
-- [`backend_alignment.rs`](../engines/lemonade/src/backend_alignment.rs) — ROCm-SDK-to-llama.cpp-backend Tier 1/Tier 2/revert alignment and backend discovery/install/selection.
+- [`backend_alignment.rs`](../engines/lemonade/src/backend_alignment.rs) — ROCm-SDK-to-llama.cpp-backend Tier 1/Tier 2/revert alignment, including the `backend_versions.json` pin handling and the set-aside/restore of ROCm backend directories around a forced reinstall. It uses `llamacpp_backend.rs`; that module does not import it back.
 - [`direct_llama.rs`](../engines/lemonade/src/direct_llama.rs) — Hugging Face checkpoint/GGUF resolution and the direct-llama-server serve path (`serve_direct_llama_server`, which runs a packaged `llama-server` on a GGUF and waits for `/v1/models` to report the model). It imports `process.rs`; `process.rs` no longer imports it.
 - [`install.rs`](../engines/lemonade/src/install.rs) — embeddable-runtime archive download/verify/extract, cache locking, and manifest persistence, plus the `LemonadeRuntime` handle and `resolve_runtime`, which wrap the persisted manifest (a leaf here, so `state.rs`, `process.rs` and `direct_llama.rs` reach it without importing `backend_alignment.rs`).
+- [`llamacpp_backend.rs`](../engines/lemonade/src/llamacpp_backend.rs) — llama.cpp backend discovery and selection: asking `lemonade backends` what the host supports, choosing the best GPU backend (`rocm` before `vulkan`, never `cpu`), installing it with one retry, the `ROCM_LLAMACPP_BACKEND_DIRS` name list, and `find_llama_server_binary_for_backend`. It imports `direct_llama.rs` for `find_binary_in`; `direct_llama.rs` does not import it. With this module the engine's modules form no import cycle.
 - [`process.rs`](../engines/lemonade/src/process.rs) — `lemond` spawn, env/path setup, and readiness/health polling. The direct `llama-server` serve loop is in `direct_llama.rs`.
 - [`runtime_dir.rs`](../engines/lemonade/src/runtime_dir.rs) — `XDG_RUNTIME_DIR` tier1/2/3 hardening for the spawned child.
 - [`state.rs`](../engines/lemonade/src/state.rs) — service state file I/O, device-policy/GPU-selection parsing, and port/endpoint helpers.
