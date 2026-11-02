@@ -19,8 +19,11 @@ use std::path::PathBuf;
 
 mod install;
 mod process;
+mod repair;
 mod runtime;
+mod startup_diagnostics;
 mod state;
+mod wheel_builds;
 
 pub(crate) const ENGINE_NAME: &str = "vllm";
 
@@ -32,7 +35,7 @@ pub(crate) const ENGINE_NAME: &str = "vllm";
 /// SDK pins the same build instead of keeping a second copy. `None` means no
 /// build has been verified for that line, not that none works.
 pub fn verified_torchaudio_release(rocm_sdk_version: &str) -> Option<&'static str> {
-    install::verified_torchaudio_release(rocm_sdk_version)
+    wheel_builds::verified_torchaudio_release(rocm_sdk_version)
 }
 
 pub(crate) const DEFAULT_HOST: &str = "127.0.0.1";

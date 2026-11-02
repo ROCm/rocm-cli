@@ -1332,12 +1332,11 @@ jobs:
   # into a renamed file is not cosmetic here, because the agent follows it,
   # finds nothing, and improvises.
   #
-  # `routing` and `behavioral` are deliberately NOT run: both need an
-  # authenticated `claude` CLI and an ANTHROPIC_API_KEY, and this repo has no
-  # such secret. Turning them on is a caller change to skillscope's
-  # `skill-evals.yml` reusable workflow once one exists — they are the half of
-  # the question that asks whether the skill actually fires, so this job is not
-  # a substitute for them.
+  # `routing` and `behavioral` are deliberately NOT run here: they make paid
+  # model calls and need a credential this repo does not hold. amd/skills
+  # grades this skill instead (docs/skill-quality.md says what that covers).
+  # They are the half of the question that asks whether the skill actually
+  # fires, so this job is not a substitute for them.
   #
   # skills/rocm-cli-assistant/ is deliberately out of scope. Despite its path it
   # is not a published skill: apps/rocm/src/main.rs embeds it verbatim into the

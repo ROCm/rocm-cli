@@ -14,12 +14,13 @@
 //! guard skips the spawn. Contracts verified against the running Linux binary
 //! (EAI-8072). Scoped to the enable/disable/mode slice, the proposal-history
 //! listing's unit formatting, the bare listing's tolerance of a torn
-//! audit-log tail, and the size cap on the audit log and compaction of the
+//! audit-log tail, the repair of one by the next audited command, and the
+//! size cap on the audit log and compaction of the
 //! proposal history (ROCMAI-729); the watcher/daemon trigger behaviour itself
 //! is covered separately.
 //!
 //! Two slices live here. The enable/disable/mode steps act on a watcher id the
-//! test already knows. The listing steps (scenario 10) assert the complementary
+//! test already knows. The listing steps (scenario 11) assert the complementary
 //! discoverability contract: everything the listing shows a user must also be
 //! able to act on, so they derive each check's identifier FROM the listing rather
 //! than knowing it in advance — hard-coding the real ids would keep passing
@@ -29,7 +30,7 @@ use cucumber::{given, then, when};
 use rocm_core::{
     AuditEventRecord, AutomationProposalRecord, EVENT_LOG_ROTATE_BYTES,
     EVENT_LOG_ROTATED_GENERATIONS, REVIEWED_PROPOSALS_RETAINED, append_automation_proposal,
-    load_automation_proposals,
+    jsonl_lock_path, load_automation_proposals,
 };
 
 use crate::E2eWorld;
@@ -292,6 +293,95 @@ async fn torn_audit_tail(world: &mut E2eWorld) {
         format!("{clean_line}\n{torn_fragment}"),
     )
     .expect("failed to seed a torn audit-event tail");
+}
+
+/// Make the audit log's directory refuse new files while the log inside it
+/// stays writable, so the repair of a torn tail cannot write the clean copy it
+/// renames into place — the failure a full disk causes, without filling one.
+///
+/// The CLI's lock file for the log is created first: it is reused when it
+/// exists but cannot be created in a directory that takes no new files. Fails
+/// if the directory still takes new files afterwards: directory permissions do
+/// not bind root, and the scenario's `@requires-dir-permissions` tag skips it
+/// there, so this is the backstop that keeps it from passing without
+/// exercising the fallback should the tag be dropped.
+/// [`restore_audit_dir_permissions`] undoes it so the scenario's temp root can
+/// be removed.
+#[given("the audit log's directory takes no new files")]
+async fn audit_dir_takes_no_new_files(world: &mut E2eWorld) {
+    let paths = world.app_paths();
+    let dir = paths.audit_dir();
+    std::fs::File::create(jsonl_lock_path(&paths.audit_events_path()))
+        .expect("failed to create the lock file");
+    forbid_new_files(&dir);
+    let probe = dir.join("probe");
+    if std::fs::File::create(&probe).is_ok() {
+        let _ = std::fs::remove_file(&probe);
+        panic!(
+            "{} still takes new files, so this scenario cannot make the audit log's \
+             replacement fail: directory permissions do not bind this user (root?)",
+            dir.display()
+        );
+    }
+}
+
+#[cfg(unix)]
+fn forbid_new_files(dir: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o555))
+        .expect("failed to make the audit directory read-only");
+}
+
+#[cfg(not(unix))]
+// Platform stub for a `@requires-os:linux` scenario. The Unix arm does I/O and
+// cannot be `const`, so making only this arm `const` would give the two
+// platforms different signatures.
+#[allow(clippy::missing_const_for_fn)]
+fn forbid_new_files(_dir: &std::path::Path) {
+    panic!("this step needs Unix directory permissions; its scenario is @requires-os:linux");
+}
+
+/// Undo [`audit_dir_takes_no_new_files`] on `dir`, best effort, from the
+/// world's teardown.
+#[cfg(unix)]
+pub(crate) fn restore_audit_dir_permissions(dir: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if dir.is_dir() {
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755));
+    }
+}
+
+#[then("the CLI prints no warning about the audit log")]
+async fn no_audit_warning(world: &mut E2eWorld) {
+    let stderr = world.cli_stderr.clone().unwrap_or_default();
+    assert!(
+        !stderr.to_lowercase().contains("audit"),
+        "expected no audit-log warning, got stderr:\n{stderr}"
+    );
+}
+
+#[then(
+    "the audit log keeps its earlier record, drops the torn line and records the permissions change"
+)]
+async fn audit_log_repaired_and_appended(world: &mut E2eWorld) {
+    let path = world.app_paths().audit_events_path();
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+    // `audit_records` parses every line, so a left-over torn fragment fails here.
+    let records = audit_records(&path);
+    let seen: Vec<(&str, &str)> = records
+        .iter()
+        .map(|record| (record.message.as_str(), record.action.as_str()))
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            ("clean", "append"),
+            ("permissions mode set to ask", "set_mode")
+        ],
+        "unexpected audit log:\n{text}"
+    );
+    assert!(text.ends_with('\n'), "the last record must be terminated");
 }
 
 #[given("an enabled automation watcher")]

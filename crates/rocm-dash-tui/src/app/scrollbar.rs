@@ -147,7 +147,7 @@ pub(crate) fn resolve_mouse(me: MouseEvent, state: &AppState) -> KeyAction {
         // the time this check runs it has reduced to `has_open_overlay()`;
         // written via `overlay_or_approval()` anyway so this can't silently
         // drift from the manager-overlay swallow it mirrors (see the
-        // analogous check in ui/mod.rs's footer-chip gating).
+        // analogous check in ui/footer.rs's footer-chip gating).
         if state.overlay_or_approval() {
             return KeyAction::Nothing;
         }
@@ -1000,7 +1000,7 @@ mod tests {
     #[test]
     fn instance_detail_scrollbar_click_grabs_drag_scrolls_then_releases() {
         // Mirrors `scrollbar_click_grabs_drag_scrolls_then_releases` for the
-        // instance Detail modal's scrollbar (`instances.rs::render_body`
+        // instance Detail modal's scrollbar (`instance_detail.rs::render_body`
         // registers one for each of its two panes) — proves the
         // `ScrollTarget::InstanceDetail` wiring added for mouse-drag support
         // actually moves `instance_detail_scroll`, not just that the bar
