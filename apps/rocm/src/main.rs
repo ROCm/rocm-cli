@@ -45,6 +45,7 @@ mod model_fit;
 mod provider_keys;
 mod providers;
 mod remote;
+mod runtime_adopt;
 mod runtime_install_finalize;
 mod runtime_registry;
 mod runtime_services;

@@ -10,11 +10,13 @@
 //! This is a crate-level module that depends on neither `therock` (which writes
 //! manifests when it installs a runtime) nor `runtimes_cmd` (which lists and
 //! activates them); both build on it. `runtimes_cmd` re-exports the selection
-//! and path-helper names that other modules import from it, but it still
-//! reaches the manifest model (the manifest and probe types and the loaders)
-//! through `therock`'s re-exports, along with a few `therock` helpers. So
-//! `runtimes_cmd` depends on `therock`, while `therock` no longer depends on
-//! `runtimes_cmd` in production code. The serde shape of
+//! and path-helper names that other modules import from it, but it and
+//! `runtime_adopt` still reach the manifest model (the manifest and probe types
+//! and the loaders) through `therock`'s re-exports, along with a few `therock`
+//! helpers. So `runtimes_cmd` depends on `therock`, while `therock` no longer
+//! depends on `runtimes_cmd` in production code. It also holds
+//! `paths_equivalent` and `normalize_path_for_compare`, which adopt and
+//! uninstall both need. The serde shape of
 //! [`InstalledRuntimeManifest`] and its probe structs is the on-disk contract of
 //! the registry files and of each install's `.rocm-cli-runtime.json`.
 
@@ -640,6 +642,22 @@ fn runtime_install_root_has_payload(path: &Path) -> Result<bool> {
         }
     }
     Ok(false)
+}
+
+pub(crate) fn paths_equivalent(left: &Path, right: &Path) -> bool {
+    let left = normalize_path_for_compare(left);
+    let right = normalize_path_for_compare(right);
+    rocm_core::runtime_paths_equivalent(&left, &right)
+}
+
+pub(crate) fn normalize_path_for_compare(path: &Path) -> PathBuf {
+    if let Ok(canonical) = path.canonicalize() {
+        return canonical;
+    }
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    std::env::current_dir().map_or_else(|_| path.to_path_buf(), |cwd| cwd.join(path))
 }
 
 #[cfg(test)]
