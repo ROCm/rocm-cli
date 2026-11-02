@@ -4412,8 +4412,9 @@ fi
         vars[0].to_owned()
     }
 
-    /// The aggregator tests lean on these three helpers, so a weakened helper must
-    /// not be able to hide a break in `ci.yml`.
+    // The next five tests cover `code_only` (used by the share-setup and
+    // gating-step tests), `aggregator_step` and `aggregator_var` (used by the
+    // aggregator tests), so that weakening one cannot hide a break in `ci.yml`.
     #[test]
     fn code_only_drops_a_command_that_only_a_comment_mentions() {
         let step =
@@ -4421,6 +4422,7 @@ fi
         let code = code_only(step);
         assert!(!code.contains("cargo xtask e2e"), "{code}");
         assert!(code.contains("echo hi"), "{code}");
+        assert_eq!(code.lines().count(), 3, "one output line per input line");
     }
 
     #[test]
@@ -4433,7 +4435,8 @@ fi
 
     #[test]
     fn aggregator_var_finds_the_one_variable_bound_to_an_expression() {
-        let step = "      - name: s\n        env:\n          A: ${{ needs.x.result }}\n          B: ${{ needs.y.result }}\n        run: true\n";
+        // `C` is a decoy whose value merely contains the expression.
+        let step = "      - name: s\n        env:\n          A: ${{ needs.x.result }}\n          B: ${{ needs.y.result }}\n          C: ${{ needs.y.result }} == 'x'\n        run: true\n";
         assert_eq!(aggregator_var(step, "${{ needs.y.result }}"), "B");
     }
 
@@ -4754,9 +4757,13 @@ fi
     /// and never an extra `||`), and set no `continue-on-error`.
     ///
     /// What this does NOT check: the command is matched as a substring, so a flag
-    /// or a trailing `|| true` added to it passes, and the `NOT_GATING` steps are
-    /// exempt by name with their content unchecked. It catches a step being
-    /// dropped, renamed, moved to the other job, skipped or made advisory.
+    /// or a trailing `|| true` added to it passes; the `NOT_GATING` steps are
+    /// exempt by name with their content unchecked; and the two unnamed actions
+    /// that open each job are checked only for their `uses:` prefix, for having
+    /// no key beyond `uses`, `with` and `if`, and for an `if` that is absent or the
+    /// `heavy` gate. It catches a step being dropped, renamed,
+    /// moved to the other job, skipped, or made advisory with `continue-on-error`,
+    /// and a new step appearing that is in neither list.
     #[test]
     fn ci_windows_jobs_keep_every_gating_step_enabled() {
         const HEAVY: &str = "needs.changes.outputs.heavy == 'true'";
@@ -4934,18 +4941,26 @@ fi
 
         // A step added to either job later is not pinned by the table above, so
         // every step must be either in it or in `NOT_GATING`. An unnamed step must
-        // be one of the two actions that open each job (kept identical across the
-        // two jobs by `ci_windows_jobs_share_one_cache_and_toolchain_setup`).
+        // `use` one of the two actions that open each job, with no key beyond
+        // `uses`, `with` and an `if:` that is absent or the `heavy` gate. Which
+        // commit they pin and what `with` passes are not checked here;
+        // `ci_windows_jobs_share_one_cache_and_toolchain_setup` only keeps the two
+        // jobs identical to each other.
         for job in ["windows-debug", "windows-release"] {
             let steps = job_steps(&ci_job(&ci, job)).unwrap_or_else(|| panic!("{job} has steps"));
             for (name, step) in &steps {
                 let accounted_for = if name.is_empty() {
+                    let uses = step_key(step, "uses");
                     [
                         "actions/checkout@",
                         "actions-rust-lang/setup-rust-toolchain@",
                     ]
                     .iter()
-                    .any(|action| step.contains(action))
+                    .any(|action| uses.starts_with(action))
+                        && step_keys(step)
+                            .iter()
+                            .all(|key| matches!(key.as_str(), "uses" | "with" | "if"))
+                        && matches!(step_key(step, "if").as_str(), "" | HEAVY)
                 } else {
                     NOT_GATING.contains(&name.as_str())
                         || GATING.iter().any(|&(j, n, ..)| j == job && n == name)
