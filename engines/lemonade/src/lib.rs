@@ -18,6 +18,7 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+mod archive_cache;
 mod archive_extract;
 /// Shared archive generator and filesystem oracle for the extraction property
 /// tests in `archive_extract` and `install`.
