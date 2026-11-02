@@ -1000,7 +1000,7 @@ mod tests {
     #[test]
     fn instance_detail_scrollbar_click_grabs_drag_scrolls_then_releases() {
         // Mirrors `scrollbar_click_grabs_drag_scrolls_then_releases` for the
-        // instance Detail modal's scrollbar (`instances.rs::render_body`
+        // instance Detail modal's scrollbar (`instance_detail.rs::render_body`
         // registers one for each of its two panes) — proves the
         // `ScrollTarget::InstanceDetail` wiring added for mouse-drag support
         // actually moves `instance_detail_scroll`, not just that the bar

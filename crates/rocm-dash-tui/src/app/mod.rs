@@ -128,7 +128,7 @@ pub struct AppState {
     /// (launch args / env vars panes). Reset when the modal opens.
     pub instance_detail_scroll: u16,
     /// Last-measured upper bound for `instance_detail_scroll`, written back
-    /// by the renderer each frame (see `ui::tabs::instances::draw_detail`),
+    /// by the renderer each frame (see `ui::instance_detail::draw_detail`),
     /// mirroring `chat_max_scroll`.
     pub instance_detail_max_scroll: u16,
     /// Vertical scroll offset (first visible line) of the active job console.

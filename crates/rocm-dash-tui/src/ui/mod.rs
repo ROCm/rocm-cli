@@ -20,6 +20,7 @@ pub mod gradient;
 mod header;
 pub mod heatmap;
 pub mod install_manager;
+mod instance_detail;
 pub mod instance_list;
 pub mod job_console;
 pub mod launcher;
@@ -135,7 +136,7 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
         // detail (the selectable list on that surface).
         Modal::Detail => {
             if state.active_tab == ActiveTab::Observe {
-                let max_scroll = tabs::instances::draw_detail(f, body, state, &theme);
+                let max_scroll = instance_detail::draw_detail(f, body, state, &theme);
                 state.instance_detail_max_scroll = max_scroll;
             }
         }
