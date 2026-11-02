@@ -27,8 +27,8 @@ use super::{
     InstalledRuntimeManifest, RuntimeFreshness, VersionOrderKey, VersionStage,
     compare_version_strings, parse_host_version, parse_version, parse_version_for_ordering,
     runtime_freshness, select_rocm_version, select_startup_update_manifest,
-    sort_manifests_newest_install_first,
 };
+use crate::runtime_registry::sort_manifests_newest_install_first;
 use crate::storage::{RetentionInputs, select_runtimes_to_remove};
 
 // ---------------------------------------------------------------------------

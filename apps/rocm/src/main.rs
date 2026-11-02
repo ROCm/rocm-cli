@@ -36,6 +36,7 @@ mod provider_keys;
 mod providers;
 mod remote;
 mod runtime_install_finalize;
+mod runtime_registry;
 mod runtime_services;
 mod runtimes_cmd;
 mod serve_cmd;
