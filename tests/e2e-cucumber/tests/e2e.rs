@@ -35,6 +35,7 @@ mod e2e {
     pub mod lifecycle_steps;
     pub mod logs_steps;
     pub mod model_catalog_steps;
+    pub mod planner_steps;
     pub mod remote_steps;
     pub mod runtime_lifecycle_steps;
     pub mod runtime_steps;
@@ -164,6 +165,17 @@ pub struct E2eWorld {
     /// launch step knows to pass `--chat-mock` (deterministic offline agent, no
     /// endpoint detection) instead of driving the real detection/consent path.
     pub chat_use_mock: bool,
+    /// The managed runtime's torch/torchvision/torchaudio versions captured BEFORE a
+    /// ComfyUI install (EAI-8051), so the post-install step can require them to be
+    /// unchanged. Comparing exact versions catches a swap to any other build, labelled
+    /// or not (e.g. stock PyPI `2.13.0`, which is CUDA yet carries no `+cu` label).
+    pub comfyui_baseline_torch_stack: Option<String>,
+    /// The managed runtime's installed distribution names captured BEFORE a ComfyUI
+    /// install (EAI-8051), so the post-install step can require the set to have
+    /// grown. Without it a run that installs nothing — `comfyui::install` skips the
+    /// whole `uv` step on an empty requirement list and still exits 0 — would pass
+    /// every runtime-preservation assertion having exercised nothing.
+    pub comfyui_baseline_distributions: Option<Vec<String>>,
     /// Per-scenario release-lifecycle state (packaging dirs, signing keys, install
     /// dir, captured logs). `Some` only for `@lifecycle` scenarios; all its paths
     /// are rooted in `isolated_root` so teardown removes them with the temp dir.
@@ -417,6 +429,8 @@ impl Default for E2eWorld {
             command_env: Vec::new(),
             tui: None,
             chat_use_mock: false,
+            comfyui_baseline_torch_stack: None,
+            comfyui_baseline_distributions: None,
             lifecycle: None,
             skill_reference: None,
             skill_symptom: None,
@@ -823,6 +837,12 @@ impl Drop for E2eWorld {
         let env = self.isolate_env();
         if let Some(root) = &self.isolated_root {
             stop_managed_services(root.path(), &env);
+        }
+        // A scenario that made the audit directory read-only must give it back
+        // before the TempDir below tries to remove it, even if a step panicked.
+        #[cfg(unix)]
+        if self.isolated_root.is_some() {
+            e2e::automations_steps::restore_audit_dir_permissions(&self.app_paths().audit_dir());
         }
         // `isolated_root` is a `TempDir`; its own Drop removes the directory.
     }
@@ -1553,7 +1573,7 @@ async fn main() {
     // point `shared_cache_dir()`/`shared_runtimes_dir()`/`shared_uv_cache_dir()`
     // at one persistent dir (see `isolate_env`): readers extracting an archive
     // and a concurrent `remove_file`/`remove_dir_all` of that same archive or
-    // runtime tree after another scenario's extract (`uv.rs`, `therock.rs`,
+    // runtime tree after another scenario's extract (`uv.rs`, `therock/process.rs`,
     // rocm-engine-lemonade's `prepare_embeddable`) would otherwise race.
     // `cap.has_amd_gpu` is a capability *probe* that can disagree with what a
     // lane actually exports (e.g. a missing GPU driver reads `false` while a

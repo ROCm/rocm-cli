@@ -10988,7 +10988,7 @@ MIT License
 ================================================================================
 
 The following component(s) are licensed under MIT License:
-  - zip 8.6.0 <https://github.com/zip-rs/zip2>
+  - zip 9.0.5 <https://github.com/zip-rs/zip2>
 
 The MIT License (MIT)
 
@@ -11056,6 +11056,7 @@ MIT License
 
 The following component(s) are licensed under MIT License:
   - nix 0.28.0 <https://github.com/nix-rust/nix>
+  - nix 0.31.3 <https://github.com/nix-rust/nix>
 
 The MIT License (MIT)
 

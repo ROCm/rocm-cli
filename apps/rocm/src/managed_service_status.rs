@@ -19,15 +19,18 @@
 //! attempts counts and one-line status text
 //! (`ManagedServiceSidebarCounts`/`managed_service_sidebar_counts`/
 //! `local_server_sidebar_status`) plus the engine display-name helper
-//! (`friendly_engine_label`) that sidebar rendering also uses. `main.rs` calls
-//! into it for the local-servers view, the duplicate-launch guard, and
-//! service-record removal; `chat.rs` calls into it for the deterministic
-//! services-tool summary; `runtime_services.rs` calls into it when reconciling
-//! live servers against a runtime activation; `service_launch.rs` calls into it
-//! for the same duplicate-launch guard `main.rs` uses before spawning a new
-//! managed service. Shared types/config (`ManagedServiceRecord`, `AppPaths`) and
-//! the `endpoint_keys` module stay reachable through `crate::`/`rocm_core::`, as
-//! for other mechanically relocated modules.
+//! (`friendly_engine_label`), which only `chat.rs` reads. `main.rs` calls into
+//! it for the in-use check behind service-record removal and pruning
+//! (`managed_service_is_live`, `recorded_service_pids`) and for
+//! `load_managed_services` in prune planning and the codex-bridge snapshot;
+//! `services_text.rs` reads the sidebar helpers for the local-servers view;
+//! `chat.rs` calls into it for the deterministic services-tool summary;
+//! `runtime_services.rs` calls into it when reconciling live servers against a
+//! runtime activation; `service_launch.rs` is the only caller of the
+//! `existing_live_managed_service` duplicate-launch guard it runs before
+//! spawning a new managed service. Shared types/config (`ManagedServiceRecord`,
+//! `AppPaths`) and the `endpoint_keys` module stay reachable through
+//! `crate::`/`rocm_core::`, as for other mechanically relocated modules.
 
 use std::fs;
 use std::time::Duration;
