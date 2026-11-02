@@ -14,6 +14,15 @@ use rocm_core::AppPaths;
 use crate::runtimes_cmd::{runtime_manifest_path, runtime_registry_dir};
 use crate::therock;
 
+/// Serializes tests that replace process-global `PATH` (or other env vars) while
+/// they run. Because env is shared across all test threads, any test that spawns a
+/// bare-name binary (e.g. `tar`) via `PATH` lookup must also hold this lock, or it
+/// can fail with ENOENT while another test has temporarily narrowed `PATH`.
+///
+/// One static for every module's tests: two locks guarding the same environment
+/// variables would let the tests that hold them race each other.
+pub(crate) static PROCESS_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// A name suffix no other call in this test process returns.
 ///
 /// Test scratch roots are named `<label>-<suffix>`. The pid separates

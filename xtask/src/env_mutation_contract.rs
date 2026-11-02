@@ -26,7 +26,7 @@
 //!
 //! The repo already had two ways of handling this — `ScopedTestEnv` in
 //! `apps/rocm/src/main.rs` and `PROCESS_ENV_TEST_LOCK` in
-//! `apps/rocm/src/therock.rs`, both of which take a process-wide lock — and the
+//! `apps/rocm/src/test_support.rs`, both of which take a process-wide lock — and the
 //! `fix.rs` tests that flaked were simply the ones that skipped the discipline.
 //! This guard makes the omission a build failure rather than an intermittent
 //! red on a required check.
