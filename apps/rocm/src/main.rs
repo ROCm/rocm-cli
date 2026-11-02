@@ -128,7 +128,7 @@ use crate::examine_report_text::{
 };
 use crate::freeform_answer::render_freeform_read_only_answer;
 use crate::freeform_execution::{prepare_freeform_execution, render_freeform_execution_header};
-use crate::gpu_policy::{GpuVramUsage, parse_gpu_indices_arg, serve_gpu_low_memory_warning};
+use crate::gpu_policy::parse_gpu_indices_arg;
 use crate::install_cmd::{install, therock_install_version_selector};
 use crate::model_fit::{PlatformRuleOut, engine_ruled_out_by_platform};
 use crate::runtimes_cmd::{current_runtime_manifest, runtimes};
@@ -155,7 +155,7 @@ use rocm_core::{
     PERMISSIONS_MODE_FULL_ACCESS, RocmCliConfig, TELEMETRY_MODE_LOCAL, TELEMETRY_MODE_OFF,
     WatcherMode, interactive_terminal, uv_cache_source,
 };
-use rocm_engine_protocol::{DevicePolicy, GpuSelection};
+use rocm_engine_protocol::DevicePolicy;
 use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -2467,55 +2467,6 @@ fn refresh_startup_update_check_quietly() {
         therock::maybe_refresh_startup_update_check(&paths, config.active_runtime_key.as_deref());
 }
 
-/// GPU/device warnings folded into the interactive deployment summary. Mirrors the
-/// inline warnings printed in the plain serve plan, in the same order.
-#[allow(clippy::too_many_arguments)]
-fn collect_serve_notes(
-    cpu_only: bool,
-    gpu_selection: &GpuSelection,
-    rocr_visible_devices_set: bool,
-    gpu_indices: &[u32],
-    gpu_vram: Option<&[GpuVramUsage]>,
-    engine_flag_note: Option<&str>,
-    host_gpu_summary: Option<&rocm_core::HostGpuSummary>,
-    engine_is_vllm: bool,
-) -> Vec<String> {
-    let mut notes = Vec::new();
-    // An engine-scoped flag the selected engine cannot honor must be reported here
-    // too: the summary path is what an interactive `rocm serve` actually prints, so
-    // a note only emitted on the plan path would never reach that user.
-    if let Some(note) = engine_flag_note {
-        notes.push(note.to_owned());
-    }
-    if cpu_only {
-        if matches!(gpu_selection, GpuSelection::Index(_)) {
-            notes.push(
-                "--gpu was ignored because --device cpu_only runs the model on CPU".to_owned(),
-            );
-        }
-    } else {
-        if rocr_visible_devices_set {
-            notes.push(
-                "ROCR_VISIBLE_DEVICES is set; the selected amd-smi ordinal is exported via \
-                 HIP_VISIBLE_DEVICES, which the runtime interprets relative to the ROCR-visible \
-                 set, so the device the engine binds may differ. Verify the selected GPU or unset \
-                 ROCR_VISIBLE_DEVICES."
-                    .to_owned(),
-            );
-        }
-        if let Some(warning) = serve_gpu_low_memory_warning(gpu_indices, gpu_vram, host_gpu_summary)
-        {
-            notes.push(warning);
-            // vLLM's total-VRAM reservation is what turns a busy card into an OOM;
-            // pair the generic warning with the concrete knob that avoids it.
-            if engine_is_vllm {
-                notes.push(rocm_core::VLLM_GPU_MEMORY_UTILIZATION_HINT.to_owned());
-            }
-        }
-    }
-    notes
-}
-
 fn comfyui(command: Option<ComfyuiCommand>) -> Result<()> {
     let paths = AppPaths::discover()?;
     let config = RocmCliConfig::load(&paths).unwrap_or_default();
@@ -4416,134 +4367,6 @@ pub(crate) mod tests {
             }
             other => panic!("expected Bench/Load, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn serve_notes_surface_the_ignored_engine_flag_in_summary_mode() {
-        // The interactive summary is what a default `rocm serve` prints, so a flag
-        // the selected engine cannot honor has to be reported through this path —
-        // not only on the plan path that an interactive run never takes.
-        let note = "--gpu-memory-utilization applies only to vLLM; ignored for engine 'lemonade'";
-        let notes = collect_serve_notes(
-            false,
-            &GpuSelection::Auto,
-            false,
-            &[0],
-            None,
-            Some(note),
-            None,
-            false,
-        );
-        assert!(
-            notes.iter().any(|entry| entry == note),
-            "the ignored-flag note must reach the summary: {notes:?}"
-        );
-
-        let quiet = collect_serve_notes(
-            false,
-            &GpuSelection::Auto,
-            false,
-            &[0],
-            None,
-            None,
-            None,
-            false,
-        );
-        assert!(
-            !quiet
-                .iter()
-                .any(|entry| entry.contains("--gpu-memory-utilization")),
-            "nothing to report when the flag was honored: {quiet:?}"
-        );
-    }
-
-    /// Duplicated from `gpu_policy::tests` (ROCMAI-214): both this test module
-    /// and `gpu_policy.rs`'s own build `GpuVramUsage` fixtures, and this helper
-    /// has no other home now that `gpu_policy.rs` owns the type.
-    fn vram(index: u32, used_mb: u64, total_mb: u64) -> GpuVramUsage {
-        GpuVramUsage {
-            index,
-            used_mb,
-            total_mb,
-        }
-    }
-
-    /// Duplicated from `gpu_policy::tests` (ROCMAI-214) for the same reason as
-    /// `vram` above.
-    fn host_gpu(gfx_target: &str) -> rocm_core::HostGpuSummary {
-        rocm_core::HostGpuSummary {
-            gfx_target: Some(gfx_target.to_owned()),
-            ..rocm_core::HostGpuSummary::default()
-        }
-    }
-
-    #[test]
-    fn serve_notes_pair_low_vram_with_the_vllm_utilization_hint() {
-        // A busy discrete card that trips the low-VRAM warning: on vLLM the note
-        // must also carry the concrete `--gpu-memory-utilization` workaround, so
-        // the interactive summary tells the user how to avoid the OOM.
-        let busy = [vram(0, 182_000, 192_000)];
-        let notes = collect_serve_notes(
-            false,
-            &GpuSelection::Auto,
-            false,
-            &[0],
-            Some(&busy),
-            None,
-            Some(&host_gpu("gfx1100")),
-            true,
-        );
-        assert!(
-            notes.iter().any(|entry| entry.contains("has only")),
-            "the low-VRAM warning must be present: {notes:?}"
-        );
-        assert!(
-            notes
-                .iter()
-                .any(|entry| entry.contains("--gpu-memory-utilization")),
-            "vLLM low-VRAM notes must hint the utilization workaround: {notes:?}"
-        );
-
-        // The literal fragments the GPU-lane scenario
-        // `@id:serve-vllm-low-vram-oom-guidance` matches on. That scenario runs
-        // only where a real card exists, so pin the wording here too: a rename
-        // then fails on every lane rather than silently on the one lane that can
-        // observe it. `GPU 0 has only` is what makes the warning provably about
-        // the *pinned* device; `vLLM reserves ~90%` is what distinguishes the
-        // pre-launch hint from any other line that merely names the flag.
-        assert!(
-            notes.iter().any(|entry| entry.contains("GPU 0 has only")),
-            "the warning must name the selected GPU: {notes:?}"
-        );
-        assert!(
-            notes
-                .iter()
-                .any(|entry| entry.contains("vLLM reserves ~90%")),
-            "the hint must explain vLLM's total-VRAM reservation: {notes:?}"
-        );
-
-        // The same busy card on a non-vLLM engine keeps the warning but omits the
-        // vLLM-only knob, which that engine cannot honor.
-        let lemonade = collect_serve_notes(
-            false,
-            &GpuSelection::Auto,
-            false,
-            &[0],
-            Some(&busy),
-            None,
-            Some(&host_gpu("gfx1100")),
-            false,
-        );
-        assert!(
-            lemonade.iter().any(|entry| entry.contains("has only")),
-            "the low-VRAM warning still fires for other engines: {lemonade:?}"
-        );
-        assert!(
-            !lemonade
-                .iter()
-                .any(|entry| entry.contains("--gpu-memory-utilization")),
-            "non-vLLM engines must not be told to pass a vLLM-only flag: {lemonade:?}"
-        );
     }
 
     /// The two runtimes every activation/reconciliation test switches between.

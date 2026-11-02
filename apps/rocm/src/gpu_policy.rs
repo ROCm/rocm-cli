@@ -55,7 +55,7 @@
 //! `drm_device_is_amd`, `parse_gpu_vram_usage`, `gpu_low_memory_warning`, and
 //! `busy_gpu_indices` have no callers outside this module and stay private;
 //! `GpuVramUsage` and its fields are `pub(crate)` for the same reason —
-//! `model_fit.rs`'s `classify_accelerator_memory`, `main.rs`'s
+//! `model_fit.rs`'s `classify_accelerator_memory`, `serve_cmd.rs`'s
 //! `collect_serve_notes`, and their own tests construct and read them
 //! directly.
 //!
