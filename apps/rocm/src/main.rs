@@ -49,6 +49,7 @@ mod runtime_adopt;
 mod runtime_install_finalize;
 mod runtime_registry;
 mod runtime_services;
+mod runtime_uninstall;
 mod runtimes_cmd;
 mod serve_cmd;
 mod serve_summary;
