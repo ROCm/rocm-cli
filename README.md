@@ -80,7 +80,10 @@ add a demo. Until the demo-gifs workflow has run once, these links 404.
 
 The installer downloads a prebuilt bundle, verifies its SHA-256 checksum,
 installs the `rocm` and `rocmd` binaries into `~/.local/bin`, and adds that
-directory to your shell `PATH`. Rerun it any time to upgrade. `rocm uninstall`
+directory to your shell `PATH`. When fish is installed (`fish` is on `PATH`,
+or `~/.config/fish` already exists), it also writes that `PATH` block to
+`~/.config/fish/config.fish` and installs fish completions, including when the
+login shell is bash, zsh, or ksh. Rerun it any time to upgrade. `rocm uninstall`
 removes the binaries, and undoes the `PATH` change too when no other program
 lives in that directory.
 
@@ -1277,6 +1280,8 @@ rocm completions zsh > ~/.zsh/completions/_rocm
 #   autoload -Uz compinit && compinit
 
 # fish
+# The Linux installer writes this file when fish is installed. Run the same
+# command after copying the binaries yourself, or to refresh the script:
 mkdir -p ~/.config/fish/completions
 rocm completions fish > ~/.config/fish/completions/rocm.fish
 

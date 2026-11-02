@@ -833,8 +833,9 @@ Expected result:
 
 - The dry run lists the binaries (on Windows, `rocm.exe` is marked as deleted
   as the command exits) and, under
-  `PATH changes from the installer that would be undone:`, the shell profile
-  (Linux) or the user `PATH` entry (Windows). It removes nothing.
+  `PATH changes from the installer that would be undone:`, each shell profile
+  the installer wrote (Linux, including `~/.config/fish/config.fish` when fish
+  was installed) or the user `PATH` entry (Windows). It removes nothing.
 - After confirming, the install folder holds no `rocm`/`rocmd` files, and a new
   terminal no longer gets the install folder on `PATH` from the installer's
   change.
