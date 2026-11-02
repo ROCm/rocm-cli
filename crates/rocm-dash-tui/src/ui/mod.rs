@@ -26,6 +26,7 @@ pub mod instance_list;
 pub mod job_console;
 pub mod launcher;
 pub mod logs_view;
+mod menu;
 pub mod modal;
 pub mod model_picker;
 pub mod onboarding;
@@ -152,9 +153,9 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
                 &theme,
             );
         }
-        Modal::Menu => modal::draw_menu(f, body, state.menu_sel, &theme),
-        Modal::Palette => modal::draw_palette(f, body, state.palette_sel, &theme),
-        Modal::Options => modal::draw_options(f, body, state, &theme),
+        Modal::Menu => menu::draw_menu(f, body, state.menu_sel, &theme),
+        Modal::Palette => menu::draw_palette(f, body, state.palette_sel, &theme),
+        Modal::Options => menu::draw_options(f, body, state, &theme),
         Modal::GlobalHelp => help_modal::draw_global_help(f, body, &theme),
         Modal::Warnings => {
             let warnings = state.latest.as_ref().map_or(&[][..], |s| &s.warnings[..]);
@@ -528,7 +529,7 @@ mod tests {
     }
 
     /// The wash `grey_overlay` paints behind an open overlay (see the
-    /// `grey_overlay_dims_every_cell` test in `modal.rs` for the exact color:
+    /// `grey_overlay_dims_every_cell` test in `menu.rs` for the exact color:
     /// the function itself is `panel::grey_overlay`, and the test stays beside
     /// `draw_logo`, which it composes); these tests only check that
     /// `draw`/`draw_focused` actually invoke it at their three call sites, not

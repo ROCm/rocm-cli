@@ -21,8 +21,9 @@
 //!
 //! Popup geometry and framing live here too, beside [`popup`]: [`centered_rect`]
 //! (with [`centered_width`]), [`draw_popup_frame`] and [`grey_overlay`], shared by
-//! `ui/approval.rs`, `ui/job_console.rs` and the other overlays, and by
-//! `ui/modal.rs`.
+//! `ui/approval.rs`, `ui/job_console.rs` and the other overlays, and by the
+//! Modal renderers (`ui/help_modal.rs`, `ui/warnings_modal.rs`,
+//! `ui/theme_picker.rs` and `ui/menu.rs`).
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};

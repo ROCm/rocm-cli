@@ -1784,7 +1784,7 @@ async fn dashboard_menu_is_displayed(world: &mut E2eWorld) {
 }
 
 /// Navigates `Modal::Menu`'s items (`["Options", "Help", "Quit"]`,
-/// `ui/modal.rs`) down to "Quit" and activates it — `j` twice from the
+/// `ui/menu.rs`) down to "Quit" and activates it — `j` twice from the
 /// default `menu_sel: 0`, then `Enter` (`KeyAction::MenuActivate`). Requires
 /// the menu to already be open (`the dashboard menu is displayed`).
 #[when("the user selects Quit from the dashboard menu")]
