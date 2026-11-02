@@ -13,6 +13,7 @@ mod automations;
 mod bootstrap;
 mod bridge_snapshot;
 mod chat;
+mod chat_cmd;
 mod chat_host_facts;
 mod cli_audit;
 mod cli_progress;
@@ -106,6 +107,7 @@ use crate::bridge_snapshot::{
     build_codex_bridge_gpu_snapshot, build_codex_bridge_snapshot,
     builtin_codex_bridge_engine_inventory,
 };
+use crate::chat_cmd::run_chat_command;
 use crate::cli_audit::{cli_lifecycle_log_path, record_cli_audit_event, sanitize_log_value};
 use crate::config_cmd::{config, render_config_text};
 use crate::diagnose_cmd::{diagnose, fix};
@@ -2054,66 +2056,16 @@ fn dispatch(cli: Cli) -> Result<()> {
             max_tokens,
             tools,
             chat_mock,
-        }) => {
-            let paths = AppPaths::discover()?;
-            if interactive_terminal() && prompt.is_none() {
-                // Interactive `rocm chat` routes to the unified dash chat
-                // (parity reached, Phases 3-8). The dash auto-detects the
-                // provider and supports `/provider` switching; --provider is
-                // honored only on the non-interactive render path below. The
-                // legacy TUI assistant has been retired.
-                if provider.is_some() {
-                    // --provider isn't threaded into the interactive dash; say so
-                    // instead of dropping it silently — the user can switch live.
-                    eprintln!(
-                        "note: launching the dash chat; switch providers with /provider <name>"
-                    );
-                }
-                return dash::run_chat(
-                    chat_mock,
-                    ChatInferenceParams {
-                        temperature,
-                        top_p,
-                        max_tokens,
-                    },
-                    false,
-                );
-            }
-            // Resolve the prompt from `--prompt` or, when it is omitted and
-            // stdin is not a terminal, from piped standard input — the
-            // documented `echo "…" | rocm chat` path. Only when neither
-            // supplies a prompt do we fall back to the status screen, which
-            // two kinds of invocation reach: stdin is a TTY that the
-            // interactive branch above declined (it also requires stdout to be
-            // one), or stdin was redirected and carried nothing but whitespace
-            // — an empty pipe or `< /dev/null`.
-            let prompt = match prompt {
-                Some(prompt) => Some(prompt),
-                None => chat::read_piped_prompt()?,
-            };
-            match prompt {
-                Some(prompt) => print!(
-                    "{}",
-                    chat::render_chat_prompt_text(
-                        &paths,
-                        provider.map_or("local", provider_name),
-                        model.as_deref(),
-                        &prompt,
-                        tools,
-                        ChatInferenceParams {
-                            temperature,
-                            top_p,
-                            max_tokens,
-                        },
-                    )?
-                ),
-                None => print!(
-                    "{}",
-                    chat::render_chat_text(&paths, provider.map_or("local", provider_name))?
-                ),
-            }
-            Ok(())
-        }
+        }) => run_chat_command(
+            provider,
+            model,
+            prompt,
+            temperature,
+            top_p,
+            max_tokens,
+            tools,
+            chat_mock,
+        ),
         Some(Command::Bootstrap { command }) => bootstrap::run(command),
         Some(Command::Install { target }) => install(target),
         Some(Command::Update {
@@ -4864,48 +4816,32 @@ pub(crate) mod tests {
         slice_braced_block(src, "fn launch_default() -> Result<()> {")
     }
 
-    /// Extract the whole `Some(Command::Chat { .. }) => { .. }` handler arm,
-    /// brace-balanced from the destructure pattern through the block body, so
-    /// both the destructured fields (e.g. `chat_mock`) and the dispatch code are
-    /// visible. Restricts to the production handler (the `=> {` form), not the
-    /// variant declaration which has no `=>`.
-    fn command_chat_handler_body(src: &str) -> String {
-        // Anchor on the handler arm specifically: the destructure that is
-        // immediately followed (after the closing `}` + `)`) by `=> {`.
-        let arm = "Some(Command::Chat {";
-        let arm_at = src.find(arm).expect("Command::Chat handler present");
-        // Balance from the `{` of the destructure to capture the full arm,
-        // including the `=> { ... }` block that follows.
-        slice_braced_to_arm_end(&src[arm_at..])
+    /// The source of `chat_cmd.rs`, where the `Command::Chat` handler lives
+    /// (it was the arm's own body in `dispatch()` in this file).
+    fn chat_cmd_source() -> String {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("chat_cmd.rs");
+        fs::read_to_string(path).expect("read apps/rocm/src/chat_cmd.rs")
     }
 
-    /// Given a slice beginning at `Some(Command::Chat {`, return the text from
-    /// that point through the end of the arm's `=> { .. }` block.
-    fn slice_braced_to_arm_end(src: &str) -> String {
-        // 1. balance the destructure `{ .. }`.
-        let pat_open = src.find('{').expect("destructure open brace");
-        let bytes = src.as_bytes();
-        let mut depth = 0usize;
-        let mut pat_end = pat_open;
-        for (i, &b) in bytes.iter().enumerate().skip(pat_open) {
-            match b {
-                b'{' => depth += 1,
-                b'}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        pat_end = i + 1;
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-        // 2. find the `=> {` block opener after the destructure and balance it.
-        let after = &src[pat_end..];
-        let block_rel = after.find("=> {").expect("arm block opener `=> {`");
-        let block_body = slice_braced_block(after, &after[block_rel..block_rel + 4]);
-        // Return destructure + block body together.
-        format!("{}{}", &src[pat_open..pat_end], block_body)
+    /// Extract the `Command::Chat` handler, `run_chat_command`: its parameter
+    /// list (where the `--chat-mock` and sampling fields are visible, as the
+    /// arm's destructure pattern once showed them) followed by its brace-balanced
+    /// body, so both the received fields and the dispatch code are visible.
+    fn command_chat_handler_body(src: &str) -> String {
+        let name = "pub(crate) fn run_chat_command(";
+        let fn_at = src.find(name).expect("Command::Chat handler present");
+        let from_params = &src[fn_at + name.len()..];
+        // The parameter list ends at the signature's `) -> Result<()> {`, which
+        // is also the opener of the body block.
+        let opener = ") -> Result<()> {";
+        let params_end = from_params
+            .find(opener)
+            .expect("handler signature ends with `) -> Result<()> {`");
+        let body = slice_braced_block(&from_params[params_end..], opener);
+        // Return the parameter list + body together.
+        format!("{}{}", &from_params[..params_end], body)
     }
 
     /// Return the brace-balanced block that follows `opener` (which must end in
@@ -4973,7 +4909,7 @@ pub(crate) mod tests {
 
     #[test]
     fn command_chat_interactive_routes_to_dash_run_chat_not_tui() {
-        let src = main_rs_source();
+        let src = chat_cmd_source();
         let body = strip_line_comments(&command_chat_handler_body(&src));
         assert!(
             body.contains("dash::run_chat("),
@@ -4991,7 +4927,7 @@ pub(crate) mod tests {
         // silently ignored — the handler emits a one-line note when provider is
         // set before rerouting to the dash. Proven by reading the handler body
         // (the interactive branch requires a TTY, unavailable in CI).
-        let src = main_rs_source();
+        let src = chat_cmd_source();
         let body = strip_line_comments(&command_chat_handler_body(&src));
         assert!(
             body.contains("provider.is_some()"),
@@ -5005,7 +4941,7 @@ pub(crate) mod tests {
 
     #[test]
     fn command_chat_honors_chat_mock_and_keeps_prompt_passthrough() {
-        let src = main_rs_source();
+        let src = chat_cmd_source();
         let body = strip_line_comments(&command_chat_handler_body(&src));
         // --chat-mock is forwarded into the dash reroute.
         assert!(
@@ -5045,7 +4981,7 @@ pub(crate) mod tests {
         // prompt from `read_piped_prompt`, with the result feeding the dispatch
         // rather than being discarded or read after the send decision is
         // already made.
-        let src = main_rs_source();
+        let src = chat_cmd_source();
         let body = strip_line_comments(&command_chat_handler_body(&src));
         assert!(
             body.contains("chat::read_piped_prompt("),
