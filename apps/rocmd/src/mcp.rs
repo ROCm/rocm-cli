@@ -772,7 +772,7 @@ pub(crate) fn handle_mcp_tool_call(paths: &AppPaths, params: &Value) -> Result<V
     }
 }
 
-pub(crate) fn run_rocm_capture(args: &[&str]) -> Result<CommandCapture> {
+fn run_rocm_capture(args: &[&str]) -> Result<CommandCapture> {
     let paths = AppPaths::discover()?;
     common::run_rocm_capture_for_paths(&paths, args, Duration::from_mins(2))
 }
