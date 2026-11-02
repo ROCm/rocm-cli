@@ -32,10 +32,17 @@ async fn says_not_found(world: &mut E2eWorld, service_id: String) {
         "naming a missing server must fail:\n{stdout}\n{stderr}"
     );
     // Everything from `Error:` on is what `main` prints for the failure; with a
-    // cause chained under it, `Caused by:` lines would follow.
+    // cause chained under it, `Caused by:` lines would follow. anyhow appends a
+    // backtrace when RUST_BACKTRACE is set, as CI does; that is not a cause.
     let error = stderr.find("Error:").map_or_else(
         || panic!("no error was printed:\n{stdout}\n{stderr}"),
-        |start| stderr[start..].trim_end(),
+        |start| {
+            let error = &stderr[start..];
+            error
+                .split_once("\n\nStack backtrace:")
+                .map_or(error, |(message, _)| message)
+                .trim_end()
+        },
     );
     assert_eq!(
         error,
