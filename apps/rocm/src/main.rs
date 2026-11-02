@@ -52,6 +52,7 @@ mod service_launch;
 mod service_records;
 mod services_cmd;
 mod services_text;
+mod setup_cmd;
 mod storage;
 #[cfg(test)]
 mod test_support;
@@ -72,10 +73,9 @@ mod update_cmd;
 // called from `run_freeform`, outside `dispatch()`) calls them. Several
 // root-level chat/examine helpers call into `runtimes_cmd` directly for the
 // same reason `engines_cmd`'s runtime-resolution helpers are re-imported;
-// `current_runtime_manifest` stays re-imported here for other root-level commands outside `dispatch()`
-// that call it directly, and `validate_runtime_manifest_for_activation` stays
-// re-imported here for the same reason. `select_runtime_manifest` is no
-// longer needed here: `single_ready_runtime_key`/
+// `current_runtime_manifest` stays re-imported here for other root-level
+// commands outside `dispatch()` that call it directly. `select_runtime_manifest`
+// is no longer needed here: `single_ready_runtime_key`/
 // `resolve_runtime_selector_to_exact_key` moved out to
 // `engine_runtime_select.rs` in ROCMAI-215 (Phase 6f), reaching it via that
 // module's own grouped `use crate::runtimes_cmd::{...}` import instead.
@@ -121,10 +121,7 @@ use crate::gpu_policy::{GpuVramUsage, parse_gpu_indices_arg, serve_gpu_low_memor
 use crate::install_cmd::{install, therock_install_version_selector};
 use crate::managed_service_status::load_managed_services;
 use crate::model_fit::{PlatformRuleOut, engine_ruled_out_by_platform};
-use crate::runtimes_cmd::{
-    current_runtime_manifest, runtimes, setup_runtime_paths,
-    validate_runtime_manifest_for_activation,
-};
+use crate::runtimes_cmd::{current_runtime_manifest, runtimes, setup_runtime_paths};
 use crate::serve_cmd::{ServeArgs, serve};
 use crate::service_records::DEFAULT_SERVICE_PRUNE_MIN_AGE_HOURS;
 // Reached only as `super::run_approved_service_action` from
@@ -136,6 +133,7 @@ use crate::services_text::{
     render_internal_status_text, render_logs_browser_text, render_logs_text,
     render_service_logs_text, run_internal_sandbox_tool,
 };
+use crate::setup_cmd::{render_setup_status_text, setup};
 use crate::uninstall::uninstall;
 use crate::uninstall_plan::UninstallOptions;
 use crate::update_cmd::{apply_runtime_update, render_update_text, update_should_preview_or_apply};
@@ -150,7 +148,6 @@ use rocm_core::{
     interactive_terminal, load_recent_automation_events, uv_cache_source,
 };
 use rocm_engine_protocol::{DevicePolicy, GpuSelection};
-use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -1873,83 +1870,6 @@ fn command_invocation_error(request_args: &[String]) -> Option<clap::Error> {
     (has_suggestion || has_flag).then_some(err)
 }
 
-fn setup(command: Option<SetupCommand>) -> Result<()> {
-    let paths = AppPaths::discover()?;
-    let mut config = RocmCliConfig::load(&paths)?;
-    match command.unwrap_or(SetupCommand::Status) {
-        SetupCommand::Status => {
-            print!("{}", render_setup_status_text(&paths, &config)?);
-        }
-        SetupCommand::Reset { yes: _ } => {
-            print!("{}", reset_setup_prompt_state(&paths, &mut config)?);
-        }
-    }
-    Ok(())
-}
-
-fn render_setup_status_text(paths: &AppPaths, config: &RocmCliConfig) -> Result<String> {
-    let manifests = therock::load_runtime_manifests(paths)?;
-    let active_manifest = config
-        .active_runtime_key
-        .as_deref()
-        .and_then(|runtime_key| {
-            manifests
-                .iter()
-                .find(|manifest| manifest.runtime_key.eq_ignore_ascii_case(runtime_key))
-        });
-    let active_ready = active_manifest
-        .is_some_and(|manifest| validate_runtime_manifest_for_activation(manifest).is_ok());
-    let state = if config.setup.completed && active_ready {
-        "completed"
-    } else if config.setup.completed {
-        "completed; active runtime needs attention"
-    } else if active_ready {
-        "runtime ready; setup not completed"
-    } else if config.onboarding_dismissed {
-        "setup dismissed"
-    } else {
-        "first-time setup available - open manually via `rocm dash`'s Observe tab with `n`"
-    };
-
-    let mut output = String::new();
-    let _ = writeln!(output, "ROCm setup");
-    let _ = writeln!(output, "  status: {state}");
-    if let Some(root) = config.setup.therock_venv.as_ref() {
-        let _ = writeln!(output, "  install folder: {}", root.display());
-    }
-    if let Some(runtime_key) = config.active_runtime_key.as_deref() {
-        let _ = writeln!(output, "  active_runtime_key: {runtime_key}");
-    }
-    match active_manifest {
-        Some(manifest) => {
-            let _ = writeln!(output, "  active_runtime_id: {}", manifest.runtime_id);
-            let status = if active_ready { "ready" } else { "not_ready" };
-            let _ = writeln!(output, "  active_runtime_status: {status}");
-        }
-        None if config.active_runtime_key.is_some() => {
-            let _ = writeln!(output, "  active_runtime_status: missing_manifest");
-        }
-        None => {
-            let _ = writeln!(output, "  active_runtime_status: <unset>");
-        }
-    }
-    let _ = writeln!(output, "  help: run `rocm help` to see how to use rocm-cli");
-    Ok(output)
-}
-
-fn reset_setup_prompt_state(paths: &AppPaths, config: &mut RocmCliConfig) -> Result<String> {
-    config.onboarding_dismissed = false;
-    config.setup.completed = false;
-    config.save(paths)?;
-    Ok([
-        "Onboarding will not reopen automatically - open it from `rocm dash`'s Observe tab with `n`.",
-        "ROCm installs were not deleted.",
-        "Installed ROCm folders, API keys, and provider settings were kept.",
-        "",
-    ]
-    .join("\n"))
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FreeformInvocation {
     approve: bool,
@@ -3160,7 +3080,6 @@ pub(crate) mod tests {
 
     use crate::runtime_install_finalize::tests::finish_sdk_install_with;
     use crate::services_text::load_managed_service;
-    use crate::test_support::write_test_pip_runtime;
 
     /// Serializes and isolates tests that read or mutate process-global env vars.
     ///
@@ -4660,117 +4579,6 @@ pub(crate) mod tests {
             }
             other => panic!("expected Bench/Load, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn setup_reset_cli_output_is_plain_and_persists_first_time_prompt() -> Result<()> {
-        let (_root, paths) = test_paths("setup-reset-cli");
-        let mut config = RocmCliConfig {
-            onboarding_dismissed: true,
-            setup: rocm_core::SetupConfig {
-                completed: true,
-                therock_venv: Some(paths.data_dir.join("envs").join("default")),
-                cli_install_dir: None,
-            },
-            ..Default::default()
-        };
-        config.provider_config_mut("openai").enabled = true;
-        config.save(&paths)?;
-
-        let rendered = reset_setup_prompt_state(&paths, &mut config)?;
-
-        // The claim itself (onboarding only opens via an explicit `n` on the
-        // Observe tab, never automatically) is proven by
-        // `crates/rocm-dash-tui/src/app/focus.rs`'s
-        // `startup_focus_gate_only_opens_onboarding_for_explicit_setup_focus`
-        // test and the `onboarding.rs` module doc — this assertion only
-        // guards the string, not the behavior.
-        assert!(rendered.contains("Onboarding will not reopen automatically"));
-        assert!(rendered.contains("ROCm installs were not deleted"));
-        assert!(rendered.contains("API keys"));
-        // ROCMAI-543: the assertions above stop before the ` - open it from
-        // `rocm dash`'s Observe tab` clause, so they stay green with the em
-        // dash put back. This covers the whole block that `rocm setup --reset`
-        // prints, including any line added to it later.
-        assert!(
-            rendered.is_ascii(),
-            "the setup-reset prompt must be ASCII-only; non-ASCII punctuation renders as \
-             mojibake on a Windows console using the OEM code page (ROCMAI-543): {rendered}"
-        );
-        assert!(!rendered.contains("request plan"));
-        assert!(!rendered.contains("planner:"));
-        assert!(!rendered.contains("tool_schema"));
-
-        let saved = RocmCliConfig::load(&paths)?;
-        assert!(!saved.onboarding_dismissed);
-        assert!(!saved.setup.completed);
-        assert!(saved.setup.therock_venv.is_some());
-        assert!(saved.provider_enabled("openai"));
-        Ok(())
-    }
-
-    #[test]
-    fn setup_status_reports_completed_active_runtime() -> Result<()> {
-        let (root, paths) = test_paths("setup-status-completed-runtime");
-        let manifest = write_test_pip_runtime(
-            &paths,
-            "release-pip-gfx120x-all-status",
-            "therock-release:gfx120X-all",
-            "7.13.0",
-            1,
-        )?;
-        let config = RocmCliConfig {
-            default_runtime_id: Some(manifest.runtime_id.clone()),
-            active_runtime_key: Some(manifest.runtime_key.clone()),
-            setup: rocm_core::SetupConfig {
-                completed: true,
-                therock_venv: Some(manifest.install_root.clone()),
-                cli_install_dir: None,
-            },
-            ..Default::default()
-        };
-
-        let rendered = render_setup_status_text(&paths, &config)?;
-
-        assert!(rendered.contains("status: completed"), "{rendered}");
-        assert!(
-            rendered.contains(&format!(
-                "install folder: {}",
-                manifest.install_root.display()
-            )),
-            "{rendered}"
-        );
-        assert!(
-            rendered.contains("active_runtime_key: release-pip-gfx120x-all-status"),
-            "{rendered}"
-        );
-        assert!(
-            rendered.contains("active_runtime_id: therock-release:gfx120X-all"),
-            "{rendered}"
-        );
-        assert!(
-            rendered.contains("active_runtime_status: ready"),
-            "{rendered}"
-        );
-        assert!(rendered.contains("rocm help"), "{rendered}");
-
-        let _ = fs::remove_dir_all(root);
-        Ok(())
-    }
-
-    #[test]
-    fn setup_status_reports_first_time_when_not_completed() -> Result<()> {
-        let (_root, paths) = test_paths("setup-status-first-time");
-        let config = RocmCliConfig::default();
-
-        let rendered = render_setup_status_text(&paths, &config)?;
-
-        // See the pointer comment in
-        // `setup_reset_cli_output_is_plain_and_persists_first_time_prompt`
-        // above: this only guards the string, not the underlying behavior.
-        assert!(rendered.contains("status: first-time setup available - open manually"));
-        assert!(rendered.contains("active_runtime_status: <unset>"));
-        Ok(())
     }
 
     #[test]

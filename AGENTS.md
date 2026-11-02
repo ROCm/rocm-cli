@@ -119,7 +119,7 @@ resulting state in the same test. Three shapes need this:
 A test that only pins the wording certifies the string, not the truth of it, and a pin
 over a false claim holds the claim in place. Where the text genuinely has to be pinned on
 its own, the assertion carries a comment naming the test that proves the behavior — see
-`setup_reset_cli_output_is_plain_and_persists_first_time_prompt` in `apps/rocm/src/main.rs`,
+`setup_reset_cli_output_is_plain_and_persists_first_time_prompt` in [`apps/rocm/src/setup_cmd.rs`](apps/rocm/src/setup_cmd.rs),
 which pins the onboarding line and points at
 `startup_focus_gate_only_opens_onboarding_for_explicit_setup_focus` for the behavior
 itself.
