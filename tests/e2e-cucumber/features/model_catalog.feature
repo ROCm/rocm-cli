@@ -25,3 +25,14 @@ Feature: Model catalog listing
     Given no Docker daemon is reachable
     When the user asks for the model catalog in verbose detail
     Then the catalog's AIM entry is flagged unavailable for lack of Docker
+
+  # ROCMAI-556: an AIM entry pins an image that may since have been withdrawn, so
+  # `rocm model --verbose` warns once the entry was last verified more than 180
+  # days ago. The entry is shipped with a verification timestamp; this plants a
+  # signed catalog whose timestamp is decades old, so the warning is exercised
+  # without depending on the date the suite runs.
+  @id:model-catalog-warns-on-stale-aim-entry
+  Scenario: model-catalog-03 - A stale AIM catalog entry is flagged in rocm model --verbose
+    Given a recipe catalog whose AIM entry was last verified long ago
+    When the user asks for the model catalog in verbose detail
+    Then the catalog warns that the AIM entry may no longer be current

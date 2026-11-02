@@ -64,3 +64,90 @@ async fn catalog_aim_entry_flagged_unavailable(world: &mut E2eWorld) {
         "expected the AIM entry to name the Docker-unavailable reason:\n{output}"
     );
 }
+
+/// Unix ms for 2001-09-09, far more than 180 days before any run of this suite.
+const LONG_AGO_MS: u64 = 1_000_000_000_000;
+
+/// Point the CLI at a signed recipe index holding the built-in `Qwen/Qwen3.5-9B`
+/// AIM entry with `generated_at_unix_ms` set `LONG_AGO_MS`, the only difference
+/// from the shipped entry. Signed because that is the only way the CLI loads a
+/// recipe index (same xtask keygen/sign path as `diagnose_steps`).
+#[given("a recipe catalog whose AIM entry was last verified long ago")]
+async fn catalog_with_stale_aim_entry(world: &mut E2eWorld) {
+    let mut recipe = rocm_core::resolve_builtin_model_recipe("Qwen/Qwen3.5-9B")
+        .expect("the built-in AIM recipe");
+    for engine_recipe in &mut recipe.engine_recipes {
+        if engine_recipe.engine == "aim" {
+            engine_recipe.generated_at_unix_ms = Some(u128::from(LONG_AGO_MS));
+        }
+    }
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("scenario has no isolated root")
+        .path()
+        .to_path_buf();
+    let index = root.join("stale-aim-recipes.json");
+    let signature = root.join("stale-aim-recipes.json.sig");
+    let public_key = root.join("stale-aim-public.pem");
+    let private_key = root.join("stale-aim-private.pem");
+    let document = serde_json::json!({
+        "schema_version": 1,
+        "source": "e2e-stale-aim",
+        "recipes": [recipe],
+    });
+    std::fs::write(
+        &index,
+        serde_json::to_vec_pretty(&document).expect("failed to serialize the recipe fixture"),
+    )
+    .expect("failed to write the recipe fixture");
+
+    let keygen = crate::e2e::diagnose_steps::xtask_command()
+        .args(["keygen", "--private-out"])
+        .arg(&private_key)
+        .arg("--public-out")
+        .arg(&public_key)
+        .current_dir(crate::e2e::diagnose_steps::workspace_root())
+        .status()
+        .expect("failed to run xtask keygen");
+    assert!(keygen.success(), "xtask keygen failed");
+    let sign = crate::e2e::diagnose_steps::xtask_command()
+        .args(["sign", "--private-key"])
+        .arg(&private_key)
+        .arg("--in")
+        .arg(&index)
+        .arg("--out")
+        .arg(&signature)
+        .current_dir(crate::e2e::diagnose_steps::workspace_root())
+        .status()
+        .expect("failed to run xtask sign");
+    assert!(sign.success(), "xtask sign failed");
+
+    world
+        .command_env
+        .push(("ROCM_CLI_MODEL_RECIPE_INDEX_PATH", index.into_os_string()));
+    world.command_env.push((
+        "ROCM_CLI_MODEL_RECIPE_INDEX_SIGNATURE_PATH",
+        signature.into_os_string(),
+    ));
+    world.command_env.push((
+        "ROCM_CLI_MODEL_RECIPE_INDEX_PUBLIC_KEY_PATH",
+        public_key.into_os_string(),
+    ));
+}
+
+#[then("the catalog warns that the AIM entry may no longer be current")]
+async fn catalog_warns_aim_entry_is_stale(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no model catalog output");
+    assert_eq!(
+        world.cli_rc,
+        Some(0),
+        "listing the catalog failed:\n{output}"
+    );
+    assert!(
+        output.contains("warning: aim entry was last verified")
+            && output.contains("days ago")
+            && output.contains("rerun the installer"),
+        "expected a staleness warning for the AIM entry, got:\n{output}"
+    );
+}

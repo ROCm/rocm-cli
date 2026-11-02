@@ -93,7 +93,7 @@ pub struct ModelRecipeEngineRecord {
     #[serde(default)]
     pub image_digest: Option<String>,
     /// When a maintainer last checked this entry against the upstream image
-    /// registry (unix ms). `rocm model` warns once it is older than
+    /// registry (unix ms). `rocm model --verbose` warns once it is older than
     /// [`MODEL_RECIPE_STALE_AFTER_MS`], since the pinned image may be gone.
     #[serde(default)]
     pub generated_at_unix_ms: Option<u128>,
@@ -123,7 +123,8 @@ pub struct ModelRecipeEngineRecord {
     /// Minimum number of GPUs the image needs per gfx family (the smallest
     /// tensor-parallel size across that family's profiles). A family left out
     /// needs one. Keys must be listed in `supported_gfx_families`. `rocm serve`
-    /// refuses to start with fewer usable GPUs. Only valid on `aim`.
+    /// gives an engine one GPU, so it refuses to start an image listed here for
+    /// the detected family, however many GPUs the host has. Only valid on `aim`.
     #[serde(default)]
     pub min_gpu_counts: BTreeMap<String, u32>,
 }
@@ -179,7 +180,7 @@ pub fn model_recipe_staleness_warning(
     let age_ms = now_ms.checked_sub(engine_recipe.generated_at_unix_ms?)?;
     (age_ms > MODEL_RECIPE_STALE_AFTER_MS).then(|| {
         format!(
-            "{} entry was last verified {} days ago; the pinned image may no longer exist; update rocm-cli for a refreshed catalog",
+            "{} entry was last verified {} days ago; the pinned image may no longer exist; update rocm-cli (rerun the installer) for a refreshed catalog",
             engine_recipe.engine,
             age_ms / (24 * 60 * 60 * 1000)
         )
@@ -1255,14 +1256,122 @@ mod tests {
     }
 
     #[test]
-    fn builtin_aim_recipe_carries_a_verification_timestamp() {
-        let recipe = resolve_builtin_model_recipe("Qwen/Qwen3.5-9B").expect("aim recipe");
-        let aim = recipe
-            .engine_recipes
-            .iter()
-            .find(|e| e.engine == "aim")
-            .expect("aim engine");
-        assert!(aim.generated_at_unix_ms.is_some());
+    fn every_builtin_aim_recipe_carries_a_verification_timestamp() {
+        let mut checked = 0;
+        for recipe in builtin_model_recipes() {
+            for aim in recipe.engine_recipes.iter().filter(|e| e.engine == "aim") {
+                checked += 1;
+                assert!(
+                    aim.generated_at_unix_ms.is_some(),
+                    "{} aim entry has no generated_at_unix_ms, so it can never be flagged stale",
+                    recipe.canonical_model_id
+                );
+            }
+        }
+        assert!(checked > 0, "the built-in catalog lists no aim entries");
+    }
+
+    #[test]
+    fn engine_recipe_gfx_support_matches_families_without_regard_to_case() {
+        let unrestricted = ModelRecipeEngineRecord {
+            engine: "aim".to_owned(),
+            ..Default::default()
+        };
+        // No families listed: any host, detected or not, is unrestricted.
+        for family in [None, Some("gfx1151"), Some("gfx94X-dcgpu")] {
+            assert_eq!(
+                engine_recipe_gfx_support(&unrestricted, family),
+                GfxSupport::Unrestricted,
+                "{family:?}"
+            );
+        }
+        let aim = ModelRecipeEngineRecord {
+            engine: "aim".to_owned(),
+            supported_gfx_families: vec!["gfx94X-dcgpu".to_owned(), "gfx110X-all".to_owned()],
+            profile_ids: BTreeMap::from([("gfx110X-all".to_owned(), "p".to_owned())]),
+            ..Default::default()
+        };
+        // Matching ignores case on both the family list and the pinned profile key.
+        assert_eq!(
+            engine_recipe_gfx_support(&aim, Some("GFX110X-ALL")),
+            GfxSupport::Supported(Some("p"))
+        );
+        assert_eq!(
+            engine_recipe_gfx_support(&aim, Some("gfx94x-DCGPU")),
+            GfxSupport::Supported(None)
+        );
+        assert_eq!(
+            engine_recipe_gfx_support(&aim, Some("gfx120X-all")),
+            GfxSupport::Unsupported
+        );
+        assert_eq!(
+            engine_recipe_gfx_support(&aim, None),
+            GfxSupport::Unrestricted
+        );
+    }
+
+    #[test]
+    fn model_recipe_targets_platform_needs_the_engine_and_a_covered_family() {
+        let platform = |engines: &[&str], families: &[&str]| ModelCatalogPlatform {
+            label: "p".to_owned(),
+            engines: engines.iter().map(|e| (*e).to_owned()).collect(),
+            gfx_families: families.iter().map(|f| (*f).to_owned()).collect(),
+        };
+        let recipe = |preferred: &[&str], families: &[&str]| {
+            let mut recipe = resolve_builtin_model_recipe("qwen").expect("recipe");
+            recipe.preferred_engines = preferred.iter().map(|e| (*e).to_owned()).collect();
+            recipe.engine_recipes = vec![ModelRecipeEngineRecord {
+                engine: "aim".to_owned(),
+                supported_gfx_families: families.iter().map(|f| (*f).to_owned()).collect(),
+                ..Default::default()
+            }];
+            recipe
+        };
+        let two_families = recipe(&["aim"], &["gfx94X-dcgpu", "gfx110X-all"]);
+        for (recipe, platform, expected, why) in [
+            (
+                &two_families,
+                platform(&["aim"], &["gfx110X-all"]),
+                true,
+                "covering just one of the recipe's families is enough",
+            ),
+            (
+                &two_families,
+                platform(&["aim"], &["gfx1151"]),
+                false,
+                "no family in common",
+            ),
+            (
+                &two_families,
+                platform(&["vllm"], &["gfx94X-dcgpu"]),
+                false,
+                "the engine does not run on the platform",
+            ),
+            (
+                &two_families,
+                platform(&["AIM"], &["GFX94X-DCGPU"]),
+                true,
+                "engine and family names compare without regard to case",
+            ),
+            (
+                &recipe(&["aim"], &[]),
+                platform(&["aim"], &["gfx1151"]),
+                true,
+                "an unrestricted recipe fits any platform running the engine",
+            ),
+            (
+                &recipe(&[], &["gfx94X-dcgpu"]),
+                platform(&["aim"], &["gfx94X-dcgpu"]),
+                false,
+                "no preferred engine, no platform",
+            ),
+        ] {
+            assert_eq!(
+                model_recipe_targets_platform(recipe, &platform),
+                expected,
+                "{why}"
+            );
+        }
     }
 
     #[test]

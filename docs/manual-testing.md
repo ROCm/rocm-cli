@@ -938,7 +938,10 @@ Expected result:
 ## 10. AIM (Docker) Engine Verification
 
 Linux/WSL2 only, and requires a reachable Docker daemon (`docker info` must
-succeed).
+succeed). The catalog entry used below has profiles for Radeon PRO W7900 and
+Radeon AI PRO R9700 (`gfx110X-all`, `gfx120X-all`) only; on any other GPU,
+such as Strix Halo or an Instinct card, `rocm serve` refuses it, so use the
+raw image form further down.
 
 ```bash
 rocm serve aim-qwen3.5-9b --engine aim --managed
@@ -957,8 +960,10 @@ and its downloaded weights, so a retry downloads them again.
 `aim-qwen3.5-9b` (canonical id `Qwen/Qwen3.5-9B`) is the catalog entry
 (`rocm model --verbose`). It supplies the pinned image and, for the detected GPU
 family, `AIM_PROFILE_ID`; on a GPU the image has no profile for (for example
-Strix Halo or an Instinct card) `rocm serve` refuses with the supported families. To serve a raw image reference instead, pass
-the profile yourself:
+Strix Halo or an Instinct card) `rocm serve` refuses with the supported
+families. An image whose smallest profile needs several GPUs is refused on every
+host, because `rocm serve` gives an engine one GPU. To serve a raw image
+reference instead, which skips these catalog checks, pass the profile yourself:
 
 ```bash
 rocm serve amdenterpriseai/aim-radeon-qwen-qwen3-5-9b:0.12.0-preview --engine aim \

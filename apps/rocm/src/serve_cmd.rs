@@ -112,7 +112,7 @@ pub(crate) fn select_serve_engine(
     }
 
     if let Some(engine) = recipe
-        .and_then(|recipe| recipe.preferred_engines.first())
+        .and_then(|recipe| recipe_preferred_engine(recipe, host_gpu_summary, cfg!(windows)))
         .filter(|value| !value.trim().is_empty())
     {
         return ServeEngineSelection {
@@ -125,6 +125,36 @@ pub(crate) fn select_serve_engine(
         engine: default_engine_for_platform().to_owned(),
         source: "platform default",
     }
+}
+
+/// The recipe's first preferred engine that can run on this host. AIM is only
+/// chosen on its own when the detected GPU family is one the image has a profile
+/// for and the host is Linux or WSL, so an undetected GPU or native Windows is not;
+/// otherwise the platform default applies, as it did before the recipe was
+/// catalogued. An explicit `--engine aim` never comes through here, and still
+/// gets the refusal that names the supported GPUs.
+fn recipe_preferred_engine<'a>(
+    recipe: &'a ModelRecipeRecord,
+    host_gpu_summary: Option<&rocm_core::HostGpuSummary>,
+    windows: bool,
+) -> Option<&'a str> {
+    let is_aim = |engine: &str| engine.eq_ignore_ascii_case("aim");
+    let aim_usable = !windows
+        && recipe
+            .engine_recipes
+            .iter()
+            .find(|record| is_aim(&record.engine))
+            .is_none_or(|record| {
+                matches!(
+                    engine_recipe_gfx_support(
+                        record,
+                        host_gpu_summary.and_then(|summary| summary.therock_family.as_deref()),
+                    ),
+                    GfxSupport::Supported(_)
+                ) || record.supported_gfx_families.is_empty()
+            });
+    let first = recipe.preferred_engines.first()?;
+    (aim_usable || !is_aim(first)).then_some(first.as_str())
 }
 
 fn model_recipe_supports_engine(recipe: &ModelRecipeRecord, engine: &str) -> bool {
@@ -219,7 +249,8 @@ fn engine_recipe_with_aim_gfx_profile(
     match engine_recipe_gfx_support(record, family.as_deref()) {
         GfxSupport::Unrestricted => Ok(hint),
         GfxSupport::Unsupported => bail!(
-            "the AIM image for `{}` has no profile for this GPU ({}); it supports: {}",
+            "the AIM image for `{}` has no profile for this GPU ({}); it supports: {}. Choose a model \
+             or engine that supports this GPU (`rocm model --verbose`)",
             recipe.canonical_model_id,
             family.as_deref().unwrap_or("unknown"),
             record.supported_gfx_families.join(", ")
@@ -295,21 +326,32 @@ fn aim_min_gpu_count(
 /// devices and fail inside the image.
 fn ensure_aim_multi_gpu_supported(model: &str, needed: u32) -> Result<()> {
     bail!(
-        "`{model}` needs {needed} GPUs on this hardware, but `rocm serve` does not support \
-         multi-GPU serving yet, so this model cannot be started here"
+        "`{model}` needs {needed} GPUs for this GPU family, but `rocm serve` runs an engine on \
+         one GPU and does not support multi-GPU serving yet, so this model cannot be started \
+         here however many GPUs the host has. Choose a model with a single-GPU profile \
+         (`rocm model --verbose`)"
     )
 }
 
-/// Note shown when the pinned AIM profile targets boards other than the detected
-/// GPU (a gfx family can cover cards the profile was not built for).
+/// Note shown when the AIM profile that was pinned for this serve targets boards
+/// other than the detected GPU (a gfx family can cover cards the profile was not
+/// built for). `hint` is the final engine hint: the note needs the catalog's
+/// profile to be what will actually run, so it stays quiet when no profile was
+/// pinned (GPU family undetected, `--device cpu_only`) or `--engine-env
+/// AIM_PROFILE_ID` replaced it.
 fn aim_board_note(
     engine: &str,
     recipe: Option<&ModelRecipeRecord>,
     gpu_name: Option<&str>,
+    hint: Option<&EngineRecipeHint>,
 ) -> Option<String> {
     let record = aim_engine_record(engine, recipe)?;
     let name = gpu_name?;
-    if record.profile_ids.is_empty() || record.supported_boards.is_empty() {
+    if record.supported_boards.is_empty() {
+        return None;
+    }
+    let pinned = hint?.extra_env.get("AIM_PROFILE_ID")?;
+    if !record.profile_ids.values().any(|id| id == pinned) {
         return None;
     }
     let squash = |value: &str| {
@@ -328,7 +370,7 @@ fn aim_board_note(
         return None;
     }
     Some(format!(
-        "the pinned AIM profile targets {}; `{name}` is not one of them, so it may not run well. Override with `--engine-env AIM_PROFILE_ID=<id>`",
+        "the pinned AIM profile `{pinned}` targets {}; `{name}` is not one of them, so it may not run well. Override with `--engine-env AIM_PROFILE_ID=<id>`",
         record.supported_boards.join(" / ")
     ))
 }
@@ -961,6 +1003,7 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
             &selected_engine,
             shared_recipe.as_ref(),
             aim_gpu_name.as_deref(),
+            engine_recipe.as_ref(),
         ),
     ]
     .into_iter()
@@ -1642,31 +1685,66 @@ mod tests {
     }
 
     #[test]
-    fn aim_catalogued_hf_ids_still_select_vllm_on_instinct_and_aim_elsewhere() {
+    fn aim_catalogued_hf_ids_pick_aim_only_on_a_gpu_it_supports() {
         // These ids had no recipe before the AIM catalog; cataloguing them must not
-        // move an Instinct host off vLLM, or refuse ids AIM has no Instinct profile for.
-        let instinct = rocm_core::HostGpuSummary {
-            therock_family: Some("gfx94X-dcgpu".to_owned()),
+        // move an Instinct host off vLLM, nor send a host the image has no profile
+        // for (or an undetected GPU, or native Windows) to an engine that refuses it.
+        let host = |family: Option<&str>| rocm_core::HostGpuSummary {
+            therock_family: family.map(str::to_owned),
             ..rocm_core::HostGpuSummary::default()
         };
-        let radeon = rocm_core::HostGpuSummary {
-            therock_family: Some("gfx1151".to_owned()),
-            ..rocm_core::HostGpuSummary::default()
-        };
-        for id in [
-            "meta-llama/Llama-3.1-8B-Instruct",
-            "openai/gpt-oss-20b",
-            "Qwen/Qwen3-32B",
+        let instinct = host(Some("gfx94X-dcgpu"));
+        let radeon = host(Some("gfx110X-all"));
+        let strix = host(Some("gfx1151"));
+        let undetected = host(None);
+
+        // An Instinct-only image (`Qwen/Qwen3-32B`) and a Radeon one
+        // (`Qwen/Qwen3.5-9B`) each get AIM on their own family and the platform
+        // default elsewhere.
+        let instinct_image = resolve_builtin_model_recipe("Qwen/Qwen3-32B").unwrap();
+        let radeon_image = resolve_builtin_model_recipe("Qwen/Qwen3.5-9B").unwrap();
+        for (recipe, family, windows, expected) in [
+            (&instinct_image, &instinct, false, Some("aim")),
+            (&instinct_image, &instinct, true, None),
+            (&instinct_image, &radeon, false, None),
+            (&instinct_image, &strix, false, None),
+            (&instinct_image, &undetected, false, None),
+            (&radeon_image, &radeon, false, Some("aim")),
+            (&radeon_image, &radeon, true, None),
+            (&radeon_image, &instinct, false, None),
+            (&radeon_image, &strix, false, None),
         ] {
-            let recipe = resolve_builtin_model_recipe(id).expect("aim-catalogued recipe");
-            assert!(model_recipe_supports_engine(&recipe, "aim"));
-            let on_instinct = select_serve_engine(None, None, Some(&recipe), Some(&instinct));
-            let on_radeon = select_serve_engine(None, None, Some(&recipe), Some(&radeon));
-            if !cfg!(windows) {
-                assert_eq!(on_instinct.engine, "vllm", "{id}");
-            }
-            assert_eq!(on_radeon.engine, "aim", "{id}");
+            assert_eq!(
+                recipe_preferred_engine(recipe, Some(family), windows),
+                expected,
+                "{} on {:?} (windows: {windows})",
+                recipe.canonical_model_id,
+                family.therock_family
+            );
         }
+        // No GPU summary at all is treated like an undetected GPU.
+        assert_eq!(recipe_preferred_engine(&radeon_image, None, false), None);
+        // Recipes that do not prefer AIM are untouched.
+        let vllm_only = resolve_builtin_model_recipe("meta-llama/Llama-3.2-3B-Instruct").unwrap();
+        assert_eq!(
+            recipe_preferred_engine(&vllm_only, Some(&strix), false),
+            Some("vllm")
+        );
+
+        // End to end through the selector. A vLLM-preferred host keeps vLLM; the
+        // rest follow the table above (the platform default is OS-specific, so
+        // compare against it rather than a literal).
+        let on_instinct = select_serve_engine(None, None, Some(&instinct_image), Some(&instinct));
+        if !cfg!(windows) {
+            assert_eq!(on_instinct.engine, "vllm");
+            let on_radeon = select_serve_engine(None, None, Some(&radeon_image), Some(&radeon));
+            assert_eq!(on_radeon.engine, "aim");
+        }
+        let on_strix = select_serve_engine(None, None, Some(&radeon_image), Some(&strix));
+        assert_eq!(on_strix.engine, default_engine_for_platform());
+        // An explicit engine is never overridden.
+        let explicit = select_serve_engine(Some("aim"), None, Some(&radeon_image), Some(&strix));
+        assert_eq!(explicit.engine, "aim");
     }
 
     #[test]
@@ -1903,17 +1981,48 @@ mod tests {
     }
 
     #[test]
-    fn aim_board_note_only_fires_for_a_pinned_profile_on_another_board() {
+    fn aim_board_note_only_fires_when_the_catalog_profile_is_what_runs() {
         let radeon = resolve_builtin_model_recipe("aim-qwen3.5-9b").expect("radeon aim entry");
-        assert!(aim_board_note("aim", Some(&radeon), Some("AMD Radeon PRO W7900")).is_none());
-        assert!(aim_board_note("aim", Some(&radeon), Some("AMD Radeon AI PRO R9700")).is_none());
-        let note = aim_board_note("aim", Some(&radeon), Some("AMD Radeon RX 7900 XTX"))
-            .expect("other board warns");
-        assert!(note.contains("W7900 / R9700") && note.contains("--engine-env AIM_PROFILE_ID"));
-        assert!(aim_board_note("aim", Some(&radeon), None).is_none());
+        // The hint the serve path ends up with once a GPU family was detected.
+        let pinned = engine_recipe_with_aim_gfx_profile(
+            "aim",
+            Some(&radeon),
+            protocol_engine_recipe_hint(&radeon, "aim"),
+            || Some("gfx110X-all".to_owned()),
+        )
+        .unwrap();
+        let note = |gpu: Option<&str>, hint: Option<&EngineRecipeHint>| {
+            aim_board_note("aim", Some(&radeon), gpu, hint)
+        };
+        assert!(note(Some("AMD Radeon PRO W7900"), pinned.as_ref()).is_none());
+        assert!(note(Some("AMD Radeon AI PRO R9700"), pinned.as_ref()).is_none());
+        let other = note(Some("AMD Radeon RX 7900 XTX"), pinned.as_ref()).expect("warns");
+        assert!(
+            other.contains("vllm-w7900-bf16-tp1-latency")
+                && other.contains("W7900 / R9700")
+                && other.contains("--engine-env AIM_PROFILE_ID"),
+            "{other}"
+        );
+        assert!(note(None, pinned.as_ref()).is_none());
+
+        // No pin applied (family undetected, or `--device cpu_only`): no claim about it.
+        let unpinned = engine_recipe_with_aim_gfx_profile(
+            "aim",
+            Some(&radeon),
+            protocol_engine_recipe_hint(&radeon, "aim"),
+            || None,
+        )
+        .unwrap();
+        assert!(note(Some("AMD Radeon RX 7900 XTX"), unpinned.as_ref()).is_none());
+        assert!(note(Some("AMD Radeon RX 7900 XTX"), None).is_none());
+        // An explicit AIM_PROFILE_ID replaced the catalog's: its board is the user's call.
+        let overridden =
+            engine_recipe_with_extra_env("aim", pinned, &["AIM_PROFILE_ID=vllm-other".to_owned()])
+                .unwrap();
+        assert!(note(Some("AMD Radeon RX 7900 XTX"), overridden.as_ref()).is_none());
         // Instinct images pin no profile, so there is nothing to mismatch.
         let instinct = resolve_builtin_model_recipe("Qwen/Qwen3-32B").expect("instinct entry");
-        assert!(aim_board_note("aim", Some(&instinct), Some("anything")).is_none());
+        assert!(aim_board_note("aim", Some(&instinct), Some("anything"), None).is_none());
     }
 
     #[test]

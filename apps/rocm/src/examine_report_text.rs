@@ -809,9 +809,14 @@ fn append_model_engine_recipe_settings_lines(output: &mut String, recipe: &Model
         if !engine_recipe.supported_gfx_families.is_empty() {
             let _ = writeln!(
                 output,
-                "      engine_recipe {} supported_gfx_families=[{}] profile_ids=[{}] min_gpu_counts=[{}]",
+                "      engine_recipe {} supported_gfx_families=[{}] requires_hf_token={} profile_ids=[{}] min_gpu_counts=[{}]",
                 engine_recipe.engine,
                 engine_recipe.supported_gfx_families.join(","),
+                if engine_recipe.requires_hf_token {
+                    "yes"
+                } else {
+                    "no"
+                },
                 format_string_map_or_none(&engine_recipe.profile_ids),
                 format_string_map_or_none(
                     &engine_recipe
@@ -2116,6 +2121,36 @@ mod tests {
         ));
         assert!(rendered.contains("llama-3.2-3b-instruct (8 GiB min GPU)"));
         assert!(rendered.contains("tiny-gpt2 (2 GiB min GPU)"));
+    }
+
+    #[test]
+    fn verbose_model_listing_shows_aim_gpu_families_and_token_requirement() {
+        let engine_lines = |id: &str| {
+            let recipe = rocm_core::resolve_builtin_model_recipe(id).expect("aim recipe");
+            let mut output = String::new();
+            append_model_engine_recipe_settings_lines(&mut output, &recipe);
+            output
+        };
+        let gated = engine_lines("meta-llama/Llama-3.2-3B-Instruct");
+        assert!(
+            gated.contains(
+                "engine_recipe aim supported_gfx_families=[gfx94X-dcgpu,gfx950-dcgpu] \
+                 requires_hf_token=yes profile_ids=[<none>] min_gpu_counts=[<none>]"
+            ),
+            "{gated}"
+        );
+        // Radeon images list the profile pinned per family and the GPU counts.
+        let radeon = engine_lines("zai-org/GLM-4.7-Flash");
+        assert!(
+            radeon.contains(
+                "supported_gfx_families=[gfx110X-all,gfx120X-all] requires_hf_token=no \
+                 profile_ids=[gfx110X-all="
+            ) && radeon.contains("min_gpu_counts=[gfx110X-all=2,gfx120X-all=4]"),
+            "{radeon}"
+        );
+        // A recipe with no AIM entry prints no such line.
+        let lemonade = engine_lines("qwen");
+        assert!(!lemonade.contains("supported_gfx_families"), "{lemonade}");
     }
 
     #[test]

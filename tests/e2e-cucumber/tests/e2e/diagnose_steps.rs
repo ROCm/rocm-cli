@@ -2238,7 +2238,7 @@ async fn assert_reason_is_not_curated(world: &mut E2eWorld) {
     );
 }
 
-fn workspace_root() -> std::path::PathBuf {
+pub(crate) fn workspace_root() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(std::path::Path::parent)
@@ -2246,7 +2246,7 @@ fn workspace_root() -> std::path::PathBuf {
         .to_path_buf()
 }
 
-fn xtask_command() -> std::process::Command {
+pub(crate) fn xtask_command() -> std::process::Command {
     if let Some(binary) = std::env::var_os("ROCM_XTASK_BINARY") {
         std::process::Command::new(binary)
     } else {
