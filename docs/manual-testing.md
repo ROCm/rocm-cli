@@ -435,7 +435,8 @@ libnuma), which can call `sudo`. `engines install` never asks for confirmation:
 without `--yes`, a Linux host with root or passwordless `sudo` installs a
 missing package anyway, and one that would need a password prints the commands
 to run while the install continues. With `--yes`, a failed OpenMPI install is an
-error; a failed libatomic or libnuma install only warns. If the
+error; a failed libatomic or libnuma install only warns. On Windows these
+installs are skipped. If the
 `install sdk` report above already printed an `engine auto-install` block for
 vLLM, that runtime has it; `--reinstall` is the flag that forces a reinstall
 when the engine already exists.
@@ -855,6 +856,9 @@ Expected result:
   then refuses with `uninstall requires --yes outside an interactive terminal`
   and exit code 1, and removes nothing. On Linux or WSL, check it with no
   terminal attached:
+
+  A regression would delete real settings, data and cache, so point `HOME` at
+  a scratch folder first:
 
   ```bash
   rocm uninstall --keep-binaries < /dev/null   # expect the refusal; exit 1

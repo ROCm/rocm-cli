@@ -886,7 +886,8 @@ rocm engines install vllm --reinstall")]
         /// passwordless sudo installs a missing package anyway, and one that
         /// would need a password prints the commands to run while the install
         /// continues. With --yes, a failed OpenMPI install is an error; a
-        /// failed libatomic or libnuma install only warns.
+        /// failed libatomic or libnuma install only warns. On Windows these
+        /// installs are skipped.
         #[arg(long)]
         yes: bool,
     },
@@ -5724,7 +5725,9 @@ pub(crate) mod tests {
         //   runtimes activate and rollback   runtime-lifecycle-11, -14, -17
         // Each entry is read from the `--yes` argument's own help, not the whole
         // page, so a sibling flag cannot satisfy it.
-        const REFUSES: &[&str] = &["(default: no)", "refuses with exit"];
+        // The trailing comma keeps `exit 1` from matching `exit 10`. Everything
+        // refuses with 1 except `fix`, whose exit 5 is its own declined status.
+        const REFUSES: &[&str] = &["(default: no)", "refuses with exit 1,"];
         const NEVER_ASKS: &[&str] = &["never asks for confirmation"];
         const NEVER_PROMPTS: &[&str] = &["never prompts"];
         let cases: &[(&[&str], &[&str])] = &[
@@ -5732,12 +5735,20 @@ pub(crate) mod tests {
             (&["runtimes", "uninstall"], REFUSES),
             (&["storage", "remove-old-installs"], REFUSES),
             (&["storage", "remove-downloads"], REFUSES),
-            (&["fix"], REFUSES),
+            (
+                &["fix"],
+                &["(default: no)", "refuses with exit 5,", "also exits 5"],
+            ),
             (&["install", "driver"], NEVER_ASKS),
             (
                 &["engines", "install"],
-                // Only OpenMPI's failure is an error; libatomic/libnuma warn.
-                &["never asks for confirmation", "only warns"],
+                &[
+                    "never asks for confirmation",
+                    // The least obvious sentence: no `--yes` still installs.
+                    "installs a missing package anyway",
+                    // Only OpenMPI's failure is an error; libatomic/libnuma warn.
+                    "only warns",
+                ],
             ),
             (&["runtimes", "activate"], NEVER_PROMPTS),
             (&["runtimes", "rollback"], NEVER_PROMPTS),

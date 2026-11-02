@@ -782,7 +782,8 @@ libnuma), including a `sudo` password prompt. `engines install` never asks for
 confirmation. Without `--yes`, a Linux host with root or passwordless `sudo`
 installs a missing package anyway, and one that would need a password prints the
 commands to run while the install continues. With `--yes`, a failed OpenMPI
-install is an error; a failed libatomic or libnuma install only warns.
+install is an error; a failed libatomic or libnuma install only warns. On
+Windows these installs are skipped.
 
 ### Will a model run here?
 
