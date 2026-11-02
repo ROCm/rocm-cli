@@ -469,12 +469,15 @@ impl MockServer {
     pub async fn start_on_port(model_name: &str, port: u16) -> Self {
         let last_chat_request = Arc::new(Mutex::new(None));
         let chat_paths = Arc::new(Mutex::new(Vec::new()));
+        let completion_requests = Arc::new(Mutex::new(Vec::new()));
         let state = ServerState {
             model_name: model_name.to_string(),
             metrics: None,
             scripted_metrics: None,
             last_chat_request: Arc::clone(&last_chat_request),
             chat_paths: Arc::clone(&chat_paths),
+            completion_requests: Arc::clone(&completion_requests),
+            chat_script: None,
         };
         let app = Router::new()
             .route("/v1/models", get(handle_models))
@@ -487,6 +490,7 @@ impl MockServer {
             scripted: None,
             last_chat_request,
             chat_paths,
+            completion_requests,
         }
     }
 
