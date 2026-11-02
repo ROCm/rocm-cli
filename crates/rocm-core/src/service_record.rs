@@ -383,10 +383,11 @@ impl ManagedServiceRecord {
         let storage_record = host_record.with_storage_paths();
         let bytes = serde_json::to_vec_pretty(&storage_record)
             .context("failed to serialize service record")?;
-        crate::write_atomic(&host_record.manifest_path, &bytes, "json").with_context(|| {
+        let manifest_path = &host_record.manifest_path;
+        crate::atomic_write::write_file_atomically(manifest_path, &bytes).with_context(|| {
             format!(
                 "failed to write service manifest {}",
-                host_record.manifest_path.display()
+                manifest_path.display()
             )
         })
     }
@@ -395,7 +396,8 @@ impl ManagedServiceRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{probe_test_record, temp_app_paths};
+    use crate::foreign_temp_probe::assert_write_spares_foreign_temp_files;
+    use crate::test_support::{probe_test_record, retired_temp_path, temp_app_paths};
 
     #[test]
     fn restarting_drops_the_previous_runs_inference_verification() {
@@ -539,6 +541,45 @@ mod tests {
         assert_eq!(record.supervisor_start_ticks, expected);
         assert_eq!(record.engine_pid, Some(pid));
         assert_eq!(record.engine_start_ticks, expected);
+    }
+
+    /// Writing a service manifest never writes through a file another writer
+    /// already staged next to it. The occupied names are the ones the retired
+    /// clock-and-pid temp naming would have picked, so a write that still used
+    /// one would truncate a foreign file and rename it into place. Reading the
+    /// manifest back would pass for either writer; the foreign files are what
+    /// tell them apart.
+    #[test]
+    fn writing_a_service_manifest_never_reuses_another_writers_temp_file() -> Result<()> {
+        let (root, paths) = temp_app_paths("record-write-foreign-temp");
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-foreign-temp",
+            "vllm",
+            "Qwen/Qwen3-0.6B",
+            "Qwen/Qwen3-0.6B",
+            "127.0.0.1",
+            9,
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            Some("gpu_required".to_owned()),
+        );
+        record.write()?;
+        record.startup_phase = Some("loading".to_owned());
+        let manifest_path = record.manifest_path.clone();
+
+        assert_write_spares_foreign_temp_files(
+            |millis| retired_temp_path(&manifest_path, millis),
+            || record.write(),
+        )?;
+
+        let published: ManagedServiceRecord = serde_json::from_slice(&fs::read(&manifest_path)?)?;
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(published.service_id, "svc-foreign-temp");
+        assert_eq!(published.startup_phase.as_deref(), Some("loading"));
+        Ok(())
     }
 
     #[test]
