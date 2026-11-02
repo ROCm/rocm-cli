@@ -1446,22 +1446,41 @@ async fn assert_service_in_list(world: &mut E2eWorld) {
 /// The `device:` value as `rocm serve` / `rocm services list` print it, split
 /// into the backend it names and the GPU ordinal it pinned, if any.
 ///
-/// Every engine reports `"<backend> gpu"` or `"<backend> gpu <n>"`
-/// (`engines/lemonade`'s and `engines/vllm`'s `reported_device`,
-/// `engines/aim`'s literal). `None` for anything else, which is what makes a
-/// hardcoded or malformed value fail rather than pass.
+/// Every engine renders it through
+/// `rocm_engine_protocol::format_reported_device`, so the grammar is
+/// `<backend>`, then an optional ` gpu <n>`, then an optional ` (<gpu name>)`.
+/// `None` for anything else, which is what makes a hardcoded or malformed value
+/// fail rather than pass.
 fn parse_device_row(value: &str) -> Option<(&str, Option<u32>)> {
-    let mut parts = value.split_whitespace();
+    // The name is the only part that may contain spaces, and it is always last
+    // and parenthesised. Split on the FIRST " (" so a name with its own
+    // parentheses ("AMD Radeon (TM) Graphics") still leaves the head intact.
+    let head = match value.split_once(" (") {
+        Some((head, name)) if name.ends_with(')') => head,
+        Some(_) => return None,
+        None => value,
+    };
+    let mut parts = head.split_whitespace();
     let backend = parts.next()?;
-    if parts.next()? != "gpu" {
-        return None;
-    }
     let ordinal = match parts.next() {
-        Some(index) => Some(index.parse().ok()?),
+        Some("gpu") => Some(parts.next()?.parse().ok()?),
+        // A bare `gpu` with no ordinal is the shape ROCMAI-550 removed; so is
+        // any other trailing word.
+        Some(_) => return None,
         None => None,
     };
     parts.next().is_none().then_some((backend, ordinal))
 }
+
+/// How long the `device:` row may take to show up after the serve returned.
+///
+/// It is not available the instant a service is recorded `ready`:
+/// `engines/lemonade` reports `"unknown"` until its own `inference_verified`
+/// probe has come back, and `fetch_service_device` drops `"unknown"` rather
+/// than printing it. So there is a real window in which a correct
+/// implementation has no row yet, and failing on the first look would make
+/// this step flake on timing rather than on behavior.
+const DEVICE_ROW_DEADLINE: Duration = Duration::from_secs(90);
 
 /// The value of the first `device:` row in `text`, trimmed.
 fn device_row_value(text: &str) -> Option<&str> {
@@ -1480,32 +1499,53 @@ fn device_row_value(text: &str) -> Option<&str> {
 /// `device:`" while reporting nothing real, so this parses it and holds it to
 /// three independent facts:
 ///
-/// 1. it has the `<backend> gpu [<n>]` shape every engine reports;
+/// 1. it has the `<backend> [gpu <n>] [(<name>)]` shape every engine reports;
 /// 2. the backend is one this engine can actually have selected - only
 ///    Lemonade has a Vulkan path, so `vulkan` from `vllm` or `aim` is wrong,
 ///    and `unknown` is wrong from any of them;
 /// 3. it equals what the `rocm serve` deployment summary printed for the same
 ///    service, which is the row the preceding Given produced and which nothing
 ///    else in these scenarios looks at.
+/// The row is polled rather than read once: see [`DEVICE_ROW_DEADLINE`] for
+/// the window in which a correct implementation legitimately has no row yet.
+/// Running out of that window is an assertion naming what was last seen, not a
+/// panic on the first look.
 #[then("the services list reports the engine's actual backend device")]
 async fn assert_services_list_reports_device(world: &mut E2eWorld) {
-    let (stdout, _, _) = crate::run_rocm(world, &["services", "list"]);
-    let model = world.model_name.as_deref().unwrap_or("");
-    let block = stdout
-        .split("\n- ")
-        .find(|block| block.to_lowercase().contains(&model.to_lowercase()))
-        .unwrap_or_else(|| panic!("no services-list entry for model {model}:\n{stdout}"));
-    let device = device_row_value(block).unwrap_or_else(|| {
+    let model = world.model_name.clone().unwrap_or_default();
+    let deadline = Instant::now() + DEVICE_ROW_DEADLINE;
+    // The last thing looked at, so a timeout can show it rather than just
+    // saying it timed out: the service's own block when there was one, else the
+    // whole listing (which is the evidence for the service having gone missing).
+    let mut last_seen = String::new();
+    let device = loop {
+        let (stdout, _, _) = crate::run_rocm(world, &["services", "list"]);
+        match stdout
+            .split("\n- ")
+            .find(|block| block.to_lowercase().contains(&model.to_lowercase()))
+        {
+            Some(block) => {
+                last_seen = block.to_owned();
+                if let Some(device) = device_row_value(&last_seen) {
+                    break device.to_owned();
+                }
+            }
+            None => last_seen = stdout,
+        }
+        assert!(
+            Instant::now() < deadline,
+            "after {}s `rocm services list` still reports no `device:` line for \
+             {model} - the engine's Healthcheck RPC should report the backend it \
+             actually selected once the service is serving:\n{last_seen}",
+            DEVICE_ROW_DEADLINE.as_secs()
+        );
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    };
+    let block = last_seen.as_str();
+    let (backend, _ordinal) = parse_device_row(&device).unwrap_or_else(|| {
         panic!(
-            "services list entry for {model} is missing a `device:` line - the \
-             engine's Healthcheck RPC should report the backend it actually \
-             selected:\n{block}"
-        )
-    });
-    let (backend, _ordinal) = parse_device_row(device).unwrap_or_else(|| {
-        panic!(
-            "`device: {device}` is not the `<backend> gpu [<n>]` shape every \
-             engine reports, so it cannot be the engine's own answer:\n{block}"
+            "`device: {device}` is not the `<backend> [gpu <n>] [(<name>)]` shape \
+             every engine reports, so it cannot be the engine's own answer:\n{block}"
         )
     });
 

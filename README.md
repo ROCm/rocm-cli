@@ -865,7 +865,8 @@ services stop <service-id> --yes`) or match the original flags.
 By default the server runs in the background under ROCm CLI's supervision and
 prints a deployment summary: a progress indicator while it starts, then a table
 with the status, the engine and the backend device it actually selected (for
-example `rocm gpu 0` or `vulkan gpu 0`, read back from the running engine), the
+example `rocm gpu 0 (AMD Instinct MI300X)`, or `vulkan (AMD Radeon Graphics)`
+where the engine pinned no GPU ordinal — read back from the running engine), the
 full inference endpoint, the API-qualified model name, and a quick smoke test
 (time to first token and approximate tokens per second). `rocm services` reports
 the same `device` for each running service. Control
@@ -920,6 +921,13 @@ rocm services restart <service-id> --yes
 rocm services remove <service-id> --yes
 rocm services prune [--older-than-hours <n> | --any-age] [--dry-run] [--yes]
 ```
+
+`list` asks each running server which backend and GPU it is actually on, so it
+can take a few seconds rather than returning instantly. The query is capped in
+total — about 18 seconds worst case, however many servers are listed — and a
+server that does not answer in time simply has no `device` line rather than
+holding up the rest of the list. The same applies to asking about servers in
+`rocm chat`, which prints the same list.
 
 `restart` starts a server again only once its stop has confirmed that every
 recorded process is gone; if the stop cannot confirm that, it says so, starts

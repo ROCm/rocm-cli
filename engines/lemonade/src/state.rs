@@ -55,13 +55,29 @@ pub(crate) fn inference_verified(
 }
 
 /// The device string reported once a model is loaded. Reflects the backend that
-/// actually ran (`rocm`, `vulkan`, …) and the pinned GPU ordinal when known,
-/// rather than a hardcoded value, so the report matches observed execution.
+/// actually ran (`rocm`, `vulkan`, …), the pinned GPU ordinal when known, and
+/// the GPU name recorded at launch, rather than a hardcoded value, so the
+/// report matches observed execution.
+///
+/// Formatted by [`rocm_engine_protocol::format_reported_device`] so all three
+/// engines render one shape; see that function for why the ordinal-less row
+/// drops the `gpu` noun rather than printing a bare `vulkan gpu`.
 pub(crate) fn reported_device(state: Option<&Value>, backend: &str) -> String {
-    match state.and_then(first_gpu_index_from_state) {
-        Some(index) => format!("{backend} gpu {index}"),
-        None => format!("{backend} gpu"),
-    }
+    rocm_engine_protocol::format_reported_device(
+        backend,
+        state.and_then(first_gpu_index_from_state),
+        state.and_then(gpu_name_from_state).as_deref(),
+    )
+}
+
+/// The GPU name recorded in service state at launch, if any.
+///
+/// Read back rather than re-probed: `healthcheck_service` runs on the
+/// `rocm services list` render path (see `fetch_service_devices`), where an
+/// extra host probe per service is latency the row is not worth, and the launch
+/// host is the one whose GPU actually ran the server.
+fn gpu_name_from_state(state: &Value) -> Option<String> {
+    value_string(state, "gpu_name")
 }
 
 /// The first pinned GPU ordinal recorded in service state, if any.
@@ -155,6 +171,13 @@ pub(crate) fn write_running_state(
             "endpoint_url": endpoint_url(&request.host, request.port),
             "device_policy": device_policy_name(&request.device_policy),
             "gpu_indices": request.gpu_indices,
+            // The host's GPU name, so `healthcheck_service` can name a device
+            // and not just a backend (ROCMAI-550). Captured here, once, rather
+            // than probed per healthcheck: `rocm services list` healthchecks
+            // every ready service on its render path. Recorded even when it is
+            // `null`, so the key's absence means an older state file rather
+            // than a probe that came back empty.
+            "gpu_name": rocm_core::detect_host_gpu_summary(None).name,
             "runtime_id": request.runtime_id.as_deref().unwrap_or(runtime.manifest.env_id.as_str()),
             "env_id": request.env_id.as_deref().unwrap_or(runtime.manifest.env_id.as_str()),
             "runtime_kind": "lemonade_embeddable",
@@ -700,11 +723,34 @@ mod tests {
     }
 
     #[test]
-    fn reported_device_reflects_backend_and_pinned_ordinal() {
-        let state = json!({ "gpu_indices": [1] });
-        assert_eq!(reported_device(Some(&state), "vulkan"), "vulkan gpu 1");
+    fn reported_device_reflects_backend_pinned_ordinal_and_gpu_name() {
+        let state = json!({ "gpu_indices": [1], "gpu_name": "AMD Instinct MI300X" });
+        assert_eq!(
+            reported_device(Some(&state), "vulkan"),
+            "vulkan gpu 1 (AMD Instinct MI300X)"
+        );
         // Without a recorded ordinal the backend is still reported truthfully.
-        assert_eq!(reported_device(None, "rocm"), "rocm gpu");
+        assert_eq!(reported_device(None, "rocm"), "rocm");
+    }
+
+    /// ROCMAI-550's own host: Windows cannot probe GPU ordinals
+    /// (`rocm_core::usable_amd_gpu_indices` is `None` off Linux), so a default
+    /// `rocm serve` records an empty `gpu_indices` there and the only
+    /// device-identifying fact in state is the name. Before this the row read
+    /// `vulkan gpu` — the backend, then a noun naming nothing — which is the
+    /// shape the ticket filed as "doesn't show the GPU".
+    #[test]
+    fn reported_device_names_the_gpu_when_no_ordinal_was_pinned() {
+        let state = json!({ "gpu_indices": [], "gpu_name": "AMD Radeon(TM) Graphics" });
+        assert_eq!(
+            reported_device(Some(&state), "vulkan"),
+            "vulkan (AMD Radeon(TM) Graphics)"
+        );
+
+        // An older state file, written before `gpu_name` was recorded, still
+        // reports its backend rather than a dangling noun.
+        let legacy = json!({ "gpu_indices": [] });
+        assert_eq!(reported_device(Some(&legacy), "vulkan"), "vulkan");
     }
 
     #[test]

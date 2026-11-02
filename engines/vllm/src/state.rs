@@ -81,14 +81,16 @@ pub(crate) fn healthcheck_service(request: HealthcheckRequest) -> Result<Healthc
 /// `rocm serve`'s `device:` row and `rocm services list` print whichever engine
 /// answered verbatim. It used to be the literal `"rocm_gpu"`, so the same row
 /// read `rocm_gpu` for vLLM and `vulkan gpu 0` for Lemonade, and neither
-/// README.md nor `docs/manual-testing.md` described the former. Falls back to
-/// the ordinal-less form when the launch pinned no specific GPU, exactly as
-/// Lemonade's does.
+/// README.md nor `docs/manual-testing.md` described the former. Both halves are
+/// now formatted by [`rocm_engine_protocol::format_reported_device`], shared
+/// with Lemonade, which is also what keeps an unpinned launch from rendering a
+/// dangling `rocm gpu`.
 fn reported_device(state: &Value) -> String {
-    match first_gpu_index_from_state(state) {
-        Some(index) => format!("rocm gpu {index}"),
-        None => "rocm gpu".to_owned(),
-    }
+    rocm_engine_protocol::format_reported_device(
+        "rocm",
+        first_gpu_index_from_state(state),
+        value_string(state, "gpu_name").as_deref(),
+    )
 }
 
 /// The first pinned GPU ordinal recorded in service state, if any.
@@ -178,10 +180,15 @@ pub(crate) fn write_running_state(
             "endpoint_url": endpoint_url(&request.host, request.port),
             "device_policy": "gpu_required",
             // Recorded so `healthcheck_service` can report the GPU this service
-            // was actually pinned to, in the same `"rocm gpu <n>"` shape
-            // `engines/lemonade` reports. Introspection only, like the rest of
-            // this file — never read back to relaunch.
+            // was actually pinned to, in the same shape `engines/lemonade`
+            // reports. Introspection only, like the rest of this file — never
+            // read back to relaunch.
             "gpu_indices": request.gpu_indices,
+            // The host's GPU name, so the `device:` row names a device and not
+            // only a backend (ROCMAI-550). Captured once here rather than
+            // probed per healthcheck, because `rocm services list`
+            // healthchecks every ready service on its render path.
+            "gpu_name": rocm_core::detect_host_gpu_summary(None).name,
             "runtime_id": runtime.runtime_id,
             "requested_runtime_id": request.runtime_id,
             "env_id": request.env_id.as_deref().unwrap_or(runtime.env_id.as_str()),
@@ -751,19 +758,27 @@ mod tests {
 
     /// The `device:` row `rocm serve` and `rocm services list` print comes
     /// straight from this string, so vLLM has to speak the same shape
-    /// `engines/lemonade` does (`"{backend} gpu {index}"`). It used to be the
-    /// literal `"rocm_gpu"`, which is the format README.md and
-    /// `docs/manual-testing.md` never described and which made one row
-    /// disagree with itself across engines.
+    /// `engines/lemonade` does. It used to be the literal `"rocm_gpu"`, which
+    /// is the format README.md and `docs/manual-testing.md` never described and
+    /// which made one row disagree with itself across engines.
     #[test]
     fn reported_device_matches_the_shape_lemonade_reports() {
+        assert_eq!(
+            reported_device(&json!({ "gpu_indices": [1], "gpu_name": "AMD Instinct MI300X" })),
+            "rocm gpu 1 (AMD Instinct MI300X)"
+        );
         assert_eq!(
             reported_device(&json!({ "gpu_indices": [1] })),
             "rocm gpu 1"
         );
         // No pinned ordinal recorded: the backend is still reported truthfully,
-        // exactly as `engines/lemonade`'s `reported_device(None, "rocm")` does.
-        assert_eq!(reported_device(&json!({ "status": "running" })), "rocm gpu");
-        assert_eq!(reported_device(&json!({ "gpu_indices": [] })), "rocm gpu");
+        // exactly as `engines/lemonade`'s `reported_device(None, "rocm")` does,
+        // and without the dangling `gpu` noun that names no device.
+        assert_eq!(reported_device(&json!({ "status": "running" })), "rocm");
+        assert_eq!(reported_device(&json!({ "gpu_indices": [] })), "rocm");
+        assert_eq!(
+            reported_device(&json!({ "gpu_name": "AMD Instinct MI300X" })),
+            "rocm (AMD Instinct MI300X)"
+        );
     }
 }
