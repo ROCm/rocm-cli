@@ -198,8 +198,15 @@ fn preflight_passes(
             && (host_kfd_device == real_kfd_device || device_accessible(host_kfd_device)))
 }
 
+/// Shared with `rocm-core`'s `/dev/kfd` pre-flight rather than restated here.
+///
+/// This was a plain `OpenOptions::open(..).is_ok()`, which left the dashboard
+/// collector as the one `amd-smi` launch site that could still block forever on
+/// a wedged device after EAI-8457 bounded every other one. The shared probe
+/// carries the 2s bound and the in-flight budget with it, so this site cannot
+/// drift away from the gate it is part of.
 fn device_accessible(path: &Path) -> bool {
-    std::fs::OpenOptions::new().read(true).open(path).is_ok()
+    rocm_core::device_readable_bounded(path)
 }
 
 fn val_u64(v: Option<&Value>) -> Option<u64> {

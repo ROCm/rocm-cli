@@ -54,7 +54,7 @@ mod test_env;
 mod test_support;
 pub mod uv;
 pub mod windows_driver;
-pub use amd_smi::{amd_smi_json, resolve_amd_smi_binary};
+pub use amd_smi::{amd_smi_json, device_readable_bounded, resolve_amd_smi_binary};
 pub use automation::{
     AuditEventRecord, AutomationEventRecord, AutomationProposalRecord, AutomationRuntimeState,
     AutomationTriggerEvent, BuiltinWatcherSpec, EVENT_LOG_ROTATE_BYTES,

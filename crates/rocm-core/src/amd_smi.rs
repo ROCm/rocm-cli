@@ -399,6 +399,36 @@ fn device_readable_within_budget(
     receiver.recv_timeout(timeout).unwrap_or(false)
 }
 
+/// A read probe of `device` that cannot park the caller.
+///
+/// This is the bounded open this module already uses for its own `/dev/kfd`
+/// pre-flight, exposed for the other crate that gates an `amd-smi` launch on
+/// the same device.
+///
+/// `rocm-dash-collectors` runs its own pre-flight before spawning `amd-smi` for
+/// the dashboard's GPU metrics, on the same `/dev/kfd` and for the same reason.
+/// It used a plain `OpenOptions::open(..).is_ok()`, so the one launch site not
+/// routed through this module could still block indefinitely on a wedged device
+/// — the exact hazard the gate removes everywhere else. Sharing the probe rather
+/// than restating it there keeps the bound, the budget, and the reasoning about
+/// why both failure branches decline in one place; a second copy would be free
+/// to drift away from all three.
+///
+/// Off Linux this is a direct open, matching [`kfd_readable`]'s wave-through:
+/// there is no `/dev/kfd` to wedge, and the bound would buy nothing.
+pub fn device_readable_bounded(device: &Path) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        device_readable(device)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // Fully qualified: the `fs` import is Linux-gated, since the bounded
+        // probe is the only other user of it.
+        std::fs::OpenOptions::new().read(true).open(device).is_ok()
+    }
+}
+
 /// Off-Linux counterpart of [`kfd_readable`]: see that function's docs for why
 /// the wave-through is load-bearing rather than a stub.
 ///
