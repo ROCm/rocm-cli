@@ -36,6 +36,7 @@ mod provider_keys;
 mod providers;
 mod remote;
 mod runtime_install_finalize;
+mod runtime_registry;
 mod runtime_services;
 mod runtimes_cmd;
 mod serve_cmd;
@@ -115,8 +116,8 @@ use crate::runtime_install_finalize::{
     print_sdk_install_success,
 };
 use crate::runtimes_cmd::{
-    active_runtime_marker_path, current_runtime_manifest, default_runtime_id_matches,
-    recover_setup_runtime_registration, runtime_usability_status, runtimes, setup_runtime_paths,
+    active_runtime_marker_path, current_runtime_manifest, recover_setup_runtime_registration,
+    runtime_usability_status, runtimes, setup_runtime_paths,
     validate_runtime_manifest_for_activation,
 };
 use crate::serve_cmd::{ServeArgs, select_serve_engine, serve};

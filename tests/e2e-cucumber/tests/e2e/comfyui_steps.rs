@@ -169,7 +169,7 @@ fn install_fake_python(path: &Path) {
 // A simplified stand-in for `rocm_core::runtime_rocm_library_filename` rather
 // than imported: only the filename's look matters here, since readiness only
 // checks `path.is_file()` on whatever the manifest lists (see
-// `probe_has_resolved_library` in `apps/rocm/src/therock.rs`) — never the
+// `probe_has_resolved_library` in `apps/rocm/src/runtime_registry.rs`) — never the
 // filename itself. Importing the product crate for that would buy nothing,
 // so it stays a local stand-in.
 fn rocm_library_filename(shortname: &str) -> String {
