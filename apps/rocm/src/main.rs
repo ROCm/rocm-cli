@@ -5722,7 +5722,8 @@ pub(crate) mod tests {
         //   fix                    diagnose-08, `consent_without_prompt` unit tests
         //   install driver         driver-install-02
         //   engines install        `system_package_install_action` unit tests
-        //   runtimes activate and rollback   runtime-lifecycle-11, -14, -17
+        //   runtimes activate and rollback   runtime-lifecycle-11 and -14
+        //                          (--restart-services without --yes), -17 (--yes without it)
         // Each entry is read from the `--yes` argument's own help, not the whole
         // page, so a sibling flag cannot satisfy it.
         // The trailing comma keeps `exit 1` from matching `exit 10`. Everything

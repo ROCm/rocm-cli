@@ -855,13 +855,11 @@ Expected result:
 - Without `--yes` and without a terminal, the command prints the same review,
   then refuses with `uninstall requires --yes outside an interactive terminal`
   and exit code 1, and removes nothing. On Linux or WSL, check it with no
-  terminal attached:
-
-  A regression would delete real settings, data and cache, so point `HOME` at
-  a scratch folder first:
+  terminal attached. A regression would delete real settings, data and cache,
+  so the command points `HOME` at a scratch folder itself:
 
   ```bash
-  rocm uninstall --keep-binaries < /dev/null   # expect the refusal; exit 1
+  HOME=$(mktemp -d) rocm uninstall --keep-binaries < /dev/null   # expect the refusal; exit 1
   ```
 
   At a terminal, the same command asks `[y/N]` and treats Enter as no.

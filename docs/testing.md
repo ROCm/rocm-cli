@@ -895,13 +895,14 @@ step with this table. The help is a wording pin; the behavior is proven here:
 | `rocm fix` | prints the plan, refuses, exit 5 (stdin only decides) | `diagnose-08` (Linux, bare metal) |
 | `rocm install driver` | never asks; prints the plan, changes nothing, exit 0 | `driver-install-02` (WSL) |
 | `rocm engines install` | never asks; a missing package installs only where no password is needed | `system_package_install_action` unit tests |
-| `rocm runtimes activate`, `rollback` | never ask; `--restart-services` is refused without `--yes` | `runtime-lifecycle-11`, `-14`, `-17` |
+| `rocm runtimes activate`, `rollback` | never ask; `--restart-services` is refused without `--yes`, and `--yes` is refused without `--restart-services` | `runtime-lifecycle-11`, `-14` (the first), `-17` (the second) |
 
 To check the first row by hand, run the command with no terminal attached. A
-regression would delete real settings, so point `HOME` at a scratch folder first:
+regression would delete real settings, so the command points `HOME` at a
+scratch folder itself:
 
 ```bash
-rocm uninstall --keep-binaries < /dev/null   # expect the refusal; exit 1
+HOME=$(mktemp -d) rocm uninstall --keep-binaries < /dev/null   # expect the refusal; exit 1
 ```
 
 ## Provider-Assisted Planning
