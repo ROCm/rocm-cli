@@ -6260,8 +6260,8 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let _root = RestoredEnvVar::set(TEST_HOST_ROOT_ENV, &root);
 
-            let gpu_nodes = crate::host_gpu::linux_kfd_gpu_node_count();
-            let gfx_target = crate::host_gpu::detect_linux_kfd_gfx_target();
+            let gpu_nodes = crate::host_gpu::linux::linux_kfd_gpu_node_count();
+            let gfx_target = crate::host_gpu::linux::detect_linux_kfd_gfx_target();
             let kfd = stat_device("/dev/kfd", "nobody", &[]);
             let wsl = crate::is_wsl_host();
             let mut podman = Examination::default();
