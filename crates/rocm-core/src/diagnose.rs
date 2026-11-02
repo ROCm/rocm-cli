@@ -3193,10 +3193,10 @@ pub fn upstream_route(target: &str) -> Route {
 /// ever sets to `pytorch`, `llama-cpp`, `unknown` or `skipped` — so those two
 /// named arms plus the ROCm-core default are the whole reachable set.
 ///
-/// Adding a framework to `examine.rs`'s probe means adding its arm here, its
+/// Adding a framework to `examine/framework.rs`'s probe means adding its arm here, its
 /// tracker in [`upstream_tracker`], and its name to the hand-maintained list in
 /// `routing_targets_cover_every_framework_the_probe_reports`. That test reads
-/// its own list rather than deriving one from `examine.rs`, so it cannot notice
+/// its own list rather than deriving one from `examine/framework.rs`, so it cannot notice
 /// a new framework on its own — all three edits are manual.
 fn route_when_no_match(e: &Examination) -> Route {
     let target = match e.framework.as_str() {
@@ -4647,7 +4647,7 @@ mod tests {
     fn comgr_matches_runtime_never_disagrees_with_the_diagnosis() {
         // `rocm examine --json`'s `comgr_matches_runtime` and `rocm diagnose`'s
         // fix-18 finding answer the same question about the same machine. Both
-        // are driven by `comgr_matches_runtime` in `examine.rs`, so this checks
+        // are driven by `comgr_matches_runtime` in `examine/library_copies.rs`, so this checks
         // the two surfaces stay in lockstep across every shape the catalog
         // itself tests -- including the case that used to disagree: a runtime
         // whose own installation ships no code object manager at all.

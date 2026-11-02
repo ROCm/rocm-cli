@@ -2587,7 +2587,7 @@ fi
     /// 403 `lm-format-enforcer` needs), and a torch realign call must follow
     /// it so that install's full-dependency resolve cannot leave an
     /// unconstrained torch in place. Runs offline against fake `uv`/`python`
-    /// shims, same pattern as `crates/rocm-core/src/examine.rs`.
+    /// shims, same pattern as `crates/rocm-core/src/examine/framework.rs`.
     #[test]
     #[cfg(unix)]
     fn install_vllm_rocm10_discover_realigns_torch_after_the_config_file_install() -> Result<()> {

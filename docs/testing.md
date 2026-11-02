@@ -1995,7 +1995,7 @@ value `sh` would assign or nothing: the driver plan
 ([`driver_install.rs`](../apps/rocm/src/driver_install.rs)), the OpenMPI,
 libatomic and libnuma install plans `rocm` runs before serving and the hints
 naming them ([`openmpi.rs`](../crates/rocm-core/src/openmpi.rs)), `rocm
-examine`'s distro fields ([`examine.rs`](../crates/rocm-core/src/examine.rs)),
+examine`'s distro fields ([`host_env.rs`](../crates/rocm-core/src/examine/host_env.rs)),
 and the distro name it prints
 ([`os_facts.rs`](../crates/rocm-core/src/host_gpu/os_facts.rs)). The one exception is
 `rocm diagnose --distro` run from Windows, which has the WSL distribution's own
