@@ -1201,12 +1201,12 @@ const NOT_INVOCATIONS: &[(&str, &str, &str)] = &[
         "error message",
     ),
     (
-        "apps/rocmd/src/service.rs",
+        "apps/rocmd/src/daemon.rs",
         "rocmd automation supervisor started",
         "log line",
     ),
     (
-        "apps/rocmd/src/service.rs",
+        "apps/rocmd/src/daemon.rs",
         "rocmd automation supervisor stopped",
         "log line",
     ),
