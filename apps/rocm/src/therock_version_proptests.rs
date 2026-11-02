@@ -23,13 +23,13 @@ use proptest::prelude::*;
 use proptest::strategy::ValueTree;
 use proptest::test_runner::{Config as ProptestConfig, TestRunner};
 
+use super::resolve::select_rocm_version;
 use super::version::{
     VersionOrderKey, VersionStage, compare_version_strings, parse_host_version, parse_version,
     parse_version_for_ordering,
 };
 use super::{
-    InstalledRuntimeManifest, RuntimeFreshness, runtime_freshness, select_rocm_version,
-    select_startup_update_manifest,
+    InstalledRuntimeManifest, RuntimeFreshness, runtime_freshness, select_startup_update_manifest,
 };
 use crate::runtime_registry::sort_manifests_newest_install_first;
 use crate::storage::{RetentionInputs, select_runtimes_to_remove};
