@@ -57,6 +57,7 @@ mod services_cmd;
 mod services_text;
 mod setup_cmd;
 mod storage;
+mod system_packages;
 #[cfg(test)]
 mod test_support;
 mod therock;
