@@ -991,7 +991,7 @@ mod tests {
     use super::*;
     // Shared with `app`'s own test module rather than each carrying its own
     // byte-identical copy — see its doc comment.
-    use crate::app::test_support::with_registry_probe;
+    use crate::app::test_support::{st, with_registry_probe};
 
     #[test]
     fn wide_triptych_aligns_tabs_with_center_not_far_left() {
@@ -1354,88 +1354,6 @@ mod tests {
             "must not offer to stop something `s` can't reach: {:?}",
             dashboard_unmanaged.body
         );
-    }
-
-    #[test]
-    fn quit_confirm_open_services_key_focuses_the_stoppable_managed_row() {
-        use crossterm::event::KeyCode;
-        use rocm_dash_core::metrics::{Instance, InstanceStatus};
-        let mut s = AppState::new("t".into(), "default-dark".into());
-        // Sorts before "svc-managed" by id (`service_rows` sorts by id), so a
-        // naive "just pick row 0" would wrongly focus this unmanaged one.
-        s.instances.insert(
-            "docker-abc".to_string(),
-            Instance {
-                container_id: "docker-abc".to_string(),
-                status: InstanceStatus::Running,
-                ..Default::default()
-            },
-        );
-        s.instances.insert(
-            "svc-managed".to_string(),
-            Instance {
-                container_id: "svc-managed".to_string(),
-                status: InstanceStatus::Running,
-                ..Default::default()
-            },
-        );
-        with_registry_probe(&mut s, true, &["svc-managed"]);
-        s.open_quit_confirm();
-
-        assert!(s.quit_confirm_open_services_key(KeyCode::Char('s')));
-        assert!(
-            s.quit_confirm.is_none(),
-            "the quit-confirm prompt must close once `s` is handled"
-        );
-        let services = s
-            .services
-            .as_ref()
-            .expect("`s` must open the Services overlay");
-        let rows = crate::ui::services_manager::service_rows(&s.instances);
-        assert_eq!(
-            rows[services.selected].id, "svc-managed",
-            "must focus the stoppable managed row, not whichever sorts first: {rows:?}"
-        );
-    }
-
-    #[test]
-    fn quit_confirm_open_services_key_is_a_no_op_without_a_stoppable_managed_instance() {
-        use crossterm::event::KeyCode;
-        use rocm_dash_core::metrics::{Instance, InstanceStatus};
-        let mut s = AppState::new("t".into(), "default-dark".into());
-        s.instances.insert(
-            "docker-abc".to_string(),
-            Instance {
-                container_id: "docker-abc".to_string(),
-                status: InstanceStatus::Running,
-                ..Default::default()
-            },
-        );
-        s.open_quit_confirm();
-
-        assert!(!s.quit_confirm_open_services_key(KeyCode::Char('s')));
-        assert!(
-            s.quit_confirm.is_some(),
-            "nothing to stop: the prompt must stay open for its normal y/n/Esc handling"
-        );
-        assert!(s.services.is_none());
-    }
-
-    #[test]
-    fn quit_confirm_open_services_key_ignores_other_keys_and_a_closed_prompt() {
-        use crossterm::event::KeyCode;
-        let mut s = AppState::new("t".into(), "default-dark".into());
-        assert!(
-            !s.quit_confirm_open_services_key(KeyCode::Char('s')),
-            "must not fire while the prompt isn't open"
-        );
-
-        s.open_quit_confirm();
-        assert!(
-            !s.quit_confirm_open_services_key(KeyCode::Char('y')),
-            "must not fire for any key other than `s`"
-        );
-        assert!(s.quit_confirm.is_some());
     }
 
     #[test]
@@ -2503,6 +2421,90 @@ mod tests {
         assert!(
             painted.contains("quit"),
             "the focused-host renderer must render the quit-confirm prompt: {painted:?}"
+        );
+    }
+
+    #[test]
+    fn draw_focused_shows_overlay_without_tab_chrome() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut s = st();
+        // Intro card (no auto-run) → deterministic overlay content to assert on.
+        s.examine_manager = Some(crate::ui::examine_manager::ExamineManagerState::default());
+        let backend = TestBackend::new(120, 32);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| crate::ui::draw_focused(f, &mut s)).unwrap();
+        let out: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(out.contains("Examine"), "overlay content present: {out:?}");
+        assert!(
+            !out.contains("1–5"),
+            "no dash tab-shell hint in focused mode"
+        );
+        assert!(
+            out.contains("Esc"),
+            "focused hint carries an Esc affordance"
+        );
+        // Periphery must carry the same grey_overlay wash `draw()` uses behind
+        // every dashboard modal — text-only assertions above would still pass
+        // if the `grey_overlay` call in `draw_focused` were dropped, since the
+        // corner is plain theme bg either way in terms of glyphs (it's blank).
+        let wash = ratatui::style::Color::Rgb(0x1c, 0x1e, 0x22);
+        let corner = term.backend().buffer().cell((0, 0)).unwrap();
+        assert_eq!(
+            corner.style().bg,
+            Some(wash),
+            "corner cell must carry grey_overlay's wash bg, not plain theme bg"
+        );
+        // The "Esc back to menu" hint is rendered with a foreground-only
+        // style (no explicit bg), and `ratatui::Style::patch` leaves an
+        // unset field alone rather than clearing it — so the hint inherits
+        // grey_overlay's wash bg from the cells underneath it, exactly like
+        // `draw()`'s footer. Assert on the cell directly (not just its
+        // text), so this fails if the hint's style ever gains an explicit
+        // `bg` that would revert it to plain theme background.
+        let hint_row_y = term.backend().buffer().area().height - 1;
+        let hint_cell = term.backend().buffer().cell((0, hint_row_y)).unwrap();
+        assert_eq!(
+            hint_cell.symbol(),
+            "E",
+            "hint row should start with the Esc affordance"
+        );
+        assert_eq!(
+            hint_cell.style().bg,
+            Some(wash),
+            "the Esc hint inherits grey_overlay's wash bg, same as draw()'s footer"
+        );
+    }
+
+    #[test]
+    fn draw_focused_serve_with_empty_recipes_does_not_panic() {
+        // Edge input: the serve wizard must render (and the focused host must
+        // paint it) with NO built-in recipes — the user can still type a path.
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut s = st();
+        s.model_recipes = Vec::new();
+        s.serve_wizard = Some(crate::ui::serve_wizard::ServeWizardState::default());
+        let backend = TestBackend::new(120, 32);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| crate::ui::draw_focused(f, &mut s)).unwrap();
+        let out: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        // No panic == pass; the focused hint is present regardless of recipes.
+        assert!(
+            out.contains("Esc"),
+            "focused hint renders with empty recipes"
         );
     }
 }

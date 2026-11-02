@@ -560,6 +560,7 @@ impl ScrollTarget {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::test_support::args_with_anthropic_key;
 
     #[test]
     fn from_digit_maps_five_to_chat() {
@@ -578,5 +579,16 @@ mod tests {
         assert_eq!(format_mmss(599), "9:59");
         assert_eq!(format_mmss(3600), "1:00:00");
         assert_eq!(format_mmss(3661), "1:01:01");
+    }
+
+    // --- Slash-command dispatch (Phase 3 nav/session + read-only) ---
+
+    // --- Focused host (Phase 2): default-off focus flag hosts one overlay ---
+
+    #[test]
+    fn resolved_args_focus_defaults_none() {
+        // The focus flag is additive and off by default in every constructor, so
+        // existing dash/chat behavior is byte-identical.
+        assert!(args_with_anthropic_key(None).focus.is_none());
     }
 }

@@ -411,6 +411,7 @@ pub(super) async fn discover_configured_chat_model(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::test_support::args_with_anthropic_key;
 
     /// Wrap service records in the `services` tool's success envelope shape
     /// (`structuredContent.services`), matching `internal_mcp_tool_success`.
@@ -674,5 +675,51 @@ mod tests {
             startup_chat_outcome(false, false),
             StartupChatOutcome::Configured
         );
+    }
+
+    #[test]
+    fn build_chat_agent_anthropic_with_key() {
+        // The factory returns Some for Anthropic when a key is present in args
+        // (carried in-process — never argv). Construction only, no network.
+        let (tx, _rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let args = args_with_anthropic_key(Some("dummy-anthropic-key"));
+        let agent = build_chat_agent(ChatProvider::Anthropic, &args, None, tx);
+        assert!(agent.is_some(), "anthropic builds with a key");
+    }
+
+    #[test]
+    fn build_chat_agent_anthropic_without_key_is_none() {
+        // No key → None (the event loop reverts to local + an error turn).
+        let (tx, _rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let args = args_with_anthropic_key(None);
+        let agent = build_chat_agent(ChatProvider::Anthropic, &args, None, tx);
+        assert!(agent.is_none(), "anthropic without a key does not build");
+    }
+
+    #[test]
+    fn build_chat_agent_openai_requires_key() {
+        // No OpenAI key → None. Without this gate the factory would build a dummy
+        // `sk-no-key` backend that 401s at request time, so the switch reports
+        // success then fails. With a key → Some (construction only, no network).
+        let (tx, _rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let mut args = args_with_anthropic_key(None);
+        assert!(
+            build_chat_agent(ChatProvider::Openai, &args, None, tx.clone()).is_none(),
+            "openai without a key must not build a dead backend"
+        );
+        args.chat_api_key = Some("sk-real-key".to_string());
+        assert!(
+            build_chat_agent(ChatProvider::Openai, &args, None, tx).is_some(),
+            "openai builds with a key"
+        );
+    }
+
+    #[test]
+    fn build_chat_agent_local_defers_to_inline_build() {
+        // Local is owned by the inline auto-detect path, so the factory returns
+        // None for it (the caller keeps the existing agent).
+        let (tx, _rx) = mpsc::unbounded_channel::<ClientMsg>();
+        let args = args_with_anthropic_key(Some("k"));
+        assert!(build_chat_agent(ChatProvider::Local, &args, None, tx).is_none());
     }
 }
