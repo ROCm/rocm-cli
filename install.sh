@@ -37,13 +37,71 @@ truthy() {
   esac
 }
 
+# Width to draw a download progress bar at, or empty when the bar should be
+# suppressed. curl sizes its bar from COLUMNS whenever that variable parses to
+# a sane number, in preference to asking the terminal, and then draws a line
+# exactly that wide. A COLUMNS left over from a wider window -- routine when a
+# terminal is resized after the shell starts -- therefore makes every refresh
+# run past the right margin, wrap, and leave the previous bar on screen, so a
+# single download arrives as a stack of partial bars and a percentage split
+# across two rows. Measuring the terminal here and passing that down puts the
+# real width back in charge, and reserving the last column keeps the line clear
+# of the margin even if the measurement is off by one. curl ignores a COLUMNS
+# of 20 or less, so terminals that narrow report no width and download quietly
+# instead of wrapping.
+progress_bar_width() {
+  width=""
+  if command -v stty >/dev/null 2>&1; then
+    width="$(stty size <&2 2>/dev/null | awk '{print $2}')"
+  fi
+  if [ -z "${width}" ] && command -v tput >/dev/null 2>&1; then
+    # Blank COLUMNS for this call. ncurses consults it before asking the
+    # terminal, so leaving it set would hand back the same stale width this
+    # function exists to get away from.
+    width="$(COLUMNS='' tput cols 2>/dev/null || true)"
+  fi
+  if [ -z "${width}" ]; then
+    width="${COLUMNS:-80}"
+  fi
+  case "${width}" in
+    "" | *[!0-9]*) width=80 ;;
+    *) : ;;
+  esac
+  if [ "${width}" -le 21 ]; then
+    return 0
+  fi
+  printf '%s\n' "$((width - 1))"
+}
+
+# Resolve a download URL to its final location so the transfer that draws the
+# progress bar is a single request. Release downloads redirect to a signed
+# asset host, and the redirect responses carry no Content-Length, so curl has
+# no total to measure against while it is still walking the chain and renders
+# its unknown-size "bouncing" bar (#=#=-#, ##O=#  #, -#O#- #) for every hop
+# before the real bar begins. Resolving first means the bar starts at a
+# percentage of a known size. The probe is best-effort: if it fails, the
+# original URL is returned and the download follows the redirects itself.
+resolve_download_url() {
+  resolved="$(curl -fsSIL -o /dev/null -w '%{url_effective}' "$1" 2>/dev/null || true)"
+  if [ -n "${resolved}" ]; then
+    printf '%s\n' "${resolved}"
+  else
+    printf '%s\n' "$1"
+  fi
+}
+
 fetch() {
   url="$1"
   output="$2"
   failure_message="${3:-failed to download ${url}}"
   if command -v curl >/dev/null 2>&1; then
+    bar_width=""
     if [ -t 2 ]; then
-      curl -fL --progress-bar "${url}" -o "${output}" || {
+      bar_width="$(progress_bar_width)"
+    fi
+    if [ -n "${bar_width}" ]; then
+      COLUMNS="${bar_width}" curl -fL --progress-bar \
+        "$(resolve_download_url "${url}")" -o "${output}" || {
         rm -f "${output}"
         fail "${failure_message}"
       }
@@ -55,7 +113,11 @@ fetch() {
     fi
   elif command -v wget >/dev/null 2>&1; then
     if [ -t 2 ]; then
-      wget --show-progress -O "${output}" "${url}" || {
+      # --show-progress on its own leaves wget's normal request logging in
+      # place, so the bar is interleaved with resolver and redirect chatter.
+      # -q silences that and leaves the bar, which wget already keeps inside
+      # the terminal width.
+      wget -q --show-progress -O "${output}" "${url}" || {
         rm -f "${output}"
         fail "${failure_message}"
       }

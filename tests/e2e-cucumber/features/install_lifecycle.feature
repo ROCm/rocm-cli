@@ -354,3 +354,15 @@ Feature: Release install lifecycle
     Then the installed rocm and rocmd binaries are gone
     And the shell profile is back to the user's own settings
     And the record of the installer's PATH change is gone
+
+  # ── Download progress rendering ────────────────────────────────────────
+
+  @id:lifecycle-linux-progress-single-line @lifecycle @requires-os:linux
+  Scenario: lifecycle-28 - Linux - a download draws one progress bar that stays inside the terminal
+    Given a freshly built release tree
+    And a generated signing keypair
+    When the release is packaged and signed with the private key file
+    And the signed bundle is installed through a pseudo-terminal narrower than COLUMNS
+    Then every download progress frame stays within the terminal
+    And each completed download reports its percentage on one row
+    And the installed rocm binary is present

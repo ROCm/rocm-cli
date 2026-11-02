@@ -60,6 +60,11 @@ pub struct LifecycleState {
     /// A shell profile the installer is pointed at through
     /// `ROCM_CLI_SHELL_PROFILE`; `None` means the default `~/.bashrc`.
     custom_profile: Option<PathBuf>,
+    /// Installer output captured straight off a pseudo-terminal, carriage
+    /// returns and all. `last_output` cannot serve here: it comes from a piped
+    /// `Command`, which the installer sees as a non-terminal and answers with
+    /// plain lines, so the progress drawing this holds never appears in it.
+    last_terminal_output: String,
 }
 
 /// The Windows user `Path` exactly as the registry holds it: its value with
@@ -534,6 +539,7 @@ async fn given_release_tree(world: &mut E2eWorld) {
         smoke_cache: None,
         profile_before_install: None,
         custom_profile: None,
+        last_terminal_output: String::new(),
     });
 }
 
@@ -1648,5 +1654,190 @@ async fn then_xdg_gone(world: &mut E2eWorld) {
         // The isolated dirs are the CLI's config, data, and cache directories
         // themselves (`ROCM_CLI_*_DIR`), so uninstall removes each one whole.
         assert_missing(dir);
+    }
+}
+
+/// Terminal geometry for the progress-rendering scenario. `STALE_COLUMNS` is
+/// deliberately wider than `PTY_COLS`: it stands in for a `COLUMNS` inherited
+/// from a larger window, which is what a shell leaves behind when its terminal
+/// is resized after it starts, and is the condition under which the installer's
+/// download bar used to wrap.
+const PTY_COLS: u16 = 80;
+const PTY_ROWS: u16 = 24;
+const STALE_COLUMNS: u16 = 96;
+
+/// Run the installer attached to a real pseudo-terminal and return everything
+/// it wrote, byte for byte.
+///
+/// The piped `run_installer` path cannot exercise progress drawing at all: the
+/// installer only draws a bar when its stderr is a terminal, so under a pipe it
+/// takes the quiet branch. Only a PTY puts it on the drawing path.
+fn run_installer_pty(
+    world: &E2eWorld,
+    install_dir: &Path,
+    download_base: &str,
+    public_key_env: &[(&str, String)],
+    extra_env: &[(&str, String)],
+    columns: u16,
+) -> String {
+    use std::io::Read as _;
+
+    use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+
+    let root = workspace_root();
+    let st = state(world);
+
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: PTY_ROWS,
+            cols: PTY_COLS,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("failed to open a pty for the installer");
+
+    // The scenario carries @requires-os:linux, so only the POSIX installer is
+    // ever driven here. This still compiles on Windows, which builds the e2e
+    // target for its own lifecycle lanes, it simply never runs.
+    let mut cmd = CommandBuilder::new("sh");
+    cmd.arg(root.join("install.sh"));
+    cmd.arg("release");
+    cmd.cwd(&root);
+    for (key, value) in std::env::vars_os() {
+        cmd.env(key, value);
+    }
+    cmd.env("ROCM_CLI_DOWNLOAD_BASE", download_base);
+    cmd.env("ROCM_CLI_INSTALL_DIR", install_dir);
+    cmd.env("ROCM_CLI_REQUIRE_SIGNATURE", "1");
+    cmd.env("HOME", &st.home_dir);
+    cmd.env("TERM", "xterm-256color");
+    // The whole point of the scenario: a COLUMNS that disagrees with the pty.
+    cmd.env("COLUMNS", columns.to_string());
+    for (key, value) in public_key_env.iter().chain(extra_env.iter()) {
+        cmd.env(key, value);
+    }
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("failed to spawn the installer under a pty");
+    // Drop the slave before reading: while this side stays open the master
+    // never reaches EOF and the read below would block past process exit.
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("failed to read the installer's pty");
+    let mut raw = Vec::new();
+    reader
+        .read_to_end(&mut raw)
+        .expect("failed to drain the installer's pty");
+    let status = child.wait().expect("installer process was not reaped");
+    let output = String::from_utf8_lossy(&raw).into_owned();
+    assert!(
+        status.success(),
+        "the installer failed under a pty:\n{output}"
+    );
+    output
+}
+
+/// The frames the installer painted: every stretch between the carriage
+/// returns and newlines that separate one redraw from the next, keeping only
+/// those carrying progress glyphs.
+fn progress_frames(terminal_output: &str) -> Vec<&str> {
+    terminal_output
+        .split(['\r', '\n'])
+        .filter(|frame| frame.contains('#') || frame.contains('%'))
+        .collect()
+}
+
+#[when("the signed bundle is installed through a pseudo-terminal narrower than COLUMNS")]
+async fn when_install_pty_stale_columns(world: &mut E2eWorld) {
+    let st = state(world);
+    let dist_dir = st.dist_dir.clone();
+    let install_dir = st.install_dir.clone();
+    let public_key = st.public_key.clone();
+    // Serve over loopback rather than file://, so the installer runs its real
+    // HTTP download path — the one that draws the bar.
+    let server = e2e_cucumber::loopback_http::LoopbackServer::start(&dist_dir);
+    let base = server.base_url();
+    let key_env = [(
+        "ROCM_CLI_SIGNING_PUBLIC_KEY_PATH",
+        public_key.to_string_lossy().into_owned(),
+    )];
+    let no_path = [("ROCM_CLI_UPDATE_SHELL_PATH", "0".to_string())];
+    let out = run_installer_pty(
+        world,
+        &install_dir,
+        &base,
+        &key_env,
+        &no_path,
+        STALE_COLUMNS,
+    );
+    state_mut(world).last_terminal_output = out;
+    drop(server);
+}
+
+#[then("every download progress frame stays within the terminal")]
+async fn then_progress_fits_terminal(world: &mut E2eWorld) {
+    let output = state(world).last_terminal_output.clone();
+    let frames = progress_frames(&output);
+    assert!(
+        !frames.is_empty(),
+        "the installer drew no progress at all under a pty:\n{output}"
+    );
+    let width = usize::from(PTY_COLS);
+    // A frame wider than the terminal certainly wraps, and one exactly as wide
+    // as it sits on the right margin, where terminals disagree about whether
+    // the next write moves down a row. Either way the carriage return that
+    // ends the frame can land on a row below the bar's, so every later redraw
+    // paints one row lower and the download arrives as a stack of bars instead
+    // of one that updates in place. Reject both.
+    let overflowing: Vec<&&str> = frames
+        .iter()
+        .filter(|frame| frame.chars().count() >= width)
+        .collect();
+    assert!(
+        overflowing.is_empty(),
+        "{} of {} progress frames reach or exceed the {width}-column terminal, \
+         so each redraw wraps onto a new row instead of replacing the last; \
+         widest was {} columns:\n{output}",
+        overflowing.len(),
+        frames.len(),
+        overflowing
+            .iter()
+            .map(|frame| frame.chars().count())
+            .max()
+            .unwrap_or(0),
+    );
+}
+
+#[then("each completed download reports its percentage on one row")]
+async fn then_percentage_not_split(world: &mut E2eWorld) {
+    let output = state(world).last_terminal_output.clone();
+    // The reported symptom, asserted directly rather than inferred from the
+    // widths above: a wrapped bar tears its percentage across the margin, so
+    // the row ends mid-number and the remainder opens the next one — the
+    // stray ".0%" from the bug report. Require that a completion reads whole
+    // somewhere, and that no orphaned tail is left on a row of its own.
+    let frames = progress_frames(&output);
+    let completed = frames
+        .iter()
+        .filter(|frame| frame.contains("100.0%"))
+        .count();
+    assert!(
+        completed >= 1,
+        "no download reported a whole 100.0% on a single row, so a completion \
+         percentage was split across the terminal's right margin:\n{output}"
+    );
+    for orphan in ["0%", ".0%"] {
+        assert!(
+            !output
+                .split(['\r', '\n'])
+                .any(|frame| frame.trim() == orphan),
+            "a stray {orphan:?} sits alone on a row, which is the tail of a \
+             percentage that wrapped past the right margin:\n{output}"
+        );
     }
 }
