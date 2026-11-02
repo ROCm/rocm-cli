@@ -84,7 +84,7 @@ pub(crate) enum Command {
         signature: PathBuf,
     },
     /// Assert the release/metadata public keys pinned in the installers and
-    /// `apps/rocm/src/therock.rs` match the canonical published keys under
+    /// `apps/rocm/src/therock/fetch.rs` match the canonical published keys under
     /// `docs/keys/`, and that any configured CI signing key matches the pinned
     /// current release key. A no-op while no canonical keys are published.
     VerifyPinnedKeys,

@@ -14,6 +14,24 @@ use rocm_core::AppPaths;
 use crate::runtimes_cmd::{runtime_manifest_path, runtime_registry_dir};
 use crate::therock;
 
+/// Serializes the `therock` tests (those in `therock.rs` and its child modules)
+/// that replace process-global environment variables while they run: `PATH`, the
+/// `ROCM_CLI_THEROCK_*` and managed-Python variables, and the Windows temp-dir
+/// variables. Because env is shared across all test threads, any `therock` test
+/// that spawns a bare-name binary (e.g. `tar`) via `PATH` lookup must also hold
+/// this lock, or it can fail with ENOENT while another test has temporarily
+/// narrowed `PATH`.
+///
+/// It stays one static for those tests: two locks guarding the same variables
+/// there would let the tests that hold them race each other. It is not the only
+/// env lock in this crate: `ScopedTestEnv` in `main.rs` serializes the tests
+/// that use it, and `engine_ipc.rs` has a private production static,
+/// `BUILTIN_ENGINE_ENV_LOCK`, that `with_scoped_builtin_engine_env` takes in
+/// production code. Neither is ordered against this lock, so a test that
+/// depends on one of those groups' variables is not protected from the
+/// `therock` tests by it.
+pub(crate) static PROCESS_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// A name suffix no other call in this test process returns.
 ///
 /// Test scratch roots are named `<label>-<suffix>`. The pid separates

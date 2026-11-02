@@ -258,7 +258,7 @@ dash-TUI, in `crates/rocm-dash-tui/src/ui/`:
 - **[`approval.rs`](crates/rocm-dash-tui/src/ui/approval.rs)** — approval-state prompts
 - **[`job_console.rs`](crates/rocm-dash-tui/src/ui/job_console.rs)**'s `draw_job_console`/`on_console_key` — the shared "a job is running" surface (streamed output, status header, Ctrl+C cancels/`q` always closes/Esc-Enter dismiss a finished job); every operational manager already routes through this instead of building its own console
 - **[`spinner.rs`](crates/rocm-dash-tui/src/ui/spinner.rs)**'s `spinner_frame`/`parse_progress_pct` — the braille animation and percentage parsing `job_console.rs` renders with
-- **[`panel.rs`](crates/rocm-dash-tui/src/ui/panel.rs)**'s `bento`/`popup` — bordered, titled panels; prefer these over an inline `Block::default()`
+- **[`panel.rs`](crates/rocm-dash-tui/src/ui/panel.rs)**'s `bento`/`popup` — bordered, titled panels; prefer these over an inline `Block::default()`. Popup geometry and framing live here too: `centered_rect`/`centered_width` size and place a popup, `draw_popup_frame` clears and frames it, and `grey_overlay` dims the backdrop
 - **[`theme.rs`](crates/rocm-dash-tui/src/ui/theme.rs)**'s `job_status_color` — the pattern to follow for any status enum's color (Running/Error/Pending/etc.); route through (or extend) a shared status→color mapping rather than a bespoke inline match per screen
 
 **Two different components are both informally "the spinner"; they are not interchangeable.** The CLI's [`cli_progress.rs`](apps/rocm/src/cli_progress.rs) `Spinner`/`AnimatedSpinner` above is TTY/stderr-gated for a plain terminal and lives in `apps/rocm`. The dash-TUI's [`spinner.rs`](crates/rocm-dash-tui/src/ui/spinner.rs) above is a pure frame/percentage helper rendered through `job_console.rs` inside a ratatui frame loop, and lives in `crates/rocm-dash-tui`. A dash-TUI screen needs the latter.
@@ -318,21 +318,33 @@ on two counts, and both change how you edit it:
 
 - **This repo is its source of truth.** The skill is a thin driver over the
   `rocm` binary, so it is versioned with the binary and lives here.
-  [`amd/skills`](https://github.com/amd/skills) is still in Phase-1
-  incubation for this skill: it carries no automated federation for
-  `rocm-doctor` yet — `.github/federation.json` there only declares
-  `AMD-AGI/TraceLens` as a source, and this skill instead sits under
-  `staging/rocm-doctor`, outside any job's coverage. Until federation picks it
-  up, the rocm-cli team hand-syncs `staging/rocm-doctor` from this folder
-  whenever it changes materially. So edit it here, and never edit the
-  `amd/skills` copy directly — the next hand-sync overwrites it.
+  [`amd/skills`](https://github.com/amd/skills) vendors a copy under
+  `skills/rocm-doctor`: its `.github/federation.json` declares
+  `ROCm/rocm-cli` as a source, and its nightly `federate-skills` workflow
+  tracks `main` here. When this folder changes on `main`, that workflow opens a
+  "Bump `rocm-doctor`" pull request in `amd/skills`, and the change reaches
+  `amd/skills` only when that pull request is merged. So edit it here, and never edit
+  the `amd/skills` copy directly — the next bump overwrites it. Those bump pull requests are also
+  where the skill is graded; [docs/skill-quality.md](docs/skill-quality.md) says
+  what runs there.
 - **`reference.md` is an e2e fixture.** `tests/e2e-cucumber/features/rocm_doctor_skill.feature`
   parses its closed-catalog table and compares it to what `rocm fix` reports.
   The failure catalog itself is authoritative in `crates/rocm-core/src/fix.rs`
   (the `RECIPES` list) and `crates/rocm-core/src/diagnose.rs` (each mode's
   checker and OS scoping) — adding, renaming, or re-scoping a failure mode
   means changing the CLI **first**, then the two docs. That feature is what
-  catches you if you forget.
+  catches you if you forget. Two sentences in
+  [SKILL.md](skills/rocm-doctor/SKILL.md) are fixtures too. One is the Phase 0
+  sentence "requires `contract_version` N or higher": scenario skill-07 parses
+  it and holds that number (the contract number) equal to what
+  `rocm fix --json` publishes. The other is the "The other N ... print-only"
+  sentence, whose number (the print-only count) is checked by
+  [skill_reference.rs](tests/e2e-cucumber/tests/skill_reference.rs) against the
+  catalog table. Keep both wordings when editing the skill.
+  Raise the contract number only after a release publishes that contract. The
+  skill is federated from `main`, and the installer that Phase 0 offers installs
+  the release channel, so an earlier raise would make the published skill stop
+  on every released CLI.
 
 The folder is excluded from `licenserc.toml`: `SKILL.md` must open with YAML
 frontmatter for the skill loader, and skills published this way carry no
@@ -358,9 +370,11 @@ Two checks gate it, and they cover different things:
   describes the binary, as above.
 
 Neither grades whether the skill actually *fires*. That is skillscope's
-`routing` and `behavioral`, which need an authenticated `claude` CLI and an
-`ANTHROPIC_API_KEY` this repo does not have. The dataset is written and checked
-so those can be switched on without further work.
+`routing` and `behavioral`, which make paid model calls and need a credential
+this repo does not hold, so they do not run here. `amd/skills` grades the skill
+instead. What runs there today, what the figures mean and what they cannot tell
+you is in [docs/skill-quality.md](docs/skill-quality.md), which is the one place
+that is kept current.
 
 `skills/rocm-cli-assistant/` is **not** in scope for skillscope: it is embedded
 verbatim into the chat system prompt with `include_str!`, so the YAML

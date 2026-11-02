@@ -120,7 +120,7 @@ pub struct ResolvedArgs {
     /// Bin-injected live registry-read seam (issue #145): whether anything is
     /// currently serving, and which ids a `rocm services stop <id> --yes` can
     /// actually reach. Read live, at the moment `AppState::has_live_instance`
-    /// / `has_stoppable_managed_instance_with` / `ui::quit_confirm_body_with`
+    /// / `has_stoppable_managed_instance_with` / `ui::quit_confirm::quit_confirm_body_with`
     /// actually need an answer — never a one-shot snapshot frozen at launch
     /// the way `services_past_attempts` is. A host whose dashboard-embedded
     /// daemon client never connects at all (Windows) gets a correct "is
@@ -575,9 +575,25 @@ impl ScrollTarget {
     ];
 }
 
+/// Esc-menu rows: Options / Help / Quit.
+pub const MENU_ITEMS: usize = 3;
+
+/// Command-palette destinations (label, tab).
+pub const PALETTE_DESTS: &[(&str, ActiveTab)] = &[
+    ("Home", ActiveTab::Home),
+    ("ROCm", ActiveTab::Rocm),
+    ("Serving", ActiveTab::Serving),
+    ("Observe", ActiveTab::Observe),
+    ("Chat", ActiveTab::Chat),
+];
+
+/// Options panel tabs.
+pub const OPTIONS_TABS: &[&str] = &["General", "CPU", "GPU", "Engines"];
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::test_support::args_with_anthropic_key;
 
     #[test]
     fn in_process_version_is_recognised_by_is_in_process() {
@@ -610,5 +626,16 @@ mod tests {
         assert_eq!(format_mmss(599), "9:59");
         assert_eq!(format_mmss(3600), "1:00:00");
         assert_eq!(format_mmss(3661), "1:01:01");
+    }
+
+    // --- Slash-command dispatch (Phase 3 nav/session + read-only) ---
+
+    // --- Focused host (Phase 2): default-off focus flag hosts one overlay ---
+
+    #[test]
+    fn resolved_args_focus_defaults_none() {
+        // The focus flag is additive and off by default in every constructor, so
+        // existing dash/chat behavior is byte-identical.
+        assert!(args_with_anthropic_key(None).focus.is_none());
     }
 }

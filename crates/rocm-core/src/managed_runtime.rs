@@ -6,8 +6,9 @@
 //!
 //! `ManagedRuntimeEnvironment`/`FrameworkInterpreter`, `active_managed_therock_*`,
 //! `prepend_runtime_paths`, and the registry-manifest probing behind them.
-//! amd-smi binary resolution (`resolve_amd_smi_binary*`) still reads those
-//! same registry records from `lib.rs` — a distinct, not-yet-scoped concern.
+//! amd-smi binary resolution (`resolve_amd_smi_binary*`) reads those same
+//! registry records from [`crate::amd_smi`] — a distinct concern that lives
+//! in its own module.
 
 use crate::{
     AppPaths, RocmCliConfig, normalize_runtime_path_for_host, normalize_therock_family,

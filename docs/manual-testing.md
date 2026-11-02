@@ -802,15 +802,19 @@ running local provider service:
 
 ```powershell
 rocm config set-planner-provider local
-rocm "start a local model"
+rocm "serve a model"
 ```
+
+Only a request the deterministic planner cannot settle is sent to the provider.
+`serve a model` names no model, so it is; `start a local model` resolves to the
+validated default model on its own and never consults the provider.
 
 Expected result:
 
 - The rendered plan says `planner: hybrid-parser-v1 + provider:local` only if
   the local provider returned a valid structured `rocm` tool call.
 - The plan still asks for review before mutating actions.
-- `rocm --yes "start a local model"` refuses to auto-run a provider-assisted
+- `rocm --yes "serve a model"` refuses to auto-run a provider-assisted
   plan; run the displayed structured command directly after reviewing it.
 
 To turn provider-assisted planning back off:
