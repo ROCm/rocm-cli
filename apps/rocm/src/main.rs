@@ -12553,6 +12553,50 @@ pub(crate) mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn a_live_service_whose_processes_survive_the_real_stop_aborts_the_uninstall() {
+        // End to end through the real stop plumbing: the record is loaded and
+        // rewritten by `stop_internal_managed_service_confirmed_with`, the confirmed
+        // verdict is computed from what termination reported, and only the final
+        // signalling is replaced by one that leaves the process alive (as a
+        // SIGKILL-resistant child would). No hand-built report is involved.
+        let child = crate::test_support::bare_command("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn the managed server");
+        let pid = child.id();
+        let (root, paths) = test_paths("uninstall-real-stop-survivor");
+        let mut record = managed_record_for_pid(&paths, pid, rocm_core::process_start_ticks(pid));
+        record.status = "ready".to_owned();
+        record.write().expect("write service record");
+
+        let report = stop_managed_services_confirmed_with(&paths, |paths, id| {
+            crate::services_text::stop_internal_managed_service_confirmed_with(paths, id, |_| {
+                (vec![pid], false)
+            })
+        })
+        .expect("stop pass");
+
+        assert!(report.stopped.is_empty(), "{report:?}");
+        assert_eq!(report.failed.len(), 1, "{report:?}");
+        let error = uninstall_removal_gate(&report).expect_err("a survivor must abort");
+        assert!(
+            format!("{error:#}").contains("svc-managed-stop"),
+            "{error:#}"
+        );
+        let on_disk = load_managed_service(&paths, "svc-managed-stop").expect("record kept");
+        assert!(
+            on_disk.stop_requested_unix_ms.is_some() && on_disk.status != "stopped",
+            "an unconfirmed stop must not be recorded as stopped: {on_disk:?}"
+        );
+        let mut child = child;
+        assert!(child.try_wait().expect("poll").is_none(), "still alive");
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn a_stop_that_finds_the_record_already_stopped_still_reports_it_unconfirmed() {
         // The premise of the test above, on the real stop: a record that reads
         // `stopped` keeps that status through a stop whose termination did not
