@@ -1113,11 +1113,20 @@ async fn user_serves_absent_gpu_index(world: &mut E2eWorld) {
 /// nothing" — it silently removes the very list the scenario exists to check.
 /// The caller's guard turns that into a loud failure, but recognising both
 /// shapes is what keeps the scenario measuring the contract at all.
+/// A help line that starts a new option: `--long` or `-x, --long`.
+fn is_option_line(line: &str) -> bool {
+    let line = line.trim_start();
+    line.starts_with("--")
+        || (line.len() > 1 && line.starts_with('-') && line.as_bytes()[1].is_ascii_alphanumeric())
+}
+
 fn advertised_device_policies(help: &str) -> Vec<String> {
     let lines: Vec<&str> = help.lines().collect();
-    let device = lines
-        .iter()
-        .position(|line| line.trim_start().starts_with("--device"));
+    let device = lines.iter().position(|line| {
+        line.trim_start()
+            .strip_prefix("--device")
+            .is_some_and(|rest| rest.starts_with([' ', '=', '<']) || rest.is_empty())
+    });
     let Some(device) = device else {
         return Vec::new();
     };
@@ -1127,7 +1136,7 @@ fn advertised_device_policies(help: &str) -> Vec<String> {
         .iter()
         .skip(device)
         .enumerate()
-        .take_while(|(offset, line)| *offset == 0 || !line.trim_start().starts_with("--"))
+        .take_while(|(offset, line)| *offset == 0 || !is_option_line(line))
         .map(|(_, line)| *line)
         .collect();
 
@@ -1288,13 +1297,27 @@ async fn user_stops_running_server(world: &mut E2eWorld) {
         .into_iter()
         .flatten()
         .flatten()
-        .filter(|entry| entry.path().extension().is_some_and(|e| e == "json"))
         .filter_map(|entry| {
+            // The manifest is `<id>.json`; `<id>.state.json` and other sidecars
+            // share the extension, so match the manifest name itself.
+            let name = entry.file_name().into_string().ok()?;
+            let id = name.strip_suffix(".json")?;
+            if id.contains('.') {
+                return None;
+            }
             let bytes = std::fs::read(entry.path()).ok()?;
             let record: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-            Some(record.get("service_id")?.as_str()?.to_owned())
+            let recorded = record.get("service_id")?.as_str()?;
+            (recorded == id).then(|| id.to_owned())
         })
         .collect();
+    // The server must answer before the stop, or the "no longer answers" check
+    // that follows could pass on a wrong URL.
+    let endpoint = world.endpoint.as_ref().expect("no endpoint configured");
+    assert!(
+        model_is_ready(&format!("{endpoint}/models"), None, 30).await,
+        "{endpoint} does not answer before the stop, so a later silence would prove nothing"
+    );
     // Exactly one, not the first `read_dir` happens to yield. Directory order is
     // unspecified, so with a second record present — a retried serve's leftover,
     // or a planted mock alongside a real one — taking the first would stop an
@@ -1362,7 +1385,7 @@ async fn assert_owned_server_stopped(world: &mut E2eWorld) {
     // defect under test into a pass.
     let mut still_running = Vec::new();
     for process in &mut world.owned_processes {
-        if process.is_running() {
+        if process.is_running().await {
             still_running.push(process.pid());
         }
     }
@@ -1533,16 +1556,21 @@ async fn assert_new_server_avoids_taken_address(world: &mut E2eWorld) {
             // address and exit nonzero, and would be accepted here as though
             // the CLI had honestly reported the conflict. Require it to say so.
             //
-            // Only these two. A bare "already" would admit the serve path's own
-            // unrelated uses of the word ("already running" for an equivalent
-            // managed service, "already being served" for a model), and a bare
-            // "address" would admit any sentence that happens to mention one.
-            // The port number or "in use" is what naming THIS conflict looks
-            // like.
+            // Conflict wording, not just the number: an unrelated failure can
+            // print an endpoint URL that contains the port. A bare "already"
+            // would admit the serve path's own unrelated uses of the word
+            // ("already running", "already being served").
             let said = output.to_lowercase();
-            let port = SERVE_PORT.to_string();
             assert!(
-                said.contains(&port) || said.contains("in use"),
+                [
+                    "in use",
+                    "address already",
+                    "port already",
+                    "already bound",
+                    "unavailable"
+                ]
+                .iter()
+                .any(|phrase| said.contains(phrase)),
                 "the CLI refused, but without naming the address that is taken — so this \
                  says nothing about whether it noticed the conflict:\n{output}"
             );

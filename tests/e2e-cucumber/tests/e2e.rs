@@ -243,13 +243,13 @@ impl OwnedProcess {
     /// Polls briefly: the product signals the process and this only has to
     /// outlast the moment between the signal landing and the kernel finishing
     /// with it, not any grace period the product itself waits out.
-    pub fn is_running(&mut self) -> bool {
+    pub async fn is_running(&mut self) -> bool {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             match self.child.try_wait() {
                 Ok(Some(_)) => return false,
                 Ok(None) if std::time::Instant::now() < deadline => {
-                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
                 Ok(None) => return true,
                 // Not treated as "stopped". The only caller asserts that the
@@ -834,8 +834,8 @@ impl Drop for E2eWorld {
         // failure is ignored rather than panicking (which would abort the run) —
         // hence the returned status is discarded here. The serve retry, where a
         // failed stop changes the next attempt's meaning, does read it.
-        let env = self.isolate_env();
         if let Some(root) = &self.isolated_root {
+            let env = self.isolate_env();
             stop_managed_services(root.path(), &env);
         }
         // A scenario that made the audit directory read-only must give it back
@@ -1581,12 +1581,7 @@ async fn main() {
     // themselves rather than only from the probe. `shared_uv_cache_dir()` is
     // deliberately excluded: uv's cache is content-addressed and uv does its
     // own locking. A lane that races becomes serialized-and-slower instead.
-    //
-    // The mock lane stays at 64: dash-08/dash-09 measure a validity window whose
-    // elapsed time advances with DAEMON CYCLES (the logical clock added in #380),
-    // so a less-loaded lane burns that window faster and clears the held value
-    // before the assertion looks. Both pass at 64-way and fail at 2..=6, so a
-    // tighter cap here would change two unrelated scenarios' verdicts.
+
     let max_concurrent =
         if cap.has_amd_gpu || shared_cache_dir().is_some() || shared_runtimes_dir().is_some() {
             1
