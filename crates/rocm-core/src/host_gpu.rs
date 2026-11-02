@@ -14,6 +14,9 @@
 //! stays here, since its only caller is this module's own gfx-target fallback
 //! chain; the registry reading it uses lives in [`crate::managed_runtime`].
 //!
+//! The leaf concerns live in child modules: `capture` (optional-command capture
+//! and the tool-on-`PATH` lookup) and `os_facts` (kernel, distro, CPU and RAM).
+//!
 //! `examine.rs` and `fix.rs` still reach several items here through `lib.rs`'s
 //! flat `crate::` re-export paths rather than `crate::host_gpu::` — a
 //! deliberate transitional step from the zero-diff extraction, not an
@@ -33,20 +36,36 @@ use crate::gfx_target::{gfx_target_from_gc_version, parse_linux_kfd_gfx_target};
 use crate::managed_runtime::{managed_sdk_ld_library_path, managed_therock_sdk_probe_candidates};
 use crate::{
     AppPaths, LegacyRocmSummary, detect_legacy_rocm_summary, detect_managed_therock_family,
-    discover_rocm_installs, hardware_root, host_path, managed_sdk_tool_path, probe_exec,
-    runtime_is_linux, runtime_is_windows, runtime_os_name, unix_time_millis,
+    discover_rocm_installs, host_path, managed_sdk_tool_path, probe_exec, runtime_is_linux,
+    runtime_is_windows, runtime_os_name, unix_time_millis,
 };
 use anyhow::Result;
+#[cfg(windows)]
+use capture::tool_path_candidates;
+use capture::{
+    OPTIONAL_COMMAND_TIMEOUT, capture_optional_command, capture_optional_command_with_timeout,
+    tool_on_path,
+};
+pub(crate) use os_facts::detect_distro_name;
+pub use os_facts::detect_system_ram_gib;
+use os_facts::{
+    bytes_text_to_gib, detect_cpu_model, detect_kernel_version, format_gib_value,
+    normalize_cpu_model,
+};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::fs;
-use std::io::{IsTerminal, Read, stdin, stdout};
+#[cfg(windows)]
+use std::io::Read;
+use std::io::{IsTerminal, stdin, stdout};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-const OPTIONAL_COMMAND_TIMEOUT: Duration = Duration::from_millis(1_500);
+mod capture;
+mod os_facts;
+
 const WINDOWS_INVENTORY_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 const WINDOWS_VIDEO_CONTROLLER_INVENTORY_SCRIPT: &str = r#"$gpus = Get-CimInstance -ClassName Win32_VideoController -Property Name,DriverVersion,DriverDate,PNPDeviceID,AdapterCompatibility | Where-Object { $_.PNPDeviceID -match 'VEN_1002' -or $_.AdapterCompatibility -match 'AMD|Advanced Micro Devices' -or $_.Name -match 'AMD|Radeon|Instinct' }; foreach ($gpu in $gpus) { $date = ''; if ($gpu.DriverDate) { $date = $gpu.DriverDate.ToUniversalTime().ToString('yyyy-MM-dd', [System.Globalization.CultureInfo]::InvariantCulture) }; "GPU`t$($gpu.Name)`t$($gpu.DriverVersion)`t$($gpu.PNPDeviceID)`t$date" }"#;
 #[cfg(windows)]
@@ -105,100 +124,6 @@ fn detect_host_gfx_target_with_context(
         .or_else(|| detect_windows_display_gfx_target_with_inventory(windows_inventory))
 }
 
-fn capture_optional_command(program: &str, args: &[&str]) -> Option<String> {
-    capture_optional_command_with_timeout(program, args, OPTIONAL_COMMAND_TIMEOUT)
-}
-
-fn capture_optional_command_with_timeout(
-    program: &str,
-    args: &[&str],
-    timeout: Duration,
-) -> Option<String> {
-    for candidate in tool_path_candidates(program) {
-        if let Some(output) =
-            capture_optional_command_candidate_with_timeout(Path::new(&candidate), args, timeout)
-        {
-            return Some(output);
-        }
-    }
-    None
-}
-
-fn capture_optional_command_candidate_with_timeout(
-    program: &Path,
-    args: &[&str],
-    timeout: Duration,
-) -> Option<String> {
-    let mut child = match Command::new(program)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(error) => {
-            debug_command_capture_failure(program, "spawn", &error.to_string());
-            return None;
-        }
-    };
-    let mut stdout_reader = child.stdout.take().map(|mut stdout| {
-        thread::spawn(move || {
-            let mut bytes = Vec::new();
-            let _ = stdout.read_to_end(&mut bytes);
-            bytes
-        })
-    });
-
-    let start = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let bytes = stdout_reader
-                    .take()
-                    .map(|reader| reader.join().unwrap_or_default())
-                    .unwrap_or_default();
-                if status.success() {
-                    return String::from_utf8(bytes).ok();
-                }
-                debug_command_capture_failure(program, "exit", &format!("status {status}"));
-                return None;
-            }
-            Ok(None) if start.elapsed() < timeout => {
-                thread::sleep(Duration::from_millis(25));
-            }
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                if let Some(reader) = stdout_reader.take() {
-                    let _ = reader.join();
-                }
-                debug_command_capture_failure(program, "timeout", "timed out");
-                return None;
-            }
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                if let Some(reader) = stdout_reader.take() {
-                    let _ = reader.join();
-                }
-                debug_command_capture_failure(program, "wait", "failed to wait");
-                return None;
-            }
-        }
-    }
-}
-
-fn debug_command_capture_failure(program: &Path, stage: &str, detail: &str) {
-    if !crate::runtime::env_flag("ROCM_CLI_DEBUG_COMMAND_CAPTURE") {
-        return;
-    }
-    eprintln!(
-        "rocm debug: command capture {stage} failed for {}: {detail}",
-        program.display()
-    );
-}
-
 fn capture_optional_path_command_with_env(
     program: &Path,
     args: &[&str],
@@ -247,58 +172,6 @@ fn capture_optional_path_command_with_env(
                 return None;
             }
         }
-    }
-}
-
-fn tool_on_path(program: &str) -> bool {
-    std::env::var_os("PATH").is_some_and(|path| {
-        std::env::split_paths(&path).any(|dir| {
-            tool_path_candidates(program)
-                .into_iter()
-                .any(|name| dir.join(name).is_file())
-        })
-    })
-}
-
-fn tool_path_candidates(program: &str) -> Vec<String> {
-    let path = Path::new(program);
-    if path.extension().is_some() || !runtime_is_windows() {
-        return vec![program.to_owned()];
-    }
-    let mut names = Vec::new();
-    names.push(program.to_owned());
-    let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_owned());
-    for ext in pathext
-        .split(';')
-        .map(str::trim)
-        .filter(|ext| !ext.is_empty())
-    {
-        names.push(format!("{program}{ext}"));
-        names.push(format!("{program}{}", ext.to_ascii_lowercase()));
-    }
-    names.extend(windows_absolute_tool_candidates(program));
-    names.sort();
-    names.dedup();
-    names
-}
-
-fn windows_absolute_tool_candidates(program: &str) -> Vec<String> {
-    if !runtime_is_windows() {
-        return Vec::new();
-    }
-    let program = program.trim().to_ascii_lowercase();
-    let system_root = std::env::var("SystemRoot")
-        .or_else(|_| std::env::var("WINDIR"))
-        .unwrap_or_else(|_| r"C:\Windows".to_owned());
-    match program.as_str() {
-        "cmd" | "cmd.exe" => vec![format!(r"{system_root}\System32\cmd.exe")],
-        "pnputil" | "pnputil.exe" => vec![format!(r"{system_root}\System32\pnputil.exe")],
-        "powershell" | "powershell.exe" => vec![
-            format!(r"{system_root}\System32\WindowsPowerShell\v1.0\powershell.exe"),
-            "powershell.exe".to_owned(),
-        ],
-        "pwsh" | "pwsh.exe" => vec!["pwsh.exe".to_owned()],
-        _ => Vec::new(),
     }
 }
 
@@ -1551,59 +1424,6 @@ fn preferred_serve_engine_for_therock_family(family: Option<&str>) -> Option<&'s
     }
 }
 
-fn detect_kernel_version() -> Option<String> {
-    if runtime_is_windows() {
-        capture_optional_command("cmd", &["/C", "ver"])
-            .map(|value| value.trim().to_owned())
-            .filter(|value| !value.is_empty())
-    } else {
-        capture_optional_command("uname", &["-r"])
-            .map(|value| value.trim().to_owned())
-            .filter(|value| !value.is_empty())
-    }
-}
-
-pub(crate) fn detect_distro_name() -> Option<String> {
-    if runtime_is_windows() {
-        return Some("Windows".to_owned());
-    }
-
-    if runtime_is_linux() {
-        return match hardware_root::read_os_release(hardware_root::host_path_for_str) {
-            // Absent matches the pre-fallback behaviour this function has
-            // always had: no file at all leaves the distro name unknown
-            // entirely, rather than reporting "Linux" for a machine that
-            // might not even be running a standard distro.
-            hardware_root::OsRelease::Absent => None,
-            read => Some(distro_name_from_os_release(&read)),
-        };
-    }
-
-    None
-}
-
-/// The distribution name `rocm examine` prints, from `read`: `PRETTY_NAME` as
-/// `sh` reads it, else `Linux`.
-///
-/// An unreadable line says which file and line made it so, on the line a
-/// person reads — `rocm examine`'s `probe_failures`, which carries the same
-/// reason, is only in the `--json` form. A blank `PRETTY_NAME` also falls
-/// back to `Linux`. A file that exists but could not be read at all is
-/// reported as itself, distinctly from a bad line it never reached.
-fn distro_name_from_os_release(read: &hardware_root::OsRelease) -> String {
-    if let hardware_root::OsRelease::Unreadable { path, error } = read {
-        return format!("Linux ({})", hardware_root::unreadable_prefix(path, error));
-    }
-    match crate::os_release::parse(read.text()) {
-        Ok(mut fields) => fields
-            .remove("PRETTY_NAME")
-            .map(|value| value.trim().to_owned())
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| "Linux".to_owned()),
-        Err(unreadable) => format!("Linux ({} {unreadable})", read.path()),
-    }
-}
-
 fn detect_cpu_model_with_windows_inventory(
     windows_inventory: Option<&WindowsExamineInventory>,
 ) -> Option<String> {
@@ -1616,42 +1436,6 @@ fn detect_cpu_model_with_windows_inventory(
     detect_cpu_model()
 }
 
-fn detect_cpu_model() -> Option<String> {
-    if runtime_is_windows() {
-        let script =
-            "Get-CimInstance Win32_Processor | Select-Object -First 1 -ExpandProperty Name";
-        return capture_optional_command_with_timeout(
-            "powershell",
-            &["-NoProfile", "-Command", script],
-            OPTIONAL_COMMAND_TIMEOUT,
-        )
-        .map(|value| normalize_cpu_model(&value))
-        .filter(|value| !value.is_empty());
-    }
-
-    if runtime_is_linux()
-        && let Some(model) = fs::read_to_string(host_path("/proc/cpuinfo"))
-            .ok()
-            .and_then(|text| {
-                text.lines().find_map(|line| {
-                    let value = line
-                        .strip_prefix("model name")
-                        .and_then(|rest| rest.split_once(':').map(|(_, value)| value))
-                        .or_else(|| {
-                            line.strip_prefix("Hardware")
-                                .and_then(|rest| rest.split_once(':').map(|(_, value)| value))
-                        })?;
-                    let value = normalize_cpu_model(value);
-                    (!value.is_empty()).then_some(value)
-                })
-            })
-    {
-        return Some(model);
-    }
-
-    None
-}
-
 fn detect_system_ram_gib_with_windows_inventory(
     windows_inventory: Option<&WindowsExamineInventory>,
 ) -> Option<f64> {
@@ -1662,56 +1446,6 @@ fn detect_system_ram_gib_with_windows_inventory(
     }
 
     detect_system_ram_gib()
-}
-
-pub fn detect_system_ram_gib() -> Option<f64> {
-    if runtime_is_windows() {
-        let script = "(Get-CimInstance -ClassName Win32_ComputerSystem -Property TotalPhysicalMemory).TotalPhysicalMemory";
-        return capture_optional_command_with_timeout(
-            "powershell",
-            &["-NoProfile", "-Command", script],
-            OPTIONAL_COMMAND_TIMEOUT,
-        )
-        .and_then(|value| bytes_text_to_gib(&value));
-    }
-
-    if runtime_is_linux()
-        && let Some(kib) = fs::read_to_string(host_path("/proc/meminfo"))
-            .ok()
-            .and_then(|text| {
-                text.lines().find_map(|line| {
-                    let value = line.strip_prefix("MemTotal:")?.trim();
-                    let number = value.split_whitespace().next()?.parse::<f64>().ok()?;
-                    Some(number)
-                })
-            })
-    {
-        return Some(kib / 1024.0 / 1024.0);
-    }
-
-    if cfg!(target_os = "macos") {
-        return capture_optional_command("sysctl", &["-n", "hw.memsize"])
-            .and_then(|value| bytes_text_to_gib(&value));
-    }
-
-    None
-}
-
-fn bytes_text_to_gib(value: &str) -> Option<f64> {
-    let bytes = value.trim().parse::<f64>().ok()?;
-    (bytes > 0.0).then_some(bytes / 1024.0 / 1024.0 / 1024.0)
-}
-
-fn format_gib_value(value: f64) -> String {
-    if value >= 10.0 {
-        format!("{value:.0} GiB")
-    } else {
-        format!("{value:.1} GiB")
-    }
-}
-
-fn normalize_cpu_model(value: &str) -> String {
-    value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Whether this host is WSL2 — the one answer, for every caller.
@@ -4458,79 +4192,6 @@ Class Name:                Display
                 .detail
                 .as_deref()
                 .is_some_and(|detail| detail.contains("librocdxg"))
-        );
-    }
-
-    #[test]
-    fn parses_os_release_pretty_name() {
-        assert_eq!(
-            distro_name_from_os_release(&hardware_root::OsRelease::found(
-                "NAME=Ubuntu\nPRETTY_NAME=\"Ubuntu 24.04.2 LTS\"\n"
-            )),
-            "Ubuntu 24.04.2 LTS"
-        );
-    }
-
-    /// The distro name is read through the shared `os_release` parser, so it
-    /// names the distro `sh` would: the last assignment wins and a trailing
-    /// comment is not part of the value. A file with no usable `PRETTY_NAME`
-    /// is plain `Linux`; an unreadable one says which line, rather than
-    /// letting `Linux` read as a description of the machine.
-    #[test]
-    fn pretty_name_reads_as_sh_reads_it() {
-        assert_eq!(
-            distro_name_from_os_release(&hardware_root::OsRelease::found(
-                "PRETTY_NAME=\"Debian GNU/Linux 12\"\nPRETTY_NAME='Ubuntu 24.04 LTS' # LTS\n"
-            )),
-            "Ubuntu 24.04 LTS"
-        );
-        assert_eq!(
-            distro_name_from_os_release(&hardware_root::OsRelease::found(
-                "PRETTY_NAME=\"Ubuntu 24.04 LTS\"\nunset ID\n"
-            )),
-            "Linux (/etc/os-release line 2 is not a plain assignment: \"unset ID\")"
-        );
-        assert_eq!(
-            distro_name_from_os_release(&hardware_root::OsRelease::found("PRETTY_NAME=\"  \"\n")),
-            "Linux"
-        );
-        assert_eq!(
-            distro_name_from_os_release(&hardware_root::OsRelease::found("ID=ubuntu\n")),
-            "Linux"
-        );
-    }
-
-    /// A file that exists but could not be read names itself and the error —
-    /// new behavior; it used to be folded into "unknown" like an absent file.
-    /// It is distinct from a bad line it never reached, and from "no file at
-    /// all", which `detect_distro_name` still reports as unknown (see its own
-    /// doc comment) — that part is unchanged.
-    #[test]
-    fn distro_name_names_an_unreadable_file_instead_of_guessing_linux() {
-        assert_eq!(
-            distro_name_from_os_release(&hardware_root::OsRelease::Unreadable {
-                path: "/usr/lib/os-release",
-                error: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied"),
-            }),
-            "Linux (/usr/lib/os-release could not be read: denied)"
-        );
-    }
-
-    /// The same malformed line as the second case in
-    /// [`pretty_name_reads_as_sh_reads_it`], but read through the fallback
-    /// path: the message must name `/usr/lib/os-release`, not
-    /// `/etc/os-release`. That test only exercises
-    /// [`hardware_root::OsRelease::found`], which hardcodes
-    /// `/etc/os-release`, so a regression that hardcoded the path back into
-    /// `distro_name_from_os_release`'s message would still pass it.
-    #[test]
-    fn a_fallback_reads_malformed_line_names_the_fallback_path() {
-        assert_eq!(
-            distro_name_from_os_release(&hardware_root::OsRelease::Found {
-                path: "/usr/lib/os-release",
-                text: "PRETTY_NAME=\"Ubuntu 24.04 LTS\"\nunset ID\n".to_owned(),
-            }),
-            "Linux (/usr/lib/os-release line 2 is not a plain assignment: \"unset ID\")"
         );
     }
 

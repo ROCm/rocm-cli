@@ -1997,7 +1997,7 @@ libatomic and libnuma install plans `rocm` runs before serving and the hints
 naming them ([`openmpi.rs`](../crates/rocm-core/src/openmpi.rs)), `rocm
 examine`'s distro fields ([`examine.rs`](../crates/rocm-core/src/examine.rs)),
 and the distro name it prints
-([`host_gpu.rs`](../crates/rocm-core/src/host_gpu.rs)). The one exception is
+([`os_facts.rs`](../crates/rocm-core/src/host_gpu/os_facts.rs)). The one exception is
 `rocm diagnose --distro` run from Windows, which has the WSL distribution's own
 `sh` source the file and reports what it assigned.
 
