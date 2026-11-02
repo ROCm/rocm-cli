@@ -7,4 +7,8 @@
 /docs/** text eol=lf
 /engines/** text eol=lf
 /scripts/** text eol=lf
+# The recorded `rocm` output the skill evals replay is compared byte for byte
+# by `cargo xtask eval-fixtures --check`, so a Windows checkout must not
+# rewrite its line endings.
+/skills/rocm-doctor/evals/fixtures/** text eol=lf
 *.sh text eol=lf

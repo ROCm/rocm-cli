@@ -2,9 +2,11 @@
 //
 // SPDX-License-Identifier: MIT
 
+use crate::sandbox_tool::{SandboxToolArg, SandboxToolPolicy};
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand};
 use rocm_core::{AppPaths, DEFAULT_LOCAL_HOST};
+use serde::Serialize;
 use serde_json::Value;
 use serde_json::json;
 use std::ffi::OsString;
@@ -118,74 +120,8 @@ pub(crate) enum Command {
     },
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
-#[value(rename_all = "snake_case")]
-pub(crate) enum SandboxToolArg {
-    CheckUpdates,
-    DriverPlan,
-    ExamineSnapshot,
-    ListServers,
-    RestartServer,
-    StopServer,
-    PrefetchArtifact,
-    NotifyUser,
-}
-
-impl SandboxToolArg {
-    pub(crate) const fn as_cli_value(self) -> &'static str {
-        match self {
-            Self::CheckUpdates => "check_updates",
-            Self::DriverPlan => "driver_plan",
-            Self::ExamineSnapshot => "examine_snapshot",
-            Self::ListServers => "list_servers",
-            Self::RestartServer => "restart_server",
-            Self::StopServer => "stop_server",
-            Self::PrefetchArtifact => "prefetch_artifact",
-            Self::NotifyUser => "notify_user",
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    pub(crate) const fn writes_data(self) -> bool {
-        matches!(
-            self,
-            Self::RestartServer | Self::StopServer | Self::NotifyUser
-        )
-    }
-
-    #[cfg(target_os = "linux")]
-    pub(crate) const fn writes_cache(self) -> bool {
-        matches!(self, Self::CheckUpdates | Self::PrefetchArtifact)
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-pub(crate) struct SandboxToolPolicy {
-    pub(crate) allow_artifact_download: bool,
-    pub(crate) artifact_max_bytes: Option<u64>,
-    pub(crate) allow_huggingface_download: bool,
-    pub(crate) huggingface_token: Option<String>,
-}
-
-impl SandboxToolPolicy {
-    pub(crate) fn from_cli(
-        allow_artifact_download: bool,
-        artifact_max_bytes: Option<u64>,
-        allow_huggingface_download: bool,
-    ) -> Self {
-        Self {
-            allow_artifact_download,
-            artifact_max_bytes,
-            allow_huggingface_download,
-            huggingface_token: allow_huggingface_download
-                .then(resolve_huggingface_token)
-                .flatten(),
-        }
-    }
-}
-
 fn print_bridge_snapshot(paths: &AppPaths, pretty: bool) -> Result<()> {
-    let snapshot = crate::common::build_bridge_snapshot(paths)?;
+    let snapshot = crate::host_snapshot::build_bridge_snapshot(paths)?;
 
     if pretty {
         println!(
@@ -203,19 +139,12 @@ fn print_bridge_snapshot(paths: &AppPaths, pretty: bool) -> Result<()> {
     Ok(())
 }
 
-fn resolve_huggingface_token() -> Option<String> {
-    [
-        "ROCM_CLI_HUGGINGFACE_TOKEN",
-        "HF_TOKEN",
-        "HUGGING_FACE_HUB_TOKEN",
-    ]
-    .iter()
-    .find_map(|name| {
-        std::env::var(name)
-            .ok()
-            .map(|value| value.trim().to_owned())
-            .filter(|value| !value.is_empty())
-    })
+fn print_json<T: Serialize>(value: &T) -> Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(value).context("failed to serialize json output")?
+    );
+    Ok(())
 }
 
 #[tokio::main]
@@ -249,7 +178,7 @@ async fn run_cli(cli: Cli) -> Result<()> {
         Command::Run {
             automations_enabled,
             local_webhook_port,
-        } => crate::service::run_daemon(&paths, automations_enabled, local_webhook_port).await?,
+        } => crate::daemon::run_daemon(&paths, automations_enabled, local_webhook_port).await?,
         Command::Supervise {
             service_id,
             engine,
@@ -262,7 +191,7 @@ async fn run_cli(cli: Cli) -> Result<()> {
             device_policy,
             gpu,
             engine_recipe_json,
-        } => crate::service::supervise_service(
+        } => crate::supervise::supervise_service(
             &paths,
             service_id,
             engine,
@@ -277,7 +206,7 @@ async fn run_cli(cli: Cli) -> Result<()> {
             engine_recipe_json,
         )?,
         Command::Status => {
-            crate::service::print_status(&paths)?;
+            crate::daemon::print_status(&paths)?;
         }
         Command::BridgeSnapshot { pretty } => {
             print_bridge_snapshot(&paths, pretty)?;
@@ -306,7 +235,7 @@ async fn run_cli(cli: Cli) -> Result<()> {
                 allow_native_fallback,
                 policy,
             )?;
-            crate::mcp::print_json(&value)?;
+            print_json(&value)?;
         }
         Command::SandboxTool {
             tool,
@@ -330,13 +259,13 @@ async fn run_cli(cli: Cli) -> Result<()> {
                 message,
                 policy,
             )?;
-            crate::mcp::print_json(&value)?;
+            print_json(&value)?;
         }
         Command::McpServer => {
             crate::mcp::run_mcp_server(&paths)?;
         }
         Command::McpToolsJson => {
-            crate::mcp::print_json(&json!({ "tools": crate::mcp::rocm_mcp_tools() }))?;
+            print_json(&json!({ "tools": crate::mcp::rocm_mcp_tools() }))?;
         }
         Command::McpCall {
             name,
@@ -357,7 +286,7 @@ async fn run_cli(cli: Cli) -> Result<()> {
                     "arguments": arguments,
                 }),
             )?;
-            crate::mcp::print_json(&result)?;
+            print_json(&result)?;
         }
     }
 

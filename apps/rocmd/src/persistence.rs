@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: MIT
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use rocm_core::{
     AppPaths, AuditEventRecord, AutomationEventRecord, AutomationRuntimeState,
     ManagedServiceRecord, append_audit_event, append_automation_event, unix_time_millis,
@@ -76,6 +76,31 @@ pub(crate) fn load_managed_services(paths: &AppPaths) -> Result<Vec<ManagedServi
 
     records.sort_by_key(|record| std::cmp::Reverse(record.created_at_unix_ms));
     Ok(records)
+}
+
+pub(crate) fn load_service_record(
+    paths: &AppPaths,
+    service_id: &str,
+) -> Result<ManagedServiceRecord> {
+    rocm_core::ServiceId::new(service_id)
+        .with_context(|| format!("invalid managed service id `{service_id}`"))?;
+    let manifest_path = paths.service_manifest_path(service_id);
+    let bytes = fs::read(&manifest_path).with_context(|| {
+        format!(
+            "managed service `{service_id}` not found at {}",
+            manifest_path.display()
+        )
+    })?;
+    let record = serde_json::from_slice::<ManagedServiceRecord>(&bytes)
+        .with_context(|| format!("failed to parse {}", manifest_path.display()))?;
+    if record.service_id != service_id {
+        bail!(
+            "managed service manifest {} contains service_id `{}`, expected `{service_id}`",
+            manifest_path.display(),
+            record.service_id
+        );
+    }
+    Ok(record)
 }
 
 #[cfg(test)]

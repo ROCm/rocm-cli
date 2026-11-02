@@ -844,7 +844,13 @@ async fn second_marked_rollback(world: &mut E2eWorld) {
 #[then("the CLI refuses and requires --yes")]
 async fn uninstall_refused_without_yes(world: &mut E2eWorld) {
     let rc = world.cli_rc.expect("no command rc recorded");
-    assert!(rc != 0, "expected refusal, got rc=0:\n{}", combined(world));
+    // `rocm runtimes uninstall --help` promises exit 1 for this refusal.
+    assert_eq!(
+        rc,
+        1,
+        "expected a refusal with exit 1:\n{}",
+        combined(world)
+    );
     assert!(
         combined(world).contains("requires --yes"),
         "expected a --yes-required error, got:\n{}",

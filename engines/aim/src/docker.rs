@@ -23,6 +23,25 @@ fn docker_output(command: Command, timeout: Duration, label: &str) -> Result<Out
     rocm_core::process::run_with_timeout(command, timeout, label)
 }
 
+/// Deterministic, Docker-name-sanitized container identity for a service.
+/// The container is stopped and removed by name (`docker kill`/`rm -f`), never
+/// by signalling a client process, so it cannot be orphaned by a killed
+/// `docker run` client. `serve_http` is the long-lived process rocmd
+/// supervises: it blocks until the container exits and records how it ended.
+pub(crate) fn container_name(service_id: &str) -> String {
+    let sanitized: String = service_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    format!("rocm-aim-{sanitized}")
+}
+
 pub(crate) struct RunSpec<'a> {
     pub name: &'a str,
     pub image: &'a str,
@@ -382,11 +401,21 @@ pub(crate) fn daemon_reachable() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ContainerState, RunSpec, gpu_device_args, is_no_such, is_nothing_to_stop,
+        ContainerState, RunSpec, container_name, gpu_device_args, is_no_such, is_nothing_to_stop,
         parse_container_state, parse_getent_gid, run_args, split_env,
     };
     use std::collections::BTreeMap;
     use std::path::Path;
+
+    #[test]
+    fn container_name_sanitizes_unsafe_characters() {
+        assert_eq!(container_name("svc 1/a"), "rocm-aim-svc-1-a");
+    }
+
+    #[test]
+    fn container_name_preserves_safe_characters() {
+        assert_eq!(container_name("svc_1.a-b"), "rocm-aim-svc_1.a-b");
+    }
 
     fn spec<'a>(gpu_indices: &'a [u32], env: &'a BTreeMap<String, String>) -> RunSpec<'a> {
         RunSpec {

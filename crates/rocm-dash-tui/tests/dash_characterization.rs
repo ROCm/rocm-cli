@@ -7,7 +7,8 @@
 //! Freezes `ui::draw` behaviour for every tab in the 5-tab IA
 //! (Home / ROCm / Serving / Observe / Chat) as TestBackend buffer-text
 //! assertions, plus a squeezed-height no-panic sweep and the Phase-3 inline-
-//! manager (de-modal) rendering contract.
+//! manager (de-modal) rendering contract. One test at the end pins that the
+//! popup helpers stay reachable through their pre-split `ui::modal` paths.
 //!
 //! Ponytail: reuse the existing `TestBackend` → `Terminal` → `ui::draw` →
 //! flatten-buffer pattern; no new test framework, no demo NDJSON.
@@ -608,4 +609,35 @@ fn demo_buffer_dump_all_tabs_inline_details_and_heroes() {
         "honest placeholder for cold instance missing"
     );
     println!("DEMO_DUMP Observe: heroes + tok/watt + live TTFT 150ms + honest — ✓");
+}
+
+/// The popup helpers moved into `ui::panel`, but `rocm_dash_tui::ui::modal::*`
+/// was their public path first. Naming them through `modal` from an external
+/// crate fails to compile if that re-export is dropped, which is what this
+/// test pins; the assertions on top check the geometry values of
+/// `centered_rect` and `centered_width` and the inner rect of
+/// `draw_popup_frame`, and `grey_overlay` is only checked for reachability.
+#[test]
+fn popup_helpers_stay_reachable_through_ui_modal() {
+    use ratatui::layout::Rect;
+
+    let area = Rect::new(0, 0, 80, 24);
+    assert_eq!(
+        ui::modal::centered_rect(50, 50, 200, 200, area),
+        Rect::new(20, 6, 40, 12)
+    );
+    assert_eq!(ui::modal::centered_width(50, 200, area), 40);
+
+    let theme = ui::theme::Theme::default();
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    let mut via_modal = Rect::default();
+    let mut via_panel = Rect::default();
+    term.draw(|f| {
+        via_modal = ui::modal::draw_popup_frame(f, area, " Help ", &theme);
+        via_panel = ui::panel::draw_popup_frame(f, area, " Help ", &theme);
+        ui::modal::grey_overlay(f);
+    })
+    .unwrap();
+    assert_eq!(via_modal, via_panel);
+    assert_eq!(via_modal, Rect::new(1, 1, 78, 22));
 }

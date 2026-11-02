@@ -94,7 +94,7 @@ pub(crate) fn endpoint_response(request: EndpointRequest) -> Result<EndpointResp
 pub(crate) fn logs_response(request: LogsRequest) -> Result<LogsResponse> {
     require_nonempty(&request.service_id, "service_id")?;
     let limit = request.tail_lines.unwrap_or(DEFAULT_LOG_TAIL_LINES);
-    let name = crate::process::container_name(&request.service_id);
+    let name = crate::docker::container_name(&request.service_id);
     let recent_lines = crate::docker::logs(&name, limit).unwrap_or_default();
     Ok(LogsResponse {
         log_path: format!("docker://{name}"),
@@ -133,7 +133,7 @@ pub(crate) fn write_running_state(
     device_policy: DevicePolicy,
     engine_recipe: Option<&EngineRecipeHint>,
 ) -> Result<()> {
-    let endpoint = crate::process::endpoint_url(host, port);
+    let endpoint = endpoint_url(host, port);
     // `extra_env` can carry secrets (e.g. an HF token passed via `--engine-env`);
     // this state file is status/introspection only (never read back to relaunch
     // the container, see `crate::process::launch_service`), so redact values
@@ -145,7 +145,7 @@ pub(crate) fn write_running_state(
             "service_id": service_id,
             "engine": crate::ENGINE_NAME,
             "status": "running",
-            "container_name": crate::process::container_name(service_id),
+            "container_name": crate::docker::container_name(service_id),
             "model_ref": model_ref,
             "served_model_id": served_model_id,
             "host": host,
@@ -214,13 +214,17 @@ fn write_state(path: &Path, value: &Value) -> Result<()> {
         .with_context(|| format!("failed to write {}", path.display()))
 }
 
+pub(crate) fn endpoint_url(host: &str, port: u16) -> String {
+    format!("{}/v1", rocm_core::format_http_base_url(host, port))
+}
+
 fn endpoint_url_from_state(state: &Value) -> Option<String> {
     if let Some(endpoint) = value_string(state, "endpoint_url") {
         return Some(endpoint);
     }
     let host = value_string(state, "host")?;
     let port = state.get("port")?.as_u64()? as u16;
-    Some(crate::process::endpoint_url(&host, port))
+    Some(endpoint_url(&host, port))
 }
 
 pub(crate) fn query_loaded_model_endpoint(

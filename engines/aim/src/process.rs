@@ -46,25 +46,6 @@ fn resolve_aim_ready_timeout(override_value: Option<String>) -> Duration {
         .map_or(DEFAULT_READY_TIMEOUT, Duration::from_secs)
 }
 
-/// Deterministic, Docker-name-sanitized container identity for a service.
-/// The container is stopped and removed by name (`docker kill`/`rm -f`), never
-/// by signalling a client process, so it cannot be orphaned by a killed
-/// `docker run` client. `serve_http` is the long-lived process rocmd
-/// supervises: it blocks until the container exits and records how it ended.
-pub(crate) fn container_name(service_id: &str) -> String {
-    let sanitized: String = service_id
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    format!("rocm-aim-{sanitized}")
-}
-
 /// Image metadata for the pre-launch `ResolveModel` step: the local daemon's
 /// copy when the image is already present, otherwise a best-effort Docker Hub
 /// lookup. Both are hints; callers must tolerate failure.
@@ -192,7 +173,7 @@ pub(crate) fn launch_service(request: LaunchRequest) -> Result<LaunchResponse> {
         &gpu_indices,
         engine_recipe.as_ref().map(|hint| &hint.extra_env),
     )?;
-    let endpoint_url = endpoint_url(&request.host, request.port);
+    let endpoint_url = crate::state::endpoint_url(&request.host, request.port);
     crate::state::write_running_state(
         &state_path,
         &request.service_id,
@@ -204,7 +185,10 @@ pub(crate) fn launch_service(request: LaunchRequest) -> Result<LaunchResponse> {
         engine_recipe.as_ref(),
     )?;
 
-    let log_path = format!("docker://{}", container_name(&request.service_id));
+    let log_path = format!(
+        "docker://{}",
+        crate::docker::container_name(&request.service_id)
+    );
     Ok(LaunchResponse {
         service_id: request.service_id,
         // ponytail: `docker run -d` backgrounds the container itself, so there is
@@ -278,7 +262,7 @@ fn run_container(
     requested_gpus: &[u32],
     extra_env: Option<&BTreeMap<String, String>>,
 ) -> Result<Option<String>> {
-    let name = container_name(service_id);
+    let name = crate::docker::container_name(service_id);
     // Normalize once so the pull, the metadata and the run all use the same image.
     let image_ref = crate::registry::normalize_image_ref(model_ref);
 
@@ -372,7 +356,7 @@ fn resolve_use_gpu(
 }
 
 pub(crate) fn serve_http(request: ServeHttpRequest) -> Result<()> {
-    let name = container_name(&request.service_id);
+    let name = crate::docker::container_name(&request.service_id);
     let label_name = run_container(
         &request.service_id,
         &request.model_ref,
@@ -504,7 +488,7 @@ fn wait_for_container_ready(
     timeout: Duration,
 ) -> Result<String> {
     let start = Instant::now();
-    let endpoint = endpoint_url(host, port);
+    let endpoint = crate::state::endpoint_url(host, port);
     let mut consecutive_errors = 0;
     loop {
         match crate::docker::container_state(name) {
@@ -551,7 +535,7 @@ fn wait_for_container_ready(
 
 pub(crate) fn stop_service(request: StopRequest) -> Result<StopResponse> {
     require_nonempty(&request.service_id, "service_id")?;
-    let name = container_name(&request.service_id);
+    let name = crate::docker::container_name(&request.service_id);
     let state_path = crate::state::state_path(&request.service_id);
     let prior_status = crate::state::read_status(&state_path);
     // Record the intent first: the container's supervisor (`serve_http`) sees the
@@ -574,10 +558,6 @@ pub(crate) fn stop_service(request: StopRequest) -> Result<StopResponse> {
         stopped,
         graceful: stopped && !request.force,
     })
-}
-
-pub(crate) fn endpoint_url(host: &str, port: u16) -> String {
-    format!("{}/v1", rocm_core::format_http_base_url(host, port))
 }
 
 pub(crate) fn parse_device_policy_arg(policy: &str) -> Result<DevicePolicy> {
@@ -647,16 +627,6 @@ mod tests {
             resolve_aim_ready_timeout(Some("not-a-number".to_owned())),
             DEFAULT_READY_TIMEOUT
         );
-    }
-
-    #[test]
-    fn container_name_sanitizes_unsafe_characters() {
-        assert_eq!(container_name("svc 1/a"), "rocm-aim-svc-1-a");
-    }
-
-    #[test]
-    fn container_name_preserves_safe_characters() {
-        assert_eq!(container_name("svc_1.a-b"), "rocm-aim-svc_1.a-b");
     }
 
     #[test]

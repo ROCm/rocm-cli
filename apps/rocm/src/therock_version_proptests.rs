@@ -6,7 +6,7 @@
 //! update-source selection.
 //!
 //! These exercise the chain that decides *which* ROCm runtime a user ends up
-//! with: [`super::compare_version_strings`] and everything that sorts with it,
+//! with: [`super::version::compare_version_strings`] and everything that sorts with it,
 //! [`super::runtime_freshness`] (the update/no-update verdict), and the
 //! manifest pickers that choose an update source.
 //!
@@ -23,12 +23,15 @@ use proptest::prelude::*;
 use proptest::strategy::ValueTree;
 use proptest::test_runner::{Config as ProptestConfig, TestRunner};
 
-use super::{
-    InstalledRuntimeManifest, RuntimeFreshness, VersionOrderKey, VersionStage,
-    compare_version_strings, parse_host_version, parse_version, parse_version_for_ordering,
-    runtime_freshness, select_rocm_version, select_startup_update_manifest,
-    sort_manifests_newest_install_first,
+use super::version::{
+    VersionOrderKey, VersionStage, compare_version_strings, parse_host_version, parse_version,
+    parse_version_for_ordering,
 };
+use super::{
+    InstalledRuntimeManifest, RuntimeFreshness, runtime_freshness, select_rocm_version,
+    select_startup_update_manifest,
+};
+use crate::runtime_registry::sort_manifests_newest_install_first;
 use crate::storage::{RetentionInputs, select_runtimes_to_remove};
 
 // ---------------------------------------------------------------------------
@@ -118,8 +121,8 @@ fn version_list() -> impl Strategy<Value = Vec<String>> {
 /// The intended numeric order of two versions, when the repository's own
 /// lenient parser can read both.
 ///
-/// [`super::parse_host_version`] lives in the same file as
-/// [`super::parse_version`] and handles the shapes the strict one rejects
+/// [`super::version::parse_host_version`] lives in the same file as
+/// [`super::version::parse_version`] and handles the shapes the strict one rejects
 /// (missing patch, `-build` suffix). Using it as the oracle keeps this a
 /// self-consistency check between two parsers that ship together rather than
 /// an opinion imported from outside: whatever the project means by "newer", it
@@ -386,7 +389,7 @@ proptest! {
             for candidate in &versions {
                 // Only candidates this channel would actually accept count.
                 if matches!(channel, super::TheRockChannel::Release)
-                    && !super::is_stable_runtime_version(candidate)
+                    && !super::version::is_stable_runtime_version(candidate)
                 {
                     continue;
                 }
@@ -964,7 +967,7 @@ fn compare_version_strings_orders_four_component_releases() {
     // the update verdict would then call `7.2.4` up to date against an index
     // offering `7.2.4.70204`.
     assert_eq!(
-        super::version_relation("7.2.4.70204", "7.2.4"),
+        super::version::version_relation("7.2.4.70204", "7.2.4"),
         Some(Ordering::Greater)
     );
     // Trailing zeros do not make a new release: PEP 440 pads the shorter side.
@@ -1056,7 +1059,7 @@ fn compare_version_strings_orders_7_9_below_7_10_0() {
 /// compare. Sorting low is the safe end *here*: `select_rocm_version` takes the
 /// maximum, so junk can only be selected when every candidate is junk. It is
 /// the wrong end for `runtime_freshness`, which is why that caller asks
-/// [`super::version_relation`] instead — see
+/// [`super::version::version_relation`] instead — see
 /// `runtime_freshness_follows_the_version_order`.
 #[test]
 fn compare_version_strings_places_unreadable_versions_below_readable_ones() {

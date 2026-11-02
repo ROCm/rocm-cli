@@ -35,8 +35,7 @@ use crate::ui::approval::{
 use crate::ui::exec::{display_args, exe_label, resolve_exe};
 use crate::ui::folder_browser::{FolderBrowser, FolderOutcome, draw_folder_browser};
 use crate::ui::job_console::{ConsoleOutcome, on_console_key};
-use crate::ui::modal::{centered_rect, draw_popup_frame};
-use crate::ui::panel::{self, BoxRole};
+use crate::ui::panel::{self, BoxRole, centered_rect, draw_popup_frame};
 use crate::ui::theme::Theme;
 
 /// A flattened registered-runtime entry for the list.
