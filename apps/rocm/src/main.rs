@@ -33,6 +33,7 @@ mod examine_report_text;
 mod freeform_execution;
 mod freeform_planner;
 mod gpu_policy;
+mod install_cmd;
 mod logging;
 mod managed_service_status;
 mod model_fit;
@@ -67,10 +68,8 @@ mod update_cmd;
 // root-level commands outside `dispatch()` call them directly.
 // `prepare_freeform_execution`/`render_freeform_execution_header` are
 // re-imported for the same reason: `execute_freeform_next_action` (itself only
-// called from `run_freeform`, outside `dispatch()`) calls them. `install()`'s
-// SDK path calls into `runtime_install_finalize` directly (not via
-// `dispatch()`), and several root-level chat/examine helpers call into
-// `runtimes_cmd` directly for the same reason `engines_cmd`'s
+// called from `run_freeform`, outside `dispatch()`) calls them. Several
+// root-level chat/examine helpers call into `runtimes_cmd` directly for the same reason `engines_cmd`'s
 // runtime-resolution helpers are re-imported; `current_runtime_manifest`
 // stays re-imported here for other root-level commands outside `dispatch()`
 // that call it directly, and
@@ -92,13 +91,14 @@ mod update_cmd;
 // `record_cli_audit_event`, `cli_lifecycle_log_path` and `sanitize_log_value`
 // (from `cli_audit.rs`) are re-imported so other modules keep reaching them as
 // `crate::<name>`; `main.rs` itself calls `record_cli_audit_event`.
+// `therock_install_version_selector` (from `install_cmd.rs`) is re-imported for
+// the same reason: `chat.rs` reaches it as `crate::therock_install_version_selector`.
 // `DEFAULT_SERVICE_PRUNE_MIN_AGE_HOURS` (from `service_records.rs`) is imported
 // for the `ServicesCommand::Prune` clap definition.
 use crate::automations::{automations, render_daemon_text};
 use crate::cli_audit::{cli_lifecycle_log_path, record_cli_audit_event, sanitize_log_value};
 use crate::config_cmd::{config, render_config_text};
 use crate::diagnose_cmd::{diagnose, fix};
-use crate::driver_install::{install_driver, reconcile_driver_install};
 use crate::engine_ipc::{run_builtin_engine_serve_http, run_builtin_engine_stdio};
 use crate::engine_runtime_select::{daemon_run_argv, parse_engine_recipe_json_arg};
 use crate::engines_cmd::{engine_manages_own_runtime, engines, runtime_manifest_for_selector};
@@ -117,13 +117,9 @@ use crate::examine_report_text::{
 };
 use crate::freeform_execution::{prepare_freeform_execution, render_freeform_execution_header};
 use crate::gpu_policy::{GpuVramUsage, parse_gpu_indices_arg, serve_gpu_low_memory_warning};
+use crate::install_cmd::{install, therock_install_version_selector};
 use crate::managed_service_status::load_managed_services;
 use crate::model_fit::{PlatformRuleOut, engine_ruled_out_by_platform};
-use crate::runtime_install_finalize::{
-    SdkInstallConsents, ensure_libatomic_for_torch, ensure_libnuma_for_torch,
-    finalize_successful_sdk_install, finish_sdk_install, maybe_auto_install_sdk_preferred_engine,
-    print_sdk_install_success,
-};
 use crate::runtimes_cmd::{
     current_runtime_manifest, recover_setup_runtime_registration,
     runtime_usability_status, runtimes, setup_runtime_paths,
@@ -2830,215 +2826,6 @@ fn examine(json: bool, framework: rocm_core::FrameworkProbe) -> Result<()> {
         // Informational platform guidance for humans (the verdict is also in
         // the `status` field for `--json` consumers).
         println!("\n{}", rocm_core::WSL_PLATFORM_NOTE);
-    }
-    Ok(())
-}
-
-fn therock_install_version_selector(
-    version: Option<String>,
-    build_date: Option<String>,
-) -> Result<Option<therock::RuntimeVersionSelector>> {
-    match (version, build_date) {
-        (Some(_), Some(_)) => bail!("use either --version or --build-date, not both"),
-        (Some(version), None) => Ok(Some(therock::RuntimeVersionSelector::version(version)?)),
-        (None, Some(build_date)) => Ok(Some(therock::RuntimeVersionSelector::build_date(
-            build_date,
-        )?)),
-        (None, None) => Ok(None),
-    }
-}
-
-fn therock_install_version_selector_display(selector: &therock::RuntimeVersionSelector) -> String {
-    match selector {
-        therock::RuntimeVersionSelector::Version(version) => format!("version:{version}"),
-        therock::RuntimeVersionSelector::BuildDate(date) => format!("build-date:{date}"),
-    }
-}
-
-fn install(target: InstallTarget) -> Result<()> {
-    let paths = AppPaths::discover()?;
-    match target {
-        InstallTarget::Sdk {
-            channel,
-            format,
-            prefix,
-            devel,
-            version,
-            build_date,
-            family,
-            dry_run,
-            yes,
-            approve_replacing_active_default,
-        } => {
-            let consents = SdkInstallConsents::resolve(yes, approve_replacing_active_default);
-            let format_name = match format {
-                InstallFormat::Wheel => "wheel",
-                InstallFormat::Tarball => "tarball",
-            };
-            let version_selector = therock_install_version_selector(version, build_date)?;
-            let version_selector_display = version_selector.as_ref().map_or_else(
-                || "latest-compatible".to_owned(),
-                therock_install_version_selector_display,
-            );
-            let prefix_display = prefix
-                .as_ref()
-                .map_or_else(|| "<managed>".to_owned(), |path| path.display().to_string());
-            match therock::install_sdk(
-                &paths,
-                chat::sdk_install_request(
-                    &channel,
-                    format_name,
-                    prefix,
-                    version_selector,
-                    family.as_deref(),
-                    dry_run,
-                    devel,
-                    consents.replace_active_default,
-                ),
-            ) {
-                Ok(result) => {
-                    let therock::SdkInstallResult { output, mutated } = result;
-                    let finalized = if mutated {
-                        finalize_successful_sdk_install(&paths)?
-                    } else {
-                        None
-                    };
-                    print!("{output}");
-                    if let Some(finalized) = &finalized {
-                        print_sdk_install_success(finalized);
-                        // The SDK runtime wheel bundles PyTorch, whose ROCm build
-                        // links against libatomic.so.1 and the system numactl
-                        // runtime (libnuma.so.1 / libnuma_1.2). Ensure both are
-                        // present for every SDK install, independent of which
-                        // engine (if any) is auto-installed below.
-                        ensure_libatomic_for_torch(consents.system_packages);
-                        ensure_libnuma_for_torch(consents.system_packages);
-                    }
-                    finish_sdk_install(
-                        &paths,
-                        finalized.as_ref(),
-                        if dry_run {
-                            "install_sdk_dry_run"
-                        } else {
-                            "install_sdk"
-                        },
-                        {
-                            // A real install that did not mutate the system was
-                            // declined at the approval prompt; recording it as
-                            // "completed" would lie in the audit trail. Dry-run
-                            // never mutates but legitimately completes a preview.
-                            let status = if dry_run || mutated {
-                                "completed"
-                            } else {
-                                "cancelled"
-                            };
-                            format!(
-                                "sdk install {status} channel={channel} format={format_name} prefix={prefix_display} version_selector={version_selector_display} dry_run={dry_run}"
-                            )
-                        },
-                        |paths, finalized| {
-                            maybe_auto_install_sdk_preferred_engine(
-                                paths,
-                                finalized,
-                                consents.system_packages,
-                            )
-                        },
-                    )?;
-                }
-                Err(error) => {
-                    record_cli_audit_event(
-                        &paths,
-                        "runtime",
-                        if dry_run {
-                            "install_sdk_dry_run"
-                        } else {
-                            "install_sdk"
-                        },
-                        "error",
-                        format!(
-                            "sdk install failed channel={channel} format={format_name} prefix={prefix_display} version_selector={version_selector_display} dry_run={dry_run}: {error}"
-                        ),
-                        None,
-                    );
-                    return Err(error);
-                }
-            }
-        }
-        InstallTarget::Driver {
-            dkms,
-            yes,
-            dry_run,
-            reconcile,
-        } => {
-            if reconcile {
-                if dkms || yes || dry_run {
-                    bail!(
-                        "`rocm install driver --reconcile` cannot be combined with --dkms, --yes, or --dry-run"
-                    );
-                }
-                match reconcile_driver_install(&paths) {
-                    Ok(output) => {
-                        print!("{output}");
-                        record_cli_audit_event(
-                            &paths,
-                            "driver",
-                            "install_driver_reconcile",
-                            "info",
-                            "driver install state reconciled",
-                            None,
-                        );
-                    }
-                    Err(error) => {
-                        record_cli_audit_event(
-                            &paths,
-                            "driver",
-                            "install_driver_reconcile",
-                            "error",
-                            format!("driver install reconciliation failed: {error}"),
-                            None,
-                        );
-                        return Err(error);
-                    }
-                }
-                return Ok(());
-            }
-            match install_driver(&paths, dkms, yes, dry_run) {
-                Ok(result) => {
-                    print!("{}", result.output);
-                    record_cli_audit_event(
-                        &paths,
-                        "driver",
-                        if result.executed {
-                            "install_driver_execute"
-                        } else {
-                            "install_driver_plan"
-                        },
-                        "info",
-                        format!("driver install handled dkms={dkms} yes={yes} dry_run={dry_run}"),
-                        None,
-                    );
-                }
-                Err(error) => {
-                    let executed = error.executed;
-                    let error = error.source;
-                    record_cli_audit_event(
-                        &paths,
-                        "driver",
-                        if executed {
-                            "install_driver_execute"
-                        } else {
-                            "install_driver_plan"
-                        },
-                        "error",
-                        format!(
-                            "driver install failed dkms={dkms} yes={yes} dry_run={dry_run}: {error}"
-                        ),
-                        None,
-                    );
-                    return Err(error);
-                }
-            }
-        }
     }
     Ok(())
 }
