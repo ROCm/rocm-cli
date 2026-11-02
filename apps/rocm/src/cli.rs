@@ -121,13 +121,12 @@ pub(crate) enum Command {
         /// cannot be read): weights plus KV cache at `--context-size` plus a
         /// compute buffer and a runtime reserve, against the dedicated VRAM of
         /// the GPU with the most of it, labelled ESTIMATED rather than READY or
-        /// BLOCKED. If `HIP_VISIBLE_DEVICES`, `ROCR_VISIBLE_DEVICES` or
-        /// `CUDA_VISIBLE_DEVICES` is set on a host whose GPUs differ in memory,
-        /// the report says that how the mask maps onto amd-smi's numbering is
-        /// unverified, so the figure may be for another card. Any other model
-        /// the catalog does not carry is reported as undetermined rather than
-        /// blocked - `rocm serve` still
-        /// accepts it, this just cannot say in advance whether it fits.
+        /// BLOCKED. A device-visibility mask on a host whose GPUs differ in
+        /// memory is flagged in the report, since which card it selects is not
+        /// verified there. Any other model the
+        /// catalog does not carry is reported as undetermined rather than
+        /// blocked - `rocm serve` still accepts it, this just cannot say in
+        /// advance whether it fits.
         ///
         /// A flag rather than a positional: `diagnose` takes no positional
         /// today, and one added now would be ambiguous against `--symptom`.

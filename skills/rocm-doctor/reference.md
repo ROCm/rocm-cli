@@ -48,10 +48,11 @@ the result from `--json`:
   nothing was checked — not a clean bill of health.
 - `route_when_no_match` — `{ target, url }` upstream tracker to use when `has_match` is false.
 - `model` — set only when `--model <ref>` was passed; otherwise not set. Answers
-  "will this curated model run here" from the recipe catalog and this host's
-  GPU/RAM, without downloading the weights: `{ verdict, evidence[], engine,
-  required_gpu_memory_gib, available_gpu_memory_gib, alternatives[],
-  undetermined_reason, fix }`. `verdict` is one of `ready`, `degraded`,
+  "will this model run here", without downloading the weights: for a curated
+  model from the recipe catalog and this host's GPU/RAM, and for a GGUF outside
+  the catalog with an `estimate` from its file header (below). Its fields:
+  `{ verdict, evidence[], engine, required_gpu_memory_gib,
+  available_gpu_memory_gib, alternatives[], undetermined_reason, fix }`. `verdict` is one of `ready`, `degraded`,
   `blocked`, `undetermined` — treat `undetermined` as "the CLI could not find
   out", never as evidence the model is incompatible. `--model` is refused
   together with `--distro`: the verdict is about the machine running the
