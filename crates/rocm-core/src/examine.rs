@@ -4375,7 +4375,7 @@ mod tests {
     fn the_managed_copy_this_cli_installs_is_reachable() {
         let (root, site_packages) = wheel_runtime_on_disk("found");
         let mut dirs = Vec::new();
-        crate::host_gpu::collect_managed_runtime_library_paths(
+        crate::managed_runtime::collect_managed_runtime_library_paths(
             &root,
             site_packages.as_deref(),
             &mut dirs,
@@ -4416,7 +4416,7 @@ mod tests {
         fs::create_dir_all(root.join("lib")).unwrap();
 
         let mut dirs = Vec::new();
-        crate::host_gpu::collect_managed_runtime_library_paths(&root, None, &mut dirs);
+        crate::managed_runtime::collect_managed_runtime_library_paths(&root, None, &mut dirs);
         assert!(
             dirs.contains(&root.join("lib")),
             "a root-format runtime keeps its libraries under the root, and that has to keep \
