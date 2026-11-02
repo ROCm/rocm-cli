@@ -1200,12 +1200,12 @@ fn service_record_matches_recovery_event(
             manifest_service_recovery_reason(record, unix_time_millis()).is_some()
         }
         "service.endpoint_recoverable" => endpoint_service_recovery_reason(record).is_some(),
-        "service.healthcheck_recoverable" => {
-            crate::common::engine_healthcheck_response(paths, &record.engine, &record.service_id)
-                .is_ok_and(|healthcheck| {
-                    crate::common::healthcheck_response_recoverable(&healthcheck)
-                })
-        }
+        "service.healthcheck_recoverable" => crate::engine_ipc::engine_healthcheck_response(
+            paths,
+            &record.engine,
+            &record.service_id,
+        )
+        .is_ok_and(|healthcheck| crate::engine_ipc::healthcheck_response_recoverable(&healthcheck)),
         _ => false,
     }
 }
@@ -1305,7 +1305,7 @@ fn handle_server_recover_event_with_record(
             // Report it and stop, rather than letting a permanent failure
             // propagate out of `evaluate_watchers` and take the whole daemon —
             // and every other watcher — down on each 30s recovery tick.
-            if let Err(error) = crate::common::ensure_public_service_has_endpoint_key(
+            if let Err(error) = crate::engine_ipc::ensure_public_service_has_endpoint_key(
                 &record.host,
                 rocm_engine_protocol::endpoint_key_file_if_present(paths, &record.service_id)
                     .and_then(|path| rocm_engine_protocol::endpoint_api_key_file_if_valid(&path))
@@ -1409,7 +1409,7 @@ pub(crate) fn find_recoverable_service(
             return Ok(Some((record, reason)));
         }
         if matches!(record.status.as_str(), "ready" | "running") {
-            let Ok(healthcheck) = crate::common::engine_healthcheck_response(
+            let Ok(healthcheck) = crate::engine_ipc::engine_healthcheck_response(
                 paths,
                 &record.engine,
                 &record.service_id,
@@ -1419,7 +1419,7 @@ pub(crate) fn find_recoverable_service(
                 }
                 continue;
             };
-            if crate::common::healthcheck_response_recoverable(&healthcheck) {
+            if crate::engine_ipc::healthcheck_response_recoverable(&healthcheck) {
                 return Ok(Some((
                     record,
                     format!("healthcheck_status_{}", healthcheck.status),

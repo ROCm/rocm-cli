@@ -100,7 +100,7 @@ pub(crate) fn supervise_service(
     // attempt leaves the recorded restart_count and timestamps intact instead of
     // clobbering them with a record no live process will ever back. The spawn
     // site below re-checks against the key actually threaded onto the command.
-    crate::common::ensure_public_service_has_endpoint_key(
+    crate::engine_ipc::ensure_public_service_has_endpoint_key(
         &record.host,
         rocm_engine_protocol::endpoint_key_file_if_present(paths, &record.service_id)
             .and_then(|path| rocm_engine_protocol::endpoint_api_key_file_if_valid(&path))
@@ -144,8 +144,8 @@ pub(crate) fn supervise_service(
     // no auth, so fail closed instead — an unreachable service is recoverable,
     // an anonymous public one is not.
     let endpoint_key_applied =
-        crate::common::apply_endpoint_key_env(&mut command, paths, &record.service_id);
-    crate::common::ensure_public_service_has_endpoint_key(
+        crate::engine_ipc::apply_endpoint_key_env(&mut command, paths, &record.service_id);
+    crate::engine_ipc::ensure_public_service_has_endpoint_key(
         &record.host,
         endpoint_key_applied,
         record.requires_api_key,
@@ -354,8 +354,8 @@ fn read_new_log_phase(log_path: &Path, pos: &mut u64) -> Option<&'static str> {
 }
 
 fn engine_healthcheck_ready(paths: &AppPaths, engine: &str, service_id: &str) -> Result<bool> {
-    Ok(crate::common::healthcheck_response_ready(
-        &crate::common::engine_healthcheck_response(paths, engine, service_id)?,
+    Ok(crate::engine_ipc::healthcheck_response_ready(
+        &crate::engine_ipc::engine_healthcheck_response(paths, engine, service_id)?,
     ))
 }
 

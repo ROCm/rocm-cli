@@ -7,6 +7,7 @@
 mod cli;
 mod common;
 mod daemon;
+mod engine_ipc;
 mod mcp;
 mod persistence;
 mod sandbox;

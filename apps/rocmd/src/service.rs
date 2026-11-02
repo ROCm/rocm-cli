@@ -36,7 +36,7 @@ pub(crate) fn stop_managed_service_with(
 }
 
 fn request_engine_stop(paths: &AppPaths, record: &ManagedServiceRecord) -> Result<StopResponse> {
-    crate::common::engine_request::<_, StopResponse>(
+    crate::engine_ipc::engine_request::<_, StopResponse>(
         paths,
         &record.engine,
         &record.service_id,
