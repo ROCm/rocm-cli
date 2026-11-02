@@ -4383,38 +4383,25 @@ fi
         )
     }
 
-    /// The aggregator's `run:` script with its comment lines dropped.
-    fn aggregator_script(aggregator: &str) -> String {
-        block_scalar_lines(aggregator, "run")
-            .into_iter()
-            .filter(|line| !line.starts_with('#'))
-            .collect::<Vec<_>>()
-            .join("\n")
+    /// The aggregator's one step, as a step block. Panics unless it is the only
+    /// step, so no other step can fail the job or let it pass.
+    fn aggregator_step(aggregator: &str) -> String {
+        let steps = job_steps(aggregator).expect("the aggregator has steps");
+        assert_eq!(
+            steps.len(),
+            1,
+            "the aggregator is exactly one step, so no other step can fail it or skip it"
+        );
+        steps.into_iter().next().expect("one step").1
     }
 
-    /// The `env:` entries of the aggregator's one step as `(variable, value)`
-    /// pairs, comments dropped. These are what bind the script's variables to the
-    /// `needs.<job>.result` it reads.
-    fn aggregator_env(aggregator: &str) -> Vec<(String, String)> {
-        let code = code_only(aggregator);
-        let mut lines = code.lines().skip_while(|line| line.trim() != "env:");
-        let Some(head) = lines.next() else {
-            return Vec::new();
-        };
-        let indent = indent_of(head);
-        lines
-            .filter(|line| !line.trim().is_empty())
-            .take_while(|line| indent_of(line) > indent)
-            .filter_map(|line| line.trim().split_once(':'))
-            .map(|(key, value)| (key.trim().to_owned(), value.trim().to_owned()))
-            .collect()
-    }
-
-    /// The one variable the aggregator binds to `expr`; panics unless it is exactly one.
-    fn aggregator_var(env: &[(String, String)], expr: &str) -> String {
+    /// The one variable the aggregator's step binds to `expr` in its `env:`;
+    /// panics unless it is exactly one.
+    fn aggregator_var(step: &str, expr: &str) -> String {
+        let env = step_env(step);
         let vars: Vec<&str> = env
             .iter()
-            .filter(|(_, value)| value == expr)
+            .filter(|(_, value)| value.as_str() == expr)
             .map(|(key, _)| key.as_str())
             .collect();
         assert_eq!(
@@ -4446,15 +4433,15 @@ fi
         let needs = yaml_value_at(&aggregator, 4, "needs")
             .expect("windows-build-and-test declares `needs:`");
         let needed = flattened_list_items(&needs);
-        let script = aggregator_script(&aggregator);
-        let env = aggregator_env(&aggregator);
+        let step = aggregator_step(&aggregator);
+        let script = preflight_body_code(&step);
         for (job, _) in &workers {
             assert!(
                 needed.iter().any(|n| n == job),
                 "windows-build-and-test must `need` {job}, or {job} can fail without \
                  failing the required check (needs: {needed:?})"
             );
-            let var = aggregator_var(&env, &format!("${{{{ needs.{job}.result }}}}"));
+            let var = aggregator_var(&step, &format!("${{{{ needs.{job}.result }}}}"));
             assert!(
                 script.contains(&format!("check {job} \"${var}\" ")),
                 "the aggregator script must check {job}'s result through ${var}:\n{script}"
@@ -4465,7 +4452,7 @@ fi
             "the aggregator must also need `changes`: a failed `changes` skips every \
              work job, and a skipped required check reads as passing"
         );
-        let changes_var = aggregator_var(&env, "${{ needs.changes.result }}");
+        let changes_var = aggregator_var(&step, "${{ needs.changes.result }}");
         assert!(
             script.contains(&format!("check changes \"${changes_var}\" success")),
             "the aggregator script must require `changes` to have succeeded through \
@@ -4485,21 +4472,30 @@ fi
             "the aggregator must run on a Linux runner so the script's `bash` is the one \
              the script test executes"
         );
-        let steps = job_steps(&aggregator).expect("the aggregator has steps");
+
+        // Exact key lists, so a key spelled in any position is seen, including on
+        // the step's `- ` line.
+        let job_keys: Vec<&str> = aggregator
+            .lines()
+            .filter(|line| {
+                indent_of(line) == 4 && !line.trim().is_empty() && !line.trim().starts_with('#')
+            })
+            .filter_map(|line| line.trim().split_once(':').map(|(key, _)| key.trim()))
+            .collect();
         assert_eq!(
-            steps.len(),
-            1,
-            "the aggregator is exactly one step, so no other step can fail it or skip it"
+            job_keys,
+            ["runs-on", "timeout-minutes", "needs", "if", "steps"],
+            "the aggregator job sets exactly these keys. A `name:` would rename the \
+             check context branch protection matches, so the required check would never \
+             report; `continue-on-error`, `strategy` or `permissions` would change \
+             whether it can fail. Change this list only with the ruleset"
         );
-        let step = &steps[0].1;
-        let key_indent = indent_of(step.lines().next().expect("a step has a first line")) + 2;
-        for key in ["if", "continue-on-error", "shell"] {
-            assert!(
-                yaml_value_at(step, key_indent, key).is_none(),
-                "the aggregator's step must not set `{key}`, which would change when it \
-                 runs or whether its failure counts:\n{step}"
-            );
-        }
+        assert_eq!(
+            step_keys(&step),
+            ["name", "env", "run"],
+            "the aggregator's step sets exactly these keys: an `if`, `continue-on-error` \
+             or `shell` would change when it runs or whether its failure counts:\n{step}"
+        );
     }
 
     /// The jobs the aggregator must wait on are found by runner, with anything not
@@ -4603,14 +4599,13 @@ fi
     #[test]
     fn ci_windows_aggregator_passes_only_when_every_job_succeeded() {
         let ci = read_workflow("ci.yml");
-        let aggregator = ci_job(&ci, "windows-build-and-test");
-        let script = aggregator_script(&aggregator);
+        let step = aggregator_step(&ci_job(&ci, "windows-build-and-test"));
+        let script = preflight_body_code(&step);
         // The variable names come from the workflow's own bindings, so a binding
         // that feeds the script the wrong job's result is run as written.
-        let env = aggregator_env(&aggregator);
-        let changes_var = aggregator_var(&env, "${{ needs.changes.result }}");
-        let debug_var = aggregator_var(&env, "${{ needs.windows-debug.result }}");
-        let release_var = aggregator_var(&env, "${{ needs.windows-release.result }}");
+        let changes_var = aggregator_var(&step, "${{ needs.changes.result }}");
+        let debug_var = aggregator_var(&step, "${{ needs.windows-debug.result }}");
+        let release_var = aggregator_var(&step, "${{ needs.windows-release.result }}");
 
         let run = |changes: &str, debug: &str, release: &str, expect_skipped: &str| -> i32 {
             let out = std::process::Command::new("bash")
@@ -4846,6 +4841,12 @@ fi
                 BUNDLE,
             ),
         ];
+        // Setup and reporting steps that do not check the change itself.
+        const NOT_GATING: &[&str] = &[
+            "Set up sccache",
+            "Probe sccache cache backend",
+            "sccache stats",
+        ];
 
         let ci = read_workflow("ci.yml");
         for &(job, name, required, forbidden, expected_if) in GATING {
@@ -4876,9 +4877,7 @@ fi
                 );
             }
             assert!(
-                !code
-                    .lines()
-                    .any(|line| line.trim_start().starts_with("continue-on-error:")),
+                !step_keys(step).iter().any(|key| key == "continue-on-error"),
                 "{job} step `{name}` must not set continue-on-error, or it cannot fail the job"
             );
             let item_indent = indent_of(step.lines().next().expect("a step has a first line"));
@@ -4887,6 +4886,33 @@ fi
                 Some(expected_if),
                 "{job} step `{name}` must keep its exact `if:`"
             );
+        }
+
+        // A step added to either job later is not pinned by the table above, so
+        // every step must be either in it or in `NOT_GATING`. An unnamed step must
+        // be one of the two actions that open each job (kept identical across the
+        // two jobs by `ci_windows_jobs_share_one_cache_and_toolchain_setup`).
+        for job in ["windows-debug", "windows-release"] {
+            let steps = job_steps(&ci_job(&ci, job)).unwrap_or_else(|| panic!("{job} has steps"));
+            for (name, step) in &steps {
+                let accounted_for = if name.is_empty() {
+                    [
+                        "actions/checkout@",
+                        "actions-rust-lang/setup-rust-toolchain@",
+                    ]
+                    .iter()
+                    .any(|action| step.contains(action))
+                } else {
+                    NOT_GATING.contains(&name.as_str())
+                        || GATING.iter().any(|&(j, n, ..)| j == job && n == name)
+                };
+                assert!(
+                    accounted_for,
+                    "{job} has a step this test does not pin:\n{step}\nAdd it to GATING \
+                     (with its command and exact `if:`) or, if it cannot fail the job, to \
+                     NOT_GATING"
+                );
+            }
         }
     }
 

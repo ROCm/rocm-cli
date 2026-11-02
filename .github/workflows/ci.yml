@@ -71,17 +71,21 @@ env:
 # with no timeout — holds a runner for six hours and, in the merge queue, stalls
 # every queued PR behind it with no signal that anything is wrong. The values here
 # are deliberately loose (roughly 4x the observed p100, which is under 3 min for
-# most jobs and ~13 min for the Windows build) so they never fire on a merely slow
-# run; they exist to convert a silent multi-hour stall into a prompt, legible
-# failure. Raise a value if a job legitimately grows into it.
+# most jobs; the two Windows jobs take 15-20 min on a cold pull-request cache and
+# keep a 45 min limit) so they never fire on a merely slow run; they exist to
+# convert a silent multi-hour stall into a prompt, legible failure. Raise a value
+# if a job legitimately grows into it.
 jobs:
   # Decide which file categories a change touches so unaffected jobs can skip
   # their expensive work. Filtering runs ONLY on pull_request; on push and in the
   # merge queue every category is forced true, so post-merge `main` and queued
   # PRs always run the full suite. That keeps the skip from ever starving a
   # required check in the merge queue (a never-produced required check stalls the
-  # queue forever — see the `commit-signatures` note below). Each output folds in
-  # `.github/workflows/**`, so any change to CI itself triggers a full run.
+  # queue forever — see the `commit-signatures` note below). Each path-filter
+  # output folds in `.github/workflows/**`, so any change to CI itself triggers a
+  # full run; the `windows` output is not a path filter, but it is true on every
+  # event except a manual dispatch that did not ask for binaries, so a change to CI
+  # always runs the Windows jobs too.
   changes:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -763,8 +767,10 @@ jobs:
 
   # Release side of the Windows lane. It builds the optimised binaries, and the
   # install lifecycle and the PR bundle consume them. The release-readiness
-  # self-test, the installer syntax check and the pinned-key check need no binaries;
-  # they sit here only to keep the two jobs about the same length. See
+  # self-test and the installer syntax check need no binaries and sit here to even
+  # out the two jobs' length (cold, this side is still the longer one). The
+  # pinned-key check runs through the `cargo xtask` alias, which builds xtask in
+  # release, so it reuses the build above rather than compiling its own. See
   # `windows-debug` for why the lane is split. The sccache key prefix below is
   # deliberately the same as that job's (and the pre-split job's), which keeps the
   # entries written before the split valid for both. Debug and release builds pass
@@ -1209,9 +1215,10 @@ jobs:
     name: remote control channel (containerised)
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    # Gated like every other heavy job here: a fast lint failure should
-    # short-circuit before this spends 30 minutes on a container and a cold
-    # cargo build, and a manual dispatch should stay a fast loop.
+    # Gated like the other heavy Linux jobs here (the Windows jobs deliberately do
+    # not wait; see `windows-debug`): a fast lint failure should short-circuit
+    # before this spends 30 minutes on a container and a cold cargo build, and a
+    # manual dispatch should stay a fast loop.
     needs: [changes, clippy, prek]
     if: github.event_name != 'workflow_dispatch' && needs.changes.outputs.heavy == 'true'
     steps:
