@@ -795,7 +795,7 @@ pub fn estimate_fit(
         estimate.detail = Some(format!(
             "no fits / does-not-fit verdict for this model: {why}, so the total above can be too \
              low; compare it with this GPU's {} MiB yourself and leave headroom",
-            (available_gib * 1024.0).floor()
+            whole_mib_offered(available_gib)
         ));
         return estimate;
     }
@@ -998,6 +998,15 @@ fn offload_suggestion(
 
 /// The evidence lines for an estimate, in the report's own voice.
 #[must_use]
+/// A host's memory in whole MiB, rounded down: a host never reads as offering
+/// more than it does, and an integer figure sits beside the integer figures in
+/// the report. The `1e-6` keeps floating-point error in the GiB figure from
+/// costing a whole MiB. Every line that shows the host's memory in MiB goes
+/// through here, so two lines never show it differently.
+const fn whole_mib_offered(gib: f64) -> f64 {
+    gib.mul_add(1024.0, 1e-6).floor()
+}
+
 pub fn evidence_lines(estimate: &ContextEstimate) -> Vec<String> {
     let mut lines = Vec::new();
     // Where the figures came from is only worth saying when there was a header
@@ -1035,9 +1044,7 @@ pub fn evidence_lines(estimate: &ContextEstimate) -> Vec<String> {
         ));
     }
     if let Some(available) = estimate.available_gib {
-        // Whole MiB, rounded down: a host never reads as offering more than it
-        // does, and an integer figure sits beside the integer figures above.
-        let offered = available.mul_add(1024.0, 1e-6).floor();
+        let offered = whole_mib_offered(available);
         lines.push(format!(
             "the GPU with the most dedicated VRAM that ROCm can see has {offered} MiB ({}) in \
              total; memory other processes already hold is not subtracted",
@@ -2049,6 +2056,26 @@ mod tests {
             &llama_like(10).u32("llama.expert_count", 8),
             "compute buffer was not measured",
         );
+    }
+
+    /// The no-verdict detail and the evidence line show the same MiB figure,
+    /// even for a GiB figure a hair under a whole MiB, which a plain floor
+    /// would show one MiB lower.
+    #[test]
+    fn the_no_verdict_detail_shows_the_same_mib_as_the_evidence_line() {
+        let (header, size) = header_of(&llama_like(10).u32("llama.expert_count", 8), 4096);
+        let gib = (8192.0 - 1e-9) / 1024.0;
+        let result = estimate(
+            &header,
+            size,
+            4096,
+            KvCacheType::F16,
+            AcceleratorMemory::Dedicated(gib),
+        );
+        let detail = result.detail.clone().unwrap_or_default();
+        assert!(detail.contains("this GPU's 8192 MiB"), "{detail}");
+        let lines = evidence_lines(&result).join("\n");
+        assert!(lines.contains("has 8192 MiB"), "{lines}");
     }
 
     /// The control: a dense model on the same card still gets its verdict.
