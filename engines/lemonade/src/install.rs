@@ -1352,9 +1352,10 @@ mod tests {
     }
 }
 
-/// Property tests for the in-process Lemonade extractor, judged on the
-/// filesystem by `archive_props` rather than by re-deriving the extractor's
-/// own path checks.
+/// Property test for the whole install path (`prepare_embeddable_with`), judged
+/// on the filesystem by `archive_props` rather than by re-deriving the
+/// extractor's own path checks. The extractor's own tar and zip property tests
+/// are in `archive_extract::archive_properties`.
 #[cfg(all(test, unix))]
 mod archive_properties {
     use proptest::prelude::*;
@@ -1369,9 +1370,9 @@ mod archive_properties {
         run_property, tar_gz_bytes,
     };
 
-    /// The in-process extractor rejects every link kind and masks the modes
-    /// the archive carries, so it promises the whole contract, not just "no
-    /// escape".
+    /// What an install promises: the extractor it runs rejects every link kind
+    /// and masks the modes the archive carries, so the installed tree is held to
+    /// the whole contract, not just "no escape".
     const FULL: Expect = Expect {
         modes: Modes::Safe,
         no_outward_links: true,

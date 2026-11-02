@@ -230,7 +230,7 @@ fn rocm_sdk_version_matches(recorded: &str, table_key: &str) -> bool {
     release_triple(recorded).is_some_and(|version| Some(version) == release_triple(table_key))
 }
 
-/// How [`install_vllm_with_uv`] should install vLLM for a given target.
+/// How `install.rs`'s `install_vllm_with_uv` should install vLLM for a given target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum VllmInstallRoute {
     /// Pin from [`VLLM_ROCM_BUILD_TABLE`] (or a caller-supplied index override).

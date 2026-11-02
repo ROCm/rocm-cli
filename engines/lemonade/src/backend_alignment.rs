@@ -11,6 +11,7 @@ use serde_json::Value;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
 use std::process::{Command as ProcessCommand, Stdio};
 use std::time::Duration;
 
@@ -20,11 +21,11 @@ use crate::llamacpp_backend::{
     ROCM_LLAMACPP_BACKEND_DIRS, best_llamacpp_backend_for_host,
     find_llama_server_binary_for_backend, install_best_llamacpp_backend,
 };
+#[cfg(target_os = "linux")]
+use crate::process::apply_lemonade_process_environment;
 #[cfg(target_os = "windows")]
 use crate::process::lemonade_process_environment_vars;
-use crate::process::{
-    LemonadeProcessEnvironment, apply_lemonade_process_environment, lemonade_process_environment,
-};
+use crate::process::{LemonadeProcessEnvironment, lemonade_process_environment};
 #[cfg(target_os = "windows")]
 use crate::runtime_dir::ParentRuntimeEnvironment;
 
