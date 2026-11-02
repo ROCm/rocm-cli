@@ -138,7 +138,7 @@ Feature: Interactive dashboard
   # this PR generalized, so a revert of that change would not turn this red.
   # The discriminating regression test for that change is the unit test
   # `back_out_requires_an_open_manager_on_any_tab` in crates/rocm-dash-tui's
-  # app/mod.rs, which does fail on revert.
+  # app/overlays.rs, which does fail on revert.
   @id:dash-manager-escape-closes-on-any-tab @requires-os:linux
   Scenario: dash-11 - Escape closes a manager overlay on any tab
     When the user opens the dashboard with demo data

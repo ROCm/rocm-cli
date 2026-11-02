@@ -1253,7 +1253,7 @@ async fn quit_chat_back_to_launcher(world: &mut E2eWorld) {
     // see `request_quit`'s doc comment.
     //
     // No `i` here, unlike `try_quit_chat`: that step's own comment notes "a
-    // fresh session starts unfocused", but `accept_chat_consent` (`app/mod.rs`)
+    // fresh session starts unfocused", but `accept_chat_consent` (`app/chat_state.rs`)
     // sets `chat_focused = true` as part of accepting the endpoint prompt this
     // step's caller (`open_chat_from_launcher`) already sent `y` to, so the
     // input here is already focused. Sending `i` first — as a first attempt

@@ -722,4 +722,20 @@ mod tests {
         let args = args_with_anthropic_key(Some("k"));
         assert!(build_chat_agent(ChatProvider::Local, &args, None, tx).is_none());
     }
+
+    #[test]
+    fn config_with_chat_sets_local_endpoint_and_clears_auth() {
+        let mut cfg = rocm_dash_core::config::Config::default();
+        cfg.tui.chat_auth_header = Some("Ocp-Apim-Subscription-Key".into());
+        let next = config_with_chat(cfg, "http://localhost:8000/v1", "qwen");
+        assert_eq!(
+            next.tui.chat_url.as_deref(),
+            Some("http://localhost:8000/v1")
+        );
+        assert_eq!(next.tui.chat_model.as_deref(), Some("qwen"));
+        assert_eq!(
+            next.tui.chat_auth_header, None,
+            "local needs no gateway auth"
+        );
+    }
 }
