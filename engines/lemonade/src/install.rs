@@ -511,7 +511,7 @@ fn collect_embeddable_roots(
         return Ok(());
     }
     let metadata = fs::symlink_metadata(path)?;
-    // See the link policy on `extract_archive`.
+    // See the link policy on `archive_extract::extract_archive`.
     if metadata.file_type().is_symlink() {
         bail!("archive contains symlink at {}", path.display());
     }

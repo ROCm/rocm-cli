@@ -137,9 +137,9 @@ pub(crate) fn rocm_sdk_series_matches(recorded: &str, table_key: &str) -> bool {
 
 /// Whether `runtime`'s recorded ROCm SDK version has a live discover-build
 /// recipe. Exposed as runtime metadata, matched directly against
-/// [`ROCM_DISCOVER_BUILD_VERSIONS`], so callers outside `install` — the vLLM
-/// launch path in `process.rs`, specifically — don't need to reach into
-/// `install`'s build-selection table for a plain yes/no check.
+/// [`ROCM_DISCOVER_BUILD_VERSIONS`], so callers outside `wheel_builds` — the
+/// vLLM launch path in `process.rs`, specifically — don't need to reach into
+/// `wheel_builds`'s build-selection table for a plain yes/no check.
 pub(crate) fn runtime_has_discover_build(runtime: &VllmRuntime) -> bool {
     runtime.rocm_sdk_version.as_deref().is_some_and(|version| {
         ROCM_DISCOVER_BUILD_VERSIONS
