@@ -362,7 +362,7 @@ pub fn horizontal_scrollbar(
 /// overflow a `u16`.
 ///
 /// `area.height * pct_y` overflows above 655 rows once `pct_y` is 100 — which
-/// [`draw_help`](crate::ui::modal::draw_help) now passes, to mean "the whole area when the content is taller
+/// [`draw_help`](crate::ui::help_modal::draw_help) now passes, to mean "the whole area when the content is taller
 /// than it". That is a debug-build panic on a terminal tall enough (tmux panes
 /// and some GUI terminals report large synthetic sizes), and a wrap-around in
 /// release. Widening here removes the ceiling for every caller rather than
