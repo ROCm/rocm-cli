@@ -28,7 +28,7 @@
 //! (see [`EVENT_LOG_ROTATE_BYTES`]): the append that finds the live file at
 //! the cap renames it whole to `<store>.1` first, under the same lock —
 //! before any torn tail in it would otherwise be repaired, so an at-cap store
-//! is never paid for with a `write_atomic` rewrite only to be rotated away
+//! is never paid for with a `write_file_atomically` rewrite only to be rotated away
 //! immediately after — and the recent-record readers span the rotated
 //! generations. The proposals store is never rotated, because a pending
 //! proposal must stay findable by id until it is reviewed; instead the status
