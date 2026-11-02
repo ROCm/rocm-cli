@@ -12,7 +12,10 @@ use crate::ui;
 
 use super::AppState;
 use super::summary::summarize_json_value;
-use super::types::{ActiveTab, ChatConsent, ChatKeyCtx, Modal, PaneFocus, ScrollTarget};
+use super::types::{
+    ActiveTab, ChatConsent, ChatKeyCtx, MENU_ITEMS, Modal, OPTIONS_TABS, PALETTE_DESTS, PaneFocus,
+    ScrollTarget,
+};
 #[cfg(test)]
 use super::types::{ChatProvider, ChatRole};
 
@@ -281,18 +284,16 @@ pub(crate) fn apply_action(state: &mut AppState, action: KeyAction) -> bool {
         }
         KeyAction::MenuMove(d) => match state.modal {
             Modal::Menu => {
-                state.menu_sel = wrap_cursor(state.menu_sel, d, crate::ui::modal::MENU_ITEMS);
+                state.menu_sel = wrap_cursor(state.menu_sel, d, MENU_ITEMS);
             }
             Modal::Palette => {
-                state.palette_sel =
-                    wrap_cursor(state.palette_sel, d, crate::ui::modal::PALETTE_DESTS.len());
+                state.palette_sel = wrap_cursor(state.palette_sel, d, PALETTE_DESTS.len());
             }
             _ => {}
         },
         KeyAction::OptionsTab(d) => {
             if state.modal == Modal::Options {
-                state.options_tab =
-                    wrap_cursor(state.options_tab, d, crate::ui::modal::OPTIONS_TABS.len());
+                state.options_tab = wrap_cursor(state.options_tab, d, OPTIONS_TABS.len());
             }
         }
         KeyAction::MenuActivate => match state.modal {
@@ -314,7 +315,7 @@ pub(crate) fn apply_action(state: &mut AppState, action: KeyAction) -> bool {
                 _ => return request_quit(state),
             },
             Modal::Palette => {
-                if let Some((_, tab)) = crate::ui::modal::PALETTE_DESTS.get(state.palette_sel) {
+                if let Some((_, tab)) = PALETTE_DESTS.get(state.palette_sel) {
                     state.active_tab = *tab;
                 }
                 state.modal = Modal::None;
@@ -1463,7 +1464,7 @@ mod tests {
         assert_eq!(s.modal, Modal::Options);
         // Options tab cycles and wraps.
         apply_action(&mut s, KeyAction::OptionsTab(-1));
-        assert_eq!(s.options_tab, crate::ui::modal::OPTIONS_TABS.len() - 1);
+        assert_eq!(s.options_tab, OPTIONS_TABS.len() - 1);
     }
 
     #[test]

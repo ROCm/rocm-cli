@@ -1500,9 +1500,18 @@ rotation policy; two further tests go through the public
 `append_automation_event`/`append_audit_event` and
 `load_recent_automation_events`/`load_recent_audit_events` wrappers instead,
 at the real size cap, so the wiring between them and the rotation policy
-itself stays covered. The user-visible side is `automations-07` through
-`automations-09` in
+itself stays covered. The repair of a torn tail, which normally replaces the
+store and falls back to cutting the debris in place when that replacement
+fails, has its own tests there: each step injected to fail, the error naming
+both causes when both fail, and a real fault on each platform (a directory
+that takes no new files on Unix, a handle without delete sharing on Windows).
+The user-visible side is `automations-07` through `automations-09`, plus
+`automations-10` for the fallback, in
 [automations.feature](../tests/e2e-cucumber/features/automations.feature).
+`automations-10` makes the audit directory read-only, which does not bind root,
+so it carries `@requires-dir-permissions` and resolves to a skip for a user the
+permission bits do not bind (the self-hosted WSL2 guest runs as root) rather
+than pass without testing the fallback.
 
 Natural-language plan handoff tests:
 

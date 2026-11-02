@@ -33,6 +33,7 @@ const REQUIRES_BARE_METAL_TAG: &str = "requires-bare-metal";
 const REQUIRES_WSL_TAG: &str = "requires-wsl";
 const REQUIRES_OOM_FAULT_INJECTION_TAG: &str = "requires-oom-fault-injection";
 const REQUIRES_CASE_SENSITIVE_FS_TAG: &str = "requires-case-sensitive-fs";
+const REQUIRES_DIR_PERMISSIONS_TAG: &str = "requires-dir-permissions";
 const SERVE_TIMEOUT_PREFIX: &str = "serve-timeout:";
 const NIGHTLY_TAG: &str = "nightly";
 const LIFECYCLE_TAG: &str = "lifecycle";
@@ -133,6 +134,15 @@ pub struct ScenarioDecl {
     /// directory or a mounted Windows drive. The answer comes from the capability
     /// probe's `case_sensitive_fs`, measured on that same temp root.
     pub requires_case_sensitive_fs: bool,
+    /// `@requires-dir-permissions`: the scenario's premise is a directory that
+    /// refuses new files once its write bits are cleared, so it is skipped for a
+    /// user those bits do not bind — root, which is what the self-hosted WSL2
+    /// guest runs the suite as.
+    ///
+    /// `@requires-os:linux` cannot express this: root on Linux is still
+    /// `linux`. The answer comes from the capability probe's
+    /// `dir_permissions_bind`, measured under the same temp root.
+    pub requires_dir_permissions: bool,
     /// Engine the scenario pins via `@requires-engine:<e>` (if any).
     pub requires_engine: Option<String>,
     /// OS the scenario requires via `@requires-os:<os>` (e.g. "linux"), if any —
@@ -182,6 +192,7 @@ impl ScenarioDecl {
         let mut requires_wsl = false;
         let mut requires_oom_fault_injection = false;
         let mut requires_case_sensitive_fs = false;
+        let mut requires_dir_permissions = false;
         let mut requires_engine = None;
         let mut requires_os = None;
         let mut serve_timeout_secs = None;
@@ -219,6 +230,8 @@ impl ScenarioDecl {
                 requires_oom_fault_injection = true;
             } else if tag == REQUIRES_CASE_SENSITIVE_FS_TAG {
                 requires_case_sensitive_fs = true;
+            } else if tag == REQUIRES_DIR_PERMISSIONS_TAG {
+                requires_dir_permissions = true;
             } else if tag == NIGHTLY_TAG {
                 nightly = true;
             } else if tag == LIFECYCLE_TAG {
@@ -237,6 +250,7 @@ impl ScenarioDecl {
             requires_wsl,
             requires_oom_fault_injection,
             requires_case_sensitive_fs,
+            requires_dir_permissions,
             requires_engine,
             requires_os,
             serve_timeout_secs,
@@ -599,6 +613,13 @@ pub fn resolve(
                 .to_owned(),
         };
     }
+    if decl.requires_dir_permissions && !cap.dir_permissions_bind {
+        return Expectation::Skip {
+            reason: "requires directory permissions that bind the user running the suite; a \
+                     read-only directory still takes new files here (root?)"
+                .to_owned(),
+        };
+    }
     let engine = decl.effective_engine(cap);
     // A scenario that pins or defaults to a real engine and would actually serve
     // needs that engine to be startable here. We treat any GPU scenario with a
@@ -708,6 +729,7 @@ mod tests {
                 platform_slug: "mi300x".into(),
                 oom_fault_injection: false,
                 case_sensitive_fs: true,
+                dir_permissions_bind: true,
             },
             "strix-ubuntu" => HostCapability {
                 os_family: "linux".into(),
@@ -720,6 +742,7 @@ mod tests {
                 platform_slug: "strix-halo".into(),
                 oom_fault_injection: false,
                 case_sensitive_fs: true,
+                dir_permissions_bind: true,
             },
             "strix-windows" => HostCapability {
                 os_family: "windows".into(),
@@ -732,6 +755,7 @@ mod tests {
                 platform_slug: "strix-halo".into(),
                 oom_fault_injection: false,
                 case_sensitive_fs: false,
+                dir_permissions_bind: true,
             },
             // A WSL2 dev box with the ROCm passthrough in place: `os_family` is
             // `linux` and a GPU is usable, so nothing but `is_wsl` distinguishes
@@ -753,6 +777,7 @@ mod tests {
                 platform_slug: "strix-halo-wsl".into(),
                 oom_fault_injection: false,
                 case_sensitive_fs: true,
+                dir_permissions_bind: true,
             },
             // The same box without the passthrough: the gfx target is reported
             // by the Windows-side driver but ROCm cannot reach it, so the probe
@@ -768,6 +793,7 @@ mod tests {
                 platform_slug: "wsl".into(),
                 oom_fault_injection: false,
                 case_sensitive_fs: true,
+                dir_permissions_bind: true,
             },
             // The hosted WSL runner before the ROCm passthrough is complete:
             // Windows still reports the gfx target, but the CLI cannot use it.
@@ -782,6 +808,7 @@ mod tests {
                 platform_slug: "strix-halo-wsl".into(),
                 oom_fault_injection: false,
                 case_sensitive_fs: true,
+                dir_permissions_bind: true,
             },
             _ => HostCapability {
                 os_family: "other".into(),
@@ -794,6 +821,7 @@ mod tests {
                 platform_slug: "mock".into(),
                 oom_fault_injection: false,
                 case_sensitive_fs: true,
+                dir_permissions_bind: true,
             },
         }
     }
@@ -1608,6 +1636,7 @@ serve_timeout_secs = 90
         // so `@requires-os:linux` alone would have let the scenario run.
         let folded = HostCapability {
             case_sensitive_fs: false,
+            dir_permissions_bind: true,
             ..cap("wsl2")
         };
         let both = decl(&[
@@ -1633,6 +1662,50 @@ serve_timeout_secs = 90
     }
 
     #[test]
+    fn dir_permissions_tag_parses_in_both_shapes() {
+        assert!(decl(&["id:x", "requires-dir-permissions"]).requires_dir_permissions);
+        assert!(decl(&["@id:x", "@requires-dir-permissions"]).requires_dir_permissions);
+        // Absent by default, so no existing scenario changes meaning.
+        assert!(!decl(&["id:x", "requires-os:linux"]).requires_dir_permissions);
+    }
+
+    #[test]
+    fn requires_dir_permissions_skips_for_a_user_the_permission_bits_do_not_bind() {
+        let m = Expectations::default();
+        let none = Included::default();
+        let d = decl(&[
+            "id:automations-torn-audit-tail-repaired-when-log-cannot-be-replaced",
+            "requires-os:linux",
+            "requires-dir-permissions",
+        ]);
+        assert_eq!(
+            resolve(&d, &cap("mi300x"), &m, none),
+            Expectation::ExpectPass,
+            "an ordinary user's read-only directory refuses new files, so the scenario runs"
+        );
+        // The case the gate exists for: the WSL2 guest runs the suite as root,
+        // so `os_family` is `linux` and `@requires-os:linux` alone would let the
+        // scenario run and pass without testing anything.
+        let as_root = HostCapability {
+            dir_permissions_bind: false,
+            ..cap("wsl2")
+        };
+        match resolve(&d, &as_root, &m, none) {
+            Expectation::Skip { reason } => assert!(
+                reason.contains("directory permissions"),
+                "the skip must name the missing premise: {reason}"
+            ),
+            other => panic!("a user the permission bits do not bind must skip, got {other:?}"),
+        }
+        // Without the tag the same host still runs it: the probe answer only
+        // matters to scenarios that declare the premise.
+        assert_eq!(
+            resolve(&decl(&["id:x", "requires-os:linux"]), &as_root, &m, none),
+            Expectation::ExpectPass
+        );
+    }
+
+    #[test]
     fn os_reason_wins_over_case_folding_reason_on_a_non_matching_os() {
         // Native Windows fails both premises of the case-twin scenario; the grid
         // must report the OS, the coarser reason, rather than the filesystem.
@@ -1644,6 +1717,38 @@ serve_timeout_secs = 90
         ]);
         let host = cap("strix-windows");
         assert!(!host.case_sensitive_fs, "fixture must fail both premises");
+        match resolve(&d, &host, &m, Included::default()) {
+            Expectation::Skip { reason } => assert!(
+                reason.contains("requires os 'linux'"),
+                "the OS reason must win: {reason}"
+            ),
+            other => panic!("native Windows must skip, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn os_reason_wins_over_dir_permissions_reason_on_a_non_matching_os() {
+        // The same ordering as the case-folding twin above, for the tag the
+        // torn-audit-tail scenario carries next to `@requires-os:linux`.
+        let m = Expectations::default();
+        let d = decl(&[
+            "id:automations-torn-audit-tail-repaired-when-log-cannot-be-replaced",
+            "requires-os:linux",
+            "requires-dir-permissions",
+        ]);
+        assert!(
+            d.requires_dir_permissions && d.requires_os.is_some(),
+            "both premise tags must parse, or the ordering below proves nothing"
+        );
+        let host = HostCapability {
+            dir_permissions_bind: false,
+            ..cap("strix-windows")
+        };
+        assert_ne!(host.os_family, "linux", "fixture must fail the OS premise");
+        assert!(
+            !host.dir_permissions_bind,
+            "fixture must fail both premises"
+        );
         match resolve(&d, &host, &m, Included::default()) {
             Expectation::Skip { reason } => assert!(
                 reason.contains("requires os 'linux'"),
@@ -1672,6 +1777,7 @@ reason = "unrelated open bug"
         ]);
         let folded = HostCapability {
             case_sensitive_fs: false,
+            dir_permissions_bind: true,
             ..cap("strix-ubuntu")
         };
         assert!(matches!(
