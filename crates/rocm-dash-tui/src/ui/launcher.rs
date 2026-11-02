@@ -289,7 +289,7 @@ fn draw_menu(f: &mut Frame, area: Rect, state: &AppState, sel: usize, theme: &Th
 /// came from `apps/rocm::dash::launcher_serving_instances`'s own
 /// `discover_managed_services` call, so all of them are genuinely reachable
 /// with `rocm services stop <id> --yes` — without this, the launcher's own
-/// copy of the quit-confirm prompt (`ui::quit_confirm_body`) would gate that
+/// copy of the quit-confirm prompt (`ui::quit_confirm::quit_confirm_body`) would gate that
 /// remediation line on an always-empty set and warn with nothing actionable.
 /// A *static* probe, not a live-reading one, because the caller already did
 /// the live read for this menu-loop pass (`run_launcher`'s own loop re-reads
@@ -769,7 +769,7 @@ mod tests {
     fn launcher_state_marks_every_seeded_instance_as_managed() {
         // Regression: `launcher_state` seeded `instances` but never a
         // registry probe, so the launcher's own copy of the quit-confirm
-        // prompt (`ui::quit_confirm_body`) gated its
+        // prompt (`ui::quit_confirm::quit_confirm_body`) gated its
         // `rocm services stop <id> --yes` line on an always-empty set and
         // warned with nothing actionable — even though every instance here
         // comes from `launcher_serving_instances`'s own

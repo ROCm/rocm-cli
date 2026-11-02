@@ -82,7 +82,7 @@ impl AppState {
     /// demo/replay/mock. Single call site for the registry-read seam so
     /// `has_live_instance`,
     /// `has_stoppable_managed_instance_with`, `quit_confirm_open_services_key`,
-    /// and `ui::quit_confirm_body_with` all read the exact same live
+    /// and `ui::quit_confirm::quit_confirm_body_with` all read the exact same live
     /// classification rather than each unwrapping `managed_registry_probe` by
     /// hand.
     pub(crate) fn live_registry_snapshot(&self) -> crate::registry_probe::ManagedRegistrySnapshot {
@@ -94,7 +94,7 @@ impl AppState {
     /// Whether at least one currently-serving instance is one this host's own
     /// registry manages (a live read — see `live_registry_snapshot`) — i.e.
     /// one `rocm services stop` can actually reach. Shared by
-    /// `ui::quit_confirm_body_with` (whether to show the "press s" hint) and
+    /// `ui::quit_confirm::quit_confirm_body_with` (whether to show the "press s" hint) and
     /// `quit_confirm_open_services_key` (whether `s` does anything), so the
     /// two can't drift on when stopping is actually offered. Takes an
     /// already-fetched `snapshot` — see

@@ -120,7 +120,7 @@ pub struct ResolvedArgs {
     /// Bin-injected live registry-read seam (issue #145): whether anything is
     /// currently serving, and which ids a `rocm services stop <id> --yes` can
     /// actually reach. Read live, at the moment `AppState::has_live_instance`
-    /// / `has_stoppable_managed_instance_with` / `ui::quit_confirm_body_with`
+    /// / `has_stoppable_managed_instance_with` / `ui::quit_confirm::quit_confirm_body_with`
     /// actually need an answer — never a one-shot snapshot frozen at launch
     /// the way `services_past_attempts` is. A host whose dashboard-embedded
     /// daemon client never connects at all (Windows) gets a correct "is

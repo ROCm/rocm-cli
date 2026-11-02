@@ -196,6 +196,9 @@ The other shared `ui/` components the contributor rules in [`AGENTS.md`](../AGEN
 
 The `ui/` modules the split moved code out of or into, beyond the shared components above:
 
+- [`ui/quit_confirm.rs`](../crates/rocm-dash-tui/src/ui/quit_confirm.rs) — the quit-confirm prompt's content (title, body listing what is still served, the "press s" stop hint), split out of [`ui/mod.rs`](../crates/rocm-dash-tui/src/ui/mod.rs), which re-exports `quit_confirm_request` for the launcher. The gates that decide whether it opens are in [`app/quit_confirm.rs`](../crates/rocm-dash-tui/src/app/quit_confirm.rs).
+- [`ui/header.rs`](../crates/rocm-dash-tui/src/ui/header.rs) — the dashboard header and its warning badge (`draw_header`), split out of `ui/mod.rs`.
+- [`ui/footer.rs`](../crates/rocm-dash-tui/src/ui/footer.rs) — the footer legend and its clickable key chips (`draw_footer`), split out of `ui/mod.rs`.
 - [`ui/modal.rs`](../crates/rocm-dash-tui/src/ui/modal.rs) — the `Modal::*` renderers (Help, global help, Esc menu, command palette, options, theme picker, warnings). The popup geometry they and every manager overlay share lives in [`ui/panel.rs`](../crates/rocm-dash-tui/src/ui/panel.rs), and the menu/palette/options navigation data they render lives in [`app/types.rs`](../crates/rocm-dash-tui/src/app/types.rs), so this file depends on those and not the reverse.
 
 The other three dashboard crates are described at crate level here, not module by module:

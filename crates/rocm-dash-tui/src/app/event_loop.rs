@@ -1263,7 +1263,7 @@ mod tests {
         // `dash.feature` scenario that opens a real dashboard/chat session
         // with a managed model present exercises it for real). Each half
         // (the bin producing the probe, `AppState::has_live_instance`/
-        // `ui::quit_confirm_body` consuming it) is tested elsewhere; this is
+        // `ui::quit_confirm::quit_confirm_body` consuming it) is tested elsewhere; this is
         // only the field-assignment logic in between.
         use crate::registry_probe::{ManagedRegistrySnapshot, StaticManagedRegistrySnapshot};
 

@@ -147,7 +147,7 @@ pub(crate) fn resolve_mouse(me: MouseEvent, state: &AppState) -> KeyAction {
         // the time this check runs it has reduced to `has_open_overlay()`;
         // written via `overlay_or_approval()` anyway so this can't silently
         // drift from the manager-overlay swallow it mirrors (see the
-        // analogous check in ui/mod.rs's footer-chip gating).
+        // analogous check in ui/footer.rs's footer-chip gating).
         if state.overlay_or_approval() {
             return KeyAction::Nothing;
         }

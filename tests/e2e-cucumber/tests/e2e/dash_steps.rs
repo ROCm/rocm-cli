@@ -910,7 +910,7 @@ async fn quit_confirm_is_displayed(world: &mut E2eWorld) {
 /// mention of the model name — directly answering AGENTS.md §3's rule that a
 /// remediation command must be asserted, not just its wording.
 ///
-/// The command sits on its own screen row (`ui::quit_confirm_body` pushes it
+/// The command sits on its own screen row (`ui::quit_confirm::quit_confirm_body` pushes it
 /// as a separate line from the model-name row above it) rather than trailing
 /// the model name on one combined line, so at this PTY's width it is not
 /// expected to word-wrap. Whitespace is still
@@ -1008,7 +1008,7 @@ async fn try_quit_launcher(world: &mut E2eWorld) {
 
 /// Launcher counterpart of `quit_confirm_is_displayed`: same marker, same
 /// prompt (`ui::launcher::draw`'s own quit_confirm arm renders the identical
-/// `ui::quit_confirm_body`), reached from the launcher's own event loop
+/// `ui::quit_confirm::quit_confirm_body`), reached from the launcher's own event loop
 /// instead of the dashboard's.
 #[then("the launcher asks whether to quit while a model is still being served")]
 async fn launcher_quit_confirm_is_displayed(world: &mut E2eWorld) {
@@ -1024,7 +1024,7 @@ async fn decline_quit_prompt(world: &mut E2eWorld) {
         .send("n")
         .unwrap_or_else(|e| panic!("failed to decline the quit prompt: {e}"));
     // The prompt's own body names the serving model (`quit_confirm_body` in
-    // `ui/mod.rs`), so the very next assertion — "the managed model is
+    // `ui/quit_confirm.rs`), so the very next assertion — "the managed model is
     // displayed" (dash-26) or "the launcher shows the model serving"
     // (dash-27; a different step, same risk) — could pass on the prompt's
     // own text even if `n` did nothing and the prompt never actually closed.

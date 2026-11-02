@@ -652,7 +652,7 @@ Feature: Interactive dashboard
   # scenario needs no daemon and no particular host hardware; the user reads
   # the text from the badge with `!`. The click on the badge, and its refusal
   # over an open modal, a manager overlay or focused chat input, are asserted by
-  # the unit tests in `crates/rocm-dash-tui/src/app/` and `ui/mod.rs`, where a
+  # the unit tests in `crates/rocm-dash-tui/src/app/` and `ui/header.rs`, where a
   # mouse event can be sent directly. The key needs no such gate: it is only
   # reached when nothing else owns the keyboard, which is the event loop's
   # existing arm order and is not re-tested here.
