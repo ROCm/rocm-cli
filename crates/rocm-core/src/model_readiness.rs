@@ -545,17 +545,7 @@ fn assess(
                  is a gap in what the CLI can see, not a verdict about the model",
                 format_gib(required)
             ));
-            readiness.fix = Some(Fix {
-                summary: "let the CLI read this host's GPU memory, then ask again".to_owned(),
-                commands: vec!["amd-smi metric --json".to_owned()],
-                verify: format!("rocm diagnose --model {model_ref}"),
-                notes: vec![
-                    "the reading comes from `amd-smi`; if it is missing or failing, the ROCm \
-                     install is what needs attention first"
-                        .to_owned(),
-                ],
-                ..Fix::default()
-            });
+            readiness.fix = Some(read_gpu_memory_fix(model_ref));
         }
         (Some(required), Some(available)) if available < required => {
             readiness.verdict = ModelVerdict::Blocked;
@@ -876,7 +866,13 @@ fn apply_context_estimate(
         // header could not be read (nothing was learnt, so it is still the honest
         // next step), except where the branches below replace it: a local path,
         // and a hub name refused as a projector.
-        readiness.fix = None;
+        // The one host gap with a next step: memory that could not be read,
+        // which `amd-smi` is how to look into, as for a curated model. No GPU
+        // and an APU's unreadable pool have no command that changes the answer,
+        // and get none here either.
+        readiness.fix = (estimate.cannot_estimate_reason
+            == Some(CannotEstimateReason::AcceleratorMemoryUnknown))
+        .then(|| read_gpu_memory_fix(&readiness.model_ref));
         if estimate.outcome == EstimateOutcome::Fits {
             readiness.alternatives.clear();
         }
@@ -901,6 +897,23 @@ fn apply_context_estimate(
         readiness.warnings.push(SERVE_OPTIONS_NOTE.to_owned());
     }
     readiness.estimate = Some(estimate);
+}
+
+/// The plan when this host's GPU memory could not be read: look at what
+/// `amd-smi` reports, then ask again. Shared by a curated model and a GGUF
+/// estimate, which hit the same gap.
+fn read_gpu_memory_fix(model_ref: &str) -> Fix {
+    Fix {
+        summary: "let the CLI read this host's GPU memory, then ask again".to_owned(),
+        commands: vec!["amd-smi metric --json".to_owned()],
+        verify: format!("rocm diagnose --model {model_ref}"),
+        notes: vec![
+            "the reading comes from `amd-smi`; if it is missing or failing, the ROCm install is \
+             what needs attention first"
+                .to_owned(),
+        ],
+        ..Fix::default()
+    }
 }
 
 /// The plan for a name refused as a multimodal projector. "Serve it and read
@@ -1808,6 +1821,56 @@ mod tests {
         );
     }
 
+    /// A sized estimate that could not be compared keeps a next step only where
+    /// one exists: memory that could not be read is looked into with `amd-smi`,
+    /// as for a curated model; no GPU and an APU have no command that would
+    /// change the answer.
+    #[test]
+    fn a_sized_estimate_that_could_not_compare_keeps_a_plan_only_when_one_exists() {
+        for (memory, expect_amd_smi) in [
+            (AcceleratorMemory::Unknown, true),
+            (AcceleratorMemory::None, false),
+            (AcceleratorMemory::UnifiedMemoryUnreadable, false),
+        ] {
+            let host = HostFacts {
+                accelerator_memory: memory,
+                system_ram_gib: Some(64.0),
+            };
+            let registry = builtin_model_recipe_registry();
+            let mut readiness = assess_model_readiness(
+                "some-lab/never-curated-7b:Q4_K_M",
+                &ModelCatalogSource::Available(&registry),
+                &host,
+                &engine_choice,
+            );
+            attach_context_estimate(
+                &mut readiness,
+                &ContextRequest::default(),
+                &host,
+                &FakeSource::weights(64),
+            );
+            let estimate = readiness.estimate.as_ref().expect("an estimate");
+            assert!(
+                estimate.total_gib.is_some(),
+                "{memory:?}: the header was sized"
+            );
+            let commands = readiness
+                .fix
+                .as_ref()
+                .map(|fix| fix.commands.clone())
+                .unwrap_or_default();
+            assert_eq!(
+                commands == vec!["amd-smi metric --json".to_owned()],
+                expect_amd_smi,
+                "{memory:?}: {:?}",
+                readiness.fix
+            );
+            if !expect_amd_smi {
+                assert!(readiness.fix.is_none(), "{memory:?}: {:?}", readiness.fix);
+            }
+        }
+    }
+
     #[test]
     fn a_gguf_outside_the_catalog_gets_an_estimate_and_stays_undetermined() {
         let mut readiness = not_curated("some-lab/never-curated-7b:Q4_K_M");
@@ -2138,10 +2201,16 @@ mod tests {
                 "{memory:?}: the need was not shown"
             );
             assert_eq!(readiness.verdict, ModelVerdict::Undetermined);
-            // Sized, so the "serve it directly" plan no longer applies.
+            // Sized, so the "serve it directly" plan no longer applies; any plan
+            // left is the host's own (see the test after this one).
+            assert!(readiness.route.is_none(), "{memory:?}");
             assert!(
-                readiness.fix.is_none() && readiness.route.is_none(),
-                "{memory:?}"
+                readiness
+                    .fix
+                    .as_ref()
+                    .is_none_or(|fix| !fix.summary.contains("serve this model directly")),
+                "{memory:?}: {:?}",
+                readiness.fix
             );
             let text = render_model_readiness_text(&readiness);
             assert!(text.contains(": UNDETERMINED"), "{memory:?}: {text}");

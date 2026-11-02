@@ -3409,7 +3409,10 @@ the text report opens `ESTIMATED:` for the first two. The parts and their tests:
   size, a gated repository and a slow reply.
 - [model_readiness.rs](../crates/rocm-core/src/model_readiness.rs): the
   host-memory states (dedicated, none, unknown, APU), what is attached to a
-  curated or non-GGUF answer (nothing), and the text and JSON shapes.
+  curated or non-GGUF answer (nothing), the plan a sized estimate keeps when it
+  could not compare (`amd-smi metric --json` where the memory was unreadable,
+  none where no GPU is visible or on an APU; unit-tested only, since no lane has
+  a GPU whose memory cannot be read), and the text and JSON shapes.
 - [diagnose_model.rs](../apps/rocm/src/diagnose_model.rs) and
   `classify_accelerator_memory` in [model_fit.rs](../apps/rocm/src/model_fit.rs): a
   device mask that hides every GPU ("no GPU is visible", not a card of 0 GiB),
