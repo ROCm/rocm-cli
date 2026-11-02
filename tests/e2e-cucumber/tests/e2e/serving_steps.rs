@@ -1517,7 +1517,7 @@ async fn assert_services_list_reports_device(world: &mut E2eWorld) {
     // The last thing looked at, so a timeout can show it rather than just
     // saying it timed out: the service's own block when there was one, else the
     // whole listing (which is the evidence for the service having gone missing).
-    let mut last_seen = String::new();
+    let mut last_seen;
     let device = loop {
         let (stdout, _, _) = crate::run_rocm(world, &["services", "list"]);
         match stdout
