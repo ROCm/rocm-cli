@@ -690,6 +690,12 @@ impl Drop for E2eWorld {
         if let Some(root) = &self.isolated_root {
             stop_managed_services(root.path());
         }
+        // A scenario that made the audit directory read-only must give it back
+        // before the TempDir below tries to remove it, even if a step panicked.
+        #[cfg(unix)]
+        if self.isolated_root.is_some() {
+            e2e::automations_steps::restore_audit_dir_permissions(&self.app_paths().audit_dir());
+        }
         // `isolated_root` is a `TempDir`; its own Drop removes the directory.
     }
 }
