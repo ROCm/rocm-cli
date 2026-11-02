@@ -908,6 +908,46 @@ async fn preview_newer_pinned_wheel_install(world: &mut E2eWorld) {
     );
 }
 
+#[when("the user previews a wheel SDK install for arch gfx1200 pinned to ROCm 10.1")]
+async fn preview_line_pinned_wheel_install(world: &mut E2eWorld) {
+    preview_ok(
+        world,
+        &[
+            "install",
+            "sdk",
+            "--channel",
+            "release",
+            "--format",
+            "wheel",
+            "--family",
+            RAW_ARCH,
+            "--version",
+            "10.1",
+            "--dry-run",
+        ],
+    );
+}
+
+#[when("the user tries to preview a wheel SDK install for arch gfx1200 pinned to ROCm 10.1")]
+async fn try_preview_line_pinned_wheel_install(world: &mut E2eWorld) {
+    preview(
+        world,
+        &[
+            "install",
+            "sdk",
+            "--channel",
+            "release",
+            "--format",
+            "wheel",
+            "--family",
+            RAW_ARCH,
+            "--version",
+            "10.1",
+            "--dry-run",
+        ],
+    );
+}
+
 #[when("the user tries to preview a wheel SDK install for arch gfx1200 pinned to ROCm 10.0.0")]
 async fn try_preview_pinned_wheel_install(world: &mut E2eWorld) {
     preview(
@@ -1029,6 +1069,33 @@ async fn preview_resolves_next_pip_index(world: &mut E2eWorld) {
         world,
         &format!("latest_compatible_version: {NEXT_ROCM_VERSION}"),
         "resolved next version",
+    );
+}
+
+#[then("the preview resolves the ROCm 10 pip index for ROCm 10.1.0")]
+async fn preview_resolves_next_pip_index_for_rocm_10_1_line(world: &mut E2eWorld) {
+    let base = next_pip_base(world);
+    assert_contains(world, &format!("canonical_source: {base}"), "next source");
+    assert_contains(world, &format!("index_url: {base}"), "resolved index");
+    assert_contains(
+        world,
+        &format!("latest_compatible_version: {NEWER_NEXT_ROCM_VERSION}"),
+        "resolved 10.1 line",
+    );
+    assert_contains(
+        world,
+        "requested: version 10.1",
+        "the pin that selected the line",
+    );
+    assert!(
+        !stdout(world).contains(&format!("latest_compatible_version: {NEXT_ROCM_VERSION}")),
+        "a 10.1 line pin selected 10.0.0:\n{}",
+        stdout(world)
+    );
+    assert!(
+        !stdout(world).contains(&current_pip_base(world)),
+        "a 10.1 line pin resolved the canonical index:\n{}",
+        stdout(world)
     );
 }
 
@@ -1258,6 +1325,43 @@ async fn failure_names_the_missing_torchaudio_build(world: &mut E2eWorld) {
         );
     }
     // Likewise for a swallowed error: no install plan was printed.
+    assert!(
+        !reported.contains("package_specs:"),
+        "the refusal still printed an install plan:\n{reported}"
+    );
+}
+
+#[then("the failure names the ROCm 10 next layout and a full version, without suggesting nightly")]
+async fn failure_names_next_layout_without_nightly(world: &mut E2eWorld) {
+    let reported = format!(
+        "{}\n{}",
+        stdout(world),
+        world.cli_stderr.as_deref().unwrap_or_default()
+    );
+    assert!(
+        reported.contains(&next_pip_base(world)),
+        "the refusal did not search the ROCm 10 next layout:\n{reported}"
+    );
+    assert!(
+        !reported.contains(&current_pip_base(world)),
+        "the refusal searched the canonical index:\n{reported}"
+    );
+    assert!(
+        reported.contains("next layout"),
+        "the refusal did not name the next layout:\n{reported}"
+    );
+    assert!(
+        reported.contains("--version 10.1.0"),
+        "the refusal did not name a full version in the 10.1 line:\n{reported}"
+    );
+    assert!(
+        reported.contains(&format!("--family {RAW_ARCH}")),
+        "the refusal did not name an exact arch:\n{reported}"
+    );
+    assert!(
+        !reported.contains("--channel nightly"),
+        "the refusal told the user to try nightly:\n{reported}"
+    );
     assert!(
         !reported.contains("package_specs:"),
         "the refusal still printed an install plan:\n{reported}"
