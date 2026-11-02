@@ -4341,7 +4341,8 @@ fi
             .collect()
     }
 
-    /// `text` with every YAML or shell comment removed.
+    /// `text` with every YAML or shell comment removed, one output line per input
+    /// line (a comment-only line becomes blank), so callers can still split it.
     fn code_only(text: &str) -> String {
         text.lines()
             .map(strip_comment)
@@ -4727,7 +4728,9 @@ fi
             let steps = job_steps(block).unwrap_or_else(|| panic!("{job} has steps"));
             let through_toolchain = steps
                 .iter()
-                .position(|(_, step)| step.contains("actions-rust-lang/setup-rust-toolchain@"))
+                .position(|(_, step)| {
+                    step_key(step, "uses").starts_with("actions-rust-lang/setup-rust-toolchain@")
+                })
                 .unwrap_or_else(|| panic!("{job} sets up the Rust toolchain"));
             let setup = steps[..=through_toolchain]
                 .iter()
@@ -4758,12 +4761,13 @@ fi
     ///
     /// What this does NOT check: the command is matched as a substring, so a flag
     /// or a trailing `|| true` added to it passes; the `NOT_GATING` steps are
-    /// exempt by name with their content unchecked; and the two unnamed actions
-    /// that open each job are checked only for their `uses:` prefix, for having
-    /// no key beyond `uses`, `with` and `if`, and for an `if` that is absent or the
-    /// `heavy` gate. It catches a step being dropped, renamed,
-    /// moved to the other job, skipped, or made advisory with `continue-on-error`,
-    /// and a new step appearing that is in neither list.
+    /// exempt by name with their content unchecked; and an unnamed step is
+    /// accepted if it `uses` the checkout or setup-rust-toolchain action, has no
+    /// key beyond `uses`, `with` and `if`, and has an `if` that is absent or the
+    /// `heavy` gate, in any number and at any position in the job. It catches a
+    /// step being dropped, renamed, moved to the other job, skipped, or made
+    /// advisory with `continue-on-error`, and a new named step, or unnamed step
+    /// using another action or a `run:`, appearing in either job.
     #[test]
     fn ci_windows_jobs_keep_every_gating_step_enabled() {
         const HEAVY: &str = "needs.changes.outputs.heavy == 'true'";
@@ -4941,11 +4945,12 @@ fi
 
         // A step added to either job later is not pinned by the table above, so
         // every step must be either in it or in `NOT_GATING`. An unnamed step must
-        // `use` one of the two actions that open each job, with no key beyond
-        // `uses`, `with` and an `if:` that is absent or the `heavy` gate. Which
-        // commit they pin and what `with` passes are not checked here;
+        // `use` the checkout or setup-rust-toolchain action, with no key beyond
+        // `uses`, `with` and an `if:` that is absent or the `heavy` gate; how many
+        // there are and where they sit is not checked. Which commit they pin and
+        // what `with` passes are not checked here either;
         // `ci_windows_jobs_share_one_cache_and_toolchain_setup` only keeps the two
-        // jobs identical to each other.
+        // jobs identical to each other, up to the first toolchain step.
         for job in ["windows-debug", "windows-release"] {
             let steps = job_steps(&ci_job(&ci, job)).unwrap_or_else(|| panic!("{job} has steps"));
             for (name, step) in &steps {
