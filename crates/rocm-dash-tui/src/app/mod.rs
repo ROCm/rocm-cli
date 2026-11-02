@@ -16,9 +16,9 @@
 //! child modules hold no `AppState` methods: `app/types.rs` (shared type/enum
 //! defs and the menu data), `app/actions.rs` (`KeyAction` dispatch:
 //! `handle_key`, `apply_action`), `app/scrollbar.rs` (mouse hit-testing),
-//! `app/event_loop.rs` (terminal lifecycle + tick loop), `app/focus.rs`
-//! (focused-host policy), `app/update_check.rs` (the Updates-tile check) and
-//! `app/summary.rs`. `crate::app::*` paths for the public surface moved out
+//! `app/event_loop.rs` (the tick loop), `app/terminal.rs` (terminal restore,
+//! shutdown latch, signal watcher), `app/focus.rs` (focused-host policy),
+//! `app/update_check.rs` (the Updates-tile check) and `app/summary.rs`. `crate::app::*` paths for the public surface moved out
 //! are unchanged via the re-exports below.
 
 use std::collections::{HashMap, VecDeque};
@@ -43,6 +43,7 @@ mod scroll;
 mod scrollbar;
 mod slash;
 mod summary;
+mod terminal;
 #[cfg(test)]
 pub(crate) mod test_support;
 mod tool_approval;
@@ -55,20 +56,20 @@ mod update_check;
 // `NO_CHAT_BACKEND_MSG` re-export this rule cost).
 pub(crate) use actions::request_quit;
 pub use actions::{KeyAction, handle_mouse, tab_bar_hit};
-pub(crate) use event_loop::{
+pub use event_loop::run;
+pub use terminal::spawn_termination_watcher;
+pub(crate) use terminal::{
     SHUTTING_DOWN, exit_on_ctrl_c, is_ctrl_c, lock_terminal_writer, restore_terminal,
     shutdown_claimed_on,
 };
-
-pub use event_loop::{run, spawn_termination_watcher};
 pub(crate) use update_check::HOME_UPDATE_CHECK_JOB_ID;
 // Only reached via a test (`launcher.rs`'s
 // `the_front_door_comes_back_after_a_session_ends_cleanly`); gated to that
 // build so the compiler (not a hand-maintained `#[allow]`) flags this as dead
 // if that caller ever disappears.
-#[cfg(test)]
-pub(crate) use event_loop::restore_after_session;
 pub use scrollbar::{FooterChip, ScrollDrag, ScrollbarHandle};
+#[cfg(test)]
+pub(crate) use terminal::restore_after_session;
 pub use types::{
     ActiveTab, ChatConsent, ChatKeyCtx, ChatRole, ChatTurn, ConnState, Focus, MENU_ITEMS, Modal,
     OPTIONS_TABS, PALETTE_DESTS, PaneFocus, PlannedAction, ReplayState, ResolvedArgs, ScrollTarget,
