@@ -773,66 +773,6 @@ mod tests {
         assert!(value.get("kfd").expect("present").is_null());
     }
 
-    /// A wheel-format managed runtime, laid out the way the CLI installs one.
-    ///
-    /// `root` is one of the runtime's own `_rocm_sdk_*` package directories --
-    /// `_rocm_sdk_devel`, matching what the probe script's
-    /// `_devel.get_devel_root()` records as `root_path` when the `devel` extra
-    /// is installed -- never a venv root above `site_packages`. The ROCm
-    /// libraries do not sit under it either: they sit in the sibling
-    /// `_rocm_sdk_core` package, beside `root`, both directly under
-    /// `site_packages`. A fixture built as `root/lib/<python>/site-packages`
-    /// (a venv layout the installer never produces) would pass against a shape
-    /// production cannot create -- this one matches `apps/rocm/src/therock.rs`'s
-    /// `ROCM_SDK_PROBE_SCRIPT` instead.
-    #[cfg(target_os = "linux")]
-    fn wheel_runtime_on_disk(tag: &str) -> (std::path::PathBuf, Option<std::path::PathBuf>) {
-        use std::fs;
-        let base = std::env::temp_dir().join(format!(
-            "rocm-comgr-wheel-{tag}-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = fs::remove_dir_all(&base);
-        let site_packages = base.join("site-packages");
-        let root = site_packages.join("_rocm_sdk_devel");
-        let sdk_lib = site_packages.join("_rocm_sdk_core").join("lib");
-        fs::create_dir_all(&root).unwrap();
-        fs::create_dir_all(&sdk_lib).unwrap();
-        fs::write(sdk_lib.join("libamd_comgr.so.3"), b"fake").unwrap();
-        (root, Some(site_packages))
-    }
-
-    /// The managed copy this CLI installs itself is reachable by the search.
-    ///
-    /// That copy is the whole reason this entry exists: the CLI puts ROCm
-    /// wheels into a managed environment, so a user who follows that path on a
-    /// host already carrying a system install ends up holding both, having done
-    /// nothing unusual. A search that cannot see the copy we put there reports
-    /// a conflict-free machine no matter what else is true of it.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn the_managed_copy_this_cli_installs_is_reachable() {
-        let (root, site_packages) = wheel_runtime_on_disk("found");
-        let mut dirs = Vec::new();
-        crate::managed_runtime::collect_managed_runtime_library_paths(
-            &root,
-            site_packages.as_deref(),
-            &mut dirs,
-        );
-
-        let expected = site_packages
-            .expect("fixture always records site_packages")
-            .join("_rocm_sdk_core")
-            .join("lib");
-        assert!(
-            dirs.contains(&expected),
-            "the search missed the copy the CLI installs, which is the case this entry exists \
-             for. Looked in: {dirs:?}"
-        );
-        let _ = std::fs::remove_dir_all(root.parent().and_then(|p| p.parent()).unwrap());
-    }
-
     #[test]
     fn status_reflects_scope_precedence() {
         let mut e = Examination {

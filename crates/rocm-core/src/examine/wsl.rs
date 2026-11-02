@@ -8,7 +8,6 @@
 
 use super::{Examination, WSL_MIN_UBUNTU, WSL_PLATFORM_NOTE, WslFacts};
 use crate::probe_exec::{MEDIUM, run, run_utf16le, which};
-use anyhow::Result;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
