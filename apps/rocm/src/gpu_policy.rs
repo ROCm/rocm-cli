@@ -509,8 +509,7 @@ fn select_auto_gpu_index(
 /// lock, `detect_gpu_count` either in the `--gpu <index>` validation or inside
 /// the lock for `--gpu auto` — so a Linux host where the KFD open hangs *and*
 /// `amd-smi` then stalls adds up to ~24s to an interactive launch (2 × (2s +
-/// 10s)); the single-probe `--model` readiness path adds up to ~12s. Both
-/// figures used to be quoted as 10s and 20s, which omitted the pre-flight.
+/// 10s)); the single-probe `--model` readiness path adds up to ~12s.
 ///
 /// The pre-flight's 2s is only spent on a host whose device open is actually
 /// hanging, which is also the host on which the probe then declines and the
@@ -839,6 +838,13 @@ fn busy_gpu_indices(paths: &AppPaths) -> Vec<u32> {
 /// Best-effort count of local AMD GPUs via `amd-smi`. Returns `None` when
 /// amd-smi is unavailable or its output cannot be parsed (callers then fall
 /// back to conservative defaults).
+///
+/// Also `None` whenever the `/dev/kfd` pre-flight declines the launch, which it
+/// does for an unreachable device and not only for one that would hang — so a
+/// host outside the render group lands here, with no sysfs fallback of the kind
+/// [`gpu_vram_usage`] has. That is deliberate and is not a loss of GPU
+/// detection; `rocm_core`'s `kfd_readable` documents why, and what answers in
+/// this count's place.
 pub(crate) fn detect_gpu_count() -> Option<usize> {
     let value = rocm_core::amd_smi_json(&["list", "--json"], AMD_SMI_SERVE_PROBE_TIMEOUT).ok()?;
     let count = value.as_array().map(Vec::len)?;

@@ -200,11 +200,10 @@ fn preflight_passes(
 
 /// Shared with `rocm-core`'s `/dev/kfd` pre-flight rather than restated here.
 ///
-/// This was a plain `OpenOptions::open(..).is_ok()`, which left the dashboard
-/// collector as the one `amd-smi` launch site that could still block forever on
-/// a wedged device after EAI-8457 bounded every other one. The shared probe
-/// carries the 2s bound and the in-flight budget with it, so this site cannot
-/// drift away from the gate it is part of.
+/// A plain `OpenOptions::open(..).is_ok()` would leave the dashboard collector
+/// as the one `amd-smi` launch site that can still block forever on a wedged
+/// device. The shared probe carries the 2s bound and the in-flight budget with
+/// it, so this site cannot drift away from the gate it is part of.
 fn device_accessible(path: &Path) -> bool {
     rocm_core::device_readable_bounded(path)
 }
