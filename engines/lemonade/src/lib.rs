@@ -26,6 +26,7 @@ mod archive_extract;
 #[path = "../../../crates/rocm-core/src/archive_props.rs"]
 mod archive_props;
 mod backend_alignment;
+mod device_policy;
 mod direct_llama;
 mod install;
 mod llamacpp_backend;
@@ -172,12 +173,12 @@ pub fn run_cli() -> Result<()> {
             model_ref,
             host,
             port,
-            device_policy: Some(crate::state::parse_device_policy_arg(
+            device_policy: Some(crate::device_policy::parse_device_policy_arg(
                 device_policy.as_deref(),
             )?),
             endpoint_mode: Some("openai".to_owned()),
             engine_recipe: None,
-            gpu_selection: crate::state::parse_gpu_selection_arg(gpu.as_deref())?,
+            gpu_selection: crate::device_policy::parse_gpu_selection_arg(gpu.as_deref())?,
         })?)?,
         CommandKind::Stdio => {
             let envelope = read_request()?;
@@ -200,8 +201,8 @@ pub fn run_cli() -> Result<()> {
             model_ref,
             host,
             port,
-            device_policy: crate::state::parse_device_policy_arg(device_policy.as_deref())?,
-            gpu_indices: crate::state::parse_gpu_indices_arg(gpu.as_deref())?,
+            device_policy: crate::device_policy::parse_device_policy_arg(device_policy.as_deref())?,
+            gpu_indices: crate::device_policy::parse_gpu_indices_arg(gpu.as_deref())?,
             runtime_id,
             env_id,
             state_path,
@@ -349,7 +350,9 @@ fn detect_response() -> DetectResponse {
         python_version: None,
         torch_version: None,
         transformers_version: None,
-        available_devices: vec![crate::state::gpu_availability_device(runtime.is_some())],
+        available_devices: vec![crate::device_policy::gpu_availability_device(
+            runtime.is_some(),
+        )],
         capabilities: capabilities(),
         notes,
     }
@@ -415,7 +418,7 @@ fn install_response(request: InstallRequest) -> Result<InstallResponse> {
 }
 
 fn resolve_model_response(request: ResolveModelRequest) -> Result<ResolveModelResponse> {
-    let device_policy = crate::state::normalize_device_policy(request.device_policy)?;
+    let device_policy = crate::device_policy::normalize_device_policy(request.device_policy)?;
     let engine_recipe = crate::state::accepted_engine_recipe(request.engine_recipe)?;
     let canonical_model_id = crate::state::resolve_lemonade_model_ref(&request.model_ref);
     Ok(ResolveModelResponse {
@@ -445,7 +448,7 @@ fn resolve_model_response(request: ResolveModelRequest) -> Result<ResolveModelRe
 fn launch_service(mut request: LaunchRequest) -> Result<LaunchResponse> {
     rocm_core::require_nonempty(&request.service_id, "service_id")?;
     rocm_core::require_nonempty(&request.model_ref, "model_ref")?;
-    request.device_policy = Some(crate::state::normalize_device_policy(
+    request.device_policy = Some(crate::device_policy::normalize_device_policy(
         request.device_policy.clone(),
     )?);
     request.engine_recipe = crate::state::accepted_engine_recipe(request.engine_recipe)?;
@@ -508,12 +511,12 @@ fn launch_service(mut request: LaunchRequest) -> Result<LaunchResponse> {
 }
 
 fn serve_http(mut request: ServeHttpRequest) -> Result<()> {
-    crate::state::require_gpu_required(&request.device_policy)?;
+    crate::device_policy::require_gpu_required(&request.device_policy)?;
     // Verify a real GPU is available before launching anything: zero usable
     // devices fails fast, `auto` resolves to the first present device (never an
     // assumed device 0), and an explicit `--gpu` index is rejected when it is not
     // actually present. This runs before any server process is spawned.
-    request.gpu_indices = crate::state::resolve_serve_gpu_indices(&request.gpu_indices)?;
+    request.gpu_indices = crate::device_policy::resolve_serve_gpu_indices(&request.gpu_indices)?;
     let mut runtime = crate::install::resolve_runtime()?;
     let mut process_env = crate::process::lemonade_process_environment()?;
     process_env.gpu_indices = request.gpu_indices.clone();
@@ -732,7 +735,7 @@ fn healthcheck_service(request: HealthcheckRequest) -> Result<HealthcheckRespons
             )
         });
     let device = if ready {
-        crate::state::reported_device(state.as_ref(), &backend)
+        crate::device_policy::reported_device(state.as_ref(), &backend)
     } else {
         "unknown".to_owned()
     };
