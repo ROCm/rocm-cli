@@ -11,8 +11,6 @@ use std::fs;
 use std::hash::{Hash, Hasher};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-#[cfg(not(windows))]
-use std::process::{Command as ProcessCommand, Stdio};
 
 use crate::device_policy::device_policy_name;
 use crate::install::{LemonadeInstallManifest, LemonadeRuntime};
@@ -49,65 +47,6 @@ pub(crate) fn inference_verified(
         model_ref,
         rocm_engine_protocol::resolve_endpoint_api_key().as_deref(),
     )
-}
-
-pub(crate) fn serve_http_command_args(request: &ServeHttpRequest) -> Vec<String> {
-    let mut args = vec![
-        "serve-http".to_owned(),
-        request.service_id.clone(),
-        request.model_ref.clone(),
-        "--host".to_owned(),
-        request.host.clone(),
-        "--port".to_owned(),
-        request.port.to_string(),
-        "--device-policy".to_owned(),
-        device_policy_name(&request.device_policy).to_owned(),
-        "--state-path".to_owned(),
-        request.state_path.display().to_string(),
-    ];
-    if let Some(runtime_id) = request.runtime_id.as_deref() {
-        args.extend(["--runtime-id".to_owned(), runtime_id.to_owned()]);
-    }
-    if let Some(env_id) = request.env_id.as_deref() {
-        args.extend(["--env-id".to_owned(), env_id.to_owned()]);
-    }
-    if let Some(log_path) = request.log_path.as_ref() {
-        args.extend(["--log-path".to_owned(), log_path.display().to_string()]);
-    }
-    if let Some(csv) = rocm_engine_protocol::gpu_indices_to_csv(&request.gpu_indices) {
-        args.extend(["--gpu".to_owned(), csv]);
-    }
-    if let Some(engine_recipe) = request.engine_recipe.as_ref() {
-        args.extend([
-            "--engine-recipe-json".to_owned(),
-            serde_json::to_string(engine_recipe).expect("engine recipe serializes"),
-        ]);
-    }
-    args
-}
-
-#[cfg(windows)]
-pub(crate) fn spawn_serve_http_background(
-    current_exe: &Path,
-    serve_args: &[String],
-) -> Result<u32> {
-    rocm_core::spawn_detached_no_inherit(current_exe, serve_args, &[])
-        .context("failed to launch Lemonade serve-http background process")
-}
-
-#[cfg(not(windows))]
-pub(crate) fn spawn_serve_http_background(
-    current_exe: &Path,
-    serve_args: &[String],
-) -> Result<u32> {
-    let child = ProcessCommand::new(current_exe)
-        .args(serve_args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("failed to launch Lemonade serve-http background process")?;
-    Ok(child.id())
 }
 
 pub(crate) fn write_running_state(
@@ -342,7 +281,6 @@ pub(crate) fn manifest_lock_hash(manifest: &LemonadeInstallManifest) -> String {
 mod tests {
     use super::*;
     use crate::test_support::scratch_dir;
-    use rocm_engine_protocol::DevicePolicy;
     use std::io::{Read, Write};
     use std::time::Duration;
 
@@ -508,28 +446,5 @@ mod tests {
             parse_http_endpoint("http://[::1]:11435/v1"),
             Some(("::1".to_owned(), 11435))
         );
-    }
-
-    #[test]
-    fn serve_http_args_preserve_runtime_selection() {
-        let request = ServeHttpRequest {
-            service_id: "svc".to_owned(),
-            model_ref: DEFAULT_MODEL.to_owned(),
-            host: "127.0.0.1".to_owned(),
-            port: 11435,
-            device_policy: DevicePolicy::GpuRequired,
-            gpu_indices: Vec::new(),
-            runtime_id: Some("runtime".to_owned()),
-            env_id: Some("env".to_owned()),
-            state_path: PathBuf::from("state.json"),
-            log_path: Some(PathBuf::from("service.log")),
-            engine_recipe: None,
-        };
-        let args = serve_http_command_args(&request);
-        assert!(args.contains(&"--runtime-id".to_owned()));
-        assert!(args.contains(&"runtime".to_owned()));
-        assert!(args.contains(&"--env-id".to_owned()));
-        assert!(args.contains(&"env".to_owned()));
-        assert!(!args.iter().any(|arg| arg == "cpu"));
     }
 }

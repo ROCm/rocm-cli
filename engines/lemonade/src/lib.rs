@@ -482,7 +482,7 @@ fn launch_service(mut request: LaunchRequest) -> Result<LaunchResponse> {
     };
     let current_exe =
         std::env::current_exe().context("failed to discover current Lemonade engine binary")?;
-    let args = crate::state::serve_http_command_args(&serve_request);
+    let args = crate::process::serve_http_command_args(&serve_request);
     crate::state::write_running_state(
         &serve_request,
         &runtime,
@@ -490,7 +490,7 @@ fn launch_service(mut request: LaunchRequest) -> Result<LaunchResponse> {
         None,
         "starting",
     )?;
-    let wrapper_pid = crate::state::spawn_serve_http_background(&current_exe, &args)?;
+    let wrapper_pid = crate::process::spawn_serve_http_background(&current_exe, &args)?;
     crate::state::merge_json_state(
         &state_path,
         &json!({
