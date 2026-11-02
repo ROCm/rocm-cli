@@ -79,7 +79,7 @@ impl RocmToolExecutor for BinToolExecutor {
             // below, which drives this function against a real `rocm`
             // subprocess that exits non-zero; the collapsing half is pinned by
             // `approved_command_failure_stays_a_collapsed_envelope` in
-            // `crates/rocm-dash-tui/src/app/mod.rs`.
+            // `crates/rocm-dash-tui/src/app/tool_approval.rs`.
             Err(e) => RocmToolOutcome::Error(e.to_string()),
         }
     }
@@ -263,7 +263,7 @@ mod tests {
         );
         // The refusal text is buried in the envelope rather than surfaced —
         // exactly the shape `approved_command_failure_stays_a_collapsed_envelope`
-        // (`crates/rocm-dash-tui/src/app/mod.rs`) then collapses out of the chat.
+        // (`crates/rocm-dash-tui/src/app/tool_approval.rs`) then collapses out of the chat.
         //
         // Anchored on the rejected selector rather than on `select_runtime_manifest`'s
         // current "installed runtime not found" wording: that message is on this

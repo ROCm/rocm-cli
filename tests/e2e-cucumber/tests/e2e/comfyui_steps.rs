@@ -31,7 +31,7 @@
 //! (`apps/rocm/src/dash_seam.rs`) replays a real refusing `rocm` subprocess
 //! through the seam and asserts the `Result`/`isError: true` envelope, and
 //! `approved_command_failure_stays_a_collapsed_envelope`
-//! (`crates/rocm-dash-tui/src/app/mod.rs`) asserts that envelope is collapsed
+//! (`crates/rocm-dash-tui/src/app/tool_approval.rs`) asserts that envelope is collapsed
 //! out of the chat.
 //!
 //! `comfyui-04` covers the source-archive download spinner under a real PTY,
