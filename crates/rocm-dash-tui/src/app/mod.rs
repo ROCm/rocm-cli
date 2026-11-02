@@ -53,8 +53,9 @@ pub use event_loop::{run, spawn_termination_watcher};
 pub(crate) use event_loop::restore_after_session;
 pub use scrollbar::{FooterChip, ScrollDrag, ScrollbarHandle};
 pub use types::{
-    ActiveTab, ChatConsent, ChatKeyCtx, ChatRole, ChatTurn, ConnState, Focus, Modal, PaneFocus,
-    PlannedAction, ReplayState, ResolvedArgs, ScrollTarget, UpdateStatus, format_mmss,
+    ActiveTab, ChatConsent, ChatKeyCtx, ChatRole, ChatTurn, ConnState, Focus, MENU_ITEMS, Modal,
+    OPTIONS_TABS, PALETTE_DESTS, PaneFocus, PlannedAction, ReplayState, ResolvedArgs, ScrollTarget,
+    UpdateStatus, format_mmss,
 };
 pub(crate) use types::{ChatProvider, PendingApproval, SlashOutcome, SlashToolRequest};
 

@@ -156,7 +156,7 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
     // Dim the whole frame behind an open manager so the modal reads as the
     // foreground (and the body underneath is visibly inert).
     if state.has_open_overlay() {
-        modal::grey_overlay(f);
+        panel::grey_overlay(f);
     }
     let manager_rect = manager_rect(body);
     draw_active_manager(f, manager_rect, state, &theme);
@@ -165,7 +165,7 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
     // and owns the screen while a mutating-tool approval is pending. This is the
     // sole approval renderer (the single gating path). It dims the backdrop too.
     if let Some(pa) = &state.approval {
-        modal::grey_overlay(f);
+        panel::grey_overlay(f);
         approval::draw_approval(f, body, &pa.req, pa.choice, &theme);
     }
 
@@ -177,7 +177,7 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
     // approval the same way it closes every other overlay (see their doc
     // comments on `AppState`, not a doc comment on `quit_confirm` itself).
     if let Some(choice) = state.quit_confirm {
-        modal::grey_overlay(f);
+        panel::grey_overlay(f);
         // `true`: the dashboard's own `s` key (`quit_confirm_open_services_key`
         // in `event_loop`) can act on the hint this renders.
         approval::draw_approval(f, body, &quit_confirm_request(state, true), choice, &theme);
@@ -448,7 +448,7 @@ pub fn draw_focused(f: &mut Frame, state: &mut AppState) {
         // the overlay reads as the foreground here too (previously this path
         // skipped the wash entirely, leaving the area outside the manager card
         // at plain theme background instead of dimmed).
-        modal::grey_overlay(f);
+        panel::grey_overlay(f);
         let manager_rect = manager_rect(body);
         draw_active_manager(f, manager_rect, state, &theme);
     } else {
@@ -473,7 +473,7 @@ pub fn draw_focused(f: &mut Frame, state: &mut AppState) {
     );
 
     if let Some(choice) = state.quit_confirm {
-        modal::grey_overlay(f);
+        panel::grey_overlay(f);
         approval::draw_approval(f, body, &quit_confirm_request(state, false), choice, &theme);
     }
 }
@@ -481,7 +481,7 @@ pub fn draw_focused(f: &mut Frame, state: &mut AppState) {
 /// Where an operational manager overlay is drawn inside the dashboard `body`.
 /// One place, so the draw paths and the tests that check what fits agree.
 pub(crate) fn manager_rect(body: Rect) -> Rect {
-    modal::centered_rect(82, 80, 130, 34, body)
+    panel::centered_rect(82, 80, 130, 34, body)
 }
 
 /// Draw whichever operational manager is open into `rect`. The managers are
@@ -2315,10 +2315,12 @@ mod tests {
         }
     }
 
-    /// The wash `grey_overlay` paints behind an open overlay (see
-    /// `modal::grey_overlay`'s own `grey_overlay_dims_every_cell` test for the
-    /// exact color); these tests only check that `draw`/`draw_focused` actually
-    /// invoke it at their three call sites, not the wash's own correctness.
+    /// The wash `grey_overlay` paints behind an open overlay (see the
+    /// `grey_overlay_dims_every_cell` test in `modal.rs` for the exact color:
+    /// the function itself is `panel::grey_overlay`, and the test stays beside
+    /// `draw_logo`, which it composes); these tests only check that
+    /// `draw`/`draw_focused` actually invoke it at their three call sites, not
+    /// the wash's own correctness.
     const OVERLAY_WASH: ratatui::style::Color = ratatui::style::Color::Rgb(0x1c, 0x1e, 0x22);
 
     #[test]

@@ -16,8 +16,7 @@ use rocm_dash_core::metrics::{Instance, InstanceStatus, ObservationFreshness};
 
 use crate::app::{AppState, ConnState, KeyAction, ScrollTarget};
 use crate::ui::format;
-use crate::ui::modal::{centered_rect, draw_popup_frame, grey_overlay};
-use crate::ui::panel::{self, BoxRole};
+use crate::ui::panel::{self, BoxRole, centered_rect, draw_popup_frame, grey_overlay};
 use crate::ui::theme::Theme;
 use crate::ui::widgets::trunc;
 

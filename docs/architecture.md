@@ -157,7 +157,7 @@ Further `rocm-core` modules, each with its own doc comment except where noted:
 
 ### `crates/rocm-dash-core`, `rocm-dash-collectors`, `rocm-dash-daemon`, `rocm-dash-tui` — dashboard/telemetry
 
-The `agent/` and `app/` files below are every production file the dashboard-TUI split has touched so far; [`app/test_support.rs`](../crates/rocm-dash-tui/src/app/test_support.rs) holds only shared test helpers.
+The `agent/` and `app/` files below are every production file the dashboard-TUI split has touched in those two directories (the `ui/` files it has touched are listed after them); [`app/test_support.rs`](../crates/rocm-dash-tui/src/app/test_support.rs) holds only shared test helpers.
 
 The old agent.rs was split (mechanical relocation — the shared seam types stay in [`agent/mod.rs`](../crates/rocm-dash-tui/src/agent/mod.rs), reached from the split-out files via `super::`) into:
 
@@ -169,7 +169,7 @@ The old agent.rs was split (mechanical relocation — the shared seam types stay
 [`app/mod.rs`](../crates/rocm-dash-tui/src/app/mod.rs) is modularized (ROCMAI-84, Phase 4 of ROCMAI-27's sequencing) into an `app/` directory. [`app/types.rs`](../crates/rocm-dash-tui/src/app/types.rs), [`app/event_loop.rs`](../crates/rocm-dash-tui/src/app/event_loop.rs), [`app/scrollbar.rs`](../crates/rocm-dash-tui/src/app/scrollbar.rs), and [`app/actions.rs`](../crates/rocm-dash-tui/src/app/actions.rs) follow full domain extraction. [`app/chat.rs`](../crates/rocm-dash-tui/src/app/chat.rs), [`app/slash.rs`](../crates/rocm-dash-tui/src/app/slash.rs), and [`app/summary.rs`](../crates/rocm-dash-tui/src/app/summary.rs) were extracted earlier via mechanical relocation, the same convention the `agent/` split above follows:
 
 - [`app/mod.rs`](../crates/rocm-dash-tui/src/app/mod.rs) — keeps `AppState`, its reducer impl around the `apply_event` entry point (`apply_action` itself lives in [`app/actions.rs`](../crates/rocm-dash-tui/src/app/actions.rs)), and the handful of items that stay with it (`ProviderSwitch`, `HISTORY_CAP`, `BENCH_CAP`) — the modularization effort's "reducer's reason to exist." `crate::app::*` paths for the public surface moved out are unchanged via re-exports (see the re-export block's comment for what counts as "public surface").
-- [`app/types.rs`](../crates/rocm-dash-tui/src/app/types.rs) — shared type/enum defs: `Focus`, `ResolvedArgs`, connection/tab/chat/replay state, `Modal`, `UpdateStatus`, `PaneFocus`, `ScrollTarget`, and the slash/plan/approval payload types; no `AppState` access.
+- [`app/types.rs`](../crates/rocm-dash-tui/src/app/types.rs) — shared type/enum defs: `Focus`, `ResolvedArgs`, connection/tab/chat/replay state, `Modal`, `UpdateStatus`, `PaneFocus`, `ScrollTarget`, the slash/plan/approval payload types, and the Esc-menu, command-palette and options-panel navigation data (`MENU_ITEMS`, `PALETTE_DESTS`, `OPTIONS_TABS`) that `app/actions.rs` reads and `ui/modal.rs` renders; no `AppState` access.
 - [`app/event_loop.rs`](../crates/rocm-dash-tui/src/app/event_loop.rs) — terminal lifecycle, signal handling, and the tick loop: `run`, `event_loop`, the termination-signal watcher, and the startup-focus / Updates-tile tick helpers.
 - [`app/scrollbar.rs`](../crates/rocm-dash-tui/src/app/scrollbar.rs) — mouse/scroll hit-testing: resolving a raw `MouseEvent` against recorded scrollbar tracks, the tab bar, and footer-legend chips into a `KeyAction`.
 - [`app/actions.rs`](../crates/rocm-dash-tui/src/app/actions.rs) — `KeyAction` dispatch: translating a key press or resolved mouse hit into a `KeyAction` and applying it to reducer state.
@@ -182,9 +182,13 @@ The old agent.rs was split (mechanical relocation — the shared seam types stay
 The other shared `ui/` components the contributor rules in [`AGENTS.md`](../AGENTS.md) name — reuse these rather than hand-rolling a new console, box, spinner or status color (the directory holds further helper and per-screen modules that are not inventoried here):
 
 - [`ui/job_console.rs`](../crates/rocm-dash-tui/src/ui/job_console.rs) — the shared "a job is running" surface: `draw_job_console` renders a job's status header, streamed output and key hints, and `on_console_key` handles its keys.
-- [`ui/panel.rs`](../crates/rocm-dash-tui/src/ui/panel.rs) — the shared box chrome: bordered, titled panels (`bento`, `popup`) and scrollbars.
+- [`ui/panel.rs`](../crates/rocm-dash-tui/src/ui/panel.rs) — the shared box chrome: bordered, titled panels (`bento`, `popup`), scrollbars, and the popup geometry and framing (`centered_rect`, `centered_width`, `draw_popup_frame`, `grey_overlay`) that [`ui/approval.rs`](../crates/rocm-dash-tui/src/ui/approval.rs), [`ui/job_console.rs`](../crates/rocm-dash-tui/src/ui/job_console.rs) and the `Modal::*` renderers in [`ui/modal.rs`](../crates/rocm-dash-tui/src/ui/modal.rs) import.
 - [`ui/spinner.rs`](../crates/rocm-dash-tui/src/ui/spinner.rs) — pure helpers for the braille spinner frame (`spinner_frame`) and progress-percentage parsing (`parse_progress_pct`) that `job_console.rs` renders with.
 - [`ui/theme.rs`](../crates/rocm-dash-tui/src/ui/theme.rs) — the semantic `Theme`, including the shared job-status-to-color mapping (`job_status_color`).
+
+The `ui/` modules the split moved code out of or into, beyond the shared components above:
+
+- [`ui/modal.rs`](../crates/rocm-dash-tui/src/ui/modal.rs) — the `Modal::*` renderers (Help, global help, Esc menu, command palette, options, theme picker, warnings). The popup geometry they and every manager overlay share lives in [`ui/panel.rs`](../crates/rocm-dash-tui/src/ui/panel.rs), and the menu/palette/options navigation data they render lives in [`app/types.rs`](../crates/rocm-dash-tui/src/app/types.rs), so this file depends on those and not the reverse.
 
 The other three dashboard crates are described at crate level here, not module by module:
 

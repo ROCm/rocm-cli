@@ -557,6 +557,21 @@ impl ScrollTarget {
     ];
 }
 
+/// Esc-menu rows: Options / Help / Quit.
+pub const MENU_ITEMS: usize = 3;
+
+/// Command-palette destinations (label, tab).
+pub const PALETTE_DESTS: &[(&str, ActiveTab)] = &[
+    ("Home", ActiveTab::Home),
+    ("ROCm", ActiveTab::Rocm),
+    ("Serving", ActiveTab::Serving),
+    ("Observe", ActiveTab::Observe),
+    ("Chat", ActiveTab::Chat),
+];
+
+/// Options panel tabs.
+pub const OPTIONS_TABS: &[&str] = &["General", "CPU", "GPU", "Engines"];
+
 #[cfg(test)]
 mod tests {
     use super::*;

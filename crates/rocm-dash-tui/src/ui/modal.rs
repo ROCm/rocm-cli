@@ -2,11 +2,13 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Centered popup helpers + the Help overlay.
+//! The Help overlay and the other `Modal::*` renderers.
 //!
 //! Modal content is rendered by the active tab (`detail_modal` from the tab
-//! module) or by `draw_help` here. This module owns the geometry and the
-//! Clear-then-block pattern so the underlying body shows through the gaps.
+//! module) or by `draw_help` here. The popup geometry and the
+//! Clear-then-block pattern (`centered_rect`, `draw_popup_frame`,
+//! `grey_overlay`) live in `ui/panel.rs`, which this module imports from, so
+//! the underlying body shows through the gaps.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -14,104 +16,13 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph, Wrap};
 
-use crate::app::{ActiveTab, AppState};
+use crate::app::{ActiveTab, AppState, OPTIONS_TABS, PALETTE_DESTS};
 use crate::ui::gradient::GradientGauge;
-use crate::ui::panel::{self, BoxRole};
+use crate::ui::panel::{
+    self, BoxRole, centered_rect, centered_width, draw_popup_frame, grey_overlay,
+};
 use crate::ui::sparkline::BrailleSparkline;
 use crate::ui::theme::{self, Theme};
-
-/// `extent * pct / 100`, computed in `u32` so the intermediate product cannot
-/// overflow a `u16`.
-///
-/// `area.height * pct_y` overflows above 655 rows once `pct_y` is 100 — which
-/// [`draw_help`] now passes, to mean "the whole area when the content is taller
-/// than it". That is a debug-build panic on a terminal tall enough (tmux panes
-/// and some GUI terminals report large synthetic sizes), and a wrap-around in
-/// release. Widening here removes the ceiling for every caller rather than
-/// leaving each one to know where it is.
-fn scale_pct(extent: u16, pct: u16) -> u16 {
-    u16::try_from(u32::from(extent) * u32::from(pct) / 100).unwrap_or(u16::MAX)
-}
-
-/// Centered rectangle taking `pct_x`% width and `pct_y`% height of `area`,
-/// clamped to a maximum so it doesn't drown the screen on big terminals.
-pub fn centered_rect(pct_x: u16, pct_y: u16, max_w: u16, max_h: u16, area: Rect) -> Rect {
-    let h_pct = centered_height(pct_y, max_h, area);
-    let v_pad = (area.height.saturating_sub(h_pct)) / 2;
-    let w_pct = centered_width(pct_x, max_w, area);
-    let vert = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(v_pad),
-            Constraint::Length(h_pct),
-            Constraint::Min(0),
-        ])
-        .split(area);
-
-    let h_pad = (area.width.saturating_sub(w_pct)) / 2;
-    let horiz = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Length(h_pad),
-            Constraint::Length(w_pct),
-            Constraint::Min(0),
-        ])
-        .split(vert[1]);
-
-    horiz[1]
-}
-
-/// Narrowest a popup is allowed to be shrunk to by the percentage, so a modal
-/// on a merely small terminal is still wide enough to read.
-const MIN_POPUP_WIDTH: u16 = 20;
-
-/// Width [`centered_rect`] will give a popup, split out so a caller that needs
-/// to lay its content out *before* the popup exists (to size the popup to that
-/// content) cannot drift from the real geometry.
-///
-/// The [`MIN_POPUP_WIDTH`] floor is itself clamped to `area.width`, which is the
-/// difference between a number the popup might get and the number it *will*
-/// get. An unclamped floor returns 20 on a terminal narrower than 20 — a width
-/// the popup can never have, because [`centered_rect`]'s `Layout::split`
-/// truncates the segment to the area. That is harmless for a caller that only
-/// renders, but both help modals now *measure* their wrapped content against
-/// this width before the popup exists: measuring the wrap at 20 columns and
-/// rendering it into 12 under-counts the rows the content needs and cuts the
-/// tail off — the precise silent truncation content-sizing was added to remove.
-pub fn centered_width(pct_x: u16, max_w: u16, area: Rect) -> u16 {
-    let floor = MIN_POPUP_WIDTH.min(area.width);
-    scale_pct(area.width, pct_x).min(max_w).max(floor)
-}
-
-/// Shortest a popup is allowed to be shrunk to by the percentage: a border pair
-/// plus enough body rows to be worth opening.
-const MIN_POPUP_HEIGHT: u16 = 5;
-
-/// Height [`centered_rect`] will give a popup — the exact counterpart of
-/// [`centered_width`], and split out for the same reason: the number this
-/// computes has to be the number the popup gets.
-///
-/// The [`MIN_POPUP_HEIGHT`] floor is clamped to `area.height` for the reason
-/// spelled out on [`centered_width`]. An unclamped floor asks for 5 rows on an
-/// area shorter than 5, which the `Layout::split` below then truncates, so the
-/// requested geometry and the rendered geometry disagree. Nothing measures
-/// against the height *today* — the callers measure their content and pass the
-/// answer in as `max_h` — so this is a latent form of the defect that had gone
-/// live on the width. Keeping the two sides identical is what stops it going
-/// live here the first time a caller needs the height before the popup exists.
-fn centered_height(pct_y: u16, max_h: u16, area: Rect) -> u16 {
-    let floor = MIN_POPUP_HEIGHT.min(area.height);
-    scale_pct(area.height, pct_y).min(max_h).max(floor)
-}
-
-/// Render a bordered block with `title` over `area` after clearing it,
-/// returning the inner area so the caller can render content into it.
-pub fn draw_popup_frame(f: &mut Frame, area: Rect, title: &str, theme: &Theme) -> Rect {
-    f.render_widget(Clear, area);
-    // Compact frame: rounded + notch title but the classic 1-cell inset, so the
-    // many manager overlays keep their original content geometry.
-    panel::popup(f, area, title, theme)
-}
 
 /// Render the Help modal for the active tab.
 ///
@@ -613,21 +524,6 @@ fn badge<'a>(label: &'a str, bg: ratatui::style::Color, preview_theme: &Theme) -
 // draw_tab_panel) over the stable 4-tab body.
 // ===========================================================================
 
-/// Esc-menu rows: Options / Help / Quit.
-pub const MENU_ITEMS: usize = 3;
-
-/// Command-palette destinations (label, tab).
-pub const PALETTE_DESTS: &[(&str, ActiveTab)] = &[
-    ("Home", ActiveTab::Home),
-    ("ROCm", ActiveTab::Rocm),
-    ("Serving", ActiveTab::Serving),
-    ("Observe", ActiveTab::Observe),
-    ("Chat", ActiveTab::Chat),
-];
-
-/// Options panel tabs.
-pub const OPTIONS_TABS: &[&str] = &["General", "CPU", "GPU", "Engines"];
-
 /// Row (relative to `inner.y`) where the Esc menu's selectable items begin,
 /// just below the 5-row logo (rows 1..=5).
 const MENU_ITEMS_Y: u16 = 8;
@@ -915,23 +811,6 @@ fn help_group_lines<'a>(
 fn put(f: &mut Frame, x: u16, y: u16, s: &str, style: Style) {
     if y < f.area().height {
         f.buffer_mut().set_string(x, y, s, style);
-    }
-}
-
-/// Dim the entire frame to a cool grey wash so a centered modal reads as the
-/// foreground. Call before drawing the modal box on top.
-pub fn grey_overlay(f: &mut Frame) {
-    use ratatui::style::Color;
-    let area = f.area();
-    let wash = Color::Rgb(0x1c, 0x1e, 0x22);
-    let dim = Color::Rgb(0x4c, 0x50, 0x57);
-    let buf = f.buffer_mut();
-    for y in area.y..area.y + area.height {
-        for x in area.x..area.x + area.width {
-            if let Some(c) = buf.cell_mut((x, y)) {
-                c.set_style(Style::default().fg(dim).bg(wash));
-            }
-        }
     }
 }
 
@@ -1557,78 +1436,6 @@ mod ported_chrome_tests {
         }
     }
 
-    /// The width the content-sized modals *measure* their wrapped content
-    /// against must be the width the popup actually gets.
-    ///
-    /// `centered_width`'s minimum-width floor is what can break that. On a
-    /// terminal narrower than the floor, an unclamped floor hands back a number
-    /// `centered_rect` then truncates (`Layout::split` cannot emit a segment
-    /// wider than its input), so `draw_help` / `draw_global_help` count the rows
-    /// their content wraps to at one width and render it at a narrower one —
-    /// under-counting the rows needed and cutting the tail off. That is the
-    /// silent truncation content-sizing exists to remove, re-introduced at a
-    /// geometry nothing else in this module exercises.
-    ///
-    /// Both live `(pct_x, max_w)` pairs are checked: `draw_help`'s 70/80 and
-    /// `draw_global_help`'s 80/100.
-    #[test]
-    fn popup_width_is_never_wider_than_a_narrow_area() {
-        for w in 0..=24u16 {
-            let area = Rect::new(0, 0, w, 40);
-            for (pct_x, max_w) in [(70u16, 80u16), (80, 100)] {
-                let measured = super::centered_width(pct_x, max_w, area);
-                assert!(
-                    measured <= w,
-                    "centered_width({pct_x}, {max_w}) returned {measured} on a \
-                     {w}-column area: the modals would measure their content at \
-                     a width the popup cannot have"
-                );
-                assert_eq!(
-                    super::centered_rect(pct_x, 100, max_w, 10, area).width,
-                    measured,
-                    "the popup's rendered width must equal the width its \
-                     content was measured against ({w}-column area)"
-                );
-            }
-        }
-    }
-
-    /// The height counterpart of the sweep above, pinned for the same reason.
-    ///
-    /// Unlike the width, nothing measures its content against this number yet,
-    /// so the defect is latent rather than live: `centered_rect` returns a rect
-    /// `Layout::split` has already truncated to the area, and *that* is why this
-    /// test asserts on `centered_height` rather than on `centered_rect(..).
-    /// height`. A test written against the returned rect could not fail — it
-    /// would be re-asserting ratatui's own invariant, which is precisely the
-    /// mistake `help_modal_is_clamped_when_the_content_cannot_fit` made before
-    /// it was deleted. The property this crate owns is that the height it *asks*
-    /// for is the height it gets.
-    ///
-    /// Both live `(pct_y, max_h)` shapes are swept: the content-sized help
-    /// modals' `pct_y = 100`, and a fixed-height overlay's 80/30.
-    #[test]
-    fn popup_height_is_never_taller_than_a_short_area() {
-        for h in 0..=8u16 {
-            let area = Rect::new(0, 0, 80, h);
-            for (pct_y, max_h) in [(100u16, 12u16), (80, 30)] {
-                let asked = super::centered_height(pct_y, max_h, area);
-                assert!(
-                    asked <= h,
-                    "centered_height({pct_y}, {max_h}) returned {asked} on a \
-                     {h}-row area: the popup would be laid out to a height it \
-                     cannot have"
-                );
-                assert_eq!(
-                    super::centered_rect(100, pct_y, 80, max_h, area).height,
-                    asked,
-                    "the popup's rendered height must equal the height it was \
-                     laid out to ({h}-row area)"
-                );
-            }
-        }
-    }
-
     /// When the content still cannot fit at full height, the modal says so.
     ///
     /// It is sized, not scrolled: there is no scrollbar and nothing to press, so
@@ -1668,23 +1475,6 @@ mod ported_chrome_tests {
                 "{w}x{h}: a modal that fits must not claim it was truncated \
                  (global={global}):\n{out}"
             );
-        }
-    }
-
-    /// `centered_rect` scales a percentage of the area, and `area.height` is a
-    /// `u16`. Since `draw_help` passes `pct_y = 100`, a `u16` product overflows
-    /// above 655 rows — a debug-build panic on a tall terminal. The arithmetic
-    /// widens to `u32` so no caller has to know where the ceiling is.
-    #[test]
-    fn centered_rect_does_not_overflow_on_a_very_tall_or_wide_area() {
-        for (w, h) in [(2000u16, 2000u16), (u16::MAX, u16::MAX)] {
-            let area = Rect::new(0, 0, w, h);
-            let r = super::centered_rect(100, 100, u16::MAX, u16::MAX, area);
-            assert!(
-                r.height <= h && r.width <= w,
-                "centered_rect({w}x{h}) escaped its area: {r:?}"
-            );
-            assert_eq!(super::centered_width(100, u16::MAX, area), w);
         }
     }
 }

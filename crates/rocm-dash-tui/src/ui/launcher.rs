@@ -153,7 +153,7 @@ pub fn draw(f: &mut Frame, area: Rect, state: &AppState, sel: usize, theme: &The
     // `ui::draw`'s own quit_confirm arm calls) rather than silently dropping
     // the decision on the floor once opened, or hand-copying the title text.
     if let Some(choice) = state.quit_confirm {
-        crate::ui::modal::grey_overlay(f);
+        crate::ui::panel::grey_overlay(f);
         // `false`: the launcher has no live Services overlay to jump to
         // (`AppState::quit_confirm_open_services_key` is dashboard-only), so
         // it must not advertise the `s` hint the dashboard's copy does.
