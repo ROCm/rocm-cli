@@ -11,7 +11,9 @@
 //! `crate::host_gpu::` paths keep resolving. The TheRock-managed-SDK gfx-target
 //! probe (`detect_managed_therock_sdk_gfx_target`) stays here, since its only
 //! caller is this module's own gfx-target fallback chain; the registry reading
-//! it uses lives in [`crate::managed_runtime`].
+//! it uses lives in [`crate::managed_runtime`]. `interactive_terminal` lives in
+//! [`crate::confirm`] and is re-exported here too, so the
+//! `crate::host_gpu::interactive_terminal` path keeps resolving.
 //!
 //! The probes live in child modules: `capture` (optional-command capture and the
 //! tool-on-`PATH` lookup), `os_facts` (kernel, distro, CPU and RAM), `linux`
@@ -26,7 +28,7 @@
 //! deliberate transitional step from the zero-diff extraction, not an
 //! oversight.
 
-use crate::confirm::interactive_terminal;
+pub use crate::confirm::interactive_terminal;
 pub use crate::gfx_target::{
     extract_first_gfx_token, gfx_target_from_pnp_device_id, gfx_target_has_no_rocm_build,
     known_therock_families, normalize_therock_family,
