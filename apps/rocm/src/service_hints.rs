@@ -15,9 +15,9 @@
 //! are built from — the command (`service_action_command`), the progressive
 //! verb (`service_action_verb`) and the past tense (`service_action_past_tense`)
 //! — plus `sandbox_tool_arg_from_service_tool`, which maps the tool name to its
-//! `SandboxToolArg`. They were relocated verbatim from `main.rs`, where
-//! `run_approved_service_action` calls all four; `services_text.rs` reads
-//! `service_action_past_tense` from here.
+//! `SandboxToolArg`. They were relocated verbatim from `main.rs`;
+//! `services_cmd.rs`'s `run_approved_service_action` calls all four, and
+//! `services_text.rs` reads `service_action_past_tense` from here.
 
 use anyhow::{Result, bail};
 

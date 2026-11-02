@@ -43,15 +43,16 @@
 //!
 //! `dispatch()` calls directly into this module at several points —
 //! `render_internal_status_text`, `run_internal_sandbox_tool`,
-//! `render_service_logs_text`, `render_logs_browser_text`, `render_logs_text`,
-//! `render_services_text`, and `render_services_json` — re-imported via `use
-//! crate::services_text::{...};`. `render_service_action_result`,
-//! `run_internal_sandbox_tool`, and `validate_service_id` are also read from
-//! `main.rs`'s own `run_approved_service_action` (dispatch-adjacent, but not
-//! itself part of this cluster — see `service_launch.rs`'s doc comment for
-//! why the broader service-record-management cluster stays at the crate
-//! root); `validate_service_id` and `load_managed_service` are also read from
-//! `service_records.rs`'s `remove_managed_service_record`/`apply_service_prune_plan`.
+//! `render_service_logs_text`, `render_logs_browser_text`, and
+//! `render_logs_text` — re-imported via `use crate::services_text::{...};`.
+//! `services_cmd.rs`'s `services()` calls `render_services_text`,
+//! `render_services_json` and `render_service_logs_text` through its own
+//! imports, and its `run_approved_service_action` also reads
+//! `render_service_action_result`, `run_internal_sandbox_tool`, and
+//! `validate_service_id`. `service_records.rs` reads `validate_service_id`
+//! (in `service_record_artifacts` and `remove_managed_service_record`) and
+//! `load_managed_service` (in `remove_managed_service_record` and
+//! `apply_service_prune_plan`).
 //! `load_managed_service` and `restart_internal_managed_service` are
 //! `pub(crate)` and read from `runtime_services.rs` (reconciling live servers
 //! against a runtime activation) and from `managed_service_status.rs`'s own
@@ -76,13 +77,13 @@
 //! other mechanically relocated modules do, and `runtime_services::` through
 //! its own `use crate::runtime_services;` for the handful of tests that drive
 //! this cluster's restart/stop behavior through `runtime_services`'s public
-//! entry points rather than calling it directly. Three tests that call this
-//! cluster's `load_managed_service`/`render_service_action_result` only
-//! incidentally — their primary subject is `runtime_services::
-//! pin_service_record_to_runtime`/`restore_service_record_pin`,
+//! entry points rather than calling it directly. Two tests that call this
+//! cluster's `load_managed_service` only incidentally — their primary subject
+//! is `runtime_services::pin_service_record_to_runtime`/
+//! `restore_service_record_pin` and
 //! `runtime_services::restart_service_onto_runtime_with`'s outcome
-//! classification, and `main.rs`'s own `run_approved_service_action`
-//! respectively — stay in `main.rs`'s shared `mod tests` instead.
+//! classification respectively — stay in `main.rs`'s shared `mod tests`
+//! instead.
 
 use std::collections::VecDeque;
 use std::fmt::Write as _;

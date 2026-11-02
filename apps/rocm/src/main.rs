@@ -45,6 +45,7 @@ mod serve_summary;
 mod service_hints;
 mod service_launch;
 mod service_records;
+mod services_cmd;
 mod services_text;
 mod storage;
 #[cfg(test)]
@@ -89,13 +90,8 @@ mod update_cmd;
 // `record_cli_audit_event`, `cli_lifecycle_log_path` and `sanitize_log_value`
 // (from `cli_audit.rs`) are re-imported so other modules keep reaching them as
 // `crate::<name>`; `main.rs` itself calls `record_cli_audit_event`.
-// `sandbox_tool_arg_from_service_tool`, `service_action_command`,
-// `service_action_verb` and `service_action_past_tense` (from
-// `service_hints.rs`) are imported for `run_approved_service_action`.
-// `DEFAULT_SERVICE_PRUNE_MIN_AGE_HOURS`, `prune_managed_service_records`,
-// `remove_managed_service_record` and `service_prune_min_age_hours` (from
-// `service_records.rs`) are imported for the `ServicesCommand::Prune` clap
-// definition and `services()`.
+// `DEFAULT_SERVICE_PRUNE_MIN_AGE_HOURS` (from `service_records.rs`) is imported
+// for the `ServicesCommand::Prune` clap definition.
 use crate::automations::{automations, render_daemon_text};
 use crate::cli_audit::{cli_lifecycle_log_path, record_cli_audit_event, sanitize_log_value};
 use crate::driver_install::{install_driver, reconcile_driver_install};
@@ -132,18 +128,15 @@ use crate::runtimes_cmd::{
     validate_runtime_manifest_for_activation,
 };
 use crate::serve_cmd::{ServeArgs, select_serve_engine, serve};
-use crate::service_hints::{
-    sandbox_tool_arg_from_service_tool, service_action_command, service_action_past_tense,
-    service_action_verb,
-};
-use crate::service_records::{
-    DEFAULT_SERVICE_PRUNE_MIN_AGE_HOURS, prune_managed_service_records,
-    remove_managed_service_record, service_prune_min_age_hours,
-};
+use crate::service_records::DEFAULT_SERVICE_PRUNE_MIN_AGE_HOURS;
+// Reached only as `super::run_approved_service_action` from
+// `advised_commands.rs`'s test, so a non-test build does not carry it.
+#[cfg(test)]
+use crate::services_cmd::run_approved_service_action;
+use crate::services_cmd::services;
 use crate::services_text::{
     render_internal_status_text, render_logs_browser_text, render_logs_text,
-    render_service_action_result, render_service_logs_text, render_services_json,
-    render_services_text, run_internal_sandbox_tool, validate_service_id,
+    render_service_logs_text, run_internal_sandbox_tool,
 };
 use crate::uninstall::uninstall;
 use crate::uninstall_plan::UninstallOptions;
@@ -3618,84 +3611,6 @@ fn collect_serve_notes(
     notes
 }
 
-fn services(command: Option<ServicesCommand>) -> Result<()> {
-    let paths = AppPaths::discover()?;
-    match command.unwrap_or(ServicesCommand::List {
-        all: false,
-        json: false,
-    }) {
-        ServicesCommand::List { all, json } => {
-            if json {
-                print!("{}", render_services_json(&paths, all)?);
-            } else {
-                print!("{}", render_services_text(&paths, all)?);
-            }
-            Ok(())
-        }
-        ServicesCommand::Logs { service_id } => {
-            print!("{}", render_service_logs_text(&paths, &service_id)?);
-            Ok(())
-        }
-        ServicesCommand::Stop { service_id, yes } => {
-            run_approved_service_action(&paths, "stop_server", &service_id, yes)
-        }
-        ServicesCommand::Restart { service_id, yes } => {
-            run_approved_service_action(&paths, "restart_server", &service_id, yes)
-        }
-        ServicesCommand::Remove { service_id, yes } => {
-            print!(
-                "{}",
-                remove_managed_service_record(&paths, &service_id, yes)?
-            );
-            record_cli_audit_event(
-                &paths,
-                "service",
-                "remove_record",
-                "info",
-                format!("removed local server record {service_id}"),
-                Some(&service_id),
-            );
-            Ok(())
-        }
-        ServicesCommand::Prune {
-            older_than_hours,
-            any_age,
-            dry_run,
-            yes,
-        } => {
-            let older_than_hours = service_prune_min_age_hours(older_than_hours, any_age);
-            let outcome = prune_managed_service_records(&paths, older_than_hours, dry_run, yes)?;
-            print!("{}", outcome.text);
-            if !dry_run && (outcome.removed_records > 0 || outcome.removed_files > 0) {
-                record_cli_audit_event(
-                    &paths,
-                    "service",
-                    "prune_records",
-                    "info",
-                    format!(
-                        "removed {} local server record(s) and {} leftover file(s) older than {older_than_hours}h",
-                        outcome.removed_records, outcome.removed_files
-                    ),
-                    None,
-                );
-            }
-            // Deliberately after the print and the audit event: a file this run
-            // could not delete still has to fail the command, but not at the
-            // cost of the record of what it *did* delete.
-            if !outcome.failures.is_empty() {
-                // Only reachable through this dispatch, so no unit test covers
-                // it: `service-cleanup-06` in
-                // `features/service_record_cleanup.feature` is its cover.
-                bail!(
-                    "{} file(s) could not be removed; see the list above",
-                    outcome.failures.len()
-                );
-            }
-            Ok(())
-        }
-    }
-}
-
 fn comfyui(command: Option<ComfyuiCommand>) -> Result<()> {
     let paths = AppPaths::discover()?;
     let config = RocmCliConfig::load(&paths).unwrap_or_default();
@@ -3857,37 +3772,6 @@ fn comfyui(command: Option<ComfyuiCommand>) -> Result<()> {
             }
         },
     }
-}
-
-fn run_approved_service_action(
-    paths: &AppPaths,
-    tool: &str,
-    service_id: &str,
-    yes: bool,
-) -> Result<()> {
-    validate_service_id(service_id)?;
-    if !yes {
-        bail!(
-            "{} local server `{service_id}` requires --yes.\n\nTry: {}",
-            service_action_verb(tool),
-            service_hints::service_action_hint(service_action_command(tool), service_id)
-        );
-    }
-    let sandbox_tool = sandbox_tool_arg_from_service_tool(tool)?;
-    let result = run_internal_sandbox_tool(paths, sandbox_tool, Some(service_id.to_owned()), true)?;
-    print!("{}", render_service_action_result(tool, &result));
-    record_cli_audit_event(
-        paths,
-        "service",
-        tool,
-        "info",
-        format!(
-            "{} managed service {service_id}",
-            service_action_past_tense(tool)
-        ),
-        Some(service_id),
-    );
-    Ok(())
 }
 
 fn config(command: ConfigCommand) -> Result<()> {
@@ -5943,38 +5827,6 @@ pub(crate) mod tests {
             rendered.contains("--any-age") && rendered.contains("--older-than-hours"),
             "the conflict must name both arguments:\n{rendered}"
         );
-    }
-
-    #[test]
-    fn service_actions_require_yes_and_render_sandbox_result() {
-        let (_root, paths) = test_paths("services-action-approval");
-        let error = run_approved_service_action(&paths, "stop_server", "svc-qwen", false)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("requires --yes"));
-        assert!(error.contains("rocm services stop svc-qwen --yes"));
-
-        let rendered = render_service_action_result(
-            "stop_server",
-            &serde_json::json!({
-                "output": {
-                    "status": "stopped",
-                    "result": {
-                        "service": {
-                            "service_id": "svc-qwen",
-                            "status": "stopped",
-                            "endpoint_url": "http://127.0.0.1:11435/v1"
-                        },
-                        "signaled_pids": [1234, 5678]
-                    }
-                }
-            }),
-        );
-
-        assert!(rendered.contains("Local server stopped"));
-        assert!(rendered.contains("service: svc-qwen"));
-        assert!(rendered.contains("status: stopped"));
-        assert!(rendered.contains("stopped processes: 2"));
     }
 
     #[test]

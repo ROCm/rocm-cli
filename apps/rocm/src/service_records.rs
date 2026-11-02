@@ -15,12 +15,13 @@
 //! `docs/architecture.md`. This module reads record state through
 //! `managed_service_status.rs` and `services_text.rs` (`load_managed_service`,
 //! `validate_service_id`) and builds its advice text with `service_hints.rs`;
-//! none of those modules depends on this one. `main.rs`'s `services()` calls
-//! `remove_managed_service_record`, `service_prune_min_age_hours` and
-//! `prune_managed_service_records`, and its clap `ServicesCommand::Prune`
-//! definition uses `DEFAULT_SERVICE_PRUNE_MIN_AGE_HOURS`; all four are
-//! `pub(crate)` and re-imported there. Every other item has no caller outside
-//! this module and stays private.
+//! none of those modules depends on this one. `services_cmd.rs`'s `services()`
+//! calls `remove_managed_service_record`, `service_prune_min_age_hours` and
+//! `prune_managed_service_records`, and `main.rs`'s clap
+//! `ServicesCommand::Prune` definition uses
+//! `DEFAULT_SERVICE_PRUNE_MIN_AGE_HOURS`, which `main.rs` re-imports; all four
+//! are `pub(crate)`. Every other item has no caller outside this module and
+//! stays private.
 //!
 //! The cluster's regression tests live in this module's own `mod tests`,
 //! reaching the shared `test_paths`, `plant_service_record` and
