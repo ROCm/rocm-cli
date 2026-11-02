@@ -14,10 +14,11 @@ Feature: ComfyUI install reports progress, makes failures actionable and preserv
   #
   # This scenario and comfyui-02/-03 below are hermetic and Windows-portable
   # (no `@requires-os:linux`), but nothing in required CI ran them on Windows
-  # until the required `windows-build-and-test` lane started selecting their
-  # ids explicitly via `E2E_ALSO_RUN_IDS` (see `docs/testing.md`'s "Install
-  # lifecycle" section) — before that, Windows coverage depended entirely on
-  # the optional, self-hosted `e2e-selfhosted.yml` lane.
+  # until the `windows-release` job of the required `windows-build-and-test` lane
+  # started selecting their ids explicitly via `E2E_ALSO_RUN_IDS` (see
+  # `docs/testing.md`'s "Install lifecycle" section) — before that, Windows
+  # coverage depended entirely on the optional, self-hosted
+  # `e2e-selfhosted.yml` lane.
   @id:comfyui-uv-install-failure-names-log
   Scenario: comfyui-01 - A failed dependency install names the log it wrote
     Given a ready ROCm runtime with a ComfyUI checkout pending dependencies
@@ -61,7 +62,7 @@ Feature: ComfyUI install reports progress, makes failures actionable and preserv
   # (`apps/rocm/src/dash_seam.rs`, which replays a real refusing subprocess), and
   # that such an envelope is then collapsed out of the chat, by
   # `approved_command_failure_stays_a_collapsed_envelope`
-  # (`crates/rocm-dash-tui/src/app/mod.rs`). The reasoning is written out at the
+  # (`crates/rocm-dash-tui/src/app/tool_approval.rs`). The reasoning is written out at the
   # seam that decides it (`execute_approved` in `apps/rocm/src/dash_seam.rs`).
   #
   # No GPU is needed: runtime readiness is filesystem + manifest state, so the

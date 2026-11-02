@@ -2012,9 +2012,11 @@ mod tests {
         // pre-setting it to the marker is cmd's equivalent of the unix
         // `read || echo`. A stdin left open blocks in `set /p` instead.
         //
-        // Both callers in `apps/rocmd/src/common.rs` run on Windows, and
-        // `run_with_timeout` has no `cfg(windows)` branch, so this covers the
-        // same promise with the same two-sidedness as the unix case.
+        // Both callers in `rocmd` run on Windows -- the amd-smi probe in
+        // `apps/rocmd/src/host_snapshot.rs` and the `rocm` capture that
+        // `apps/rocmd/src/common.rs` makes through `run_rocm_capture_with_env`
+        // -- and `run_with_timeout` has no `cfg(windows)` branch, so this covers
+        // the same promise with the same two-sidedness as the unix case.
         let fixture = WindowsFixture::script(
             "stdin",
             &format!(
