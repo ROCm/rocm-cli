@@ -16,13 +16,15 @@
 //! their pid and millisecond collide; a collision just moves on to the next
 //! attempt. A failed write or publish removes its temp file.
 //!
-//! On Windows, when the destination already exists, the publish uses
-//! `ReplaceFileW` rather than `rename`. `std::fs::rename` does replace an
-//! existing file there, but as `MoveFileExW` it fails with a sharing violation
-//! while another process holds the destination open, which is the case
-//! `ReplaceFileW` is used for. Two publishes of one file in flight at once
-//! through `ReplaceFileW` are not exercised by any test; the concurrency tests
-//! below run on Unix only.
+//! On Windows the publish tries `rename` first. `std::fs::rename` replaces an
+//! existing file in one step, so a lock-free reader (`RocmCliConfig::load`, the
+//! automation stores) finds the old or the new file and never an absent one.
+//! Only when that rename fails and the destination exists, which is the case of
+//! another process holding it open without delete sharing, does the publish
+//! fall back to `ReplaceFileW`. That fallback can leave the destination briefly
+//! absent, so it is the exception rather than the first choice. Two publishes of
+//! one file in flight at once through `ReplaceFileW` are not exercised by any
+//! test; the concurrency tests below run on Unix only.
 //!
 //! Atomic, not durable: neither the temp file nor its directory is fsynced
 //! before the publish. That survives a crashed process and a concurrent
@@ -242,15 +244,25 @@ pub fn publish_temp_file(tmp: &Path, path: &Path) -> io::Result<()> {
 #[cfg(windows)]
 #[doc(hidden)]
 pub fn publish_temp_file(tmp: &Path, path: &Path) -> io::Result<()> {
-    if path.try_exists()? {
-        return replace_file_windows(path, tmp);
-    }
+    publish_rename_first(tmp, path, fs::rename, replace_file_windows)
+}
 
-    match fs::rename(tmp, path) {
+/// The Windows publish order, with both steps passed in so a test can check it
+/// on any host: `rename` first, because it replaces in one step and never
+/// leaves the destination absent; `replace` only when the rename failed and the
+/// destination exists. A failed rename onto a destination that does not exist is
+/// returned as it is, since `replace` has nothing to replace.
+#[cfg(any(windows, test))]
+fn publish_rename_first<R, P>(tmp: &Path, path: &Path, rename: R, replace: P) -> io::Result<()>
+where
+    R: FnOnce(&Path, &Path) -> io::Result<()>,
+    P: FnOnce(&Path, &Path) -> io::Result<()>,
+{
+    match rename(tmp, path) {
         Ok(()) => Ok(()),
         Err(rename_error) => {
             if path.try_exists()? {
-                replace_file_windows(path, tmp)
+                replace(path, tmp)
             } else {
                 Err(rename_error)
             }
@@ -369,6 +381,130 @@ mod tests {
             vec!["artifact.tar.gz".to_owned()],
             "only the occupied destination should remain"
         );
+    }
+
+    /// The Windows publish order: `rename` is tried first so the destination is
+    /// never absent, and `ReplaceFileW` is reached only after a failed rename
+    /// onto a destination that exists. Runs on every host because the order is
+    /// a plain function of the two injected steps.
+    #[test]
+    fn windows_publish_renames_first_and_skips_the_replace_when_it_succeeds() {
+        let root = scratch_dir("publish-rename-first");
+        fs::create_dir_all(&root).unwrap();
+        // The destination must exist: with it absent, no ordering of the two
+        // steps would reach the replace, so the test could not tell them apart.
+        let existing = root.join("existing");
+        fs::write(&existing, b"old").unwrap();
+        let replaced = std::cell::Cell::new(false);
+        let renamed = std::cell::Cell::new(false);
+        publish_rename_first(
+            Path::new("tmp"),
+            &existing,
+            |_, _| {
+                renamed.set(true);
+                Ok(())
+            },
+            |_, _| {
+                replaced.set(true);
+                Ok(())
+            },
+        )
+        .expect("a successful rename is the whole publish");
+        let _ = fs::remove_dir_all(&root);
+        assert!(renamed.get(), "the rename must be tried first");
+        assert!(
+            !replaced.get(),
+            "ReplaceFileW must not run after a rename that worked"
+        );
+    }
+
+    #[test]
+    fn windows_publish_falls_back_to_the_replace_only_for_an_existing_destination() {
+        let root = scratch_dir("publish-fallback");
+        fs::create_dir_all(&root).unwrap();
+        let existing = root.join("existing");
+        fs::write(&existing, b"old").unwrap();
+        let sharing = || Err(io::Error::from(io::ErrorKind::PermissionDenied));
+
+        let replaced = std::cell::Cell::new(None);
+        publish_rename_first(
+            Path::new("tmp"),
+            &existing,
+            |_, _| sharing(),
+            |path, tmp| {
+                replaced.set(Some((path.to_path_buf(), tmp.to_path_buf())));
+                Ok(())
+            },
+        )
+        .expect("the fallback result is the publish result");
+        assert_eq!(
+            replaced.take(),
+            Some((existing, PathBuf::from("tmp"))),
+            "the fallback replaces the destination with the staged file"
+        );
+
+        let missing = root.join("missing");
+        let called = std::cell::Cell::new(false);
+        let error = publish_rename_first(
+            Path::new("tmp"),
+            &missing,
+            |_, _| sharing(),
+            |_, _| {
+                called.set(true);
+                Ok(())
+            },
+        )
+        .expect_err("a failed rename onto a missing destination is an error");
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(
+            !called.get(),
+            "there is nothing for ReplaceFileW to replace"
+        );
+    }
+
+    /// A reader that polls the destination while a writer replaces it over and
+    /// over must never find it missing: that is what a lock-free reader of the
+    /// config or an automation store would read as an empty store. Runs on the
+    /// native Windows job as well as Unix, where `publish_temp_file` is the
+    /// rename-first path. A transient permission error while a replace is in
+    /// flight is tolerated; an absent destination is not.
+    #[test]
+    fn a_reader_never_finds_the_destination_absent_while_it_is_replaced() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let root = scratch_dir("atomic-reader-gap");
+        fs::create_dir_all(&root).unwrap();
+        let destination = root.join("store.json");
+        write_file_atomically(&destination, b"0").unwrap();
+
+        let done = Arc::new(AtomicBool::new(false));
+        let reader = {
+            let destination = destination.clone();
+            let done = Arc::clone(&done);
+            std::thread::spawn(move || {
+                let mut reads = 0u32;
+                while !done.load(Ordering::Relaxed) {
+                    match fs::read(&destination) {
+                        Ok(_) => reads += 1,
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                            return Err(error);
+                        }
+                        Err(_) => {}
+                    }
+                }
+                Ok(reads)
+            })
+        };
+        for round in 1..=300u32 {
+            write_file_atomically(&destination, round.to_string().as_bytes()).unwrap();
+        }
+        done.store(true, Ordering::Relaxed);
+        let outcome = reader.join().unwrap();
+        let _ = fs::remove_dir_all(&root);
+        let reads = outcome.expect("the destination was absent while it was being replaced");
+        assert!(reads > 0, "the reader never read the destination at all");
     }
 
     #[test]

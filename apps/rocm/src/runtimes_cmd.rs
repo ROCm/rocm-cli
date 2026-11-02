@@ -1802,9 +1802,9 @@ pub(crate) fn active_runtime_marker_path(paths: &AppPaths) -> PathBuf {
 /// directory at once (two terminals, a script), so the write goes through the
 /// shared atomic writer: each writer stages into its own exclusively created
 /// temp file, and the marker is replaced rather than removed first, so a
-/// reader always finds a complete marker. On Windows the replace goes through
-/// `ReplaceFileW`, and two replacements in flight at once there are not
-/// tested. It does not order the two activations: the last one to publish
+/// reader always finds a complete marker. On Windows the replace is a
+/// `rename`, falling back to `ReplaceFileW` only when that fails, and two
+/// replacements in flight at once through the fallback are not tested. It does not order the two activations: the last one to publish
 /// wins, as before.
 fn write_active_runtime_marker(paths: &AppPaths, marker: ActiveRuntimeMarker) -> Result<()> {
     let path = active_runtime_marker_path(paths);
@@ -1812,7 +1812,7 @@ fn write_active_runtime_marker(paths: &AppPaths, marker: ActiveRuntimeMarker) ->
     // write the failed-activation restore uses, and it is strictly stronger than
     // a bare `fs::rename`, which on Windows is `MoveFileExW` and fails with a
     // sharing violation when another process holds the marker open. The helper
-    // uses `ReplaceFileW` there whenever the destination exists. The
+    // renames first there and falls back to `ReplaceFileW` when that fails. The
     // destination is never removed first, on any platform — that would leave a
     // window with no marker at all, which runtime resolution and the storage
     // retention holds both read as "nothing is active" — and a failed publish
@@ -2252,9 +2252,8 @@ pub(crate) mod tests {
     /// probability per round rather than deterministically; against the
     /// current writer nothing in it is timing-dependent. Unix only: the
     /// property under test is that `rename` replaces in one step. The Windows
-    /// publish path goes through `ReplaceFileW` instead, whose behaviour with
-    /// two replacements of one file in flight this test has not been run
-    /// against.
+    /// publish tries `rename` first too, but this test has not been run
+    /// against it there, nor against the `ReplaceFileW` fallback.
     #[cfg(unix)]
     #[test]
     fn concurrent_active_runtime_marker_writes_keep_a_complete_marker_published() -> Result<()> {
