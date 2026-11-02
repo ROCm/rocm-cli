@@ -18,6 +18,12 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+mod archive_extract;
+/// Shared archive generator and filesystem oracle for the extraction property
+/// tests in `archive_extract` and `install`.
+#[cfg(all(test, unix))]
+#[path = "../../../crates/rocm-core/src/archive_props.rs"]
+mod archive_props;
 mod backend_alignment;
 mod direct_llama;
 mod install;
