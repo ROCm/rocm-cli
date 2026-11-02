@@ -242,7 +242,12 @@ pub fn command_failure_detail(output: &std::process::Output) -> String {
 /// diagnostic left — and inlining the two `is_empty` checks there to get it put
 /// the same rule in two places. `fallback` is a closure because formatting an
 /// `ExitStatus` is wasted work on the overwhelmingly common non-blank path.
-pub fn command_failure_detail_or_else(
+///
+/// `pub(crate)`, not `pub`: the only caller outside this module is
+/// [`amd_smi_json`], also in this crate. External callers that want the
+/// precedence rule want [`command_failure_detail`], which is the public pair of
+/// this and carries the fallback they would otherwise have to supply.
+pub(crate) fn command_failure_detail_or_else(
     output: &std::process::Output,
     fallback: impl FnOnce() -> String,
 ) -> String {

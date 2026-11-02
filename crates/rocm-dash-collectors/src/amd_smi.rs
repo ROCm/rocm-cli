@@ -94,12 +94,14 @@ impl AmdSmiCollector {
         gpu_reachable: bool,
         host_kfd_device: &Path,
     ) -> Option<Self> {
-        if !preflight_passes(
+        if !preflight_passes_off_thread(
             skip_device_preflight,
             gpu_reachable,
             Path::new(KFD_DEVICE),
             host_kfd_device,
-        ) {
+        )
+        .await
+        {
             return None;
         }
         let me = Self {
@@ -163,6 +165,46 @@ impl AmdSmiCollector {
             .map_err(|_| io::Error::other(format!("amd-smi {args:?} timed out")))??;
         serde_json::from_str(&s).map_err(|e| io::Error::other(format!("parse: {e}")))
     }
+}
+
+/// [`preflight_passes`] moved off the async worker thread.
+///
+/// The device branch of the pre-flight blocks: `device_accessible` waits on a
+/// bounded `open`, up to `rocm_core`'s 2s `KFD_OPEN_TIMEOUT` per probe, and
+/// under a simulated host root there are two probes, so ~4s. The only caller is
+/// an `async fn` reached from a `tokio::spawn` in `rocm-dash-daemon`'s run
+/// loop, and AGENTS.md puts blocking work on the blocking pool rather than on
+/// an async worker.
+///
+/// Deliberately no `timeout` wrapped around the `spawn_blocking`: that would
+/// drop only the `JoinHandle` and leave the blocking thread running, and the
+/// probe is already bounded from the inside, which is the bound that matters.
+///
+/// The two non-device branches short-circuit *before* the thread hop, so a
+/// caller that skips the pre-flight or already knows the GPU is reachable pays
+/// nothing and -- relevant to the `#[doc(hidden)]` skip entry point -- never
+/// needs a runtime with a blocking pool at all.
+///
+/// A `JoinError` reads as "not readable", matching
+/// `device_readable_within_budget`: every branch that fails to get an answer
+/// declines rather than falling back to a blocking open on the caller's thread.
+async fn preflight_passes_off_thread(
+    skip_device_preflight: bool,
+    gpu_reachable: bool,
+    real_kfd_device: &Path,
+    host_kfd_device: &Path,
+) -> bool {
+    if skip_device_preflight || gpu_reachable {
+        return true;
+    }
+    // Owned: `spawn_blocking` needs a `'static` closure.
+    let real_kfd_device = real_kfd_device.to_path_buf();
+    let host_kfd_device = host_kfd_device.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        preflight_passes(false, false, &real_kfd_device, &host_kfd_device)
+    })
+    .await
+    .unwrap_or(false)
 }
 
 /// The device pre-flight passes if the caller already skipped it, already
@@ -489,6 +531,94 @@ mod tests {
             !preflight_passes(false, false, &real_missing, &host_missing),
             "neither readable: amd-smi does not run"
         );
+    }
+
+    /// A FIFO under `root`, or `None` (with a visible skip notice) on a host
+    /// with no `mkfifo(1)`.
+    ///
+    /// Shelled out rather than calling `libc::mkfifo`, because the workspace
+    /// lints deny `unsafe_code` — the same reason, and the same shape, as
+    /// `rocm_core::amd_smi`'s test helper of this name.
+    #[cfg(target_os = "linux")]
+    fn make_fifo(root: &Path, name: &str) -> Option<std::path::PathBuf> {
+        let fifo = root.join(name);
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        if matches!(&made, Ok(status) if status.success()) {
+            return Some(fifo);
+        }
+        eprintln!(
+            "skip: no usable mkfifo(1), so the off-thread pre-flight check cannot be exercised \
+             here; this assertion did NOT run"
+        );
+        None
+    }
+
+    /// The blocking pre-flight must not be run on the async worker.
+    ///
+    /// `device_readable_bounded` parks its caller for up to `rocm_core`'s 2s
+    /// `KFD_OPEN_TIMEOUT`, and the only production caller is an `async fn`
+    /// reached from `rocm-dash-daemon`'s `tokio::spawn`. A single-worker
+    /// (`current_thread`) runtime is what makes the difference observable: a
+    /// ticker task can only make progress while the pre-flight is *not*
+    /// occupying the one worker, so an inline `preflight_passes` — the shape
+    /// this had before — records zero ticks, while the `spawn_blocking` version
+    /// lets the ticker run for the whole ~2s probe.
+    ///
+    /// The device is a FIFO with no writer, the same real blocking `open` the
+    /// `rocm-core` probe tests use: against an ordinary missing path the open
+    /// fails instantly and the test could pass without proving anything.
+    ///
+    /// Linux-only: off Linux `device_readable_bounded` is a direct unbounded
+    /// open, which on this FIFO would never return at all.
+    #[tokio::test(flavor = "current_thread")]
+    #[cfg(target_os = "linux")]
+    async fn the_device_preflight_does_not_run_on_the_async_worker() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let Some(fifo) = make_fifo(dir.path(), "blocking-kfd") else {
+            return;
+        };
+
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let ticker_ticks = Arc::clone(&ticks);
+        let ticker = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                ticker_ticks.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        let passed = preflight_passes_off_thread(false, false, &fifo, &fifo).await;
+        ticker.abort();
+        let observed = ticks.load(Ordering::Relaxed);
+
+        assert!(
+            !passed,
+            "a device whose open never returns must fail the pre-flight, or the timing \
+             assertion below proves nothing"
+        );
+        assert!(
+            observed >= 5,
+            "the async worker was parked by the pre-flight: a 20ms ticker got {observed} ticks \
+             during a ~2s blocking probe, so the probe is not on the blocking pool"
+        );
+    }
+
+    /// The two non-device branches answer without a thread hop, so they stay
+    /// usable on a runtime with no blocking pool — notably the `#[doc(hidden)]`
+    /// skip entry point the daemon integration tests use.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_short_circuit_branches_need_no_blocking_pool() {
+        let missing = Path::new("/nonexistent/kfd");
+        assert!(preflight_passes_off_thread(true, false, missing, missing).await);
+        assert!(preflight_passes_off_thread(false, true, missing, missing).await);
     }
 
     const SAMPLE_METRIC: &str = r#"{

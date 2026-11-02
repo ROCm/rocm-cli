@@ -565,6 +565,7 @@ mod tests {
         // WSL is waved through deliberately, so the blocked case cannot hold
         // there.
         if is_wsl_host() {
+            skip_notice("this is a WSL host, which the KFD gate waves through by design");
             return Ok(());
         }
         let _host_root = host_root_guard();
@@ -826,7 +827,9 @@ mod tests {
     ///
     /// Shelled out rather than calling `libc::mkfifo`, because the workspace
     /// lints deny `unsafe_code`. A missing coreutils is not evidence about the
-    /// probe, so the caller skips rather than fails.
+    /// probe, so the caller skips rather than fails — but it says so on stderr
+    /// (see [`skip_notice`]), because a silent skip here is a green result for
+    /// a test that checked nothing.
     #[cfg(target_os = "linux")]
     fn make_fifo(root: &Path, name: &str) -> Option<PathBuf> {
         let fifo = root.join(name);
@@ -836,7 +839,25 @@ mod tests {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
-        matches!(&made, Ok(status) if status.success()).then_some(fifo)
+        if matches!(&made, Ok(status) if status.success()) {
+            return Some(fifo);
+        }
+        skip_notice("no usable mkfifo(1), so no device whose open really blocks can be built here");
+        None
+    }
+
+    /// Announce that a test gave up without asserting its subject.
+    ///
+    /// Every conditional skip in this module goes through here. The tests that
+    /// have one are the ones that need a host feature (`mkfifo(1)`) or a host
+    /// *shape* (bare-metal Linux rather than WSL) to have anything to assert;
+    /// where that is missing they return `Ok(())`, which is indistinguishable
+    /// from a pass unless something says otherwise. `cargo test` shows this on
+    /// a failing run and under `--nocapture`; matches the `skip:` form already
+    /// used in `rocm-dash-daemon`'s server and end-to-end tests.
+    #[cfg(target_os = "linux")]
+    fn skip_notice(reason: &str) {
+        eprintln!("skip: {reason}; this assertion did NOT run");
     }
 
     /// Pins the production wiring the injected helpers cannot: that
@@ -954,6 +975,9 @@ mod tests {
         const PAYLOAD_CHARS: usize = 200_000;
 
         if is_wsl_host() {
+            // The gate waves WSL through, so the fake amd-smi would run and
+            // this would stop testing the quote bound rather than the gate.
+            skip_notice("this is a WSL host, where the gate does not reach the launch path");
             return Ok(());
         }
 
