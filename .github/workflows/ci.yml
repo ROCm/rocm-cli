@@ -587,7 +587,9 @@ jobs:
   # joined by `windows-build-and-test` below. One serial job was the longest pole
   # of the whole run (it alone decided when CI went green); the debug side
   # (clippy, build, test, smoke) and the release side (release build, install
-  # lifecycle, PR bundle) share no outputs, so they run side by side.
+  # lifecycle, PR bundle) share no outputs, so they run side by side. The one
+  # thing the release side gives up is the debug build's warm-up of the e2e
+  # harness's dev-profile dependencies, which it now compiles for itself.
   #
   # Neither job waits for `clippy` or `prek`. Those stay required checks in their
   # own right, so a lint failure still blocks the merge. What this trades is about

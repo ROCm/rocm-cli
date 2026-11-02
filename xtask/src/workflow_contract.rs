@@ -4392,11 +4392,46 @@ fi
             .join("\n")
     }
 
+    /// The `env:` entries of the aggregator's one step as `(variable, value)`
+    /// pairs, comments dropped. These are what bind the script's variables to the
+    /// `needs.<job>.result` it reads.
+    fn aggregator_env(aggregator: &str) -> Vec<(String, String)> {
+        let code = code_only(aggregator);
+        let mut lines = code.lines().skip_while(|line| line.trim() != "env:");
+        let Some(head) = lines.next() else {
+            return Vec::new();
+        };
+        let indent = indent_of(head);
+        lines
+            .filter(|line| !line.trim().is_empty())
+            .take_while(|line| indent_of(line) > indent)
+            .filter_map(|line| line.trim().split_once(':'))
+            .map(|(key, value)| (key.trim().to_owned(), value.trim().to_owned()))
+            .collect()
+    }
+
+    /// The one variable the aggregator binds to `expr`; panics unless it is exactly one.
+    fn aggregator_var(env: &[(String, String)], expr: &str) -> String {
+        let vars: Vec<&str> = env
+            .iter()
+            .filter(|(_, value)| value == expr)
+            .map(|(key, _)| key.as_str())
+            .collect();
+        assert_eq!(
+            vars.len(),
+            1,
+            "the aggregator must bind exactly one env variable to `{expr}`, found {vars:?} in {env:?}"
+        );
+        vars[0].to_owned()
+    }
+
     /// `windows-build-and-test` is the one Windows check branch protection knows
     /// by name. The work is split across other jobs, which are NOT required checks
     /// themselves, so a work job the aggregator does not wait on can fail and still
     /// let a merge through. Every job in the Windows lane must therefore be named in
-    /// the aggregator's `needs:` and have its result read by the script.
+    /// the aggregator's `needs:`, bound to a variable by its own `needs.<job>.result`,
+    /// and have that variable checked by the script. The job and its one step carry
+    /// nothing that could skip it or hide a failure.
     #[test]
     fn ci_windows_aggregator_requires_every_windows_job() {
         let ci = read_workflow("ci.yml");
@@ -4411,21 +4446,18 @@ fi
         let needs = yaml_value_at(&aggregator, 4, "needs")
             .expect("windows-build-and-test declares `needs:`");
         let needed = flattened_list_items(&needs);
-        let code = code_only(&aggregator);
         let script = aggregator_script(&aggregator);
+        let env = aggregator_env(&aggregator);
         for (job, _) in &workers {
             assert!(
                 needed.iter().any(|n| n == job),
                 "windows-build-and-test must `need` {job}, or {job} can fail without \
                  failing the required check (needs: {needed:?})"
             );
+            let var = aggregator_var(&env, &format!("${{{{ needs.{job}.result }}}}"));
             assert!(
-                code.contains(&format!("needs.{job}.result")),
-                "windows-build-and-test must read needs.{job}.result"
-            );
-            assert!(
-                script.contains(&format!("check {job} ")),
-                "the aggregator script must check {job}'s result:\n{script}"
+                script.contains(&format!("check {job} \"${var}\" ")),
+                "the aggregator script must check {job}'s result through ${var}:\n{script}"
             );
         }
         assert!(
@@ -4433,11 +4465,68 @@ fi
             "the aggregator must also need `changes`: a failed `changes` skips every \
              work job, and a skipped required check reads as passing"
         );
+        let changes_var = aggregator_var(&env, "${{ needs.changes.result }}");
         assert!(
-            code.contains("!cancelled()") && !code.contains("always()"),
-            "the aggregator uses `!cancelled()`, so a run superseded by a new commit \
-             still cancels it:\n{aggregator}"
+            script.contains(&format!("check changes \"${changes_var}\" success")),
+            "the aggregator script must require `changes` to have succeeded through \
+             ${changes_var}:\n{script}"
         );
+
+        assert_eq!(
+            yaml_value_at(&aggregator, 4, "if").as_deref(),
+            Some("${{ !cancelled() }}"),
+            "the aggregator runs unless the run is cancelled, so a run superseded by a \
+             new commit still cancels it, and no other condition can skip it: a skipped \
+             required check reads as passing"
+        );
+        assert_eq!(
+            yaml_value_at(&aggregator, 4, "runs-on").as_deref(),
+            Some("ubuntu-latest"),
+            "the aggregator must run on a Linux runner so the script's `bash` is the one \
+             the script test executes"
+        );
+        let steps = job_steps(&aggregator).expect("the aggregator has steps");
+        assert_eq!(
+            steps.len(),
+            1,
+            "the aggregator is exactly one step, so no other step can fail it or skip it"
+        );
+        let step = &steps[0].1;
+        let key_indent = indent_of(step.lines().next().expect("a step has a first line")) + 2;
+        for key in ["if", "continue-on-error", "shell"] {
+            assert!(
+                yaml_value_at(step, key_indent, key).is_none(),
+                "the aggregator's step must not set `{key}`, which would change when it \
+                 runs or whether its failure counts:\n{step}"
+            );
+        }
+    }
+
+    /// The jobs the aggregator must wait on are found by runner, with anything not
+    /// shown to be Linux presumed Windows, so a `runs-on` the helper cannot read
+    /// cannot slip a job past the aggregator tests.
+    #[test]
+    fn windows_work_jobs_presumes_windows_unless_shown_to_be_linux() {
+        let ci = "jobs:\n\
+                  \x20 lint:\n\
+                  \x20   runs-on: ubuntu-latest\n\
+                  \x20 pinned:\n\
+                  \x20   runs-on: ubuntu-24.04\n\
+                  \x20 matrix:\n\
+                  \x20   runs-on: ${{ matrix.os }}\n\
+                  \x20 selfhosted:\n\
+                  \x20   runs-on: [self-hosted, linux]\n\
+                  \x20 windows:\n\
+                  \x20   runs-on: windows-latest\n\
+                  \x20 powershell-lint:\n\
+                  \x20   runs-on: windows-latest\n\
+                  \x20 windows-build-and-test:\n\
+                  \x20   runs-on: ubuntu-latest\n";
+        let ids: Vec<String> = windows_work_jobs(ci)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(ids, ["matrix", "selfhosted", "windows"]);
     }
 
     /// Whether the Windows jobs run is decided once, as the `changes` job's
@@ -4483,8 +4572,7 @@ fi
             "the aggregator must not set continue-on-error"
         );
 
-        for job in ["windows-debug", "windows-release"] {
-            let block = ci_job(&ci, job);
+        for (job, block) in windows_work_jobs(&ci) {
             assert_eq!(
                 yaml_value_at(&block, 4, "needs").as_deref(),
                 Some("changes"),
@@ -4515,14 +4603,21 @@ fi
     #[test]
     fn ci_windows_aggregator_passes_only_when_every_job_succeeded() {
         let ci = read_workflow("ci.yml");
-        let script = aggregator_script(&ci_job(&ci, "windows-build-and-test"));
+        let aggregator = ci_job(&ci, "windows-build-and-test");
+        let script = aggregator_script(&aggregator);
+        // The variable names come from the workflow's own bindings, so a binding
+        // that feeds the script the wrong job's result is run as written.
+        let env = aggregator_env(&aggregator);
+        let changes_var = aggregator_var(&env, "${{ needs.changes.result }}");
+        let debug_var = aggregator_var(&env, "${{ needs.windows-debug.result }}");
+        let release_var = aggregator_var(&env, "${{ needs.windows-release.result }}");
 
         let run = |changes: &str, debug: &str, release: &str, expect_skipped: &str| -> i32 {
             let out = std::process::Command::new("bash")
                 .args(["-e", "-c", &script])
-                .env("CHANGES_RESULT", changes)
-                .env("DEBUG_RESULT", debug)
-                .env("RELEASE_RESULT", release)
+                .env(&changes_var, changes)
+                .env(&debug_var, debug)
+                .env(&release_var, release)
                 .env("EXPECT_SKIPPED", expect_skipped)
                 .output()
                 .expect("running the aggregator script");
