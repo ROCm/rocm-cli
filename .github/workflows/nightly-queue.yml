@@ -1,0 +1,52 @@
+# Nightly E2E on the shared GPU queue — the publishing side.
+#
+# The nightly itself runs next to the queue, on its own schedule, and leaves its
+# results where the queue-report runner can read them. This job only publishes
+# a finished run: it prints the run's report and lane matrix, uploads the lanes'
+# files, and passes or fails with the run's verdict. It needs no credential, so
+# the shared self-hosted runner never holds the queue's. What that does and does
+# not protect is in docs/nightly-on-the-queue.md.
+name: Nightly E2E (queue)
+
+on:
+  # Manual only, and gating nothing, until the lane image carries the suite and
+  # the published verdict can be trusted (see the doc). The run itself is not
+  # scheduled before then either. A schedule will replace this, set after the
+  # run's deadline, or it would find that night's run still going and fail.
+  workflow_dispatch:
+    inputs:
+      request_id:
+        description: "The run to publish; empty publishes the newest scheduled run, which must have finished"
+        type: string
+        default: ""
+
+# Nothing here reads the repository. Uploading files uses the per-job runtime
+# token GitHub issues to every job regardless of these permissions.
+permissions: {}
+
+concurrency:
+  group: nightly-queue
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish nightly results
+    runs-on: [queue-report]
+    # Reads and uploads files a finished run left; nothing here waits on GPUs.
+    timeout-minutes: 15
+    steps:
+      - name: Publish the run
+        env:
+          REQUEST_ID: ${{ inputs.request_id }}
+        # One line: the workflow contract forbids backslashes in this file.
+        run: /opt/queue/bin/queue-publish --out "${RUNNER_TEMP}/results" --request "${REQUEST_ID}"
+
+      - name: Upload lane results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nightly-queue-results
+          path: ${{ runner.temp }}/results
+          # The publisher's files only; a lane's hidden files are not published.
+          include-hidden-files: false
+          if-no-files-found: warn

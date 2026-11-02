@@ -1654,7 +1654,9 @@ jobs:
         }
     }
 
-    /// Both self-hosted workflows, so a lane added to either is covered.
+    /// Both self-hosted workflows that run GPU lanes, so a lane added to either is
+    /// covered. `nightly-queue.yml` also runs self-hosted but runs no GPU lane;
+    /// `queue_nightly_publisher_holds_no_credential` covers it.
     fn self_hosted_workflows() -> [(&'static str, String); 2] {
         [
             ("e2e-selfhosted.yml", read_workflow("e2e-selfhosted.yml")),
@@ -8701,5 +8703,225 @@ permissions:
             unchecked_native_commands(&["cargo build", "exit 0"]),
             ["cargo build"]
         );
+    }
+
+    #[test]
+    fn queue_nightly_publisher_holds_no_credential() {
+        // The queue-report runner is persistent, and any job that names its label
+        // can run on it, so the publishing job must not bring a credential onto
+        // it. A credential reaches a job through an expression, an action that
+        // takes the job token by default, an environment, a permission, or a
+        // runtime variable, so this is an allowlist over all of those rather than
+        // a list of known spellings where one is possible: expressions and actions
+        // are allowlisted, permissions must be empty, and environments and
+        // runtime-token variables are refused outright.
+        let text = read_workflow("nightly-queue.yml");
+
+        // The checks below read text, not parsed YAML, so first rule out the YAML
+        // that decodes to something other than it reads: escape sequences (only
+        // double-quoted scalars have them), explicit `? key` entries, and anchors
+        // and aliases (`&a` / `*a`), which can stand in for a key. A plain
+        // workflow needs none of them.
+        assert!(
+            !text.contains('\\'),
+            "nightly-queue.yml contains a backslash; a YAML escape could spell a forbidden \
+             key or expression past these checks"
+        );
+        assert!(
+            !text.lines().any(|line| {
+                let line = line.trim_start().trim_start_matches('-').trim_start();
+                line == "?" || line.starts_with("? ")
+            }),
+            "nightly-queue.yml uses an explicit `? key` entry, which these checks cannot read"
+        );
+        assert!(
+            !without_comments(&text).contains(['&', '*']),
+            "nightly-queue.yml contains `&` or `*`, banned outright here because a YAML anchor \
+             or alias could stand in for a key these checks read"
+        );
+
+        // Expressions and keys can be written in any case, spacing or quoting.
+        // Lines keep their breaks; comments are kept too, because GitHub
+        // substitutes expressions inside a `run:` script, shell comments included.
+        let flatten = |text: &str| -> String {
+            text.to_lowercase()
+                .chars()
+                .filter(|c| *c == '\n' || !(c.is_whitespace() || *c == '"' || *c == '\''))
+                .collect()
+        };
+        let flat = flatten(&text);
+        let expressions: Vec<&str> = flat
+            .match_indices("${{")
+            .map(|(start, _)| {
+                let end = flat[start..]
+                    .find("}}")
+                    .expect("every ${{ in nightly-queue.yml is closed");
+                &flat[start..start + end + 2]
+            })
+            .collect();
+        for expression in &expressions {
+            assert!(
+                ["${{inputs.request_id}}", "${{runner.temp}}"].contains(expression),
+                "nightly-queue.yml evaluates `{expression}`: only the request id and the \
+                 runner's temp directory may be read, so no secret or token can reach the \
+                 shared runner (see docs/nightly-on-the-queue.md)"
+            );
+        }
+
+        // Keys, by contrast, are only keys outside comments.
+        let keys = flatten(&without_comments(&text));
+        for (start, _) in keys.match_indices("uses:") {
+            let value: String = keys[start + "uses:".len()..]
+                .chars()
+                .take_while(|c| {
+                    c.is_ascii_alphanumeric() || matches!(c, '/' | '@' | '.' | '_' | '-')
+                })
+                .collect();
+            let pinned = value
+                .strip_prefix("actions/upload-artifact@")
+                .is_some_and(|sha| sha.len() == 40 && sha.chars().all(|c| c.is_ascii_hexdigit()));
+            assert!(
+                pinned,
+                "nightly-queue.yml uses `{value}`: only upload-artifact, pinned to a full commit \
+                 SHA, may run there, since another action could take the job token by default"
+            );
+        }
+        for forbidden in ["environment:", "actions_runtime_token", "actions_id_token"] {
+            assert!(
+                !keys.contains(forbidden),
+                "nightly-queue.yml mentions `{forbidden}`, which would bring a credential to \
+                 the shared runner"
+            );
+        }
+        assert_eq!(
+            keys.matches("permissions:").count(),
+            1,
+            "nightly-queue.yml must declare permissions once, at the top, so no job widens them"
+        );
+        assert_eq!(
+            top_level_block(&without_comments(&text), "permissions").trim(),
+            "{}",
+            "nightly-queue.yml must grant no permissions: the job only uploads files"
+        );
+
+        // The workflow itself: dispatched by hand only, routed to the reporting
+        // runner, uploading only the results it was given, and never hidden files.
+        let plain = without_comments(&text);
+        let on = top_level_block(&plain, "on");
+        let triggers: Vec<&str> = on
+            .lines()
+            .filter(|line| indent_of(line) == 2)
+            .map(str::trim)
+            .collect();
+        assert_eq!(
+            triggers,
+            ["workflow_dispatch:"],
+            "nightly-queue.yml must be dispatched by hand only"
+        );
+        assert_eq!(
+            runs_on_values(&plain),
+            ["[queue-report]"],
+            "nightly-queue.yml must run on the queue-report runner, which carries that label \
+             alone"
+        );
+        let upload: Vec<&str> = plain
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("path:") || line.starts_with("include-hidden-files:"))
+            .collect();
+        assert_eq!(
+            upload,
+            [
+                "path: ${{ runner.temp }}/results",
+                "include-hidden-files: false"
+            ],
+            "nightly-queue.yml must upload only the published results, and no hidden files"
+        );
+
+        // The runner is registered with `queue-report` alone, without GitHub's
+        // default `self-hosted`, OS and architecture labels, so only a job naming
+        // that literal label lands on it. No other workflow on `main` may name it,
+        // nor name this workflow, which is how another one would wait on its
+        // result; it gates nothing. This catches a mistake on `main`, not an
+        // attempt to hide one: a workflow on any other branch can name the label
+        // anyway, which is why the runner holds nothing worth taking.
+        let workflow_name = strip_comment(&top_level_block(&plain, "name")).to_owned();
+        let dir = repo_root().join(".github/workflows");
+        for entry in std::fs::read_dir(&dir).expect("reading .github/workflows") {
+            let name = entry.expect("workflow dir entry").file_name();
+            let name = name.to_string_lossy();
+            if name == "nightly-queue.yml" || !(name.ends_with(".yml") || name.ends_with(".yaml")) {
+                continue;
+            }
+            let found = queue_runner_references(&read_workflow(&name), &workflow_name);
+            assert!(
+                found.is_empty(),
+                "{name} names {found:?}: only nightly-queue.yml may use the queue-report runner, \
+                 and no workflow may depend on nightly-queue.yml, which gates nothing (see \
+                 docs/nightly-on-the-queue.md)"
+            );
+        }
+    }
+
+    /// What in `workflow` would route a job to the queue-report runner or make
+    /// it depend on the workflow named `queue_workflow_name`: the runner's
+    /// label, the workflow's file stem, or its name. Compared with case, quotes
+    /// and every whitespace character (line breaks included) removed, so a name
+    /// split across lines still counts; comments do not.
+    fn queue_runner_references(workflow: &str, queue_workflow_name: &str) -> Vec<String> {
+        let squeeze = |text: &str| -> String {
+            text.to_lowercase()
+                .chars()
+                .filter(|c| !(c.is_whitespace() || *c == '"' || *c == '\''))
+                .collect()
+        };
+        let text = squeeze(&without_comments(workflow));
+        [
+            "queue-report".to_owned(),
+            "nightly-queue".to_owned(),
+            squeeze(queue_workflow_name),
+        ]
+        .into_iter()
+        .filter(|reference| text.contains(reference.as_str()))
+        .collect()
+    }
+
+    #[test]
+    fn queue_runner_references_catches_each_way_of_naming_the_queue() {
+        let name = r#""Nightly E2E (queue)""#;
+        let job = |body: &str| format!("jobs:\n  build:\n{body}\n");
+        for (workflow, expected) in [
+            (job("    runs-on: [queue-report]"), vec!["queue-report"]),
+            (
+                job("    runs-on: [self-hosted, Queue-Report]"),
+                vec!["queue-report"],
+            ),
+            (job("    runs-on: \"queue-report\""), vec!["queue-report"]),
+            (
+                "on:\n  workflow_run:\n    workflows: [\"Nightly E2E (queue)\"]\n".to_owned(),
+                vec!["nightlye2e(queue)"],
+            ),
+            (
+                "on:\n  workflow_run:\n    workflows:\n      - Nightly E2E\n        (queue)\n"
+                    .to_owned(),
+                vec!["nightlye2e(queue)"],
+            ),
+            (
+                job("    uses: ./.github/workflows/nightly-queue.yml"),
+                vec!["nightly-queue"],
+            ),
+            (job("    runs-on: ubuntu-latest"), vec![]),
+            (job("    runs-on: [self-hosted, linux, mi300x]"), vec![]),
+            (
+                job("    runs-on: ubuntu-latest\n    # moved off queue-report and nightly-queue"),
+                vec![],
+            ),
+        ] {
+            assert_eq!(
+                queue_runner_references(&workflow, name),
+                expected,
+                "references found in:\n{workflow}"
+            );
+        }
     }
 }
