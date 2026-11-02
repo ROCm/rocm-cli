@@ -17,9 +17,9 @@ cargo test --workspace --all-targets
 ```
 
 Note that `cargo test` runs every test as a thread in **one process**, which is
-also what the required `windows-build-and-test` lane does. See
-[Tests that touch the environment](#tests-that-touch-the-environment) before
-writing a test that sets an environment variable.
+also what the `windows-debug` job of the required `windows-build-and-test` lane
+does. See [Tests that touch the environment](#tests-that-touch-the-environment)
+before writing a test that sets an environment variable.
 
 Run clippy with warnings as errors:
 
@@ -1725,9 +1725,10 @@ The harness applies the matching OS requirement itself; do not select these
 with cucumber's `--tags`/`-n` flags, because those bypass the suite's custom
 expectation and applicability resolver.
 
-The required `windows-build-and-test` lane additionally folds in the hermetic
-`comfyui-01`/`comfyui-02`/`comfyui-03` scenarios (not themselves `@lifecycle`)
-via `E2E_ALSO_RUN_IDS`, a comma-separated list of `@id`s:
+The `windows-release` job of the required `windows-build-and-test` lane
+additionally folds in the hermetic `comfyui-01`/`comfyui-02`/`comfyui-03`
+scenarios (not themselves `@lifecycle`) via `E2E_ALSO_RUN_IDS`, a
+comma-separated list of `@id`s:
 
 ```powershell
 $env:E2E_INCLUDE_LIFECYCLE = "1"
