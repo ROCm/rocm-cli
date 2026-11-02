@@ -19,6 +19,9 @@ use crate::parse::{
     scenario_id, scenario_passed, stats_of,
 };
 
+#[cfg(test)]
+mod test_support;
+
 /// The platform/OS a report belongs to, parsed from its artifact name.
 ///
 /// Splitting these into separate fields (rather than one mashed
@@ -1716,42 +1719,9 @@ fn platform_section(report: &PlatformReport) -> Markup {
 
 #[cfg(test)]
 mod tests {
+    use super::test_support::{feature_json, grid_order, write_platform, write_report};
     use super::*;
     use crate::command_coverage::{KNOWN_COMMAND_SURFACE, command_coverage_summary};
-
-    // One feature with scenarios; each scenario is (tags, step-statuses).
-    fn feature_json(scenarios: &[(&[&str], &[&str])]) -> String {
-        let els: Vec<String> = scenarios
-            .iter()
-            .enumerate()
-            .map(|(i, (tags, statuses))| {
-                let tags = tags
-                    .iter()
-                    .map(|t| format!(r#"{{"name":"{t}"}}"#))
-                    .collect::<Vec<_>>()
-                    .join(",");
-                let steps = statuses
-                    .iter()
-                    .map(|s| {
-                        format!(r#"{{"keyword":"Given ","name":"x","result":{{"status":"{s}"}}}}"#)
-                    })
-                    .collect::<Vec<_>>()
-                    .join(",");
-                format!(r#"{{"name":"s{i}","tags":[{tags}],"steps":[{steps}]}}"#)
-            })
-            .collect();
-        format!(
-            r#"[{{"name":"F","uri":"f.feature","elements":[{}]}}]"#,
-            els.join(",")
-        )
-    }
-
-    fn write_report(features_json: &str) -> tempfile::NamedTempFile {
-        use std::io::Write as _;
-        let mut f = tempfile::NamedTempFile::new().expect("temp file");
-        f.write_all(features_json.as_bytes()).expect("write json");
-        f
-    }
 
     #[test]
     fn parse_descriptor_maps_known_artifacts() {
@@ -2421,25 +2391,6 @@ mod tests {
         assert!(!C::Pass.is_problem());
         assert!(!C::Xfail.is_problem());
         assert!(!C::Skip.is_problem());
-    }
-
-    /// Write a report.json + platform.json pair into a fresh dir and return the
-    /// report.json path (the input the grid keys on).
-    fn write_platform(report_json: &str, platform_json: &str) -> (tempfile::TempDir, PathBuf) {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let report = dir.path().join("report.json");
-        std::fs::write(&report, report_json).expect("write report");
-        std::fs::write(dir.path().join("platform.json"), platform_json).expect("write platform");
-        (dir, report)
-    }
-
-    /// The order the grid renders rows in, flattened across feature groups.
-    fn grid_order(inputs: &[(String, PathBuf)]) -> Vec<(String, String)> {
-        Grid::build(&load_reports(inputs))
-            .groups
-            .iter()
-            .flat_map(|g| g.rows.iter().map(|r| (g.feature.clone(), r.id.clone())))
-            .collect()
     }
 
     #[test]
