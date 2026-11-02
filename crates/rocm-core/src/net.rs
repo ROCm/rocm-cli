@@ -804,6 +804,12 @@ pub fn managed_service_endpoint_model_ready(
     openai_models_endpoint_has_model(&record.endpoint_url, expected, endpoint_api_key, timeout)
 }
 
+/// Interactive `rocm serve` startup deadline.
+///
+/// `rocmd`'s server-recover watcher uses the same bound so it does not restart
+/// a live process that has not opened its port yet.
+pub const SERVE_STARTUP_DEADLINE: Duration = Duration::from_mins(30);
+
 /// How far along a managed service's endpoint is.
 ///
 /// The middle state is the one that matters: an engine lists a model within
