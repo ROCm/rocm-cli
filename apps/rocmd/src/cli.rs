@@ -6,6 +6,7 @@ use crate::sandbox_tool::{SandboxToolArg, SandboxToolPolicy};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use rocm_core::{AppPaths, DEFAULT_LOCAL_HOST};
+use serde::Serialize;
 use serde_json::Value;
 use serde_json::json;
 use std::ffi::OsString;
@@ -138,6 +139,14 @@ fn print_bridge_snapshot(paths: &AppPaths, pretty: bool) -> Result<()> {
     Ok(())
 }
 
+fn print_json<T: Serialize>(value: &T) -> Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(value).context("failed to serialize json output")?
+    );
+    Ok(())
+}
+
 #[tokio::main]
 pub async fn run_bin_cli() -> Result<()> {
     let cli = Cli::parse();
@@ -226,7 +235,7 @@ async fn run_cli(cli: Cli) -> Result<()> {
                 allow_native_fallback,
                 policy,
             )?;
-            crate::mcp::print_json(&value)?;
+            print_json(&value)?;
         }
         Command::SandboxTool {
             tool,
@@ -250,13 +259,13 @@ async fn run_cli(cli: Cli) -> Result<()> {
                 message,
                 policy,
             )?;
-            crate::mcp::print_json(&value)?;
+            print_json(&value)?;
         }
         Command::McpServer => {
             crate::mcp::run_mcp_server(&paths)?;
         }
         Command::McpToolsJson => {
-            crate::mcp::print_json(&json!({ "tools": crate::mcp::rocm_mcp_tools() }))?;
+            print_json(&json!({ "tools": crate::mcp::rocm_mcp_tools() }))?;
         }
         Command::McpCall {
             name,
@@ -277,7 +286,7 @@ async fn run_cli(cli: Cli) -> Result<()> {
                     "arguments": arguments,
                 }),
             )?;
-            crate::mcp::print_json(&result)?;
+            print_json(&result)?;
         }
     }
 

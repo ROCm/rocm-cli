@@ -12,7 +12,6 @@ use rocm_core::{
     AppPaths, AutomationRuntimeState, CommandCapture, DEFAULT_LOCAL_HOST, ExamineSummary,
     RocmCliConfig, command_capture_text, load_recent_automation_events,
 };
-use serde::Serialize;
 use serde_json::Value;
 use serde_json::json;
 use std::collections::VecDeque;
@@ -177,14 +176,6 @@ fn write_json_line(writer: &mut impl Write, value: &Value) -> Result<()> {
     writer.write_all(serde_json::to_string(value)?.as_bytes())?;
     writer.write_all(b"\n")?;
     writer.flush()?;
-    Ok(())
-}
-
-pub(crate) fn print_json<T: Serialize>(value: &T) -> Result<()> {
-    println!(
-        "{}",
-        serde_json::to_string_pretty(value).context("failed to serialize json output")?
-    );
     Ok(())
 }
 
