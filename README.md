@@ -431,7 +431,8 @@ hardware, not something an install or a setting can put right.
 - `--yes` skips the interactive confirmation once you've reviewed it. Without
   it, a fix that changes files or settings asks `[y/N]` (default: no). When
   stdin is not a terminal it prints the plan and refuses with exit code 5,
-  changing nothing. Fixes that only print steps never ask.
+  changing nothing; answering no also exits 5. Fixes that only print steps
+  never ask.
 - `--device-index` pins the discrete GPU index for `fix-9-igpu-dgpu`, marked
   NEEDS-ARG; without it, that fix only prints the `rocminfo` (Linux) or
   `hipInfo.exe` (Windows) query needed to find the index and makes no change.
@@ -591,7 +592,8 @@ undocumented distro, or a refused version override) installs nothing and exits
 non-zero, after printing the plan.
 
 `install driver` never asks for confirmation. Without `--yes`, in a terminal or
-not, it prints the plan marked `approval: required`, changes nothing, and exits 0.
+not, it prints the plan, changes nothing, and exits 0. A plan that would install
+something is marked `approval: required`.
 
 On Windows, `install driver` is validate-only: it installs and changes nothing,
 with or without `--yes`, and it starts no driver command. It prints the AMD
@@ -778,8 +780,9 @@ and installs once more; see
 `--yes` approves required system-package installs, such as OpenMPI for vLLM,
 including a `sudo` password prompt. `engines install` never asks for
 confirmation. Without `--yes`, a Linux host with root or passwordless `sudo`
-installs them anyway, and any other host prints the commands to run and the
-install continues.
+installs a missing package anyway, and one that would need a password prints the
+commands to run while the install continues. With `--yes`, a failed package
+install is an error.
 
 ### Will a model run here?
 

@@ -303,8 +303,8 @@ enum Command {
         /// Skip the interactive confirmation (use after approving the plan).
         /// Without it, a fix that changes files or settings asks `[y/N]`
         /// (default: no); when stdin is not a terminal it prints the plan and
-        /// refuses with exit 5, changing nothing. Fixes that only print steps
-        /// never ask.
+        /// refuses with exit 5, changing nothing. Answering no also exits 5.
+        /// Fixes that only print steps never ask.
         #[arg(long)]
         yes: bool,
         /// Show the plan without changing anything.
@@ -882,9 +882,10 @@ rocm engines install vllm --reinstall")]
         reinstall: bool,
         /// Approve required system-package installs (such as OpenMPI for
         /// vLLM), including a sudo password prompt. This command never asks
-        /// for confirmation: without --yes, a Linux host with root or
-        /// passwordless sudo installs them anyway, and any other host prints
-        /// the commands to run and the install continues.
+        /// for confirmation. Without --yes, a Linux host with root or
+        /// passwordless sudo installs a missing package anyway, and one that
+        /// would need a password prints the commands to run while the install
+        /// continues. With --yes, a failed package install is an error.
         #[arg(long)]
         yes: bool,
     },
@@ -916,9 +917,9 @@ enum RuntimesCommand {
         /// Restart running local servers so they use the newly active runtime.
         #[arg(long)]
         restart_services: bool,
-        /// Approve restarting running local servers. Requires --restart-services,
-        /// which is itself refused without --yes, in a terminal or not; this
-        /// command never prompts.
+        /// Approve restarting running local servers. Pass it with
+        /// --restart-services, which is refused without it, in a terminal or
+        /// not; this command never prompts.
         //
         // `requires` rather than a silent no-op: unlike `runtimes uninstall`,
         // where `--yes` skips a real prompt, activation has nothing to confirm
@@ -936,9 +937,9 @@ left, so it cannot undo more than one activation."
         /// Restart running local servers so they use the restored runtime.
         #[arg(long)]
         restart_services: bool,
-        /// Approve restarting running local servers. Requires --restart-services,
-        /// which is itself refused without --yes, in a terminal or not; this
-        /// command never prompts.
+        /// Approve restarting running local servers. Pass it with
+        /// --restart-services, which is refused without it, in a terminal or
+        /// not; this command never prompts.
         #[arg(long, requires = "restart_services")]
         yes: bool,
     },

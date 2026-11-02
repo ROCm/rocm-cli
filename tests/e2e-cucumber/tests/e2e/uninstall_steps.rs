@@ -234,6 +234,14 @@ async fn uninstall_refused_without_yes(world: &mut E2eWorld) {
         stderr.contains("uninstall requires --yes outside an interactive terminal"),
         "expected the --yes refusal on stderr:\n{stderr}"
     );
+    // The help promises the plan is printed before the refusal, so the person
+    // who is refused can see what `--yes` would have removed.
+    let config = config_dir(world).display().to_string();
+    assert!(
+        output(world).contains(&config),
+        "the plan must name the config folder ({config}) before refusing:\n{}",
+        output(world)
+    );
 }
 
 #[then("the error names the cache folder it could not check")]

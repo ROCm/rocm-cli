@@ -2,12 +2,13 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Steps for `rocm storage report` — the command whose job is to tell a user
-//! what ROCm CLI has put on their disk.
+//! Steps for `rocm storage` — `report`, whose job is to tell a user what ROCm CLI
+//! has put on their disk, and the confirmation gate on `remove-downloads`.
 //!
-//! Black-box throughout: the scenario plants a local server record the same way
-//! `rocm serve --managed` would, then reads the real binary's rendered report.
-//! No GPU and no network, so this runs on the mock lane every PR.
+//! Black-box throughout: the report scenario plants a local server record the
+//! same way `rocm serve --managed` would, then reads the real binary's rendered
+//! report; the removal scenario plants a download and runs the real binary with
+//! no terminal. No GPU and no network, so these run on the mock lane every PR.
 
 use crate::E2eWorld;
 use cucumber::{given, then, when};
@@ -161,6 +162,18 @@ async fn removal_refused(world: &mut E2eWorld) {
     assert!(
         stderr.contains("requires --yes outside an interactive terminal"),
         "expected the --yes refusal on stderr:\n{stderr}"
+    );
+    // The help promises the plan is printed before the refusal, so the person
+    // who is refused can see what `--yes` would have removed.
+    let folder = download_path(world)
+        .parent()
+        .expect("download has a parent")
+        .display()
+        .to_string();
+    assert!(
+        report(world).contains(&folder),
+        "the plan must name the folder it would remove from ({folder}) before refusing:\n{}",
+        report(world)
     );
 }
 

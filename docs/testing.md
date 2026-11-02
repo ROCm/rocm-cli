@@ -882,17 +882,23 @@ anything is removed:
 cargo xtask e2e -- -n "uninstall-"
 ```
 
-Without `--yes`, `rocm uninstall` asks `[y/N]` (default: no) at a terminal and,
-outside one, prints the plan and refuses with exit code 1, removing nothing;
-`uninstall-04` pins that. `rocm storage remove-downloads` gates the same way
-(`storage-01`), and `rocm fix` refuses with exit code 5 when stdin is not a
-terminal (`diagnose-08`). `rocm install driver` and `rocm engines install` never
-ask: without `--yes` the first prints its plan and changes nothing, and the
-second installs the system packages only where it can do so without a prompt.
-Each `--yes` help line says which of these applies, and
-`yes_help_says_what_happens_without_it_outside_a_terminal` keeps them in step.
-To check one by hand, point `HOME` at a scratch folder first so a regression
-cannot reach real files:
+What each command does without `--yes` when there is no terminal is stated in
+its `--yes` help, and
+`yes_help_says_what_happens_without_it_outside_a_terminal` keeps those lines in
+step with this table. The help is a wording pin; the behavior is proven here:
+
+| Command | Without `--yes`, no terminal | Proven by |
+|---|---|---|
+| `rocm uninstall` | prints the plan, refuses, exit 1, removes nothing | `uninstall-04` (Linux) |
+| `rocm runtimes uninstall` | same | `runtime-lifecycle-04` |
+| `rocm storage remove-downloads`, `remove-old-installs` | same; only when there is something to remove | `storage-01` (Linux, `remove-downloads`); both verbs share the gate unit-tested by `removal_requires_yes_when_there_is_no_terminal_to_prompt` |
+| `rocm fix` | prints the plan, refuses, exit 5 (stdin only decides) | `diagnose-08` (Linux, bare metal) |
+| `rocm install driver` | never asks; prints the plan, changes nothing, exit 0 | `driver-install-02` (WSL) |
+| `rocm engines install` | never asks; a missing package installs only where no password is needed | `system_package_install_action` unit tests |
+| `rocm runtimes activate`, `rollback` | never ask; `--restart-services` is refused without `--yes` | `runtime-lifecycle-11`, `-14`, `-17` |
+
+To check the first row by hand, run the command with no terminal attached. A
+regression would delete real settings, so point `HOME` at a scratch folder first:
 
 ```bash
 rocm uninstall --keep-binaries < /dev/null   # expect the refusal; exit 1
