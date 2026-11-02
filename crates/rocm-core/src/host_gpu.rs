@@ -18,8 +18,8 @@
 
 use crate::{
     AppPaths, LegacyRocmSummary, TheRockFamilyManifest, detect_legacy_rocm_summary,
-    detect_managed_therock_family, discover_rocm_installs, examine, hardware_root, host_path,
-    managed_sdk_tool_path, runtime_is_linux, runtime_is_windows, runtime_os_name,
+    detect_managed_therock_family, discover_rocm_installs, hardware_root, host_path,
+    managed_sdk_tool_path, probe_exec, runtime_is_linux, runtime_is_windows, runtime_os_name,
     sort_records_newest_install_first, unix_time_millis,
 };
 use anyhow::Result;
@@ -2493,7 +2493,7 @@ fn detect_linux_amdgpu_driver_version() -> Option<String> {
             return Some(version.to_owned());
         }
     }
-    let (rc, out, _) = examine::run("modinfo", &["amdgpu"], examine::SHORT);
+    let (rc, out, _) = probe_exec::run("modinfo", &["amdgpu"], probe_exec::SHORT);
     if rc != 0 {
         return None;
     }

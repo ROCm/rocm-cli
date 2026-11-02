@@ -10,15 +10,16 @@
 //! shapes mirror `examine.py` field-for-field so the catalog consumes the CLI's
 //! output unchanged.
 
+use crate::probe_exec::{
+    MEDIUM, SHORT, read_host_text, read_text, run, run_utf16le, run_with_env, truncate_to_chars,
+    which,
+};
 use crate::{FrameworkInterpreter, RUNTIME_LIBRARY_PATH_ENV, runtime_is_linux, runtime_is_windows};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Environment variables that commonly steer (or break) ROCm/HIP runtime
 /// behavior. Captured verbatim into `Examination::env`.
@@ -603,152 +604,6 @@ impl Examination {
         value.to_owned()
     }
 }
-
-// ---------------------------------------------------------------------------
-// Shell / fs helpers (never panic)
-// ---------------------------------------------------------------------------
-
-/// Run a command with a timeout. Returns `(rc, stdout, stderr)`. `rc` is `127`
-/// when the program can't be spawned and `124` on timeout.
-pub(crate) fn run(program: &str, args: &[&str], timeout: Duration) -> (i32, String, String) {
-    run_with_env(program, args, &[], timeout)
-}
-
-/// [`run`] with extra environment variables overlaid on the inherited ones.
-pub(crate) fn run_with_env(
-    program: &str,
-    args: &[&str],
-    envs: &[(String, OsString)],
-    timeout: Duration,
-) -> (i32, String, String) {
-    let (rc, stdout, stderr) = run_raw(program, args, envs, timeout);
-    (
-        rc,
-        String::from_utf8_lossy(&stdout).into_owned(),
-        String::from_utf8_lossy(&stderr).into_owned(),
-    )
-}
-
-/// [`run`] without the UTF-8 assumption, for output that is not UTF-8.
-fn run_raw(
-    program: &str,
-    args: &[&str],
-    envs: &[(String, OsString)],
-    timeout: Duration,
-) -> (i32, Vec<u8>, Vec<u8>) {
-    let Ok(mut child) = Command::new(program)
-        .args(args)
-        .envs(envs.iter().map(|(key, value)| (key, value)))
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    else {
-        return (127, Vec::new(), Vec::new());
-    };
-    // Bytes, then a lossy conversion at the end. `read_to_string` FAILS on
-    // invalid UTF-8 and the error was discarded, so a single stray byte silently
-    // emptied the whole capture — which reads downstream as "the command printed
-    // nothing", not as "the output could not be decoded".
-    let stdout_handle = child.stdout.take().map(|mut stdout| {
-        thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = stdout.read_to_end(&mut buf);
-            buf
-        })
-    });
-    let stderr_handle = child.stderr.take().map(|mut stderr| {
-        thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = stderr.read_to_end(&mut buf);
-            buf
-        })
-    });
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    break None;
-                }
-                thread::sleep(Duration::from_millis(20));
-            }
-            Err(_) => break None,
-        }
-    };
-    let stdout: Vec<u8> = stdout_handle
-        .and_then(|handle| handle.join().ok())
-        .unwrap_or_default();
-    let stderr: Vec<u8> = stderr_handle
-        .and_then(|handle| handle.join().ok())
-        .unwrap_or_default();
-    let rc = match status {
-        Some(status) => status.code().unwrap_or(-1),
-        None => 124,
-    };
-    (rc, stdout, stderr)
-}
-
-/// Run a command whose output is UTF-16LE, as `wsl.exe`'s is.
-///
-/// Decoding is by declaration, not detection. Sniffing the encoding cannot work
-/// here: UTF-16LE text in a Latin or Cyrillic script is made entirely of bytes
-/// below 0x80, so it is *valid UTF-8* and decodes without error straight into
-/// mojibake — no NUL-density or validity test can tell the two apart. The one
-/// reliable fact is which program produced the bytes.
-fn run_utf16le(program: &str, args: &[&str], timeout: Duration) -> (i32, String) {
-    let (rc, stdout, _) = run_raw(program, args, &[], timeout);
-    (rc, decode_utf16le(&stdout))
-}
-
-fn decode_utf16le(bytes: &[u8]) -> String {
-    let body = bytes.strip_prefix(&[0xFF, 0xFE]).unwrap_or(bytes);
-    // `chunks_exact` drops a trailing odd byte rather than panicking on it.
-    let units: Vec<u16> = body
-        .chunks_exact(2)
-        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
-        .collect();
-    String::from_utf16_lossy(&units)
-}
-
-fn read_text(path: &str) -> String {
-    std::fs::read_to_string(path).unwrap_or_default()
-}
-
-/// [`read_text`] for an absolute host path, read where [`crate::host_path`]
-/// says the host is.
-fn read_host_text(path: &str) -> String {
-    std::fs::read_to_string(crate::host_path(path)).unwrap_or_default()
-}
-
-/// Whether `program` resolves on `PATH` (best-effort, no execution).
-pub(crate) fn which(program: &str) -> bool {
-    let Ok(path) = std::env::var("PATH") else {
-        return false;
-    };
-    let (sep, exts): (char, &[&str]) = if runtime_is_windows() {
-        (';', &[".exe", ".bat", ".cmd", ""])
-    } else {
-        (':', &[""])
-    };
-    for dir in path.split(sep) {
-        if dir.is_empty() {
-            continue;
-        }
-        for ext in exts {
-            if Path::new(dir).join(format!("{program}{ext}")).is_file() {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-pub(crate) const SHORT: Duration = Duration::from_secs(5);
-const MEDIUM: Duration = Duration::from_secs(8);
 
 // ---------------------------------------------------------------------------
 // Platform probes
@@ -2115,18 +1970,6 @@ fn merge_live_repo_paths(e: &mut Examination, dirs: &[&str]) {
     }
 }
 
-/// Pull `X.Y[.Z]` out of a `rocm-X.Y.Z` path component.
-pub(crate) fn extract_rocm_version(path: &str) -> Option<String> {
-    let idx = path.find("rocm-")?;
-    let tail = &path[idx + "rocm-".len()..];
-    let version: String = tail
-        .chars()
-        .take_while(|c| c.is_ascii_digit() || *c == '.')
-        .collect();
-    let trimmed = version.trim_matches('.');
-    (trimmed.contains('.')).then(|| trimmed.to_owned())
-}
-
 // ---------------------------------------------------------------------------
 // Framework probes
 // ---------------------------------------------------------------------------
@@ -2958,23 +2801,6 @@ fn managed_runtime_roots() -> Vec<(std::path::PathBuf, Vec<std::path::PathBuf>)>
     runtimes
 }
 
-/// Truncate `value` to at most `max_chars` characters, appending a marker when
-/// truncated. Slices on char boundaries (matching Python's `value[:n]`); a byte
-/// slice would panic when the cut lands inside a multibyte character.
-///
-/// `pub(crate)` because [`crate::process`] bounds its timeout quote with the
-/// same marker, and a second copy here would be free to drift from it.
-/// (`host_gpu.rs`'s `truncate_diagnostic_line` is a different function with a
-/// different marker — plain `...` — not a third copy of this one.)
-pub(crate) fn truncate_to_chars(value: String, max_chars: usize) -> String {
-    if value.chars().count() > max_chars {
-        let truncated: String = value.chars().take(max_chars).collect();
-        format!("{truncated}...[truncated]")
-    } else {
-        value
-    }
-}
-
 /// The shared-memory filesystem a serving workload uses.
 const SHM_PATH: &str = "/dev/shm";
 
@@ -3366,6 +3192,7 @@ fn oldest_runtime_version(output: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::probe_exec::decode_utf16le;
 
     #[test]
     fn is_live_rocm_repo_file_name_skips_quarantined_files() {
@@ -3946,21 +3773,6 @@ mod tests {
         let mut truncated = utf16le("Ubuntu", false);
         truncated.push(0x00);
         assert_eq!(decode_utf16le(&truncated), "Ubuntu");
-    }
-
-    #[test]
-    fn command_output_that_is_not_utf8_is_kept_rather_than_dropped() {
-        // `read_to_string` fails on invalid UTF-8, and the error was discarded --
-        // so one stray byte emptied a whole capture, which every caller then read
-        // as "the command printed nothing".
-        let (rc, out, _) = run("printf", &["ok\\xffdone"], SHORT);
-        if rc == 127 {
-            return; // no `printf` binary on this host
-        }
-        assert!(
-            out.starts_with("ok") && out.ends_with("done"),
-            "the undecodable byte must not take the rest of the output with it: {out:?}"
-        );
     }
 
     /// Ported from the same Python preflight, which owned this rule until the
@@ -5908,21 +5720,6 @@ mod tests {
     }
 
     #[test]
-    fn env_truncation_is_char_safe_across_multibyte_boundary() {
-        // 5000 'é' chars = 10000 bytes; byte 4000 lands inside a char, which a
-        // byte slice would panic on. Must truncate cleanly to 4000 chars.
-        let value = "é".repeat(5000);
-        let out = truncate_to_chars(value, 4000);
-        assert!(out.ends_with("...[truncated]"));
-        assert_eq!(out.chars().filter(|&c| c == 'é').count(), 4000);
-    }
-
-    #[test]
-    fn env_truncation_leaves_short_values_untouched() {
-        assert_eq!(truncate_to_chars("short".to_owned(), 4000), "short");
-    }
-
-    #[test]
     fn iommu_param_parsed_from_cmdline() {
         assert_eq!(
             parse_iommu_param("BOOT_IMAGE=/vmlinuz iommu=pt amd_iommu=on quiet"),
@@ -6375,15 +6172,6 @@ mod tests {
             classify_amd_marketing_name("Ryzen AI Max+ 395"),
             ("gfx1151".to_owned(), true)
         );
-    }
-
-    #[test]
-    fn rocm_version_extracted_from_path() {
-        assert_eq!(
-            extract_rocm_version("/opt/rocm-6.4.1"),
-            Some("6.4.1".to_owned())
-        );
-        assert_eq!(extract_rocm_version("/opt/rocm"), None);
     }
 
     #[test]

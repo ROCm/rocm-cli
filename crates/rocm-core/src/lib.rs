@@ -35,6 +35,7 @@ pub mod openmpi;
 pub mod os_release;
 pub mod paths;
 pub mod placeholder;
+mod probe_exec;
 pub mod proc_lifecycle;
 pub mod process;
 pub mod quoting;
