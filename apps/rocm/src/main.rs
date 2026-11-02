@@ -30,6 +30,7 @@ mod engine_ipc;
 mod engine_runtime_select;
 mod engines_cmd;
 mod examine_report_text;
+mod freeform_answer;
 mod freeform_execution;
 mod freeform_planner;
 mod gpu_policy;
@@ -69,12 +70,11 @@ mod update_cmd;
 // `prepare_freeform_execution`/`render_freeform_execution_header` are
 // re-imported for the same reason: `execute_freeform_next_action` (itself only
 // called from `run_freeform`, outside `dispatch()`) calls them. Several
-// root-level chat/examine helpers call into `runtimes_cmd` directly for the same reason `engines_cmd`'s
-// runtime-resolution helpers are re-imported; `current_runtime_manifest`
-// stays re-imported here for other root-level commands outside `dispatch()`
-// that call it directly, and
-// `recover_setup_runtime_registration`/`validate_runtime_manifest_for_activation`
-// stay re-imported here for the same reason. `select_runtime_manifest` is no
+// root-level chat/examine helpers call into `runtimes_cmd` directly for the
+// same reason `engines_cmd`'s runtime-resolution helpers are re-imported;
+// `current_runtime_manifest` stays re-imported here for other root-level commands outside `dispatch()`
+// that call it directly, and `validate_runtime_manifest_for_activation` stays
+// re-imported here for the same reason. `select_runtime_manifest` is no
 // longer needed here: `single_ready_runtime_key`/
 // `resolve_runtime_selector_to_exact_key` moved out to
 // `engine_runtime_select.rs` in ROCMAI-215 (Phase 6f), reaching it via that
@@ -115,14 +115,14 @@ use crate::examine_report_text::{
     render_model_registry_text_with_context_and_host,
     render_model_registry_verbose_text_with_context_and_host,
 };
+use crate::freeform_answer::render_freeform_read_only_answer;
 use crate::freeform_execution::{prepare_freeform_execution, render_freeform_execution_header};
 use crate::gpu_policy::{GpuVramUsage, parse_gpu_indices_arg, serve_gpu_low_memory_warning};
 use crate::install_cmd::{install, therock_install_version_selector};
 use crate::managed_service_status::load_managed_services;
 use crate::model_fit::{PlatformRuleOut, engine_ruled_out_by_platform};
 use crate::runtimes_cmd::{
-    current_runtime_manifest, recover_setup_runtime_registration,
-    runtime_usability_status, runtimes, setup_runtime_paths,
+    current_runtime_manifest, runtimes, setup_runtime_paths,
     validate_runtime_manifest_for_activation,
 };
 use crate::serve_cmd::{ServeArgs, serve};
@@ -149,7 +149,7 @@ use rocm_core::{
     TELEMETRY_MODE_OFF, WatcherMode, daemon_binary_path, default_engine_for_platform,
     interactive_terminal, load_recent_automation_events, uv_cache_source,
 };
-use rocm_engine_protocol::{DEFAULT_LOG_TAIL_LINES, DevicePolicy, GpuSelection};
+use rocm_engine_protocol::{DevicePolicy, GpuSelection};
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Write};
@@ -1996,125 +1996,6 @@ fn execute_freeform_next_action(plan: freeform_planner::StructuredRequestPlan) -
     argv.extend(execution.action.args);
     let cli = Cli::try_parse_from(argv)?;
     dispatch(cli)
-}
-
-fn render_freeform_read_only_answer(
-    request: &str,
-    plan: &freeform_planner::StructuredRequestPlan,
-    paths: &AppPaths,
-    config: &RocmCliConfig,
-) -> Result<Option<String>> {
-    if plan.actions.len() != 1 || plan.actions[0].approval != "not required" {
-        return Ok(None);
-    }
-    match plan.actions[0].args.as_slice() {
-        [command] if command == "examine" => {
-            render_freeform_examine_answer(request, paths, config).map(Some)
-        }
-        [command, subcommand] if command == "comfyui" && subcommand == "status" => {
-            comfyui::render_chat_status_answer(paths).map(Some)
-        }
-        [command, subcommand] if command == "comfyui" && subcommand == "logs" => {
-            let logs = comfyui::render_logs(paths, DEFAULT_LOG_TAIL_LINES)?;
-            Ok(Some(format!("ComfyUI logs\n\n{logs}")))
-        }
-        _ => Ok(None),
-    }
-}
-
-fn render_freeform_examine_answer(
-    request: &str,
-    paths: &AppPaths,
-    config: &RocmCliConfig,
-) -> Result<String> {
-    recover_setup_runtime_registration(paths, config)?;
-    let examine = ExamineSummary::gather()?;
-    let manifests = therock::load_runtime_manifests(paths)?;
-    let active = current_runtime_manifest(config, &manifests);
-    let lower = request.to_ascii_lowercase();
-    let asks_where = chat::any_substring(&lower, &["where", "folder", "path"]);
-    let mut output = String::new();
-    let _ = writeln!(
-        output,
-        "{}",
-        if asks_where {
-            "ROCm install location"
-        } else {
-            "ROCm status"
-        }
-    );
-    let _ = writeln!(output);
-
-    if let Some(detail) = examine.driver.detail.as_deref() {
-        let _ = writeln!(output, "GPU: {detail}");
-    } else if let Some(target) = examine.detected_gfx_target.as_deref() {
-        let _ = writeln!(output, "GPU: AMD GPU target {target}");
-    } else {
-        let _ = writeln!(output, "GPU: I could not identify an AMD GPU yet.");
-    }
-    if let Some(target) = examine.detected_gfx_target.as_deref() {
-        let _ = writeln!(output, "Target: {target}");
-    }
-
-    if let Some(manifest) = active {
-        let status = runtime_usability_status(manifest);
-        if status == "ready" {
-            let _ = writeln!(output, "ROCm/TheRock: installed and active for ROCm CLI");
-        } else {
-            let _ = writeln!(output, "ROCm/TheRock: found, but status is {status}");
-        }
-        let _ = writeln!(output, "Folder: {}", manifest.install_root.display());
-        let _ = writeln!(
-            output,
-            "Version: {}",
-            therock::runtime_version_display(&manifest.version)
-        );
-        let _ = writeln!(output, "GPU package: {}", manifest.family);
-    } else {
-        let setup_root = config.setup.therock_venv.as_deref();
-        if let Some(root) = setup_root {
-            let _ = writeln!(
-                output,
-                "ROCm/TheRock: setup folder saved, but no active runtime is selected"
-            );
-            let _ = writeln!(output, "Folder: {}", root.display());
-        } else if manifests.len() == 1 {
-            let manifest = &manifests[0];
-            let _ = writeln!(
-                output,
-                "ROCm/TheRock: installed, but not selected as the active runtime"
-            );
-            let _ = writeln!(output, "Folder: {}", manifest.install_root.display());
-            let _ = writeln!(output, "Runtime: {}", manifest.runtime_key);
-            let _ = writeln!(
-                output,
-                "Next step: rocm runtimes activate {}",
-                manifest.runtime_key
-            );
-        } else if manifests.is_empty() {
-            let _ = writeln!(output, "ROCm/TheRock: not installed for ROCm CLI yet");
-            let _ = writeln!(
-                output,
-                "Next step: run `rocm` and choose Install ROCm, or ask to install TheRock into a folder you choose."
-            );
-        } else {
-            let _ = writeln!(
-                output,
-                "ROCm/TheRock: multiple installs found, but none is active"
-            );
-            let _ = writeln!(output, "Run `rocm runtimes list` to choose one.");
-        }
-    }
-
-    if examine.legacy_rocm.status == "not_detected" && active.is_some() {
-        let _ = writeln!(
-            output,
-            "Note: ROCm CLI is using its managed TheRock runtime, not a global ROCm install."
-        );
-    }
-    let _ = writeln!(output);
-    let _ = writeln!(output, "Nothing was changed.");
-    Ok(output)
 }
 
 /// Sampling controls a caller can pass through to the underlying chat request.
