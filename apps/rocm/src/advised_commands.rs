@@ -1279,39 +1279,25 @@ const NOT_INVOCATIONS: &[(&str, &str, &str)] = &[
         "the doc's expected result is that the parser rejects this combination",
     ),
     // The `device:` row's value (ROCMAI-550). Every engine reports the backend
-    // it selected as `<backend> gpu [<n>]` -- `vulkan gpu 0`, `rocm gpu 1` --
-    // so the ROCm half of that value reads as a `rocm` invocation to this scan
-    // while naming no command at all. These are the engine side of it and the
-    // two docs that quote the format back.
-    (
-        "engines/vllm/src/state.rs",
-        "rocm gpu {index}",
-        "the `device:` value vLLM reports, `<backend> gpu <ordinal>`, not a command",
-    ),
+    // it selected as `<backend> [gpu <n>] [(<name>)]` -- `vulkan (AMD Radeon
+    // Graphics)`, `rocm gpu 1 (AMD Instinct MI300X)` -- so the ROCm half of
+    // that value reads as a `rocm` invocation to this scan while naming no
+    // command at all. These are the engine side of it and the two docs that
+    // quote the format back.
     (
         "engines/vllm/src/state.rs",
         "rocm gpu",
-        "the `device:` value vLLM reports when no GPU ordinal was pinned",
-    ),
-    (
-        "engines/aim/src/state.rs",
-        "rocm gpu",
-        "the `device:` value AIM reports; its state records no GPU ordinal",
+        "the shape note for the `device:` value vLLM reports, not a command",
     ),
     (
         "README.md",
-        "rocm gpu 0",
+        "rocm gpu 0 (AMD Instinct MI300X)",
         "an example `device:` value in the deployment-summary description, not a command",
     ),
     (
         "docs/manual-testing.md",
-        "rocm gpu <n>",
+        "rocm gpu 0 (AMD Instinct MI300X)",
         "the `device:` value the tester is told to expect, not a command to run",
-    ),
-    (
-        "docs/manual-testing.md",
-        "rocm gpu",
-        "the ordinal-less `device:` value the tester is told to expect",
     ),
 ];
 
