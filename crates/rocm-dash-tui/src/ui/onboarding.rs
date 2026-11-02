@@ -715,11 +715,8 @@ fn draw_configure(f: &mut Frame, area: Rect, cfg: &InstallConfig, theme: &Theme)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-
-    fn key(c: KeyCode) -> KeyEvent {
-        KeyEvent::new(c, KeyModifiers::NONE)
-    }
+    use crate::app::test_support::press as key;
+    use crossterm::event::KeyCode;
 
     #[test]
     fn welcome_enter_advances_to_choose() {

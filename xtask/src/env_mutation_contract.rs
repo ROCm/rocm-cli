@@ -116,10 +116,11 @@ mod tests {
     /// Named helpers that serialize env mutation for their whole scope.
     ///
     /// Membership is "holds a lock for its whole scope", not "wraps an env
-    /// mutation". `ScopedEnvVar` (`apps/rocm/src/main.rs`) was listed here and
+    /// mutation". `ScopedEnvVar` (`apps/rocm/src/engine_ipc.rs` as of
+    /// ROCMAI-213; originally `apps/rocm/src/main.rs`) was listed here and
     /// only ever saved and restored — its one caller,
     /// `with_scoped_builtin_engine_env`, takes `BUILTIN_ENGINE_ENV_LOCK`
-    /// itself. The type is visible to the largest test module in the tree, in
+    /// itself. The type was visible to the largest test module in the tree, in
     /// the same file, so any test that merely named it was granted the full
     /// exemption while holding nothing: the exact failure this guard exists to
     /// prevent, written into the guard.

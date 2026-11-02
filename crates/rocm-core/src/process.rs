@@ -6,8 +6,9 @@
 //!
 //! Hidden-console/detached spawn and exit-wait on Windows, process/process-tree
 //! termination on both platforms, and the exclusive `FileLock` used to
-//! serialize the daemon autostart path, the managed-launch GPU claim, and
-//! `uv` installs across processes.
+//! serialize check-then-act sequences over shared on-disk state across
+//! processes — e.g. the daemon autostart path, the managed-launch GPU claim,
+//! a `uv` install, and each JSONL store's append/rewrite.
 //!
 //! [`run_with_timeout`] is the bulk of the file: run a command to completion
 //! with both streams captured and a real time bound. A thread per pipe drains
@@ -387,9 +388,11 @@ pub fn process_is_running(pid: u32) -> bool {
 /// Wraps the standard-library file lock (`std::fs::File::lock`), so the exclusion
 /// holds between *separate `rocm` processes*, not just threads: each caller opens
 /// the same lock-file path and only one can hold the lock at a time. It exists to
-/// serialize check-then-act sequences over shared on-disk state — the daemon
-/// autostart decision and the managed-serve GPU select-then-claim — so two
-/// concurrent invocations cannot both pass the same TOCTOU check.
+/// serialize check-then-act sequences over shared on-disk state — e.g. the
+/// daemon autostart decision, the managed-serve GPU select-then-claim, a
+/// `uv` install, and each JSONL store's append-or-repair and read-modify-write
+/// (see `jsonl_lock_path` in `automation.rs`) — so two concurrent invocations
+/// cannot both pass the same check, or interleave a write with another's.
 ///
 /// The lock is released when the guard is dropped, and by the OS if the process
 /// exits while holding it (so a crashed holder never wedges the next caller).
@@ -627,24 +630,25 @@ const DRAIN_GRACE: Duration = Duration::from_millis(200);
 /// only as an opaque error, so this is the only place that can still tell which
 /// of its characters came from the child. All four callers inherit it.
 ///
-/// It bounds this message and nothing else. A caller that quotes the `Output`
-/// handed back to it is quoting raw child output of its own, unbounded and
-/// persisted the same way -- `capture_amd_smi_json`'s non-zero-exit `bail!` and
-/// the daemon's `parse_sandbox_child_output` both do. Both predate this
-/// constant and are outside its scope; of the two, #623 tracks the
-/// `capture_amd_smi_json` quote.
+/// It bounds this message by itself. A caller that quotes the `Output` handed
+/// back to it is quoting raw child output of its own, persisted the same way,
+/// so it has to apply a bound too -- which is why this is `pub(crate)` rather
+/// than private: [`crate::amd_smi::amd_smi_json`] bounds its non-zero-exit
+/// quote (the one #623 tracked) with *this* constant instead of declaring a
+/// second one free to drift from it. The daemon's
+/// `parse_sandbox_child_output` still predates both and is outside this scope.
 ///
 /// The bound matters because the message does not stop at a terminal. `rocmd`
 /// renders the whole error chain into the bridge snapshot's `note`, and the
 /// GPU-metrics watcher copies that note into the automation-event and audit
-/// JSONL files once a minute — files whose append helpers rewrite the whole
-/// file each time. Unbounded, a child that prints a megabyte and then stalls
-/// past its timeout grows both logs by that much per minute, and every
-/// subsequent append costs more than the last.
+/// JSONL files once a minute — stores that are never rotated or capped.
+/// Unbounded, a child that prints a megabyte and then stalls past its
+/// timeout grows both logs by that much per minute, forever. A 151K-character
+/// JSONL line was reproduced from exactly that poller.
 ///
 /// Sized to still hold a real stderr backtrace: the point is to stop a
 /// payload-sized quote, not to shorten diagnostics.
-const MAX_QUOTED_OUTPUT_CHARS: usize = 2000;
+pub(crate) const MAX_QUOTED_OUTPUT_CHARS: usize = 2000;
 
 /// One captured stream: the bytes so far, whether its reader saw EOF, and the
 /// read error that stopped it, if one did.
@@ -1866,9 +1870,9 @@ mod tests {
             //
             // Unbounded, this message travels: `rocmd` renders the error chain
             // into the bridge snapshot's `note`, and the GPU-metrics watcher
-            // writes that note into two JSONL logs every 60s, rewriting each
-            // file whole. A real amd-smi on a multi-GPU host prints well past
-            // this fixture's size.
+            // writes that note into two JSONL logs every 60s, neither ever
+            // rotated or capped. A real amd-smi on a multi-GPU host prints
+            // well past this fixture's size.
             let mut command = Command::new(shell);
             command.args([
                 "-c",

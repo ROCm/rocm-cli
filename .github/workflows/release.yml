@@ -14,6 +14,17 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # setup-rust-toolchain v2 no longer sets this; its replacement,
+  # CARGO_BUILD_WARNINGS=deny, needs cargo 1.97+ and we pin 1.96.0
+  # (rust-toolchain.toml). Once the toolchain reaches 1.97, replace this with
+  # `CARGO_BUILD_WARNINGS: deny` instead (set at workflow level so it reaches
+  # jobs that don't use setup-rust-toolchain too).
+  RUSTFLAGS: -D warnings
+  # aws-lc-sys 0.46 and later auto-detect an AWS-LC already installed on the
+  # build host and link it when found. Release binaries must not depend on
+  # what the runner or build container happens to have, so always build the
+  # vendored copy.
+  AWS_LC_SYS_USE_SYSTEM: "0"
   # REQUIRED, not dormant: every readiness step below runs --require-signatures,
   # which now means signatures must actually verify, so this is the public key
   # the release is verified against. Removing or blanking the secret fails every
@@ -42,7 +53,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
 
       - name: Verify pinned keys match the signing key
         run: cargo xtask verify-pinned-keys
@@ -120,6 +131,7 @@ jobs:
             -e CARGO_HOME=/host-cargo \
             -e RUSTUP_HOME=/host-cargo/rustup \
             -e ROCM_CLI_RELEASE_REF="${{ steps.version.outputs.value }}" \
+            -e AWS_LC_SYS_USE_SYSTEM \
             -v "$HOME/.cargo":/host-cargo \
             -v "$PWD":/work \
             -w /work \
@@ -211,7 +223,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
 
       - name: Verify pinned keys match the signing key
         shell: pwsh

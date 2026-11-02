@@ -5,7 +5,7 @@
 use anyhow::{Context, Result, bail};
 use rocm_core::{
     AppPaths, AutomationRuntimeState, CodexBridgeEngine, CodexBridgeGpuSnapshot,
-    CodexBridgeSnapshot, ExamineSummary, RocmCliConfig, amd_smi_json, daemon_binary_path,
+    CodexBridgeSnapshot, CommandCapture, ExamineSummary, RocmCliConfig, amd_smi_json,
     default_engine_for_platform, format_host_port, load_recent_automation_events, unix_time_millis,
 };
 #[cfg(test)]
@@ -35,6 +35,12 @@ use std::time::Duration;
 /// and keeps a watcher thread parked on an unhealthy host. `serve` gets exactly
 /// one shot at learning the GPU layout before placing a model, and abandoning
 /// it degrades the placement decision for the whole lifetime of that service.
+///
+/// Not the whole wait: `amd_smi_json` runs its `/dev/kfd` pre-flight before it
+/// spawns anything, bounded separately by `rocm_core`'s `KFD_OPEN_TIMEOUT` (2s
+/// on Linux). A poll therefore costs up to 4s on a host whose device open also
+/// hangs. Still inside the watcher's 60s cadence, so the tick is late rather
+/// than skipped.
 const AMD_SMI_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub(crate) fn build_bridge_snapshot(paths: &AppPaths) -> Result<CodexBridgeSnapshot> {
@@ -96,9 +102,9 @@ pub(crate) fn gather_gpu_snapshot() -> CodexBridgeGpuSnapshot {
                 //
                 // The note is the only account of any of this that reaches the
                 // bridge snapshot and the automation watcher, so it carries the
-                // causes too -- bounded, because it is persisted; see the
-                // `MAX_QUOTED_OUTPUT_CHARS` that `amd_smi_json` and
-                // `run_with_timeout` each apply to their own quote.
+                // causes too -- bounded, because it is persisted; see
+                // `MAX_QUOTED_OUTPUT_CHARS`, which `amd_smi_json` and
+                // `run_with_timeout` share for their two quotes.
                 amd_smi_available: false,
                 static_snapshot: None,
                 monitor_snapshot: None,
@@ -182,6 +188,10 @@ const fn rocmd_engine_inventory() -> &'static [(&'static str, &'static str)] {
             "vllm",
             "Linux/WSL ROCm GPU serving engine through external vLLM",
         ),
+        (
+            "aim",
+            "AMD Enterprise AI pre-built Docker serving containers",
+        ),
     ]
 }
 
@@ -201,42 +211,27 @@ where
         .map(|plugin| plugin.executable_path))
 }
 
-#[derive(Debug)]
-pub(crate) struct CommandCapture {
-    pub(crate) argv: Vec<String>,
-    pub(crate) exit_status: i32,
-    pub(crate) stdout: String,
-    pub(crate) stderr: String,
-}
-
 pub(crate) fn run_rocm_capture(args: &[&str]) -> Result<CommandCapture> {
     let paths = AppPaths::discover()?;
     run_rocm_capture_for_paths(&paths, args, Duration::from_mins(2))
 }
 
+/// Run `rocm` on `paths`' config/data/cache roots, via the shared
+/// [`rocm_core::run_rocm_capture_with_env`].
 pub(crate) fn run_rocm_capture_for_paths(
     paths: &AppPaths,
     args: &[&str],
     timeout: Duration,
 ) -> Result<CommandCapture> {
-    let rocm_binary = daemon_binary_path()?;
-    let mut command = ProcessCommand::new(&rocm_binary);
-    // Stdio left to `run_with_timeout`, which sets it itself.
-    command
-        .args(args)
-        .env("ROCM_CLI_CONFIG_DIR", &paths.config_dir)
-        .env("ROCM_CLI_DATA_DIR", &paths.data_dir)
-        .env("ROCM_CLI_CACHE_DIR", &paths.cache_dir);
-    let output = rocm_core::process::run_with_timeout(command, timeout, "process")
-        .with_context(|| format!("failed to run {}", rocm_binary.display()))?;
-    Ok(CommandCapture {
-        argv: std::iter::once(rocm_binary.display().to_string())
-            .chain(args.iter().map(|value| (*value).to_owned()))
-            .collect(),
-        exit_status: output.status.code().unwrap_or(1),
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-    })
+    rocm_core::run_rocm_capture_with_env(
+        args,
+        &[
+            ("ROCM_CLI_CONFIG_DIR", paths.config_dir.as_path()),
+            ("ROCM_CLI_DATA_DIR", paths.data_dir.as_path()),
+            ("ROCM_CLI_CACHE_DIR", paths.cache_dir.as_path()),
+        ],
+        timeout,
+    )
 }
 
 pub(crate) fn optional_arg(flag: &str, value: Option<&str>) -> Vec<String> {

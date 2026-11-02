@@ -127,7 +127,7 @@ pub(super) fn build_local_agent(
 /// Local engines that expose an OpenAI-compatible `/v1` surface the dash chat
 /// can talk to directly. A managed service running one of these is a valid
 /// auto-detected chat endpoint regardless of which port it bound.
-const OPENAI_COMPATIBLE_ENGINES: &[&str] = &["vllm", "lemonade"];
+const OPENAI_COMPATIBLE_ENGINES: &[&str] = &["vllm", "lemonade", "aim"];
 
 /// A managed-service endpoint the dash chat can route to, picked from the
 /// read-only `services` tool payload.
