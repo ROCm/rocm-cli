@@ -3390,8 +3390,9 @@ the text report opens `ESTIMATED:` for the first two. The parts and their tests:
 - [gguf_fit.rs](../crates/rocm-core/src/gguf_fit.rs): the arithmetic (exact KV
   figures, the boundary between fits and does not, the largest context -- a
   trained context that is not a whole step included, on both sides -- the
-  suggestions, each layout it refuses to estimate, and the measured llama.cpp
-  loads the allowances were calibrated on, which the synthetic Llama- and
+  suggestions, each layout it refuses to estimate, the state-space, hybrid and
+  mixture-of-experts layouts that get their figures with no verdict, and the
+  measured llama.cpp loads the allowances were calibrated on, which the synthetic Llama- and
   Qwen-shaped headers must reproduce: buffer sizes, and a total above the
   measured use by at most 5% in each load but one, and by 5% to 6% in the load
   made with the card almost full. The module documentation describes the loads

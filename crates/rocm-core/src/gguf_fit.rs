@@ -186,6 +186,11 @@ pub enum CannotEstimateReason {
     LatentAttention,
     /// No layer keeps a KV cache.
     NoAttentionLayers,
+    /// State-space (pure or hybrid) or mixture-of-experts layers: the figures
+    /// are given, but part of the memory is either not counted (a recurrent
+    /// state) or not measured (expert compute buffers), so the total can be too
+    /// low and no fits / does-not-fit verdict is given.
+    UnmeasuredLayout,
     /// A figure the formula needs is not in the header.
     MissingMetadata,
     /// No GPU is visible to ROCm.
@@ -773,6 +778,27 @@ pub fn estimate_fit(
         estimate.detail = Some(detail.to_owned());
         return estimate;
     };
+    // A layout whose figure can be too low gets the figures and no verdict: a
+    // confident "fits" that is wrong costs a user a failed load, and a margin
+    // with no measurement behind it would be a guess. The host's memory is
+    // still reported, so the reader can compare it themselves.
+    if header.ssm || header.moe {
+        let why = match (header.ssm, header.moe) {
+            (true, true) => {
+                "it has state-space layers, whose recurrent state is not counted, and \
+                             mixture-of-experts layers, whose compute buffer was not measured"
+            }
+            (true, false) => "it has state-space layers, whose recurrent state is not counted",
+            _ => "it is a mixture-of-experts model, whose compute buffer was not measured",
+        };
+        estimate.cannot_estimate_reason = Some(CannotEstimateReason::UnmeasuredLayout);
+        estimate.detail = Some(format!(
+            "no fits / does-not-fit verdict for this model: {why}, so the total above can be too \
+             low; compare it with this GPU's {} MiB yourself and leave headroom",
+            (available_gib * 1024.0).floor()
+        ));
+        return estimate;
+    }
     let available = available_gib * GIB;
     estimate.max_context = sizing.max_context(available, kv, trained_context(header));
 
@@ -1928,6 +1954,115 @@ mod tests {
         // A dense model with every width present carries none of them.
         let plain = notes_of(&llama_like(10));
         assert!(plain.is_empty(), "{plain}");
+    }
+
+    /// A layout whose figure can be too low gets its figures and no verdict, on
+    /// a card where a dense model of the same size fits and on one where it does
+    /// not: part of its memory is not counted or not measured, so neither "fits"
+    /// nor "does not fit" can be relied on. A host that could not compare keeps
+    /// its own reason.
+    fn assert_figures_and_no_verdict(layout: &str, builder: &Builder, why: &str) {
+        let (header, size) = header_of(builder, 4096);
+        for memory in [
+            AcceleratorMemory::Dedicated(1000.0),
+            AcceleratorMemory::Dedicated(0.5),
+        ] {
+            let result = estimate(&header, size, 4096, KvCacheType::F16, memory);
+            assert_eq!(
+                result.outcome,
+                EstimateOutcome::CannotEstimate,
+                "{layout} on {memory:?}"
+            );
+            assert_eq!(
+                result.cannot_estimate_reason,
+                Some(CannotEstimateReason::UnmeasuredLayout),
+                "{layout}"
+            );
+            assert!(
+                result.total_gib.is_some(),
+                "{layout}: the figures are given"
+            );
+            assert!(
+                result.available_gib.is_some(),
+                "{layout}: the card is named"
+            );
+            assert_eq!(result.max_context, None, "{layout}: a ceiling is a verdict");
+            assert!(
+                result.suggestions.is_empty(),
+                "{layout}: {:?}",
+                result.suggestions
+            );
+            let detail = result.detail.clone().unwrap_or_default();
+            assert!(
+                detail.contains(why) && detail.contains("can be too low"),
+                "{layout}: {detail}"
+            );
+            let lines = evidence_lines(&result).join("\n");
+            assert!(!lines.contains("largest context"), "{layout}: {lines}");
+        }
+        // A host that could not compare keeps its own reason: there was no
+        // verdict to withhold.
+        let unknown = estimate(
+            &header,
+            size,
+            4096,
+            KvCacheType::F16,
+            AcceleratorMemory::Unknown,
+        );
+        assert_eq!(
+            unknown.cannot_estimate_reason,
+            Some(CannotEstimateReason::AcceleratorMemoryUnknown),
+            "{layout}"
+        );
+    }
+
+    #[test]
+    fn a_state_space_model_gets_figures_and_no_verdict() {
+        assert_figures_and_no_verdict(
+            "state-space",
+            &llama_like(10).u32("llama.ssm.state_size", 16),
+            "recurrent state is not counted",
+        );
+    }
+
+    /// Attention in some layers (a KV head count per layer, zero for the
+    /// state-space ones) and state-space keys: a hybrid.
+    #[test]
+    fn a_hybrid_model_gets_figures_and_no_verdict() {
+        let hybrid = Builder::new()
+            .string("general.architecture", "h")
+            .u32("h.block_count", 4)
+            .u32("h.embedding_length", 512)
+            .u32("h.feed_forward_length", 1024)
+            .u32("h.attention.head_count", 8)
+            .u32_array("h.attention.head_count_kv", &[0, 8, 0, 8])
+            .u32("h.context_length", 8192)
+            .u32("h.ssm.state_size", 16)
+            .tensor("w", &[1024]);
+        assert_figures_and_no_verdict("hybrid", &hybrid, "recurrent state is not counted");
+    }
+
+    #[test]
+    fn a_mixture_of_experts_model_gets_figures_and_no_verdict() {
+        assert_figures_and_no_verdict(
+            "mixture-of-experts",
+            &llama_like(10).u32("llama.expert_count", 8),
+            "compute buffer was not measured",
+        );
+    }
+
+    /// The control: a dense model on the same card still gets its verdict.
+    #[test]
+    fn a_dense_model_still_gets_its_verdict() {
+        let (header, size) = header_of(&llama_like(10), 4096);
+        let dense = estimate(
+            &header,
+            size,
+            4096,
+            KvCacheType::F16,
+            AcceleratorMemory::Dedicated(1000.0),
+        );
+        assert_eq!(dense.outcome, EstimateOutcome::Fits);
     }
 
     #[test]

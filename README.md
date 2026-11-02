@@ -871,9 +871,13 @@ loads, and why that describes the fit rather than a bound, is written down once,
 in the
 [`gguf_fit` module documentation](https://github.com/ROCm/rocm-cli/blob/main/crates/rocm-core/src/gguf_fit.rs).
 A model with sliding-window, state-space or mixture-of-experts layers was not
-measured: its KV cache is sized as if every layer attended over the whole
-context (which can overstate it), a state-space model's recurrent state is not
-counted (which can understate it), and the output says which applies. Another
+measured. A sliding-window model's KV cache is sized as if every layer attended
+over the whole context, which can only overstate it, so it still gets a verdict.
+A state-space or hybrid model's recurrent state is not counted, and a
+mixture-of-experts model's compute buffer was not measured, so for those the
+figures are shown with this GPU's memory but with no fits / does-not-fit verdict
+(`cannot_estimate`, reason `unmeasured_layout`): a "fits" that is too low would
+be worse than no answer. Another
 GPU, engine build or batch size can miss by more, so leave headroom. The figures
 are compared with the total dedicated VRAM of the GPU with the most of it that
 ROCm can see, the same figure a curated model's minimum is compared with, not

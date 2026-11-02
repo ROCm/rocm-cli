@@ -68,7 +68,9 @@ the result from `--json`:
   need, with nothing to compare it to) and are null when it is about the file
   (`header_unreadable`, `not_a_model` for a multimodal projector named in place
   of a model, `split_file`, `latent_attention`, `no_attention_layers`,
-  `missing_metadata`)); what was asked for (`context_size`, `context_size_defaulted`,
+  `missing_metadata`), and are given with no verdict for `unmeasured_layout` (a
+  state-space, hybrid or mixture-of-experts model, part of whose memory is not
+  counted or not measured, so the total can be too low)); what was asked for (`context_size`, `context_size_defaulted`,
   `kv_cache_type`); the memory figures (`weights_gib`, `kv_cache_gib`,
   `compute_buffer_gib`, `runtime_reserve_gib`, `total_gib`, the same in bytes as
   `weights_bytes`, `kv_cache_bytes`, `compute_buffer_bytes`,
