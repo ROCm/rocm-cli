@@ -287,7 +287,7 @@ Guardrails:
   - do not pair two independently ordered lists by index when they share an id;
     correlate by id. Where no id exists, positional pairing is allowed only as the last
     resort after every stronger identifier (device id, name) has been tried, as
-    `fill_unidentified_gpus_from_hipinfo` in [examine.rs](crates/rocm-core/src/examine.rs) does;
+    `fill_unidentified_gpus_from_hipinfo` in [windows.rs](crates/rocm-core/src/examine/windows.rs) does;
     otherwise degrade to "unknown", never to a guess on multi-adapter hosts
   - check the documented width and range of every WMI or Win32 field before trusting
     it (a 32-bit field saturates at 4 GiB)
