@@ -8,30 +8,25 @@ use rocm_core::{
     http_get_text_with_auth, prepend_runtime_paths, runtime_is_linux, runtime_is_windows,
 };
 use rocm_engine_protocol::EngineRecipeHint;
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::ffi::OsString;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::time::Duration;
 
-use crate::direct_llama::{direct_llama_model_path, llama_server_backend_label};
-use crate::install::{LemonadeInstallManifest, LemonadeRuntime};
+use crate::LLAMACPP_RECIPE;
+use crate::install::LemonadeInstallManifest;
 use crate::runtime_dir::{ParentRuntimeEnvironment, child_runtime_dir_var};
-use crate::state::{
-    MAX_TAIL_READ, mark_json_status, merge_json_state, parse_http_endpoint,
-    resolve_lemonade_model_ref, terminate_pid, write_running_state,
-};
-use crate::{LLAMACPP_RECIPE, ServeHttpRequest};
+use crate::state::{MAX_TAIL_READ, parse_http_endpoint, resolve_lemonade_model_ref};
 
 const STARTUP_FAILURE_LOG_TAIL_LINES: usize = 80;
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct LemonadeProcessEnvironment {
     rocm_root: Option<PathBuf>,
-    path_entries: Vec<PathBuf>,
-    library_entries: Vec<PathBuf>,
+    pub(crate) path_entries: Vec<PathBuf>,
+    pub(crate) library_entries: Vec<PathBuf>,
     pub(crate) gpu_indices: Vec<u32>,
 }
 
@@ -241,13 +236,6 @@ pub(crate) fn lemonade_process_environment_vars(
     Ok(vars)
 }
 
-fn push_existing_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
-    if !path.exists() || paths.iter().any(|existing| existing == &path) {
-        return;
-    }
-    paths.push(path);
-}
-
 pub(crate) fn wait_for_lemonade_cli_status(
     manifest: &LemonadeInstallManifest,
     host: &str,
@@ -435,211 +423,6 @@ pub(crate) fn run_lemonade_model_load(
     Ok(())
 }
 
-/// Run one of Lemonade's packaged `llama-server` binaries (`server`) directly on a
-/// GGUF file, exposing the model under `request.model_ref` via `--alias`. This is how
-/// a canonical Hugging Face name is served under exactly that name — Lemonade's router
-/// renames registered models, but an llama-server alias is a free-form string.
-pub(crate) fn serve_direct_llama_server(
-    request: &ServeHttpRequest,
-    runtime: &LemonadeRuntime,
-    process_env: &LemonadeProcessEnvironment,
-    server: &Path,
-    log_path: Option<&Path>,
-    reason: &anyhow::Error,
-) -> Result<()> {
-    let paths = AppPaths::discover()?;
-    let model_path = direct_llama_model_path(&paths, &request.model_ref).with_context(|| {
-        format!(
-            "Lemonade downloaded model `{}` was not found for direct serving",
-            request.model_ref
-        )
-    })?;
-    if !server.is_file() {
-        bail!("Lemonade llama-server is missing at {}", server.display());
-    }
-    let backend = llama_server_backend_label(server);
-
-    if let Some(log_path) = log_path
-        && let Some(parent) = log_path.parent()
-    {
-        fs::create_dir_all(parent)?;
-    }
-    if let Some(log_path) = log_path {
-        let mut log = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log_path)
-            .with_context(|| format!("failed to open {}", log_path.display()))?;
-        writeln!(
-            log,
-            "\nLaunching Lemonade packaged {backend} llama-server directly: {reason:#}"
-        )
-        .ok();
-    }
-
-    let mut direct_env = process_env.clone();
-    if let Some(server_dir) = server.parent() {
-        push_existing_path(&mut direct_env.path_entries, server_dir.to_path_buf());
-        push_existing_path(&mut direct_env.library_entries, server_dir.to_path_buf());
-    }
-
-    let mut command = ProcessCommand::new(server);
-    command
-        .arg("-m")
-        .arg(&model_path)
-        .arg("--host")
-        .arg(&request.host)
-        .arg("--port")
-        .arg(request.port.to_string())
-        .arg("--n-gpu-layers")
-        .arg("999")
-        .arg("--alias")
-        .arg(&request.model_ref)
-        .stdin(Stdio::null());
-    if let Some(engine_recipe) = request.engine_recipe.as_ref() {
-        command.args(&engine_recipe.required_flags);
-    }
-    // Packaged llama-server is raw llama.cpp — it does not read `LEMONADE_API_KEY`.
-    // When `rocm serve` protects a public endpoint, hand llama-server the *existing*
-    // CLI-managed 0600 key file via `--api-key-file` (a path, not the value, so the
-    // secret never lands in the process table). Reusing the managed file rather than
-    // writing a copy keeps the key's lifecycle owned by `rocm serve` — created before
-    // spawn, deleted on stop — with no stale plaintext copy left behind on teardown.
-    if let Some(key_file) = rocm_engine_protocol::resolve_endpoint_api_key_file() {
-        command.arg("--api-key-file").arg(&key_file);
-    }
-    if let Some(log_path) = log_path {
-        let log = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log_path)
-            .with_context(|| format!("failed to open {}", log_path.display()))?;
-        command.stdout(Stdio::from(log.try_clone()?));
-        command.stderr(Stdio::from(log));
-    } else {
-        command.stdout(Stdio::inherit()).stderr(Stdio::inherit());
-    }
-    apply_lemonade_process_environment(&mut command, &direct_env)?;
-    hide_child_console_window(&mut command);
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("failed to start {}", server.display()))?;
-    write_running_state(
-        request,
-        runtime,
-        std::process::id(),
-        Some(child.id()),
-        "running",
-    )?;
-    // If the server never becomes ready (or fails the smoke test), don't leak the child
-    // or leave the state stuck at `running`: kill it and mark the service failed.
-    let readiness = (|| -> Result<()> {
-        wait_for_openai_models_ready(
-            &request.host,
-            request.port,
-            &request.model_ref,
-            Duration::from_mins(2),
-        )?;
-        if !query_chat_smoke_endpoint(&request.host, request.port, &request.model_ref)? {
-            bail!("Lemonade packaged llama-server did not pass a chat-completion smoke test");
-        }
-        Ok(())
-    })();
-    if let Err(error) = readiness {
-        let _ = terminate_pid(child.id(), true);
-        let _ = child.wait();
-        let _ = mark_json_status(&request.state_path, "failed");
-        return Err(error);
-    }
-    merge_json_state(
-        &request.state_path,
-        &json!({
-            "status": "ready",
-            "server_pid": child.id(),
-            // Identity token for the server PID, captured while the child is alive.
-            "server_start_ticks": rocm_core::process_start_ticks(child.id()),
-            "backend_state": "ready",
-            "backend_requested": backend,
-            "backend_mode": "lemonade-packaged-llama-server",
-            "load_response": {
-                "status": "loaded",
-                "method": "lemonade-packaged-llama-server",
-                "model_name": request.model_ref,
-                "model_path": model_path,
-                "llamacpp_backend": backend
-            },
-        }),
-    )?;
-    let status = child
-        .wait()
-        .context("failed waiting for Lemonade packaged llama-server")?;
-    mark_json_status(
-        &request.state_path,
-        if status.success() {
-            "stopped"
-        } else {
-            "failed"
-        },
-    )?;
-    if status.success() {
-        Ok(())
-    } else {
-        bail!("Lemonade packaged llama-server exited with status {status}")
-    }
-}
-
-fn wait_for_openai_models_ready(
-    host: &str,
-    port: u16,
-    model_ref: &str,
-    timeout: Duration,
-) -> Result<()> {
-    let endpoint = format_http_base_url(host, port);
-    let endpoint_api_key = rocm_engine_protocol::resolve_endpoint_api_key();
-    let start = std::time::Instant::now();
-    let mut last_error = None;
-    while start.elapsed() < timeout {
-        match http_get_text_with_auth(
-            &endpoint,
-            "/v1/models",
-            endpoint_api_key.as_deref(),
-            Duration::from_secs(3),
-        )
-        .and_then(|body| parse_models_ready(&body, model_ref))
-        {
-            Ok(true) => return Ok(()),
-            Ok(false) => last_error = Some("model was not reported by /v1/models".to_owned()),
-            Err(error) => last_error = Some(error.to_string()),
-        }
-        std::thread::sleep(Duration::from_millis(500));
-    }
-    bail!(
-        "Lemonade packaged llama-server did not become ready: {}",
-        last_error.unwrap_or_else(|| "not checked".to_owned())
-    )
-}
-
-fn parse_models_ready(body: &str, model_ref: &str) -> Result<bool> {
-    let value = serde_json::from_str::<Value>(body.trim())
-        .context("failed to parse /v1/models response")?;
-    Ok(models_payload_has_loaded_model(&value, model_ref))
-}
-
-fn models_payload_has_loaded_model(value: &Value, model_ref: &str) -> bool {
-    value
-        .get("data")
-        .or_else(|| value.get("models"))
-        .and_then(Value::as_array)
-        .is_some_and(|models| {
-            models.iter().any(|model| {
-                ["id", "model", "name"]
-                    .into_iter()
-                    .filter_map(|field| model.get(field).and_then(Value::as_str))
-                    .any(|loaded| model_names_match(loaded, model_ref))
-            })
-        })
-}
-
 /// Whether `/v1/models` advertises `model_ref` as ready to serve on GPU. A stock
 /// `llama-server` (direct-serve) entry has no `recipe_options` and is accepted by name,
 /// since the direct-serve path only runs GPU backends. A Lemonade-router entry carries
@@ -782,7 +565,7 @@ fn health_has_loaded_model(health: &Value, model_ref: &str, backend: &str) -> bo
         })
 }
 
-fn model_names_match(left: &str, right: &str) -> bool {
+pub(crate) fn model_names_match(left: &str, right: &str) -> bool {
     left.eq_ignore_ascii_case(right)
         || resolve_lemonade_model_ref(left).eq_ignore_ascii_case(&resolve_lemonade_model_ref(right))
 }
@@ -798,6 +581,7 @@ fn lemonade_backend_matches(value: &str, backend: &str) -> bool {
 mod tests {
     use super::*;
     use crate::DEFAULT_MODEL;
+    use serde_json::json;
 
     #[test]
     fn models_ready_accepts_direct_serve_and_gates_router_backend() {

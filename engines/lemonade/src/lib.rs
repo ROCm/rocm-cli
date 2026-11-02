@@ -534,7 +534,7 @@ fn serve_http(mut request: ServeHttpRequest) -> Result<()> {
             log_path,
         )?;
         let backend = crate::direct_llama::llama_server_backend_label(&server);
-        return crate::process::serve_direct_llama_server(
+        return crate::direct_llama::serve_direct_llama_server(
             &request,
             &runtime,
             &process_env,
@@ -604,7 +604,7 @@ fn serve_http(mut request: ServeHttpRequest) -> Result<()> {
         {
             let _ = crate::state::terminate_pid(child.id(), true);
             let _ = child.wait();
-            return crate::process::serve_direct_llama_server(
+            return crate::direct_llama::serve_direct_llama_server(
                 &request,
                 &runtime,
                 &process_env,
@@ -630,7 +630,7 @@ fn serve_http(mut request: ServeHttpRequest) -> Result<()> {
         {
             let _ = crate::state::terminate_pid(child.id(), true);
             let _ = child.wait();
-            return crate::process::serve_direct_llama_server(
+            return crate::direct_llama::serve_direct_llama_server(
                 &request,
                 &runtime,
                 &process_env,
