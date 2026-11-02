@@ -2181,7 +2181,7 @@ override that isn't a plain version token is refused rather than silently
 falling back, since it is interpolated into privileged shell commands:
 
 ```bash
-cargo test -p rocm --bin rocm driver_install
+cargo test -p rocm --bin rocm -- driver_install driver_plan
 ```
 
 `driver-install-06` in

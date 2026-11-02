@@ -16,6 +16,12 @@ use std::fmt::Write as _;
 
 use rocm_core::placeholder::empty_as_unknown;
 
+mod rocdxg;
+
+#[cfg(test)]
+pub(crate) use rocdxg::scoped_rocdxg_env;
+pub(crate) use rocdxg::wsl_rocdxg_driver_plan;
+
 #[derive(Debug, Clone)]
 pub(crate) struct DriverInstallPlan {
     pub(crate) supported: bool,
