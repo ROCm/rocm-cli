@@ -65,7 +65,8 @@ the result from `--json`:
   figures are still given when the reason is about the host (`no_gpu`,
   `accelerator_memory_unknown`, `unified_memory_unreadable`: what the model would
   need, with nothing to compare it to) and are null when it is about the file
-  (`header_unreadable`, `split_file`, `latent_attention`, `no_attention_layers`,
+  (`header_unreadable`, `not_a_model` for a multimodal projector named in place
+  of a model, `split_file`, `latent_attention`, `no_attention_layers`,
   `missing_metadata`)); what was asked for (`context_size`, `context_size_defaulted`,
   `kv_cache_type`); the memory figures (`weights_gib`, `kv_cache_gib`,
   `compute_buffer_gib`, `runtime_reserve_gib`, `total_gib`, the same in bytes as

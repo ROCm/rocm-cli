@@ -40,6 +40,7 @@
 //! under "Calibration against measured loads".
 
 use crate::gguf::{GgufHeader, MAX_BLOCK_COUNT};
+use crate::gguf_source::ProjectorNamed;
 use crate::model_readiness::{AcceleratorMemory, format_gib};
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -175,6 +176,9 @@ pub enum EstimateOutcome {
 pub enum CannotEstimateReason {
     /// The GGUF header could not be fetched or read.
     HeaderUnreadable,
+    /// The file named is a multimodal projector (`mmproj`), not a language
+    /// model, so there is no model to size.
+    NotAModel,
     /// The file is one shard of a split model; the metadata and the weights are
     /// spread over several files.
     SplitFile,
@@ -271,15 +275,28 @@ pub struct FitRequest {
 }
 
 impl ContextEstimate {
-    /// An estimate that could not be made because the header could not be
-    /// reached or read. Carries no figure: nothing was learnt about the model.
+    /// An estimate that could not be made because opening the file failed.
+    /// Carries no figure: nothing was learnt about the model.
+    ///
+    /// Usually the header could not be reached or read
+    /// ([`CannotEstimateReason::HeaderUnreadable`]). A name refused as a
+    /// multimodal projector ([`ProjectorNamed`]) is
+    /// [`CannotEstimateReason::NotAModel`] instead: nothing failed to be read, the
+    /// file is not a model.
     #[must_use]
     pub fn unreadable(source: &str, request: &FitRequest, error: &anyhow::Error) -> Self {
+        let (reason, detail) = match error.downcast_ref::<ProjectorNamed>() {
+            Some(refusal) => (CannotEstimateReason::NotAModel, refusal.to_string()),
+            None => (
+                CannotEstimateReason::HeaderUnreadable,
+                format!("the GGUF header could not be read: {error:#}"),
+            ),
+        };
         Self {
             source: source.to_owned(),
             outcome: EstimateOutcome::CannotEstimate,
-            cannot_estimate_reason: Some(CannotEstimateReason::HeaderUnreadable),
-            detail: Some(format!("the GGUF header could not be read: {error:#}")),
+            cannot_estimate_reason: Some(reason),
+            detail: Some(detail),
             architecture: None,
             layers: None,
             context_size: request.context_size,
@@ -958,8 +975,12 @@ fn offload_suggestion(
 pub fn evidence_lines(estimate: &ContextEstimate) -> Vec<String> {
     let mut lines = Vec::new();
     // Where the figures came from is only worth saying when there was a header
-    // to read them from; for an unreadable one the detail says what happened.
-    if estimate.cannot_estimate_reason != Some(CannotEstimateReason::HeaderUnreadable) {
+    // to read them from; for an unreadable one, or a file that is not a model,
+    // the detail says what happened.
+    if !matches!(
+        estimate.cannot_estimate_reason,
+        Some(CannotEstimateReason::HeaderUnreadable | CannotEstimateReason::NotAModel)
+    ) {
         lines.push(format!(
             "estimated from the GGUF header of {} ({} architecture, {} layers); the weights were \
              not downloaded",
@@ -2702,9 +2723,11 @@ mod tests {
     }
 
     /// A trained context below one step, on a card whose memory falls between the
-    /// exact total and the shown one, used to step below zero: a panic in a debug
-    /// build and a wrap to a huge context, then a loop, in a release one. The
-    /// answer is that no step fits.
+    /// exact total and the shown one, used to step below zero: plain subtraction
+    /// took 250 to `250 - CONTEXT_STEP`, a panic in a debug build and a wrap to a
+    /// huge context, then a loop, in a release one. The first step down now
+    /// rounds onto a whole step, and the answer is that no step fits. (The
+    /// `context > 0` guard at zero itself is covered by the next test.)
     #[test]
     fn a_trained_context_below_one_step_that_does_not_fit_gives_no_context() {
         let sizing = Sizing {
@@ -2719,6 +2742,33 @@ mod tests {
         // 250 tokens of mask is under a MiB and shows as one: 2281 MiB in all.
         let available = 2280.5 * MIB as f64;
         assert!(!sizing.fits(250, kv, available));
+        assert_eq!(sizing.max_context(available, kv, Some(250)), None);
+    }
+
+    /// Where the card's memory falls between the exact total at zero context and
+    /// the shown one, even zero context does not fit, yet the room left after the
+    /// exact fixed part is positive, so the search reaches zero (stepping down
+    /// from 256 with no cap, or rounding 250 down with one) and is stopped there
+    /// only by its `context > 0` guard. Without that guard it would step to
+    /// `0 - CONTEXT_STEP`: a panic in a debug build, a wrap in a release one. The
+    /// test above does not reach this, because there zero context fits.
+    #[test]
+    fn when_even_zero_context_does_not_fit_the_search_stops_at_zero() {
+        let sizing = Sizing {
+            data: 0.0,
+            // Half a MiB over 1000 MiB: shown as 1001, so the exact fixed part is
+            // 2280.5 MiB and the shown one 2281 MiB.
+            weights: 1000.5 * MIB as f64,
+            compute_base: 0.0,
+            kv_elements_per_token: 0.0,
+            widest_layer_kv_elements: 0.0,
+            layers: 1,
+        };
+        let kv = KvCacheType::F16;
+        let available = 2280.75 * MIB as f64;
+        assert!(available > sizing.fixed(), "the early return must not fire");
+        assert!(!sizing.fits(0, kv, available), "zero context must not fit");
+        assert_eq!(sizing.max_context(available, kv, None), None);
         assert_eq!(sizing.max_context(available, kv, Some(250)), None);
     }
 

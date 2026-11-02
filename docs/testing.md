@@ -3399,7 +3399,9 @@ the text report opens `ESTIMATED:` for the first two. The parts and their tests:
 - [gguf_source.rs](../crates/rocm-core/src/gguf_source.rs): reference parsing
   (an existing file wins over `owner/repo:QUANT`; `owner/repo:dir/file.gguf`
   names one of two same-named files), file selection (shards of one model versus
-  two models; a full path beats a bare name that matches a nested file), names
+  two models; a full path beats a bare name that matches a nested file; a
+  multimodal projector is never picked, and a name that matches only projectors
+  is refused as naming one), names
   in a listing that could leave the repository or hide in a terminal (dropped,
   and never requested), and the range reader, tested against a loopback server that
   records the ranges it is asked for, so a read of the weights would show, and
@@ -3408,11 +3410,21 @@ the text report opens `ESTIMATED:` for the first two. The parts and their tests:
 - [model_readiness.rs](../crates/rocm-core/src/model_readiness.rs): the
   host-memory states (dedicated, none, unknown, APU), what is attached to a
   curated or non-GGUF answer (nothing), and the text and JSON shapes.
+- [diagnose_model.rs](../apps/rocm/src/diagnose_model.rs) and
+  `classify_accelerator_memory` in [main.rs](../apps/rocm/src/main.rs): a
+  device mask that hides every GPU ("no GPU is visible", not a card of 0 GiB),
+  and the note for a mask on a host whose GPUs differ in memory. Both are unit
+  tests only: the hosted e2e runners have no GPU for a mask to hide, and no CI
+  lane has GPUs of different sizes.
 
 Scenario `diagnose-51` points `HF_ENDPOINT` at a loopback stand-in that counts
 requests, and shows that `rocm diagnose --report --model owner/repo:QUANT` makes
 none and says on stderr that `--model` was ignored, while the same question
-without `--report` does reach the endpoint and prints no such note.
+without `--report` does reach the endpoint and prints no such note. Scenario
+`diagnose-51` has the stand-in answer the repository listing with a model and
+its multimodal projector, and shows that naming the projector exactly is
+answered as a projector, with the model file named instead, after the listing
+request alone.
 
 Scenarios `diagnose-49` and `diagnose-50` write a small GGUF into the scenario's
 isolated directory and assert the shape and the sizes (weights and KV cache are
@@ -3423,7 +3435,7 @@ against a real GPU load; see [manual-testing.md](manual-testing.md) for the
 check that does.
 
 ```bash
-cargo xtask e2e -- -n '(diagnose-49|diagnose-50|diagnose-51)'
+cargo xtask e2e -- -n '(diagnose-49|diagnose-50|diagnose-51|diagnose-52)'
 ```
 
 ## Doctor Report Preflight

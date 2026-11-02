@@ -3577,9 +3577,13 @@ async fn assert_gguf_text_report_is_labelled(world: &mut E2eWorld) {
     );
 }
 
-#[given("a Hugging Face endpoint that records every request made to it")]
-async fn a_hub_endpoint_that_counts_requests(world: &mut E2eWorld) {
-    use std::io::Write as _;
+/// Start a stand-in Hugging Face endpoint on a loopback port and point the CLI at
+/// it. It counts every connection. A repository listing request
+/// (`/api/models/...`) is answered with `listing` when one is given; every other
+/// request, and a listing when none is given, gets an empty 404. It stops when
+/// the World lets go of its handle, so a scenario leaves no thread behind.
+fn start_stand_in_hub(world: &mut E2eWorld, listing: Option<&'static str>) {
+    use std::io::{Read as _, Write as _};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind the stand-in hub");
@@ -3590,15 +3594,30 @@ async fn a_hub_endpoint_that_counts_requests(world: &mut E2eWorld) {
     let requests = Arc::new(AtomicUsize::new(0));
     let seen = Arc::clone(&requests);
     std::thread::spawn(move || {
-        // Answers every connection with an empty 404 and counts it. Stops when the
-        // World lets go of its handle, so a scenario leaves no thread behind.
         while Arc::strong_count(&seen) > 1 {
             match listener.accept() {
                 Ok((mut stream, _)) => {
                     seen.fetch_add(1, Ordering::SeqCst);
-                    let _ = stream.write_all(
-                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                    );
+                    let _ = stream.set_nonblocking(false);
+                    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                    // The request line is all that is needed, and it arrives first.
+                    let mut buf = [0_u8; 2048];
+                    let read = stream.read(&mut buf).unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buf[..read]);
+                    let is_listing = request
+                        .split_whitespace()
+                        .nth(1)
+                        .is_some_and(|path| path.starts_with("/api/models/"));
+                    let response = match listing {
+                        Some(body) if is_listing => format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        ),
+                        _ => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_owned(),
+                    };
+                    let _ = stream.write_all(response.as_bytes());
                 }
                 Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
             }
@@ -3608,6 +3627,71 @@ async fn a_hub_endpoint_that_counts_requests(world: &mut E2eWorld) {
     world
         .command_env
         .push(("HF_ENDPOINT", format!("http://127.0.0.1:{port}").into()));
+}
+
+#[given("a Hugging Face endpoint that records every request made to it")]
+async fn a_hub_endpoint_that_counts_requests(world: &mut E2eWorld) {
+    start_stand_in_hub(world, None);
+}
+
+/// A repository holding one model and its multimodal projector, as llama.cpp
+/// vision models ship. Sizes are given so no `HEAD` request is needed.
+const MODEL_AND_PROJECTOR_LISTING: &str = r#"{"siblings":[{"rfilename":"e2e-model-Q4_K_M.gguf","size":1048576},{"rfilename":"mmproj-e2e-model-f16.gguf","size":1048576}]}"#;
+
+#[given("a Hugging Face repository that holds a model and its multimodal projector")]
+async fn a_hub_repository_with_a_model_and_a_projector(world: &mut E2eWorld) {
+    start_stand_in_hub(world, Some(MODEL_AND_PROJECTOR_LISTING));
+}
+
+#[when("the user asks the CLI whether the projector file would run, naming it exactly")]
+async fn user_asks_about_the_projector_file(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(
+        world,
+        &[
+            "diagnose",
+            "--model",
+            "e2e-owner/e2e-repo:mmproj-e2e-model-f16.gguf",
+        ],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the CLI says the file is a multimodal projector and names the model file instead")]
+async fn assert_the_cli_named_the_projector_and_the_model(world: &mut E2eWorld) {
+    assert_eq!(world.cli_rc, Some(0), "{:?}", world.cli_stderr);
+    let output = world.cli_output.clone().unwrap_or_default();
+    assert!(
+        output.contains("names a multimodal projector (mmproj), not a language model"),
+        "{output}"
+    );
+    assert!(output.contains("e2e-model-Q4_K_M.gguf"), "{output}");
+    assert!(!output.contains("no GGUF file matching"), "{output}");
+    // Nothing points the user back at the file it refused.
+    assert!(
+        !output.contains("rocm serve e2e-owner/e2e-repo:mmproj"),
+        "the refused projector was offered as a serve command:\n{output}"
+    );
+    // The one model in the repository is offered by its exact name.
+    assert!(
+        output.contains(
+            "verify after fix: rocm diagnose --model e2e-owner/e2e-repo:e2e-model-Q4_K_M.gguf"
+        ),
+        "{output}"
+    );
+    assert!(!output.contains("header could not be read"), "{output}");
+}
+
+#[then("the endpoint was asked only for the repository's file list")]
+async fn assert_only_the_listing_was_requested(world: &mut E2eWorld) {
+    let seen = world
+        .hub_requests
+        .as_ref()
+        .expect("no stand-in hub")
+        .load(std::sync::atomic::Ordering::SeqCst);
+    // One listing request; the projector was refused before any header read.
+    assert_eq!(seen, 1, "the hub was asked {seen} time(s)");
 }
 
 const HUB_MODEL_REF: &str = "e2e-owner/e2e-repo:Q4_K_M";

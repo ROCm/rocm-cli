@@ -1304,7 +1304,10 @@ Expected result:
 Also check the refusals: `owner/repo` with no `:QUANT` reads nothing and, with a
 `--context-size`, says a quantization is needed; a repository that does not
 exist says it was not found; a `.gguf` path that does not exist says it could
-not be opened and does not point at the upstream tracker. None downloads
+not be opened and does not point at the upstream tracker; and naming a vision
+model's `mmproj-*.gguf` file on Hugging Face (`owner/repo:mmproj-....gguf`) says
+it is a multimodal projector, not a model, names the model file instead, and
+does not suggest `rocm serve` for the projector. None downloads
 anything.
 
 Finally, `rocm diagnose --report --model <owner>/<repo>:Q4_K_M --context-size

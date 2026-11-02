@@ -825,8 +825,13 @@ Pass a local `.gguf` path, or `owner/repo:QUANT` for a file on Hugging Face
 (for example `owner/repo:Q4_K_M`, or an exact file name ending in `.gguf`, with
 its directory when the file is in one and another file shares its name:
 `owner/repo:dir/model-Q4_K_M.gguf`; a bare name means the file at the top of the
-repository when there is one). A file that exists on this machine is read
-as that file even when its name looks like `owner/repo:QUANT`. A bare
+repository when there is one). On Hugging Face, a multimodal projector (an `mmproj`
+file shipped beside a vision model) is never picked as the model, and naming one
+by its file name is answered as such, with the repository's model files named
+instead. A local projector file is not recognised as one; it is read like any
+other GGUF. A file that
+exists on this machine is read as that file even when its name looks like
+`owner/repo:QUANT`. A bare
 `owner/repo`, with no quantization, names a repository rather than a file and
 is answered like any other model outside the catalog: undetermined, with
 nothing read.

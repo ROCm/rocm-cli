@@ -154,40 +154,113 @@ fn has_label(name: &str, label: &str) -> bool {
     })
 }
 
+/// A name that matches only multimodal projectors, which are not models.
+///
+/// Raised by [`select_gguf_file`] as a typed error so a caller can tell it from
+/// a file that could not be found or read, and offer one of `models` instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectorNamed {
+    /// What the user named, as they wrote it.
+    pub variant: String,
+    /// The repository's model files (every GGUF that is not a projector), by
+    /// full name.
+    pub models: Vec<String>,
+}
+
+impl std::fmt::Display for ProjectorNamed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Capped as `names_for_error` caps a listing; `models` itself stays
+        // complete.
+        const SHOWN: usize = 8;
+        let models = if self.models.is_empty() {
+            "none: every GGUF file in it is a projector".to_owned()
+        } else {
+            let mut shown: Vec<&str> = self.models.iter().take(SHOWN).map(String::as_str).collect();
+            if self.models.len() > SHOWN {
+                shown.push("...");
+            }
+            shown.join(", ")
+        };
+        write!(
+            f,
+            "`{}` names a multimodal projector (mmproj), not a language model; name the \
+             model's own GGUF file or its quantization (the repository's models: {models})",
+            self.variant
+        )
+    }
+}
+
+impl std::error::Error for ProjectorNamed {}
+
+/// Whether a GGUF file name is a multimodal projector (`mmproj`, in any case),
+/// which ships beside a vision model and is not a language model itself.
+#[must_use]
+pub fn names_projector(name: &str) -> bool {
+    name.to_ascii_lowercase().contains("mmproj")
+}
+
 /// Pick the GGUF file a `variant` names out of a repository's files.
 ///
 /// An exact file name, or a quantization label as `rocm serve` takes it. Never
 /// picks between two quantizations: a label that matches several files is an
 /// error listing them, except that the shards of one split model resolve to
-/// their first shard.
+/// their first shard. A multimodal projector (`mmproj` in its name, in any
+/// case) is not a model: it is never picked, and a file name that matches only
+/// projectors is refused as naming one ([`ProjectorNamed`]) rather than
+/// reported as missing. A quantization label that matches only a projector is
+/// reported as matching nothing.
 ///
 /// # Errors
 ///
-/// When nothing matches, or the match is ambiguous.
+/// When nothing matches, the match is ambiguous, or the file named is a
+/// projector.
 pub fn select_gguf_file<'a>(files: &'a [HubFile], variant: &str) -> Result<&'a HubFile> {
-    let ggufs: Vec<&HubFile> = files
+    let is_projector = |file: &HubFile| names_projector(&file.name);
+    let all_ggufs: Vec<&HubFile> = files
         .iter()
         .filter(|file| file.name.to_ascii_lowercase().ends_with(".gguf"))
-        .filter(|file| !file.name.to_ascii_lowercase().contains("mmproj"))
+        .collect();
+    let ggufs: Vec<&HubFile> = all_ggufs
+        .iter()
+        .copied()
+        .filter(|file| !is_projector(file))
         .collect();
     let matches: Vec<&HubFile> = if variant.to_ascii_lowercase().ends_with(".gguf") {
         // A name is unique in a repository, so one that matches in full is the
         // file asked for, even where another file in a directory has the same
-        // last component (`m.gguf` at the root, `dir/m.gguf` below it).
-        let exact: Vec<&HubFile> = ggufs
+        // last component (`m.gguf` at the root, `dir/m.gguf` below it). Searched
+        // over every GGUF, projectors included, so that naming one is answered
+        // for what it is.
+        let exact: Vec<&HubFile> = all_ggufs
             .iter()
             .copied()
             .filter(|file| file.name == variant)
             .collect();
-        if exact.is_empty() {
-            ggufs
+        let named = if exact.is_empty() {
+            all_ggufs
                 .iter()
                 .copied()
                 .filter(|file| file.name.rsplit('/').next() == Some(variant))
                 .collect()
         } else {
             exact
+        };
+        // A projector named this way is not the model asked for. Where the name
+        // also matches a model (a bare name both share), the model is the
+        // answer; where it matches only projectors, the user is told what they
+        // named rather than that it is missing.
+        let models: Vec<&HubFile> = named
+            .iter()
+            .copied()
+            .filter(|file| !is_projector(file))
+            .collect();
+        if models.is_empty() && !named.is_empty() {
+            return Err(anyhow::Error::new(ProjectorNamed {
+                variant: variant.to_owned(),
+                models: ggufs.iter().map(|file| file.name.clone()).collect(),
+            }));
         }
+        models
     } else {
         ggufs
             .iter()
@@ -199,7 +272,11 @@ pub fn select_gguf_file<'a>(files: &'a [HubFile], variant: &str) -> Result<&'a H
         [only] => Ok(only),
         [] => bail!(
             "no GGUF file matching `{variant}` in the repository (it has: {})",
-            names_for_error(&ggufs)
+            if ggufs.is_empty() && !all_ggufs.is_empty() {
+                "no model GGUF files; every one in it is a multimodal projector".to_owned()
+            } else {
+                names_for_error(&ggufs)
+            }
         ),
         several => first_shard_of_one_set(several).ok_or_else(|| {
             anyhow!(
@@ -281,7 +358,9 @@ pub struct OpenedGguf {
 pub trait GgufSource {
     /// # Errors
     ///
-    /// When the file cannot be found or reached.
+    /// When the file cannot be found or reached, or (for a hub file named by
+    /// its file name) is a multimodal projector: then the error is a
+    /// [`ProjectorNamed`], which a caller can downcast to.
     fn open(&self, reference: &GgufRef) -> Result<OpenedGguf>;
 }
 
@@ -822,6 +901,81 @@ mod tests {
                     .all(|request| request.ends_with("/o/r/resolve/main/ok-Q4_K_M.gguf")),
             "{requests:?}"
         );
+    }
+
+    /// A projector is never picked as the model, but a name that matches only
+    /// projectors says what it named, rather than that the repository has no
+    /// such file (which is what filtering projectors out before the match used to
+    /// say, with the file missing from the list too).
+    #[test]
+    fn a_name_that_matches_only_projectors_is_refused_as_naming_a_projector() {
+        let files = [
+            file("m-Q4_K_M.gguf", 5),
+            file("mmproj-m-f16.gguf", 1),
+            file("vision/MMPROJ-Q8_0.gguf", 1),
+            file("x/mmproj.gguf", 1),
+            file("y/mmproj.gguf", 1),
+        ];
+        for named in [
+            "mmproj-m-f16.gguf",
+            "vision/MMPROJ-Q8_0.gguf",
+            "MMPROJ-Q8_0.gguf",
+            "mmproj.gguf",
+        ] {
+            let error = select_gguf_file(&files, named).unwrap_err().to_string();
+            assert!(error.contains("multimodal projector"), "{named}: {error}");
+            assert!(!error.contains("no GGUF file matching"), "{named}: {error}");
+            assert!(!error.contains("matches several files"), "{named}: {error}");
+            // The model is listed as the alternative, and no projector is.
+            let models = error.split("the repository's models:").nth(1).unwrap_or("");
+            assert!(models.contains("m-Q4_K_M.gguf"), "{named}: {error}");
+            assert!(
+                !models.to_ascii_lowercase().contains("mmproj"),
+                "{named}: {error}"
+            );
+        }
+        // The model itself is still picked by name and by label.
+        assert_eq!(
+            select_gguf_file(&files, "m-Q4_K_M.gguf").unwrap().name,
+            "m-Q4_K_M.gguf"
+        );
+        assert_eq!(
+            select_gguf_file(&files, "Q4_K_M").unwrap().name,
+            "m-Q4_K_M.gguf"
+        );
+        // A name that matches nothing at all is still "no such file".
+        let missing = select_gguf_file(&files, "other.gguf")
+            .unwrap_err()
+            .to_string();
+        assert!(missing.contains("no GGUF file matching"), "{missing}");
+    }
+
+    /// A bare name shared by a model and a projector picks the model, as it did
+    /// before projectors were searched by name at all.
+    #[test]
+    fn a_bare_name_shared_with_a_projector_picks_the_model() {
+        let files = [file("a/m.gguf", 5), file("mmproj/m.gguf", 1)];
+        assert_eq!(select_gguf_file(&files, "m.gguf").unwrap().name, "a/m.gguf");
+    }
+
+    /// A repository with nothing but projectors says so, not that it has no GGUF.
+    #[test]
+    fn a_repository_of_only_projectors_says_it_has_no_model() {
+        let files = [file("mmproj-a.gguf", 1)];
+        let error = select_gguf_file(&files, "mmproj-a.gguf")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("every GGUF file in it is a projector"),
+            "{error}"
+        );
+        // Asked for something else, it still does not claim to have no GGUF.
+        let other = select_gguf_file(&files, "Q4_K_M").unwrap_err().to_string();
+        assert!(
+            other.contains("every one in it is a multimodal projector"),
+            "{other}"
+        );
+        assert!(!other.contains("it has: no GGUF files"), "{other}");
     }
 
     #[test]

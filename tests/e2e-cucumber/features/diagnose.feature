@@ -793,3 +793,14 @@ Feature: Diagnosing failures and listing fixes
     When the user asks the CLI the same model question without preparing a report
     Then the endpoint was asked about the model
     And the CLI does not say the model was ignored
+
+  # A llama.cpp vision model ships its multimodal projector (mmproj) beside the
+  # model. Naming the projector exactly is answered for what it is, with the
+  # model file named instead, rather than as a file the repository lacks; and
+  # it is refused from the listing alone, before any header is read.
+  @id:diagnose-a-projector-named-exactly-is-answered-as-a-projector
+  Scenario: diagnose-51 - Naming a model's multimodal projector says what it is and names the model
+    Given a Hugging Face repository that holds a model and its multimodal projector
+    When the user asks the CLI whether the projector file would run, naming it exactly
+    Then the CLI says the file is a multimodal projector and names the model file instead
+    And the endpoint was asked only for the repository's file list

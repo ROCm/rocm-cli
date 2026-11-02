@@ -46,7 +46,7 @@ use crate::gguf_fit::{
     CannotEstimateReason, ContextEstimate, ESTIMATE_CAVEAT, EstimateOutcome, FitRequest,
     KvCacheType, SERVE_OPTIONS_NOTE, estimate_fit, evidence_lines, tokens,
 };
-use crate::gguf_source::{GgufRef, GgufSource, parse_gguf_ref};
+use crate::gguf_source::{GgufRef, GgufSource, ProjectorNamed, parse_gguf_ref};
 use serde::{Deserialize, Serialize};
 
 /// How many fallback alternatives to offer when a recipe declares none that fit.
@@ -736,9 +736,9 @@ pub fn attach_context_estimate(
             reference,
             fit_request,
         } => {
-            let estimate =
+            let (estimate, refused_models) =
                 read_context_estimate(&reference, &readiness.model_ref, &fit_request, host, source);
-            apply_context_estimate(readiness, &reference, estimate);
+            apply_context_estimate(readiness, &reference, estimate, refused_models.as_deref());
         }
     }
 }
@@ -815,29 +815,42 @@ fn plan_context_estimate(readiness: &ModelReadiness, request: &ContextRequest) -
 
 /// Read `reference`'s header through `source` and size it against `host`. A
 /// header that cannot be reached or read is an estimate with no figures, named
-/// after `model_ref` as the user wrote it.
+/// after `model_ref` as the user wrote it. When the name was refused as a
+/// multimodal projector, the repository's model files come back as well, for
+/// the plan to offer one.
 fn read_context_estimate(
     reference: &GgufRef,
     model_ref: &str,
     fit_request: &FitRequest,
     host: &HostFacts,
     source: &dyn GgufSource,
-) -> ContextEstimate {
+) -> (ContextEstimate, Option<Vec<String>>) {
     let read = source.open(reference).and_then(|mut opened| {
         let header =
             parse_gguf_header(&mut opened.reader).map_err(|error| anyhow::anyhow!("{error}"))?;
         Ok((header, opened.size, opened.description))
     });
     match read {
-        Ok((header, size, description)) => estimate_fit(
-            &header,
-            size,
-            &description,
-            fit_request,
-            host.accelerator_memory,
-            host.system_ram_gib,
+        Ok((header, size, description)) => (
+            estimate_fit(
+                &header,
+                size,
+                &description,
+                fit_request,
+                host.accelerator_memory,
+                host.system_ram_gib,
+            ),
+            None,
         ),
-        Err(error) => ContextEstimate::unreadable(model_ref, fit_request, &error),
+        Err(error) => {
+            let refused_models = error
+                .downcast_ref::<ProjectorNamed>()
+                .map(|refusal| refusal.models.clone());
+            (
+                ContextEstimate::unreadable(model_ref, fit_request, &error),
+                refused_models,
+            )
+        }
     }
 }
 
@@ -848,6 +861,7 @@ fn apply_context_estimate(
     readiness: &mut ModelReadiness,
     reference: &GgufRef,
     estimate: ContextEstimate,
+    refused_models: Option<&[String]>,
 ) {
     readiness.evidence.extend(evidence_lines(&estimate));
     // The route sends a user to the upstream tracker because the catalog lacks
@@ -859,8 +873,9 @@ fn apply_context_estimate(
         // The header was read and sized, so the "serve it directly and read the
         // engine's refusal" plan answered a question that no longer applies --
         // whether or not this host could be compared against. It stays when the
-        // header could not be read: then nothing was learnt and it is still the
-        // honest next step.
+        // header could not be read (nothing was learnt, so it is still the honest
+        // next step), except where the branches below replace it: a local path,
+        // and a hub name refused as a projector.
         readiness.fix = None;
         if estimate.outcome == EstimateOutcome::Fits {
             readiness.alternatives.clear();
@@ -877,6 +892,8 @@ fn apply_context_estimate(
             verify: format!("rocm diagnose --model {}", readiness.model_ref),
             ..Fix::default()
         });
+    } else if estimate.cannot_estimate_reason == Some(CannotEstimateReason::NotAModel) {
+        readiness.fix = Some(projector_fix(reference, refused_models));
     } else if let Some(fix) = &mut readiness.fix {
         point_fix_at_unsized_gguf(fix, reference, &readiness.model_ref);
     }
@@ -884,6 +901,43 @@ fn apply_context_estimate(
         readiness.warnings.push(SERVE_OPTIONS_NOTE.to_owned());
     }
     readiness.estimate = Some(estimate);
+}
+
+/// The plan for a name refused as a multimodal projector. "Serve it and read
+/// the engine's refusal" would point back at the file just refused, so the plan
+/// is to ask about the model instead: by its exact file name when the
+/// repository holds one model, and with no command when it holds several (the
+/// estimate's detail lists them) or none.
+fn projector_fix(reference: &GgufRef, models: Option<&[String]>) -> Fix {
+    let summary = "name the model's own GGUF file or quantization, not its multimodal projector, \
+                   then ask again"
+        .to_owned();
+    // The model's name comes from the hub's listing, not from the user, so it is
+    // offered only when it reads back as that same hub file: a name the parser
+    // would take for a local path, or that a shell would expand, is not printed
+    // as a command.
+    let verify = match (reference, models) {
+        (GgufRef::Hub { owner, repo, .. }, Some([only])) => {
+            let candidate = format!("{owner}/{repo}:{only}");
+            let reads_back = parse_gguf_ref(&candidate)
+                == Some(GgufRef::Hub {
+                    owner: owner.clone(),
+                    repo: repo.clone(),
+                    variant: Some(only.clone()),
+                });
+            if reads_back {
+                format!("rocm diagnose --model {candidate}")
+            } else {
+                String::new()
+            }
+        }
+        _ => String::new(),
+    };
+    Fix {
+        summary,
+        verify,
+        ..Fix::default()
+    }
 }
 
 /// Rewrite the "serve it and see" plan for a GGUF reference whose header was
@@ -1531,6 +1585,9 @@ mod tests {
         /// weights it pretends to carry, so no test allocates a real model.
         size: u64,
         opened: Mutex<Vec<GgufRef>>,
+        /// When set, opening refuses the name as a multimodal projector, as
+        /// file selection does, listing these model files.
+        refusal: Option<Vec<String>>,
     }
 
     impl FakeSource {
@@ -1539,6 +1596,7 @@ mod tests {
                 size: file.len() as u64,
                 file: Some(file),
                 opened: Mutex::new(Vec::new()),
+                refusal: None,
             }
         }
 
@@ -1550,6 +1608,7 @@ mod tests {
                 size: header.len() as u64 + weights_mib * 1024 * 1024,
                 file: Some(header),
                 opened: Mutex::new(Vec::new()),
+                refusal: None,
             }
         }
 
@@ -1558,6 +1617,15 @@ mod tests {
                 file: None,
                 size: 0,
                 opened: Mutex::new(Vec::new()),
+                refusal: None,
+            }
+        }
+
+        /// A hub that refuses the name as a projector, with `models` beside it.
+        fn refusing_a_projector(models: &[&str]) -> Self {
+            Self {
+                refusal: Some(models.iter().map(|&model| model.to_owned()).collect()),
+                ..Self::failing()
             }
         }
 
@@ -1569,6 +1637,12 @@ mod tests {
     impl GgufSource for FakeSource {
         fn open(&self, reference: &GgufRef) -> anyhow::Result<OpenedGguf> {
             self.opened.lock().unwrap().push(reference.clone());
+            if let (Some(models), GgufRef::Hub { variant, .. }) = (&self.refusal, reference) {
+                return Err(anyhow::Error::new(ProjectorNamed {
+                    variant: variant.clone().unwrap_or_default(),
+                    models: models.clone(),
+                }));
+            }
             let Some(file) = &self.file else {
                 anyhow::bail!("the hub could not be reached");
             };
@@ -1650,6 +1724,87 @@ mod tests {
             plan_context_estimate(&curated, &both),
             ContextPlan::LeaveAsIs { note: Some(note) } if note.contains("curated recipe")
         ));
+    }
+
+    /// A name refused as a projector is `not_a_model`, and the plan points at
+    /// the model rather than at serving the projector it refused: by its exact
+    /// name when there is one model, and with no command to run otherwise.
+    #[test]
+    fn a_refused_projector_is_not_offered_back_as_a_serve_command() {
+        let refused = |models: &[&str]| {
+            let mut readiness = not_curated("some-lab/vision-7b:mmproj-vision-7b-f16.gguf");
+            attach_context_estimate(
+                &mut readiness,
+                &ContextRequest::default(),
+                &host_with(24.0, 64.0),
+                &FakeSource::refusing_a_projector(models),
+            );
+            readiness
+        };
+        let one = refused(&["vision-7b-Q4_K_M.gguf"]);
+        let estimate = one.estimate.as_ref().expect("an estimate");
+        assert_eq!(
+            estimate.cannot_estimate_reason,
+            Some(CannotEstimateReason::NotAModel)
+        );
+        assert!(
+            estimate
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.starts_with("`mmproj-vision-7b-f16.gguf` names a")),
+            "{:?}",
+            estimate.detail
+        );
+        let fix = one.fix.as_ref().expect("a plan for the user");
+        assert!(
+            fix.summary.contains("not its multimodal projector"),
+            "{fix:?}"
+        );
+        assert_eq!(
+            fix.verify,
+            "rocm diagnose --model some-lab/vision-7b:vision-7b-Q4_K_M.gguf"
+        );
+        let text = render_model_readiness_text(&one);
+        assert!(!text.contains("header could not be read"), "{text}");
+        // No header was read, so the report does not say the figures came from one.
+        assert!(!text.contains("estimated from the GGUF header"), "{text}");
+        assert!(!text.contains("rocm serve"), "{text}");
+        // A listed name the parser would not read back as that hub file (a shell
+        // expansion, a space) is not printed as a command.
+        for unsafe_name in ["x$(id).gguf", "my model.gguf"] {
+            let odd = refused(&[unsafe_name]);
+            assert_eq!(
+                odd.fix.as_ref().map(|fix| fix.verify.as_str()),
+                Some(""),
+                "{unsafe_name}"
+            );
+        }
+        // Several models: no single command to name, so none is given.
+        let several = refused(&["vision-7b-Q4_K_M.gguf", "vision-7b-Q8_0.gguf"]);
+        assert_eq!(
+            several.fix.as_ref().map(|fix| fix.verify.as_str()),
+            Some("")
+        );
+        // A projector-like name that failed for another reason (an unreachable
+        // hub) is not blamed on the name: it keeps the unreadable answer.
+        let mut unreachable = not_curated("some-lab/vision-7b:mmproj-vision-7b-f16.gguf");
+        attach_context_estimate(
+            &mut unreachable,
+            &ContextRequest::default(),
+            &host_with(24.0, 64.0),
+            &FakeSource::failing(),
+        );
+        assert_eq!(
+            unreachable
+                .estimate
+                .and_then(|estimate| estimate.cannot_estimate_reason),
+            Some(CannotEstimateReason::HeaderUnreadable)
+        );
+        assert!(
+            unreachable
+                .fix
+                .is_some_and(|fix| !fix.summary.contains("multimodal projector")),
+        );
     }
 
     #[test]
