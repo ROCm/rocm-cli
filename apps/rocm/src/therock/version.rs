@@ -31,8 +31,9 @@ pub(super) struct ParsedVersion {
 /// `ParsedVersion` is what [`parse_version`]'s strict grammar gate yields, and
 /// is never compared: the PyTorch stack matchers read its `major`, `minor` and
 /// `stage`, and the layout selection its `major`. This one exists only to be
-/// compared, so its release segment is a vector and it has no fields a caller
-/// would reach into.
+/// compared, so its release segment is a vector. Callers do not build or edit
+/// one; only `release` and `stage` are `pub(super)`, because the property
+/// tests read them.
 ///
 /// Field order is the comparison order, and it is PEP 440's: release segment
 /// first, then stage, then the stage's number.
@@ -67,7 +68,7 @@ pub(super) enum VersionStage {
 }
 
 /// Total order over published version strings — the total order used for
-/// sorting candidates in this module's "which build does the user get?"
+/// sorting candidates in the `therock` module's "which build does the user get?"
 /// decisions. It is not always the first key: [`super::select_tarball_candidate`]
 /// orders by upload time first and uses this only to break ties.
 ///

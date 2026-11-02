@@ -3,8 +3,11 @@
 // SPDX-License-Identifier: MIT
 
 //! Filesystem helpers behind TheRock installs: unique scratch directories and
-//! the stage-then-publish atomic file writes used for the metadata cache, the
-//! startup update-check record and runtime registry files.
+//! the stage-then-publish atomic file writes. The writes serve the metadata
+//! cache entries and the staged metadata public key, the startup update-check
+//! record, and (through `therock`'s re-export of `write_file_atomically`) the
+//! active-runtime marker that `runtimes_cmd` maintains. Runtime registry
+//! manifests do not go through these writers.
 //!
 //! A leaf of the `therock` module: nothing here depends on the rest of it.
 

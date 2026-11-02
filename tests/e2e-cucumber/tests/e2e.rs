@@ -1282,7 +1282,7 @@ async fn main() {
     // point `shared_cache_dir()`/`shared_runtimes_dir()`/`shared_uv_cache_dir()`
     // at one persistent dir (see `isolate_env`): readers extracting an archive
     // and a concurrent `remove_file`/`remove_dir_all` of that same archive or
-    // runtime tree after another scenario's extract (`uv.rs`, `therock.rs`,
+    // runtime tree after another scenario's extract (`uv.rs`, `therock/process.rs`,
     // rocm-engine-lemonade's `prepare_embeddable`) would otherwise race.
     // `cap.has_amd_gpu` is a capability *probe* that can disagree with what a
     // lane actually exports (e.g. a missing GPU driver reads `false` while a

@@ -3,7 +3,8 @@
 // SPDX-License-Identifier: MIT
 
 /// Property-based tests for version ordering and update-source selection.
-/// A child module so it can reach this module's private comparators directly.
+/// A child module so it can reach this module's private items, and the
+/// `pub(super)` comparators in `version`, directly.
 #[cfg(test)]
 #[path = "therock_version_proptests.rs"]
 mod version_proptests;
@@ -5587,8 +5588,10 @@ mod tests {
     #[test]
     #[allow(unsafe_code)] // std::env::set_var is unsafe in edition 2024
     fn render_update_json_installs_the_suppression_guard_around_resolution() -> Result<()> {
-        // Unlike the two tests above (which only exercise the guard's own
-        // bookkeeping in isolation), this proves `render_update_json` itself
+        // Unlike the two guard tests in `therock::process`
+        // (`suppress_progress_output_contract` and
+        // `progress_line_is_suppressed_while_guard_is_held`, which exercise the
+        // guard in isolation), this proves `render_update_json` itself
         // installs the guard around a code path that *actually reaches* a
         // live `progress_line` call: a wheel-format manifest whose only PATH
         // python is a non-executable stub fails
@@ -5609,8 +5612,9 @@ mod tests {
         //
         // The lock below is no longer for `PATH`: it's still needed because
         // this test mutates the real `ROCM_CLI_DISABLE_MANAGED_PYTHON_BOOTSTRAP`
-        // process env var below, and every process-env-mutating test in this
-        // file takes this lock.
+        // process env var below, and every process-env-mutating test in
+        // `therock` (this file and its child modules) takes this lock, which
+        // lives in `test_support`.
         let _env_guard = PROCESS_ENV_TEST_LOCK.lock().unwrap();
         let (root, paths) = test_paths("render-update-json-installs-guard");
 
@@ -7606,11 +7610,11 @@ mod tests {
 
     #[test]
     fn nested_python_resolver_env_override_restores_the_outer_one_on_drop() {
-        // Mirrors `suppress_progress_output_contract`'s bookkeeping check for
-        // `SuppressProgressOutput`: proves the same restore-previous
-        // composition for `OverridePythonResolverEnv`, which its doc comment
-        // claims but nothing else here exercises. Thread-local, so this
-        // doesn't race with other tests' threads.
+        // Mirrors the bookkeeping check `suppress_progress_output_contract` (in
+        // `therock::process`) makes for `SuppressProgressOutput`: proves the
+        // same restore-previous composition for `OverridePythonResolverEnv`,
+        // which its doc comment claims but no other test exercises.
+        // Thread-local, so this doesn't race with other tests' threads.
         assert!(python_resolver_env_override().is_none());
         {
             let _outer = OverridePythonResolverEnv::new(PythonResolverEnv {
@@ -7869,10 +7873,11 @@ exit 1
         //
         // Deliberate gap: this only covers the all-error case. Asserting a
         // successful row survives alongside a failing one would need a second
-        // manifest that resolves for real, and no fixture here stands up a
-        // resolvable wheel index — only a raw-body local HTTP server exists,
-        // for `native_http_download_and_get_round_trip_without_powershell`'s
-        // lower-level use. Not worth building just for this one assertion.
+        // manifest that resolves for real, and no fixture in this module stands
+        // up a resolvable wheel index — only the raw-body local HTTP servers
+        // that the `therock::fetch` tests start exist (for example in
+        // `native_http_download_and_get_round_trip_without_powershell`), for
+        // their lower-level use. Not worth building just for this one assertion.
         let mut manifest = test_runtime_manifest("active", "therock-release:gfx120X-all", 1);
         manifest.channel = "unsupported-channel".to_owned();
         write_test_runtime_manifest(&paths, &manifest)?;

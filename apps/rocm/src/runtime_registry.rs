@@ -3,15 +3,20 @@
 // SPDX-License-Identifier: MIT
 
 //! The installed-runtime registry: the manifest model every runtime install
-//! writes, where those manifests live on disk, and the loaders that read them
-//! back.
+//! writes, where those manifests live on disk, the loaders that read them back,
+//! and the registry selection and activation validation built on them (picking
+//! the active or a named runtime, and checking that a manifest is usable).
 //!
-//! This is a crate-level module so that `therock` (which writes manifests when
-//! it installs a runtime) and `runtimes_cmd` (which lists, selects and
-//! activates them) can both depend on it without depending on each other. The
-//! serde shape of [`InstalledRuntimeManifest`] and its probe structs is the
-//! on-disk contract of the registry files and of each install's
-//! `.rocm-cli-runtime.json`.
+//! This is a crate-level module that depends on neither `therock` (which writes
+//! manifests when it installs a runtime) nor `runtimes_cmd` (which lists and
+//! activates them); both build on it. `runtimes_cmd` re-exports the selection
+//! and path-helper names that other modules import from it, but it still
+//! reaches the manifest model (the manifest and probe types and the loaders)
+//! through `therock`'s re-exports, along with a few `therock` helpers. So
+//! `runtimes_cmd` depends on `therock`, while `therock` no longer depends on
+//! `runtimes_cmd` in production code. The serde shape of
+//! [`InstalledRuntimeManifest`] and its probe structs is the on-disk contract of
+//! the registry files and of each install's `.rocm-cli-runtime.json`.
 
 use anyhow::{Context, Result, bail};
 use rocm_core::{
