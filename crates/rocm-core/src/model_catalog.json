@@ -4,13 +4,13 @@
   "generated_at_unix_ms": null,
   "platforms": [
     {
-      "label": "AMD Ryzen AI - Strix Halo (Lemonade / llama.cpp)",
-      "engines": ["lemonade", "llama.cpp", "llamacpp"],
+      "label": "AMD Ryzen AI - Strix Halo (Lemonade / llama.cpp / AIM)",
+      "engines": ["lemonade", "llama.cpp", "llamacpp", "aim"],
       "gfx_families": ["gfx1151"]
     },
     {
-      "label": "AMD Radeon - RX 7000/9000, Radeon PRO (Lemonade / llama.cpp)",
-      "engines": ["lemonade", "llama.cpp", "llamacpp"],
+      "label": "AMD Radeon - RX 7000/9000, Radeon PRO (Lemonade / llama.cpp / AIM)",
+      "engines": ["lemonade", "llama.cpp", "llamacpp", "aim"],
       "gfx_families": ["gfx110X-all", "gfx120X-all"]
     },
     {
@@ -507,6 +507,50 @@
       ],
       "warnings": [
         "multimodal model; text chat is the default serve path"
+      ]
+    },
+    {
+      "canonical_model_id": "aim-qwen3.5-9b",
+      "aliases": [
+        "amdenterpriseai/aim-radeon-qwen-qwen3-5-9b"
+      ],
+      "task": "chat",
+      "source": "recipe_index",
+      "revision": "main",
+      "loader": "aim",
+      "trust_remote_code": false,
+      "dtype": "auto",
+      "device_policy": "gpu_required",
+      "min_gpu_mem_gb": 24,
+      "recommended_system_ram_gb": 32,
+      "quantization": "none; served as-is by the AIM image's bundled vLLM",
+      "artifact_hint": "AMD Enterprise AI (AIM) pre-built Docker image; pulled and run by the aim engine, not by Hugging Face resolution",
+      "artifacts": [],
+      "engine_recipes": [
+        {
+          "engine": "aim",
+          "required_flags": [],
+          "parser_settings": {},
+          "preferred_endpoint": null,
+          "unsupported_combinations": [],
+          "notes": [
+            "pins AIM_PROFILE_ID=vllm-w7900-bf16-tp1-latency via extra_env; Radeon profile auto-selection isn't reliable yet, override with --engine-env if needed",
+            "requires a reachable Docker daemon; the image is pulled on first serve"
+          ],
+          "model_id_override": "amdenterpriseai/aim-radeon-qwen-qwen3-5-9b:0.12.0-preview",
+          "image_digest": "sha256:ee1201261f358be881318de5930ce9505d17309486f747a83147d7d042fc95ce",
+          "extra_env": {
+            "AIM_PROFILE_ID": "vllm-w7900-bf16-tp1-latency"
+          }
+        }
+      ],
+      "manual_alternatives": [],
+      "chat_template_mode": "auto",
+      "preferred_engines": [
+        "aim"
+      ],
+      "warnings": [
+        "Radeon-targeted AIM image; requires Docker and an explicit AIM_PROFILE_ID"
       ]
     }
   ]

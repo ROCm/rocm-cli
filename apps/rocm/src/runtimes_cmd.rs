@@ -13,15 +13,18 @@
 //! way `EnginesCommand` stayed behind when `engines()` moved to
 //! `engines_cmd.rs` in Phase 6a. `RuntimeActivationResult` and
 //! `ActiveRuntimeMarker` stay `pub(crate)`: the former is read by
-//! `append_update_activate_summary` in `main.rs`'s `apply_runtime_update`
-//! flow, the latter by `storage.rs`. `select_runtime_manifest`,
+//! `append_update_activate_summary` in `update_cmd.rs`'s
+//! `apply_runtime_update` flow, the latter by `storage.rs`. `select_runtime_manifest`,
 //! `validate_runtime_manifest_for_activation`, `normalize_path_for_compare`,
 //! `recover_setup_runtime_registration`, `active_runtime_marker_path`,
 //! `should_remove_runtime_install_root`, and `runtime_usability_status` are
 //! also `pub(crate)` and read from `engines_cmd.rs`, `storage.rs`, and
 //! `comfyui.rs`. The SDK-install-finalization/torch-alignment/dependency bundle
-//! this cluster calls into (`finish_sdk_install` and friends) lives in the
-//! sibling `runtime_install_finalize.rs`, reached via `crate::`.
+//! (`finish_sdk_install` and friends) lives in the sibling
+//! `runtime_install_finalize.rs`, which calls into this module (for
+//! `activate_runtime`, `newest_installed_runtime_manifest` and
+//! `recover_setup_runtime_registration`); this module reaches back into it
+//! only from its own test module.
 
 use std::fmt::Write as _;
 use std::fs;
@@ -35,32 +38,54 @@ use rocm_core::{
 use serde::{Deserialize, Serialize};
 
 use crate::therock;
+use crate::uninstall_plan::confirm_uninstall;
 use crate::{
-    ROLLBACK_RECOVERY_HINT, RuntimesCommand, cli_report, confirm_uninstall, record_cli_audit_event,
-    runtime_services,
+    ROLLBACK_RECOVERY_HINT, RuntimesCommand, cli_report, record_cli_audit_event, runtime_services,
 };
+
+/// Refuse `--restart-services` without `--yes`, naming the command the user
+/// ran (`activate <runtime>` or `rollback`) in the retry hint, so following it
+/// repeats the same activation or rollback with the approval added.
+pub(crate) fn ensure_runtime_service_restart_approved(command: &RuntimesCommand) -> Result<()> {
+    match command {
+        RuntimesCommand::Activate {
+            runtime,
+            restart_services,
+            yes,
+        } => runtime_services::ensure_service_restart_approved(
+            *restart_services,
+            *yes,
+            &format!("activate {runtime}"),
+        ),
+        RuntimesCommand::Rollback {
+            restart_services,
+            yes,
+        } => runtime_services::ensure_service_restart_approved(*restart_services, *yes, "rollback"),
+        RuntimesCommand::List
+        | RuntimesCommand::Uninstall { .. }
+        | RuntimesCommand::Import { .. }
+        | RuntimesCommand::Adopt { .. } => Ok(()),
+    }
+}
 
 pub(crate) fn runtimes(command: Option<RuntimesCommand>) -> Result<()> {
     let paths = AppPaths::discover()?;
     let mut config = RocmCliConfig::load(&paths)?;
+    let command = command.unwrap_or(RuntimesCommand::List);
+    // Checked before anything is written: a refused restart must leave the
+    // previously active runtime in place, not switch the runtime and then
+    // decline the half of the job the user actually asked for.
+    ensure_runtime_service_restart_approved(&command)?;
 
-    match command.unwrap_or(RuntimesCommand::List) {
+    match command {
         RuntimesCommand::List => {
             print!("{}", render_runtimes_text(&paths, &config)?);
         }
         RuntimesCommand::Activate {
             runtime,
             restart_services,
-            yes,
+            yes: _,
         } => {
-            // Checked before anything is written: a refused restart must leave
-            // the previously active runtime in place, not switch the runtime and
-            // then decline the half of the job the user actually asked for.
-            runtime_services::ensure_service_restart_approved(
-                restart_services,
-                yes,
-                &format!("activate {runtime}"),
-            )?;
             let mut result = activate_runtime(&paths, &mut config, &runtime)?;
             if restart_services {
                 runtime_services::restart_stale_runtime_services(
@@ -110,9 +135,8 @@ pub(crate) fn runtimes(command: Option<RuntimesCommand>) -> Result<()> {
         }
         RuntimesCommand::Rollback {
             restart_services,
-            yes,
+            yes: _,
         } => {
-            runtime_services::ensure_service_restart_approved(restart_services, yes, "rollback")?;
             let mut result = rollback_runtime(&paths, &mut config)?;
             if restart_services {
                 runtime_services::restart_stale_runtime_services(
@@ -1180,14 +1204,9 @@ fn import_runtime_manifest(
 pub(crate) fn newest_installed_runtime_manifest(
     paths: &AppPaths,
 ) -> Result<Option<therock::InstalledRuntimeManifest>> {
-    let mut manifests = therock::load_runtime_manifests(paths)?;
-    manifests.sort_by(|left, right| {
-        right
-            .installed_at_unix_ms
-            .cmp(&left.installed_at_unix_ms)
-            .then_with(|| left.runtime_key.cmp(&right.runtime_key))
-    });
-    Ok(manifests.into_iter().next())
+    // `load_runtime_manifests` already returns newest install first with ties
+    // broken on the runtime key, so re-sorting here would be a no-op.
+    Ok(therock::load_runtime_manifests(paths)?.into_iter().next())
 }
 
 #[derive(Debug, Clone)]
@@ -1804,6 +1823,8 @@ fn write_active_runtime_marker(paths: &AppPaths, marker: ActiveRuntimeMarker) ->
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::append_examine_runtime_state;
+    use crate::engine_runtime_select::resolve_runtime_selector_to_exact_key;
     use crate::runtime_install_finalize::{
         finalize_successful_sdk_install, render_sdk_install_success,
     };
@@ -1811,7 +1832,6 @@ pub(crate) mod tests {
     use crate::tests::{
         NEW_RUNTIME_KEY, OLD_RUNTIME_KEY, plant_service_record_on_runtime, test_paths,
     };
-    use crate::{append_examine_runtime_state, resolve_runtime_selector_to_exact_key};
 
     #[test]
     fn runtime_selector_recovers_setup_runtime_registry_from_local_manifest() -> Result<()> {

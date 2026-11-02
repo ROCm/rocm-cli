@@ -185,11 +185,12 @@ The WSL entries, in the order a broken stack usually reveals them:
 | `fix-wsl-5-distro-too-old` | The distro release is below the floor in the [prerequisites](#prerequisites) above |
 | `fix-wsl-6-host-driver-too-old` | The distro-side plumbing is complete but the Windows host driver is missing or too old |
 
-Seven entries that are not WSL-specific also run on WSL: `fix-1-arch`,
+Eight entries that are not WSL-specific also run on WSL: `fix-1-arch`,
 `fix-2-unset-override`, `fix-6-path`, `fix-8-wheel-rocm`, `fix-16-vllm-oom`,
-`fix-18-comgr-conflict`, and `fix-19-shm-too-small`. `fix-16-vllm-oom` is driven
-by the error text you pass with `--symptom` and reads nothing from the
-environment or the ROCm install. `fix-18-comgr-conflict` and
+`fix-17-torch-dlpack`, `fix-18-comgr-conflict`, and `fix-19-shm-too-small`.
+`fix-16-vllm-oom` and `fix-17-torch-dlpack` are driven by the error text you
+pass with `--symptom` and read nothing from the environment or the ROCm
+install. `fix-18-comgr-conflict` and
 `fix-19-shm-too-small` apply when you run `rocm diagnose` inside the distro. A
 `--distro` run skips both (see
 [Diagnose a distro from Windows](#diagnose-a-distro-from-windows) later in this

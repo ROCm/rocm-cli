@@ -15,6 +15,7 @@ e2e-test-hooks = [
     "rocm-core/e2e-test-hooks",
     "rocm-engine-lemonade/e2e-test-hooks",
     "rocm-engine-vllm/e2e-test-hooks",
+    "rocm-engine-aim/e2e-test-hooks",
 ]
 # Test-only fault injection for the e2e suite. Enabled ONLY by the `xtask e2e`
 # mock-lane build (never by the release build), it compiles in a `rocm serve`
@@ -46,6 +47,7 @@ rocm-engine-lemonade = { path = "../../engines/lemonade" }
 rocm-engine-protocol = { path = "../../crates/rocm-engine-protocol" }
 rocmd = { path = "../rocmd" }
 rocm-engine-vllm = { path = "../../engines/vllm" }
+rocm-engine-aim = { path = "../../engines/aim" }
 rpassword.workspace = true
 serde.workspace = true
 serde_json.workspace = true

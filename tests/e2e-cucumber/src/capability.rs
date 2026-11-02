@@ -34,6 +34,30 @@ fn rocm_binary() -> String {
     std::env::var("ROCM_CLI_BINARY").unwrap_or_else(|_| "rocm".to_string())
 }
 
+/// Whether a container runtime is usable here.
+///
+/// Probed rather than assumed: a developer machine may have the client without
+/// a running daemon.
+///
+/// Necessary but not sufficient for `@requires-docker` — see the
+/// `requires_docker` gate in `expectation.rs`, which also wants an explicit
+/// opt-in. A daemon answering does not mean the fixture image can be built: a
+/// self-hosted runner behind a restricted network has both a working daemon
+/// and no route to the package mirror the image installs from.
+///
+/// Also used by [`HostCapability::engine_available`] for `"aim"`: unlike
+/// lemonade/vllm, the AIM adapter is always present in the binary's inventory
+/// (a static description, not a liveness probe — see `rocm engines list`), so
+/// "can this engine start" must check for a reachable Docker daemon itself.
+pub(crate) fn docker_available() -> bool {
+    std::process::Command::new("docker")
+        .arg("info")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
 /// What `rocm serve <model>` would pick with no `--engine`, from GPU family + OS.
 ///
 /// Mirrors the product precedence in `preferred_serve_engine_for_host_gpu_summary`
@@ -155,6 +179,16 @@ impl HostCapability {
             "vllm" => {
                 !self.os_family.eq_ignore_ascii_case("windows")
                     && family_prefers_vllm(self.gfx_target.as_deref())
+            }
+            "aim" => {
+                self.available_engines.iter().any(|e| e == engine)
+                    && docker_available()
+                    // aim's verified hardware is Radeon (gfx110X/120X) and
+                    // Strix Halo (gfx1151) — exactly the families
+                    // `family_prefers_vllm` excludes. Without this, a
+                    // Docker-equipped Instinct lane would run the Radeon aim
+                    // image with a W7900 profile.
+                    && !family_prefers_vllm(self.gfx_target.as_deref())
             }
             _ => self.available_engines.iter().any(|e| e == engine),
         }
@@ -688,7 +722,7 @@ fn parse_engines_list(text: &str) -> Vec<String> {
             continue;
         }
         let first = trimmed.split_whitespace().next().unwrap_or("");
-        if matches!(first, "lemonade" | "vllm") && !engines.iter().any(|e| e == first) {
+        if matches!(first, "lemonade" | "vllm" | "aim") && !engines.iter().any(|e| e == first) {
             engines.push(first.to_owned());
         }
     }
@@ -1183,7 +1217,7 @@ Local model engines
     /// `expectation.rs`'s `requires_oom_fault_injection_runs_only_when_the_hook_is_built_in`
     /// builds `HostCapability { oom_fault_injection: .. }` by hand and so never
     /// reaches this comparison; without this test, editing the literal on one
-    /// side of the producer/consumer pair would make serve-26 a permanent skip
+    /// side of the producer/consumer pair would make serve-28 a permanent skip
     /// with nothing red. The `"1"` asserted here is the same literal
     /// `xtask::e2e`'s `command.env(OOM_FAULT_INJECTION_ENV, "1")` writes, pinned
     /// by `release_build_resolves_and_exports_both_cli_binaries` on that side.

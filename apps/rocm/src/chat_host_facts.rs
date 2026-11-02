@@ -117,10 +117,11 @@ impl HostFacts {
                 format!("- ROCm/TheRock family for this GPU: {f}\n")
             });
         let engines = if self.vllm_available() {
-            "- Serving engines that run here: Lemonade and vLLM.\n"
+            "- Serving engines that run here: Lemonade, vLLM and AIM (AIM runs models from Docker \
+             containers and needs a running Docker daemon).\n"
         } else {
-            "- Serving engines that run here: Lemonade. vLLM is skipped on native Windows; \
-             tell the user to use WSL2 or Linux for that ROCm GPU engine.\n"
+            "- Serving engines that run here: Lemonade. vLLM and AIM are skipped on native Windows; \
+             tell the user to use WSL2 or Linux for those ROCm GPU engines.\n"
         };
         format!(
             "Facts about the machine you are running on, detected by ROCm CLI. Trust these \
@@ -171,8 +172,8 @@ mod tests {
             "the detected adapter and target must both appear:\n{block}"
         );
         assert!(
-            block.contains("Lemonade and vLLM"),
-            "vLLM is available under WSL:\n{block}"
+            block.contains("Lemonade, vLLM and AIM"),
+            "vLLM and AIM are available under WSL:\n{block}"
         );
         assert!(
             !block.contains("ROCm/TheRock family"),
@@ -194,7 +195,7 @@ mod tests {
         let block = facts.render();
         assert!(block.contains("- Operating system: Windows"), "{block}");
         assert!(
-            block.contains("vLLM is skipped on native Windows"),
+            block.contains("vLLM and AIM are skipped on native Windows"),
             "the caveat must survive, now stated only where it is true:\n{block}"
         );
         assert!(

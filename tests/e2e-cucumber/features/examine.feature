@@ -119,9 +119,9 @@ Feature: GPU detection and system inspection
     Then the inspection reports Linux as the operating system
     And the inspection reports that the host is WSL
 
-  # The dry-run plan used to print the raw `${ROCM_CLI_AMDGPU_VERSION:-...}` shell
-  # placeholder on its `repo_version:` line instead of the effective version, so
-  # the preview a user reviews before approving disagreed with what the install
+  # The dry-run plan used to print the raw `${ROCM_CLI_AMDGPU_VERSION:-7.2.4}`
+  # shell placeholder on its `repo_version:` line instead of the effective version,
+  # so the preview a user reviews before approving disagreed with what the install
   # would actually pull. The plan is rendered on every Linux host regardless of
   # GPU (the driver is not yet installed when you preview it), so the mock lane
   # pins this without hardware.
@@ -296,6 +296,7 @@ Feature: GPU detection and system inspection
     Given a machine whose release file quotes every value in single quotes
     When the user inspects that machine in machine-readable form
     Then the inspection reports the distribution "rhel" version "9.4" named "Red Hat Enterprise Linux 9.4 (Plow)"
+    And the inspection reports the distribution family "fedora"
     And the inspection reports no trouble reading the release file
 
   @id:examine-reads-last-os-release-assignment @requires-os:linux
@@ -367,11 +368,10 @@ Feature: GPU detection and system inspection
   # With an amd-smi that prints a snapshot's worth of JSON and only then
   # stalls, that quote is the entire payload, and the note is not a terminal
   # message: `record_gpu_metrics` copies it into the automation-event and audit
-  # JSONL files every 60s, and both append helpers rewrite the whole file each
-  # time. Unbounded, the logs grew by the payload's size every minute and each
-  # write cost more than the last. So the note must name the timeout, keep
-  # enough of the child's output to be worth reading, say that it was shortened
-  # -- and stay small.
+  # JSONL files every 60s, neither ever rotated or capped. Unbounded, the logs
+  # grew by the payload's size every minute, forever. So the note must name
+  # the timeout, keep enough of the child's output to be worth reading, say
+  # that it was shortened -- and stay small.
   #
   # Asserted here rather than only as a unit test because the note's journey is
   # the point: the bound lives in `rocm-core`'s `run_with_timeout` and the
@@ -428,3 +428,39 @@ Feature: GPU detection and system inspection
     Given a GPU machine whose release file cannot be read
     When the user inspects that machine in machine-readable form
     Then the inspection's verdict is degraded, and its only failure says the release file could not be read
+
+  # `examine` on Windows adds the AMD display driver's version, date and an age
+  # line. Windows only: the driver comes from the Windows adapter inventory, so
+  # no other platform has these lines. `@requires-gpu` so that a driver exists
+  # to be read. The scenario names no driver: it holds the readable form to the
+  # machine-readable one, and holds the verdict to the date, so it passes on a
+  # machine with an old driver and on one with a current driver, and fails only
+  # if the CLI calls a driver old that is not. Whether a driver dated before
+  # 27 July 2023 is reported as old needs such a machine and is not covered here.
+  @id:examine-windows-driver-version-date-and-age @requires-os:windows @requires-gpu
+  Scenario: examine-29 - On Windows the inspection reports the display driver and judges its age by its date
+    Given a machine with an AMD GPU
+    When the user inspects the system both for reading and for scripting
+    Then the inspection reports the display driver's version and date as the machine-readable form does
+    And the inspection calls the driver old only when its date is before 27 July 2023
+
+  # `rocm_install_method` used to report "amdgpu-install"/"tarball-or-other";
+  # renamed to "repo-native"/"runfile-or-tarball" alongside the switch away
+  # from the amdgpu-install wrapper. It also feeds fix-12's applicability
+  # score (not which remediation commands it renders -- that comes from the
+  # package family and distro, not this field), so a silent revert of the
+  # rename would misfire there without any test catching it -- this pins the
+  # JSON contract directly rather than only
+  # asserting the human-readable form (examine-06), which never named it. A
+  # whitelist rather than one pinned value keeps this hermetic: which method
+  # actually fires depends on this host's real ROCm repo markers (some
+  # developer machines and self-hosted GPU runners have them, a clean mock
+  # lane does not), not just on the install this scenario plants. No GPU
+  # needed: the install is planted by the harness (`plant_unmanaged_rocm`),
+  # same as examine-06. Linux/WSL only, like examine-12: `probe_rocm_install`
+  # only runs there, so `rocm_install_method` is empty on Windows.
+  @id:examine-reports-a-current-install-method-name @requires-os:linux
+  Scenario: examine-30 - System inspection reports a current install-method name, not the retired amdgpu-install naming
+    Given a machine with a ROCm install that was not set up by the CLI
+    When the user inspects the system in machine-readable form
+    Then the inspection reports a current install-method name

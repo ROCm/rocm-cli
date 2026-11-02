@@ -198,3 +198,56 @@ Feature: TheRock "next" ROCm 10 install layout
     When the user previews a wheel SDK install for arch gfx1200 pinned to ROCm 10.0.0 with the toolchain
     Then the preview resolves the ROCm 10 pip index
     And the preview requests the gfx1200 device extras with the toolchain
+
+  # The regression this pins: torchaudio's published metadata names no ROCm
+  # build, so a pin to any ROCm 10 version but the newest resolved torchaudio
+  # from the newest build, and the install refused the mixed stack. The other
+  # scenarios publish one build per package and could not see it. The pinned
+  # build also publishes a torchaudio rebuild (`2.9.1.2`), the shape the live
+  # index uses, and the plan must take that rather than the original release.
+  # ROCm 10.0 has no hardware-verified torchaudio recorded, so that newest build
+  # is a fallback, and the plan says so.
+  @id:therock-next-11-older-pin-keeps-one-rocm-build
+  Scenario: therock-next-11 - A ROCm 10 wheel install pinned below the newest build installs only that build
+    Given a ROCm 10 pip index fixture that also publishes a newer ROCm 10 build
+    When the user previews a wheel SDK install for arch gfx1200 pinned to ROCm 10.0.0
+    Then the preview resolves the ROCm 10 pip index
+    And every package in the preview is built for ROCm 10.0.0
+    And the preview says its torchaudio is the newest build for ROCm 10.0.0 and not hardware-verified
+
+  # The refusal half of therock-next-11: when the pinned build publishes no
+  # torchaudio this host can install — here only a wheel for another platform —
+  # the install stops and says so instead of taking another build's torchaudio.
+  @id:therock-next-12-missing-torchaudio-build-refused
+  Scenario: therock-next-12 - A ROCm 10 wheel install refuses when the pinned build publishes no torchaudio
+    Given a ROCm 10 pip index fixture whose ROCm 10.0.0 torchaudio is only a wheel this host cannot install
+    When the user tries to preview a wheel SDK install for arch gfx1200 pinned to ROCm 10.0.0
+    Then the install fails
+    And the failure says no torchaudio for ROCm 10.0.0 is published for this platform, without falling back to another
+
+  # The other half of therock-next-11, on the same fixture: newest is not a safe
+  # choice among builds sharing a `+rocm` label. The live index publishes
+  # `2.11.0`, `2.11.0.2` and `2.11.0.3` all as `+rocm10.1.0`, and `2.11.0` is a
+  # CPU-only rebuild. When a torchaudio release is recorded as verified on
+  # hardware for the requested line (ROCm 10.1: `2.11.0.2`, the same pin the
+  # vLLM ROCm 10.x install uses) and is published, the plan takes it over the
+  # newer `2.11.0.3`.
+  @id:therock-next-13-verified-torchaudio-over-newer-rebuild
+  Scenario: therock-next-13 - A ROCm 10 wheel install takes the hardware-verified torchaudio over a newer rebuild
+    Given a ROCm 10 pip index fixture where several torchaudio rebuilds share one ROCm label
+    When the user previews a wheel SDK install for arch gfx1200 pinned to ROCm 10.1.0
+    Then the preview installs the hardware-verified torchaudio for ROCm 10.1.0, not the newer rebuild
+
+  # The real-install half of therock-next-11: past the preview, an unverified
+  # torchaudio is also announced in the install log, since it is the one stack
+  # choice ROCm CLI makes on its own judgement. No GPU or download is needed to
+  # see it: with an active default runtime and no consent flag, the install is
+  # refused right after the note, before `uv` runs or anything changes on disk.
+  @id:therock-next-14-real-install-notes-unverified-torchaudio
+  Scenario: therock-next-14 - A real ROCm 10 wheel install notes an unverified torchaudio in its install log
+    Given a ROCm 10 pip index fixture that also publishes a newer ROCm 10 build
+    And a registered ROCm 10 wheel runtime with a grouped family
+    And that runtime is the active default
+    When the user installs a wheel SDK for arch gfx1200 pinned to ROCm 10.0.0 without confirming
+    Then the install is refused without replacing the active default runtime
+    And the install log notes that its torchaudio is the newest build for ROCm 10.0.0 and not hardware-verified

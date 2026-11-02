@@ -43,6 +43,7 @@ tests/e2e-cucumber/
 │   └── e2e/                      # step functions — one file per feature area
 │       ├── chat_steps.rs
 │       ├── examine_steps.rs
+│       ├── planner_steps.rs      # planning-assistant scenarios (scripted chat mock)
 │       ├── runtime_steps.rs
 │       ├── serving_steps.rs
 │       └── skill_steps.rs
@@ -51,7 +52,7 @@ tests/e2e-cucumber/
     ├── lib.rs
     ├── capability.rs             # host capability probe (OS / GPU / effective engine)
     ├── expectation.rs            # tag parsing + pass/xfail/skip resolution
-    └── mock_server.rs            # axum mock OpenAI server
+    └── mock_server.rs            # axum mock OpenAI server (fixed stub, or a scripted reply per chat request)
 ```
 
 ## Running tests
@@ -146,7 +147,7 @@ Scenarios carry stable-id and capability tags:
 | `@requires-oom-fault-injection` | Needs the `rocm` binary under test to carry the test-only `e2e-oom-fault-injection` hook, which fabricates a managed launch that runs out of GPU memory so the OOM guidance can be verified without a GPU. Unlike every other capability this one **cannot be probed** — no product command exposes it — so `xtask e2e` reports it via `ROCM_E2E_OOM_FAULT_INJECTION=1`, set only when xtask compiled the binary itself with the feature. A prebuilt `ROCM_CLI_BINARY` (the self-hosted lanes' shipping release build) has the hook compiled out, so these scenarios resolve to **skip** there and run on the mock lane. |
 | `@serve-timeout:<secs>` | Lengthen the serve-readiness wait for a genuinely slow serve (e.g. a large model). |
 | `@nightly` | Expensive scenario skipped by default; included when `E2E_INCLUDE_NIGHTLY=1`. |
-| `@lifecycle` | Expensive, OS-mutating release-lifecycle scenario (packaging + real installer + install/uninstall). Skipped by default; included when `E2E_INCLUDE_LIFECYCLE=1`. `E2E_ONLY_LIFECYCLE=1` selects only this set without bypassing expectation resolution. |
+| `@lifecycle` | Expensive, OS-mutating release-lifecycle scenario (packaging + real installer + install/uninstall). Skipped by default; included when `E2E_INCLUDE_LIFECYCLE=1`. `E2E_ONLY_LIFECYCLE=1` selects only this set without bypassing expectation resolution. A caller can additionally fold specific non-`@lifecycle` scenarios into that restricted set via `E2E_ALSO_RUN_IDS` (comma-separated `@id`s), without tagging them `@lifecycle` — which would also pull them out of the full-suite lanes that don't set `E2E_INCLUDE_LIFECYCLE`. `ci.yml`'s Windows lane uses this to fold in the hermetic comfyui-01/02/03 scenarios. |
 
 Known bugs are **not** tagged in the `.feature` files — they live in
 `expectations.toml`, keyed by `@id`, each with a `when = { ... }` condition (e.g.
@@ -253,9 +254,10 @@ The `.feature` file is both the spec and the test input — cucumber reads it at
 
 ## Design principles
 
-- **Black-box only.** Step functions interact with `rocm` and explicitly configured `rocmd` through their CLIs and HTTP endpoints. No imports from the rocm-cli codebase. Where a scenario needs the CLI to know about a running server, it plants a managed-service record as plain JSON matching the on-disk schema (see `register_mock_service`) — the same file `rocm serve --managed` would write — rather than importing the record type.
+- **Black-box only.** Step functions interact with `rocm` and explicitly configured `rocmd` through their CLIs and HTTP endpoints. No imports from the rocm-cli codebase. Where a scenario needs the CLI to know about a running server, it plants a managed-service record as plain JSON matching the on-disk schema (see `register_mock_service`) — the same file `rocm serve --managed` would write — rather than importing the record type. (A harness *unit* test may read a planted record back through `rocm_core::ManagedServiceRecord`, to tie the writer's field names to the ones the CLI reads; steps do not.)
 - **Isolated state.** Each scenario uses isolated config, data, and cache directories. Tests never touch `~/.rocm`.
 - **Behavioral language.** Feature files describe what users care about, not implementation details. How steps are implemented (mock vs real, which port, which API) stays in the step functions.
+- **A scenario about a sequence of chat completions scripts them.** `MockServer::chat_requests` records every chat completion request body even with the fixed stub reply, so a scenario can count completions and read each prompt. A script makes a double ask visible in what the user sees as well: `MockServer::start_with_chat_script` hands out one distinct reply per chat completion request (on either the `/v1/chat/completions` or the unversioned `/chat/completions` route), so the plan that gets printed or returned shows which call produced it, and a request past the end of the script gets HTTP 500 (and is still recorded), so asking more often than scripted fails loudly instead of recycling a reply. Plant the service with `ServiceRecordOptions { inference_verified: true, .. }` so the CLI's own readiness probe does not consume the first scripted reply. `planner_steps.rs` is the worked example.
 - **OS-assigned ports.** The mock server binds to `127.0.0.1:0` to avoid port conflicts between tests.
 - **A message is asserted with the state it describes.** A `Then` step matching printed output ("no existing SDK was found", "becomes the active default runtime", "stop them with `rocm services stop <id> --yes`") asserts the resulting state in the same scenario — the file that was or was not written, the runtime that is or is not active, the advice's named command actually clearing the condition. Matching the text alone certifies the wording, not the truth of it, which is how a scenario passes over a CLI that is wrong about what it did. See AGENTS.md §3.
 
@@ -276,14 +278,17 @@ return, and where a report goes when nothing matched.
 |  | expected value lives in | catches |
 |---|---|---|
 | `diagnose.feature` | the test suite (e.g. `CATALOG_FIX_IDS`) | the **CLI** drifting |
-| `rocm_doctor_skill.feature` | `skills/rocm-doctor/reference.md` | the **document** drifting |
+| `rocm_doctor_skill.feature` | [reference.md](../../skills/rocm-doctor/reference.md) (and, for `skill-07`, [SKILL.md](../../skills/rocm-doctor/SKILL.md)) | the **document** drifting |
 
 Only the second can notice that a published document has gone stale, and that is
 the whole reason the feature exists. So anything already proven by
 `diagnose.feature` — that a fix for another OS is declined without writing
 anything, that the listing is complete, that a report says plainly whether a
 cause was established — stays there and is **not** restated here. If a scenario
-in this feature does not read `reference.md`, it is in the wrong file.
+in this feature does not read `reference.md`, it is in the wrong file. The one
+exception is `skill-07`, which reads
+[SKILL.md](../../skills/rocm-doctor/SKILL.md) for the catalog contract number
+that Phase 0 requires.
 
 Reading that document as test data is a deliberate, narrow exception to
 **Black-box only** above: nothing is imported from the rocm-cli codebase — a
@@ -295,9 +300,14 @@ constants, so editing one of those in `reference.md` starts being checked with
 no code change, and every one of those parsers asserts it found something — a
 heading it depends on being reworded upstream must fail loudly rather than
 quietly reduce an assertion to a no-op. Free-standing prose outside those
-spots — the failure-mode count in the catalog heading, the Linux-only/
-Windows-only recap line under the table, SKILL.md's "the other N are
-print-only" — is not parsed, so it can drift without failing anything here.
+spots — such as the Linux-only/Windows-only recap line under the table — is
+not parsed, so it can drift without failing anything here. Two counts are
+checked outside this feature by
+[skill_reference.rs](tests/skill_reference.rs): the failure-mode count in the
+catalog heading, and SKILL.md's "The other N ... print-only" count. Two
+sentences in SKILL.md are therefore fixtures. `skill-07` reads the sentence
+that declares the required catalog contract version, so rewording that
+sentence fails the scenario. `skill_reference.rs` reads the print-only count.
 
 Two rules follow:
 
