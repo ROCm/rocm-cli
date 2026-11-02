@@ -77,7 +77,7 @@ pub(crate) fn healthcheck_service(request: HealthcheckRequest) -> Result<Healthc
 ///
 /// vLLM only ever runs on ROCm here (`device_policy` is pinned to
 /// `gpu_required` at launch), so the backend half is fixed — but the shape has
-/// to match what `engines/lemonade` reports, `"{backend} gpu {index}"`, because
+/// to match what `engines/lemonade` reports, because
 /// `rocm serve`'s `device:` row and `rocm services list` print whichever engine
 /// answered verbatim. It used to be the literal `"rocm_gpu"`, so the same row
 /// read `rocm_gpu` for vLLM and `vulkan gpu 0` for Lemonade, and neither

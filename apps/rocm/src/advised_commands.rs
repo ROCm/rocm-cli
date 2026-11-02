@@ -1282,13 +1282,10 @@ const NOT_INVOCATIONS: &[(&str, &str, &str)] = &[
     // it selected as `<backend> [gpu <n>] [(<name>)]` -- `vulkan (AMD Radeon
     // Graphics)`, `rocm gpu 1 (AMD Instinct MI300X)` -- so the ROCm half of
     // that value reads as a `rocm` invocation to this scan while naming no
-    // command at all. These are the engine side of it and the two docs that
+    // command at all. The engines no longer need an entry each: they build the
+    // string through `rocm_engine_protocol::format_reported_device` rather
+    // than holding a `"rocm gpu ..."` literal. These are the two docs that
     // quote the format back.
-    (
-        "engines/vllm/src/state.rs",
-        "rocm gpu",
-        "the shape note for the `device:` value vLLM reports, not a command",
-    ),
     (
         "README.md",
         "rocm gpu 0 (AMD Instinct MI300X)",
