@@ -6,9 +6,11 @@
 //!
 //! Modal content is rendered by the active tab (`detail_modal` from the tab
 //! module) or by `draw_help` here. The popup geometry and the
-//! Clear-then-block pattern (`centered_rect`, `draw_popup_frame`,
-//! `grey_overlay`) live in `ui/panel.rs`, which this module imports from, so
-//! the underlying body shows through the gaps.
+//! Clear-then-block pattern (`centered_rect`, `centered_width`,
+//! `draw_popup_frame`, `grey_overlay`) live in `ui/panel.rs`, so the underlying
+//! body shows through the gaps; this module imports them from there, and
+//! re-exports those four helpers so their pre-split `ui::modal` paths still
+//! resolve.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -18,9 +20,10 @@ use ratatui::widgets::{Clear, Paragraph, Wrap};
 
 use crate::app::{ActiveTab, AppState, OPTIONS_TABS, PALETTE_DESTS};
 use crate::ui::gradient::GradientGauge;
-use crate::ui::panel::{
-    self, BoxRole, centered_rect, centered_width, draw_popup_frame, grey_overlay,
-};
+use crate::ui::panel::{self, BoxRole};
+// Re-exported, not just imported: these four were public at this path before
+// the geometry moved into `panel`, so the pre-split public paths stay valid.
+pub use crate::ui::panel::{centered_rect, centered_width, draw_popup_frame, grey_overlay};
 use crate::ui::sparkline::BrailleSparkline;
 use crate::ui::theme::{self, Theme};
 
