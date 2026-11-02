@@ -71,10 +71,10 @@ env:
 # with no timeout — holds a runner for six hours and, in the merge queue, stalls
 # every queued PR behind it with no signal that anything is wrong. The values here
 # are deliberately loose (roughly 4x the observed p100 for most jobs, which is
-# under 3 min; the two Windows jobs are the exception at about 2-3x, since they
-# take 15-21 min on a cold pull-request cache and keep a 45 min limit) so they
-# never fire on a merely slow run; they exist to convert a silent multi-hour stall
-# into a prompt, legible failure. Raise a value if a job legitimately grows into it.
+# under 3 min; the two Windows jobs are the exception, since they run for many
+# minutes on a cold pull-request cache and keep a 45 min limit) so they never fire
+# on a merely slow run; they exist to convert a silent multi-hour stall into a
+# prompt, legible failure. Raise a value if a job legitimately grows into it.
 jobs:
   # Decide which file categories a change touches so unaffected jobs can skip
   # their expensive work. Filtering runs ONLY on pull_request; on push and in the
@@ -594,11 +594,10 @@ jobs:
   # lifecycle, PR bundle) share no outputs, so they run side by side. The release
   # side gives up the debug build's warm-up of the e2e harness's dev-profile
   # dependencies, which it now compiles for itself. The two sides are not the same
-  # length: on a cold pull-request cache the release job took about 21 min against
-  # about 15 for debug, so the gain over one serial job is real there but smaller
-  # than the sum of the parts. On a warm cache (a push to main) the lanes have not
-  # been measured since the split; compare the two jobs' durations over several
-  # runs there before rebalancing steps between them.
+  # length: the release job is the longer one on a cold pull-request cache, so the
+  # gain over one serial job is smaller than the sum of the parts. Compare the two
+  # jobs' durations over several runs on main (and the numbers on the pull request
+  # that introduced the split) before rebalancing steps between them.
   #
   # Neither job waits for `clippy` or `prek`. Those stay required checks in their
   # own right, so a lint failure still blocks the merge. What this trades is about
