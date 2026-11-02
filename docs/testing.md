@@ -127,6 +127,93 @@ child write the file instead, so this process never holds a write fd on it. The
 same applies to E2E steps: scenarios run concurrently in one process, and the
 `rocm` child that runs the shim can be the one refused.
 
+### Advised commands must parse
+
+`apps/rocm/src/advised_commands.rs` checks the `rocm`/`rocmd` commands that the
+CLI and its docs tell a user to run against the real parser. It is a text
+scanner: it finds commands by a leading `rocm ` or `rocmd ` word in these
+places, and checks only what it finds:
+
+- the `--help` of every visible command: lines that start with a command
+  (EXAMPLES rows) and inline backtick spans
+- production Rust string literals: backtick spans, literals that start with a
+  command, and labelled lines such as `next step: rocm …`. Whole-line `//`
+  comments, items gated on `cfg(test)` or `cfg(all(test, …))`, and whole
+  files declared only as test modules (following `#[path]`) are skipped; a
+  trailing `// …` comment or a `/* … */` block on a line of code is still
+  scanned.
+- `README.md`, `docs/` and `skills/`: inline backtick spans and fenced
+  code-block lines
+- the VHS tapes under `docs/tapes/`
+
+Each line is split into the commands of a shell list (at `&&`, `||`, `;` and a
+`|` standing between spaces, but not inside quotes, `<…>`, `[…]` or `{…}`), and
+every command that runs `rocm` or `rocmd` is checked; commands for other tools
+are skipped. A command ends at a shell comment, a redirection, or where
+trailing prose starts (` (`, ` —`, ` → `, ` then `). A double space does not
+end it, except on an indented EXAMPLES row, where the description column
+follows one.
+
+It fills in placeholders such as `<model>` and `{}`, drops one that stands for
+options described elsewhere (`<case-appropriate options above>`), tries each
+`[--flag]` group and `a|b` alternative (a nested group such as
+`[--restart-services [--yes]]` is tried with and without its inner part), then
+routes each command the way `rocm` itself does. `rocmd` commands go through
+`rocmd`'s own parser, with nothing run.
+These fail the test:
+
+- a command that clap rejects
+- a command that ends up at the natural-language planner, unless the advice
+  itself is a multi-word request: its first request word is a quoted request
+  (`rocm "start a local model"`) or a placeholder that names one
+  (`rocm --yes <natural language request>`). Only the first word counts, as in
+  real routing, and a placeholder filled in with several words does not count,
+  so a removed subcommand that took a text argument (`frobnicate <TEXT>`,
+  `frobnicate "two words"`) still fails.
+- a command that leaves out a required argument or subcommand, when it is a
+  line meant to be run as written: a fenced code line, a string literal that
+  starts with a command, a labelled `next step:`/`Try:` line, or a help
+  EXAMPLES row
+
+Only an inline backtick span in prose (``pass `rocm serve --engine` ``) may name
+a command without its values, or a command that marks the gap with `…`.
+
+`every_source_is_scanned` requires each of the four sources to still yield a
+named command (the `rocm examine` EXAMPLES row, the dashboard's `rocm update`
+literal, README's fenced `rocm install sdk` and inline `rocm examine`, the CLI
+tape's `rocm examine`) and a minimum count per source and surface, so a broken
+extractor cannot pass silently.
+
+Known gaps of the text scanner. Advice written these ways is not checked, or
+not checked as written:
+
+- a Rust raw string (`r#"…"#`) or a string literal that spans lines without a
+  trailing `\` is not read as one literal
+- a backtick span that wraps across lines in a Rust string is not seen
+  (Markdown and `--help` text join wrapped spans; Rust source does not)
+- an EXAMPLES row in `--help` that wraps onto a second line is checked only up
+  to the wrap (clap is built without `wrap_help`, so this happens only where an
+  author breaks the line)
+- a `{` or `}` inside a string in a `#[cfg(test)]` item can end the skipped
+  item early or late
+- templated advice whose verb is a format argument (the `services` hint in
+  `service_hints.rs`, whose verb is `{action}`, and the `runtimes` retry line
+  in `runtime_services.rs`, whose subcommand is `{command}`) is excluded and
+  checked through the functions that build it instead
+- separate optional groups are tried one at a time, never together (they can
+  be mutually exclusive, as in `rocm dash [--demo] [--replay <file>]`), so a
+  command that fails only when flags from two of them are combined is not
+  caught
+
+When it fails, fix the advice (or the CLI). Add text to `NOT_INVOCATIONS`, with
+a reason, only when the text starts with `rocm` but is not advice to run
+anything, such as a log line or an error message that names the command. To see
+every command it found and the result for each:
+
+```bash
+cargo test -p rocm --bin rocm advised_commands::dump_advised_invocations -- --ignored --nocapture
+```
+
 Run the cross-platform smoke test:
 
 ```bash
@@ -614,8 +701,9 @@ The running guard is tested against a ComfyUI answering on its port
 (`starting`).
 
 The e2e scenarios `comfyui-05` to `comfyui-13`
-([comfyui.feature](../tests/e2e-cucumber/features/comfyui.feature), Linux, no
-GPU) cover the same through the built binary: what is kept, replaced and left
+([comfyui.feature](../tests/e2e-cucumber/features/comfyui.feature), no GPU;
+only `comfyui-08`, `-11` and `-12` stay Linux-only, the rest also run on
+Windows) cover the same through the built binary: what is kept, replaced and left
 in place (also when the saved run state is unreadable), a failed download, the
 dry run, a reinstall refused while ComfyUI runs (which the dry run says
 first, and which is refused before anything is downloaded), `start` refusing a half-replaced folder until the command it names is
@@ -630,6 +718,26 @@ download that is not a ComfyUI release, which is neither installed nor kept:
 ```bash
 cargo xtask e2e -- -n "comfyui-(0[5-9]|1[0-3])"
 ```
+
+`-n` bypasses the suite's applicability resolver, so the `@requires-os:linux`
+gate is not applied: run it only on Linux.
+
+`comfyui-14` is different: it installs ComfyUI into a real, isolated managed
+runtime and checks the ROCm torch stack survives with no `nvidia-*` packages
+added. It carries `@requires-gpu @nightly @requires-os:linux @requires-bare-metal`
+and does a real `install sdk --yes` first (system-package consent, and a sudo
+OpenMPI install on vLLM families). Those tags gate it only in a
+harness-selected run, which needs the nightly opt-in and a bare-metal Linux AMD
+GPU host:
+
+```bash
+E2E_INCLUDE_NIGHTLY=1 cargo xtask e2e
+```
+
+Do not select it with `-n`/`--name`, or with the `name_filter` input of the
+self-hosted CI dispatch (which forwards `--name`): each bypasses every gate
+above, so on WSL2, Windows or a machine with no GPU it would still run the real
+install.
 
 ## Runtime Selection And Activation
 
@@ -742,6 +850,8 @@ cargo test -p rocm --bin rocm update_report_policy
 cargo test -p rocm-engine-lemonade stdio_protocol_routes_all_methods_without_side_effects
 cargo test -p rocm-engine-vllm stdio_protocol_routes_all_methods_without_side_effects
 cargo test -p rocm-engine-vllm
+cargo test -p rocm-engine-aim
+cargo test -p rocm --bin rocm extra_env
 cargo test -p rocmd event_collector
 cargo test -p rocmd event_dispatcher
 ```
@@ -779,8 +889,14 @@ resolution is only used after a user configures a planner provider:
 
 ```bash
 rocm config set-planner-provider local
-rocm "start a local model"
+rocm "serve a model"
 ```
+
+Only a request the deterministic planner cannot settle reaches the provider:
+`serve a model` names no model, so its plan is a placeholder and the provider is
+asked, while `start a local model` resolves to the validated default model at
+high confidence and never consults the provider (so, under `--yes`, it runs the
+`rocm serve` it plans).
 
 For OpenAI or Anthropic, prompt sending must also be enabled and a key must be
 available through the OS secure store or session environment:
@@ -795,11 +911,51 @@ Provider-assisted output is reduced to a validated `rocm` tool call. It is
 shown for review in the TUI, but non-interactive `rocm --yes ...` does not
 execute provider-assisted plans automatically.
 
+A request is planned exactly once, so the plan shown to the user is the plan
+the provider gave: building a plan can call the provider, whose answers are not
+guaranteed to be the same twice, and a second call could describe a different
+command than the first. Three E2E scenarios in
+[chat.feature](../tests/e2e-cucumber/features/chat.feature) hold this through the
+real binary, against a mock chat provider that answers from a script (a
+different plan on each call, via `MockServer::start_with_chat_script` in
+[mock_server.rs](../tests/e2e-cucumber/src/mock_server.rs); steps in
+[planner_steps.rs](../tests/e2e-cucumber/tests/e2e/planner_steps.rs)):
+
+- `chat-10` (`chat-freeform-yes-plans-once`): `rocm --yes "serve a model"`
+  asks the planning provider exactly once, prints the provider's plan, and is
+  refused (non-zero exit, no `execution` section) rather than running it. This
+  is also the scenario for the claim above that `--yes` does not execute
+  provider-assisted plans.
+- `chat-11` (`chat-assistant-plan-tool-plans-once`): the chat assistant's
+  `natural_language_plan` tool asks the planning provider exactly once.
+- `chat-12` (`chat-plan-tool-text-matches-action`): the same tool called
+  directly through the hidden `rocm mcp-call` entry point asks the provider
+  exactly once, and the JSON it returns agrees with itself: the rendered plan
+  text (`structuredContent.text`) and the action it reports as what would run
+  next (`structuredContent.action`) are both the provider's first answer, with
+  the action marked `provider_assisted`.
+
+```bash
+cargo xtask e2e -- -n "chat-10"
+cargo xtask e2e -- -n "chat-11"
+cargo xtask e2e -- -n "chat-12"
+```
+
+All three run on the mock lane and need no GPU. The plan shown and the action
+that would run can be compared only where both are reported, which is the
+`natural_language_plan` tool (`chat-12`). The `--yes` surface refuses a
+provider-assisted plan before dispatching it, so it never runs the plan's
+command and shows only the plan text; for that surface the reuse of the
+rendered plan is covered by the unit tests below.
+
 Focused coverage:
 
 ```bash
 cargo test -p rocm --bin rocm provider_planner
 cargo test -p rocm --bin rocm freeform_execution_validation_rejects_provider_assisted_plans
+cargo test -p rocm --bin rocm freeform_plan_dedup_prevents_provider_assisted_divergence
+cargo test -p rocm --bin rocm freeform_execution_reuses_the_rendered_plan_without_rebuilding
+cargo test -p e2e-cucumber --lib chat_script_tests
 ```
 
 Log browser smoke:
@@ -970,6 +1126,26 @@ via `VLLM_API_KEY`), the packaged llama-server fallback (via `--api-key-file`),
 and Lemonade on non-Windows are all fully supported. Teaching the Windows
 detached-spawn primitive to carry a value-typed override (so Windows Lemonade can
 serve public with auth) is tracked as a separate follow-up.
+
+Lemonade backend pin restore focused tests (the restore after a kept alignment
+pin stops installing; `docs/engine-plugins.md`, section "Lemonade backend
+alignment on engine install"):
+
+```bash
+cargo test -p rocm-engine-lemonade restore
+cargo test -p rocm-engine-lemonade equal_pin
+cargo test -p rocm-engine-lemonade failed_retry
+```
+
+They assert each warning together with the real state it describes: the pin
+file, the ROCm backend directories (including a partial build the first attempt
+left), and that a missing or mismatched cached archive triggers no download.
+No Gherkin scenario covers the restore: it needs a runtime tree that already
+holds a stale pin and a live backend download, which only a gated hardware lane
+has. The Windows Strix Halo e2e lane's prewarm step (`rocm engines install
+lemonade` against the shared tree) reaches the restore only on a runner whose
+shared tree still holds a stale pin; on a healthy runner the install succeeds and
+the restore never runs, so a green lane does not show that it works.
 
 Engine recipe adapter contract focused tests:
 
@@ -1157,6 +1333,128 @@ while unsupported Linux IDs remain non-mutating instead of guessed. The
 reconcile path is also non-privileged. It refreshes passive checks and persists
 the `total`/`present`/`missing` check summary without running DKMS commands.
 
+Windows display driver checks (`fix-22-display-driver-old`) are covered by unit
+tests, because the Linux CI lane cannot simulate a Windows host:
+
+```bash
+cargo test -p rocm-core -- windows_driver:: windows_driver_fills windows_driver_version_date \
+  display_driver old_driver driver_age driver_fact driver_date driver_from_the_inventory \
+  driver_without_the_cpu second_query version_less no_date basic_display same_adapter \
+  local_host_driver_probe formats_the_driver_date_in_utc diagnosis_remediation_matches_the_fix_catalog_for_shared_fix_ids \
+  needs_reboot_true_fix_ids_match_the_known_set every_recipe_id_is_unique_and_covers_the_catalog
+cargo test -p rocm --bin rocm -- windows_install_driver should_execute_never \
+  the_fix_id_the_install_text planners_describe the_chat_entry the_production_planner provider_plans
+```
+
+The filters are plain name fragments, because the tests sit in five modules and
+share no prefix. They match the fix-22 and driver-age tests, the install-driver
+planner tests, and some neighbouring inventory tests (for example the startup
+paths that must not start the driver query). After adding or renaming one of
+these tests, check the set with the same arguments and `-- --list`.
+
+The `rocm install driver` tests assert the printed version, date, verdict and fix
+id together with the fact that the plan has no commands and stays non-mutating,
+with or without `--yes`. A `no` verdict is asserted together with the sentence
+that the date cannot judge newer GPUs such as gfx1151.
+
+Four `@requires-os:windows` scenarios run on the Windows GPU lane
+(`e2e-gpu-strix-windows`): `examine-29` in
+[examine.feature](../tests/e2e-cucumber/features/examine.feature),
+`diagnose-41` in
+[diagnose.feature](../tests/e2e-cucumber/features/diagnose.feature), and
+`driver-install-04` and `driver-install-05` in
+[driver_install.feature](../tests/e2e-cucumber/features/driver_install.feature).
+They name no driver. The inspection, diagnosis and unapproved install scenarios
+compare their output with `rocm examine --json` on the same machine:
+the version, date and `driver_age` lines match the JSON, the verdict follows the
+date, `rocm install driver` prints that the driver install changes nothing and
+writes no installer state, with or without `--yes`, and `fix-22-display-driver-old`
+appears in `rocm diagnose` only for an old driver. The old-driver branch is
+covered by these scenarios but needs a machine whose display driver is dated
+before 27 July 2023, the value of `FIRST_HIP_SDK_FOR_WINDOWS` in
+[windows_driver.rs](../crates/rocm-core/src/windows_driver.rs). Unit tests cover
+that branch.
+
+Run these scenarios only on Windows. Cucumber's `-n` and `-t` filters replace
+this harness's platform filter, so selecting a Windows scenario by name or tag
+on Linux runs it against Linux behavior instead of skipping it. The Windows
+install steps also require a native Windows build before any CLI invocation.
+[driver_host_guard.rs](../tests/e2e-cucumber/tests/driver_host_guard.rs) checks
+that ordering without running an installer. Do not run these scenarios on a
+non-Windows host.
+
+Lines that `rocm fix` and `rocm diagnose` print for Windows are meant to be
+pasted into Windows PowerShell 5.1 or cmd, so they are held to a text rule: no
+`&&` or `||`, no bare `where`, no `%NAME%`, no empty-string argument, and no
+`$` or `\"` inside a double-quoted `powershell -Command "..."` body, and no
+`Get-Item` there without `-ErrorAction Stop` (a missing path is a
+non-terminating error, so the line would print it and still exit 0). The `where`
+and `-Command` matches ignore case.
+`fails_in_windows_powershell` in
+[fix.rs](../crates/rocm-core/src/fix.rs) applies it to every catalog recipe that
+applies on Windows (commands, the `Verify` line and the `Verify (Linux, WSL)`
+line) and to the `Fix` values `rocm diagnose` builds for Windows. Scenarios
+`diagnose-43`, `diagnose-44` and `diagnose-45` in
+[diagnose.feature](../tests/e2e-cucumber/features/diagnose.feature) apply it to
+what `rocm fix <id> --dry-run` prints; the plan prints before the platform
+gate, so they run on the Linux lanes too. The e2e crate cannot depend on
+rocm-core, so it carries its own copy of the rule,
+[powershell_text_rule.rs](../tests/e2e-cucumber/src/powershell_text_rule.rs).
+Both copies are tested against one table of cases,
+[powershell_text_rule_cases.txt](../tests/e2e-cucumber/fixtures/powershell_text_rule_cases.txt):
+add a case there, and a rule that gets it wrong fails on its own side.
+
+The rule reads text; it does not prove a line runs. On Windows,
+`cargo test -p rocm-core --lib` types the `Verify` lines of fix-2, fix-13, fix-14, fix-15, fix-21 and
+fix-22 into cmd and into Windows PowerShell and checks the exit code and
+output (the tests in [fix.rs](../crates/rocm-core/src/fix.rs) named
+`the_override_verify_runs_in_cmd_and_powershell`,
+`the_hip_sdk_verify_runs_the_exe_under_hip_path`,
+`the_adrenalin_verify_runs_and_its_filter_keeps_only_amd`,
+`the_msvc_verify_runs_in_cmd_and_powershell`,
+`the_outdated_msvc_verify_prints_a_version_and_fails_when_the_dll_is_missing`
+and `the_display_driver_verify_runs_in_cmd_and_powershell`; fix-15 and fix-21
+also must exit non-zero when their DLL is missing, fix-15 in
+`the_msvc_verify_exits_nonzero_when_a_dll_is_missing`), and runs the fix-9 line
+that only `rocm diagnose` prints
+(`the_igpu_verify_pins_the_variable_it_names` in
+[diagnose.rs](../crates/rocm-core/src/diagnose.rs)). These tests are compiled on
+Windows only, so the Linux lanes do not run them, and no Windows scenario covers
+the Windows lines `rocm diagnose` prints: those are held by the text rule
+(`windows_diagnosis_remediation_passes_the_powershell_text_rule`) and the tests
+above. The fix-6 PATH write is not run by any test because it changes the
+user's PATH.
+
+A catalog entry can carry a second line for Linux and WSL, printed as
+`Verify (Linux, WSL):`, when the line every OS can run cannot show what Linux
+needs. fix-6 does: `hipcc --version` for every OS, and `rocminfo | head -n 5`
+for Linux and WSL, which shows the GPU and passes on a runtime-only install
+that has no `hipcc`. `diagnose-45` asserts both lines and the note that names
+the runtime-only case. fix-2 does too: the `python` line for every OS (it is
+what cmd and PowerShell run), and `echo "${HSA_OVERRIDE_GFX_VERSION:-OK_UNSET}"`
+for Linux and WSL, which needs no Python (a stock Ubuntu has `python3` only)
+and no `||`. `diagnose-44` asserts both lines and the note.
+
+The `rocm diagnose` Linux arms print the catalog's Linux line and nothing from
+the plain line: fix-6 prints `rocminfo | head -n 5` alone (chaining `hipcc
+--version` fails on a runtime-only install), and fix-2 prints its Linux line
+followed by `python3 -c "import torch; ..."`, the check that clearing the
+override left the GPU usable. Scenarios `diagnose-46` (fix-2, run with
+`HSA_OVERRIDE_GFX_VERSION` set) and `diagnose-47` (fix-6, on a simulated host)
+in [diagnose.feature](../tests/e2e-cucumber/features/diagnose.feature) assert
+the line `rocm diagnose` prints, and that it names `python3` and no `hipcc`.
+Both are `@requires-os:linux`, so they run on every Linux lane (WSL2 included),
+GPU or not, and are skipped on Windows. The arms are also checked against the
+catalog in [diagnose.rs](../crates/rocm-core/src/diagnose.rs)
+(`the_override_fix_verify_matches_the_catalog_copy`,
+`the_path_fix_verify_matches_the_catalog_copy`). On Unix hosts,
+`the_path_fix_verify_passes_on_a_runtime_only_linux_install` and
+`the_override_fix_verify_runs_where_only_python3_exists` run the lines
+`rocm diagnose` prints in `/bin/sh` on a `PATH` of stand-in executables with no
+`hipcc` or no `python`. `the_override_linux_verify_runs_with_nothing_on_path`
+([fix.rs](../crates/rocm-core/src/fix.rs)) runs the catalog's `verify_linux`
+line for fix-2, not the `rocm diagnose` one, on an empty `PATH`.
+
 Provider audit focused test:
 
 ```bash
@@ -1182,6 +1480,30 @@ The plain proposal history test verifies that `/automations` and
 server/artifact details, and approve/reject controls instead of raw backend
 action or restricted-tool names.
 
+Automation history stores (events, audit, proposals):
+
+```bash
+cargo test -p rocm-core automation::tests
+```
+
+These cover the three JSONL stores in
+[automation.rs](../crates/rocm-core/src/automation.rs): concurrent writers
+across threads and processes losing no records, size-based rotation of the
+event and audit logs under the same lock (no record lost or duplicated while
+writers rotate, recent reads spanning the rollover, a failed rotation still
+keeping the record and printing its one-shot warning to stderr, lock-free
+readers never reading a file twice or skipping a generation), and proposal
+compaction keeping every pending proposal, the
+newest reviewed ones, and legacy proposal ids. Most of those drive
+`append_jsonl_record`/`load_recent_jsonl_records` directly with a custom
+rotation policy; two further tests go through the public
+`append_automation_event`/`append_audit_event` and
+`load_recent_automation_events`/`load_recent_audit_events` wrappers instead,
+at the real size cap, so the wiring between them and the rotation policy
+itself stays covered. The user-visible side is `automations-07` through
+`automations-09` in
+[automations.feature](../tests/e2e-cucumber/features/automations.feature).
+
 Natural-language plan handoff tests:
 
 ```bash
@@ -1195,6 +1517,8 @@ cargo test -p rocm --bin rocm freeform_execution_header_surfaces_explicit_approv
 cargo test -p rocm --bin rocm hybrid_planner_driver_action_includes_yes_for_approved_execution
 cargo test -p rocm --bin rocm render_freeform_plan_exposes_structured_tool_calls
 cargo test -p rocm --bin rocm natural_serve_with_missing_model_does_not_focus_approval
+cargo test -p rocm --bin rocm freeform_plan_dedup_prevents_provider_assisted_divergence
+cargo test -p rocm --bin rocm freeform_execution_reuses_the_rendered_plan_without_rebuilding
 ```
 
 In the TUI, recognized mutating plain-language requests render a plan and then
@@ -1243,6 +1567,32 @@ cargo test -p rocm --bin rocm render_update_text_reports_all_update_surfaces
 `rocm update` must report runtime checks plus CLI, engine, and model-recipe
 surfaces honestly. `rocm update --apply` remains runtime-only until production
 metadata feeds exist for the other surfaces.
+
+Runtime version-ordering tests:
+
+```bash
+cargo test -p rocm --bin rocm version_proptests
+cargo xtask e2e -- -n 'update-0[78]'
+```
+
+Where `rocm install sdk` and `rocm update` compare runtime versions, they
+compare them in one PEP 440 order over published version strings (`7.9` <
+`7.10.0`, `7.0.0b1` < `7.0.0rc1` < `7.0.0` < `7.0.0.post1`, `7.2.4.70204` above
+`7.2.4`). That covers picking the newest ROCm version from a wheel index,
+breaking ties between tarball builds uploaded at the same time, and the
+update-or-not verdict. It does not decide everything on its own: tarball builds
+are picked by upload time first, and on the release channel only a stable
+version in the strict `X.Y.Z` shape is a candidate at all, so a four-component
+release such as `7.2.4.70204` is never picked there. The property tests check
+that the order is total, that picks do not depend on the order the index lists
+versions in, and that the update verdict points the same way as the order. Two
+spellings of one version (`7.0.0-rc1` and `7.0.0rc1`) are not offered as an
+update for a tarball runtime; a wheel runtime for an exact device target,
+installed under one spelling, can still report `repair_available` against an
+index that publishes the other,
+because its runtime key and package specs carry the index's spelling.
+`generator_reach_report` prints how often each hard case is generated (run it
+with `-- --nocapture`), and fails if the generator stops reaching them.
 
 Model recipe engine metadata checks:
 
@@ -1365,6 +1715,26 @@ E2E_INCLUDE_LIFECYCLE=1 E2E_ONLY_LIFECYCLE=1 cargo xtask e2e
 The harness applies the matching OS requirement itself; do not select these
 with cucumber's `--tags`/`-n` flags, because those bypass the suite's custom
 expectation and applicability resolver.
+
+The required `windows-build-and-test` lane additionally folds in the hermetic
+`comfyui-01`/`comfyui-02`/`comfyui-03` scenarios (not themselves `@lifecycle`)
+via `E2E_ALSO_RUN_IDS`, a comma-separated list of `@id`s:
+
+```powershell
+$env:E2E_INCLUDE_LIFECYCLE = "1"
+$env:E2E_ONLY_LIFECYCLE = "1"
+$env:E2E_ALSO_RUN_IDS = "comfyui-uv-install-failure-names-log,comfyui-uv-install-progress-streamed,comfyui-ambiguous-runtime-actionable"
+cargo xtask e2e
+```
+
+These three were made hermetic and Windows-portable without being tagged
+`@lifecycle` — they're ComfyUI install scenarios, not release packaging/
+install/uninstall ones, and tagging them `@lifecycle` would drop them out of
+the full-suite runs in `nightly.yml` and `e2e-selfhosted.yml`, neither of
+which sets `E2E_INCLUDE_LIFECYCLE`. `E2E_ALSO_RUN_IDS` selects them into this
+lane instead, so this is the one required lane that guarantees Windows
+coverage for them; the self-hosted Windows lane that otherwise runs them is
+optional.
 
 Heavy CI runs the matching set per platform. The scenarios reject untrusted
 signers, bad checksums, bad detached signatures, and missing required signature
@@ -1574,7 +1944,7 @@ including that the managed-service probe is not even *consulted* on a GPU host
 That unit test exercises `reuse_pregate_opens` directly, so on its own it cannot
 see `serve()` ceasing to pass `host_has_no_usable_gpu` at the call site — the
 call site is a seam no unit test in `apps/rocm` can reach, because the host GPU
-probe is a real hardware probe with no injection point. serve-29 closes it, and
+probe is a real hardware probe with no injection point. serve-31 closes it, and
 being `@requires-gpu` it runs on the **`E2E self-hosted`** lane only, never on
 the per-PR mock lane. The host predicate itself is the shared
 `host_has_no_usable_gpu` function, called by both the bail and the test rather
@@ -1583,7 +1953,7 @@ than restated in either, so the test cannot drift from the production rule.
 The bypass decision's other arguments are in the same position — the unit tests
 in `apps/rocm/src/service_launch.rs` pin `managed_service_reuse_refusal` itself,
 not which values `serve()` hands it — so each one has a scenario instead:
-serve-28 for `require_api_key`, serve-30 for the requested recipe. The device
+serve-30 for `require_api_key`, serve-32 for the requested recipe. The device
 policy needs neither: the predicate takes it by value rather than as an
 `Option`, so a call site that drops it does not compile.
 
@@ -1603,20 +1973,20 @@ all (see the comment at
 [`tests/e2e-cucumber/tests/e2e.rs`](../tests/e2e-cucumber/tests/e2e.rs), above
 `only_lifecycle`). That caveat applies to every `-n` in this file, but it bites
 hardest here: these five are selected *by* host GPU state, so `-n` runs them on
-hosts whose premise does not hold — serve-26/27/28/30 need a host with no usable
-AMD GPU and serve-29 needs one with a GPU, and each silently reports the wrong
+hosts whose premise does not hold — serve-28/29/30/32 need a host with no usable
+AMD GPU and serve-31 needs one with a GPU, and each silently reports the wrong
 answer on the other. (The one supported way to drive them off their own lane is
 to make the host match: masking every device with `HIP_VISIBLE_DEVICES=` makes
 the harness and the product agree the host has no usable GPU, which is what the
-mock lane has.) Note also that `-n` matches the scenario *name* (`serve-26 -
+mock lane has.) Note also that `-n` matches the scenario *name* (`serve-28 -
 Reuse succeeds on a GPU-less host`), not the `@id:` tag, so passing an id to it
 silently selects nothing.
 
-- serve-26, `@id:serve-reuse-exempt-from-no-gpu-refusal` — a `serve` that
+- serve-28, `@id:serve-reuse-exempt-from-no-gpu-refusal` — a `serve` that
   matches an already-running vLLM service on a GPU-less host is not refused: it
   prints the reuse summary. The only end-to-end proof of the exemption's happy
   path.
-- serve-27, `@id:serve-unrelated-live-service-still-fails-fast` — a live
+- serve-29, `@id:serve-unrelated-live-service-still-fails-fast` — a live
   Lemonade service for an *unrelated* model does not soften the no-GPU refusal:
   serving a different model is refused before any engine starts, and nothing is
   prepared or downloaded. Lemonade specifically, because it manages its own
@@ -1630,20 +2000,20 @@ silently selects nothing.
   configured, and no other e2e root has one, so without this fixture the call
   could be hoisted above the bail with every refusal scenario still green. The
   final `Then` asserts the registry is still empty after the refusal.
-- serve-28, `@id:serve-unreusable-live-service-still-fails-fast` — a live vLLM
+- serve-30, `@id:serve-unreusable-live-service-still-fails-fast` — a live vLLM
   service for the *same* model, which this invocation nonetheless cannot reuse
   (`--require-api-key` against a service that has no key), also does not soften
-  the refusal. This is the pre-gate's *acceptance* term, which serve-26 and
-  serve-27 cannot reach: serve-26 plants a record that really is reusable, and
-  serve-27 fails the gate's outer engine/model condition before the acceptance
+  the refusal. This is the pre-gate's *acceptance* term, which serve-28 and
+  serve-29 cannot reach: serve-28 plants a record that really is reusable, and
+  serve-29 fails the gate's outer engine/model condition before the acceptance
   test runs. The discriminating assertion is that the `rocm services stop`
   advice is absent — that advice is printed only from the spawn, which is
   reachable only once the no-GPU bail has been bypassed.
-- serve-30, `@id:serve-recipe-mismatched-live-service-still-fails-fast` — the
+- serve-32, `@id:serve-recipe-mismatched-live-service-still-fails-fast` — the
   same shape for the *other* independent argument of that acceptance test. A
   live vLLM service for the same model, against a serve that asks for a
   `--tool-call-parser` the service was not started with, is a recipe mismatch,
-  so it also earns no bypass. serve-28 cannot stand in for it: the record every
+  so it also earns no bypass. serve-30 cannot stand in for it: the record every
   other scenario plants carries `engine_recipe_json: null`, which is exactly
   what a serve with no recipe-bearing flags requests, so the recipe argument
   matched whether `serve()` passed it or not. `--tool-call-parser` is the
@@ -1654,19 +2024,19 @@ silently selects nothing.
   replaces it.
 
 Those four carry `@requires-no-gpu` (their premise is a host with no usable AMD
-GPU), so they get their live coverage on the GitHub-hosted mock lane; serve-26,
-serve-28 and serve-30 also carry `@requires-os:linux`.
+GPU), so they get their live coverage on the GitHub-hosted mock lane; serve-28,
+serve-30 and serve-32 also carry `@requires-os:linux`.
 
 The fifth is the pre-gate's other half, and it is the one that needs real
 hardware:
 
-- serve-29, `@id:serve-live-reuse-candidate-does-not-preempt-gpu-validation`
+- serve-31, `@id:serve-live-reuse-candidate-does-not-preempt-gpu-validation`
   (**`@requires-gpu`**, so the `E2E self-hosted` lane only) — on a host that
   *does* have a usable GPU, a live service this invocation really could reuse
   still does not pull engine or registry work ahead of `--gpu` validation. The
   record matches on liveness, engine and canonical model id, so every term of
   the pre-gate except `host_has_no_usable_gpu` is satisfied and that predicate
-  alone is what holds the gate shut. It reuses serve-27's setup-venv fixture so
+  alone is what holds the gate shut. It reuses serve-29's setup-venv fixture so
   the final `Then` can assert the registry is still empty: with the gate wrongly
   open, `recover_setup_runtime_registration` re-files the planted manifest before
   the refusal. This is the only check in the repo that fails if `serve()` stops
@@ -1740,6 +2110,27 @@ rocm --bin rocm wsl_rocdxg`). Running it end to end needs a WSL2 host with
 `/dev/dxg` and dxcore present, since the plan refuses before installing
 otherwise.
 
+## Bare-metal driver install
+
+On Linux bare metal, `rocm install driver` defaults to the floating `latest`
+amdgpu release; `ROCM_CLI_AMDGPU_DRIVER_VERSION` overrides it (replacing the
+retired `ROCM_CLI_AMDGPU_VERSION`/`ROCM_CLI_AMDGPU_PACKAGE_RELEASE` pair, which the plan refuses while either is still set). An
+override that isn't a plain version token is refused rather than silently
+falling back, since it is interpolated into privileged shell commands:
+
+```bash
+cargo test -p rocm --bin rocm driver_install
+```
+
+`driver-install-06` in
+[driver_install.feature](../tests/e2e-cucumber/features/driver_install.feature)
+asserts the plan a real bare-metal Linux host actually produces: the apt
+repo file and signing key with the host's own suite (`noble` on 24.04,
+`resolute` on 26.04), and the previous-driver warning. The warning command is
+also run against a stubbed `dpkg-query` by
+`previous_driver_warning_fires_only_when_amdgpu_dkms_is_installed` in
+[driver_install.rs](../apps/rocm/src/driver_install.rs).
+
 ## /etc/os-release
 
 Every Rust reader of `/etc/os-release` parses it with
@@ -1807,10 +2198,14 @@ examine`'s distro fields and distro name via `record_distro` and
 `distro_name_from_os_release`, which both take the whole `OsRelease` directly.
 The three `_read`-suffixed functions are the one seam the real call site
 hands its result to, and each delegates to the matching `_at` function with
-the path it actually read. `install_hint_for`/`build_driver_install_plan`
-are bare-text siblings of `_at` — not something `_read` delegates through —
-kept only for the unit tests below, which fixture text directly and have no
-`OsRelease` of their own to construct.
+the path it actually read. The unit tests below call the `_read` functions
+directly too, constructing an `OsRelease` from fixture text instead of going
+through a bare-text sibling — `crate::hardware_root::OsRelease::found` in
+[openmpi.rs](../crates/rocm-core/src/openmpi.rs)'s tests, and the equivalent
+`os_release_found` test helper in
+[driver_install.rs](../apps/rocm/src/driver_install.rs)'s (the former is
+`#[cfg(test)] pub(crate)` inside `rocm-core` and so not visible from
+`apps/rocm`'s own tests).
 
 ```bash
 cargo test -p rocm-core --lib os_release
@@ -1926,6 +2321,19 @@ does not apply on — and exits 3.
 cargo xtask e2e -- -n '(diagnose-40)'
 ```
 
+`diagnose-42` uses the same simulated-host mechanism for the driver-reinstall
+advice: an Ubuntu 24.04 `os-release` and two stale repo files planted under the
+root make `fix-7-stale-repos` fire, and the scenario checks that it names both
+repo files by their real paths and `rocm install driver --dkms --yes`, and that
+`rocm install driver --help` accepts those flags. `driver-install-08` covers the
+retired `ROCM_CLI_AMDGPU_VERSION` / `ROCM_CLI_AMDGPU_PACKAGE_RELEASE` refusal
+and checks that setting `ROCM_CLI_AMDGPU_DRIVER_VERSION`, as the refusal advises,
+clears it.
+
+```bash
+cargo xtask e2e -- -n '(diagnose-42|driver-install-08)'
+```
+
 The other half of the same change — `fix-13-hip-sdk-missing` no longer firing
 just because no HIP SDK is installed — has **no** end-to-end coverage and cannot
 have any. `check_13_hip_sdk_missing` returns early on every non-Windows host, so
@@ -2003,7 +2411,12 @@ opens over SSH, with no `DISPLAY` or `WAYLAND_DISPLAY` on Linux, or with
 `ROCM_NO_BROWSER` set to a non-empty value. A machine with no mail client
 configured reaches the same printed form, which is why the address appears on
 its own and not only inside the `mailto:` link. That is the common case on
-servers and in containers. The opt-out is the easiest to check on a desktop:
+servers and in containers. Whichever happened, the line straight under the
+report, before the link, says the mail goes from the user's own mail account
+and carries their address, while the report itself names no user, host, or file
+path. That holds on every branch, including the plain `--report` preview, which
+tells the user how to mail the report themselves. The opt-out is the easiest to
+check on a desktop:
 
 ```bash
 ROCM_NO_BROWSER=1 rocm diagnose --report --send
@@ -2034,3 +2447,116 @@ afterwards. `engine`/`engine_version` carry the same distinction: a host a
 probe found no engine on reports `"engine": "none"`, while a host whose engine
 probe never ran (skipped rather than completed) reports `"engine": "unknown"`,
 since a probe that never ran cannot say an engine is absent.
+
+### The same report from the dashboard
+
+The dashboard offers this report on its Diagnose screen. It calls the CLI and
+shows what the CLI prints, so there is nothing to compare by hand except the
+flow.
+
+Open the screen from the Observe tab with `d`, or from the ROCm tab by choosing
+the Diagnose verb and pressing `Enter`. Both open the card and run nothing yet.
+The bare `rocm` launcher's Diagnose & fix entry is different. It starts
+`rocm examine` at once, and `p` is ignored while that console runs, so wait for
+the examine result, then press `p`.
+
+1. On the card, or after the examine result, press `p`. The console runs
+   `rocm diagnose --report --json` and shows the report, or the refusal
+   envelope. Nothing is sent at this step.
+2. Press `Enter` or `Esc` to leave the console. The card starts with "A report is
+   ready" for a report, or with the CLI's own explanation for a refusal. A
+   refusal offers no way to send, and neither does output that could not be read.
+3. Press `s`. An approval shows the report again, with the default button on
+   Deny. `n`, `Esc`, `q`, or `Enter` on Deny starts nothing.
+4. Press `y`, or move to Approve and press `Enter`. The console runs
+   `rocm diagnose --report --send` and shows the CLI's own outcome: a mail
+   client opened, or the address and link printed. The same environment rules
+   as above decide which, so `ROCM_NO_BROWSER=1 rocm dash` forces the printed
+   form on a desktop.
+
+The send examines the machine again. If the machine changed between the preview
+and the approve, the mail carries the second result. The send console prints the
+report again, and the mail client shows the full content before the mail is sent.
+On a WSL host the preview always shows the `platform-not-probed` refusal, so the
+approve path needs a host with an approved architecture. The unit tests in
+[examine_manager.rs](../crates/rocm-dash-tui/src/ui/examine_manager.rs) cover that
+path everywhere. They also cover a report taller than the approval dialog, which
+scrolls with PgUp, PgDn, Home and End and says when more is below, and a preview
+or send that is already running, which starts nothing and says so.
+
+### Counting received reports
+
+Mail has no query, so reports are counted from an export of the mail. This is
+maintainer tooling, not part of `rocm`, and it sends and files nothing:
+
+```bash
+cargo xtask report-rollup <export-dir>
+cargo xtask report-rollup <export-dir> --json
+cargo xtask report-rollup <export-dir> --verbose
+```
+
+The report address is a group, so every member receives each report, and any
+member's copies can be exported. Every recipient's copy carries the same
+`Message-ID`, so exports from two members' inboxes can share one directory: the
+second copy of each report is removed as a duplicate, not counted twice.
+
+Export each message as an `.eml` file into one directory. Outlook on the web
+and the new Outlook save a message as `.eml`, and the Graph endpoint
+`GET /me/messages/{id}/$value` returns the same bytes, which makes a bulk
+export a short loop. A raw report body saved as `.json` is read too.
+Nothing else is: `.msg`, `.mbox` and text exports are named as unsupported and
+not read. One message per file is the point. A damaged `.eml` is exactly one
+unread report, while an mbox can merge or split messages without any error.
+
+The output is a tree that counts the reports at every level of the group key:
+the catalog entry, then the architecture, the ROCm release, the distribution
+and its major version, and the engine. Read it for the level where one count
+splits into several: the field at that level is the one that separates the
+reports. In the tree under `unrecognised`, for example, a count that stays
+whole down to the architecture and splits at `rocm` says the ROCm release
+separates those reports. The definition of "same
+problem" is `Report::group_key` in
+[report.rs](../crates/rocm-core/src/report.rs), and the counting is in
+[report_rollup.rs](../crates/rocm-core/src/report_rollup.rs).
+
+Every input lands in exactly one bucket, and each bucket is printed:
+
+- A report read and grouped. Those with no recognised cause are counted apart,
+  because a report carries no error text to separate them further.
+- A refusal, counted by the rule that refused.
+- An unread report, from a newer CLI or with a body that is not a report,
+  counted by the schema it declared and never as zero.
+- A message that is not a report: a reply, an automatic reply, a bounce, or
+  unrelated mail. `--verbose` lists each by file name and subject.
+- A duplicate export of a message already counted, matched on its
+  `Message-ID`.
+- A file in a format that is not read, or a folder inside the export. Only one
+  level is read, and each folder is named.
+
+A forwarded report is counted, and the output says how many arrived that way.
+A forward carries a new `Message-ID`, so a report forwarded to the mailbox
+after it was also sent there directly is counted twice. Nothing can remove that
+duplicate, because identical reports from two people are legitimate. A report
+with no `Message-ID` cannot be deduplicated either, and the output says how
+many there were.
+
+Every count is of reports, not of people. A report carries no machine
+identifier, so one person who sends the same report five times counts as five.
+
+The mail around a report identifies its sender, and the report does not. The
+reader keeps only the subject, the content headers and a digest of the
+`Message-ID`, and it reads only the JSON value in the body, so nothing from a
+report's mail headers or signature reaches any output.
+
+The other inputs are the maintainer's own, and the outputs differ in how much of
+them they carry. `--json` carries counts and the group values, and a group value
+is always one the CLI itself writes: a catalog entry, a supported architecture,
+an approved distribution or engine, a release number, or a fallback word such as
+`unknown`. The address takes mail from anyone, so a report holding any other
+value, a name or terminal control characters for instance, is read as unread:
+counted, and grouped nowhere. No free text from the input reaches `--json`, so
+it is the one to pass on. The text output names the files it could not read, and
+`--verbose` adds the file name and subject of each message that is not a
+report. A subject or a file name can name a person, so keep that output to your
+own terminal. The export itself still holds everything. Never commit it, and
+delete it once the rollup is taken.

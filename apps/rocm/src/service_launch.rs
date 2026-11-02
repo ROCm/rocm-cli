@@ -46,18 +46,21 @@ use rocm_core::{format_http_base_url, process_is_running};
 use rocm_engine_protocol::{DevicePolicy, EngineRecipeHint, ResolveModelResponse};
 
 use crate::endpoint_keys;
-use crate::engines_cmd::env_root_for_service;
-use crate::service_hints;
-use crate::{
-    SandboxToolArg, builtin_engine_serve_http_args, device_policy_name,
-    existing_live_managed_service, managed_service_launcher_path, record_cli_audit_event,
-    render_service_action_result, run_internal_sandbox_tool, status_for_readiness,
-    wait_for_service_http_ready_with_progress,
-};
-#[cfg(windows)]
-use crate::{app_path_env_var_refs, app_path_env_var_values};
+use crate::engine_ipc::builtin_engine_serve_http_args;
 #[cfg(not(windows))]
-use crate::{apply_app_path_env, read_optional_tail_lines};
+use crate::engine_runtime_select::apply_app_path_env;
+#[cfg(windows)]
+use crate::engine_runtime_select::{app_path_env_var_refs, app_path_env_var_values};
+use crate::engine_runtime_select::{
+    managed_service_launcher_path, wait_for_service_http_ready_with_progress,
+};
+use crate::engines_cmd::env_root_for_service;
+use crate::managed_service_status::existing_live_managed_service;
+use crate::service_hints;
+#[cfg(not(windows))]
+use crate::services_text::read_optional_tail_lines;
+use crate::services_text::{render_service_action_result, run_internal_sandbox_tool};
+use crate::{SandboxToolArg, device_policy_name, record_cli_audit_event, status_for_readiness};
 
 pub(crate) fn validate_bind_host(host: &str, allow_public_bind: bool) -> Result<()> {
     if !is_loopback_host(host) && !allow_public_bind {
@@ -362,6 +365,21 @@ pub(crate) enum ManagedReuseRefusal {
 /// only policy a record can carry is the one `parse_device_policy` admits
 /// (see below), so `existing.device_policy == Some("cpu_only")` is not
 /// reachable from any `rocm serve` this CLI can run.
+/// The `rocm serve` no-usable-GPU refusal, worded once.
+///
+/// Two places raise it and they must say the same thing: `serve()`'s fail-fast
+/// pre-flight, and the spawn below when the reuse that waived that pre-flight
+/// turns out not to be available after all.
+pub(crate) fn no_usable_gpu_refusal(device_policy: &DevicePolicy) -> String {
+    format!(
+        "no usable AMD GPU detected; `rocm serve` requires a GPU under the {policy} \
+         policy and does not fall back to CPU. Check the driver with `rocm examine`, \
+         confirm /dev/kfd is present, and ensure HIP_VISIBLE_DEVICES / \
+         ROCR_VISIBLE_DEVICES are not masking every device.",
+        policy = device_policy_name(device_policy)
+    )
+}
+
 pub(crate) fn managed_service_reuse_refusal(
     existing: &ManagedServiceRecord,
     requested_recipe_json: Option<&str>,
@@ -414,6 +432,7 @@ fn spawn_managed_engine_child(
     env_id: Option<&str>,
     engine_recipe: Option<&EngineRecipeHint>,
     require_api_key: bool,
+    gpu_refusal_waived_for_reuse: bool,
 ) -> Result<ManagedSpawn> {
     paths.ensure()?;
     fs::create_dir_all(paths.services_dir())?;
@@ -503,6 +522,19 @@ fn spawn_managed_engine_child(
         }));
     }
 
+    // Nothing live to reuse — and if the only reason this invocation got past
+    // `serve()`'s no-usable-GPU pre-flight was a reusable service, that premise
+    // has just been falsified. `serve()` decided it from a snapshot taken before
+    // GPU selection and the launch lock; the check above is the authoritative
+    // one, so a service that died in between (an OOM, say) would otherwise fall
+    // through to a real spawn on a host with no usable GPU, and the user would
+    // get whatever the engine says about having no device instead of the
+    // actionable refusal the pre-flight exists to give. Raise it here, where the
+    // premise is known to be false.
+    if gpu_refusal_waived_for_reuse {
+        bail!("{}", no_usable_gpu_refusal(device_policy));
+    }
+
     let mut record = ManagedServiceRecord::new(
         paths,
         service_id,
@@ -518,6 +550,7 @@ fn spawn_managed_engine_child(
         Some(device_policy_name(device_policy).to_owned()),
     );
     record.gpu_indices = gpu_indices.to_vec();
+    record.served_model_id = resolve.served_model_id.clone();
     record.engine_recipe_json = requested_recipe_json;
     // The flag the user actually passed, carried through rather than re-derived.
     //
@@ -656,6 +689,7 @@ pub(crate) fn start_managed_service(
     endpoint_api_key: Option<&str>,
     launch_lock: rocm_core::FileLock,
     require_api_key: bool,
+    gpu_refusal_waived_for_reuse: bool,
     on_wait_tick: &mut dyn FnMut(Duration),
 ) -> Result<ManagedLaunchReport> {
     let paths = AppPaths::discover()?;
@@ -673,6 +707,7 @@ pub(crate) fn start_managed_service(
         env_id,
         engine_recipe,
         require_api_key,
+        gpu_refusal_waived_for_reuse,
     )? {
         ManagedSpawn::AlreadyRunning(report) => return Ok(report),
         ManagedSpawn::Spawned { record, child_pid } => (*record, child_pid),
@@ -690,7 +725,11 @@ pub(crate) fn start_managed_service(
         engine,
         host,
         port,
-        &resolve.canonical_model_id,
+        &|| {
+            let mut latest = record.clone();
+            let _ = latest.refresh_from_engine_state();
+            latest.served_model_name().to_owned()
+        },
         endpoint_api_key,
         Duration::from_secs(45),
         on_wait_tick,
@@ -981,6 +1020,7 @@ pub(crate) fn run_attached_service(
     endpoint_api_key: Option<&str>,
     launch_lock: rocm_core::FileLock,
     require_api_key: bool,
+    gpu_refusal_waived_for_reuse: bool,
 ) -> Result<()> {
     let paths = AppPaths::discover()?;
 
@@ -998,6 +1038,7 @@ pub(crate) fn run_attached_service(
         env_id,
         resolve.engine_recipe.as_ref(),
         require_api_key,
+        gpu_refusal_waived_for_reuse,
     )?;
     // The claiming record is persisted (or an existing service was found), so the
     // selected GPU is now visible to concurrent auto-selection. Release the launch
@@ -1403,6 +1444,7 @@ mod tests {
 
         let resolve = ResolveModelResponse {
             canonical_model_id: "qwen-canonical".to_owned(),
+            served_model_id: None,
             task: "chat".to_owned(),
             source: "hf".to_owned(),
             revision: "main".to_owned(),
@@ -1436,6 +1478,7 @@ mod tests {
             None,
             None,
             Some(&requested_recipe),
+            false,
             false,
         );
         let _ = fs::remove_dir_all(root);
@@ -1492,6 +1535,7 @@ mod tests {
 
         let resolve = ResolveModelResponse {
             canonical_model_id: "qwen-canonical".to_owned(),
+            served_model_id: None,
             task: "chat".to_owned(),
             source: "hf".to_owned(),
             revision: "main".to_owned(),
@@ -1521,6 +1565,7 @@ mod tests {
             None,
             // The demand that used to be silently discarded.
             true,
+            false,
         );
         let _ = fs::remove_dir_all(root);
 
@@ -1576,6 +1621,7 @@ mod tests {
 
         let resolve = ResolveModelResponse {
             canonical_model_id: "qwen-canonical".to_owned(),
+            served_model_id: None,
             task: "chat".to_owned(),
             source: "hf".to_owned(),
             revision: "main".to_owned(),
@@ -1606,6 +1652,7 @@ mod tests {
             None,
             None,
             true,
+            false,
         );
         let _ = fs::remove_dir_all(root);
 

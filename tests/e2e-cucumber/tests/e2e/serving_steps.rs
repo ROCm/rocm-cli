@@ -664,6 +664,81 @@ async fn setup_lemonade_hf_checkpoint_model(world: &mut E2eWorld) {
     .await;
 }
 
+#[given("a model is being served on aim")]
+async fn setup_aim_model(world: &mut E2eWorld) {
+    serve_aim_canary(world).await;
+}
+
+/// Serves the same hardware-verified AIM canary [`setup_aim_model`] does.
+/// Factored out so the lifecycle-parity scenario can call it a second time,
+/// after stopping the service, without duplicating the image/profile pin.
+async fn serve_aim_canary(world: &mut E2eWorld) {
+    // Serves via the raw AIM Docker image reference rather than the catalog
+    // recipe added in ROCMAI-555 — this is a hardware-verified serve+inference
+    // canary pinned to one exact image/profile, not a catalog-discovery test.
+    //
+    // The `aim-meta-llama-llama-3-2-1b-instruct` image originally used here
+    // bundles only Instinct-series (MI300X/MI250X/MI355X/MI325X/MI350X)
+    // profiles — confirmed via its container logs to report "Found 0
+    // compatible profiles" on Strix Halo/gfx1151, the only runner this
+    // scenario executes on. `aim-radeon-qwen-qwen3-5-9b` is a Radeon-targeted
+    // image, hardware-verified serving real inference on Strix Halo; its
+    // profile still needs an explicit pick via `--engine-env` because
+    // auto-selection isn't reliable for Radeon targets yet.
+    let image = "amdenterpriseai/aim-radeon-qwen-qwen3-5-9b:0.12.0-preview";
+    // The container bundles vLLM, which echoes the model's baked-in HF id
+    // (not the Docker image reference) as `model` — confirmed live on Strix
+    // Halo.
+    let model = "Qwen/Qwen3.5-9B";
+    serve_and_wait(
+        world,
+        &[
+            "serve",
+            image,
+            "--engine",
+            "aim",
+            "--engine-env",
+            "AIM_PROFILE_ID=vllm-w7900-bf16-tp1-latency",
+            "--managed",
+        ],
+        model,
+        "Qwen3.5-9B",
+    )
+    .await;
+}
+
+/// Stops the AIM service this scenario started and asserts the stop actually
+/// took: reuses [`stop_scenario_services`] (itself `crate::stop_managed_services`,
+/// the same real-record stop the serve-retry path and scenario teardown use),
+/// rather than a hardcoded service id — the AIM canary's id comes from a real
+/// `--managed` launch, not a planted record, so there is no fixed id to match.
+#[when("the user stops the AIM service")]
+async fn stop_aim_service(world: &mut E2eWorld) {
+    let status = stop_scenario_services(world);
+    assert!(
+        status.contains(": stopped"),
+        "expected the AIM service to stop cleanly, got: {status}"
+    );
+    // A stop that leaves the container running would let the next serve reuse
+    // it and still pass inference, so check the container is actually gone.
+    let remaining = std::process::Command::new("docker")
+        .args(["ps", "-q", "--filter", "name=rocm-aim-"])
+        .output()
+        .expect("docker ps should run on an AIM host");
+    let remaining = String::from_utf8_lossy(&remaining.stdout);
+    assert!(
+        remaining.trim().is_empty(),
+        "an AIM container is still running after the stop: {remaining}"
+    );
+}
+
+/// Serves the same AIM canary again, proving the engine can be launched a
+/// second time after a stop — the restart half of lifecycle parity.
+#[when("the user serves that same model on aim again")]
+async fn reserve_aim_model(world: &mut E2eWorld) {
+    serve_aim_canary(world).await;
+}
+
 #[given("a large model is being served on GPU")]
 async fn setup_large_gpu_model(world: &mut E2eWorld) {
     // Large-model nightly coverage follows the host's serving path. vLLM hosts
@@ -1235,7 +1310,7 @@ fn setup_runtime_fixture_paths(world: &E2eWorld) -> (PathBuf, PathBuf) {
     )
 }
 
-/// Makes the refusal's *ordering* observable, which no assertion in serve-26/28/29
+/// Makes the refusal's *ordering* observable, which no assertion in serve-28/30/31
 /// could do before.
 ///
 /// `rocm serve` resolves its runtime selection with
@@ -1395,7 +1470,7 @@ async fn user_serves_live_model_requiring_a_key(world: &mut E2eWorld) {
 /// Serve the *same* model the live planted record names, asking for a vLLM
 /// tool-call parser the running service was not started with.
 ///
-/// The discriminating step of serve-30. Liveness, engine and canonical model id
+/// The discriminating step of serve-32. Liveness, engine and canonical model id
 /// all match, so the pre-gate's outer condition holds, and `--tool-call-parser`
 /// is what makes the *requested* recipe non-null: on vLLM
 /// `engine_recipe_with_tool_call_override` synthesizes a hint even for a model
@@ -1410,8 +1485,8 @@ async fn user_serves_live_model_requiring_a_key(world: &mut E2eWorld) {
 /// replaces the no-GPU one — which `the user is told no AMD GPU was detected`
 /// sees. Every other scenario plants a null recipe against a serve that
 /// requests none, so none of them can tell the two apart. `--env-id` satisfies
-/// model resolution without installing a runtime, the same way serve-26 and
-/// serve-28 do; captured pipe output rather than a PTY, because the expected
+/// model resolution without installing a runtime, the same way serve-28 and
+/// serve-30 do; captured pipe output rather than a PTY, because the expected
 /// outcome is a refusal on stderr.
 #[when("the user serves that same model with a tool-call parser under the GPU-required default")]
 async fn user_serves_live_model_with_a_tool_call_parser(world: &mut E2eWorld) {
@@ -1436,7 +1511,7 @@ async fn user_serves_live_model_with_a_tool_call_parser(world: &mut E2eWorld) {
 /// Serve the *same* model the live planted record names, pinned to a GPU ordinal
 /// the host does not have.
 ///
-/// The discriminating step of serve-29, and it only means anything on a host
+/// The discriminating step of serve-31, and it only means anything on a host
 /// that has a usable GPU. There the reuse pre-gate must stay shut on
 /// `host_has_no_usable_gpu` alone — every other term is satisfied, since the
 /// planted record matches on liveness, engine and canonical model id — so
@@ -1447,7 +1522,7 @@ async fn user_serves_live_model_with_a_tool_call_parser(world: &mut E2eWorld) {
 /// the way; the paired `no runtime registry manifest was written` is what sees
 /// that.
 ///
-/// No `--env-id`, unlike serve-26/28/30: `validate_engine_selection_runtime`
+/// No `--env-id`, unlike serve-28/30/32: `validate_engine_selection_runtime`
 /// only reaches `recover_setup_runtime_registration` when neither
 /// `--runtime-id` nor `--env-id` is given, so naming one would make that
 /// assertion unfalsifiable. Captured pipe output rather than a PTY, because the
@@ -1583,7 +1658,7 @@ async fn assert_no_stop_the_running_server_advice(world: &mut E2eWorld) {
     );
 }
 
-/// serve-30's counterpart to `the user is not told to stop the running server`.
+/// serve-32's counterpart to `the user is not told to stop the running server`.
 ///
 /// The recipe-mismatch refusal `spawn_managed_engine_child` raises does not
 /// print `rocm services stop` — it says to stop the service and run `rocm

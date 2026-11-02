@@ -488,6 +488,12 @@ pub struct InstallResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResolveModelResponse {
     pub canonical_model_id: String,
+    /// The model name the running server advertises in `/v1/models` and accepts
+    /// in requests, when it differs from `canonical_model_id` (a container
+    /// engine's `canonical_model_id` is the image to pull, not the served name).
+    /// `None` means they are the same.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub served_model_id: Option<String>,
     pub task: String,
     pub source: String,
     pub revision: String,
@@ -503,6 +509,18 @@ pub struct ResolveModelResponse {
     pub warnings: Vec<String>,
 }
 
+impl ResolveModelResponse {
+    /// The model name the running server answers to: `served_model_id` when the
+    /// engine reported one, else `canonical_model_id`.
+    #[must_use]
+    pub fn served_model_name(&self) -> &str {
+        self.served_model_id
+            .as_deref()
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or(&self.canonical_model_id)
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EngineRecipeHint {
     pub contract_version: String,
@@ -511,6 +529,13 @@ pub struct EngineRecipeHint {
     pub required_flags: Vec<String>,
     #[serde(default)]
     pub parser_settings: BTreeMap<String, String>,
+    /// Engine-specific environment variables to pass through verbatim to the
+    /// engine's own process/container (e.g. AIM's `AIM_PROFILE_ID` override).
+    /// Generic by design — only `engines/aim` currently reads this.
+    /// Omitted when empty so a recipe hint serialises as it did before the
+    /// field existed (duplicate-serve reuse compares the JSON as a string).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra_env: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preferred_endpoint: Option<EngineRecipeEndpointHint>,
     #[serde(default)]
@@ -621,6 +646,32 @@ pub struct LogsResponse {
 
 #[cfg(test)]
 mod tests {
+    fn resolve_response(served: Option<&str>) -> ResolveModelResponse {
+        ResolveModelResponse {
+            canonical_model_id: "image:tag".to_owned(),
+            served_model_id: served.map(str::to_owned),
+            task: "chat".to_owned(),
+            source: "s".to_owned(),
+            revision: "r".to_owned(),
+            loader: "l".to_owned(),
+            trust_remote_code: false,
+            chat_template_mode: "auto".to_owned(),
+            dtype: "auto".to_owned(),
+            device_policy: DevicePolicy::GpuRequired,
+            estimated_memory: "1 GiB".to_owned(),
+            launch_defaults: Value::Null,
+            engine_recipe: None,
+            warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn served_model_name_prefers_a_non_blank_served_id() {
+        assert_eq!(resolve_response(Some("qwen")).served_model_name(), "qwen");
+        assert_eq!(resolve_response(Some(" ")).served_model_name(), "image:tag");
+        assert_eq!(resolve_response(None).served_model_name(), "image:tag");
+    }
+
     use super::*;
 
     #[test]
@@ -888,6 +939,7 @@ mod tests {
                     "reasoning_parser".to_owned(),
                     "qwen3".to_owned(),
                 )]),
+                extra_env: BTreeMap::from([("AIM_PROFILE_ID".to_owned(), "foo".to_owned())]),
                 preferred_endpoint: Some(EngineRecipeEndpointHint {
                     endpoint_mode: "openai".to_owned(),
                     settings: BTreeMap::from([("streaming".to_owned(), "true".to_owned())]),
@@ -921,6 +973,10 @@ mod tests {
         );
         assert_eq!(hint.unsupported_combinations.len(), 1);
         assert_eq!(hint.notes, vec!["signed recipe metadata"]);
+        assert_eq!(
+            hint.extra_env.get("AIM_PROFILE_ID").map(String::as_str),
+            Some("foo")
+        );
     }
 
     #[test]
@@ -939,6 +995,7 @@ mod tests {
                 engine: "vllm".to_owned(),
                 required_flags: vec!["--enable-auto-tool-choice".to_owned()],
                 parser_settings: BTreeMap::new(),
+                extra_env: BTreeMap::new(),
                 preferred_endpoint: None,
                 unsupported_combinations: Vec::new(),
                 notes: Vec::new(),

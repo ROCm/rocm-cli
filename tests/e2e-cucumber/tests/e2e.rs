@@ -31,8 +31,11 @@ mod e2e {
     pub mod driver_steps;
     pub mod engines_steps;
     pub mod examine_steps;
+    pub mod host_guard;
     pub mod lifecycle_steps;
     pub mod logs_steps;
+    pub mod model_catalog_steps;
+    pub mod planner_steps;
     pub mod remote_steps;
     pub mod runtime_lifecycle_steps;
     pub mod runtime_steps;
@@ -142,6 +145,17 @@ pub struct E2eWorld {
     /// launch step knows to pass `--chat-mock` (deterministic offline agent, no
     /// endpoint detection) instead of driving the real detection/consent path.
     pub chat_use_mock: bool,
+    /// The managed runtime's torch/torchvision/torchaudio versions captured BEFORE a
+    /// ComfyUI install (EAI-8051), so the post-install step can require them to be
+    /// unchanged. Comparing exact versions catches a swap to any other build, labelled
+    /// or not (e.g. stock PyPI `2.13.0`, which is CUDA yet carries no `+cu` label).
+    pub comfyui_baseline_torch_stack: Option<String>,
+    /// The managed runtime's installed distribution names captured BEFORE a ComfyUI
+    /// install (EAI-8051), so the post-install step can require the set to have
+    /// grown. Without it a run that installs nothing — `comfyui::install` skips the
+    /// whole `uv` step on an empty requirement list and still exits 0 — would pass
+    /// every runtime-preservation assertion having exercised nothing.
+    pub comfyui_baseline_distributions: Option<Vec<String>>,
     /// Per-scenario release-lifecycle state (packaging dirs, signing keys, install
     /// dir, captured logs). `Some` only for `@lifecycle` scenarios; all its paths
     /// are rooted in `isolated_root` so teardown removes them with the temp dir.
@@ -166,6 +180,10 @@ pub struct E2eWorld {
     /// reads the record, but a real `rocm services stop e2e-mock --yes` would
     /// then signal the harness process itself.
     pub recorded_process: Option<std::process::Child>,
+    /// Whether the Doctor report preview in the dashboard console was the CLI's
+    /// refusal envelope (it carries a `refused` key). Recorded when the preview
+    /// is read, so a later step can check the card against what the CLI said.
+    pub dash_report_refused: Option<bool>,
 }
 
 /// One scenario's resolved expectation plus the identity needed to report it.
@@ -314,10 +332,13 @@ impl Default for E2eWorld {
             command_env: Vec::new(),
             tui: None,
             chat_use_mock: false,
+            comfyui_baseline_torch_stack: None,
+            comfyui_baseline_distributions: None,
             lifecycle: None,
             skill_reference: None,
             skill_symptom: None,
             recorded_process: None,
+            dash_report_refused: None,
         }
     }
 }
@@ -397,14 +418,18 @@ impl E2eWorld {
         }
         // When a scenario declares a longer serve-readiness window (via a
         // `@serve-timeout:<secs>` tag → serve_timeout_override), also raise the
-        // CLI's OWN vLLM readiness cap to match. `rocm serve --managed` otherwise
-        // SIGTERM-kills a vLLM that isn't ready within its default (5 min,
-        // EAI-7393), which a large model's cold load legitimately exceeds — so
-        // extending only the harness's poll (`model_is_ready`) isn't enough; the CLI
-        // would kill the server first. Keeping the two in lockstep makes the
-        // big-model serve actually reach ready (verified on MI300X with Qwen3.6-27B).
+        // CLI's OWN per-engine readiness cap(s) to match. `rocm serve --managed`
+        // otherwise kills/fails a server that isn't ready within its default (5
+        // min, EAI-7393), which a large model's cold load legitimately exceeds —
+        // so extending only the harness's poll (`model_is_ready`) isn't enough;
+        // the CLI would terminate the server first. Keeping them in lockstep
+        // makes the big-model serve actually reach ready (vLLM verified on
+        // MI300X with Qwen3.6-27B; AIM verified on Strix Halo with a 9B model's
+        // cold-start HF download). Setting both vars unconditionally is harmless
+        // — the unused one is a no-op for whichever engine isn't in play.
         if let Some(secs) = self.serve_timeout_override {
             env.push(("ROCM_CLI_VLLM_READY_TIMEOUT_SECS", secs.to_string().into()));
+            env.push(("ROCM_CLI_AIM_READY_TIMEOUT_SECS", secs.to_string().into()));
         }
         env
     }
@@ -1165,7 +1190,9 @@ async fn main() {
 
     use cucumber::writer::{self, Stats as _};
     use e2e_cucumber::capability::host_capability;
-    use e2e_cucumber::expectation::{Expectation, ScenarioDecl, resolve};
+    use e2e_cucumber::expectation::{
+        Expectation, ScenarioDecl, lifecycle_lane_includes, resolve, unmatched_also_run_ids,
+    };
     use e2e_cucumber::monotonic_clock::MonotonicClockWriter;
 
     let dir = results_dir();
@@ -1204,6 +1231,19 @@ async fn main() {
     // either its CLI filter OR this closure, so CLI selection would bypass OS,
     // nightly/lifecycle, ID, and expectation resolution entirely.
     let only_lifecycle = std::env::var_os("E2E_ONLY_LIFECYCLE").is_some_and(|v| v == "1");
+    // A `E2E_ONLY_LIFECYCLE` lane can fold in specific non-`@lifecycle`
+    // scenarios by `@id` (comma-separated) instead of running the full suite —
+    // e.g. the Windows lane adding the hermetic comfyui scenarios so they get
+    // required-CI coverage there without being tagged `@lifecycle`, which would
+    // also pull them out of `nightly.yml` and `e2e-selfhosted.yml` (neither sets
+    // `E2E_INCLUDE_LIFECYCLE`, so a `@lifecycle` tag would drop them from both).
+    let also_run_ids: Vec<String> = std::env::var("E2E_ALSO_RUN_IDS")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect();
     // Heavy `@merge-queue` serves run only in the merge queue (a cheaper
     // per-engine canary covers them on the PR fast path); set by
     // e2e-selfhosted.yml on the `merge_group` event.
@@ -1309,6 +1349,10 @@ async fn main() {
         // host — e.g. a required engine can't start) are filtered out and never
         // run; their resolution is still recorded so platform.json can show N/A.
         .filter_run(concat!(env!("CARGO_MANIFEST_DIR"), "/features/"), {
+            // Cloned so the outer `also_run_ids` survives this `move` closure —
+            // it is checked against every recorded scenario id after the run,
+            // to catch a listed id that matched nothing.
+            let also_run_ids = also_run_ids.clone();
             move |feature, _rule, scenario| {
                 let decl = ScenarioDecl::from_tags(&scenario.tags);
                 let expectation = resolve(
@@ -1322,7 +1366,7 @@ async fn main() {
                         merge_queue: include_merge_queue,
                     },
                 );
-                let run = (!only_lifecycle || decl.lifecycle)
+                let run = (!only_lifecycle || lifecycle_lane_includes(&decl, &also_run_ids))
                     && !matches!(expectation, Expectation::Skip { .. });
                 if let Some(id) = &decl.id {
                     let engine = decl.effective_engine(cap).to_owned();
@@ -1372,6 +1416,17 @@ async fn main() {
     let actual = e2e_cucumber::report::scenario_results_by_id(&dir.join("report.json"))
         .expect("failed to read scenario results");
     let resolutions = resolutions.lock().expect("resolutions poisoned");
+
+    // Every scenario's id was recorded above regardless of whether it ran, so
+    // an `E2E_ALSO_RUN_IDS` entry missing from `resolutions` means no scenario
+    // in the suite carries that `@id` — a rename or typo that would otherwise
+    // silently drop the scenario from this lane while CI stayed green.
+    let known_ids: Vec<String> = resolutions.keys().cloned().collect();
+    let unmatched = unmatched_also_run_ids(&also_run_ids, &known_ids);
+    assert!(
+        unmatched.is_empty(),
+        "E2E_ALSO_RUN_IDS listed id(s) that no scenario carries (rename or typo?): {unmatched:?}"
+    );
 
     // Collect component versions (OS/ROCm/vLLM/lemonade) for the report heading.
     // OS is always collected (every platform, incl. mock); ROCm/vLLM/lemonade come

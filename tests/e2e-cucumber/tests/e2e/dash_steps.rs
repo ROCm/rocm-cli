@@ -174,6 +174,85 @@ async fn open_dashboard_demo(world: &mut E2eWorld) {
     world.tui = Some(session);
 }
 
+/// The one warning `dash-38`'s recording reports. Short and ASCII so it stays on
+/// one screen row inside the popup and is found by a plain substring match.
+const RECORDED_WARNING: &str = "amd-smi unavailable (GPU device inaccessible)";
+
+#[when("the user opens the dashboard replaying a recording that reports a warning")]
+async fn open_dashboard_replaying_warning(world: &mut E2eWorld) {
+    // A snapshot with a working GPU *and* a warning: the combination where the
+    // warning text used to be drawn nowhere in the dashboard. The dashboard
+    // forgets its latest snapshot the moment a replay ends, and replay caps the
+    // wait between entries at two seconds, so a single line would be gone before
+    // the scenario looked at it. Sixty entries two seconds apart keep the
+    // recording playing for two minutes, far longer than the scenario runs.
+    let snapshot = |ts_us: u64| {
+        format!(
+            concat!(
+                r#"{{"ts_us":{ts_us},"event":{{"kind":"snapshot","#,
+                r#""timestamp":"2023-11-15T00:00:00Z","#,
+                r#""host":{{"cpu_overall_pct":0.0,"cpu_per_core_pct":[],"memory_used_mb":0,"#,
+                r#""memory_total_mb":0,"swap_used_mb":0,"swap_total_mb":0,"#,
+                r#""disk_read_bps":0,"disk_write_bps":0,"net_rx_bps":0,"net_tx_bps":0}},"#,
+                r#""gpus":[{{"device_id":"0","vram_used_mb":0,"vram_total_mb":1024,"#,
+                r#""gpu_utilization_pct":0.0,"temperature_c":0.0,"power_w":0.0,"clock_mhz":null}}],"#,
+                r#""gpu_system_info":null,"instances":[],"warnings":["{warning}"]}}}}"#,
+            ),
+            ts_us = ts_us,
+            warning = RECORDED_WARNING
+        )
+    };
+    let recording_text: String = (0..60u64)
+        .map(|i| snapshot(1_700_000_000_000_000 + i * 2_000_000) + "\n")
+        .collect();
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .to_path_buf();
+    let recording = root.join("warning-recording.ndjson");
+    std::fs::write(&recording, recording_text)
+        .unwrap_or_else(|e| panic!("failed to write {}: {e}", recording.display()));
+    let path = recording.to_string_lossy().to_string();
+    let session = TuiSession::spawn(world, &["dash", "--replay", &path])
+        .unwrap_or_else(|e| panic!("failed to open the dashboard replaying a recording: {e}"));
+    world.tui = Some(session);
+}
+
+#[then("the header shows that one warning is reported")]
+async fn header_shows_one_warning(world: &mut E2eWorld) {
+    session(world)
+        .wait_for_screen("⚠ 1", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the header warning badge did not appear: {e}"));
+}
+
+#[when("the user opens the warnings")]
+async fn open_warnings(world: &mut E2eWorld) {
+    // `!` toggles the popup, so it is not safe to resend; the previous step
+    // already waited for a frame that shows the badge, so the event loop is up.
+    session(world)
+        .send("!")
+        .unwrap_or_else(|e| panic!("failed to open the warnings: {e}"));
+}
+
+#[then("the warning text is displayed")]
+async fn warning_text_is_displayed(world: &mut E2eWorld) {
+    session(world)
+        .wait_for_screen(RECORDED_WARNING, default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the warning text was not shown: {e}"));
+}
+
+#[then("the warning text is no longer displayed")]
+async fn warning_text_is_gone(world: &mut E2eWorld) {
+    session(world)
+        .wait_until_gone(RECORDED_WARNING, default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the warnings popup did not close: {e}"));
+}
+
 /// The name of a child directory `dash-25` plants under the scenario's cwd;
 /// `existing_folder_browser_shows_scenario_folder` asserts the browser lists
 /// it by this fixed, short label rather than its full path — the browser's
@@ -202,6 +281,50 @@ async fn open_dashboard_in_scenario_folder(world: &mut E2eWorld) {
     });
     let session = TuiSession::spawn_in(world, &["dash", "--demo"], &root)
         .unwrap_or_else(|e| panic!("failed to open the dashboard in {}: {e}", root.display()));
+    world.tui = Some(session);
+}
+
+/// Name of the scenario-owned directory `dash-36` (#693) spawns directly
+/// into. Unlike [`ADOPT_SCENARIO_CHILD`] — a whitespace-containing *child*
+/// entry listed by a browser rooted elsewhere — the space here is in this
+/// directory's own name, and this directory itself is the `spawn_in` cwd.
+/// Onboarding's Adopt flow seeds its browser from `std::env::current_dir()`
+/// (`activate_choice` in `onboarding.rs`) with no intervening navigation, so
+/// choosing "[ use this folder ]" stages an approval whose `--root` argument
+/// is this exact whitespace path — the one #500's `quote_display_arg`
+/// (`crates/rocm-dash-tui/src/ui/exec.rs`) is supposed to quote for display,
+/// and the one dash-25 never reaches.
+///
+/// Kept to two short words only for readability on screen, not for wrap
+/// avoidance: the approval preview's command line wraps at word boundaries
+/// (`Wrap { trim: false }` in `draw_approval`) once it outgrows the popup's
+/// own content width, and on a long enough host temp path it reliably does,
+/// regardless of how short this constant is (PR #707 review, 2026-10-16: a
+/// runner `_temp` prefix long enough to push even the bare quoted value past
+/// one row). `approval_preview_quotes_whitespace_root` handles that by
+/// reconstructing the popup's own wrapped body
+/// (`TuiSession::popup_body_text`) rather than requiring this value to fit
+/// on one physical row — see that step for why. The `--python
+/// <root>/bin/python` tail is not part of what that step asserts.
+const ADOPT_WHITESPACE_ROOT: &str = "a b";
+
+#[when("the user opens the dashboard in a scenario folder whose own name has a space")]
+async fn open_dashboard_in_whitespace_named_folder(world: &mut E2eWorld) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .to_path_buf();
+    let cwd = root.join(ADOPT_WHITESPACE_ROOT);
+    std::fs::create_dir_all(&cwd).unwrap_or_else(|e| {
+        panic!(
+            "failed to create scenario-owned folder {}: {e}",
+            cwd.display()
+        )
+    });
+    let session = TuiSession::spawn_in(world, &["dash", "--demo"], &cwd)
+        .unwrap_or_else(|e| panic!("failed to open the dashboard in {}: {e}", cwd.display()));
     world.tui = Some(session);
 }
 
@@ -571,6 +694,40 @@ async fn close_onboarding_setup(world: &mut E2eWorld) {
     tui.wait_until_gone(open_sub_view_marker, default_timeout())
         .await
         .unwrap_or_else(|e| panic!("sub-view did not close: {e}"));
+    tui.send("\u{1b}")
+        .unwrap_or_else(|e| panic!("failed to close onboarding: {e}"));
+    tui.wait_until_gone("Welcome to ROCm — first-run setup", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("onboarding wizard did not close: {e}"));
+}
+
+/// The approval modal's own popup title (`format!("Review: {}", req.title)`
+/// in `draw_approval`, with `req.title` set from `OnboardingChoice::title()`
+/// in `stage_approval`), used by `deny_adopt_approval_and_close_onboarding`
+/// both to wait for the modal and as proof it closed.
+const ADOPT_APPROVAL_TITLE: &str = "Review: adopt existing ROCm folder";
+
+#[when("the user denies the adopt approval and closes onboarding setup")]
+async fn deny_adopt_approval_and_close_onboarding(world: &mut E2eWorld) {
+    // `close_onboarding_setup` above closes the two sub-views it was written
+    // for (Configure, and the Adopt folder browser), but a staged approval is
+    // a third, later sub-view neither of its markers matches — this scenario
+    // (dash-36, #693) is the first to reach one. Same double-Esc shape:
+    // the first Esc denies the approval (`on_key`'s approval-focused branch
+    // treats Esc the same as `n`/`q` — `ApprovalVerdict::Cancel`), landing
+    // back on the bare Choose step with nothing else open; the second Esc
+    // then closes the wizard itself from there (`OnboardingStep::Choose`'s
+    // own Esc arm). Waiting for the approval's own title to clear between
+    // the two keys avoids the same coalescing risk `close_onboarding_setup`
+    // guards against: two bare ESC bytes arriving in the same PTY read
+    // collapse into a single `KeyCode::Esc`, which would only dismiss the
+    // approval and leave the wizard open.
+    let tui = session(world);
+    tui.send("\u{1b}")
+        .unwrap_or_else(|e| panic!("failed to deny the adopt approval: {e}"));
+    tui.wait_until_gone(ADOPT_APPROVAL_TITLE, default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the adopt approval prompt did not close: {e}"));
     tui.send("\u{1b}")
         .unwrap_or_else(|e| panic!("failed to close onboarding: {e}"));
     tui.wait_until_gone("Welcome to ROCm — first-run setup", default_timeout())
@@ -1226,6 +1383,29 @@ async fn gpu_telemetry_displayed(world: &mut E2eWorld) {
     .unwrap_or_else(|e| panic!("GPU telemetry did not appear: {e}"));
 }
 
+#[when("the user selects the ROCm diagnose action")]
+async fn select_rocm_diagnose_action(world: &mut E2eWorld) {
+    // The ROCm actions list opens on "Set up / Install ROCm"; "Diagnose & fix"
+    // is two rows down, after "Check for updates".
+    session(world)
+        .send("jj")
+        .unwrap_or_else(|e| panic!("failed to move to the diagnose action: {e}"));
+}
+
+#[then("the diagnose action says it runs rocm examine")]
+async fn diagnose_action_runs_examine(world: &mut E2eWorld) {
+    let tui = session(world);
+    tui.wait_for_screen("Runs: rocm examine", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the diagnose action's `Runs:` line did not appear: {e}"));
+    let screen = tui.screen_text();
+    assert!(
+        screen.contains("Diagnose & fix") && !screen.contains("rocm doctor"),
+        "the `Runs:` line must belong to the diagnose action and name a real \
+         subcommand, not `rocm doctor`:\n{screen}"
+    );
+}
+
 #[then("ROCm setup actions are displayed")]
 async fn rocm_actions_displayed(world: &mut E2eWorld) {
     session(world)
@@ -1682,6 +1862,80 @@ async fn existing_folder_browser_shows_scenario_folder(world: &mut E2eWorld) {
         .wait_for_screen(&marker, default_timeout())
         .await
         .unwrap_or_else(|e| panic!("the existing-folder browser did not show {marker:?}: {e}"));
+}
+
+#[then("the existing-folder browser is displayed")]
+async fn existing_folder_browser_displayed(world: &mut E2eWorld) {
+    // The Adopt browser's own popup title (`FolderBrowser::new("Pick an
+    // existing ROCm folder", ...)` in `onboarding.rs`'s `activate_choice`) —
+    // distinct from the Configure-path browser's "Pick an install folder"
+    // the existing `install_folder_browser_displayed` step waits for.
+    // Synchronizes before `choose_current_folder`, which has no wait of its
+    // own, the same way `install_folder_browser_displayed` does for dash-23.
+    session(world)
+        .wait_for_screen("Pick an existing ROCm folder", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the existing-folder browser did not appear: {e}"));
+}
+
+#[then("the approval preview quotes the whitespace-containing root path")]
+async fn approval_preview_quotes_whitespace_root(world: &mut E2eWorld) {
+    // The real path the Adopt browser resolved: `activate_choice` seeds it
+    // from the spawned child's own `std::env::current_dir()`, which on
+    // Linux always reports the fully resolved (symlink-free) absolute path
+    // of the `spawn_in` cwd — the same string `Path::canonicalize` computes
+    // here on the directory `open_dashboard_in_whitespace_named_folder`
+    // created, so the two agree without hardcoding a path.
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join(ADOPT_WHITESPACE_ROOT)
+        .canonicalize()
+        .unwrap_or_else(|e| panic!("failed to canonicalize the scenario root: {e}"));
+    // `quote_display_arg` (`crates/rocm-dash-tui/src/ui/exec.rs`, #500) wraps
+    // any whitespace-containing argument value in a pair of quote characters
+    // with no other transformation (our path has no embedded quote to
+    // escape), so the rendered `--root` argument is this exact string,
+    // quoted. #693's contract is "rendered as one unambiguous, quoted unit" —
+    // not any particular quote character — so this accepts either common
+    // convention rather than pinning the double-quote `quote_display_arg`
+    // happens to use today; a future change to the escaping character alone
+    // should not read as a regression here.
+    //
+    // Deliberately *without* a `--root ` prefix, and matched against
+    // `TuiSession::popup_body_text` rather than the raw `screen_text()` grid
+    // (PR #707 review, 2026-10-16, and a follow-up review of that fix on the
+    // same date): the popup wraps its command line at word boundaries, and
+    // on a long enough host temp path a plain single-row substring match —
+    // of the `--root ` prefix and its quoted value together, or even of the
+    // quoted value alone — times out even though the product rendered the
+    // path quoted correctly, because the match can't see across the row
+    // break. `popup_body_text` reconstructs the popup's own body across
+    // however many rows it actually wrapped onto, so this holds regardless
+    // of host path length. The quoted value alone is still unambiguous
+    // within that reconstruction: the only other quoted argument in this
+    // body is `--python`, and `quote_display_arg` quotes that argument's
+    // *entire* value (`<root>/bin/python`), so its closing quote never lands
+    // right after `<root>` the way it does for `--root`'s value alone.
+    let expected_double_quoted = format!("\"{}\"", root.display());
+    let expected_single_quoted = format!("'{}'", root.display());
+    session(world)
+        .wait_for_popup_body_where(
+            &format!(
+                "the approval preview to contain {expected_double_quoted:?} or {expected_single_quoted:?}"
+            ),
+            ADOPT_APPROVAL_TITLE,
+            |body| body.contains(&expected_double_quoted) || body.contains(&expected_single_quoted),
+            default_timeout(),
+        )
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "the approval preview never showed {expected_double_quoted:?} or {expected_single_quoted:?}: {e}"
+            )
+        });
 }
 
 #[then("the Configure step shows the chosen folder instead of the placeholder")]
@@ -2155,4 +2409,206 @@ async fn gpu_section_reports_binary_units(world: &mut E2eWorld) {
         "#673 REGRESSION: GPU VRAM is labeled in decimal-looking GB units \
          instead of binary GiB, got:\n{gpu_row}"
     );
+}
+
+// ── Doctor report ──────────────────────────────────────────────────
+
+/// The Diagnose screen's own panel title, drawn by `draw_examine_manager`. It is
+/// on screen exactly while the screen is open, so it proves the screen opened
+/// and, as an absence, that it closed.
+const DIAGNOSE_SCREEN_TITLE: &str = "Examine — environment check";
+
+#[when("the user opens the Diagnose screen")]
+async fn open_diagnose_screen(world: &mut E2eWorld) {
+    // `d` opens it from the Observe tab (`KeyAction::OpenExamine`). Resent until
+    // it takes, for the same reason `open_observe_view` resends: nothing before
+    // this proves the event loop is reading input yet.
+    session(world)
+        .send_until("d", DIAGNOSE_SCREEN_TITLE, default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("failed to open the Diagnose screen: {e}"));
+}
+
+#[when("the user prepares a Doctor report")]
+async fn prepare_doctor_report(world: &mut E2eWorld) {
+    session(world)
+        .send("p")
+        .unwrap_or_else(|e| panic!("failed to ask for a Doctor report: {e}"));
+}
+
+#[then("the report is displayed for review")]
+async fn report_displayed_for_review(world: &mut E2eWorld) {
+    let tui = session(world);
+    // Whichever way this machine goes, the command prints one JSON object that
+    // carries a `schema`: the report, or the refusal envelope.
+    tui.wait_for_screen("\"schema\"", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the report preview did not appear: {e}"));
+    // The console's dismiss hint appears only once the job has finished, so
+    // the key that follows cannot land on a job still running.
+    tui.wait_for_screen("Enter/Esc dismiss", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the report preview never finished: {e}"));
+    // What the CLI said, read from its own output on the console: the refusal
+    // envelope is the one with a `refused` key. The card is checked against it
+    // after the console is left.
+    world.dash_report_refused = Some(tui.screen_text().contains("\"refused\""));
+}
+
+#[when("the user leaves the report review")]
+async fn leave_report_review(world: &mut E2eWorld) {
+    let tui = session(world);
+    tui.send("\r")
+        .unwrap_or_else(|e| panic!("failed to leave the report review: {e}"));
+    tui.wait_for_screen("Prepare a Doctor report", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the Diagnose screen did not come back: {e}"));
+}
+
+#[then("the dashboard offers to send a report only if the CLI prepared one")]
+async fn dashboard_offers_send_only_if_the_cli_prepared_one(world: &mut E2eWorld) {
+    let refused = world
+        .dash_report_refused
+        .expect("the preview step records whether the CLI refused");
+    let screen = session(world).screen_text();
+    let ready = screen.contains("A report is ready");
+    let offers_send = screen.contains("· s review & send");
+    // The CLI decides. A report is ready exactly when the CLI printed one, and
+    // the dashboard may offer to send exactly then.
+    assert_eq!(
+        ready, !refused,
+        "the card must say a report is ready exactly when the CLI did not refuse \
+         (CLI refused: {refused}, card ready: {ready}):\n{screen}"
+    );
+    assert_eq!(
+        offers_send, !refused,
+        "send must be offered exactly when the CLI did not refuse \
+         (CLI refused: {refused}, send offered: {offers_send}):\n{screen}"
+    );
+    // A refusal reaches the card as the CLI's own explanation, not as the
+    // dashboard's "could not be read". Every refusal the CLI gives says that no
+    // report was prepared. The card puts the outcome first, so a short terminal
+    // does not cut it off.
+    if refused {
+        assert!(
+            screen.contains("prepared"),
+            "the CLI's explanation did not reach the card:\n{screen}"
+        );
+        assert!(
+            !screen.contains("could not be read"),
+            "a refusal was shown as unreadable output:\n{screen}"
+        );
+    }
+}
+
+/// Title of the send approval the `s` key opens.
+const SEND_REVIEW_TITLE: &str = "Report this diagnosis";
+
+/// The part of the dashboard's sender notice this suite matches on, mirrored
+/// from `REPORT_SENDER_NOTICE` in `crates/rocm-dash-tui/src/ui/examine_manager.rs`
+/// (this crate runs the built binary and links neither).
+const SENDER_NOTICE_FRAGMENT: &str = "it goes from your own mail account and carries your address";
+
+/// The send review's title as the shared approval popup stamps it, which is
+/// what `TuiSession::wait_for_popup_body_where` finds the popup by.
+const SEND_REVIEW_TITLE_BAR: &str = "Review: Report this diagnosis";
+
+#[when("the user asks to review the report for sending")]
+async fn ask_to_review_for_sending(world: &mut E2eWorld) {
+    // `s` only opens the review. Nothing is sent before an approve, and this
+    // scenario never approves.
+    session(world)
+        .send("s")
+        .unwrap_or_else(|e| panic!("failed to ask to review the report for sending: {e}"));
+}
+
+#[then("the review says the mail carries the user's own address before showing the report")]
+async fn review_states_the_sender_notice_first(world: &mut E2eWorld) {
+    let refused = world
+        .dash_report_refused
+        .expect("the preview step records whether the CLI refused");
+    let tui = session(world);
+    if refused {
+        // Nothing to send, so no review may open. Give a stray dialog the
+        // time it would take to draw before looking.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let screen = tui.screen_text();
+        assert!(
+            !screen.contains(SEND_REVIEW_TITLE),
+            "a refusal opened a send review:\n{screen}"
+        );
+        return;
+    }
+    // Read the popup's own body, not the whole screen. The review is drawn
+    // over the Diagnose screen and the Observe panels, which share its rows,
+    // so the whole screen joined into one line puts their text (a panel's
+    // "MODEL" heading, say) into the middle of any sentence the review
+    // wrapped. `wait_for_popup_body_where` slices each row to the popup's own
+    // columns and undoes the wrap. It waits for the report's first key so the
+    // body is read once the review has drawn the report.
+    //
+    // Both sides are then compared with all whitespace removed. A wrap that
+    // ends flush with the popup's right border cannot be told apart from a
+    // word split mid-word, so the rejoined body can read "carriesyour" there
+    // (see `popup_body_text`). Without whitespace the fragment still occurs
+    // only in the notice.
+    let mut body = String::new();
+    tui.wait_for_popup_body_where(
+        "the send review shows the report",
+        SEND_REVIEW_TITLE_BAR,
+        |text| {
+            text.clone_into(&mut body);
+            text.contains("\"schema\"")
+        },
+        default_timeout(),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("the send review did not open with the report: {e}"));
+    let screen = tui.screen_text();
+    let unspaced = |text: &str| text.split_whitespace().collect::<String>();
+    let compact = unspaced(&body);
+    let notice = compact.find(&unspaced(SENDER_NOTICE_FRAGMENT));
+    let report = compact.find("\"schema\"");
+    assert!(
+        notice.is_some(),
+        "the send review does not say the mail carries the user's address:\n{body}\n{screen}"
+    );
+    // On the first screen of the review, above the report: the body scrolls
+    // and Approve does not, so a notice below the report could be approved
+    // past without ever being seen. The report's first key, `"schema"`, is on
+    // that first screen too; requiring it keeps the order check from passing
+    // only because the report was missing.
+    assert!(
+        report.is_some(),
+        "the review's first screen does not show the report it asks about:\n{screen}"
+    );
+    assert!(
+        notice < report,
+        "the notice must come before the report in the review:\n{screen}"
+    );
+}
+
+#[when("the user declines the send")]
+async fn decline_the_send(world: &mut E2eWorld) {
+    if world.dash_report_refused == Some(true) {
+        return;
+    }
+    let tui = session(world);
+    tui.send("n")
+        .unwrap_or_else(|e| panic!("failed to decline the send: {e}"));
+    tui.wait_until_gone(SEND_REVIEW_TITLE, default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the send review is still open after declining: {e}"));
+}
+
+#[when("the user closes the Diagnose screen")]
+async fn close_diagnose_screen(world: &mut E2eWorld) {
+    // An open overlay eats the quit key, so a scenario that opened one closes it
+    // before the quit step.
+    let tui = session(world);
+    tui.send("\u{1b}")
+        .unwrap_or_else(|e| panic!("failed to close the Diagnose screen: {e}"));
+    tui.wait_until_gone(DIAGNOSE_SCREEN_TITLE, default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the Diagnose screen is still open after Escape: {e}"));
 }
