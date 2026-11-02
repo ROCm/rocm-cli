@@ -371,7 +371,9 @@ async fn request_refused_without_running(world: &mut E2eWorld) {
     // The behavior: a non-zero exit and no execution section. The message is
     // asserted alongside them and certifies nothing on its own — it is the
     // refusal's wording, and the two checks before it are what show that
-    // nothing ran.
+    // nothing ran. Shown to fail when the refusal is removed: with the
+    // `provider_assisted` check in `validate_freeform_execution_action` deleted,
+    // the command exits 0 and stdout carries the `execution` header.
     assert_ne!(
         rc, 0,
         "a provider-assisted plan must not succeed under --yes"

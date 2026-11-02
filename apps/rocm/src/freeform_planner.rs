@@ -124,7 +124,7 @@ pub(crate) fn plan_next_action(plan: StructuredRequestPlan) -> Option<FreeformPl
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StructuredRequestPlan {
-    request: String,
+    pub(crate) request: String,
     planner: String,
     provider_assisted: bool,
     intent: PlannerIntent,
@@ -1821,6 +1821,18 @@ mod tests {
                 .any(|note| note.contains("validated rocm tool call"))
         );
         Ok(())
+    }
+
+    // The black-box harness repeats this wording as `PLANNER_PROMPT_MARKER` and
+    // `User request: ` in `tests/e2e-cucumber/tests/e2e/planner_steps.rs` to tell
+    // a planning request from a chat completion; this ties them to the source.
+    #[test]
+    fn provider_planner_prompt_keeps_the_wording_the_e2e_harness_matches() {
+        let deterministic = build_freeform_plan("serve a model", &RocmCliConfig::default());
+        let prompt = build_provider_planner_prompt("serve a model", &deterministic);
+
+        assert!(prompt.starts_with("You are resolving an ambiguous rocm-cli request"));
+        assert!(prompt.contains("User request: serve a model"));
     }
 
     #[test]
