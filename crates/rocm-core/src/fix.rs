@@ -2026,16 +2026,16 @@ fn run_render_group(opts: &FixOptions) -> i32 {
         .unwrap_or_default();
     if user.is_empty() {
         fail!("Could not determine current user from $USER/$LOGNAME.");
-        return 3;
+        return exit::NOT_APPLICABLE;
     }
     if !which("usermod") {
         fail!("`usermod` not on PATH; cannot add groups.");
-        return 3;
+        return exit::NOT_APPLICABLE;
     }
     let root = is_root();
     if !which("sudo") && !root {
         fail!("`sudo` is not on PATH and we are not root; cannot add groups.");
-        return 3;
+        return exit::NOT_APPLICABLE;
     }
     let (program, args): (&str, Vec<String>) = if root {
         (
@@ -2062,23 +2062,23 @@ fn run_render_group(opts: &FixOptions) -> i32 {
     println!("Will run: {program} {}", args.join(" "));
     if opts.dry_run {
         println!("(dry-run; not executed)");
-        return 0;
+        return exit::OK;
     }
     if !confirm("Add user to render,video groups?", opts.yes) {
-        return 5;
+        return exit::DECLINED;
     }
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let (rc, out, err) = run(program, &arg_refs, RUN_TIMEOUT);
     relay_output(&out, &err);
     if rc != 0 {
         fail!("usermod exited {rc}; group membership NOT changed.");
-        return 4;
+        return exit::FAILED;
     }
     println!("Added {user} to render,video.");
     println!(
         "IMPORTANT: log out and back in (or reboot) for the membership to take effect in new shells and services. `newgrp render` patches the current shell only."
     );
-    0
+    exit::OK
 }
 
 /// fix-2: help the user clear HSA_OVERRIDE_GFX_VERSION for future shells.
@@ -2101,7 +2101,7 @@ fn run_unset_override_linux() -> i32 {
         println!("(This command can't unset it in your parent shell; it only sees a copy.)");
     }
     let Some(home) = home_dir() else {
-        return 0;
+        return exit::OK;
     };
     report_persistent_override(&[
         home.join(".bashrc"),
@@ -2129,7 +2129,7 @@ fn report_persistent_override(candidates: &[PathBuf]) -> i32 {
         .collect();
     if hits.is_empty() {
         println!("\nNo persistent HSA_OVERRIDE_GFX_VERSION found in your shell rc files.");
-        return 0;
+        return exit::OK;
     }
     println!("\nPersistent HSA_OVERRIDE_GFX_VERSION found in:");
     for f in &hits {
@@ -2144,7 +2144,7 @@ fn report_persistent_override(candidates: &[PathBuf]) -> i32 {
             f.display()
         );
     }
-    0
+    exit::OK
 }
 
 fn run_unset_override_windows(opts: &FixOptions) -> i32 {
@@ -2178,7 +2178,7 @@ fn run_unset_override_windows(opts: &FixOptions) -> i32 {
 /// `5` as "user declined", and a caller (human or agent) relies on that to
 /// tell "nothing happened because you said no" apart from "nothing happened
 /// because there was nothing to do". Declining just the User scope can't
-/// short-circuit straight to `return 5`, though -- if the Machine scope is
+/// short-circuit straight to `return exit::DECLINED`, though -- if the Machine scope is
 /// also set, the guidance for clearing it (which needs an elevated shell)
 /// still has to print unconditionally, so the decline is recorded in a flag
 /// and checked only once both scopes have had their say.
@@ -2191,7 +2191,7 @@ fn report_and_clear_override_windows(
     if user_val.is_empty() && machine_val.is_empty() {
         println!("\nNo persistent HSA_OVERRIDE_GFX_VERSION found in either the User");
         println!("or Machine env scope. You're done after closing/reopening shells.");
-        return 0;
+        return exit::OK;
     }
     println!("\nPersistent HSA_OVERRIDE_GFX_VERSION found in:");
     if !user_val.is_empty() {
@@ -2221,7 +2221,7 @@ fn report_and_clear_override_windows(
             relay_output(&out, &err);
             if rc != 0 {
                 fail!("setx exited {rc}; User scope NOT changed.");
-                return 4;
+                return exit::FAILED;
             }
             println!("Cleared from User scope. Reopen your terminal for it to take effect.");
         } else {
@@ -2239,7 +2239,7 @@ fn report_and_clear_override_windows(
             "or remove it through System Properties -> Environment Variables -> System variables. This command does NOT elevate itself."
         );
     }
-    if declined { 5 } else { 0 }
+    if declined { exit::DECLINED } else { exit::OK }
 }
 
 /// fix-6: persist the ROCm/HIP bin directory on PATH (with consent).
@@ -2256,7 +2256,7 @@ fn run_path_export_linux(opts: &FixOptions) -> i32 {
     // report pointed at -- including a versioned root like /opt/rocm-6.4.1.
     let Some(install) = crate::discover_rocm_installs().into_iter().next() else {
         fail!("No ROCm install found; nothing to add to PATH.");
-        return 3;
+        return exit::NOT_APPLICABLE;
     };
     let bin_path = install.path.join("bin");
     if !bin_path.is_dir() {
@@ -2264,13 +2264,13 @@ fn run_path_export_linux(opts: &FixOptions) -> i32 {
             "{} does not exist; nothing to add to PATH.",
             bin_path.display()
         );
-        return 3;
+        return exit::NOT_APPLICABLE;
     }
     let bin_dir_owned = bin_path.to_string_lossy().into_owned();
     let bin_dir = bin_dir_owned.as_str();
     let Some(rc_file) = shell_rc_file() else {
         fail!("Could not determine your home directory.");
-        return 3;
+        return exit::NOT_APPLICABLE;
     };
     let export_line = format!("export PATH=\"{bin_dir}:$PATH\"");
     if let Ok(existing) = std::fs::read_to_string(&rc_file)
@@ -2282,16 +2282,16 @@ fn run_path_export_linux(opts: &FixOptions) -> i32 {
             "{} already adds {bin_dir} to PATH; no change.",
             rc_file.display()
         );
-        return 0;
+        return exit::OK;
     }
     println!("Plan: append the following line to {}:", rc_file.display());
     println!("  {export_line}");
     if opts.dry_run {
         println!("(dry-run; not executed)");
-        return 0;
+        return exit::OK;
     }
     if !confirm(&format!("Append to {}?", rc_file.display()), opts.yes) {
-        return 5;
+        return exit::DECLINED;
     }
     if let Err(exc) = append_line(
         &rc_file,
@@ -2299,14 +2299,14 @@ fn run_path_export_linux(opts: &FixOptions) -> i32 {
         &export_line,
     ) {
         fail!("Failed to write {}: {exc}", rc_file.display());
-        return 4;
+        return exit::FAILED;
     }
     println!(
         "Appended to {}. Open a new shell or run `source {}` for the change to take effect.",
         rc_file.display(),
         rc_file.display()
     );
-    0
+    exit::OK
 }
 
 fn run_path_export_windows(opts: &FixOptions) -> i32 {
@@ -2316,7 +2316,7 @@ fn run_path_export_windows(opts: &FixOptions) -> i32 {
     }
     if sdk_path.is_empty() {
         fail!("No HIP SDK install found. Run fix-13-hip-sdk-missing first.");
-        return 3;
+        return exit::NOT_APPLICABLE;
     }
     let bin_dir = Path::new(&sdk_path).join("bin");
     if !bin_dir.is_dir() {
@@ -2324,7 +2324,7 @@ fn run_path_export_windows(opts: &FixOptions) -> i32 {
             "{} does not exist on disk; HIP SDK install looks incomplete.",
             bin_dir.display()
         );
-        return 3;
+        return exit::NOT_APPLICABLE;
     }
     let bin_dir = bin_dir.to_string_lossy().into_owned();
     path_export_windows(opts, &bin_dir, || ps_env_scope("PATH", "User"))
@@ -2370,11 +2370,11 @@ fn path_export_windows(
 ) -> i32 {
     let Some(user_path) = read_user_path() else {
         fail!("Could not read the current User PATH; User PATH NOT changed.");
-        return 4;
+        return exit::FAILED;
     };
     if !user_path.is_empty() && user_path.to_lowercase().contains(&bin_dir.to_lowercase()) {
         println!("User PATH already contains {bin_dir}; no change.");
-        return 0;
+        return exit::OK;
     }
     let new_path = windows_path_prepend(bin_dir, &user_path);
     // Escaped once here, before either the printed preview or the real
@@ -2387,10 +2387,10 @@ fn path_export_windows(
     println!("  [Environment]::SetEnvironmentVariable('PATH', '{escaped_new_path}', 'User')");
     if opts.dry_run {
         println!("(dry-run; not executed)");
-        return 0;
+        return exit::OK;
     }
     if !confirm("Update User PATH?", opts.yes) {
-        return 5;
+        return exit::DECLINED;
     }
     // PowerShell's SetEnvironmentVariable, not `setx`: `setx` silently
     // truncates values past 1024 characters while still exiting 0, which a
@@ -2405,19 +2405,19 @@ fn path_export_windows(
     relay_output(&out, &err);
     if rc != 0 {
         fail!("PowerShell exited {rc}; User PATH NOT changed.");
-        return 4;
+        return exit::FAILED;
     }
     println!(
         "Added {bin_dir} to your User PATH. This only takes effect in NEW shells -- close this terminal and reopen it before re-running hipInfo."
     );
-    0
+    exit::OK
 }
 
 /// fix-9: persist HIP_VISIBLE_DEVICES so the iGPU is hidden.
 fn run_hip_visible_devices(opts: &FixOptions) -> i32 {
     if let Some(idx) = opts.device_index.filter(|&i| i < 0) {
         fail!("--device-index must be >= 0 (got {idx}).");
-        return 3;
+        return exit::NOT_APPLICABLE;
     }
     if runtime_is_windows() {
         run_hip_visible_devices_windows(opts)
@@ -2433,11 +2433,11 @@ fn run_hip_visible_devices_linux(opts: &FixOptions) -> i32 {
         println!(
             "Run `rocminfo | grep -E 'Agent |Marketing|gfx'` and identify the row of your DISCRETE GPU (the iGPU is typically Agent 1). Then re-run with --device-index N."
         );
-        return 0;
+        return exit::OK;
     };
     let Some(rc_file) = shell_rc_file() else {
         fail!("Could not determine your home directory.");
-        return 3;
+        return exit::NOT_APPLICABLE;
     };
     pin_device_in_rc_file(&rc_file, idx, opts, || {
         confirm(&format!("Append to {}?", rc_file.display()), opts.yes)
@@ -2468,16 +2468,16 @@ fn pin_device_in_rc_file(
             "{} already sets HIP_VISIBLE_DEVICES; edit by hand rather than appending a second copy.",
             rc_file.display()
         );
-        return 0;
+        return exit::OK;
     }
     println!("Plan: append the following line to {}:", rc_file.display());
     println!("  {export_line}");
     if opts.dry_run {
         println!("(dry-run; not executed)");
-        return 0;
+        return exit::OK;
     }
     if !consent() {
-        return 5;
+        return exit::DECLINED;
     }
     if let Err(exc) = append_line(
         rc_file,
@@ -2485,13 +2485,13 @@ fn pin_device_in_rc_file(
         &export_line,
     ) {
         fail!("Failed to write {}: {exc}", rc_file.display());
-        return 4;
+        return exit::FAILED;
     }
     println!(
         "Appended to {}. Open a new shell for the change to take effect, then re-run your workload.",
         rc_file.display()
     );
-    0
+    exit::OK
 }
 
 fn run_hip_visible_devices_windows(opts: &FixOptions) -> i32 {
@@ -2505,7 +2505,7 @@ fn run_hip_visible_devices_windows(opts: &FixOptions) -> i32 {
         println!(
             "Then re-run with --device-index N (the iGPU is typically device# 0; the dGPU is usually device# 1)."
         );
-        return 0;
+        return exit::OK;
     };
     // Out of scope for ROCMAI-449 (that fix is specific to fix-6-path's
     // read-then-overwrite-the-whole-PATH-value shape): a failed read here
@@ -2516,16 +2516,16 @@ fn run_hip_visible_devices_windows(opts: &FixOptions) -> i32 {
         println!(
             "User scope already sets HIP_VISIBLE_DEVICES={existing:?}; remove or update it manually rather than overwriting from this command."
         );
-        return 0;
+        return exit::OK;
     }
     println!("Plan: persist HIP_VISIBLE_DEVICES in the User env scope:");
     println!("  setx HIP_VISIBLE_DEVICES {idx}");
     if opts.dry_run {
         println!("(dry-run; not executed)");
-        return 0;
+        return exit::OK;
     }
     if !confirm("Set HIP_VISIBLE_DEVICES in the User scope?", opts.yes) {
-        return 5;
+        return exit::DECLINED;
     }
     let (rc, out, err) = run(
         "setx",
@@ -2535,12 +2535,12 @@ fn run_hip_visible_devices_windows(opts: &FixOptions) -> i32 {
     relay_output(&out, &err);
     if rc != 0 {
         fail!("setx exited {rc}; HIP_VISIBLE_DEVICES NOT changed.");
-        return 4;
+        return exit::FAILED;
     }
     println!(
         "setx only takes effect in NEW shells -- close this terminal and reopen it before re-running your workload."
     );
-    0
+    exit::OK
 }
 
 /// Read a Windows environment variable from a given scope via PowerShell.
@@ -4954,5 +4954,64 @@ mod tests {
     fn indent_continuation_keeps_multi_line_verify_under_its_label() {
         assert_eq!(indent_continuation("a\nb\nc", "  "), "a\n  b\n  c");
         assert_eq!(indent_continuation("single", "  "), "single");
+    }
+
+    /// Lines of `production` (source text, test module already cut off) that
+    /// produce an exit code as a bare integer: a `return 4;`, a tail
+    /// expression `0`, a one-line `{ 5 }` branch, or a match arm `=> 3,`.
+    /// Comment lines are skipped, so prose may still talk about "return 5".
+    fn bare_exit_code_literals(production: &str) -> Vec<String> {
+        let shapes =
+            regex::Regex::new(r"\breturn\s+\d+\s*;|^\s*\d+\s*$|\{\s*\d+\s*\}|=>\s*\d+\s*,?\s*$")
+                .unwrap();
+        production
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .filter(|line| shapes.is_match(line))
+            .map(|line| line.trim().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn the_bare_exit_code_lint_flags_each_way_of_writing_one() {
+        let flagged = bare_exit_code_literals(
+            "    return 3;\n    0\n    if declined { 5 } else { exit::OK }\n    Err(_) => 4,\n",
+        );
+        assert_eq!(
+            flagged,
+            [
+                "return 3;",
+                "0",
+                "if declined { 5 } else { exit::OK }",
+                "Err(_) => 4,"
+            ]
+        );
+        // Named constants, comments, and unrelated integers are left alone.
+        assert!(
+            bare_exit_code_literals(
+                "    return exit::FAILED;\n    exit::OK\n    // return 5; is what this used to say\n    let width = 80;\n    if rc != 0 {\n"
+            )
+            .is_empty()
+        );
+    }
+
+    /// Every runner reports its result through `exit::`, so the published
+    /// manifest and the code that produces the codes cannot come to disagree.
+    /// `rc != 0` on a child's own status is not a runner result and is not
+    /// matched.
+    #[test]
+    fn fix_runners_return_named_exit_constants_not_integers() {
+        let source = include_str!("fix.rs");
+        let (production, _tests) = source
+            .split_once("#[cfg(test)]\nmod tests {")
+            .expect("fix.rs has a test module");
+        let (_, runners) = production
+            .split_once("\npub fn apply(")
+            .expect("fix.rs defines apply");
+        assert_eq!(
+            bare_exit_code_literals(runners),
+            Vec::<String>::new(),
+            "use exit::OK, exit::NOT_APPLICABLE, exit::FAILED or exit::DECLINED"
+        );
     }
 }
