@@ -19,7 +19,10 @@
 //! its own new record as a single rewrite via `write_atomic`, so a lock-free
 //! reader never observes a file shrunk mid-repair. That rewrite costs O(store)
 //! rather than O(record), the same as a proposal status update, which rewrites
-//! the whole store via `write_atomic` too. Nothing in this module ever
+//! the whole store via `write_atomic` too. Only when that rewrite itself fails
+//! (a full disk, or on Windows another program holding the store open without
+//! delete sharing) does the append cut the debris in place instead, so a store
+//! cannot be wedged by a failed repair; otherwise nothing in this module ever
 //! shrinks a store in place. Readers take no lock, and an unterminated last
 //! line that is not valid JSON — an append caught mid-write — is skipped
 //! rather than reported as corruption.
@@ -244,7 +247,8 @@ pub struct AuditEventRecord {
 /// rewrite needs it for its read-modify-write; an append needs it both to
 /// serialize against other appends and because it can itself replace or
 /// rename the live file out from under a concurrent writer — a torn tail is
-/// repaired by renaming a new file over the store (see [`TailState::Torn`]),
+/// repaired by renaming a new file over the store, or by truncating it when
+/// that fails (see [`TailState::Torn`]),
 /// and a rotating events or audit store is renamed aside to `<store>.1` (see
 /// [`rotate_jsonl_generations`]) — and an append that had already opened the
 /// old file would otherwise land in the replaced or rotated-away copy and
@@ -367,8 +371,9 @@ fn open_jsonl_for_append(path: &Path) -> Result<fs::File> {
 /// back, and the debris itself is discarded by the *next* append rather than
 /// being cut first as a separate step — see [`inspect_tail`] and
 /// [`TailState::Torn`]. A reader already skips the debris in the meantime.
-/// Nothing in this function ever truncates the live file, so a lock-free
-/// reader never observes it shrink.
+/// This function truncates the live file only as the last resort when that
+/// replacement itself fails (see [`repair_torn_tail_and_append`]), so a
+/// lock-free reader can observe it shrink only then, never on the normal path.
 ///
 /// [`append_or_tolerate_a_missing_newline`] checks whether a failed write
 /// landed anyway before reporting it, so a write that fails but still lands
@@ -419,31 +424,14 @@ fn append_jsonl_record<T: Serialize>(
         }
     }
     match inspect_tail(path, &file)? {
-        TailState::Torn(tail_start) => {
-            // A torn tail is debris — crash or a failed write — that must be
-            // cut before this record lands. Cutting it in place and then
-            // appending as a second step would briefly shrink the file for
-            // any lock-free reader mid-scan, and regrowing it afterward can
-            // make that scan splice bytes read at two different moments into
-            // something that parses as a record nobody wrote (the hazard
-            // `ReverseLines::next_line`'s short-read guard exists for).
-            // Replacing the whole file atomically instead means a reader
-            // only ever sees the pre-repair length or this append's, never a
-            // length in between.
-            let mut content = read_range(path, &file, 0, tail_start)?;
-            content.extend_from_slice(&line);
-            // Done with the pre-repair file's handle before replacing it,
-            // rather than leaving that to whatever happens to still have
-            // `file` open at function return. The rename already succeeds
-            // with this handle open regardless — std opens files with
-            // `FILE_SHARE_DELETE` by default on Windows, so a rename isn't
-            // blocked by it (see `write_atomic`'s doc for the case that
-            // *isn't* covered: another process holding the destination open
-            // without delete-sharing) — but this states the intent rather
-            // than leaning on that default.
-            drop(file);
-            crate::write_atomic(path, &content, "jsonl")?;
-        }
+        TailState::Torn(tail_start) => repair_torn_tail_and_append(
+            path,
+            file,
+            tail_start,
+            &line,
+            |path, content| crate::write_atomic(path, content, "jsonl"),
+            truncate_jsonl_in_place,
+        )?,
         TailState::ValidUnterminated(start) => {
             line.insert(0, b'\n');
             append_or_tolerate_a_missing_newline(path, &file, &line, start)?;
@@ -453,6 +441,76 @@ fn append_jsonl_record<T: Serialize>(
         }
     }
     Ok(())
+}
+
+/// Discard the torn tail of the store at `path`, which starts at `tail_start`,
+/// and land `line` in its place. The caller must hold the store's
+/// [`jsonl_lock_path`] lock; `file` is its handle on the pre-repair store.
+///
+/// The repair publishes the clean prefix plus `line` as one `replace`, so a
+/// lock-free reader only ever sees the pre-repair length or the post-append
+/// length (see [`append_jsonl_record`]). That rewrite can itself fail — no
+/// room for the copy on a full disk, or on Windows another program holding
+/// the store open without delete sharing — and leaving it there would wedge
+/// the store: every later append would hit the same debris and the same
+/// failure. Only then does this fall back to `truncate`, cutting the debris
+/// in place and appending `line` as a plain append. That reopens, on this
+/// already-failing path only, the shrink a lock-free reader can briefly
+/// observe; a truncate frees space rather than needing it and renames
+/// nothing, so it can succeed where `replace` cannot. Like a repair by
+/// `replace`, the fallback prints nothing.
+///
+/// If `truncate` fails too, the error names both causes and the store is left
+/// as it was; readers keep skipping the debris.
+///
+/// `replace` and `truncate` are parameters so a test can make either fail on
+/// demand.
+fn repair_torn_tail_and_append(
+    path: &Path,
+    file: fs::File,
+    tail_start: u64,
+    line: &[u8],
+    replace: impl FnOnce(&Path, &[u8]) -> Result<()>,
+    truncate: impl FnOnce(&Path, u64) -> Result<()>,
+) -> Result<()> {
+    let mut content = read_range(path, &file, 0, tail_start)?;
+    content.extend_from_slice(line);
+    // Done with the pre-repair file's handle before replacing it, rather than
+    // leaving that to whatever happens to still have `file` open at function
+    // return. The rename already succeeds with this handle open regardless —
+    // std opens files with `FILE_SHARE_DELETE` by default on Windows, so a
+    // rename isn't blocked by it (see `write_atomic`'s doc for the case that
+    // *isn't* covered: another process holding the destination open without
+    // delete-sharing) — but this states the intent rather than leaning on that
+    // default.
+    drop(file);
+    let replace_error = match replace(path, &content) {
+        Ok(()) => return Ok(()),
+        Err(error) => error,
+    };
+    drop(content);
+    if let Err(truncate_error) = truncate(path, tail_start) {
+        bail!(
+            "failed to repair the torn tail of {}: replacing it failed ({replace_error:#}); \
+             truncating it failed ({truncate_error:#})",
+            path.display()
+        );
+    }
+    let file = open_jsonl_for_append(path)?;
+    append_or_tolerate_a_missing_newline(path, &file, line, tail_start)
+}
+
+/// Cut the store at `path` down to `len` bytes through a fresh write handle.
+///
+/// Not the append handle: on Windows an append-only handle lacks
+/// `FILE_WRITE_DATA`, which `set_len` needs.
+fn truncate_jsonl_in_place(path: &Path, len: u64) -> Result<()> {
+    fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .with_context(|| format!("failed to open {} for writing", path.display()))?
+        .set_len(len)
+        .with_context(|| format!("failed to truncate {}", path.display()))
 }
 
 /// The warning to print that rotating `path` failed, or `None` after the first
@@ -545,8 +603,9 @@ enum TailState {
     ValidUnterminated(u64),
     /// Debris — crash, or a write that failed partway through a genuinely
     /// incomplete record — starting at this offset. Must be cut before the
-    /// next record lands, but never by truncating in place — see
-    /// [`append_jsonl_record`].
+    /// next record lands, by replacing the store rather than truncating it in
+    /// place — except as the fallback when that replacement fails; see
+    /// [`append_jsonl_record`] and [`repair_torn_tail_and_append`].
     Torn(u64),
 }
 
@@ -583,12 +642,13 @@ fn inspect_tail(path: &Path, file: &fs::File) -> Result<TailState> {
 /// Read bytes `[start, end)` of `file`.
 ///
 /// Returns fewer bytes if the file now ends before `end`. Nothing this
-/// module's own writers do can shrink a store in place — an append only ever
+/// module's own writers do shrinks a store in place — an append only ever
 /// grows it, and a torn-tail repair replaces it wholesale via `write_atomic`
-/// rather than truncating the live file (see [`inspect_tail`] and
-/// [`TailState::Torn`]) — so a short read here means the store was edited or
-/// truncated out-of-band, a case this module does not try to recover from
-/// cleanly. Most callers treat what is still there the same as any other
+/// (see [`inspect_tail`] and [`TailState::Torn`]) — except the repair's
+/// fallback, taken only when that replacement fails and only under the store's
+/// lock (see [`repair_torn_tail_and_append`]); otherwise a short read here
+/// means the store was edited or truncated out-of-band, a case this module
+/// does not try to recover from cleanly. Most callers treat what is still there the same as any other
 /// unexpectedly-ending tail; [`ReverseLines`] is the one exception, and
 /// reports an error instead once it would have to splice such a read onto
 /// bytes it already read, rather than risk inventing a line.
@@ -775,10 +835,12 @@ fn open_jsonl_generations(path: &Path, generations: usize) -> Result<Vec<(PathBu
 ///
 /// The scan takes no lock. A concurrent append only ever grows the file (see
 /// [`append_jsonl_record`]); nothing this module's own writers do shrinks it
-/// in place. The retry below is for a store edited or truncated out-of-band
-/// — by a person, not a concurrent writer — while a scan is in flight: a
-/// scan that fails while the file's length moved under it is retried from
-/// the new end, so that still never surfaces as an error.
+/// in place except the torn-tail repair's fallback, taken only when replacing
+/// the store fails (see [`repair_torn_tail_and_append`]). The retry below is
+/// for a store edited or truncated out-of-band — by a person — or shrunk by
+/// that rare fallback while a scan is in flight: a scan that fails while the
+/// file's length moved under it is retried from the new end, so that still
+/// never surfaces as an error.
 fn load_recent_jsonl_records_from<T: DeserializeOwned>(
     path: &Path,
     file: &fs::File,
@@ -923,8 +985,8 @@ impl<'a> ReverseLines<'a> {
             // A short read while `pending` is empty — nothing accumulated
             // yet, whether from an earlier call or from this one — just
             // means the store was edited or truncated out-of-band (see
-            // `read_range`); nothing a concurrent writer does can shrink it
-            // in place. Once `pending` holds any bytes, a short read means
+            // `read_range`); no concurrent writer shrinks it in place short of
+            // the torn-tail repair's rare fallback. Once `pending` holds any bytes, a short read means
             // they no longer continue from it, so splicing them would
             // invent a line.
             if bytes.len() as u64 != self.pos - start && !self.pending.is_empty() {
@@ -2247,8 +2309,8 @@ mod tests {
         Ok(())
     }
 
-    // Nothing in this module's own writers shrinks a store, but an
-    // out-of-band edit might, and load_recent_jsonl_records is supposed to
+    // Nothing in this module's own writers shrinks a store (bar the torn-tail
+    // repair's rare fallback), but an out-of-band edit might, and load_recent_jsonl_records is supposed to
     // retry from the new length rather than fail. Driving that needs the
     // shrink to land strictly between two of ReverseLines's own chunked
     // reads (see the `test_hooks` module doc) — which in turn
@@ -2473,6 +2535,236 @@ mod tests {
              truncated the live file in place instead of replacing it"
         );
         assert_eq!(text?, format!("{}\n{}\n", audit_line("a"), audit_line("b")));
+        Ok(())
+    }
+
+    /// The store's file identity, as a string so one assertion covers the
+    /// inode on Unix and the volume serial plus file index on Windows.
+    #[cfg(unix)]
+    fn file_identity(path: &Path) -> Result<String> {
+        use std::os::unix::fs::MetadataExt;
+        Ok(fs::metadata(path)?.ino().to_string())
+    }
+
+    #[cfg(windows)]
+    fn file_identity(path: &Path) -> Result<String> {
+        Ok(format!(
+            "{:?}",
+            crate::test_support::windows_file_identity(path)?
+        ))
+    }
+
+    /// Run the torn-tail repair on the seeded audit store with the replace and
+    /// truncate steps supplied by the test, appending the record `b`.
+    fn repair_audit_store_with(
+        paths: &AppPaths,
+        replace: impl FnOnce(&Path, &[u8]) -> Result<()>,
+        truncate: impl FnOnce(&Path, u64) -> Result<()>,
+    ) -> Result<()> {
+        let path = paths.audit_events_path();
+        let file = open_jsonl_for_append(&path)?;
+        let TailState::Torn(tail_start) = inspect_tail(&path, &file)? else {
+            bail!("the seeded store has no torn tail");
+        };
+        let mut line = audit_line("b").into_bytes();
+        line.push(b'\n');
+        repair_torn_tail_and_append(&path, file, tail_start, &line, replace, truncate)
+    }
+
+    // The fallback the whole-store rewrite lacked: when it cannot complete
+    // (a full disk, a sharing violation), the debris is cut in place instead
+    // of wedging every later append on it. The same file identity afterwards
+    // is what tells that apart from the replace the test above pins.
+    #[test]
+    fn a_torn_tail_is_cut_in_place_when_replacing_the_store_fails() -> Result<()> {
+        let (root, paths) = temp_app_paths("torn-tail-fallback-truncates");
+        let torn = &audit_line("torn")[..20];
+        seed_audit_store(&paths, &format!("{}\n{torn}", audit_line("a")))?;
+        let path = paths.audit_events_path();
+        let before = file_identity(&path)?;
+        let mut attempted = Vec::new();
+
+        repair_audit_store_with(
+            &paths,
+            |_, content| {
+                attempted = content.to_vec();
+                bail!("no space left on device")
+            },
+            truncate_jsonl_in_place,
+        )?;
+
+        let after = file_identity(&path)?;
+        let text = fs::read_to_string(&path);
+        let recent = load_recent_audit_events(&paths, 5);
+        fs::remove_dir_all(root).ok();
+        let expected = format!("{}\n{}\n", audit_line("a"), audit_line("b"));
+        assert_eq!(
+            String::from_utf8(attempted)?,
+            expected,
+            "the whole-store replace must be tried first, with the full repaired store"
+        );
+        assert_eq!(text?, expected);
+        assert_eq!(before, after, "the fallback must cut the debris in place");
+        assert_eq!(audit_messages(&recent?), ["a", "b"]);
+        Ok(())
+    }
+
+    // The fallback is a last resort: a replace that works must not be
+    // followed by a truncate, or the shrink window it closes would be back on
+    // every repair.
+    #[test]
+    fn a_torn_tail_is_not_truncated_when_replacing_the_store_works() -> Result<()> {
+        let (root, paths) = temp_app_paths("torn-tail-fallback-unused");
+        let torn = &audit_line("torn")[..20];
+        seed_audit_store(&paths, &format!("{}\n{torn}", audit_line("a")))?;
+        let path = paths.audit_events_path();
+        let before = file_identity(&path)?;
+
+        repair_audit_store_with(
+            &paths,
+            |path, content| crate::write_atomic(path, content, "jsonl"),
+            |_, _| bail!("truncate must not run when the replace succeeded"),
+        )?;
+
+        let after = file_identity(&path)?;
+        let text = fs::read_to_string(&path);
+        fs::remove_dir_all(root).ok();
+        assert_eq!(text?, format!("{}\n{}\n", audit_line("a"), audit_line("b")));
+        assert_ne!(before, after, "a working replace publishes a new file");
+        Ok(())
+    }
+
+    #[test]
+    fn a_torn_tail_that_can_be_neither_replaced_nor_cut_reports_both_causes() -> Result<()> {
+        let (root, paths) = temp_app_paths("torn-tail-fallback-both-fail");
+        let torn = &audit_line("torn")[..20];
+        let seeded = format!("{}\n{torn}", audit_line("a"));
+        seed_audit_store(&paths, &seeded)?;
+        let path = paths.audit_events_path();
+
+        let result = repair_audit_store_with(
+            &paths,
+            |_, _| bail!("no space left on device"),
+            |_, _| bail!("permission denied"),
+        );
+
+        let text = fs::read_to_string(&path);
+        let recent = load_recent_audit_events(&paths, 5);
+        fs::remove_dir_all(root).ok();
+        assert_eq!(
+            format!("{:#}", result.expect_err("both steps failed")),
+            format!(
+                "failed to repair the torn tail of {}: replacing it failed (no space left on \
+                 device); truncating it failed (permission denied)",
+                path.display()
+            )
+        );
+        assert_eq!(
+            text?, seeded,
+            "a failed repair must leave the store as it was"
+        );
+        assert_eq!(audit_messages(&recent?), ["a"]);
+        Ok(())
+    }
+
+    // After the fallback the store is clean, so the next append is the plain
+    // one-line append: no second repair, no new file.
+    #[test]
+    fn appends_after_a_fallback_repair_are_plain_appends() -> Result<()> {
+        let (root, paths) = temp_app_paths("torn-tail-fallback-then-append");
+        let torn = &audit_line("torn")[..20];
+        seed_audit_store(&paths, &format!("{}\n{torn}", audit_line("a")))?;
+        let path = paths.audit_events_path();
+        repair_audit_store_with(
+            &paths,
+            |_, _| bail!("no space left on device"),
+            truncate_jsonl_in_place,
+        )?;
+        let repaired = file_identity(&path)?;
+
+        append_audit_event(&paths, &audit_record("c"))?;
+
+        let after = file_identity(&path)?;
+        let text = fs::read_to_string(&path);
+        fs::remove_dir_all(root).ok();
+        assert_eq!(
+            text?,
+            format!(
+                "{}\n{}\n{}\n",
+                audit_line("a"),
+                audit_line("b"),
+                audit_line("c")
+            )
+        );
+        assert_eq!(repaired, after);
+        Ok(())
+    }
+
+    // The real trigger rather than an injected one: a store directory that
+    // takes no new files, so the temp copy of the whole-store replace cannot
+    // be created, while the store file itself can still be written.
+    #[cfg(unix)]
+    #[test]
+    fn append_repairs_a_torn_tail_in_a_directory_that_takes_no_new_files() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (root, paths) = temp_app_paths("torn-tail-read-only-dir");
+        let torn = &audit_line("torn")[..20];
+        seed_audit_store(&paths, &format!("{}\n{torn}", audit_line("a")))?;
+        let path = paths.audit_events_path();
+        let dir = path.parent().context("the audit store has a directory")?;
+        // Create the lock file now: the append reuses an existing one, but
+        // could not create it inside the read-only directory.
+        drop(FileLock::acquire(jsonl_lock_path(&path))?);
+        let before = file_identity(&path)?;
+
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o555))?;
+        let read_only_holds = fs::File::create(dir.join("probe")).is_err();
+        let result = read_only_holds.then(|| append_audit_event(&paths, &audit_record("b")));
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o755))?;
+
+        let after = file_identity(&path)?;
+        let text = fs::read_to_string(&path);
+        fs::remove_dir_all(root).ok();
+        let Some(result) = result else {
+            // Running as a user the permission bits do not bind (root).
+            eprintln!("skipped: a read-only directory still takes new files for this user");
+            return Ok(());
+        };
+        result?;
+        assert_eq!(text?, format!("{}\n{}\n", audit_line("a"), audit_line("b")));
+        assert_eq!(before, after);
+        Ok(())
+    }
+
+    // Windows' real trigger: another program holds the store open without
+    // delete sharing (a virus scanner or indexer, say), so the rename over it
+    // is refused while the store itself can still be written.
+    #[cfg(windows)]
+    #[test]
+    fn append_repairs_a_torn_tail_while_another_handle_blocks_replacing_the_store() -> Result<()> {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        const FILE_SHARE_READ_WRITE: u32 = 0x1 | 0x2;
+        let (root, paths) = temp_app_paths("torn-tail-share-violation");
+        let torn = &audit_line("torn")[..20];
+        seed_audit_store(&paths, &format!("{}\n{torn}", audit_line("a")))?;
+        let path = paths.audit_events_path();
+        let before = file_identity(&path)?;
+        let blocker = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ_WRITE)
+            .open(&path)?;
+
+        let result = append_audit_event(&paths, &audit_record("b"));
+
+        drop(blocker);
+        let after = file_identity(&path)?;
+        let text = fs::read_to_string(&path);
+        fs::remove_dir_all(root).ok();
+        result?;
+        assert_eq!(text?, format!("{}\n{}\n", audit_line("a"), audit_line("b")));
+        assert_eq!(before, after);
         Ok(())
     }
 
