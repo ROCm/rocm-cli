@@ -216,11 +216,12 @@ These modules are private `mod` declarations — [`lib.rs`](../crates/e2e-report
 
 `engines/vllm` follows full domain extraction:
 
-- [`install.rs`](../engines/vllm/src/install.rs) — ROCm/vLLM build-variant discovery and install execution. It asks `repair.rs` whether an already-resolvable environment still needs an install pass.
+- [`install.rs`](../engines/vllm/src/install.rs) — ROCm/vLLM install execution: the static-pin and the ROCm 10.x discovery install routes, run through `uv`. It reads the build tables and target resolution from `wheel_builds.rs`, and asks `repair.rs` whether an already-resolvable environment still needs an install pass.
 - [`process.rs`](../engines/vllm/src/process.rs) — spawn/env/path setup and readiness polling.
 - [`repair.rs`](../engines/vllm/src/repair.rs) — runtime-repair assessment: whether an already-resolvable managed vLLM environment violates vLLM's pinned dependencies and must be reinstalled (`assess_runtime_repair`, `RepairAssessment`), including the rule that treats the SDK's build of torch, and a torch the user chose with the alignment disabled, as intended rather than a defect. It imports `runtime.rs` and nothing from `install.rs`.
 - [`runtime.rs`](../engines/vllm/src/runtime.rs) — TheRock/managed-runtime resolution and TheRock library/bin path derivation; the path derivation performs no filesystem writes. The launch path's compat-shim writes (a `libmpi_cxx` stub, stale-numa-shim removal) are this module's separate `ensure_therock_compat_shims`, called only from `process.rs`; the running-state payload, which never calls it, falls back to a plain directory listing instead.
 - [`state.rs`](../engines/vllm/src/state.rs) — service state file I/O, log tailing, and health/inference probing.
+- [`wheel_builds.rs`](../engines/vllm/src/wheel_builds.rs) — which vLLM wheels to install for a ROCm SDK version: the static build table (`VLLM_ROCM_BUILD_TABLE`) and the ROCm 10.x discovery table (`VLLM_ROCM_DISCOVER_BUILD_TABLE`, with the `DiscoverVersion` series/exact constraint), the install-route choice (`vllm_install_route`), target resolution including the `ROCM_CLI_VLLM_ROCM_INDEX_URL` override (`vllm_install_target`), and the SDK-version matchers. It also holds `verified_torchaudio_release`, which the crate re-exports from `lib.rs` for the `rocm` binary. It imports only `runtime.rs` and runs no process.
 
 [`lib.rs`](../engines/vllm/src/lib.rs) keeps only CLI/envelope dispatch and the few items shared across those modules.
 
