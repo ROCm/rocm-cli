@@ -1960,15 +1960,27 @@ Run the suite unfiltered and let the harness select:
 cargo xtask e2e
 ```
 
-There is deliberately no focused command for it. Cucumber 0.23 honours
+To run just this one, go through xtask so it still builds the binary:
+
+```bash
+cargo xtask e2e -- -n "serve-28"
+```
+
+That works because `cargo xtask e2e` compiles the binary under test itself,
+with `--features "rocm/e2e-test-hooks rocm/e2e-oom-fault-injection"`, and is
+the only producer of `ROCM_E2E_OOM_FAULT_INJECTION=1`. The CI dispatch filter
+takes the same route.
+
+The caveat is about the filter, not about this scenario. Cucumber 0.23 honours
 *either* its own CLI filter *or* the harness closure, never both, so `-n` or
 `--tags` bypasses the OS, capability and expectation resolution that decides
 whether a scenario may run at all (see the comment at
 [`tests/e2e-cucumber/tests/e2e.rs`](../tests/e2e-cucumber/tests/e2e.rs), above
-`only_lifecycle`). That matters most
-for serve-28, which is gated on the `@requires-oom-fault-injection` capability:
-selected from the CLI it would run on a binary built without the hook and fail
-for the wrong reason. Note also that `-n` matches the scenario *name*
+`only_lifecycle`). For serve-28 that bypass is a hazard only when the binary is
+a **prebuilt** `ROCM_CLI_BINARY`: the hook is compiled out there, the
+`@requires-oom-fault-injection` skip no longer applies, and the scenario fails
+for the wrong reason instead of being reported as skipped. Do not select it by
+name on that route. Note also that `-n` matches the scenario *name*
 (`serve-28 - A launch that runs out of GPU memory ...`), not the `@id:` tag, so
 passing an id to it silently selects nothing.
 

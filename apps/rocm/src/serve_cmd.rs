@@ -58,7 +58,7 @@ use crate::service_launch::{
     print_managed_launch_plain, resolve_endpoint_auth, run_attached_service, start_managed_service,
     validate_bind_host,
 };
-use crate::{append_oom_serve_note, cli_progress, collect_serve_notes, device_policy_name};
+use crate::{cli_progress, collect_serve_notes, device_policy_name};
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) struct ServeEngineSelection {
@@ -951,7 +951,19 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
             require_api_key,
             &mut |_elapsed| spinner.tick(),
         )?;
-        ensure_background_helper_running_quiet(summary_mode)?;
+        // Not when the launch was fabricated. `simulate_oom_managed_launch`
+        // writes a `starting` record for a process that never existed, so the
+        // helper would be left watching a pid that will never appear, with
+        // nothing in the scenario's teardown to stop it: observed as `rocm
+        // daemon` processes outliving their e2e checkout by days, still
+        // carrying `ROCM_E2E_SIMULATE_OOM_LAUNCH=1`. The helper is for
+        // supervising a real spawned server; there is none here, and the note
+        // this scenario asserts is computed before it would have run.
+        // `e2e_simulate_oom_launch` is a `const fn` returning `false` without
+        // the test-only feature, so this branch folds away in shipped builds.
+        if !e2e_simulate_oom_launch() {
+            ensure_background_helper_running_quiet(summary_mode)?;
+        }
 
         // An equivalent service was already running, so nothing was spawned and the
         // freshly generated key is unused — drop it rather than leave it orphaned in
@@ -1020,7 +1032,7 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
             // The engine *name*, not `engine_serves_vllm`: the note's gate is
             // derived inside `append_oom_serve_note` from the value it is about,
             // because a boolean here was a call-site seam no test could hold.
-            let notes = append_oom_serve_note(
+            let notes = serve_summary::append_oom_serve_note(
                 notes,
                 &selected_engine,
                 report.already_running,

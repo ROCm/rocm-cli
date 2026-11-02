@@ -191,12 +191,24 @@ fn vllm_log_segments(log: &str) -> impl Iterator<Item = String> + '_ {
 /// the tail mention running out of memory, the *last* one is the proximate
 /// failure — the point where the process actually gave up — and the earlier ones
 /// are usually the allocator's own retry chatter leading up to it. The cost is
-/// real and worth stating: on a tail like "torch.OutOfMemoryError: ... Tried to
-/// allocate 7.21 GiB. GPU 0 has a total capacity of 24.00 GiB." followed by a
-/// bare "RuntimeError: ... killed: out of memory", the vaguer line wins even
-/// though the first carries the allocation size and the capacity. Both are
-/// diagnosable, so this picks which line is quoted, never whether one is. The
-/// user still sees every line: callers print the whole log tail beside the hint.
+/// real and worth stating: on a tail like "torch.OutOfMemoryError: HIP out of
+/// memory. Tried to allocate 7.21 GiB. GPU 0 has a total capacity of 24.00 GiB."
+/// followed by "RuntimeError: hipErrorOutOfMemory", the vaguer line wins even
+/// though the first carries the allocation size and the capacity. Both of those
+/// score, so there the choice really is only *which* line is quoted.
+///
+/// The example has to be two lines that both score, and that is not a detail:
+/// a line that does not score is not a losing candidate, it is not a candidate
+/// at all. A bare "RuntimeError: ... killed: out of memory" is sub-threshold —
+/// `sub_threshold_lines_carry_no_hint_at_all` in `engines/vllm` pins exactly
+/// that — so appending one to the tail above changes nothing and the torch line
+/// is still selected.
+///
+/// Whether the user also sees the losing line depends on the surface, so this
+/// claims nothing about it. The engine's startup-failure bail does print the
+/// whole tail beside the hint; the `rocm serve` summary note does not — it
+/// carries the one selected line and points at `rocm services logs` for the
+/// rest.
 ///
 /// The return value is *log text*, not a shell-safe token: some callers only
 /// display it. A caller that renders it inside a quoted command must gate it on

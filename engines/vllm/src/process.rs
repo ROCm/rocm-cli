@@ -687,8 +687,10 @@ fn oom_utilization_hint(log_tail: &str) -> String {
     // the shared log at different points, with this bail's own sanitized echo
     // written into it in between, so for a colourised line they can print
     // different (both sound) `--symptom` arguments -- this one the canonical
-    // symptom, the CLI the rendered row. See `rocm_core::vllm_log_segments` for
-    // the measurement. Its guarantee is specifically that
+    // symptom, the CLI the rendered row. See `vllm_log_segments` in
+    // `crates/rocm-core/src/vllm_oom.rs` for the measurement — spelled as a
+    // file path, not a `rocm_core::` path, because that function is private to
+    // its module and no such path resolves. Its guarantee is specifically that
     // a line passing `quotable_in_single_quotes` is diagnosable -- not that
     // every returned line is -- which is exactly what the branch below needs,
     // since the non-quotable branch substitutes the canonical symptom anyway.
@@ -1736,7 +1738,7 @@ mod tests {
         std::fs::write(&log, IMPORT_TRACEBACK).expect("write log");
         let context = startup_log_context(Some(&log));
         assert!(
-            context.contains("Last 80 lines of startup log:"),
+            context.contains("Startup log, last 80 lines as the terminal drew them:"),
             "{context}"
         );
         assert!(
