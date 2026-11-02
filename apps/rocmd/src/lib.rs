@@ -6,6 +6,7 @@
 
 mod cli;
 mod common;
+mod daemon;
 mod mcp;
 mod persistence;
 mod sandbox;
@@ -18,7 +19,3 @@ mod watchers;
 mod webhook;
 
 pub use cli::{parse_args, run_bin_cli, run_from_args};
-
-use std::time::Duration;
-
-const WATCHER_TICK_INTERVAL: Duration = Duration::from_secs(5);
