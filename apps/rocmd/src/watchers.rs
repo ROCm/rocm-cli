@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: MIT
 
+use crate::common::payload_string;
 use crate::persistence::load_service_record;
 use crate::supervise::restart_managed_service;
 use anyhow::{Context, Result, bail};
@@ -1120,15 +1121,6 @@ fn restricted_driver_plan_result(value: &Value) -> Result<RestrictedDriverPlanRe
         status,
         exit_status,
     })
-}
-
-pub(crate) fn payload_string(payload: &Value, key: &str) -> Option<String> {
-    payload
-        .get(key)
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
 }
 
 #[cfg(test)]

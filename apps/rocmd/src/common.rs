@@ -426,6 +426,15 @@ pub(crate) fn wait_for_port(host: &str, port: u16, timeout: Duration) -> bool {
     false
 }
 
+pub(crate) fn payload_string(payload: &Value, key: &str) -> Option<String> {
+    payload
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
