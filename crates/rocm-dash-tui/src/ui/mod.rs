@@ -40,6 +40,7 @@ pub mod tabs;
 pub mod theme;
 mod theme_picker;
 pub mod update_manager;
+mod warnings_modal;
 pub mod widgets;
 
 use ratatui::Frame;
@@ -157,7 +158,7 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
         Modal::GlobalHelp => help_modal::draw_global_help(f, body, &theme),
         Modal::Warnings => {
             let warnings = state.latest.as_ref().map_or(&[][..], |s| &s.warnings[..]);
-            modal::draw_warnings(f, body, warnings, &theme);
+            warnings_modal::draw_warnings(f, body, warnings, &theme);
         }
     }
 

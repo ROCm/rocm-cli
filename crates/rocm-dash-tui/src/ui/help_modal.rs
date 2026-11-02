@@ -154,8 +154,8 @@ fn help_title(base: &str, needed: u16, popup: Rect) -> String {
 /// Popup height that shows `content_rows` rows of wrapped content: the content
 /// plus the popup's top and bottom border rows. Shared by [`draw_help`],
 /// [`draw_global_help`] and
-/// [`draw_warnings`](crate::ui::modal::draw_warnings) so the content-sized
-/// modals cannot drift apart.
+/// [`draw_warnings`](crate::ui::warnings_modal::draw_warnings) so the
+/// content-sized modals cannot drift apart.
 pub(super) fn popup_height_for(content_rows: usize) -> u16 {
     u16::try_from(content_rows)
         .unwrap_or(u16::MAX)
