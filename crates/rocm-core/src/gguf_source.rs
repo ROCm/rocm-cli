@@ -384,13 +384,13 @@ impl LiveGgufSource {
 fn is_safe_listed_name(name: &str) -> bool {
     !name.is_empty()
         && !name.chars().any(|c| {
+            // Code points, not char literals: the ASCII output contract
+            // (`xtask/src/ascii_output_contract.rs`) rejects a `\u{..}` escape
+            // for a non-ASCII character in a literal.
             c.is_control()
                 || matches!(
-                    c,
-                    '\u{200B}'..='\u{200F}'
-                        | '\u{202A}'..='\u{202E}'
-                        | '\u{2066}'..='\u{2069}'
-                        | '\u{FEFF}'
+                    u32::from(c),
+                    0x200B..=0x200F | 0x202A..=0x202E | 0x2066..=0x2069 | 0xFEFF
                 )
         })
         && name
@@ -612,7 +612,15 @@ impl RangedReader {
                 self.position
             )));
         }
-        let mut window = Vec::with_capacity(usize::try_from(wanted).unwrap_or(0));
+        // `wanted` is at most WINDOW_BYTES already; the clamp states that bound
+        // where the allocation is made. A comparison rather than `min`, so a
+        // static analyser sees the bound as well as a reader does.
+        let capacity = if wanted <= WINDOW_BYTES {
+            wanted
+        } else {
+            WINDOW_BYTES
+        };
+        let mut window = Vec::with_capacity(usize::try_from(capacity).unwrap_or(0));
         // A body that ends early surfaces as `UnexpectedEof`, which would read as
         // "the header ends here". It is the connection that ended.
         if let Err(error) = response.into_reader().take(wanted).read_to_end(&mut window) {
@@ -773,6 +781,11 @@ mod tests {
             "m-\u{202E}fuggQ4_K_M.gguf",
             "m-Q4_K_M\u{200B}.gguf",
             "m-Q4_K_M\u{2066}.gguf",
+            // Both ends of each range, and the byte order mark.
+            "m-Q4_K_M\u{200F}.gguf",
+            "m-Q4_K_M\u{202A}.gguf",
+            "m-Q4_K_M\u{2069}.gguf",
+            "m-Q4_K_M\u{FEFF}.gguf",
         ] {
             assert!(!is_safe_listed_name(name), "{name:?}");
         }
