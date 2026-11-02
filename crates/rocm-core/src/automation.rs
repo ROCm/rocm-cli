@@ -454,14 +454,24 @@ fn append_jsonl_record<T: Serialize>(
 /// the store open without delete sharing — and leaving it there would wedge
 /// the store: every later append would hit the same debris and the same
 /// failure. Only then does this fall back to `truncate`, cutting the debris
-/// in place and appending `line` as a plain append. That reopens, on this
-/// already-failing path only, the shrink a lock-free reader can briefly
-/// observe; a truncate frees space rather than needing it and renames
-/// nothing, so it can succeed where `replace` cannot. Like a repair by
-/// `replace`, the fallback prints nothing.
+/// in place and appending `line` as a plain append. A truncate frees space
+/// rather than needing it and renames nothing, so it can succeed where
+/// `replace` cannot. Like a repair by `replace`, the fallback prints nothing.
+///
+/// The fallback reopens, on this already-failing path only, the shrink a
+/// lock-free reader can observe, and the reader's guards narrow that window
+/// without closing it: a scan that comes back short is refused or retried
+/// (see [`ReverseLines`] and `load_recent_jsonl_records_from`), but one that
+/// already read part of a debris line longer than a scan chunk and then finds
+/// the file regrown to at least its old length reads on undetected, and can
+/// splice the two reads into a record nobody wrote. That is the cost of not
+/// wedging the store, accepted for a path that needs a failing replace, a
+/// debris line that long and a reader mid-scan all at once.
 ///
 /// If `truncate` fails too, the error names both causes and the store is left
-/// as it was; readers keep skipping the debris.
+/// as it was; readers keep skipping the debris. If the append after a
+/// successful truncate fails, the error carries the replace failure too: it is
+/// the root cause.
 ///
 /// `replace` and `truncate` are parameters so a test can make either fail on
 /// demand.
@@ -496,8 +506,15 @@ fn repair_torn_tail_and_append(
             path.display()
         );
     }
-    let file = open_jsonl_for_append(path)?;
-    append_or_tolerate_a_missing_newline(path, &file, line, tail_start)
+    open_jsonl_for_append(path)
+        .and_then(|file| append_or_tolerate_a_missing_newline(path, &file, line, tail_start))
+        .with_context(|| {
+            format!(
+                "failed to append to {} after cutting its torn tail \
+                 (replacing the store had failed: {replace_error:#})",
+                path.display()
+            )
+        })
 }
 
 /// Cut the store at `path` down to `len` bytes through a fresh write handle.
@@ -753,8 +770,8 @@ fn load_recent_jsonl_records<T: DeserializeOwned>(
 /// A rotation can rename files between two of the opens: opening the live
 /// file and then `.1` across one would open the same file twice (and read its
 /// records twice), and opening `.1` and then the live file across one would
-/// skip a generation. A torn-tail repair (see [`TailState::Torn`]) also
-/// replaces the live file, by renaming a new one over it — not a rotation,
+/// skip a generation. A torn-tail repair (see [`TailState::Torn`]) normally
+/// also replaces the live file, by renaming a new one over it — not a rotation,
 /// but the same hazard for this snapshot: a path opened before the repair
 /// would still read the pre-repair file by handle, yet a path opened after
 /// would see different content at the same name. So after opening them all,
@@ -839,8 +856,9 @@ fn open_jsonl_generations(path: &Path, generations: usize) -> Result<Vec<(PathBu
 /// the store fails (see [`repair_torn_tail_and_append`]). The retry below is
 /// for a store edited or truncated out-of-band — by a person — or shrunk by
 /// that rare fallback while a scan is in flight: a scan that fails while the
-/// file's length moved under it is retried from the new end, so that still
-/// never surfaces as an error.
+/// file's length moved under it is retried from the new end, so a shrink the
+/// scan's reads catch never surfaces as an error. The one shrink they cannot
+/// catch is described on [`repair_torn_tail_and_append`].
 fn load_recent_jsonl_records_from<T: DeserializeOwned>(
     path: &Path,
     file: &fs::File,
@@ -986,9 +1004,9 @@ impl<'a> ReverseLines<'a> {
             // yet, whether from an earlier call or from this one — just
             // means the store was edited or truncated out-of-band (see
             // `read_range`); no concurrent writer shrinks it in place short of
-            // the torn-tail repair's rare fallback. Once `pending` holds any bytes, a short read means
-            // they no longer continue from it, so splicing them would
-            // invent a line.
+            // the torn-tail repair's rare fallback. Once `pending` holds any
+            // bytes, a short read means they no longer continue from it, so
+            // splicing them would invent a line.
             if bytes.len() as u64 != self.pos - start && !self.pending.is_empty() {
                 bail!("{} shrank while it was being read", self.path.display());
             }
@@ -2642,10 +2660,18 @@ mod tests {
         seed_audit_store(&paths, &seeded)?;
         let path = paths.audit_events_path();
 
+        // Layered like the real steps (`write_atomic` and
+        // `truncate_jsonl_in_place` both wrap the OS error in a context), so
+        // the assertion fails if either cause is formatted without its chain.
         let result = repair_audit_store_with(
             &paths,
-            |_, _| bail!("no space left on device"),
-            |_, _| bail!("permission denied"),
+            |_, _| {
+                Err(anyhow::anyhow!("no space left on device"))
+                    .context("failed to replace the store")
+            },
+            |_, _| {
+                Err(anyhow::anyhow!("permission denied")).context("failed to truncate the store")
+            },
         );
 
         let text = fs::read_to_string(&path);
@@ -2654,8 +2680,9 @@ mod tests {
         assert_eq!(
             format!("{:#}", result.expect_err("both steps failed")),
             format!(
-                "failed to repair the torn tail of {}: replacing it failed (no space left on \
-                 device); truncating it failed (permission denied)",
+                "failed to repair the torn tail of {}: replacing it failed (failed to replace \
+                 the store: no space left on device); truncating it failed (failed to truncate \
+                 the store: permission denied)",
                 path.display()
             )
         );
@@ -2664,6 +2691,42 @@ mod tests {
             "a failed repair must leave the store as it was"
         );
         assert_eq!(audit_messages(&recent?), ["a"]);
+        Ok(())
+    }
+
+    // The replace failure is the root cause, so it must survive into the error
+    // when the cut itself works but the append after it does not. The truncate
+    // stub swaps the store for a directory, which makes reopening it fail.
+    #[test]
+    fn a_failed_append_after_the_cut_still_reports_why_the_replace_failed() -> Result<()> {
+        let (root, paths) = temp_app_paths("torn-tail-fallback-append-fails");
+        let torn = &audit_line("torn")[..20];
+        seed_audit_store(&paths, &format!("{}\n{torn}", audit_line("a")))?;
+        let path = paths.audit_events_path();
+
+        let result = repair_audit_store_with(
+            &paths,
+            |_, _| {
+                Err(anyhow::anyhow!("no space left on device"))
+                    .context("failed to replace the store")
+            },
+            |path, _| {
+                fs::remove_file(path)?;
+                fs::create_dir(path)?;
+                Ok(())
+            },
+        );
+
+        fs::remove_dir_all(root).ok();
+        let message = format!("{:#}", result.expect_err("the append after the cut failed"));
+        assert!(
+            message.starts_with(&format!(
+                "failed to append to {} after cutting its torn tail (replacing the store had \
+                 failed: failed to replace the store: no space left on device): ",
+                path.display()
+            )),
+            "unexpected error: {message}"
+        );
         Ok(())
     }
 
@@ -2703,6 +2766,11 @@ mod tests {
     // The real trigger rather than an injected one: a store directory that
     // takes no new files, so the temp copy of the whole-store replace cannot
     // be created, while the store file itself can still be written.
+    //
+    // This is the only test that drives the production `replace`/`truncate`
+    // wiring in `append_jsonl_record` rather than injected steps, and it passes
+    // without testing anything for a user the permission bits do not bind
+    // (root). CI runs it as a regular user.
     #[cfg(unix)]
     #[test]
     fn append_repairs_a_torn_tail_in_a_directory_that_takes_no_new_files() -> Result<()> {
