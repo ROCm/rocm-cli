@@ -403,11 +403,9 @@ mod tests {
                 "args": ["serve", "sshleifer/tiny-gpt2", "--engine", "vllm", "--managed"]
             }
         }"#;
-        let plan = freeform_planner::provider_planner_response_to_plan(
-            "start a local model",
-            "local",
-            content,
-        )?;
+        let plan =
+            freeform_planner::provider_planner_response_to_plan("serve a model", "local", content)?;
+        assert_eq!(plan.request, "serve a model");
         let action =
             freeform_planner::plan_next_action(plan).expect("provider plan should have an action");
 
