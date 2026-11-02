@@ -1448,7 +1448,7 @@ fn every_source_is_scanned() {
     );
     assert!(
         has(
-            "apps/rocm/src/main.rs:",
+            "apps/rocm/src/service_records.rs:",
             "rocm services prune --dry-run",
             Surface::CommandLine
         ),
@@ -1457,7 +1457,7 @@ fn every_source_is_scanned() {
     );
     assert!(
         has(
-            "apps/rocm/src/main.rs:",
+            "apps/rocm/src/service_records.rs:",
             "rocm services prune --yes",
             Surface::CommandLine
         ),

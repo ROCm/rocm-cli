@@ -1099,7 +1099,7 @@ would simply deadlock. Both tests therefore stage the launch from a second
 thread and let the code under test block on it.
 
 - `services_prune_waits_for_the_managed_launch_lock_before_sweeping`
-  (`apps/rocm/src/main.rs`) holds the lock on the main thread with only the key
+  ([`apps/rocm/src/service_records.rs`](../apps/rocm/src/service_records.rs)) holds the lock on the main thread with only the key
   written, runs `prune` on a worker, asserts the worker does *not* report
   completion while the lock is held, then publishes the record and releases.
   Two assertions fail independently if the acquire is removed: that negative

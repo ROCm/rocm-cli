@@ -149,7 +149,7 @@ pub(crate) fn parse_gpu_indices_arg(value: Option<&str>) -> Result<Vec<u32>> {
 /// That span is relied on by a second caller: because the guard outlives both
 /// `store_endpoint_api_key` and the first `record.write()`, it also covers the
 /// interval in which a launch's 0600 endpoint key sits on disk with no manifest
-/// beside it. [`prune_managed_service_records`] acquires the same lock so its
+/// beside it. [`crate::service_records::prune_managed_service_records`] acquires the same lock so its
 /// leftover sweep cannot read the directory in that state. Shortening the
 /// guard's life — releasing it before the record is persisted — would silently
 /// reopen that window as well as the GPU double-booking one.

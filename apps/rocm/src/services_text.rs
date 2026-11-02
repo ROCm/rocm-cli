@@ -51,7 +51,7 @@
 //! itself part of this cluster — see `service_launch.rs`'s doc comment for
 //! why the broader service-record-management cluster stays at the crate
 //! root); `validate_service_id` and `load_managed_service` are also read from
-//! `main.rs`'s `remove_managed_service_record`/`apply_service_prune_plan`.
+//! `service_records.rs`'s `remove_managed_service_record`/`apply_service_prune_plan`.
 //! `load_managed_service` and `restart_internal_managed_service` are
 //! `pub(crate)` and read from `runtime_services.rs` (reconciling live servers
 //! against a runtime activation) and from `managed_service_status.rs`'s own
