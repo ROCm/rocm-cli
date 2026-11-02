@@ -1517,9 +1517,18 @@ rotation policy; two further tests go through the public
 `append_automation_event`/`append_audit_event` and
 `load_recent_automation_events`/`load_recent_audit_events` wrappers instead,
 at the real size cap, so the wiring between them and the rotation policy
-itself stays covered. The user-visible side is `automations-07` through
-`automations-09` in
+itself stays covered. The repair of a torn tail, which normally replaces the
+store and falls back to cutting the debris in place when that replacement
+fails, has its own tests there: each step injected to fail, the error naming
+both causes when both fail, and a real fault on each platform (a directory
+that takes no new files on Unix, a handle without delete sharing on Windows).
+The user-visible side is `automations-07` through `automations-09`, plus
+`automations-10` for the fallback, in
 [automations.feature](../tests/e2e-cucumber/features/automations.feature).
+`automations-10` makes the audit directory read-only, which does not bind root,
+so it carries `@requires-dir-permissions` and resolves to a skip for a user the
+permission bits do not bind (the self-hosted WSL2 guest runs as root) rather
+than pass without testing the fallback.
 
 Natural-language plan handoff tests:
 
@@ -2433,3 +2442,84 @@ it is the one to pass on. The text output names the files it could not read, and
 report. A subject or a file name can name a person, so keep that output to your
 own terminal. The export itself still holds everything. Never commit it, and
 delete it once the rollup is taken.
+
+## Doctor Skill Eval Replays
+
+The rocm-doctor skill's behavioural evals
+([`skills/rocm-doctor/evals/`](../skills/rocm-doctor/evals/)) run on grading machines
+that have no `rocm` binary. An agent following the skill stops at the install offer
+there, so a case can only grade what the agent does before a diagnosis exists. A case
+that grades how the agent reads a diagnosis, or what it does on an older CLI, needs a
+`rocm` to talk to. How those cases are graded, and where, is in
+[skill-quality.md](skill-quality.md).
+
+[`evals/hooks.py`](../skills/rocm-doctor/evals/hooks.py) supplies one. For a case that
+has a directory under [`evals/fixtures/`](../skills/rocm-doctor/evals/fixtures/), the
+hook writes a stub `rocm` into a temporary directory, puts it first on `PATH`, and
+removes it afterwards. The stub replays recorded output for `rocm --version`,
+`rocm fix --json` and `rocm diagnose`, and refuses every other command with exit
+code 2. It only prints text read from the recording, so whatever an agent asks it,
+it cannot change a machine or send anything; that comes from answering a fixed set
+of commands, not from the refusals. It also refuses `diagnose` options the
+recording does not cover (`--report`, `--send`, `--distro`, `--model`), for fidelity
+only: the recorded answer belongs to one symptom, and replaying it for a variant
+would show the agent output the real CLI never prints. A case with no fixture
+directory runs as before, with no `rocm` on `PATH`. The hook assumes skillscope
+runs one case at a time in one process, which `skillscope/behavior.py` does: it
+puts the stub on the process-wide `PATH` because the agent inherits that, and
+refuses to start a second replay while one is active. `cargo test -p xtask` runs the
+hook's own tests
+([`evals/test_hooks.py`](../skills/rocm-doctor/evals/test_hooks.py)): a replayed
+command, the refused ones, and that `PATH` and the temporary directory are left as
+they were found. They need `python3` or `python` on `PATH`; on CI a missing Python
+fails the test, elsewhere it says it skipped.
+
+The recordings are generated, not typed in:
+
+```bash
+cargo xtask eval-fixtures          # write skills/rocm-doctor/evals/fixtures/*/replies.json
+cargo xtask eval-fixtures --check  # fail if any recording is missing, stale, or unexpected
+```
+
+The manifest comes from the compiled catalog and each diagnosis from
+`rocm_core::run_diagnose`, run over the recorded examination in
+[`tests/remote-ssh/examination.json`](../tests/remote-ssh/examination.json), so a
+catalog change cannot leave a stale recording behind. After a change to the failure
+catalog or to what `rocm diagnose` prints, run `cargo xtask eval-fixtures` and commit
+the result; the check names what is out of date. CI runs the check, and
+`cargo test -p xtask` runs it too. Read the diff after regenerating: a recording that
+changed is output the skill is now graded against. What an older CLI printed cannot be
+generated. It was recorded once from a real older build and lives in
+[`evals/fixtures/recorded/`](../skills/rocm-doctor/evals/fixtures/recorded/).
+
+To add a case, add an entry to
+[`evals/fixtures/cases.json`](../skills/rocm-doctor/evals/fixtures/cases.json) (the
+case id, `current` or `older`, and the error text the agent would pass as the
+symptom), run the command above, and add the case to
+[`evals/evals.json`](../skills/rocm-doctor/evals/evals.json) with the same id. The
+check also fails when a case id is not an id in `evals.json`, or when the part of the
+symptom before its first `:` does not appear in that case's prompt, because the hook
+finds a replay by id and a recording for a different question grades nothing. A
+directory that no case owns fails the check, and the command never deletes one:
+remove it by hand.
+
+Limits worth knowing. A replay says what the catalog says for a recorded host
+with no GPU data, so it grades how the agent reads and relays an answer, not whether
+the CLI is right about a real machine; and it answers `diagnose` with the same
+recorded output whatever `--symptom` is. The current-CLI replay's `--version` line
+is not the format the real `rocm --version` prints (the older-CLI replay prints that
+one), so only `fix --json` tells
+the two replays apart. The marker in it is what the current-CLI case's `logs_contain`
+pin matches, and `cargo test -p xtask` fails if a pin is quoted in `SKILL.md` or
+`reference.md`, where it would stop proving the replay ran.
+
+On Windows the launcher is a `rocm.cmd` (cmd and PowerShell) plus an extensionless
+`rocm` script (Git Bash, which does not look for `.cmd`). The Windows CI job runs
+`cargo test --workspace --all-targets` when a change touches the heavy paths, which
+include `skills/**`, so `test_hooks.py` runs the shim there. That covers a temp
+directory and Python path without spaces; a path with spaces or parentheses is not
+exercised, and neither is the agent's own shell on the amd/skills Windows leg.
+Both replay cases also say "on Linux" in the prompt: run on a Windows host, the
+agent answered that its own machine is Windows and declined to run the CLI there, so
+neither case passed (0 of 2 in a local run), while on a Linux host (WSL2) both
+passed. Treat them as Linux-host cases when reading a run.
