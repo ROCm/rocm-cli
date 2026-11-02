@@ -1459,6 +1459,67 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
         );
     }
 
+    /// Plant the stub `gh` the missing-report check calls: it prints the file
+    /// `$LISTING` when `lists_artifacts`, and otherwise fails the way an API
+    /// outage does.
+    #[cfg(unix)]
+    fn write_gh_stub(stub: &std::path::Path, lists_artifacts: bool) {
+        let body = if lists_artifacts {
+            "#!/bin/sh\ncat \"$LISTING\"\n"
+        } else {
+            "#!/bin/sh\necho 'HTTP 502' >&2\nexit 1\n"
+        };
+        // Not `std::fs::write` plus a chmod: see the test below.
+        rocm_core::fake_executable::write_fake_executable(stub, body).expect("plant gh stub");
+    }
+
+    /// The stub is run straight after it is written, while other test threads
+    /// spawn children of their own. A child spawned while the stub is open for
+    /// writing keeps that descriptor until its own `exec`, and Linux refuses to
+    /// execute a file anything still has open for writing: the check then fails
+    /// with `Text file busy` for reasons that have nothing to do with its logic.
+    #[test]
+    #[cfg(unix)]
+    fn gh_stub_runs_first_time_while_other_threads_spawn() {
+        const THREADS: usize = 16;
+        const PER_THREAD: usize = 40;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let start = std::sync::Barrier::new(THREADS);
+        let failures: Vec<String> = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..THREADS)
+                .map(|thread| {
+                    let (dir, start) = (dir.path(), &start);
+                    scope.spawn(move || {
+                        start.wait();
+                        let mut failures = Vec::new();
+                        for run in 0..PER_THREAD {
+                            let stub = dir.join(format!("gh-{thread}-{run}"));
+                            write_gh_stub(&stub, false);
+                            match std::process::Command::new(&stub).output() {
+                                // The failing stub exits 1 and says why on stderr.
+                                Ok(out) if out.stderr == b"HTTP 502\n" => {}
+                                Ok(out) => failures.push(format!("{out:?}")),
+                                Err(error) => failures.push(error.to_string()),
+                            }
+                        }
+                        failures
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .flat_map(|worker| worker.join().expect("a worker panicked"))
+                .collect()
+        });
+        assert!(
+            failures.is_empty(),
+            "{} of {} first runs failed: {:?}",
+            failures.len(),
+            THREADS * PER_THREAD,
+            &failures[..failures.len().min(3)]
+        );
+    }
+
     /// Run a report job's missing-report check script under `bash -e`, as a
     /// `run:` step does, with a stub `gh` that lists `uploaded` (or fails when
     /// `uploaded` is `None`) and a `needs` context of `results`.
@@ -1468,8 +1529,6 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
         results: &[(&str, &str)],
         uploaded: Option<&[&str]>,
     ) -> (i32, String, String) {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::tempdir().expect("temp dir");
         let script = dir.path().join("check.sh");
         let listing = dir.path().join("artifacts.txt");
@@ -1482,16 +1541,10 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
         )
         .expect("write script");
         std::fs::write(&summary, "").expect("write summary");
-        match uploaded {
-            Some(names) => {
-                std::fs::write(&listing, names.join("\n") + "\n").expect("write listing");
-                std::fs::write(&stub, "#!/bin/sh\ncat \"$LISTING\"\n").expect("write gh stub");
-            }
-            None => std::fs::write(&stub, "#!/bin/sh\necho 'HTTP 502' >&2\nexit 1\n")
-                .expect("write gh stub"),
+        if let Some(names) = uploaded {
+            std::fs::write(&listing, names.join("\n") + "\n").expect("write listing");
         }
-        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
-            .expect("make the stub executable");
+        write_gh_stub(&stub, uploaded.is_some());
 
         let needs: serde_json::Map<String, serde_json::Value> = results
             .iter()
