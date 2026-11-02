@@ -4412,6 +4412,45 @@ fi
         vars[0].to_owned()
     }
 
+    /// The aggregator tests lean on these three helpers, so a weakened helper must
+    /// not be able to hide a break in `ci.yml`.
+    #[test]
+    fn code_only_drops_a_command_that_only_a_comment_mentions() {
+        let step =
+            "      - name: s\n        # cargo xtask e2e\n        run: echo hi # cargo xtask e2e\n";
+        let code = code_only(step);
+        assert!(!code.contains("cargo xtask e2e"), "{code}");
+        assert!(code.contains("echo hi"), "{code}");
+    }
+
+    #[test]
+    #[should_panic(expected = "exactly one step")]
+    fn aggregator_step_rejects_a_second_step() {
+        aggregator_step(
+            "    steps:\n      - name: a\n        run: x\n      - name: b\n        run: y\n",
+        );
+    }
+
+    #[test]
+    fn aggregator_var_finds_the_one_variable_bound_to_an_expression() {
+        let step = "      - name: s\n        env:\n          A: ${{ needs.x.result }}\n          B: ${{ needs.y.result }}\n        run: true\n";
+        assert_eq!(aggregator_var(step, "${{ needs.y.result }}"), "B");
+    }
+
+    #[test]
+    #[should_panic(expected = "exactly one env variable")]
+    fn aggregator_var_rejects_two_variables_bound_to_one_expression() {
+        let step = "      - name: s\n        env:\n          A: ${{ needs.x.result }}\n          B: ${{ needs.x.result }}\n        run: true\n";
+        aggregator_var(step, "${{ needs.x.result }}");
+    }
+
+    #[test]
+    #[should_panic(expected = "exactly one env variable")]
+    fn aggregator_var_rejects_an_expression_nothing_is_bound_to() {
+        let step = "      - name: s\n        env:\n          A: ${{ needs.x.result }}\n        run: true\n";
+        aggregator_var(step, "${{ needs.y.result }}");
+    }
+
     /// `windows-build-and-test` is the one Windows check branch protection knows
     /// by name. The work is split across other jobs, which are NOT required checks
     /// themselves, so a work job the aggregator does not wait on can fail and still
@@ -4709,11 +4748,15 @@ fi
         }
     }
 
-    /// Splitting the lane moved steps between jobs, and a step that still exists
-    /// can have been made unable to fail the job. Each step the Windows gate
-    /// depends on is therefore pinned by name: its command, an exact `if:` (no
-    /// weaker than the `heavy` gate, and never an extra `||`), and no
-    /// `continue-on-error`.
+    /// Splitting the lane moved steps between jobs, so each step the Windows gate
+    /// depends on is pinned by name: it must still exist exactly once, still
+    /// contain its command, carry an exact `if:` (no weaker than the `heavy` gate,
+    /// and never an extra `||`), and set no `continue-on-error`.
+    ///
+    /// What this does NOT check: the command is matched as a substring, so a flag
+    /// or a trailing `|| true` added to it passes, and the `NOT_GATING` steps are
+    /// exempt by name with their content unchecked. It catches a step being
+    /// dropped, renamed, moved to the other job, skipped or made advisory.
     #[test]
     fn ci_windows_jobs_keep_every_gating_step_enabled() {
         const HEAVY: &str = "needs.changes.outputs.heavy == 'true'";
@@ -4841,7 +4884,8 @@ fi
                 BUNDLE,
             ),
         ];
-        // Setup and reporting steps that do not check the change itself.
+        // Setup and reporting steps that do not check the change itself. Only
+        // their names are checked.
         const NOT_GATING: &[&str] = &[
             "Set up sccache",
             "Probe sccache cache backend",
