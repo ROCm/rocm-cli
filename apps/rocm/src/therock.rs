@@ -9,11 +9,16 @@
 #[path = "therock_version_proptests.rs"]
 mod version_proptests;
 
+mod family;
 mod fetch;
 mod io;
 mod process;
+mod source;
+#[cfg(test)]
+mod test_support;
 mod version;
 
+use self::family::{family_override_or_recovered_arch, family_resolution_hint, resolve_family};
 pub(crate) use self::fetch::truthy_env;
 use self::fetch::{download_file, download_text_cached, preflight_tarball_space};
 pub(crate) use self::io::write_file_atomically;
@@ -25,11 +30,17 @@ use self::process::{
     extract_tarball_and_discard_archive, progress_line, progress_output_suppressed, run_command,
     run_command_with_env, run_uv_progress_command, wait_with_output_bounded,
 };
+pub(crate) use self::source::RuntimeVersionSelector;
+#[cfg(test)]
+use self::source::THEROCK_SOURCE_LAYOUT_GENERATION;
+use self::source::{
+    FamilyResolution, SourceLayout, THEROCK_NEXT_MIN_MAJOR, TheRockChannel, next_layout_requested,
+    requested_source_layout, resolve_source, select_source_layout,
+};
 pub(crate) use self::version::runtime_version_display;
 use self::version::{
-    ParsedVersion, VersionStage, compare_version_strings, is_stable_runtime_version,
-    normalize_requested_build_date, parse_host_version, parse_version, parse_version_for_ordering,
-    runtime_version_build_date, version_relation,
+    ParsedVersion, compare_version_strings, is_stable_runtime_version, parse_host_version,
+    parse_version, parse_version_for_ordering, runtime_version_build_date, version_relation,
 };
 #[cfg(test)]
 pub(crate) use crate::runtime_registry::RocmSdkLibraryProbe;
@@ -46,12 +57,11 @@ use crate::runtime_registry::{
 use anyhow::{Context, Result, bail};
 use rocm_core::{
     AppPaths, ManagedToolConfig, RUNTIME_LIBRARY_PATH_ENV, RocmCliConfig, detect_host_gfx_target,
-    detect_host_gpu_diagnostics, detect_legacy_rocm_summary, detect_managed_therock_family,
-    ensure_uv_binary, extract_first_gfx_token, gfx_target_has_no_rocm_build, interactive_terminal,
-    known_therock_families, managed_tools_dir, normalize_runtime_path_for_host,
-    normalize_therock_family, runtime_is_windows, runtime_os_name, runtime_path_list_split,
-    runtime_python_executable_in_env, unix_time_millis, uv_command_env, uv_pip_install_base,
-    uv_venv_args,
+    detect_host_gpu_diagnostics, detect_legacy_rocm_summary, ensure_uv_binary,
+    extract_first_gfx_token, interactive_terminal, managed_tools_dir,
+    normalize_runtime_path_for_host, normalize_therock_family, runtime_is_windows, runtime_os_name,
+    runtime_path_list_split, runtime_python_executable_in_env, unix_time_millis, uv_command_env,
+    uv_pip_install_base, uv_venv_args,
 };
 #[cfg(test)]
 use rocm_core::{disk_space, managed_uv_cache_dir};
@@ -65,283 +75,12 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-const THEROCK_NIGHTLY_PIP_INDEX_BASE: &str = "https://rocm.nightlies.amd.com/whl-multi-arch";
-const THEROCK_RELEASE_PIP_INDEX_BASE: &str = "https://repo.amd.com/rocm/whl-multi-arch";
-const THEROCK_RELEASE_TARBALL_BASE: &str = "https://repo.amd.com/rocm/tarball/";
-const THEROCK_NIGHTLY_TARBALL_BASE: &str = "https://rocm.nightlies.amd.com/tarball/";
-/// ROCm 10's aggregate pip index. Same simple-index shape the canonical
-/// multi-arch stream publishes, on a separate host, with its own package
-/// generation; it is not a mirror of, or a fallback for, the canonical index.
-const THEROCK_NEXT_PIP_INDEX_BASE: &str = "https://stable.repo.amd.com/rocm/whl-next";
-/// ROCm 10's tarball catalog. Same scrapeable listing the canonical catalog
-/// uses, but it publishes non-release sibling archives beside the real dist
-/// archive (see [`select_tarball_candidate`]).
-const THEROCK_NEXT_TARBALL_BASE: &str = "https://stable.repo.amd.com/rocm/core/tarball/";
-const THEROCK_SOURCE_LAYOUT_GENERATION: &str = "multi-arch-v2";
-/// Recorded in a [`WheelRuntimeComposition`] installed from the ROCm 10 layout,
-/// so a later update reads back the layout that produced the runtime instead of
-/// guessing it from the version.
-const THEROCK_NEXT_LAYOUT_GENERATION: &str = "next-v1";
-/// The first ROCm major version published only in the next layout. A pin at or
-/// past it is the one request the canonical stream provably cannot serve, and
-/// therefore the only thing that selects [`SourceLayout::Next`].
-const THEROCK_NEXT_MIN_MAJOR: u32 = 10;
 const DEFAULT_MANAGED_PYTHON_VERSION: &str = "3.12";
 /// Interpreter `uv` provisions for a [`SourceLayout::Next`] install. See
 /// [`python_requirement`] for why this differs from the canonical default.
 const NEXT_MANAGED_PYTHON_VERSION: &str = "3.14";
 const STARTUP_UPDATE_CHECK_INTERVAL_MS: u128 = 12 * 60 * 60 * 1_000;
 const STARTUP_UPDATE_CHECK_TIMEOUT_SECS: u64 = 2;
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum TheRockChannel {
-    Release,
-    Nightly,
-}
-
-/// Which published hosting layout a resolution reads from.
-///
-/// Orthogonal to [`TheRockChannel`]. `Canonical` is the release/nightly stream
-/// the CLI has always installed and remains the answer for every request that
-/// does not explicitly ask for something else. `Next` is ROCm 10's separately
-/// hosted layout — an extension, never a fallback: nothing degrades into it and
-/// nothing degrades out of it, so a canonical install resolves exactly the URLs,
-/// device target, and package specs it resolved before the layout existed.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SourceLayout {
-    Canonical,
-    Next,
-}
-
-impl SourceLayout {
-    const fn generation(self) -> &'static str {
-        match self {
-            Self::Canonical => THEROCK_SOURCE_LAYOUT_GENERATION,
-            Self::Next => THEROCK_NEXT_LAYOUT_GENERATION,
-        }
-    }
-
-    /// The layout a recorded [`WheelRuntimeComposition`] was installed from.
-    ///
-    /// Manifests written before compositions existed carry no generation and
-    /// therefore came from the canonical stream. A non-empty generation is an
-    /// explicit provenance contract: reject values this build cannot reproduce
-    /// instead of silently redirecting an update to the canonical source.
-    fn from_generation(generation: Option<&str>) -> Result<Self> {
-        match generation {
-            None | Some(THEROCK_SOURCE_LAYOUT_GENERATION) => Ok(Self::Canonical),
-            Some(THEROCK_NEXT_LAYOUT_GENERATION) => Ok(Self::Next),
-            Some(other) => bail!(
-                "runtime records unsupported TheRock source layout generation `{other}`; update rocm-cli before updating this runtime"
-            ),
-        }
-    }
-}
-
-/// The concrete bases one (channel, layout) pair resolves artifacts from.
-///
-/// Owns its strings because every base is overridable for fixture testing; see
-/// [`env_override_base`].
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct ResolvedSource {
-    wheel_index: String,
-    tarball_catalog: String,
-    layout: SourceLayout,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub(crate) enum RuntimeVersionSelector {
-    Version(String),
-    BuildDate(String),
-}
-
-impl RuntimeVersionSelector {
-    pub(crate) fn version(value: impl Into<String>) -> Result<Self> {
-        let value = value.into();
-        let trimmed = value.trim();
-        if trimmed.is_empty() {
-            bail!("TheRock version cannot be empty");
-        }
-        if trimmed
-            .chars()
-            .any(|ch| ch.is_control() || ch.is_whitespace())
-        {
-            bail!("TheRock version must be a single version string");
-        }
-        Ok(Self::Version(trimmed.to_owned()))
-    }
-
-    pub(crate) fn build_date(value: impl AsRef<str>) -> Result<Self> {
-        Ok(Self::BuildDate(normalize_requested_build_date(
-            value.as_ref(),
-        )?))
-    }
-
-    fn describe(&self) -> String {
-        match self {
-            Self::Version(version) => format!("version {version}"),
-            Self::BuildDate(date) => format!("build date {date}"),
-        }
-    }
-
-    fn matches_version(&self, version: &str) -> bool {
-        match self {
-            Self::Version(requested) => version == requested,
-            Self::BuildDate(date) => runtime_version_build_date(version).as_deref() == Some(date),
-        }
-    }
-}
-
-impl TheRockChannel {
-    fn parse(value: &str) -> Result<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "release" => Ok(Self::Release),
-            "nightly" => Ok(Self::Nightly),
-            other => bail!("unsupported TheRock channel: {other}"),
-        }
-    }
-
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Release => "release",
-            Self::Nightly => "nightly",
-        }
-    }
-}
-
-/// Whether a `ROCM_CLI_THEROCK_*_BASE` override is honoured at all.
-///
-/// Every artifact base is a trust boundary: a stray override left in a shell
-/// profile would silently redirect a real install to an untrusted host. Reading
-/// them requires a second, deliberate opt-in that no normal install sets, so the
-/// overrides exist for fixture servers and operators who mean it, and are inert
-/// otherwise. See `docs/release-trust.md`.
-fn therock_base_override_allowed() -> bool {
-    std::env::var("ROCM_CLI_THEROCK_ALLOW_BASE_OVERRIDE")
-        .ok()
-        .is_some_and(|value| !value.trim().is_empty())
-}
-
-/// The base to use, given the opt-in flag and whatever the per-base variable
-/// says. Pure so the trust rule is stated once and can be checked without
-/// mutating process environment from a test.
-fn select_base_override(allowed: bool, override_value: Option<&str>, default: &str) -> String {
-    if !allowed {
-        return default.to_owned();
-    }
-    override_value
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map_or_else(|| default.to_owned(), str::to_owned)
-}
-
-fn env_override_base(env_var: &str, default: &str) -> String {
-    select_base_override(
-        therock_base_override_allowed(),
-        std::env::var(env_var).ok().as_deref(),
-        default,
-    )
-}
-
-/// The bases `channel` publishes under `layout`.
-///
-/// The next layout is hosted per-layout rather than per-channel: it has no
-/// nightly stream, and [`select_source_layout`] refuses to reach it from one, so
-/// there is nothing here to branch on.
-fn resolve_source(channel: TheRockChannel, layout: SourceLayout) -> ResolvedSource {
-    match layout {
-        SourceLayout::Canonical => match channel {
-            TheRockChannel::Release => ResolvedSource {
-                wheel_index: env_override_base(
-                    "ROCM_CLI_THEROCK_RELEASE_PIP_BASE",
-                    THEROCK_RELEASE_PIP_INDEX_BASE,
-                ),
-                tarball_catalog: env_override_base(
-                    "ROCM_CLI_THEROCK_RELEASE_TARBALL_BASE",
-                    THEROCK_RELEASE_TARBALL_BASE,
-                ),
-                layout,
-            },
-            TheRockChannel::Nightly => ResolvedSource {
-                wheel_index: env_override_base(
-                    "ROCM_CLI_THEROCK_NIGHTLY_PIP_BASE",
-                    THEROCK_NIGHTLY_PIP_INDEX_BASE,
-                ),
-                tarball_catalog: env_override_base(
-                    "ROCM_CLI_THEROCK_NIGHTLY_TARBALL_BASE",
-                    THEROCK_NIGHTLY_TARBALL_BASE,
-                ),
-                layout,
-            },
-        },
-        SourceLayout::Next => ResolvedSource {
-            wheel_index: env_override_base(
-                "ROCM_CLI_THEROCK_NEXT_PIP_BASE",
-                THEROCK_NEXT_PIP_INDEX_BASE,
-            ),
-            tarball_catalog: env_override_base(
-                "ROCM_CLI_THEROCK_NEXT_TARBALL_BASE",
-                THEROCK_NEXT_TARBALL_BASE,
-            ),
-            layout,
-        },
-    }
-}
-
-/// Whether `selector` names a ROCm release that only the next layout publishes.
-///
-/// An exact *stable* pin is the only signal that qualifies. A build date names
-/// a nightly build, an unparseable string names nothing this CLI can reason
-/// about, and neither is evidence that the canonical stream cannot serve the
-/// request. Nor is a pinned prerelease of a future major: the canonical
-/// nightly stream already serves those (see
-/// `nightly_accepts_future_prerelease_major_without_cli_changes`), so gating
-/// on major alone would route a nightly alpha pin like `10.1.0a20260822` into
-/// a refusal the release-channel retry it suggests could never satisfy.
-fn next_layout_requested(selector: &RuntimeVersionSelector) -> bool {
-    let RuntimeVersionSelector::Version(version) = selector else {
-        return false;
-    };
-    parse_version(version).is_some_and(|parsed| {
-        parsed.stage == VersionStage::Stable && parsed.major >= THEROCK_NEXT_MIN_MAJOR
-    })
-}
-
-/// The layout an install must read from, and the refusal when it cannot.
-///
-/// Only an explicit pin at ROCm >= [`THEROCK_NEXT_MIN_MAJOR`] selects `Next`,
-/// because that is the one request the canonical stream provably cannot serve.
-/// No selector, a build date, an unparseable pin, or an older pin all stay
-/// canonical, so nothing that resolves today starts resolving somewhere else.
-/// A pin that does reach `Next` still needs an exact arch, because that layout
-/// picks its device payload by exact arch and a grouped family names none.
-fn select_source_layout(
-    channel: TheRockChannel,
-    family_resolution: &FamilyResolution,
-    version_selector: Option<&RuntimeVersionSelector>,
-) -> Result<SourceLayout> {
-    let Some(selector) = version_selector.filter(|selector| next_layout_requested(selector)) else {
-        return Ok(SourceLayout::Canonical);
-    };
-    let RuntimeVersionSelector::Version(version) = selector else {
-        return Ok(SourceLayout::Canonical);
-    };
-    let major = parse_version(version).map_or(THEROCK_NEXT_MIN_MAJOR, |parsed| parsed.major);
-    if !matches!(channel, TheRockChannel::Release) {
-        bail!(
-            "ROCm {major} and newer is published only on the release channel; re-run `rocm install sdk --channel release --version {version}`"
-        );
-    }
-    if family_resolution.raw_arch.is_none() {
-        bail!(
-            "installing ROCm {major} requires an exact GPU arch, but the resolved target family `{}` names a group of them.\n\
-             ROCm {major} selects its device payload by exact arch, so re-run with the one this host has, for example `rocm install sdk --version {version} --family gfx1200`.\n\n{}",
-            family_resolution.family,
-            detect_host_gpu_diagnostics()
-        );
-    }
-    Ok(SourceLayout::Next)
-}
-
 fn render_canonical_provenance(
     output: &mut String,
     channel: TheRockChannel,
@@ -504,19 +243,6 @@ impl AggregateDeviceTarget {
             Self::Undetermined(reason) => Some(reason),
         }
     }
-}
-
-#[derive(Debug, Clone)]
-struct FamilyResolution {
-    family: String,
-    source: String,
-    /// The exact GFX arch behind `family`, when one is genuinely known —
-    /// `gfx1200`, never the group `gfx120X-all`.
-    ///
-    /// A grouped family names no single arch, and the next layout selects its
-    /// device payload by exact arch, so `None` here is what makes a ROCm 10 pin
-    /// refuse instead of installing a runtime with the wrong kernels.
-    raw_arch: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1161,25 +887,6 @@ fn manifest_source_layout(manifest: &InstalledRuntimeManifest) -> Result<SourceL
             .as_ref()
             .map(|composition| composition.source_layout_generation.as_str())
     }))
-}
-
-/// The family override to actually resolve a next-layout wheel request with,
-/// given a (possibly grouped) family and an exact arch recorded or requested
-/// alongside it.
-///
-/// A grouped family (e.g. `gfx125X-dcgpu`) carries no exact arch, so passing
-/// it straight through would leave the next layout's device target
-/// undetermined and the whole resolve would bail — on the very host the
-/// runtime is already installed on. `candidate_arch` is the exact arch a more
-/// authoritative source already recorded for this same family; when it
-/// agrees, pass it as the override itself, which `resolve_family` also
-/// normalizes back to this same family. Used by both halves of updating a
-/// next-layout manifest: `resolve_latest_for_manifest` (planning) and
-/// `install_wheel_runtime` via `device_target_override` (applying) — a fix to
-/// one without the other leaves the update path half-working.
-fn family_override_or_recovered_arch(family: &str, candidate_arch: Option<&str>) -> String {
-    raw_arch_agreeing_with_family(candidate_arch.map(str::to_owned), family)
-        .unwrap_or_else(|| family.to_owned())
 }
 
 /// The family override to re-resolve a wheel manifest's update *plan* with.
@@ -3054,161 +2761,6 @@ fn select_tarball_candidate(
     candidates.pop()
 }
 
-/// Whether `value` is an exact GFX arch code (`gfx1200`, `gfx90a`) rather than
-/// a grouped family label (`gfx120X-all`) or prose with a gfx token in it.
-///
-/// Deliberately stricter than [`extract_first_gfx_token`], which digs a target
-/// out of noisy KFD output: a `--family` value is only evidence of an exact arch
-/// when the user typed exactly one, and `gfx120X-all` normalizing to a family
-/// must not be mistaken for naming a member of it.
-fn is_raw_gfx_arch_code(value: &str) -> bool {
-    let lower = value.to_ascii_lowercase();
-    let Some(rest) = lower.strip_prefix("gfx") else {
-        return false;
-    };
-    let Some(last) = rest.len().checked_sub(1) else {
-        return false;
-    };
-    rest.bytes()
-        .enumerate()
-        .all(|(index, byte)| byte.is_ascii_digit() || (index == last && byte.is_ascii_lowercase()))
-}
-
-fn family_override_raw_arch(value: &str) -> Option<String> {
-    let trimmed = value.trim();
-    is_raw_gfx_arch_code(trimmed).then(|| trimmed.to_ascii_lowercase())
-}
-
-/// A host-probed arch, kept only when it belongs to the family some more
-/// authoritative source already resolved.
-///
-/// A managed runtime's manifest records the family but never the arch, so the
-/// arch can only be recovered by probing this host. That probe is trustworthy
-/// exactly when it agrees: a second card, or a machine the runtime was moved to,
-/// reports an arch from a different family, and installing its device payload
-/// would produce a runtime that cannot run the family's kernels.
-fn raw_arch_agreeing_with_family(raw_arch: Option<String>, family: &str) -> Option<String> {
-    raw_arch.filter(|raw| normalize_therock_family(raw).as_deref() == Some(family))
-}
-
-fn resolve_family(paths: &AppPaths, family_override: Option<&str>) -> Result<FamilyResolution> {
-    let env_override = std::env::var("ROCM_CLI_THEROCK_FAMILY").ok();
-
-    // An explicitly asked-for target that ROCm publishes no build for is
-    // refused here rather than normalized. `normalize_therock_family` answers
-    // `None` for gfx90c, and `None` from this branch means "fall through", so
-    // without this the user's `--family gfx90c` would be dropped and whatever
-    // GPU this host happens to have would be installed for instead.
-    // Unrecognized spellings keep falling through to detection, which is the
-    // long-standing behavior for a typo.
-    //
-    // The guard sits inside each source's own branch, not ahead of both, so a
-    // source is only ever refused when it is actually the one being consulted:
-    // a valid `--family` must resolve even if a stale `ROCM_CLI_THEROCK_FAMILY`
-    // left over from an earlier session happens to name gfx90c, and the
-    // reverse for an env value once `--family` isn't the one in play.
-    if let Some(value) = family_override {
-        if gfx_target_has_no_rocm_build(value) {
-            bail!(unsupported_requested_target_message(
-                value.trim(),
-                "--family"
-            ));
-        }
-        if let Some(family) = normalize_therock_family(value) {
-            return Ok(FamilyResolution {
-                family,
-                source: "manifest".to_owned(),
-                raw_arch: family_override_raw_arch(value),
-            });
-        }
-    }
-
-    if let Some(value) = env_override.as_deref() {
-        if gfx_target_has_no_rocm_build(value) {
-            bail!(unsupported_requested_target_message(
-                value.trim(),
-                "ROCM_CLI_THEROCK_FAMILY"
-            ));
-        }
-        if let Some(family) = normalize_therock_family(value) {
-            return Ok(FamilyResolution {
-                family,
-                source: "env".to_owned(),
-                raw_arch: family_override_raw_arch(value),
-            });
-        }
-    }
-
-    if let Some(family) = detect_managed_therock_family(paths) {
-        let raw_arch = raw_arch_agreeing_with_family(detect_host_gfx_target(), &family);
-        return Ok(FamilyResolution {
-            family,
-            source: "managed-runtime".to_owned(),
-            raw_arch,
-        });
-    }
-
-    let host_arch = detect_host_gfx_target();
-    if let Some(raw_arch) = host_arch.as_deref()
-        && let Some(family) = normalize_therock_family(raw_arch)
-    {
-        return Ok(FamilyResolution {
-            family,
-            source: "host".to_owned(),
-            raw_arch: Some(raw_arch.to_owned()),
-        });
-    }
-
-    // A GPU was detected that is known to have no package family: the gfx90c
-    // Vega iGPU in Renoir/Cezanne APUs. Listing the recognized families would
-    // invite installing a build for different silicon, so say plainly that
-    // there is nothing to install for this GPU. Other unmapped targets keep the
-    // generic error below, which points at `--family`.
-    if let Some(raw_arch) = host_arch.as_deref()
-        && gfx_target_has_no_rocm_build(raw_arch)
-    {
-        let message = unsupported_host_gpu_message(raw_arch);
-        let diagnostics = detect_host_gpu_diagnostics();
-        bail!("{message}\n\n{diagnostics}");
-    }
-
-    bail!(
-        "unable to resolve a supported TheRock GPU family for this host.\n\
-         Re-run with an explicit package family: `rocm install sdk --family <FAMILY>`.\n\
-         Recognized families: {}.\n\n{}",
-        known_therock_families().join(", "),
-        detect_host_gpu_diagnostics()
-    )
-}
-
-/// The install error for a detected GPU target that no TheRock package family
-/// covers. It deliberately does not list `--family` values: none of them was
-/// built for this GPU.
-fn unsupported_host_gpu_message(raw_arch: &str) -> String {
-    format!(
-        "no ROCm SDK build exists for the detected GPU target `{raw_arch}`, so \
-         `rocm install sdk` has nothing to install for it.\n\
-         The GPU is detected but is not supported by ROCm; \
-         the Vulkan backend can still be used."
-    )
-}
-
-/// The install error for a target the user asked for by name that no TheRock
-/// package family covers.
-///
-/// Separate from [`unsupported_host_gpu_message`] because nothing was detected
-/// here: the user named the target, so the error names where it came from and
-/// does not claim a GPU is present. Like that message it offers no `--family`
-/// values, since none of them was built for this GPU.
-fn unsupported_requested_target_message(value: &str, source: &str) -> String {
-    format!(
-        "no ROCm SDK build exists for the GPU target `{value}` requested by \
-         {source}, so `rocm install sdk` has nothing to install for it.\n\
-         That GPU is not supported by ROCm; the Vulkan backend can still be \
-         used. Nothing was installed and no other family was substituted."
-    )
-}
-
 fn select_rocm_version(
     channel: TheRockChannel,
     rocm_versions: &[String],
@@ -4510,20 +4062,6 @@ const fn python_requirement(layout: SourceLayout) -> PythonRequirement {
     }
 }
 
-/// The layout an install or update will read from, as far as is knowable before
-/// an interpreter has been chosen. An update passes its manifest's recorded
-/// layout; a fresh install passes its request and lets the pin decide.
-fn requested_source_layout(
-    layout_override: Option<SourceLayout>,
-    version_selector: Option<&RuntimeVersionSelector>,
-) -> SourceLayout {
-    match layout_override {
-        Some(layout) => layout,
-        None if version_selector.is_some_and(next_layout_requested) => SourceLayout::Next,
-        None => SourceLayout::Canonical,
-    }
-}
-
 /// Whether a `Canonical`-layout install (auto-select, or a nightly
 /// build-date/prerelease pin) will actually resolve a ROCm build at major >=
 /// [`THEROCK_NEXT_MIN_MAJOR`], regardless of [`VersionStage`].
@@ -5036,62 +4574,6 @@ fn wheel_runtime_key(
     ))
 }
 
-fn family_resolution_hint(
-    source: &str,
-    family: &str,
-    channel: TheRockChannel,
-    format: &str,
-) -> String {
-    let families = known_therock_families().join(", ");
-    let auto_detected = matches!(source, "host" | "managed-runtime");
-    let mut hint = String::new();
-
-    if auto_detected {
-        let _ = write!(
-            hint,
-            "no installable TheRock {} runtime was found for the auto-detected GPU family `{family}`.\n\
-             Re-run with an explicit package family: `rocm install sdk --family <FAMILY>`.\n\
-             Recognized families: {families}.",
-            channel.as_str()
-        );
-    } else {
-        let _ = write!(
-            hint,
-            "no installable TheRock {} runtime was found for the requested package family `{family}`.\n\
-             Recognized families: {families}.",
-            channel.as_str()
-        );
-    }
-
-    let other_channel = match channel {
-        TheRockChannel::Release => "nightly",
-        TheRockChannel::Nightly => "release",
-    };
-    let alternate_format = match format {
-        "wheel" if !runtime_is_windows() => Some("tarball"),
-        "tarball" => Some("wheel"),
-        _ => None,
-    };
-    match alternate_format {
-        Some(alternate_format) => {
-            let _ = write!(
-                hint,
-                "\nIf your GPU is newer than the {} packages, try `--channel {other_channel}` or `--format {alternate_format}`.",
-                channel.as_str()
-            );
-        }
-        None => {
-            let _ = write!(
-                hint,
-                "\nIf your GPU is newer than the {} packages, try `--channel {other_channel}`.",
-                channel.as_str()
-            );
-        }
-    }
-
-    hint
-}
-
 const fn platform_tarball_token() -> &'static str {
     if runtime_is_windows() {
         "windows"
@@ -5183,162 +4665,11 @@ fn slugify(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    use super::test_support::workspace_test_artifact_dir;
+    use super::test_support::{test_paths, test_runtime_manifest, write_test_runtime_manifest};
     use super::*;
     use crate::test_support::PROCESS_ENV_TEST_LOCK;
-
-    fn family_for_test(family: &str, raw_arch: Option<&str>) -> FamilyResolution {
-        FamilyResolution {
-            family: family.to_owned(),
-            source: "manifest".to_owned(),
-            raw_arch: raw_arch.map(str::to_owned),
-        }
-    }
-
-    /// Everything a user can ask for today must keep resolving the canonical
-    /// stream. The next layout is an extension, so no existing request may start
-    /// answering from somewhere else.
-    #[test]
-    fn only_a_rocm_10_pin_leaves_the_canonical_layout() {
-        let exact = family_for_test("gfx120X-all", Some("gfx1200"));
-        let build_date = RuntimeVersionSelector::build_date("2026-06-05").unwrap();
-        let older_pin = RuntimeVersionSelector::version("7.14.0").unwrap();
-        let unparseable = RuntimeVersionSelector::version("main").unwrap();
-
-        for selector in [
-            None,
-            Some(&build_date),
-            Some(&older_pin),
-            Some(&unparseable),
-        ] {
-            assert_eq!(
-                select_source_layout(TheRockChannel::Release, &exact, selector).unwrap(),
-                SourceLayout::Canonical,
-                "selector {selector:?} must stay canonical"
-            );
-        }
-
-        let pin = RuntimeVersionSelector::version("10.0.0").unwrap();
-        assert_eq!(
-            select_source_layout(TheRockChannel::Release, &exact, Some(&pin)).unwrap(),
-            SourceLayout::Next
-        );
-    }
-
-    /// A grouped family names no single arch, and the next layout has no
-    /// grouped device payload to fall back to, so the refusal has to name the
-    /// flag and a value that would work.
-    #[test]
-    fn rocm_10_pin_without_an_exact_arch_refuses_actionably() {
-        let grouped = family_for_test("gfx120X-all", None);
-        let pin = RuntimeVersionSelector::version("10.0.0").unwrap();
-
-        let error = select_source_layout(TheRockChannel::Release, &grouped, Some(&pin))
-            .expect_err("a grouped family cannot select a device payload")
-            .to_string();
-
-        assert!(error.contains("requires an exact GPU arch"), "{error}");
-        assert!(error.contains("--family gfx1200"), "{error}");
-    }
-
-    #[test]
-    fn rocm_10_pin_on_nightly_refuses_instead_of_resolving() {
-        let exact = family_for_test("gfx120X-all", Some("gfx1200"));
-        let pin = RuntimeVersionSelector::version("10.0.0").unwrap();
-
-        let error = select_source_layout(TheRockChannel::Nightly, &exact, Some(&pin))
-            .expect_err("the next layout has no nightly stream")
-            .to_string();
-
-        assert!(error.contains("--channel release"), "{error}");
-    }
-
-    /// A pinned nightly prerelease of a future major (e.g. a ROCm 10 alpha
-    /// build) is not evidence the canonical stream can't serve it — only a
-    /// *stable* pin is. Gating on major alone would refuse this pin and then
-    /// suggest a release-channel retry that the stable-version filter would
-    /// also reject, leaving no working path.
-    #[test]
-    fn nightly_prerelease_pin_of_a_future_major_stays_canonical() {
-        let exact = family_for_test("gfx120X-all", Some("gfx1200"));
-        let pin = RuntimeVersionSelector::version("10.1.0a20260822").unwrap();
-
-        assert_eq!(
-            select_source_layout(TheRockChannel::Nightly, &exact, Some(&pin)).unwrap(),
-            SourceLayout::Canonical
-        );
-    }
-
-    #[test]
-    fn next_layout_resolves_its_own_bases() {
-        let _guard = PROCESS_ENV_TEST_LOCK.lock().unwrap();
-        let next = resolve_source(TheRockChannel::Release, SourceLayout::Next);
-
-        assert_eq!(
-            next.wheel_index,
-            "https://stable.repo.amd.com/rocm/whl-next"
-        );
-        assert_eq!(
-            next.tarball_catalog,
-            "https://stable.repo.amd.com/rocm/core/tarball/"
-        );
-        assert_eq!(next.layout.generation(), "next-v1");
-    }
-
-    /// A base override is a redirect to an arbitrary host, so naming the
-    /// variable must not be enough on its own.
-    #[test]
-    fn base_overrides_are_inert_without_the_explicit_opt_in() {
-        let default = THEROCK_NEXT_PIP_INDEX_BASE;
-        let fixture = "http://127.0.0.1:9/whl";
-
-        // Naming the variable is not enough; without the opt-in it is ignored.
-        assert_eq!(select_base_override(false, Some(fixture), default), default);
-        assert_eq!(
-            select_base_override(true, Some(fixture), default),
-            fixture,
-            "an opted-in override must be honoured"
-        );
-        // A variable that is present but blank is not a redirect.
-        assert_eq!(select_base_override(true, Some("   "), default), default);
-        assert_eq!(select_base_override(true, None, default), default);
-    }
-
-    /// The test above only proves the pure decision rule; it never reads
-    /// process environment, so it can't catch `env_override_base` or
-    /// `resolve_source` failing to wire that rule to the real variables. The
-    /// only thing that does today is `therock-next-06`, an e2e scenario gated
-    /// `@nightly` because it has to reach the live default index — so on the
-    /// blocking lane this trust boundary otherwise has zero coverage of the
-    /// actual env-reading path. Exercise it here instead, with no network.
-    #[test]
-    #[allow(unsafe_code)] // std::env::set_var is unsafe in edition 2024
-    fn env_override_is_ignored_end_to_end_without_the_opt_in() {
-        let _guard = PROCESS_ENV_TEST_LOCK.lock().unwrap();
-        let old_override = std::env::var_os("ROCM_CLI_THEROCK_NEXT_PIP_BASE");
-        let old_allow = std::env::var_os("ROCM_CLI_THEROCK_ALLOW_BASE_OVERRIDE");
-        unsafe {
-            std::env::set_var("ROCM_CLI_THEROCK_NEXT_PIP_BASE", "http://127.0.0.1:9/whl");
-            std::env::remove_var("ROCM_CLI_THEROCK_ALLOW_BASE_OVERRIDE");
-        }
-
-        let next = resolve_source(TheRockChannel::Release, SourceLayout::Next);
-
-        unsafe {
-            match old_override {
-                Some(value) => std::env::set_var("ROCM_CLI_THEROCK_NEXT_PIP_BASE", value),
-                None => std::env::remove_var("ROCM_CLI_THEROCK_NEXT_PIP_BASE"),
-            }
-            match old_allow {
-                Some(value) => std::env::set_var("ROCM_CLI_THEROCK_ALLOW_BASE_OVERRIDE", value),
-                None => std::env::remove_var("ROCM_CLI_THEROCK_ALLOW_BASE_OVERRIDE"),
-            }
-        }
-
-        assert_eq!(
-            next.wheel_index, THEROCK_NEXT_PIP_INDEX_BASE,
-            "an override named without the trust opt-in must not redirect resolution"
-        );
-    }
 
     #[test]
     fn tarball_catalog_rejects_unsafe_file_names_at_the_parser_boundary() {
@@ -5367,45 +4698,6 @@ mod tests {
                 .len(),
             1
         );
-    }
-
-    #[test]
-    fn family_override_raw_arch_accepts_only_exact_arch_codes() {
-        assert_eq!(
-            family_override_raw_arch("gfx1200"),
-            Some("gfx1200".to_owned())
-        );
-        assert_eq!(
-            family_override_raw_arch(" gfx90a "),
-            Some("gfx90a".to_owned())
-        );
-        assert_eq!(
-            family_override_raw_arch("GFX1250"),
-            Some("gfx1250".to_owned())
-        );
-        assert_eq!(family_override_raw_arch("gfx120X-all"), None);
-        assert_eq!(family_override_raw_arch("gfx103X-dgpu"), None);
-        assert_eq!(
-            family_override_raw_arch("gpu target gfx1030 detected"),
-            None
-        );
-        assert_eq!(family_override_raw_arch("gfx"), None);
-        assert_eq!(family_override_raw_arch(""), None);
-    }
-
-    /// A managed runtime records only its family, so the arch has to come from
-    /// a host probe — and is worth nothing when the host is a different card.
-    #[test]
-    fn managed_family_keeps_only_a_host_arch_from_the_same_family() {
-        assert_eq!(
-            raw_arch_agreeing_with_family(Some("gfx1030".to_owned()), "gfx103X-dgpu"),
-            Some("gfx1030".to_owned())
-        );
-        assert_eq!(
-            raw_arch_agreeing_with_family(Some("gfx90a".to_owned()), "gfx103X-dgpu"),
-            None
-        );
-        assert_eq!(raw_arch_agreeing_with_family(None, "gfx103X-dgpu"), None);
     }
 
     /// Updating a next-layout manifest whose family is a group label (as
@@ -5774,100 +5066,6 @@ mod tests {
         // `gfx90X-dcgpu`, so a plain `rocm install sdk` targeted data-center
         // packages and the error listed that family as a `--family` choice.
         assert_eq!(normalize_therock_family("gfx90c"), None);
-    }
-
-    #[test]
-    fn unsupported_gpu_error_names_the_gpu_and_does_not_suggest_families() {
-        let message = unsupported_host_gpu_message("gfx90c");
-        assert!(message.contains("no ROCm SDK build"), "{message}");
-        assert!(message.contains("`gfx90c`"), "{message}");
-        assert!(message.contains("Vulkan"), "{message}");
-        assert!(!message.contains("--family"), "{message}");
-        for family in known_therock_families() {
-            assert!(
-                !message.contains(family),
-                "the error must not offer `{family}` for an unsupported GPU: {message}"
-            );
-        }
-    }
-
-    /// Asking for gfx90c by name must fail, not quietly install for some other
-    /// GPU.
-    ///
-    /// `normalize_therock_family("gfx90c")` is `None`, and in `resolve_family`
-    /// `None` from the override branch means "keep looking" — so before the
-    /// explicit-target guard, `--family gfx90c` was dropped on the floor and
-    /// the host's own family was installed instead. That is worse than the
-    /// data-center mapping this change removed: the user named a target and
-    /// got a different one with no warning.
-    ///
-    /// Reaching detection at all would make this test depend on the machine it
-    /// runs on, so a failure here is also the signal that the guard moved below
-    /// the branches it has to precede.
-    #[test]
-    fn requesting_gfx90c_by_name_fails_instead_of_installing_another_family() {
-        let (_root, paths) = test_paths("resolve-family-gfx90c-override");
-        let error = resolve_family(&paths, Some("gfx90c"))
-            .expect_err("--family gfx90c must not resolve to any package family");
-        let message = error.to_string();
-        assert!(message.contains("no ROCm SDK build"), "{message}");
-        assert!(message.contains("`gfx90c`"), "{message}");
-        assert!(message.contains("--family"), "{message}");
-        assert!(
-            message.contains("no other family was substituted"),
-            "{message}"
-        );
-        for family in known_therock_families() {
-            assert!(
-                !message.contains(family),
-                "asking for gfx90c must not resolve or offer `{family}`: {message}"
-            );
-        }
-    }
-
-    /// A valid `--family` must resolve even if `ROCM_CLI_THEROCK_FAMILY` is
-    /// stale and happens to name gfx90c.
-    ///
-    /// The no-build guard used to run ahead of both sources regardless of
-    /// which one would actually be consulted, so a leftover env value with no
-    /// bearing on this invocation could refuse an otherwise-valid `--family`.
-    /// The guard now lives inside each source's own branch, so it only fires
-    /// for the source actually being read.
-    #[test]
-    #[allow(unsafe_code)] // std::env::set_var is unsafe in edition 2024
-    fn cli_family_overrides_a_stale_env_value_naming_an_unsupported_gpu() {
-        let _guard = PROCESS_ENV_TEST_LOCK.lock().unwrap();
-        let old_env = std::env::var_os("ROCM_CLI_THEROCK_FAMILY");
-        unsafe {
-            std::env::set_var("ROCM_CLI_THEROCK_FAMILY", "gfx90c");
-        }
-
-        let (_root, paths) = test_paths("resolve-family-cli-overrides-stale-env");
-        let resolution = resolve_family(&paths, Some("gfx1103"));
-
-        unsafe {
-            match old_env {
-                Some(value) => std::env::set_var("ROCM_CLI_THEROCK_FAMILY", value),
-                None => std::env::remove_var("ROCM_CLI_THEROCK_FAMILY"),
-            }
-        }
-
-        let resolution = resolution
-            .expect("a valid --family must resolve even with an unrelated gfx90c env override set");
-        assert_eq!(resolution.family, "gfx110X-all");
-        assert_eq!(resolution.source, "manifest");
-    }
-
-    #[test]
-    fn requested_target_error_names_where_the_target_came_from() {
-        let message = unsupported_requested_target_message("gfx90c", "--family");
-        assert!(message.contains("`gfx90c`"), "{message}");
-        assert!(message.contains("--family"), "{message}");
-        // The user named it; nothing was detected, so the error must not say so.
-        assert!(!message.contains("detected"), "{message}");
-
-        let message = unsupported_requested_target_message("gfx90c", "ROCM_CLI_THEROCK_FAMILY");
-        assert!(message.contains("ROCM_CLI_THEROCK_FAMILY"), "{message}");
     }
 
     #[test]
@@ -7320,34 +6518,6 @@ mod tests {
         assert_eq!(next.version, "3.14");
     }
 
-    /// The requirement is read before `resolve_pip_runtime` runs, so it has to
-    /// be derivable from the request alone. Only an explicit stable ROCm >= 10
-    /// pin reaches the next layout; a build-date pin, an older pin, or no
-    /// selector at all must stay canonical so nothing that installs today
-    /// starts demanding a different interpreter.
-    #[test]
-    fn requested_source_layout_reads_the_request_not_the_resolution() {
-        let next_pin = RuntimeVersionSelector::Version("10.1.0".to_owned());
-        assert_eq!(
-            requested_source_layout(None, Some(&next_pin)),
-            SourceLayout::Next
-        );
-
-        let old_pin = RuntimeVersionSelector::Version("7.2.3".to_owned());
-        assert_eq!(
-            requested_source_layout(None, Some(&old_pin)),
-            SourceLayout::Canonical
-        );
-        assert_eq!(requested_source_layout(None, None), SourceLayout::Canonical);
-
-        // An update supplies its manifest's layout, which wins over the (absent)
-        // selector so the runtime keeps the interpreter its stream needs.
-        assert_eq!(
-            requested_source_layout(Some(SourceLayout::Next), None),
-            SourceLayout::Next
-        );
-    }
-
     /// A tag mismatch and a broken venv are different failures with different
     /// fixes, so the gate must not report one as the other.
     #[cfg(unix)]
@@ -7976,59 +7146,6 @@ exit 1
         assert!(!paths.cache_dir.join("therock").join("metadata").exists());
         let _ = fs::remove_dir_all(root);
         Ok(())
-    }
-
-    #[test]
-    fn resolve_family_uses_managed_runtime_before_host_detection() -> Result<()> {
-        if std::env::var("ROCM_CLI_THEROCK_FAMILY")
-            .ok()
-            .and_then(|value| normalize_therock_family(&value))
-            .is_some()
-        {
-            return Ok(());
-        }
-
-        let (root, paths) = test_paths("resolve-family-managed-runtime");
-        let manifest = test_runtime_manifest("active", "therock-release:gfx120X-all", 1);
-        write_test_runtime_manifest(&paths, &manifest)?;
-
-        let resolution = resolve_family(&paths, None)?;
-
-        assert_eq!(resolution.family, "gfx120X-all");
-        assert_eq!(resolution.source, "managed-runtime");
-        let _ = fs::remove_dir_all(root);
-        Ok(())
-    }
-
-    #[test]
-    fn family_resolution_hint_for_auto_detected_points_at_family_flag() {
-        let hint = family_resolution_hint("host", "gfx950-dcgpu", TheRockChannel::Release, "wheel");
-
-        assert!(hint.contains("auto-detected GPU family `gfx950-dcgpu`"));
-        assert!(hint.contains("--family <FAMILY>"));
-        // Lists recognized families the user can pass instead.
-        assert!(hint.contains("gfx110X-all"));
-        // Points at the other channel as an escape hatch.
-        assert!(hint.contains("--channel nightly"));
-    }
-
-    #[test]
-    fn family_resolution_hint_for_user_supplied_frames_around_requested_family() {
-        let hint =
-            family_resolution_hint("manifest", "gfx110X-all", TheRockChannel::Release, "wheel");
-
-        assert!(hint.contains("requested package family `gfx110X-all`"));
-        // A family the user named themselves is not described as auto-detected.
-        assert!(!hint.contains("auto-detected"));
-        assert!(!hint.contains("--family <FAMILY>"));
-        assert!(hint.contains("--channel nightly"));
-    }
-
-    #[test]
-    fn family_resolution_hint_suggests_release_channel_from_nightly() {
-        let hint = family_resolution_hint("host", "gfx950-dcgpu", TheRockChannel::Nightly, "wheel");
-
-        assert!(hint.contains("--channel release"));
     }
 
     #[test]
@@ -8964,78 +8081,6 @@ exit 1
             warning,
             "ROCm 7.14.0 is the newest version in this repository but has no installable PyTorch wheels for this Python and platform; installing ROCm 7.13.0 instead"
         );
-    }
-
-    fn test_paths(name: &str) -> (PathBuf, AppPaths) {
-        let root = workspace_test_artifact_dir().join(format!(
-            "rocm-cli-therock-test-{name}-{}",
-            crate::test_support::unique_suffix()
-        ));
-        (
-            root.clone(),
-            AppPaths {
-                config_dir: root.join("config"),
-                data_dir: root.join("data"),
-                cache_dir: root.join("cache"),
-            },
-        )
-    }
-
-    #[test]
-    fn test_paths_gives_each_call_its_own_root_even_for_one_label() {
-        crate::test_support::assert_each_call_gets_its_own_root(|| test_paths("same-label").0);
-    }
-
-    fn workspace_test_artifact_dir() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .join(".rocm-work")
-            .join("tests")
-            .join("therock")
-    }
-
-    fn test_runtime_manifest(
-        runtime_key: &str,
-        runtime_id: &str,
-        installed_at_unix_ms: u128,
-    ) -> InstalledRuntimeManifest {
-        InstalledRuntimeManifest {
-            runtime_key: runtime_key.to_owned(),
-            runtime_id: runtime_id.to_owned(),
-            channel: "release".to_owned(),
-            format: "wheel".to_owned(),
-            family: runtime_id
-                .split_once(':')
-                .map_or_else(|| "gfx120X-all".to_owned(), |(_, family)| family.to_owned()),
-            family_source: "test".to_owned(),
-            version: "7.13.0a20260416".to_owned(),
-            install_root: PathBuf::from("runtime-root"),
-            selected_artifact_url: "https://example.invalid/rocm".to_owned(),
-            source_layout_generation: None,
-            index_url: Some("https://example.invalid/simple".to_owned()),
-            tarball_file_name: None,
-            python_launcher: Some("python".to_owned()),
-            python_executable: Some("python".to_owned()),
-            pip_cache_dir: None,
-            rocm_sdk: None,
-            sdk_torch: None,
-            wheel_composition: None,
-            read_only: false,
-            imported_from: None,
-            devel: true,
-            installed_at_unix_ms,
-        }
-    }
-
-    fn write_test_runtime_manifest(
-        paths: &AppPaths,
-        manifest: &InstalledRuntimeManifest,
-    ) -> Result<()> {
-        let path = runtime_manifest_path(paths, &manifest.runtime_key);
-        fs::create_dir_all(path.parent().expect("manifest path should have parent"))?;
-        fs::write(path, serde_json::to_vec_pretty(manifest)?)?;
-        Ok(())
     }
 
     /// Rewrite an already-written registry manifest so it still *reads* but no
