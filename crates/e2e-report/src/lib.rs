@@ -14,9 +14,7 @@ mod consolidated;
 mod parse;
 mod single_report;
 
-pub use consolidated::{
-    PlatformReports, RunMeta, consolidated_summary_markdown, generate_consolidated,
-    load_platform_reports,
-};
+pub use consolidated::html::{RunMeta, generate_consolidated};
+pub use consolidated::{PlatformReports, consolidated_summary_markdown, load_platform_reports};
 pub use parse::{XfailReport, evaluate_xfail, scenario_results_by_id};
 pub use single_report::generate;
