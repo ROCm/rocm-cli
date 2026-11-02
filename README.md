@@ -428,7 +428,10 @@ hardware, not something an install or a setting can put right.
 `rocm fix` takes these flags:
 
 - `--dry-run` shows any fix's plan without changing anything.
-- `--yes` skips the interactive confirmation once you've reviewed it.
+- `--yes` skips the interactive confirmation once you've reviewed it. Without
+  it, a fix that changes files or settings asks `[y/N]` (default: no). When
+  stdin is not a terminal it prints the plan and refuses with exit code 5,
+  changing nothing. Fixes that only print steps never ask.
 - `--device-index` pins the discrete GPU index for `fix-9-igpu-dgpu`, marked
   NEEDS-ARG; without it, that fix only prints the `rocminfo` (Linux) or
   `hipInfo.exe` (Windows) query needed to find the index and makes no change.
@@ -587,6 +590,9 @@ Approving (`--yes`) a plan that is `supported: false` (an
 undocumented distro, or a refused version override) installs nothing and exits
 non-zero, after printing the plan.
 
+`install driver` never asks for confirmation. Without `--yes`, in a terminal or
+not, it prints the plan marked `approval: required`, changes nothing, and exits 0.
+
 On Windows, `install driver` is validate-only: it installs and changes nothing,
 with or without `--yes`, and it starts no driver command. It prints the AMD
 display driver version and date, and whether the date is older than the first
@@ -695,8 +701,9 @@ reported as stopped by the attempt. The error says which is which. Read
 to fail the same way again — then start a stopped server with
 `rocm services restart <service-id> --yes` once the cause is fixed.
 
-`uninstall` prompts for confirmation unless `--yes` is passed; outside an
-interactive terminal `--yes` is required. `--dry-run` prints the plan and
+`runtimes uninstall` prompts `[y/N]` (default: no) unless `--yes` is passed.
+Outside an interactive terminal it prints the plan and refuses with exit code 1,
+removing nothing, so `--yes` is required there. `--dry-run` prints the plan and
 exits without prompting or making changes.
 
 `adopt` registers an existing TheRock-based Python environment as a managed
@@ -714,6 +721,11 @@ rocm storage [report [--json]]
 rocm storage remove-old-installs [--keep N] [--dry-run] [--yes]
 rocm storage remove-downloads [--dry-run] [--yes]
 ```
+
+Both removal commands list what they would remove, then ask `[y/N]` (default:
+no) unless `--yes` is passed. Outside an interactive terminal, when there is
+something to remove, they refuse with exit code 1 and remove nothing, so `--yes`
+is required there. `--dry-run` never asks.
 
 `remove-old-installs` keeps the two most recent installs for each channel,
 format, GPU family, and toolchain choice, and never touches the install in use,
@@ -764,7 +776,10 @@ and installs once more; see
 `ROCM_CLI_DISABLE_LEMONADE_BACKEND_ALIGNMENT`, which turns both off.
 
 `--yes` approves required system-package installs, such as OpenMPI for vLLM,
-without asking.
+including a `sudo` password prompt. `engines install` never asks for
+confirmation. Without `--yes`, a Linux host with root or passwordless `sudo`
+installs them anyway, and any other host prints the commands to run and the
+install continues.
 
 ### Will a model run here?
 
@@ -1201,8 +1216,10 @@ rocm uninstall [--yes] [--dry-run]
 
 `rocm uninstall` removes four categories of files that ROCm CLI manages on this
 computer: its binaries, configuration, data, and caches. It lists what it will
-do and asks before doing it. Use `--dry-run` to only list, and `--yes` to skip
-the confirmation. Each `--keep-*` flag skips the removal of one category:
+do and asks `[y/N]` (default: no) before doing it. Use `--dry-run` to only list,
+and `--yes` to skip the confirmation. Outside an interactive terminal, when there
+is something to remove, it refuses with exit code 1 and removes nothing unless
+you pass `--yes`. Each `--keep-*` flag skips the removal of one category:
 
 - `--keep-binaries` keeps the installed ROCm CLI binaries.
 - `--keep-config` keeps your saved settings.

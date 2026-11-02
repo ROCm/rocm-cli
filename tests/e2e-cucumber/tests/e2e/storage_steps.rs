@@ -10,7 +10,7 @@
 //! No GPU and no network, so this runs on the mock lane every PR.
 
 use crate::E2eWorld;
-use cucumber::{then, when};
+use cucumber::{given, then, when};
 
 #[when("the user asks what ROCm CLI is keeping on disk")]
 async fn run_storage_report(world: &mut E2eWorld) {
@@ -108,4 +108,69 @@ async fn assert_re_downloadable_notes(world: &mut E2eWorld) {
             "`{label}` must be marked as re-downloadable:\n{stdout}"
         );
     }
+}
+
+fn download_path(world: &E2eWorld) -> std::path::PathBuf {
+    world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("cache")
+        .join("therock")
+        .join("archive.tar.gz")
+}
+
+#[given("ROCm CLI has a downloaded file on disk")]
+async fn plant_download(world: &mut E2eWorld) {
+    let file = download_path(world);
+    std::fs::create_dir_all(file.parent().expect("download has a parent"))
+        .expect("failed to create the downloads folder");
+    std::fs::write(&file, "downloaded").expect("failed to plant a download");
+}
+
+#[when("the user removes the downloaded files without confirming")]
+async fn remove_downloads_unconfirmed(world: &mut E2eWorld) {
+    let cache = download_path(world)
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("download sits two folders below the cache")
+        .display()
+        .to_string();
+    // No `--yes`; the harness gives the binary no terminal to answer a prompt.
+    let (stdout, stderr, rc) = crate::run_rocm_with_env(
+        world,
+        &["storage", "remove-downloads"],
+        &[("ROCM_CLI_CACHE_DIR", &cache)],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the removal is refused and the user is told to confirm explicitly")]
+async fn removal_refused(world: &mut E2eWorld) {
+    let rc = world.cli_rc.expect("no exit code captured");
+    let stderr = world.cli_stderr.as_deref().unwrap_or("");
+    assert_eq!(
+        rc,
+        1,
+        "a refused removal must exit 1\nstdout:\n{}\nstderr:\n{stderr}",
+        report(world)
+    );
+    assert!(
+        stderr.contains("requires --yes outside an interactive terminal"),
+        "expected the --yes refusal on stderr:\n{stderr}"
+    );
+}
+
+#[then("the downloaded file is still there")]
+async fn download_still_there(world: &mut E2eWorld) {
+    let file = download_path(world);
+    assert!(
+        file.is_file(),
+        "the refused removal deleted {}:\n{}",
+        file.display(),
+        report(world)
+    );
 }

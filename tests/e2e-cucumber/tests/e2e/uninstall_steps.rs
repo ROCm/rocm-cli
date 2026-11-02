@@ -77,13 +77,28 @@ async fn cache_behind_looping_link(world: &mut E2eWorld) {
 }
 
 fn run_uninstall(world: &mut E2eWorld, keep: &[&str], settings: &[(&str, &str)]) {
+    run_uninstall_with(world, true, keep, settings);
+}
+
+/// `confirmed: false` leaves `--yes` off, so the run reaches the confirmation
+/// gate; the harness gives the binary no terminal, which is the case the gate
+/// has to refuse.
+fn run_uninstall_with(
+    world: &mut E2eWorld,
+    confirmed: bool,
+    keep: &[&str],
+    settings: &[(&str, &str)],
+) {
     let root = root(world).to_path_buf();
     let home = root.join("home");
     std::fs::create_dir_all(&home).expect("failed to create isolated HOME");
     let home = home.display().to_string();
     let uv = root.join("uv-cache").display().to_string();
     let hf = root.join("hf-home").display().to_string();
-    let mut args = vec!["uninstall", "--yes", "--keep-binaries"];
+    let mut args = vec!["uninstall", "--keep-binaries"];
+    if confirmed {
+        args.push("--yes");
+    }
     args.extend_from_slice(keep);
     let mut envs = vec![
         ("HOME", home.as_str()),
@@ -128,6 +143,17 @@ async fn uninstall_config_and_cache(world: &mut E2eWorld) {
             ("ROCM_CLI_CONFIG_DIR", &config),
             ("ROCM_CLI_CACHE_DIR", &cache),
         ],
+    );
+}
+
+#[when("the user uninstalls the config without confirming")]
+async fn uninstall_config_unconfirmed(world: &mut E2eWorld) {
+    let config = config_dir(world).display().to_string();
+    run_uninstall_with(
+        world,
+        false,
+        &["--keep-data", "--keep-cache"],
+        &[("ROCM_CLI_CONFIG_DIR", &config)],
     );
 }
 
@@ -191,6 +217,22 @@ async fn uninstall_fails(world: &mut E2eWorld) {
         rc != 0,
         "uninstall must fail, got exit 0\nstdout:\n{}",
         output(world)
+    );
+}
+
+#[then("the uninstall is refused and the user is told to confirm explicitly")]
+async fn uninstall_refused_without_yes(world: &mut E2eWorld) {
+    let rc = world.cli_rc.expect("no exit code captured");
+    let stderr = world.cli_stderr.as_deref().unwrap_or("");
+    assert_eq!(
+        rc,
+        1,
+        "a refused uninstall must exit 1\nstdout:\n{}\nstderr:\n{stderr}",
+        output(world)
+    );
+    assert!(
+        stderr.contains("uninstall requires --yes outside an interactive terminal"),
+        "expected the --yes refusal on stderr:\n{stderr}"
     );
 }
 

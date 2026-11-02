@@ -882,6 +882,22 @@ anything is removed:
 cargo xtask e2e -- -n "uninstall-"
 ```
 
+Without `--yes`, `rocm uninstall` asks `[y/N]` (default: no) at a terminal and,
+outside one, prints the plan and refuses with exit code 1, removing nothing;
+`uninstall-04` pins that. `rocm storage remove-downloads` gates the same way
+(`storage-01`), and `rocm fix` refuses with exit code 5 when stdin is not a
+terminal (`diagnose-08`). `rocm install driver` and `rocm engines install` never
+ask: without `--yes` the first prints its plan and changes nothing, and the
+second installs the system packages only where it can do so without a prompt.
+Each `--yes` help line says which of these applies, and
+`yes_help_says_what_happens_without_it_outside_a_terminal` keeps them in step.
+To check one by hand, point `HOME` at a scratch folder first so a regression
+cannot reach real files:
+
+```bash
+rocm uninstall --keep-binaries < /dev/null   # expect the refusal; exit 1
+```
+
 ## Provider-Assisted Planning
 
 The deterministic planner remains the default. Optional LLM/provider ambiguity

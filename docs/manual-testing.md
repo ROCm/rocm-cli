@@ -431,7 +431,9 @@ rocm engines install vllm --runtime-id <runtime_key_b> --yes
 ```
 
 `--yes` approves required system-package installs such as OpenMPI, which can
-call `sudo`. If the `install sdk` report above already printed an
+call `sudo`. `engines install` never asks for confirmation: without `--yes`, a
+Linux host with root or passwordless `sudo` installs them anyway, and any other
+host prints the commands to run and the install continues. If the `install sdk` report above already printed an
 `engine auto-install` block for vLLM, that runtime has it; `--reinstall` is the
 flag that forces a reinstall when the engine already exists.
 
@@ -846,6 +848,16 @@ Expected result:
   `PATH change left in place` and names it, and the `PATH` change stays.
 - With `rocm uninstall --keep-binaries`, the review says the `PATH` change
   stays too, and it does.
+- Without `--yes` and without a terminal, the command prints the same review,
+  then refuses with `uninstall requires --yes outside an interactive terminal`
+  and exit code 1, and removes nothing. On Linux or WSL, check it with no
+  terminal attached:
+
+  ```bash
+  rocm uninstall --keep-binaries < /dev/null   # expect the refusal; exit 1
+  ```
+
+  At a terminal, the same command asks `[y/N]` and treats Enter as no.
 
 ## 9. AIM (Docker) Engine Verification
 
