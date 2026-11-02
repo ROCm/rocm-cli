@@ -28,12 +28,12 @@ const THEROCK_NIGHTLY_TARBALL_BASE: &str = "https://rocm.nightlies.amd.com/tarba
 const THEROCK_NEXT_PIP_INDEX_BASE: &str = "https://stable.repo.amd.com/rocm/whl-next";
 /// ROCm 10's tarball catalog. Same scrapeable listing the canonical catalog
 /// uses, but it publishes non-release sibling archives beside the real dist
-/// archive (see [`select_tarball_candidate`]).
+/// archive (see `select_tarball_candidate` in `resolve/tarball.rs`).
 const THEROCK_NEXT_TARBALL_BASE: &str = "https://stable.repo.amd.com/rocm/core/tarball/";
 pub(super) const THEROCK_SOURCE_LAYOUT_GENERATION: &str = "multi-arch-v2";
-/// Recorded in a [`WheelRuntimeComposition`] installed from the ROCm 10 layout,
-/// so a later update reads back the layout that produced the runtime instead of
-/// guessing it from the version.
+/// Recorded in a [`WheelRuntimeComposition`](crate::runtime_registry::WheelRuntimeComposition)
+/// installed from the ROCm 10 layout, so a later update reads back the layout
+/// that produced the runtime instead of guessing it from the version.
 const THEROCK_NEXT_LAYOUT_GENERATION: &str = "next-v1";
 /// The first ROCm major version published only in the next layout. A pin at or
 /// past it is the one request the canonical stream provably cannot serve, and
@@ -68,7 +68,9 @@ impl SourceLayout {
         }
     }
 
-    /// The layout a recorded [`WheelRuntimeComposition`] was installed from.
+    /// The layout a recorded
+    /// [`WheelRuntimeComposition`](crate::runtime_registry::WheelRuntimeComposition)
+    /// was installed from.
     ///
     /// Manifests written before compositions existed carry no generation and
     /// therefore came from the canonical stream. A non-empty generation is an

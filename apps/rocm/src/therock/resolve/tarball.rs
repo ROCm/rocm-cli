@@ -8,8 +8,10 @@
 //! this request can install (`select_tarball_candidate`, `tarball_family_token`),
 //! and tying that to the resolved family and source (`resolve_tarball_artifact`).
 //!
-//! Builds on `fetch`, `family`, `source` and `version`; the platform token it
-//! matches archive names against stays in `therock.rs` with the other keys.
+//! Builds on `fetch`, `family`, `source` and `version`. The one item it reads
+//! from `therock.rs` is the platform token it matches archive names against,
+//! `platform_tarball_token`, which stays there for good with the other keys and
+//! roots helpers.
 
 use super::super::family::{family_resolution_hint, resolve_family};
 use super::super::fetch::download_text_cached;
@@ -132,6 +134,8 @@ pub(in crate::therock) fn resolve_tarball_artifact_with_timeout(
 /// family keeps its canonical spelling. Confined here rather than pushed into
 /// [`normalize_therock_family`] so a filename quirk cannot leak into the family
 /// a manifest records or the extras a wheel install requests.
+///
+/// [`normalize_therock_family`]: rocm_core::normalize_therock_family
 fn tarball_family_token(layout: SourceLayout, family: &str) -> &str {
     if matches!(layout, SourceLayout::Next) && family == "gfx103X-dgpu" {
         "gfx103X-all"

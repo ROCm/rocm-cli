@@ -3283,7 +3283,7 @@ fn select_latest_version(versions: &[String], channel: TheRockChannel) -> Option
 
 /// Whether a `Canonical`-layout install (auto-select, or a nightly
 /// build-date/prerelease pin) will actually resolve a ROCm build at major >=
-/// [`THEROCK_NEXT_MIN_MAJOR`], regardless of [`VersionStage`].
+/// [`THEROCK_NEXT_MIN_MAJOR`], regardless of [`VersionStage`](version::VersionStage).
 ///
 /// `requested_source_layout` only answers from the shape of the request: an
 /// explicit *stable* pin at ROCm >= `THEROCK_NEXT_MIN_MAJOR` routes to `Next`

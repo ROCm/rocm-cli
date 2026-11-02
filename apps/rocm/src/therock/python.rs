@@ -9,7 +9,9 @@
 //! environment.
 //!
 //! Builds on `io`, `process` and `source` (`python_requirement` takes a
-//! `SourceLayout`); nothing in those depends on this module.
+//! `SourceLayout`); nothing in those depends on this module. The one item it
+//! reads from `therock.rs` is `venv_python_path`, which stays there for good
+//! with the other keys and roots helpers.
 
 use super::io::{linux_temp_dir, windows_temp_dir};
 use super::process::{
@@ -213,6 +215,8 @@ fn managed_python_bootstrap_disabled() -> bool {
 /// the one the canonical stream uses. Both fields move together, so they travel
 /// together: `version` is what `uv` provisions, `tag` is what an already-present
 /// interpreter is checked against.
+///
+/// [`THEROCK_NEXT_MIN_MAJOR`]: super::source::THEROCK_NEXT_MIN_MAJOR
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct PythonRequirement {
     tag: &'static str,
@@ -229,6 +233,9 @@ pub(super) struct PythonRequirement {
 /// no pin, or a nightly build-date/prerelease pin, needs
 /// [`canonical_auto_select_needs_next_python`] to check whether the channel's
 /// own "latest" has rotated past [`THEROCK_NEXT_MIN_MAJOR`] on its own.
+///
+/// [`canonical_auto_select_needs_next_python`]: super::canonical_auto_select_needs_next_python
+/// [`THEROCK_NEXT_MIN_MAJOR`]: super::source::THEROCK_NEXT_MIN_MAJOR
 pub(super) const fn python_requirement(layout: SourceLayout) -> PythonRequirement {
     match layout {
         SourceLayout::Next => PythonRequirement {
@@ -407,6 +414,8 @@ thread_local! {
 /// use composes correctly, mirroring [`SuppressProgressOutput`]; the
 /// `nested_python_resolver_env_override_restores_the_outer_one_on_drop` test
 /// covers the property this claims).
+///
+/// [`SuppressProgressOutput`]: super::process::SuppressProgressOutput
 #[cfg(test)]
 pub(super) struct OverridePythonResolverEnv {
     previous: Option<PythonResolverEnv>,
@@ -446,7 +455,7 @@ pub(super) fn resolve_python_launcher(
     resolve_python_launcher_in(paths, &env, requirement)
 }
 
-pub(super) fn resolve_python_launcher_in(
+fn resolve_python_launcher_in(
     paths: &AppPaths,
     env: &PythonResolverEnv,
     requirement: PythonRequirement,

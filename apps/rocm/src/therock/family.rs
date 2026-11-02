@@ -47,6 +47,8 @@ pub(super) fn family_override_or_recovered_arch(
 /// out of noisy KFD output: a `--family` value is only evidence of an exact arch
 /// when the user typed exactly one, and `gfx120X-all` normalizing to a family
 /// must not be mistaken for naming a member of it.
+///
+/// [`extract_first_gfx_token`]: rocm_core::extract_first_gfx_token
 fn is_raw_gfx_arch_code(value: &str) -> bool {
     let lower = value.to_ascii_lowercase();
     let Some(rest) = lower.strip_prefix("gfx") else {

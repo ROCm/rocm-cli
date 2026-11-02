@@ -88,7 +88,12 @@ pub(super) fn write_test_runtime_manifest(
     Ok(())
 }
 
-#[test]
-fn test_paths_gives_each_call_its_own_root_even_for_one_label() {
-    crate::test_support::assert_each_call_gets_its_own_root(|| test_paths("same-label").0);
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_paths_gives_each_call_its_own_root_even_for_one_label() {
+        crate::test_support::assert_each_call_gets_its_own_root(|| test_paths("same-label").0);
+    }
 }

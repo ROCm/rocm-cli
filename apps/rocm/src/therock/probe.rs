@@ -64,6 +64,8 @@ fn parse_rocm_sdk_probe(output: &str) -> Result<RocmSdkPythonProbe> {
 /// HIP version loads happily against those libraries and then reports no
 /// devices at all.
 ///
+/// [`validate_rocm_sdk_runtime_probe`]: crate::runtime_registry::validate_rocm_sdk_runtime_probe
+///
 /// Enumeration succeeding is in turn not the same question as the device being
 /// usable. A torch built against a different HIP version can enumerate the
 /// GPUs and then fault on the first kernel it launches, so the two failures are
