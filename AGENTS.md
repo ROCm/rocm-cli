@@ -258,7 +258,7 @@ dash-TUI, in `crates/rocm-dash-tui/src/ui/`:
 - **[`approval.rs`](crates/rocm-dash-tui/src/ui/approval.rs)** — approval-state prompts
 - **[`job_console.rs`](crates/rocm-dash-tui/src/ui/job_console.rs)**'s `draw_job_console`/`on_console_key` — the shared "a job is running" surface (streamed output, status header, Ctrl+C cancels/`q` always closes/Esc-Enter dismiss a finished job); every operational manager already routes through this instead of building its own console
 - **[`spinner.rs`](crates/rocm-dash-tui/src/ui/spinner.rs)**'s `spinner_frame`/`parse_progress_pct` — the braille animation and percentage parsing `job_console.rs` renders with
-- **[`panel.rs`](crates/rocm-dash-tui/src/ui/panel.rs)**'s `bento`/`popup` — bordered, titled panels; prefer these over an inline `Block::default()`
+- **[`panel.rs`](crates/rocm-dash-tui/src/ui/panel.rs)**'s `bento`/`popup` — bordered, titled panels; prefer these over an inline `Block::default()`. Popup geometry and framing live here too: `centered_rect`/`centered_width` size and place a popup, `draw_popup_frame` clears and frames it, and `grey_overlay` dims the backdrop
 - **[`theme.rs`](crates/rocm-dash-tui/src/ui/theme.rs)**'s `job_status_color` — the pattern to follow for any status enum's color (Running/Error/Pending/etc.); route through (or extend) a shared status→color mapping rather than a bespoke inline match per screen
 
 **Two different components are both informally "the spinner"; they are not interchangeable.** The CLI's [`cli_progress.rs`](apps/rocm/src/cli_progress.rs) `Spinner`/`AnimatedSpinner` above is TTY/stderr-gated for a plain terminal and lives in `apps/rocm`. The dash-TUI's [`spinner.rs`](crates/rocm-dash-tui/src/ui/spinner.rs) above is a pure frame/percentage helper rendered through `job_console.rs` inside a ratatui frame loop, and lives in `crates/rocm-dash-tui`. A dash-TUI screen needs the latter.
@@ -324,7 +324,9 @@ on two counts, and both change how you edit it:
   tracks `main` here. When this folder changes on `main`, that workflow opens a
   "Bump `rocm-doctor`" pull request in `amd/skills`, and the change reaches
   `amd/skills` only when that pull request is merged. So edit it here, and never edit
-  the `amd/skills` copy directly — the next bump overwrites it.
+  the `amd/skills` copy directly — the next bump overwrites it. Those bump pull requests are also
+  where the skill is graded; [docs/skill-quality.md](docs/skill-quality.md) says
+  what runs there.
 - **`reference.md` is an e2e fixture.** `tests/e2e-cucumber/features/rocm_doctor_skill.feature`
   parses its closed-catalog table and compares it to what `rocm fix` reports.
   The failure catalog itself is authoritative in `crates/rocm-core/src/fix.rs`
@@ -368,9 +370,11 @@ Two checks gate it, and they cover different things:
   describes the binary, as above.
 
 Neither grades whether the skill actually *fires*. That is skillscope's
-`routing` and `behavioral`, which need an authenticated `claude` CLI and an
-`ANTHROPIC_API_KEY` this repo does not have. The dataset is written and checked
-so those can be switched on without further work.
+`routing` and `behavioral`, which make paid model calls and need a credential
+this repo does not hold, so they do not run here. `amd/skills` grades the skill
+instead. What runs there today, what the figures mean and what they cannot tell
+you is in [docs/skill-quality.md](docs/skill-quality.md), which is the one place
+that is kept current.
 
 `skills/rocm-cli-assistant/` is **not** in scope for skillscope: it is embedded
 verbatim into the chat system prompt with `include_str!`, so the YAML

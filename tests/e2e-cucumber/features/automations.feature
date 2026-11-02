@@ -6,7 +6,8 @@ Feature: Automation watchers
   # per-entry approve/reject controls are gated on "pending"). This feature
   # pins the enable/disable/mode-confirmation slice, the proposal-history
   # listing's unit formatting, the bare listing's tolerance of a torn
-  # audit-log tail, and how the audit log and proposal history are kept
+  # audit-log tail, how the next write repairs one, and how the audit log
+  # and proposal history are kept
   # bounded; the watcher/daemon trigger behaviour itself is covered
   # elsewhere. Config-only (no GPU, no network), so it runs on the mock lane
   # every PR.
@@ -127,3 +128,26 @@ Feature: Automation watchers
     When the user selects a permissions mode
     Then each rotated generation holds what the previous one held
     And the oldest previous generation is gone
+
+  # A write that was cut off leaves a torn last line, and the next append
+  # repairs it by writing a clean copy of the audit log beside it and renaming
+  # that over the original. When the copy cannot be made — a full disk, or on
+  # Windows another program holding the log open without delete sharing — the
+  # repair used to give up: the debris stayed, the CLI warned that it failed to
+  # write the audit event on every command that records one, and the event was
+  # lost. The repair now falls back to cutting the debris in place. A directory
+  # that takes no new files is the same failure without filling a disk, so this
+  # drives it through `rocm config set-permissions`, a command the CLI audits.
+  # The fault is a directory permission, which does not bind root (the
+  # self-hosted WSL2 guest runs the suite as root), so `@requires-dir-permissions`
+  # skips it there rather than let it pass without testing anything. The unit
+  # tests in `automation.rs` cover the other triggers (an injected failure of
+  # each step, and on Windows a handle without delete sharing).
+  @id:automations-torn-audit-tail-repaired-when-log-cannot-be-replaced @requires-os:linux @requires-dir-permissions
+  Scenario: automations-10 - A command still records its audit event when the torn audit log cannot be replaced
+    Given the audit event log ends in a torn, unterminated line
+    And the audit log's directory takes no new files
+    When the user selects a permissions mode
+    Then the CLI confirms the permissions mode
+    And the CLI prints no warning about the audit log
+    And the audit log keeps its earlier record, drops the torn line and records the permissions change

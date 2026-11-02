@@ -115,6 +115,14 @@ jobs:
               - '**/*.rs'
               - '**/Cargo.toml'
               - 'Cargo.lock'
+              # `cargo xtask eval-fixtures --check` compares these recordings with
+              # what the compiled catalog says, and `cargo test -p xtask` runs the
+              # eval hook's own tests. A hand edit to a recording, to the hook, to
+              # its tests or to the dataset must run them, though no *.rs file moved.
+              - 'skills/rocm-doctor/evals/**'
+              # The examination every replayed diagnosis runs over: an edit to it
+              # changes what `eval-fixtures --check` expects.
+              - 'tests/remote-ssh/examination.json'
               - 'rust-toolchain*'
               # clippy runs `cargo xtask manifest --check` against this file;
               # pinned_tool_versions_match_across_docs_and_workflows (xtask)
@@ -1179,6 +1187,10 @@ jobs:
         if: needs.changes.outputs.rust == 'true'
         run: cargo xtask catalog --check
 
+      - name: Recorded rocm output the skill evals replay is current
+        if: needs.changes.outputs.rust == 'true'
+        run: cargo xtask eval-fixtures --check
+
       # Surface the cache hit rate for the clippy compile so the effect is visible
       # in the logs, on the local-only path too — see build-and-test for why this
       # is gated on sccache being present rather than on the remote backend being
@@ -1332,12 +1344,11 @@ jobs:
   # into a renamed file is not cosmetic here, because the agent follows it,
   # finds nothing, and improvises.
   #
-  # `routing` and `behavioral` are deliberately NOT run: both need an
-  # authenticated `claude` CLI and an ANTHROPIC_API_KEY, and this repo has no
-  # such secret. Turning them on is a caller change to skillscope's
-  # `skill-evals.yml` reusable workflow once one exists — they are the half of
-  # the question that asks whether the skill actually fires, so this job is not
-  # a substitute for them.
+  # `routing` and `behavioral` are deliberately NOT run here: they make paid
+  # model calls and need a credential this repo does not hold. amd/skills
+  # grades this skill instead (docs/skill-quality.md says what that covers).
+  # They are the half of the question that asks whether the skill actually
+  # fires, so this job is not a substitute for them.
   #
   # skills/rocm-cli-assistant/ is deliberately out of scope. Despite its path it
   # is not a published skill: apps/rocm/src/main.rs embeds it verbatim into the

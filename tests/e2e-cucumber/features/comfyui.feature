@@ -61,7 +61,7 @@ Feature: ComfyUI install reports progress, makes failures actionable and preserv
   # (`apps/rocm/src/dash_seam.rs`, which replays a real refusing subprocess), and
   # that such an envelope is then collapsed out of the chat, by
   # `approved_command_failure_stays_a_collapsed_envelope`
-  # (`crates/rocm-dash-tui/src/app/mod.rs`). The reasoning is written out at the
+  # (`crates/rocm-dash-tui/src/app/tool_approval.rs`). The reasoning is written out at the
   # seam that decides it (`execute_approved` in `apps/rocm/src/dash_seam.rs`).
   #
   # No GPU is needed: runtime readiness is filesystem + manifest state, so the
