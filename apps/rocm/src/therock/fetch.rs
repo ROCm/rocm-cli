@@ -6,7 +6,7 @@
 //! etag cache and detached-signature verification, the streaming artifact
 //! download, and the size and free-space preflight for the tarball.
 //!
-//! Owns the pinned metadata trust root (`PINNED_METADATA_PUBLIC_KEY_PEM`),
+//! Owns the pinned metadata trust root,
 //! which `cargo xtask verify-pinned-keys` checks against the canonical
 //! published key. Depends on the sibling `io` module for atomic writes and on
 //! `slugify` in the parent for cache file names.
