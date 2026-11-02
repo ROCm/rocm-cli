@@ -15,7 +15,7 @@
 
 use anyhow::{Context, Result, bail};
 use rocm_core::{
-    AppPaths, normalize_runtime_path_for_host, normalize_runtime_path_for_storage,
+    AppPaths, RocmCliConfig, normalize_runtime_path_for_host, normalize_runtime_path_for_storage,
     normalize_runtime_path_text_for_host, normalize_runtime_path_text_for_storage,
 };
 use serde::{Deserialize, Serialize};
@@ -456,9 +456,191 @@ fn probe_has_resolved_library(probe: &RocmSdkPythonProbe, shortname: &str) -> bo
     })
 }
 
+pub(crate) fn current_runtime_manifest<'a>(
+    config: &RocmCliConfig,
+    manifests: &'a [InstalledRuntimeManifest],
+) -> Option<&'a InstalledRuntimeManifest> {
+    if let Some(active_key) = config.active_runtime_key.as_deref()
+        && let Some(manifest) = manifests
+            .iter()
+            .find(|manifest| manifest.runtime_key.eq_ignore_ascii_case(active_key))
+    {
+        return Some(manifest);
+    }
+
+    let matches = default_runtime_id_matches(config, manifests);
+    match matches.as_slice() {
+        [manifest] => Some(*manifest),
+        _ => None,
+    }
+}
+
+pub(crate) fn default_runtime_id_matches<'a>(
+    config: &RocmCliConfig,
+    manifests: &'a [InstalledRuntimeManifest],
+) -> Vec<&'a InstalledRuntimeManifest> {
+    let Some(default_runtime_id) = config.default_runtime_id.as_deref() else {
+        return Vec::new();
+    };
+    manifests
+        .iter()
+        .filter(|manifest| manifest.runtime_id.eq_ignore_ascii_case(default_runtime_id))
+        .collect()
+}
+
+pub(crate) fn runtime_keys_text(manifests: &[&InstalledRuntimeManifest]) -> String {
+    manifests
+        .iter()
+        .map(|manifest| manifest.runtime_key.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Resolves a user-typed selector to the one installed runtime it names.
+///
+/// Matching a `runtime_key` regardless of letter case is a deliberate
+/// convenience, but it only names one runtime while no two installed keys
+/// differ just in case — and they can. Generated keys are slugified to lower
+/// case, while `runtimes adopt --runtime-key` takes the key the user typed and
+/// `runtimes import` takes it from the supplied manifest; neither slugifies,
+/// so the key is stored verbatim. The registry keeps one file per key, so
+/// `ABC.json` and `abc.json` are two entries on a case-sensitive filesystem
+/// and nothing rejects the pair.
+///
+/// So an exact key match is taken first and wins outright: it is the one
+/// reading of the selector that cannot be mistaken. The case-insensitive
+/// fallback applies only when it lands on a single record; two case twins are
+/// reported as the ambiguity they are, the same way a `runtime_id` naming
+/// several installs already is.
+///
+/// Callers rely on that being a function of the key alone, because several of
+/// them resolve the same key more than once and must land on the same record
+/// every time: `storage remove-old-installs` decides about a manifest and then
+/// names it to the deleter by key, and the uninstall revalidation re-derives
+/// its plan from disk after the confirmation prompt. Resolving by "newest
+/// case-insensitive match" made that decide about one install and act on
+/// another.
+pub(crate) fn select_runtime_manifest<'a>(
+    manifests: &'a [InstalledRuntimeManifest],
+    selector: &str,
+) -> Result<&'a InstalledRuntimeManifest> {
+    let selector = selector.trim();
+    if selector.is_empty() {
+        bail!("runtime selector must not be empty");
+    }
+
+    if let Some(manifest) = manifests
+        .iter()
+        .find(|manifest| manifest.runtime_key == selector)
+    {
+        return Ok(manifest);
+    }
+
+    let key_matches = manifests
+        .iter()
+        .filter(|manifest| manifest.runtime_key.eq_ignore_ascii_case(selector))
+        .collect::<Vec<_>>();
+    match key_matches.as_slice() {
+        [manifest] => return Ok(manifest),
+        [] => {}
+        _ => bail!(
+            "runtime selector `{selector}` matches several installed runtime keys that differ only in letter case; name one of them exactly: {}",
+            runtime_keys_text(&key_matches)
+        ),
+    }
+
+    let id_matches = manifests
+        .iter()
+        .filter(|manifest| manifest.runtime_id.eq_ignore_ascii_case(selector))
+        .collect::<Vec<_>>();
+    match id_matches.as_slice() {
+        [manifest] => Ok(manifest),
+        [] => bail!("installed runtime not found: {selector}"),
+        _ => bail!(
+            "runtime selector `{selector}` matches multiple installed runtimes; activate one by runtime_key: {}",
+            runtime_keys_text(&id_matches)
+        ),
+    }
+}
+
+pub(crate) fn runtime_usability_status(manifest: &InstalledRuntimeManifest) -> String {
+    match validate_runtime_manifest_for_activation(manifest) {
+        Ok(()) => "ready".to_owned(),
+        Err(error) => format!("unusable ({error})"),
+    }
+}
+
+pub(crate) fn validate_runtime_manifest_for_activation(
+    manifest: &InstalledRuntimeManifest,
+) -> Result<()> {
+    if manifest.runtime_key.trim().is_empty() {
+        bail!("manifest runtime_key is empty");
+    }
+    if manifest.runtime_id.trim().is_empty() {
+        bail!("manifest runtime_id is empty");
+    }
+    if !manifest.install_root.is_dir() {
+        bail!(
+            "install root is missing: {}",
+            manifest.install_root.display()
+        );
+    }
+    let local_manifest = manifest.install_root.join(".rocm-cli-runtime.json");
+    if !manifest.read_only && !local_manifest.is_file() {
+        bail!(
+            "local runtime manifest is missing: {}",
+            local_manifest.display()
+        );
+    }
+
+    match manifest.format.as_str() {
+        "wheel" => validate_wheel_runtime_manifest(manifest),
+        "tarball" => validate_tarball_runtime_manifest(manifest),
+        other => bail!("unsupported runtime format in manifest: {other}"),
+    }
+}
+
+fn validate_wheel_runtime_manifest(manifest: &InstalledRuntimeManifest) -> Result<()> {
+    let python_executable = manifest
+        .python_executable
+        .as_deref()
+        .context("pip runtime manifest is missing python_executable")?;
+    if !Path::new(python_executable).is_file() {
+        bail!("runtime Python executable is missing: {python_executable}");
+    }
+    let probe = manifest
+        .rocm_sdk
+        .as_ref()
+        .context("pip runtime manifest is missing rocm_sdk probe data")?;
+    validate_rocm_sdk_runtime_probe(probe)?;
+    Ok(())
+}
+
+fn validate_tarball_runtime_manifest(manifest: &InstalledRuntimeManifest) -> Result<()> {
+    if runtime_install_root_has_payload(&manifest.install_root)? {
+        Ok(())
+    } else {
+        bail!(
+            "tarball runtime install root has no payload files: {}",
+            manifest.install_root.display()
+        )
+    }
+}
+
+fn runtime_install_root_has_payload(path: &Path) -> Result<bool> {
+    for entry in fs::read_dir(path).with_context(|| format!("failed to read {}", path.display()))? {
+        let entry = entry?;
+        if !entry.file_name().to_string_lossy().starts_with('.') {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::write_test_pip_runtime;
 
     fn test_paths(name: &str) -> (PathBuf, AppPaths) {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -644,5 +826,70 @@ mod tests {
             "update planning must recover the installed target without probing the current host"
         );
         assert_eq!(wheel_composition_device_target(None), None);
+    }
+
+    /// Matching a key regardless of case is a convenience for a user who typed
+    /// the wrong one; it must not quietly pick between two installs whose keys
+    /// differ only in case. `runtimes adopt --runtime-key` stores the key
+    /// verbatim while generated keys are lower-cased, so such a pair is
+    /// reachable, and a caller that resolves the same key twice — prune decides
+    /// about a manifest and then names it to the deleter by key — has to get
+    /// the same install both times.
+    ///
+    /// No registry is involved here: the manifests are handed straight to the
+    /// resolver, so this holds on every platform even though only a
+    /// case-sensitive filesystem can store such a pair.
+    #[test]
+    fn runtime_selector_prefers_the_exact_key_over_a_case_twin() -> Result<()> {
+        let (root, paths) = test_paths("runtime-case-twin");
+        let base = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-7-13-0",
+            "therock-release:gfx120X-all",
+            "7.13.0",
+            20,
+        )?;
+        // Newest first, as `load_runtime_manifests` hands them over. The
+        // adopted twin is stamped with the moment it was adopted, so it leads.
+        let manifests = vec![
+            InstalledRuntimeManifest {
+                runtime_key: "RELEASE-PIP-GFX120X-ALL-7-13-0".to_owned(),
+                installed_at_unix_ms: 99,
+                read_only: true,
+                ..base.clone()
+            },
+            base.clone(),
+        ];
+
+        let exact = select_runtime_manifest(&manifests, &base.runtime_key)?;
+        assert_eq!(
+            exact.runtime_key, base.runtime_key,
+            "the key as stored resolves to its own record, not to the newer twin"
+        );
+        let twin = select_runtime_manifest(&manifests, "RELEASE-PIP-GFX120X-ALL-7-13-0")?;
+        assert_eq!(twin.runtime_key, "RELEASE-PIP-GFX120X-ALL-7-13-0");
+
+        // Neither key matches exactly, so the selector genuinely names both.
+        // Reported as the ambiguity it is, like a runtime_id naming several.
+        let error = select_runtime_manifest(&manifests, "Release-Pip-Gfx120X-All-7-13-0")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("differ only in letter case"),
+            "an ambiguous selector must be refused, not silently resolved: {error}"
+        );
+        assert!(error.contains("release-pip-gfx120x-all-7-13-0"));
+        assert!(error.contains("RELEASE-PIP-GFX120X-ALL-7-13-0"));
+
+        // The convenience itself is untouched: with one candidate, any casing
+        // still resolves.
+        let only = vec![base.clone()];
+        assert_eq!(
+            select_runtime_manifest(&only, "Release-Pip-Gfx120X-All-7-13-0")?.runtime_key,
+            base.runtime_key
+        );
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
     }
 }

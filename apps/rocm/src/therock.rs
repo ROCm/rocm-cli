@@ -2185,11 +2185,12 @@ fn active_default_runtime_relation(
 ) -> Result<Option<String>> {
     let (manifests, unparsed) = load_runtime_manifests_reporting_unparsed(paths)?;
     let config = RocmCliConfig::load(paths)?;
-    let Some(active) = crate::current_runtime_manifest(&config, &manifests) else {
+    let Some(active) = crate::runtime_registry::current_runtime_manifest(&config, &manifests)
+    else {
         return Ok(unresolved_active_default_relation_text(
             config.active_runtime_key.as_deref(),
             config.default_runtime_id.as_deref(),
-            crate::default_runtime_id_matches(&config, &manifests).len(),
+            crate::runtime_registry::default_runtime_id_matches(&config, &manifests).len(),
             &unparsed,
         ));
     };
