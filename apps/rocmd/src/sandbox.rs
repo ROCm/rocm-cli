@@ -6,7 +6,7 @@ use crate::common;
 use crate::persistence::load_managed_services;
 use crate::sandbox_tool::{SandboxToolArg, SandboxToolPolicy};
 use crate::service::{stop_managed_service, stop_report_confirmed};
-use crate::watchers::restart_managed_service;
+use crate::supervise::restart_managed_service;
 use anyhow::{Context, Result, bail};
 use rocm_core::{
     AppPaths, AuditEventRecord, CommandCapture, ExamineSummary, ModelRecipeArtifactRecord,
