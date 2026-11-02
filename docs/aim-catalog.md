@@ -29,15 +29,15 @@ flagged.
 The owner of the AIM relationship (likely the AMD EAI team) does this; it does
 not need a rocm-cli maintainer.
 
-1. Watch for AMD Enterprise AI Suite releases. A version bump is the practical
-   signal that AIM images were added or changed.
+1. Watch for new AIM releases. A version bump is the practical signal that AIM
+   images were added or changed.
 2. For each AIM entry, find the newest stable tag
    (`oras repo tags docker.io/amdenterpriseai/<image>`) and copy its digest
    (`oras resolve docker.io/amdenterpriseai/<image>:<tag>`) into `image_digest` (and `model_id_override` if the tag moved).
    Check each `profile_ids` entry is still a valid profile.
 3. Set `generated_at_unix_ms` to now (`date +%s%3N`).
 4. Add entries for new AIM images the same way as the existing ones. The list
-   of images is the AMD Enterprise AI AIM catalog
+   of images is the AMD Inference Microservices (AIM) catalog
    (<https://enterprise-ai.docs.amd.com/en/latest/aims/catalog/models.html>).
    CPU-only (`aim-epyc-*`) images are left out, since rocm-cli never falls back
    to CPU, as are non-chat images (speech, video, bio) until the serve path

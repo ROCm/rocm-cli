@@ -491,6 +491,12 @@ rocm update --json")]
         command: EnginesCommand,
     },
     /// Show recommended local models and what this machine can run.
+    ///
+    /// The default list is the curated recommendations. The AMD Inference Microservices
+    /// (AIM) catalog of pre-built Docker images is not part of it: use --verbose to see
+    /// every AIM image with the GPU families it supports, how many GPUs it needs, and
+    /// whether it requires a Hugging Face token. Serve one with
+    /// `rocm serve <model> --engine aim` (needs a reachable Docker daemon).
     #[command(
         alias = "models",
         after_help = "EXAMPLES:\n  \
@@ -2717,7 +2723,7 @@ const fn builtin_engine_inventory() -> &'static [(&'static str, &'static str)] {
         ),
         (
             "aim",
-            "AMD Enterprise AI pre-built Docker serving containers",
+            "AMD Inference Microservices (AIM) pre-built Docker serving containers",
         ),
     ]
 }
@@ -5070,7 +5076,7 @@ pub(crate) const fn engine_inventory() -> &'static [(&'static str, &'static str)
         ),
         (
             "aim",
-            "AMD Enterprise AI pre-built Docker serving containers",
+            "AMD Inference Microservices (AIM) pre-built Docker serving containers",
         ),
     ]
 }

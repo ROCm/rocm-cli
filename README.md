@@ -821,9 +821,13 @@ rocm model [--verbose]
 `rocm model` (alias `rocm models`) lists the recommended local models, grouped by
 the hardware they target. Pass `--verbose` to list every recipe, including ones
 hidden from the default list, with details such as aliases, data type, minimum
-GPU memory, and preferred engines. AIM entries are hand-maintained and record
-when they were last verified; `rocm model --verbose` warns when one is over 180
-days old (see `docs/aim-catalog.md`).
+GPU memory, and preferred engines. The AMD Inference Microservices (AIM) Docker
+images are among the hidden recipes: `--verbose` shows each one's supported GPU
+families, GPU count, and whether it needs a Hugging Face token, and
+`rocm serve <model> --engine aim` runs it (needs a reachable Docker daemon).
+AIM entries are hand-maintained and record when they were last verified;
+`rocm model --verbose` warns when one is over 180 days old (see
+`docs/aim-catalog.md`).
 
 ### Model serving
 
