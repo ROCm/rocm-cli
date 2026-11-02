@@ -21,6 +21,7 @@ mod install;
 mod process;
 mod repair;
 mod runtime;
+mod startup_diagnostics;
 mod state;
 mod wheel_builds;
 
