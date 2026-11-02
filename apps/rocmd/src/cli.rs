@@ -182,7 +182,7 @@ async fn run_cli(cli: Cli) -> Result<()> {
             device_policy,
             gpu,
             engine_recipe_json,
-        } => crate::service::supervise_service(
+        } => crate::supervise::supervise_service(
             &paths,
             service_id,
             engine,

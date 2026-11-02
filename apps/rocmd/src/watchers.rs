@@ -1539,7 +1539,7 @@ pub(crate) fn restart_managed_service(
         // Not a write-back of `record`: a stop issued since the spawn has
         // persisted its marker, and a `failed` record without one is what
         // recovery restarts. Same discipline as the supervisor's own writes.
-        crate::service::update_supervised_record(paths, record, |current| {
+        crate::supervise::update_supervised_record(paths, record, |current| {
             current.status = "failed".to_owned();
         })?;
         anyhow::bail!(
@@ -1573,7 +1573,7 @@ fn record_spawned_supervisor(
     record.record_supervisor_identity(pid);
     let (supervisor_pid, supervisor_start_ticks) =
         (record.supervisor_pid, record.supervisor_start_ticks);
-    crate::service::update_supervised_record(paths, &unrecorded, |current| {
+    crate::supervise::update_supervised_record(paths, &unrecorded, |current| {
         current.supervisor_pid = supervisor_pid;
         current.supervisor_start_ticks = supervisor_start_ticks;
     })

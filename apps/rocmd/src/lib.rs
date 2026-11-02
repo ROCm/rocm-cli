@@ -11,6 +11,7 @@ mod persistence;
 mod sandbox;
 mod sandbox_tool;
 mod service;
+mod supervise;
 #[cfg(test)]
 mod test_support;
 mod watchers;
