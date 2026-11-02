@@ -3748,6 +3748,7 @@ dependencies = [
  "csv",
  "regex",
  "reqwest 0.12.28",
+ "rocm-core",
  "rocm-dash-core",
  "serde",
  "serde_json",
