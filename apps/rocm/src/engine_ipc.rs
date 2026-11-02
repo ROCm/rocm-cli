@@ -342,6 +342,23 @@ pub(crate) fn fetch_service_device(
 /// couple of healthy engines answer (`engines/lemonade`'s endpoint probe is
 /// the slowest at `rocm_core::INFERENCE_PROBE_TIMEOUT`, 8s worst case, and
 /// only on a miss) while still bounding the whole render.
+///
+/// **Worst-case wall time for `rocm services list` is this budget plus one
+/// in-flight probe, i.e. ~18s** with the built-in engines, not 10s. The budget
+/// is a *start* gate: it is tested before each probe, never inside one, so a
+/// probe begun at 9.99s still runs to its own timeout. The arithmetic is 10s
+/// of elapsed budget plus Lemonade's 8s `INFERENCE_PROBE_TIMEOUT`. That bound
+/// applies equally to the chat `services` tool, which renders through the same
+/// [`crate::services_text::render_services_text`].
+///
+/// Why not a per-probe deadline that would hold the total at 10s: the probe is
+/// `engine_request`, which for a built-in engine is a synchronous in-process
+/// call and for an external plugin is a `wait()` on a spawned child. Neither
+/// can be cancelled from here without either a thread per probe (ruled out by
+/// the process-wide env/mutex scoping `fetch_service_devices` documents) or a
+/// kill path for a child mid-RPC. Both are larger changes than the row is
+/// worth; the start gate is what keeps the cost flat in the number of
+/// services, which is the growth that actually matters.
 pub(crate) const SERVICE_DEVICE_PROBE_BUDGET: Duration = Duration::from_secs(10);
 
 /// Devices for several services at once, keyed by service id, under one shared
@@ -361,7 +378,9 @@ pub(crate) const SERVICE_DEVICE_PROBE_BUDGET: Duration = Duration::from_secs(10)
 /// The budget is checked between probes, not inside one: a single external
 /// plugin that never exits still blocks, because `engine_request` waits on its
 /// child unbounded. That is the pre-existing behavior of every engine call
-/// site in the CLI and is not made worse here.
+/// site in the CLI and is not made worse here. See
+/// [`SERVICE_DEVICE_PROBE_BUDGET`] for what that makes the worst-case wall
+/// time of a `rocm services list`.
 pub(crate) fn fetch_service_devices<'a, I>(
     paths: &AppPaths,
     services: I,
@@ -370,12 +389,40 @@ where
     I: IntoIterator<Item = (&'a str, &'a str)>,
 {
     let started = Instant::now();
+    collect_service_devices(
+        services,
+        || started.elapsed(),
+        |service_id, engine| fetch_service_device(paths, engine, service_id),
+    )
+}
+
+/// The budget loop of [`fetch_service_devices`], with the clock and the probe
+/// injected.
+///
+/// Split out so the budget-exhausted exit has a test. In the real function the
+/// clock is `Instant::elapsed` and the probe is a live engine RPC, so covering
+/// that branch would otherwise mean making a test wait out
+/// [`SERVICE_DEVICE_PROBE_BUDGET`] against real engines — which is both slow
+/// and exactly the timing-dependent shape that flakes. What the branch has to
+/// guarantee is not just that later services lack a `device:` row but that
+/// they were never *probed*, since the whole point is to stop paying; only an
+/// injected probe can observe that.
+fn collect_service_devices<'a, I, C, P>(
+    services: I,
+    mut elapsed: C,
+    mut probe: P,
+) -> std::collections::HashMap<String, String>
+where
+    I: IntoIterator<Item = (&'a str, &'a str)>,
+    C: FnMut() -> Duration,
+    P: FnMut(&str, &str) -> Option<String>,
+{
     let mut devices = std::collections::HashMap::new();
     for (service_id, engine) in services {
-        if started.elapsed() >= SERVICE_DEVICE_PROBE_BUDGET {
+        if elapsed() >= SERVICE_DEVICE_PROBE_BUDGET {
             break;
         }
-        if let Some(device) = fetch_service_device(paths, engine, service_id) {
+        if let Some(device) = probe(service_id, engine) {
             devices.insert(service_id.to_owned(), device);
         }
     }
@@ -600,6 +647,99 @@ mod tests {
 
     use super::*;
     use crate::tests::test_paths;
+
+    /// Every service inside the budget is probed and reported.
+    #[test]
+    fn service_device_probes_run_while_the_budget_holds() {
+        let mut probed = Vec::new();
+        let devices = collect_service_devices(
+            [("svc-a", "lemonade"), ("svc-b", "vllm")],
+            || Duration::ZERO,
+            |service_id, engine| {
+                probed.push(service_id.to_owned());
+                Some(format!("{engine}-device"))
+            },
+        );
+
+        assert_eq!(probed, ["svc-a", "svc-b"]);
+        assert_eq!(
+            devices.get("svc-a").map(String::as_str),
+            Some("lemonade-device")
+        );
+        assert_eq!(
+            devices.get("svc-b").map(String::as_str),
+            Some("vllm-device")
+        );
+    }
+
+    /// Once [`SERVICE_DEVICE_PROBE_BUDGET`] is spent the remaining services are
+    /// *not probed at all*, and what was already learned is still rendered.
+    ///
+    /// This is the branch that keeps `rocm services list` — and the chat
+    /// `services` tool, which renders through the same
+    /// `render_services_text` — from scaling its wall time with the number of
+    /// services. Dropping the later rows is only half of it; the point is to
+    /// stop paying for them, so the probe counter below is the real assertion.
+    /// Asserting it against the live clock and live engines would mean a test
+    /// that waits out ten real seconds, which is why the loop takes both
+    /// injected.
+    #[test]
+    fn service_device_probes_stop_once_the_budget_is_exhausted() {
+        let mut probed = Vec::new();
+        // Inside the budget for the first service, over it from then on.
+        let mut tick = 0;
+        let devices = collect_service_devices(
+            [
+                ("svc-fast", "lemonade"),
+                ("svc-hung", "vllm"),
+                ("svc-never-reached", "aim"),
+            ],
+            || {
+                tick += 1;
+                if tick <= 1 {
+                    Duration::ZERO
+                } else {
+                    SERVICE_DEVICE_PROBE_BUDGET
+                }
+            },
+            |service_id, _engine| {
+                probed.push(service_id.to_owned());
+                Some("rocm gpu 0".to_owned())
+            },
+        );
+
+        assert_eq!(
+            probed,
+            ["svc-fast"],
+            "the budget must stop further probing, not merely hide its results"
+        );
+        assert_eq!(
+            devices.get("svc-fast").map(String::as_str),
+            Some("rocm gpu 0"),
+            "what was learned before the budget ran out is still reported"
+        );
+        assert!(
+            !devices.contains_key("svc-hung") && !devices.contains_key("svc-never-reached"),
+            "an unprobed service must get no `device:` row: {devices:?}"
+        );
+    }
+
+    /// A service whose engine cannot answer costs its own probe and nothing
+    /// more: it is skipped, and the services after it are still probed.
+    #[test]
+    fn a_service_whose_probe_fails_does_not_suppress_the_rest() {
+        let devices = collect_service_devices(
+            [("svc-quiet", "lemonade"), ("svc-ok", "vllm")],
+            || Duration::ZERO,
+            |service_id, _engine| (service_id == "svc-ok").then(|| "rocm gpu 1".to_owned()),
+        );
+
+        assert!(!devices.contains_key("svc-quiet"), "{devices:?}");
+        assert_eq!(
+            devices.get("svc-ok").map(String::as_str),
+            Some("rocm gpu 1")
+        );
+    }
 
     #[test]
     fn engine_plugin_discovery_finds_runtime_binary() -> Result<()> {

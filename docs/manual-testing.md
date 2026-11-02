@@ -285,14 +285,15 @@ Expected result:
 
 - The engine uses ROCm GPU execution. The deployment summary's `device:` row
   reports what the engine actually selected, so check it by reading that row
-  rather than inferring it from the absence of a fallback warning: expect
-  `rocm gpu <n>`, or a bare `rocm gpu` when the launch pinned no ordinal (no
-  `--gpu`, nothing recorded in the engine's `gpu_indices`). `rocm services`
-  shows the same `device` while it runs. Every engine reports this row in the
-  same `<backend> gpu [<n>]` shape, so the first word is the half that decides
-  this check.
-- The run does not fall back to CPU or Vulkan — a `device:` of `vulkan gpu <n>`
-  fails this check even though the serve itself succeeds.
+  rather than inferring it from the absence of a fallback warning. Every engine
+  reports it in the same `<backend> [gpu <n>] [(<gpu name>)]` shape — so expect
+  something like `rocm gpu 0 (AMD Instinct MI300X)`, with the ordinal omitted
+  when the launch pinned none (no `--gpu`, nothing recorded in the engine's
+  `gpu_indices`) and the name omitted when the host probe could not read one.
+  `rocm services` shows the same `device` while it runs. The first word is the
+  half that decides this check.
+- The run does not fall back to CPU or Vulkan — a `device:` whose first word is
+  `vulkan` fails this check even though the serve itself succeeds.
 - If the GPU cannot be used, the command fails with a clear error.
 - The OpenAI-compatible endpoint answers a simple chat request.
 

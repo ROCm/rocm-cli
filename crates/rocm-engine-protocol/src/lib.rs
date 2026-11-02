@@ -566,6 +566,51 @@ pub struct LaunchResponse {
     pub state_path: String,
 }
 
+/// The [`HealthcheckResponse::device`] string, in the one shape every engine
+/// reports and the `device:` row of `rocm serve` / `rocm services list` prints
+/// verbatim.
+///
+/// ROCMAI-550 asks those two surfaces for "the llama.cpp backend actually
+/// chosen (`vulkan`/`rocm`) **and the device name**", so both halves are named
+/// arguments here rather than text each engine formats for itself:
+///
+/// | backend | ordinal | name | rendered |
+/// | --- | --- | --- | --- |
+/// | `vulkan` | `Some(0)` | `Some("AMD Radeon Graphics")` | `vulkan gpu 0 (AMD Radeon Graphics)` |
+/// | `vulkan` | `Some(0)` | `None` | `vulkan gpu 0` |
+/// | `vulkan` | `None` | `Some("AMD Radeon Graphics")` | `vulkan (AMD Radeon Graphics)` |
+/// | `vulkan` | `None` | `None` | `vulkan` |
+///
+/// The last row deliberately drops the `gpu` noun rather than printing a
+/// dangling `vulkan gpu`. That bare form is not hypothetical: it is what the
+/// ticket's own host produces. `gpu_indices` comes from
+/// `engines/lemonade`'s `resolve_serve_gpu_indices`, whose probe
+/// (`rocm_core::usable_amd_gpu_indices`) returns `None` off Linux, so a default
+/// `rocm serve` on Windows pins no ordinal and records an empty list — and
+/// Windows on a gfx90c Vega iGPU is exactly the machine ROCMAI-550 was filed
+/// from. `device: vulkan gpu` would answer "which GPU?" with the word "gpu".
+///
+/// The name is whatever the engine recorded for the host at launch; it is not
+/// per-ordinal. On a multi-GPU host the ordinal is the precise half and the
+/// name is context, which is why the ordinal is never dropped in favour of it.
+#[must_use]
+pub fn format_reported_device(
+    backend: &str,
+    gpu_index: Option<u32>,
+    gpu_name: Option<&str>,
+) -> String {
+    use std::fmt::Write as _;
+
+    let mut device = backend.to_owned();
+    if let Some(index) = gpu_index {
+        let _ = write!(device, " gpu {index}");
+    }
+    if let Some(name) = gpu_name.map(str::trim).filter(|name| !name.is_empty()) {
+        let _ = write!(device, " ({name})");
+    }
+    device
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthcheckResponse {
     /// Engine-reported service state. `ready` is reserved for a service that has
@@ -646,6 +691,55 @@ pub struct LogsResponse {
 
 #[cfg(test)]
 mod tests {
+    /// The `device:` row has to carry a device, not the word "gpu".
+    ///
+    /// The ordinal-less case is the one ROCMAI-550 was filed about: on Windows
+    /// `rocm_core::usable_amd_gpu_indices` cannot probe, so a default
+    /// `rocm serve` records an empty `gpu_indices` and the old formatting
+    /// rendered a bare `vulkan gpu`. The name is what makes that row answer the
+    /// question; with neither, the noun goes too rather than dangling.
+    #[test]
+    fn reported_device_never_renders_a_dangling_gpu_noun() {
+        assert_eq!(
+            super::format_reported_device("vulkan", Some(0), Some("AMD Radeon Graphics")),
+            "vulkan gpu 0 (AMD Radeon Graphics)"
+        );
+        assert_eq!(
+            super::format_reported_device("vulkan", None, Some("AMD Radeon Graphics")),
+            "vulkan (AMD Radeon Graphics)"
+        );
+        assert_eq!(
+            super::format_reported_device("rocm", Some(1), None),
+            "rocm gpu 1"
+        );
+        // The regression this exists to stop: nothing known beyond the backend
+        // must not be padded out with a noun that names no device.
+        assert_eq!(
+            super::format_reported_device("vulkan", None, None),
+            "vulkan"
+        );
+    }
+
+    /// A name the host probe could not fill in arrives as `Some("")` or
+    /// `Some("  ")` just as easily as `None` (the Windows display-adapter probe
+    /// and the Linux DRM read both build it from scraped text), and
+    /// `vulkan ()` is worse than no parenthetical at all.
+    #[test]
+    fn reported_device_treats_a_blank_gpu_name_as_absent() {
+        assert_eq!(
+            super::format_reported_device("vulkan", Some(0), Some("")),
+            "vulkan gpu 0"
+        );
+        assert_eq!(
+            super::format_reported_device("vulkan", None, Some("   ")),
+            "vulkan"
+        );
+        assert_eq!(
+            super::format_reported_device("rocm", Some(2), Some("  MI300X  ")),
+            "rocm gpu 2 (MI300X)"
+        );
+    }
+
     fn resolve_response(served: Option<&str>) -> ResolveModelResponse {
         ResolveModelResponse {
             canonical_model_id: "image:tag".to_owned(),

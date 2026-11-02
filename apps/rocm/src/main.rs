@@ -2745,6 +2745,15 @@ fn engine_inventory_note(
 /// claims no backend and names the command that can answer. A new
 /// `GpuSupportLevel` variant now has to be classified here rather than
 /// silently inheriting the ROCm claim.
+///
+/// What the `Unknown` arm promises is bounded by what the named command
+/// delivers. It used to say `rocm examine` would show "which llama.cpp backend
+/// this GPU uses", and examine showed no such thing — it printed a
+/// `rocm_support` line only for `VulkanOnly`, so on exactly the hosts that got
+/// this note it printed nothing at all. `ExamineSummary::rocm_support_line`
+/// now answers for every level, and this says what that answer is: the support
+/// level, not the backend. The backend is settled by launching one, which that
+/// line in turn points at.
 const fn lemonade_engine_note(level: rocm_core::GpuSupportLevel) -> &'static str {
     match level {
         rocm_core::GpuSupportLevel::VulkanOnly => {
@@ -2754,7 +2763,7 @@ const fn lemonade_engine_note(level: rocm_core::GpuSupportLevel) -> &'static str
             "default embedded Lemonade server with ROCm llama.cpp backend"
         }
         rocm_core::GpuSupportLevel::Unknown => {
-            "default embedded Lemonade server; run `rocm examine` to see which llama.cpp backend this GPU uses"
+            "default embedded Lemonade server; run `rocm examine` for this host's GPU support level, which says how to find the backend"
         }
     }
 }

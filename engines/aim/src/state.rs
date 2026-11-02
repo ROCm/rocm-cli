@@ -33,16 +33,9 @@ pub(crate) fn healthcheck_service(request: HealthcheckRequest) -> Result<Healthc
         .as_ref()
         .and_then(|s| value_string(s, "status"))
         .unwrap_or_else(|| "unknown".to_owned());
-    // `"{backend} gpu"`, the shape `engines/lemonade` and `engines/vllm` report,
-    // because `rocm serve`'s `device:` row and `rocm services list` print
-    // whichever engine answered verbatim and must not change format per engine.
-    // No ordinal: unlike the other two this state file records no `gpu_indices`
-    // (the container gets the device list, see `docker::RunSpec`), so claiming
-    // one would be inventing it.
-    let device = if state.is_some() {
-        "rocm gpu"
-    } else {
-        "unknown"
+    let device = match state.as_ref() {
+        Some(state) => reported_device(state),
+        None => "unknown".to_owned(),
     };
 
     let listed = !endpoint_url.is_empty()
@@ -56,8 +49,28 @@ pub(crate) fn healthcheck_service(request: HealthcheckRequest) -> Result<Healthc
         listed,
         ready,
         &state_status,
-        device,
+        &device,
     ))
+}
+
+/// The device string reported once state exists for the service.
+///
+/// AIM only ever runs on ROCm, so the backend half is fixed, and the shape is
+/// whatever [`rocm_engine_protocol::format_reported_device`] renders — the same
+/// one `engines/lemonade` and `engines/vllm` use, because `rocm serve`'s
+/// `device:` row and `rocm services list` print whichever engine answered
+/// verbatim and must not change format per engine.
+///
+/// No ordinal: unlike the other two this state file records no `gpu_indices`
+/// (the container gets the device list, see `docker::RunSpec`), so claiming one
+/// would be inventing it. That is exactly why the name matters here — without
+/// it this engine's row would be the bare backend on every host.
+fn reported_device(state: &Value) -> String {
+    rocm_engine_protocol::format_reported_device(
+        "rocm",
+        None,
+        value_string(state, "gpu_name").as_deref(),
+    )
 }
 
 pub(crate) fn endpoint_response(request: EndpointRequest) -> Result<EndpointResponse> {
@@ -139,6 +152,13 @@ pub(crate) fn write_running_state(
             "port": port,
             "endpoint_url": endpoint,
             "device_policy": device_policy,
+            // The host's GPU name, so the `device:` row names a device and not
+            // only a backend (ROCMAI-550). This engine records no GPU ordinal,
+            // so without it its row would be the bare word `rocm` on every
+            // host. Captured once here rather than probed per healthcheck:
+            // `rocm services list` healthchecks every ready service on its
+            // render path.
+            "gpu_name": rocm_core::detect_host_gpu_summary(None).name,
             "engine_recipe": engine_recipe,
             "started_at_unix_ms": current_unix_millis(),
         }),
@@ -359,6 +379,69 @@ mod tests {
         let on_disk = fs::read_to_string(&path).unwrap();
         assert!(!on_disk.contains("hf_super_secret"));
         assert!(on_disk.contains("HF_TOKEN"));
+    }
+
+    /// ROCMAI-550 changed the device this engine reports for an existing
+    /// service from the literal `"rocm_gpu"` to the shared
+    /// `<backend> [gpu <n>] [(<name>)]` shape, and nothing pinned it.
+    ///
+    /// This drives the real persist-then-report path:
+    /// [`write_running_state`] writes the state file, [`read_service_state`]
+    /// reads it back and [`reported_device`] renders it — exactly what
+    /// [`healthcheck_service`] does for a tracked service, minus the
+    /// `state_path` lookup, which resolves through the caller's real
+    /// `AppPaths` and so cannot be driven from a unit test (the no-state half
+    /// is covered by
+    /// `healthcheck_reports_unknown_for_a_service_with_no_state_file`).
+    ///
+    /// Reverting the string to `"rocm_gpu"`, or dropping the `gpu_name` field
+    /// from the state write, fails this.
+    #[test]
+    fn reported_device_for_existing_state_matches_the_shared_engine_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("svc-device.json");
+        write_running_state(
+            &path,
+            "svc-device",
+            "some/model",
+            Some("Org/Served"),
+            "127.0.0.1",
+            8000,
+            DevicePolicy::GpuRequired,
+            None,
+        )
+        .unwrap();
+
+        // The probed name is whatever the test host has, so assert the shape
+        // rather than a value: `rocm`, optionally followed by `(<name>)`, and
+        // never the old `rocm_gpu` or a `gpu` noun with no ordinal behind it.
+        let state = read_service_state(&path).unwrap();
+        let device = reported_device(&state);
+        assert!(
+            device == "rocm" || (device.starts_with("rocm (") && device.ends_with(')')),
+            "AIM must report the shared `<backend> [(<name>)]` shape: {device}"
+        );
+        assert!(
+            !device.contains("rocm_gpu"),
+            "the pre-ROCMAI-550 literal must not come back: {device}"
+        );
+        assert!(
+            !device.split_whitespace().any(|word| word == "gpu"),
+            "this engine pins no ordinal, so a bare `gpu` noun would name \
+             nothing: {device}"
+        );
+        // The state file must actually carry the key the row is built from,
+        // even when the host probe found no name.
+        assert!(
+            state.get("gpu_name").is_some(),
+            "write_running_state must record gpu_name: {state}"
+        );
+
+        // And the name, when the host has one, reaches the row.
+        assert_eq!(
+            reported_device(&json!({ "gpu_name": "AMD Instinct MI300X" })),
+            "rocm (AMD Instinct MI300X)"
+        );
     }
 
     #[test]

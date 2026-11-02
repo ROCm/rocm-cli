@@ -1939,12 +1939,22 @@ impl ExamineSummary {
         })
     }
 
-    /// The `rocm_support` line of the examine text, or an empty string.
+    /// The `rocm_support` line of the examine text.
     ///
-    /// Present only when a GPU was detected but no ROCm package family covers
-    /// it (for example the gfx90c Vega iGPU in Renoir / Cezanne APUs). Without
-    /// it `compatible_therock_family: <unknown>` reads like a probe failure, when
-    /// the GPU was in fact recognized and simply has no ROCm build.
+    /// ROCMAI-550 asks `rocm examine` to "report the support level with one
+    /// line of what the user can do", so every level gets a line — including
+    /// the ones where the answer is "this build cannot tell". The earlier draft
+    /// printed only the `VulkanOnly` line, which made this report unable to
+    /// answer the very question the other surfaces send people here to ask:
+    /// `lemonade_engine_note` in `apps/rocm/src/main.rs` tells an `Unknown`
+    /// host to run `rocm examine`, and silence there is not an answer.
+    ///
+    /// Without the `VulkanOnly` line specifically,
+    /// `compatible_therock_family: <unknown>` reads like a probe failure when
+    /// the GPU was in fact recognized and simply has no ROCm build (the gfx90c
+    /// Vega iGPU in Renoir / Cezanne APUs). The `Unknown` line exists for the
+    /// mirror-image misreading: the same `<unknown>` value, where the CLI
+    /// genuinely does not know, must not be read as either claim.
     ///
     /// Classified by [`gpu_support_level`] rather than re-deriving the same
     /// `(detected, covering family)` test here: this line and that function are
@@ -1960,10 +1970,33 @@ impl ExamineSummary {
             // panic path.
             GpuSupportLevel::VulkanOnly => format!(
                 "  rocm_support: GPU detected ({}) but not supported by ROCm; \
-                 the Vulkan backend can still be used\n",
+                 the Vulkan backend can still be used - serve on it with \
+                 `rocm serve <model> --engine lemonade`\n",
                 detected.unwrap_or_default()
             ),
-            GpuSupportLevel::RocmHip | GpuSupportLevel::Unknown => String::new(),
+            // The covering family is the fact; it is already printed on its own
+            // line above, so this one says what it means rather than repeating
+            // it.
+            GpuSupportLevel::RocmHip => format!(
+                "  rocm_support: GPU detected ({}) with full ROCm/HIP support; \
+                 install the SDK for it with `rocm install sdk`\n",
+                detected.unwrap_or("<unknown>")
+            ),
+            // Not folded in with `VulkanOnly`: a detection gap is not a
+            // confirmed absence of ROCm support, and saying "Vulkan" here would
+            // be the same false claim in the other direction. What the user can
+            // do is let an engine decide and then read back what it chose -
+            // which is the `device:` row this same ticket added, and the only
+            // thing on this host that can actually settle the question.
+            GpuSupportLevel::Unknown => format!(
+                "  rocm_support: unknown - {}, so this build can confirm neither \
+                 ROCm support nor its absence; `rocm serve <model> --engine \
+                 lemonade` reports the backend it picked on its `device:` row\n",
+                match detected {
+                    Some(gfx) => format!("GPU target {gfx} is not in this build's catalog"),
+                    None => "no AMD GPU was detected".to_owned(),
+                }
+            ),
         }
     }
 
@@ -5175,22 +5208,88 @@ Class Name:                Display
         );
     }
 
+    /// Every support level reports one, because the other surfaces send the
+    /// user here to find out: `lemonade_engine_note` tells an `Unknown` host to
+    /// run `rocm examine`, and an examine that prints nothing for `Unknown`
+    /// makes that advice name a command which cannot clear the condition.
+    ///
+    /// Each line is checked against what it is allowed to claim, not merely for
+    /// being non-empty — the failure mode this guards is a report that answers
+    /// confidently on a host where the CLI knows nothing.
     #[test]
-    fn examine_render_omits_the_support_note_for_supported_or_missing_gpus() {
+    fn examine_render_reports_a_support_level_for_every_host() {
         let family = normalize_therock_family("gfx1103");
         let supported = examine_summary_with_gpu(Some("gfx1103"), family.as_deref());
         let rendered = supported.render_text();
-        assert!(!rendered.contains("rocm_support"), "{rendered}");
+        assert!(
+            rendered.contains("rocm_support: GPU detected (gfx1103) with full ROCm/HIP support"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("rocm install sdk"), "{rendered}");
 
+        // No GPU found: the level is reported as unknown, and nothing about the
+        // hardware is asserted in either direction.
         let missing = examine_summary_with_gpu(None, None);
         let rendered = missing.render_text();
-        assert!(!rendered.contains("rocm_support"), "{rendered}");
+        assert!(
+            rendered.contains("rocm_support: unknown - no AMD GPU was detected"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("Vulkan backend can still be used"),
+            "nothing was detected, so no backend may be promised: {rendered}"
+        );
 
         // An unmapped target the CLI knows nothing about is not claimed to be
         // unsupported; only targets known to have no ROCm build are.
         let unknown = examine_summary_with_gpu(Some("gfx803"), None);
         let rendered = unknown.render_text();
-        assert!(!rendered.contains("rocm_support"), "{rendered}");
+        assert!(
+            rendered.contains(
+                "rocm_support: unknown - GPU target gfx803 is not in this build's catalog"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("not supported by ROCm"),
+            "an unrecognized target must not be reported as confirmed \
+             ROCm-less: {rendered}"
+        );
+        assert!(
+            !rendered.contains("full ROCm/HIP support"),
+            "nor as supported: {rendered}"
+        );
+    }
+
+    /// The remediation in `lemonade_engine_note` (`apps/rocm/src/main.rs`) for
+    /// an `Unknown` host names `rocm examine`. AGENTS.md requires a named
+    /// command to actually clear the condition that printed it, so the line
+    /// examine prints there has to be an answer about the support level — the
+    /// thing the note said it would show.
+    #[test]
+    fn examine_answers_the_support_question_the_unknown_engine_note_sends_users_here_for() {
+        for detected in [None, Some("gfx803")] {
+            let rendered = examine_summary_with_gpu(detected, None).render_text();
+            let line = rendered
+                .lines()
+                .find(|line| line.trim_start().starts_with("rocm_support:"))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "`rocm examine` is where the Unknown-tier engine note sends \
+                         the user; it must print a support level:\n{rendered}"
+                    )
+                });
+            // Says which level it is, and leaves a command that can settle it.
+            assert!(line.contains("unknown"), "{line}");
+            assert!(
+                line.contains("rocm serve <model> --engine lemonade"),
+                "an `unknown` answer still has to leave somewhere to go: {line}"
+            );
+            assert!(
+                line.contains("device:"),
+                "and name where the real backend shows up: {line}"
+            );
+        }
     }
 
     #[test]
