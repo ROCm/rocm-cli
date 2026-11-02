@@ -218,6 +218,10 @@ fn forbid_new_files(dir: &std::path::Path) {
 }
 
 #[cfg(not(unix))]
+// Platform stub for a `@requires-os:linux` scenario. The Unix arm does I/O and
+// cannot be `const`, so making only this arm `const` would give the two
+// platforms different signatures.
+#[allow(clippy::missing_const_for_fn)]
 fn forbid_new_files(_dir: &std::path::Path) {
     panic!("this step needs Unix directory permissions; its scenario is @requires-os:linux");
 }

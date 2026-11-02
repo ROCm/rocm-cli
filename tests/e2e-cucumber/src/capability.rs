@@ -461,6 +461,9 @@ fn probe_dir_permissions_bind(dir: &std::path::Path) -> bool {
 }
 
 #[cfg(not(unix))]
+// Platform stub. The Unix arm does I/O and cannot be `const`, so making only
+// this arm `const` would give the two platforms different signatures.
+#[allow(clippy::missing_const_for_fn)]
 fn probe_dir_permissions_bind(_dir: &std::path::Path) -> bool {
     false
 }
