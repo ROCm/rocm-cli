@@ -881,7 +881,7 @@ fn install_messages_treat_equal_spellings_as_one_version() {
         false,
         1_000,
     );
-    let text = super::active_default_relation_text(
+    let text = super::consent::active_default_relation_text(
         &active,
         super::TheRockChannel::Nightly,
         "gfx120X-all",
@@ -892,7 +892,7 @@ fn install_messages_treat_equal_spellings_as_one_version() {
         "a respelling of the installed version is not an upgrade: {text}"
     );
     // A genuinely newer version still reads as one.
-    let text = super::active_default_relation_text(
+    let text = super::consent::active_default_relation_text(
         &active,
         super::TheRockChannel::Nightly,
         "gfx120X-all",
@@ -912,14 +912,14 @@ fn install_messages_treat_equal_spellings_as_one_version() {
         false,
         1_000,
     );
-    let text = super::active_default_relation_text(
+    let text = super::consent::active_default_relation_text(
         &unidentifiable,
         super::TheRockChannel::Nightly,
         "gfx120X-all",
         "7.0.0",
     );
     assert!(text.starts_with("upgrade from installed"), "{text}");
-    let text = super::active_default_relation_text(
+    let text = super::consent::active_default_relation_text(
         &active,
         super::TheRockChannel::Nightly,
         "gfx120X-all",
