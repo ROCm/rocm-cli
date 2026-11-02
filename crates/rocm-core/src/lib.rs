@@ -75,6 +75,7 @@ pub use config::{
     PermissionsConfig, ProviderUserConfig, RocmCliConfig, SetupConfig, TELEMETRY_MODE_LOCAL,
     TELEMETRY_MODE_OFF, TelemetryConfig, WatcherMode, WatcherUserConfig,
 };
+pub use confirm::interactive_terminal;
 pub use crypto::{
     generate_rsa_signing_keypair, sign_rsa_pkcs1_sha256_signature,
     verify_rsa_pkcs1_sha256_signature,
@@ -108,7 +109,7 @@ pub use host_gpu::{
     DriverSummary, ExamineSummary, HostGpuSummary, WslHostDriverProbe, WslSummary,
     default_engine_for_host, default_engine_for_platform, detect_gpu_driver_version,
     detect_host_gfx_target, detect_host_gpu_diagnostics, detect_host_gpu_summary,
-    detect_system_ram_gib, has_usable_amd_gpu, interactive_terminal, is_amdgpu_device, is_wsl_host,
+    detect_system_ram_gib, has_usable_amd_gpu, is_amdgpu_device, is_wsl_host,
     preferred_serve_engine_for_host_gpu_summary, usable_amd_gpu_indices,
 };
 #[cfg(any(target_os = "linux", test))]
