@@ -30,6 +30,14 @@
 //! *estimate* everywhere it is shown, and why layouts the formula does not
 //! describe (latent attention, split files, models with no attention layers) are
 //! reported as [`EstimateOutcome::CannotEstimate`] rather than guessed at.
+//!
+//! This is the one place the figures above -- which loads, and how close the
+//! estimate came to them -- are written down. The README, `docs/testing.md` and
+//! `docs/manual-testing.md` point here for them. The GPU and engine build are
+//! also named, without figures, in [`ESTIMATE_CAVEAT`], the README and the
+//! calibration tests' comments, so a recalibration on other hardware changes
+//! those names as well as this paragraph, the constants below and the tests
+//! under "Calibration against measured loads".
 
 use crate::gguf::{GgufHeader, MAX_BLOCK_COUNT};
 use crate::model_readiness::{AcceleratorMemory, format_gib};
@@ -1017,6 +1025,11 @@ pub fn evidence_lines(estimate: &ContextEstimate) -> Vec<String> {
 }
 
 /// The standing caveat that goes with every estimate that has figures.
+///
+/// It names the GPU and engine build the allowances were calibrated on, because
+/// that is what a reader of the output needs to judge whether their own setup is
+/// like it, and printed output cannot link anywhere. How close the calibration
+/// came is in the module documentation, and only there.
 pub const ESTIMATE_CAVEAT: &str = "these are estimates from the file's metadata, with the compute buffer and runtime \
      overhead calibrated on one GPU and engine build (an MI300X running llama.cpp b9752) with \
      flash attention on, which is assumed here (without it llama.cpp also allocates an \

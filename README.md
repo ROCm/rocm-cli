@@ -860,16 +860,11 @@ or GPU layer count yet**, so none of them is printed as a `rocm serve` command.
 The KV cache is exact for a plain full-attention model, and the weights are the
 file's own size from its tensor offsets, less the input embedding, which
 llama.cpp keeps in host memory. Only the compute buffer and the runtime reserve
-are allowances, calibrated against sixteen real loads of two dense models on one
-MI300X (gfx942) with llama.cpp b9752 and ROCm 7.2, flash attention on. In
-fifteen of those loads the estimated total was above what the GPU's used memory
-grew by, by 0.05% to 2.9% with an f16 KV cache and up to 4.5% with a quantized
-one; in the sixteenth, a load made with the card almost full, it was 5.5% above,
-because the process overhead measured there was only about 0.4 GiB against
-1.05-1.28 GiB in the others, which is unexplained. So across all sixteen the
-estimate was 0.05% to 5.5% above what was used, never below. That is the same
-loads the allowances were fitted to, on two dense models and one build, so it
-says how well they fit, not that the estimate is an upper bound elsewhere.
+are allowances, calibrated against real loads of two dense models on one MI300X
+with llama.cpp b9752, flash attention on. How close the estimate came to those
+loads, and why that describes the fit rather than a bound, is written down once,
+in the
+[`gguf_fit` module documentation](https://github.com/ROCm/rocm-cli/blob/main/crates/rocm-core/src/gguf_fit.rs).
 A model with sliding-window, state-space or mixture-of-experts layers was not
 measured: its KV cache is sized as if every layer attended over the whole
 context (which can overstate it), a state-space model's recurrent state is not

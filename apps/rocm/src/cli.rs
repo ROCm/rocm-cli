@@ -160,7 +160,7 @@ pub(crate) enum Command {
         /// estimate assumes flash attention is on. Applies to a GGUF outside the
         /// catalog.
         #[arg(long, value_enum, value_name = "TYPE", requires = "model")]
-        kv_cache_type: Option<KvCacheTypeArg>,
+        kv_cache_type: Option<crate::diagnose_model::KvCacheTypeArg>,
         /// Show the report this machine would contribute, and send nothing.
         ///
         /// Nothing leaves the machine: this prints the exact content so it can
@@ -1316,30 +1316,6 @@ pub(crate) enum FrameworkArg {
     Skip,
 }
 
-/// KV cache element type for `rocm diagnose --model`'s GGUF estimate.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-pub(crate) enum KvCacheTypeArg {
-    /// 16-bit floats (llama.cpp's default).
-    #[value(name = "f16")]
-    F16,
-    /// 8-bit quantized: about half the size of f16.
-    #[value(name = "q8_0")]
-    Q8_0,
-    /// 4-bit quantized: about a quarter the size of f16.
-    #[value(name = "q4_0")]
-    Q4_0,
-}
-
-impl From<KvCacheTypeArg> for rocm_core::gguf_fit::KvCacheType {
-    fn from(arg: KvCacheTypeArg) -> Self {
-        match arg {
-            KvCacheTypeArg::F16 => Self::F16,
-            KvCacheTypeArg::Q8_0 => Self::Q8_0,
-            KvCacheTypeArg::Q4_0 => Self::Q4_0,
-        }
-    }
-}
-
 impl From<FrameworkArg> for rocm_core::FrameworkProbe {
     fn from(value: FrameworkArg) -> Self {
         match value {
@@ -2040,22 +2016,6 @@ mod tests {
         }
         let over = (rocm_core::gguf_fit::MAX_CONTEXT_SIZE + 1).to_string();
         assert!(parse_diagnose(&["--model", "o/r:Q4_K_M", "--context-size", &over]).is_err());
-    }
-
-    // Every spelling the flag takes maps to the type the estimate uses, so a
-    // mismatch between the two enums cannot silently estimate another cache.
-    #[test]
-    fn every_kv_cache_flag_value_names_the_matching_estimate_type() {
-        use clap::ValueEnum;
-        for arg in KvCacheTypeArg::value_variants() {
-            let name = arg
-                .to_possible_value()
-                .expect("named")
-                .get_name()
-                .to_owned();
-            let kind = rocm_core::gguf_fit::KvCacheType::from(*arg);
-            assert_eq!(kind.name(), name);
-        }
     }
 
     // `--yes` approves a restart, so on its own it asks for something that was

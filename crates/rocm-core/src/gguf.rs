@@ -267,18 +267,10 @@ impl<R: Read + Seek> Reader<'_, R> {
     }
 
     fn value(&mut self, value_type: u32, depth: u8, keep: bool) -> Result<Value, GgufError> {
-        // GGUF metadata value types, in the order the format numbers them.
+        if let Some((width, num)) = fixed_width(value_type) {
+            return self.scalar(width, num);
+        }
         match value_type {
-            0 | 7 => self.scalar(1, Num::Unsigned),
-            1 => self.scalar(1, Num::Signed),
-            2 => self.scalar(2, Num::Unsigned),
-            3 => self.scalar(2, Num::Signed),
-            4 => self.scalar(4, Num::Unsigned),
-            5 => self.scalar(4, Num::Signed),
-            6 => self.scalar(4, Num::Other),
-            10 => self.scalar(8, Num::Unsigned),
-            11 => self.scalar(8, Num::Signed),
-            12 => self.scalar(8, Num::Other),
             8 => Ok(self
                 .string(MAX_KEPT_STRING)?
                 .map_or(Value::Skipped, Value::Str)),
@@ -304,28 +296,14 @@ impl<R: Read + Seek> Reader<'_, R> {
     fn array(&mut self, depth: u8, keep: bool) -> Result<Value, GgufError> {
         let element_type = self.u32()?;
         let len = self.u64()?;
-        let fixed_width: Option<(u64, Num)> = match element_type {
-            0 | 7 => Some((1, Num::Unsigned)),
-            1 => Some((1, Num::Signed)),
-            2 => Some((2, Num::Unsigned)),
-            3 => Some((2, Num::Signed)),
-            4 => Some((4, Num::Unsigned)),
-            5 => Some((4, Num::Signed)),
-            6 => Some((4, Num::Other)),
-            10 => Some((8, Num::Unsigned)),
-            11 => Some((8, Num::Signed)),
-            12 => Some((8, Num::Other)),
-            _ => None,
-        };
-        if let Some((width, num)) = fixed_width {
+        if let Some((width, num)) = fixed_width(element_type) {
             if keep && num != Num::Other && len <= MAX_KEPT_ARRAY {
-                let width_bytes = usize::try_from(width).unwrap_or(8);
                 let mut values = Vec::with_capacity(usize::try_from(len).unwrap_or(0));
                 let mut usable = true;
                 for _ in 0..len {
                     let mut buf = [0_u8; 8];
-                    self.inner.read_exact(&mut buf[..width_bytes])?;
-                    match decode_int(buf, width_bytes, num) {
+                    self.inner.read_exact(&mut buf[..width])?;
+                    match decode_int(buf, width, num) {
                         Some(value) => values.push(value),
                         None => usable = false,
                     }
@@ -338,7 +316,7 @@ impl<R: Read + Seek> Reader<'_, R> {
                     Value::Skipped
                 });
             }
-            let total = len.checked_mul(width).ok_or_else(|| {
+            let total = len.checked_mul(width as u64).ok_or_else(|| {
                 GgufError::Malformed(format!("array of {len} elements is out of range"))
             })?;
             self.skip(total)?;
@@ -372,6 +350,30 @@ impl<R: Read + Seek> Reader<'_, R> {
             }
         }
         Ok(Value::Skipped)
+    }
+}
+
+/// The width in bytes, and how to read it, of a fixed-width GGUF metadata type
+/// (a scalar value, or an array element); `None` for a string, an array, or a
+/// type id the format does not define. The one table of fixed-width type ids: a
+/// scalar and an array element share it, so a type added here is read in both
+/// places.
+const fn fixed_width(type_id: u32) -> Option<(usize, Num)> {
+    // GGUF metadata value types, in the order the format numbers them; 8 is a
+    // string and 9 an array, neither of fixed width.
+    match type_id {
+        // uint8, and bool (one byte, read as its byte value).
+        0 | 7 => Some((1, Num::Unsigned)),
+        1 => Some((1, Num::Signed)),
+        2 => Some((2, Num::Unsigned)),
+        3 => Some((2, Num::Signed)),
+        4 => Some((4, Num::Unsigned)),
+        5 => Some((4, Num::Signed)),
+        6 => Some((4, Num::Other)),
+        10 => Some((8, Num::Unsigned)),
+        11 => Some((8, Num::Signed)),
+        12 => Some((8, Num::Other)),
+        _ => None,
     }
 }
 

@@ -719,49 +719,77 @@ pub struct ContextRequest {
 /// verdict stays `Undetermined`: what is added is [`ModelReadiness::estimate`]
 /// and the evidence that goes with it. `source` is the only thing that reads a
 /// file or the network, and it reads the header, never the weights.
+///
+/// Three steps, each its own function: [`plan_context_estimate`] decides whether
+/// there is a file to read (and, when there is not, what to say about flags that
+/// were passed), [`read_context_estimate`] reads the header and sizes it, and
+/// [`apply_context_estimate`] rewrites the readiness for what came back.
 pub fn attach_context_estimate(
     readiness: &mut ModelReadiness,
     request: &ContextRequest,
     host: &HostFacts,
     source: &dyn GgufSource,
 ) {
-    let asked = request.context_size.is_some() || request.kv_cache_type.is_some();
-    if readiness.canonical_model_id.is_some() {
-        if asked {
-            readiness.evidence.push(
-                "a context size and KV cache type do not apply to a curated recipe, whose GPU memory \
-                 minimum is fixed; estimates for them cover GGUF models outside the catalog"
-                    .to_owned(),
-            );
+    match plan_context_estimate(readiness, request) {
+        ContextPlan::LeaveAsIs { note } => readiness.evidence.extend(note),
+        ContextPlan::Estimate {
+            reference,
+            fit_request,
+        } => {
+            let estimate =
+                read_context_estimate(&reference, &readiness.model_ref, &fit_request, host, source);
+            apply_context_estimate(readiness, &reference, estimate);
         }
-        return;
+    }
+}
+
+/// What [`plan_context_estimate`] decided for an answer.
+#[derive(Debug, PartialEq)]
+enum ContextPlan {
+    /// Nothing is read and the answer keeps its shape. `note` is the evidence
+    /// line that says why a context flag the user passed was not applied; `None`
+    /// when no flag was passed, or for an answer that owes no explanation.
+    LeaveAsIs { note: Option<String> },
+    /// Read this GGUF's header and size it for this request.
+    Estimate {
+        reference: GgufRef,
+        fit_request: FitRequest,
+    },
+}
+
+/// Decide whether `readiness` is owed an estimate, without reading anything.
+fn plan_context_estimate(readiness: &ModelReadiness, request: &ContextRequest) -> ContextPlan {
+    let asked = request.context_size.is_some() || request.kv_cache_type.is_some();
+    let leave = |note: String| ContextPlan::LeaveAsIs {
+        note: asked.then_some(note),
+    };
+    if readiness.canonical_model_id.is_some() {
+        return leave(
+            "a context size and KV cache type do not apply to a curated recipe, whose GPU memory \
+             minimum is fixed; estimates for them cover GGUF models outside the catalog"
+                .to_owned(),
+        );
     }
     if readiness.undetermined_reason == Some(UndeterminedReason::CatalogUnreachable) {
         // Whether the reference names a curated model is exactly what could not be
         // found out, so there is no telling which answer it is owed: say that the
         // flags were not applied rather than dropping them without a word.
-        if asked {
-            readiness.evidence.push(
-                "the context size and KV cache type were not applied: the recipe catalog could \
-                 not be read, so it is not known whether this is a curated model or a GGUF \
-                 outside the catalog"
-                    .to_owned(),
-            );
-        }
-        return;
+        return leave(
+            "the context size and KV cache type were not applied: the recipe catalog could \
+             not be read, so it is not known whether this is a curated model or a GGUF \
+             outside the catalog"
+                .to_owned(),
+        );
     }
     if readiness.undetermined_reason != Some(UndeterminedReason::ModelNotCurated) {
-        return;
+        return ContextPlan::LeaveAsIs { note: None };
     }
     let Some(reference) = parse_gguf_ref(&readiness.model_ref) else {
-        if asked {
-            readiness.evidence.push(
-                "a context size and KV cache type are estimated for GGUF models only: a local \
-                 .gguf path, or `owner/repo:QUANT` on Hugging Face"
-                    .to_owned(),
-            );
-        }
-        return;
+        return leave(
+            "a context size and KV cache type are estimated for GGUF models only: a local \
+             .gguf path, or `owner/repo:QUANT` on Hugging Face"
+                .to_owned(),
+        );
     };
     // `owner/repo` with no quantization names a repository, not a file, and a
     // repository is not read (every file in it is a different model). Without a
@@ -769,35 +797,58 @@ pub fn attach_context_estimate(
     // reached without touching the network; with one, the user is told what
     // would make it answerable.
     if matches!(reference, GgufRef::Hub { variant: None, .. }) {
-        if asked {
-            readiness.evidence.push(format!(
-                "`{}` names a repository, not a model file: add `:QUANT` (for example \
-                 `:Q4_K_M`) to estimate one of its GGUF files",
-                readiness.model_ref
-            ));
-        }
-        return;
+        return leave(format!(
+            "`{}` names a repository, not a model file: add `:QUANT` (for example \
+             `:Q4_K_M`) to estimate one of its GGUF files",
+            readiness.model_ref
+        ));
     }
-    let fit_request = FitRequest {
-        context_size: request.context_size.unwrap_or(DEFAULT_CONTEXT_SIZE),
-        context_size_defaulted: request.context_size.is_none(),
-        kv_cache_type: request.kv_cache_type.unwrap_or(KvCacheType::F16),
-    };
-    let estimate = match source.open(&reference).and_then(|mut opened| {
+    ContextPlan::Estimate {
+        reference,
+        fit_request: FitRequest {
+            context_size: request.context_size.unwrap_or(DEFAULT_CONTEXT_SIZE),
+            context_size_defaulted: request.context_size.is_none(),
+            kv_cache_type: request.kv_cache_type.unwrap_or(KvCacheType::F16),
+        },
+    }
+}
+
+/// Read `reference`'s header through `source` and size it against `host`. A
+/// header that cannot be reached or read is an estimate with no figures, named
+/// after `model_ref` as the user wrote it.
+fn read_context_estimate(
+    reference: &GgufRef,
+    model_ref: &str,
+    fit_request: &FitRequest,
+    host: &HostFacts,
+    source: &dyn GgufSource,
+) -> ContextEstimate {
+    let read = source.open(reference).and_then(|mut opened| {
         let header =
             parse_gguf_header(&mut opened.reader).map_err(|error| anyhow::anyhow!("{error}"))?;
         Ok((header, opened.size, opened.description))
-    }) {
+    });
+    match read {
         Ok((header, size, description)) => estimate_fit(
             &header,
             size,
             &description,
-            &fit_request,
+            fit_request,
             host.accelerator_memory,
             host.system_ram_gib,
         ),
-        Err(error) => ContextEstimate::unreadable(&readiness.model_ref, &fit_request, &error),
-    };
+        Err(error) => ContextEstimate::unreadable(model_ref, fit_request, &error),
+    }
+}
+
+/// Put `estimate` on `readiness`, and rewrite the parts of the answer that were
+/// written for a model nobody had looked at: the route, the fix, the
+/// alternatives and the warnings, each according to what the estimate found.
+fn apply_context_estimate(
+    readiness: &mut ModelReadiness,
+    reference: &GgufRef,
+    estimate: ContextEstimate,
+) {
     readiness.evidence.extend(evidence_lines(&estimate));
     // The route sends a user to the upstream tracker because the catalog lacks
     // the model. A GGUF was looked at directly, so that is no longer the
@@ -806,16 +857,14 @@ pub fn attach_context_estimate(
     readiness.route = None;
     if estimate.total_gib.is_some() {
         // The header was read and sized, so the "serve it directly and read the
-        // engine's refusal" plan and the report-it route answered a question
-        // that no longer applies -- whether or not this host could be compared
-        // against. They stay when the header could not be read: then nothing
-        // was learnt and they are still the honest next step.
+        // engine's refusal" plan answered a question that no longer applies --
+        // whether or not this host could be compared against. It stays when the
+        // header could not be read: then nothing was learnt and it is still the
+        // honest next step.
         readiness.fix = None;
         if estimate.outcome == EstimateOutcome::Fits {
             readiness.alternatives.clear();
         }
-    }
-    if estimate.total_gib.is_some() {
         readiness.warnings.push(ESTIMATE_CAVEAT.to_owned());
     } else if estimate.cannot_estimate_reason == Some(CannotEstimateReason::HeaderUnreadable)
         && matches!(reference, GgufRef::Local(_))
@@ -829,32 +878,37 @@ pub fn attach_context_estimate(
             ..Fix::default()
         });
     } else if let Some(fix) = &mut readiness.fix {
-        // The plan was written for a model that is not a GGUF reference, and its
-        // note says so. This one is, and the estimate above says why it could not
-        // be sized, so the note says that instead of contradicting it.
-        fix.notes = vec![
-            "`rocm serve` accepts models outside this catalog; the estimate above could not size \
-             this GGUF, so this cannot say in advance whether it will fit"
-                .to_owned(),
-        ];
-        // `rocm serve` takes `owner/repo:QUANT`, whose label has no `/`; the
-        // `owner/repo:dir/file.gguf` form selects an exact file for this estimate
-        // only, and serve would not read it as a checkpoint. Naming it in a
-        // `rocm serve` command would hand the user a line that fails.
-        if matches!(&reference, GgufRef::Hub { variant: Some(variant), .. } if variant.contains('/'))
-        {
-            fix.verify = format!("rocm diagnose --model {}", readiness.model_ref);
-            fix.notes.push(
-                "`rocm serve` does not accept an exact file name after the colon; it takes \
-                 `owner/repo:QUANT`"
-                    .to_owned(),
-            );
-        }
+        point_fix_at_unsized_gguf(fix, reference, &readiness.model_ref);
     }
     if estimate.outcome == EstimateOutcome::DoesNotFit && !estimate.suggestions.is_empty() {
         readiness.warnings.push(SERVE_OPTIONS_NOTE.to_owned());
     }
     readiness.estimate = Some(estimate);
+}
+
+/// Rewrite the "serve it and see" plan for a GGUF reference whose header was
+/// reached for but not sized.
+fn point_fix_at_unsized_gguf(fix: &mut Fix, reference: &GgufRef, model_ref: &str) {
+    // The plan was written for a model that is not a GGUF reference, and its
+    // note says so. This one is, and the estimate says why it could not be
+    // sized, so the note says that instead of contradicting it.
+    fix.notes = vec![
+        "`rocm serve` accepts models outside this catalog; the estimate above could not size \
+         this GGUF, so this cannot say in advance whether it will fit"
+            .to_owned(),
+    ];
+    // `rocm serve` takes `owner/repo:QUANT`, whose label has no `/`; the
+    // `owner/repo:dir/file.gguf` form selects an exact file for this estimate
+    // only, and serve would not read it as a checkpoint. Naming it in a
+    // `rocm serve` command would hand the user a line that fails.
+    if matches!(reference, GgufRef::Hub { variant: Some(variant), .. } if variant.contains('/')) {
+        fix.verify = format!("rocm diagnose --model {model_ref}");
+        fix.notes.push(
+            "`rocm serve` does not accept an exact file name after the colon; it takes \
+             `owner/repo:QUANT`"
+                .to_owned(),
+        );
+    }
 }
 
 /// What an estimate says when a device-visibility variable is set on a host
@@ -1541,6 +1595,61 @@ mod tests {
             context_size: Some(context),
             kv_cache_type: None,
         }
+    }
+
+    /// The decide step on its own: a GGUF outside the catalog is planned for a
+    /// read with the defaults filled in, and an answer that is not one is left as
+    /// it is, with an explanation only when a context flag was passed.
+    #[test]
+    fn the_plan_reads_only_a_gguf_outside_the_catalog_and_fills_in_the_defaults() {
+        let gguf = not_curated("some-lab/never-curated-7b:Q4_K_M");
+        assert_eq!(
+            plan_context_estimate(&gguf, &ContextRequest::default()),
+            ContextPlan::Estimate {
+                reference: GgufRef::Hub {
+                    owner: "some-lab".to_owned(),
+                    repo: "never-curated-7b".to_owned(),
+                    variant: Some("Q4_K_M".to_owned()),
+                },
+                fit_request: FitRequest {
+                    context_size: DEFAULT_CONTEXT_SIZE,
+                    context_size_defaulted: true,
+                    kv_cache_type: KvCacheType::F16,
+                },
+            }
+        );
+        let not_gguf = not_curated("some-lab/never-curated-7b");
+        assert_eq!(
+            plan_context_estimate(&not_gguf, &ContextRequest::default()),
+            ContextPlan::LeaveAsIs { note: None }
+        );
+        assert!(matches!(
+            plan_context_estimate(&not_gguf, &asked(8192)),
+            ContextPlan::LeaveAsIs { note: Some(note) } if note.contains("add `:QUANT`")
+        ));
+        // Flags that were passed are carried as given, not replaced by defaults.
+        let both = ContextRequest {
+            context_size: Some(32768),
+            kv_cache_type: Some(KvCacheType::Q8_0),
+        };
+        assert!(matches!(
+            plan_context_estimate(&gguf, &both),
+            ContextPlan::Estimate { fit_request, .. } if fit_request == FitRequest {
+                context_size: 32768,
+                context_size_defaulted: false,
+                kv_cache_type: KvCacheType::Q8_0,
+            }
+        ));
+        // A curated model is never read, and is told why only when it asked.
+        let curated = not_curated(SMALL_MODEL_REF);
+        assert_eq!(
+            plan_context_estimate(&curated, &ContextRequest::default()),
+            ContextPlan::LeaveAsIs { note: None }
+        );
+        assert!(matches!(
+            plan_context_estimate(&curated, &both),
+            ContextPlan::LeaveAsIs { note: Some(note) } if note.contains("curated recipe")
+        ));
     }
 
     #[test]

@@ -29,16 +29,17 @@ use rocm_core::browser::Opener;
 use rocm_core::{AppPaths, RocmCliConfig};
 use serde::Serialize;
 
+use crate::FixExitCode;
 use crate::cli_report::{JsonOrText, print_json_or_text};
+use crate::diagnose_model;
 use crate::model_fit::assess_model_on_this_host;
-use crate::{FixExitCode, ModelQuery, report_ignores_model_note};
 
 pub(crate) fn diagnose(
     symptom: Option<String>,
     top: usize,
     json: bool,
     distro: Option<String>,
-    model: Option<ModelQuery>,
+    model: Option<diagnose_model::ModelQuery>,
     report_requested: bool,
     send: bool,
 ) -> Result<()> {
@@ -99,7 +100,7 @@ pub(crate) fn diagnose(
     // the model's header from the network -- which `--report` promises it never
     // does -- so under `--report` the model is not assessed at all.
     if report_requested && let Some(query) = &model {
-        eprintln!("{}", report_ignores_model_note(query));
+        eprintln!("{}", diagnose_model::report_ignores_model_note(query));
     }
     if let Some(query) = model.as_ref().filter(|_| !report_requested) {
         report.model = Some(assess_model_on_this_host(

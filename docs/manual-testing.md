@@ -1256,8 +1256,10 @@ Expected result:
 Needs a host with a Radeon GPU (a discrete card: an APU answers `undetermined`
 by design) and network access to Hugging Face. The point is to check the
 estimate against what a real load uses: the compute buffer and runtime reserve
-were calibrated on one GPU (an MI300X, gfx942) and one engine build (llama.cpp
-b9752, ROCm 7.2), so a different GPU or build can differ.
+were calibrated on one GPU and one engine build (an MI300X with llama.cpp b9752),
+so a different GPU or build can differ. How close the estimate came on them is
+recorded in the module documentation of
+[gguf_fit.rs](../crates/rocm-core/src/gguf_fit.rs), not repeated here.
 
 ```bash
 rocm diagnose --model <owner>/<repo>:Q4_K_M --context-size 8192
@@ -1288,10 +1290,10 @@ Expected result:
   86016 tokens (used memory grew by 15449, 15837, 15788 and 15767 MiB) and failed
   to allocate at 87040, 90112 and 93184, so the real limit was between 86016 and
   87040 tokens and the estimate was about 7-8% under it (79872 is 7.1% under
-  86016 and 8.2% under 87040). At 86016 tokens the estimate needed about 16.2 GiB
-  (16628 MiB) against the 15767 MiB measured, 5.5% above,
-  because the process overhead measured there was only about 0.4 GiB against
-  1.05-1.28 GiB in the unconstrained loads; why is not known. The baseline moved
+  86016 and 8.2% under 87040). The load at 86016 tokens is the calibration load
+  "made with the card almost full" in
+  [gguf_fit.rs](../crates/rocm-core/src/gguf_fit.rs)'s module documentation,
+  which says how the estimate compared with it. The baseline moved
   by 354 MiB between runs, so those used-memory figures are good to a few
   hundred MiB at best. That is one model on one card, not a bound; a different
   model, GPU or build can land elsewhere. At a size well above what loads, the

@@ -24,6 +24,7 @@ mod comfyui;
 mod config_cmd;
 mod dash;
 mod dash_seam;
+mod diagnose_model;
 // Unix-only: its generators plant symlinks with `std::os::unix::fs::symlink`.
 #[cfg(all(test, unix))]
 mod deletion_properties;
@@ -182,7 +183,6 @@ use crate::update_cmd::update;
 
 use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, FromArgMatches, Parser};
-use rocm_core::model_readiness::ContextRequest;
 use rocm_core::{
     AppPaths, EndpointReadiness, RocmCliConfig, interactive_terminal, uv_cache_source,
 };
@@ -297,32 +297,6 @@ fn clap_exit_code(err: clap::Error) -> anyhow::Error {
     let code = err.exit_code();
     let _ = err.print();
     ClapExitCode(code).into()
-}
-
-/// What `rocm diagnose --model` was asked about.
-struct ModelQuery {
-    model_ref: String,
-    context: ContextRequest,
-}
-
-/// What `--report` says to stderr when it was given a model question: the report
-/// is about this machine, so the model flags did nothing, and nothing about the
-/// model was fetched. A flag that is accepted and silently has no effect reads as
-/// an answer that was never asked for.
-fn report_ignores_model_note(query: &ModelQuery) -> String {
-    let mut ignored = vec!["--model"];
-    if query.context.context_size.is_some() {
-        ignored.push("--context-size");
-    }
-    if query.context.kv_cache_type.is_some() {
-        ignored.push("--kv-cache-type");
-    }
-    let verb = if ignored.len() == 1 { "was" } else { "were" };
-    format!(
-        "note: --report describes this machine, not a model, so {} {verb} ignored and nothing \
-         about the model was fetched",
-        ignored.join(", ")
-    )
 }
 
 fn main() -> ExitCode {
@@ -717,12 +691,8 @@ fn dispatch(cli: Cli) -> Result<()> {
             report,
             send,
         }) => {
-            let model = model.map(|model_ref| ModelQuery {
-                model_ref,
-                context: ContextRequest {
-                    context_size,
-                    kv_cache_type: kv_cache_type.map(Into::into),
-                },
+            let model = model.map(|model_ref| {
+                diagnose_model::ModelQuery::new(model_ref, context_size, kv_cache_type)
             });
             diagnose(symptom, top, json, distro, model, report, send)
         }
