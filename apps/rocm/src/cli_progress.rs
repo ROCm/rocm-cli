@@ -618,12 +618,24 @@ mod tests {
             Duration::from_millis(5),
             true,
         );
-        thread::sleep(Duration::from_millis(60));
-        let idx = spinner.inner.lock().unwrap().idx;
-        assert!(
-            idx >= 3,
-            "the background ticker must keep advancing frames on its own: idx={idx}"
-        );
+        // Poll for 3 ticks instead of asserting a fixed sleep produced them:
+        // the ticker is a real OS thread repainting real stderr on a 5ms
+        // interval, and a single fixed sleep races scheduler/IO jitter under
+        // `cargo test --workspace`'s parallel execution (see #763). A long,
+        // bounded poll tolerates any amount of delay while still failing
+        // promptly if the ticker genuinely stalls.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let idx = spinner.inner.lock().unwrap().idx;
+            if idx >= 3 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the background ticker must keep advancing frames on its own: idx={idx}"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
     }
 
     #[test]

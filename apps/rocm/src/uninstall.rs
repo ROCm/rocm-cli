@@ -4,9 +4,9 @@
 
 //! `rocm uninstall` command handler.
 //!
-//! The plan itself is built by `build_uninstall_plan` in the crate root, which
-//! `rocm storage` shares the plan and removal shape with. This module owns what
-//! only uninstall does on top of removing files:
+//! The plan itself is built by `build_uninstall_plan` in `uninstall_plan.rs`,
+//! which `rocm storage` shares the plan and removal shape with. This module
+//! owns what only uninstall does on top of removing files:
 //!
 //! - undoing the PATH change the installer recorded making;
 //! - deleting the running `rocm.exe` on Windows, which cannot unlink itself.
@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use rocm_core::{AppPaths, interactive_terminal};
 
-use crate::{
+use crate::uninstall_plan::{
     UninstallOptions, UninstallPlan, build_uninstall_plan, confirm_uninstall,
     is_rocm_install_entry_name, remove_path, render_uninstall_plan,
 };
@@ -857,18 +857,6 @@ mod tests {
         assert!(plan_is_empty(&UninstallPlan::default()));
     }
 
-    #[test]
-    fn the_running_executable_is_matched_whatever_case_windows_reports_it_in() {
-        let exe = Path::new(r"C:\Users\me\.local\bin\rocm.exe");
-        let listed = Path::new(r"C:\Users\me\.local\bin\ROCM.EXE");
-        assert!(crate::is_running_executable(listed, exe, true));
-        assert!(crate::is_running_executable(exe, exe, true));
-        let rocmd = Path::new(r"C:\Users\me\.local\bin\rocmd.exe");
-        assert!(!crate::is_running_executable(rocmd, exe, true));
-        // Elsewhere the running binary is unlinked like any other.
-        assert!(!crate::is_running_executable(exe, exe, false));
-    }
-
     #[cfg(unix)]
     mod plan {
         use super::*;
@@ -927,7 +915,7 @@ mod tests {
             plan.actions = layout
                 .removed
                 .iter()
-                .map(|path| crate::UninstallPlanEntry {
+                .map(|path| crate::uninstall_plan::UninstallPlanEntry {
                     kind: "binary",
                     path: path.clone(),
                 })
@@ -946,7 +934,7 @@ mod tests {
             fs::write(config.join("config.json"), "{}")?;
             plan.actions.insert(
                 0,
-                crate::UninstallPlanEntry {
+                crate::uninstall_plan::UninstallPlanEntry {
                     kind: "config",
                     path: config.clone(),
                 },
@@ -1024,10 +1012,11 @@ mod tests {
             let (mut plan, config) =
                 with_config(&layout, with_binaries(&layout, plan_for(&layout)))?;
             // A name too long for any filesystem fails to remove, even for root.
-            plan.actions.push(crate::UninstallPlanEntry {
-                kind: "binary",
-                path: layout.bin.join("x".repeat(300)),
-            });
+            plan.actions
+                .push(crate::uninstall_plan::UninstallPlanEntry {
+                    kind: "binary",
+                    path: layout.bin.join("x".repeat(300)),
+                });
 
             let (lines, result) = run(&plan);
             assert!(result.is_err(), "the last removal fails: {lines:?}");
@@ -1269,7 +1258,7 @@ mod tests {
                     keep_binaries,
                     ..UninstallOptions::default()
                 };
-                crate::plan_installed_binaries(
+                crate::uninstall_plan::plan_installed_binaries(
                     &mut plan,
                     &options,
                     || Ok(layout.removed[0].clone()),

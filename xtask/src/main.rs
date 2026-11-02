@@ -25,6 +25,8 @@ mod manifest;
 mod package;
 mod paths;
 mod powershell;
+mod report_mailbox;
+mod report_rollup;
 mod rocm_releases;
 mod signing;
 mod tpn;
@@ -265,6 +267,24 @@ pub(crate) enum Command {
         #[arg(long)]
         html_out: PathBuf,
     },
+    /// Count received Doctor reports from an export of the report mailbox.
+    ///
+    /// Reads `.eml` files (one message each) and raw `.json` report bodies,
+    /// and prints how many reports describe each problem, at every level of
+    /// the group key, with refused and unreadable reports counted apart.
+    /// Sends and files nothing. Counts are reports, not people.
+    ReportRollup {
+        /// `.eml` or `.json` files, or directories holding them (read one
+        /// level deep).
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+        /// Print the rollup as JSON.
+        #[arg(long)]
+        json: bool,
+        /// Also list each message skipped as not a report, by file and subject.
+        #[arg(long)]
+        verbose: bool,
+    },
     /// Lint PowerShell scripts with PSScriptAnalyzer (parse errors are reported
     /// too, so this also covers syntax).
     PowershellLint {
@@ -354,6 +374,11 @@ fn run() -> Result<()> {
             artifacts_dir,
             html_out,
         } => e2e_report::run(&artifacts_dir, &html_out)?,
+        Command::ReportRollup {
+            paths,
+            json,
+            verbose,
+        } => report_rollup::run(&paths, json, verbose)?,
         Command::PowershellLint { shell, files } => powershell::run(shell, files)?,
     }
     Ok(())

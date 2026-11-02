@@ -4,7 +4,7 @@
 
 //! Property tests for the recursive-deletion paths that are *not* the runtime
 //! install-root guard: `rocm uninstall` and `rocm storage remove-downloads`,
-//! both of which end in [`crate::remove_path`].
+//! both of which end in [`crate::uninstall_plan::remove_path`].
 //!
 //! The oracle is the real filesystem, not a restatement of the code's own path
 //! logic. Each case builds a sandbox tree (planted symlinks, sibling folders
@@ -26,7 +26,7 @@ use proptest::prelude::*;
 use proptest::test_runner::{Config, TestCaseError, TestRunner};
 use rocm_core::AppPaths;
 
-use crate::{UninstallOptions, build_uninstall_plan, remove_path};
+use crate::uninstall_plan::{UninstallOptions, build_uninstall_plan, remove_path};
 
 // ---------------------------------------------------------------------------
 // Sandbox + snapshot helpers (the oracle)
@@ -669,7 +669,7 @@ fn uninstall_case(
         };
         let plan = build_uninstall_plan(&paths, &options)
             .map_err(|error| TestCaseError::fail(format!("plan failed: {error:#}")))?;
-        let rendered = crate::render_uninstall_plan(
+        let rendered = crate::uninstall_plan::render_uninstall_plan(
             &plan,
             &UninstallOptions {
                 dry_run: true,

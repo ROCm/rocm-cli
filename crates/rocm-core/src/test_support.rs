@@ -13,6 +13,44 @@ use crate::{AppPaths, ManagedServiceRecord, unix_time_millis};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// The volume serial number paired with the 64-bit file index: this
+/// platform's file identity, the way an inode is on Unix. Shared by every
+/// test that tells a publish-by-rename apart from a rewrite in place.
+///
+/// Read through `GetFileInformationByHandle` rather than
+/// `std::os::windows::fs::MetadataExt`, whose `volume_serial_number` and
+/// `file_index` accessors are unstable behind the `windows_by_handle`
+/// feature gate and so cannot be called on the pinned stable toolchain.
+#[cfg(windows)]
+#[allow(unsafe_code)] // Win32 FFI
+pub(crate) fn windows_file_identity(path: &std::path::Path) -> anyhow::Result<(u32, u64)> {
+    use anyhow::{Context, bail};
+    use std::fs;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    let file =
+        fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    // All-POD `repr(C)` record, fully overwritten by the call below on
+    // success and never read on failure.
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    let handle = file.as_raw_handle() as HANDLE;
+    if unsafe { GetFileInformationByHandle(handle, &raw mut info) } == 0 {
+        bail!(
+            "failed to read the file identity of {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        );
+    }
+    Ok((
+        info.dwVolumeSerialNumber,
+        (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+    ))
+}
+
 pub(crate) fn temp_app_paths(name: &str) -> (PathBuf, AppPaths) {
     let root = workspace_test_artifact_dir().join(format!("rocm-core-{name}-{}", unique_suffix()));
     let paths = AppPaths {

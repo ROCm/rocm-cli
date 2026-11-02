@@ -1,4 +1,4 @@
-Feature: ComfyUI install reports progress and makes failures actionable
+Feature: ComfyUI install reports progress, makes failures actionable and preserves the runtime
 
   # `rocm comfyui install` shells out to `uv` to resolve ComfyUI's Python
   # dependencies. A failed resolve (a version conflict, a yanked release, a
@@ -11,6 +11,13 @@ Feature: ComfyUI install reports progress and makes failures actionable
   # The runtime, its rocm_sdk probe, the Python interpreter and `uv` itself are
   # all planted so the scenario is hermetic: no GPU, no network, no real
   # package resolution.
+  #
+  # This scenario and comfyui-02/-03 below are hermetic and Windows-portable
+  # (no `@requires-os:linux`), but nothing in required CI ran them on Windows
+  # until the required `windows-build-and-test` lane started selecting their
+  # ids explicitly via `E2E_ALSO_RUN_IDS` (see `docs/testing.md`'s "Install
+  # lifecycle" section) — before that, Windows coverage depended entirely on
+  # the optional, self-hosted `e2e-selfhosted.yml` lane.
   @id:comfyui-uv-install-failure-names-log
   Scenario: comfyui-01 - A failed dependency install names the log it wrote
     Given a ready ROCm runtime with a ComfyUI checkout pending dependencies
@@ -113,21 +120,19 @@ Feature: ComfyUI install reports progress and makes failures actionable
   # aside, a failure after the new code is in place, and a download that is
   # not a ComfyUI release. Each asserts what the CLI prints together with what
   # is actually on disk afterwards. Only three of these still need the POSIX
-  # shell: comfyui-11's GPU-check failing transition plants a `#!/bin/sh`
-  # script (its passing-again half uses the Windows-portable `fake-python`
-  # stand-in, like every other scenario here), and comfyui-08/comfyui-12 each
-  # start their stand-in running ComfyUI process through `sh -c` (see
-  # `spawn_stand_in`). comfyui-05/-06/-07/-09/-10/-13 plant the same
-  # Windows-portable `fake-python` stand-in `comfyui-01`/`-02`/`-03` use and
-  # have no shell dependency of their own, but stay `@requires-os:linux` too:
-  # their reinstall behavior has not been run on Windows yet. Ungating them
-  # is tracked separately (#697), to keep this fix scoped to #629's
-  # comfyui-01/02/03 ask.
+  # shell and stay `@requires-os:linux`: comfyui-11's GPU-check failing
+  # transition plants a `#!/bin/sh` script (its passing-again half uses the
+  # Windows-portable `fake-python` stand-in, like every other scenario here),
+  # and comfyui-08/comfyui-12 each start their stand-in running ComfyUI
+  # process through `sh -c` (see `spawn_stand_in`). comfyui-05/-06/-07/-09/-10/-13
+  # plant the same Windows-portable `fake-python` stand-in `comfyui-01`/`-02`/`-03`
+  # use and have no shell dependency of their own, so they now run on both
+  # platforms too (#697).
   #
   # rocm-cli's saved record of a ComfyUI it started is unreadable here. `stop`
   # cannot read it either, so it must not block the reinstall; the reinstall
   # says it could not tell.
-  @id:comfyui-reinstall-keeps-user-data @requires-os:linux
+  @id:comfyui-reinstall-keeps-user-data
   Scenario: comfyui-05 - Reinstalling ComfyUI replaces its code and keeps the user's own files
     Given a ComfyUI install holding the user's models, workflows, images and custom nodes
     And a newer ComfyUI release is available to download
@@ -138,7 +143,7 @@ Feature: ComfyUI install reports progress and makes failures actionable
     And the reinstall lists the code it replaced
     And the reinstall says it could not tell whether ComfyUI was running
 
-  @id:comfyui-reinstall-failed-download-changes-nothing @requires-os:linux
+  @id:comfyui-reinstall-failed-download-changes-nothing
   Scenario: comfyui-06 - A ComfyUI reinstall whose download fails leaves the existing install untouched
     Given a ComfyUI install holding the user's models, workflows, images and custom nodes
     And the ComfyUI release download fails
@@ -146,7 +151,7 @@ Feature: ComfyUI install reports progress and makes failures actionable
     Then the reinstall fails
     And the existing ComfyUI code and the user's files are untouched
 
-  @id:comfyui-reinstall-dry-run-names-kept-folders @requires-os:linux
+  @id:comfyui-reinstall-dry-run-names-kept-folders
   Scenario: comfyui-07 - A ComfyUI reinstall dry run says what it replaces and keeps
     Given a ComfyUI install holding the user's models, workflows, images and custom nodes
     When the user previews reinstalling ComfyUI
@@ -192,7 +197,7 @@ Feature: ComfyUI install reports progress and makes failures actionable
   # the CLI's own message) and proves the condition is cleared. `status` and
   # the answer to a natural-language status question both name that command
   # rather than `start` until then.
-  @id:comfyui-interrupted-reinstall-blocks-start @requires-os:linux
+  @id:comfyui-interrupted-reinstall-blocks-start
   Scenario: comfyui-09 - ComfyUI will not start a half-replaced install until the reinstall is finished
     Given a ComfyUI install holding the user's models, workflows, images and custom nodes
     And a newer ComfyUI release is available to download
@@ -213,7 +218,7 @@ Feature: ComfyUI install reports progress and makes failures actionable
   # of `source/`. The install recorded what its release shipped, so the
   # reinstall knows that entry is the user's: it renames it and says where,
   # instead of deleting it as old code.
-  @id:comfyui-reinstall-sets-aside-colliding-entry @requires-os:linux
+  @id:comfyui-reinstall-sets-aside-colliding-entry
   Scenario: comfyui-10 - Reinstalling ComfyUI renames a folder of the user's that the new release also ships
     Given a ComfyUI install holding the user's models, workflows, images and custom nodes
     And the user keeps an app folder there that the installed ComfyUI release did not ship
@@ -264,10 +269,61 @@ Feature: ComfyUI install reports progress and makes failures actionable
   # A download that unpacks but has no main.py is not installed: the reinstall
   # would otherwise remove the installed code and put nothing startable in its
   # place. It is not kept either, so the next attempt downloads again.
-  @id:comfyui-reinstall-rejects-download-without-main-py @requires-os:linux
+  @id:comfyui-reinstall-rejects-download-without-main-py
   Scenario: comfyui-13 - A ComfyUI reinstall whose download is not a ComfyUI release leaves the install untouched
     Given a ComfyUI install holding the user's models, workflows, images and custom nodes
     And the newer ComfyUI release offered for download has no main.py
     When the user reinstalls ComfyUI
     Then the reinstall fails saying the download is not a ComfyUI release, and does not keep it
     And the existing ComfyUI code and the user's files are untouched
+
+  # EAI-8051: `rocm comfyui install` installs ComfyUI's dependencies INTO the
+  # machine's managed ROCm runtime. Before #298 nothing constrained the torch stack,
+  # so a transitive dependency could pull CUDA `nvidia-*` wheels into the runtime
+  # and displace its ROCm torch, leaving a CUDA build with no AMD GPU support --
+  # installing an optional app broke the base. #298 now pins the torch stack with
+  # a `uv --constraint` file; this scenario guards against that regressing.
+  #
+  # The contract: after installing an optional app, the machine's ROCm runtime must
+  # still be a ROCm runtime — its torch, torchvision and torchaudio versions are unchanged and
+  # no `nvidia-*` CUDA distributions appear in it. Since #298 the install exits 0,
+  # so the scenario also requires that. It is also the step that catches a revert
+  # of #298 (the post-install GPU probe then bails and the install exits non-zero),
+  # so do not relax it as a mere premise: a bail-out (no runtime, download failure)
+  # would otherwise leave the runtime trivially unchanged and report green having
+  # installed nothing. It further requires the runtime's package set to have GROWN,
+  # because a zero exit code alone still permits an empty filtered requirement list,
+  # which skips the dependency install outright. Together those two make the
+  # runtime-health checks the ADDITIONAL contract on top of an install that really
+  # happened, not a substitute for it.
+  #
+  # Genuinely destructive and expensive: it needs a real managed runtime (a
+  # multi-GiB SDK install) and mutates it, so it runs ONLY on a GPU host, behind
+  # @nightly, against this scenario's own isolated runtime prefix (it must never
+  # share a runtime tree with other scenarios — it may corrupt it). Gated
+  # @requires-gpu @nightly, like runtime-install-sdk-active, which also does a
+  # real `install sdk`. NOT @lifecycle: that tag is for OS-mutating
+  # release scenarios and no lane sets E2E_INCLUDE_LIFECYCLE on a GPU host, so
+  # combining it with @nightly would make this scenario unreachable on every lane;
+  # its Given step runs the same `install sdk --yes` as runtime-01, so it does the same
+  # host-level work: system-package consent, the torch system libraries, and the
+  # preferred-engine auto install (for vLLM families a sudo OpenMPI package install when
+  # missing, then a full vLLM engine install into the runtime), which adds nightly time;
+  # otherwise it touches only its own isolated runtime prefix.
+  #
+  # Native Linux only: @requires-os:linux keeps Windows out, and
+  # @requires-bare-metal keeps WSL2 out (it reports linux, so the first tag alone
+  # would not). WSL2 is excluded because no run of `comfyui install` there has
+  # been seen, not because the amdgpu premise is known to be absent; no ticket
+  # tracks lifting that gate. Separately, if Windows is ever admitted, note the
+  # `nvidia-*` check has no teeth there (PyPI's Windows torch wheels are CPU
+  # builds).
+  @id:comfyui-install-preserves-the-rocm-runtime @requires-gpu @nightly @requires-os:linux @requires-bare-metal
+  Scenario: comfyui-14 - Installing ComfyUI does not replace the ROCm runtime with a CUDA one
+    Given a machine with a managed ROCm runtime
+    And the runtime has torch and no CUDA packages
+    When the user installs ComfyUI without choosing a runtime
+    Then the ComfyUI install succeeds
+    And ComfyUI's dependencies were installed into the runtime
+    And the runtime's torch stack is unchanged
+    And no nvidia-* packages were added to the runtime

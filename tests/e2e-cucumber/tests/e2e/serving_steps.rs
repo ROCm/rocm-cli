@@ -149,6 +149,7 @@ async fn serve_and_wait(world: &mut E2eWorld, args: &[&str], model: &str, ready_
     if rc == 0 && model_is_ready(&MODELS_URL, Some(ready_substr), timeout_secs).await {
         world.endpoint = Some(SERVE_BASE_URL.to_string());
         world.model_name = Some(model.to_string());
+        world.serve_summary = Some(stdout);
         return;
     }
     let invocation = format!("`rocm {}`", args.join(" "));
@@ -549,6 +550,7 @@ async fn serve_gpu_model(world: &mut E2eWorld) {
         if rc == 0 && model_is_ready(&MODELS_URL, Some(ready_substr), timeout_secs).await {
             world.endpoint = Some(SERVE_BASE_URL.to_string());
             world.model_name = Some(model.to_string());
+            world.serve_summary = Some(stdout);
             return;
         }
         // `serve_failure_evidence` reads and copies out the log BEFORE it stops
@@ -631,6 +633,81 @@ async fn setup_lemonade_hf_checkpoint_model(world: &mut E2eWorld) {
         "Qwen3-0.6B",
     )
     .await;
+}
+
+#[given("a model is being served on aim")]
+async fn setup_aim_model(world: &mut E2eWorld) {
+    serve_aim_canary(world).await;
+}
+
+/// Serves the same hardware-verified AIM canary [`setup_aim_model`] does.
+/// Factored out so the lifecycle-parity scenario can call it a second time,
+/// after stopping the service, without duplicating the image/profile pin.
+async fn serve_aim_canary(world: &mut E2eWorld) {
+    // Serves via the raw AIM Docker image reference rather than the catalog
+    // recipe added in ROCMAI-555 — this is a hardware-verified serve+inference
+    // canary pinned to one exact image/profile, not a catalog-discovery test.
+    //
+    // The `aim-meta-llama-llama-3-2-1b-instruct` image originally used here
+    // bundles only Instinct-series (MI300X/MI250X/MI355X/MI325X/MI350X)
+    // profiles — confirmed via its container logs to report "Found 0
+    // compatible profiles" on Strix Halo/gfx1151, the only runner this
+    // scenario executes on. `aim-radeon-qwen-qwen3-5-9b` is a Radeon-targeted
+    // image, hardware-verified serving real inference on Strix Halo; its
+    // profile still needs an explicit pick via `--engine-env` because
+    // auto-selection isn't reliable for Radeon targets yet.
+    let image = "amdenterpriseai/aim-radeon-qwen-qwen3-5-9b:0.12.0-preview";
+    // The container bundles vLLM, which echoes the model's baked-in HF id
+    // (not the Docker image reference) as `model` — confirmed live on Strix
+    // Halo.
+    let model = "Qwen/Qwen3.5-9B";
+    serve_and_wait(
+        world,
+        &[
+            "serve",
+            image,
+            "--engine",
+            "aim",
+            "--engine-env",
+            "AIM_PROFILE_ID=vllm-w7900-bf16-tp1-latency",
+            "--managed",
+        ],
+        model,
+        "Qwen3.5-9B",
+    )
+    .await;
+}
+
+/// Stops the AIM service this scenario started and asserts the stop actually
+/// took: reuses [`stop_scenario_services`] (itself `crate::stop_managed_services`,
+/// the same real-record stop the serve-retry path and scenario teardown use),
+/// rather than a hardcoded service id — the AIM canary's id comes from a real
+/// `--managed` launch, not a planted record, so there is no fixed id to match.
+#[when("the user stops the AIM service")]
+async fn stop_aim_service(world: &mut E2eWorld) {
+    let status = stop_scenario_services(world);
+    assert!(
+        status.contains(": stopped"),
+        "expected the AIM service to stop cleanly, got: {status}"
+    );
+    // A stop that leaves the container running would let the next serve reuse
+    // it and still pass inference, so check the container is actually gone.
+    let remaining = std::process::Command::new("docker")
+        .args(["ps", "-q", "--filter", "name=rocm-aim-"])
+        .output()
+        .expect("docker ps should run on an AIM host");
+    let remaining = String::from_utf8_lossy(&remaining.stdout);
+    assert!(
+        remaining.trim().is_empty(),
+        "an AIM container is still running after the stop: {remaining}"
+    );
+}
+
+/// Serves the same AIM canary again, proving the engine can be launched a
+/// second time after a stop — the restart half of lifecycle parity.
+#[when("the user serves that same model on aim again")]
+async fn reserve_aim_model(world: &mut E2eWorld) {
+    serve_aim_canary(world).await;
 }
 
 #[given("a large model is being served on GPU")]
@@ -1366,10 +1443,50 @@ async fn assert_service_in_list(world: &mut E2eWorld) {
     );
 }
 
+/// The `device:` value as `rocm serve` / `rocm services list` print it, split
+/// into the backend it names and the GPU ordinal it pinned, if any.
+///
+/// Every engine reports `"<backend> gpu"` or `"<backend> gpu <n>"`
+/// (`engines/lemonade`'s and `engines/vllm`'s `reported_device`,
+/// `engines/aim`'s literal). `None` for anything else, which is what makes a
+/// hardcoded or malformed value fail rather than pass.
+fn parse_device_row(value: &str) -> Option<(&str, Option<u32>)> {
+    let mut parts = value.split_whitespace();
+    let backend = parts.next()?;
+    if parts.next()? != "gpu" {
+        return None;
+    }
+    let ordinal = match parts.next() {
+        Some(index) => Some(index.parse().ok()?),
+        None => None,
+    };
+    parts.next().is_none().then_some((backend, ordinal))
+}
+
+/// The value of the first `device:` row in `text`, trimmed.
+fn device_row_value(text: &str) -> Option<&str> {
+    text.lines()
+        .find_map(|line| line.trim_start().strip_prefix("device:"))
+        .map(str::trim)
+}
+
 /// ROCMAI-550: `rocm services list` must show the backend/device the engine
 /// actually selected (read live from its `Healthcheck` RPC), not just that a
 /// service exists. Reuses `assert_service_in_list`'s model-name match so this
 /// only checks the row for the service this scenario just started.
+///
+/// It asserts the VALUE, not merely the presence of the row. A row whose value
+/// were empty, malformed, or nailed to a constant would satisfy "starts with
+/// `device:`" while reporting nothing real, so this parses it and holds it to
+/// three independent facts:
+///
+/// 1. it has the `<backend> gpu [<n>]` shape every engine reports;
+/// 2. the backend is one this engine can actually have selected - only
+///    Lemonade has a Vulkan path, so `vulkan` from `vllm` or `aim` is wrong,
+///    and `unknown` is wrong from any of them;
+/// 3. it equals what the `rocm serve` deployment summary printed for the same
+///    service, which is the row the preceding Given produced and which nothing
+///    else in these scenarios looks at.
 #[then("the services list reports the engine's actual backend device")]
 async fn assert_services_list_reports_device(world: &mut E2eWorld) {
     let (stdout, _, _) = crate::run_rocm(world, &["services", "list"]);
@@ -1378,13 +1495,70 @@ async fn assert_services_list_reports_device(world: &mut E2eWorld) {
         .split("\n- ")
         .find(|block| block.to_lowercase().contains(&model.to_lowercase()))
         .unwrap_or_else(|| panic!("no services-list entry for model {model}:\n{stdout}"));
+    let device = device_row_value(block).unwrap_or_else(|| {
+        panic!(
+            "services list entry for {model} is missing a `device:` line - the \
+             engine's Healthcheck RPC should report the backend it actually \
+             selected:\n{block}"
+        )
+    });
+    let (backend, _ordinal) = parse_device_row(device).unwrap_or_else(|| {
+        panic!(
+            "`device: {device}` is not the `<backend> gpu [<n>]` shape every \
+             engine reports, so it cannot be the engine's own answer:\n{block}"
+        )
+    });
+
+    let engine = block
+        .lines()
+        .find_map(|line| line.trim_start().strip_prefix("engine:"))
+        .map_or_else(
+            || panic!("services-list entry for {model} has no engine:\n{block}"),
+            str::trim,
+        );
+    // Only Lemonade has a Vulkan llama.cpp backend; vLLM and AIM are ROCm-only,
+    // so `vulkan` from either would mean the row is not coming from the engine
+    // that served. `unknown` is the engines' own "I have no state for this",
+    // which `fetch_service_device` is supposed to drop rather than print.
+    let allowed: &[&str] = match engine {
+        "lemonade" => &["rocm", "vulkan"],
+        _ => &["rocm"],
+    };
     assert!(
-        block
-            .lines()
-            .any(|line| line.trim_start().starts_with("device:")),
-        "services list entry for {model} is missing a `device:` line — the engine's \
-         Healthcheck RPC should report the backend it actually selected:\n{block}"
+        allowed.contains(&backend),
+        "`device: {device}` names backend `{backend}`, which the `{engine}` \
+         engine cannot have selected (expected one of {allowed:?}):\n{block}"
     );
+
+    // The same fact, read from the other surface. `rocm serve` printed this row
+    // at launch; nothing else in these scenarios inspects that summary, so
+    // without this the summary half of ROCMAI-550 has no live assertion at all.
+    //
+    // The summary row is conditional by design: `serve` only asks the engine
+    // once the launch already reported `ready`, and a managed launch can return
+    // while the weights are still loading (which is why the Given then polls
+    // `/v1/models`). So the assertion is two-sided rather than unconditional -
+    // a device row must agree with this one, and its absence must be explained
+    // by a not-yet-ready launch rather than by the row having been dropped.
+    let summary = world
+        .serve_summary
+        .as_deref()
+        .expect("the Given step must have recorded the serve summary");
+    match device_row_value(summary) {
+        Some(summary_device) => assert_eq!(
+            summary_device, device,
+            "`rocm serve` and `rocm services list` must report the same device \
+             for one service; they read it from the same Healthcheck RPC"
+        ),
+        None => assert!(
+            !summary
+                .lines()
+                .any(|line| line.trim_start().starts_with("status")
+                    && line.trim_end().ends_with("ready")),
+            "the serve summary reported `ready` but printed no `device:` row, so \
+             the row was dropped rather than deferred:\n{summary}"
+        ),
+    }
 }
 
 #[then("the list reports the attempt and how to look at it")]

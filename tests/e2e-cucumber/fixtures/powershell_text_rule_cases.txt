@@ -1,0 +1,92 @@
+# Cases for the text rule over the lines `rocm fix` and `rocm diagnose` print for
+# Windows: what it must refuse (`flag`) and what it must let through (`pass`).
+#
+# The rule exists twice. `fails_in_windows_powershell` in
+# crates/rocm-core/src/fix.rs checks the catalog and the diagnosis fixes; the
+# diagnose-43..45 steps use `powershell_text_rule::refusal` in this crate, which
+# does not depend on rocm-core. Both read this file and must agree on every
+# line, so a change to one rule that the other does not follow fails a test on
+# whichever side was left behind. Add a case here, not in either test.
+#
+# One case per line: `flag <line>` or `pass <line>`. Blank lines and `#` lines
+# are ignored.
+
+# `&&` and `||` are syntax errors in Windows PowerShell 5.1.
+flag a && b
+flag a || b
+flag env | grep HSA_OVERRIDE_GFX_VERSION || echo OK_UNSET
+
+# A bare `where` is `Where-Object` in PowerShell. A lone `&` is cmd's command
+# separator, so `where` starts a command after it.
+flag where foo.dll
+flag echo x | where foo
+flag echo x & where foo
+flag where foo & echo x
+flag (where foo.dll)
+flag cmd /c where foo.dll
+flag cmd /c "where foo.dll"
+flag powershell -NoProfile -Command "where foo.dll"
+pass where.exe foo.dll
+pass echo x & where.exe foo
+pass cmd /c where.exe foo.dll
+pass echo where is it
+
+# PowerShell does not expand `%NAME%`.
+flag setx PATH "%PATH%;C:\bin"
+flag echo %HIP_PATH%
+pass echo 100% done
+pass echo 50%x
+pass echo % %
+pass a | b
+
+# An empty-string argument to a native program is dropped by Windows
+# PowerShell 5.1, so `setx` gets one argument and fails.
+flag setx HSA_OVERRIDE_GFX_VERSION ""
+flag setx HSA_OVERRIDE_GFX_VERSION ''
+flag tool a "" b
+# An empty string that is not a whole argument, or that sits in a body.
+pass python -c "print('')"
+pass powershell -NoProfile -Command "Get-Item a -ErrorAction Stop | Where-Object Name -ne ''"
+pass [Environment]::SetEnvironmentVariable('HSA_OVERRIDE_GFX_VERSION',$null,'User')
+
+# `-Command` is not case-sensitive, and `-c` and the other prefixes of it are
+# the same flag. `\"` inside the body ends the string early in PowerShell, and
+# `$_` in it is expanded by the outer shell.
+flag powershell -NoProfile -command "(Get-Item a | Where-Object { $_.Name -like 'x' })"
+flag powershell -NoProfile -Command "(Get-Item a | Where-Object { $_.Name -like 'x' })"
+flag powershell -NoProfile -Command "& \"C:\x\hipInfo.exe\" | Select-Object -First 5"
+flag powershell -NoProfile -c "& \"C:\x\hipInfo.exe\" | Select-Object -First 5"
+flag powershell -NoProfile -comm "(Get-Item a | Where-Object { $_.Name -like 'x' })"
+
+# cmd does not take a single-quoted argument as one argument.
+flag powershell -NoProfile -Command 'Get-Item a | Select-Object Name'
+flag powershell -NoProfile -c 'Get-Item a'
+
+# An outer PowerShell expands any `$` in a double-quoted body before the inner
+# one starts, `$env:SystemRoot` included: with a space in its value it would
+# split the inner command.
+flag powershell -NoProfile -Command "& (Join-Path $env:HIP_PATH 'bin\hipInfo.exe')"
+flag powershell -NoProfile -Command "Get-Item $env:SystemRoot\a.dll, $env:HIP_PATH"
+flag powershell -NoProfile -Command "(Get-Item $env:SystemRoot\System32\a.dll).VersionInfo"
+flag powershell -NoProfile -c "(Get-Item $env:SystemRoot\System32\a.dll).VersionInfo"
+flag powershell -NoProfile -Command "$null"
+
+# What the catalog prints instead.
+pass powershell -NoProfile -Command "& 'C:\x\hipInfo.exe' | Select-Object -First 5"
+pass powershell -NoProfile -Command "Get-Item a -ErrorAction Stop | Where-Object Name -match 'x'"
+pass powershell -NoProfile -Command "(Get-Item ([Environment]::GetFolderPath('System') + '\a.dll') -ErrorAction Stop).VersionInfo"
+pass powershell -NoProfile -c "(Get-Item ([Environment]::GetFolderPath('System') + '\a.dll') -ErrorAction Stop).VersionInfo"
+
+# `Get-Item` on a missing path is a non-terminating error, and the line exits 0.
+flag powershell -NoProfile -Command "(Get-Item ([Environment]::GetFolderPath('System') + '\a.dll')).VersionInfo"
+flag POWERSHELL -command "(GET-ITEM 'x').Length"
+
+# The bare `where` match ignores case, like the rest of the rule.
+flag CMD /C WHERE foo.dll
+flag WHERE foo.dll
+
+# Not a PowerShell `-Command` line, so the body rule does not apply.
+pass python -c "print('a')"
+pass python -c "import os; print(os.environ.get('A') or 'B')"
+pass rocminfo | head -n 5
+pass echo "${HSA_OVERRIDE_GFX_VERSION:-OK_UNSET}"

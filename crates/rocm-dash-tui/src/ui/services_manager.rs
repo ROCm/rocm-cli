@@ -424,7 +424,8 @@ fn trunc(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use crate::app::test_support::press as key;
+    use crossterm::event::KeyCode;
     use rocm_dash_core::metrics::{Instance, InstanceStatus};
 
     fn inst(id: &str, model: &str, tps: Option<f64>) -> Instance {
@@ -444,10 +445,6 @@ mod tests {
         m.insert("a".into(), inst("svc-a", "llama3", Some(42.0)));
         m.insert("b".into(), inst("svc-b", "qwen", None));
         m
-    }
-
-    fn key(c: KeyCode) -> KeyEvent {
-        KeyEvent::new(c, KeyModifiers::NONE)
     }
 
     #[test]

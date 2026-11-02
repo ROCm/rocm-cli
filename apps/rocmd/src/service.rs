@@ -7,6 +7,7 @@ use rocm_core::{
     AppPaths, AutomationRuntimeState, ManagedServiceRecord, RocmCliConfig, WatcherRuntimeSnapshot,
     builtin_watchers, daemon_binary_path, unix_time_millis,
 };
+use rocm_engine_protocol::{EngineMethod, StopRequest, StopResponse};
 use serde_json::Value;
 use serde_json::json;
 use std::fs;
@@ -38,6 +39,31 @@ pub(crate) fn stop_managed_service_with(
     service_id: &str,
     terminate: impl Fn(&rocm_core::ProcessIdentity) -> rocm_core::TerminationOutcome,
 ) -> Result<Value> {
+    stop_managed_service_via(paths, service_id, terminate, request_engine_stop)
+}
+
+fn request_engine_stop(paths: &AppPaths, record: &ManagedServiceRecord) -> Result<StopResponse> {
+    crate::common::engine_request::<_, StopResponse>(
+        paths,
+        &record.engine,
+        &record.service_id,
+        EngineMethod::Stop,
+        &StopRequest {
+            service_id: record.service_id.clone(),
+            force: true,
+        },
+    )
+}
+
+/// [`stop_managed_service_with`], with the engine `Stop` request supplied by the
+/// caller as well, so a test can see what was asked of the engine and make it
+/// fail.
+pub(crate) fn stop_managed_service_via(
+    paths: &AppPaths,
+    service_id: &str,
+    terminate: impl Fn(&rocm_core::ProcessIdentity) -> rocm_core::TerminationOutcome,
+    engine_stop: impl Fn(&AppPaths, &ManagedServiceRecord) -> Result<StopResponse>,
+) -> Result<Value> {
     let mut stopping = find_managed_service(paths, service_id)?;
     // Record the request before the stop starts, not only after it ends. A stop
     // can take up to `MANAGED_STOP_GRACE` twice per recorded PID, and for that
@@ -48,6 +74,12 @@ pub(crate) fn stop_managed_service_with(
     let requested_at = rocm_core::unix_time_millis();
     stopping.stop_requested_unix_ms = Some(requested_at);
     stopping.write()?;
+    // Ask the engine to stop before signalling recorded PIDs. Lemonade is
+    // skipped: `rocm services stop` unloads its model over HTTP rather than
+    // sending it an engine `Stop`, and this path has never touched it. For a
+    // container-backed engine (`aim`) this is the only thing that stops the
+    // container, since its recorded PIDs are only the supervisor that follows it.
+    let engine_stop = (stopping.engine != "lemonade").then(|| engine_stop(paths, &stopping));
     let stops = terminate_recorded_service_pids(&stopping, terminate);
     let pids_where = |keep: fn(&RecordedPidStop) -> bool| -> Vec<u32> {
         stops
@@ -86,8 +118,11 @@ pub(crate) fn stop_managed_service_with(
     // stop was running — those are processes it never touched, and claiming the
     // service stopped, clearing their PIDs or dropping the key they serve with
     // would each be false.
-    let all_stopped =
-        stops.iter().all(|stop| stop.stopped) && stopping.names_same_processes(&record);
+    let engine_stop_confirms = !rocm_core::engine_stop_decides_confirmation(&stopping.engine)
+        || engine_stop.as_ref().is_some_and(Result::is_ok);
+    let all_stopped = stops.iter().all(|stop| stop.stopped)
+        && stopping.names_same_processes(&record)
+        && engine_stop_confirms;
     // A PID whose identity cannot be read at all — `/proc/<pid>/stat`
     // unreadable while `kill(pid, 0)` still answers: another uid, `hidepid`, an
     // LSM — comes back `Unverified`, which never counts as stopped. Nor can it
@@ -150,8 +185,26 @@ pub(crate) fn stop_managed_service_with(
         "force_signaled_pids": force_signaled_pids,
         "skipped_pids": skipped_pids,
         "pid_outcomes": pid_outcomes,
+        "engine_stop": engine_stop_report(engine_stop),
         "stopped": all_stopped,
     }))
+}
+
+/// The engine `Stop` outcome as it appears in a stop report; `null` when no
+/// engine `Stop` was sent.
+fn engine_stop_report(engine_stop: Option<Result<StopResponse>>) -> Value {
+    match engine_stop {
+        None => Value::Null,
+        Some(Ok(response)) => json!({
+            "attempted": true,
+            "stopped": response.stopped,
+            "graceful": response.graceful,
+        }),
+        Some(Err(error)) => json!({
+            "attempted": true,
+            "error": error.to_string(),
+        }),
+    }
 }
 
 /// Whether a [`stop_managed_service`] report confirms that every recorded
@@ -1842,6 +1895,124 @@ mod tests {
                 .context("the stop never reached a termination")??,
             "the stop request must be on disk while the processes are being stopped"
         );
+        Ok(())
+    }
+
+    /// Seeds a keyed service and relabels it as belonging to `engine`.
+    fn seed_service_for_engine(
+        paths: &AppPaths,
+        service_id: &str,
+        port: u16,
+        engine: &str,
+    ) -> Result<()> {
+        seed_keyed_service(paths, service_id, port)?;
+        let mut record = load_service_record(paths, service_id)?;
+        record.engine = engine.to_owned();
+        record.write()
+    }
+
+    /// A container-backed service (`aim`) has no process whose exit proves it
+    /// stopped, so a stop must send the engine a `Stop` and report its result.
+    #[test]
+    fn stopping_an_aim_service_sends_the_engine_a_forced_stop() -> Result<()> {
+        let (root, paths) = temp_app_paths("stop-aim-sends-engine-stop");
+        paths.ensure()?;
+        let service_id = "svc-stop-aim-sends-engine-stop";
+        seed_service_for_engine(&paths, service_id, 11460, "aim")?;
+        let requested = std::cell::RefCell::new(Vec::new());
+
+        let result = stop_managed_service_via(
+            &paths,
+            service_id,
+            |_| rocm_core::TerminationOutcome::Graceful,
+            |_, record| {
+                requested
+                    .borrow_mut()
+                    .push((record.engine.clone(), record.service_id.clone()));
+                Ok(StopResponse {
+                    stopped: true,
+                    graceful: false,
+                })
+            },
+        );
+        fs::remove_dir_all(root).ok();
+
+        let report = result?;
+        assert_eq!(
+            requested.into_inner(),
+            vec![("aim".to_owned(), service_id.to_owned())]
+        );
+        assert_eq!(report["stopped"], true);
+        assert_eq!(report["engine_stop"]["attempted"], true);
+        assert_eq!(report["engine_stop"]["stopped"], true);
+        Ok(())
+    }
+
+    /// If the container cannot be stopped the service is still running, however
+    /// cleanly its supervisor process went away.
+    #[test]
+    fn a_failed_engine_stop_leaves_an_aim_service_unconfirmed() -> Result<()> {
+        let (root, paths) = temp_app_paths("stop-aim-engine-stop-fails");
+        paths.ensure()?;
+        let service_id = "svc-stop-aim-engine-stop-fails";
+        seed_service_for_engine(&paths, service_id, 11461, "aim")?;
+
+        let result = stop_managed_service_via(
+            &paths,
+            service_id,
+            |_| rocm_core::TerminationOutcome::Graceful,
+            |_, _| anyhow::bail!("docker kill failed"),
+        );
+        let reloaded = load_service_record(&paths, service_id);
+        fs::remove_dir_all(root).ok();
+
+        let report = result?;
+        assert_eq!(report["stopped"], false);
+        assert!(
+            report["engine_stop"]["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("docker kill failed")),
+            "{report}"
+        );
+        let reloaded = reloaded?;
+        assert_ne!(reloaded.status, "stopped");
+        assert!(reloaded.stop_requested_unix_ms.is_some());
+        Ok(())
+    }
+
+    /// Lemonade is unloaded over HTTP by `rocm services stop`, never sent an
+    /// engine `Stop`; this path must not newly start doing so. A PID-supervised
+    /// engine gets the `Stop` but its PIDs stay authoritative for the verdict.
+    #[test]
+    fn engine_stop_is_skipped_for_lemonade_and_advisory_for_pid_engines() -> Result<()> {
+        let (root, paths) = temp_app_paths("stop-engine-stop-policy");
+        paths.ensure()?;
+        seed_service_for_engine(&paths, "svc-stop-policy-lemonade", 11462, "lemonade")?;
+        seed_service_for_engine(&paths, "svc-stop-policy-vllm", 11463, "vllm")?;
+
+        let lemonade = stop_managed_service_via(
+            &paths,
+            "svc-stop-policy-lemonade",
+            |_| rocm_core::TerminationOutcome::Graceful,
+            |_, _| panic!("lemonade must not be sent an engine Stop"),
+        );
+        let vllm = stop_managed_service_via(
+            &paths,
+            "svc-stop-policy-vllm",
+            |_| rocm_core::TerminationOutcome::Graceful,
+            |_, _| anyhow::bail!("engine unreachable"),
+        );
+        fs::remove_dir_all(root).ok();
+
+        let lemonade = lemonade?;
+        assert_eq!(lemonade["stopped"], true);
+        assert!(lemonade["engine_stop"].is_null());
+        let vllm = vllm?;
+        assert_eq!(
+            vllm["stopped"], true,
+            "the PIDs decide for a process engine"
+        );
+        assert!(vllm["engine_stop"]["error"].is_string());
         Ok(())
     }
 

@@ -369,11 +369,8 @@ fn render_field(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::test_support::press as key;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-
-    fn key(c: KeyCode) -> KeyEvent {
-        KeyEvent::new(c, KeyModifiers::NONE)
-    }
 
     fn type_str(br: &mut Option<BenchRunState>, jobs: &mut State, s: &str) {
         for ch in s.chars() {

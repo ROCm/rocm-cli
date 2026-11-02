@@ -117,6 +117,18 @@ mod tests {
              marker on every repaint, so transliterating anything here in isolation \
              would change nothing observable.",
         ),
+        (
+            "apps/rocm/src/advised_commands.rs",
+            "Test code, compiled into no binary: `apps/rocm/src/main.rs` declares it \
+             only as `#[cfg(test)] mod advised_commands;`, which `TEST_ONLY_FRAGMENTS` \
+             (a path test) cannot see. Its non-ASCII literals are needles and fixtures \
+             of the advised-command checker -- the em dash, en dash and arrow that end \
+             a command in prose, the ellipsis a doc writes for an omitted argument, \
+             and a Unicode model reference fed to `generate_service_id` -- so they are \
+             matched against the docs, never written anywhere. Spelling them as \
+             `\\u{..}` escapes would not help: this scan flags an escape that denotes \
+             non-ASCII just the same.",
+        ),
     ];
 
     /// Path fragments that mark test-only sources: integration-test crates,

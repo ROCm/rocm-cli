@@ -412,6 +412,7 @@ fn resolve_model_response(request: ResolveModelRequest) -> Result<ResolveModelRe
     let canonical_model_id = crate::state::resolve_lemonade_model_ref(&request.model_ref);
     Ok(ResolveModelResponse {
         canonical_model_id,
+        served_model_id: None,
         task: "chat-completions".to_owned(),
         source: "lemonade".to_owned(),
         revision: "main".to_owned(),

@@ -313,12 +313,21 @@ struct ManagedRuntimeCandidate {
 fn load_runtime_manifests(runtime_id: Option<&str>) -> Result<Vec<TheRockRuntimeManifest>> {
     let paths = AppPaths::discover()?;
     let registry = paths.data_dir.join("runtimes").join("registry");
+    load_runtime_manifests_in(&registry, runtime_id)
+}
+
+/// The registry manifests in `registry` matching `runtime_id`, in
+/// [`sort_manifests_newest_install_first`]'s order.
+fn load_runtime_manifests_in(
+    registry: &Path,
+    runtime_id: Option<&str>,
+) -> Result<Vec<TheRockRuntimeManifest>> {
     if !registry.is_dir() {
         return Ok(Vec::new());
     }
     let mut manifests = Vec::new();
     for entry in
-        fs::read_dir(&registry).with_context(|| format!("failed to read {}", registry.display()))?
+        fs::read_dir(registry).with_context(|| format!("failed to read {}", registry.display()))?
     {
         let path = entry?.path();
         if path.extension().and_then(|value| value.to_str()) != Some("json") {
@@ -332,13 +341,31 @@ fn load_runtime_manifests(runtime_id: Option<&str>) -> Result<Vec<TheRockRuntime
         if !runtime_matches(&manifest, runtime_id) {
             continue;
         }
-        manifests.push((manifest.installed_at_unix_ms.unwrap_or(0), manifest));
+        manifests.push((path, manifest));
     }
-    manifests.sort_by_key(|(installed_at, _)| std::cmp::Reverse(*installed_at));
+    sort_manifests_newest_install_first(&mut manifests);
     Ok(manifests
         .into_iter()
         .map(|(_, manifest)| manifest)
         .collect())
+}
+
+/// Order newest install first, breaking ties on the runtime key and then on the
+/// manifest's own file path, so the result is a function of registry contents
+/// only rather than of whatever order `read_dir` happened to return — a
+/// `--devel` install and its plain sibling land in the same millisecond. A
+/// manifest without `installed_at_unix_ms` (written before the field existed)
+/// reads as installed at 0. This matches the tiebreak the CLI's own registry
+/// order uses.
+fn sort_manifests_newest_install_first(manifests: &mut [(PathBuf, TheRockRuntimeManifest)]) {
+    manifests.sort_by(|(left_path, left), (right_path, right)| {
+        right
+            .installed_at_unix_ms
+            .unwrap_or(0)
+            .cmp(&left.installed_at_unix_ms.unwrap_or(0))
+            .then_with(|| left.runtime_key.cmp(&right.runtime_key))
+            .then_with(|| left_path.cmp(right_path))
+    });
 }
 /// The torch build the SDK installed into this runtime, as its manifest records it.
 ///
@@ -1177,6 +1204,142 @@ mod tests {
             assert!(
                 !env.path().join("rocm-cli-lib-compat").exists(),
                 "must not write into the venv root's compat dir when sdk_root is absent"
+            );
+        }
+    }
+
+    #[test]
+    fn load_runtime_manifests_breaks_install_time_ties_on_the_runtime_key() -> Result<()> {
+        // Both pairings of file name and runtime key, so a read-order pick is wrong
+        // in one of them. A third, older manifest proves the tie only applies to
+        // manifests that actually share `installed_at_unix_ms`.
+        for (first_file_key, second_file_key) in [("aaa", "bbb"), ("bbb", "aaa")] {
+            let registry = std::env::temp_dir().join(format!(
+                "rocm-engine-vllm-runtime-tie-{first_file_key}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir_all(&registry)?;
+
+            for (file, key) in [("first", first_file_key), ("second", second_file_key)] {
+                fs::write(
+                    registry.join(format!("{file}.json")),
+                    serde_json::to_vec(&serde_json::json!({
+                        "runtime_key": key,
+                        "runtime_id": "therock-stable:gfx94X-dcgpu",
+                        "installed_at_unix_ms": 2_000_u128,
+                    }))?,
+                )?;
+            }
+            fs::write(
+                registry.join("older.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "runtime_key": "older",
+                    "runtime_id": "therock-stable:gfx94X-dcgpu",
+                    "installed_at_unix_ms": 1_000_u128,
+                }))?,
+            )?;
+
+            let manifests =
+                load_runtime_manifests_in(&registry, Some("therock-stable:gfx94X-dcgpu"));
+            let _ = fs::remove_dir_all(&registry);
+            let manifests = manifests?;
+
+            let keys: Vec<Option<String>> = manifests
+                .into_iter()
+                .map(|manifest| manifest.runtime_key)
+                .collect();
+            assert_eq!(
+                keys,
+                vec![
+                    Some("aaa".to_owned()),
+                    Some("bbb".to_owned()),
+                    Some("older".to_owned())
+                ],
+                "files first={first_file_key}, second={second_file_key}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn manifests_without_a_key_or_a_time_still_sort_deterministically() {
+        let manifest = |path: &str, fields: serde_json::Value| {
+            (
+                PathBuf::from(path),
+                serde_json::from_value::<TheRockRuntimeManifest>(fields).expect("manifest"),
+            )
+        };
+        let paths = |manifests: &[(PathBuf, TheRockRuntimeManifest)]| {
+            manifests
+                .iter()
+                .map(|(path, _)| path.display().to_string())
+                .collect::<Vec<_>>()
+        };
+
+        // Two keyless manifests in the same millisecond differ only in their
+        // path, so the path is the last tiebreak and decides in both input
+        // orders.
+        for mut manifests in [
+            vec![
+                manifest(
+                    "b.json",
+                    serde_json::json!({ "installed_at_unix_ms": 2_000 }),
+                ),
+                manifest(
+                    "a.json",
+                    serde_json::json!({ "installed_at_unix_ms": 2_000 }),
+                ),
+            ],
+            vec![
+                manifest(
+                    "a.json",
+                    serde_json::json!({ "installed_at_unix_ms": 2_000 }),
+                ),
+                manifest(
+                    "b.json",
+                    serde_json::json!({ "installed_at_unix_ms": 2_000 }),
+                ),
+            ],
+        ] {
+            sort_manifests_newest_install_first(&mut manifests);
+            assert_eq!(paths(&manifests), ["a.json", "b.json"]);
+        }
+
+        // A manifest written before `installed_at_unix_ms` existed reads as
+        // installed at 0: it ties with an explicit 0 (so the key decides) and
+        // sorts below any real install time.
+        for mut manifests in [
+            vec![
+                manifest("untimed.json", serde_json::json!({ "runtime_key": "aaa" })),
+                manifest(
+                    "zero.json",
+                    serde_json::json!({ "runtime_key": "bbb", "installed_at_unix_ms": 0 }),
+                ),
+                manifest(
+                    "timed.json",
+                    serde_json::json!({ "runtime_key": "zzz", "installed_at_unix_ms": 1 }),
+                ),
+            ],
+            vec![
+                manifest(
+                    "timed.json",
+                    serde_json::json!({ "runtime_key": "zzz", "installed_at_unix_ms": 1 }),
+                ),
+                manifest(
+                    "zero.json",
+                    serde_json::json!({ "runtime_key": "bbb", "installed_at_unix_ms": 0 }),
+                ),
+                manifest("untimed.json", serde_json::json!({ "runtime_key": "aaa" })),
+            ],
+        ] {
+            sort_manifests_newest_install_first(&mut manifests);
+            assert_eq!(
+                paths(&manifests),
+                ["timed.json", "untimed.json", "zero.json"]
             );
         }
     }

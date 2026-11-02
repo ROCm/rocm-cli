@@ -25,6 +25,9 @@ libc.workspace = true
 rand.workspace = true
 regex = "1"
 rsa.workspace = true
+# File identity (inode / Windows file index), so the lock-free JSONL readers in
+# `automation.rs` can tell when a store rotation renamed a file under them.
+same-file = "1"
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

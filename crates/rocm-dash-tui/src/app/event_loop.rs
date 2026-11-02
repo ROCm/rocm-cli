@@ -1245,8 +1245,10 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
                         );
                         crate::jobs::run_effects(fx, &job_tx);
                     }
-                    // The examine overlay, when open, owns all keys (read-only
-                    // `rocm examine` job through the job-bridge).
+                    // The examine overlay, when open, owns all keys. It runs the
+                    // read-only `rocm examine` job and the Doctor report preview
+                    // through the job-bridge. A report send runs only after an
+                    // approval.
                     Some(Ok(CtEvent::Key(k))) if state.examine_manager.is_some() => {
                         let fx = crate::ui::examine_manager::on_key(
                             &mut state.examine_manager,

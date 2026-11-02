@@ -15,7 +15,7 @@ mod test_support;
 mod watchers;
 mod webhook;
 
-pub use cli::{run_bin_cli, run_from_args};
+pub use cli::{parse_args, run_bin_cli, run_from_args};
 
 use std::time::Duration;
 

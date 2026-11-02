@@ -224,6 +224,15 @@ pub async fn run_bin_cli() -> Result<()> {
     run_cli(cli).await
 }
 
+/// Parse `args` with the real `rocmd` command line and run nothing.
+///
+/// `rocm`'s advised-command check uses it: [`run_from_args`] would execute the
+/// command, and appending `--help` instead makes clap stop before it validates
+/// conflicting or required arguments.
+pub fn parse_args(args: Vec<OsString>) -> std::result::Result<(), clap::Error> {
+    Cli::try_parse_from(args).map(|_| ())
+}
+
 pub fn run_from_args(args: Vec<OsString>) -> Result<()> {
     let cli = Cli::try_parse_from(args)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -359,6 +368,33 @@ async fn run_cli(cli: Cli) -> Result<()> {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn parse_args_validates_without_running() {
+        let argv = |extra: &[&str]| -> Vec<OsString> {
+            [
+                "rocmd",
+                "supervise",
+                "svc",
+                "--engine",
+                "e",
+                "--model-ref",
+                "m",
+                "--canonical-model-id",
+                "c",
+                "--port",
+                "1",
+            ]
+            .iter()
+            .chain(extra)
+            .map(OsString::from)
+            .collect()
+        };
+        parse_args(argv(&["--runtime-id", "a"])).expect("a complete supervise command parses");
+        let error = parse_args(argv(&["--runtime-id", "a", "--env-id", "b"]))
+            .expect_err("the two ids conflict");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
 
     #[test]
     fn direct_mcp_call_parses_allow_mutation_flag() {

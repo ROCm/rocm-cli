@@ -1145,6 +1145,7 @@ mod tests {
             simulated: false,
             last_body_area: None,
             last_tab_bar_area: None,
+            last_header_badge: None,
             last_footer_chips: Vec::new(),
             jobs: rocm_dash_core::state::State::default(),
             services: None,
