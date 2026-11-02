@@ -214,23 +214,6 @@ pub(crate) fn stop_report_confirmed(report: &Value) -> bool {
     report.get("stopped").and_then(Value::as_bool) == Some(true)
 }
 
-/// The `stop_server` sandbox tool's answer for a [`stop_managed_service`]
-/// report. The status is taken from the same verdict that decided what the
-/// stop wrote to the manifest, so the two cannot disagree.
-pub(crate) fn sandbox_stop_server_value(stopped: Value) -> Value {
-    let status = if stop_report_confirmed(&stopped) {
-        "stopped"
-    } else {
-        "stop_unconfirmed"
-    };
-    json!({
-        "tool": crate::sandbox_tool::SandboxToolArg::StopServer.as_cli_value(),
-        "status": status,
-        "mutating": true,
-        "result": stopped,
-    })
-}
-
 /// How long a stop waits for a recorded process tree to exit on its own before
 /// escalating to a forced kill. Matches `rocm services stop`, which terminates
 /// the same records.
