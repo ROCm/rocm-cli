@@ -25,7 +25,7 @@
 //! (`friendly_engine_label`), which only `chat.rs` reads. `service_records.rs`
 //! calls into it for the in-use check behind service-record removal and pruning
 //! (`managed_service_is_live`, `recorded_service_pids`) and for
-//! `load_managed_services` in prune planning, and `main.rs` calls
+//! `load_managed_services` in prune planning, and `bridge_snapshot.rs` calls
 //! `load_managed_services` for the codex-bridge snapshot;
 //! `services_text.rs` reads the sidebar helpers for the local-servers view;
 //! `chat.rs` calls into it for the deterministic services-tool summary;

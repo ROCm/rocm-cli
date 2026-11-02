@@ -11,6 +11,7 @@ mod advised_commands;
 mod archive_props;
 mod automations;
 mod bootstrap;
+mod bridge_snapshot;
 mod chat;
 mod chat_host_facts;
 mod cli_audit;
@@ -93,9 +94,17 @@ mod update_cmd;
 // `crate::<name>`; `main.rs` itself calls `record_cli_audit_event`.
 // `therock_install_version_selector` (from `install_cmd.rs`) is re-imported for
 // the same reason: `chat.rs` reaches it as `crate::therock_install_version_selector`.
+// `build_codex_bridge_gpu_snapshot` and `builtin_codex_bridge_engine_inventory`
+// (from `bridge_snapshot.rs`) are re-imported only so `chat.rs` keeps reaching
+// them as `crate::<name>`; `build_codex_bridge_snapshot` is called from
+// `dispatch()` as well.
 // `DEFAULT_SERVICE_PRUNE_MIN_AGE_HOURS` (from `service_records.rs`) is imported
 // for the `ServicesCommand::Prune` clap definition.
 use crate::automations::{automations, render_daemon_text};
+use crate::bridge_snapshot::{
+    build_codex_bridge_gpu_snapshot, build_codex_bridge_snapshot,
+    builtin_codex_bridge_engine_inventory,
+};
 use crate::cli_audit::{cli_lifecycle_log_path, record_cli_audit_event, sanitize_log_value};
 use crate::config_cmd::{config, render_config_text};
 use crate::diagnose_cmd::{diagnose, fix};
@@ -119,7 +128,6 @@ use crate::freeform_answer::render_freeform_read_only_answer;
 use crate::freeform_execution::{prepare_freeform_execution, render_freeform_execution_header};
 use crate::gpu_policy::{GpuVramUsage, parse_gpu_indices_arg, serve_gpu_low_memory_warning};
 use crate::install_cmd::{install, therock_install_version_selector};
-use crate::managed_service_status::load_managed_services;
 use crate::model_fit::{PlatformRuleOut, engine_ruled_out_by_platform};
 use crate::runtimes_cmd::{current_runtime_manifest, runtimes, setup_runtime_paths};
 use crate::serve_cmd::{ServeArgs, serve};
@@ -141,11 +149,9 @@ use crate::update_cmd::{apply_runtime_update, render_update_text, update_should_
 use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use rocm_core::{
-    AppPaths, AutomationRuntimeState, CodexBridgeEngine, CodexBridgeGpuSnapshot,
-    CodexBridgeSnapshot, DEFAULT_LOCAL_HOST, EndpointReadiness, ExamineSummary,
-    PERMISSIONS_MODE_ASK, PERMISSIONS_MODE_FULL_ACCESS, RocmCliConfig, TELEMETRY_MODE_LOCAL,
-    TELEMETRY_MODE_OFF, WatcherMode, daemon_binary_path, default_engine_for_platform,
-    interactive_terminal, load_recent_automation_events, uv_cache_source,
+    AppPaths, DEFAULT_LOCAL_HOST, EndpointReadiness, ExamineSummary, PERMISSIONS_MODE_ASK,
+    PERMISSIONS_MODE_FULL_ACCESS, RocmCliConfig, TELEMETRY_MODE_LOCAL, TELEMETRY_MODE_OFF,
+    WatcherMode, interactive_terminal, uv_cache_source,
 };
 use rocm_engine_protocol::{DevicePolicy, GpuSelection};
 use std::fs;
@@ -2459,73 +2465,6 @@ fn refresh_startup_update_check_quietly() {
         therock::maybe_refresh_startup_update_check(&paths, config.active_runtime_key.as_deref());
 }
 
-fn build_codex_bridge_snapshot(paths: &AppPaths) -> Result<CodexBridgeSnapshot> {
-    let config = RocmCliConfig::load(paths).unwrap_or_default();
-    Ok(CodexBridgeSnapshot {
-        protocol: "rocmd-codex-bridge-v0".to_owned(),
-        generated_at_unix_ms: rocm_core::unix_time_millis(),
-        examine: ExamineSummary::gather()?,
-        gpu: build_codex_bridge_gpu_snapshot(&config),
-        config,
-        automation_runtime: AutomationRuntimeState::load(paths)?,
-        recent_automation_events: load_recent_automation_events(paths, 32)?,
-        engines: builtin_codex_bridge_engine_inventory(),
-        services: load_managed_services(paths)?,
-    })
-}
-
-fn build_codex_bridge_gpu_snapshot(config: &RocmCliConfig) -> CodexBridgeGpuSnapshot {
-    if !config.telemetry.local_inspection_enabled() {
-        return CodexBridgeGpuSnapshot {
-            amd_smi_available: false,
-            static_snapshot: None,
-            monitor_snapshot: None,
-            note: Some("GPU telemetry is disabled by rocm-cli config.".to_owned()),
-        };
-    }
-
-    CodexBridgeGpuSnapshot {
-        amd_smi_available: false,
-        static_snapshot: None,
-        monitor_snapshot: None,
-        note: Some("Use `rocm examine` for the current local AMD GPU summary.".to_owned()),
-    }
-}
-
-fn builtin_codex_bridge_engine_inventory() -> Vec<CodexBridgeEngine> {
-    let default_engine = default_engine_for_platform();
-    let binary_path = daemon_binary_path()
-        .ok()
-        .map(|path| path.display().to_string());
-    builtin_engine_inventory()
-        .iter()
-        .map(|(id, summary)| CodexBridgeEngine {
-            id: (*id).to_owned(),
-            summary: (*summary).to_owned(),
-            default_for_platform: *id == default_engine,
-            installed_binary: true,
-            binary_path: binary_path.clone(),
-        })
-        .collect()
-}
-
-const fn builtin_engine_inventory() -> &'static [(&'static str, &'static str)] {
-    &[
-        (
-            "lemonade",
-            "default embedded Lemonade server with ROCm llama.cpp backend",
-        ),
-        (
-            "vllm",
-            "Linux/WSL ROCm GPU serving engine through external vLLM",
-        ),
-        (
-            "aim",
-            "AMD Enterprise AI pre-built Docker serving containers",
-        ),
-    ]
-}
-
 /// The `--json` document.
 ///
 /// `Examination` stays at the top level, verbatim: its field names deliberately
@@ -3078,6 +3017,7 @@ pub(crate) mod tests {
 
     use rocm_core::ManagedServiceRecord;
 
+    use crate::bridge_snapshot::builtin_engine_inventory;
     use crate::runtime_install_finalize::tests::finish_sdk_install_with;
     use crate::services_text::load_managed_service;
 
