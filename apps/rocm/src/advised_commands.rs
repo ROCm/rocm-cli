@@ -1228,7 +1228,7 @@ const NOT_INVOCATIONS: &[(&str, &str, &str)] = &[
         "report heading",
     ),
     (
-        "apps/rocm/src/main.rs",
+        "apps/rocm/src/config_cmd.rs",
         "rocm config",
         "heading of the `rocm config` report (`writeln!(output, \"rocm config\")`)",
     ),

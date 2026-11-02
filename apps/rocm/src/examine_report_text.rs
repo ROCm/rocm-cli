@@ -50,13 +50,11 @@
 //! `append_model_engine_support_lines` and this module's own test). Both
 //! stay private.
 //!
-//! `render_config_text` and `telemetry_policy_summary` sit immediately
+//! `render_config_text` and `telemetry_policy_summary` sat immediately
 //! adjacent to this cluster's end boundary in `main.rs` (they render the
-//! `rocm config` command's own output) but are explicitly out of scope —
-//! they don't fit any of the 8 named Phase 6f clusters, a gap already
-//! flagged on epic ROCMAI-27 and on ROCMAI-179 ("Phase 8: validate
-//! module-split sufficiency"). They are left exactly where they are,
-//! untouched by this change.
+//! `rocm config` command's own output) but were explicitly out of scope —
+//! they didn't fit any of the 8 named Phase 6f clusters — so this split
+//! left them where they were. They now live in `config_cmd.rs`.
 //!
 //! `dispatch()` calls directly into this module at two points — the
 //! `Command::Model` arm's calls to
