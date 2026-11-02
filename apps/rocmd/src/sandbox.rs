@@ -3,9 +3,9 @@
 // SPDX-License-Identifier: MIT
 
 use crate::ARTIFACT_PREFETCH_TIMEOUT;
-use crate::cli::{SandboxToolArg, SandboxToolPolicy};
 use crate::common;
 use crate::persistence::load_managed_services;
+use crate::sandbox_tool::{SandboxToolArg, SandboxToolPolicy};
 use crate::service::{sandbox_stop_server_value, stop_managed_service};
 use crate::watchers::restart_managed_service;
 use anyhow::{Context, Result, bail};

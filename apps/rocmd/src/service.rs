@@ -224,7 +224,7 @@ pub(crate) fn sandbox_stop_server_value(stopped: Value) -> Value {
         "stop_unconfirmed"
     };
     json!({
-        "tool": crate::cli::SandboxToolArg::StopServer.as_cli_value(),
+        "tool": crate::sandbox_tool::SandboxToolArg::StopServer.as_cli_value(),
         "status": status,
         "mutating": true,
         "result": stopped,

@@ -237,11 +237,11 @@ fn handle_therock_update_event(
     handle_therock_update_event_with_runner(paths, mode, state, event, |paths| {
         crate::sandbox::run_sandbox_tool(
             paths,
-            crate::cli::SandboxToolArg::CheckUpdates,
+            crate::sandbox_tool::SandboxToolArg::CheckUpdates,
             None,
             None,
             None,
-            crate::cli::SandboxToolPolicy::default(),
+            crate::sandbox_tool::SandboxToolPolicy::default(),
         )
     })
 }
@@ -362,7 +362,7 @@ fn restricted_check_updates_result(value: &Value) -> Result<RestrictedCheckUpdat
         .get("tool")
         .and_then(Value::as_str)
         .context("restricted update check did not report a tool name")?;
-    if tool != crate::cli::SandboxToolArg::CheckUpdates.as_cli_value() {
+    if tool != crate::sandbox_tool::SandboxToolArg::CheckUpdates.as_cli_value() {
         bail!("restricted update check returned `{tool}`, expected `check_updates`");
     }
     let status = value
@@ -988,11 +988,11 @@ fn handle_driver_upgrade_event(
     handle_driver_upgrade_event_with_runner(paths, mode, state, event, |paths| {
         crate::sandbox::run_sandbox_tool(
             paths,
-            crate::cli::SandboxToolArg::DriverPlan,
+            crate::sandbox_tool::SandboxToolArg::DriverPlan,
             None,
             None,
             None,
-            crate::cli::SandboxToolPolicy::default(),
+            crate::sandbox_tool::SandboxToolPolicy::default(),
         )
     })
 }
@@ -1106,7 +1106,7 @@ fn restricted_driver_plan_result(value: &Value) -> Result<RestrictedDriverPlanRe
         .get("tool")
         .and_then(Value::as_str)
         .context("restricted driver plan did not report a tool name")?;
-    if tool != crate::cli::SandboxToolArg::DriverPlan.as_cli_value() {
+    if tool != crate::sandbox_tool::SandboxToolArg::DriverPlan.as_cli_value() {
         bail!("restricted driver plan returned `{tool}`, expected `driver_plan`");
     }
     let status = value

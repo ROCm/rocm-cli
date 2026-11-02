@@ -9,6 +9,7 @@ mod common;
 mod mcp;
 mod persistence;
 mod sandbox;
+mod sandbox_tool;
 mod service;
 #[cfg(test)]
 mod test_support;
@@ -61,11 +62,11 @@ mod tests {
 
         let value = sandbox::run_sandbox_tool(
             &paths,
-            cli::SandboxToolArg::StopServer,
+            sandbox_tool::SandboxToolArg::StopServer,
             Some("svc-current".to_owned()),
             None,
             None,
-            cli::SandboxToolPolicy::default(),
+            sandbox_tool::SandboxToolPolicy::default(),
         )?;
         let reloaded = watchers::load_service_record(&paths, "svc-current")?;
         fs::remove_dir_all(root).ok();
