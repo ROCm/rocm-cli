@@ -27,6 +27,7 @@ mod dash_seam;
 mod deletion_properties;
 mod diagnose_cmd;
 mod driver_install;
+mod driver_plan;
 mod endpoint_keys;
 mod engine_ipc;
 mod engine_runtime_select;
