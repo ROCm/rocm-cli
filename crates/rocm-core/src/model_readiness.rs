@@ -1640,6 +1640,7 @@ mod tests {
             if let (Some(models), GgufRef::Hub { variant, .. }) = (&self.refusal, reference) {
                 return Err(anyhow::Error::new(ProjectorNamed {
                     variant: variant.clone().unwrap_or_default(),
+                    projectors: vec![variant.clone().unwrap_or_default()],
                     models: models.clone(),
                 }));
             }
@@ -1686,7 +1687,9 @@ mod tests {
                     variant: Some("Q4_K_M".to_owned()),
                 },
                 fit_request: FitRequest {
-                    context_size: DEFAULT_CONTEXT_SIZE,
+                    // 4096, written out: `--help` and the README state it
+                    // independently of the constant.
+                    context_size: 4096,
                     context_size_defaulted: true,
                     kv_cache_type: KvCacheType::F16,
                 },
@@ -1748,10 +1751,8 @@ mod tests {
             Some(CannotEstimateReason::NotAModel)
         );
         assert!(
-            estimate
-                .detail
-                .as_deref()
-                .is_some_and(|detail| detail.starts_with("`mmproj-vision-7b-f16.gguf` names a")),
+            estimate.detail.as_deref().is_some_and(|detail| detail
+                .starts_with("`mmproj-vision-7b-f16.gguf` is a multimodal projector")),
             "{:?}",
             estimate.detail
         );
@@ -1852,7 +1853,14 @@ mod tests {
             !text.contains("READY") && !text.contains("BLOCKED"),
             "{text}"
         );
-        assert!(text.contains("note: these are estimates"), "{text}");
+        // Labelled `note:`, as a figure's caveat, not `recipe note:`: there is no
+        // recipe behind an estimate.
+        assert!(
+            text.lines()
+                .any(|line| line.starts_with("   note: these are estimates")),
+            "{text}"
+        );
+        assert!(!text.contains("recipe note"), "{text}");
     }
 
     #[test]
@@ -2081,7 +2089,7 @@ mod tests {
             &FakeSource::weights(64),
         );
         let estimate = readiness.estimate.as_ref().unwrap();
-        assert_eq!(estimate.context_size, DEFAULT_CONTEXT_SIZE);
+        assert_eq!(estimate.context_size, 4096, "the default --help documents");
         assert!(estimate.context_size_defaulted);
         assert_eq!(estimate.kv_cache_type, KvCacheType::F16);
         let text = render_model_readiness_text(&readiness);

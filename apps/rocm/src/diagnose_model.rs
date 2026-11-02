@@ -11,8 +11,9 @@
 //! caveat: whether a device-visibility variable is set (read here), over the
 //! `amd-smi` rows the host's memory was classified from (passed in).
 //!
-//! The `Diagnose` command variant, its dispatch arm and `diagnose()` itself stay
-//! in `main.rs` with the rest of the command tree.
+//! The `Diagnose` command variant and its dispatch arm stay in `main.rs` with the
+//! rest of the command tree; `diagnose()` is in `diagnose_cmd.rs`, and the host
+//! assessment that calls [`attach_gguf_estimate`] in `model_fit.rs`.
 
 use crate::gpu_policy::GpuVramUsage;
 use clap::ValueEnum;
@@ -102,13 +103,34 @@ pub(crate) fn attach_gguf_estimate(
     gguf_source: &dyn GgufSource,
     vram: Option<&[GpuVramUsage]>,
 ) {
+    attach_gguf_estimate_with(
+        readiness,
+        context,
+        host,
+        gguf_source,
+        vram,
+        device_visibility_mask_is_set(),
+    );
+}
+
+/// [`attach_gguf_estimate`] with whether a mask is set passed in, so a test can
+/// drive it without touching the process environment.
+fn attach_gguf_estimate_with(
+    readiness: &mut ModelReadiness,
+    context: &ContextRequest,
+    host: &HostFacts,
+    gguf_source: &dyn GgufSource,
+    vram: Option<&[GpuVramUsage]>,
+    mask_set: bool,
+) {
     // The one step that can touch a file or the network, and only for a GGUF
     // reference the catalog does not carry; it reads the header, not the weights.
     attach_context_estimate(readiness, context, host, gguf_source);
     // Which card a device-visibility mask selects, in `amd-smi`'s numbering, has
     // not been verified on a multi-GPU machine, so an estimate that compared
-    // memory says so when it could have compared the wrong card.
-    note_mask_for_rows(readiness, vram, device_visibility_mask_is_set());
+    // memory says so when it could have compared the wrong card. After the
+    // estimate, never before: the caveat is attached to the estimate it doubts.
+    note_mask_for_rows(readiness, vram, mask_set);
 }
 
 /// [`note_unverified_mask`] over the rows `amd-smi` reported.
@@ -133,13 +155,21 @@ fn note_mask_for_rows(
 /// also honours `CUDA_VISIBLE_DEVICES`, which the memory classification does
 /// not, so a figure compared under it is just as open to doubt.
 fn device_visibility_mask_is_set() -> bool {
-    [
-        "HIP_VISIBLE_DEVICES",
-        "ROCR_VISIBLE_DEVICES",
-        "CUDA_VISIBLE_DEVICES",
-    ]
-    .iter()
-    .any(|name| std::env::var_os(name).is_some())
+    mask_set_where(|name| std::env::var_os(name).is_some())
+}
+
+/// The variables that hide GPUs from the runtime. The caveat text
+/// ([`rocm_core::model_readiness::MASK_UNVERIFIED_NOTE`]) names each of them;
+/// a test holds the two together.
+const DEVICE_VISIBILITY_VARIABLES: [&str; 3] = [
+    "HIP_VISIBLE_DEVICES",
+    "ROCR_VISIBLE_DEVICES",
+    "CUDA_VISIBLE_DEVICES",
+];
+
+/// Whether `is_set` holds for any of [`DEVICE_VISIBILITY_VARIABLES`].
+fn mask_set_where(is_set: impl Fn(&str) -> bool) -> bool {
+    DEVICE_VISIBILITY_VARIABLES.iter().any(|name| is_set(name))
 }
 
 #[cfg(test)]
@@ -252,6 +282,143 @@ mod tests {
         assert!(!noted(Some(&mixed), false), "no mask, nothing to doubt");
         assert!(!noted(Some(&same), true), "the same card either way");
         assert!(!noted(None, true), "no rows, no figure compared");
+    }
+
+    /// Each variable on its own counts as a mask, and the caveat names each.
+    #[test]
+    fn each_visibility_variable_alone_is_a_mask_and_the_caveat_names_it() {
+        // The three the runtime honours, named here so dropping one from the
+        // constant fails; and every entry of the constant, so adding one that
+        // the caveat does not name fails too.
+        for variable in [
+            "HIP_VISIBLE_DEVICES",
+            "ROCR_VISIBLE_DEVICES",
+            "CUDA_VISIBLE_DEVICES",
+        ] {
+            assert!(
+                DEVICE_VISIBILITY_VARIABLES.contains(&variable),
+                "{variable}"
+            );
+        }
+        for variable in DEVICE_VISIBILITY_VARIABLES {
+            assert!(mask_set_where(|name| name == variable), "{variable}");
+            assert!(
+                rocm_core::model_readiness::MASK_UNVERIFIED_NOTE.contains(variable),
+                "{variable}"
+            );
+        }
+        assert!(!mask_set_where(|_| false));
+    }
+
+    /// A GGUF of a few kilobytes: 32 layers, 8 KV heads of width 128, so its
+    /// KV cache is real and an estimate compares it against the card.
+    fn tiny_gguf() -> Vec<u8> {
+        fn string(out: &mut Vec<u8>, value: &str) {
+            out.extend_from_slice(&(value.len() as u64).to_le_bytes());
+            out.extend_from_slice(value.as_bytes());
+        }
+        fn entry_u32(out: &mut Vec<u8>, key: &str, value: u32) {
+            string(out, key);
+            out.extend_from_slice(&4_u32.to_le_bytes());
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        let mut metadata = Vec::new();
+        string(&mut metadata, "general.architecture");
+        metadata.extend_from_slice(&8_u32.to_le_bytes());
+        string(&mut metadata, "t");
+        entry_u32(&mut metadata, "t.block_count", 32);
+        entry_u32(&mut metadata, "t.embedding_length", 4096);
+        entry_u32(&mut metadata, "t.feed_forward_length", 14336);
+        entry_u32(&mut metadata, "t.attention.head_count", 32);
+        entry_u32(&mut metadata, "t.attention.head_count_kv", 8);
+        entry_u32(&mut metadata, "t.context_length", 8192);
+        let mut file = Vec::new();
+        file.extend_from_slice(b"GGUF");
+        file.extend_from_slice(&3_u32.to_le_bytes());
+        file.extend_from_slice(&1_u64.to_le_bytes());
+        file.extend_from_slice(&7_u64.to_le_bytes());
+        file.extend_from_slice(&metadata);
+        string(&mut file, "w");
+        file.extend_from_slice(&1_u32.to_le_bytes());
+        file.extend_from_slice(&1024_u64.to_le_bytes());
+        file.extend_from_slice(&0_u32.to_le_bytes());
+        file.extend_from_slice(&0_u64.to_le_bytes());
+        file.resize(file.len().div_ceil(32) * 32, 0);
+        file
+    }
+
+    struct OneFile(Vec<u8>);
+
+    impl GgufSource for OneFile {
+        fn open(
+            &self,
+            _reference: &rocm_core::gguf_source::GgufRef,
+        ) -> anyhow::Result<rocm_core::gguf_source::OpenedGguf> {
+            Ok(rocm_core::gguf_source::OpenedGguf {
+                reader: Box::new(std::io::Cursor::new(self.0.clone())),
+                size: self.0.len() as u64 + 1024 * 1024 * 1024,
+                description: "t.gguf".to_owned(),
+            })
+        }
+    }
+
+    /// The glue end to end: an estimate is read through the source and compared
+    /// with the card, and the mask caveat lands on it -- which it can only do
+    /// once the estimate exists, so the order of the two steps matters.
+    #[test]
+    fn attaching_an_estimate_under_a_mask_on_mixed_gpus_carries_the_caveat() {
+        let registry = rocm_core::builtin_model_recipe_registry();
+        let host = HostFacts {
+            accelerator_memory: AcceleratorMemory::Dedicated(24.0),
+            system_ram_gib: Some(64.0),
+        };
+        let attach = |mask_set: bool, rows: &[GpuVramUsage]| {
+            let mut readiness = crate::model_fit::assess_model_for_host(
+                "some-lab/never-curated-7b:Q4_K_M",
+                &ModelCatalogSource::Available(&registry),
+                &host,
+                None,
+                None,
+            );
+            attach_gguf_estimate_with(
+                &mut readiness,
+                &ContextRequest::default(),
+                &host,
+                &OneFile(tiny_gguf()),
+                Some(rows),
+                mask_set,
+            );
+            readiness
+        };
+        let mixed = [gpu_row(0, 24), gpu_row(1, 8)];
+        let noted = attach(true, &mixed);
+        let estimate = noted.estimate.as_ref().expect("an estimate was attached");
+        // Sized and compared, not just tagged with the card: `available_gib` is
+        // set before sizing, so on its own it would hold for an estimate that
+        // failed.
+        assert_eq!(
+            estimate.outcome,
+            rocm_core::gguf_fit::EstimateOutcome::Fits,
+            "{estimate:?}"
+        );
+        assert!(estimate.total_gib.is_some(), "{estimate:?}");
+        assert!(
+            estimate
+                .notes
+                .iter()
+                .any(|note| note == rocm_core::model_readiness::MASK_UNVERIFIED_NOTE),
+            "{:?}",
+            estimate.notes
+        );
+        let unmasked = attach(false, &mixed);
+        assert!(
+            !unmasked
+                .estimate
+                .expect("an estimate")
+                .notes
+                .iter()
+                .any(|note| note == rocm_core::model_readiness::MASK_UNVERIFIED_NOTE)
+        );
     }
 
     // Every spelling the flag takes maps to the type the estimate uses, so a

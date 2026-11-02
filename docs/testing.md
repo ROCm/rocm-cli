@@ -3411,7 +3411,7 @@ the text report opens `ESTIMATED:` for the first two. The parts and their tests:
   host-memory states (dedicated, none, unknown, APU), what is attached to a
   curated or non-GGUF answer (nothing), and the text and JSON shapes.
 - [diagnose_model.rs](../apps/rocm/src/diagnose_model.rs) and
-  `classify_accelerator_memory` in [main.rs](../apps/rocm/src/main.rs): a
+  `classify_accelerator_memory` in [model_fit.rs](../apps/rocm/src/model_fit.rs): a
   device mask that hides every GPU ("no GPU is visible", not a card of 0 GiB),
   and the note for a mask on a host whose GPUs differ in memory. Both are unit
   tests only: the hosted e2e runners have no GPU for a mask to hide, and no CI
@@ -3429,13 +3429,24 @@ request alone.
 Scenarios `diagnose-49` and `diagnose-50` write a small GGUF into the scenario's
 isolated directory and assert the shape and the sizes (weights and KV cache are
 exact), and that a host that measured its GPU gets a comparison while one that
-could not is told why. The "does not fit" half depends on the host's VRAM, so
-it is covered by the unit tests, not by a scenario. Nothing in either runs
-against a real GPU load; see [manual-testing.md](manual-testing.md) for the
-check that does.
+could not is told why. Which branch runs depends on the lane: the GPU-less
+hosted runners take the "could not compare" one (the text report must then read
+UNDETERMINED), and the MI300X self-hosted lane (`E2E tests (MI300X, ...)` in
+`e2e-selfhosted.yml`) takes the compared one, where the text report must read
+ESTIMATED. The "does not fit" half depends on the host's VRAM, so it is covered
+by the unit tests, not by a scenario. Nothing in either runs against a real GPU
+load; see [manual-testing.md](manual-testing.md) for the check that does.
+
+Scenarios `diagnose-52` to `diagnose-55` cover the refusals, all host-independent:
+the context options without `--model` (a usage error naming it), a curated model
+asked about a context size (told the options do not apply, no estimate), a
+`.gguf` path that does not exist (named as not opened, no upstream route, and a
+plan to ask again about that path), and a bare `owner/repo` with a context size
+(told to add `:QUANT`, with a counting stand-in hub showing nothing was fetched). Scenario `diagnose-56` asks the stand-in hub for a quantization that matches
+nothing, and the answer lists the model and the projector, marked as one.
 
 ```bash
-cargo xtask e2e -- -n '(diagnose-49|diagnose-50|diagnose-51|diagnose-52)'
+cargo xtask e2e -- -n '(diagnose-49|diagnose-5[0-7])'
 ```
 
 ## Doctor Report Preflight

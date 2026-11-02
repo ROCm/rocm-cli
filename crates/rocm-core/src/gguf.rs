@@ -889,15 +889,30 @@ mod tests {
     }
 
     #[test]
-    fn arrays_are_skipped_not_stored_and_their_length_is_what_is_kept() {
+    fn parsing_resumes_exactly_after_arrays_it_skips() {
+        // A kept key placed after two large arrays the parser skips: it is read
+        // with its value only if each skip moved exactly past its array.
         let file = llama_like(1000)
             .u8_array_of_len("tokenizer.ggml.token_type", 5000)
             .u32_array("tokenizer.ggml.merges_like", &vec![7; 5000])
-            .u32("llama.after_the_arrays", 99)
+            .u32("llama.attention.key_length", 99)
             .file(0);
         let header = parse(&file).unwrap();
-        // Parsing continued correctly past the skipped arrays...
+        assert_eq!(header.key_length, Some(99));
         assert_eq!(header.tensor_count, 2);
+    }
+
+    /// A feed-forward width given per layer (an array) is read as the widest,
+    /// which is the one a compute buffer is sized for, not the first or the
+    /// narrowest.
+    #[test]
+    fn a_per_layer_feed_forward_width_is_read_as_the_widest() {
+        let file = Builder::new()
+            .string("general.architecture", "llama")
+            .u32_array("llama.feed_forward_length", &[11_008, 14_336, 8_192])
+            .tensor("w", &[16])
+            .file(0);
+        assert_eq!(parse(&file).unwrap().feed_forward_length, Some(14_336));
     }
 
     #[test]
@@ -1104,9 +1119,16 @@ mod tests {
 
     #[test]
     fn a_header_that_spans_more_than_the_size_bound_is_refused() {
-        let over = usize::try_from(MAX_HEADER_BYTES).unwrap() + 1;
-        let file = Builder::new().u8_array_of_len("blob", over as u64).file(0);
-        assert!(malformed(parse(&file)).contains("is larger than"));
+        // Two arrays, each under the bound on its own, that together carry the
+        // header past it: no single length is refused, so it is the running
+        // check on the header's size that has to catch it.
+        let half = MAX_HEADER_BYTES / 2 + 1;
+        let file = Builder::new()
+            .u8_array_of_len("blob.a", half)
+            .u8_array_of_len("blob.b", half)
+            .file(0);
+        let message = malformed(parse(&file));
+        assert!(message.contains("the header is larger than"), "{message}");
         let under = usize::try_from(MAX_HEADER_BYTES).unwrap() / 2;
         parse(&Builder::new().u8_array_of_len("blob", under as u64).file(0)).unwrap();
     }

@@ -753,7 +753,10 @@ Feature: Diagnosing failures and listing fixes
   # A GGUF outside the catalog has no recipe, so there is no tested minimum to
   # compare. Its header still says how many layers it has, how many KV heads and
   # how wide, and the file's size is the weights: enough to estimate memory at a
-  # chosen context size without downloading anything. The answer must stay
+  # chosen context size. (That a remote file is read for its header alone is
+  # asserted by the gguf_source unit test that serves an 8 GiB file and records
+  # every range; a local file is only opened, so no step here could see a
+  # download.) The answer must stay
   # visibly an estimate -- a different outcome from the closed verdict, and a
   # different word -- because a figure derived from metadata and allowances
   # calibrated on one GPU is not a model that was loaded. The file is a few kilobytes of header and a
@@ -767,7 +770,6 @@ Feature: Diagnosing failures and listing fixes
     Then the answer is an estimate under its own outcome, and the verdict stays undetermined
     And the estimate sizes the file's weights and its KV cache at that context
     And a machine that measured its GPU is told whether the estimate fits, and one that could not is told why
-    And no model weights were fetched
 
   # The human-readable half of diagnose-49: the label is what a reader sees
   # first, and READY or BLOCKED over a figure derived from metadata would claim
@@ -777,7 +779,6 @@ Feature: Diagnosing failures and listing fixes
     Given a user asking about a small GGUF file on this machine
     When the user asks the CLI whether that file would run at 2048 tokens with a q8_0 KV cache, in human-readable form
     Then the report is labelled an estimate, or undetermined with the figures, and is never ready or blocked
-    And no model weights were fetched
 
   # `--report` promises that nothing leaves the machine. A GGUF reference such as
   # owner/repo:Q4_K_M is read from Hugging Face, which would put the model's name
@@ -804,3 +805,47 @@ Feature: Diagnosing failures and listing fixes
     When the user asks the CLI whether the projector file would run, naming it exactly
     Then the CLI says the file is a multimodal projector and names the model file instead
     And the endpoint was asked only for the repository's file list
+
+  # The context options describe the model being asked about. Without --model
+  # they would be accepted and do nothing, so the CLI refuses them as a usage
+  # error before anything runs.
+  @id:diagnose-context-options-need-a-model
+  Scenario: diagnose-52 - The context options are refused without a model to apply them to
+    When the user asks the CLI for a context size or a KV cache type without naming a model
+    Then the CLI refuses each as a usage error that names --model
+
+  # A curated model's memory minimum comes from its recipe and is fixed, so a
+  # context size cannot change the answer. The report says so instead of
+  # silently ignoring the option, and makes no estimate.
+  @id:diagnose-context-options-do-not-apply-to-a-curated-model
+  Scenario: diagnose-53 - A curated model is told the context options do not apply to it
+    When the user asks the CLI whether the smallest curated model would run at 8192 tokens, in machine-readable form
+    Then the answer says the context options do not apply to a curated recipe, and carries no estimate
+
+  # A .gguf path that does not exist is a path to check, not a model to report
+  # upstream: the answer names the path, gives no upstream route, and its plan
+  # is to ask again once the path is right.
+  @id:diagnose-a-missing-gguf-path-is-a-path-to-check
+  Scenario: diagnose-54 - A GGUF path that does not exist is answered as a path to check, not a model to report
+    When the user asks the CLI whether a GGUF file that does not exist would run, in machine-readable form
+    Then the answer says the file could not be opened and offers no upstream route
+    And the plan is to ask again about that path
+
+  # owner/repo with no :QUANT names a repository, and every file in it is a
+  # different model, so nothing is read; with a context size the user is told
+  # what would make it answerable. The stand-in hub shows no request was made.
+  @id:diagnose-a-bare-repository-with-a-context-size-asks-for-a-quantization
+  Scenario: diagnose-55 - A bare repository with a context size is told to name a quantization, and nothing is fetched
+    Given a Hugging Face endpoint that records every request made to it
+    When the user asks the CLI about a repository with no quantization at 8192 tokens, in machine-readable form
+    Then the answer says the reference names a repository and asks for a quantization
+    And no request reached the endpoint
+
+  # A quantization that matches nothing lists what the repository does hold,
+  # and a multimodal projector is among the files listed, marked as one, rather
+  # than left out: a user looking at the hub sees it there too.
+  @id:diagnose-a-quantization-that-matches-nothing-lists-every-gguf
+  Scenario: diagnose-56 - A quantization that matches nothing lists the repository's files, projectors marked
+    Given a Hugging Face repository that holds a model and its multimodal projector
+    When the user asks the CLI about a quantization the repository does not hold
+    Then the CLI says nothing matches and lists the model and the projector, marked as a projector

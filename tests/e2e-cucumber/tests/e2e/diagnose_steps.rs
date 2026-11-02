@@ -3396,10 +3396,6 @@ async fn user_asks_about_a_small_gguf(world: &mut E2eWorld) {
     let path = root.join("tiny-e2e-model.gguf");
     std::fs::write(&path, tiny_gguf_bytes()).expect("write the GGUF fixture");
     world.model_name = Some(path.to_string_lossy().into_owned());
-    let weights = scenario_weights_dir(world);
-    world
-        .command_env
-        .push(("HF_HOME", weights.into_os_string()));
 }
 
 #[when(
@@ -3562,15 +3558,27 @@ async fn assert_gguf_text_report_is_labelled(world: &mut E2eWorld) {
             "an estimate was reported with the verdict word {verdict}: {header}"
         );
     }
-    // The JSON step above accepts either comparison outcome for a measured GPU,
-    // so the text must too: a host with very little dedicated VRAM is told the
-    // estimate does not fit, under the same label.
-    assert!(
-        header.contains(": ESTIMATED: fits at 2048 tokens")
-            || header.contains(": ESTIMATED: does not fit at 2048 tokens")
-            || header.ends_with(": UNDETERMINED"),
-        "{header}"
-    );
+    // Which label is owed depends on whether this host's memory was compared,
+    // and the report says which: a compared estimate names the card it was
+    // compared with. Either comparison outcome is accepted (a host with very
+    // little dedicated VRAM is told the estimate does not fit), but a compared
+    // estimate must be labelled ESTIMATED and one that was not, UNDETERMINED --
+    // so the label is checked on whichever lane runs this, not only accepted.
+    // A GPU-less hosted runner takes the second branch; a lane that measures
+    // dedicated VRAM (the MI300X self-hosted lane) takes the first.
+    let compared = output.contains("the GPU with the most dedicated VRAM that ROCm can see has");
+    if compared {
+        assert!(
+            header.contains(": ESTIMATED: fits at 2048 tokens")
+                || header.contains(": ESTIMATED: does not fit at 2048 tokens"),
+            "the estimate compared memory but is not labelled ESTIMATED: {header}"
+        );
+    } else {
+        assert!(
+            header.ends_with(": UNDETERMINED"),
+            "nothing was compared, so the answer is undetermined: {header}"
+        );
+    }
     assert!(
         output.contains("KV cache (q8_0)"),
         "the figures the estimate rests on were not shown:\n{output}"
@@ -3663,7 +3671,9 @@ async fn assert_the_cli_named_the_projector_and_the_model(world: &mut E2eWorld) 
     assert_eq!(world.cli_rc, Some(0), "{:?}", world.cli_stderr);
     let output = world.cli_output.clone().unwrap_or_default();
     assert!(
-        output.contains("names a multimodal projector (mmproj), not a language model"),
+        output.contains(
+            "`mmproj-e2e-model-f16.gguf` is a multimodal projector (mmproj), not a language model"
+        ),
         "{output}"
     );
     assert!(output.contains("e2e-model-Q4_K_M.gguf"), "{output}");
@@ -3760,5 +3770,206 @@ async fn assert_the_hub_was_asked_about_the_model(world: &mut E2eWorld) {
         seen > 0,
         "the same question without --report never reached the endpoint, so the check above \
          proved nothing"
+    );
+}
+
+fn run_model_question(world: &mut E2eWorld, args: &[&str]) {
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(world, args);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+fn evidence_text(model: &serde_json::Value) -> String {
+    model_field(model, "evidence")
+        .as_array()
+        .map(|lines| {
+            lines
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
+}
+
+#[when("the user asks the CLI for a context size or a KV cache type without naming a model")]
+async fn user_asks_for_context_options_without_a_model(world: &mut E2eWorld) {
+    let mut outcomes = Vec::new();
+    for option in [["--context-size", "8192"], ["--kv-cache-type", "q8_0"]] {
+        let (_, stderr, rc) =
+            crate::run_rocm_with_scenario_env(world, &["diagnose", option[0], option[1]]);
+        outcomes.push(format!("{}\t{rc}\t{stderr}", option[0]));
+    }
+    world.cli_output = Some(outcomes.join("\n\u{0}\n"));
+}
+
+#[then("the CLI refuses each as a usage error that names --model")]
+async fn assert_context_options_refused_without_a_model(world: &mut E2eWorld) {
+    let output = world.cli_output.clone().unwrap_or_default();
+    let outcomes: Vec<&str> = output.split("\n\u{0}\n").collect();
+    assert_eq!(outcomes.len(), 2, "{output}");
+    for outcome in outcomes {
+        let mut parts = outcome.splitn(3, '\t');
+        let (option, rc, stderr) = (
+            parts.next().unwrap_or(""),
+            parts.next().unwrap_or(""),
+            parts.next().unwrap_or(""),
+        );
+        // clap's usage-error exit code.
+        assert_eq!(
+            rc, "2",
+            "{option} was not refused as a usage error: {stderr}"
+        );
+        assert!(
+            stderr.contains("--model"),
+            "{option}: the refusal does not name what is missing: {stderr}"
+        );
+    }
+}
+
+#[when(
+    "the user asks the CLI whether the smallest curated model would run at 8192 tokens, in machine-readable form"
+)]
+async fn user_asks_about_a_curated_model_with_a_context_size(world: &mut E2eWorld) {
+    run_model_question(
+        world,
+        &[
+            "diagnose",
+            "--model",
+            SMALLEST_MODEL_REF,
+            "--context-size",
+            "8192",
+            "--json",
+        ],
+    );
+}
+
+#[then(
+    "the answer says the context options do not apply to a curated recipe, and carries no estimate"
+)]
+async fn assert_curated_model_says_context_options_do_not_apply(world: &mut E2eWorld) {
+    assert_eq!(world.cli_rc, Some(0), "{:?}", world.cli_stderr);
+    let model = model_section(world);
+    let evidence = evidence_text(&model);
+    assert!(
+        evidence.contains("do not apply to a curated recipe"),
+        "the option was accepted and nothing said it was not applied: {model:#}"
+    );
+    assert!(
+        model.get("estimate").is_none_or(serde_json::Value::is_null),
+        "a curated model was estimated from a header it has none of: {model:#}"
+    );
+}
+
+fn missing_gguf_path(world: &E2eWorld) -> String {
+    world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("no-such-model.gguf")
+        .to_string_lossy()
+        .into_owned()
+}
+
+#[when(
+    "the user asks the CLI whether a GGUF file that does not exist would run, in machine-readable form"
+)]
+async fn user_asks_about_a_missing_gguf(world: &mut E2eWorld) {
+    let path = missing_gguf_path(world);
+    assert!(
+        !std::path::Path::new(&path).exists(),
+        "{path} must not exist"
+    );
+    run_model_question(world, &["diagnose", "--model", &path, "--json"]);
+}
+
+#[then("the answer says the file could not be opened and offers no upstream route")]
+async fn assert_missing_gguf_could_not_be_opened(world: &mut E2eWorld) {
+    assert_eq!(world.cli_rc, Some(0), "{:?}", world.cli_stderr);
+    let model = model_section(world);
+    let path = missing_gguf_path(world);
+    let evidence = evidence_text(&model);
+    assert!(
+        evidence.contains(&format!("could not open {path}")),
+        "the answer does not say which file could not be opened: {model:#}"
+    );
+    assert_eq!(
+        estimate_section(&model)["cannot_estimate_reason"],
+        "header_unreadable",
+        "{model:#}"
+    );
+    assert!(
+        model.get("route").is_none_or(serde_json::Value::is_null),
+        "a path that does not exist was routed to the upstream tracker: {model:#}"
+    );
+}
+
+#[then("the plan is to ask again about that path")]
+async fn assert_missing_gguf_plan_is_to_check_the_path(world: &mut E2eWorld) {
+    let model = model_section(world);
+    let path = missing_gguf_path(world);
+    let fix = model_field(&model, "fix");
+    assert_eq!(
+        fix["verify"].as_str(),
+        Some(format!("rocm diagnose --model {path}").as_str()),
+        "{model:#}"
+    );
+    assert!(
+        !fix["verify"].as_str().unwrap_or("").contains("rocm serve"),
+        "serving a file that is not there only repeats the error: {model:#}"
+    );
+}
+
+#[when(
+    "the user asks the CLI about a repository with no quantization at 8192 tokens, in machine-readable form"
+)]
+async fn user_asks_about_a_bare_repository_with_a_context_size(world: &mut E2eWorld) {
+    run_model_question(
+        world,
+        &[
+            "diagnose",
+            "--model",
+            UNCURATED_MODEL_REF,
+            "--context-size",
+            "8192",
+            "--json",
+        ],
+    );
+}
+
+#[then("the answer says the reference names a repository and asks for a quantization")]
+async fn assert_bare_repository_asks_for_a_quantization(world: &mut E2eWorld) {
+    assert_eq!(world.cli_rc, Some(0), "{:?}", world.cli_stderr);
+    let model = model_section(world);
+    let evidence = evidence_text(&model);
+    assert!(
+        evidence.contains(&format!(
+            "`{UNCURATED_MODEL_REF}` names a repository, not a model file: add `:QUANT`"
+        )),
+        "{model:#}"
+    );
+    assert!(
+        model.get("estimate").is_none_or(serde_json::Value::is_null),
+        "a repository was estimated as if it were one file: {model:#}"
+    );
+}
+
+#[when("the user asks the CLI about a quantization the repository does not hold")]
+async fn user_asks_about_a_missing_quantization(world: &mut E2eWorld) {
+    run_model_question(world, &["diagnose", "--model", "e2e-owner/e2e-repo:Q8_0"]);
+}
+
+#[then("the CLI says nothing matches and lists the model and the projector, marked as a projector")]
+async fn assert_missing_quantization_lists_every_gguf(world: &mut E2eWorld) {
+    assert_eq!(world.cli_rc, Some(0), "{:?}", world.cli_stderr);
+    let output = world.cli_output.clone().unwrap_or_default();
+    assert!(
+        output.contains(
+            "no GGUF file matching `Q8_0` in the repository (it has: e2e-model-Q4_K_M.gguf, \
+             mmproj-e2e-model-f16.gguf (multimodal projector))"
+        ),
+        "{output}"
     );
 }

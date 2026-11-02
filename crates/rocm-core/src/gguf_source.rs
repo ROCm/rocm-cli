@@ -162,6 +162,9 @@ fn has_label(name: &str, label: &str) -> bool {
 pub struct ProjectorNamed {
     /// What the user named, as they wrote it.
     pub variant: String,
+    /// The projector file or files that name matched, by full name in the
+    /// repository: what the user actually pointed at.
+    pub projectors: Vec<String>,
     /// The repository's model files (every GGUF that is not a projector), by
     /// full name.
     pub models: Vec<String>,
@@ -181,10 +184,25 @@ impl std::fmt::Display for ProjectorNamed {
             }
             shown.join(", ")
         };
+        let mut named: Vec<String> = self
+            .projectors
+            .iter()
+            .take(SHOWN)
+            .map(|name| format!("`{name}`"))
+            .collect();
+        if self.projectors.len() > SHOWN {
+            named.push("...".to_owned());
+        }
+        let named = named.join(", ");
+        let is = if self.projectors.len() == 1 {
+            "is a multimodal projector"
+        } else {
+            "are multimodal projectors"
+        };
         write!(
             f,
-            "`{}` names a multimodal projector (mmproj), not a language model; name the \
-             model's own GGUF file or its quantization (the repository's models: {models})",
+            "{named} {is} (mmproj), not a language model, so `{}` cannot be estimated; name \
+             the model's own GGUF file or its quantization (the repository's models: {models})",
             self.variant
         )
     }
@@ -257,6 +275,7 @@ pub fn select_gguf_file<'a>(files: &'a [HubFile], variant: &str) -> Result<&'a H
         if models.is_empty() && !named.is_empty() {
             return Err(anyhow::Error::new(ProjectorNamed {
                 variant: variant.to_owned(),
+                projectors: named.iter().map(|file| file.name.clone()).collect(),
                 models: ggufs.iter().map(|file| file.name.clone()).collect(),
             }));
         }
@@ -270,13 +289,11 @@ pub fn select_gguf_file<'a>(files: &'a [HubFile], variant: &str) -> Result<&'a H
     };
     match matches.as_slice() {
         [only] => Ok(only),
+        // The repository's GGUF files are listed with the projectors among them,
+        // marked as such, rather than left out (up to eight, then `...`).
         [] => bail!(
             "no GGUF file matching `{variant}` in the repository (it has: {})",
-            if ggufs.is_empty() && !all_ggufs.is_empty() {
-                "no model GGUF files; every one in it is a multimodal projector".to_owned()
-            } else {
-                names_for_error(&ggufs)
-            }
+            names_for_error_marking_projectors(&all_ggufs)
         ),
         several => first_shard_of_one_set(several).ok_or_else(|| {
             anyhow!(
@@ -326,6 +343,30 @@ fn first_shard_of_one_set<'a>(candidates: &[&'a HubFile]) -> Option<&'a HubFile>
         .map(|(file, _)| *file)
 }
 
+/// [`names_for_error`], with each multimodal projector marked as one.
+fn names_for_error_marking_projectors(files: &[&HubFile]) -> String {
+    const SHOWN: usize = 8;
+    let mut names: Vec<String> = files
+        .iter()
+        .take(SHOWN)
+        .map(|file| {
+            if names_projector(&file.name) {
+                format!("{} (multimodal projector)", file.name)
+            } else {
+                file.name.clone()
+            }
+        })
+        .collect();
+    if files.len() > SHOWN {
+        names.push("...".to_owned());
+    }
+    if names.is_empty() {
+        "no GGUF files".to_owned()
+    } else {
+        names.join(", ")
+    }
+}
+
 fn names_for_error(files: &[&HubFile]) -> String {
     const SHOWN: usize = 8;
     let mut names: Vec<&str> = files.iter().take(SHOWN).map(|f| f.name.as_str()).collect();
@@ -350,6 +391,56 @@ pub struct OpenedGguf {
     pub size: u64,
     /// What to call the file in a report.
     pub description: String,
+}
+
+/// A buffered reader whose relative seeks stay inside its buffer where they can.
+///
+/// The header parser skips every string it does not keep with a relative seek,
+/// and a vocabulary is 128k to 262k of them. `BufReader::seek` drops the buffer
+/// every time, so each skip became a syscall and the next read a refill: a
+/// 300k-token header took seconds to read from disk. `seek_relative` keeps the
+/// buffer when the target is inside it. The position is tracked here, because
+/// `BufReader`'s own `stream_position` asks the file, which is a seek too, and
+/// the parser asks after every skip.
+struct RelativeSeekBuf<R> {
+    inner: BufReader<R>,
+    /// Where the next read starts, from the start of the stream.
+    position: u64,
+}
+
+impl<R> RelativeSeekBuf<R> {
+    /// Over a stream positioned at its start.
+    const fn new(inner: BufReader<R>) -> Self {
+        Self { inner, position: 0 }
+    }
+}
+
+impl<R: Read> Read for RelativeSeekBuf<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let read = self.inner.read(buf)?;
+        self.position += read as u64;
+        Ok(read)
+    }
+}
+
+impl<R: Read + Seek> Seek for RelativeSeekBuf<R> {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        match pos {
+            SeekFrom::Current(offset) => {
+                let target = self.position.checked_add_signed(offset).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "seek before the start")
+                })?;
+                self.inner.seek_relative(offset)?;
+                self.position = target;
+            }
+            other => self.position = self.inner.seek(other)?,
+        }
+        Ok(self.position)
+    }
+
+    fn stream_position(&mut self) -> io::Result<u64> {
+        Ok(self.position)
+    }
 }
 
 /// Opens a GGUF named by a [`GgufRef`]. A trait so the estimate can be tested
@@ -390,6 +481,7 @@ impl LiveGgufSource {
     }
 
     /// A source against an explicit hub base URL.
+    #[cfg(test)]
     #[must_use]
     pub fn with_hub(hub: &str) -> Self {
         Self {
@@ -548,7 +640,7 @@ impl GgufSource for LiveGgufSource {
                     .with_context(|| format!("could not open {}", path.display()))?;
                 let size = metadata.len();
                 Ok(OpenedGguf {
-                    reader: Box::new(BufReader::new(file)),
+                    reader: Box::new(RelativeSeekBuf::new(BufReader::new(file))),
                     size,
                     description: path.display().to_string(),
                 })
@@ -651,6 +743,7 @@ impl RangedReader {
     }
 
     /// Bytes requested from the server so far.
+    #[cfg(test)]
     #[must_use]
     pub const fn fetched(&self) -> u64 {
         self.fetched
@@ -764,7 +857,7 @@ mod tests {
     use super::*;
     use crate::gguf::test_builder::llama_like;
     use crate::gguf::{GgufError, parse_gguf_header};
-    use std::io::Write as _;
+    use std::io::{Cursor, Write as _};
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
     use std::thread;
@@ -916,14 +1009,32 @@ mod tests {
             file("x/mmproj.gguf", 1),
             file("y/mmproj.gguf", 1),
         ];
-        for named in [
-            "mmproj-m-f16.gguf",
-            "vision/MMPROJ-Q8_0.gguf",
-            "MMPROJ-Q8_0.gguf",
-            "mmproj.gguf",
+        // What was typed, and the real file (or files) it points at, which the
+        // refusal names.
+        for (named, real) in [
+            (
+                "mmproj-m-f16.gguf",
+                "`mmproj-m-f16.gguf` is a multimodal projector",
+            ),
+            (
+                "vision/MMPROJ-Q8_0.gguf",
+                "`vision/MMPROJ-Q8_0.gguf` is a multimodal projector",
+            ),
+            (
+                "MMPROJ-Q8_0.gguf",
+                "`vision/MMPROJ-Q8_0.gguf` is a multimodal projector",
+            ),
+            (
+                "mmproj.gguf",
+                "`x/mmproj.gguf`, `y/mmproj.gguf` are multimodal projectors",
+            ),
         ] {
             let error = select_gguf_file(&files, named).unwrap_err().to_string();
-            assert!(error.contains("multimodal projector"), "{named}: {error}");
+            assert!(error.starts_with(real), "{named}: {error}");
+            assert!(
+                error.contains(&format!("so `{named}` cannot be estimated")),
+                "{named}: {error}"
+            );
             assert!(!error.contains("no GGUF file matching"), "{named}: {error}");
             assert!(!error.contains("matches several files"), "{named}: {error}");
             // The model is listed as the alternative, and no projector is.
@@ -943,11 +1054,20 @@ mod tests {
             select_gguf_file(&files, "Q4_K_M").unwrap().name,
             "m-Q4_K_M.gguf"
         );
-        // A name that matches nothing at all is still "no such file".
-        let missing = select_gguf_file(&files, "other.gguf")
-            .unwrap_err()
-            .to_string();
-        assert!(missing.contains("no GGUF file matching"), "{missing}");
+        // A name that matches nothing at all is still "no such file", and the
+        // listing shows every real file, the projectors marked as such.
+        for absent in ["other.gguf", "F16"] {
+            let missing = select_gguf_file(&files, absent).unwrap_err().to_string();
+            assert!(missing.contains("no GGUF file matching"), "{missing}");
+            assert!(
+                missing.contains("m-Q4_K_M.gguf, mmproj-m-f16.gguf (multimodal projector)"),
+                "{missing}"
+            );
+            assert!(
+                missing.contains("vision/MMPROJ-Q8_0.gguf (multimodal projector)"),
+                "{missing}"
+            );
+        }
     }
 
     /// A bare name shared by a model and a projector picks the model, as it did
@@ -969,13 +1089,175 @@ mod tests {
             error.contains("every GGUF file in it is a projector"),
             "{error}"
         );
-        // Asked for something else, it still does not claim to have no GGUF.
+        // Asked for something else, it lists the real file rather than claiming
+        // the repository has no GGUF.
         let other = select_gguf_file(&files, "Q4_K_M").unwrap_err().to_string();
         assert!(
-            other.contains("every one in it is a multimodal projector"),
+            other.contains("it has: mmproj-a.gguf (multimodal projector)"),
             "{other}"
         );
-        assert!(!other.contains("it has: no GGUF files"), "{other}");
+    }
+
+    /// `_` before a label is a boundary as `-` and `.` are: llama.cpp's own
+    /// conversions name files `model_Q4_K_M.gguf` as often as `model-Q4_K_M.gguf`.
+    #[test]
+    fn a_label_after_an_underscore_is_matched() {
+        let files = [file("model_Q4_K_M.gguf", 5), file("model_Q8_0.gguf", 8)];
+        assert_eq!(
+            select_gguf_file(&files, "Q4_K_M").unwrap().name,
+            "model_Q4_K_M.gguf"
+        );
+    }
+
+    /// A listed name is sent percent-encoded, one segment at a time: a `+` sent
+    /// raw is read as a space by some servers, and a space breaks the request.
+    #[test]
+    fn a_listed_file_name_is_requested_percent_encoded() {
+        let listing = r#"{"siblings":[{"rfilename":"dir/m+x-Q4_K_M.gguf","size":1048576}]}"#;
+        let hub = fake_hub_with(
+            llama_like(10).header_bytes(),
+            1 << 20,
+            Serve::Honour,
+            listing.to_owned(),
+        );
+        let mut opened = LiveGgufSource::with_hub(&hub.base)
+            .open(&hub_ref("Q4_K_M"))
+            .unwrap();
+        parse_gguf_header(&mut opened.reader).unwrap();
+        let requests = hub.requests.lock().unwrap().clone();
+        assert!(
+            !requests.is_empty()
+                && requests
+                    .iter()
+                    .all(|request| request.ends_with("/o/r/resolve/main/dir/m%2Bx-Q4_K_M.gguf")),
+            "{requests:?}"
+        );
+    }
+
+    /// A loopback server that accepts every connection, counts it, and answers
+    /// nothing for `stall`: the shape of a hub that has stopped responding.
+    fn stalling_server(stall: Duration) -> (String, Arc<Mutex<usize>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let connections = Arc::new(Mutex::new(0));
+        let counted = Arc::clone(&connections);
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { break };
+                *counted.lock().unwrap() += 1;
+                thread::spawn(move || {
+                    thread::sleep(stall);
+                    drop(stream);
+                });
+            }
+        });
+        (base, connections)
+    }
+
+    /// The listing request is bound by the read's deadline, not only by the
+    /// agent's one-minute timeout: a spent deadline makes no request at all, and
+    /// a hub that stops answering is cut off when the deadline passes.
+    #[test]
+    fn the_listing_request_is_bound_by_the_deadline() {
+        let (base, connections) = stalling_server(Duration::from_secs(3));
+        let source = LiveGgufSource::with_hub(&base);
+        let agent = LiveGgufSource::agent();
+        let error = source
+            .list_files(&agent, "o", "r", Instant::now())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("took longer than"), "{error}");
+        assert_eq!(
+            *connections.lock().unwrap(),
+            0,
+            "a request after the deadline"
+        );
+        let began = Instant::now();
+        assert!(
+            source
+                .list_files(
+                    &agent,
+                    "o",
+                    "r",
+                    Instant::now() + Duration::from_millis(300)
+                )
+                .is_err()
+        );
+        assert!(
+            began.elapsed() < Duration::from_secs(2),
+            "waited {:?} for a hub that never answered",
+            began.elapsed()
+        );
+    }
+
+    /// The same bound on the `HEAD` request for a file the listing did not size.
+    #[test]
+    fn the_head_request_is_bound_by_the_deadline() {
+        let (base, connections) = stalling_server(Duration::from_secs(3));
+        let url = format!("{base}/o/r/resolve/main/m.gguf");
+        let agent = LiveGgufSource::agent();
+        let error = head_size(&agent, &url, Instant::now())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("took longer than"), "{error}");
+        assert_eq!(
+            *connections.lock().unwrap(),
+            0,
+            "a request after the deadline"
+        );
+        let began = Instant::now();
+        assert!(head_size(&agent, &url, Instant::now() + Duration::from_millis(300)).is_err());
+        assert!(
+            began.elapsed() < Duration::from_secs(2),
+            "waited {:?} for a hub that never answered",
+            began.elapsed()
+        );
+    }
+
+    /// Counts the seeks that reach the file under the buffer.
+    struct CountingSeeks<R> {
+        inner: R,
+        seeks: Arc<Mutex<usize>>,
+    }
+
+    impl<R: Read> Read for CountingSeeks<R> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.inner.read(buf)
+        }
+    }
+
+    impl<R: Seek> Seek for CountingSeeks<R> {
+        fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+            *self.seeks.lock().unwrap() += 1;
+            self.inner.seek(pos)
+        }
+    }
+
+    /// Skipping a large vocabulary stays inside the read buffer: the file under
+    /// it is sought a handful of times, not once per token, which is what made a
+    /// real header take seconds to read from disk.
+    #[test]
+    fn a_local_header_is_skipped_through_without_seeking_the_file_per_token() {
+        let tokens = 50_000;
+        let file = llama_like(tokens).header_bytes();
+        let seeks = Arc::new(Mutex::new(0));
+        let mut reader = RelativeSeekBuf::new(BufReader::new(CountingSeeks {
+            inner: Cursor::new(file),
+            seeks: Arc::clone(&seeks),
+        }));
+        let header = parse_gguf_header(&mut reader).unwrap();
+        assert_eq!(header.tensor_count, 2);
+        // The same header read straight from memory: the wrapper changes how
+        // the bytes are reached, never what is read.
+        let direct =
+            parse_gguf_header(&mut Cursor::new(llama_like(tokens).header_bytes())).unwrap();
+        assert_eq!(header.data_offset, direct.data_offset);
+        assert_eq!(header.token_embd, direct.token_embd);
+        let seeks = *seeks.lock().unwrap();
+        assert!(
+            seeks < tokens / 100,
+            "{seeks} seeks reached the file for {tokens} tokens"
+        );
     }
 
     #[test]

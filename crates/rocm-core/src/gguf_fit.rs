@@ -3064,6 +3064,104 @@ mod tests {
         );
     }
 
+    /// A smaller cache's "largest context then" is capped at the trained context,
+    /// as the main ceiling is: a q4_0 cache with room for ~29k tokens on a model
+    /// trained for 8192 offers 8192, not a context the model was never trained
+    /// for.
+    #[test]
+    fn a_smaller_cache_suggestion_caps_its_largest_context_at_the_trained_one() {
+        let (header, size) = llama_trained_for(8192);
+        let fixed = estimate(
+            &header,
+            size,
+            0,
+            KvCacheType::F16,
+            AcceleratorMemory::Dedicated(64.0),
+        )
+        .total_gib
+        .unwrap();
+        // 16384 tokens at f16 is 2 GiB of cache, at q4_0 about 0.56: room for 1.
+        let memory = AcceleratorMemory::Dedicated(fixed + 1.0);
+        let result = estimate(&header, size, 16384, KvCacheType::F16, memory);
+        assert_eq!(result.outcome, EstimateOutcome::DoesNotFit);
+        let uncapped = sizing(&header, size)
+            .unwrap()
+            .max_context((fixed + 1.0) * GIB, KvCacheType::Q4_0, None)
+            .unwrap();
+        assert!(
+            uncapped > 8192,
+            "the cap must bind for this to mean anything"
+        );
+        let q4 = result
+            .suggestions
+            .iter()
+            .find(|s| s.text.contains("q4_0 KV cache"))
+            .expect("a q4_0 suggestion");
+        assert!(
+            q4.text
+                .contains(&format!("the largest context then is {}", tokens(8192))),
+            "{}",
+            q4.text
+        );
+    }
+
+    /// A request exactly at the ceiling fits, and the ceiling is still printed:
+    /// it is only a ceiling *below* a request that fits which is left out.
+    #[test]
+    fn a_request_at_exactly_the_ceiling_still_prints_the_ceiling() {
+        let (header, size) = llama(GIB_U as usize / 1024);
+        let kv = KvCacheType::F16;
+        let card = gpu_mib(shown_mib(&header, size, 24576, kv));
+        let result = estimate(&header, size, 24576, kv, card);
+        assert_eq!(result.outcome, EstimateOutcome::Fits);
+        assert_eq!(result.max_context, Some(24576));
+        let lines = evidence_lines(&result).join("\n");
+        assert!(
+            lines.contains(&format!(
+                "largest context that fits, with the KV cache at f16: {}",
+                tokens(24576)
+            )),
+            "{lines}"
+        );
+    }
+
+    /// Either width missing understates the compute buffer, not only both.
+    #[test]
+    fn a_header_missing_either_width_says_the_compute_buffer_is_understated() {
+        let base = || {
+            Builder::new()
+                .string("general.architecture", "x")
+                .u32("x.block_count", 2)
+                .u32("x.attention.head_count", 4)
+                .u32("x.attention.key_length", 64)
+                .u32("x.attention.value_length", 64)
+        };
+        for (which, builder) in [
+            (
+                "no feed-forward width",
+                base().u32("x.embedding_length", 256),
+            ),
+            (
+                "no embedding width",
+                base().u32("x.feed_forward_length", 512),
+            ),
+        ] {
+            let (header, size) = header_of(&builder.tensor("w", &[1024]), 4096);
+            let result = estimate(
+                &header,
+                size,
+                1024,
+                KvCacheType::F16,
+                AcceleratorMemory::Dedicated(8.0),
+            );
+            assert!(
+                result.notes.iter().any(|note| note.contains("understated")),
+                "{which}: {:?}",
+                result.notes
+            );
+        }
+    }
+
     fn split_header(count: u32) -> Builder {
         Builder::new()
             .string("general.architecture", "x")
