@@ -248,12 +248,11 @@ pub struct AuditEventRecord {
 /// serialize against other appends and because it can itself replace or
 /// rename the live file out from under a concurrent writer — a torn tail is
 /// repaired by renaming a new file over the store, or by truncating it when
-/// that fails (see [`TailState::Torn`]),
-/// and a rotating events or audit store is renamed aside to `<store>.1` (see
-/// [`rotate_jsonl_generations`]) — and an append that had already opened the
-/// old file would otherwise land in the replaced or rotated-away copy and
-/// vanish.
-fn jsonl_lock_path(path: &Path) -> PathBuf {
+/// that fails (see `TailState::Torn`), and a rotating events or audit store is
+/// renamed aside to `<store>.1` (see `rotate_jsonl_generations`) — and an
+/// append that had already opened the old file would otherwise land in the
+/// replaced or rotated-away copy and vanish.
+pub fn jsonl_lock_path(path: &Path) -> PathBuf {
     let mut name = path.file_name().unwrap_or_default().to_os_string();
     name.push(".lock");
     path.with_file_name(name)
@@ -463,10 +462,11 @@ fn append_jsonl_record<T: Serialize>(
 /// without closing it: a scan that comes back short is refused or retried
 /// (see [`ReverseLines`] and `load_recent_jsonl_records_from`), but one that
 /// already read part of a debris line longer than a scan chunk and then finds
-/// the file regrown to at least its old length reads on undetected, and can
-/// splice the two reads into a record nobody wrote. That is the cost of not
-/// wedging the store, accepted for a path that needs a failing replace, a
-/// debris line that long and a reader mid-scan all at once.
+/// the file regrown past the offset the scan has reached (not its old length:
+/// the check compares each read with that offset, which only shrinks) reads on
+/// undetected, and can splice the two reads into a record nobody wrote. That
+/// is the cost of not wedging the store, accepted for a path that needs a
+/// failing replace, a debris line that long and a reader mid-scan all at once.
 ///
 /// If `truncate` fails too, the error names both causes and the store is left
 /// as it was; readers keep skipping the debris. If the append after a
@@ -665,10 +665,11 @@ fn inspect_tail(path: &Path, file: &fs::File) -> Result<TailState> {
 /// fallback, taken only when that replacement fails and only under the store's
 /// lock (see [`repair_torn_tail_and_append`]); otherwise a short read here
 /// means the store was edited or truncated out-of-band, a case this module
-/// does not try to recover from cleanly. Most callers treat what is still there the same as any other
-/// unexpectedly-ending tail; [`ReverseLines`] is the one exception, and
-/// reports an error instead once it would have to splice such a read onto
-/// bytes it already read, rather than risk inventing a line.
+/// does not try to recover from cleanly. Most callers treat what is still
+/// there the same as any other unexpectedly-ending tail; [`ReverseLines`] is
+/// the one exception, and reports an error instead once it would have to
+/// splice such a read onto bytes it already read, rather than risk inventing
+/// a line.
 fn read_range(path: &Path, file: &fs::File, start: u64, end: u64) -> Result<Vec<u8>> {
     let mut reader = file;
     reader
@@ -2328,14 +2329,15 @@ mod tests {
     }
 
     // Nothing in this module's own writers shrinks a store (bar the torn-tail
-    // repair's rare fallback), but an out-of-band edit might, and load_recent_jsonl_records is supposed to
-    // retry from the new length rather than fail. Driving that needs the
-    // shrink to land strictly between two of ReverseLines's own chunked
-    // reads (see the `test_hooks` module doc) — which in turn
-    // needs a scan that takes more than one physical read in the first
-    // place, hence the pathologically long first record here (same
-    // technique as append_leaves_a_torn_line_longer_than_one_scan_chunk_cut_cleanly
-    // below, just complete JSON rather than torn).
+    // repair's rare fallback), but an out-of-band edit might, and
+    // load_recent_jsonl_records is supposed to retry from the new length
+    // rather than fail. Driving that needs the shrink to land strictly
+    // between two of ReverseLines's own chunked reads (see the `test_hooks`
+    // module doc) — which in turn needs a scan that takes more than one
+    // physical read in the first place, hence the pathologically long first
+    // record here (same technique as
+    // append_leaves_a_torn_line_longer_than_one_scan_chunk_cut_cleanly below,
+    // just complete JSON rather than torn).
     #[test]
     fn load_recent_retries_past_a_shrink_mid_scan_and_succeeds() -> Result<()> {
         let (root, paths) = temp_app_paths("scan-retry-after-shrink");

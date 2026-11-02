@@ -1648,6 +1648,38 @@ serve_timeout_secs = 90
     }
 
     #[test]
+    fn os_reason_wins_over_dir_permissions_reason_on_a_non_matching_os() {
+        // The same ordering as the case-folding twin above, for the tag the
+        // torn-audit-tail scenario carries next to `@requires-os:linux`.
+        let m = Expectations::default();
+        let d = decl(&[
+            "id:automations-torn-audit-tail-repaired-when-log-cannot-be-replaced",
+            "requires-os:linux",
+            "requires-dir-permissions",
+        ]);
+        assert!(
+            d.requires_dir_permissions && d.requires_os.is_some(),
+            "both premise tags must parse, or the ordering below proves nothing"
+        );
+        let host = HostCapability {
+            dir_permissions_bind: false,
+            ..cap("strix-windows")
+        };
+        assert_ne!(host.os_family, "linux", "fixture must fail the OS premise");
+        assert!(
+            !host.dir_permissions_bind,
+            "fixture must fail both premises"
+        );
+        match resolve(&d, &host, &m, Included::default()) {
+            Expectation::Skip { reason } => assert!(
+                reason.contains("requires os 'linux'"),
+                "the OS reason must win: {reason}"
+            ),
+            other => panic!("native Windows must skip, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn case_folding_skip_is_not_recorded_as_a_known_bug() {
         // A host that cannot hold the premise is not-applicable, not a defect, so
         // an xfail row for the same id must not turn the skip into an xfail.

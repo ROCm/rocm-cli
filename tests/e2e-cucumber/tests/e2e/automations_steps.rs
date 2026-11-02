@@ -23,7 +23,7 @@ use cucumber::{given, then, when};
 use rocm_core::{
     AuditEventRecord, AutomationProposalRecord, EVENT_LOG_ROTATE_BYTES,
     EVENT_LOG_ROTATED_GENERATIONS, REVIEWED_PROPOSALS_RETAINED, append_automation_proposal,
-    load_automation_proposals,
+    jsonl_lock_path, load_automation_proposals,
 };
 
 use crate::E2eWorld;
@@ -196,8 +196,10 @@ async fn torn_audit_tail(world: &mut E2eWorld) {
 /// be removed.
 #[given("the audit log's directory takes no new files")]
 async fn audit_dir_takes_no_new_files(world: &mut E2eWorld) {
-    let dir = world.app_paths().audit_dir();
-    std::fs::File::create(dir.join("events.jsonl.lock")).expect("failed to create the lock file");
+    let paths = world.app_paths();
+    let dir = paths.audit_dir();
+    std::fs::File::create(jsonl_lock_path(&paths.audit_events_path()))
+        .expect("failed to create the lock file");
     forbid_new_files(&dir);
     let probe = dir.join("probe");
     if std::fs::File::create(&probe).is_ok() {
