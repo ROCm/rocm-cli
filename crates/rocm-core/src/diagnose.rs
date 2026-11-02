@@ -5094,7 +5094,7 @@ mod tests {
     /// a re-added arm has to come with a probe that reaches it.
     ///
     /// The list below is **hand-maintained**: its first four entries mirror what
-    /// `Examination::probe` sets in `examine.rs`, and the rest are names the
+    /// `Examination::probe` sets in `examine/framework.rs`, and the rest are names the
     /// probe never returns, kept so a re-added arm for one of them shows up.
     /// Neither half is derived from that code, so adding a fifth framework to
     /// the probe will not fail this test — see the note on

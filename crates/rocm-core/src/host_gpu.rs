@@ -23,10 +23,10 @@
 //! `rocm examine` text of an `ExamineSummary`), `diagnostics` (the GPU
 //! detection diagnostics text) and `engine_default` (the default serve engine).
 //!
-//! `examine.rs` and `fix.rs` still reach several items here through `lib.rs`'s
-//! flat `crate::` re-export paths rather than `crate::host_gpu::` — a
-//! deliberate transitional step from the zero-diff extraction, not an
-//! oversight.
+//! The `examine` child modules and `fix.rs` still reach several items here
+//! through `lib.rs`'s flat `crate::` re-export paths rather than
+//! `crate::host_gpu::` — a deliberate transitional step from the zero-diff
+//! extraction, not an oversight.
 
 pub use crate::confirm::interactive_terminal;
 pub use crate::gfx_target::{

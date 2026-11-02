@@ -69,13 +69,14 @@ fn parse_gpus_windows_output(out: &str, e: &mut Examination) {
         // is wasted work whenever the id resolves.
         //
         // `Win32_VideoController` hands us `PCI\VEN_1002&DEV_1636&...` in the
-        // same row as the name, and `gfx_target`'s PCI-id table answers for parts
-        // the name table has no arm for -- every Vega iGPU among them. This
-        // probe used to drop the id and ask the name alone, so a Renoir /
-        // Lucienne / Cezanne / Barcelo laptop reported an empty `gfx_target`
-        // unless a HIP SDK was installed for `hipInfo` to fill it in: exactly
-        // the host that has no HIP SDK to ask. A device id is also the stronger
-        // answer where both have one, being the ASIC rather than the brand.
+        // same row as the name, and the PCI-id table in the `gfx_target` module
+        // answers for parts the name table has no arm for -- every Vega iGPU
+        // among them. This probe used to drop the id and ask the name alone,
+        // so a Renoir / Lucienne / Cezanne / Barcelo laptop reported an empty
+        // `gfx_target` unless a HIP SDK was installed for `hipInfo` to fill it
+        // in: exactly the host that has no HIP SDK to ask. A device id is also
+        // the stronger answer where both have one, being the ASIC rather than
+        // the brand.
         let (gfx_target, is_apu) = match crate::host_gpu::gfx_target_from_pnp_device_id(&pnp) {
             // `gfx_is_apu_family` knows the answer whenever the id resolved a
             // target; the name heuristic's `is_apu` guess is only consulted

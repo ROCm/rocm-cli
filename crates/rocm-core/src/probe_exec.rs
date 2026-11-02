@@ -7,8 +7,8 @@
 //! [`run`]/[`run_with_env`] run a command under a timeout and never panic, `which`
 //! resolves a program on `PATH` without executing it, and [`read_text`]/
 //! [`read_host_text`] read a file as a possibly-empty string. They sit apart from
-//! [`crate::examine`] so `fix`, `process`, `host_gpu` and `rocm_install` can reach
-//! them without importing the module that owns the `Examination` document.
+//! [`crate::examine`] so `fix`, `process` and `host_gpu` can reach them without
+//! importing the module that owns the `Examination` document.
 
 use crate::runtime_is_windows;
 use std::ffi::OsString;

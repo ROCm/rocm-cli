@@ -1436,8 +1436,8 @@ mod tests {
     /// `"unknown"` is `Examination::framework`'s struct default, and a
     /// completed probe leaves it there when neither engine was found -- the
     /// ordinary case for most machines. Found by mutation: the prior code
-    /// special-cased an empty string here, a value `examine.rs` never
-    /// actually writes, so every one of these tests passed against a branch
+    /// special-cased an empty string here, a value `examine/framework.rs`
+    /// never actually writes, so every one of these tests passed against a branch
     /// that could never run, while the case that does run every day fell
     /// through to [`UNKNOWN`] and mislabelled an absence as unreadable.
     #[test]

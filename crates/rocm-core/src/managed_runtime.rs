@@ -1232,8 +1232,8 @@ mod tests {
     ///
     /// Those are what `examine`'s comgr/HIP search now reads to find a managed
     /// runtime's libraries (see `known_install_roots`/`install_library_dirs` in
-    /// `examine.rs`), in place of re-deriving the layout from `root_path` and
-    /// `site_packages` after the fact -- a guess that does not hold for every
+    /// `examine/library_copies.rs`), in place of re-deriving the layout from
+    /// `root_path` and `site_packages` after the fact -- a guess that does not hold for every
     /// real install shape, which is what left a managed runtime's own code
     /// object manager library unseen on a real host
     /// (`examine-finds-the-managed-runtimes-own-compilation-library`). A
