@@ -93,7 +93,7 @@ pub(crate) struct KfdGpuNode {
 ///
 /// Same planted-directory seam and cfg gating as [`detect_kfd_gfx_target_in`].
 /// The `/sys` path lives in the probe that calls this
-/// (`examine::probe_gpus_kernel_membership`), so that probe's own wiring is
+/// (`examine::linux_gpus::probe_gpus_kernel_membership_in`), so that probe's own wiring is
 /// drivable from a test too rather than only the reconcile it hands off to.
 #[cfg(any(target_os = "linux", test))]
 pub(crate) fn kfd_gpu_nodes_in(nodes_dir: &Path) -> Option<Vec<KfdGpuNode>> {

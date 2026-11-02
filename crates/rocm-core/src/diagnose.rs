@@ -1558,7 +1558,7 @@ fn repo_pkg_family(e: &Examination) -> &'static str {
 /// Whether `rocm_install_method` indicates a package-manager-driven install,
 /// covering both the marker-file-based `"repo-native"` value and the
 /// dpkg/rpm-query fallback's `"apt"`/`"dnf"` (see `probe_rocm_install` in
-/// `examine.rs`): a host without one of `REPO_NATIVE_INSTALL_MARKERS` present
+/// `examine/rocm_install_probe.rs`): a host without one of `REPO_NATIVE_INSTALL_MARKERS` present
 /// but whose package manager confirms `rocm-hip-runtime` is installed is
 /// still repo-native-managed, just detected a different way.
 ///
@@ -8298,7 +8298,7 @@ mod tests {
 
     #[test]
     fn repo_native_broken_claims_repo_native_evidence_for_dpkg_rpm_fallback_methods() {
-        // probe_rocm_install (examine.rs) falls back to the literal "apt"/"dnf"
+        // probe_rocm_install (examine/rocm_install_probe.rs) falls back to the literal "apt"/"dnf"
         // when dpkg/rpm confirms the package is installed but no marker file
         // was found. Those hosts are still repo-native-managed, so the evidence
         // line must fire for them too, not just the marker-file-detected

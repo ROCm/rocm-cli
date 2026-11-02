@@ -14,9 +14,8 @@
 //! random text, so every branch is reached; `inputs_reach_every_region` checks
 //! that.
 
-use super::{
-    WSL_MIN_UBUNTU, distro_clears_wsl_floor, line_blacklists_amdgpu, mode_access, parse_iommu_param,
-};
+use super::linux_driver::{line_blacklists_amdgpu, mode_access};
+use super::{WSL_MIN_UBUNTU, distro_clears_wsl_floor, parse_iommu_param};
 use proptest::prelude::*;
 use proptest::strategy::ValueTree;
 use proptest::test_runner::TestRunner;

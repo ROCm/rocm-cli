@@ -485,7 +485,7 @@ fn distro(examination: &Examination) -> String {
 /// machine with a fully installed HIP SDK.
 ///
 /// Within each platform the path decides absence and the version decides
-/// readability, because `examine.rs` collapses both into an empty string:
+/// readability, because `examine/rocm_install_probe.rs` collapses both into an empty string:
 /// "no install was found" and "an install was found whose version could not
 /// be read" arrive identical. Those are different facts to anybody counting,
 /// in the same way [`ReadOutcome`] keeps an unreadable report apart from an
@@ -1482,7 +1482,7 @@ mod tests {
 
     /// An absent ROCm and an unreadable one are different facts.
     ///
-    /// `examine.rs` collapses both into an empty `rocm_version`, so without
+    /// `examine/rocm_install_probe.rs` collapses both into an empty `rocm_version`, so without
     /// this the report would say "not installed" about a machine whose install
     /// merely could not be read -- turning an install problem into an absence
     /// for anybody counting.
