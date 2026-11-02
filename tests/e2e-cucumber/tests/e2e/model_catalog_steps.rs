@@ -24,8 +24,12 @@ async fn catalog_lists_aim_recipe(world: &mut E2eWorld) {
         Some(0),
         "listing the catalog is not a failure:\n{output}"
     );
+    // The recipe is listed by its model name (`aim-qwen3.5-9b` is an alias) and
+    // shares the entry with vLLM, so match the AIM engine within that one line.
     assert!(
-        output.contains("aim-qwen3.5-9b") && output.contains("engines=[aim]"),
+        output
+            .lines()
+            .any(|line| line.contains("Qwen/Qwen3.5-9B") && line.contains("engines=[aim")),
         "expected the AIM recipe listed by canonical id and engine:\n{output}"
     );
 }

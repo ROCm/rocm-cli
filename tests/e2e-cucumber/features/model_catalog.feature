@@ -1,6 +1,6 @@
 Feature: Model catalog listing
 
-  # ROCMAI-555: the AIM engine recipe (aim-qwen3.5-9b) is curated out of the
+  # ROCMAI-555: the AIM engine recipe (Qwen/Qwen3.5-9B) is curated out of the
   # default `rocm model` view (it is not `featured`), so only `--verbose`
   # actually lists it. `model` and its `models` alias share one parser branch,
   # so exercising `model --verbose` covers the epic's "rocm model or rocm

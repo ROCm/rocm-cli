@@ -1747,7 +1747,7 @@ async fn assert_no_service_started(world: &mut E2eWorld) {
         .join("data")
         .join("services");
     let records = std::fs::read_dir(&services_dir)
-        .map(|entries| entries.count())
+        .map(Iterator::count)
         .unwrap_or(0);
     assert_eq!(records, 0, "a refused serve left service records behind");
 }
