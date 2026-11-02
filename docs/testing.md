@@ -2191,14 +2191,14 @@ repo file and signing key with the host's own suite (`noble` on 24.04,
 `resolute` on 26.04), and the previous-driver warning. The warning command is
 also run against a stubbed `dpkg-query` by
 `previous_driver_warning_fires_only_when_amdgpu_dkms_is_installed` in
-[driver_install.rs](../apps/rocm/src/driver_install.rs).
+[driver_plan.rs](../apps/rocm/src/driver_plan.rs).
 
 ## /etc/os-release
 
 Every Rust reader of `/etc/os-release` parses it with
 [`os_release.rs`](../crates/rocm-core/src/os_release.rs), which returns the
 value `sh` would assign or nothing: the driver plan
-([`driver_install.rs`](../apps/rocm/src/driver_install.rs)), the OpenMPI,
+([`driver_plan.rs`](../apps/rocm/src/driver_plan.rs)), the OpenMPI,
 libatomic and libnuma install plans `rocm` runs before serving and the hints
 naming them ([`openmpi.rs`](../crates/rocm-core/src/openmpi.rs)), `rocm
 examine`'s distro fields ([`host_env.rs`](../crates/rocm-core/src/examine/host_env.rs)),
@@ -2265,7 +2265,7 @@ directly too, constructing an `OsRelease` from fixture text instead of going
 through a bare-text sibling — `crate::hardware_root::OsRelease::found` in
 [openmpi.rs](../crates/rocm-core/src/openmpi.rs)'s tests, and the equivalent
 `os_release_found` test helper in
-[driver_install.rs](../apps/rocm/src/driver_install.rs)'s (the former is
+[driver_plan.rs](../apps/rocm/src/driver_plan.rs)'s (the former is
 `#[cfg(test)] pub(crate)` inside `rocm-core` and so not visible from
 `apps/rocm`'s own tests).
 

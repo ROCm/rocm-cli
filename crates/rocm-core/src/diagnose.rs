@@ -1573,7 +1573,7 @@ fn is_repo_native_installed(method: &str) -> bool {
 /// Whether `rocm install driver --dkms` plans any commands for this host.
 ///
 /// Mirrors the full `(os_id, version_id)` / `ID_LIKE`-derivative
-/// matrix in `apps/rocm/src/driver_install.rs::build_driver_install_plan_at`
+/// matrix in `apps/rocm/src/driver_plan.rs::build_driver_install_plan_at`
 /// (`rocm-core` can't call that plan builder directly: `apps/rocm` depends
 /// on `rocm-core`, not the reverse).
 pub fn dkms_driver_plan_is_supported(e: &Examination) -> bool {
@@ -8510,7 +8510,7 @@ mod tests {
         // (distro_id, distro_version, distro_id_like, supported). Kept in step
         // with `build_driver_install_plan_at` by
         // `driver_plan_support_matches_rocm_core_diagnose` in
-        // `apps/rocm/src/driver_install.rs`.
+        // `apps/rocm/src/driver_plan.rs`.
         let table = [
             ("ubuntu", "22.04", "debian", true),
             ("ubuntu", "24.04", "debian", true),

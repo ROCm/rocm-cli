@@ -252,7 +252,7 @@ pub(crate) fn host_default_engine(paths: Option<&AppPaths>) -> &'static str {
 }
 
 /// The plan for a driver request. `only_reports` is the same platform decision
-/// `rocm install driver` makes (see `driver_install::install_driver_only_reports_on`):
+/// `rocm install driver` makes (see `driver_plan::install_driver_only_reports_on`):
 /// where it holds the command changes nothing, so the plan is read-only, carries
 /// no `--yes` and does not call the change privileged or disruptive.
 pub(crate) fn plan_driver_request(

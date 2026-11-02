@@ -370,7 +370,7 @@ use crate::tests::ScopedTestEnv;
 /// through the same `build_driver_install_plan_at` call doesn't need a
 /// second guard: one helper covers both input sets regardless of which
 /// branch actually reads them.
-pub(crate) fn scoped_rocdxg_env() -> ScopedTestEnv {
+pub(super) fn scoped_rocdxg_env() -> ScopedTestEnv {
     let mut env = ScopedTestEnv::with_amd_overrides_cleared();
     env.clear("ROCM_CLI_ROCDXG_VERSION");
     env.clear(ROCDXG_SHA256_ENV);
