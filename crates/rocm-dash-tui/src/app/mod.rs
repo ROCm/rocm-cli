@@ -16,9 +16,10 @@
 //! child modules hold no `AppState` methods: `app/types.rs` (shared type/enum
 //! defs and the menu data), `app/actions.rs` (`KeyAction` dispatch:
 //! `handle_key`, `apply_action`), `app/scrollbar.rs` (mouse hit-testing),
-//! `app/event_loop.rs` (terminal lifecycle + tick loop) and `app/summary.rs`.
-//! `crate::app::*` paths for the public surface moved out are unchanged via
-//! the re-exports below.
+//! `app/event_loop.rs` (terminal lifecycle + tick loop), `app/focus.rs`
+//! (focused-host policy), `app/update_check.rs` (the Updates-tile check) and
+//! `app/summary.rs`. `crate::app::*` paths for the public surface moved out
+//! are unchanged via the re-exports below.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -35,6 +36,7 @@ mod actions;
 mod chat;
 mod chat_state;
 mod event_loop;
+mod focus;
 mod overlays;
 mod quit_confirm;
 mod scroll;
@@ -45,6 +47,7 @@ mod summary;
 pub(crate) mod test_support;
 mod tool_approval;
 mod types;
+mod update_check;
 
 // Re-exports restoring the pre-split `crate::app::*` public surface. A
 // `pub(crate)` item with no caller through that path isn't re-exported just
@@ -53,11 +56,12 @@ mod types;
 pub(crate) use actions::request_quit;
 pub use actions::{KeyAction, handle_mouse, tab_bar_hit};
 pub(crate) use event_loop::{
-    HOME_UPDATE_CHECK_JOB_ID, SHUTTING_DOWN, exit_on_ctrl_c, is_ctrl_c, lock_terminal_writer,
-    restore_terminal, shutdown_claimed_on,
+    SHUTTING_DOWN, exit_on_ctrl_c, is_ctrl_c, lock_terminal_writer, restore_terminal,
+    shutdown_claimed_on,
 };
 
 pub use event_loop::{run, spawn_termination_watcher};
+pub(crate) use update_check::HOME_UPDATE_CHECK_JOB_ID;
 // Only reached via a test (`launcher.rs`'s
 // `the_front_door_comes_back_after_a_session_ends_cleanly`); gated to that
 // build so the compiler (not a hand-maintained `#[allow]`) flags this as dead
