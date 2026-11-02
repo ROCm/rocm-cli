@@ -84,10 +84,11 @@
 //! This cluster reaches three items that stayed behind in `main.rs` because
 //! they already had callers outside it: `engine_inventory()` (the built-in
 //! engine list, also read from `update_cmd.rs`),
-//! `engine_ruled_out_by_platform` (also read from `main.rs`'s
-//! `assess_model_for_host`; the private `PlatformRuleOut` enum it returns, which
-//! `model_registry_adapter_availability_note` matches on, is reached the same
-//! way), and `missing_packaged_engine_reason` (already noted in
+//! `engine_ruled_out_by_platform` (also read from `assess_model_for_host`; it
+//! and the `PlatformRuleOut` enum it returns, which
+//! `model_registry_adapter_availability_note` matches on, have since moved to
+//! `model_fit.rs` and are re-imported in `main.rs`, so they are reached the
+//! same way), and `missing_packaged_engine_reason` (already noted in
 //! [`engine_ipc.rs`](../apps/rocm/src/engine_ipc.rs)'s doc comment as having
 //! callers outside that cluster, plus its own test — this cluster is one of
 //! them) — all three reached via `use crate::{...};`, the same way other

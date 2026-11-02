@@ -55,8 +55,9 @@
 //! `drm_device_is_amd`, `parse_gpu_vram_usage`, `gpu_low_memory_warning`, and
 //! `busy_gpu_indices` have no callers outside this module and stay private;
 //! `GpuVramUsage` and its fields are `pub(crate)` for the same reason —
-//! `main.rs`'s `classify_accelerator_memory`/`collect_serve_notes` and their
-//! own tests construct and read them directly.
+//! `model_fit.rs`'s `classify_accelerator_memory`, `main.rs`'s
+//! `collect_serve_notes`, and their own tests construct and read them
+//! directly.
 //!
 //! `gpu_vram_usage_sysfs` has two definitions, `#[cfg(target_os = "linux")]`
 //! and `#[cfg(not(target_os = "linux"))]` — both moved intact, cfg-gates
@@ -664,7 +665,7 @@ fn drm_device_is_amd(device_dir: &Path) -> bool {
 /// GPU), and every other reader of this figure already treats zero as "not a
 /// real reading": [`GpuVramUsage::free_fraction`] returns `None` on it rather
 /// than reporting the GPU fully occupied. Keeping the row here would let
-/// [`host_accelerator_memory`] construct `AcceleratorMemory::Dedicated(0.0)`,
+/// `model_fit.rs`'s `host_accelerator_memory` construct `AcceleratorMemory::Dedicated(0.0)`,
 /// which reads as "measured, and it is nothing" rather than "could not
 /// measure" -- turning a diagnostic gap into a confident `Blocked` verdict.
 fn parse_gpu_vram_usage(value: &serde_json::Value) -> Vec<GpuVramUsage> {
