@@ -19,6 +19,7 @@ use std::path::PathBuf;
 
 mod install;
 mod process;
+mod repair;
 mod runtime;
 mod state;
 
