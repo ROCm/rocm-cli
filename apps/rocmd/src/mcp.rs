@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT
 
 use crate::common;
+use crate::host_snapshot;
 use crate::persistence;
 use anyhow::{Context, Result, bail};
 #[cfg(test)]
@@ -585,7 +586,7 @@ pub(crate) fn handle_mcp_tool_call(paths: &AppPaths, params: &Value) -> Result<V
             }
         }
         "bridge_snapshot" => {
-            let snapshot = common::build_bridge_snapshot(paths)?;
+            let snapshot = host_snapshot::build_bridge_snapshot(paths)?;
             Ok(tool_success(
                 format!(
                     "Captured bridge snapshot for {} / {} with default engine `{}`.",
@@ -596,7 +597,7 @@ pub(crate) fn handle_mcp_tool_call(paths: &AppPaths, params: &Value) -> Result<V
         }
         "gpu_snapshot" => {
             let config = RocmCliConfig::load(paths).unwrap_or_default();
-            let gpu = common::gather_gpu_snapshot_for_config(&config);
+            let gpu = host_snapshot::gather_gpu_snapshot_for_config(&config);
             let status = if !config.telemetry.local_inspection_enabled() {
                 "GPU telemetry is disabled by rocm-cli config."
             } else if gpu.amd_smi_available {
@@ -607,7 +608,7 @@ pub(crate) fn handle_mcp_tool_call(paths: &AppPaths, params: &Value) -> Result<V
             Ok(tool_success(status.to_owned(), json!(gpu)))
         }
         "engines" => {
-            let engines = common::bridge_engine_inventory();
+            let engines = host_snapshot::bridge_engine_inventory();
             Ok(tool_success(
                 format!("Found {} engine entries.", engines.len()),
                 json!({ "engines": engines }),

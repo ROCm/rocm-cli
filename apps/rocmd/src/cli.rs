@@ -120,7 +120,7 @@ pub(crate) enum Command {
 }
 
 fn print_bridge_snapshot(paths: &AppPaths, pretty: bool) -> Result<()> {
-    let snapshot = crate::common::build_bridge_snapshot(paths)?;
+    let snapshot = crate::host_snapshot::build_bridge_snapshot(paths)?;
 
     if pretty {
         println!(

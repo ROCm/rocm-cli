@@ -65,7 +65,7 @@ fn collect_automation_events(
     state: &AutomationRuntimeState,
 ) -> Result<Vec<AutomationTriggerEvent>> {
     collect_automation_events_with_gpu_snapshot(paths, state, || {
-        crate::common::gather_gpu_snapshot_for_config(config)
+        crate::host_snapshot::gather_gpu_snapshot_for_config(config)
     })
 }
 
