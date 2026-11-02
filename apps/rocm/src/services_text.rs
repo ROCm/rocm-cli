@@ -114,16 +114,14 @@ use crate::managed_service_status::{
     load_managed_services, local_server_sidebar_status, managed_service_is_live,
     managed_service_sidebar_counts, refresh_managed_service_runtime_liveness,
 };
-use crate::service_hints;
+use crate::service_hints::{self, service_action_past_tense};
 use crate::service_launch::ensure_public_service_has_endpoint_key;
 #[cfg(not(windows))]
 use crate::service_launch::{
     attach_background_stdio, detach_background_command, managed_engine_startup_failure_detail,
     managed_service_process_command,
 };
-use crate::{
-    SandboxToolArg, cli_lifecycle_log_path, service_action_past_tense, status_for_readiness,
-};
+use crate::{SandboxToolArg, cli_lifecycle_log_path, status_for_readiness};
 
 pub(crate) fn render_logs_text(paths: &AppPaths) -> String {
     render_logs_browser_text(paths, None)

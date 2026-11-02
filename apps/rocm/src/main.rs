@@ -88,6 +88,9 @@ mod update_cmd;
 // `record_cli_audit_event`, `cli_lifecycle_log_path` and `sanitize_log_value`
 // (from `cli_audit.rs`) are re-imported so other modules keep reaching them as
 // `crate::<name>`; `main.rs` itself calls `record_cli_audit_event`.
+// `sandbox_tool_arg_from_service_tool`, `service_action_command`,
+// `service_action_verb` and `service_action_past_tense` (from
+// `service_hints.rs`) are imported for `run_approved_service_action`.
 use crate::automations::{automations, render_daemon_text};
 use crate::cli_audit::{cli_lifecycle_log_path, record_cli_audit_event, sanitize_log_value};
 use crate::driver_install::{install_driver, reconcile_driver_install};
@@ -126,6 +129,10 @@ use crate::runtimes_cmd::{
     validate_runtime_manifest_for_activation,
 };
 use crate::serve_cmd::{ServeArgs, select_serve_engine, serve};
+use crate::service_hints::{
+    sandbox_tool_arg_from_service_tool, service_action_command, service_action_past_tense,
+    service_action_verb,
+};
 use crate::services_text::{
     load_managed_service, render_internal_status_text, render_logs_browser_text, render_logs_text,
     render_service_action_result, render_service_logs_text, render_services_json,
@@ -3876,39 +3883,6 @@ fn run_approved_service_action(
         Some(service_id),
     );
     Ok(())
-}
-
-fn sandbox_tool_arg_from_service_tool(tool: &str) -> Result<SandboxToolArg> {
-    match tool {
-        "stop_server" => Ok(SandboxToolArg::StopServer),
-        "restart_server" => Ok(SandboxToolArg::RestartServer),
-        "list_servers" => Ok(SandboxToolArg::ListServers),
-        other => bail!("unsupported service tool `{other}`"),
-    }
-}
-
-fn service_action_command(tool: &str) -> &'static str {
-    match tool {
-        "restart_server" => "restart",
-        "stop_server" => "stop",
-        _ => "run",
-    }
-}
-
-fn service_action_verb(tool: &str) -> &'static str {
-    match tool {
-        "restart_server" => "Restarting",
-        "stop_server" => "Stopping",
-        _ => "Changing",
-    }
-}
-
-fn service_action_past_tense(tool: &str) -> &'static str {
-    match tool {
-        "restart_server" => "restarted",
-        "stop_server" => "stopped",
-        _ => "updated",
-    }
 }
 
 // ---------------------------------------------------------------------------
