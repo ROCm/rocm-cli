@@ -2918,7 +2918,6 @@ VERSION_CODENAME=noble
     #[cfg(unix)]
     #[test]
     fn previous_driver_warning_fires_only_when_amdgpu_dkms_is_installed() {
-        use std::os::unix::fs::PermissionsExt;
         let _env = ScopedTestEnv::with_amd_overrides_cleared();
         let os_release = "ID=ubuntu\nVERSION_ID=\"24.04\"\nVERSION_CODENAME=noble\n";
         let plan = build_driver_install_plan_read(
@@ -2932,8 +2931,11 @@ VERSION_CODENAME=noble
         let root = dir.path().to_path_buf();
         let run = |status: &str| {
             let stub = root.join("dpkg-query");
-            fs::write(&stub, format!("#!/bin/sh\nprintf '%s' '{status}'\n")).unwrap();
-            fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+            rocm_core::fake_executable::write_fake_executable(
+                &stub,
+                format!("#!/bin/sh\nprintf '%s' '{status}'\n"),
+            )
+            .unwrap();
             let out = ProcessCommand::new("sh")
                 .args(["-c", command])
                 .env("PATH", format!("{}:/usr/bin:/bin", root.display()))

@@ -7608,13 +7608,11 @@ mod tests {
     /// the whole `PATH` of a shell that runs a Linux verify line.
     #[cfg(unix)]
     fn stub_bin_dir(stubs: &[(&str, &str)]) -> tempfile::TempDir {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().expect("the stub directory is created");
         for (name, script) in stubs {
             let path = dir.path().join(name);
-            std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).expect("a stub is written");
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-                .expect("a stub is made executable");
+            crate::fake_executable::write_fake_executable(&path, format!("#!/bin/sh\n{script}\n"))
+                .expect("a stub is planted");
         }
         dir
     }
