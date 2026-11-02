@@ -1142,11 +1142,11 @@ fn system_prefix_requires_ack(prefix: &std::path::Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::persistence::load_service_record;
     use crate::test_support::{
         assert_unconfirmed_stop_kept_the_service, seed_keyed_service, stop_with_outcome,
         temp_app_paths, workspace_test_artifact_dir,
     };
-    use crate::watchers::load_service_record;
     use std::fs;
     use std::path::PathBuf;
 

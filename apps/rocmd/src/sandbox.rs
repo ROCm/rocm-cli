@@ -991,11 +991,11 @@ fn command_available(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::persistence::load_service_record;
     use crate::test_support::{
         assert_unconfirmed_stop_kept_the_service, seed_keyed_service, stop_with_outcome,
         temp_app_paths,
     };
-    use crate::watchers::load_service_record;
     use rocm_core::ManagedServiceRecord;
     use std::io::Read;
 

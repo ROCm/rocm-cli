@@ -837,7 +837,7 @@ pub(crate) fn update_supervised_record(
     if !paths.service_manifest_path(&supervisor.service_id).exists() {
         return Ok(());
     }
-    let mut current = crate::watchers::load_service_record(paths, &supervisor.service_id)?;
+    let mut current = crate::persistence::load_service_record(paths, &supervisor.service_id)?;
     if current.supervisor_pid != supervisor.supervisor_pid
         || current.supervisor_start_ticks != supervisor.supervisor_start_ticks
     {
@@ -1045,11 +1045,11 @@ fn wait_for_service_ready(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::persistence::load_service_record;
     use crate::test_support::identity_probe_record;
     use crate::test_support::{
         UNCONFIRMED_STOP_PID, seed_keyed_service, temp_app_paths, unique_test_root,
     };
-    use crate::watchers::load_service_record;
     use crate::watchers::{find_recoverable_service, stop_requested};
 
     /// Drive `supervise_service` far enough to reach the key guard, and return
@@ -1500,7 +1500,7 @@ mod tests {
         assert!(!key_path.exists());
 
         let result = stop_managed_service(&paths, service_id);
-        let reloaded = crate::watchers::load_service_record(&paths, service_id);
+        let reloaded = crate::persistence::load_service_record(&paths, service_id);
         fs::remove_dir_all(root).ok();
 
         let value = result?;
