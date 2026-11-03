@@ -12,43 +12,51 @@
 //! the real host's answers cannot leak into the simulated one.
 //!
 //! It answers from `$ROCM_CLI_TEST_HOST_ROOT/.fake-tools/`: the file named after
-//! the full command line (`uname -r`), else the one named after the tool alone
-//! (`lsmod`). Its contents are printed and the exit code is 0. With neither file
-//! the simulated host does not have that tool, which is reported the way a shell
-//! reports a missing command: on stderr, with exit code 127.
+//! the exact command line (`uname -r`, `lspci -nn -D`). Its contents are printed
+//! and the exit code is 0. Only a tool in
+//! [`ARGV_INDEPENDENT_TOOLS`](e2e_cucumber::simulated_host::ARGV_INDEPENDENT_TOOLS)
+//! also answers from the file named after the tool alone, whatever its
+//! arguments (see [`canned_answer`]). Any other command line nobody
+//! planted is reported the way a shell reports a missing command, on stderr
+//! with exit code 127, naming the full command line: a stand-in that answered
+//! a changed invocation with the old canned text would hide exactly the drift
+//! between the CLI and the simulated machine this suite exists to catch.
 
+use std::ffi::OsString;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-/// Must match `simulated_host::TOOL_OUTPUT_DIR`.
-const TOOL_OUTPUT_DIR: &str = ".fake-tools";
-/// Must match `rocm_core::hardware_root::TEST_HOST_ROOT_ENV`.
-const TEST_HOST_ROOT_ENV: &str = "ROCM_CLI_TEST_HOST_ROOT";
+use e2e_cucumber::simulated_host::{TEST_HOST_ROOT_ENV, TOOL_OUTPUT_DIR, canned_answer};
 
 fn main() -> ExitCode {
-    let mut args = std::env::args();
-    let tool = tool_name(&args.next().unwrap_or_default());
-    let args: Vec<String> = args.collect();
+    let (tool, args) = command_line(std::env::args_os());
 
     let Some(root) = std::env::var_os(TEST_HOST_ROOT_ENV).filter(|root| !root.is_empty()) else {
         eprintln!("{tool}: {TEST_HOST_ROOT_ENV} is not set; this is a simulated-host stand-in");
         return ExitCode::from(127);
     };
-    let outputs = PathBuf::from(root).join(TOOL_OUTPUT_DIR);
-    let with_args = std::iter::once(tool.as_str())
-        .chain(args.iter().map(String::as_str))
-        .collect::<Vec<_>>()
-        .join(" ");
-    for name in [with_args.as_str(), tool.as_str()] {
-        if let Ok(text) = std::fs::read(outputs.join(name)) {
+    match canned_answer(&PathBuf::from(root).join(TOOL_OUTPUT_DIR), &tool, &args) {
+        Ok(text) => {
             // A closed stdout (the caller stopped reading) is not this tool's failure.
             let _ = std::io::stdout().write_all(&text);
-            return ExitCode::SUCCESS;
+            ExitCode::SUCCESS
+        }
+        Err(message) => {
+            eprintln!("{message}");
+            ExitCode::from(127)
         }
     }
-    eprintln!("{tool}: command not found");
-    ExitCode::from(127)
+}
+
+/// The tool name and arguments of this invocation. Lossy rather than
+/// `std::env::args()`, which panics on an argument that is not UTF-8: such a
+/// command line was planted for nobody, so it gets the missing-command answer
+/// like any other instead of a crash.
+fn command_line(mut argv: impl Iterator<Item = OsString>) -> (String, Vec<String>) {
+    let tool = tool_name(&argv.next().unwrap_or_default().to_string_lossy());
+    let args = argv.map(|arg| arg.to_string_lossy().into_owned()).collect();
+    (tool, args)
 }
 
 /// The tool this invocation stands in for: the full file name it was linked
@@ -64,6 +72,22 @@ fn tool_name(argv0: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::tool_name;
+
+    /// An argument that is not UTF-8 is carried lossily instead of panicking.
+    #[cfg(unix)]
+    #[test]
+    fn an_argument_that_is_not_utf8_is_carried_lossily() {
+        use super::command_line;
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt as _;
+        let argv = [
+            OsString::from("/sim/bin/lspci"),
+            OsString::from_vec(vec![b'-', 0xff]),
+        ];
+        let (tool, args) = command_line(argv.into_iter());
+        assert_eq!(tool, "lspci");
+        assert_eq!(args, ["-\u{fffd}"]);
+    }
 
     #[test]
     fn a_windows_interop_tool_keeps_its_extension() {
