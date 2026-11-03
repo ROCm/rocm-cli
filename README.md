@@ -931,7 +931,20 @@ per-GPU VRAM (through `amd-smi`, or the amdgpu DRM sysfs counters when `amd-smi`
 is not installed) and picks the lowest-numbered GPU that is idle and not already
 used by another ROCm CLI server (managed or foreground), falling back to the GPU
 with the most free memory. Pass a single index (`--gpu 1`) to pin a specific
-device.
+device. An index the machine does not have is refused before anything starts,
+and the error lists the indices that exist. On Windows the index is checked
+against the AMD display adapters Windows reports (and against the `amd-smi`
+count when that works, whichever is lower). That list can include an adapter the
+ROCm runtime does not support, so on Windows the check can still accept an index
+the runtime cannot use; it is a guard against a mistyped index, not a guarantee
+the device is usable. If neither the Windows list nor `amd-smi` can be read, the
+index is used unchecked and `rocm serve` prints a warning on stderr saying so.
+If a visibility mask is set but cannot be applied (on Windows `HIP_VISIBLE_DEVICES`
+holding an empty value, a UUID, or an ordinal past the adapters Windows lists; on
+Linux a mask when the GPU lists could not be read but `amd-smi` still gives a
+count), the index is still refused when it is at or past the GPU count, and one
+below the count is accepted with a warning that the mask was not applied. When
+`amd-smi` gives a count and no mask is set, the Windows list is not queried.
 
 The selected GPU is exposed to the engine through `HIP_VISIBLE_DEVICES`. Serving
 one model across multiple GPUs is not supported. Because selection uses the

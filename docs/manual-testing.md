@@ -320,6 +320,41 @@ While the log stream is attached, verify detach and stop behave differently:
 - Re-run the serve command and press `Ctrl+C` instead. The server shuts down and
   `rocm services` no longer lists it as running.
 
+### Windows `--gpu` index check
+
+On a Windows machine with one AMD GPU, pin an index the machine does not have:
+
+```powershell
+rocm serve qwen --engine lemonade --gpu 7
+rocm services
+```
+
+Expected result:
+
+- `rocm serve` exits non-zero before starting anything, and says index 7 is not
+  present and lists the usable indices (`[0]` here).
+- `rocm services` shows no new server. Repeat with `--gpu 0` to confirm a real
+  index still starts.
+- With `HIP_VISIBLE_DEVICES=0` set (an ordinal the machine has), `--gpu 7`
+  is refused as not available under that mask (it names `HIP_VISIBLE_DEVICES`
+  only) and lists `[0]`. With only `ROCR_VISIBLE_DEVICES` set, which native
+  Windows ignores, the refusal says the index is not present on this host and
+  names no mask.
+- With `HIP_VISIBLE_DEVICES=3` set (an ordinal past the one adapter, which
+  cannot be resolved; an empty value is treated the same way), `--gpu 7` is still refused: it is past the adapter count
+  whatever the mask says, and the message says the mask could not be resolved.
+  `--gpu 0` is below the count, so it is accepted with a `warning:` line saying
+  the index was checked only against the GPU count, not the mask (so this
+  starts a server; stop it afterwards).
+- On a machine with an AMD adapter the ROCm runtime does not support beside a
+  supported one, the Windows list counts both, so `--gpu 1` can still pass the
+  check; `amd-smi list`, when it works, lowers the bound.
+
+If neither the Windows adapter list nor `amd-smi` can be read, `--gpu 7` is used
+unchecked and `rocm serve` prints a `warning:` line on stderr saying the index
+was not checked. The automated scenario for the refusal is `serve-16` on the
+Windows GPU lane.
+
 ### Windows display driver check
 
 On a Windows machine with an AMD GPU, check what the CLI says about the display
