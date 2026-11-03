@@ -1566,7 +1566,7 @@ const KERNEL_IDENTIFIED_GPUS: &[(&str, &str, bool, &str)] = &[
 /// `(PCI address, KFD gfx_target_version)` for each [`KERNEL_IDENTIFIED_GPUS`]
 /// row: gfx902 packs as 90002, gfx1102 as 110002.
 const KERNEL_IDENTIFIED_NODES: &[(&str, u32)] =
-    &[("0000:03:00.0", 90002), ("0000:01:00.0", 110002)];
+    &[("0000:03:00.0", 90002), ("0000:01:00.0", 110_002)];
 
 #[given(
     "a machine with a Raven Ridge integrated GPU and a discrete AMD GPU that only the kernel identifies"
@@ -1580,7 +1580,7 @@ async fn machine_with_kernel_identified_gpus(world: &mut E2eWorld) {
 /// 9070 XT. Neither node states a PCI address, so the report lists both from the
 /// topology alone, the way it does in a container with no `pciutils`.
 const KERNEL_ONLY_GPUS: &[(u32, &str, bool)] =
-    &[(110501, "gfx1151", true), (120001, "gfx1201", false)];
+    &[(110_501, "gfx1151", true), (120_001, "gfx1201", false)];
 
 #[given(
     "a machine whose only list of GPUs is the kernel's, naming a Strix Halo integrated GPU and a Radeon RX 9070 XT"
