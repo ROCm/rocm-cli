@@ -130,7 +130,7 @@ pub(crate) fn select_serve_engine(
 /// The recipe's first preferred engine that can run on this host. AIM is only
 /// chosen on its own when the detected GPU family is one the image has a profile
 /// for and the host is Linux or WSL, so an undetected GPU or native Windows is not,
-/// and vLLM is not an option on native Windows. When no listed engine fits, the
+/// and on native Windows vLLM is not an option once AIM has been passed over. When no listed engine fits, the
 /// platform default applies, as it did before the recipe was catalogued. An
 /// explicit `--engine aim` never comes through here, and still gets the refusal
 /// that names the supported GPUs.
@@ -154,15 +154,20 @@ fn recipe_preferred_engine<'a>(
                     GfxSupport::Supported(_)
                 ) || record.supported_gfx_families.is_empty()
             });
+    // Native Windows has no vLLM, but a recipe whose first engine is vLLM keeps
+    // it there, as it does without the AIM catalog: the skip applies only when
+    // falling past an AIM first choice that was not usable.
+    let mut passed_unusable_aim = false;
     recipe
         .preferred_engines
         .iter()
         .map(String::as_str)
         .find(|engine| {
             if is_aim(engine) {
+                passed_unusable_aim |= !aim_usable;
                 aim_usable
             } else {
-                !(windows && engine.eq_ignore_ascii_case("vllm"))
+                !(windows && passed_unusable_aim && engine.eq_ignore_ascii_case("vllm"))
             }
         })
 }
@@ -1762,6 +1767,12 @@ mod tests {
         let vllm_only = resolve_builtin_model_recipe("meta-llama/Llama-3.2-3B-Instruct").unwrap();
         assert_eq!(
             recipe_preferred_engine(&vllm_only, Some(&strix), false),
+            Some("vllm")
+        );
+        // A recipe that lists vLLM first keeps it on native Windows (the skip
+        // applies only past an unusable AIM first choice), as it does on main.
+        assert_eq!(
+            recipe_preferred_engine(&vllm_only, Some(&strix), true),
             Some("vllm")
         );
 
