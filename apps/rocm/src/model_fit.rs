@@ -259,13 +259,21 @@ pub(crate) enum PlatformRuleOut {
 
 /// Whether, and why, the platform gate rules this engine out on this host.
 pub(crate) fn engine_ruled_out_by_platform(engine: &str) -> PlatformRuleOut {
+    engine_ruled_out_by_platform_with(engine, rocm_engine_aim::builtin_docker_daemon_reachable)
+}
+
+/// [`engine_ruled_out_by_platform`] with the Docker probe injected, so a caller
+/// that asks about many engines in one pass (the `/model` listing) can answer
+/// the same `docker info` once instead of once per recipe.
+pub(crate) fn engine_ruled_out_by_platform_with(
+    engine: &str,
+    docker_reachable: impl FnOnce() -> bool,
+) -> PlatformRuleOut {
     if rocm_core::runtime_is_windows() && engine.eq_ignore_ascii_case("vllm") {
         PlatformRuleOut::NativeWindowsVllm
     } else if rocm_core::runtime_is_windows() && engine.eq_ignore_ascii_case("aim") {
         PlatformRuleOut::NativeWindowsAim
-    } else if engine.eq_ignore_ascii_case("aim")
-        && !rocm_engine_aim::builtin_docker_daemon_reachable()
-    {
+    } else if engine.eq_ignore_ascii_case("aim") && !docker_reachable() {
         PlatformRuleOut::AimDockerUnavailable
     } else {
         PlatformRuleOut::Allowed

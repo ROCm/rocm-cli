@@ -93,7 +93,7 @@ pub(crate) const fn builtin_engine_inventory() -> &'static [(&'static str, &'sta
         ),
         (
             "aim",
-            "AMD Enterprise AI pre-built Docker serving containers",
+            "AMD Inference Microservices (AIM) pre-built Docker serving containers",
         ),
     ]
 }

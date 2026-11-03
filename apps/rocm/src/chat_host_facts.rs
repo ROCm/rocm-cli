@@ -79,6 +79,23 @@ impl HostFacts {
         self.os_name != "windows"
     }
 
+    /// Whether any catalogued AIM image has a profile for this GPU's family.
+    /// `None` when the family is unknown, where `rocm serve` enforces nothing.
+    fn aim_catalog_covers_gpu(&self) -> Option<bool> {
+        let family = self
+            .gfx_target
+            .as_deref()
+            .or(self.therock_family.as_deref())
+            .and_then(rocm_core::normalize_therock_family)?;
+        Some(rocm_core::builtin_model_recipes().iter().any(|recipe| {
+            recipe
+                .engine_recipes
+                .iter()
+                .filter(|record| record.engine.eq_ignore_ascii_case("aim"))
+                .any(|record| record.supported_gfx_families.contains(&family))
+        }))
+    }
+
     /// How to describe the operating system to a non-technical user. WSL is
     /// called out because it is the case the old prompt got wrong: it asserted
     /// "on native Windows, vLLM is skipped" at a user who was on WSL, where
@@ -123,12 +140,18 @@ impl HostFacts {
             "- Serving engines that run here: Lemonade. vLLM and AIM are skipped on native Windows; \
              tell the user to use WSL2 or Linux for those ROCm GPU engines.\n"
         };
+        let aim_note = if self.vllm_available() && self.aim_catalog_covers_gpu() == Some(false) {
+            "- No catalogued AIM model has a profile for this GPU family, and `rocm serve` \
+             refuses them here; do not suggest an AIM catalog model.\n"
+        } else {
+            ""
+        };
         format!(
             "Facts about the machine you are running on, detected by ROCm CLI. Trust these \
              over anything you remember about ROCm:\n\
              - Operating system: {os}\n\
              - AMD GPU: {gpu}\n\
-             {family}{engines}\
+             {family}{engines}{aim_note}\
              ROCm and ROCm CLI support this operating system. Never tell the user ROCm is \
              unavailable on their platform, and never suggest CUDA, DirectML, or CPU fallback.",
             os = self.operating_system(),
@@ -175,6 +198,11 @@ mod tests {
             block.contains("Lemonade, vLLM and AIM"),
             "vLLM and AIM are available under WSL:\n{block}"
         );
+        // Strix Halo has no profile in any catalogued AIM image.
+        assert!(
+            block.contains("do not suggest an AIM catalog model"),
+            "{block}"
+        );
         assert!(
             !block.contains("ROCm/TheRock family"),
             "a family identical to the target adds nothing:\n{block}"
@@ -202,6 +230,20 @@ mod tests {
             block.contains("- ROCm/TheRock family for this GPU: gfx120X-all"),
             "a family that differs from the target is worth a line:\n{block}"
         );
+    }
+
+    #[test]
+    fn aim_catalog_note_only_appears_where_no_catalogued_image_covers_the_gpu() {
+        let block = |target: Option<&str>| {
+            HostFacts::from_gpu_summary("linux", false, gpu(None, target, target)).render()
+        };
+        let note = "do not suggest an AIM catalog model";
+        assert!(!block(Some("gfx942")).contains(note));
+        assert!(!block(Some("gfx1100")).contains(note));
+        assert!(!block(Some("gfx1201")).contains(note));
+        assert!(block(Some("gfx1151")).contains(note));
+        // No detected GPU: nothing is enforced, so nothing is claimed.
+        assert!(!block(None).contains(note));
     }
 
     #[test]
