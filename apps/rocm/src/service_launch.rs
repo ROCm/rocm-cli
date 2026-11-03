@@ -276,6 +276,29 @@ pub(crate) fn managed_engine_startup_failure_detail(status: ExitStatus, log_path
 /// the only record of why, since the child is detached and writes nowhere else
 /// — platform-generic since ROCMAI-541 attaches it on Windows too (see
 /// `spawn_detached_with_log` above).
+/// Retire a crashed service: mark the manifest and the engine's own state file
+/// `failed`. The engine process is gone and cannot stamp its own file, so this
+/// does it on the engine's behalf.
+///
+/// Both writes are merges, never a whole-record `ManagedServiceRecord::write()`,
+/// because every caller holds a copy of the record captured before the crash:
+/// writing that back wholesale would erase a `stop_requested_unix_ms` a
+/// concurrent stop may have written in the same window. Stamping the manifest
+/// alone is not enough either — `refresh_from_engine_state` reads the engine
+/// state file back into a newer manifest, so an unstamped state file would undo
+/// the manifest write on the next refresh.
+///
+/// Best-effort by design: a crash report must not be lost because the
+/// bookkeeping behind it could not be written.
+pub(crate) fn mark_service_failed(manifest_path: &Path, engine_state_path: &Path) {
+    let _ =
+        rocm_core::merge_json_state_file(manifest_path, &serde_json::json!({ "status": "failed" }));
+    let _ = rocm_core::merge_json_state_file(
+        engine_state_path,
+        &serde_json::json!({ "status": "failed" }),
+    );
+}
+
 pub(crate) fn managed_engine_exit_failure_detail(service_id: &str, log_path: &Path) -> String {
     let recent_lines = read_optional_tail_lines(log_path, 80, "service log");
     if recent_lines.is_empty() {
@@ -386,14 +409,7 @@ fn finalize_managed_launch_readiness(
             return Ok(false);
         }
         record.status = "failed".to_owned();
-        let _ = rocm_core::merge_json_state_file(
-            &record.manifest_path,
-            &serde_json::json!({ "status": "failed" }),
-        );
-        let _ = rocm_core::merge_json_state_file(
-            &record.engine_state_path,
-            &serde_json::json!({ "status": "failed" }),
-        );
+        mark_service_failed(&record.manifest_path, &record.engine_state_path);
         bail!(
             "{}",
             managed_engine_exit_failure_detail(&record.service_id, &record.log_path)
@@ -820,14 +836,7 @@ fn spawn_managed_engine_child(
             // before this spawn, and writing it back wholesale would erase a
             // `stop_requested_unix_ms` a concurrent stop could have written to
             // disk in this same narrow window.
-            let _ = rocm_core::merge_json_state_file(
-                &record.manifest_path,
-                &serde_json::json!({ "status": "failed" }),
-            );
-            let _ = rocm_core::merge_json_state_file(
-                &record.engine_state_path,
-                &serde_json::json!({ "status": "failed" }),
-            );
+            mark_service_failed(&record.manifest_path, &record.engine_state_path);
             bail!(
                 "{}",
                 managed_engine_startup_failure_detail(status, &record.log_path)
@@ -1443,13 +1452,9 @@ pub(crate) fn run_attached_service(
                     },
                 );
             if still_watching_this_supervisor {
-                let _ = rocm_core::merge_json_state_file(
+                mark_service_failed(
                     &paths.service_manifest_path(&service_id),
-                    &serde_json::json!({ "status": "failed" }),
-                );
-                let _ = rocm_core::merge_json_state_file(
                     &engine_state_path,
-                    &serde_json::json!({ "status": "failed" }),
                 );
             }
             bail!(

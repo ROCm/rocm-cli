@@ -1095,6 +1095,123 @@ async fn user_serves_negative_temperature(world: &mut E2eWorld) {
     world.cli_rc = Some(rc);
 }
 
+/// A gated AIM catalog entry (`requires_hf_token`), with a profile for a Radeon
+/// PRO W7900 (`gfx110X-all`). The token check runs before GPU detection and
+/// Docker, so no engine or GPU is needed to reach it.
+const GATED_AIM_MODEL: &str = "meta-llama/Llama-3.1-8B-Instruct";
+
+/// An AIM image with profiles for Radeon (`gfx110X-all`, `gfx120X-all`) only.
+const RADEON_AIM_MODEL: &str = "Qwen/Qwen3.5-9B";
+
+/// An AIM image that needs 8 GPUs on an Instinct MI300X.
+const EIGHT_GPU_AIM_MODEL: &str = "deepseek-ai/DeepSeek-R1";
+
+/// Put a `docker` that always fails first on `PATH` and have it log every call to
+/// a file in the scenario root, so a refused serve can be shown never to have
+/// reached Docker (not even `docker info`).
+#[given("Docker is watched for any call")]
+async fn docker_is_watched(world: &mut E2eWorld) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("scenario has no isolated root")
+        .path()
+        .to_path_buf();
+    let bin_dir = root.join("watched-docker-bin");
+    crate::install_fixture_binary(
+        "fake-docker",
+        &bin_dir.join(e2e_cucumber::fixture_binary::fixture_target_name("docker")),
+    );
+    let mut path = std::ffi::OsString::from(&bin_dir);
+    path.push(if cfg!(windows) { ";" } else { ":" });
+    path.push(std::env::var_os("PATH").unwrap_or_default());
+    world.command_env.push(("PATH", path));
+    world
+        .command_env
+        .push(("FAKE_DOCKER_LOG", docker_call_log(world).into_os_string()));
+}
+
+fn docker_call_log(world: &E2eWorld) -> std::path::PathBuf {
+    world
+        .isolated_root
+        .as_ref()
+        .expect("scenario has no isolated root")
+        .path()
+        .join("docker-calls.log")
+}
+
+/// Plant one GPU in the simulated kernel topology (`ROCM_CLI_TEST_HOST_ROOT`, honoured
+/// by `e2e-test-hooks` builds) so the family the CLI detects does not depend on the
+/// runner's hardware. `gfx_target_version` is the kernel's decimal encoding.
+fn plant_single_gpu(world: &mut E2eWorld, gfx_target_version: u32) {
+    let host_root = world
+        .isolated_root
+        .as_ref()
+        .expect("scenario has no isolated root")
+        .path()
+        .join("host-root");
+    let node = host_root.join("sys/class/kfd/kfd/topology/nodes/1");
+    std::fs::create_dir_all(&node).expect("failed to create the planted KFD node");
+    // `cpu_cores_count 0` with a nonzero `simd_count` makes the node a GPU.
+    std::fs::write(
+        node.join("properties"),
+        format!("cpu_cores_count 0\nsimd_count 56\ngfx_target_version {gfx_target_version}\n"),
+    )
+    .expect("failed to write the planted KFD node properties");
+    world
+        .command_env
+        .push(("ROCM_CLI_TEST_HOST_ROOT", host_root.into_os_string()));
+}
+
+/// gfx942, TheRock family `gfx94X-dcgpu`.
+#[given("a host whose only GPU is an AMD Instinct MI300X")]
+async fn host_with_an_mi300x(world: &mut E2eWorld) {
+    plant_single_gpu(world, 90402);
+}
+
+/// gfx1100, TheRock family `gfx110X-all`.
+#[given("a host whose only GPU is an AMD Radeon PRO W7900")]
+async fn host_with_a_w7900(world: &mut E2eWorld) {
+    plant_single_gpu(world, 110_000);
+}
+
+fn run_serve_aim(world: &mut E2eWorld, args: &[&str]) {
+    let mut full = vec!["serve"];
+    full.extend_from_slice(args);
+    full.extend_from_slice(&["--engine", "aim"]);
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(world, &full);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[when("the user serves a gated AIM model without passing a Hugging Face token")]
+async fn user_serves_gated_aim_without_token(world: &mut E2eWorld) {
+    run_serve_aim(world, &[GATED_AIM_MODEL]);
+}
+
+#[when(
+    "the user serves a gated AIM model with an exported Hugging Face token while every GPU is masked"
+)]
+async fn user_serves_gated_aim_with_token(world: &mut E2eWorld) {
+    world
+        .command_env
+        .push(("HF_TOKEN", "hf_e2e_placeholder".into()));
+    // An empty mask hides every device, so a GPU host presents as having none usable.
+    world.command_env.push(("HIP_VISIBLE_DEVICES", "".into()));
+    run_serve_aim(world, &[GATED_AIM_MODEL, "--engine-env", "HF_TOKEN"]);
+}
+
+#[when("the user serves a Radeon-only AIM image")]
+async fn user_serves_radeon_only_aim(world: &mut E2eWorld) {
+    run_serve_aim(world, &[RADEON_AIM_MODEL]);
+}
+
+#[when("the user serves an AIM image that needs eight GPUs")]
+async fn user_serves_eight_gpu_aim(world: &mut E2eWorld) {
+    run_serve_aim(world, &[EIGHT_GPU_AIM_MODEL]);
+}
+
 /// Serve with every GPU hidden from the CLI and engine via an empty
 /// `HIP_VISIBLE_DEVICES`, so a GPU host presents as having no usable device.
 #[when("the user serves a model with every GPU masked from view")]
@@ -1539,6 +1656,168 @@ async fn user_serves_live_model_on_absent_gpu_index(world: &mut E2eWorld) {
     world.cli_rc = Some(rc);
 }
 
+/// Serve with an explicit `--engine vllm`. Only run on native Windows
+/// (`@requires-os:windows`), where the platform gate refuses it before any
+/// runtime resolution or launch; the model name is arbitrary because the
+/// refusal comes first.
+#[when("the user serves a model with the vLLM engine")]
+async fn user_serves_with_vllm(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(
+        world,
+        &["serve", "nonexistent-model-xyz", "--engine", "vllm"],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+/// `rocm engines install vllm --yes`. Runs with the scenario's fixture env, so
+/// the recording `uv` of serve-35 is the one an unrefused install would reach.
+#[when("the user installs the vLLM engine")]
+async fn user_installs_vllm(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) =
+        crate::run_rocm_with_scenario_env(world, &["engines", "install", "vllm", "--yes"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the install is refused")]
+async fn assert_install_refused(world: &mut E2eWorld) {
+    let rc = world.cli_rc.expect("no install rc recorded");
+    assert!(
+        rc != 0,
+        "expected the install to be refused, but it exited 0:\n{}",
+        serve_output(world)
+    );
+}
+
+/// The native-Windows vLLM refusal, for the action that was attempted. It must
+/// be the platform reason, not the "no active ROCm runtime" error that used to
+/// pre-empt it, and must name the way out for that action. The paired steps
+/// (`serving is refused before any engine starts` / `the install is refused`,
+/// and the no-record / no-environment checks) prove the behavior it describes.
+#[then(expr = "the user is told vLLM needs WSL or Linux, or the Lemonade engine to {word}")]
+async fn assert_vllm_native_windows_refusal(world: &mut E2eWorld, action: String) {
+    let output = serve_output(world);
+    let remedy = match action.as_str() {
+        "serve" => "`--engine lemonade`",
+        "install" => "`rocm engines install lemonade`",
+        other => panic!("unknown action {other:?}"),
+    };
+    assert!(
+        output.contains("vLLM is not supported on native Windows")
+            && output.contains("WSL or Linux")
+            && output.contains(remedy),
+        "expected the native-Windows vLLM refusal naming WSL/Linux and {remedy}, got:\n{output}"
+    );
+    assert!(
+        !output.contains("no active ROCm runtime"),
+        "the platform refusal must come before runtime resolution, got:\n{output}"
+    );
+}
+
+/// The refused serve left nothing behind: a launch always writes a
+/// managed-service record under `<data>/services/`, and `services list --all`
+/// reads exactly those records.
+#[then("no local server was recorded")]
+async fn assert_no_service_recorded(world: &mut E2eWorld) {
+    let services = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("data")
+        .join("services");
+    let records: Vec<_> = std::fs::read_dir(&services)
+        .map(|entries| entries.flatten().map(|entry| entry.path()).collect())
+        .unwrap_or_default();
+    assert!(
+        records.is_empty(),
+        "a refused serve must not record a service, found: {records:?}"
+    );
+    let listed = crate::run_rocm_ok(world, &["services", "list", "--all"]);
+    assert!(
+        !listed.contains("vllm-"),
+        "a refused serve must not appear in `services list --all`:\n{listed}"
+    );
+}
+
+/// Give the planted runtime what a real vLLM install needs to get going, and
+/// stand a recording `uv` in for the real one. The runtime then resolves as a
+/// managed Python environment, so an install that is NOT refused runs
+/// `uv pip install vllm`, which the stand-in records instead of fetching.
+/// Without this the planted runtime is rejected by the vLLM adapter before it
+/// writes anything, and "nothing was installed" could not fail.
+#[given("the runtime has a Python interpreter and uv is a recording stand-in")]
+async fn runtime_with_recording_uv(world: &mut E2eWorld) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .to_path_buf();
+    let install_root = PathBuf::from(world.model_name.clone().expect("no runtime install root"));
+    let python = install_root.join("python.exe");
+    std::fs::write(&python, "not a real interpreter").expect("failed to write python stand-in");
+
+    let registry = root.join("data").join("runtimes").join("registry");
+    let manifest_path = registry.join("release-tarball-gfx942.json");
+    let mut manifest: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&manifest_path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", manifest_path.display())),
+    )
+    .expect("runtime manifest is not JSON");
+    manifest["python_executable"] = serde_json::json!(python);
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_string_pretty(&manifest).expect("failed to serialize manifest"),
+    )
+    .expect("failed to rewrite runtime manifest");
+
+    let marker = root.join(UV_MARKER);
+    let uv = root.join("recording-uv.cmd");
+    std::fs::write(
+        &uv,
+        format!(
+            "@echo off
+echo %* > \"{}\"
+exit /b 1
+",
+            marker.display()
+        ),
+    )
+    .expect("failed to write recording uv");
+    world
+        .command_env
+        .push(("ROCM_CLI_UV_BINARY", uv.into_os_string()));
+}
+
+/// File the recording `uv` writes when it is invoked.
+const UV_MARKER: &str = "uv-was-run.txt";
+
+/// The refused install never started: the recording `uv` was not invoked and
+/// nothing exists under the runtime's `<install_root>/engines`, the folder a
+/// real install is rooted at (`env_root_for_runtime`). Both can fail: with the
+/// platform gate removed the install runs `uv pip install vllm`.
+#[then("no vLLM install was started")]
+async fn assert_no_vllm_install_started(world: &mut E2eWorld) {
+    let root = world.isolated_root.as_ref().expect("no isolated root");
+    let marker = root.path().join(UV_MARKER);
+    assert!(
+        !marker.exists(),
+        "a refused vLLM install must not run uv, but it was invoked with: {}",
+        std::fs::read_to_string(&marker).unwrap_or_default()
+    );
+    let install_root = PathBuf::from(world.model_name.clone().expect("no runtime install root"));
+    let engines = install_root.join("engines");
+    assert!(
+        !engines.exists(),
+        "a refused vLLM install must not create {}",
+        engines.display()
+    );
+}
+
 #[when("the CLI reports the service as ready")]
 async fn when_cli_reports_ready(world: &mut E2eWorld) {
     // Read readiness from the CLI's own view (`services list`), not a direct
@@ -1694,6 +1973,71 @@ async fn assert_no_engine_preparation(world: &mut E2eWorld) {
         !output.contains("Preparing "),
         "a live managed service for an unrelated model must not drag engine \
          preparation ahead of the no-usable-GPU refusal:\n{output}"
+    );
+}
+
+#[then("the CLI explains that the model needs a Hugging Face token")]
+async fn assert_hf_token_message(world: &mut E2eWorld) {
+    let output = serve_output(world);
+    assert!(
+        output.contains("needs a Hugging Face token") && output.contains("--engine-env HF_TOKEN"),
+        "expected the gated-model refusal naming the remedy, got:\n{output}"
+    );
+}
+
+#[then("no service was started")]
+async fn assert_no_service_started(world: &mut E2eWorld) {
+    let services_dir = world
+        .isolated_root
+        .as_ref()
+        .expect("scenario has no isolated root")
+        .path()
+        .join("data")
+        .join("services");
+    let records = std::fs::read_dir(&services_dir).map_or(0, Iterator::count);
+    assert_eq!(records, 0, "a refused serve left service records behind");
+}
+
+#[then("the refusal is that no usable GPU is visible")]
+async fn assert_refusal_is_no_usable_gpu(world: &mut E2eWorld) {
+    // The token gate and the GPU-family gate were both passed: the serve got as
+    // far as the GPU-required pre-flight, which the empty mask fails.
+    let output = serve_output(world);
+    assert!(
+        output.contains("no usable AMD GPU") && !output.contains("needs a Hugging Face token"),
+        "expected the exported token to clear its gate and the serve to stop at the \
+         GPU pre-flight, got:\n{output}"
+    );
+}
+
+#[then("the CLI says the image has no profile for this GPU and names the GPUs it supports")]
+async fn assert_no_profile_for_gpu(world: &mut E2eWorld) {
+    let output = serve_output(world);
+    assert!(
+        output.contains("has no profile for this GPU (gfx94X-dcgpu)")
+            && output.contains("it supports: gfx110X-all, gfx120X-all"),
+        "expected the unsupported-GPU refusal naming the detected and supported families, \
+         got:\n{output}"
+    );
+}
+
+#[then("the CLI says the image needs eight GPUs and multi-GPU serving is not supported")]
+async fn assert_needs_eight_gpus(world: &mut E2eWorld) {
+    let output = serve_output(world);
+    assert!(
+        output.contains("needs 8 GPUs") && output.contains("does not support multi-GPU serving"),
+        "expected the multi-GPU refusal, got:\n{output}"
+    );
+}
+
+#[then("Docker was never called")]
+async fn assert_docker_never_called(world: &mut E2eWorld) {
+    let log = docker_call_log(world);
+    let calls = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        calls.is_empty(),
+        "a refused serve reached Docker ({}):\n{calls}",
+        log.display()
     );
 }
 
@@ -2339,6 +2683,46 @@ async fn assert_scripted_crash_fails(world: &mut E2eWorld) {
         output.contains("exited unexpectedly"),
         "expected the crash to be reported as an unexpected exit: {output}"
     );
+    // That wrapper is not enough on its own. `managed_engine_exit_failure_detail`
+    // prints "exited unexpectedly" even when the log tail is EMPTY, so asserting
+    // only it would stay green in exactly the failure ROCMAI-541 is about: the
+    // engine's reason reaching neither the log nor the user. Pin the engine's
+    // OWN message in both places instead — the log, which is what the Windows
+    // stdio attach fixes, and the CLI output, which is what the user sees.
+    let service_id = world
+        .scripted_service_id
+        .clone()
+        .expect("no scripted service_id captured from the serve's own output");
+    let log = scripted_service_log(world, &service_id);
+    assert!(
+        log.contains(SCRIPTED_ENGINE_DEATH_REASON),
+        "the engine's own failure reason never reached the service log — the bug \
+         this scenario exists for. Log was:\n{log}"
+    );
+    assert!(
+        output.contains(SCRIPTED_ENGINE_DEATH_REASON),
+        "the engine's own failure reason never reached the user:\n{output}"
+    );
+}
+
+/// The scripted engine's own death message, which must survive from the
+/// detached child all the way to the service log and the user. Must match the
+/// `bail!` in `run_scripted_e2e_engine_serve_http`.
+const SCRIPTED_ENGINE_DEATH_REASON: &str = "scripted e2e engine death after startup";
+
+/// Read the service log the way `rocm logs` would: off the `log_path` the
+/// manifest records, rather than re-deriving it.
+fn scripted_service_log(world: &E2eWorld, service_id: &str) -> String {
+    let manifest_path = world.app_paths().service_manifest_path(service_id);
+    let record = read_json_file(&manifest_path);
+    let log_path = record
+        .get("log_path")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| panic!("record has no log_path: {record}"));
+    match std::fs::read(log_path) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(error) => panic!("failed to read service log {log_path}: {error}"),
+    }
 }
 
 #[then("the service record and its engine state both read failed")]

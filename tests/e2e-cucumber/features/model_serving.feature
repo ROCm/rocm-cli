@@ -345,7 +345,9 @@ Feature: Model serving
   # AIM serve + inference canary (ROCMAI-554). This scenario deliberately still
   # serves via the raw AIM Docker image reference rather than the catalog
   # recipe added in ROCMAI-555 — it's a hardware-verified canary pinned to one
-  # exact image/profile, not a catalog-discovery test. `@requires-engine:aim`
+  # exact image/profile, not a catalog-discovery test. Because it names the raw
+  # image, the catalog's GPU-family refusal (no profile for Strix Halo) does not
+  # apply to it. `@requires-engine:aim`
   # skips here when Docker is unreachable OR the gfx family isn't one aim is
   # verified on (see `HostCapability::engine_available`'s "aim" arm — Radeon
   # gfx110X/120X and Strix Halo gfx1151, not Instinct); a Strix Halo
@@ -520,6 +522,104 @@ Feature: Model serving
     And the user is told no AMD GPU was detected
     And the user is not told to relaunch the server with different options
 
+  # Native-Windows platform gate (ROCMAI-823). `rocm engines list` already
+  # reports vLLM as `runtime: unsupported_native_windows`; `serve` takes the
+  # same decision (`engine_ruled_out_by_platform`) and refuses before runtime
+  # resolution or any launch. Before the gate, an active runtime let this print
+  # "managed service launched" and exit 0 while the engine died with no output.
+  # Hermetic (a planted read-only runtime, no GPU, no network, no engine, no
+  # `e2e-test-hooks`), so the required `windows-build-and-test` lane selects it
+  # via `E2E_ALSO_RUN_IDS`.
+  @id:serve-vllm-refused-on-native-windows @requires-os:windows
+  Scenario: serve-33 - Serving with vLLM on native Windows is refused before anything launches
+    Given a registered read-only runtime
+    And the first runtime is active
+    When the user serves a model with the vLLM engine
+    Then serving is refused before any engine starts
+    And the user is told vLLM needs WSL or Linux, or the Lemonade engine to serve
+    And no local server was recorded
+
+  # The install half of the same gate. Without it `rocm engines install vllm`
+  # either failed on an unrelated "no active ROCm runtime" error (as here, with
+  # no runtime) or went on to run the install. Hermetic, and selected into the
+  # required Windows lane for the same reason as serve-33.
+  @id:serve-vllm-install-refused-on-native-windows @requires-os:windows
+  Scenario: serve-34 - Installing vLLM on native Windows is refused with the platform reason
+    When the user installs the vLLM engine
+    Then the install is refused
+    And the user is told vLLM needs WSL or Linux, or the Lemonade engine to install
+
+  # The same refusal with a runtime present, which is the case that used to go
+  # on to install. The runtime resolves as a managed Python environment and a
+  # recording stand-in replaces `uv`, so an install that was NOT refused would
+  # run `uv pip install vllm`; nothing fetched is shown by that never happening,
+  # not only by the exit message.
+  @id:serve-vllm-install-with-runtime-refused-on-native-windows @requires-os:windows
+  Scenario: serve-35 - Installing vLLM on native Windows with an active runtime never starts the install
+    Given a registered read-only runtime
+    And the first runtime is active
+    And the runtime has a Python interpreter and uv is a recording stand-in
+    When the user installs the vLLM engine
+    Then the install is refused
+    And no vLLM install was started
+    And the user is told vLLM needs WSL or Linux, or the Lemonade engine to install
+
+  # ROCMAI-556: a gated AIM image is refused before anything is pulled when no
+  # Hugging Face token was passed. The check runs ahead of GPU detection and
+  # Docker, so it needs neither and gates every PR (ungated). The refusal names
+  # the remedy and leaves no service record behind; serve-37 proves the named
+  # remedy clears the condition. A Docker that logs its calls shows that nothing
+  # was pulled. serve-38 and serve-39 cover the GPU-dependent refusals.
+  @id:serve-gated-aim-refused-without-hf-token
+  Scenario: serve-36 - A gated AIM image is refused without a Hugging Face token
+    Given Docker is watched for any call
+    When the user serves a gated AIM model without passing a Hugging Face token
+    Then serving is refused before any engine starts
+    And the CLI explains that the model needs a Hugging Face token
+    And no service was started
+    And Docker was never called
+
+  # The remedy printed by serve-36 (`export HF_TOKEN`, then `--engine-env
+  # HF_TOKEN`) must actually clear that refusal. The host's one GPU is one the
+  # image supports and every GPU is masked, so the serve passes the token and
+  # GPU-family gates and stops at the GPU pre-flight, still before anything is
+  # pulled. The GPU is planted, so the outcome does not depend on the runner.
+  # Linux only: the empty `HIP_VISIBLE_DEVICES` mask and the planted kernel
+  # topology are Linux mechanisms.
+  @id:serve-gated-aim-token-remedy-clears-refusal @requires-os:linux
+  Scenario: serve-37 - Passing the exported Hugging Face token clears the gated AIM refusal
+    Given Docker is watched for any call
+    And a host whose only GPU is an AMD Radeon PRO W7900
+    When the user serves a gated AIM model with an exported Hugging Face token while every GPU is masked
+    Then serving is refused before any engine starts
+    And the refusal is that no usable GPU is visible
+    And Docker was never called
+
+  # An AIM image only carries profiles for some GPUs. On a GPU it has none for,
+  # `rocm serve --engine aim` is refused up front and names what the image does
+  # support, rather than pulling a container that fails inside. The detected GPU
+  # is planted (an Instinct card against a Radeon-only image), so this needs no
+  # AMD hardware and runs on every Linux lane.
+  @id:serve-aim-refused-on-unsupported-gpu @requires-os:linux
+  Scenario: serve-38 - An AIM image is refused on a GPU it has no profile for
+    Given Docker is watched for any call
+    And a host whose only GPU is an AMD Instinct MI300X
+    When the user serves a Radeon-only AIM image
+    Then serving is refused before any engine starts
+    And the CLI says the image has no profile for this GPU and names the GPUs it supports
+    And Docker was never called
+
+  # `rocm serve` gives an engine one GPU, so an AIM image whose smallest profile
+  # needs several is refused before launch instead of starting with too few.
+  @id:serve-aim-refused-when-it-needs-several-gpus @requires-os:linux
+  Scenario: serve-39 - An AIM image that needs several GPUs is refused
+    Given Docker is watched for any call
+    And a host whose only GPU is an AMD Instinct MI300X
+    When the user serves an AIM image that needs eight GPUs
+    Then serving is refused before any engine starts
+    And the CLI says the image needs eight GPUs and multi-GPU serving is not supported
+    And Docker was never called
+
   # ROCMAI-541 regression coverage. `--verbose` streams the real detached child's
   # log in this terminal (`run_attached_service`), and a managed engine that dies
   # well after its early-startup window must fail that attach loudly — never the
@@ -536,7 +636,7 @@ Feature: Model serving
   # specifically — the only possible outcome of a scripted/CI `--verbose`
   # session, per that function's own doc comment.
   @id:serve-scripted-death-after-startup @requires-no-gpu
-  Scenario: serve-33 - A managed engine that dies after startup fails loudly
+  Scenario: serve-40 - A managed engine that dies after startup fails loudly
     Given the scripted engine is armed to die shortly after startup
     When the user serves a model expecting the engine to crash after startup
     Then serving fails with a non-zero exit and names the crash
@@ -546,13 +646,13 @@ Feature: Model serving
   # externally triggered stop in the same post-startup window must NOT be
   # treated as the crash above. `rocm services stop` run from a second
   # invocation kills the pid the attached `--verbose` session is watching,
-  # landing in the identical `AttachOutcome::ServerExited` arm serve-33
+  # landing in the identical `AttachOutcome::ServerExited` arm serve-40
   # exercises — never `AttachOutcome::Stop`, which only ever fires from this
   # attached session's own keystroke reader (and piped stdio has none at all).
   # Before ROCMAI-541 B2 this made a clean, intentional, externally-triggered
-  # stop fail exactly like serve-33's crash.
+  # stop fail exactly like serve-40's crash.
   @id:serve-scripted-external-stop-while-attached @requires-no-gpu
-  Scenario: serve-34 - An externally stopped attached serve exits cleanly, not as a crash
+  Scenario: serve-41 - An externally stopped attached serve exits cleanly, not as a crash
     Given the scripted engine is armed to run until stopped
     When the user attaches to the scripted serve in the background
     And another shell stops that service while it is attached

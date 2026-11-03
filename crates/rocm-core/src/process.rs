@@ -42,7 +42,7 @@ use windows_sys::Win32::System::Threading::{
     WaitForSingleObject,
 };
 
-use crate::examine::truncate_to_chars;
+use crate::probe_exec::truncate_to_chars;
 use std::io::{ErrorKind, Read};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -2179,5 +2179,72 @@ mod tests {
         );
 
         assert_the_child_is_given_an_empty_stdin(fixture.command());
+    }
+
+    /// ROCMAI-541, and the only check that runs on the platform the bug was
+    /// reported on: a detached child's stdout AND stderr must both reach the
+    /// log file the caller named.
+    ///
+    /// `spawn_detached_no_inherit` attaches neither, which is what lost a
+    /// failing `__engine-serve-http`'s reason on Windows. Nothing else in the
+    /// suite covers that: the liveness test is Unix-only, and the
+    /// scripted-engine e2e scenarios run on the Linux no-GPU lane, where the
+    /// Unix `attach_background_stdio` branch does the attaching and this code
+    /// never executes.
+    ///
+    /// stderr matters more than stdout here — an engine's final error chain is
+    /// printed there — so both streams are asserted, not just the easy one.
+    #[cfg(windows)]
+    #[test]
+    fn a_detached_child_writes_both_streams_into_the_log() {
+        const OUT_MARKER: &str = "rocmai541-stdout-reached-the-log";
+        const ERR_MARKER: &str = "rocmai541-stderr-reached-the-log";
+
+        let dir = std::env::temp_dir().join(format!(
+            "rocm-core-detached-log-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&dir).expect("create the fixture dir");
+
+        // A .bat rather than `cmd /c "echo a & echo b 1>&2"`: `CreateProcessW`
+        // cannot run a .bat directly, but handing cmd a single path argument
+        // sidesteps cmd's quoting rules entirely, which an inline compound
+        // command would otherwise have to survive.
+        let script = dir.join("emit.bat");
+        fs::write(
+            &script,
+            format!("@echo off\r\necho {OUT_MARKER}\r\necho {ERR_MARKER} 1>&2\r\n"),
+        )
+        .expect("write the fixture script");
+        let log_path = dir.join("service.log");
+
+        let comspec = std::env::var_os("COMSPEC")
+            .unwrap_or_else(|| OsString::from(r"C:\Windows\System32\cmd.exe"));
+        let pid = spawn_detached_with_log(
+            Path::new(&comspec),
+            &["/c".to_owned(), script.to_string_lossy().into_owned()],
+            &[],
+            &log_path,
+        )
+        .expect("spawn the detached child");
+
+        let exit_code = wait_for_process_exit(pid).expect("wait for the detached child");
+        let log = fs::read(&log_path).map_or_else(
+            |error| panic!("failed to read {}: {error}", log_path.display()),
+            |bytes| String::from_utf8_lossy(&bytes).into_owned(),
+        );
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(exit_code, 0, "fixture child failed; log was:\n{log}");
+        assert!(
+            log.contains(OUT_MARKER),
+            "the child's stdout never reached the log:\n{log}"
+        );
+        assert!(
+            log.contains(ERR_MARKER),
+            "the child's stderr never reached the log, which is the half that \
+             carries an engine's error chain:\n{log}"
+        );
     }
 }

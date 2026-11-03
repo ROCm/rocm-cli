@@ -821,7 +821,14 @@ rocm model [--verbose]
 `rocm model` (alias `rocm models`) lists the recommended local models, grouped by
 the hardware they target. Pass `--verbose` to list every recipe, including ones
 hidden from the default list, with details such as aliases, data type, minimum
-GPU memory, and preferred engines.
+GPU memory, and preferred engines. The AMD Inference Microservices (AIM) Docker
+images are among the hidden recipes: `--verbose` shows each one's supported GPU
+families, the GPU count it needs per family, and whether it needs a Hugging Face
+token (`requires_hf_token=yes`), and
+`rocm serve <model> --engine aim` runs it (needs a reachable Docker daemon).
+AIM entries are hand-maintained and record when they were last verified;
+`rocm model --verbose` warns when one is over 180 days old (see
+`docs/aim-catalog.md`).
 
 ### Model serving
 
@@ -897,6 +904,11 @@ can:
   the server keeps running. Manage it afterward with `rocm services`.
 - Press **Ctrl-C** to stop the server instead.
 
+If the server dies on its own while you are attached, `rocm serve` exits
+**non-zero** and prints why, quoting the end of the service log, and the service
+is left marked `failed`. Stopping it deliberately — Ctrl-C here, or `rocm
+services stop` from another shell — still exits 0.
+
 `--managed` is the explicit form of the default background behavior.
 `--no-smoke-test` skips the post-startup inference probe.
 
@@ -912,7 +924,10 @@ instead of silently substituting a different model.
 
 Some models (such as Llama) are gated and require Hugging Face authentication.
 Log in with `huggingface-cli login` or set `HF_TOKEN` in your environment
-before serving gated models.
+before serving gated models. The exception is `--engine aim`, whose container
+does not read your environment on its own: export `HF_TOKEN` and pass
+`--engine-env HF_TOKEN` (see above), or `rocm serve` refuses a gated AIM image
+before pulling anything.
 
 `--gpu` selects which AMD GPU the server runs on. `auto` (the default) probes
 per-GPU VRAM (through `amd-smi`, or the amdgpu DRM sysfs counters when `amd-smi`
