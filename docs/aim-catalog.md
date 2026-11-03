@@ -65,7 +65,9 @@ Whoever owns the AIM images does this; it does not need a rocm-cli maintainer.
 8. Set `min_gpu_mem_gb`. The AIM docs publish GPU counts but no VRAM, so the
    values in the catalog are estimates: total parameters times 1 byte (2 when
    the image has no fp8 profile) plus 20% headroom, rounded up. Leave it unset
-   for other dtypes (for example MXFP4), and cap it at the entry's
+   for other dtypes (for example MXFP4), including when only some supported
+   families have an MXFP4 single-GPU profile (Llama-3.1-405B-Instruct and GLM-4.7
+   on `gfx950-dcgpu`), and cap it at the entry's
    `min_gpu_counts` times the smallest supported GPU's memory so it never
    contradicts the GPU count. Entries whose
    parameter count is not published (DeepSeek-V4-Flash, MiniMax-M3, GLM-5.2) are
