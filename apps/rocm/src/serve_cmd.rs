@@ -127,14 +127,13 @@ pub(crate) fn select_serve_engine(
     }
 }
 
-/// The recipe's first preferred engine, unless it is AIM and AIM cannot run on
-/// this host; the caller then falls back to the platform default, and a later
-/// preferred engine such as `vllm` is not considered. AIM is only
+/// The recipe's first preferred engine that can run on this host. AIM is only
 /// chosen on its own when the detected GPU family is one the image has a profile
-/// for and the host is Linux or WSL, so an undetected GPU or native Windows is not;
-/// otherwise the platform default applies, as it did before the recipe was
-/// catalogued. An explicit `--engine aim` never comes through here, and still
-/// gets the refusal that names the supported GPUs.
+/// for and the host is Linux or WSL, so an undetected GPU or native Windows is not,
+/// and vLLM is not an option on native Windows. When no listed engine fits, the
+/// platform default applies, as it did before the recipe was catalogued. An
+/// explicit `--engine aim` never comes through here, and still gets the refusal
+/// that names the supported GPUs.
 fn recipe_preferred_engine<'a>(
     recipe: &'a ModelRecipeRecord,
     host_gpu_summary: Option<&rocm_core::HostGpuSummary>,
@@ -155,8 +154,17 @@ fn recipe_preferred_engine<'a>(
                     GfxSupport::Supported(_)
                 ) || record.supported_gfx_families.is_empty()
             });
-    let first = recipe.preferred_engines.first()?;
-    (aim_usable || !is_aim(first)).then_some(first.as_str())
+    recipe
+        .preferred_engines
+        .iter()
+        .map(String::as_str)
+        .find(|engine| {
+            if is_aim(engine) {
+                aim_usable
+            } else {
+                !(windows && engine.eq_ignore_ascii_case("vllm"))
+            }
+        })
 }
 
 fn model_recipe_supports_engine(recipe: &ModelRecipeRecord, engine: &str) -> bool {
@@ -742,6 +750,14 @@ fn engine_recipe_with_extra_env(
     });
     for entry in engine_env {
         let (key, value) = entry.split_once('=').unwrap_or((entry.as_str(), ""));
+        // A bare `KEY` forwards it from the environment; the hint cannot carry an
+        // explicitly empty value, so `KEY=` would silently mean the same thing.
+        if entry.contains('=') && value.is_empty() {
+            bail!(
+                "--engine-env `{entry}` sets an empty value; pass `{key}` alone to forward it \
+                 from your environment, or `{key}=VALUE`"
+            );
+        }
         if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
             bail!(
                 "--engine-env expects `KEY=VALUE` (or a bare `KEY` to forward it from the \
@@ -1714,20 +1730,20 @@ mod tests {
         let undetected = host(None);
 
         // An Instinct-only image (`Qwen/Qwen3-32B`) and a Radeon one
-        // (`Qwen/Qwen3.5-9B`) each get AIM on their own family and the platform
-        // default elsewhere.
+        // (`Qwen/Qwen3.5-9B`) each get AIM on their own family and their next
+        // listed engine (vLLM) elsewhere, or the platform default on Windows.
         let instinct_image = resolve_builtin_model_recipe("Qwen/Qwen3-32B").unwrap();
         let radeon_image = resolve_builtin_model_recipe("Qwen/Qwen3.5-9B").unwrap();
         for (recipe, family, windows, expected) in [
             (&instinct_image, &instinct, false, Some("aim")),
             (&instinct_image, &instinct, true, None),
-            (&instinct_image, &radeon, false, None),
-            (&instinct_image, &strix, false, None),
-            (&instinct_image, &undetected, false, None),
+            (&instinct_image, &radeon, false, Some("vllm")),
+            (&instinct_image, &strix, false, Some("vllm")),
+            (&instinct_image, &undetected, false, Some("vllm")),
             (&radeon_image, &radeon, false, Some("aim")),
             (&radeon_image, &radeon, true, None),
-            (&radeon_image, &instinct, false, None),
-            (&radeon_image, &strix, false, None),
+            (&radeon_image, &instinct, false, Some("vllm")),
+            (&radeon_image, &strix, false, Some("vllm")),
         ] {
             assert_eq!(
                 recipe_preferred_engine(recipe, Some(family), windows),
@@ -1738,7 +1754,10 @@ mod tests {
             );
         }
         // No GPU summary at all is treated like an undetected GPU.
-        assert_eq!(recipe_preferred_engine(&radeon_image, None, false), None);
+        assert_eq!(
+            recipe_preferred_engine(&radeon_image, None, false),
+            Some("vllm")
+        );
         // Recipes that do not prefer AIM are untouched.
         let vllm_only = resolve_builtin_model_recipe("meta-llama/Llama-3.2-3B-Instruct").unwrap();
         assert_eq!(
@@ -1756,7 +1775,16 @@ mod tests {
             assert_eq!(on_radeon.engine, "aim");
         }
         let on_strix = select_serve_engine(None, None, Some(&radeon_image), Some(&strix));
-        assert_eq!(on_strix.engine, default_engine_for_platform());
+        // AIM has no profile for Strix Halo, so the recipe's next engine is used;
+        // native Windows has no vLLM either, so it takes the platform default.
+        assert_eq!(
+            on_strix.engine,
+            if cfg!(windows) {
+                default_engine_for_platform()
+            } else {
+                "vllm"
+            }
+        );
         // An explicit engine is never overridden.
         let explicit = select_serve_engine(Some("aim"), None, Some(&radeon_image), Some(&strix));
         assert_eq!(explicit.engine, "aim");
@@ -2099,7 +2127,10 @@ mod tests {
             ..rocm_core::HostGpuSummary::default()
         };
         let mut recipe = resolve_builtin_model_recipe("Qwen/Qwen3-32B").unwrap();
-        assert_eq!(recipe_preferred_engine(&recipe, Some(&host), false), None);
+        assert_eq!(
+            recipe_preferred_engine(&recipe, Some(&host), false),
+            Some("vllm")
+        );
         // Only a signed external index reaches these two arms, so they are built
         // here: an AIM record that restricts no family is usable on any GPU, and
         // a recipe that lists AIM first but carries no AIM record has nothing to
@@ -2742,6 +2773,20 @@ mod tests {
             None,
             "a flag reported as ignored must not change what the engine is sent"
         );
+    }
+
+    #[test]
+    fn engine_env_distinguishes_a_bare_key_from_an_empty_value() {
+        let env = |entry: &str| engine_recipe_with_extra_env("aim", None, &[entry.to_owned()]);
+        let bare = env("HF_TOKEN").unwrap().expect("hint");
+        assert_eq!(bare.extra_env.get("HF_TOKEN").map(String::as_str), Some(""));
+        let err = env("HF_TOKEN=").unwrap_err().to_string();
+        assert!(
+            err.contains("empty value") && err.contains("`HF_TOKEN` alone"),
+            "{err}"
+        );
+        let set = env("A=b").unwrap().expect("hint");
+        assert_eq!(set.extra_env.get("A").map(String::as_str), Some("b"));
     }
 
     #[test]
