@@ -34,6 +34,8 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::time::Duration;
 
+use e2e_cucumber::fixture_binary::FAKE_LEMONADE_INSTALL_REFUSAL;
+
 /// What `lemonade backends` prints here.
 ///
 /// Read by the Lemonade engine's own unit tests (`include_str!` of this file),
@@ -69,25 +71,43 @@ fn main() -> ExitCode {
     }
 }
 
-/// Stay alive until the parent kills us. `rocm serve` spawns `lemond`, records
-/// its pid, and terminates it when the serve fails -- so exiting on our own
-/// would race that teardown and turn the scenario's expected backend-install
-/// failure into a spurious "server exited" diagnosis.
+/// Stay alive for as long as the process that spawned us does.
+///
+/// Exiting while the engine still runs would turn the scenario's expected
+/// backend-install failure into a spurious "server exited" diagnosis. But the
+/// engine does not stop `lemond` when the backend install fails (#729): it
+/// exits and leaves the server running, and only the scenario's teardown
+/// (`stop_managed_services`, best-effort) stops it. So this fake also exits on
+/// its own once its parent is gone -- on Unix, when it has been re-parented --
+/// and in any case after [`LEMOND_MAX_LIFETIME`], so a run whose teardown did
+/// not get that far still leaves no process behind.
 fn run_lemond() -> ExitCode {
-    loop {
-        std::thread::sleep(Duration::from_mins(1));
+    #[cfg(unix)]
+    let spawned_by = std::os::unix::process::parent_id();
+    let started = std::time::Instant::now();
+    while started.elapsed() < LEMOND_MAX_LIFETIME {
+        std::thread::sleep(Duration::from_millis(500));
+        #[cfg(unix)]
+        if std::os::unix::process::parent_id() != spawned_by {
+            break;
+        }
     }
+    ExitCode::SUCCESS
 }
+
+/// Backstop on the fake server's lifetime, for a parent that never exits or a
+/// platform where re-parenting is not observable. The scenario finishes in
+/// seconds, so this is far longer than any run needs.
+const LEMOND_MAX_LIFETIME: Duration = Duration::from_mins(10);
 
 fn run_lemonade_cli(args: &[String]) -> ExitCode {
     if let Some(index) = args.iter().position(|arg| arg == "backends") {
         if args.get(index + 1).map(String::as_str) == Some("install") {
-            // Fail loudly on stderr: the engine surfaces the child's output, and
-            // a scenario that somehow ran against a real runtime should be
-            // obvious in the log rather than look like a genuine install bug.
+            // Fail loudly on stderr: the engine passes the child's stderr
+            // through, and the scenario asserts this line to prove the install
+            // it saw fail was this fake's rather than a real runtime's.
             eprintln!(
-                "fake-lemonade: refusing to install a backend; this runtime was planted by the \
-                 E2E harness for @id:serve-lemonade-preparation-recovery"
+                "{FAKE_LEMONADE_INSTALL_REFUSAL} for @id:serve-lemonade-preparation-recovery"
             );
             return ExitCode::FAILURE;
         }
