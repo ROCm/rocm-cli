@@ -1011,6 +1011,18 @@ rocm engines list
 
 The packaged Linux/WSL-only vLLM adapter should render
 `runtime: unsupported_native_windows`, not `runtime: not found`.
+`rocm serve <model> --engine vllm` and `rocm engines install vllm` take the
+same decision and must exit non-zero with "vLLM is not supported on native
+Windows", naming WSL/Linux and the Lemonade engine, before any runtime check,
+download, or launch. Focused tests:
+
+```powershell
+cargo test -p rocm --test vllm_native_windows_gate
+cargo test -p rocm --bin rocm platform_refusal
+```
+
+The e2e scenarios `serve-33`/`serve-34`/`serve-35` (`@requires-os:windows`) cover the
+same refusal on the required Windows lane.
 The vLLM live GPU acceptance script should return a clean skip on native
 Windows. It remains a strict GPU-required test on Linux/WSL.
 
@@ -1750,13 +1762,14 @@ expectation and applicability resolver.
 
 The `windows-release` job of the required `windows-build-and-test` lane
 additionally folds in the hermetic `comfyui-01`/`comfyui-02`/`comfyui-03`
-scenarios (not themselves `@lifecycle`) via `E2E_ALSO_RUN_IDS`, a
+scenarios and the native-Windows vLLM refusal scenarios
+`serve-33`/`serve-34`/`serve-35` (none of them `@lifecycle`) via `E2E_ALSO_RUN_IDS`, a
 comma-separated list of `@id`s:
 
 ```powershell
 $env:E2E_INCLUDE_LIFECYCLE = "1"
 $env:E2E_ONLY_LIFECYCLE = "1"
-$env:E2E_ALSO_RUN_IDS = "comfyui-uv-install-failure-names-log,comfyui-uv-install-progress-streamed,comfyui-ambiguous-runtime-actionable"
+$env:E2E_ALSO_RUN_IDS = "comfyui-uv-install-failure-names-log,comfyui-uv-install-progress-streamed,comfyui-ambiguous-runtime-actionable,serve-vllm-refused-on-native-windows,serve-vllm-install-refused-on-native-windows,serve-vllm-install-with-runtime-refused-on-native-windows"
 cargo xtask e2e
 ```
 

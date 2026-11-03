@@ -39,8 +39,7 @@
 //! `preferred_engine_action_target`, `model_registry_reason`, `format_gib`,
 //! `append_engine_detect_summary`, `friendly_engine_runtime_kind`,
 //! `friendly_engine_detect_notes`, `friendly_engine_detect_note_fallback`,
-//! `engine_runtime_status_label`, and
-//! `engine_runtime_is_native_windows_unsupported`).
+//! and `engine_runtime_status_label`).
 //!
 //! Two items physically interleaved in this span in `main.rs` moved with it
 //! rather than staying behind, since neither has a caller outside this
@@ -87,9 +86,10 @@
 //! they already had callers outside it: `engine_inventory()` (the built-in
 //! engine list, also read from `update_cmd.rs`),
 //! `engine_ruled_out_by_platform` (also read from `main.rs`'s
-//! `assess_model_for_host`; the private `PlatformRuleOut` enum it returns, which
-//! `model_registry_adapter_availability_note` matches on, is reached the same
-//! way), and `missing_packaged_engine_reason` (already noted in
+//! `assess_model_for_host` and `ensure_engine_allowed_on_platform`; the private
+//! `PlatformRuleOut` enum it returns, which
+//! `model_registry_adapter_availability_note` and `engine_runtime_status_label`
+//! match on, is reached the same way), and `missing_packaged_engine_reason` (already noted in
 //! [`engine_ipc.rs`](../apps/rocm/src/engine_ipc.rs)'s doc comment as having
 //! callers outside that cluster, plus its own test — this cluster is one of
 //! them) — all three reached via `use crate::{...};`, the same way other
@@ -1406,34 +1406,27 @@ fn friendly_engine_detect_note_fallback(note: &str) -> String {
     note.to_owned()
 }
 
+/// The `runtime:` label `rocm engines list` prints for an engine.
+///
+/// `unsupported_native_windows` comes from `engine_ruled_out_by_platform`, the
+/// same decision `rocm serve` and `rocm engines install` refuse on
+/// (`ensure_engine_allowed_on_platform`), so the inventory cannot call an
+/// engine unsupported while those commands go ahead with it, or the reverse.
 fn engine_runtime_status_label(engine: &str, detect: &DetectResponse) -> &'static str {
-    if detect.installed {
+    runtime_status_label_for(detect.installed, engine_ruled_out_by_platform(engine))
+}
+
+/// [`engine_runtime_status_label`] with the platform decision passed in rather
+/// than re-derived, so every branch is unit-testable on any host (the same seam
+/// as `unsupported_here_for` and `platform_refusal`).
+fn runtime_status_label_for(installed: bool, ruled_out: PlatformRuleOut) -> &'static str {
+    if installed {
         "ready"
-    } else if engine_runtime_is_native_windows_unsupported(engine, detect) {
+    } else if ruled_out == PlatformRuleOut::NativeWindowsVllm {
         "unsupported_native_windows"
     } else {
         "not found"
     }
-}
-
-fn engine_runtime_is_native_windows_unsupported(engine: &str, detect: &DetectResponse) -> bool {
-    if !rocm_core::runtime_is_windows() || !engine.eq_ignore_ascii_case("vllm") {
-        return false;
-    }
-
-    detect
-        .notes
-        .iter()
-        .chain(
-            detect
-                .available_devices
-                .iter()
-                .filter_map(|device| device.reason.as_ref()),
-        )
-        .any(|note| {
-            let normalized = note.to_ascii_lowercase();
-            normalized.contains("linux/wsl") && normalized.contains("native windows")
-        })
 }
 
 #[cfg(test)]
@@ -1842,6 +1835,35 @@ mod tests {
             assert_eq!(engine_runtime_status_label("vllm", &detect), "not found");
             assert!(model_registry_adapter_availability_note("vllm").is_none());
         }
+    }
+
+    /// The native-Windows branch of the `runtime:` label, exercised with an
+    /// injected platform decision so it runs on every host rather than only on
+    /// a Windows runner. An engine that is installed stays `ready`; only an
+    /// engine that is absent AND ruled out gets the platform label, and an
+    /// engine ruled out for another reason (AIM) does not borrow it.
+    #[test]
+    fn runtime_status_label_names_the_native_windows_rule_out_on_any_host() {
+        assert_eq!(
+            runtime_status_label_for(false, PlatformRuleOut::NativeWindowsVllm),
+            "unsupported_native_windows"
+        );
+        assert_eq!(
+            runtime_status_label_for(true, PlatformRuleOut::NativeWindowsVllm),
+            "ready"
+        );
+        assert_eq!(
+            runtime_status_label_for(false, PlatformRuleOut::Allowed),
+            "not found"
+        );
+        assert_eq!(
+            runtime_status_label_for(false, PlatformRuleOut::NativeWindowsAim),
+            "not found"
+        );
+        assert_eq!(
+            runtime_status_label_for(false, PlatformRuleOut::AimDockerUnavailable),
+            "not found"
+        );
     }
 
     #[test]

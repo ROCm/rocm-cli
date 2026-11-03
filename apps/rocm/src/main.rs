@@ -3173,6 +3173,59 @@ fn unsupported_here_for(engine: &str, ruled_out: PlatformRuleOut) -> Option<Stri
     }
 }
 
+/// What the user asked to do with an engine the platform gate may rule out.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum GatedEngineAction {
+    Serve,
+    Install,
+}
+
+/// Refuse `serve`, `engines install` and `engines shell` (which installs the
+/// engine itself when its environment is missing) up front when the platform gate rules
+/// the engine out on this host.
+///
+/// Takes the same decision `rocm engines list` reports as
+/// `runtime: unsupported_native_windows`, and runs before runtime resolution,
+/// so a native-Windows vLLM request gets the platform reason rather than an
+/// unrelated "no active ROCm runtime" error, a network fetch, or a launched
+/// service that dies with no output.
+fn ensure_engine_allowed_on_platform(engine: &str, action: GatedEngineAction) -> Result<()> {
+    refuse_if_ruled_out(engine_ruled_out_by_platform(engine), action)
+}
+
+/// [`ensure_engine_allowed_on_platform`] with the platform decision passed in,
+/// so the refusing branch is testable on any host.
+fn refuse_if_ruled_out(ruled_out: PlatformRuleOut, action: GatedEngineAction) -> Result<()> {
+    match platform_refusal(ruled_out, action) {
+        Some(refusal) => bail!("{refusal}"),
+        None => Ok(()),
+    }
+}
+
+/// The refusal message for an engine, given why the platform gate already
+/// ruled it out.
+///
+/// `ruled_out` is passed in rather than re-derived, as in
+/// [`unsupported_here_for`], so both branches are unit-testable on any host.
+/// Only native-Windows vLLM is refused here. The AIM conditions are left to
+/// the AIM adapter, which checks Docker and GPU passthrough itself when it
+/// launches; refusing them up front would be a separate behavior change.
+fn platform_refusal(ruled_out: PlatformRuleOut, action: GatedEngineAction) -> Option<String> {
+    match ruled_out {
+        PlatformRuleOut::NativeWindowsVllm => Some(match action {
+            GatedEngineAction::Serve => "vLLM is not supported on native Windows; serve it from \
+                 WSL or Linux, or use the Lemonade engine (`--engine lemonade`)"
+                .to_owned(),
+            GatedEngineAction::Install => "vLLM is not supported on native Windows; install it \
+                 from WSL or Linux, or use the Lemonade engine (`rocm engines install lemonade`)"
+                .to_owned(),
+        }),
+        PlatformRuleOut::Allowed
+        | PlatformRuleOut::NativeWindowsAim
+        | PlatformRuleOut::AimDockerUnavailable => None,
+    }
+}
+
 /// The catalog entry a report should name, and whether a fix was offered for it.
 ///
 /// Reads `has_match` rather than taking the head of `matched`. Several checkers
@@ -9259,6 +9312,86 @@ pub(crate) mod tests {
             message.to_lowercase().contains("docker"),
             "the message has to name the actual reason, Docker: {message:?}"
         );
+    }
+
+    /// Native-Windows vLLM is refused for both serve and install, and each
+    /// refusal names the way out for that action. Wording only: that the
+    /// refusal fires before anything is launched or installed is proven by the
+    /// binary-level tests in `tests/vllm_native_windows_gate.rs` and the
+    /// `serve-vllm-refused-on-native-windows` /
+    /// `serve-vllm-install-refused-on-native-windows` scenarios.
+    #[test]
+    fn platform_refusal_names_wsl_linux_and_lemonade_for_native_windows_vllm() {
+        let serve = platform_refusal(PlatformRuleOut::NativeWindowsVllm, GatedEngineAction::Serve)
+            .expect("native-Windows vLLM serve is refused");
+        let install = platform_refusal(
+            PlatformRuleOut::NativeWindowsVllm,
+            GatedEngineAction::Install,
+        )
+        .expect("native-Windows vLLM install is refused");
+        for message in [&serve, &install] {
+            assert!(
+                message.contains("vLLM is not supported on native Windows")
+                    && message.contains("WSL or Linux")
+                    && message.contains("Lemonade"),
+                "{message:?}"
+            );
+        }
+        assert!(serve.contains("`--engine lemonade`"), "{serve:?}");
+        assert!(
+            install.contains("`rocm engines install lemonade`"),
+            "{install:?}"
+        );
+    }
+
+    /// Only native-Windows vLLM is refused up front; an allowed engine, and
+    /// the AIM conditions left to its own adapter, pass through.
+    #[test]
+    fn platform_refusal_is_none_unless_native_windows_vllm() {
+        for ruled_out in [
+            PlatformRuleOut::Allowed,
+            PlatformRuleOut::NativeWindowsAim,
+            PlatformRuleOut::AimDockerUnavailable,
+        ] {
+            for action in [GatedEngineAction::Serve, GatedEngineAction::Install] {
+                assert_eq!(platform_refusal(ruled_out, action), None, "{ruled_out:?}");
+            }
+        }
+    }
+
+    /// The refusing branch of the gate, with an injected decision so it is
+    /// exercised on Linux CI too (the host-decision test below is vacuous there
+    /// for vLLM): native-Windows vLLM becomes an error carrying the action's
+    /// message, and everything else passes.
+    #[test]
+    fn refuse_if_ruled_out_errors_with_the_refusal_on_any_host() {
+        for action in [GatedEngineAction::Serve, GatedEngineAction::Install] {
+            let error = refuse_if_ruled_out(PlatformRuleOut::NativeWindowsVllm, action)
+                .expect_err("native-Windows vLLM must be refused");
+            assert_eq!(
+                error.to_string(),
+                platform_refusal(PlatformRuleOut::NativeWindowsVllm, action)
+                    .expect("native-Windows vLLM has a refusal")
+            );
+            assert!(refuse_if_ruled_out(PlatformRuleOut::Allowed, action).is_ok());
+        }
+    }
+
+    /// The gate takes the host's own decision: vLLM is refused on native
+    /// Windows and allowed everywhere else, and Lemonade is never refused.
+    #[test]
+    fn ensure_engine_allowed_on_platform_follows_the_host_decision() {
+        for action in [GatedEngineAction::Serve, GatedEngineAction::Install] {
+            assert_eq!(
+                ensure_engine_allowed_on_platform("vllm", action).is_err(),
+                rocm_core::runtime_is_windows()
+            );
+            assert_eq!(
+                ensure_engine_allowed_on_platform("VLLM", action).is_err(),
+                rocm_core::runtime_is_windows()
+            );
+            assert!(ensure_engine_allowed_on_platform("lemonade", action).is_ok());
+        }
     }
 
     /// Child half of [`engine_ruled_out_by_platform_gates_aim_on_docker_reachability`].
