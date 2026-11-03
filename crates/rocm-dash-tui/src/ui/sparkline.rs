@@ -48,8 +48,9 @@ impl<'a> BrailleSparkline<'a> {
 
     /// Color each character cell by the larger of its two samples, mapped
     /// across the gradient (low value = stops[0], peak = stops[2]). When
-    /// set, overrides `style.fg` per cell. Leaves `style.fg` as the fallback
-    /// for empty/zero cells.
+    /// set, overrides `style.fg` per cell, including the zero-value baseline
+    /// so an idle graph reads as one line. Leaves `style.fg` as the fallback
+    /// for cells with no sample at all.
     #[must_use]
     pub const fn gradient(mut self, start: Color, mid: Color, end: Color) -> Self {
         self.gradient = Some([start, mid, end]);
@@ -66,24 +67,28 @@ impl Widget for BrailleSparkline<'_> {
         let rows = area.height as usize;
         let total_dot_rows = rows * 4;
 
-        // Right-align: show the most recent `cols * 2` samples.
+        // Right-align: show the most recent `cols * 2` samples. When the
+        // history is shorter than that, offset it to the right edge so the
+        // graph grows leftwards instead of clinging to the left border.
         let bins = cols * 2;
         let start = self.data.len().saturating_sub(bins);
         let slice = &self.data[start..];
+        let x_off = cols.saturating_sub(slice.len().div_ceil(2));
 
-        for cx in 0..cols {
-            let left = slice.get(cx * 2).copied();
-            let right = slice.get(cx * 2 + 1).copied();
+        for cx in x_off..cols {
+            let i = (cx - x_off) * 2;
+            let left = slice.get(i).copied();
+            let right = slice.get(i + 1).copied();
             // Color the whole character column by the larger of its two
             // samples — peaks render with the gradient end color even when
             // their neighbor is low.
             let cell_value = left.unwrap_or(0).max(right.unwrap_or(0));
             let style = match self.gradient {
-                Some(stops) if cell_value > 0 => {
+                Some(stops) => {
                     let t = cell_value as f64 / self.max as f64;
                     self.style.fg(lerp3_t(stops, t))
                 }
-                _ => self.style,
+                None => self.style,
             };
             for cy in 0..rows {
                 let row_top = cy * 4;
@@ -101,13 +106,20 @@ impl Widget for BrailleSparkline<'_> {
 
 /// Returns a 4-bit mask of which dots in this character row are lit
 /// (bit 0 = top dot in the cell, bit 3 = bottom).
+///
+/// A cell with no sample draws nothing. Every sample that exists draws at
+/// least the bottom dot row, so the graph is a continuous baseline that rises
+/// under load rather than scattered fragments: at the panel sizes we use, a
+/// few percent of `max` otherwise rounds to zero dots and vanishes.
 fn lit_dots(value: Option<u64>, max: u64, total_dot_rows: usize, row_top: usize) -> u8 {
     let Some(v) = value else {
         return 0;
     };
     let v = v.min(max);
     // Fill from the bottom. A value at `max` lights every dot row.
-    let lit = ((v as f64 / max as f64) * total_dot_rows as f64).round() as usize;
+    let lit = ((v as f64 / max as f64) * total_dot_rows as f64)
+        .round()
+        .max(1.0) as usize;
     let first_lit_row = total_dot_rows.saturating_sub(lit);
 
     let mut mask = 0u8;
@@ -189,9 +201,17 @@ mod tests {
     }
 
     #[test]
-    fn zero_value_lights_nothing() {
-        let m = lit_dots(Some(0), 100, 4, 0);
-        assert_eq!(m, 0);
+    fn zero_value_lights_the_baseline_dot_row() {
+        // A present sample always draws the bottom dot row (bit 3) so the
+        // graph stays continuous at idle; only an absent sample is blank.
+        assert_eq!(lit_dots(Some(0), 100, 4, 0), 0b1000);
+        assert_eq!(lit_dots(None, 100, 4, 0), 0);
+    }
+
+    #[test]
+    fn sub_dot_value_still_draws_the_baseline() {
+        // 2.8% of a 3-row cell rounds to 0 dots; it must not vanish.
+        assert_eq!(lit_dots(Some(2), 100, 12, 8), 0b1000);
     }
 
     #[test]
@@ -220,6 +240,27 @@ mod tests {
             .render(buf.area, &mut buf);
         let fg = buf.cell((0, 0)).unwrap().style().fg;
         assert_eq!(fg, Some(stops.2));
+    }
+
+    #[test]
+    fn short_history_renders_against_the_right_edge() {
+        // A history shorter than the area is the normal case for the first
+        // minutes of a session. It must grow leftwards from the right edge,
+        // not sit in a clump on the left with dead space beside it.
+        let data = vec![100u64; 4]; // 4 samples = 2 character columns
+        let mut buf = Buffer::empty(Rect::new(0, 0, 10, 1));
+        BrailleSparkline::new(&data)
+            .max(100)
+            .render(buf.area, &mut buf);
+        let drawn: Vec<bool> = (0..10)
+            .map(|x| buf.cell((x, 0)).unwrap().symbol() != " ")
+            .collect();
+        assert_eq!(
+            drawn,
+            [
+                false, false, false, false, false, false, false, false, true, true
+            ]
+        );
     }
 
     #[test]
