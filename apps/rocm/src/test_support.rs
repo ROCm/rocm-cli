@@ -59,8 +59,27 @@ pub(crate) fn unique_suffix() -> String {
 /// small share of cases, so a lower count would pass with them present. `0`
 /// would pass vacuously.
 pub(crate) fn proptest_cases(default: u32) -> u32 {
-    std::env::var("PROPTEST_CASES")
-        .ok()
+    case_count_from_env("PROPTEST_CASES", default)
+}
+
+/// Case count read from `var`, raising `default` but never lowering it, for
+/// the same reason as [`proptest_cases`]. The uninstall properties use it with
+/// their own knob, `ROCM_DELETION_PROP_CASES`. A value that is ignored,
+/// because it is lower or does not parse, is reported on stderr.
+pub(crate) fn case_count_from_env(var: &str, default: u32) -> u32 {
+    let requested = std::env::var(var).ok();
+    let cases = raised_case_count(requested.as_deref(), default);
+    if let Some(requested) = requested
+        && requested.parse::<u32>().ok() != Some(cases)
+    {
+        eprintln!("{var}={requested} ignored: this property runs at least {default} cases");
+    }
+    cases
+}
+
+/// The pure half of [`case_count_from_env`].
+fn raised_case_count(requested: Option<&str>, default: u32) -> u32 {
+    requested
         .and_then(|value| value.parse().ok())
         .map_or(default, |requested: u32| requested.max(default))
 }
@@ -218,5 +237,14 @@ mod tests {
         let suffixes: std::collections::HashSet<String> =
             (0..64).map(|_| unique_suffix()).collect();
         assert_eq!(suffixes.len(), 64, "two calls must never share a suffix");
+    }
+
+    #[test]
+    fn case_counts_are_raised_but_never_lowered() {
+        assert_eq!(raised_case_count(None, 256), 256);
+        assert_eq!(raised_case_count(Some("4096"), 256), 4096);
+        assert_eq!(raised_case_count(Some("16"), 256), 256);
+        assert_eq!(raised_case_count(Some("0"), 256), 256);
+        assert_eq!(raised_case_count(Some("lots"), 256), 256);
     }
 }

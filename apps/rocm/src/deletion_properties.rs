@@ -147,12 +147,10 @@ impl Reach {
     }
 }
 
-/// 256 by default; `ROCM_DELETION_PROP_CASES` raises it for a deeper local run.
+/// 256 by default; `ROCM_DELETION_PROP_CASES` raises it for a deeper local
+/// run, and is ignored when it is lower.
 fn case_count() -> u32 {
-    std::env::var("ROCM_DELETION_PROP_CASES")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(256)
+    crate::test_support::case_count_from_env("ROCM_DELETION_PROP_CASES", 256)
 }
 
 fn report_reach(name: &str, reach: &Mutex<Reach>) {

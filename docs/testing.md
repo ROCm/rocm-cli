@@ -237,17 +237,16 @@ PROPTEST_CASES=10000 cargo test -p rocm --bin rocm proptests
 ```
 
 An explicit case count overrides `PROPTEST_CASES`, so a module that sets one
-reads the variable back itself: in `rocm` through `proptest_cases` in
-[test_support.rs](../apps/rocm/src/test_support.rs); in `rocm-core` through
-the `cases` helper in
-[examine_driver_proptests.rs](../crates/rocm-core/src/examine_driver_proptests.rs)
-and through `run_property` in
-[archive_props.rs](../crates/rocm-core/src/archive_props.rs). All three only
-ever raise the module's count: a `PROPTEST_CASES` below it is ignored, because
-some of these properties catch their target defect in a small share of cases
-and would pass with it present on a short run. The uninstall properties read their own knob instead,
-`ROCM_DELETION_PROP_CASES`, described under Uninstall And Download Removal
-below.
+reads the variable back itself: through the `proptest_cases` helper in each
+crate's test support, [rocm's](../apps/rocm/src/test_support.rs) and
+[rocm-core's](../crates/rocm-core/src/test_support.rs), and through
+`run_property` in [archive_props.rs](../crates/rocm-core/src/archive_props.rs),
+which keeps its own copy because three crates include it by `#[path]`. All of
+them only ever raise the module's count: a `PROPTEST_CASES` below it is
+ignored, because some of these properties catch their target defect in a small
+share of cases and would pass with it present on a short run. The uninstall properties read their own
+knob instead, `ROCM_DELETION_PROP_CASES`, described under Uninstall And
+Download Removal below; it follows the same rule.
 
 ### Known-gap reproducers
 
@@ -944,7 +943,8 @@ ROCM_DELETION_PROP_CASES=4096 cargo test -p rocm --bin rocm deletion_properties
 ```
 
 The default is 256 cases; `ROCM_DELETION_PROP_CASES` raises it for a deeper
-local run. They are Unix-only because they plant symlinks.
+local run, and a lower value is ignored. They are Unix-only because they plant
+symlinks.
 
 The `uninstall-NN` E2E scenarios (`features/uninstall.feature`) check the same
 behaviour through the built binary, confined to the scenario's own folder,
