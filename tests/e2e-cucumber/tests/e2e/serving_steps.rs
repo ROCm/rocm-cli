@@ -1924,3 +1924,49 @@ async fn assert_stop_hint_clears_the_service(world: &mut E2eWorld) {
         "the on-disk record must persist the stop, got:\n{record}"
     );
 }
+
+/// The discriminating assertion for the fabricated-launch daemon suppression.
+///
+/// `simulate_oom_managed_launch` writes a `starting` record for a process that
+/// never existed, so `ensure_background_helper_running_quiet` would leave a
+/// `rocm daemon` supervising a pid that will never appear — and nothing in this
+/// scenario's teardown stops it. Observed in the wild as daemons outliving their
+/// e2e checkout by days.
+///
+/// Without this step the suppression was untested: deleting the
+/// `if !e2e_simulate_oom_launch()` guard in `serve_cmd.rs` left serve-28 green,
+/// because every other assertion here is about the summary text. Both artefacts
+/// the autostart path can leave are checked, since the daemon publishes its
+/// runtime-state only after it is up — a spawn caught in the window before that
+/// shows up as a claim and nothing else.
+#[then("no background automation daemon was left behind")]
+async fn no_background_automation_daemon_was_left_behind(world: &mut E2eWorld) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("data")
+        .join("automations");
+
+    let state_path = root.join("runtime-state.json");
+    if let Ok(text) = std::fs::read_to_string(&state_path) {
+        let state: serde_json::Value =
+            serde_json::from_str(&text).expect("automation runtime-state is not valid JSON");
+        assert_ne!(
+            state.get("running").and_then(serde_json::Value::as_bool),
+            Some(true),
+            "a fabricated OOM launch must not start the automation daemon, but \
+             {} says one is running:\n{text}",
+            state_path.display()
+        );
+    }
+
+    let claim_path = root.join("autostart.claim");
+    assert!(
+        !claim_path.is_file(),
+        "a fabricated OOM launch must not even claim a daemon autostart, but {} exists: {:?}",
+        claim_path.display(),
+        std::fs::read_to_string(&claim_path).ok()
+    );
+}

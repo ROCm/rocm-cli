@@ -4245,22 +4245,7 @@ fi
     #[test]
     fn the_release_workflow_builds_no_feature_gated_binaries() {
         let release = read_workflow("release.yml");
-        let mut builds = 0usize;
-        let mut offenders: Vec<String> = Vec::new();
-        for block in multiline_run_blocks(&release)
-            .into_iter()
-            .chain(std::iter::once(release.clone()))
-        {
-            for command in logical_commands(&block) {
-                if !command.contains("cargo build") {
-                    continue;
-                }
-                builds += 1;
-                if command_enables_a_feature(&command) {
-                    offenders.push(command);
-                }
-            }
-        }
+        let (builds, offenders) = release_feature_offenders(&release);
         assert!(
             builds > 0,
             "release.yml has no `cargo build` step for this guard to check; if the build moved, \
@@ -4310,16 +4295,58 @@ fi
                 .any(|word| word == "-F" || (word.starts_with("-F") && word.len() > 2))
     }
 
+    /// Every `cargo build` in `source`, and which of them turn a feature on.
+    ///
+    /// This is *the* guard: `the_release_workflow_builds_no_feature_gated_binaries`
+    /// runs it over `release.yml`, and
+    /// `the_release_feature_guard_catches_every_spelling` runs the same function
+    /// over one-line fixtures. Sharing the body is the point rather than tidiness.
+    /// The spelling test used to re-state the predicate in its own closure, so it
+    /// was testing a copy: breaking the real loop (making the `offenders.push`
+    /// below a no-op) left both tests green while a feature-carrying release
+    /// build sailed through. With one function there is nothing left to drift.
+    ///
+    /// A bare command string is a valid `source`: `multiline_run_blocks` finds no
+    /// `run: |` block in it, and the `chain` below feeds the whole input through
+    /// `logical_commands` anyway — the same path that lets the workflow-level
+    /// check see builds written outside a multiline block.
+    fn release_feature_offenders(source: &str) -> (usize, Vec<String>) {
+        let mut builds = 0usize;
+        let mut offenders: Vec<String> = Vec::new();
+        for block in multiline_run_blocks(source)
+            .into_iter()
+            .chain(std::iter::once(source.to_owned()))
+        {
+            for command in logical_commands(&block) {
+                if !command.contains("cargo build") {
+                    continue;
+                }
+                builds += 1;
+                if command_enables_a_feature(&command) {
+                    offenders.push(command);
+                }
+            }
+        }
+        (builds, offenders)
+    }
+
     /// The guard must catch every spelling that enables a feature, and must not
     /// fire on a clean release build. Each case is a shape that previously
     /// slipped through: a flag on a `\` continuation, and a compact `-Fname`.
+    ///
+    /// `caught` calls [`release_feature_offenders`] — the function the
+    /// `release.yml` check itself runs — so breaking that loop fails this test
+    /// too.
     #[test]
     fn the_release_feature_guard_catches_every_spelling() {
-        let caught = |command: &str| {
-            logical_commands(command)
-                .iter()
-                .any(|c| c.contains("cargo build") && command_enables_a_feature(c))
-        };
+        let caught = |command: &str| !release_feature_offenders(command).1.is_empty();
+        // The fixtures below are all builds, so the guard must also see them as
+        // builds; otherwise `caught` could return false for the wrong reason and
+        // the negative cases would pass vacuously.
+        assert!(
+            release_feature_offenders("cargo build --release -p rocm").0 > 0,
+            "the shared guard must count a plain `cargo build` fixture as a build"
+        );
 
         assert!(caught(
             "cargo build --release -p rocm --features rocm/e2e-test-hooks"

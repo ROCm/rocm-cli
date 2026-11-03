@@ -399,3 +399,8 @@ Feature: Model serving
     Then the deployment summary blames this launch for GPU memory
     And the deployment summary names the GPU memory knobs
     And the deployment summary quotes the engine's own failing line
+    # The fabricated launch has no process behind it, so `rocm serve` must not
+    # start the background automation daemon to supervise one. Without this the
+    # suppression was untested: deleting the guard left the scenario green and a
+    # `rocm daemon` outliving the checkout.
+    And no background automation daemon was left behind
