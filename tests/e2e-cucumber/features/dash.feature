@@ -667,3 +667,23 @@ Feature: Interactive dashboard
     Then the warning text is no longer displayed
     When the user quits the dashboard
     Then the dashboard exits successfully
+
+  # #771: the Services manager painted every row's status in the "ok" color, so
+  # a stopped or failed service looked as healthy as a running one. A recording
+  # supplies one service per lifecycle state, so the scenario needs no daemon
+  # and no GPU. The scenario compares the colors the user sees rather than
+  # naming a theme's RGB values: running, starting and stopped must all differ,
+  # and stopped and failed, which are both errors, must match. Each status
+  # cell is read from the row carrying its model name, because the Instances
+  # tab behind the overlay shows the same status words. The mapping from every
+  # status to its tone is covered by the unit tests in
+  # `crates/rocm-dash-tui/src/ui/theme.rs`.
+  @id:dash-services-status-colored-by-state @requires-os:linux
+  Scenario: dash-39 - The Services manager colors each service's status by its state
+    When the user opens the dashboard replaying a recording with running, starting, stopped and failed services
+    And the user opens the Observe view
+    And the user opens the services manager
+    Then the services manager is displayed
+    And each service's status is colored by its state
+    When the user quits the dashboard
+    Then the dashboard exits successfully

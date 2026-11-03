@@ -220,6 +220,67 @@ async fn open_dashboard_replaying_warning(world: &mut E2eWorld) {
     world.tui = Some(session);
 }
 
+/// One recorded instance per lifecycle state the Services manager colors. The
+/// model name carries the state so the scenario can find each row by it.
+fn recorded_instance(id: &str, model: &str, status_json: &str) -> String {
+    format!(
+        concat!(
+            r#"{{"container_id":"{id}","container_name":"vllm-{id}","status":{status},"#,
+            r#""model_name":"{model}","gpu_ids":["0"],"tensor_parallel_size":1,"#,
+            r#""vram_used_mb":0,"vram_total_mb":0,"gen_tps":null,"launch_args":[],"env_vars":{{}}}}"#,
+        ),
+        id = id,
+        model = model,
+        status = status_json
+    )
+}
+
+#[when(
+    "the user opens the dashboard replaying a recording with running, starting, stopped and failed services"
+)]
+async fn open_dashboard_replaying_services_in_each_state(world: &mut E2eWorld) {
+    // Sixty entries two seconds apart keep the recording playing for two
+    // minutes, far longer than the scenario runs (see the warning recording
+    // above: the dashboard forgets its latest snapshot when a replay ends).
+    let instances = [
+        recorded_instance("c1", "state-running", r#""running""#),
+        recorded_instance("c2", "state-starting", r#"{"starting":{"phase":null}}"#),
+        recorded_instance("c3", "state-stopped", r#""stopped""#),
+        recorded_instance("c4", "state-failed", r#""error""#),
+    ]
+    .join(",");
+    let snapshot = |ts_us: u64| {
+        format!(
+            concat!(
+                r#"{{"ts_us":{ts_us},"event":{{"kind":"snapshot","#,
+                r#""timestamp":"2023-11-15T00:00:00Z","#,
+                r#""host":{{"cpu_overall_pct":0.0,"cpu_per_core_pct":[],"memory_used_mb":0,"#,
+                r#""memory_total_mb":0,"swap_used_mb":0,"swap_total_mb":0,"#,
+                r#""disk_read_bps":0,"disk_write_bps":0,"net_rx_bps":0,"net_tx_bps":0}},"#,
+                r#""gpus":[],"gpu_system_info":null,"instances":[{instances}],"warnings":[]}}}}"#,
+            ),
+            ts_us = ts_us,
+            instances = instances
+        )
+    };
+    let recording_text: String = (0..60u64)
+        .map(|i| snapshot(1_700_000_000_000_000 + i * 2_000_000) + "\n")
+        .collect();
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .to_path_buf();
+    let recording = root.join("service-states-recording.ndjson");
+    std::fs::write(&recording, recording_text)
+        .unwrap_or_else(|e| panic!("failed to write {}: {e}", recording.display()));
+    let path = recording.to_string_lossy().to_string();
+    let session = TuiSession::spawn(world, &["dash", "--replay", &path])
+        .unwrap_or_else(|e| panic!("failed to open the dashboard replaying a recording: {e}"));
+    world.tui = Some(session);
+}
+
 #[then("the header shows that one warning is reported")]
 async fn header_shows_one_warning(world: &mut E2eWorld) {
     session(world)
@@ -1679,6 +1740,50 @@ async fn services_manager_displayed(world: &mut E2eWorld) {
         .wait_for_screen("Services — managed inference servers", default_timeout())
         .await
         .unwrap_or_else(|e| panic!("the services manager did not appear: {e}"));
+}
+
+#[then("each service's status is colored by its state")]
+async fn services_status_colored_by_state(world: &mut E2eWorld) {
+    let tui = session(world);
+    // Every row carries its model name; waiting for the last one means the whole
+    // list has rendered.
+    tui.wait_for_screen("state-failed", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the services list did not render every row: {e}"));
+    let color = |model: &str, label: &str| {
+        tui.foreground_in_row_with(model, label).unwrap_or_else(|| {
+            panic!(
+                "no {label} status cell on the {model} row:\n{}",
+                tui.screen_text()
+            )
+        })
+    };
+    let running = color("state-running", "RUNNING");
+    let starting = color("state-starting", "STARTING");
+    let stopped = color("state-stopped", "STOPPED");
+    let failed = color("state-failed", "ERROR");
+    // Before the fix every row's status was painted the "ok" color, so a stopped
+    // or failed service looked as healthy as a running one.
+    assert_ne!(
+        running, stopped,
+        "a stopped service is colored like a running one"
+    );
+    assert_ne!(
+        running, failed,
+        "a failed service is colored like a running one"
+    );
+    assert_ne!(
+        running, starting,
+        "a starting service is colored like a running one"
+    );
+    assert_ne!(
+        starting, stopped,
+        "a stopped service is colored like a starting one"
+    );
+    assert_eq!(
+        stopped, failed,
+        "stopped and failed services are both errors and share a color"
+    );
 }
 
 #[then("the services manager is closed")]
