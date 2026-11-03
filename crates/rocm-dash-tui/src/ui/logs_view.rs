@@ -170,6 +170,17 @@ mod tests {
     }
 
     #[test]
+    fn backspace_edits_the_query() {
+        let mut l = Some(LogsViewState::default());
+        let mut jobs = State::default();
+        for c in "vl".chars() {
+            on_key(&mut l, &mut jobs, key(KeyCode::Char(c)));
+        }
+        on_key(&mut l, &mut jobs, key(KeyCode::Backspace));
+        assert_eq!(l.as_ref().unwrap().query, "v");
+    }
+
+    #[test]
     fn esc_closes_when_idle_and_q_types_into_query() {
         let mut l = Some(LogsViewState::default());
         let mut jobs = State::default();

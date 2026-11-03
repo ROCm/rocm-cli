@@ -400,6 +400,29 @@ mod tests {
         on_key(&mut br, &mut jobs, key(KeyCode::Backspace));
         assert_eq!(br.as_ref().unwrap().model, "a");
         assert_eq!(br.as_ref().unwrap().endpoint, "http://h");
+
+        // Concurrency (default "1,8,32,64") and Out are their own buffers.
+        on_key(&mut br, &mut jobs, key(KeyCode::Tab));
+        on_key(&mut br, &mut jobs, key(KeyCode::Char('x')));
+        assert_eq!(br.as_ref().unwrap().concurrency, "1,8,32,64x");
+        on_key(&mut br, &mut jobs, key(KeyCode::Backspace));
+        assert_eq!(br.as_ref().unwrap().concurrency, "1,8,32,64");
+        assert_eq!(br.as_ref().unwrap().out, "");
+        on_key(&mut br, &mut jobs, key(KeyCode::Tab));
+        on_key(&mut br, &mut jobs, key(KeyCode::Char('o')));
+        assert_eq!(br.as_ref().unwrap().out, "o");
+        assert_eq!(br.as_ref().unwrap().concurrency, "1,8,32,64");
+        on_key(&mut br, &mut jobs, key(KeyCode::Backspace));
+        assert_eq!(br.as_ref().unwrap().out, "");
+    }
+
+    #[test]
+    fn a_non_edit_key_leaves_the_message_alone() {
+        let mut br = with_endpoint("http://h");
+        let mut jobs = State::default();
+        br.as_mut().unwrap().message = Some("keep".into());
+        on_key(&mut br, &mut jobs, key(KeyCode::Home));
+        assert_eq!(br.as_ref().unwrap().message.as_deref(), Some("keep"));
     }
 
     // ---------- T12: submit → exactly one SpawnJob with correct args ----------

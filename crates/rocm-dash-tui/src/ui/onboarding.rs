@@ -463,7 +463,7 @@ fn configure_key(o: &mut OnboardingState, key: KeyEvent) -> Vec<SideEffect> {
                     }
                     KeyCode::Up => cfg.pin_mode = cfg.pin_mode.prev(),
                     KeyCode::Down => cfg.pin_mode = cfg.pin_mode.next(),
-                    code @ (KeyCode::Backspace | KeyCode::Char(_)) => {
+                    code => {
                         // Only collect characters once a pin mode is selected,
                         // so the default (None) view ignores stray keystrokes.
                         // Backspace is never gated.
@@ -472,7 +472,6 @@ fn configure_key(o: &mut OnboardingState, key: KeyEvent) -> Vec<SideEffect> {
                             collecting && !c.is_control()
                         });
                     }
-                    _ => {}
                 }
             }
         }
@@ -1288,6 +1287,22 @@ mod tests {
                 .unwrap()
                 .pin_value,
             "2026-06"
+        );
+    }
+
+    #[test]
+    fn control_chars_are_not_collected_into_the_pin_value() {
+        let (mut ob, mut jobs) = open_configure();
+        on_key(&mut ob, &mut jobs, key(KeyCode::Down)); // Build date
+        type_str(&mut ob, &mut jobs, "a\u{7}b");
+        assert_eq!(
+            ob.as_ref()
+                .unwrap()
+                .install_config
+                .as_ref()
+                .unwrap()
+                .pin_value,
+            "ab"
         );
     }
 

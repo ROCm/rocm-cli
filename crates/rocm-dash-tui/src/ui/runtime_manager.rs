@@ -697,6 +697,18 @@ mod tests {
     }
 
     #[test]
+    fn backspace_edits_the_import_path() {
+        let mut rm = Some(RuntimeManagerState::default());
+        let mut jobs = State::default();
+        on_key(&mut rm, &[], &mut jobs, key(KeyCode::Char('i')));
+        for c in "ab".chars() {
+            on_key(&mut rm, &[], &mut jobs, key(KeyCode::Char(c)));
+        }
+        on_key(&mut rm, &[], &mut jobs, key(KeyCode::Backspace));
+        assert_eq!(rm.as_ref().unwrap().import_input.as_deref(), Some("a"));
+    }
+
+    #[test]
     fn import_empty_path_is_rejected() {
         let mut rm = Some(RuntimeManagerState::default());
         let mut jobs = State::default();

@@ -247,8 +247,7 @@ pub fn on_key(
             }
             i.move_field(1);
         }
-        code @ (KeyCode::Backspace | KeyCode::Char(_)) => i.edit_text(code),
-        _ => {}
+        code => i.edit_text(code),
     }
     Vec::new()
 }
@@ -647,9 +646,13 @@ mod tests {
         assert_eq!(ins.as_ref().unwrap().prefix, "/");
         assert_eq!(ins.as_ref().unwrap().channel, "release");
 
-        // A non-text field swallows both keys without touching either buffer.
+        // A non-text field swallows each key without touching either buffer.
+        // Checked after each key alone: a stray append followed by a stray pop
+        // would otherwise cancel out.
         ins.as_mut().unwrap().field = at(Field::Format);
         on_key(&mut ins, &mut jobs, key(KeyCode::Char('z')));
+        assert_eq!(ins.as_ref().unwrap().channel, "release");
+        assert_eq!(ins.as_ref().unwrap().prefix, "/");
         on_key(&mut ins, &mut jobs, key(KeyCode::Backspace));
         assert_eq!(ins.as_ref().unwrap().channel, "release");
         assert_eq!(ins.as_ref().unwrap().prefix, "/");

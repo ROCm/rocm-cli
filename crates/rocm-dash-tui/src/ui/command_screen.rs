@@ -261,6 +261,15 @@ mod tests {
     }
 
     #[test]
+    fn backspace_edits_the_command_line() {
+        let mut cs = Some(CommandScreenState::default());
+        let mut jobs = State::default();
+        type_str(&mut cs, &mut jobs, "ab");
+        on_key(&mut cs, &mut jobs, key(KeyCode::Backspace));
+        assert_eq!(cs.as_ref().unwrap().input, "a");
+    }
+
+    #[test]
     fn empty_input_is_rejected() {
         let mut cs = Some(CommandScreenState::default());
         let mut jobs = State::default();

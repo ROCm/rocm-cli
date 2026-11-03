@@ -270,6 +270,17 @@ mod tests {
     }
 
     #[test]
+    fn a_non_edit_key_leaves_the_cursor_alone() {
+        let mut p = ModelPicker {
+            selected: 2,
+            ..Default::default()
+        };
+        let out = p.on_key(KeyCode::Tab, &recipes());
+        assert_eq!(out, PickerOutcome::None);
+        assert_eq!(p.selected, 2);
+    }
+
+    #[test]
     fn enter_chooses_the_selected_filtered_recipe() {
         let mut p = ModelPicker {
             query: "glm".into(),

@@ -321,8 +321,7 @@ pub fn on_key(
                 w.move_field(1);
             }
         }
-        code @ (KeyCode::Backspace | KeyCode::Char(_)) => w.edit_text(code),
-        _ => {}
+        code => w.edit_text(code),
     }
     Vec::new()
 }
@@ -707,6 +706,33 @@ mod tests {
         assert!(fx.is_empty());
         assert!(wiz.as_ref().unwrap().approval.is_none());
         assert!(jobs.jobs.is_empty());
+    }
+
+    #[test]
+    fn typing_and_backspace_edit_each_text_field_through_on_key() {
+        let mut wiz = Some(ServeWizardState::default());
+        let mut jobs = State::default();
+        {
+            let w = wiz.as_mut().unwrap();
+            w.model.clear();
+            w.host.clear();
+            w.port.clear();
+        }
+        for (field, text) in [
+            (Field::Model, "ab"),
+            (Field::Host, "cd"),
+            (Field::Port, "12"),
+        ] {
+            wiz.as_mut().unwrap().field = FIELDS.iter().position(|f| *f == field).unwrap();
+            for k in typed(text) {
+                on_key(&mut wiz, &mut jobs, &[], k);
+            }
+            on_key(&mut wiz, &mut jobs, &[], key(KeyCode::Backspace));
+        }
+        let w = wiz.as_ref().unwrap();
+        assert_eq!(w.model, "a");
+        assert_eq!(w.host, "c");
+        assert_eq!(w.port, "1");
     }
 
     #[test]
