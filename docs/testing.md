@@ -2368,15 +2368,34 @@ cargo xtask e2e -- -n '(diagnose-42|driver-install-08)'
 ```
 
 The other half of the same change — `fix-13-hip-sdk-missing` no longer firing
-just because no HIP SDK is installed — has **no** end-to-end coverage and cannot
-have any. `check_13_hip_sdk_missing` returns early on every non-Windows host, so
+just because no HIP SDK is installed — has no Linux end-to-end coverage.
+`check_13_hip_sdk_missing` returns early on every non-Windows host, so
 on a Linux lane that early return alone satisfies "no cause tells this user to
 install the HIP SDK"; the assertion would still hold with `check_20` deleted.
 The gate itself is held by unit tests in
 [diagnose.rs](../crates/rocm-core/src/diagnose.rs)
-(`fix_13_does_not_fire_on_a_lemonade_vulkan_host_with_no_hip_evidence` and its
-neighbours) and by the Windows manual check in
+(`fix_13_does_not_fire_on_a_lemonade_vulkan_host_with_no_hip_evidence`,
+`fix_13_does_not_fire_on_a_lemonade_strix_halo_host_with_a_managed_runtime`
+and their neighbours) and by the Windows manual check in
 [manual-testing.md](manual-testing.md), in the Ryzen 4000/5000 section.
+
+On the Windows GPU lane (`e2e-gpu-strix-windows`), `diagnose-48` in
+[diagnose.feature](../tests/e2e-cucumber/features/diagnose.feature) runs the
+gate on a real host, like `diagnose-41`: it names no host shape and holds
+`rocm diagnose --json` to `rocm examine --json` on the same machine.
+`fix-13-hip-sdk-missing` has to appear exactly when the inspection reports an
+AMD GPU and either a HIP-built llama.cpp with no usable system HIP SDK, or an
+ambient (not managed-runtime) HIP-built PyTorch: the latter scores a further
+25 whether or not the SDK is healthy, so it lists the entry (weakly, below the
+match threshold) even beside a working SDK. ROCMAI-837 considers that +25
+listing wrong, so whoever changes the bonus must update the scenario's oracle
+too. On that lane's Strix Halo hosts (Lemonade, no system SDK) it asserts the
+cause is absent, which is the host shape of ROCMAI-830. Run it only on
+Windows:
+
+```bash
+cargo xtask e2e -- -n '(diagnose-48)'
+```
 
 ## Model Fit Preflight
 
