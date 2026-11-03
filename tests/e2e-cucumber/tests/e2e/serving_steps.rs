@@ -1741,6 +1741,16 @@ async fn assert_lemonade_preparation_retry_is_bounded(world: &mut E2eWorld) {
         1,
         "expected exactly one retry announcement:\n{output}"
     );
+    // Both attempts must have been refused by the planted runtime. Without its
+    // line, `serve` did not accept the planted runtime and attempted some other
+    // install -- for a mismatched `env_id`, the real multi-gigabyte one.
+    assert_eq!(
+        output
+            .matches(e2e_cucumber::fixture_binary::FAKE_LEMONADE_INSTALL_REFUSAL)
+            .count(),
+        2,
+        "expected the planted runtime to refuse both backend installs:\n{output}"
+    );
 }
 
 #[then("the user is told how to reinstall Lemonade and retry serving")]

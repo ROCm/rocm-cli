@@ -293,8 +293,8 @@ mod tests {
                 ),
                 "{workflow} prebuilt E2E lane must build with \
                  `--features rocm/e2e-test-hooks`, matching what `cargo xtask e2e` \
-                 builds for itself; without it the suite's scripted failure seams \
-                 are compiled out:\n{block}"
+                 builds for itself; without it the suite's test seams, such as the \
+                 simulated host root, are compiled out:\n{block}"
             );
         }
     }
