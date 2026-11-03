@@ -473,12 +473,8 @@ impl ActivationSnapshot {
             // failed, so it is the write least able to afford leaving a
             // truncated marker behind — which runtime resolution and the
             // storage retention holds would both read as "nothing is active".
+            // The helper creates the `runtimes` folder when it is missing.
             MarkerSnapshot::Contents(bytes) => {
-                let parent = path
-                    .parent()
-                    .context("active runtime marker path has no parent directory")?;
-                fs::create_dir_all(parent)
-                    .with_context(|| format!("failed to create {}", parent.display()))?;
                 rocm_core::atomic_write::write_file_atomically(&path, &bytes)
                     .with_context(|| format!("failed to restore {}", path.display()))?;
             }
@@ -851,7 +847,9 @@ pub(crate) const fn toolchain_state_text(includes_devel: bool) -> &'static str {
 /// temp file, and the marker is replaced rather than removed first, so a
 /// reader always finds a complete marker. On Windows the replace goes through
 /// `ReplaceFileW`, and two replacements in flight at once there are not
-/// tested. It does not order the two activations: the last one to publish
+/// tested; a `ReplaceFileW` that fails part-way can leave the marker missing,
+/// which the writer repairs with a plain rename where it can (see
+/// `rocm_core::atomic_write`). It does not order the two activations: the last one to publish
 /// wins, as before.
 fn write_active_runtime_marker(paths: &AppPaths, marker: ActiveRuntimeMarker) -> Result<()> {
     let path = active_runtime_marker_path(paths);
@@ -864,7 +862,9 @@ fn write_active_runtime_marker(paths: &AppPaths, marker: ActiveRuntimeMarker) ->
     // window with no marker at all, which runtime resolution and the storage
     // retention holds both read as "nothing is active" — and a failed publish
     // takes its temp file with it, so a retried activation cannot strand one in
-    // the folder `rocm runtimes` reads. It also creates the `runtimes` folder
+    // the folder `rocm runtimes` reads. The one exception is a Windows publish
+    // that took the old marker away and could not put the new one in place:
+    // the temp file is then the only copy, so it is kept and the error names it. It also creates the `runtimes` folder
     // when it is missing.
     let bytes =
         serde_json::to_vec_pretty(&marker).context("failed to serialize active runtime marker")?;
@@ -1252,7 +1252,7 @@ pub(crate) mod tests {
     /// the test says it is inconclusive on stderr and passes rather than
     /// failing code that is correct.
     #[test]
-    fn active_runtime_marker_write_never_reuses_another_writers_temp_file() -> Result<()> {
+    fn active_runtime_marker_write_never_returns_to_millis_only_temp_names() -> Result<()> {
         const FOREIGN: &[u8] = b"another writer's staged marker";
         const ATTEMPTS: usize = 3;
         const MAX_WINDOW_MS: u128 = 16_000;
@@ -1537,10 +1537,10 @@ pub(crate) mod tests {
     }
 
     /// Replace the active-runtime marker with a NON-EMPTY directory, so the
-    /// next `write_active_runtime_marker` fails at a predictable point: its
-    /// `create_dir_all` of the parent succeeds, and the final `fs::rename` of
-    /// the temp file onto a non-empty directory fails on both supported
-    /// platforms without needing privileges or a real full disk.
+    /// next `write_active_runtime_marker` fails at a predictable point: the
+    /// temp file is staged beside it, and publishing that file onto a
+    /// non-empty directory fails on both supported platforms without needing
+    /// privileges or a real full disk.
     fn break_active_runtime_marker(paths: &AppPaths) -> Result<PathBuf> {
         let marker = active_runtime_marker_path(paths);
         let _ = fs::remove_file(&marker);
