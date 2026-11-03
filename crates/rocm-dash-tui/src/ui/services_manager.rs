@@ -34,7 +34,7 @@ use crate::ui::exec::{exe_label, quote_display_arg, resolve_exe};
 use crate::ui::format;
 use crate::ui::job_console::{ConsoleOutcome, on_console_key};
 use crate::ui::panel::{self, BoxRole};
-use crate::ui::theme::Theme;
+use crate::ui::theme::{StatusTone, Theme, instance_status_tone};
 
 /// A lifecycle operation on a managed service.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +84,9 @@ pub struct ServiceRow {
     pub model: String,
     pub port: Option<u16>,
     pub status: String,
+    /// Tone for `status`, so the renderer colors a stopped or failed service
+    /// differently from a running one instead of painting every row "ok".
+    pub tone: StatusTone,
     pub gen_tps: Option<f64>,
     /// Freshness metadata for `gen_tps`; `None` for legacy snapshots.
     pub gen_tps_observation: Option<ObservationMetadata>,
@@ -102,6 +105,7 @@ pub fn service_rows<S: ::std::hash::BuildHasher>(
             // `label()` surfaces the DOWNLOADING/LOADING/WARMUP startup phase
             // when the instance is `Starting`; never a raw `{:?}` debug string.
             status: i.status.label().to_owned(),
+            tone: instance_status_tone(i.status),
             gen_tps: i.gen_tps,
             gen_tps_observation: i.gen_tps_observation.clone(),
         })
@@ -349,7 +353,10 @@ pub fn draw_services_manager<S: ::std::hash::BuildHasher>(
                         format!(":{:<6}", port_str(r.port)),
                         Style::default().fg(theme.muted),
                     ),
-                    Span::styled(format!("{:<10}", r.status), Style::default().fg(theme.ok)),
+                    Span::styled(
+                        format!("{:<10}", r.status),
+                        Style::default().fg(theme.tone_color(r.tone)),
+                    ),
                     Span::styled(
                         format!(
                             "gen {}",
@@ -566,6 +573,61 @@ mod tests {
             .iter()
             .map(ratatui::buffer::Cell::symbol)
             .collect()
+    }
+
+    #[test]
+    fn status_text_is_colored_by_service_state() {
+        // Regression: every row's status used to be painted `theme.ok`, so a
+        // stopped or failed service looked as healthy as a running one.
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let cases = [
+            ("svc-1", InstanceStatus::Ready, "READY"),
+            (
+                "svc-2",
+                InstanceStatus::Starting { phase: None },
+                "STARTING",
+            ),
+            ("svc-3", InstanceStatus::Stopped, "STOPPED"),
+            ("svc-4", InstanceStatus::Error, "ERROR"),
+            ("svc-5", InstanceStatus::Unknown, "UNKNOWN"),
+        ];
+        let mut insts = HashMap::new();
+        for (id, status, _) in cases {
+            insts.insert(
+                id.to_string(),
+                Instance {
+                    status,
+                    ..inst(id, "llama3", None)
+                },
+            );
+        }
+        let theme = Theme::from_name("default-dark");
+        let mut term = Terminal::new(TestBackend::new(120, 28)).unwrap();
+        let sm = ServicesManagerState::default();
+        let jobs = State::default();
+        term.draw(|f| draw_services_manager(f, f.area(), &sm, &insts, &jobs, 0, &theme))
+            .unwrap();
+        let cells = term.backend().buffer().content().to_vec();
+        let symbols: Vec<&str> = cells.iter().map(ratatui::buffer::Cell::symbol).collect();
+        let fg_of = |label: &str| {
+            let width = label.chars().count();
+            let at = (0..symbols.len().saturating_sub(width))
+                .find(|&i| symbols[i..i + width].concat() == label)
+                .unwrap_or_else(|| panic!("status label {label} should render"));
+            cells[at].fg
+        };
+        for (_, status, label) in cases {
+            assert_eq!(
+                fg_of(label),
+                theme.instance_status_color(status),
+                "{label} must use its own status color"
+            );
+        }
+        // The point of the fix: the failed states are not the "ok" color.
+        assert_eq!(fg_of("READY"), theme.ok);
+        assert_ne!(fg_of("STOPPED"), theme.ok);
+        assert_ne!(fg_of("ERROR"), theme.ok);
     }
 
     #[test]

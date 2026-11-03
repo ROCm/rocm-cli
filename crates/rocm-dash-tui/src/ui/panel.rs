@@ -31,7 +31,7 @@ use ratatui::widgets::{
     Block, BorderType, Borders, Clear, Padding, Scrollbar, ScrollbarOrientation, ScrollbarState,
 };
 
-use crate::ui::theme::Theme;
+use crate::ui::theme::{StatusTone, Theme};
 
 /// Semantic role of a box. Drives the border color + tint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +53,22 @@ pub enum BoxRole {
 }
 
 impl BoxRole {
+    /// The role whose border color matches a [`StatusTone`], so a status-driven
+    /// card takes its border from the same tone as the status text instead of
+    /// a second, parallel status-to-role match.
+    #[must_use]
+    pub const fn from_tone(tone: StatusTone) -> Self {
+        match tone {
+            StatusTone::Neutral => Self::Neutral,
+            StatusTone::Muted => Self::Muted,
+            StatusTone::Info => Self::Secondary,
+            StatusTone::Accent => Self::Primary,
+            StatusTone::Warning => Self::Warning,
+            StatusTone::Success => Self::Success,
+            StatusTone::Error | StatusTone::Alert => Self::Danger,
+        }
+    }
+
     /// Base border color for this role.
     #[must_use]
     pub const fn color(self, theme: &Theme) -> Color {
@@ -770,6 +786,28 @@ mod tests {
                 "centered_rect({w}x{h}) escaped its area: {r:?}"
             );
             assert_eq!(super::centered_width(100, u16::MAX, area), w);
+        }
+    }
+
+    #[test]
+    fn from_tone_border_matches_the_tone_color() {
+        // A status-driven card's border must be the same color as the status
+        // text for every tone a status enum can map to.
+        let theme = Theme::default_dark();
+        for tone in [
+            StatusTone::Muted,
+            StatusTone::Info,
+            StatusTone::Accent,
+            StatusTone::Warning,
+            StatusTone::Success,
+            StatusTone::Error,
+            StatusTone::Alert,
+        ] {
+            assert_eq!(
+                BoxRole::from_tone(tone).color(&theme),
+                theme.tone_color(tone),
+                "{tone:?}"
+            );
         }
     }
 }

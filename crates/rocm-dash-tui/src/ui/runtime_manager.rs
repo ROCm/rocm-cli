@@ -36,7 +36,7 @@ use crate::ui::exec::{display_args, exe_label, resolve_exe};
 use crate::ui::folder_browser::{FolderBrowser, FolderOutcome, draw_folder_browser};
 use crate::ui::job_console::{ConsoleOutcome, on_console_key};
 use crate::ui::panel::{self, BoxRole, centered_rect, draw_popup_frame};
-use crate::ui::theme::Theme;
+use crate::ui::theme::{StatusTone, Theme};
 use crate::ui::widgets::apply_char_key;
 
 /// A flattened registered-runtime entry for the list.
@@ -421,13 +421,14 @@ pub fn draw_runtime_manager(
                 } else {
                     "  "
                 };
-                let marker_color = if rt.active {
-                    theme.ok
+                let marker_tone = if rt.active {
+                    StatusTone::Success
                 } else if rt.rollback {
-                    theme.warn
+                    StatusTone::Warning
                 } else {
-                    theme.muted
+                    StatusTone::Muted
                 };
+                let marker_color = theme.tone_color(marker_tone);
                 ListItem::new(Line::from(vec![
                     Span::styled(marker, Style::default().fg(marker_color)),
                     Span::styled(
