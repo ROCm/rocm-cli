@@ -540,7 +540,7 @@ repository.
 | uuid | 1.23.3 | Apache-2.0 OR MIT |
 | valuable | 0.1.1 | MIT |
 | version_check | 0.9.5 | MIT/Apache-2.0 |
-| vt100 | 0.16.2 | MIT |
+| vt100 | 0.18.1 | MIT |
 | vte | 0.15.0 | Apache-2.0 OR MIT |
 | vtparse | 0.6.2 | MIT |
 | walkdir | 2.5.0 | Unlicense/MIT |
