@@ -20,7 +20,8 @@ use clap::ValueEnum;
 use rocm_core::gguf_fit::KvCacheType;
 use rocm_core::gguf_source::GgufSource;
 use rocm_core::model_readiness::{
-    ContextRequest, HostFacts, ModelReadiness, attach_context_estimate, note_unverified_mask,
+    ContextRequest, HostFacts, ModelReadiness, UndeterminedReason, attach_context_estimate,
+    note_unverified_mask,
 };
 
 /// KV cache element type for `rocm diagnose --model`'s GGUF estimate.
@@ -96,6 +97,11 @@ pub(crate) fn report_ignores_model_note(query: &ModelQuery) -> String {
 ///
 /// `vram` is the `amd-smi` reading the host's memory was classified from, passed
 /// in rather than read again: each read is a subprocess.
+///
+/// A header read from the hub (a listing, a `HEAD`, then range requests, within
+/// a two-minute budget) can take a while with nothing printed, so a spinner
+/// covers it. It is drawn on stderr and only when stderr is a terminal, so
+/// `--json` and piped output are unchanged.
 pub(crate) fn attach_gguf_estimate(
     readiness: &mut ModelReadiness,
     context: &ContextRequest,
@@ -103,6 +109,12 @@ pub(crate) fn attach_gguf_estimate(
     gguf_source: &dyn GgufSource,
     vram: Option<&[GpuVramUsage]>,
 ) {
+    let _spinner = reads_from_the_hub(readiness).then(|| {
+        crate::cli_progress::AnimatedSpinner::start(format!(
+            "Reading the GGUF header of {} from Hugging Face...",
+            readiness.model_ref
+        ))
+    });
     attach_gguf_estimate_with(
         readiness,
         context,
@@ -111,6 +123,21 @@ pub(crate) fn attach_gguf_estimate(
         vram,
         device_visibility_mask_is_set(),
     );
+}
+
+/// Whether estimating this answer reads a file header from the hub: a catalog
+/// miss named as `owner/repo:QUANT` (or `owner/repo:file.gguf`). A curated model,
+/// a local path and a bare `owner/repo` make no request.
+fn reads_from_the_hub(readiness: &ModelReadiness) -> bool {
+    readiness.undetermined_reason == Some(UndeterminedReason::ModelNotCurated)
+        && readiness.canonical_model_id.is_none()
+        && matches!(
+            rocm_core::gguf_source::parse_gguf_ref(&readiness.model_ref),
+            Some(rocm_core::gguf_source::GgufRef::Hub {
+                variant: Some(_),
+                ..
+            })
+        )
 }
 
 /// [`attach_gguf_estimate`] with whether a mask is set passed in, so a test can
@@ -177,6 +204,42 @@ mod tests {
     use super::*;
     use rocm_core::gguf_fit::{ContextEstimate, FitRequest};
     use rocm_core::model_readiness::{AcceleratorMemory, ModelCatalogSource};
+
+    /// The spinner is for a hub read only: a catalog miss named `owner/repo:QUANT`.
+    /// A local path, a bare repository, a name that is not a GGUF reference and a
+    /// curated model make no request, so they get none.
+    #[test]
+    fn only_a_hub_gguf_outside_the_catalog_is_read_from_the_hub() {
+        let registry = rocm_core::builtin_model_recipe_registry();
+        let host = HostFacts {
+            accelerator_memory: AcceleratorMemory::Dedicated(24.0),
+            system_ram_gib: None,
+        };
+        let answer = |model: &str| {
+            crate::model_fit::assess_model_for_host(
+                model,
+                &ModelCatalogSource::Available(&registry),
+                &host,
+                None,
+                None,
+            )
+        };
+        assert!(reads_from_the_hub(&answer(
+            "some-lab/never-curated-7b:Q4_K_M"
+        )));
+        assert!(reads_from_the_hub(&answer(
+            "some-lab/never-curated-7b:dir/m-Q4_K_M.gguf"
+        )));
+        for model in [
+            "models/m.gguf",
+            "some-lab/never-curated-7b",
+            "not-a-gguf-at-all",
+        ] {
+            assert!(!reads_from_the_hub(&answer(model)), "{model}");
+        }
+        let curated = &registry.recipes[0].canonical_model_id;
+        assert!(!reads_from_the_hub(&answer(curated)), "{curated}");
+    }
 
     /// A readiness whose estimate compared memory, built without a network or a file.
     fn readiness_with_a_compared_estimate() -> ModelReadiness {
