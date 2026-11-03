@@ -8,8 +8,10 @@ Feature: Automation watchers
   # listing's unit formatting, the bare listing's tolerance of a torn
   # audit-log tail, how the next write repairs one, and how the audit log
   # and proposal history are kept
-  # bounded; the watcher/daemon trigger behaviour itself is covered
-  # elsewhere. Config-only (no GPU, no network), so it runs on the mock lane
+  # bounded, and that a repeated GPU thermal alert does not queue a second stop
+  # request; the rest of the watcher/daemon trigger behaviour is covered
+  # elsewhere. No GPU and no network (the one daemon-driven scenario takes its
+  # alerts from the daemon's loopback webhook), so it runs on the mock lane
   # every PR.
 
   @id:automations-enable-confirms-mode
@@ -151,3 +153,28 @@ Feature: Automation watchers
     Then the CLI confirms the permissions mode
     And the CLI prints no warning about the audit log
     And the audit log keeps its earlier record, drops the torn line and records the permissions change
+
+  # The gpu-thermal-protect watcher queues a request to stop the hot server and
+  # waits for a person to review it. While that request is waiting, the same
+  # alert arriving again must not queue another, or the review list fills with
+  # copies of one request. The check for a waiting request once read only the
+  # most recent proposals, so a stop request with enough newer proposals queued
+  # behind it was missed and a second one was queued. This drives the real
+  # daemon: the alerts reach it through its loopback webhook (`rocmd run
+  # --local-webhook-port`), the same dispatch a telemetry alert takes, and the
+  # proposals are read back from the store `rocm automations` lists. The
+  # newer proposals are seeded directly, one more than the store keeps of
+  # reviewed ones, so they sit outside any recent window.
+  @id:automations-thermal-stop-not-requeued-behind-newer-proposals
+  @requires-os:linux
+  Scenario: automations-11 - A repeated thermal alert queues no second stop request while the first waits behind newer proposals
+    Given a fresh CLI configuration
+    And the GPU thermal-protection watcher is enabled in propose mode
+    And a ready managed model server
+    And the automation daemon is running with its local webhook
+    When a GPU thermal alert for the server reaches the daemon
+    Then one stop request for the server is waiting for review
+    When more proposals for other servers are queued after it than the history keeps
+    And a GPU thermal alert for the server reaches the daemon again
+    Then the daemon records that a stop request is already waiting for the server
+    And only one stop request for the server is waiting for review

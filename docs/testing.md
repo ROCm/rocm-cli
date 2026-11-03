@@ -1881,6 +1881,23 @@ same watcher policy paths as scheduler, managed-service recovery, GPU
 telemetry, and cache-warm proposal events. See `docs/automations.md` for the
 local curl smoke and accepted fields.
 
+The check that keeps a repeated alert from queueing a second request while the
+first still waits (`gpu-thermal-protect` stop requests, `server-recover` restart
+requests) reads the whole proposal store, so a pending request is found however
+many proposals were queued after it:
+
+```bash
+cargo test -p rocmd older_than_the_recent_window
+```
+
+The user-visible side is `automations-11` in
+[automations.feature](../tests/e2e-cucumber/features/automations.feature). It
+starts the real `rocmd run --automations-enabled --local-webhook-port 0`, posts
+the same thermal alert to its webhook twice with more proposals than the store
+keeps of reviewed ones queued in between, and checks that one stop request is
+left waiting. It is Linux only (`@requires-os:linux`): the managed server's
+recorded process is a disposable `sleep`.
+
 vLLM TheRock GPU acceptance:
 
 ```bash
