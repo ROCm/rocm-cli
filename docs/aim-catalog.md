@@ -26,6 +26,16 @@ warning; `rocm serve` does not check it. Every built-in AIM entry must carry a
 timestamp (a unit test enforces it); an entry without one, such as one from a
 configured recipe index, is never flagged.
 
+## What `rocm serve` checks, and its limit
+
+For an AIM catalog entry `rocm serve` checks, before pulling anything, that a
+gated image has `HF_TOKEN`, that the detected GPU family has a profile, and that
+the image does not need several GPUs. The family comes from one host-level
+reading (the lowest KFD node), not from the GPU `--gpu` selects or the
+visibility mask, so on a host with mixed GPUs, such as an APU plus a discrete
+card, `--gpu 1` is judged by the host's first GPU. The board-name note has the
+same limit.
+
 ## Refreshing an entry
 
 Whoever owns the AIM images does this; it does not need a rocm-cli maintainer.

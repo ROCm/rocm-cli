@@ -37,7 +37,7 @@
 //! `append_model_fit_lines`, `append_manual_alternative_lines`,
 //! `manual_alternative_recommendations`, `recipe_is_manual_fit`,
 //! `append_model_engine_support_lines`, `recipe_display_ref`,
-//! `preferred_engine_action_target`, `model_registry_reason`, `format_gib`,
+//! `preferred_engine_action_target`, `once_per_call`, `model_registry_reason`, `format_gib`,
 //! `append_engine_detect_summary`, `friendly_engine_runtime_kind`,
 //! `friendly_engine_detect_notes`, `friendly_engine_detect_note_fallback`,
 //! `engine_runtime_status_label`, and
@@ -135,7 +135,8 @@ use crate::runtimes_cmd::{
 };
 use crate::therock;
 use crate::{
-    PlatformRuleOut, engine_inventory, engine_ruled_out_by_platform, missing_packaged_engine_reason,
+    PlatformRuleOut, engine_inventory, engine_ruled_out_by_platform_with,
+    missing_packaged_engine_reason,
 };
 
 pub(crate) fn render_launch_summary(paths: &AppPaths, config: &RocmCliConfig) -> String {
@@ -643,6 +644,11 @@ pub(crate) fn render_model_registry_verbose_text_with_context_and_host(
             return output;
         }
     };
+    // Every AIM recipe asks whether Docker is reachable; one `docker info` per
+    // listing answers all of them.
+    let docker_reachable = once_per_call(rocm_engine_aim::builtin_docker_daemon_reachable);
+    // Detected only if a recipe's first engine is AIM, whose usability depends on it.
+    let host_gpu = std::cell::OnceCell::new();
     for recipe in &registry.recipes {
         let aliases = if recipe.aliases.is_empty() {
             "<none>".to_owned()
@@ -686,8 +692,14 @@ pub(crate) fn render_model_registry_verbose_text_with_context_and_host(
         }
         append_model_recipe_metadata_lines(&mut output, recipe, paths);
         append_model_host_ram_fit_lines(&mut output, recipe, host_ram_gib);
-        append_model_fit_lines(&mut output, recipe, aggregate_gpu_vram_gib);
-        append_model_engine_support_lines(&mut output, recipe, paths);
+        append_model_fit_lines(
+            &mut output,
+            recipe,
+            aggregate_gpu_vram_gib,
+            &host_gpu,
+            paths,
+        );
+        append_model_engine_support_lines(&mut output, recipe, paths, &docker_reachable);
         if recipe.trust_remote_code {
             let _ = writeln!(output, "      trust_remote_code: true");
         }
@@ -1058,7 +1070,10 @@ fn append_model_fit_lines(
     output: &mut String,
     recipe: &ModelRecipeRecord,
     aggregate_gpu_vram_gib: Option<f64>,
+    host_gpu: &std::cell::OnceCell<rocm_core::HostGpuSummary>,
+    paths: Option<&AppPaths>,
 ) {
+    let engine_target = preferred_engine_action_target(recipe, host_gpu, paths);
     match recipe.min_gpu_mem_gb {
         None => {
             let _ = writeln!(output, "      gpu_fit: supported");
@@ -1071,7 +1086,7 @@ fn append_model_fit_lines(
                 output,
                 "      action: use /plan serve {} with {}",
                 recipe_display_ref(recipe),
-                preferred_engine_action_target(recipe)
+                engine_target
             );
         }
         Some(required) => match aggregate_gpu_vram_gib {
@@ -1087,7 +1102,7 @@ fn append_model_fit_lines(
                     output,
                     "      action: use /plan serve {} with {}",
                     recipe_display_ref(recipe),
-                    preferred_engine_action_target(recipe)
+                    engine_target
                 );
             }
             Some(available) => {
@@ -1209,11 +1224,19 @@ fn recipe_is_manual_fit(recipe: &ModelRecipeRecord, aggregate_gpu_vram_gib: Opti
     }
 }
 
+/// Wraps `probe` so it runs at most once, however many times the result is asked
+/// for, for as long as the returned closure lives.
+fn once_per_call(probe: impl Fn() -> bool) -> impl Fn() -> bool {
+    let cached = std::cell::OnceCell::new();
+    move || *cached.get_or_init(&probe)
+}
+
 #[allow(dead_code)]
 fn append_model_engine_support_lines(
     output: &mut String,
     recipe: &ModelRecipeRecord,
     paths: Option<&AppPaths>,
+    docker_reachable: &dyn Fn() -> bool,
 ) {
     if recipe.preferred_engines.is_empty() {
         let _ = writeln!(output, "      engine_support: unknown");
@@ -1227,7 +1250,7 @@ fn append_model_engine_support_lines(
     let _ = writeln!(output, "      engine_support:");
     for engine in &recipe.preferred_engines {
         if builtin_engine_available(engine) {
-            if let Some(note) = model_registry_adapter_availability_note(engine) {
+            if let Some(note) = model_registry_adapter_availability_note(engine, docker_reachable) {
                 let _ = writeln!(
                     output,
                     "        {engine}: adapter_available path=<built-in> {note}"
@@ -1238,7 +1261,9 @@ fn append_model_engine_support_lines(
         } else if let Some(paths) = paths {
             match resolve_engine_binary_path_with_paths(engine, paths) {
                 Ok(path) => {
-                    if let Some(note) = model_registry_adapter_availability_note(engine) {
+                    if let Some(note) =
+                        model_registry_adapter_availability_note(engine, docker_reachable)
+                    {
                         let _ = writeln!(
                             output,
                             "        {engine}: adapter_available path={} {note}",
@@ -1277,8 +1302,11 @@ fn append_model_engine_support_lines(
 }
 
 #[allow(dead_code)]
-fn model_registry_adapter_availability_note(engine: &str) -> Option<&'static str> {
-    match engine_ruled_out_by_platform(engine) {
+fn model_registry_adapter_availability_note(
+    engine: &str,
+    docker_reachable: &dyn Fn() -> bool,
+) -> Option<&'static str> {
+    match engine_ruled_out_by_platform_with(engine, docker_reachable) {
         PlatformRuleOut::Allowed => None,
         PlatformRuleOut::AimDockerUnavailable => Some(
             "runtime_status=unsupported_docker_unavailable reason=Docker daemon not reachable; start Docker or choose a different engine; run /engine for adapter details",
@@ -1301,11 +1329,22 @@ fn recipe_display_ref(recipe: &ModelRecipeRecord) -> &str {
 }
 
 #[allow(dead_code)]
-fn preferred_engine_action_target(recipe: &ModelRecipeRecord) -> &str {
-    recipe
+fn preferred_engine_action_target(
+    recipe: &ModelRecipeRecord,
+    host_gpu: &std::cell::OnceCell<rocm_core::HostGpuSummary>,
+    paths: Option<&AppPaths>,
+) -> String {
+    let first = recipe
         .preferred_engines
         .first()
-        .map_or("<engine>", String::as_str)
+        .map_or("<engine>", String::as_str);
+    if !first.eq_ignore_ascii_case("aim") {
+        return first.to_owned();
+    }
+    // AIM is host-gated (GPU family, platform), so name the engine `rocm serve`
+    // would pick on this host instead of assuming AIM.
+    let host = host_gpu.get_or_init(|| rocm_core::detect_host_gpu_summary(paths));
+    crate::serve_cmd::select_serve_engine(None, None, Some(recipe), Some(host)).engine
 }
 
 #[allow(dead_code)]
@@ -1867,12 +1906,12 @@ mod tests {
                 "unsupported_native_windows"
             );
             assert!(
-                model_registry_adapter_availability_note("vllm")
+                model_registry_adapter_availability_note("vllm", &|| true)
                     .is_some_and(|note| note.contains("unsupported_native_windows"))
             );
         } else {
             assert_eq!(engine_runtime_status_label("vllm", &detect), "not found");
-            assert!(model_registry_adapter_availability_note("vllm").is_none());
+            assert!(model_registry_adapter_availability_note("vllm", &|| true).is_none());
         }
     }
 
@@ -2159,6 +2198,39 @@ mod tests {
     }
 
     #[test]
+    fn engine_action_target_follows_what_serve_would_pick_on_this_host() {
+        let target = |recipe_id: &str, family: &str| {
+            let recipe = rocm_core::resolve_builtin_model_recipe(recipe_id).expect("recipe");
+            let host = std::cell::OnceCell::new();
+            let _ = host.set(rocm_core::HostGpuSummary {
+                therock_family: Some(family.to_owned()),
+                ..rocm_core::HostGpuSummary::default()
+            });
+            preferred_engine_action_target(&recipe, &host, None)
+        };
+        // A recipe that lists no AIM is untouched by the host.
+        assert_eq!(target("tiny-gpt2", "gfx1151"), "vllm");
+        if !cfg!(windows) {
+            // AIM is named only where `rocm serve` would pick it.
+            assert_eq!(target("Qwen/Qwen3.5-9B", "gfx110X-all"), "aim");
+            assert_ne!(target("Qwen/Qwen3.5-9B", "gfx1151"), "aim");
+            // Instinct hosts prefer vLLM, which `rocm serve` picks over AIM.
+            assert_eq!(target("Qwen/Qwen3-32B", "gfx94X-dcgpu"), "vllm");
+        }
+    }
+
+    #[test]
+    fn once_per_call_runs_the_probe_once() {
+        let calls = std::cell::Cell::new(0);
+        let cached = once_per_call(|| {
+            calls.set(calls.get() + 1);
+            false
+        });
+        assert!(!cached() && !cached() && !cached());
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
     fn verbose_model_listing_shows_a_token_requirement_without_gfx_families() {
         // A schema-valid record can carry `requires_hf_token` alone; the listing
         // must still say the image needs a token.
@@ -2223,7 +2295,12 @@ mod tests {
         let recipe = resolve_builtin_model_recipe("qwen32b").expect("qwen32b recipe");
         let mut output = String::new();
 
-        append_model_engine_support_lines(&mut output, &recipe, Some(&paths));
+        append_model_engine_support_lines(
+            &mut output,
+            &recipe,
+            Some(&paths),
+            &rocm_engine_aim::builtin_docker_daemon_reachable,
+        );
         let _ = fs::remove_dir_all(root);
 
         if cfg!(windows) {
