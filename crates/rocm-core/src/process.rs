@@ -2200,11 +2200,14 @@ mod tests {
         const OUT_MARKER: &str = "rocmai541-stdout-reached-the-log";
         const ERR_MARKER: &str = "rocmai541-stderr-reached-the-log";
 
-        let dir = std::env::temp_dir().join(format!(
-            "rocm-core-detached-log-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
+        // Plain pid, no thread id: `ThreadId`'s Debug form is `ThreadId(2)`, and
+        // `quote_windows_arg` only quotes an argument containing whitespace or a
+        // quote — so a path carrying cmd's own metacharacters reaches it bare and
+        // `(` ends the token early. Only this test uses this name, so the pid
+        // alone keeps it unique.
+        let dir =
+            std::env::temp_dir().join(format!("rocm-core-detached-log-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("create the fixture dir");
 
         // A .bat rather than `cmd /c "echo a & echo b 1>&2"`: `CreateProcessW`
