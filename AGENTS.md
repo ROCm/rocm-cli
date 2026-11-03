@@ -252,6 +252,7 @@ CLI:
 
 - [`cli_progress.rs`](apps/rocm/src/cli_progress.rs)'s **`Spinner`** — a caller-driven indicator that only advances when the caller's own loop ticks it (e.g. `serve`'s HTTP-polling wait loop)
 - [`cli_progress.rs`](apps/rocm/src/cli_progress.rs)'s **`AnimatedSpinner`** — progress that must keep animating between caller updates and can go quiet for long stretches (e.g. a download, or the ComfyUI/SDK extraction spinner)
+- [`cli_report.rs`](apps/rocm/src/cli_report.rs)'s **`write_marked_row`** — one row of a listing that flags a row with a glyph and explains it in a `legend:` line: writes `{indent}{marker} {body}`, with a blank marker column when `marker` is `None`. The caller keeps its glyph constant, its legend and the shape of `body` (e.g. `rocm engines` and `rocm examine` for the default engine, `rocm runtimes list` for the active/rollback runtime); a new marked listing should reuse it rather than hand-roll the `if marked { GLYPH } else { " " }` prefix
 
 dash-TUI, in `crates/rocm-dash-tui/src/ui/`:
 
@@ -288,7 +289,7 @@ Guardrails:
   - do not pair two independently ordered lists by index when they share an id;
     correlate by id. Where no id exists, positional pairing is allowed only as the last
     resort after every stronger identifier (device id, name) has been tried, as
-    `fill_unidentified_gpus_from_hipinfo` in [examine.rs](crates/rocm-core/src/examine.rs) does;
+    `fill_unidentified_gpus_from_hipinfo` in [windows.rs](crates/rocm-core/src/examine/windows.rs) does;
     otherwise degrade to "unknown", never to a guess on multi-adapter hosts
   - check the documented width and range of every WMI or Win32 field before trusting
     it (a 32-bit field saturates at 4 GiB)

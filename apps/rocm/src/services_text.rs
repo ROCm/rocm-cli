@@ -580,14 +580,7 @@ fn read_managed_service_manifest(
 ) -> Result<(ManagedServiceRecord, PathBuf)> {
     validate_service_id(service_id)?;
     let manifest_path = paths.service_manifest_path(service_id);
-    let bytes = fs::read(&manifest_path).with_context(|| {
-        format!(
-            "managed service `{service_id}` not found at {}",
-            manifest_path.display()
-        )
-    })?;
-    let mut record = serde_json::from_slice::<ManagedServiceRecord>(&bytes)
-        .with_context(|| format!("failed to parse {}", manifest_path.display()))?;
+    let mut record = ManagedServiceRecord::read_manifest(paths, service_id)?;
     record.normalize_paths_for_host();
     Ok((record, manifest_path))
 }
@@ -1603,6 +1596,51 @@ mod tests {
         );
 
         assert_eq!(rendered, "Install (error): line one");
+    }
+
+    /// `logs`, `stop` and `restart` for an id with no record all fail with the
+    /// shared not-found error alone — one plain line, no OS cause under it.
+    /// `remove` and `rocm logs --service` reach the same `load_managed_service`.
+    #[test]
+    fn service_commands_report_an_unknown_id_without_an_os_cause() -> Result<()> {
+        let (root, paths) = test_paths("service-unknown-id");
+        paths.ensure()?;
+        let expected = "No local server named `nope`. See `rocm services list --all`.";
+        let errors = [
+            render_service_logs_text(&paths, "nope").map(drop),
+            run_internal_sandbox_tool(
+                &paths,
+                SandboxToolArg::StopServer,
+                Some("nope".to_owned()),
+                true,
+            )
+            .map(drop),
+            run_internal_sandbox_tool(
+                &paths,
+                SandboxToolArg::RestartServer,
+                Some("nope".to_owned()),
+                true,
+            )
+            .map(drop),
+        ];
+        for error in errors {
+            let error = error.expect_err("no record exists for `nope`");
+            assert!(
+                error
+                    .downcast_ref::<rocm_core::ManagedServiceNotFound>()
+                    .is_some(),
+                "{error:?}"
+            );
+            // anyhow appends a backtrace when RUST_BACKTRACE is set, as CI does.
+            let rendered = format!("{error:?}");
+            let rendered = rendered
+                .split_once("\n\nStack backtrace:")
+                .map_or(rendered.as_str(), |(message, _)| message);
+            assert_eq!(rendered, expected);
+        }
+        assert!(!paths.service_manifest_path("nope").exists());
+        let _ = fs::remove_dir_all(root);
+        Ok(())
     }
 
     #[test]

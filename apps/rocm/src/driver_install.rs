@@ -2252,7 +2252,7 @@ mod tests {
 
     /// On WSL, `build_driver_install_plan_read`'s `Unreadable` branch must
     /// not fire at all: WSL has its own guest-side os-release probe (see
-    /// `examine.rs`'s `WSL_REMOTE_PROBE`), so the local Rust-side read this
+    /// `examine/wsl.rs`'s `WSL_REMOTE_PROBE`), so the local Rust-side read this
     /// function receives is never authoritative for a WSL host, and the plan
     /// must stay the ordinary `wsl_rocdxg` one — not `unreadable_os_release` —
     /// regardless of what it says. Without the `reaches_os_release_parse`

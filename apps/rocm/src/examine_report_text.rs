@@ -39,8 +39,7 @@
 //! `preferred_engine_action_target`, `model_registry_reason`, `format_gib`,
 //! `append_engine_detect_summary`, `friendly_engine_runtime_kind`,
 //! `friendly_engine_detect_notes`, `friendly_engine_detect_note_fallback`,
-//! `engine_runtime_status_label`, and
-//! `engine_runtime_is_native_windows_unsupported`).
+//! and `engine_runtime_status_label`).
 //!
 //! Two items physically interleaved in this span in `main.rs` moved with it
 //! rather than staying behind, since neither has a caller outside this
@@ -84,11 +83,13 @@
 //! This cluster reaches three items that stayed behind in `main.rs` because
 //! they already had callers outside it: `engine_inventory()` (the built-in
 //! engine list, also read from `update_cmd.rs`),
-//! `engine_ruled_out_by_platform` (also read from `assess_model_for_host`; it
-//! and the `PlatformRuleOut` enum it returns, which
-//! `model_registry_adapter_availability_note` matches on, have since moved to
-//! `model_fit.rs` and are re-imported in `main.rs`, so they are reached the
-//! same way), and `missing_packaged_engine_reason` (already noted in
+//! `engine_ruled_out_by_platform` (also read from `assess_model_for_host` and
+//! from `main.rs`'s `ensure_engine_allowed_on_platform`; it and the
+//! `PlatformRuleOut` enum it returns, which
+//! `model_registry_adapter_availability_note` and `engine_runtime_status_label`
+//! match on, have since moved to `model_fit.rs` and are re-imported in
+//! `main.rs`, so they are reached the same way), and
+//! `missing_packaged_engine_reason` (already noted in
 //! [`engine_ipc.rs`](../apps/rocm/src/engine_ipc.rs)'s doc comment as having
 //! callers outside that cluster, plus its own test — this cluster is one of
 //! them) — all three reached via `use crate::{...};`, the same way other
@@ -122,6 +123,7 @@ use rocm_engine_protocol::{
     DetectRequest, DetectResponse, ENGINE_RECIPE_CONTRACT_VERSION, EngineMethod,
 };
 
+use crate::cli_report::write_marked_row;
 use crate::engine_ipc::{
     builtin_engine_available, engine_request, resolve_engine_binary_path,
     resolve_engine_binary_path_with_paths,
@@ -240,7 +242,8 @@ fn plain_status_label(status: &str) -> String {
 const DEFAULT_ENGINE_MARKER: &str = "*";
 
 /// Writes the legend line explaining [`DEFAULT_ENGINE_MARKER`]. Shared by both
-/// engine-inventory renderers so the two copies cannot drift apart.
+/// engine-inventory renderers so the two copies cannot drift apart; their rows
+/// share [`write_marked_row`] for the same reason.
 fn write_default_engine_legend(output: &mut String) {
     let _ = writeln!(output, "  legend: {DEFAULT_ENGINE_MARKER} = default engine");
 }
@@ -291,12 +294,8 @@ pub(crate) fn render_engine_inventory_text_with_paths(paths: Option<&AppPaths>) 
         write_default_engine_legend(&mut output);
     }
     for (name, note) in engine_inventory() {
-        let marker = if *name == default_engine {
-            DEFAULT_ENGINE_MARKER
-        } else {
-            " "
-        };
-        let _ = writeln!(output, "{marker} {name:10} {note}");
+        let marker = (*name == default_engine).then_some(DEFAULT_ENGINE_MARKER);
+        write_marked_row(&mut output, "", marker, format_args!("{name:10} {note}"));
         append_engine_detect_summary(&mut output, name, paths);
     }
     let _ = writeln!(
@@ -482,11 +481,7 @@ fn append_examine_engine_inventory(
         write_default_engine_legend(output);
     }
     for (engine, note) in engine_inventory() {
-        let marker = if *engine == effective_default {
-            DEFAULT_ENGINE_MARKER
-        } else {
-            " "
-        };
+        let marker = (*engine == effective_default).then_some(DEFAULT_ENGINE_MARKER);
         let adapter = if builtin_engine_available(engine) {
             "built_in".to_owned()
         } else {
@@ -506,9 +501,11 @@ fn append_examine_engine_inventory(
                     .or(entry.last_installed_env_id.as_deref())
             })
             .unwrap_or("<unset>");
-        let _ = writeln!(
+        write_marked_row(
             output,
-            "  {marker} {engine} adapter={adapter} runtime_pref={runtime_pref} note={note}"
+            "  ",
+            marker,
+            format_args!("{engine} adapter={adapter} runtime_pref={runtime_pref} note={note}"),
         );
     }
 }
@@ -1405,34 +1402,27 @@ fn friendly_engine_detect_note_fallback(note: &str) -> String {
     note.to_owned()
 }
 
+/// The `runtime:` label `rocm engines list` prints for an engine.
+///
+/// `unsupported_native_windows` comes from `engine_ruled_out_by_platform`, the
+/// same decision `rocm serve` and `rocm engines install` refuse on
+/// (`ensure_engine_allowed_on_platform`), so the inventory cannot call an
+/// engine unsupported while those commands go ahead with it, or the reverse.
 fn engine_runtime_status_label(engine: &str, detect: &DetectResponse) -> &'static str {
-    if detect.installed {
+    runtime_status_label_for(detect.installed, engine_ruled_out_by_platform(engine))
+}
+
+/// [`engine_runtime_status_label`] with the platform decision passed in rather
+/// than re-derived, so every branch is unit-testable on any host (the same seam
+/// as `unsupported_here_for` and `platform_refusal`).
+fn runtime_status_label_for(installed: bool, ruled_out: PlatformRuleOut) -> &'static str {
+    if installed {
         "ready"
-    } else if engine_runtime_is_native_windows_unsupported(engine, detect) {
+    } else if ruled_out == PlatformRuleOut::NativeWindowsVllm {
         "unsupported_native_windows"
     } else {
         "not found"
     }
-}
-
-fn engine_runtime_is_native_windows_unsupported(engine: &str, detect: &DetectResponse) -> bool {
-    if !rocm_core::runtime_is_windows() || !engine.eq_ignore_ascii_case("vllm") {
-        return false;
-    }
-
-    detect
-        .notes
-        .iter()
-        .chain(
-            detect
-                .available_devices
-                .iter()
-                .filter_map(|device| device.reason.as_ref()),
-        )
-        .any(|note| {
-            let normalized = note.to_ascii_lowercase();
-            normalized.contains("linux/wsl") && normalized.contains("native windows")
-        })
 }
 
 #[cfg(test)]
@@ -1692,6 +1682,28 @@ mod tests {
     }
 
     #[test]
+    fn render_engine_inventory_text_keeps_every_row_in_the_marker_layout() {
+        let (root, paths) = test_paths("engine-inventory-row-layout");
+        let host_default =
+            rocm_core::default_engine_for_host(&rocm_core::detect_host_gpu_summary(Some(&paths)));
+
+        let rendered = render_engine_inventory_text_with_paths(Some(&paths));
+        let _ = fs::remove_dir_all(root);
+
+        for (name, _) in engine_inventory() {
+            let expected = if *name == host_default {
+                format!("{DEFAULT_ENGINE_MARKER} {name:10} ")
+            } else {
+                format!("  {name:10} ")
+            };
+            assert!(
+                rendered.lines().any(|line| line.starts_with(&expected)),
+                "expected a row starting {expected:?}:\n{rendered}"
+            );
+        }
+    }
+
+    #[test]
     fn render_engine_inventory_text_omits_legend_when_configured_default_matches_nothing() {
         // A configured default naming an external plugin (or a stale/typo'd
         // name) matches zero rows in `engine_inventory()`'s built-ins list —
@@ -1841,6 +1853,35 @@ mod tests {
             assert_eq!(engine_runtime_status_label("vllm", &detect), "not found");
             assert!(model_registry_adapter_availability_note("vllm").is_none());
         }
+    }
+
+    /// The native-Windows branch of the `runtime:` label, exercised with an
+    /// injected platform decision so it runs on every host rather than only on
+    /// a Windows runner. An engine that is installed stays `ready`; only an
+    /// engine that is absent AND ruled out gets the platform label, and an
+    /// engine ruled out for another reason (AIM) does not borrow it.
+    #[test]
+    fn runtime_status_label_names_the_native_windows_rule_out_on_any_host() {
+        assert_eq!(
+            runtime_status_label_for(false, PlatformRuleOut::NativeWindowsVllm),
+            "unsupported_native_windows"
+        );
+        assert_eq!(
+            runtime_status_label_for(true, PlatformRuleOut::NativeWindowsVllm),
+            "ready"
+        );
+        assert_eq!(
+            runtime_status_label_for(false, PlatformRuleOut::Allowed),
+            "not found"
+        );
+        assert_eq!(
+            runtime_status_label_for(false, PlatformRuleOut::NativeWindowsAim),
+            "not found"
+        );
+        assert_eq!(
+            runtime_status_label_for(false, PlatformRuleOut::AimDockerUnavailable),
+            "not found"
+        );
     }
 
     #[test]
@@ -2312,6 +2353,28 @@ mod tests {
             legend_pos < marker_pos,
             "legend must appear before the entries it explains:\n{output}"
         );
+    }
+
+    #[test]
+    fn examine_engine_inventory_keeps_every_row_in_the_marker_layout() {
+        let (root, paths) = test_paths("examine-engine-inventory-row-layout");
+        let config = RocmCliConfig::default();
+        let mut output = String::new();
+
+        append_examine_engine_inventory(&mut output, &paths, &config, "vllm");
+        let _ = fs::remove_dir_all(root);
+
+        for (engine, _) in engine_inventory() {
+            let expected = if *engine == "vllm" {
+                format!("  {DEFAULT_ENGINE_MARKER} {engine} adapter=")
+            } else {
+                format!("    {engine} adapter=")
+            };
+            assert!(
+                output.lines().any(|line| line.starts_with(&expected)),
+                "expected a row starting {expected:?}:\n{output}"
+            );
+        }
     }
 
     #[test]
