@@ -419,7 +419,7 @@ fn os_major(examination: &Examination) -> String {
     match examination.os_family.as_str() {
         "linux" => {
             // `distro_version` is `VERSION_ID` from `/etc/os-release`
-            // (`examine.rs::probe_os`), e.g. "22.04" -- the actual distro
+            // (`examine/host_env.rs::probe_os`), e.g. "22.04" -- the actual distro
             // release. `os_version` on Linux is `uname -v`'s kernel *build*
             // banner (e.g. "#1 SMP PREEMPT_DYNAMIC Thu Jun 18 21:54:43 UTC
             // 2026"): a timestamp, not a release, and reading it here is the
@@ -431,7 +431,7 @@ fn os_major(examination: &Examination) -> String {
         "windows" => {
             // Windows has no `/etc/os-release` analogue: `distro_id` /
             // `distro_version` are populated only under `runtime_is_linux()`
-            // in `examine.rs::probe_os`, and stay empty here. The only
+            // in `examine/host_env.rs::probe_os`, and stay empty here. The only
             // version-bearing field on this platform is `os_version` itself,
             // `cmd /C ver`'s banner, e.g. "Microsoft Windows [Version
             // 10.0.22631.4460]" -- extract the NT major component that
@@ -451,7 +451,7 @@ fn os_major(examination: &Examination) -> String {
 /// than published, because an unrecognised value is as likely to name a
 /// company as a distribution.
 ///
-/// Windows has no such file: `examine.rs::probe_os` populates `distro_id` only
+/// Windows has no such file: `examine/host_env.rs::probe_os` populates `distro_id` only
 /// under `runtime_is_linux()`, so the value there is a constant rather than
 /// anything read from the machine.
 fn distro(examination: &Examination) -> String {
@@ -485,7 +485,7 @@ fn distro(examination: &Examination) -> String {
 /// machine with a fully installed HIP SDK.
 ///
 /// Within each platform the path decides absence and the version decides
-/// readability, because `examine.rs` collapses both into an empty string:
+/// readability, because `examine/rocm_install_probe.rs` collapses both into an empty string:
 /// "no install was found" and "an install was found whose version could not
 /// be read" arrive identical. Those are different facts to anybody counting,
 /// in the same way [`ReadOutcome`] keeps an unreadable report apart from an
@@ -530,7 +530,7 @@ fn rocm_release(examination: &Examination) -> String {
 /// simply never touched, would be indistinguishable from that ordinary case
 /// and would also read as absent here.
 ///
-/// `"skipped"` is what `examine.rs` records when
+/// `"skipped"` is what `examine/framework.rs` records when
 /// [`crate::examine::FrameworkProbe::Skip`] was requested and the probe never
 /// ran at all. Unlike the default, that is not
 /// "looked and found nothing", so it is left to fall through the allowlist
@@ -909,7 +909,7 @@ mod tests {
     }
 
     /// I6, continued — the Windows equivalent. `distro_version` is never
-    /// populated there (`examine.rs::probe_os` only sets it under
+    /// populated there (`examine/host_env.rs::probe_os` only sets it under
     /// `runtime_is_linux()`), so the NT major version has to come out of
     /// `os_version` itself, `cmd /C ver`'s banner — but only the major
     /// component, never the banner whole.
@@ -1404,7 +1404,7 @@ mod tests {
 
     /// An engine name this build does not recognise is not published.
     ///
-    /// Today every value of `framework` is a literal written by `examine.rs`,
+    /// Today every value of `framework` is a literal written by `examine/framework.rs`,
     /// so this guards a future probe rather than the current one: the moment
     /// one sets that field from parsed output, an allowlist is the difference
     /// between a name and whatever the parse produced. Found by mutation --
@@ -1436,8 +1436,8 @@ mod tests {
     /// `"unknown"` is `Examination::framework`'s struct default, and a
     /// completed probe leaves it there when neither engine was found -- the
     /// ordinary case for most machines. Found by mutation: the prior code
-    /// special-cased an empty string here, a value `examine.rs` never
-    /// actually writes, so every one of these tests passed against a branch
+    /// special-cased an empty string here, a value `examine/framework.rs`
+    /// never actually writes, so every one of these tests passed against a branch
     /// that could never run, while the case that does run every day fell
     /// through to [`UNKNOWN`] and mislabelled an absence as unreadable.
     #[test]
@@ -1482,7 +1482,7 @@ mod tests {
 
     /// An absent ROCm and an unreadable one are different facts.
     ///
-    /// `examine.rs` collapses both into an empty `rocm_version`, so without
+    /// `examine/rocm_install_probe.rs` collapses both into an empty `rocm_version`, so without
     /// this the report would say "not installed" about a machine whose install
     /// merely could not be read -- turning an install problem into an absence
     /// for anybody counting.

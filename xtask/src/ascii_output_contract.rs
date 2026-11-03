@@ -206,7 +206,7 @@ mod tests {
             STRIPPED_FROM_INPUT,
         ),
         (
-            "crates/rocm-core/src/examine.rs",
+            "crates/rocm-core/src/examine/linux_gpus.rs",
             "(\\u{2122})",
             STRIPPED_FROM_INPUT,
         ),

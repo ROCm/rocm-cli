@@ -13,7 +13,7 @@
 //!   give the same verdict.
 //! - The facts come from one place. All three commands take the version and
 //!   date from the same Windows device inventory and the same adapter choice
-//!   (`preferred_amd_display` in `host_gpu.rs`), which ranks a ROCm-supported
+//!   (`preferred_amd_display` in `host_gpu/windows_inventory.rs`), which ranks a ROCm-supported
 //!   discrete GPU above an integrated one. Given the same inventory, all three
 //!   commands select the same adapter.
 //!

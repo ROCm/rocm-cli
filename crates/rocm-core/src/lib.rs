@@ -24,6 +24,7 @@ pub mod endpoint_key;
 pub mod examine;
 pub mod fake_executable;
 pub mod fix;
+mod gfx_target;
 pub mod hardware_root;
 pub mod host_gpu;
 pub mod log_tail;
@@ -35,6 +36,7 @@ pub mod openmpi;
 pub mod os_release;
 pub mod paths;
 pub mod placeholder;
+mod probe_exec;
 pub mod proc_lifecycle;
 pub mod process;
 pub mod quoting;
@@ -73,6 +75,7 @@ pub use config::{
     PermissionsConfig, ProviderUserConfig, RocmCliConfig, SetupConfig, TELEMETRY_MODE_LOCAL,
     TELEMETRY_MODE_OFF, TelemetryConfig, WatcherMode, WatcherUserConfig,
 };
+pub use confirm::interactive_terminal;
 pub use crypto::{
     generate_rsa_signing_keypair, sign_rsa_pkcs1_sha256_signature,
     verify_rsa_pkcs1_sha256_signature,
@@ -97,22 +100,24 @@ pub use fix::{
     apply as apply_fix, catalog_manifest, catalog_manifest_json, exit as fix_exit,
     list_recipes as list_fix_recipes,
 };
+pub use gfx_target::{GpuSupportLevel, gpu_support_level, gpu_support_level_for_host_gpu};
+pub use gfx_target::{
+    extract_first_gfx_token, gfx_target_has_no_rocm_build, known_therock_families,
+    normalize_therock_family,
+};
 pub use hardware_root::host_path;
 pub use host_gpu::{
-    DriverSummary, ExamineSummary, GpuSupportLevel, HostGpuSummary, WslHostDriverProbe, WslSummary,
+    DriverSummary, ExamineSummary, HostGpuSummary, WslHostDriverProbe, WslSummary,
     default_engine_for_host, default_engine_for_platform, detect_gpu_driver_version,
     detect_host_gfx_target, detect_host_gpu_diagnostics, detect_host_gpu_summary,
-    detect_system_ram_gib, extract_first_gfx_token, gfx_target_has_no_rocm_build,
-    gpu_support_level, gpu_support_level_for_host_gpu, has_usable_amd_gpu, interactive_terminal,
-    is_amdgpu_device, is_wsl_host, known_therock_families, normalize_therock_family,
-    pinned_gpu_name, preferred_serve_engine_for_host_gpu_summary, usable_amd_gpu_indices,
+    detect_system_ram_gib, has_usable_amd_gpu, is_amdgpu_device, is_wsl_host, pinned_gpu_name,
+    preferred_serve_engine_for_host_gpu_summary, usable_amd_gpu_indices,
 };
 #[cfg(any(target_os = "linux", test))]
 use host_gpu::{KfdGpuNode, kfd_gpu_nodes_in};
 use host_gpu::{
-    collect_sdk_library_paths, detect_linux_sysfs_gfx_target, detect_local_windows_host_driver,
-    detect_wsl_host_driver, detect_wsl_summary, is_wsl1_kernel, ldconfig_cache,
-    ldconfig_lists_librocdxg, managed_therock_sdk_probe_candidates,
+    detect_linux_sysfs_gfx_target, detect_local_windows_host_driver, detect_wsl_host_driver,
+    detect_wsl_summary, is_wsl1_kernel, ldconfig_cache, ldconfig_lists_librocdxg,
 };
 pub use log_tail::tail_lines;
 pub use managed_runtime::{
@@ -121,7 +126,7 @@ pub use managed_runtime::{
     active_managed_therock_version, detect_managed_therock_family, prepend_runtime_paths,
 };
 use managed_runtime::{
-    TheRockFamilyManifest, managed_sdk_tool_path, sort_records_newest_install_first,
+    collect_sdk_library_paths, managed_sdk_tool_path, managed_therock_sdk_probe_candidates,
 };
 pub use model_catalog::{
     ModelArtifactCacheStatus, ModelCatalogPlatform, ModelRecipeArtifactRecord,

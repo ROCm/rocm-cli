@@ -1130,8 +1130,8 @@ enum ServicesCommand {
     ///
     /// Each running server is asked which backend and GPU it is actually on, so
     /// this takes a few seconds rather than returning instantly. The asking is
-    /// capped in total — about 18 seconds worst case, however many servers are
-    /// listed — and a server that does not answer in time simply has no device
+    /// capped in total (about 18 seconds worst case, however many servers are
+    /// listed), and a server that does not answer in time simply has no device
     /// line.
     List {
         /// Include failed, stopped, and old service records.

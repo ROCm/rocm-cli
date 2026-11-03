@@ -42,7 +42,7 @@ use windows_sys::Win32::System::Threading::{
     WaitForSingleObject,
 };
 
-use crate::examine::truncate_to_chars;
+use crate::probe_exec::truncate_to_chars;
 use std::io::{ErrorKind, Read};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};

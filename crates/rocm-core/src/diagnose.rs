@@ -1558,7 +1558,7 @@ fn repo_pkg_family(e: &Examination) -> &'static str {
 /// Whether `rocm_install_method` indicates a package-manager-driven install,
 /// covering both the marker-file-based `"repo-native"` value and the
 /// dpkg/rpm-query fallback's `"apt"`/`"dnf"` (see `probe_rocm_install` in
-/// `examine.rs`): a host without one of `REPO_NATIVE_INSTALL_MARKERS` present
+/// `examine/rocm_install_probe.rs`): a host without one of `REPO_NATIVE_INSTALL_MARKERS` present
 /// but whose package manager confirms `rocm-hip-runtime` is installed is
 /// still repo-native-managed, just detected a different way.
 ///
@@ -3193,10 +3193,10 @@ pub fn upstream_route(target: &str) -> Route {
 /// ever sets to `pytorch`, `llama-cpp`, `unknown` or `skipped` — so those two
 /// named arms plus the ROCm-core default are the whole reachable set.
 ///
-/// Adding a framework to `examine.rs`'s probe means adding its arm here, its
+/// Adding a framework to `examine/framework.rs`'s probe means adding its arm here, its
 /// tracker in [`upstream_tracker`], and its name to the hand-maintained list in
 /// `routing_targets_cover_every_framework_the_probe_reports`. That test reads
-/// its own list rather than deriving one from `examine.rs`, so it cannot notice
+/// its own list rather than deriving one from `examine/framework.rs`, so it cannot notice
 /// a new framework on its own — all three edits are manual.
 fn route_when_no_match(e: &Examination) -> Route {
     let target = match e.framework.as_str() {
@@ -4778,7 +4778,7 @@ mod tests {
     fn comgr_matches_runtime_never_disagrees_with_the_diagnosis() {
         // `rocm examine --json`'s `comgr_matches_runtime` and `rocm diagnose`'s
         // fix-18 finding answer the same question about the same machine. Both
-        // are driven by `comgr_matches_runtime` in `examine.rs`, so this checks
+        // are driven by `comgr_matches_runtime` in `examine/library_copies.rs`, so this checks
         // the two surfaces stay in lockstep across every shape the catalog
         // itself tests -- including the case that used to disagree: a runtime
         // whose own installation ships no code object manager at all.
@@ -5225,7 +5225,7 @@ mod tests {
     /// a re-added arm has to come with a probe that reaches it.
     ///
     /// The list below is **hand-maintained**: its first four entries mirror what
-    /// `Examination::probe` sets in `examine.rs`, and the rest are names the
+    /// `Examination::probe` sets in `examine/framework.rs`, and the rest are names the
     /// probe never returns, kept so a re-added arm for one of them shows up.
     /// Neither half is derived from that code, so adding a fifth framework to
     /// the probe will not fail this test — see the note on
@@ -8429,7 +8429,7 @@ mod tests {
 
     #[test]
     fn repo_native_broken_claims_repo_native_evidence_for_dpkg_rpm_fallback_methods() {
-        // probe_rocm_install (examine.rs) falls back to the literal "apt"/"dnf"
+        // probe_rocm_install (examine/rocm_install_probe.rs) falls back to the literal "apt"/"dnf"
         // when dpkg/rpm confirms the package is installed but no marker file
         // was found. Those hosts are still repo-native-managed, so the evidence
         // line must fire for them too, not just the marker-file-detected
