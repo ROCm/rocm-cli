@@ -725,27 +725,25 @@ fn packaged_therock_pin(output: &str) -> String {
         .parent()
         .unwrap_or_else(|| panic!("env_path {env_path} has no parent"))
         .join("downloads");
-    let archive = std::fs::read_dir(&downloads)
+    // The archive's top-level directory is its file name without the
+    // extension. rocm-cli names the archive itself (`lemonade_archive_name`),
+    // always in lower case; the extension is compared ignoring ASCII case, as
+    // clippy's `case_sensitive_file_extension_comparisons` asks.
+    let archive_stem = |path: &std::path::Path| -> Option<String> {
+        let name = path.file_name()?.to_str()?;
+        [".tar.gz", ".zip"].iter().find_map(|extension| {
+            let split = name.len().checked_sub(extension.len())?;
+            let (stem, tail) = (name.get(..split)?, name.get(split..)?);
+            (tail.eq_ignore_ascii_case(extension) && stem.starts_with(&archive_prefix))
+                .then(|| stem.to_owned())
+        })
+    };
+    let (archive, stem) = std::fs::read_dir(&downloads)
         .unwrap_or_else(|error| panic!("failed to list {}: {error}", downloads.display()))
         .filter_map(Result::ok)
         .map(|entry| entry.path())
-        .find(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| {
-                    name.starts_with(&archive_prefix)
-                        && (name.ends_with(".tar.gz") || name.ends_with(".zip"))
-                })
-        })
+        .find_map(|path| archive_stem(&path).map(|stem| (path, stem)))
         .unwrap_or_else(|| panic!("no cached {env_id} archive in {}", downloads.display()));
-    let name = archive
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or_default();
-    let stem = name
-        .strip_suffix(".tar.gz")
-        .or_else(|| name.strip_suffix(".zip"))
-        .unwrap_or(name);
     let member = format!("{stem}/resources/backend_versions.json");
     let extracted = std::process::Command::new("tar")
         .arg("-xOf")
