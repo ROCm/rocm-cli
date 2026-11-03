@@ -32,6 +32,15 @@ async fn catalog_lists_aim_recipe(world: &mut E2eWorld) {
             .any(|line| line.contains("Qwen/Qwen3.5-9B") && line.contains("engines=[aim")),
         "expected the AIM recipe listed by canonical id and engine:\n{output}"
     );
+    // The host-fit fields of the same entry: which GPU families it covers, that
+    // it needs no Hugging Face token, and the profile pinned for a family.
+    assert!(
+        output.lines().any(|line| line.contains("engine_recipe aim")
+            && line.contains("supported_gfx_families=[gfx110X-all,gfx120X-all]")
+            && line.contains("requires_hf_token=no")
+            && line.contains("gfx110X-all=vllm-w7900-bf16-tp1-latency")),
+        "expected the AIM recipe's host-fit line in the verbose listing:\n{output}"
+    );
 }
 
 /// Plant a `docker` on `PATH` that always fails, so the catalog's
@@ -147,7 +156,7 @@ async fn catalog_warns_aim_entry_is_stale(world: &mut E2eWorld) {
     assert!(
         output.contains("warning: aim entry was last verified")
             && output.contains("days ago")
-            && output.contains("rerun the installer"),
+            && output.contains("entries are refreshed by hand"),
         "expected a staleness warning for the AIM entry, got:\n{output}"
     );
 }

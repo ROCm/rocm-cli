@@ -631,7 +631,8 @@ rocm serve qwen --verbose --device gpu_required")]
         /// `AIM_PROFILE_ID=...`) and other engines ignore it. `KEY=VALUE` is
         /// recorded with the service, so for a secret such as `HF_TOKEN` pass a
         /// bare `KEY` instead: it is forwarded from your environment and never
-        /// stored.
+        /// stored. A gated AIM image (one that needs a Hugging Face token) is
+        /// refused up front unless `HF_TOKEN` is passed this way.
         #[arg(long = "engine-env", value_name = "KEY[=VALUE]")]
         engine_env: Vec<String>,
     },

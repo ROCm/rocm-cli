@@ -127,7 +127,9 @@ pub(crate) fn select_serve_engine(
     }
 }
 
-/// The recipe's first preferred engine that can run on this host. AIM is only
+/// The recipe's first preferred engine, unless it is AIM and AIM cannot run on
+/// this host; the caller then falls back to the platform default, and a later
+/// preferred engine such as `vllm` is not considered. AIM is only
 /// chosen on its own when the detected GPU family is one the image has a profile
 /// for and the host is Linux or WSL, so an undetected GPU or native Windows is not;
 /// otherwise the platform default applies, as it did before the recipe was
@@ -264,6 +266,30 @@ fn engine_recipe_with_aim_gfx_profile(
             (hint, _) => hint,
         }),
     }
+}
+
+/// The AIM checks that depend on the host GPU, in the order `serve` applies
+/// them: refuse a family the image has no profile for, pin the profile the
+/// catalog names for the detected family, then refuse an image that needs more
+/// than one GPU. The host is only probed for an AIM record that restricts GPU
+/// families, and not at all for `--device cpu_only`, since these checks are about
+/// the GPU the container would use. An undetected family enforces nothing.
+fn aim_gpu_preflight(
+    engine: &str,
+    model: &str,
+    recipe: Option<&ModelRecipeRecord>,
+    hint: Option<EngineRecipeHint>,
+    cpu_only: bool,
+    detect_family: impl FnOnce() -> Option<String>,
+) -> Result<Option<EngineRecipeHint>> {
+    let family = aim_engine_record(engine, recipe)
+        .filter(|record| !record.supported_gfx_families.is_empty() && !cpu_only)
+        .and_then(|_| detect_family());
+    let hint = engine_recipe_with_aim_gfx_profile(engine, recipe, hint, || family.clone())?;
+    if let Some(needed) = aim_min_gpu_count(engine, recipe, family.as_deref()) {
+        ensure_aim_multi_gpu_supported(model, needed)?;
+    }
+    Ok(hint)
 }
 
 fn aim_engine_record<'a>(
@@ -914,6 +940,18 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
         .filter(|recipe| model_recipe_supports_engine(recipe, &selected_engine))
         .and_then(|recipe| protocol_engine_recipe_hint(recipe, &selected_engine));
     let device_policy = parse_device_policy(device.as_ref().map(|policy| policy.as_policy_str()))?;
+    // CPU-only serving never pins a GPU, so skip GPU resolution entirely and
+    // surface the explicit `--gpu` as ignored rather than printing a device the
+    // server will not use.
+    //
+    // Always `false` today, and kept anyway: `parse_device_policy` rejects
+    // `cpu`/`cpu_only` outright (pinned by
+    // `parse_device_policy_defaults_to_gpu_required_without_cpu_fallback`), so
+    // the only policy that reaches here is `GpuRequired`. The term is what makes
+    // every `!cpu_only` guard below read as a guard on the *policy* rather than
+    // on a constant, so admitting the policy later cannot silently turn CPU-only
+    // serving into GPU pre-flight failures. It is not evidence that the CPU path
+    // is exercised; nothing in the suite can reach it.
     let cpu_only = matches!(device_policy, DevicePolicy::CpuOnly);
     // The token needs nothing from the GPU, so it is checked first: a gated model
     // is refused for its missing token on any host, not only on one whose GPU the
@@ -926,29 +964,18 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
         engine_recipe_with_extra_env(&selected_engine, None, &engine_env)?.as_ref(),
         |key| std::env::var(key).ok(),
     )?;
-    // The AIM GPU checks are about the GPU the container would use, so they do
-    // not apply to `--device cpu_only`.
-    let aim_host_family = aim_engine_record(&selected_engine, shared_recipe.as_ref())
-        .filter(|record| !record.supported_gfx_families.is_empty() && !cpu_only)
-        .and_then(|_| {
+    let recipe_hint = aim_gpu_preflight(
+        &selected_engine,
+        &model,
+        shared_recipe.as_ref(),
+        recipe_hint,
+        cpu_only,
+        || {
             detect_host_gfx_target()
                 .as_deref()
                 .and_then(normalize_therock_family)
-        });
-    let recipe_hint = engine_recipe_with_aim_gfx_profile(
-        &selected_engine,
-        shared_recipe.as_ref(),
-        recipe_hint,
-        || aim_host_family.clone(),
+        },
     )?;
-    let aim_min_gpus = aim_min_gpu_count(
-        &selected_engine,
-        shared_recipe.as_ref(),
-        aim_host_family.as_deref(),
-    );
-    if let Some(needed) = aim_min_gpus {
-        ensure_aim_multi_gpu_supported(&model, needed)?;
-    }
     // vLLM rejects the TUI chat tab's tool-bearing requests with HTTP 400 unless it
     // is launched with `--enable-auto-tool-choice`/`--tool-call-parser`. The parser
     // is model-specific and vLLM does not auto-detect it, so it is never guessed: it
@@ -1021,18 +1048,6 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
         None
     };
     let gpu_selection = parse_gpu_selection(gpu.as_deref())?;
-    // CPU-only serving never pins a GPU, so skip GPU resolution entirely and
-    // surface the explicit `--gpu` as ignored rather than printing a device the
-    // server will not use.
-    //
-    // Always `false` today, and kept anyway: `parse_device_policy` rejects
-    // `cpu`/`cpu_only` outright (pinned by
-    // `parse_device_policy_defaults_to_gpu_required_without_cpu_fallback`), so
-    // the only policy that reaches here is `GpuRequired`. The term is what makes
-    // every `!cpu_only` guard below read as a guard on the *policy* rather than
-    // on a constant, so admitting the policy later cannot silently turn CPU-only
-    // serving into GPU pre-flight failures. It is not evidence that the CPU path
-    // is exercised; nothing in the suite can reach it.
     // AMD GPU ordinals still usable after the active visibility mask
     // (`HIP_VISIBLE_DEVICES`, then `ROCR_VISIBLE_DEVICES`) is applied, in HIP
     // ordinal space — the space `--gpu` is validated and exported through. A
@@ -2026,18 +2041,86 @@ mod tests {
     }
 
     #[test]
-    fn aim_gfx_check_is_skipped_when_the_gpu_is_unknown_or_the_engine_is_not_aim() {
+    fn aim_gpu_preflight_probes_only_for_a_restricted_aim_record_off_cpu_only() {
         let radeon = resolve_builtin_model_recipe("aim-qwen3.5-9b").expect("radeon aim entry");
         let hint = protocol_engine_recipe_hint(&radeon, "aim");
-        let unchanged =
-            engine_recipe_with_aim_gfx_profile("aim", Some(&radeon), hint.clone(), || None)
-                .unwrap();
-        assert_eq!(unchanged, hint);
-        let vllm = engine_recipe_with_aim_gfx_profile("vllm", Some(&radeon), None, || {
-            panic!("host GPU must not be probed for other engines")
+        let preflight = |engine: &str, cpu_only: bool, family: fn() -> Option<String>| {
+            aim_gpu_preflight(engine, "m", Some(&radeon), hint.clone(), cpu_only, family)
+        };
+        let no_probe = || -> Option<String> { panic!("host GPU must not be probed") };
+
+        // An undetected family enforces nothing.
+        assert_eq!(preflight("aim", false, || None).unwrap(), hint);
+        // The probe runs for AIM off `cpu_only`, and the result is enforced.
+        assert!(preflight("aim", false, || Some("gfx94X-dcgpu".to_owned())).is_err());
+        // Neither a different engine nor `--device cpu_only` reaches the probe,
+        // so an unsupported family cannot refuse them.
+        assert_eq!(preflight("vllm", false, no_probe).unwrap(), hint);
+        assert_eq!(preflight("aim", true, no_probe).unwrap(), hint);
+    }
+
+    #[test]
+    fn aim_gpu_preflight_pins_the_profile_and_then_refuses_multi_gpu_images() {
+        let radeon = resolve_builtin_model_recipe("aim-qwen3.5-9b").expect("radeon aim entry");
+        let pinned = aim_gpu_preflight(
+            "aim",
+            "m",
+            Some(&radeon),
+            protocol_engine_recipe_hint(&radeon, "aim"),
+            false,
+            || Some("gfx110X-all".to_owned()),
+        )
+        .unwrap()
+        .expect("hint");
+        assert_eq!(
+            pinned.extra_env.get("AIM_PROFILE_ID").map(String::as_str),
+            Some("vllm-w7900-bf16-tp1-latency")
+        );
+
+        // The multi-GPU refusal comes from the same pre-flight, and only for a
+        // family whose count exceeds one.
+        let multi = resolve_builtin_model_recipe("zai-org/GLM-4.7-Flash").expect("multi-GPU entry");
+        let hint = || protocol_engine_recipe_hint(&multi, "aim");
+        let err = aim_gpu_preflight("aim", "m", Some(&multi), hint(), false, || {
+            Some("gfx120X-all".to_owned())
         })
-        .unwrap();
-        assert!(vllm.is_none());
+        .unwrap_err();
+        assert!(err.to_string().contains("multi-GPU serving yet"), "{err:#}");
+        assert!(
+            aim_gpu_preflight("aim", "m", Some(&multi), hint(), true, || None).is_ok(),
+            "cpu_only skips the multi-GPU check"
+        );
+    }
+
+    #[test]
+    fn recipe_preferred_engine_treats_unrestricted_and_missing_aim_records_as_usable() {
+        let host = rocm_core::HostGpuSummary {
+            therock_family: Some("gfx1151".to_owned()),
+            ..rocm_core::HostGpuSummary::default()
+        };
+        let mut recipe = resolve_builtin_model_recipe("Qwen/Qwen3-32B").unwrap();
+        assert_eq!(recipe_preferred_engine(&recipe, Some(&host), false), None);
+        // Only a signed external index reaches these two arms, so they are built
+        // here: an AIM record that restricts no family is usable on any GPU, and
+        // a recipe that lists AIM first but carries no AIM record has nothing to
+        // gate it.
+        for record in &mut recipe.engine_recipes {
+            if record.engine == "aim" {
+                record.supported_gfx_families.clear();
+            }
+        }
+        assert_eq!(
+            recipe_preferred_engine(&recipe, Some(&host), false),
+            Some("aim")
+        );
+        recipe
+            .engine_recipes
+            .retain(|record| record.engine != "aim");
+        assert_eq!(
+            recipe_preferred_engine(&recipe, Some(&host), false),
+            Some("aim")
+        );
+        assert_eq!(recipe_preferred_engine(&recipe, Some(&host), true), None);
     }
 
     #[test]

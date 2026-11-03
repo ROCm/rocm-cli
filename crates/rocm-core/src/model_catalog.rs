@@ -180,7 +180,7 @@ pub fn model_recipe_staleness_warning(
     let age_ms = now_ms.checked_sub(engine_recipe.generated_at_unix_ms?)?;
     (age_ms > MODEL_RECIPE_STALE_AFTER_MS).then(|| {
         format!(
-            "{} entry was last verified {} days ago; the pinned image may no longer exist; update rocm-cli (rerun the installer) for a refreshed catalog",
+            "{} entry was last verified {} days ago; the pinned image may no longer exist; entries are refreshed by hand, so a newer rocm-cli release or recipe index may carry a current one",
             engine_recipe.engine,
             age_ms / (24 * 60 * 60 * 1000)
         )
@@ -1253,6 +1253,93 @@ mod tests {
         let mut wrong_engine = aim;
         wrong_engine.engine = "vllm".to_owned();
         assert!(validate_model_recipe_engine_record(&wrong_engine, "m").is_err());
+    }
+
+    /// One case per branch of `validate_model_recipe_engine_record` added for the
+    /// AIM host-fit fields; each is the only thing wrong (or, for the `ok` rows,
+    /// the only content) in its record, so removing a branch turns its row red.
+    #[test]
+    fn engine_record_validation_covers_each_aim_field_branch() {
+        let aim = |edit: fn(&mut ModelRecipeEngineRecord)| {
+            let mut record = ModelRecipeEngineRecord {
+                engine: "aim".to_owned(),
+                ..Default::default()
+            };
+            edit(&mut record);
+            record
+        };
+        let cases: Vec<(&str, ModelRecipeEngineRecord, bool)> = vec![
+            (
+                "unknown gfx family",
+                aim(|r| r.supported_gfx_families = vec!["gfx0000".to_owned()]),
+                false,
+            ),
+            (
+                "profile pin and AIM_PROFILE_ID env",
+                aim(|r| {
+                    r.supported_gfx_families = vec!["gfx110X-all".to_owned()];
+                    r.profile_ids
+                        .insert("gfx110X-all".to_owned(), "p".to_owned());
+                    r.extra_env
+                        .insert("AIM_PROFILE_ID".to_owned(), "q".to_owned());
+                }),
+                false,
+            ),
+            (
+                "min_gpu_counts family not in supported_gfx_families",
+                aim(|r| {
+                    r.supported_gfx_families = vec!["gfx110X-all".to_owned()];
+                    r.min_gpu_counts.insert("gfx120X-all".to_owned(), 2);
+                }),
+                false,
+            ),
+            (
+                "requires_hf_token on a non-aim engine",
+                ModelRecipeEngineRecord {
+                    engine: "vllm".to_owned(),
+                    requires_hf_token: true,
+                    ..Default::default()
+                },
+                false,
+            ),
+            (
+                "supported_boards on a non-aim engine",
+                ModelRecipeEngineRecord {
+                    engine: "vllm".to_owned(),
+                    supported_boards: vec!["W7900".to_owned()],
+                    ..Default::default()
+                },
+                false,
+            ),
+            ("empty aim record", aim(|_| {}), false),
+            (
+                "aim record carrying only supported_gfx_families",
+                aim(|r| r.supported_gfx_families = vec!["gfx110X-all".to_owned()]),
+                true,
+            ),
+            (
+                "aim record carrying only requires_hf_token",
+                aim(|r| r.requires_hf_token = true),
+                true,
+            ),
+            (
+                "aim record carrying only supported_boards",
+                aim(|r| r.supported_boards = vec!["W7900".to_owned()]),
+                true,
+            ),
+            (
+                "aim record carrying only generated_at_unix_ms",
+                aim(|r| r.generated_at_unix_ms = Some(1)),
+                true,
+            ),
+        ];
+        for (name, record, valid) in cases {
+            assert_eq!(
+                validate_model_recipe_engine_record(&record, "m").is_ok(),
+                valid,
+                "{name}"
+            );
+        }
     }
 
     #[test]

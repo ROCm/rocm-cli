@@ -13,8 +13,9 @@ Feature: Model catalog listing
   # The epic names two reasons a listed AIM image can be unusable: an
   # unsupported GPU family, or no Docker. Only the Docker check runs at the
   # catalog layer today (see `engine_ruled_out_by_platform` in main.rs);
-  # GPU-family fit is a `rocm serve`/`rocm diagnose --model` readiness check,
-  # not a catalog property. This plants a `docker` that always fails so the
+  # GPU-family fit is a property of the entry (`supported_gfx_families`, shown by
+  # `--verbose`) but is only enforced by `rocm serve`, not by the listing.
+  # This plants a `docker` that always fails so the
   # unavailable branch is exercised deterministically on every host, including
   # ones where Docker really is reachable (an earlier variant compared against
   # the host's real Docker state, which asserted a different outcome per host).

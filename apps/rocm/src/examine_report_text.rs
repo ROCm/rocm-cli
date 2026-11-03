@@ -29,7 +29,8 @@
 //! `render_model_registry_verbose_text_with_context_and_host`,
 //! `model_catalog_header`, `append_model_recipe_registry_source`,
 //! `append_model_recipe_metadata_lines`,
-//! `append_model_engine_recipe_settings_lines`, `format_list_or_none`,
+//! `append_model_engine_recipe_settings_lines`,
+//! `append_model_recipe_staleness_lines`, `format_list_or_none`,
 //! `format_string_map_or_none`, `append_model_artifact_lines`,
 //! `append_artifact_source_policy_lines`, `artifact_source_policy_label`,
 //! `format_bytes`, `append_model_host_ram_fit_lines`,
@@ -806,12 +807,16 @@ fn append_model_engine_recipe_settings_lines(output: &mut String, recipe: &Model
                 .join("; ")
         };
         let notes = format_list_or_none(&engine_recipe.notes);
-        if !engine_recipe.supported_gfx_families.is_empty() {
+        if !engine_recipe.supported_gfx_families.is_empty()
+            || engine_recipe.requires_hf_token
+            || !engine_recipe.profile_ids.is_empty()
+            || !engine_recipe.min_gpu_counts.is_empty()
+        {
             let _ = writeln!(
                 output,
                 "      engine_recipe {} supported_gfx_families=[{}] requires_hf_token={} profile_ids=[{}] min_gpu_counts=[{}]",
                 engine_recipe.engine,
-                engine_recipe.supported_gfx_families.join(","),
+                format_list_or_none(&engine_recipe.supported_gfx_families),
                 if engine_recipe.requires_hf_token {
                     "yes"
                 } else {
@@ -2151,6 +2156,26 @@ mod tests {
         // A recipe with no AIM entry prints no such line.
         let lemonade = engine_lines("qwen");
         assert!(!lemonade.contains("supported_gfx_families"), "{lemonade}");
+    }
+
+    #[test]
+    fn verbose_model_listing_shows_a_token_requirement_without_gfx_families() {
+        // A schema-valid record can carry `requires_hf_token` alone; the listing
+        // must still say the image needs a token.
+        let mut recipe =
+            rocm_core::resolve_builtin_model_recipe("meta-llama/Llama-3.2-3B-Instruct")
+                .expect("aim recipe");
+        for record in &mut recipe.engine_recipes {
+            record.supported_gfx_families.clear();
+        }
+        let mut output = String::new();
+        append_model_engine_recipe_settings_lines(&mut output, &recipe);
+        assert!(
+            output.contains(
+                "engine_recipe aim supported_gfx_families=[<none>] requires_hf_token=yes"
+            ),
+            "{output}"
+        );
     }
 
     #[test]

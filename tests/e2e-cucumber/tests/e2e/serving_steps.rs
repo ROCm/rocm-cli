@@ -1810,6 +1810,9 @@ async fn assert_no_engine_preparation(world: &mut E2eWorld) {
         !output.contains("Preparing "),
         "a live managed service for an unrelated model must not drag engine \
          preparation ahead of the no-usable-GPU refusal:\n{output}"
+    );
+}
+
 #[then("the CLI explains that the model needs a Hugging Face token")]
 async fn assert_hf_token_message(world: &mut E2eWorld) {
     let output = serve_output(world);
