@@ -3,8 +3,9 @@
 # This file is the SINGLE SOURCE OF TRUTH for those pins. Nothing else in the
 # tree may spell a runtime version literal: archive names, download URLs, and
 # offline fallbacks are all derived from the values below by the `rocm-deps`
-# crate, whose build script turns each entry into a Rust constant. Editing a
-# version here is the whole bump.
+# crate, whose build script turns each entry into a Rust constant. A bump also
+# records the new archives' digests where the adapter verifies them; for
+# Lemonade, that is `EMBEDDABLE_*_SHA256` in engines/lemonade/src/install.rs.
 #
 # Schema: one `[runtime.<name>]` table per managed runtime, with one or more
 # string fields. Every field becomes a `pub const <NAME>_<FIELD>: &str` in
@@ -15,4 +16,4 @@
 # Lemonade embeddable release, published as
 # `lemonade-embeddable-<version>-<os-arch>.{tar.gz|zip}` under the
 # `v<version>` tag of the lemonade-sdk/lemonade GitHub releases.
-version = "11.5.1"
+version = "2026.44.1"

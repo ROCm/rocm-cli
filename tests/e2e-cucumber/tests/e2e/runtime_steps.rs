@@ -516,22 +516,104 @@ async fn user_reinstalls_lemonade_engine(world: &mut E2eWorld) {
     world.cli_stderr = Some(stderr);
 }
 
-/// Verified against real hardware (Strix Halo, gfx1151): a fresh managed SDK
-/// install's version does not match Lemonade's packaged pin, Tier 1's install
-/// 404s (the pinned build predates a ROCm-7.14 asset), and Tier 2's newest
-/// build succeeds -- producing exactly this line. This is the one part of the
-/// alignment path with no other e2e coverage: the unit tests exercise the
-/// Tier 1/Tier 2/revert state machine directly (against injected install/align
-/// steps), but nothing else asserts that `rocm engines install lemonade`
-/// actually surfaces the outcome to the user.
-#[then("the CLI reports that Lemonade's ROCm backend was aligned to the active SDK")]
-async fn assert_lemonade_backend_alignment_reported(world: &mut E2eWorld) {
+/// The pin Lemonade installed against ends up equal to the active SDK, by
+/// whichever route this host takes:
+///
+/// - the active SDK differs from Lemonade's packaged `therock.version`, and the
+///   install aligns the pin to it and says so ("Aligned Lemonade's ROCm llama.cpp
+///   backend ..."), as on an SDK older than the pin (ROCm 7.14 against
+///   Lemonade 2026.44.1's 10.1.0, whose pinned llama.cpp build also ships a 7.14
+///   archive);
+/// - the active SDK already is the packaged pin (a ROCm 10.1 SDK), so there is
+///   nothing to align: no alignment line, no alignment attempt, and the ROCm
+///   backend installs as packaged.
+///
+/// Either way the pin in the installed `backend_versions.json` is read back and
+/// compared with the active runtime's own version from `rocm runtimes list`, and
+/// the selected backend must be `rocm`: a failed alignment reverts the pin to the
+/// packaged value and fails the comparison, and a message without the matching
+/// pin fails it too. The unit tests drive the Tier 1/Tier 2/revert state machine
+/// against injected steps; this is the only check that `rocm engines install
+/// lemonade` reaches a ROCm backend paired with the SDK on real hardware.
+#[then("Lemonade's ROCm backend is paired with the active SDK")]
+async fn assert_lemonade_backend_paired_with_active_sdk(world: &mut E2eWorld) {
     let output = world.cli_output.as_deref().expect("no install output");
+    let stderr = world.cli_stderr.as_deref().unwrap_or_default();
     assert!(
         output
-            .contains("Aligned Lemonade's ROCm llama.cpp backend to match the installed ROCm SDK"),
-        "expected the install to report the ROCm backend alignment outcome:\n{output}"
+            .contains("Selected the best supported llama.cpp backend for this GPU: llamacpp:rocm"),
+        "expected Lemonade's ROCm llama.cpp backend to be selected:\n{output}"
     );
+    let pinned_version = installed_therock_pin(output);
+    let active_version = active_runtime_version(world);
+    if !is_plain_release_version(&active_version) {
+        // A dated (nightly) SDK is left alone by design: no alignment is
+        // attempted and the packaged pin stays.
+        assert_eq!(
+            pinned_version,
+            packaged_therock_pin(output),
+            "a nightly SDK ({active_version}) must leave Lemonade's packaged pin in place"
+        );
+        assert!(
+            !output.contains("Aligned Lemonade's ROCm")
+                && !stderr.contains("Aligned Lemonade's ROCm"),
+            "a nightly SDK ({active_version}) was aligned to:\nstdout:\n{output}\nstderr:\n{stderr}"
+        );
+        return;
+    }
+    assert_eq!(
+        pinned_version, active_version,
+        "the installed backend_versions.json does not pin the active ROCm SDK:\nstdout:\n{output}\nstderr:\n{stderr}"
+    );
+    let reported_aligned = output
+        .contains("Aligned Lemonade's ROCm llama.cpp backend to match the installed ROCm SDK");
+    if !reported_aligned {
+        // Only right when the packaged pin already was the active SDK: then no
+        // alignment is attempted at all.
+        assert!(
+            !stderr.contains("Aligned Lemonade's ROCm backend to")
+                && !stderr.contains("could not align Lemonade's ROCm backend to"),
+            "an alignment ran but the install did not report it:\n{stderr}"
+        );
+    }
+}
+
+/// Whether `version` is a plain `major.minor.patch` release, the only kind
+/// Lemonade's backend alignment matches against (a nightly such as
+/// `7.14.0a20260601` is left alone).
+fn is_plain_release_version(version: &str) -> bool {
+    let parts: Vec<&str> = version.split('.').collect();
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// `therock.version` in the `resources/backend_versions.json` of the runtime
+/// tree the install reports (`env_path:`).
+fn installed_therock_pin(output: &str) -> String {
+    let env_path = output
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("env_path: "))
+        .unwrap_or_else(|| panic!("no env_path in install output:\n{output}"));
+    let backend_versions_path =
+        std::path::Path::new(env_path).join("resources/backend_versions.json");
+    let contents = std::fs::read_to_string(&backend_versions_path).unwrap_or_else(|error| {
+        panic!(
+            "failed to read {}: {error}",
+            backend_versions_path.display()
+        )
+    });
+    let parsed: serde_json::Value = serde_json::from_str(&contents).unwrap_or_else(|error| {
+        panic!(
+            "failed to parse {}: {error}",
+            backend_versions_path.display()
+        )
+    });
+    parsed["therock"]["version"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no therock.version in {}", backend_versions_path.display()))
+        .to_owned()
 }
 
 /// The CLI names the variable whenever it is set, so a user can tell it was
@@ -562,9 +644,9 @@ async fn assert_lemonade_backend_alignment_opted_out(world: &mut E2eWorld) {
 /// (marked with `*`; see `ACTIVE_RUNTIME_MARKER` in `apps/rocm/src/main.rs`).
 ///
 /// Read independently of Lemonade's own reporting, on purpose: this is the
-/// comparator [`assert_packaged_pin_survives`] uses to prove the pin was not
-/// rewritten to match it, so it must not come from anything alignment itself
-/// could produce (there is no `ROCm SDK:` line in `rocm version` on this
+/// comparator [`assert_lemonade_backend_paired_with_active_sdk`] uses to prove
+/// the pin was aligned to it, so it must not come from anything alignment
+/// itself could produce (there is no `ROCm SDK:` line in `rocm version` on this
 /// branch -- that surface is a different, later change).
 fn active_runtime_version(world: &E2eWorld) -> String {
     let (stdout, _, _) = crate::run_rocm(world, &["runtimes", "list"]);
@@ -582,12 +664,12 @@ fn active_runtime_version(world: &E2eWorld) -> String {
 /// The packaged pin was not rewritten.
 ///
 /// Reads `resources/backend_versions.json` inside the runtime tree the install
-/// itself reports (`env_path:`) and compares it against the active runtime's
-/// own version (from `rocm runtimes list`, not from anything Lemonade's
-/// alignment reports), rather than inferring the outcome from an absent log
-/// line alone. Both checks matter: the revert path can fail to restore the
-/// pin (best-effort, matching its sibling warnings) while still printing no
-/// "Aligned ..." line, so absence of that line alone cannot distinguish a
+/// itself reports (`env_path:`) and compares it with the copy inside the
+/// Lemonade archive the install verified, rather than inferring the outcome
+/// from an absent log line alone. The absent-line checks matter too: the
+/// revert path can fail to restore the pin (best-effort, matching its sibling
+/// warnings) while still printing no "Aligned ..." line, so absence of that
+/// line alone cannot distinguish a
 /// failed-restore from an honestly untouched pin -- hence also checking for
 /// the revert path's own "could not align ... reverting" warning, which does
 /// fire whenever a restore was attempted. `--reinstall` (the When's own
@@ -610,34 +692,79 @@ async fn assert_packaged_pin_survives(world: &mut E2eWorld) {
         "an alignment attempt ran (and failed) instead of never starting:\n{stderr}"
     );
 
+    let pinned_version = installed_therock_pin(output);
+    let packaged_version = packaged_therock_pin(output);
+    // Where the active SDK already is the packaged pin (a ROCm 10.1 SDK against
+    // Lemonade 2026.44.1) this cannot tell an untouched pin from one rewritten to
+    // the same value; the absent alignment and revert lines above are then the
+    // whole check.
+    assert_eq!(
+        pinned_version, packaged_version,
+        "the pin differs from the one the Lemonade archive ships even though the user opted out"
+    );
+}
+
+/// `therock.version` as the Lemonade embeddable archive the install verified
+/// ships it, read from the cached archive beside the runtime tree
+/// (`<root>/downloads/` next to `<root>/runtime`) with the system `tar`, which
+/// reads both the Linux `.tar.gz` and, as bsdtar on Windows, the `.zip`. The
+/// archive is the one named by the install's `env_id`
+/// (`lemonade-embeddable-<version>`): the downloads directory is never pruned,
+/// so a runner that installed an earlier pin still holds that archive too.
+fn packaged_therock_pin(output: &str) -> String {
     let env_path = output
         .lines()
         .find_map(|line| line.trim().strip_prefix("env_path: "))
         .unwrap_or_else(|| panic!("no env_path in install output:\n{output}"));
-    let backend_versions_path =
-        std::path::Path::new(env_path).join("resources/backend_versions.json");
-    let contents = std::fs::read_to_string(&backend_versions_path).unwrap_or_else(|error| {
-        panic!(
-            "failed to read {}: {error}",
-            backend_versions_path.display()
-        )
-    });
-    let parsed: serde_json::Value = serde_json::from_str(&contents).unwrap_or_else(|error| {
-        panic!(
-            "failed to parse {}: {error}",
-            backend_versions_path.display()
-        )
-    });
-    let pinned_version = parsed["therock"]["version"]
-        .as_str()
-        .unwrap_or_else(|| panic!("no therock.version in {}", backend_versions_path.display()));
-
-    let active_version = active_runtime_version(world);
-    assert_ne!(
-        pinned_version, active_version,
-        "the packaged pin was rewritten to the active ROCm SDK version even though the user \
-         opted out"
+    let env_id = output
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("env_id: "))
+        .unwrap_or_else(|| panic!("no env_id in install output:\n{output}"));
+    let archive_prefix = format!("{env_id}-");
+    let downloads = std::path::Path::new(env_path)
+        .parent()
+        .unwrap_or_else(|| panic!("env_path {env_path} has no parent"))
+        .join("downloads");
+    let archive = std::fs::read_dir(&downloads)
+        .unwrap_or_else(|error| panic!("failed to list {}: {error}", downloads.display()))
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name.starts_with(&archive_prefix)
+                        && (name.ends_with(".tar.gz") || name.ends_with(".zip"))
+                })
+        })
+        .unwrap_or_else(|| panic!("no cached {env_id} archive in {}", downloads.display()));
+    let name = archive
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    let stem = name
+        .strip_suffix(".tar.gz")
+        .or_else(|| name.strip_suffix(".zip"))
+        .unwrap_or(name);
+    let member = format!("{stem}/resources/backend_versions.json");
+    let extracted = std::process::Command::new("tar")
+        .arg("-xOf")
+        .arg(&archive)
+        .arg(&member)
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run tar on {}: {error}", archive.display()));
+    assert!(
+        extracted.status.success(),
+        "tar could not read {member} from {}: {}",
+        archive.display(),
+        String::from_utf8_lossy(&extracted.stderr)
     );
+    let parsed: serde_json::Value = serde_json::from_slice(&extracted.stdout)
+        .unwrap_or_else(|error| panic!("failed to parse {member}: {error}"));
+    parsed["therock"]["version"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no therock.version in {member}"))
+        .to_owned()
 }
 
 /// The engine inventory reports a usable engine runtime.

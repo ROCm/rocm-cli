@@ -95,7 +95,7 @@ pub(crate) fn prepare_llamacpp_backend_for_active_rocm(
                 disabled,
                 try_llamacpp_backend_alignment,
                 install_best_llamacpp_backend,
-                latest_llamacpp_rocm_stable_tag,
+                newest_llamacpp_rocm_stable_tag_for,
             )
         },
     )
@@ -341,7 +341,7 @@ fn install_pinned_backend_or_restore_packaged_pins(
 
 /// The Tier 1 / Tier 2 / revert state machine, isolated from the config and active-SDK
 /// lookups above so it can be exercised in tests against a temp `backend_versions.json`
-/// with the install/align/latest-tag steps injected, instead of spawning a real
+/// with the install/align/tag-lookup steps injected, instead of spawning a real
 /// `lemond` and reaching GitHub.
 ///
 /// `disabled` is the resolved value of [`lemonade_backend_alignment_disabled`], passed
@@ -365,7 +365,7 @@ fn align_llamacpp_backend_to_version(
     disabled: bool,
     mut align: impl FnMut(&mut LemonadeInstallManifest, &str, bool, &str) -> bool,
     mut fallback_install: impl FnMut(&mut LemonadeInstallManifest, bool) -> Result<()>,
-    mut latest_tag: impl FnMut() -> Result<String>,
+    mut newest_tag_with_asset: impl FnMut(&str) -> Result<String>,
 ) -> Result<Option<String>> {
     if disabled {
         fallback_install(manifest, false)?;
@@ -393,31 +393,41 @@ fn align_llamacpp_backend_to_version(
     // matching ROCm-version asset — Lemonade only started publishing per-ROCm-
     // version builds partway through its release history, and the embeddable's
     // pin (frozen at whatever build was current when this Lemonade version was
-    // cut) does not track that. Point at the current newest build instead, still
-    // paired with the active ROCm version, forcing a real reinstall attempt
-    // regardless of whatever Tier 1 left on disk.
+    // cut) does not track that. Point at the newest build that actually ships an
+    // archive for the active ROCm version instead, still paired with that version,
+    // forcing a real reinstall attempt regardless of whatever Tier 1 left on disk.
     let pinned_tag = read_backend_versions_llamacpp_tag(backend_versions_path);
-    let latest_tag_applied = match latest_tag() {
-        Ok(latest_tag) if pinned_tag.as_deref() != Some(latest_tag.as_str()) => {
-            match write_backend_versions_llamacpp_tag(backend_versions_path, &latest_tag) {
+    let found_tag_applied = match newest_tag_with_asset(target_version) {
+        Ok(tag) if pinned_tag.as_deref() != Some(tag.as_str()) => {
+            match write_backend_versions_llamacpp_tag(backend_versions_path, &tag) {
                 Ok(()) => true,
                 Err(error) => {
                     eprintln!(
-                        "Warning: could not pin Lemonade's backend to llama.cpp {latest_tag}: \
+                        "Warning: could not pin Lemonade's backend to llama.cpp {tag}: \
                          {error:#}"
                     );
                     false
                 }
             }
         }
-        // The pinned tag already is the latest — Tier 1 already tried it.
+        // The pinned tag already is that build — Tier 1 already tried it.
         Ok(_) => false,
         Err(error) => {
-            eprintln!("Warning: could not determine Lemonade's latest llama.cpp build: {error:#}");
+            eprintln!(
+                "Warning: could not look up a llama.cpp build that ships an archive for ROCm \
+                 {target_version}: {error:#}"
+            );
             false
         }
     };
-    if latest_tag_applied && align(manifest, target_version, true, "the latest llama.cpp build") {
+    if found_tag_applied
+        && align(
+            manifest,
+            target_version,
+            true,
+            "the newest llama.cpp build for this ROCm version",
+        )
+    {
         return Ok(Some(target_version.to_owned()));
     }
 
@@ -440,7 +450,7 @@ fn align_llamacpp_backend_to_version(
              ({pinned_version}): {error:#}"
         );
     }
-    if latest_tag_applied {
+    if found_tag_applied {
         // Best-effort, matching the therock.version restore above: a failure here
         // must not skip the fallback reinstall below. Restore the original tag when
         // there was one; otherwise Tier 2 pinned a key that did not exist before, so
@@ -549,19 +559,85 @@ const fn llamacpp_backend_alignment_succeeded(
 /// (and, at the time of writing, is) older than that.
 const LLAMACPP_ROCM_STABLE_REPO: &str = "lemonade-sdk/llama.cpp";
 
-/// The newest published release tag for [`LLAMACPP_ROCM_STABLE_REPO`] (e.g.
-/// `b10952`), queried directly rather than assumed — the whole reason Tier 2
-/// exists is that the embeddable's own pinned tag cannot be trusted to have a
-/// matching-ROCm-version asset.
-fn latest_llamacpp_rocm_stable_tag() -> Result<String> {
-    let url = format!("https://api.github.com/repos/{LLAMACPP_ROCM_STABLE_REPO}/releases/latest");
-    let timeout = Duration::from_secs(15);
+/// How many of [`LLAMACPP_ROCM_STABLE_REPO`]'s newest releases Tier 2 searches
+/// for one that ships the archive it needs. The repository publishes a build
+/// about twice a day, so this covers roughly the last two weeks; one listing page
+/// of this size is about 2 MB.
+const LLAMACPP_RELEASES_SEARCHED: usize = 30;
+
+/// The `llamacpp:rocm-stable` archive Lemonade downloads for build `tag` paired
+/// with ROCm `rocm_version` — the name Lemonade's own installer builds, from the
+/// ROCm version's `major.minor` (`10.1.0` -> `rocm-10.1`).
+fn llamacpp_rocm_stable_asset_name(tag: &str, rocm_version: &str, windows: bool) -> String {
+    let major_minor = rocm_version
+        .splitn(3, '.')
+        .take(2)
+        .collect::<Vec<_>>()
+        .join(".");
+    if windows {
+        format!("llama-{tag}-bin-win-rocm-{major_minor}-x64.zip")
+    } else {
+        format!("llama-{tag}-bin-ubuntu-rocm-{major_minor}-x64.tar.gz")
+    }
+}
+
+/// From a GitHub release listing (`GET /repos/{repo}/releases`), the tag of the
+/// most recently published release that actually ships the `llamacpp:rocm-stable`
+/// archive for `rocm_version` on this platform.
+///
+/// The newest release is not good enough on its own: a release can be published
+/// before, or without, its ROCm archives (`b12013` through `b12062` carry only
+/// qualification reports), and a build can skip one ROCm version or one platform.
+/// Drafts, prereleases and assets still uploading are skipped.
+fn newest_llamacpp_tag_with_asset(
+    releases: &Value,
+    rocm_version: &str,
+    windows: bool,
+) -> Option<String> {
+    releases
+        .as_array()?
+        .iter()
+        .filter(|release| {
+            !release
+                .get("draft")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+                && !release
+                    .get("prerelease")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+        })
+        .filter_map(|release| {
+            let tag = release.get("tag_name")?.as_str()?;
+            let wanted = llamacpp_rocm_stable_asset_name(tag, rocm_version, windows);
+            let ships_asset = release.get("assets")?.as_array()?.iter().any(|asset| {
+                asset.get("name").and_then(Value::as_str) == Some(wanted.as_str())
+                    && asset
+                        .get("state")
+                        .and_then(Value::as_str)
+                        .is_none_or(|state| state == "uploaded")
+            });
+            let published_at = release.get("published_at")?.as_str()?;
+            ships_asset.then_some((published_at, tag))
+        })
+        .max_by(|left, right| left.0.cmp(right.0))
+        .map(|(_, tag)| tag.to_owned())
+}
+
+/// The newest [`LLAMACPP_ROCM_STABLE_REPO`] build that ships an archive for
+/// `rocm_version` on this platform (e.g. `b12003`), queried directly rather than
+/// assumed — the whole reason Tier 2 exists is that the embeddable's own pinned
+/// tag cannot be trusted to have a matching-ROCm-version asset.
+fn newest_llamacpp_rocm_stable_tag_for(rocm_version: &str) -> Result<String> {
+    let url = format!(
+        "https://api.github.com/repos/{LLAMACPP_ROCM_STABLE_REPO}/releases?per_page={LLAMACPP_RELEASES_SEARCHED}"
+    );
     // `timeout_connect` takes precedence over `timeout` and defaults to 30s, so without
     // it a host that blackholes rather than refuses would stall well past the intended
-    // ceiling.
+    // ceiling. The overall timeout also covers reading the listing.
     let agent = ureq::AgentBuilder::new()
-        .timeout_connect(timeout)
-        .timeout(timeout)
+        .timeout_connect(Duration::from_secs(15))
+        .timeout(Duration::from_secs(30))
         .build();
     let response = agent
         .get(&url)
@@ -571,10 +647,14 @@ fn latest_llamacpp_rocm_stable_tag() -> Result<String> {
     let body: Value = response
         .into_json()
         .with_context(|| format!("failed to parse response from {url}"))?;
-    body.get("tag_name")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-        .with_context(|| format!("{url} response is missing 'tag_name'"))
+    let windows = runtime_is_windows();
+    newest_llamacpp_tag_with_asset(&body, rocm_version, windows).with_context(|| {
+        format!(
+            "none of the {LLAMACPP_RELEASES_SEARCHED} newest {LLAMACPP_ROCM_STABLE_REPO} \
+             releases ships {}",
+            llamacpp_rocm_stable_asset_name("<tag>", rocm_version, windows)
+        )
+    })
 }
 
 /// Read `resources/backend_versions.json`'s pinned `llamacpp.rocm-stable` build tag.
@@ -1013,8 +1093,8 @@ mod tests {
 
     #[test]
     fn plain_semver_accepts_release_versions_only() {
-        assert!(looks_like_plain_semver("10.0.0"));
-        assert!(looks_like_plain_semver("7.13.0"));
+        assert!(looks_like_plain_semver("7.14.0"));
+        assert!(looks_like_plain_semver("10.1.0"));
         assert!(!looks_like_plain_semver("7.14.0a20260601"));
         assert!(!looks_like_plain_semver("10.0"));
         assert!(!looks_like_plain_semver("10.0.0.1"));
@@ -1028,8 +1108,8 @@ mod tests {
         fs::write(
             &path,
             serde_json::to_vec_pretty(&json!({
-                "llamacpp": { "rocm-stable": "b9752" },
-                "therock": { "version": "7.13.0", "architectures": ["gfx1151"] },
+                "llamacpp": { "rocm-stable": "b11580" },
+                "therock": { "version": "10.1.0", "architectures": ["gfx1151"] },
             }))
             .unwrap(),
         )
@@ -1037,18 +1117,18 @@ mod tests {
 
         assert_eq!(
             read_backend_versions_therock_version(&path),
-            Some("7.13.0".to_owned())
+            Some("10.1.0".to_owned())
         );
 
-        write_backend_versions_therock_version(&path, "10.0.0").unwrap();
+        write_backend_versions_therock_version(&path, "7.14.0").unwrap();
         assert_eq!(
             read_backend_versions_therock_version(&path),
-            Some("10.0.0".to_owned())
+            Some("7.14.0".to_owned())
         );
 
         // Every other key, including sibling keys under `therock`, is preserved.
         let value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(value["llamacpp"]["rocm-stable"], "b9752");
+        assert_eq!(value["llamacpp"]["rocm-stable"], "b11580");
         assert_eq!(value["therock"]["architectures"][0], "gfx1151");
 
         fs::remove_dir_all(&dir).ok();
@@ -1065,7 +1145,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(read_backend_versions_therock_version(&path), None);
-        assert!(write_backend_versions_therock_version(&path, "10.0.0").is_err());
+        assert!(write_backend_versions_therock_version(&path, "7.14.0").is_err());
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -1077,8 +1157,8 @@ mod tests {
         fs::write(
             &path,
             serde_json::to_vec_pretty(&json!({
-                "llamacpp": { "rocm-stable": "b9752", "vulkan": "b9747" },
-                "therock": { "version": "7.13.0" },
+                "llamacpp": { "rocm-stable": "b11580", "vulkan": "b11393" },
+                "therock": { "version": "10.1.0" },
             }))
             .unwrap(),
         )
@@ -1086,20 +1166,20 @@ mod tests {
 
         assert_eq!(
             read_backend_versions_llamacpp_tag(&path),
-            Some("b9752".to_owned())
+            Some("b11580".to_owned())
         );
 
-        write_backend_versions_llamacpp_tag(&path, "b10952").unwrap();
+        write_backend_versions_llamacpp_tag(&path, "b12003").unwrap();
         assert_eq!(
             read_backend_versions_llamacpp_tag(&path),
-            Some("b10952".to_owned())
+            Some("b12003".to_owned())
         );
 
         // Sibling keys, including the unrelated `llamacpp.vulkan` tag and the
         // whole `therock` object, are preserved.
         let value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(value["llamacpp"]["vulkan"], "b9747");
-        assert_eq!(value["therock"]["version"], "7.13.0");
+        assert_eq!(value["llamacpp"]["vulkan"], "b11393");
+        assert_eq!(value["therock"]["version"], "10.1.0");
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -1115,7 +1195,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(read_backend_versions_llamacpp_tag(&path), None);
-        assert!(write_backend_versions_llamacpp_tag(&path, "b10952").is_err());
+        assert!(write_backend_versions_llamacpp_tag(&path, "b12003").is_err());
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -1287,7 +1367,7 @@ mod tests {
     #[test]
     fn align_honors_the_disabled_flag_without_touching_the_pin_or_the_injected_steps() {
         // This pins `align`'s own half of the opt-out contract in isolation: the pin
-        // and llama.cpp tag stay byte-identical and `align`/`latest_tag` are never
+        // and llama.cpp tag stay byte-identical and `align`/`newest_tag_with_asset` are never
         // called. The real production gate -- whether this function is even reached
         // with `disabled == true` in the first place -- lives one level up, in
         // `prepare_llamacpp_backend_for_active_rocm_impl`; see
@@ -1295,14 +1375,14 @@ mod tests {
         // below for that half.
         let dir = scratch_dir("align-disabled");
         let path = dir.join("backend_versions.json");
-        write_backend_versions_fixture(&path, "7.13.0", "b9752");
+        write_backend_versions_fixture(&path, "10.1.0", "b11580");
         let mut manifest = test_manifest(dir.clone());
 
         let result = align_llamacpp_backend_to_version(
             &mut manifest,
             &path,
-            "10.0.0",
-            "7.13.0",
+            "7.14.0",
+            "10.1.0",
             true,
             |_manifest, _target, _force_reinstall, _label| {
                 panic!("disabled means no alignment attempt of any kind")
@@ -1314,18 +1394,18 @@ mod tests {
                 );
                 Ok(())
             },
-            || panic!("disabled means tier 2's tag lookup must not run either"),
+            |_target| panic!("disabled means tier 2's tag lookup must not run either"),
         );
 
         assert_eq!(result.unwrap(), None);
         assert_eq!(
             read_backend_versions_therock_version(&path),
-            Some("7.13.0".to_owned()),
+            Some("10.1.0".to_owned()),
             "the packaged pin must survive untouched when alignment is disabled"
         );
         assert_eq!(
             read_backend_versions_llamacpp_tag(&path),
-            Some("b9752".to_owned()),
+            Some("b11580".to_owned()),
             "the packaged llama.cpp tag must survive untouched when alignment is disabled"
         );
         fs::remove_dir_all(&dir).ok();
@@ -1411,8 +1491,8 @@ mod tests {
             &mut manifest,
             false,
             false,
-            || Ok(Some("10.0.0".to_owned())),
-            |_path| Some("7.13.0".to_owned()),
+            || Ok(Some("7.14.0".to_owned())),
+            |_path| Some("10.1.0".to_owned()),
             |_manifest| Err(anyhow!("lemond failed to start")),
             |_manifest, force_reinstall| {
                 assert!(
@@ -1894,14 +1974,14 @@ mod tests {
     fn align_tier1_success_keeps_target_version_pinned() {
         let dir = scratch_dir("align-tier1-success");
         let path = dir.join("backend_versions.json");
-        write_backend_versions_fixture(&path, "7.13.0", "b9752");
+        write_backend_versions_fixture(&path, "10.1.0", "b11580");
         let mut manifest = test_manifest(dir.clone());
 
         let result = align_llamacpp_backend_to_version(
             &mut manifest,
             &path,
-            "10.0.0",
-            "7.13.0",
+            "7.14.0",
+            "10.1.0",
             false,
             |_manifest, _target, force_reinstall, _label| {
                 // A stale backend installed against the OLD pin must not be able to
@@ -1911,30 +1991,176 @@ mod tests {
                 true
             },
             |_manifest, _force_reinstall| panic!("tier 1 succeeded; no fallback install"),
-            || panic!("tier 1 succeeded; tier 2's tag lookup must not run"),
+            |_target| panic!("tier 1 succeeded; tier 2's tag lookup must not run"),
         );
 
-        assert_eq!(result.unwrap(), Some("10.0.0".to_owned()));
+        assert_eq!(result.unwrap(), Some("7.14.0".to_owned()));
         assert_eq!(
             read_backend_versions_therock_version(&path),
-            Some("10.0.0".to_owned())
+            Some("7.14.0".to_owned())
         );
         fs::remove_dir_all(&dir).ok();
+    }
+
+    /// One `GET /repos/lemonade-sdk/llama.cpp/releases` entry, trimmed to the
+    /// fields Tier 2 reads.
+    fn llamacpp_release(tag: &str, published_at: &str, assets: &[&str]) -> Value {
+        json!({
+            "tag_name": tag,
+            "draft": false,
+            "prerelease": false,
+            "published_at": published_at,
+            "assets": assets
+                .iter()
+                .map(|name| json!({ "name": name, "state": "uploaded" }))
+                .collect::<Vec<_>>(),
+        })
+    }
+
+    /// Synthetic, modelled on the real listing in early November 2026, where
+    /// b12062 carries only qualification reports and b11997 no ROCm 7.14
+    /// archive. The real b12003 ships both platforms; here it ships Linux
+    /// archives only, so Linux and Windows pick different builds.
+    fn llamacpp_releases_fixture() -> Value {
+        json!([
+            llamacpp_release(
+                "b12062",
+                "2026-11-03T03:41:03Z",
+                &[
+                    "qualification-llama-b12062-bin-ubuntu-rocm-10.1-x64.json",
+                    "qualification-llama-b12062-bin-ubuntu-rocm-7.14-x64.json",
+                ],
+            ),
+            llamacpp_release(
+                "b12003",
+                "2026-10-30T03:47:50Z",
+                &[
+                    "llama-b12003-bin-ubuntu-rocm-10.1-x64.tar.gz",
+                    "llama-b12003-bin-ubuntu-rocm-7.14-x64.tar.gz",
+                ],
+            ),
+            llamacpp_release(
+                "b11997",
+                "2026-10-29T16:11:35Z",
+                &[
+                    "llama-b11997-bin-ubuntu-rocm-10.1-x64.tar.gz",
+                    "llama-b11997-bin-win-rocm-10.1-x64.zip",
+                    "qualification-llama-b11997-bin-ubuntu-rocm-7.14-x64.json",
+                ],
+            ),
+            llamacpp_release(
+                "b11972",
+                "2026-10-29T00:43:52Z",
+                &[
+                    "llama-b11972-bin-ubuntu-rocm-10.1-x64.tar.gz",
+                    "llama-b11972-bin-ubuntu-rocm-7.14-x64.tar.gz",
+                    "llama-b11972-bin-win-rocm-10.1-x64.zip",
+                    "llama-b11972-bin-win-rocm-7.14-x64.zip",
+                ],
+            ),
+        ])
+    }
+
+    #[test]
+    fn llamacpp_asset_name_matches_what_lemonade_downloads() {
+        assert_eq!(
+            llamacpp_rocm_stable_asset_name("b11580", "10.1.0", false),
+            "llama-b11580-bin-ubuntu-rocm-10.1-x64.tar.gz"
+        );
+        assert_eq!(
+            llamacpp_rocm_stable_asset_name("b11580", "7.14.0", true),
+            "llama-b11580-bin-win-rocm-7.14-x64.zip"
+        );
+    }
+
+    #[test]
+    fn tier2_skips_a_newer_release_that_does_not_ship_the_archive() {
+        let releases = llamacpp_releases_fixture();
+        assert_eq!(
+            newest_llamacpp_tag_with_asset(&releases, "10.1.0", false).as_deref(),
+            Some("b12003"),
+            "the newest release ships only qualification reports"
+        );
+        assert_eq!(
+            newest_llamacpp_tag_with_asset(&releases, "10.1.0", true).as_deref(),
+            Some("b11997"),
+            "b12003 ships no Windows archive"
+        );
+        assert_eq!(
+            newest_llamacpp_tag_with_asset(&releases, "7.14.0", false).as_deref(),
+            Some("b12003")
+        );
+        assert_eq!(
+            newest_llamacpp_tag_with_asset(&releases, "7.14.0", true).as_deref(),
+            Some("b11972"),
+            "b12003 ships no Windows archive and b11997 no ROCm 7.14 archive"
+        );
+        assert_eq!(
+            newest_llamacpp_tag_with_asset(&releases, "7.13.0", false),
+            None,
+            "no release ships ROCm 7.13"
+        );
+    }
+
+    #[test]
+    fn tier2_picks_by_publication_date_and_skips_unfinished_releases() {
+        let mut draft = llamacpp_release(
+            "b12100",
+            "2026-11-04T00:00:00Z",
+            &["llama-b12100-bin-ubuntu-rocm-10.1-x64.tar.gz"],
+        );
+        draft["draft"] = json!(true);
+        let mut prerelease = llamacpp_release(
+            "b12101",
+            "2026-11-04T01:00:00Z",
+            &["llama-b12101-bin-ubuntu-rocm-10.1-x64.tar.gz"],
+        );
+        prerelease["prerelease"] = json!(true);
+        let mut uploading = llamacpp_release(
+            "b12102",
+            "2026-11-04T02:00:00Z",
+            &["llama-b12102-bin-ubuntu-rocm-10.1-x64.tar.gz"],
+        );
+        uploading["assets"][0]["state"] = json!("open");
+        // Listed out of date order: the listing's order is not trusted.
+        let releases = json!([
+            llamacpp_release(
+                "b11900",
+                "2026-10-26T14:08:13Z",
+                &["llama-b11900-bin-ubuntu-rocm-10.1-x64.tar.gz"],
+            ),
+            draft,
+            prerelease,
+            uploading,
+            llamacpp_release(
+                "b11945",
+                "2026-10-28T00:47:33Z",
+                &["llama-b11945-bin-ubuntu-rocm-10.1-x64.tar.gz"],
+            ),
+        ]);
+        assert_eq!(
+            newest_llamacpp_tag_with_asset(&releases, "10.1.0", false).as_deref(),
+            Some("b11945")
+        );
+        assert_eq!(
+            newest_llamacpp_tag_with_asset(&json!({}), "10.1.0", false),
+            None
+        );
     }
 
     #[test]
     fn align_falls_through_to_tier2_and_succeeds() {
         let dir = scratch_dir("align-tier2-success");
         let path = dir.join("backend_versions.json");
-        write_backend_versions_fixture(&path, "7.13.0", "b9752");
+        write_backend_versions_fixture(&path, "10.1.0", "b11580");
         let mut manifest = test_manifest(dir.clone());
         let mut align_calls = 0;
 
         let result = align_llamacpp_backend_to_version(
             &mut manifest,
             &path,
-            "10.0.0",
-            "7.13.0",
+            "7.14.0",
+            "10.1.0",
             false,
             |_manifest, _target, force_reinstall, _label| {
                 // Both tiers force a reinstall now, so the mock can no longer use
@@ -1948,18 +2174,24 @@ mod tests {
                 align_calls > 1
             },
             |_manifest, _force_reinstall| panic!("tier 2 succeeded; no fallback install"),
-            || Ok("b10952".to_owned()),
+            |target| {
+                assert_eq!(
+                    target, "7.14.0",
+                    "tier 2 looks for a build that ships the active ROCm version's archive"
+                );
+                Ok("b12003".to_owned())
+            },
         );
 
-        assert_eq!(result.unwrap(), Some("10.0.0".to_owned()));
+        assert_eq!(result.unwrap(), Some("7.14.0".to_owned()));
         assert_eq!(align_calls, 2, "both tiers were attempted");
         assert_eq!(
             read_backend_versions_therock_version(&path),
-            Some("10.0.0".to_owned())
+            Some("7.14.0".to_owned())
         );
         assert_eq!(
             read_backend_versions_llamacpp_tag(&path),
-            Some("b10952".to_owned()),
+            Some("b12003".to_owned()),
             "tier 2 pins the newer llama.cpp tag"
         );
         fs::remove_dir_all(&dir).ok();
@@ -1973,31 +2205,31 @@ mod tests {
         // value rather than staying on Tier 2's newer pin.
         let dir = scratch_dir("align-revert-restores-tag");
         let path = dir.join("backend_versions.json");
-        write_backend_versions_fixture(&path, "7.13.0", "b9752");
+        write_backend_versions_fixture(&path, "10.1.0", "b11580");
         let mut manifest = test_manifest(dir.clone());
 
         let result = align_llamacpp_backend_to_version(
             &mut manifest,
             &path,
-            "10.0.0",
-            "7.13.0",
+            "7.14.0",
+            "10.1.0",
             false,
             |_manifest, _target, _force_reinstall, _label| false,
             |_manifest, force_reinstall| {
                 assert!(force_reinstall);
                 Ok(())
             },
-            || Ok("b10952".to_owned()),
+            |_target| Ok("b12003".to_owned()),
         );
 
         assert_eq!(result.unwrap(), None);
         assert_eq!(
             read_backend_versions_therock_version(&path),
-            Some("7.13.0".to_owned())
+            Some("10.1.0".to_owned())
         );
         assert_eq!(
             read_backend_versions_llamacpp_tag(&path),
-            Some("b9752".to_owned()),
+            Some("b11580".to_owned()),
             "the llama.cpp tag must be restored to its original value, not left on Tier 2's pin"
         );
         fs::remove_dir_all(&dir).ok();
@@ -2015,7 +2247,7 @@ mod tests {
             &path,
             serde_json::to_vec_pretty(&json!({
                 "llamacpp": {},
-                "therock": { "version": "7.13.0" },
+                "therock": { "version": "10.1.0" },
             }))
             .unwrap(),
         )
@@ -2025,15 +2257,15 @@ mod tests {
         let result = align_llamacpp_backend_to_version(
             &mut manifest,
             &path,
-            "10.0.0",
-            "7.13.0",
+            "7.14.0",
+            "10.1.0",
             false,
             |_manifest, _target, _force_reinstall, _label| false,
             |_manifest, force_reinstall| {
                 assert!(force_reinstall);
                 Ok(())
             },
-            || Ok("b10952".to_owned()),
+            |_target| Ok("b12003".to_owned()),
         );
 
         assert_eq!(result.unwrap(), None);
@@ -2046,18 +2278,18 @@ mod tests {
     }
 
     #[test]
-    fn align_skips_tier2_reinstall_when_pinned_tag_is_already_latest() {
+    fn align_skips_tier2_reinstall_when_the_pinned_tag_is_the_one_found() {
         let dir = scratch_dir("align-tier2-tag-unchanged");
         let path = dir.join("backend_versions.json");
-        write_backend_versions_fixture(&path, "7.13.0", "b9752");
+        write_backend_versions_fixture(&path, "10.1.0", "b11580");
         let mut manifest = test_manifest(dir.clone());
         let mut align_calls = 0;
 
         let result = align_llamacpp_backend_to_version(
             &mut manifest,
             &path,
-            "10.0.0",
-            "7.13.0",
+            "7.14.0",
+            "10.1.0",
             false,
             |_manifest, _target, _force_reinstall, _label| {
                 align_calls += 1;
@@ -2070,15 +2302,16 @@ mod tests {
                 );
                 Ok(())
             },
-            // Already the latest tag: Tier 2's own reinstall must not be attempted.
-            || Ok("b9752".to_owned()),
+            // The pinned tag is the build Tier 2 found, which Tier 1 already tried:
+            // Tier 2's own reinstall must not be attempted.
+            |_target| Ok("b11580".to_owned()),
         );
 
         assert_eq!(result.unwrap(), None);
         assert_eq!(align_calls, 1, "only tier 1 was attempted");
         assert_eq!(
             read_backend_versions_therock_version(&path),
-            Some("7.13.0".to_owned()),
+            Some("10.1.0".to_owned()),
             "reverted to the original pinned version"
         );
         fs::remove_dir_all(&dir).ok();
@@ -2091,7 +2324,7 @@ mod tests {
         // path, and every sibling warning in this function is best-effort.
         let dir = scratch_dir("align-revert-write-fails");
         let path = dir.join("backend_versions.json");
-        write_backend_versions_fixture(&path, "7.13.0", "b9752");
+        write_backend_versions_fixture(&path, "10.1.0", "b11580");
         let mut manifest = test_manifest(dir.clone());
         let mut fallback_called = false;
 
@@ -2100,8 +2333,8 @@ mod tests {
         let result = align_llamacpp_backend_to_version(
             &mut manifest,
             &path,
-            "10.0.0",
-            "7.13.0",
+            "7.14.0",
+            "10.1.0",
             false,
             |_manifest, _target, _force_reinstall, _label| {
                 fs::write(
@@ -2116,7 +2349,7 @@ mod tests {
                 assert!(force_reinstall);
                 Ok(())
             },
-            || bail!("network unavailable"),
+            |_target| bail!("network unavailable"),
         );
 
         assert_eq!(
@@ -2137,7 +2370,7 @@ mod tests {
         // the pre-existing backend must come back rather than staying deleted.
         let dir = scratch_dir("align-revert-fallback-install-fails");
         let path = dir.join("backend_versions.json");
-        write_backend_versions_fixture(&path, "7.13.0", "b9752");
+        write_backend_versions_fixture(&path, "10.1.0", "b11580");
         let mut manifest = test_manifest(dir.clone());
         let llamacpp = dir.join("bin").join("llamacpp");
         let server = platform_binary_name("llama-server");
@@ -2148,15 +2381,15 @@ mod tests {
         let result = align_llamacpp_backend_to_version(
             &mut manifest,
             &path,
-            "10.0.0",
-            "7.13.0",
+            "7.14.0",
+            "10.1.0",
             false,
             |_manifest, _target, _force_reinstall, _label| false,
             |_manifest, force_reinstall| {
                 assert!(force_reinstall);
                 bail!("network unavailable")
             },
-            || Ok("b10952".to_owned()),
+            |_target| Ok("b12003".to_owned()),
         );
 
         assert!(

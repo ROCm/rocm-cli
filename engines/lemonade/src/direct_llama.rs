@@ -480,7 +480,7 @@ const DIRECT_LLAMA_SERVER_BACKENDS: [&str; 4] = ["rocm-stable", "rocm-nightly", 
 ///
 /// Lemonade's backend installer extracts some llama.cpp releases straight into
 /// `<backend>/`, but others land one level deeper under a build-numbered directory
-/// (e.g. `rocm-stable/llama-b9752/llama-server`), so both layouts are checked.
+/// (e.g. `rocm-stable/llama-b11580/llama-server`), so both layouts are checked.
 pub(crate) fn find_llama_server_binary(manifest: &LemonadeInstallManifest) -> Option<PathBuf> {
     let llamacpp_dir = manifest.runtime_dir.join("bin").join("llamacpp");
     let binary = platform_binary_name("llama-server");
@@ -828,11 +828,11 @@ mod tests {
     #[test]
     fn find_llama_server_binary_finds_build_numbered_nesting() {
         // Some Lemonade llama.cpp releases extract one level deeper than
-        // `<backend>/llama-server`, e.g. `rocm-stable/llama-b9752/llama-server`.
+        // `<backend>/llama-server`, e.g. `rocm-stable/llama-b11580/llama-server`.
         let dir = scratch_dir("find-server-nested");
         let runtime_dir = dir.join("runtime");
         let llamacpp = runtime_dir.join("bin").join("llamacpp");
-        let nested = llamacpp.join("rocm-stable").join("llama-b9752");
+        let nested = llamacpp.join("rocm-stable").join("llama-b11580");
         fs::create_dir_all(&nested).unwrap();
         let server = nested.join(platform_binary_name("llama-server"));
         fs::write(&server, b"x").unwrap();

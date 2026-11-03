@@ -271,11 +271,11 @@ pub fn lemonade_embeddable_fallback_version() -> String {
 /// and locate the server binary. Pure data; no I/O.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmbeddableArtifact {
-    /// Version without a leading `v`, e.g. `11.5.1`.
+    /// Version without a leading `v`, e.g. `2026.44.1`.
     pub version: String,
     /// The archive's `browser_download_url`.
     pub url: String,
-    /// The archive file name, e.g. `lemonade-embeddable-11.5.1-ubuntu-x64.tar.gz`.
+    /// The archive file name, e.g. `lemonade-embeddable-2026.44.1-ubuntu-x64.tar.gz`.
     pub archive_name: String,
     /// The unpacked server executable name (`lemond` / `lemond.exe`).
     pub server_bin: String,
@@ -303,7 +303,7 @@ fn server_bin_for(os: &str) -> &'static str {
     }
 }
 
-/// Strip a leading `v` from a release tag (`v11.5.1` → `11.5.1`).
+/// Strip a leading `v` from a release tag (`v2026.44.1` → `2026.44.1`).
 fn strip_v(tag: &str) -> &str {
     rocm_deps::strip_v(tag)
 }
