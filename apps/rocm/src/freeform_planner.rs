@@ -368,11 +368,7 @@ fn build_freeform_plan_on(
             .or(requested_model)
             .unwrap_or("<model>");
         let engine = infer_engine_from_request(&lower)
-            .or_else(|| {
-                resolved_recipe
-                    .as_ref()
-                    .and_then(|recipe| recipe.preferred_engines.first().map(String::as_str))
-            })
+            .or_else(|| resolved_recipe.as_ref().and_then(planner_recipe_engine))
             .unwrap_or(default_engine);
         let device_policy = infer_device_policy_from_request(&lower).or_else(|| {
             resolved_recipe
@@ -1139,6 +1135,17 @@ pub(crate) fn render_structured_request_plan(
     output
 }
 
+/// The recipe's first preferred engine, unless it is AIM with another engine
+/// listed behind it. AIM is host-gated (GPU family, platform, Hugging Face
+/// token), so the planner leaves the engine to the host default instead of
+/// emitting an explicit `--engine aim` that `rocm serve` would never override.
+/// An AIM-only recipe has no alternative and keeps AIM.
+pub(crate) fn planner_recipe_engine(recipe: &ModelRecipeRecord) -> Option<&str> {
+    let first = recipe.preferred_engines.first()?;
+    (!(first.eq_ignore_ascii_case("aim") && recipe.preferred_engines.len() > 1))
+        .then_some(first.as_str())
+}
+
 fn planner_is_serve_request(lower: &str) -> bool {
     lower.contains("serve")
         || lower.contains("run a small local model")
@@ -1344,6 +1351,44 @@ mod tests {
                         "--managed".to_owned(),
                     ]
         }));
+    }
+
+    #[test]
+    fn planner_does_not_emit_host_gated_aim_as_an_explicit_engine() {
+        // `Qwen/Qwen3-32B` lists `aim` first with `vllm` behind it; `rocm serve`
+        // never overrides an explicit `--engine aim`, so the plan must not name it.
+        let recipe = resolve_builtin_model_recipe("Qwen/Qwen3-32B").expect("catalogued id");
+        assert_eq!(
+            recipe.preferred_engines.first().map(String::as_str),
+            Some("aim")
+        );
+        assert_eq!(planner_recipe_engine(&recipe), None);
+        let plan = build_freeform_plan_with_recipes(
+            "serve Qwen/Qwen3-32B",
+            &RocmCliConfig::default(),
+            Some(&[recipe]),
+            "vllm",
+        );
+        assert!(
+            plan.parsed
+                .contains(&("engine".to_owned(), "vllm".to_owned())),
+            "{:?}",
+            plan.parsed
+        );
+        // An explicit request for AIM is still honoured.
+        let explicit = build_freeform_plan_with_recipes(
+            "serve Qwen/Qwen3-32B with aim",
+            &RocmCliConfig::default(),
+            None,
+            "vllm",
+        );
+        assert!(
+            explicit
+                .parsed
+                .contains(&("engine".to_owned(), "aim".to_owned())),
+            "{:?}",
+            explicit.parsed
+        );
     }
 
     #[test]

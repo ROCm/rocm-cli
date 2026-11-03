@@ -31,16 +31,17 @@ for Lemonade and vLLM.
 | Platform | Prebuilt binary | Notes |
 |---|---|---|
 | Linux (x86_64) | Yes | Ubuntu 24.04 or newer; full support, including the live dashboard and both inference engines |
-| Windows (x86_64) | Yes | CLI and Lemonade serving; no live dashboard or vLLM |
+| Windows (x86_64) | Yes | CLI and Lemonade serving; live dashboard shows GPU/CPU/memory but not the serving-instance registry; no vLLM |
 | WSL2 (x86_64) | Yes (Linux binary) | Ubuntu 24.04 or newer; full support, including the live dashboard |
 | macOS | No | No official installer, release, CI, or QA coverage |
 <!-- platform-support-table-end -->
 
 For WSL2 setup and diagnosis, see [docs/wsl.md](docs/wsl.md).
 
-Live dashboard telemetry requires Linux or WSL2 (see
-[Interactive interfaces](#interactive-interfaces)). vLLM serving is Linux or WSL2
-only (see [docs/vllm.md](docs/vllm.md)).
+Live dashboard telemetry works on Windows too, but shows only GPU/CPU/memory —
+the serving-instance registry view needs the `rocmdashd` unix socket, so it's
+Linux/WSL2 only (see [Interactive interfaces](#interactive-interfaces)). vLLM
+serving is Linux or WSL2 only (see [docs/vllm.md](docs/vllm.md)).
 
 The minimum supported Linux release, native or under WSL2, is Ubuntu 24.04. On
 other distributions the equivalent requirement is glibc 2.38 with
@@ -226,9 +227,10 @@ five tabs (switch with `Tab`/`Shift+Tab` or number keys `1`–`5`):
 | **Observe** | Live GPU utilization, instances, and benchmark telemetry |
 | **Chat** | Assistant chat backed by a local server or configured provider |
 
-Live mode reads telemetry over a Unix domain socket, so it requires Linux or
-WSL2. Use `rocm dash --demo` for a synthetic session that runs anywhere without a
-GPU or daemon.
+Live mode works on Windows too, but shows only GPU/CPU/memory — the
+serving-instance registry needs the Unix domain socket telemetry, so that view
+is Linux/WSL2 only. Use `rocm dash --demo` for a synthetic session that runs
+anywhere without a GPU or daemon.
 
 ## Configure ROCm and serve a model
 
@@ -821,7 +823,14 @@ rocm model [--verbose]
 `rocm model` (alias `rocm models`) lists the recommended local models, grouped by
 the hardware they target. Pass `--verbose` to list every recipe, including ones
 hidden from the default list, with details such as aliases, data type, minimum
-GPU memory, and preferred engines.
+GPU memory, and preferred engines. The AMD Inference Microservices (AIM) Docker
+images are among the hidden recipes: `--verbose` shows each one's supported GPU
+families, the GPU count it needs per family, and whether it needs a Hugging Face
+token (`requires_hf_token=yes`), and
+`rocm serve <model> --engine aim` runs it (needs a reachable Docker daemon).
+AIM entries are hand-maintained and record when they were last verified;
+`rocm model --verbose` warns when one is over 180 days old (see
+`docs/aim-catalog.md`).
 
 ### Model serving
 
@@ -912,7 +921,10 @@ instead of silently substituting a different model.
 
 Some models (such as Llama) are gated and require Hugging Face authentication.
 Log in with `huggingface-cli login` or set `HF_TOKEN` in your environment
-before serving gated models.
+before serving gated models. The exception is `--engine aim`, whose container
+does not read your environment on its own: export `HF_TOKEN` and pass
+`--engine-env HF_TOKEN` (see above), or `rocm serve` refuses a gated AIM image
+before pulling anything.
 
 `--gpu` selects which AMD GPU the server runs on. `auto` (the default) probes
 per-GPU VRAM (through `amd-smi`, or the amdgpu DRM sysfs counters when `amd-smi`
@@ -925,6 +937,60 @@ The selected GPU is exposed to the engine through `HIP_VISIBLE_DEVICES`. Serving
 one model across multiple GPUs is not supported. Because selection uses the
 `amd-smi` ordinal but is applied through `HIP_VISIBLE_DEVICES`, ROCm CLI warns
 when `ROCR_VISIBLE_DEVICES` is set, because the two orderings can diverge.
+
+#### Reuse is exempt from the no-GPU refusal
+
+Under the default `gpu_required` policy, `rocm serve` on a host with no usable
+AMD GPU fails fast with `no usable AMD GPU detected`, before any engine is
+prepared or downloaded. A `rocm serve` that matches an **already-running
+managed service for the same engine and model** now skips that refusal and
+prints the reuse summary instead. This is a real change to a refusal you may be
+relying on: on a GPU-less host, `rocm serve <model>` can now succeed where it
+previously always failed.
+
+The exemption is limited to that case, and nothing else about `gpu_required`
+changes. The reused service was vetted against the policy at its own launch,
+and the reusing invocation launches no process and does no GPU work. A live
+service for a different engine does not soften the refusal, and neither does one
+for a model whose name does not overlap — those still fail fast with the usual
+message and prepare nothing.
+
+Matching the engine and model is necessary but not sufficient. The exemption
+applies only when the service would *actually* be reused, and that is decided by
+exactly the predicate the launch itself applies: the recipe settings must match
+(the sampling-control rule under [Model serving](#model-serving) above), a
+`--require-api-key` request must be satisfiable by a service that already has a
+key, and the service's recorded device policy must satisfy this one — a
+`gpu_required` serve is not reused from a service recorded as `cpu_only`. That
+is the only policy pair refused; any other combination, including a record that
+predates the field and so names no policy at all, is accepted. (No `rocm serve`
+can record a `cpu_only` service today — `--device cpu_only` is refused outright,
+since CPU is not a fallback path here — so that term is a guard, not a refusal
+you will meet.) A live service that fails any of those is not reusable, so it
+buys no bypass: `rocm serve` refuses on the GPU instead, which is the accurate
+message and leaves your running server alone. (Telling you to stop it and re-run
+would not help: the re-run would have nothing left to reuse and would hit the
+same GPU refusal.)
+
+Two limits are worth stating exactly, because they are easy to read as stronger
+than they are:
+
+- **Model names are matched leniently.** The check that decides whether reuse is
+  even worth asking about uses the same two-way substring match the service
+  listings use, so a live `qwen3-8b-instruct` service opens it for
+  `rocm serve qwen`. On a GPU-less host that invocation then does engine
+  preparation — possibly printing `Preparing <engine> for GPU serving...` and
+  installing — *before* the refusal it ultimately gets, and if that preparation
+  fails you get its error rather than the GPU one. Leniency is deliberate:
+  tightening it would silently break legitimate reuse by short name. Only a
+  model name that does not overlap is guaranteed to refuse first with nothing
+  prepared.
+- **The exemption does not apply with an explicit `--gpu <index>`.** It skips
+  the no-usable-GPU bail, not the pinned-index check that follows it — and that
+  check refuses *every* index on a host with no usable GPU, because there is no
+  visible ordinal for one to name. So `rocm serve <model> --gpu 0` is refused on
+  a GPU-less host whether or not a reusable service is running, and so is
+  `--gpu 1`, and so on. The exemption applies under the default `--gpu auto`.
 
 Manage background servers started with `--managed`:
 
@@ -1023,7 +1089,9 @@ For `rocm dash`:
 - `--demo` runs a deterministic synthetic session with no GPU or daemon needed.
   It works on all platforms.
 - `--replay <file>` replays a recorded NDJSON session.
-- Live mode requires Unix domain sockets (Linux and WSL2 only).
+- Live mode works on Windows too, but shows only GPU/CPU/memory — there's no
+  `rocmdashd` unix socket to connect to there, so the serving-instance
+  registry view stays empty (Linux and WSL2 get the full live view).
 
 ### Bench
 
@@ -1233,7 +1301,12 @@ you pass `--yes`. Each `--keep-*` flag skips the removal of one category:
   the managed `uv` package cache, which `--keep-data` controls.
 
 By default, the configuration and data directories are both `~/.rocm`, and the
-cache directory is `~/.rocm/cache`. `uninstall` removes a category's directory
+cache directory is `~/.rocm/cache`. The `ROCM_CLI_CONFIG_DIR`,
+`ROCM_CLI_DATA_DIR`, and `ROCM_CLI_CACHE_DIR` environment variables move them;
+when only `ROCM_CLI_DATA_DIR` is set, the cache directory moves with it, to
+`<data directory>/cache`. A cache that an earlier version kept at `~/.rocm/cache`
+while only `ROCM_CLI_DATA_DIR` was set is no longer used or removed by `rocm
+uninstall`; delete it by hand if you don't need it. `uninstall` removes a category's directory
 unless you keep that category, so on a default installation a flag doesn't
 protect its files by itself. To keep your settings and data, pass `--keep-config`
 and `--keep-data` together. Run with `--dry-run` first to confirm what is kept.

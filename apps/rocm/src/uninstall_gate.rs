@@ -18,10 +18,9 @@ use std::time::Duration;
 
 use crate::chat::loopback_tcp_port_is_reachable;
 use crate::services_text::{MANAGED_STOP_GRACE, stop_internal_managed_service_confirmed};
-use crate::{
-    endpoint_keys, host_port_resolves, load_managed_services, managed_service_is_live,
-    managed_service_record_is_in_use,
-};
+use crate::managed_service_status::{load_managed_services, managed_service_is_live};
+use crate::service_records::managed_service_record_is_in_use;
+use crate::{endpoint_keys, host_port_resolves};
 
 /// A managed service uninstall could not confirm stopped, and why.
 ///
