@@ -37,29 +37,37 @@ truthy() {
   esac
 }
 
-# Width to draw a download progress bar at, or empty when the bar should be
-# suppressed. curl sizes its bar from COLUMNS whenever that variable parses to
-# a sane number, in preference to asking the terminal, and then draws a line
-# exactly that wide. A COLUMNS left over from a wider window -- routine when a
-# terminal is resized after the shell starts -- therefore makes every refresh
-# run past the right margin, wrap, and leave the previous bar on screen, so a
-# single download arrives as a stack of partial bars and a percentage split
-# across two rows. Measuring the terminal here and passing that down puts the
-# real width back in charge, and reserving the last column keeps the line clear
-# of the margin even if the measurement is off by one. curl ignores a COLUMNS
-# of 20 or less, so terminals that narrow report no width and download quietly
-# instead of wrapping.
+# Width to draw a download progress bar at, or empty when no bar should be
+# drawn. curl sizes its bar from COLUMNS whenever that variable parses to a
+# sane number, in preference to asking the terminal, and then draws a line
+# exactly that wide. A COLUMNS left over from a wider window, routine when a
+# terminal is resized after the shell starts, therefore makes every refresh run
+# past the right margin and wrap; the carriage return ending each frame then
+# returns to the start of the wrapped row rather than the bar's, so each redraw
+# paints a row lower and one download arrives as a stack of partial bars with
+# its percentage torn across two rows. Measuring the terminal here and passing
+# that width down puts the real one back in charge, and reserving the last
+# column keeps the line clear of the margin if the measurement is off by one.
 progress_bar_width() {
   width=""
   if command -v stty >/dev/null 2>&1; then
+    # fd 2 is what fetch() gates the bar on, and the only descriptor still
+    # attached to the terminal under `curl ... | sh`, where stdin is the pipe.
     width="$(stty size <&2 2>/dev/null | awk '{print $2}')"
   fi
+  # A terminal whose window size was never set (a freshly opened pty, say)
+  # reports 0. That means "unmeasured", not "extremely narrow", so fall through
+  # to the other sources rather than treating it as a width and dropping the
+  # bar that curl would otherwise have drawn at its own default.
+  [ "${width}" = "0" ] && width=""
   if [ -z "${width}" ] && command -v tput >/dev/null 2>&1; then
-    # Blank COLUMNS for this call. ncurses consults it before asking the
-    # terminal, so leaving it set would hand back the same stale width this
-    # function exists to get away from.
-    width="$(COLUMNS='' tput cols 2>/dev/null || true)"
+    # Read fd 2 here too: tput otherwise sizes from its own stdin, which under
+    # `curl ... | sh` is the pipe, making ncurses report its 80-column default
+    # instead of the terminal. COLUMNS is blanked because ncurses consults it
+    # first, and would hand back the stale value this function exists to escape.
+    width="$(COLUMNS='' tput cols <&2 2>/dev/null || true)"
   fi
+  [ "${width}" = "0" ] && width=""
   if [ -z "${width}" ]; then
     width="${COLUMNS:-80}"
   fi
@@ -67,28 +75,31 @@ progress_bar_width() {
     "" | *[!0-9]*) width=80 ;;
     *) : ;;
   esac
+  # Strip leading zeros. A zero-padded value such as 080 passes the digit check
+  # above but is an octal literal to POSIX arithmetic, which dash rejects
+  # outright ("Illegal number: 080"). bash's 10# prefix would force base 10 but
+  # is not POSIX, and dash rejects that too, so do it by hand.
+  while :; do
+    case "${width}" in
+      0[0-9]*) width="${width#0}" ;;
+      *) break ;;
+    esac
+  done
+  # A bare 0 reaching here came from the environment rather than a measurement,
+  # so treat it as unmeasured like the terminal sources above.
+  [ "${width}" = "0" ] && width=80
+  # curl ignores a COLUMNS of 20 or less and sizes the bar itself, which would
+  # reintroduce the overrun this function exists to prevent. Report no width so
+  # the caller downloads quietly instead.
   if [ "${width}" -le 21 ]; then
     return 0
   fi
   printf '%s\n' "$((width - 1))"
 }
 
-# Resolve a download URL to its final location so the transfer that draws the
-# progress bar is a single request. Release downloads redirect to a signed
-# asset host, and the redirect responses carry no Content-Length, so curl has
-# no total to measure against while it is still walking the chain and renders
-# its unknown-size "bouncing" bar (#=#=-#, ##O=#  #, -#O#- #) for every hop
-# before the real bar begins. Resolving first means the bar starts at a
-# percentage of a known size. The probe is best-effort: if it fails, the
-# original URL is returned and the download follows the redirects itself.
-resolve_download_url() {
-  resolved="$(curl -fsSIL -o /dev/null -w '%{url_effective}' "$1" 2>/dev/null || true)"
-  if [ -n "${resolved}" ]; then
-    printf '%s\n' "${resolved}"
-  else
-    printf '%s\n' "$1"
-  fi
-}
+# Set once the narrow-terminal notice below has been printed, so three
+# downloads do not repeat it.
+narrow_terminal_reported=0
 
 fetch() {
   url="$1"
@@ -98,10 +109,13 @@ fetch() {
     bar_width=""
     if [ -t 2 ]; then
       bar_width="$(progress_bar_width)"
+      if [ -z "${bar_width}" ] && [ "${narrow_terminal_reported}" -eq 0 ]; then
+        echo "terminal too narrow for a progress bar, downloading quietly"
+        narrow_terminal_reported=1
+      fi
     fi
     if [ -n "${bar_width}" ]; then
-      COLUMNS="${bar_width}" curl -fL --progress-bar \
-        "$(resolve_download_url "${url}")" -o "${output}" || {
+      COLUMNS="${bar_width}" curl -fL --progress-bar "${url}" -o "${output}" || {
         rm -f "${output}"
         fail "${failure_message}"
       }
@@ -113,11 +127,12 @@ fetch() {
     fi
   elif command -v wget >/dev/null 2>&1; then
     if [ -t 2 ]; then
-      # --show-progress on its own leaves wget's normal request logging in
-      # place, so the bar is interleaved with resolver and redirect chatter.
-      # -q silences that and leaves the bar, which wget already keeps inside
-      # the terminal width.
-      wget -q --show-progress -O "${output}" "${url}" || {
+      # --show-progress alone leaves wget's full request logging in place, so
+      # the bar is interleaved with resolver and redirect chatter. -nv drops
+      # that chatter and keeps the bar, which wget already holds inside the
+      # terminal width. Not -q, which would also swallow wget's reason for a
+      # failure and leave only this script's generic message.
+      wget -nv --show-progress -O "${output}" "${url}" || {
         rm -f "${output}"
         fail "${failure_message}"
       }

@@ -364,5 +364,24 @@ Feature: Release install lifecycle
     When the release is packaged and signed with the private key file
     And the signed bundle is installed through a pseudo-terminal narrower than COLUMNS
     Then every download progress frame stays within the terminal
-    And each completed download reports its percentage on one row
+    And the finished screen shows one completed bar per download
+    And the installed rocm binary is present
+
+  @id:lifecycle-linux-progress-narrow-terminal @lifecycle @requires-os:linux
+  Scenario: lifecycle-29 - Linux - a terminal too narrow for a bar downloads quietly and says why
+    Given a freshly built release tree
+    And a generated signing keypair
+    When the release is packaged and signed with the private key file
+    And the signed bundle is installed through a terminal too narrow for a progress bar
+    Then the installer reports that the terminal is too narrow for a progress bar
+    And the installed rocm binary is present
+
+  @id:lifecycle-linux-progress-wget-fallback @lifecycle @requires-os:linux
+  Scenario: lifecycle-30 - Linux - the wget fallback keeps its progress bar inside the terminal
+    Given a freshly built release tree
+    And a generated signing keypair
+    When the release is packaged and signed with the private key file
+    And the signed bundle is installed through a pseudo-terminal with curl unavailable
+    Then every download progress frame stays within the terminal
+    And the download prints no request logging around the bar
     And the installed rocm binary is present

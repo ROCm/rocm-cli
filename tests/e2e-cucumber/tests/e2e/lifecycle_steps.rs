@@ -65,6 +65,13 @@ pub struct LifecycleState {
     /// `Command`, which the installer sees as a non-terminal and answers with
     /// plain lines, so the progress drawing this holds never appears in it.
     last_terminal_output: String,
+    /// The same bytes after a terminal emulator has drawn them, one row per
+    /// line. Wrapping is something the emulator does when a line overruns the
+    /// margin, never something the writer puts in the byte stream, so a torn
+    /// progress bar is only visible once the stream has been rendered. Raw
+    /// bytes answer "how wide was each frame", this answers "what did the user
+    /// end up looking at".
+    last_terminal_screen: String,
 }
 
 /// The Windows user `Path` exactly as the registry holds it: its value with
@@ -540,6 +547,7 @@ async fn given_release_tree(world: &mut E2eWorld) {
         profile_before_install: None,
         custom_profile: None,
         last_terminal_output: String::new(),
+        last_terminal_screen: String::new(),
     });
 }
 
@@ -1657,29 +1665,45 @@ async fn then_xdg_gone(world: &mut E2eWorld) {
     }
 }
 
-/// Terminal geometry for the progress-rendering scenario. `STALE_COLUMNS` is
+/// Terminal geometry for the progress-rendering scenarios. `STALE_COLUMNS` is
 /// deliberately wider than `PTY_COLS`: it stands in for a `COLUMNS` inherited
 /// from a larger window, which is what a shell leaves behind when its terminal
-/// is resized after it starts, and is the condition under which the installer's
-/// download bar used to wrap.
+/// is resized after it starts, and is the condition under which the
+/// installer's download bar used to overrun the margin and wrap.
+///
+/// `PTY_ROWS` is tall enough to hold a whole successful install, so a clean run
+/// never scrolls and the rendered screen below shows every progress row at
+/// once. A wrapping run overflows it, which is itself part of the symptom.
 const PTY_COLS: u16 = 80;
-const PTY_ROWS: u16 = 24;
+const PTY_ROWS: u16 = 40;
 const STALE_COLUMNS: u16 = 96;
+/// A terminal narrow enough that curl would ignore the width handed to it, so
+/// the installer declines to draw a bar at all.
+const NARROW_PTY_COLS: u16 = 20;
 
-/// Run the installer attached to a real pseudo-terminal and return everything
-/// it wrote, byte for byte.
+/// Downloads a release install performs: the archive, its checksum sidecar and
+/// its signature sidecar. One progress bar each.
+const EXPECTED_DOWNLOADS: usize = 3;
+
+/// Run the installer attached to a real pseudo-terminal, returning both what it
+/// wrote and what a terminal drawing those bytes would show.
 ///
 /// The piped `run_installer` path cannot exercise progress drawing at all: the
 /// installer only draws a bar when its stderr is a terminal, so under a pipe it
 /// takes the quiet branch. Only a PTY puts it on the drawing path.
+///
+/// `pty_cols` is the terminal's real width. `columns_env` is what the installer
+/// inherits as `COLUMNS`; `None` leaves it unset. The two are separate on
+/// purpose, because disagreeing is exactly the condition under test.
 fn run_installer_pty(
     world: &E2eWorld,
     install_dir: &Path,
     download_base: &str,
     public_key_env: &[(&str, String)],
     extra_env: &[(&str, String)],
-    columns: u16,
-) -> String {
+    pty_cols: u16,
+    columns_env: Option<u16>,
+) -> (String, String) {
     use std::io::Read as _;
 
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
@@ -1690,16 +1714,20 @@ fn run_installer_pty(
     let pair = native_pty_system()
         .openpty(PtySize {
             rows: PTY_ROWS,
-            cols: PTY_COLS,
+            cols: pty_cols,
             pixel_width: 0,
             pixel_height: 0,
         })
         .expect("failed to open a pty for the installer");
 
-    // The scenario carries @requires-os:linux, so only the POSIX installer is
+    // The scenarios carry @requires-os:linux, so only the POSIX installer is
     // ever driven here. This still compiles on Windows, which builds the e2e
     // target for its own lifecycle lanes, it simply never runs.
-    let mut cmd = CommandBuilder::new("sh");
+    // Absolute path: a scenario may hand the child a PATH that portable-pty
+    // would also use to resolve this program, and `sh` must stay findable
+    // regardless of what that PATH shadows out.
+    let shell = which_on_path("sh").unwrap_or_else(|| PathBuf::from("/bin/sh"));
+    let mut cmd = CommandBuilder::new(shell);
     cmd.arg(root.join("install.sh"));
     cmd.arg("release");
     cmd.cwd(&root);
@@ -1711,8 +1739,12 @@ fn run_installer_pty(
     cmd.env("ROCM_CLI_REQUIRE_SIGNATURE", "1");
     cmd.env("HOME", &st.home_dir);
     cmd.env("TERM", "xterm-256color");
-    // The whole point of the scenario: a COLUMNS that disagrees with the pty.
-    cmd.env("COLUMNS", columns.to_string());
+    match columns_env {
+        Some(cols) => cmd.env("COLUMNS", cols.to_string()),
+        // The harness's own COLUMNS would otherwise leak in and stand in for a
+        // value the scenario meant to leave unset.
+        None => cmd.env_remove("COLUMNS"),
+    }
     for (key, value) in public_key_env.iter().chain(extra_env.iter()) {
         cmd.env(key, value);
     }
@@ -1739,7 +1771,21 @@ fn run_installer_pty(
         status.success(),
         "the installer failed under a pty:\n{output}"
     );
-    output
+
+    // Draw the stream the way a terminal would. Wrapping is the emulator's
+    // doing and never appears in the byte stream, so this is the only view in
+    // which an over-wide bar actually tears.
+    let mut parser = vt100::Parser::new(PTY_ROWS, pty_cols, 0);
+    parser.process(&raw);
+    // `rows()`, not `contents()`: the latter stitches a wrapped row back onto
+    // the one it came from, reporting a 96-column line on an 80-column screen
+    // and hiding the very tearing this is here to catch.
+    let screen = parser
+        .screen()
+        .rows(0, pty_cols)
+        .collect::<Vec<_>>()
+        .join("\n");
+    (output, screen)
 }
 
 /// The frames the installer painted: every stretch between the carriage
@@ -1752,14 +1798,23 @@ fn progress_frames(terminal_output: &str) -> Vec<&str> {
         .collect()
 }
 
-#[when("the signed bundle is installed through a pseudo-terminal narrower than COLUMNS")]
-async fn when_install_pty_stale_columns(world: &mut E2eWorld) {
+/// Rows of a rendered screen that carry progress glyphs.
+fn progress_rows(screen: &str) -> Vec<&str> {
+    screen
+        .lines()
+        .map(str::trim_end)
+        .filter(|row| row.contains('#') || row.contains('%'))
+        .collect()
+}
+
+/// Serve the signed dist over loopback and install from it under a pty.
+fn install_under_pty(world: &mut E2eWorld, pty_cols: u16, columns_env: Option<u16>) {
     let st = state(world);
     let dist_dir = st.dist_dir.clone();
     let install_dir = st.install_dir.clone();
     let public_key = st.public_key.clone();
-    // Serve over loopback rather than file://, so the installer runs its real
-    // HTTP download path — the one that draws the bar.
+    // Loopback rather than file://, so the installer runs the HTTP download
+    // path that actually draws a bar.
     let server = e2e_cucumber::loopback_http::LoopbackServer::start(&dist_dir);
     let base = server.base_url();
     let key_env = [(
@@ -1767,16 +1822,29 @@ async fn when_install_pty_stale_columns(world: &mut E2eWorld) {
         public_key.to_string_lossy().into_owned(),
     )];
     let no_path = [("ROCM_CLI_UPDATE_SHELL_PATH", "0".to_string())];
-    let out = run_installer_pty(
+    let (raw, screen) = run_installer_pty(
         world,
         &install_dir,
         &base,
         &key_env,
         &no_path,
-        STALE_COLUMNS,
+        pty_cols,
+        columns_env,
     );
-    state_mut(world).last_terminal_output = out;
+    let st = state_mut(world);
+    st.last_terminal_output = raw;
+    st.last_terminal_screen = screen;
     drop(server);
+}
+
+#[when("the signed bundle is installed through a pseudo-terminal narrower than COLUMNS")]
+async fn when_install_pty_stale_columns(world: &mut E2eWorld) {
+    install_under_pty(world, PTY_COLS, Some(STALE_COLUMNS));
+}
+
+#[when("the signed bundle is installed through a terminal too narrow for a progress bar")]
+async fn when_install_pty_narrow(world: &mut E2eWorld) {
+    install_under_pty(world, NARROW_PTY_COLS, None);
 }
 
 #[then("every download progress frame stays within the terminal")]
@@ -1790,10 +1858,9 @@ async fn then_progress_fits_terminal(world: &mut E2eWorld) {
     let width = usize::from(PTY_COLS);
     // A frame wider than the terminal certainly wraps, and one exactly as wide
     // as it sits on the right margin, where terminals disagree about whether
-    // the next write moves down a row. Either way the carriage return that
-    // ends the frame can land on a row below the bar's, so every later redraw
-    // paints one row lower and the download arrives as a stack of bars instead
-    // of one that updates in place. Reject both.
+    // the next write moves down a row. Either way the carriage return ending
+    // the frame can land on a row below the bar's, so every later redraw paints
+    // one row lower. Reject both.
     let overflowing: Vec<&&str> = frames
         .iter()
         .filter(|frame| frame.chars().count() >= width)
@@ -1813,31 +1880,151 @@ async fn then_progress_fits_terminal(world: &mut E2eWorld) {
     );
 }
 
-#[then("each completed download reports its percentage on one row")]
-async fn then_percentage_not_split(world: &mut E2eWorld) {
-    let output = state(world).last_terminal_output.clone();
-    // The reported symptom, asserted directly rather than inferred from the
-    // widths above: a wrapped bar tears its percentage across the margin, so
-    // the row ends mid-number and the remainder opens the next one — the
-    // stray ".0%" from the bug report. Require that a completion reads whole
-    // somewhere, and that no orphaned tail is left on a row of its own.
-    let frames = progress_frames(&output);
-    let completed = frames
-        .iter()
-        .filter(|frame| frame.contains("100.0%"))
-        .count();
-    assert!(
-        completed >= 1,
-        "no download reported a whole 100.0% on a single row, so a completion \
-         percentage was split across the terminal's right margin:\n{output}"
+#[then("the finished screen shows one completed bar per download")]
+async fn then_one_bar_per_download(world: &mut E2eWorld) {
+    // Asserted against the rendered screen, not the byte stream. A bar that
+    // overruns the margin is torn in two by the terminal, which leaves the
+    // leftovers of every earlier redraw stranded on their own rows; none of
+    // that exists in the bytes, where each redraw is just one over-wide frame.
+    let screen = state(world).last_terminal_screen.clone();
+    let rows = progress_rows(&screen);
+    assert_eq!(
+        rows.len(),
+        EXPECTED_DOWNLOADS,
+        "expected {EXPECTED_DOWNLOADS} progress rows on the finished screen, \
+         one per download, but found {}. More than that means each redraw left \
+         the previous bar behind instead of replacing it:\n{screen}",
+        rows.len(),
     );
-    for orphan in ["0%", ".0%"] {
+    // Every surviving row is a finished bar. A stack of wrapped redraws leaves
+    // partial bars with no percentage, and a torn one leaves a stranded tail.
+    let unfinished: Vec<&&str> = rows.iter().filter(|row| !row.contains("100.0%")).collect();
+    assert!(
+        unfinished.is_empty(),
+        "{} of {} progress rows do not carry a whole 100.0%, so a bar was left \
+         partially drawn or its percentage was torn across the margin: {:?}\n{screen}",
+        unfinished.len(),
+        rows.len(),
+        unfinished,
+    );
+}
+
+#[then("the installer reports that the terminal is too narrow for a progress bar")]
+async fn then_narrow_notice(world: &mut E2eWorld) {
+    // The notice is longer than this terminal is wide, so on the rendered
+    // screen it is split across physical rows and no single row contains it.
+    // Read it from the byte stream, which carries it whole, and keep the
+    // screen for the question it alone can answer: was a bar drawn.
+    let output = state(world).last_terminal_output.clone();
+    assert!(
+        output.contains("too narrow for a progress bar"),
+        "a terminal too narrow to size a bar downloads quietly, which should \
+         say so rather than look like a stall:\n{output}"
+    );
+    let screen = state(world).last_terminal_screen.clone();
+    let rows = progress_rows(&screen);
+    assert!(
+        rows.is_empty(),
+        "no progress bar should be drawn at {NARROW_PTY_COLS} columns, but the \
+         screen carries {}: {rows:?}\n{screen}",
+        rows.len(),
+    );
+}
+
+/// A single directory that shadows `PATH`, holding a symlink to every
+/// executable reachable on it except `name`.
+///
+/// Dropping whole directories the way [`path_without_openssl`] does cannot work
+/// for curl: it lives in `/usr/bin` beside `sh`, `tar`, `awk` and ~980 other
+/// tools the installer and the harness both need, so removing that directory
+/// leaves nothing able to run. Shadowing one name keeps everything else exactly
+/// where the installer expects to find it, and `command -v curl` then genuinely
+/// misses, which is what sends `fetch()` down its wget branch.
+fn path_shadowing_out(world: &E2eWorld, name: &str) -> String {
+    let farm = root(world).join("path-without").join(name);
+    std::fs::create_dir_all(&farm).expect("failed to create the shadow PATH directory");
+    for dir in std::env::var("PATH").unwrap_or_default().split(':') {
+        if dir.is_empty() {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            if file_name == name {
+                continue;
+            }
+            let link = farm.join(&file_name);
+            // First writer wins, so earlier PATH entries keep their precedence.
+            if !link.exists() {
+                let _ = std::os::unix::fs::symlink(entry.path(), &link);
+            }
+        }
+    }
+    assert!(
+        !farm.join(name).exists(),
+        "{name} is still resolvable through the shadow PATH"
+    );
+    farm.to_string_lossy().into_owned()
+}
+
+#[when("the signed bundle is installed through a pseudo-terminal with curl unavailable")]
+async fn when_install_pty_without_curl(world: &mut E2eWorld) {
+    assert!(
+        which_on_path("wget").is_some(),
+        "this scenario covers the installer's wget branch and the host has no \
+         wget; install it or the branch goes untested"
+    );
+    let st = state(world);
+    let dist_dir = st.dist_dir.clone();
+    let install_dir = st.install_dir.clone();
+    let public_key = st.public_key.clone();
+    let server = e2e_cucumber::loopback_http::LoopbackServer::start(&dist_dir);
+    let base = server.base_url();
+    let key_env = [(
+        "ROCM_CLI_SIGNING_PUBLIC_KEY_PATH",
+        public_key.to_string_lossy().into_owned(),
+    )];
+    let extra = [
+        ("ROCM_CLI_UPDATE_SHELL_PATH", "0".to_string()),
+        ("PATH", path_shadowing_out(world, "curl")),
+    ];
+    let (raw, screen) = run_installer_pty(
+        world,
+        &install_dir,
+        &base,
+        &key_env,
+        &extra,
+        PTY_COLS,
+        Some(STALE_COLUMNS),
+    );
+    let st = state_mut(world);
+    st.last_terminal_output = raw;
+    st.last_terminal_screen = screen;
+    drop(server);
+}
+
+/// First directory on `PATH` holding `name`, or `None`.
+fn which_on_path(name: &str) -> Option<PathBuf> {
+    std::env::var("PATH").ok().and_then(|path| {
+        path.split(':')
+            .map(|dir| Path::new(dir).join(name))
+            .find(|candidate| candidate.exists())
+    })
+}
+
+#[then("the download prints no request logging around the bar")]
+async fn then_no_request_logging(world: &mut E2eWorld) {
+    let output = state(world).last_terminal_output.clone();
+    // wget's default verbosity narrates every step of the request, which lands
+    // interleaved with the progress bar. These lines are what -nv drops while
+    // still leaving the bar, and still reporting a failure's reason.
+    for noise in ["Connecting to", "HTTP request sent", "Length:"] {
         assert!(
-            !output
-                .split(['\r', '\n'])
-                .any(|frame| frame.trim() == orphan),
-            "a stray {orphan:?} sits alone on a row, which is the tail of a \
-             percentage that wrapped past the right margin:\n{output}"
+            !output.contains(noise),
+            "{noise:?} appears around the progress bar, so the downloader is \
+             narrating the request instead of just drawing the bar:\n{output}"
         );
     }
 }
