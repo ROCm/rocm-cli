@@ -226,6 +226,49 @@ fn build_host_gpu_snapshot(
     }
 }
 
+/// Windows has no rocmdashd socket yet, so this builds `Snapshot`s in-process
+/// instead of connecting anywhere: `HostCollector` (already cross-platform)
+/// for CPU/memory, `WinPerfCollector` (OS perf counters, no AMD tool needed)
+/// for GPU. Sends `Connected` like the unix arm, but then a stream of
+/// `ClientMsg::HostGpuSnapshot` rather than `Event::Snapshot` — deliberately
+/// not routed through `Event::Snapshot`, to avoid disturbing the "quit while
+/// serving" confirmation prompt (see `AppState::push_host_gpu_snapshot`).
+#[cfg(windows)]
+async fn connect_and_run(connect: &str, tx: UnboundedSender<ClientMsg>) -> anyhow::Result<()> {
+    use rocm_dash_collectors::host::HostCollector;
+    use rocm_dash_collectors::winperf::WinPerfCollector;
+    info!(
+        connect,
+        "windows: collecting metrics in-process (no daemon socket)"
+    );
+    let _ = tx.send(ClientMsg::Connected {
+        host: "localhost".into(),
+        daemon_version: crate::app::ConnState::in_process_version(env!("CARGO_PKG_VERSION")),
+    });
+
+    let mut host = HostCollector::new();
+    let gpu = WinPerfCollector::new();
+    // Mirrors the daemon's `gpu_tick` cadence (rocm_dash_daemon::runner::RunnerOptions::default()).
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
+    // A slow powershell/ADLX tick (see `WinPerfCollector::snapshot`) must not
+    // queue up a burst of catch-up ticks once it returns; matches
+    // `rocm-dash-daemon/src/runner.rs`'s existing explicit choice.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        ticker.tick().await;
+        let snapshot =
+            build_host_gpu_snapshot(host.tick(), gpu.snapshot().await, chrono::Utc::now());
+        if tx
+            .send(ClientMsg::HostGpuSnapshot(Box::new(snapshot)))
+            .is_err()
+        {
+            break;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -275,47 +318,4 @@ mod tests {
         );
         assert!(snap.instances.is_empty());
     }
-}
-
-/// Windows has no rocmdashd socket yet, so this builds `Snapshot`s in-process
-/// instead of connecting anywhere: `HostCollector` (already cross-platform)
-/// for CPU/memory, `WinPerfCollector` (OS perf counters, no AMD tool needed)
-/// for GPU. Sends `Connected` like the unix arm, but then a stream of
-/// `ClientMsg::HostGpuSnapshot` rather than `Event::Snapshot` — deliberately
-/// not routed through `Event::Snapshot`, to avoid disturbing the "quit while
-/// serving" confirmation prompt (see `AppState::push_host_gpu_snapshot`).
-#[cfg(windows)]
-async fn connect_and_run(connect: &str, tx: UnboundedSender<ClientMsg>) -> anyhow::Result<()> {
-    use rocm_dash_collectors::host::HostCollector;
-    use rocm_dash_collectors::winperf::WinPerfCollector;
-    info!(
-        connect,
-        "windows: collecting metrics in-process (no daemon socket)"
-    );
-    let _ = tx.send(ClientMsg::Connected {
-        host: "localhost".into(),
-        daemon_version: crate::app::ConnState::in_process_version(env!("CARGO_PKG_VERSION")),
-    });
-
-    let mut host = HostCollector::new();
-    let gpu = WinPerfCollector::new();
-    // Mirrors the daemon's `gpu_tick` cadence (rocm_dash_daemon::runner::RunnerOptions::default()).
-    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
-    // A slow powershell/ADLX tick (see `WinPerfCollector::snapshot`) must not
-    // queue up a burst of catch-up ticks once it returns; matches
-    // `rocm-dash-daemon/src/runner.rs`'s existing explicit choice.
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-    loop {
-        ticker.tick().await;
-        let snapshot =
-            build_host_gpu_snapshot(host.tick(), gpu.snapshot().await, chrono::Utc::now());
-        if tx
-            .send(ClientMsg::HostGpuSnapshot(Box::new(snapshot)))
-            .is_err()
-        {
-            break;
-        }
-    }
-    Ok(())
 }
