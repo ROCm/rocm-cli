@@ -144,9 +144,10 @@ Feature: Runtime configuration
     Then the adoption is refused
     And the error explains which install types can be adopted
 
-  # Both channels now resolve from one canonical aggregate index each, so the
+  # The nightly channel resolves from one canonical aggregate index, and an
+  # unpinned release install from the ROCm 10 index (runtime-09 below), so the
   # provenance the preview prints is the whole of what the user can check before
-  # committing to a multi-GiB install. This pins the nightly half: the source that
+  # committing to a multi-GiB install. This pins the nightly case: the source that
   # was selected, the version that came back from it, and the layout generation
   # that source was read as. `--family` is supplied so the scenario needs no GPU,
   # and `@nightly` because it resolves the real index over the network — the same
@@ -160,8 +161,8 @@ Feature: Runtime configuration
   # resolver read a per-family index, `repo.amd.com/rocm/whl/{family}`, which is
   # frozen at 7.13.0 and has no device payloads at all, so every release install
   # got a stale SDK and a bare `rocm[libraries,devel]` — no GPU backend in it.
-  # Both halves are fixed by the same canonical model: one flat aggregate index
-  # for the channel, and the device payload for the chip this host actually has.
+  # An unpinned release install now reads the ROCm 10 index and still asks for
+  # the device payload of the chip this host actually has.
   #
   # The obvious regression test for that history is the one that does not work.
   # Asserting the broken per-family URL is *absent* passes with the bug present:
@@ -181,11 +182,13 @@ Feature: Runtime configuration
   # needs a detected chip name and never opens the device. It therefore runs on
   # WSL hosts that can read the Windows-side target before ROCm passthrough is
   # ready, while mock hosts with no target skip it.
-  @id:runtime-resolve-canonical-release @requires-gfx-target
-  Scenario: runtime-09 - Previewing a release SDK install resolves the canonical aggregate for this GPU
+  # Needs a detected chip (`@requires-gfx-target`), not a full GPU open. It
+  # dry-runs against the live ROCm 10 index, so it does not run on a mock host.
+  @id:runtime-resolve-next-release @requires-gfx-target
+  Scenario: runtime-09 - Previewing a release SDK install resolves the newest stable ROCm 10 release for this GPU
     Given a machine with an AMD GPU
     When the user dry-runs a release SDK install for this host
-    Then the SDK preview reports canonical release provenance
+    Then the SDK preview reports the next-layout release source
     And the SDK preview requests the device payload for this host's GPU
 
   # `rollback` can only ever undo one step, not walk a history. A unit test on

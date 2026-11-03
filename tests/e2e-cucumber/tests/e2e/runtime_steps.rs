@@ -58,9 +58,21 @@ async fn user_previews_sdk_install(world: &mut E2eWorld) {
     // `--family` because a host with no AMD GPU has no target to detect, and the
     // preview resolves the install folder before it needs one. `--dry-run` keeps
     // this to a plan: no venv, no multi-GiB download.
+    // `--channel nightly` because an unpinned release install now reads the
+    // ROCm 10 layout and refuses a group family. This scenario only needs a
+    // successful plan so it can read the folder the plan names; nightly
+    // auto-select still accepts `gfx110X-all`.
     let stdout = crate::run_rocm_ok(
         world,
-        &["install", "sdk", "--family", "gfx110X-all", "--dry-run"],
+        &[
+            "install",
+            "sdk",
+            "--channel",
+            "nightly",
+            "--family",
+            "gfx110X-all",
+            "--dry-run",
+        ],
     );
     world.cli_output = Some(stdout);
 }
@@ -277,7 +289,19 @@ async fn user_installs_other_family_without_yes(world: &mut E2eWorld) {
     // `active_default_runtime_relation` shared by both formats — with a family
     // the host has genuinely never held. The refusal still costs only the
     // catalog listing: it bails before the multi-GiB archive is fetched.
-    let args = ["install", "sdk", "--format", "tarball", "--family", family];
+    // `--channel nightly` so a group family still reaches the consent gate.
+    // An unpinned release tarball now requires an exact arch and would stop
+    // before that gate.
+    let args = [
+        "install",
+        "sdk",
+        "--channel",
+        "nightly",
+        "--format",
+        "tarball",
+        "--family",
+        family,
+    ];
     let (stdout, stderr, rc) = crate::run_rocm(world, &args);
     world.cli_output = Some(stdout);
     world.cli_stderr = Some(stderr);
@@ -758,9 +782,9 @@ async fn user_dry_runs_release_sdk(world: &mut E2eWorld) {
     world.cli_output = Some(stdout);
 }
 
-#[then("the SDK preview reports canonical release provenance")]
-async fn assert_canonical_release_provenance(world: &mut E2eWorld) {
-    const AGGREGATE: &str = "https://repo.amd.com/rocm/whl-multi-arch";
+#[then("the SDK preview reports the next-layout release source")]
+async fn assert_next_release_provenance(world: &mut E2eWorld) {
+    const NEXT_INDEX: &str = "https://stable.repo.amd.com/rocm/whl-next";
     let output = world.cli_output.as_deref().expect("no SDK preview output");
 
     assert_eq!(
@@ -768,24 +792,22 @@ async fn assert_canonical_release_provenance(world: &mut E2eWorld) {
         "release",
         "the preview is not previewing the release channel:\n{output}"
     );
-    // rocm-cli#271 was this URL with `/{family}` glued on the end: a per-family
-    // index frozen at 7.13.0 that publishes no device payloads at all. The
-    // release channel now reads one flat aggregate, and `index_url` is the line
-    // that says so — the URL the resolver chose, not the one it advertises.
+    // An unpinned release install reads the ROCm 10 index, not the canonical
+    // multi-arch index. `index_url` is the URL the resolver chose.
     assert_eq!(
         preview_field(output, "canonical_source"),
-        AGGREGATE,
-        "the preview declares a source other than the canonical release aggregate:\n{output}"
+        NEXT_INDEX,
+        "the preview declares a source other than the ROCm 10 index:\n{output}"
     );
     assert_eq!(
         preview_field(output, "index_url"),
-        AGGREGATE,
-        "the release install resolved something other than the flat aggregate index:\n{output}"
+        NEXT_INDEX,
+        "the release install resolved something other than the ROCm 10 index:\n{output}"
     );
     assert_eq!(
         preview_field(output, "source_layout_generation"),
-        "multi-arch-v2",
-        "the preview read the aggregate as some other layout:\n{output}"
+        "next-v1",
+        "the preview read the ROCm 10 index as some other layout:\n{output}"
     );
     // The release channel installs stable versions only, and a stable version
     // encodes no build date. Reporting that instead of a date is the honest

@@ -659,12 +659,17 @@ ROCm distribution. Two install formats are supported:
 
 - **Wheel format** — Python wheel packages (`rocm`, `torch`, `torchvision`,
   `torchaudio`) are resolved from AMD-hosted PyPI-compatible indexes and
-  installed via `uv` into a managed virtual environment. Release channel wheels
-  are served from `https://repo.amd.com/rocm/whl-multi-arch`. Nightly channel
-  wheels are served from `https://rocm.nightlies.amd.com/whl-multi-arch`.
+  installed via `uv` into a managed virtual environment. An unpinned release
+  install, and a pin of stable ROCm 10 or newer, resolves wheels from
+  `https://stable.repo.amd.com/rocm/whl-next`. A pin of an older stable release,
+  such as `--version 7.14.1`, uses `https://repo.amd.com/rocm/whl-multi-arch`.
+  Nightly channel wheels are served from
+  `https://rocm.nightlies.amd.com/whl-multi-arch`.
 - **Tarball format** — Prebuilt SDK tarballs are downloaded from AMD-hosted
-  artifact storage. Release channel tarballs are served from
-  `https://repo.amd.com/rocm/tarball/`. Nightly tarballs are served from
+  artifact storage. An unpinned release install, and a pin of stable ROCm 10
+  or newer, uses `https://stable.repo.amd.com/rocm/core/tarball/`. A runtime
+  installed from `https://repo.amd.com/rocm/tarball/` stays on that catalog
+  when it is updated. Nightly tarballs are served from
   `https://rocm.nightlies.amd.com/tarball/`. The metadata index files for
   tarball installs are optionally verified with an RSA/SHA-256 detached
   signature (controlled by `ROCM_CLI_METADATA_PUBLIC_KEY_PATH` /
