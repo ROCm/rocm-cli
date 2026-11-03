@@ -147,9 +147,14 @@ review and may decline:
   Compare absolute counts, and do not read a one-case move as a real change.
 - **These are our prompts, not the field.** Nothing here measures failures users
   actually hit.
-- **The grading host has no AMD GPU and no `rocm` CLI.** The behavioral cases therefore
+- **The grading host has no AMD GPU and no `rocm` CLI.** Most behavioral cases therefore
   grade the skill's procedure (probing first, asking for consent before anything that
   mutates, routing upstream when nothing is established), not whether a diagnosis was
-  correct. A rise does not mean users get fixed faster.
+  correct. The exception is a case with a directory under
+  [`evals/fixtures/`](../skills/rocm-doctor/evals/fixtures/): it gets a replayed `rocm`
+  that answers `--version`, `fix --json` and `diagnose` from a recording, so it can
+  grade the version check or how an answer is read. The recording is of a host with no
+  GPU data, so even there a rise does not mean users get fixed faster. See
+  [Doctor Skill Eval Replays](testing.md#doctor-skill-eval-replays).
 - **Editing the dataset moves the figures.** A changed content hash between two runs
   means the scenario set may have changed; look at that diff before comparing them.
