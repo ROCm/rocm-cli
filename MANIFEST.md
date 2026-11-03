@@ -73,6 +73,7 @@ repository.
 | axum-core | 0.5.6 | MIT |
 | backtrace | 0.3.76 | MIT OR Apache-2.0 |
 | base64 | 0.22.1 | MIT OR Apache-2.0 |
+| base64 | 0.23.1 | MIT OR Apache-2.0 |
 | base64ct | 1.8.3 | Apache-2.0 OR MIT |
 | bit-set | 0.5.3 | MIT/Apache-2.0 |
 | bit-vec | 0.6.3 | MIT/Apache-2.0 |
