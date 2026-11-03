@@ -326,10 +326,11 @@ Feature: Interactive dashboard
   # EAI-8450: the amd-smi device pre-flight only ever checked bare-metal
   # `/dev/kfd`, so under WSL2 (no such device node — GPU access goes through
   # WSLg's `/dev/dxg` instead) the dashboard always reported no GPU, even with
-  # a real one passed through. `@requires-wsl` rather than `@requires-gpu`
+  # a real one passed through. `@requires-wsl` rather than `@requires-real-gpu`
   # alone: the premise under test is the WSL detection path specifically.
   # Currently skipped on every CI lane — no WSL lane carries a real GPU yet
-  # (tracked separately in #223) — but still runs locally on WSL hardware.
+  # (tracked separately in #223) — but runs locally on WSL hardware with
+  # `E2E_HARDWARE=real`.
   @id:dash-reports-wsl-gpu-telemetry @requires-wsl @requires-real-gpu
   Scenario: dash-24 - Dashboard displays GPU telemetry through WSL
     When the user opens the dashboard

@@ -33,8 +33,8 @@ use std::fmt::Write as _;
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// Directory under the root holding the canned tool outputs.
-/// Must match `TOOL_OUTPUT_DIR` in `src/bin/fake-host-tool.rs`.
+/// Directory under the root holding the canned tool outputs, which
+/// `src/bin/fake-host-tool.rs` answers from.
 pub const TOOL_OUTPUT_DIR: &str = ".fake-tools";
 
 /// The environment variable that points the CLI at a simulated root.
@@ -67,6 +67,57 @@ pub const HOST_TOOLS: &[&str] = &[
     "dmesg",
 ];
 
+/// Tools whose canned answer is stored under the tool's bare name.
+///
+/// That answer is given whatever arguments the tool is run with.
+/// `powershell.exe` is the only one: the CLI passes it a whole inventory
+/// script, which no file can be named after. Every other tool answers only the
+/// exact command line that was planted.
+pub const ARGV_INDEPENDENT_TOOLS: &[&str] = &["powershell.exe"];
+
+/// The canned-output file names `fake-host-tool` tries for `tool args...`.
+///
+/// In order: the exact command line, then — only for an
+/// [`ARGV_INDEPENDENT_TOOLS`] entry — the bare tool name. The first entry is the
+/// one a missing-answer message names.
+#[must_use]
+pub fn canned_output_names(tool: &str, args: &[String]) -> Vec<String> {
+    let exact = std::iter::once(tool)
+        .chain(args.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut names = vec![exact];
+    if !args.is_empty() && ARGV_INDEPENDENT_TOOLS.contains(&tool) {
+        names.push(tool.to_owned());
+    }
+    names
+}
+
+/// `fake-host-tool`'s answer for `tool args...` from the canned outputs in
+/// `outputs`.
+///
+/// The answer is the first of [`canned_output_names`] that was planted, or,
+/// when none was, the message a shell gives for a missing command, naming the
+/// whole command line. The stand-in prints the first on stdout and exits 0, or
+/// the second on stderr and exits 127.
+///
+/// # Errors
+///
+/// The missing-command message, when nothing was planted for this command line.
+pub fn canned_answer(outputs: &Path, tool: &str, args: &[String]) -> Result<Vec<u8>, String> {
+    let names = canned_output_names(tool, args);
+    names
+        .iter()
+        .find_map(|name| std::fs::read(outputs.join(name)).ok())
+        .ok_or_else(|| {
+            format!(
+                "{tool}: command not found (fake-host-tool: the simulated machine has no canned \
+                 answer for `{}`; plant one in simulated_host.rs if the CLI now runs it)",
+                names[0]
+            )
+        })
+}
+
 /// One AMD GPU, as the PCI bus and the kernel's KFD topology describe it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SimulatedGpu {
@@ -79,6 +130,9 @@ pub struct SimulatedGpu {
     pub pci_class: &'static str,
     /// The `lspci` marketing name between the vendor and the `[vendor:device]`.
     pub pci_name: &'static str,
+    /// The adapter name the Windows host reports for it, which the CLI reads
+    /// a gfx target from on WSL.
+    pub windows_name: &'static str,
     /// KFD's `location_id`: the kernel's `(bus << 8) | devfn`.
     pub location_id: u32,
 }
@@ -92,6 +146,7 @@ impl SimulatedGpu {
             device_id: 0x74a1,
             pci_class: "Processing accelerators [1200]",
             pci_name: "Aqua Vanjaram [Instinct MI300X]",
+            windows_name: "AMD Instinct MI300X",
             location_id: (bus as u32) << 8,
         }
     }
@@ -104,6 +159,7 @@ impl SimulatedGpu {
             device_id: 0x1586,
             pci_class: "Display controller [0380]",
             pci_name: "Strix Halo [Radeon Graphics / Radeon 8050S / 8060S Graphics]",
+            windows_name: "AMD Radeon(TM) 8060S Graphics",
             location_id: 0xc5 << 8,
         }
     }
@@ -132,9 +188,9 @@ pub enum Platform {
     /// DRM cards.
     BareMetal,
     /// A WSL2 distribution reaching the GPU through `/dev/dxg` and the Windows
-    /// host driver. `rocdxg_ready` adds ROCDXG (the library and its linker-cache
-    /// entry), without which ROCm cannot reach the device.
-    Wsl2 { rocdxg_ready: bool },
+    /// host driver, with ROCDXG (the library and its linker-cache entry)
+    /// installed, without which ROCm cannot reach the device.
+    Wsl2,
 }
 
 /// A machine to simulate.
@@ -181,7 +237,7 @@ impl SimulatedHost {
     #[must_use]
     pub fn wsl2_strix_halo() -> Self {
         Self {
-            platform: Platform::Wsl2 { rocdxg_ready: true },
+            platform: Platform::Wsl2,
             gpus: vec![SimulatedGpu::strix_halo()],
         }
     }
@@ -207,7 +263,7 @@ impl SimulatedHost {
         tool: &Path,
         real_path: &std::ffi::OsStr,
     ) -> io::Result<Vec<PathBuf>> {
-        let wsl = matches!(self.platform, Platform::Wsl2 { .. });
+        let wsl = self.platform == Platform::Wsl2;
         let kernel = if wsl { WSL2_KERNEL } else { BARE_METAL_KERNEL };
 
         write(
@@ -246,7 +302,7 @@ impl SimulatedHost {
 
         match self.platform {
             Platform::BareMetal => self.plant_bare_metal(root)?,
-            Platform::Wsl2 { rocdxg_ready } => plant_wsl2(root, rocdxg_ready)?,
+            Platform::Wsl2 => plant_wsl2(root, &self.gpus)?,
         }
         let stand_ins = link_stand_ins(&tools, tool)?;
         let filtered = filter_real_path(&tools.join("host-path"), real_path)?;
@@ -305,17 +361,22 @@ impl SimulatedHost {
         // Every simulated machine is a prepared one: the system libraries vLLM
         // and PyTorch's ROCm wheels need (OpenMPI, libatomic, libnuma) are
         // installed, as the CLI's own dependency checks would have left them.
-        let mut text = String::from("5 libs found in cache `/etc/ld.so.cache'\n");
-        for (soname, path) in [
+        let mut libraries = vec![
             ("libc.so.6", "/lib/x86_64-linux-gnu/libc.so.6"),
             ("libmpi.so.40", "/usr/lib/x86_64-linux-gnu/libmpi.so.40"),
             ("libatomic.so.1", "/lib/x86_64-linux-gnu/libatomic.so.1"),
             ("libnuma.so.1", "/lib/x86_64-linux-gnu/libnuma.so.1"),
-        ] {
-            let _ = writeln!(text, "\t{soname} (libc6,x86-64) => {path}");
+        ];
+        if self.platform == Platform::Wsl2 {
+            libraries.push(("librocdxg.so", "/opt/rocm/lib/librocdxg.so"));
         }
-        if self.platform == (Platform::Wsl2 { rocdxg_ready: true }) {
-            text.push_str("\tlibrocdxg.so (libc6,x86-64) => /opt/rocm/lib/librocdxg.so\n");
+        // The header counts the entries listed below it, as the real one does.
+        let mut text = format!(
+            "{} libs found in cache `/etc/ld.so.cache'\n",
+            libraries.len()
+        );
+        for (soname, path) in libraries {
+            let _ = writeln!(text, "\t{soname} (libc6,x86-64) => {path}");
         }
         text
     }
@@ -325,7 +386,7 @@ impl SimulatedHost {
     /// through `/dev/dxg`.
     #[must_use]
     pub fn lspci(&self) -> String {
-        if matches!(self.platform, Platform::Wsl2 { .. }) {
+        if self.platform == Platform::Wsl2 {
             return String::new();
         }
         let mut text = String::from(
@@ -345,23 +406,33 @@ impl SimulatedHost {
     }
 }
 
-fn plant_wsl2(root: &Path, rocdxg_ready: bool) -> io::Result<()> {
-    // What the CLI's video-controller inventory query prints on the Windows
-    // host: one tab-separated `GPU` line per AMD display adapter.
+fn plant_wsl2(root: &Path, gpus: &[SimulatedGpu]) -> io::Result<()> {
     write(
         root,
         &format!("{TOOL_OUTPUT_DIR}/powershell.exe"),
-        "GPU\tAMD Radeon(TM) 8060S Graphics\t32.0.21025.10016\t\
-         PCI\\VEN_1002&DEV_1586&SUBSYS_1F111043&REV_C1\\4&1A2B3C4D&0&0041\n",
+        &windows_gpu_inventory(gpus),
     )?;
     write(root, "dev/dxg", "")?;
     write(root, "usr/lib/wsl/lib/libdxcore.so", "")?;
     write(root, "proc/modules", "")?;
-    if rocdxg_ready {
-        write(root, "opt/rocm/lib/librocdxg.so", "")?;
-        write(root, "opt/rocm/share/rocdxg/dids.conf", "")?;
+    write(root, "opt/rocm/lib/librocdxg.so", "")?;
+    write(root, "opt/rocm/share/rocdxg/dids.conf", "")
+}
+
+/// What the CLI's video-controller inventory query prints on the Windows host
+/// for `gpus`: one tab-separated `GPU` line per AMD display adapter, with the
+/// simulated GPU's own name and PCI device id.
+fn windows_gpu_inventory(gpus: &[SimulatedGpu]) -> String {
+    let mut text = String::new();
+    for gpu in gpus {
+        let _ = writeln!(
+            text,
+            "GPU\t{}\t32.0.21025.10016\t\
+             PCI\\VEN_1002&DEV_{:04X}&SUBSYS_1F111043&REV_C1\\4&1A2B3C4D&0&0041",
+            gpu.windows_name, gpu.device_id
+        );
     }
-    Ok(())
+    text
 }
 
 /// Write `contents` to `root/relative`, creating parent directories.
@@ -403,7 +474,7 @@ fn filter_real_path(dir: &Path, real_path: &std::ffi::OsStr) -> io::Result<PathB
     std::fs::create_dir_all(dir)?;
     let mut seen = std::collections::HashSet::new();
     for entry_dir in std::env::split_paths(real_path) {
-        if !entry_dir.is_absolute() || entry_dir.starts_with("/mnt") {
+        if !keep_path_dir(&entry_dir) {
             continue;
         }
         let Ok(entries) = std::fs::read_dir(&entry_dir) else {
@@ -420,6 +491,13 @@ fn filter_real_path(dir: &Path, real_path: &std::ffi::OsStr) -> io::Result<PathB
         }
     }
     Ok(dir.to_path_buf())
+}
+
+/// Whether a real `PATH` entry may serve a simulated machine: only an absolute
+/// directory (a relative one would resolve against wherever the CLI runs), and
+/// never one under WSL's `/mnt`, whose drives lead to the real Windows host.
+fn keep_path_dir(dir: &Path) -> bool {
+    dir.is_absolute() && !dir.starts_with("/mnt")
 }
 
 #[cfg(unix)]
@@ -517,9 +595,11 @@ pub fn bare_metal_layout_drift(real: &Path, simulated: &Path) -> Vec<String> {
              file under /{KFD_NODES}, which is where the simulated machine puts it"
         ));
     }
-    let Some((_, simulated_props)) = simulated_gpus.first() else {
-        return drift;
-    };
+    // Compared property by property against the simulated GPU node when there
+    // is one; the CPU-node and DRM-card checks below hold whatever was planted.
+    let simulated_props = simulated_gpus
+        .first()
+        .map_or(&[][..], |(_, props)| props.as_slice());
     for (node, real_props) in &real_gpus {
         let name = node.file_name().unwrap_or_default().to_string_lossy();
         for (key, _) in simulated_props {
@@ -748,6 +828,45 @@ mod tests {
         assert!(cache.contains("librocdxg.so"), "{cache}");
     }
 
+    /// The `ldconfig -p` header states how many entries follow it, as the real
+    /// cache listing does, on every platform the fixture plants.
+    #[test]
+    fn the_linker_cache_header_counts_the_libraries_it_lists() {
+        for host in [
+            SimulatedHost::instinct_mi300x(1),
+            SimulatedHost::bare_metal_without_gpu(),
+            SimulatedHost::wsl2_strix_halo(),
+        ] {
+            let cache = host.ldconfig_cache();
+            let (header, entries) = cache.split_once('\n').expect("a header line");
+            let listed = entries.lines().count();
+            assert_eq!(
+                header,
+                format!("{listed} libs found in cache `/etc/ld.so.cache'"),
+                "{host:?}:\n{cache}"
+            );
+        }
+    }
+
+    /// A stand-in only answers the command line it was planted for: `lspci`
+    /// with flags the fixture never wrote must not get the `-nn -D` listing.
+    /// Only an argv-independent tool falls back to its bare name.
+    #[test]
+    fn a_stand_in_answers_only_the_command_line_it_was_planted_for() {
+        let args = |list: &[&str]| list.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
+        assert_eq!(
+            canned_output_names("lspci", &args(&["-nn", "-D"])),
+            ["lspci -nn -D"]
+        );
+        assert_eq!(canned_output_names("lspci", &args(&["-D"])), ["lspci -D"]);
+        assert_eq!(canned_output_names("uname", &args(&["-n"])), ["uname -n"]);
+        assert_eq!(canned_output_names("mpirun", &[]), ["mpirun"]);
+        assert_eq!(
+            canned_output_names("powershell.exe", &args(&["-NoLogo", "-Command", "Get-X"])),
+            ["powershell.exe -NoLogo -Command Get-X", "powershell.exe"]
+        );
+    }
+
     /// Only the tools the simulated machine has are on its `PATH`; the real
     /// machine's hardware tools are filtered out, and everything else it has
     /// stays reachable.
@@ -786,10 +905,116 @@ mod tests {
 
     #[test]
     fn a_wsl2_machine_answers_the_windows_host_query() {
+        let host = SimulatedHost::wsl2_strix_halo();
+        let root = planted(&host);
+        let outputs = root.path().join(TOOL_OUTPUT_DIR);
+        assert!(
+            outputs
+                .join("bin/powershell.exe")
+                .symlink_metadata()
+                .is_ok()
+        );
+        assert!(outputs.join("bin/lspci").symlink_metadata().is_ok());
+        // Whatever inventory script the CLI sends, the answer names the
+        // simulated GPU's own PCI device, one `GPU` line per adapter.
+        let script = [
+            "-NoProfile".to_owned(),
+            "-Command".to_owned(),
+            "...".to_owned(),
+        ];
+        let answer =
+            String::from_utf8(canned_answer(&outputs, "powershell.exe", &script).unwrap()).unwrap();
+        let lines: Vec<&str> = answer.lines().collect();
+        assert_eq!(lines.len(), host.gpus().len(), "{answer}");
+        let gpu = &host.gpus()[0];
+        let device = format!("VEN_1002&DEV_{:04X}&", gpu.device_id);
+        assert!(
+            lines[0].starts_with(&format!("GPU\t{}\t", gpu.windows_name)),
+            "{answer}"
+        );
+        assert!(lines[0].contains(&device), "{answer}");
+    }
+
+    /// One line per GPU, each naming that GPU's own adapter and device id, the
+    /// id in the upper-case hex Windows prints.
+    #[test]
+    fn the_windows_inventory_names_each_simulated_gpu() {
+        let gpus = [SimulatedGpu::strix_halo(), SimulatedGpu::mi300x(0x11)];
+        let inventory = windows_gpu_inventory(&gpus);
+        let lines: Vec<&str> = inventory.lines().collect();
+        assert_eq!(lines.len(), 2, "{inventory}");
+        assert!(
+            lines[0].starts_with("GPU\tAMD Radeon(TM) 8060S Graphics\t"),
+            "{inventory}"
+        );
+        assert!(lines[0].contains("VEN_1002&DEV_1586&"), "{inventory}");
+        assert!(
+            lines[1].starts_with("GPU\tAMD Instinct MI300X\t"),
+            "{inventory}"
+        );
+        assert!(lines[1].contains("VEN_1002&DEV_74A1&"), "{inventory}");
+    }
+
+    /// The stand-in answers only the command line it was planted for: the CLI
+    /// running `lspci` with other flags gets a missing command naming the whole
+    /// line, not the canned text for the old flags. `powershell.exe` is the one
+    /// tool answered whatever its arguments.
+    #[test]
+    fn the_stand_in_refuses_a_command_line_nobody_planted() {
         let root = planted(&SimulatedHost::wsl2_strix_halo());
-        let bin = root.path().join(TOOL_OUTPUT_DIR).join("bin");
-        assert!(bin.join("powershell.exe").symlink_metadata().is_ok());
-        assert!(bin.join("lspci").symlink_metadata().is_ok());
+        let outputs = root.path().join(TOOL_OUTPUT_DIR);
+        let args = |line: &str| line.split(' ').map(str::to_owned).collect::<Vec<_>>();
+        assert!(canned_answer(&outputs, "lspci", &args("-nn -D")).is_ok());
+        let err = canned_answer(&outputs, "lspci", &args("-nn")).unwrap_err();
+        assert!(err.starts_with("lspci: command not found"), "{err}");
+        assert!(err.contains("`lspci -nn`"), "{err}");
+        assert!(canned_answer(&outputs, "uname", &args("-n")).is_err());
+        assert!(canned_answer(&outputs, "rocminfo", &[]).is_err());
+        assert!(canned_answer(&outputs, "powershell.exe", &args("-Command x")).is_ok());
+    }
+
+    /// Unix only: a simulated machine is a Linux host, and on Windows a
+    /// drive-less `/usr/bin` is not an absolute path at all.
+    #[cfg(unix)]
+    #[test]
+    fn only_absolute_path_entries_outside_mnt_reach_a_simulated_machine() {
+        assert!(keep_path_dir(Path::new("/usr/bin")));
+        assert!(keep_path_dir(Path::new("/mntx/bin")));
+        assert!(!keep_path_dir(Path::new("/mnt/c/Windows/System32")));
+        assert!(!keep_path_dir(Path::new("/mnt")));
+        assert!(!keep_path_dir(Path::new("bin")));
+        assert!(!keep_path_dir(Path::new("./node_modules/.bin")));
+    }
+
+    /// The filtered view of the real `PATH` keeps the first executable of each
+    /// name, as a lookup would find it, and leaves out non-executables.
+    #[cfg(unix)]
+    #[test]
+    fn the_filtered_path_keeps_the_first_executable_of_each_name() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let make = |dir: &Path, name: &str, mode: u32| {
+            let path = dir.join(name);
+            std::fs::write(&path, "").expect("file");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("chmod");
+        };
+        let first = tempfile::tempdir().expect("first");
+        let second = tempfile::tempdir().expect("second");
+        make(first.path(), "tar", 0o755);
+        make(first.path(), "notes.txt", 0o644);
+        make(second.path(), "tar", 0o755);
+        make(second.path(), "sh", 0o755);
+        let out = tempfile::tempdir().expect("out");
+        let real_path = std::env::join_paths([first.path(), second.path()]).expect("join");
+        let dir = filter_real_path(&out.path().join("view"), &real_path).expect("filter");
+        assert_eq!(
+            std::fs::read_link(dir.join("tar")).expect("tar"),
+            first.path().join("tar")
+        );
+        assert_eq!(
+            std::fs::read_link(dir.join("sh")).expect("sh"),
+            second.path().join("sh")
+        );
+        assert!(dir.join("notes.txt").symlink_metadata().is_err());
     }
 }
 
@@ -837,6 +1062,32 @@ mod drift_tests {
         let drift = bare_metal_layout_drift(real.path(), simulated.path());
         assert!(
             drift.iter().any(|line| line.contains("gfx_target_version")),
+            "{drift:#?}"
+        );
+    }
+
+    /// Held against a simulated machine with no GPU, the checks that do not
+    /// need a simulated GPU node to compare with still run: a real CPU node
+    /// that reports a target, or no AMD DRM card at all, is drift either way.
+    #[test]
+    fn checks_without_a_simulated_gpu_node_still_run() {
+        let real = planted(&SimulatedHost::instinct_mi300x(1));
+        let cpu = real.path().join(KFD_NODES).join("0");
+        let props = std::fs::read_to_string(cpu.join("properties")).expect("props");
+        std::fs::write(
+            cpu.join("properties"),
+            props.replace("gfx_target_version 0", "gfx_target_version 90402"),
+        )
+        .expect("rewrite");
+        std::fs::remove_dir_all(real.path().join("sys/class/drm")).expect("drop drm");
+        let simulated = planted(&SimulatedHost::bare_metal_without_gpu());
+        let drift = bare_metal_layout_drift(real.path(), simulated.path());
+        assert!(
+            drift.iter().any(|line| line.contains("CPU KFD node")),
+            "{drift:#?}"
+        );
+        assert!(
+            drift.iter().any(|line| line.contains("vendor 0x1002")),
             "{drift:#?}"
         );
     }
