@@ -36,6 +36,7 @@ const MAX_KEY_LEN: u64 = 4096;
 
 /// The input-embedding tensor, which llama.cpp keeps in host memory.
 const TOKEN_EMBD_NAME: &str = "token_embd.weight";
+const OUTPUT_NAME: &str = "output.weight";
 /// String values longer than this are skipped rather than stored; the only
 /// strings the estimate reads (an architecture name) are far shorter.
 const MAX_KEPT_STRING: u64 = 4096;
@@ -177,6 +178,10 @@ pub struct GgufHeader {
     pub moe: bool,
     /// Where `token_embd.weight` sits in the tensor data, when the file has one.
     pub token_embd: Option<TensorSpan>,
+    /// The file has its own `output.weight`. Without one the embeddings are
+    /// tied: llama.cpp uses `token_embd.weight` for the output layer too, and
+    /// places that use of it with the output layer, on the GPU.
+    pub has_output: bool,
 }
 
 /// A tensor's place in the tensor data.
@@ -502,6 +507,7 @@ pub fn parse_gguf_header<R: Read + Seek>(source: &mut R) -> Result<GgufHeader, G
     let mut param_count = 0_u64;
     let mut offsets: Vec<u64> = Vec::new();
     let mut token_embd_offset = None;
+    let mut has_output = false;
     for _ in 0..tensor_count {
         let name = reader.string(MAX_KEY_LEN)?;
         let dims = reader.u32()?;
@@ -522,6 +528,7 @@ pub fn parse_gguf_header<R: Read + Seek>(source: &mut R) -> Result<GgufHeader, G
         if name.as_deref() == Some(TOKEN_EMBD_NAME) {
             token_embd_offset = Some(offset);
         }
+        has_output |= name.as_deref() == Some(OUTPUT_NAME);
     }
     let token_embd = token_embd_offset.map(|offset| TensorSpan {
         offset,
@@ -564,6 +571,7 @@ pub fn parse_gguf_header<R: Read + Seek>(source: &mut R) -> Result<GgufHeader, G
         latent_attention,
         moe,
         token_embd,
+        has_output,
     })
 }
 
@@ -738,7 +746,8 @@ pub(crate) mod test_builder {
     }
 
     /// A llama-shaped model: 32 layers, 32 heads of which 8 are KV heads, head
-    /// width 128, so 4096 embedding. Vocabulary of `vocab` tokens.
+    /// width 128, so 4096 embedding. Vocabulary of `vocab` tokens. It has its
+    /// own `output.weight`, as Llama 3 does, so its embeddings are not tied.
     pub fn llama_like(vocab: usize) -> Builder {
         Builder::new()
             .string("general.architecture", "llama")
@@ -751,6 +760,11 @@ pub(crate) mod test_builder {
             .string_array("tokenizer.ggml.tokens", vocab)
             .tensor_at("token_embd.weight", &[4096, vocab as u64], 0)
             .tensor_at("blk.0.attn_q.weight", &[4096, 4096], vocab as u64 * 4096)
+            .tensor_at(
+                "output.weight",
+                &[4096, vocab as u64],
+                vocab as u64 * 4096 + 4096 * 4096,
+            )
     }
 }
 
@@ -776,8 +790,8 @@ mod tests {
         assert_eq!(header.head_count, Some(PerLayer::Uniform(32)));
         assert_eq!(header.head_count_kv, Some(PerLayer::Uniform(8)));
         assert_eq!(header.context_length, Some(131_072));
-        assert_eq!(header.tensor_count, 2);
-        assert_eq!(header.param_count, 4096 * 10 + 4096 * 4096);
+        assert_eq!(header.tensor_count, 3);
+        assert_eq!(header.param_count, 2 * 4096 * 10 + 4096 * 4096);
         assert!(!header.sliding_window && !header.ssm && !header.latent_attention);
     }
 
@@ -814,6 +828,20 @@ mod tests {
                 next_offset: None
             })
         );
+    }
+
+    #[test]
+    fn an_output_tensor_is_noticed_and_its_absence_means_tied_embeddings() {
+        let untied = Builder::new()
+            .tensor_at("token_embd.weight", &[8, 8], 0)
+            .tensor_at("output.weight", &[8, 8], 64)
+            .file(128);
+        assert!(parse(&untied).unwrap().has_output);
+        let tied = Builder::new()
+            .tensor_at("token_embd.weight", &[8, 8], 0)
+            .tensor_at("output_norm.weight", &[8], 64)
+            .file(128);
+        assert!(!parse(&tied).unwrap().has_output);
     }
 
     #[test]
@@ -899,7 +927,7 @@ mod tests {
             .file(0);
         let header = parse(&file).unwrap();
         assert_eq!(header.key_length, Some(99));
-        assert_eq!(header.tensor_count, 2);
+        assert_eq!(header.tensor_count, 3);
     }
 
     /// A feed-forward width given per layer (an array) is read as the widest,

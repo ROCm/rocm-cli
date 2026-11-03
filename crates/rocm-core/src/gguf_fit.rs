@@ -10,19 +10,30 @@
 //!
 //! The KV-cache formula is exact for a plain full-attention model (it is how
 //! llama.cpp lays the cache out), and the weights are the file's own size from
-//! its tensor offsets, less the input embedding, which llama.cpp keeps in host
-//! memory. Only two allowances are **calibrated against real loads on one GPU and
-//! one engine build**: the compute buffer and the runtime overhead. The loads were
-//! on an MI300X (gfx942) with llama.cpp b9752 on ROCm 7.2, flash attention on, two
-//! dense models (a 32-layer Llama-shaped Q4_K_M and a 28-layer Qwen2-shaped Q8_0),
-//! each at several context sizes and KV-cache types (fifteen loads), and one more
-//! load of the Llama-shaped model made with the card almost full. In fifteen of
-//! the sixteen the total came out *above* what the GPU's used memory grew by: by
-//! 0.05% to 2.9% with an f16 KV cache and up to 4.5% with a quantized one, where
-//! the dequantization allowance is deliberately generous. In the sixteenth it was
-//! 5.5% above, because the process overhead measured there was about 0.4 GiB
-//! against 1.05-1.28 GiB in the others, for a reason that is not known. Across
-//! all sixteen it was 0.05% to 5.5% above and never below. That is the same data
+//! its tensor offsets, less the input embedding when the file has its own output
+//! layer: llama.cpp keeps the input embedding in host memory, but a model with
+//! tied embeddings (no `output.weight`) uses the same tensor as its output
+//! layer's weight, which goes to the GPU with that layer, so there it is counted.
+//! Only two allowances are **calibrated against real loads on one GPU and one
+//! engine build**: the compute buffer and the runtime overhead. The loads were on
+//! an MI300X (gfx942) with llama.cpp b9752 on ROCm 7.2, flash attention on, two
+//! dense full-attention models -- a 32-layer Llama-3.1-8B-shaped Q4_K_M with its
+//! own output layer, and a 28-layer Qwen2.5-1.5B-shaped Q8_0 with tied embeddings
+//! -- each at several context sizes and KV-cache types (fifteen loads), and one
+//! more load of the Llama-shaped model made with the card almost full. In all
+//! sixteen the total came out *above* what the GPU's used memory grew by, never
+//! below. For the Llama-shaped model it was 0.8% to 2.9% above with an f16 KV
+//! cache and up to 4.5% with a quantized one, where the dequantization allowance
+//! is deliberately generous, and 5.5% in the load made with the card almost full,
+//! because the process overhead measured there was about 0.4 GiB against 1.05-1.1
+//! GiB in the others, for a reason that is not known. For the tied Qwen-shaped
+//! model it was 3.6% to 7.9% above with an f16 cache and 9.5% with a q8_0 one: the
+//! output layer's copy of the embedding (236 MiB) is counted, and llama.cpp's own
+//! log did not show it in the GPU's model buffer, but the overhead left over for
+//! that model was about 180 MiB larger than for the Llama-shaped one, so whether
+//! it is really on the GPU is not settled and the estimate takes the side that
+//! cannot say "fits" when it does not. Across all sixteen it was 0.8% to 9.5%
+//! above. That is the same data
 //! the allowances were fitted to, so it measures the fit, not a guarantee:
 //! another engine build, another GPU or a different batch size can miss by more.
 //! That is why the answer is labelled an *estimate* everywhere it is shown. Where
@@ -538,13 +549,19 @@ fn sizing(header: &GgufHeader, file_size: u64) -> Result<Sizing, (CannotEstimate
         })?;
     // The input embedding runs from its offset to the next tensor's, or to the
     // end of the data when it is the last. Clamped so a header that disagrees
-    // with the file's size cannot make the weights negative.
-    let embedding = header.token_embd.map_or(0, |span| {
-        span.next_offset
-            .unwrap_or(data)
-            .min(data)
-            .saturating_sub(span.offset)
-    });
+    // with the file's size cannot make the weights negative. llama.cpp keeps it
+    // in host memory only when the file has its own output layer: with tied
+    // embeddings (no `output.weight`) the same tensor is the output layer's
+    // weight too, and is placed with that layer on the GPU, so it stays in.
+    let embedding = header
+        .token_embd
+        .filter(|_| header.has_output)
+        .map_or(0, |span| {
+            span.next_offset
+                .unwrap_or(data)
+                .min(data)
+                .saturating_sub(span.offset)
+        });
     let weights = data.saturating_sub(embedding);
 
     let mut kv_elements = 0_u64;
@@ -2453,6 +2470,9 @@ mod tests {
     /// feed-forward 8960, tied embeddings (no `output.weight`). 1_888_581_632
     /// bytes of tensor data, of which the 151936 x 1536 Q8_0 `token_embd.weight`
     /// is 247_959_552 (236.47 MiB logged host-mapped, 1564.63 MiB on the GPU).
+    /// The estimate counts the embedding in VRAM as well, for the output layer's
+    /// use of it, so its total is above this model's loads by more than the
+    /// Llama-shaped model's.
     fn measured_qwen() -> (GgufHeader, u64) {
         let builder = Builder::new()
             .string("general.architecture", "qwen2")
@@ -2520,7 +2540,8 @@ mod tests {
         bytes as f64 / MIB as f64
     }
 
-    fn check_against_measured(header: &GgufHeader, size: u64, loads: &[Load]) {
+    /// `above` is how far above the measured use the total may come, as a factor.
+    fn check_against_measured(header: &GgufHeader, size: u64, loads: &[Load], above: f64) {
         for measured in loads {
             let result = estimate(
                 header,
@@ -2552,11 +2573,12 @@ mod tests {
                     "{label}: compute {compute}"
                 );
             }
-            // The total is above what the load really used, and by under 5%.
+            // The total is above what the load really used, and by less than
+            // `above`.
             let total = mib(result.total_bytes.unwrap());
             assert!(total >= measured.used_mib, "{label}: total {total}");
             assert!(
-                total <= measured.used_mib * 1.05,
+                total <= measured.used_mib * above,
                 "{label}: total {total} vs {}",
                 measured.used_mib
             );
@@ -2566,13 +2588,15 @@ mod tests {
     #[test]
     fn the_llama_shaped_model_reproduces_the_measured_loads() {
         let (header, size) = measured_llama();
-        check_against_measured(&header, size, &LLAMA_LOADS);
+        check_against_measured(&header, size, &LLAMA_LOADS, 1.05);
     }
 
     #[test]
     fn the_qwen_shaped_tied_embedding_model_reproduces_the_measured_loads() {
         let (header, size) = measured_qwen();
-        check_against_measured(&header, size, &QWEN_LOADS);
+        // The output layer's copy of the tied embedding is counted: 3.6% to
+        // 9.5% above.
+        check_against_measured(&header, size, &QWEN_LOADS, 1.10);
     }
 
     /// The sixteenth load, made with the card almost full: the process overhead
@@ -2626,10 +2650,11 @@ mod tests {
             KvCacheType::F16,
             AcceleratorMemory::Dedicated(192.0),
         );
-        assert_eq!(result.weights_bytes, Some(1_640_622_080));
+        // Tied embeddings: the whole tensor data, the embedding included.
+        assert_eq!(result.weights_bytes, Some(1_888_581_632));
         assert_eq!(result.kv_cache_bytes, Some(896 * MIB));
         assert_eq!(result.compute_buffer_bytes, Some(64_487_424 + 32 * MIB));
-        assert_eq!(result.total_bytes, Some(4_020_365_312));
+        assert_eq!(result.total_bytes, Some(4_020_365_312 + 247_959_552));
     }
 
     #[test]
@@ -3043,6 +3068,7 @@ mod tests {
             .u32("llama.embedding_length", 64)
             .u32("llama.attention.head_count", 4)
             .tensor_at("blk.0.attn_q.weight", &[64, 64], 0)
+            .tensor_at("output.weight", &[64, 100], 500)
             .tensor_at("token_embd.weight", &[64, 100], 1000);
         let (header, size) = header_of(&builder, 0);
         let size = size + 5000;
@@ -3054,6 +3080,24 @@ mod tests {
             AcceleratorMemory::Dedicated(8.0),
         );
         assert_eq!(result.weights_bytes, Some(1000));
+        // The same file without its own output layer has tied embeddings: the
+        // output layer uses the embedding on the GPU, so it stays in.
+        let tied = Builder::new()
+            .string("general.architecture", "llama")
+            .u32("llama.block_count", 2)
+            .u32("llama.embedding_length", 64)
+            .u32("llama.attention.head_count", 4)
+            .tensor_at("blk.0.attn_q.weight", &[64, 64], 0)
+            .tensor_at("token_embd.weight", &[64, 100], 1000);
+        let (header, size) = header_of(&tied, 0);
+        let result = estimate(
+            &header,
+            size + 5000,
+            512,
+            KvCacheType::F16,
+            AcceleratorMemory::Dedicated(8.0),
+        );
+        assert_eq!(result.weights_bytes, Some(5000));
         // No input embedding at all: every byte of the data is weights.
         let builder = Builder::new()
             .string("general.architecture", "llama")
@@ -3077,6 +3121,7 @@ mod tests {
             .u32("llama.block_count", 2)
             .u32("llama.embedding_length", 64)
             .u32("llama.attention.head_count", 4)
+            .tensor_at("output.weight", &[64, 100], 0)
             .tensor_at("token_embd.weight", &[64, 100], 9_000);
         let (header, size) = header_of(&builder, 0);
         let result = estimate(
@@ -3188,7 +3233,8 @@ mod tests {
             .u32("llama.attention.head_count_kv", 8)
             .u32("llama.context_length", 131_072)
             .tensor_at("token_embd.weight", &[4096, 10], 0)
-            .tensor_at("big", &[params], embedding);
+            .tensor_at("big", &[params], embedding)
+            .tensor_at("output.weight", &[4096, 10], data);
         let (header, size) = header_of(&builder, 0);
         let size = size + data;
         // What Q5_K_M (5.69 bits per weight) needs in VRAM, worked out here: the

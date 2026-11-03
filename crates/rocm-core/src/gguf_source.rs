@@ -1279,7 +1279,7 @@ mod tests {
             seeks: Arc::clone(&seeks),
         }));
         let header = parse_gguf_header(&mut reader).unwrap();
-        assert_eq!(header.tensor_count, 2);
+        assert_eq!(header.tensor_count, 3);
         // The same header read straight from memory: the wrapper changes how
         // the bytes are reached, never what is read.
         let direct =

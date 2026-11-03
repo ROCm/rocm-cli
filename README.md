@@ -864,9 +864,14 @@ or GPU layer count yet**, so none of them is printed as a `rocm serve` command.
 
 The KV cache is exact for a plain full-attention model, and the weights are the
 file's own size from its tensor offsets, less the input embedding, which
-llama.cpp keeps in host memory. Only the compute buffer and the runtime reserve
-are allowances, calibrated against real loads of two dense models on one MI300X
-with llama.cpp b9752, flash attention on. How close the estimate came to those
+llama.cpp keeps in host memory -- except for a model with tied embeddings (no
+separate output layer), whose output layer uses the same tensor on the GPU, so
+there it is counted. Only the compute buffer and the runtime reserve are
+allowances, calibrated against real loads of two dense full-attention models on
+one MI300X with llama.cpp b9752, flash attention on: a Llama-3.1-8B-shaped model
+with its own output layer and a Qwen2.5-1.5B-shaped model with tied embeddings.
+No mixture-of-experts, state-space, hybrid or sliding-window model was among
+them. How close the estimate came to those
 loads, and why that describes the fit rather than a bound, is written down once,
 in the
 [`gguf_fit` module documentation](https://github.com/ROCm/rocm-cli/blob/main/crates/rocm-core/src/gguf_fit.rs).
@@ -877,7 +882,9 @@ A state-space or hybrid model's recurrent state is not counted, and a
 mixture-of-experts model's compute buffer was not measured, so for those the
 figures are shown with this GPU's memory but with no fits / does-not-fit verdict
 (`cannot_estimate`, reason `unmeasured_layout`): a "fits" that is too low would
-be worse than no answer. A header without the feed-forward or embedding width,
+be worse than no answer. Many current open models are mixture-of-experts or
+hybrid, so for a large share of them this gives the memory figures and leaves
+the comparison to the reader. A header without the feed-forward or embedding width,
 which size the compute buffer, is treated the same way (reason
 `missing_metadata`, with the figures). Another
 GPU, engine build or batch size can miss by more, so leave headroom. The figures

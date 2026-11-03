@@ -3395,8 +3395,10 @@ the text report opens `ESTIMATED:` for the first two. The parts and their tests:
   mixture-of-experts layouts that get their figures with no verdict, and the
   measured llama.cpp loads the allowances were calibrated on, which the synthetic Llama- and
   Qwen-shaped headers must reproduce: buffer sizes, and a total above the
-  measured use by at most 5% in each load but one, and by 5% to 6% in the load
-  made with the card almost full. The module documentation describes the loads
+  measured use by at most 5% in each load of the Llama-shaped model but one, by
+  5% to 6% in the load made with the card almost full, and by at most 10% for the
+  tied-embedding Qwen-shaped model, whose output layer's copy of the embedding is
+  counted. The module documentation describes the loads
   and records the actual margins).
 - [gguf_source.rs](../crates/rocm-core/src/gguf_source.rs): reference parsing
   (an existing file wins over `owner/repo:QUANT`; `owner/repo:dir/file.gguf`
