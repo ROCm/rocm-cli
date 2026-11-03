@@ -1086,6 +1086,18 @@ asserting on the files left on disk rather than on the summary line the command
 prints — the defect they exist to fix is a file being left behind, which a
 summary claiming success cannot reveal.
 
+Every command that takes a service id (`services stop`/`restart`/`logs`/`remove`
+and `rocm logs --service`) reads the record through one loader,
+`ManagedServiceRecord::read_manifest` in
+[service_record.rs](../crates/rocm-core/src/service_record.rs), which `rocmd`
+shares too. An id with no record fails with one plain line pointing at
+`rocm services list --all` and no OS error under it; a record that exists but
+cannot be read or parsed keeps its cause. The loader's unit tests cover all
+three cases, and `features/service_unknown_id.feature` (`service-unknown-01`
+through `-05`, mock lane) runs each command against a missing id, asserting
+the exit code and the exact error together, then runs the listing command the
+error names to confirm it works and does not list the id.
+
 `prune`'s leftover sweep carries a second, unrelated race: a file with no record
 beside it is also what a *launch in progress* looks like, because `rocm serve`
 writes the 0600 endpoint key before it writes the record, and `--any-age` leaves
