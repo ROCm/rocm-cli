@@ -2802,10 +2802,10 @@ async fn assert_exit_codes_published(world: &mut E2eWorld) {
 #[then("the CLI refuses and explains that the two cannot be combined")]
 async fn assert_json_with_fix_id_refused(world: &mut E2eWorld) {
     let stderr = world.cli_stderr.as_ref().expect("no stderr");
-    assert_ne!(
+    assert_eq!(
         world.cli_rc,
-        Some(0),
-        "a request with no answer must not look like it succeeded"
+        Some(1),
+        "a request with no answer must exit 1, as README.md and reference.md document"
     );
     assert!(
         stderr.contains("--json"),
@@ -3222,7 +3222,9 @@ async fn assert_no_hip_sdk_advice(world: &mut E2eWorld) {
     // The stated substitute is the unit test
     // `fix_13_does_not_fire_on_a_lemonade_vulkan_host_with_no_hip_evidence` in
     // `rocm-core::diagnose`, which drives the whole `diagnose()` pipeline on
-    // the ticket's exact Windows/gfx90c host shape.
+    // the ticket's exact Windows/gfx90c host shape. The gate on a supported
+    // Windows GPU (the Strix Halo shape of ROCMAI-830) does run end to end, as
+    // `diagnose-48` on the Windows GPU lane.
     let output = world.cli_output.as_ref().expect("no diagnose output");
     assert!(
         !output.contains("fix-13-hip-sdk-missing"),
@@ -3269,4 +3271,63 @@ async fn assert_old_driver_advice_follows_the_inspection(world: &mut E2eWorld) {
             .unwrap_or_else(|| panic!("the diagnosis has no numeric threshold:\n{diagnosis:#}"));
         assert!(score < threshold, "{row:#}");
     }
+}
+
+#[then(
+    "the diagnosis lists the HIP SDK cause only when the inspection finds something that needs it"
+)]
+async fn assert_hip_sdk_advice_follows_the_inspection(world: &mut E2eWorld) {
+    const FIX_ID: &str = "fix-13-hip-sdk-missing";
+    let diagnosis: serde_json::Value =
+        serde_json::from_str(world.cli_output.as_ref().expect("no diagnosis"))
+            .expect("`diagnose --json` did not emit valid JSON");
+    let (examine_json, _, _) = crate::run_rocm(world, &["examine", "--json"]);
+    let examine: serde_json::Value =
+        serde_json::from_str(&examine_json).expect("`examine --json` did not emit valid JSON");
+    let field = |name: &str| {
+        examine
+            .get(name)
+            .unwrap_or_else(|| panic!("the inspection carries no `{name}`:\n{examine:#}"))
+    };
+    let text = |name: &str| field(name).as_str().unwrap_or_default().to_owned();
+    // Something on this host that calls into the system HIP SDK, read from the
+    // inspection the same way `check_13_hip_sdk_missing` reads it with no
+    // symptom: a managed runtime's HIP build brings its own HIP runtime, and
+    // Lemonade's bundled llama.cpp is not on PATH as a HIP build.
+    let has_amd_gpu = field("has_amd_gpu").as_bool() == Some(true);
+    let framework = text("framework");
+    let ambient_hip_torch = framework == "pytorch"
+        && text("framework_rocm_version").starts_with("hip=")
+        && text("framework_source") != "managed-runtime";
+    let hip_llama_cpp = framework == "llama-cpp" && text("framework_rocm_version") == "GGML_HIP=ON";
+    let ambient_hip_torch = has_amd_gpu && ambient_hip_torch;
+    let hip_llama_cpp = has_amd_gpu && hip_llama_cpp;
+    let needs_hip = ambient_hip_torch || hip_llama_cpp;
+    let sdk_unusable =
+        text("hip_sdk_path").is_empty() || field("hipinfo_present").as_bool() != Some(true);
+    // ROCMAI-837 considers the ambient-torch +25 listing beside a healthy SDK
+    // wrong. This oracle copies that rule on purpose, so whoever changes the
+    // +25 bonus in `check_13_hip_sdk_missing` must update this copy too.
+    // Mirrors the scoring in `check_13_hip_sdk_missing`, not only its
+    // headline: inside the `needs_hip` gate an unusable SDK scores 35 or 30,
+    // and an ambient HIP-built torch adds a further 25 that does not look at
+    // the SDK at all. `run_all_checks` keeps any score above zero in
+    // `matched`, so a host with ambient HIP torch and a healthy SDK still
+    // lists the entry (weakly, 25).
+    let expected = needs_hip && (sdk_unusable || ambient_hip_torch);
+    let present = diagnosis["matched"]
+        .as_array()
+        .expect("matched is a list")
+        .iter()
+        .any(|entry| entry["id"] == FIX_ID);
+    assert_eq!(
+        present,
+        expected,
+        "{FIX_ID} present: {present}; inspection: framework {framework:?} (source {:?}, \
+         rocm {:?}), HIP SDK {:?}, hipInfo {}\n{diagnosis:#}",
+        text("framework_source"),
+        text("framework_rocm_version"),
+        text("hip_sdk_path"),
+        field("hipinfo_present"),
+    );
 }

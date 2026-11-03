@@ -39,11 +39,8 @@ async fn assert_driver_plan_matches_host_release(world: &mut E2eWorld) {
     // Derived from the host's own `/etc/os-release`, not from `output` --
     // asserting against the very thing being checked would let a change that
     // breaks the arm-selection logic pass by construction. The hosted
-    // `ubuntu-latest` E2E image (26.04 once GitHub's migration completes) reports 26.04 ("resolute"), which has no
-    // published repo.radeon.com/amdgpu suite yet and takes
-    // `ubuntu_native_archive`; the self-hosted GPU lane reports 24.04 and
-    // takes the apt arm. See the `("ubuntu", "26.04")` arm in
-    // `driver_install.rs`.
+    // `ubuntu-latest` E2E image (26.04 once GitHub's migration completes) and the self-hosted GPU
+    // lane (24.04) both take the apt arm, with their own release codename.
     let os_release_text =
         rocm_core::hardware_root::read_os_release(rocm_core::hardware_root::identity_path_for_str)
             .text()
@@ -54,21 +51,11 @@ async fn assert_driver_plan_matches_host_release(world: &mut E2eWorld) {
     if os_release.get("ID").map(String::as_str) != Some("ubuntu") {
         // Every bare-metal Linux lane in this repo runs Ubuntu today, but
         // this scenario's premise is Ubuntu specifically (every assertion
-        // below hard-codes Ubuntu's apt/native-archive command text), so a
+        // below hard-codes Ubuntu's apt command text), so a
         // future non-Ubuntu bare-metal lane has no premise here rather than
         // failing against text it was never meant to produce. The harness has
         // no per-step skip, so say so rather than passing silently.
         eprintln!("driver-install-06: not an Ubuntu host, nothing asserted");
-        return;
-    }
-
-    if os_release.get("VERSION_ID").map(String::as_str) == Some("26.04") {
-        assert!(output.contains("policy: ubuntu_native_archive"), "{output}");
-        assert!(output.contains("supported: false"), "{output}");
-        assert!(
-            output.contains("ships ROCm natively via the standard archive"),
-            "{output}"
-        );
         return;
     }
 
@@ -95,6 +82,24 @@ async fn assert_driver_plan_matches_host_release(world: &mut E2eWorld) {
     );
     assert!(
         output.contains("tee /etc/apt/sources.list.d/amdgpu.list >/dev/null"),
+        "{output}"
+    );
+    // The suite is the host's own codename, so 26.04 gets `resolute`.
+    let codename = os_release
+        .get("VERSION_CODENAME")
+        .or_else(|| os_release.get("UBUNTU_CODENAME"))
+        .expect("Ubuntu os-release names a codename");
+    assert!(
+        output.contains(&format!("/ubuntu {codename} main")),
+        "{output}"
+    );
+    // A previous amdgpu-dkms is detected and warned about, never removed
+    // by the plan itself. The dry run only shows the planned command text; the
+    // conditional (warns only when amdgpu-dkms is installed) is proven by
+    // `previous_driver_warning_fires_only_when_amdgpu_dkms_is_installed` in
+    // apps/rocm/src/driver_install.rs.
+    assert!(
+        output.contains("from a previous installation is installed and was not removed"),
         "{output}"
     );
 }

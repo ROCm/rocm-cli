@@ -39,6 +39,10 @@ use serde::Deserialize;
 
 use crate::EnginesCommand;
 use crate::engine_ipc::{engine_request, engine_request_with_env_root};
+use crate::engine_runtime_select::{
+    apply_app_path_env, resolve_engine_selection, resolve_runtime_selector_to_exact_key,
+    validate_engine_selection_runtime,
+};
 use crate::runtime_install_finalize::{
     ensure_libatomic_for_torch, ensure_libnuma_for_torch, ensure_openmpi_for_vllm,
     settle_engine_install,
@@ -49,9 +53,8 @@ use crate::runtimes_cmd::{
 };
 use crate::therock;
 use crate::{
-    apply_app_path_env, record_cli_audit_event, render_engine_inventory_text_with_paths,
-    resolve_engine_selection, resolve_runtime_selector_to_exact_key,
-    validate_engine_selection_runtime,
+    GatedEngineAction, ensure_engine_allowed_on_platform, record_cli_audit_event,
+    render_engine_inventory_text_with_paths,
 };
 
 pub(crate) fn render_engine_inventory_text() -> String {
@@ -78,6 +81,9 @@ pub(crate) fn engines(command: EnginesCommand) -> Result<()> {
             reinstall,
             yes,
         } => {
+            // Before runtime resolution and any download: the same platform
+            // decision `engines list` reports as `unsupported_native_windows`.
+            ensure_engine_allowed_on_platform(&engine, GatedEngineAction::Install)?;
             let paths = AppPaths::discover()?;
             let mut config = RocmCliConfig::load(&paths)?;
             let runtime_id =
@@ -553,6 +559,11 @@ fn engine_shell(
     env_id: Option<&str>,
     shell_override: Option<&str>,
 ) -> Result<()> {
+    // `resolve_engine_env` below issues `EngineMethod::Install` itself when an
+    // active runtime has no environment yet, so this is an install route and
+    // takes the same up-front platform refusal as `engines install`. It sits
+    // before the terminal check so the refusal does not depend on a TTY.
+    ensure_engine_allowed_on_platform(engine, GatedEngineAction::Install)?;
     if !interactive_terminal() {
         bail!("`rocm engines shell` requires an interactive terminal");
     }

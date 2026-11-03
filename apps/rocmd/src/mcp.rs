@@ -2,21 +2,22 @@
 //
 // SPDX-License-Identifier: MIT
 
-use crate::common::{self, CommandCapture};
+use crate::common;
+use crate::host_snapshot;
 use crate::persistence;
 use anyhow::{Context, Result, bail};
 #[cfg(test)]
 use rocm_core::unix_time_millis;
 use rocm_core::{
-    AppPaths, AutomationRuntimeState, DEFAULT_LOCAL_HOST, ExamineSummary, RocmCliConfig,
-    load_recent_automation_events,
+    AppPaths, AutomationRuntimeState, CommandCapture, DEFAULT_LOCAL_HOST, ExamineSummary,
+    RocmCliConfig, command_capture_text, load_recent_automation_events,
 };
-use serde::Serialize;
 use serde_json::Value;
 use serde_json::json;
 use std::collections::VecDeque;
 use std::fs;
 use std::io::{self, BufRead, Write};
+use std::time::Duration;
 
 pub(crate) fn run_mcp_server(paths: &AppPaths) -> Result<()> {
     let stdin = io::stdin();
@@ -175,14 +176,6 @@ fn write_json_line(writer: &mut impl Write, value: &Value) -> Result<()> {
     writer.write_all(serde_json::to_string(value)?.as_bytes())?;
     writer.write_all(b"\n")?;
     writer.flush()?;
-    Ok(())
-}
-
-pub(crate) fn print_json<T: Serialize>(value: &T) -> Result<()> {
-    println!(
-        "{}",
-        serde_json::to_string_pretty(value).context("failed to serialize json output")?
-    );
     Ok(())
 }
 
@@ -567,7 +560,7 @@ pub(crate) fn handle_mcp_tool_call(paths: &AppPaths, params: &Value) -> Result<V
     match name {
         "examine" => {
             let examine = ExamineSummary::gather()?;
-            let output = common::run_rocm_capture(&["examine"])?;
+            let output = run_rocm_capture(&["examine"])?;
             let text = command_capture_text(&output);
             if output.exit_status == 0 {
                 Ok(tool_success(text, json!(examine)))
@@ -584,7 +577,7 @@ pub(crate) fn handle_mcp_tool_call(paths: &AppPaths, params: &Value) -> Result<V
             }
         }
         "bridge_snapshot" => {
-            let snapshot = common::build_bridge_snapshot(paths)?;
+            let snapshot = host_snapshot::build_bridge_snapshot(paths)?;
             Ok(tool_success(
                 format!(
                     "Captured bridge snapshot for {} / {} with default engine `{}`.",
@@ -595,7 +588,7 @@ pub(crate) fn handle_mcp_tool_call(paths: &AppPaths, params: &Value) -> Result<V
         }
         "gpu_snapshot" => {
             let config = RocmCliConfig::load(paths).unwrap_or_default();
-            let gpu = common::gather_gpu_snapshot_for_config(&config);
+            let gpu = host_snapshot::gather_gpu_snapshot_for_config(&config);
             let status = if !config.telemetry.local_inspection_enabled() {
                 "GPU telemetry is disabled by rocm-cli config."
             } else if gpu.amd_smi_available {
@@ -606,7 +599,7 @@ pub(crate) fn handle_mcp_tool_call(paths: &AppPaths, params: &Value) -> Result<V
             Ok(tool_success(status.to_owned(), json!(gpu)))
         }
         "engines" => {
-            let engines = common::bridge_engine_inventory();
+            let engines = host_snapshot::bridge_engine_inventory();
             Ok(tool_success(
                 format!("Found {} engine entries.", engines.len()),
                 json!({ "engines": engines }),
@@ -670,7 +663,7 @@ pub(crate) fn handle_mcp_tool_call(paths: &AppPaths, params: &Value) -> Result<V
                 .get("request")
                 .and_then(Value::as_str)
                 .context("natural_language_plan requires `request`")?;
-            let output = common::run_rocm_capture(&[request])?;
+            let output = run_rocm_capture(&[request])?;
             Ok(tool_result_from_command(
                 "Ran natural-language planning through `rocm`.",
                 output,
@@ -681,7 +674,7 @@ pub(crate) fn handle_mcp_tool_call(paths: &AppPaths, params: &Value) -> Result<V
             let argv = normalized_rocm_command_args(&arguments)?;
             ensure_rocm_command_is_read_only(&argv)?;
             let refs = argv.iter().map(String::as_str).collect::<Vec<_>>();
-            let output = common::run_rocm_capture(&refs)?;
+            let output = run_rocm_capture(&refs)?;
             Ok(tool_result_from_command(
                 "Ran read-only `rocm` command.",
                 output,
@@ -689,7 +682,7 @@ pub(crate) fn handle_mcp_tool_call(paths: &AppPaths, params: &Value) -> Result<V
             ))
         }
         "update_check" => {
-            let output = common::run_rocm_capture(&["update"])?;
+            let output = run_rocm_capture(&["update"])?;
             Ok(tool_result_from_command(
                 "Ran `rocm update`.",
                 output,
@@ -699,7 +692,7 @@ pub(crate) fn handle_mcp_tool_call(paths: &AppPaths, params: &Value) -> Result<V
         "install_sdk_dry_run" => {
             let argv = build_install_sdk_args(&arguments, true)?;
             let refs = argv.iter().map(String::as_str).collect::<Vec<_>>();
-            let output = common::run_rocm_capture(&refs)?;
+            let output = run_rocm_capture(&refs)?;
             Ok(tool_result_from_command(
                 "Ran `rocm install sdk --dry-run`.",
                 output,
@@ -709,7 +702,7 @@ pub(crate) fn handle_mcp_tool_call(paths: &AppPaths, params: &Value) -> Result<V
         "install_sdk" => {
             let argv = build_install_sdk_args(&arguments, false)?;
             let refs = argv.iter().map(String::as_str).collect::<Vec<_>>();
-            let output = common::run_rocm_capture(&refs)?;
+            let output = run_rocm_capture(&refs)?;
             Ok(tool_result_from_command(
                 "Ran `rocm install sdk`.",
                 output,
@@ -719,7 +712,7 @@ pub(crate) fn handle_mcp_tool_call(paths: &AppPaths, params: &Value) -> Result<V
         "install_engine" => {
             let argv = build_install_engine_args(&arguments)?;
             let refs = argv.iter().map(String::as_str).collect::<Vec<_>>();
-            let output = common::run_rocm_capture(&refs)?;
+            let output = run_rocm_capture(&refs)?;
             Ok(tool_result_from_command(
                 "Ran `rocm engines install`.",
                 output,
@@ -729,7 +722,7 @@ pub(crate) fn handle_mcp_tool_call(paths: &AppPaths, params: &Value) -> Result<V
         "launch_server" => {
             let argv = build_launch_server_args(&arguments)?;
             let refs = argv.iter().map(String::as_str).collect::<Vec<_>>();
-            let output = common::run_rocm_capture(&refs)?;
+            let output = run_rocm_capture(&refs)?;
             Ok(tool_result_from_command(
                 "Ran `rocm serve --managed`.",
                 output,
@@ -747,7 +740,7 @@ pub(crate) fn handle_mcp_tool_call(paths: &AppPaths, params: &Value) -> Result<V
         "watcher_enable" => {
             let argv = build_watcher_enable_args(&arguments)?;
             let refs = argv.iter().map(String::as_str).collect::<Vec<_>>();
-            let output = common::run_rocm_capture(&refs)?;
+            let output = run_rocm_capture(&refs)?;
             Ok(tool_result_from_command(
                 "Ran `rocm automations enable`.",
                 output,
@@ -765,7 +758,7 @@ pub(crate) fn handle_mcp_tool_call(paths: &AppPaths, params: &Value) -> Result<V
                 watcher.to_owned(),
             ];
             let refs = argv.iter().map(String::as_str).collect::<Vec<_>>();
-            let output = common::run_rocm_capture(&refs)?;
+            let output = run_rocm_capture(&refs)?;
             Ok(tool_result_from_command(
                 "Ran `rocm automations disable`.",
                 output,
@@ -777,6 +770,11 @@ pub(crate) fn handle_mcp_tool_call(paths: &AppPaths, params: &Value) -> Result<V
             json!({ "tool": other }),
         )),
     }
+}
+
+fn run_rocm_capture(args: &[&str]) -> Result<CommandCapture> {
+    let paths = AppPaths::discover()?;
+    common::run_rocm_capture_for_paths(&paths, args, Duration::from_mins(2))
 }
 
 fn tool_success(text: String, structured: Value) -> Value {
@@ -840,20 +838,6 @@ fn tool_result_from_command(prefix: &str, output: CommandCapture, is_error: bool
         },
         "isError": is_error || output.exit_status != 0,
     })
-}
-
-fn command_capture_text(output: &CommandCapture) -> String {
-    if output.stderr.trim().is_empty() {
-        output.stdout.trim().to_owned()
-    } else if output.stdout.trim().is_empty() {
-        format!("stderr:\n{}", output.stderr.trim())
-    } else {
-        format!(
-            "stdout:\n{}\n\nstderr:\n{}",
-            output.stdout.trim(),
-            output.stderr.trim()
-        )
-    }
 }
 
 fn read_tail_lines(path: &std::path::Path, limit: usize) -> Result<String> {
@@ -1156,11 +1140,11 @@ fn system_prefix_requires_ack(prefix: &std::path::Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::persistence::load_service_record;
     use crate::test_support::{
         assert_unconfirmed_stop_kept_the_service, seed_keyed_service, stop_with_outcome,
         temp_app_paths, workspace_test_artifact_dir,
     };
-    use crate::watchers::load_service_record;
     use std::fs;
     use std::path::PathBuf;
 

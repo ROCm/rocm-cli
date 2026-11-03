@@ -2,16 +2,16 @@
 //
 // SPDX-License-Identifier: MIT
 
-use crate::ARTIFACT_PREFETCH_TIMEOUT;
-use crate::cli::{SandboxToolArg, SandboxToolPolicy};
-use crate::common::{self, CommandCapture};
+use crate::common;
 use crate::persistence::load_managed_services;
-use crate::service::{sandbox_stop_server_value, stop_managed_service};
-use crate::watchers::restart_managed_service;
+use crate::sandbox_tool::{SandboxToolArg, SandboxToolPolicy};
+use crate::service::{stop_managed_service, stop_report_confirmed};
+use crate::supervise::restart_managed_service;
 use anyhow::{Context, Result, bail};
 use rocm_core::{
-    AppPaths, AuditEventRecord, ExamineSummary, ModelRecipeArtifactRecord, append_audit_event,
-    model_artifact_cache_status, resolve_model_recipe_artifact, unix_time_millis,
+    AppPaths, AuditEventRecord, CommandCapture, ExamineSummary, ModelRecipeArtifactRecord,
+    append_audit_event, model_artifact_cache_status, resolve_model_recipe_artifact,
+    unix_time_millis,
 };
 use serde_json::Value;
 use serde_json::json;
@@ -28,6 +28,8 @@ use std::process::{Command as ProcessCommand, Stdio};
 #[cfg(test)]
 use std::thread;
 use std::time::Duration;
+
+const ARTIFACT_PREFETCH_TIMEOUT: Duration = Duration::from_mins(10);
 
 pub(crate) fn run_sandbox_runner(
     paths: &AppPaths,
@@ -253,6 +255,23 @@ pub(crate) fn run_sandbox_tool(
             }))
         }
     }
+}
+
+/// The `stop_server` sandbox tool's answer for a [`stop_managed_service`]
+/// report. The status is taken from the same verdict that decided what the
+/// stop wrote to the manifest, so the two cannot disagree.
+fn sandbox_stop_server_value(stopped: Value) -> Value {
+    let status = if stop_report_confirmed(&stopped) {
+        "stopped"
+    } else {
+        "stop_unconfirmed"
+    };
+    json!({
+        "tool": SandboxToolArg::StopServer.as_cli_value(),
+        "status": status,
+        "mutating": true,
+        "result": stopped,
+    })
 }
 
 pub(crate) fn record_notification_audit(
@@ -972,7 +991,12 @@ fn command_available(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::temp_app_paths;
+    use crate::persistence::load_service_record;
+    use crate::test_support::{
+        assert_unconfirmed_stop_kept_the_service, seed_keyed_service, stop_with_outcome,
+        temp_app_paths,
+    };
+    use rocm_core::ManagedServiceRecord;
     use std::io::Read;
 
     fn serve_one_http_response(bytes: Vec<u8>) -> Result<String> {
@@ -2246,5 +2270,90 @@ mod tests {
         assert!(!is_huggingface_url(
             "https://huggingface.co@evil.example/Qwen/Test-1B"
         ));
+    }
+
+    #[test]
+    fn sandbox_tool_stop_server_updates_manifest_and_skips_current_pid() -> Result<()> {
+        let (root, paths) = temp_app_paths("sandbox-stop-current-pid");
+        paths.ensure()?;
+        let current_pid = std::process::id();
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-current",
+            "vllm",
+            "qwen",
+            "Qwen/Qwen3.5",
+            "127.0.0.1",
+            11435,
+            "managed",
+            current_pid,
+            None,
+            None,
+            None,
+        );
+        record.engine_pid = Some(current_pid);
+        record.status = "ready".to_owned();
+        record.write()?;
+
+        let value = run_sandbox_tool(
+            &paths,
+            SandboxToolArg::StopServer,
+            Some("svc-current".to_owned()),
+            None,
+            None,
+            SandboxToolPolicy::default(),
+        )?;
+        let reloaded = load_service_record(&paths, "svc-current")?;
+        fs::remove_dir_all(root).ok();
+
+        assert_eq!(value.get("status").and_then(Value::as_str), Some("stopped"));
+        assert_eq!(value.get("mutating").and_then(Value::as_bool), Some(true));
+        assert_eq!(reloaded.status, "stopped");
+        assert!(
+            value
+                .get("result")
+                .and_then(|result| result.get("skipped_pids"))
+                .and_then(Value::as_array)
+                .is_some_and(|pids| pids
+                    .iter()
+                    .any(|pid| pid.as_u64() == Some(u64::from(current_pid))))
+        );
+        Ok(())
+    }
+
+    /// The sandbox tool used to report `status: stopped` unconditionally.
+    #[test]
+    fn sandbox_tool_stop_server_reports_an_unconfirmed_stop() -> Result<()> {
+        let (root, paths) = temp_app_paths("sandbox-stop-unconfirmed");
+        paths.ensure()?;
+        let service_id = "svc-sandbox-stop-unconfirmed";
+        let key_path = seed_keyed_service(&paths, service_id, 11448)?;
+
+        // The tool is `stop_managed_service` feeding `sandbox_stop_server_value`;
+        // `sandbox_tool_stop_server_updates_manifest_and_skips_current_pid`
+        // drives that whole tool for real.
+        let result = stop_with_outcome(
+            &paths,
+            service_id,
+            rocm_core::TerminationOutcome::Unverified,
+        )
+        .map(sandbox_stop_server_value);
+        let key_kept = key_path.exists();
+        let reloaded = load_service_record(&paths, service_id);
+        fs::remove_dir_all(root).ok();
+
+        let value = result?;
+        assert_eq!(
+            value.get("status").and_then(Value::as_str),
+            Some("stop_unconfirmed"),
+            "{value}"
+        );
+        assert_eq!(
+            value.pointer("/result/stopped").and_then(Value::as_bool),
+            Some(false),
+            "{value}"
+        );
+        assert_unconfirmed_stop_kept_the_service(&reloaded?, key_kept);
+        Ok(())
     }
 }

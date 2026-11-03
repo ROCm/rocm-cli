@@ -2,17 +2,19 @@
 //
 // SPDX-License-Identifier: MIT
 
+use crate::common::payload_string;
+use crate::persistence::load_service_record;
+use crate::supervise::restart_managed_service;
 use anyhow::{Context, Result, bail};
 use rocm_core::{
     AppPaths, AutomationProposalRecord, AutomationRuntimeState, AutomationTriggerEvent,
     CodexBridgeGpuSnapshot, ManagedServiceRecord, RocmCliConfig, WatcherMode,
-    WatcherRuntimeSnapshot, append_automation_proposal, builtin_watchers,
+    WatcherRuntimeSnapshot, append_automation_proposal, builtin_watchers, format_host_port,
     resolve_model_recipe_artifact, unix_time_millis,
 };
 use serde_json::Value;
 use serde_json::json;
-use std::fs;
-use std::process::{Command as ProcessCommand, Stdio};
+use std::net::{SocketAddr, TcpStream};
 use std::thread;
 use std::time::Duration;
 
@@ -63,7 +65,7 @@ fn collect_automation_events(
     state: &AutomationRuntimeState,
 ) -> Result<Vec<AutomationTriggerEvent>> {
     collect_automation_events_with_gpu_snapshot(paths, state, || {
-        crate::common::gather_gpu_snapshot_for_config(config)
+        crate::host_snapshot::gather_gpu_snapshot_for_config(config)
     })
 }
 
@@ -237,11 +239,11 @@ fn handle_therock_update_event(
     handle_therock_update_event_with_runner(paths, mode, state, event, |paths| {
         crate::sandbox::run_sandbox_tool(
             paths,
-            crate::cli::SandboxToolArg::CheckUpdates,
+            crate::sandbox_tool::SandboxToolArg::CheckUpdates,
             None,
             None,
             None,
-            crate::cli::SandboxToolPolicy::default(),
+            crate::sandbox_tool::SandboxToolPolicy::default(),
         )
     })
 }
@@ -362,7 +364,7 @@ fn restricted_check_updates_result(value: &Value) -> Result<RestrictedCheckUpdat
         .get("tool")
         .and_then(Value::as_str)
         .context("restricted update check did not report a tool name")?;
-    if tool != crate::cli::SandboxToolArg::CheckUpdates.as_cli_value() {
+    if tool != crate::sandbox_tool::SandboxToolArg::CheckUpdates.as_cli_value() {
         bail!("restricted update check returned `{tool}`, expected `check_updates`");
     }
     let status = value
@@ -854,6 +856,23 @@ fn pending_stop_proposal_exists(paths: &AppPaths, service_id: &str) -> Result<bo
         }))
 }
 
+/// Reads the whole proposals store rather than a recent window: a pending
+/// proposal is never dropped, so it can be arbitrarily old, and a window that
+/// missed it would let the watcher queue a duplicate once the original aged
+/// out of that window. Compaction bounds the reviewed proposals to a fixed
+/// count; pending ones are kept.
+fn pending_restart_proposal_exists(paths: &AppPaths, service_id: &str) -> Result<bool> {
+    Ok(rocm_core::load_automation_proposals(paths)?
+        .into_iter()
+        .any(|proposal| {
+            proposal.status == "pending"
+                && proposal.watcher_id == "server-recover"
+                && proposal.service_id.as_deref() == Some(service_id)
+                && (proposal.action == "queue_restart_proposal"
+                    || proposal.tool.as_deref() == Some("restart_server"))
+        }))
+}
+
 fn handle_cache_warm_event(
     paths: &AppPaths,
     mode: WatcherMode,
@@ -971,11 +990,11 @@ fn handle_driver_upgrade_event(
     handle_driver_upgrade_event_with_runner(paths, mode, state, event, |paths| {
         crate::sandbox::run_sandbox_tool(
             paths,
-            crate::cli::SandboxToolArg::DriverPlan,
+            crate::sandbox_tool::SandboxToolArg::DriverPlan,
             None,
             None,
             None,
-            crate::cli::SandboxToolPolicy::default(),
+            crate::sandbox_tool::SandboxToolPolicy::default(),
         )
     })
 }
@@ -1089,7 +1108,7 @@ fn restricted_driver_plan_result(value: &Value) -> Result<RestrictedDriverPlanRe
         .get("tool")
         .and_then(Value::as_str)
         .context("restricted driver plan did not report a tool name")?;
-    if tool != crate::cli::SandboxToolArg::DriverPlan.as_cli_value() {
+    if tool != crate::sandbox_tool::SandboxToolArg::DriverPlan.as_cli_value() {
         bail!("restricted driver plan returned `{tool}`, expected `driver_plan`");
     }
     let status = value
@@ -1104,15 +1123,6 @@ fn restricted_driver_plan_result(value: &Value) -> Result<RestrictedDriverPlanRe
         status,
         exit_status,
     })
-}
-
-pub(crate) fn payload_string(payload: &Value, key: &str) -> Option<String> {
-    payload
-        .get(key)
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
 }
 
 #[cfg(test)]
@@ -1190,12 +1200,12 @@ fn service_record_matches_recovery_event(
             manifest_service_recovery_reason(record, unix_time_millis()).is_some()
         }
         "service.endpoint_recoverable" => endpoint_service_recovery_reason(record).is_some(),
-        "service.healthcheck_recoverable" => {
-            crate::common::engine_healthcheck_response(paths, &record.engine, &record.service_id)
-                .is_ok_and(|healthcheck| {
-                    crate::common::healthcheck_response_recoverable(&healthcheck)
-                })
-        }
+        "service.healthcheck_recoverable" => crate::engine_ipc::engine_healthcheck_response(
+            paths,
+            &record.engine,
+            &record.service_id,
+        )
+        .is_ok_and(|healthcheck| crate::engine_ipc::healthcheck_response_recoverable(&healthcheck)),
         _ => false,
     }
 }
@@ -1225,6 +1235,43 @@ fn handle_server_recover_event_with_record(
             Some(record.service_id.clone()),
         ),
         WatcherPolicyAction::QueueProposal => {
+            // An unreadable proposals store is reported and skipped, never
+            // propagated: the daemon loop exits on an error out of
+            // `evaluate_watchers`, so a store that stays corrupt would take it
+            // down on every recovery tick.
+            match pending_restart_proposal_exists(paths, &record.service_id) {
+                Ok(true) => {
+                    return crate::persistence::record_event(
+                        paths,
+                        state,
+                        "server-recover",
+                        "info",
+                        "restart_proposal_already_pending",
+                        &format!(
+                            "managed service {} needs recovery ({recovery_reason_display}); a restart request awaiting review is already queued",
+                            record.service_id,
+                        ),
+                        Some(record.service_id.clone()),
+                    );
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    return crate::persistence::record_event(
+                        paths,
+                        state,
+                        "server-recover",
+                        "error",
+                        "restart_proposal_check_failed",
+                        &format!(
+                            "managed service {} needs recovery ({recovery_reason_display}); \
+                             not queueing a restart request because the proposals store could \
+                             not be checked for one already pending: {error:#}",
+                            record.service_id,
+                        ),
+                        Some(record.service_id.clone()),
+                    );
+                }
+            }
             let message = format!(
                 "managed service {} needs recovery ({recovery_reason_display}); queueing restart proposal",
                 record.service_id,
@@ -1258,7 +1305,7 @@ fn handle_server_recover_event_with_record(
             // Report it and stop, rather than letting a permanent failure
             // propagate out of `evaluate_watchers` and take the whole daemon —
             // and every other watcher — down on each 30s recovery tick.
-            if let Err(error) = crate::common::ensure_public_service_has_endpoint_key(
+            if let Err(error) = crate::engine_ipc::ensure_public_service_has_endpoint_key(
                 &record.host,
                 rocm_engine_protocol::endpoint_key_file_if_present(paths, &record.service_id)
                     .and_then(|path| rocm_engine_protocol::endpoint_api_key_file_if_valid(&path))
@@ -1362,7 +1409,7 @@ pub(crate) fn find_recoverable_service(
             return Ok(Some((record, reason)));
         }
         if matches!(record.status.as_str(), "ready" | "running") {
-            let Ok(healthcheck) = crate::common::engine_healthcheck_response(
+            let Ok(healthcheck) = crate::engine_ipc::engine_healthcheck_response(
                 paths,
                 &record.engine,
                 &record.service_id,
@@ -1372,7 +1419,7 @@ pub(crate) fn find_recoverable_service(
                 }
                 continue;
             };
-            if crate::common::healthcheck_response_recoverable(&healthcheck) {
+            if crate::engine_ipc::healthcheck_response_recoverable(&healthcheck) {
                 return Ok(Some((
                     record,
                     format!("healthcheck_status_{}", healthcheck.status),
@@ -1401,33 +1448,24 @@ pub(crate) const fn stop_requested(record: &ManagedServiceRecord) -> bool {
 }
 
 fn endpoint_service_recovery_reason(record: &ManagedServiceRecord) -> Option<String> {
-    (!crate::common::wait_for_port(&record.host, record.port, ENDPOINT_HEALTH_TIMEOUT))
+    (!wait_for_port(&record.host, record.port, ENDPOINT_HEALTH_TIMEOUT))
         .then(|| "endpoint_status_unreachable".to_owned())
 }
 
-pub(crate) fn load_service_record(
-    paths: &AppPaths,
-    service_id: &str,
-) -> Result<ManagedServiceRecord> {
-    rocm_core::ServiceId::new(service_id)
-        .with_context(|| format!("invalid managed service id `{service_id}`"))?;
-    let manifest_path = paths.service_manifest_path(service_id);
-    let bytes = fs::read(&manifest_path).with_context(|| {
-        format!(
-            "managed service `{service_id}` not found at {}",
-            manifest_path.display()
-        )
-    })?;
-    let record = serde_json::from_slice::<ManagedServiceRecord>(&bytes)
-        .with_context(|| format!("failed to parse {}", manifest_path.display()))?;
-    if record.service_id != service_id {
-        bail!(
-            "managed service manifest {} contains service_id `{}`, expected `{service_id}`",
-            manifest_path.display(),
-            record.service_id
-        );
+fn wait_for_port(host: &str, port: u16, timeout: Duration) -> bool {
+    let address: SocketAddr = match format_host_port(host, port).parse() {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+
+    let start = std::time::Instant::now();
+    while start.elapsed() < timeout {
+        if TcpStream::connect_timeout(&address, Duration::from_millis(200)).is_ok() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(200));
     }
-    Ok(record)
+    false
 }
 
 fn manifest_service_recovery_reason(
@@ -1445,147 +1483,6 @@ fn manifest_service_recovery_reason(
         }
         _ => None,
     }
-}
-
-pub(crate) fn restart_managed_service(
-    paths: &AppPaths,
-    record: &mut ManagedServiceRecord,
-) -> Result<()> {
-    let rocmd_binary =
-        std::env::current_exe().context("failed to resolve current rocmd executable path")?;
-    let log_file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&record.log_path)
-        .with_context(|| format!("failed to open {}", record.log_path.display()))?;
-    let log_file_err = log_file
-        .try_clone()
-        .context("failed to clone service log file handle")?;
-
-    record.status = "recovering".to_owned();
-    // Counts the restart and drops the previous run's inference verification.
-    // The respawned child writes a fresh record of its own, and "recovering" is
-    // outside the statuses that probe, so a stale verdict would not currently be
-    // acted on — but this record is written again below, after the spawn, and
-    // that write can land after the child's. Clearing here keeps the invariant
-    // true at the one site that reuses a record across restarts.
-    record.reset_for_restart();
-    // No supervisor exists until the spawn below succeeds, so none is recorded.
-    // Recording this daemon's own PID here, as a stand-in, left the manifest
-    // naming the daemon as the service's supervisor whenever the spawn failed:
-    // a stop run from any other process (`rocmd sandbox-tool stop_server`,
-    // `rocm services stop`) verifies that identity, finds it live, and
-    // terminates the daemon's whole process tree. The spawned supervisor's
-    // identity is recorded right after the spawn.
-    record.supervisor_pid = 0;
-    record.supervisor_start_ticks = None;
-    // The engine PID belonged to the run being replaced, and nothing here
-    // starts an engine: the supervisor spawned below records its own, together
-    // with its token. Carried forward, the old PID would sit beside a
-    // supervisor it no longer matches — and on a record `rocm` wrote, with no
-    // token at all, so the next stop could only signal it blind.
-    record.engine_pid = None;
-    record.engine_start_ticks = None;
-    // Restarting is a request to run, so it supersedes any earlier stop request,
-    // as `rocm services restart` treats it too.
-    record.stop_requested_unix_ms = None;
-    record.write()?;
-
-    let mut child = detached_rocmd_command(&rocmd_binary)
-        .args(recovery_supervise_args(record))
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(log_file))
-        .stderr(Stdio::from(log_file_err))
-        .spawn()
-        .context("failed to spawn recovery supervisor")?;
-
-    record_spawned_supervisor(paths, record, child.id())?;
-
-    thread::sleep(Duration::from_millis(200));
-    if let Some(status) = child
-        .try_wait()
-        .context("failed to check recovery supervisor startup state")?
-    {
-        // Not a write-back of `record`: a stop issued since the spawn has
-        // persisted its marker, and a `failed` record without one is what
-        // recovery restarts. Same discipline as the supervisor's own writes.
-        crate::service::update_supervised_record(paths, record, |current| {
-            current.status = "failed".to_owned();
-        })?;
-        anyhow::bail!(
-            "recovery supervisor exited immediately with status {status}; inspect {}",
-            record.log_path.display()
-        );
-    }
-
-    Ok(())
-}
-
-/// Record the supervisor [`restart_managed_service`] just spawned, as `pid`.
-///
-/// Between the restart's first write — which clears the recorded PIDs, since
-/// no supervisor exists yet — and this one, the record names no process at
-/// all. A stop that starts in that window persists its marker first and then
-/// finds nothing to signal; writing the restart's whole copy back here would
-/// erase that marker while the new supervisor comes up, and leave the stop's
-/// own final write comparing against a record that no longer shows the
-/// process it has to answer for. So only the supervisor's identity is applied,
-/// to the record as it is on disk now, through the same ownership guard as the
-/// supervisor's own writes: against the copy from before this assignment, so
-/// it is the cleared PID that has to still be there. If the new supervisor has
-/// already recorded itself, or the record was removed, nothing is written.
-fn record_spawned_supervisor(
-    paths: &AppPaths,
-    record: &mut ManagedServiceRecord,
-    pid: u32,
-) -> Result<()> {
-    let unrecorded = record.clone();
-    record.record_supervisor_identity(pid);
-    let (supervisor_pid, supervisor_start_ticks) =
-        (record.supervisor_pid, record.supervisor_start_ticks);
-    crate::service::update_supervised_record(paths, &unrecorded, |current| {
-        current.supervisor_pid = supervisor_pid;
-        current.supervisor_start_ticks = supervisor_start_ticks;
-    })
-}
-
-fn recovery_supervise_args(record: &ManagedServiceRecord) -> Vec<String> {
-    let mut args = vec![
-        "supervise".to_owned(),
-        record.service_id.clone(),
-        "--engine".to_owned(),
-        record.engine.clone(),
-        "--model-ref".to_owned(),
-        record.model_ref.clone(),
-        "--canonical-model-id".to_owned(),
-        record.canonical_model_id.clone(),
-        "--host".to_owned(),
-        record.host.clone(),
-        "--port".to_owned(),
-        record.port.to_string(),
-        "--device-policy".to_owned(),
-        record
-            .device_policy
-            .as_deref()
-            .unwrap_or("gpu_required")
-            .to_owned(),
-    ];
-    args.extend(crate::common::optional_arg(
-        "--runtime-id",
-        record.runtime_id.as_deref(),
-    ));
-    args.extend(crate::common::optional_arg(
-        "--env-id",
-        record.env_id.as_deref(),
-    ));
-    if let Some(csv) = rocm_engine_protocol::gpu_indices_to_csv(&record.gpu_indices) {
-        args.extend(["--gpu".to_owned(), csv]);
-    }
-    args.extend(crate::common::optional_arg(
-        "--engine-recipe-json",
-        record.engine_recipe_json.as_deref(),
-    ));
-    args
 }
 
 fn queue_proposal(
@@ -1659,26 +1556,14 @@ fn proposal_arguments_for_action(action: &str, service_id: Option<&str>) -> Valu
     }
 }
 
-#[cfg(unix)]
-fn detached_rocmd_command(rocmd_binary: &std::path::Path) -> ProcessCommand {
-    let mut command = ProcessCommand::new("setsid");
-    command.arg(rocmd_binary);
-    command
-}
-
-#[cfg(not(unix))]
-fn detached_rocmd_command(rocmd_binary: &std::path::Path) -> ProcessCommand {
-    ProcessCommand::new(rocmd_binary)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::identity_probe_record;
     use crate::test_support::{
         UNCONFIRMED_STOP_PID, seed_keyed_service, stop_with_outcome, temp_app_paths,
     };
     use rocm_core::{AuditEventRecord, AutomationEventRecord};
+    use std::fs;
 
     fn test_watcher_snapshot(
         id: &str,
@@ -2235,6 +2120,277 @@ mod tests {
     }
 
     #[test]
+    fn server_recover_does_not_duplicate_pending_restart_proposals() -> Result<()> {
+        let (root, paths) = temp_app_paths("server-recover-dedupe");
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-unhealthy",
+            "vllm",
+            "tiny",
+            "Tiny/Test",
+            "127.0.0.1",
+            11436,
+            "managed",
+            123,
+            None,
+            None,
+            None,
+        );
+        record.status = "unreachable".to_owned();
+        record.write()?;
+        let mut state = test_runtime_state(vec![test_watcher_snapshot(
+            "server-recover",
+            WatcherMode::Propose,
+            None,
+        )]);
+        let event = AutomationTriggerEvent {
+            at_unix_ms: 1,
+            kind: "service.manifest_recoverable".to_owned(),
+            source: "managed_service".to_owned(),
+            watcher_hint: Some("server-recover".to_owned()),
+            service_id: Some(record.service_id.clone()),
+            reason: Some("manifest_status_failed".to_owned()),
+            payload: json!({}),
+        };
+
+        handle_server_recover_event_with_record(
+            &paths,
+            WatcherMode::Propose,
+            &mut state,
+            &event,
+            &mut record,
+        )?;
+        handle_server_recover_event_with_record(
+            &paths,
+            WatcherMode::Propose,
+            &mut state,
+            &event,
+            &mut record,
+        )?;
+        let events = rocm_core::load_recent_automation_events(&paths, 2)?;
+        let proposals = rocm_core::load_recent_automation_proposals(&paths, 10)?;
+        fs::remove_dir_all(root).ok();
+
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(proposals[0].tool.as_deref(), Some("restart_server"));
+        // The wording describes a proposal still awaiting review; the single
+        // pending proposal asserted here is what makes that true.
+        assert_eq!(proposals[0].status, "pending");
+        assert!(events.iter().any(|event| {
+            event.action == "restart_proposal_already_pending"
+                && event.message.contains("a restart request awaiting review")
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn server_recover_dedupe_sees_a_pending_restart_older_than_the_recent_window() -> Result<()> {
+        let (root, paths) = temp_app_paths("server-recover-dedupe-old");
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-unhealthy",
+            "vllm",
+            "tiny",
+            "Tiny/Test",
+            "127.0.0.1",
+            11436,
+            "managed",
+            123,
+            None,
+            None,
+            None,
+        );
+        record.status = "unreachable".to_owned();
+        record.write()?;
+        let mut state = test_runtime_state(vec![test_watcher_snapshot(
+            "server-recover",
+            WatcherMode::Propose,
+            None,
+        )]);
+        let event = AutomationTriggerEvent {
+            at_unix_ms: 1,
+            kind: "service.manifest_recoverable".to_owned(),
+            source: "managed_service".to_owned(),
+            watcher_hint: Some("server-recover".to_owned()),
+            service_id: Some(record.service_id.clone()),
+            reason: Some("manifest_status_failed".to_owned()),
+            payload: json!({}),
+        };
+
+        handle_server_recover_event_with_record(
+            &paths,
+            WatcherMode::Propose,
+            &mut state,
+            &event,
+            &mut record,
+        )?;
+        // Enough newer proposals from other watchers that the restart proposal
+        // is no longer among the 100 most recent.
+        for index in 0..101 {
+            queue_proposal_with_arguments(
+                &paths,
+                "gpu-thermal-protect",
+                "queue_stop_server_proposal",
+                "Stop another server",
+                "unrelated proposal",
+                Some(format!("svc-other-{index}")),
+                json!({}),
+            )?;
+        }
+        handle_server_recover_event_with_record(
+            &paths,
+            WatcherMode::Propose,
+            &mut state,
+            &event,
+            &mut record,
+        )?;
+        let restarts = rocm_core::load_automation_proposals(&paths)?
+            .into_iter()
+            .filter(|proposal| proposal.tool.as_deref() == Some("restart_server"))
+            .count();
+        fs::remove_dir_all(root).ok();
+
+        assert_eq!(restarts, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn server_recover_dedupe_ignores_proposals_that_do_not_block_a_restart() -> Result<()> {
+        let (root, paths) = temp_app_paths("server-recover-dedupe-filters");
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-unhealthy",
+            "vllm",
+            "tiny",
+            "Tiny/Test",
+            "127.0.0.1",
+            11436,
+            "managed",
+            123,
+            None,
+            None,
+            None,
+        );
+        record.status = "unreachable".to_owned();
+        record.write()?;
+        // Each of these matches the restart check on all but one field, so
+        // none of them may suppress a new restart for `svc-unhealthy`.
+        for (watcher_id, service_id, status) in [
+            ("server-recover", "svc-unhealthy", "approved"),
+            ("server-recover", "svc-other", "pending"),
+            ("another-watcher", "svc-unhealthy", "pending"),
+        ] {
+            append_automation_proposal(
+                &paths,
+                &AutomationProposalRecord {
+                    at_unix_ms: unix_time_millis(),
+                    proposal_id: String::new(),
+                    watcher_id: watcher_id.to_owned(),
+                    action: "queue_restart_proposal".to_owned(),
+                    title: "Restart".to_owned(),
+                    message: "unrelated".to_owned(),
+                    status: status.to_owned(),
+                    service_id: Some(service_id.to_owned()),
+                    tool: Some("restart_server".to_owned()),
+                    arguments: json!({}),
+                    reviewed_at_unix_ms: None,
+                },
+            )?;
+        }
+        let mut state = test_runtime_state(vec![test_watcher_snapshot(
+            "server-recover",
+            WatcherMode::Propose,
+            None,
+        )]);
+        let event = AutomationTriggerEvent {
+            at_unix_ms: 1,
+            kind: "service.manifest_recoverable".to_owned(),
+            source: "managed_service".to_owned(),
+            watcher_hint: Some("server-recover".to_owned()),
+            service_id: Some(record.service_id.clone()),
+            reason: Some("manifest_status_failed".to_owned()),
+            payload: json!({}),
+        };
+
+        handle_server_recover_event_with_record(
+            &paths,
+            WatcherMode::Propose,
+            &mut state,
+            &event,
+            &mut record,
+        )?;
+        let queued = rocm_core::load_automation_proposals(&paths)?
+            .into_iter()
+            .filter(|proposal| {
+                proposal.watcher_id == "server-recover"
+                    && proposal.status == "pending"
+                    && proposal.service_id.as_deref() == Some("svc-unhealthy")
+            })
+            .count();
+        fs::remove_dir_all(root).ok();
+
+        assert_eq!(queued, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn server_recover_reports_an_unreadable_proposals_store_instead_of_failing() -> Result<()> {
+        let (root, paths) = temp_app_paths("server-recover-corrupt-store");
+        paths.ensure()?;
+        fs::write(paths.automation_proposals_path(), "not a proposal\n")?;
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-unhealthy",
+            "vllm",
+            "tiny",
+            "Tiny/Test",
+            "127.0.0.1",
+            11436,
+            "managed",
+            123,
+            None,
+            None,
+            None,
+        );
+        record.status = "unreachable".to_owned();
+        record.write()?;
+        let mut state = test_runtime_state(vec![test_watcher_snapshot(
+            "server-recover",
+            WatcherMode::Propose,
+            None,
+        )]);
+        let event = AutomationTriggerEvent {
+            at_unix_ms: 1,
+            kind: "service.manifest_recoverable".to_owned(),
+            source: "managed_service".to_owned(),
+            watcher_hint: Some("server-recover".to_owned()),
+            service_id: Some(record.service_id.clone()),
+            reason: Some("manifest_status_failed".to_owned()),
+            payload: json!({}),
+        };
+
+        let outcome = handle_server_recover_event_with_record(
+            &paths,
+            WatcherMode::Propose,
+            &mut state,
+            &event,
+            &mut record,
+        );
+        let events = rocm_core::load_recent_automation_events(&paths, 1)?;
+        let stored = fs::read_to_string(paths.automation_proposals_path())?;
+        fs::remove_dir_all(root).ok();
+
+        // An error out of a watcher ends the daemon loop, so a corrupt store
+        // must surface as an event and a skipped tick, not as `Err`.
+        outcome?;
+        assert_eq!(stored, "not a proposal\n", "nothing may be queued");
+        assert!(events.iter().any(|event| {
+            event.level == "error" && event.action == "restart_proposal_check_failed"
+        }));
+        Ok(())
+    }
+
+    #[test]
     fn local_webhook_gpu_metrics_event_uses_existing_read_only_policy() -> Result<()> {
         let (root, paths) = temp_app_paths("local-webhook-gpu-metrics");
         paths.ensure()?;
@@ -2489,7 +2645,7 @@ mod tests {
             &event,
             |_paths| {
                 Ok(crate::sandbox::sandbox_driver_plan_value(
-                    crate::common::CommandCapture {
+                    rocm_core::CommandCapture {
                         argv: vec![
                             "rocm".to_owned(),
                             "install".to_owned(),
@@ -2944,7 +3100,7 @@ mod tests {
             &event,
             |_paths| {
                 Ok(crate::sandbox::sandbox_check_updates_value(
-                    crate::common::CommandCapture {
+                    rocm_core::CommandCapture {
                         argv: vec!["rocm".to_owned(), "update".to_owned()],
                         exit_status: 0,
                         stdout: "update\n  managed runtimes: none\n".to_owned(),
@@ -3009,7 +3165,7 @@ mod tests {
             &mut state,
             &event,
             |_paths| {
-                Ok(crate::sandbox::sandbox_check_updates_value(crate::common::CommandCapture {
+                Ok(crate::sandbox::sandbox_check_updates_value(rocm_core::CommandCapture {
                     argv: vec!["rocm".to_owned(), "update".to_owned()],
                     exit_status: 0,
                     stdout: "update\n  runtime release-pip-gfx120x-all status=update_available installed=7.13.0 latest=7.14.0\n".to_owned(),
@@ -3164,38 +3320,6 @@ mod tests {
     }
 
     #[test]
-    fn recovery_supervise_args_preserve_engine_recipe_json() {
-        let (_root, paths) = temp_app_paths("recovery-engine-recipe");
-        let mut record = ManagedServiceRecord::new(
-            &paths,
-            "svc-1",
-            "vllm",
-            "qwen",
-            "Qwen/Qwen3.5-4B",
-            "127.0.0.1",
-            11435,
-            "managed",
-            123,
-            Some("therock-release:gfx120X-all".to_owned()),
-            Some("env-1".to_owned()),
-            Some("gpu_required".to_owned()),
-        );
-        let engine_recipe_json = r#"{"contract_version":"0.1.0","engine":"vllm","required_flags":["--enable-auto-tool-choice"]}"#;
-        record.engine_recipe_json = Some(engine_recipe_json.to_owned());
-
-        let args = recovery_supervise_args(&record);
-
-        assert!(
-            args.windows(2)
-                .any(|pair| pair[0] == "--engine-recipe-json" && pair[1] == engine_recipe_json)
-        );
-        assert!(
-            args.windows(2)
-                .any(|pair| { pair[0] == "--canonical-model-id" && pair[1] == "Qwen/Qwen3.5-4B" })
-        );
-    }
-
-    #[test]
     fn watcher_policy_maps_modes_to_decisions() {
         assert_eq!(
             watcher_policy_action("server-recover", WatcherMode::Observe),
@@ -3213,41 +3337,6 @@ mod tests {
             watcher_policy_action("therock-update", WatcherMode::Contained),
             WatcherPolicyAction::RunContained
         );
-    }
-
-    /// The same guarantee for the daemon's recovery path, which records a PID of
-    /// its own. See `supervise_service_persists_the_supervisor_identity_token`
-    /// for why an unrecorded token is the defect rather than a cosmetic gap.
-    ///
-    /// The restart re-execs `rocmd supervise`, which here is the test binary:
-    /// it rejects those arguments and exits at once, so the restart reports
-    /// failure — after it has written the record this test reads.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn restart_managed_service_persists_the_supervisor_identity_token() -> Result<()> {
-        let (root, paths) = temp_app_paths("restart-records-identity");
-        paths.ensure()?;
-        fs::create_dir_all(paths.services_dir())?;
-
-        let service_id = "svc-restart-identity";
-        let mut record = identity_probe_record(&paths, service_id, 11444);
-        record.status = "failed".to_owned();
-        record.write()?;
-        assert_eq!(
-            load_service_record(&paths, service_id)?.supervisor_start_ticks,
-            None,
-            "precondition: the seeded record carries no token"
-        );
-
-        let _ = restart_managed_service(&paths, &mut record);
-        let persisted = load_service_record(&paths, service_id);
-        fs::remove_dir_all(root).ok();
-
-        assert!(
-            persisted?.supervisor_start_ticks.is_some(),
-            "restart_managed_service must persist the supervisor's start-time token beside its PID"
-        );
-        Ok(())
     }
 
     /// An unconfirmed stop leaves the status at `ready` on purpose, which is
@@ -3344,175 +3433,6 @@ mod tests {
             "without a stop request the same record must still be recovered"
         );
         assert!(event_without_request);
-        Ok(())
-    }
-
-    /// A restart moves the supervisor PID; the engine PID it carried belonged
-    /// to the run being replaced. On a record `rocm serve --background` wrote,
-    /// that PID has no token, so carrying it past the point where the two PIDs
-    /// diverge leaves the next stop an entry it can only signal blind.
-    ///
-    /// Linux-only for the same reason as the test above: the restart re-execs
-    /// the test binary, which is only known to reject those arguments there.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn restart_managed_service_drops_the_replaced_runs_engine_pid() -> Result<()> {
-        let (root, paths) = temp_app_paths("restart-drops-engine-pid");
-        paths.ensure()?;
-        fs::create_dir_all(paths.services_dir())?;
-
-        let service_id = "svc-restart-drops-engine-pid";
-        let mut record = identity_probe_record(&paths, service_id, 11455);
-        // The shape `rocm serve --background` writes: one PID in both roles.
-        record.supervisor_pid = UNCONFIRMED_STOP_PID;
-        record.engine_pid = Some(UNCONFIRMED_STOP_PID);
-        record.engine_start_ticks = None;
-        record.stop_requested_unix_ms = Some(1);
-        record.status = "failed".to_owned();
-        record.write()?;
-
-        let _ = restart_managed_service(&paths, &mut record);
-        let persisted = load_service_record(&paths, service_id);
-        fs::remove_dir_all(root).ok();
-
-        let persisted = persisted?;
-        assert_ne!(persisted.supervisor_pid, UNCONFIRMED_STOP_PID);
-        assert_eq!(
-            persisted.engine_pid, None,
-            "the replaced run's engine PID must not outlive the restart"
-        );
-        assert_eq!(persisted.engine_start_ticks, None);
-        assert_eq!(
-            persisted.stop_requested_unix_ms, None,
-            "a restart supersedes an earlier stop request"
-        );
-        Ok(())
-    }
-
-    /// A stop that lands while a restart waits to see whether its supervisor
-    /// survived startup must outlive the restart's `failed` write: a `failed`
-    /// record without the marker is exactly what recovery restarts.
-    ///
-    /// The restarted supervisor is the test binary, which rejects the
-    /// `supervise` arguments and exits at once, so the restart reaches that
-    /// write. A thread plays the stop: once the restart has recorded the
-    /// spawned supervisor, it persists a marker, as a stop does first.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn restart_failure_write_keeps_a_stop_marker_set_meanwhile() -> Result<()> {
-        let (root, paths) = temp_app_paths("restart-failure-keeps-marker");
-        paths.ensure()?;
-        fs::create_dir_all(paths.services_dir())?;
-
-        let service_id = "svc-restart-failure-marker";
-        let mut record = identity_probe_record(&paths, service_id, 11456);
-        record.status = "failed".to_owned();
-        record.write()?;
-
-        let stop = {
-            let paths = paths.clone();
-            thread::spawn(move || -> Result<bool> {
-                let deadline = std::time::Instant::now() + Duration::from_secs(10);
-                while std::time::Instant::now() < deadline {
-                    // `write` is not atomic, so a read can land mid-write and
-                    // see a truncated file; just look again.
-                    let Ok(mut on_disk) = load_service_record(&paths, service_id) else {
-                        thread::sleep(Duration::from_millis(5));
-                        continue;
-                    };
-                    if on_disk.supervisor_pid != 0 && on_disk.supervisor_pid != std::process::id() {
-                        on_disk.stop_requested_unix_ms = Some(1);
-                        on_disk.write()?;
-                        return Ok(true);
-                    }
-                    thread::sleep(Duration::from_millis(5));
-                }
-                Ok(false)
-            })
-        };
-        let outcome = restart_managed_service(&paths, &mut record);
-        let stop_landed = stop.join().expect("stop thread");
-        let persisted = load_service_record(&paths, service_id);
-        fs::remove_dir_all(root).ok();
-
-        assert!(
-            stop_landed?,
-            "precondition: the stop ran during the restart"
-        );
-        assert!(outcome.is_err(), "the test binary is not a supervisor");
-        let persisted = persisted?;
-        assert_eq!(persisted.status, "failed");
-        assert_eq!(
-            persisted.stop_requested_unix_ms,
-            Some(1),
-            "the restart's failure write must not withdraw a stop issued meanwhile"
-        );
-        Ok(())
-    }
-
-    /// Between a restart's first write, which clears the recorded PIDs, and the
-    /// one recording the supervisor it spawned, a stop can persist its marker.
-    /// Writing the restart's own copy back would erase it while the new
-    /// supervisor comes up — so only the identity is applied.
-    #[test]
-    fn restart_records_its_supervisor_without_erasing_a_stop_marker() -> Result<()> {
-        let (root, paths) = temp_app_paths("restart-spawn-keeps-marker");
-        paths.ensure()?;
-        let service_id = "svc-restart-spawn-marker";
-        // The restart's copy after its first write: no supervisor, no marker.
-        let mut restarting = identity_probe_record(&paths, service_id, 11457);
-        restarting.status = "recovering".to_owned();
-        restarting.supervisor_pid = 0;
-        restarting.supervisor_start_ticks = None;
-        // A stop started since: same (empty) processes, marker set.
-        let mut on_disk = restarting.clone();
-        on_disk.stop_requested_unix_ms = Some(1);
-        on_disk.write()?;
-
-        record_spawned_supervisor(&paths, &mut restarting, std::process::id())?;
-        let persisted = load_service_record(&paths, service_id);
-        fs::remove_dir_all(root).ok();
-
-        let persisted = persisted?;
-        assert_eq!(restarting.supervisor_pid, std::process::id());
-        assert_eq!(persisted.supervisor_pid, std::process::id());
-        assert_eq!(
-            persisted.supervisor_start_ticks,
-            restarting.supervisor_start_ticks
-        );
-        assert_eq!(
-            persisted.stop_requested_unix_ms,
-            Some(1),
-            "recording the spawned supervisor must not withdraw a standing stop"
-        );
-        Ok(())
-    }
-
-    /// The spawned supervisor may record itself before the restart does, and
-    /// the record may be removed outright; either way the restart's write is
-    /// not the one to land.
-    #[test]
-    fn restart_leaves_a_record_naming_another_supervisor_or_none() -> Result<()> {
-        let (root, paths) = temp_app_paths("restart-spawn-not-owner");
-        paths.ensure()?;
-        let service_id = "svc-restart-spawn-not-owner";
-        let mut restarting = identity_probe_record(&paths, service_id, 11458);
-        restarting.supervisor_pid = 0;
-        restarting.supervisor_start_ticks = None;
-        let mut on_disk = restarting.clone();
-        on_disk.supervisor_pid = 4_242_424;
-        on_disk.write()?;
-
-        record_spawned_supervisor(&paths, &mut restarting.clone(), std::process::id())?;
-        let after_supervisor = load_service_record(&paths, service_id);
-
-        fs::remove_file(paths.service_manifest_path(service_id))?;
-        record_spawned_supervisor(&paths, &mut restarting, std::process::id())?;
-        let resurrected = paths.service_manifest_path(service_id).exists();
-        fs::remove_dir_all(root).ok();
-
-        assert_eq!(after_supervisor?.supervisor_pid, 4_242_424);
-        assert!(!resurrected, "a removed record must not be written back");
         Ok(())
     }
 }

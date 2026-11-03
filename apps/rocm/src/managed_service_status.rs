@@ -14,20 +14,26 @@
 //! registry (`load_managed_services`, `refresh_managed_service_runtime_liveness`,
 //! `recorded_service_pids`, `settle_pending_stop_key_cleanup`), the idempotency
 //! guard that finds an already-live service for a given engine+model
-//! (`existing_live_managed_service`), the "is this record live" classifier
+//! (`existing_live_managed_service`, and its records-in-hand form
+//! `find_live_managed_service`), the serve reuse pre-gate that decides whether
+//! asking the engine about reuse is worth a round-trip
+//! (`live_managed_services_for_model`), the "is this record live" classifier
 //! (`managed_service_is_live`), and the dashboard sidebar's ready/starting/past-
 //! attempts counts and one-line status text
 //! (`ManagedServiceSidebarCounts`/`managed_service_sidebar_counts`/
 //! `local_server_sidebar_status`) plus the engine display-name helper
-//! (`friendly_engine_label`) that sidebar rendering also uses. `main.rs` calls
-//! into it for the local-servers view, the duplicate-launch guard, and
-//! service-record removal; `chat.rs` calls into it for the deterministic
-//! services-tool summary; `runtime_services.rs` calls into it when reconciling
-//! live servers against a runtime activation; `service_launch.rs` calls into it
-//! for the same duplicate-launch guard `main.rs` uses before spawning a new
-//! managed service. Shared types/config (`ManagedServiceRecord`, `AppPaths`) and
-//! the `endpoint_keys` module stay reachable through `crate::`/`rocm_core::`, as
-//! for other mechanically relocated modules.
+//! (`friendly_engine_label`), which only `chat.rs` reads. `main.rs` calls into
+//! it for the in-use check behind service-record removal and pruning
+//! (`managed_service_is_live`, `recorded_service_pids`) and for
+//! `load_managed_services` in prune planning and the codex-bridge snapshot;
+//! `services_text.rs` reads the sidebar helpers for the local-servers view;
+//! `chat.rs` calls into it for the deterministic services-tool summary;
+//! `runtime_services.rs` calls into it when reconciling live servers against a
+//! runtime activation; `service_launch.rs` is the only caller of the
+//! `existing_live_managed_service` duplicate-launch guard it runs before
+//! spawning a new managed service. Shared types/config (`ManagedServiceRecord`,
+//! `AppPaths`) and the `endpoint_keys` module stay reachable through
+//! `crate::`/`rocm_core::`, as for other mechanically relocated modules.
 
 use std::fs;
 use std::time::Duration;
@@ -39,6 +45,7 @@ use rocm_core::{
 };
 
 use crate::endpoint_keys;
+use crate::engine_runtime_select::service_model_names_match;
 
 pub(crate) fn friendly_engine_label(engine: &str) -> &str {
     match engine {
@@ -94,14 +101,78 @@ pub(crate) fn existing_live_managed_service(
     engine: &str,
     canonical_model_id: &str,
 ) -> Option<ManagedServiceRecord> {
-    load_managed_services(paths)
-        .ok()?
-        .into_iter()
-        .find(|record| {
+    find_live_managed_service(
+        &load_managed_services(paths).ok()?,
+        engine,
+        canonical_model_id,
+    )
+    .cloned()
+}
+
+/// [`existing_live_managed_service`]'s match rule, over records already in hand.
+///
+/// Split out so a caller that has just loaded and liveness-refreshed the
+/// registry can ask the same question again without a second disk scan, and so
+/// the two spellings of "which record would be reused" cannot drift apart.
+pub(crate) fn find_live_managed_service<'a>(
+    records: &'a [ManagedServiceRecord],
+    engine: &str,
+    canonical_model_id: &str,
+) -> Option<&'a ManagedServiceRecord> {
+    records.iter().find(|record| {
+        record.engine == engine
+            && record.canonical_model_id == canonical_model_id
+            && managed_service_is_live(record)
+    })
+}
+
+/// The liveness-refreshed registry, returned only when one of its records is a
+/// live service for `engine` that plausibly already serves `model_ref` —
+/// decided from the records alone, with no canonical model id and so no engine
+/// round-trip.
+///
+/// Pre-gate for the reuse detection in `serve`. Everything that check does is
+/// real engine work: a `ResolveModel` round-trip and, for a self-managing
+/// engine, an `ensure_self_managed_engine_ready` that may print
+/// "Preparing <engine> for GPU serving..." and install. That work runs ahead of
+/// the no-usable-GPU pre-flight, so it must be reserved for invocations that can
+/// actually reuse something: keying on the engine alone let a live service for an
+/// unrelated model pull an install in front of the bail on a GPU-less host.
+///
+/// Cheap only *relative* to what it guards — it is not free. `load_managed_services`
+/// refreshes liveness for every record before this function's model filter is
+/// applied, so each live record can cost an endpoint listing probe, an inference
+/// probe, and a `record.write()`. It buys no engine round-trip and no install;
+/// it does not buy "no I/O".
+///
+/// Hands the whole refreshed `Vec` back rather than a `bool` precisely because
+/// that scan is not free: the caller's follow-up canonical-id lookup runs over
+/// these records via [`find_live_managed_service`] instead of paying for the
+/// same scan a second time. The authoritative check inside
+/// `spawn_managed_engine_child` still re-reads from disk, and must: it runs
+/// under the launch lock, after GPU selection, and detecting that this set went
+/// stale in the meantime is the whole point of it.
+///
+/// Matching uses [`service_model_names_match`] — the same lenient relation the
+/// service-listing surfaces already use to tie a user-typed name to a record — so
+/// a short-vs-canonical spelling still reaches the probe. The probe then decides
+/// reuse authoritatively on the canonical id; this only decides whether asking is
+/// worth the engine round-trip.
+pub(crate) fn live_managed_services_for_model(
+    paths: &AppPaths,
+    engine: &str,
+    model_ref: &str,
+) -> Option<Vec<ManagedServiceRecord>> {
+    let records = load_managed_services(paths).ok()?;
+    records
+        .iter()
+        .any(|record| {
             record.engine == engine
-                && record.canonical_model_id == canonical_model_id
+                && (service_model_names_match(&record.model_ref, model_ref)
+                    || service_model_names_match(&record.canonical_model_id, model_ref))
                 && managed_service_is_live(record)
         })
+        .then_some(records)
 }
 
 const SERVICE_LIVENESS_CHECK_TIMEOUT: Duration = Duration::from_millis(750);
@@ -287,7 +358,7 @@ mod tests {
     use std::thread;
 
     use super::*;
-    use crate::load_managed_service;
+    use crate::services_text::load_managed_service;
     use crate::tests::test_paths;
 
     #[test]
@@ -741,5 +812,246 @@ mod tests {
         assert_eq!(endpoint_keys::endpoint_api_key(&paths, service_id), None);
         assert_eq!(record.stop_requested_unix_ms, None);
         let _ = fs::remove_dir_all(root);
+    }
+
+    /// Write one live managed record and report what the reuse pre-gate makes of
+    /// a serve for `queried_model_ref`.
+    fn reuse_pregate_for(
+        label: &str,
+        record_model_ref: &str,
+        record_canonical_model_id: &str,
+        queried_engine: &str,
+        queried_model_ref: &str,
+    ) -> Result<bool> {
+        reuse_pregate_for_record(
+            label,
+            record_model_ref,
+            record_canonical_model_id,
+            queried_engine,
+            queried_model_ref,
+            "starting",
+        )
+    }
+
+    /// As [`reuse_pregate_for`], but with the record's `status` chosen by the
+    /// caller so the liveness arm of the pre-gate can be discriminated. Every
+    /// other test plants a live record, which left `managed_service_is_live`
+    /// deletable with the suite still green.
+    fn reuse_pregate_for_record(
+        label: &str,
+        record_model_ref: &str,
+        record_canonical_model_id: &str,
+        queried_engine: &str,
+        queried_model_ref: &str,
+        record_status: &str,
+    ) -> Result<bool> {
+        let (root, paths) = test_paths(label);
+        paths.ensure()?;
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            format!("lemonade-{label}"),
+            "lemonade",
+            record_model_ref,
+            record_canonical_model_id,
+            "127.0.0.1",
+            11_520,
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            None,
+        );
+        record.status = record_status.to_owned();
+        record.engine_pid = Some(std::process::id());
+        record.write()?;
+
+        let gated =
+            live_managed_services_for_model(&paths, queried_engine, queried_model_ref).is_some();
+        let _ = fs::remove_dir_all(root);
+        Ok(gated)
+    }
+
+    #[test]
+    fn reuse_pregate_skips_engine_work_for_an_unrelated_live_model() -> Result<()> {
+        // EAI-8059 review: the reuse probe runs a `ResolveModel` round-trip and,
+        // for a self-managing engine, an install that prints "Preparing ... for
+        // GPU serving" — all of it ahead of the no-usable-GPU bail. Keying the
+        // pre-gate on the engine alone let a live service for a model this
+        // invocation can never reuse pull that work in front of the bail. Gating
+        // on the model keeps the fail-fast contract true.
+        assert!(
+            !reuse_pregate_for(
+                "reuse-pregate-other-model",
+                "other",
+                "other-canonical",
+                "lemonade",
+                "qwen",
+            )?,
+            "a live service for an unrelated model must not unlock the reuse probe"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reuse_pregate_admits_the_same_model_including_a_short_spelling() -> Result<()> {
+        // The probe must still be reached for anything that could genuinely be
+        // reused, so the gate must not narrow reuse detection: an exact ref, a
+        // canonical-id-only match, and a short-vs-canonical spelling all pass.
+        // The probe then decides reuse authoritatively on the canonical id.
+        assert!(
+            reuse_pregate_for(
+                "reuse-pregate-exact",
+                "qwen",
+                "qwen-canonical",
+                "lemonade",
+                "qwen",
+            )?,
+            "the same raw model ref must unlock the reuse probe"
+        );
+        assert!(
+            reuse_pregate_for(
+                "reuse-pregate-canonical",
+                "some-alias",
+                "Qwen/Qwen3-8B",
+                "lemonade",
+                "Qwen/Qwen3-8B",
+            )?,
+            "a canonical-id match must unlock the reuse probe"
+        );
+        assert!(
+            reuse_pregate_for(
+                "reuse-pregate-short",
+                "Qwen/Qwen3-8B",
+                "Qwen/Qwen3-8B",
+                "lemonade",
+                "qwen3-8b",
+            )?,
+            "a short spelling of the same model must unlock the reuse probe"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reuse_pregate_admits_the_model_id_the_reuse_scenario_plants() -> Result<()> {
+        // `@id:serve-reuse-exempt-from-no-gpu-refusal` plants a live record for
+        // this exact id and then serves it, relying on the reuse short-circuit
+        // to reach the summary on a GPU-less host. That scenario only runs on
+        // the `@requires-no-gpu` mock lane, so pin the pre-gate's verdict for
+        // its literal model id here too: a matcher change that silently turned
+        // the scenario into a launch attempt would otherwise only show up there.
+        assert!(
+            reuse_pregate_for(
+                "reuse-pregate-e2e-reuse",
+                "e2e/reuse-model",
+                "e2e/reuse-model",
+                "lemonade",
+                "e2e/reuse-model",
+            )?,
+            "the reuse scenario's planted service must unlock the reuse probe"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reuse_pregate_admits_a_match_on_the_raw_model_ref_alone() -> Result<()> {
+        // Discriminates the `record.model_ref` arm. Every other positive case
+        // also matches on `canonical_model_id` (`"qwen-canonical"` contains
+        // `"qwen"`, and the rest use identical fields), so deleting that arm
+        // left the whole suite green. Here the canonical id shares nothing with
+        // the query, so only the raw ref can open the gate — which is the case
+        // that matters in practice: a user types the name they launched with
+        // before the engine has reported any canonical id for it.
+        assert!(
+            reuse_pregate_for(
+                "reuse-pregate-model-ref-only",
+                "qwen",
+                "unrelated-canonical-id",
+                "lemonade",
+                "qwen",
+            )?,
+            "a match on the record's raw model ref alone must unlock the reuse probe"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reuse_pregate_rejects_a_record_that_is_no_longer_live() -> Result<()> {
+        // Discriminates the `managed_service_is_live(record)` arm. The shared
+        // helper otherwise always plants a live record, so deleting that arm
+        // also left the suite green. A stopped or failed service cannot be
+        // reused, so letting its record open the gate would drag the
+        // `ResolveModel` round-trip and any self-managed engine install in front
+        // of the no-usable-GPU bail for nothing — exactly the fail-fast contract
+        // the pre-gate exists to keep.
+        for status in ["stopped", "failed"] {
+            assert!(
+                !reuse_pregate_for_record(
+                    &format!("reuse-pregate-{status}"),
+                    "qwen",
+                    "qwen-canonical",
+                    "lemonade",
+                    "qwen",
+                    status,
+                )?,
+                "a {status} service must not unlock the reuse probe"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn reuse_pregate_still_keys_on_the_engine() -> Result<()> {
+        assert!(
+            !reuse_pregate_for(
+                "reuse-pregate-other-engine",
+                "qwen",
+                "qwen-canonical",
+                "vllm",
+                "qwen",
+            )?,
+            "a live service for a different engine must not unlock the reuse probe"
+        );
+        Ok(())
+    }
+
+    /// The canonical-id lookup the serve path runs over the pre-gate's own
+    /// records must agree with the disk-reading guard the spawn uses, or the
+    /// single-scan optimisation would have changed behaviour rather than cost.
+    #[test]
+    fn find_live_managed_service_agrees_with_the_disk_reading_guard() -> Result<()> {
+        let (root, paths) = test_paths("find-live-matches-existing");
+        paths.ensure()?;
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "lemonade-find-live",
+            "lemonade",
+            "qwen",
+            "qwen-canonical",
+            "127.0.0.1",
+            11_521,
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            None,
+        );
+        record.status = "starting".to_owned();
+        record.engine_pid = Some(std::process::id());
+        record.write()?;
+
+        let records = live_managed_services_for_model(&paths, "lemonade", "qwen")
+            .expect("the planted live record opens the pre-gate");
+        assert_eq!(
+            find_live_managed_service(&records, "lemonade", "qwen-canonical")
+                .map(|r| r.service_id.clone()),
+            existing_live_managed_service(&paths, "lemonade", "qwen-canonical")
+                .map(|r| r.service_id),
+        );
+        assert!(
+            find_live_managed_service(&records, "lemonade", "not-this-model").is_none(),
+            "the canonical-id term must still discriminate"
+        );
+        let _ = fs::remove_dir_all(root);
+        Ok(())
     }
 }

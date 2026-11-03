@@ -138,7 +138,7 @@ Feature: Interactive dashboard
   # this PR generalized, so a revert of that change would not turn this red.
   # The discriminating regression test for that change is the unit test
   # `back_out_requires_an_open_manager_on_any_tab` in crates/rocm-dash-tui's
-  # app/mod.rs, which does fail on revert.
+  # app/overlays.rs, which does fail on revert.
   @id:dash-manager-escape-closes-on-any-tab @requires-os:linux
   Scenario: dash-11 - Escape closes a manager overlay on any tab
     When the user opens the dashboard with demo data
@@ -644,4 +644,26 @@ Feature: Interactive dashboard
     When the user declines the send
     And the user closes the Diagnose screen
     And the user quits the dashboard
+    Then the dashboard exits successfully
+
+  # #286: the header's warning badge counted warnings but gave no way to read
+  # them, and while a GPU is reported the text is drawn nowhere else in the
+  # dashboard. A recording supplies one warning next to a working GPU so the
+  # scenario needs no daemon and no particular host hardware; the user reads
+  # the text from the badge with `!`. The click on the badge, and its refusal
+  # over an open modal, a manager overlay or focused chat input, are asserted by
+  # the unit tests in `crates/rocm-dash-tui/src/app/` and `ui/header.rs`, where a
+  # mouse event can be sent directly. The key needs no such gate: it is only
+  # reached when nothing else owns the keyboard, which is the event loop's
+  # existing arm order and is not re-tested here.
+  @id:dash-warning-badge-opens-the-warning @requires-os:linux
+  Scenario: dash-38 - A user reads the warning behind the header badge
+    When the user opens the dashboard replaying a recording that reports a warning
+    Then the header shows that one warning is reported
+    When the user opens the warnings
+    Then the warning text is displayed
+    And the backdrop behind the popup is dimmed
+    When the user presses Escape
+    Then the warning text is no longer displayed
+    When the user quits the dashboard
     Then the dashboard exits successfully

@@ -40,3 +40,13 @@ Feature: Uninstall
     Then the uninstall fails
     And the error names the cache folder it could not check
     And the config folder still holds the user's files
+
+  # `rocm uninstall --help` promises that, without --yes and outside a terminal,
+  # the command prints the plan and refuses rather than asking or assuming an
+  # answer. The harness runs the binary with no terminal, so this is that case.
+  @id:uninstall-refused-without-yes-outside-terminal @requires-os:linux
+  Scenario: uninstall-04 - Uninstalling without confirming outside a terminal is refused and removes nothing
+    Given the config folder holds the user's files
+    When the user uninstalls the config without confirming
+    Then the uninstall is refused and the user is told to confirm explicitly
+    And the config folder still holds the user's files

@@ -35,6 +35,23 @@ pub fn is_catalog_id(id: &str) -> bool {
     id.starts_with("fix-") || id.starts_with("info-")
 }
 
+/// The whole number that follows `phrase` in a markdown document, and the text
+/// after that number.
+///
+/// Both are read from the document with its whitespace collapsed first, because
+/// the sentences these fixtures sit in are hard-wrapped and the number can land
+/// on either side of a line break. `None` when the phrase is absent or is not
+/// followed by a digit. Shared by the two places that read a number out of
+/// `SKILL.md` prose, so the wrap handling lives in one function.
+#[must_use]
+pub fn number_after_phrase(md: &str, phrase: &str) -> Option<(u64, String)> {
+    let flat = md.split_whitespace().collect::<Vec<_>>().join(" ");
+    let after = flat.split(phrase).nth(1)?;
+    let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+    let number = digits.parse().ok()?;
+    Some((number, after[digits.len()..].to_owned()))
+}
+
 /// Select the single binary directory consumed by lifecycle packaging.
 ///
 /// `xtask package` accepts one `ROCM_BIN_DIR`, so prebuilt `rocm` and `rocmd`
@@ -159,7 +176,7 @@ pub use e2e_report as report;
 #[cfg(test)]
 mod tests {
     use super::{
-        chat_response_is_successful, cli_failure_report, lifecycle_binary_dir,
+        chat_response_is_successful, cli_failure_report, lifecycle_binary_dir, number_after_phrase,
         user_path_write_region,
     };
     use std::path::Path;
@@ -208,6 +225,25 @@ mod tests {
     /// whole-output `!contains("setx ")` — what diagnose-38 asserted before —
     /// fails on this output even though the CLI did exactly the right thing,
     /// which is what left `main`'s Windows E2E lane permanently red.
+    #[test]
+    fn number_after_phrase_reads_across_a_hard_wrap() {
+        let md = "This skill requires `contract_version`
+   12 or higher, and
+more.";
+        assert_eq!(
+            number_after_phrase(md, "requires `contract_version` "),
+            Some((12, " or higher, and more.".to_owned()))
+        );
+        assert_eq!(number_after_phrase(md, "no such phrase"), None);
+        assert_eq!(
+            number_after_phrase(
+                "requires `contract_version` many",
+                "requires `contract_version` "
+            ),
+            None
+        );
+    }
+
     #[test]
     fn the_write_region_excludes_the_catalog_prose_that_merely_names_setx() {
         let output = format!("{PATH_FIX_CATALOG_BLOCK}{PATH_WRITE_THROUGH_POWERSHELL}");

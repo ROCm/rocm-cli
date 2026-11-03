@@ -46,13 +46,15 @@
 //! `decode_engine_response`, `with_scoped_builtin_engine_env`,
 //! `builtin_engine_request`, and `ScopedEnvVar` have no callers outside this
 //! module and stay private. Shared helpers this module calls back into at the
-//! crate root — `apply_app_path_env`, `app_path_env_vars`,
-//! `with_sigpipe_ignored`, `optional_arg`, `engine_recipe_json_arg`,
-//! `device_policy_name`, `missing_packaged_engine_reason` — stay in
-//! `main.rs` and are reached unqualified via `use crate::{...}`, same as for
-//! other mechanically relocated modules. `parse_device_policy` moved out of
-//! `main.rs` into `gpu_policy.rs` in ROCMAI-214 (Phase 6f); it is reached via
-//! `use crate::gpu_policy::parse_device_policy;` instead.
+//! crate root — `with_sigpipe_ignored`, `device_policy_name`,
+//! `missing_packaged_engine_reason` — stay in `main.rs` and are reached
+//! unqualified via `use crate::{...}`, same as for other mechanically
+//! relocated modules. `parse_device_policy` moved out of `main.rs` into
+//! `gpu_policy.rs` in ROCMAI-214 (Phase 6f); it is reached via `use
+//! crate::gpu_policy::parse_device_policy;` instead. `apply_app_path_env`,
+//! `app_path_env_vars`, `optional_arg`, and `engine_recipe_json_arg` moved out
+//! of `main.rs` into `engine_runtime_select.rs` in ROCMAI-215 (Phase 6f); this
+//! file's `use` list below points there now instead of at the crate root.
 
 use std::ffi::OsString;
 use std::io::{self, BufRead, Read, Write};
@@ -70,11 +72,11 @@ use rocm_engine_protocol::{
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use crate::gpu_policy::parse_device_policy;
-use crate::{
-    app_path_env_vars, apply_app_path_env, device_policy_name, engine_recipe_json_arg,
-    missing_packaged_engine_reason, optional_arg, with_sigpipe_ignored,
+use crate::engine_runtime_select::{
+    app_path_env_vars, apply_app_path_env, engine_recipe_json_arg, optional_arg,
 };
+use crate::gpu_policy::parse_device_policy;
+use crate::{device_policy_name, missing_packaged_engine_reason, with_sigpipe_ignored};
 
 static BUILTIN_ENGINE_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 

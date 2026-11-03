@@ -174,6 +174,85 @@ async fn open_dashboard_demo(world: &mut E2eWorld) {
     world.tui = Some(session);
 }
 
+/// The one warning `dash-38`'s recording reports. Short and ASCII so it stays on
+/// one screen row inside the popup and is found by a plain substring match.
+const RECORDED_WARNING: &str = "amd-smi unavailable (GPU device inaccessible)";
+
+#[when("the user opens the dashboard replaying a recording that reports a warning")]
+async fn open_dashboard_replaying_warning(world: &mut E2eWorld) {
+    // A snapshot with a working GPU *and* a warning: the combination where the
+    // warning text used to be drawn nowhere in the dashboard. The dashboard
+    // forgets its latest snapshot the moment a replay ends, and replay caps the
+    // wait between entries at two seconds, so a single line would be gone before
+    // the scenario looked at it. Sixty entries two seconds apart keep the
+    // recording playing for two minutes, far longer than the scenario runs.
+    let snapshot = |ts_us: u64| {
+        format!(
+            concat!(
+                r#"{{"ts_us":{ts_us},"event":{{"kind":"snapshot","#,
+                r#""timestamp":"2023-11-15T00:00:00Z","#,
+                r#""host":{{"cpu_overall_pct":0.0,"cpu_per_core_pct":[],"memory_used_mb":0,"#,
+                r#""memory_total_mb":0,"swap_used_mb":0,"swap_total_mb":0,"#,
+                r#""disk_read_bps":0,"disk_write_bps":0,"net_rx_bps":0,"net_tx_bps":0}},"#,
+                r#""gpus":[{{"device_id":"0","vram_used_mb":0,"vram_total_mb":1024,"#,
+                r#""gpu_utilization_pct":0.0,"temperature_c":0.0,"power_w":0.0,"clock_mhz":null}}],"#,
+                r#""gpu_system_info":null,"instances":[],"warnings":["{warning}"]}}}}"#,
+            ),
+            ts_us = ts_us,
+            warning = RECORDED_WARNING
+        )
+    };
+    let recording_text: String = (0..60u64)
+        .map(|i| snapshot(1_700_000_000_000_000 + i * 2_000_000) + "\n")
+        .collect();
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .to_path_buf();
+    let recording = root.join("warning-recording.ndjson");
+    std::fs::write(&recording, recording_text)
+        .unwrap_or_else(|e| panic!("failed to write {}: {e}", recording.display()));
+    let path = recording.to_string_lossy().to_string();
+    let session = TuiSession::spawn(world, &["dash", "--replay", &path])
+        .unwrap_or_else(|e| panic!("failed to open the dashboard replaying a recording: {e}"));
+    world.tui = Some(session);
+}
+
+#[then("the header shows that one warning is reported")]
+async fn header_shows_one_warning(world: &mut E2eWorld) {
+    session(world)
+        .wait_for_screen("⚠ 1", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the header warning badge did not appear: {e}"));
+}
+
+#[when("the user opens the warnings")]
+async fn open_warnings(world: &mut E2eWorld) {
+    // `!` toggles the popup, so it is not safe to resend; the previous step
+    // already waited for a frame that shows the badge, so the event loop is up.
+    session(world)
+        .send("!")
+        .unwrap_or_else(|e| panic!("failed to open the warnings: {e}"));
+}
+
+#[then("the warning text is displayed")]
+async fn warning_text_is_displayed(world: &mut E2eWorld) {
+    session(world)
+        .wait_for_screen(RECORDED_WARNING, default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the warning text was not shown: {e}"));
+}
+
+#[then("the warning text is no longer displayed")]
+async fn warning_text_is_gone(world: &mut E2eWorld) {
+    session(world)
+        .wait_until_gone(RECORDED_WARNING, default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the warnings popup did not close: {e}"));
+}
+
 /// The name of a child directory `dash-25` plants under the scenario's cwd;
 /// `existing_folder_browser_shows_scenario_folder` asserts the browser lists
 /// it by this fixed, short label rather than its full path — the browser's
@@ -831,7 +910,7 @@ async fn quit_confirm_is_displayed(world: &mut E2eWorld) {
 /// mention of the model name — directly answering AGENTS.md §3's rule that a
 /// remediation command must be asserted, not just its wording.
 ///
-/// The command sits on its own screen row (`ui::quit_confirm_body` pushes it
+/// The command sits on its own screen row (`ui::quit_confirm::quit_confirm_body` pushes it
 /// as a separate line from the model-name row above it) rather than trailing
 /// the model name on one combined line, so at this PTY's width it is not
 /// expected to word-wrap. Whitespace is still
@@ -929,7 +1008,7 @@ async fn try_quit_launcher(world: &mut E2eWorld) {
 
 /// Launcher counterpart of `quit_confirm_is_displayed`: same marker, same
 /// prompt (`ui::launcher::draw`'s own quit_confirm arm renders the identical
-/// `ui::quit_confirm_body`), reached from the launcher's own event loop
+/// `ui::quit_confirm::quit_confirm_body`), reached from the launcher's own event loop
 /// instead of the dashboard's.
 #[then("the launcher asks whether to quit while a model is still being served")]
 async fn launcher_quit_confirm_is_displayed(world: &mut E2eWorld) {
@@ -945,7 +1024,7 @@ async fn decline_quit_prompt(world: &mut E2eWorld) {
         .send("n")
         .unwrap_or_else(|e| panic!("failed to decline the quit prompt: {e}"));
     // The prompt's own body names the serving model (`quit_confirm_body` in
-    // `ui/mod.rs`), so the very next assertion — "the managed model is
+    // `ui/quit_confirm.rs`), so the very next assertion — "the managed model is
     // displayed" (dash-26) or "the launcher shows the model serving"
     // (dash-27; a different step, same risk) — could pass on the prompt's
     // own text even if `n` did nothing and the prompt never actually closed.
@@ -1174,7 +1253,7 @@ async fn quit_chat_back_to_launcher(world: &mut E2eWorld) {
     // see `request_quit`'s doc comment.
     //
     // No `i` here, unlike `try_quit_chat`: that step's own comment notes "a
-    // fresh session starts unfocused", but `accept_chat_consent` (`app/mod.rs`)
+    // fresh session starts unfocused", but `accept_chat_consent` (`app/chat_state.rs`)
     // sets `chat_focused = true` as part of accepting the endpoint prompt this
     // step's caller (`open_chat_from_launcher`) already sent `y` to, so the
     // input here is already focused. Sending `i` first — as a first attempt

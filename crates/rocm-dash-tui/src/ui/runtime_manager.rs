@@ -35,9 +35,9 @@ use crate::ui::approval::{
 use crate::ui::exec::{display_args, exe_label, resolve_exe};
 use crate::ui::folder_browser::{FolderBrowser, FolderOutcome, draw_folder_browser};
 use crate::ui::job_console::{ConsoleOutcome, on_console_key};
-use crate::ui::modal::{centered_rect, draw_popup_frame};
-use crate::ui::panel::{self, BoxRole};
+use crate::ui::panel::{self, BoxRole, centered_rect, draw_popup_frame};
 use crate::ui::theme::Theme;
+use crate::ui::widgets::apply_char_key;
 
 /// A flattened registered-runtime entry for the list.
 ///
@@ -189,9 +189,6 @@ pub fn on_key(
     if let Some(input) = r.import_input.as_mut() {
         match key.code {
             KeyCode::Esc => r.import_input = None,
-            KeyCode::Backspace => {
-                input.pop();
-            }
             KeyCode::Enter => {
                 let path = input.trim().to_string();
                 if path.is_empty() {
@@ -203,8 +200,9 @@ pub fn on_key(
                     stage_approval(r, RuntimeAction::Import, args);
                 }
             }
-            KeyCode::Char(c) => input.push(c),
-            _ => {}
+            code => {
+                apply_char_key(input, code);
+            }
         }
         return Vec::new();
     }
@@ -696,6 +694,18 @@ mod tests {
         let pending = rm.as_ref().unwrap().approval.as_ref().unwrap();
         assert_eq!(pending.action, RuntimeAction::Import);
         assert_eq!(pending.args, vec!["runtimes", "import", "/tmp/m.json"]);
+    }
+
+    #[test]
+    fn backspace_edits_the_import_path() {
+        let mut rm = Some(RuntimeManagerState::default());
+        let mut jobs = State::default();
+        on_key(&mut rm, &[], &mut jobs, key(KeyCode::Char('i')));
+        for c in "ab".chars() {
+            on_key(&mut rm, &[], &mut jobs, key(KeyCode::Char(c)));
+        }
+        on_key(&mut rm, &[], &mut jobs, key(KeyCode::Backspace));
+        assert_eq!(rm.as_ref().unwrap().import_input.as_deref(), Some("a"));
     }
 
     #[test]

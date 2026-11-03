@@ -5,13 +5,17 @@
 //! The TheRock managed-runtime-environment surface.
 //!
 //! `ManagedRuntimeEnvironment`/`FrameworkInterpreter`, `active_managed_therock_*`,
-//! `prepend_runtime_paths`, and the registry-manifest probing behind them.
-//! amd-smi binary resolution (`resolve_amd_smi_binary*`) still reads those
-//! same registry records from `lib.rs` — a distinct, not-yet-scoped concern.
+//! `prepend_runtime_paths`, and the registry-manifest probing behind them,
+//! including the managed-SDK probe candidates (`managed_therock_sdk_probe_candidates`,
+//! `TheRockSdkProbeCandidate`) and the library directories a managed runtime keeps.
+//! amd-smi binary resolution (`resolve_amd_smi_binary*`) reads those same
+//! registry records from [`crate::amd_smi`] — a distinct concern that lives
+//! in its own module.
 
+use crate::gfx_target::normalize_therock_family;
 use crate::{
-    AppPaths, RocmCliConfig, normalize_runtime_path_for_host, normalize_therock_family,
-    runtime_is_linux, runtime_is_windows, runtime_python_executable_in_env,
+    AppPaths, RocmCliConfig, normalize_runtime_path_for_host, runtime_is_linux, runtime_is_windows,
+    runtime_python_executable_in_env,
 };
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -423,11 +427,167 @@ pub(crate) struct TheRockSdkProbeManifest {
     pub(crate) library_paths: Vec<PathBuf>,
 }
 
+pub(crate) fn managed_therock_sdk_probe_candidates(
+    registry_dir: &Path,
+) -> Vec<TheRockSdkProbeCandidate> {
+    let Ok(entries) = fs::read_dir(registry_dir) else {
+        return Vec::new();
+    };
+    let mut records = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(record) = fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<TheRockFamilyManifest>(&bytes).ok())
+        else {
+            continue;
+        };
+        if !record.looks_like_therock() {
+            continue;
+        }
+        let sdk_ready = record
+            .rocm_sdk
+            .as_ref()
+            .is_some_and(|sdk| sdk.import_ok && sdk.root_path.is_some() && sdk.bin_path.is_some());
+        if !sdk_ready {
+            continue;
+        }
+        records.push((path, record));
+    }
+    sort_records_newest_install_first(&mut records);
+    records
+        .into_iter()
+        .filter_map(|(_, record)| {
+            let sdk = record.rocm_sdk?;
+            Some(TheRockSdkProbeCandidate {
+                site_packages: sdk.site_packages,
+                root_path: sdk.root_path?,
+                bin_path: sdk.bin_path?,
+                library_paths: sdk.library_paths,
+            })
+        })
+        .collect()
+}
+
+pub(crate) fn managed_sdk_ld_library_path(
+    candidate: &TheRockSdkProbeCandidate,
+) -> Option<OsString> {
+    let mut paths = Vec::new();
+    collect_managed_runtime_library_paths(
+        &candidate.root_path,
+        candidate.site_packages.as_deref(),
+        &mut paths,
+    );
+    let wsl_lib = PathBuf::from("/usr/lib/wsl/lib");
+    if wsl_lib.is_dir() {
+        paths.push(wsl_lib);
+    }
+    if let Some(existing) = std::env::var_os("LD_LIBRARY_PATH")
+        && !existing.is_empty()
+    {
+        paths.extend(std::env::split_paths(&existing));
+    }
+    if paths.is_empty() {
+        None
+    } else {
+        std::env::join_paths(paths).ok()
+    }
+}
+
+/// Every library directory a managed runtime keeps, given its root and the
+/// `site-packages` its SDK recorded.
+///
+/// One description of the layout, deliberately. A wheel-format runtime does not
+/// keep its ROCm libraries under the root: they sit in a sibling `_rocm_sdk_*`
+/// package inside `site-packages`, and a caller that walks the root alone sees
+/// an empty runtime rather than a populated one. That is not a difference a
+/// caller should have to remember, so it lives here and every search shares it.
+pub(crate) fn collect_managed_runtime_library_paths(
+    root: &Path,
+    site_packages: Option<&Path>,
+    paths: &mut Vec<PathBuf>,
+) {
+    collect_sdk_library_paths(root, paths);
+    // Nothing to do when `site_packages` is `None`, and the absence of an
+    // `else` is deliberate rather than an oversight.
+    //
+    // `None` is not reachable from a real candidate today: `ROCM_SDK_PROBE_SCRIPT`
+    // has recorded `site_packages` unconditionally, outside its `try`, since the
+    // probe's initial version, so every manifest that parses at all carries
+    // `Some` here. `site_packages` stays `Option` because the field is
+    // `serde(default)` (a read-only probe cannot depend on a registry record
+    // being current), not because there is a real shape it needs to degrade
+    // gracefully for.
+    //
+    // There also is not a guess worth making if this were ever reached: `root`
+    // is one of the runtime's own `_rocm_sdk_*` package directories (the probe
+    // script's `_devel.get_devel_root()` result, or the first package root it
+    // found when there is no `devel` extra), never a venv root with a
+    // `root/lib/<python>/site-packages` layout underneath it to re-derive. A
+    // fallback that assumed that shape previously shipped here and could not
+    // have been exercised by any real record; removed along with its test
+    // rather than kept as a guess for a case that cannot arise.
+    if let Some(recorded) = site_packages {
+        collect_sdk_package_library_paths(recorded, paths);
+    }
+}
+
+/// Library directories of the `_rocm_sdk_*` packages inside `site_packages`.
+///
+/// They belong to the runtime that contains them, not to themselves.
+fn collect_sdk_package_library_paths(site_packages: &Path, paths: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(site_packages) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .is_some_and(|name| name.starts_with("_rocm_sdk_"))
+        {
+            collect_sdk_library_paths(&path, paths);
+        }
+    }
+}
+
+pub(crate) fn collect_sdk_library_paths(root: &Path, paths: &mut Vec<PathBuf>) {
+    for path in [
+        root.join("bin"),
+        root.join("lib"),
+        root.join("lib64"),
+        root.join("lib").join("rocm_sysdeps").join("lib"),
+    ] {
+        if path.is_dir() {
+            paths.push(path);
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct TheRockSdkProbeCandidate {
+    site_packages: Option<PathBuf>,
+    pub(crate) root_path: PathBuf,
+    pub(crate) bin_path: PathBuf,
+    /// The SDK's own recorded library directories -- every package root the
+    /// probe script actually imported and asked Python for (see
+    /// `ROCM_SDK_PROBE_SCRIPT`'s `add_runtime_root`), not a layout guessed from
+    /// `root_path`/`site_packages` after the fact. This is what
+    /// `probe_runtime_devices` puts on `LD_LIBRARY_PATH` for a served process;
+    /// a caller that needs to find a managed runtime's actual libraries (comgr
+    /// included) should prefer this over re-deriving the layout.
+    pub(crate) library_paths: Vec<PathBuf>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::runtime_python_executable_name;
     use crate::test_support::temp_app_paths;
+    use crate::unix_time_millis;
 
     #[test]
     fn managed_therock_family_uses_runtime_manifest_not_host_mapping() -> Result<()> {
@@ -1016,6 +1176,105 @@ mod tests {
                 "rocm_sdk": { "import_ok": true }
             }))?,
         )?;
+        Ok(())
+    }
+
+    #[test]
+    fn managed_therock_sdk_probe_candidates_break_install_time_ties_on_the_runtime_key()
+    -> Result<()> {
+        // Same shape as the amd-smi and active-runtime fallback tie tests: both
+        // pairings of file name and runtime key, so a read-order pick is wrong
+        // in one of them.
+        for (first_file_key, second_file_key) in [("aaa", "bbb"), ("bbb", "aaa")] {
+            let temp_root = std::env::temp_dir().join(format!(
+                "rocm-cli-sdk-probe-tie-{first_file_key}-{}-{}",
+                std::process::id(),
+                unix_time_millis()
+            ));
+            let registry_dir = temp_root.join("runtimes/registry");
+            fs::create_dir_all(&registry_dir)?;
+            for (file, key) in [("first", first_file_key), ("second", second_file_key)] {
+                let root = temp_root.join(key);
+                let bin = root.join("bin");
+                fs::create_dir_all(&bin)?;
+                fs::write(
+                    registry_dir.join(format!("{file}.json")),
+                    serde_json::to_vec(&serde_json::json!({
+                        "runtime_key": key,
+                        "runtime_id": "therock-stable:gfx94X-dcgpu",
+                        "installed_at_unix_ms": 2_000_u128,
+                        "rocm_sdk": {
+                            "import_ok": true,
+                            "root_path": root,
+                            "bin_path": bin,
+                        },
+                    }))?,
+                )?;
+            }
+
+            let candidates = managed_therock_sdk_probe_candidates(&registry_dir);
+            let expected_bin_path = temp_root.join("aaa").join("bin");
+            let _ = fs::remove_dir_all(&temp_root);
+
+            assert_eq!(
+                candidates
+                    .first()
+                    .map(|candidate| candidate.bin_path.clone()),
+                Some(expected_bin_path),
+                "files first={first_file_key}, second={second_file_key}"
+            );
+        }
+        Ok(())
+    }
+
+    /// `managed_therock_sdk_probe_candidates` surfaces the SDK's own recorded
+    /// `library_paths` rather than dropping them.
+    ///
+    /// Those are what `examine`'s comgr/HIP search now reads to find a managed
+    /// runtime's libraries (see `known_install_roots`/`install_library_dirs` in
+    /// `examine/library_copies.rs`), in place of re-deriving the layout from
+    /// `root_path` and `site_packages` after the fact -- a guess that does not hold for every
+    /// real install shape, which is what left a managed runtime's own code
+    /// object manager library unseen on a real host
+    /// (`examine-finds-the-managed-runtimes-own-compilation-library`). A
+    /// candidate whose `library_paths` came back empty would defeat that fix
+    /// silently, so this pins the field surviving the read.
+    #[test]
+    fn managed_sdk_probe_candidate_carries_recorded_library_paths() -> Result<()> {
+        let (root, paths) = temp_app_paths("managed-sdk-library-paths");
+        let registry = paths.data_dir.join("runtimes").join("registry");
+        let site_packages = root.join("site-packages");
+        let sdk_root = site_packages.join("_rocm_sdk_devel");
+        let sdk_bin = sdk_root.join("bin");
+        let comgr_dir = site_packages.join("_rocm_sdk_core").join("lib");
+        fs::create_dir_all(&sdk_bin)?;
+        fs::create_dir_all(&comgr_dir)?;
+        fs::create_dir_all(&registry)?;
+        fs::write(
+            registry.join("runtime.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "runtime_id": "therock-release:gfx120X-all",
+                "family": "gfx120X-all",
+                "installed_at_unix_ms": 10,
+                "rocm_sdk": {
+                    "import_ok": true,
+                    "site_packages": site_packages,
+                    "root_path": sdk_root,
+                    "bin_path": sdk_bin,
+                    "library_paths": [comgr_dir]
+                }
+            }))?,
+        )?;
+
+        let candidates = managed_therock_sdk_probe_candidates(&registry);
+        assert_eq!(candidates.len(), 1, "expected exactly one candidate");
+        assert_eq!(
+            candidates[0].library_paths,
+            vec![comgr_dir],
+            "the recorded library_paths must survive into the candidate, or the \
+             comgr/HIP search has nowhere else reliable to find them"
+        );
+        fs::remove_dir_all(root).ok();
         Ok(())
     }
 }

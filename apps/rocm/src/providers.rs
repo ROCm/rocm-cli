@@ -1619,6 +1619,14 @@ mod tests {
     use std::sync::mpsc;
     use std::thread;
 
+    // The black-box e2e harness repeats this id as `BUILTIN_ASSISTANT_MODEL_ID` in
+    // `tests/e2e-cucumber/tests/e2e/planner_steps.rs`; the planted service must carry
+    // it or the CLI reports no ready service instead of calling the mock.
+    #[test]
+    fn builtin_assistant_model_id_matches_the_e2e_harness() {
+        assert_eq!(BUILTIN_ASSISTANT_MODEL_ID, "Qwen3-4B-Instruct-2507-GGUF");
+    }
+
     #[test]
     fn local_provider_endpoint_parser_supports_ipv6_loopback() {
         assert_eq!(

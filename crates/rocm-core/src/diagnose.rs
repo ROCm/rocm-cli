@@ -850,9 +850,7 @@ fn check_3_rocm_kernel_unsupported(e: &Examination, symptom: &str) -> Diagnosis 
         "# Compare to the live AMD matrix:".to_owned(),
         "#   https://rocm.docs.amd.com/projects/install-on-linux/en/latest/reference/system-requirements.html".to_owned(),
     ];
-    if ubuntu_driver_is_native_archive(e) {
-        commands.push("# Note on Ubuntu 26.04: the amdgpu driver ships in-tree there, so `rocm install driver --dkms` plans nothing; run `apt install rocm` (with sudo if not root) instead.".to_owned());
-    } else if dkms_driver_plan_is_supported(e) {
+    if dkms_driver_plan_is_supported(e) {
         commands.push("# If your kernel is above the supported range, install the HWE".to_owned());
         commands.push(
             "# kernel that matches ROCm, then rerun `rocm install driver --dkms --yes`.".to_owned(),
@@ -1174,9 +1172,7 @@ fn check_7_stale_repos(e: &Examination, symptom: &str) -> Diagnosis {
         "# If the package manager now resolves, reinstall the driver only (review the plan, then approve):"
             .to_owned(),
     );
-    if ubuntu_driver_is_native_archive(e) {
-        commands.push("#   sudo apt install rocm   # Ubuntu 26.04 ships the amdgpu driver in-tree, so there is no DKMS driver to reinstall".to_owned());
-    } else if dkms_driver_plan_is_supported(e) {
+    if dkms_driver_plan_is_supported(e) {
         commands.push("#   rocm install driver --dkms   # review the plan".to_owned());
         commands
             .push("#   rocm install driver --dkms --yes   # reinstalls the driver only".to_owned());
@@ -1562,7 +1558,7 @@ fn repo_pkg_family(e: &Examination) -> &'static str {
 /// Whether `rocm_install_method` indicates a package-manager-driven install,
 /// covering both the marker-file-based `"repo-native"` value and the
 /// dpkg/rpm-query fallback's `"apt"`/`"dnf"` (see `probe_rocm_install` in
-/// `examine.rs`): a host without one of `REPO_NATIVE_INSTALL_MARKERS` present
+/// `examine/rocm_install_probe.rs`): a host without one of `REPO_NATIVE_INSTALL_MARKERS` present
 /// but whose package manager confirms `rocm-hip-runtime` is installed is
 /// still repo-native-managed, just detected a different way.
 ///
@@ -1574,33 +1570,17 @@ fn is_repo_native_installed(method: &str) -> bool {
     matches!(method, "repo-native" | "amdgpu-install" | "apt" | "dnf")
 }
 
-/// Whether `rocm install driver --dkms` has nothing to reinstall on this
-/// host. Ubuntu 26.04 ships the amdgpu kernel driver in-tree and
-/// `build_driver_install_plan_at` in `apps/rocm/src/driver_install.rs` plans no
-/// DKMS repo install there (see the `("ubuntu", "26.04")` arm); `rocm-core`
-/// can't call that plan builder directly (`apps/rocm` depends on
-/// `rocm-core`, not the reverse), so this mirrors just that one condition.
-/// WSL hosts never reach `check_3`/`check_7`/`check_12` at all -- see
-/// `CHECKERS`'s `&["linux"]` tag on each.
-fn ubuntu_driver_is_native_archive(e: &Examination) -> bool {
-    e.distro_id.eq_ignore_ascii_case("ubuntu") && e.distro_version == "26.04"
-}
-
 /// Whether `rocm install driver --dkms` plans any commands for this host.
 ///
 /// Mirrors the full `(os_id, version_id)` / `ID_LIKE`-derivative
 /// matrix in `apps/rocm/src/driver_install.rs::build_driver_install_plan_at`
-/// (`rocm-core` can't call that plan builder directly -- see
-/// `ubuntu_driver_is_native_archive` above for why). Ubuntu 26.04 is
-/// deliberately excluded here even though its plan is also "no DKMS repo
-/// commands": that host has its own guidance (native archive, `apt install
-/// rocm`), handled separately via `ubuntu_driver_is_native_archive`, not the
-/// "no plan was guessed for this distro at all" case this function reports.
+/// (`rocm-core` can't call that plan builder directly: `apps/rocm` depends
+/// on `rocm-core`, not the reverse).
 pub fn dkms_driver_plan_is_supported(e: &Examination) -> bool {
     let os_id = e.distro_id.to_ascii_lowercase();
     let version_id = e.distro_version.as_str();
     match (os_id.as_str(), version_id) {
-        ("ubuntu", "22.04" | "24.04") => true,
+        ("ubuntu", "22.04" | "24.04" | "26.04") => true,
         ("debian", "12" | "13") => true,
         ("rhel", "10.1" | "10.0" | "9.7" | "9.6" | "9.4" | "8.10") => true,
         ("ol", "10.1" | "9.7" | "8.10") => true,
@@ -1613,7 +1593,7 @@ pub fn dkms_driver_plan_is_supported(e: &Examination) -> bool {
                 .map(str::to_ascii_lowercase)
                 .collect();
             let mentions = |family: &str| likes.iter().any(|like| like == family);
-            (mentions("ubuntu") && matches!(version_id, "22.04" | "24.04"))
+            (mentions("ubuntu") && matches!(version_id, "22.04" | "24.04" | "26.04"))
                 || (mentions("debian") && matches!(version_id, "12" | "13"))
                 || (mentions("rhel")
                     && !matches!(os_id.as_str(), "ol" | "oracle")
@@ -1643,7 +1623,7 @@ fn check_12_repo_native_broken(e: &Examination, symptom: &str) -> Diagnosis {
     // Purging `amdgpu-dkms` is only the first half of purge-then-reinstall:
     // where rocm-cli plans no reinstall (undocumented distro) it would strip
     // the driver with nothing to put back, so that step is withheld there.
-    let reinstall_planned = ubuntu_driver_is_native_archive(e) || dkms_driver_plan_is_supported(e);
+    let reinstall_planned = dkms_driver_plan_is_supported(e);
     let mut commands = vec!["# Clear the half-configured package/DKMS state first.".to_owned()];
     match family {
         "apt" => {
@@ -1685,16 +1665,7 @@ fn check_12_repo_native_broken(e: &Examination, symptom: &str) -> Diagnosis {
     if let Some(cmd) = refresh_command_for_family(family) {
         commands.push(format!("sudo {cmd}"));
     }
-    let summary = if ubuntu_driver_is_native_archive(e) {
-        commands
-            .push("# Ubuntu 26.04 ships the amdgpu kernel driver in-tree; there is no".to_owned());
-        commands.push(
-            "# repo-native DKMS driver to reinstall here. Reinstall the userspace stack:"
-                .to_owned(),
-        );
-        commands.push("sudo apt install rocm".to_owned());
-        "Clear the half-configured package state, quarantine the repo-native install's repo files, THEN reinstall the userspace stack via `sudo apt install rocm` (Ubuntu 26.04 ships the amdgpu kernel driver in-tree, so there is no DKMS driver to reinstall).".to_owned()
-    } else if dkms_driver_plan_is_supported(e) {
+    let summary = if dkms_driver_plan_is_supported(e) {
         commands.push("# Reinstall via rocm-cli's repo-native flow:".to_owned());
         commands.push("rocm install driver --dkms --yes".to_owned());
         "Clear the half-configured package/DKMS state, quarantine the repo-native install's repo files, THEN reinstall via `rocm install driver --dkms --yes`.".to_owned()
@@ -1730,14 +1701,7 @@ fn check_12_repo_native_broken(e: &Examination, symptom: &str) -> Diagnosis {
     // report the pipeline's last stage, masking a missing/failing
     // `rocminfo`.
     //
-    // Ubuntu 26.04 has no `amdgpu-dkms`/DKMS module to query (see
-    // `ubuntu_driver_is_native_archive` above): check the `rocm` package
-    // dpkg reinstalled instead.
-    let verify = if ubuntu_driver_is_native_archive(e) {
-        "dpkg-query -W -f='${Status}' rocm 2>/dev/null | grep -q 'install ok installed' \
-         && rocminfo >/dev/null 2>&1"
-            .to_owned()
-    } else if dkms_driver_plan_is_supported(e) {
+    let verify = if dkms_driver_plan_is_supported(e) {
         "(dpkg-query -W -f='${Status}' amdgpu-dkms 2>/dev/null | grep -q 'install ok installed' \
          || rpm -q amdgpu-dkms >/dev/null 2>&1) \
          && dkms status amdgpu 2>/dev/null | grep -q installed \
@@ -3229,10 +3193,10 @@ pub fn upstream_route(target: &str) -> Route {
 /// ever sets to `pytorch`, `llama-cpp`, `unknown` or `skipped` — so those two
 /// named arms plus the ROCm-core default are the whole reachable set.
 ///
-/// Adding a framework to `examine.rs`'s probe means adding its arm here, its
+/// Adding a framework to `examine/framework.rs`'s probe means adding its arm here, its
 /// tracker in [`upstream_tracker`], and its name to the hand-maintained list in
 /// `routing_targets_cover_every_framework_the_probe_reports`. That test reads
-/// its own list rather than deriving one from `examine.rs`, so it cannot notice
+/// its own list rather than deriving one from `examine/framework.rs`, so it cannot notice
 /// a new framework on its own — all three edits are manual.
 fn route_when_no_match(e: &Examination) -> Route {
     let target = match e.framework.as_str() {
@@ -3792,6 +3756,137 @@ mod tests {
                 .iter()
                 .map(|d| (&d.id, d.score))
                 .collect::<Vec<_>>()
+        );
+    }
+
+    /// ROCMAI-830: the other host ROCMAI-546's gate has to hold on. A native
+    /// Windows Strix Halo (gfx1151) whose default engine is Lemonade, with no
+    /// system HIP SDK, diagnosed twice: before any runtime was installed, and
+    /// after `rocm install sdk` put a managed TheRock wheel runtime in place.
+    ///
+    /// Unlike the gfx90c laptop above, gfx1151 is a supported ROCm target, so
+    /// `info-20` does not fire and nothing outranks fix-13 here: on v0.2.1,
+    /// which was cut before the gate landed, fix-13 was the *only* entry and
+    /// ranked #1 at 35 on a machine serving models fine. A managed runtime is
+    /// not a HIP-based setup that needs the system SDK either -- its wheels
+    /// bundle their own HIP runtime -- whether the torch probe through it
+    /// answered (a `hip=` build) or timed out (`unknown`, as on the reporting
+    /// machine under load).
+    ///
+    /// The fields mirror that machine's `rocm examine --json`. The final
+    /// positive-control arm keeps the gate honest: the same host with an
+    /// ambient HIP-built torch on PATH does need the SDK, so fix-13 still
+    /// ranks first there.
+    #[test]
+    fn fix_13_does_not_fire_on_a_lemonade_strix_halo_host_with_a_managed_runtime() {
+        let strix_halo = |framework: &str, rocm_version: &str, source: &str| Examination {
+            os_family: "windows".to_owned(),
+            cpu_vendor: "amd".to_owned(),
+            gpus: vec![Gpu {
+                name: "AMD Radeon(TM) 8060S Graphics".to_owned(),
+                gfx_target: "gfx1151".to_owned(),
+                is_apu: Some(true),
+                is_amd: true,
+                ..Gpu::default()
+            }],
+            has_amd_gpu: true,
+            has_apu: true,
+            // No system HIP SDK: the arm that used to score 35 on its own.
+            hip_sdk_path: String::new(),
+            hipinfo_present: false,
+            adrenalin_version: "32.0.32015.7029".to_owned(),
+            msvc_redist_present: Some(true),
+            framework: framework.to_owned(),
+            framework_rocm_version: rocm_version.to_owned(),
+            framework_source: source.to_owned(),
+            ..Examination::default()
+        };
+        let summary = |report: &DiagnoseReport| {
+            report
+                .matched
+                .iter()
+                .map(|d| (d.id.clone(), d.score))
+                .collect::<Vec<_>>()
+        };
+
+        for (label, host) in [
+            (
+                "before any runtime was installed",
+                strix_halo("unknown", "", ""),
+            ),
+            // Framework "unknown" means nothing HIP-based is detected, so
+            // `needs_hip` is false whatever `framework_source` says: this arm
+            // documents the reporting machine's shape but does not exercise
+            // the managed-runtime exemption. The next arm does.
+            (
+                "managed runtime whose torch probe timed out (no HIP evidence)",
+                strix_halo("unknown", "", "managed-runtime"),
+            ),
+            (
+                "managed runtime whose torch is a HIP build",
+                strix_halo("pytorch", "hip=7.14.60850", "managed-runtime"),
+            ),
+        ] {
+            assert_eq!(
+                check_13_hip_sdk_missing(&host, "").score,
+                0,
+                "{label}: nothing on this host calls into the system HIP SDK"
+            );
+            let report = diagnose(&host, "");
+            assert!(
+                report.matched.is_empty() && !report.has_match,
+                "{label}: a healthy Lemonade host must report no match, not a WEAK \
+                 fix-13 at #1: {:?}",
+                summary(&report)
+            );
+        }
+
+        let ambient = diagnose(&strix_halo("pytorch", "hip=7.14.60850", "path"), "");
+        assert_eq!(
+            ambient.matched.first().map(|d| d.id.as_str()),
+            Some("fix-13-hip-sdk-missing"),
+            "the same host with a HIP-built torch on PATH really needs the SDK: {:?}",
+            summary(&ambient)
+        );
+    }
+
+    /// Pins what production does today for an ambient HIP-built PyTorch beside
+    /// a healthy system SDK: the +25 "PyTorch needs a working SDK" bonus is not
+    /// gated on the SDK being unusable, so fix-13 still lists (score 25, below
+    /// `MIN_SCORE_FOR_MATCH`, so advice only). The diagnose-48 oracle mirrors
+    /// this. If the bonus is later gated on `sdk_unusable`, change both.
+    #[test]
+    fn fix_13_lists_weakly_for_ambient_hip_torch_beside_a_healthy_system_sdk() {
+        let host = |hip_sdk_path: &str, hipinfo_present: bool, source: &str| Examination {
+            os_family: "windows".to_owned(),
+            has_amd_gpu: true,
+            hip_sdk_path: hip_sdk_path.to_owned(),
+            hipinfo_present,
+            framework: "pytorch".to_owned(),
+            framework_rocm_version: "hip=7.14.60850".to_owned(),
+            framework_source: source.to_owned(),
+            ..Examination::default()
+        };
+        let sdk = r"C:\Program Files\AMD\ROCm\6.4";
+
+        let healthy = host(sdk, true, "path");
+        assert_eq!(check_13_hip_sdk_missing(&healthy, "").score, 25);
+        let report = diagnose(&healthy, "");
+        let row = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-13-hip-sdk-missing")
+            .expect("ambient HIP torch lists fix-13 even with a healthy SDK");
+        assert!(
+            row.score < MIN_SCORE_FOR_MATCH,
+            "advice only: {}",
+            row.score
+        );
+
+        // Control: the same healthy SDK under a managed runtime is silent.
+        assert_eq!(
+            check_13_hip_sdk_missing(&host(sdk, true, "managed-runtime"), "").score,
+            0
         );
     }
 
@@ -4479,7 +4574,7 @@ mod tests {
         // two installations and fire on the most common install we ship. (A
         // fixture nesting `_rocm_sdk_core` under the root, the shape the
         // installer never produces, would pass by construction without
-        // proving that -- this one matches `apps/rocm/src/therock.rs`'s
+        // proving that -- this one matches `apps/rocm/src/therock/probe.rs`'s
         // `ROCM_SDK_PROBE_SCRIPT` instead.)
         let mut e = linux_base();
         let root = "/data/runtimes/therock/_rocm_sdk_devel";
@@ -4683,7 +4778,7 @@ mod tests {
     fn comgr_matches_runtime_never_disagrees_with_the_diagnosis() {
         // `rocm examine --json`'s `comgr_matches_runtime` and `rocm diagnose`'s
         // fix-18 finding answer the same question about the same machine. Both
-        // are driven by `comgr_matches_runtime` in `examine.rs`, so this checks
+        // are driven by `comgr_matches_runtime` in `examine/library_copies.rs`, so this checks
         // the two surfaces stay in lockstep across every shape the catalog
         // itself tests -- including the case that used to disagree: a runtime
         // whose own installation ships no code object manager at all.
@@ -5130,7 +5225,7 @@ mod tests {
     /// a re-added arm has to come with a probe that reaches it.
     ///
     /// The list below is **hand-maintained**: its first four entries mirror what
-    /// `Examination::probe` sets in `examine.rs`, and the rest are names the
+    /// `Examination::probe` sets in `examine/framework.rs`, and the rest are names the
     /// probe never returns, kept so a re-added arm for one of them shows up.
     /// Neither half is derived from that code, so adding a fifth framework to
     /// the probe will not fail this test — see the note on
@@ -7846,30 +7941,6 @@ mod tests {
     }
 
     #[test]
-    fn kernel_unsupported_on_ubuntu_26_04_names_the_native_archive_path() {
-        let mut e = linux_base();
-        e.distro_id = "ubuntu".to_owned();
-        e.distro_version = "26.04".to_owned();
-        e.rocm_version = "7.0.0".to_owned();
-        e.amdgpu_loaded = Some(false);
-        let report = diagnose(&e, "kernel/rocm mismatch");
-        let hit = report
-            .matched
-            .iter()
-            .find(|d| d.id == "fix-3-rocm-kernel")
-            .expect("unsupported kernel triple should be diagnosed");
-        let commands = hit.fix.as_ref().unwrap().commands.join("\n");
-        assert!(
-            commands.contains("Note on Ubuntu 26.04") && commands.contains("apt install rocm"),
-            "Ubuntu 26.04 must be told to use the native archive path, not a DKMS rerun: {commands}"
-        );
-        assert!(
-            !commands.contains("rerun `rocm install driver --dkms --yes`"),
-            "Ubuntu 26.04 must not be told to rerun a command that plans nothing there: {commands}"
-        );
-    }
-
-    #[test]
     fn kernel_unsupported_on_an_undocumented_distro_does_not_suggest_a_dkms_rerun() {
         let mut e = linux_base();
         e.distro_id = "fedora".to_owned();
@@ -7890,33 +7961,6 @@ mod tests {
         assert!(
             !commands.contains("rerun `rocm install driver --dkms --yes`"),
             "an undocumented distro must not be told to rerun a command that plans nothing: {commands}"
-        );
-    }
-
-    #[test]
-    fn stale_repos_on_ubuntu_26_04_suggests_apt_install_rocm_not_a_dkms_reinstall() {
-        let mut e = linux_base();
-        e.distro_id = "ubuntu".to_owned();
-        e.distro_version = "26.04".to_owned();
-        e.rocm_repos_seen = vec![
-            "/etc/apt/sources.list.d/amdgpu.list".to_owned(),
-            "/etc/apt/sources.list.d/rocm.list".to_owned(),
-        ];
-        let report = diagnose(&e, "stale repo conflict");
-        let hit = report
-            .matched
-            .iter()
-            .find(|d| d.id == "fix-7-stale-repos")
-            .expect("duplicate repo files should be diagnosed");
-        let commands = hit.fix.as_ref().unwrap().commands.join("\n");
-        assert!(
-            commands.contains("sudo apt install rocm")
-                && commands.contains("Ubuntu 26.04 ships the amdgpu driver in-tree"),
-            "Ubuntu 26.04 must be pointed at the native archive reinstall, not DKMS: {commands}"
-        );
-        assert!(
-            !commands.contains("rocm install driver --dkms --yes"),
-            "Ubuntu 26.04 must not be offered a DKMS reinstall that plans nothing there: {commands}"
         );
     }
 
@@ -7944,40 +7988,6 @@ mod tests {
             !commands.contains("rocm install driver --dkms --yes")
                 && !commands.contains("rocm install driver --dkms   # review the plan"),
             "an undocumented distro must not be offered a DKMS reinstall that plans nothing: {commands}"
-        );
-    }
-
-    #[test]
-    fn repo_native_broken_on_ubuntu_26_04_reinstalls_the_userspace_stack_not_dkms() {
-        let mut e = linux_base();
-        e.distro_id = "ubuntu".to_owned();
-        e.distro_version = "26.04".to_owned();
-        e.rocm_install_method = "repo-native".to_owned();
-        e.rocm_repos_seen = vec!["/etc/apt/sources.list.d/amdgpu.list".to_owned()];
-        let report = diagnose(
-            &e,
-            "dpkg: error processing package amdgpu-dkms (half-configured)",
-        );
-        let hit = report
-            .matched
-            .iter()
-            .find(|d| d.id == "fix-12-installer")
-            .expect("repo-native broken state should be diagnosed");
-        let fix = hit.fix.as_ref().unwrap();
-        let commands = fix.commands.join("\n");
-        assert!(
-            commands.contains("sudo apt install rocm"),
-            "Ubuntu 26.04 must reinstall the userspace stack, not a DKMS driver: {commands}"
-        );
-        assert!(
-            !commands.contains("rocm install driver --dkms --yes"),
-            "Ubuntu 26.04 must not be offered a DKMS reinstall that plans nothing there: {commands}"
-        );
-        assert!(
-            fix.verify.contains("dpkg-query -W -f='${Status}' rocm")
-                && !fix.verify.contains("amdgpu-dkms"),
-            "Ubuntu 26.04's verify must check the `rocm` package, not a nonexistent DKMS module: {}",
-            fix.verify
         );
     }
 
@@ -8419,7 +8429,7 @@ mod tests {
 
     #[test]
     fn repo_native_broken_claims_repo_native_evidence_for_dpkg_rpm_fallback_methods() {
-        // probe_rocm_install (examine.rs) falls back to the literal "apt"/"dnf"
+        // probe_rocm_install (examine/rocm_install_probe.rs) falls back to the literal "apt"/"dnf"
         // when dpkg/rpm confirms the package is installed but no marker file
         // was found. Those hosts are still repo-native-managed, so the evidence
         // line must fire for them too, not just the marker-file-detected
@@ -8504,7 +8514,7 @@ mod tests {
         let table = [
             ("ubuntu", "22.04", "debian", true),
             ("ubuntu", "24.04", "debian", true),
-            ("ubuntu", "26.04", "debian", false),
+            ("ubuntu", "26.04", "debian", true),
             ("debian", "12", "", true),
             ("debian", "13", "", true),
             ("rhel", "9.7", "fedora", true),

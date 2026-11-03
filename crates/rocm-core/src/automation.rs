@@ -19,10 +19,24 @@
 //! its own new record as a single rewrite via `write_atomic`, so a lock-free
 //! reader never observes a file shrunk mid-repair. That rewrite costs O(store)
 //! rather than O(record), the same as a proposal status update, which rewrites
-//! the whole store via `write_atomic` too. Nothing in this module ever
+//! the whole store via `write_atomic` too. Only when that rewrite itself fails
+//! (a full disk, or on Windows another program holding the store open without
+//! delete sharing) does the append cut the debris in place instead, so a store
+//! cannot be wedged by a failed repair; otherwise nothing in this module ever
 //! shrinks a store in place. Readers take no lock, and an unterminated last
 //! line that is not valid JSON — an append caught mid-write — is skipped
-//! rather than reported as corruption. The stores are not rotated or capped.
+//! rather than reported as corruption.
+//!
+//! The events and audit stores are additionally capped by size-based rotation
+//! (see [`EVENT_LOG_ROTATE_BYTES`]): the append that finds the live file at
+//! the cap renames it whole to `<store>.1` first, under the same lock —
+//! before any torn tail in it would otherwise be repaired, so an at-cap store
+//! is never paid for with a `write_atomic` rewrite only to be rotated away
+//! immediately after — and the recent-record readers span the rotated
+//! generations. The proposals store is never rotated, because a pending
+//! proposal must stay findable by id until it is reviewed; instead the status
+//! rewrite compacts it, dropping all but the newest
+//! [`REVIEWED_PROPOSALS_RETAINED`] reviewed proposals.
 //!
 //! `AutomationTriggerEvent` is also defined here, but this module persists
 //! none of it: it is the in-memory trigger type passed between `rocmd`'s
@@ -30,11 +44,14 @@
 //! `apps/rocmd/src/webhook.rs`), never serialized.
 
 use anyhow::{Context, Result, bail};
+use same_file::Handle;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::fs;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::AppPaths;
@@ -228,11 +245,14 @@ pub struct AuditEventRecord {
 ///
 /// Appends and the proposal-status rewrite both take it. The proposal
 /// rewrite needs it for its read-modify-write; an append needs it both to
-/// serialize against other appends and because it can itself become a
-/// rewrite — a torn tail is repaired by renaming a new file over the store
-/// (see [`TailState::Torn`]) — and an append that had already opened the old
-/// file would otherwise land in the replaced copy and vanish.
-fn jsonl_lock_path(path: &Path) -> PathBuf {
+/// serialize against other appends and because it can itself replace or
+/// rename the live file out from under a concurrent writer — a torn tail is
+/// repaired by renaming a new file over the store, or by truncating it when
+/// that fails (see `TailState::Torn`), and a rotating events or audit store is
+/// renamed aside to `<store>.1` (see `rotate_jsonl_generations`) — and an
+/// append that had already opened the old file would otherwise land in the
+/// replaced or rotated-away copy and vanish.
+pub fn jsonl_lock_path(path: &Path) -> PathBuf {
     let mut name = path.file_name().unwrap_or_default().to_os_string();
     name.push(".lock");
     path.with_file_name(name)
@@ -240,6 +260,102 @@ fn jsonl_lock_path(path: &Path) -> PathBuf {
 
 /// How many bytes the backward scans below read per step.
 const JSONL_SCAN_CHUNK: u64 = 64 * 1024;
+
+/// Size at which the automation events store and the audit store are rotated:
+/// the next append renames the live file to `<store>.1` and starts a new one.
+///
+/// With the `gpu-metrics` watcher enabled, the busiest writer, `rocmd` adds a
+/// record a minute to each store — about 600 KB a day to the audit log — so
+/// one generation holds roughly two weeks of history; without it, months.
+/// Small enough that a rotated file can still be opened in an editor or read
+/// whole by a script.
+pub const EVENT_LOG_ROTATE_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Rotated generations kept per store besides the live file.
+///
+/// `<store>.1` is the newest, `<store>.4` the oldest; the oldest is dropped by
+/// the next rotation. Caps each store at about 40 MiB — about two months of
+/// history at the `gpu-metrics` rate — where it previously grew without bound.
+/// A store that grew past the cap before rotation existed is rotated whole, so
+/// it only falls under the cap once that file is itself dropped.
+pub const EVENT_LOG_ROTATED_GENERATIONS: usize = 4;
+
+/// Reviewed proposals kept by the proposals store's compaction.
+///
+/// "Reviewed" is any status but `pending` (approved, rejected, ...); the most
+/// recently reviewed are kept, and pending proposals always are. Reviewed
+/// proposals only come from the status rewrite that compacts, so this bounds
+/// them exactly.
+pub const REVIEWED_PROPOSALS_RETAINED: usize = 200;
+
+/// Size-based rotation policy for a JSONL store.
+#[derive(Debug, Clone, Copy)]
+struct JsonlRotation {
+    /// Rotate before an append once the live file is at least this long.
+    max_bytes: u64,
+    /// Rotated generations to keep besides the live file; at least 1.
+    generations: usize,
+}
+
+/// The policy for the automation events store and the audit store.
+const EVENT_LOG_ROTATION: JsonlRotation = JsonlRotation {
+    max_bytes: EVENT_LOG_ROTATE_BYTES,
+    generations: EVENT_LOG_ROTATED_GENERATIONS,
+};
+
+/// Path of generation `generation` of the store at `path`: the live file for
+/// `0`, else `<store file name>.<generation>` beside it (`events.jsonl.1`).
+fn jsonl_generation_path(path: &Path, generation: usize) -> PathBuf {
+    if generation == 0 {
+        return path.to_path_buf();
+    }
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".{generation}"));
+    path.with_file_name(name)
+}
+
+/// Rotate the live file to `.1`, first shifting the generations in its way
+/// up by one — `.{n-1}` over `.{n}` (dropping the oldest), …, `.1` to `.2` —
+/// and leaving no live file for the caller's append to create. The caller must
+/// hold the store's [`jsonl_lock_path`] lock, so no append can land in a file
+/// being renamed.
+///
+/// Only the unbroken run of generations from `.1` up is shifted: a missing
+/// generation is a free slot, so nothing older than it has to move, and
+/// nothing is dropped. That matters after a rotation that stopped part-way
+/// (shifted `.1` away, then failed to rename the live file, leaving a gap at
+/// `.1`): the next rotation then only fills the gap, instead of shifting — and
+/// dropping — one more generation each time it runs.
+///
+/// Renames newest-last, so at every instant the files present, read live
+/// first, are still in order with no file under two names; a lock-free reader
+/// relies on that (see [`open_jsonl_generations`]). Stops at the first failed
+/// rename: going on could rename a file over one that was never shifted away.
+fn rotate_jsonl_generations(path: &Path, generations: usize) -> Result<()> {
+    let mut run = 0;
+    while run < generations && fs::symlink_metadata(jsonl_generation_path(path, run + 1)).is_ok() {
+        run += 1;
+    }
+    // When every generation exists, the oldest is renamed over, not moved.
+    for generation in (1..=run.min(generations - 1)).rev() {
+        let from = jsonl_generation_path(path, generation);
+        let to = jsonl_generation_path(path, generation + 1);
+        fs::rename(&from, &to)
+            .with_context(|| format!("failed to rotate {} to {}", from.display(), to.display()))?;
+    }
+    let first = jsonl_generation_path(path, 1);
+    fs::rename(path, &first)
+        .with_context(|| format!("failed to rotate {} to {}", path.display(), first.display()))
+}
+
+fn open_jsonl_for_append(path: &Path) -> Result<fs::File> {
+    fs::OpenOptions::new()
+        .read(true)
+        .append(true)
+        .create(true)
+        .open(path)
+        .with_context(|| format!("failed to open {}", path.display()))
+}
 
 /// Append one JSONL `record` to `path`, creating the file if needed.
 ///
@@ -254,8 +370,9 @@ const JSONL_SCAN_CHUNK: u64 = 64 * 1024;
 /// back, and the debris itself is discarded by the *next* append rather than
 /// being cut first as a separate step — see [`inspect_tail`] and
 /// [`TailState::Torn`]. A reader already skips the debris in the meantime.
-/// Nothing in this function ever truncates the live file, so a lock-free
-/// reader never observes it shrink.
+/// This function truncates the live file only as the last resort when that
+/// replacement itself fails (see [`repair_torn_tail_and_append`]), so a
+/// lock-free reader can observe it shrink only then, never on the normal path.
 ///
 /// [`append_or_tolerate_a_missing_newline`] checks whether a failed write
 /// landed anyway before reporting it, so a write that fails but still lands
@@ -267,44 +384,53 @@ const JSONL_SCAN_CHUNK: u64 = 64 * 1024;
 /// without knowing whether the record landed anyway. A caller that retries
 /// on `Err` in that specific, low-likelihood case could write a duplicate
 /// the store has no way to detect or remove.
-fn append_jsonl_record<T: Serialize>(path: &Path, record: &T, context_label: &str) -> Result<()> {
+///
+/// With a `rotation` policy, a live file already at `max_bytes` is rotated
+/// aside (see [`rotate_jsonl_generations`]) *before* [`inspect_tail`] runs —
+/// whole, debris and all, rather than repairing a torn tail first and
+/// rotating the repaired copy away a moment later. Rotation is best effort:
+/// if it fails, the record is still appended to the unrotated file via the
+/// normal `inspect_tail` path below, and the next append tries again — losing
+/// a record to a failed rename would be worse than one oversized file.
+fn append_jsonl_record<T: Serialize>(
+    path: &Path,
+    record: &T,
+    rotation: Option<JsonlRotation>,
+    context_label: &str,
+) -> Result<()> {
     let mut line = serde_json::to_vec(record)
         .with_context(|| format!("failed to serialize {context_label}"))?;
     line.push(b'\n');
 
     let _lock = FileLock::acquire(jsonl_lock_path(path))?;
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .append(true)
-        .create(true)
-        .open(path)
-        .with_context(|| format!("failed to open {}", path.display()))?;
-    match inspect_tail(path, &file)? {
-        TailState::Torn(tail_start) => {
-            // A torn tail is debris — crash or a failed write — that must be
-            // cut before this record lands. Cutting it in place and then
-            // appending as a second step would briefly shrink the file for
-            // any lock-free reader mid-scan, and regrowing it afterward can
-            // make that scan splice bytes read at two different moments into
-            // something that parses as a record nobody wrote (the hazard
-            // `ReverseLines::next_line`'s short-read guard exists for).
-            // Replacing the whole file atomically instead means a reader
-            // only ever sees the pre-repair length or this append's, never a
-            // length in between.
-            let mut content = read_range(path, &file, 0, tail_start)?;
-            content.extend_from_slice(&line);
-            // Done with the pre-repair file's handle before replacing it,
-            // rather than leaving that to whatever happens to still have
-            // `file` open at function return. The rename already succeeds
-            // with this handle open regardless — std opens files with
-            // `FILE_SHARE_DELETE` by default on Windows, so a rename isn't
-            // blocked by it (see `write_atomic`'s doc for the case that
-            // *isn't* covered: another process holding the destination open
-            // without delete-sharing) — but this states the intent rather
-            // than leaning on that default.
+    let mut file = open_jsonl_for_append(path)?;
+    if let Some(rotation) = rotation {
+        let len = file
+            .metadata()
+            .with_context(|| format!("failed to stat {}", path.display()))?
+            .len();
+        if len >= rotation.max_bytes {
+            // Close the live file before renaming it, so no write handle of
+            // ours is held across the rename and the reopen below gets the
+            // new file.
             drop(file);
-            crate::write_atomic(path, &content, "jsonl")?;
+            if let Err(error) = rotate_jsonl_generations(path, rotation.generations)
+                && let Some(warning) = rotation_failure_warning(path, &error)
+            {
+                eprintln!("{warning}");
+            }
+            file = open_jsonl_for_append(path)?;
         }
+    }
+    match inspect_tail(path, &file)? {
+        TailState::Torn(tail_start) => repair_torn_tail_and_append(
+            path,
+            file,
+            tail_start,
+            &line,
+            |path, content| crate::write_atomic(path, content, "jsonl"),
+            truncate_jsonl_in_place,
+        )?,
         TailState::ValidUnterminated(start) => {
             line.insert(0, b'\n');
             append_or_tolerate_a_missing_newline(path, &file, &line, start)?;
@@ -314,6 +440,109 @@ fn append_jsonl_record<T: Serialize>(path: &Path, record: &T, context_label: &st
         }
     }
     Ok(())
+}
+
+/// Discard the torn tail of the store at `path`, which starts at `tail_start`,
+/// and land `line` in its place. The caller must hold the store's
+/// [`jsonl_lock_path`] lock; `file` is its handle on the pre-repair store.
+///
+/// The repair publishes the clean prefix plus `line` as one `replace`, so a
+/// lock-free reader only ever sees the pre-repair length or the post-append
+/// length (see [`append_jsonl_record`]). That rewrite can itself fail — no
+/// room for the copy on a full disk, or on Windows another program holding
+/// the store open without delete sharing — and leaving it there would wedge
+/// the store: every later append would hit the same debris and the same
+/// failure. Only then does this fall back to `truncate`, cutting the debris
+/// in place and appending `line` as a plain append. A truncate frees space
+/// rather than needing it and renames nothing, so it can succeed where
+/// `replace` cannot. Like a repair by `replace`, the fallback prints nothing.
+///
+/// The fallback reopens, on this already-failing path only, the shrink a
+/// lock-free reader can observe, and the reader's guards narrow that window
+/// without closing it: a scan that comes back short is refused or retried
+/// (see [`ReverseLines`] and `load_recent_jsonl_records_from`), but one that
+/// already read part of a debris line longer than a scan chunk and then finds
+/// the file regrown past the offset the scan has reached (not its old length:
+/// the check compares each read with that offset, which only shrinks) reads on
+/// undetected, and can splice the two reads into a record nobody wrote. That
+/// is the cost of not wedging the store, accepted for a path that needs a
+/// failing replace, a debris line that long and a reader mid-scan all at once.
+///
+/// If `truncate` fails too, the error names both causes and the store is left
+/// as it was; readers keep skipping the debris. If the append after a
+/// successful truncate fails, the error carries the replace failure too: it is
+/// the root cause.
+///
+/// `replace` and `truncate` are parameters so a test can make either fail on
+/// demand.
+fn repair_torn_tail_and_append(
+    path: &Path,
+    file: fs::File,
+    tail_start: u64,
+    line: &[u8],
+    replace: impl FnOnce(&Path, &[u8]) -> Result<()>,
+    truncate: impl FnOnce(&Path, u64) -> Result<()>,
+) -> Result<()> {
+    let mut content = read_range(path, &file, 0, tail_start)?;
+    content.extend_from_slice(line);
+    // Done with the pre-repair file's handle before replacing it, rather than
+    // leaving that to whatever happens to still have `file` open at function
+    // return. The rename already succeeds with this handle open regardless —
+    // std opens files with `FILE_SHARE_DELETE` by default on Windows, so a
+    // rename isn't blocked by it (see `write_atomic`'s doc for the case that
+    // *isn't* covered: another process holding the destination open without
+    // delete-sharing) — but this states the intent rather than leaning on that
+    // default.
+    drop(file);
+    let replace_error = match replace(path, &content) {
+        Ok(()) => return Ok(()),
+        Err(error) => error,
+    };
+    drop(content);
+    if let Err(truncate_error) = truncate(path, tail_start) {
+        bail!(
+            "failed to repair the torn tail of {}: replacing it failed ({replace_error:#}); \
+             truncating it failed ({truncate_error:#})",
+            path.display()
+        );
+    }
+    open_jsonl_for_append(path)
+        .and_then(|file| append_or_tolerate_a_missing_newline(path, &file, line, tail_start))
+        .with_context(|| {
+            format!(
+                "failed to append to {} after cutting its torn tail \
+                 (replacing the store had failed: {replace_error:#})",
+                path.display()
+            )
+        })
+}
+
+/// Cut the store at `path` down to `len` bytes through a fresh write handle.
+///
+/// Not the append handle: on Windows an append-only handle lacks
+/// `FILE_WRITE_DATA`, which `set_len` needs.
+fn truncate_jsonl_in_place(path: &Path, len: u64) -> Result<()> {
+    fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .with_context(|| format!("failed to open {} for writing", path.display()))?
+        .set_len(len)
+        .with_context(|| format!("failed to truncate {}", path.display()))
+}
+
+/// The warning to print that rotating `path` failed, or `None` after the first
+/// one for that store in this process, so a rename that keeps failing (e.g.
+/// another program holds the live file open without delete sharing on
+/// Windows) is observable without a line on every single append while the
+/// store stays stuck over its cap. Keyed by path so one store's failure does
+/// not silence another's.
+fn rotation_failure_warning(path: &Path, error: &anyhow::Error) -> Option<String> {
+    static WARNED: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
+    WARNED
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(path.to_path_buf())
+        .then(|| format!("warning: failed to rotate {}: {error:#}", path.display()))
 }
 
 /// Append-mode write of `line`, starting at offset `start`.
@@ -391,8 +620,9 @@ enum TailState {
     ValidUnterminated(u64),
     /// Debris — crash, or a write that failed partway through a genuinely
     /// incomplete record — starting at this offset. Must be cut before the
-    /// next record lands, but never by truncating in place — see
-    /// [`append_jsonl_record`].
+    /// next record lands, by replacing the store rather than truncating it in
+    /// place — except as the fallback when that replacement fails; see
+    /// [`append_jsonl_record`] and [`repair_torn_tail_and_append`].
     Torn(u64),
 }
 
@@ -429,15 +659,17 @@ fn inspect_tail(path: &Path, file: &fs::File) -> Result<TailState> {
 /// Read bytes `[start, end)` of `file`.
 ///
 /// Returns fewer bytes if the file now ends before `end`. Nothing this
-/// module's own writers do can shrink a store in place — an append only ever
+/// module's own writers do shrinks a store in place — an append only ever
 /// grows it, and a torn-tail repair replaces it wholesale via `write_atomic`
-/// rather than truncating the live file (see [`inspect_tail`] and
-/// [`TailState::Torn`]) — so a short read here means the store was edited or
-/// truncated out-of-band, a case this module does not try to recover from
-/// cleanly. Most callers treat what is still there the same as any other
-/// unexpectedly-ending tail; [`ReverseLines`] is the one exception, and
-/// reports an error instead once it would have to splice such a read onto
-/// bytes it already read, rather than risk inventing a line.
+/// (see [`inspect_tail`] and [`TailState::Torn`]) — except the repair's
+/// fallback, taken only when that replacement fails and only under the store's
+/// lock (see [`repair_torn_tail_and_append`]); otherwise a short read here
+/// means the store was edited or truncated out-of-band, a case this module
+/// does not try to recover from cleanly. Most callers treat what is still
+/// there the same as any other unexpectedly-ending tail; [`ReverseLines`] is
+/// the one exception, and reports an error instead once it would have to
+/// splice such a read onto bytes it already read, rather than risk inventing
+/// a line.
 fn read_range(path: &Path, file: &fs::File, start: u64, end: u64) -> Result<Vec<u8>> {
     let mut reader = file;
     reader
@@ -492,32 +724,152 @@ fn parse_jsonl_records<T: DeserializeOwned>(
     Ok(records)
 }
 
-/// Read the most recent `limit` JSONL records from `path`, in on-disk order.
-/// Returns an empty vec when `path` doesn't exist yet or `limit` is `0`.
+/// Read the most recent `limit` JSONL records from the store at `path` and
+/// its first `generations` rotated generations (see
+/// [`rotate_jsonl_generations`]), in on-disk order, oldest first. Returns an
+/// empty vec when no generation exists yet or `limit` is `0`.
 ///
-/// Scans backwards from the end of the file and stops once it has `limit`
-/// records, so the cost tracks `limit`, not the size of the store; a corrupt
-/// line older than those records is therefore not reported. As in
-/// [`parse_jsonl_records`], an unterminated last line that is not valid JSON is
-/// an append caught mid-write and is skipped.
+/// Reads the live file first and moves on to `.1`, `.2`, … only while it is
+/// still short of `limit`, so a read just after a rotation still returns the
+/// records that were rotated aside. Each file is scanned backwards from its
+/// end, stopping once it has `limit` records, so the cost tracks `limit`, not
+/// the size of the store; a corrupt line older than those records is
+/// therefore not reported. As in [`parse_jsonl_records`], an unterminated
+/// last line that is not valid JSON is an append caught mid-write and is
+/// skipped.
+fn load_recent_jsonl_records<T: DeserializeOwned>(
+    path: &Path,
+    generations: usize,
+    limit: usize,
+    context_label: &str,
+) -> Result<Vec<T>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let mut newest_first = Vec::new();
+    let mut found = 0;
+    for (generation_path, handle) in open_jsonl_generations(path, generations)? {
+        let records = load_recent_jsonl_records_from(
+            &generation_path,
+            handle.as_file(),
+            limit - found,
+            context_label,
+        )?;
+        found += records.len();
+        newest_first.push(records);
+        if found >= limit {
+            break;
+        }
+    }
+    Ok(newest_first.into_iter().rev().flatten().collect())
+}
+
+/// Open the store's live file and its first `generations` rotated
+/// generations, newest first, skipping any that do not exist — as one
+/// consistent snapshot, so the readers can take no lock.
+///
+/// A rotation can rename files between two of the opens: opening the live
+/// file and then `.1` across one would open the same file twice (and read its
+/// records twice), and opening `.1` and then the live file across one would
+/// skip a generation. A torn-tail repair (see [`TailState::Torn`]) normally
+/// also replaces the live file, by renaming a new one over it — not a rotation,
+/// but the same hazard for this snapshot: a path opened before the repair
+/// would still read the pre-repair file by handle, yet a path opened after
+/// would see different content at the same name. So after opening them all,
+/// every path is opened again and must still name the same file, or still be
+/// missing; if any moved, the whole set is reopened — the identity check does
+/// not need to tell a rotation from a repair apart, it only needs one retry
+/// either way. A rotation only ever moves a file to a higher generation, and
+/// a new live file (whether from rotation or repair) is a new file, so a path
+/// naming the same file at both opens named it throughout: the handles are
+/// what every path named at one instant between the two passes, which
+/// [`rotate_jsonl_generations`] keeps in order with no file under two names.
+/// The handles stay open, so a dropped generation is still readable and its
+/// file identity cannot be reused meanwhile.
+///
+/// Giving up after eight retries returns an error naming `path`, but some
+/// callers (the dashboard's status view, among others) read recent records
+/// through `.unwrap_or_default()` and would present that as an empty
+/// activity list rather than surface it. Accepted: reaching the retry limit
+/// needs the file to keep moving under every one of eight consecutive opens,
+/// far more contention than a rotation once per `EVENT_LOG_ROTATE_BYTES` of
+/// appends produces, and the very next read tries again from scratch.
+fn open_jsonl_generations(path: &Path, generations: usize) -> Result<Vec<(PathBuf, Handle)>> {
+    // A rotation happens once per `EVENT_LOG_ROTATE_BYTES` of appends, so
+    // even one retry is rare; running out means something else is renaming
+    // the files.
+    const ATTEMPTS: usize = 8;
+    let open = |path: &Path| -> Result<Option<Handle>> {
+        match fs::File::open(path) {
+            Ok(file) => Handle::from_file(file)
+                .map(Some)
+                .with_context(|| format!("failed to identify {}", path.display())),
+            // Windows cannot open a directory this way; like a missing file,
+            // it holds no records (a directory opened on Linux is skipped
+            // below).
+            Err(error) if error.kind() == ErrorKind::NotFound || path.is_dir() => Ok(None),
+            Err(error) => Err(error).with_context(|| format!("failed to open {}", path.display())),
+        }
+    };
+    let paths: Vec<PathBuf> = (0..=generations)
+        .map(|generation| jsonl_generation_path(path, generation))
+        .collect();
+    for _ in 0..ATTEMPTS {
+        let handles = paths
+            .iter()
+            .map(|path| open(path))
+            .collect::<Result<Vec<_>>>()?;
+        // A single file cannot be read twice or skipped.
+        let mut stable = generations == 0;
+        if !stable {
+            stable = true;
+            for (path, handle) in paths.iter().zip(&handles) {
+                if open(path)?.as_ref() != handle.as_ref() {
+                    stable = false;
+                    break;
+                }
+            }
+        }
+        if !stable {
+            continue;
+        }
+        let mut files = Vec::new();
+        for (path, handle) in paths.into_iter().zip(handles) {
+            let Some(handle) = handle else { continue };
+            let metadata = handle
+                .as_file()
+                .metadata()
+                .with_context(|| format!("failed to stat {}", path.display()))?;
+            if metadata.is_file() {
+                files.push((path, handle));
+            }
+        }
+        return Ok(files);
+    }
+    bail!("{} kept being rotated while it was read", path.display())
+}
+
+/// [`load_recent_jsonl_records`] over one file, `file`, opened from `path`.
 ///
 /// The scan takes no lock. A concurrent append only ever grows the file (see
 /// [`append_jsonl_record`]); nothing this module's own writers do shrinks it
-/// in place. The retry below is for a store edited or truncated out-of-band
-/// — by a person, not a concurrent writer — while a scan is in flight: a
-/// scan that fails while the file's length moved under it is retried from
-/// the new end, so that still never surfaces as an error.
-fn load_recent_jsonl_records<T: DeserializeOwned>(
+/// in place except the torn-tail repair's fallback, taken only when replacing
+/// the store fails (see [`repair_torn_tail_and_append`]). The retry below is
+/// for a store edited or truncated out-of-band — by a person — or shrunk by
+/// that rare fallback while a scan is in flight: a scan that fails while the
+/// file's length moved under it is retried from the new end, so a shrink the
+/// scan's reads catch never surfaces as an error. The one shrink they cannot
+/// catch is described on [`repair_torn_tail_and_append`].
+fn load_recent_jsonl_records_from<T: DeserializeOwned>(
     path: &Path,
+    file: &fs::File,
     limit: usize,
     context_label: &str,
 ) -> Result<Vec<T>> {
     const ATTEMPTS: usize = 3;
-    if !path.is_file() || limit == 0 {
+    if limit == 0 {
         return Ok(Vec::new());
     }
-    let file =
-        fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
     let file_len = || {
         file.metadata()
             .map(|metadata| metadata.len())
@@ -526,15 +878,15 @@ fn load_recent_jsonl_records<T: DeserializeOwned>(
     let mut attempt = 1;
     loop {
         let len = file_len()?;
-        match scan_recent_jsonl_records(path, &file, len, limit, context_label) {
+        match scan_recent_jsonl_records(path, file, len, limit, context_label) {
             Err(_) if attempt < ATTEMPTS && file_len()? != len => attempt += 1,
             outcome => return outcome,
         }
     }
 }
 
-/// One backward scan of [`load_recent_jsonl_records`], over the first `len`
-/// bytes of `file`.
+/// One backward scan of [`load_recent_jsonl_records_from`], over the first
+/// `len` bytes of `file`.
 fn scan_recent_jsonl_records<T: DeserializeOwned>(
     path: &Path,
     file: &fs::File,
@@ -652,10 +1004,10 @@ impl<'a> ReverseLines<'a> {
             // A short read while `pending` is empty — nothing accumulated
             // yet, whether from an earlier call or from this one — just
             // means the store was edited or truncated out-of-band (see
-            // `read_range`); nothing a concurrent writer does can shrink it
-            // in place. Once `pending` holds any bytes, a short read means
-            // they no longer continue from it, so splicing them would
-            // invent a line.
+            // `read_range`); no concurrent writer shrinks it in place short of
+            // the torn-tail repair's rare fallback. Once `pending` holds any
+            // bytes, a short read means they no longer continue from it, so
+            // splicing them would invent a line.
             if bytes.len() as u64 != self.pos - start && !self.pending.is_empty() {
                 bail!("{} shrank while it was being read", self.path.display());
             }
@@ -719,6 +1071,7 @@ pub fn append_automation_event(paths: &AppPaths, event: &AutomationEventRecord) 
     append_jsonl_record(
         &paths.automation_events_path(),
         event,
+        Some(EVENT_LOG_ROTATION),
         "automation event record",
     )
 }
@@ -732,16 +1085,24 @@ pub fn append_automation_proposal(
     if proposal.proposal_id.is_empty() {
         proposal.proposal_id = generate_proposal_id(&proposal.watcher_id);
     }
+    // Never rotated: a pending proposal must stay findable by id until it is
+    // reviewed. The status rewrite compacts the store instead.
     append_jsonl_record(
         &paths.automation_proposals_path(),
         &proposal,
+        None,
         "automation proposal record",
     )
 }
 
 pub fn append_audit_event(paths: &AppPaths, event: &AuditEventRecord) -> Result<()> {
     paths.ensure()?;
-    append_jsonl_record(&paths.audit_events_path(), event, "audit event record")
+    append_jsonl_record(
+        &paths.audit_events_path(),
+        event,
+        Some(EVENT_LOG_ROTATION),
+        "audit event record",
+    )
 }
 
 pub fn load_automation_proposals(paths: &AppPaths) -> Result<Vec<AutomationProposalRecord>> {
@@ -761,19 +1122,39 @@ pub fn load_automation_proposals(paths: &AppPaths) -> Result<Vec<AutomationPropo
     )
 }
 
+/// The most recent `limit` proposals, newest first.
+///
+/// Reads only the end of the store (see [`load_recent_jsonl_records`]), unless
+/// that window holds a legacy proposal written before proposals had ids: its
+/// id derives from its line number in the whole file, so then the whole store
+/// is read. The first status update rewrites every legacy proposal with its
+/// derived id (see [`update_automation_proposal_status`]), so this fallback
+/// only lasts until then.
 pub fn load_recent_automation_proposals(
     paths: &AppPaths,
     limit: usize,
 ) -> Result<Vec<AutomationProposalRecord>> {
-    if limit == 0 {
-        return Ok(Vec::new());
+    let mut proposals: Vec<AutomationProposalRecord> = load_recent_jsonl_records(
+        &paths.automation_proposals_path(),
+        0,
+        limit,
+        "proposal record",
+    )?;
+    if proposals
+        .iter()
+        .any(|proposal| proposal.proposal_id.is_empty())
+    {
+        proposals = load_automation_proposals(paths)?;
+        let skip = proposals.len().saturating_sub(limit);
+        proposals.drain(..skip);
     }
-    let mut proposals = load_automation_proposals(paths)?;
     proposals.reverse();
-    proposals.truncate(limit);
     Ok(proposals)
 }
 
+/// Find a proposal by id. Reads the whole store: a pending proposal can be
+/// arbitrarily old. Compaction keeps that bounded by the pending proposals
+/// plus [`REVIEWED_PROPOSALS_RETAINED`].
 pub fn find_automation_proposal(
     paths: &AppPaths,
     proposal_id: &str,
@@ -784,11 +1165,17 @@ pub fn find_automation_proposal(
         .with_context(|| format!("automation proposal `{proposal_id}` not found"))
 }
 
-/// Set one proposal's `status` by rewriting the proposals store.
+/// Set one proposal's `status` by rewriting the proposals store, compacting
+/// it on the way (see [`compact_reviewed_proposals`]).
 ///
 /// The whole read-modify-write runs under the store's [`jsonl_lock_path`]
 /// lock, so a proposal appended (or another status set) meanwhile is neither
 /// dropped nor overwritten.
+///
+/// The rewrite also migrates legacy proposals, written before proposals had
+/// ids: each is written back with the id it was read under, derived from its
+/// line number *before* compaction removed any line above it, so its id never
+/// changes — and once written, reads no longer need the whole file to derive it.
 pub fn update_automation_proposal_status(
     paths: &AppPaths,
     proposal_id: &str,
@@ -810,12 +1197,64 @@ pub fn update_automation_proposal_status(
         proposal.reviewed_at_unix_ms = Some(unix_time_millis());
     }
     let updated = proposal.clone();
+    compact_reviewed_proposals(&mut proposals, REVIEWED_PROPOSALS_RETAINED, proposal_id);
     write_automation_proposals(paths, &proposals)?;
     Ok(updated)
 }
 
+/// Drop all but the `keep` most recently reviewed proposals, keeping every
+/// pending one and the on-disk order of the rest.
+///
+/// "Most recently reviewed" goes by `reviewed_at_unix_ms`, except that
+/// `just_reviewed`, the proposal the calling status update reviewed, always
+/// counts as the newest — even if it was queued long ago or the clock has
+/// moved backwards since other reviews — so a review never removes the
+/// proposal it just recorded. A reviewed proposal with no review time (older
+/// records) counts as the oldest; ties go by position in the store.
+fn compact_reviewed_proposals(
+    proposals: &mut Vec<AutomationProposalRecord>,
+    keep: usize,
+    just_reviewed: &str,
+) {
+    let mut reviewed: Vec<(bool, u128, usize)> = proposals
+        .iter()
+        .enumerate()
+        .filter(|(_, proposal)| proposal.status != "pending")
+        .map(|(index, proposal)| {
+            (
+                proposal.proposal_id == just_reviewed,
+                proposal.reviewed_at_unix_ms.unwrap_or(0),
+                index,
+            )
+        })
+        .collect();
+    let Some(excess) = reviewed
+        .len()
+        .checked_sub(keep)
+        .filter(|&excess| excess > 0)
+    else {
+        return;
+    };
+    reviewed.sort_unstable();
+    let dropped: std::collections::HashSet<usize> = reviewed[..excess]
+        .iter()
+        .map(|&(_, _, index)| index)
+        .collect();
+    let mut index = 0;
+    proposals.retain(|_| {
+        let kept = !dropped.contains(&index);
+        index += 1;
+        kept
+    });
+}
+
 pub fn load_recent_audit_events(paths: &AppPaths, limit: usize) -> Result<Vec<AuditEventRecord>> {
-    load_recent_jsonl_records(&paths.audit_events_path(), limit, "audit event")
+    load_recent_jsonl_records(
+        &paths.audit_events_path(),
+        EVENT_LOG_ROTATED_GENERATIONS,
+        limit,
+        "audit event",
+    )
 }
 
 /// Replace the proposals store with `proposals`. The caller must hold the
@@ -871,13 +1310,37 @@ pub fn load_recent_automation_events(
     paths: &AppPaths,
     limit: usize,
 ) -> Result<Vec<AutomationEventRecord>> {
-    load_recent_jsonl_records(&paths.automation_events_path(), limit, "event")
+    load_recent_jsonl_records(
+        &paths.automation_events_path(),
+        EVENT_LOG_ROTATED_GENERATIONS,
+        limit,
+        "event",
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_support::temp_app_paths;
+
+    #[test]
+    fn a_rotation_failure_is_reported_once_per_store() {
+        // Shaped like the real stores, which share a file name and differ
+        // only by directory: keying on the file name alone must not pass.
+        let events = Path::new("rotation-warning-test/automations/events.jsonl");
+        let audit = Path::new("rotation-warning-test/audit/events.jsonl");
+        let error = anyhow::anyhow!("rename blocked");
+
+        let first = rotation_failure_warning(events, &error)
+            .expect("the first failure for a store is reported");
+        assert!(first.contains("rotation-warning-test/automations/events.jsonl"));
+        assert!(first.contains("rename blocked"));
+        assert_eq!(rotation_failure_warning(events, &error), None);
+        let other = rotation_failure_warning(audit, &error)
+            .expect("one store's failure must not silence another store's warning");
+        assert!(other.contains("rotation-warning-test/audit/events.jsonl"));
+        assert_eq!(rotation_failure_warning(audit, &error), None);
+    }
 
     #[test]
     fn builtin_watchers_include_read_only_gpu_metrics() {
@@ -1865,15 +2328,16 @@ mod tests {
         Ok(())
     }
 
-    // Nothing in this module's own writers shrinks a store, but an
-    // out-of-band edit might, and load_recent_jsonl_records is supposed to
-    // retry from the new length rather than fail. Driving that needs the
-    // shrink to land strictly between two of ReverseLines's own chunked
-    // reads (see the `test_hooks` module doc) — which in turn
-    // needs a scan that takes more than one physical read in the first
-    // place, hence the pathologically long first record here (same
-    // technique as append_leaves_a_torn_line_longer_than_one_scan_chunk_cut_cleanly
-    // below, just complete JSON rather than torn).
+    // Nothing in this module's own writers shrinks a store (bar the torn-tail
+    // repair's rare fallback), but an out-of-band edit might, and
+    // load_recent_jsonl_records is supposed to retry from the new length
+    // rather than fail. Driving that needs the shrink to land strictly
+    // between two of ReverseLines's own chunked reads (see the `test_hooks`
+    // module doc) — which in turn needs a scan that takes more than one
+    // physical read in the first place, hence the pathologically long first
+    // record here (same technique as
+    // append_leaves_a_torn_line_longer_than_one_scan_chunk_cut_cleanly below,
+    // just complete JSON rather than torn).
     #[test]
     fn load_recent_retries_past_a_shrink_mid_scan_and_succeeds() -> Result<()> {
         let (root, paths) = temp_app_paths("scan-retry-after-shrink");
@@ -2094,6 +2558,286 @@ mod tests {
         Ok(())
     }
 
+    /// The store's file identity, as a string so one assertion covers the
+    /// inode on Unix and the volume serial plus file index on Windows.
+    #[cfg(unix)]
+    fn file_identity(path: &Path) -> Result<String> {
+        use std::os::unix::fs::MetadataExt;
+        Ok(fs::metadata(path)?.ino().to_string())
+    }
+
+    #[cfg(windows)]
+    fn file_identity(path: &Path) -> Result<String> {
+        Ok(format!(
+            "{:?}",
+            crate::test_support::windows_file_identity(path)?
+        ))
+    }
+
+    /// Run the torn-tail repair on the seeded audit store with the replace and
+    /// truncate steps supplied by the test, appending the record `b`.
+    fn repair_audit_store_with(
+        paths: &AppPaths,
+        replace: impl FnOnce(&Path, &[u8]) -> Result<()>,
+        truncate: impl FnOnce(&Path, u64) -> Result<()>,
+    ) -> Result<()> {
+        let path = paths.audit_events_path();
+        let file = open_jsonl_for_append(&path)?;
+        let TailState::Torn(tail_start) = inspect_tail(&path, &file)? else {
+            bail!("the seeded store has no torn tail");
+        };
+        let mut line = audit_line("b").into_bytes();
+        line.push(b'\n');
+        repair_torn_tail_and_append(&path, file, tail_start, &line, replace, truncate)
+    }
+
+    // The fallback the whole-store rewrite lacked: when it cannot complete
+    // (a full disk, a sharing violation), the debris is cut in place instead
+    // of wedging every later append on it. The same file identity afterwards
+    // is what tells that apart from the replace the test above pins.
+    #[test]
+    fn a_torn_tail_is_cut_in_place_when_replacing_the_store_fails() -> Result<()> {
+        let (root, paths) = temp_app_paths("torn-tail-fallback-truncates");
+        let torn = &audit_line("torn")[..20];
+        seed_audit_store(&paths, &format!("{}\n{torn}", audit_line("a")))?;
+        let path = paths.audit_events_path();
+        let before = file_identity(&path)?;
+        let mut attempted = Vec::new();
+
+        repair_audit_store_with(
+            &paths,
+            |_, content| {
+                attempted = content.to_vec();
+                bail!("no space left on device")
+            },
+            truncate_jsonl_in_place,
+        )?;
+
+        let after = file_identity(&path)?;
+        let text = fs::read_to_string(&path);
+        let recent = load_recent_audit_events(&paths, 5);
+        fs::remove_dir_all(root).ok();
+        let expected = format!("{}\n{}\n", audit_line("a"), audit_line("b"));
+        assert_eq!(
+            String::from_utf8(attempted)?,
+            expected,
+            "the whole-store replace must be tried first, with the full repaired store"
+        );
+        assert_eq!(text?, expected);
+        assert_eq!(before, after, "the fallback must cut the debris in place");
+        assert_eq!(audit_messages(&recent?), ["a", "b"]);
+        Ok(())
+    }
+
+    // The fallback is a last resort: a replace that works must not be
+    // followed by a truncate, or the shrink window it closes would be back on
+    // every repair.
+    #[test]
+    fn a_torn_tail_is_not_truncated_when_replacing_the_store_works() -> Result<()> {
+        let (root, paths) = temp_app_paths("torn-tail-fallback-unused");
+        let torn = &audit_line("torn")[..20];
+        seed_audit_store(&paths, &format!("{}\n{torn}", audit_line("a")))?;
+        let path = paths.audit_events_path();
+        let before = file_identity(&path)?;
+
+        repair_audit_store_with(
+            &paths,
+            |path, content| crate::write_atomic(path, content, "jsonl"),
+            |_, _| bail!("truncate must not run when the replace succeeded"),
+        )?;
+
+        let after = file_identity(&path)?;
+        let text = fs::read_to_string(&path);
+        fs::remove_dir_all(root).ok();
+        assert_eq!(text?, format!("{}\n{}\n", audit_line("a"), audit_line("b")));
+        assert_ne!(before, after, "a working replace publishes a new file");
+        Ok(())
+    }
+
+    #[test]
+    fn a_torn_tail_that_can_be_neither_replaced_nor_cut_reports_both_causes() -> Result<()> {
+        let (root, paths) = temp_app_paths("torn-tail-fallback-both-fail");
+        let torn = &audit_line("torn")[..20];
+        let seeded = format!("{}\n{torn}", audit_line("a"));
+        seed_audit_store(&paths, &seeded)?;
+        let path = paths.audit_events_path();
+
+        // Layered like the real steps (`write_atomic` and
+        // `truncate_jsonl_in_place` both wrap the OS error in a context), so
+        // the assertion fails if either cause is formatted without its chain.
+        let result = repair_audit_store_with(
+            &paths,
+            |_, _| {
+                Err(anyhow::anyhow!("no space left on device"))
+                    .context("failed to replace the store")
+            },
+            |_, _| {
+                Err(anyhow::anyhow!("permission denied")).context("failed to truncate the store")
+            },
+        );
+
+        let text = fs::read_to_string(&path);
+        let recent = load_recent_audit_events(&paths, 5);
+        fs::remove_dir_all(root).ok();
+        assert_eq!(
+            format!("{:#}", result.expect_err("both steps failed")),
+            format!(
+                "failed to repair the torn tail of {}: replacing it failed (failed to replace \
+                 the store: no space left on device); truncating it failed (failed to truncate \
+                 the store: permission denied)",
+                path.display()
+            )
+        );
+        assert_eq!(
+            text?, seeded,
+            "a failed repair must leave the store as it was"
+        );
+        assert_eq!(audit_messages(&recent?), ["a"]);
+        Ok(())
+    }
+
+    // The replace failure is the root cause, so it must survive into the error
+    // when the cut itself works but the append after it does not. The truncate
+    // stub swaps the store for a directory, which makes reopening it fail.
+    #[test]
+    fn a_failed_append_after_the_cut_still_reports_why_the_replace_failed() -> Result<()> {
+        let (root, paths) = temp_app_paths("torn-tail-fallback-append-fails");
+        let torn = &audit_line("torn")[..20];
+        seed_audit_store(&paths, &format!("{}\n{torn}", audit_line("a")))?;
+        let path = paths.audit_events_path();
+
+        let result = repair_audit_store_with(
+            &paths,
+            |_, _| {
+                Err(anyhow::anyhow!("no space left on device"))
+                    .context("failed to replace the store")
+            },
+            |path, _| {
+                fs::remove_file(path)?;
+                fs::create_dir(path)?;
+                Ok(())
+            },
+        );
+
+        fs::remove_dir_all(root).ok();
+        let message = format!("{:#}", result.expect_err("the append after the cut failed"));
+        assert!(
+            message.starts_with(&format!(
+                "failed to append to {} after cutting its torn tail (replacing the store had \
+                 failed: failed to replace the store: no space left on device): ",
+                path.display()
+            )),
+            "unexpected error: {message}"
+        );
+        Ok(())
+    }
+
+    // After the fallback the store is clean, so the next append is the plain
+    // one-line append: no second repair, no new file.
+    #[test]
+    fn appends_after_a_fallback_repair_are_plain_appends() -> Result<()> {
+        let (root, paths) = temp_app_paths("torn-tail-fallback-then-append");
+        let torn = &audit_line("torn")[..20];
+        seed_audit_store(&paths, &format!("{}\n{torn}", audit_line("a")))?;
+        let path = paths.audit_events_path();
+        repair_audit_store_with(
+            &paths,
+            |_, _| bail!("no space left on device"),
+            truncate_jsonl_in_place,
+        )?;
+        let repaired = file_identity(&path)?;
+
+        append_audit_event(&paths, &audit_record("c"))?;
+
+        let after = file_identity(&path)?;
+        let text = fs::read_to_string(&path);
+        fs::remove_dir_all(root).ok();
+        assert_eq!(
+            text?,
+            format!(
+                "{}\n{}\n{}\n",
+                audit_line("a"),
+                audit_line("b"),
+                audit_line("c")
+            )
+        );
+        assert_eq!(repaired, after);
+        Ok(())
+    }
+
+    // The real trigger rather than an injected one: a store directory that
+    // takes no new files, so the temp copy of the whole-store replace cannot
+    // be created, while the store file itself can still be written.
+    //
+    // This is the only test that drives the production `replace`/`truncate`
+    // wiring in `append_jsonl_record` rather than injected steps, and it passes
+    // without testing anything for a user the permission bits do not bind
+    // (root). CI runs it as a regular user.
+    #[cfg(unix)]
+    #[test]
+    fn append_repairs_a_torn_tail_in_a_directory_that_takes_no_new_files() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (root, paths) = temp_app_paths("torn-tail-read-only-dir");
+        let torn = &audit_line("torn")[..20];
+        seed_audit_store(&paths, &format!("{}\n{torn}", audit_line("a")))?;
+        let path = paths.audit_events_path();
+        let dir = path.parent().context("the audit store has a directory")?;
+        // Create the lock file now: the append reuses an existing one, but
+        // could not create it inside the read-only directory.
+        drop(FileLock::acquire(jsonl_lock_path(&path))?);
+        let before = file_identity(&path)?;
+
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o555))?;
+        let read_only_holds = fs::File::create(dir.join("probe")).is_err();
+        let result = read_only_holds.then(|| append_audit_event(&paths, &audit_record("b")));
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o755))?;
+
+        let after = file_identity(&path)?;
+        let text = fs::read_to_string(&path);
+        fs::remove_dir_all(root).ok();
+        let Some(result) = result else {
+            // Running as a user the permission bits do not bind (root).
+            eprintln!("skipped: a read-only directory still takes new files for this user");
+            return Ok(());
+        };
+        result?;
+        assert_eq!(text?, format!("{}\n{}\n", audit_line("a"), audit_line("b")));
+        assert_eq!(before, after);
+        Ok(())
+    }
+
+    // Windows' real trigger: another program holds the store open without
+    // delete sharing (a virus scanner or indexer, say), so the rename over it
+    // is refused while the store itself can still be written.
+    #[cfg(windows)]
+    #[test]
+    fn append_repairs_a_torn_tail_while_another_handle_blocks_replacing_the_store() -> Result<()> {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        const FILE_SHARE_READ_WRITE: u32 = 0x1 | 0x2;
+        let (root, paths) = temp_app_paths("torn-tail-share-violation");
+        let torn = &audit_line("torn")[..20];
+        seed_audit_store(&paths, &format!("{}\n{torn}", audit_line("a")))?;
+        let path = paths.audit_events_path();
+        let before = file_identity(&path)?;
+        let blocker = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ_WRITE)
+            .open(&path)?;
+
+        let result = append_audit_event(&paths, &audit_record("b"));
+
+        drop(blocker);
+        let after = file_identity(&path)?;
+        let text = fs::read_to_string(&path);
+        fs::remove_dir_all(root).ok();
+        result?;
+        assert_eq!(text?, format!("{}\n{}\n", audit_line("a"), audit_line("b")));
+        assert_eq!(before, after);
+        Ok(())
+    }
+
     #[cfg(unix)]
     #[test]
     fn append_to_a_clean_or_unterminated_store_keeps_the_same_file() -> Result<()> {
@@ -2207,5 +2951,703 @@ mod tests {
             jsonl_lock_path(&paths.automation_proposals_path()),
             paths.automations_dir().join("proposals.jsonl.lock")
         );
+    }
+
+    #[test]
+    fn rotated_generations_are_numbered_siblings_of_the_store() {
+        let path = PathBuf::from("d").join("audit").join("events.jsonl");
+        assert_eq!(jsonl_generation_path(&path, 0), path);
+        assert_eq!(
+            jsonl_generation_path(&path, 1),
+            PathBuf::from("d").join("audit").join("events.jsonl.1")
+        );
+        assert_eq!(
+            jsonl_generation_path(&path, 4),
+            PathBuf::from("d").join("audit").join("events.jsonl.4")
+        );
+    }
+
+    /// Append an audit record tagged `tag` to `path` under `rotation`.
+    fn append_rotating(path: &Path, tag: &str, rotation: JsonlRotation) -> Result<()> {
+        append_jsonl_record(
+            path,
+            &audit_record(tag),
+            Some(rotation),
+            "audit event record",
+        )
+    }
+
+    /// The tags in every generation of the audit-shaped store at `path`,
+    /// oldest first, read straight from the files.
+    fn tags_in_every_generation(path: &Path, generations: usize) -> Result<Vec<String>> {
+        let mut tags = Vec::new();
+        for generation in (0..=generations).rev() {
+            let generation_path = jsonl_generation_path(path, generation);
+            if !generation_path.exists() {
+                continue;
+            }
+            for line in fs::read_to_string(&generation_path)?.lines() {
+                tags.push(serde_json::from_str::<AuditEventRecord>(line)?.message);
+            }
+        }
+        Ok(tags)
+    }
+
+    fn recent_tags(path: &Path, generations: usize, limit: usize) -> Result<Vec<String>> {
+        Ok(
+            load_recent_jsonl_records::<AuditEventRecord>(path, generations, limit, "audit")?
+                .into_iter()
+                .map(|record| record.message)
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn rotation_keeps_the_live_file_and_the_configured_generations() -> Result<()> {
+        let (root, paths) = temp_app_paths("rotation-generations");
+        paths.ensure()?;
+        let path = paths.audit_events_path();
+        // One record per file: every append after the first rotates.
+        let rotation = JsonlRotation {
+            max_bytes: 1,
+            generations: 2,
+        };
+        for tag in ["a", "b", "c", "d"] {
+            append_rotating(&path, tag, rotation)?;
+        }
+        let on_disk = tags_in_every_generation(&path, 3);
+        let third = jsonl_generation_path(&path, 3).exists();
+        let lock = jsonl_lock_path(&path).is_file();
+        let all = recent_tags(&path, 2, 10);
+        let two = recent_tags(&path, 2, 2);
+        fs::remove_dir_all(root).ok();
+        // `a` was dropped by the rotation that would have made it `.3`.
+        assert_eq!(on_disk?, ["b", "c", "d"]);
+        assert!(!third, "only `generations` rotated files are kept");
+        assert!(lock, "rotation leaves the store's lock file alone");
+        assert_eq!(all?, ["b", "c", "d"]);
+        assert_eq!(two?, ["c", "d"]);
+        Ok(())
+    }
+
+    fn event_line(tag: &str) -> String {
+        serde_json::to_string(&event_record(tag)).expect("serialize event record")
+    }
+
+    /// Write `contents` as the automation events store, creating its directory.
+    fn seed_events_store(paths: &AppPaths, contents: &str) -> Result<()> {
+        paths.ensure()?;
+        fs::write(paths.automation_events_path(), contents)?;
+        Ok(())
+    }
+
+    // The rotation tests above all drive `append_jsonl_record` and
+    // `load_recent_jsonl_records` directly with a custom `JsonlRotation`,
+    // which proves the mechanism works but never exercises the wiring that
+    // connects it to the real stores: `append_automation_event` and
+    // `append_audit_event` passing `Some(EVENT_LOG_ROTATION)`, and
+    // `load_recent_automation_events`/`load_recent_audit_events` passing
+    // `EVENT_LOG_ROTATED_GENERATIONS`. Flip either side back to `None`/`0`
+    // and every test above still passes. These two tests close that gap by
+    // going through the public wrappers only, at the real
+    // `EVENT_LOG_ROTATE_BYTES` cap — seeding the live file directly (fast)
+    // rather than looping a real append to size, since it's the one real
+    // append afterward that is under test, not how the filler got there.
+    #[test]
+    fn events_store_rotates_through_the_public_wrapper() -> Result<()> {
+        let (root, paths) = temp_app_paths("events-public-wrapper-rotation");
+        let filler = event_line("filler") + "\n";
+        let repeats = (EVENT_LOG_ROTATE_BYTES as usize).div_ceil(filler.len());
+        seed_events_store(&paths, &filler.repeat(repeats))?;
+
+        append_automation_event(&paths, &event_record("new"))?;
+        let rotated = jsonl_generation_path(&paths.automation_events_path(), 1).exists();
+        // `limit: 2` so the read must actually cross into the rotated `.1` to
+        // satisfy it — `limit: 1` would be answered by the live file alone and
+        // never exercise `load_recent_automation_events`'s own
+        // `EVENT_LOG_ROTATED_GENERATIONS` wiring, only the append side's.
+        let recent = load_recent_automation_events(&paths, 2);
+        fs::remove_dir_all(root).ok();
+
+        assert!(
+            rotated,
+            "the live file was at the cap and should have rotated"
+        );
+        assert_eq!(
+            recent?
+                .into_iter()
+                .map(|event| event.message)
+                .collect::<Vec<_>>(),
+            ["filler", "new"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn audit_log_rotates_through_the_public_wrapper() -> Result<()> {
+        let (root, paths) = temp_app_paths("audit-public-wrapper-rotation");
+        let filler = audit_line("filler") + "\n";
+        let repeats = (EVENT_LOG_ROTATE_BYTES as usize).div_ceil(filler.len());
+        seed_audit_store(&paths, &filler.repeat(repeats))?;
+
+        append_audit_event(&paths, &audit_record("new"))?;
+        let rotated = jsonl_generation_path(&paths.audit_events_path(), 1).exists();
+        // `limit: 2`, for the same reason as the events-store twin above: the
+        // read must actually cross into `.1` to exercise
+        // `load_recent_audit_events`'s own generations wiring.
+        let recent = load_recent_audit_events(&paths, 2);
+        fs::remove_dir_all(root).ok();
+
+        assert!(
+            rotated,
+            "the live file was at the cap and should have rotated"
+        );
+        assert_eq!(
+            recent?
+                .into_iter()
+                .map(|event| event.message)
+                .collect::<Vec<_>>(),
+            ["filler", "new"]
+        );
+        Ok(())
+    }
+
+    // Right after a rollover the live file holds fewer records than a reader
+    // asks for; the rest must come from the rotated generations, in order.
+    #[test]
+    fn load_recent_spans_a_rollover() -> Result<()> {
+        let (root, paths) = temp_app_paths("rotation-spans");
+        paths.ensure()?;
+        let path = paths.audit_events_path();
+        let line_len = audit_line("00").len() as u64 + 1;
+        // Rotate once a file holds five records.
+        let rotation = JsonlRotation {
+            max_bytes: 5 * line_len,
+            generations: 4,
+        };
+        for n in 0..12 {
+            append_rotating(&path, &format!("{n:02}"), rotation)?;
+        }
+        let live = fs::read_to_string(&path)?.lines().count();
+        let recent = recent_tags(&path, rotation.generations, 4);
+        let spanning = recent_tags(&path, rotation.generations, 9);
+        let everything = recent_tags(&path, rotation.generations, 100);
+        let live_only = recent_tags(&path, 0, 100);
+        fs::remove_dir_all(root).ok();
+        assert_eq!(live, 2, "12 records rotate after the 5th and 10th");
+        assert_eq!(recent?, ["08", "09", "10", "11"]);
+        assert_eq!(
+            spanning?,
+            ["03", "04", "05", "06", "07", "08", "09", "10", "11"]
+        );
+        let expected: Vec<String> = (0..12).map(|n| format!("{n:02}")).collect();
+        assert_eq!(everything?, expected);
+        assert_eq!(live_only?, ["10", "11"]);
+        Ok(())
+    }
+
+    // A reader can see the store mid-rotation: no live file yet, or a gap
+    // where `.1` was shifted to `.2` but the live file not yet renamed.
+    #[test]
+    fn load_recent_reads_a_store_caught_mid_rotation_in_order() -> Result<()> {
+        let (root, paths) = temp_app_paths("rotation-mid");
+        paths.ensure()?;
+        let path = paths.audit_events_path();
+        let write = |generation: usize, tags: &[&str]| -> Result<()> {
+            let text: String = tags.iter().map(|tag| audit_line(tag) + "\n").collect();
+            fs::write(jsonl_generation_path(&path, generation), text)?;
+            Ok(())
+        };
+        write(1, &["c", "d"])?;
+        write(2, &["a", "b"])?;
+        let no_live = recent_tags(&path, 4, 3);
+        write(0, &["e"])?;
+        fs::remove_file(jsonl_generation_path(&path, 1))?;
+        write(3, &["a"])?;
+        write(2, &["b", "c", "d"])?;
+        let gap = recent_tags(&path, 4, 10);
+        fs::remove_dir_all(root).ok();
+        assert_eq!(no_live?, ["b", "c", "d"]);
+        assert_eq!(gap?, ["a", "b", "c", "d", "e"]);
+        Ok(())
+    }
+
+    // Rotation is best effort: a rename that fails must not cost the record,
+    // nor rename the live file over a `.1` that was never shifted away.
+    #[test]
+    fn a_rotation_that_fails_still_appends_the_record() -> Result<()> {
+        let (root, paths) = temp_app_paths("rotation-fails");
+        paths.ensure()?;
+        let path = paths.audit_events_path();
+        fs::write(&path, audit_line("a") + "\n")?;
+        fs::write(jsonl_generation_path(&path, 1), audit_line("old") + "\n")?;
+        // `.1` cannot be renamed over a non-empty directory.
+        let blocker = jsonl_generation_path(&path, 2);
+        fs::create_dir_all(&blocker)?;
+        fs::write(blocker.join("keep"), "x")?;
+        let rotation = JsonlRotation {
+            max_bytes: 1,
+            generations: 2,
+        };
+        let appended = append_rotating(&path, "b", rotation);
+        let live = fs::read_to_string(&path);
+        let first = fs::read_to_string(jsonl_generation_path(&path, 1));
+        let recent = recent_tags(&path, 2, 10);
+        fs::remove_dir_all(root).ok();
+        appended?;
+        assert_eq!(live?, format!("{}\n{}\n", audit_line("a"), audit_line("b")));
+        assert_eq!(first?, audit_line("old") + "\n");
+        assert_eq!(recent?, ["old", "a", "b"]);
+        Ok(())
+    }
+
+    // `rotation_failure_warning` is unit-tested on its own; this pins that
+    // `append_jsonl_record` actually prints it, once for a store that keeps
+    // failing to rotate. Run in a child process to read its stderr, which the
+    // test harness would otherwise swallow.
+    #[test]
+    fn a_failed_rotation_prints_its_warning_once_to_stderr() -> Result<()> {
+        const WARNING_CHILD_ENV: &str = "ROCM_CORE_TEST_ROTATION_WARNING_CHILD";
+
+        if let Some(path) = std::env::var_os(WARNING_CHILD_ENV) {
+            let rotation = JsonlRotation {
+                max_bytes: 1,
+                generations: 2,
+            };
+            append_rotating(Path::new(&path), "b", rotation)?;
+            append_rotating(Path::new(&path), "c", rotation)?;
+            return Ok(());
+        }
+
+        let (root, paths) = temp_app_paths("rotation-warning");
+        paths.ensure()?;
+        let path = paths.audit_events_path();
+        fs::write(&path, audit_line("a") + "\n")?;
+        fs::write(jsonl_generation_path(&path, 1), audit_line("old") + "\n")?;
+        // `.1` cannot be renamed over a non-empty directory.
+        let blocker = jsonl_generation_path(&path, 2);
+        fs::create_dir_all(&blocker)?;
+        fs::write(blocker.join("keep"), "x")?;
+        let exe = std::env::current_exe().context("current test executable")?;
+        let output = std::process::Command::new(&exe)
+            .args([
+                "automation::tests::a_failed_rotation_prints_its_warning_once_to_stderr",
+                "--exact",
+                "--quiet",
+                "--nocapture",
+            ])
+            .env(WARNING_CHILD_ENV, &path)
+            .output()
+            .context("spawn rotation-warning child")?;
+        fs::remove_dir_all(root).ok();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "child process failed: {:?}\nstdout: {}\nstderr: {stderr}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+        );
+        assert_eq!(
+            stderr.matches("warning: failed to rotate").count(),
+            1,
+            "two appends to a store stuck at its cap must print one warning: {stderr}"
+        );
+        assert!(
+            stderr.contains("events.jsonl"),
+            "the warning names the store: {stderr}"
+        );
+        Ok(())
+    }
+
+    // A rotation that shifted `.1` away but then failed to rename the live
+    // file leaves a gap at `.1`. The next rotation must only fill it: shifting
+    // the older generations again would drop one more each time a rotation
+    // keeps failing that way (e.g. on Windows, while another program holds the
+    // live file open without delete sharing).
+    #[test]
+    fn a_rotation_after_one_left_part_way_drops_no_generation() -> Result<()> {
+        let (root, paths) = temp_app_paths("rotation-part-way");
+        paths.ensure()?;
+        let path = paths.audit_events_path();
+        let write = |generation: usize, tag: &str| -> Result<()> {
+            fs::write(
+                jsonl_generation_path(&path, generation),
+                audit_line(tag) + "\n",
+            )?;
+            Ok(())
+        };
+        // `.1` = a was shifted to `.2`; the live file `e` was not renamed.
+        write(0, "e")?;
+        write(2, "a")?;
+        write(3, "b")?;
+        write(4, "c")?;
+        let rotation = JsonlRotation {
+            max_bytes: 1,
+            generations: 4,
+        };
+        append_rotating(&path, "f", rotation)?;
+        let on_disk = tags_in_every_generation(&path, 5);
+        let fifth = jsonl_generation_path(&path, 5).exists();
+        fs::remove_dir_all(root).ok();
+        assert_eq!(on_disk?, ["c", "b", "a", "e", "f"]);
+        assert!(!fifth, "rotation never writes past `generations`");
+        Ok(())
+    }
+
+    fn assert_holds_exactly_in_writer_order(tags: &[String], expected: &[String]) {
+        let mut sorted = tags.to_vec();
+        sorted.sort();
+        let mut expected = expected.to_vec();
+        expected.sort();
+        assert_eq!(
+            sorted, expected,
+            "rotation lost or duplicated records under concurrent writers"
+        );
+        // Each writer appends in order, so its records must read back in order
+        // across the generations, oldest first.
+        let mut last_seen = std::collections::HashMap::new();
+        for tag in tags {
+            let (writer, n) = tag.rsplit_once('-').expect("tag is <writer>-<n>");
+            let n: usize = n.parse().expect("numeric sequence");
+            if let Some(previous) = last_seen.insert(writer.to_owned(), n) {
+                assert!(
+                    previous < n,
+                    "{writer}'s records are out of order: {tags:?}"
+                );
+            }
+        }
+    }
+
+    /// Small enough that the concurrency tests below rotate every ~14
+    /// records, with enough generations that none is dropped.
+    const TEST_ROTATION: JsonlRotation = JsonlRotation {
+        max_bytes: 2048,
+        generations: 64,
+    };
+
+    // Rotation renames the live file, so it must run under the store lock:
+    // an append that had already opened the file being renamed would land in
+    // the rotated copy (or be lost), and two writers rotating at once would
+    // shift the generations twice.
+    #[test]
+    fn rotation_under_concurrent_threads_loses_no_records() -> Result<()> {
+        const WRITERS: usize = 8;
+        const APPENDS_PER_WRITER: usize = 25;
+        let (root, paths) = temp_app_paths("rotation-threads");
+        paths.ensure()?;
+        let path = paths.audit_events_path();
+        let barrier = std::sync::Barrier::new(WRITERS);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..WRITERS)
+                .map(|writer| {
+                    let (path, barrier) = (&path, &barrier);
+                    scope.spawn(move || -> Result<()> {
+                        barrier.wait();
+                        for n in 0..APPENDS_PER_WRITER {
+                            append_rotating(path, &format!("t{writer}-{n}"), TEST_ROTATION)?;
+                        }
+                        Ok(())
+                    })
+                })
+                .collect();
+            for handle in handles {
+                handle.join().expect("writer thread panicked")?;
+            }
+            Ok::<_, anyhow::Error>(())
+        })?;
+
+        let expected: Vec<String> = (0..WRITERS)
+            .flat_map(|writer| (0..APPENDS_PER_WRITER).map(move |n| format!("t{writer}-{n}")))
+            .collect();
+        let tags = tags_in_every_generation(&path, TEST_ROTATION.generations);
+        let rotated = jsonl_generation_path(&path, 2).exists();
+        fs::remove_dir_all(root).ok();
+        assert!(rotated, "the test must actually rotate more than once");
+        assert_holds_exactly_in_writer_order(&tags?, &expected);
+        Ok(())
+    }
+
+    /// Env var that turns a re-exec of this test binary into one writer of
+    /// [`rotation_under_concurrent_processes_loses_no_records`]: its value is
+    /// `<store path>|<writer index>`.
+    const CHILD_ROTATING_WRITER_ENV: &str = "ROCM_CORE_TEST_JSONL_CHILD_ROTATING_WRITER";
+
+    #[test]
+    fn rotation_under_concurrent_processes_loses_no_records() -> Result<()> {
+        const WRITERS: usize = 6;
+        const APPENDS_PER_WRITER: usize = 20;
+        if let Some(spec) = std::env::var_os(CHILD_ROTATING_WRITER_ENV) {
+            let spec = spec.to_string_lossy().into_owned();
+            let (path, writer) = spec.split_once('|').context("malformed writer spec")?;
+            for n in 0..APPENDS_PER_WRITER {
+                append_rotating(Path::new(path), &format!("p{writer}-{n}"), TEST_ROTATION)?;
+            }
+            return Ok(());
+        }
+
+        let (root, paths) = temp_app_paths("rotation-processes");
+        paths.ensure()?;
+        let path = paths.audit_events_path();
+        let exe = std::env::current_exe().context("current test executable")?;
+        let children = (0..WRITERS)
+            .map(|writer| {
+                std::process::Command::new(&exe)
+                    .args([
+                        "automation::tests::rotation_under_concurrent_processes_loses_no_records",
+                        "--exact",
+                        "--quiet",
+                    ])
+                    .env(
+                        CHILD_ROTATING_WRITER_ENV,
+                        format!("{}|{writer}", path.display()),
+                    )
+                    .stdout(std::process::Stdio::null())
+                    .spawn()
+                    .context("spawn writer process")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for mut child in children {
+            let status = child.wait()?;
+            assert!(status.success(), "writer process failed: {status:?}");
+        }
+
+        let expected: Vec<String> = (0..WRITERS)
+            .flat_map(|writer| (0..APPENDS_PER_WRITER).map(move |n| format!("p{writer}-{n}")))
+            .collect();
+        let tags = tags_in_every_generation(&path, TEST_ROTATION.generations);
+        let rotated = jsonl_generation_path(&path, 2).exists();
+        fs::remove_dir_all(root).ok();
+        assert!(rotated, "the test must actually rotate more than once");
+        assert_holds_exactly_in_writer_order(&tags?, &expected);
+        Ok(())
+    }
+
+    // Readers take no lock, so a rotation can rename the files they are
+    // opening. One sequential writer makes every correct read a run of
+    // consecutive numbers: a file read twice or a generation skipped breaks
+    // the run.
+    #[test]
+    fn reads_racing_rotations_see_each_record_once_and_in_order() -> Result<()> {
+        const APPENDS: usize = 4000;
+        const LIMIT: usize = 20;
+        let rotation = JsonlRotation {
+            max_bytes: 2048,
+            generations: 3,
+        };
+        let (root, paths) = temp_app_paths("rotation-read-race");
+        paths.ensure()?;
+        let path = paths.audit_events_path();
+        let done = std::sync::atomic::AtomicBool::new(false);
+        let outcome = std::thread::scope(|scope| {
+            let reader = scope.spawn(|| -> Result<usize> {
+                let mut reads = 0;
+                while !done.load(std::sync::atomic::Ordering::Acquire) {
+                    let numbers: Vec<usize> = recent_tags(&path, rotation.generations, LIMIT)?
+                        .iter()
+                        .map(|tag| tag.parse().expect("numeric tag"))
+                        .collect();
+                    if numbers.windows(2).any(|pair| pair[1] != pair[0] + 1) {
+                        bail!("read {numbers:?}: a record was read twice or skipped");
+                    }
+                    // Three full generations always hold more than LIMIT.
+                    if numbers.last().is_some_and(|&last| last >= 100) && numbers.len() != LIMIT {
+                        bail!("read {numbers:?}: a generation was skipped");
+                    }
+                    reads += 1;
+                }
+                Ok(reads)
+            });
+            let written =
+                (0..APPENDS).try_for_each(|n| append_rotating(&path, &n.to_string(), rotation));
+            done.store(true, std::sync::atomic::Ordering::Release);
+            let reads = reader.join().expect("reader panicked");
+            written.and(reads)
+        });
+        fs::remove_dir_all(root).ok();
+        assert!(outcome? > 0, "the reader must have run");
+        Ok(())
+    }
+
+    fn reviewed_proposal(tag: &str, reviewed_at: Option<u128>) -> AutomationProposalRecord {
+        AutomationProposalRecord {
+            status: "approved".to_owned(),
+            reviewed_at_unix_ms: reviewed_at,
+            ..proposal_record(tag)
+        }
+    }
+
+    fn proposal_ids(proposals: &[AutomationProposalRecord]) -> Vec<&str> {
+        proposals.iter().map(|p| p.proposal_id.as_str()).collect()
+    }
+
+    #[test]
+    fn compaction_keeps_every_pending_proposal_and_the_most_recently_reviewed() {
+        let mut proposals = vec![
+            proposal_record("pending-old"),
+            reviewed_proposal("reviewed-at-10", Some(10)),
+            reviewed_proposal("reviewed-at-30", Some(30)),
+            proposal_record("pending-new"),
+            reviewed_proposal("reviewed-at-20", Some(20)),
+            reviewed_proposal("reviewed-never-timed", None),
+        ];
+        compact_reviewed_proposals(&mut proposals, 2, "pending-new");
+        assert_eq!(
+            proposal_ids(&proposals),
+            [
+                "pending-old",
+                "reviewed-at-30",
+                "pending-new",
+                "reviewed-at-20"
+            ]
+        );
+        compact_reviewed_proposals(&mut proposals, 2, "pending-new");
+        assert_eq!(
+            proposals.len(),
+            4,
+            "already within the cap: nothing dropped"
+        );
+        // The proposal just reviewed is kept even when its review time is the
+        // oldest, as after the clock moved backwards.
+        compact_reviewed_proposals(&mut proposals, 1, "reviewed-at-20");
+        assert_eq!(
+            proposal_ids(&proposals),
+            ["pending-old", "pending-new", "reviewed-at-20"]
+        );
+    }
+
+    /// Write `proposals` as the proposals store, one JSON line each.
+    fn seed_proposals_store(paths: &AppPaths, lines: &[String]) -> Result<()> {
+        paths.ensure()?;
+        fs::write(paths.automation_proposals_path(), lines.join("\n") + "\n")?;
+        Ok(())
+    }
+
+    fn proposal_line(proposal: &AutomationProposalRecord) -> String {
+        serde_json::to_string(proposal).expect("serialize proposal")
+    }
+
+    // A pending proposal must stay findable by id until it is reviewed, however
+    // many proposals were reviewed after it was queued.
+    #[test]
+    fn a_status_update_compacts_reviewed_proposals_but_keeps_pending_ones() -> Result<()> {
+        let (root, paths) = temp_app_paths("proposal-compaction");
+        let reviewed = REVIEWED_PROPOSALS_RETAINED + 5;
+        let mut lines = vec![proposal_line(&proposal_record("pending-old"))];
+        lines.extend((0..reviewed).map(|n| {
+            proposal_line(&reviewed_proposal(
+                &format!("r{n}"),
+                Some(1_000 + n as u128),
+            ))
+        }));
+        lines.push(proposal_line(&proposal_record("to-review")));
+        seed_proposals_store(&paths, &lines)?;
+
+        let updated = update_automation_proposal_status(&paths, "to-review", "rejected")?;
+        let proposals = load_automation_proposals(&paths);
+        let pending_old = find_automation_proposal(&paths, "pending-old");
+        fs::remove_dir_all(root).ok();
+
+        let proposals = proposals?;
+        assert_eq!(updated.status, "rejected");
+        assert_eq!(pending_old?.status, "pending");
+        let reviewed_ids: Vec<&str> = proposals
+            .iter()
+            .filter(|p| p.status != "pending")
+            .map(|p| p.proposal_id.as_str())
+            .collect();
+        assert_eq!(reviewed_ids.len(), REVIEWED_PROPOSALS_RETAINED);
+        // The just-reviewed proposal is the newest review, so it is kept; the
+        // six oldest reviews make room for it.
+        assert_eq!(reviewed_ids.last(), Some(&"to-review"));
+        for n in 0..6 {
+            assert!(
+                !reviewed_ids.contains(&format!("r{n}").as_str()),
+                "r{n} kept"
+            );
+        }
+        assert_eq!(reviewed_ids[0], "r6");
+        assert_eq!(proposals[0].proposal_id, "pending-old");
+        Ok(())
+    }
+
+    // A legacy proposal's id derives from its line number, so compaction
+    // removing lines above it must not change the id it is known by — and
+    // the rewrite must persist that id so later reads need no line number.
+    #[test]
+    fn legacy_proposal_ids_survive_compaction_and_are_persisted() -> Result<()> {
+        let (root, paths) = temp_app_paths("proposal-legacy-compaction");
+        let reviewed = REVIEWED_PROPOSALS_RETAINED + 3;
+        let mut lines: Vec<String> = (0..reviewed)
+            .map(|n| proposal_line(&reviewed_proposal(&format!("r{n}"), Some(n as u128 + 1))))
+            .collect();
+        let legacy = AutomationProposalRecord {
+            at_unix_ms: 77,
+            ..proposal_record("")
+        };
+        lines.push(proposal_line(&legacy));
+        lines.push(proposal_line(&proposal_record("to-review")));
+        seed_proposals_store(&paths, &lines)?;
+        let legacy_id = format!("legacy-77-{reviewed}");
+
+        let before = find_automation_proposal(&paths, &legacy_id);
+        let update = update_automation_proposal_status(&paths, "to-review", "approved");
+        let after = find_automation_proposal(&paths, &legacy_id);
+        let recent = load_recent_automation_proposals(&paths, 2);
+        let on_disk = fs::read_to_string(paths.automation_proposals_path());
+        let approve_legacy = update_automation_proposal_status(&paths, &legacy_id, "approved");
+        fs::remove_dir_all(root).ok();
+
+        assert_eq!(before?.status, "pending");
+        update?;
+        assert_eq!(after?.status, "pending", "the legacy id still resolves");
+        assert_eq!(proposal_ids(&recent?), ["to-review", legacy_id.as_str()]);
+        assert!(
+            on_disk?.contains(&format!("\"proposal_id\":\"{legacy_id}\"")),
+            "the rewrite persists the legacy id"
+        );
+        assert_eq!(approve_legacy?.status, "approved");
+        Ok(())
+    }
+
+    #[test]
+    fn recent_proposals_read_only_the_tail_but_fall_back_for_legacy_ids() -> Result<()> {
+        let (root, paths) = temp_app_paths("proposal-tail");
+        // A corrupt line older than the window fails a whole-file read, so a
+        // read that succeeds proves only the tail was read.
+        seed_proposals_store(
+            &paths,
+            &[
+                "not json".to_owned(),
+                proposal_line(&proposal_record("a")),
+                proposal_line(&proposal_record("b")),
+            ],
+        )?;
+        let tail = load_recent_automation_proposals(&paths, 2);
+        let whole = load_automation_proposals(&paths);
+        let legacy = AutomationProposalRecord {
+            at_unix_ms: 5,
+            ..proposal_record("")
+        };
+        seed_proposals_store(
+            &paths,
+            &[
+                proposal_line(&proposal_record("a")),
+                String::new(),
+                proposal_line(&legacy),
+                proposal_line(&proposal_record("b")),
+            ],
+        )?;
+        let with_legacy = load_recent_automation_proposals(&paths, 2);
+        let full = load_automation_proposals(&paths);
+        fs::remove_dir_all(root).ok();
+        assert_eq!(proposal_ids(&tail?), ["b", "a"]);
+        assert!(
+            whole.is_err(),
+            "the whole-file read reports the corrupt line"
+        );
+        // Same ids as the whole-file read, line index and all.
+        assert_eq!(proposal_ids(&with_legacy?), ["b", "legacy-5-2"]);
+        assert_eq!(proposal_ids(&full?), ["a", "legacy-5-2", "b"]);
+        Ok(())
     }
 }

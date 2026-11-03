@@ -1146,7 +1146,7 @@ const NOT_INVOCATIONS: &[(&str, &str, &str)] = &[
         "error message naming the command, not advice",
     ),
     (
-        "apps/rocm/src/main.rs",
+        "apps/rocm/src/examine_report_text.rs",
         "rocm interactive shell",
         "heading of the non-interactive launcher report",
     ),
@@ -1201,12 +1201,12 @@ const NOT_INVOCATIONS: &[(&str, &str, &str)] = &[
         "error message",
     ),
     (
-        "apps/rocmd/src/service.rs",
+        "apps/rocmd/src/daemon.rs",
         "rocmd automation supervisor started",
         "log line",
     ),
     (
-        "apps/rocmd/src/service.rs",
+        "apps/rocmd/src/daemon.rs",
         "rocmd automation supervisor stopped",
         "log line",
     ),
@@ -1263,7 +1263,7 @@ const NOT_INVOCATIONS: &[(&str, &str, &str)] = &[
         "remediation-flag wording (`rocm fix can run it`), not a command",
     ),
     (
-        "crates/rocm-core/src/host_gpu.rs",
+        "crates/rocm-core/src/host_gpu/capture.rs",
         "rocm debug: command capture {stage} failed for {}: {detail}",
         "debug log line",
     ),
