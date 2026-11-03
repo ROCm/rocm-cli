@@ -516,7 +516,7 @@ Two things make this testable without a Ryzen 4000/5000 laptop, and both matter
 when changing it:
 
 - `gfx_target_has_no_rocm_build` in
-  [host_gpu.rs](../crates/rocm-core/src/host_gpu.rs) is deliberately conjoined
+  [gfx_target.rs](../crates/rocm-core/src/gfx_target.rs) is deliberately conjoined
   with `normalize_therock_family` returning `None`. Do not simplify it to a bare
   target-name check. Every test that drives the refusal does so by naming the
   target explicitly, and the conjunct is the only reason any of them is also
@@ -2197,9 +2197,9 @@ value `sh` would assign or nothing: the driver plan
 ([`driver_install.rs`](../apps/rocm/src/driver_install.rs)), the OpenMPI,
 libatomic and libnuma install plans `rocm` runs before serving and the hints
 naming them ([`openmpi.rs`](../crates/rocm-core/src/openmpi.rs)), `rocm
-examine`'s distro fields ([`examine.rs`](../crates/rocm-core/src/examine.rs)),
+examine`'s distro fields ([`host_env.rs`](../crates/rocm-core/src/examine/host_env.rs)),
 and the distro name it prints
-([`host_gpu.rs`](../crates/rocm-core/src/host_gpu.rs)). The one exception is
+([`os_facts.rs`](../crates/rocm-core/src/host_gpu/os_facts.rs)). The one exception is
 `rocm diagnose --distro` run from Windows, which has the WSL distribution's own
 `sh` source the file and reports what it assigned.
 
