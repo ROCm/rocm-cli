@@ -13,7 +13,7 @@
 //!   in the `run:` lines the CLI offers to be copied. An unquoted value there
 //!   means the line the operator reads is not the argv that runs, and the
 //!   copyable ones mean it is not what runs when they paste it either.
-//! * [`crate::therock::quote_display_arg`] builds the `command: uv … && uv …`
+//! * [`crate::therock`]'s install dry-run builds the `command: uv … && uv …`
 //!   line the install dry-run prints. Its install root comes from a `--prefix`
 //!   the local assistant can choose, and the line is offered to be run.
 //! * [`crate::service_hints`], the `rocm services` list in

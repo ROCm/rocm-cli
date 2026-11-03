@@ -74,6 +74,7 @@ pub(crate) use crate::runtime_registry::{
 use crate::runtime_registry::{
     runtime_manifest_path, save_runtime_manifest, wheel_composition_includes_devel,
 };
+use crate::shell_quote::shell_quote;
 use anyhow::{Context, Result, bail};
 use rocm_core::{
     AppPaths, detect_host_gpu_diagnostics, detect_legacy_rocm_summary, ensure_uv_binary,
@@ -538,14 +539,20 @@ fn install_wheel_runtime(
         }
         install_args.extend(wheel_composition.package_specs.iter().cloned());
         let venv_args = uv_venv_args(&python_launcher.executable, &install_root);
+        // This line is offered as the command to run, so it has to be one a
+        // shell reads back as the argv it previews. The install root in it
+        // comes from a `--prefix` the local assistant can choose
+        // (`install_sdk_dry_run` is a model-callable tool), so a bare or
+        // double-quoted value here would be a model-chosen value in a line a
+        // user is invited to paste.
         let venv_args_display = venv_args
             .iter()
-            .map(|arg| quote_display_arg(arg))
+            .map(|arg| shell_quote(arg))
             .collect::<Vec<_>>()
             .join(" ");
         let install_args_display = install_args
             .iter()
-            .map(|arg| quote_display_arg(arg))
+            .map(|arg| shell_quote(arg))
             .collect::<Vec<_>>()
             .join(" ");
         let _ = writeln!(output, "  mode: dry-run");
@@ -757,22 +764,6 @@ fn install_wheel_runtime(
     }
     let _ = writeln!(output, "  manifest: {}", manifest_path.display());
     Ok(SdkInstallResult::installed(output))
-}
-
-/// Quote one argument of the `command:` line the dry-run preview prints.
-///
-/// That line is offered as the command — `uv <venv args> && uv <install args>`
-/// — so it has to be one a shell reads back as the argv it previews. It used to
-/// quote only on whitespace and a short metacharacter list, with `"`, which
-/// left `` ` `` and `'` unquoted and kept `$(…)` live *inside* the quotes; the
-/// install root comes from a `--prefix` the local assistant can choose
-/// (`install_sdk_dry_run` is a model-callable tool), so that was a model-chosen
-/// value in a line a user is invited to run.
-///
-/// [`crate::shell_quote::shell_quote`] is the same quoter the remote command
-/// line and the approval previews use.
-fn quote_display_arg(value: &str) -> String {
-    crate::shell_quote::shell_quote(value)
 }
 
 /// The host's legacy/system ROCm version when it is strictly newer than the
@@ -1446,20 +1437,23 @@ mod tests {
     }
 
     #[test]
-    fn display_command_quotes_package_extras() {
-        assert_eq!(quote_display_arg("package[extra]"), "'package[extra]'");
+    fn the_dry_run_quoter_quotes_package_extras() {
+        assert_eq!(shell_quote("package[extra]"), "'package[extra]'");
         assert_eq!(
-            quote_display_arg("C:\\Program Files\\Python\\python.exe"),
+            shell_quote("C:\\Program Files\\Python\\python.exe"),
             "'C:\\Program Files\\Python\\python.exe'"
         );
     }
 
-    /// The `command:` line is printed as the command to run, and the install
-    /// root in it comes from a `--prefix` the local assistant can choose
-    /// (`install_sdk_dry_run` is model-callable). The old quoter returned
-    /// `` /tmp/`id` `` completely bare — no trigger character in it — and wrapped
-    /// `/tmp/$(id)` in double quotes, where substitution still fires. Both ran
-    /// on paste.
+    /// The dry-run's `command:` line is printed as the command to run, and the
+    /// install root in it comes from a `--prefix` the local assistant can
+    /// choose (`install_sdk_dry_run` is model-callable). The double-quoting
+    /// helper that line used to be built with returned `` /tmp/`id` `` completely bare — no
+    /// trigger character in it — and wrapped `/tmp/$(id)` in double quotes,
+    /// where substitution still fires. Both ran on paste.
+    ///
+    /// This asks the quoter the line is built with, `shell_quote`; scenario
+    /// therock-next-15 checks the rendered line itself end to end.
     ///
     /// Asked of a real `sh`, not of a word-splitter. That distinction is the
     /// whole test: `shlex` is a *splitter*, so it hands back
@@ -1469,7 +1463,7 @@ mod tests {
     /// test passed against the defect it exists to catch.
     #[cfg(unix)]
     #[test]
-    fn a_dry_run_command_line_cannot_run_a_second_command_on_paste() {
+    fn the_dry_run_quoter_cannot_run_a_second_command_on_paste() {
         for hostile in [
             "/tmp/`id`",
             "/tmp/$(id)",
@@ -1478,7 +1472,7 @@ mod tests {
             "/tmp/$HOME",
             "",
         ] {
-            let quoted = quote_display_arg(hostile);
+            let quoted = shell_quote(hostile);
             let output = std::process::Command::new(crate::shell_quote::TEST_SH)
                 .arg("-c")
                 .arg(format!("printf %s {quoted}"))
