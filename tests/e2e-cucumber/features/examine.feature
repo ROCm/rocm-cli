@@ -464,3 +464,57 @@ Feature: GPU detection and system inspection
     Given a machine with a ROCm install that was not set up by the CLI
     When the user inspects the system in machine-readable form
     Then the inspection reports a current install-method name
+
+  # Whether a GPU is integrated decides two things a user sees: `rocm serve`
+  # withholds its low-VRAM warning on an APU (whose "VRAM" is a BIOS carve-out
+  # of system RAM), and `rocm diagnose` raises `fix-9-igpu-dgpu` only on a host
+  # with both an integrated and a discrete AMD GPU. Every AMD GPU on this bus
+  # used to be misreported: the PCI scan ignored the `[1002:xxxx]` device id,
+  # so a GPU `pci.ids` cannot name ("Device") got no architecture; `examine`
+  # kept its own name table, which called Krackan Point gfx1150 (it is gfx1152)
+  # and knew the Renoir and Mendocino codenames only as "some APU"; and gfx1037
+  # was not classified as integrated at all.
+  #
+  # The host is simulated, so this runs on every Linux lane, GPU or not. A
+  # stand-in `lspci` on PATH lists the five GPUs as `lspci -nn -D` prints them,
+  # a stand-in `rocminfo` lists no agents, and the simulated host root has no
+  # kernel topology, so the PCI scan alone names every card. (What `rocminfo`
+  # adds is covered one level down: on a real host its agents are dropped by
+  # ROCm/rocm-cli#393, so the folds it feeds cannot be reached from here.)
+  @id:examine-tells-integrated-gpus-from-discrete-ones @requires-os:linux
+  Scenario: examine-31 - The inspection tells integrated GPUs from discrete ones by the part they are
+    Given a machine whose PCI bus lists a Radeon RX 7900 XTX and four integrated AMD GPUs
+    When the user inspects that machine in machine-readable form
+    Then the inspection names each GPU's architecture and reports only the RX 7900 XTX as discrete
+    And the inspection reports the machine as having both an integrated and a discrete AMD GPU
+
+  # A Raven Ridge or Picasso integrated GPU is named by no lookup table: its
+  # device id is not in the device-id table and `pci.ids`' "Raven Ridge" is not
+  # in the name table. Its architecture reaches the CLI only from the kernel's
+  # GPU topology, which reports gfx902. The report used to take that
+  # architecture but keep the PCI scan's "not an APU" default, so a Raven
+  # laptop with a discrete card reported no integrated GPU and
+  # `fix-9-igpu-dgpu` could not fire on it.
+  #
+  # The host is simulated, so this runs on every Linux lane, GPU or not: a
+  # stand-in `lspci` lists the two GPUs, a stand-in `rocminfo` lists no agents,
+  # and the simulated host root carries a kernel topology node for each card.
+  @id:examine-classifies-an-igpu-from-the-kernel-topology @requires-os:linux
+  Scenario: examine-32 - An integrated GPU that only the kernel identifies is reported as integrated
+    Given a machine with a Raven Ridge integrated GPU and a discrete AMD GPU that only the kernel identifies
+    When the user inspects that machine in machine-readable form
+    Then the inspection reports the Raven Ridge GPU as an integrated gfx902 and the other card as discrete
+    And the inspection reports the machine as having both an integrated and a discrete AMD GPU
+
+  # The same rule where no PCI scan answers at all: an ordinary ROCm container
+  # ships no `pciutils`, so the kernel's topology is the only list of GPUs. A
+  # card listed from the topology alone used to carry no verdict whatever its
+  # architecture, so such a host reported neither an integrated nor a discrete
+  # GPU. Simulated as `examine-32` is, with a stand-in `lspci` that lists
+  # nothing and no PCI address on either topology node.
+  @id:examine-classifies-gpus-only-the-kernel-lists @requires-os:linux
+  Scenario: examine-33 - GPUs that only the kernel lists are reported as integrated or discrete by their architecture
+    Given a machine whose only list of GPUs is the kernel's, naming a Strix Halo integrated GPU and a Radeon RX 9070 XT
+    When the user inspects that machine in machine-readable form
+    Then the inspection reports the Strix Halo GPU as integrated and the RX 9070 XT as discrete
+    And the inspection reports the machine as having both an integrated and a discrete AMD GPU

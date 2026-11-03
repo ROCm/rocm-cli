@@ -205,11 +205,6 @@ mod tests {
             "\\u{feff}",
             STRIPPED_FROM_INPUT,
         ),
-        (
-            "crates/rocm-core/src/examine.rs",
-            "(\\u{2122})",
-            STRIPPED_FROM_INPUT,
-        ),
         ("crates/rocm-dash-core/src/state.rs", "⋯", JOB_GLYPH),
         ("crates/rocm-dash-core/src/state.rs", "✓", JOB_GLYPH),
         ("crates/rocm-dash-core/src/state.rs", "✗", JOB_GLYPH),
