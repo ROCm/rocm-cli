@@ -252,6 +252,7 @@ CLI:
 
 - [`cli_progress.rs`](apps/rocm/src/cli_progress.rs)'s **`Spinner`** — a caller-driven indicator that only advances when the caller's own loop ticks it (e.g. `serve`'s HTTP-polling wait loop)
 - [`cli_progress.rs`](apps/rocm/src/cli_progress.rs)'s **`AnimatedSpinner`** — progress that must keep animating between caller updates and can go quiet for long stretches (e.g. a download, or the ComfyUI/SDK extraction spinner)
+- [`cli_report.rs`](apps/rocm/src/cli_report.rs)'s **`write_marked_row`** — one row of a listing that flags a row with a glyph and explains it in a `legend:` line: writes `{indent}{marker} {body}`, with a blank marker column when `marker` is `None`. The caller keeps its glyph constant, its legend and the shape of `body` (e.g. `rocm engines` and `rocm examine` for the default engine, `rocm runtime list` for the active/rollback runtime); a new marked listing should reuse it rather than hand-roll the `if marked { GLYPH } else { " " }` prefix
 
 dash-TUI, in `crates/rocm-dash-tui/src/ui/`:
 

@@ -41,9 +41,43 @@ impl ActionReport {
     }
 }
 
+/// Appends one row of a marked listing: `{indent}{marker} {body}\n`, where an
+/// unmarked row (`marker: None`) gets a single space in the marker column so
+/// every row's body stays aligned under the marked ones.
+///
+/// Used by the listings that flag a row with a glyph and explain it in a
+/// `legend:` line (the default engine in `rocm engines`/`rocm examine`, the
+/// active/rollback runtime in `rocm runtime list`). The caller owns the glyph
+/// constants, the legend and the shape of `body`; this owns only the shared
+/// marker-column layout, so a new listing cannot quietly pick a different one.
+pub(crate) fn write_marked_row(
+    output: &mut String,
+    indent: &str,
+    marker: Option<&str>,
+    body: impl std::fmt::Display,
+) {
+    let _ = writeln!(output, "{indent}{} {body}", marker.unwrap_or(" "));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn marked_row_puts_the_marker_before_the_body() {
+        let mut output = String::new();
+        write_marked_row(&mut output, "", Some("*"), "lemonade   note");
+        write_marked_row(&mut output, "  ", Some("-"), format_args!("rt-{}", 1));
+        assert_eq!(output, "* lemonade   note\n  - rt-1\n");
+    }
+
+    #[test]
+    fn unmarked_row_keeps_the_marker_column_blank() {
+        let mut output = String::new();
+        write_marked_row(&mut output, "", None, "vllm       note");
+        write_marked_row(&mut output, "  ", None, "aim");
+        assert_eq!(output, "  vllm       note\n    aim\n");
+    }
 
     #[test]
     fn renders_headline_then_indented_details() {

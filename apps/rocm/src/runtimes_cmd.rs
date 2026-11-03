@@ -653,11 +653,11 @@ pub(crate) fn render_runtimes_text(paths: &AppPaths, config: &RocmCliConfig) -> 
             .as_deref()
             .is_some_and(|runtime_key| runtime_key == manifest.runtime_key);
         let marker = if active {
-            ACTIVE_RUNTIME_MARKER
+            Some(ACTIVE_RUNTIME_MARKER)
         } else if rollback {
-            ROLLBACK_RUNTIME_MARKER
+            Some(ROLLBACK_RUNTIME_MARKER)
         } else {
-            " "
+            None
         };
         let status = runtime_usability_status(&manifest);
         let mode = if manifest.read_only {
@@ -669,17 +669,21 @@ pub(crate) fn render_runtimes_text(paths: &AppPaths, config: &RocmCliConfig) -> 
         // says, so an install missing it should not be silent about that.
         // `rocm examine` reports the same thing for the active runtime.
         let toolchain = toolchain_state_text(manifest.includes_devel());
-        let _ = writeln!(
-            output,
-            "  {marker} {} runtime_id={} version={} format={} family={} mode={} status={} toolchain={}",
-            manifest.runtime_key,
-            manifest.runtime_id,
-            therock::runtime_version_display(&manifest.version),
-            manifest.format,
-            manifest.family,
-            mode,
-            status,
-            toolchain
+        cli_report::write_marked_row(
+            &mut output,
+            "  ",
+            marker,
+            format_args!(
+                "{} runtime_id={} version={} format={} family={} mode={} status={} toolchain={}",
+                manifest.runtime_key,
+                manifest.runtime_id,
+                therock::runtime_version_display(&manifest.version),
+                manifest.format,
+                manifest.family,
+                mode,
+                status,
+                toolchain
+            ),
         );
         let _ = writeln!(
             output,
