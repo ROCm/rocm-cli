@@ -520,6 +520,48 @@ Feature: Model serving
     And the user is told no AMD GPU was detected
     And the user is not told to relaunch the server with different options
 
+  # Native-Windows platform gate (ROCMAI-823). `rocm engines list` already
+  # reports vLLM as `runtime: unsupported_native_windows`; `serve` takes the
+  # same decision (`engine_ruled_out_by_platform`) and refuses before runtime
+  # resolution or any launch. Before the gate, an active runtime let this print
+  # "managed service launched" and exit 0 while the engine died with no output.
+  # Hermetic (a planted read-only runtime, no GPU, no network, no engine, no
+  # `e2e-test-hooks`), so the required `windows-build-and-test` lane selects it
+  # via `E2E_ALSO_RUN_IDS`.
+  @id:serve-vllm-refused-on-native-windows @requires-os:windows
+  Scenario: serve-33 - Serving with vLLM on native Windows is refused before anything launches
+    Given a registered read-only runtime
+    And the first runtime is active
+    When the user serves a model with the vLLM engine
+    Then serving is refused before any engine starts
+    And the user is told vLLM needs WSL or Linux, or the Lemonade engine to serve
+    And no local server was recorded
+
+  # The install half of the same gate. Without it `rocm engines install vllm`
+  # either failed on an unrelated "no active ROCm runtime" error (as here, with
+  # no runtime) or went on to run the install. Hermetic, and selected into the
+  # required Windows lane for the same reason as serve-33.
+  @id:serve-vllm-install-refused-on-native-windows @requires-os:windows
+  Scenario: serve-34 - Installing vLLM on native Windows is refused with the platform reason
+    When the user installs the vLLM engine
+    Then the install is refused
+    And the user is told vLLM needs WSL or Linux, or the Lemonade engine to install
+
+  # The same refusal with a runtime present, which is the case that used to go
+  # on to install. The runtime resolves as a managed Python environment and a
+  # recording stand-in replaces `uv`, so an install that was NOT refused would
+  # run `uv pip install vllm`; nothing fetched is shown by that never happening,
+  # not only by the exit message.
+  @id:serve-vllm-install-with-runtime-refused-on-native-windows @requires-os:windows
+  Scenario: serve-35 - Installing vLLM on native Windows with an active runtime never starts the install
+    Given a registered read-only runtime
+    And the first runtime is active
+    And the runtime has a Python interpreter and uv is a recording stand-in
+    When the user installs the vLLM engine
+    Then the install is refused
+    And no vLLM install was started
+    And the user is told vLLM needs WSL or Linux, or the Lemonade engine to install
+
   # `serve` advertises a set of device policies, and the list the user is offered
   # has to be the list the command accepts. Runs on the no-GPU lane, where a
   # refusal that names the policy itself is cleanly distinguishable from the
@@ -529,7 +571,7 @@ Feature: Model serving
   # advertised list and the accepted list are one list), so this ships as a
   # guard rather than an expected failure.
   @id:serve-rejects-no-advertised-device-policy @requires-no-gpu
-  Scenario: serve-33 - Every device policy the serve command offers is one it accepts
+  Scenario: serve-36 - Every device policy the serve command offers is one it accepts
     When the user serves a model under each device policy the command offers
     Then no policy is refused for being that policy
 
@@ -547,7 +589,7 @@ Feature: Model serving
   # little headroom left on main alone, so three more real serves follow
   # serve-06/07/08 onto the merge-queue path where the budget for them lives.
   @id:serve-services-stop-reports-what-it-stopped @requires-gpu @merge-queue
-  Scenario: serve-34 - Stopping a running server reports that it stopped it
+  Scenario: serve-37 - Stopping a running server reports that it stopped it
     Given a managed runtime is active
     And a model is being served on GPU
     When the user stops the server that is running
@@ -563,7 +605,7 @@ Feature: Model serving
   # touches the installed program: the removal is scoped to this scenario's own
   # directories and keeps the binaries.
   @id:serve-uninstall-stops-what-it-manages @requires-os:linux
-  Scenario: serve-35 - Removing the CLI's managed files stops the servers it manages
+  Scenario: serve-38 - Removing the CLI's managed files stops the servers it manages
     Given a local server this machine manages is running
     When the user removes the CLI's managed files
     Then the removal is reported as complete
@@ -576,7 +618,7 @@ Feature: Model serving
   # this scenario also guards them.
   # @merge-queue for the serve-cost reason on `@id:serve-services-stop-reports-what-it-stopped`.
   @id:serve-auto-gpu-selection-names-a-device @requires-gpu @merge-queue
-  Scenario: serve-36 - Letting the CLI choose the GPU names the device it chose
+  Scenario: serve-39 - Letting the CLI choose the GPU names the device it chose
     Given a managed runtime is active
     And a machine with an AMD GPU
     When the user serves a model letting the CLI choose the GPU
@@ -588,7 +630,7 @@ Feature: Model serving
   # or say the usual one is busy — but silently reusing it is not.
   # @merge-queue for the serve-cost reason on `@id:serve-services-stop-reports-what-it-stopped`.
   @id:serve-second-server-gets-a-free-port @requires-gpu @merge-queue
-  Scenario: serve-37 - A second server does not take an address already in use
+  Scenario: serve-40 - A second server does not take an address already in use
     Given a managed runtime is active
     And the address a new server would use is already taken
     When the user serves a model without choosing an address

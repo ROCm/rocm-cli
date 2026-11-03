@@ -203,6 +203,7 @@ The other shared `ui/` components the contributor rules in [`AGENTS.md`](../AGEN
 - [`ui/panel.rs`](../crates/rocm-dash-tui/src/ui/panel.rs) — the shared box chrome: bordered, titled panels (`bento`, `popup`), scrollbars, and the popup geometry and framing (`centered_rect`, `centered_width`, `draw_popup_frame`, `grey_overlay`) that [`ui/approval.rs`](../crates/rocm-dash-tui/src/ui/approval.rs), [`ui/job_console.rs`](../crates/rocm-dash-tui/src/ui/job_console.rs) and the `Modal::*` renderers in [`ui/modal.rs`](../crates/rocm-dash-tui/src/ui/modal.rs) import.
 - [`ui/spinner.rs`](../crates/rocm-dash-tui/src/ui/spinner.rs) — pure helpers for the braille spinner frame (`spinner_frame`) and progress-percentage parsing (`parse_progress_pct`) that `job_console.rs` renders with.
 - [`ui/theme.rs`](../crates/rocm-dash-tui/src/ui/theme.rs) — the semantic `Theme`, including the shared job-status-to-color mapping (`job_status_color`).
+- [`ui/widgets.rs`](../crates/rocm-dash-tui/src/ui/widgets.rs) — small helpers shared across tabs, including `apply_char_key`/`apply_char_key_filtered`, the append-only text-field edit (`Char` appends, `Backspace` pops one char) that every form's key handler calls instead of writing its own `push`/`pop` arms. The Chat tab's input is the exception: its keys go through the `KeyAction` table in [`app/actions.rs`](../crates/rocm-dash-tui/src/app/actions.rs).
 
 The `ui/` modules the split moved code out of or into, beyond the shared components above:
 
