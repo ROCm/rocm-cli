@@ -491,6 +491,12 @@ rocm update --json")]
         command: EnginesCommand,
     },
     /// Show recommended local models and what this machine can run.
+    ///
+    /// The default list is the curated recommendations. The AMD Inference Microservices
+    /// (AIM) catalog of pre-built Docker images is not part of it: use --verbose to see
+    /// every AIM image with the GPU families it supports, how many GPUs it needs, and
+    /// whether it requires a Hugging Face token. Serve one with
+    /// `rocm serve <model> --engine aim` (needs a reachable Docker daemon).
     #[command(
         alias = "models",
         after_help = "EXAMPLES:\n  \
@@ -625,7 +631,8 @@ rocm serve qwen --verbose --device gpu_required")]
         /// `AIM_PROFILE_ID=...`) and other engines ignore it. `KEY=VALUE` is
         /// recorded with the service, so for a secret such as `HF_TOKEN` pass a
         /// bare `KEY` instead: it is forwarded from your environment and never
-        /// stored.
+        /// stored. A gated AIM image (one that needs a Hugging Face token) is
+        /// refused up front unless `HF_TOKEN` is passed this way.
         #[arg(long = "engine-env", value_name = "KEY[=VALUE]")]
         engine_env: Vec<String>,
     },
@@ -2717,7 +2724,7 @@ const fn builtin_engine_inventory() -> &'static [(&'static str, &'static str)] {
         ),
         (
             "aim",
-            "AMD Enterprise AI pre-built Docker serving containers",
+            "AMD Inference Microservices (AIM) pre-built Docker serving containers",
         ),
     ]
 }
@@ -3139,13 +3146,21 @@ enum PlatformRuleOut {
 
 /// Whether, and why, the platform gate rules this engine out on this host.
 fn engine_ruled_out_by_platform(engine: &str) -> PlatformRuleOut {
+    engine_ruled_out_by_platform_with(engine, rocm_engine_aim::builtin_docker_daemon_reachable)
+}
+
+/// [`engine_ruled_out_by_platform`] with the Docker probe injected, so a caller
+/// that asks about many engines in one pass (the `/model` listing) can answer
+/// the same `docker info` once instead of once per recipe.
+fn engine_ruled_out_by_platform_with(
+    engine: &str,
+    docker_reachable: impl FnOnce() -> bool,
+) -> PlatformRuleOut {
     if rocm_core::runtime_is_windows() && engine.eq_ignore_ascii_case("vllm") {
         PlatformRuleOut::NativeWindowsVllm
     } else if rocm_core::runtime_is_windows() && engine.eq_ignore_ascii_case("aim") {
         PlatformRuleOut::NativeWindowsAim
-    } else if engine.eq_ignore_ascii_case("aim")
-        && !rocm_engine_aim::builtin_docker_daemon_reachable()
-    {
+    } else if engine.eq_ignore_ascii_case("aim") && !docker_reachable() {
         PlatformRuleOut::AimDockerUnavailable
     } else {
         PlatformRuleOut::Allowed
@@ -3191,6 +3206,14 @@ enum GatedEngineAction {
 /// service that dies with no output.
 fn ensure_engine_allowed_on_platform(engine: &str, action: GatedEngineAction) -> Result<()> {
     refuse_if_ruled_out(engine_ruled_out_by_platform(engine), action)
+}
+
+/// The part of [`ensure_engine_allowed_on_platform`] that needs no Docker probe:
+/// treats the daemon as reachable, so only the OS gate can refuse. `serve` runs
+/// it first and the full gate after its own AIM pre-flight, so a request that
+/// pre-flight refuses never reaches `docker info`.
+fn ensure_engine_allowed_on_os(engine: &str, action: GatedEngineAction) -> Result<()> {
+    refuse_if_ruled_out(engine_ruled_out_by_platform_with(engine, || true), action)
 }
 
 /// [`ensure_engine_allowed_on_platform`] with the platform decision passed in,
@@ -5123,7 +5146,7 @@ pub(crate) const fn engine_inventory() -> &'static [(&'static str, &'static str)
         ),
         (
             "aim",
-            "AMD Enterprise AI pre-built Docker serving containers",
+            "AMD Inference Microservices (AIM) pre-built Docker serving containers",
         ),
     ]
 }

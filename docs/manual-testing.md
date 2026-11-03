@@ -938,7 +938,13 @@ Expected result:
 ## 10. AIM (Docker) Engine Verification
 
 Linux/WSL2 only, and requires a reachable Docker daemon (`docker info` must
-succeed).
+succeed). The catalog entry used below has profiles for Radeon PRO W7900 and
+Radeon AI PRO R9700 (`gfx110X-all`, `gfx120X-all`) only; on a GPU of another
+family, such as Strix Halo or an Instinct card, `rocm serve` refuses it, so use
+the raw image form further down. Other boards of a supported family (for
+example an RX 7900 XTX) are not refused: the CLI prints a note that the pinned
+profile targets the W7900 / R9700 and names `--engine-env AIM_PROFILE_ID` to
+override it.
 
 ```bash
 rocm serve aim-qwen3.5-9b --engine aim --managed
@@ -954,9 +960,15 @@ the engine's default 5-minute readiness wait. Raise it with
 environment of `rocm serve`. Stopping or failing a start removes the container
 and its downloaded weights, so a retry downloads them again.
 
-`aim-qwen3.5-9b` is the catalog entry (`rocm model --verbose`). It supplies the
-pinned image and `AIM_PROFILE_ID`; to serve a raw image reference instead, pass
-the profile yourself:
+`aim-qwen3.5-9b` (canonical id `Qwen/Qwen3.5-9B`) is the catalog entry
+(`rocm model --verbose`). It supplies the pinned image and, for the detected GPU
+family, `AIM_PROFILE_ID`; on a GPU the image has no profile for (for example
+Strix Halo or an Instinct card) `rocm serve` refuses with the supported
+families. An image whose smallest profile needs several GPUs on the detected
+family is refused, because `rocm serve` gives an engine one GPU. None of these
+GPU checks run when the host's GPU family cannot be detected or with
+`--device cpu_only`. To serve a raw image
+reference instead, which skips these catalog checks, pass the profile yourself:
 
 ```bash
 rocm serve amdenterpriseai/aim-radeon-qwen-qwen3-5-9b:0.12.0-preview --engine aim \
@@ -966,7 +978,9 @@ rocm serve amdenterpriseai/aim-radeon-qwen-qwen3-5-9b:0.12.0-preview --engine ai
 `--engine-env KEY=VALUE` is stored with the service record, so use it for
 non-secret values only. For a secret such as a gated model's `HF_TOKEN`, export
 it and pass the bare name (`export HF_TOKEN=...`, then `--engine-env HF_TOKEN`):
-it is forwarded from your environment and never stored. `--engine-env` is
+it is forwarded from your environment and never stored. A gated model
+(`rocm model --verbose` shows the `HF_TOKEN` note) is refused before
+anything is pulled if no token was passed. `--engine-env` is
 ignored by the other engines (the command prints a note saying so).
 
 Expected result:
