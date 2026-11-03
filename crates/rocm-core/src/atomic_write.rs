@@ -7,7 +7,7 @@
 //! [`write_file_atomically`] stages the bytes in a fresh sibling temp file and
 //! then publishes it over the destination in one step, so a reader sees either
 //! the previous complete file or the new complete file, never a partial one,
-//! and the destination is never absent while it is being replaced.
+//! and the destination is not removed before the new file takes its place.
 //!
 //! The temp file is named `{file name}.tmp-{pid}-{millis}-{attempt}` and
 //! reserved with `create_new`, so two writers — threads of one process or
@@ -19,9 +19,18 @@
 //! `ReplaceFileW` rather than `rename`. `std::fs::rename` does replace an
 //! existing file there, but as `MoveFileExW` it fails with a sharing violation
 //! while another process holds the destination open, which is the case
-//! `ReplaceFileW` is used for. Two publishes of one file in flight at once
-//! through `ReplaceFileW` are not exercised by any test; the concurrency tests
-//! below run on Unix only.
+//! `ReplaceFileW` is used for. The concurrency tests below run on every
+//! platform, but each starts with no destination, so on Windows at most one of
+//! their publishes goes through `ReplaceFileW`: two `ReplaceFileW` publishes of
+//! one file in flight at once are not exercised by any test.
+//!
+//! One failure leaves the destination absent: Microsoft documents that
+//! `ReplaceFileW`, called without a backup name, can fail after it has already
+//! moved the old file off the destination name
+//! (`ERROR_UNABLE_TO_MOVE_REPLACEMENT` and `ERROR_UNABLE_TO_MOVE_REPLACEMENT_2`).
+//! The publish then retries once as a plain rename. If the destination is
+//! still missing after that, the temp file is kept rather than removed, since
+//! it holds the only copy of the new contents, and the error names it.
 //!
 //! Atomic, not durable: neither the temp file nor its directory is fsynced
 //! before the publish. That survives a crashed process and a concurrent
@@ -209,15 +218,35 @@ fn publish_staged_file(tmp: &Path, path: &Path) -> Result<()> {
     publish_staged_file_with(tmp, path, publish_temp_file)
 }
 
+/// Publish a staged file over `path`, removing the temp file if publishing
+/// fails — unless the failed publish took the existing file away.
+///
+/// A rename either replaces the destination or leaves it alone, but Windows'
+/// `ReplaceFileW` can fail after moving the old file off the destination name
+/// (see `replace_file_windows`). Removing the temp file then would leave no
+/// copy of the contents under any name the user can find, so it is kept and
+/// the error says where.
 fn publish_staged_file_with<F>(tmp: &Path, path: &Path, publish: F) -> Result<()>
 where
     F: FnOnce(&Path, &Path) -> io::Result<()>,
 {
-    publish(tmp, path)
-        .inspect_err(|_| {
-            let _ = fs::remove_file(tmp);
-        })
-        .with_context(|| format!("failed to publish {}", path.display()))
+    let destination_existed = path.exists();
+    let Err(error) = publish(tmp, path) else {
+        return Ok(());
+    };
+    if destination_existed && !path.exists() && tmp.exists() {
+        return Err(error).with_context(|| {
+            format!(
+                "failed to publish {}, and the replace took the old file away; the new \
+                 contents are kept in {} - rename that file to {} to restore it",
+                path.display(),
+                tmp.display(),
+                path.display()
+            )
+        });
+    }
+    let _ = fs::remove_file(tmp);
+    Err(error).with_context(|| format!("failed to publish {}", path.display()))
 }
 
 /// Test seam: move the staged file `tmp` over `path` in one step, replacing
@@ -261,6 +290,9 @@ pub fn publish_temp_file(tmp: &Path, path: &Path) -> io::Result<()> {
 #[allow(unsafe_code)] // Win32 FFI
 fn replace_file_windows(path: &Path, replacement: &Path) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{
+        ERROR_UNABLE_TO_MOVE_REPLACEMENT, ERROR_UNABLE_TO_MOVE_REPLACEMENT_2,
+    };
     use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
 
     let path_wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
@@ -283,11 +315,37 @@ fn replace_file_windows(path: &Path, replacement: &Path) -> io::Result<()> {
             std::ptr::null(),
         )
     };
-    if replaced == 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
+    if replaced != 0 {
+        return Ok(());
     }
+    let error = io::Error::last_os_error();
+    // Microsoft documents two partial outcomes for a call without a backup
+    // name, and in both the replacement is still under its own name:
+    // `ERROR_UNABLE_TO_MOVE_REPLACEMENT` ("the replaced file no longer exists
+    // and the replacement file exists under its original name") and
+    // `ERROR_UNABLE_TO_MOVE_REPLACEMENT_2` ("the file to be replaced still
+    // exists with a different name"). Either way nothing is at `path` any
+    // more. One plain rename puts the new contents there; if that fails too,
+    // `publish_staged_file_with` keeps the replacement file.
+    let partial = [
+        ERROR_UNABLE_TO_MOVE_REPLACEMENT,
+        ERROR_UNABLE_TO_MOVE_REPLACEMENT_2,
+    ]
+    .into_iter()
+    .any(|code| {
+        error
+            .raw_os_error()
+            .is_some_and(|raw| u32::try_from(raw) == Ok(code))
+    });
+    if !partial {
+        return Err(error);
+    }
+    fs::rename(replacement, path).map_err(|retry| {
+        io::Error::new(
+            retry.kind(),
+            format!("{error}; retrying as a plain rename also failed: {retry}"),
+        )
+    })
 }
 
 #[cfg(test)]
@@ -346,28 +404,40 @@ mod tests {
         assert_eq!(temp.parent().unwrap(), Path::new("/tmp/cache"));
     }
 
-    /// Same property end to end: the temp file the real write creates (and
-    /// then cleans up) leaves only the destination behind.
+    /// Same property end to end: the temp file a write stages, observed at the
+    /// moment it is published, keeps the destination's full name, and the
+    /// publish leaves only the destination behind.
     #[test]
     fn write_file_atomically_temp_name_preserves_multi_dot_file_names() {
         let root = scratch_dir("atomic-name");
-        let occupied = root.join("artifact.tar.gz");
-        fs::create_dir_all(occupied.join("nested")).unwrap();
-        fs::write(occupied.join("nested").join("keep"), b"x").unwrap();
+        let destination = root.join("artifact.tar.gz");
+        let temp_id = process_temp_id();
+        let mut staged_name = None;
 
-        // Fails after the temp file exists, so the observed name is the real one.
-        write_file_atomically(&occupied, b"payload").expect_err("rename should fail");
+        write_file_atomically_with_publish(
+            &destination,
+            b"payload",
+            |attempt| OsString::from(format!("{temp_id}-{attempt}")),
+            || {},
+            |tmp, path| {
+                staged_name = tmp.file_name().map(OsStr::to_os_string);
+                publish_temp_file(tmp, path)
+            },
+        )
+        .unwrap();
 
         let names: Vec<String> = fs::read_dir(&root)
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
+        let published = fs::read(&destination);
         let _ = fs::remove_dir_all(&root);
         assert_eq!(
-            names,
-            vec!["artifact.tar.gz".to_owned()],
-            "only the occupied destination should remain"
+            staged_name,
+            Some(OsString::from(format!("artifact.tar.gz.tmp-{temp_id}-0")))
         );
+        assert_eq!(published.unwrap(), b"payload");
+        assert_eq!(names, vec!["artifact.tar.gz".to_owned()]);
     }
 
     #[test]
@@ -419,11 +489,22 @@ mod tests {
 
         let writers: Vec<_> = [b"first".as_slice(), b"second".as_slice()]
             .into_iter()
-            .map(|bytes| {
+            .enumerate()
+            .map(|(writer, bytes)| {
                 let destination = destination.clone();
                 let before_publish = std::sync::Arc::clone(&before_publish);
                 std::thread::spawn(move || {
-                    let staged = stage_file_for_atomic_publish(&destination, bytes)?;
+                    // Both threads ask for the same first name, as two writers
+                    // sharing a pid and a millisecond would, so the collision
+                    // happens every run rather than when the clock lines up.
+                    let staged =
+                        stage_file_for_atomic_publish_with(&destination, bytes, |attempt| {
+                            if attempt == 0 {
+                                OsString::from("same-millisecond")
+                            } else {
+                                OsString::from(format!("same-millisecond-{writer}-{attempt}"))
+                            }
+                        })?;
                     before_publish.wait();
                     publish_staged_file(&staged, &destination)
                 })
@@ -501,6 +582,42 @@ mod tests {
             .collect();
         let _ = fs::remove_dir_all(&root);
         assert_eq!(leftovers, vec![OsString::from("sdk.tar.gz")]);
+    }
+
+    /// A publish that fails after taking the old file away — what Windows'
+    /// `ReplaceFileW` documents for `ERROR_UNABLE_TO_MOVE_REPLACEMENT` without
+    /// a backup name — must not also delete the temp file, which then holds the
+    /// only copy. The error names it so the user can put it back.
+    #[test]
+    fn a_publish_that_removes_the_destination_keeps_the_new_contents() {
+        let root = scratch_dir("replace-partial");
+        let destination = root.join("active.json");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&destination, b"old").unwrap();
+
+        let error = write_file_atomically_with_publish(
+            &destination,
+            b"new",
+            |attempt| OsString::from(format!("replace-partial-{attempt}")),
+            || {},
+            |_tmp, path| {
+                fs::remove_file(path).unwrap();
+                Err(io::Error::other("simulated partial replace"))
+            },
+        )
+        .expect_err("the failed publish must be reported");
+        let message = format!("{error:#}");
+
+        let kept = temp_sibling_path(&destination, OsStr::new("replace-partial-0")).unwrap();
+        let kept_bytes = fs::read(&kept);
+        let destination_exists = destination.exists();
+        let _ = fs::remove_dir_all(&root);
+        assert!(!destination_exists);
+        assert_eq!(kept_bytes.unwrap(), b"new", "the new contents were deleted");
+        assert!(
+            message.contains(&kept.display().to_string()),
+            "the error does not say where the contents are: {message}"
+        );
     }
 
     #[cfg(unix)]
