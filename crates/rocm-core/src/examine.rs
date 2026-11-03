@@ -2221,7 +2221,7 @@ fn runtime_library_path_env(
         // `runtime_path_list_split`, not `std::env::split_paths`: on Windows it
         // trims, drops empty entries and host-normalises each one, on top of the
         // same quoting rules `split_paths` applies. The sibling composition in
-        // `probe_runtime_devices` (`apps/rocm/src/therock.rs`, a different crate)
+        // `probe_runtime_devices` (`apps/rocm/src/therock/probe.rs`, a different crate)
         // already uses it, and the two building the same variable differently is
         // how they drift.
         //
@@ -4531,7 +4531,7 @@ mod tests {
     /// `_rocm_sdk_core` package, beside `root`, both directly under
     /// `site_packages`. A fixture built as `root/lib/<python>/site-packages`
     /// (a venv layout the installer never produces) would pass against a shape
-    /// production cannot create -- this one matches `apps/rocm/src/therock.rs`'s
+    /// production cannot create -- this one matches `apps/rocm/src/therock/probe.rs`'s
     /// `ROCM_SDK_PROBE_SCRIPT` instead.
     #[cfg(target_os = "linux")]
     fn wheel_runtime_on_disk(tag: &str) -> (std::path::PathBuf, Option<std::path::PathBuf>) {

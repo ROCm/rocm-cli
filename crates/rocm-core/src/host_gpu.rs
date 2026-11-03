@@ -4126,7 +4126,10 @@ mod tests {
             Some("AMD Instinct MI300X".to_owned())
         });
         assert_eq!(name, None);
-        assert!(!probed, "a name that cannot be attributed must not be probed");
+        assert!(
+            !probed,
+            "a name that cannot be attributed must not be probed"
+        );
 
         // Ordinal 0 on that same host is no safer: the probe answers for the
         // host's primary adapter, which the mask/enumeration order need not
