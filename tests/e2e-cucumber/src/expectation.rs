@@ -2337,7 +2337,7 @@ flaky = true
              \x20 Scenario: f-01 - The thing works\n\
              \x20   Given a thing\n",
         );
-        // Not attributed to `thing-works` — that was the round-9 false positive.
+        // Not attributed to `thing-works`, the scenario declared below it.
         assert!(claims.ids.is_empty(), "{:?}", claims.ids);
         // But not swallowed either: it is reported against its own line.
         assert_eq!(claims.unbound, [1]);

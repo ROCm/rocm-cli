@@ -601,15 +601,16 @@ Feature: Model serving
   # processes. This scenario asserts the stronger behaviour — that removing the
   # CLI's managed files reports completion while the server it was managing is
   # left running, and with the records gone, the supported way to stop it has
-  # been removed along with them. Nothing here
-  # touches the installed program: the removal is scoped to this scenario's own
-  # directories and keeps the binaries.
-  @id:serve-uninstall-stops-what-it-manages @requires-os:linux
+  # been removed along with them. The removal keeps the binaries and the cache,
+  # so it reaches only this scenario's own config and data directories. It is
+  # still a real `rocm uninstall`, so it runs with the other `@lifecycle`
+  # scenarios rather than on every Linux lane.
+  @id:serve-uninstall-stops-what-it-manages @requires-os:linux @lifecycle
   Scenario: serve-38 - Removing the CLI's managed files stops the servers it manages
     Given a local server this machine manages is running
     When the user removes the CLI's managed files
-    Then the removal is reported as complete
-    And the server is no longer running
+    Then the server is no longer running
+    And the removal is reported as complete
 
   # Expected to FAIL on Windows. Asking the CLI to choose a GPU on a machine that
   # has one must end with a device chosen: reporting that it selected none and

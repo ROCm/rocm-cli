@@ -1121,6 +1121,22 @@ pub fn run_rocm_with_env(
     )
 }
 
+/// Write `script` as the executable `name` in `bin`, and return the `PATH` that
+/// puts `bin` first.
+#[cfg(unix)]
+fn install_shim(bin: &std::path::Path, name: &str, script: &str) -> String {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let shim = bin.join(name);
+    std::fs::write(&shim, script)
+        .unwrap_or_else(|err| panic!("failed to write the {name} shim: {err}"));
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
+        .unwrap_or_else(|err| panic!("failed to mark the {name} shim executable: {err}"));
+
+    let existing = std::env::var("PATH").unwrap_or_default();
+    format!("{}:{existing}", bin.display())
+}
+
 /// Install a `stat` shim on the front of `PATH` that answers for ONE device path
 /// and delegates every other invocation to the real binary, and return the `PATH`
 /// value to hand the child.
@@ -1149,8 +1165,6 @@ pub fn stat_shim_path(
     owner: &str,
     group: &str,
 ) -> String {
-    use std::os::unix::fs::PermissionsExt as _;
-
     let root = world.isolated_root.as_ref().expect("no isolated root");
     let bin = root.path().join("stat-shim");
     std::fs::create_dir_all(&bin).expect("failed to create the stat shim directory");
@@ -1173,13 +1187,7 @@ pub fn stat_shim_path(
          if [ -n \"$fmt\" ] && [ -n \"$want\" ]; then\n  \
          printf '%s|%s|%s\\n' '{mode}' '{owner}' '{group}'\n  exit 0\nfi\nexec {real} \"$@\"\n"
     );
-    let shim = bin.join("stat");
-    std::fs::write(&shim, script).expect("failed to write the stat shim");
-    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
-        .expect("failed to mark the stat shim executable");
-
-    let existing = std::env::var("PATH").unwrap_or_default();
-    format!("{}:{existing}", bin.display())
+    install_shim(&bin, "stat", &script)
 }
 
 #[cfg(not(unix))]
@@ -1204,8 +1212,6 @@ pub fn stat_shim_path(
 /// after [`stat_shim_path`], whose directory this reuses.
 #[cfg(unix)]
 pub fn id_shim_path(world: &E2eWorld, groups: &[&str]) -> String {
-    use std::os::unix::fs::PermissionsExt as _;
-
     let root = world.isolated_root.as_ref().expect("no isolated root");
     let bin = root.path().join("stat-shim");
     std::fs::create_dir_all(&bin).expect("failed to create the shim directory");
@@ -1220,13 +1226,7 @@ pub fn id_shim_path(world: &E2eWorld, groups: &[&str]) -> String {
         "#!/bin/sh\nif [ \"$1\" = \"-Gn\" ]; then\n  echo '{}'\n  exit 0\nfi\nexec {real} \"$@\"\n",
         groups.join(" ")
     );
-    let shim = bin.join("id");
-    std::fs::write(&shim, script).expect("failed to write the id shim");
-    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
-        .expect("failed to mark the id shim executable");
-
-    let existing = std::env::var("PATH").unwrap_or_default();
-    format!("{}:{existing}", bin.display())
+    install_shim(&bin, "id", &script)
 }
 
 #[cfg(not(unix))]
@@ -1582,7 +1582,6 @@ async fn main() {
     // themselves rather than only from the probe. `shared_uv_cache_dir()` is
     // deliberately excluded: uv's cache is content-addressed and uv does its
     // own locking. A lane that races becomes serialized-and-slower instead.
-
     let max_concurrent =
         if cap.has_amd_gpu || shared_cache_dir().is_some() || shared_runtimes_dir().is_some() {
             1

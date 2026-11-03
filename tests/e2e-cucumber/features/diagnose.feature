@@ -728,12 +728,33 @@ Feature: Diagnosing failures and listing fixes
     When the user diagnoses that machine with a rocminfo not found symptom
     Then the PATH cause prints a verify line that shows the GPU with rocminfo alone
 
+  # A missing system HIP SDK is a fault only when something on the machine calls
+  # into it: a HIP-built PyTorch from outside a managed runtime, or a HIP-built
+  # llama.cpp on PATH. Lemonade's bundled llama.cpp does not, and a managed
+  # TheRock runtime brings its own HIP. On v0.2.1 a healthy Windows Strix Halo
+  # serving through Lemonade was still told "install the HIP SDK" as its #1
+  # cause, before and after `rocm install sdk`. Like diagnose-41 the scenario
+  # names no host shape: it holds `diagnose` to what `rocm examine --json`
+  # reports on the same machine, so on the self-hosted Windows GPU lanes (Strix
+  # Halo, Lemonade, no system SDK) it asserts the cause is absent. The arm where
+  # an ambient HIP framework needs the SDK is held by the unit test
+  # `fix_13_does_not_fire_on_a_lemonade_strix_halo_host_with_a_managed_runtime`
+  # in crates/rocm-core/src/diagnose.rs. The oracle also counts a weak listing
+  # (below the match threshold) as present, which is what production does for
+  # an ambient HIP torch beside a healthy SDK; ROCMAI-837 considers that +25
+  # bonus wrong, so whoever changes it must update this scenario's oracle too.
+  @id:diagnose-windows-hip-sdk-advice-follows-the-inspection @requires-os:windows @requires-gpu
+  Scenario: diagnose-48 - On Windows the diagnosis lists the HIP SDK cause only when the inspection finds something that needs it
+    Given a machine with an AMD GPU
+    When the user diagnoses this machine in machine-readable form, with no symptom
+    Then the diagnosis lists the HIP SDK cause only when the inspection finds something that needs it
+
   # Expected to FAIL. `diagnose` and `fix` are two views of the same remedy: the
   # first tells the user what will put the machine right, while the second is the
   # command they are told to run. They must not leave the user with two different
   # definitions of what proves the remedy worked.
   @id:diagnose-and-fix-agree-on-how-to-verify @requires-os:linux @requires-bare-metal
-  Scenario: diagnose-48 - Diagnosing a problem and previewing its fix agree on how to verify it
+  Scenario: diagnose-49 - Diagnosing a problem and previewing its fix agree on how to verify it
     Given a user who hit a device-permission failure
     When the user compares the diagnosis with the matching fix preview
     Then both give the same way to verify that the fix worked
@@ -745,17 +766,17 @@ Feature: Diagnosing failures and listing fixes
   # (the lookup failure now falls back to the conventional group), so this ships
   # as a guard rather than an expected failure.
   @id:diagnose-commands-name-a-real-group @requires-gpu @requires-bare-metal @requires-os:linux
-  Scenario: diagnose-49 - Every group named in a diagnosis is one the machine recognises
+  Scenario: diagnose-50 - Every group named in a diagnosis is one the machine recognises
     Given the GPU device belongs to a group the machine cannot name
     When the user asks the CLI to diagnose a device-permission failure
     Then every group named in the remedy exists on the machine
 
   # Expected to FAIL on a bare-metal GPU host whose device group is not the
   # hard-coded default. The diagnosis promises one command and its matching fix
-  # previews another. This is distinct from scenario diagnose-48:
+  # previews another. This is distinct from scenario diagnose-49:
   # even after the verify text agrees, the actual change must agree too.
   @id:diagnose-and-fix-agree-on-the-remedy-command @requires-gpu @requires-bare-metal @requires-os:linux
-  Scenario: diagnose-50 - Diagnosing a problem and previewing its fix agree on the remedy command
+  Scenario: diagnose-51 - Diagnosing a problem and previewing its fix agree on the remedy command
     Given the GPU device belongs to a recognised non-default group
     When the user compares the diagnosis with the matching fix preview
     Then both give the same command for applying the remedy
@@ -765,7 +786,7 @@ Feature: Diagnosing failures and listing fixes
   # not the outcome. A diagnosis should credit the observable access the user
   # has instead of recommending a permission repair for a usable device.
   @id:diagnose-credits-a-usable-device @requires-gpu @requires-bare-metal @requires-os:linux
-  Scenario: diagnose-51 - A usable GPU device is not diagnosed as a permission failure
+  Scenario: diagnose-52 - A usable GPU device is not diagnosed as a permission failure
     Given the user can already read and write the GPU device
     When the user asks the CLI to diagnose the machine
     Then adding the user to a device group is not offered as a cause
