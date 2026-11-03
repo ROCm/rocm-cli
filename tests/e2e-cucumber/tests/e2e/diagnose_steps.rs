@@ -3340,8 +3340,10 @@ async fn report_names_the_rocm_version_leading_version(world: &mut E2eWorld) {
     let leading = first_line
         .strip_prefix("rocm-cli ")
         .and_then(|rest| rest.split_once(" ("))
-        .map(|(version, _)| version)
-        .unwrap_or_else(|| panic!("expected 'rocm-cli <version> (<ref>, <hash>)': {first_line}"));
+        .map_or_else(
+            || panic!("expected 'rocm-cli <version> (<ref>, <hash>)': {first_line}"),
+            |(version, _)| version,
+        );
     assert_eq!(
         reported, leading,
         "the report's cli_version is not the version `rocm version` leads with \
