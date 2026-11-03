@@ -70,7 +70,7 @@ toml = "1.1"
 # already pulls in, so this adds no second copy to the tree.
 tower-http = { version = "0.7", features = ["fs"] }
 url = "2"
-vt100 = "0.16"
+vt100 = "0.18"
 
 [dev-dependencies]
 # `FileLock`, so the service-cleanup lane can hold the managed-launch lock that a
