@@ -1894,8 +1894,8 @@ The user-visible side is `automations-11` in
 [automations.feature](../tests/e2e-cucumber/features/automations.feature). It
 starts the real `rocmd run --automations-enabled --local-webhook-port 0`, posts
 the same thermal alert to its webhook twice with more proposals than the store
-keeps of reviewed ones queued in between, and checks that one stop request is
-left waiting. It is Linux only (`@requires-os:linux`): the managed server's
+keeps of reviewed ones queued in between (beyond a recent-window read of that
+size), and checks that one stop request is left waiting. It is Linux only (`@requires-os:linux`): the managed server's
 recorded process is a disposable `sleep`.
 
 vLLM TheRock GPU acceptance:

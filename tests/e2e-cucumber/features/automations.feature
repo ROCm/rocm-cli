@@ -164,7 +164,7 @@ Feature: Automation watchers
   # --local-webhook-port`), the same dispatch a telemetry alert takes, and the
   # proposals are read back from the store `rocm automations` lists. The
   # newer proposals are seeded directly, one more than the store keeps of
-  # reviewed ones, so they sit outside any recent window.
+  # reviewed ones, so they sit beyond a recent-window read of that size.
   @id:automations-thermal-stop-not-requeued-behind-newer-proposals
   @requires-os:linux
   Scenario: automations-11 - A repeated thermal alert queues no second stop request while the first waits behind newer proposals

@@ -16,8 +16,9 @@
 //! listing's unit formatting, the bare listing's tolerance of a torn
 //! audit-log tail, the repair of one by the next audited command, and the
 //! size cap on the audit log and compaction of the
-//! proposal history (ROCMAI-729); the watcher/daemon trigger behaviour itself
-//! is covered separately.
+//! proposal history (ROCMAI-729). One scenario (automations-11) starts a real
+//! `rocmd run` and feeds it GPU thermal alerts through its loopback webhook; the
+//! rest of the watcher/daemon trigger behaviour is covered separately.
 
 use std::io::{Read, Write};
 use std::process::Stdio;
@@ -27,9 +28,8 @@ use cucumber::{given, then, when};
 use e2e_cucumber::polled_deadline::{PolledDeadline, RetryTiming};
 use rocm_core::{
     AuditEventRecord, AutomationProposalRecord, EVENT_LOG_ROTATE_BYTES,
-    EVENT_LOG_ROTATED_GENERATIONS, ManagedServiceRecord, REVIEWED_PROPOSALS_RETAINED,
-    append_automation_proposal, jsonl_lock_path, load_automation_proposals,
-    load_recent_automation_events,
+    EVENT_LOG_ROTATED_GENERATIONS, REVIEWED_PROPOSALS_RETAINED, append_automation_proposal,
+    jsonl_lock_path, load_automation_proposals, load_recent_automation_events,
 };
 
 use crate::E2eWorld;
@@ -833,25 +833,34 @@ async fn ready_managed_server(world: &mut E2eWorld) {
     paths
         .ensure()
         .expect("failed to create the data directories");
-    let mut record = ManagedServiceRecord::new(
-        &paths,
-        HOT_SERVICE,
-        "vllm",
-        "tiny",
-        "Tiny/Test",
-        "127.0.0.1",
-        11435,
-        "managed",
-        pid,
-        None,
-        None,
-        None,
-    );
-    record.supervisor_start_ticks = rocm_core::process_start_ticks(pid);
-    record.status = "ready".to_owned();
-    record
-        .write()
-        .expect("failed to write the managed server record");
+    // Planted as plain JSON, not through the record type: the harness exercises
+    // the CLI's own reading of the record.
+    let manifest = paths.service_manifest_path(HOT_SERVICE);
+    let record = serde_json::json!({
+        "service_id": HOT_SERVICE,
+        "engine": "vllm",
+        "model_ref": "tiny",
+        "canonical_model_id": "Tiny/Test",
+        "host": "127.0.0.1",
+        "port": 11435,
+        "endpoint_url": "http://127.0.0.1:11435/v1",
+        "mode": "managed",
+        "status": "ready",
+        "supervisor_pid": pid,
+        "supervisor_start_ticks": rocm_core::process_start_ticks(pid),
+        "engine_pid": null,
+        "manifest_path": manifest,
+        "log_path": paths.service_log_path(HOT_SERVICE),
+        "engine_state_path": paths.service_engine_state_path("vllm", HOT_SERVICE),
+        "created_at_unix_ms": 1_700_000_000_000_u64,
+    });
+    std::fs::create_dir_all(manifest.parent().expect("manifest path has a parent"))
+        .expect("failed to create the services directory");
+    std::fs::write(
+        &manifest,
+        serde_json::to_vec_pretty(&record).expect("failed to serialize the record"),
+    )
+    .expect("failed to write the managed server record");
 }
 
 #[given("the automation daemon is running with its local webhook")]

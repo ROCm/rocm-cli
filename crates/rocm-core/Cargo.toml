@@ -52,8 +52,9 @@ proptest = { version = "1", default-features = false, features = ["std"] }
 # archives byte-by-byte and judge the result on the filesystem.
 flate2 = "1"
 # The exit-code lint in `fix.rs` parses the source rather than pattern-matching
-# its text, so a suffixed, hex or one-line-match literal cannot slip past it.
-# Test-only; already in the lockfile through the derive macros.
+# its text, so the spelling and layout of a literal do not matter to it (its doc
+# comment lists what it still cannot see). Test-only; already in the lockfile
+# through the derive macros.
 syn = { version = "2", features = ["full", "visit"] }
 tar = "0.4"
 tempfile = "3"

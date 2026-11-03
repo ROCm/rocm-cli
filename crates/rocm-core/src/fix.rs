@@ -4966,13 +4966,17 @@ mod tests {
         bare: Vec<String>,
     }
 
-    /// Whether `attrs` carry `#[cfg(test)]`.
+    /// Whether `attrs` carry a `#[cfg(..)]` that mentions `test`, such as
+    /// `#[cfg(test)]` or `#[cfg(all(test, windows))]`.
     fn is_cfg_test(attrs: &[syn::Attribute]) -> bool {
         attrs.iter().any(|attr| {
             attr.path().is_ident("cfg")
-                && attr
-                    .parse_args::<syn::Ident>()
-                    .is_ok_and(|ident| ident == "test")
+                && attr.meta.require_list().is_ok_and(|list| {
+                    list.tokens
+                        .to_string()
+                        .split(|c: char| !c.is_alphanumeric() && c != '_')
+                        .any(|word| word == "test")
+                })
         })
     }
 
@@ -4990,6 +4994,14 @@ mod tests {
             syn::Expr::Paren(paren) => int_literal(&paren.expr),
             _ => None,
         }
+    }
+
+    /// Whether `expr` can evaluate to an integer literal: it is one, or an `if`,
+    /// `match` or block with a literal result in some branch.
+    fn yields_literal(expr: &syn::Expr) -> bool {
+        let mut branches = FunctionResults::default();
+        branches.result(expr);
+        !branches.literals.is_empty()
     }
 
     fn pattern_name(pat: &syn::Pat) -> Option<String> {
@@ -5024,7 +5036,6 @@ mod tests {
                     }
                 }
                 syn::Expr::Paren(paren) => self.result(&paren.expr),
-                syn::Expr::Group(group) => self.result(&group.expr),
                 syn::Expr::Block(block) => self.tail(&block.block),
                 syn::Expr::Unsafe(block) => self.tail(&block.block),
                 syn::Expr::If(branch) => {
@@ -5059,7 +5070,7 @@ mod tests {
 
         fn visit_local(&mut self, local: &'ast syn::Local) {
             if let (Some(name), Some(init)) = (pattern_name(&local.pat), &local.init)
-                && int_literal(&init.expr).is_some()
+                && yields_literal(&init.expr)
             {
                 self.literal_locals.insert(name);
             }
@@ -5069,7 +5080,7 @@ mod tests {
         fn visit_expr_assign(&mut self, assign: &'ast syn::ExprAssign) {
             if let syn::Expr::Path(target) = &*assign.left
                 && let Some(name) = target.path.get_ident()
-                && int_literal(&assign.right).is_some()
+                && yields_literal(&assign.right)
             {
                 self.literal_locals.insert(name.to_string());
             }
@@ -5111,7 +5122,9 @@ mod tests {
     fn scan_items(items: &[syn::Item], scan: &mut ExitCodeScan) {
         for item in items {
             match item {
-                syn::Item::Fn(function) => scan_function(&function.sig, &function.block, scan),
+                syn::Item::Fn(function) if !is_cfg_test(&function.attrs) => {
+                    scan_function(&function.sig, &function.block, scan);
+                }
                 syn::Item::Impl(imp) => {
                     for item in &imp.items {
                         if let syn::ImplItem::Fn(method) = item {
@@ -5129,16 +5142,20 @@ mod tests {
         }
     }
 
-    /// Find the integer literals that a `-> i32` function reports as its
-    /// result in `source`, wherever in the file the function sits.
+    /// Find the integer literals that a free or `impl` function returning `i32`
+    /// reports as its result, in `source`, wherever in the file it sits.
     ///
     /// It parses the source, so the spelling of the literal does not matter
     /// (`4i32`, `4_i32`, `0x4`, `-1`), nor does the layout (a one-line `match`,
     /// a `return 3` with no semicolon, a comment). A literal counts when it is
     /// the operand of a `return`, the function's tail expression, an arm of a
-    /// tail `if` or `match`, or a local that was set to a literal and is then
-    /// returned by name. What it cannot see is a literal that reaches the
-    /// result some other way: through arithmetic, a helper that returns it, a
+    /// tail `if` or `match`, or a local that was set to such a value and is then
+    /// returned by name (tracked by name, without scoping, so an unrelated local
+    /// of the same name can be flagged: a spurious failure, never a miss).
+    ///
+    /// What it does not see: trait default methods, a function nested in a
+    /// function body, a return type spelled through an alias, a literal reaching
+    /// the result through a cast or arithmetic, a helper that returns it, or a
     /// value read from a struct. So this is a net under the `exit::` constants,
     /// not a proof that no runner can return a number of its own.
     fn scan_exit_code_literals(source: &str) -> ExitCodeScan {
@@ -5164,6 +5181,14 @@ mod tests {
             fn via_local() -> i32 { let rc = 4; rc }
             fn via_typed_local() -> i32 { let rc: i32 = 4; rc }
             fn via_assignment() -> i32 { let mut rc = exit::OK; rc = 4; rc }
+            fn via_if_local(c: bool) -> i32 { let code = if c { 3 } else { exit::OK }; return code; }
+            fn via_match_local(rc: i32) -> i32 { let code = match rc { 1 => exit::OK, _ => 4 }; code }
+            fn in_else(c: bool) -> i32 { if c { exit::OK } else { 4 } }
+            fn in_block_arm(r: Result<(), ()>) -> i32 { match r { Ok(_) => exit::OK, Err(_) => { 4 } } }
+            fn in_unsafe() -> i32 { unsafe { 4 } }
+            fn parenthesised() -> i32 { (4) }
+            fn returned_parenthesised() -> i32 { return (4); }
+            fn parenthesised_branch(c: bool) -> i32 { (if c { 4 } else { exit::OK }) }
             struct Runner;
             impl Runner { fn method(&self) -> i32 { 3 } }
             mod inner { pub fn nested() -> i32 { 5 } }
@@ -5185,6 +5210,14 @@ mod tests {
                 "via_local: `rc` is set to an integer literal",
                 "via_typed_local: `rc` is set to an integer literal",
                 "via_assignment: `rc` is set to an integer literal",
+                "via_if_local: `code` is set to an integer literal",
+                "via_match_local: `code` is set to an integer literal",
+                "in_else: 4",
+                "in_block_arm: 4",
+                "in_unsafe: 4",
+                "parenthesised: 4",
+                "returned_parenthesised: 4",
+                "parenthesised_branch: 4",
                 "method: 3",
                 "nested: 5",
             ]
@@ -5213,8 +5246,13 @@ mod tests {
                 exit::OK
             }
             fn not_a_runner() -> usize { 3 }
+            fn nested() -> i32 { fn inner() -> i32 { 7 } exit::OK }
             #[cfg(test)]
             mod tests { fn in_tests() -> i32 { 3 } }
+            #[cfg(all(test, windows))]
+            mod windows_tests { fn in_tests() -> i32 { 3 } }
+            #[cfg(test)]
+            fn test_only() -> i32 { 3 }
             ",
         );
         assert_eq!(scan.bare, Vec::<String>::new());
@@ -5225,7 +5263,8 @@ mod tests {
                 "compares",
                 "other_integers",
                 "commented",
-                "closure"
+                "closure",
+                "nested"
             ]
         );
     }
@@ -5244,9 +5283,19 @@ mod tests {
             "apply",
             "act_on",
             "run_render_group",
+            "run_unset_override",
             "run_unset_override_linux",
-            "run_unset_override_windows",
             "report_persistent_override",
+            "run_unset_override_windows",
+            "report_and_clear_override_windows",
+            "run_path_export",
+            "run_path_export_linux",
+            "run_path_export_windows",
+            "path_export_windows",
+            "run_hip_visible_devices",
+            "run_hip_visible_devices_linux",
+            "pin_device_in_rc_file",
+            "run_hip_visible_devices_windows",
         ] {
             assert!(
                 scan.checked.iter().any(|name| name == runner),

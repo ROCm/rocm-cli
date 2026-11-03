@@ -2341,10 +2341,10 @@ mod tests {
         };
 
         handle_gpu_thermal_protect_event(&paths, WatcherMode::Propose, &mut state, &event)?;
-        // More newer proposals than the store retains reviewed ones, so the
-        // stop proposal falls outside any recent window a reader could take,
-        // not just the one the code once used. A pending proposal is never
-        // dropped from the store, so it is still waiting for review.
+        // More newer proposals than the store keeps reviewed ones (all pending
+        // here, so none is compacted away), which puts the stop proposal beyond
+        // a recent-window read the size of that cap. A pending proposal is
+        // never dropped from the store, so it is still waiting for review.
         for index in 0..=rocm_core::REVIEWED_PROPOSALS_RETAINED {
             queue_proposal_with_arguments(
                 &paths,
@@ -2482,9 +2482,9 @@ mod tests {
             &event,
             &mut record,
         )?;
-        // More newer proposals than the store retains reviewed ones, so the
-        // restart proposal falls outside any recent window a reader could take,
-        // not just the one the code once used.
+        // More newer proposals than the store keeps reviewed ones (all pending
+        // here, so none is compacted away), which puts the restart proposal
+        // beyond a recent-window read the size of that cap.
         for index in 0..=rocm_core::REVIEWED_PROPOSALS_RETAINED {
             queue_proposal_with_arguments(
                 &paths,

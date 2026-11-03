@@ -1470,8 +1470,8 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
             "#!/bin/sh\necho 'HTTP 502' >&2\nexit 1\n"
         };
         // Not `std::fs::write` plus a chmod: the stub is run straight away, which
-        // races other threads' spawns (see `rocm_core::fake_executable`, whose own
-        // tests cover the race).
+        // races other threads' spawns (see `rocm_core::fake_executable`; its own
+        // tests cover the helper, and the report-check tests run this stub).
         rocm_core::fake_executable::write_fake_executable(stub, body).expect("plant gh stub");
     }
 
