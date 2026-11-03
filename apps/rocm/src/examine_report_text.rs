@@ -123,6 +123,7 @@ use rocm_engine_protocol::{
     DetectRequest, DetectResponse, ENGINE_RECIPE_CONTRACT_VERSION, EngineMethod,
 };
 
+use crate::cli_report::write_marked_row;
 use crate::engine_ipc::{
     builtin_engine_available, engine_request, resolve_engine_binary_path,
     resolve_engine_binary_path_with_paths,
@@ -241,7 +242,8 @@ fn plain_status_label(status: &str) -> String {
 const DEFAULT_ENGINE_MARKER: &str = "*";
 
 /// Writes the legend line explaining [`DEFAULT_ENGINE_MARKER`]. Shared by both
-/// engine-inventory renderers so the two copies cannot drift apart.
+/// engine-inventory renderers so the two copies cannot drift apart; their rows
+/// share [`write_marked_row`] for the same reason.
 fn write_default_engine_legend(output: &mut String) {
     let _ = writeln!(output, "  legend: {DEFAULT_ENGINE_MARKER} = default engine");
 }
@@ -292,12 +294,8 @@ pub(crate) fn render_engine_inventory_text_with_paths(paths: Option<&AppPaths>) 
         write_default_engine_legend(&mut output);
     }
     for (name, note) in engine_inventory() {
-        let marker = if *name == default_engine {
-            DEFAULT_ENGINE_MARKER
-        } else {
-            " "
-        };
-        let _ = writeln!(output, "{marker} {name:10} {note}");
+        let marker = (*name == default_engine).then_some(DEFAULT_ENGINE_MARKER);
+        write_marked_row(&mut output, "", marker, format_args!("{name:10} {note}"));
         append_engine_detect_summary(&mut output, name, paths);
     }
     let _ = writeln!(
@@ -483,11 +481,7 @@ fn append_examine_engine_inventory(
         write_default_engine_legend(output);
     }
     for (engine, note) in engine_inventory() {
-        let marker = if *engine == effective_default {
-            DEFAULT_ENGINE_MARKER
-        } else {
-            " "
-        };
+        let marker = (*engine == effective_default).then_some(DEFAULT_ENGINE_MARKER);
         let adapter = if builtin_engine_available(engine) {
             "built_in".to_owned()
         } else {
@@ -507,9 +501,11 @@ fn append_examine_engine_inventory(
                     .or(entry.last_installed_env_id.as_deref())
             })
             .unwrap_or("<unset>");
-        let _ = writeln!(
+        write_marked_row(
             output,
-            "  {marker} {engine} adapter={adapter} runtime_pref={runtime_pref} note={note}"
+            "  ",
+            marker,
+            format_args!("{engine} adapter={adapter} runtime_pref={runtime_pref} note={note}"),
         );
     }
 }
@@ -1686,6 +1682,28 @@ mod tests {
     }
 
     #[test]
+    fn render_engine_inventory_text_keeps_every_row_in_the_marker_layout() {
+        let (root, paths) = test_paths("engine-inventory-row-layout");
+        let host_default =
+            rocm_core::default_engine_for_host(&rocm_core::detect_host_gpu_summary(Some(&paths)));
+
+        let rendered = render_engine_inventory_text_with_paths(Some(&paths));
+        let _ = fs::remove_dir_all(root);
+
+        for (name, _) in engine_inventory() {
+            let expected = if *name == host_default {
+                format!("{DEFAULT_ENGINE_MARKER} {name:10} ")
+            } else {
+                format!("  {name:10} ")
+            };
+            assert!(
+                rendered.lines().any(|line| line.starts_with(&expected)),
+                "expected a row starting {expected:?}:\n{rendered}"
+            );
+        }
+    }
+
+    #[test]
     fn render_engine_inventory_text_omits_legend_when_configured_default_matches_nothing() {
         // A configured default naming an external plugin (or a stale/typo'd
         // name) matches zero rows in `engine_inventory()`'s built-ins list —
@@ -2335,6 +2353,28 @@ mod tests {
             legend_pos < marker_pos,
             "legend must appear before the entries it explains:\n{output}"
         );
+    }
+
+    #[test]
+    fn examine_engine_inventory_keeps_every_row_in_the_marker_layout() {
+        let (root, paths) = test_paths("examine-engine-inventory-row-layout");
+        let config = RocmCliConfig::default();
+        let mut output = String::new();
+
+        append_examine_engine_inventory(&mut output, &paths, &config, "vllm");
+        let _ = fs::remove_dir_all(root);
+
+        for (engine, _) in engine_inventory() {
+            let expected = if *engine == "vllm" {
+                format!("  {DEFAULT_ENGINE_MARKER} {engine} adapter=")
+            } else {
+                format!("    {engine} adapter=")
+            };
+            assert!(
+                output.lines().any(|line| line.starts_with(&expected)),
+                "expected a row starting {expected:?}:\n{output}"
+            );
+        }
     }
 
     #[test]
