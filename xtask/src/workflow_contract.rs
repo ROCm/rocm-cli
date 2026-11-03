@@ -1469,55 +1469,10 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
         } else {
             "#!/bin/sh\necho 'HTTP 502' >&2\nexit 1\n"
         };
-        // Not `std::fs::write` plus a chmod: see the test below.
+        // Not `std::fs::write` plus a chmod: the stub is run straight away, which
+        // races other threads' spawns (see `rocm_core::fake_executable`, whose own
+        // tests cover the race).
         rocm_core::fake_executable::write_fake_executable(stub, body).expect("plant gh stub");
-    }
-
-    /// The stub is run straight after it is written, while other test threads
-    /// spawn children of their own. A child spawned while the stub is open for
-    /// writing keeps that descriptor until its own `exec`, and Linux refuses to
-    /// execute a file anything still has open for writing: the check then fails
-    /// with `Text file busy` for reasons that have nothing to do with its logic.
-    #[test]
-    #[cfg(unix)]
-    fn gh_stub_runs_first_time_while_other_threads_spawn() {
-        const THREADS: usize = 16;
-        const PER_THREAD: usize = 40;
-        let dir = tempfile::tempdir().expect("temp dir");
-        let start = std::sync::Barrier::new(THREADS);
-        let failures: Vec<String> = std::thread::scope(|scope| {
-            let workers: Vec<_> = (0..THREADS)
-                .map(|thread| {
-                    let (dir, start) = (dir.path(), &start);
-                    scope.spawn(move || {
-                        start.wait();
-                        let mut failures = Vec::new();
-                        for run in 0..PER_THREAD {
-                            let stub = dir.join(format!("gh-{thread}-{run}"));
-                            write_gh_stub(&stub, false);
-                            match std::process::Command::new(&stub).output() {
-                                // The failing stub exits 1 and says why on stderr.
-                                Ok(out) if out.stderr == b"HTTP 502\n" => {}
-                                Ok(out) => failures.push(format!("{out:?}")),
-                                Err(error) => failures.push(error.to_string()),
-                            }
-                        }
-                        failures
-                    })
-                })
-                .collect();
-            workers
-                .into_iter()
-                .flat_map(|worker| worker.join().expect("a worker panicked"))
-                .collect()
-        });
-        assert!(
-            failures.is_empty(),
-            "{} of {} first runs failed: {:?}",
-            failures.len(),
-            THREADS * PER_THREAD,
-            &failures[..failures.len().min(3)]
-        );
     }
 
     /// Run a report job's missing-report check script under `bash -e`, as a
