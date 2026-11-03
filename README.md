@@ -870,10 +870,19 @@ passes). When the server is ready it prints a deployment summary: a table
 with the status, the full inference endpoint, the API-qualified model name,
 and a quick smoke test (time to first token and approximate tokens per
 second). A model that is still loading is not reported as a finished "not
-ready" summary. If the wait fails and the server is still running, the
-message names `rocm logs --service <service-id>` and
-`rocm services stop <service-id> --yes`. Control returns to your shell with
-the server still running; manage it later with `rocm services` (below).
+ready" summary. The wait fails, and `rocm serve` exits non-zero, when the
+engine reports failure or its process exits, when a download percent stops
+advancing for 3 minutes, when the port stays closed with no engine log for
+2 minutes, when a load log line stops changing for 5 minutes with the port
+still closed, or after 30 minutes in all. A stall leaves the server running:
+the message names `rocm logs --service <service-id>` and
+`rocm services stop <service-id> --yes`, and the background helper does not
+restart a live server for being slow until those 30 minutes pass. Engine log
+lines shown on the status line have credentials (the endpoint key, `--api-key`
+and token values, `hf_` tokens) masked. Piped output (not a terminal) keeps
+the 45-second wait and reports the server as it stood then. Control returns
+to your shell with the server still running; manage it later with
+`rocm services` (below).
 
 `--verbose` (or `--foreground`) instead attaches to the server in the current
 terminal and streams every engine log line. Use it to debug a startup problem.

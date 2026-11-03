@@ -939,8 +939,14 @@ keeps a status line through download, load, and health until the server can
 serve or that wait fails. A download that is still moving is not cut off at
 45 seconds, and a failure names `rocm logs --service <service-id>` and
 `rocm services stop <service-id> --yes` instead of printing
-`Deployment summary (not ready yet)`. Piped output keeps the 45-second status
-budget. The status line is a TTY spinner, and the harness does not allocate a
+`Deployment summary (not ready yet)`. The wait fails when the engine fails or
+exits, a download percent stops for 3 minutes (`DOWNLOAD_STALL`), the port
+stays closed with no log for 2 minutes (`SILENT_UNREACHABLE`), a load line
+stops changing for 5 minutes (`SILENT_LOAD`), or after 30 minutes
+(`rocm_core::SERVE_STARTUP_DEADLINE`). Engine log lines are masked of
+credentials before they are shown (`redact_log_line`). `rocmd` does not
+restart a live `running` or `starting` service younger than that deadline.
+Piped output keeps the 45-second status budget. The status line is a TTY spinner, and the harness does not allocate a
 PTY, so this is not a default-lane Gherkin scenario (a live engine would also
 be `@requires-gpu`). `decide_serve_startup` and `wait_for_serve_startup` in
 [serve_progress.rs](../apps/rocm/src/serve_progress.rs) are the state matrix,
@@ -948,7 +954,7 @@ covered by:
 
 ```bash
 cargo test -p rocm --bin rocm serve_progress
-cargo test -p rocmd recovery_leaves_a_live_startup_alone
+cargo test -p rocmd recovery_leaves_a_live
 ```
 
 Public-endpoint authentication focused tests:

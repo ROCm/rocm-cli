@@ -970,11 +970,10 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
             Ok(report) => report,
             Err(error) => {
                 spinner.clear();
-                // The process is already recorded. Start supervision before
-                // returning the startup failure so a server that is still
-                // running is not left with no daemon.
-                if let Err(helper) = ensure_background_helper_running_quiet(summary_mode) {
-                    return Err(error.context(helper));
+                if let Some(warning) = supervise_after_launch_error(&error, || {
+                    ensure_background_helper_running_quiet(summary_mode)
+                }) {
+                    eprintln!("{warning}");
                 }
                 return Err(error);
             }
@@ -1065,6 +1064,31 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
         launch_lock,
         require_api_key,
     )
+}
+
+/// Start supervision after `start_managed_service` failed, when that failure
+/// left a launched server behind. Returns the warning to print when the
+/// helper itself would not start.
+///
+/// Only a startup stop ([`serve_progress::ServeStartupFailed`]) is known to
+/// leave a process that may still be running. Other errors either come before
+/// the child exists (the claiming record is written first, as `starting`, and
+/// `rocmd` treats it as any stale start), or from a child that already exited
+/// or an I/O error writing its record, which did not start the helper before
+/// this wait existed either. The startup failure stays the error the user
+/// reads; a helper failure is a warning beside it.
+fn supervise_after_launch_error(
+    error: &anyhow::Error,
+    start_helper: impl FnOnce() -> Result<()>,
+) -> Option<String> {
+    error
+        .downcast_ref::<serve_progress::ServeStartupFailed>()
+        .and_then(|_| start_helper().err())
+        .map(|helper| {
+            format!(
+                "warning: the background helper did not start, so nothing restarts this server if it fails: {helper:#}"
+            )
+        })
 }
 
 #[cfg(test)]
@@ -1876,5 +1900,51 @@ mod tests {
         assert!(!engine_recipe_enables_tool_choice(Some(&without)));
         let with = engine_recipe_with_tool_call_override("vllm", None, Some("hermes"));
         assert!(engine_recipe_enables_tool_choice(with.as_ref()));
+    }
+
+    #[test]
+    fn a_startup_stop_starts_supervision_and_keeps_its_own_error() {
+        use std::cell::Cell;
+        let stop = || -> anyhow::Error {
+            serve_progress::ServeStartupFailed(
+                "qwen on vllm stopped making download progress".to_owned(),
+            )
+            .into()
+        };
+        // Row: startup stop, helper starts. Helper called, nothing to warn.
+        let called = Cell::new(false);
+        let warning = super::supervise_after_launch_error(&stop(), || {
+            called.set(true);
+            Ok(())
+        });
+        assert!(called.get());
+        assert_eq!(warning, None);
+
+        // Row: startup stop, helper fails. The warning names the helper
+        // error; the startup failure is still what the caller returns.
+        let error = stop();
+        let warning = super::supervise_after_launch_error(&error, || anyhow::bail!("no daemon"))
+            .expect("a helper that failed is reported");
+        assert!(
+            warning.starts_with("warning: the background helper did not start"),
+            "{warning}"
+        );
+        assert!(warning.contains("no daemon"), "{warning}");
+        assert_eq!(
+            error.to_string(),
+            "qwen on vllm stopped making download progress"
+        );
+
+        // Row: any other launch error. No helper.
+        let called = Cell::new(false);
+        let warning = super::supervise_after_launch_error(&anyhow::anyhow!("spawn failed"), || {
+            called.set(true);
+            Ok(())
+        });
+        assert!(
+            !called.get(),
+            "a launch that never ran a server starts no helper"
+        );
+        assert_eq!(warning, None);
     }
 }

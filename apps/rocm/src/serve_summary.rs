@@ -177,8 +177,8 @@ pub(crate) fn render_summary(summary: &DeploymentSummary) -> String {
         };
         let _ = writeln!(
             out,
-            "  note: {explanation} - check `rocm logs --service {}` or `rocm services list`",
-            summary.service_id
+            "  note: {explanation} - check `{}` or `rocm services list`",
+            crate::service_hints::service_logs_hint(&summary.service_id)
         );
     }
     for note in &summary.notes {

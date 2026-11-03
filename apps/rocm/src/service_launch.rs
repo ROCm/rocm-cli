@@ -595,7 +595,10 @@ pub(crate) fn start_managed_service(
                 engine_failed: latest.status == "failed",
                 process_alive: process_is_running(latest.supervisor_pid)
                     || latest.engine_pid.is_some_and(process_is_running),
-                log_line: serve_progress::latest_meaningful_log_line(&latest.log_path),
+                log_line: serve_progress::latest_meaningful_log_line(
+                    &latest.log_path,
+                    endpoint_api_key,
+                ),
             };
             (model_name, signals)
         };
@@ -638,7 +641,12 @@ pub(crate) fn start_managed_service(
         Some(service_id),
     );
     if let Some(stop) = startup_stop {
-        bail!("{}", stop.user_message(requested_model, engine, service_id));
+        return Err(serve_progress::ServeStartupFailed(stop.user_message(
+            requested_model,
+            engine,
+            service_id,
+        ))
+        .into());
     }
     Ok(ManagedLaunchReport {
         service_id: service_id.to_owned(),

@@ -1413,6 +1413,14 @@ pub(crate) fn find_recoverable_service(
             continue;
         }
         if let Some(reason) = manifest_service_recovery_reason(&record, now) {
+            // `rocm services` persists an engine's own `starting` state into
+            // the record, so a live server still downloading under the
+            // interactive serve wait (or left by a Ctrl-C of it) can read
+            // `starting` past the stale-start window. It is not stale until
+            // the startup deadline.
+            if record.status == "starting" && live_startup_still_in_progress(&record, now) {
+                continue;
+            }
             return Ok(Some((record, reason)));
         }
         if matches!(record.status.as_str(), "ready" | "running") {
@@ -3278,6 +3286,69 @@ mod tests {
             )),
             "at the startup deadline a live process with a closed port is recoverable"
         );
+        Ok(())
+    }
+
+    /// `rocm services` writes an engine's own `starting` state into the
+    /// record, so a live startup can read `starting` past the five-minute
+    /// stale-start window. That record is spared until
+    /// [`rocm_core::SERVE_STARTUP_DEADLINE`] like a `running` one; a dead pid
+    /// at the same age, or a live one past the deadline, is still stale.
+    #[test]
+    fn recovery_leaves_a_live_starting_record_alone_until_the_startup_deadline() -> Result<()> {
+        let (root, paths) = temp_app_paths("recover-live-starting");
+        paths.ensure()?;
+
+        let mut live = ManagedServiceRecord::new(
+            &paths,
+            "svc-live-starting",
+            "lemonade",
+            "qwen",
+            "Qwen/Qwen3.5",
+            "127.0.0.1",
+            11462,
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            None,
+        );
+        live.status = "starting".to_owned();
+        let now = unix_time_millis();
+        let deadline_ms = rocm_core::SERVE_STARTUP_DEADLINE.as_millis();
+        // Past the stale-start window, two seconds inside the startup deadline.
+        live.created_at_unix_ms = now.saturating_sub(deadline_ms.saturating_sub(2_000));
+        assert!(now.saturating_sub(live.created_at_unix_ms) >= SERVER_TRANSIENT_STALE_MS);
+        live.write()?;
+        let found_inside = find_recoverable_service(&paths)?;
+
+        live.supervisor_pid = u32::MAX;
+        live.write()?;
+        let found_dead = find_recoverable_service(&paths)?;
+
+        live.supervisor_pid = std::process::id();
+        live.created_at_unix_ms = now.saturating_sub(deadline_ms);
+        live.write()?;
+        let found_at_deadline = find_recoverable_service(&paths)?;
+        fs::remove_dir_all(root).ok();
+
+        assert!(
+            found_inside.is_none(),
+            "a live starting process inside the startup deadline must not be restarted: {found_inside:?}"
+        );
+        for (found, why) in [
+            (found_dead, "a dead pid is a stale start"),
+            (found_at_deadline, "a live start past the deadline is stale"),
+        ] {
+            assert_eq!(
+                found.map(|(record, reason)| (record.service_id, reason)),
+                Some((
+                    "svc-live-starting".to_owned(),
+                    "manifest_status_starting_stale".to_owned()
+                )),
+                "{why}"
+            );
+        }
         Ok(())
     }
 

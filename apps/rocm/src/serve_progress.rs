@@ -16,8 +16,8 @@
 //! | State | What we observe | Status line | Exit if data never arrives |
 //! | --- | --- | --- | --- |
 //! | unreachable | port down, no meaningful log, process alive | `Starting {model} on {engine}…` | silent limit, or the deadline |
-//! | downloading | latest log line is a download, the endpoint is not listing the model, and progress is still moving | that log line | stall limit once the line (or its percent) freezes |
-//! | loading | latest log line is anything else meaningful, port still down | that log line | silent-load limit once the line freezes |
+//! | downloading | latest log line is a download, the endpoint is not listing the model, and progress is still moving | that log line | stall limit once the line (or its percent) freezes, or the deadline |
+//! | loading | latest log line is anything else meaningful, port still down | that log line | silent-load limit once the line freezes, or the deadline |
 //! | listing | HTTP lists the model, inference has not answered | the log line, or `Waiting for {model} to serve…` | the overall deadline (the server is answering) |
 //! | serving | inference answered | wait returns ready | immediate |
 //! | failed | engine state `failed`, or every recorded pid is dead | last log line, or a fixed failure line | immediate |
@@ -175,6 +175,22 @@ pub(crate) struct ServeStartupStop {
     pub readiness: EndpointReadiness,
 }
 
+/// The error `start_managed_service` returns when the wait stopped.
+///
+/// The process is recorded (and may still be running), unlike a spawn
+/// failure, so the caller starts supervision for this error and no other.
+/// `Display` is [`ServeStartupStop::user_message`].
+#[derive(Debug)]
+pub(crate) struct ServeStartupFailed(pub String);
+
+impl std::fmt::Display for ServeStartupFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ServeStartupFailed {}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ServeStartupDecision {
     Continue(ServeStartupView),
@@ -196,16 +212,21 @@ pub(crate) fn waiting_label(model: &str) -> String {
 ///
 /// Carriage-return progress bars keep only their last segment. ANSI and
 /// other control bytes are stripped. Blank lines and lines with no words
-/// are skipped so a rule of dashes cannot cover a real stage.
-pub(crate) fn latest_meaningful_log_line(path: &Path) -> Option<String> {
+/// are skipped so a rule of dashes cannot cover a real stage. Credentials
+/// are masked ([`redact_log_line`]) before the line is truncated, so a key
+/// cut at the length limit cannot show its prefix.
+pub(crate) fn latest_meaningful_log_line(
+    path: &Path,
+    endpoint_api_key: Option<&str>,
+) -> Option<String> {
     let lines = rocm_core::tail_lines(path, LOG_TAIL_LINES, LOG_TAIL_BYTES).ok()?;
     lines.into_iter().rev().find_map(|line| {
-        let sanitized = sanitize_log_line(&line);
+        let sanitized = sanitize_log_line(&line, endpoint_api_key);
         is_meaningful(&sanitized).then_some(sanitized)
     })
 }
 
-pub(crate) fn sanitize_log_line(raw: &str) -> String {
+pub(crate) fn sanitize_log_line(raw: &str, endpoint_api_key: Option<&str>) -> String {
     let segment = raw
         .rsplit(['\r', '\n'])
         .find(|part| !part.trim().is_empty())
@@ -213,7 +234,7 @@ pub(crate) fn sanitize_log_line(raw: &str) -> String {
     let stripped = rocm_core::terminal::strip_terminal_control_sequences(segment);
     let ascii: String = stripped.chars().filter(char::is_ascii).collect();
     let collapsed = ascii.split_whitespace().collect::<Vec<_>>().join(" ");
-    truncate_label(&collapsed)
+    truncate_label(&redact_log_line(&collapsed, endpoint_api_key))
 }
 
 fn truncate_label(line: &str) -> String {
@@ -382,11 +403,7 @@ pub(crate) fn decide_serve_startup(
     timing: ServeStartupTiming,
     policy: &ServeStartupPolicy,
 ) -> ServeStartupDecision {
-    let mut signals = signals.clone();
-    if !policy.watch_engine {
-        signals.engine_failed = false;
-        signals.process_alive = true;
-    }
+    let signals = effective_signals(signals.clone(), policy);
     let view = classify(model, engine, readiness, &signals);
     let process_alive = signals.process_alive;
 
@@ -468,19 +485,30 @@ pub(crate) fn decide_serve_startup(
 
 /// The status written to the service record when the wait stops.
 ///
-/// A live process stays `running`. `starting` is what `rocmd` restarts once
-/// the stale-start window elapses
-/// (`find_recoverable_service_detects_stale_starting_manifest`), which would
-/// kill the server [`ServeStartupStop::user_message`] just said is still
-/// running. `running` with a live pid is what
-/// `recovery_leaves_a_live_startup_alone_and_still_restarts_a_dead_one`
-/// leaves alone until [`rocm_core::SERVE_STARTUP_DEADLINE`]. Engine failure
-/// and a dead process are `failed`, which recovery is supposed to restart.
-pub(crate) fn recorded_status_after_stop(stop: &ServeStartupStop) -> &'static str {
+/// Engine failure and a dead process are `failed`, which recovery is supposed
+/// to restart. Every other reason leaves the process alive and is `running`:
+/// [`decide_serve_startup`] returns `ProcessExited` before it checks any
+/// stall or the deadline, so a stall or deadline stop always has
+/// `process_alive`. A live `running` record is what
+/// `recovery_leaves_a_live_startup_alone_and_still_restarts_a_dead_one`, and a
+/// live `starting` one what
+/// `recovery_leaves_a_live_starting_record_alone_until_the_startup_deadline`,
+/// leaves alone until [`rocm_core::SERVE_STARTUP_DEADLINE`], so `rocmd` does
+/// not kill the server [`ServeStartupStop::user_message`] just said is still
+/// running.
+pub(crate) const fn recorded_status_after_stop(stop: &ServeStartupStop) -> &'static str {
     match stop.reason {
         ServeStartupStopReason::EngineFailed | ServeStartupStopReason::ProcessExited => "failed",
-        _ if stop.process_alive => "running",
-        _ => "starting",
+        ServeStartupStopReason::DownloadStalled
+        | ServeStartupStopReason::Silent
+        | ServeStartupStopReason::SilentLoad
+        | ServeStartupStopReason::Deadline => {
+            debug_assert!(
+                stop.process_alive,
+                "a stall or deadline stop is only reached with a live process"
+            );
+            "running"
+        }
     }
 }
 
@@ -556,56 +584,43 @@ pub(crate) fn wait_for_serve_startup(
     let mut token = String::new();
     let mut best = EndpointReadiness::Unreachable;
 
+    // One observe, one probe, one decision and at most one status-line update
+    // per poll, so the spinner advances once per tick.
     loop {
         let (probe_model, signals) = observe();
-        let signals = adjusted_signals(signals, policy);
+        let mut signals = effective_signals(signals, policy);
+        signals.log_line = signals
+            .log_line
+            .map(|line| redact_log_line(&line, endpoint_api_key));
+        // A failed engine or a dead process is decided without waiting on a
+        // probe that cannot succeed.
+        if !signals.engine_failed && signals.process_alive {
+            match probe_service_http_readiness(
+                engine_name,
+                host,
+                port,
+                &probe_model,
+                endpoint_api_key,
+            ) {
+                EndpointReadiness::Serving => return Ok(EndpointReadiness::Serving),
+                EndpointReadiness::Listing => best = EndpointReadiness::Listing,
+                EndpointReadiness::Unreachable => {}
+            }
+        }
         let next_token = progress_token(best, &signals);
         if next_token != token {
             token = next_token;
             progress_at = Instant::now();
         }
-        match step(
-            model,
-            engine_name,
-            best,
-            &signals,
-            timing(started, progress_at),
-            policy,
-            on_view,
-        ) {
-            LoopStep::Continue => {}
-            LoopStep::Ready => return Ok(EndpointReadiness::Serving),
-            LoopStep::Budget(readiness) => return Ok(readiness),
-            LoopStep::Stop(stop) => return Err(stop),
-        }
-
-        match probe_service_http_readiness(engine_name, host, port, &probe_model, endpoint_api_key)
-        {
-            EndpointReadiness::Serving => return Ok(EndpointReadiness::Serving),
-            EndpointReadiness::Listing => best = EndpointReadiness::Listing,
-            EndpointReadiness::Unreachable => {}
-        }
-
-        let (_, signals) = observe();
-        let signals = adjusted_signals(signals, policy);
-        let next_token = progress_token(best, &signals);
-        if next_token != token {
-            token = next_token;
-            progress_at = Instant::now();
-        }
-        match step(
-            model,
-            engine_name,
-            best,
-            &signals,
-            timing(started, progress_at),
-            policy,
-            on_view,
-        ) {
-            LoopStep::Continue => {}
-            LoopStep::Ready => return Ok(EndpointReadiness::Serving),
-            LoopStep::Budget(readiness) => return Ok(readiness),
-            LoopStep::Stop(stop) => return Err(stop),
+        let timing = ServeStartupTiming {
+            elapsed: started.elapsed(),
+            since_progress: progress_at.elapsed(),
+        };
+        match decide_serve_startup(model, engine_name, best, &signals, timing, policy) {
+            ServeStartupDecision::Continue(view) => on_view(&view),
+            ServeStartupDecision::Ready => return Ok(EndpointReadiness::Serving),
+            ServeStartupDecision::BudgetElapsed(readiness) => return Ok(readiness),
+            ServeStartupDecision::Stop(stop) => return Err(stop),
         }
 
         let remaining = policy.bounds.deadline.saturating_sub(started.elapsed());
@@ -616,7 +631,11 @@ pub(crate) fn wait_for_serve_startup(
     }
 }
 
-const fn adjusted_signals(
+/// The signals the policy looks at.
+///
+/// The piped path ignores engine failure and process liveness so a serve that
+/// exits in CI still returns a readiness status.
+const fn effective_signals(
     mut signals: ServeStartupSignals,
     policy: &ServeStartupPolicy,
 ) -> ServeStartupSignals {
@@ -627,42 +646,136 @@ const fn adjusted_signals(
     signals
 }
 
-fn timing(started: Instant, progress_at: Instant) -> ServeStartupTiming {
-    ServeStartupTiming {
-        elapsed: started.elapsed(),
-        since_progress: progress_at.elapsed(),
-    }
-}
+const REDACTED: &str = "[redacted]";
 
-enum LoopStep {
-    Continue,
-    Ready,
-    Budget(EndpointReadiness),
-    Stop(ServeStartupStop),
-}
-
-fn step(
-    model: &str,
-    engine: &str,
-    readiness: EndpointReadiness,
-    signals: &ServeStartupSignals,
-    timing: ServeStartupTiming,
-    policy: &ServeStartupPolicy,
-    on_view: &mut dyn FnMut(&ServeStartupView),
-) -> LoopStep {
-    // `decide_serve_startup` applies `watch_engine` again. The signals here
-    // are already adjusted, and the policy still carries the flag, so a
-    // second pass is a no-op. Passing the policy through keeps the stall
-    // clocks on one struct.
-    match decide_serve_startup(model, engine, readiness, signals, timing, policy) {
-        ServeStartupDecision::Continue(view) => {
-            on_view(&view);
-            LoopStep::Continue
+/// Mask credentials in an engine log line before it reaches the status line
+/// or the failure text.
+///
+/// Engines echo their launch arguments (vLLM prints its non-default args),
+/// and those can carry the endpoint key or a hub token. The line is already
+/// one ASCII line with single spaces. Masked: the endpoint key wherever it
+/// appears, the value after a secret-named flag or key (`--api-key X`,
+/// `api_key=X`, `'api_key': 'X'`, `"api_key":"X"`, `Authorization: Bearer X`),
+/// and Hugging Face `hf_` tokens. A list value (`'api_key': ['a', 'b']`) has
+/// only its first item masked.
+pub(crate) fn redact_log_line(line: &str, endpoint_api_key: Option<&str>) -> String {
+    let line = match endpoint_api_key.filter(|key| !key.is_empty()) {
+        Some(key) => line.replace(key, REDACTED),
+        None => line.to_owned(),
+    };
+    let mut out: Vec<String> = Vec::new();
+    let mut mask_next = false;
+    for word in line.split(' ') {
+        if mask_next {
+            mask_next = false;
+            if word.eq_ignore_ascii_case("bearer") || word.eq_ignore_ascii_case("basic") {
+                out.push(word.to_owned());
+                mask_next = true;
+                continue;
+            }
+            out.push(mask_value(word));
+            continue;
         }
-        ServeStartupDecision::Ready => LoopStep::Ready,
-        ServeStartupDecision::BudgetElapsed(readiness) => LoopStep::Budget(readiness),
-        ServeStartupDecision::Stop(stop) => LoopStep::Stop(stop),
+        if let Some((name, value)) = word.split_once('=')
+            && is_secret_name(name)
+        {
+            out.push(if value.is_empty() {
+                format!("{name}=")
+            } else {
+                format!("{name}={}", mask_value(value))
+            });
+            continue;
+        }
+        // Compact JSON or YAML: `"api_key":"X"`.
+        if let Some((name, value)) = word.split_once(':')
+            && !value.is_empty()
+            && is_secret_name(name)
+        {
+            out.push(format!("{name}:{}", mask_compact_value(value)));
+            continue;
+        }
+        if names_a_following_secret(word) {
+            mask_next = true;
+            out.push(word.to_owned());
+            continue;
+        }
+        if looks_like_hf_token(word) {
+            out.push(REDACTED.to_owned());
+            continue;
+        }
+        out.push(word.to_owned());
     }
+    out.join(" ")
+}
+
+/// Whether `word` names a secret (`--api-key`, `HF_TOKEN`, `'api_key':`,
+/// `Authorization:`, `Bearer`).
+fn is_secret_name(word: &str) -> bool {
+    let name = word
+        .trim_start_matches('-')
+        .trim_matches(|c: char| matches!(c, '\'' | '"' | ':' | ',' | '{' | '('))
+        .to_ascii_lowercase()
+        .replace('-', "_");
+    if name.is_empty() {
+        return false;
+    }
+    name == "authorization"
+        || name == "bearer"
+        || ["api_key", "apikey", "token", "password", "secret"]
+            .iter()
+            .any(|suffix| name.ends_with(suffix))
+}
+
+/// A flag (`--api-key`), a key ending in `:` (`'api_key':`,
+/// `Authorization:`), or `Bearer`, whose next word is the secret. A bare word
+/// such as "token" in prose does not mask what follows it.
+fn names_a_following_secret(word: &str) -> bool {
+    if word.eq_ignore_ascii_case("bearer") {
+        return true;
+    }
+    let unquoted = word.trim_end_matches(['\'', '"', ',']);
+    (word.starts_with('-') || unquoted.ends_with(':')) && is_secret_name(word)
+}
+
+/// Keep the quoting and trailing punctuation around a masked value, so a
+/// Python-dict log line stays readable.
+fn mask_value(word: &str) -> String {
+    if word.contains(REDACTED) {
+        return word.to_owned();
+    }
+    let body_start = word
+        .find(|c: char| !matches!(c, '\'' | '"' | '(' | '['))
+        .unwrap_or(word.len());
+    let body_end = word
+        .rfind(|c: char| !matches!(c, '\'' | '"' | ',' | ')' | ']' | '}'))
+        .map_or(body_start, |index| index + 1);
+    if body_end <= body_start {
+        return word.to_owned();
+    }
+    format!("{}{REDACTED}{}", &word[..body_start], &word[body_end..])
+}
+
+/// Mask one compact value (`"X","port":8000}` or `X,port:8000}`) and keep
+/// what follows it, so the rest of a one-word JSON object stays readable.
+fn mask_compact_value(value: &str) -> String {
+    if let Some(quote) = value.chars().next().filter(|c| matches!(c, '"' | '\'')) {
+        let rest = &value[1..];
+        return match rest.find(quote) {
+            Some(end) if end > 0 => format!("{quote}{REDACTED}{}", &rest[end..]),
+            _ => value.to_owned(),
+        };
+    }
+    let end = value.find([',', '}', ']']).unwrap_or(value.len());
+    if end == 0 {
+        return value.to_owned();
+    }
+    format!("{REDACTED}{}", &value[end..])
+}
+
+fn looks_like_hf_token(word: &str) -> bool {
+    let body = word.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_');
+    body.strip_prefix("hf_")
+        .is_some_and(|rest| rest.len() >= 20 && rest.chars().all(|c| c.is_ascii_alphanumeric()))
 }
 
 #[cfg(test)]
@@ -1030,7 +1143,10 @@ mod tests {
     #[test]
     fn sanitize_log_line_keeps_the_latest_progress_segment_and_drops_ansi() {
         let raw = "\u{1b}[32mold line\rDownloading model.safetensors: 12%\u{1b}[0m";
-        assert_eq!(sanitize_log_line(raw), "Downloading model.safetensors: 12%");
+        assert_eq!(
+            sanitize_log_line(raw, None),
+            "Downloading model.safetensors: 12%"
+        );
     }
 
     #[test]
@@ -1041,7 +1157,7 @@ mod tests {
             "Loading safetensors checkpoint shards: 40%\n\n----------\n",
         )
         .unwrap();
-        let line = latest_meaningful_log_line(&path);
+        let line = latest_meaningful_log_line(&path, None);
         let _ = std::fs::remove_file(&path);
         assert_eq!(
             line.as_deref(),
@@ -1065,7 +1181,12 @@ mod tests {
             notes: Vec::new(),
         };
         let rendered = crate::serve_summary::render_summary(&summary);
-        assert!(rendered.contains(&hint), "{rendered}");
+        // The message names only the hint: the rendered summary can carry an
+        // endpoint key.
+        assert!(
+            rendered.contains(&hint),
+            "the deployment summary must name `{hint}`"
+        );
         let stop = assert_stop(decide_serve_startup(
             "qwen",
             "vllm",
@@ -1443,5 +1564,156 @@ mod tests {
             "a moving download must hit the deadline, not the stall limit"
         );
         assert!(step > 3);
+    }
+
+    #[test]
+    fn wait_observes_and_updates_the_status_line_once_per_poll() {
+        // Row: unreachable, refused port. One observe and one status-line
+        // update per poll, so the spinner does not tick twice per tick.
+        let poll = Duration::from_millis(20);
+        let deadline = Duration::from_millis(400);
+        let mut policy = short_policy(deadline, Duration::from_secs(30));
+        policy.poll = poll;
+        let mut observes = 0_u32;
+        let mut views = 0_u32;
+        let result = wait_for_serve_startup(
+            "vllm",
+            "qwen",
+            "127.0.0.1",
+            refused_port(),
+            None,
+            &policy,
+            &mut || {
+                observes += 1;
+                ("qwen".to_owned(), alive())
+            },
+            &mut |_| views += 1,
+        );
+        let stop = result.expect_err("nothing answers, so the deadline ends the wait");
+        assert_eq!(stop.reason, ServeStartupStopReason::Deadline);
+        // The last observe ends in the stop, which draws no frame.
+        assert_eq!(views + 1, observes, "one frame per observed poll");
+        let polls = u32::try_from(deadline.as_millis() / poll.as_millis()).unwrap();
+        assert!(
+            observes <= polls + 2,
+            "{observes} observes in {polls} polls: the engine is sampled more than once per poll"
+        );
+    }
+
+    #[test]
+    fn redact_log_line_masks_keys_tokens_and_secret_flags() {
+        let key = "sk-endpoint-0123456789";
+        for (raw, expected) in [
+            (
+                "non-default args: {'model': 'qwen', 'api_key': 'sk-endpoint-0123456789', 'port': 8000}",
+                "non-default args: {'model': 'qwen', 'api_key': '[redacted]', 'port': 8000}",
+            ),
+            (
+                "launch --api-key abc123 --port 8000",
+                "launch --api-key [redacted] --port 8000",
+            ),
+            (
+                "env HF_TOKEN=hf_abcdefghijklmnopqrstuvwx set",
+                "env HF_TOKEN=[redacted] set",
+            ),
+            (
+                "using hf_abcdefghijklmnopqrstuvwx for the hub",
+                "using [redacted] for the hub",
+            ),
+            (
+                "header Authorization: Bearer abc.def.ghi sent",
+                "header Authorization: Bearer [redacted] sent",
+            ),
+            (
+                r#"config {"api_key":"abc123","port":8000}"#,
+                r#"config {"api_key":"[redacted]","port":8000}"#,
+            ),
+            (
+                "header Authorization: Basic dXNlcjpwYXNz sent",
+                "header Authorization: Basic [redacted] sent",
+            ),
+            (
+                "serving with key sk-endpoint-0123456789 on 0.0.0.0",
+                "serving with key [redacted] on 0.0.0.0",
+            ),
+        ] {
+            assert_eq!(redact_log_line(raw, Some(key)), expected, "{raw}");
+        }
+        // Ordinary progress lines, including prose about tokens, are untouched.
+        for line in [
+            "Loading safetensors checkpoint shards: 40%",
+            "Downloading tokenizer.json: 100%",
+            "the token budget is 8192 tokens",
+            "max_num_batched_tokens=8192",
+        ] {
+            assert_eq!(redact_log_line(line, Some(key)), line);
+        }
+    }
+
+    #[test]
+    fn a_secret_in_the_engine_log_never_reaches_the_status_line_or_the_failure() {
+        let key = "sk-endpoint-0123456789";
+        let mut labels = Vec::new();
+        let mut samples = 0_u32;
+        let result = wait_for_serve_startup(
+            "vllm",
+            "qwen",
+            "127.0.0.1",
+            refused_port(),
+            Some(key),
+            &short_policy(Duration::from_secs(5), Duration::from_secs(30)),
+            &mut || {
+                // A live sample first, so the status line draws the line,
+                // then the failure that ends the wait.
+                samples += 1;
+                (
+                    "qwen".to_owned(),
+                    ServeStartupSignals {
+                        engine_failed: samples > 1,
+                        process_alive: true,
+                        log_line: Some(format!(
+                            "error: bad args --api-key {key} --hf-token hf_abcdefghijklmnopqrstuvwx"
+                        )),
+                    },
+                )
+            },
+            &mut |view| labels.push(view.label.clone()),
+        );
+        let stop = result.expect_err("a failed engine ends the wait");
+        let message = stop.user_message("qwen", "vllm", "svc-1");
+        for text in [&stop.label, &message] {
+            assert!(
+                !text.contains(key),
+                "endpoint key leaked: {}",
+                text.replace(key, "<KEY>")
+            );
+            assert!(
+                !text.contains("hf_abcdefghijklmnopqrstuvwx"),
+                "hub token leaked"
+            );
+        }
+        assert!(
+            message.contains("--api-key [redacted]"),
+            "the line is still quoted, masked"
+        );
+        assert!(!labels.is_empty(), "the live sample drew a status line");
+        for label in &labels {
+            assert!(!label.contains(key), "endpoint key on the status line");
+            assert!(label.contains("--api-key [redacted]"), "{label}");
+        }
+    }
+
+    #[test]
+    fn a_key_cut_at_the_length_limit_is_masked_before_truncation() {
+        let key = "sk-endpoint-0123456789abcdef";
+        // Put the key across the MAX_LABEL_CHARS boundary.
+        let pad = "x".repeat(MAX_LABEL_CHARS - 25);
+        let raw = format!("args {pad} {key} trailing words");
+        let line = sanitize_log_line(&raw, Some(key));
+        assert!(
+            !line.contains("sk-endpoint"),
+            "key prefix survived truncation: {line}"
+        );
+        assert!(line.chars().count() <= MAX_LABEL_CHARS);
     }
 }
