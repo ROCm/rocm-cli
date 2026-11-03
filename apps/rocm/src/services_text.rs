@@ -1383,9 +1383,12 @@ mod tests {
     use crate::providers;
     use crate::runtime_services;
     use crate::runtimes_cmd::tests::activate_old_runtime;
+    // Only the Unix-gated reconciliation test below builds a pre-spawn record.
+    #[cfg(not(windows))]
+    use crate::service_launch::tests::pre_spawn_record;
     use crate::service_launch::tests::{
-        exit_status_from_code, manifest_on_disk, pre_spawn_record, spawn_must_not_be_reached,
-        spawn_that_fails, stand_in_child_pid, stand_in_spawn, stand_in_spawn_observed,
+        exit_status_from_code, manifest_on_disk, spawn_must_not_be_reached, spawn_that_fails,
+        stand_in_child_pid, stand_in_spawn, stand_in_spawn_observed,
     };
     use crate::service_launch::{ManagedEngineStartupCheck, SpawnedManagedEngine};
     use crate::tests::{
