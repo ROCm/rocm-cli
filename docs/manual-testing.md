@@ -365,6 +365,7 @@ rocm services
 rocm services list --all
 rocm services logs <service-id>
 rocm services logs <service-id> --follow
+rocm serve <model> --wait   # from another terminal: returns once the server answers
 ```
 
 Expected result:

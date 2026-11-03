@@ -842,7 +842,7 @@ rocm serve <model> [--engine lemonade|vllm|aim]
                    [--gpu auto|<index>]
                    [--runtime-id KEY | --env-id ID]
                    [--host HOST] [--port PORT]
-                   [--verbose] [--foreground | --managed]
+                   [--verbose] [--foreground | --managed | --wait]
                    [--no-smoke-test]
                    [--allow-public-bind] [--require-api-key] [--api-key KEY]
                    [--temperature TEMP] [--top-p PROB] [--max-tokens N]
@@ -908,6 +908,11 @@ can:
 - Press **Ctrl-C** to stop the server instead.
 
 `--managed` is the explicit form of the default background behavior.
+`--wait` keeps `rocm serve` waiting until the server answers requests, however
+long a first-time model download takes, instead of returning `starting` after 45
+seconds; it returns early, reporting the last status, if the server exits. It
+cannot be combined with `--foreground` or `--verbose`. Watch the download with
+`rocm logs --service <id> --follow` from another terminal.
 `--no-smoke-test` skips the post-startup inference probe.
 
 Which model form to pass depends on the engine your GPU selects. The Lemonade

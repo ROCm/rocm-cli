@@ -628,7 +628,6 @@ Feature: Model serving
     And the CLI says the image needs eight GPUs and multi-GPU serving is not supported
     And Docker was never called
 
-
   # ROCMAI-827: `rocm serve` started the background automation helper
   # (`rocm daemon`) on every launch, even with every automation watcher off —
   # when it has nothing to do — and that helper outlived the service. With no
@@ -640,3 +639,13 @@ Feature: Model serving
     Given a managed runtime is active
     When the user serves a GGUF model on lemonade with no automation enabled
     Then serving started no background helper
+
+  # `--wait` makes a managed serve wait for readiness past the usual 45 seconds,
+  # so it cannot be combined with the attached modes, which already stay on the
+  # terminal. The waiting itself (a live server that becomes ready, one that
+  # exits first) is covered by `wait_past_readiness_budget_*` in
+  # `apps/rocm/src/service_launch.rs`, since a scenario would need a slow engine.
+  @id:serve-wait-conflicts-with-attached-modes
+  Scenario: serve-41 - Waiting for readiness cannot be combined with attached mode
+    When the user serves a model with both --wait and --verbose
+    Then the CLI refuses and names the conflicting flags

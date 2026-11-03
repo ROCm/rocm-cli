@@ -583,6 +583,12 @@ rocm serve qwen --verbose --device gpu_required")]
         /// Keep the server managed by ROCm CLI.
         #[arg(long)]
         managed: bool,
+        /// Keep waiting until the server answers requests, however long a first-time
+        /// model download takes, instead of returning `starting` after 45 seconds.
+        /// Returns early if the server exits. Cannot be combined with --foreground
+        /// or --verbose, which already stay attached.
+        #[arg(long, conflicts_with_all = ["foreground", "verbose"])]
+        wait: bool,
         /// Stream every engine log line in this terminal instead of a deployment summary.
         #[arg(long, conflicts_with = "managed")]
         verbose: bool,
@@ -2130,6 +2136,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             port,
             foreground,
             managed,
+            wait,
             verbose,
             no_smoke_test,
             allow_public_bind,
@@ -2152,6 +2159,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             port,
             foreground,
             managed,
+            wait,
             verbose,
             no_smoke_test,
             allow_public_bind,
@@ -3528,6 +3536,22 @@ pub(crate) mod tests {
         let mut argv = vec!["rocm", "serve", "qwen"];
         argv.extend_from_slice(args);
         Cli::try_parse_from(argv)
+    }
+
+    #[test]
+    fn serve_wait_parses_and_conflicts_with_attached_modes() {
+        let cli = parse_serve(&["--wait"]).expect("--wait parses");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Serve { wait: true, .. })
+        ));
+        let cli = parse_serve(&[]).expect("default parses");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Serve { wait: false, .. })
+        ));
+        assert!(parse_serve(&["--wait", "--verbose"]).is_err());
+        assert!(parse_serve(&["--wait", "--foreground"]).is_err());
     }
 
     #[test]

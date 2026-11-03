@@ -672,6 +672,25 @@ fn spawn_managed_engine_child(
     })
 }
 
+/// How long one readiness wait polls before `rocm serve` reports `starting`.
+const READINESS_WAIT: Duration = Duration::from_secs(45);
+
+/// `rocm serve --wait`: keep waiting past [`READINESS_WAIT`] (a first start
+/// downloads the model, which can take far longer) until the server answers or
+/// stops being live. A server that exited ends the wait with the last reading
+/// instead of blocking forever.
+fn wait_past_readiness_budget(
+    mut probe: impl FnMut() -> EndpointReadiness,
+    mut still_live: impl FnMut() -> bool,
+) -> EndpointReadiness {
+    loop {
+        let readiness = probe();
+        if readiness == EndpointReadiness::Serving || !still_live() {
+            return readiness;
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn start_managed_service(
     engine: &str,
@@ -689,6 +708,7 @@ pub(crate) fn start_managed_service(
     launch_lock: rocm_core::FileLock,
     require_api_key: bool,
     gpu_refusal_waived_for_reuse: bool,
+    wait_until_ready: bool,
     on_wait_tick: &mut dyn FnMut(Duration),
 ) -> Result<ManagedLaunchReport> {
     let paths = AppPaths::discover()?;
@@ -720,19 +740,33 @@ pub(crate) fn start_managed_service(
     #[cfg(windows)]
     thread::sleep(Duration::from_millis(200));
 
-    let readiness = wait_for_service_http_ready_with_progress(
-        engine,
-        host,
-        port,
-        &|| {
-            let mut latest = record.clone();
-            let _ = latest.refresh_from_engine_state();
-            latest.served_model_name().to_owned()
-        },
-        endpoint_api_key,
-        Duration::from_secs(45),
-        on_wait_tick,
-    );
+    let probe = |on_tick: &mut dyn FnMut(Duration)| {
+        wait_for_service_http_ready_with_progress(
+            engine,
+            host,
+            port,
+            &|| {
+                let mut latest = record.clone();
+                let _ = latest.refresh_from_engine_state();
+                latest.served_model_name().to_owned()
+            },
+            endpoint_api_key,
+            READINESS_WAIT,
+            on_tick,
+        )
+    };
+    let readiness = if wait_until_ready {
+        wait_past_readiness_budget(
+            || probe(&mut *on_wait_tick),
+            || {
+                let mut latest = record.clone();
+                let _ = latest.refresh_from_engine_state();
+                crate::managed_service_status::managed_service_is_live(&latest)
+            },
+        )
+    } else {
+        probe(on_wait_tick)
+    };
     let launch_status = status_for_readiness(readiness);
     record.status = launch_status.to_owned();
     if readiness == EndpointReadiness::Serving {
@@ -1417,6 +1451,49 @@ fn stream_attached_logs_no_tty(log_path: &Path, child_pid: u32) -> Result<Attach
 mod tests {
     use super::*;
     use crate::tests::test_paths;
+
+    #[test]
+    fn wait_past_readiness_budget_keeps_probing_a_live_starting_server() {
+        let mut readings = vec![
+            EndpointReadiness::Unreachable,
+            EndpointReadiness::Unreachable,
+            EndpointReadiness::Serving,
+        ]
+        .into_iter();
+        let mut probes = 0;
+        let result = wait_past_readiness_budget(
+            || {
+                probes += 1;
+                readings.next().expect("no probe after Serving")
+            },
+            || true,
+        );
+        assert_eq!(result, EndpointReadiness::Serving);
+        assert_eq!(probes, 3, "must outlast the first (45s) budget");
+    }
+
+    #[test]
+    fn wait_past_readiness_budget_stops_when_the_server_exits() {
+        let mut probes = 0;
+        let result = wait_past_readiness_budget(
+            || {
+                probes += 1;
+                EndpointReadiness::Unreachable
+            },
+            || false,
+        );
+        assert_eq!(result, EndpointReadiness::Unreachable);
+        assert_eq!(probes, 1);
+    }
+
+    #[test]
+    fn wait_past_readiness_budget_returns_at_once_when_already_serving() {
+        let result = wait_past_readiness_budget(
+            || EndpointReadiness::Serving,
+            || panic!("liveness is irrelevant once serving"),
+        );
+        assert_eq!(result, EndpointReadiness::Serving);
+    }
 
     #[test]
     fn serve_bind_validation_requires_public_ack() {

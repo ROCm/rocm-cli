@@ -880,6 +880,7 @@ pub(crate) struct ServeArgs {
     pub(crate) port: u16,
     pub(crate) foreground: bool,
     pub(crate) managed: bool,
+    pub(crate) wait: bool,
     pub(crate) verbose: bool,
     pub(crate) no_smoke_test: bool,
     pub(crate) allow_public_bind: bool,
@@ -905,6 +906,7 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
         port,
         foreground,
         managed,
+        wait,
         verbose,
         no_smoke_test,
         allow_public_bind,
@@ -1500,6 +1502,7 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
             launch_lock,
             require_api_key,
             gpu_refusal_waived_for_reuse,
+            wait,
             &mut |_elapsed| spinner.tick(),
         )?;
         ensure_background_helper_running_quiet(summary_mode)?;

@@ -2599,3 +2599,26 @@ async fn assert_stop_hint_clears_the_service(world: &mut E2eWorld) {
         "the on-disk record must persist the stop, got:\n{record}"
     );
 }
+
+#[when("the user serves a model with both --wait and --verbose")]
+async fn serve_wait_and_verbose(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["serve", "qwen", "--wait", "--verbose"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the CLI refuses and names the conflicting flags")]
+async fn serve_wait_refused(world: &mut E2eWorld) {
+    let rc = world.cli_rc.expect("no command rc recorded");
+    let text = format!(
+        "{}\n{}",
+        world.cli_output.as_deref().unwrap_or(""),
+        world.cli_stderr.as_deref().unwrap_or("")
+    );
+    assert!(rc != 0, "expected refusal, got rc=0:\n{text}");
+    assert!(
+        text.contains("--wait") && text.contains("--verbose"),
+        "expected both flags named, got:\n{text}"
+    );
+}

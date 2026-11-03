@@ -1009,6 +1009,11 @@ rocm logs --service <service-id>
 rocm logs --service <service-id> --follow   # Ctrl-C to stop following
 ```
 
+While a first-time model download is running, `rocm serve <model> --wait` keeps
+waiting past the usual 45 seconds until the server answers (or exits), and
+`--wait` with `--verbose` or `--foreground` is refused (`serve-41`). Run the
+log follow above from a second terminal to watch the download.
+
 The no-log first-run path should report `no CLI logs found yet` without
 creating the configured `data/logs` directory.
 
@@ -1606,7 +1611,7 @@ all four combinations, `stop_output_carries_the_helper_note_...` and
 bad config from failing a `serve` after its launch. The user-visible side is `automations-11` in
 [automations.feature](../tests/e2e-cucumber/features/automations.feature)
 (mock lane: enable starts a live helper, disabling the last watcher makes it
-exit) and `serve-40` in
+exit) and `serve-41` in
 [model_serving.feature](../tests/e2e-cucumber/features/model_serving.feature)
 (GPU lane: serving with no watcher enabled starts no helper).
 
