@@ -22,7 +22,7 @@ use axum::body::{Body, Bytes};
 use axum::extract::{DefaultBodyLimit, Path, Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
 use axum::middleware::{self, Next};
-use axum::response::{Html, IntoResponse, Redirect, Response};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{any, get};
 use rocm_core::{AppPaths, DEFAULT_LOCAL_HOST, ManagedServiceRecord};
 use serde_json::{Value, json};
@@ -52,6 +52,11 @@ const FORWARD_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// The OpenAPI security scheme name used for servers started with an endpoint
 /// key; Swagger UI's "Authorize" box fills it in.
 const ENDPOINT_KEY_SCHEME: &str = "endpoint_key";
+
+/// How long a stopping docs server lets in-flight requests finish. A try-it
+/// answer may stream for minutes and the forwarder sets no overall timeout, so
+/// without this bound an open stream would hold up the daemon's shutdown.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
 /// A running docs server. It runs on a thread and runtime of its own: the
 /// daemon's loop runs watcher checks synchronously on its single-threaded
@@ -104,12 +109,7 @@ pub(crate) fn start_api_docs_server(paths: AppPaths, port: u16) -> Result<ApiDoc
         .spawn(move || {
             runtime.block_on(async move {
                 let served = match TcpListener::from_std(listener) {
-                    Ok(listener) => axum::serve(listener, app)
-                        .with_graceful_shutdown(async {
-                            let _ = shutdown_received.await;
-                        })
-                        .await
-                        .map_err(anyhow::Error::from),
+                    Ok(listener) => serve_until_stopped(listener, app, shutdown_received).await,
                     Err(error) => Err(error.into()),
                 };
                 if let Err(error) = served {
@@ -123,6 +123,28 @@ pub(crate) fn start_api_docs_server(paths: AppPaths, port: u16) -> Result<ApiDoc
         shutdown,
         thread,
     })
+}
+
+/// Serve until `shutdown` fires, then give in-flight requests
+/// [`SHUTDOWN_GRACE`] to finish before dropping them.
+async fn serve_until_stopped(
+    listener: TcpListener,
+    app: Router,
+    shutdown: tokio::sync::oneshot::Receiver<()>,
+) -> Result<()> {
+    let stopping = Arc::new(tokio::sync::Notify::new());
+    let stop_signal = Arc::clone(&stopping);
+    let serve = axum::serve(listener, app).with_graceful_shutdown(async move {
+        let _ = shutdown.await;
+        stop_signal.notify_one();
+    });
+    tokio::select! {
+        served = serve => served.map_err(anyhow::Error::from),
+        () = async {
+            stopping.notified().await;
+            tokio::time::sleep(SHUTDOWN_GRACE).await;
+        } => Ok(()),
+    }
 }
 
 /// The client the forwarder sends try-it requests with.
@@ -204,30 +226,41 @@ async fn health() -> impl IntoResponse {
     axum::Json(json!({ "status": "ok", "source": "api_docs", "bind": "loopback_only" }))
 }
 
-/// Every server the record says is up. Errors reading the records read as "no
-/// servers": the docs page must never take the daemon down.
-fn running_services(paths: &AppPaths) -> Vec<ManagedServiceRecord> {
-    crate::persistence::load_managed_services(paths)
-        .unwrap_or_default()
+/// Every server the record says is up. A failure to read the records is
+/// logged and returned, so a page can say the records could not be read
+/// rather than claim that nothing is running.
+fn running_services(paths: &AppPaths) -> Result<Vec<ManagedServiceRecord>> {
+    let records = crate::persistence::load_managed_services(paths).inspect_err(|error| {
+        eprintln!("API docs could not read the service records: {error:#}");
+    })?;
+    Ok(records
         .into_iter()
-        .filter(service_is_running)
-        .collect()
-}
-
-fn service_is_running(record: &ManagedServiceRecord) -> bool {
-    matches!(
-        record.status.as_str(),
-        "starting" | "running" | "recovering" | "ready"
-    )
+        .filter(ManagedServiceRecord::is_live)
+        .collect())
 }
 
 /// The running server with this id. Looked up by matching the id against the
 /// records rather than by building a path from it, so a crafted id cannot
 /// reach outside the services folder.
-fn find_running_service(paths: &AppPaths, service_id: &str) -> Option<ManagedServiceRecord> {
-    running_services(paths)
+fn find_running_service(
+    paths: &AppPaths,
+    service_id: &str,
+) -> Result<Option<ManagedServiceRecord>> {
+    Ok(running_services(paths)?
         .into_iter()
-        .find(|record| record.service_id == service_id)
+        .find(|record| record.service_id == service_id))
+}
+
+/// The answer for a server lookup that could not read the records: 503, since
+/// the server may well be running.
+fn records_unreadable(error: &anyhow::Error) -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        axum::Json(json!({
+            "error": format!("could not read the service records: {error:#}"),
+        })),
+    )
+        .into_response()
 }
 
 fn not_running_page(service_id: &str) -> Response {
@@ -244,8 +277,11 @@ fn not_running_page(service_id: &str) -> Response {
         .into_response()
 }
 
-async fn index_page(State(state): State<DocsState>) -> Html<String> {
-    let services = running_services(&state.paths);
+async fn index_page(State(state): State<DocsState>) -> Response {
+    let services = match running_services(&state.paths) {
+        Ok(services) => services,
+        Err(error) => return records_unreadable(&error),
+    };
     let mut rows = String::new();
     for record in &services {
         let id = html_escape(&record.service_id);
@@ -266,6 +302,7 @@ async fn index_page(State(state): State<DocsState>) -> Html<String> {
         "<!doctype html><html><head><meta charset=\"utf-8\"><title>ROCm CLI API docs</title></head>\
          <body><h1>Running model servers</h1>{body}</body></html>"
     ))
+    .into_response()
 }
 
 async fn service_openapi_json(
@@ -273,8 +310,9 @@ async fn service_openapi_json(
     Path(service_id): Path<String>,
 ) -> Response {
     match find_running_service(&state.paths, &service_id) {
-        Some(record) => axum::Json(service_openapi(&record)).into_response(),
-        None => (
+        Ok(Some(record)) => axum::Json(service_openapi(&record)).into_response(),
+        Err(error) => records_unreadable(&error),
+        Ok(None) => (
             StatusCode::NOT_FOUND,
             axum::Json(json!({
                 "error": format!("server {service_id} is not running"),
@@ -284,8 +322,26 @@ async fn service_openapi_json(
     }
 }
 
-async fn docs_redirect(Path(service_id): Path<String>) -> Redirect {
-    Redirect::permanent(&format!("/services/{service_id}/docs/"))
+/// `/services/<id>/docs` to the page itself, whose assets load relative to
+/// the trailing slash. Only a running server's id is redirected: the id comes
+/// percent-decoded from the request, and one that is not a running server's
+/// (a newline in it, say) would make an invalid `Location`. The redirect is
+/// temporary, since the server it names can stop.
+async fn docs_redirect(State(state): State<DocsState>, Path(service_id): Path<String>) -> Response {
+    match find_running_service(&state.paths, &service_id) {
+        Ok(Some(record)) => {
+            match HeaderValue::try_from(format!("/services/{}/docs/", record.service_id)) {
+                Ok(location) => (
+                    StatusCode::TEMPORARY_REDIRECT,
+                    [(header::LOCATION, location)],
+                )
+                    .into_response(),
+                Err(_) => not_running_page(&service_id),
+            }
+        }
+        Ok(None) => not_running_page(&service_id),
+        Err(error) => records_unreadable(&error),
+    }
 }
 
 async fn docs_index(State(state): State<DocsState>, Path(service_id): Path<String>) -> Response {
@@ -300,15 +356,18 @@ async fn docs_file(
 }
 
 fn serve_swagger_file(state: &DocsState, service_id: &str, file: &str) -> Response {
-    if find_running_service(&state.paths, service_id).is_none() {
-        return not_running_page(service_id);
+    match find_running_service(&state.paths, service_id) {
+        Ok(Some(_)) => {}
+        Ok(None) => return not_running_page(service_id),
+        Err(error) => return records_unreadable(&error),
     }
     let config = Arc::new(
         utoipa_swagger_ui::Config::new([format!("/services/{service_id}/openapi.json")])
+            .try_it_out_enabled(true)
             // The endpoint key typed into "Authorize" lasts until the page is
             // closed; it is not saved in the browser, where it would outlive
             // the server it belongs to.
-            .try_it_out_enabled(true),
+            .persist_authorization(false),
     );
     match utoipa_swagger_ui::serve(file, config) {
         Ok(Some(swagger_file)) => (
@@ -330,12 +389,16 @@ async fn forward(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let Some(record) = find_running_service(&state.paths, &service_id) else {
-        return (
-            StatusCode::NOT_FOUND,
-            axum::Json(json!({ "error": format!("server {service_id} is not running") })),
-        )
-            .into_response();
+    let record = match find_running_service(&state.paths, &service_id) {
+        Ok(Some(record)) => record,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                axum::Json(json!({ "error": format!("server {service_id} is not running") })),
+            )
+                .into_response();
+        }
+        Err(error) => return records_unreadable(&error),
     };
     // The path exactly as the browser sent it. The extracted one is
     // percent-decoded: an encoded `?` or `/` in it would turn into a query or
@@ -363,11 +426,22 @@ async fn forward(
             let content_type = answer.headers().get(header::CONTENT_TYPE).cloned();
             let mut response = Response::new(Body::from_stream(answer.bytes_stream()));
             *response.status_mut() = status;
+            let headers = response.headers_mut();
             if let Some(content_type) = content_type {
-                response
-                    .headers_mut()
-                    .insert(header::CONTENT_TYPE, content_type);
+                headers.insert(header::CONTENT_TYPE, content_type);
             }
+            // The answer comes from the model server but is served from the
+            // docs' origin. A page in it (llama.cpp's own UI, say) must not
+            // run there: it is shown as data, never as a document of this
+            // origin.
+            headers.insert(
+                header::X_CONTENT_TYPE_OPTIONS,
+                HeaderValue::from_static("nosniff"),
+            );
+            headers.insert(
+                header::CONTENT_SECURITY_POLICY,
+                HeaderValue::from_static("sandbox"),
+            );
             response
         }
         Err(error) => (
@@ -889,6 +963,10 @@ mod tests {
             initializer.contains("/services/svc-live/openapi.json"),
             "Swagger UI must load this server's description: {initializer}"
         );
+        assert!(
+            initializer.contains("\"persistAuthorization\": false"),
+            "the endpoint key must not be saved in the browser: {initializer}"
+        );
 
         let openapi: Value = client
             .get(format!("{base}/services/svc-live/openapi.json"))
@@ -1072,6 +1150,192 @@ mod tests {
                 .contains("could not reach server svc-dead")
         );
         server.stop();
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    fn no_redirect_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn docs_redirect_only_names_a_running_server() -> Result<()> {
+        let (root, paths) = temp_app_paths("api-docs-redirect");
+        paths.ensure()?;
+        fs::create_dir_all(paths.services_dir())?;
+        record(&paths, "svc-live", "vllm", 9).write()?;
+        let server = start_api_docs_server(paths.clone(), 0)?;
+        let base = server.base_url.clone();
+        let client = no_redirect_client();
+
+        let redirect = client
+            .get(format!("{base}/services/svc-live/docs"))
+            .send()
+            .await?;
+        assert_eq!(redirect.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            redirect.headers()[header::LOCATION],
+            "/services/svc-live/docs/"
+        );
+
+        // A decoded newline would make an invalid `Location` (axum then
+        // answers 500); a page the user visits can send this request, and it
+        // gets a 404 naming no server instead.
+        for crafted in ["%0A", "svc-live%0D%0AX-Injected:%201", "not-running"] {
+            let response = client
+                .get(format!("{base}/services/{crafted}/docs"))
+                .send()
+                .await?;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{crafted}");
+            assert!(response.headers().get(header::LOCATION).is_none());
+        }
+
+        server.stop();
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unreadable_records_are_reported_not_shown_as_no_servers() -> Result<()> {
+        let (root, paths) = temp_app_paths("api-docs-unreadable");
+        paths.ensure()?;
+        fs::create_dir_all(paths.services_dir())?;
+        record(&paths, "svc-live", "vllm", 9).write()?;
+        // A `.json` entry that cannot be read as a file fails the whole load.
+        fs::create_dir_all(paths.services_dir().join("broken.json"))?;
+        let server = start_api_docs_server(paths.clone(), 0)?;
+        let base = server.base_url.clone();
+        let client = no_redirect_client();
+
+        for path in [
+            "/",
+            "/services/svc-live/docs",
+            "/services/svc-live/docs/",
+            "/services/svc-live/openapi.json",
+            "/services/svc-live/api/v1/models",
+        ] {
+            let response = client.get(format!("{base}{path}")).send().await?;
+            assert_eq!(
+                response.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{path}: the server may be running; the records just could not be read"
+            );
+            assert!(
+                response
+                    .text()
+                    .await?
+                    .contains("could not read the service records"),
+                "{path}"
+            );
+        }
+
+        server.stop();
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn forwarded_answers_cannot_run_as_pages_of_the_docs_origin() -> Result<()> {
+        let (root, paths) = temp_app_paths("api-docs-forward-headers");
+        paths.ensure()?;
+        fs::create_dir_all(paths.services_dir())?;
+        let model_port = start_echo_model_server().await;
+        record(&paths, "svc-live", "vllm", model_port).write()?;
+        let server = start_api_docs_server(paths.clone(), 0)?;
+
+        let response = test_client()
+            .post(format!(
+                "{}/services/svc-live/api/v1/chat/completions",
+                server.base_url
+            ))
+            .body("{}")
+            .send()
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::X_CONTENT_TYPE_OPTIONS],
+            "nosniff"
+        );
+        assert_eq!(
+            response.headers()[header::CONTENT_SECURITY_POLICY],
+            "sandbox"
+        );
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "application/json",
+            "the server's own content type is kept"
+        );
+
+        server.stop();
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    /// A model server that answers with the start of a stream and then never
+    /// finishes it, like a long completion.
+    fn start_endless_stream_server() -> u16 {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind((DEFAULT_LOCAL_HOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().map_while(std::result::Result::ok) {
+                std::thread::spawn(move || {
+                    let mut request = [0_u8; 4096];
+                    let _ = stream.read(&mut request);
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                          Transfer-Encoding: chunked\r\n\r\n5\r\ndata:\r\n",
+                    );
+                    let _ = stream.flush();
+                    // Hold the stream open, unfinished, until the peer goes.
+                    while matches!(stream.read(&mut request), Ok(read) if read > 0) {}
+                });
+            }
+        });
+        port
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stopping_does_not_wait_for_an_open_try_it_stream() -> Result<()> {
+        let (root, paths) = temp_app_paths("api-docs-stop-stream");
+        paths.ensure()?;
+        fs::create_dir_all(paths.services_dir())?;
+        let model_port = start_endless_stream_server();
+        record(&paths, "svc-live", "vllm", model_port).write()?;
+        let server = start_api_docs_server(paths.clone(), 0)?;
+
+        let mut response = test_client()
+            .post(format!(
+                "{}/services/svc-live/api/v1/chat/completions",
+                server.base_url
+            ))
+            .body("{}")
+            .send()
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.chunk().await?.is_some(), "the stream has started");
+
+        // On a thread of its own, not `spawn_blocking`: a `stop()` that hangs
+        // must fail this test, not park a blocking-pool thread the test
+        // runtime then waits for when it shuts down.
+        let started = std::time::Instant::now();
+        let (stopped, stop_finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            server.stop();
+            let _ = stopped.send(());
+        });
+        assert!(
+            stop_finished
+                .recv_timeout(SHUTDOWN_GRACE + Duration::from_secs(10))
+                .is_ok(),
+            "stop() waited on the open stream for {:?}",
+            started.elapsed()
+        );
+        drop(response);
         fs::remove_dir_all(root).ok();
         Ok(())
     }

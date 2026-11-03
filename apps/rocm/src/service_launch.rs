@@ -1102,12 +1102,16 @@ pub(crate) fn run_attached_service(
     let endpoint = format!("{}/v1", format_http_base_url(host, port));
     println!("  service_id: {service_id}");
     println!("  endpoint: {endpoint}");
+    // A helper that was just started gets a few seconds to bring its docs
+    // up; the spinner (on a terminal only) shows that wait is not a hang.
+    let mut docs_wait = crate::cli_progress::Spinner::new("Waiting for the API docs...");
     let docs_link = crate::api_docs_link::service_docs_link(
         &paths,
         &service_id,
         crate::api_docs_link::serve_docs_wait(helper_starting),
-        &mut || {},
+        &mut || docs_wait.tick(),
     );
+    docs_wait.clear();
     if let Some(link) = docs_link.as_deref() {
         println!("  docs: {link}");
     }

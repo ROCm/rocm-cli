@@ -753,6 +753,22 @@ mod tests {
     use super::*;
     use crate::test_support::temp_app_paths;
 
+    #[test]
+    fn api_docs_are_served_only_when_on_and_on_a_nameable_port() {
+        let docs = |enabled, port| ApiDocsConfig { enabled, port };
+        assert_eq!(docs(true, 11_430).served_port(), Some(11_430));
+        assert_eq!(docs(false, 11_430).served_port(), None, "turned off");
+        assert_eq!(
+            docs(true, 0).served_port(),
+            None,
+            "port 0 binds a random port no link could name"
+        );
+        assert_eq!(
+            ApiDocsConfig::default().served_port(),
+            Some(DEFAULT_API_DOCS_PORT)
+        );
+    }
+
     // The socket-path precedence is mirrored in `rocm-dash-core`; these tests
     // mirror the ones there so a divergence in either crate is caught.
 

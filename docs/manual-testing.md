@@ -705,6 +705,12 @@ Expected result:
 
 - The deployment summary has a `docs` row under `endpoint`, and `rocm services
   list` shows the same `docs:` link for that server.
+- Running `rocm serve <model> | cat` again while that server runs prints a
+  `docs:` line under "managed service already running".
+- After `rocm services stop <service-id> --yes`, `rocm serve <model> --verbose`
+  prints a `docs:` line after `endpoint:`, and again in the "detached - server
+  still running" block after Ctrl-D. When no helper was running before that
+  serve, a spinner shows the wait while the helper brings its docs up.
 - Opening the link in a browser shows the server's routes. Under
   `POST /v1/chat/completions`, "Try it out" then "Execute" returns a chat
   completion from the served model; the example body already names that model.

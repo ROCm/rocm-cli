@@ -103,6 +103,71 @@ fn docs_link_in_serve_output(stdout: &str) -> Option<String> {
     })
 }
 
+/// What the helper and its docs looked like when `rocm serve` printed no docs
+/// link, gathered after the fact: the configured docs port, the helper's own
+/// state and recent events (it records `api_docs_unavailable` when its docs
+/// could not start), what the docs port answers now, and the services list.
+/// The helper started by `rocm serve` discards its output, so this is the
+/// only record of why the link was missing.
+async fn missing_docs_link_evidence(world: &E2eWorld, stdout: &str) -> String {
+    let paths = world.app_paths();
+    let read = |path: std::path::PathBuf| {
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| format!("<cannot read {}: {error}>", path.display()))
+    };
+    let config: Value = serde_json::from_str(&read(paths.config_path())).unwrap_or(Value::Null);
+    let docs_port = config["api_docs"]["port"].as_u64();
+    let events = read(paths.automation_events_path());
+    let recent_events: Vec<&str> = events.lines().rev().take(15).collect();
+    let service_id = stdout
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("service_id: "))
+        .unwrap_or("<none printed>");
+    // Bounded: this runs only when the docs path already misbehaves, and a
+    // docs port that accepts but never answers must not hang the step.
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .no_proxy()
+        .build()
+        .expect("failed to build the evidence client");
+    let mut probes = String::new();
+    if let Some(port) = docs_port {
+        for path in [
+            "/health".to_owned(),
+            format!("/services/{service_id}/openapi.json"),
+        ] {
+            let url = format!("http://127.0.0.1:{port}{path}");
+            let answer = match client.get(&url).send().await {
+                Ok(response) => {
+                    let status = response.status();
+                    let body = response.text().await.unwrap_or_default();
+                    format!("{status} {}", body.chars().take(300).collect::<String>())
+                }
+                Err(error) => format!("no answer: {error}"),
+            };
+            probes.push_str(&format!("  GET {url} -> {answer}\n"));
+        }
+    }
+    let run = |args: &[&str]| {
+        let (stdout, stderr, rc) = crate::run_rocm(world, args);
+        format!("(rc={rc})\n{stdout}{stderr}")
+    };
+    let listing = run(&["services", "list", "--all"]);
+    let daemon_status = run(&["daemon", "--status"]);
+    format!(
+        "--- api_docs in config.json: {api_docs}\n\
+         --- docs port now:\n{probes}\
+         --- rocm daemon --status:\n{daemon_status}\n\
+         --- helper state ({state_path}):\n{state}\n\
+         --- newest helper events, newest first:\n{events}\n\
+         --- rocm services list --all:\n{listing}",
+        api_docs = config["api_docs"],
+        state_path = paths.automation_state_path().display(),
+        state = read(paths.automation_state_path()),
+        events = recent_events.join("\n"),
+    )
+}
+
 // ── Given ──────────────────────────────────────────────────────────
 
 #[given("the background helper is not running")]
@@ -289,8 +354,10 @@ async fn running_server_has_no_docs_link(world: &mut E2eWorld) {
 #[then("the API docs link printed when it started opens the server's API docs")]
 async fn serve_printed_docs_link_opens(world: &mut E2eWorld) {
     let stdout = world.serve_stdout.as_deref().expect("no serve output");
-    let link = docs_link_in_serve_output(stdout)
-        .unwrap_or_else(|| panic!("`rocm serve` printed no API docs link:\n{stdout}"));
+    let Some(link) = docs_link_in_serve_output(stdout) else {
+        let evidence = missing_docs_link_evidence(world, stdout).await;
+        panic!("`rocm serve` printed no API docs link:\n{stdout}\n{evidence}");
+    };
     let (origin, openapi) = openapi_behind(&link).await;
     for route in ["/v1/models", "/v1/chat/completions", "/v1/completions"] {
         assert!(

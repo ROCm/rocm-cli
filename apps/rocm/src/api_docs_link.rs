@@ -101,32 +101,36 @@ pub(crate) fn service_docs_links<'a>(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::tests::test_paths;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     /// A stand-in docs server answering every request with `status` and `body`
     /// until the returned flag is set.
     fn stand_in_docs_server(status: &'static str, body: String) -> (u16, Arc<AtomicBool>) {
-        stand_in_docs_server_after(0, status, body)
+        let (port, stop, _) = stand_in_docs_server_after(0, status, body);
+        (port, stop)
     }
 
     /// As [`stand_in_docs_server`], but the first `not_yet` requests are
-    /// answered 503, as by a docs server still coming up.
-    fn stand_in_docs_server_after(
+    /// answered 503, as by a docs server still coming up. Also returns the
+    /// number of connections it has accepted.
+    pub(crate) fn stand_in_docs_server_after(
         not_yet: usize,
         status: &'static str,
         body: String,
-    ) -> (u16, Arc<AtomicBool>) {
+    ) -> (u16, Arc<AtomicBool>, Arc<AtomicUsize>) {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         listener.set_nonblocking(true).unwrap();
         let port = listener.local_addr().unwrap().port();
         let stop = Arc::new(AtomicBool::new(false));
         let stop_flag = Arc::clone(&stop);
+        let connections = Arc::new(AtomicUsize::new(0));
+        let accepted = Arc::clone(&connections);
         thread::spawn(move || {
             let mut answered = 0;
             while !stop_flag.load(Ordering::Relaxed) {
@@ -134,6 +138,7 @@ mod tests {
                     thread::sleep(Duration::from_millis(10));
                     continue;
                 };
+                accepted.fetch_add(1, Ordering::SeqCst);
                 stream.set_nonblocking(false).ok();
                 stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
                 let mut request = [0_u8; 1024];
@@ -151,7 +156,7 @@ mod tests {
                 );
             }
         });
-        (port, stop)
+        (port, stop, connections)
     }
 
     fn closed_port() -> u16 {
@@ -162,7 +167,11 @@ mod tests {
             .port()
     }
 
-    fn paths_with_docs(name: &str, enabled: bool, port: u16) -> (std::path::PathBuf, AppPaths) {
+    pub(crate) fn paths_with_docs(
+        name: &str,
+        enabled: bool,
+        port: u16,
+    ) -> (std::path::PathBuf, AppPaths) {
         let (root, paths) = test_paths(name);
         paths.ensure().unwrap();
         let mut config = RocmCliConfig::default();
@@ -172,7 +181,7 @@ mod tests {
         (root, paths)
     }
 
-    fn openapi_for(service_id: &str) -> String {
+    pub(crate) fn openapi_for(service_id: &str) -> String {
         serde_json::json!({ "servers": [{ "url": format!("/services/{service_id}/api") }] })
             .to_string()
     }
@@ -251,6 +260,24 @@ mod tests {
     }
 
     #[test]
+    fn a_docs_server_that_is_down_is_asked_once_for_the_whole_list() {
+        // Up enough to accept a connection but not answering `/health`: every
+        // per-server probe would connect again, so the count shows whether
+        // the list asked once or once per server.
+        let (port, stop, connections) =
+            stand_in_docs_server_after(0, "503 Service Unavailable", "{}".to_owned());
+        let (root, paths) = paths_with_docs("docs-link-down-once", true, port);
+        assert!(service_docs_links(&paths, ["svc-1", "svc-2", "svc-3"]).is_empty());
+        assert_eq!(connections.load(Ordering::SeqCst), 1);
+        stop.store(true, Ordering::Relaxed);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// Port 0 cannot be told apart here from a port nothing listens on: both
+    /// refuse the probe. What makes port 0 mean "off" is
+    /// `ApiDocsConfig::served_port`, tested in `rocm-core`'s config tests; this
+    /// pins only that the CLI prints no link for it.
+    #[test]
     fn no_link_when_the_docs_port_is_zero() {
         let (root, paths) = paths_with_docs("docs-link-port-zero", true, 0);
         assert_eq!(
@@ -267,7 +294,7 @@ mod tests {
 
         // A helper that comes up partway through the wait still gets its link,
         // and the caller's progress indicator is ticked while it waits.
-        let (port, stop) = stand_in_docs_server_after(2, "200 OK", openapi_for("svc-1"));
+        let (port, stop, _) = stand_in_docs_server_after(2, "200 OK", openapi_for("svc-1"));
         let (root, paths) = paths_with_docs("docs-link-late", true, port);
         let mut ticks = 0;
         assert_eq!(

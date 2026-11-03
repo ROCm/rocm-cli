@@ -1128,6 +1128,9 @@ enum ComfyuiCommand {
 enum ServicesCommand {
     /// Show currently running local model servers, and count the records that
     /// are no longer running.
+    ///
+    /// A running server also gets a `docs:` link to its API docs, served by the
+    /// background helper; the link is shown only once those docs answer for it.
     List {
         /// Include failed, stopped, and old service records.
         #[arg(short, long)]
