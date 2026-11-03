@@ -576,9 +576,45 @@ fn simulated_low_vram_usage() -> Option<Vec<GpuVramUsage>> {
 /// The `amd-smi` half of [`gpu_vram_usage`], routed through the guarded
 /// launcher so a missing `/dev/kfd` declines the spawn instead of stalling.
 fn gpu_vram_usage_amd_smi() -> Option<Vec<GpuVramUsage>> {
-    let value = rocm_core::amd_smi_json(&["metric", "--json"], AMD_SMI_SERVE_PROBE_TIMEOUT).ok()?;
+    let value = amd_smi_probe_json(&["metric", "--json"], "per-GPU VRAM occupancy")?;
     let rows = parse_gpu_vram_usage(&value);
     if rows.is_empty() { None } else { Some(rows) }
+}
+
+/// Run one advisory `serve`-path `amd-smi` probe, logging the error on the way
+/// to the `None` both callers want.
+///
+/// Both probes degrade rather than fail, so neither has anywhere to *return* an
+/// error: the caller's contract is `Option`, and a decline is a normal, expected
+/// answer on a GPU-less host. That made the whole class silent, including the
+/// two cases a user would want to know about — the pre-flight refusing a device
+/// that is merely slow rather than wedged (the 2s `KFD_OPEN_TIMEOUT` is a
+/// heuristic bound, and a loaded host can trip it while being perfectly
+/// healthy), and an `amd-smi` that ran and failed. "Why did `--gpu auto` not
+/// rank my GPUs?" had no answer anywhere.
+///
+/// `debug!` and not `warn!`: on a GPU-less host this fires on every `serve`,
+/// where it is the expected outcome and not a problem, so at `warn` it would be
+/// noise that trains people to ignore the level. `RUST_LOG=debug`, or the CLI's
+/// own log file, is where someone looking for this goes.
+///
+/// `{error:#}` rather than `to_string()`, matching `rocmd`'s bridge-snapshot
+/// note: the outermost context says "failed to launch amd-smi ...", which names
+/// the wrong thing when what happened was a pre-flight decline or a timeout.
+/// The causes are the whole value of the line.
+fn amd_smi_probe_json(args: &[&str], purpose: &str) -> Option<serde_json::Value> {
+    match rocm_core::amd_smi_json(args, AMD_SMI_SERVE_PROBE_TIMEOUT) {
+        Ok(value) => Some(value),
+        Err(error) => {
+            tracing::debug!(
+                probe = purpose,
+                args = args.join(" "),
+                error = format!("{error:#}"),
+                "amd-smi probe declined or failed; GPU selection degrades to service state alone"
+            );
+            None
+        }
+    }
 }
 
 /// Fallback per-GPU VRAM occupancy read straight from the amdgpu DRM sysfs
@@ -846,7 +882,7 @@ fn busy_gpu_indices(paths: &AppPaths) -> Vec<u32> {
 /// detection; `rocm_core`'s `kfd_readable` documents why, and what answers in
 /// this count's place.
 pub(crate) fn detect_gpu_count() -> Option<usize> {
-    let value = rocm_core::amd_smi_json(&["list", "--json"], AMD_SMI_SERVE_PROBE_TIMEOUT).ok()?;
+    let value = amd_smi_probe_json(&["list", "--json"], "local AMD GPU count")?;
     let count = value.as_array().map(Vec::len)?;
     if count == 0 { None } else { Some(count) }
 }

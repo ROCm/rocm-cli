@@ -175,6 +175,20 @@ fn preflight_kfd_device() -> PathBuf {
 /// (see [`KFD_OPEN_TIMEOUT`]). A refusal is recoverable and names what it
 /// refused; a hang is neither.
 ///
+/// # What this does not prove
+///
+/// It is a **mitigation heuristic, not a proof**. All this establishes is that
+/// `open("/dev/kfd")` returned inside [`KFD_OPEN_TIMEOUT`]. The hang it exists
+/// to prevent is attributed to `amd-smi`'s *later* ioctls against a wedged
+/// device, so a device that opens and then wedges on the next ioctl is outside
+/// what the gate can see, and the 2s bound is chosen rather than measured. No
+/// run against a genuinely unhealthy driver backs any of this up: the lane that
+/// runs these tests has no `amd-smi` and no GPU, and the FIFO fixtures model a
+/// blocking `open`, the closest reachable analogue rather than the real
+/// failure. What the gate buys is that the hazard's common precondition — a
+/// device the kernel will not hand out — refuses the spawn, instead of betting
+/// on a timeout that cannot reach a process in uninterruptible sleep.
+///
 /// # What the broad refusal costs
 ///
 /// On a host outside the render group `amd-smi` might well have answered — much
@@ -548,6 +562,40 @@ mod tests {
         crate::hardware_root::HOST_ROOT_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The pre-flight's bound and budget are quoted as literal numbers in
+    /// several places that cannot see this constant, and in at least two of
+    /// them the quoted figure is *derived* — the caller's own timeout plus this
+    /// one. Changing [`KFD_OPEN_TIMEOUT`] without touching those leaves prose
+    /// that confidently states the wrong worst case, and nothing else in the
+    /// tree notices. This test is the tripwire: it fails on the change, and its
+    /// message is the list of what to update.
+    ///
+    /// Not a claim that 2s and 8 are the right values — both are judgement
+    /// calls, argued where they are declared. It only makes changing them cost
+    /// a deliberate pass over every restatement.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_probe_bound_and_budget_are_restated_in_these_places() {
+        assert_eq!(
+            KFD_OPEN_TIMEOUT,
+            Duration::from_secs(2),
+            "the pre-flight's open bound changed. Figures derived from it are restated in: \
+             this module's `KFD_OPEN_TIMEOUT` and `amd_smi_json` docs; \
+             `apps/rocm/src/gpu_policy.rs::AMD_SMI_SERVE_PROBE_TIMEOUT` (one probe 2+10=12s, \
+             two sequential probes ~24s, `--model` readiness ~12s); \
+             `apps/rocmd/src/host_snapshot.rs::AMD_SMI_PROBE_TIMEOUT` (2+2=4s); \
+             `crates/rocm-dash-collectors/src/amd_smi.rs`'s \
+             `the_device_preflight_does_not_run_on_the_async_worker` doc; and \
+             the `amd-smi KFD pre-flight` section of `docs/testing.md`. \
+             Update every one of them, then update this assertion."
+        );
+        assert_eq!(
+            MAX_INFLIGHT_KFD_PROBES, 8,
+            "the in-flight probe budget changed; it is restated in this module's own docs and \
+             in the `amd-smi KFD pre-flight` section of `docs/testing.md`"
+        );
     }
 
     /// The gate has to stop the *spawn*, not merely report a failure after it:
