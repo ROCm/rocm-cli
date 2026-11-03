@@ -1854,6 +1854,38 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    #[test]
+    fn render_runtimes_text_keeps_every_row_in_the_marker_layout() -> Result<()> {
+        let (root, paths) = test_paths("runtime-row-layout");
+        for (key, version, build) in [
+            ("rt-active", "7.13.0", 30),
+            ("rt-rollback", "7.12.0", 20),
+            ("rt-idle", "7.11.0", 10),
+        ] {
+            write_test_pip_runtime(&paths, key, "therock-release:gfx120X-all", version, build)?;
+        }
+        let config = RocmCliConfig {
+            active_runtime_key: Some("rt-active".to_owned()),
+            previous_runtime_key: Some("rt-rollback".to_owned()),
+            ..RocmCliConfig::default()
+        };
+
+        let rendered = render_runtimes_text(&paths, &config)?;
+        let _ = fs::remove_dir_all(root);
+
+        for expected in [
+            format!("  {ACTIVE_RUNTIME_MARKER} rt-active runtime_id="),
+            format!("  {ROLLBACK_RUNTIME_MARKER} rt-rollback runtime_id="),
+            "    rt-idle runtime_id=".to_owned(),
+        ] {
+            assert!(
+                rendered.lines().any(|line| line.starts_with(&expected)),
+                "expected a row starting {expected:?}:\n{rendered}"
+            );
+        }
+        Ok(())
+    }
+
     /// Whether a runtime carries the compiler toolchain is otherwise invisible,
     /// and `rocm update` reinstalls whatever the runtime recorded — so a user
     /// who installed without it has no way to see that, or to understand why a

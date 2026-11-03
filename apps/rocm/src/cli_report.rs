@@ -47,9 +47,11 @@ impl ActionReport {
 ///
 /// Used by the listings that flag a row with a glyph and explain it in a
 /// `legend:` line (the default engine in `rocm engines`/`rocm examine`, the
-/// active/rollback runtime in `rocm runtime list`). The caller owns the glyph
+/// active/rollback runtime in `rocm runtimes list`). The caller owns the glyph
 /// constants, the legend and the shape of `body`; this owns only the shared
 /// marker-column layout, so a new listing cannot quietly pick a different one.
+/// A marker must be a single column wide: the blank used for unmarked rows is
+/// one space, so a wider marker would push its own row out of line.
 pub(crate) fn write_marked_row(
     output: &mut String,
     indent: &str,
