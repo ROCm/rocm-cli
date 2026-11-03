@@ -63,7 +63,8 @@
 //! re-imported via `use crate::examine_report_text::{...};`; `examine_cmd.rs`'s
 //! `examine()`, which the `Command::Examine` arm calls, imports and calls
 //! `examine_human_report` itself. `main.rs`'s own `launch_default` calls
-//! `render_launch_summary` directly, also re-imported there. `render_examine_text`, `render_examine_text_with_paths`, and
+//! `render_launch_summary` directly, also re-imported there.
+//! `render_examine_text`, `render_examine_text_with_paths`, and
 //! `render_model_registry_verbose_text_with_context_and_host` are also
 //! `pub(crate)`, read from [`chat.rs`](../apps/rocm/src/chat.rs)'s
 //! deterministic tool-output summaries; `render_engine_inventory_text_with_paths`

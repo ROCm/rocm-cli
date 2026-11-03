@@ -13,13 +13,10 @@
 //! Mechanically relocated from `main.rs` with no behavior change; see
 //! `docs/architecture.md`. This module depends only on `rocm_core`. Callers in
 //! other modules keep reaching these items as `crate::<name>` through the
-//! `use crate::cli_audit::{...};` re-import in `main.rs`:
-//! `record_cli_audit_event` (`main.rs`, `chat.rs`, `engines_cmd.rs`,
-//! `runtime_install_finalize.rs`, `runtimes_cmd.rs`, `service_launch.rs`,
-//! `storage.rs`), `cli_lifecycle_log_path`
-//! (`services_text.rs`) and `sanitize_log_value` (`runtime_install_finalize.rs`,
-//! `update_cmd.rs`). Those three are `pub(crate)`; every other item has no
-//! caller outside this module and stays private.
+//! `use crate::cli_audit::{...};` re-import in `main.rs`; `git grep` for the
+//! name finds them, so they are not listed here. `record_cli_audit_event`,
+//! `cli_lifecycle_log_path` and `sanitize_log_value` are `pub(crate)`; every
+//! other item has no caller outside this module and stays private.
 //!
 //! The two regression tests for this log live in this module's own
 //! `mod tests`, reaching the shared `test_paths` fixture through
