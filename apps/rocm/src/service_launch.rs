@@ -698,7 +698,7 @@ pub(crate) const fn e2e_simulate_oom_launch() -> bool {
 /// the launch report the summary path would see for it — `already_running: false`
 /// (this invocation launched it), `status: "starting"` (it failed to become
 /// ready), and a `log_path` whose contents carry a real allocator OOM signature.
-/// [`crate::append_oom_serve_note`] then renders the memory-knob guidance. No process is
+/// [`crate::serve_summary::append_oom_serve_note`] then renders the memory-knob guidance. No process is
 /// spawned. Compiled out of shipped binaries.
 #[cfg(feature = "e2e-oom-fault-injection")]
 #[allow(clippy::too_many_arguments)]

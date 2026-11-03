@@ -1086,6 +1086,18 @@ asserting on the files left on disk rather than on the summary line the command
 prints — the defect they exist to fix is a file being left behind, which a
 summary claiming success cannot reveal.
 
+Every command that takes a service id (`services stop`/`restart`/`logs`/`remove`
+and `rocm logs --service`) reads the record through one loader,
+`ManagedServiceRecord::read_manifest` in
+[service_record.rs](../crates/rocm-core/src/service_record.rs), which `rocmd`
+shares too. An id with no record fails with one plain line pointing at
+`rocm services list --all` and no OS error under it; a record that exists but
+cannot be read or parsed keeps its cause. The loader's unit tests cover all
+three cases, and `features/service_unknown_id.feature` (`service-unknown-01`
+through `-05`, mock lane) runs each command against a missing id, asserting
+the exit code and the exact error together, then runs the listing command the
+error names to confirm it works and does not list the id.
+
 `prune`'s leftover sweep carries a second, unrelated race: a file with no record
 beside it is also what a *launch in progress* looks like, because `rocm serve`
 writes the 0600 endpoint key before it writes the record, and `--any-age` leaves
@@ -1991,6 +2003,91 @@ policy needs neither: the predicate takes it by value rather than as an
 `Option`, so a call site that drops it does not compile.
 
 E2E scenarios, in
+[`tests/e2e-cucumber/features/model_serving.feature`](../tests/e2e-cucumber/features/model_serving.feature).
+Run the suite unfiltered and let the harness select:
+
+```bash
+cargo xtask e2e
+```
+
+Unfiltered, deliberately — do not reach for the `cargo xtask e2e -- -n "..."`
+form other sections of this file use. Cucumber 0.23 honours *either* its own CLI
+filter *or* the harness closure, never both, so `-n` and `--tags` bypass the OS,
+capability and expectation resolution that decides whether a scenario may run at
+all (see the comment at
+[`tests/e2e-cucumber/tests/e2e.rs`](../tests/e2e-cucumber/tests/e2e.rs), above
+`only_lifecycle`). That caveat applies to every `-n` in this file, but it bites
+hardest here: these five are selected *by* host GPU state, so `-n` runs them on
+hosts whose premise does not hold — serve-28/29/30/32 need a host with no usable
+AMD GPU and serve-31 needs one with a GPU, and each silently reports the wrong
+answer on the other. (The one supported way to drive them off their own lane is
+to make the host match: masking every device with `HIP_VISIBLE_DEVICES=` makes
+the harness and the product agree the host has no usable GPU, which is what the
+mock lane has.) Note also that `-n` matches the scenario *name* (`serve-28 -
+Reuse succeeds on a GPU-less host`), not the `@id:` tag, so passing an id to it
+silently selects nothing.
+
+- serve-28, `@id:serve-reuse-exempt-from-no-gpu-refusal` — a `serve` that
+  matches an already-running vLLM service on a GPU-less host is not refused: it
+  prints the reuse summary. The only end-to-end proof of the exemption's happy
+  path.
+- serve-29, `@id:serve-unrelated-live-service-still-fails-fast` — a live
+  Lemonade service for an *unrelated* model does not soften the no-GPU refusal:
+  serving a different model is refused before any engine starts, and nothing is
+  prepared or downloaded. Lemonade specifically, because it manages its own
+  runtime and so is the engine whose preparation is user-visible.
+  It carries a second premise — a configured setup venv the runtime registry has
+  not yet recorded — which makes the refusal's *ordering* observable. `rocm
+  serve` resolves its runtime selection below the no-GPU bail deliberately,
+  because that resolution reaches `recover_setup_runtime_registration`, which
+  writes a runtime registry manifest and can fail with a manifest error that has
+  nothing to do with the GPU. Recovery returns early when no setup venv is
+  configured, and no other e2e root has one, so without this fixture the call
+  could be hoisted above the bail with every refusal scenario still green. The
+  final `Then` asserts the registry is still empty after the refusal.
+- serve-30, `@id:serve-unreusable-live-service-still-fails-fast` — a live vLLM
+  service for the *same* model, which this invocation nonetheless cannot reuse
+  (`--require-api-key` against a service that has no key), also does not soften
+  the refusal. This is the pre-gate's *acceptance* term, which serve-28 and
+  serve-29 cannot reach: serve-28 plants a record that really is reusable, and
+  serve-29 fails the gate's outer engine/model condition before the acceptance
+  test runs. The discriminating assertion is that the `rocm services stop`
+  advice is absent — that advice is printed only from the spawn, which is
+  reachable only once the no-GPU bail has been bypassed.
+- serve-32, `@id:serve-recipe-mismatched-live-service-still-fails-fast` — the
+  same shape for the *other* independent argument of that acceptance test. A
+  live vLLM service for the same model, against a serve that asks for a
+  `--tool-call-parser` the service was not started with, is a recipe mismatch,
+  so it also earns no bypass. serve-30 cannot stand in for it: the record every
+  other scenario plants carries `engine_recipe_json: null`, which is exactly
+  what a serve with no recipe-bearing flags requests, so the recipe argument
+  matched whether `serve()` passed it or not. `--tool-call-parser` is the
+  cheapest way to make the requested recipe non-null without a catalog entry —
+  on vLLM it synthesizes a recipe hint for a model that has none. The
+  discriminating assertion is that the message is still the no-GPU one: grant
+  the bypass and the run reaches the spawn, whose own recipe-mismatch refusal
+  replaces it.
+
+Those four carry `@requires-no-gpu` (their premise is a host with no usable AMD
+GPU), so they get their live coverage on the GitHub-hosted mock lane; serve-28,
+serve-30 and serve-32 also carry `@requires-os:linux`.
+
+The fifth is the pre-gate's other half, and it is the one that needs real
+hardware:
+
+- serve-31, `@id:serve-live-reuse-candidate-does-not-preempt-gpu-validation`
+  (**`@requires-gpu`**, so the `E2E self-hosted` lane only) — on a host that
+  *does* have a usable GPU, a live service this invocation really could reuse
+  still does not pull engine or registry work ahead of `--gpu` validation. The
+  record matches on liveness, engine and canonical model id, so every term of
+  the pre-gate except `host_has_no_usable_gpu` is satisfied and that predicate
+  alone is what holds the gate shut. It reuses serve-29's setup-venv fixture so
+  the final `Then` can assert the registry is still empty: with the gate wrongly
+  open, `recover_setup_runtime_registration` re-files the planted manifest before
+  the refusal. This is the only check in the repo that fails if `serve()` stops
+  passing the host predicate into `reuse_pregate_opens` — the unit test pins the
+  helper, not the call site, and the four no-GPU scenarios above run where the
+  gate opens either way.
 
 ## Serve OOM Guidance
 
@@ -2052,85 +2149,6 @@ Run the suite unfiltered and let the harness select:
 cargo xtask e2e
 ```
 
-Unfiltered, deliberately — do not reach for the `cargo xtask e2e -- -n "..."`
-form other sections of this file use. Cucumber 0.23 honours *either* its own CLI
-filter *or* the harness closure, never both, so `-n` and `--tags` bypass the OS,
-capability and expectation resolution that decides whether a scenario may run at
-all (see the comment at
-[`tests/e2e-cucumber/tests/e2e.rs`](../tests/e2e-cucumber/tests/e2e.rs), above
-`only_lifecycle`). That caveat applies to every `-n` in this file, but it bites
-hardest here: these five are selected *by* host GPU state, so `-n` runs them on
-hosts whose premise does not hold — serve-33/29/30/32 need a host with no usable
-AMD GPU and serve-31 needs one with a GPU, and each silently reports the wrong
-answer on the other. (The one supported way to drive them off their own lane is
-to make the host match: masking every device with `HIP_VISIBLE_DEVICES=` makes
-the harness and the product agree the host has no usable GPU, which is what the
-mock lane has.) Note also that `-n` matches the scenario *name* (`serve-33 -
-Reuse succeeds on a GPU-less host`), not the `@id:` tag, so passing an id to it
-silently selects nothing.
-
-- serve-33, `@id:serve-reuse-exempt-from-no-gpu-refusal` — a `serve` that
-  matches an already-running vLLM service on a GPU-less host is not refused: it
-  prints the reuse summary. The only end-to-end proof of the exemption's happy
-  path.
-- serve-29, `@id:serve-unrelated-live-service-still-fails-fast` — a live
-  Lemonade service for an *unrelated* model does not soften the no-GPU refusal:
-  serving a different model is refused before any engine starts, and nothing is
-  prepared or downloaded. Lemonade specifically, because it manages its own
-  runtime and so is the engine whose preparation is user-visible.
-  It carries a second premise — a configured setup venv the runtime registry has
-  not yet recorded — which makes the refusal's *ordering* observable. `rocm
-  serve` resolves its runtime selection below the no-GPU bail deliberately,
-  because that resolution reaches `recover_setup_runtime_registration`, which
-  writes a runtime registry manifest and can fail with a manifest error that has
-  nothing to do with the GPU. Recovery returns early when no setup venv is
-  configured, and no other e2e root has one, so without this fixture the call
-  could be hoisted above the bail with every refusal scenario still green. The
-  final `Then` asserts the registry is still empty after the refusal.
-- serve-30, `@id:serve-unreusable-live-service-still-fails-fast` — a live vLLM
-  service for the *same* model, which this invocation nonetheless cannot reuse
-  (`--require-api-key` against a service that has no key), also does not soften
-  the refusal. This is the pre-gate's *acceptance* term, which serve-33 and
-  serve-29 cannot reach: serve-33 plants a record that really is reusable, and
-  serve-29 fails the gate's outer engine/model condition before the acceptance
-  test runs. The discriminating assertion is that the `rocm services stop`
-  advice is absent — that advice is printed only from the spawn, which is
-  reachable only once the no-GPU bail has been bypassed.
-- serve-32, `@id:serve-recipe-mismatched-live-service-still-fails-fast` — the
-  same shape for the *other* independent argument of that acceptance test. A
-  live vLLM service for the same model, against a serve that asks for a
-  `--tool-call-parser` the service was not started with, is a recipe mismatch,
-  so it also earns no bypass. serve-30 cannot stand in for it: the record every
-  other scenario plants carries `engine_recipe_json: null`, which is exactly
-  what a serve with no recipe-bearing flags requests, so the recipe argument
-  matched whether `serve()` passed it or not. `--tool-call-parser` is the
-  cheapest way to make the requested recipe non-null without a catalog entry —
-  on vLLM it synthesizes a recipe hint for a model that has none. The
-  discriminating assertion is that the message is still the no-GPU one: grant
-  the bypass and the run reaches the spawn, whose own recipe-mismatch refusal
-  replaces it.
-
-Those four carry `@requires-no-gpu` (their premise is a host with no usable AMD
-GPU), so they get their live coverage on the GitHub-hosted mock lane; serve-33,
-serve-30 and serve-32 also carry `@requires-os:linux`.
-
-The fifth is the pre-gate's other half, and it is the one that needs real
-hardware:
-
-- serve-31, `@id:serve-live-reuse-candidate-does-not-preempt-gpu-validation`
-  (**`@requires-gpu`**, so the `E2E self-hosted` lane only) — on a host that
-  *does* have a usable GPU, a live service this invocation really could reuse
-  still does not pull engine or registry work ahead of `--gpu` validation. The
-  record matches on liveness, engine and canonical model id, so every term of
-  the pre-gate except `host_has_no_usable_gpu` is satisfied and that predicate
-  alone is what holds the gate shut. It reuses serve-29's setup-venv fixture so
-  the final `Then` can assert the registry is still empty: with the gate wrongly
-  open, `recover_setup_runtime_registration` re-files the planted manifest before
-  the refusal. This is the only check in the repo that fails if `serve()` stops
-  passing the host predicate into `reuse_pregate_opens` — the unit test pins the
-  helper, not the call site, and the four no-GPU scenarios above run where the
-  gate opens either way.
-
 To run just this one, go through xtask so it still builds the binary:
 
 ```bash
@@ -2139,8 +2157,12 @@ cargo xtask e2e -- -n "serve-33"
 
 That works because `cargo xtask e2e` compiles the binary under test itself,
 with `--features "rocm/e2e-test-hooks rocm/e2e-oom-fault-injection"`, and is
-the only producer of `ROCM_E2E_OOM_FAULT_INJECTION=1`. The CI dispatch filter
-takes the same route.
+the only producer of `ROCM_E2E_OOM_FAULT_INJECTION=1`.
+
+The CI dispatch filter does **not** take the same route, and that is precisely
+the hazard described below: it runs a **prebuilt** `ROCM_CLI_BINARY`, so a
+`name_filter=serve-33` dispatch selects this scenario against a build with the
+hook compiled out.
 
 The caveat is about the filter, not about this scenario. Cucumber 0.23 honours
 *either* its own CLI filter *or* the harness closure, never both, so `-n` or

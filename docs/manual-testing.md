@@ -775,7 +775,7 @@ test is described in
 [the README](../README.md#when-a-serve-runs-out-of-gpu-memory); the automated
 coverage is listed in [testing.md](testing.md#serve-oom-guidance).
 
-### 5a. The out-of-memory note
+### 6a. The out-of-memory note
 
 Force a launch that cannot fit — either a model larger than the card, or the
 same model with the whole card reserved while another workload holds memory:
@@ -817,7 +817,7 @@ Expected result:
   that sentence, but still carries the confirmation, the model-too-large caveat,
   and the `diagnose` command.
 
-### 5b. Where the note is deliberately absent
+### 6b. Where the note is deliberately absent
 
 None of these is a bug; check each so the note's scope is not mistaken for
 flakiness:

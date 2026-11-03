@@ -200,7 +200,7 @@ pub fn is_control_or_line_separator(c: char) -> bool {
 /// serve` summary's OOM note shows neither — it is one sentence plus the
 /// command — so on that surface the fallback really does withhold the failing
 /// line, and the user has to reach for `rocm services logs <service-id>` (which
-/// is what docs/manual-testing.md §5a tells them).
+/// is what docs/manual-testing.md §6a tells them).
 ///
 /// This is the counterpart of [`strip_terminal_control_sequences`], not a
 /// duplicate of it: text rocm-cli merely *echoes* is stripped, while text it
