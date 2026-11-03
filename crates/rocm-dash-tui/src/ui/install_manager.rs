@@ -27,6 +27,7 @@ use crate::ui::folder_browser::{FolderBrowser, FolderOutcome, draw_folder_browse
 use crate::ui::job_console::{ConsoleOutcome, on_console_key};
 use crate::ui::panel::{self, BoxRole};
 use crate::ui::theme::Theme;
+use crate::ui::widgets::apply_char_key;
 
 /// Package formats — mirrors `apps/rocm` `InstallFormat` (clap value-enum).
 pub const FORMATS: &[&str] = &["wheel", "tarball"];
@@ -112,24 +113,14 @@ impl InstallManagerState {
         }
     }
 
-    fn type_char(&mut self, c: char) {
-        match self.current_field() {
-            Field::Channel => self.channel.push(c),
-            Field::Prefix => self.prefix.push(c),
-            _ => {}
-        }
-    }
-
-    fn backspace(&mut self) {
-        match self.current_field() {
-            Field::Channel => {
-                self.channel.pop();
-            }
-            Field::Prefix => {
-                self.prefix.pop();
-            }
-            _ => {}
-        }
+    /// Type or backspace into the focused text field; other fields ignore it.
+    fn edit_text(&mut self, code: KeyCode) {
+        let buf = match self.current_field() {
+            Field::Channel => &mut self.channel,
+            Field::Prefix => &mut self.prefix,
+            _ => return,
+        };
+        apply_char_key(buf, code);
     }
 
     /// Build the `rocm install sdk …` argv, or an error message.
@@ -148,7 +139,7 @@ impl InstallManagerState {
         ];
         // The crate's rule is "byte-exact where the folder browser is the only
         // writer; trimmed where a human types". This field is both — the
-        // browser fills it, and `type_char` lets it be edited — so it is
+        // browser fills it, and `edit_text` lets it be edited — so it is
         // trimmed, like `channel` above and like every other typed field in
         // this form. `onboarding::build_install_args` is the other side of that
         // rule: nothing but the browser can write its prefix, so it stays exact.
@@ -256,8 +247,7 @@ pub fn on_key(
             }
             i.move_field(1);
         }
-        KeyCode::Backspace => i.backspace(),
-        KeyCode::Char(c) => i.type_char(c),
+        code @ (KeyCode::Backspace | KeyCode::Char(_)) => i.edit_text(code),
         _ => {}
     }
     Vec::new()
@@ -636,6 +626,33 @@ mod tests {
         assert!(fx.is_empty());
         assert!(ins.as_ref().unwrap().approval.is_none());
         assert!(jobs.jobs.is_empty());
+    }
+
+    #[test]
+    fn typing_and_backspace_edit_only_the_focused_text_field() {
+        let mut ins = Some(InstallManagerState::default());
+        let mut jobs = State::default();
+        let at = |f: Field| FIELDS.iter().position(|x| *x == f).unwrap();
+
+        ins.as_mut().unwrap().field = at(Field::Channel);
+        on_key(&mut ins, &mut jobs, key(KeyCode::Char('x')));
+        assert_eq!(ins.as_ref().unwrap().channel, "releasex");
+        on_key(&mut ins, &mut jobs, key(KeyCode::Backspace));
+        assert_eq!(ins.as_ref().unwrap().channel, "release");
+
+        ins.as_mut().unwrap().field = at(Field::Prefix);
+        on_key(&mut ins, &mut jobs, key(KeyCode::Char('/')));
+        on_key(&mut ins, &mut jobs, key(KeyCode::Char('a')));
+        on_key(&mut ins, &mut jobs, key(KeyCode::Backspace));
+        assert_eq!(ins.as_ref().unwrap().prefix, "/");
+        assert_eq!(ins.as_ref().unwrap().channel, "release");
+
+        // A non-text field swallows both keys without touching either buffer.
+        ins.as_mut().unwrap().field = at(Field::Format);
+        on_key(&mut ins, &mut jobs, key(KeyCode::Char('z')));
+        on_key(&mut ins, &mut jobs, key(KeyCode::Backspace));
+        assert_eq!(ins.as_ref().unwrap().channel, "release");
+        assert_eq!(ins.as_ref().unwrap().prefix, "/");
     }
 
     #[test]

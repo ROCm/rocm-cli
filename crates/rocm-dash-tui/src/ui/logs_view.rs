@@ -21,6 +21,7 @@ use crate::ui::exec::resolve_exe;
 use crate::ui::job_console::{ConsoleOutcome, on_console_key};
 use crate::ui::panel::{self, BoxRole};
 use crate::ui::theme::Theme;
+use crate::ui::widgets::apply_char_key;
 
 /// Overlay state. `None` on `AppState` means the overlay is closed.
 #[derive(Debug, Clone, Default)]
@@ -58,11 +59,9 @@ pub fn on_key(
     match key.code {
         KeyCode::Esc => *logs = None,
         KeyCode::Enter => return run_logs(l, jobs),
-        KeyCode::Backspace => {
-            l.query.pop();
+        code => {
+            apply_char_key(&mut l.query, code);
         }
-        KeyCode::Char(c) => l.query.push(c),
-        _ => {}
     }
     Vec::new()
 }

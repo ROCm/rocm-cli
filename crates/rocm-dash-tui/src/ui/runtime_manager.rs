@@ -37,6 +37,7 @@ use crate::ui::folder_browser::{FolderBrowser, FolderOutcome, draw_folder_browse
 use crate::ui::job_console::{ConsoleOutcome, on_console_key};
 use crate::ui::panel::{self, BoxRole, centered_rect, draw_popup_frame};
 use crate::ui::theme::Theme;
+use crate::ui::widgets::apply_char_key;
 
 /// A flattened registered-runtime entry for the list.
 ///
@@ -188,9 +189,6 @@ pub fn on_key(
     if let Some(input) = r.import_input.as_mut() {
         match key.code {
             KeyCode::Esc => r.import_input = None,
-            KeyCode::Backspace => {
-                input.pop();
-            }
             KeyCode::Enter => {
                 let path = input.trim().to_string();
                 if path.is_empty() {
@@ -202,8 +200,9 @@ pub fn on_key(
                     stage_approval(r, RuntimeAction::Import, args);
                 }
             }
-            KeyCode::Char(c) => input.push(c),
-            _ => {}
+            code => {
+                apply_char_key(input, code);
+            }
         }
         return Vec::new();
     }

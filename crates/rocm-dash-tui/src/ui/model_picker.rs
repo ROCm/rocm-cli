@@ -23,6 +23,7 @@ use ratatui::widgets::{List, ListItem, ListState, Paragraph};
 
 use crate::ui::panel::{centered_rect, draw_popup_frame};
 use crate::ui::theme::Theme;
+use crate::ui::widgets::apply_char_key;
 
 /// A flattened model-recipe entry for the picker. Mirrors the fields of
 /// `rocm-core::ModelRecipeRecord` the picker needs, with no core dependency.
@@ -92,17 +93,12 @@ impl ModelPicker {
                 .filtered(recipes)
                 .get(self.selected)
                 .map_or(PickerOutcome::None, |r| PickerOutcome::Chosen((*r).clone())),
-            KeyCode::Backspace => {
-                self.query.pop();
-                self.selected = 0;
+            code => {
+                if apply_char_key(&mut self.query, code) {
+                    self.selected = 0;
+                }
                 PickerOutcome::None
             }
-            KeyCode::Char(c) => {
-                self.query.push(c);
-                self.selected = 0;
-                PickerOutcome::None
-            }
-            _ => PickerOutcome::None,
         }
     }
 }
@@ -258,6 +254,18 @@ mod tests {
         let out = p.on_key(KeyCode::Char('g'), &recipes());
         assert_eq!(out, PickerOutcome::None);
         assert_eq!(p.query, "g");
+        assert_eq!(p.selected, 0);
+    }
+
+    #[test]
+    fn backspace_resets_cursor_even_when_the_query_is_empty() {
+        let mut p = ModelPicker {
+            selected: 2,
+            ..Default::default()
+        };
+        let out = p.on_key(KeyCode::Backspace, &recipes());
+        assert_eq!(out, PickerOutcome::None);
+        assert_eq!(p.query, "");
         assert_eq!(p.selected, 0);
     }
 

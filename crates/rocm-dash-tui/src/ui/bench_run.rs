@@ -21,6 +21,7 @@ use rocm_dash_core::state::{SideEffect, State, StateEvent};
 use crate::ui::exec::resolve_exe;
 use crate::ui::panel::{self, BoxRole};
 use crate::ui::theme::Theme;
+use crate::ui::widgets::apply_char_key;
 
 /// Which field of the form has focus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -81,6 +82,15 @@ impl BenchRunState {
             tailed_path,
         }
     }
+
+    const fn active_buffer_mut(&mut self) -> &mut String {
+        match self.active_field {
+            Field::Endpoint => &mut self.endpoint,
+            Field::Model => &mut self.model,
+            Field::Concurrency => &mut self.concurrency,
+            Field::Out => &mut self.out,
+        }
+    }
 }
 
 /// Handle a key while the bench-run form is open.
@@ -129,27 +139,11 @@ pub fn on_key(br: &mut Option<BenchRunState>, jobs: &mut State, key: KeyEvent) -
         KeyCode::Enter => {
             return try_submit(br, jobs);
         }
-        KeyCode::Backspace => {
-            match state.active_field {
-                Field::Endpoint => state.endpoint.pop(),
-                Field::Model => state.model.pop(),
-                Field::Concurrency => state.concurrency.pop(),
-                Field::Out => state.out.pop(),
-            };
-            state.message = None;
-            return Vec::new();
-        }
-        KeyCode::Char(c) => {
-            match state.active_field {
-                Field::Endpoint => state.endpoint.push(c),
-                Field::Model => state.model.push(c),
-                Field::Concurrency => state.concurrency.push(c),
-                Field::Out => state.out.push(c),
+        code => {
+            if apply_char_key(state.active_buffer_mut(), code) {
+                state.message = None;
             }
-            state.message = None;
-            return Vec::new();
         }
-        _ => {}
     }
     Vec::new()
 }
@@ -383,6 +377,29 @@ mod tests {
         let mut s = BenchRunState::new(None);
         s.endpoint = endpoint.to_string();
         Some(s)
+    }
+
+    #[test]
+    fn typing_and_backspace_edit_the_active_field_and_clear_the_message() {
+        let mut br = with_endpoint("http://h");
+        let mut jobs = State::default();
+
+        br.as_mut().unwrap().message = Some("stale".into());
+        on_key(&mut br, &mut jobs, key(KeyCode::Char('1')));
+        assert_eq!(br.as_ref().unwrap().endpoint, "http://h1");
+        assert!(br.as_ref().unwrap().message.is_none());
+
+        br.as_mut().unwrap().message = Some("stale".into());
+        on_key(&mut br, &mut jobs, key(KeyCode::Backspace));
+        assert_eq!(br.as_ref().unwrap().endpoint, "http://h");
+        assert!(br.as_ref().unwrap().message.is_none());
+
+        // Tab to Model: backspace there must not eat the endpoint.
+        on_key(&mut br, &mut jobs, key(KeyCode::Tab));
+        type_str(&mut br, &mut jobs, "ab");
+        on_key(&mut br, &mut jobs, key(KeyCode::Backspace));
+        assert_eq!(br.as_ref().unwrap().model, "a");
+        assert_eq!(br.as_ref().unwrap().endpoint, "http://h");
     }
 
     // ---------- T12: submit → exactly one SpawnJob with correct args ----------

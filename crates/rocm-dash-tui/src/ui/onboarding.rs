@@ -45,6 +45,7 @@ use crate::ui::folder_browser::{FolderBrowser, FolderOutcome, draw_folder_browse
 use crate::ui::job_console::{ConsoleOutcome, on_console_key};
 use crate::ui::panel::{self, BoxRole};
 use crate::ui::theme::Theme;
+use crate::ui::widgets::apply_char_key_filtered;
 
 /// Which step of the wizard is showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -462,13 +463,14 @@ fn configure_key(o: &mut OnboardingState, key: KeyEvent) -> Vec<SideEffect> {
                     }
                     KeyCode::Up => cfg.pin_mode = cfg.pin_mode.prev(),
                     KeyCode::Down => cfg.pin_mode = cfg.pin_mode.next(),
-                    KeyCode::Backspace => {
-                        cfg.pin_value.pop();
-                    }
-                    // Only collect characters once a pin mode is selected, so
-                    // the default (None) view ignores stray keystrokes.
-                    KeyCode::Char(c) if cfg.pin_mode != PinMode::None && !c.is_control() => {
-                        cfg.pin_value.push(c);
+                    code @ (KeyCode::Backspace | KeyCode::Char(_)) => {
+                        // Only collect characters once a pin mode is selected,
+                        // so the default (None) view ignores stray keystrokes.
+                        // Backspace is never gated.
+                        let collecting = cfg.pin_mode != PinMode::None;
+                        apply_char_key_filtered(&mut cfg.pin_value, code, |c| {
+                            collecting && !c.is_control()
+                        });
                     }
                     _ => {}
                 }
@@ -1286,6 +1288,25 @@ mod tests {
                 .unwrap()
                 .pin_value,
             "2026-06"
+        );
+    }
+
+    #[test]
+    fn backspace_still_edits_pin_value_after_returning_to_no_pin_mode() {
+        let (mut ob, mut jobs) = open_configure();
+        on_key(&mut ob, &mut jobs, key(KeyCode::Down)); // Build date
+        type_str(&mut ob, &mut jobs, "20");
+        on_key(&mut ob, &mut jobs, key(KeyCode::Up)); // back to None
+        type_str(&mut ob, &mut jobs, "26"); // gated: ignored
+        on_key(&mut ob, &mut jobs, key(KeyCode::Backspace)); // never gated
+        assert_eq!(
+            ob.as_ref()
+                .unwrap()
+                .install_config
+                .as_ref()
+                .unwrap()
+                .pin_value,
+            "2"
         );
     }
 

@@ -27,6 +27,7 @@ use crate::ui::exec::{display_args, exe_label, resolve_exe};
 use crate::ui::job_console::{ConsoleOutcome, on_console_key};
 use crate::ui::panel::{self, BoxRole};
 use crate::ui::theme::Theme;
+use crate::ui::widgets::apply_char_key;
 
 /// One stable console for the runner — a second command waits for the first.
 const JOB_ID: &str = "command";
@@ -112,12 +113,10 @@ pub fn on_key(
     // into the command line — `q` is not a close key in a text field.
     match key.code {
         KeyCode::Esc => *cs = None,
-        KeyCode::Backspace => {
-            c.input.pop();
-        }
         KeyCode::Enter => return request_run(c),
-        KeyCode::Char(ch) => c.input.push(ch),
-        _ => {}
+        code => {
+            apply_char_key(&mut c.input, code);
+        }
     }
     Vec::new()
 }
