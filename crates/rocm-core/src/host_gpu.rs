@@ -4007,11 +4007,13 @@ mod tests {
                 WindowsDisplayAdapter {
                     name: "AMD Radeon(TM) Graphics (Renoir)".to_owned(),
                     driver_version: None,
+                    driver_date: None,
                     pnp_device_id: None,
                 },
                 WindowsDisplayAdapter {
                     name: "AMD Radeon RX 6800M".to_owned(),
                     driver_version: None,
+                    driver_date: None,
                     pnp_device_id: None,
                 },
             ],
@@ -4045,6 +4047,7 @@ mod tests {
                 .map(|name| WindowsDisplayAdapter {
                     name: name.to_owned(),
                     driver_version: None,
+                    driver_date: None,
                     pnp_device_id: None,
                 })
                 .collect(),
