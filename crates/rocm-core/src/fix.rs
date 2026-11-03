@@ -4956,60 +4956,306 @@ mod tests {
         assert_eq!(indent_continuation("single", "  "), "single");
     }
 
-    /// Lines of `production` (source text, test module already cut off) that
-    /// produce an exit code as a bare integer: a `return 4;`, a tail
-    /// expression `0`, a one-line `{ 5 }` branch, or a match arm `=> 3,`.
-    /// Comment lines are skipped, so prose may still talk about "return 5".
-    fn bare_exit_code_literals(production: &str) -> Vec<String> {
-        let shapes =
-            regex::Regex::new(r"\breturn\s+\d+\s*;|^\s*\d+\s*$|\{\s*\d+\s*\}|=>\s*\d+\s*,?\s*$")
-                .unwrap();
-        production
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("//"))
-            .filter(|line| shapes.is_match(line))
-            .map(|line| line.trim().to_string())
-            .collect()
+    /// What [`scan_exit_code_literals`] found in a source file.
+    #[derive(Default)]
+    struct ExitCodeScan {
+        /// The `-> i32` functions it inspected, so a test can notice when a
+        /// reorder or rename leaves it looking at fewer of them than it should.
+        checked: Vec<String>,
+        /// `function: literal` for each integer literal reported as a result.
+        bare: Vec<String>,
+    }
+
+    /// Whether `attrs` carry `#[cfg(test)]`.
+    fn is_cfg_test(attrs: &[syn::Attribute]) -> bool {
+        attrs.iter().any(|attr| {
+            attr.path().is_ident("cfg")
+                && attr
+                    .parse_args::<syn::Ident>()
+                    .is_ok_and(|ident| ident == "test")
+        })
+    }
+
+    /// The text of `expr` when it is an integer literal in any spelling
+    /// (`4`, `4_i32`, `0x4`, `-1`).
+    fn int_literal(expr: &syn::Expr) -> Option<String> {
+        match expr {
+            syn::Expr::Lit(lit) => match &lit.lit {
+                syn::Lit::Int(int) => Some(int.to_string()),
+                _ => None,
+            },
+            syn::Expr::Unary(unary) if matches!(unary.op, syn::UnOp::Neg(_)) => {
+                int_literal(&unary.expr).map(|text| format!("-{text}"))
+            }
+            syn::Expr::Paren(paren) => int_literal(&paren.expr),
+            _ => None,
+        }
+    }
+
+    fn pattern_name(pat: &syn::Pat) -> Option<String> {
+        match pat {
+            syn::Pat::Ident(ident) => Some(ident.ident.to_string()),
+            syn::Pat::Type(typed) => pattern_name(&typed.pat),
+            _ => None,
+        }
+    }
+
+    /// The results of one function body: the integer literals it returns, and
+    /// the names it returns that were set to an integer literal.
+    #[derive(Default)]
+    struct FunctionResults {
+        literals: Vec<String>,
+        returned_names: Vec<String>,
+        literal_locals: std::collections::HashSet<String>,
+    }
+
+    impl FunctionResults {
+        /// Record `expr`, a value the function hands back: look through the
+        /// branches of an `if` or `match` and the block of a tail expression.
+        fn result(&mut self, expr: &syn::Expr) {
+            if let Some(text) = int_literal(expr) {
+                self.literals.push(text);
+                return;
+            }
+            match expr {
+                syn::Expr::Path(path) => {
+                    if let Some(name) = path.path.get_ident() {
+                        self.returned_names.push(name.to_string());
+                    }
+                }
+                syn::Expr::Paren(paren) => self.result(&paren.expr),
+                syn::Expr::Group(group) => self.result(&group.expr),
+                syn::Expr::Block(block) => self.tail(&block.block),
+                syn::Expr::Unsafe(block) => self.tail(&block.block),
+                syn::Expr::If(branch) => {
+                    self.tail(&branch.then_branch);
+                    if let Some((_, otherwise)) = &branch.else_branch {
+                        self.result(otherwise);
+                    }
+                }
+                syn::Expr::Match(matched) => {
+                    for arm in &matched.arms {
+                        self.result(&arm.body);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        fn tail(&mut self, block: &syn::Block) {
+            if let Some(syn::Stmt::Expr(expr, None)) = block.stmts.last() {
+                self.result(expr);
+            }
+        }
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for FunctionResults {
+        fn visit_expr_return(&mut self, ret: &'ast syn::ExprReturn) {
+            if let Some(expr) = &ret.expr {
+                self.result(expr);
+            }
+            syn::visit::visit_expr_return(self, ret);
+        }
+
+        fn visit_local(&mut self, local: &'ast syn::Local) {
+            if let (Some(name), Some(init)) = (pattern_name(&local.pat), &local.init)
+                && int_literal(&init.expr).is_some()
+            {
+                self.literal_locals.insert(name);
+            }
+            syn::visit::visit_local(self, local);
+        }
+
+        fn visit_expr_assign(&mut self, assign: &'ast syn::ExprAssign) {
+            if let syn::Expr::Path(target) = &*assign.left
+                && let Some(name) = target.path.get_ident()
+                && int_literal(&assign.right).is_some()
+            {
+                self.literal_locals.insert(name.to_string());
+            }
+            syn::visit::visit_expr_assign(self, assign);
+        }
+
+        // A `return` inside a closure or a nested function is that function's
+        // result, not this one's.
+        fn visit_expr_closure(&mut self, _: &'ast syn::ExprClosure) {}
+
+        fn visit_item_fn(&mut self, _: &'ast syn::ItemFn) {}
+    }
+
+    fn scan_function(sig: &syn::Signature, body: &syn::Block, scan: &mut ExitCodeScan) {
+        let returns_i32 = matches!(
+            &sig.output,
+            syn::ReturnType::Type(_, ty)
+                if matches!(&**ty, syn::Type::Path(path) if path.path.is_ident("i32"))
+        );
+        if !returns_i32 {
+            return;
+        }
+        let name = sig.ident.to_string();
+        let mut results = FunctionResults::default();
+        syn::visit::Visit::visit_block(&mut results, body);
+        results.tail(body);
+        for literal in &results.literals {
+            scan.bare.push(format!("{name}: {literal}"));
+        }
+        for local in &results.returned_names {
+            if results.literal_locals.contains(local) {
+                scan.bare
+                    .push(format!("{name}: `{local}` is set to an integer literal"));
+            }
+        }
+        scan.checked.push(name);
+    }
+
+    fn scan_items(items: &[syn::Item], scan: &mut ExitCodeScan) {
+        for item in items {
+            match item {
+                syn::Item::Fn(function) => scan_function(&function.sig, &function.block, scan),
+                syn::Item::Impl(imp) => {
+                    for item in &imp.items {
+                        if let syn::ImplItem::Fn(method) = item {
+                            scan_function(&method.sig, &method.block, scan);
+                        }
+                    }
+                }
+                syn::Item::Mod(module) if !is_cfg_test(&module.attrs) => {
+                    if let Some((_, items)) = &module.content {
+                        scan_items(items, scan);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Find the integer literals that a `-> i32` function reports as its
+    /// result in `source`, wherever in the file the function sits.
+    ///
+    /// It parses the source, so the spelling of the literal does not matter
+    /// (`4i32`, `4_i32`, `0x4`, `-1`), nor does the layout (a one-line `match`,
+    /// a `return 3` with no semicolon, a comment). A literal counts when it is
+    /// the operand of a `return`, the function's tail expression, an arm of a
+    /// tail `if` or `match`, or a local that was set to a literal and is then
+    /// returned by name. What it cannot see is a literal that reaches the
+    /// result some other way: through arithmetic, a helper that returns it, a
+    /// value read from a struct. So this is a net under the `exit::` constants,
+    /// not a proof that no runner can return a number of its own.
+    fn scan_exit_code_literals(source: &str) -> ExitCodeScan {
+        let file = syn::parse_file(source).expect("the source parses");
+        let mut scan = ExitCodeScan::default();
+        scan_items(&file.items, &mut scan);
+        scan
     }
 
     #[test]
     fn the_bare_exit_code_lint_flags_each_way_of_writing_one() {
-        let flagged = bare_exit_code_literals(
-            "    return 3;\n    0\n    if declined { 5 } else { exit::OK }\n    Err(_) => 4,\n",
+        let scan = scan_exit_code_literals(
+            r"
+            fn tail() -> i32 { 0 }
+            fn returned() -> i32 { return 3; }
+            fn no_semicolon(x: bool) -> i32 { if x { return 3 } exit::OK }
+            fn branches(x: bool) -> i32 { if x { 5 } else { exit::OK } }
+            fn one_line_match(r: Result<(), ()>) -> i32 { match r { Ok(_) => 0, Err(_) => 4 } }
+            fn suffixed() -> i32 { return 4i32; }
+            fn underscored() -> i32 { return 4_i32; }
+            fn hex() -> i32 { return 0x4; }
+            fn negative() -> i32 { return -1; }
+            fn via_local() -> i32 { let rc = 4; rc }
+            fn via_typed_local() -> i32 { let rc: i32 = 4; rc }
+            fn via_assignment() -> i32 { let mut rc = exit::OK; rc = 4; rc }
+            struct Runner;
+            impl Runner { fn method(&self) -> i32 { 3 } }
+            mod inner { pub fn nested() -> i32 { 5 } }
+            ",
         );
         assert_eq!(
-            flagged,
+            scan.bare,
             [
-                "return 3;",
-                "0",
-                "if declined { 5 } else { exit::OK }",
-                "Err(_) => 4,"
+                "tail: 0",
+                "returned: 3",
+                "no_semicolon: 3",
+                "branches: 5",
+                "one_line_match: 0",
+                "one_line_match: 4",
+                "suffixed: 4i32",
+                "underscored: 4_i32",
+                "hex: 0x4",
+                "negative: -1",
+                "via_local: `rc` is set to an integer literal",
+                "via_typed_local: `rc` is set to an integer literal",
+                "via_assignment: `rc` is set to an integer literal",
+                "method: 3",
+                "nested: 5",
             ]
         );
-        // Named constants, comments, and unrelated integers are left alone.
-        assert!(
-            bare_exit_code_literals(
-                "    return exit::FAILED;\n    exit::OK\n    // return 5; is what this used to say\n    let width = 80;\n    if rc != 0 {\n"
-            )
-            .is_empty()
+    }
+
+    #[test]
+    fn the_bare_exit_code_lint_leaves_named_constants_and_unrelated_integers_alone() {
+        let scan = scan_exit_code_literals(
+            r"
+            fn named(x: bool) -> i32 { if x { return exit::FAILED; } exit::OK }
+            fn compares(rc: i32) -> i32 { if rc != 0 { return exit::FAILED; } exit::OK }
+            fn other_integers() -> i32 {
+                let width = 80;
+                let _ = width;
+                for _ in 0..3 {}
+                exit::OK
+            }
+            fn commented() -> i32 {
+                // return 5; is what this used to say
+                exit::OK
+            }
+            fn closure() -> i32 {
+                let f = |x: i32| { return 7; };
+                f(1);
+                exit::OK
+            }
+            fn not_a_runner() -> usize { 3 }
+            #[cfg(test)]
+            mod tests { fn in_tests() -> i32 { 3 } }
+            ",
+        );
+        assert_eq!(scan.bare, Vec::<String>::new());
+        assert_eq!(
+            scan.checked,
+            [
+                "named",
+                "compares",
+                "other_integers",
+                "commented",
+                "closure"
+            ]
         );
     }
 
     /// Every runner reports its result through `exit::`, so the published
-    /// manifest and the code that produces the codes cannot come to disagree.
-    /// `rc != 0` on a child's own status is not a runner result and is not
+    /// manifest and the code that produces the codes are meant not to come to
+    /// disagree. [`scan_exit_code_literals`] says what the check can and cannot
+    /// see; `rc != 0` on a child's own status is not a runner result and is not
     /// matched.
     #[test]
     fn fix_runners_return_named_exit_constants_not_integers() {
-        let source = include_str!("fix.rs");
-        let (production, _tests) = source
-            .split_once("#[cfg(test)]\nmod tests {")
-            .expect("fix.rs has a test module");
-        let (_, runners) = production
-            .split_once("\npub fn apply(")
-            .expect("fix.rs defines apply");
+        let scan = scan_exit_code_literals(include_str!("fix.rs"));
+        // A reorder or a rename must not leave the scan looking at fewer
+        // runners than it should without anyone noticing.
+        for runner in [
+            "apply",
+            "act_on",
+            "run_render_group",
+            "run_unset_override_linux",
+            "run_unset_override_windows",
+            "report_persistent_override",
+        ] {
+            assert!(
+                scan.checked.iter().any(|name| name == runner),
+                "the scan no longer inspects `{runner}`; checked: {:?}",
+                scan.checked
+            );
+        }
         assert_eq!(
-            bare_exit_code_literals(runners),
+            scan.bare,
             Vec::<String>::new(),
             "use exit::OK, exit::NOT_APPLICABLE, exit::FAILED or exit::DECLINED"
         );
