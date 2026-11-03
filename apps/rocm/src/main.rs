@@ -1652,12 +1652,11 @@ fn cli_version_string() -> String {
 }
 
 /// The leading version of [`cli_version_string`], without the parenthetical
-/// ref and hash. For one-token fields such as `rocm update`'s `cli: installed=`.
+/// ref and hash. For one-token fields such as `rocm update`'s `cli: installed=`
+/// and a problem report's `cli_version`. `build.rs` exports it beside the full
+/// string, from the same function, so nothing here parses that string.
 fn cli_version_number() -> String {
-    let full = cli_version_string();
-    full.split_once(' ')
-        .map_or(full.as_str(), |(version, _)| version)
-        .to_owned()
+    env!("ROCM_CLI_VERSION_NUMBER").to_owned()
 }
 
 /// `rocm version`: the traceable build string, plus the ROCm SDK and GPU
@@ -3200,6 +3199,16 @@ fn perform_delivery(
     format!("{SENDER_NOTICE}\n{outcome}")
 }
 
+/// The report this machine would contribute, naming this build's leading
+/// version: the one `rocm version` starts with.
+fn prepare_cli_report(
+    examination: &rocm_core::Examination,
+    entry: Option<&str>,
+    fix_offered: bool,
+) -> std::result::Result<rocm_core::Report, rocm_core::ReportRefusal> {
+    rocm_core::prepare_report(examination, entry, fix_offered, &cli_version_number())
+}
+
 /// Print the report this machine would contribute, and send nothing.
 fn show_prepared_report(
     examination: &rocm_core::Examination,
@@ -3213,7 +3222,7 @@ fn show_prepared_report(
     // looking for a fault. Anything scripting this reads the outcome from
     // `--json` rather than from the exit code, exactly as `rocm diagnose` itself
     // already asks callers to do.
-    match rocm_core::prepare_report(examination, entry, fix_offered) {
+    match prepare_cli_report(examination, entry, fix_offered) {
         Ok(prepared) => {
             if json {
                 println!("{}", serde_json::to_string_pretty(&prepared)?);
@@ -5539,9 +5548,13 @@ pub(crate) mod tests {
         Cli::command().debug_assert();
     }
 
-    /// `-V`/`--version` and `rocm version` both print `ROCM_CLI_VERSION`, the
-    /// one string `format_cli_version` in `build.rs` embeds. Tag, `main`, and
-    /// unknown shapes are the `format_cli_version_*` tests there.
+    /// `cli_version_string` is `ROCM_CLI_VERSION`, the one string
+    /// `format_cli_version` in `build.rs` embeds, clap's `-V`/`--version` is
+    /// that same string, and `cli_version_number` leads it. This does not run
+    /// the binary: `@id:examine-version` compares the printed `rocm version`
+    /// and `-V`/`--version` lines. Tag, `main`, and unknown shapes are the
+    /// `format_cli_version_*` tests in `build.rs`; this checks only the shape
+    /// of the ref this checkout resolved, which is never a release tag in CI.
     #[test]
     fn version_surfaces_share_one_build_script_string() {
         let full = super::cli_version_string();
@@ -5566,6 +5579,36 @@ pub(crate) mod tests {
         if reference == "unknown" {
             assert_eq!(number, env!("CARGO_PKG_VERSION"));
         }
+    }
+
+    /// `rocm diagnose --report` publishes the version `rocm version` leads
+    /// with, not `rocm-core`'s frozen package version. The e2e side is
+    /// `@id:diagnose-report-names-the-cli-version`, which only reaches a real
+    /// report on a lane with a released AMD GPU.
+    #[test]
+    fn a_problem_report_names_the_version_rocm_version_leads_with() {
+        let examination = rocm_core::Examination {
+            os_family: "linux".to_owned(),
+            distro_id: "ubuntu".to_owned(),
+            distro_version: "22.04".to_owned(),
+            has_amd_gpu: true,
+            gpus: vec![rocm_core::examine::Gpu {
+                name: "test".to_owned(),
+                gfx_target: "gfx1100".to_owned(),
+                pci_id: String::new(),
+                is_apu: Some(false),
+                is_amd: true,
+            }],
+            ..rocm_core::Examination::default()
+        };
+        let report = super::prepare_cli_report(&examination, None, false)
+            .expect("a released GPU must produce a report");
+        let number = super::cli_version_number();
+        assert_eq!(report.cli_version, number);
+        assert!(
+            super::cli_version_string().starts_with(&format!("{number} (")),
+            "{number:?} does not lead `rocm version`'s string"
+        );
     }
 
     /// EAI-7362: the top-level `rocm --help` command list must be alphabetical,

@@ -394,8 +394,11 @@ The ROCm release and the inference engine's release are each cut
 back to a release, so a build number that would narrow toward one machine
 never appears there; the CLI's own version is the exception, since it names
 the tool that wrote the report instead of something read off the machine.
-That value is the same string `rocm version` prints (`X.Y.Z (vX.Y.Z, <hash>)`
-for a release tag, `0.0.0-dev (<ref>, <hash>)` for any other resolved ref).
+That value is the version `rocm version` leads with (`X.Y.Z` for a release
+tag `vX.Y.Z`, `0.0.0-dev` for any other resolved ref), without the ref and
+commit hash that follow it there, since a local branch name is text from the
+machine. A version with characters other than letters, digits, `.`, `-` and
+`+`, or longer than 64 characters, is reported as `unknown` instead.
 The distribution is checked against a list of known names instead of
 being repeated from the machine.
 

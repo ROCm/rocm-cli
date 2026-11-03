@@ -3270,3 +3270,81 @@ async fn assert_old_driver_advice_follows_the_inspection(world: &mut E2eWorld) {
         assert!(score < threshold, "{row:#}");
     }
 }
+
+// ── The CLI version a problem report names ─────────────────────────
+
+#[given("a simulated Linux machine whose only GPU is a released one")]
+async fn simulated_machine_with_a_released_gpu(world: &mut E2eWorld) {
+    // Planted as in diagnose-40, but with gfx_target_version 110000 (gfx1100),
+    // which is on the compatibility matrix, so `--report` prepares a report on
+    // every Linux lane instead of refusing on the runner's own hardware.
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .to_owned();
+    let host = root.join("host-root");
+    std::fs::create_dir_all(host.join("etc")).expect("failed to create planted etc");
+    std::fs::write(
+        host.join("etc/os-release"),
+        "ID=ubuntu\nVERSION_ID=\"24.04\"\nPRETTY_NAME=\"Ubuntu 24.04 LTS\"\n",
+    )
+    .expect("failed to write planted os-release");
+    let node = host.join("sys/class/kfd/kfd/topology/nodes/1");
+    std::fs::create_dir_all(&node).expect("failed to create planted KFD node");
+    std::fs::write(
+        node.join("properties"),
+        "cpu_cores_count 0\nsimd_count 96\ngfx_target_version 110000\n",
+    )
+    .expect("failed to write planted KFD node properties");
+    world
+        .command_env
+        .push(("ROCM_CLI_TEST_HOST_ROOT", host.into_os_string()));
+    // An empty PCI bus, so a runner's real card cannot join the planted one.
+    let bin = root.join("released-gpu-bin");
+    std::fs::create_dir_all(&bin).expect("failed to create the fake PATH dir");
+    rocm_core::fake_executable::write_fake_executable(&bin.join("lspci"), "#!/bin/sh\nexit 0\n")
+        .expect("failed to write the fake lspci");
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .expect("PATH entries cannot hold a separator");
+    world.command_env.push(("PATH", path));
+}
+
+#[when("the user asks the CLI what that machine's report would carry in machine-readable form")]
+async fn user_asks_for_the_simulated_machines_report(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) =
+        crate::run_rocm_with_scenario_env(world, &["diagnose", "--report", "--json"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the report names the CLI version that `rocm version` leads with")]
+async fn report_names_the_rocm_version_leading_version(world: &mut E2eWorld) {
+    let out = world.cli_output.clone().expect("no CLI output");
+    let stderr = world.cli_stderr.clone().unwrap_or_default();
+    assert_eq!(world.cli_rc, Some(0), "{out}\n{stderr}");
+    let report: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|err| {
+        panic!("the planted released GPU did not produce a JSON report ({err}):\n{out}\n{stderr}")
+    });
+    let reported = report["cli_version"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the report has no cli_version:\n{report:#}"));
+
+    let (version_out, version_err, version_rc) = crate::run_rocm(world, &["version"]);
+    assert_eq!(version_rc, 0, "{version_out}\n{version_err}");
+    let first_line = version_out.lines().next().unwrap_or_default().trim();
+    let leading = first_line
+        .strip_prefix("rocm-cli ")
+        .and_then(|rest| rest.split_once(" ("))
+        .map(|(version, _)| version)
+        .unwrap_or_else(|| panic!("expected 'rocm-cli <version> (<ref>, <hash>)': {first_line}"));
+    assert_eq!(
+        reported, leading,
+        "the report's cli_version is not the version `rocm version` leads with \
+         ({first_line}):\n{report:#}"
+    );
+}

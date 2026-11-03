@@ -727,3 +727,15 @@ Feature: Diagnosing failures and listing fixes
     Given a simulated Linux machine with ROCm missing from PATH
     When the user diagnoses that machine with a rocminfo not found symptom
     Then the PATH cause prints a verify line that shows the GPU with rocminfo alone
+
+  # A report names the CLI that wrote it with the version `rocm version` leads
+  # with (`X.Y.Z` for a release tag, `0.0.0-dev` for any other ref), not the
+  # frozen workspace package version. Only that one token: the ref and hash
+  # after it can carry a local branch name. The host is simulated as in
+  # diagnose-40, with a released GPU instead, so a report is prepared on every
+  # Linux lane rather than only on one whose own GPU is on the matrix.
+  @id:diagnose-report-names-the-cli-version @requires-os:linux
+  Scenario: diagnose-48 - A problem report names the CLI version that rocm version prints
+    Given a simulated Linux machine whose only GPU is a released one
+    When the user asks the CLI what that machine's report would carry in machine-readable form
+    Then the report names the CLI version that `rocm version` leads with

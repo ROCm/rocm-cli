@@ -15,7 +15,12 @@
 //! - unresolved ref (`unknown`: no tag, no branch, no git) →
 //!   `<CARGO_PKG_VERSION> (unknown, <hash>)`
 //!
-//! `ROCM_CLI_VERSION_REF` and `ROCM_CLI_GIT_HASH` stay set to those inputs.
+//! `ROCM_CLI_VERSION_NUMBER` is that leading version on its own, and
+//! `ROCM_CLI_VERSION_REF` and `ROCM_CLI_GIT_HASH` stay set to the inputs.
+//!
+//! A ref that resolved to the literal name `unknown` (a branch or
+//! `ROCM_CLI_RELEASE_REF` of that name) is indistinguishable from one that did
+//! not resolve, and takes the package-version fallback.
 //! The workspace package version is shared by every crate and unpublished, so
 //! it is the leading version only when the ref did not resolve.
 
@@ -64,6 +69,14 @@ fn main() {
         "cargo:rustc-env=ROCM_CLI_VERSION={}",
         format_cli_version(&version_ref, &git_hash, &pkg_version)
     );
+    // Its leading version on its own, for one-token fields (`rocm update`'s
+    // `cli: installed=`, a problem report's `cli_version`). Exported from the
+    // same function rather than cut back out of the string above, so no
+    // consumer depends on how that string is laid out.
+    println!(
+        "cargo:rustc-env=ROCM_CLI_VERSION_NUMBER={}",
+        cli_version_number(&version_ref, &pkg_version)
+    );
 }
 
 /// Leading version for a build whose ref resolved and is not a release tag.
@@ -87,8 +100,19 @@ fn format_cli_version(version_ref: &str, git_hash: &str, cargo_pkg_version: &str
     } else {
         git_hash
     };
-    let version = displayed_version(resolved_ref, cargo_pkg_version);
+    let version = cli_version_number(resolved_ref, cargo_pkg_version);
     format!("{version} ({resolved_ref}, {resolved_hash})")
+}
+
+/// The leading version of [`format_cli_version`]'s string, which that
+/// function is built from. An empty ref is `unknown`, as there.
+fn cli_version_number(version_ref: &str, cargo_pkg_version: &str) -> String {
+    let resolved_ref = if version_ref.is_empty() {
+        "unknown"
+    } else {
+        version_ref
+    };
+    displayed_version(resolved_ref, cargo_pkg_version)
 }
 
 fn displayed_version(version_ref: &str, cargo_pkg_version: &str) -> String {
@@ -250,7 +274,7 @@ fn run_git_at(cwd: &Path, args: &[&str]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_cli_version, git_watch_paths};
+    use super::{cli_version_number, format_cli_version, git_watch_paths};
     use std::fs;
     use std::path::Path;
     use std::process::Command;
@@ -497,6 +521,43 @@ mod tests {
     }
 
     #[test]
+    fn format_cli_version_rejects_other_near_misses_of_a_release_tag() {
+        // Too many components, as the parser's own comment says.
+        assert_eq!(
+            format_cli_version("v1.2.3.4", "abcdef1", "0.1.0"),
+            "0.0.0-dev (v1.2.3.4, abcdef1)"
+        );
+        // A build separator with nothing after it, the `+` twin of `v1.2.3-`.
+        assert_eq!(
+            format_cli_version("v1.2.3+", "abcdef1", "0.1.0"),
+            "0.0.0-dev (v1.2.3+, abcdef1)"
+        );
+        // A pre-release and a build suffix together are still a release.
+        assert_eq!(
+            format_cli_version("v1.2.3-rc.1+build.5", "abcdef1", "0.1.0"),
+            "1.2.3-rc.1+build.5 (v1.2.3-rc.1+build.5, abcdef1)"
+        );
+    }
+
+    #[test]
+    fn cli_version_number_is_the_leading_version_of_format_cli_version() {
+        for (version_ref, hash, package) in [
+            ("v0.2.1", "1cde824", "0.1.0"),
+            ("v0.2.1-rc.1", "1cde824", "0.1.0"),
+            ("main", "abcdef1", "0.1.0"),
+            ("unknown", "abcdef1", "0.1.0"),
+            ("", "", ""),
+        ] {
+            let number = cli_version_number(version_ref, package);
+            let full = format_cli_version(version_ref, hash, package);
+            assert!(
+                full.starts_with(&format!("{number} (")),
+                "{number:?} does not lead {full:?}"
+            );
+        }
+    }
+
+    #[test]
     fn embedded_cli_version_uses_format_cli_version() {
         // The build script exports one string. This ties that export to the
         // formatter, using the ref and hash this checkout actually resolved.
@@ -507,6 +568,10 @@ mod tests {
                 env!("ROCM_CLI_GIT_HASH"),
                 env!("CARGO_PKG_VERSION"),
             )
+        );
+        assert_eq!(
+            env!("ROCM_CLI_VERSION_NUMBER"),
+            cli_version_number(env!("ROCM_CLI_VERSION_REF"), env!("CARGO_PKG_VERSION"))
         );
     }
 }

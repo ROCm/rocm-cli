@@ -225,7 +225,7 @@ mod tests {
     }
 
     fn report_of(entry: Option<&str>) -> Report {
-        prepare_report(&reportable_machine(), entry, false)
+        prepare_report(&reportable_machine(), entry, false, "0.0.0-dev")
             .expect("a released machine must produce a report")
     }
 
