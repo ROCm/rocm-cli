@@ -1561,6 +1561,36 @@ so it carries `@requires-dir-permissions` and resolves to a skip for a user the
 permission bits do not bind (the self-hosted WSL2 guest runs as root) rather
 than pass without testing the fallback.
 
+Background helper (`rocm daemon`) lifecycle tests:
+
+```bash
+cargo nextest run -p rocm -E 'test(background_helper_not_spawned_when_no_automation_is_enabled) | test(background_helper_spawned_when_an_automation_is_enabled) | test(background_helper_is_started_when_the_exiting_daemon_publishes_stopped) | test(helper_note) | test(stop_output_carries) | test(plan_warns_about_a_helper) | test(unreadable_config)'
+cargo nextest run -p rocmd -E 'test(automation_loop_)'
+```
+
+The first command checks that the autostart shared by `serve` and
+`automations enable` spawns the helper only while an automation watcher is
+enabled, and that an enable racing the helper's exit still gets a helper (the
+decision is made under the autostart lock). The second drives the helper's loop
+with a fast injected tick: it exits on its own once no watcher is enabled,
+keeps running across several ticks while one is, stays when a watcher is
+re-enabled inside the exit window, and publishes "stopped" and clears its spawn
+claim under the autostart lock. The lock wait is its own select arm polled with
+try-lock, so it neither parks a thread nor delays webhook dispatch or shutdown
+(a test shuts the loop down while the lock is held) and gives up a stuck wait.
+The note that `services stop` and `rocm uninstall` print about the helper is
+derived from both whether a watcher is enabled and whether the helper is running:
+`helper_note_follows_watcher_enabled_and_helper_running` pins the exact text for
+all four combinations, `stop_output_carries_the_helper_note_...` and
+`plan_warns_about_a_helper_...` pin what each surface prints for them, and
+`background_helper_autostart_treats_an_unreadable_config_as_no_watcher` keeps a
+bad config from failing a `serve` after its launch. The user-visible side is `automations-11` in
+[automations.feature](../tests/e2e-cucumber/features/automations.feature)
+(mock lane: enable starts a live helper, disabling the last watcher makes it
+exit) and `serve-40` in
+[model_serving.feature](../tests/e2e-cucumber/features/model_serving.feature)
+(GPU lane: serving with no watcher enabled starts no helper).
+
 Natural-language plan handoff tests:
 
 ```bash
