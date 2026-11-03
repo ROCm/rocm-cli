@@ -1006,6 +1006,7 @@ Log browser smoke:
 rocm logs
 rocm logs --search server
 rocm logs --service <service-id>
+rocm logs --service <service-id> --follow   # Ctrl-C to stop following
 ```
 
 The no-log first-run path should report `no CLI logs found yet` without

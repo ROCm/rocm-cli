@@ -1288,12 +1288,17 @@ provider settings are left untouched.
 ### Logs and cleanup
 
 ```
-rocm logs [--service <service-id>] [--search TERM ...] [QUERY ...]
+rocm logs [--service <service-id> [--follow]] [--search TERM ...] [QUERY ...]
+rocm services logs <service-id> [--follow]
 
 rocm uninstall [--yes] [--dry-run]
                [--keep-binaries] [--keep-config] [--keep-data] [--keep-cache]
                [--force-dev-binaries]
 ```
+
+`--follow` (`-f`) keeps printing a server's new log output, such as a model
+download's progress, until the server stops. Ctrl-C ends the follow and leaves
+the server running.
 
 `rocm uninstall` removes four categories of files that ROCm CLI manages on this
 computer: its binaries, configuration, data, and caches. It lists what it will

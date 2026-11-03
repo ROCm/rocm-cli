@@ -24,3 +24,21 @@ Feature: Log inspection
     Given recorded command logs containing several lines about a topic
     When the user asks for one service's logs and a search term together
     Then the CLI refuses and explains only one may be used
+
+  # `--follow` keeps printing new output while a server starts (a model download
+  # can take many minutes). It ends by itself once the server is no longer
+  # starting or running, so the scenario plants a stopped record: the snapshot
+  # is printed, the CLI says it is not following, and the command returns
+  # instead of waiting. Streaming new output from a live service is covered by
+  # `follow_service_logs_streams_new_output_until_the_service_stops` in
+  # `apps/rocm/src/services_text.rs`.
+  @id:logs-follow-stopped-service-returns
+  Scenario: logs-04 - Following a stopped server's logs prints them and returns
+    Given a stopped local server whose log shows a download at 43 percent
+    When the user follows that server's logs
+    Then the CLI prints the download line, says it is not following, and exits
+
+  @id:logs-follow-requires-service
+  Scenario: logs-05 - Following without naming a server is refused
+    When the user asks to follow logs without naming a service
+    Then the CLI refuses because --follow needs --service

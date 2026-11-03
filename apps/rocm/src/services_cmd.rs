@@ -36,8 +36,8 @@ use crate::service_records::{
     prune_managed_service_records, remove_managed_service_record, service_prune_min_age_hours,
 };
 use crate::services_text::{
-    render_service_action_result_with_helper_note, render_service_logs_text, render_services_json,
-    render_services_text, run_internal_sandbox_tool, validate_service_id,
+    follow_service_logs, render_service_action_result_with_helper_note, render_service_logs_text,
+    render_services_json, render_services_text, run_internal_sandbox_tool, validate_service_id,
 };
 
 pub(crate) fn services(command: Option<ServicesCommand>) -> Result<()> {
@@ -54,9 +54,13 @@ pub(crate) fn services(command: Option<ServicesCommand>) -> Result<()> {
             }
             Ok(())
         }
-        ServicesCommand::Logs { service_id } => {
-            print!("{}", render_service_logs_text(&paths, &service_id)?);
-            Ok(())
+        ServicesCommand::Logs { service_id, follow } => {
+            if follow {
+                follow_service_logs(&paths, &service_id)
+            } else {
+                print!("{}", render_service_logs_text(&paths, &service_id)?);
+                Ok(())
+            }
         }
         ServicesCommand::Stop { service_id, yes } => {
             run_approved_service_action(&paths, "stop_server", &service_id, yes)

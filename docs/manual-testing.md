@@ -364,6 +364,7 @@ After a managed or foreground serve attempt, inspect local server records:
 rocm services
 rocm services list --all
 rocm services logs <service-id>
+rocm services logs <service-id> --follow
 ```
 
 Expected result:

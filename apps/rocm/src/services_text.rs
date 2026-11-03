@@ -88,7 +88,7 @@
 use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::fs;
-use std::io::{self, BufRead};
+use std::io::{self, BufRead, Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
 #[cfg(not(windows))]
 use std::process::Stdio;
@@ -548,6 +548,165 @@ pub(crate) fn render_service_action_result_with_helper_note(
         let _ = writeln!(text, "  note: {}", note.text);
     }
     text
+}
+
+/// How often `--follow` looks for new log output.
+const LOG_FOLLOW_POLL: Duration = Duration::from_millis(500);
+/// How often `--follow` re-reads the service record to see whether it stopped.
+const LOG_FOLLOW_LIVENESS_EVERY: Duration = Duration::from_secs(2);
+
+/// Reads whatever a growing log file gained since the last [`Self::poll`].
+///
+/// Download bars (tqdm, huggingface_hub) redraw in place with `\r`, so a
+/// finished segment ends at either `\r` or `\n`; a trailing partial segment is
+/// held back until its terminator arrives.
+struct LogTail {
+    path: PathBuf,
+    offset: u64,
+    pending: Vec<u8>,
+}
+
+/// One completed piece of log output and whether it ended in a carriage return.
+#[derive(Debug, PartialEq, Eq)]
+struct LogSegment {
+    text: String,
+    redraw: bool,
+}
+
+impl LogTail {
+    /// Start following at the file's current end.
+    fn at_end(path: &Path) -> Self {
+        let offset = fs::metadata(path).map_or(0, |meta| meta.len());
+        Self {
+            path: path.to_path_buf(),
+            offset,
+            pending: Vec::new(),
+        }
+    }
+
+    fn poll(&mut self) -> Vec<LogSegment> {
+        let Ok(mut file) = fs::File::open(&self.path) else {
+            return Vec::new();
+        };
+        let len = file.metadata().map_or(0, |meta| meta.len());
+        if len < self.offset {
+            // Truncated or replaced (a restart reuses the path): start over.
+            self.offset = 0;
+            self.pending.clear();
+        }
+        if file.seek(SeekFrom::Start(self.offset)).is_err() {
+            return Vec::new();
+        }
+        let mut fresh = Vec::new();
+        if file.read_to_end(&mut fresh).is_err() {
+            return Vec::new();
+        }
+        self.offset += fresh.len() as u64;
+        self.pending.extend_from_slice(&fresh);
+
+        let mut segments = Vec::new();
+        let mut start = 0;
+        let mut index = 0;
+        while index < self.pending.len() {
+            let byte = self.pending[index];
+            if byte == b'\n' || byte == b'\r' {
+                let mut redraw = byte == b'\r';
+                let text = String::from_utf8_lossy(&self.pending[start..index]).into_owned();
+                // `\r\n` is one line break, not a redraw followed by an empty line.
+                if redraw && self.pending.get(index + 1) == Some(&b'\n') {
+                    redraw = false;
+                    index += 1;
+                }
+                segments.push(LogSegment { text, redraw });
+                start = index + 1;
+            }
+            index += 1;
+        }
+        self.pending.drain(..start);
+        segments
+    }
+}
+
+fn write_log_segments(out: &mut impl io::Write, segments: &[LogSegment], tty: bool) -> Result<()> {
+    for segment in segments {
+        match (tty, segment.redraw) {
+            // Redraw the same terminal row, as the engine's own bar does.
+            (true, true) => write!(out, "\r\x1b[2K{}", segment.text)?,
+            (true, false) => writeln!(out, "\r\x1b[2K{}", segment.text)?,
+            (false, _) => writeln!(out, "{}", segment.text)?,
+        }
+    }
+    out.flush()?;
+    Ok(())
+}
+
+/// `rocm logs --service <id> --follow`: print the recent output, then keep
+/// printing new output until the service is no longer starting or running.
+/// Ctrl-C ends the follow and leaves the service running.
+pub(crate) fn follow_service_logs(paths: &AppPaths, service_id: &str) -> Result<()> {
+    use std::io::IsTerminal as _;
+    let mut out = io::stdout();
+    let tty = out.is_terminal();
+    follow_service_logs_with(
+        paths,
+        service_id,
+        &mut out,
+        tty,
+        LOG_FOLLOW_POLL,
+        LOG_FOLLOW_LIVENESS_EVERY,
+    )
+}
+
+fn follow_service_logs_with(
+    paths: &AppPaths,
+    service_id: &str,
+    out: &mut impl io::Write,
+    tty: bool,
+    poll: Duration,
+    liveness_every: Duration,
+) -> Result<()> {
+    let record = load_managed_service(paths, service_id)?;
+    // Open the tail before the snapshot so output written in between is not lost.
+    let mut tail = LogTail::at_end(&record.log_path);
+    write!(out, "{}", render_service_logs_text(paths, service_id)?)?;
+    if !managed_service_is_live(&record) {
+        writeln!(
+            out,
+            "\nService {service_id} is {}; not following.",
+            record.status
+        )?;
+        return Ok(());
+    }
+    writeln!(
+        out,
+        "\nFollowing {service_id} - Ctrl-C stops following and leaves the server running."
+    )?;
+    out.flush()?;
+
+    let mut since_check = Duration::ZERO;
+    loop {
+        thread::sleep(poll);
+        write_log_segments(out, &tail.poll(), tty)?;
+        since_check += poll;
+        if since_check < liveness_every {
+            continue;
+        }
+        since_check = Duration::ZERO;
+        let record = load_managed_service(paths, service_id)?;
+        if !managed_service_is_live(&record) {
+            // Output written between the last poll and the exit.
+            write_log_segments(out, &tail.poll(), tty)?;
+            if tty {
+                writeln!(out)?;
+            }
+            writeln!(
+                out,
+                "Service {service_id} is {}; stopped following.",
+                record.status
+            )?;
+            return Ok(());
+        }
+    }
 }
 
 pub(crate) fn render_service_action_result(tool: &str, value: &serde_json::Value) -> String {
@@ -1655,6 +1814,152 @@ mod tests {
             assert_eq!(rendered, expected);
         }
         assert!(!paths.service_manifest_path("nope").exists());
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn log_tail_yields_only_new_complete_segments() -> Result<()> {
+        let (root, paths) = test_paths("log-tail");
+        paths.ensure()?;
+        let log = root.join("tail.log");
+        fs::write(&log, "old line\n")?;
+        let mut tail = LogTail::at_end(&log);
+        assert!(tail.poll().is_empty());
+
+        // tqdm-style bar redraws with `\r`; the last piece has no terminator yet.
+        fs::write(&log, "old line\n 28%|##\r 33%|###\rdone\r\nhalf")?;
+        let segments = tail.poll();
+        assert_eq!(
+            segments,
+            vec![
+                LogSegment {
+                    text: " 28%|##".into(),
+                    redraw: true
+                },
+                LogSegment {
+                    text: " 33%|###".into(),
+                    redraw: true
+                },
+                LogSegment {
+                    text: "done".into(),
+                    redraw: false
+                },
+            ]
+        );
+        // The held-back partial segment completes on the next poll.
+        let mut file = fs::OpenOptions::new().append(true).open(&log)?;
+        std::io::Write::write_all(&mut file, b" line\n")?;
+        assert_eq!(
+            tail.poll(),
+            vec![LogSegment {
+                text: "half line".into(),
+                redraw: false
+            }]
+        );
+
+        // A truncated log (restart reusing the path) is read from the start.
+        fs::write(&log, "new\n")?;
+        assert_eq!(
+            tail.poll(),
+            vec![LogSegment {
+                text: "new".into(),
+                redraw: false
+            }]
+        );
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn follow_service_logs_prints_snapshot_and_returns_for_a_stopped_service() -> Result<()> {
+        let (root, paths) = test_paths("follow-stopped");
+        paths.ensure()?;
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc_follow_stopped",
+            "vllm",
+            "qwen3.5",
+            "Qwen/Qwen3.5",
+            "127.0.0.1",
+            11436,
+            "managed",
+            0,
+            None,
+            None,
+            None,
+        );
+        record.status = "stopped".to_owned();
+        record.write()?;
+        fs::write(&record.log_path, "Downloading 86%\n")?;
+
+        let mut out = Vec::new();
+        follow_service_logs_with(
+            &paths,
+            "svc_follow_stopped",
+            &mut out,
+            false,
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+        )?;
+        let out = String::from_utf8(out)?;
+        assert!(out.contains("Downloading 86%"), "{out}");
+        assert!(
+            out.contains("Service svc_follow_stopped is stopped; not following."),
+            "{out}"
+        );
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn follow_service_logs_streams_new_output_until_the_service_stops() -> Result<()> {
+        let (root, paths) = test_paths("follow-live");
+        paths.ensure()?;
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc_follow_live",
+            "vllm",
+            "qwen3.5",
+            "Qwen/Qwen3.5",
+            "127.0.0.1",
+            11437,
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            None,
+        );
+        record.status = "starting".to_owned();
+        record.write()?;
+        fs::write(&record.log_path, "before\n")?;
+
+        let log_path = record.log_path;
+        let manifest_paths = paths.clone();
+        let writer = thread::spawn(move || -> Result<()> {
+            thread::sleep(Duration::from_millis(150));
+            let mut file = fs::OpenOptions::new().append(true).open(&log_path)?;
+            std::io::Write::write_all(&mut file, b"Downloading 43%\n")?;
+            thread::sleep(Duration::from_millis(150));
+            let mut record = load_managed_service(&manifest_paths, "svc_follow_live")?;
+            record.status = "stopped".to_owned();
+            record.write()?;
+            Ok(())
+        });
+        let mut out = Vec::new();
+        follow_service_logs_with(
+            &paths,
+            "svc_follow_live",
+            &mut out,
+            false,
+            Duration::from_millis(20),
+            Duration::from_millis(40),
+        )?;
+        writer.join().expect("writer thread")?;
+        let out = String::from_utf8(out)?;
+        assert!(out.contains("Following svc_follow_live"), "{out}");
+        assert!(out.contains("Downloading 43%"), "{out}");
+        assert!(out.contains("stopped following"), "{out}");
         let _ = fs::remove_dir_all(root);
         Ok(())
     }

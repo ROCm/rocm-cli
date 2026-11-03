@@ -148,7 +148,7 @@ use crate::service_records::DEFAULT_SERVICE_PRUNE_MIN_AGE_HOURS;
 use crate::services_cmd::run_approved_service_action;
 use crate::services_cmd::services;
 use crate::services_text::{
-    render_internal_status_text, render_logs_browser_text, render_logs_text,
+    follow_service_logs, render_internal_status_text, render_logs_browser_text, render_logs_text,
     render_service_logs_text, run_internal_sandbox_tool,
 };
 use crate::setup_cmd::{render_setup_status_text, setup};
@@ -682,11 +682,16 @@ rocm serve qwen --verbose --device gpu_required")]
     #[command(after_help = "EXAMPLES:\n  \
 rocm logs\n  \
 rocm logs --service <service-id>\n  \
+rocm logs --service <service-id> --follow\n  \
 rocm logs --search error timeout")]
     Logs {
         /// Show logs for a managed service id.
         #[arg(long)]
         service: Option<String>,
+        /// Keep printing new output for --service until the server stops (Ctrl-C ends the
+        /// follow and leaves the server running). Use it to watch a model download.
+        #[arg(long, short = 'f', requires = "service")]
+        follow: bool,
         /// Search recent logs for one or more words.
         #[arg(long, num_args = 1.., value_name = "QUERY")]
         search: Vec<String>,
@@ -1170,6 +1175,10 @@ enum ServicesCommand {
     Logs {
         /// Service id from `rocm services list`.
         service_id: String,
+        /// Keep printing new output until the server stops (Ctrl-C ends the follow and
+        /// leaves the server running). Use it to watch a model download.
+        #[arg(long, short = 'f')]
+        follow: bool,
     },
     /// Stop a local model server.
     Stop {
@@ -2162,6 +2171,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         Some(Command::Config { command }) => config(command),
         Some(Command::Logs {
             service,
+            follow,
             search,
             query,
         }) => {
@@ -2177,7 +2187,11 @@ fn dispatch(cli: Cli) -> Result<()> {
                 );
             }
             if let Some(service_id) = service {
-                print!("{}", render_service_logs_text(&paths, &service_id)?);
+                if follow {
+                    follow_service_logs(&paths, &service_id)?;
+                } else {
+                    print!("{}", render_service_logs_text(&paths, &service_id)?);
+                }
             } else {
                 let query = if search.is_empty() {
                     (!query.is_empty()).then(|| query.join(" "))
