@@ -1088,16 +1088,6 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
             .collect()
     }
 
-    /// The ids of every job in a workflow's `jobs:` block, in file order.
-    fn workflow_job_ids(text: &str) -> Vec<String> {
-        top_level_block(text, "jobs")
-            .lines()
-            .filter(|line| indent_of(line) == 2 && !line.trim_start().starts_with('#'))
-            .filter_map(|line| line.trim().strip_suffix(':'))
-            .map(str::to_owned)
-            .collect()
-    }
-
     /// `(line number, line)` for every line naming `ubuntu-latest` outside a
     /// comment, wherever it sits: a `runs-on`, a matrix list, an `include`.
     fn moving_ubuntu_label_lines(text: &str) -> Vec<(usize, String)> {
@@ -1160,8 +1150,10 @@ jobs:
     }
 
     /// The `ci.yml` jobs that run on both Ubuntu LTS images, with the name each
-    /// reported before the split. Branch protection requires these names
-    /// verbatim, so the 24.04 leg must keep reporting them.
+    /// reported before the split. Branch protection requires the first three
+    /// names verbatim, so the 24.04 leg must keep reporting them; the
+    /// `remote-ssh` check is not required, and keeps its name so that it can
+    /// be made required without a rename.
     const LTS_SPLIT_JOBS: [(&str, &str); 4] = [
         ("build-and-test", "build-and-test"),
         ("test", "Test (affected crates)"),
@@ -1191,7 +1183,7 @@ jobs:
                  expected the line `{expected}`"
             );
             assert_eq!(
-                flattened_values(block, "runs-on"),
+                runs_on_values(block),
                 vec!["${{ matrix.os }}".to_owned()],
                 "ci.yml job `{job}` must run on its matrix image"
             );
@@ -1213,11 +1205,111 @@ jobs:
         }
     }
 
+    /// Run `ci.yml`'s E2E "Decide whether to run" step under bash, as a `run:`
+    /// step does, with each `${{ … }}` expression replaced by the value given
+    /// for it, and return what it wrote to `run=` in `$GITHUB_OUTPUT`.
+    ///
+    /// An expression the table does not name fails the test rather than
+    /// expanding to nothing, so the gate cannot start reading a new context
+    /// that this test silently feeds as empty.
+    #[cfg(unix)]
+    fn run_e2e_gate(event: &str, build_and_test: &str, heavy: &str) -> String {
+        let ci = read_workflow("ci.yml");
+        let step = job_steps(job_block(&ci, "e2e"))
+            .expect("ci.yml's `e2e` job has a `steps:` list")
+            .into_iter()
+            .find_map(|(name, step)| (name == "Decide whether to run").then_some(step))
+            .expect("ci.yml's `e2e` job has a \"Decide whether to run\" step");
+        let mut script = dedent(&run_block(&step).expect(
+            "the E2E gate step has no `run: |` block; `run_block` reads only that \
+             literal form, not `run: |-`, `run: >` or a one-line `run:`",
+        ))
+        .expect("the gate step's script is not empty");
+        let values = [
+            ("github.event_name", event),
+            ("needs.build-and-test.result", build_and_test),
+            ("needs.changes.outputs.heavy", heavy),
+        ];
+        while let Some(open) = script.find("${{") {
+            let close = open
+                + script[open..]
+                    .find("}}")
+                    .expect("every `${{` in the gate step is closed");
+            let expr = script[open + 3..close].trim().to_owned();
+            let value = values
+                .iter()
+                .find(|(name, _)| *name == expr)
+                .unwrap_or_else(|| {
+                    panic!("the E2E gate reads `{expr}`, which this test does not feed")
+                })
+                .1;
+            script.replace_range(open..close + 2, value);
+        }
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let output = dir.path().join("github_output");
+        std::fs::write(&output, "").expect("write GITHUB_OUTPUT");
+        let out = std::process::Command::new("bash")
+            .arg("-e")
+            .arg("-c")
+            .arg(&script)
+            .env("GITHUB_OUTPUT", &output)
+            .output()
+            .expect("running the gate script");
+        assert!(
+            out.status.success(),
+            "the E2E gate script failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let written = std::fs::read_to_string(&output).expect("read GITHUB_OUTPUT");
+        let runs: Vec<&str> = written
+            .lines()
+            .filter_map(|line| line.strip_prefix("run="))
+            .collect();
+        assert_eq!(
+            runs.len(),
+            1,
+            "the E2E gate writes `run=` exactly once; wrote {written:?}"
+        );
+        runs[0].to_owned()
+    }
+
+    /// The E2E scenarios run whenever `build-and-test` reached a verdict, not
+    /// only when it succeeded.
+    ///
+    /// `build-and-test` is a matrix over both LTS images and `needs` sees only
+    /// its aggregate result, so a failure on ubuntu-26.04 alone reads as
+    /// `failure` here. Gating on `success` alone would then skip the scenarios
+    /// on the required 24.04 leg, which would report green without having run
+    /// one.
+    #[cfg(unix)]
+    #[test]
+    fn e2e_gate_runs_scenarios_whenever_build_and_test_reached_a_verdict() {
+        // (event, build-and-test result, heavy, expected run=)
+        let cases = [
+            ("pull_request", "success", "true", "true"),
+            ("pull_request", "failure", "true", "true"),
+            ("merge_group", "failure", "true", "true"),
+            ("pull_request", "cancelled", "true", "false"),
+            ("pull_request", "skipped", "true", "false"),
+            ("pull_request", "success", "false", "false"),
+            ("pull_request", "failure", "false", "false"),
+            ("workflow_dispatch", "skipped", "", "true"),
+        ];
+        for (event, result, heavy, expected) in cases {
+            assert_eq!(
+                run_e2e_gate(event, result, heavy),
+                expected,
+                "ci.yml E2E gate with event={event}, build-and-test={result}, heavy={heavy:?}"
+            );
+        }
+    }
+
     /// The runner image a hosted Linux job's caches must be keyed by, as it
     /// appears in a key: the literal image, or `matrix.os` for a split job.
     /// `None` for a job that is not a hosted Linux job.
     fn hosted_linux_image_token(job_block_text: &str) -> Option<String> {
-        let runs_on = flattened_values(job_block_text, "runs-on");
+        let runs_on = runs_on_values(job_block_text);
         let value = runs_on.first()?;
         if value == "${{ matrix.os }}" {
             Some("matrix.os".to_owned())
@@ -1242,7 +1334,7 @@ jobs:
     fn hosted_linux_compile_caches_are_keyed_by_runner_image() {
         let mut checked = 0;
         for (name, text) in all_workflows() {
-            for job in workflow_job_ids(&text) {
+            for job in job_ids(&text) {
                 let block = job_block(&text, &job);
                 let Some(image) = hosted_linux_image_token(block) else {
                     continue;

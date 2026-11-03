@@ -467,6 +467,18 @@ prefixed but distinct from the self-hosted names above, so no name string
 actually collides). An offline or unclaimed self-hosted runner can no longer
 block a merge.
 
+**Hosted Ubuntu images.** `build-and-test`, `test`, `e2e` and `remote-ssh`
+each run on both `ubuntu-24.04` and `ubuntu-26.04`. The 24.04 legs keep the
+check names these jobs always had, and three of those are required
+(`build-and-test`, `Test (affected crates)`, `E2E tests`);
+`remote control channel (containerised)` is not required on either image. The
+26.04 legs report with an `(ubuntu-26.04)` suffix, and none of those names is a
+required check yet (confirmed 2026-11-02), so a failure that occurs only on
+26.04 shows red but does not block a merge. Making 26.04 blocking takes an
+admin adding `build-and-test (ubuntu-26.04)`,
+`Test (affected crates) (ubuntu-26.04)` and `E2E tests (ubuntu-26.04)` to the
+required list.
+
 ## Fork safety
 
 Self-hosted runners are not used for untrusted fork pull requests: GitHub

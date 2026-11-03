@@ -1257,9 +1257,10 @@ jobs:
     #
     # No GPU, no ROCm, no tailnet: the remote's `rocm` and `tailscale` are
     # stand-ins that answer in the shapes the real tools do.
-    # Runs on both Ubuntu LTS images. The 24.04 leg keeps the bare name,
-    # which is what branch protection requires; the 26.04 leg reports as
-    # "remote control channel (containerised) (ubuntu-26.04)".
+    # Runs on both Ubuntu LTS images. The 24.04 leg keeps the bare name, the
+    # one this check has always reported under; the 26.04 leg reports as
+    # "remote control channel (containerised) (ubuntu-26.04)". Neither leg is
+    # a required check today.
     name: ${{ matrix.os == 'ubuntu-24.04' && 'remote control channel (containerised)' || format('remote control channel (containerised) ({0})', matrix.os) }}
     strategy:
       fail-fast: false
