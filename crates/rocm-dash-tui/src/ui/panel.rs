@@ -21,8 +21,9 @@
 //!
 //! Popup geometry and framing live here too, beside [`popup`]: [`centered_rect`]
 //! (with [`centered_width`]), [`draw_popup_frame`] and [`grey_overlay`], shared by
-//! `ui/approval.rs`, `ui/job_console.rs` and the other overlays, and by
-//! `ui/modal.rs`.
+//! `ui/approval.rs`, `ui/job_console.rs` and the other overlays, and by the
+//! Modal renderers (`ui/help_modal.rs`, `ui/warnings_modal.rs`,
+//! `ui/theme_picker.rs` and `ui/menu.rs`).
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -362,7 +363,7 @@ pub fn horizontal_scrollbar(
 /// overflow a `u16`.
 ///
 /// `area.height * pct_y` overflows above 655 rows once `pct_y` is 100 — which
-/// [`draw_help`](crate::ui::modal::draw_help) now passes, to mean "the whole area when the content is taller
+/// [`draw_help`](crate::ui::help_modal::draw_help) now passes, to mean "the whole area when the content is taller
 /// than it". That is a debug-build panic on a terminal tall enough (tmux panes
 /// and some GUI terminals report large synthetic sizes), and a wrap-around in
 /// release. Widening here removes the ceiling for every caller rather than
