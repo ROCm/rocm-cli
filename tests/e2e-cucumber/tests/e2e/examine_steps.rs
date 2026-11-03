@@ -2062,3 +2062,128 @@ async fn assert_examine_driver_age_follows_the_date(world: &mut E2eWorld) {
         "{age}"
     );
 }
+
+/// The `rocm_support` line's value, or `None` when the report has no such line.
+fn rocm_support_line(output: &str) -> Option<&str> {
+    field_value(output, "rocm_support")
+}
+
+/// What `rocm examine` reported as the detected GPU target and the ROCm package
+/// family covering it, with the report's `<unknown>` placeholder read back as
+/// "absent" so the two can be reasoned about as the CLI's own
+/// `gpu_support_level` inputs.
+fn detected_gpu_facts(output: &str) -> (Option<&str>, Option<&str>) {
+    let field = |name| field_value(output, name).filter(|value| *value != "<unknown>");
+    (
+        field("detected_gfx_target"),
+        field("compatible_therock_family"),
+    )
+}
+
+/// ROCMAI-550: the report answers the support question on every host, including
+/// the ones where the honest answer is "this build cannot tell".
+#[then("the inspection states this host's ROCm support level")]
+async fn assert_examine_states_a_support_level(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no command was run");
+    let line = rocm_support_line(output).unwrap_or_else(|| {
+        panic!(
+            "`rocm examine` printed no `rocm_support` line. Other surfaces send \
+             the user here to find out whether this GPU is supported, so there \
+             is no host on which the answer may be silence:\n{output}"
+        )
+    });
+    assert!(
+        !line.is_empty(),
+        "the `rocm_support` line states nothing:\n{output}"
+    );
+}
+
+/// The cross-check. The claim is judged against the two facts the same report
+/// prints, not against a hardcoded expectation, so this says something on every
+/// lane: the mock lane detects no GPU and must not be told it has ROCm support;
+/// the GPU runners have a covering package family and must not be told their
+/// card has no ROCm build.
+#[then("the support level agrees with the GPU the inspection detected")]
+async fn assert_support_level_agrees_with_detection(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no command was run");
+    let line = rocm_support_line(output).expect("no rocm_support line");
+    let (detected, family) = detected_gpu_facts(output);
+
+    match (detected, family) {
+        // A package family covers this GPU: full ROCm/HIP support, and the
+        // report must not hedge it into either of the weaker answers.
+        (_, Some(_)) => {
+            assert!(
+                line.contains("full ROCm/HIP support"),
+                "a GPU with a covering ROCm package family is supported, and the \
+                 support line must say so: {line}\n{output}"
+            );
+            assert!(
+                !line.contains("not supported by ROCm") && !line.starts_with("unknown"),
+                "{line}\n{output}"
+            );
+        }
+        // Nothing detected at all. The honest answer is "unknown"; claiming
+        // either support or a working Vulkan backend would be inventing
+        // hardware.
+        (None, None) => {
+            assert!(
+                line.starts_with("unknown"),
+                "no GPU was detected, so neither support nor its absence can be \
+                 claimed: {line}\n{output}"
+            );
+            assert!(
+                !line.contains("Vulkan backend can still be used"),
+                "no backend may be promised for a GPU that was not found: \
+                 {line}\n{output}"
+            );
+        }
+        // Detected, with no family covering it. Both answers are legitimate
+        // here and which one is correct depends on the catalog: `gfx90c` is
+        // *known* to have no ROCm build (Vulkan-only), anything unrecognised is
+        // a gap in what this build knows (unknown). What is never legitimate is
+        // claiming ROCm support for a GPU no package family covers.
+        (Some(gfx), None) => {
+            assert!(
+                line.contains(gfx),
+                "the support line must name the target it is judging: {line}\n{output}"
+            );
+            assert!(
+                line.contains("not supported by ROCm") || line.contains("unknown"),
+                "no ROCm package family covers {gfx}, so the line must report \
+                 either a Vulkan-only GPU or an unknown one: {line}\n{output}"
+            );
+            assert!(
+                !line.contains("full ROCm/HIP support"),
+                "a GPU with no covering package family must not be reported as \
+                 ROCm-supported: {line}\n{output}"
+            );
+        }
+    }
+}
+
+/// AGENTS.md wants a line that tells the user what they can do, and a named
+/// command that can actually clear the condition it was printed for. The
+/// specific pairing checked here is the one this round fixed: a host whose
+/// managed SDK is already installed must not be told to install it.
+#[then("the support level leaves a command that fits this host")]
+async fn assert_support_level_advice_fits(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no command was run");
+    let line = rocm_support_line(output).expect("no rocm_support line");
+    assert!(
+        line.contains("rocm "),
+        "the support line must leave the user somewhere to go: {line}\n{output}"
+    );
+
+    // `detected_therock_family` is the managed SDK that is installed, as
+    // opposed to `compatible_therock_family`, which is what this GPU could run.
+    let sdk_installed = field_value(output, "detected_therock_family")
+        .is_some_and(|value| value != "<not detected>" && value != "<unknown>");
+    if sdk_installed {
+        assert!(
+            !line.contains("rocm install sdk"),
+            "this host already has a managed ROCm SDK, so installing one clears \
+             nothing: {line}\n{output}"
+        );
+    }
+}

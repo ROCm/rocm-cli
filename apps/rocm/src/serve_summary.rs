@@ -56,8 +56,19 @@ pub(crate) struct DeploymentSummary {
     /// `"ready"`, `"starting"`, or an existing service's status.
     pub status: String,
     /// The backend/device the engine actually selected (e.g. `"vulkan gpu 0"`,
-    /// `"rocm gpu 0"`), read from the engine's own `Healthcheck` response.
-    /// `None` when the query failed or the service was not ready to ask.
+    /// `"rocm gpu 0 (AMD Instinct MI300X)"`), read from the engine's own
+    /// `Healthcheck` response.
+    ///
+    /// **`None` is a supported outcome, and renders no `device:` row at all.**
+    /// A launch is `ready` once its server answers, but an engine can still be
+    /// unable to say which device it is on: `engines/lemonade` reports
+    /// `"unknown"` until its own inference probe returns, which for a model
+    /// still loading its weights can be minutes away. `rocm serve` retries
+    /// within `engine_ipc::SERVE_DEVICE_PROBE_BUDGET` and then prints the
+    /// summary without the row rather than making the user wait for it;
+    /// `rocm services list` shows it as soon as the engine can answer. So
+    /// neither a caller nor a test may read a missing row as a failure to
+    /// select a device.
     pub device: Option<String>,
     /// True when an equivalent server was already running and nothing was spawned.
     pub already_running: bool,

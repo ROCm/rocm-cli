@@ -289,9 +289,15 @@ Expected result:
   reports it in the same `<backend> [gpu <n>] [(<gpu name>)]` shape — so expect
   something like `rocm gpu 0 (AMD Instinct MI300X)`, with the ordinal omitted
   when the launch pinned none (no `--gpu`, nothing recorded in the engine's
-  `gpu_indices`) and the name omitted when the host probe could not read one.
-  `rocm services` shows the same `device` while it runs. The first word is the
-  half that decides this check.
+  `gpu_indices`) and the name omitted when the host probe could not read one or
+  the machine has more than one AMD GPU (where naming one could name the wrong
+  one). `rocm services` shows the same `device` while it runs. The first word is
+  the half that decides this check.
+- The whole `device:` row may be missing from the deployment summary, and that
+  is not a failure of this check: the engine reports no device until it has
+  verified it can serve, which a model still loading its weights has not. Run
+  `rocm services list` and read the row there instead — the check is on what the
+  row says, not on which surface said it first.
 - The run does not fall back to CPU or Vulkan — a `device:` whose first word is
   `vulkan` fails this check even though the serve itself succeeds.
 - If the GPU cannot be used, the command fails with a clear error.

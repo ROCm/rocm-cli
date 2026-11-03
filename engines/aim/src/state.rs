@@ -157,8 +157,11 @@ pub(crate) fn write_running_state(
             // so without it its row would be the bare word `rocm` on every
             // host. Captured once here rather than probed per healthcheck:
             // `rocm services list` healthchecks every ready service on its
-            // render path.
-            "gpu_name": rocm_core::detect_host_gpu_summary(None).name,
+            // render path. The empty ordinal list is the literal truth — the
+            // container is handed a device list, not an ordinal — and
+            // `rocm_core::pinned_gpu_name` still declines on any host where
+            // more than one AMD GPU could be the one that answered.
+            "gpu_name": rocm_core::pinned_gpu_name(&[]),
             "engine_recipe": engine_recipe,
             "started_at_unix_ms": current_unix_millis(),
         }),

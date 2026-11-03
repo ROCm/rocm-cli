@@ -1916,8 +1916,9 @@ fn device_row_value(text: &str) -> Option<&str> {
 ///    Lemonade has a Vulkan path, so `vulkan` from `vllm` or `aim` is wrong,
 ///    and `unknown` is wrong from any of them;
 /// 3. it equals what the `rocm serve` deployment summary printed for the same
-///    service, which is the row the preceding Given produced and which nothing
-///    else in these scenarios looks at.
+///    service — *when* that summary printed a device row at all, which is a
+///    documented maybe rather than a promise (see the comment at that
+///    comparison, and `serve_summary::DeploymentSummary::device`).
 /// The row is polled rather than read once: see [`DEVICE_ROW_DEADLINE`] for
 /// the window in which a correct implementation legitimately has no row yet.
 /// Running out of that window is an assertion naming what was last seen, not a
@@ -1986,30 +1987,36 @@ async fn assert_services_list_reports_device(world: &mut E2eWorld) {
     // at launch; nothing else in these scenarios inspects that summary, so
     // without this the summary half of ROCMAI-550 has no live assertion at all.
     //
-    // The summary row is conditional by design: `serve` only asks the engine
-    // once the launch already reported `ready`, and a managed launch can return
-    // while the weights are still loading (which is why the Given then polls
-    // `/v1/models`). So the assertion is two-sided rather than unconditional -
-    // a device row must agree with this one, and its absence must be explained
-    // by a not-yet-ready launch rather than by the row having been dropped.
+    // Only when the summary HAS the row. Its absence is not a defect and must
+    // not be asserted against, in either direction:
+    //
+    // * `serve` asks the engine once the launch reports `ready` and retries
+    //   only within `engine_ipc::SERVE_DEVICE_PROBE_BUDGET` (~6s), because the
+    //   row is informational and the alternative is holding a terminal;
+    // * `engines/lemonade` answers `"unknown"` until its own
+    //   `inference_verified` probe returns, which for a model still loading can
+    //   be far longer than that - which is exactly why the Given step then
+    //   polls `/v1/models` for up to minutes;
+    // * so a correct `rocm serve` can print `status ready` with no `device:`
+    //   row, while `rocm services list` - asked later, after this step has
+    //   waited - has one.
+    //
+    // An earlier revision asserted that a `ready` summary must carry the row.
+    // That is the exact false failure this note describes, and it was invisible
+    // only because serve-07 is xfail'd on lemonade+linux (see the comment on
+    // that scenario in model_serving.feature). What remains asserted is the
+    // half that is a real invariant: the two surfaces read one engine over one
+    // RPC, so where both speak they must say the same thing.
     let summary = world
         .serve_summary
         .as_deref()
         .expect("the Given step must have recorded the serve summary");
-    match device_row_value(summary) {
-        Some(summary_device) => assert_eq!(
+    if let Some(summary_device) = device_row_value(summary) {
+        assert_eq!(
             summary_device, device,
             "`rocm serve` and `rocm services list` must report the same device \
              for one service; they read it from the same Healthcheck RPC"
-        ),
-        None => assert!(
-            !summary
-                .lines()
-                .any(|line| line.trim_start().starts_with("status")
-                    && line.trim_end().ends_with("ready")),
-            "the serve summary reported `ready` but printed no `device:` row, so \
-             the row was dropped rather than deferred:\n{summary}"
-        ),
+        );
     }
 }
 
