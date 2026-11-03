@@ -89,8 +89,6 @@ use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, BufRead};
 use std::path::{Path, PathBuf};
-#[cfg(not(windows))]
-use std::process::Stdio;
 use std::thread;
 use std::time::Duration;
 
@@ -100,10 +98,6 @@ use rocm_engine_protocol::{DEFAULT_LOG_TAIL_LINES, EngineMethod, StopRequest, St
 
 use crate::endpoint_keys;
 use crate::engine_ipc::{builtin_engine_serve_http_args, engine_request};
-#[cfg(not(windows))]
-use crate::engine_runtime_select::apply_app_path_env;
-#[cfg(windows)]
-use crate::engine_runtime_select::{app_path_env_var_refs, app_path_env_var_values};
 use crate::engine_runtime_select::{
     http_post_local_service_json, managed_service_launcher_path, parse_engine_recipe_json_arg,
     wait_for_service_http_ready,
@@ -116,10 +110,10 @@ use crate::managed_service_status::{
 };
 use crate::service_hints;
 use crate::service_launch::ensure_public_service_has_endpoint_key;
-#[cfg(not(windows))]
 use crate::service_launch::{
-    attach_background_stdio, detach_background_command, managed_engine_startup_failure_detail,
-    managed_service_process_command,
+    ManagedEngineSpawnRequest, ManagedStartupRecord, SpawnManagedEngine,
+    adopt_spawned_engine_child, spawn_managed_engine_process, update_managed_record_on_disk,
+    watch_managed_engine_startup,
 };
 use crate::{
     SandboxToolArg, cli_lifecycle_log_path, service_action_past_tense, status_for_readiness,
@@ -958,21 +952,73 @@ pub(crate) fn restart_internal_managed_service(
     service_id: &str,
     runtime_pin: Option<&str>,
 ) -> Result<ManagedServiceRecord> {
+    let seams = restart_engine_seams();
     restart_internal_managed_service_with(
         paths,
         service_id,
         runtime_pin,
         terminate_recorded_service_pids,
+        &*seams.spawn,
+        &*seams.wait_ready,
     )
 }
 
-/// [`restart_internal_managed_service`], with the termination of the recorded
-/// processes supplied by the caller — see [`stop_internal_managed_service_with`].
+/// The readiness wait [`restart_internal_managed_service_with`] takes.
+type RestartReadinessWait<'a> =
+    dyn Fn(&ManagedServiceRecord, Option<&str>) -> EndpointReadiness + 'a;
+
+/// The spawn and readiness wait [`restart_internal_managed_service`] hands its
+/// restart.
+#[derive(Clone)]
+struct RestartEngineSeams {
+    spawn: std::rc::Rc<SpawnManagedEngine<'static>>,
+    wait_ready: std::rc::Rc<RestartReadinessWait<'static>>,
+}
+
+/// The real engine spawn and the real readiness wait — or, in a unit test that
+/// installed them, stand-ins. The override is how a test drives the production
+/// wrapper itself, and so pins what it forwards (its `runtime_pin` above all)
+/// rather than only what `restart_internal_managed_service_with` does with
+/// arguments a test passed it directly.
+fn restart_engine_seams() -> RestartEngineSeams {
+    #[cfg(test)]
+    if let Some(seams) = tests::RESTART_ENGINE_SEAMS.with(|seams| seams.borrow().clone()) {
+        return seams;
+    }
+    RestartEngineSeams {
+        spawn: std::rc::Rc::new(spawn_managed_engine_process),
+        wait_ready: std::rc::Rc::new(wait_for_restarted_service_ready),
+    }
+}
+
+/// The readiness wait a restarted service gets: the same 45 s the launch path
+/// allows, probed with the service's own key.
+fn wait_for_restarted_service_ready(
+    record: &ManagedServiceRecord,
+    endpoint_api_key: Option<&str>,
+) -> EndpointReadiness {
+    wait_for_service_http_ready(
+        &record.engine,
+        &record.host,
+        record.port,
+        record.served_model_name(),
+        endpoint_api_key,
+        Duration::from_secs(45),
+    )
+}
+
+/// [`restart_internal_managed_service`] with the termination of the recorded
+/// processes (see [`stop_internal_managed_service_with`]), the spawn and the
+/// readiness wait injected, so a test can drive the restart's record
+/// bookkeeping end to end without starting an engine or sitting through a 45 s
+/// wait.
 fn restart_internal_managed_service_with(
     paths: &AppPaths,
     service_id: &str,
     runtime_pin: Option<&str>,
     terminate: impl FnOnce(&ManagedServiceRecord) -> (Vec<u32>, bool),
+    spawn_engine: &SpawnManagedEngine<'_>,
+    wait_ready: &RestartReadinessWait<'_>,
 ) -> Result<ManagedServiceRecord> {
     let record = load_service_for_restart(paths, service_id, runtime_pin)?;
     // Preserve the endpoint key across the restart: `stop_internal_managed_service`
@@ -1014,6 +1060,11 @@ fn restart_internal_managed_service_with(
     // its own marker, so a restart supersedes every stop asked for before it;
     // one asked for since is someone else's, and none of the writes below
     // touches it.
+    //
+    // Nothing below writes the record until a child exists. So a restart that
+    // fails before one does — any step up to and including the spawn — leaves
+    // the record exactly as the stop above wrote it: `"stopped"`, because
+    // nothing replaced the stop.
     let (stopped_record, _) = read_managed_service_manifest(paths, service_id)?;
     // Still after the stop, like the device-policy refusal inside it always was:
     // the callers' "stopped by the attempt" report and pin restore both cover a
@@ -1041,94 +1092,122 @@ fn restart_internal_managed_service_with(
     // file and reuse the key for the readiness probe.
     let endpoint_key_file = endpoint_keys::endpoint_key_file_if_present(paths, &record.service_id);
     let endpoint_api_key = endpoint_keys::endpoint_api_key(paths, &record.service_id);
-    #[cfg(windows)]
-    let child_pid = {
-        let env_values = app_path_env_var_values(paths, engine_envs_root.as_deref());
-        let mut env_refs = app_path_env_var_refs(&env_values);
-        if let Some(key_file) = endpoint_key_file.as_deref() {
-            env_refs.push((rocm_engine_protocol::ENDPOINT_API_KEY_FILE_ENV, key_file));
-        }
-        rocm_core::spawn_detached_no_inherit(&current_exe, &serve_args, &env_refs)
-            .context("failed to restart managed engine process")?
+    let spawned = spawn_engine(&ManagedEngineSpawnRequest {
+        paths,
+        program: &current_exe,
+        args: &serve_args,
+        engine_envs_root: engine_envs_root.as_deref(),
+        endpoint_key_file: endpoint_key_file.as_deref(),
+        log_path: &record.log_path,
+    })
+    .context("failed to restart managed engine process")?;
+    // A child exists from here. Its startup check runs through the same helper
+    // as the launch path's, with the restart's own guarded writes: the record
+    // goes on disk as `"starting"` naming the new child before the check, and
+    // names it for the rest of the restart, readiness wait included. A child
+    // observed dead at startup is retired as `"failed"`, key kept, as for a
+    // crash. A Unix query that fails leaves the record `"starting"` on the new
+    // pid. Not `"running"`: the readiness verdict below is what promotes it, and
+    // a `"running"` record whose port is not open yet is one `rocmd`'s
+    // server-recover watcher would treat as unreachable and restart.
+    let mut on_record = RestartStartupRecord {
+        paths,
+        runtime_pin,
+        expected: stopped_record,
+        child_on_record: false,
     };
-    #[cfg(not(windows))]
-    let child_pid = {
-        let mut command = managed_service_process_command(&current_exe, &serve_args);
-        command.stdin(Stdio::null());
-        attach_background_stdio(&mut command, Some(&record.log_path))?;
-        detach_background_command(&mut command);
-        apply_app_path_env(&mut command, paths);
-        if let Some(engine_envs_root) = engine_envs_root.as_deref() {
-            command.env("ROCM_CLI_ENGINE_ENVS_ROOT", engine_envs_root);
-        }
-        if let Some(key_file) = endpoint_key_file.as_deref() {
-            command.env(rocm_engine_protocol::ENDPOINT_API_KEY_FILE_ENV, key_file);
-        }
-        let mut child = command
-            .spawn()
-            .context("failed to restart managed engine process")?;
-        thread::sleep(Duration::from_millis(200));
-        if let Some(status) = child
-            .try_wait()
-            .context("failed to check restarted engine startup state")?
-        {
-            update_restarting_record(paths, &stopped_record, |current| {
-                current.status = "failed".to_owned();
-            })?;
-            bail!(
-                "{}",
-                managed_engine_startup_failure_detail(status, &record.log_path)
-            );
-        }
-        child.id()
-    };
-    #[cfg(windows)]
-    thread::sleep(Duration::from_millis(200));
-    // Recorded before the readiness wait, so a stop issued during it finds the
-    // new child rather than the processes already stopped.
-    let started = record_restarted_child(paths, &stopped_record, runtime_pin, child_pid)?;
-    let readiness = wait_for_service_http_ready(
-        &started.engine,
-        &started.host,
-        started.port,
-        started.served_model_name(),
-        endpoint_api_key.as_deref(),
-        Duration::from_secs(45),
-    );
+    watch_managed_engine_startup(&mut on_record, spawned)?;
+    let started = on_record.expected;
+    let readiness = wait_ready(&started, endpoint_api_key.as_deref());
     record_restart_readiness(paths, &started, readiness)
 }
 
+/// A restart's side of [`watch_managed_engine_startup`]: the same two writes the
+/// launch path makes — the child put on record, and a dead one retired — but
+/// each applied to the record as it is on disk, through
+/// [`update_restarting_record`], rather than written back from a copy. A stop
+/// may run while the restart does, and its marker must survive the restart's
+/// writes.
+struct RestartStartupRecord<'a> {
+    paths: &'a AppPaths,
+    runtime_pin: Option<&'a str>,
+    /// The record as this restart last left it on disk: its confirmed stop's,
+    /// then, once the child is on record, the one naming it.
+    expected: ManagedServiceRecord,
+    /// Whether `expected` names the child yet. A child the spawn already saw
+    /// die is never put on record, so its retirement is the restart's first
+    /// write.
+    child_on_record: bool,
+}
+
+impl ManagedStartupRecord for RestartStartupRecord<'_> {
+    fn persist_spawned_child(&mut self, child_pid: u32) -> Result<()> {
+        self.expected =
+            record_restarted_child(self.paths, &self.expected, self.runtime_pin, child_pid)?;
+        self.child_on_record = true;
+        Ok(())
+    }
+
+    /// Retire the record as `"failed"`. Writes nothing when it has changed
+    /// since this restart last wrote it: whoever wrote since — a stop, another
+    /// restart — holds a truer view than a retirement would.
+    ///
+    /// A child the spawn saw die is kept off the record, which is retired
+    /// naming the processes the confirmed stop left on it. The restart is
+    /// still counted, as `record_restarted_child` counts one that survives: a
+    /// child was spawned whether or not it survived startup, matching
+    /// `rocmd`'s own restart.
+    fn retire(&mut self) -> Result<()> {
+        let count_restart = !self.child_on_record;
+        if let Some(retired) = update_restarting_record(self.paths, &self.expected, |current| {
+            if count_restart {
+                current.reset_for_restart();
+            }
+            current.status = "failed".to_owned();
+        })? {
+            self.expected = retired;
+        }
+        Ok(())
+    }
+
+    fn service_id(&self) -> &str {
+        &self.expected.service_id
+    }
+
+    fn log_path(&self) -> &Path {
+        &self.expected.log_path
+    }
+}
+
 /// Apply one of a restart's own changes to the record as it is on disk now,
-/// rather than writing back a copy the restart holds. `write` replaces the
-/// whole file, and a stop records `stop_requested_unix_ms` before it signals
-/// anything — the same hazard `rocmd`'s `update_supervised_record` guards
-/// against for the supervisor's writes.
+/// through the guard the launch shares, [`update_managed_record_on_disk`].
 ///
 /// Nothing is written, and `None` returned, when the record no longer reads
 /// as `expected` left it — it is gone, names other processes, or has another
 /// status: whoever wrote since holds a truer view than this restart. `update`
 /// never touches the stop marker, so a stop asked for meanwhile survives.
+///
+/// Stricter than the launch's ownership test, which lets the status and the
+/// engine pid move: a restart's first write lands on the `"stopped"` record its
+/// own stop left, which is not live, so "still owned" cannot mean "still live"
+/// here — it has to mean "exactly as this restart last saw it".
 fn update_restarting_record(
     paths: &AppPaths,
     expected: &ManagedServiceRecord,
     update: impl FnOnce(&mut ManagedServiceRecord),
 ) -> Result<Option<ManagedServiceRecord>> {
-    if !paths.service_manifest_path(&expected.service_id).exists() {
-        return Ok(None);
-    }
-    let (mut current, _) = read_managed_service_manifest(paths, &expected.service_id)?;
-    if !current.names_same_processes(expected) || current.status != expected.status {
-        return Ok(None);
-    }
-    update(&mut current);
-    current.write()?;
-    Ok(Some(current))
+    update_managed_record_on_disk(
+        paths,
+        &expected.service_id,
+        |current| current.names_same_processes(expected) && current.status == expected.status,
+        update,
+    )
 }
 
-/// Record the child a restart just started, over the record its confirmed
-/// stop left (`stopped`). Fails when that record has changed since: the child
-/// is then running but unrecorded, and the caller has to hear that rather than
-/// a claim that the service restarted.
+/// Record the child a restart just started as `"starting"`, over the record its
+/// confirmed stop left (`stopped`). Fails when that record has changed since:
+/// the child is then running but unrecorded, and the caller has to hear that
+/// rather than a claim that the service restarted.
 ///
 /// `runtime_pin` is re-applied here because the record on disk does not carry
 /// it: the restart's own load refreshed the record from the outgoing process's
@@ -1144,11 +1223,11 @@ fn record_restarted_child(
 ) -> Result<ManagedServiceRecord> {
     update_restarting_record(paths, stopped, |current| {
         apply_restart_runtime_pin(current, runtime_pin);
-        current.status = "running".to_owned();
-        // Both roles move to the restarted child, each with its own token —
-        // see `spawn_managed_engine_child`.
-        current.record_supervisor_identity(child_pid);
-        current.record_engine_identity(child_pid);
+        // `"starting"` until the readiness verdict promotes it — see
+        // `restart_internal_managed_service_with`.
+        current.status = "starting".to_owned();
+        // Both roles move to the restarted child, each with its own token.
+        adopt_spawned_engine_child(current, child_pid);
         // Counts the restart and drops the previous run's inference
         // verification — the new child has an unloaded model, so the old
         // verdict says nothing about it.
@@ -1184,7 +1263,6 @@ fn record_restart_readiness(
             .map_or_else(|_| started.clone(), |(record, _)| record)),
     }
 }
-
 pub(crate) fn validate_service_id(service_id: &str) -> Result<()> {
     // Single source of truth for what makes an id safe as a filesystem path
     // component (rejects empty, path separators, `..`, control chars).
@@ -1304,6 +1382,15 @@ mod tests {
     use super::*;
     use crate::providers;
     use crate::runtime_services;
+    use crate::runtimes_cmd::tests::activate_old_runtime;
+    // Only the Unix-gated reconciliation test below builds a pre-spawn record.
+    #[cfg(not(windows))]
+    use crate::service_launch::tests::pre_spawn_record;
+    use crate::service_launch::tests::{
+        exit_status_from_code, manifest_on_disk, spawn_must_not_be_reached, spawn_that_fails,
+        stand_in_child_pid, stand_in_spawn, stand_in_spawn_observed,
+    };
+    use crate::service_launch::{ManagedEngineStartupCheck, SpawnedManagedEngine};
     use crate::tests::{
         NEW_RUNTIME_KEY, OLD_RUNTIME_KEY, ScopedTestEnv, plant_service_record_on_runtime,
         test_paths,
@@ -2356,9 +2443,14 @@ mod tests {
         record.write().unwrap();
         endpoint_keys::store_endpoint_api_key(&paths, service_id, "key-123").unwrap();
 
-        let result = restart_internal_managed_service_with(&paths, service_id, None, |_| {
-            (vec![999_999_999], false)
-        });
+        let result = restart_internal_managed_service_with(
+            &paths,
+            service_id,
+            None,
+            |_| (vec![999_999_999], false),
+            &spawn_must_not_be_reached,
+            &readiness_must_not_be_reached,
+        );
 
         let on_disk = raw_manifest(&paths, service_id);
         let key = endpoint_keys::endpoint_api_key(&paths, service_id);
@@ -2872,5 +2964,604 @@ mod tests {
             "the verified process must be terminated"
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    /// A Lemonade service record as a previous run left it, for the restart
+    /// tests: `"ready"`, no key, and still carrying the pending-stop marker of an
+    /// earlier stop that could not confirm.
+    ///
+    /// Its pid is this test process, which keeps that marker in the record the
+    /// restart loads — the load-time refresh settles a marker only once every
+    /// recorded pid is gone — while the restart's own stop never signals it,
+    /// since a stop skips the caller's pid. That stop therefore confirms, and
+    /// clears the marker; a restart write applied to a stale copy of the record
+    /// would put it back on disk.
+    fn previous_lemonade_run(paths: &AppPaths, service_id: &str, port: u16) -> Result<()> {
+        let mut record = ManagedServiceRecord::new(
+            paths,
+            service_id,
+            "lemonade",
+            "qwen",
+            "qwen-canonical",
+            "127.0.0.1",
+            port,
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            Some("gpu_required".to_owned()),
+        );
+        record.status = "ready".to_owned();
+        record.stop_requested_unix_ms = Some(1);
+        record.write()
+    }
+
+    /// A readiness wait for a restart that must fail before reaching it.
+    fn readiness_must_not_be_reached(
+        _record: &ManagedServiceRecord,
+        _endpoint_api_key: Option<&str>,
+    ) -> EndpointReadiness {
+        panic!("this restart was meant to fail before its readiness wait")
+    }
+
+    /// The restart path's startup death, through `restart_internal_managed_service`
+    /// itself. Before the check runs, the record must already name the new child,
+    /// count the restart, and carry no stop marker; the death must then fail the
+    /// restart naming the log and retire the record as `"failed"`.
+    #[test]
+    fn a_restart_whose_engine_dies_at_startup_fails_and_retires_the_record() -> Result<()> {
+        let (root, paths) = test_paths("managed-restart-dies-at-startup");
+        paths.ensure()?;
+        let service_id = "lemonade-qwen-restart-1";
+        previous_lemonade_run(&paths, service_id, 11526)?;
+        let manifest_path = paths.service_manifest_path(service_id);
+        let seen_at_check = std::rc::Rc::default();
+        let spawn = stand_in_spawn(
+            manifest_path.clone(),
+            std::rc::Rc::clone(&seen_at_check),
+            || Ok(Some(exit_status_from_code(3))),
+        );
+
+        let outcome = restart_internal_managed_service_with(
+            &paths,
+            service_id,
+            None,
+            terminate_recorded_service_pids,
+            &spawn,
+            &readiness_must_not_be_reached,
+        );
+        let after = manifest_on_disk(&manifest_path);
+        let log_path = paths.service_log_path(service_id);
+        let _ = fs::remove_dir_all(root);
+
+        let error = outcome.expect_err("a restart whose engine died at startup must fail");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("managed engine exited immediately")
+                && message.contains(&log_path.display().to_string()),
+            "the failure must say the engine died and name its log: {message}"
+        );
+        let at_check = seen_at_check
+            .borrow_mut()
+            .take()
+            .expect("the record was on disk when the check ran");
+        assert_eq!(
+            (
+                at_check.status.as_str(),
+                at_check.supervisor_pid,
+                at_check.restart_count,
+                at_check.stop_requested_unix_ms,
+            ),
+            ("starting", stand_in_child_pid(), 1, None),
+            "before its check the record must name the new child, count the restart, \
+             and carry no stop marker"
+        );
+        let after = after.expect("the record is still on disk");
+        assert_eq!(
+            (
+                after.status.as_str(),
+                after.supervisor_pid,
+                after.restart_count,
+                after.stop_requested_unix_ms,
+            ),
+            ("failed", stand_in_child_pid(), 1, None),
+            "a restart that died at startup is retired, still naming its child"
+        );
+        Ok(())
+    }
+
+    /// A restart whose child survives its check: the record names that child as
+    /// `"starting"` for the whole readiness wait — not the previous run's pid, and
+    /// not `"running"` before the port is open — and the wait's verdict is what
+    /// the restart then records, here a served inference that is latched as
+    /// verified.
+    #[test]
+    fn a_restarted_child_is_on_record_as_starting_for_the_readiness_wait() -> Result<()> {
+        let (root, paths) = test_paths("managed-restart-survives-startup");
+        paths.ensure()?;
+        let service_id = "lemonade-qwen-restart-2";
+        previous_lemonade_run(&paths, service_id, 11527)?;
+        let manifest_path = paths.service_manifest_path(service_id);
+        let spawn = stand_in_spawn(manifest_path.clone(), std::rc::Rc::default(), || Ok(None));
+        let seen_during_wait: std::cell::RefCell<Option<ManagedServiceRecord>> =
+            std::cell::RefCell::default();
+        let wait = |_record: &ManagedServiceRecord, _key: Option<&str>| {
+            *seen_during_wait.borrow_mut() = manifest_on_disk(&manifest_path);
+            EndpointReadiness::Serving
+        };
+
+        let outcome = restart_internal_managed_service_with(
+            &paths,
+            service_id,
+            None,
+            terminate_recorded_service_pids,
+            &spawn,
+            &wait,
+        );
+        let after = manifest_on_disk(&manifest_path);
+        let _ = fs::remove_dir_all(root);
+
+        let restarted = outcome?;
+        let during = seen_during_wait
+            .borrow_mut()
+            .take()
+            .expect("the record was on disk during the wait");
+        assert_eq!(
+            (
+                during.status.as_str(),
+                during.supervisor_pid,
+                during.restart_count,
+                during.stop_requested_unix_ms,
+            ),
+            ("starting", stand_in_child_pid(), 1, None),
+            "during the readiness wait the record must name the new child as starting"
+        );
+        assert_eq!(restarted.status, "ready", "the wait's verdict is recorded");
+        let after = after.expect("the record is on disk");
+        assert_eq!(after.status, "ready");
+        assert!(
+            after.inference_verified_at_unix_ms.is_some(),
+            "a served inference is latched as verified"
+        );
+        Ok(())
+    }
+
+    /// The restart's counterpart of the launch test above: a death the spawn
+    /// itself saw keeps the dead child off the record, which is retired naming
+    /// only the previous run's pids, as the stop left them. The restart is counted,
+    /// since a child did spawn, and no stop marker is put back. The old pids carry
+    /// whatever exposure to pid reuse the stopped record already had; the change
+    /// adds none.
+    #[test]
+    fn a_restart_the_spawn_saw_die_keeps_the_dead_child_off_record() -> Result<()> {
+        let (root, paths) = test_paths("managed-restart-observed-death");
+        paths.ensure()?;
+        let service_id = "lemonade-qwen-restart-5";
+        previous_lemonade_run(&paths, service_id, 11531)?;
+        let manifest_path = paths.service_manifest_path(service_id);
+
+        let outcome = restart_internal_managed_service_with(
+            &paths,
+            service_id,
+            None,
+            terminate_recorded_service_pids,
+            &stand_in_spawn_observed(Some(exit_status_from_code(3))),
+            &readiness_must_not_be_reached,
+        );
+        let after = manifest_on_disk(&manifest_path);
+        let _ = fs::remove_dir_all(root);
+
+        assert!(
+            outcome.is_err(),
+            "a restart whose engine died at startup must fail"
+        );
+        let after = after.expect("the record is still on disk");
+        assert_eq!(
+            (
+                after.status.as_str(),
+                after.supervisor_pid,
+                after.engine_pid,
+                after.restart_count,
+                after.stop_requested_unix_ms,
+            ),
+            ("failed", std::process::id(), None, 1, None),
+            "retired without naming the dead child"
+        );
+        Ok(())
+    }
+
+    /// A restart whose spawn fails has replaced nothing, so it must leave the
+    /// record exactly as its stop wrote it: not retired as `"failed"`, and no
+    /// restart counted.
+    ///
+    /// Compared byte for byte against the manifest as it stood when the spawn was
+    /// attempted, i.e. right after the stop, so this holds whatever the stop
+    /// wrote. (A stop that cannot confirm never reaches the spawn — see
+    /// `restart_does_not_start_an_engine_over_an_unconfirmed_stop`.)
+    #[test]
+    fn a_restart_whose_spawn_fails_leaves_the_record_as_its_stop_wrote_it() -> Result<()> {
+        let (root, paths) = test_paths("managed-restart-spawn-fails");
+        paths.ensure()?;
+        let service_id = "lemonade-qwen-restart-3";
+        previous_lemonade_run(&paths, service_id, 11528)?;
+        let manifest_path = paths.service_manifest_path(service_id);
+        let at_spawn: std::cell::RefCell<Option<Vec<u8>>> = std::cell::RefCell::default();
+        let spawn = |request: &ManagedEngineSpawnRequest<'_>| {
+            *at_spawn.borrow_mut() = fs::read(&manifest_path).ok();
+            spawn_that_fails(request)
+        };
+
+        let outcome = restart_internal_managed_service_with(
+            &paths,
+            service_id,
+            None,
+            terminate_recorded_service_pids,
+            &spawn,
+            &readiness_must_not_be_reached,
+        );
+        let after_bytes = fs::read(&manifest_path).ok();
+        let after = manifest_on_disk(&manifest_path);
+        let _ = fs::remove_dir_all(root);
+
+        let error = outcome.expect_err("a restart whose spawn failed must fail");
+        assert!(
+            format!("{error:#}").contains("failed to restart managed engine process"),
+            "{error:#}"
+        );
+        let at_spawn = at_spawn.borrow_mut().take();
+        assert!(at_spawn.is_some(), "the spawn was attempted");
+        assert!(
+            after_bytes == at_spawn,
+            "a failed spawn must leave the record as the stop wrote it, got {after:?}"
+        );
+        let after = after.expect("the record is still on disk");
+        assert_eq!(
+            (after.status.as_str(), after.restart_count),
+            ("stopped", 0),
+            "the stop's `stopped` stands, and nothing was restarted"
+        );
+        Ok(())
+    }
+
+    /// The restart's half of `a_launch_names_its_child_on_record_before_the_startup_check`
+    /// in `service_launch.rs`: a startup check that cannot answer — a Unix
+    /// `try_wait` error — fails the restart with that error, and leaves the new
+    /// child on record as `"starting"`, restart counted and no stop marker put
+    /// back. Not retired: the child's state is unknown, and freeing the engine +
+    /// model could put a rival engine on its port. Named, so a stop can reach
+    /// it and the liveness refresh can reconcile it, rather than the previous
+    /// run's pids, which a refresh would read as a finished stop.
+    #[test]
+    fn a_restart_whose_startup_check_cannot_answer_keeps_the_child_on_record() -> Result<()> {
+        let (root, paths) = test_paths("managed-restart-check-cannot-answer");
+        paths.ensure()?;
+        let service_id = "lemonade-qwen-restart-7";
+        previous_lemonade_run(&paths, service_id, 11539)?;
+        let manifest_path = paths.service_manifest_path(service_id);
+        let seen_at_check = std::rc::Rc::default();
+        let spawn = stand_in_spawn(
+            manifest_path.clone(),
+            std::rc::Rc::clone(&seen_at_check),
+            || bail!("cannot query the child"),
+        );
+
+        let outcome = restart_internal_managed_service_with(
+            &paths,
+            service_id,
+            None,
+            terminate_recorded_service_pids,
+            &spawn,
+            &readiness_must_not_be_reached,
+        );
+        let after = manifest_on_disk(&manifest_path);
+        let _ = fs::remove_dir_all(root);
+
+        let error = outcome.expect_err("a restart whose startup check cannot answer must fail");
+        assert!(
+            format!("{error:#}").contains("cannot query the child"),
+            "the query failure is what reaches the user: {error:#}"
+        );
+        let expected = ("starting", stand_in_child_pid(), 1, None);
+        let at_check = seen_at_check
+            .borrow_mut()
+            .take()
+            .expect("the record was on disk when the check ran");
+        assert_eq!(
+            (
+                at_check.status.as_str(),
+                at_check.supervisor_pid,
+                at_check.restart_count,
+                at_check.stop_requested_unix_ms,
+            ),
+            expected,
+            "the record must name the new child before its startup check runs"
+        );
+        let after = after.expect("the record is still on disk");
+        assert_eq!(
+            (
+                after.status.as_str(),
+                after.supervisor_pid,
+                after.restart_count,
+                after.stop_requested_unix_ms,
+            ),
+            expected,
+            "a check that cannot answer must leave the child on record, not retire it"
+        );
+        Ok(())
+    }
+
+    /// A stop asked for while the restart's startup check runs persists its
+    /// marker before it signals anything. The restart's writes around that
+    /// check go to the record as it is on disk, never a copy it holds, so
+    /// retiring the dead child keeps the marker — the liveness refresh still
+    /// needs it to finish that stop.
+    #[test]
+    fn a_restart_retiring_a_dead_child_keeps_a_stop_asked_for_during_its_check() -> Result<()> {
+        let (root, paths) = test_paths("managed-restart-stop-during-check");
+        paths.ensure()?;
+        let service_id = "lemonade-qwen-restart-6";
+        previous_lemonade_run(&paths, service_id, 11532)?;
+        let manifest_path = paths.service_manifest_path(service_id);
+        let spawn = |_request: &ManagedEngineSpawnRequest<'_>| -> Result<SpawnedManagedEngine> {
+            let manifest_path = manifest_path.clone();
+            Ok(SpawnedManagedEngine {
+                pid: stand_in_child_pid(),
+                startup: ManagedEngineStartupCheck::Pending(Box::new(move || {
+                    let mut stopping = manifest_on_disk(&manifest_path)
+                        .expect("the child is on record before its check");
+                    stopping.stop_requested_unix_ms = Some(4_242);
+                    stopping.write()?;
+                    Ok(Some(exit_status_from_code(3)))
+                })),
+            })
+        };
+
+        let outcome = restart_internal_managed_service_with(
+            &paths,
+            service_id,
+            None,
+            terminate_recorded_service_pids,
+            &spawn,
+            &readiness_must_not_be_reached,
+        );
+        let after = manifest_on_disk(&manifest_path);
+        let _ = fs::remove_dir_all(root);
+
+        assert!(
+            outcome.is_err(),
+            "a restart whose engine died at startup must fail"
+        );
+        let after = after.expect("the record is still on disk");
+        assert_eq!(
+            (
+                after.status.as_str(),
+                after.supervisor_pid,
+                after.stop_requested_unix_ms,
+            ),
+            ("failed", stand_in_child_pid(), Some(4_242)),
+            "the dead child is retired and the stop asked for meanwhile survives"
+        );
+        Ok(())
+    }
+
+    thread_local! {
+        /// Stand-ins for the spawn and readiness wait the production
+        /// [`restart_internal_managed_service`] uses, installed by
+        /// [`RestartSeamsGuard`]. Read by `restart_engine_seams`.
+        pub(crate) static RESTART_ENGINE_SEAMS: RefCell<Option<RestartEngineSeams>> =
+            const { RefCell::new(None) };
+    }
+
+    /// Installs restart stand-ins on this test's thread for its lifetime.
+    struct RestartSeamsGuard;
+
+    impl RestartSeamsGuard {
+        fn install(seams: RestartEngineSeams) -> Self {
+            RESTART_ENGINE_SEAMS.with(|slot| *slot.borrow_mut() = Some(seams));
+            Self
+        }
+    }
+
+    impl Drop for RestartSeamsGuard {
+        fn drop(&mut self) {
+            RESTART_ENGINE_SEAMS.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    /// What the stand-in spawn and readiness wait saw of one restart.
+    #[derive(Default)]
+    struct SeenByRestart {
+        /// `Some` once the spawn ran; the request fields below are read then.
+        argv: Option<Vec<String>>,
+        endpoint_key_file: Option<PathBuf>,
+        engine_envs_root: Option<PathBuf>,
+        waited: bool,
+        readiness_key: Option<String>,
+        on_disk_while_waiting: Option<ManagedServiceRecord>,
+    }
+
+    /// The pin through the production restart, not just through
+    /// [`load_service_for_restart`]: `restart_internal_managed_service` must
+    /// hand it on, and `restart_internal_managed_service_with` must hand it to
+    /// its own load, or the child is launched on the runtime it was already
+    /// using. The stand-ins are installed under the wrapper rather than passed
+    /// to `_with`, so dropping the pin from either fails this.
+    ///
+    /// The same restart pins the rest of what the child is started with — the
+    /// service's endpoint key file, the pinned runtime's engine env root — and
+    /// the key the readiness probe uses, since a public service restarted
+    /// without them comes back unauthenticated or on the wrong env. Its spawn
+    /// answers as the Windows watched spawn does (`Observed`, alive), and the
+    /// readiness wait reads the manifest: by then it must already name the
+    /// child as `"starting"`, which is what the `Observed` arm's write is for.
+    #[test]
+    fn a_pinned_restart_launches_and_records_the_child_on_the_pinned_runtime() -> Result<()> {
+        let (root, paths) = test_paths("service-runtime-pin-restart");
+        paths.ensure()?;
+        activate_old_runtime(&paths)?;
+        // This process's pid: the restart's stop never signals its caller.
+        let planted = plant_service_record_on_runtime(
+            &paths,
+            "svc-pin-restart",
+            "vllm",
+            "ready",
+            std::process::id(),
+            Some(OLD_RUNTIME_KEY),
+            Some("custom-env"),
+        )?;
+        fs::write(
+            &planted.engine_state_path,
+            serde_json::to_vec(&serde_json::json!({
+                "status": "ready",
+                "requested_runtime_id": OLD_RUNTIME_KEY,
+                "runtime_id": "therock-release:gfx120X-all",
+                "env_id": "custom-env",
+            }))?,
+        )?;
+        endpoint_keys::store_endpoint_api_key(&paths, "svc-pin-restart", "pin-restart-key")?;
+        let manifest_path = paths.service_manifest_path("svc-pin-restart");
+
+        let seen = std::rc::Rc::new(RefCell::new(SeenByRestart::default()));
+        let spawn = {
+            let seen = std::rc::Rc::clone(&seen);
+            move |request: &ManagedEngineSpawnRequest<'_>| -> Result<SpawnedManagedEngine> {
+                let mut seen = seen.borrow_mut();
+                seen.argv = Some(request.args.to_vec());
+                seen.endpoint_key_file = request.endpoint_key_file.map(Path::to_path_buf);
+                seen.engine_envs_root = request.engine_envs_root.map(Path::to_path_buf);
+                Ok(SpawnedManagedEngine {
+                    pid: stand_in_child_pid(),
+                    startup: ManagedEngineStartupCheck::Observed(None),
+                })
+            }
+        };
+        let wait = {
+            let seen = std::rc::Rc::clone(&seen);
+            let manifest_path = manifest_path.clone();
+            move |_record: &ManagedServiceRecord, key: Option<&str>| {
+                let mut seen = seen.borrow_mut();
+                seen.waited = true;
+                seen.readiness_key = key.map(str::to_owned);
+                seen.on_disk_while_waiting = manifest_on_disk(&manifest_path);
+                EndpointReadiness::Serving
+            }
+        };
+        let outcome = {
+            let _seams = RestartSeamsGuard::install(RestartEngineSeams {
+                spawn: std::rc::Rc::new(spawn),
+                wait_ready: std::rc::Rc::new(wait),
+            });
+            restart_internal_managed_service(&paths, "svc-pin-restart", Some(NEW_RUNTIME_KEY))
+        };
+        let on_disk = manifest_on_disk(&manifest_path).expect("the restart left a record");
+        let expected_key_file =
+            endpoint_keys::endpoint_key_file_if_present(&paths, "svc-pin-restart");
+        let expected_envs_root = env_root_for_service(&paths, "vllm", Some(NEW_RUNTIME_KEY), None)?;
+        let _ = fs::remove_dir_all(&root);
+
+        outcome?;
+        let seen = std::rc::Rc::try_unwrap(seen)
+            .ok()
+            .expect("the stand-ins were dropped with the restart")
+            .into_inner();
+        let argv = seen.argv.expect("the restart reached its spawn");
+        assert_eq!(
+            argv_flag_value(&argv, "--runtime-id"),
+            Some(NEW_RUNTIME_KEY),
+            "the child must be launched on the pinned runtime: {argv:?}"
+        );
+        assert_eq!(on_disk.runtime_id.as_deref(), Some(NEW_RUNTIME_KEY));
+        assert_eq!(on_disk.env_id, None);
+
+        assert!(expected_key_file.is_some(), "the test stored a key file");
+        assert_eq!(
+            seen.endpoint_key_file, expected_key_file,
+            "the child must be handed the service's own endpoint key file"
+        );
+        assert!(
+            expected_envs_root.is_some(),
+            "the pinned runtime has an engine env root for the child to be given"
+        );
+        assert_eq!(
+            seen.engine_envs_root, expected_envs_root,
+            "the child must be given the pinned runtime's engine env root"
+        );
+        assert!(seen.waited, "the restart reached its readiness wait");
+        assert_eq!(
+            seen.readiness_key.as_deref(),
+            Some("pin-restart-key"),
+            "the readiness probe must authenticate with the service's key"
+        );
+
+        let waiting = seen
+            .on_disk_while_waiting
+            .expect("a record was on disk during the readiness wait");
+        assert_eq!(
+            waiting.status, "starting",
+            "a child the spawn saw alive is on record before the readiness wait"
+        );
+        assert_eq!(waiting.supervisor_pid, stand_in_child_pid());
+        assert_eq!(waiting.engine_pid, Some(stand_in_child_pid()));
+        Ok(())
+    }
+
+    /// What the record a spawned child is persisted as is worth, once written: it
+    /// keeps the claim while that child lives and is reconciled once it does not,
+    /// without losing the endpoint key a crash must keep.
+    ///
+    /// This proves the record, not *when* it is written. That the launch and the
+    /// restart write it before their startup checks is pinned at those call sites
+    /// by `a_launch_names_its_child_on_record_before_the_startup_check` and
+    /// `a_restart_whose_engine_dies_at_startup_fails_and_retires_the_record`.
+    ///
+    /// Restart-shaped on purpose — previous run's dead pid, endpoint key on disk,
+    /// stop marker already cleared — because that is the case where an
+    /// inaccurate record cost the most: a refresh read the dead pids as a
+    /// finished stop and deleted the key of a service that may be running. So the
+    /// child is put on record by the restart's own write, `record_restarted_child`:
+    /// a launch's write refuses a `"stopped"` record, which a stop settled.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_record_naming_the_spawned_child_is_reconciled_once_the_child_is_gone() -> Result<()> {
+        let (root, paths) = test_paths("managed-child-persisted-before-check");
+        paths.ensure()?;
+        let mut record = pre_spawn_record(&paths, 11517);
+        record.supervisor_pid = 999_999_999;
+        record.status = "stopped".to_owned();
+        record.write()?;
+        endpoint_keys::store_endpoint_api_key(&paths, &record.service_id, "k-restart")?;
+        let mut child = std::process::Command::new("sleep").arg("30").spawn()?;
+        let child_pid = child.id();
+
+        record_restarted_child(&paths, &record, None, child_pid)?;
+        let while_alive = load_managed_services(&paths)?;
+        let _ = child.kill();
+        let _ = child.wait();
+        let after_exit = load_managed_services(&paths)?;
+        let key_after_exit = endpoint_keys::endpoint_api_key(&paths, &record.service_id);
+        let _ = fs::remove_dir_all(root);
+
+        let alive = while_alive.first().expect("record on disk");
+        assert_eq!(
+            alive.supervisor_pid, child_pid,
+            "the record must name the child"
+        );
+        assert_eq!(alive.engine_pid, Some(child_pid));
+        assert!(
+            alive.supervisor_start_ticks.is_some(),
+            "a stop needs the start-time token to verify it is this child"
+        );
+        assert_eq!(alive.status, "starting", "a live child keeps the claim");
+        let gone = after_exit.first().expect("record on disk");
+        assert_eq!(
+            gone.status, "stopped",
+            "once the child is gone the refresh must reconcile the record"
+        );
+        assert_eq!(
+            key_after_exit.as_deref(),
+            Some("k-restart"),
+            "no stop was requested, so the key must survive the child, as for a crash"
+        );
+        Ok(())
     }
 }

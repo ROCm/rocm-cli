@@ -15,8 +15,8 @@
 //!   `SpawnedManagedEngine`, `ManagedEngineStartupCheck`,
 //!   `spawn_managed_engine_process`) and the startup check behind it
 //!   (`watch_managed_engine_startup`): an engine that exits within the settle
-//!   window fails the launch on Windows and Unix alike, naming the engine's own
-//!   log;
+//!   window fails the launch, and the service restart that shares the seam, on
+//!   Windows and Unix alike, naming the engine's own log;
 //! - the record bookkeeping around that check: every launch write after the
 //!   claim goes through `LaunchRecord`, a guarded read-modify-write of the
 //!   record on disk (`update_managed_record_on_disk`) that keeps a stop,
@@ -505,10 +505,9 @@ pub(crate) fn persist_spawned_engine_child(
 /// holds a truer view. `update` should touch only the caller's own fields, and
 /// never the stop marker, so a stop asked for meanwhile survives.
 ///
-/// The launch's writes reach disk through it, via [`LaunchRecord`]. The
-/// restart's `update_restarting_record` in `services_text.rs` follows the same
-/// pattern with a stricter idea of what "still owned" means — see
-/// [`LaunchRecord`].
+/// Shared by the launch ([`LaunchRecord`]) and the restart
+/// (`update_restarting_record` in `services_text.rs`). They differ only in what
+/// "still owned" means — see each.
 pub(crate) fn update_managed_record_on_disk(
     paths: &AppPaths,
     service_id: &str,
@@ -614,10 +613,10 @@ pub(crate) fn record_launch_readiness(
 ///
 /// The launch never writes back a copy it holds: a stop may write the same
 /// record while it runs, so each change is applied to the record as it is on
-/// disk, through [`update_managed_record_on_disk`] via [`LaunchRecord`]. A trait
-/// rather than [`LaunchRecord`] itself so that a caller with its own ownership
-/// rule can go through the same startup check,
-/// [`watch_managed_engine_startup`].
+/// disk, through [`update_managed_record_on_disk`] via [`LaunchRecord`]. The
+/// restart does the same through its own `RestartStartupRecord` in
+/// `services_text.rs`, with a stricter ownership rule, and both go through the
+/// one startup check, [`watch_managed_engine_startup`].
 pub(crate) trait ManagedStartupRecord {
     /// Put the spawned child on record as a `"starting"` service naming it.
     fn persist_spawned_child(&mut self, child_pid: u32) -> Result<()>;
@@ -646,9 +645,9 @@ impl ManagedStartupRecord for LaunchRecord<'_> {
     }
 }
 
-/// Everything a platform needs to start a managed engine child. The launch
-/// builds one and hands it to the spawner, so every caller starts an engine the
-/// same way.
+/// Everything a platform needs to start a managed engine child. The launch and
+/// the restart both build one and hand it to the same spawner, so the two
+/// cannot drift in how an engine is started.
 pub(crate) struct ManagedEngineSpawnRequest<'a> {
     pub(crate) paths: &'a AppPaths,
     pub(crate) program: &'a Path,
@@ -1879,7 +1878,7 @@ fn stream_attached_logs_no_tty(log_path: &Path, child_pid: u32) -> Result<Attach
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::tests::test_paths;
 
@@ -2231,7 +2230,7 @@ mod tests {
 
     /// Build the pre-spawn record every managed launch persists to claim its
     /// engine + model: `"starting"`, with no child pid recorded yet.
-    fn pre_spawn_record(paths: &AppPaths, port: u16) -> ManagedServiceRecord {
+    pub(crate) fn pre_spawn_record(paths: &AppPaths, port: u16) -> ManagedServiceRecord {
         ManagedServiceRecord::new(
             paths,
             "lemonade-qwen-3000",
