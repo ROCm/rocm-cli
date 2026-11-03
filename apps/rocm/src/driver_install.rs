@@ -852,9 +852,4 @@ mod tests {
         assert!(!should_execute(&mutating, false, false));
         assert!(!should_execute(&mutating, true, true));
     }
-
-    // EAI-7406: distro selection must honor `/etc/os-release` `ID_LIKE`, so that
-    // Debian/Ubuntu-family and RHEL-rebuild derivatives that share their base
-    // version scheme are matched to the correct apt (`ubuntu/<codename>`) or EL
-    // (`el/`) plan instead of falling through to the unsupported plan.
 }

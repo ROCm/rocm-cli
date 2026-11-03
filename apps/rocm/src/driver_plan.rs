@@ -3074,6 +3074,11 @@ VERSION_ID="41"
         assert!(render_driver_install_plan(&bare_metal, false, false).contains("post_reboot"));
     }
 
+    // EAI-7406: distro selection must honor `/etc/os-release` `ID_LIKE`, so that
+    // Debian/Ubuntu-family and RHEL-rebuild derivatives that share their base
+    // version scheme are matched to the correct apt (`ubuntu/<codename>`) or EL
+    // (`el/`) plan instead of falling through to the unsupported plan.
+
     #[test]
     fn driver_plan_ubuntu_derivative_via_id_like_matches_ubuntu_plan() {
         let _env = ScopedTestEnv::with_amd_overrides_cleared();
