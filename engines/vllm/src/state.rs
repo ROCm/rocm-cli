@@ -184,11 +184,14 @@ pub(crate) fn write_running_state(
             // reports. Introspection only, like the rest of this file — never
             // read back to relaunch.
             "gpu_indices": request.gpu_indices,
-            // The host's GPU name, so the `device:` row names a device and not
-            // only a backend (ROCMAI-550). Captured once here rather than
-            // probed per healthcheck, because `rocm services list`
-            // healthchecks every ready service on its render path.
-            "gpu_name": rocm_core::detect_host_gpu_summary(None).name,
+            // The name of the GPU this service was pinned to, so the `device:`
+            // row names a device and not only a backend (ROCMAI-550). Captured
+            // once here rather than probed per healthcheck, because `rocm
+            // services list` healthchecks every ready service on its render
+            // path. `rocm_core::pinned_gpu_name` answers `null` when the host
+            // probe cannot be attributed to the pinned ordinal, so the row
+            // falls back to `rocm gpu <n>` rather than naming another card.
+            "gpu_name": rocm_core::pinned_gpu_name(&request.gpu_indices),
             "runtime_id": runtime.runtime_id,
             "requested_runtime_id": request.runtime_id,
             "env_id": request.env_id.as_deref().unwrap_or(runtime.env_id.as_str()),

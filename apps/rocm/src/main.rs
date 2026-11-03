@@ -506,8 +506,11 @@ rocm model --verbose"
     ///
     /// Picks an engine and ROCm runtime automatically unless overridden. By default the
     /// server runs as a managed background service and prints a deployment summary
-    /// (status, endpoint, model, and smoke-test metrics); use --verbose to stream engine
-    /// logs in this terminal instead. When streaming, press Ctrl-D to detach and leave the
+    /// (status, endpoint, model, smoke-test metrics, and the backend device the engine
+    /// reports it is running on). The device line is read back from the running server, so
+    /// it is omitted when the engine cannot say yet: a server that answers is not always
+    /// done loading its weights. `rocm services list` shows it once it is known. Use
+    /// --verbose to stream engine logs in this terminal instead. When streaming, press Ctrl-D to detach and leave the
     /// server running, or Ctrl-C to stop it. Inspect or stop servers later with
     /// `rocm services`.
     ///
@@ -1124,6 +1127,12 @@ enum ComfyuiCommand {
 enum ServicesCommand {
     /// Show currently running local model servers, and count the records that
     /// are no longer running.
+    ///
+    /// Each running server is asked which backend and GPU it is actually on, so
+    /// this takes a few seconds rather than returning instantly. The asking is
+    /// capped in total — about 18 seconds worst case, however many servers are
+    /// listed — and a server that does not answer in time simply has no device
+    /// line.
     List {
         /// Include failed, stopped, and old service records.
         #[arg(short, long)]

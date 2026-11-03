@@ -333,6 +333,81 @@ pub(crate) fn fetch_service_device(
     (!response.device.is_empty() && response.device != "unknown").then_some(response.device)
 }
 
+/// How long `rocm serve`'s deployment summary may keep asking the engine which
+/// device it selected, and how long it waits between asks.
+///
+/// A managed launch reports `ready` as soon as its server answers, but
+/// `engines/lemonade` reports `device: "unknown"` until its own
+/// `inference_verified` probe has come back — so asking once, immediately,
+/// loses the row on exactly the Vulkan case ROCMAI-550 is about. One retry
+/// window closes the common case: the default smoke test has just put a real
+/// completion through the server, so the engine's own probe is a cache hit.
+///
+/// **It cannot close every case, and is not meant to.** A server that reported
+/// `ready` while weights are still loading can stay unverified for minutes, and
+/// waiting that out would hold the terminal hostage for an informational row
+/// that `rocm services list` will show as soon as it exists. So the row is
+/// *optional by contract* — see [`crate::serve_summary::DeploymentSummary`]'s
+/// `device` field, `docs/manual-testing.md` and README.md, which all say it can
+/// be absent.
+///
+/// The budget is a start gate, like [`SERVICE_DEVICE_PROBE_BUDGET`]: it is
+/// tested before each attempt, never inside one, so the worst-case addition to
+/// `rocm serve` is this budget plus one in-flight probe — about 14s with
+/// Lemonade's 8s `rocm_core::INFERENCE_PROBE_TIMEOUT`, and only on a launch
+/// that was going to have no row at all.
+const SERVE_DEVICE_PROBE_BUDGET: Duration = Duration::from_secs(6);
+/// Pause between the attempts [`SERVE_DEVICE_PROBE_BUDGET`] allows. Short
+/// enough that the common case (the engine is a second away from verifying)
+/// resolves quickly, long enough not to spin on an engine that answers
+/// instantly.
+const SERVE_DEVICE_PROBE_INTERVAL: Duration = Duration::from_secs(2);
+
+/// [`fetch_service_device`], retried briefly, for `rocm serve`'s one-shot
+/// deployment summary.
+///
+/// `None` is a legitimate answer and must stay cheap to get: see
+/// [`SERVE_DEVICE_PROBE_BUDGET`] for why the wait is bounded and why the
+/// summary prints no `device:` row rather than blocking on one.
+pub(crate) fn fetch_service_device_briefly(
+    paths: &AppPaths,
+    engine: &str,
+    service_id: &str,
+) -> Option<String> {
+    let started = Instant::now();
+    retry_service_device(
+        || started.elapsed(),
+        || fetch_service_device(paths, engine, service_id),
+        std::thread::sleep,
+    )
+}
+
+/// The retry loop of [`fetch_service_device_briefly`], with the clock, the
+/// probe and the wait injected.
+///
+/// Split out for the same reason as [`collect_service_devices`]: driving this
+/// against the live clock would mean a test that really sleeps out
+/// [`SERVE_DEVICE_PROBE_BUDGET`] against a real engine. What has to be
+/// guaranteed is not just that a late answer is reported but that the loop
+/// *stops* — an unbounded retry here would hang every `rocm serve` whose engine
+/// never verifies.
+fn retry_service_device<C, P, S>(mut elapsed: C, mut probe: P, mut wait: S) -> Option<String>
+where
+    C: FnMut() -> Duration,
+    P: FnMut() -> Option<String>,
+    S: FnMut(Duration),
+{
+    loop {
+        if let Some(device) = probe() {
+            return Some(device);
+        }
+        if elapsed() >= SERVE_DEVICE_PROBE_BUDGET {
+            return None;
+        }
+        wait(SERVE_DEVICE_PROBE_INTERVAL);
+    }
+}
+
 /// How long [`fetch_service_devices`] may spend on live `Healthcheck` RPCs in
 /// total, across however many services were listed.
 ///
@@ -721,6 +796,64 @@ mod tests {
         assert!(
             !devices.contains_key("svc-hung") && !devices.contains_key("svc-never-reached"),
             "an unprobed service must get no `device:` row: {devices:?}"
+        );
+    }
+
+    /// The serve summary asks again when the first answer is `None`: the
+    /// engine can be seconds from verifying its own inference probe, which is
+    /// the `device: "unknown"` window `engines/lemonade` has right after a
+    /// launch reports ready.
+    #[test]
+    fn the_serve_summary_probe_waits_for_a_device_that_is_not_ready_yet() {
+        let mut attempts = 0;
+        let mut waited = Duration::ZERO;
+        let device = retry_service_device(
+            || Duration::ZERO,
+            || {
+                attempts += 1;
+                (attempts > 2).then(|| "vulkan gpu 0".to_owned())
+            },
+            |interval| waited += interval,
+        );
+
+        assert_eq!(device.as_deref(), Some("vulkan gpu 0"));
+        assert_eq!(attempts, 3);
+        assert_eq!(
+            waited,
+            SERVE_DEVICE_PROBE_INTERVAL * 2,
+            "the retries must pace themselves rather than spin"
+        );
+    }
+
+    /// And it gives up. A lemonade service whose weights are still loading can
+    /// stay `unknown` for minutes; the summary prints no `device:` row rather
+    /// than holding the terminal, which is why the row is documented as
+    /// optional.
+    #[test]
+    fn the_serve_summary_probe_gives_up_within_its_budget() {
+        let mut attempts = 0;
+        // Inside the budget for the first attempt, past it from then on.
+        let mut tick = 0;
+        let device = retry_service_device(
+            || {
+                tick += 1;
+                if tick <= 1 {
+                    Duration::ZERO
+                } else {
+                    SERVE_DEVICE_PROBE_BUDGET
+                }
+            },
+            || {
+                attempts += 1;
+                None
+            },
+            |_| {},
+        );
+
+        assert_eq!(device, None);
+        assert_eq!(
+            attempts, 2,
+            "the budget must end the retries, not merely discard their results"
         );
     }
 

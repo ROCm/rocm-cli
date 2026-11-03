@@ -1812,6 +1812,29 @@ impl WindowsExamineInventory {
             .is_some_and(|d| d.driver_version.is_none() || d.driver_date.is_none())
     }
 
+    /// How many of the listed adapters are recognizably AMD GPUs.
+    ///
+    /// Used only by [`pinned_gpu_name`], to answer "could the preferred
+    /// adapter's name belong to a card other than the pinned one?". Counts an
+    /// adapter when either half of [`Self::preferred_amd_display`]'s
+    /// recognition applies (an AMD PCI device id, or an AMD marketing name) —
+    /// deliberately *not* that function's last-resort "any adapter with a
+    /// name", which matches non-AMD displays and would read a laptop's Intel
+    /// panel as a second AMD GPU and drop a name that was fine.
+    fn amd_display_count(&self) -> usize {
+        self.displays
+            .iter()
+            .filter(|display| {
+                display
+                    .pnp_device_id
+                    .as_deref()
+                    .and_then(amd_pci_device_id_from_pnp_id)
+                    .is_some()
+                    || gfx_target_from_amd_marketing_name(&display.name).is_some()
+            })
+            .count()
+    }
+
     fn amd_display_name(&self) -> Option<String> {
         self.preferred_amd_display()
             .map(|display| display.name.trim())
@@ -1977,11 +2000,28 @@ impl ExamineSummary {
             // The covering family is the fact; it is already printed on its own
             // line above, so this one says what it means rather than repeating
             // it.
-            GpuSupportLevel::RocmHip => format!(
-                "  rocm_support: GPU detected ({}) with full ROCm/HIP support; \
-                 install the SDK for it with `rocm install sdk`\n",
-                detected.unwrap_or("<unknown>")
-            ),
+            //
+            // The advice is conditional because AGENTS.md wants a named command
+            // to be able to clear the condition it is printed for. On a host
+            // that already has a managed SDK, `rocm install sdk` clears
+            // nothing — it is the install that is already done — so the line
+            // says so and points at what is left to do instead.
+            // `detected_therock_family` is the installed managed runtime (see
+            // `detect_managed_therock_family`), as opposed to
+            // `compatible_therock_family`, which is what this GPU *could* run.
+            GpuSupportLevel::RocmHip => match self.detected_therock_family.as_deref() {
+                Some(installed) => format!(
+                    "  rocm_support: GPU detected ({}) with full ROCm/HIP support, and the \
+                     managed ROCm SDK for {installed} is already installed - serve on it with \
+                     `rocm serve <model>`\n",
+                    detected.unwrap_or("<unknown>")
+                ),
+                None => format!(
+                    "  rocm_support: GPU detected ({}) with full ROCm/HIP support; \
+                     install the SDK for it with `rocm install sdk`\n",
+                    detected.unwrap_or("<unknown>")
+                ),
+            },
             // Not folded in with `VulkanOnly`: a detection gap is not a
             // confirmed absence of ROCm support, and saying "Vulkan" here would
             // be the same false claim in the other direction. What the user can
@@ -3365,6 +3405,116 @@ pub fn detect_host_gpu_summary(paths: Option<&AppPaths>) -> HostGpuSummary {
     detect_host_gpu_summary_fast(paths)
 }
 
+/// The GPU name an engine may record at launch for a service pinned to
+/// `gpu_indices`, for the `device:` row `rocm serve` and `rocm services list`
+/// print (ROCMAI-550).
+///
+/// `None` whenever the name cannot be attributed to the *pinned* device, which
+/// is most of what this function is for. Every name probe on this host —
+/// [`detect_host_gpu_summary`] on Linux, the Windows display inventory — answers
+/// for the host's primary/preferred adapter, not for an ordinal. On a multi-GPU
+/// host that would print `gpu 1 (<name of GPU 0>)`: a row that looks specific
+/// and is wrong, which is worse than the bare `gpu 1` it replaced. So the name
+/// is reported only when the host has exactly **one** AMD GPU, where "the
+/// primary one" and "the pinned one" cannot differ.
+///
+/// The three built-in engines all call this instead of probing themselves, so
+/// the rule lives in one place and `engines/aim` (which records no ordinal at
+/// all) is held to it as well.
+///
+/// Why not map the ordinal to a device properly: the ordinals in `gpu_indices`
+/// are HIP ordinals *after* the visibility mask
+/// ([`usable_amd_gpu_indices`]), so ordinal 0 under `ROCR_VISIBLE_DEVICES=1`
+/// is the host's second card. Attributing a name would mean enumerating
+/// devices in HIP order and re-applying that mask, and neither KFD topology
+/// nodes nor DRM cards carry a marketing name — so it is a real probe to build
+/// and one no lane here can verify (none of the CI hosts has two AMD GPUs).
+/// Until that exists, a mask in effect is treated exactly like a second GPU:
+/// no name.
+#[must_use]
+pub fn pinned_gpu_name(gpu_indices: &[u32]) -> Option<String> {
+    gpu_name_for_single_gpu_host(
+        gpu_indices,
+        amd_gpu_count_for_naming(),
+        gpu_visibility_mask_in_effect(),
+        host_primary_gpu_name,
+    )
+}
+
+/// The decision [`pinned_gpu_name`] makes, with the host probes lifted out.
+///
+/// Split out because every input here is a host fact a unit test cannot plant
+/// (a second GPU, a Windows display inventory), while the rule itself — "a name
+/// only when nothing else on this host could be the one that was pinned" — is
+/// the whole point and is exactly what a regression would silently undo.
+fn gpu_name_for_single_gpu_host<F>(
+    gpu_indices: &[u32],
+    present_amd_gpus: Option<usize>,
+    mask_in_effect: bool,
+    name: F,
+) -> Option<String>
+where
+    F: FnOnce() -> Option<String>,
+{
+    // A pinned ordinal other than 0 cannot be the only GPU on the host, so it
+    // is already outside what the probes can attribute. Checked separately from
+    // the count so a disagreement between the two (a `--gpu 1` that got past
+    // validation on a host now reporting one GPU) also declines to name.
+    if gpu_indices.iter().any(|&index| index != 0) {
+        return None;
+    }
+    if mask_in_effect || present_amd_gpus != Some(1) {
+        return None;
+    }
+    name()
+}
+
+/// How many AMD GPUs this host presents, for [`pinned_gpu_name`]'s
+/// "could this name belong to another card?" test. `None` when it cannot be
+/// established, which declines the name rather than guessing.
+fn amd_gpu_count_for_naming() -> Option<usize> {
+    #[cfg(target_os = "linux")]
+    {
+        if !runtime_is_windows() {
+            // WSL2 exposes no per-device topology; the ROCm-over-dxg path
+            // reaches a single device, which is what `usable_amd_gpu_indices`
+            // reports there too.
+            if is_wsl_host() {
+                return Some(1);
+            }
+            return combine_amd_gpu_counts(
+                linux_kfd_gpu_node_count(),
+                linux_drm_amdgpu_card_count(),
+            );
+        }
+    }
+    detect_windows_examine_inventory().map(|inventory| inventory.amd_display_count())
+}
+
+/// The host's primary/preferred AMD GPU name — correct only on a host with one
+/// AMD GPU, which is why [`pinned_gpu_name`] is the only caller.
+fn host_primary_gpu_name() -> Option<String> {
+    if runtime_is_windows() {
+        return detect_windows_examine_inventory().and_then(|i| i.amd_display_name());
+    }
+    detect_host_gpu_summary(None).name
+}
+
+/// Whether a GPU visibility mask is narrowing what the engine can see, so a
+/// HIP ordinal no longer indexes the host's own device order.
+#[cfg(target_os = "linux")]
+fn gpu_visibility_mask_in_effect() -> bool {
+    visibility_mask_from_env().is_some()
+}
+
+/// Platform stub: the mask readers are Linux-only (see
+/// [`visibility_mask_from_env`]), so nothing here can observe a mask. A mask
+/// reader for another platform must extend this rather than leave it `false`.
+#[cfg(not(target_os = "linux"))]
+const fn gpu_visibility_mask_in_effect() -> bool {
+    false
+}
+
 #[cfg(windows)]
 fn detect_host_gpu_summary_fast(_paths: Option<&AppPaths>) -> HostGpuSummary {
     let windows_inventory = detect_windows_examine_inventory();
@@ -3946,6 +4096,99 @@ mod tests {
         assert_eq!(
             gpu_support_level(Some("gfx_totally_unrecognized"), None),
             GpuSupportLevel::Unknown
+        );
+    }
+
+    /// The one host shape where the probes can attribute a name to the pinned
+    /// device: a single AMD GPU, unmasked, pinned to ordinal 0 (or to nothing,
+    /// which is how `engines/aim` records every launch).
+    #[test]
+    fn a_single_unmasked_gpu_is_named() {
+        for indices in [&[][..], &[0][..]] {
+            assert_eq!(
+                gpu_name_for_single_gpu_host(indices, Some(1), false, || Some(
+                    "AMD Radeon Graphics".to_owned()
+                )),
+                Some("AMD Radeon Graphics".to_owned())
+            );
+        }
+    }
+
+    /// The failure this exists to prevent: on a two-GPU host the name probe
+    /// answers for the primary adapter whatever ordinal was pinned, so
+    /// `gpu 1 (<name of GPU 0>)` would be a specific-looking lie. The probe
+    /// must not even be called.
+    #[test]
+    fn a_second_gpu_on_the_host_withholds_the_name() {
+        let mut probed = false;
+        let name = gpu_name_for_single_gpu_host(&[1], Some(2), false, || {
+            probed = true;
+            Some("AMD Instinct MI300X".to_owned())
+        });
+        assert_eq!(name, None);
+        assert!(!probed, "a name that cannot be attributed must not be probed");
+
+        // Ordinal 0 on that same host is no safer: the probe answers for the
+        // host's primary adapter, which the mask/enumeration order need not
+        // agree with.
+        assert_eq!(
+            gpu_name_for_single_gpu_host(&[0], Some(2), false, || Some("AMD".to_owned())),
+            None
+        );
+    }
+
+    /// A visibility mask renumbers the devices, so ordinal 0 need not be the
+    /// host's first GPU and a one-device *view* is not a one-GPU host.
+    #[test]
+    fn a_visibility_mask_withholds_the_name() {
+        assert_eq!(
+            gpu_name_for_single_gpu_host(&[0], Some(1), true, || Some("AMD".to_owned())),
+            None
+        );
+    }
+
+    /// An unprobeable host count declines rather than guessing, so a platform
+    /// whose GPU count cannot be read reports the backend without a name.
+    #[test]
+    fn an_unknown_gpu_count_withholds_the_name() {
+        assert_eq!(
+            gpu_name_for_single_gpu_host(&[0], None, false, || Some("AMD".to_owned())),
+            None
+        );
+        // And a host with no AMD GPU at all has nothing to name.
+        assert_eq!(
+            gpu_name_for_single_gpu_host(&[], Some(0), false, || Some("AMD".to_owned())),
+            None
+        );
+    }
+
+    /// Only AMD adapters count toward "is this host ambiguous?" — a laptop's
+    /// Intel panel alongside one Radeon is still one AMD GPU, and counting it
+    /// would drop a name that was correct.
+    #[test]
+    fn the_windows_display_count_counts_amd_adapters_only() {
+        let inventory = WindowsExamineInventory {
+            cpu_model: None,
+            system_ram_gib: None,
+            displays: vec![
+                WindowsDisplayAdapter {
+                    name: "Intel(R) UHD Graphics".to_owned(),
+                    driver_version: None,
+                    driver_date: None,
+                    pnp_device_id: Some("PCI\\VEN_8086&DEV_9A49".to_owned()),
+                },
+                WindowsDisplayAdapter {
+                    name: "AMD Radeon(TM) Graphics".to_owned(),
+                    driver_version: None,
+                    driver_date: None,
+                    pnp_device_id: Some("PCI\\VEN_1002&DEV_15BF".to_owned()),
+                },
+            ],
+        };
+        assert_eq!(inventory.amd_display_count(), 1);
+        assert_eq!(
+            inventory.amd_display_name(),
+            Some("AMD Radeon(TM) Graphics".to_owned())
         );
     }
 
@@ -5226,6 +5469,25 @@ Class Name:                Display
             "{rendered}"
         );
         assert!(rendered.contains("rocm install sdk"), "{rendered}");
+
+        // Same GPU, but the SDK it was being told to install is already there:
+        // the advice has to be something that is still left to do (AGENTS.md
+        // wants a named command to be able to clear the condition).
+        let mut installed = supported;
+        installed.detected_therock_family = Some("gfx110X-dgpu".to_owned());
+        let rendered = installed.render_text();
+        assert!(
+            rendered.contains("rocm_support: GPU detected (gfx1103) with full ROCm/HIP support"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("managed ROCm SDK for gfx110X-dgpu is already installed"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("rocm install sdk"),
+            "an install that is already done must not be the advice: {rendered}"
+        );
 
         // No GPU found: the level is reported as unknown, and nothing about the
         // hardware is asserted in either direction.

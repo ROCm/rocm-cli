@@ -888,9 +888,17 @@ example `rocm gpu 0 (AMD Instinct MI300X)`, or `vulkan (AMD Radeon Graphics)`
 where the engine pinned no GPU ordinal — read back from the running engine), the
 full inference endpoint, the API-qualified model name, and a quick smoke test
 (time to first token and approximate tokens per second). `rocm services` reports
-the same `device` for each running service. Control
-returns to your shell with the server still running; manage it later with `rocm
-services` (below).
+the same `device` for each running service.
+
+The device line is omitted when the engine cannot say yet. A server is reported
+ready as soon as it answers, which can be before it has finished loading the
+model, and until then the engine does not know which device it ended up on;
+`rocm serve` waits a few seconds for it rather than holding your terminal, and
+`rocm services` shows it once it is known. The GPU name is omitted on a machine
+with more than one AMD GPU, where naming one of them could name the wrong one.
+
+Control returns to your shell with the server still running; manage it later
+with `rocm services` (below).
 
 `--verbose` (or `--foreground`) instead attaches to the server in the current
 terminal and streams every engine log line. Use it to debug a startup problem.
