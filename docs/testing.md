@@ -2323,7 +2323,7 @@ prints when `pci.ids` has no name), by both, and by codename.
 RUSTC_WRAPPER= cargo xtask e2e -- -n 'examine-31 '
 ```
 
-`examine-30` covers the kernel-topology route the same way, for an integrated
+`examine-32` covers the kernel-topology route the same way, for an integrated
 GPU no lookup table names. Its simulated host root carries a KFD topology node
 per card, and its two `lspci` rows resolve no target (a Raven Ridge iGPU and an
 unnamed `Device` row), so the gfx902 and gfx1102 the topology reports are the
@@ -2331,10 +2331,10 @@ only evidence. The Raven Ridge iGPU must come out integrated and the other card
 discrete:
 
 ```bash
-RUSTC_WRAPPER= cargo xtask e2e -- -n 'examine-30 '
+RUSTC_WRAPPER= cargo xtask e2e -- -n 'examine-32 '
 ```
 
-`examine-31` drops the PCI scan altogether, as an ordinary ROCm container with
+`examine-33` drops the PCI scan altogether, as an ordinary ROCm container with
 no `pciutils` does: the stand-in `lspci` lists nothing and neither topology node
 states a PCI address, so both GPUs are listed from the topology alone and must
 still come out integrated (gfx1151) and discrete (gfx1201). The sysfs fallback

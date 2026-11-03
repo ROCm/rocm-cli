@@ -500,7 +500,7 @@ Feature: GPU detection and system inspection
   # stand-in `lspci` lists the two GPUs, a stand-in `rocminfo` lists no agents,
   # and the simulated host root carries a kernel topology node for each card.
   @id:examine-classifies-an-igpu-from-the-kernel-topology @requires-os:linux
-  Scenario: examine-30 - An integrated GPU that only the kernel identifies is reported as integrated
+  Scenario: examine-32 - An integrated GPU that only the kernel identifies is reported as integrated
     Given a machine with a Raven Ridge integrated GPU and a discrete AMD GPU that only the kernel identifies
     When the user inspects that machine in machine-readable form
     Then the inspection reports the Raven Ridge GPU as an integrated gfx902 and the other card as discrete
@@ -510,10 +510,10 @@ Feature: GPU detection and system inspection
   # ships no `pciutils`, so the kernel's topology is the only list of GPUs. A
   # card listed from the topology alone used to carry no verdict whatever its
   # architecture, so such a host reported neither an integrated nor a discrete
-  # GPU. Simulated as `examine-30` is, with a stand-in `lspci` that lists
+  # GPU. Simulated as `examine-32` is, with a stand-in `lspci` that lists
   # nothing and no PCI address on either topology node.
   @id:examine-classifies-gpus-only-the-kernel-lists @requires-os:linux
-  Scenario: examine-31 - GPUs that only the kernel lists are reported as integrated or discrete by their architecture
+  Scenario: examine-33 - GPUs that only the kernel lists are reported as integrated or discrete by their architecture
     Given a machine whose only list of GPUs is the kernel's, naming a Strix Halo integrated GPU and a Radeon RX 9070 XT
     When the user inspects that machine in machine-readable form
     Then the inspection reports the Strix Halo GPU as integrated and the RX 9070 XT as discrete

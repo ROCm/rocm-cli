@@ -1541,7 +1541,7 @@ async fn machine_with_five_amd_gpus_on_the_bus(world: &mut E2eWorld) {
     plant_pci_bus(world, PCI_BUS_GPUS, &[]);
 }
 
-/// The two AMD GPUs `examine-30` puts on the PCI bus, in [`PCI_BUS_GPUS`]'s
+/// The two AMD GPUs `examine-32` puts on the PCI bus, in [`PCI_BUS_GPUS`]'s
 /// shape, plus the KFD `gfx_target_version` the kernel topology reports for
 /// each. Neither row resolves a target from its PCI line: the Raven Ridge iGPU
 /// (`15dd`) is in neither lookup table, and the Navi 33 card (`7480`) is in
@@ -1575,7 +1575,7 @@ async fn machine_with_kernel_identified_gpus(world: &mut E2eWorld) {
     plant_pci_bus(world, KERNEL_IDENTIFIED_GPUS, KERNEL_IDENTIFIED_NODES);
 }
 
-/// The two GPUs `examine-31`'s kernel topology lists, as `(KFD
+/// The two GPUs `examine-33`'s kernel topology lists, as `(KFD
 /// gfx_target_version, gfx target, integrated)`: a Strix Halo iGPU and an RX
 /// 9070 XT. Neither node states a PCI address, so the report lists both from the
 /// topology alone, the way it does in a container with no `pciutils`.
