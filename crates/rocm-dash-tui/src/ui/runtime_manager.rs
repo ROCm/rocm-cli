@@ -61,6 +61,18 @@ pub struct RuntimeSummary {
     pub rollback: bool,
 }
 
+/// Tone of a runtime's list marker: the active default wins over the rollback
+/// target, and every other runtime is muted.
+const fn runtime_marker_tone(rt: &RuntimeSummary) -> StatusTone {
+    if rt.active {
+        StatusTone::Success
+    } else if rt.rollback {
+        StatusTone::Warning
+    } else {
+        StatusTone::Muted
+    }
+}
+
 /// Marker shown beside the active runtime in the list. Every place *in this
 /// module* that renders this glyph MUST use this constant so it can't drift
 /// out of sync with the legend rendered in `draw_runtime_manager`. Other
@@ -421,14 +433,7 @@ pub fn draw_runtime_manager(
                 } else {
                     "  "
                 };
-                let marker_tone = if rt.active {
-                    StatusTone::Success
-                } else if rt.rollback {
-                    StatusTone::Warning
-                } else {
-                    StatusTone::Muted
-                };
-                let marker_color = theme.tone_color(marker_tone);
+                let marker_color = theme.tone_color(runtime_marker_tone(rt));
                 ListItem::new(Line::from(vec![
                     Span::styled(marker, Style::default().fg(marker_color)),
                     Span::styled(
@@ -572,6 +577,23 @@ mod tests {
                 rollback: true,
             },
         ]
+    }
+
+    #[test]
+    fn marker_color_distinguishes_active_rollback_and_other_runtimes() {
+        let theme = Theme::from_name("default-dark");
+        let rt = |active, rollback| RuntimeSummary {
+            active,
+            rollback,
+            ..RuntimeSummary::default()
+        };
+        let color = |r: &RuntimeSummary| theme.tone_color(runtime_marker_tone(r));
+        assert_eq!(color(&rt(true, false)), theme.ok);
+        assert_eq!(color(&rt(false, true)), theme.warn);
+        assert_eq!(color(&rt(false, false)), theme.muted);
+        // A runtime that is both the active default and the rollback target
+        // reads as active.
+        assert_eq!(color(&rt(true, true)), theme.ok);
     }
 
     #[test]

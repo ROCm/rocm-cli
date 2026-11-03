@@ -673,10 +673,11 @@ Feature: Interactive dashboard
   # supplies one service per lifecycle state, so the scenario needs no daemon
   # and no GPU. The scenario compares the colors the user sees rather than
   # naming a theme's RGB values: running, starting and stopped must all differ,
-  # and stopped and failed, which are both errors, must match. Each status
-  # cell is read from the row carrying its model name, because the Instances
-  # tab behind the overlay shows the same status words. The mapping from every
-  # status to its tone is covered by the unit tests in
+  # and stopped and failed, which are both errors, must match. A status cell
+  # is read only from a row that also carries its model name, and every such
+  # row must agree, because the Instances tab behind the overlay can show the
+  # same words; so no layout order can hide a wrong color. The mapping from
+  # every status to its tone is covered by the unit tests in
   # `crates/rocm-dash-tui/src/ui/theme.rs`.
   @id:dash-services-status-colored-by-state @requires-os:linux
   Scenario: dash-39 - The Services manager colors each service's status by its state

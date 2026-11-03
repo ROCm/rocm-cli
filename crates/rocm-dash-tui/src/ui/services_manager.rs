@@ -24,7 +24,9 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{List, ListItem, ListState, Paragraph};
 
-use rocm_dash_core::metrics::{Instance, ObservationFreshness, ObservationMetadata};
+use rocm_dash_core::metrics::{
+    Instance, InstanceStatus, ObservationFreshness, ObservationMetadata,
+};
 use rocm_dash_core::state::{SideEffect, State, StateEvent};
 
 use crate::ui::approval::{
@@ -34,7 +36,7 @@ use crate::ui::exec::{exe_label, quote_display_arg, resolve_exe};
 use crate::ui::format;
 use crate::ui::job_console::{ConsoleOutcome, on_console_key};
 use crate::ui::panel::{self, BoxRole};
-use crate::ui::theme::{StatusTone, Theme, instance_status_tone};
+use crate::ui::theme::Theme;
 
 /// A lifecycle operation on a managed service.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,10 +85,9 @@ pub struct ServiceRow {
     pub id: String,
     pub model: String,
     pub port: Option<u16>,
-    pub status: String,
-    /// Tone for `status`, so the renderer colors a stopped or failed service
-    /// differently from a running one instead of painting every row "ok".
-    pub tone: StatusTone,
+    /// The renderer derives both the label and the color from this one value, so
+    /// a stopped or failed service cannot be colored like a running one.
+    pub status: InstanceStatus,
     pub gen_tps: Option<f64>,
     /// Freshness metadata for `gen_tps`; `None` for legacy snapshots.
     pub gen_tps_observation: Option<ObservationMetadata>,
@@ -102,10 +103,7 @@ pub fn service_rows<S: ::std::hash::BuildHasher>(
             id: i.container_id.clone(),
             model: i.model_name.clone(),
             port: i.port,
-            // `label()` surfaces the DOWNLOADING/LOADING/WARMUP startup phase
-            // when the instance is `Starting`; never a raw `{:?}` debug string.
-            status: i.status.label().to_owned(),
-            tone: instance_status_tone(i.status),
+            status: i.status,
             gen_tps: i.gen_tps,
             gen_tps_observation: i.gen_tps_observation.clone(),
         })
@@ -353,9 +351,12 @@ pub fn draw_services_manager<S: ::std::hash::BuildHasher>(
                         format!(":{:<6}", port_str(r.port)),
                         Style::default().fg(theme.muted),
                     ),
+                    // `label()` surfaces the DOWNLOADING/LOADING/WARMUP startup
+                    // phase when the instance is `Starting`; never a raw `{:?}`
+                    // debug string.
                     Span::styled(
-                        format!("{:<10}", r.status),
-                        Style::default().fg(theme.tone_color(r.tone)),
+                        format!("{:<10}", r.status.label()),
+                        Style::default().fg(theme.instance_status_color(r.status)),
                     ),
                     Span::styled(
                         format!(
@@ -591,6 +592,7 @@ mod tests {
             ("svc-3", InstanceStatus::Stopped, "STOPPED"),
             ("svc-4", InstanceStatus::Error, "ERROR"),
             ("svc-5", InstanceStatus::Unknown, "UNKNOWN"),
+            ("svc-6", InstanceStatus::Running, "RUNNING"),
         ];
         let mut insts = HashMap::new();
         for (id, status, _) in cases {
@@ -626,6 +628,7 @@ mod tests {
         }
         // The point of the fix: the failed states are not the "ok" color.
         assert_eq!(fg_of("READY"), theme.ok);
+        assert_eq!(fg_of("RUNNING"), theme.ok);
         assert_ne!(fg_of("STOPPED"), theme.ok);
         assert_ne!(fg_of("ERROR"), theme.ok);
     }

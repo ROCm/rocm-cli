@@ -1750,13 +1750,23 @@ async fn services_status_colored_by_state(world: &mut E2eWorld) {
     tui.wait_for_screen("state-failed", default_timeout())
         .await
         .unwrap_or_else(|e| panic!("the services list did not render every row: {e}"));
+    // A row is read only when it carries both the model name and the status
+    // word, and every such row (the Instances tab behind the overlay can draw
+    // one too) must agree, so no layout order can hide a wrong color.
     let color = |model: &str, label: &str| {
-        tui.foreground_in_row_with(model, label).unwrap_or_else(|| {
+        let found = tui.foregrounds_in_rows_with(model, label);
+        let first = *found.first().unwrap_or_else(|| {
             panic!(
-                "no {label} status cell on the {model} row:\n{}",
+                "no row shows {label} next to {model}:\n{}",
                 tui.screen_text()
             )
-        })
+        });
+        assert!(
+            found.iter().all(|c| *c == first),
+            "{label} next to {model} is not colored consistently: {found:?}\n{}",
+            tui.screen_text()
+        );
+        first
     };
     let running = color("state-running", "RUNNING");
     let starting = color("state-starting", "STARTING");
