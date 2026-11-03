@@ -50,23 +50,21 @@
 //! `append_model_engine_support_lines` and this module's own test). Both
 //! stay private.
 //!
-//! `render_config_text` and `telemetry_policy_summary` sit immediately
+//! `render_config_text` and `telemetry_policy_summary` sat immediately
 //! adjacent to this cluster's end boundary in `main.rs` (they render the
-//! `rocm config` command's own output) but are explicitly out of scope —
-//! they don't fit any of the 8 named Phase 6f clusters, a gap already
-//! flagged on epic ROCMAI-27 and on ROCMAI-179 ("Phase 8: validate
-//! module-split sufficiency"). They are left exactly where they are,
-//! untouched by this change.
+//! `rocm config` command's own output) but were explicitly out of scope —
+//! they didn't fit any of the 8 named Phase 6f clusters — so this split
+//! left them where they were. They now live in `config_cmd.rs`.
 //!
 //! `dispatch()` calls directly into this module at two points — the
 //! `Command::Model` arm's calls to
 //! `render_model_registry_verbose_text_with_context_and_host` (with
-//! `--verbose`) and `render_model_registry_text_with_context_and_host` — and
-//! `main.rs`'s `examine()`, which the `Command::Examine` arm calls, calls
-//! `examine_human_report`; all re-imported via
-//! `use crate::examine_report_text::{...};`. `main.rs`'s own
-//! `launch_default` calls `render_launch_summary` directly, also re-imported
-//! there. `render_examine_text`, `render_examine_text_with_paths`, and
+//! `--verbose`) and `render_model_registry_text_with_context_and_host` —
+//! re-imported via `use crate::examine_report_text::{...};`; `examine_cmd.rs`'s
+//! `examine()`, which the `Command::Examine` arm calls, imports and calls
+//! `examine_human_report` itself. `main.rs`'s own `launch_default` calls
+//! `render_launch_summary` directly, also re-imported there.
+//! `render_examine_text`, `render_examine_text_with_paths`, and
 //! `render_model_registry_verbose_text_with_context_and_host` are also
 //! `pub(crate)`, read from [`chat.rs`](../apps/rocm/src/chat.rs)'s
 //! deterministic tool-output summaries; `render_engine_inventory_text_with_paths`
@@ -86,11 +84,13 @@
 //! This cluster reaches three items that stayed behind in `main.rs` because
 //! they already had callers outside it: `engine_inventory()` (the built-in
 //! engine list, also read from `update_cmd.rs`),
-//! `engine_ruled_out_by_platform` (also read from `main.rs`'s
-//! `assess_model_for_host` and `ensure_engine_allowed_on_platform`; the private
+//! `engine_ruled_out_by_platform` (also read from `assess_model_for_host` and
+//! from `main.rs`'s `ensure_engine_allowed_on_platform`; it and the
 //! `PlatformRuleOut` enum it returns, which
 //! `model_registry_adapter_availability_note` and `engine_runtime_status_label`
-//! match on, is reached the same way), and `missing_packaged_engine_reason` (already noted in
+//! match on, have since moved to `model_fit.rs` and are re-imported in
+//! `main.rs`, so they are reached the same way), and
+//! `missing_packaged_engine_reason` (already noted in
 //! [`engine_ipc.rs`](../apps/rocm/src/engine_ipc.rs)'s doc comment as having
 //! callers outside that cluster, plus its own test — this cluster is one of
 //! them) — all three reached via `use crate::{...};`, the same way other
@@ -99,14 +99,14 @@
 //! The cluster's regression tests live in this module's own `mod tests`,
 //! reaching the shared `test_paths` fixture through `crate::tests::` and
 //! `write_test_pip_runtime` through `crate::test_support::`, the same way
-//! other mechanically relocated modules do. Four tests interleaved among
+//! other mechanically relocated modules do. Two tests interleaved among
 //! this cluster's tests in `main.rs`'s old shared `mod tests` stayed behind
 //! because their primary subject is unrelated: `missing_packaged_engine_reason`'s
-//! own test (`missing_packaged_engine_reason_has_no_deferred_first_party_engines`),
-//! two CLI-lifecycle-audit-log tests
-//! (`record_cli_audit_event_writes_cli_lifecycle_record`,
-//! `cli_lifecycle_log_sanitizes_components_and_newlines`), and the
-//! whole-command-tree ASCII-help walk (`every_help_text_in_the_command_tree_is_ascii`).
+//! own test (`missing_packaged_engine_reason_has_no_deferred_first_party_engines`)
+//! and the whole-command-tree ASCII-help walk
+//! (`every_help_text_in_the_command_tree_is_ascii`). Two further such tests, for
+//! the CLI audit/lifecycle log, stayed there when this module was split out and
+//! have since moved to `cli_audit.rs`.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
